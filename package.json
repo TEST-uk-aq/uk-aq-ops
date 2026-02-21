@@ -8,7 +8,9 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "check": "node --check src/server.mjs"
+    "start:prune": "node src/server.mjs",
+    "start:flush": "node src/history_outbox_flush_service.mjs",
+    "check": "node --check src/server.mjs && node --check src/history_outbox_flush_service.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0"

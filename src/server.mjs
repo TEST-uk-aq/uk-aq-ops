@@ -9,11 +9,20 @@ const DEFAULT_DRY_RUN = true;
 const DEFAULT_MAX_HOURS_PER_RUN = 48;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
 const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
+const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
+const DEFAULT_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE = 1_000;
+const DEFAULT_FLUSH_CLAIM_BATCH_LIMIT = 20;
+const DEFAULT_MAX_FLUSH_BATCHES = 30;
 const PREVIEW_LIMIT = 25;
 const RPC_SCHEMA = "uk_aq_public";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_DELETE_HOUR_BUCKET = "uk_aq_rpc_observations_delete_hour_bucket";
+const RPC_REPAIR_ENQUEUE_HOUR_BUCKET = "uk_aq_rpc_history_outbox_enqueue_hour_bucket";
+const RPC_OUTBOX_CLAIM = "uk_aq_rpc_history_outbox_claim";
+const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_history_outbox_resolve";
+const RPC_HISTORY_UPSERT = "uk_aq_rpc_history_observations_upsert";
+const RPC_HISTORY_RECEIPTS_UPSERT = "uk_aq_rpc_history_sync_receipt_daily_upsert";
 
 function nowIso() {
   return new Date().toISOString();
@@ -104,6 +113,28 @@ function toBigIntString(value, fieldName) {
     throw new Error(`Missing bigint for ${fieldName}`);
   }
   return toBigInt(value, fieldName).toString();
+}
+
+function toOptionalBigInt(value, fieldName) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  return toBigInt(value, fieldName);
+}
+
+function buildBucketWindow(hourStartIso) {
+  const hourStartDate = new Date(hourStartIso);
+  if (Number.isNaN(hourStartDate.getTime())) {
+    throw new Error(`Invalid hour_start value: ${hourStartIso}`);
+  }
+  return {
+    window_start: hourStartDate.toISOString(),
+    window_end: new Date(hourStartDate.getTime() + HOUR_MS).toISOString(),
+  };
+}
+
+function toObservedDay(observedAtIso) {
+  return observedAtIso.slice(0, 10);
 }
 
 function buildWindow(maxHoursPerRun) {
@@ -254,6 +285,265 @@ function compareBuckets(ingestBuckets, historyBuckets) {
   };
 }
 
+function determineBucketMismatch(ingestBucket, historyBucket) {
+  if (!ingestBucket && historyBucket) {
+    return {
+      connector_id: historyBucket.connector_id,
+      hour_start: historyBucket.hour_start,
+      reason: "missing_in_ingest",
+      ingest_count: null,
+      history_count: historyBucket.observation_count.toString(),
+    };
+  }
+
+  if (!ingestBucket) {
+    return null;
+  }
+
+  if (!historyBucket) {
+    return {
+      connector_id: ingestBucket.connector_id,
+      hour_start: ingestBucket.hour_start,
+      reason: "missing_in_history",
+      ingest_count: ingestBucket.observation_count.toString(),
+      history_count: null,
+    };
+  }
+
+  if (ingestBucket.observation_count !== historyBucket.observation_count) {
+    return {
+      connector_id: ingestBucket.connector_id,
+      hour_start: ingestBucket.hour_start,
+      reason: "count_mismatch",
+      ingest_count: ingestBucket.observation_count.toString(),
+      history_count: historyBucket.observation_count.toString(),
+    };
+  }
+
+  if (ingestBucket.fingerprint !== historyBucket.fingerprint) {
+    return {
+      connector_id: ingestBucket.connector_id,
+      hour_start: ingestBucket.hour_start,
+      reason: "fingerprint_mismatch",
+      ingest_count: ingestBucket.observation_count.toString(),
+      history_count: historyBucket.observation_count.toString(),
+    };
+  }
+
+  return null;
+}
+
+function pickRepairMismatchBucket(mismatches) {
+  const historyCountGreaterThanIngest = [];
+
+  for (const mismatch of mismatches) {
+    if (mismatch.reason === "missing_in_history" || mismatch.reason === "fingerprint_mismatch") {
+      return { candidate: mismatch, historyCountGreaterThanIngest };
+    }
+
+    if (mismatch.reason !== "count_mismatch") {
+      continue;
+    }
+
+    const ingestCount = toOptionalBigInt(mismatch.ingest_count, "mismatch.ingest_count");
+    const historyCount = toOptionalBigInt(mismatch.history_count, "mismatch.history_count");
+    if (ingestCount !== null && historyCount !== null && historyCount > ingestCount) {
+      historyCountGreaterThanIngest.push(mismatch);
+      continue;
+    }
+    return { candidate: mismatch, historyCountGreaterThanIngest };
+  }
+
+  return { candidate: null, historyCountGreaterThanIngest };
+}
+
+function toIntField(value, fieldName) {
+  const number = Number(value ?? 0);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new Error(`Invalid integer for ${fieldName}: ${String(value)}`);
+  }
+  return Math.trunc(number);
+}
+
+function normalizeHistoryRows(inputRows) {
+  const deduped = new Map();
+  for (const row of inputRows) {
+    const connectorId = toBigIntString(row.connector_id, "history_row.connector_id");
+    const timeseriesId = toBigIntString(row.timeseries_id, "history_row.timeseries_id");
+    const observedAt = toIso(row.observed_at, "history_row.observed_at");
+    const value = row.value === undefined ? null : row.value;
+    const status = row.status === undefined ? null : row.status;
+    const key = `${connectorId}|${timeseriesId}|${observedAt}`;
+    deduped.set(key, {
+      connector_id: connectorId,
+      timeseries_id: timeseriesId,
+      observed_at: observedAt,
+      value,
+      status,
+    });
+  }
+  return Array.from(deduped.values());
+}
+
+function buildReceiptRows(historyRows) {
+  const deduped = new Map();
+  for (const row of historyRows) {
+    const key = `${row.connector_id}|${row.timeseries_id}|${toObservedDay(row.observed_at)}`;
+    deduped.set(key, {
+      connector_id: row.connector_id,
+      timeseries_id: row.timeseries_id,
+      observed_day: toObservedDay(row.observed_at),
+    });
+  }
+  return Array.from(deduped.values());
+}
+
+async function enqueueHistoryOutboxRepairBucket(client, mismatch, chunkSize) {
+  const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_ENQUEUE_HOUR_BUCKET, {
+    p_connector_id: mismatch.connector_id,
+    p_hour_start: mismatch.hour_start,
+    p_chunk_size: chunkSize,
+  });
+
+  if (error) {
+    throw new Error(`repair enqueue RPC failed: ${error.message}`);
+  }
+
+  const firstRow = Array.isArray(data) ? data[0] : data;
+  return {
+    connector_id: mismatch.connector_id,
+    hour_start: mismatch.hour_start,
+    rows_selected: toIntField(firstRow?.rows_selected ?? 0, "rows_selected"),
+    outbox_entries_enqueued: toIntField(
+      firstRow?.outbox_entries_enqueued ?? 0,
+      "outbox_entries_enqueued",
+    ),
+  };
+}
+
+async function flushHistoryOutbox(mainClient, historyClient, claimBatchLimit, maxFlushBatches) {
+  const summary = {
+    batches_run: 0,
+    claimed_entries: 0,
+    delivered_rows: 0,
+    failed_entries: 0,
+    receipts_upserted: 0,
+    rows_resolved: 0,
+    drained: false,
+  };
+
+  for (let batch = 1; batch <= maxFlushBatches; batch += 1) {
+    const claimResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OUTBOX_CLAIM, {
+      batch_limit: claimBatchLimit,
+    });
+
+    if (claimResult.error) {
+      throw new Error(`outbox claim RPC failed: ${claimResult.error.message}`);
+    }
+
+    const entries = Array.isArray(claimResult.data) ? claimResult.data : [];
+    if (!entries.length) {
+      summary.drained = true;
+      break;
+    }
+    summary.batches_run = batch;
+    summary.claimed_entries += entries.length;
+
+    const historyRows = normalizeHistoryRows(
+      entries.flatMap((entry) => (Array.isArray(entry.payload) ? entry.payload : [])),
+    );
+
+    const resolutions = [];
+    if (!historyRows.length) {
+      for (const entry of entries) {
+        resolutions.push({ id: entry.id, ok: true });
+      }
+    } else {
+      try {
+        const upsertResult = await historyClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_UPSERT, {
+          rows: historyRows,
+        });
+        if (upsertResult.error) {
+          throw new Error(upsertResult.error.message);
+        }
+        const upsertRow = Array.isArray(upsertResult.data) ? upsertResult.data[0] : upsertResult.data;
+        summary.delivered_rows += toIntField(
+          upsertRow?.observations_upserted ?? historyRows.length,
+          "observations_upserted",
+        );
+
+        const receiptRows = buildReceiptRows(historyRows);
+        if (receiptRows.length) {
+          const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_RECEIPTS_UPSERT, {
+            rows: receiptRows,
+          });
+          if (receiptResult.error) {
+            throw new Error(`history receipts upsert failed: ${receiptResult.error.message}`);
+          }
+          const receiptRow = Array.isArray(receiptResult.data)
+            ? receiptResult.data[0]
+            : receiptResult.data;
+          summary.receipts_upserted += toIntField(
+            receiptRow?.rows_upserted ?? receiptRows.length,
+            "rows_upserted",
+          );
+        }
+
+        for (const entry of entries) {
+          resolutions.push({ id: entry.id, ok: true });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        summary.failed_entries += entries.length;
+        for (const entry of entries) {
+          resolutions.push({ id: entry.id, ok: false, error: message });
+        }
+      }
+    }
+
+    if (resolutions.length) {
+      const resolveResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OUTBOX_RESOLVE, {
+        resolutions,
+      });
+      if (resolveResult.error) {
+        throw new Error(`outbox resolve RPC failed: ${resolveResult.error.message}`);
+      }
+      const resolveRow = Array.isArray(resolveResult.data) ? resolveResult.data[0] : resolveResult.data;
+      summary.rows_resolved += toIntField(
+        resolveRow?.rows_resolved ?? resolutions.length,
+        "rows_resolved",
+      );
+    }
+  }
+
+  return {
+    ...summary,
+    max_flush_batches_reached: !summary.drained,
+  };
+}
+
+async function recheckSingleBucket(ingestClient, historyClient, mismatch) {
+  const bucketWindow = buildBucketWindow(mismatch.hour_start);
+  const [ingestRows, historyRows] = await Promise.all([
+    fetchHourlyFingerprints(ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck"),
+    fetchHourlyFingerprints(historyClient, bucketWindow.window_start, bucketWindow.window_end, "history_recheck"),
+  ]);
+
+  const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
+  const historyMap = new Map(historyRows.map((row) => [row.key, row]));
+  const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
+  const bucketMismatch = determineBucketMismatch(ingestMap.get(key), historyMap.get(key));
+
+  return {
+    connector_id: mismatch.connector_id,
+    hour_start: mismatch.hour_start,
+    verified: bucketMismatch === null,
+    mismatch: bucketMismatch,
+    ingest_bucket_found: ingestMap.has(key),
+    history_bucket_found: historyMap.has(key),
+  };
+}
+
 async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatchesPerHour) {
   let totalDeleted = 0n;
   let batchesRun = 0;
@@ -318,6 +608,28 @@ function buildRunConfig(url) {
     1,
     100,
   );
+  const repairOneMismatchBucket = parseBoolean(
+    params.get("repairOneMismatchBucket") ?? process.env.REPAIR_ONE_MISMATCH_BUCKET,
+    DEFAULT_REPAIR_ONE_MISMATCH_BUCKET,
+  );
+  const repairBucketOutboxChunkSize = parsePositiveInt(
+    params.get("repairChunkSize") ?? process.env.REPAIR_BUCKET_OUTBOX_CHUNK_SIZE,
+    DEFAULT_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE,
+    1,
+    10_000,
+  );
+  const flushClaimBatchLimit = parsePositiveInt(
+    params.get("flushClaimBatchLimit") ?? process.env.FLUSH_CLAIM_BATCH_LIMIT,
+    DEFAULT_FLUSH_CLAIM_BATCH_LIMIT,
+    1,
+    1_000,
+  );
+  const maxFlushBatches = parsePositiveInt(
+    params.get("maxFlushBatches") ?? process.env.MAX_FLUSH_BATCHES,
+    DEFAULT_MAX_FLUSH_BATCHES,
+    1,
+    1_000,
+  );
 
   return {
     supabaseUrl: requiredEnvAny(["SUPABASE_URL", "SB_URL"]),
@@ -328,6 +640,10 @@ function buildRunConfig(url) {
     maxHoursPerRun,
     deleteBatchSize,
     maxDeleteBatchesPerHour,
+    repairOneMismatchBucket,
+    repairBucketOutboxChunkSize,
+    flushClaimBatchLimit,
+    maxFlushBatches,
   };
 }
 
@@ -364,6 +680,10 @@ async function runPrune(config) {
     max_hours_per_run: config.maxHoursPerRun,
     delete_batch_size: config.deleteBatchSize,
     max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
+    repair_one_mismatch_bucket: config.repairOneMismatchBucket,
+    repair_bucket_outbox_chunk_size: config.repairBucketOutboxChunkSize,
+    flush_claim_batch_limit: config.flushClaimBatchLimit,
+    max_flush_batches: config.maxFlushBatches,
   });
 
   const [ingestBuckets, historyBuckets] = await Promise.all([
@@ -375,9 +695,21 @@ async function runPrune(config) {
     ingestBuckets,
     historyBuckets,
   );
+  const { candidate: repairCandidate, historyCountGreaterThanIngest } = pickRepairMismatchBucket(mismatches);
 
   for (const mismatch of mismatches) {
     logStructured("ERROR", "hour_bucket_mismatch", { run_id: runId, ...mismatch });
+  }
+  for (const mismatch of historyCountGreaterThanIngest) {
+    logStructured("ERROR", "hour_bucket_history_count_exceeds_ingest", {
+      run_id: runId,
+      connector_id: mismatch.connector_id,
+      hour_start: mismatch.hour_start,
+      reason: mismatch.reason,
+      ingest_count: mismatch.ingest_count,
+      history_count: mismatch.history_count,
+      alert_condition: true,
+    });
   }
   if (historyExtraBuckets.length > 0) {
     logStructured("INFO", "history_extra_buckets", {
@@ -398,10 +730,67 @@ async function runPrune(config) {
     deletable_bucket_count: deletableBuckets.length,
     total_deletable_rows: totalDeletableRows.toString(),
     mismatch_count: mismatches.length,
+    history_count_exceeds_ingest_count: historyCountGreaterThanIngest.length,
     history_extra_bucket_count: historyExtraBuckets.length,
   };
 
   if (config.dryRun) {
+    let repairPilot = null;
+    if (config.repairOneMismatchBucket) {
+      if (!repairCandidate) {
+        repairPilot = {
+          attempted: false,
+          reason: "no_repairable_mismatch_bucket_found",
+        };
+        logStructured("INFO", "repair_one_mismatch_bucket_skipped", {
+          run_id: runId,
+          ...repairPilot,
+        });
+      } else {
+        try {
+          const enqueueResult = await enqueueHistoryOutboxRepairBucket(
+            ingestClient,
+            repairCandidate,
+            config.repairBucketOutboxChunkSize,
+          );
+          const flushResult = await flushHistoryOutbox(
+            ingestClient,
+            historyClient,
+            config.flushClaimBatchLimit,
+            config.maxFlushBatches,
+          );
+          const recheck = await recheckSingleBucket(ingestClient, historyClient, repairCandidate);
+          repairPilot = {
+            attempted: true,
+            connector_id: repairCandidate.connector_id,
+            hour_start: repairCandidate.hour_start,
+            initial_reason: repairCandidate.reason,
+            flush_scope: "all_due_outbox_entries",
+            enqueue: enqueueResult,
+            flush: flushResult,
+            recheck,
+          };
+          logStructured("INFO", "repair_one_mismatch_bucket_result", {
+            run_id: runId,
+            ...repairPilot,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          repairPilot = {
+            attempted: true,
+            connector_id: repairCandidate.connector_id,
+            hour_start: repairCandidate.hour_start,
+            initial_reason: repairCandidate.reason,
+            error: message,
+          };
+          logStructured("ERROR", "repair_one_mismatch_bucket_error", {
+            run_id: runId,
+            ...repairPilot,
+          });
+        }
+      }
+    }
+
     for (const bucket of deletableBuckets) {
       logStructured("INFO", "hour_bucket_deletable_plan", {
         run_id: runId,
@@ -412,11 +801,15 @@ async function runPrune(config) {
     }
     logStructured("INFO", "ingestdb_prune_dry_run_summary", {
       ...summaryBase,
+      repair_one_mismatch_bucket_enabled: config.repairOneMismatchBucket,
+      repair_one_mismatch_bucket_result: repairPilot,
       mismatches_preview: sampleRows(mismatches),
       deletable_buckets_preview: sampleRows(deletableBuckets.map(toBucketOutput)),
     });
     return {
       ...summaryBase,
+      repair_one_mismatch_bucket_enabled: config.repairOneMismatchBucket,
+      repair_one_mismatch_bucket_result: repairPilot,
       deletable_buckets_preview: sampleRows(deletableBuckets.map(toBucketOutput)),
       mismatches_preview: sampleRows(mismatches),
     };

@@ -135,4 +135,106 @@ $$;
 revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int) from public;
 revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int) from anon, authenticated;
 grant execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int) to service_role;
+
+drop function if exists uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int);
+create or replace function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(
+  p_connector_id bigint,
+  p_hour_start timestamptz,
+  p_chunk_size int default 1000
+)
+returns table (
+  rows_selected int,
+  outbox_entries_enqueued int
+)
+language plpgsql
+security definer
+set search_path = uk_aq_core, uk_aq_raw, public, pg_catalog
+as $$
+declare
+  v_hour_start timestamptz;
+  v_hour_end timestamptz;
+  v_chunk_size int;
+  v_rows_selected int := 0;
+  v_outbox_entries_enqueued int := 0;
+begin
+  set local timezone = 'UTC';
+
+  if auth.role() <> 'service_role' then
+    raise exception 'service_role required';
+  end if;
+
+  if p_connector_id is null then
+    raise exception 'p_connector_id is required';
+  end if;
+
+  if p_hour_start is null then
+    raise exception 'p_hour_start is required';
+  end if;
+
+  v_hour_start := date_trunc('hour', p_hour_start);
+  v_hour_end := v_hour_start + interval '1 hour';
+  v_chunk_size := greatest(1, least(coalesce(p_chunk_size, 1000), 10000));
+
+  with source_rows as (
+    select
+      o.connector_id,
+      o.timeseries_id,
+      o.observed_at,
+      o.value,
+      o.status,
+      row_number() over (
+        order by o.timeseries_id, o.observed_at
+      ) as rn
+    from uk_aq_core.observations o
+    where o.connector_id = p_connector_id
+      and o.observed_at >= v_hour_start
+      and o.observed_at < v_hour_end
+  ),
+  chunked as (
+    select
+      ((sr.rn - 1) / v_chunk_size) as chunk_no,
+      jsonb_agg(
+        jsonb_build_object(
+          'connector_id', sr.connector_id,
+          'timeseries_id', sr.timeseries_id,
+          'observed_at', sr.observed_at,
+          'value', sr.value,
+          'status', sr.status
+        )
+        order by sr.timeseries_id, sr.observed_at
+      ) as payload,
+      count(*)::int as chunk_rows
+    from source_rows sr
+    group by ((sr.rn - 1) / v_chunk_size)
+  ),
+  inserted as (
+    insert into uk_aq_raw.history_observation_outbox (
+      payload,
+      next_attempt_at
+    )
+    select
+      c.payload,
+      now()
+    from chunked c
+    where c.payload is not null
+      and jsonb_array_length(c.payload) > 0
+    returning 1
+  )
+  select
+    coalesce((select sum(c.chunk_rows) from chunked c), 0),
+    coalesce((select count(*) from inserted), 0)
+  into
+    v_rows_selected,
+    v_outbox_entries_enqueued;
+
+  return query
+  select
+    coalesce(v_rows_selected, 0),
+    coalesce(v_outbox_entries_enqueued, 0);
+end;
+$$;
+
+revoke execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int) from public;
+revoke execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int) from anon, authenticated;
+grant execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int) to service_role;
 grant usage on schema uk_aq_public to service_role;

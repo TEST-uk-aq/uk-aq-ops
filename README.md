@@ -1,6 +1,9 @@
 # uk-aq-ops
 
-Cloud Run operations service for verifying and pruning old rows from ingest after content parity checks with history.
+Cloud Run operations services for:
+
+- verifying and pruning old rows from ingest after content parity checks with history
+- flushing the main DB history outbox into history DB
 
 ## What this service does
 
@@ -25,6 +28,10 @@ Optional environment variables:
 - `MAX_HOURS_PER_RUN` (default `48`)
 - `DELETE_BATCH_SIZE` (default `50000`)
 - `MAX_DELETE_BATCHES_PER_HOUR` (default `10`)
+- `REPAIR_ONE_MISMATCH_BUCKET` (default `true`; dry-run pilot: enqueue+flush one mismatch bucket)
+- `REPAIR_BUCKET_OUTBOX_CHUNK_SIZE` (default `1000`)
+- `FLUSH_CLAIM_BATCH_LIMIT` (default `20`)
+- `MAX_FLUSH_BATCHES` (default `30`)
 - `PORT` (default `8080`)
 
 Aliases are also supported for URLs: `SB_URL`, `HISTORY_URL`.
@@ -40,12 +47,28 @@ Query params for `POST /run`:
 - `maxHours=<int>`
 - `deleteBatchSize=<int>`
 - `maxDeleteBatchesPerHour=<int>`
+- `repairOneMismatchBucket=true|false`
+- `repairChunkSize=<int>`
+- `flushClaimBatchLimit=<int>`
+- `maxFlushBatches=<int>`
 
 ## Local run
 
 ```bash
 npm install
 npm run start
+```
+
+Run prune service explicitly:
+
+```bash
+npm run start:prune
+```
+
+Run history outbox flush service:
+
+```bash
+npm run start:flush
 ```
 
 Dry-run example:
@@ -63,7 +86,10 @@ Apply these scripts in Supabase SQL editor:
 
 ## Deployment and scheduler setup
 
-See `system_docs/setup/uk-aq-ingestdb-prune.md`.
+See:
+
+- `system_docs/setup/uk-aq-ingestdb-prune.md`
+- `system_docs/setup/uk-aq-history-outbox-flush-service.md`
 
 ## GitHub deploy workflow
 
@@ -75,3 +101,7 @@ It uses the same deploy auth pattern as ingest:
 - or fallback `GCP_SA_KEY` secret
 
 Default runtime service account is `uk-aq-ops-job@<GCP_PROJECT_ID>.iam.gserviceaccount.com` unless `GCP_OPS_PRUNE_RUNTIME_SERVICE_ACCOUNT` is set.
+
+History outbox flush service workflow:
+
+- `.github/workflows/uk_aq_history_outbox_flush_service_cloud_run_deploy.yml`
