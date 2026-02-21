@@ -7,6 +7,7 @@ const DAY_MS = 24 * HOUR_MS;
 
 const DEFAULT_DRY_RUN = true;
 const DEFAULT_MAX_HOURS_PER_RUN = 48;
+const DEFAULT_INGESTDB_RETENTION_DAYS = 7;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
 const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
 const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
@@ -137,7 +138,7 @@ function toObservedDay(observedAtIso) {
   return observedAtIso.slice(0, 10);
 }
 
-function buildWindow(maxHoursPerRun) {
+function buildWindow(maxHoursPerRun, retentionDays) {
   const now = new Date();
   const utcMidnightMs = Date.UTC(
     now.getUTCFullYear(),
@@ -148,7 +149,7 @@ function buildWindow(maxHoursPerRun) {
     0,
     0,
   );
-  const windowEndMs = utcMidnightMs - (7 * DAY_MS);
+  const windowEndMs = utcMidnightMs - (retentionDays * DAY_MS);
   const windowStartMs = windowEndMs - (maxHoursPerRun * HOUR_MS);
   return {
     window_start: new Date(windowStartMs).toISOString(),
@@ -655,6 +656,12 @@ function buildRunConfig(url) {
     1,
     24 * 31,
   );
+  const ingestDbRetentionDays = parsePositiveInt(
+    params.get("retentionDays") ?? process.env.INGESTDB_RETENTION_DAYS,
+    DEFAULT_INGESTDB_RETENTION_DAYS,
+    1,
+    3650,
+  );
   const deleteBatchSize = parsePositiveInt(
     params.get("deleteBatchSize") ?? process.env.DELETE_BATCH_SIZE,
     DEFAULT_DELETE_BATCH_SIZE,
@@ -697,6 +704,7 @@ function buildRunConfig(url) {
     historySecretKey: requiredEnvAny(["HISTORY_SECRET_KEY"]),
     dryRun,
     maxHoursPerRun,
+    ingestDbRetentionDays,
     deleteBatchSize,
     maxDeleteBatchesPerHour,
     repairOneMismatchBucket,
@@ -730,12 +738,16 @@ async function runPrune(config) {
     db: { schema: RPC_SCHEMA },
   });
 
-  const { window_start: windowStart, window_end: windowEnd } = buildWindow(config.maxHoursPerRun);
+  const { window_start: windowStart, window_end: windowEnd } = buildWindow(
+    config.maxHoursPerRun,
+    config.ingestDbRetentionDays,
+  );
   logStructured("INFO", "ingestdb_prune_run_start", {
     run_id: runId,
     mode: config.dryRun ? "dry-run" : "delete",
     window_start: windowStart,
     window_end: windowEnd,
+    ingestdb_retention_days: config.ingestDbRetentionDays,
     max_hours_per_run: config.maxHoursPerRun,
     delete_batch_size: config.deleteBatchSize,
     max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
@@ -782,6 +794,7 @@ async function runPrune(config) {
     mode: config.dryRun ? "dry-run" : "delete",
     window_start: windowStart,
     window_end: windowEnd,
+    ingestdb_retention_days: config.ingestDbRetentionDays,
     ingest_bucket_count: ingestBuckets.length,
     history_bucket_count: historyBuckets.length,
     deletable_bucket_count: deletableBuckets.length,
@@ -1156,6 +1169,7 @@ server.listen(port, () => {
   logStructured("INFO", "ingestdb_prune_service_started", {
     port,
     default_dry_run: DEFAULT_DRY_RUN,
+    default_ingestdb_retention_days: DEFAULT_INGESTDB_RETENTION_DAYS,
     default_max_hours_per_run: DEFAULT_MAX_HOURS_PER_RUN,
   });
 });

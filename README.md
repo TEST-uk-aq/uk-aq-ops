@@ -26,6 +26,7 @@ Required environment variables:
 Optional environment variables:
 
 - `DRY_RUN` (default `true`)
+- `INGESTDB_RETENTION_DAYS` (default `7`)
 - `MAX_HOURS_PER_RUN` (default `48`)
 - `DELETE_BATCH_SIZE` (default `50000`)
 - `MAX_DELETE_BATCHES_PER_HOUR` (default `10`)
@@ -45,6 +46,7 @@ Aliases are also supported for URLs: `SB_URL`, `HISTORY_URL`.
 Query params for `POST /run`:
 
 - `dryRun=true|false`
+- `retentionDays=<int>`
 - `maxHours=<int>`
 - `deleteBatchSize=<int>`
 - `maxDeleteBatchesPerHour=<int>`
