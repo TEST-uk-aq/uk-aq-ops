@@ -25,7 +25,7 @@ Required environment variables:
 
 Optional environment variables:
 
-- `DRY_RUN` (default `true`)
+- `INGESTDB_PRUNE_DRY_RUN` (default `true`)
 - `INGESTDB_RETENTION_DAYS` (default `7`)
 - `MAX_HOURS_PER_RUN` (default `48`)
 - `DELETE_BATCH_SIZE` (default `50000`)

@@ -649,7 +649,10 @@ async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatche
 function buildRunConfig(url) {
   const params = url.searchParams;
 
-  const dryRun = parseBoolean(params.get("dryRun") ?? process.env.DRY_RUN, DEFAULT_DRY_RUN);
+  const dryRun = parseBoolean(
+    params.get("dryRun") ?? process.env.INGESTDB_PRUNE_DRY_RUN,
+    DEFAULT_DRY_RUN,
+  );
   const maxHoursPerRun = parsePositiveInt(
     params.get("maxHours") ?? process.env.MAX_HOURS_PER_RUN,
     DEFAULT_MAX_HOURS_PER_RUN,

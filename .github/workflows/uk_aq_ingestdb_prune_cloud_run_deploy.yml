@@ -43,7 +43,7 @@ jobs:
       OPS_PRUNE_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_OPS_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       HISTORY_SUPABASE_URL: ${{ vars.HISTORY_SUPABASE_URL }}
-      DRY_RUN: ${{ vars.GCP_OPS_PRUNE_DRY_RUN || 'true' }}
+      INGESTDB_PRUNE_DRY_RUN: ${{ vars.GCP_OPS_INGESTDB_PRUNE_DRY_RUN || 'true' }}
       INGESTDB_RETENTION_DAYS: ${{ vars.INGESTDB_RETENTION_DAYS || '7' }}
       MAX_HOURS_PER_RUN: ${{ vars.GCP_OPS_PRUNE_MAX_HOURS_PER_RUN || '48' }}
       DELETE_BATCH_SIZE: ${{ vars.GCP_OPS_PRUNE_DELETE_BATCH_SIZE || '50000' }}
@@ -174,7 +174,7 @@ jobs:
           env_updates=()
           env_updates+=("SUPABASE_URL=${SUPABASE_URL}")
           env_updates+=("HISTORY_SUPABASE_URL=${HISTORY_SUPABASE_URL}")
-          env_updates+=("DRY_RUN=${DRY_RUN}")
+          env_updates+=("INGESTDB_PRUNE_DRY_RUN=${INGESTDB_PRUNE_DRY_RUN}")
           env_updates+=("INGESTDB_RETENTION_DAYS=${INGESTDB_RETENTION_DAYS}")
           env_updates+=("MAX_HOURS_PER_RUN=${MAX_HOURS_PER_RUN}")
           env_updates+=("DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}")
