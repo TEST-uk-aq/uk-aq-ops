@@ -103,7 +103,7 @@ It uses the same deploy auth pattern as ingest:
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` + `GCP_SERVICE_ACCOUNT` (recommended)
 - or fallback `GCP_SA_KEY` secret
 
-Default runtime service account is `uk-aq-ops-job@<GCP_PROJECT_ID>.iam.gserviceaccount.com` unless `GCP_OPS_PRUNE_RUNTIME_SERVICE_ACCOUNT` is set.
+Default runtime service account is `uk-aq-ops-job@<GCP_PROJECT_ID>.iam.gserviceaccount.com` unless `INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT` is set.
 
 History outbox flush service workflow:
 
