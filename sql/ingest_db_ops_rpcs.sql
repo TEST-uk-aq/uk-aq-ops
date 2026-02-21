@@ -42,8 +42,8 @@ begin
             '|',
             o.connector_id::text,
             o.timeseries_id::text,
-            o.observed_at::text,
-            coalesce(to_char(o.value, 'FM9999999990D999999999'), 'NULL'),
+            to_char(o.observed_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+            coalesce(to_char(o.value, 'FM9999999990.999999999'), 'NULL'),
             coalesce(o.status, 'NULL')
           ),
           'sha256'
@@ -198,7 +198,10 @@ begin
           'connector_id', sr.connector_id,
           'timeseries_id', sr.timeseries_id,
           'observed_at', sr.observed_at,
-          'value', sr.value,
+          'value', case
+            when sr.value is null then null
+            else sr.value::text
+          end,
           'status', sr.status
         )
         order by sr.timeseries_id, sr.observed_at

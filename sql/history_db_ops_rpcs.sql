@@ -42,8 +42,8 @@ begin
             '|',
             o.connector_id::text,
             o.timeseries_id::text,
-            o.observed_at::text,
-            coalesce(to_char(o.value, 'FM9999999990D999999999'), 'NULL'),
+            to_char(o.observed_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+            coalesce(to_char(o.value, 'FM9999999990.999999999'), 'NULL'),
             coalesce(o.status, 'NULL')
           ),
           'sha256'
