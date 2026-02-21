@@ -93,6 +93,18 @@ function toIntField(value, fieldName) {
   return Math.trunc(number);
 }
 
+function parseFloat8Hex(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const hex = String(value).trim().toLowerCase();
+  if (!/^[0-9a-f]{16}$/.test(hex)) {
+    return null;
+  }
+  const parsed = Buffer.from(hex, "hex").readDoubleBE(0);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function toObservedDay(observedAtIso) {
   return observedAtIso.slice(0, 10);
 }
@@ -103,7 +115,8 @@ function normalizeHistoryRows(inputRows) {
     const connectorId = toBigIntString(row.connector_id, "history_row.connector_id");
     const timeseriesId = toBigIntString(row.timeseries_id, "history_row.timeseries_id");
     const observedAt = toIso(row.observed_at, "history_row.observed_at");
-    const value = row.value === undefined ? null : row.value;
+    const valueFromHex = parseFloat8Hex(row.value_float8_hex);
+    const value = valueFromHex ?? (row.value === undefined ? null : row.value);
     const status = row.status === undefined ? null : row.status;
     const key = `${connectorId}|${timeseriesId}|${observedAt}`;
     deduped.set(key, {

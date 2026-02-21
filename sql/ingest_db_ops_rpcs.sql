@@ -200,7 +200,14 @@ begin
           'observed_at', sr.observed_at,
           'value', case
             when sr.value is null then null
-            else sr.value::text
+            else trim(trailing '.' from trim(trailing '0' from to_char(
+              sr.value,
+              'FM9999999999999990.99999999999999999'
+            )))
+          end,
+          'value_float8_hex', case
+            when sr.value is null then null
+            else encode(float8send(sr.value), 'hex')
           end,
           'status', sr.status
         )
