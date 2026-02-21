@@ -10,6 +10,7 @@ const DEFAULT_MAX_HOURS_PER_RUN = 48;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
 const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
 const PREVIEW_LIMIT = 25;
+const RPC_SCHEMA = "uk_aq_public";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_DELETE_HOUR_BUCKET = "uk_aq_rpc_observations_delete_hour_bucket";
@@ -171,7 +172,7 @@ function normalizeFingerprintRows(rows, sourceName) {
 }
 
 async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceName) {
-  const { data, error } = await client.rpc(RPC_HOURLY_FINGERPRINT, {
+  const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_HOURLY_FINGERPRINT, {
     window_start: windowStart,
     window_end: windowEnd,
   });
@@ -261,7 +262,7 @@ async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatche
 
   for (let batchNumber = 1; batchNumber <= maxDeleteBatchesPerHour; batchNumber += 1) {
     batchesRun = batchNumber;
-    const { data, error } = await client.rpc(RPC_DELETE_HOUR_BUCKET, {
+    const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_DELETE_HOUR_BUCKET, {
       p_connector_id: bucket.connector_id,
       p_hour_start: bucket.hour_start,
       p_delete_limit: deleteBatchSize,
@@ -347,9 +348,11 @@ async function runPrune(config) {
   const runId = randomUUID();
   const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
+    db: { schema: RPC_SCHEMA },
   });
   const historyClient = createClient(config.historySupabaseUrl, config.historySecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
+    db: { schema: RPC_SCHEMA },
   });
 
   const { window_start: windowStart, window_end: windowEnd } = buildWindow(config.maxHoursPerRun);
