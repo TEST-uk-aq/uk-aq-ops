@@ -11,6 +11,7 @@ Cloud Run operations services for:
 - Computes hourly fingerprints in both DBs via RPC only.
 - Compares buckets by `(connector_id, hour_start)`.
 - Deletes only buckets that fully match in count + fingerprint.
+- In standard mode, repairs mismatches by enqueueing to outbox, flushes in-process, rechecks mismatches, then deletes buckets that became verified.
 - Defaults to dry-run mode.
 
 ## Runtime environment

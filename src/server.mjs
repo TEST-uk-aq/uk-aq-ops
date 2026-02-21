@@ -333,12 +333,14 @@ function determineBucketMismatch(ingestBucket, historyBucket) {
   return null;
 }
 
-function pickRepairMismatchBucket(mismatches) {
+function classifyRepairMismatches(mismatches) {
+  const repairableMismatches = [];
   const historyCountGreaterThanIngest = [];
 
   for (const mismatch of mismatches) {
     if (mismatch.reason === "missing_in_history" || mismatch.reason === "fingerprint_mismatch") {
-      return { candidate: mismatch, historyCountGreaterThanIngest };
+      repairableMismatches.push(mismatch);
+      continue;
     }
 
     if (mismatch.reason !== "count_mismatch") {
@@ -351,10 +353,13 @@ function pickRepairMismatchBucket(mismatches) {
       historyCountGreaterThanIngest.push(mismatch);
       continue;
     }
-    return { candidate: mismatch, historyCountGreaterThanIngest };
+    repairableMismatches.push(mismatch);
   }
 
-  return { candidate: null, historyCountGreaterThanIngest };
+  return {
+    repairableMismatches,
+    historyCountGreaterThanIngest,
+  };
 }
 
 function toIntField(value, fieldName) {
@@ -544,6 +549,60 @@ async function recheckSingleBucket(ingestClient, historyClient, mismatch) {
   };
 }
 
+async function recheckMismatchBuckets(
+  ingestClient,
+  historyClient,
+  windowStart,
+  windowEnd,
+  initialMismatches,
+) {
+  const [ingestRows, historyRows] = await Promise.all([
+    fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest_recheck"),
+    fetchHourlyFingerprints(historyClient, windowStart, windowEnd, "history_recheck"),
+  ]);
+
+  const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
+  const historyMap = new Map(historyRows.map((row) => [row.key, row]));
+  const nowDeletableBuckets = [];
+  const stillMismatched = [];
+
+  for (const mismatch of initialMismatches) {
+    const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
+    const ingestBucket = ingestMap.get(key);
+    const historyBucket = historyMap.get(key);
+    const nextMismatch = determineBucketMismatch(ingestBucket, historyBucket);
+
+    if (nextMismatch) {
+      stillMismatched.push(nextMismatch);
+      continue;
+    }
+
+    if (!ingestBucket || !historyBucket) {
+      stillMismatched.push({
+        connector_id: mismatch.connector_id,
+        hour_start: mismatch.hour_start,
+        reason: "missing_in_both_or_unknown_after_repair",
+        ingest_count: ingestBucket ? ingestBucket.observation_count.toString() : null,
+        history_count: historyBucket ? historyBucket.observation_count.toString() : null,
+      });
+      continue;
+    }
+
+    nowDeletableBuckets.push({
+      connector_id: ingestBucket.connector_id,
+      hour_start: ingestBucket.hour_start,
+      observation_count: ingestBucket.observation_count,
+      min_observed_at: ingestBucket.min_observed_at,
+      max_observed_at: ingestBucket.max_observed_at,
+    });
+  }
+
+  return {
+    nowDeletableBuckets,
+    stillMismatched,
+  };
+}
+
 async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatchesPerHour) {
   let totalDeleted = 0n;
   let batchesRun = 0;
@@ -691,11 +750,9 @@ async function runPrune(config) {
     fetchHourlyFingerprints(historyClient, windowStart, windowEnd, "history"),
   ]);
 
-  const { deletableBuckets, mismatches, historyExtraBuckets } = compareBuckets(
-    ingestBuckets,
-    historyBuckets,
-  );
-  const { candidate: repairCandidate, historyCountGreaterThanIngest } = pickRepairMismatchBucket(mismatches);
+  const { deletableBuckets, mismatches, historyExtraBuckets } = compareBuckets(ingestBuckets, historyBuckets);
+  const { repairableMismatches, historyCountGreaterThanIngest } = classifyRepairMismatches(mismatches);
+  const repairCandidate = repairableMismatches[0] ?? null;
 
   for (const mismatch of mismatches) {
     logStructured("ERROR", "hour_bucket_mismatch", { run_id: runId, ...mismatch });
@@ -866,17 +923,199 @@ async function runPrune(config) {
     }
   }
 
+  const repairEnqueueResults = [];
+  const repairEnqueueErrors = [];
+  let repairFlushResult = null;
+
+  if (repairableMismatches.length > 0) {
+    for (const mismatch of repairableMismatches) {
+      try {
+        const enqueueResult = await enqueueHistoryOutboxRepairBucket(
+          ingestClient,
+          mismatch,
+          config.repairBucketOutboxChunkSize,
+        );
+        repairEnqueueResults.push(enqueueResult);
+        logStructured("INFO", "hour_bucket_repair_enqueue_result", {
+          run_id: runId,
+          connector_id: enqueueResult.connector_id,
+          hour_start: enqueueResult.hour_start,
+          rows_selected: enqueueResult.rows_selected,
+          outbox_entries_enqueued: enqueueResult.outbox_entries_enqueued,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const errorPayload = {
+          connector_id: mismatch.connector_id,
+          hour_start: mismatch.hour_start,
+          reason: mismatch.reason,
+          message,
+        };
+        repairEnqueueErrors.push(errorPayload);
+        logStructured("ERROR", "hour_bucket_repair_enqueue_error", {
+          run_id: runId,
+          ...errorPayload,
+        });
+      }
+    }
+
+    try {
+      repairFlushResult = await flushHistoryOutbox(
+        ingestClient,
+        historyClient,
+        config.flushClaimBatchLimit,
+        config.maxFlushBatches,
+      );
+      logStructured("INFO", "repair_outbox_flush_result", {
+        run_id: runId,
+        ...repairFlushResult,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      repairFlushResult = {
+        error: message,
+      };
+      logStructured("ERROR", "repair_outbox_flush_error", {
+        run_id: runId,
+        message,
+      });
+    }
+  }
+
+  let repairedNowDeletableBuckets = [];
+  let mismatchesAfterRepair = mismatches;
+  if (repairableMismatches.length > 0) {
+    const recheckResult = await recheckMismatchBuckets(
+      ingestClient,
+      historyClient,
+      windowStart,
+      windowEnd,
+      mismatches,
+    );
+    repairedNowDeletableBuckets = recheckResult.nowDeletableBuckets;
+    mismatchesAfterRepair = recheckResult.stillMismatched;
+  }
+
+  for (const mismatch of mismatchesAfterRepair) {
+    logStructured("ERROR", "hour_bucket_mismatch_after_repair", {
+      run_id: runId,
+      ...mismatch,
+    });
+  }
+  for (const bucket of repairedNowDeletableBuckets) {
+    logStructured("INFO", "hour_bucket_repaired_and_now_deletable", {
+      run_id: runId,
+      connector_id: bucket.connector_id,
+      hour_start: bucket.hour_start,
+      observation_count: bucket.observation_count.toString(),
+    });
+  }
+
+  const deletedAfterRepairBucketResults = [];
+  const deleteAfterRepairErrors = [];
+  const capAfterRepairWarnings = [];
+  let totalDeletedAfterRepairRows = 0n;
+
+  for (const bucket of repairedNowDeletableBuckets) {
+    try {
+      const result = await deleteHourBucket(
+        ingestClient,
+        bucket,
+        config.deleteBatchSize,
+        config.maxDeleteBatchesPerHour,
+      );
+      totalDeletedAfterRepairRows += result.deleted_rows;
+
+      const bucketResult = {
+        connector_id: result.connector_id,
+        hour_start: result.hour_start,
+        deleted_rows: result.deleted_rows.toString(),
+        batches_run: result.batches_run,
+        drained: result.drained,
+      };
+      deletedAfterRepairBucketResults.push(bucketResult);
+      logStructured("INFO", "hour_bucket_delete_after_repair_result", {
+        run_id: runId,
+        ...bucketResult,
+      });
+
+      if (result.max_batches_reached_with_remaining_rows) {
+        const warningPayload = {
+          connector_id: result.connector_id,
+          hour_start: result.hour_start,
+          deleted_rows: result.deleted_rows.toString(),
+          batches_run: result.batches_run,
+          max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
+          reason: "max_batches_reached_before_drain",
+          alert_condition: true,
+        };
+        capAfterRepairWarnings.push(warningPayload);
+        logStructured("WARNING", "hour_bucket_delete_after_repair_cap_reached", {
+          run_id: runId,
+          ...warningPayload,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errorPayload = {
+        connector_id: bucket.connector_id,
+        hour_start: bucket.hour_start,
+        reason: "delete_after_repair_error",
+        message,
+      };
+      deleteAfterRepairErrors.push(errorPayload);
+      logStructured("ERROR", "hour_bucket_delete_after_repair_error", {
+        run_id: runId,
+        ...errorPayload,
+      });
+    }
+  }
+
+  const finalMismatchCount = mismatchesAfterRepair.length;
+  const totalRowsSelectedForRepair = repairEnqueueResults.reduce(
+    (total, row) => total + BigInt(row.rows_selected),
+    0n,
+  );
+  const totalOutboxEntriesEnqueuedForRepair = repairEnqueueResults.reduce(
+    (total, row) => total + BigInt(row.outbox_entries_enqueued),
+    0n,
+  );
+
   const runSummary = {
     ...summaryBase,
+    repairable_mismatch_bucket_count: repairableMismatches.length,
+    repair_enqueue_success_count: repairEnqueueResults.length,
+    repair_enqueue_error_count: repairEnqueueErrors.length,
+    repair_rows_selected_total: totalRowsSelectedForRepair.toString(),
+    repair_outbox_entries_enqueued_total: totalOutboxEntriesEnqueuedForRepair.toString(),
+    repair_outbox_flush_result: repairFlushResult,
+    mismatch_after_repair_count: finalMismatchCount,
+    repaired_now_deletable_bucket_count: repairedNowDeletableBuckets.length,
     deleted_bucket_count: deletedBucketResults.length,
     total_deleted_rows: totalDeletedRows.toString(),
+    deleted_after_repair_bucket_count: deletedAfterRepairBucketResults.length,
+    total_deleted_after_repair_rows: totalDeletedAfterRepairRows.toString(),
     delete_error_count: deleteErrors.length,
     cap_warning_count: capWarnings.length,
-    alert_condition_count: mismatches.length + deleteErrors.length + capWarnings.length,
+    delete_after_repair_error_count: deleteAfterRepairErrors.length,
+    cap_after_repair_warning_count: capAfterRepairWarnings.length,
+    alert_condition_count:
+      finalMismatchCount +
+      deleteErrors.length +
+      capWarnings.length +
+      repairEnqueueErrors.length +
+      deleteAfterRepairErrors.length +
+      capAfterRepairWarnings.length,
     deleted_buckets_preview: sampleRows(deletedBucketResults),
-    mismatches_preview: sampleRows(mismatches),
+    deleted_after_repair_buckets_preview: sampleRows(deletedAfterRepairBucketResults),
+    mismatches_before_repair_preview: sampleRows(mismatches),
+    mismatches_after_repair_preview: sampleRows(mismatchesAfterRepair),
+    repair_enqueue_results_preview: sampleRows(repairEnqueueResults),
+    repair_enqueue_errors_preview: sampleRows(repairEnqueueErrors),
     delete_errors_preview: sampleRows(deleteErrors),
     cap_warnings_preview: sampleRows(capWarnings),
+    delete_after_repair_errors_preview: sampleRows(deleteAfterRepairErrors),
+    cap_after_repair_warnings_preview: sampleRows(capAfterRepairWarnings),
   };
   logStructured("INFO", "ingestdb_prune_delete_summary", runSummary);
   return runSummary;
