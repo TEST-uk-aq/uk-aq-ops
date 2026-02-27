@@ -14,6 +14,7 @@ const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
 const DEFAULT_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE = 1_000;
 const DEFAULT_FLUSH_CLAIM_BATCH_LIMIT = 20;
 const DEFAULT_MAX_FLUSH_BATCHES = 30;
+const DEFAULT_MAX_HOURS_PER_BATCH = 24;
 const PREVIEW_LIMIT = 25;
 const RPC_SCHEMA = "uk_aq_public";
 
@@ -157,12 +158,210 @@ function buildWindow(maxHoursPerRun, retentionDays) {
   };
 }
 
+function splitWindowIntoBatches(windowStartIso, windowEndIso, maxHoursPerBatch = DEFAULT_MAX_HOURS_PER_BATCH) {
+  const windowStartMs = Date.parse(windowStartIso);
+  const windowEndMs = Date.parse(windowEndIso);
+  if (Number.isNaN(windowStartMs) || Number.isNaN(windowEndMs)) {
+    throw new Error(`Invalid window for batching: ${windowStartIso} -> ${windowEndIso}`);
+  }
+  if (windowEndMs <= windowStartMs) {
+    throw new Error(`window_end must be greater than window_start: ${windowStartIso} -> ${windowEndIso}`);
+  }
+  const batchMs = maxHoursPerBatch * HOUR_MS;
+  const batches = [];
+  let cursorMs = windowStartMs;
+  while (cursorMs < windowEndMs) {
+    const batchEndMs = Math.min(cursorMs + batchMs, windowEndMs);
+    const batchHours = Math.max(1, Math.trunc((batchEndMs - cursorMs) / HOUR_MS));
+    batches.push({
+      batch_index: batches.length + 1,
+      window_start: new Date(cursorMs).toISOString(),
+      window_end: new Date(batchEndMs).toISOString(),
+      batch_hours: batchHours,
+    });
+    cursorMs = batchEndMs;
+  }
+  return batches;
+}
+
 function buildBucketKey(connectorId, hourStartIso) {
   return `${connectorId}|${hourStartIso}`;
 }
 
 function sampleRows(rows, limit = PREVIEW_LIMIT) {
   return rows.slice(0, limit);
+}
+
+function toSafeInt(value) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return Math.trunc(parsed);
+}
+
+function toSafeBigInt(value) {
+  if (value === null || value === undefined || value === "") {
+    return 0n;
+  }
+  try {
+    return BigInt(String(value));
+  } catch {
+    return 0n;
+  }
+}
+
+function sumIntField(rows, field) {
+  return rows.reduce((total, row) => total + toSafeInt(row?.[field]), 0);
+}
+
+function sumBigIntField(rows, field) {
+  return rows.reduce((total, row) => total + toSafeBigInt(row?.[field]), 0n);
+}
+
+function mergePreviewField(rows, field) {
+  const merged = [];
+  for (const row of rows) {
+    const previewRows = Array.isArray(row?.[field]) ? row[field] : [];
+    for (const preview of previewRows) {
+      merged.push(preview);
+      if (merged.length >= PREVIEW_LIMIT) {
+        return merged;
+      }
+    }
+  }
+  return merged;
+}
+
+function aggregateDryRunRepairPilot(batchSummaries) {
+  const pilots = batchSummaries
+    .map((summary) => summary?.repair_one_mismatch_bucket_result)
+    .filter((pilot) => pilot && typeof pilot === "object");
+  return {
+    batched: true,
+    batch_count: batchSummaries.length,
+    attempted_batches: pilots.filter((pilot) => pilot.attempted === true).length,
+    verified_batches: pilots.filter((pilot) => pilot?.recheck?.verified === true).length,
+    error_batches: pilots.filter((pilot) => typeof pilot.error === "string" && pilot.error.length > 0).length,
+    preview: sampleRows(pilots),
+  };
+}
+
+function aggregateRepairFlushResult(batchSummaries) {
+  const flushResults = batchSummaries
+    .map((summary) => summary?.repair_outbox_flush_result)
+    .filter((result) => result && typeof result === "object");
+
+  if (flushResults.length === 0) {
+    return null;
+  }
+
+  return {
+    batched: true,
+    batch_count: batchSummaries.length,
+    batches_with_flush: flushResults.length,
+    batches_with_flush_error: flushResults.filter((result) =>
+      typeof result.error === "string" && result.error.length > 0
+    ).length,
+    batches_run: sumIntField(flushResults, "batches_run"),
+    claimed_entries: sumIntField(flushResults, "claimed_entries"),
+    delivered_rows: sumIntField(flushResults, "delivered_rows"),
+    failed_entries: sumIntField(flushResults, "failed_entries"),
+    receipts_upserted: sumIntField(flushResults, "receipts_upserted"),
+    rows_resolved: sumIntField(flushResults, "rows_resolved"),
+    drained: flushResults.every((result) => result.drained === true),
+    max_flush_batches_reached: flushResults.some((result) => result.max_flush_batches_reached === true),
+  };
+}
+
+function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, parentRunId) {
+  const summaryBase = {
+    run_id: parentRunId,
+    mode: config.dryRun ? "dry-run" : "delete",
+    window_start: overallWindow.window_start,
+    window_end: overallWindow.window_end,
+    ingestdb_retention_days: config.ingestDbRetentionDays,
+    max_hours_per_run: config.maxHoursPerRun,
+    ingest_bucket_count: sumIntField(batchSummaries, "ingest_bucket_count"),
+    history_bucket_count: sumIntField(batchSummaries, "history_bucket_count"),
+    deletable_bucket_count: sumIntField(batchSummaries, "deletable_bucket_count"),
+    total_deletable_rows: sumBigIntField(batchSummaries, "total_deletable_rows").toString(),
+    mismatch_count: sumIntField(batchSummaries, "mismatch_count"),
+    history_count_exceeds_ingest_count: sumIntField(batchSummaries, "history_count_exceeds_ingest_count"),
+    history_extra_bucket_count: sumIntField(batchSummaries, "history_extra_bucket_count"),
+    batch_count: batches.length,
+    batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
+    batch_windows_preview: sampleRows(batches),
+    batch_run_ids_preview: sampleRows(batchSummaries.map((summary) => summary.run_id)),
+  };
+
+  if (config.dryRun) {
+    return {
+      ...summaryBase,
+      repair_one_mismatch_bucket_enabled: config.repairOneMismatchBucket,
+      repair_one_mismatch_bucket_result: aggregateDryRunRepairPilot(batchSummaries),
+      deletable_buckets_preview: mergePreviewField(batchSummaries, "deletable_buckets_preview"),
+      mismatches_preview: mergePreviewField(batchSummaries, "mismatches_preview"),
+    };
+  }
+
+  return {
+    ...summaryBase,
+    repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
+    repair_enqueue_success_count: sumIntField(batchSummaries, "repair_enqueue_success_count"),
+    repair_enqueue_error_count: sumIntField(batchSummaries, "repair_enqueue_error_count"),
+    repair_rows_selected_total: sumBigIntField(batchSummaries, "repair_rows_selected_total").toString(),
+    repair_outbox_entries_enqueued_total: sumBigIntField(
+      batchSummaries,
+      "repair_outbox_entries_enqueued_total",
+    ).toString(),
+    repair_outbox_flush_result: aggregateRepairFlushResult(batchSummaries),
+    mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
+    repaired_now_deletable_bucket_count: sumIntField(
+      batchSummaries,
+      "repaired_now_deletable_bucket_count",
+    ),
+    deleted_bucket_count: sumIntField(batchSummaries, "deleted_bucket_count"),
+    total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
+    deleted_after_repair_bucket_count: sumIntField(
+      batchSummaries,
+      "deleted_after_repair_bucket_count",
+    ),
+    total_deleted_after_repair_rows: sumBigIntField(
+      batchSummaries,
+      "total_deleted_after_repair_rows",
+    ).toString(),
+    delete_error_count: sumIntField(batchSummaries, "delete_error_count"),
+    cap_warning_count: sumIntField(batchSummaries, "cap_warning_count"),
+    delete_after_repair_error_count: sumIntField(batchSummaries, "delete_after_repair_error_count"),
+    cap_after_repair_warning_count: sumIntField(batchSummaries, "cap_after_repair_warning_count"),
+    alert_condition_count: sumIntField(batchSummaries, "alert_condition_count"),
+    deleted_buckets_preview: mergePreviewField(batchSummaries, "deleted_buckets_preview"),
+    deleted_after_repair_buckets_preview: mergePreviewField(
+      batchSummaries,
+      "deleted_after_repair_buckets_preview",
+    ),
+    mismatches_before_repair_preview: mergePreviewField(
+      batchSummaries,
+      "mismatches_before_repair_preview",
+    ),
+    mismatches_after_repair_preview: mergePreviewField(
+      batchSummaries,
+      "mismatches_after_repair_preview",
+    ),
+    repair_enqueue_results_preview: mergePreviewField(batchSummaries, "repair_enqueue_results_preview"),
+    repair_enqueue_errors_preview: mergePreviewField(batchSummaries, "repair_enqueue_errors_preview"),
+    delete_errors_preview: mergePreviewField(batchSummaries, "delete_errors_preview"),
+    cap_warnings_preview: mergePreviewField(batchSummaries, "cap_warnings_preview"),
+    delete_after_repair_errors_preview: mergePreviewField(
+      batchSummaries,
+      "delete_after_repair_errors_preview",
+    ),
+    cap_after_repair_warnings_preview: mergePreviewField(
+      batchSummaries,
+      "cap_after_repair_warnings_preview",
+    ),
+  };
 }
 
 function normalizeFingerprintRows(rows, sourceName) {
@@ -743,7 +942,7 @@ function toBucketOutput(bucket) {
   };
 }
 
-async function runPrune(config) {
+async function runPruneSingleWindow(config, window, runContext = {}) {
   const runId = randomUUID();
   const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -754,17 +953,20 @@ async function runPrune(config) {
     db: { schema: RPC_SCHEMA },
   });
 
-  const { window_start: windowStart, window_end: windowEnd } = buildWindow(
-    config.maxHoursPerRun,
-    config.ingestDbRetentionDays,
-  );
+  const windowStart = toIso(window.window_start, "window_start");
+  const windowEnd = toIso(window.window_end, "window_end");
+  const batchWindowHours = Math.max(1, Math.trunc((Date.parse(windowEnd) - Date.parse(windowStart)) / HOUR_MS));
   logStructured("INFO", "ingestdb_prune_run_start", {
     run_id: runId,
+    parent_run_id: runContext.parent_run_id ?? null,
+    batch_index: runContext.batch_index ?? 1,
+    batch_count: runContext.batch_count ?? 1,
+    batch_window_hours: batchWindowHours,
     mode: config.dryRun ? "dry-run" : "delete",
     window_start: windowStart,
     window_end: windowEnd,
     ingestdb_retention_days: config.ingestDbRetentionDays,
-    max_hours_per_run: config.maxHoursPerRun,
+    max_hours_per_run: batchWindowHours,
     delete_batch_size: config.deleteBatchSize,
     max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
     repair_one_mismatch_bucket: config.repairOneMismatchBucket,
@@ -805,8 +1007,17 @@ async function runPrune(config) {
   }
 
   const totalDeletableRows = deletableBuckets.reduce((total, row) => total + row.observation_count, 0n);
+  const batchSummaryMeta = runContext.batch_count && runContext.batch_count > 1
+    ? {
+      parent_run_id: runContext.parent_run_id ?? null,
+      batch_index: runContext.batch_index ?? 1,
+      batch_count: runContext.batch_count,
+      batch_window_hours: batchWindowHours,
+    }
+    : {};
   const summaryBase = {
     run_id: runId,
+    ...batchSummaryMeta,
     mode: config.dryRun ? "dry-run" : "delete",
     window_start: windowStart,
     window_end: windowEnd,
@@ -1148,6 +1359,59 @@ async function runPrune(config) {
   };
   logStructured("INFO", "ingestdb_prune_delete_summary", runSummary);
   return runSummary;
+}
+
+async function runPrune(config) {
+  const overallWindow = buildWindow(
+    config.maxHoursPerRun,
+    config.ingestDbRetentionDays,
+  );
+  const batches = splitWindowIntoBatches(
+    overallWindow.window_start,
+    overallWindow.window_end,
+    DEFAULT_MAX_HOURS_PER_BATCH,
+  );
+
+  if (batches.length <= 1) {
+    return runPruneSingleWindow(config, batches[0] ?? overallWindow);
+  }
+
+  const parentRunId = randomUUID();
+  logStructured("INFO", "ingestdb_prune_batch_plan", {
+    run_id: parentRunId,
+    mode: config.dryRun ? "dry-run" : "delete",
+    window_start: overallWindow.window_start,
+    window_end: overallWindow.window_end,
+    ingestdb_retention_days: config.ingestDbRetentionDays,
+    max_hours_per_run: config.maxHoursPerRun,
+    batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
+    batch_count: batches.length,
+    batches_preview: sampleRows(batches),
+  });
+
+  const batchSummaries = [];
+  for (const batch of batches) {
+    const summary = await runPruneSingleWindow(config, batch, {
+      parent_run_id: parentRunId,
+      batch_index: batch.batch_index,
+      batch_count: batches.length,
+    });
+    batchSummaries.push(summary);
+  }
+
+  const aggregateSummary = aggregateBatchSummary(
+    config,
+    overallWindow,
+    batches,
+    batchSummaries,
+    parentRunId,
+  );
+  logStructured(
+    "INFO",
+    config.dryRun ? "ingestdb_prune_dry_run_batched_summary" : "ingestdb_prune_delete_batched_summary",
+    aggregateSummary,
+  );
+  return aggregateSummary;
 }
 
 const server = createServer(async (req, res) => {
