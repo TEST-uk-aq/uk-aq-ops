@@ -54,6 +54,12 @@ jobs:
       MAX_FLUSH_BATCHES: ${{ vars.INGESTDB_PRUNE_MAX_FLUSH_BATCHES || '30' }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
+      DROPBOX_APP_KEY_SECRET_NAME: ${{ vars.DROPBOX_APP_KEY_SECRET_NAME || '' }}
+      DROPBOX_APP_SECRET_SECRET_NAME: ${{ vars.DROPBOX_APP_SECRET_SECRET_NAME || '' }}
+      DROPBOX_REFRESH_TOKEN_SECRET_NAME: ${{ vars.DROPBOX_REFRESH_TOKEN_SECRET_NAME || '' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AIR_ERROR_DROPBOX_FOLDER: ${{ vars.UK_AIR_ERROR_DROPBOX_FOLDER || '/error_log' }}
+      UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -151,6 +157,14 @@ jobs:
           set -euo pipefail
           gcloud secrets describe "${SB_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           gcloud secrets describe "${HISTORY_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
+          for optional_secret in \
+            "${DROPBOX_APP_KEY_SECRET_NAME:-}" \
+            "${DROPBOX_APP_SECRET_SECRET_NAME:-}" \
+            "${DROPBOX_REFRESH_TOKEN_SECRET_NAME:-}"; do
+            if [ -n "${optional_secret}" ]; then
+              gcloud secrets describe "${optional_secret}" --project "${PROJECT_ID}" >/dev/null
+            fi
+          done
 
       - name: Configure Docker auth for Artifact Registry
         run: |
@@ -183,6 +197,15 @@ jobs:
           env_updates+=("REPAIR_BUCKET_OUTBOX_CHUNK_SIZE=${REPAIR_BUCKET_OUTBOX_CHUNK_SIZE}")
           env_updates+=("FLUSH_CLAIM_BATCH_LIMIT=${FLUSH_CLAIM_BATCH_LIMIT}")
           env_updates+=("MAX_FLUSH_BATCHES=${MAX_FLUSH_BATCHES}")
+          if [ -n "${UK_AQ_DROPBOX_ROOT:-}" ]; then
+            env_updates+=("UK_AQ_DROPBOX_ROOT=${UK_AQ_DROPBOX_ROOT}")
+          fi
+          if [ -n "${UK_AIR_ERROR_DROPBOX_FOLDER:-}" ]; then
+            env_updates+=("UK_AIR_ERROR_DROPBOX_FOLDER=${UK_AIR_ERROR_DROPBOX_FOLDER}")
+          fi
+          if [ -n "${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL:-}" ]; then
+            env_updates+=("UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL=${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL}")
+          fi
 
           env_file="${RUNNER_TEMP}/uk-aq-ingestdb-prune-env.yaml"
           : > "${env_file}"
@@ -193,7 +216,19 @@ jobs:
               "${env_file}" "${key}" "${value}"
           done
 
-          secret_csv="SB_SECRET_KEY=${SB_SECRET_KEY_SECRET_NAME}:latest,HISTORY_SECRET_KEY=${HISTORY_SECRET_KEY_SECRET_NAME}:latest"
+          secret_updates=()
+          secret_updates+=("SB_SECRET_KEY=${SB_SECRET_KEY_SECRET_NAME}:latest")
+          secret_updates+=("HISTORY_SECRET_KEY=${HISTORY_SECRET_KEY_SECRET_NAME}:latest")
+          if [ -n "${DROPBOX_APP_KEY_SECRET_NAME:-}" ]; then
+            secret_updates+=("DROPBOX_APP_KEY=${DROPBOX_APP_KEY_SECRET_NAME}:latest")
+          fi
+          if [ -n "${DROPBOX_APP_SECRET_SECRET_NAME:-}" ]; then
+            secret_updates+=("DROPBOX_APP_SECRET=${DROPBOX_APP_SECRET_SECRET_NAME}:latest")
+          fi
+          if [ -n "${DROPBOX_REFRESH_TOKEN_SECRET_NAME:-}" ]; then
+            secret_updates+=("DROPBOX_REFRESH_TOKEN=${DROPBOX_REFRESH_TOKEN_SECRET_NAME}:latest")
+          fi
+          secret_csv="$(IFS=,; echo "${secret_updates[*]}")"
 
           echo "env_file=${env_file}" >> "${GITHUB_OUTPUT}"
           echo "secret_csv=${secret_csv}" >> "${GITHUB_OUTPUT}"

@@ -34,9 +34,22 @@ Optional environment variables:
 - `REPAIR_BUCKET_OUTBOX_CHUNK_SIZE` (default `1000`)
 - `FLUSH_CLAIM_BATCH_LIMIT` (default `20`)
 - `MAX_FLUSH_BATCHES` (default `30`)
+- `UK_AQ_DROPBOX_ROOT` (optional Dropbox root prefix)
+- `UK_AIR_ERROR_DROPBOX_FOLDER` (optional, default `/error_log`)
+- `UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL` (optional allowlist gate for Dropbox error uploads)
 - `PORT` (default `8080`)
 
 Aliases are also supported for URLs: `SB_URL`, `HISTORY_URL`.
+
+Optional Secret Manager mappings for Dropbox error uploads:
+
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
+- `DROPBOX_REFRESH_TOKEN`
+
+When configured, fatal prune run errors (`500`) are written to Dropbox:
+
+- `<UK_AQ_DROPBOX_ROOT>/error_log/YYYY-MM-DD/uk_aq_error_cloud_run_ingestdb_prune_<timestamp>_<uuid>.json`
 
 ## Endpoints
 

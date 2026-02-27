@@ -25,6 +25,8 @@ const RPC_OUTBOX_CLAIM = "uk_aq_rpc_history_outbox_claim";
 const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_history_outbox_resolve";
 const RPC_HISTORY_UPSERT = "uk_aq_rpc_history_observations_upsert";
 const RPC_HISTORY_RECEIPTS_UPSERT = "uk_aq_rpc_history_sync_receipt_daily_upsert";
+const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
+const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
 function nowIso() {
   return new Date().toISOString();
@@ -76,6 +78,133 @@ function parsePositiveInt(raw, fallback, min = 1, max = 1_000_000) {
     return max;
   }
   return intValue;
+}
+
+function normalizeDropboxPath(raw) {
+  const value = (raw || "").trim();
+  if (!value) {
+    return "";
+  }
+  const withSlash = value.startsWith("/") ? value : `/${value}`;
+  return withSlash.replace(/\/+$/, "");
+}
+
+function dropboxWithRoot(path) {
+  const root = normalizeDropboxPath(process.env.UK_AQ_DROPBOX_ROOT || "");
+  const cleaned = normalizeDropboxPath(path);
+  if (!root) {
+    return cleaned;
+  }
+  if (!cleaned) {
+    return root;
+  }
+  if (cleaned === root || cleaned.startsWith(`${root}/`)) {
+    return cleaned;
+  }
+  return `${root}${cleaned}`;
+}
+
+function errorDropboxFolderPath() {
+  const configured = (process.env.UK_AIR_ERROR_DROPBOX_FOLDER || "/error_log").trim();
+  let folder = dropboxWithRoot(configured);
+  if (!folder) {
+    return "/error_log";
+  }
+  if (folder.endsWith("/error_log")) {
+    return folder;
+  }
+  return `${folder}/error_log`;
+}
+
+function formatCompactUtc(ts) {
+  return ts.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+function buildDropboxErrorFileName(createdAt, errorId) {
+  return `uk_aq_error_cloud_run_ingestdb_prune_${formatCompactUtc(createdAt)}_${errorId}.json`;
+}
+
+async function readResponseText(response, limit = 1000) {
+  const raw = await response.text();
+  return raw.length <= limit ? raw : raw.slice(0, limit);
+}
+
+function shouldUploadErrorDropbox() {
+  const allowedUrl = (process.env.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || "").trim();
+  if (!allowedUrl) {
+    return true;
+  }
+  const supabaseUrl = (process.env.SUPABASE_URL || process.env.SB_URL || "").trim();
+  return supabaseUrl === allowedUrl;
+}
+
+async function dropboxRefreshAccessToken() {
+  const appKey = (process.env.DROPBOX_APP_KEY || "").trim();
+  const appSecret = (process.env.DROPBOX_APP_SECRET || "").trim();
+  const refreshToken = (process.env.DROPBOX_REFRESH_TOKEN || "").trim();
+
+  if (!(appKey && appSecret && refreshToken)) {
+    return null;
+  }
+
+  const tokenBody = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: appKey,
+    client_secret: appSecret,
+  });
+  const tokenResp = await fetch(DROPBOX_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: tokenBody.toString(),
+  });
+  if (!tokenResp.ok) {
+    const text = await readResponseText(tokenResp);
+    throw new Error(`Dropbox token request failed (${tokenResp.status}): ${text}`);
+  }
+  const tokenJson = await tokenResp.json();
+  const accessToken = String(tokenJson?.access_token || "");
+  if (!accessToken) {
+    throw new Error("Dropbox token response missing access_token.");
+  }
+  return accessToken;
+}
+
+async function uploadErrorPayloadToDropbox(payload, createdAt, errorId) {
+  if (!shouldUploadErrorDropbox()) {
+    return { uploaded: false, reason: "allowlist_mismatch" };
+  }
+
+  const accessToken = await dropboxRefreshAccessToken();
+  if (!accessToken) {
+    return { uploaded: false, reason: "missing_credentials" };
+  }
+
+  const dateFolder = createdAt.slice(0, 10);
+  const folder = errorDropboxFolderPath();
+  const fileName = buildDropboxErrorFileName(createdAt, errorId);
+  const dropboxPath = `${folder}/${dateFolder}/${fileName}`;
+  const uploadResp = await fetch(DROPBOX_UPLOAD_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Dropbox-API-Arg": JSON.stringify({
+        path: dropboxPath,
+        mode: "add",
+        autorename: true,
+        mute: false,
+      }),
+      "Content-Type": "application/octet-stream",
+    },
+    body: JSON.stringify(payload, null, 2),
+  });
+
+  if (!uploadResp.ok) {
+    const text = await readResponseText(uploadResp);
+    throw new Error(`Dropbox upload failed (${uploadResp.status}): ${text}`);
+  }
+
+  return { uploaded: true, dropbox_path: dropboxPath };
 }
 
 function requiredEnvAny(names) {
@@ -1415,8 +1544,12 @@ async function runPrune(config) {
 }
 
 const server = createServer(async (req, res) => {
+  let requestPath = "/";
+  let requestQuery = "";
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    requestPath = url.pathname;
+    requestQuery = url.search || "";
 
     if (url.pathname === "/healthz") {
       jsonResponse(res, 200, { ok: true, now: nowIso() });
@@ -1436,10 +1569,52 @@ const server = createServer(async (req, res) => {
     jsonResponse(res, 200, summary);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    logStructured("ERROR", "ingestdb_prune_run_error", { message });
+    const stack = error instanceof Error ? error.stack || null : null;
+    const errorId = randomUUID();
+    const createdAt = nowIso();
+    const errorPayload = {
+      id: errorId,
+      created_at: createdAt,
+      source: "cloud_run_ingestdb_prune",
+      severity: "error",
+      message,
+      stack,
+      context: {
+        request_method: req.method || "",
+        request_path: requestPath,
+        request_query: requestQuery,
+        host: req.headers.host || "",
+        user_agent: req.headers["user-agent"] || "",
+      },
+    };
+
+    let dropboxResult = { uploaded: false, reason: "not_attempted" };
+    try {
+      dropboxResult = await uploadErrorPayloadToDropbox(errorPayload, createdAt, errorId);
+    } catch (uploadError) {
+      const uploadMessage = uploadError instanceof Error ? uploadError.message : String(uploadError);
+      dropboxResult = { uploaded: false, reason: "upload_failed", upload_error: uploadMessage };
+      logStructured("ERROR", "ingestdb_prune_error_dropbox_upload_failed", {
+        error_id: errorId,
+        message: uploadMessage,
+      });
+    }
+
+    logStructured("ERROR", "ingestdb_prune_run_error", {
+      error_id: errorId,
+      message,
+      request_method: req.method || "",
+      request_path: requestPath,
+      dropbox_uploaded: Boolean(dropboxResult.uploaded),
+      dropbox_path: dropboxResult.dropbox_path || null,
+      dropbox_reason: dropboxResult.reason || null,
+    });
     jsonResponse(res, 500, {
       error: "ingestdb_prune_run_error",
       message,
+      error_id: errorId,
+      dropbox_uploaded: Boolean(dropboxResult.uploaded),
+      dropbox_path: dropboxResult.dropbox_path || null,
     });
   }
 });
