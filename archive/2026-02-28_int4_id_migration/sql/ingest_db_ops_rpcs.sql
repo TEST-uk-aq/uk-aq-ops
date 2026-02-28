@@ -7,7 +7,7 @@ create or replace function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprin
   window_end timestamptz
 )
 returns table (
-  connector_id integer,
+  connector_id bigint,
   hour_start timestamptz,
   observation_count bigint,
   fingerprint text,
@@ -77,9 +77,9 @@ revoke execute on function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprin
 revoke execute on function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprint(timestamptz, timestamptz) from anon, authenticated;
 grant execute on function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprint(timestamptz, timestamptz) to service_role;
 
-drop function if exists uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(integer, timestamptz, int);
+drop function if exists uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int);
 create or replace function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(
-  p_connector_id integer,
+  p_connector_id bigint,
   p_hour_start timestamptz,
   p_delete_limit int default 50000
 )
@@ -132,13 +132,13 @@ begin
 end;
 $$;
 
-revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(integer, timestamptz, int) from public;
-revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(integer, timestamptz, int) from anon, authenticated;
-grant execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(integer, timestamptz, int) to service_role;
+revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int) from public;
+revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int) from anon, authenticated;
+grant execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int) to service_role;
 
-drop function if exists uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(integer, timestamptz, int);
+drop function if exists uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int);
 create or replace function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(
-  p_connector_id integer,
+  p_connector_id bigint,
   p_hour_start timestamptz,
   p_chunk_size int default 1000
 )
@@ -244,7 +244,7 @@ begin
 end;
 $$;
 
-revoke execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(integer, timestamptz, int) from public;
-revoke execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(integer, timestamptz, int) from anon, authenticated;
-grant execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(integer, timestamptz, int) to service_role;
+revoke execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int) from public;
+revoke execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int) from anon, authenticated;
+grant execute on function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int) to service_role;
 grant usage on schema uk_aq_public to service_role;

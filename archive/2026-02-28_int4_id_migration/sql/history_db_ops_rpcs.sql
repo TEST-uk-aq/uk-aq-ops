@@ -7,7 +7,7 @@ create or replace function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprin
   window_end timestamptz
 )
 returns table (
-  connector_id integer,
+  connector_id bigint,
   hour_start timestamptz,
   observation_count bigint,
   fingerprint text,
