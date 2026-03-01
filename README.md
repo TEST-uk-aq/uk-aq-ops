@@ -57,8 +57,8 @@ See setup guide:
 
 What it does:
 - Runs via `POST /run`.
-- Ensures UTC-day partitions exist through `today + 7 days`.
-- Enforces hot/cold index policy (hot = today + previous 2 UTC days).
+- Ensures UTC-day partitions exist through `today + 3 days`.
+- Enforces hot/cold index policy (hot = previous 2 UTC days + today + next 3 UTC days).
 - Logs diagnostics for `uk_aq_history.observations_default`.
 - Computes retention cutoff using Europe/London local-day semantics (`31 complete local days + today`) and drops only eligible UTC-day partitions.
 - Applies backup gate before each partition drop:
@@ -71,7 +71,7 @@ Required environment variables:
 - `HISTORY_SECRET_KEY`
 
 Optional partition controls:
-- `HISTORY_PARTITIONS_FUTURE_DAYS` (default `7`)
+- `HISTORY_PARTITIONS_FUTURE_DAYS` (policy-fixed to `3`)
 - `HISTORY_PARTITIONS_HOT_DAYS` (default `3`)
 - `HISTORY_COMPLETE_LOCAL_DAYS` (default `31`)
 - `HISTORY_DEFAULT_TOP_N` (default `20`)

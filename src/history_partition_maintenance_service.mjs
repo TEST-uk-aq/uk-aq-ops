@@ -15,7 +15,7 @@ const RPC_DROP_PARTITION = "uk_aq_rpc_history_drop_partition";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
-const DEFAULT_FUTURE_PARTITION_DAYS = 7;
+const DEFAULT_FUTURE_PARTITION_DAYS = 3;
 const DEFAULT_HOT_PARTITION_DAYS = 3;
 const DEFAULT_COMPLETE_LOCAL_DAYS = 31;
 const DEFAULT_DEFAULT_TOP_N = 20;
@@ -342,8 +342,8 @@ function buildHistoryConfig(url) {
   const futurePartitionDays = parsePositiveInt(
     params.get("futureDays") ?? process.env.HISTORY_PARTITIONS_FUTURE_DAYS,
     DEFAULT_FUTURE_PARTITION_DAYS,
-    1,
-    60,
+    DEFAULT_FUTURE_PARTITION_DAYS,
+    DEFAULT_FUTURE_PARTITION_DAYS,
   );
   const hotPartitionDays = parsePositiveInt(
     params.get("hotDays") ?? process.env.HISTORY_PARTITIONS_HOT_DAYS,
@@ -695,9 +695,9 @@ async function runHistoryPartitionMaintenance(config) {
     0,
     0,
   )));
-  const hotEndDayUtc = todayUtc;
-  const hotStartDayUtc = shiftIsoDate(todayUtc, -(config.hotPartitionDays - 1));
   const futureEndDayUtc = shiftIsoDate(todayUtc, config.futurePartitionDays);
+  const hotEndDayUtc = futureEndDayUtc;
+  const hotStartDayUtc = shiftIsoDate(todayUtc, -(config.hotPartitionDays - 1));
 
   const retentionCutoffUtc = computeRetentionCutoffUtc(now, config.completeLocalDays);
   const retentionCutoffIso = retentionCutoffUtc.toISOString();

@@ -92,8 +92,6 @@ security definer
 set search_path = uk_aq_history, public, pg_catalog
 as $$
 declare
-  v_today_utc date := (now() at time zone 'UTC')::date;
-  v_hot_future_end_day_utc date := ((now() at time zone 'UTC')::date + 3);
   v_day date;
   v_partition_name text;
   v_partition_exists boolean;
@@ -131,16 +129,14 @@ begin
     select to_regclass(format('uk_aq_history.%I', v_partition_name)) is not null
     into v_partition_exists;
 
-    if not v_partition_exists then
-      execute format(
-        'create table uk_aq_history.%I '
-        'partition of uk_aq_history.observations '
-        'for values from (%L) to (%L)',
-        v_partition_name,
-        format('%s 00:00:00+00', v_day),
-        format('%s 00:00:00+00', v_day + 1)
-      );
-    end if;
+    execute format(
+      'create table if not exists uk_aq_history.%I '
+      'partition of uk_aq_history.observations '
+      'for values from (%L) to (%L)',
+      v_partition_name,
+      format('%s 00:00:00+00', v_day),
+      format('%s 00:00:00+00', v_day + 1)
+    );
 
     select exists (
       select 1
@@ -156,14 +152,6 @@ begin
       v_partition_name || '_observed_at_brin_idx',
       v_partition_name
     );
-
-    if v_day between v_today_utc and v_hot_future_end_day_utc then
-      execute format(
-        'create unique index if not exists %I on uk_aq_history.%I (connector_id, timeseries_id, observed_at)',
-        v_partition_name || '_hot_key_uidx',
-        v_partition_name
-      );
-    end if;
 
     day_utc := v_day;
     partition_name := v_partition_name;

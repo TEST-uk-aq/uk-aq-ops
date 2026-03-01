@@ -1,23 +1,23 @@
-name: Deploy History Partition Maintenance Cloud Run Service
+name: Deploy IngestDB Prune Cloud Run Service
 
 on:
   push:
     branches:
       - main
     paths:
-      - "src/history_partition_maintenance_service.mjs"
+      - "src/server.mjs"
       - "Dockerfile"
       - "package.json"
       - "package-lock.json"
-      - ".github/workflows/uk_aq_history_partition_maintenance_cloud_run_deploy.yml"
+      - ".github/workflows/uk_aq_ingestdb_prune_cloud_run_deploy.yml"
   workflow_dispatch:
 
 concurrency:
-  group: uk-aq-history-partition-maintenance-service-deploy
+  group: uk-aq-ingestdb-prune-deploy
   cancel-in-progress: false
 
 jobs:
-  deploy-history-partition-maintenance-service:
+  deploy-ingestdb-prune-service:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,40 +26,40 @@ jobs:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
       REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
-      SERVICE_NAME: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_NAME || vars.HISTORY_PARTITION_MAINTENANCE_SERVICE_NAME || 'uk-aq-history-partition-maintenance-service' }}
-      RESOURCE_LABEL: uk-aq-history-partition-maintenance-service
-      HISTORY_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.HISTORY_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT || '' }}
-      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || vars.HISTORY_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || '900' }}
-      SERVICE_CPU: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_CPU || vars.HISTORY_PARTITION_MAINTENANCE_SERVICE_CPU || '1' }}
-      SERVICE_MEMORY: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_MEMORY || vars.HISTORY_PARTITION_MAINTENANCE_SERVICE_MEMORY || '256Mi' }}
-      SERVICE_CONCURRENCY: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_CONCURRENCY || vars.HISTORY_PARTITION_MAINTENANCE_SERVICE_CONCURRENCY || '1' }}
-      SERVICE_MAX_INSTANCES: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_MAX_INSTANCES || vars.HISTORY_PARTITION_MAINTENANCE_SERVICE_MAX_INSTANCES || '1' }}
-      SERVICE_MIN_INSTANCES: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SERVICE_MIN_INSTANCES || vars.HISTORY_PARTITION_MAINTENANCE_SERVICE_MIN_INSTANCES || '0' }}
-      SCHEDULER_ENABLED: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SCHEDULER_ENABLED || vars.HISTORY_PARTITION_MAINTENANCE_SCHEDULER_ENABLED || 'true' }}
-      SCHEDULER_JOB_NAME: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SCHEDULER_JOB_NAME || vars.HISTORY_PARTITION_MAINTENANCE_SCHEDULER_JOB_NAME || 'uk-aq-history-partition-maintenance-daily' }}
-      SCHEDULER_CRON: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SCHEDULER_CRON || vars.HISTORY_PARTITION_MAINTENANCE_SCHEDULER_CRON || '0 3 * * *' }}
-      SCHEDULER_TIMEZONE: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SCHEDULER_TIMEZONE || vars.HISTORY_PARTITION_MAINTENANCE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
-      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.HISTORY_PARTITION_MAINTENANCE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
-      HISTORY_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_HISTORY_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT || vars.HISTORY_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT || '' }}
+      SERVICE_NAME: ${{ vars.INGESTDB_PRUNE_SERVICE_NAME || 'uk-aq-ingestdb-prune-service' }}
+      RESOURCE_LABEL: uk-aq-ingestdb-prune-service
+      INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT || '' }}
+      SERVICE_TIMEOUT_SECONDS: ${{ vars.INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || '900' }}
+      SERVICE_CPU: ${{ vars.INGESTDB_PRUNE_SERVICE_CPU || '1' }}
+      SERVICE_MEMORY: ${{ vars.INGESTDB_PRUNE_SERVICE_MEMORY || '256Mi' }}
+      SERVICE_CONCURRENCY: ${{ vars.INGESTDB_PRUNE_SERVICE_CONCURRENCY || '1' }}
+      SERVICE_MAX_INSTANCES: ${{ vars.INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || '1' }}
+      SERVICE_MIN_INSTANCES: ${{ vars.INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || '0' }}
+      SCHEDULER_ENABLED: ${{ vars.INGESTDB_PRUNE_SCHEDULER_ENABLED || 'true' }}
+      SCHEDULER_JOB_NAME: ${{ vars.INGESTDB_PRUNE_SCHEDULER_JOB_NAME || 'uk-aq-ingestdb-prune-daily' }}
+      SCHEDULER_CRON: ${{ vars.INGESTDB_PRUNE_SCHEDULER_CRON || '0 2 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.INGESTDB_PRUNE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       HISTORY_SUPABASE_URL: ${{ vars.HISTORY_SUPABASE_URL }}
-      HISTORY_PARTITIONS_FUTURE_DAYS: ${{ vars.HISTORY_PARTITIONS_FUTURE_DAYS || '3' }}
-      HISTORY_PARTITIONS_HOT_DAYS: ${{ vars.HISTORY_PARTITIONS_HOT_DAYS || '3' }}
-      HISTORY_COMPLETE_LOCAL_DAYS: ${{ vars.HISTORY_COMPLETE_LOCAL_DAYS || '31' }}
-      HISTORY_DEFAULT_TOP_N: ${{ vars.HISTORY_DEFAULT_TOP_N || '20' }}
-      HISTORY_PARTITION_DROP_DRY_RUN: ${{ vars.HISTORY_PARTITION_DROP_DRY_RUN || 'false' }}
-      HISTORY_R2_ENDPOINT: ${{ vars.HISTORY_R2_ENDPOINT || '' }}
-      HISTORY_R2_BUCKET: ${{ vars.HISTORY_R2_BUCKET || '' }}
-      HISTORY_R2_REGION: ${{ vars.HISTORY_R2_REGION || 'auto' }}
-      HISTORY_R2_OBSERVATIONS_PREFIX: ${{ vars.HISTORY_R2_OBSERVATIONS_PREFIX || 'uk_aq_history/observations' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
-      UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER: ${{ vars.UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER || '/history_partition_maintenance' }}
-      UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
+      INGESTDB_PRUNE_DRY_RUN: ${{ vars.INGESTDB_PRUNE_DRY_RUN || 'true' }}
+      INGESTDB_RETENTION_DAYS: ${{ vars.INGESTDB_RETENTION_DAYS || '7' }}
+      MAX_HOURS_PER_RUN: ${{ vars.INGESTDB_PRUNE_MAX_HOURS_PER_RUN || '48' }}
+      DELETE_BATCH_SIZE: ${{ vars.INGESTDB_PRUNE_DELETE_BATCH_SIZE || '50000' }}
+      MAX_DELETE_BATCHES_PER_HOUR: ${{ vars.INGESTDB_PRUNE_MAX_DELETE_BATCHES_PER_HOUR || '10' }}
+      REPAIR_ONE_MISMATCH_BUCKET: ${{ vars.INGESTDB_PRUNE_REPAIR_ONE_MISMATCH_BUCKET || 'true' }}
+      REPAIR_BUCKET_OUTBOX_CHUNK_SIZE: ${{ vars.INGESTDB_PRUNE_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE || '1000' }}
+      FLUSH_CLAIM_BATCH_LIMIT: ${{ vars.INGESTDB_PRUNE_FLUSH_CLAIM_BATCH_LIMIT || '20' }}
+      MAX_FLUSH_BATCHES: ${{ vars.INGESTDB_PRUNE_MAX_FLUSH_BATCHES || '30' }}
+      SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
-      HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME || '' }}
-      HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME || '' }}
       DROPBOX_APP_KEY_SECRET_NAME: ${{ vars.DROPBOX_APP_KEY_SECRET_NAME || '' }}
       DROPBOX_APP_SECRET_SECRET_NAME: ${{ vars.DROPBOX_APP_SECRET_SECRET_NAME || '' }}
       DROPBOX_REFRESH_TOKEN_SECRET_NAME: ${{ vars.DROPBOX_REFRESH_TOKEN_SECRET_NAME || '' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AIR_ERROR_DROPBOX_FOLDER: ${{ vars.UK_AIR_ERROR_DROPBOX_FOLDER || '/error_log' }}
+      UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -75,6 +75,10 @@ jobs:
             echo "Missing required repo variable: GCP_PROJECT_ID"
             exit 1
           fi
+          if [ -z "${SUPABASE_URL:-}" ]; then
+            echo "Missing required repo variable: SUPABASE_URL"
+            exit 1
+          fi
           if [ -z "${HISTORY_SUPABASE_URL:-}" ]; then
             echo "Missing required repo variable: HISTORY_SUPABASE_URL"
             exit 1
@@ -85,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          runtime_sa="${HISTORY_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT:-}"
+          runtime_sa="${INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT:-}"
           if [ -z "${runtime_sa}" ]; then
             runtime_sa="uk-aq-ops-job@${PROJECT_ID}.iam.gserviceaccount.com"
           fi
@@ -94,7 +98,7 @@ jobs:
             exit 1
           fi
 
-          scheduler_sa="${HISTORY_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
+          scheduler_sa="${INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
           if [[ "${scheduler_sa}" == *"-compute@developer.gserviceaccount.com" ]]; then
             echo "Invalid scheduler service account: default compute service account is not allowed."
             exit 1
@@ -121,19 +125,19 @@ jobs:
 
       - name: Authenticate to Google Cloud (WIF)
         if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != '' }}
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to Google Cloud (Service Account Key fallback)
         if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || env.GCP_SERVICE_ACCOUNT == '' }}
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ env.GCP_SA_KEY }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure gcloud project
         run: |
@@ -151,10 +155,9 @@ jobs:
       - name: Verify Secret Manager secrets exist
         run: |
           set -euo pipefail
+          gcloud secrets describe "${SB_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           gcloud secrets describe "${HISTORY_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           for optional_secret in \
-            "${HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME:-}" \
-            "${HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" \
             "${DROPBOX_APP_KEY_SECRET_NAME:-}" \
             "${DROPBOX_APP_SECRET_SECRET_NAME:-}" \
             "${DROPBOX_REFRESH_TOKEN_SECRET_NAME:-}"; do
@@ -172,7 +175,7 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-history-partition-maintenance-service:${GITHUB_SHA::12}"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-ingestdb-prune:${GITHUB_SHA::12}"
           echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
           docker build -t "${IMAGE}" .
           docker push "${IMAGE}"
@@ -183,35 +186,28 @@ jobs:
           set -euo pipefail
 
           env_updates=()
+          env_updates+=("SUPABASE_URL=${SUPABASE_URL}")
           env_updates+=("HISTORY_SUPABASE_URL=${HISTORY_SUPABASE_URL}")
-          env_updates+=("HISTORY_PARTITIONS_FUTURE_DAYS=${HISTORY_PARTITIONS_FUTURE_DAYS}")
-          env_updates+=("HISTORY_PARTITIONS_HOT_DAYS=${HISTORY_PARTITIONS_HOT_DAYS}")
-          env_updates+=("HISTORY_COMPLETE_LOCAL_DAYS=${HISTORY_COMPLETE_LOCAL_DAYS}")
-          env_updates+=("HISTORY_DEFAULT_TOP_N=${HISTORY_DEFAULT_TOP_N}")
-          env_updates+=("HISTORY_PARTITION_DROP_DRY_RUN=${HISTORY_PARTITION_DROP_DRY_RUN}")
-          if [ -n "${HISTORY_R2_ENDPOINT:-}" ]; then
-            env_updates+=("HISTORY_R2_ENDPOINT=${HISTORY_R2_ENDPOINT}")
-          fi
-          if [ -n "${HISTORY_R2_BUCKET:-}" ]; then
-            env_updates+=("HISTORY_R2_BUCKET=${HISTORY_R2_BUCKET}")
-          fi
-          if [ -n "${HISTORY_R2_REGION:-}" ]; then
-            env_updates+=("HISTORY_R2_REGION=${HISTORY_R2_REGION}")
-          fi
-          if [ -n "${HISTORY_R2_OBSERVATIONS_PREFIX:-}" ]; then
-            env_updates+=("HISTORY_R2_OBSERVATIONS_PREFIX=${HISTORY_R2_OBSERVATIONS_PREFIX}")
-          fi
+          env_updates+=("INGESTDB_PRUNE_DRY_RUN=${INGESTDB_PRUNE_DRY_RUN}")
+          env_updates+=("INGESTDB_RETENTION_DAYS=${INGESTDB_RETENTION_DAYS}")
+          env_updates+=("MAX_HOURS_PER_RUN=${MAX_HOURS_PER_RUN}")
+          env_updates+=("DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}")
+          env_updates+=("MAX_DELETE_BATCHES_PER_HOUR=${MAX_DELETE_BATCHES_PER_HOUR}")
+          env_updates+=("REPAIR_ONE_MISMATCH_BUCKET=${REPAIR_ONE_MISMATCH_BUCKET}")
+          env_updates+=("REPAIR_BUCKET_OUTBOX_CHUNK_SIZE=${REPAIR_BUCKET_OUTBOX_CHUNK_SIZE}")
+          env_updates+=("FLUSH_CLAIM_BATCH_LIMIT=${FLUSH_CLAIM_BATCH_LIMIT}")
+          env_updates+=("MAX_FLUSH_BATCHES=${MAX_FLUSH_BATCHES}")
           if [ -n "${UK_AQ_DROPBOX_ROOT:-}" ]; then
             env_updates+=("UK_AQ_DROPBOX_ROOT=${UK_AQ_DROPBOX_ROOT}")
           fi
-          if [ -n "${UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER:-}" ]; then
-            env_updates+=("UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER=${UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER}")
+          if [ -n "${UK_AIR_ERROR_DROPBOX_FOLDER:-}" ]; then
+            env_updates+=("UK_AIR_ERROR_DROPBOX_FOLDER=${UK_AIR_ERROR_DROPBOX_FOLDER}")
           fi
           if [ -n "${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL:-}" ]; then
             env_updates+=("UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL=${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL}")
           fi
 
-          env_file="${RUNNER_TEMP}/uk-aq-history-partition-maintenance-env.yaml"
+          env_file="${RUNNER_TEMP}/uk-aq-ingestdb-prune-env.yaml"
           : > "${env_file}"
           for kv in "${env_updates[@]}"; do
             key="${kv%%=*}"
@@ -221,13 +217,8 @@ jobs:
           done
 
           secret_updates=()
+          secret_updates+=("SB_SECRET_KEY=${SB_SECRET_KEY_SECRET_NAME}:latest")
           secret_updates+=("HISTORY_SECRET_KEY=${HISTORY_SECRET_KEY_SECRET_NAME}:latest")
-          if [ -n "${HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
-            secret_updates+=("HISTORY_R2_ACCESS_KEY_ID=${HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
-          fi
-          if [ -n "${HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" ]; then
-            secret_updates+=("HISTORY_R2_SECRET_ACCESS_KEY=${HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME}:latest")
-          fi
           if [ -n "${DROPBOX_APP_KEY_SECRET_NAME:-}" ]; then
             secret_updates+=("DROPBOX_APP_KEY=${DROPBOX_APP_KEY_SECRET_NAME}:latest")
           fi
@@ -248,8 +239,6 @@ jobs:
           gcloud run deploy "${SERVICE_NAME}" \
             --region "${REGION}" \
             --image "${{ steps.build.outputs.image }}" \
-            --command "node" \
-            --args "src/history_partition_maintenance_service.mjs" \
             --service-account "${{ steps.service_accounts.outputs.runtime_sa }}" \
             --timeout "${SERVICE_TIMEOUT_SECONDS}" \
             --cpu "${SERVICE_CPU}" \

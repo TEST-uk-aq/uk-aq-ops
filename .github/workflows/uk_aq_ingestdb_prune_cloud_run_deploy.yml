@@ -26,21 +26,21 @@ jobs:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
       REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
-      SERVICE_NAME: ${{ vars.INGESTDB_PRUNE_SERVICE_NAME || 'uk-aq-ingestdb-prune-service' }}
+      SERVICE_NAME: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_NAME || vars.INGESTDB_PRUNE_SERVICE_NAME || 'uk-aq-ingestdb-prune-service' }}
       RESOURCE_LABEL: uk-aq-ingestdb-prune-service
-      INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT || '' }}
-      SERVICE_TIMEOUT_SECONDS: ${{ vars.INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || '900' }}
-      SERVICE_CPU: ${{ vars.INGESTDB_PRUNE_SERVICE_CPU || '1' }}
-      SERVICE_MEMORY: ${{ vars.INGESTDB_PRUNE_SERVICE_MEMORY || '256Mi' }}
-      SERVICE_CONCURRENCY: ${{ vars.INGESTDB_PRUNE_SERVICE_CONCURRENCY || '1' }}
-      SERVICE_MAX_INSTANCES: ${{ vars.INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || '1' }}
-      SERVICE_MIN_INSTANCES: ${{ vars.INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || '0' }}
-      SCHEDULER_ENABLED: ${{ vars.INGESTDB_PRUNE_SCHEDULER_ENABLED || 'true' }}
-      SCHEDULER_JOB_NAME: ${{ vars.INGESTDB_PRUNE_SCHEDULER_JOB_NAME || 'uk-aq-ingestdb-prune-daily' }}
-      SCHEDULER_CRON: ${{ vars.INGESTDB_PRUNE_SCHEDULER_CRON || '0 2 * * *' }}
-      SCHEDULER_TIMEZONE: ${{ vars.INGESTDB_PRUNE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
-      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
-      INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
+      INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT || '' }}
+      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || vars.INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || '900' }}
+      SERVICE_CPU: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_CPU || vars.INGESTDB_PRUNE_SERVICE_CPU || '1' }}
+      SERVICE_MEMORY: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_MEMORY || vars.INGESTDB_PRUNE_SERVICE_MEMORY || '256Mi' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_CONCURRENCY || vars.INGESTDB_PRUNE_SERVICE_CONCURRENCY || '1' }}
+      SERVICE_MAX_INSTANCES: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || '1' }}
+      SERVICE_MIN_INSTANCES: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || '0' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_ENABLED || vars.INGESTDB_PRUNE_SCHEDULER_ENABLED || 'true' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_JOB_NAME || vars.INGESTDB_PRUNE_SCHEDULER_JOB_NAME || 'uk-aq-ingestdb-prune-daily' }}
+      SCHEDULER_CRON: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_CRON || vars.INGESTDB_PRUNE_SCHEDULER_CRON || '0 2 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_TIMEZONE || vars.INGESTDB_PRUNE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       HISTORY_SUPABASE_URL: ${{ vars.HISTORY_SUPABASE_URL }}
       INGESTDB_PRUNE_DRY_RUN: ${{ vars.INGESTDB_PRUNE_DRY_RUN || 'true' }}
@@ -125,19 +125,19 @@ jobs:
 
       - name: Authenticate to Google Cloud (WIF)
         if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != '' }}
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
         with:
           workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to Google Cloud (Service Account Key fallback)
         if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || env.GCP_SERVICE_ACCOUNT == '' }}
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
         with:
           credentials_json: ${{ env.GCP_SA_KEY }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
 
       - name: Configure gcloud project
         run: |
