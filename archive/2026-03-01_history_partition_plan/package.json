@@ -10,8 +10,7 @@
     "start": "node src/server.mjs",
     "start:prune": "node src/server.mjs",
     "start:flush": "node src/history_outbox_flush_service.mjs",
-    "start:history-partitions": "node src/history_partition_maintenance_service.mjs",
-    "check": "node --check src/server.mjs && node --check src/history_outbox_flush_service.mjs && node --check src/history_partition_maintenance_service.mjs"
+    "check": "node --check src/server.mjs && node --check src/history_outbox_flush_service.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0"
