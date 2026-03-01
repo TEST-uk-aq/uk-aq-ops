@@ -77,6 +77,7 @@ revoke execute on function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprin
 revoke execute on function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprint(timestamptz, timestamptz) from anon, authenticated;
 grant execute on function uk_aq_public.uk_aq_rpc_observations_hourly_fingerprint(timestamptz, timestamptz) to service_role;
 
+drop function if exists uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(bigint, timestamptz, int);
 drop function if exists uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(integer, timestamptz, int);
 create or replace function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(
   p_connector_id integer,
@@ -136,6 +137,7 @@ revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucke
 revoke execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(integer, timestamptz, int) from anon, authenticated;
 grant execute on function uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket(integer, timestamptz, int) to service_role;
 
+drop function if exists uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(bigint, timestamptz, int);
 drop function if exists uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(integer, timestamptz, int);
 create or replace function uk_aq_public.uk_aq_rpc_history_outbox_enqueue_hour_bucket(
   p_connector_id integer,

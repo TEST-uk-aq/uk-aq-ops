@@ -746,8 +746,9 @@ function buildReceiptRows(historyRows) {
 }
 
 async function enqueueHistoryOutboxRepairBucket(client, mismatch, chunkSize) {
+  const connectorId = toIntField(mismatch.connector_id, "mismatch.connector_id");
   const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_ENQUEUE_HOUR_BUCKET, {
-    p_connector_id: mismatch.connector_id,
+    p_connector_id: connectorId,
     p_hour_start: mismatch.hour_start,
     p_chunk_size: chunkSize,
   });
@@ -946,6 +947,7 @@ async function recheckMismatchBuckets(
 }
 
 async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatchesPerHour) {
+  const connectorId = toIntField(bucket.connector_id, "bucket.connector_id");
   let totalDeleted = 0n;
   let batchesRun = 0;
   let drained = false;
@@ -954,7 +956,7 @@ async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatche
   for (let batchNumber = 1; batchNumber <= maxDeleteBatchesPerHour; batchNumber += 1) {
     batchesRun = batchNumber;
     const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_DELETE_HOUR_BUCKET, {
-      p_connector_id: bucket.connector_id,
+      p_connector_id: connectorId,
       p_hour_start: bucket.hour_start,
       p_delete_limit: deleteBatchSize,
     });
