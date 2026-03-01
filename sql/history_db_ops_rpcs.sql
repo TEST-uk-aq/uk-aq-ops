@@ -44,13 +44,15 @@ begin
             o.timeseries_id::text,
             to_char(o.observed_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
             coalesce(to_char(o.value, 'FM9999999990.999999999'), 'NULL'),
-            coalesce(o.status, 'NULL')
+            coalesce(sc.code, 'NULL')
           ),
           'sha256'
         ),
         'hex'
       ) as row_hash_hex
     from uk_aq_history.observations o
+    left join uk_aq_history.status_codes sc
+      on sc.status_id = o.status_id
     where o.observed_at >= window_start
       and o.observed_at < window_end
   )
