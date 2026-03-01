@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "src/history_partition_maintenance_service.mjs"
+      - "workers/uk_aq_history_partition_maintenance_service/server.mjs"
       - "Dockerfile"
       - "package.json"
       - "package-lock.json"
@@ -47,16 +47,16 @@ jobs:
       HISTORY_COMPLETE_LOCAL_DAYS: ${{ vars.HISTORY_COMPLETE_LOCAL_DAYS || '31' }}
       HISTORY_DEFAULT_TOP_N: ${{ vars.HISTORY_DEFAULT_TOP_N || '20' }}
       HISTORY_PARTITION_DROP_DRY_RUN: ${{ vars.HISTORY_PARTITION_DROP_DRY_RUN || 'false' }}
-      HISTORY_R2_ENDPOINT: ${{ vars.HISTORY_R2_ENDPOINT || '' }}
-      HISTORY_R2_BUCKET: ${{ vars.HISTORY_R2_BUCKET || '' }}
-      HISTORY_R2_REGION: ${{ vars.HISTORY_R2_REGION || 'auto' }}
-      HISTORY_R2_OBSERVATIONS_PREFIX: ${{ vars.HISTORY_R2_OBSERVATIONS_PREFIX || 'uk_aq_history/observations' }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_OBSERVATIONS_PREFIX: ${{ vars.CFLARE_R2_OBSERVATIONS_PREFIX || 'uk_aq_history/observations' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
       UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER: ${{ vars.UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER || '/history_partition_maintenance' }}
       UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
       HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
-      HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME || '' }}
-      HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME || '' }}
+      CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME || '' }}
+      CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME || '' }}
       DROPBOX_APP_KEY_SECRET_NAME: ${{ vars.DROPBOX_APP_KEY_SECRET_NAME || '' }}
       DROPBOX_APP_SECRET_SECRET_NAME: ${{ vars.DROPBOX_APP_SECRET_SECRET_NAME || '' }}
       DROPBOX_REFRESH_TOKEN_SECRET_NAME: ${{ vars.DROPBOX_REFRESH_TOKEN_SECRET_NAME || '' }}
@@ -153,8 +153,8 @@ jobs:
           set -euo pipefail
           gcloud secrets describe "${HISTORY_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           for optional_secret in \
-            "${HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME:-}" \
-            "${HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" \
+            "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" \
+            "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" \
             "${DROPBOX_APP_KEY_SECRET_NAME:-}" \
             "${DROPBOX_APP_SECRET_SECRET_NAME:-}" \
             "${DROPBOX_REFRESH_TOKEN_SECRET_NAME:-}"; do
@@ -189,17 +189,17 @@ jobs:
           env_updates+=("HISTORY_COMPLETE_LOCAL_DAYS=${HISTORY_COMPLETE_LOCAL_DAYS}")
           env_updates+=("HISTORY_DEFAULT_TOP_N=${HISTORY_DEFAULT_TOP_N}")
           env_updates+=("HISTORY_PARTITION_DROP_DRY_RUN=${HISTORY_PARTITION_DROP_DRY_RUN}")
-          if [ -n "${HISTORY_R2_ENDPOINT:-}" ]; then
-            env_updates+=("HISTORY_R2_ENDPOINT=${HISTORY_R2_ENDPOINT}")
+          if [ -n "${CFLARE_R2_ENDPOINT:-}" ]; then
+            env_updates+=("CFLARE_R2_ENDPOINT=${CFLARE_R2_ENDPOINT}")
           fi
-          if [ -n "${HISTORY_R2_BUCKET:-}" ]; then
-            env_updates+=("HISTORY_R2_BUCKET=${HISTORY_R2_BUCKET}")
+          if [ -n "${CFLARE_R2_BUCKET:-}" ]; then
+            env_updates+=("CFLARE_R2_BUCKET=${CFLARE_R2_BUCKET}")
           fi
-          if [ -n "${HISTORY_R2_REGION:-}" ]; then
-            env_updates+=("HISTORY_R2_REGION=${HISTORY_R2_REGION}")
+          if [ -n "${CFLARE_R2_REGION:-}" ]; then
+            env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
           fi
-          if [ -n "${HISTORY_R2_OBSERVATIONS_PREFIX:-}" ]; then
-            env_updates+=("HISTORY_R2_OBSERVATIONS_PREFIX=${HISTORY_R2_OBSERVATIONS_PREFIX}")
+          if [ -n "${CFLARE_R2_OBSERVATIONS_PREFIX:-}" ]; then
+            env_updates+=("CFLARE_R2_OBSERVATIONS_PREFIX=${CFLARE_R2_OBSERVATIONS_PREFIX}")
           fi
           if [ -n "${UK_AQ_DROPBOX_ROOT:-}" ]; then
             env_updates+=("UK_AQ_DROPBOX_ROOT=${UK_AQ_DROPBOX_ROOT}")
@@ -222,11 +222,11 @@ jobs:
 
           secret_updates=()
           secret_updates+=("HISTORY_SECRET_KEY=${HISTORY_SECRET_KEY_SECRET_NAME}:latest")
-          if [ -n "${HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
-            secret_updates+=("HISTORY_R2_ACCESS_KEY_ID=${HISTORY_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
+          if [ -n "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
+            secret_updates+=("CFLARE_R2_ACCESS_KEY_ID=${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
           fi
-          if [ -n "${HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" ]; then
-            secret_updates+=("HISTORY_R2_SECRET_ACCESS_KEY=${HISTORY_R2_SECRET_ACCESS_KEY_SECRET_NAME}:latest")
+          if [ -n "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" ]; then
+            secret_updates+=("CFLARE_R2_SECRET_ACCESS_KEY=${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}:latest")
           fi
           if [ -n "${DROPBOX_APP_KEY_SECRET_NAME:-}" ]; then
             secret_updates+=("DROPBOX_APP_KEY=${DROPBOX_APP_KEY_SECRET_NAME}:latest")
@@ -249,7 +249,7 @@ jobs:
             --region "${REGION}" \
             --image "${{ steps.build.outputs.image }}" \
             --command "node" \
-            --args "src/history_partition_maintenance_service.mjs" \
+            --args "workers/uk_aq_history_partition_maintenance_service/server.mjs" \
             --service-account "${{ steps.service_accounts.outputs.runtime_sa }}" \
             --timeout "${SERVICE_TIMEOUT_SECONDS}" \
             --cpu "${SERVICE_CPU}" \

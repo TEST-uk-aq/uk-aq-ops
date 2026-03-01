@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "src/history_outbox_flush_service.mjs"
+      - "workers/uk_aq_history_outbox_flush_service/server.mjs"
       - "Dockerfile"
       - "package.json"
       - "package-lock.json"
@@ -191,7 +191,7 @@ jobs:
             --region "${REGION}" \
             --image "${{ steps.build.outputs.image }}" \
             --command "node" \
-            --args "src/history_outbox_flush_service.mjs" \
+            --args "workers/uk_aq_history_outbox_flush_service/server.mjs" \
             --service-account "${{ steps.service_accounts.outputs.runtime_sa }}" \
             --timeout "${SERVICE_TIMEOUT_SECONDS}" \
             --cpu "${SERVICE_CPU}" \
@@ -261,3 +261,10 @@ jobs:
               --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
             echo "Created Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
           fi
+
+      - name: Show deployed service
+        run: |
+          set -euo pipefail
+          gcloud run services describe "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --format="yaml(metadata.name,metadata.labels,spec.template.spec.serviceAccountName,spec.template.spec.containerConcurrency,spec.template.spec.containers[0].image,spec.template.spec.containers[0].resources,status.url)"

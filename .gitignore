@@ -1,3 +1,6 @@
 node_modules/
 .DS_Store
 logs/
+.env.supabase
+.env
+workers/GCP-vars/astute-lyceum-484111-k5-7c737a34a644.json

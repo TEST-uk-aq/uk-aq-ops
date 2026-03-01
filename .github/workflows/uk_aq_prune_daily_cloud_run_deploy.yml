@@ -1,23 +1,23 @@
-name: Deploy IngestDB Prune Cloud Run Service
+name: Deploy UK AQ Prune Daily Cloud Run Service
 
 on:
   push:
     branches:
       - main
     paths:
-      - "src/server.mjs"
+      - "workers/uk_aq_prune_daily/server.mjs"
       - "Dockerfile"
       - "package.json"
       - "package-lock.json"
-      - ".github/workflows/uk_aq_ingestdb_prune_cloud_run_deploy.yml"
+      - ".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml"
   workflow_dispatch:
 
 concurrency:
-  group: uk-aq-ingestdb-prune-deploy
+  group: uk-aq-prune-daily-deploy
   cancel-in-progress: false
 
 jobs:
-  deploy-ingestdb-prune-service:
+  deploy-uk-aq-prune-daily-service:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,21 +26,21 @@ jobs:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
       REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
-      SERVICE_NAME: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_NAME || vars.INGESTDB_PRUNE_SERVICE_NAME || 'uk-aq-ingestdb-prune-service' }}
-      RESOURCE_LABEL: uk-aq-ingestdb-prune-service
-      INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT || '' }}
-      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || vars.INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || '900' }}
-      SERVICE_CPU: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_CPU || vars.INGESTDB_PRUNE_SERVICE_CPU || '1' }}
-      SERVICE_MEMORY: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_MEMORY || vars.INGESTDB_PRUNE_SERVICE_MEMORY || '256Mi' }}
-      SERVICE_CONCURRENCY: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_CONCURRENCY || vars.INGESTDB_PRUNE_SERVICE_CONCURRENCY || '1' }}
-      SERVICE_MAX_INSTANCES: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || '1' }}
-      SERVICE_MIN_INSTANCES: ${{ vars.GCP_INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || '0' }}
-      SCHEDULER_ENABLED: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_ENABLED || vars.INGESTDB_PRUNE_SCHEDULER_ENABLED || 'true' }}
-      SCHEDULER_JOB_NAME: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_JOB_NAME || vars.INGESTDB_PRUNE_SCHEDULER_JOB_NAME || 'uk-aq-ingestdb-prune-daily' }}
-      SCHEDULER_CRON: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_CRON || vars.INGESTDB_PRUNE_SCHEDULER_CRON || '0 2 * * *' }}
-      SCHEDULER_TIMEZONE: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_TIMEZONE || vars.INGESTDB_PRUNE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
-      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
-      INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
+      SERVICE_NAME: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_NAME || vars.GCP_INGESTDB_PRUNE_SERVICE_NAME || vars.INGESTDB_PRUNE_SERVICE_NAME || 'uk-aq-prune-daily' }}
+      RESOURCE_LABEL: uk-aq-prune-daily
+      UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_ACCOUNT || vars.GCP_INGESTDB_PRUNE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT || '' }}
+      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_TIMEOUT_SECONDS || vars.GCP_INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || vars.UK_AQ_PRUNE_DAILY_SERVICE_TIMEOUT_SECONDS || vars.INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || '900' }}
+      SERVICE_CPU: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_CPU || vars.GCP_INGESTDB_PRUNE_SERVICE_CPU || vars.UK_AQ_PRUNE_DAILY_SERVICE_CPU || vars.INGESTDB_PRUNE_SERVICE_CPU || '1' }}
+      SERVICE_MEMORY: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_MEMORY || vars.GCP_INGESTDB_PRUNE_SERVICE_MEMORY || vars.UK_AQ_PRUNE_DAILY_SERVICE_MEMORY || vars.INGESTDB_PRUNE_SERVICE_MEMORY || '256Mi' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_CONCURRENCY || vars.GCP_INGESTDB_PRUNE_SERVICE_CONCURRENCY || vars.UK_AQ_PRUNE_DAILY_SERVICE_CONCURRENCY || vars.INGESTDB_PRUNE_SERVICE_CONCURRENCY || '1' }}
+      SERVICE_MAX_INSTANCES: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_MAX_INSTANCES || vars.GCP_INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || vars.UK_AQ_PRUNE_DAILY_SERVICE_MAX_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || '1' }}
+      SERVICE_MIN_INSTANCES: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_MIN_INSTANCES || vars.GCP_INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || vars.UK_AQ_PRUNE_DAILY_SERVICE_MIN_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || '0' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_ENABLED || vars.GCP_INGESTDB_PRUNE_SCHEDULER_ENABLED || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_ENABLED || vars.INGESTDB_PRUNE_SCHEDULER_ENABLED || 'true' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_JOB_NAME || vars.GCP_INGESTDB_PRUNE_SCHEDULER_JOB_NAME || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_JOB_NAME || vars.INGESTDB_PRUNE_SCHEDULER_JOB_NAME || 'uk-aq-prune-daily' }}
+      SCHEDULER_CRON: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_CRON || vars.GCP_INGESTDB_PRUNE_SCHEDULER_CRON || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_CRON || vars.INGESTDB_PRUNE_SCHEDULER_CRON || '0 2 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_TIMEZONE || vars.GCP_INGESTDB_PRUNE_SCHEDULER_TIMEZONE || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_TIMEZONE || vars.INGESTDB_PRUNE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.GCP_INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT || vars.GCP_INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       HISTORY_SUPABASE_URL: ${{ vars.HISTORY_SUPABASE_URL }}
       INGESTDB_PRUNE_DRY_RUN: ${{ vars.INGESTDB_PRUNE_DRY_RUN || 'true' }}
@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          runtime_sa="${INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT:-}"
+          runtime_sa="${UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT:-}"
           if [ -z "${runtime_sa}" ]; then
             runtime_sa="uk-aq-ops-job@${PROJECT_ID}.iam.gserviceaccount.com"
           fi
@@ -98,7 +98,7 @@ jobs:
             exit 1
           fi
 
-          scheduler_sa="${INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
+          scheduler_sa="${UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
           if [[ "${scheduler_sa}" == *"-compute@developer.gserviceaccount.com" ]]; then
             echo "Invalid scheduler service account: default compute service account is not allowed."
             exit 1
@@ -175,7 +175,7 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-ingestdb-prune:${GITHUB_SHA::12}"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-prune-daily:${GITHUB_SHA::12}"
           echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
           docker build -t "${IMAGE}" .
           docker push "${IMAGE}"
@@ -207,7 +207,7 @@ jobs:
             env_updates+=("UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL=${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL}")
           fi
 
-          env_file="${RUNNER_TEMP}/uk-aq-ingestdb-prune-env.yaml"
+          env_file="${RUNNER_TEMP}/uk-aq-prune-daily-env.yaml"
           : > "${env_file}"
           for kv in "${env_updates[@]}"; do
             key="${kv%%=*}"

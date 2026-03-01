@@ -378,13 +378,13 @@ function buildHistoryConfig(url) {
     dropDryRun,
     r2: {
       // TODO: wire these env vars via Secret Manager for production.
-      endpoint: (process.env.HISTORY_R2_ENDPOINT || process.env.R2_ENDPOINT || "").trim(),
-      bucket: (process.env.HISTORY_R2_BUCKET || process.env.R2_BUCKET || "").trim(),
-      accessKeyId: (process.env.HISTORY_R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || "").trim(),
-      secretAccessKey: (process.env.HISTORY_R2_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || "").trim(),
-      region: (process.env.HISTORY_R2_REGION || process.env.R2_REGION || "auto").trim() || "auto",
+      endpoint: (process.env.CFLARE_R2_ENDPOINT || process.env.R2_ENDPOINT || "").trim(),
+      bucket: (process.env.CFLARE_R2_BUCKET || process.env.R2_BUCKET || "").trim(),
+      accessKeyId: (process.env.CFLARE_R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || "").trim(),
+      secretAccessKey: (process.env.CFLARE_R2_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || "").trim(),
+      region: (process.env.CFLARE_R2_REGION || process.env.R2_REGION || "auto").trim() || "auto",
       observationsPrefix: (
-        process.env.HISTORY_R2_OBSERVATIONS_PREFIX
+        process.env.CFLARE_R2_OBSERVATIONS_PREFIX
         || process.env.R2_OBSERVATIONS_PREFIX
         || "uk_aq_history/observations"
       ).trim().replace(/^\/+|\/+$/g, ""),

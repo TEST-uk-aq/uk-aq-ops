@@ -7,11 +7,11 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node src/server.mjs",
-    "start:prune": "node src/server.mjs",
-    "start:flush": "node src/history_outbox_flush_service.mjs",
-    "start:history-partitions": "node src/history_partition_maintenance_service.mjs",
-    "check": "node --check src/server.mjs && node --check src/history_outbox_flush_service.mjs && node --check src/history_partition_maintenance_service.mjs"
+    "start": "node workers/uk_aq_prune_daily/server.mjs",
+    "start:prune": "node workers/uk_aq_prune_daily/server.mjs",
+    "start:flush": "node workers/uk_aq_history_outbox_flush_service/server.mjs",
+    "start:history-partitions": "node workers/uk_aq_history_partition_maintenance_service/server.mjs",
+    "check": "node --check workers/uk_aq_prune_daily/server.mjs && node --check workers/uk_aq_history_outbox_flush_service/server.mjs && node --check workers/uk_aq_history_partition_maintenance_service/server.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0"
