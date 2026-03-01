@@ -391,7 +391,7 @@ begin
   return query
   with parts as (
     select
-      c.relname as partition_name,
+      c.relname::text as partition_name,
       to_date(substring(c.relname from '([0-9]{8})$'), 'YYYYMMDD') as partition_day_utc
     from pg_inherits i
     join pg_class c on c.oid = i.inhrelid
@@ -410,10 +410,10 @@ begin
     from parts p
   )
   select
-    b.partition_name,
+    b.partition_name::text,
     b.partition_day_utc,
-    b.partition_start_utc,
-    b.partition_end_utc
+    b.partition_start_utc::timestamptz,
+    b.partition_end_utc::timestamptz
   from bounds b
   where b.partition_end_utc <= cutoff_utc
   order by b.partition_day_utc;
