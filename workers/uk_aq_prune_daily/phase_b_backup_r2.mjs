@@ -85,6 +85,35 @@ function parseBigInt(value, fieldName) {
   }
 }
 
+function normalizeDayUtc(value) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      return "";
+    }
+    return value.toISOString().slice(0, 10);
+  }
+
+  const text = String(value).trim();
+  if (!text) {
+    return "";
+  }
+
+  const isoDateMatch = text.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (isoDateMatch) {
+    return isoDateMatch[1];
+  }
+
+  const parsed = new Date(text);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+
+  return text.slice(0, 10);
+}
+
 function escapeSingleQuotes(value) {
   return String(value).replace(/'/g, "''");
 }
@@ -201,7 +230,7 @@ async function withPgClient(connectionString, fn) {
 
 function toConnectorDayRow(row) {
   return {
-    day_utc: String(row.day_utc || "").slice(0, 10),
+    day_utc: normalizeDayUtc(row.day_utc),
     connector_id: Number(row.connector_id),
     expected_row_count: parseBigInt(row.expected_row_count, "expected_row_count"),
     min_observed_at: row.min_observed_at ? new Date(row.min_observed_at).toISOString() : null,
@@ -1350,7 +1379,7 @@ where g.day_utc in (${literalList})
     const result = await client.query(sql);
     const map = new Map();
     for (const row of result.rows) {
-      map.set(String(row.day_utc).slice(0, 10), Boolean(row.backup_done));
+      map.set(normalizeDayUtc(row.day_utc), Boolean(row.backup_done));
     }
     return map;
   });
