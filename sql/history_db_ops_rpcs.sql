@@ -16,7 +16,7 @@ returns table (
 )
 language plpgsql
 security definer
-set search_path = uk_aq_history, public, pg_catalog
+set search_path = uk_aq_history, extensions, public, pg_catalog
 as $$
 begin
   set local timezone = 'UTC';
