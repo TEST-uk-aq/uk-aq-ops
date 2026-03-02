@@ -11,9 +11,15 @@
     "start:prune": "node workers/uk_aq_prune_daily/server.mjs",
     "start:flush": "node workers/uk_aq_history_outbox_flush_service/server.mjs",
     "start:history-partitions": "node workers/uk_aq_history_partition_maintenance_service/server.mjs",
-    "check": "node --check workers/uk_aq_prune_daily/server.mjs && node --check workers/uk_aq_history_outbox_flush_service/server.mjs && node --check workers/uk_aq_history_partition_maintenance_service/server.mjs"
+    "check": "node --check workers/shared/r2_sigv4.mjs && node --check workers/uk_aq_prune_daily/phase_b_backup_r2.mjs && node --check workers/uk_aq_prune_daily/server.mjs && node --check workers/uk_aq_history_outbox_flush_service/server.mjs && node --check workers/uk_aq_history_partition_maintenance_service/server.mjs && node --check scripts/backup_r2/download_day.mjs",
+    "test": "node --test tests/**/*.test.mjs",
+    "backup:download-day": "node scripts/backup_r2/download_day.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.0"
+    "@supabase/supabase-js": "^2.57.0",
+    "apache-arrow": "^21.1.0",
+    "parquet-wasm": "^0.7.1",
+    "pg": "^8.19.0",
+    "pg-cursor": "^2.18.0"
   }
 }

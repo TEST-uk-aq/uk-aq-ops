@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - "workers/uk_aq_prune_daily/server.mjs"
+      - "workers/uk_aq_prune_daily/phase_b_backup_r2.mjs"
+      - "workers/shared/r2_sigv4.mjs"
       - "Dockerfile"
       - "package.json"
       - "package-lock.json"
@@ -52,8 +54,27 @@ jobs:
       REPAIR_BUCKET_OUTBOX_CHUNK_SIZE: ${{ vars.INGESTDB_PRUNE_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE || '1000' }}
       FLUSH_CLAIM_BATCH_LIMIT: ${{ vars.INGESTDB_PRUNE_FLUSH_CLAIM_BATCH_LIMIT || '20' }}
       MAX_FLUSH_BATCHES: ${{ vars.INGESTDB_PRUNE_MAX_FLUSH_BATCHES || '30' }}
+      UK_AQ_DEPLOY_ENV: ${{ vars.UK_AQ_DEPLOY_ENV || 'dev' }}
+      BACKUP_PHASE_B_ENABLED: ${{ vars.BACKUP_PHASE_B_ENABLED || 'true' }}
+      BACKUP_PART_MAX_ROWS: ${{ vars.BACKUP_PART_MAX_ROWS || '1000000' }}
+      BACKUP_CURSOR_FETCH_ROWS: ${{ vars.BACKUP_CURSOR_FETCH_ROWS || '20000' }}
+      BACKUP_ROW_GROUP_SIZE: ${{ vars.BACKUP_ROW_GROUP_SIZE || '100000' }}
+      BACKUP_MAX_CANDIDATES_PER_RUN: ${{ vars.BACKUP_MAX_CANDIDATES_PER_RUN || '500' }}
+      BACKUP_STAGING_RETENTION_DAYS: ${{ vars.BACKUP_STAGING_RETENTION_DAYS || '7' }}
+      BACKUP_STAGING_PREFIX: ${{ vars.BACKUP_STAGING_PREFIX || 'backup/staging' }}
+      BACKUP_COMMITTED_PREFIX: ${{ vars.BACKUP_COMMITTED_PREFIX || 'backup/observations' }}
+      BACKUP_RUNS_PREFIX: ${{ vars.BACKUP_RUNS_PREFIX || 'backup/runs' }}
+      R2_BUCKET_PROD: ${{ vars.R2_BUCKET_PROD || '' }}
+      R2_BUCKET_STAGE: ${{ vars.R2_BUCKET_STAGE || '' }}
+      R2_BUCKET_DEV: ${{ vars.R2_BUCKET_DEV || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
+      SUPABASE_DB_URL_SECRET_NAME: ${{ vars.SUPABASE_DB_URL_SECRET_NAME || 'SUPABASE_DB_URL' }}
+      CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME || 'CFLARE_R2_ACCESS_KEY_ID' }}
+      CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME || 'CFLARE_R2_SECRET_ACCESS_KEY' }}
       DROPBOX_APP_KEY_SECRET_NAME: ${{ vars.DROPBOX_APP_KEY_SECRET_NAME || '' }}
       DROPBOX_APP_SECRET_SECRET_NAME: ${{ vars.DROPBOX_APP_SECRET_SECRET_NAME || '' }}
       DROPBOX_REFRESH_TOKEN_SECRET_NAME: ${{ vars.DROPBOX_REFRESH_TOKEN_SECRET_NAME || '' }}
@@ -82,6 +103,16 @@ jobs:
           if [ -z "${HISTORY_SUPABASE_URL:-}" ]; then
             echo "Missing required repo variable: HISTORY_SUPABASE_URL"
             exit 1
+          fi
+          if [ "${BACKUP_PHASE_B_ENABLED:-true}" = "true" ]; then
+            if [ -z "${CFLARE_R2_ENDPOINT:-}" ]; then
+              echo "Missing required repo variable: CFLARE_R2_ENDPOINT (Phase B backup enabled)."
+              exit 1
+            fi
+            if [ -z "${R2_BUCKET_PROD:-}" ] && [ -z "${R2_BUCKET_STAGE:-}" ] && [ -z "${R2_BUCKET_DEV:-}" ] && [ -z "${CFLARE_R2_BUCKET:-}" ]; then
+              echo "Missing R2 bucket mapping (set R2_BUCKET_PROD/STAGE/DEV or CFLARE_R2_BUCKET)."
+              exit 1
+            fi
           fi
 
       - name: Resolve runtime and scheduler service accounts
@@ -157,6 +188,9 @@ jobs:
           set -euo pipefail
           gcloud secrets describe "${SB_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           gcloud secrets describe "${HISTORY_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
+          gcloud secrets describe "${SUPABASE_DB_URL_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
+          gcloud secrets describe "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
+          gcloud secrets describe "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           for optional_secret in \
             "${DROPBOX_APP_KEY_SECRET_NAME:-}" \
             "${DROPBOX_APP_SECRET_SECRET_NAME:-}" \
@@ -197,6 +231,30 @@ jobs:
           env_updates+=("REPAIR_BUCKET_OUTBOX_CHUNK_SIZE=${REPAIR_BUCKET_OUTBOX_CHUNK_SIZE}")
           env_updates+=("FLUSH_CLAIM_BATCH_LIMIT=${FLUSH_CLAIM_BATCH_LIMIT}")
           env_updates+=("MAX_FLUSH_BATCHES=${MAX_FLUSH_BATCHES}")
+          env_updates+=("UK_AQ_DEPLOY_ENV=${UK_AQ_DEPLOY_ENV}")
+          env_updates+=("BACKUP_PHASE_B_ENABLED=${BACKUP_PHASE_B_ENABLED}")
+          env_updates+=("BACKUP_PART_MAX_ROWS=${BACKUP_PART_MAX_ROWS}")
+          env_updates+=("BACKUP_CURSOR_FETCH_ROWS=${BACKUP_CURSOR_FETCH_ROWS}")
+          env_updates+=("BACKUP_ROW_GROUP_SIZE=${BACKUP_ROW_GROUP_SIZE}")
+          env_updates+=("BACKUP_MAX_CANDIDATES_PER_RUN=${BACKUP_MAX_CANDIDATES_PER_RUN}")
+          env_updates+=("BACKUP_STAGING_RETENTION_DAYS=${BACKUP_STAGING_RETENTION_DAYS}")
+          env_updates+=("BACKUP_STAGING_PREFIX=${BACKUP_STAGING_PREFIX}")
+          env_updates+=("BACKUP_COMMITTED_PREFIX=${BACKUP_COMMITTED_PREFIX}")
+          env_updates+=("BACKUP_RUNS_PREFIX=${BACKUP_RUNS_PREFIX}")
+          env_updates+=("CFLARE_R2_ENDPOINT=${CFLARE_R2_ENDPOINT}")
+          env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
+          if [ -n "${R2_BUCKET_PROD:-}" ]; then
+            env_updates+=("R2_BUCKET_PROD=${R2_BUCKET_PROD}")
+          fi
+          if [ -n "${R2_BUCKET_STAGE:-}" ]; then
+            env_updates+=("R2_BUCKET_STAGE=${R2_BUCKET_STAGE}")
+          fi
+          if [ -n "${R2_BUCKET_DEV:-}" ]; then
+            env_updates+=("R2_BUCKET_DEV=${R2_BUCKET_DEV}")
+          fi
+          if [ -n "${CFLARE_R2_BUCKET:-}" ]; then
+            env_updates+=("CFLARE_R2_BUCKET=${CFLARE_R2_BUCKET}")
+          fi
           if [ -n "${UK_AQ_DROPBOX_ROOT:-}" ]; then
             env_updates+=("UK_AQ_DROPBOX_ROOT=${UK_AQ_DROPBOX_ROOT}")
           fi
@@ -219,6 +277,9 @@ jobs:
           secret_updates=()
           secret_updates+=("SB_SECRET_KEY=${SB_SECRET_KEY_SECRET_NAME}:latest")
           secret_updates+=("HISTORY_SECRET_KEY=${HISTORY_SECRET_KEY_SECRET_NAME}:latest")
+          secret_updates+=("SUPABASE_DB_URL=${SUPABASE_DB_URL_SECRET_NAME}:latest")
+          secret_updates+=("CFLARE_R2_ACCESS_KEY_ID=${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
+          secret_updates+=("CFLARE_R2_SECRET_ACCESS_KEY=${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}:latest")
           if [ -n "${DROPBOX_APP_KEY_SECRET_NAME:-}" ]; then
             secret_updates+=("DROPBOX_APP_KEY=${DROPBOX_APP_KEY_SECRET_NAME}:latest")
           fi

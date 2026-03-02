@@ -31,6 +31,11 @@ Required env:
 - `HISTORY_SUPABASE_URL`
 - `SB_SECRET_KEY`
 - `HISTORY_SECRET_KEY`
+- `SUPABASE_DB_URL` (direct Postgres URL for streaming Phase B backup reads)
+- `CFLARE_R2_ENDPOINT`
+- one bucket mapping: `R2_BUCKET_PROD` / `R2_BUCKET_STAGE` / `R2_BUCKET_DEV` (or fallback `CFLARE_R2_BUCKET`)
+- `CFLARE_R2_ACCESS_KEY_ID`
+- `CFLARE_R2_SECRET_ACCESS_KEY`
 
 Primary controls:
 
@@ -39,6 +44,16 @@ Primary controls:
 - `INGESTDB_PRUNE_MAX_HOURS_PER_RUN` (default `48`)
 - `INGESTDB_PRUNE_DELETE_BATCH_SIZE` (default `50000`)
 - `INGESTDB_PRUNE_MAX_DELETE_BATCHES_PER_HOUR` (default `10`)
+- `BACKUP_PHASE_B_ENABLED` (default `true`)
+- `BACKUP_PART_MAX_ROWS` (default `1000000`)
+- `BACKUP_CURSOR_FETCH_ROWS` (default `20000`)
+- `BACKUP_ROW_GROUP_SIZE` (default `100000`)
+- `BACKUP_MAX_CANDIDATES_PER_RUN` (default `500`)
+- `BACKUP_STAGING_RETENTION_DAYS` (default `7`)
+- `BACKUP_STAGING_PREFIX` (default `backup/staging`)
+- `BACKUP_COMMITTED_PREFIX` (default `backup/observations`)
+- `BACKUP_RUNS_PREFIX` (default `backup/runs`)
+- `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
 
 ### 2) History Outbox Flush (`workers/uk_aq_history_outbox_flush_service/server.mjs`)
 
@@ -74,6 +89,13 @@ Type-check quick validation:
 
 ```bash
 npm run check
+```
+
+Download one backed-up UTC day from R2 (manifest-first, no Supabase reads):
+
+```bash
+node scripts/backup_r2/download_day.mjs --day 2026-02-20 --out ./tmp/backup_download
+node scripts/backup_r2/download_day.mjs --day 2026-02-20 --connector 4 --out ./tmp/backup_download
 ```
 
 ## Env + GitHub sync
