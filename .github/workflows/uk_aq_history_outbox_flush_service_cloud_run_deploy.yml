@@ -47,6 +47,8 @@ jobs:
       MAX_FLUSH_BATCHES: ${{ vars.HISTORY_OUTBOX_FLUSH_MAX_FLUSH_BATCHES || '30' }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
+      SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+      HISTORY_SECRET_KEY: ${{ secrets.HISTORY_SECRET_KEY }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -138,6 +140,38 @@ jobs:
           gcloud artifacts repositories describe "${REPO}" \
             --location "${REGION}" \
             --project "${PROJECT_ID}" >/dev/null
+
+      - name: Sync GitHub secrets to GCP Secret Manager
+        run: |
+          set -euo pipefail
+          UPSERT_SCRIPT="scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+
+          upsert_secret() {
+            local secret_name="$1"
+            local secret_value="$2"
+            local required="${3:-0}"
+
+            if [ -z "${secret_name}" ]; then
+              if [ "${required}" = "1" ]; then
+                echo "Missing required secret name."
+                exit 1
+              fi
+              return 0
+            fi
+
+            if [ -z "${secret_value}" ] && [ "${required}" = "0" ]; then
+              echo "Skipping optional secret ${secret_name} (no GitHub secret/variable value)."
+              return 0
+            fi
+
+            printf '%s' "${secret_value}" | "${UPSERT_SCRIPT}" \
+              --project "${PROJECT_ID}" \
+              --secret "${secret_name}" \
+              --required "${required}"
+          }
+
+          upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1
+          upsert_secret "${HISTORY_SECRET_KEY_SECRET_NAME}" "${HISTORY_SECRET_KEY}" 1
 
       - name: Verify Secret Manager secrets exist
         run: |
