@@ -128,23 +128,42 @@ jobs:
         run: |
           set -euo pipefail
 
+          validate_service_account() {
+            local label="$1"
+            local value="$2"
+            if [[ "${value}" == *$'\n'* ]] || [[ "${value}" == *$'\r'* ]]; then
+              echo "Invalid ${label}: contains newline characters."
+              exit 1
+            fi
+            if [[ "${value}" == \#* ]]; then
+              echo "Invalid ${label}: starts with '#', check repo variable value."
+              exit 1
+            fi
+            if ! [[ "${value}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.gserviceaccount\.com$ ]]; then
+              echo "Invalid ${label}: expected a gserviceaccount.com email, got '${value}'."
+              exit 1
+            fi
+          }
+
           runtime_sa="${UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT:-}"
           if [ -z "${runtime_sa}" ]; then
             runtime_sa="uk-aq-ops-job@${PROJECT_ID}.iam.gserviceaccount.com"
           fi
+          validate_service_account "runtime service account" "${runtime_sa}"
           if [[ "${runtime_sa}" == *"-compute@developer.gserviceaccount.com" ]]; then
             echo "Invalid runtime service account: default compute service account is not allowed."
             exit 1
           fi
 
           scheduler_sa="${UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
+          validate_service_account "scheduler service account" "${scheduler_sa}"
           if [[ "${scheduler_sa}" == *"-compute@developer.gserviceaccount.com" ]]; then
             echo "Invalid scheduler service account: default compute service account is not allowed."
             exit 1
           fi
 
-          echo "runtime_sa=${runtime_sa}" >> "${GITHUB_OUTPUT}"
-          echo "scheduler_sa=${scheduler_sa}" >> "${GITHUB_OUTPUT}"
+          printf 'runtime_sa=%s\n' "${runtime_sa}" >> "${GITHUB_OUTPUT}"
+          printf 'scheduler_sa=%s\n' "${scheduler_sa}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate Google auth config
         run: |
