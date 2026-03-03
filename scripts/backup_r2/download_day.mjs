@@ -62,18 +62,13 @@ function parseArgs(argv) {
   return args;
 }
 
-function resolveSafeOutputDir(rawOutDir) {
-  const outputRoot = process.cwd();
-  const resolved = path.resolve(outputRoot, rawOutDir);
-  const relative = path.relative(outputRoot, resolved);
-  if (
-    relative === ".." ||
-    relative.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(relative)
-  ) {
-    throw new Error("--out must be inside the current working directory");
+function sanitizeOutputDirName(rawOutDir) {
+  const trimmed = String(rawOutDir || "").trim();
+  const baseName = path.basename(trimmed);
+  if (!/^[A-Za-z0-9._-]{1,120}$/.test(baseName)) {
+    throw new Error("--out must be a simple directory name (letters, numbers, . _ -)");
   }
-  return resolved;
+  return baseName;
 }
 
 async function downloadObject(r2, objectKey, targetPath) {
@@ -95,7 +90,7 @@ async function main() {
     throw new Error("Missing R2 config. Set endpoint, bucket, region, access key id, and secret.");
   }
 
-  const outDir = resolveSafeOutputDir(args.out);
+  const outDir = path.join(process.cwd(), sanitizeOutputDirName(args.out));
   fs.mkdirSync(outDir, { recursive: true });
 
   const manifestKey = args.connector === null
@@ -120,10 +115,7 @@ async function main() {
   let totalBytes = 0;
   for (let idx = 0; idx < parquetKeys.length; idx += 1) {
     const objectKey = parquetKeys[idx];
-    const extension = String(objectKey).toLowerCase().endsWith(".parquet")
-      ? ".parquet"
-      : ".bin";
-    const localName = `part-${String(idx).padStart(5, "0")}${extension}`;
+    const localName = `part-${String(idx).padStart(5, "0")}.parquet`;
     const targetPath = path.join(outDir, "data", localName);
     const result = await downloadObject(config.r2, objectKey, targetPath);
     totalBytes += result.bytes;
