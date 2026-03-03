@@ -62,6 +62,20 @@ function parseArgs(argv) {
   return args;
 }
 
+function resolveSafeOutputDir(rawOutDir) {
+  const outputRoot = process.cwd();
+  const resolved = path.resolve(outputRoot, rawOutDir);
+  const relative = path.relative(outputRoot, resolved);
+  if (
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error("--out must be inside the current working directory");
+  }
+  return resolved;
+}
+
 async function downloadObject(r2, objectKey, targetPath) {
   const object = await r2GetObject({ r2, key: objectKey });
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
@@ -81,7 +95,7 @@ async function main() {
     throw new Error("Missing R2 config. Set endpoint, bucket, region, access key id, and secret.");
   }
 
-  const outDir = path.resolve(args.out);
+  const outDir = resolveSafeOutputDir(args.out);
   fs.mkdirSync(outDir, { recursive: true });
 
   const manifestKey = args.connector === null
