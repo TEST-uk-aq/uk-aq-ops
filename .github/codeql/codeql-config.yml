@@ -1,0 +1,8 @@
+name: UK-AQ CodeQL Config
+
+queries:
+  - uses: security-and-quality
+
+paths-ignore:
+  - archive
+  - "**/archive/**"
