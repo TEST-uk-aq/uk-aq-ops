@@ -62,23 +62,8 @@ function parseArgs(argv) {
   return args;
 }
 
-function toOutPath(outDir, objectKey) {
-  const normalizedKey = String(objectKey).replace(/\\/g, "/").replace(/^\/+/, "");
-  const targetPath = path.resolve(outDir, normalizedKey);
-  const relative = path.relative(outDir, targetPath);
-  if (
-    relative === ".." ||
-    relative.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(relative)
-  ) {
-    throw new Error(`Unsafe object key path: ${objectKey}`);
-  }
-  return targetPath;
-}
-
-async function downloadObject(r2, objectKey, outDir) {
+async function downloadObject(r2, objectKey, targetPath) {
   const object = await r2GetObject({ r2, key: objectKey });
-  const targetPath = toOutPath(outDir, objectKey);
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.writeFileSync(targetPath, object.body);
   return {
@@ -106,7 +91,7 @@ async function main() {
   const manifestObject = await r2GetObject({ r2: config.r2, key: manifestKey });
   const manifest = JSON.parse(manifestObject.body.toString("utf8"));
 
-  const manifestTarget = toOutPath(outDir, manifestKey);
+  const manifestTarget = path.join(outDir, "manifest.json");
   fs.mkdirSync(path.dirname(manifestTarget), { recursive: true });
   fs.writeFileSync(manifestTarget, manifestObject.body);
 
@@ -119,8 +104,14 @@ async function main() {
   }
 
   let totalBytes = 0;
-  for (const objectKey of parquetKeys) {
-    const result = await downloadObject(config.r2, objectKey, outDir);
+  for (let idx = 0; idx < parquetKeys.length; idx += 1) {
+    const objectKey = parquetKeys[idx];
+    const extension = String(objectKey).toLowerCase().endsWith(".parquet")
+      ? ".parquet"
+      : ".bin";
+    const localName = `part-${String(idx).padStart(5, "0")}${extension}`;
+    const targetPath = path.join(outDir, "data", localName);
+    const result = await downloadObject(config.r2, objectKey, targetPath);
     totalBytes += result.bytes;
   }
 
