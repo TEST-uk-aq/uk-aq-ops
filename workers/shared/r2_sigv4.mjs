@@ -40,9 +40,9 @@ function buildAmzDate(date) {
   return date.toISOString().replace(/[:-]|\.\d{3}/g, "");
 }
 
-function normalizeHeaders(headers) {
+function normalizeHeaders(headers = {}) {
   const pairs = [];
-  for (const [rawName, rawValue] of Object.entries(headers || {})) {
+  for (const [rawName, rawValue] of Object.entries(headers)) {
     if (rawValue === undefined || rawValue === null) {
       continue;
     }
@@ -298,11 +298,11 @@ export async function r2GetObject({ r2, key }) {
 
 function decodeXmlEntities(value) {
   return value
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 function parseListObjectsXml(xml) {

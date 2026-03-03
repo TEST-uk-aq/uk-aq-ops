@@ -63,7 +63,17 @@ function parseArgs(argv) {
 }
 
 function toOutPath(outDir, objectKey) {
-  return path.join(outDir, objectKey);
+  const normalizedKey = String(objectKey).replace(/\\/g, "/").replace(/^\/+/, "");
+  const targetPath = path.resolve(outDir, normalizedKey);
+  const relative = path.relative(outDir, targetPath);
+  if (
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error(`Unsafe object key path: ${objectKey}`);
+  }
+  return targetPath;
 }
 
 async function downloadObject(r2, objectKey, outDir) {

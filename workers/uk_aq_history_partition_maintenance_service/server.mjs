@@ -2,7 +2,6 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { createClient } from "@supabase/supabase-js";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
 const HISTORY_TIME_ZONE = "Europe/London";
 
 const RPC_SCHEMA = "uk_aq_public";
@@ -513,11 +512,11 @@ function buildAwsSignedRequest({ method, endpoint, region, accessKeyId, secretAc
 
 function decodeXmlEntities(value) {
   return value
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 function hasRequiredR2Config(r2) {
@@ -827,22 +826,23 @@ async function runHistoryPartitionMaintenance(config) {
         created_at: createdAt,
       };
 
-      let skipDropboxResult = { uploaded: false, reason: "not_attempted" };
-      try {
-        skipDropboxResult = await uploadMaintenanceLogToDropbox(
-          "history_partition_skip_drop",
-          skipPayload,
-          createdAt,
-          skipId,
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        skipDropboxResult = {
-          uploaded: false,
-          reason: "upload_failed",
-          upload_error: message,
-        };
-      }
+      const skipDropboxResult = await (async () => {
+        try {
+          return await uploadMaintenanceLogToDropbox(
+            "history_partition_skip_drop",
+            skipPayload,
+            createdAt,
+            skipId,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            uploaded: false,
+            reason: "upload_failed",
+            upload_error: message,
+          };
+        }
+      })();
 
       const skip = {
         partition_name: candidate.partition_name,
@@ -974,22 +974,25 @@ const server = createServer(async (req, res) => {
       },
     };
 
-    let dropboxResult = { uploaded: false, reason: "not_attempted" };
-    try {
-      dropboxResult = await uploadMaintenanceLogToDropbox(
-        "history_partition_service_error",
-        payload,
-        createdAt,
-        errorId,
-      );
-    } catch (uploadError) {
-      const uploadMessage = uploadError instanceof Error ? uploadError.message : String(uploadError);
-      dropboxResult = {
-        uploaded: false,
-        reason: "upload_failed",
-        upload_error: uploadMessage,
-      };
-    }
+    const dropboxResult = await (async () => {
+      try {
+        return await uploadMaintenanceLogToDropbox(
+          "history_partition_service_error",
+          payload,
+          createdAt,
+          errorId,
+        );
+      } catch (uploadError) {
+        const uploadMessage = uploadError instanceof Error
+          ? uploadError.message
+          : String(uploadError);
+        return {
+          uploaded: false,
+          reason: "upload_failed",
+          upload_error: uploadMessage,
+        };
+      }
+    })();
 
     logStructured("ERROR", "history_partition_maintenance_run_error", {
       error_id: errorId,
@@ -1003,7 +1006,7 @@ const server = createServer(async (req, res) => {
 
     jsonResponse(res, 500, {
       error: "history_partition_maintenance_run_error",
-      message,
+      message: "Internal error. See logs with error_id.",
       error_id: errorId,
       dropbox_uploaded: Boolean(dropboxResult.uploaded),
       dropbox_path: dropboxResult.dropbox_path || null,

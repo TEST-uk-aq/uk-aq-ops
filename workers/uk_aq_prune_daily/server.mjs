@@ -1770,17 +1770,20 @@ const server = createServer(async (req, res) => {
       },
     };
 
-    let dropboxResult = { uploaded: false, reason: "not_attempted" };
-    try {
-      dropboxResult = await uploadErrorPayloadToDropbox(errorPayload, createdAt, errorId);
-    } catch (uploadError) {
-      const uploadMessage = uploadError instanceof Error ? uploadError.message : String(uploadError);
-      dropboxResult = { uploaded: false, reason: "upload_failed", upload_error: uploadMessage };
-      logStructured("ERROR", "ingestdb_prune_error_dropbox_upload_failed", {
-        error_id: errorId,
-        message: uploadMessage,
-      });
-    }
+    const dropboxResult = await (async () => {
+      try {
+        return await uploadErrorPayloadToDropbox(errorPayload, createdAt, errorId);
+      } catch (uploadError) {
+        const uploadMessage = uploadError instanceof Error
+          ? uploadError.message
+          : String(uploadError);
+        logStructured("ERROR", "ingestdb_prune_error_dropbox_upload_failed", {
+          error_id: errorId,
+          message: uploadMessage,
+        });
+        return { uploaded: false, reason: "upload_failed", upload_error: uploadMessage };
+      }
+    })();
 
     logStructured("ERROR", "ingestdb_prune_run_error", {
       error_id: errorId,
@@ -1793,7 +1796,7 @@ const server = createServer(async (req, res) => {
     });
     jsonResponse(res, 500, {
       error: "ingestdb_prune_run_error",
-      message,
+      message: "Internal error. See logs with error_id.",
       error_id: errorId,
       dropbox_uploaded: Boolean(dropboxResult.uploaded),
       dropbox_path: dropboxResult.dropbox_path || null,

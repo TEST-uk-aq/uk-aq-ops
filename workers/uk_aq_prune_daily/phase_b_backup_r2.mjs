@@ -120,13 +120,13 @@ function escapeSingleQuotes(value) {
 
 function minIso(left, right) {
   if (!left) return right || null;
-  if (!right) return left || null;
+  if (!right) return left;
   return left <= right ? left : right;
 }
 
 function maxIso(left, right) {
   if (!left) return right || null;
-  if (!right) return left || null;
+  if (!right) return left;
   return left >= right ? left : right;
 }
 

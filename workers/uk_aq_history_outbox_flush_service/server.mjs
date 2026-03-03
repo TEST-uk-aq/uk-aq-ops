@@ -327,10 +327,15 @@ const server = createServer(async (req, res) => {
     jsonResponse(res, 200, summary);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    logStructured("ERROR", "history_outbox_flush_service_run_error", { message });
+    const errorId = randomUUID();
+    logStructured("ERROR", "history_outbox_flush_service_run_error", {
+      error_id: errorId,
+      message,
+    });
     jsonResponse(res, 500, {
       error: "history_outbox_flush_service_run_error",
-      message,
+      message: "Internal error. See logs with error_id.",
+      error_id: errorId,
     });
   }
 });
