@@ -9,7 +9,6 @@ import * as parquetWasm from "parquet-wasm/esm";
 import {
   hasRequiredR2Config,
   normalizePrefix,
-  r2CopyObject,
   r2DeleteObjects,
   r2GetObject,
   r2HeadObject,
@@ -29,8 +28,8 @@ const DEFAULT_COMMITTED_PREFIX = "backup/observations";
 const DEFAULT_RUNS_PREFIX = "backup/runs";
 
 const BACKUP_SCHEMA_NAME = "observations";
-const BACKUP_SCHEMA_VERSION = 1;
-const WRITER_VERSION = "parquet-wasm-zstd-v1";
+const BACKUP_SCHEMA_VERSION = 2;
+const WRITER_VERSION = "parquet-wasm-zstd-v2";
 
 export const BACKUP_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
   "connector_id",
@@ -38,9 +37,15 @@ export const BACKUP_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
   "observed_at",
   "value",
   "status",
-  // TODO(phase-b-v2): drop created_at and bump backup schema version to keep readers tolerant.
   "created_at",
 ]);
+export const BACKUP_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
+  "connector_id",
+  "timeseries_id",
+  "observed_at",
+  "value",
+]);
+const BACKUP_OBSERVATIONS_COLUMNS = BACKUP_OBSERVATIONS_COLUMNS_V2;
 
 let parquetWasmInitialized = false;
 
@@ -197,10 +202,6 @@ function ensureParquetWasmInitialized() {
   parquetWasmInitialized = true;
 }
 
-function observationsSelectList(columns) {
-  return columns.map((column) => `o.${column}`).join(", ");
-}
-
 function connectorPrefix(basePrefix, dayUtc, connectorId) {
   return `${basePrefix}/day_utc=${dayUtc}/connector_id=${connectorId}`;
 }
@@ -241,6 +242,55 @@ async function withPgClient(connectionString, fn) {
   }
 }
 
+function toResumePartEntry(value, index) {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Invalid resume part entry at index ${index}`);
+  }
+  const key = String(value.key || "").trim();
+  if (!key) {
+    throw new Error(`Missing resume part key at index ${index}`);
+  }
+  const rowCount = Number(value.row_count);
+  if (!Number.isFinite(rowCount) || rowCount <= 0) {
+    throw new Error(`Invalid resume part row_count at index ${index}`);
+  }
+  const bytes = Number(value.bytes);
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    throw new Error(`Invalid resume part bytes at index ${index}`);
+  }
+  const etagOrHash = value.etag_or_hash === null || value.etag_or_hash === undefined
+    ? null
+    : String(value.etag_or_hash);
+
+  return {
+    key,
+    row_count: Math.trunc(rowCount),
+    bytes: Math.trunc(bytes),
+    etag_or_hash: etagOrHash,
+  };
+}
+
+function parseResumeParts(value) {
+  if (value === null || value === undefined || value === "") {
+    return [];
+  }
+
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      throw new Error("Invalid resume_parts_json payload.");
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("resume_parts_json must be an array.");
+  }
+
+  return parsed.map((entry, index) => toResumePartEntry(entry, index));
+}
+
 function toConnectorDayRow(row) {
   return {
     day_utc: normalizeDayUtc(row.day_utc),
@@ -260,6 +310,19 @@ function toConnectorDayRow(row) {
     backup_total_bytes: row.backup_total_bytes === null || row.backup_total_bytes === undefined
       ? null
       : parseBigInt(row.backup_total_bytes, "backup_total_bytes"),
+    resume_last_timeseries_id: row.resume_last_timeseries_id === null || row.resume_last_timeseries_id === undefined
+      ? null
+      : Number(row.resume_last_timeseries_id),
+    resume_last_observed_at: row.resume_last_observed_at
+      ? new Date(row.resume_last_observed_at).toISOString()
+      : null,
+    resume_part_index: row.resume_part_index === null || row.resume_part_index === undefined
+      ? 0
+      : Number(row.resume_part_index),
+    resume_exported_row_count: row.resume_exported_row_count === null || row.resume_exported_row_count === undefined
+      ? 0n
+      : parseBigInt(row.resume_exported_row_count, "resume_exported_row_count"),
+    resume_parts: parseResumeParts(row.resume_parts_json),
   };
 }
 
@@ -295,7 +358,12 @@ upserted as (
     backup_row_count,
     backup_file_count,
     backup_total_bytes,
-    backup_completed_at
+    backup_completed_at,
+    resume_last_timeseries_id,
+    resume_last_observed_at,
+    resume_part_index,
+    resume_exported_row_count,
+    resume_parts_json
   )
   select
     e.day_utc,
@@ -310,7 +378,12 @@ upserted as (
     null,
     null,
     null,
-    null
+    null,
+    null,
+    null,
+    0,
+    0,
+    '[]'::jsonb
   from eligible e
   on conflict (day_utc, connector_id)
   do update set
@@ -325,6 +398,41 @@ upserted as (
     backup_file_count = null,
     backup_total_bytes = null,
     backup_completed_at = null,
+    resume_last_timeseries_id = case
+      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.backup_candidates.resume_last_timeseries_id
+      else null
+    end,
+    resume_last_observed_at = case
+      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.backup_candidates.resume_last_observed_at
+      else null
+    end,
+    resume_part_index = case
+      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then coalesce(uk_aq_ops.backup_candidates.resume_part_index, 0)
+      else 0
+    end,
+    resume_exported_row_count = case
+      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then coalesce(uk_aq_ops.backup_candidates.resume_exported_row_count, 0)
+      else 0
+    end,
+    resume_parts_json = case
+      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then coalesce(uk_aq_ops.backup_candidates.resume_parts_json, '[]'::jsonb)
+      else '[]'::jsonb
+    end,
     updated_at = now()
   where uk_aq_ops.backup_candidates.status <> 'complete'
   returning
@@ -338,7 +446,12 @@ upserted as (
     manifest_key,
     backup_row_count,
     backup_file_count,
-    backup_total_bytes
+    backup_total_bytes,
+    resume_last_timeseries_id,
+    resume_last_observed_at,
+    resume_part_index,
+    resume_exported_row_count,
+    resume_parts_json
 )
 select * from upserted
 order by day_utc, connector_id
@@ -407,7 +520,12 @@ select
   c.manifest_key,
   c.backup_row_count,
   c.backup_file_count,
-  c.backup_total_bytes
+  c.backup_total_bytes,
+  c.resume_last_timeseries_id,
+  c.resume_last_observed_at,
+  c.resume_part_index,
+  c.resume_exported_row_count,
+  c.resume_parts_json
 from uk_aq_ops.backup_candidates c
 where c.status = 'pending'
 order by c.day_utc, c.connector_id
@@ -457,6 +575,11 @@ set
   backup_row_count = $5,
   backup_file_count = $6,
   backup_total_bytes = $7,
+  resume_last_timeseries_id = null,
+  resume_last_observed_at = null,
+  resume_part_index = 0,
+  resume_exported_row_count = 0,
+  resume_parts_json = '[]'::jsonb,
   backup_completed_at = now(),
   updated_at = now()
 where day_utc = $1::date
@@ -470,6 +593,43 @@ where day_utc = $1::date
       backupRowCount.toString(),
       backupFileCount,
       backupTotalBytes.toString(),
+    ],
+  );
+}
+
+async function updateCandidateResumeCheckpoint(client, {
+  dayUtc,
+  connectorId,
+  runId,
+  lastTimeseriesId,
+  lastObservedAt,
+  partIndex,
+  exportedRowCount,
+  parts,
+}) {
+  await client.query(
+    `
+update uk_aq_ops.backup_candidates
+set
+  resume_last_timeseries_id = $4,
+  resume_last_observed_at = $5,
+  resume_part_index = $6,
+  resume_exported_row_count = $7,
+  resume_parts_json = $8::jsonb,
+  updated_at = now()
+where day_utc = $1::date
+  and connector_id = $2::integer
+  and run_id = $3
+`,
+    [
+      dayUtc,
+      connectorId,
+      runId,
+      lastTimeseriesId,
+      lastObservedAt,
+      partIndex,
+      exportedRowCount.toString(),
+      JSON.stringify(parts),
     ],
   );
 }
@@ -504,7 +664,12 @@ select
   manifest_key,
   backup_row_count,
   backup_file_count,
-  backup_total_bytes
+  backup_total_bytes,
+  resume_last_timeseries_id,
+  resume_last_observed_at,
+  resume_part_index,
+  resume_exported_row_count,
+  resume_parts_json
 from uk_aq_ops.backup_candidates
 where day_utc = $1::date
 order by connector_id
@@ -636,7 +801,7 @@ function createConnectorManifest({
     files: fileEntries,
     backup_schema_name: BACKUP_SCHEMA_NAME,
     backup_schema_version: BACKUP_SCHEMA_VERSION,
-    columns: BACKUP_OBSERVATIONS_COLUMNS_V1,
+    columns: BACKUP_OBSERVATIONS_COLUMNS,
     writer_version: WRITER_VERSION,
     writer_git_sha: writerGitSha,
     ...stats,
@@ -696,7 +861,7 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
     })),
     backup_schema_name: BACKUP_SCHEMA_NAME,
     backup_schema_version: BACKUP_SCHEMA_VERSION,
-    columns: BACKUP_OBSERVATIONS_COLUMNS_V1,
+    columns: BACKUP_OBSERVATIONS_COLUMNS,
     writer_version: WRITER_VERSION,
     writer_git_sha: writerGitSha,
     ...stats,
@@ -730,8 +895,6 @@ function rowsToParquetBuffer(rows, writerProperties) {
     timeseries_id: Int32Array.from(rows.map((row) => Number(row.timeseries_id))),
     observed_at: rows.map((row) => new Date(row.observed_at)),
     value: rows.map((row) => (row.value === null || row.value === undefined ? null : Number(row.value))),
-    status: rows.map((row) => (row.status === undefined ? null : row.status)),
-    created_at: rows.map((row) => (row.created_at ? new Date(row.created_at) : null)),
   });
 
   const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
@@ -763,32 +926,131 @@ async function cursorRead(cursor, rowCount) {
   });
 }
 
+async function writeCommittedPartAndCheckpoint({
+  streamClient,
+  runtime,
+  dayUtc,
+  connectorId,
+  partIndex,
+  rows,
+  committedParts,
+  observedRows,
+  totalBytes,
+}) {
+  const parquetBuffer = rowsToParquetBuffer(rows, parquetWriterProperties(runtime.row_group_size));
+  const committedKey = buildPartKey(runtime.committed_prefix, dayUtc, connectorId, partIndex);
+  const putResult = await r2PutObject({
+    r2: runtime.r2,
+    key: committedKey,
+    body: parquetBuffer,
+    content_type: "application/octet-stream",
+  });
+  const head = await r2HeadObject({ r2: runtime.r2, key: committedKey });
+  if (!head.exists) {
+    throw new Error(`Missing committed object after write: ${committedKey}`);
+  }
+
+  const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
+    ? Math.trunc(head.bytes)
+    : Math.trunc(putResult.bytes);
+  const etagOrHash = head.etag || putResult.etag || null;
+  const partEntry = {
+    key: committedKey,
+    row_count: rows.length,
+    bytes,
+    etag_or_hash: etagOrHash,
+  };
+  const nextParts = [...committedParts, partEntry];
+  const nextObservedRows = observedRows + BigInt(rows.length);
+  const nextTotalBytes = totalBytes + BigInt(bytes);
+  const nextPartIndex = partIndex + 1;
+  const lastRow = rows[rows.length - 1];
+
+  await updateCandidateResumeCheckpoint(streamClient, {
+    dayUtc,
+    connectorId,
+    runId: runtime.run_id,
+    lastTimeseriesId: Number(lastRow.timeseries_id),
+    lastObservedAt: new Date(lastRow.observed_at).toISOString(),
+    partIndex: nextPartIndex,
+    exportedRowCount: nextObservedRows,
+    parts: nextParts,
+  });
+
+  return {
+    partIndex: nextPartIndex,
+    committedParts: nextParts,
+    observedRows: nextObservedRows,
+    totalBytes: nextTotalBytes,
+  };
+}
+
 async function exportCandidateToR2({ candidate, runtime }) {
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
   const dayStart = `${dayUtc}T00:00:00.000Z`;
   const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
 
-  const writerProperties = parquetWriterProperties(runtime.row_group_size);
   const expectedRowCount = candidate.expected_row_count;
+  let committedParts = [...candidate.resume_parts];
+  let observedRows = candidate.resume_exported_row_count;
+  const observedRowsFromParts = committedParts.reduce(
+    (sum, part) => sum + BigInt(part.row_count),
+    0n,
+  );
+  if (observedRows !== observedRowsFromParts) {
+    observedRows = observedRowsFromParts;
+  }
+  let totalBytes = committedParts.reduce(
+    (sum, part) => sum + BigInt(part.bytes),
+    0n,
+  );
+  let partIndex = Number(candidate.resume_part_index || 0);
+  const resumeTimeseriesId = candidate.resume_last_timeseries_id;
+  const resumeObservedAt = candidate.resume_last_observed_at;
 
-  const stagingParts = [];
-  const committedParts = [];
-  let observedRows = 0n;
-  let totalBytes = 0n;
+  if (partIndex !== committedParts.length) {
+    throw new Error(
+      `Resume checkpoint mismatch for day=${dayUtc} connector=${connectorId}: part_index=${partIndex} parts=${committedParts.length}`,
+    );
+  }
+  if (partIndex > 0 && (resumeTimeseriesId === null || !resumeObservedAt)) {
+    throw new Error(
+      `Resume checkpoint missing key tuple for day=${dayUtc} connector=${connectorId} with part_index=${partIndex}`,
+    );
+  }
+
+  for (const part of committedParts) {
+    const head = await r2HeadObject({ r2: runtime.r2, key: part.key });
+    if (!head.exists) {
+      throw new Error(`Resume checkpoint references missing committed object: ${part.key}`);
+    }
+    if (typeof head.bytes === "number" && Number.isFinite(head.bytes)) {
+      part.bytes = Math.trunc(head.bytes);
+    }
+    part.etag_or_hash = head.etag || part.etag_or_hash || null;
+  }
+  totalBytes = committedParts.reduce((sum, part) => sum + BigInt(part.bytes), 0n);
 
   await withPgClient(runtime.supabase_db_url, async (streamClient) => {
     const sql = `
-select ${observationsSelectList(BACKUP_OBSERVATIONS_COLUMNS_V1)}
-from uk_aq_core.observations o
-where o.connector_id = $1
-  and o.observed_at >= $2::timestamptz
-  and o.observed_at < $3::timestamptz
-order by o.timeseries_id asc, o.observed_at asc
+select
+  connector_id,
+  timeseries_id,
+  observed_at,
+  value
+from uk_aq_ops.uk_aq_phase_b_backup_rows(
+  $1::integer,
+  $2::timestamptz,
+  $3::timestamptz,
+  $4::integer,
+  $5::timestamptz
+)
 `;
 
-    const cursor = streamClient.query(new Cursor(sql, [connectorId, dayStart, dayEnd]));
-    let partIndex = 0;
+    const cursor = streamClient.query(
+      new Cursor(sql, [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt]),
+    );
     let pendingRows = [];
 
     try {
@@ -804,64 +1066,45 @@ order by o.timeseries_id asc, o.observed_at asc
             timeseries_id: Number(row.timeseries_id),
             observed_at: row.observed_at,
             value: row.value,
-            status: row.status,
-            created_at: row.created_at,
           });
 
           if (pendingRows.length >= runtime.part_max_rows) {
-            const parquetBuffer = rowsToParquetBuffer(pendingRows, writerProperties);
-            const stagingKey = buildPartKey(runtime.staging_prefix, dayUtc, connectorId, partIndex);
-            const committedKey = buildPartKey(runtime.committed_prefix, dayUtc, connectorId, partIndex);
-            const putResult = await r2PutObject({
-              r2: runtime.r2,
-              key: stagingKey,
-              body: parquetBuffer,
-              content_type: "application/octet-stream",
+            const flushed = await writeCommittedPartAndCheckpoint({
+              streamClient,
+              runtime,
+              dayUtc,
+              connectorId,
+              partIndex,
+              rows: pendingRows,
+              committedParts,
+              observedRows,
+              totalBytes,
             });
-            stagingParts.push({
-              key: stagingKey,
-              row_count: pendingRows.length,
-              bytes: putResult.bytes,
-              etag_or_hash: putResult.etag || null,
-            });
-            committedParts.push({
-              key: committedKey,
-              row_count: pendingRows.length,
-              bytes: putResult.bytes,
-              etag_or_hash: putResult.etag || null,
-            });
-            observedRows += BigInt(pendingRows.length);
-            totalBytes += BigInt(putResult.bytes);
-            partIndex += 1;
+            partIndex = flushed.partIndex;
+            committedParts = flushed.committedParts;
+            observedRows = flushed.observedRows;
+            totalBytes = flushed.totalBytes;
             pendingRows = [];
           }
         }
       }
 
       if (pendingRows.length > 0) {
-        const parquetBuffer = rowsToParquetBuffer(pendingRows, writerProperties);
-        const stagingKey = buildPartKey(runtime.staging_prefix, dayUtc, connectorId, partIndex);
-        const committedKey = buildPartKey(runtime.committed_prefix, dayUtc, connectorId, partIndex);
-        const putResult = await r2PutObject({
-          r2: runtime.r2,
-          key: stagingKey,
-          body: parquetBuffer,
-          content_type: "application/octet-stream",
+        const flushed = await writeCommittedPartAndCheckpoint({
+          streamClient,
+          runtime,
+          dayUtc,
+          connectorId,
+          partIndex,
+          rows: pendingRows,
+          committedParts,
+          observedRows,
+          totalBytes,
         });
-        stagingParts.push({
-          key: stagingKey,
-          row_count: pendingRows.length,
-          bytes: putResult.bytes,
-          etag_or_hash: putResult.etag || null,
-        });
-        committedParts.push({
-          key: committedKey,
-          row_count: pendingRows.length,
-          bytes: putResult.bytes,
-          etag_or_hash: putResult.etag || null,
-        });
-        observedRows += BigInt(pendingRows.length);
-        totalBytes += BigInt(putResult.bytes);
+        partIndex = flushed.partIndex;
+        committedParts = flushed.committedParts;
+        observedRows = flushed.observedRows;
+        totalBytes = flushed.totalBytes;
       }
     } finally {
       await closeCursor(cursor);
@@ -872,34 +1115,6 @@ order by o.timeseries_id asc, o.observed_at asc
     throw new Error(
       `Row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${expectedRowCount.toString()} observed=${observedRows.toString()}`,
     );
-  }
-
-  for (const part of stagingParts) {
-    const head = await r2HeadObject({ r2: runtime.r2, key: part.key });
-    if (!head.exists) {
-      throw new Error(`Missing staged object: ${part.key}`);
-    }
-  }
-
-  for (let index = 0; index < stagingParts.length; index += 1) {
-    const staged = stagingParts[index];
-    const committed = committedParts[index];
-    await r2CopyObject({
-      r2: runtime.r2,
-      source_key: staged.key,
-      dest_key: committed.key,
-    });
-  }
-
-  for (const part of committedParts) {
-    const head = await r2HeadObject({ r2: runtime.r2, key: part.key });
-    if (!head.exists) {
-      throw new Error(`Missing committed object: ${part.key}`);
-    }
-    part.etag_or_hash = head.etag || part.etag_or_hash || null;
-    if (typeof head.bytes === "number" && Number.isFinite(head.bytes)) {
-      part.bytes = head.bytes;
-    }
   }
 
   const backedUpAtUtc = nowIso();
@@ -1256,7 +1471,8 @@ export async function runPhaseBBackup({
         day_utc: candidate.day_utc,
         connector_id: candidate.connector_id,
         expected_row_count: candidate.expected_row_count.toString(),
-        planned_staging_prefix: connectorPrefix(runtime.staging_prefix, candidate.day_utc, candidate.connector_id),
+        resume_part_index: Number(candidate.resume_part_index || 0),
+        resume_exported_row_count: candidate.resume_exported_row_count.toString(),
         planned_committed_prefix: connectorPrefix(runtime.committed_prefix, candidate.day_utc, candidate.connector_id),
         planned_manifest_key: buildConnectorManifestKey(
           runtime.committed_prefix,
@@ -1317,6 +1533,8 @@ export async function runPhaseBBackup({
           run_id: runId,
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
+          resumed_from_part_index: Number(candidate.resume_part_index || 0),
+          resumed_from_row_count: candidate.resume_exported_row_count.toString(),
           expected_row_count: candidate.expected_row_count.toString(),
           written_row_count: exportResult.written_row_count.toString(),
           file_count: exportResult.file_count,
@@ -1350,6 +1568,8 @@ export async function runPhaseBBackup({
           run_id: runId,
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
+          resumed_from_part_index: Number(candidate.resume_part_index || 0),
+          resumed_from_row_count: candidate.resume_exported_row_count.toString(),
           error: message,
           next_action: "retry_safe",
           prune_blocked_for_day: true,

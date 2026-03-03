@@ -24,6 +24,7 @@ Each gcloud-facing service now lives under `workers/`:
 - verifies hourly fingerprints (ingest vs history)
 - prunes only verified ingest hour buckets
 - can repair mismatches through outbox replay before re-check
+- Phase B backup uses server-side projection + resume checkpoints so failed exports can continue without re-reading completed parts
 
 Required env:
 
