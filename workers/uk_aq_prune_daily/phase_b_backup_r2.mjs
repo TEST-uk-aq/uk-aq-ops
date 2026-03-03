@@ -1000,7 +1000,7 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
 }
 
 async function cleanupStaging({ runtime, logStructured }) {
-  const thresholdMs = Date.now() - (runtime.staging_retention_days * DAY_MS);
+  const thresholdMs = (Date.now() - (runtime.staging_retention_days * DAY_MS));
   const entries = await r2ListAllObjects({
     r2: runtime.r2,
     prefix: `${runtime.staging_prefix}/`,
