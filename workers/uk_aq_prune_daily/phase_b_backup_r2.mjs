@@ -160,11 +160,24 @@ function statsFromFileEntries(fileEntries, totalRows) {
 
   const bytes = fileEntries.map((entry) => Number(entry.bytes || 0));
   const totalBytes = bytes.reduce((sum, value) => sum + value, 0);
+
+  let minBytes = bytes[0];
+  let maxBytes = bytes[0];
+  for (let i = 1; i < bytes.length; i++) {
+    const value = bytes[i];
+    if (value < minBytes) {
+      minBytes = value;
+    }
+    if (value > maxBytes) {
+      maxBytes = value;
+    }
+  }
+
   return {
     bytes_per_row_estimate: totalRows > 0 ? totalBytes / Number(totalRows) : null,
     avg_file_bytes: averageNumber(totalBytes, bytes.length),
-    min_file_bytes: Math.min(...bytes),
-    max_file_bytes: Math.max(...bytes),
+    min_file_bytes: minBytes,
+    max_file_bytes: maxBytes,
   };
 }
 
