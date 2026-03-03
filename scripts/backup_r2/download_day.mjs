@@ -73,7 +73,11 @@ function sanitizeOutputDirName(rawOutDir) {
 
 async function downloadObject(r2, objectKey, targetPath) {
   const object = await r2GetObject({ r2, key: objectKey });
+  if (!Buffer.isBuffer(object.body)) {
+    throw new Error(`R2 object body is not binary data: ${objectKey}`);
+  }
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  // lgtm[js/http-to-file-access] R2 backup downloader intentionally persists validated remote backup objects.
   fs.writeFileSync(targetPath, object.body);
   return {
     key: objectKey,
@@ -102,7 +106,9 @@ async function main() {
 
   const manifestTarget = path.join(outDir, "manifest.json");
   fs.mkdirSync(path.dirname(manifestTarget), { recursive: true });
-  fs.writeFileSync(manifestTarget, manifestObject.body);
+  // Write normalized JSON rather than the raw payload blob from transport.
+  // lgtm[js/http-to-file-access] Downloader intentionally stores fetched manifest metadata locally.
+  fs.writeFileSync(manifestTarget, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const parquetKeys = Array.isArray(manifest.parquet_object_keys)
     ? manifest.parquet_object_keys.map((key) => String(key))
