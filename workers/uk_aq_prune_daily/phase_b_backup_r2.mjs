@@ -160,11 +160,24 @@ function statsFromFileEntries(fileEntries, totalRows) {
 
   const bytes = fileEntries.map((entry) => Number(entry.bytes || 0));
   const totalBytes = bytes.reduce((sum, value) => sum + value, 0);
+
+  let minBytes = bytes[0];
+  let maxBytes = bytes[0];
+  for (let i = 1; i < bytes.length; i++) {
+    const value = bytes[i];
+    if (value < minBytes) {
+      minBytes = value;
+    }
+    if (value > maxBytes) {
+      maxBytes = value;
+    }
+  }
+
   return {
     bytes_per_row_estimate: totalRows > 0 ? totalBytes / Number(totalRows) : null,
     avg_file_bytes: averageNumber(totalBytes, bytes.length),
-    min_file_bytes: Math.min(...bytes),
-    max_file_bytes: Math.max(...bytes),
+    min_file_bytes: minBytes,
+    max_file_bytes: maxBytes,
   };
 }
 
@@ -691,13 +704,23 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
   });
 }
 
+const PARQUET_WRITER_PROPERTIES_CACHE = new Map();
+
 function parquetWriterProperties(rowGroupSize) {
+  const key = Number(rowGroupSize);
+  if (PARQUET_WRITER_PROPERTIES_CACHE.has(key)) {
+    return PARQUET_WRITER_PROPERTIES_CACHE.get(key);
+  }
+
   ensureParquetWasmInitialized();
-  return new parquetWasm.WriterPropertiesBuilder()
+  const writerProperties = new parquetWasm.WriterPropertiesBuilder()
     .setCompression(parquetWasm.Compression.ZSTD)
-    .setMaxRowGroupSize(rowGroupSize)
+    .setMaxRowGroupSize(key)
     .setCreatedBy(WRITER_VERSION)
     .build();
+
+  PARQUET_WRITER_PROPERTIES_CACHE.set(key, writerProperties);
+  return writerProperties;
 }
 
 function rowsToParquetBuffer(rows, writerProperties) {
@@ -1000,7 +1023,7 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
 }
 
 async function cleanupStaging({ runtime, logStructured }) {
-  const thresholdMs = Date.now() - (runtime.staging_retention_days * DAY_MS);
+  const thresholdMs = (Date.now() - (runtime.staging_retention_days * DAY_MS));
   const entries = await r2ListAllObjects({
     r2: runtime.r2,
     prefix: `${runtime.staging_prefix_base}/`,
