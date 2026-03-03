@@ -691,13 +691,23 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
   });
 }
 
+const PARQUET_WRITER_PROPERTIES_CACHE = new Map();
+
 function parquetWriterProperties(rowGroupSize) {
+  const key = Number(rowGroupSize);
+  if (PARQUET_WRITER_PROPERTIES_CACHE.has(key)) {
+    return PARQUET_WRITER_PROPERTIES_CACHE.get(key);
+  }
+
   ensureParquetWasmInitialized();
-  return new parquetWasm.WriterPropertiesBuilder()
+  const writerProperties = new parquetWasm.WriterPropertiesBuilder()
     .setCompression(parquetWasm.Compression.ZSTD)
-    .setMaxRowGroupSize(rowGroupSize)
+    .setMaxRowGroupSize(key)
     .setCreatedBy(WRITER_VERSION)
     .build();
+
+  PARQUET_WRITER_PROPERTIES_CACHE.set(key, writerProperties);
+  return writerProperties;
 }
 
 function rowsToParquetBuffer(rows, writerProperties) {
