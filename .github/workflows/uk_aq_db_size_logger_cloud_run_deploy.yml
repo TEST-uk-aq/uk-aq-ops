@@ -56,7 +56,6 @@ jobs:
       AGGDAILY_SECRET_KEY: ${{ secrets.AGGDAILY_SECRET_KEY }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
-      AGGDAILY_SECRET_KEY_SECRET_NAME: ${{ vars.AGGDAILY_SECRET_KEY_SECRET_NAME || 'AGGDAILY_SECRET_KEY' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -186,7 +185,7 @@ jobs:
           if [ -n "${AGGDAILY_SUPABASE_URL:-}" ]; then
             aggdaily_required=1
           fi
-          upsert_secret "${AGGDAILY_SECRET_KEY_SECRET_NAME}" "${AGGDAILY_SECRET_KEY}" "${aggdaily_required}"
+          upsert_secret "AGGDAILY_SECRET_KEY" "${AGGDAILY_SECRET_KEY}" "${aggdaily_required}"
 
       - name: Build Cloud Run env and secret args
         id: cloudrun_args
@@ -256,7 +255,7 @@ jobs:
           if [ -n "${AGGDAILY_SUPABASE_URL:-}" ]; then
             aggdaily_required=1
           fi
-          add_secret_binding "AGGDAILY_SECRET_KEY" "${AGGDAILY_SECRET_KEY_SECRET_NAME}" "${aggdaily_required}"
+          add_secret_binding "AGGDAILY_SECRET_KEY" "AGGDAILY_SECRET_KEY" "${aggdaily_required}"
 
           env_file="${RUNNER_TEMP}/uk-aq-db-size-logger-env.yaml"
           : > "${env_file}"

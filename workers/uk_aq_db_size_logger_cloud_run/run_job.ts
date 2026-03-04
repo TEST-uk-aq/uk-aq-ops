@@ -6,9 +6,10 @@ type RpcResult<T> = {
 };
 
 type DbSizeSample = {
-  database_label: string;
+  database_label: "ingestdb" | "historydb" | "aggdailydb";
   database_name: string;
   size_bytes: number;
+  oldest_observed_at: string | null;
   sampled_at: string;
 };
 
@@ -49,16 +50,20 @@ const AGGDAILY_DB_LABEL = parseDatabaseLabel(
   "aggdailydb",
 );
 
+if ((AGGDAILY_SUPABASE_URL && !AGGDAILY_PRIVILEGED_KEY) ||
+  (!AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  throw new Error(
+    "Agg Daily config requires both AGGDAILY_SUPABASE_URL and AGGDAILY_SECRET_KEY",
+  );
+}
+const AGGDAILY_ENABLED = Boolean(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY);
+
 function requiredEnv(name: string): string {
   const value = (Deno.env.get(name) || "").trim();
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
-}
-
-function optionalEnv(name: string): string {
-  return (Deno.env.get(name) || "").trim();
 }
 
 function requiredEnvAny(names: string[]): string {
@@ -73,6 +78,11 @@ function requiredEnvAny(names: string[]): string {
   );
 }
 
+function optionalEnv(name: string): string | null {
+  const value = (Deno.env.get(name) || "").trim();
+  return value || null;
+}
+
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   const value = Number(raw || "");
   if (!Number.isFinite(value) || value <= 0) {
@@ -83,13 +93,30 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 
 function parseDatabaseLabel(
   raw: string | undefined,
-  fallback: string,
-): string {
+  fallback: "ingestdb" | "historydb" | "aggdailydb",
+): "ingestdb" | "historydb" | "aggdailydb" {
   const value = (raw || "").trim().toLowerCase();
-  if (value && /^[a-z0-9_]+$/.test(value)) {
+  if (value === "ingestdb" || value === "historydb" || value === "aggdailydb") {
     return value;
   }
   return fallback;
+}
+
+function parseIsoTimestamp(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) {
+    return null;
+  }
+  return new Date(ms).toISOString();
+}
+
+function isMissingOldestUpsertArgError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes("p_oldest_observed_at") &&
+    normalized.includes("uk_aq_rpc_db_size_metric_upsert");
 }
 
 function sleep(ms: number): Promise<void> {
@@ -178,7 +205,7 @@ async function postgrestRpc<T>(
 }
 
 function parseDbSizeSample(
-  databaseLabel: string,
+  databaseLabel: "ingestdb" | "historydb" | "aggdailydb",
   payload: unknown,
 ): DbSizeSample {
   if (!Array.isArray(payload) || payload.length === 0) {
@@ -194,9 +221,8 @@ function parseDbSizeSample(
     ? root.database_name.trim()
     : "";
   const sizeBytes = Number(root.size_bytes);
-  const sampledAtText = typeof root.sampled_at === "string"
-    ? root.sampled_at
-    : "";
+  const sampledAt = parseIsoTimestamp(root.sampled_at) || new Date().toISOString();
+  const oldestObservedAt = parseIsoTimestamp(root.oldest_observed_at);
 
   if (!databaseName) {
     throw new Error(`${databaseLabel}: missing database_name`);
@@ -205,17 +231,17 @@ function parseDbSizeSample(
     throw new Error(`${databaseLabel}: invalid size_bytes`);
   }
 
-  const sampledAt = sampledAtText || new Date().toISOString();
   return {
     database_label: databaseLabel,
     database_name: databaseName,
     size_bytes: Math.trunc(sizeBytes),
+    oldest_observed_at: oldestObservedAt,
     sampled_at: sampledAt,
   };
 }
 
 async function collectDbSizeSample(
-  databaseLabel: string,
+  databaseLabel: "ingestdb" | "historydb" | "aggdailydb",
   baseUrl: string,
   privilegedKey: string,
 ): Promise<DbSizeSample> {
@@ -232,18 +258,35 @@ async function collectDbSizeSample(
 }
 
 async function upsertDbSizeSample(sample: DbSizeSample): Promise<void> {
-  const result = await postgrestRpc<unknown>(
+  const baseArgs: Record<string, unknown> = {
+    p_database_label: sample.database_label,
+    p_database_name: sample.database_name,
+    p_size_bytes: sample.size_bytes,
+    p_recorded_at: sample.sampled_at,
+    p_source: "uk_aq_db_size_logger_cloud_run",
+  };
+  const maybeExtendedArgs = sample.oldest_observed_at
+    ? { ...baseArgs, p_oldest_observed_at: sample.oldest_observed_at }
+    : baseArgs;
+
+  let result = await postgrestRpc<unknown>(
     SUPABASE_URL,
     SUPABASE_PRIVILEGED_KEY,
     DB_SIZE_UPSERT_RPC,
-    {
-      p_database_label: sample.database_label,
-      p_database_name: sample.database_name,
-      p_size_bytes: sample.size_bytes,
-      p_recorded_at: sample.sampled_at,
-      p_source: "uk_aq_db_size_logger_cloud_run",
-    },
+    maybeExtendedArgs,
   );
+  if (
+    result.error &&
+    "p_oldest_observed_at" in maybeExtendedArgs &&
+    isMissingOldestUpsertArgError(result.error.message)
+  ) {
+    result = await postgrestRpc<unknown>(
+      SUPABASE_URL,
+      SUPABASE_PRIVILEGED_KEY,
+      DB_SIZE_UPSERT_RPC,
+      baseArgs,
+    );
+  }
   if (result.error) {
     throw new Error(
       `${sample.database_label}: upsert failed: ${result.error.message}`,
@@ -282,51 +325,40 @@ async function main(): Promise<void> {
     retention_days: DB_SIZE_RETENTION_DAYS,
     ingest_label: INGEST_DB_LABEL,
     history_label: HISTORY_DB_LABEL,
+    aggdaily_enabled: AGGDAILY_ENABLED,
     aggdaily_label: AGGDAILY_DB_LABEL,
-    aggdaily_enabled: Boolean(AGGDAILY_SUPABASE_URL),
   });
-
-  const samples: DbSizeSample[] = [];
 
   const ingestSample = await collectDbSizeSample(
     INGEST_DB_LABEL,
     SUPABASE_URL,
     SUPABASE_PRIVILEGED_KEY,
   );
-  samples.push(ingestSample);
-
   const historySample = await collectDbSizeSample(
     HISTORY_DB_LABEL,
     HISTORY_SUPABASE_URL,
     HISTORY_PRIVILEGED_KEY,
   );
-  samples.push(historySample);
-
-  if (AGGDAILY_SUPABASE_URL) {
-    if (!AGGDAILY_PRIVILEGED_KEY) {
-      throw new Error(
-        "Missing required environment variable: AGGDAILY_SECRET_KEY (required when AGGDAILY_SUPABASE_URL is set)",
-      );
-    }
-    const aggdailySample = await collectDbSizeSample(
+  const aggdailySample = AGGDAILY_ENABLED
+    ? await collectDbSizeSample(
       AGGDAILY_DB_LABEL,
-      AGGDAILY_SUPABASE_URL,
-      AGGDAILY_PRIVILEGED_KEY,
-    );
-    samples.push(aggdailySample);
-  }
+      AGGDAILY_SUPABASE_URL as string,
+      AGGDAILY_PRIVILEGED_KEY as string,
+    )
+    : null;
 
-  for (const sample of samples) {
-    await upsertDbSizeSample(sample);
+  await upsertDbSizeSample(ingestSample);
+  await upsertDbSizeSample(historySample);
+  if (aggdailySample) {
+    await upsertDbSizeSample(aggdailySample);
   }
   const rowsDeleted = await cleanupOldRows(DB_SIZE_RETENTION_DAYS);
-  const samplesByLabel = Object.fromEntries(
-    samples.map((sample) => [sample.database_label, sample]),
-  );
 
   console.log("uk_aq_db_size_logger_summary", {
     started_at: startedAt,
-    samples: samplesByLabel,
+    ingestdb: ingestSample,
+    historydb: historySample,
+    aggdailydb: aggdailySample,
     rows_deleted: rowsDeleted,
   });
 }
