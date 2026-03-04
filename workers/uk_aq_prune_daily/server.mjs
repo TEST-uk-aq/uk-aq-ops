@@ -20,6 +20,10 @@ const DEFAULT_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE = 1_000;
 const DEFAULT_FLUSH_CLAIM_BATCH_LIMIT = 20;
 const DEFAULT_MAX_FLUSH_BATCHES = 30;
 const DEFAULT_MAX_HOURS_PER_BATCH = 24;
+const DEFAULT_HISTORY_UPSERT_RPC_RETRIES = 3;
+const DEFAULT_HISTORY_UPSERT_RETRY_BASE_MS = 1_000;
+const DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
+const DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const PREVIEW_LIMIT = 25;
 const RPC_SCHEMA = "uk_aq_public";
 
@@ -83,6 +87,35 @@ function parsePositiveInt(raw, fallback, min = 1, max = 1_000_000) {
     return max;
   }
   return intValue;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function historyUpsertErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 400 ? `${message.slice(0, 397)}...` : message;
+}
+
+function isHistoryStatementTimeoutError(message) {
+  return /statement timeout|canceling statement due to statement timeout/i.test(message);
+}
+
+function isRetryableHistoryUpsertError(message) {
+  const normalized = message.toLowerCase();
+  return (
+    isHistoryStatementTimeoutError(normalized)
+    || normalized.includes("deadlock detected")
+    || normalized.includes("could not serialize access due to")
+    || normalized.includes("connection terminated")
+    || normalized.includes("connection reset")
+    || normalized.includes("http 429")
+    || normalized.includes("http 500")
+    || normalized.includes("http 502")
+    || normalized.includes("http 503")
+    || normalized.includes("http 504")
+  );
 }
 
 function normalizeDropboxPath(raw) {
@@ -772,6 +805,66 @@ function buildReceiptRows(historyRows) {
   return Array.from(deduped.values());
 }
 
+async function upsertHistoryRowsChunk(historyClient, rows) {
+  const upsertResult = await historyClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_UPSERT, {
+    rows,
+  });
+  if (upsertResult.error) {
+    throw new Error(upsertResult.error.message || "unknown_history_upsert_error");
+  }
+  const upsertRow = Array.isArray(upsertResult.data) ? upsertResult.data[0] : upsertResult.data;
+  return toIntField(
+    upsertRow?.observations_upserted ?? rows.length,
+    "observations_upserted",
+  );
+}
+
+async function upsertHistoryRowsWithFallback(historyClient, rows, splitDepth = 0) {
+  let lastMessage = "unknown_history_upsert_error";
+
+  for (let attempt = 1; attempt <= DEFAULT_HISTORY_UPSERT_RPC_RETRIES; attempt += 1) {
+    try {
+      return await upsertHistoryRowsChunk(historyClient, rows);
+    } catch (error) {
+      lastMessage = historyUpsertErrorMessage(error);
+      if (
+        attempt < DEFAULT_HISTORY_UPSERT_RPC_RETRIES
+        && isRetryableHistoryUpsertError(lastMessage)
+      ) {
+        await sleep(Math.min(5_000, DEFAULT_HISTORY_UPSERT_RETRY_BASE_MS * attempt));
+        continue;
+      }
+      break;
+    }
+  }
+
+  if (
+    isHistoryStatementTimeoutError(lastMessage)
+    && splitDepth < DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH
+    && rows.length >= DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MIN_ROWS * 2
+  ) {
+    const midpoint = Math.floor(rows.length / 2);
+    const leftRows = rows.slice(0, midpoint);
+    const rightRows = rows.slice(midpoint);
+    if (!leftRows.length || !rightRows.length) {
+      throw new Error(`history upsert failed: ${lastMessage}`);
+    }
+    const leftUpserted = await upsertHistoryRowsWithFallback(
+      historyClient,
+      leftRows,
+      splitDepth + 1,
+    );
+    const rightUpserted = await upsertHistoryRowsWithFallback(
+      historyClient,
+      rightRows,
+      splitDepth + 1,
+    );
+    return leftUpserted + rightUpserted;
+  }
+
+  throw new Error(`history upsert failed: ${lastMessage}`);
+}
+
 async function enqueueHistoryOutboxRepairBucket(client, mismatch, chunkSize) {
   const connectorId = toIntField(mismatch.connector_id, "mismatch.connector_id");
   const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_ENQUEUE_HOUR_BUCKET, {
@@ -835,17 +928,7 @@ async function flushHistoryOutbox(mainClient, historyClient, claimBatchLimit, ma
       }
     } else {
       try {
-        const upsertResult = await historyClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_UPSERT, {
-          rows: historyRows,
-        });
-        if (upsertResult.error) {
-          throw new Error(upsertResult.error.message);
-        }
-        const upsertRow = Array.isArray(upsertResult.data) ? upsertResult.data[0] : upsertResult.data;
-        summary.delivered_rows += toIntField(
-          upsertRow?.observations_upserted ?? historyRows.length,
-          "observations_upserted",
-        );
+        summary.delivered_rows += await upsertHistoryRowsWithFallback(historyClient, historyRows);
 
         const receiptRows = buildReceiptRows(historyRows);
         if (receiptRows.length) {
