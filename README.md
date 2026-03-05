@@ -74,8 +74,17 @@ Primary controls:
 
 - `GET /` health
 - `POST /` executes logger job
-- samples ingest + history DB size via RPC
-- upserts metrics and runs retention cleanup
+- samples ingest + history DB size via RPC (optional aggdaily)
+- upserts metrics and runs retention cleanup in each source DB's local metrics table
+- default GitHub deploy keeps Cloud Scheduler disabled; Supabase `pg_cron` is the primary hourly scheduler
+
+### 5) DB Size Metrics API Worker (`workers/uk_aq_db_size_metrics_api_worker/worker.mjs`)
+
+- `GET /v1/db-size-metrics`
+- dashboard fan-in endpoint for DB size trend rows
+- reads `uk_aq_public.uk_aq_db_size_metrics_hourly` from ingest + history + optional aggdaily
+- preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
+- optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 
 ## Local run
 

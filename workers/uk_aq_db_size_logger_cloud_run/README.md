@@ -1,13 +1,15 @@
 # uk_aq DB size logger Cloud Run service
 
 This Cloud Run service samples current Postgres database size for both ingest DB
-and history DB once per run, then writes hourly points into
-`uk_aq_raw.db_size_metrics_hourly` in ingest DB.
+and history DB once per run, then writes hourly points into each DB's local
+`uk_aq_ops.db_size_metrics_hourly` table (through
+`uk_aq_public.uk_aq_rpc_db_size_metric_upsert`).
 Agg Daily DB sampling is optional and enabled when its URL + secret are supplied.
 Each sample also captures the oldest `observed_at` timestamp currently present in
 that database's observations table.
 
-Scheduler triggers the service with an authenticated POST request.
+Primary scheduling is now Supabase `pg_cron` in each DB (local sample/write).
+Cloud Run service remains available for manual/on-demand runs or fallback scheduling.
 
 ## Required env vars / secrets
 

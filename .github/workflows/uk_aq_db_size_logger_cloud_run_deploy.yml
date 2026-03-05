@@ -33,7 +33,7 @@ jobs:
       SERVICE_CONCURRENCY: ${{ vars.GCP_DB_SIZE_LOGGER_SERVICE_CONCURRENCY || vars.DB_SIZE_LOGGER_SERVICE_CONCURRENCY || '1' }}
       SERVICE_MAX_INSTANCES: ${{ vars.GCP_DB_SIZE_LOGGER_SERVICE_MAX_INSTANCES || vars.DB_SIZE_LOGGER_SERVICE_MAX_INSTANCES || '1' }}
       SERVICE_MIN_INSTANCES: ${{ vars.GCP_DB_SIZE_LOGGER_SERVICE_MIN_INSTANCES || vars.DB_SIZE_LOGGER_SERVICE_MIN_INSTANCES || '0' }}
-      SCHEDULER_ENABLED: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_ENABLED || vars.DB_SIZE_LOGGER_SCHEDULER_ENABLED || 'true' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_ENABLED || vars.DB_SIZE_LOGGER_SCHEDULER_ENABLED || 'false' }}
       SCHEDULER_JOB_NAME: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_JOB_NAME || vars.DB_SIZE_LOGGER_SCHEDULER_JOB_NAME || 'uk-aq-db-size-logger-hourly' }}
       SCHEDULER_CRON: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_CRON || vars.DB_SIZE_LOGGER_SCHEDULER_CRON || '0 * * * *' }}
       SCHEDULER_TIMEZONE: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_TIMEZONE || vars.DB_SIZE_LOGGER_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
@@ -317,7 +317,12 @@ jobs:
 
           enabled="$(printf '%s' "${SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
-            echo "Skipping scheduler trigger management (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
+            if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
+              gcloud scheduler jobs pause "${SCHEDULER_JOB_NAME}" --location "${REGION}" || true
+              echo "Paused existing scheduler job ${SCHEDULER_JOB_NAME} (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
+            else
+              echo "Scheduler job ${SCHEDULER_JOB_NAME} not found; nothing to pause."
+            fi
             exit 0
           fi
 

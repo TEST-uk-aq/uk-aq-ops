@@ -13,6 +13,12 @@ type DbSizeSample = {
   sampled_at: string;
 };
 
+type DbSource = {
+  database_label: "ingestdb" | "historydb" | "aggdailydb";
+  base_url: string;
+  privileged_key: string;
+};
+
 const SUPABASE_URL = requiredEnv("SUPABASE_URL");
 const SUPABASE_PRIVILEGED_KEY = requiredEnvAny(["SB_SECRET_KEY"]);
 const HISTORY_SUPABASE_URL = requiredEnv("HISTORY_SUPABASE_URL");
@@ -257,7 +263,10 @@ async function collectDbSizeSample(
   return parseDbSizeSample(databaseLabel, result.data);
 }
 
-async function upsertDbSizeSample(sample: DbSizeSample): Promise<void> {
+async function upsertDbSizeSample(
+  target: DbSource,
+  sample: DbSizeSample,
+): Promise<void> {
   const baseArgs: Record<string, unknown> = {
     p_database_label: sample.database_label,
     p_database_name: sample.database_name,
@@ -270,8 +279,8 @@ async function upsertDbSizeSample(sample: DbSizeSample): Promise<void> {
     : baseArgs;
 
   let result = await postgrestRpc<unknown>(
-    SUPABASE_URL,
-    SUPABASE_PRIVILEGED_KEY,
+    target.base_url,
+    target.privileged_key,
     DB_SIZE_UPSERT_RPC,
     maybeExtendedArgs,
   );
@@ -281,8 +290,8 @@ async function upsertDbSizeSample(sample: DbSizeSample): Promise<void> {
     isMissingOldestUpsertArgError(result.error.message)
   ) {
     result = await postgrestRpc<unknown>(
-      SUPABASE_URL,
-      SUPABASE_PRIVILEGED_KEY,
+      target.base_url,
+      target.privileged_key,
       DB_SIZE_UPSERT_RPC,
       baseArgs,
     );
@@ -294,15 +303,20 @@ async function upsertDbSizeSample(sample: DbSizeSample): Promise<void> {
   }
 }
 
-async function cleanupOldRows(retentionDays: number): Promise<number> {
+async function cleanupOldRows(
+  target: DbSource,
+  retentionDays: number,
+): Promise<number> {
   const result = await postgrestRpc<unknown>(
-    SUPABASE_URL,
-    SUPABASE_PRIVILEGED_KEY,
+    target.base_url,
+    target.privileged_key,
     DB_SIZE_CLEANUP_RPC,
     { p_retention_days: retentionDays },
   );
   if (result.error) {
-    throw new Error(`cleanup failed: ${result.error.message}`);
+    throw new Error(
+      `${target.database_label}: cleanup failed: ${result.error.message}`,
+    );
   }
   if (!Array.isArray(result.data) || result.data.length === 0) {
     return 0;
@@ -319,6 +333,26 @@ async function cleanupOldRows(retentionDays: number): Promise<number> {
 }
 
 async function main(): Promise<void> {
+  const sources: DbSource[] = [
+    {
+      database_label: INGEST_DB_LABEL,
+      base_url: SUPABASE_URL,
+      privileged_key: SUPABASE_PRIVILEGED_KEY,
+    },
+    {
+      database_label: HISTORY_DB_LABEL,
+      base_url: HISTORY_SUPABASE_URL,
+      privileged_key: HISTORY_PRIVILEGED_KEY,
+    },
+  ];
+  if (AGGDAILY_ENABLED) {
+    sources.push({
+      database_label: AGGDAILY_DB_LABEL,
+      base_url: AGGDAILY_SUPABASE_URL as string,
+      privileged_key: AGGDAILY_PRIVILEGED_KEY as string,
+    });
+  }
+
   const startedAt = new Date().toISOString();
   console.log("uk_aq_db_size_logger_start", {
     started_at: startedAt,
@@ -327,39 +361,43 @@ async function main(): Promise<void> {
     history_label: HISTORY_DB_LABEL,
     aggdaily_enabled: AGGDAILY_ENABLED,
     aggdaily_label: AGGDAILY_DB_LABEL,
+    targets: sources.map((source) => source.database_label),
   });
 
-  const ingestSample = await collectDbSizeSample(
-    INGEST_DB_LABEL,
-    SUPABASE_URL,
-    SUPABASE_PRIVILEGED_KEY,
-  );
-  const historySample = await collectDbSizeSample(
-    HISTORY_DB_LABEL,
-    HISTORY_SUPABASE_URL,
-    HISTORY_PRIVILEGED_KEY,
-  );
-  const aggdailySample = AGGDAILY_ENABLED
-    ? await collectDbSizeSample(
-      AGGDAILY_DB_LABEL,
-      AGGDAILY_SUPABASE_URL as string,
-      AGGDAILY_PRIVILEGED_KEY as string,
-    )
-    : null;
+  const samplesByLabel: Record<"ingestdb" | "historydb" | "aggdailydb", DbSizeSample | null> = {
+    ingestdb: null,
+    historydb: null,
+    aggdailydb: null,
+  };
+  const rowsDeletedByLabel: Record<"ingestdb" | "historydb" | "aggdailydb", number> = {
+    ingestdb: 0,
+    historydb: 0,
+    aggdailydb: 0,
+  };
 
-  await upsertDbSizeSample(ingestSample);
-  await upsertDbSizeSample(historySample);
-  if (aggdailySample) {
-    await upsertDbSizeSample(aggdailySample);
+  for (const source of sources) {
+    const sample = await collectDbSizeSample(
+      source.database_label,
+      source.base_url,
+      source.privileged_key,
+    );
+    await upsertDbSizeSample(source, sample);
+    const deleted = await cleanupOldRows(source, DB_SIZE_RETENTION_DAYS);
+
+    samplesByLabel[source.database_label] = sample;
+    rowsDeletedByLabel[source.database_label] = deleted;
   }
-  const rowsDeleted = await cleanupOldRows(DB_SIZE_RETENTION_DAYS);
+
+  const rowsDeleted = rowsDeletedByLabel.ingestdb + rowsDeletedByLabel.historydb +
+    rowsDeletedByLabel.aggdailydb;
 
   console.log("uk_aq_db_size_logger_summary", {
     started_at: startedAt,
-    ingestdb: ingestSample,
-    historydb: historySample,
-    aggdailydb: aggdailySample,
+    ingestdb: samplesByLabel.ingestdb,
+    historydb: samplesByLabel.historydb,
+    aggdailydb: samplesByLabel.aggdailydb,
     rows_deleted: rowsDeleted,
+    rows_deleted_by_db: rowsDeletedByLabel,
   });
 }
 
