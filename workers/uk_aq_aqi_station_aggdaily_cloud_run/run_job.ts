@@ -5,8 +5,6 @@ type RpcResult<T> = {
   error: RpcError | null;
 };
 
-type RpcQueryParams = Record<string, string | number | boolean>;
-
 type RunMode = "fast" | "reconcile_short" | "reconcile_deep" | "backfill";
 
 type SourceRow = {
@@ -241,16 +239,8 @@ async function postgrestRpc<T>(
   privilegedKey: string,
   rpcName: string,
   args: Record<string, unknown>,
-  queryParams?: RpcQueryParams,
 ): Promise<RpcResult<T>> {
-  const query = new URLSearchParams();
-  if (queryParams) {
-    for (const [key, value] of Object.entries(queryParams)) {
-      query.set(key, String(value));
-    }
-  }
-  const querySuffix = query.toString() ? `?${query.toString()}` : "";
-  const url = `${normalizeUrl(baseUrl)}/rpc/${rpcName}${querySuffix}`;
+  const url = `${normalizeUrl(baseUrl)}/rpc/${rpcName}`;
   const headers: Record<string, string> = {
     apikey: privilegedKey,
     Authorization: `Bearer ${privilegedKey}`,
@@ -427,40 +417,82 @@ function parseSourceRows(payload: unknown): SourceRow[] {
   return rows;
 }
 
-async function fetchSourceRows(sourceArgs: Record<string, unknown>): Promise<SourceRow[]> {
-  const rows: SourceRow[] = [];
-  let offset = 0;
-  let page = 0;
+function hasStatementTimeout(message: string): boolean {
+  return message.toLowerCase().includes("statement timeout");
+}
 
-  while (true) {
-    page += 1;
-    if (page > 10000) {
-      throw new Error("source RPC pagination exceeded 10000 pages");
-    }
+function hourDiff(start: Date, endExclusive: Date): number {
+  const diffMs = endExclusive.getTime() - start.getTime();
+  return Math.max(0, Math.round(diffMs / ONE_HOUR_MS));
+}
 
-    const sourceResult = await postgrestRpc<unknown>(
-      INGEST_SUPABASE_URL,
-      INGEST_PRIVILEGED_KEY,
-      SOURCE_RPC,
-      sourceArgs,
-      {
-        limit: SOURCE_PAGE_SIZE,
-        offset,
-      },
-    );
-    if (sourceResult.error) {
-      throw new Error(`source RPC failed: ${sourceResult.error.message}`);
-    }
+function midpointHour(start: Date, endExclusive: Date): Date {
+  const hours = hourDiff(start, endExclusive);
+  const leftHours = Math.max(1, Math.floor(hours / 2));
+  return addHours(start, leftHours);
+}
 
-    const batch = parseSourceRows(sourceResult.data);
-    if (batch.length === 0) {
-      break;
-    }
-
-    rows.push(...batch);
-    offset += batch.length;
+async function fetchSourceRowsRecursive(
+  startHour: Date,
+  endHourExclusive: Date,
+  depth: number,
+): Promise<SourceRow[]> {
+  const sourceArgs: Record<string, unknown> = {
+    p_window_start: hourIso(startHour),
+    p_window_end: hourIso(endHourExclusive),
+  };
+  if (STATION_IDS && STATION_IDS.length > 0) {
+    sourceArgs.p_station_ids = STATION_IDS;
   }
 
+  const sourceResult = await postgrestRpc<unknown>(
+    INGEST_SUPABASE_URL,
+    INGEST_PRIVILEGED_KEY,
+    SOURCE_RPC,
+    sourceArgs,
+  );
+
+  const windowHours = hourDiff(startHour, endHourExclusive);
+  const canSplit = windowHours > 1 && depth < 20;
+
+  if (sourceResult.error) {
+    if (canSplit && hasStatementTimeout(sourceResult.error.message)) {
+      const mid = midpointHour(startHour, endHourExclusive);
+      const left = await fetchSourceRowsRecursive(startHour, mid, depth + 1);
+      const right = await fetchSourceRowsRecursive(mid, endHourExclusive, depth + 1);
+      return [...left, ...right];
+    }
+    throw new Error(`source RPC failed: ${sourceResult.error.message}`);
+  }
+
+  const rows = parseSourceRows(sourceResult.data);
+  const reachedApiCap = rows.length >= SOURCE_PAGE_SIZE;
+  if (reachedApiCap && canSplit) {
+    const mid = midpointHour(startHour, endHourExclusive);
+    const left = await fetchSourceRowsRecursive(startHour, mid, depth + 1);
+    const right = await fetchSourceRowsRecursive(mid, endHourExclusive, depth + 1);
+    return [...left, ...right];
+  }
+
+  if (reachedApiCap && !canSplit) {
+    throw new Error(
+      "source RPC result saturated API row cap for a 1-hour window; increase API max rows or run with station filter",
+    );
+  }
+
+  return rows;
+}
+
+async function fetchSourceRows(sourceStart: Date, sourceEndExclusive: Date): Promise<SourceRow[]> {
+  const rows = await fetchSourceRowsRecursive(sourceStart, sourceEndExclusive, 0);
+  rows.sort((a, b) => {
+    if (a.timestamp_hour_utc < b.timestamp_hour_utc) return -1;
+    if (a.timestamp_hour_utc > b.timestamp_hour_utc) return 1;
+    if (a.station_id !== b.station_id) return a.station_id - b.station_id;
+    if (a.pollutant_code < b.pollutant_code) return -1;
+    if (a.pollutant_code > b.pollutant_code) return 1;
+    return 0;
+  });
   return rows;
 }
 
@@ -828,15 +860,7 @@ async function main(): Promise<void> {
   let errorMessage: string | null = null;
 
   try {
-    const sourceArgs: Record<string, unknown> = {
-      p_window_start: hourIso(window.sourceStart),
-      p_window_end: hourIso(window.endExclusive),
-    };
-    if (STATION_IDS && STATION_IDS.length > 0) {
-      sourceArgs.p_station_ids = STATION_IDS;
-    }
-
-    const sourceRows = await fetchSourceRows(sourceArgs);
+    const sourceRows = await fetchSourceRows(window.sourceStart, window.endExclusive);
     sourceRowsCount = sourceRows.length;
 
     const breakpointsResult = await postgrestRpc<unknown>(

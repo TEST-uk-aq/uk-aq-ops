@@ -56,5 +56,5 @@ Computes station-hour DAQI + EAQI rows (pollutant-specific) from ingest observat
 ## Retry/Chunk Settings
 
 - `UK_AQ_AQI_RPC_RETRIES` (default `3`)
-- `UK_AQ_AQI_SOURCE_PAGE_SIZE` (default `1000`)
+- `UK_AQ_AQI_SOURCE_PAGE_SIZE` (default `1000`, used as API-cap detection threshold for adaptive source-window splitting)
 - `UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE` (default `2000`)
