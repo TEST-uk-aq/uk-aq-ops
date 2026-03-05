@@ -1,0 +1,4 @@
+Pollutant,WHO AQG levels (exposure metric),DAQI (UK) thresholds (metric),EAQI thresholds (metric)
+PM2.5,Annual AQG: 5 • 24h AQG: 15 • (24h IT-4: 25),"24h mean: Low 0–35 (idx 1–3), Moderate 36–53 (4–6), High 54–70 (7–9), Very high ≥71 (10)","1h: Good 0–5, Fair 6–15, Moderate 16–50, Poor 51–90, Very poor 91–140, Extremely poor >140"
+PM10,Annual AQG: 15 • 24h AQG: 45 • (24h IT-4: 50),"24h mean: Low 0–50 (idx 1–3), Moderate 51–75 (4–6), High 76–100 (7–9), Very high ≥101 (10)","1h: Good 0–15, Fair 16–45, Moderate 46–120, Poor 121–195, Very poor 196–270, Extremely poor >270"
+NO2,Annual AQG: 10 • 24h AQG: 25 • (24h IT-2: 50),"Hourly mean: Low 0–200 (idx 1–3), Moderate 201–400 (4–6), High 401–600 (7–9), Very high ≥601 (10)","1h: Good 0–10, Fair 11–25, Moderate 26–60, Poor 61–100, Very poor 101–150, Extremely poor >150"

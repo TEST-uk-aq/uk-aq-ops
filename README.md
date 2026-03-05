@@ -15,6 +15,7 @@ Each gcloud-facing service now lives under `workers/`:
 - `workers/uk_aq_history_outbox_flush_service/server.mjs`
 - `workers/uk_aq_history_partition_maintenance_service/server.mjs`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
+- `workers/uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`
 
 ## Services
 
@@ -86,6 +87,15 @@ Primary controls:
 - preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
 - optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 
+### 6) Station AQI AggDaily Worker (`workers/uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`)
+
+- `GET /` health
+- `POST /` executes AQI run job
+- reads station-hour pollutant means from ingest RPC
+- computes pollutant-specific DAQI + EAQI levels (PM DAQI uses rolling 24h mean)
+- upserts `station_aqi_hourly` and refreshes daily/monthly rollups in aggdaily
+- logs run telemetry (`aqi_compute_runs`) with 7-day retention cleanup
+
 ## Local run
 
 ```bash
@@ -147,9 +157,11 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_history_outbox_flush_service_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_history_partition_maintenance_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_aqi_station_aggdaily_cloud_run_deploy.yml`
 
 ## Setup docs
 
 - `system_docs/setup/uk-aq-ingestdb-prune.md`
 - `system_docs/setup/uk-aq-history-outbox-flush-service.md`
 - `system_docs/setup/uk-aq-history-partition-maintenance.md`
+- `system_docs/setup/uk-aq-aqi-station-aggdaily.md`
