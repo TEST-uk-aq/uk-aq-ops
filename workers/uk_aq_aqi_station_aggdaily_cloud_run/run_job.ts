@@ -5,6 +5,8 @@ type RpcResult<T> = {
   error: RpcError | null;
 };
 
+type RpcQueryParams = Record<string, string | number | boolean>;
+
 type RunMode = "fast" | "reconcile_short" | "reconcile_deep" | "backfill";
 
 type SourceRow = {
@@ -135,6 +137,10 @@ const HOURLY_UPSERT_CHUNK_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE"),
   2000,
 );
+const SOURCE_PAGE_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_AQI_SOURCE_PAGE_SIZE"),
+  1000,
+);
 const RUN_LOG_RETENTION_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_RUN_LOG_RETENTION_DAYS"),
   7,
@@ -235,8 +241,16 @@ async function postgrestRpc<T>(
   privilegedKey: string,
   rpcName: string,
   args: Record<string, unknown>,
+  queryParams?: RpcQueryParams,
 ): Promise<RpcResult<T>> {
-  const url = `${normalizeUrl(baseUrl)}/rpc/${rpcName}`;
+  const query = new URLSearchParams();
+  if (queryParams) {
+    for (const [key, value] of Object.entries(queryParams)) {
+      query.set(key, String(value));
+    }
+  }
+  const querySuffix = query.toString() ? `?${query.toString()}` : "";
+  const url = `${normalizeUrl(baseUrl)}/rpc/${rpcName}${querySuffix}`;
   const headers: Record<string, string> = {
     apikey: privilegedKey,
     Authorization: `Bearer ${privilegedKey}`,
@@ -410,6 +424,43 @@ function parseSourceRows(payload: unknown): SourceRow[] {
       capture_ratio: Number.isFinite(captureRatio) ? captureRatio : 0,
     });
   }
+  return rows;
+}
+
+async function fetchSourceRows(sourceArgs: Record<string, unknown>): Promise<SourceRow[]> {
+  const rows: SourceRow[] = [];
+  let offset = 0;
+  let page = 0;
+
+  while (true) {
+    page += 1;
+    if (page > 10000) {
+      throw new Error("source RPC pagination exceeded 10000 pages");
+    }
+
+    const sourceResult = await postgrestRpc<unknown>(
+      INGEST_SUPABASE_URL,
+      INGEST_PRIVILEGED_KEY,
+      SOURCE_RPC,
+      sourceArgs,
+      {
+        limit: SOURCE_PAGE_SIZE,
+        offset,
+      },
+    );
+    if (sourceResult.error) {
+      throw new Error(`source RPC failed: ${sourceResult.error.message}`);
+    }
+
+    const batch = parseSourceRows(sourceResult.data);
+    if (batch.length === 0) {
+      break;
+    }
+
+    rows.push(...batch);
+    offset += batch.length;
+  }
+
   return rows;
 }
 
@@ -785,16 +836,7 @@ async function main(): Promise<void> {
       sourceArgs.p_station_ids = STATION_IDS;
     }
 
-    const sourceResult = await postgrestRpc<unknown>(
-      INGEST_SUPABASE_URL,
-      INGEST_PRIVILEGED_KEY,
-      SOURCE_RPC,
-      sourceArgs,
-    );
-    if (sourceResult.error) {
-      throw new Error(`source RPC failed: ${sourceResult.error.message}`);
-    }
-    const sourceRows = parseSourceRows(sourceResult.data);
+    const sourceRows = await fetchSourceRows(sourceArgs);
     sourceRowsCount = sourceRows.length;
 
     const breakpointsResult = await postgrestRpc<unknown>(

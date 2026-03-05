@@ -7,8 +7,6 @@ const ALLOWED_RUN_MODES = new Set(["fast", "reconcile_short", "reconcile_deep", 
 
 let inFlight = false;
 
-/* trigger */
-
 type RequestBody = {
   trigger_mode?: unknown;
   run_mode?: unknown;
