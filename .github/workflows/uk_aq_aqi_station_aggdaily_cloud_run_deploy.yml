@@ -37,8 +37,8 @@ jobs:
       SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_AQI_STATION_AGGDAILY_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SCHEDULER_TIMEZONE: ${{ vars.GCP_AQI_STATION_AGGDAILY_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_AQI_STATION_AGGDAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
-      SCHEDULER_FAST_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_FAST_JOB_NAME || 'uk-aq-aqi-station-fast-5m' }}
-      SCHEDULER_FAST_CRON: ${{ vars.GCP_AQI_STATION_AGGDAILY_FAST_CRON || '*/5 * * * *' }}
+      SCHEDULER_FAST_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_FAST_JOB_NAME || 'uk-aq-aqi-station-sync-hourly' }}
+      SCHEDULER_FAST_CRON: ${{ vars.GCP_AQI_STATION_AGGDAILY_FAST_CRON || '20 * * * *' }}
       SCHEDULER_SHORT_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_SHORT_JOB_NAME || 'uk-aq-aqi-station-reconcile-2h' }}
       SCHEDULER_SHORT_CRON: ${{ vars.GCP_AQI_STATION_AGGDAILY_SHORT_CRON || '7 */2 * * *' }}
       SCHEDULER_DEEP_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_DEEP_JOB_NAME || 'uk-aq-aqi-station-reconcile-deep-daily' }}
@@ -46,13 +46,13 @@ jobs:
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       AGGDAILY_SUPABASE_URL: ${{ vars.AGGDAILY_SUPABASE_URL }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
-      UK_AQ_AQI_SOURCE_RPC: ${{ vars.UK_AQ_AQI_SOURCE_RPC || 'uk_aq_rpc_station_aqi_hourly_source' }}
-      UK_AQ_AQI_BREAKPOINTS_RPC: ${{ vars.UK_AQ_AQI_BREAKPOINTS_RPC || 'uk_aq_rpc_aqi_breakpoints_active' }}
+      UK_AQ_AQI_HELPER_WINDOW_RPC: ${{ vars.UK_AQ_AQI_HELPER_WINDOW_RPC || 'uk_aq_rpc_station_aqi_hourly_helper_window' }}
       UK_AQ_AQI_HOURLY_UPSERT_RPC: ${{ vars.UK_AQ_AQI_HOURLY_UPSERT_RPC || 'uk_aq_rpc_station_aqi_hourly_upsert' }}
       UK_AQ_AQI_ROLLUP_REFRESH_RPC: ${{ vars.UK_AQ_AQI_ROLLUP_REFRESH_RPC || 'uk_aq_rpc_station_aqi_rollups_refresh' }}
       UK_AQ_AQI_RUN_LOG_RPC: ${{ vars.UK_AQ_AQI_RUN_LOG_RPC || 'uk_aq_rpc_aqi_compute_run_log' }}
       UK_AQ_AQI_RUN_CLEANUP_RPC: ${{ vars.UK_AQ_AQI_RUN_CLEANUP_RPC || 'uk_aq_rpc_aqi_compute_runs_cleanup' }}
       UK_AQ_AQI_MATURITY_DELAY_HOURS: ${{ vars.UK_AQ_AQI_MATURITY_DELAY_HOURS || '3' }}
+      UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES: ${{ vars.UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES || '10' }}
       UK_AQ_AQI_SHORT_LOOKBACK_HOURS: ${{ vars.UK_AQ_AQI_SHORT_LOOKBACK_HOURS || '36' }}
       UK_AQ_AQI_DEEP_LOOKBACK_DAYS: ${{ vars.UK_AQ_AQI_DEEP_LOOKBACK_DAYS || '14' }}
       UK_AQ_AQI_RPC_RETRIES: ${{ vars.UK_AQ_AQI_RPC_RETRIES || '3' }}
@@ -234,13 +234,13 @@ jobs:
           add_env SUPABASE_URL
           add_env AGGDAILY_SUPABASE_URL
           add_env UK_AQ_PUBLIC_SCHEMA
-          add_env UK_AQ_AQI_SOURCE_RPC
-          add_env UK_AQ_AQI_BREAKPOINTS_RPC
+          add_env UK_AQ_AQI_HELPER_WINDOW_RPC
           add_env UK_AQ_AQI_HOURLY_UPSERT_RPC
           add_env UK_AQ_AQI_ROLLUP_REFRESH_RPC
           add_env UK_AQ_AQI_RUN_LOG_RPC
           add_env UK_AQ_AQI_RUN_CLEANUP_RPC
           add_env UK_AQ_AQI_MATURITY_DELAY_HOURS
+          add_env UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES
           add_env UK_AQ_AQI_SHORT_LOOKBACK_HOURS
           add_env UK_AQ_AQI_DEEP_LOOKBACK_DAYS
           add_env UK_AQ_AQI_RPC_RETRIES

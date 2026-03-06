@@ -7,50 +7,7 @@ type RpcResult<T> = {
 
 type RunMode = "fast" | "reconcile_short" | "reconcile_deep" | "backfill";
 
-type SourceRow = {
-  station_id: number;
-  timestamp_hour_utc: string;
-  pollutant_code: "pm25" | "pm10" | "no2";
-  hourly_mean_ugm3: number;
-  sample_count: number;
-};
-
-type BreakpointRow = {
-  standard_code: "daqi" | "eaqi";
-  pollutant_code: "pm25" | "pm10" | "no2";
-  averaging_code: "hourly_mean" | "rolling_24h_mean";
-  index_level: number;
-  index_band: string;
-  range_low: number;
-  range_high: number | null;
-};
-
-type IndexMatch = {
-  index_level: number;
-  index_band: string;
-};
-
-type PollutantHour = {
-  hourlyMean: number;
-  sampleCount: number;
-};
-
-type HourlyUpsertMetrics = {
-  rows_attempted: number;
-  rows_changed: number;
-  rows_inserted: number;
-  rows_updated: number;
-  station_hours_changed: number;
-  station_hours_changed_gt_cutoff: number;
-  max_changed_lag_hours: number | null;
-};
-
-type RollupMetrics = {
-  daily_rows_upserted: number;
-  monthly_rows_upserted: number;
-};
-
-type CandidateHourlyRow = {
+type HelperRow = {
   station_id: number;
   timestamp_hour_utc: string;
 
@@ -82,7 +39,29 @@ type CandidateHourlyRow = {
   eaqi_pm10_index_band: string | null;
 };
 
+type HourlyUpsertMetrics = {
+  rows_attempted: number;
+  rows_changed: number;
+  rows_inserted: number;
+  rows_updated: number;
+  station_hours_changed: number;
+  station_hours_changed_gt_cutoff: number;
+  max_changed_lag_hours: number | null;
+};
+
+type RollupMetrics = {
+  daily_rows_upserted: number;
+  monthly_rows_upserted: number;
+};
+
+type SyncWindow = {
+  hourEndStartExclusive: Date;
+  hourEndEndInclusive: Date;
+  referenceHourEnd: Date;
+};
+
 const ONE_HOUR_MS = 60 * 60 * 1000;
+const ONE_MINUTE_MS = 60 * 1000;
 
 const INGEST_SUPABASE_URL = requiredEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = requiredEnvAny(["SB_SECRET_KEY"]);
@@ -90,10 +69,8 @@ const AGGDAILY_SUPABASE_URL = requiredEnv("AGGDAILY_SUPABASE_URL");
 const AGGDAILY_PRIVILEGED_KEY = requiredEnv("AGGDAILY_SECRET_KEY");
 
 const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
-const SOURCE_RPC = (Deno.env.get("UK_AQ_AQI_SOURCE_RPC") ||
-  "uk_aq_rpc_station_aqi_hourly_source").trim();
-const BREAKPOINTS_RPC = (Deno.env.get("UK_AQ_AQI_BREAKPOINTS_RPC") ||
-  "uk_aq_rpc_aqi_breakpoints_active").trim();
+const HELPER_WINDOW_RPC = (Deno.env.get("UK_AQ_AQI_HELPER_WINDOW_RPC") ||
+  "uk_aq_rpc_station_aqi_hourly_helper_window").trim();
 const HOURLY_UPSERT_RPC = (Deno.env.get("UK_AQ_AQI_HOURLY_UPSERT_RPC") ||
   "uk_aq_rpc_station_aqi_hourly_upsert").trim();
 const ROLLUP_REFRESH_RPC = (Deno.env.get("UK_AQ_AQI_ROLLUP_REFRESH_RPC") ||
@@ -109,6 +86,10 @@ const MATURITY_DELAY_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_MATURITY_DELAY_HOURS"),
   3,
 );
+const MATURITY_DELAY_BUFFER_MINUTES = parsePositiveInt(
+  Deno.env.get("UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES"),
+  10,
+);
 const SHORT_LOOKBACK_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_SHORT_LOOKBACK_HOURS"),
   36,
@@ -121,10 +102,6 @@ const RPC_RETRIES = parsePositiveInt(Deno.env.get("UK_AQ_AQI_RPC_RETRIES"), 3);
 const HOURLY_UPSERT_CHUNK_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE"),
   2000,
-);
-const SOURCE_PAGE_SIZE = parsePositiveInt(
-  Deno.env.get("UK_AQ_AQI_SOURCE_PAGE_SIZE"),
-  1000,
 );
 const RUN_LOG_RETENTION_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_RUN_LOG_RETENTION_DAYS"),
@@ -304,219 +281,138 @@ function hourIso(date: Date): string {
   return floorUtcHour(date).toISOString();
 }
 
-function runWindow(nowUtc: Date): {
-  start: Date;
-  endExclusive: Date;
-  sourceStart: Date;
-  referenceHour: Date;
-} {
-  const matureHour = floorUtcHour(new Date(nowUtc.getTime() - MATURITY_DELAY_HOURS * ONE_HOUR_MS));
+function runWindow(nowUtc: Date): SyncWindow {
+  const totalDelayMs =
+    MATURITY_DELAY_HOURS * ONE_HOUR_MS + MATURITY_DELAY_BUFFER_MINUTES * ONE_MINUTE_MS;
+  const targetHourEnd = floorUtcHour(new Date(nowUtc.getTime() - totalDelayMs));
 
   if (RUN_MODE === "backfill") {
     if (!FROM_HOUR_UTC || !TO_HOUR_UTC) {
       throw new Error("Backfill mode requires UK_AQ_AQI_FROM_HOUR_UTC and UK_AQ_AQI_TO_HOUR_UTC");
     }
-    const fromHour = parseIsoHour(FROM_HOUR_UTC);
-    const toHourInclusive = parseIsoHour(TO_HOUR_UTC);
-    if (toHourInclusive.getTime() < fromHour.getTime()) {
+    const fromHourEnd = parseIsoHour(FROM_HOUR_UTC);
+    const toHourEnd = parseIsoHour(TO_HOUR_UTC);
+    if (toHourEnd.getTime() < fromHourEnd.getTime()) {
       throw new Error("UK_AQ_AQI_TO_HOUR_UTC must be >= UK_AQ_AQI_FROM_HOUR_UTC");
     }
-    const endExclusive = addHours(toHourInclusive, 1);
     return {
-      start: fromHour,
-      endExclusive,
-      sourceStart: addHours(fromHour, -23),
-      referenceHour: matureHour,
+      hourEndStartExclusive: addHours(fromHourEnd, -1),
+      hourEndEndInclusive: toHourEnd,
+      referenceHourEnd: targetHourEnd,
     };
   }
 
   if (RUN_MODE === "fast") {
-    const start = matureHour;
-    const endExclusive = addHours(start, 1);
     return {
-      start,
-      endExclusive,
-      sourceStart: addHours(start, -23),
-      referenceHour: matureHour,
+      hourEndStartExclusive: addHours(targetHourEnd, -1),
+      hourEndEndInclusive: targetHourEnd,
+      referenceHourEnd: targetHourEnd,
     };
   }
 
   if (RUN_MODE === "reconcile_short") {
-    const start = addHours(matureHour, -(SHORT_LOOKBACK_HOURS - 1));
-    const endExclusive = addHours(matureHour, 1);
     return {
-      start,
-      endExclusive,
-      sourceStart: addHours(start, -23),
-      referenceHour: matureHour,
+      hourEndStartExclusive: addHours(targetHourEnd, -SHORT_LOOKBACK_HOURS),
+      hourEndEndInclusive: targetHourEnd,
+      referenceHourEnd: targetHourEnd,
     };
   }
 
   const deepHours = DEEP_LOOKBACK_DAYS * 24;
-  const start = addHours(matureHour, -(deepHours - 1));
-  const endExclusive = addHours(matureHour, 1);
   return {
-    start,
-    endExclusive,
-    sourceStart: addHours(start, -23),
-    referenceHour: matureHour,
+    hourEndStartExclusive: addHours(targetHourEnd, -deepHours),
+    hourEndEndInclusive: targetHourEnd,
+    referenceHourEnd: targetHourEnd,
   };
 }
 
-function parseSourceRows(payload: unknown): SourceRow[] {
-  if (!Array.isArray(payload)) {
-    throw new Error("source RPC returned non-array payload");
+function toNullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
   }
-  const rows: SourceRow[] = [];
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed;
+}
+
+function toNullableInt(value: unknown): number | null {
+  const parsed = toNullableNumber(value);
+  if (parsed === null) {
+    return null;
+  }
+  return Math.trunc(parsed);
+}
+
+function toNullableText(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const parsed = String(value).trim();
+  return parsed ? parsed : null;
+}
+
+function parseHelperRows(payload: unknown): HelperRow[] {
+  if (!Array.isArray(payload)) {
+    throw new Error("helper window RPC returned non-array payload");
+  }
+
+  const rows: HelperRow[] = [];
   for (const item of payload) {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       continue;
     }
     const row = item as Record<string, unknown>;
-    const pollutant = String(row.pollutant_code || "").trim().toLowerCase();
-    if (pollutant !== "pm25" && pollutant !== "pm10" && pollutant !== "no2") {
-      continue;
-    }
     const stationId = Number(row.station_id);
-    const hourlyMean = Number(row.hourly_mean_ugm3);
-    const sampleCount = Number(row.sample_count);
-    const timestamp = String(row.timestamp_hour_utc || "").trim();
-    if (!Number.isInteger(stationId) || stationId <= 0 || Number.isNaN(Date.parse(timestamp))) {
+    const timestampRaw = String(row.timestamp_hour_utc || "").trim();
+    if (!Number.isInteger(stationId) || stationId <= 0 || Number.isNaN(Date.parse(timestampRaw))) {
       continue;
     }
-    if (!Number.isFinite(hourlyMean)) {
-      continue;
-    }
+
     rows.push({
       station_id: Math.trunc(stationId),
-      timestamp_hour_utc: hourIso(new Date(Date.parse(timestamp))),
-      pollutant_code: pollutant,
-      hourly_mean_ugm3: hourlyMean,
-      sample_count: Number.isFinite(sampleCount) ? Math.trunc(sampleCount) : 0,
+      timestamp_hour_utc: hourIso(new Date(Date.parse(timestampRaw))),
+      no2_hourly_mean_ugm3: toNullableNumber(row.no2_hourly_mean_ugm3),
+      pm25_hourly_mean_ugm3: toNullableNumber(row.pm25_hourly_mean_ugm3),
+      pm10_hourly_mean_ugm3: toNullableNumber(row.pm10_hourly_mean_ugm3),
+      pm25_rolling24h_mean_ugm3: toNullableNumber(row.pm25_rolling24h_mean_ugm3),
+      pm10_rolling24h_mean_ugm3: toNullableNumber(row.pm10_rolling24h_mean_ugm3),
+      no2_hourly_sample_count: toNullableInt(row.no2_hourly_sample_count),
+      pm25_hourly_sample_count: toNullableInt(row.pm25_hourly_sample_count),
+      pm10_hourly_sample_count: toNullableInt(row.pm10_hourly_sample_count),
+      pm25_rolling24h_valid_hours: toNullableInt(row.pm25_rolling24h_valid_hours),
+      pm10_rolling24h_valid_hours: toNullableInt(row.pm10_rolling24h_valid_hours),
+      daqi_no2_index_level: toNullableInt(row.daqi_no2_index_level),
+      daqi_no2_index_band: toNullableText(row.daqi_no2_index_band),
+      daqi_pm25_index_level: toNullableInt(row.daqi_pm25_index_level),
+      daqi_pm25_index_band: toNullableText(row.daqi_pm25_index_band),
+      daqi_pm10_index_level: toNullableInt(row.daqi_pm10_index_level),
+      daqi_pm10_index_band: toNullableText(row.daqi_pm10_index_band),
+      eaqi_no2_index_level: toNullableInt(row.eaqi_no2_index_level),
+      eaqi_no2_index_band: toNullableText(row.eaqi_no2_index_band),
+      eaqi_pm25_index_level: toNullableInt(row.eaqi_pm25_index_level),
+      eaqi_pm25_index_band: toNullableText(row.eaqi_pm25_index_band),
+      eaqi_pm10_index_level: toNullableInt(row.eaqi_pm10_index_level),
+      eaqi_pm10_index_band: toNullableText(row.eaqi_pm10_index_band),
     });
   }
-  return rows;
-}
 
-function hasStatementTimeout(message: string): boolean {
-  return message.toLowerCase().includes("statement timeout");
-}
-
-function hourDiff(start: Date, endExclusive: Date): number {
-  const diffMs = endExclusive.getTime() - start.getTime();
-  return Math.max(0, Math.round(diffMs / ONE_HOUR_MS));
-}
-
-function midpointHour(start: Date, endExclusive: Date): Date {
-  const hours = hourDiff(start, endExclusive);
-  const leftHours = Math.max(1, Math.floor(hours / 2));
-  return addHours(start, leftHours);
-}
-
-async function fetchSourceRowsRecursive(
-  startHour: Date,
-  endHourExclusive: Date,
-  depth: number,
-): Promise<SourceRow[]> {
-  const sourceArgs: Record<string, unknown> = {
-    p_window_start: hourIso(startHour),
-    p_window_end: hourIso(endHourExclusive),
-  };
-  if (STATION_IDS && STATION_IDS.length > 0) {
-    sourceArgs.p_station_ids = STATION_IDS;
-  }
-
-  const sourceResult = await postgrestRpc<unknown>(
-    INGEST_SUPABASE_URL,
-    INGEST_PRIVILEGED_KEY,
-    SOURCE_RPC,
-    sourceArgs,
-  );
-
-  const windowHours = hourDiff(startHour, endHourExclusive);
-  const canSplit = windowHours > 1 && depth < 20;
-
-  if (sourceResult.error) {
-    if (canSplit && hasStatementTimeout(sourceResult.error.message)) {
-      const mid = midpointHour(startHour, endHourExclusive);
-      const left = await fetchSourceRowsRecursive(startHour, mid, depth + 1);
-      const right = await fetchSourceRowsRecursive(mid, endHourExclusive, depth + 1);
-      return [...left, ...right];
-    }
-    throw new Error(`source RPC failed: ${sourceResult.error.message}`);
-  }
-
-  const rows = parseSourceRows(sourceResult.data);
-  const reachedApiCap = rows.length >= SOURCE_PAGE_SIZE;
-  if (reachedApiCap && canSplit) {
-    const mid = midpointHour(startHour, endHourExclusive);
-    const left = await fetchSourceRowsRecursive(startHour, mid, depth + 1);
-    const right = await fetchSourceRowsRecursive(mid, endHourExclusive, depth + 1);
-    return [...left, ...right];
-  }
-
-  if (reachedApiCap && !canSplit) {
-    throw new Error(
-      "source RPC result saturated API row cap for a 1-hour window; increase API max rows or run with station filter",
-    );
-  }
-
-  return rows;
-}
-
-async function fetchSourceRows(sourceStart: Date, sourceEndExclusive: Date): Promise<SourceRow[]> {
-  const rows = await fetchSourceRowsRecursive(sourceStart, sourceEndExclusive, 0);
   rows.sort((a, b) => {
     if (a.timestamp_hour_utc < b.timestamp_hour_utc) return -1;
     if (a.timestamp_hour_utc > b.timestamp_hour_utc) return 1;
-    if (a.station_id !== b.station_id) return a.station_id - b.station_id;
-    if (a.pollutant_code < b.pollutant_code) return -1;
-    if (a.pollutant_code > b.pollutant_code) return 1;
-    return 0;
+    return a.station_id - b.station_id;
   });
+
   return rows;
 }
 
-function parseBreakpoints(payload: unknown): BreakpointRow[] {
-  if (!Array.isArray(payload)) {
-    throw new Error("breakpoints RPC returned non-array payload");
+function toSafeInt(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 0;
   }
-  const rows: BreakpointRow[] = [];
-  for (const item of payload) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
-      continue;
-    }
-    const row = item as Record<string, unknown>;
-    const standard = String(row.standard_code || "").trim().toLowerCase();
-    const pollutant = String(row.pollutant_code || "").trim().toLowerCase();
-    const averaging = String(row.averaging_code || "").trim().toLowerCase();
-    if ((standard !== "daqi" && standard !== "eaqi") ||
-      (pollutant !== "pm25" && pollutant !== "pm10" && pollutant !== "no2") ||
-      (averaging !== "hourly_mean" && averaging !== "rolling_24h_mean")) {
-      continue;
-    }
-    const indexLevel = Number(row.index_level);
-    const rangeLow = Number(row.range_low);
-    const rangeHighRaw = row.range_high;
-    const rangeHigh = rangeHighRaw === null || rangeHighRaw === undefined
-      ? null
-      : Number(rangeHighRaw);
-    const indexBand = String(row.index_band || "").trim();
-    if (!Number.isFinite(indexLevel) || !Number.isFinite(rangeLow) || !indexBand) {
-      continue;
-    }
-    rows.push({
-      standard_code: standard,
-      pollutant_code: pollutant,
-      averaging_code: averaging,
-      index_level: Math.trunc(indexLevel),
-      index_band: indexBand,
-      range_low: rangeLow,
-      range_high: Number.isFinite(rangeHigh ?? Number.NaN) ? (rangeHigh as number) : null,
-    });
-  }
-  rows.sort((a, b) => a.range_low - b.range_low || a.index_level - b.index_level);
-  return rows;
+  return Math.max(0, Math.trunc(parsed));
 }
 
 function parseHourlyUpsertMetrics(payload: unknown): HourlyUpsertMetrics {
@@ -546,68 +442,6 @@ function parseRollupMetrics(payload: unknown): RollupMetrics {
   };
 }
 
-function toSafeInt(value: unknown): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return 0;
-  }
-  return Math.max(0, Math.trunc(parsed));
-}
-
-function toNullableNumber(value: unknown): number | null {
-  if (value === null || value === undefined) {
-    return null;
-  }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-  return parsed;
-}
-
-function buildBreakpointMap(rows: BreakpointRow[]): Map<string, BreakpointRow[]> {
-  const map = new Map<string, BreakpointRow[]>();
-  for (const row of rows) {
-    const key = `${row.standard_code}|${row.pollutant_code}|${row.averaging_code}`;
-    const list = map.get(key) || [];
-    list.push(row);
-    map.set(key, list);
-  }
-  for (const list of map.values()) {
-    list.sort((a, b) => a.range_low - b.range_low || a.index_level - b.index_level);
-  }
-  return map;
-}
-
-function lookupIndex(
-  breakpointMap: Map<string, BreakpointRow[]>,
-  standard: "daqi" | "eaqi",
-  pollutant: "pm25" | "pm10" | "no2",
-  averaging: "hourly_mean" | "rolling_24h_mean",
-  value: number | null,
-): IndexMatch | null {
-  if (value === null || !Number.isFinite(value)) {
-    return null;
-  }
-  const key = `${standard}|${pollutant}|${averaging}`;
-  const rows = breakpointMap.get(key);
-  if (!rows || !rows.length) {
-    return null;
-  }
-  for (const row of rows) {
-    if (value < row.range_low) {
-      continue;
-    }
-    if (row.range_high === null || value <= row.range_high) {
-      return {
-        index_level: row.index_level,
-        index_band: row.index_band,
-      };
-    }
-  }
-  return null;
-}
-
 function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   if (rows.length === 0) {
     return [];
@@ -619,204 +453,34 @@ function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
-function mapKeyStationPollutant(stationId: number, pollutant: string): string {
-  return `${stationId}|${pollutant}`;
-}
-
-function mapKeyStationHour(stationId: number, hourMs: number): string {
-  return `${stationId}|${hourMs}`;
-}
-
-function parseStationHourKey(key: string): { stationId: number; hourMs: number } {
-  const [stationRaw, hourRaw] = key.split("|");
-  return {
-    stationId: Number(stationRaw),
-    hourMs: Number(hourRaw),
+async function fetchHelperRows(window: SyncWindow): Promise<HelperRow[]> {
+  const args: Record<string, unknown> = {
+    p_hour_end_start_exclusive: hourIso(window.hourEndStartExclusive),
+    p_hour_end_end_inclusive: hourIso(window.hourEndEndInclusive),
   };
-}
-
-function toHourMs(iso: string): number {
-  return floorUtcHour(new Date(Date.parse(iso))).getTime();
-}
-
-function buildCandidateRows(
-  sourceRows: SourceRow[],
-  targetStart: Date,
-  targetEndExclusive: Date,
-  breakpointMap: Map<string, BreakpointRow[]>,
-): CandidateHourlyRow[] {
-  const hourlyByStationPollutant = new Map<string, Map<number, PollutantHour>>();
-  const targetStationHourKeys = new Set<string>();
-
-  const targetStartMs = targetStart.getTime();
-  const targetEndMs = targetEndExclusive.getTime();
-
-  for (const row of sourceRows) {
-    const hourMs = toHourMs(row.timestamp_hour_utc);
-    const stationPollutantKey = mapKeyStationPollutant(row.station_id, row.pollutant_code);
-    const byHour = hourlyByStationPollutant.get(stationPollutantKey) || new Map<number, PollutantHour>();
-    byHour.set(hourMs, {
-      hourlyMean: row.hourly_mean_ugm3,
-      sampleCount: row.sample_count,
-    });
-    hourlyByStationPollutant.set(stationPollutantKey, byHour);
-
-    if (hourMs >= targetStartMs && hourMs < targetEndMs) {
-      targetStationHourKeys.add(mapKeyStationHour(row.station_id, hourMs));
-    }
+  if (STATION_IDS && STATION_IDS.length > 0) {
+    args.p_station_ids = STATION_IDS;
   }
 
-  function hourlyValue(
-    stationId: number,
-    pollutant: "pm25" | "pm10" | "no2",
-    hourMs: number,
-  ): PollutantHour | null {
-    const byHour = hourlyByStationPollutant.get(mapKeyStationPollutant(stationId, pollutant));
-    if (!byHour) {
-      return null;
-    }
-    return byHour.get(hourMs) || null;
+  const result = await postgrestRpc<unknown>(
+    INGEST_SUPABASE_URL,
+    INGEST_PRIVILEGED_KEY,
+    HELPER_WINDOW_RPC,
+    args,
+  );
+  if (result.error) {
+    throw new Error(`helper window RPC failed: ${result.error.message}`);
   }
-
-  function rolling24h(
-    stationId: number,
-    pollutant: "pm25" | "pm10",
-    endHourMs: number,
-  ): { mean: number | null; validHours: number } {
-    let sum = 0;
-    let validHours = 0;
-    for (let i = 0; i < 24; i += 1) {
-      const hourValue = hourlyValue(stationId, pollutant, endHourMs - i * ONE_HOUR_MS);
-      if (hourValue && Number.isFinite(hourValue.hourlyMean)) {
-        sum += hourValue.hourlyMean;
-        validHours += 1;
-      }
-    }
-    if (validHours < 18) {
-      return { mean: null, validHours };
-    }
-    return { mean: sum / validHours, validHours };
-  }
-
-  const rows: CandidateHourlyRow[] = [];
-
-  for (const key of targetStationHourKeys) {
-    const { stationId, hourMs } = parseStationHourKey(key);
-    const no2 = hourlyValue(stationId, "no2", hourMs);
-    const pm25 = hourlyValue(stationId, "pm25", hourMs);
-    const pm10 = hourlyValue(stationId, "pm10", hourMs);
-
-    const pm25Rolling = rolling24h(stationId, "pm25", hourMs);
-    const pm10Rolling = rolling24h(stationId, "pm10", hourMs);
-
-    const daqiNo2 = lookupIndex(
-      breakpointMap,
-      "daqi",
-      "no2",
-      "hourly_mean",
-      no2?.hourlyMean ?? null,
-    );
-    const daqiPm25 = lookupIndex(
-      breakpointMap,
-      "daqi",
-      "pm25",
-      "rolling_24h_mean",
-      pm25Rolling.mean,
-    );
-    const daqiPm10 = lookupIndex(
-      breakpointMap,
-      "daqi",
-      "pm10",
-      "rolling_24h_mean",
-      pm10Rolling.mean,
-    );
-
-    const eaqiNo2 = lookupIndex(
-      breakpointMap,
-      "eaqi",
-      "no2",
-      "hourly_mean",
-      no2?.hourlyMean ?? null,
-    );
-    const eaqiPm25 = lookupIndex(
-      breakpointMap,
-      "eaqi",
-      "pm25",
-      "hourly_mean",
-      pm25?.hourlyMean ?? null,
-    );
-    const eaqiPm10 = lookupIndex(
-      breakpointMap,
-      "eaqi",
-      "pm10",
-      "hourly_mean",
-      pm10?.hourlyMean ?? null,
-    );
-
-    const hasAnyValue =
-      no2 !== null ||
-      pm25 !== null ||
-      pm10 !== null ||
-      pm25Rolling.mean !== null ||
-      pm10Rolling.mean !== null ||
-      daqiNo2 !== null ||
-      daqiPm25 !== null ||
-      daqiPm10 !== null ||
-      eaqiNo2 !== null ||
-      eaqiPm25 !== null ||
-      eaqiPm10 !== null;
-
-    if (!hasAnyValue) {
-      continue;
-    }
-
-    rows.push({
-      station_id: stationId,
-      timestamp_hour_utc: new Date(hourMs).toISOString(),
-
-      no2_hourly_mean_ugm3: no2?.hourlyMean ?? null,
-      pm25_hourly_mean_ugm3: pm25?.hourlyMean ?? null,
-      pm10_hourly_mean_ugm3: pm10?.hourlyMean ?? null,
-      pm25_rolling24h_mean_ugm3: pm25Rolling.mean,
-      pm10_rolling24h_mean_ugm3: pm10Rolling.mean,
-
-      no2_hourly_sample_count: no2?.sampleCount ?? null,
-      pm25_hourly_sample_count: pm25?.sampleCount ?? null,
-      pm10_hourly_sample_count: pm10?.sampleCount ?? null,
-
-      pm25_rolling24h_valid_hours: pm25Rolling.validHours,
-      pm10_rolling24h_valid_hours: pm10Rolling.validHours,
-
-      daqi_no2_index_level: daqiNo2?.index_level ?? null,
-      daqi_no2_index_band: daqiNo2?.index_band ?? null,
-      daqi_pm25_index_level: daqiPm25?.index_level ?? null,
-      daqi_pm25_index_band: daqiPm25?.index_band ?? null,
-      daqi_pm10_index_level: daqiPm10?.index_level ?? null,
-      daqi_pm10_index_band: daqiPm10?.index_band ?? null,
-
-      eaqi_no2_index_level: eaqiNo2?.index_level ?? null,
-      eaqi_no2_index_band: eaqiNo2?.index_band ?? null,
-      eaqi_pm25_index_level: eaqiPm25?.index_level ?? null,
-      eaqi_pm25_index_band: eaqiPm25?.index_band ?? null,
-      eaqi_pm10_index_level: eaqiPm10?.index_level ?? null,
-      eaqi_pm10_index_band: eaqiPm10?.index_band ?? null,
-    });
-  }
-
-  rows.sort((a, b) => {
-    if (a.timestamp_hour_utc < b.timestamp_hour_utc) return -1;
-    if (a.timestamp_hour_utc > b.timestamp_hour_utc) return 1;
-    return a.station_id - b.station_id;
-  });
-
-  return rows;
+  return parseHelperRows(result.data);
 }
 
 async function main(): Promise<void> {
   const startedAt = Date.now();
   const nowUtc = new Date();
   const window = runWindow(nowUtc);
-  const lateCutoffHour = addHours(window.referenceHour, -SHORT_LOOKBACK_HOURS);
+
+  const referenceHourStart = addHours(window.referenceHourEnd, -1);
+  const lateCutoffHour = addHours(referenceHourStart, -SHORT_LOOKBACK_HOURS);
 
   let sourceRowsCount = 0;
   let candidateStationHours = 0;
@@ -831,31 +495,12 @@ async function main(): Promise<void> {
   let errorMessage: string | null = null;
 
   try {
-    const sourceRows = await fetchSourceRows(window.sourceStart, window.endExclusive);
-    sourceRowsCount = sourceRows.length;
+    const helperRows = await fetchHelperRows(window);
+    sourceRowsCount = helperRows.length;
+    candidateStationHours = helperRows.length;
 
-    const breakpointsResult = await postgrestRpc<unknown>(
-      AGGDAILY_SUPABASE_URL,
-      AGGDAILY_PRIVILEGED_KEY,
-      BREAKPOINTS_RPC,
-      { p_effective_at: new Date().toISOString() },
-    );
-    if (breakpointsResult.error) {
-      throw new Error(`breakpoints RPC failed: ${breakpointsResult.error.message}`);
-    }
-    const breakpoints = parseBreakpoints(breakpointsResult.data);
-    const breakpointMap = buildBreakpointMap(breakpoints);
-
-    const candidateRows = buildCandidateRows(
-      sourceRows,
-      window.start,
-      window.endExclusive,
-      breakpointMap,
-    );
-    candidateStationHours = candidateRows.length;
-
-    if (candidateRows.length > 0) {
-      const chunks = chunkRows(candidateRows, Math.max(100, HOURLY_UPSERT_CHUNK_SIZE));
+    if (helperRows.length > 0) {
+      const chunks = chunkRows(helperRows, Math.max(100, HOURLY_UPSERT_CHUNK_SIZE));
       for (const chunk of chunks) {
         const upsertResult = await postgrestRpc<unknown>(
           AGGDAILY_SUPABASE_URL,
@@ -864,7 +509,7 @@ async function main(): Promise<void> {
           {
             p_rows: chunk,
             p_late_cutoff_hour: hourIso(lateCutoffHour),
-            p_reference_hour: hourIso(window.referenceHour),
+            p_reference_hour: hourIso(referenceHourStart),
           },
         );
         if (upsertResult.error) {
@@ -882,14 +527,14 @@ async function main(): Promise<void> {
         }
       }
 
-      const stationIds = Array.from(new Set(candidateRows.map((row) => row.station_id)));
+      const stationIds = Array.from(new Set(helperRows.map((row) => row.station_id)));
       const rollupResult = await postgrestRpc<unknown>(
         AGGDAILY_SUPABASE_URL,
         AGGDAILY_PRIVILEGED_KEY,
         ROLLUP_REFRESH_RPC,
         {
-          p_start_hour_utc: hourIso(window.start),
-          p_end_hour_utc: hourIso(window.endExclusive),
+          p_start_hour_utc: hourIso(window.hourEndStartExclusive),
+          p_end_hour_utc: hourIso(window.hourEndEndInclusive),
           p_station_ids: stationIds,
         },
       );
@@ -917,8 +562,8 @@ async function main(): Promise<void> {
     {
       p_run_mode: RUN_MODE,
       p_trigger_mode: TRIGGER_MODE,
-      p_window_start_utc: hourIso(window.start),
-      p_window_end_utc: hourIso(window.endExclusive),
+      p_window_start_utc: hourIso(window.hourEndStartExclusive),
+      p_window_end_utc: hourIso(window.hourEndEndInclusive),
       p_source_rows: sourceRowsCount,
       p_candidate_station_hours: candidateStationHours,
       p_rows_upserted: rowsUpserted,
@@ -962,8 +607,8 @@ async function main(): Promise<void> {
     ok: runStatus === "ok",
     run_mode: RUN_MODE,
     trigger_mode: TRIGGER_MODE,
-    window_start_utc: hourIso(window.start),
-    window_end_utc: hourIso(window.endExclusive),
+    window_start_utc: hourIso(window.hourEndStartExclusive),
+    window_end_utc: hourIso(window.hourEndEndInclusive),
     source_rows: sourceRowsCount,
     candidate_station_hours: candidateStationHours,
     rows_upserted: rowsUpserted,

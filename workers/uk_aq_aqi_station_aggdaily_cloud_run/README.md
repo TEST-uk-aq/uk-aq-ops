@@ -1,8 +1,6 @@
 # UK AQ Station AQI AggDaily Cloud Run
 
-Computes station-hour DAQI + EAQI rows (pollutant-specific) from ingest observations and writes to AggDaily DB.
-
-v1 completeness fields: source uses `sample_count` only (expected-count cadence completeness is deferred).
+Syncs precomputed station-hour AQI helper rows from ingest DB into AggDaily DB (hourly upsert + daily/monthly rollup refresh).
 
 ## Endpoints
 
@@ -23,10 +21,10 @@ v1 completeness fields: source uses `sample_count` only (expected-count cadence 
 
 ## Run Modes
 
-- `fast`: latest mature hour only
+- `fast`: latest mature hour-end window only
 - `reconcile_short`: mature lookback window (default 36h)
 - `reconcile_deep`: deep mature lookback window (default 14d)
-- `backfill`: explicit hour range using `from_hour_utc` + `to_hour_utc`
+- `backfill`: explicit hour-end range using `from_hour_utc` + `to_hour_utc`
 
 ## Required Environment
 
@@ -38,6 +36,7 @@ v1 completeness fields: source uses `sample_count` only (expected-count cadence 
 ## AQI Settings
 
 - `UK_AQ_AQI_MATURITY_DELAY_HOURS` (default `3`)
+- `UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES` (default `10`)
 - `UK_AQ_AQI_SHORT_LOOKBACK_HOURS` (default `36`)
 - `UK_AQ_AQI_DEEP_LOOKBACK_DAYS` (default `14`)
 - `UK_AQ_AQI_RUN_MODE` (default `fast`)
@@ -47,8 +46,7 @@ v1 completeness fields: source uses `sample_count` only (expected-count cadence 
 
 ## RPC Names
 
-- `UK_AQ_AQI_SOURCE_RPC` (default `uk_aq_rpc_station_aqi_hourly_source`)
-- `UK_AQ_AQI_BREAKPOINTS_RPC` (default `uk_aq_rpc_aqi_breakpoints_active`)
+- `UK_AQ_AQI_HELPER_WINDOW_RPC` (default `uk_aq_rpc_station_aqi_hourly_helper_window`)
 - `UK_AQ_AQI_HOURLY_UPSERT_RPC` (default `uk_aq_rpc_station_aqi_hourly_upsert`)
 - `UK_AQ_AQI_ROLLUP_REFRESH_RPC` (default `uk_aq_rpc_station_aqi_rollups_refresh`)
 - `UK_AQ_AQI_RUN_LOG_RPC` (default `uk_aq_rpc_aqi_compute_run_log`)
@@ -58,5 +56,4 @@ v1 completeness fields: source uses `sample_count` only (expected-count cadence 
 ## Retry/Chunk Settings
 
 - `UK_AQ_AQI_RPC_RETRIES` (default `3`)
-- `UK_AQ_AQI_SOURCE_PAGE_SIZE` (default `1000`, used as API-cap detection threshold for adaptive source-window splitting)
 - `UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE` (default `2000`)
