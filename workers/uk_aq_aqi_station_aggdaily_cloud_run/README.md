@@ -12,7 +12,7 @@ Syncs precomputed station-hour AQI helper rows from ingest DB into AggDaily DB (
 ```json
 {
   "trigger_mode": "scheduler",
-  "run_mode": "fast",
+  "run_mode": "sync_hourly",
   "from_hour_utc": "2026-03-01T00:00:00Z",
   "to_hour_utc": "2026-03-01T23:00:00Z",
   "station_ids": [101, 102]
@@ -21,9 +21,7 @@ Syncs precomputed station-hour AQI helper rows from ingest DB into AggDaily DB (
 
 ## Run Modes
 
-- `fast`: latest mature hour-end window only
-- `reconcile_short`: mature lookback window (default 36h)
-- `reconcile_deep`: deep mature lookback window (default 14d)
+- `sync_hourly`: latest mature hour-end window only
 - `backfill`: explicit hour-end range using `from_hour_utc` + `to_hour_utc`
 
 ## Required Environment
@@ -37,9 +35,7 @@ Syncs precomputed station-hour AQI helper rows from ingest DB into AggDaily DB (
 
 - `UK_AQ_AQI_MATURITY_DELAY_HOURS` (default `3`)
 - `UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES` (default `10`)
-- `UK_AQ_AQI_SHORT_LOOKBACK_HOURS` (default `36`)
-- `UK_AQ_AQI_DEEP_LOOKBACK_DAYS` (default `14`)
-- `UK_AQ_AQI_RUN_MODE` (default `fast`)
+- `UK_AQ_AQI_RUN_MODE` (default `sync_hourly`)
 - `UK_AQ_AQI_FROM_HOUR_UTC` (backfill)
 - `UK_AQ_AQI_TO_HOUR_UTC` (backfill)
 - `UK_AQ_AQI_STATION_IDS_CSV` (optional station filter)

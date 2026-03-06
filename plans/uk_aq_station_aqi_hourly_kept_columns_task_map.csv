@@ -1,0 +1,19 @@
+column_name,populated_by_task
+station_id,AQI sync task (Cloud Run run_job.ts) via uk_aq_rpc_station_aqi_hourly_upsert from ingest helper window
+timestamp_hour_utc,AQI sync task (Cloud Run run_job.ts) via uk_aq_rpc_station_aqi_hourly_upsert from ingest helper window
+no2_hourly_mean_ugm3,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+pm25_hourly_mean_ugm3,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+pm10_hourly_mean_ugm3,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+pm25_rolling24h_mean_ugm3,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+pm10_rolling24h_mean_ugm3,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+no2_hourly_sample_count,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+pm25_hourly_sample_count,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+pm10_hourly_sample_count,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+daqi_no2_index_level,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+daqi_pm25_rolling24h_index_level,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+daqi_pm10_rolling24h_index_level,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+eaqi_no2_index_level,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+eaqi_pm25_index_level,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+eaqi_pm10_index_level,AQI ingest helper tick compute then AQI sync upsert to AggDaily
+created_at,AggDaily table default now() on first insert during AQI sync upsert
+updated_at,AQI sync upsert sets now() on insert or changed update

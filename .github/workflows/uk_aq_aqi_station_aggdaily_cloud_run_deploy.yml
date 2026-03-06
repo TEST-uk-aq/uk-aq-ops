@@ -37,12 +37,8 @@ jobs:
       SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_AQI_STATION_AGGDAILY_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SCHEDULER_TIMEZONE: ${{ vars.GCP_AQI_STATION_AGGDAILY_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_AQI_STATION_AGGDAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
-      SCHEDULER_FAST_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_FAST_JOB_NAME || 'uk-aq-aqi-station-aggdaily-sync-hourly' }}
-      SCHEDULER_FAST_CRON: ${{ vars.GCP_AQI_STATION_AGGDAILY_FAST_CRON || '20 * * * *' }}
-      SCHEDULER_SHORT_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_SHORT_JOB_NAME || 'uk-aq-aqi-station-reconcile-2h' }}
-      SCHEDULER_SHORT_CRON: ${{ vars.GCP_AQI_STATION_AGGDAILY_SHORT_CRON || '7 */2 * * *' }}
-      SCHEDULER_DEEP_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_DEEP_JOB_NAME || 'uk-aq-aqi-station-reconcile-deep-daily' }}
-      SCHEDULER_DEEP_CRON: ${{ vars.GCP_AQI_STATION_AGGDAILY_DEEP_CRON || '17 3 * * *' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_AQI_STATION_AGGDAILY_JOB_NAME || 'uk-aq-aqi-station-aggdaily-sync-hourly' }}
+      SCHEDULER_CRON: ${{ vars.GCP_AQI_STATION_AGGDAILY_CRON || '20 * * * *' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       AGGDAILY_SUPABASE_URL: ${{ vars.AGGDAILY_SUPABASE_URL }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
@@ -53,8 +49,6 @@ jobs:
       UK_AQ_AQI_RUN_CLEANUP_RPC: ${{ vars.UK_AQ_AQI_RUN_CLEANUP_RPC || 'uk_aq_rpc_aqi_compute_runs_cleanup' }}
       UK_AQ_AQI_MATURITY_DELAY_HOURS: ${{ vars.UK_AQ_AQI_MATURITY_DELAY_HOURS || '3' }}
       UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES: ${{ vars.UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES || '10' }}
-      UK_AQ_AQI_SHORT_LOOKBACK_HOURS: ${{ vars.UK_AQ_AQI_SHORT_LOOKBACK_HOURS || '36' }}
-      UK_AQ_AQI_DEEP_LOOKBACK_DAYS: ${{ vars.UK_AQ_AQI_DEEP_LOOKBACK_DAYS || '14' }}
       UK_AQ_AQI_RPC_RETRIES: ${{ vars.UK_AQ_AQI_RPC_RETRIES || '3' }}
       UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE: ${{ vars.UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE || '2000' }}
       UK_AQ_AQI_RUN_LOG_RETENTION_DAYS: ${{ vars.UK_AQ_AQI_RUN_LOG_RETENTION_DAYS || '7' }}
@@ -241,8 +235,6 @@ jobs:
           add_env UK_AQ_AQI_RUN_CLEANUP_RPC
           add_env UK_AQ_AQI_MATURITY_DELAY_HOURS
           add_env UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES
-          add_env UK_AQ_AQI_SHORT_LOOKBACK_HOURS
-          add_env UK_AQ_AQI_DEEP_LOOKBACK_DAYS
           add_env UK_AQ_AQI_RPC_RETRIES
           add_env UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE
           add_env UK_AQ_AQI_RUN_LOG_RETENTION_DAYS
@@ -321,9 +313,7 @@ jobs:
           }
 
           if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
-            maybe_pause "${SCHEDULER_FAST_JOB_NAME}"
-            maybe_pause "${SCHEDULER_SHORT_JOB_NAME}"
-            maybe_pause "${SCHEDULER_DEEP_JOB_NAME}"
+            maybe_pause "${SCHEDULER_JOB_NAME}"
             echo "Scheduler disabled (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
             exit 0
           fi
@@ -370,9 +360,7 @@ jobs:
             fi
           }
 
-          ensure_job "${SCHEDULER_FAST_JOB_NAME}" "${SCHEDULER_FAST_CRON}" '{"trigger_mode":"scheduler","run_mode":"fast"}'
-          ensure_job "${SCHEDULER_SHORT_JOB_NAME}" "${SCHEDULER_SHORT_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_short"}'
-          ensure_job "${SCHEDULER_DEEP_JOB_NAME}" "${SCHEDULER_DEEP_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_deep"}'
+          ensure_job "${SCHEDULER_JOB_NAME}" "${SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"sync_hourly"}'
 
       - name: Show deployed service
         run: |

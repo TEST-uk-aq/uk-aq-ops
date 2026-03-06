@@ -140,7 +140,7 @@ Per requested behavior for hourly stored indices:
 - Require at least 18 valid hourly means (75%).
 
 DAQI storage for the hour:
-- Store pollutant-specific DAQI index levels independently (`daqi_no2_index_level`, `daqi_pm25_index_level`, `daqi_pm10_index_level`).
+- Store pollutant-specific DAQI index levels independently (`daqi_no2_index_level`, `daqi_pm25_rolling24h_index_level`, `daqi_pm10_rolling24h_index_level`).
 - Do not store DAQI overall/dominant fields in the base fact table.
 - Do not compute or expose a combined DAQI+EAQI value.
 
@@ -242,17 +242,15 @@ create table if not exists uk_aq_aggdaily.station_aqi_hourly (
   pm25_rolling24h_mean_ugm3 double precision,
   pm10_rolling24h_mean_ugm3 double precision,
 
-  -- completeness / coverage
-  no2_hourly_capture_ratio real,
-  pm25_hourly_capture_ratio real,
-  pm10_hourly_capture_ratio real,
-  pm25_rolling24h_valid_hours smallint,
-  pm10_rolling24h_valid_hours smallint,
+  -- sample context
+  no2_hourly_sample_count smallint,
+  pm25_hourly_sample_count smallint,
+  pm10_hourly_sample_count smallint,
 
   -- DAQI pollutant-specific
   daqi_no2_index_level smallint,
-  daqi_pm25_index_level smallint,
-  daqi_pm10_index_level smallint,
+  daqi_pm25_rolling24h_index_level smallint,
+  daqi_pm10_rolling24h_index_level smallint,
 
   -- EAQI pollutant-specific
   eaqi_no2_index_level smallint,
@@ -271,7 +269,7 @@ create index if not exists station_aqi_hourly_hour_idx
   on uk_aq_aggdaily.station_aqi_hourly (timestamp_hour_utc desc);
 
 create index if not exists station_aqi_hourly_daqi_pm25_idx
-  on uk_aq_aggdaily.station_aqi_hourly (daqi_pm25_index_level, timestamp_hour_utc desc);
+  on uk_aq_aggdaily.station_aqi_hourly (daqi_pm25_rolling24h_index_level, timestamp_hour_utc desc);
 
 create index if not exists station_aqi_hourly_eaqi_pm25_idx
   on uk_aq_aggdaily.station_aqi_hourly (eaqi_pm25_index_level, timestamp_hour_utc desc);

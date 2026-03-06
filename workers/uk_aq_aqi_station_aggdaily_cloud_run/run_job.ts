@@ -5,7 +5,7 @@ type RpcResult<T> = {
   error: RpcError | null;
 };
 
-type RunMode = "fast" | "reconcile_short" | "reconcile_deep" | "backfill";
+type RunMode = "sync_hourly" | "backfill";
 
 type HelperRow = {
   station_id: number;
@@ -21,22 +21,14 @@ type HelperRow = {
   pm25_hourly_sample_count: number | null;
   pm10_hourly_sample_count: number | null;
 
-  pm25_rolling24h_valid_hours: number | null;
-  pm10_rolling24h_valid_hours: number | null;
 
   daqi_no2_index_level: number | null;
-  daqi_no2_index_band: string | null;
-  daqi_pm25_index_level: number | null;
-  daqi_pm25_index_band: string | null;
-  daqi_pm10_index_level: number | null;
-  daqi_pm10_index_band: string | null;
+  daqi_pm25_rolling24h_index_level: number | null;
+  daqi_pm10_rolling24h_index_level: number | null;
 
   eaqi_no2_index_level: number | null;
-  eaqi_no2_index_band: string | null;
   eaqi_pm25_index_level: number | null;
-  eaqi_pm25_index_band: string | null;
   eaqi_pm10_index_level: number | null;
-  eaqi_pm10_index_band: string | null;
 };
 
 type HourlyUpsertMetrics = {
@@ -80,7 +72,7 @@ const RUN_LOG_RPC = (Deno.env.get("UK_AQ_AQI_RUN_LOG_RPC") ||
 const RUN_CLEANUP_RPC = (Deno.env.get("UK_AQ_AQI_RUN_CLEANUP_RPC") ||
   "uk_aq_rpc_aqi_compute_runs_cleanup").trim();
 
-const RUN_MODE = parseRunMode(Deno.env.get("UK_AQ_AQI_RUN_MODE"), "fast");
+const RUN_MODE = parseRunMode(Deno.env.get("UK_AQ_AQI_RUN_MODE"), "sync_hourly");
 const TRIGGER_MODE = (Deno.env.get("UK_AQ_AQI_TRIGGER_MODE") || "manual").trim() || "manual";
 const MATURITY_DELAY_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_MATURITY_DELAY_HOURS"),
@@ -90,14 +82,7 @@ const MATURITY_DELAY_BUFFER_MINUTES = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES"),
   10,
 );
-const SHORT_LOOKBACK_HOURS = parsePositiveInt(
-  Deno.env.get("UK_AQ_AQI_SHORT_LOOKBACK_HOURS"),
-  36,
-);
-const DEEP_LOOKBACK_DAYS = parsePositiveInt(
-  Deno.env.get("UK_AQ_AQI_DEEP_LOOKBACK_DAYS"),
-  14,
-);
+const LATE_CHANGE_CUTOFF_HOURS = 36;
 const RPC_RETRIES = parsePositiveInt(Deno.env.get("UK_AQ_AQI_RPC_RETRIES"), 3);
 const HOURLY_UPSERT_CHUNK_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE"),
@@ -144,12 +129,7 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 
 function parseRunMode(raw: string | undefined, fallback: RunMode): RunMode {
   const value = (raw || "").trim().toLowerCase();
-  if (
-    value === "fast" ||
-    value === "reconcile_short" ||
-    value === "reconcile_deep" ||
-    value === "backfill"
-  ) {
+  if (value === "sync_hourly" || value === "backfill") {
     return value;
   }
   return fallback;
@@ -302,25 +282,8 @@ function runWindow(nowUtc: Date): SyncWindow {
     };
   }
 
-  if (RUN_MODE === "fast") {
-    return {
-      hourEndStartExclusive: addHours(targetHourEnd, -1),
-      hourEndEndInclusive: targetHourEnd,
-      referenceHourEnd: targetHourEnd,
-    };
-  }
-
-  if (RUN_MODE === "reconcile_short") {
-    return {
-      hourEndStartExclusive: addHours(targetHourEnd, -SHORT_LOOKBACK_HOURS),
-      hourEndEndInclusive: targetHourEnd,
-      referenceHourEnd: targetHourEnd,
-    };
-  }
-
-  const deepHours = DEEP_LOOKBACK_DAYS * 24;
   return {
-    hourEndStartExclusive: addHours(targetHourEnd, -deepHours),
+    hourEndStartExclusive: addHours(targetHourEnd, -1),
     hourEndEndInclusive: targetHourEnd,
     referenceHourEnd: targetHourEnd,
   };
@@ -343,14 +306,6 @@ function toNullableInt(value: unknown): number | null {
     return null;
   }
   return Math.trunc(parsed);
-}
-
-function toNullableText(value: unknown): string | null {
-  if (value === null || value === undefined) {
-    return null;
-  }
-  const parsed = String(value).trim();
-  return parsed ? parsed : null;
 }
 
 function parseHelperRows(payload: unknown): HelperRow[] {
@@ -381,20 +336,12 @@ function parseHelperRows(payload: unknown): HelperRow[] {
       no2_hourly_sample_count: toNullableInt(row.no2_hourly_sample_count),
       pm25_hourly_sample_count: toNullableInt(row.pm25_hourly_sample_count),
       pm10_hourly_sample_count: toNullableInt(row.pm10_hourly_sample_count),
-      pm25_rolling24h_valid_hours: toNullableInt(row.pm25_rolling24h_valid_hours),
-      pm10_rolling24h_valid_hours: toNullableInt(row.pm10_rolling24h_valid_hours),
       daqi_no2_index_level: toNullableInt(row.daqi_no2_index_level),
-      daqi_no2_index_band: toNullableText(row.daqi_no2_index_band),
-      daqi_pm25_index_level: toNullableInt(row.daqi_pm25_index_level),
-      daqi_pm25_index_band: toNullableText(row.daqi_pm25_index_band),
-      daqi_pm10_index_level: toNullableInt(row.daqi_pm10_index_level),
-      daqi_pm10_index_band: toNullableText(row.daqi_pm10_index_band),
+      daqi_pm25_rolling24h_index_level: toNullableInt(row.daqi_pm25_rolling24h_index_level),
+      daqi_pm10_rolling24h_index_level: toNullableInt(row.daqi_pm10_rolling24h_index_level),
       eaqi_no2_index_level: toNullableInt(row.eaqi_no2_index_level),
-      eaqi_no2_index_band: toNullableText(row.eaqi_no2_index_band),
       eaqi_pm25_index_level: toNullableInt(row.eaqi_pm25_index_level),
-      eaqi_pm25_index_band: toNullableText(row.eaqi_pm25_index_band),
       eaqi_pm10_index_level: toNullableInt(row.eaqi_pm10_index_level),
-      eaqi_pm10_index_band: toNullableText(row.eaqi_pm10_index_band),
     });
   }
 
@@ -480,7 +427,7 @@ async function main(): Promise<void> {
   const window = runWindow(nowUtc);
 
   const referenceHourStart = addHours(window.referenceHourEnd, -1);
-  const lateCutoffHour = addHours(referenceHourStart, -SHORT_LOOKBACK_HOURS);
+  const lateCutoffHour = addHours(referenceHourStart, -LATE_CHANGE_CUTOFF_HOURS);
 
   let sourceRowsCount = 0;
   let candidateStationHours = 0;
@@ -551,9 +498,7 @@ async function main(): Promise<void> {
   }
 
   const durationMs = Date.now() - startedAt;
-  const deepReconcileEffective = RUN_MODE === "reconcile_deep"
-    ? stationHoursChangedGt36h > 0
-    : null;
+  const deepReconcileEffective = null;
 
   const runLogResult = await postgrestRpc<unknown>(
     AGGDAILY_SUPABASE_URL,
