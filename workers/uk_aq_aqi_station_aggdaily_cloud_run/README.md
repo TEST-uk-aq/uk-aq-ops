@@ -2,6 +2,8 @@
 
 Computes station-hour DAQI + EAQI rows (pollutant-specific) from ingest observations and writes to AggDaily DB.
 
+v1 completeness fields: source uses `sample_count` only (expected-count cadence completeness is deferred).
+
 ## Endpoints
 
 - `GET /` health

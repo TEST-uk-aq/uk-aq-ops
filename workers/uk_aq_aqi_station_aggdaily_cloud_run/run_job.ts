@@ -13,9 +13,6 @@ type SourceRow = {
   pollutant_code: "pm25" | "pm10" | "no2";
   hourly_mean_ugm3: number;
   sample_count: number;
-  expected_count: number;
-  required_count: number;
-  capture_ratio: number;
 };
 
 type BreakpointRow = {
@@ -36,8 +33,6 @@ type IndexMatch = {
 type PollutantHour = {
   hourlyMean: number;
   sampleCount: number;
-  expectedCount: number;
-  captureRatio: number;
 };
 
 type HourlyUpsertMetrics = {
@@ -65,17 +60,9 @@ type CandidateHourlyRow = {
   pm25_rolling24h_mean_ugm3: number | null;
   pm10_rolling24h_mean_ugm3: number | null;
 
-  no2_hourly_capture_ratio: number | null;
-  pm25_hourly_capture_ratio: number | null;
-  pm10_hourly_capture_ratio: number | null;
-
   no2_hourly_sample_count: number | null;
   pm25_hourly_sample_count: number | null;
   pm10_hourly_sample_count: number | null;
-
-  no2_hourly_expected_count: number | null;
-  pm25_hourly_expected_count: number | null;
-  pm10_hourly_expected_count: number | null;
 
   pm25_rolling24h_valid_hours: number | null;
   pm10_rolling24h_valid_hours: number | null;
@@ -393,9 +380,6 @@ function parseSourceRows(payload: unknown): SourceRow[] {
     const stationId = Number(row.station_id);
     const hourlyMean = Number(row.hourly_mean_ugm3);
     const sampleCount = Number(row.sample_count);
-    const expectedCount = Number(row.expected_count);
-    const requiredCount = Number(row.required_count);
-    const captureRatio = Number(row.capture_ratio);
     const timestamp = String(row.timestamp_hour_utc || "").trim();
     if (!Number.isInteger(stationId) || stationId <= 0 || Number.isNaN(Date.parse(timestamp))) {
       continue;
@@ -409,9 +393,6 @@ function parseSourceRows(payload: unknown): SourceRow[] {
       pollutant_code: pollutant,
       hourly_mean_ugm3: hourlyMean,
       sample_count: Number.isFinite(sampleCount) ? Math.trunc(sampleCount) : 0,
-      expected_count: Number.isFinite(expectedCount) ? Math.trunc(expectedCount) : 0,
-      required_count: Number.isFinite(requiredCount) ? Math.trunc(requiredCount) : 0,
-      capture_ratio: Number.isFinite(captureRatio) ? captureRatio : 0,
     });
   }
   return rows;
@@ -677,8 +658,6 @@ function buildCandidateRows(
     byHour.set(hourMs, {
       hourlyMean: row.hourly_mean_ugm3,
       sampleCount: row.sample_count,
-      expectedCount: row.expected_count,
-      captureRatio: row.capture_ratio,
     });
     hourlyByStationPollutant.set(stationPollutantKey, byHour);
 
@@ -801,17 +780,9 @@ function buildCandidateRows(
       pm25_rolling24h_mean_ugm3: pm25Rolling.mean,
       pm10_rolling24h_mean_ugm3: pm10Rolling.mean,
 
-      no2_hourly_capture_ratio: no2?.captureRatio ?? null,
-      pm25_hourly_capture_ratio: pm25?.captureRatio ?? null,
-      pm10_hourly_capture_ratio: pm10?.captureRatio ?? null,
-
       no2_hourly_sample_count: no2?.sampleCount ?? null,
       pm25_hourly_sample_count: pm25?.sampleCount ?? null,
       pm10_hourly_sample_count: pm10?.sampleCount ?? null,
-
-      no2_hourly_expected_count: no2?.expectedCount ?? null,
-      pm25_hourly_expected_count: pm25?.expectedCount ?? null,
-      pm10_hourly_expected_count: pm10?.expectedCount ?? null,
 
       pm25_rolling24h_valid_hours: pm25Rolling.validHours,
       pm10_rolling24h_valid_hours: pm10Rolling.validHours,
