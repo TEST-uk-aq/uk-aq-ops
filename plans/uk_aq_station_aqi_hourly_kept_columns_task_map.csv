@@ -8,12 +8,6 @@ pm25_rolling24h_mean_ugm3,AQI ingest helper tick compute then AQI sync upsert to
 pm10_rolling24h_mean_ugm3,AQI ingest helper tick compute then AQI sync upsert to AggDaily
 no2_hourly_sample_count,AQI ingest helper tick compute then AQI sync upsert to AggDaily
 pm25_hourly_sample_count,AQI ingest helper tick compute then AQI sync upsert to AggDaily
-pm10_hourly_sample_count,AQI ingest helper tick compute then AQI sync upsert to AggDaily
-daqi_no2_index_level,AQI sync upsert computes in AggDaily via uk_aq_aqi_index_lookup from NO2 hourly mean
-daqi_pm25_rolling24h_index_level,AQI sync upsert computes in AggDaily via uk_aq_aqi_index_lookup from PM2.5 rolling24h mean
-daqi_pm10_rolling24h_index_level,AQI sync upsert computes in AggDaily via uk_aq_aqi_index_lookup from PM10 rolling24h mean
-eaqi_no2_index_level,AQI sync upsert computes in AggDaily via uk_aq_aqi_index_lookup from NO2 hourly mean
-eaqi_pm25_index_level,AQI sync upsert computes in AggDaily via uk_aq_aqi_index_lookup from PM2.5 hourly mean
-eaqi_pm10_index_level,AQI sync upsert computes in AggDaily via uk_aq_aqi_index_lookup from PM10 hourly mean
+pm10_hourly_sample_count,AQI ingest helper tick compute then AQI sync upsert to AggDailyom PM10 hourly mean
 created_at,AggDaily table default now() on first insert during AQI sync upsert
 updated_at,AQI sync upsert sets now() on insert or changed update
