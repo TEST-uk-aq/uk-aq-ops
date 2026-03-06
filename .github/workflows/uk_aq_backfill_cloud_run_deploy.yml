@@ -1,0 +1,444 @@
+name: Deploy Backfill Cloud Run Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_backfill_cloud_run/**"
+      - "scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+      - ".github/workflows/uk_aq_backfill_cloud_run_deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: uk-aq-backfill-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-backfill-service:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
+      REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
+      SERVICE_NAME: ${{ vars.GCP_BACKFILL_SERVICE_NAME || vars.BACKFILL_SERVICE_NAME || 'uk-aq-backfill' }}
+      BACKFILL_SERVICE_ACCOUNT: ${{ vars.GCP_BACKFILL_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.BACKFILL_SERVICE_ACCOUNT || '' }}
+      RESOURCE_LABEL: uk-aq-backfill-service
+      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_BACKFILL_SERVICE_TIMEOUT_SECONDS || vars.BACKFILL_SERVICE_TIMEOUT_SECONDS || '900' }}
+      SERVICE_CPU: ${{ vars.GCP_BACKFILL_SERVICE_CPU || vars.BACKFILL_SERVICE_CPU || '1' }}
+      SERVICE_MEMORY: ${{ vars.GCP_BACKFILL_SERVICE_MEMORY || vars.BACKFILL_SERVICE_MEMORY || '1Gi' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_BACKFILL_SERVICE_CONCURRENCY || vars.BACKFILL_SERVICE_CONCURRENCY || '1' }}
+      SERVICE_MAX_INSTANCES: ${{ vars.GCP_BACKFILL_SERVICE_MAX_INSTANCES || vars.BACKFILL_SERVICE_MAX_INSTANCES || '1' }}
+      SERVICE_MIN_INSTANCES: ${{ vars.GCP_BACKFILL_SERVICE_MIN_INSTANCES || vars.BACKFILL_SERVICE_MIN_INSTANCES || '0' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_BACKFILL_SCHEDULER_ENABLED || vars.BACKFILL_SCHEDULER_ENABLED || 'false' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_BACKFILL_SCHEDULER_JOB_NAME || vars.BACKFILL_SCHEDULER_JOB_NAME || 'uk-aq-backfill-local-to-aggdaily' }}
+      SCHEDULER_CRON: ${{ vars.GCP_BACKFILL_SCHEDULER_CRON || vars.BACKFILL_SCHEDULER_CRON || '35 2 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.GCP_BACKFILL_SCHEDULER_TIMEZONE || vars.BACKFILL_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_BACKFILL_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.BACKFILL_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_BACKFILL_SCHEDULER_SERVICE_ACCOUNT || vars.BACKFILL_SCHEDULER_SERVICE_ACCOUNT || '' }}
+      SCHEDULER_PATH: ${{ vars.GCP_BACKFILL_SCHEDULER_PATH || vars.BACKFILL_SCHEDULER_PATH || '/run' }}
+      SCHEDULER_RUN_MODE: ${{ vars.GCP_BACKFILL_SCHEDULER_RUN_MODE || vars.BACKFILL_SCHEDULER_RUN_MODE || 'local_to_aggdaily' }}
+      SCHEDULER_DRY_RUN: ${{ vars.GCP_BACKFILL_SCHEDULER_DRY_RUN || vars.BACKFILL_SCHEDULER_DRY_RUN || 'false' }}
+      SCHEDULER_FORCE_REPLACE: ${{ vars.GCP_BACKFILL_SCHEDULER_FORCE_REPLACE || vars.BACKFILL_SCHEDULER_FORCE_REPLACE || 'false' }}
+      SCHEDULER_ENABLE_R2_FALLBACK: ${{ vars.GCP_BACKFILL_SCHEDULER_ENABLE_R2_FALLBACK || vars.BACKFILL_SCHEDULER_ENABLE_R2_FALLBACK || 'false' }}
+      SCHEDULER_FROM_DAY_UTC: ${{ vars.GCP_BACKFILL_SCHEDULER_FROM_DAY_UTC || vars.BACKFILL_SCHEDULER_FROM_DAY_UTC || '' }}
+      SCHEDULER_TO_DAY_UTC: ${{ vars.GCP_BACKFILL_SCHEDULER_TO_DAY_UTC || vars.BACKFILL_SCHEDULER_TO_DAY_UTC || '' }}
+      SCHEDULER_CONNECTOR_IDS_CSV: ${{ vars.GCP_BACKFILL_SCHEDULER_CONNECTOR_IDS_CSV || vars.BACKFILL_SCHEDULER_CONNECTOR_IDS_CSV || '' }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      HISTORY_SUPABASE_URL: ${{ vars.HISTORY_SUPABASE_URL }}
+      AGGDAILY_SUPABASE_URL: ${{ vars.AGGDAILY_SUPABASE_URL }}
+      UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
+      UK_AQ_BACKFILL_OPS_SCHEMA: ${{ vars.UK_AQ_BACKFILL_OPS_SCHEMA || 'uk_aq_ops' }}
+      UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC: ${{ vars.UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC || 'uk_aq_rpc_observations_hourly_fingerprint' }}
+      UK_AQ_BACKFILL_SOURCE_RPC: ${{ vars.UK_AQ_BACKFILL_SOURCE_RPC || 'uk_aq_rpc_station_aqi_hourly_source' }}
+      UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC: ${{ vars.UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC || 'uk_aq_rpc_station_aqi_hourly_upsert' }}
+      UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC: ${{ vars.UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC || 'uk_aq_rpc_station_aqi_rollups_refresh' }}
+      UK_AQ_BACKFILL_RPC_RETRIES: ${{ vars.UK_AQ_BACKFILL_RPC_RETRIES || '3' }}
+      UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE: ${{ vars.UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE || '2000' }}
+      UK_AQ_BACKFILL_INGEST_RETENTION_DAYS: ${{ vars.UK_AQ_BACKFILL_INGEST_RETENTION_DAYS || '7' }}
+      UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS: ${{ vars.UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS || '31' }}
+      UK_AQ_BACKFILL_LOCAL_TIMEZONE: ${{ vars.UK_AQ_BACKFILL_LOCAL_TIMEZONE || 'Europe/London' }}
+      UK_AQ_BACKFILL_LEDGER_ENABLED: ${{ vars.UK_AQ_BACKFILL_LEDGER_ENABLED || 'true' }}
+      UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER: ${{ vars.UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER || 'false' }}
+      UK_AQ_BACKFILL_ENABLE_R2_FALLBACK: ${{ vars.UK_AQ_BACKFILL_ENABLE_R2_FALLBACK || 'false' }}
+      UK_AQ_BACKFILL_METADATA_SCHEMA: ${{ vars.UK_AQ_BACKFILL_METADATA_SCHEMA || 'uk_aq_core' }}
+      UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE: ${{ vars.UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE || '1000' }}
+      SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+      HISTORY_SECRET_KEY: ${{ secrets.HISTORY_SECRET_KEY }}
+      AGGDAILY_SECRET_KEY: ${{ secrets.AGGDAILY_SECRET_KEY }}
+      SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
+      HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
+      AGGDAILY_SECRET_KEY_SECRET_NAME: ${{ vars.AGGDAILY_SECRET_KEY_SECRET_NAME || 'AGGDAILY_SECRET_KEY' }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required project config
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT_ID:-}" ]; then
+            echo "Missing required variable: GCP_PROJECT_ID"
+            exit 1
+          fi
+          if [ -z "${BACKFILL_SERVICE_ACCOUNT:-}" ]; then
+            echo "Missing required service account setting: GCP_BACKFILL_SERVICE_ACCOUNT (or GCP_OPS_JOB_SERVICE_ACCOUNT)"
+            exit 1
+          fi
+          if [[ "${BACKFILL_SERVICE_ACCOUNT}" == *"-compute@developer.gserviceaccount.com" ]]; then
+            echo "Invalid runtime service account: default compute service account is not allowed."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_URL:-}" ]; then
+            echo "Missing required variable: SUPABASE_URL"
+            exit 1
+          fi
+          if [ -z "${HISTORY_SUPABASE_URL:-}" ]; then
+            echo "Missing required variable: HISTORY_SUPABASE_URL"
+            exit 1
+          fi
+          if [ -z "${AGGDAILY_SUPABASE_URL:-}" ]; then
+            echo "Missing required variable: AGGDAILY_SUPABASE_URL"
+            exit 1
+          fi
+
+      - name: Validate Google auth config
+        run: |
+          set -euo pipefail
+          if [ -n "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" ] && [ -n "${GCP_SERVICE_ACCOUNT:-}" ]; then
+            echo "Using Workload Identity Federation auth."
+          elif [ -n "${GCP_SA_KEY:-}" ]; then
+            echo "Using Service Account key auth."
+          else
+            echo "Missing Google auth config."
+            echo "Set either:"
+            echo "1) GCP_WORKLOAD_IDENTITY_PROVIDER + GCP_SERVICE_ACCOUNT"
+            echo "or"
+            echo "2) GCP_SA_KEY"
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud (WIF)
+        if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to Google Cloud (Service Account Key fallback)
+        if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || env.GCP_SERVICE_ACCOUNT == '' }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+
+      - name: Configure gcloud project
+        run: |
+          set -euo pipefail
+          gcloud config set project "${PROJECT_ID}"
+          gcloud config set run/region "${REGION}"
+
+      - name: Verify Artifact Registry repository exists
+        run: |
+          set -euo pipefail
+          gcloud artifacts repositories describe "${REPO}" \
+            --location "${REGION}" \
+            --project "${PROJECT_ID}" >/dev/null
+
+      - name: Configure Docker auth for Artifact Registry
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push backfill image
+        id: build
+        run: |
+          set -euo pipefail
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-backfill:${GITHUB_SHA::12}"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          docker build -f workers/uk_aq_backfill_cloud_run/Dockerfile -t "${IMAGE}" .
+          docker push "${IMAGE}"
+
+      - name: Sync GitHub secrets to GCP Secret Manager
+        run: |
+          set -euo pipefail
+          UPSERT_SCRIPT="scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+
+          upsert_secret() {
+            local secret_name="$1"
+            local secret_value="$2"
+            local required="${3:-0}"
+
+            if [ -z "${secret_name}" ]; then
+              if [ "${required}" = "1" ]; then
+                echo "Missing required secret name."
+                exit 1
+              fi
+              return 0
+            fi
+
+            if [ -z "${secret_value}" ] && [ "${required}" = "0" ]; then
+              echo "Skipping optional secret ${secret_name} (no GitHub secret/variable value)."
+              return 0
+            fi
+
+            printf '%s' "${secret_value}" | "${UPSERT_SCRIPT}" \
+              --project "${PROJECT_ID}" \
+              --secret "${secret_name}" \
+              --required "${required}"
+          }
+
+          upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1
+          upsert_secret "${HISTORY_SECRET_KEY_SECRET_NAME}" "${HISTORY_SECRET_KEY}" 1
+          upsert_secret "${AGGDAILY_SECRET_KEY_SECRET_NAME}" "${AGGDAILY_SECRET_KEY}" 1
+
+      - name: Build Cloud Run env and secret args
+        id: cloudrun_args
+        run: |
+          set -euo pipefail
+
+          require_env() {
+            local key="$1"
+            local value="${!key:-}"
+            if [ -z "${value}" ]; then
+              echo "Missing required value for ${key}"
+              exit 1
+            fi
+          }
+
+          add_env() {
+            local key="$1"
+            local value="${!key:-}"
+            if [ -n "${value}" ]; then
+              env_updates+=("${key}=${value}")
+            fi
+          }
+
+          add_secret_binding() {
+            local env_key="$1"
+            local secret_name="$2"
+            local required="${3:-0}"
+            if [ -z "${secret_name}" ]; then
+              if [ "${required}" = "1" ]; then
+                echo "Missing secret name for required binding ${env_key}"
+                exit 1
+              fi
+              return 0
+            fi
+            if gcloud secrets describe "${secret_name}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+              secret_updates+=("${env_key}=${secret_name}:latest")
+              return 0
+            fi
+            if [ "${required}" = "1" ]; then
+              echo "Required Secret Manager secret not found: ${secret_name}"
+              exit 1
+            fi
+          }
+
+          require_env SUPABASE_URL
+          require_env HISTORY_SUPABASE_URL
+          require_env AGGDAILY_SUPABASE_URL
+
+          env_updates=()
+          add_env SUPABASE_URL
+          add_env HISTORY_SUPABASE_URL
+          add_env AGGDAILY_SUPABASE_URL
+          add_env UK_AQ_PUBLIC_SCHEMA
+          add_env UK_AQ_BACKFILL_OPS_SCHEMA
+          add_env UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC
+          add_env UK_AQ_BACKFILL_SOURCE_RPC
+          add_env UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC
+          add_env UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC
+          add_env UK_AQ_BACKFILL_RPC_RETRIES
+          add_env UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE
+          add_env UK_AQ_BACKFILL_INGEST_RETENTION_DAYS
+          add_env UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS
+          add_env UK_AQ_BACKFILL_LOCAL_TIMEZONE
+          add_env UK_AQ_BACKFILL_LEDGER_ENABLED
+          add_env UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER
+          add_env UK_AQ_BACKFILL_ENABLE_R2_FALLBACK
+          add_env UK_AQ_BACKFILL_METADATA_SCHEMA
+          add_env UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE
+          env_updates+=("GCP_PROJECT_ID=${PROJECT_ID}")
+
+          secret_updates=()
+          add_secret_binding "SB_SECRET_KEY" "${SB_SECRET_KEY_SECRET_NAME}" 1
+          add_secret_binding "HISTORY_SECRET_KEY" "${HISTORY_SECRET_KEY_SECRET_NAME}" 1
+          add_secret_binding "AGGDAILY_SECRET_KEY" "${AGGDAILY_SECRET_KEY_SECRET_NAME}" 1
+
+          env_file="${RUNNER_TEMP}/uk-aq-backfill-env.yaml"
+          : > "${env_file}"
+          for kv in "${env_updates[@]}"; do
+            key="${kv%%=*}"
+            value="${kv#*=}"
+            python3 -c 'import json,sys; f=open(sys.argv[1], "a", encoding="utf-8"); print(f"{sys.argv[2]}: {json.dumps(sys.argv[3])}", file=f); f.close()' \
+              "${env_file}" "${key}" "${value}"
+          done
+
+          secret_csv="$(IFS=,; echo "${secret_updates[*]}")"
+          echo "env_file=${env_file}" >> "${GITHUB_OUTPUT}"
+          echo "secret_csv=${secret_csv}" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy Cloud Run service
+        run: |
+          set -euo pipefail
+          ENV_FILE='${{ steps.cloudrun_args.outputs.env_file }}'
+          SECRET_CSV='${{ steps.cloudrun_args.outputs.secret_csv }}'
+
+          CMD=(
+            gcloud run deploy "${SERVICE_NAME}"
+            --region "${REGION}"
+            --image "${{ steps.build.outputs.image }}"
+            --service-account "${BACKFILL_SERVICE_ACCOUNT}"
+            --timeout "${SERVICE_TIMEOUT_SECONDS}"
+            --cpu "${SERVICE_CPU}"
+            --memory "${SERVICE_MEMORY}"
+            --concurrency "${SERVICE_CONCURRENCY}"
+            --max-instances "${SERVICE_MAX_INSTANCES}"
+            --min-instances "${SERVICE_MIN_INSTANCES}"
+            --labels "job_name=${RESOURCE_LABEL}"
+            --no-allow-unauthenticated
+          )
+          if [ -n "${ENV_FILE}" ]; then
+            CMD+=(--env-vars-file "${ENV_FILE}")
+          fi
+          if [ -n "${SECRET_CSV}" ]; then
+            CMD+=(--set-secrets "${SECRET_CSV}")
+          fi
+          "${CMD[@]}"
+
+      - name: Verify service labels
+        run: |
+          set -euo pipefail
+          labels_json="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format="json(metadata.labels)")"
+          job_name_label="$(
+            python3 -c 'import json,sys; print(((json.loads(sys.stdin.read()) or {}).get("metadata", {}) or {}).get("labels", {}).get("job_name", ""))' <<<"${labels_json}"
+          )"
+          if [ "${job_name_label}" != "${RESOURCE_LABEL}" ]; then
+            echo "job_name label mismatch: expected ${RESOURCE_LABEL}, got ${job_name_label:-<missing>}"
+            exit 1
+          fi
+          echo "Verified label job_name=${job_name_label}"
+
+      - name: Ensure Cloud Scheduler trigger exists
+        run: |
+          set -euo pipefail
+
+          enabled="$(printf '%s' "${SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
+            if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
+              gcloud scheduler jobs pause "${SCHEDULER_JOB_NAME}" --location "${REGION}" || true
+              echo "Paused existing scheduler job ${SCHEDULER_JOB_NAME} (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
+            else
+              echo "Scheduler job ${SCHEDULER_JOB_NAME} not found; nothing to pause."
+            fi
+            exit 0
+          fi
+
+          scheduler_sa="${SCHEDULER_SERVICE_ACCOUNT:-${BACKFILL_SERVICE_ACCOUNT}}"
+          service_uri="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+          scheduler_path="${SCHEDULER_PATH:-/run}"
+          if [[ "${scheduler_path}" != /* ]]; then
+            scheduler_path="/${scheduler_path}"
+          fi
+          scheduler_uri="${service_uri}${scheduler_path}"
+
+          scheduler_body="$(python3 - <<'PY'
+          import json
+          import os
+
+          def parse_bool(raw):
+              value = str(raw or "").strip().lower()
+              if value in {"1", "true", "yes", "on"}:
+                  return True
+              if value in {"0", "false", "no", "off"}:
+                  return False
+              return None
+
+          payload = {
+              "trigger_mode": "scheduler",
+              "run_mode": os.getenv("SCHEDULER_RUN_MODE", "local_to_aggdaily").strip() or "local_to_aggdaily",
+          }
+
+          for env_key, field in [
+              ("SCHEDULER_DRY_RUN", "dry_run"),
+              ("SCHEDULER_FORCE_REPLACE", "force_replace"),
+              ("SCHEDULER_ENABLE_R2_FALLBACK", "enable_r2_fallback"),
+          ]:
+              parsed = parse_bool(os.getenv(env_key, ""))
+              if parsed is not None:
+                  payload[field] = parsed
+
+          for env_key, field in [
+              ("SCHEDULER_FROM_DAY_UTC", "from_day_utc"),
+              ("SCHEDULER_TO_DAY_UTC", "to_day_utc"),
+          ]:
+              value = os.getenv(env_key, "").strip()
+              if value:
+                  payload[field] = value
+
+          raw_connector_csv = os.getenv("SCHEDULER_CONNECTOR_IDS_CSV", "").strip()
+          if raw_connector_csv:
+              connector_ids = []
+              for part in raw_connector_csv.split(","):
+                  part = part.strip()
+                  if not part:
+                      continue
+                  try:
+                      number = int(part)
+                  except ValueError:
+                      continue
+                  if number > 0:
+                      connector_ids.append(number)
+              if connector_ids:
+                  payload["connector_ids"] = sorted(set(connector_ids))
+
+          print(json.dumps(payload, separators=(",", ":")))
+          PY
+          )"
+
+          gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --member "serviceAccount:${scheduler_sa}" \
+            --role "roles/run.invoker" >/dev/null
+
+          if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
+            gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
+              --location "${REGION}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${scheduler_uri}" \
+              --http-method POST \
+              --update-headers "Content-Type=application/json" \
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+            echo "Updated Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
+          else
+            gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
+              --location "${REGION}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${scheduler_uri}" \
+              --http-method POST \
+              --headers "Content-Type=application/json" \
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+            echo "Created Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
+          fi
+
+      - name: Show deployed service
+        run: |
+          gcloud run services describe "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --format="yaml(metadata.name,metadata.labels,spec.template.spec.serviceAccountName,spec.template.spec.containerConcurrency,spec.template.spec.containers[0].image,spec.template.spec.containers[0].resources,status.url)"

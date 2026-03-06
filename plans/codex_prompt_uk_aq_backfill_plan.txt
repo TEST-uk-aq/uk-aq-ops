@@ -1,0 +1,151 @@
+Please implement the UK AQ backfill feature in this repo by following the plan first, then coding carefully in phases.
+
+Repo:
+- uk-aq-ops
+
+Read these first before making changes:
+1. plans/uk_aq_backfill_plan.md
+2. AGENTS.md
+3. README.md
+4. existing worker patterns under workers/
+5. any existing scripts and helpers related to:
+   - AggDaily
+   - backup_r2
+   - run ledgers / job status / Cloud Run entrypoints
+
+You may also inspect these related repos for reference patterns only, but do not edit them:
+- uk-aq-ingest
+- uk-aq-schema
+
+If you need to change any existing file, first check AGENTS.md and current repo conventions for archive rules. This functionality is classed as a significant change, so archive any existing file before modifying them, and clearly note the archive path in your summary.
+
+
+Goal:
+Add one new Cloud Run worker in uk-aq-ops with three run modes:
+- local_to_aggdaily
+- history_to_r2
+- source_to_all
+
+Important fixed decisions:
+- Keep one worker with multiple run modes, not three separate workers.
+- Keep the existing R2 layout:
+  backup/observations/day_utc=YYYY-MM-DD/connector_id=N/
+  containing manifest.json and parquet part files such as part-00000.parquet
+- source_to_all should skip History DB writes for dates outside the rolling local retention window.
+- The rolling local retention window is 31/32 days depending on DST.
+- Treat History DB as the canonical local raw source for historic work already in our stack.
+- Treat R2 as the durable archive target, not the normal primary compute source.
+- Do not redesign the architecture unless required by the existing repo structure.
+- Follow existing repo conventions and naming patterns wherever practical.
+
+Implementation scope for this task:
+Phase 1 only:
+Implement the worker skeleton, shared plumbing, and the first run mode:
+- local_to_aggdaily
+
+Also implement the framework for the other two modes so they are stubbed and wired, but do not fully implement their data pipelines yet.
+
+What I want delivered in this change:
+1. A new worker, probably under:
+   workers/uk_aq_backfill_cloud_run/
+   unless the repo has a better matching pattern
+2. Run mode routing for:
+   - local_to_aggdaily
+   - history_to_r2
+   - source_to_all
+3. Manual trigger support matching current Cloud Run patterns in this repo
+4. Dry-run support
+5. Day-by-day backward processing through time
+6. Idempotent local_to_aggdaily processing by UTC day and connector
+7. Clear structured logging
+8. Checkpoint/run ledger design wired in, even if minimal at first
+9. Documentation updates for how to run it
+
+For local_to_aggdaily, implement:
+- date range input
+- optional connector filter
+- backward day iteration
+- source priority:
+  1. Ingest DB for recent windows still locally available
+  2. History DB for older retained local raw data
+  3. R2 only as explicit fallback/repair path, not default
+- recompute AggDaily only for the targeted impacted days/connectors
+- safe rerun behaviour
+- default skip of already-complete days unless force/replace is explicitly set
+
+Do not:
+- fully implement source_to_all acquisition yet
+- fully implement history_to_r2 export yet
+- add unnecessary new infrastructure
+- move historic backfill through Ingest DB as the main path
+- change the existing R2 partition layout
+- duplicate raw observations into AggDaily DB
+
+Where backfill run metadata should live:
+- Prefer uk_aq_ops in AggDaily DB if that matches current schema patterns cleanly
+- If schema changes are needed, create them in the appropriate schema/sql location following existing repo conventions
+- Keep schema additions minimal and operationally useful
+
+Suggested metadata objects, if needed:
+- backfill_runs
+- backfill_run_days
+- backfill_checkpoints
+- backfill_errors
+
+Minimum useful fields:
+- run_id
+- run_mode
+- trigger_mode
+- connector_id
+- source_kind
+- window_from_utc
+- window_to_utc
+- day_utc
+- status
+- rows_read
+- rows_written_aggdaily
+- objects_written_r2
+- checkpoint_json
+- error_json
+- started_at
+- finished_at
+
+Runtime behaviour:
+- Process newest selected day first, then move older
+- Default chunk size: one UTC day
+- Start with single-run safety rather than aggressive concurrency
+- Make retries resume-safe
+- Make dry-run estimate work without writes where practical
+
+For the retention boundary:
+- source_to_all must skip History DB writes for dates older than the rolling 31/32-day local retention window
+- encapsulate this rule in one helper so it is easy to reason about and test
+- document clearly how the retention boundary is determined
+
+Testing:
+- Add or update tests for the new routing and core helper logic where this repo’s patterns support tests
+- At minimum, cover:
+  - run mode parsing
+  - backward day iteration
+  - retention window helper
+  - skip/force logic for already-complete days
+
+Docs:
+- Update README or the most appropriate docs so I can understand:
+  - what the worker does
+  - available run modes
+  - what Phase 1 implements now
+  - what is still stubbed for future phases
+  - expected env vars and example manual invocations
+
+Output format I want from you:
+1. First inspect the repo and give me a short implementation plan based on the actual repo structure
+2. Then list the files you intend to create or modify
+3. Then implement the changes
+4. Then summarise:
+   - what you changed
+   - what remains stubbed
+   - any assumptions you made
+   - any follow-up recommendations
+
+Please be careful to preserve existing style and patterns in this repo.

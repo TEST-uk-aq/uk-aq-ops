@@ -6,7 +6,6 @@ Cloud Run operations services for:
 - flushing ingest history outbox rows into history DB
 - maintaining history DB partitions/index policy/retention
 - logging ingest/history database size samples
-- running operational backfill workflows across ingest/history/aggdaily
 
 ## Worker layout
 
@@ -17,7 +16,6 @@ Each gcloud-facing service now lives under `workers/`:
 - `workers/uk_aq_history_partition_maintenance_service/server.mjs`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
 - `workers/uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`
-- `workers/uk_aq_backfill_cloud_run/run_service.ts`
 
 ## Services
 
@@ -98,23 +96,6 @@ Primary controls:
 - upserts `station_aqi_hourly` and refreshes daily/monthly rollups in aggdaily
 - logs run telemetry (`aqi_compute_runs`) with 7-day retention cleanup
 
-### 7) Backfill Worker (`workers/uk_aq_backfill_cloud_run/run_service.ts`)
-
-- `GET /` health
-- `POST /` executes backfill job
-- `POST /run` executes backfill job (alias)
-- run modes:
-  - `local_to_aggdaily` (Phase 1 implemented)
-  - `history_to_r2` (Phase 1 stubbed)
-  - `source_to_all` (Phase 1 stubbed)
-- `local_to_aggdaily` behavior:
-  - UTC-day backfill with newest day first
-  - optional connector filter
-  - source priority: ingest -> history -> explicit R2 fallback
-  - default skip if checkpoint already complete; `force_replace` bypasses skip
-  - dry-run support with write estimates
-  - minimal run/day/checkpoint ledger wiring in `uk_aq_ops` (if schema is applied)
-
 ## Local run
 
 ```bash
@@ -122,7 +103,6 @@ npm install
 npm run start:prune
 npm run start:flush
 npm run start:history-partitions
-deno run --allow-env --allow-net --allow-read --allow-write --allow-run workers/uk_aq_backfill_cloud_run/run_service.ts
 ```
 
 Type-check quick validation:
@@ -185,4 +165,3 @@ Apply in Supabase SQL editor:
 - `system_docs/setup/uk-aq-history-outbox-flush-service.md`
 - `system_docs/setup/uk-aq-history-partition-maintenance.md`
 - `system_docs/setup/uk-aq-aqi-station-aggdaily.md`
-- `system_docs/setup/uk-aq-backfill-cloud-run.md`
