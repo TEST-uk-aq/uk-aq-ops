@@ -2,6 +2,8 @@
 
 Syncs precomputed station-hour AQI helper rows from ingest DB into AggDaily DB (hourly upsert + daily/monthly rollup refresh).
 
+Helper rows carry means/sample counts; AQI index levels are computed in the AggDaily hourly upsert RPC.
+
 ## Endpoints
 
 - `GET /` health

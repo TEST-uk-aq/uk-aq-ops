@@ -20,15 +20,6 @@ type HelperRow = {
   no2_hourly_sample_count: number | null;
   pm25_hourly_sample_count: number | null;
   pm10_hourly_sample_count: number | null;
-
-
-  daqi_no2_index_level: number | null;
-  daqi_pm25_rolling24h_index_level: number | null;
-  daqi_pm10_rolling24h_index_level: number | null;
-
-  eaqi_no2_index_level: number | null;
-  eaqi_pm25_index_level: number | null;
-  eaqi_pm10_index_level: number | null;
 };
 
 type HourlyUpsertMetrics = {
@@ -336,12 +327,6 @@ function parseHelperRows(payload: unknown): HelperRow[] {
       no2_hourly_sample_count: toNullableInt(row.no2_hourly_sample_count),
       pm25_hourly_sample_count: toNullableInt(row.pm25_hourly_sample_count),
       pm10_hourly_sample_count: toNullableInt(row.pm10_hourly_sample_count),
-      daqi_no2_index_level: toNullableInt(row.daqi_no2_index_level),
-      daqi_pm25_rolling24h_index_level: toNullableInt(row.daqi_pm25_rolling24h_index_level),
-      daqi_pm10_rolling24h_index_level: toNullableInt(row.daqi_pm10_rolling24h_index_level),
-      eaqi_no2_index_level: toNullableInt(row.eaqi_no2_index_level),
-      eaqi_pm25_index_level: toNullableInt(row.eaqi_pm25_index_level),
-      eaqi_pm10_index_level: toNullableInt(row.eaqi_pm10_index_level),
     });
   }
 
