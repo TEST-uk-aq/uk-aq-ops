@@ -30,6 +30,23 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      - name: Set Worker secrets
+        working-directory: workers/uk_aq_aqi_history_r2_test_worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg AGGDAILY_SUPABASE_URL "${{ vars.AGGDAILY_SUPABASE_URL }}" \
+            --arg AGGDAILY_SECRET_KEY "${{ secrets.AGGDAILY_SECRET_KEY }}" \
+            '{AGGDAILY_SUPABASE_URL: $AGGDAILY_SUPABASE_URL, AGGDAILY_SECRET_KEY: $AGGDAILY_SECRET_KEY} | with_entries(select(.value != \"\"))')"
+          if [ "$(printf '%s' "$secrets_json" | jq 'length')" -gt 0 ]; then
+            printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-aqi-history-r2-test
+          else
+            echo "No Worker secrets to set."
+          fi
+
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
