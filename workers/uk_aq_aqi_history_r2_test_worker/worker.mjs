@@ -346,7 +346,9 @@ export default {
       return jsonResponse({ ok: false, error: "Not found" }, { status: 404, cacheSeconds: 30 });
     }
 
-    const prefix = normalizePrefix(env.AQI_R2_TEST_PREFIX || DEFAULT_PREFIX) || DEFAULT_PREFIX;
+    const defaultPrefix = normalizePrefix(env.AQI_R2_TEST_PREFIX || DEFAULT_PREFIX) || DEFAULT_PREFIX;
+    const overridePrefix = normalizePrefix(url.searchParams.get("prefix") || "");
+    const prefix = overridePrefix || defaultPrefix;
     const cacheKey = new Request(url.toString(), { method: "GET" });
 
     const cached = await caches.default.match(cacheKey);

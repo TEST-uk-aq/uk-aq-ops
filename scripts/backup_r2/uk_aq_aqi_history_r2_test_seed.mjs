@@ -82,7 +82,7 @@ function parseArgs(argv) {
       continue;
     }
     if (arg === "--hourly-days") {
-      out.hourlyDays = parsePositiveInt(argv[i + 1], DEFAULT_HOURLY_DAYS, 1, 31);
+      out.hourlyDays = parsePositiveInt(argv[i + 1], DEFAULT_HOURLY_DAYS, 1, 366);
       i += 1;
       continue;
     }
