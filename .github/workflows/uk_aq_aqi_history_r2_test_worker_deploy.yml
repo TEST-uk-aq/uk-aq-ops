@@ -1,0 +1,39 @@
+name: Deploy uk_aq_aqi_history_r2_test Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_aqi_history_r2_test_worker/**"
+      - ".github/workflows/uk_aq_aqi_history_r2_test_worker_deploy.yml"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/uk_aq_aqi_history_r2_test_worker
+          command: deploy

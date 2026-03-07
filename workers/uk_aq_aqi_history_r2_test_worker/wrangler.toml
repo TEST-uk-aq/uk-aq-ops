@@ -1,0 +1,12 @@
+name = "uk-aq-aqi-history-r2-test"
+main = "worker.mjs"
+compatibility_date = "2026-03-07"
+
+[vars]
+AQI_R2_TEST_PREFIX = "aqi-r2-test/v1"
+AQI_R2_TEST_CACHE_MAX_AGE_SECONDS = "300"
+
+[[r2_buckets]]
+binding = "AQI_R2_TEST_BUCKET"
+bucket_name = "uk-aq-backup-cic-test"
+preview_bucket_name = "uk-aq-backup-cic-test"
