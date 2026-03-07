@@ -72,7 +72,7 @@ Core:
 - `UK_AQ_BACKFILL_FORCE_REPLACE` (default `false`)
 - `UK_AQ_BACKFILL_FROM_DAY_UTC` (default yesterday UTC)
 - `UK_AQ_BACKFILL_TO_DAY_UTC` (default `from_day_utc`)
-- `UK_AQ_BACKFILL_CONNECTOR_IDS_CSV` (optional filter)
+- `UK_AQ_BACKFILL_CONNECTOR_IDS` (optional filter)
 - `UK_AQ_BACKFILL_ENABLE_R2_FALLBACK` (default `false`)
 
 Retention / iteration:
@@ -80,6 +80,14 @@ Retention / iteration:
 - `UK_AQ_BACKFILL_INGEST_RETENTION_DAYS` (default `7`)
 - `UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS` (default `31`)
 - `UK_AQ_BACKFILL_LOCAL_TIMEZONE` (default `Europe/London`)
+- `UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE` (default `1000`)
+- `UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE` (default `2000`)
+- `UK_AQ_BACKFILL_RPC_RETRIES` (default `3`)
+
+Source RPC paging:
+
+- `UK_AQ_BACKFILL_SOURCE_RPC_PAGE_SIZE` (default `1000`)
+- `UK_AQ_BACKFILL_SOURCE_RPC_MAX_PAGES` (default `200`)
 
 RPC names:
 
@@ -98,7 +106,11 @@ Ledger:
 
 If you want persistent skip/checkpoint behavior across runs, apply:
 
-- `workers/uk_aq_backfill_cloud_run/sql/uk_aq_backfill_ops_aggdaily.sql`
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aggdaily_db/uk_aq_backfill_ops_aggdaily.sql` (canonical)
+
+The same ledger tables are included in:
+
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aggdaily_db/uk_aq_aggdaily_schema.sql`
 
 Tables:
 

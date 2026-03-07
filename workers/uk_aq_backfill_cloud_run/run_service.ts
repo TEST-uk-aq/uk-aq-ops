@@ -188,7 +188,7 @@ async function runJob(args: {
     env.UK_AQ_BACKFILL_TO_DAY_UTC = args.toDayUtc;
   }
   if (args.connectorIds && args.connectorIds.length > 0) {
-    env.UK_AQ_BACKFILL_CONNECTOR_IDS_CSV = args.connectorIds.join(",");
+    env.UK_AQ_BACKFILL_CONNECTOR_IDS = args.connectorIds.join(",");
   }
 
   const child = new Deno.Command("deno", {

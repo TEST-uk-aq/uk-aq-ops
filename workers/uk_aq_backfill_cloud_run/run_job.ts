@@ -161,13 +161,25 @@ const ENABLE_R2_FALLBACK = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_ENABLE_R2_FALLBACK"),
   false,
 );
-const CONNECTOR_IDS = parseConnectorIds(optionalEnv("UK_AQ_BACKFILL_CONNECTOR_IDS_CSV"));
+const CONNECTOR_IDS = parseConnectorIds(optionalEnv("UK_AQ_BACKFILL_CONNECTOR_IDS"));
 
 const SOURCE_RPC_RETRIES = parsePositiveInt(
   Deno.env.get("UK_AQ_BACKFILL_RPC_RETRIES"),
   3,
   1,
   10,
+);
+const SOURCE_RPC_PAGE_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOURCE_RPC_PAGE_SIZE"),
+  1000,
+  100,
+  5000,
+);
+const SOURCE_RPC_MAX_PAGES = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOURCE_RPC_MAX_PAGES"),
+  200,
+  1,
+  2000,
 );
 const HOURLY_UPSERT_CHUNK_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE"),
@@ -313,8 +325,10 @@ async function postgrestRpc<T>(
   source: SourceDbConfig,
   rpcName: string,
   args: Record<string, unknown>,
+  query?: URLSearchParams,
 ): Promise<RpcResult<T>> {
-  const url = `${normalizeRestUrl(source.base_url)}/rpc/${rpcName}`;
+  const queryString = query ? `?${query.toString()}` : "";
+  const url = `${normalizeRestUrl(source.base_url)}/rpc/${rpcName}${queryString}`;
   const headers: Record<string, string> = {
     apikey: source.privileged_key,
     Authorization: `Bearer ${source.privileged_key}`,
@@ -889,13 +903,59 @@ async function fetchSourceRowsForConnector(
   }
 
   let lastError = "unknown_source_rpc_error";
+  let emptySuccessLabel: string | null = null;
   for (const attempt of attempts) {
-    const response = await postgrestRpc<unknown>(source, SOURCE_RPC, attempt.args);
-    if (!response.error) {
-      const rows = Array.isArray(response.data) ? response.data : [];
+    const rows: unknown[] = [];
+    let attemptFailed = false;
+    let hitMaxPages = true;
+
+    for (let pageIndex = 0; pageIndex < SOURCE_RPC_MAX_PAGES; pageIndex += 1) {
+      const query = new URLSearchParams();
+      query.set("order", "timestamp_hour_utc.asc,station_id.asc,pollutant_code.asc");
+      query.set("limit", String(SOURCE_RPC_PAGE_SIZE));
+      query.set("offset", String(pageIndex * SOURCE_RPC_PAGE_SIZE));
+
+      const response = await postgrestRpc<unknown>(source, SOURCE_RPC, attempt.args, query);
+      if (response.error) {
+        lastError = response.error.message;
+        attemptFailed = true;
+        hitMaxPages = false;
+        break;
+      }
+
+      const pageRows = Array.isArray(response.data) ? response.data : [];
+      rows.push(...pageRows);
+
+      if (pageRows.length < SOURCE_RPC_PAGE_SIZE) {
+        hitMaxPages = false;
+        break;
+      }
+    }
+
+    if (attemptFailed) {
+      continue;
+    }
+
+    if (hitMaxPages) {
+      logStructured("warning", "source_rpc_rows_truncated", {
+        source_kind: sourceKind,
+        connector_id: connectorId,
+        source_filter: attempt.label,
+        source_rpc_page_size: SOURCE_RPC_PAGE_SIZE,
+        source_rpc_max_pages: SOURCE_RPC_MAX_PAGES,
+        rows_fetched: rows.length,
+      });
+    }
+
+    if (rows.length > 0) {
       return { rows, source_filter: attempt.label };
     }
-    lastError = response.error.message;
+
+    emptySuccessLabel = attempt.label;
+  }
+
+  if (emptySuccessLabel) {
+    return { rows: [], source_filter: emptySuccessLabel };
   }
 
   throw new Error(

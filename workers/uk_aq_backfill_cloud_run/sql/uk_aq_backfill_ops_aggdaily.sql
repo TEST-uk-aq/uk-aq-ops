@@ -1,5 +1,7 @@
 -- Backfill ops metadata tables for AggDaily DB.
--- Apply in AggDaily DB (service_role context).
+-- Canonical location is the schema repo:
+--   ../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aggdaily_db/uk_aq_backfill_ops_aggdaily.sql
+-- Keep this file in sync only as a convenience mirror.
 
 create schema if not exists uk_aq_ops;
 
