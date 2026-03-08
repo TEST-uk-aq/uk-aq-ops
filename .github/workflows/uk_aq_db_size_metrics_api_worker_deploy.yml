@@ -37,12 +37,10 @@ jobs:
           secrets_json="$(jq -n \
             --arg SUPABASE_URL "${{ vars.SUPABASE_URL }}" \
             --arg SB_SECRET_KEY "${{ secrets.SB_SECRET_KEY }}" \
-            --arg HISTORY_SUPABASE_URL "${{ vars.HISTORY_SUPABASE_URL }}" \
-            --arg HISTORY_SECRET_KEY "${{ secrets.HISTORY_SECRET_KEY }}" \
-            --arg AGGDAILY_SUPABASE_URL "${{ vars.AGGDAILY_SUPABASE_URL }}" \
-            --arg AGGDAILY_SECRET_KEY "${{ secrets.AGGDAILY_SECRET_KEY }}" \
+            --arg OBS_AQIDB_SUPABASE_URL "${{ vars.OBS_AQIDB_SUPABASE_URL }}" \
+            --arg OBS_AQIDB_SECRET_KEY "${{ secrets.OBS_AQIDB_SECRET_KEY }}" \
             --arg UK_AQ_DB_SIZE_API_TOKEN "${{ secrets.UK_AQ_DB_SIZE_API_TOKEN }}" \
-            '{SUPABASE_URL: $SUPABASE_URL, SB_SECRET_KEY: $SB_SECRET_KEY, HISTORY_SUPABASE_URL: $HISTORY_SUPABASE_URL, HISTORY_SECRET_KEY: $HISTORY_SECRET_KEY, AGGDAILY_SUPABASE_URL: $AGGDAILY_SUPABASE_URL, AGGDAILY_SECRET_KEY: $AGGDAILY_SECRET_KEY, UK_AQ_DB_SIZE_API_TOKEN: $UK_AQ_DB_SIZE_API_TOKEN} | with_entries(select(.value != ""))')"
+            '{SUPABASE_URL: $SUPABASE_URL, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, UK_AQ_DB_SIZE_API_TOKEN: $UK_AQ_DB_SIZE_API_TOKEN} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
             if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-db-size-metrics-api; then
               exit 0

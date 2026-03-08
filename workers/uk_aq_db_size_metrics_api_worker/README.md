@@ -17,29 +17,33 @@ Response shape:
 - `generated_at`
 - `lookback_days`
 - `db_size_metrics` (same row shape as `uk_aq_public.uk_aq_db_size_metrics_hourly`)
+- `schema_size_metrics` (same row shape as `uk_aq_public.uk_aq_schema_size_metrics_hourly`)
+- `r2_domain_size_metrics` (same row shape as `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`)
 - `oldest_by_label`
 - `db_size_metrics_error`
+- `schema_size_metrics_error`
+- `r2_domain_size_metrics_error`
 
 Behavior:
 
 - Reads from each configured DB view `uk_aq_public.uk_aq_db_size_metrics_hourly`:
   - ingest (`SUPABASE_URL` + `SB_SECRET_KEY`)
-  - history (`HISTORY_SUPABASE_URL` + `HISTORY_SECRET_KEY`)
-  - aggdaily (optional: `AGGDAILY_SUPABASE_URL` + `AGGDAILY_SECRET_KEY`)
+  - obs_aqidb (`OBS_AQIDB_SUPABASE_URL` + `OBS_AQIDB_SECRET_KEY`)
 - Merges and sorts rows by `bucket_hour`.
 - Preserves null `oldest_observed_at` values as null (dashboard can render placeholder `>=--/--/----`).
+- Reads schema/R2 size rows from ingest public views:
+  - `uk_aq_public.uk_aq_schema_size_metrics_hourly`
+  - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
 
 ## Required secrets / vars
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
-- `HISTORY_SUPABASE_URL`
-- `HISTORY_SECRET_KEY`
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
 
 Optional:
 
-- `AGGDAILY_SUPABASE_URL`
-- `AGGDAILY_SECRET_KEY` (required if `AGGDAILY_SUPABASE_URL` is set)
 - `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`)
 - `UK_AQ_DB_SIZE_API_TOKEN` (if set, caller must send `Authorization: Bearer <token>`)
 
@@ -55,9 +59,7 @@ Set secrets:
 ```bash
 wrangler secret put SUPABASE_URL
 wrangler secret put SB_SECRET_KEY
-wrangler secret put HISTORY_SUPABASE_URL
-wrangler secret put HISTORY_SECRET_KEY
-wrangler secret put AGGDAILY_SUPABASE_URL
-wrangler secret put AGGDAILY_SECRET_KEY
+wrangler secret put OBS_AQIDB_SUPABASE_URL
+wrangler secret put OBS_AQIDB_SECRET_KEY
 wrangler secret put UK_AQ_DB_SIZE_API_TOKEN
 ```

@@ -1,12 +1,15 @@
 # uk_aq DB size logger Cloud Run service
 
-This Cloud Run service samples current Postgres database size for both ingest DB
-and history DB once per run, then writes hourly points into each DB's local
-`uk_aq_ops.db_size_metrics_hourly` table (through
-`uk_aq_public.uk_aq_rpc_db_size_metric_upsert`).
-Agg Daily DB sampling is optional and enabled when its URL + secret are supplied.
-Each sample also captures the oldest `observed_at` timestamp currently present in
-that database's observations table.
+This Cloud Run service samples and persists hourly size metrics for:
+
+- DB clusters: `ingestdb`, `obs_aqidb`
+- obs_aqidb schemas: `uk_aq_observs`, `uk_aq_aqilevels`
+- R2 History domains: `observations`, `aqilevels`
+
+DB cluster metrics are written via `uk_aq_public.uk_aq_rpc_db_size_metric_upsert`.
+Schema and R2 domain metrics are written via
+`uk_aq_public.uk_aq_rpc_schema_size_metric_upsert` and
+`uk_aq_public.uk_aq_rpc_r2_domain_size_metric_upsert`.
 
 Primary scheduling is now Supabase `pg_cron` in each DB (local sample/write).
 Cloud Run service remains available for manual/on-demand runs or fallback scheduling.
@@ -15,8 +18,8 @@ Cloud Run service remains available for manual/on-demand runs or fallback schedu
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
-- `HISTORY_SUPABASE_URL`
-- `HISTORY_SECRET_KEY`
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
 
 ## Optional env vars
 
@@ -26,8 +29,19 @@ Cloud Run service remains available for manual/on-demand runs or fallback schedu
 - `UK_AQ_DB_SIZE_CLEANUP_RPC` (default `uk_aq_rpc_db_size_metric_cleanup`)
 - `UK_AQ_DB_SIZE_RETENTION_DAYS` (default `120`)
 - `UK_AQ_DB_SIZE_RPC_RETRIES` (default `3`)
+- `UK_AQ_SCHEMA_SIZE_SOURCE_RPC` (default `uk_aq_rpc_schema_size_bytes`)
+- `UK_AQ_SCHEMA_SIZE_UPSERT_RPC` (default `uk_aq_rpc_schema_size_metric_upsert`)
+- `UK_AQ_SCHEMA_SIZE_CLEANUP_RPC` (default `uk_aq_rpc_schema_size_metric_cleanup`)
+- `UK_AQ_SCHEMA_SIZE_RETENTION_DAYS` (default `120`)
+- `UK_AQ_R2_DOMAIN_SIZE_UPSERT_RPC` (default `uk_aq_rpc_r2_domain_size_metric_upsert`)
+- `UK_AQ_R2_DOMAIN_SIZE_CLEANUP_RPC` (default `uk_aq_rpc_r2_domain_size_metric_cleanup`)
+- `UK_AQ_R2_DOMAIN_SIZE_RETENTION_DAYS` (default `120`)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
+- `CFLARE_R2_ENDPOINT` (fallback `R2_ENDPOINT`)
+- `CFLARE_R2_BUCKET` (fallback `R2_BUCKET`)
+- `CFLARE_R2_REGION` (fallback `R2_REGION`, default `auto`)
+- `CFLARE_R2_ACCESS_KEY_ID` (fallback `R2_ACCESS_KEY_ID`)
+- `CFLARE_R2_SECRET_ACCESS_KEY` (fallback `R2_SECRET_ACCESS_KEY`)
 - `UK_AQ_INGEST_DB_LABEL` (default `ingestdb`)
-- `UK_AQ_HISTORY_DB_LABEL` (default `historydb`)
-- `AGGDAILY_SUPABASE_URL` (optional; enable Agg Daily sampling when set with secret)
-- `AGGDAILY_SECRET_KEY` (optional; must be set when `AGGDAILY_SUPABASE_URL` is set)
-- `UK_AQ_AGGDAILY_DB_LABEL` (default `aggdailydb`)
+- `UK_AQ_OBS_AQIDB_DB_LABEL` (default `obs_aqidb`)

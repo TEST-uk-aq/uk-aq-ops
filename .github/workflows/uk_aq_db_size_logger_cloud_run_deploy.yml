@@ -40,22 +40,35 @@ jobs:
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.DB_SIZE_LOGGER_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
       SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_SERVICE_ACCOUNT || vars.DB_SIZE_LOGGER_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
-      HISTORY_SUPABASE_URL: ${{ vars.HISTORY_SUPABASE_URL }}
-      AGGDAILY_SUPABASE_URL: ${{ vars.AGGDAILY_SUPABASE_URL }}
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
       UK_AQ_DB_SIZE_RPC: ${{ vars.UK_AQ_DB_SIZE_RPC || 'uk_aq_rpc_database_size_bytes' }}
       UK_AQ_DB_SIZE_UPSERT_RPC: ${{ vars.UK_AQ_DB_SIZE_UPSERT_RPC || 'uk_aq_rpc_db_size_metric_upsert' }}
       UK_AQ_DB_SIZE_CLEANUP_RPC: ${{ vars.UK_AQ_DB_SIZE_CLEANUP_RPC || 'uk_aq_rpc_db_size_metric_cleanup' }}
       UK_AQ_DB_SIZE_RETENTION_DAYS: ${{ vars.UK_AQ_DB_SIZE_RETENTION_DAYS || '120' }}
+      UK_AQ_SCHEMA_SIZE_SOURCE_RPC: ${{ vars.UK_AQ_SCHEMA_SIZE_SOURCE_RPC || 'uk_aq_rpc_schema_size_bytes' }}
+      UK_AQ_SCHEMA_SIZE_UPSERT_RPC: ${{ vars.UK_AQ_SCHEMA_SIZE_UPSERT_RPC || 'uk_aq_rpc_schema_size_metric_upsert' }}
+      UK_AQ_SCHEMA_SIZE_CLEANUP_RPC: ${{ vars.UK_AQ_SCHEMA_SIZE_CLEANUP_RPC || 'uk_aq_rpc_schema_size_metric_cleanup' }}
+      UK_AQ_SCHEMA_SIZE_RETENTION_DAYS: ${{ vars.UK_AQ_SCHEMA_SIZE_RETENTION_DAYS || '120' }}
+      UK_AQ_R2_DOMAIN_SIZE_UPSERT_RPC: ${{ vars.UK_AQ_R2_DOMAIN_SIZE_UPSERT_RPC || 'uk_aq_rpc_r2_domain_size_metric_upsert' }}
+      UK_AQ_R2_DOMAIN_SIZE_CLEANUP_RPC: ${{ vars.UK_AQ_R2_DOMAIN_SIZE_CLEANUP_RPC || 'uk_aq_rpc_r2_domain_size_metric_cleanup' }}
+      UK_AQ_R2_DOMAIN_SIZE_RETENTION_DAYS: ${{ vars.UK_AQ_R2_DOMAIN_SIZE_RETENTION_DAYS || '120' }}
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || vars.R2_ENDPOINT }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || vars.R2_BUCKET }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || vars.R2_REGION || 'auto' }}
       UK_AQ_DB_SIZE_RPC_RETRIES: ${{ vars.UK_AQ_DB_SIZE_RPC_RETRIES || '3' }}
       UK_AQ_INGEST_DB_LABEL: ${{ vars.UK_AQ_INGEST_DB_LABEL || 'ingestdb' }}
-      UK_AQ_HISTORY_DB_LABEL: ${{ vars.UK_AQ_HISTORY_DB_LABEL || 'historydb' }}
-      UK_AQ_AGGDAILY_DB_LABEL: ${{ vars.UK_AQ_AGGDAILY_DB_LABEL || 'aggdailydb' }}
+      UK_AQ_OBS_AQIDB_DB_LABEL: ${{ vars.UK_AQ_OBS_AQIDB_DB_LABEL || 'obs_aqidb' }}
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
-      HISTORY_SECRET_KEY: ${{ secrets.HISTORY_SECRET_KEY }}
-      AGGDAILY_SECRET_KEY: ${{ secrets.AGGDAILY_SECRET_KEY }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
-      HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
+      OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
+      CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME || 'CFLARE_R2_ACCESS_KEY_ID' }}
+      CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME || 'CFLARE_R2_SECRET_ACCESS_KEY' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -82,12 +95,8 @@ jobs:
             echo "Missing required variable: SUPABASE_URL"
             exit 1
           fi
-          if [ -z "${HISTORY_SUPABASE_URL:-}" ]; then
-            echo "Missing required variable: HISTORY_SUPABASE_URL"
-            exit 1
-          fi
-          if [ -n "${AGGDAILY_SUPABASE_URL:-}" ] && [ -z "${AGGDAILY_SECRET_KEY:-}" ]; then
-            echo "AGGDAILY_SUPABASE_URL is set but AGGDAILY_SECRET_KEY is missing."
+          if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ]; then
+            echo "Missing required variable: OBS_AQIDB_SUPABASE_URL"
             exit 1
           fi
 
@@ -180,12 +189,9 @@ jobs:
           }
 
           upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1
-          upsert_secret "${HISTORY_SECRET_KEY_SECRET_NAME}" "${HISTORY_SECRET_KEY}" 1
-          aggdaily_required=0
-          if [ -n "${AGGDAILY_SUPABASE_URL:-}" ]; then
-            aggdaily_required=1
-          fi
-          upsert_secret "AGGDAILY_SECRET_KEY" "${AGGDAILY_SECRET_KEY}" "${aggdaily_required}"
+          upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
+          upsert_secret "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" "${CFLARE_R2_ACCESS_KEY_ID}" 0
+          upsert_secret "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" "${CFLARE_R2_SECRET_ACCESS_KEY}" 0
 
       - name: Build Cloud Run env and secret args
         id: cloudrun_args
@@ -231,31 +237,38 @@ jobs:
           }
 
           require_env SUPABASE_URL
-          require_env HISTORY_SUPABASE_URL
+          require_env OBS_AQIDB_SUPABASE_URL
 
           env_updates=()
           add_env SUPABASE_URL
-          add_env HISTORY_SUPABASE_URL
-          add_env AGGDAILY_SUPABASE_URL
+          add_env OBS_AQIDB_SUPABASE_URL
           add_env UK_AQ_PUBLIC_SCHEMA
           add_env UK_AQ_DB_SIZE_RPC
           add_env UK_AQ_DB_SIZE_UPSERT_RPC
           add_env UK_AQ_DB_SIZE_CLEANUP_RPC
           add_env UK_AQ_DB_SIZE_RETENTION_DAYS
+          add_env UK_AQ_SCHEMA_SIZE_SOURCE_RPC
+          add_env UK_AQ_SCHEMA_SIZE_UPSERT_RPC
+          add_env UK_AQ_SCHEMA_SIZE_CLEANUP_RPC
+          add_env UK_AQ_SCHEMA_SIZE_RETENTION_DAYS
+          add_env UK_AQ_R2_DOMAIN_SIZE_UPSERT_RPC
+          add_env UK_AQ_R2_DOMAIN_SIZE_CLEANUP_RPC
+          add_env UK_AQ_R2_DOMAIN_SIZE_RETENTION_DAYS
+          add_env UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
+          add_env UK_AQ_R2_HISTORY_AQILEVELS_PREFIX
+          add_env CFLARE_R2_ENDPOINT
+          add_env CFLARE_R2_BUCKET
+          add_env CFLARE_R2_REGION
           add_env UK_AQ_DB_SIZE_RPC_RETRIES
           add_env UK_AQ_INGEST_DB_LABEL
-          add_env UK_AQ_HISTORY_DB_LABEL
-          add_env UK_AQ_AGGDAILY_DB_LABEL
+          add_env UK_AQ_OBS_AQIDB_DB_LABEL
           env_updates+=("GCP_PROJECT_ID=${PROJECT_ID}")
 
           secret_updates=()
           add_secret_binding "SB_SECRET_KEY" "${SB_SECRET_KEY_SECRET_NAME}" 1
-          add_secret_binding "HISTORY_SECRET_KEY" "${HISTORY_SECRET_KEY_SECRET_NAME}" 1
-          aggdaily_required=0
-          if [ -n "${AGGDAILY_SUPABASE_URL:-}" ]; then
-            aggdaily_required=1
-          fi
-          add_secret_binding "AGGDAILY_SECRET_KEY" "AGGDAILY_SECRET_KEY" "${aggdaily_required}"
+          add_secret_binding "OBS_AQIDB_SECRET_KEY" "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" 1
+          add_secret_binding "CFLARE_R2_ACCESS_KEY_ID" "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" 0
+          add_secret_binding "CFLARE_R2_SECRET_ACCESS_KEY" "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" 0
 
           env_file="${RUNNER_TEMP}/uk-aq-db-size-logger-env.yaml"
           : > "${env_file}"

@@ -49,7 +49,7 @@ function normalizeDbSizeRows(rows, expectedLabel) {
 
     const rowLabel = String(row.database_label || "").trim().toLowerCase();
     const label = rowLabel || expectedLabel;
-    if (label !== "ingestdb" && label !== "historydb" && label !== "aggdailydb") {
+    if (label !== "ingestdb" && label !== "obs_aqidb") {
       continue;
     }
     if (expectedLabel && label !== expectedLabel) {
@@ -122,21 +122,16 @@ function isAuthorized(request, env) {
 function sourceConfigs(env) {
   const ingestUrl = String(env.SUPABASE_URL || "").trim();
   const ingestKey = String(env.SB_SECRET_KEY || "").trim();
-  const historyUrl = String(env.HISTORY_SUPABASE_URL || "").trim();
-  const historyKey = String(env.HISTORY_SECRET_KEY || "").trim();
-  const aggdailyUrl = String(env.AGGDAILY_SUPABASE_URL || "").trim();
-  const aggdailyKey = String(env.AGGDAILY_SECRET_KEY || "").trim();
+  const obsAqiUrl = String(env.OBS_AQIDB_SUPABASE_URL || "").trim();
+  const obsAqiKey = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
 
   const configs = [];
 
   if (ingestUrl && ingestKey) {
     configs.push({ label: "ingestdb", baseUrl: ingestUrl.replace(/\/$/, ""), key: ingestKey });
   }
-  if (historyUrl && historyKey) {
-    configs.push({ label: "historydb", baseUrl: historyUrl.replace(/\/$/, ""), key: historyKey });
-  }
-  if (aggdailyUrl && aggdailyKey) {
-    configs.push({ label: "aggdailydb", baseUrl: aggdailyUrl.replace(/\/$/, ""), key: aggdailyKey });
+  if (obsAqiUrl && obsAqiKey) {
+    configs.push({ label: "obs_aqidb", baseUrl: obsAqiUrl.replace(/\/$/, ""), key: obsAqiKey });
   }
 
   return configs;
@@ -186,11 +181,173 @@ async function fetchDbSizeRowsForSource(env, source, lookbackDays) {
   return normalizeDbSizeRows(payload, source.label);
 }
 
+function normalizeSchemaSizeRows(rows) {
+  const normalized = [];
+
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+
+    const label = String(row.database_label || "").trim().toLowerCase();
+    const schemaName = String(row.schema_name || "").trim().toLowerCase();
+    if (label !== "obs_aqidb") {
+      continue;
+    }
+    if (schemaName !== "uk_aq_observs" && schemaName !== "uk_aq_aqilevels") {
+      continue;
+    }
+
+    const bucketHour = toIsoOrNull(row.bucket_hour);
+    if (!bucketHour) {
+      continue;
+    }
+
+    const rawSize = Number(row.size_bytes);
+    if (!Number.isFinite(rawSize) || rawSize < 0) {
+      continue;
+    }
+
+    normalized.push({
+      bucket_hour: bucketHour,
+      database_label: label,
+      schema_name: schemaName,
+      size_bytes: Math.trunc(rawSize),
+      oldest_observed_at: toIsoOrNull(row.oldest_observed_at),
+      recorded_at: toIsoOrNull(row.recorded_at),
+    });
+  }
+
+  normalized.sort((a, b) => {
+    const aMs = Date.parse(a.bucket_hour) || 0;
+    const bMs = Date.parse(b.bucket_hour) || 0;
+    if (aMs !== bMs) {
+      return aMs - bMs;
+    }
+    return a.schema_name.localeCompare(b.schema_name);
+  });
+
+  return normalized;
+}
+
+function normalizeR2DomainSizeRows(rows) {
+  const normalized = [];
+
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+
+    const domainName = String(row.domain_name || "").trim().toLowerCase();
+    if (domainName !== "observations" && domainName !== "aqilevels") {
+      continue;
+    }
+
+    const bucketHour = toIsoOrNull(row.bucket_hour);
+    if (!bucketHour) {
+      continue;
+    }
+
+    const rawSize = Number(row.size_bytes);
+    if (!Number.isFinite(rawSize) || rawSize < 0) {
+      continue;
+    }
+
+    normalized.push({
+      bucket_hour: bucketHour,
+      domain_name: domainName,
+      size_bytes: Math.trunc(rawSize),
+      recorded_at: toIsoOrNull(row.recorded_at),
+    });
+  }
+
+  normalized.sort((a, b) => {
+    const aMs = Date.parse(a.bucket_hour) || 0;
+    const bMs = Date.parse(b.bucket_hour) || 0;
+    if (aMs !== bMs) {
+      return aMs - bMs;
+    }
+    return a.domain_name.localeCompare(b.domain_name);
+  });
+
+  return normalized;
+}
+
+async function fetchIngestMetricViewRows(env, lookbackDays, viewName, select, normalizeFn) {
+  const ingestUrl = String(env.SUPABASE_URL || "").trim();
+  const ingestKey = String(env.SB_SECRET_KEY || "").trim();
+  const publicSchema = String(env.UK_AQ_PUBLIC_SCHEMA || "uk_aq_public").trim() || "uk_aq_public";
+
+  if (!ingestUrl || !ingestKey) {
+    return { rows: [], warning: "ingestdb: missing SUPABASE_URL or SB_SECRET_KEY" };
+  }
+
+  const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
+  const query = new URLSearchParams({
+    select,
+    bucket_hour: `gte.${since}`,
+    order: "bucket_hour.asc",
+    limit: "5000",
+  });
+
+  const response = await fetch(`${ingestUrl.replace(/\/$/, "")}/rest/v1/${viewName}?${query.toString()}`, {
+    method: "GET",
+    headers: {
+      apikey: ingestKey,
+      Authorization: `Bearer ${ingestKey}`,
+      Accept: "application/json",
+      "Accept-Profile": publicSchema,
+      "x-ukaq-egress-caller": "uk_aq_db_size_metrics_api_worker",
+    },
+  });
+
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch (_error) {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const message =
+      (payload && typeof payload === "object" && !Array.isArray(payload) && (payload.message || payload.error_description || payload.error)) ||
+      (typeof text === "string" ? text.slice(0, 400) : "") ||
+      `HTTP ${response.status}`;
+    return { rows: [], warning: `${viewName}: ${String(message)}` };
+  }
+
+  if (!Array.isArray(payload)) {
+    return { rows: [], warning: `${viewName}: non-array payload` };
+  }
+
+  return { rows: normalizeFn(payload), warning: null };
+}
+
+async function fetchSchemaSizeRows(env, lookbackDays) {
+  return fetchIngestMetricViewRows(
+    env,
+    lookbackDays,
+    "uk_aq_schema_size_metrics_hourly",
+    "bucket_hour,database_label,schema_name,size_bytes,oldest_observed_at,recorded_at",
+    normalizeSchemaSizeRows,
+  );
+}
+
+async function fetchR2DomainSizeRows(env, lookbackDays) {
+  return fetchIngestMetricViewRows(
+    env,
+    lookbackDays,
+    "uk_aq_r2_domain_size_metrics_hourly",
+    "bucket_hour,domain_name,size_bytes,recorded_at",
+    normalizeR2DomainSizeRows,
+  );
+}
+
 function latestOldestByLabel(rows) {
   const out = {
     ingestdb: null,
-    historydb: null,
-    aggdailydb: null,
+    obs_aqidb: null,
   };
   for (const row of rows) {
     const label = row.database_label;
@@ -205,7 +362,7 @@ function latestOldestByLabel(rows) {
 async function fetchAllDbSizeRows(env, lookbackDays) {
   const sources = sourceConfigs(env);
   if (sources.length === 0) {
-    throw new Error("No DB source credentials configured (SUPABASE/HISTORY/AGGDAILY)");
+    throw new Error("No DB source credentials configured (SUPABASE/OBS_AQIDB)");
   }
 
   const rowsBySource = [];
@@ -257,12 +414,18 @@ export default {
 
     try {
       const result = await fetchAllDbSizeRows(env, lookbackDays);
+      const schemaResult = await fetchSchemaSizeRows(env, lookbackDays);
+      const r2DomainResult = await fetchR2DomainSizeRows(env, lookbackDays);
       return jsonResponse({
         generated_at: new Date().toISOString(),
         lookback_days: lookbackDays,
         db_size_metrics: result.rows,
+        schema_size_metrics: schemaResult.rows,
+        r2_domain_size_metrics: r2DomainResult.rows,
         oldest_by_label: latestOldestByLabel(result.rows),
         db_size_metrics_error: result.warning,
+        schema_size_metrics_error: schemaResult.warning,
+        r2_domain_size_metrics_error: r2DomainResult.warning,
         source: "multidb_uk_aq_public.uk_aq_db_size_metrics_hourly",
       });
     } catch (error) {
@@ -272,12 +435,15 @@ export default {
           generated_at: new Date().toISOString(),
           lookback_days: lookbackDays,
           db_size_metrics: [],
+          schema_size_metrics: [],
+          r2_domain_size_metrics: [],
           oldest_by_label: {
             ingestdb: null,
-            historydb: null,
-            aggdailydb: null,
+            obs_aqidb: null,
           },
           db_size_metrics_error: message,
+          schema_size_metrics_error: null,
+          r2_domain_size_metrics_error: null,
         },
         500,
       );
