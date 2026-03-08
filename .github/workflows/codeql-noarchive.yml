@@ -92,6 +92,7 @@ jobs:
         language:
           - actions
           - javascript-typescript
+          - python
 
     steps:
       - name: Checkout
