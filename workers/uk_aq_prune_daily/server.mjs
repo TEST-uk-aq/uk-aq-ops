@@ -5,7 +5,7 @@ import {
   fetchBackupDoneDays,
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
-} from "./phase_b_backup_r2.mjs";
+} from "./phase_b_history_r2.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -452,16 +452,16 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     ingest_bucket_count: sumIntField(batchSummaries, "ingest_bucket_count"),
     observs_bucket_count: sumIntField(batchSummaries, "observs_bucket_count"),
     deletable_bucket_count: sumIntField(batchSummaries, "deletable_bucket_count"),
-    deletable_bucket_count_before_backup_gate: sumIntField(
+    deletable_bucket_count_before_history_gate: sumIntField(
       batchSummaries,
-      "deletable_bucket_count_before_backup_gate",
+      "deletable_bucket_count_before_history_gate",
     ),
     total_deletable_rows: sumBigIntField(batchSummaries, "total_deletable_rows").toString(),
     mismatch_count: sumIntField(batchSummaries, "mismatch_count"),
     observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
     observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
-    backup_gate_enabled: Boolean(config.phaseB?.enabled),
-    backup_gate_blocked_bucket_count: sumIntField(batchSummaries, "backup_gate_blocked_bucket_count"),
+    history_gate_enabled: Boolean(config.phaseB?.enabled),
+    history_gate_blocked_bucket_count: sumIntField(batchSummaries, "history_gate_blocked_bucket_count"),
     batch_count: batches.length,
     batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
     batch_windows_preview: sampleRows(batches),
@@ -475,9 +475,9 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       repair_one_mismatch_bucket_result: aggregateDryRunRepairPilot(batchSummaries),
       deletable_buckets_preview: mergePreviewField(batchSummaries, "deletable_buckets_preview"),
       mismatches_preview: mergePreviewField(batchSummaries, "mismatches_preview"),
-      backup_gate_blocked_buckets_preview: mergePreviewField(
+      history_gate_blocked_buckets_preview: mergePreviewField(
         batchSummaries,
-        "backup_gate_blocked_buckets_preview",
+        "history_gate_blocked_buckets_preview",
       ),
     };
   }
@@ -498,13 +498,13 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "repaired_now_deletable_bucket_count",
     ),
-    repaired_now_deletable_bucket_count_before_backup_gate: sumIntField(
+    repaired_now_deletable_bucket_count_before_history_gate: sumIntField(
       batchSummaries,
-      "repaired_now_deletable_bucket_count_before_backup_gate",
+      "repaired_now_deletable_bucket_count_before_history_gate",
     ),
-    backup_gate_blocked_after_repair_bucket_count: sumIntField(
+    history_gate_blocked_after_repair_bucket_count: sumIntField(
       batchSummaries,
-      "backup_gate_blocked_after_repair_bucket_count",
+      "history_gate_blocked_after_repair_bucket_count",
     ),
     deleted_bucket_count: sumIntField(batchSummaries, "deleted_bucket_count"),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
@@ -526,9 +526,9 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "deleted_after_repair_buckets_preview",
     ),
-    backup_gate_blocked_after_repair_preview: mergePreviewField(
+    history_gate_blocked_after_repair_preview: mergePreviewField(
       batchSummaries,
-      "backup_gate_blocked_after_repair_preview",
+      "history_gate_blocked_after_repair_preview",
     ),
     mismatches_before_repair_preview: mergePreviewField(
       batchSummaries,
@@ -1155,50 +1155,50 @@ function buildRunConfig(url) {
 
   const phaseB = resolvePhaseBRuntimeConfig(process.env);
   phaseB.enabled = parseBoolean(
-    params.get("backupEnabled") ?? process.env.BACKUP_PHASE_B_ENABLED,
+    params.get("historyEnabled") ?? process.env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED,
     phaseB.enabled,
   );
   phaseB.part_max_rows = parsePositiveInt(
-    params.get("backupPartMaxRows") ?? phaseB.part_max_rows,
+    params.get("historyPartMaxRows") ?? phaseB.part_max_rows,
     phaseB.part_max_rows,
     1,
     5_000_000,
   );
   phaseB.cursor_fetch_rows = parsePositiveInt(
-    params.get("backupCursorFetchRows") ?? phaseB.cursor_fetch_rows,
+    params.get("historyCursorFetchRows") ?? phaseB.cursor_fetch_rows,
     phaseB.cursor_fetch_rows,
     1_000,
     500_000,
   );
   phaseB.row_group_size = parsePositiveInt(
-    params.get("backupRowGroupSize") ?? phaseB.row_group_size,
+    params.get("historyRowGroupSize") ?? phaseB.row_group_size,
     phaseB.row_group_size,
     10_000,
     2_000_000,
   );
   phaseB.max_candidates_per_run = parsePositiveInt(
-    params.get("backupMaxCandidates") ?? phaseB.max_candidates_per_run,
+    params.get("historyMaxCandidates") ?? phaseB.max_candidates_per_run,
     phaseB.max_candidates_per_run,
     1,
     50_000,
   );
   phaseB.staging_retention_days = parsePositiveInt(
-    params.get("backupStagingRetentionDays") ?? phaseB.staging_retention_days,
+    params.get("historyStagingRetentionDays") ?? phaseB.staging_retention_days,
     phaseB.staging_retention_days,
     1,
     90,
   );
-  const backupDbUrlOverride = (params.get("backupDbUrl") || "").trim();
-  if (backupDbUrlOverride) {
-    phaseB.supabase_db_url = backupDbUrlOverride;
+  const historyDbUrlOverride = (params.get("historyDbUrl") || "").trim();
+  if (historyDbUrlOverride) {
+    phaseB.supabase_db_url = historyDbUrlOverride;
   }
-  const backupBucketOverride = (params.get("backupR2Bucket") || "").trim();
-  if (backupBucketOverride) {
-    phaseB.r2.bucket = backupBucketOverride;
+  const historyBucketOverride = (params.get("historyR2Bucket") || "").trim();
+  if (historyBucketOverride) {
+    phaseB.r2.bucket = historyBucketOverride;
   }
-  const backupEndpointOverride = (params.get("backupR2Endpoint") || "").trim();
-  if (backupEndpointOverride) {
-    phaseB.r2.endpoint = backupEndpointOverride;
+  const historyEndpointOverride = (params.get("historyR2Endpoint") || "").trim();
+  if (historyEndpointOverride) {
+    phaseB.r2.endpoint = historyEndpointOverride;
   }
 
   return {
@@ -1254,8 +1254,8 @@ async function applyBackupGateFilter(config, runId, buckets, gateStage) {
   const blockedBuckets = [];
   for (const bucket of buckets) {
     const dayUtc = toBucketDayUtc(bucket);
-    const backupDone = dayGateMap.get(dayUtc) === true;
-    if (backupDone) {
+    const historyDone = dayGateMap.get(dayUtc) === true;
+    if (historyDone) {
       allowedBuckets.push(bucket);
       continue;
     }
@@ -1264,12 +1264,12 @@ async function applyBackupGateFilter(config, runId, buckets, gateStage) {
       hour_start: bucket.hour_start,
       day_utc: dayUtc,
       observation_count: bucket.observation_count.toString(),
-      reason: "backup_not_complete_for_day",
+      reason: "history_not_complete_for_day",
     });
   }
 
   if (blockedBuckets.length > 0) {
-    logStructured("WARNING", "backup_gate_blocked_buckets", {
+    logStructured("WARNING", "history_gate_blocked_buckets", {
       run_id: runId,
       gate_stage: gateStage,
       blocked_count: blockedBuckets.length,
@@ -1277,7 +1277,7 @@ async function applyBackupGateFilter(config, runId, buckets, gateStage) {
       prune_blocked_for_day: true,
     });
   } else {
-    logStructured("INFO", "backup_gate_allows_all_buckets", {
+    logStructured("INFO", "history_gate_allows_all_buckets", {
       run_id: runId,
       gate_stage: gateStage,
       allowed_count: allowedBuckets.length,
@@ -1322,7 +1322,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     repair_bucket_outbox_chunk_size: config.repairBucketOutboxChunkSize,
     flush_claim_batch_limit: config.flushClaimBatchLimit,
     max_flush_batches: config.maxFlushBatches,
-    backup_gate_enabled: Boolean(config.phaseB?.enabled),
+    history_gate_enabled: Boolean(config.phaseB?.enabled),
   });
 
   const [ingestBuckets, observsBuckets] = await Promise.all([
@@ -1338,7 +1338,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     "pre_repair",
   );
   const gatedDeletableBuckets = preRepairBackupGate.allowedBuckets;
-  const backupGateBlockedBuckets = preRepairBackupGate.blockedBuckets;
+  const historyGateBlockedBuckets = preRepairBackupGate.blockedBuckets;
   const { repairableMismatches, observsCountGreaterThanIngest } = classifyRepairMismatches(mismatches);
   const repairCandidate = repairableMismatches[0] ?? null;
 
@@ -1383,14 +1383,14 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     ingest_bucket_count: ingestBuckets.length,
     observs_bucket_count: observsBuckets.length,
     deletable_bucket_count: gatedDeletableBuckets.length,
-    deletable_bucket_count_before_backup_gate: deletableBuckets.length,
+    deletable_bucket_count_before_history_gate: deletableBuckets.length,
     total_deletable_rows: totalDeletableRows.toString(),
     mismatch_count: mismatches.length,
     observs_count_exceeds_ingest_count: observsCountGreaterThanIngest.length,
     observs_extra_bucket_count: observsExtraBuckets.length,
-    backup_gate_enabled: Boolean(config.phaseB?.enabled),
-    backup_gate_blocked_bucket_count: backupGateBlockedBuckets.length,
-    backup_gate_blocked_buckets_preview: sampleRows(backupGateBlockedBuckets),
+    history_gate_enabled: Boolean(config.phaseB?.enabled),
+    history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
+    history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
   };
 
   if (config.dryRun) {
@@ -1605,7 +1605,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     "post_repair",
   );
   const gatedRepairedNowDeletableBuckets = postRepairBackupGate.allowedBuckets;
-  const backupGateBlockedAfterRepairBuckets = postRepairBackupGate.blockedBuckets;
+  const historyGateBlockedAfterRepairBuckets = postRepairBackupGate.blockedBuckets;
 
   for (const mismatch of mismatchesAfterRepair) {
     logStructured("ERROR", "hour_bucket_mismatch_after_repair", {
@@ -1702,8 +1702,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     repair_outbox_flush_result: repairFlushResult,
     mismatch_after_repair_count: finalMismatchCount,
     repaired_now_deletable_bucket_count: gatedRepairedNowDeletableBuckets.length,
-    repaired_now_deletable_bucket_count_before_backup_gate: repairedNowDeletableBuckets.length,
-    backup_gate_blocked_after_repair_bucket_count: backupGateBlockedAfterRepairBuckets.length,
+    repaired_now_deletable_bucket_count_before_history_gate: repairedNowDeletableBuckets.length,
+    history_gate_blocked_after_repair_bucket_count: historyGateBlockedAfterRepairBuckets.length,
     deleted_bucket_count: deletedBucketResults.length,
     total_deleted_rows: totalDeletedRows.toString(),
     deleted_after_repair_bucket_count: deletedAfterRepairBucketResults.length,
@@ -1719,13 +1719,13 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       repairEnqueueErrors.length +
       deleteAfterRepairErrors.length +
       capAfterRepairWarnings.length +
-      backupGateBlockedBuckets.length +
-      backupGateBlockedAfterRepairBuckets.length,
+      historyGateBlockedBuckets.length +
+      historyGateBlockedAfterRepairBuckets.length,
     deleted_buckets_preview: sampleRows(deletedBucketResults),
     deleted_after_repair_buckets_preview: sampleRows(deletedAfterRepairBucketResults),
     mismatches_before_repair_preview: sampleRows(mismatches),
     mismatches_after_repair_preview: sampleRows(mismatchesAfterRepair),
-    backup_gate_blocked_after_repair_preview: sampleRows(backupGateBlockedAfterRepairBuckets),
+    history_gate_blocked_after_repair_preview: sampleRows(historyGateBlockedAfterRepairBuckets),
     repair_enqueue_results_preview: sampleRows(repairEnqueueResults),
     repair_enqueue_errors_preview: sampleRows(repairEnqueueErrors),
     delete_errors_preview: sampleRows(deleteErrors),
@@ -1739,7 +1739,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
 
 async function runPrune(config) {
   const phaseBRunId = randomUUID();
-  const phaseBBackupSummary = await runPhaseBBackup({
+  const phaseBHistorySummary = await runPhaseBBackup({
     dryRun: config.dryRun,
     phaseB: config.phaseB,
     logStructured,
@@ -1760,7 +1760,7 @@ async function runPrune(config) {
     const singleSummary = await runPruneSingleWindow(config, batches[0] ?? overallWindow);
     return {
       ...singleSummary,
-      phase_b_backup: phaseBBackupSummary,
+      phase_b_history: phaseBHistorySummary,
     };
   }
 
@@ -1768,8 +1768,8 @@ async function runPrune(config) {
   logStructured("INFO", "ingestdb_prune_batch_plan", {
     run_id: parentRunId,
     mode: config.dryRun ? "dry-run" : "delete",
-    phase_b_backup_enabled: Boolean(config.phaseB?.enabled),
-    phase_b_backup_run_id: phaseBBackupSummary?.run_id || null,
+    phase_b_history_enabled: Boolean(config.phaseB?.enabled),
+    phase_b_history_run_id: phaseBHistorySummary?.run_id || null,
     window_start: overallWindow.window_start,
     window_end: overallWindow.window_end,
     ingestdb_retention_days: config.ingestDbRetentionDays,
@@ -1798,7 +1798,7 @@ async function runPrune(config) {
   );
   const combinedSummary = {
     ...aggregateSummary,
-    phase_b_backup: phaseBBackupSummary,
+    phase_b_history: phaseBHistorySummary,
   };
   logStructured(
     "INFO",

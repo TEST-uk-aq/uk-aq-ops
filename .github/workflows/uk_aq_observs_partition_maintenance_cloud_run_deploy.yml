@@ -50,7 +50,7 @@ jobs:
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
-      CFLARE_R2_OBSERVATIONS_PREFIX: ${{ vars.CFLARE_R2_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
       UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER: ${{ vars.UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER || '/observs_partition_maintenance' }}
       UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
@@ -270,8 +270,8 @@ jobs:
           if [ -n "${CFLARE_R2_REGION:-}" ]; then
             env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
           fi
-          if [ -n "${CFLARE_R2_OBSERVATIONS_PREFIX:-}" ]; then
-            env_updates+=("CFLARE_R2_OBSERVATIONS_PREFIX=${CFLARE_R2_OBSERVATIONS_PREFIX}")
+          if [ -n "${UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX:-}" ]; then
+            env_updates+=("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX=${UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX}")
           fi
           if [ -n "${UK_AQ_DROPBOX_ROOT:-}" ]; then
             env_updates+=("UK_AQ_DROPBOX_ROOT=${UK_AQ_DROPBOX_ROOT}")

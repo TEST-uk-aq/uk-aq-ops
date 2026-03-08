@@ -383,8 +383,7 @@ function buildObservsConfig(url) {
       secretAccessKey: (process.env.CFLARE_R2_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || "").trim(),
       region: (process.env.CFLARE_R2_REGION || process.env.R2_REGION || "auto").trim() || "auto",
       observationsPrefix: (
-        process.env.CFLARE_R2_OBSERVATIONS_PREFIX
-        || process.env.R2_OBSERVATIONS_PREFIX
+        process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
         || "history/v1/observations"
       ).trim().replace(/^\/+|\/+$/g, ""),
     },
@@ -510,21 +509,12 @@ function buildAwsSignedRequest({ method, endpoint, region, accessKeyId, secretAc
   };
 }
 
-function decodeXmlEntities(value) {
-  return value
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
 function hasRequiredR2Config(r2) {
   return Boolean(r2.endpoint && r2.bucket && r2.accessKeyId && r2.secretAccessKey && r2.region);
 }
 
-async function r2HeadSuccessMarker(r2, dayUtc) {
-  const objectKey = `${r2.observationsPrefix}/date=${dayUtc}/_SUCCESS`;
+async function r2HeadDayManifest(r2, dayUtc) {
+  const objectKey = `${r2.observationsPrefix}/day_utc=${dayUtc}/manifest.json`;
   const request = buildAwsSignedRequest({
     method: "HEAD",
     endpoint: r2.endpoint,
@@ -543,69 +533,22 @@ async function r2HeadSuccessMarker(r2, dayUtc) {
   if (response.status === 200) {
     return {
       confirmed: true,
-      method: "head_success_marker",
-      marker_key: objectKey,
+      method: "head_day_manifest",
+      manifest_key: objectKey,
     };
   }
 
   const body = await readResponseText(response, 500);
   return {
     confirmed: false,
-    method: "head_success_marker",
-    marker_key: objectKey,
+    method: "head_day_manifest",
+    manifest_key: objectKey,
     status: response.status,
     response_text: body,
   };
 }
 
-async function r2ListPrefixForParquet(r2, dayUtc) {
-  const prefix = `${r2.observationsPrefix}/date=${dayUtc}/`;
-  const request = buildAwsSignedRequest({
-    method: "GET",
-    endpoint: r2.endpoint,
-    region: r2.region,
-    accessKeyId: r2.accessKeyId,
-    secretAccessKey: r2.secretAccessKey,
-    bucket: r2.bucket,
-    objectKey: "",
-    query: {
-      "list-type": 2,
-      "max-keys": 1000,
-      prefix,
-    },
-  });
-
-  const response = await fetch(request.url, {
-    method: "GET",
-    headers: request.headers,
-  });
-
-  if (!response.ok) {
-    const body = await readResponseText(response, 500);
-    return {
-      confirmed: false,
-      method: "list_prefix",
-      prefix,
-      status: response.status,
-      response_text: body,
-      parquet_count: 0,
-    };
-  }
-
-  const xml = await response.text();
-  const keys = [...xml.matchAll(/<Key>([^<]+)<\/Key>/g)].map((match) => decodeXmlEntities(match[1]));
-  const parquetKeys = keys.filter((key) => key.toLowerCase().endsWith(".parquet"));
-
-  return {
-    confirmed: parquetKeys.length > 0,
-    method: "list_prefix",
-    prefix,
-    parquet_count: parquetKeys.length,
-    parquet_keys_sample: parquetKeys.slice(0, 10),
-  };
-}
-
-async function backupExists(dayUtc, r2) {
+async function historyManifestExists(dayUtc, r2) {
   if (!hasRequiredR2Config(r2)) {
     return {
       confirmed: false,
@@ -614,40 +557,25 @@ async function backupExists(dayUtc, r2) {
   }
 
   try {
-    const markerResult = await r2HeadSuccessMarker(r2, dayUtc);
-    if (markerResult.confirmed) {
+    const manifestResult = await r2HeadDayManifest(r2, dayUtc);
+    if (manifestResult.confirmed) {
       return {
         confirmed: true,
-        method: markerResult.method,
-        details: markerResult,
-      };
-    }
-
-    const listResult = await r2ListPrefixForParquet(r2, dayUtc);
-    if (listResult.confirmed) {
-      return {
-        confirmed: true,
-        method: listResult.method,
-        details: {
-          ...markerResult,
-          fallback: listResult,
-        },
+        method: manifestResult.method,
+        details: manifestResult,
       };
     }
 
     return {
       confirmed: false,
-      reason: "backup_not_confirmed",
-      details: {
-        marker: markerResult,
-        fallback: listResult,
-      },
+      reason: "history_manifest_not_confirmed",
+      details: manifestResult,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
       confirmed: false,
-      reason: "backup_check_error",
+      reason: "history_manifest_check_error",
       details: {
         error: message,
       },
@@ -813,16 +741,16 @@ async function runObservsPartitionMaintenance(config) {
       continue;
     }
 
-    const backupCheck = await backupExists(candidate.partition_day_utc, config.r2);
-    if (!backupCheck.confirmed) {
+    const historyManifestCheck = await historyManifestExists(candidate.partition_day_utc, config.r2);
+    if (!historyManifestCheck.confirmed) {
       const skipId = randomUUID();
       const createdAt = nowIso();
       const skipPayload = {
         run_id: runId,
-        event: "observs_partition_drop_skipped_backup_not_confirmed",
-        message: "SKIP DROP — backup not confirmed",
+        event: "observs_partition_drop_skipped_history_manifest_not_confirmed",
+        message: "SKIP DROP — history manifest not confirmed",
         partition: candidate,
-        backup_check: backupCheck,
+        history_manifest_check: historyManifestCheck,
         created_at: createdAt,
       };
 
@@ -847,8 +775,8 @@ async function runObservsPartitionMaintenance(config) {
       const skip = {
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
-        reason: "backup_not_confirmed",
-        backup_check: backupCheck,
+        reason: "history_manifest_not_confirmed",
+        history_manifest_check: historyManifestCheck,
         dropbox_uploaded: Boolean(skipDropboxResult.uploaded),
         dropbox_path: skipDropboxResult.dropbox_path || null,
         dropbox_reason: skipDropboxResult.reason || null,
@@ -857,7 +785,7 @@ async function runObservsPartitionMaintenance(config) {
 
       logStructured("WARNING", "observs_partition_drop_skipped", {
         run_id: runId,
-        message: "SKIP DROP — backup not confirmed",
+        message: "SKIP DROP — history manifest not confirmed",
         ...skip,
       });
       continue;
@@ -876,13 +804,13 @@ async function runObservsPartitionMaintenance(config) {
       dropped.push({
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
-        backup_method: backupCheck.method,
+        history_manifest_method: historyManifestCheck.method,
       });
       logStructured("INFO", "observs_partition_dropped", {
         run_id: runId,
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
-        backup_method: backupCheck.method,
+        history_manifest_method: historyManifestCheck.method,
       });
     } else {
       const skip = {

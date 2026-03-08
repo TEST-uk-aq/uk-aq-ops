@@ -23,15 +23,15 @@ const DEFAULT_CURSOR_FETCH_ROWS = 20_000;
 const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
-const DEFAULT_STAGING_PREFIX = "backup/staging";
-const DEFAULT_COMMITTED_PREFIX = "backup/observations";
-const DEFAULT_RUNS_PREFIX = "backup/runs";
+const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
+const DEFAULT_COMMITTED_PREFIX = "history/v1/observations";
+const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 
-const BACKUP_SCHEMA_NAME = "observations";
-const BACKUP_SCHEMA_VERSION = 2;
+const HISTORY_SCHEMA_NAME = "observations";
+const HISTORY_SCHEMA_VERSION = 2;
 const WRITER_VERSION = "parquet-wasm-zstd-v2";
 
-export const BACKUP_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
+export const HISTORY_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
   "connector_id",
   "timeseries_id",
   "observed_at",
@@ -39,13 +39,13 @@ export const BACKUP_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
   "status",
   "created_at",
 ]);
-export const BACKUP_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
+export const HISTORY_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
   "connector_id",
   "timeseries_id",
   "observed_at",
   "value",
 ]);
-const BACKUP_OBSERVATIONS_COLUMNS = BACKUP_OBSERVATIONS_COLUMNS_V2;
+const HISTORY_OBSERVATIONS_COLUMNS = HISTORY_OBSERVATIONS_COLUMNS_V2;
 
 let parquetWasmInitialized = false;
 
@@ -227,7 +227,7 @@ function toPgConnectionConfig(connectionString) {
     connectionString,
     statement_timeout: 0,
     query_timeout: 0,
-    application_name: "uk_aq_prune_daily_phase_b_backup",
+    application_name: "uk_aq_prune_daily_phase_b_history",
   };
 }
 
@@ -301,15 +301,15 @@ function toConnectorDayRow(row) {
     status: String(row.status || "pending"),
     run_id: row.run_id ? String(row.run_id) : null,
     manifest_key: row.manifest_key ? String(row.manifest_key) : null,
-    backup_row_count: row.backup_row_count === null || row.backup_row_count === undefined
+    history_row_count: row.history_row_count === null || row.history_row_count === undefined
       ? null
-      : parseBigInt(row.backup_row_count, "backup_row_count"),
-    backup_file_count: row.backup_file_count === null || row.backup_file_count === undefined
+      : parseBigInt(row.history_row_count, "history_row_count"),
+    history_file_count: row.history_file_count === null || row.history_file_count === undefined
       ? null
-      : Number(row.backup_file_count),
-    backup_total_bytes: row.backup_total_bytes === null || row.backup_total_bytes === undefined
+      : Number(row.history_file_count),
+    history_total_bytes: row.history_total_bytes === null || row.history_total_bytes === undefined
       ? null
-      : parseBigInt(row.backup_total_bytes, "backup_total_bytes"),
+      : parseBigInt(row.history_total_bytes, "history_total_bytes"),
     resume_last_timeseries_id: row.resume_last_timeseries_id === null || row.resume_last_timeseries_id === undefined
       ? null
       : Number(row.resume_last_timeseries_id),
@@ -336,7 +336,7 @@ with eligible as (
     min(o.observed_at) as min_observed_at,
     max(o.observed_at) as max_observed_at
   from uk_aq_core.observations o
-  left join uk_aq_ops.backup_candidates existing_complete
+  left join uk_aq_ops.history_candidates existing_complete
     on existing_complete.day_utc = (o.observed_at at time zone 'UTC')::date
    and existing_complete.connector_id = o.connector_id
    and existing_complete.status = 'complete'
@@ -345,7 +345,7 @@ with eligible as (
   group by 1, 2
 ),
 upserted as (
-  insert into uk_aq_ops.backup_candidates (
+  insert into uk_aq_ops.history_candidates (
     day_utc,
     connector_id,
     expected_row_count,
@@ -355,10 +355,10 @@ upserted as (
     run_id,
     last_error,
     manifest_key,
-    backup_row_count,
-    backup_file_count,
-    backup_total_bytes,
-    backup_completed_at,
+    history_row_count,
+    history_file_count,
+    history_total_bytes,
+    history_completed_at,
     resume_last_timeseries_id,
     resume_last_observed_at,
     resume_part_index,
@@ -394,47 +394,47 @@ upserted as (
     run_id = null,
     last_error = null,
     manifest_key = null,
-    backup_row_count = null,
-    backup_file_count = null,
-    backup_total_bytes = null,
-    backup_completed_at = null,
+    history_row_count = null,
+    history_file_count = null,
+    history_total_bytes = null,
+    history_completed_at = null,
     resume_last_timeseries_id = case
-      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then uk_aq_ops.backup_candidates.resume_last_timeseries_id
+      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.resume_last_timeseries_id
       else null
     end,
     resume_last_observed_at = case
-      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then uk_aq_ops.backup_candidates.resume_last_observed_at
+      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.resume_last_observed_at
       else null
     end,
     resume_part_index = case
-      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then coalesce(uk_aq_ops.backup_candidates.resume_part_index, 0)
+      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then coalesce(uk_aq_ops.history_candidates.resume_part_index, 0)
       else 0
     end,
     resume_exported_row_count = case
-      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then coalesce(uk_aq_ops.backup_candidates.resume_exported_row_count, 0)
+      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then coalesce(uk_aq_ops.history_candidates.resume_exported_row_count, 0)
       else 0
     end,
     resume_parts_json = case
-      when uk_aq_ops.backup_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.backup_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.backup_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then coalesce(uk_aq_ops.backup_candidates.resume_parts_json, '[]'::jsonb)
+      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then coalesce(uk_aq_ops.history_candidates.resume_parts_json, '[]'::jsonb)
       else '[]'::jsonb
     end,
     updated_at = now()
-  where uk_aq_ops.backup_candidates.status <> 'complete'
+  where uk_aq_ops.history_candidates.status <> 'complete'
   returning
     day_utc,
     connector_id,
@@ -444,9 +444,9 @@ upserted as (
     status,
     run_id,
     manifest_key,
-    backup_row_count,
-    backup_file_count,
-    backup_total_bytes,
+    history_row_count,
+    history_file_count,
+    history_total_bytes,
     resume_last_timeseries_id,
     resume_last_observed_at,
     resume_part_index,
@@ -467,18 +467,18 @@ with day_status as (
   select
     c.day_utc,
     bool_and(c.status = 'complete') as all_complete
-  from uk_aq_ops.backup_candidates c
+  from uk_aq_ops.history_candidates c
   group by c.day_utc
 )
 insert into uk_aq_ops.prune_day_gates (
   day_utc,
-  backup_done,
-  backup_run_id,
-  backup_manifest_key,
-  backup_row_count,
-  backup_file_count,
-  backup_total_bytes,
-  backup_completed_at,
+  history_done,
+  history_run_id,
+  history_manifest_key,
+  history_row_count,
+  history_file_count,
+  history_total_bytes,
+  history_completed_at,
   updated_at
 )
 select
@@ -495,13 +495,13 @@ from day_status d
 where d.all_complete = false
 on conflict (day_utc)
 do update set
-  backup_done = false,
-  backup_run_id = null,
-  backup_manifest_key = null,
-  backup_row_count = null,
-  backup_file_count = null,
-  backup_total_bytes = null,
-  backup_completed_at = null,
+  history_done = false,
+  history_run_id = null,
+  history_manifest_key = null,
+  history_row_count = null,
+  history_file_count = null,
+  history_total_bytes = null,
+  history_completed_at = null,
   updated_at = now()
 `;
   await client.query(sql);
@@ -518,15 +518,15 @@ select
   c.status,
   c.run_id,
   c.manifest_key,
-  c.backup_row_count,
-  c.backup_file_count,
-  c.backup_total_bytes,
+  c.history_row_count,
+  c.history_file_count,
+  c.history_total_bytes,
   c.resume_last_timeseries_id,
   c.resume_last_observed_at,
   c.resume_part_index,
   c.resume_exported_row_count,
   c.resume_parts_json
-from uk_aq_ops.backup_candidates c
+from uk_aq_ops.history_candidates c
 where c.status = 'pending'
 order by c.day_utc, c.connector_id
 limit $1
@@ -539,7 +539,7 @@ limit $1
 async function markCandidateInProgress(client, dayUtc, connectorId, runId) {
   const result = await client.query(
     `
-update uk_aq_ops.backup_candidates
+update uk_aq_ops.history_candidates
 set
   status = 'in_progress',
   run_id = $3,
@@ -560,27 +560,27 @@ async function markCandidateComplete(client, {
   connectorId,
   runId,
   manifestKey,
-  backupRowCount,
-  backupFileCount,
-  backupTotalBytes,
+  historyRowCount,
+  historyFileCount,
+  historyTotalBytes,
 }) {
   await client.query(
     `
-update uk_aq_ops.backup_candidates
+update uk_aq_ops.history_candidates
 set
   status = 'complete',
   run_id = $3,
   last_error = null,
   manifest_key = $4,
-  backup_row_count = $5,
-  backup_file_count = $6,
-  backup_total_bytes = $7,
+  history_row_count = $5,
+  history_file_count = $6,
+  history_total_bytes = $7,
   resume_last_timeseries_id = null,
   resume_last_observed_at = null,
   resume_part_index = 0,
   resume_exported_row_count = 0,
   resume_parts_json = '[]'::jsonb,
-  backup_completed_at = now(),
+  history_completed_at = now(),
   updated_at = now()
 where day_utc = $1::date
   and connector_id = $2::integer
@@ -590,9 +590,9 @@ where day_utc = $1::date
       connectorId,
       runId,
       manifestKey,
-      backupRowCount.toString(),
-      backupFileCount,
-      backupTotalBytes.toString(),
+      historyRowCount.toString(),
+      historyFileCount,
+      historyTotalBytes.toString(),
     ],
   );
 }
@@ -609,7 +609,7 @@ async function updateCandidateResumeCheckpoint(client, {
 }) {
   await client.query(
     `
-update uk_aq_ops.backup_candidates
+update uk_aq_ops.history_candidates
 set
   resume_last_timeseries_id = $4,
   resume_last_observed_at = $5,
@@ -637,7 +637,7 @@ where day_utc = $1::date
 async function markCandidateFailed(client, { dayUtc, connectorId, runId, errorText }) {
   await client.query(
     `
-update uk_aq_ops.backup_candidates
+update uk_aq_ops.history_candidates
 set
   status = 'failed',
   run_id = $3,
@@ -662,15 +662,15 @@ select
   status,
   run_id,
   manifest_key,
-  backup_row_count,
-  backup_file_count,
-  backup_total_bytes,
+  history_row_count,
+  history_file_count,
+  history_total_bytes,
   resume_last_timeseries_id,
   resume_last_observed_at,
   resume_part_index,
   resume_exported_row_count,
   resume_parts_json
-from uk_aq_ops.backup_candidates
+from uk_aq_ops.history_candidates
 where day_utc = $1::date
 order by connector_id
 `,
@@ -701,25 +701,25 @@ async function updateDayGateBlocked(client, dayUtc) {
     `
 insert into uk_aq_ops.prune_day_gates (
   day_utc,
-  backup_done,
-  backup_run_id,
-  backup_manifest_key,
-  backup_row_count,
-  backup_file_count,
-  backup_total_bytes,
-  backup_completed_at,
+  history_done,
+  history_run_id,
+  history_manifest_key,
+  history_row_count,
+  history_file_count,
+  history_total_bytes,
+  history_completed_at,
   updated_at
 )
 values ($1::date, false, null, null, null, null, null, null, now())
 on conflict (day_utc)
 do update set
-  backup_done = false,
-  backup_run_id = null,
-  backup_manifest_key = null,
-  backup_row_count = null,
-  backup_file_count = null,
-  backup_total_bytes = null,
-  backup_completed_at = null,
+  history_done = false,
+  history_run_id = null,
+  history_manifest_key = null,
+  history_row_count = null,
+  history_file_count = null,
+  history_total_bytes = null,
+  history_completed_at = null,
   updated_at = now()
 `,
     [dayUtc],
@@ -738,13 +738,13 @@ async function updateDayGateComplete(client, {
     `
 insert into uk_aq_ops.prune_day_gates (
   day_utc,
-  backup_done,
-  backup_run_id,
-  backup_manifest_key,
-  backup_row_count,
-  backup_file_count,
-  backup_total_bytes,
-  backup_completed_at,
+  history_done,
+  history_run_id,
+  history_manifest_key,
+  history_row_count,
+  history_file_count,
+  history_total_bytes,
+  history_completed_at,
   updated_at
 )
 values (
@@ -760,13 +760,13 @@ values (
 )
 on conflict (day_utc)
 do update set
-  backup_done = true,
-  backup_run_id = excluded.backup_run_id,
-  backup_manifest_key = excluded.backup_manifest_key,
-  backup_row_count = excluded.backup_row_count,
-  backup_file_count = excluded.backup_file_count,
-  backup_total_bytes = excluded.backup_total_bytes,
-  backup_completed_at = now(),
+  history_done = true,
+  history_run_id = excluded.history_run_id,
+  history_manifest_key = excluded.history_manifest_key,
+  history_row_count = excluded.history_row_count,
+  history_file_count = excluded.history_file_count,
+  history_total_bytes = excluded.history_total_bytes,
+  history_completed_at = now(),
   updated_at = now()
 `,
     [dayUtc, runId, manifestKey, rowCount.toString(), fileCount, totalBytes.toString()],
@@ -799,9 +799,9 @@ function createConnectorManifest({
     file_count: fileEntries.length,
     total_bytes: totalBytes,
     files: fileEntries,
-    backup_schema_name: BACKUP_SCHEMA_NAME,
-    backup_schema_version: BACKUP_SCHEMA_VERSION,
-    columns: BACKUP_OBSERVATIONS_COLUMNS,
+    history_schema_name: HISTORY_SCHEMA_NAME,
+    history_schema_version: HISTORY_SCHEMA_VERSION,
+    columns: HISTORY_OBSERVATIONS_COLUMNS,
     writer_version: WRITER_VERSION,
     writer_git_sha: writerGitSha,
     ...stats,
@@ -859,9 +859,9 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
       file_count: manifest.file_count,
       total_bytes: manifest.total_bytes,
     })),
-    backup_schema_name: BACKUP_SCHEMA_NAME,
-    backup_schema_version: BACKUP_SCHEMA_VERSION,
-    columns: BACKUP_OBSERVATIONS_COLUMNS,
+    history_schema_name: HISTORY_SCHEMA_NAME,
+    history_schema_version: HISTORY_SCHEMA_VERSION,
+    columns: HISTORY_OBSERVATIONS_COLUMNS,
     writer_version: WRITER_VERSION,
     writer_git_sha: writerGitSha,
     ...stats,
@@ -1039,7 +1039,7 @@ select
   timeseries_id,
   observed_at,
   value
-from uk_aq_ops.uk_aq_phase_b_backup_rows(
+from uk_aq_ops.uk_aq_phase_b_history_rows(
   $1::integer,
   $2::timestamptz,
   $3::timestamptz,
@@ -1164,7 +1164,7 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
     await updateDayGateBlocked(client, dayUtc);
     return {
       day_utc: dayUtc,
-      backup_done: false,
+      history_done: false,
       pending_connectors: dayState.pending + dayState.in_progress + dayState.failed,
     };
   }
@@ -1205,15 +1205,15 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
   }
 
   const totalRows = dayCandidates.reduce(
-    (sum, row) => sum + (row.backup_row_count || 0n),
+    (sum, row) => sum + (row.history_row_count || 0n),
     0n,
   );
   const totalFiles = dayCandidates.reduce(
-    (sum, row) => sum + Number(row.backup_file_count || 0),
+    (sum, row) => sum + Number(row.history_file_count || 0),
     0,
   );
   const totalBytes = dayCandidates.reduce(
-    (sum, row) => sum + (row.backup_total_bytes || 0n),
+    (sum, row) => sum + (row.history_total_bytes || 0n),
     0n,
   );
 
@@ -1228,12 +1228,12 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
 
   return {
     day_utc: dayUtc,
-    backup_done: true,
+    history_done: true,
     pending_connectors: 0,
-    backup_manifest_key: dayManifestKey,
-    backup_row_count: totalRows.toString(),
-    backup_file_count: totalFiles,
-    backup_total_bytes: totalBytes.toString(),
+    history_manifest_key: dayManifestKey,
+    history_row_count: totalRows.toString(),
+    history_file_count: totalFiles,
+    history_total_bytes: totalBytes.toString(),
   };
 }
 
@@ -1274,7 +1274,7 @@ async function cleanupStaging({ runtime, logStructured }) {
     deletedCount += result.deleted_count;
     errorCount += result.errors.length;
     if (result.errors.length > 0) {
-      logStructured("WARNING", "phase_b_backup_staging_cleanup_batch_errors", {
+      logStructured("WARNING", "phase_b_history_staging_cleanup_batch_errors", {
         run_id: runtime.run_id,
         batch_size: batch.length,
         error_count: result.errors.length,
@@ -1353,13 +1353,19 @@ function resolveR2Bucket(env, deployEnv) {
 
 export function resolvePhaseBRuntimeConfig(env = process.env) {
   const deployEnv = String(env.UK_AQ_DEPLOY_ENV || env.DEPLOY_ENV || "dev").trim().toLowerCase() || "dev";
-  const stagingBasePrefix = normalizePrefix(env.BACKUP_STAGING_PREFIX || DEFAULT_STAGING_PREFIX);
-  const committedPrefix = normalizePrefix(env.BACKUP_COMMITTED_PREFIX || DEFAULT_COMMITTED_PREFIX);
-  const runsPrefix = normalizePrefix(env.BACKUP_RUNS_PREFIX || DEFAULT_RUNS_PREFIX);
+  const stagingBasePrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_STAGING_PREFIX || DEFAULT_STAGING_PREFIX,
+  );
+  const committedPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || DEFAULT_COMMITTED_PREFIX,
+  );
+  const runsPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
+  );
 
   return {
     deploy_env: deployEnv,
-    enabled: String(env.BACKUP_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
+    enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
     supabase_db_url: String(env.SUPABASE_DB_URL || env.DATABASE_URL || "").trim(),
     r2: {
       endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
@@ -1368,17 +1374,32 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
       secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
     },
-    part_max_rows: parsePositiveInt(env.BACKUP_PART_MAX_ROWS, DEFAULT_PART_MAX_ROWS, 1, 5_000_000),
-    cursor_fetch_rows: parsePositiveInt(env.BACKUP_CURSOR_FETCH_ROWS, DEFAULT_CURSOR_FETCH_ROWS, 1_000, 500_000),
-    row_group_size: parsePositiveInt(env.BACKUP_ROW_GROUP_SIZE, DEFAULT_ROW_GROUP_SIZE, 10_000, 2_000_000),
+    part_max_rows: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_PART_MAX_ROWS,
+      DEFAULT_PART_MAX_ROWS,
+      1,
+      5_000_000,
+    ),
+    cursor_fetch_rows: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS,
+      DEFAULT_CURSOR_FETCH_ROWS,
+      1_000,
+      500_000,
+    ),
+    row_group_size: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE,
+      DEFAULT_ROW_GROUP_SIZE,
+      10_000,
+      2_000_000,
+    ),
     max_candidates_per_run: parsePositiveInt(
-      env.BACKUP_MAX_CANDIDATES_PER_RUN,
+      env.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN,
       DEFAULT_MAX_CANDIDATES_PER_RUN,
       1,
       50_000,
     ),
     staging_retention_days: parsePositiveInt(
-      env.BACKUP_STAGING_RETENTION_DAYS,
+      env.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS,
       DEFAULT_STAGING_RETENTION_DAYS,
       1,
       90,
@@ -1412,10 +1433,10 @@ export async function runPhaseBBackup({
   }
 
   if (!runtime.supabase_db_url) {
-    throw new Error("Phase B backup requires SUPABASE_DB_URL (or DATABASE_URL) for streaming Postgres extraction.");
+    throw new Error("Phase B history export requires SUPABASE_DB_URL (or DATABASE_URL) for streaming Postgres extraction.");
   }
   if (!hasRequiredR2Config(runtime.r2)) {
-    throw new Error("Phase B backup requires R2 endpoint/bucket/region/access credentials.");
+    throw new Error("Phase B history export requires R2 endpoint/bucket/region/access credentials.");
   }
 
   const window = dayWindowFromNow(nowUtc);
@@ -1440,7 +1461,7 @@ export async function runPhaseBBackup({
     blocked_preview: [],
   };
 
-  logStructured("INFO", "phase_b_backup_run_start", {
+  logStructured("INFO", "phase_b_history_run_start", {
     run_id: runId,
     dry_run: dryRun,
     now_utc: window.now_utc,
@@ -1484,7 +1505,7 @@ export async function runPhaseBBackup({
       summary.completed_preview = planned.slice(0, 25);
       summary.blocked_days = uniqueSorted(pendingCandidates.map((candidate) => candidate.day_utc)).length;
 
-      logStructured("INFO", "phase_b_backup_dry_run_plan", {
+      logStructured("INFO", "phase_b_history_dry_run_plan", {
         run_id: runId,
         pending_candidates: pendingCandidates.length,
         planned_preview: planned.slice(0, 25),
@@ -1512,9 +1533,9 @@ export async function runPhaseBBackup({
           connectorId: candidate.connector_id,
           runId,
           manifestKey: exportResult.manifest_key,
-          backupRowCount: exportResult.written_row_count,
-          backupFileCount: exportResult.file_count,
-          backupTotalBytes: exportResult.total_bytes,
+          historyRowCount: exportResult.written_row_count,
+          historyFileCount: exportResult.file_count,
+          historyTotalBytes: exportResult.total_bytes,
         });
 
         totalWrittenRows += exportResult.written_row_count;
@@ -1529,7 +1550,7 @@ export async function runPhaseBBackup({
         dayResults.set(candidate.day_utc, dayState);
 
         const durationMs = Math.max(0, Date.now() - startedAtMs);
-        logStructured("INFO", "phase_b_backup_candidate_complete", {
+        logStructured("INFO", "phase_b_history_candidate_complete", {
           run_id: runId,
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
@@ -1564,7 +1585,7 @@ export async function runPhaseBBackup({
           error: message,
           next_action: "retry_safe",
         });
-        logStructured("ERROR", "phase_b_backup_candidate_failed", {
+        logStructured("ERROR", "phase_b_history_candidate_failed", {
           run_id: runId,
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
@@ -1579,7 +1600,7 @@ export async function runPhaseBBackup({
   });
 
   if (dryRun) {
-    logStructured("INFO", "phase_b_backup_run_summary", summary);
+    logStructured("INFO", "phase_b_history_run_summary", summary);
     return summary;
   }
 
@@ -1587,10 +1608,10 @@ export async function runPhaseBBackup({
   summary.total_written_bytes = totalWrittenBytes.toString();
 
   const dayStates = Array.from(dayResults.values());
-  summary.completed_days = dayStates.filter((state) => state.backup_done === true).length;
-  summary.blocked_days = dayStates.filter((state) => state.backup_done !== true).length;
+  summary.completed_days = dayStates.filter((state) => state.history_done === true).length;
+  summary.blocked_days = dayStates.filter((state) => state.history_done !== true).length;
   summary.completed_preview = dayStates.slice(0, 25);
-  summary.blocked_preview = dayStates.filter((state) => state.backup_done !== true).slice(0, 25);
+  summary.blocked_preview = dayStates.filter((state) => state.history_done !== true).slice(0, 25);
 
   const cleanupSummary = await cleanupStaging({ runtime, logStructured });
   summary.staging_cleanup = cleanupSummary;
@@ -1598,7 +1619,7 @@ export async function runPhaseBBackup({
   const runManifestKey = await writeRunManifest({ runtime, runSummary: summary });
   summary.run_manifest_key = runManifestKey;
 
-  logStructured("INFO", "phase_b_backup_run_summary", summary);
+  logStructured("INFO", "phase_b_history_run_summary", summary);
   return summary;
 }
 
@@ -1615,14 +1636,17 @@ export async function fetchBackupDoneDays({ supabaseDbUrl, dayUtcList }) {
   return await withPgClient(supabaseDbUrl, async (client) => {
     const literalList = distinctDays.map((day) => `'${escapeSingleQuotes(day)}'::date`).join(", ");
     const sql = `
-select g.day_utc::text as day_utc, g.backup_done
+select g.day_utc::text as day_utc
 from uk_aq_ops.prune_day_gates g
 where g.day_utc in (${literalList})
+  and g.history_done is true
+  and nullif(btrim(g.history_manifest_key), '') is not null
+  and g.history_completed_at is not null
 `;
     const result = await client.query(sql);
     const map = new Map();
     for (const row of result.rows) {
-      map.set(normalizeDayUtc(row.day_utc), Boolean(row.backup_done));
+      map.set(normalizeDayUtc(row.day_utc), true);
     }
     return map;
   });

@@ -7,7 +7,7 @@ import * as parquetWasm from "parquet-wasm/esm";
 
 import {
   resolvePhaseBRuntimeConfig,
-} from "../../workers/uk_aq_prune_daily/phase_b_backup_r2.mjs";
+} from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
   hasRequiredR2Config,
   normalizePrefix,

@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  BACKUP_OBSERVATIONS_COLUMNS_V2,
+  HISTORY_OBSERVATIONS_COLUMNS_V2,
   buildConnectorManifestForTest,
   computeDayGateState,
-} from "../workers/uk_aq_prune_daily/phase_b_backup_r2.mjs";
+} from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 test("connector manifest includes expected Phase B fields", () => {
   const manifest = buildConnectorManifestForTest({
@@ -16,7 +16,7 @@ test("connector manifest includes expected Phase B fields", () => {
     maxObservedAt: "2026-02-20T00:02:00.000Z",
     fileEntries: [
       {
-        key: "backup/observations/day_utc=2026-02-20/connector_id=4/part-00000.parquet",
+        key: "history/v1/observations/day_utc=2026-02-20/connector_id=4/part-00000.parquet",
         bytes: 1200,
         row_count: 3,
         etag_or_hash: "etag-a",
@@ -32,13 +32,13 @@ test("connector manifest includes expected Phase B fields", () => {
   assert.equal(manifest.source_row_count, 3);
   assert.equal(manifest.file_count, 1);
   assert.equal(manifest.total_bytes, 1200);
-  assert.deepEqual(manifest.columns, BACKUP_OBSERVATIONS_COLUMNS_V2);
+  assert.deepEqual(manifest.columns, HISTORY_OBSERVATIONS_COLUMNS_V2);
   assert.ok(Array.isArray(manifest.parquet_object_keys));
   assert.equal(manifest.parquet_object_keys.length, 1);
   assert.equal(typeof manifest.manifest_hash, "string");
   assert.ok(manifest.manifest_hash.length > 10);
-  assert.equal(manifest.backup_schema_name, "observations");
-  assert.equal(manifest.backup_schema_version, 2);
+  assert.equal(manifest.history_schema_name, "observations");
+  assert.equal(manifest.history_schema_version, 2);
 });
 
 test("day gate is only complete when all connector candidates are complete", () => {

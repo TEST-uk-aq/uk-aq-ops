@@ -27,7 +27,7 @@ Each gcloud-facing service now lives under `workers/`:
 - verifies hourly fingerprints (ingest vs `obs_aqidb` `uk_aq_observs`)
 - prunes only verified ingest hour buckets
 - can repair mismatches through outbox replay before re-check
-- Phase B backup uses server-side projection + resume checkpoints so failed exports can continue without re-reading completed parts
+- Phase B R2 History export uses server-side projection + resume checkpoints so failed exports can continue without re-reading completed parts
 
 Required env:
 
@@ -35,7 +35,7 @@ Required env:
 - `OBS_AQIDB_SUPABASE_URL`
 - `SB_SECRET_KEY`
 - `OBS_AQIDB_SECRET_KEY`
-- `SUPABASE_DB_URL` (direct Postgres URL for streaming Phase B backup reads)
+- `SUPABASE_DB_URL` (direct Postgres URL for streaming Phase B history reads)
 - `CFLARE_R2_ENDPOINT`
 - one bucket mapping: `R2_BUCKET_PROD` / `R2_BUCKET_STAGE` / `R2_BUCKET_DEV` (or fallback `CFLARE_R2_BUCKET`)
 - `CFLARE_R2_ACCESS_KEY_ID`
@@ -48,15 +48,15 @@ Primary controls:
 - `INGESTDB_PRUNE_MAX_HOURS_PER_RUN` (default `48`)
 - `INGESTDB_PRUNE_DELETE_BATCH_SIZE` (default `50000`)
 - `INGESTDB_PRUNE_MAX_DELETE_BATCHES_PER_HOUR` (default `10`)
-- `BACKUP_PHASE_B_ENABLED` (default `true`)
-- `BACKUP_PART_MAX_ROWS` (default `1000000`)
-- `BACKUP_CURSOR_FETCH_ROWS` (default `20000`)
-- `BACKUP_ROW_GROUP_SIZE` (default `100000`)
-- `BACKUP_MAX_CANDIDATES_PER_RUN` (default `500`)
-- `BACKUP_STAGING_RETENTION_DAYS` (default `7`)
-- `BACKUP_STAGING_PREFIX` (default `backup/staging`)
-- `BACKUP_COMMITTED_PREFIX` (default `backup/observations`)
-- `BACKUP_RUNS_PREFIX` (default `backup/runs`)
+- `UK_AQ_R2_HISTORY_PHASE_B_ENABLED` (default `true`)
+- `UK_AQ_R2_HISTORY_PART_MAX_ROWS` (default `1000000`)
+- `UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS` (default `20000`)
+- `UK_AQ_R2_HISTORY_ROW_GROUP_SIZE` (default `100000`)
+- `UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN` (default `500`)
+- `UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS` (default `7`)
+- `UK_AQ_R2_HISTORY_STAGING_PREFIX` (default `history/v1/_ops/observations/staging`)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
+- `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
 
 ### 2) Observs Outbox Flush (`workers/uk_aq_observs_outbox_flush_service/server.mjs`)
@@ -71,7 +71,7 @@ Primary controls:
 - `POST /run`
 - ensures daily partitions, enforces hot/cold indexes
 - runs default partition diagnostics
-- applies retention drops with backup gate checks
+- applies retention drops with R2 History manifest gate checks
 
 ### 4) DB Size Logger (`workers/uk_aq_db_size_logger_cloud_run/run_service.ts`)
 
@@ -131,7 +131,7 @@ Type-check quick validation:
 npm run check
 ```
 
-Download one backed-up UTC day from R2 (manifest-first, no Supabase reads):
+Download one R2 History UTC day (manifest-first, no Supabase reads):
 
 ```bash
 node scripts/backup_r2/download_day.mjs --day 2026-02-20 --out ./tmp/backup_download

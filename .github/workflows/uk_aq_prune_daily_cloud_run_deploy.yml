@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_prune_daily/server.mjs"
-      - "workers/uk_aq_prune_daily/phase_b_backup_r2.mjs"
+      - "workers/uk_aq_prune_daily/phase_b_history_r2.mjs"
       - "workers/shared/r2_sigv4.mjs"
       - "Dockerfile"
       - "package.json"
@@ -55,15 +55,15 @@ jobs:
       FLUSH_CLAIM_BATCH_LIMIT: ${{ vars.INGESTDB_PRUNE_FLUSH_CLAIM_BATCH_LIMIT || '20' }}
       MAX_FLUSH_BATCHES: ${{ vars.INGESTDB_PRUNE_MAX_FLUSH_BATCHES || '30' }}
       UK_AQ_DEPLOY_ENV: ${{ vars.UK_AQ_DEPLOY_ENV || 'dev' }}
-      BACKUP_PHASE_B_ENABLED: ${{ vars.BACKUP_PHASE_B_ENABLED || 'true' }}
-      BACKUP_PART_MAX_ROWS: ${{ vars.BACKUP_PART_MAX_ROWS || '1000000' }}
-      BACKUP_CURSOR_FETCH_ROWS: ${{ vars.BACKUP_CURSOR_FETCH_ROWS || '20000' }}
-      BACKUP_ROW_GROUP_SIZE: ${{ vars.BACKUP_ROW_GROUP_SIZE || '100000' }}
-      BACKUP_MAX_CANDIDATES_PER_RUN: ${{ vars.BACKUP_MAX_CANDIDATES_PER_RUN || '500' }}
-      BACKUP_STAGING_RETENTION_DAYS: ${{ vars.BACKUP_STAGING_RETENTION_DAYS || '7' }}
-      BACKUP_STAGING_PREFIX: ${{ vars.BACKUP_STAGING_PREFIX || 'backup/staging' }}
-      BACKUP_COMMITTED_PREFIX: ${{ vars.BACKUP_COMMITTED_PREFIX || 'backup/observations' }}
-      BACKUP_RUNS_PREFIX: ${{ vars.BACKUP_RUNS_PREFIX || 'backup/runs' }}
+      UK_AQ_R2_HISTORY_PHASE_B_ENABLED: ${{ vars.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || 'true' }}
+      UK_AQ_R2_HISTORY_PART_MAX_ROWS: ${{ vars.UK_AQ_R2_HISTORY_PART_MAX_ROWS || '1000000' }}
+      UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS: ${{ vars.UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS || '20000' }}
+      UK_AQ_R2_HISTORY_ROW_GROUP_SIZE: ${{ vars.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE || '100000' }}
+      UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500' }}
+      UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS: ${{ vars.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS || '7' }}
+      UK_AQ_R2_HISTORY_STAGING_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_STAGING_PREFIX || 'history/v1/_ops/observations/staging' }}
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_RUNS_PREFIX || 'history/v1/_ops/observations/runs' }}
       R2_BUCKET_PROD: ${{ vars.R2_BUCKET_PROD || '' }}
       R2_BUCKET_STAGE: ${{ vars.R2_BUCKET_STAGE || '' }}
       R2_BUCKET_DEV: ${{ vars.R2_BUCKET_DEV || '' }}
@@ -112,7 +112,7 @@ jobs:
             echo "Missing required repo variable: OBS_AQIDB_SUPABASE_URL"
             exit 1
           fi
-          if [ "${BACKUP_PHASE_B_ENABLED:-true}" = "true" ]; then
+          if [ "${UK_AQ_R2_HISTORY_PHASE_B_ENABLED:-true}" = "true" ]; then
             if [ -z "${CFLARE_R2_ENDPOINT:-}" ]; then
               echo "Missing required repo variable: CFLARE_R2_ENDPOINT (Phase B backup enabled)."
               exit 1
@@ -304,15 +304,15 @@ jobs:
           env_updates+=("FLUSH_CLAIM_BATCH_LIMIT=${FLUSH_CLAIM_BATCH_LIMIT}")
           env_updates+=("MAX_FLUSH_BATCHES=${MAX_FLUSH_BATCHES}")
           env_updates+=("UK_AQ_DEPLOY_ENV=${UK_AQ_DEPLOY_ENV}")
-          env_updates+=("BACKUP_PHASE_B_ENABLED=${BACKUP_PHASE_B_ENABLED}")
-          env_updates+=("BACKUP_PART_MAX_ROWS=${BACKUP_PART_MAX_ROWS}")
-          env_updates+=("BACKUP_CURSOR_FETCH_ROWS=${BACKUP_CURSOR_FETCH_ROWS}")
-          env_updates+=("BACKUP_ROW_GROUP_SIZE=${BACKUP_ROW_GROUP_SIZE}")
-          env_updates+=("BACKUP_MAX_CANDIDATES_PER_RUN=${BACKUP_MAX_CANDIDATES_PER_RUN}")
-          env_updates+=("BACKUP_STAGING_RETENTION_DAYS=${BACKUP_STAGING_RETENTION_DAYS}")
-          env_updates+=("BACKUP_STAGING_PREFIX=${BACKUP_STAGING_PREFIX}")
-          env_updates+=("BACKUP_COMMITTED_PREFIX=${BACKUP_COMMITTED_PREFIX}")
-          env_updates+=("BACKUP_RUNS_PREFIX=${BACKUP_RUNS_PREFIX}")
+          env_updates+=("UK_AQ_R2_HISTORY_PHASE_B_ENABLED=${UK_AQ_R2_HISTORY_PHASE_B_ENABLED}")
+          env_updates+=("UK_AQ_R2_HISTORY_PART_MAX_ROWS=${UK_AQ_R2_HISTORY_PART_MAX_ROWS}")
+          env_updates+=("UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS=${UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS}")
+          env_updates+=("UK_AQ_R2_HISTORY_ROW_GROUP_SIZE=${UK_AQ_R2_HISTORY_ROW_GROUP_SIZE}")
+          env_updates+=("UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN=${UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN}")
+          env_updates+=("UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS=${UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS}")
+          env_updates+=("UK_AQ_R2_HISTORY_STAGING_PREFIX=${UK_AQ_R2_HISTORY_STAGING_PREFIX}")
+          env_updates+=("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX=${UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX}")
+          env_updates+=("UK_AQ_R2_HISTORY_RUNS_PREFIX=${UK_AQ_R2_HISTORY_RUNS_PREFIX}")
           env_updates+=("CFLARE_R2_ENDPOINT=${CFLARE_R2_ENDPOINT}")
           env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
           if [ -n "${R2_BUCKET_PROD:-}" ]; then

@@ -96,8 +96,6 @@ const R2_DOMAIN_SIZE_RETENTION_DAYS = parsePositiveInt(
 
 const R2_HISTORY_OBSERVATIONS_PREFIX = parseHistoryPrefix(
   optionalEnv("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX") ||
-    optionalEnv("CFLARE_R2_OBSERVATIONS_PREFIX") ||
-    optionalEnv("R2_OBSERVATIONS_PREFIX") ||
     "history/v1/observations",
 );
 const R2_HISTORY_AQILEVELS_PREFIX = parseHistoryPrefix(
