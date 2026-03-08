@@ -98,7 +98,7 @@ curl -X POST "http://localhost:8080/run?dryRun=true"
 Apply these scripts in Supabase SQL editor:
 
 - `sql/ingest_db_ops_rpcs.sql`
-- `sql/history_db_ops_rpcs.sql`
+- `sql/observs_db_ops_rpcs.sql`
 
 ## Deployment and scheduler setup
 

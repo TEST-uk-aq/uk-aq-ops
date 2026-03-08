@@ -4,7 +4,7 @@ const HOUR_MS = 60 * 60 * 1000;
 export const ALLOWED_TRIGGER_MODES = Object.freeze(["scheduler", "manual"]);
 export const ALLOWED_RUN_MODES = Object.freeze([
   "local_to_aggdaily",
-  "history_to_r2",
+  "obs_aqi_to_r2",
   "source_to_all",
 ]);
 

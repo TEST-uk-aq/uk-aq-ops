@@ -4,16 +4,16 @@ import { createClient } from "@supabase/supabase-js";
 
 const DEFAULT_FLUSH_CLAIM_BATCH_LIMIT = 20;
 const DEFAULT_MAX_FLUSH_BATCHES = 30;
-const DEFAULT_HISTORY_UPSERT_RPC_RETRIES = 3;
-const DEFAULT_HISTORY_UPSERT_RETRY_BASE_MS = 1_000;
-const DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
-const DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
+const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
+const DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS = 1_000;
+const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
+const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const RPC_SCHEMA = "uk_aq_public";
 
-const RPC_OUTBOX_CLAIM = "uk_aq_rpc_history_outbox_claim";
-const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_history_outbox_resolve";
-const RPC_HISTORY_UPSERT = "uk_aq_rpc_history_observations_upsert";
-const RPC_HISTORY_RECEIPTS_UPSERT = "uk_aq_rpc_history_sync_receipt_daily_upsert";
+const RPC_OUTBOX_CLAIM = "uk_aq_rpc_observs_outbox_claim";
+const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_observs_outbox_resolve";
+const RPC_OBSERVS_UPSERT = "uk_aq_rpc_observs_observations_upsert";
+const RPC_OBSERVS_RECEIPTS_UPSERT = "uk_aq_rpc_observs_sync_receipt_daily_upsert";
 
 function nowIso() {
   return new Date().toISOString();
@@ -57,19 +57,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function historyUpsertErrorMessage(error) {
+function observsUpsertErrorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.length > 400 ? `${message.slice(0, 397)}...` : message;
 }
 
-function isHistoryStatementTimeoutError(message) {
+function isObservsStatementTimeoutError(message) {
   return /statement timeout|canceling statement due to statement timeout/i.test(message);
 }
 
-function isRetryableHistoryUpsertError(message) {
+function isRetryableObservsUpsertError(message) {
   const normalized = message.toLowerCase();
   return (
-    isHistoryStatementTimeoutError(normalized)
+    isObservsStatementTimeoutError(normalized)
     || normalized.includes("deadlock detected")
     || normalized.includes("could not serialize access due to")
     || normalized.includes("connection terminated")
@@ -142,12 +142,12 @@ function toObservedDay(observedAtIso) {
   return observedAtIso.slice(0, 10);
 }
 
-function normalizeHistoryRows(inputRows) {
+function normalizeObservsRows(inputRows) {
   const deduped = new Map();
   for (const row of inputRows) {
-    const connectorId = toBigIntString(row.connector_id, "history_row.connector_id");
-    const timeseriesId = toBigIntString(row.timeseries_id, "history_row.timeseries_id");
-    const observedAt = toIso(row.observed_at, "history_row.observed_at");
+    const connectorId = toBigIntString(row.connector_id, "observs_row.connector_id");
+    const timeseriesId = toBigIntString(row.timeseries_id, "observs_row.timeseries_id");
+    const observedAt = toIso(row.observed_at, "observs_row.observed_at");
     const valueFromHex = parseFloat8Hex(row.value_float8_hex);
     const value = valueFromHex ?? (row.value === undefined ? null : row.value);
     const status = row.status === undefined ? null : row.status;
@@ -163,9 +163,9 @@ function normalizeHistoryRows(inputRows) {
   return Array.from(deduped.values());
 }
 
-function buildReceiptRows(historyRows) {
+function buildReceiptRows(observsRows) {
   const deduped = new Map();
-  for (const row of historyRows) {
+  for (const row of observsRows) {
     const key = `${row.connector_id}|${row.timeseries_id}|${toObservedDay(row.observed_at)}`;
     deduped.set(key, {
       connector_id: row.connector_id,
@@ -176,12 +176,12 @@ function buildReceiptRows(historyRows) {
   return Array.from(deduped.values());
 }
 
-async function upsertHistoryRowsChunk(historyClient, rows) {
-  const upsertResult = await historyClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_UPSERT, {
+async function upsertObservsRowsChunk(observsClient, rows) {
+  const upsertResult = await observsClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_UPSERT, {
     rows,
   });
   if (upsertResult.error) {
-    throw new Error(upsertResult.error.message || "unknown_history_upsert_error");
+    throw new Error(upsertResult.error.message || "unknown_observs_upsert_error");
   }
   const upsertRow = Array.isArray(upsertResult.data) ? upsertResult.data[0] : upsertResult.data;
   return toIntField(
@@ -190,19 +190,19 @@ async function upsertHistoryRowsChunk(historyClient, rows) {
   );
 }
 
-async function upsertHistoryRowsWithFallback(historyClient, rows, splitDepth = 0) {
-  let lastMessage = "unknown_history_upsert_error";
+async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0) {
+  let lastMessage = "unknown_observs_upsert_error";
 
-  for (let attempt = 1; attempt <= DEFAULT_HISTORY_UPSERT_RPC_RETRIES; attempt += 1) {
+  for (let attempt = 1; attempt <= DEFAULT_OBSERVS_UPSERT_RPC_RETRIES; attempt += 1) {
     try {
-      return await upsertHistoryRowsChunk(historyClient, rows);
+      return await upsertObservsRowsChunk(observsClient, rows);
     } catch (error) {
-      lastMessage = historyUpsertErrorMessage(error);
+      lastMessage = observsUpsertErrorMessage(error);
       if (
-        attempt < DEFAULT_HISTORY_UPSERT_RPC_RETRIES
-        && isRetryableHistoryUpsertError(lastMessage)
+        attempt < DEFAULT_OBSERVS_UPSERT_RPC_RETRIES
+        && isRetryableObservsUpsertError(lastMessage)
       ) {
-        await sleep(Math.min(5_000, DEFAULT_HISTORY_UPSERT_RETRY_BASE_MS * attempt));
+        await sleep(Math.min(5_000, DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS * attempt));
         continue;
       }
       break;
@@ -210,33 +210,33 @@ async function upsertHistoryRowsWithFallback(historyClient, rows, splitDepth = 0
   }
 
   if (
-    isHistoryStatementTimeoutError(lastMessage)
-    && splitDepth < DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH
-    && rows.length >= DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MIN_ROWS * 2
+    isObservsStatementTimeoutError(lastMessage)
+    && splitDepth < DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH
+    && rows.length >= DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS * 2
   ) {
     const midpoint = Math.floor(rows.length / 2);
     const leftRows = rows.slice(0, midpoint);
     const rightRows = rows.slice(midpoint);
     if (!leftRows.length || !rightRows.length) {
-      throw new Error(`history upsert failed: ${lastMessage}`);
+      throw new Error(`observs upsert failed: ${lastMessage}`);
     }
-    const leftUpserted = await upsertHistoryRowsWithFallback(
-      historyClient,
+    const leftUpserted = await upsertObservsRowsWithFallback(
+      observsClient,
       leftRows,
       splitDepth + 1,
     );
-    const rightUpserted = await upsertHistoryRowsWithFallback(
-      historyClient,
+    const rightUpserted = await upsertObservsRowsWithFallback(
+      observsClient,
       rightRows,
       splitDepth + 1,
     );
     return leftUpserted + rightUpserted;
   }
 
-  throw new Error(`history upsert failed: ${lastMessage}`);
+  throw new Error(`observs upsert failed: ${lastMessage}`);
 }
 
-async function flushHistoryOutbox(mainClient, historyClient, claimBatchLimit, maxFlushBatches) {
+async function flushObservsOutbox(mainClient, observsClient, claimBatchLimit, maxFlushBatches) {
   const summary = {
     batches_run: 0,
     claimed_entries: 0,
@@ -263,26 +263,26 @@ async function flushHistoryOutbox(mainClient, historyClient, claimBatchLimit, ma
     summary.batches_run = batch;
     summary.claimed_entries += entries.length;
 
-    const historyRows = normalizeHistoryRows(
+    const observsRows = normalizeObservsRows(
       entries.flatMap((entry) => (Array.isArray(entry.payload) ? entry.payload : [])),
     );
 
     const resolutions = [];
-    if (!historyRows.length) {
+    if (!observsRows.length) {
       for (const entry of entries) {
         resolutions.push({ id: entry.id, ok: true });
       }
     } else {
       try {
-        summary.delivered_rows += await upsertHistoryRowsWithFallback(historyClient, historyRows);
+        summary.delivered_rows += await upsertObservsRowsWithFallback(observsClient, observsRows);
 
-        const receiptRows = buildReceiptRows(historyRows);
+        const receiptRows = buildReceiptRows(observsRows);
         if (receiptRows.length) {
-          const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_RECEIPTS_UPSERT, {
+          const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_RECEIPTS_UPSERT, {
             rows: receiptRows,
           });
           if (receiptResult.error) {
-            throw new Error(`history receipts upsert failed: ${receiptResult.error.message}`);
+            throw new Error(`observs receipts upsert failed: ${receiptResult.error.message}`);
           }
           const receiptRow = Array.isArray(receiptResult.data)
             ? receiptResult.data[0]
@@ -331,9 +331,9 @@ function buildRunConfig(url) {
   const params = url.searchParams;
   return {
     supabaseUrl: requiredEnvAny(["SUPABASE_URL", "SB_URL"]),
-    historySupabaseUrl: requiredEnvAny(["HISTORY_SUPABASE_URL", "HISTORY_URL"]),
+    observsSupabaseUrl: requiredEnvAny(["OBS_AQIDB_SUPABASE_URL"]),
     ingestSecretKey: requiredEnvAny(["SB_SECRET_KEY"]),
-    historySecretKey: requiredEnvAny(["HISTORY_SECRET_KEY"]),
+    observsSecretKey: requiredEnvAny(["OBS_AQIDB_SECRET_KEY"]),
     flushClaimBatchLimit: parsePositiveInt(
       params.get("flushClaimBatchLimit") ?? process.env.FLUSH_CLAIM_BATCH_LIMIT,
       DEFAULT_FLUSH_CLAIM_BATCH_LIMIT,
@@ -360,29 +360,29 @@ async function runFlush(config) {
     auth: { persistSession: false, autoRefreshToken: false },
     db: { schema: RPC_SCHEMA },
   });
-  const historyClient = createClient(config.historySupabaseUrl, config.historySecretKey, {
+  const observsClient = createClient(config.observsSupabaseUrl, config.observsSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
     db: { schema: RPC_SCHEMA },
   });
 
-  logStructured("INFO", "history_outbox_flush_service_run_start", {
+  logStructured("INFO", "observs_outbox_flush_service_run_start", {
     run_id: runId,
     flush_claim_batch_limit: config.flushClaimBatchLimit,
     max_flush_batches: config.maxFlushBatches,
   });
 
-  const summary = await flushHistoryOutbox(
+  const summary = await flushObservsOutbox(
     ingestClient,
-    historyClient,
+    observsClient,
     config.flushClaimBatchLimit,
     config.maxFlushBatches,
   );
   const payload = { run_id: runId, ...summary };
 
   if (summary.alert_condition) {
-    logStructured("WARNING", "history_outbox_flush_service_run_warning", payload);
+    logStructured("WARNING", "observs_outbox_flush_service_run_warning", payload);
   } else {
-    logStructured("INFO", "history_outbox_flush_service_run_summary", payload);
+    logStructured("INFO", "observs_outbox_flush_service_run_summary", payload);
   }
 
   return payload;
@@ -411,12 +411,12 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const errorId = randomUUID();
-    logStructured("ERROR", "history_outbox_flush_service_run_error", {
+    logStructured("ERROR", "observs_outbox_flush_service_run_error", {
       error_id: errorId,
       message,
     });
     jsonResponse(res, 500, {
-      error: "history_outbox_flush_service_run_error",
+      error: "observs_outbox_flush_service_run_error",
       message: "Internal error. See logs with error_id.",
       error_id: errorId,
     });
@@ -425,7 +425,7 @@ const server = createServer(async (req, res) => {
 
 const port = parsePositiveInt(process.env.PORT, 8080, 1, 65535);
 server.listen(port, () => {
-  logStructured("INFO", "history_outbox_flush_service_started", {
+  logStructured("INFO", "observs_outbox_flush_service_started", {
     port,
     default_flush_claim_batch_limit: DEFAULT_FLUSH_CLAIM_BATCH_LIMIT,
     default_max_flush_batches: DEFAULT_MAX_FLUSH_BATCHES,

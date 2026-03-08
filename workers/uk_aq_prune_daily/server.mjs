@@ -20,20 +20,20 @@ const DEFAULT_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE = 1_000;
 const DEFAULT_FLUSH_CLAIM_BATCH_LIMIT = 20;
 const DEFAULT_MAX_FLUSH_BATCHES = 30;
 const DEFAULT_MAX_HOURS_PER_BATCH = 24;
-const DEFAULT_HISTORY_UPSERT_RPC_RETRIES = 3;
-const DEFAULT_HISTORY_UPSERT_RETRY_BASE_MS = 1_000;
-const DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
-const DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
+const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
+const DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS = 1_000;
+const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
+const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const PREVIEW_LIMIT = 25;
 const RPC_SCHEMA = "uk_aq_public";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_DELETE_HOUR_BUCKET = "uk_aq_rpc_observations_delete_hour_bucket";
-const RPC_REPAIR_ENQUEUE_HOUR_BUCKET = "uk_aq_rpc_history_outbox_enqueue_hour_bucket";
-const RPC_OUTBOX_CLAIM = "uk_aq_rpc_history_outbox_claim";
-const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_history_outbox_resolve";
-const RPC_HISTORY_UPSERT = "uk_aq_rpc_history_observations_upsert";
-const RPC_HISTORY_RECEIPTS_UPSERT = "uk_aq_rpc_history_sync_receipt_daily_upsert";
+const RPC_REPAIR_ENQUEUE_HOUR_BUCKET = "uk_aq_rpc_observs_outbox_enqueue_hour_bucket";
+const RPC_OUTBOX_CLAIM = "uk_aq_rpc_observs_outbox_claim";
+const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_observs_outbox_resolve";
+const RPC_OBSERVS_UPSERT = "uk_aq_rpc_observs_observations_upsert";
+const RPC_OBSERVS_RECEIPTS_UPSERT = "uk_aq_rpc_observs_sync_receipt_daily_upsert";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
@@ -93,19 +93,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function historyUpsertErrorMessage(error) {
+function observsUpsertErrorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.length > 400 ? `${message.slice(0, 397)}...` : message;
 }
 
-function isHistoryStatementTimeoutError(message) {
+function isObservsStatementTimeoutError(message) {
   return /statement timeout|canceling statement due to statement timeout/i.test(message);
 }
 
-function isRetryableHistoryUpsertError(message) {
+function isRetryableObservsUpsertError(message) {
   const normalized = message.toLowerCase();
   return (
-    isHistoryStatementTimeoutError(normalized)
+    isObservsStatementTimeoutError(normalized)
     || normalized.includes("deadlock detected")
     || normalized.includes("could not serialize access due to")
     || normalized.includes("connection terminated")
@@ -450,7 +450,7 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     ingestdb_retention_days: config.ingestDbRetentionDays,
     max_hours_per_run: config.maxHoursPerRun,
     ingest_bucket_count: sumIntField(batchSummaries, "ingest_bucket_count"),
-    history_bucket_count: sumIntField(batchSummaries, "history_bucket_count"),
+    observs_bucket_count: sumIntField(batchSummaries, "observs_bucket_count"),
     deletable_bucket_count: sumIntField(batchSummaries, "deletable_bucket_count"),
     deletable_bucket_count_before_backup_gate: sumIntField(
       batchSummaries,
@@ -458,8 +458,8 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     ),
     total_deletable_rows: sumBigIntField(batchSummaries, "total_deletable_rows").toString(),
     mismatch_count: sumIntField(batchSummaries, "mismatch_count"),
-    history_count_exceeds_ingest_count: sumIntField(batchSummaries, "history_count_exceeds_ingest_count"),
-    history_extra_bucket_count: sumIntField(batchSummaries, "history_extra_bucket_count"),
+    observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
+    observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
     backup_gate_enabled: Boolean(config.phaseB?.enabled),
     backup_gate_blocked_bucket_count: sumIntField(batchSummaries, "backup_gate_blocked_bucket_count"),
     batch_count: batches.length,
@@ -605,45 +605,45 @@ async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceNam
   return normalizeFingerprintRows(rows, sourceName);
 }
 
-function compareBuckets(ingestBuckets, historyBuckets) {
+function compareBuckets(ingestBuckets, observsBuckets) {
   const ingestByKey = new Map(ingestBuckets.map((row) => [row.key, row]));
-  const historyByKey = new Map(historyBuckets.map((row) => [row.key, row]));
+  const observsByKey = new Map(observsBuckets.map((row) => [row.key, row]));
 
   const deletableBuckets = [];
   const mismatches = [];
-  const historyExtraBuckets = [];
+  const observsExtraBuckets = [];
 
   for (const ingest of ingestBuckets) {
-    const history = historyByKey.get(ingest.key);
-    if (!history) {
+    const observs = observsByKey.get(ingest.key);
+    if (!observs) {
       mismatches.push({
         connector_id: ingest.connector_id,
         hour_start: ingest.hour_start,
-        reason: "missing_in_history",
+        reason: "missing_in_observs",
         ingest_count: ingest.observation_count.toString(),
-        history_count: null,
+        observs_count: null,
       });
       continue;
     }
 
-    if (ingest.observation_count !== history.observation_count) {
+    if (ingest.observation_count !== observs.observation_count) {
       mismatches.push({
         connector_id: ingest.connector_id,
         hour_start: ingest.hour_start,
         reason: "count_mismatch",
         ingest_count: ingest.observation_count.toString(),
-        history_count: history.observation_count.toString(),
+        observs_count: observs.observation_count.toString(),
       });
       continue;
     }
 
-    if (ingest.fingerprint !== history.fingerprint) {
+    if (ingest.fingerprint !== observs.fingerprint) {
       mismatches.push({
         connector_id: ingest.connector_id,
         hour_start: ingest.hour_start,
         reason: "fingerprint_mismatch",
         ingest_count: ingest.observation_count.toString(),
-        history_count: history.observation_count.toString(),
+        observs_count: observs.observation_count.toString(),
       });
       continue;
     }
@@ -657,12 +657,12 @@ function compareBuckets(ingestBuckets, historyBuckets) {
     });
   }
 
-  for (const history of historyBuckets) {
-    if (!ingestByKey.has(history.key)) {
-      historyExtraBuckets.push({
-        connector_id: history.connector_id,
-        hour_start: history.hour_start,
-        observation_count: history.observation_count.toString(),
+  for (const observs of observsBuckets) {
+    if (!ingestByKey.has(observs.key)) {
+      observsExtraBuckets.push({
+        connector_id: observs.connector_id,
+        hour_start: observs.hour_start,
+        observation_count: observs.observation_count.toString(),
       });
     }
   }
@@ -670,18 +670,18 @@ function compareBuckets(ingestBuckets, historyBuckets) {
   return {
     deletableBuckets,
     mismatches,
-    historyExtraBuckets,
+    observsExtraBuckets,
   };
 }
 
-function determineBucketMismatch(ingestBucket, historyBucket) {
-  if (!ingestBucket && historyBucket) {
+function determineBucketMismatch(ingestBucket, observsBucket) {
+  if (!ingestBucket && observsBucket) {
     return {
-      connector_id: historyBucket.connector_id,
-      hour_start: historyBucket.hour_start,
+      connector_id: observsBucket.connector_id,
+      hour_start: observsBucket.hour_start,
       reason: "missing_in_ingest",
       ingest_count: null,
-      history_count: historyBucket.observation_count.toString(),
+      observs_count: observsBucket.observation_count.toString(),
     };
   }
 
@@ -689,33 +689,33 @@ function determineBucketMismatch(ingestBucket, historyBucket) {
     return null;
   }
 
-  if (!historyBucket) {
+  if (!observsBucket) {
     return {
       connector_id: ingestBucket.connector_id,
       hour_start: ingestBucket.hour_start,
-      reason: "missing_in_history",
+      reason: "missing_in_observs",
       ingest_count: ingestBucket.observation_count.toString(),
-      history_count: null,
+      observs_count: null,
     };
   }
 
-  if (ingestBucket.observation_count !== historyBucket.observation_count) {
+  if (ingestBucket.observation_count !== observsBucket.observation_count) {
     return {
       connector_id: ingestBucket.connector_id,
       hour_start: ingestBucket.hour_start,
       reason: "count_mismatch",
       ingest_count: ingestBucket.observation_count.toString(),
-      history_count: historyBucket.observation_count.toString(),
+      observs_count: observsBucket.observation_count.toString(),
     };
   }
 
-  if (ingestBucket.fingerprint !== historyBucket.fingerprint) {
+  if (ingestBucket.fingerprint !== observsBucket.fingerprint) {
     return {
       connector_id: ingestBucket.connector_id,
       hour_start: ingestBucket.hour_start,
       reason: "fingerprint_mismatch",
       ingest_count: ingestBucket.observation_count.toString(),
-      history_count: historyBucket.observation_count.toString(),
+      observs_count: observsBucket.observation_count.toString(),
     };
   }
 
@@ -724,10 +724,10 @@ function determineBucketMismatch(ingestBucket, historyBucket) {
 
 function classifyRepairMismatches(mismatches) {
   const repairableMismatches = [];
-  const historyCountGreaterThanIngest = [];
+  const observsCountGreaterThanIngest = [];
 
   for (const mismatch of mismatches) {
-    if (mismatch.reason === "missing_in_history" || mismatch.reason === "fingerprint_mismatch") {
+    if (mismatch.reason === "missing_in_observs" || mismatch.reason === "fingerprint_mismatch") {
       repairableMismatches.push(mismatch);
       continue;
     }
@@ -737,9 +737,9 @@ function classifyRepairMismatches(mismatches) {
     }
 
     const ingestCount = toOptionalBigInt(mismatch.ingest_count, "mismatch.ingest_count");
-    const historyCount = toOptionalBigInt(mismatch.history_count, "mismatch.history_count");
-    if (ingestCount !== null && historyCount !== null && historyCount > ingestCount) {
-      historyCountGreaterThanIngest.push(mismatch);
+    const observsCount = toOptionalBigInt(mismatch.observs_count, "mismatch.observs_count");
+    if (ingestCount !== null && observsCount !== null && observsCount > ingestCount) {
+      observsCountGreaterThanIngest.push(mismatch);
       continue;
     }
     repairableMismatches.push(mismatch);
@@ -747,7 +747,7 @@ function classifyRepairMismatches(mismatches) {
 
   return {
     repairableMismatches,
-    historyCountGreaterThanIngest,
+    observsCountGreaterThanIngest,
   };
 }
 
@@ -771,12 +771,12 @@ function parseFloat8Hex(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function normalizeHistoryRows(inputRows) {
+function normalizeObservsRows(inputRows) {
   const deduped = new Map();
   for (const row of inputRows) {
-    const connectorId = toBigIntString(row.connector_id, "history_row.connector_id");
-    const timeseriesId = toBigIntString(row.timeseries_id, "history_row.timeseries_id");
-    const observedAt = toIso(row.observed_at, "history_row.observed_at");
+    const connectorId = toBigIntString(row.connector_id, "observs_row.connector_id");
+    const timeseriesId = toBigIntString(row.timeseries_id, "observs_row.timeseries_id");
+    const observedAt = toIso(row.observed_at, "observs_row.observed_at");
     const valueFromHex = parseFloat8Hex(row.value_float8_hex);
     const value = valueFromHex ?? (row.value === undefined ? null : row.value);
     const status = row.status === undefined ? null : row.status;
@@ -792,9 +792,9 @@ function normalizeHistoryRows(inputRows) {
   return Array.from(deduped.values());
 }
 
-function buildReceiptRows(historyRows) {
+function buildReceiptRows(observsRows) {
   const deduped = new Map();
-  for (const row of historyRows) {
+  for (const row of observsRows) {
     const key = `${row.connector_id}|${row.timeseries_id}|${toObservedDay(row.observed_at)}`;
     deduped.set(key, {
       connector_id: row.connector_id,
@@ -805,12 +805,12 @@ function buildReceiptRows(historyRows) {
   return Array.from(deduped.values());
 }
 
-async function upsertHistoryRowsChunk(historyClient, rows) {
-  const upsertResult = await historyClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_UPSERT, {
+async function upsertObservsRowsChunk(observsClient, rows) {
+  const upsertResult = await observsClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_UPSERT, {
     rows,
   });
   if (upsertResult.error) {
-    throw new Error(upsertResult.error.message || "unknown_history_upsert_error");
+    throw new Error(upsertResult.error.message || "unknown_observs_upsert_error");
   }
   const upsertRow = Array.isArray(upsertResult.data) ? upsertResult.data[0] : upsertResult.data;
   return toIntField(
@@ -819,19 +819,19 @@ async function upsertHistoryRowsChunk(historyClient, rows) {
   );
 }
 
-async function upsertHistoryRowsWithFallback(historyClient, rows, splitDepth = 0) {
-  let lastMessage = "unknown_history_upsert_error";
+async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0) {
+  let lastMessage = "unknown_observs_upsert_error";
 
-  for (let attempt = 1; attempt <= DEFAULT_HISTORY_UPSERT_RPC_RETRIES; attempt += 1) {
+  for (let attempt = 1; attempt <= DEFAULT_OBSERVS_UPSERT_RPC_RETRIES; attempt += 1) {
     try {
-      return await upsertHistoryRowsChunk(historyClient, rows);
+      return await upsertObservsRowsChunk(observsClient, rows);
     } catch (error) {
-      lastMessage = historyUpsertErrorMessage(error);
+      lastMessage = observsUpsertErrorMessage(error);
       if (
-        attempt < DEFAULT_HISTORY_UPSERT_RPC_RETRIES
-        && isRetryableHistoryUpsertError(lastMessage)
+        attempt < DEFAULT_OBSERVS_UPSERT_RPC_RETRIES
+        && isRetryableObservsUpsertError(lastMessage)
       ) {
-        await sleep(Math.min(5_000, DEFAULT_HISTORY_UPSERT_RETRY_BASE_MS * attempt));
+        await sleep(Math.min(5_000, DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS * attempt));
         continue;
       }
       break;
@@ -839,33 +839,33 @@ async function upsertHistoryRowsWithFallback(historyClient, rows, splitDepth = 0
   }
 
   if (
-    isHistoryStatementTimeoutError(lastMessage)
-    && splitDepth < DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH
-    && rows.length >= DEFAULT_HISTORY_UPSERT_TIMEOUT_SPLIT_MIN_ROWS * 2
+    isObservsStatementTimeoutError(lastMessage)
+    && splitDepth < DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH
+    && rows.length >= DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS * 2
   ) {
     const midpoint = Math.floor(rows.length / 2);
     const leftRows = rows.slice(0, midpoint);
     const rightRows = rows.slice(midpoint);
     if (!leftRows.length || !rightRows.length) {
-      throw new Error(`history upsert failed: ${lastMessage}`);
+      throw new Error(`observs upsert failed: ${lastMessage}`);
     }
-    const leftUpserted = await upsertHistoryRowsWithFallback(
-      historyClient,
+    const leftUpserted = await upsertObservsRowsWithFallback(
+      observsClient,
       leftRows,
       splitDepth + 1,
     );
-    const rightUpserted = await upsertHistoryRowsWithFallback(
-      historyClient,
+    const rightUpserted = await upsertObservsRowsWithFallback(
+      observsClient,
       rightRows,
       splitDepth + 1,
     );
     return leftUpserted + rightUpserted;
   }
 
-  throw new Error(`history upsert failed: ${lastMessage}`);
+  throw new Error(`observs upsert failed: ${lastMessage}`);
 }
 
-async function enqueueHistoryOutboxRepairBucket(client, mismatch, chunkSize) {
+async function enqueueObservsOutboxRepairBucket(client, mismatch, chunkSize) {
   const connectorId = toIntField(mismatch.connector_id, "mismatch.connector_id");
   const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_ENQUEUE_HOUR_BUCKET, {
     p_connector_id: connectorId,
@@ -889,7 +889,7 @@ async function enqueueHistoryOutboxRepairBucket(client, mismatch, chunkSize) {
   };
 }
 
-async function flushHistoryOutbox(mainClient, historyClient, claimBatchLimit, maxFlushBatches) {
+async function flushObservsOutbox(mainClient, observsClient, claimBatchLimit, maxFlushBatches) {
   const summary = {
     batches_run: 0,
     claimed_entries: 0,
@@ -917,26 +917,26 @@ async function flushHistoryOutbox(mainClient, historyClient, claimBatchLimit, ma
     summary.batches_run = batch;
     summary.claimed_entries += entries.length;
 
-    const historyRows = normalizeHistoryRows(
+    const observsRows = normalizeObservsRows(
       entries.flatMap((entry) => (Array.isArray(entry.payload) ? entry.payload : [])),
     );
 
     const resolutions = [];
-    if (!historyRows.length) {
+    if (!observsRows.length) {
       for (const entry of entries) {
         resolutions.push({ id: entry.id, ok: true });
       }
     } else {
       try {
-        summary.delivered_rows += await upsertHistoryRowsWithFallback(historyClient, historyRows);
+        summary.delivered_rows += await upsertObservsRowsWithFallback(observsClient, observsRows);
 
-        const receiptRows = buildReceiptRows(historyRows);
+        const receiptRows = buildReceiptRows(observsRows);
         if (receiptRows.length) {
-          const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_HISTORY_RECEIPTS_UPSERT, {
+          const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_RECEIPTS_UPSERT, {
             rows: receiptRows,
           });
           if (receiptResult.error) {
-            throw new Error(`history receipts upsert failed: ${receiptResult.error.message}`);
+            throw new Error(`observs receipts upsert failed: ${receiptResult.error.message}`);
           }
           const receiptRow = Array.isArray(receiptResult.data)
             ? receiptResult.data[0]
@@ -980,17 +980,17 @@ async function flushHistoryOutbox(mainClient, historyClient, claimBatchLimit, ma
   };
 }
 
-async function recheckSingleBucket(ingestClient, historyClient, mismatch) {
+async function recheckSingleBucket(ingestClient, observsClient, mismatch) {
   const bucketWindow = buildBucketWindow(mismatch.hour_start);
-  const [ingestRows, historyRows] = await Promise.all([
+  const [ingestRows, observsRows] = await Promise.all([
     fetchHourlyFingerprints(ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck"),
-    fetchHourlyFingerprints(historyClient, bucketWindow.window_start, bucketWindow.window_end, "history_recheck"),
+    fetchHourlyFingerprints(observsClient, bucketWindow.window_start, bucketWindow.window_end, "observs_recheck"),
   ]);
 
   const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
-  const historyMap = new Map(historyRows.map((row) => [row.key, row]));
+  const observsMap = new Map(observsRows.map((row) => [row.key, row]));
   const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
-  const bucketMismatch = determineBucketMismatch(ingestMap.get(key), historyMap.get(key));
+  const bucketMismatch = determineBucketMismatch(ingestMap.get(key), observsMap.get(key));
 
   return {
     connector_id: mismatch.connector_id,
@@ -998,45 +998,45 @@ async function recheckSingleBucket(ingestClient, historyClient, mismatch) {
     verified: bucketMismatch === null,
     mismatch: bucketMismatch,
     ingest_bucket_found: ingestMap.has(key),
-    history_bucket_found: historyMap.has(key),
+    observs_bucket_found: observsMap.has(key),
   };
 }
 
 async function recheckMismatchBuckets(
   ingestClient,
-  historyClient,
+  observsClient,
   windowStart,
   windowEnd,
   initialMismatches,
 ) {
-  const [ingestRows, historyRows] = await Promise.all([
+  const [ingestRows, observsRows] = await Promise.all([
     fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest_recheck"),
-    fetchHourlyFingerprints(historyClient, windowStart, windowEnd, "history_recheck"),
+    fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs_recheck"),
   ]);
 
   const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
-  const historyMap = new Map(historyRows.map((row) => [row.key, row]));
+  const observsMap = new Map(observsRows.map((row) => [row.key, row]));
   const nowDeletableBuckets = [];
   const stillMismatched = [];
 
   for (const mismatch of initialMismatches) {
     const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
     const ingestBucket = ingestMap.get(key);
-    const historyBucket = historyMap.get(key);
-    const nextMismatch = determineBucketMismatch(ingestBucket, historyBucket);
+    const observsBucket = observsMap.get(key);
+    const nextMismatch = determineBucketMismatch(ingestBucket, observsBucket);
 
     if (nextMismatch) {
       stillMismatched.push(nextMismatch);
       continue;
     }
 
-    if (!ingestBucket || !historyBucket) {
+    if (!ingestBucket || !observsBucket) {
       stillMismatched.push({
         connector_id: mismatch.connector_id,
         hour_start: mismatch.hour_start,
         reason: "missing_in_both_or_unknown_after_repair",
         ingest_count: ingestBucket ? ingestBucket.observation_count.toString() : null,
-        history_count: historyBucket ? historyBucket.observation_count.toString() : null,
+        observs_count: observsBucket ? observsBucket.observation_count.toString() : null,
       });
       continue;
     }
@@ -1203,9 +1203,9 @@ function buildRunConfig(url) {
 
   return {
     supabaseUrl: requiredEnvAny(["SUPABASE_URL", "SB_URL"]),
-    historySupabaseUrl: requiredEnvAny(["HISTORY_SUPABASE_URL", "HISTORY_URL"]),
+    observsSupabaseUrl: requiredEnvAny(["OBS_AQIDB_SUPABASE_URL"]),
     ingestSecretKey: requiredEnvAny(["SB_SECRET_KEY"]),
-    historySecretKey: requiredEnvAny(["HISTORY_SECRET_KEY"]),
+    observsSecretKey: requiredEnvAny(["OBS_AQIDB_SECRET_KEY"]),
     dryRun,
     maxHoursPerRun,
     ingestDbRetentionDays,
@@ -1297,7 +1297,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     auth: { persistSession: false, autoRefreshToken: false },
     db: { schema: RPC_SCHEMA },
   });
-  const historyClient = createClient(config.historySupabaseUrl, config.historySecretKey, {
+  const observsClient = createClient(config.observsSupabaseUrl, config.observsSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
     db: { schema: RPC_SCHEMA },
   });
@@ -1325,12 +1325,12 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     backup_gate_enabled: Boolean(config.phaseB?.enabled),
   });
 
-  const [ingestBuckets, historyBuckets] = await Promise.all([
+  const [ingestBuckets, observsBuckets] = await Promise.all([
     fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest"),
-    fetchHourlyFingerprints(historyClient, windowStart, windowEnd, "history"),
+    fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs"),
   ]);
 
-  const { deletableBuckets, mismatches, historyExtraBuckets } = compareBuckets(ingestBuckets, historyBuckets);
+  const { deletableBuckets, mismatches, observsExtraBuckets } = compareBuckets(ingestBuckets, observsBuckets);
   const preRepairBackupGate = await applyBackupGateFilter(
     config,
     runId,
@@ -1339,28 +1339,28 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   );
   const gatedDeletableBuckets = preRepairBackupGate.allowedBuckets;
   const backupGateBlockedBuckets = preRepairBackupGate.blockedBuckets;
-  const { repairableMismatches, historyCountGreaterThanIngest } = classifyRepairMismatches(mismatches);
+  const { repairableMismatches, observsCountGreaterThanIngest } = classifyRepairMismatches(mismatches);
   const repairCandidate = repairableMismatches[0] ?? null;
 
   for (const mismatch of mismatches) {
     logStructured("ERROR", "hour_bucket_mismatch", { run_id: runId, ...mismatch });
   }
-  for (const mismatch of historyCountGreaterThanIngest) {
-    logStructured("ERROR", "hour_bucket_history_count_exceeds_ingest", {
+  for (const mismatch of observsCountGreaterThanIngest) {
+    logStructured("ERROR", "hour_bucket_observs_count_exceeds_ingest", {
       run_id: runId,
       connector_id: mismatch.connector_id,
       hour_start: mismatch.hour_start,
       reason: mismatch.reason,
       ingest_count: mismatch.ingest_count,
-      history_count: mismatch.history_count,
+      observs_count: mismatch.observs_count,
       alert_condition: true,
     });
   }
-  if (historyExtraBuckets.length > 0) {
-    logStructured("INFO", "history_extra_buckets", {
+  if (observsExtraBuckets.length > 0) {
+    logStructured("INFO", "observs_extra_buckets", {
       run_id: runId,
-      count: historyExtraBuckets.length,
-      sample: sampleRows(historyExtraBuckets),
+      count: observsExtraBuckets.length,
+      sample: sampleRows(observsExtraBuckets),
     });
   }
 
@@ -1381,13 +1381,13 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     window_end: windowEnd,
     ingestdb_retention_days: config.ingestDbRetentionDays,
     ingest_bucket_count: ingestBuckets.length,
-    history_bucket_count: historyBuckets.length,
+    observs_bucket_count: observsBuckets.length,
     deletable_bucket_count: gatedDeletableBuckets.length,
     deletable_bucket_count_before_backup_gate: deletableBuckets.length,
     total_deletable_rows: totalDeletableRows.toString(),
     mismatch_count: mismatches.length,
-    history_count_exceeds_ingest_count: historyCountGreaterThanIngest.length,
-    history_extra_bucket_count: historyExtraBuckets.length,
+    observs_count_exceeds_ingest_count: observsCountGreaterThanIngest.length,
+    observs_extra_bucket_count: observsExtraBuckets.length,
     backup_gate_enabled: Boolean(config.phaseB?.enabled),
     backup_gate_blocked_bucket_count: backupGateBlockedBuckets.length,
     backup_gate_blocked_buckets_preview: sampleRows(backupGateBlockedBuckets),
@@ -1407,18 +1407,18 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
         });
       } else {
         try {
-          const enqueueResult = await enqueueHistoryOutboxRepairBucket(
+          const enqueueResult = await enqueueObservsOutboxRepairBucket(
             ingestClient,
             repairCandidate,
             config.repairBucketOutboxChunkSize,
           );
-          const flushResult = await flushHistoryOutbox(
+          const flushResult = await flushObservsOutbox(
             ingestClient,
-            historyClient,
+            observsClient,
             config.flushClaimBatchLimit,
             config.maxFlushBatches,
           );
-          const recheck = await recheckSingleBucket(ingestClient, historyClient, repairCandidate);
+          const recheck = await recheckSingleBucket(ingestClient, observsClient, repairCandidate);
           repairPilot = {
             attempted: true,
             connector_id: repairCandidate.connector_id,
@@ -1532,7 +1532,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   if (repairableMismatches.length > 0) {
     for (const mismatch of repairableMismatches) {
       try {
-        const enqueueResult = await enqueueHistoryOutboxRepairBucket(
+        const enqueueResult = await enqueueObservsOutboxRepairBucket(
           ingestClient,
           mismatch,
           config.repairBucketOutboxChunkSize,
@@ -1562,9 +1562,9 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     }
 
     try {
-      repairFlushResult = await flushHistoryOutbox(
+      repairFlushResult = await flushObservsOutbox(
         ingestClient,
-        historyClient,
+        observsClient,
         config.flushClaimBatchLimit,
         config.maxFlushBatches,
       );
@@ -1589,7 +1589,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   if (repairableMismatches.length > 0) {
     const recheckResult = await recheckMismatchBuckets(
       ingestClient,
-      historyClient,
+      observsClient,
       windowStart,
       windowEnd,
       mismatches,

@@ -5,7 +5,7 @@ Cloud Run worker for UK AQ operational backfill workflows.
 Phase 1 implementation status:
 
 - `local_to_aggdaily`: implemented
-- `history_to_r2`: wired stub (not yet implemented)
+- `obs_aqi_to_r2`: wired stub (not yet implemented)
 - `source_to_all`: wired stub (not yet implemented)
 
 ## Endpoints
@@ -38,18 +38,18 @@ All fields are optional unless noted.
   - processes newest selected UTC day first, then older days
   - uses source priority per day/connector:
     - ingest DB for likely in-retention days
-    - history DB for older local days
+    - observs DB for older local days
     - R2 only when explicit fallback is enabled
   - default skip if checkpoint is already complete
   - `force_replace=true` bypasses skip
   - writes AggDaily hourly + rollups via existing AQI RPCs
 
-- `history_to_r2`
+- `obs_aqi_to_r2`
   - phase 1 stub only
 
 - `source_to_all`
   - phase 1 stub only
-  - retention helper is active and classifies history-write eligible/skipped days
+  - retention helper is active and classifies observs-write eligible/skipped days
 
 ## Required Environment
 
@@ -57,8 +57,8 @@ For `local_to_aggdaily`:
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
-- `HISTORY_SUPABASE_URL`
-- `HISTORY_SECRET_KEY`
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
 - `AGGDAILY_SUPABASE_URL`
 - `AGGDAILY_SECRET_KEY`
 
@@ -78,7 +78,7 @@ Core:
 Retention / iteration:
 
 - `UK_AQ_BACKFILL_INGEST_RETENTION_DAYS` (default `7`)
-- `UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS` (default `31`)
+- `UK_AQ_BACKFILL_OBS_AQI_LOCAL_RETENTION_DAYS` (default `31`)
 - `UK_AQ_BACKFILL_LOCAL_TIMEZONE` (default `Europe/London`)
 - `UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE` (default `1000`)
 - `UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE` (default `2000`)

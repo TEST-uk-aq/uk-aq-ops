@@ -1,25 +1,23 @@
-name: Deploy UK AQ Prune Daily Cloud Run Service
+name: Deploy Observs Partition Maintenance Cloud Run Service
 
 on:
   push:
     branches:
       - main
     paths:
-      - "workers/uk_aq_prune_daily/server.mjs"
-      - "workers/uk_aq_prune_daily/phase_b_backup_r2.mjs"
-      - "workers/shared/r2_sigv4.mjs"
+      - "workers/uk_aq_observs_partition_maintenance_service/server.mjs"
       - "Dockerfile"
       - "package.json"
       - "package-lock.json"
-      - ".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml"
+      - ".github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml"
   workflow_dispatch:
 
 concurrency:
-  group: uk-aq-prune-daily-deploy
+  group: uk-aq-observs-partition-maintenance-service-deploy
   cancel-in-progress: false
 
 jobs:
-  deploy-uk-aq-prune-daily-service:
+  deploy-observs-partition-maintenance-service:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,56 +26,38 @@ jobs:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
       REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
-      SERVICE_NAME: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_NAME || vars.GCP_INGESTDB_PRUNE_SERVICE_NAME || vars.INGESTDB_PRUNE_SERVICE_NAME || 'uk-aq-prune-daily' }}
-      RESOURCE_LABEL: uk-aq-prune-daily
-      UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_ACCOUNT || vars.GCP_INGESTDB_PRUNE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT || '' }}
-      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_TIMEOUT_SECONDS || vars.GCP_INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || vars.UK_AQ_PRUNE_DAILY_SERVICE_TIMEOUT_SECONDS || vars.INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || '900' }}
-      SERVICE_CPU: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_CPU || vars.GCP_INGESTDB_PRUNE_SERVICE_CPU || vars.UK_AQ_PRUNE_DAILY_SERVICE_CPU || vars.INGESTDB_PRUNE_SERVICE_CPU || '1' }}
-      SERVICE_MEMORY: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_MEMORY || vars.GCP_INGESTDB_PRUNE_SERVICE_MEMORY || vars.UK_AQ_PRUNE_DAILY_SERVICE_MEMORY || vars.INGESTDB_PRUNE_SERVICE_MEMORY || '256Mi' }}
-      SERVICE_CONCURRENCY: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_CONCURRENCY || vars.GCP_INGESTDB_PRUNE_SERVICE_CONCURRENCY || vars.UK_AQ_PRUNE_DAILY_SERVICE_CONCURRENCY || vars.INGESTDB_PRUNE_SERVICE_CONCURRENCY || '1' }}
-      SERVICE_MAX_INSTANCES: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_MAX_INSTANCES || vars.GCP_INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || vars.UK_AQ_PRUNE_DAILY_SERVICE_MAX_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MAX_INSTANCES || '1' }}
-      SERVICE_MIN_INSTANCES: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_MIN_INSTANCES || vars.GCP_INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || vars.UK_AQ_PRUNE_DAILY_SERVICE_MIN_INSTANCES || vars.INGESTDB_PRUNE_SERVICE_MIN_INSTANCES || '0' }}
-      SCHEDULER_ENABLED: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_ENABLED || vars.GCP_INGESTDB_PRUNE_SCHEDULER_ENABLED || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_ENABLED || vars.INGESTDB_PRUNE_SCHEDULER_ENABLED || 'true' }}
-      SCHEDULER_JOB_NAME: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_JOB_NAME || vars.GCP_INGESTDB_PRUNE_SCHEDULER_JOB_NAME || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_JOB_NAME || vars.INGESTDB_PRUNE_SCHEDULER_JOB_NAME || 'uk-aq-prune-daily' }}
-      SCHEDULER_CRON: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_CRON || vars.GCP_INGESTDB_PRUNE_SCHEDULER_CRON || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_CRON || vars.INGESTDB_PRUNE_SCHEDULER_CRON || '0 2 * * *' }}
-      SCHEDULER_TIMEZONE: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_TIMEZONE || vars.GCP_INGESTDB_PRUNE_SCHEDULER_TIMEZONE || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_TIMEZONE || vars.INGESTDB_PRUNE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
-      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.GCP_INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
-      UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT || vars.GCP_INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
-      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SERVICE_NAME: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_NAME || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_NAME || 'uk-aq-observs-partition-maintenance-service' }}
+      RESOURCE_LABEL: uk-aq-observs-partition-maintenance-service
+      OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT || '' }}
+      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || '900' }}
+      SERVICE_CPU: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_CPU || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_CPU || '1' }}
+      SERVICE_MEMORY: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_MEMORY || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_MEMORY || '256Mi' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_CONCURRENCY || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_CONCURRENCY || '1' }}
+      SERVICE_MAX_INSTANCES: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_MAX_INSTANCES || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_MAX_INSTANCES || '1' }}
+      SERVICE_MIN_INSTANCES: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_MIN_INSTANCES || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_MIN_INSTANCES || '0' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_ENABLED || vars.OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_ENABLED || 'true' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_JOB_NAME || vars.OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_JOB_NAME || 'uk-aq-observs-partition-maintenance-daily' }}
+      SCHEDULER_CRON: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_CRON || vars.OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_CRON || '0 3 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_TIMEZONE || vars.OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT || vars.OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT || '' }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
-      INGESTDB_PRUNE_DRY_RUN: ${{ vars.INGESTDB_PRUNE_DRY_RUN || 'true' }}
-      INGESTDB_RETENTION_DAYS: ${{ vars.INGESTDB_RETENTION_DAYS || '7' }}
-      MAX_HOURS_PER_RUN: ${{ vars.INGESTDB_PRUNE_MAX_HOURS_PER_RUN || '48' }}
-      DELETE_BATCH_SIZE: ${{ vars.INGESTDB_PRUNE_DELETE_BATCH_SIZE || '50000' }}
-      MAX_DELETE_BATCHES_PER_HOUR: ${{ vars.INGESTDB_PRUNE_MAX_DELETE_BATCHES_PER_HOUR || '10' }}
-      REPAIR_ONE_MISMATCH_BUCKET: ${{ vars.INGESTDB_PRUNE_REPAIR_ONE_MISMATCH_BUCKET || 'true' }}
-      REPAIR_BUCKET_OUTBOX_CHUNK_SIZE: ${{ vars.INGESTDB_PRUNE_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE || '1000' }}
-      FLUSH_CLAIM_BATCH_LIMIT: ${{ vars.INGESTDB_PRUNE_FLUSH_CLAIM_BATCH_LIMIT || '20' }}
-      MAX_FLUSH_BATCHES: ${{ vars.INGESTDB_PRUNE_MAX_FLUSH_BATCHES || '30' }}
-      UK_AQ_DEPLOY_ENV: ${{ vars.UK_AQ_DEPLOY_ENV || 'dev' }}
-      BACKUP_PHASE_B_ENABLED: ${{ vars.BACKUP_PHASE_B_ENABLED || 'true' }}
-      BACKUP_PART_MAX_ROWS: ${{ vars.BACKUP_PART_MAX_ROWS || '1000000' }}
-      BACKUP_CURSOR_FETCH_ROWS: ${{ vars.BACKUP_CURSOR_FETCH_ROWS || '20000' }}
-      BACKUP_ROW_GROUP_SIZE: ${{ vars.BACKUP_ROW_GROUP_SIZE || '100000' }}
-      BACKUP_MAX_CANDIDATES_PER_RUN: ${{ vars.BACKUP_MAX_CANDIDATES_PER_RUN || '500' }}
-      BACKUP_STAGING_RETENTION_DAYS: ${{ vars.BACKUP_STAGING_RETENTION_DAYS || '7' }}
-      BACKUP_STAGING_PREFIX: ${{ vars.BACKUP_STAGING_PREFIX || 'backup/staging' }}
-      BACKUP_COMMITTED_PREFIX: ${{ vars.BACKUP_COMMITTED_PREFIX || 'backup/observations' }}
-      BACKUP_RUNS_PREFIX: ${{ vars.BACKUP_RUNS_PREFIX || 'backup/runs' }}
-      R2_BUCKET_PROD: ${{ vars.R2_BUCKET_PROD || '' }}
-      R2_BUCKET_STAGE: ${{ vars.R2_BUCKET_STAGE || '' }}
-      R2_BUCKET_DEV: ${{ vars.R2_BUCKET_DEV || '' }}
-      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      OBSERVS_PARTITIONS_FUTURE_DAYS: ${{ vars.OBSERVS_PARTITIONS_FUTURE_DAYS || '3' }}
+      OBSERVS_PARTITIONS_HOT_DAYS: ${{ vars.OBSERVS_PARTITIONS_HOT_DAYS || '3' }}
+      OBSERVS_COMPLETE_LOCAL_DAYS: ${{ vars.OBSERVS_COMPLETE_LOCAL_DAYS || '31' }}
+      OBSERVS_DEFAULT_TOP_N: ${{ vars.OBSERVS_DEFAULT_TOP_N || '20' }}
+      OBSERVS_PARTITION_DROP_DRY_RUN: ${{ vars.OBSERVS_PARTITION_DROP_DRY_RUN || 'false' }}
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
-      SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
+      CFLARE_R2_OBSERVATIONS_PREFIX: ${{ vars.CFLARE_R2_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER: ${{ vars.UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER || '/observs_partition_maintenance' }}
+      UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
       OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
-      SUPABASE_DB_URL_SECRET_NAME: ${{ vars.SUPABASE_DB_URL_SECRET_NAME || 'SUPABASE_DB_URL' }}
-      CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME || 'CFLARE_R2_ACCESS_KEY_ID' }}
-      CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME || 'CFLARE_R2_SECRET_ACCESS_KEY' }}
-      SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+      CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME || '' }}
+      CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME || '' }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
-      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
@@ -86,9 +66,6 @@ jobs:
       DROPBOX_APP_KEY_SECRET_NAME: ${{ vars.DROPBOX_APP_KEY_SECRET_NAME || '' }}
       DROPBOX_APP_SECRET_SECRET_NAME: ${{ vars.DROPBOX_APP_SECRET_SECRET_NAME || '' }}
       DROPBOX_REFRESH_TOKEN_SECRET_NAME: ${{ vars.DROPBOX_REFRESH_TOKEN_SECRET_NAME || '' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
-      UK_AIR_ERROR_DROPBOX_FOLDER: ${{ vars.UK_AIR_ERROR_DROPBOX_FOLDER || '/error_log' }}
-      UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -104,23 +81,9 @@ jobs:
             echo "Missing required repo variable: GCP_PROJECT_ID"
             exit 1
           fi
-          if [ -z "${SUPABASE_URL:-}" ]; then
-            echo "Missing required repo variable: SUPABASE_URL"
-            exit 1
-          fi
           if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ]; then
             echo "Missing required repo variable: OBS_AQIDB_SUPABASE_URL"
             exit 1
-          fi
-          if [ "${BACKUP_PHASE_B_ENABLED:-true}" = "true" ]; then
-            if [ -z "${CFLARE_R2_ENDPOINT:-}" ]; then
-              echo "Missing required repo variable: CFLARE_R2_ENDPOINT (Phase B backup enabled)."
-              exit 1
-            fi
-            if [ -z "${R2_BUCKET_PROD:-}" ] && [ -z "${R2_BUCKET_STAGE:-}" ] && [ -z "${R2_BUCKET_DEV:-}" ] && [ -z "${CFLARE_R2_BUCKET:-}" ]; then
-              echo "Missing R2 bucket mapping (set R2_BUCKET_PROD/STAGE/DEV or CFLARE_R2_BUCKET)."
-              exit 1
-            fi
           fi
 
       - name: Resolve runtime and scheduler service accounts
@@ -145,7 +108,7 @@ jobs:
             fi
           }
 
-          runtime_sa="${UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT:-}"
+          runtime_sa="${OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT:-}"
           if [ -z "${runtime_sa}" ]; then
             runtime_sa="uk-aq-ops-job@${PROJECT_ID}.iam.gserviceaccount.com"
           fi
@@ -155,7 +118,7 @@ jobs:
             exit 1
           fi
 
-          scheduler_sa="${UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
+          scheduler_sa="${OBSERVS_PARTITION_MAINTENANCE_SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
           validate_service_account "scheduler service account" "${scheduler_sa}"
           if [[ "${scheduler_sa}" == *"-compute@developer.gserviceaccount.com" ]]; then
             echo "Invalid scheduler service account: default compute service account is not allowed."
@@ -239,12 +202,14 @@ jobs:
               --required "${required}"
           }
 
-          upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1
           upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
-          upsert_secret "${SUPABASE_DB_URL_SECRET_NAME}" "${SUPABASE_DB_URL}" 1
-          upsert_secret "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" "${CFLARE_R2_ACCESS_KEY_ID}" 1
-          upsert_secret "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" "${CFLARE_R2_SECRET_ACCESS_KEY}" 1
 
+          if [ -n "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
+            upsert_secret "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" "${CFLARE_R2_ACCESS_KEY_ID}" 1
+          fi
+          if [ -n "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" ]; then
+            upsert_secret "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" "${CFLARE_R2_SECRET_ACCESS_KEY}" 1
+          fi
           if [ -n "${DROPBOX_APP_KEY_SECRET_NAME:-}" ]; then
             upsert_secret "${DROPBOX_APP_KEY_SECRET_NAME}" "${DROPBOX_APP_KEY}" 1
           fi
@@ -258,12 +223,10 @@ jobs:
       - name: Verify Secret Manager secrets exist
         run: |
           set -euo pipefail
-          gcloud secrets describe "${SB_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           gcloud secrets describe "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
-          gcloud secrets describe "${SUPABASE_DB_URL_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
-          gcloud secrets describe "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
-          gcloud secrets describe "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           for optional_secret in \
+            "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" \
+            "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" \
             "${DROPBOX_APP_KEY_SECRET_NAME:-}" \
             "${DROPBOX_APP_SECRET_SECRET_NAME:-}" \
             "${DROPBOX_REFRESH_TOKEN_SECRET_NAME:-}"; do
@@ -281,7 +244,7 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-prune-daily:${GITHUB_SHA::12}"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-observs-partition-maintenance-service:${GITHUB_SHA::12}"
           echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
           docker build -t "${IMAGE}" .
           docker push "${IMAGE}"
@@ -292,52 +255,35 @@ jobs:
           set -euo pipefail
 
           env_updates=()
-          env_updates+=("SUPABASE_URL=${SUPABASE_URL}")
           env_updates+=("OBS_AQIDB_SUPABASE_URL=${OBS_AQIDB_SUPABASE_URL}")
-          env_updates+=("INGESTDB_PRUNE_DRY_RUN=${INGESTDB_PRUNE_DRY_RUN}")
-          env_updates+=("INGESTDB_RETENTION_DAYS=${INGESTDB_RETENTION_DAYS}")
-          env_updates+=("MAX_HOURS_PER_RUN=${MAX_HOURS_PER_RUN}")
-          env_updates+=("DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}")
-          env_updates+=("MAX_DELETE_BATCHES_PER_HOUR=${MAX_DELETE_BATCHES_PER_HOUR}")
-          env_updates+=("REPAIR_ONE_MISMATCH_BUCKET=${REPAIR_ONE_MISMATCH_BUCKET}")
-          env_updates+=("REPAIR_BUCKET_OUTBOX_CHUNK_SIZE=${REPAIR_BUCKET_OUTBOX_CHUNK_SIZE}")
-          env_updates+=("FLUSH_CLAIM_BATCH_LIMIT=${FLUSH_CLAIM_BATCH_LIMIT}")
-          env_updates+=("MAX_FLUSH_BATCHES=${MAX_FLUSH_BATCHES}")
-          env_updates+=("UK_AQ_DEPLOY_ENV=${UK_AQ_DEPLOY_ENV}")
-          env_updates+=("BACKUP_PHASE_B_ENABLED=${BACKUP_PHASE_B_ENABLED}")
-          env_updates+=("BACKUP_PART_MAX_ROWS=${BACKUP_PART_MAX_ROWS}")
-          env_updates+=("BACKUP_CURSOR_FETCH_ROWS=${BACKUP_CURSOR_FETCH_ROWS}")
-          env_updates+=("BACKUP_ROW_GROUP_SIZE=${BACKUP_ROW_GROUP_SIZE}")
-          env_updates+=("BACKUP_MAX_CANDIDATES_PER_RUN=${BACKUP_MAX_CANDIDATES_PER_RUN}")
-          env_updates+=("BACKUP_STAGING_RETENTION_DAYS=${BACKUP_STAGING_RETENTION_DAYS}")
-          env_updates+=("BACKUP_STAGING_PREFIX=${BACKUP_STAGING_PREFIX}")
-          env_updates+=("BACKUP_COMMITTED_PREFIX=${BACKUP_COMMITTED_PREFIX}")
-          env_updates+=("BACKUP_RUNS_PREFIX=${BACKUP_RUNS_PREFIX}")
-          env_updates+=("CFLARE_R2_ENDPOINT=${CFLARE_R2_ENDPOINT}")
-          env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
-          if [ -n "${R2_BUCKET_PROD:-}" ]; then
-            env_updates+=("R2_BUCKET_PROD=${R2_BUCKET_PROD}")
-          fi
-          if [ -n "${R2_BUCKET_STAGE:-}" ]; then
-            env_updates+=("R2_BUCKET_STAGE=${R2_BUCKET_STAGE}")
-          fi
-          if [ -n "${R2_BUCKET_DEV:-}" ]; then
-            env_updates+=("R2_BUCKET_DEV=${R2_BUCKET_DEV}")
+          env_updates+=("OBSERVS_PARTITIONS_FUTURE_DAYS=${OBSERVS_PARTITIONS_FUTURE_DAYS}")
+          env_updates+=("OBSERVS_PARTITIONS_HOT_DAYS=${OBSERVS_PARTITIONS_HOT_DAYS}")
+          env_updates+=("OBSERVS_COMPLETE_LOCAL_DAYS=${OBSERVS_COMPLETE_LOCAL_DAYS}")
+          env_updates+=("OBSERVS_DEFAULT_TOP_N=${OBSERVS_DEFAULT_TOP_N}")
+          env_updates+=("OBSERVS_PARTITION_DROP_DRY_RUN=${OBSERVS_PARTITION_DROP_DRY_RUN}")
+          if [ -n "${CFLARE_R2_ENDPOINT:-}" ]; then
+            env_updates+=("CFLARE_R2_ENDPOINT=${CFLARE_R2_ENDPOINT}")
           fi
           if [ -n "${CFLARE_R2_BUCKET:-}" ]; then
             env_updates+=("CFLARE_R2_BUCKET=${CFLARE_R2_BUCKET}")
           fi
+          if [ -n "${CFLARE_R2_REGION:-}" ]; then
+            env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
+          fi
+          if [ -n "${CFLARE_R2_OBSERVATIONS_PREFIX:-}" ]; then
+            env_updates+=("CFLARE_R2_OBSERVATIONS_PREFIX=${CFLARE_R2_OBSERVATIONS_PREFIX}")
+          fi
           if [ -n "${UK_AQ_DROPBOX_ROOT:-}" ]; then
             env_updates+=("UK_AQ_DROPBOX_ROOT=${UK_AQ_DROPBOX_ROOT}")
           fi
-          if [ -n "${UK_AIR_ERROR_DROPBOX_FOLDER:-}" ]; then
-            env_updates+=("UK_AIR_ERROR_DROPBOX_FOLDER=${UK_AIR_ERROR_DROPBOX_FOLDER}")
+          if [ -n "${UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER:-}" ]; then
+            env_updates+=("UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER=${UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER}")
           fi
           if [ -n "${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL:-}" ]; then
             env_updates+=("UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL=${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL}")
           fi
 
-          env_file="${RUNNER_TEMP}/uk-aq-prune-daily-env.yaml"
+          env_file="${RUNNER_TEMP}/uk-aq-observs-partition-maintenance-env.yaml"
           : > "${env_file}"
           for kv in "${env_updates[@]}"; do
             key="${kv%%=*}"
@@ -347,11 +293,13 @@ jobs:
           done
 
           secret_updates=()
-          secret_updates+=("SB_SECRET_KEY=${SB_SECRET_KEY_SECRET_NAME}:latest")
           secret_updates+=("OBS_AQIDB_SECRET_KEY=${OBS_AQIDB_SECRET_KEY_SECRET_NAME}:latest")
-          secret_updates+=("SUPABASE_DB_URL=${SUPABASE_DB_URL_SECRET_NAME}:latest")
-          secret_updates+=("CFLARE_R2_ACCESS_KEY_ID=${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
-          secret_updates+=("CFLARE_R2_SECRET_ACCESS_KEY=${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}:latest")
+          if [ -n "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
+            secret_updates+=("CFLARE_R2_ACCESS_KEY_ID=${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
+          fi
+          if [ -n "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" ]; then
+            secret_updates+=("CFLARE_R2_SECRET_ACCESS_KEY=${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}:latest")
+          fi
           if [ -n "${DROPBOX_APP_KEY_SECRET_NAME:-}" ]; then
             secret_updates+=("DROPBOX_APP_KEY=${DROPBOX_APP_KEY_SECRET_NAME}:latest")
           fi
@@ -372,6 +320,8 @@ jobs:
           gcloud run deploy "${SERVICE_NAME}" \
             --region "${REGION}" \
             --image "${{ steps.build.outputs.image }}" \
+            --command "node" \
+            --args "workers/uk_aq_observs_partition_maintenance_service/server.mjs" \
             --service-account "${{ steps.service_accounts.outputs.runtime_sa }}" \
             --timeout "${SERVICE_TIMEOUT_SECONDS}" \
             --cpu "${SERVICE_CPU}" \

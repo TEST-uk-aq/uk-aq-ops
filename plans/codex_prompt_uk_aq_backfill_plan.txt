@@ -23,7 +23,7 @@ If you need to change any existing file, first check AGENTS.md and current repo 
 Goal:
 Add one new Cloud Run worker in uk-aq-ops with three run modes:
 - local_to_aggdaily
-- history_to_r2
+- obs_aqi_to_r2
 - source_to_all
 
 Important fixed decisions:
@@ -51,7 +51,7 @@ What I want delivered in this change:
    unless the repo has a better matching pattern
 2. Run mode routing for:
    - local_to_aggdaily
-   - history_to_r2
+   - obs_aqi_to_r2
    - source_to_all
 3. Manual trigger support matching current Cloud Run patterns in this repo
 4. Dry-run support
@@ -75,7 +75,7 @@ For local_to_aggdaily, implement:
 
 Do not:
 - fully implement source_to_all acquisition yet
-- fully implement history_to_r2 export yet
+- fully implement obs_aqi_to_r2 export yet
 - add unnecessary new infrastructure
 - move historic backfill through Ingest DB as the main path
 - change the existing R2 partition layout

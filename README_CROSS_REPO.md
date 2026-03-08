@@ -21,8 +21,8 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 ## Setup & run (lightweight)
 ### Required env vars (names only; discoverable in code)
 - `SUPABASE_URL`, `SB_SECRET_KEY`
-- `HISTORY_SUPABASE_URL`, `HISTORY_SECRET_KEY`
-- Service-specific vars documented in `README.md` and `system_docs/setup/*`.
+- `OBS_AQIDB_SUPABASE_URL`, `OBS_AQIDB_SECRET_KEY`
+- Service-specific vars documented in `README.md` and `system_docs/*`.
 
 ### Commands
 - See `README.md` for local run commands and deployment workflow references.
@@ -30,7 +30,7 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 ## Where to start
 - `README.md`
 - `workers/`
-- `system_docs/setup/`
+- `system_docs/`
 
 ## Conventions
 - Project-wide naming conventions live in ingest repo `AGENTS.md`.

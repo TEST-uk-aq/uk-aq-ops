@@ -50,7 +50,7 @@ Suggested worker path:
 
 Suggested trigger styles:
 - `trigger_mode=scheduler|manual`
-- `run_mode=local_to_aggdaily|history_to_r2|source_to_all`
+- `run_mode=local_to_aggdaily|obs_aqi_to_r2|source_to_all`
 
 Why this is the best fit:
 - matches the existing Ops Cloud Run pattern
@@ -72,9 +72,9 @@ Your draft names are understandable, but I would make them shorter and more oper
    - meaning: rebuild AggDaily from data already held in your stack
    - better than `backfill_aggdailydb_from_local` because it is shorter and still clear
 
-2. `history_to_r2`
+2. `obs_aqi_to_r2`
    - meaning: export historical observations from History DB into R2 backup layout
-   - better than `backfill_cflarer2_from_historydb` because it is shorter and matches source->destination naming
+   - better than `backfill_cflarer2_from_obs_aqidb` because it is shorter and matches source->destination naming
 
 3. `source_to_all`
    - meaning: acquire historic data from API/download/manual file and write it through the full pipeline
@@ -82,13 +82,13 @@ Your draft names are understandable, but I would make them shorter and more oper
 
 ### Alternative names if you want “backfill” visible everywhere
 - `backfill_local_to_aggdaily`
-- `backfill_history_to_r2`
+- `backfill_obs_aqi_to_r2`
 - `backfill_source_to_all`
 
 ### Recommendation
 Use the shorter forms internally and externally:
 - `local_to_aggdaily`
-- `history_to_r2`
+- `obs_aqi_to_r2`
 - `source_to_all`
 
 They are easier to type, easier to log, and consistent with source->destination semantics.
@@ -125,7 +125,7 @@ Recommended behavior:
 - support `connector_code`, `station_id`, and date-range filters
 - default to not touching already-complete days unless `--force` or equivalent is set
 
-### Mode B: `history_to_r2`
+### Mode B: `obs_aqi_to_r2`
 Purpose:
 Export historical raw observations already stored in History DB into the Phase B R2 layout.
 
@@ -249,7 +249,7 @@ DB-size effect:
 ## 7) Egress and cost recommendations
 
 ### Cloudflare R2
-Cloudflare documents that R2 has **no egress bandwidth charges** for any storage class, although reads still involve request operations and Infrequent Access also has retrieval fees. For your design, that means `history_to_r2` is usually safer from an egress-cost perspective than repeatedly reading large ranges back out of Supabase just to rebuild archive files. Source: Cloudflare R2 pricing docs.  
+Cloudflare documents that R2 has **no egress bandwidth charges** for any storage class, although reads still involve request operations and Infrequent Access also has retrieval fees. For your design, that means `obs_aqi_to_r2` is usually safer from an egress-cost perspective than repeatedly reading large ranges back out of Supabase just to rebuild archive files. Source: Cloudflare R2 pricing docs.  
 
 ### Supabase
 Supabase documents egress as network data transmitted out of the system, and its pricing page continues to show plan-specific DB size and egress quotas. That means heavy readback jobs from Ingest DB or History DB into Cloud Run can become the dominant egress/cost driver if you recompute broad historic windows inefficiently. Sources: Supabase pricing page and Supabase egress docs.  
@@ -307,7 +307,7 @@ Minimum columns to capture:
 - `run_mode`
 - `trigger_mode`
 - `connector_id` or `connector_code`
-- `source_kind` (`historydb`, `ingestdb`, `r2`, `api`, `download`, `manual_file`)
+- `source_kind` (`obs_aqidb`, `ingestdb`, `r2`, `api`, `download`, `manual_file`)
 - `window_from_utc`
 - `window_to_utc`
 - `day_utc`
@@ -376,7 +376,7 @@ This is the right approach for current networks and future ones because the acqu
 1. Build **one new Cloud Run worker in `uk-aq-ops` with three run modes**.
 2. Use these mode names:
    - `local_to_aggdaily`
-   - `history_to_r2`
+   - `obs_aqi_to_r2`
    - `source_to_all`
 3. Treat **History DB as the canonical local raw source** for historic work.
 4. Treat **R2 as the durable archive target**, not the primary compute source.
@@ -394,7 +394,7 @@ Phase 1:
 - easiest value, lowest external dependency risk
 
 Phase 2:
-- `history_to_r2`
+- `obs_aqi_to_r2`
 - extends archive completeness while staying inside your own stack
 
 Phase 3:

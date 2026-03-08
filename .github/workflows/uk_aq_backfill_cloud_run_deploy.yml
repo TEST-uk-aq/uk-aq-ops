@@ -48,7 +48,7 @@ jobs:
       SCHEDULER_TO_DAY_UTC: ${{ vars.GCP_BACKFILL_SCHEDULER_TO_DAY_UTC || vars.BACKFILL_SCHEDULER_TO_DAY_UTC || '' }}
       SCHEDULER_CONNECTOR_IDS_CSV: ${{ vars.GCP_BACKFILL_SCHEDULER_CONNECTOR_IDS_CSV || vars.BACKFILL_SCHEDULER_CONNECTOR_IDS_CSV || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
-      HISTORY_SUPABASE_URL: ${{ vars.HISTORY_SUPABASE_URL }}
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       AGGDAILY_SUPABASE_URL: ${{ vars.AGGDAILY_SUPABASE_URL }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
       UK_AQ_BACKFILL_OPS_SCHEMA: ${{ vars.UK_AQ_BACKFILL_OPS_SCHEMA || 'uk_aq_ops' }}
@@ -59,7 +59,7 @@ jobs:
       UK_AQ_BACKFILL_RPC_RETRIES: ${{ vars.UK_AQ_BACKFILL_RPC_RETRIES || '3' }}
       UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE: ${{ vars.UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE || '2000' }}
       UK_AQ_BACKFILL_INGEST_RETENTION_DAYS: ${{ vars.UK_AQ_BACKFILL_INGEST_RETENTION_DAYS || '7' }}
-      UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS: ${{ vars.UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS || '31' }}
+      UK_AQ_BACKFILL_OBS_AQI_LOCAL_RETENTION_DAYS: ${{ vars.UK_AQ_BACKFILL_OBS_AQI_LOCAL_RETENTION_DAYS || '31' }}
       UK_AQ_BACKFILL_LOCAL_TIMEZONE: ${{ vars.UK_AQ_BACKFILL_LOCAL_TIMEZONE || 'Europe/London' }}
       UK_AQ_BACKFILL_LEDGER_ENABLED: ${{ vars.UK_AQ_BACKFILL_LEDGER_ENABLED || 'true' }}
       UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER: ${{ vars.UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER || 'true' }}
@@ -67,10 +67,10 @@ jobs:
       UK_AQ_BACKFILL_METADATA_SCHEMA: ${{ vars.UK_AQ_BACKFILL_METADATA_SCHEMA || 'uk_aq_core' }}
       UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE: ${{ vars.UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE || '1000' }}
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
-      HISTORY_SECRET_KEY: ${{ secrets.HISTORY_SECRET_KEY }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
       AGGDAILY_SECRET_KEY: ${{ secrets.AGGDAILY_SECRET_KEY }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
-      HISTORY_SECRET_KEY_SECRET_NAME: ${{ vars.HISTORY_SECRET_KEY_SECRET_NAME || 'HISTORY_SECRET_KEY' }}
+      OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
       AGGDAILY_SECRET_KEY_SECRET_NAME: ${{ vars.AGGDAILY_SECRET_KEY_SECRET_NAME || 'AGGDAILY_SECRET_KEY' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
@@ -98,8 +98,8 @@ jobs:
             echo "Missing required variable: SUPABASE_URL"
             exit 1
           fi
-          if [ -z "${HISTORY_SUPABASE_URL:-}" ]; then
-            echo "Missing required variable: HISTORY_SUPABASE_URL"
+          if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ]; then
+            echo "Missing required variable: OBS_AQIDB_SUPABASE_URL"
             exit 1
           fi
           if [ -z "${AGGDAILY_SUPABASE_URL:-}" ]; then
@@ -196,7 +196,7 @@ jobs:
           }
 
           upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1
-          upsert_secret "${HISTORY_SECRET_KEY_SECRET_NAME}" "${HISTORY_SECRET_KEY}" 1
+          upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
           upsert_secret "${AGGDAILY_SECRET_KEY_SECRET_NAME}" "${AGGDAILY_SECRET_KEY}" 1
 
       - name: Build Cloud Run env and secret args
@@ -243,12 +243,12 @@ jobs:
           }
 
           require_env SUPABASE_URL
-          require_env HISTORY_SUPABASE_URL
+          require_env OBS_AQIDB_SUPABASE_URL
           require_env AGGDAILY_SUPABASE_URL
 
           env_updates=()
           add_env SUPABASE_URL
-          add_env HISTORY_SUPABASE_URL
+          add_env OBS_AQIDB_SUPABASE_URL
           add_env AGGDAILY_SUPABASE_URL
           add_env UK_AQ_PUBLIC_SCHEMA
           add_env UK_AQ_BACKFILL_OPS_SCHEMA
@@ -259,7 +259,7 @@ jobs:
           add_env UK_AQ_BACKFILL_RPC_RETRIES
           add_env UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE
           add_env UK_AQ_BACKFILL_INGEST_RETENTION_DAYS
-          add_env UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS
+          add_env UK_AQ_BACKFILL_OBS_AQI_LOCAL_RETENTION_DAYS
           add_env UK_AQ_BACKFILL_LOCAL_TIMEZONE
           add_env UK_AQ_BACKFILL_LEDGER_ENABLED
           add_env UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER
@@ -270,7 +270,7 @@ jobs:
 
           secret_updates=()
           add_secret_binding "SB_SECRET_KEY" "${SB_SECRET_KEY_SECRET_NAME}" 1
-          add_secret_binding "HISTORY_SECRET_KEY" "${HISTORY_SECRET_KEY_SECRET_NAME}" 1
+          add_secret_binding "OBS_AQIDB_SECRET_KEY" "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" 1
           add_secret_binding "AGGDAILY_SECRET_KEY" "${AGGDAILY_SECRET_KEY_SECRET_NAME}" 1
 
           env_file="${RUNNER_TEMP}/uk-aq-backfill-env.yaml"

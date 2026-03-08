@@ -7,7 +7,7 @@ create schema if not exists uk_aq_ops;
 
 create table if not exists uk_aq_ops.backfill_runs (
   run_id uuid primary key,
-  run_mode text not null check (run_mode in ('local_to_aggdaily', 'history_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aggdaily', 'obs_aqi_to_r2', 'source_to_all')),
   trigger_mode text not null check (trigger_mode in ('manual', 'scheduler')),
   window_from_utc date not null,
   window_to_utc date not null,
@@ -32,10 +32,10 @@ create index if not exists backfill_runs_started_at_idx
 create table if not exists uk_aq_ops.backfill_run_days (
   id bigserial primary key,
   run_id uuid not null references uk_aq_ops.backfill_runs(run_id) on delete cascade,
-  run_mode text not null check (run_mode in ('local_to_aggdaily', 'history_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aggdaily', 'obs_aqi_to_r2', 'source_to_all')),
   day_utc date not null,
   connector_id integer not null,
-  source_kind text not null check (source_kind in ('ingestdb', 'historydb', 'r2', 'api', 'download', 'manual_file', 'none')),
+  source_kind text not null check (source_kind in ('ingestdb', 'obs_aqidb', 'r2', 'api', 'download', 'manual_file', 'none')),
   status text not null check (status in ('planned', 'in_progress', 'complete', 'skipped', 'error', 'dry_run', 'stubbed')),
   rows_read bigint not null default 0,
   rows_written_aggdaily bigint not null default 0,
@@ -55,10 +55,10 @@ create index if not exists backfill_run_days_lookup_idx
   on uk_aq_ops.backfill_run_days (run_mode, day_utc desc, connector_id);
 
 create table if not exists uk_aq_ops.backfill_checkpoints (
-  run_mode text not null check (run_mode in ('local_to_aggdaily', 'history_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aggdaily', 'obs_aqi_to_r2', 'source_to_all')),
   day_utc date not null,
   connector_id integer not null,
-  source_kind text not null check (source_kind in ('ingestdb', 'historydb', 'r2', 'api', 'download', 'manual_file', 'none')),
+  source_kind text not null check (source_kind in ('ingestdb', 'obs_aqidb', 'r2', 'api', 'download', 'manual_file', 'none')),
   status text not null check (status in ('complete', 'error', 'dry_run', 'skipped')),
   rows_read bigint not null default 0,
   rows_written_aggdaily bigint not null default 0,
@@ -75,7 +75,7 @@ create index if not exists backfill_checkpoints_day_connector_idx
 create table if not exists uk_aq_ops.backfill_errors (
   id bigserial primary key,
   run_id uuid,
-  run_mode text not null check (run_mode in ('local_to_aggdaily', 'history_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aggdaily', 'obs_aqi_to_r2', 'source_to_all')),
   day_utc date,
   connector_id integer,
   source_kind text,

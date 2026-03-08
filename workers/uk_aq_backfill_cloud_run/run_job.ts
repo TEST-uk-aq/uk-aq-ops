@@ -18,13 +18,13 @@ import {
   utcDayStartIso,
 } from "./backfill_core.mjs";
 
-type RunMode = "local_to_aggdaily" | "history_to_r2" | "source_to_all";
+type RunMode = "local_to_aggdaily" | "obs_aqi_to_r2" | "source_to_all";
 type TriggerMode = "scheduler" | "manual";
-type SourceKind = "ingestdb" | "historydb" | "r2";
+type SourceKind = "ingestdb" | "obs_aqidb" | "r2";
 type RunStatus = "ok" | "error" | "dry_run" | "stubbed";
 
 type SourceDbConfig = {
-  kind: "ingestdb" | "historydb";
+  kind: "ingestdb" | "obs_aqidb";
   base_url: string;
   privileged_key: string;
 };
@@ -111,7 +111,7 @@ type LocalToAggDailySummary = {
 };
 
 type StubModeSummary = {
-  mode: "history_to_r2" | "source_to_all";
+  mode: "obs_aqi_to_r2" | "source_to_all";
   run_id: string;
   stubbed: true;
   message: string;
@@ -119,16 +119,16 @@ type StubModeSummary = {
   to_day_utc: string;
   days_planned: number;
   retention_window?: Record<string, unknown>;
-  history_write_eligible_days?: string[];
-  history_write_skipped_days?: string[];
+  observs_write_eligible_days?: string[];
+  observs_write_skipped_days?: string[];
 };
 
 type RunSummary = LocalToAggDailySummary | StubModeSummary;
 
 const INGEST_SUPABASE_URL = optionalEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = optionalEnvAny(["SB_SECRET_KEY"]);
-const HISTORY_SUPABASE_URL = optionalEnv("HISTORY_SUPABASE_URL");
-const HISTORY_PRIVILEGED_KEY = optionalEnv("HISTORY_SECRET_KEY");
+const OBS_AQIDB_SUPABASE_URL = optionalEnv("OBS_AQIDB_SUPABASE_URL");
+const OBS_AQI_PRIVILEGED_KEY = optionalEnv("OBS_AQIDB_SECRET_KEY");
 const AGGDAILY_SUPABASE_URL = optionalEnv("AGGDAILY_SUPABASE_URL");
 const AGGDAILY_PRIVILEGED_KEY = optionalEnv("AGGDAILY_SECRET_KEY");
 
@@ -193,8 +193,8 @@ const INGEST_RETENTION_DAYS = parsePositiveInt(
   1,
   14,
 );
-const HISTORY_LOCAL_RETENTION_DAYS = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_HISTORY_LOCAL_RETENTION_DAYS"),
+const OBS_AQI_LOCAL_RETENTION_DAYS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_OBS_AQI_LOCAL_RETENTION_DAYS"),
   31,
   1,
   120,
@@ -292,7 +292,7 @@ function asErrorMessage(payload: unknown, status: number): string {
   return `HTTP ${status}`;
 }
 
-function buildSourceDb(kind: "ingestdb" | "historydb"): SourceDbConfig | null {
+function buildSourceDb(kind: "ingestdb" | "obs_aqidb"): SourceDbConfig | null {
   if (kind === "ingestdb") {
     if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
       return null;
@@ -304,19 +304,19 @@ function buildSourceDb(kind: "ingestdb" | "historydb"): SourceDbConfig | null {
     };
   }
 
-  if (!(HISTORY_SUPABASE_URL && HISTORY_PRIVILEGED_KEY)) {
+  if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return null;
   }
   return {
     kind,
-    base_url: HISTORY_SUPABASE_URL,
-    privileged_key: HISTORY_PRIVILEGED_KEY,
+    base_url: OBS_AQIDB_SUPABASE_URL,
+    privileged_key: OBS_AQI_PRIVILEGED_KEY,
   };
 }
 
-const SOURCE_DB_BY_KIND: Record<"ingestdb" | "historydb", SourceDbConfig | null> = {
+const SOURCE_DB_BY_KIND: Record<"ingestdb" | "obs_aqidb", SourceDbConfig | null> = {
   ingestdb: buildSourceDb("ingestdb"),
-  historydb: buildSourceDb("historydb"),
+  obs_aqidb: buildSourceDb("obs_aqidb"),
 };
 
 const stationIdCache = new Map<number, number[]>();
@@ -767,7 +767,7 @@ async function fetchStationIdsForConnector(connectorId: number): Promise<number[
 }
 
 async function fetchConnectorCountsForDay(
-  sourceKind: "ingestdb" | "historydb",
+  sourceKind: "ingestdb" | "obs_aqidb",
   dayStartIso: string,
   dayEndIso: string,
 ): Promise<Map<number, number>> {
@@ -814,13 +814,13 @@ async function fetchConnectorCountsForDay(
 
 function connectorListFromCounts(
   ingestCounts: Map<number, number>,
-  historyCounts: Map<number, number>,
+  observsCounts: Map<number, number>,
 ): number[] {
   const connectorIds = new Set<number>();
   for (const key of ingestCounts.keys()) {
     connectorIds.add(key);
   }
-  for (const key of historyCounts.keys()) {
+  for (const key of observsCounts.keys()) {
     connectorIds.add(key);
   }
   return Array.from(connectorIds).sort((left, right) => left - right);
@@ -830,7 +830,7 @@ function chooseSourceForConnector(
   dayUtc: string,
   connectorId: number,
   ingestCounts: Map<number, number>,
-  historyCounts: Map<number, number>,
+  observsCounts: Map<number, number>,
 ): SourceKind | null {
   const prefersIngest = isDayLikelyInIngestWindow({
     dayUtc,
@@ -838,12 +838,12 @@ function chooseSourceForConnector(
     ingestRetentionDays: INGEST_RETENTION_DAYS,
   });
 
-  const orderedSources: Array<"ingestdb" | "historydb"> = prefersIngest
-    ? ["ingestdb", "historydb"]
-    : ["historydb", "ingestdb"];
+  const orderedSources: Array<"ingestdb" | "obs_aqidb"> = prefersIngest
+    ? ["ingestdb", "obs_aqidb"]
+    : ["obs_aqidb", "ingestdb"];
 
   for (const sourceKind of orderedSources) {
-    const counts = sourceKind === "ingestdb" ? ingestCounts : historyCounts;
+    const counts = sourceKind === "ingestdb" ? ingestCounts : observsCounts;
     const sourceConfig = SOURCE_DB_BY_KIND[sourceKind];
     if (!sourceConfig) {
       continue;
@@ -861,7 +861,7 @@ function chooseSourceForConnector(
 }
 
 async function fetchSourceRowsForConnector(
-  sourceKind: "ingestdb" | "historydb",
+  sourceKind: "ingestdb" | "obs_aqidb",
   connectorId: number,
   lookbackStartIso: string,
   dayEndIso: string,
@@ -1322,8 +1322,8 @@ async function runLocalToAggDaily(
   if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
     throw new Error("local_to_aggdaily requires SUPABASE_URL + SB_SECRET_KEY");
   }
-  if (!(HISTORY_SUPABASE_URL && HISTORY_PRIVILEGED_KEY)) {
-    throw new Error("local_to_aggdaily requires HISTORY_SUPABASE_URL + HISTORY_SECRET_KEY");
+  if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
+    throw new Error("local_to_aggdaily requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
   }
   if (!(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
     throw new Error("local_to_aggdaily requires AGGDAILY_SUPABASE_URL + AGGDAILY_SECRET_KEY");
@@ -1361,9 +1361,9 @@ async function runLocalToAggDaily(
     });
 
     const ingestCounts = await fetchConnectorCountsForDay("ingestdb", dayStartIso, dayEndIso);
-    const historyCounts = await fetchConnectorCountsForDay("historydb", dayStartIso, dayEndIso);
+    const observsCounts = await fetchConnectorCountsForDay("obs_aqidb", dayStartIso, dayEndIso);
 
-    const connectors = CONNECTOR_IDS || connectorListFromCounts(ingestCounts, historyCounts);
+    const connectors = CONNECTOR_IDS || connectorListFromCounts(ingestCounts, observsCounts);
 
     if (!connectors.length) {
       logStructured("warning", "local_to_aggdaily_day_no_connectors", {
@@ -1378,14 +1378,14 @@ async function runLocalToAggDaily(
         dayUtc,
         connectorId,
         ingestCounts,
-        historyCounts,
+        observsCounts,
       );
 
       if (!sourceKind) {
         const noSourceResult: LocalToAggDailyDayConnectorResult = {
           day_utc: dayUtc,
           connector_id: connectorId,
-          source_kind: "historydb",
+          source_kind: "obs_aqidb",
           status: "skipped",
           skip_reason: "no_source_rows",
           rows_read: 0,
@@ -1685,12 +1685,12 @@ async function runLocalToAggDaily(
   return summary;
 }
 
-async function runHistoryToR2Stub(
+async function runObservsToR2Stub(
   runId: string,
   window: { from_day_utc: string; to_day_utc: string },
 ): Promise<StubModeSummary> {
   return {
-    mode: "history_to_r2",
+    mode: "obs_aqi_to_r2",
     run_id: runId,
     stubbed: true,
     message: "Phase 1 stub: mode wiring and trigger plumbing only. Pipeline implementation is pending.",
@@ -1707,18 +1707,18 @@ async function runSourceToAllStub(
   const retentionWindow = computeRollingLocalRetentionWindow({
     nowUtc: new Date(),
     timeZone: LOCAL_TIMEZONE,
-    localRetentionDays: HISTORY_LOCAL_RETENTION_DAYS,
+    localRetentionDays: OBS_AQI_LOCAL_RETENTION_DAYS,
   });
 
   const days = buildBackwardDayRange(window.from_day_utc, window.to_day_utc);
-  const historyWriteEligibleDays: string[] = [];
-  const historyWriteSkippedDays: string[] = [];
+  const observsWriteEligibleDays: string[] = [];
+  const observsWriteSkippedDays: string[] = [];
 
   for (const dayUtc of days) {
     if (isDayInRollingRetentionWindow(dayUtc, retentionWindow)) {
-      historyWriteEligibleDays.push(dayUtc);
+      observsWriteEligibleDays.push(dayUtc);
     } else {
-      historyWriteSkippedDays.push(dayUtc);
+      observsWriteSkippedDays.push(dayUtc);
     }
   }
 
@@ -1727,13 +1727,13 @@ async function runSourceToAllStub(
     run_id: runId,
     stubbed: true,
     message:
-      "Phase 1 stub: mode wiring only. Retention-boundary helper is active and classifies history-write eligible vs skipped days.",
+      "Phase 1 stub: mode wiring only. Retention-boundary helper is active and classifies observs-write eligible vs skipped days.",
     from_day_utc: window.from_day_utc,
     to_day_utc: window.to_day_utc,
     days_planned: days.length,
     retention_window: retentionWindow,
-    history_write_eligible_days: historyWriteEligibleDays,
-    history_write_skipped_days: historyWriteSkippedDays,
+    observs_write_eligible_days: observsWriteEligibleDays,
+    observs_write_skipped_days: observsWriteSkippedDays,
   };
 }
 
@@ -1756,7 +1756,7 @@ async function main(): Promise<void> {
     to_day_utc: window.to_day_utc,
     connector_ids: CONNECTOR_IDS,
     ingest_retention_days: INGEST_RETENTION_DAYS,
-    history_local_retention_days: HISTORY_LOCAL_RETENTION_DAYS,
+    observs_local_retention_days: OBS_AQI_LOCAL_RETENTION_DAYS,
     local_timezone: LOCAL_TIMEZONE,
     ledger_enabled: ledgerEnabled,
   });
@@ -1772,8 +1772,8 @@ async function main(): Promise<void> {
         runStatus = "error";
         errorMessage = `local_to_aggdaily encountered ${summary.connector_day_error} connector-day errors`;
       }
-    } else if (RUN_MODE === "history_to_r2") {
-      summary = await runHistoryToR2Stub(runId, window);
+    } else if (RUN_MODE === "obs_aqi_to_r2") {
+      summary = await runObservsToR2Stub(runId, window);
       runStatus = "stubbed";
     } else {
       summary = await runSourceToAllStub(runId, window);

@@ -9,9 +9,9 @@
   "scripts": {
     "start": "node workers/uk_aq_prune_daily/server.mjs",
     "start:prune": "node workers/uk_aq_prune_daily/server.mjs",
-    "start:flush": "node workers/uk_aq_history_outbox_flush_service/server.mjs",
-    "start:history-partitions": "node workers/uk_aq_history_partition_maintenance_service/server.mjs",
-    "check": "node --check workers/shared/r2_sigv4.mjs && node --check workers/uk_aq_prune_daily/phase_b_backup_r2.mjs && node --check workers/uk_aq_prune_daily/server.mjs && node --check workers/uk_aq_history_outbox_flush_service/server.mjs && node --check workers/uk_aq_history_partition_maintenance_service/server.mjs && node --check workers/uk_aq_aqi_history_r2_test_worker/worker.mjs && node --check scripts/backup_r2/download_day.mjs && node --check scripts/backup_r2/uk_aq_aqi_history_r2_test_seed.mjs",
+    "start:flush": "node workers/uk_aq_observs_outbox_flush_service/server.mjs",
+    "start:observs-partitions": "node workers/uk_aq_observs_partition_maintenance_service/server.mjs",
+    "check": "node --check workers/shared/r2_sigv4.mjs && node --check workers/uk_aq_prune_daily/phase_b_backup_r2.mjs && node --check workers/uk_aq_prune_daily/server.mjs && node --check workers/uk_aq_observs_outbox_flush_service/server.mjs && node --check workers/uk_aq_observs_partition_maintenance_service/server.mjs && node --check workers/uk_aq_aqi_history_r2_test_worker/worker.mjs && node --check scripts/backup_r2/download_day.mjs && node --check scripts/backup_r2/uk_aq_aqi_history_r2_test_seed.mjs",
     "test": "node --test tests/**/*.test.mjs",
     "backup:download-day": "node scripts/backup_r2/download_day.mjs"
   },

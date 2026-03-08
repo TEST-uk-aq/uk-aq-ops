@@ -2,19 +2,19 @@
 
 Cloud Run operations services for:
 
-- pruning verified ingest rows after parity checks against history
-- flushing ingest history outbox rows into history DB
-- maintaining history DB partitions/index policy/retention
-- logging ingest/history database size samples
-- running operational backfill workflows across ingest/history/aggdaily
+- pruning verified ingest rows after parity checks against `obs_aqidb` (`uk_aq_observs`)
+- flushing ingest outbox rows into `obs_aqidb` (`uk_aq_observs`)
+- maintaining `uk_aq_observs` partitions/index policy/retention
+- logging ingest/obs_aqidb database size samples
+- running operational backfill workflows across ingest/obs_aqidb/aggdaily
 
 ## Worker layout
 
 Each gcloud-facing service now lives under `workers/`:
 
 - `workers/uk_aq_prune_daily/server.mjs`
-- `workers/uk_aq_history_outbox_flush_service/server.mjs`
-- `workers/uk_aq_history_partition_maintenance_service/server.mjs`
+- `workers/uk_aq_observs_outbox_flush_service/server.mjs`
+- `workers/uk_aq_observs_partition_maintenance_service/server.mjs`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
 - `workers/uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`
 - `workers/uk_aq_backfill_cloud_run/run_service.ts`
@@ -24,7 +24,7 @@ Each gcloud-facing service now lives under `workers/`:
 ### 1) UK AQ Prune Daily (`workers/uk_aq_prune_daily/server.mjs`)
 
 - `POST /run`
-- verifies hourly fingerprints (ingest vs history)
+- verifies hourly fingerprints (ingest vs `obs_aqidb` `uk_aq_observs`)
 - prunes only verified ingest hour buckets
 - can repair mismatches through outbox replay before re-check
 - Phase B backup uses server-side projection + resume checkpoints so failed exports can continue without re-reading completed parts
@@ -32,9 +32,9 @@ Each gcloud-facing service now lives under `workers/`:
 Required env:
 
 - `SUPABASE_URL`
-- `HISTORY_SUPABASE_URL`
+- `OBS_AQIDB_SUPABASE_URL`
 - `SB_SECRET_KEY`
-- `HISTORY_SECRET_KEY`
+- `OBS_AQIDB_SECRET_KEY`
 - `SUPABASE_DB_URL` (direct Postgres URL for streaming Phase B backup reads)
 - `CFLARE_R2_ENDPOINT`
 - one bucket mapping: `R2_BUCKET_PROD` / `R2_BUCKET_STAGE` / `R2_BUCKET_DEV` (or fallback `CFLARE_R2_BUCKET`)
@@ -59,14 +59,14 @@ Primary controls:
 - `BACKUP_RUNS_PREFIX` (default `backup/runs`)
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
 
-### 2) History Outbox Flush (`workers/uk_aq_history_outbox_flush_service/server.mjs`)
+### 2) Observs Outbox Flush (`workers/uk_aq_observs_outbox_flush_service/server.mjs`)
 
 - `POST /run`
 - claims outbox rows in ingest DB
-- upserts to history DB
+- upserts to `obs_aqidb` (`uk_aq_observs`)
 - writes receipts and resolves outbox rows
 
-### 3) History Partition Maintenance (`workers/uk_aq_history_partition_maintenance_service/server.mjs`)
+### 3) Observs Partition Maintenance (`workers/uk_aq_observs_partition_maintenance_service/server.mjs`)
 
 - `POST /run`
 - ensures daily partitions, enforces hot/cold indexes
@@ -77,7 +77,7 @@ Primary controls:
 
 - `GET /` health
 - `POST /` executes logger job
-- samples ingest + history DB size via RPC (optional aggdaily)
+- samples ingest + obs_aqidb DB cluster size via RPC (optional aggdaily)
 - upserts metrics and runs retention cleanup in each source DB's local metrics table
 - default GitHub deploy keeps Cloud Scheduler disabled; Supabase `pg_cron` is the primary hourly scheduler
 
@@ -85,7 +85,7 @@ Primary controls:
 
 - `GET /v1/db-size-metrics`
 - dashboard fan-in endpoint for DB size trend rows
-- reads `uk_aq_public.uk_aq_db_size_metrics_hourly` from ingest + history + optional aggdaily
+- reads `uk_aq_public.uk_aq_db_size_metrics_hourly` from ingest + obs_aqidb + optional aggdaily
 - preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
 - optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 
@@ -105,12 +105,12 @@ Primary controls:
 - `POST /run` executes backfill job (alias)
 - run modes:
   - `local_to_aggdaily` (Phase 1 implemented)
-  - `history_to_r2` (Phase 1 stubbed)
+  - `obs_aqi_to_r2` (Phase 1 stubbed)
   - `source_to_all` (Phase 1 stubbed)
 - `local_to_aggdaily` behavior:
   - UTC-day backfill with newest day first
   - optional connector filter
-  - source priority: ingest -> history -> explicit R2 fallback
+  - source priority: ingest -> obs_aqidb -> explicit R2 History fallback
   - default skip if checkpoint already complete; `force_replace` bypasses skip
   - dry-run support with write estimates
   - minimal run/day/checkpoint ledger wiring in `uk_aq_ops` (if schema is applied)
@@ -121,7 +121,7 @@ Primary controls:
 npm install
 npm run start:prune
 npm run start:flush
-npm run start:history-partitions
+npm run start:observs-partitions
 deno run --allow-env --allow-net --allow-read --allow-write --allow-run workers/uk_aq_backfill_cloud_run/run_service.ts
 ```
 
@@ -169,20 +169,20 @@ uk_aq_sync_github_secrets \
 Apply in Supabase SQL editor:
 
 - `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/ingest_db/ingest_db_ops_rpcs.sql` (ingest DB)
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/history_db/history_db_ops_rpcs.sql` (history DB)
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/observs_db/observs_db_ops_rpcs.sql` (obs_aqidb / `uk_aq_observs`)
 
 ## Deployment workflows
 
 - `/.github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml`
-- `/.github/workflows/uk_aq_history_outbox_flush_service_cloud_run_deploy.yml`
-- `/.github/workflows/uk_aq_history_partition_maintenance_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_observs_outbox_flush_service_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_aqi_station_aggdaily_cloud_run_deploy.yml`
 
 ## Setup docs
 
-- `system_docs/setup/uk-aq-ingestdb-prune.md`
-- `system_docs/setup/uk-aq-history-outbox-flush-service.md`
-- `system_docs/setup/uk-aq-history-partition-maintenance.md`
-- `system_docs/setup/uk-aq-aqi-station-aggdaily.md`
-- `system_docs/setup/uk-aq-backfill-cloud-run.md`
+- `system_docs/uk-aq-ingestdb-prune.md`
+- `system_docs/uk-aq-observs-outbox-flush-service.md`
+- `system_docs/uk-aq-observs-partition-maintenance.md`
+- `system_docs/uk-aq-aqi-station-aggdaily.md`
+- `system_docs/uk-aq-backfill-cloud-run.md`

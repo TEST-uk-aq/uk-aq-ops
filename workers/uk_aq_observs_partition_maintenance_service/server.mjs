@@ -2,14 +2,14 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { createClient } from "@supabase/supabase-js";
 
-const HISTORY_TIME_ZONE = "Europe/London";
+const OBSERVS_TIME_ZONE = "Europe/London";
 
 const RPC_SCHEMA = "uk_aq_public";
-const RPC_ENSURE_PARTITIONS = "uk_aq_rpc_history_ensure_daily_partitions";
-const RPC_ENFORCE_HOT_COLD_INDEXES = "uk_aq_rpc_history_enforce_hot_cold_indexes";
-const RPC_DEFAULT_DIAGNOSTICS = "uk_aq_rpc_history_observations_default_diagnostics";
-const RPC_DROP_CANDIDATES = "uk_aq_rpc_history_drop_candidates";
-const RPC_DROP_PARTITION = "uk_aq_rpc_history_drop_partition";
+const RPC_ENSURE_PARTITIONS = "uk_aq_rpc_observs_ensure_daily_partitions";
+const RPC_ENFORCE_HOT_COLD_INDEXES = "uk_aq_rpc_observs_enforce_hot_cold_indexes";
+const RPC_DEFAULT_DIAGNOSTICS = "uk_aq_rpc_observs_observations_default_diagnostics";
+const RPC_DROP_CANDIDATES = "uk_aq_rpc_observs_drop_candidates";
+const RPC_DROP_PARTITION = "uk_aq_rpc_observs_drop_partition";
 
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -21,14 +21,14 @@ const DEFAULT_DEFAULT_TOP_N = 20;
 const DEFAULT_DROP_DRY_RUN = false;
 
 const LONDON_DATE_FORMATTER = new Intl.DateTimeFormat("en-GB", {
-  timeZone: HISTORY_TIME_ZONE,
+  timeZone: OBSERVS_TIME_ZONE,
   year: "numeric",
   month: "2-digit",
   day: "2-digit",
 });
 
 const LONDON_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-GB", {
-  timeZone: HISTORY_TIME_ZONE,
+  timeZone: OBSERVS_TIME_ZONE,
   year: "numeric",
   month: "2-digit",
   day: "2-digit",
@@ -124,10 +124,10 @@ function dropboxWithRoot(path) {
   return `${root}${cleaned}`;
 }
 
-function historyMaintenanceDropboxFolderPath() {
-  const configured = (process.env.UK_AQ_HISTORY_PARTITION_DROPBOX_FOLDER || "/history_partition_maintenance").trim();
+function observsMaintenanceDropboxFolderPath() {
+  const configured = (process.env.UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER || "/observs_partition_maintenance").trim();
   const folder = dropboxWithRoot(configured);
-  return folder || "/history_partition_maintenance";
+  return folder || "/observs_partition_maintenance";
 }
 
 function formatCompactUtc(ts) {
@@ -149,8 +149,8 @@ function shouldUploadDropbox() {
     return true;
   }
   const candidates = [
-    (process.env.HISTORY_SUPABASE_URL || "").trim(),
-    (process.env.HISTORY_URL || "").trim(),
+    (process.env.OBS_AQIDB_SUPABASE_URL || "").trim(),
+    (process.env.OBS_AQIDB_SUPABASE_URL || "").trim(),
     (process.env.SUPABASE_URL || "").trim(),
     (process.env.SB_URL || "").trim(),
   ].filter(Boolean);
@@ -223,7 +223,7 @@ async function uploadJsonToDropbox(payload, dropboxPath) {
 }
 
 async function uploadMaintenanceLogToDropbox(eventType, payload, createdAt, id) {
-  const folder = historyMaintenanceDropboxFolderPath();
+  const folder = observsMaintenanceDropboxFolderPath();
   const dateFolder = createdAt.slice(0, 10);
   const fileName = buildMaintenanceFileName(eventType, createdAt, id);
   const dropboxPath = `${folder}/${dateFolder}/${fileName}`;
@@ -335,41 +335,41 @@ function computeRetentionCutoffUtc(now, completeLocalDays) {
   );
 }
 
-function buildHistoryConfig(url) {
+function buildObservsConfig(url) {
   const params = url.searchParams;
 
   const futurePartitionDays = parsePositiveInt(
-    params.get("futureDays") ?? process.env.HISTORY_PARTITIONS_FUTURE_DAYS,
+    params.get("futureDays") ?? process.env.OBSERVS_PARTITIONS_FUTURE_DAYS,
     DEFAULT_FUTURE_PARTITION_DAYS,
     DEFAULT_FUTURE_PARTITION_DAYS,
     DEFAULT_FUTURE_PARTITION_DAYS,
   );
   const hotPartitionDays = parsePositiveInt(
-    params.get("hotDays") ?? process.env.HISTORY_PARTITIONS_HOT_DAYS,
+    params.get("hotDays") ?? process.env.OBSERVS_PARTITIONS_HOT_DAYS,
     DEFAULT_HOT_PARTITION_DAYS,
     1,
     10,
   );
   const completeLocalDays = parsePositiveInt(
-    params.get("completeLocalDays") ?? process.env.HISTORY_COMPLETE_LOCAL_DAYS,
+    params.get("completeLocalDays") ?? process.env.OBSERVS_COMPLETE_LOCAL_DAYS,
     DEFAULT_COMPLETE_LOCAL_DAYS,
     1,
     365,
   );
   const defaultTopN = parsePositiveInt(
-    params.get("defaultTopN") ?? process.env.HISTORY_DEFAULT_TOP_N,
+    params.get("defaultTopN") ?? process.env.OBSERVS_DEFAULT_TOP_N,
     DEFAULT_DEFAULT_TOP_N,
     1,
     200,
   );
   const dropDryRun = parseBoolean(
-    params.get("dropDryRun") ?? process.env.HISTORY_PARTITION_DROP_DRY_RUN,
+    params.get("dropDryRun") ?? process.env.OBSERVS_PARTITION_DROP_DRY_RUN,
     DEFAULT_DROP_DRY_RUN,
   );
 
   return {
-    historySupabaseUrl: requiredEnvAny(["HISTORY_SUPABASE_URL", "HISTORY_URL"]),
-    historySecretKey: requiredEnvAny(["HISTORY_SECRET_KEY"]),
+    observsSupabaseUrl: requiredEnvAny(["OBS_AQIDB_SUPABASE_URL"]),
+    observsSecretKey: requiredEnvAny(["OBS_AQIDB_SECRET_KEY"]),
     futurePartitionDays,
     hotPartitionDays,
     completeLocalDays,
@@ -385,7 +385,7 @@ function buildHistoryConfig(url) {
       observationsPrefix: (
         process.env.CFLARE_R2_OBSERVATIONS_PREFIX
         || process.env.R2_OBSERVATIONS_PREFIX
-        || "uk_aq_history/observations"
+        || "history/v1/observations"
       ).trim().replace(/^\/+|\/+$/g, ""),
     },
   };
@@ -677,9 +677,9 @@ function parseDefaultDiagnosticsRow(row) {
   };
 }
 
-async function runHistoryPartitionMaintenance(config) {
+async function runObservsPartitionMaintenance(config) {
   const runId = randomUUID();
-  const historyClient = createClient(config.historySupabaseUrl, config.historySecretKey, {
+  const observsClient = createClient(config.observsSupabaseUrl, config.observsSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
     db: { schema: RPC_SCHEMA },
   });
@@ -703,7 +703,7 @@ async function runHistoryPartitionMaintenance(config) {
   const cutoffFloorDayUtc = retentionCutoffIso.slice(0, 10);
   const ensureStartDayUtc = minIsoDate(hotStartDayUtc, cutoffFloorDayUtc);
 
-  logStructured("INFO", "history_partition_maintenance_run_start", {
+  logStructured("INFO", "observs_partition_maintenance_run_start", {
     run_id: runId,
     now_utc: now.toISOString(),
     hot_start_day_utc: hotStartDayUtc,
@@ -716,32 +716,32 @@ async function runHistoryPartitionMaintenance(config) {
   });
 
   const ensured = await callRpc(
-    historyClient,
+    observsClient,
     RPC_ENSURE_PARTITIONS,
     {
       start_day_utc: ensureStartDayUtc,
       end_day_utc: futureEndDayUtc,
     },
-    "history ensure daily partitions",
+    "observs ensure daily partitions",
   );
 
   const enforceResults = await callRpc(
-    historyClient,
+    observsClient,
     RPC_ENFORCE_HOT_COLD_INDEXES,
     {
       hot_start_day_utc: hotStartDayUtc,
       hot_end_day_utc: hotEndDayUtc,
     },
-    "history enforce hot/cold indexes",
+    "observs enforce hot/cold indexes",
   );
 
   const diagnosticsRows = await callRpc(
-    historyClient,
+    observsClient,
     RPC_DEFAULT_DIAGNOSTICS,
     {
       top_n: config.defaultTopN,
     },
-    "history default partition diagnostics",
+    "observs default partition diagnostics",
   );
   const defaultDiagnostics = parseDefaultDiagnosticsRow(diagnosticsRows[0]);
 
@@ -753,7 +753,7 @@ async function runHistoryPartitionMaintenance(config) {
       generated_at: nowIso(),
       diagnostics: defaultDiagnostics,
     };
-    logStructured("WARNING", "history_default_partition_non_zero", {
+    logStructured("WARNING", "observs_default_partition_non_zero", {
       run_id: runId,
       default_row_count: defaultDiagnostics.default_row_count,
       min_observed_at: defaultDiagnostics.min_observed_at,
@@ -763,7 +763,7 @@ async function runHistoryPartitionMaintenance(config) {
 
     try {
       defaultDropboxUpload = await uploadMaintenanceLogToDropbox(
-        "history_default_partition_alert",
+        "observs_default_partition_alert",
         payload,
         nowIso(),
         randomUUID(),
@@ -775,7 +775,7 @@ async function runHistoryPartitionMaintenance(config) {
         reason: "upload_failed",
         upload_error: message,
       };
-      logStructured("ERROR", "history_default_partition_dropbox_upload_failed", {
+      logStructured("ERROR", "observs_default_partition_dropbox_upload_failed", {
         run_id: runId,
         message,
       });
@@ -783,12 +783,12 @@ async function runHistoryPartitionMaintenance(config) {
   }
 
   const dropCandidates = (await callRpc(
-    historyClient,
+    observsClient,
     RPC_DROP_CANDIDATES,
     {
       cutoff_utc: retentionCutoffIso,
     },
-    "history drop candidates",
+    "observs drop candidates",
   )).map(normalizeDropCandidate);
 
   const dropped = [];
@@ -806,7 +806,7 @@ async function runHistoryPartitionMaintenance(config) {
         reason: "drop_dry_run",
       };
       skipped.push(skip);
-      logStructured("INFO", "history_partition_drop_dry_run_skip", {
+      logStructured("INFO", "observs_partition_drop_dry_run_skip", {
         run_id: runId,
         ...skip,
       });
@@ -819,7 +819,7 @@ async function runHistoryPartitionMaintenance(config) {
       const createdAt = nowIso();
       const skipPayload = {
         run_id: runId,
-        event: "history_partition_drop_skipped_backup_not_confirmed",
+        event: "observs_partition_drop_skipped_backup_not_confirmed",
         message: "SKIP DROP — backup not confirmed",
         partition: candidate,
         backup_check: backupCheck,
@@ -829,7 +829,7 @@ async function runHistoryPartitionMaintenance(config) {
       const skipDropboxResult = await (async () => {
         try {
           return await uploadMaintenanceLogToDropbox(
-            "history_partition_skip_drop",
+            "observs_partition_skip_drop",
             skipPayload,
             createdAt,
             skipId,
@@ -855,7 +855,7 @@ async function runHistoryPartitionMaintenance(config) {
       };
       skipped.push(skip);
 
-      logStructured("WARNING", "history_partition_drop_skipped", {
+      logStructured("WARNING", "observs_partition_drop_skipped", {
         run_id: runId,
         message: "SKIP DROP — backup not confirmed",
         ...skip,
@@ -864,12 +864,12 @@ async function runHistoryPartitionMaintenance(config) {
     }
 
     const dropResultRows = await callRpc(
-      historyClient,
+      observsClient,
       RPC_DROP_PARTITION,
       {
         p_partition_name: candidate.partition_name,
       },
-      `drop history partition ${candidate.partition_name}`,
+      `drop observs partition ${candidate.partition_name}`,
     );
     const didDrop = Boolean(dropResultRows?.[0]?.dropped);
     if (didDrop) {
@@ -878,7 +878,7 @@ async function runHistoryPartitionMaintenance(config) {
         partition_day_utc: candidate.partition_day_utc,
         backup_method: backupCheck.method,
       });
-      logStructured("INFO", "history_partition_dropped", {
+      logStructured("INFO", "observs_partition_dropped", {
         run_id: runId,
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
@@ -891,7 +891,7 @@ async function runHistoryPartitionMaintenance(config) {
         reason: "drop_rpc_returned_false",
       };
       skipped.push(skip);
-      logStructured("WARNING", "history_partition_drop_not_applied", {
+      logStructured("WARNING", "observs_partition_drop_not_applied", {
         run_id: runId,
         ...skip,
       });
@@ -921,7 +921,7 @@ async function runHistoryPartitionMaintenance(config) {
     skipped_preview: skipped.slice(0, 50),
   };
 
-  logStructured("INFO", "history_partition_maintenance_run_summary", summary);
+  logStructured("INFO", "observs_partition_maintenance_run_summary", summary);
   return summary;
 }
 
@@ -949,8 +949,8 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const config = buildHistoryConfig(url);
-    const summary = await runHistoryPartitionMaintenance(config);
+    const config = buildObservsConfig(url);
+    const summary = await runObservsPartitionMaintenance(config);
     jsonResponse(res, 200, summary);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -961,7 +961,7 @@ const server = createServer(async (req, res) => {
     const payload = {
       id: errorId,
       created_at: createdAt,
-      source: "cloud_run_history_partition_maintenance",
+      source: "cloud_run_observs_partition_maintenance",
       severity: "error",
       message,
       stack,
@@ -977,7 +977,7 @@ const server = createServer(async (req, res) => {
     const dropboxResult = await (async () => {
       try {
         return await uploadMaintenanceLogToDropbox(
-          "history_partition_service_error",
+          "observs_partition_service_error",
           payload,
           createdAt,
           errorId,
@@ -994,7 +994,7 @@ const server = createServer(async (req, res) => {
       }
     })();
 
-    logStructured("ERROR", "history_partition_maintenance_run_error", {
+    logStructured("ERROR", "observs_partition_maintenance_run_error", {
       error_id: errorId,
       message,
       request_method: req.method || "",
@@ -1005,7 +1005,7 @@ const server = createServer(async (req, res) => {
     });
 
     jsonResponse(res, 500, {
-      error: "history_partition_maintenance_run_error",
+      error: "observs_partition_maintenance_run_error",
       message: "Internal error. See logs with error_id.",
       error_id: errorId,
       dropbox_uploaded: Boolean(dropboxResult.uploaded),
@@ -1016,7 +1016,7 @@ const server = createServer(async (req, res) => {
 
 const port = parsePositiveInt(process.env.PORT, 8080, 1, 65535);
 server.listen(port, () => {
-  logStructured("INFO", "history_partition_maintenance_service_started", {
+  logStructured("INFO", "observs_partition_maintenance_service_started", {
     port,
     defaults: {
       future_partition_days: DEFAULT_FUTURE_PARTITION_DAYS,
