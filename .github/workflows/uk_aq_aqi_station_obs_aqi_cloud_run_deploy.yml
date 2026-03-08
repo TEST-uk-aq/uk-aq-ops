@@ -274,6 +274,7 @@ jobs:
             --concurrency "${SERVICE_CONCURRENCY}"
             --max-instances "${SERVICE_MAX_INSTANCES}"
             --min-instances "${SERVICE_MIN_INSTANCES}"
+            --no-cpu-boost
             --labels "job_name=${RESOURCE_LABEL}"
             --no-allow-unauthenticated
           )
