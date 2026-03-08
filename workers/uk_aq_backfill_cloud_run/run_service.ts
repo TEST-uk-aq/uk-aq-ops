@@ -53,15 +53,15 @@ function resolveTriggerMode(req: Request, body: RequestBody | null): string {
 function resolveRunMode(req: Request, body: RequestBody | null): string {
   const queryValue = readStringQuery(req, "run_mode");
   if (queryValue) {
-    return parseRunMode(queryValue, "local_to_aggdaily");
+    return parseRunMode(queryValue, "local_to_aqilevels");
   }
 
   const headerValue = (req.headers.get("x-uk-aq-backfill-run-mode") || "").trim();
   if (headerValue) {
-    return parseRunMode(headerValue, "local_to_aggdaily");
+    return parseRunMode(headerValue, "local_to_aqilevels");
   }
 
-  return parseRunMode(body?.run_mode, "local_to_aggdaily");
+  return parseRunMode(body?.run_mode, "local_to_aqilevels");
 }
 
 function resolveDryRun(req: Request, body: RequestBody | null): boolean {
@@ -223,7 +223,7 @@ serve(async (req: Request) => {
     return json({
       ok: true,
       service: "uk_aq_backfill_cloud_run",
-      run_modes: ["local_to_aggdaily", "obs_aqi_to_r2", "source_to_all"],
+      run_modes: ["local_to_aqilevels", "obs_aqi_to_r2", "source_to_all"],
     });
   }
 

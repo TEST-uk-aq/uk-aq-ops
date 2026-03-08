@@ -9,10 +9,10 @@ import {
 } from "../workers/uk_aq_backfill_cloud_run/backfill_core.mjs";
 
 test("parseRunMode accepts valid values and falls back on invalid", () => {
-  assert.equal(parseRunMode("local_to_aggdaily", "obs_aqi_to_r2"), "local_to_aggdaily");
-  assert.equal(parseRunMode("OBS_AQI_TO_R2", "local_to_aggdaily"), "obs_aqi_to_r2");
+  assert.equal(parseRunMode("local_to_aqilevels", "obs_aqi_to_r2"), "local_to_aqilevels");
+  assert.equal(parseRunMode("OBS_AQI_TO_R2", "local_to_aqilevels"), "obs_aqi_to_r2");
   assert.equal(parseRunMode("", "source_to_all"), "source_to_all");
-  assert.equal(parseRunMode("not-a-mode", "local_to_aggdaily"), "local_to_aggdaily");
+  assert.equal(parseRunMode("not-a-mode", "local_to_aqilevels"), "local_to_aqilevels");
 });
 
 test("buildBackwardDayRange returns newest-first days", () => {

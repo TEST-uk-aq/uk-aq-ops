@@ -34,13 +34,13 @@ jobs:
       SERVICE_MAX_INSTANCES: ${{ vars.GCP_BACKFILL_SERVICE_MAX_INSTANCES || vars.BACKFILL_SERVICE_MAX_INSTANCES || '1' }}
       SERVICE_MIN_INSTANCES: ${{ vars.GCP_BACKFILL_SERVICE_MIN_INSTANCES || vars.BACKFILL_SERVICE_MIN_INSTANCES || '0' }}
       SCHEDULER_ENABLED: ${{ vars.GCP_BACKFILL_SCHEDULER_ENABLED || vars.BACKFILL_SCHEDULER_ENABLED || 'false' }}
-      SCHEDULER_JOB_NAME: ${{ vars.GCP_BACKFILL_SCHEDULER_JOB_NAME || vars.BACKFILL_SCHEDULER_JOB_NAME || 'uk-aq-backfill-local-to-aggdaily' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_BACKFILL_SCHEDULER_JOB_NAME || vars.BACKFILL_SCHEDULER_JOB_NAME || 'uk-aq-backfill-local-to-aqilevels' }}
       SCHEDULER_CRON: ${{ vars.GCP_BACKFILL_SCHEDULER_CRON || vars.BACKFILL_SCHEDULER_CRON || '35 2 * * *' }}
       SCHEDULER_TIMEZONE: ${{ vars.GCP_BACKFILL_SCHEDULER_TIMEZONE || vars.BACKFILL_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_BACKFILL_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.BACKFILL_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
       SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_BACKFILL_SCHEDULER_SERVICE_ACCOUNT || vars.BACKFILL_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SCHEDULER_PATH: ${{ vars.GCP_BACKFILL_SCHEDULER_PATH || vars.BACKFILL_SCHEDULER_PATH || '/run' }}
-      SCHEDULER_RUN_MODE: ${{ vars.GCP_BACKFILL_SCHEDULER_RUN_MODE || vars.BACKFILL_SCHEDULER_RUN_MODE || 'local_to_aggdaily' }}
+      SCHEDULER_RUN_MODE: ${{ vars.GCP_BACKFILL_SCHEDULER_RUN_MODE || vars.BACKFILL_SCHEDULER_RUN_MODE || 'local_to_aqilevels' }}
       SCHEDULER_DRY_RUN: ${{ vars.GCP_BACKFILL_SCHEDULER_DRY_RUN || vars.BACKFILL_SCHEDULER_DRY_RUN || 'false' }}
       SCHEDULER_FORCE_REPLACE: ${{ vars.GCP_BACKFILL_SCHEDULER_FORCE_REPLACE || vars.BACKFILL_SCHEDULER_FORCE_REPLACE || 'false' }}
       SCHEDULER_ENABLE_R2_FALLBACK: ${{ vars.GCP_BACKFILL_SCHEDULER_ENABLE_R2_FALLBACK || vars.BACKFILL_SCHEDULER_ENABLE_R2_FALLBACK || 'false' }}
@@ -49,13 +49,12 @@ jobs:
       SCHEDULER_CONNECTOR_IDS_CSV: ${{ vars.GCP_BACKFILL_SCHEDULER_CONNECTOR_IDS_CSV || vars.BACKFILL_SCHEDULER_CONNECTOR_IDS_CSV || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
-      AGGDAILY_SUPABASE_URL: ${{ vars.AGGDAILY_SUPABASE_URL }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
       UK_AQ_BACKFILL_OPS_SCHEMA: ${{ vars.UK_AQ_BACKFILL_OPS_SCHEMA || 'uk_aq_ops' }}
       UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC: ${{ vars.UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC || 'uk_aq_rpc_observations_hourly_fingerprint' }}
       UK_AQ_BACKFILL_SOURCE_RPC: ${{ vars.UK_AQ_BACKFILL_SOURCE_RPC || 'uk_aq_rpc_station_aqi_hourly_source' }}
-      UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC: ${{ vars.UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC || 'uk_aq_rpc_station_aqi_hourly_upsert' }}
-      UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC: ${{ vars.UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC || 'uk_aq_rpc_station_aqi_rollups_refresh' }}
+      UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC: ${{ vars.UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC || 'uk_aq_rpc_station_aqi_hourly_upsert' }}
+      UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC: ${{ vars.UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC || 'uk_aq_rpc_station_aqi_rollups_refresh' }}
       UK_AQ_BACKFILL_RPC_RETRIES: ${{ vars.UK_AQ_BACKFILL_RPC_RETRIES || '3' }}
       UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE: ${{ vars.UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE || '2000' }}
       UK_AQ_BACKFILL_INGEST_RETENTION_DAYS: ${{ vars.UK_AQ_BACKFILL_INGEST_RETENTION_DAYS || '7' }}
@@ -68,10 +67,8 @@ jobs:
       UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE: ${{ vars.UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE || '1000' }}
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
-      AGGDAILY_SECRET_KEY: ${{ secrets.AGGDAILY_SECRET_KEY }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
-      AGGDAILY_SECRET_KEY_SECRET_NAME: ${{ vars.AGGDAILY_SECRET_KEY_SECRET_NAME || 'AGGDAILY_SECRET_KEY' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -100,10 +97,6 @@ jobs:
           fi
           if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ]; then
             echo "Missing required variable: OBS_AQIDB_SUPABASE_URL"
-            exit 1
-          fi
-          if [ -z "${AGGDAILY_SUPABASE_URL:-}" ]; then
-            echo "Missing required variable: AGGDAILY_SUPABASE_URL"
             exit 1
           fi
 
@@ -197,7 +190,6 @@ jobs:
 
           upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1
           upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
-          upsert_secret "${AGGDAILY_SECRET_KEY_SECRET_NAME}" "${AGGDAILY_SECRET_KEY}" 1
 
       - name: Build Cloud Run env and secret args
         id: cloudrun_args
@@ -244,18 +236,16 @@ jobs:
 
           require_env SUPABASE_URL
           require_env OBS_AQIDB_SUPABASE_URL
-          require_env AGGDAILY_SUPABASE_URL
 
           env_updates=()
           add_env SUPABASE_URL
           add_env OBS_AQIDB_SUPABASE_URL
-          add_env AGGDAILY_SUPABASE_URL
           add_env UK_AQ_PUBLIC_SCHEMA
           add_env UK_AQ_BACKFILL_OPS_SCHEMA
           add_env UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC
           add_env UK_AQ_BACKFILL_SOURCE_RPC
-          add_env UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC
-          add_env UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC
+          add_env UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC
+          add_env UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC
           add_env UK_AQ_BACKFILL_RPC_RETRIES
           add_env UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE
           add_env UK_AQ_BACKFILL_INGEST_RETENTION_DAYS
@@ -271,7 +261,6 @@ jobs:
           secret_updates=()
           add_secret_binding "SB_SECRET_KEY" "${SB_SECRET_KEY_SECRET_NAME}" 1
           add_secret_binding "OBS_AQIDB_SECRET_KEY" "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" 1
-          add_secret_binding "AGGDAILY_SECRET_KEY" "${AGGDAILY_SECRET_KEY_SECRET_NAME}" 1
 
           env_file="${RUNNER_TEMP}/uk-aq-backfill-env.yaml"
           : > "${env_file}"
@@ -364,7 +353,7 @@ jobs:
 
           payload = {
               "trigger_mode": "scheduler",
-              "run_mode": os.getenv("SCHEDULER_RUN_MODE", "local_to_aggdaily").strip() or "local_to_aggdaily",
+              "run_mode": os.getenv("SCHEDULER_RUN_MODE", "local_to_aqilevels").strip() or "local_to_aqilevels",
           }
 
           for env_key, field in [

@@ -12,9 +12,9 @@
 ## Schema Placement Policy
 
 - Canonical SQL DDL belongs in the schema repo (`.../CIC-test-uk-aq-schema/schemas/...`), not only in ops worker directories.
-- If ops introduces or changes AggDaily tables, the change must also be reflected in:
-  - `schemas/aggdaily_db/uk_aq_aggdaily_schema.sql` (main AggDaily schema), and
-  - a schema-repo SQL file under `schemas/aggdaily_db/` when a targeted apply file is needed.
+- If ops introduces or changes Obs AQI tables, the change must also be reflected in:
+  - `schemas/aqilevels_db/uk_aq_aqilevels_schema.sql` (main Obs AQI schema), and
+  - a schema-repo SQL file under `schemas/aqilevels_db/` when a targeted apply file is needed.
 
 ## R2/Cloudflare Cache Cost Policy
 

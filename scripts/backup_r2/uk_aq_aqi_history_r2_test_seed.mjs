@@ -42,8 +42,8 @@ Options:
   -h, --help                Show help
 
 Required environment:
-  AGGDAILY_SUPABASE_URL
-  AGGDAILY_SECRET_KEY
+  OBS_AQIDB_SUPABASE_URL
+  OBS_AQIDB_SECRET_KEY
   CFLARE_R2_* (or R2_*) vars for upload unless --dry-run
 `);
 }
@@ -763,10 +763,10 @@ function buildHourlyRealMaps({ realRows, selectedStationIdSet, stationById, gene
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  const aggdailyBaseUrl = String(process.env.AGGDAILY_SUPABASE_URL || "").trim().replace(/\/$/, "");
-  const aggdailyKey = String(process.env.AGGDAILY_SECRET_KEY || "").trim();
-  if (!aggdailyBaseUrl || !aggdailyKey) {
-    throw new Error("Missing AGGDAILY_SUPABASE_URL or AGGDAILY_SECRET_KEY.");
+  const obsAqiBaseUrl = String(process.env.OBS_AQIDB_SUPABASE_URL || "").trim().replace(/\/$/, "");
+  const obsAqiKey = String(process.env.OBS_AQIDB_SECRET_KEY || "").trim();
+  if (!obsAqiBaseUrl || !obsAqiKey) {
+    throw new Error("Missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY.");
   }
 
   const runtime = resolvePhaseBRuntimeConfig(process.env);
@@ -781,8 +781,8 @@ async function main() {
 
   const hourlySinceIso = hourlyPeriods[0];
   const allHourlyRows = await fetchStationHourlyRows({
-    baseUrl: aggdailyBaseUrl,
-    key: aggdailyKey,
+    baseUrl: obsAqiBaseUrl,
+    key: obsAqiKey,
     sinceIso: hourlySinceIso,
   });
 
@@ -790,8 +790,8 @@ async function main() {
   const selectedStationIds = rankedStationIds.slice(0, args.stationLimit);
 
   const selectedStationRows = await fetchStationsByIds({
-    baseUrl: aggdailyBaseUrl,
-    key: aggdailyKey,
+    baseUrl: obsAqiBaseUrl,
+    key: obsAqiKey,
     stationIds: selectedStationIds,
   });
 

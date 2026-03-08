@@ -37,8 +37,8 @@ Response notes:
 
 Required Worker secrets for `supabase-data`:
 
-- `AGGDAILY_SUPABASE_URL`
-- `AGGDAILY_SECRET_KEY`
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
 
 ## Deploy (manual)
 

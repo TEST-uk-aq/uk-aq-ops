@@ -48,8 +48,8 @@ const ONE_MINUTE_MS = 60 * 1000;
 
 const INGEST_SUPABASE_URL = requiredEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = requiredEnvAny(["SB_SECRET_KEY"]);
-const AGGDAILY_SUPABASE_URL = requiredEnv("AGGDAILY_SUPABASE_URL");
-const AGGDAILY_PRIVILEGED_KEY = requiredEnv("AGGDAILY_SECRET_KEY");
+const OBS_AQIDB_SUPABASE_URL = requiredEnv("OBS_AQIDB_SUPABASE_URL");
+const OBS_AQI_PRIVILEGED_KEY = requiredEnv("OBS_AQIDB_SECRET_KEY");
 
 const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
 const HELPER_WINDOW_RPC = (Deno.env.get("UK_AQ_AQI_HELPER_WINDOW_RPC") ||
@@ -183,7 +183,7 @@ async function postgrestRpc<T>(
     Accept: "application/json",
     "Accept-Profile": RPC_SCHEMA,
     "Content-Profile": RPC_SCHEMA,
-    "x-ukaq-egress-caller": "uk_aq_aqi_station_aggdaily_cloud_run",
+    "x-ukaq-egress-caller": "uk_aq_aqi_station_obs_aqi_cloud_run",
   };
 
   for (let attempt = 1; attempt <= RPC_RETRIES; attempt += 1) {
@@ -435,8 +435,8 @@ async function main(): Promise<void> {
       const chunks = chunkRows(helperRows, Math.max(100, HOURLY_UPSERT_CHUNK_SIZE));
       for (const chunk of chunks) {
         const upsertResult = await postgrestRpc<unknown>(
-          AGGDAILY_SUPABASE_URL,
-          AGGDAILY_PRIVILEGED_KEY,
+          OBS_AQIDB_SUPABASE_URL,
+          OBS_AQI_PRIVILEGED_KEY,
           HOURLY_UPSERT_RPC,
           {
             p_rows: chunk,
@@ -461,8 +461,8 @@ async function main(): Promise<void> {
 
       const stationIds = Array.from(new Set(helperRows.map((row) => row.station_id)));
       const rollupResult = await postgrestRpc<unknown>(
-        AGGDAILY_SUPABASE_URL,
-        AGGDAILY_PRIVILEGED_KEY,
+        OBS_AQIDB_SUPABASE_URL,
+        OBS_AQI_PRIVILEGED_KEY,
         ROLLUP_REFRESH_RPC,
         {
           p_start_hour_utc: hourIso(window.hourEndStartExclusive),
@@ -486,8 +486,8 @@ async function main(): Promise<void> {
   const deepReconcileEffective = null;
 
   const runLogResult = await postgrestRpc<unknown>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     RUN_LOG_RPC,
     {
       p_run_mode: RUN_MODE,
@@ -518,8 +518,8 @@ async function main(): Promise<void> {
   }
 
   const cleanupResult = await postgrestRpc<unknown>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     RUN_CLEANUP_RPC,
     {
       p_retention_days: RUN_LOG_RETENTION_DAYS,

@@ -487,8 +487,8 @@ async function handleSupabaseDataRequest(request, env) {
     return jsonResponse({ ok: false, error: "from_utc must be <= to_utc" }, { status: 400, cacheSeconds: 30 });
   }
 
-  const baseUrl = String(env.AGGDAILY_SUPABASE_URL || "").trim().replace(/\/$/, "");
-  const key = String(env.AGGDAILY_SECRET_KEY || "").trim();
+  const baseUrl = String(env.OBS_AQIDB_SUPABASE_URL || "").trim().replace(/\/$/, "");
+  const key = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
   const schema = String(env.UK_AQ_PUBLIC_SCHEMA || "uk_aq_public").trim() || "uk_aq_public";
 
   if (!baseUrl || !key) {

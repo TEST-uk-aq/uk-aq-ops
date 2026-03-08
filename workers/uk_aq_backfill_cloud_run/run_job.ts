@@ -18,7 +18,7 @@ import {
   utcDayStartIso,
 } from "./backfill_core.mjs";
 
-type RunMode = "local_to_aggdaily" | "obs_aqi_to_r2" | "source_to_all";
+type RunMode = "local_to_aqilevels" | "obs_aqi_to_r2" | "source_to_all";
 type TriggerMode = "scheduler" | "manual";
 type SourceKind = "ingestdb" | "obs_aqidb" | "r2";
 type RunStatus = "ok" | "error" | "dry_run" | "stubbed";
@@ -78,21 +78,21 @@ type RollupMetrics = {
   monthly_rows_upserted: number;
 };
 
-type LocalToAggDailyDayConnectorResult = {
+type LocalToAqilevelsDayConnectorResult = {
   day_utc: string;
   connector_id: number;
   source_kind: SourceKind;
   status: "complete" | "skipped" | "error" | "dry_run";
   skip_reason: string | null;
   rows_read: number;
-  rows_written_aggdaily: number;
+  rows_written_aqilevels: number;
   daily_rows_upserted: number;
   monthly_rows_upserted: number;
   error: string | null;
 };
 
-type LocalToAggDailySummary = {
-  mode: "local_to_aggdaily";
+type LocalToAqilevelsSummary = {
+  mode: "local_to_aqilevels";
   run_id: string;
   dry_run: boolean;
   force_replace: boolean;
@@ -104,10 +104,10 @@ type LocalToAggDailySummary = {
   connector_day_skipped: number;
   connector_day_error: number;
   rows_read: number;
-  rows_written_aggdaily: number;
+  rows_written_aqilevels: number;
   rollup_daily_rows_upserted: number;
   rollup_monthly_rows_upserted: number;
-  day_connector_results: LocalToAggDailyDayConnectorResult[];
+  day_connector_results: LocalToAqilevelsDayConnectorResult[];
 };
 
 type StubModeSummary = {
@@ -123,14 +123,12 @@ type StubModeSummary = {
   observs_write_skipped_days?: string[];
 };
 
-type RunSummary = LocalToAggDailySummary | StubModeSummary;
+type RunSummary = LocalToAqilevelsSummary | StubModeSummary;
 
 const INGEST_SUPABASE_URL = optionalEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = optionalEnvAny(["SB_SECRET_KEY"]);
 const OBS_AQIDB_SUPABASE_URL = optionalEnv("OBS_AQIDB_SUPABASE_URL");
 const OBS_AQI_PRIVILEGED_KEY = optionalEnv("OBS_AQIDB_SECRET_KEY");
-const AGGDAILY_SUPABASE_URL = optionalEnv("AGGDAILY_SUPABASE_URL");
-const AGGDAILY_PRIVILEGED_KEY = optionalEnv("AGGDAILY_SECRET_KEY");
 
 const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
 const OPS_SCHEMA = (Deno.env.get("UK_AQ_BACKFILL_OPS_SCHEMA") || "uk_aq_ops").trim();
@@ -139,14 +137,14 @@ const HOURLY_FINGERPRINT_RPC = (Deno.env.get("UK_AQ_BACKFILL_HOURLY_FINGERPRINT_
   "uk_aq_rpc_observations_hourly_fingerprint").trim();
 const SOURCE_RPC = (Deno.env.get("UK_AQ_BACKFILL_SOURCE_RPC") ||
   "uk_aq_rpc_station_aqi_hourly_source").trim();
-const HOURLY_UPSERT_RPC = (Deno.env.get("UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC") ||
+const HOURLY_UPSERT_RPC = (Deno.env.get("UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC") ||
   "uk_aq_rpc_station_aqi_hourly_upsert").trim();
-const ROLLUP_REFRESH_RPC = (Deno.env.get("UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC") ||
+const ROLLUP_REFRESH_RPC = (Deno.env.get("UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC") ||
   "uk_aq_rpc_station_aqi_rollups_refresh").trim();
 
 const RUN_MODE = parseRunMode(
   Deno.env.get("UK_AQ_BACKFILL_RUN_MODE"),
-  "local_to_aggdaily",
+  "local_to_aqilevels",
 ) as RunMode;
 const TRIGGER_MODE = parseTriggerMode(
   Deno.env.get("UK_AQ_BACKFILL_TRIGGER_MODE"),
@@ -963,22 +961,22 @@ async function fetchSourceRowsForConnector(
   );
 }
 
-async function upsertAggDailyRows(
+async function upsertAqilevelsRows(
   helperRows: HelperRow[],
   dayStartIso: string,
   dayEndIso: string,
 ): Promise<{ rowsWritten: number; dailyRows: number; monthlyRows: number }> {
-  const aggdailyUrl = requiredEnv("AGGDAILY_SUPABASE_URL");
-  const aggdailyKey = requiredEnv("AGGDAILY_SECRET_KEY");
+  const aqilevelsUrl = requiredEnv("OBS_AQIDB_SUPABASE_URL");
+  const aqilevelsKey = requiredEnv("OBS_AQIDB_SECRET_KEY");
 
   if (helperRows.length === 0) {
     return { rowsWritten: 0, dailyRows: 0, monthlyRows: 0 };
   }
 
-  const aggdailySource: SourceDbConfig = {
+  const aqilevelsSource: SourceDbConfig = {
     kind: "ingestdb",
-    base_url: aggdailyUrl,
-    privileged_key: aggdailyKey,
+    base_url: aqilevelsUrl,
+    privileged_key: aqilevelsKey,
   };
 
   let rowsWritten = 0;
@@ -988,13 +986,13 @@ async function upsertAggDailyRows(
   const lateCutoffHour = addUtcHours(referenceHour, -36);
 
   for (const chunk of chunkRows(helperRows, HOURLY_UPSERT_CHUNK_SIZE)) {
-    const result = await postgrestRpc<unknown>(aggdailySource, HOURLY_UPSERT_RPC, {
+    const result = await postgrestRpc<unknown>(aqilevelsSource, HOURLY_UPSERT_RPC, {
       p_rows: chunk,
       p_late_cutoff_hour: lateCutoffHour,
       p_reference_hour: referenceHour,
     });
     if (result.error) {
-      throw new Error(`AggDaily hourly upsert RPC failed: ${result.error.message}`);
+      throw new Error(`AQI levels hourly upsert RPC failed: ${result.error.message}`);
     }
 
     const metrics = parseHourlyUpsertMetrics(result.data);
@@ -1003,19 +1001,19 @@ async function upsertAggDailyRows(
   }
 
   const stationIds = Array.from(new Set(helperRows.map((row) => row.station_id))).sort((l, r) => l - r);
-  const rollupResult = await postgrestRpc<unknown>(aggdailySource, ROLLUP_REFRESH_RPC, {
+  const rollupResult = await postgrestRpc<unknown>(aqilevelsSource, ROLLUP_REFRESH_RPC, {
     p_start_hour_utc: dayStartIso,
     p_end_hour_utc: dayEndIso,
     p_station_ids: stationIds,
   });
   if (rollupResult.error) {
-    throw new Error(`AggDaily rollup refresh RPC failed: ${rollupResult.error.message}`);
+    throw new Error(`AQI levels rollup refresh RPC failed: ${rollupResult.error.message}`);
   }
 
   const rollupMetrics = parseRollupMetrics(rollupResult.data);
 
-  logStructured("info", "local_to_aggdaily_chunk_summary", {
-    rows_written_aggdaily: rowsWritten,
+  logStructured("info", "local_to_aqilevels_chunk_summary", {
+    rows_written_aqilevels: rowsWritten,
     station_hours_changed: stationHoursChanged,
     daily_rows_upserted: rollupMetrics.daily_rows_upserted,
     monthly_rows_upserted: rollupMetrics.monthly_rows_upserted,
@@ -1056,7 +1054,7 @@ async function detectLedgerEnabled(): Promise<boolean> {
   if (!LEDGER_ENABLED) {
     return false;
   }
-  if (!(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return false;
   }
   if (DRY_RUN && !DRY_RUN_WRITE_LEDGER) {
@@ -1068,8 +1066,8 @@ async function detectLedgerEnabled(): Promise<boolean> {
   query.set("limit", "1");
 
   const result = await postgrestTable<unknown[]>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     {
       method: "GET",
       schema: OPS_SCHEMA,
@@ -1095,7 +1093,7 @@ async function ledgerInsertRun(
   runId: string,
   window: { from_day_utc: string; to_day_utc: string },
 ): Promise<void> {
-  if (!ledgerEnabled || !(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  if (!ledgerEnabled || !(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return;
   }
 
@@ -1113,8 +1111,8 @@ async function ledgerInsertRun(
   };
 
   const result = await postgrestTable<unknown>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     {
       method: "POST",
       schema: OPS_SCHEMA,
@@ -1137,7 +1135,7 @@ async function ledgerUpdateRun(
   runId: string,
   patch: Record<string, unknown>,
 ): Promise<void> {
-  if (!ledgerEnabled || !(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  if (!ledgerEnabled || !(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return;
   }
 
@@ -1145,8 +1143,8 @@ async function ledgerUpdateRun(
   query.set("run_id", `eq.${runId}`);
 
   const result = await postgrestTable<unknown>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     {
       method: "PATCH",
       schema: OPS_SCHEMA,
@@ -1170,7 +1168,7 @@ async function ledgerFetchCheckpointStatus(
   dayUtc: string,
   connectorId: number,
 ): Promise<string | null> {
-  if (!ledgerEnabled || !(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  if (!ledgerEnabled || !(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return null;
   }
 
@@ -1182,8 +1180,8 @@ async function ledgerFetchCheckpointStatus(
   query.set("limit", "1");
 
   const result = await postgrestTable<Array<Record<string, unknown>>>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     {
       method: "GET",
       schema: OPS_SCHEMA,
@@ -1214,13 +1212,13 @@ async function ledgerUpsertCheckpoint(
   ledgerEnabled: boolean,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  if (!ledgerEnabled || !(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  if (!ledgerEnabled || !(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return;
   }
 
   const result = await postgrestTable<unknown>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     {
       method: "POST",
       schema: OPS_SCHEMA,
@@ -1242,13 +1240,13 @@ async function ledgerInsertRunDay(
   ledgerEnabled: boolean,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  if (!ledgerEnabled || !(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  if (!ledgerEnabled || !(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return;
   }
 
   const result = await postgrestTable<unknown>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     {
       method: "POST",
       schema: OPS_SCHEMA,
@@ -1270,13 +1268,13 @@ async function ledgerInsertError(
   ledgerEnabled: boolean,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  if (!ledgerEnabled || !(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
+  if (!ledgerEnabled || !(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     return;
   }
 
   const result = await postgrestTable<unknown>(
-    AGGDAILY_SUPABASE_URL,
-    AGGDAILY_PRIVILEGED_KEY,
+    OBS_AQIDB_SUPABASE_URL,
+    OBS_AQI_PRIVILEGED_KEY,
     {
       method: "POST",
       schema: OPS_SCHEMA,
@@ -1314,24 +1312,24 @@ function normalizeRowsForDay(
   };
 }
 
-async function runLocalToAggDaily(
+async function runLocalToAqilevels(
   runId: string,
   window: { from_day_utc: string; to_day_utc: string },
   ledgerEnabled: boolean,
-): Promise<LocalToAggDailySummary> {
+): Promise<LocalToAqilevelsSummary> {
   if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
-    throw new Error("local_to_aggdaily requires SUPABASE_URL + SB_SECRET_KEY");
+    throw new Error("local_to_aqilevels requires SUPABASE_URL + SB_SECRET_KEY");
   }
   if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
-    throw new Error("local_to_aggdaily requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
+    throw new Error("local_to_aqilevels requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
   }
-  if (!(AGGDAILY_SUPABASE_URL && AGGDAILY_PRIVILEGED_KEY)) {
-    throw new Error("local_to_aggdaily requires AGGDAILY_SUPABASE_URL + AGGDAILY_SECRET_KEY");
+  if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
+    throw new Error("local_to_aqilevels requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
   }
 
   const days = buildBackwardDayRange(window.from_day_utc, window.to_day_utc);
-  const summary: LocalToAggDailySummary = {
-    mode: "local_to_aggdaily",
+  const summary: LocalToAqilevelsSummary = {
+    mode: "local_to_aqilevels",
     run_id: runId,
     dry_run: DRY_RUN,
     force_replace: FORCE_REPLACE,
@@ -1343,7 +1341,7 @@ async function runLocalToAggDaily(
     connector_day_skipped: 0,
     connector_day_error: 0,
     rows_read: 0,
-    rows_written_aggdaily: 0,
+    rows_written_aqilevels: 0,
     rollup_daily_rows_upserted: 0,
     rollup_monthly_rows_upserted: 0,
     day_connector_results: [],
@@ -1353,7 +1351,7 @@ async function runLocalToAggDaily(
     const dayStartIso = utcDayStartIso(dayUtc);
     const dayEndIso = utcDayEndIso(dayUtc);
 
-    logStructured("info", "local_to_aggdaily_day_start", {
+    logStructured("info", "local_to_aqilevels_day_start", {
       run_id: runId,
       day_utc: dayUtc,
       connector_filter: CONNECTOR_IDS,
@@ -1366,7 +1364,7 @@ async function runLocalToAggDaily(
     const connectors = CONNECTOR_IDS || connectorListFromCounts(ingestCounts, observsCounts);
 
     if (!connectors.length) {
-      logStructured("warning", "local_to_aggdaily_day_no_connectors", {
+      logStructured("warning", "local_to_aqilevels_day_no_connectors", {
         run_id: runId,
         day_utc: dayUtc,
       });
@@ -1382,14 +1380,14 @@ async function runLocalToAggDaily(
       );
 
       if (!sourceKind) {
-        const noSourceResult: LocalToAggDailyDayConnectorResult = {
+        const noSourceResult: LocalToAqilevelsDayConnectorResult = {
           day_utc: dayUtc,
           connector_id: connectorId,
           source_kind: "obs_aqidb",
           status: "skipped",
           skip_reason: "no_source_rows",
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           daily_rows_upserted: 0,
           monthly_rows_upserted: 0,
           error: null,
@@ -1404,7 +1402,7 @@ async function runLocalToAggDaily(
           source_kind: "none",
           status: "skipped",
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           objects_written_r2: 0,
           checkpoint_json: { skip_reason: "no_source_rows" },
           started_at: nowIso(),
@@ -1417,14 +1415,14 @@ async function runLocalToAggDaily(
       const skipDecision = shouldSkipCompletedDay(existingStatus, FORCE_REPLACE);
 
       if (skipDecision.skip) {
-        const skippedResult: LocalToAggDailyDayConnectorResult = {
+        const skippedResult: LocalToAqilevelsDayConnectorResult = {
           day_utc: dayUtc,
           connector_id: connectorId,
           source_kind: sourceKind,
           status: "skipped",
           skip_reason: skipDecision.reason,
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           daily_rows_upserted: 0,
           monthly_rows_upserted: 0,
           error: null,
@@ -1440,7 +1438,7 @@ async function runLocalToAggDaily(
           source_kind: sourceKind,
           status: "skipped",
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           objects_written_r2: 0,
           checkpoint_json: { skip_reason: skipDecision.reason },
           started_at: nowIso(),
@@ -1452,14 +1450,14 @@ async function runLocalToAggDaily(
       const startedAt = nowIso();
 
       if (sourceKind === "r2") {
-        const result: LocalToAggDailyDayConnectorResult = {
+        const result: LocalToAqilevelsDayConnectorResult = {
           day_utc: dayUtc,
           connector_id: connectorId,
           source_kind: "r2",
           status: "error",
           skip_reason: null,
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           daily_rows_upserted: 0,
           monthly_rows_upserted: 0,
           error: "r2_fallback_not_implemented_in_phase1",
@@ -1476,7 +1474,7 @@ async function runLocalToAggDaily(
           source_kind: sourceKind,
           status: "error",
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           objects_written_r2: 0,
           error_json: { message: result.error },
           started_at: startedAt,
@@ -1512,17 +1510,17 @@ async function runLocalToAggDaily(
         let monthlyRows = 0;
 
         if (DRY_RUN) {
-          logStructured("info", "local_to_aggdaily_dry_run_plan", {
+          logStructured("info", "local_to_aqilevels_dry_run_plan", {
             run_id: runId,
             day_utc: dayUtc,
             connector_id: connectorId,
             source_kind: sourceKind,
             source_filter: sourceFetch.source_filter,
             rows_read: normalized.rowsRead,
-            rows_candidate_aggdaily: normalized.helperRows.length,
+            rows_candidate_aqilevels: normalized.helperRows.length,
           });
         } else {
-          const writeSummary = await upsertAggDailyRows(
+          const writeSummary = await upsertAqilevelsRows(
             normalized.helperRows,
             dayStartIso,
             dayEndIso,
@@ -1532,22 +1530,22 @@ async function runLocalToAggDaily(
           monthlyRows = writeSummary.monthlyRows;
         }
 
-        const status: LocalToAggDailyDayConnectorResult["status"] = DRY_RUN ? "dry_run" : "complete";
-        const result: LocalToAggDailyDayConnectorResult = {
+        const status: LocalToAqilevelsDayConnectorResult["status"] = DRY_RUN ? "dry_run" : "complete";
+        const result: LocalToAqilevelsDayConnectorResult = {
           day_utc: dayUtc,
           connector_id: connectorId,
           source_kind: sourceKind,
           status,
           skip_reason: null,
           rows_read: normalized.rowsRead,
-          rows_written_aggdaily: rowsWritten,
+          rows_written_aqilevels: rowsWritten,
           daily_rows_upserted: dailyRows,
           monthly_rows_upserted: monthlyRows,
           error: null,
         };
 
         summary.rows_read += normalized.rowsRead;
-        summary.rows_written_aggdaily += rowsWritten;
+        summary.rows_written_aqilevels += rowsWritten;
         summary.rollup_daily_rows_upserted += dailyRows;
         summary.rollup_monthly_rows_upserted += monthlyRows;
 
@@ -1567,11 +1565,11 @@ async function runLocalToAggDaily(
           source_kind: sourceKind,
           status,
           rows_read: normalized.rowsRead,
-          rows_written_aggdaily: rowsWritten,
+          rows_written_aqilevels: rowsWritten,
           objects_written_r2: 0,
           checkpoint_json: {
             source_filter: sourceFetch.source_filter,
-            rows_candidate_aggdaily: normalized.helperRows.length,
+            rows_candidate_aqilevels: normalized.helperRows.length,
             dry_run: DRY_RUN,
           },
           started_at: startedAt,
@@ -1586,7 +1584,7 @@ async function runLocalToAggDaily(
             source_kind: sourceKind,
             status: "complete",
             rows_read: normalized.rowsRead,
-            rows_written_aggdaily: rowsWritten,
+            rows_written_aqilevels: rowsWritten,
             objects_written_r2: 0,
             checkpoint_json: {
               updated_by_run_id: runId,
@@ -1597,27 +1595,27 @@ async function runLocalToAggDaily(
           });
         }
 
-        logStructured("info", "local_to_aggdaily_day_connector_done", {
+        logStructured("info", "local_to_aqilevels_day_connector_done", {
           run_id: runId,
           day_utc: dayUtc,
           connector_id: connectorId,
           source_kind: sourceKind,
           status,
           rows_read: normalized.rowsRead,
-          rows_written_aggdaily: rowsWritten,
+          rows_written_aqilevels: rowsWritten,
           daily_rows_upserted: dailyRows,
           monthly_rows_upserted: monthlyRows,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const result: LocalToAggDailyDayConnectorResult = {
+        const result: LocalToAqilevelsDayConnectorResult = {
           day_utc: dayUtc,
           connector_id: connectorId,
           source_kind: sourceKind,
           status: "error",
           skip_reason: null,
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           daily_rows_upserted: 0,
           monthly_rows_upserted: 0,
           error: message,
@@ -1634,7 +1632,7 @@ async function runLocalToAggDaily(
           source_kind: sourceKind,
           status: "error",
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           objects_written_r2: 0,
           error_json: { message },
           started_at: startedAt,
@@ -1648,7 +1646,7 @@ async function runLocalToAggDaily(
           source_kind: sourceKind,
           status: "error",
           rows_read: 0,
-          rows_written_aggdaily: 0,
+          rows_written_aqilevels: 0,
           objects_written_r2: 0,
           checkpoint_json: {
             updated_by_run_id: runId,
@@ -1669,7 +1667,7 @@ async function runLocalToAggDaily(
           finished_at: nowIso(),
         });
 
-        logStructured("error", "local_to_aggdaily_day_connector_failed", {
+        logStructured("error", "local_to_aqilevels_day_connector_failed", {
           run_id: runId,
           day_utc: dayUtc,
           connector_id: connectorId,
@@ -1766,11 +1764,11 @@ async function main(): Promise<void> {
   let errorMessage: string | null = null;
 
   try {
-    if (RUN_MODE === "local_to_aggdaily") {
-      summary = await runLocalToAggDaily(runId, window, ledgerEnabled);
+    if (RUN_MODE === "local_to_aqilevels") {
+      summary = await runLocalToAqilevels(runId, window, ledgerEnabled);
       if (summary.connector_day_error > 0) {
         runStatus = "error";
-        errorMessage = `local_to_aggdaily encountered ${summary.connector_day_error} connector-day errors`;
+        errorMessage = `local_to_aqilevels encountered ${summary.connector_day_error} connector-day errors`;
       }
     } else if (RUN_MODE === "obs_aqi_to_r2") {
       summary = await runObservsToR2Stub(runId, window);
@@ -1810,7 +1808,7 @@ async function main(): Promise<void> {
   await ledgerUpdateRun(ledgerEnabled, runId, {
     status: runStatus,
     rows_read: "rows_read" in summary ? summary.rows_read : 0,
-    rows_written_aggdaily: "rows_written_aggdaily" in summary ? summary.rows_written_aggdaily : 0,
+    rows_written_aqilevels: "rows_written_aqilevels" in summary ? summary.rows_written_aqilevels : 0,
     objects_written_r2: 0,
     checkpoint_json: {
       summary,

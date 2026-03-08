@@ -1,8 +1,8 @@
-# UK AQ Station AQI AggDaily Cloud Run
+# UK AQ Station AQI Obs AQI Cloud Run
 
-Syncs precomputed station-hour AQI helper rows from ingest DB into AggDaily DB (hourly upsert + daily/monthly rollup refresh).
+Syncs precomputed station-hour AQI helper rows from ingest DB into Obs AQI DB (hourly upsert + daily/monthly rollup refresh).
 
-Helper rows carry means/sample counts; AQI index levels are computed in the AggDaily hourly upsert RPC.
+Helper rows carry means/sample counts; AQI index levels are computed in the Obs AQI hourly upsert RPC.
 
 ## Endpoints
 
@@ -30,8 +30,8 @@ Helper rows carry means/sample counts; AQI index levels are computed in the AggD
 
 - `SUPABASE_URL` (ingest DB URL)
 - `SB_SECRET_KEY` (ingest service key)
-- `AGGDAILY_SUPABASE_URL`
-- `AGGDAILY_SECRET_KEY`
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
 
 ## AQI Settings
 

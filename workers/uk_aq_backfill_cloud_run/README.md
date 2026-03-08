@@ -4,7 +4,7 @@ Cloud Run worker for UK AQ operational backfill workflows.
 
 Phase 1 implementation status:
 
-- `local_to_aggdaily`: implemented
+- `local_to_aqilevels`: implemented
 - `obs_aqi_to_r2`: wired stub (not yet implemented)
 - `source_to_all`: wired stub (not yet implemented)
 
@@ -21,7 +21,7 @@ All fields are optional unless noted.
 ```json
 {
   "trigger_mode": "manual",
-  "run_mode": "local_to_aggdaily",
+  "run_mode": "local_to_aqilevels",
   "dry_run": true,
   "force_replace": false,
   "from_day_utc": "2026-02-01",
@@ -33,7 +33,7 @@ All fields are optional unless noted.
 
 ## Run Modes
 
-- `local_to_aggdaily`
+- `local_to_aqilevels`
   - phase 1 implemented
   - processes newest selected UTC day first, then older days
   - uses source priority per day/connector:
@@ -42,7 +42,7 @@ All fields are optional unless noted.
     - R2 only when explicit fallback is enabled
   - default skip if checkpoint is already complete
   - `force_replace=true` bypasses skip
-  - writes AggDaily hourly + rollups via existing AQI RPCs
+  - writes Obs AQI hourly + rollups via existing AQI RPCs
 
 - `obs_aqi_to_r2`
   - phase 1 stub only
@@ -53,20 +53,20 @@ All fields are optional unless noted.
 
 ## Required Environment
 
-For `local_to_aggdaily`:
+For `local_to_aqilevels`:
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
-- `AGGDAILY_SUPABASE_URL`
-- `AGGDAILY_SECRET_KEY`
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
 
 ## Optional Environment
 
 Core:
 
-- `UK_AQ_BACKFILL_RUN_MODE` (default `local_to_aggdaily`)
+- `UK_AQ_BACKFILL_RUN_MODE` (default `local_to_aqilevels`)
 - `UK_AQ_BACKFILL_TRIGGER_MODE` (default `manual`)
 - `UK_AQ_BACKFILL_DRY_RUN` (default `false`)
 - `UK_AQ_BACKFILL_FORCE_REPLACE` (default `false`)
@@ -93,8 +93,8 @@ RPC names:
 
 - `UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC` (default `uk_aq_rpc_observations_hourly_fingerprint`)
 - `UK_AQ_BACKFILL_SOURCE_RPC` (default `uk_aq_rpc_station_aqi_hourly_source`)
-- `UK_AQ_BACKFILL_AGGDAILY_HOURLY_UPSERT_RPC` (default `uk_aq_rpc_station_aqi_hourly_upsert`)
-- `UK_AQ_BACKFILL_AGGDAILY_ROLLUP_REFRESH_RPC` (default `uk_aq_rpc_station_aqi_rollups_refresh`)
+- `UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC` (default `uk_aq_rpc_station_aqi_hourly_upsert`)
+- `UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC` (default `uk_aq_rpc_station_aqi_rollups_refresh`)
 
 Ledger:
 
@@ -102,15 +102,15 @@ Ledger:
 - `UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER` (default `false`)
 - `UK_AQ_BACKFILL_OPS_SCHEMA` (default `uk_aq_ops`)
 
-## Ledger Tables (AggDaily)
+## Ledger Tables (Obs AQI)
 
 If you want persistent skip/checkpoint behavior across runs, apply:
 
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aggdaily_db/uk_aq_backfill_ops_aggdaily.sql` (canonical)
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aqilevels_db/uk_aq_backfill_ops_obs_aqi.sql` (canonical)
 
 The same ledger tables are included in:
 
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aggdaily_db/uk_aq_aggdaily_schema.sql`
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aqilevels_db/uk_aq_aqilevels_schema.sql`
 
 Tables:
 
@@ -126,7 +126,7 @@ curl -X POST "https://<cloud-run-url>/run" \
   -H "content-type: application/json" \
   -d '{
     "trigger_mode": "manual",
-    "run_mode": "local_to_aggdaily",
+    "run_mode": "local_to_aqilevels",
     "dry_run": true,
     "from_day_utc": "2026-02-01",
     "to_day_utc": "2026-02-05",

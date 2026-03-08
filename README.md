@@ -6,7 +6,7 @@ Cloud Run operations services for:
 - flushing ingest outbox rows into `obs_aqidb` (`uk_aq_observs`)
 - maintaining `uk_aq_observs` partitions/index policy/retention
 - logging ingest/obs_aqidb database size samples
-- running operational backfill workflows across ingest/obs_aqidb/aggdaily
+- running operational backfill workflows across ingest/obs_aqidb
 
 ## Worker layout
 
@@ -16,7 +16,7 @@ Each gcloud-facing service now lives under `workers/`:
 - `workers/uk_aq_observs_outbox_flush_service/server.mjs`
 - `workers/uk_aq_observs_partition_maintenance_service/server.mjs`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
-- `workers/uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`
+- `workers/uk_aq_aqi_station_obs_aqi_cloud_run/run_service.ts`
 - `workers/uk_aq_backfill_cloud_run/run_service.ts`
 
 ## Services
@@ -77,7 +77,7 @@ Primary controls:
 
 - `GET /` health
 - `POST /` executes logger job
-- samples ingest + obs_aqidb DB cluster size via RPC (optional aggdaily)
+- samples ingest + obs_aqidb DB cluster size via RPC
 - upserts metrics and runs retention cleanup in each source DB's local metrics table
 - default GitHub deploy keeps Cloud Scheduler disabled; Supabase `pg_cron` is the primary hourly scheduler
 
@@ -85,17 +85,17 @@ Primary controls:
 
 - `GET /v1/db-size-metrics`
 - dashboard fan-in endpoint for DB size trend rows
-- reads `uk_aq_public.uk_aq_db_size_metrics_hourly` from ingest + obs_aqidb + optional aggdaily
+- reads `uk_aq_public.uk_aq_db_size_metrics_hourly` from ingest + obs_aqidb
 - preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
 - optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 
-### 6) Station AQI AggDaily Worker (`workers/uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`)
+### 6) Station AQI Obs AQI Worker (`workers/uk_aq_aqi_station_obs_aqi_cloud_run/run_service.ts`)
 
 - `GET /` health
 - `POST /` executes AQI run job
 - reads station-hour pollutant means from ingest RPC
 - computes pollutant-specific DAQI + EAQI levels (PM DAQI uses rolling 24h mean)
-- upserts `station_aqi_hourly` and refreshes daily/monthly rollups in aggdaily
+- upserts `station_aqi_hourly` and refreshes daily/monthly rollups in `uk_aq_aqilevels`
 - logs run telemetry (`aqi_compute_runs`) with 7-day retention cleanup
 
 ### 7) Backfill Worker (`workers/uk_aq_backfill_cloud_run/run_service.ts`)
@@ -104,10 +104,10 @@ Primary controls:
 - `POST /` executes backfill job
 - `POST /run` executes backfill job (alias)
 - run modes:
-  - `local_to_aggdaily` (Phase 1 implemented)
+  - `local_to_aqilevels` (Phase 1 implemented)
   - `obs_aqi_to_r2` (Phase 1 stubbed)
   - `source_to_all` (Phase 1 stubbed)
-- `local_to_aggdaily` behavior:
+- `local_to_aqilevels` behavior:
   - UTC-day backfill with newest day first
   - optional connector filter
   - source priority: ingest -> obs_aqidb -> explicit R2 History fallback
@@ -177,12 +177,12 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_observs_outbox_flush_service_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
-- `/.github/workflows/uk_aq_aqi_station_aggdaily_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_aqi_station_obs_aqi_cloud_run_deploy.yml`
 
 ## Setup docs
 
 - `system_docs/uk-aq-ingestdb-prune.md`
 - `system_docs/uk-aq-observs-outbox-flush-service.md`
 - `system_docs/uk-aq-observs-partition-maintenance.md`
-- `system_docs/uk-aq-aqi-station-aggdaily.md`
+- `system_docs/uk-aq-aqi-station-obs-aqi.md`
 - `system_docs/uk-aq-backfill-cloud-run.md`

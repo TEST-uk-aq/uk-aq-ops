@@ -3,7 +3,7 @@ const HOUR_MS = 60 * 60 * 1000;
 
 export const ALLOWED_TRIGGER_MODES = Object.freeze(["scheduler", "manual"]);
 export const ALLOWED_RUN_MODES = Object.freeze([
-  "local_to_aggdaily",
+  "local_to_aqilevels",
   "obs_aqi_to_r2",
   "source_to_all",
 ]);
@@ -11,12 +11,12 @@ export const ALLOWED_RUN_MODES = Object.freeze([
 const RUN_MODE_SET = new Set(ALLOWED_RUN_MODES);
 const TRIGGER_MODE_SET = new Set(ALLOWED_TRIGGER_MODES);
 
-export function parseRunMode(raw, fallback = "local_to_aggdaily") {
+export function parseRunMode(raw, fallback = "local_to_aqilevels") {
   const value = String(raw || "").trim().toLowerCase();
   if (RUN_MODE_SET.has(value)) {
     return value;
   }
-  return RUN_MODE_SET.has(fallback) ? fallback : "local_to_aggdaily";
+  return RUN_MODE_SET.has(fallback) ? fallback : "local_to_aqilevels";
 }
 
 export function parseTriggerMode(raw, fallback = "manual") {

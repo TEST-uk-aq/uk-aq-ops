@@ -141,7 +141,7 @@ def main() -> int:
         help=f"Targets CSV path (default: {DEFAULT_TARGETS_FILE}).",
     )
     parser.add_argument(
-        "--include-aggdaily-label",
+        "--include-legacy-aggdaily-label",
         action="store_true",
         help="Also include UK_AQ_AGGDAILY_DB_LABEL as a deletion candidate.",
     )
@@ -157,7 +157,7 @@ def main() -> int:
     targets_file = Path(args.targets_file)
 
     legacy_keys = set(LEGACY_RENAMED_KEYS)
-    if args.include_aggdaily_label:
+    if args.include_legacy_aggdaily_label:
         legacy_keys.add("UK_AQ_AGGDAILY_DB_LABEL")
 
     target_keys = load_target_keys(targets_file)
