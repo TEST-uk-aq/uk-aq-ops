@@ -273,13 +273,20 @@ function normalizeR2DomainSizeRows(rows) {
   return normalized;
 }
 
-async function fetchIngestMetricViewRows(env, lookbackDays, viewName, select, normalizeFn) {
-  const ingestUrl = String(env.SUPABASE_URL || "").trim();
-  const ingestKey = String(env.SB_SECRET_KEY || "").trim();
+async function fetchMetricViewRowsFromSource({
+  env,
+  lookbackDays,
+  sourceLabel,
+  sourceUrl,
+  sourceKey,
+  viewName,
+  select,
+  normalizeFn,
+}) {
   const publicSchema = String(env.UK_AQ_PUBLIC_SCHEMA || "uk_aq_public").trim() || "uk_aq_public";
 
-  if (!ingestUrl || !ingestKey) {
-    return { rows: [], warning: "ingestdb: missing SUPABASE_URL or SB_SECRET_KEY" };
+  if (!sourceUrl || !sourceKey) {
+    return { rows: [], warning: `${sourceLabel}: missing source URL or source key` };
   }
 
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
@@ -290,11 +297,11 @@ async function fetchIngestMetricViewRows(env, lookbackDays, viewName, select, no
     limit: "5000",
   });
 
-  const response = await fetch(`${ingestUrl.replace(/\/$/, "")}/rest/v1/${viewName}?${query.toString()}`, {
+  const response = await fetch(`${sourceUrl.replace(/\/$/, "")}/rest/v1/${viewName}?${query.toString()}`, {
     method: "GET",
     headers: {
-      apikey: ingestKey,
-      Authorization: `Bearer ${ingestKey}`,
+      apikey: sourceKey,
+      Authorization: `Bearer ${sourceKey}`,
       Accept: "application/json",
       "Accept-Profile": publicSchema,
       "x-ukaq-egress-caller": "uk_aq_db_size_metrics_api_worker",
@@ -314,34 +321,50 @@ async function fetchIngestMetricViewRows(env, lookbackDays, viewName, select, no
       (payload && typeof payload === "object" && !Array.isArray(payload) && (payload.message || payload.error_description || payload.error)) ||
       (typeof text === "string" ? text.slice(0, 400) : "") ||
       `HTTP ${response.status}`;
-    return { rows: [], warning: `${viewName}: ${String(message)}` };
+    return { rows: [], warning: `${sourceLabel}/${viewName}: ${String(message)}` };
   }
 
   if (!Array.isArray(payload)) {
-    return { rows: [], warning: `${viewName}: non-array payload` };
+    return { rows: [], warning: `${sourceLabel}/${viewName}: non-array payload` };
   }
 
   return { rows: normalizeFn(payload), warning: null };
 }
 
 async function fetchSchemaSizeRows(env, lookbackDays) {
-  return fetchIngestMetricViewRows(
+  const obsAqiUrl = String(env.OBS_AQIDB_SUPABASE_URL || "").trim();
+  const obsAqiKey = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
+  if (!obsAqiUrl || !obsAqiKey) {
+    return { rows: [], warning: "obs_aqidb: missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY" };
+  }
+  return fetchMetricViewRowsFromSource({
     env,
     lookbackDays,
-    "uk_aq_schema_size_metrics_hourly",
-    "bucket_hour,database_label,schema_name,size_bytes,oldest_observed_at,recorded_at",
-    normalizeSchemaSizeRows,
-  );
+    sourceLabel: "obs_aqidb",
+    sourceUrl: obsAqiUrl,
+    sourceKey: obsAqiKey,
+    viewName: "uk_aq_schema_size_metrics_hourly",
+    select: "bucket_hour,database_label,schema_name,size_bytes,oldest_observed_at,recorded_at",
+    normalizeFn: normalizeSchemaSizeRows,
+  });
 }
 
 async function fetchR2DomainSizeRows(env, lookbackDays) {
-  return fetchIngestMetricViewRows(
+  const ingestUrl = String(env.SUPABASE_URL || "").trim();
+  const ingestKey = String(env.SB_SECRET_KEY || "").trim();
+  if (!ingestUrl || !ingestKey) {
+    return { rows: [], warning: "ingestdb: missing SUPABASE_URL or SB_SECRET_KEY" };
+  }
+  return fetchMetricViewRowsFromSource({
     env,
     lookbackDays,
-    "uk_aq_r2_domain_size_metrics_hourly",
-    "bucket_hour,domain_name,size_bytes,recorded_at",
-    normalizeR2DomainSizeRows,
-  );
+    sourceLabel: "ingestdb",
+    sourceUrl: ingestUrl,
+    sourceKey: ingestKey,
+    viewName: "uk_aq_r2_domain_size_metrics_hourly",
+    select: "bucket_hour,domain_name,size_bytes,recorded_at",
+    normalizeFn: normalizeR2DomainSizeRows,
+  });
 }
 
 function latestOldestByLabel(rows) {

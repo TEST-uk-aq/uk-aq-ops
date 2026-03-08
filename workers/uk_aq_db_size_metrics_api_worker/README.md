@@ -31,8 +31,9 @@ Behavior:
   - obs_aqidb (`OBS_AQIDB_SUPABASE_URL` + `OBS_AQIDB_SECRET_KEY`)
 - Merges and sorts rows by `bucket_hour`.
 - Preserves null `oldest_observed_at` values as null (dashboard can render placeholder `>=--/--/----`).
-- Reads schema/R2 size rows from ingest public views:
+- Reads schema-size rows from obs_aqidb public view:
   - `uk_aq_public.uk_aq_schema_size_metrics_hourly`
+- Reads R2-domain size rows from ingestdb public view:
   - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
 
 ## Required secrets / vars

@@ -696,10 +696,10 @@ async function main(): Promise<void> {
 
   try {
     for (const sample of schemaSamples) {
-      await upsertSchemaSizeSample(ingestSource, sample);
+      await upsertSchemaSizeSample(obsSource, sample);
     }
     schemaRowsDeleted = await cleanupMetricRows(
-      ingestSource,
+      obsSource,
       SCHEMA_SIZE_CLEANUP_RPC,
       SCHEMA_SIZE_RETENTION_DAYS,
     );

@@ -11,6 +11,11 @@ Schema and R2 domain metrics are written via
 `uk_aq_public.uk_aq_rpc_schema_size_metric_upsert` and
 `uk_aq_public.uk_aq_rpc_r2_domain_size_metric_upsert`.
 
+Write targets:
+- DB cluster metrics -> each cluster (`ingestdb`, `obs_aqidb`)
+- Schema metrics (`uk_aq_observs`, `uk_aq_aqilevels`) -> `obs_aqidb`
+- R2 domain metrics (`observations`, `aqilevels`) -> `ingestdb`
+
 Primary scheduling is now Supabase `pg_cron` in each DB (local sample/write).
 Cloud Run service remains available for manual/on-demand runs or fallback scheduling.
 
