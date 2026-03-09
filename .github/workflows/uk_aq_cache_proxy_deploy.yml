@@ -1,0 +1,64 @@
+name: Deploy uk_aq_cache_proxy Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_cache_proxy/**"
+      - ".github/workflows/uk_aq_cache_proxy_deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy Worker (base)
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/uk_aq_cache_proxy
+          command: deploy
+
+      - name: Set Worker secrets
+        working-directory: workers/uk_aq_cache_proxy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg SUPABASE_URL "${{ vars.SUPABASE_URL }}" \
+            --arg SB_PUBLISHABLE_DEFAULT_KEY "${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}" \
+            --arg UK_AQ_CACHE_ALLOWED_ORIGINS "${{ vars.UK_AQ_CACHE_ALLOWED_ORIGINS }}" \
+            --arg UK_AQ_EDGE_ACCESS_TOKEN_SECRET "${{ secrets.UK_AQ_EDGE_ACCESS_TOKEN_SECRET }}" \
+            --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" \
+            --arg UK_AQ_CACHE_BYPASS_SECRET "${{ secrets.UK_AQ_CACHE_BYPASS_SECRET }}" \
+            --arg UK_AQ_TURNSTILE_SECRET_KEY "${{ secrets.UK_AQ_TURNSTILE_SECRET_KEY }}" \
+            --arg UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS "${{ vars.UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS }}" \
+            '{SUPABASE_URL: $SUPABASE_URL, SB_PUBLISHABLE_DEFAULT_KEY: $SB_PUBLISHABLE_DEFAULT_KEY, UK_AQ_CACHE_ALLOWED_ORIGINS: $UK_AQ_CACHE_ALLOWED_ORIGINS, UK_AQ_EDGE_ACCESS_TOKEN_SECRET: $UK_AQ_EDGE_ACCESS_TOKEN_SECRET, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_CACHE_BYPASS_SECRET: $UK_AQ_CACHE_BYPASS_SECRET, UK_AQ_TURNSTILE_SECRET_KEY: $UK_AQ_TURNSTILE_SECRET_KEY, UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: $UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS} | with_entries(select(.value != \"\"))')"
+          for attempt in 1 2 3; do
+            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-cache-proxy; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to apply Worker secrets after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/uk_aq_cache_proxy
+          command: deploy

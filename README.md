@@ -21,6 +21,12 @@ Each gcloud-facing service now lives under `workers/`:
 - `workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`
 - `workers/uk_aq_backfill_cloud_run/run_service.ts`
 
+Cloudflare edge workers in this repo:
+
+- `workers/uk_aq_db_size_metrics_api_worker/worker.mjs`
+- `workers/uk_aq_observs_history_r2_api_worker/worker.mjs`
+- `workers/uk_aq_cache_proxy/src/index.ts`
+
 ## Services
 
 ### 1) UK AQ Prune Daily (`workers/uk_aq_prune_daily/server.mjs`)
@@ -134,7 +140,23 @@ Primary controls:
   - source priority: ingest -> obs_aqidb -> explicit R2 History fallback
   - default skip if checkpoint already complete; `force_replace` bypasses skip
   - dry-run support with write estimates
-  - minimal run/day/checkpoint ledger wiring in `uk_aq_ops` (if schema is applied)
+- minimal run/day/checkpoint ledger wiring in `uk_aq_ops` (if schema is applied)
+
+### 10) Cache Proxy Worker (`workers/uk_aq_cache_proxy/src/index.ts`)
+
+- Cloudflare cache/auth proxy for website AQ read routes.
+- Session endpoints:
+  - `POST /api/aq/session/start`
+  - `POST /api/aq/session/end`
+- Proxied AQ routes:
+  - `/api/aq/latest`
+  - `/api/aq/timeseries`
+  - `/api/aq/stations-chart`
+  - `/api/aq/stations`
+  - `/api/aq/la-hex`
+  - `/api/aq/pcon-hex`
+- Upstream auth header:
+  - injects `X-UK-AQ-Upstream-Auth` using `UK_AQ_EDGE_UPSTREAM_SECRET`.
 
 ## Local run
 
@@ -218,6 +240,7 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_station_aqi_hourly_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_r2_history_dropbox_backup.yml`
+- `/.github/workflows/uk_aq_cache_proxy_deploy.yml`
 
 ## Setup docs
 
@@ -228,3 +251,4 @@ Apply in Supabase SQL editor:
 - `system_docs/uk-aq-station-aqi-hourly.md`
 - `system_docs/uk-aq-backfill-cloud-run.md`
 - `system_docs/uk-aq-r2-history-dropbox-backup.md`
+- `system_docs/uk-aq-cache-proxy.md`
