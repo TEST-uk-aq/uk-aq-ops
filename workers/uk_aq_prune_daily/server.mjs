@@ -23,6 +23,8 @@ const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
 const DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS = 1_000;
 const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
 const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
+const DEFAULT_REPAIR_FETCH_PAGE_SIZE = 1_000;
+const MAX_REPAIR_FETCH_PAGES = 500;
 const PREVIEW_LIMIT = 25;
 const RPC_SCHEMA = "uk_aq_public";
 
@@ -889,20 +891,50 @@ async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0
 
 async function fetchObservationsForRepairBucket(client, mismatch) {
   const connectorId = toIntField(mismatch.connector_id, "mismatch.connector_id");
-  const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_FETCH_HOUR_BUCKET, {
-    p_connector_id: connectorId,
-    p_hour_start: mismatch.hour_start,
-  });
+  const pageSize = DEFAULT_REPAIR_FETCH_PAGE_SIZE;
+  const rows = [];
+  let pagesFetched = 0;
+  let reachedEnd = false;
 
-  if (error) {
-    throw new Error(`repair fetch RPC failed: ${error.message}`);
+  for (let pageIndex = 0; pageIndex < MAX_REPAIR_FETCH_PAGES; pageIndex += 1) {
+    const pageOffset = pageIndex * pageSize;
+    const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_FETCH_HOUR_BUCKET, {
+      p_connector_id: connectorId,
+      p_hour_start: mismatch.hour_start,
+      p_page_size: pageSize,
+      p_page_offset: pageOffset,
+    });
+
+    if (error) {
+      throw new Error(`repair fetch RPC failed: ${error.message}`);
+    }
+
+    const pageRows = Array.isArray(data) ? data : [];
+    pagesFetched += 1;
+    if (pageRows.length === 0) {
+      reachedEnd = true;
+      break;
+    }
+
+    rows.push(...pageRows);
+
+    if (pageRows.length < pageSize) {
+      reachedEnd = true;
+      break;
+    }
   }
 
-  return Array.isArray(data) ? data : [];
+  if (!reachedEnd) {
+    throw new Error(
+      `repair fetch page cap reached for connector_id=${connectorId}, hour_start=${mismatch.hour_start}`,
+    );
+  }
+
+  return { rows, pagesFetched };
 }
 
 async function replayObservationsForRepairBucket(mainClient, observsClient, mismatch) {
-  const rawRows = await fetchObservationsForRepairBucket(mainClient, mismatch);
+  const { rows: rawRows, pagesFetched } = await fetchObservationsForRepairBucket(mainClient, mismatch);
   const observsRows = normalizeObservsRows(rawRows);
 
   let rowsReplayed = 0;
@@ -930,6 +962,7 @@ async function replayObservationsForRepairBucket(mainClient, observsClient, mism
   return {
     connector_id: mismatch.connector_id,
     hour_start: mismatch.hour_start,
+    fetch_pages: pagesFetched,
     rows_selected: rawRows.length,
     rows_replayed: rowsReplayed,
     receipts_upserted: receiptsUpserted,
