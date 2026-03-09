@@ -100,7 +100,15 @@ Primary controls:
 - preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
 - optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 
-### 7) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
+### 7) Observs History R2 API Worker (`workers/uk_aq_observs_history_r2_api_worker/worker.mjs`)
+
+- `GET /v1/observations` (alias: `GET /`)
+- reads only committed R2 history days/manifests under `history/v1/observations/...`
+- requires `x-uk-aq-upstream-auth` matching `UK_AQ_EDGE_UPSTREAM_SECRET`
+- returns normalized `{observed_at,value}` rows for a single `timeseries_id` + `connector_id`
+- consumed by ingest edge function `uk_aq_timeseries` for old-window reads
+
+### 8) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
 
 - `GET /` health
 - `POST /` executes AQI run job
@@ -109,7 +117,7 @@ Primary controls:
 - upserts `station_aqi_hourly` and refreshes daily/monthly rollups in `uk_aq_aqilevels`
 - logs run telemetry (`aqi_compute_runs`) with 7-day retention cleanup
 
-### 8) Backfill Worker (`workers/uk_aq_backfill_cloud_run/run_service.ts`)
+### 9) Backfill Worker (`workers/uk_aq_backfill_cloud_run/run_service.ts`)
 
 - `GET /` health
 - `POST /` executes backfill job

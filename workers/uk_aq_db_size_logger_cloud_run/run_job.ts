@@ -254,12 +254,6 @@ function asErrorMessage(payload: unknown, status: number): string {
   return `HTTP ${status}`;
 }
 
-function isMissingRpcError(message: string, rpcName: string): boolean {
-  const normalized = message.toLowerCase();
-  return normalized.includes("could not find") && normalized.includes(rpcName.toLowerCase()) ||
-    normalized.includes("pgrst202") || normalized.includes("does not exist");
-}
-
 function parseRowsDeleted(payload: unknown): number {
   if (!Array.isArray(payload) || payload.length === 0) {
     return 0;
@@ -398,41 +392,8 @@ function parseSchemaSizeSamples(payload: unknown): SchemaSizeSample[] {
     }
   }
 
-  for (const schemaName of SCHEMA_NAMES) {
-    if (!sampleBySchema.has(schemaName)) {
-      sampleBySchema.set(schemaName, {
-        database_label: "obs_aqidb",
-        schema_name: schemaName,
-        size_bytes: 0,
-        oldest_observed_at: null,
-        sampled_at: nowIso,
-        source: "uk_aq_db_size_logger_cloud_run_fallback_zero",
-      });
-    }
-  }
-
-  return SCHEMA_NAMES.map((schemaName) => sampleBySchema.get(schemaName)!)
+  return Array.from(sampleBySchema.values())
     .sort((a, b) => a.schema_name.localeCompare(b.schema_name));
-}
-
-function buildFallbackSchemaSamples(sampledAt: string, source: string): SchemaSizeSample[] {
-  return SCHEMA_NAMES.map((schemaName) => ({
-    database_label: "obs_aqidb",
-    schema_name: schemaName,
-    size_bytes: 0,
-    oldest_observed_at: null,
-    sampled_at: sampledAt,
-    source,
-  }));
-}
-
-function buildFallbackR2DomainSamples(sampledAt: string, source: string): R2DomainSizeSample[] {
-  return R2_DOMAINS.map((domainName) => ({
-    domain_name: domainName,
-    size_bytes: 0,
-    sampled_at: sampledAt,
-    source,
-  }));
 }
 
 async function collectDbSizeSample(
@@ -680,55 +641,74 @@ async function main(): Promise<void> {
 
   let schemaSamples: SchemaSizeSample[] = [];
   let schemaRowsDeleted = 0;
-  const schemaSampledAt = new Date().toISOString();
+  let schemaSourceAvailable = false;
   try {
     schemaSamples = await collectSchemaSizeSamples(obsSource);
+    if (schemaSamples.length === 0) {
+      warnings.push(
+        "schema_source: no valid schema size rows returned; skipping schema upsert for this run",
+      );
+    } else {
+      schemaSourceAvailable = true;
+    }
   } catch (error) {
     const message = warningMessage(error);
     warnings.push(`schema_source: ${message}`);
-    const fallbackSource = isMissingRpcError(message, SCHEMA_SIZE_SOURCE_RPC)
-      ? "uk_aq_db_size_logger_cloud_run_missing_schema_rpc"
-      : "uk_aq_db_size_logger_cloud_run_fallback_zero";
-    schemaSamples = buildFallbackSchemaSamples(schemaSampledAt, fallbackSource);
   }
 
-  try {
-    for (const sample of schemaSamples) {
-      await upsertSchemaSizeSample(obsSource, sample);
+  if (!schemaSourceAvailable) {
+    warnings.push("schema_persist: skipped (source unavailable); will retry next run");
+  }
+
+  if (schemaSourceAvailable) {
+    try {
+      for (const sample of schemaSamples) {
+        await upsertSchemaSizeSample(obsSource, sample);
+      }
+      schemaRowsDeleted = await cleanupMetricRows(
+        obsSource,
+        SCHEMA_SIZE_CLEANUP_RPC,
+        SCHEMA_SIZE_RETENTION_DAYS,
+      );
+    } catch (error) {
+      warnings.push(`schema_persist: ${warningMessage(error)}`);
     }
-    schemaRowsDeleted = await cleanupMetricRows(
-      obsSource,
-      SCHEMA_SIZE_CLEANUP_RPC,
-      SCHEMA_SIZE_RETENTION_DAYS,
-    );
-  } catch (error) {
-    warnings.push(`schema_persist: ${warningMessage(error)}`);
   }
 
   let r2DomainSamples: R2DomainSizeSample[] = [];
   let r2DomainRowsDeleted = 0;
+  let r2SourceAvailable = false;
   const r2SampledAt = new Date().toISOString();
   try {
     r2DomainSamples = await collectR2DomainSamples(r2SampledAt);
+    if (r2DomainSamples.length === 0) {
+      warnings.push(
+        "r2_domain_source: no valid domain rows returned; skipping r2-domain upsert for this run",
+      );
+    } else {
+      r2SourceAvailable = true;
+    }
   } catch (error) {
     warnings.push(`r2_domain_source: ${warningMessage(error)}`);
-    r2DomainSamples = buildFallbackR2DomainSamples(
-      r2SampledAt,
-      "uk_aq_db_size_logger_cloud_run_fallback_zero",
-    );
   }
 
-  try {
-    for (const sample of r2DomainSamples) {
-      await upsertR2DomainSample(ingestSource, sample);
+  if (!r2SourceAvailable) {
+    warnings.push("r2_domain_persist: skipped (source unavailable); will retry next run");
+  }
+
+  if (r2SourceAvailable) {
+    try {
+      for (const sample of r2DomainSamples) {
+        await upsertR2DomainSample(ingestSource, sample);
+      }
+      r2DomainRowsDeleted = await cleanupMetricRows(
+        ingestSource,
+        R2_DOMAIN_SIZE_CLEANUP_RPC,
+        R2_DOMAIN_SIZE_RETENTION_DAYS,
+      );
+    } catch (error) {
+      warnings.push(`r2_domain_persist: ${warningMessage(error)}`);
     }
-    r2DomainRowsDeleted = await cleanupMetricRows(
-      ingestSource,
-      R2_DOMAIN_SIZE_CLEANUP_RPC,
-      R2_DOMAIN_SIZE_RETENTION_DAYS,
-    );
-  } catch (error) {
-    warnings.push(`r2_domain_persist: ${warningMessage(error)}`);
   }
 
   const rowsDeleted = rowsDeletedByDb.ingestdb + rowsDeletedByDb.obs_aqidb +

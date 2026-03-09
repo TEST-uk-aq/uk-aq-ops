@@ -1,0 +1,12 @@
+name = "uk-aq-observs-history-r2-api"
+main = "worker.mjs"
+compatibility_date = "2026-03-09"
+
+[vars]
+UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
+UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS = "300"
+
+[[r2_buckets]]
+binding = "UK_AQ_HISTORY_BUCKET"
+bucket_name = "uk-aq-backup-cic-test"
+preview_bucket_name = "uk-aq-backup-cic-test"
