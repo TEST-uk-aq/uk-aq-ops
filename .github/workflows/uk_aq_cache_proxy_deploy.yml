@@ -15,23 +15,38 @@ permissions:
 jobs:
   deploy-worker:
     runs-on: ubuntu-latest
+    env:
+      UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
+      UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate cache Cloudflare credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "Missing secret UK_AQ_CACHE_CLOUDFLARE_API_TOKEN."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Missing variable UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID."
+            exit 1
+          fi
+
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_cache_proxy
-          command: deploy
+          command: deploy --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
 
       - name: Set Worker secrets
         working-directory: workers/uk_aq_cache_proxy
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           secrets_json="$(jq -n \
@@ -43,9 +58,9 @@ jobs:
             --arg UK_AQ_CACHE_BYPASS_SECRET "${{ secrets.UK_AQ_CACHE_BYPASS_SECRET }}" \
             --arg UK_AQ_TURNSTILE_SECRET_KEY "${{ secrets.UK_AQ_TURNSTILE_SECRET_KEY }}" \
             --arg UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS "${{ vars.UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS }}" \
-            '{SUPABASE_URL: $SUPABASE_URL, SB_PUBLISHABLE_DEFAULT_KEY: $SB_PUBLISHABLE_DEFAULT_KEY, UK_AQ_CACHE_ALLOWED_ORIGINS: $UK_AQ_CACHE_ALLOWED_ORIGINS, UK_AQ_EDGE_ACCESS_TOKEN_SECRET: $UK_AQ_EDGE_ACCESS_TOKEN_SECRET, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_CACHE_BYPASS_SECRET: $UK_AQ_CACHE_BYPASS_SECRET, UK_AQ_TURNSTILE_SECRET_KEY: $UK_AQ_TURNSTILE_SECRET_KEY, UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: $UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS} | with_entries(select(.value != \"\"))')"
+            '{SUPABASE_URL: $SUPABASE_URL, SB_PUBLISHABLE_DEFAULT_KEY: $SB_PUBLISHABLE_DEFAULT_KEY, UK_AQ_CACHE_ALLOWED_ORIGINS: $UK_AQ_CACHE_ALLOWED_ORIGINS, UK_AQ_EDGE_ACCESS_TOKEN_SECRET: $UK_AQ_EDGE_ACCESS_TOKEN_SECRET, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_CACHE_BYPASS_SECRET: $UK_AQ_CACHE_BYPASS_SECRET, UK_AQ_TURNSTILE_SECRET_KEY: $UK_AQ_TURNSTILE_SECRET_KEY, UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: $UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
-            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-cache-proxy; then
+            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_CACHE_WORKER_NAME}"; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -58,7 +73,7 @@ jobs:
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_cache_proxy
-          command: deploy
+          command: deploy --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
