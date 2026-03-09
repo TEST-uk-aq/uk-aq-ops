@@ -107,7 +107,7 @@ jobs:
             exit 1
           fi
 
-          dropbox_token="$(DROPBOX_ACCESS_TOKEN="${dropbox_access_token}" DROPBOX_REFRESH_TOKEN="${DROPBOX_REFRESH_TOKEN}" python3 -c 'import json, os; print(json.dumps({\"access_token\": os.environ[\"DROPBOX_ACCESS_TOKEN\"], \"token_type\": \"bearer\", \"refresh_token\": os.environ[\"DROPBOX_REFRESH_TOKEN\"], \"expiry\": \"0001-01-01T00:00:00Z\"}, separators=(\",\", \":\")))')"
+          dropbox_token="$(DROPBOX_ACCESS_TOKEN="${dropbox_access_token}" DROPBOX_REFRESH_TOKEN="${DROPBOX_REFRESH_TOKEN}" python3 -c 'import json, os; print(json.dumps({"access_token": os.environ["DROPBOX_ACCESS_TOKEN"], "token_type": "bearer", "refresh_token": os.environ["DROPBOX_REFRESH_TOKEN"], "expiry": "0001-01-01T00:00:00Z"}, separators=(",", ":")))')"
 
           mkdir -p "$(dirname "${RCLONE_CONFIG}")"
           {
