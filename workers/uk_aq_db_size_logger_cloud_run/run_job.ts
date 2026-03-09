@@ -233,6 +233,14 @@ function isRetryableStatus(status: number): boolean {
     status === 504;
 }
 
+function isRetryableErrorMessage(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  return normalized.includes("statement timeout") ||
+    normalized.includes("canceling statement due to statement timeout") ||
+    normalized.includes("deadlock detected") ||
+    normalized.includes("could not serialize access due to");
+}
+
 function normalizeUrl(baseUrl: string): string {
   const trimmed = baseUrl.trim().replace(/\/$/, "");
   return `${trimmed}/rest/v1`;
@@ -303,13 +311,17 @@ async function postgrestRpc<T>(
         return { data: payload as T, error: null };
       }
 
-      if (attempt < RPC_RETRIES && isRetryableStatus(response.status)) {
+      const errorMessage = asErrorMessage(payload, response.status);
+      const retryable = isRetryableStatus(response.status) ||
+        isRetryableErrorMessage(errorMessage);
+
+      if (attempt < RPC_RETRIES && retryable) {
         await sleep(Math.min(5000, 1000 * attempt));
         continue;
       }
       return {
         data: null,
-        error: { message: asErrorMessage(payload, response.status) },
+        error: { message: errorMessage },
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
