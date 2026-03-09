@@ -16,7 +16,7 @@ Each gcloud-facing service now lives under `workers/`:
 - `workers/uk_aq_observs_outbox_flush_service/server.mjs`
 - `workers/uk_aq_observs_partition_maintenance_service/server.mjs`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
-- `workers/uk_aq_aqi_station_obs_aqi_cloud_run/run_service.ts`
+- `workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`
 - `workers/uk_aq_backfill_cloud_run/run_service.ts`
 
 ## Services
@@ -89,7 +89,7 @@ Primary controls:
 - preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
 - optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 
-### 6) Station AQI Obs AQI Worker (`workers/uk_aq_aqi_station_obs_aqi_cloud_run/run_service.ts`)
+### 6) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
 
 - `GET /` health
 - `POST /` executes AQI run job
@@ -177,12 +177,12 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_observs_outbox_flush_service_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
-- `/.github/workflows/uk_aq_aqi_station_obs_aqi_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_station_aqi_hourly_cloud_run_deploy.yml`
 
 ## Setup docs
 
 - `system_docs/uk-aq-ingestdb-prune.md`
 - `system_docs/uk-aq-observs-outbox-flush-service.md`
 - `system_docs/uk-aq-observs-partition-maintenance.md`
-- `system_docs/uk-aq-aqi-station-obs-aqi.md`
+- `system_docs/uk-aq-station-aqi-hourly.md`
 - `system_docs/uk-aq-backfill-cloud-run.md`

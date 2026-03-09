@@ -183,7 +183,7 @@ async function postgrestRpc<T>(
     Accept: "application/json",
     "Accept-Profile": RPC_SCHEMA,
     "Content-Profile": RPC_SCHEMA,
-    "x-ukaq-egress-caller": "uk_aq_aqi_station_obs_aqi_cloud_run",
+    "x-ukaq-egress-caller": "uk_aq_station_aqi_hourly_cloud_run",
   };
 
   for (let attempt = 1; attempt <= RPC_RETRIES; attempt += 1) {

@@ -1,4 +1,4 @@
-# UK AQ Station AQI Obs AQI Cloud Run
+# UK AQ Station AQI Hourly Cloud Run
 
 Syncs precomputed station-hour AQI helper rows from ingest DB into Obs AQI DB (hourly upsert + daily/monthly rollup refresh).
 
