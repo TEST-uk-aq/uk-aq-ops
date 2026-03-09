@@ -40,7 +40,7 @@ jobs:
 
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '/CIC-Test' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
       UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v1.json' }}
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
@@ -145,9 +145,9 @@ jobs:
           fi
 
           dropbox_root="${UK_AQ_DROPBOX_ROOT%/}"
-          if [ -z "${dropbox_root}" ]; then
-            dropbox_root="/"
-          fi
+          # Dropbox app-folder tokens use app-relative paths; leading slash causes
+          # "path root is not supported for sandbox app" for some operations.
+          dropbox_root="${dropbox_root#/}"
 
           dropbox_dir="${UK_AQ_R2_HISTORY_DROPBOX_DIR#/}"
           dropbox_dir="${dropbox_dir%/}"
@@ -156,10 +156,10 @@ jobs:
             exit 1
           fi
 
-          if [ "${dropbox_root}" = "/" ]; then
-            dropbox_backup_root="/${dropbox_dir}"
-          else
+          if [ -n "${dropbox_root}" ]; then
             dropbox_backup_root="${dropbox_root}/${dropbox_dir}"
+          else
+            dropbox_backup_root="${dropbox_dir}"
           fi
 
           cmd=(

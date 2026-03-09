@@ -163,7 +163,7 @@ Run manifest-aware incremental R2 History -> Dropbox backup:
 ```bash
 node scripts/backup_r2/sync_history_to_dropbox.mjs \
   --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
-  --dest-root "uk_aq_dropbox:/CIC-Test/R2_history_backup"
+  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup"
 ```
 
 Notes:
