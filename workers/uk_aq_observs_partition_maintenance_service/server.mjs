@@ -16,7 +16,7 @@ const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
 const DEFAULT_FUTURE_PARTITION_DAYS = 3;
 const DEFAULT_HOT_PARTITION_DAYS = 3;
-const DEFAULT_COMPLETE_LOCAL_DAYS = 31;
+const DEFAULT_OBSERVS_RETENTION_DAYS = 14;
 const DEFAULT_DEFAULT_TOP_N = 20;
 const DEFAULT_DROP_DRY_RUN = false;
 
@@ -319,9 +319,9 @@ function zonedLocalDateTimeToUtc(localParts, timeZoneFormatter) {
   return new Date(utcEpoch);
 }
 
-function computeRetentionCutoffUtc(now, completeLocalDays) {
+function computeRetentionCutoffUtc(now, retentionDays) {
   const londonToday = getLondonDateParts(now);
-  const earliestKeptLocalDate = shiftLocalDateParts(londonToday, -completeLocalDays);
+  const earliestKeptLocalDate = shiftLocalDateParts(londonToday, -retentionDays);
   return zonedLocalDateTimeToUtc(
     {
       year: earliestKeptLocalDate.year,
@@ -350,9 +350,9 @@ function buildObservsConfig(url) {
     1,
     10,
   );
-  const completeLocalDays = parsePositiveInt(
-    params.get("completeLocalDays") ?? process.env.OBSERVS_COMPLETE_LOCAL_DAYS,
-    DEFAULT_COMPLETE_LOCAL_DAYS,
+  const observsRetentionDays = parsePositiveInt(
+    params.get("retentionDays") ?? process.env.OBS_AQIDB_OBSERVS_RETENTION_DAYS,
+    DEFAULT_OBSERVS_RETENTION_DAYS,
     1,
     365,
   );
@@ -372,7 +372,7 @@ function buildObservsConfig(url) {
     observsSecretKey: requiredEnvAny(["OBS_AQIDB_SECRET_KEY"]),
     futurePartitionDays,
     hotPartitionDays,
-    completeLocalDays,
+    observsRetentionDays,
     defaultTopN,
     dropDryRun,
     r2: {
@@ -626,7 +626,7 @@ async function runObservsPartitionMaintenance(config) {
   const hotEndDayUtc = futureEndDayUtc;
   const hotStartDayUtc = shiftIsoDate(todayUtc, -(config.hotPartitionDays - 1));
 
-  const retentionCutoffUtc = computeRetentionCutoffUtc(now, config.completeLocalDays);
+  const retentionCutoffUtc = computeRetentionCutoffUtc(now, config.observsRetentionDays);
   const retentionCutoffIso = retentionCutoffUtc.toISOString();
   const cutoffFloorDayUtc = retentionCutoffIso.slice(0, 10);
   const ensureStartDayUtc = minIsoDate(hotStartDayUtc, cutoffFloorDayUtc);
@@ -638,7 +638,7 @@ async function runObservsPartitionMaintenance(config) {
     hot_end_day_utc: hotEndDayUtc,
     ensure_start_day_utc: ensureStartDayUtc,
     ensure_end_day_utc: futureEndDayUtc,
-    complete_local_days: config.completeLocalDays,
+    observs_retention_days: config.observsRetentionDays,
     retention_cutoff_utc: retentionCutoffIso,
     drop_dry_run: config.dropDryRun,
   });
@@ -834,7 +834,7 @@ async function runObservsPartitionMaintenance(config) {
     ensure_start_day_utc: ensureStartDayUtc,
     ensure_end_day_utc: futureEndDayUtc,
     retention_cutoff_utc: retentionCutoffIso,
-    complete_local_days: config.completeLocalDays,
+    observs_retention_days: config.observsRetentionDays,
     drop_dry_run: config.dropDryRun,
     ensured_partition_count: ensured.length,
     ensured_partitions_preview: ensured.slice(0, 25),
@@ -949,7 +949,7 @@ server.listen(port, () => {
     defaults: {
       future_partition_days: DEFAULT_FUTURE_PARTITION_DAYS,
       hot_partition_days: DEFAULT_HOT_PARTITION_DAYS,
-      complete_local_days: DEFAULT_COMPLETE_LOCAL_DAYS,
+      observs_retention_days: DEFAULT_OBSERVS_RETENTION_DAYS,
       default_top_n: DEFAULT_DEFAULT_TOP_N,
       drop_dry_run: DEFAULT_DROP_DRY_RUN,
     },

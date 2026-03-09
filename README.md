@@ -5,6 +5,7 @@ Cloud Run operations services for:
 - pruning verified ingest rows after parity checks against `obs_aqidb` (`uk_aq_observs`)
 - flushing ingest outbox rows into `obs_aqidb` (`uk_aq_observs`)
 - maintaining `uk_aq_observs` partitions/index policy/retention
+- enforcing `uk_aq_aqilevels` retention with manifest-gated day cleanup
 - logging ingest/obs_aqidb database size samples
 - running operational backfill workflows across ingest/obs_aqidb
 
@@ -15,6 +16,7 @@ Each gcloud-facing service now lives under `workers/`:
 - `workers/uk_aq_prune_daily/server.mjs`
 - `workers/uk_aq_observs_outbox_flush_service/server.mjs`
 - `workers/uk_aq_observs_partition_maintenance_service/server.mjs`
+- `workers/uk_aq_aqilevels_retention_service/server.mjs`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
 - `workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`
 - `workers/uk_aq_backfill_cloud_run/run_service.ts`
@@ -81,7 +83,16 @@ Primary controls:
 - upserts metrics and runs retention cleanup in each source DB's local metrics table
 - default GitHub deploy keeps Cloud Scheduler disabled; Supabase `pg_cron` is the primary hourly scheduler
 
-### 5) DB Size Metrics API Worker (`workers/uk_aq_db_size_metrics_api_worker/worker.mjs`)
+### 5) AQI Levels Retention (`workers/uk_aq_aqilevels_retention_service/server.mjs`)
+
+- `POST /run`
+- computes retention cutoff using Europe/London local-day policy
+- lists AQI day candidates older than cutoff from `uk_aq_aqilevels`
+- checks committed R2 History manifest per day:
+  - `history/v1/aqilevels/day_utc=YYYY-MM-DD/manifest.json`
+- deletes only days with confirmed committed manifest
+
+### 6) DB Size Metrics API Worker (`workers/uk_aq_db_size_metrics_api_worker/worker.mjs`)
 
 - `GET /v1/db-size-metrics`
 - dashboard fan-in endpoint for DB size trend rows
@@ -89,7 +100,7 @@ Primary controls:
 - preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
 - optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 
-### 6) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
+### 7) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
 
 - `GET /` health
 - `POST /` executes AQI run job
@@ -98,7 +109,7 @@ Primary controls:
 - upserts `station_aqi_hourly` and refreshes daily/monthly rollups in `uk_aq_aqilevels`
 - logs run telemetry (`aqi_compute_runs`) with 7-day retention cleanup
 
-### 7) Backfill Worker (`workers/uk_aq_backfill_cloud_run/run_service.ts`)
+### 8) Backfill Worker (`workers/uk_aq_backfill_cloud_run/run_service.ts`)
 
 - `GET /` health
 - `POST /` executes backfill job
@@ -122,6 +133,7 @@ npm install
 npm run start:prune
 npm run start:flush
 npm run start:observs-partitions
+npm run start:aqilevels-retention
 deno run --allow-env --allow-net --allow-read --allow-write --allow-run workers/uk_aq_backfill_cloud_run/run_service.ts
 ```
 
@@ -176,6 +188,7 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_observs_outbox_flush_service_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_aqilevels_retention_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_station_aqi_hourly_cloud_run_deploy.yml`
 
@@ -184,5 +197,6 @@ Apply in Supabase SQL editor:
 - `system_docs/uk-aq-ingestdb-prune.md`
 - `system_docs/uk-aq-observs-outbox-flush-service.md`
 - `system_docs/uk-aq-observs-partition-maintenance.md`
+- `system_docs/uk-aq-aqilevels-retention.md`
 - `system_docs/uk-aq-station-aqi-hourly.md`
 - `system_docs/uk-aq-backfill-cloud-run.md`
