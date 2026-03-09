@@ -1641,6 +1641,7 @@ from uk_aq_ops.prune_day_gates g
 where g.day_utc in (${literalList})
   and g.history_done is true
   and nullif(btrim(g.history_manifest_key), '') is not null
+  and g.history_manifest_key ~ '^history/v1/(observations|aqilevels)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$'
   and g.history_completed_at is not null
 `;
     const result = await client.query(sql);
