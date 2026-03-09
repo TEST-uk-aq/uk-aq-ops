@@ -1,0 +1,198 @@
+name: UK AQ R2 History Dropbox Backup
+
+on:
+  schedule:
+    - cron: "35 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without writing copy/checkpoint changes"
+        required: false
+        default: false
+        type: boolean
+      max_days_per_run:
+        description: "Override max new days copied per domain (0 = unlimited)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-r2-history-dropbox-backup
+  cancel-in-progress: false
+
+jobs:
+  backup-r2-history-to-dropbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '/CIC-Test' }}
+      UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
+      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v1.json' }}
+      UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
+
+      INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          required_vars=(
+            CFLARE_R2_ENDPOINT
+            CFLARE_R2_BUCKET
+            CFLARE_R2_ACCESS_KEY_ID
+            CFLARE_R2_SECRET_ACCESS_KEY
+            DROPBOX_APP_KEY
+            DROPBOX_APP_SECRET
+            DROPBOX_REFRESH_TOKEN
+            UK_AQ_DROPBOX_ROOT
+            UK_AQ_R2_HISTORY_DROPBOX_DIR
+          )
+
+          missing=0
+          for key in "${required_vars[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required value: ${key}" >&2
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Configure rclone remotes
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
+        run: |
+          set -euo pipefail
+
+          endpoint="${CFLARE_R2_ENDPOINT%/}"
+          dropbox_access_token="$(curl -fsS https://api.dropbox.com/oauth2/token \
+            -u "${DROPBOX_APP_KEY}:${DROPBOX_APP_SECRET}" \
+            -d grant_type=refresh_token \
+            --data-urlencode "refresh_token=${DROPBOX_REFRESH_TOKEN}" \
+            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("access_token",""))')"
+
+          if [ -z "${dropbox_access_token}" ]; then
+            echo "Failed to fetch Dropbox access token from refresh token" >&2
+            exit 1
+          fi
+
+          dropbox_token="$(DROPBOX_ACCESS_TOKEN="${dropbox_access_token}" DROPBOX_REFRESH_TOKEN="${DROPBOX_REFRESH_TOKEN}" python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+  "access_token": os.environ["DROPBOX_ACCESS_TOKEN"],
+  "token_type": "bearer",
+  "refresh_token": os.environ["DROPBOX_REFRESH_TOKEN"],
+  "expiry": "0001-01-01T00:00:00Z"
+}, separators=(",", ":")))
+PY
+)"
+
+          mkdir -p "$(dirname "${RCLONE_CONFIG}")"
+          cat > "${RCLONE_CONFIG}" <<RCLONECFG
+[uk_aq_r2]
+type = s3
+provider = Cloudflare
+env_auth = false
+access_key_id = ${CFLARE_R2_ACCESS_KEY_ID}
+secret_access_key = ${CFLARE_R2_SECRET_ACCESS_KEY}
+endpoint = ${endpoint}
+region = ${CFLARE_R2_REGION}
+acl = private
+no_check_bucket = true
+
+[uk_aq_dropbox]
+type = dropbox
+client_id = ${DROPBOX_APP_KEY}
+client_secret = ${DROPBOX_APP_SECRET}
+token = ${dropbox_token}
+RCLONECFG
+
+          chmod 600 "${RCLONE_CONFIG}"
+
+          # shellcheck disable=SC2016
+          echo "RCLONE_CONFIG=${RCLONE_CONFIG}" >> "$GITHUB_ENV"
+
+      - name: Run manifest-aware incremental backup
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+
+          max_days="${INPUT_MAX_DAYS_PER_RUN:-}"
+          if [ -z "${max_days}" ]; then
+            max_days="${UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN}"
+          fi
+
+          dropbox_root="${UK_AQ_DROPBOX_ROOT%/}"
+          if [ -z "${dropbox_root}" ]; then
+            dropbox_root="/"
+          fi
+
+          dropbox_dir="${UK_AQ_R2_HISTORY_DROPBOX_DIR#/}"
+          dropbox_dir="${dropbox_dir%/}"
+          if [ -z "${dropbox_dir}" ]; then
+            echo "UK_AQ_R2_HISTORY_DROPBOX_DIR must not be empty" >&2
+            exit 1
+          fi
+
+          if [ "${dropbox_root}" = "/" ]; then
+            dropbox_backup_root="/${dropbox_dir}"
+          else
+            dropbox_backup_root="${dropbox_root}/${dropbox_dir}"
+          fi
+
+          cmd=(
+            node scripts/backup_r2/sync_history_to_dropbox.mjs
+            --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
+            --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
+            --state-rel-path "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}"
+            --max-days-per-run "${max_days}"
+            --report-out "tmp/r2_history_dropbox_backup_report.json"
+          )
+
+          if [ "${INPUT_DRY_RUN}" = "true" ]; then
+            cmd+=(--dry-run)
+          fi
+
+          echo "Running: ${cmd[*]}"
+          "${cmd[@]}"
+
+      - name: Upload backup report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-r2-history-dropbox-backup-report
+          path: tmp/r2_history_dropbox_backup_report.json
+          if-no-files-found: ignore

@@ -158,6 +158,22 @@ node scripts/backup_r2/download_day.mjs --day 2026-02-20 --out ./tmp/backup_down
 node scripts/backup_r2/download_day.mjs --day 2026-02-20 --connector 4 --out ./tmp/backup_download
 ```
 
+Run manifest-aware incremental R2 History -> Dropbox backup:
+
+```bash
+node scripts/backup_r2/sync_history_to_dropbox.mjs \
+  --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
+  --dest-root "uk_aq_dropbox:/CIC-Test/R2_history_backup"
+```
+
+Notes:
+- Dropbox layout mirrors R2 History layout exactly:
+  - `history/v1/observations/day_utc=YYYY-MM-DD/...`
+  - `history/v1/aqilevels/day_utc=YYYY-MM-DD/...`
+- No `YYYY/YYYY-MM` reshaping is applied.
+- Checkpoint file default:
+  - `_ops/checkpoints/r2_history_backup_state_v1.json`
+
 ## Env + GitHub sync
 
 Repo-local files:
@@ -199,6 +215,7 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_aqilevels_retention_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_station_aqi_hourly_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_r2_history_dropbox_backup.yml`
 
 ## Setup docs
 
@@ -208,3 +225,4 @@ Apply in Supabase SQL editor:
 - `system_docs/uk-aq-aqilevels-retention.md`
 - `system_docs/uk-aq-station-aqi-hourly.md`
 - `system_docs/uk-aq-backfill-cloud-run.md`
+- `system_docs/uk-aq-r2-history-dropbox-backup.md`
