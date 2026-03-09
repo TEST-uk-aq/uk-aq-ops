@@ -1,5 +1,14 @@
+import {
+  hasRequiredR2Config,
+  normalizePrefix,
+  r2HeadObject,
+  r2ListAllCommonPrefixes,
+} from "../shared/r2_sigv4.mjs";
+
 const DEFAULT_LOOKBACK_DAYS = 28;
 const MAX_LOOKBACK_DAYS = 120;
+const R2_HISTORY_DAYS_MAX_LOOKBACK_DAYS = 3660;
+const R2_HISTORY_DAYS_DEFAULT_MAX_LOOKBACK_DAYS = 120;
 
 function corsHeaders() {
   return {
@@ -28,6 +37,14 @@ function parsePositiveInt(raw, fallback) {
   return Math.trunc(value);
 }
 
+function parseNonNegativeInt(raw, fallback) {
+  const value = Number(raw || "");
+  if (!Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  return Math.trunc(value);
+}
+
 function toIsoOrNull(value) {
   if (typeof value !== "string" || !value.trim()) {
     return null;
@@ -37,6 +54,32 @@ function toIsoOrNull(value) {
     return null;
   }
   return new Date(ms).toISOString();
+}
+
+function parseIsoDay(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return null;
+  }
+  const ms = Date.parse(`${trimmed}T00:00:00.000Z`);
+  if (Number.isNaN(ms)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function normalizeBucketName(value) {
+  const bucket = String(value || "").trim();
+  if (!bucket) {
+    return "";
+  }
+  if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) {
+    return "";
+  }
+  return bucket;
 }
 
 function normalizeDbSizeRows(rows, expectedLabel) {
@@ -135,6 +178,136 @@ function sourceConfigs(env) {
   }
 
   return configs;
+}
+
+function resolveR2Config(env, bucketName) {
+  return {
+    endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
+    bucket: String(bucketName || "").trim(),
+    region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
+    access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
+    secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
+  };
+}
+
+function resolveR2HistoryBucket(env) {
+  const bucket = normalizeBucketName(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "");
+  if (!bucket) {
+    throw new Error("Missing bucket env CFLARE_R2_BUCKET/R2_BUCKET");
+  }
+  return bucket;
+}
+
+function sortedDayArray(daySet, maxLookbackDays) {
+  const sorted = Array.from(daySet).sort((a, b) => a.localeCompare(b));
+  if (maxLookbackDays <= 0 || sorted.length === 0) {
+    return sorted;
+  }
+  const cutoff = new Date(Date.now() - maxLookbackDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+  return sorted.filter((day) => day >= cutoff);
+}
+
+async function listCommittedDaysForDomain({
+  r2,
+  domainPrefix,
+  maxKeys,
+  maxLookbackDays,
+}) {
+  const domainRoot = `${domainPrefix}/`;
+  const folderPrefixes = await r2ListAllCommonPrefixes({
+    r2,
+    prefix: domainRoot,
+    delimiter: "/",
+    max_keys: maxKeys,
+  });
+
+  const discoveredDays = new Set();
+  for (const prefix of folderPrefixes) {
+    const match = prefix.match(/day_utc=(\d{4}-\d{2}-\d{2})\/$/);
+    if (!match) {
+      continue;
+    }
+    const day = parseIsoDay(match[1]);
+    if (!day) {
+      continue;
+    }
+    const manifestKey = `${domainPrefix}/day_utc=${day}/manifest.json`;
+    const manifest = await r2HeadObject({ r2, key: manifestKey });
+    if (!manifest.exists) {
+      continue;
+    }
+    discoveredDays.add(day);
+  }
+
+  const days = sortedDayArray(discoveredDays, maxLookbackDays);
+  const minDay = days.length ? days[0] : null;
+  const maxDay = days.length ? days[days.length - 1] : null;
+  return {
+    days,
+    min_day_utc: minDay,
+    max_day_utc: maxDay,
+    day_count: days.length,
+  };
+}
+
+async function fetchR2HistoryDays(env, url) {
+  const maxKeys = Math.max(
+    100,
+    Math.min(1000, parsePositiveInt(url.searchParams.get("max_keys"), 1000)),
+  );
+  const maxLookbackDays = Math.max(
+    0,
+    Math.min(
+      R2_HISTORY_DAYS_MAX_LOOKBACK_DAYS,
+      parseNonNegativeInt(
+        url.searchParams.get("max_days"),
+        R2_HISTORY_DAYS_DEFAULT_MAX_LOOKBACK_DAYS,
+      ),
+    ),
+  );
+
+  const bucket = resolveR2HistoryBucket(env);
+  const r2 = resolveR2Config(env, bucket);
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing R2 config for history days API (endpoint/bucket/region/access credentials)");
+  }
+
+  const observationsPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations",
+  );
+  const aqilevelsPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels",
+  );
+
+  const observations = await listCommittedDaysForDomain({
+    r2,
+    domainPrefix: observationsPrefix,
+    maxKeys,
+    maxLookbackDays,
+  });
+  const aqilevels = await listCommittedDaysForDomain({
+    r2,
+    domainPrefix: aqilevelsPrefix,
+    maxKeys,
+    maxLookbackDays,
+  });
+
+  return {
+    bucket,
+    max_keys: maxKeys,
+    max_days: maxLookbackDays,
+    prefixes: {
+      observations: observationsPrefix,
+      aqilevels: aqilevelsPrefix,
+    },
+    domains: {
+      observations,
+      aqilevels,
+    },
+    source: "cloudflare_r2_manifest_scan",
+  };
 }
 
 async function fetchDbSizeRowsForSource(env, source, lookbackDays) {
@@ -419,8 +592,12 @@ export default {
     }
 
     const url = new URL(request.url);
-    const allowedPaths = new Set(["/", "/db-size-metrics", "/v1/db-size-metrics"]);
-    if (!allowedPaths.has(url.pathname)) {
+    const dbSizePaths = new Set(["/", "/db-size-metrics", "/v1/db-size-metrics"]);
+    const r2HistoryDaysPaths = new Set(["/r2-history-days", "/v1/r2-history-days"]);
+    const isDbSizePath = dbSizePaths.has(url.pathname);
+    const isR2HistoryDaysPath = r2HistoryDaysPaths.has(url.pathname);
+
+    if (!isDbSizePath && !isR2HistoryDaysPath) {
       return jsonResponse({ error: "Not found" }, 404);
     }
 
@@ -430,6 +607,47 @@ export default {
 
     if (!isAuthorized(request, env)) {
       return jsonResponse({ error: "Unauthorized" }, 401);
+    }
+
+    if (isR2HistoryDaysPath) {
+      try {
+        const result = await fetchR2HistoryDays(env, url);
+        return jsonResponse({
+          generated_at: new Date().toISOString(),
+          ...result,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return jsonResponse(
+          {
+            generated_at: new Date().toISOString(),
+            bucket: null,
+            max_keys: null,
+            max_days: null,
+            prefixes: {
+              observations: null,
+              aqilevels: null,
+            },
+            domains: {
+              observations: {
+                days: [],
+                min_day_utc: null,
+                max_day_utc: null,
+                day_count: 0,
+              },
+              aqilevels: {
+                days: [],
+                min_day_utc: null,
+                max_day_utc: null,
+                day_count: 0,
+              },
+            },
+            source: "cloudflare_r2_manifest_scan",
+            error: message,
+          },
+          500,
+        );
+      }
     }
 
     const requestedLookback = parsePositiveInt(url.searchParams.get("lookback_days"), DEFAULT_LOOKBACK_DAYS);

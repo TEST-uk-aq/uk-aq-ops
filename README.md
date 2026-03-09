@@ -92,11 +92,13 @@ Primary controls:
   - `history/v1/aqilevels/day_utc=YYYY-MM-DD/manifest.json`
 - deletes only days with confirmed committed manifest
 
-### 6) DB Size Metrics API Worker (`workers/uk_aq_db_size_metrics_api_worker/worker.mjs`)
+### 6) DB + R2 Metrics API Worker (`workers/uk_aq_db_size_metrics_api_worker/worker.mjs`)
 
 - `GET /v1/db-size-metrics`
+- `GET /v1/r2-history-days`
 - dashboard fan-in endpoint for DB size trend rows
 - reads `uk_aq_public.uk_aq_db_size_metrics_hourly` from ingest + obs_aqidb
+- scans committed R2 History day manifests for observations + aqilevels
 - preserves null `oldest_observed_at` values for placeholder rendering in dashboard tooltips
 - optional bearer token gate (`UK_AQ_DB_SIZE_API_TOKEN`)
 

@@ -307,6 +307,7 @@ function decodeXmlEntities(value) {
 
 function parseListObjectsXml(xml) {
   const entries = [];
+  const commonPrefixes = [];
   const contentMatches = [...xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)];
   for (const match of contentMatches) {
     const block = match[1];
@@ -325,14 +326,31 @@ function parseListObjectsXml(xml) {
     });
   }
 
+  const prefixMatches = [...xml.matchAll(/<CommonPrefixes>([\s\S]*?)<\/CommonPrefixes>/g)];
+  for (const match of prefixMatches) {
+    const block = match[1];
+    const prefixMatch = block.match(/<Prefix>([^<]+)<\/Prefix>/);
+    if (!prefixMatch) {
+      continue;
+    }
+    commonPrefixes.push(decodeXmlEntities(prefixMatch[1]));
+  }
+
   const tokenMatch = xml.match(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/);
   return {
     entries,
+    common_prefixes: commonPrefixes,
     next_token: tokenMatch ? decodeXmlEntities(tokenMatch[1]) : null,
   };
 }
 
-export async function r2ListObjectsV2({ r2, prefix, continuation_token = null, max_keys = 1000 }) {
+export async function r2ListObjectsV2({
+  r2,
+  prefix,
+  continuation_token = null,
+  max_keys = 1000,
+  delimiter = null,
+}) {
   const query = {
     "list-type": 2,
     "max-keys": String(max_keys),
@@ -340,6 +358,9 @@ export async function r2ListObjectsV2({ r2, prefix, continuation_token = null, m
   };
   if (continuation_token) {
     query["continuation-token"] = continuation_token;
+  }
+  if (delimiter) {
+    query.delimiter = delimiter;
   }
 
   const request = buildAwsSignedRequest({
@@ -384,6 +405,26 @@ export async function r2ListAllObjects({ r2, prefix, max_keys = 1000 }) {
     token = page.next_token;
   }
   return entries;
+}
+
+export async function r2ListAllCommonPrefixes({ r2, prefix, delimiter = "/", max_keys = 1000 }) {
+  const prefixes = [];
+  let token = null;
+  for (;;) {
+    const page = await r2ListObjectsV2({
+      r2,
+      prefix,
+      continuation_token: token,
+      max_keys,
+      delimiter,
+    });
+    prefixes.push(...(Array.isArray(page.common_prefixes) ? page.common_prefixes : []));
+    if (!page.next_token) {
+      break;
+    }
+    token = page.next_token;
+  }
+  return Array.from(new Set(prefixes)).sort((a, b) => a.localeCompare(b));
 }
 
 function buildDeleteObjectsXml(keys) {

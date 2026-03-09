@@ -1,6 +1,7 @@
-name = "uk-aq-db-size-metrics-api"
+name = "uk-aq-db-r2-metrics-api"
 main = "worker.mjs"
 compatibility_date = "2026-03-04"
+compatibility_flags = ["nodejs_compat"]
 
 [vars]
 UK_AQ_PUBLIC_SCHEMA = "uk_aq_public"

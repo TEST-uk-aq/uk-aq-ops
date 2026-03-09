@@ -1,4 +1,4 @@
-name: Deploy uk_aq_db_size_metrics_api Worker
+name: Deploy uk_aq_db_r2_metrics_api Worker
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_db_size_metrics_api_worker/**"
-      - ".github/workflows/uk_aq_db_size_metrics_api_worker_deploy.yml"
+      - ".github/workflows/uk_aq_db_r2_metrics_api_worker_deploy.yml"
   workflow_dispatch:
 
 permissions:
@@ -39,10 +39,17 @@ jobs:
             --arg SB_SECRET_KEY "${{ secrets.SB_SECRET_KEY }}" \
             --arg OBS_AQIDB_SUPABASE_URL "${{ vars.OBS_AQIDB_SUPABASE_URL }}" \
             --arg OBS_AQIDB_SECRET_KEY "${{ secrets.OBS_AQIDB_SECRET_KEY }}" \
+            --arg CFLARE_R2_ENDPOINT "${{ vars.CFLARE_R2_ENDPOINT }}" \
+            --arg CFLARE_R2_BUCKET "${{ vars.CFLARE_R2_BUCKET }}" \
+            --arg CFLARE_R2_REGION "${{ vars.CFLARE_R2_REGION }}" \
+            --arg CFLARE_R2_ACCESS_KEY_ID "${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}" \
+            --arg CFLARE_R2_SECRET_ACCESS_KEY "${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}" \
+            --arg UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX "${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}" \
+            --arg UK_AQ_R2_HISTORY_AQILEVELS_PREFIX "${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}" \
             --arg UK_AQ_DB_SIZE_API_TOKEN "${{ secrets.UK_AQ_DB_SIZE_API_TOKEN }}" \
-            '{SUPABASE_URL: $SUPABASE_URL, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, UK_AQ_DB_SIZE_API_TOKEN: $UK_AQ_DB_SIZE_API_TOKEN} | with_entries(select(.value != ""))')"
+            '{SUPABASE_URL: $SUPABASE_URL, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, CFLARE_R2_ENDPOINT: $CFLARE_R2_ENDPOINT, CFLARE_R2_BUCKET: $CFLARE_R2_BUCKET, CFLARE_R2_REGION: $CFLARE_R2_REGION, CFLARE_R2_ACCESS_KEY_ID: $CFLARE_R2_ACCESS_KEY_ID, CFLARE_R2_SECRET_ACCESS_KEY: $CFLARE_R2_SECRET_ACCESS_KEY, UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: $UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX, UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: $UK_AQ_R2_HISTORY_AQILEVELS_PREFIX, UK_AQ_DB_SIZE_API_TOKEN: $UK_AQ_DB_SIZE_API_TOKEN} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
-            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-db-size-metrics-api; then
+            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-db-r2-metrics-api; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then

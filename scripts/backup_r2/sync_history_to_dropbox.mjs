@@ -49,7 +49,7 @@ function usage() {
       "    --dest-root <rclone-destination-root> [options]",
       "",
       "Required:",
-      "  --source-root   Example: uk_aq_r2:uk-aq-backup-cic-test",
+      "  --source-root   Example: uk_aq_r2:uk-aq-history-cic-test",
       "  --dest-root     Example: uk_aq_dropbox:/CIC-Test/R2_history_backup",
       "",
       "Optional:",

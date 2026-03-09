@@ -8,5 +8,5 @@ AQI_R2_TEST_CACHE_MAX_AGE_SECONDS = "300"
 
 [[r2_buckets]]
 binding = "AQI_R2_TEST_BUCKET"
-bucket_name = "uk-aq-backup-cic-test"
-preview_bucket_name = "uk-aq-backup-cic-test"
+bucket_name = "uk-aq-history-cic-test"
+preview_bucket_name = "uk-aq-history-cic-test"
