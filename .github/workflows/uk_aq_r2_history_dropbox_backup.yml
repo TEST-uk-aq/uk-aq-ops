@@ -107,38 +107,27 @@ jobs:
             exit 1
           fi
 
-          dropbox_token="$(DROPBOX_ACCESS_TOKEN="${dropbox_access_token}" DROPBOX_REFRESH_TOKEN="${DROPBOX_REFRESH_TOKEN}" python3 - <<'PY'
-import json
-import os
-
-print(json.dumps({
-  "access_token": os.environ["DROPBOX_ACCESS_TOKEN"],
-  "token_type": "bearer",
-  "refresh_token": os.environ["DROPBOX_REFRESH_TOKEN"],
-  "expiry": "0001-01-01T00:00:00Z"
-}, separators=(",", ":")))
-PY
-)"
+          dropbox_token="$(DROPBOX_ACCESS_TOKEN="${dropbox_access_token}" DROPBOX_REFRESH_TOKEN="${DROPBOX_REFRESH_TOKEN}" python3 -c 'import json, os; print(json.dumps({\"access_token\": os.environ[\"DROPBOX_ACCESS_TOKEN\"], \"token_type\": \"bearer\", \"refresh_token\": os.environ[\"DROPBOX_REFRESH_TOKEN\"], \"expiry\": \"0001-01-01T00:00:00Z\"}, separators=(\",\", \":\")))')"
 
           mkdir -p "$(dirname "${RCLONE_CONFIG}")"
-          cat > "${RCLONE_CONFIG}" <<RCLONECFG
-[uk_aq_r2]
-type = s3
-provider = Cloudflare
-env_auth = false
-access_key_id = ${CFLARE_R2_ACCESS_KEY_ID}
-secret_access_key = ${CFLARE_R2_SECRET_ACCESS_KEY}
-endpoint = ${endpoint}
-region = ${CFLARE_R2_REGION}
-acl = private
-no_check_bucket = true
-
-[uk_aq_dropbox]
-type = dropbox
-client_id = ${DROPBOX_APP_KEY}
-client_secret = ${DROPBOX_APP_SECRET}
-token = ${dropbox_token}
-RCLONECFG
+          {
+            echo "[uk_aq_r2]"
+            echo "type = s3"
+            echo "provider = Cloudflare"
+            echo "env_auth = false"
+            echo "access_key_id = ${CFLARE_R2_ACCESS_KEY_ID}"
+            echo "secret_access_key = ${CFLARE_R2_SECRET_ACCESS_KEY}"
+            echo "endpoint = ${endpoint}"
+            echo "region = ${CFLARE_R2_REGION}"
+            echo "acl = private"
+            echo "no_check_bucket = true"
+            echo
+            echo "[uk_aq_dropbox]"
+            echo "type = dropbox"
+            echo "client_id = ${DROPBOX_APP_KEY}"
+            echo "client_secret = ${DROPBOX_APP_SECRET}"
+            echo "token = ${dropbox_token}"
+          } > "${RCLONE_CONFIG}"
 
           chmod 600 "${RCLONE_CONFIG}"
 
