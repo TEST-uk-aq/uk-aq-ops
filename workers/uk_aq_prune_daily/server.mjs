@@ -13,6 +13,8 @@ const DAY_MS = 24 * HOUR_MS;
 const DEFAULT_DRY_RUN = true;
 const DEFAULT_MAX_HOURS_PER_RUN = 48;
 const DEFAULT_INGESTDB_RETENTION_DAYS = 7;
+const DEFAULT_PHASE_A_ENABLED = true;
+const DEFAULT_PHASE_A_RECENT_DAYS = 3;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
 const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
 const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
@@ -325,6 +327,24 @@ function buildWindow(maxHoursPerRun, retentionDays) {
   };
 }
 
+function buildRecentUtcDayWindow(recentDays) {
+  const now = new Date();
+  const utcTomorrowMidnightMs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0,
+    0,
+    0,
+    0,
+  );
+  const windowStartMs = utcTomorrowMidnightMs - (recentDays * DAY_MS);
+  return {
+    window_start: new Date(windowStartMs).toISOString(),
+    window_end: new Date(utcTomorrowMidnightMs).toISOString(),
+  };
+}
+
 function splitWindowIntoBatches(windowStartIso, windowEndIso, maxHoursPerBatch = DEFAULT_MAX_HOURS_PER_BATCH) {
   const windowStartMs = Date.parse(windowStartIso);
   const windowEndMs = Date.parse(windowEndIso);
@@ -550,6 +570,46 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "cap_after_repair_warnings_preview",
     ),
+  };
+}
+
+function aggregatePhaseARecentSummary(overallWindow, batches, batchSummaries, parentRunId, recentDays) {
+  return {
+    run_id: parentRunId,
+    mode: "phase-a-repair-only",
+    phase: "phase_a_recent",
+    enabled: true,
+    recent_window_days: recentDays,
+    window_start: overallWindow.window_start,
+    window_end: overallWindow.window_end,
+    batch_count: batches.length,
+    batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
+    ingest_bucket_count: sumIntField(batchSummaries, "ingest_bucket_count"),
+    observs_bucket_count: sumIntField(batchSummaries, "observs_bucket_count"),
+    mismatch_count: sumIntField(batchSummaries, "mismatch_count"),
+    observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
+    observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
+    repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
+    repair_enqueue_success_count: sumIntField(batchSummaries, "repair_enqueue_success_count"),
+    repair_enqueue_error_count: sumIntField(batchSummaries, "repair_enqueue_error_count"),
+    repair_rows_selected_total: sumBigIntField(batchSummaries, "repair_rows_selected_total").toString(),
+    repair_outbox_entries_enqueued_total: sumBigIntField(
+      batchSummaries,
+      "repair_outbox_entries_enqueued_total",
+    ).toString(),
+    repair_outbox_flush_result: aggregateRepairFlushResult(batchSummaries),
+    mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
+    repaired_now_deletable_bucket_count: sumIntField(batchSummaries, "repaired_now_deletable_bucket_count"),
+    deleted_bucket_count: sumIntField(batchSummaries, "deleted_bucket_count"),
+    total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
+    deleted_after_repair_bucket_count: sumIntField(batchSummaries, "deleted_after_repair_bucket_count"),
+    total_deleted_after_repair_rows: sumBigIntField(batchSummaries, "total_deleted_after_repair_rows").toString(),
+    batch_windows_preview: sampleRows(batches),
+    batch_run_ids_preview: sampleRows(batchSummaries.map((summary) => summary.run_id)),
+    mismatches_before_repair_preview: mergePreviewField(batchSummaries, "mismatches_before_repair_preview"),
+    mismatches_after_repair_preview: mergePreviewField(batchSummaries, "mismatches_after_repair_preview"),
+    repair_enqueue_results_preview: mergePreviewField(batchSummaries, "repair_enqueue_results_preview"),
+    repair_enqueue_errors_preview: mergePreviewField(batchSummaries, "repair_enqueue_errors_preview"),
   };
 }
 
@@ -1152,6 +1212,16 @@ function buildRunConfig(url) {
     1,
     1_000,
   );
+  const phaseAEnabled = parseBoolean(
+    params.get("phaseAEnabled") ?? process.env.INGESTDB_PRUNE_PHASE_A_ENABLED,
+    DEFAULT_PHASE_A_ENABLED,
+  );
+  const phaseARecentDays = parsePositiveInt(
+    params.get("phaseARecentDays") ?? process.env.INGESTDB_PRUNE_PHASE_A_RECENT_DAYS,
+    DEFAULT_PHASE_A_RECENT_DAYS,
+    1,
+    14,
+  );
 
   const phaseB = resolvePhaseBRuntimeConfig(process.env);
   phaseB.enabled = parseBoolean(
@@ -1215,6 +1285,8 @@ function buildRunConfig(url) {
     repairBucketOutboxChunkSize,
     flushClaimBatchLimit,
     maxFlushBatches,
+    phaseAEnabled,
+    phaseARecentDays,
     phaseB,
   };
 }
@@ -1305,13 +1377,17 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   const windowStart = toIso(window.window_start, "window_start");
   const windowEnd = toIso(window.window_end, "window_end");
   const batchWindowHours = Math.max(1, Math.trunc((Date.parse(windowEnd) - Date.parse(windowStart)) / HOUR_MS));
+  const repairOnlyMode = runContext.repair_only === true;
+  const dryRunMode = config.dryRun && !repairOnlyMode;
+  const modeLabel = repairOnlyMode ? "phase-a-repair-only" : (dryRunMode ? "dry-run" : "delete");
+  const historyGateEnabled = Boolean(config.phaseB?.enabled) && !repairOnlyMode;
   logStructured("INFO", "ingestdb_prune_run_start", {
     run_id: runId,
     parent_run_id: runContext.parent_run_id ?? null,
     batch_index: runContext.batch_index ?? 1,
     batch_count: runContext.batch_count ?? 1,
     batch_window_hours: batchWindowHours,
-    mode: config.dryRun ? "dry-run" : "delete",
+    mode: modeLabel,
     window_start: windowStart,
     window_end: windowEnd,
     ingestdb_retention_days: config.ingestDbRetentionDays,
@@ -1322,7 +1398,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     repair_bucket_outbox_chunk_size: config.repairBucketOutboxChunkSize,
     flush_claim_batch_limit: config.flushClaimBatchLimit,
     max_flush_batches: config.maxFlushBatches,
-    history_gate_enabled: Boolean(config.phaseB?.enabled),
+    history_gate_enabled: historyGateEnabled,
+    phase: repairOnlyMode ? "phase_a_recent" : "prune",
   });
 
   const [ingestBuckets, observsBuckets] = await Promise.all([
@@ -1331,12 +1408,18 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   ]);
 
   const { deletableBuckets, mismatches, observsExtraBuckets } = compareBuckets(ingestBuckets, observsBuckets);
-  const preRepairBackupGate = await applyBackupGateFilter(
-    config,
-    runId,
-    deletableBuckets,
-    "pre_repair",
-  );
+  const preRepairBackupGate = historyGateEnabled
+    ? await applyBackupGateFilter(
+      config,
+      runId,
+      deletableBuckets,
+      "pre_repair",
+    )
+    : {
+      allowedBuckets: deletableBuckets,
+      blockedBuckets: [],
+      dayGateMap: new Map(),
+    };
   const gatedDeletableBuckets = preRepairBackupGate.allowedBuckets;
   const historyGateBlockedBuckets = preRepairBackupGate.blockedBuckets;
   const { repairableMismatches, observsCountGreaterThanIngest } = classifyRepairMismatches(mismatches);
@@ -1376,7 +1459,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   const summaryBase = {
     run_id: runId,
     ...batchSummaryMeta,
-    mode: config.dryRun ? "dry-run" : "delete",
+    mode: modeLabel,
     window_start: windowStart,
     window_end: windowEnd,
     ingestdb_retention_days: config.ingestDbRetentionDays,
@@ -1388,12 +1471,13 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     mismatch_count: mismatches.length,
     observs_count_exceeds_ingest_count: observsCountGreaterThanIngest.length,
     observs_extra_bucket_count: observsExtraBuckets.length,
-    history_gate_enabled: Boolean(config.phaseB?.enabled),
+    history_gate_enabled: historyGateEnabled,
     history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
     history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
+    phase: repairOnlyMode ? "phase_a_recent" : "prune",
   };
 
-  if (config.dryRun) {
+  if (dryRunMode) {
     let repairPilot = null;
     if (config.repairOneMismatchBucket) {
       if (!repairCandidate) {
@@ -1479,49 +1563,51 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   const capWarnings = [];
   let totalDeletedRows = 0n;
 
-  for (const bucket of gatedDeletableBuckets) {
-    try {
-      const result = await deleteHourBucket(
-        ingestClient,
-        bucket,
-        config.deleteBatchSize,
-        config.maxDeleteBatchesPerHour,
-      );
-      totalDeletedRows += result.deleted_rows;
+  if (!repairOnlyMode) {
+    for (const bucket of gatedDeletableBuckets) {
+      try {
+        const result = await deleteHourBucket(
+          ingestClient,
+          bucket,
+          config.deleteBatchSize,
+          config.maxDeleteBatchesPerHour,
+        );
+        totalDeletedRows += result.deleted_rows;
 
-      const bucketResult = {
-        connector_id: result.connector_id,
-        hour_start: result.hour_start,
-        deleted_rows: result.deleted_rows.toString(),
-        batches_run: result.batches_run,
-        drained: result.drained,
-      };
-      deletedBucketResults.push(bucketResult);
-      logStructured("INFO", "hour_bucket_delete_result", { run_id: runId, ...bucketResult });
-
-      if (result.max_batches_reached_with_remaining_rows) {
-        const warningPayload = {
+        const bucketResult = {
           connector_id: result.connector_id,
           hour_start: result.hour_start,
           deleted_rows: result.deleted_rows.toString(),
           batches_run: result.batches_run,
-          max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
-          reason: "max_batches_reached_before_drain",
-          alert_condition: true,
+          drained: result.drained,
         };
-        capWarnings.push(warningPayload);
-        logStructured("WARNING", "hour_bucket_delete_cap_reached", { run_id: runId, ...warningPayload });
+        deletedBucketResults.push(bucketResult);
+        logStructured("INFO", "hour_bucket_delete_result", { run_id: runId, ...bucketResult });
+
+        if (result.max_batches_reached_with_remaining_rows) {
+          const warningPayload = {
+            connector_id: result.connector_id,
+            hour_start: result.hour_start,
+            deleted_rows: result.deleted_rows.toString(),
+            batches_run: result.batches_run,
+            max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
+            reason: "max_batches_reached_before_drain",
+            alert_condition: true,
+          };
+          capWarnings.push(warningPayload);
+          logStructured("WARNING", "hour_bucket_delete_cap_reached", { run_id: runId, ...warningPayload });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const errorPayload = {
+          connector_id: bucket.connector_id,
+          hour_start: bucket.hour_start,
+          reason: "delete_error",
+          message,
+        };
+        deleteErrors.push(errorPayload);
+        logStructured("ERROR", "hour_bucket_delete_error", { run_id: runId, ...errorPayload });
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const errorPayload = {
-        connector_id: bucket.connector_id,
-        hour_start: bucket.hour_start,
-        reason: "delete_error",
-        message,
-      };
-      deleteErrors.push(errorPayload);
-      logStructured("ERROR", "hour_bucket_delete_error", { run_id: runId, ...errorPayload });
     }
   }
 
@@ -1598,12 +1684,18 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     mismatchesAfterRepair = recheckResult.stillMismatched;
   }
 
-  const postRepairBackupGate = await applyBackupGateFilter(
-    config,
-    runId,
-    repairedNowDeletableBuckets,
-    "post_repair",
-  );
+  const postRepairBackupGate = historyGateEnabled
+    ? await applyBackupGateFilter(
+      config,
+      runId,
+      repairedNowDeletableBuckets,
+      "post_repair",
+    )
+    : {
+      allowedBuckets: repairedNowDeletableBuckets,
+      blockedBuckets: [],
+      dayGateMap: new Map(),
+    };
   const gatedRepairedNowDeletableBuckets = postRepairBackupGate.allowedBuckets;
   const historyGateBlockedAfterRepairBuckets = postRepairBackupGate.blockedBuckets;
 
@@ -1627,58 +1719,60 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   const capAfterRepairWarnings = [];
   let totalDeletedAfterRepairRows = 0n;
 
-  for (const bucket of gatedRepairedNowDeletableBuckets) {
-    try {
-      const result = await deleteHourBucket(
-        ingestClient,
-        bucket,
-        config.deleteBatchSize,
-        config.maxDeleteBatchesPerHour,
-      );
-      totalDeletedAfterRepairRows += result.deleted_rows;
+  if (!repairOnlyMode) {
+    for (const bucket of gatedRepairedNowDeletableBuckets) {
+      try {
+        const result = await deleteHourBucket(
+          ingestClient,
+          bucket,
+          config.deleteBatchSize,
+          config.maxDeleteBatchesPerHour,
+        );
+        totalDeletedAfterRepairRows += result.deleted_rows;
 
-      const bucketResult = {
-        connector_id: result.connector_id,
-        hour_start: result.hour_start,
-        deleted_rows: result.deleted_rows.toString(),
-        batches_run: result.batches_run,
-        drained: result.drained,
-      };
-      deletedAfterRepairBucketResults.push(bucketResult);
-      logStructured("INFO", "hour_bucket_delete_after_repair_result", {
-        run_id: runId,
-        ...bucketResult,
-      });
-
-      if (result.max_batches_reached_with_remaining_rows) {
-        const warningPayload = {
+        const bucketResult = {
           connector_id: result.connector_id,
           hour_start: result.hour_start,
           deleted_rows: result.deleted_rows.toString(),
           batches_run: result.batches_run,
-          max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
-          reason: "max_batches_reached_before_drain",
-          alert_condition: true,
+          drained: result.drained,
         };
-        capAfterRepairWarnings.push(warningPayload);
-        logStructured("WARNING", "hour_bucket_delete_after_repair_cap_reached", {
+        deletedAfterRepairBucketResults.push(bucketResult);
+        logStructured("INFO", "hour_bucket_delete_after_repair_result", {
           run_id: runId,
-          ...warningPayload,
+          ...bucketResult,
+        });
+
+        if (result.max_batches_reached_with_remaining_rows) {
+          const warningPayload = {
+            connector_id: result.connector_id,
+            hour_start: result.hour_start,
+            deleted_rows: result.deleted_rows.toString(),
+            batches_run: result.batches_run,
+            max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
+            reason: "max_batches_reached_before_drain",
+            alert_condition: true,
+          };
+          capAfterRepairWarnings.push(warningPayload);
+          logStructured("WARNING", "hour_bucket_delete_after_repair_cap_reached", {
+            run_id: runId,
+            ...warningPayload,
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const errorPayload = {
+          connector_id: bucket.connector_id,
+          hour_start: bucket.hour_start,
+          reason: "delete_after_repair_error",
+          message,
+        };
+        deleteAfterRepairErrors.push(errorPayload);
+        logStructured("ERROR", "hour_bucket_delete_after_repair_error", {
+          run_id: runId,
+          ...errorPayload,
         });
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const errorPayload = {
-        connector_id: bucket.connector_id,
-        hour_start: bucket.hour_start,
-        reason: "delete_after_repair_error",
-        message,
-      };
-      deleteAfterRepairErrors.push(errorPayload);
-      logStructured("ERROR", "hour_bucket_delete_after_repair_error", {
-        run_id: runId,
-        ...errorPayload,
-      });
     }
   }
 
@@ -1733,11 +1827,70 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     delete_after_repair_errors_preview: sampleRows(deleteAfterRepairErrors),
     cap_after_repair_warnings_preview: sampleRows(capAfterRepairWarnings),
   };
-  logStructured("INFO", "ingestdb_prune_delete_summary", runSummary);
+  logStructured(
+    "INFO",
+    repairOnlyMode ? "ingestdb_phase_a_recent_repair_summary" : "ingestdb_prune_delete_summary",
+    runSummary,
+  );
   return runSummary;
 }
 
+async function runPhaseARecent(config) {
+  if (!config.phaseAEnabled) {
+    const skippedSummary = {
+      enabled: false,
+      skipped: true,
+      reason: "phase_a_disabled",
+      recent_window_days: config.phaseARecentDays,
+    };
+    logStructured("INFO", "ingestdb_phase_a_recent_check_skipped", skippedSummary);
+    return skippedSummary;
+  }
+
+  const overallWindow = buildRecentUtcDayWindow(config.phaseARecentDays);
+  const batches = splitWindowIntoBatches(
+    overallWindow.window_start,
+    overallWindow.window_end,
+    DEFAULT_MAX_HOURS_PER_BATCH,
+  );
+  const parentRunId = randomUUID();
+  logStructured("INFO", "ingestdb_phase_a_recent_check_plan", {
+    run_id: parentRunId,
+    mode: "phase-a-repair-only",
+    phase: "phase_a_recent",
+    recent_window_days: config.phaseARecentDays,
+    window_start: overallWindow.window_start,
+    window_end: overallWindow.window_end,
+    batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
+    batch_count: batches.length,
+    batches_preview: sampleRows(batches),
+  });
+
+  const batchSummaries = [];
+  for (const batch of batches) {
+    const summary = await runPruneSingleWindow(config, batch, {
+      parent_run_id: parentRunId,
+      batch_index: batch.batch_index,
+      batch_count: batches.length,
+      repair_only: true,
+    });
+    batchSummaries.push(summary);
+  }
+
+  const aggregateSummary = aggregatePhaseARecentSummary(
+    overallWindow,
+    batches,
+    batchSummaries,
+    parentRunId,
+    config.phaseARecentDays,
+  );
+  logStructured("INFO", "ingestdb_phase_a_recent_check_summary", aggregateSummary);
+  return aggregateSummary;
+}
+
 async function runPrune(config) {
+  const phaseARecentSummary = await runPhaseARecent(config);
+
   const phaseBRunId = randomUUID();
   const phaseBHistorySummary = await runPhaseBBackup({
     dryRun: config.dryRun,
@@ -1760,6 +1913,7 @@ async function runPrune(config) {
     const singleSummary = await runPruneSingleWindow(config, batches[0] ?? overallWindow);
     return {
       ...singleSummary,
+      phase_a_recent: phaseARecentSummary,
       phase_b_history: phaseBHistorySummary,
     };
   }
@@ -1798,6 +1952,7 @@ async function runPrune(config) {
   );
   const combinedSummary = {
     ...aggregateSummary,
+    phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
   };
   logStructured(
