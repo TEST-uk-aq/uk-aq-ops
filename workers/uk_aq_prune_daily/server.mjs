@@ -18,9 +18,6 @@ const DEFAULT_PHASE_A_RECENT_DAYS = 3;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
 const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
 const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
-const DEFAULT_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE = 1_000;
-const DEFAULT_FLUSH_CLAIM_BATCH_LIMIT = 20;
-const DEFAULT_MAX_FLUSH_BATCHES = 30;
 const DEFAULT_MAX_HOURS_PER_BATCH = 24;
 const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
 const DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS = 1_000;
@@ -31,9 +28,7 @@ const RPC_SCHEMA = "uk_aq_public";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_DELETE_HOUR_BUCKET = "uk_aq_rpc_observations_delete_hour_bucket";
-const RPC_REPAIR_ENQUEUE_HOUR_BUCKET = "uk_aq_rpc_observs_outbox_enqueue_hour_bucket";
-const RPC_OUTBOX_CLAIM = "uk_aq_rpc_observs_outbox_claim";
-const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_observs_outbox_resolve";
+const RPC_REPAIR_FETCH_HOUR_BUCKET = "uk_aq_rpc_observations_select_hour_bucket";
 const RPC_OBSERVS_UPSERT = "uk_aq_rpc_observs_observations_upsert";
 const RPC_OBSERVS_RECEIPTS_UPSERT = "uk_aq_rpc_observs_sync_receipt_daily_upsert";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
@@ -434,33 +429,6 @@ function aggregateDryRunRepairPilot(batchSummaries) {
   };
 }
 
-function aggregateRepairFlushResult(batchSummaries) {
-  const flushResults = batchSummaries
-    .map((summary) => summary?.repair_outbox_flush_result)
-    .filter((result) => result && typeof result === "object");
-
-  if (flushResults.length === 0) {
-    return null;
-  }
-
-  return {
-    batched: true,
-    batch_count: batchSummaries.length,
-    batches_with_flush: flushResults.length,
-    batches_with_flush_error: flushResults.filter((result) =>
-      typeof result.error === "string" && result.error.length > 0
-    ).length,
-    batches_run: sumIntField(flushResults, "batches_run"),
-    claimed_entries: sumIntField(flushResults, "claimed_entries"),
-    delivered_rows: sumIntField(flushResults, "delivered_rows"),
-    failed_entries: sumIntField(flushResults, "failed_entries"),
-    receipts_upserted: sumIntField(flushResults, "receipts_upserted"),
-    rows_resolved: sumIntField(flushResults, "rows_resolved"),
-    drained: flushResults.every((result) => result.drained === true),
-    max_flush_batches_reached: flushResults.some((result) => result.max_flush_batches_reached === true),
-  };
-}
-
 function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, parentRunId) {
   const summaryBase = {
     run_id: parentRunId,
@@ -505,14 +473,11 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
   return {
     ...summaryBase,
     repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
-    repair_enqueue_success_count: sumIntField(batchSummaries, "repair_enqueue_success_count"),
-    repair_enqueue_error_count: sumIntField(batchSummaries, "repair_enqueue_error_count"),
+    repair_replay_success_count: sumIntField(batchSummaries, "repair_replay_success_count"),
+    repair_replay_error_count: sumIntField(batchSummaries, "repair_replay_error_count"),
     repair_rows_selected_total: sumBigIntField(batchSummaries, "repair_rows_selected_total").toString(),
-    repair_outbox_entries_enqueued_total: sumBigIntField(
-      batchSummaries,
-      "repair_outbox_entries_enqueued_total",
-    ).toString(),
-    repair_outbox_flush_result: aggregateRepairFlushResult(batchSummaries),
+    repair_rows_replayed_total: sumBigIntField(batchSummaries, "repair_rows_replayed_total").toString(),
+    repair_receipts_upserted_total: sumBigIntField(batchSummaries, "repair_receipts_upserted_total").toString(),
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
     repaired_now_deletable_bucket_count: sumIntField(
       batchSummaries,
@@ -558,8 +523,8 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "mismatches_after_repair_preview",
     ),
-    repair_enqueue_results_preview: mergePreviewField(batchSummaries, "repair_enqueue_results_preview"),
-    repair_enqueue_errors_preview: mergePreviewField(batchSummaries, "repair_enqueue_errors_preview"),
+    repair_replay_results_preview: mergePreviewField(batchSummaries, "repair_replay_results_preview"),
+    repair_replay_errors_preview: mergePreviewField(batchSummaries, "repair_replay_errors_preview"),
     delete_errors_preview: mergePreviewField(batchSummaries, "delete_errors_preview"),
     cap_warnings_preview: mergePreviewField(batchSummaries, "cap_warnings_preview"),
     delete_after_repair_errors_preview: mergePreviewField(
@@ -590,14 +555,11 @@ function aggregatePhaseARecentSummary(overallWindow, batches, batchSummaries, pa
     observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
     observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
     repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
-    repair_enqueue_success_count: sumIntField(batchSummaries, "repair_enqueue_success_count"),
-    repair_enqueue_error_count: sumIntField(batchSummaries, "repair_enqueue_error_count"),
+    repair_replay_success_count: sumIntField(batchSummaries, "repair_replay_success_count"),
+    repair_replay_error_count: sumIntField(batchSummaries, "repair_replay_error_count"),
     repair_rows_selected_total: sumBigIntField(batchSummaries, "repair_rows_selected_total").toString(),
-    repair_outbox_entries_enqueued_total: sumBigIntField(
-      batchSummaries,
-      "repair_outbox_entries_enqueued_total",
-    ).toString(),
-    repair_outbox_flush_result: aggregateRepairFlushResult(batchSummaries),
+    repair_rows_replayed_total: sumBigIntField(batchSummaries, "repair_rows_replayed_total").toString(),
+    repair_receipts_upserted_total: sumBigIntField(batchSummaries, "repair_receipts_upserted_total").toString(),
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
     repaired_now_deletable_bucket_count: sumIntField(batchSummaries, "repaired_now_deletable_bucket_count"),
     deleted_bucket_count: sumIntField(batchSummaries, "deleted_bucket_count"),
@@ -608,8 +570,8 @@ function aggregatePhaseARecentSummary(overallWindow, batches, batchSummaries, pa
     batch_run_ids_preview: sampleRows(batchSummaries.map((summary) => summary.run_id)),
     mismatches_before_repair_preview: mergePreviewField(batchSummaries, "mismatches_before_repair_preview"),
     mismatches_after_repair_preview: mergePreviewField(batchSummaries, "mismatches_after_repair_preview"),
-    repair_enqueue_results_preview: mergePreviewField(batchSummaries, "repair_enqueue_results_preview"),
-    repair_enqueue_errors_preview: mergePreviewField(batchSummaries, "repair_enqueue_errors_preview"),
+    repair_replay_results_preview: mergePreviewField(batchSummaries, "repair_replay_results_preview"),
+    repair_replay_errors_preview: mergePreviewField(batchSummaries, "repair_replay_errors_preview"),
   };
 }
 
@@ -925,118 +887,52 @@ async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0
   throw new Error(`observs upsert failed: ${lastMessage}`);
 }
 
-async function enqueueObservsOutboxRepairBucket(client, mismatch, chunkSize) {
+async function fetchObservationsForRepairBucket(client, mismatch) {
   const connectorId = toIntField(mismatch.connector_id, "mismatch.connector_id");
-  const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_ENQUEUE_HOUR_BUCKET, {
+  const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_FETCH_HOUR_BUCKET, {
     p_connector_id: connectorId,
     p_hour_start: mismatch.hour_start,
-    p_chunk_size: chunkSize,
   });
 
   if (error) {
-    throw new Error(`repair enqueue RPC failed: ${error.message}`);
+    throw new Error(`repair fetch RPC failed: ${error.message}`);
   }
 
-  const firstRow = Array.isArray(data) ? data[0] : data;
-  return {
-    connector_id: mismatch.connector_id,
-    hour_start: mismatch.hour_start,
-    rows_selected: toIntField(firstRow?.rows_selected ?? 0, "rows_selected"),
-    outbox_entries_enqueued: toIntField(
-      firstRow?.outbox_entries_enqueued ?? 0,
-      "outbox_entries_enqueued",
-    ),
-  };
+  return Array.isArray(data) ? data : [];
 }
 
-async function flushObservsOutbox(mainClient, observsClient, claimBatchLimit, maxFlushBatches) {
-  const summary = {
-    batches_run: 0,
-    claimed_entries: 0,
-    delivered_rows: 0,
-    failed_entries: 0,
-    receipts_upserted: 0,
-    rows_resolved: 0,
-    drained: false,
-  };
+async function replayObservationsForRepairBucket(mainClient, observsClient, mismatch) {
+  const rawRows = await fetchObservationsForRepairBucket(mainClient, mismatch);
+  const observsRows = normalizeObservsRows(rawRows);
 
-  for (let batch = 1; batch <= maxFlushBatches; batch += 1) {
-    const claimResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OUTBOX_CLAIM, {
-      batch_limit: claimBatchLimit,
-    });
-
-    if (claimResult.error) {
-      throw new Error(`outbox claim RPC failed: ${claimResult.error.message}`);
-    }
-
-    const entries = Array.isArray(claimResult.data) ? claimResult.data : [];
-    if (!entries.length) {
-      summary.drained = true;
-      break;
-    }
-    summary.batches_run = batch;
-    summary.claimed_entries += entries.length;
-
-    const observsRows = normalizeObservsRows(
-      entries.flatMap((entry) => (Array.isArray(entry.payload) ? entry.payload : [])),
-    );
-
-    const resolutions = [];
-    if (!observsRows.length) {
-      for (const entry of entries) {
-        resolutions.push({ id: entry.id, ok: true });
-      }
-    } else {
-      try {
-        summary.delivered_rows += await upsertObservsRowsWithFallback(observsClient, observsRows);
-
-        const receiptRows = buildReceiptRows(observsRows);
-        if (receiptRows.length) {
-          const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_RECEIPTS_UPSERT, {
-            rows: receiptRows,
-          });
-          if (receiptResult.error) {
-            throw new Error(`observs receipts upsert failed: ${receiptResult.error.message}`);
-          }
-          const receiptRow = Array.isArray(receiptResult.data)
-            ? receiptResult.data[0]
-            : receiptResult.data;
-          summary.receipts_upserted += toIntField(
-            receiptRow?.rows_upserted ?? receiptRows.length,
-            "rows_upserted",
-          );
-        }
-
-        for (const entry of entries) {
-          resolutions.push({ id: entry.id, ok: true });
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        summary.failed_entries += entries.length;
-        for (const entry of entries) {
-          resolutions.push({ id: entry.id, ok: false, error: message });
-        }
-      }
-    }
-
-    if (resolutions.length) {
-      const resolveResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OUTBOX_RESOLVE, {
-        resolutions,
+  let rowsReplayed = 0;
+  let receiptsUpserted = 0;
+  if (observsRows.length > 0) {
+    rowsReplayed = await upsertObservsRowsWithFallback(observsClient, observsRows);
+    const receiptRows = buildReceiptRows(observsRows);
+    if (receiptRows.length > 0) {
+      const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_RECEIPTS_UPSERT, {
+        rows: receiptRows,
       });
-      if (resolveResult.error) {
-        throw new Error(`outbox resolve RPC failed: ${resolveResult.error.message}`);
+      if (receiptResult.error) {
+        throw new Error(`observs receipts upsert failed: ${receiptResult.error.message}`);
       }
-      const resolveRow = Array.isArray(resolveResult.data) ? resolveResult.data[0] : resolveResult.data;
-      summary.rows_resolved += toIntField(
-        resolveRow?.rows_resolved ?? resolutions.length,
-        "rows_resolved",
+      const receiptRow = Array.isArray(receiptResult.data)
+        ? receiptResult.data[0]
+        : receiptResult.data;
+      receiptsUpserted = toIntField(
+        receiptRow?.rows_upserted ?? receiptRows.length,
+        "rows_upserted",
       );
     }
   }
 
   return {
-    ...summary,
-    max_flush_batches_reached: !summary.drained,
+    connector_id: mismatch.connector_id,
+    hour_start: mismatch.hour_start,
+    rows_selected: rawRows.length,
+    rows_replayed: rowsReplayed,
+    receipts_upserted: receiptsUpserted,
   };
 }
 
@@ -1194,24 +1090,6 @@ function buildRunConfig(url) {
     params.get("repairOneMismatchBucket") ?? process.env.REPAIR_ONE_MISMATCH_BUCKET,
     DEFAULT_REPAIR_ONE_MISMATCH_BUCKET,
   );
-  const repairBucketOutboxChunkSize = parsePositiveInt(
-    params.get("repairChunkSize") ?? process.env.REPAIR_BUCKET_OUTBOX_CHUNK_SIZE,
-    DEFAULT_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE,
-    1,
-    10_000,
-  );
-  const flushClaimBatchLimit = parsePositiveInt(
-    params.get("flushClaimBatchLimit") ?? process.env.FLUSH_CLAIM_BATCH_LIMIT,
-    DEFAULT_FLUSH_CLAIM_BATCH_LIMIT,
-    1,
-    1_000,
-  );
-  const maxFlushBatches = parsePositiveInt(
-    params.get("maxFlushBatches") ?? process.env.MAX_FLUSH_BATCHES,
-    DEFAULT_MAX_FLUSH_BATCHES,
-    1,
-    1_000,
-  );
   const phaseAEnabled = parseBoolean(
     params.get("phaseAEnabled") ?? process.env.INGESTDB_PRUNE_PHASE_A_ENABLED,
     DEFAULT_PHASE_A_ENABLED,
@@ -1282,9 +1160,6 @@ function buildRunConfig(url) {
     deleteBatchSize,
     maxDeleteBatchesPerHour,
     repairOneMismatchBucket,
-    repairBucketOutboxChunkSize,
-    flushClaimBatchLimit,
-    maxFlushBatches,
     phaseAEnabled,
     phaseARecentDays,
     phaseB,
@@ -1395,9 +1270,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     delete_batch_size: config.deleteBatchSize,
     max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
     repair_one_mismatch_bucket: config.repairOneMismatchBucket,
-    repair_bucket_outbox_chunk_size: config.repairBucketOutboxChunkSize,
-    flush_claim_batch_limit: config.flushClaimBatchLimit,
-    max_flush_batches: config.maxFlushBatches,
     history_gate_enabled: historyGateEnabled,
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   });
@@ -1491,16 +1363,10 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
         });
       } else {
         try {
-          const enqueueResult = await enqueueObservsOutboxRepairBucket(
-            ingestClient,
-            repairCandidate,
-            config.repairBucketOutboxChunkSize,
-          );
-          const flushResult = await flushObservsOutbox(
+          const replayResult = await replayObservationsForRepairBucket(
             ingestClient,
             observsClient,
-            config.flushClaimBatchLimit,
-            config.maxFlushBatches,
+            repairCandidate,
           );
           const recheck = await recheckSingleBucket(ingestClient, observsClient, repairCandidate);
           repairPilot = {
@@ -1508,9 +1374,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
             connector_id: repairCandidate.connector_id,
             hour_start: repairCandidate.hour_start,
             initial_reason: repairCandidate.reason,
-            flush_scope: "all_due_outbox_entries",
-            enqueue: enqueueResult,
-            flush: flushResult,
+            replay: replayResult,
             recheck,
           };
           logStructured("INFO", "repair_one_mismatch_bucket_result", {
@@ -1611,25 +1475,25 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     }
   }
 
-  const repairEnqueueResults = [];
-  const repairEnqueueErrors = [];
-  let repairFlushResult = null;
+  const repairReplayResults = [];
+  const repairReplayErrors = [];
 
   if (repairableMismatches.length > 0) {
     for (const mismatch of repairableMismatches) {
       try {
-        const enqueueResult = await enqueueObservsOutboxRepairBucket(
+        const replayResult = await replayObservationsForRepairBucket(
           ingestClient,
+          observsClient,
           mismatch,
-          config.repairBucketOutboxChunkSize,
         );
-        repairEnqueueResults.push(enqueueResult);
-        logStructured("INFO", "hour_bucket_repair_enqueue_result", {
+        repairReplayResults.push(replayResult);
+        logStructured("INFO", "hour_bucket_repair_replay_result", {
           run_id: runId,
-          connector_id: enqueueResult.connector_id,
-          hour_start: enqueueResult.hour_start,
-          rows_selected: enqueueResult.rows_selected,
-          outbox_entries_enqueued: enqueueResult.outbox_entries_enqueued,
+          connector_id: replayResult.connector_id,
+          hour_start: replayResult.hour_start,
+          rows_selected: replayResult.rows_selected,
+          rows_replayed: replayResult.rows_replayed,
+          receipts_upserted: replayResult.receipts_upserted,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1639,34 +1503,12 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
           reason: mismatch.reason,
           message,
         };
-        repairEnqueueErrors.push(errorPayload);
-        logStructured("ERROR", "hour_bucket_repair_enqueue_error", {
+        repairReplayErrors.push(errorPayload);
+        logStructured("ERROR", "hour_bucket_repair_replay_error", {
           run_id: runId,
           ...errorPayload,
         });
       }
-    }
-
-    try {
-      repairFlushResult = await flushObservsOutbox(
-        ingestClient,
-        observsClient,
-        config.flushClaimBatchLimit,
-        config.maxFlushBatches,
-      );
-      logStructured("INFO", "repair_outbox_flush_result", {
-        run_id: runId,
-        ...repairFlushResult,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      repairFlushResult = {
-        error: message,
-      };
-      logStructured("ERROR", "repair_outbox_flush_error", {
-        run_id: runId,
-        message,
-      });
     }
   }
 
@@ -1777,23 +1619,27 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   }
 
   const finalMismatchCount = mismatchesAfterRepair.length;
-  const totalRowsSelectedForRepair = repairEnqueueResults.reduce(
+  const totalRowsSelectedForRepair = repairReplayResults.reduce(
     (total, row) => total + BigInt(row.rows_selected),
     0n,
   );
-  const totalOutboxEntriesEnqueuedForRepair = repairEnqueueResults.reduce(
-    (total, row) => total + BigInt(row.outbox_entries_enqueued),
+  const totalRowsReplayedForRepair = repairReplayResults.reduce(
+    (total, row) => total + BigInt(row.rows_replayed),
+    0n,
+  );
+  const totalReceiptsUpsertedForRepair = repairReplayResults.reduce(
+    (total, row) => total + BigInt(row.receipts_upserted),
     0n,
   );
 
   const runSummary = {
     ...summaryBase,
     repairable_mismatch_bucket_count: repairableMismatches.length,
-    repair_enqueue_success_count: repairEnqueueResults.length,
-    repair_enqueue_error_count: repairEnqueueErrors.length,
+    repair_replay_success_count: repairReplayResults.length,
+    repair_replay_error_count: repairReplayErrors.length,
     repair_rows_selected_total: totalRowsSelectedForRepair.toString(),
-    repair_outbox_entries_enqueued_total: totalOutboxEntriesEnqueuedForRepair.toString(),
-    repair_outbox_flush_result: repairFlushResult,
+    repair_rows_replayed_total: totalRowsReplayedForRepair.toString(),
+    repair_receipts_upserted_total: totalReceiptsUpsertedForRepair.toString(),
     mismatch_after_repair_count: finalMismatchCount,
     repaired_now_deletable_bucket_count: gatedRepairedNowDeletableBuckets.length,
     repaired_now_deletable_bucket_count_before_history_gate: repairedNowDeletableBuckets.length,
@@ -1810,7 +1656,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       finalMismatchCount +
       deleteErrors.length +
       capWarnings.length +
-      repairEnqueueErrors.length +
+      repairReplayErrors.length +
       deleteAfterRepairErrors.length +
       capAfterRepairWarnings.length +
       historyGateBlockedBuckets.length +
@@ -1820,8 +1666,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     mismatches_before_repair_preview: sampleRows(mismatches),
     mismatches_after_repair_preview: sampleRows(mismatchesAfterRepair),
     history_gate_blocked_after_repair_preview: sampleRows(historyGateBlockedAfterRepairBuckets),
-    repair_enqueue_results_preview: sampleRows(repairEnqueueResults),
-    repair_enqueue_errors_preview: sampleRows(repairEnqueueErrors),
+    repair_replay_results_preview: sampleRows(repairReplayResults),
+    repair_replay_errors_preview: sampleRows(repairReplayErrors),
     delete_errors_preview: sampleRows(deleteErrors),
     cap_warnings_preview: sampleRows(capWarnings),
     delete_after_repair_errors_preview: sampleRows(deleteAfterRepairErrors),
