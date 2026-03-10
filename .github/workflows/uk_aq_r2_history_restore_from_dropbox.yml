@@ -102,11 +102,20 @@ jobs:
             exit 1
           fi
 
-          day_utc="$(printf "%s" "${INPUT_DAY_UTC}" | xargs)"
+          day_utc="$(printf "%s" "${INPUT_DAY_UTC}" | tr -d '\r\n' | xargs)"
+          if printf "%s" "${day_utc}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ].*$'; then
+            day_utc="${day_utc:0:10}"
+          fi
+          case "${day_utc}" in
+            ""|"null"|"NULL"|"none"|"NONE"|"all"|"ALL"|"\"\""|"''")
+              day_utc=""
+              ;;
+          esac
           if [ -n "${day_utc}" ] && ! printf "%s" "${day_utc}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
             echo "day_utc must be YYYY-MM-DD when provided." >&2
             exit 1
           fi
+          echo "NORMALIZED_DAY_UTC=${day_utc}" >> "$GITHUB_ENV"
 
       - name: Configure rclone remotes
         env:
@@ -181,7 +190,7 @@ jobs:
             cmd+=(--domain aqilevels)
           fi
 
-          day_utc="$(printf "%s" "${INPUT_DAY_UTC}" | xargs)"
+          day_utc="${NORMALIZED_DAY_UTC:-}"
           if [ -n "${day_utc}" ]; then
             cmd+=(--day-utc "${day_utc}")
           fi
