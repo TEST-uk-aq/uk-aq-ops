@@ -33,6 +33,7 @@ R2 history-days query params:
 
 - `max_days` (optional; default `120`, clamped `0..3660`; `0` = no lookback filter)
 - `max_keys` (optional; default `1000`, clamped `100..1000`)
+- `strict_manifests` (optional; default `false`; when `true`, verifies top-level day manifest exists with `HEAD` per day)
 - `token` (optional; only used if `UK_AQ_DB_SIZE_API_TOKEN` is configured)
 
 R2 history-days response shape:
@@ -41,9 +42,10 @@ R2 history-days response shape:
 - `bucket`
 - `max_days`
 - `max_keys`
+- `strict_manifests`
 - `prefixes.observations`
 - `prefixes.aqilevels`
-- `domains.observations.days` (committed `YYYY-MM-DD` list from `manifest.json` presence)
+- `domains.observations.days` (`YYYY-MM-DD` day list from R2 domain day prefixes)
 - `domains.aqilevels.days`
 - `domains.<domain>.min_day_utc`
 - `domains.<domain>.max_day_utc`
@@ -60,10 +62,12 @@ Behavior:
   - `uk_aq_public.uk_aq_schema_size_metrics_hourly`
 - Reads R2-domain size rows from ingestdb public view:
   - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
-- For `/v1/r2-history-days`, scans R2 by month prefix for each domain and only includes days where:
-  - `<prefix>/day_utc=YYYY-MM-DD/manifest.json` exists.
-  - This preserves the committed-day contract used for serving/backup eligibility.
-  - The month-paged scan avoids one `HEAD` call per day (prevents Worker subrequest-limit failures on large lookbacks).
+- For `/v1/r2-history-days`, defaults to low-subrequest domain day-prefix scan:
+  - lists `day_utc=YYYY-MM-DD/` common prefixes under each domain;
+  - filters by `max_days` and excludes future dates.
+- Optional strict mode (`strict_manifests=true`):
+  - verifies `<prefix>/day_utc=YYYY-MM-DD/manifest.json` exists via `HEAD` per day;
+  - use for diagnostics when you need strict committed-manifest confirmation.
 
 ## Required secrets / vars
 

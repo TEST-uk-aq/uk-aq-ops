@@ -1,8 +1,8 @@
 import {
   hasRequiredR2Config,
   normalizePrefix,
-  r2ListObjectsV2,
   r2ListAllCommonPrefixes,
+  r2HeadObject,
 } from "../shared/r2_sigv4.mjs";
 
 const DEFAULT_LOOKBACK_DAYS = 28;
@@ -220,47 +220,6 @@ function buildDayCutoff(maxLookbackDays) {
     .slice(0, 10);
 }
 
-function enumerateMonthKeys(startDay, endDay) {
-  const parsedStart = parseIsoDay(startDay);
-  const parsedEnd = parseIsoDay(endDay);
-  if (!parsedStart || !parsedEnd || parsedStart > parsedEnd) {
-    return [];
-  }
-  const [startYear, startMonth] = parsedStart.split("-").slice(0, 2).map((v) => Number(v));
-  const [endYear, endMonth] = parsedEnd.split("-").slice(0, 2).map((v) => Number(v));
-  if (!Number.isFinite(startYear) || !Number.isFinite(startMonth) || !Number.isFinite(endYear) || !Number.isFinite(endMonth)) {
-    return [];
-  }
-  const months = [];
-  let year = startYear;
-  let month = startMonth;
-  while (year < endYear || (year === endYear && month <= endMonth)) {
-    months.push(`${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}`);
-    month += 1;
-    if (month > 12) {
-      month = 1;
-      year += 1;
-    }
-  }
-  return months;
-}
-
-function collectMonthKeysFromDayPrefixes(folderPrefixes) {
-  const monthKeys = new Set();
-  for (const prefix of folderPrefixes) {
-    const match = prefix.match(/day_utc=(\d{4}-\d{2}-\d{2})\/$/);
-    if (!match) {
-      continue;
-    }
-    const day = parseIsoDay(match[1]);
-    if (!day) {
-      continue;
-    }
-    monthKeys.add(day.slice(0, 7));
-  }
-  return Array.from(monthKeys).sort((a, b) => a.localeCompare(b));
-}
-
 function escapeRegex(value) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -270,52 +229,53 @@ async function listCommittedDaysForDomain({
   domainPrefix,
   maxKeys,
   maxLookbackDays,
+  strictManifests,
 }) {
   const cutoffDay = buildDayCutoff(maxLookbackDays);
   const todayDay = new Date().toISOString().slice(0, 10);
-  const monthKeys = cutoffDay
-    ? enumerateMonthKeys(cutoffDay, todayDay)
-    : collectMonthKeysFromDayPrefixes(await r2ListAllCommonPrefixes({
-      r2,
-      prefix: `${domainPrefix}/`,
-      delimiter: "/",
-      max_keys: maxKeys,
-    }));
-
-  const dayManifestPattern = new RegExp(
-    `^${escapeRegex(domainPrefix)}/day_utc=(\\d{4}-\\d{2}-\\d{2})/manifest\\.json$`,
-  );
   const discoveredDays = new Set();
-  for (const monthKey of monthKeys) {
-    const monthPrefix = `${domainPrefix}/day_utc=${monthKey}-`;
-    let token = null;
-    for (;;) {
-      const page = await r2ListObjectsV2({
-        r2,
-        prefix: monthPrefix,
-        continuation_token: token,
-        max_keys: maxKeys,
-      });
-      const entries = Array.isArray(page.entries) ? page.entries : [];
-      for (const entry of entries) {
-        const key = String(entry && entry.key ? entry.key : "");
-        const keyMatch = key.match(dayManifestPattern);
-        if (!keyMatch) {
-          continue;
-        }
-        const day = parseIsoDay(keyMatch[1]);
-        if (!day) {
-          continue;
-        }
-        if (cutoffDay && day < cutoffDay) {
-          continue;
-        }
-        discoveredDays.add(day);
+  const dayPrefixes = await r2ListAllCommonPrefixes({
+    r2,
+    prefix: `${domainPrefix}/`,
+    delimiter: "/",
+    max_keys: maxKeys,
+  });
+
+  const dayPrefixPattern = new RegExp(
+    `^${escapeRegex(domainPrefix)}/day_utc=(\\d{4}-\\d{2}-\\d{2})/$`,
+  );
+
+  for (const prefix of dayPrefixes) {
+    const prefixMatch = String(prefix || "").match(dayPrefixPattern);
+    if (!prefixMatch) {
+      continue;
+    }
+    const day = parseIsoDay(prefixMatch[1]);
+    if (!day) {
+      continue;
+    }
+    if (day > todayDay) {
+      continue;
+    }
+    if (cutoffDay && day < cutoffDay) {
+      continue;
+    }
+    discoveredDays.add(day);
+  }
+
+  if (strictManifests) {
+    const strictDays = sortedDayArray(discoveredDays, 0);
+    const committedDays = [];
+    for (const day of strictDays) {
+      const manifestKey = `${domainPrefix}/day_utc=${day}/manifest.json`;
+      const head = await r2HeadObject({ r2, key: manifestKey });
+      if (head.exists) {
+        committedDays.push(day);
       }
-      if (!page.next_token) {
-        break;
-      }
-      token = page.next_token;
+    }
+    discoveredDays.clear();
+    for (const day of committedDays) {
+      discoveredDays.add(day);
     }
   }
 
@@ -345,6 +305,7 @@ async function fetchR2HistoryDays(env, url) {
       ),
     ),
   );
+  const strictManifests = String(url.searchParams.get("strict_manifests") || "").trim().toLowerCase() === "true";
 
   const bucket = resolveR2HistoryBucket(env);
   const r2 = resolveR2Config(env, bucket);
@@ -364,12 +325,14 @@ async function fetchR2HistoryDays(env, url) {
     domainPrefix: observationsPrefix,
     maxKeys,
     maxLookbackDays,
+    strictManifests,
   });
   const aqilevels = await listCommittedDaysForDomain({
     r2,
     domainPrefix: aqilevelsPrefix,
     maxKeys,
     maxLookbackDays,
+    strictManifests,
   });
 
   return {
@@ -385,6 +348,7 @@ async function fetchR2HistoryDays(env, url) {
       aqilevels,
     },
     source: "cloudflare_r2_manifest_scan",
+    strict_manifests: strictManifests,
   };
 }
 
