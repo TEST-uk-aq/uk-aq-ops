@@ -19,7 +19,6 @@ import {
 } from "./backfill_core.mjs";
 import fs from "node:fs";
 import path from "node:path";
-import { Buffer } from "node:buffer";
 import { fileURLToPath } from "node:url";
 import * as arrow from "apache-arrow";
 import * as parquetWasm from "parquet-wasm/esm";
@@ -459,11 +458,16 @@ const DRY_RUN_WRITE_LEDGER = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_DRY_RUN_WRITE_LEDGER"),
   false,
 );
+const TEXT_ENCODER = new TextEncoder();
 
 const SOURCE_METADATA_SCHEMA = (Deno.env.get("UK_AQ_BACKFILL_METADATA_SCHEMA") || "uk_aq_core").trim();
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function encodeJsonBody(payload: unknown): Uint8Array {
+  return TEXT_ENCODER.encode(JSON.stringify(payload, null, 2));
 }
 
 function logStructured(level: "info" | "warning" | "error", event: string, details: Record<string, unknown>) {
@@ -1741,7 +1745,7 @@ async function exportObsConnectorDayToR2(args: {
   await r2PutObject({
     r2: OBS_R2_CONFIG,
     key: manifestKey,
-    body: Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"),
+    body: encodeJsonBody(connectorManifest),
     content_type: "application/json",
   });
   const manifestHead = await r2HeadObject({ r2: OBS_R2_CONFIG, key: manifestKey });
@@ -1946,7 +1950,7 @@ async function exportAqiConnectorDayToR2(args: {
   await r2PutObject({
     r2: OBS_R2_CONFIG,
     key: manifestKey,
-    body: Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"),
+    body: encodeJsonBody(connectorManifest),
     content_type: "application/json",
   });
   const manifestHead = await r2HeadObject({ r2: OBS_R2_CONFIG, key: manifestKey });
@@ -3519,7 +3523,7 @@ async function runObservsToR2(
       await r2PutObject({
         r2: OBS_R2_CONFIG,
         key: dayManifestKey,
-        body: Buffer.from(JSON.stringify(dayManifest, null, 2), "utf8"),
+        body: encodeJsonBody(dayManifest),
         content_type: "application/json",
       });
       const manifestHead = await r2HeadObject({ r2: OBS_R2_CONFIG, key: dayManifestKey });
@@ -3797,7 +3801,7 @@ async function runObservsToR2(
       await r2PutObject({
         r2: OBS_R2_CONFIG,
         key: dayManifestKey,
-        body: Buffer.from(JSON.stringify(dayManifest, null, 2), "utf8"),
+        body: encodeJsonBody(dayManifest),
         content_type: "application/json",
       });
       const manifestHead = await r2HeadObject({ r2: OBS_R2_CONFIG, key: dayManifestKey });
