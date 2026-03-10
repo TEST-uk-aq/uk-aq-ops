@@ -280,6 +280,7 @@
       "dependencies": [
         "npm:@supabase/supabase-js@^2.57.0",
         "npm:apache-arrow@^21.1.0",
+        "npm:hyparquet-compressors@^1.1.1",
         "npm:hyparquet@^1.25.1",
         "npm:parquet-wasm@~0.7.1",
         "npm:pg-cursor@^2.18.0",

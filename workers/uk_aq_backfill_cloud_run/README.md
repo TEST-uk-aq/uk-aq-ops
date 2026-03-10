@@ -119,6 +119,7 @@ Source RPC paging:
 - `UK_AQ_BACKFILL_SOURCE_RPC_PAGE_SIZE` (default `1000`)
 - `UK_AQ_BACKFILL_SOURCE_RPC_MAX_PAGES` (default `200`)
 - `UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE` (default `20000`)
+- `UK_AQ_BACKFILL_OBS_R2_MAX_PAGES` (default `50000`; safety ceiling for obs/aqi history export pagination)
 
 RPC names:
 
@@ -134,6 +135,7 @@ Fallback note:
 
 - if `UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC` is unavailable, expose `uk_aq_observs` in PostgREST for table fallback.
 - `UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC` and `UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC` are required for AQI-domain export (apply schema RPC migration in `CIC-test-uk-aq-schema`).
+- `obs_aqi_to_r2` export pagination continues until an empty page is returned (cursor-based); it does not stop early when a page is smaller than the requested page size.
 
 R2 history prefixes:
 

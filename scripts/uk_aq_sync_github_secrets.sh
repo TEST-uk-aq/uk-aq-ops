@@ -271,10 +271,14 @@ set_secret() {
 set_variable() {
   local name="$1"
   local value="$2"
+  if [[ -z "${value}" ]]; then
+    echo "skip empty variable ${name} (GitHub Actions variables cannot be empty)"
+    return 0
+  fi
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     echo "[dry-run] would set variable ${name} (len=${#value})"
   else
-    gh_cmd variable set "${name}" --repo "${REPO}" --body "${value}"
+    gh_cmd variable set "${name}" --repo "${REPO}" --body "${value}" < /dev/null
     echo "set variable ${name}"
   fi
 }

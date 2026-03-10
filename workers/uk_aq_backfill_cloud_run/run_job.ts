@@ -414,6 +414,12 @@ const OBS_R2_SOURCE_PAGE_SIZE = parsePositiveInt(
   1000,
   100000,
 );
+const OBS_R2_SOURCE_MAX_PAGES = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_OBS_R2_MAX_PAGES"),
+  50000,
+  10,
+  1000000,
+);
 const HOURLY_UPSERT_CHUNK_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE"),
   2000,
@@ -1650,6 +1656,7 @@ async function exportObsConnectorDayToR2(args: {
   const fileEntries: ObsHistoryFileEntry[] = [];
   let rowsRead = 0;
   let partIndex = 0;
+  let pageCount = 0;
   let minObservedAt: string | null = null;
   let maxObservedAt: string | null = null;
   let cursor: ObsHistorySourceCursor = {
@@ -1686,6 +1693,13 @@ async function exportObsConnectorDayToR2(args: {
   };
 
   while (true) {
+    pageCount += 1;
+    if (pageCount > OBS_R2_SOURCE_MAX_PAGES) {
+      throw new Error(
+        `obs_aqi_to_r2 observations export exceeded max pages (${OBS_R2_SOURCE_MAX_PAGES}) for day=${args.day_utc} connector=${args.connector_id}`,
+      );
+    }
+
     const pageRows = await fetchObsHistoryRowsPage(
       args.day_utc,
       args.connector_id,
@@ -1716,14 +1730,18 @@ async function exportObsConnectorDayToR2(args: {
     }
 
     const last = pageRows[pageRows.length - 1];
-    cursor = {
+    const nextCursor: ObsHistorySourceCursor = {
       after_timeseries_id: last.timeseries_id,
       after_observed_at: last.observed_at,
     };
-
-    if (pageRows.length < OBS_R2_SOURCE_PAGE_SIZE) {
-      break;
+    const cursorUnchanged = nextCursor.after_timeseries_id === cursor.after_timeseries_id &&
+      nextCursor.after_observed_at === cursor.after_observed_at;
+    if (cursorUnchanged) {
+      throw new Error(
+        `obs_aqi_to_r2 observations pagination cursor did not advance for day=${args.day_utc} connector=${args.connector_id}`,
+      );
     }
+    cursor = nextCursor;
   }
 
   await flushPart();
@@ -1842,6 +1860,7 @@ async function exportAqiConnectorDayToR2(args: {
   const fileEntries: ObsHistoryFileEntry[] = [];
   let rowsRead = 0;
   let partIndex = 0;
+  let pageCount = 0;
   let minTimestampHourUtc: string | null = null;
   let maxTimestampHourUtc: string | null = null;
   let cursor: AqilevelsHistorySourceCursor = {
@@ -1878,6 +1897,13 @@ async function exportAqiConnectorDayToR2(args: {
   };
 
   while (true) {
+    pageCount += 1;
+    if (pageCount > OBS_R2_SOURCE_MAX_PAGES) {
+      throw new Error(
+        `obs_aqi_to_r2 AQI export exceeded max pages (${OBS_R2_SOURCE_MAX_PAGES}) for day=${args.day_utc} connector=${args.connector_id}`,
+      );
+    }
+
     const pageRows = await fetchAqilevelsHistoryRowsPage(
       args.day_utc,
       args.connector_id,
@@ -1921,14 +1947,18 @@ async function exportAqiConnectorDayToR2(args: {
     }
 
     const last = pageRows[pageRows.length - 1];
-    cursor = {
+    const nextCursor: AqilevelsHistorySourceCursor = {
       after_station_id: last.station_id,
       after_timestamp_hour_utc: last.timestamp_hour_utc,
     };
-
-    if (pageRows.length < OBS_R2_SOURCE_PAGE_SIZE) {
-      break;
+    const cursorUnchanged = nextCursor.after_station_id === cursor.after_station_id &&
+      nextCursor.after_timestamp_hour_utc === cursor.after_timestamp_hour_utc;
+    if (cursorUnchanged) {
+      throw new Error(
+        `obs_aqi_to_r2 AQI pagination cursor did not advance for day=${args.day_utc} connector=${args.connector_id}`,
+      );
     }
+    cursor = nextCursor;
   }
 
   await flushPart();
