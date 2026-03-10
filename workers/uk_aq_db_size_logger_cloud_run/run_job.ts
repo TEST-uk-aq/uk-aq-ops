@@ -637,18 +637,30 @@ async function main(): Promise<void> {
     ingestdb: 0,
     obs_aqidb: 0,
   };
+  let dbSourceSuccessCount = 0;
 
   for (const source of sources) {
-    const sample = await collectDbSizeSample(
-      source.database_label,
-      source.base_url,
-      source.privileged_key,
-    );
-    await upsertDbSizeSample(source, sample);
-    const deleted = await cleanupMetricRows(source, DB_SIZE_CLEANUP_RPC, DB_SIZE_RETENTION_DAYS);
+    try {
+      const sample = await collectDbSizeSample(
+        source.database_label,
+        source.base_url,
+        source.privileged_key,
+      );
+      await upsertDbSizeSample(source, sample);
+      const deleted = await cleanupMetricRows(source, DB_SIZE_CLEANUP_RPC, DB_SIZE_RETENTION_DAYS);
 
-    samplesByLabel[source.database_label] = sample;
-    rowsDeletedByDb[source.database_label] = deleted;
+      samplesByLabel[source.database_label] = sample;
+      rowsDeletedByDb[source.database_label] = deleted;
+      dbSourceSuccessCount += 1;
+    } catch (error) {
+      warnings.push(`db_size_${source.database_label}: ${warningMessage(error)}`);
+    }
+  }
+
+  if (dbSourceSuccessCount === 0) {
+    throw new Error(
+      "db_size: failed for all sources; no db size metrics persisted",
+    );
   }
 
   let schemaSamples: SchemaSizeSample[] = [];

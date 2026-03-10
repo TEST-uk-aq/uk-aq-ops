@@ -18,6 +18,8 @@ Write targets:
 
 Primary scheduling is now Supabase `pg_cron` in each DB (local sample/write).
 Cloud Run service remains available for manual/on-demand runs or fallback scheduling.
+If one DB source call fails (for example, statement timeout), the run records a warning
+and continues; it only fails when both DB sources fail in the same run.
 
 ## Required env vars / secrets
 

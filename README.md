@@ -87,6 +87,7 @@ Primary controls:
 - `POST /` executes logger job
 - samples ingest + obs_aqidb DB cluster size via RPC
 - upserts metrics and runs retention cleanup in each source DB's local metrics table
+- degrades to warning on single-source DB-size failures; fails only if both DB sources fail
 - default GitHub deploy keeps Cloud Scheduler disabled; Supabase `pg_cron` is the primary hourly scheduler
 
 ### 5) AQI Levels Retention (`workers/uk_aq_aqilevels_retention_service/server.mjs`)
