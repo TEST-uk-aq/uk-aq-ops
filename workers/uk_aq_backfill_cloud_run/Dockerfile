@@ -2,8 +2,8 @@ FROM denoland/deno:2.2.3
 
 WORKDIR /app
 
-COPY package.json package-lock.json deno.lock /app/
-RUN deno install
+COPY package.json package-lock.json /app/
+RUN deno install --no-lock
 
 COPY workers/shared/r2_sigv4.mjs /app/workers/shared/r2_sigv4.mjs
 COPY workers/uk_aq_backfill_cloud_run/backfill_core.mjs /app/workers/uk_aq_backfill_cloud_run/backfill_core.mjs
