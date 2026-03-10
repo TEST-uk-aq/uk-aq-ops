@@ -1,7 +1,7 @@
 import {
   hasRequiredR2Config,
   normalizePrefix,
-  r2HeadObject,
+  r2ListObjectsV2,
   r2ListAllCommonPrefixes,
 } from "../shared/r2_sigv4.mjs";
 
@@ -209,21 +209,44 @@ function sortedDayArray(daySet, maxLookbackDays) {
   return sorted.filter((day) => day >= cutoff);
 }
 
-async function listCommittedDaysForDomain({
-  r2,
-  domainPrefix,
-  maxKeys,
-  maxLookbackDays,
-}) {
-  const domainRoot = `${domainPrefix}/`;
-  const folderPrefixes = await r2ListAllCommonPrefixes({
-    r2,
-    prefix: domainRoot,
-    delimiter: "/",
-    max_keys: maxKeys,
-  });
+function buildDayCutoff(maxLookbackDays) {
+  if (!Number.isFinite(maxLookbackDays) || maxLookbackDays <= 0) {
+    return null;
+  }
+  const now = new Date();
+  const startOfTodayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return new Date(startOfTodayUtc - maxLookbackDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+}
 
-  const discoveredDays = new Set();
+function enumerateMonthKeys(startDay, endDay) {
+  const parsedStart = parseIsoDay(startDay);
+  const parsedEnd = parseIsoDay(endDay);
+  if (!parsedStart || !parsedEnd || parsedStart > parsedEnd) {
+    return [];
+  }
+  const [startYear, startMonth] = parsedStart.split("-").slice(0, 2).map((v) => Number(v));
+  const [endYear, endMonth] = parsedEnd.split("-").slice(0, 2).map((v) => Number(v));
+  if (!Number.isFinite(startYear) || !Number.isFinite(startMonth) || !Number.isFinite(endYear) || !Number.isFinite(endMonth)) {
+    return [];
+  }
+  const months = [];
+  let year = startYear;
+  let month = startMonth;
+  while (year < endYear || (year === endYear && month <= endMonth)) {
+    months.push(`${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}`);
+    month += 1;
+    if (month > 12) {
+      month = 1;
+      year += 1;
+    }
+  }
+  return months;
+}
+
+function collectMonthKeysFromDayPrefixes(folderPrefixes) {
+  const monthKeys = new Set();
   for (const prefix of folderPrefixes) {
     const match = prefix.match(/day_utc=(\d{4}-\d{2}-\d{2})\/$/);
     if (!match) {
@@ -233,15 +256,70 @@ async function listCommittedDaysForDomain({
     if (!day) {
       continue;
     }
-    const manifestKey = `${domainPrefix}/day_utc=${day}/manifest.json`;
-    const manifest = await r2HeadObject({ r2, key: manifestKey });
-    if (!manifest.exists) {
-      continue;
+    monthKeys.add(day.slice(0, 7));
+  }
+  return Array.from(monthKeys).sort((a, b) => a.localeCompare(b));
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function listCommittedDaysForDomain({
+  r2,
+  domainPrefix,
+  maxKeys,
+  maxLookbackDays,
+}) {
+  const cutoffDay = buildDayCutoff(maxLookbackDays);
+  const todayDay = new Date().toISOString().slice(0, 10);
+  const monthKeys = cutoffDay
+    ? enumerateMonthKeys(cutoffDay, todayDay)
+    : collectMonthKeysFromDayPrefixes(await r2ListAllCommonPrefixes({
+      r2,
+      prefix: `${domainPrefix}/`,
+      delimiter: "/",
+      max_keys: maxKeys,
+    }));
+
+  const dayManifestPattern = new RegExp(
+    `^${escapeRegex(domainPrefix)}/day_utc=(\\d{4}-\\d{2}-\\d{2})/manifest\\.json$`,
+  );
+  const discoveredDays = new Set();
+  for (const monthKey of monthKeys) {
+    const monthPrefix = `${domainPrefix}/day_utc=${monthKey}-`;
+    let token = null;
+    for (;;) {
+      const page = await r2ListObjectsV2({
+        r2,
+        prefix: monthPrefix,
+        continuation_token: token,
+        max_keys: maxKeys,
+      });
+      const entries = Array.isArray(page.entries) ? page.entries : [];
+      for (const entry of entries) {
+        const key = String(entry && entry.key ? entry.key : "");
+        const keyMatch = key.match(dayManifestPattern);
+        if (!keyMatch) {
+          continue;
+        }
+        const day = parseIsoDay(keyMatch[1]);
+        if (!day) {
+          continue;
+        }
+        if (cutoffDay && day < cutoffDay) {
+          continue;
+        }
+        discoveredDays.add(day);
+      }
+      if (!page.next_token) {
+        break;
+      }
+      token = page.next_token;
     }
-    discoveredDays.add(day);
   }
 
-  const days = sortedDayArray(discoveredDays, maxLookbackDays);
+  const days = sortedDayArray(discoveredDays, 0);
   const minDay = days.length ? days[0] : null;
   const maxDay = days.length ? days[days.length - 1] : null;
   return {

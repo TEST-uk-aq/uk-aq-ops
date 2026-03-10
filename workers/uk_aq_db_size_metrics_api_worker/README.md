@@ -60,9 +60,10 @@ Behavior:
   - `uk_aq_public.uk_aq_schema_size_metrics_hourly`
 - Reads R2-domain size rows from ingestdb public view:
   - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
-- For `/v1/r2-history-days`, scans R2 day folders for each domain and only includes days where:
+- For `/v1/r2-history-days`, scans R2 by month prefix for each domain and only includes days where:
   - `<prefix>/day_utc=YYYY-MM-DD/manifest.json` exists.
-  - This is the committed-day contract used for serving/backup eligibility.
+  - This preserves the committed-day contract used for serving/backup eligibility.
+  - The month-paged scan avoids one `HEAD` call per day (prevents Worker subrequest-limit failures on large lookbacks).
 
 ## Required secrets / vars
 
