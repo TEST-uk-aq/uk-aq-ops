@@ -65,10 +65,26 @@ jobs:
       UK_AQ_BACKFILL_ENABLE_R2_FALLBACK: ${{ vars.UK_AQ_BACKFILL_ENABLE_R2_FALLBACK || 'false' }}
       UK_AQ_BACKFILL_METADATA_SCHEMA: ${{ vars.UK_AQ_BACKFILL_METADATA_SCHEMA || 'uk_aq_core' }}
       UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE: ${{ vars.UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE || '1000' }}
+      UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC: ${{ vars.UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC || 'uk_aq_rpc_observs_history_day_rows' }}
+      UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE: ${{ vars.UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE || '20000' }}
+      UK_AQ_DEPLOY_ENV: ${{ vars.UK_AQ_DEPLOY_ENV || 'dev' }}
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_PART_MAX_ROWS: ${{ vars.UK_AQ_R2_HISTORY_PART_MAX_ROWS || '1000000' }}
+      UK_AQ_R2_HISTORY_ROW_GROUP_SIZE: ${{ vars.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE || '100000' }}
+      R2_BUCKET_PROD: ${{ vars.R2_BUCKET_PROD || '' }}
+      R2_BUCKET_STAGE: ${{ vars.R2_BUCKET_STAGE || '' }}
+      R2_BUCKET_DEV: ${{ vars.R2_BUCKET_DEV || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || vars.R2_BUCKET || '' }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || vars.R2_ENDPOINT || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || vars.R2_REGION || 'auto' }}
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
+      CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME || 'CFLARE_R2_ACCESS_KEY_ID' }}
+      CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME || 'CFLARE_R2_SECRET_ACCESS_KEY' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY || secrets.R2_SECRET_ACCESS_KEY }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -97,6 +113,14 @@ jobs:
           fi
           if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ]; then
             echo "Missing required variable: OBS_AQIDB_SUPABASE_URL"
+            exit 1
+          fi
+          if [ -z "${CFLARE_R2_ENDPOINT:-}" ]; then
+            echo "Missing required variable: CFLARE_R2_ENDPOINT (or R2_ENDPOINT)"
+            exit 1
+          fi
+          if [ -z "${R2_BUCKET_PROD:-}" ] && [ -z "${R2_BUCKET_STAGE:-}" ] && [ -z "${R2_BUCKET_DEV:-}" ] && [ -z "${CFLARE_R2_BUCKET:-}" ]; then
+            echo "Missing R2 bucket mapping (set R2_BUCKET_PROD/STAGE/DEV or CFLARE_R2_BUCKET/R2_BUCKET)"
             exit 1
           fi
 
@@ -190,6 +214,8 @@ jobs:
 
           upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1
           upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
+          upsert_secret "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" "${CFLARE_R2_ACCESS_KEY_ID}" 1
+          upsert_secret "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" "${CFLARE_R2_SECRET_ACCESS_KEY}" 1
 
       - name: Build Cloud Run env and secret args
         id: cloudrun_args
@@ -256,11 +282,25 @@ jobs:
           add_env UK_AQ_BACKFILL_ENABLE_R2_FALLBACK
           add_env UK_AQ_BACKFILL_METADATA_SCHEMA
           add_env UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE
+          add_env UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC
+          add_env UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE
+          add_env UK_AQ_DEPLOY_ENV
+          add_env UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
+          add_env UK_AQ_R2_HISTORY_PART_MAX_ROWS
+          add_env UK_AQ_R2_HISTORY_ROW_GROUP_SIZE
+          add_env R2_BUCKET_PROD
+          add_env R2_BUCKET_STAGE
+          add_env R2_BUCKET_DEV
+          add_env CFLARE_R2_BUCKET
+          add_env CFLARE_R2_ENDPOINT
+          add_env CFLARE_R2_REGION
           env_updates+=("GCP_PROJECT_ID=${PROJECT_ID}")
 
           secret_updates=()
           add_secret_binding "SB_SECRET_KEY" "${SB_SECRET_KEY_SECRET_NAME}" 1
           add_secret_binding "OBS_AQIDB_SECRET_KEY" "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" 1
+          add_secret_binding "CFLARE_R2_ACCESS_KEY_ID" "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" 1
+          add_secret_binding "CFLARE_R2_SECRET_ACCESS_KEY" "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}" 1
 
           env_file="${RUNNER_TEMP}/uk-aq-backfill-env.yaml"
           : > "${env_file}"
