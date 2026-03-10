@@ -13,8 +13,8 @@
 
 - Canonical SQL DDL belongs in the schema repo (`.../CIC-test-uk-aq-schema/schemas/...`), not only in ops worker directories.
 - If ops introduces or changes Obs AQI tables, the change must also be reflected in:
-  - `schemas/aqilevels_db/uk_aq_aqilevels_schema.sql` (main Obs AQI schema), and
-  - a schema-repo SQL file under `schemas/aqilevels_db/` when a targeted apply file is needed.
+  - `schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql` (main Obs AQI schema), and
+  - a schema-repo SQL file under `schemas/obs_aqi_db/` when a targeted apply file is needed.
 
 ## R2/Cloudflare Cache Cost Policy
 

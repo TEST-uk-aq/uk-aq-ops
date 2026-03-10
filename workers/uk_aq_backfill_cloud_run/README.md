@@ -2,11 +2,11 @@
 
 Cloud Run worker for UK AQ operational backfill workflows.
 
-Phase 1 implementation status:
+Current implementation status (Phase 9, incremental):
 
-- `local_to_aqilevels`: implemented
-- `obs_aqi_to_r2`: wired stub (not yet implemented)
-- `source_to_all`: wired stub (not yet implemented)
+- `local_to_aqilevels`: implemented.
+- `obs_aqi_to_r2`: implemented as plan/check mode (dry-run planning + no-op success when days are already backed up).
+- `source_to_all`: partially implemented (executes local retained days via `local_to_aqilevels`, reports non-local days as pending source acquisition).
 
 ## Endpoints
 
@@ -34,33 +34,52 @@ All fields are optional unless noted.
 ## Run Modes
 
 - `local_to_aqilevels`
-  - phase 1 implemented
-  - processes newest selected UTC day first, then older days
-  - uses source priority per day/connector:
-    - ingest DB for likely in-retention days
-    - observs DB for older local days
-    - R2 only when explicit fallback is enabled
-  - default skip if checkpoint is already complete
-  - `force_replace=true` bypasses skip
-  - writes Obs AQI hourly + rollups via existing AQI RPCs
+  - processes newest selected UTC day first, then older days.
+  - source priority per day/connector:
+    - ingest DB for likely in-retention days.
+    - obs_aqidb for older local days.
+    - optional R2 fallback only when explicitly enabled.
+  - default skip when checkpoint is already complete.
+  - `force_replace=true` bypasses checkpoint skip.
+  - writes Obs AQI hourly + rollups via AQI RPCs.
 
 - `obs_aqi_to_r2`
-  - phase 1 stub only
+  - checks requested day window against committed backup evidence.
+  - uses:
+    - `uk_aq_public.uk_aq_rpc_r2_history_window` (history min/max),
+    - `uk_aq_ops.prune_day_gates` completion fields (`history_done`, `history_manifest_key`, `history_completed_at`).
+  - behavior:
+    - `dry_run=true`: returns a planning summary (`backed_up_days`, `pending_backfill_days`).
+    - `dry_run=false` and all days already backed up: returns `ok`.
+    - `dry_run=false` and pending days exist: throws by default.
+    - if `UK_AQ_BACKFILL_ALLOW_STUB_MODES=true`, pending-day non-dry runs return `stubbed` (no writes executed).
 
 - `source_to_all`
-  - phase 1 stub only
-  - retention helper is active and classifies observs-write eligible/skipped days
+  - computes rolling local retention window.
+  - runs `local_to_aqilevels` for retained UTC days inside that window.
+  - returns `source_acquisition_pending_days` for non-local days (external acquisition/write path still pending).
+  - non-dry runs with pending non-local days return `stubbed`.
+
+## Runtime Status Values
+
+- `ok`: run completed for requested scope.
+- `dry_run`: planning mode, no writes.
+- `stubbed`: run completed with intentionally unimplemented write path.
+- `error`: run failed.
 
 ## Required Environment
 
-For `local_to_aqilevels`:
+For `local_to_aqilevels` and `source_to_all` local-write path:
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
-- `OBS_AQIDB_SUPABASE_URL`
-- `OBS_AQIDB_SECRET_KEY`
+
+For `obs_aqi_to_r2` planning:
+
+- `SUPABASE_URL`
+- `SB_SECRET_KEY`
 
 ## Optional Environment
 
@@ -74,6 +93,7 @@ Core:
 - `UK_AQ_BACKFILL_TO_DAY_UTC` (default `from_day_utc`)
 - `UK_AQ_BACKFILL_CONNECTOR_IDS` (optional filter)
 - `UK_AQ_BACKFILL_ENABLE_R2_FALLBACK` (default `false`)
+- `UK_AQ_BACKFILL_ALLOW_STUB_MODES` (default `false`)
 
 Retention / iteration:
 
@@ -106,11 +126,11 @@ Ledger:
 
 If you want persistent skip/checkpoint behavior across runs, apply:
 
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aqilevels_db/uk_aq_backfill_ops_obs_aqi.sql` (canonical)
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/obs_aqi_db/uk_aq_backfill_ops_obs_aqi.sql` (canonical)
 
 The same ledger tables are included in:
 
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aqilevels_db/uk_aq_aqilevels_schema.sql`
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql`
 
 Tables:
 
@@ -126,7 +146,7 @@ curl -X POST "https://<cloud-run-url>/run" \
   -H "content-type: application/json" \
   -d '{
     "trigger_mode": "manual",
-    "run_mode": "local_to_aqilevels",
+    "run_mode": "source_to_all",
     "dry_run": true,
     "from_day_utc": "2026-02-01",
     "to_day_utc": "2026-02-05",

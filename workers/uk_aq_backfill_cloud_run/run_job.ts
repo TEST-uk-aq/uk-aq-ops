@@ -110,6 +110,36 @@ type LocalToAqilevelsSummary = {
   day_connector_results: LocalToAqilevelsDayConnectorResult[];
 };
 
+type ObsAqiToR2Summary = {
+  mode: "obs_aqi_to_r2";
+  run_id: string;
+  dry_run: boolean;
+  from_day_utc: string;
+  to_day_utc: string;
+  days_planned: number;
+  backed_up_days: string[];
+  pending_backfill_days: string[];
+  min_day_utc: string | null;
+  max_day_utc: string | null;
+  message: string;
+};
+
+type SourceToAllSummary = {
+  mode: "source_to_all";
+  run_id: string;
+  dry_run: boolean;
+  from_day_utc: string;
+  to_day_utc: string;
+  days_planned: number;
+  rows_read: number;
+  rows_written_aqilevels: number;
+  retention_window: Record<string, unknown>;
+  local_to_aqilevels_days: string[];
+  source_acquisition_pending_days: string[];
+  local_to_aqilevels_summary: LocalToAqilevelsSummary | null;
+  warnings: string[];
+};
+
 type StubModeSummary = {
   mode: "obs_aqi_to_r2" | "source_to_all";
   run_id: string;
@@ -123,7 +153,22 @@ type StubModeSummary = {
   observs_write_skipped_days?: string[];
 };
 
-type RunSummary = LocalToAqilevelsSummary | StubModeSummary;
+type RunFailureSummary = {
+  mode: RunMode;
+  run_id: string;
+  failed: true;
+  message: string;
+  from_day_utc: string;
+  to_day_utc: string;
+  days_planned: number;
+};
+
+type RunSummary =
+  | LocalToAqilevelsSummary
+  | ObsAqiToR2Summary
+  | SourceToAllSummary
+  | StubModeSummary
+  | RunFailureSummary;
 
 const INGEST_SUPABASE_URL = optionalEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = optionalEnvAny(["SB_SECRET_KEY"]);
@@ -157,6 +202,10 @@ const FORCE_REPLACE = parseBooleanish(
 );
 const ENABLE_R2_FALLBACK = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_ENABLE_R2_FALLBACK"),
+  false,
+);
+const ALLOW_STUB_MODES = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_ALLOW_STUB_MODES"),
   false,
 );
 const CONNECTOR_IDS = parseConnectorIds(optionalEnv("UK_AQ_BACKFILL_CONNECTOR_IDS"));
@@ -453,6 +502,108 @@ async function postgrestTable<T>(
       status: 0,
     };
   }
+}
+
+type R2HistoryWindowRow = {
+  min_day_utc: unknown;
+  max_day_utc: unknown;
+};
+
+type PruneDayGateRow = {
+  day_utc: unknown;
+};
+
+function chunkList<T>(values: T[], chunkSize: number): T[][] {
+  if (values.length === 0) {
+    return [];
+  }
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += chunkSize) {
+    chunks.push(values.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
+function parseOptionalDay(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  if (!text) {
+    return null;
+  }
+  const parsed = parseIsoDayUtc(text);
+  if (parsed) {
+    return parsed;
+  }
+  const isoPrefix = text.slice(0, 10);
+  return parseIsoDayUtc(isoPrefix);
+}
+
+async function fetchR2HistoryWindowSummary(): Promise<{
+  min_day_utc: string | null;
+  max_day_utc: string | null;
+}> {
+  const source = SOURCE_DB_BY_KIND.ingestdb;
+  if (!source) {
+    return { min_day_utc: null, max_day_utc: null };
+  }
+  const response = await postgrestRpc<R2HistoryWindowRow[]>(
+    source,
+    "uk_aq_rpc_r2_history_window",
+    {},
+  );
+  if (response.error) {
+    throw new Error(`R2 history window RPC failed: ${response.error.message}`);
+  }
+  const rows = Array.isArray(response.data) ? response.data : [];
+  const first = rows.length > 0 ? rows[0] : null;
+  return {
+    min_day_utc: parseOptionalDay(first?.min_day_utc),
+    max_day_utc: parseOptionalDay(first?.max_day_utc),
+  };
+}
+
+async function fetchR2BackedUpDaySet(dayUtcList: string[]): Promise<Set<string>> {
+  const source = SOURCE_DB_BY_KIND.ingestdb;
+  const backedUp = new Set<string>();
+  if (!source || dayUtcList.length === 0) {
+    return backedUp;
+  }
+
+  for (const chunk of chunkList(dayUtcList, 180)) {
+    const query = new URLSearchParams();
+    query.set("select", "day_utc");
+    query.set("day_utc", `in.(${chunk.join(",")})`);
+    query.set("history_done", "eq.true");
+    query.set("history_manifest_key", "not.is.null");
+    query.set("history_completed_at", "not.is.null");
+
+    const result = await postgrestTable<PruneDayGateRow[]>(
+      source.base_url,
+      source.privileged_key,
+      {
+        method: "GET",
+        schema: OPS_SCHEMA,
+        table: "prune_day_gates",
+        query,
+      },
+    );
+
+    if (result.error) {
+      throw new Error(`prune_day_gates lookup failed: ${result.error}`);
+    }
+
+    const rows = Array.isArray(result.data) ? result.data : [];
+    for (const row of rows) {
+      const day = parseOptionalDay(row.day_utc);
+      if (day) {
+        backedUp.add(day);
+      }
+    }
+  }
+
+  return backedUp;
 }
 
 function toSafeInt(value: unknown): number {
@@ -1316,6 +1467,7 @@ async function runLocalToAqilevels(
   runId: string,
   window: { from_day_utc: string; to_day_utc: string },
   ledgerEnabled: boolean,
+  dayListOverride: string[] | null = null,
 ): Promise<LocalToAqilevelsSummary> {
   if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
     throw new Error("local_to_aqilevels requires SUPABASE_URL + SB_SECRET_KEY");
@@ -1323,11 +1475,10 @@ async function runLocalToAqilevels(
   if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
     throw new Error("local_to_aqilevels requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
   }
-  if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
-    throw new Error("local_to_aqilevels requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
-  }
 
-  const days = buildBackwardDayRange(window.from_day_utc, window.to_day_utc);
+  const days = dayListOverride && dayListOverride.length > 0
+    ? [...dayListOverride]
+    : buildBackwardDayRange(window.from_day_utc, window.to_day_utc);
   const summary: LocalToAqilevelsSummary = {
     mode: "local_to_aqilevels",
     run_id: runId,
@@ -1683,25 +1834,68 @@ async function runLocalToAqilevels(
   return summary;
 }
 
-async function runObservsToR2Stub(
-  runId: string,
-  window: { from_day_utc: string; to_day_utc: string },
-): Promise<StubModeSummary> {
+function deriveWindowFromDayList(dayUtcList: string[]): { from_day_utc: string; to_day_utc: string } {
+  if (dayUtcList.length === 0) {
+    throw new Error("dayUtcList must not be empty");
+  }
+  const sorted = [...dayUtcList].sort(compareIsoDay);
   return {
-    mode: "obs_aqi_to_r2",
-    run_id: runId,
-    stubbed: true,
-    message: "Phase 1 stub: mode wiring and trigger plumbing only. Pipeline implementation is pending.",
-    from_day_utc: window.from_day_utc,
-    to_day_utc: window.to_day_utc,
-    days_planned: dayRangeDaysCount(window.from_day_utc, window.to_day_utc),
+    from_day_utc: sorted[0],
+    to_day_utc: sorted[sorted.length - 1],
   };
 }
 
-async function runSourceToAllStub(
+async function runObservsToR2(
   runId: string,
   window: { from_day_utc: string; to_day_utc: string },
-): Promise<StubModeSummary> {
+): Promise<ObsAqiToR2Summary | StubModeSummary> {
+  const requestedDays = buildBackwardDayRange(window.from_day_utc, window.to_day_utc);
+  const historyWindow = await fetchR2HistoryWindowSummary();
+  const backedUpDaySet = await fetchR2BackedUpDaySet(requestedDays);
+  const backedUpDays = requestedDays.filter((dayUtc) => backedUpDaySet.has(dayUtc));
+  const pendingDays = requestedDays.filter((dayUtc) => !backedUpDaySet.has(dayUtc));
+
+  if (!DRY_RUN && pendingDays.length > 0 && !ALLOW_STUB_MODES) {
+    throw new Error(
+      `obs_aqi_to_r2 has ${pendingDays.length} pending day(s) and write-path implementation is pending; rerun with dry_run=true for plan output.`,
+    );
+  }
+
+  if (!DRY_RUN && pendingDays.length > 0 && ALLOW_STUB_MODES) {
+    return {
+      mode: "obs_aqi_to_r2",
+      run_id: runId,
+      stubbed: true,
+      message:
+        "Stub mode allowed by UK_AQ_BACKFILL_ALLOW_STUB_MODES=true. Pending days were planned but no R2 writes were executed.",
+      from_day_utc: window.from_day_utc,
+      to_day_utc: window.to_day_utc,
+      days_planned: requestedDays.length,
+    };
+  }
+
+  return {
+    mode: "obs_aqi_to_r2",
+    run_id: runId,
+    dry_run: DRY_RUN,
+    from_day_utc: window.from_day_utc,
+    to_day_utc: window.to_day_utc,
+    days_planned: requestedDays.length,
+    backed_up_days: backedUpDays,
+    pending_backfill_days: pendingDays,
+    min_day_utc: historyWindow.min_day_utc,
+    max_day_utc: historyWindow.max_day_utc,
+    message: pendingDays.length > 0
+      ? "Planned pending days for R2 backfill; mode currently supports dry-run planning only."
+      : "All requested days already appear backed up via prune day-gates.",
+  };
+}
+
+async function runSourceToAll(
+  runId: string,
+  window: { from_day_utc: string; to_day_utc: string },
+  ledgerEnabled: boolean,
+): Promise<SourceToAllSummary> {
   const retentionWindow = computeRollingLocalRetentionWindow({
     nowUtc: new Date(),
     timeZone: LOCAL_TIMEZONE,
@@ -1709,29 +1903,49 @@ async function runSourceToAllStub(
   });
 
   const days = buildBackwardDayRange(window.from_day_utc, window.to_day_utc);
-  const observsWriteEligibleDays: string[] = [];
-  const observsWriteSkippedDays: string[] = [];
+  const localToAqilevelsDays: string[] = [];
+  const sourceAcquisitionPendingDays: string[] = [];
 
   for (const dayUtc of days) {
     if (isDayInRollingRetentionWindow(dayUtc, retentionWindow)) {
-      observsWriteEligibleDays.push(dayUtc);
+      localToAqilevelsDays.push(dayUtc);
     } else {
-      observsWriteSkippedDays.push(dayUtc);
+      sourceAcquisitionPendingDays.push(dayUtc);
     }
+  }
+
+  let localSummary: LocalToAqilevelsSummary | null = null;
+  if (localToAqilevelsDays.length > 0) {
+    const localWindow = deriveWindowFromDayList(localToAqilevelsDays);
+    localSummary = await runLocalToAqilevels(
+      runId,
+      localWindow,
+      ledgerEnabled,
+      localToAqilevelsDays,
+    );
+  }
+
+  const warnings: string[] = [];
+  if (sourceAcquisitionPendingDays.length > 0) {
+    warnings.push(
+      "External source acquisition for non-local days is pending Phase 9 implementation; those days were not written.",
+    );
   }
 
   return {
     mode: "source_to_all",
     run_id: runId,
-    stubbed: true,
-    message:
-      "Phase 1 stub: mode wiring only. Retention-boundary helper is active and classifies observs-write eligible vs skipped days.",
+    dry_run: DRY_RUN,
     from_day_utc: window.from_day_utc,
     to_day_utc: window.to_day_utc,
     days_planned: days.length,
+    rows_read: localSummary?.rows_read || 0,
+    rows_written_aqilevels: localSummary?.rows_written_aqilevels || 0,
     retention_window: retentionWindow,
-    observs_write_eligible_days: observsWriteEligibleDays,
-    observs_write_skipped_days: observsWriteSkippedDays,
+    local_to_aqilevels_days: localToAqilevelsDays,
+    source_acquisition_pending_days: sourceAcquisitionPendingDays,
+    local_to_aqilevels_summary: localSummary,
+    warnings,
   };
 }
 
@@ -1756,6 +1970,7 @@ async function main(): Promise<void> {
     ingest_retention_days: INGEST_RETENTION_DAYS,
     observs_local_retention_days: OBS_AQI_LOCAL_RETENTION_DAYS,
     local_timezone: LOCAL_TIMEZONE,
+    allow_stub_modes: ALLOW_STUB_MODES,
     ledger_enabled: ledgerEnabled,
   });
 
@@ -1771,11 +1986,23 @@ async function main(): Promise<void> {
         errorMessage = `local_to_aqilevels encountered ${summary.connector_day_error} connector-day errors`;
       }
     } else if (RUN_MODE === "obs_aqi_to_r2") {
-      summary = await runObservsToR2Stub(runId, window);
-      runStatus = "stubbed";
+      summary = await runObservsToR2(runId, window);
+      if ("stubbed" in summary && summary.stubbed) {
+        runStatus = "stubbed";
+      } else {
+        runStatus = DRY_RUN ? "dry_run" : "ok";
+      }
     } else {
-      summary = await runSourceToAllStub(runId, window);
-      runStatus = "stubbed";
+      summary = await runSourceToAll(runId, window, ledgerEnabled);
+      const localErrors = summary.local_to_aqilevels_summary?.connector_day_error || 0;
+      if (localErrors > 0) {
+        runStatus = "error";
+        errorMessage = `source_to_all local_to_aqilevels encountered ${localErrors} connector-day errors`;
+      } else if (!DRY_RUN && summary.source_acquisition_pending_days.length > 0) {
+        runStatus = "stubbed";
+      } else {
+        runStatus = DRY_RUN ? "dry_run" : "ok";
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1784,12 +2011,12 @@ async function main(): Promise<void> {
     summary = {
       mode: RUN_MODE,
       run_id: runId,
-      stubbed: true,
+      failed: true,
       message: "run_failed",
       from_day_utc: window.from_day_utc,
       to_day_utc: window.to_day_utc,
       days_planned: dayRangeDaysCount(window.from_day_utc, window.to_day_utc),
-    } as StubModeSummary;
+    };
 
     await ledgerInsertError(ledgerEnabled, {
       run_id: runId,
@@ -1814,6 +2041,7 @@ async function main(): Promise<void> {
       summary,
       connector_ids: CONNECTOR_IDS,
       enable_r2_fallback: ENABLE_R2_FALLBACK,
+      allow_stub_modes: ALLOW_STUB_MODES,
     },
     error_json: errorMessage ? { message: errorMessage } : null,
     finished_at: nowIso(),

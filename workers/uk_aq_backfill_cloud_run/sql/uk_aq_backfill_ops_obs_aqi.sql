@@ -1,6 +1,6 @@
 -- Backfill ops metadata tables for Obs AQI DB.
 -- Canonical location is the schema repo:
---   ../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/aqilevels_db/uk_aq_backfill_ops_obs_aqi.sql
+--   ../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/obs_aqi_db/uk_aq_backfill_ops_obs_aqi.sql
 -- Keep this file in sync only as a convenience mirror.
 
 create schema if not exists uk_aq_ops;

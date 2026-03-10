@@ -230,7 +230,7 @@ uk_aq_sync_github_secrets \
 Apply in Supabase SQL editor:
 
 - `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/ingest_db/ingest_db_ops_rpcs.sql` (ingest DB)
-- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/observs_db/observs_db_ops_rpcs.sql` (obs_aqidb / `uk_aq_observs`)
+- `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_ops_rpcs.sql` (obs_aqidb / `uk_aq_observs`)
 
 ## Deployment workflows
 
