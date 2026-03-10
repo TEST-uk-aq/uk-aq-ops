@@ -1,4 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
+import { Buffer } from "node:buffer";
 
 export function encodeRfc3986(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
