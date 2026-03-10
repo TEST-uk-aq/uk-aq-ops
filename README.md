@@ -113,6 +113,7 @@ Primary controls:
 
 - `GET /v1/observations` (alias: `GET /`)
 - reads only committed R2 history days/manifests under `history/v1/observations/...`
+- supports ZSTD-compressed parquet via `hyparquet-compressors` (required for current history parts)
 - requires `x-uk-aq-upstream-auth` matching `UK_AQ_EDGE_UPSTREAM_SECRET`
 - returns normalized `{observed_at,value}` rows for a single `timeseries_id` + `connector_id`
 - consumed by ingest edge function `uk_aq_timeseries` for old-window reads
@@ -196,6 +197,7 @@ Notes:
   - `history/v1/observations/day_utc=YYYY-MM-DD/...`
   - `history/v1/aqilevels/day_utc=YYYY-MM-DD/...`
 - No `YYYY/YYYY-MM` reshaping is applied.
+- Already-checkpointed days are re-copied if the source day `manifest.json` hash changes.
 - Checkpoint file default:
   - `_ops/checkpoints/r2_history_backup_state_v1.json`
 

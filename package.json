@@ -21,6 +21,7 @@
     "@supabase/supabase-js": "^2.57.0",
     "apache-arrow": "^21.1.0",
     "hyparquet": "^1.25.1",
+    "hyparquet-compressors": "^1.1.1",
     "parquet-wasm": "^0.7.1",
     "pg": "^8.19.0",
     "pg-cursor": "^2.18.0"

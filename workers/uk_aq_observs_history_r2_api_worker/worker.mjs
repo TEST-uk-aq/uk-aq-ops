@@ -1,4 +1,5 @@
 import { parquetReadObjects } from "hyparquet";
+import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/observations";
 const DEFAULT_CACHE_SECONDS = 300;
@@ -186,6 +187,7 @@ async function fetchParquetRowsFromR2(env, key) {
     file: arrayBuffer,
     rowFormat: "object",
     columns: ["timeseries_id", "observed_at", "value"],
+    compressors,
   });
   return { exists: true, rows: Array.isArray(rows) ? rows : [] };
 }

@@ -412,13 +412,81 @@ function markDayCopied(state, domain, dayUtc, details) {
   state.updated_at = details.copied_at;
 }
 
-function selectCandidateDays(days, domainState, maxDaysPerRun) {
-  const copiedDays = new Set(Object.keys(domainState.days || {}));
-  const candidates = days.filter((dayUtc) => !copiedDays.has(dayUtc));
-  if (maxDaysPerRun > 0) {
-    return candidates.slice(0, maxDaysPerRun);
+function buildCandidatePlan(params) {
+  const {
+    listedDays,
+    domainState,
+    domainPrefix,
+    sourceRoot,
+    rcloneBin,
+    maxDaysPerRun,
+  } = params;
+
+  const domainDays = domainState && typeof domainState.days === "object" && domainState.days
+    ? domainState.days
+    : {};
+
+  const candidates = [];
+  let skippedIncomplete = 0;
+  let skippedUnchanged = 0;
+
+  for (const dayUtc of listedDays) {
+    const relativeDayPath = `${domainPrefix}/day_utc=${dayUtc}`;
+    const sourceDayPath = joinTargetPath(sourceRoot, relativeDayPath);
+    const sourceManifestPath = joinTargetPath(sourceDayPath, "manifest.json");
+
+    const checkpointEntry = domainDays[dayUtc];
+    const checkpointManifestHash = checkpointEntry
+      ? String(checkpointEntry.manifest_hash || "").trim()
+      : "";
+
+    // New day (or legacy checkpoint row without hash): queue copy directly.
+    if (!checkpointEntry || !checkpointManifestHash) {
+      candidates.push({
+        day_utc: dayUtc,
+        relative_day_path: relativeDayPath,
+        source_day_path: sourceDayPath,
+        source_manifest_path: sourceManifestPath,
+        manifest_hash: "",
+      });
+      continue;
+    }
+
+    // Existing day: compare source manifest hash with checkpoint hash.
+    const sourceManifest = rcloneCatMaybe(rcloneBin, sourceManifestPath);
+    if (!sourceManifest.found) {
+      skippedIncomplete += 1;
+      continue;
+    }
+
+    const manifest = parseManifestOrThrow(sourceManifest.text, sourceManifestPath);
+    validateManifestDay(manifest, dayUtc, sourceManifestPath);
+    const sourceManifestHash = sha256Hex(sourceManifest.text);
+
+    if (sourceManifestHash === checkpointManifestHash) {
+      skippedUnchanged += 1;
+      continue;
+    }
+
+    candidates.push({
+      day_utc: dayUtc,
+      relative_day_path: relativeDayPath,
+      source_day_path: sourceDayPath,
+      source_manifest_path: sourceManifestPath,
+      manifest_hash: sourceManifestHash,
+    });
   }
-  return candidates;
+
+  const limitedCandidates = maxDaysPerRun > 0
+    ? candidates.slice(0, maxDaysPerRun)
+    : candidates;
+  const skippedByLimit = Math.max(0, candidates.length - limitedCandidates.length);
+
+  return {
+    candidates: limitedCandidates,
+    skipped_existing: skippedUnchanged + skippedByLimit,
+    skipped_incomplete: skippedIncomplete,
+  };
 }
 
 function validateManifestDay(manifest, dayUtc, manifestPath) {
@@ -486,34 +554,45 @@ async function main(args) {
     const domainState = state.domains[domain] || emptyDomainState();
 
     const listedDays = listDayFolders(args.rclone_bin, sourceDomainPath);
-    const candidateDays = selectCandidateDays(listedDays, domainState, args.max_days_per_run);
+    const candidatePlan = buildCandidatePlan({
+      listedDays,
+      domainState,
+      domainPrefix,
+      sourceRoot: args.source_root,
+      rcloneBin: args.rclone_bin,
+      maxDaysPerRun: args.max_days_per_run,
+    });
+    const candidateDays = candidatePlan.candidates;
 
     const domainSummary = {
       prefix: domainPrefix,
       listed_days: listedDays.length,
       candidate_days: candidateDays.length,
       copied_days: 0,
-      skipped_existing: Math.max(0, listedDays.length - candidateDays.length),
-      skipped_incomplete: 0,
+      skipped_existing: candidatePlan.skipped_existing,
+      skipped_incomplete: candidatePlan.skipped_incomplete,
       copied_day_list: [],
     };
 
-    for (const dayUtc of candidateDays) {
-      const relativeDayPath = `${domainPrefix}/day_utc=${dayUtc}`;
-      const sourceDayPath = joinTargetPath(args.source_root, relativeDayPath);
+    for (const candidate of candidateDays) {
+      const dayUtc = candidate.day_utc;
+      const relativeDayPath = candidate.relative_day_path;
+      const sourceDayPath = candidate.source_day_path;
       const destDayPath = joinTargetPath(args.dest_root, relativeDayPath);
-      const sourceManifestPath = joinTargetPath(sourceDayPath, "manifest.json");
+      const sourceManifestPath = candidate.source_manifest_path;
 
-      const sourceManifest = rcloneCatMaybe(args.rclone_bin, sourceManifestPath);
-      if (!sourceManifest.found) {
-        domainSummary.skipped_incomplete += 1;
-        continue;
+      let manifestHash = String(candidate.manifest_hash || "").trim();
+      if (!manifestHash) {
+        const sourceManifest = rcloneCatMaybe(args.rclone_bin, sourceManifestPath);
+        if (!sourceManifest.found) {
+          domainSummary.skipped_incomplete += 1;
+          continue;
+        }
+        const manifest = parseManifestOrThrow(sourceManifest.text, sourceManifestPath);
+        validateManifestDay(manifest, dayUtc, sourceManifestPath);
+        manifestHash = sha256Hex(sourceManifest.text);
       }
 
-      const manifest = parseManifestOrThrow(sourceManifest.text, sourceManifestPath);
-      validateManifestDay(manifest, dayUtc, sourceManifestPath);
-
-      const manifestHash = sha256Hex(sourceManifest.text);
       copyDayFolder(args.rclone_bin, sourceDayPath, destDayPath, args.dry_run);
 
       if (!args.dry_run) {

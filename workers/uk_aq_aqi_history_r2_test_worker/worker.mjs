@@ -1,4 +1,5 @@
 import { parquetReadObjects } from "hyparquet";
+import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_PREFIX = "aqi-r2-test/v1";
 const DEFAULT_CACHE_SECONDS = 300;
@@ -202,7 +203,11 @@ async function readParquetRowsFromR2(env, key, rowLimit) {
   }
 
   const arrayBuffer = await object.arrayBuffer();
-  const rows = await parquetReadObjects({ file: arrayBuffer, rowFormat: "object" });
+  const rows = await parquetReadObjects({
+    file: arrayBuffer,
+    rowFormat: "object",
+    compressors,
+  });
 
   return {
     exists: true,
