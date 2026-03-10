@@ -66,9 +66,12 @@ jobs:
       UK_AQ_BACKFILL_METADATA_SCHEMA: ${{ vars.UK_AQ_BACKFILL_METADATA_SCHEMA || 'uk_aq_core' }}
       UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE: ${{ vars.UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE || '1000' }}
       UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC: ${{ vars.UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC || 'uk_aq_rpc_observs_history_day_rows' }}
+      UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC: ${{ vars.UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC || 'uk_aq_rpc_aqilevels_history_day_rows' }}
+      UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC: ${{ vars.UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC || 'uk_aq_rpc_aqilevels_history_day_connector_counts' }}
       UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE: ${{ vars.UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE || '20000' }}
       UK_AQ_DEPLOY_ENV: ${{ vars.UK_AQ_DEPLOY_ENV || 'dev' }}
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
       UK_AQ_R2_HISTORY_PART_MAX_ROWS: ${{ vars.UK_AQ_R2_HISTORY_PART_MAX_ROWS || '1000000' }}
       UK_AQ_R2_HISTORY_ROW_GROUP_SIZE: ${{ vars.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE || '100000' }}
       R2_BUCKET_PROD: ${{ vars.R2_BUCKET_PROD || '' }}
@@ -283,9 +286,12 @@ jobs:
           add_env UK_AQ_BACKFILL_METADATA_SCHEMA
           add_env UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE
           add_env UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC
+          add_env UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC
+          add_env UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC
           add_env UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE
           add_env UK_AQ_DEPLOY_ENV
           add_env UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
+          add_env UK_AQ_R2_HISTORY_AQILEVELS_PREFIX
           add_env UK_AQ_R2_HISTORY_PART_MAX_ROWS
           add_env UK_AQ_R2_HISTORY_ROW_GROUP_SIZE
           add_env R2_BUCKET_PROD

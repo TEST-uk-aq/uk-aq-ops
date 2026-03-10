@@ -44,15 +44,15 @@ All fields are optional unless noted.
   - writes Obs AQI hourly + rollups via AQI RPCs.
 
 - `obs_aqi_to_r2`
-  - checks requested day window against actual committed day manifests in R2:
+  - checks requested day window against actual committed day manifests in R2 (both domains):
     - `history/v1/observations/day_utc=YYYY-MM-DD/manifest.json`
-  - exports obs rows from `obs_aqidb` into:
-    - connector parquet part files,
-    - connector manifests,
-    - day manifest.
-  - writes use manifest-first contract under `history/v1/observations`.
+    - `history/v1/aqilevels/day_utc=YYYY-MM-DD/manifest.json`
+  - exports from `obs_aqidb` into both domains:
+    - observations rows -> `history/v1/observations/...`
+    - AQI hourly rows -> `history/v1/aqilevels/...`
+  - each domain writes connector parquet part files, connector manifests, and a day manifest.
   - behavior:
-    - `dry_run=true`: returns a planning summary (`backed_up_days`, `pending_backfill_days`).
+    - `dry_run=true`: returns a planning summary (`backed_up_days`, `pending_backfill_days`) where "backed up" means both observations + aqilevels day manifests exist.
     - `dry_run=false`: writes pending day manifests and connector payloads to R2.
     - `force_replace=true`: re-exports selected days/connectors and overwrites manifests.
     - run returns `error` when connector/day failures leave pending days.
@@ -127,10 +127,18 @@ RPC names:
 - `UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC` (default `uk_aq_rpc_station_aqi_hourly_upsert`)
 - `UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC` (default `uk_aq_rpc_station_aqi_rollups_refresh`)
 - `UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC` (default `uk_aq_rpc_observs_history_day_rows`; falls back to direct `uk_aq_observs.observations` table query when missing)
+- `UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC` (default `uk_aq_rpc_aqilevels_history_day_rows`)
+- `UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC` (default `uk_aq_rpc_aqilevels_history_day_connector_counts`)
 
 Fallback note:
 
 - if `UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC` is unavailable, expose `uk_aq_observs` in PostgREST for table fallback.
+- `UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC` and `UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC` are required for AQI-domain export (apply schema RPC migration in `CIC-test-uk-aq-schema`).
+
+R2 history prefixes:
+
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
 
 Ledger:
 
