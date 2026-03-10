@@ -143,6 +143,26 @@ function normalizeOrigin(value: string | null): string | null {
   }
 }
 
+function resolveRequestOrigin(request: Request, url: URL): string | null {
+  const originHeader = normalizeOrigin(request.headers.get("Origin"));
+  if (originHeader) {
+    return originHeader;
+  }
+
+  // Same-origin browser fetches can omit Origin for safe methods.
+  const secFetchSite = (request.headers.get("Sec-Fetch-Site") ?? "").toLowerCase();
+  if (secFetchSite === "same-origin") {
+    return url.origin;
+  }
+
+  const refererOrigin = normalizeOrigin(request.headers.get("Referer"));
+  if (refererOrigin && refererOrigin === url.origin) {
+    return refererOrigin;
+  }
+
+  return null;
+}
+
 function parseAllowedOrigins(value: string): Set<string> {
   const origins = new Set<string>();
   value
@@ -603,7 +623,7 @@ function requiresApiCORS(pathname: string): boolean {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const requestOrigin = normalizeOrigin(request.headers.get("Origin"));
+    const requestOrigin = resolveRequestOrigin(request, url);
 
     const allowedOriginsRaw = await readSecret(env.UK_AQ_CACHE_ALLOWED_ORIGINS);
     const allowedOrigins = parseAllowedOrigins(allowedOriginsRaw);
