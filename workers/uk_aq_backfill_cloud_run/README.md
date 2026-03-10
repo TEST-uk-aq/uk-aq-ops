@@ -47,7 +47,7 @@ All fields are optional unless noted.
   - checks requested day window against committed backup evidence.
   - uses:
     - `uk_aq_public.uk_aq_rpc_r2_history_window` (history min/max),
-    - `uk_aq_ops.prune_day_gates` completion fields (`history_done`, `history_manifest_key`, `history_completed_at`).
+    - `uk_aq_public.uk_aq_rpc_r2_history_backed_up_days(date, date)` for committed day list.
   - behavior:
     - `dry_run=true`: returns a planning summary (`backed_up_days`, `pending_backfill_days`).
     - `dry_run=false` and all days already backed up: returns `ok`.

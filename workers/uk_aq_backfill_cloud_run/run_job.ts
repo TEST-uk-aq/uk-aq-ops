@@ -509,7 +509,7 @@ type R2HistoryWindowRow = {
   max_day_utc: unknown;
 };
 
-type PruneDayGateRow = {
+type R2BackedUpDayRow = {
   day_utc: unknown;
 };
 
@@ -571,35 +571,24 @@ async function fetchR2BackedUpDaySet(dayUtcList: string[]): Promise<Set<string>>
     return backedUp;
   }
 
-  for (const chunk of chunkList(dayUtcList, 180)) {
-    const query = new URLSearchParams();
-    query.set("select", "day_utc");
-    query.set("day_utc", `in.(${chunk.join(",")})`);
-    query.set("history_done", "eq.true");
-    query.set("history_manifest_key", "not.is.null");
-    query.set("history_completed_at", "not.is.null");
-
-    const result = await postgrestTable<PruneDayGateRow[]>(
-      source.base_url,
-      source.privileged_key,
-      {
-        method: "GET",
-        schema: OPS_SCHEMA,
-        table: "prune_day_gates",
-        query,
-      },
-    );
-
-    if (result.error) {
-      throw new Error(`prune_day_gates lookup failed: ${result.error}`);
-    }
-
-    const rows = Array.isArray(result.data) ? result.data : [];
-    for (const row of rows) {
-      const day = parseOptionalDay(row.day_utc);
-      if (day) {
-        backedUp.add(day);
-      }
+  const requestedSet = new Set(dayUtcList);
+  const window = deriveWindowFromDayList(dayUtcList);
+  const response = await postgrestRpc<R2BackedUpDayRow[]>(
+    source,
+    "uk_aq_rpc_r2_history_backed_up_days",
+    {
+      p_from_day_utc: window.from_day_utc,
+      p_to_day_utc: window.to_day_utc,
+    },
+  );
+  if (response.error) {
+    throw new Error(`R2 backed-up day RPC failed: ${response.error.message}`);
+  }
+  const rows = Array.isArray(response.data) ? response.data : [];
+  for (const row of rows) {
+    const day = parseOptionalDay(row.day_utc);
+    if (day && requestedSet.has(day)) {
+      backedUp.add(day);
     }
   }
 
