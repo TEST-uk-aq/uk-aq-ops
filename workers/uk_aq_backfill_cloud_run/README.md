@@ -5,7 +5,7 @@ Cloud Run worker for UK AQ operational backfill workflows.
 Current implementation status (Phase 9, incremental):
 
 - `local_to_aqilevels`: implemented.
-- `obs_aqi_to_r2`: implemented as plan/check mode (dry-run planning + no-op success when days are already backed up).
+- `obs_aqi_to_r2`: implemented (dry-run planning + non-dry R2 export/write path).
 - `source_to_all`: partially implemented (executes local retained days via `local_to_aqilevels`, reports non-local days as pending source acquisition).
 
 ## Endpoints
@@ -44,15 +44,18 @@ All fields are optional unless noted.
   - writes Obs AQI hourly + rollups via AQI RPCs.
 
 - `obs_aqi_to_r2`
-  - checks requested day window against committed backup evidence.
-  - uses:
-    - `uk_aq_public.uk_aq_rpc_r2_history_window` (history min/max),
-    - `uk_aq_public.uk_aq_rpc_r2_history_backed_up_days(date, date)` for committed day list.
+  - checks requested day window against actual committed day manifests in R2:
+    - `history/v1/observations/day_utc=YYYY-MM-DD/manifest.json`
+  - exports obs rows from `obs_aqidb` into:
+    - connector parquet part files,
+    - connector manifests,
+    - day manifest.
+  - writes use manifest-first contract under `history/v1/observations`.
   - behavior:
     - `dry_run=true`: returns a planning summary (`backed_up_days`, `pending_backfill_days`).
-    - `dry_run=false` and all days already backed up: returns `ok`.
-    - `dry_run=false` and pending days exist: throws by default.
-    - if `UK_AQ_BACKFILL_ALLOW_STUB_MODES=true`, pending-day non-dry runs return `stubbed` (no writes executed).
+    - `dry_run=false`: writes pending day manifests and connector payloads to R2.
+    - `force_replace=true`: re-exports selected days/connectors and overwrites manifests.
+    - run returns `error` when connector/day failures leave pending days.
 
 - `source_to_all`
   - computes rolling local retention window.
@@ -76,10 +79,17 @@ For `local_to_aqilevels` and `source_to_all` local-write path:
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
 
-For `obs_aqi_to_r2` planning:
+For `obs_aqi_to_r2` export/write:
 
-- `SUPABASE_URL`
-- `SB_SECRET_KEY`
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
+- `CFLARE_R2_ENDPOINT` (or `R2_ENDPOINT`)
+- `CFLARE_R2_REGION` (or `R2_REGION`, default `auto`)
+- bucket via one of:
+  - `CFLARE_R2_BUCKET` / `R2_BUCKET`
+  - or deploy mapping `R2_BUCKET_PROD|R2_BUCKET_STAGE|R2_BUCKET_DEV` with `UK_AQ_DEPLOY_ENV`
+- `CFLARE_R2_ACCESS_KEY_ID` (or `R2_ACCESS_KEY_ID`)
+- `CFLARE_R2_SECRET_ACCESS_KEY` (or `R2_SECRET_ACCESS_KEY`)
 
 ## Optional Environment
 
@@ -108,6 +118,7 @@ Source RPC paging:
 
 - `UK_AQ_BACKFILL_SOURCE_RPC_PAGE_SIZE` (default `1000`)
 - `UK_AQ_BACKFILL_SOURCE_RPC_MAX_PAGES` (default `200`)
+- `UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE` (default `20000`)
 
 RPC names:
 
@@ -115,6 +126,11 @@ RPC names:
 - `UK_AQ_BACKFILL_SOURCE_RPC` (default `uk_aq_rpc_station_aqi_hourly_source`)
 - `UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC` (default `uk_aq_rpc_station_aqi_hourly_upsert`)
 - `UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC` (default `uk_aq_rpc_station_aqi_rollups_refresh`)
+- `UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC` (default `uk_aq_rpc_observs_history_day_rows`; falls back to direct `uk_aq_observs.observations` table query when missing)
+
+Fallback note:
+
+- if `UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC` is unavailable, expose `uk_aq_observs` in PostgREST for table fallback.
 
 Ledger:
 

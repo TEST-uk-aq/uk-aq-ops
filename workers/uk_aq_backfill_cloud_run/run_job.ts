@@ -17,6 +17,22 @@ import {
   utcDayEndIso,
   utcDayStartIso,
 } from "./backfill_core.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { Buffer } from "node:buffer";
+import { fileURLToPath } from "node:url";
+import * as arrow from "apache-arrow";
+import * as parquetWasm from "parquet-wasm/esm";
+import {
+  hasRequiredR2Config,
+  normalizePrefix,
+  r2DeleteObjects,
+  r2GetObject,
+  r2HeadObject,
+  r2ListAllObjects,
+  r2PutObject,
+  sha256Hex,
+} from "../shared/r2_sigv4.mjs";
 
 type RunMode = "local_to_aqilevels" | "obs_aqi_to_r2" | "source_to_all";
 type TriggerMode = "scheduler" | "manual";
@@ -68,6 +84,51 @@ type HelperRow = {
   pm10_hourly_sample_count: number | null;
 };
 
+type ObsHistoryRow = {
+  timeseries_id: number;
+  observed_at: string;
+  value: number | null;
+};
+
+type ObsHistoryParquetRow = {
+  connector_id: number;
+  timeseries_id: number;
+  observed_at: string;
+  value: number | null;
+};
+
+type ObsHistoryFileEntry = {
+  key: string;
+  row_count: number;
+  bytes: number;
+  etag_or_hash: string | null;
+};
+
+type ObsConnectorManifest = {
+  day_utc: string;
+  connector_id: number;
+  run_id: string;
+  manifest_key: string;
+  source_row_count: number;
+  min_observed_at: string | null;
+  max_observed_at: string | null;
+  parquet_object_keys: string[];
+  file_count: number;
+  total_bytes: number;
+  files: ObsHistoryFileEntry[];
+};
+
+type ObsAqiToR2DayConnectorResult = {
+  day_utc: string;
+  connector_id: number;
+  status: "complete" | "skipped" | "error" | "dry_run";
+  skip_reason: string | null;
+  rows_read: number;
+  objects_written_r2: number;
+  manifest_key: string | null;
+  error: string | null;
+};
+
 type HourlyUpsertMetrics = {
   rows_changed: number;
   station_hours_changed: number;
@@ -114,11 +175,21 @@ type ObsAqiToR2Summary = {
   mode: "obs_aqi_to_r2";
   run_id: string;
   dry_run: boolean;
+  force_replace: boolean;
   from_day_utc: string;
   to_day_utc: string;
   days_planned: number;
+  days_processed: number;
+  connector_day_complete: number;
+  connector_day_skipped: number;
+  connector_day_error: number;
+  rows_read: number;
+  objects_written_r2: number;
   backed_up_days: string[];
   pending_backfill_days: string[];
+  exported_days: string[];
+  failed_days: string[];
+  day_connector_results: ObsAqiToR2DayConnectorResult[];
   min_day_utc: string | null;
   max_day_utc: string | null;
   message: string;
@@ -186,6 +257,34 @@ const HOURLY_UPSERT_RPC = (Deno.env.get("UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_
   "uk_aq_rpc_station_aqi_hourly_upsert").trim();
 const ROLLUP_REFRESH_RPC = (Deno.env.get("UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC") ||
   "uk_aq_rpc_station_aqi_rollups_refresh").trim();
+const OBS_R2_SOURCE_RPC = (Deno.env.get("UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC") ||
+  "uk_aq_rpc_observs_history_day_rows").trim();
+
+const HISTORY_OBSERVATIONS_SCHEMA_NAME = "observations";
+const HISTORY_OBSERVATIONS_SCHEMA_VERSION = 2;
+const HISTORY_OBSERVATIONS_WRITER_VERSION = "parquet-wasm-zstd-v2";
+const HISTORY_OBSERVATIONS_COLUMNS = Object.freeze([
+  "connector_id",
+  "timeseries_id",
+  "observed_at",
+  "value",
+]);
+
+const OBS_R2_DEPLOY_ENV = (Deno.env.get("UK_AQ_DEPLOY_ENV") || Deno.env.get("DEPLOY_ENV") || "dev")
+  .trim()
+  .toLowerCase();
+const OBS_R2_HISTORY_PREFIX = normalizePrefix(
+  Deno.env.get("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX") || "history/v1/observations",
+) || "history/v1/observations";
+const OBS_R2_WRITER_GIT_SHA = (Deno.env.get("GITHUB_SHA") || "").trim() || null;
+const OBS_R2_CONFIG = {
+  endpoint: (Deno.env.get("CFLARE_R2_ENDPOINT") || Deno.env.get("R2_ENDPOINT") || "").trim(),
+  bucket: resolveR2BucketByDeployEnv(),
+  region: (Deno.env.get("CFLARE_R2_REGION") || Deno.env.get("R2_REGION") || "auto").trim() || "auto",
+  access_key_id: (Deno.env.get("CFLARE_R2_ACCESS_KEY_ID") || Deno.env.get("R2_ACCESS_KEY_ID") || "").trim(),
+  secret_access_key: (Deno.env.get("CFLARE_R2_SECRET_ACCESS_KEY") || Deno.env.get("R2_SECRET_ACCESS_KEY") || "")
+    .trim(),
+};
 
 const RUN_MODE = parseRunMode(
   Deno.env.get("UK_AQ_BACKFILL_RUN_MODE"),
@@ -228,11 +327,29 @@ const SOURCE_RPC_MAX_PAGES = parsePositiveInt(
   1,
   2000,
 );
+const OBS_R2_SOURCE_PAGE_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE"),
+  20000,
+  1000,
+  100000,
+);
 const HOURLY_UPSERT_CHUNK_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE"),
   2000,
   100,
   10000,
+);
+const OBS_R2_PART_MAX_ROWS = parsePositiveInt(
+  Deno.env.get("UK_AQ_R2_HISTORY_PART_MAX_ROWS"),
+  1000000,
+  1000,
+  5000000,
+);
+const OBS_R2_ROW_GROUP_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_R2_HISTORY_ROW_GROUP_SIZE"),
+  100000,
+  10000,
+  2000000,
 );
 const INGEST_RETENTION_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_BACKFILL_INGEST_RETENTION_DAYS"),
@@ -309,6 +426,21 @@ function optionalEnvAny(names: string[]): string | null {
     }
   }
   return null;
+}
+
+function resolveR2BucketByDeployEnv(): string {
+  const explicit = optionalEnvAny(["CFLARE_R2_BUCKET", "R2_BUCKET"]);
+  if (explicit) {
+    return explicit;
+  }
+
+  if (OBS_R2_DEPLOY_ENV === "prod" || OBS_R2_DEPLOY_ENV === "production") {
+    return optionalEnv("R2_BUCKET_PROD") || "";
+  }
+  if (OBS_R2_DEPLOY_ENV === "stage" || OBS_R2_DEPLOY_ENV === "staging") {
+    return optionalEnv("R2_BUCKET_STAGE") || "";
+  }
+  return optionalEnv("R2_BUCKET_DEV") || "";
 }
 
 function normalizeRestUrl(baseUrl: string): string {
@@ -504,14 +636,14 @@ async function postgrestTable<T>(
   }
 }
 
-type R2HistoryWindowRow = {
-  min_day_utc: unknown;
-  max_day_utc: unknown;
+type ObsHistorySourceCursor = {
+  after_timeseries_id: number | null;
+  after_observed_at: string | null;
 };
 
-type R2BackedUpDayRow = {
-  day_utc: unknown;
-};
+let obsR2SourceRpcAvailable: boolean | null = null;
+let parquetWasmInitialized = false;
+const PARQUET_WRITER_PROPERTIES_CACHE = new Map<number, unknown>();
 
 function chunkList<T>(values: T[], chunkSize: number): T[][] {
   if (values.length === 0) {
@@ -540,59 +672,644 @@ function parseOptionalDay(value: unknown): string | null {
   return parseIsoDayUtc(isoPrefix);
 }
 
-async function fetchR2HistoryWindowSummary(): Promise<{
-  min_day_utc: string | null;
-  max_day_utc: string | null;
-}> {
-  const source = SOURCE_DB_BY_KIND.ingestdb;
-  if (!source) {
-    return { min_day_utc: null, max_day_utc: null };
-  }
-  const response = await postgrestRpc<R2HistoryWindowRow[]>(
-    source,
-    "uk_aq_rpc_r2_history_window",
-    {},
-  );
-  if (response.error) {
-    throw new Error(`R2 history window RPC failed: ${response.error.message}`);
-  }
-  const rows = Array.isArray(response.data) ? response.data : [];
-  const first = rows.length > 0 ? rows[0] : null;
+function buildObsDayManifestKey(dayUtc: string): string {
+  return `${OBS_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/manifest.json`;
+}
+
+function buildObsConnectorPrefix(dayUtc: string, connectorId: number): string {
+  return `${OBS_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/connector_id=${connectorId}`;
+}
+
+function buildObsConnectorManifestKey(dayUtc: string, connectorId: number): string {
+  return `${buildObsConnectorPrefix(dayUtc, connectorId)}/manifest.json`;
+}
+
+function buildObsPartKey(dayUtc: string, connectorId: number, partIndex: number): string {
+  return `${buildObsConnectorPrefix(dayUtc, connectorId)}/part-${String(partIndex).padStart(5, "0")}.parquet`;
+}
+
+function dayBoundsFromIsoDay(dayUtc: string): { start_iso: string; end_iso: string } {
   return {
-    min_day_utc: parseOptionalDay(first?.min_day_utc),
-    max_day_utc: parseOptionalDay(first?.max_day_utc),
+    start_iso: utcDayStartIso(dayUtc),
+    end_iso: utcDayStartIso(shiftIsoDay(dayUtc, 1)),
   };
 }
 
 async function fetchR2BackedUpDaySet(dayUtcList: string[]): Promise<Set<string>> {
-  const source = SOURCE_DB_BY_KIND.ingestdb;
   const backedUp = new Set<string>();
-  if (!source || dayUtcList.length === 0) {
+  if (!dayUtcList.length) {
     return backedUp;
   }
+  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+    throw new Error("obs_aqi_to_r2 requires CFLARE_R2_* / R2_* environment variables.");
+  }
 
-  const requestedSet = new Set(dayUtcList);
-  const window = deriveWindowFromDayList(dayUtcList);
-  const response = await postgrestRpc<R2BackedUpDayRow[]>(
+  for (const dayUtc of dayUtcList) {
+    const key = buildObsDayManifestKey(dayUtc);
+    const head = await r2HeadObject({
+      r2: OBS_R2_CONFIG,
+      key,
+    });
+    if (head.exists) {
+      backedUp.add(dayUtc);
+    }
+  }
+  return backedUp;
+}
+
+function normalizeObsHistoryRows(payload: unknown): ObsHistoryRow[] {
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  const rows: ObsHistoryRow[] = [];
+  for (const item of payload) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const timeseriesId = Number(record.timeseries_id);
+    const observedAtRaw = typeof record.observed_at === "string"
+      ? record.observed_at
+      : String(record.observed_at || "");
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) {
+      continue;
+    }
+    const observedAtMs = Date.parse(observedAtRaw);
+    if (!Number.isFinite(observedAtMs)) {
+      continue;
+    }
+    rows.push({
+      timeseries_id: Math.trunc(timeseriesId),
+      observed_at: new Date(observedAtMs).toISOString(),
+      value: toSafeNumber(record.value),
+    });
+  }
+
+  rows.sort((left, right) => {
+    if (left.timeseries_id !== right.timeseries_id) {
+      return left.timeseries_id - right.timeseries_id;
+    }
+    if (left.observed_at < right.observed_at) return -1;
+    if (left.observed_at > right.observed_at) return 1;
+    return 0;
+  });
+
+  return rows;
+}
+
+function isRpcMissingError(message: string, status: number): boolean {
+  if (status === 404) {
+    return true;
+  }
+  const text = message.toLowerCase();
+  return (
+    text.includes("could not find the function") ||
+    text.includes("function") && text.includes("does not exist") ||
+    text.includes("schema cache")
+  );
+}
+
+async function fetchObsHistoryRowsPageViaRpc(
+  source: SourceDbConfig,
+  args: {
+    day_utc: string;
+    connector_id: number;
+    cursor: ObsHistorySourceCursor;
+    limit: number;
+  },
+): Promise<{ rows: ObsHistoryRow[]; missing_rpc: boolean }> {
+  const response = await postgrestRpc<unknown[]>(
     source,
-    "uk_aq_rpc_r2_history_backed_up_days",
+    OBS_R2_SOURCE_RPC,
     {
-      p_from_day_utc: window.from_day_utc,
-      p_to_day_utc: window.to_day_utc,
+      p_day_utc: args.day_utc,
+      p_connector_id: args.connector_id,
+      p_after_timeseries_id: args.cursor.after_timeseries_id,
+      p_after_observed_at: args.cursor.after_observed_at,
+      p_limit: args.limit,
     },
   );
   if (response.error) {
-    throw new Error(`R2 backed-up day RPC failed: ${response.error.message}`);
+    if (isRpcMissingError(response.error.message, response.status)) {
+      return { rows: [], missing_rpc: true };
+    }
+    throw new Error(
+      `obs_aqi_to_r2 source RPC failed for day=${args.day_utc} connector=${args.connector_id}: ${response.error.message}`,
+    );
   }
-  const rows = Array.isArray(response.data) ? response.data : [];
-  for (const row of rows) {
-    const day = parseOptionalDay(row.day_utc);
-    if (day && requestedSet.has(day)) {
-      backedUp.add(day);
+  return {
+    rows: normalizeObsHistoryRows(response.data),
+    missing_rpc: false,
+  };
+}
+
+async function fetchObsHistoryRowsPageViaTable(
+  source: SourceDbConfig,
+  args: {
+    day_utc: string;
+    connector_id: number;
+    cursor: ObsHistorySourceCursor;
+    limit: number;
+  },
+): Promise<ObsHistoryRow[]> {
+  const bounds = dayBoundsFromIsoDay(args.day_utc);
+  const query = new URLSearchParams();
+  query.set("select", "timeseries_id,observed_at,value");
+  query.set("connector_id", `eq.${args.connector_id}`);
+  query.append("observed_at", `gte.${bounds.start_iso}`);
+  query.append("observed_at", `lt.${bounds.end_iso}`);
+  if (args.cursor.after_timeseries_id !== null && args.cursor.after_observed_at) {
+    query.set(
+      "or",
+      `(` +
+        `timeseries_id.gt.${args.cursor.after_timeseries_id},` +
+        `and(timeseries_id.eq.${args.cursor.after_timeseries_id},observed_at.gt.${args.cursor.after_observed_at})` +
+      `)`,
+    );
+  }
+  query.set("order", "timeseries_id.asc,observed_at.asc");
+  query.set("limit", String(args.limit));
+
+  const result = await postgrestTable<unknown[]>(
+    source.base_url,
+    source.privileged_key,
+    {
+      method: "GET",
+      schema: "uk_aq_observs",
+      table: "observations",
+      query,
+    },
+  );
+
+  if (result.error) {
+    throw new Error(
+      `obs_aqi_to_r2 table fallback failed for day=${args.day_utc} connector=${args.connector_id}: ${result.error}`,
+    );
+  }
+
+  return normalizeObsHistoryRows(result.data);
+}
+
+async function fetchObsHistoryRowsPage(
+  dayUtc: string,
+  connectorId: number,
+  cursor: ObsHistorySourceCursor,
+  limit: number,
+): Promise<ObsHistoryRow[]> {
+  const source = SOURCE_DB_BY_KIND.obs_aqidb;
+  if (!source) {
+    throw new Error("obs_aqi_to_r2 requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
+  }
+
+  if (obsR2SourceRpcAvailable !== false) {
+    const shouldLogFallback = obsR2SourceRpcAvailable === null;
+    const rpcResult = await fetchObsHistoryRowsPageViaRpc(source, {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      cursor,
+      limit,
+    });
+    if (!rpcResult.missing_rpc) {
+      obsR2SourceRpcAvailable = true;
+      return rpcResult.rows;
+    }
+    if (shouldLogFallback) {
+      logStructured("warning", "obs_aqi_to_r2_source_rpc_missing_fallback_table", {
+        rpc_name: OBS_R2_SOURCE_RPC,
+      });
+    }
+    obsR2SourceRpcAvailable = false;
+  }
+
+  return await fetchObsHistoryRowsPageViaTable(source, {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    cursor,
+    limit,
+  });
+}
+
+function averageNumber(total: number, count: number): number | null {
+  if (!count) {
+    return null;
+  }
+  return total / count;
+}
+
+function statsFromFileEntries(fileEntries: ObsHistoryFileEntry[], totalRows: number) {
+  if (!fileEntries.length) {
+    return {
+      bytes_per_row_estimate: totalRows > 0 ? null : 0,
+      avg_file_bytes: 0,
+      min_file_bytes: 0,
+      max_file_bytes: 0,
+    };
+  }
+
+  const bytes = fileEntries.map((entry) => Number(entry.bytes || 0));
+  const totalBytes = bytes.reduce((sum, value) => sum + value, 0);
+  let minBytes = bytes[0];
+  let maxBytes = bytes[0];
+  for (let i = 1; i < bytes.length; i += 1) {
+    const value = bytes[i];
+    if (value < minBytes) minBytes = value;
+    if (value > maxBytes) maxBytes = value;
+  }
+
+  return {
+    bytes_per_row_estimate: totalRows > 0 ? totalBytes / totalRows : null,
+    avg_file_bytes: averageNumber(totalBytes, bytes.length),
+    min_file_bytes: minBytes,
+    max_file_bytes: maxBytes,
+  };
+}
+
+function withManifestHash<T extends Record<string, unknown>>(payloadWithoutHash: T): T & { manifest_hash: string } {
+  return {
+    ...payloadWithoutHash,
+    manifest_hash: sha256Hex(JSON.stringify(payloadWithoutHash)),
+  };
+}
+
+function createObsConnectorManifest(args: {
+  dayUtc: string;
+  connectorId: number;
+  runId: string;
+  manifestKey: string;
+  sourceRowCount: number;
+  minObservedAt: string | null;
+  maxObservedAt: string | null;
+  fileEntries: ObsHistoryFileEntry[];
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+}): ObsConnectorManifest & { [key: string]: unknown } {
+  const parquetObjectKeys = args.fileEntries.map((entry) => entry.key);
+  const totalBytes = args.fileEntries.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const stats = statsFromFileEntries(args.fileEntries, args.sourceRowCount);
+
+  return withManifestHash({
+    day_utc: args.dayUtc,
+    connector_id: args.connectorId,
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: args.sourceRowCount,
+    min_observed_at: args.minObservedAt,
+    max_observed_at: args.maxObservedAt,
+    parquet_object_keys: parquetObjectKeys,
+    file_count: args.fileEntries.length,
+    total_bytes: totalBytes,
+    files: args.fileEntries,
+    history_schema_name: HISTORY_OBSERVATIONS_SCHEMA_NAME,
+    history_schema_version: HISTORY_OBSERVATIONS_SCHEMA_VERSION,
+    columns: HISTORY_OBSERVATIONS_COLUMNS,
+    writer_version: HISTORY_OBSERVATIONS_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...stats,
+    backed_up_at_utc: args.backedUpAtUtc,
+  });
+}
+
+function createObsDayManifest(args: {
+  dayUtc: string;
+  runId: string;
+  connectorManifests: Array<ObsConnectorManifest & Record<string, unknown>>;
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+}) {
+  const files = args.connectorManifests.flatMap((manifest) =>
+    (Array.isArray(manifest.files) ? manifest.files : []).map((entry) => ({
+      connector_id: manifest.connector_id,
+      key: entry.key,
+      bytes: entry.bytes,
+      row_count: entry.row_count,
+      etag_or_hash: entry.etag_or_hash,
+    }))
+  );
+  const parquetObjectKeys = Array.from(new Set(files.map((entry) => entry.key))).sort((a, b) =>
+    a.localeCompare(b)
+  );
+  const totalRows = args.connectorManifests.reduce(
+    (sum, manifest) => sum + toSafeInt(manifest.source_row_count),
+    0,
+  );
+  const totalBytes = files.reduce((sum, file) => sum + toSafeInt(file.bytes), 0);
+  const connectorIds = args.connectorManifests
+    .map((manifest) => Number(manifest.connector_id))
+    .filter((value) => Number.isInteger(value))
+    .sort((a, b) => a - b);
+
+  let minObservedAt: string | null = null;
+  let maxObservedAt: string | null = null;
+  for (const manifest of args.connectorManifests) {
+    const minValue = typeof manifest.min_observed_at === "string"
+      ? manifest.min_observed_at
+      : null;
+    const maxValue = typeof manifest.max_observed_at === "string"
+      ? manifest.max_observed_at
+      : null;
+    if (minValue && (!minObservedAt || minValue < minObservedAt)) {
+      minObservedAt = minValue;
+    }
+    if (maxValue && (!maxObservedAt || maxValue > maxObservedAt)) {
+      maxObservedAt = maxValue;
     }
   }
 
-  return backedUp;
+  const stats = statsFromFileEntries(
+    files.map((entry) => ({
+      key: entry.key,
+      row_count: toSafeInt(entry.row_count),
+      bytes: toSafeInt(entry.bytes),
+      etag_or_hash: typeof entry.etag_or_hash === "string" ? entry.etag_or_hash : null,
+    })),
+    totalRows,
+  );
+
+  return withManifestHash({
+    day_utc: args.dayUtc,
+    connector_id: null,
+    connector_ids: connectorIds,
+    run_id: args.runId,
+    source_row_count: totalRows,
+    min_observed_at: minObservedAt,
+    max_observed_at: maxObservedAt,
+    parquet_object_keys: parquetObjectKeys,
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    connector_manifests: args.connectorManifests.map((manifest) => ({
+      connector_id: manifest.connector_id,
+      manifest_key: manifest.manifest_key,
+      source_row_count: manifest.source_row_count,
+      file_count: manifest.file_count,
+      total_bytes: manifest.total_bytes,
+    })),
+    history_schema_name: HISTORY_OBSERVATIONS_SCHEMA_NAME,
+    history_schema_version: HISTORY_OBSERVATIONS_SCHEMA_VERSION,
+    columns: HISTORY_OBSERVATIONS_COLUMNS,
+    writer_version: HISTORY_OBSERVATIONS_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...stats,
+    backed_up_at_utc: args.backedUpAtUtc,
+  });
+}
+
+function ensureParquetWasmInitialized(): void {
+  if (parquetWasmInitialized) {
+    return;
+  }
+
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const wasmPath = path.resolve(moduleDir, "../../node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm");
+  const wasmBytes = fs.readFileSync(wasmPath);
+  (parquetWasm as unknown as { initSync: (args: { module: Uint8Array }) => void }).initSync({
+    module: wasmBytes,
+  });
+  parquetWasmInitialized = true;
+}
+
+function parquetWriterProperties(rowGroupSize: number): unknown {
+  const key = Number(rowGroupSize);
+  if (PARQUET_WRITER_PROPERTIES_CACHE.has(key)) {
+    return PARQUET_WRITER_PROPERTIES_CACHE.get(key) || null;
+  }
+  ensureParquetWasmInitialized();
+  const parquetAny = parquetWasm as any;
+  const writerProperties = new parquetAny.WriterPropertiesBuilder()
+    .setCompression(parquetAny.Compression.ZSTD)
+    .setMaxRowGroupSize(key)
+    .setCreatedBy(HISTORY_OBSERVATIONS_WRITER_VERSION)
+    .build();
+  PARQUET_WRITER_PROPERTIES_CACHE.set(key, writerProperties);
+  return writerProperties;
+}
+
+function rowsToParquetBuffer(rows: ObsHistoryParquetRow[]): Uint8Array {
+  ensureParquetWasmInitialized();
+  const table = (arrow as unknown as {
+    tableFromArrays: (data: Record<string, unknown>) => unknown;
+    tableToIPC: (table: unknown, mode: "stream") => Uint8Array;
+  }).tableFromArrays({
+    connector_id: Int32Array.from(rows.map((row) => row.connector_id)),
+    timeseries_id: Int32Array.from(rows.map((row) => row.timeseries_id)),
+    observed_at: rows.map((row) => new Date(row.observed_at)),
+    value: rows.map((row) => (row.value === null || row.value === undefined ? null : Number(row.value))),
+  });
+  const wasmTable = (parquetWasm as unknown as {
+    Table: { fromIPCStream: (bytes: Uint8Array) => unknown };
+  }).Table.fromIPCStream(
+    (arrow as unknown as { tableToIPC: (table: unknown, mode: "stream") => Uint8Array }).tableToIPC(
+      table,
+      "stream",
+    ),
+  );
+  return (parquetWasm as unknown as {
+    writeParquet: (table: unknown, writerProperties: unknown) => Uint8Array;
+  }).writeParquet(wasmTable, parquetWriterProperties(OBS_R2_ROW_GROUP_SIZE));
+}
+
+async function deleteR2Prefix(prefix: string): Promise<void> {
+  const entries = await r2ListAllObjects({
+    r2: OBS_R2_CONFIG,
+    prefix: `${prefix}/`,
+    max_keys: 1000,
+  });
+  const keys = entries.map((entry) => String(entry.key || "").trim()).filter(Boolean);
+  if (!keys.length) {
+    return;
+  }
+  for (const batch of chunkList(keys, 1000)) {
+    const result = await r2DeleteObjects({ r2: OBS_R2_CONFIG, keys: batch });
+    if (result.errors.length > 0) {
+      throw new Error(`R2 delete prefix failed (${prefix}): ${JSON.stringify(result.errors.slice(0, 10))}`);
+    }
+  }
+}
+
+async function loadExistingConnectorManifest(dayUtc: string, connectorId: number): Promise<ObsConnectorManifest | null> {
+  const key = buildObsConnectorManifestKey(dayUtc, connectorId);
+  const head = await r2HeadObject({ r2: OBS_R2_CONFIG, key });
+  if (!head.exists) {
+    return null;
+  }
+  const object = await r2GetObject({ r2: OBS_R2_CONFIG, key });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(object.body.toString("utf8"));
+  } catch {
+    throw new Error(`Invalid existing connector manifest JSON: ${key}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Existing connector manifest is not an object: ${key}`);
+  }
+  const record = parsed as Record<string, unknown>;
+  const filesRaw = Array.isArray(record.files) ? record.files : [];
+  const files: ObsHistoryFileEntry[] = filesRaw
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return null;
+      }
+      const item = entry as Record<string, unknown>;
+      const fileKey = String(item.key || "").trim();
+      if (!fileKey) {
+        return null;
+      }
+      return {
+        key: fileKey,
+        row_count: toSafeInt(item.row_count),
+        bytes: toSafeInt(item.bytes),
+        etag_or_hash: item.etag_or_hash === null || item.etag_or_hash === undefined
+          ? null
+          : String(item.etag_or_hash),
+      };
+    })
+    .filter((value): value is ObsHistoryFileEntry => value !== null);
+
+  return {
+    day_utc: parseOptionalDay(record.day_utc) || dayUtc,
+    connector_id: Number(record.connector_id) || connectorId,
+    run_id: String(record.run_id || ""),
+    manifest_key: String(record.manifest_key || key).trim() || key,
+    source_row_count: toSafeInt(record.source_row_count),
+    min_observed_at: typeof record.min_observed_at === "string" ? record.min_observed_at : null,
+    max_observed_at: typeof record.max_observed_at === "string" ? record.max_observed_at : null,
+    parquet_object_keys: Array.isArray(record.parquet_object_keys)
+      ? record.parquet_object_keys.map((value) => String(value || "").trim()).filter(Boolean)
+      : files.map((file) => file.key),
+    file_count: toSafeInt(record.file_count) || files.length,
+    total_bytes: toSafeInt(record.total_bytes) || files.reduce((sum, file) => sum + file.bytes, 0),
+    files,
+  };
+}
+
+async function exportObsConnectorDayToR2(args: {
+  run_id: string;
+  day_utc: string;
+  connector_id: number;
+}): Promise<{
+  rows_read: number;
+  objects_written_r2: number;
+  manifest_key: string;
+  connector_manifest: ObsConnectorManifest & Record<string, unknown>;
+}> {
+  if (FORCE_REPLACE) {
+    await deleteR2Prefix(buildObsConnectorPrefix(args.day_utc, args.connector_id));
+  }
+
+  const parquetRowsBuffer: ObsHistoryParquetRow[] = [];
+  const fileEntries: ObsHistoryFileEntry[] = [];
+  let rowsRead = 0;
+  let partIndex = 0;
+  let minObservedAt: string | null = null;
+  let maxObservedAt: string | null = null;
+  let cursor: ObsHistorySourceCursor = {
+    after_timeseries_id: null,
+    after_observed_at: null,
+  };
+
+  const flushPart = async (): Promise<void> => {
+    if (!parquetRowsBuffer.length) {
+      return;
+    }
+    const partRows = parquetRowsBuffer.splice(0, parquetRowsBuffer.length);
+    const partKey = buildObsPartKey(args.day_utc, args.connector_id, partIndex);
+    const parquetBuffer = rowsToParquetBuffer(partRows);
+    const putResult = await r2PutObject({
+      r2: OBS_R2_CONFIG,
+      key: partKey,
+      body: parquetBuffer,
+      content_type: "application/octet-stream",
+    });
+    const head = await r2HeadObject({ r2: OBS_R2_CONFIG, key: partKey });
+    if (!head.exists) {
+      throw new Error(`Missing parquet part after upload: ${partKey}`);
+    }
+    fileEntries.push({
+      key: partKey,
+      row_count: partRows.length,
+      bytes: typeof head.bytes === "number" && Number.isFinite(head.bytes)
+        ? Math.trunc(head.bytes)
+        : Math.trunc(putResult.bytes),
+      etag_or_hash: head.etag || putResult.etag || null,
+    });
+    partIndex += 1;
+  };
+
+  while (true) {
+    const pageRows = await fetchObsHistoryRowsPage(
+      args.day_utc,
+      args.connector_id,
+      cursor,
+      OBS_R2_SOURCE_PAGE_SIZE,
+    );
+    if (!pageRows.length) {
+      break;
+    }
+
+    for (const row of pageRows) {
+      rowsRead += 1;
+      if (!minObservedAt || row.observed_at < minObservedAt) {
+        minObservedAt = row.observed_at;
+      }
+      if (!maxObservedAt || row.observed_at > maxObservedAt) {
+        maxObservedAt = row.observed_at;
+      }
+      parquetRowsBuffer.push({
+        connector_id: args.connector_id,
+        timeseries_id: row.timeseries_id,
+        observed_at: row.observed_at,
+        value: row.value,
+      });
+      if (parquetRowsBuffer.length >= OBS_R2_PART_MAX_ROWS) {
+        await flushPart();
+      }
+    }
+
+    const last = pageRows[pageRows.length - 1];
+    cursor = {
+      after_timeseries_id: last.timeseries_id,
+      after_observed_at: last.observed_at,
+    };
+
+    if (pageRows.length < OBS_R2_SOURCE_PAGE_SIZE) {
+      break;
+    }
+  }
+
+  await flushPart();
+
+  const manifestKey = buildObsConnectorManifestKey(args.day_utc, args.connector_id);
+  const connectorManifest = createObsConnectorManifest({
+    dayUtc: args.day_utc,
+    connectorId: args.connector_id,
+    runId: args.run_id,
+    manifestKey,
+    sourceRowCount: rowsRead,
+    minObservedAt,
+    maxObservedAt,
+    fileEntries,
+    writerGitSha: OBS_R2_WRITER_GIT_SHA,
+    backedUpAtUtc: nowIso(),
+  });
+
+  await r2PutObject({
+    r2: OBS_R2_CONFIG,
+    key: manifestKey,
+    body: Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"),
+    content_type: "application/json",
+  });
+  const manifestHead = await r2HeadObject({ r2: OBS_R2_CONFIG, key: manifestKey });
+  if (!manifestHead.exists) {
+    throw new Error(`Missing connector manifest after upload: ${manifestKey}`);
+  }
+
+  return {
+    rows_read: rowsRead,
+    objects_written_r2: fileEntries.length + 1,
+    manifest_key: manifestKey,
+    connector_manifest: connectorManifest,
+  };
 }
 
 function toSafeInt(value: unknown): number {
@@ -1837,47 +2554,345 @@ function deriveWindowFromDayList(dayUtcList: string[]): { from_day_utc: string; 
 async function runObservsToR2(
   runId: string,
   window: { from_day_utc: string; to_day_utc: string },
-): Promise<ObsAqiToR2Summary | StubModeSummary> {
+  ledgerEnabled: boolean,
+): Promise<ObsAqiToR2Summary> {
+  if (!(OBS_AQIDB_SUPABASE_URL && OBS_AQI_PRIVILEGED_KEY)) {
+    throw new Error("obs_aqi_to_r2 requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY");
+  }
+  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+    throw new Error("obs_aqi_to_r2 requires CFLARE_R2_* or R2_* credentials.");
+  }
+
   const requestedDays = buildBackwardDayRange(window.from_day_utc, window.to_day_utc);
-  const historyWindow = await fetchR2HistoryWindowSummary();
-  const backedUpDaySet = await fetchR2BackedUpDaySet(requestedDays);
-  const backedUpDays = requestedDays.filter((dayUtc) => backedUpDaySet.has(dayUtc));
-  const pendingDays = requestedDays.filter((dayUtc) => !backedUpDaySet.has(dayUtc));
+  const initialBackedUpDaySet = await fetchR2BackedUpDaySet(requestedDays);
+  const initialBackedUpDays = requestedDays.filter((dayUtc) => initialBackedUpDaySet.has(dayUtc));
+  const executionDays = FORCE_REPLACE
+    ? [...requestedDays]
+    : requestedDays.filter((dayUtc) => !initialBackedUpDaySet.has(dayUtc));
 
-  if (!DRY_RUN && pendingDays.length > 0 && !ALLOW_STUB_MODES) {
-    throw new Error(
-      `obs_aqi_to_r2 has ${pendingDays.length} pending day(s) and write-path implementation is pending; rerun with dry_run=true for plan output.`,
-    );
-  }
-
-  if (!DRY_RUN && pendingDays.length > 0 && ALLOW_STUB_MODES) {
-    return {
-      mode: "obs_aqi_to_r2",
-      run_id: runId,
-      stubbed: true,
-      message:
-        "Stub mode allowed by UK_AQ_BACKFILL_ALLOW_STUB_MODES=true. Pending days were planned but no R2 writes were executed.",
-      from_day_utc: window.from_day_utc,
-      to_day_utc: window.to_day_utc,
-      days_planned: requestedDays.length,
-    };
-  }
-
-  return {
+  const initialBackedUpSorted = [...initialBackedUpDays].sort(compareIsoDay);
+  const summary: ObsAqiToR2Summary = {
     mode: "obs_aqi_to_r2",
     run_id: runId,
     dry_run: DRY_RUN,
+    force_replace: FORCE_REPLACE,
     from_day_utc: window.from_day_utc,
     to_day_utc: window.to_day_utc,
     days_planned: requestedDays.length,
-    backed_up_days: backedUpDays,
-    pending_backfill_days: pendingDays,
-    min_day_utc: historyWindow.min_day_utc,
-    max_day_utc: historyWindow.max_day_utc,
-    message: pendingDays.length > 0
-      ? "Planned pending days for R2 backfill; mode currently supports dry-run planning only."
-      : "All requested days already appear backed up via prune day-gates.",
+    days_processed: 0,
+    connector_day_complete: 0,
+    connector_day_skipped: 0,
+    connector_day_error: 0,
+    rows_read: 0,
+    objects_written_r2: 0,
+    backed_up_days: initialBackedUpDays,
+    pending_backfill_days: executionDays,
+    exported_days: [],
+    failed_days: [],
+    day_connector_results: [],
+    min_day_utc: initialBackedUpSorted.length ? initialBackedUpSorted[0] : null,
+    max_day_utc: initialBackedUpSorted.length
+      ? initialBackedUpSorted[initialBackedUpSorted.length - 1]
+      : null,
+    message: executionDays.length > 0
+      ? "Planned pending day exports for observations history manifests."
+      : "All requested days already have day manifests in R2.",
   };
+
+  if (DRY_RUN) {
+    return summary;
+  }
+
+  for (const dayUtc of executionDays) {
+    const dayStartIso = utcDayStartIso(dayUtc);
+    const dayEndIso = utcDayEndIso(dayUtc);
+
+    logStructured("info", "obs_aqi_to_r2_day_start", {
+      run_id: runId,
+      day_utc: dayUtc,
+      connector_filter: CONNECTOR_IDS,
+      force_replace: FORCE_REPLACE,
+    });
+
+    const connectorCounts = await fetchConnectorCountsForDay("obs_aqidb", dayStartIso, dayEndIso);
+    const allSourceConnectors = Array.from(connectorCounts.entries())
+      .filter((entry) => entry[1] > 0)
+      .map((entry) => entry[0])
+      .sort((left, right) => left - right);
+    const targetConnectors = (CONNECTOR_IDS || allSourceConnectors).slice().sort((left, right) => left - right);
+    const targetSet = new Set(targetConnectors);
+    const manifestsByConnector = new Map<number, ObsConnectorManifest & Record<string, unknown>>();
+    let dayFailed = false;
+
+    for (const connectorId of targetConnectors) {
+      const startedAt = nowIso();
+      const expectedRows = connectorCounts.get(connectorId) || 0;
+      if (expectedRows <= 0) {
+        summary.connector_day_skipped += 1;
+        summary.day_connector_results.push({
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          status: "skipped",
+          skip_reason: "no_source_rows",
+          rows_read: 0,
+          objects_written_r2: 0,
+          manifest_key: null,
+          error: null,
+        });
+
+        await ledgerInsertRunDay(ledgerEnabled, {
+          run_id: runId,
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          source_kind: "obs_aqidb",
+          status: "skipped",
+          rows_read: 0,
+          rows_written_aqilevels: 0,
+          objects_written_r2: 0,
+          checkpoint_json: { skip_reason: "no_source_rows" },
+          started_at: startedAt,
+          finished_at: nowIso(),
+        });
+        continue;
+      }
+
+      try {
+        const exportResult = await exportObsConnectorDayToR2({
+          run_id: runId,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+        });
+        if (expectedRows > 0 && exportResult.rows_read <= 0) {
+          throw new Error(
+            `obs_aqi_to_r2 expected rows for connector=${connectorId} day=${dayUtc} but export returned 0 rows`,
+          );
+        }
+        if (expectedRows > 0 && exportResult.rows_read !== expectedRows) {
+          logStructured("warning", "obs_aqi_to_r2_connector_row_mismatch", {
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            expected_rows: expectedRows,
+            exported_rows: exportResult.rows_read,
+          });
+        }
+        manifestsByConnector.set(connectorId, exportResult.connector_manifest);
+
+        summary.connector_day_complete += 1;
+        summary.rows_read += exportResult.rows_read;
+        summary.objects_written_r2 += exportResult.objects_written_r2;
+        summary.day_connector_results.push({
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          status: "complete",
+          skip_reason: null,
+          rows_read: exportResult.rows_read,
+          objects_written_r2: exportResult.objects_written_r2,
+          manifest_key: exportResult.manifest_key,
+          error: null,
+        });
+
+        await ledgerInsertRunDay(ledgerEnabled, {
+          run_id: runId,
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          source_kind: "obs_aqidb",
+          status: "complete",
+          rows_read: exportResult.rows_read,
+          rows_written_aqilevels: 0,
+          objects_written_r2: exportResult.objects_written_r2,
+          checkpoint_json: {
+            manifest_key: exportResult.manifest_key,
+          },
+          started_at: startedAt,
+          finished_at: nowIso(),
+        });
+
+        await ledgerUpsertCheckpoint(ledgerEnabled, {
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          source_kind: "obs_aqidb",
+          status: "complete",
+          rows_read: exportResult.rows_read,
+          rows_written_aqilevels: 0,
+          objects_written_r2: exportResult.objects_written_r2,
+          checkpoint_json: {
+            updated_by_run_id: runId,
+            manifest_key: exportResult.manifest_key,
+            completed_at: nowIso(),
+          },
+          updated_at: nowIso(),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        dayFailed = true;
+        summary.connector_day_error += 1;
+        summary.day_connector_results.push({
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          status: "error",
+          skip_reason: null,
+          rows_read: 0,
+          objects_written_r2: 0,
+          manifest_key: null,
+          error: message,
+        });
+
+        await ledgerInsertRunDay(ledgerEnabled, {
+          run_id: runId,
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          source_kind: "obs_aqidb",
+          status: "error",
+          rows_read: 0,
+          rows_written_aqilevels: 0,
+          objects_written_r2: 0,
+          error_json: { message },
+          started_at: startedAt,
+          finished_at: nowIso(),
+        });
+
+        await ledgerUpsertCheckpoint(ledgerEnabled, {
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          source_kind: "obs_aqidb",
+          status: "error",
+          rows_read: 0,
+          rows_written_aqilevels: 0,
+          objects_written_r2: 0,
+          checkpoint_json: {
+            updated_by_run_id: runId,
+            failed_at: nowIso(),
+          },
+          error_json: { message },
+          updated_at: nowIso(),
+        });
+
+        await ledgerInsertError(ledgerEnabled, {
+          run_id: runId,
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          source_kind: "obs_aqidb",
+          error_json: { message },
+          started_at: startedAt,
+          finished_at: nowIso(),
+        });
+      }
+    }
+
+    for (const connectorId of allSourceConnectors) {
+      if (targetSet.has(connectorId)) {
+        continue;
+      }
+      if (manifestsByConnector.has(connectorId)) {
+        continue;
+      }
+      const existing = await loadExistingConnectorManifest(dayUtc, connectorId);
+      if (existing) {
+        manifestsByConnector.set(connectorId, existing);
+      } else {
+        dayFailed = true;
+      }
+    }
+
+    if (allSourceConnectors.length === 0) {
+      dayFailed = true;
+      await ledgerInsertError(ledgerEnabled, {
+        run_id: runId,
+        run_mode: RUN_MODE,
+        day_utc: dayUtc,
+        connector_id: null,
+        source_kind: "obs_aqidb",
+        error_json: { message: "no_source_rows_for_day" },
+        started_at: nowIso(),
+        finished_at: nowIso(),
+      });
+      logStructured("warning", "obs_aqi_to_r2_day_no_source_rows", {
+        run_id: runId,
+        day_utc: dayUtc,
+      });
+    }
+
+    const unresolvedConnectors = allSourceConnectors.filter((connectorId) =>
+      !manifestsByConnector.has(connectorId)
+    );
+    if (unresolvedConnectors.length > 0) {
+      dayFailed = true;
+      await ledgerInsertError(ledgerEnabled, {
+        run_id: runId,
+        run_mode: RUN_MODE,
+        day_utc: dayUtc,
+        connector_id: null,
+        source_kind: "r2",
+        error_json: { message: "day_manifest_blocked_missing_connector_manifests", missing_connectors: unresolvedConnectors },
+        started_at: nowIso(),
+        finished_at: nowIso(),
+      });
+    }
+
+    if (!dayFailed) {
+      const connectorManifests = Array.from(manifestsByConnector.values()).sort((left, right) =>
+        Number(left.connector_id) - Number(right.connector_id)
+      );
+      const dayManifest = createObsDayManifest({
+        dayUtc,
+        runId,
+        connectorManifests,
+        writerGitSha: OBS_R2_WRITER_GIT_SHA,
+        backedUpAtUtc: nowIso(),
+      });
+      const dayManifestKey = buildObsDayManifestKey(dayUtc);
+      await r2PutObject({
+        r2: OBS_R2_CONFIG,
+        key: dayManifestKey,
+        body: Buffer.from(JSON.stringify(dayManifest, null, 2), "utf8"),
+        content_type: "application/json",
+      });
+      const manifestHead = await r2HeadObject({ r2: OBS_R2_CONFIG, key: dayManifestKey });
+      if (!manifestHead.exists) {
+        throw new Error(`Missing day manifest after upload: ${dayManifestKey}`);
+      }
+      summary.objects_written_r2 += 1;
+      summary.exported_days.push(dayUtc);
+      logStructured("info", "obs_aqi_to_r2_day_complete", {
+        run_id: runId,
+        day_utc: dayUtc,
+        connector_count: connectorManifests.length,
+        day_manifest_key: dayManifestKey,
+      });
+    } else {
+      summary.failed_days.push(dayUtc);
+      logStructured("warning", "obs_aqi_to_r2_day_failed", {
+        run_id: runId,
+        day_utc: dayUtc,
+        unresolved_connectors: unresolvedConnectors,
+      });
+    }
+
+    summary.days_processed += 1;
+  }
+
+  const finalBackedUpDaySet = await fetchR2BackedUpDaySet(requestedDays);
+  summary.backed_up_days = requestedDays.filter((dayUtc) => finalBackedUpDaySet.has(dayUtc));
+  summary.pending_backfill_days = requestedDays.filter((dayUtc) => !finalBackedUpDaySet.has(dayUtc));
+  const backedUpSorted = [...summary.backed_up_days].sort(compareIsoDay);
+  summary.min_day_utc = backedUpSorted.length ? backedUpSorted[0] : null;
+  summary.max_day_utc = backedUpSorted.length ? backedUpSorted[backedUpSorted.length - 1] : null;
+  if (summary.pending_backfill_days.length > 0) {
+    summary.message = `obs_aqi_to_r2 completed with ${summary.pending_backfill_days.length} pending day(s).`;
+  } else if (executionDays.length === 0) {
+    summary.message = "All requested days already had committed day manifests in R2.";
+  } else {
+    summary.message = "obs_aqi_to_r2 completed and all requested days now have committed day manifests in R2.";
+  }
+
+  return summary;
 }
 
 async function runSourceToAll(
@@ -1975,9 +2990,11 @@ async function main(): Promise<void> {
         errorMessage = `local_to_aqilevels encountered ${summary.connector_day_error} connector-day errors`;
       }
     } else if (RUN_MODE === "obs_aqi_to_r2") {
-      summary = await runObservsToR2(runId, window);
-      if ("stubbed" in summary && summary.stubbed) {
-        runStatus = "stubbed";
+      summary = await runObservsToR2(runId, window, ledgerEnabled);
+      if (summary.connector_day_error > 0 || (!DRY_RUN && summary.pending_backfill_days.length > 0)) {
+        runStatus = "error";
+        errorMessage =
+          `obs_aqi_to_r2 encountered ${summary.connector_day_error} connector-day errors and has ${summary.pending_backfill_days.length} pending day(s)`;
       } else {
         runStatus = DRY_RUN ? "dry_run" : "ok";
       }
@@ -2025,7 +3042,7 @@ async function main(): Promise<void> {
     status: runStatus,
     rows_read: "rows_read" in summary ? summary.rows_read : 0,
     rows_written_aqilevels: "rows_written_aqilevels" in summary ? summary.rows_written_aqilevels : 0,
-    objects_written_r2: 0,
+    objects_written_r2: "objects_written_r2" in summary ? summary.objects_written_r2 : 0,
     checkpoint_json: {
       summary,
       connector_ids: CONNECTOR_IDS,

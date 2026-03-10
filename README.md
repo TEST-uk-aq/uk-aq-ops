@@ -133,7 +133,7 @@ Primary controls:
 - `POST /run` executes backfill job (alias)
 - run modes:
   - `local_to_aqilevels` (Phase 1 implemented)
-  - `obs_aqi_to_r2` (Phase 1 stubbed)
+  - `obs_aqi_to_r2` (implemented: dry-run planning + non-dry R2 export)
   - `source_to_all` (Phase 1 stubbed)
 - `local_to_aqilevels` behavior:
   - UTC-day backfill with newest day first
