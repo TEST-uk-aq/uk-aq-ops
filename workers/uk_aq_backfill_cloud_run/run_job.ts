@@ -779,6 +779,14 @@ function buildAqiDayManifestKey(dayUtc: string): string {
   return `${AQI_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/manifest.json`;
 }
 
+function buildObsDayPrefix(dayUtc: string): string {
+  return `${OBS_R2_HISTORY_PREFIX}/day_utc=${dayUtc}`;
+}
+
+function buildAqiDayPrefix(dayUtc: string): string {
+  return `${AQI_R2_HISTORY_PREFIX}/day_utc=${dayUtc}`;
+}
+
 function buildObsConnectorPrefix(dayUtc: string, connectorId: number): string {
   return `${OBS_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/connector_id=${connectorId}`;
 }
@@ -3303,9 +3311,11 @@ async function runObservsToR2(
   }
 
   const processedDays = new Set<string>();
+  const hasConnectorFilter = Array.isArray(CONNECTOR_IDS) && CONNECTOR_IDS.length > 0;
 
   for (const dayUtc of observsExecutionDays) {
     processedDays.add(dayUtc);
+    const hadExistingDayManifest = initialObservsBackedUpDaySet.has(dayUtc);
     const dayStartIso = utcDayStartIso(dayUtc);
     const dayEndIso = utcDayEndIso(dayUtc);
 
@@ -3325,6 +3335,45 @@ async function runObservsToR2(
     const targetSet = new Set(targetConnectors);
     const manifestsByConnector = new Map<number, ObsConnectorManifest & Record<string, unknown>>();
     let dayFailed = false;
+
+    if (hasConnectorFilter) {
+      const unresolvedConnectorsBeforeExport: number[] = [];
+      for (const connectorId of allSourceConnectors) {
+        if (targetSet.has(connectorId)) {
+          continue;
+        }
+        const existing = await loadExistingConnectorManifest(dayUtc, connectorId);
+        if (existing) {
+          manifestsByConnector.set(connectorId, existing);
+        } else {
+          unresolvedConnectorsBeforeExport.push(connectorId);
+        }
+      }
+      if (unresolvedConnectorsBeforeExport.length > 0) {
+        dayFailed = true;
+        summary.failed_days.push(dayUtc);
+        await ledgerInsertError(ledgerEnabled, {
+          run_id: runId,
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: null,
+          source_kind: "r2",
+          error_json: {
+            message: "connector_filter_blocked_partial_day_write",
+            missing_connectors: unresolvedConnectorsBeforeExport,
+          },
+          started_at: nowIso(),
+          finished_at: nowIso(),
+        });
+        logStructured("warning", "obs_aqi_to_r2_day_skipped_connector_filter_incomplete", {
+          run_id: runId,
+          day_utc: dayUtc,
+          target_connectors: targetConnectors,
+          missing_connectors: unresolvedConnectorsBeforeExport,
+        });
+        continue;
+      }
+    }
 
     for (const connectorId of targetConnectors) {
       const startedAt = nowIso();
@@ -3575,12 +3624,46 @@ async function runObservsToR2(
         day_utc: dayUtc,
         unresolved_connectors: unresolvedConnectors,
       });
+      if (!hadExistingDayManifest) {
+        try {
+          await deleteR2Prefix(buildObsDayPrefix(dayUtc));
+          logStructured("info", "obs_aqi_to_r2_day_failed_cleanup_deleted", {
+            run_id: runId,
+            day_utc: dayUtc,
+            domain: "observations",
+            day_prefix: buildObsDayPrefix(dayUtc),
+          });
+        } catch (cleanupError) {
+          const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          logStructured("warning", "obs_aqi_to_r2_day_failed_cleanup_error", {
+            run_id: runId,
+            day_utc: dayUtc,
+            domain: "observations",
+            error: cleanupMessage,
+          });
+          await ledgerInsertError(ledgerEnabled, {
+            run_id: runId,
+            run_mode: RUN_MODE,
+            day_utc: dayUtc,
+            connector_id: null,
+            source_kind: "r2",
+            error_json: {
+              message: "day_failed_cleanup_error",
+              domain: "observations",
+              error: cleanupMessage,
+            },
+            started_at: nowIso(),
+            finished_at: nowIso(),
+          });
+        }
+      }
     }
 
   }
 
   for (const dayUtc of aqilevelsExecutionDays) {
     processedDays.add(dayUtc);
+    const hadExistingDayManifest = initialAqilevelsBackedUpDaySet.has(dayUtc);
     const connectorCounts = await fetchAqilevelsConnectorCountsForDay(dayUtc);
     const allSourceConnectors = Array.from(connectorCounts.entries())
       .filter((entry) => entry[1] > 0)
@@ -3590,6 +3673,45 @@ async function runObservsToR2(
     const targetSet = new Set(targetConnectors);
     const manifestsByConnector = new Map<number, AqilevelsConnectorManifest & Record<string, unknown>>();
     let dayFailed = false;
+
+    if (hasConnectorFilter) {
+      const unresolvedConnectorsBeforeExport: number[] = [];
+      for (const connectorId of allSourceConnectors) {
+        if (targetSet.has(connectorId)) {
+          continue;
+        }
+        const existing = await loadExistingAqiConnectorManifest(dayUtc, connectorId);
+        if (existing) {
+          manifestsByConnector.set(connectorId, existing);
+        } else {
+          unresolvedConnectorsBeforeExport.push(connectorId);
+        }
+      }
+      if (unresolvedConnectorsBeforeExport.length > 0) {
+        dayFailed = true;
+        summary.failed_days.push(dayUtc);
+        await ledgerInsertError(ledgerEnabled, {
+          run_id: runId,
+          run_mode: RUN_MODE,
+          day_utc: dayUtc,
+          connector_id: null,
+          source_kind: "r2",
+          error_json: {
+            message: "aqilevels_connector_filter_blocked_partial_day_write",
+            missing_connectors: unresolvedConnectorsBeforeExport,
+          },
+          started_at: nowIso(),
+          finished_at: nowIso(),
+        });
+        logStructured("warning", "obs_aqi_to_r2_aqilevels_day_skipped_connector_filter_incomplete", {
+          run_id: runId,
+          day_utc: dayUtc,
+          target_connectors: targetConnectors,
+          missing_connectors: unresolvedConnectorsBeforeExport,
+        });
+        continue;
+      }
+    }
 
     logStructured("info", "obs_aqi_to_r2_aqilevels_day_start", {
       run_id: runId,
@@ -3853,6 +3975,39 @@ async function runObservsToR2(
         day_utc: dayUtc,
         unresolved_connectors: unresolvedConnectors,
       });
+      if (!hadExistingDayManifest) {
+        try {
+          await deleteR2Prefix(buildAqiDayPrefix(dayUtc));
+          logStructured("info", "obs_aqi_to_r2_aqilevels_day_failed_cleanup_deleted", {
+            run_id: runId,
+            day_utc: dayUtc,
+            domain: "aqilevels",
+            day_prefix: buildAqiDayPrefix(dayUtc),
+          });
+        } catch (cleanupError) {
+          const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          logStructured("warning", "obs_aqi_to_r2_aqilevels_day_failed_cleanup_error", {
+            run_id: runId,
+            day_utc: dayUtc,
+            domain: "aqilevels",
+            error: cleanupMessage,
+          });
+          await ledgerInsertError(ledgerEnabled, {
+            run_id: runId,
+            run_mode: RUN_MODE,
+            day_utc: dayUtc,
+            connector_id: null,
+            source_kind: "r2",
+            error_json: {
+              message: "day_failed_cleanup_error",
+              domain: "aqilevels",
+              error: cleanupMessage,
+            },
+            started_at: nowIso(),
+            finished_at: nowIso(),
+          });
+        }
+      }
     }
   }
 

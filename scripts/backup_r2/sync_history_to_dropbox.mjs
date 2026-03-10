@@ -234,7 +234,7 @@ function rcloneCatMaybe(rcloneBin, targetPath) {
 function listDayFolders(rcloneBin, sourceDomainPath) {
   const result = runRclone(
     rcloneBin,
-    ["lsf", sourceDomainPath, "--dirs-only", "--format", "p", "--max-depth", "1"],
+    ["lsf", sourceDomainPath, "--files-only", "--format", "p", "--max-depth", "2"],
     { allow_failure: true },
   );
 
@@ -258,7 +258,7 @@ function listDayFolders(rcloneBin, sourceDomainPath) {
 
   const days = [];
   for (const line of lines) {
-    const match = line.match(/^day_utc=(\d{4}-\d{2}-\d{2})\/?$/);
+    const match = line.match(/^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/);
     if (!match) {
       continue;
     }
@@ -459,8 +459,14 @@ function buildCandidatePlan(params) {
       continue;
     }
 
-    const manifest = parseManifestOrThrow(sourceManifest.text, sourceManifestPath);
-    validateManifestDay(manifest, dayUtc, sourceManifestPath);
+    let manifest;
+    try {
+      manifest = parseManifestOrThrow(sourceManifest.text, sourceManifestPath);
+      validateManifestDay(manifest, dayUtc, sourceManifestPath);
+    } catch {
+      skippedIncomplete += 1;
+      continue;
+    }
     const sourceManifestHash = sha256Hex(sourceManifest.text);
 
     if (sourceManifestHash === checkpointManifestHash) {
@@ -588,8 +594,13 @@ async function main(args) {
           domainSummary.skipped_incomplete += 1;
           continue;
         }
-        const manifest = parseManifestOrThrow(sourceManifest.text, sourceManifestPath);
-        validateManifestDay(manifest, dayUtc, sourceManifestPath);
+        try {
+          const manifest = parseManifestOrThrow(sourceManifest.text, sourceManifestPath);
+          validateManifestDay(manifest, dayUtc, sourceManifestPath);
+        } catch {
+          domainSummary.skipped_incomplete += 1;
+          continue;
+        }
         manifestHash = sha256Hex(sourceManifest.text);
       }
 
