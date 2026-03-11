@@ -4,11 +4,11 @@ Date: 2026-03-06
 ## 1) Goal
 Add a backfill capability to `uk-aq-ops` that can run in three modes:
 
-1. Rebuild or extend AggDaily DB from data you already hold locally.
-2. Rebuild or extend Cloudflare R2 backups from local history data.
-3. Backfill older historic data from network APIs or downloaded files, then fan that data into History DB, AggDaily DB, and Cloudflare R2.
+1. Rebuild or extend ObsAQI DB from data you already hold locally.
+2. Rebuild or extend Cloudflare R2 History from local history data.
+3. Backfill older historic data from network APIs or downloaded files, then write canonical Observs + AQI outputs into R2 History.
 
-The design should follow the current Ops repo pattern of Cloud Run workers with manual and scheduler trigger modes. The repo already uses that pattern for prune, outbox flush, partition maintenance, DB size logging, and the station AQI AggDaily worker. The current AggDaily worker also already exposes a `run_mode` concept (`sync_hourly` and `backfill`), which is a good precedent for this backfill feature. Source refs: `uk-aq-ops` README and current worker layout; `uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`.  
+The design should follow the current Ops repo pattern of Cloud Run workers with manual and scheduler trigger modes. The repo already uses that pattern for prune, outbox flush, partition maintenance, DB size logging, and the station AQI worker targeting ObsAQI tables. The current ObsAQI worker also already exposes a `run_mode` concept (`sync_hourly` and `backfill`), which is a good precedent for this backfill feature. Source refs: `uk-aq-ops` README and current worker layout; `uk_aq_aqi_station_aggdaily_cloud_run/run_service.ts`.  
 
 ## 2) Relevant repo findings
 
@@ -18,20 +18,20 @@ Current `uk-aq-ops` responsibilities already include:
 - flush ingest outbox rows into history DB
 - maintain history partitions/index policy/retention
 - log DB sizes
-- compute station AQI into AggDaily DB
+- compute station AQI into ObsAQI DB
 
 That means the repo is already the right place for a cross-database backfill/orchestration service rather than putting this into ingest. Source: `uk-aq-ops` README.  
 
-Important project rule: Phase B observations backup is mandatory, and the repo explicitly says not to reduce backup coverage just to save cost or egress. So the backfill design must preserve full R2 backup integrity. Source: `uk-aq-ops/AGENTS.md`.  
+Important project rule: Phase B observations backup is mandatory, and the repo explicitly says not to reduce backup coverage just to save cost or egress. So the backfill design must preserve full R2 History integrity. Source: `uk-aq-ops/AGENTS.md`.  
 
 ### Schema repo
-The AggDaily schema already contains:
+The ObsAQI schema already contains:
 - mirrored `uk_aq_core` metadata tables
 - `uk_aq_ops` and `uk_aq_public` patterns
 - DB size metrics objects
-- `uk_aq_aggdaily.station_aqi_hourly` as a key derived-data table
+- `uk_aq_aqilevels.station_aqi_hourly` as a key derived-data table
 
-That means AggDaily is already positioned as a derived/read-optimized destination DB, not the source of truth for raw observations. Source: `schemas/aggdaily_db/uk_aq_aggdaily_schema.sql`.  
+That means ObsAQI is already positioned as a derived/read-optimized destination DB, not the source of truth for raw observations. Source: `schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql`.  
 
 ### Ingest repo
 The ingest repo confirms:
@@ -50,7 +50,7 @@ Suggested worker path:
 
 Suggested trigger styles:
 - `trigger_mode=scheduler|manual`
-- `run_mode=local_to_aggdaily|obs_aqi_to_r2|source_to_all`
+- `run_mode=local_to_aqilevels|obs_aqi_to_r2|source_to_r2`
 
 Why this is the best fit:
 - matches the existing Ops Cloud Run pattern
@@ -68,36 +68,36 @@ Mitigation:
 Your draft names are understandable, but I would make them shorter and more operation-oriented.
 
 ### Recommended public run mode names
-1. `local_to_aggdaily`
-   - meaning: rebuild AggDaily from data already held in your stack
+1. `local_to_aqilevels`
+   - meaning: rebuild ObsAQI from data already held in your stack
    - better than `backfill_aggdailydb_from_local` because it is shorter and still clear
 
 2. `obs_aqi_to_r2`
-   - meaning: export historical observations from History DB into R2 backup layout
+   - meaning: export historical observations from History DB into R2 History layout
    - better than `backfill_cflarer2_from_obs_aqidb` because it is shorter and matches source->destination naming
 
-3. `source_to_all`
-   - meaning: acquire historic data from API/download/manual file and write it through the full pipeline
+3. `source_to_r2`
+   - meaning: acquire historic data from API/download/manual file and write canonical Observs + AQI outputs to R2 History
    - better than `backfill_all_from_web` because some inputs are not “web” in the narrow sense; they may be local files
 
 ### Alternative names if you want “backfill” visible everywhere
-- `backfill_local_to_aggdaily`
+- `backfill_local_to_aqilevels`
 - `backfill_obs_aqi_to_r2`
-- `backfill_source_to_all`
+- `backfill_source_to_r2`
 
 ### Recommendation
 Use the shorter forms internally and externally:
-- `local_to_aggdaily`
+- `local_to_aqilevels`
 - `obs_aqi_to_r2`
-- `source_to_all`
+- `source_to_r2`
 
 They are easier to type, easier to log, and consistent with source->destination semantics.
 
 ## 5) What each mode should do
 
-### Mode A: `local_to_aggdaily`
+### Mode A: `local_to_aqilevels`
 Purpose:
-Populate or repair AggDaily using data you already hold in Ingest DB, History DB, and optionally R2.
+Populate or repair ObsAQI using data you already hold in Ingest DB, History DB, and optionally R2.
 
 Recommended source priority:
 1. **Ingest DB** for recent windows still inside your live retention.
@@ -105,19 +105,19 @@ Recommended source priority:
 3. **R2 only as optional fallback or parity source**, not first choice.
 
 Why:
-- AggDaily recompute wants relational querying, joins, and idempotent window scans.
+- ObsAQI recompute wants relational querying, joins, and idempotent window scans.
 - History DB is a better source for this than reading many parquet files back out of object storage.
 - R2 should remain the durable backup/archive layer, not the first-line compute source.
 
 Suggested use cases:
 - rebuild a date range after schema changes
-- populate newly added AggDaily rollups
-- repair gaps caused by an earlier failed AggDaily job
+- populate newly added ObsAQI rollups
+- repair gaps caused by an earlier failed ObsAQI job
 - recalculate a connector after changes in derived logic
 
 Write targets:
-- `uk_aq_aggdaily.*` tables only
-- optional ops run logs in AggDaily or Ops DB schema
+- `uk_aq_aqilevels.*` tables only
+- optional ops run logs in ObsAQI or Ops DB schema
 
 Recommended behavior:
 - idempotent date-window recompute
@@ -132,7 +132,7 @@ Export historical raw observations already stored in History DB into the Phase B
 Recommended scope:
 - read from History DB only
 - write connector-day parquet part files, manifest.json files, and checkpoints to R2
-- do not write AggDaily from this mode
+- do not write ObsAQI from this mode
 
 Why:
 - keeps this mode narrow and reliable
@@ -151,20 +151,23 @@ Recommended behavior:
 - ability to skip days already committed unless `--replace-existing` is set
 
 Current layout note:
-- your existing R2 structure is already connector-per-day, for example `backup/observations/day_utc=YYYY-MM-DD/connector_id=7/` containing `manifest.json` and `part-00000.parquet`
+- your existing R2 structure is already connector-per-day, for example `history/v1/observations/day_utc=YYYY-MM-DD/connector_id=7/` containing `manifest.json` and `part-00000.parquet`
 - so this plan should preserve that layout rather than invent a different one
 
-### Mode C: `source_to_all`
+### Mode C: `source_to_r2`
 Purpose:
-Acquire older historic data from network APIs, auto-download files, or manually supplied files, then populate all relevant stores.
+Acquire older historic data from network APIs, auto-download files, or manually supplied files, then build R2 History outputs in canonical connector/day layout.
 
 Recommended flow:
 1. acquire raw source data for a bounded day range
-2. normalize into your canonical observation shape
-3. upsert into History DB
-4. write/export matching parquet backup to R2
-5. trigger or directly run AggDaily recompute for impacted days/connectors
-6. record per-day per-connector checkpoints and provenance
+2. stage raw source files for replay in development (Dropbox mirror for Sensor.Community)
+3. normalize into your canonical observation shape
+4. compute AQI values in the worker from normalized observation rows (direct worker compute)
+5. write/export matching parquet history files + manifests to R2 for:
+   - `history/v1/observations`
+   - `history/v1/aqilevels`
+6. do not require History DB writes for this mode by default
+7. record per-day per-connector checkpoints and provenance
 
 Recommendation on Ingest DB:
 - **do not make Ingest DB the main target for old historic backfill**
@@ -173,10 +176,16 @@ Recommendation on Ingest DB:
 Why:
 - Ingest DB is designed around short retention and live ingest operations
 - using it as a historic staging store would increase churn and compete with live workloads
-- History DB is the better raw target for older backfill
+- R2 History is the intended durable target for this mode
 
 Special case for “last 31/32 days”:
 - If the fetched historic range overlaps your local retention horizon, dedupe against History DB first and only use Ingest DB when there is a very specific operational benefit
+
+Sensor.Community-first delivery decision:
+- process Sensor.Community first using **daily** archive files from `https://archive.sensor.community/`
+- include met fields in normalization/output
+- development replay files will be mirrored to:
+  - `/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_Backfill_raw_files/sensorcommunity`
 
 ## 6) Options, pros, cons, egress effect, DB-size effect
 
@@ -212,7 +221,7 @@ Egress effect:
 DB-size effect:
 - same destination data footprint, slightly more ops metadata spread across services if each keeps its own run tables
 
-### Option 3: Use AggDaily rebuilds from R2 as the default “local” source
+### Option 3: Use ObsAQI rebuilds from R2 as the default “local” source
 Pros:
 - proves archive usability
 - can work even if History DB is missing some windows
@@ -255,7 +264,7 @@ Cloudflare documents that R2 has **no egress bandwidth charges** for any storage
 Supabase documents egress as network data transmitted out of the system, and its pricing page continues to show plan-specific DB size and egress quotas. That means heavy readback jobs from Ingest DB or History DB into Cloud Run can become the dominant egress/cost driver if you recompute broad historic windows inefficiently. Sources: Supabase pricing page and Supabase egress docs.  
 
 ### Practical recommendation
-To keep egress low without compromising backup integrity:
+To keep egress low without compromising R2 History integrity:
 - prefer **History DB as the source of truth for raw historic backfill already in your stack**
 - avoid reading from both History DB and R2 for the same day unless you are doing verification or repair
 - chunk by day and connector
@@ -283,17 +292,17 @@ Expected DB-size effect:
 - temporary growth during overlapping windows
 - sustained growth only for the days you deliberately keep locally before retention/export rules move the long tail to R2
 
-### AggDaily DB
+### ObsAQI DB
 Recommendation:
-- only store derived daily/monthly/hourly aggregates and run metadata here
-- do not duplicate raw observations into AggDaily
+- store AQI-derived tables and run metadata
+- avoid duplicating full historic raw observations for `source_to_r2` default path
 
 Reason:
-- keeps AggDaily compact and purpose-built
+- keeps ObsAQI compact and purpose-built
 - matches current schema role and existing AQI storage direction
 
 ## 9) Recommended control plane and metadata
-Add backfill ops tables, probably in the destination DB most natural for the mode, or keep them centralized in AggDaily/Ops if you want one run ledger.
+Add backfill ops tables, probably in the destination DB most natural for the mode, or keep them centralized in ObsAQI/Ops if you want one run ledger.
 
 Recommended logical tables:
 - `uk_aq_ops.backfill_runs`
@@ -314,7 +323,7 @@ Minimum columns to capture:
 - `status`
 - `rows_read`
 - `rows_written_history`
-- `rows_written_aggdaily`
+- `rows_written_obs_aqilevels`
 - `objects_written_r2`
 - `bytes_read`
 - `bytes_written`
@@ -342,6 +351,14 @@ Default:
 
 Optional:
 - allow smaller chunks for large file-based sources or connectors with dense data
+
+### Pace control
+Default:
+- run single-day jobs and intentionally pause between days
+
+Recommendation:
+- add a configurable inter-day delay for scheduled batches (for example `UK_AQ_BACKFILL_INTER_DAY_DELAY_SECONDS`)
+- keep manual operations as explicit one-day runs during early rollout
 
 ### Idempotency
 All modes should be idempotent by day and connector.
@@ -375,22 +392,24 @@ This is the right approach for current networks and future ones because the acqu
 ### Strong recommendations
 1. Build **one new Cloud Run worker in `uk-aq-ops` with three run modes**.
 2. Use these mode names:
-   - `local_to_aggdaily`
+   - `local_to_aqilevels`
    - `obs_aqi_to_r2`
-   - `source_to_all`
-3. Treat **History DB as the canonical local raw source** for historic work.
+   - `source_to_r2`
+3. Treat **History DB as the canonical local raw source** for local-window recompute only.
 4. Treat **R2 as the durable archive target**, not the primary compute source.
 5. Keep **historic source backfill out of Ingest DB** unless you have a very narrow compatibility reason.
 6. Add **day-level checkpoints and run logs** from the start.
 7. Keep the current **connector-per-day R2 layout with `manifest.json` plus parquet part files**.
-8. For `source_to_all`, **skip History DB writes for dates outside the rolling 31/32-day local retention window** and still write those days to AggDaily and R2.
+8. For `source_to_r2`, default to **source -> R2 History only** (observs + aqilevels in canonical history format).
 9. Process **backwards by UTC day**.
 10. Keep the design **idempotent and resume-safe**.
+11. Start connector rollout with Sensor.Community daily archive files and include met fields.
+12. Use slow pacing: single-day jobs with gaps between days.
 
 
 ### Best first implementation order
 Phase 1:
-- `local_to_aggdaily`
+- `local_to_aqilevels`
 - easiest value, lowest external dependency risk
 
 Phase 2:
@@ -398,35 +417,17 @@ Phase 2:
 - extends archive completeness while staying inside your own stack
 
 Phase 3:
-- `source_to_all`
+- `source_to_r2`
 - most useful long term, but highest connector/source variance
 
-## 13) Decisions to confirm before implementation
-I have made provisional recommendations above, but these are the main choices you should confirm before coding:
-
-1. **Should `source_to_all` write to Ingest DB at all?**
-   - My recommendation: no, except maybe a tiny compatibility path.
-
-2. **For `local_to_aggdaily`, should R2 ever be used as a normal source, or only fallback/repair?**
-   - My recommendation: fallback/repair only.
-
-3. **Where do you want the backfill run ledger/checkpoint tables to live?**
-   - My recommendation: `uk_aq_ops` in AggDaily DB, unless you want a dedicated ops metadata home elsewhere.
-
-4. **Do you want “replace existing” support for R2 days, or only skip-existing plus repair mode?**
-   - My recommendation: default skip-existing, explicit replace flag.
-
-5. **Should `source_to_all` skip History DB writes for dates outside the rolling 31/32-day retention window?**
-   - Confirmed decision: yes. Keep only the rolling local window in History DB, while still writing older backfill days to R2 and AggDaily.
-
-6. **Should AggDaily recompute be called inline from `source_to_all`, or queued as a follow-up run?**
-   - My recommendation: inline for small day chunks at first, queueable later if runtime grows.
-
-7. **Do you want one standard connector-day parquet layout for all connectors now, even if some historic files arrive in odd shapes?**
-   - My recommendation: yes, normalize everything into the same canonical backup layout with `manifest.json` plus one or more parquet part files.
-
-8. **Do you want dry-run estimation from day one?**
-   - My recommendation: yes.
+## 13) Confirmed decisions (2026-03-11)
+1. Sensor.Community archive granularity: **daily files**.
+2. Primary destination: **R2 History**.
+3. AQI generation in `source_to_r2`: **direct worker compute**.
+4. Sensor.Community historical processing: **include met fields**.
+5. Operational pacing: **single-day runs with intentional gaps between days**.
+6. Development replay source mirror:
+   - `/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_Backfill_raw_files/sensorcommunity`
 
 ## 14) Suggested plan file location
 Recommended repo location:

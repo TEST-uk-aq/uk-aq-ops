@@ -24,14 +24,14 @@ Goal:
 Add one new Cloud Run worker in uk-aq-ops with three run modes:
 - local_to_aggdaily
 - obs_aqi_to_r2
-- source_to_all
+- source_to_r2
 
 Important fixed decisions:
 - Keep one worker with multiple run modes, not three separate workers.
 - Keep the existing R2 layout:
   backup/observations/day_utc=YYYY-MM-DD/connector_id=N/
   containing manifest.json and parquet part files such as part-00000.parquet
-- source_to_all should skip History DB writes for dates outside the rolling local retention window.
+- source_to_r2 should skip History DB writes for dates outside the rolling local retention window.
 - The rolling local retention window is 31/32 days depending on DST.
 - Treat History DB as the canonical local raw source for historic work already in our stack.
 - Treat R2 as the durable archive target, not the normal primary compute source.
@@ -52,7 +52,7 @@ What I want delivered in this change:
 2. Run mode routing for:
    - local_to_aggdaily
    - obs_aqi_to_r2
-   - source_to_all
+   - source_to_r2
 3. Manual trigger support matching current Cloud Run patterns in this repo
 4. Dry-run support
 5. Day-by-day backward processing through time
@@ -74,7 +74,7 @@ For local_to_aggdaily, implement:
 - default skip of already-complete days unless force/replace is explicitly set
 
 Do not:
-- fully implement source_to_all acquisition yet
+- fully implement source_to_r2 acquisition yet
 - fully implement obs_aqi_to_r2 export yet
 - add unnecessary new infrastructure
 - move historic backfill through Ingest DB as the main path
@@ -118,7 +118,7 @@ Runtime behaviour:
 - Make dry-run estimate work without writes where practical
 
 For the retention boundary:
-- source_to_all must skip History DB writes for dates older than the rolling 31/32-day local retention window
+- source_to_r2 must skip History DB writes for dates older than the rolling 31/32-day local retention window
 - encapsulate this rule in one helper so it is easy to reason about and test
 - document clearly how the retention boundary is determined
 

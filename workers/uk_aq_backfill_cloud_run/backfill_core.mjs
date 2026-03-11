@@ -5,7 +5,7 @@ export const ALLOWED_TRIGGER_MODES = Object.freeze(["scheduler", "manual"]);
 export const ALLOWED_RUN_MODES = Object.freeze([
   "local_to_aqilevels",
   "obs_aqi_to_r2",
-  "source_to_all",
+  "source_to_r2",
 ]);
 
 const RUN_MODE_SET = new Set(ALLOWED_RUN_MODES);

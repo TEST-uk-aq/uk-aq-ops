@@ -18,7 +18,7 @@ Usage:
 Required env vars:
   UK_AQ_BACKFILL_SERVICE_URL
   UK_AQ_BACKFILL_TRIGGER_MODE   (manual|scheduler)
-  UK_AQ_BACKFILL_RUN_MODE       (local_to_aqilevels|obs_aqi_to_r2|source_to_all)
+  UK_AQ_BACKFILL_RUN_MODE       (local_to_aqilevels|obs_aqi_to_r2|source_to_r2)
   UK_AQ_BACKFILL_DRY_RUN        (true|false)
   UK_AQ_BACKFILL_FORCE_REPLACE  (true|false)
   UK_AQ_BACKFILL_FROM_DAY_UTC   (YYYY-MM-DD)
@@ -152,7 +152,7 @@ case "${TRIGGER_MODE}" in
 esac
 
 case "${RUN_MODE}" in
-  local_to_aqilevels|obs_aqi_to_r2|source_to_all) ;;
+  local_to_aqilevels|obs_aqi_to_r2|source_to_r2) ;;
   *)
     echo "Invalid UK_AQ_BACKFILL_RUN_MODE: ${RUN_MODE}" >&2
     exit 2

@@ -7,7 +7,7 @@ create schema if not exists uk_aq_ops;
 
 create table if not exists uk_aq_ops.backfill_runs (
   run_id uuid primary key,
-  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2')),
   trigger_mode text not null check (trigger_mode in ('manual', 'scheduler')),
   window_from_utc date not null,
   window_to_utc date not null,
@@ -32,7 +32,7 @@ create index if not exists backfill_runs_started_at_idx
 create table if not exists uk_aq_ops.backfill_run_days (
   id bigserial primary key,
   run_id uuid not null references uk_aq_ops.backfill_runs(run_id) on delete cascade,
-  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2')),
   day_utc date not null,
   connector_id integer not null,
   source_kind text not null check (source_kind in ('ingestdb', 'obs_aqidb', 'r2', 'api', 'download', 'manual_file', 'none')),
@@ -55,7 +55,7 @@ create index if not exists backfill_run_days_lookup_idx
   on uk_aq_ops.backfill_run_days (run_mode, day_utc desc, connector_id);
 
 create table if not exists uk_aq_ops.backfill_checkpoints (
-  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2')),
   day_utc date not null,
   connector_id integer not null,
   source_kind text not null check (source_kind in ('ingestdb', 'obs_aqidb', 'r2', 'api', 'download', 'manual_file', 'none')),
@@ -75,7 +75,7 @@ create index if not exists backfill_checkpoints_day_connector_idx
 create table if not exists uk_aq_ops.backfill_errors (
   id bigserial primary key,
   run_id uuid,
-  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_all')),
+  run_mode text not null check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2')),
   day_utc date,
   connector_id integer,
   source_kind text,
@@ -84,6 +84,71 @@ create table if not exists uk_aq_ops.backfill_errors (
   finished_at timestamptz,
   created_at timestamptz not null default now()
 );
+
+do $$
+declare
+  v_table text;
+  v_constraint text;
+begin
+  -- Normalize legacy run mode rows before enforcing renamed check constraints.
+  update uk_aq_ops.backfill_runs
+  set run_mode = 'source_to_r2'
+  where run_mode = 'source_to_all';
+
+  update uk_aq_ops.backfill_run_days
+  set run_mode = 'source_to_r2'
+  where run_mode = 'source_to_all';
+
+  update uk_aq_ops.backfill_checkpoints
+  set run_mode = 'source_to_r2'
+  where run_mode = 'source_to_all';
+
+  update uk_aq_ops.backfill_errors
+  set run_mode = 'source_to_r2'
+  where run_mode = 'source_to_all';
+
+  for v_table in
+    select unnest(array[
+      'backfill_runs',
+      'backfill_run_days',
+      'backfill_checkpoints',
+      'backfill_errors'
+    ])
+  loop
+    for v_constraint in
+      select c.conname
+      from pg_constraint c
+      join pg_class t on t.oid = c.conrelid
+      join pg_namespace n on n.oid = t.relnamespace
+      where n.nspname = 'uk_aq_ops'
+        and t.relname = v_table
+        and c.contype = 'c'
+        and pg_get_constraintdef(c.oid) ilike '%run_mode%'
+    loop
+      execute format(
+        'alter table uk_aq_ops.%I drop constraint if exists %I',
+        v_table,
+        v_constraint
+      );
+    end loop;
+  end loop;
+
+  alter table uk_aq_ops.backfill_runs
+    add constraint backfill_runs_run_mode_check
+    check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2'));
+
+  alter table uk_aq_ops.backfill_run_days
+    add constraint backfill_run_days_run_mode_check
+    check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2'));
+
+  alter table uk_aq_ops.backfill_checkpoints
+    add constraint backfill_checkpoints_run_mode_check
+    check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2'));
+
+  alter table uk_aq_ops.backfill_errors
+    add constraint backfill_errors_run_mode_check
+    check (run_mode in ('local_to_aqilevels', 'obs_aqi_to_r2', 'source_to_r2'));
+end $$;
 
 create index if not exists backfill_errors_run_idx
   on uk_aq_ops.backfill_errors (run_id, created_at desc);

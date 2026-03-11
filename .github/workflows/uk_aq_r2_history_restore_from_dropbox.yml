@@ -23,6 +23,11 @@ on:
         required: false
         default: true
         type: boolean
+      restore_core:
+        description: "Restore core metadata domain"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -48,6 +53,7 @@ jobs:
 
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
+      UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
 
@@ -55,6 +61,7 @@ jobs:
       INPUT_DAY_UTC: ${{ github.event.inputs.day_utc || '' }}
       INPUT_RESTORE_OBSERVATIONS: ${{ github.event.inputs.restore_observations || 'true' }}
       INPUT_RESTORE_AQILEVELS: ${{ github.event.inputs.restore_aqilevels || 'true' }}
+      INPUT_RESTORE_CORE: ${{ github.event.inputs.restore_core || 'true' }}
 
     steps:
       - name: Checkout
@@ -97,7 +104,7 @@ jobs:
             exit 1
           fi
 
-          if [ "${INPUT_RESTORE_OBSERVATIONS}" != "true" ] && [ "${INPUT_RESTORE_AQILEVELS}" != "true" ]; then
+          if [ "${INPUT_RESTORE_OBSERVATIONS}" != "true" ] && [ "${INPUT_RESTORE_AQILEVELS}" != "true" ] && [ "${INPUT_RESTORE_CORE}" != "true" ]; then
             echo "At least one domain must be selected." >&2
             exit 1
           fi
@@ -188,6 +195,9 @@ jobs:
           fi
           if [ "${INPUT_RESTORE_AQILEVELS}" = "true" ]; then
             cmd+=(--domain aqilevels)
+          fi
+          if [ "${INPUT_RESTORE_CORE}" = "true" ]; then
+            cmd+=(--domain core)
           fi
 
           day_utc="${NORMALIZED_DAY_UTC:-}"

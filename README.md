@@ -137,7 +137,7 @@ Primary controls:
 - run modes:
   - `local_to_aqilevels` (Phase 1 implemented)
   - `obs_aqi_to_r2` (implemented: dry-run planning + non-dry R2 export for both `observations` and `aqilevels` domains)
-  - `source_to_all` (Phase 1 stubbed)
+  - `source_to_r2` (Phase 1 stubbed)
 - `local_to_aqilevels` behavior:
   - UTC-day backfill with newest day first
   - optional connector filter

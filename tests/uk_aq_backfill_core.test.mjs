@@ -11,7 +11,7 @@ import {
 test("parseRunMode accepts valid values and falls back on invalid", () => {
   assert.equal(parseRunMode("local_to_aqilevels", "obs_aqi_to_r2"), "local_to_aqilevels");
   assert.equal(parseRunMode("OBS_AQI_TO_R2", "local_to_aqilevels"), "obs_aqi_to_r2");
-  assert.equal(parseRunMode("", "source_to_all"), "source_to_all");
+  assert.equal(parseRunMode("", "source_to_r2"), "source_to_r2");
   assert.equal(parseRunMode("not-a-mode", "local_to_aqilevels"), "local_to_aqilevels");
 });
 

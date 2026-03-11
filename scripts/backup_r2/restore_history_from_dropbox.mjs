@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
-const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels"]);
+const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "core"]);
 
 function normalizePrefix(rawPrefix) {
   return String(rawPrefix || "").trim().replace(/^\/+|\/+$/g, "");
@@ -13,6 +13,7 @@ function normalizePrefix(rawPrefix) {
 const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
   observations: normalizePrefix(process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations"),
   aqilevels: normalizePrefix(process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels"),
+  core: normalizePrefix(process.env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core"),
 });
 
 const DEFAULT_RCLONE_BIN =
@@ -34,7 +35,7 @@ function usage() {
       "  --dest-root     Example: uk_aq_r2:uk-aq-history-cic-test",
       "",
       "Optional:",
-      "  --domain <name>              observations | aqilevels (repeatable; default both)",
+      "  --domain <name>              observations | aqilevels | core (repeatable; default all)",
       "  --day-utc <YYYY-MM-DD>       Restore only one day folder under selected domains",
       "  --rclone-bin <name>          Default: rclone",
       "  --report-out <file>          Write JSON report to file",

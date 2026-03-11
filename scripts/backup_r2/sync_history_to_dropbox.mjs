@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
-const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels"]);
+const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "core"]);
 
 function parseNonNegativeInt(rawValue, fallback) {
   const value = Number(rawValue);
@@ -26,6 +26,7 @@ function normalizePrefix(rawPrefix) {
 const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
   observations: normalizePrefix(process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations"),
   aqilevels: normalizePrefix(process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels"),
+  core: normalizePrefix(process.env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core"),
 });
 
 const DEFAULT_STATE_REL_PATH =
@@ -54,7 +55,7 @@ function usage() {
       "",
       "Optional:",
       "  --state-rel-path <path>      Default: _ops/checkpoints/r2_history_backup_state_v1.json",
-      "  --domain <name>              observations | aqilevels (repeatable)",
+      "  --domain <name>              observations | aqilevels | core (repeatable)",
       "  --max-days-per-run <N>       0 = unlimited (default 0)",
       "  --rclone-bin <name>          Default: rclone",
       "  --report-out <file>          Write JSON report to file",
@@ -296,14 +297,15 @@ function emptyDomainState() {
 }
 
 function emptyCheckpointState(nowIso) {
+  const domains = {};
+  for (const domain of DOMAIN_NAMES) {
+    domains[domain] = emptyDomainState();
+  }
   return {
     version: 1,
     created_at: nowIso,
     updated_at: nowIso,
-    domains: {
-      observations: emptyDomainState(),
-      aqilevels: emptyDomainState(),
-    },
+    domains,
   };
 }
 

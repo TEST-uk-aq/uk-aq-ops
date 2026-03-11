@@ -6,7 +6,7 @@ Current implementation status (Phase 9, incremental):
 
 - `local_to_aqilevels`: implemented.
 - `obs_aqi_to_r2`: implemented (dry-run planning + non-dry R2 export/write path).
-- `source_to_all`: partially implemented (executes local retained days via `local_to_aqilevels`, reports non-local days as pending source acquisition).
+- `source_to_r2`: partially implemented (executes local retained days via `local_to_aqilevels`, reports non-local days as pending source acquisition).
 
 ## Endpoints
 
@@ -57,7 +57,7 @@ All fields are optional unless noted.
     - `force_replace=true`: re-exports selected days/connectors and overwrites manifests.
     - run returns `error` when connector/day failures leave pending days.
 
-- `source_to_all`
+- `source_to_r2`
   - computes rolling local retention window.
   - runs `local_to_aqilevels` for retained UTC days inside that window.
   - returns `source_acquisition_pending_days` for non-local days (external acquisition/write path still pending).
@@ -72,7 +72,7 @@ All fields are optional unless noted.
 
 ## Required Environment
 
-For `local_to_aqilevels` and `source_to_all` local-write path:
+For `local_to_aqilevels` and `source_to_r2` local-write path:
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
@@ -172,7 +172,7 @@ curl -X POST "https://<cloud-run-url>/run" \
   -H "content-type: application/json" \
   -d '{
     "trigger_mode": "manual",
-    "run_mode": "source_to_all",
+    "run_mode": "source_to_r2",
     "dry_run": true,
     "from_day_utc": "2026-02-01",
     "to_day_utc": "2026-02-05",

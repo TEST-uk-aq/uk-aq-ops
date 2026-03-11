@@ -33,7 +33,7 @@ import {
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
 
-type RunMode = "local_to_aqilevels" | "obs_aqi_to_r2" | "source_to_all";
+type RunMode = "local_to_aqilevels" | "obs_aqi_to_r2" | "source_to_r2";
 type TriggerMode = "scheduler" | "manual";
 type SourceKind = "ingestdb" | "obs_aqidb" | "r2";
 type RunStatus = "ok" | "error" | "dry_run" | "stubbed";
@@ -248,7 +248,7 @@ type ObsAqiToR2Summary = {
 };
 
 type SourceToAllSummary = {
-  mode: "source_to_all";
+  mode: "source_to_r2";
   run_id: string;
   dry_run: boolean;
   from_day_utc: string;
@@ -264,7 +264,7 @@ type SourceToAllSummary = {
 };
 
 type StubModeSummary = {
-  mode: "obs_aqi_to_r2" | "source_to_all";
+  mode: "obs_aqi_to_r2" | "source_to_r2";
   run_id: string;
   stubbed: true;
   message: string;
@@ -4086,7 +4086,7 @@ async function runSourceToAll(
   }
 
   return {
-    mode: "source_to_all",
+    mode: "source_to_r2",
     run_id: runId,
     dry_run: DRY_RUN,
     from_day_utc: window.from_day_utc,
@@ -4152,7 +4152,7 @@ async function main(): Promise<void> {
       const localErrors = summary.local_to_aqilevels_summary?.connector_day_error || 0;
       if (localErrors > 0) {
         runStatus = "error";
-        errorMessage = `source_to_all local_to_aqilevels encountered ${localErrors} connector-day errors`;
+        errorMessage = `source_to_r2 local_to_aqilevels encountered ${localErrors} connector-day errors`;
       } else if (!DRY_RUN && summary.source_acquisition_pending_days.length > 0) {
         runStatus = "stubbed";
       } else {
