@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME || 'uk-aq-aqi-history-r2-api' }}
-      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
-      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN }}
+      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,17 +27,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN}" ]; then
-            echo "Missing secret UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN (or fallback UK_AQ_CACHE_CLOUDFLARE_API_TOKEN)."
+            echo "Missing secret UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN (or fallback CLOUDFLARE_API_TOKEN)."
             exit 1
           fi
           if [ -z "${UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID}" ]; then
-            echo "Missing variable UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID (or fallback UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID)."
+            echo "Missing variable UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID (or fallback CLOUDFLARE_ACCOUNT_ID)."
             exit 1
           fi
           if [ -z "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" ]; then
             echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
             exit 1
           fi
+          echo "Deploy target worker: ${UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME}"
+          echo "Cloudflare account id: ${UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID}"
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
@@ -75,3 +77,15 @@ jobs:
           accountId: ${{ env.UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_aqi_history_r2_api_worker
           command: deploy --name ${{ env.UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME }}
+
+      - name: Print Wrangler logs on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          latest_log="$(ls -1t "${HOME}/.config/.wrangler/logs"/wrangler-*.log 2>/dev/null | head -n 1 || true)"
+          if [ -n "${latest_log}" ] && [ -f "${latest_log}" ]; then
+            echo "Last Wrangler log: ${latest_log}"
+            sed -n '1,220p' "${latest_log}" || true
+          else
+            echo "No Wrangler log file found under ~/.config/.wrangler/logs"
+          fi
