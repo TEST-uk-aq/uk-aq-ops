@@ -38,6 +38,14 @@ jobs:
             echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
             exit 1
           fi
+          if [ -z "${{ vars.OBS_AQIDB_SUPABASE_URL }}" ]; then
+            echo "Missing variable OBS_AQIDB_SUPABASE_URL."
+            exit 1
+          fi
+          if [ -z "${{ secrets.OBS_AQIDB_SECRET_KEY }}" ]; then
+            echo "Missing secret OBS_AQIDB_SECRET_KEY."
+            exit 1
+          fi
           echo "Deploy target worker: ${UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME}"
           echo "Cloudflare account id: ${UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID}"
 
@@ -58,7 +66,9 @@ jobs:
           set -euo pipefail
           secrets_json="$(jq -n \
             --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" \
-            '{UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET} | with_entries(select(.value != ""))')"
+            --arg OBS_AQIDB_SUPABASE_URL "${{ vars.OBS_AQIDB_SUPABASE_URL }}" \
+            --arg OBS_AQIDB_SECRET_KEY "${{ secrets.OBS_AQIDB_SECRET_KEY }}" \
+            '{UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
             if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME}"; then
               exit 0

@@ -1,6 +1,9 @@
 # UK AQ AQI History R2 API Worker
 
-Cloudflare Worker for historical AQI reads from R2 History.
+Cloudflare Worker for AQI history reads with stitched sources:
+
+- recent data from `obs_aqidb` (`uk_aq_public.uk_aq_station_aqi_hourly`)
+- older data from R2 History
 
 Routes:
 
@@ -39,14 +42,22 @@ R2 paths expected:
 
 Serving rule:
 
-- a UTC day is served only when the day manifest exists (committed history rule).
-- no `_SUCCESS` marker or loose parquet scan fallback is used.
+- Recent period uses ObsAQIDB (default last 7 days).
+- Older period uses committed R2 day manifests:
+  - a UTC day is served only when the day manifest exists.
+  - no `_SUCCESS` marker or loose parquet scan fallback is used.
+- Overlapping timestamps are de-duplicated with ObsAQIDB as source-of-truth.
+
+Required runtime secrets for stitched mode:
+
+- `OBS_AQIDB_SUPABASE_URL`
+- `OBS_AQIDB_SECRET_KEY`
 
 Response:
 
 - returns hourly points sorted by `period_start_utc` ascending:
   - `{ period_start_utc, daqi_index_level, eaqi_index_level, station_id }`
-- includes coverage diagnostics (`missing_day_manifest_keys`, etc.).
+- includes source and coverage diagnostics (history + obs_aqidb windows/counts).
 - sets `x-ukaq-cache: HIT|MISS`.
 
 ## Deploy (manual)

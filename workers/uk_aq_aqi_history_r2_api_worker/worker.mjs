@@ -6,6 +6,13 @@ const DEFAULT_CACHE_SECONDS = 300;
 const MAX_CACHE_SECONDS = 3600;
 const MAX_LIMIT = 20000;
 const MAX_RANGE_DAYS = 366;
+const DEFAULT_OBSAQIDB_SOURCE_OF_TRUTH_HOURS = 24 * 7;
+const MAX_OBSAQIDB_SOURCE_OF_TRUTH_HOURS = MAX_RANGE_DAYS * 24;
+const DEFAULT_OBSAQIDB_TIMEOUT_MS = 10000;
+const MIN_OBSAQIDB_TIMEOUT_MS = 2000;
+const MAX_OBSAQIDB_TIMEOUT_MS = 30000;
+const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
+const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set(["/", "/v1/aqi-history"]);
@@ -20,6 +27,10 @@ function corsHeaders() {
 
 function normalizePrefix(raw) {
   return String(raw || "").trim().replace(/^\/+|\/+$/g, "");
+}
+
+function normalizeBaseUrl(raw) {
+  return String(raw || "").trim().replace(/\/+$/, "");
 }
 
 function parsePositiveInt(raw, fallback, min = 1, max = 100000) {
@@ -217,6 +228,30 @@ function maxFiniteIndex(values, maxValue) {
   return Math.max(1, Math.min(maxValue, Math.trunc(out)));
 }
 
+function buildEmptyHistoryRead() {
+  return {
+    points: [],
+    days_scanned: 0,
+    scanned_connector_manifests: 0,
+    scanned_parquet_files: 0,
+    missing_day_manifest_keys: [],
+    missing_connector_manifest_keys: [],
+    missing_parquet_keys: [],
+  };
+}
+
+function normalizeAndSortRows(rowsByPeriodStart, limit) {
+  const rows = Array.from(rowsByPeriodStart.values()).sort((left, right) => {
+    const leftMs = Date.parse(String(left.period_start_utc || "")) || 0;
+    const rightMs = Date.parse(String(right.period_start_utc || "")) || 0;
+    return leftMs - rightMs;
+  });
+  if (limit !== null && rows.length > limit) {
+    return rows.slice(rows.length - limit);
+  }
+  return rows;
+}
+
 function appendFilteredRows(rows, {
   stationId,
   startMs,
@@ -266,18 +301,6 @@ function appendFilteredRows(rows, {
       station_id: rowStationId,
     });
   }
-}
-
-function normalizeAndSortRows(rowsByPeriodStart, limit) {
-  const rows = Array.from(rowsByPeriodStart.values()).sort((left, right) => {
-    const leftMs = Date.parse(String(left.period_start_utc || "")) || 0;
-    const rightMs = Date.parse(String(right.period_start_utc || "")) || 0;
-    return leftMs - rightMs;
-  });
-  if (limit !== null && rows.length > limit) {
-    return rows.slice(rows.length - limit);
-  }
-  return rows;
 }
 
 async function readHistoryRows({
@@ -364,6 +387,145 @@ async function readHistoryRows({
     missing_connector_manifest_keys: Array.from(missingConnectorManifestKeys.values()),
     missing_parquet_keys: Array.from(missingParquetKeys.values()),
   };
+}
+
+async function readRecentRowsFromObsAqiDb({
+  env,
+  stationId,
+  startIso,
+  endIso,
+  sinceIso,
+}) {
+  const baseUrl = normalizeBaseUrl(env.OBS_AQIDB_SUPABASE_URL || "");
+  const apiKey = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
+  if (!baseUrl || !apiKey) {
+    throw new Error(
+      "Missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY for recent AQI reads.",
+    );
+  }
+
+  const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim()
+    || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
+  const timeoutMs = parsePositiveInt(
+    env.UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS,
+    DEFAULT_OBSAQIDB_TIMEOUT_MS,
+    MIN_OBSAQIDB_TIMEOUT_MS,
+    MAX_OBSAQIDB_TIMEOUT_MS,
+  );
+
+  const endpoint = new URL(`${baseUrl}/rest/v1/uk_aq_station_aqi_hourly`);
+  endpoint.searchParams.set(
+    "select",
+    [
+      "station_id",
+      "timestamp_hour_utc",
+      "daqi_no2_index_level",
+      "daqi_pm25_rolling24h_index_level",
+      "daqi_pm10_rolling24h_index_level",
+      "eaqi_no2_index_level",
+      "eaqi_pm25_index_level",
+      "eaqi_pm10_index_level",
+    ].join(","),
+  );
+  endpoint.searchParams.append("station_id", `eq.${stationId}`);
+  endpoint.searchParams.append(
+    "timestamp_hour_utc",
+    `gte.${startIso}`,
+  );
+  endpoint.searchParams.append(
+    "timestamp_hour_utc",
+    `lt.${endIso}`,
+  );
+  if (sinceIso) {
+    endpoint.searchParams.append(
+      "timestamp_hour_utc",
+      `gt.${sinceIso}`,
+    );
+  }
+  endpoint.searchParams.set("order", "timestamp_hour_utc.asc");
+  endpoint.searchParams.set("limit", String(MAX_LIMIT));
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        apikey: apiKey,
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+        "Accept-Profile": schema,
+        "x-ukaq-egress-caller": "uk_aq_aqi_history_r2_api_worker",
+      },
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("ObsAQIDB request timed out.");
+    }
+    throw new Error(`ObsAQIDB request failed: ${String(error)}`);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const responseText = await response.text();
+  let payload = null;
+  try {
+    payload = responseText ? JSON.parse(responseText) : null;
+  } catch (_error) {
+    payload = null;
+  }
+  if (!response.ok || !Array.isArray(payload)) {
+    const message = payload && typeof payload === "object"
+      ? (payload.message || payload.error || payload.hint || JSON.stringify(payload))
+      : responseText;
+    throw new Error(
+      `ObsAQIDB response failed (${response.status}): ${String(message || "unknown error")}`,
+    );
+  }
+
+  const rowsByPeriodStart = new Map();
+  appendFilteredRows(payload, {
+    stationId,
+    startMs: Date.parse(startIso),
+    endMs: Date.parse(endIso),
+    sinceMs: sinceIso ? Date.parse(sinceIso) : Number.NaN,
+    outByPeriodStart: rowsByPeriodStart,
+  });
+
+  return {
+    source_path: `${schema}.uk_aq_station_aqi_hourly`,
+    points: normalizeAndSortRows(rowsByPeriodStart, null),
+  };
+}
+
+function mergePointsPreferRecent(historyPoints, recentPoints, limit) {
+  const merged = new Map();
+  for (const point of historyPoints) {
+    const key = String(point?.period_start_utc || "").trim();
+    if (!key) {
+      continue;
+    }
+    merged.set(key, point);
+  }
+  // Recent ObsAQIDB rows are source of truth and overwrite overlapping R2 rows.
+  for (const point of recentPoints) {
+    const key = String(point?.period_start_utc || "").trim();
+    if (!key) {
+      continue;
+    }
+    merged.set(key, point);
+  }
+  const rows = Array.from(merged.values()).sort((left, right) => {
+    const leftMs = Date.parse(String(left.period_start_utc || "")) || 0;
+    const rightMs = Date.parse(String(right.period_start_utc || "")) || 0;
+    return leftMs - rightMs;
+  });
+  if (limit !== null && rows.length > limit) {
+    return rows.slice(rows.length - limit);
+  }
+  return rows;
 }
 
 function resolveTimeRange(url) {
@@ -470,21 +632,62 @@ async function handleRequest(request, env) {
     30,
     MAX_CACHE_SECONDS,
   );
+  const obsAqiDbSourceOfTruthHours = parsePositiveInt(
+    env.UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS,
+    DEFAULT_OBSAQIDB_SOURCE_OF_TRUTH_HOURS,
+    1,
+    MAX_OBSAQIDB_SOURCE_OF_TRUTH_HOURS,
+  );
 
-  const historyRead = await readHistoryRows({
-    env,
-    historyPrefix,
-    stationId,
-    startIso,
-    endIso,
-    sinceIso,
-    limit,
-  });
+  const nowMs = Date.now();
+  const startMs = Date.parse(startIso);
+  const endMs = Date.parse(endIso);
+  const splitBoundaryMs = nowMs - obsAqiDbSourceOfTruthHours * HOUR_MS;
+  const splitBoundaryIso = new Date(splitBoundaryMs).toISOString();
+
+  const historyStartMs = startMs;
+  const historyEndMs = endMs < splitBoundaryMs ? endMs : splitBoundaryMs;
+  const recentStartMs = startMs > splitBoundaryMs ? startMs : splitBoundaryMs;
+  const recentEndMs = endMs;
+  const hasHistoryWindow = historyEndMs > historyStartMs;
+  const hasRecentWindow = recentEndMs > recentStartMs;
+
+  const historyRead = hasHistoryWindow
+    ? await readHistoryRows({
+      env,
+      historyPrefix,
+      stationId,
+      startIso: new Date(historyStartMs).toISOString(),
+      endIso: new Date(historyEndMs).toISOString(),
+      sinceIso,
+      limit: null,
+    })
+    : buildEmptyHistoryRead();
+
+  const recentRead = hasRecentWindow
+    ? await readRecentRowsFromObsAqiDb({
+      env,
+      stationId,
+      startIso: new Date(recentStartMs).toISOString(),
+      endIso: new Date(recentEndMs).toISOString(),
+      sinceIso,
+    })
+    : { source_path: null, points: [] };
+
+  const points = mergePointsPreferRecent(historyRead.points, recentRead.points, limit);
+  const source = hasHistoryWindow && hasRecentWindow
+    ? "obs_aqidb_history_stitched"
+    : hasRecentWindow
+    ? "obs_aqidb_only"
+    : "history_only";
 
   return jsonResponse({
     ok: true,
     generated_at_utc: new Date().toISOString(),
     history_prefix: historyPrefix,
+    source,
+    source_split_boundary_utc: splitBoundaryIso,
+    source_of_truth_hours: obsAqiDbSourceOfTruthHours,
     scope,
     grain,
     entity_id: String(stationId),
@@ -492,8 +695,8 @@ async function handleRequest(request, env) {
     query_from_utc: startIso,
     query_to_utc: endIso,
     since_utc: sinceIso,
-    row_count: historyRead.points.length,
-    points: historyRead.points,
+    row_count: points.length,
+    points,
     coverage: {
       days_scanned: historyRead.days_scanned,
       scanned_connector_manifests: historyRead.scanned_connector_manifests,
@@ -501,6 +704,12 @@ async function handleRequest(request, env) {
       missing_day_manifest_keys: historyRead.missing_day_manifest_keys,
       missing_connector_manifest_keys: historyRead.missing_connector_manifest_keys,
       missing_parquet_keys: historyRead.missing_parquet_keys,
+      obs_aqidb_source_path: recentRead.source_path,
+      obs_aqidb_row_count: recentRead.points.length,
+      history_window_from_utc: hasHistoryWindow ? new Date(historyStartMs).toISOString() : null,
+      history_window_to_utc: hasHistoryWindow ? new Date(historyEndMs).toISOString() : null,
+      obs_aqidb_window_from_utc: hasRecentWindow ? new Date(recentStartMs).toISOString() : null,
+      obs_aqidb_window_to_utc: hasRecentWindow ? new Date(recentEndMs).toISOString() : null,
     },
   }, {
     status: 200,
