@@ -4,6 +4,7 @@ import {
   HISTORY_OBSERVATIONS_COLUMNS_V2,
   buildConnectorManifestForTest,
   computeDayGateState,
+  resolvePhaseBRuntimeConfig,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 test("connector manifest includes expected Phase B fields", () => {
@@ -66,4 +67,10 @@ test("day gate is only complete when all connector candidates are complete", () 
   assert.equal(completeState.pending, 0);
   assert.equal(completeState.in_progress, 0);
   assert.equal(completeState.failed, 0);
+});
+
+test("runtime config includes AQI levels prefix defaults", () => {
+  const config = resolvePhaseBRuntimeConfig({});
+  assert.equal(config.committed_prefix, "history/v1/observations");
+  assert.equal(config.aqilevels_prefix, "history/v1/aqilevels");
 });

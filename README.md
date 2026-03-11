@@ -35,7 +35,8 @@ Cloudflare edge workers in this repo:
 - verifies hourly fingerprints (ingest vs `obs_aqidb` `uk_aq_observs`)
 - prunes only verified ingest hour buckets
 - can repair mismatches through outbox replay before re-check
-- Phase B R2 History export uses server-side projection + resume checkpoints so failed exports can continue without re-reading completed parts
+- Phase B R2 History export writes both `observations` and `aqilevels` domains (AQI export follows completed observation days and fills missing AQI day manifests)
+- observations export uses server-side projection + resume checkpoints so failed exports can continue without re-reading completed parts
 
 Required env:
 
@@ -64,6 +65,7 @@ Primary controls:
 - `UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS` (default `7`)
 - `UK_AQ_R2_HISTORY_STAGING_PREFIX` (default `history/v1/_ops/observations/staging`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
 - `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
 

@@ -22,14 +22,22 @@ const DEFAULT_PART_MAX_ROWS = 1_000_000;
 const DEFAULT_CURSOR_FETCH_ROWS = 20_000;
 const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
+const DEFAULT_AQILEVELS_SOURCE_MAX_PAGES = 50_000;
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
 const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
 const DEFAULT_COMMITTED_PREFIX = "history/v1/observations";
+const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels";
 const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 
 const HISTORY_SCHEMA_NAME = "observations";
 const HISTORY_SCHEMA_VERSION = 2;
 const WRITER_VERSION = "parquet-wasm-zstd-v2";
+const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels";
+const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
+const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v1";
+const AQILEVELS_CONNECTOR_COUNTS_RPC = "uk_aq_rpc_aqilevels_history_day_connector_counts";
+const AQILEVELS_ROWS_RPC = "uk_aq_rpc_aqilevels_history_day_rows";
+const DEFAULT_RPC_SCHEMA = "uk_aq_public";
 
 export const HISTORY_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
   "connector_id",
@@ -46,6 +54,25 @@ export const HISTORY_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
   "value",
 ]);
 const HISTORY_OBSERVATIONS_COLUMNS = HISTORY_OBSERVATIONS_COLUMNS_V2;
+const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
+  "connector_id",
+  "station_id",
+  "timestamp_hour_utc",
+  "no2_hourly_mean_ugm3",
+  "pm25_hourly_mean_ugm3",
+  "pm10_hourly_mean_ugm3",
+  "pm25_rolling24h_mean_ugm3",
+  "pm10_rolling24h_mean_ugm3",
+  "no2_hourly_sample_count",
+  "pm25_hourly_sample_count",
+  "pm10_hourly_sample_count",
+  "daqi_no2_index_level",
+  "daqi_pm25_rolling24h_index_level",
+  "daqi_pm10_rolling24h_index_level",
+  "eaqi_no2_index_level",
+  "eaqi_pm25_index_level",
+  "eaqi_pm10_index_level",
+]);
 
 let parquetWasmInitialized = false;
 
@@ -88,6 +115,17 @@ function parseBigInt(value, fieldName) {
   } catch {
     throw new Error(`Invalid bigint for ${fieldName}: ${String(value)}`);
   }
+}
+
+function readResponseTextLimit(text, limit = 1000) {
+  if (typeof text !== "string") {
+    return "";
+  }
+  return text.length <= limit ? text : `${text.slice(0, limit)}...`;
+}
+
+function normalizeBaseUrl(raw) {
+  return String(raw || "").trim().replace(/\/+$/, "");
 }
 
 function normalizeDayUtc(value) {
@@ -240,6 +278,41 @@ async function withPgClient(connectionString, fn) {
   } finally {
     await client.end();
   }
+}
+
+async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payload }) {
+  const endpoint = `${normalizeBaseUrl(baseUrl)}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      apikey: privilegedKey,
+      Authorization: `Bearer ${privilegedKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "Accept-Profile": rpcSchema,
+      "Content-Profile": rpcSchema,
+    },
+    body: JSON.stringify(payload ?? {}),
+  });
+
+  const text = await response.text();
+  let parsed = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+  }
+
+  if (!response.ok) {
+    const message = parsed && typeof parsed === "object" && parsed.message
+      ? String(parsed.message)
+      : readResponseTextLimit(text);
+    throw new Error(`PostgREST RPC ${rpcName} failed (${response.status}): ${message}`);
+  }
+
+  return parsed;
 }
 
 function toResumePartEntry(value, index) {
@@ -869,22 +942,115 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
   });
 }
 
+function createAqilevelConnectorManifest({
+  dayUtc,
+  connectorId,
+  runId,
+  sourceRowCount,
+  minTimestampHourUtc,
+  maxTimestampHourUtc,
+  fileEntries,
+  writerGitSha,
+  backedUpAtUtc,
+}) {
+  const parquetObjectKeys = fileEntries.map((entry) => entry.key);
+  const totalBytes = fileEntries.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const stats = statsFromFileEntries(fileEntries, sourceRowCount);
+
+  return withManifestHash({
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    run_id: runId,
+    source_row_count: Number(sourceRowCount),
+    min_timestamp_hour_utc: minTimestampHourUtc,
+    max_timestamp_hour_utc: maxTimestampHourUtc,
+    parquet_object_keys: parquetObjectKeys,
+    file_count: fileEntries.length,
+    total_bytes: totalBytes,
+    files: fileEntries,
+    history_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
+    history_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
+    columns: HISTORY_AQILEVELS_COLUMNS,
+    writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
+    writer_git_sha: writerGitSha,
+    ...stats,
+    backed_up_at_utc: backedUpAtUtc,
+  });
+}
+
+function createAqilevelDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, backedUpAtUtc }) {
+  const files = connectorManifests.flatMap((manifest) =>
+    (Array.isArray(manifest.files) ? manifest.files : []).map((entry) => ({
+      connector_id: manifest.connector_id,
+      key: entry.key,
+      bytes: entry.bytes,
+      row_count: entry.row_count,
+      etag_or_hash: entry.etag_or_hash,
+    }))
+  );
+
+  const parquetObjectKeys = uniqueSorted(files.map((entry) => entry.key));
+  const totalRows = connectorManifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
+  const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
+  const connectorIds = connectorManifests.map((manifest) => Number(manifest.connector_id));
+
+  const minTimestampHourUtc = connectorManifests.reduce(
+    (current, manifest) => minIso(current, manifest.min_timestamp_hour_utc || null),
+    null,
+  );
+  const maxTimestampHourUtc = connectorManifests.reduce(
+    (current, manifest) => maxIso(current, manifest.max_timestamp_hour_utc || null),
+    null,
+  );
+
+  const stats = statsFromFileEntries(files, totalRows);
+
+  return withManifestHash({
+    day_utc: dayUtc,
+    connector_id: null,
+    connector_ids: connectorIds,
+    run_id: runId,
+    source_row_count: totalRows,
+    min_timestamp_hour_utc: minTimestampHourUtc,
+    max_timestamp_hour_utc: maxTimestampHourUtc,
+    parquet_object_keys: parquetObjectKeys,
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    connector_manifests: connectorManifests.map((manifest) => ({
+      connector_id: manifest.connector_id,
+      manifest_key: manifest.manifest_key,
+      source_row_count: manifest.source_row_count,
+      file_count: manifest.file_count,
+      total_bytes: manifest.total_bytes,
+    })),
+    history_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
+    history_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
+    columns: HISTORY_AQILEVELS_COLUMNS,
+    writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
+    writer_git_sha: writerGitSha,
+    ...stats,
+    backed_up_at_utc: backedUpAtUtc,
+  });
+}
+
 const PARQUET_WRITER_PROPERTIES_CACHE = new Map();
 
-function parquetWriterProperties(rowGroupSize) {
+function parquetWriterProperties(rowGroupSize, createdBy = WRITER_VERSION) {
   const key = Number(rowGroupSize);
-  if (PARQUET_WRITER_PROPERTIES_CACHE.has(key)) {
-    return PARQUET_WRITER_PROPERTIES_CACHE.get(key);
+  const cacheKey = `${key}:${createdBy}`;
+  if (PARQUET_WRITER_PROPERTIES_CACHE.has(cacheKey)) {
+    return PARQUET_WRITER_PROPERTIES_CACHE.get(cacheKey);
   }
 
   ensureParquetWasmInitialized();
   const writerProperties = new parquetWasm.WriterPropertiesBuilder()
     .setCompression(parquetWasm.Compression.ZSTD)
     .setMaxRowGroupSize(key)
-    .setCreatedBy(WRITER_VERSION)
+    .setCreatedBy(createdBy)
     .build();
 
-  PARQUET_WRITER_PROPERTIES_CACHE.set(key, writerProperties);
+  PARQUET_WRITER_PROPERTIES_CACHE.set(cacheKey, writerProperties);
   return writerProperties;
 }
 
@@ -895,6 +1061,33 @@ function rowsToParquetBuffer(rows, writerProperties) {
     timeseries_id: Int32Array.from(rows.map((row) => Number(row.timeseries_id))),
     observed_at: rows.map((row) => new Date(row.observed_at)),
     value: rows.map((row) => (row.value === null || row.value === undefined ? null : Number(row.value))),
+  });
+
+  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
+  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
+  return Buffer.from(parquetBytes);
+}
+
+function rowsToAqilevelParquetBuffer(rows, writerProperties) {
+  ensureParquetWasmInitialized();
+  const table = arrow.tableFromArrays({
+    connector_id: rows.map((row) => Number(row.connector_id)),
+    station_id: rows.map((row) => Number(row.station_id)),
+    timestamp_hour_utc: rows.map((row) => new Date(row.timestamp_hour_utc)),
+    no2_hourly_mean_ugm3: rows.map((row) => row.no2_hourly_mean_ugm3),
+    pm25_hourly_mean_ugm3: rows.map((row) => row.pm25_hourly_mean_ugm3),
+    pm10_hourly_mean_ugm3: rows.map((row) => row.pm10_hourly_mean_ugm3),
+    pm25_rolling24h_mean_ugm3: rows.map((row) => row.pm25_rolling24h_mean_ugm3),
+    pm10_rolling24h_mean_ugm3: rows.map((row) => row.pm10_rolling24h_mean_ugm3),
+    no2_hourly_sample_count: rows.map((row) => row.no2_hourly_sample_count),
+    pm25_hourly_sample_count: rows.map((row) => row.pm25_hourly_sample_count),
+    pm10_hourly_sample_count: rows.map((row) => row.pm10_hourly_sample_count),
+    daqi_no2_index_level: rows.map((row) => row.daqi_no2_index_level),
+    daqi_pm25_rolling24h_index_level: rows.map((row) => row.daqi_pm25_rolling24h_index_level),
+    daqi_pm10_rolling24h_index_level: rows.map((row) => row.daqi_pm10_rolling24h_index_level),
+    eaqi_no2_index_level: rows.map((row) => row.eaqi_no2_index_level),
+    eaqi_pm25_index_level: rows.map((row) => row.eaqi_pm25_index_level),
+    eaqi_pm10_index_level: rows.map((row) => row.eaqi_pm10_index_level),
   });
 
   const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
@@ -1156,6 +1349,522 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
   };
 }
 
+function toAqilevelConnectorCountRow(row) {
+  const expectedRowCountValue = row.expected_row_count === undefined
+    ? row.row_count
+    : row.expected_row_count;
+  return {
+    connector_id: Number(row.connector_id),
+    expected_row_count: parseBigInt(expectedRowCountValue, "aqi_expected_row_count"),
+    min_timestamp_hour_utc: row.min_timestamp_hour_utc
+      ? new Date(row.min_timestamp_hour_utc).toISOString()
+      : null,
+    max_timestamp_hour_utc: row.max_timestamp_hour_utc
+      ? new Date(row.max_timestamp_hour_utc).toISOString()
+      : null,
+  };
+}
+
+function hasAqilevelSourceConfig(runtime) {
+  const source = runtime?.aqilevels_source || {};
+  return Boolean(
+    String(source.base_url || "").trim()
+    && String(source.privileged_key || "").trim()
+    && String(source.rpc_schema || "").trim()
+    && String(source.connector_counts_rpc || "").trim()
+    && String(source.rows_rpc || "").trim(),
+  );
+}
+
+function normalizeAqilevelHistoryRow(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) {
+    return null;
+  }
+  const parsed = {
+    station_id: Number(row.station_id),
+    timestamp_hour_utc: row.timestamp_hour_utc ? new Date(row.timestamp_hour_utc).toISOString() : null,
+    no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3 === null || row.no2_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.no2_hourly_mean_ugm3),
+    pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3 === null || row.pm25_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm25_hourly_mean_ugm3),
+    pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3 === null || row.pm10_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm10_hourly_mean_ugm3),
+    pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3 === null || row.pm25_rolling24h_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm25_rolling24h_mean_ugm3),
+    pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3 === null || row.pm10_rolling24h_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm10_rolling24h_mean_ugm3),
+    no2_hourly_sample_count: row.no2_hourly_sample_count === null || row.no2_hourly_sample_count === undefined
+      ? null
+      : Number(row.no2_hourly_sample_count),
+    pm25_hourly_sample_count: row.pm25_hourly_sample_count === null || row.pm25_hourly_sample_count === undefined
+      ? null
+      : Number(row.pm25_hourly_sample_count),
+    pm10_hourly_sample_count: row.pm10_hourly_sample_count === null || row.pm10_hourly_sample_count === undefined
+      ? null
+      : Number(row.pm10_hourly_sample_count),
+    daqi_no2_index_level: row.daqi_no2_index_level === null || row.daqi_no2_index_level === undefined
+      ? null
+      : Number(row.daqi_no2_index_level),
+    daqi_pm25_rolling24h_index_level: row.daqi_pm25_rolling24h_index_level === null
+      || row.daqi_pm25_rolling24h_index_level === undefined
+      ? null
+      : Number(row.daqi_pm25_rolling24h_index_level),
+    daqi_pm10_rolling24h_index_level: row.daqi_pm10_rolling24h_index_level === null
+      || row.daqi_pm10_rolling24h_index_level === undefined
+      ? null
+      : Number(row.daqi_pm10_rolling24h_index_level),
+    eaqi_no2_index_level: row.eaqi_no2_index_level === null || row.eaqi_no2_index_level === undefined
+      ? null
+      : Number(row.eaqi_no2_index_level),
+    eaqi_pm25_index_level: row.eaqi_pm25_index_level === null || row.eaqi_pm25_index_level === undefined
+      ? null
+      : Number(row.eaqi_pm25_index_level),
+    eaqi_pm10_index_level: row.eaqi_pm10_index_level === null || row.eaqi_pm10_index_level === undefined
+      ? null
+      : Number(row.eaqi_pm10_index_level),
+  };
+
+  if (!Number.isFinite(parsed.station_id) || parsed.station_id <= 0 || !parsed.timestamp_hour_utc) {
+    return null;
+  }
+  return parsed;
+}
+
+async function fetchAqilevelConnectorCounts(runtime, dayUtc) {
+  const payload = await postgrestRpc({
+    baseUrl: runtime.aqilevels_source.base_url,
+    privilegedKey: runtime.aqilevels_source.privileged_key,
+    rpcSchema: runtime.aqilevels_source.rpc_schema,
+    rpcName: runtime.aqilevels_source.connector_counts_rpc,
+    payload: {
+      p_day_utc: dayUtc,
+      p_connector_ids: null,
+    },
+  });
+
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  return payload
+    .map(toAqilevelConnectorCountRow)
+    .filter((row) => Number.isInteger(row.connector_id) && row.connector_id > 0 && row.expected_row_count > 0n);
+}
+
+async function fetchAqilevelRowsPage(runtime, { dayUtc, connectorId, afterStationId, afterTimestampHourUtc, limit }) {
+  const payload = await postgrestRpc({
+    baseUrl: runtime.aqilevels_source.base_url,
+    privilegedKey: runtime.aqilevels_source.privileged_key,
+    rpcSchema: runtime.aqilevels_source.rpc_schema,
+    rpcName: runtime.aqilevels_source.rows_rpc,
+    payload: {
+      p_day_utc: dayUtc,
+      p_connector_id: connectorId,
+      p_after_station_id: afterStationId,
+      p_after_timestamp_hour_utc: afterTimestampHourUtc,
+      p_limit: limit,
+    },
+  });
+
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  const normalized = [];
+  for (const row of payload) {
+    const parsed = normalizeAqilevelHistoryRow(row);
+    if (parsed) {
+      normalized.push(parsed);
+    }
+  }
+  return normalized;
+}
+
+async function fetchAqilevelCandidateDays(client, latestEligibleDayUtc, scanLimit) {
+  const sql = `
+select g.day_utc::text as day_utc
+from uk_aq_ops.prune_day_gates g
+where g.history_done is true
+  and g.day_utc <= $1::date
+order by g.day_utc desc
+limit $2
+`;
+  const result = await client.query(sql, [latestEligibleDayUtc, scanLimit]);
+  return result.rows.map((row) => normalizeDayUtc(row.day_utc)).filter(Boolean);
+}
+
+async function discoverPendingAqilevelDays({ client, runtime, latestEligibleDayUtc }) {
+  const scanLimit = Math.max(runtime.max_candidates_per_run * 4, runtime.max_candidates_per_run);
+  const candidates = await fetchAqilevelCandidateDays(client, latestEligibleDayUtc, scanLimit);
+  const pending = [];
+
+  for (const dayUtc of candidates) {
+    const manifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
+    const head = await r2HeadObject({ r2: runtime.r2, key: manifestKey });
+    if (!head.exists) {
+      pending.push(dayUtc);
+    }
+    if (pending.length >= runtime.max_candidates_per_run) {
+      break;
+    }
+  }
+
+  return uniqueSorted(pending);
+}
+
+async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
+  const connectorId = Number(connector.connector_id);
+  const expectedRowCount = connector.expected_row_count;
+  const fileEntries = [];
+  let partIndex = 0;
+  let pendingRows = [];
+  let observedRows = 0n;
+  let totalBytes = 0n;
+  let minTimestampHourUtc = null;
+  let maxTimestampHourUtc = null;
+  let cursorAfterStationId = null;
+  let cursorAfterTimestampHourUtc = null;
+  let pageCount = 0;
+
+  const flushPart = async () => {
+    if (!pendingRows.length) {
+      return;
+    }
+    const partRows = pendingRows;
+    pendingRows = [];
+
+    const partKey = buildPartKey(runtime.aqilevels_prefix, dayUtc, connectorId, partIndex);
+    const parquetBuffer = rowsToAqilevelParquetBuffer(
+      partRows,
+      parquetWriterProperties(runtime.row_group_size, HISTORY_AQILEVELS_WRITER_VERSION),
+    );
+    const putResult = await r2PutObject({
+      r2: runtime.r2,
+      key: partKey,
+      body: parquetBuffer,
+      content_type: "application/octet-stream",
+    });
+    const head = await r2HeadObject({ r2: runtime.r2, key: partKey });
+    if (!head.exists) {
+      throw new Error(`Missing AQI committed object after write: ${partKey}`);
+    }
+    const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
+      ? Math.trunc(head.bytes)
+      : Math.trunc(putResult.bytes);
+    const etagOrHash = head.etag || putResult.etag || null;
+
+    fileEntries.push({
+      key: partKey,
+      row_count: partRows.length,
+      bytes,
+      etag_or_hash: etagOrHash,
+    });
+    partIndex += 1;
+    observedRows += BigInt(partRows.length);
+    totalBytes += BigInt(bytes);
+  };
+
+  for (;;) {
+    pageCount += 1;
+    if (pageCount > runtime.aqilevels_source_max_pages) {
+      throw new Error(
+        `AQI source RPC exceeded max pages (${runtime.aqilevels_source_max_pages}) for day=${dayUtc} connector=${connectorId}`,
+      );
+    }
+
+    const pageRows = await fetchAqilevelRowsPage(runtime, {
+      dayUtc,
+      connectorId,
+      afterStationId: cursorAfterStationId,
+      afterTimestampHourUtc: cursorAfterTimestampHourUtc,
+      limit: runtime.cursor_fetch_rows,
+    });
+    if (!pageRows.length) {
+      break;
+    }
+
+    for (const row of pageRows) {
+      if (!minTimestampHourUtc || row.timestamp_hour_utc < minTimestampHourUtc) {
+        minTimestampHourUtc = row.timestamp_hour_utc;
+      }
+      if (!maxTimestampHourUtc || row.timestamp_hour_utc > maxTimestampHourUtc) {
+        maxTimestampHourUtc = row.timestamp_hour_utc;
+      }
+
+      pendingRows.push({
+        connector_id: connectorId,
+        station_id: row.station_id,
+        timestamp_hour_utc: row.timestamp_hour_utc,
+        no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3,
+        pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3,
+        pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3,
+        pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3,
+        pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3,
+        no2_hourly_sample_count: row.no2_hourly_sample_count,
+        pm25_hourly_sample_count: row.pm25_hourly_sample_count,
+        pm10_hourly_sample_count: row.pm10_hourly_sample_count,
+        daqi_no2_index_level: row.daqi_no2_index_level,
+        daqi_pm25_rolling24h_index_level: row.daqi_pm25_rolling24h_index_level,
+        daqi_pm10_rolling24h_index_level: row.daqi_pm10_rolling24h_index_level,
+        eaqi_no2_index_level: row.eaqi_no2_index_level,
+        eaqi_pm25_index_level: row.eaqi_pm25_index_level,
+        eaqi_pm10_index_level: row.eaqi_pm10_index_level,
+      });
+
+      if (pendingRows.length >= runtime.part_max_rows) {
+        await flushPart();
+      }
+    }
+
+    const last = pageRows[pageRows.length - 1];
+    const nextAfterStationId = Number(last.station_id);
+    const nextAfterTimestampHourUtc = String(last.timestamp_hour_utc);
+    const cursorUnchanged = nextAfterStationId === cursorAfterStationId
+      && nextAfterTimestampHourUtc === cursorAfterTimestampHourUtc;
+    if (cursorUnchanged) {
+      throw new Error(
+        `AQI source RPC cursor did not advance for day=${dayUtc} connector=${connectorId}`,
+      );
+    }
+    cursorAfterStationId = nextAfterStationId;
+    cursorAfterTimestampHourUtc = nextAfterTimestampHourUtc;
+  }
+
+  if (pendingRows.length > 0) {
+    await flushPart();
+  }
+
+  if (observedRows !== expectedRowCount) {
+    throw new Error(
+      `AQI row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${expectedRowCount.toString()} observed=${observedRows.toString()}`,
+    );
+  }
+
+  const connectorManifestKey = buildConnectorManifestKey(runtime.aqilevels_prefix, dayUtc, connectorId);
+  const connectorManifest = createAqilevelConnectorManifest({
+    dayUtc,
+    connectorId,
+    runId: runtime.run_id,
+    sourceRowCount: Number(observedRows),
+    minTimestampHourUtc: minTimestampHourUtc || connector.min_timestamp_hour_utc || null,
+    maxTimestampHourUtc: maxTimestampHourUtc || connector.max_timestamp_hour_utc || null,
+    fileEntries,
+    writerGitSha: runtime.writer_git_sha,
+    backedUpAtUtc: nowIso(),
+  });
+  await r2PutObject({
+    r2: runtime.r2,
+    key: connectorManifestKey,
+    body: Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"),
+    content_type: "application/json",
+  });
+
+  const manifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
+  if (!manifestHead.exists) {
+    throw new Error(`AQI connector manifest missing after upload: ${connectorManifestKey}`);
+  }
+
+  return {
+    connector_id: connectorId,
+    manifest_key: connectorManifestKey,
+    source_row_count: observedRows,
+    file_count: fileEntries.length,
+    total_bytes: totalBytes,
+    connector_manifest: {
+      ...connectorManifest,
+      manifest_key: connectorManifestKey,
+    },
+  };
+}
+
+async function exportAqilevelDayToR2({ runtime, dayUtc }) {
+  const connectorCounts = await fetchAqilevelConnectorCounts(runtime, dayUtc);
+  if (connectorCounts.length === 0) {
+    return {
+      status: "skipped_no_source_rows",
+      day_utc: dayUtc,
+      connector_count: 0,
+      source_row_count: 0n,
+      file_count: 0,
+      total_bytes: 0n,
+      day_manifest_key: null,
+    };
+  }
+
+  const connectorManifests = [];
+  let totalRows = 0n;
+  let totalBytes = 0n;
+  let totalFiles = 0;
+
+  for (const connector of connectorCounts) {
+    const result = await exportAqilevelConnectorDayToR2({
+      runtime,
+      dayUtc,
+      connector,
+    });
+    totalRows += result.source_row_count;
+    totalBytes += result.total_bytes;
+    totalFiles += result.file_count;
+    connectorManifests.push(result.connector_manifest);
+  }
+
+  const dayManifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
+  const dayManifest = createAqilevelDayManifest({
+    dayUtc,
+    runId: runtime.run_id,
+    connectorManifests,
+    writerGitSha: runtime.writer_git_sha,
+    backedUpAtUtc: nowIso(),
+  });
+  await r2PutObject({
+    r2: runtime.r2,
+    key: dayManifestKey,
+    body: Buffer.from(JSON.stringify(dayManifest, null, 2), "utf8"),
+    content_type: "application/json",
+  });
+
+  const dayHead = await r2HeadObject({ r2: runtime.r2, key: dayManifestKey });
+  if (!dayHead.exists) {
+    throw new Error(`AQI day manifest missing after upload: ${dayManifestKey}`);
+  }
+
+  return {
+    status: "complete",
+    day_utc: dayUtc,
+    connector_count: connectorCounts.length,
+    source_row_count: totalRows,
+    file_count: totalFiles,
+    total_bytes: totalBytes,
+    day_manifest_key: dayManifestKey,
+  };
+}
+
+async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logStructured }) {
+  const summary = {
+    enabled: true,
+    dry_run: dryRun,
+    latest_eligible_day_utc: latestEligibleDayUtc,
+    pending_days: 0,
+    completed_days: 0,
+    skipped_days_no_source_rows: 0,
+    failed_days: 0,
+    total_written_rows: "0",
+    total_written_bytes: "0",
+    pending_preview: [],
+    completed_preview: [],
+    failures: [],
+  };
+
+  logStructured("INFO", "phase_b_aqilevels_run_start", {
+    run_id: runtime.run_id,
+    dry_run: dryRun,
+    latest_eligible_day_utc: latestEligibleDayUtc,
+    max_candidates_per_run: runtime.max_candidates_per_run,
+    aqilevels_prefix: runtime.aqilevels_prefix,
+    aqilevels_rpc_schema: runtime.aqilevels_source?.rpc_schema || null,
+    aqilevels_rows_rpc: runtime.aqilevels_source?.rows_rpc || null,
+    aqilevels_connector_counts_rpc: runtime.aqilevels_source?.connector_counts_rpc || null,
+  });
+
+  if (!hasAqilevelSourceConfig(runtime)) {
+    throw new Error("Phase B AQI export requires OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY with AQI history RPCs.");
+  }
+
+  const pendingDays = await withPgClient(runtime.supabase_db_url, async (client) => {
+    return await discoverPendingAqilevelDays({
+      client,
+      runtime,
+      latestEligibleDayUtc,
+    });
+  });
+
+  summary.pending_days = pendingDays.length;
+  summary.pending_preview = pendingDays.slice(0, 25);
+  if (dryRun) {
+    summary.completed_preview = summary.completed_preview.slice(0, 25);
+    summary.failures = summary.failures.slice(0, 25);
+    logStructured("INFO", "phase_b_aqilevels_run_summary", {
+      run_id: runtime.run_id,
+      ...summary,
+    });
+    return summary;
+  }
+
+  let totalRows = 0n;
+  let totalBytes = 0n;
+  for (const dayUtc of pendingDays) {
+    const startedAtMs = Date.now();
+    try {
+      const dayResult = await exportAqilevelDayToR2({
+        runtime,
+        dayUtc,
+      });
+
+      if (dayResult.status === "skipped_no_source_rows") {
+        summary.skipped_days_no_source_rows += 1;
+        logStructured("INFO", "phase_b_aqilevels_day_skipped_no_source_rows", {
+          run_id: runtime.run_id,
+          day_utc: dayUtc,
+        });
+        continue;
+      }
+
+      summary.completed_days += 1;
+      totalRows += dayResult.source_row_count;
+      totalBytes += dayResult.total_bytes;
+      summary.completed_preview.push({
+        day_utc: dayUtc,
+        connector_count: dayResult.connector_count,
+        source_row_count: dayResult.source_row_count.toString(),
+        file_count: dayResult.file_count,
+        total_bytes: dayResult.total_bytes.toString(),
+        day_manifest_key: dayResult.day_manifest_key,
+      });
+      logStructured("INFO", "phase_b_aqilevels_day_complete", {
+        run_id: runtime.run_id,
+        day_utc: dayUtc,
+        connector_count: dayResult.connector_count,
+        source_row_count: dayResult.source_row_count.toString(),
+        file_count: dayResult.file_count,
+        total_bytes: dayResult.total_bytes.toString(),
+        day_manifest_key: dayResult.day_manifest_key,
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      summary.failed_days += 1;
+      summary.failures.push({
+        day_utc: dayUtc,
+        error: message,
+        next_action: "retry_safe",
+      });
+      logStructured("ERROR", "phase_b_aqilevels_day_failed", {
+        run_id: runtime.run_id,
+        day_utc: dayUtc,
+        error: message,
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+        next_action: "retry_safe",
+      });
+    }
+  }
+
+  summary.total_written_rows = totalRows.toString();
+  summary.total_written_bytes = totalBytes.toString();
+
+  summary.completed_preview = summary.completed_preview.slice(0, 25);
+  summary.failures = summary.failures.slice(0, 25);
+  logStructured("INFO", "phase_b_aqilevels_run_summary", {
+    run_id: runtime.run_id,
+    ...summary,
+  });
+  return summary;
+}
+
 async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
   const dayCandidates = await fetchDayCandidates(client, dayUtc);
   const dayState = computeDayGateState(dayCandidates);
@@ -1359,6 +2068,9 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   const committedPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || DEFAULT_COMMITTED_PREFIX,
   );
+  const aqilevelsPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_AQILEVELS_PREFIX,
+  );
   const runsPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
   );
@@ -1392,6 +2104,12 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       10_000,
       2_000_000,
     ),
+    aqilevels_source_max_pages: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_AQILEVELS_SOURCE_MAX_PAGES,
+      DEFAULT_AQILEVELS_SOURCE_MAX_PAGES,
+      10,
+      1_000_000,
+    ),
     max_candidates_per_run: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN,
       DEFAULT_MAX_CANDIDATES_PER_RUN,
@@ -1406,7 +2124,16 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     ),
     staging_prefix_base: stagingBasePrefix,
     committed_prefix: committedPrefix,
+    aqilevels_prefix: aqilevelsPrefix,
     runs_prefix: runsPrefix,
+    aqilevels_source: {
+      base_url: String(env.OBS_AQIDB_SUPABASE_URL || "").trim(),
+      privileged_key: String(env.OBS_AQIDB_SECRET_KEY || "").trim(),
+      rpc_schema: String(env.UK_AQ_PUBLIC_SCHEMA || DEFAULT_RPC_SCHEMA).trim() || DEFAULT_RPC_SCHEMA,
+      connector_counts_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC || AQILEVELS_CONNECTOR_COUNTS_RPC)
+        .trim(),
+      rows_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC || AQILEVELS_ROWS_RPC).trim(),
+    },
     writer_git_sha: String(env.GITHUB_SHA || "").trim() || null,
   };
 }
@@ -1459,6 +2186,7 @@ export async function runPhaseBBackup({
     failures: [],
     completed_preview: [],
     blocked_preview: [],
+    aqilevels: null,
   };
 
   logStructured("INFO", "phase_b_history_run_start", {
@@ -1472,6 +2200,8 @@ export async function runPhaseBBackup({
     row_group_size: runtime.row_group_size,
     deploy_env: runtime.deploy_env,
     r2_bucket: runtime.r2.bucket,
+    observations_prefix: runtime.committed_prefix,
+    aqilevels_prefix: runtime.aqilevels_prefix,
   });
 
   const dayResults = new Map();
@@ -1597,6 +2327,13 @@ export async function runPhaseBBackup({
         });
       }
     }
+  });
+
+  summary.aqilevels = await runAqilevelsBackup({
+    runtime,
+    latestEligibleDayUtc: window.latest_eligible_day_utc,
+    dryRun,
+    logStructured,
   });
 
   if (dryRun) {
