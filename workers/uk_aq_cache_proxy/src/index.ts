@@ -1,6 +1,7 @@
 export interface Env {
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
+  UK_AQ_AQI_HISTORY_R2_API_URL: unknown;
   UK_AQ_CACHE_ALLOWED_ORIGINS: unknown;
   UK_AQ_EDGE_ACCESS_TOKEN_SECRET: unknown;
   UK_AQ_EDGE_UPSTREAM_SECRET: unknown;
@@ -58,6 +59,8 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
   },
 };
 
+const EXTERNAL_AQI_HISTORY_UPSTREAM = "__uk_aq_aqi_history_r2_api__";
+
 const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_latest: "realtime",
   uk_aq_timeseries: "realtime",
@@ -65,6 +68,7 @@ const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_stations: "stations_metadata",
   uk_aq_la_hex: "metadata",
   uk_aq_pcon_hex: "metadata",
+  [EXTERNAL_AQI_HISTORY_UPSTREAM]: "realtime",
 };
 
 const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> = {
@@ -74,6 +78,7 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
   stations: "uk_aq_stations",
   "la-hex": "uk_aq_la_hex",
   "pcon-hex": "uk_aq_pcon_hex",
+  "aqi-history": EXTERNAL_AQI_HISTORY_UPSTREAM,
 };
 
 const API_PREFIX = "/api/aq/";
@@ -753,12 +758,17 @@ export default {
 
     const profileName = FUNCTION_PROFILE_MAP[upstreamFunction];
     const profile = CACHE_PROFILES[profileName];
+    const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
 
     const supabaseUrl = await readSecret(env.SUPABASE_URL);
     const supabasePublishableKey = await readSecret(env.SB_PUBLISHABLE_DEFAULT_KEY);
+    const aqiHistoryUpstreamUrl = await readSecret(env.UK_AQ_AQI_HISTORY_R2_API_URL);
     const upstreamAuthSecret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-    if (!supabaseUrl || !supabasePublishableKey) {
+    if (!usingExternalAqiHistoryUpstream && (!supabaseUrl || !supabasePublishableKey)) {
       return makeErrorResponse(500, "missing_worker_secrets", requestOrigin, allowedOrigins);
+    }
+    if (usingExternalAqiHistoryUpstream && !aqiHistoryUpstreamUrl) {
+      return makeErrorResponse(500, "missing_aqi_history_upstream_url", requestOrigin, allowedOrigins);
     }
     if (!upstreamAuthSecret) {
       return makeErrorResponse(500, "missing_upstream_auth_secret", requestOrigin, allowedOrigins);
@@ -799,12 +809,26 @@ export default {
       }
     }
 
-    const upstreamUrl = new URL(`${normalizeBaseUrl(supabaseUrl)}/functions/v1/${upstreamFunction}`);
+    let upstreamUrl: URL;
+    try {
+      upstreamUrl = usingExternalAqiHistoryUpstream
+        ? new URL(normalizeBaseUrl(aqiHistoryUpstreamUrl))
+        : new URL(`${normalizeBaseUrl(supabaseUrl)}/functions/v1/${upstreamFunction}`);
+    } catch (_err) {
+      return makeErrorResponse(
+        500,
+        usingExternalAqiHistoryUpstream ? "invalid_aqi_history_upstream_url" : "invalid_upstream_url",
+        requestOrigin,
+        allowedOrigins,
+      );
+    }
     upstreamUrl.search = url.search;
 
     const upstreamHeaders = new Headers();
-    upstreamHeaders.set("apikey", supabasePublishableKey);
-    upstreamHeaders.set("Authorization", `Bearer ${supabasePublishableKey}`);
+    if (!usingExternalAqiHistoryUpstream) {
+      upstreamHeaders.set("apikey", supabasePublishableKey);
+      upstreamHeaders.set("Authorization", `Bearer ${supabasePublishableKey}`);
+    }
     upstreamHeaders.set(UPSTREAM_AUTH_HEADER, upstreamAuthSecret);
     const accept = request.headers.get("Accept");
     if (accept) {
