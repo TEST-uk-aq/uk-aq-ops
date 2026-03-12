@@ -187,6 +187,15 @@ Sensor.Community-first delivery decision:
 - development replay files will be mirrored to:
   - `/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_Backfill_raw_files/sensorcommunity`
 
+Placeholder to revisit for Sensor.Community archive filtering:
+- Archive files include non-UK stations, so source_to_r2 must not ingest blindly by connector/day.
+- Backfill selection should start from the known UK station/timeseries set in core metadata (prefer R2 core snapshot, fallback to ingest `uk_aq_core`).
+- We still need a defined strategy for archive stations that appear in source data but are missing from core tables:
+  - detect and log unknown station refs/timeseries refs during archive parsing,
+  - queue for controlled core onboarding (not automatic ingest by default),
+  - then rerun source_to_r2 for the affected day/connector after onboarding.
+- Keep this as an explicit Phase 9 follow-up item before enabling broad Sensor.Community source_to_r2 runs.
+
 ## 6) Options, pros, cons, egress effect, DB-size effect
 
 ### Option 1: Single worker, multi-mode router

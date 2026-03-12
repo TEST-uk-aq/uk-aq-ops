@@ -6,7 +6,7 @@ Current implementation status (Phase 9, incremental):
 
 - `local_to_aqilevels`: implemented.
 - `obs_aqi_to_r2`: implemented (dry-run planning + non-dry R2 export/write path).
-- `source_to_r2`: partially implemented (executes local retained days via `local_to_aqilevels`, reports non-local days as pending source acquisition).
+- `source_to_r2`: implemented for Sensor.Community archive-to-R2 flow (station_ref-filtered by core metadata, observations + aqilevels manifests written to R2).
 
 ## Endpoints
 
@@ -58,10 +58,15 @@ All fields are optional unless noted.
     - run returns `error` when connector/day failures leave pending days.
 
 - `source_to_r2`
-  - computes rolling local retention window.
-  - runs `local_to_aqilevels` for retained UTC days inside that window.
-  - returns `source_acquisition_pending_days` for non-local days (external acquisition/write path still pending).
-  - non-dry runs with pending non-local days return `stubbed`.
+  - supports Sensor.Community archive backfill (`https://archive.sensor.community/YYYY-MM-DD/`).
+  - resolves known station/timeseries bindings from core metadata (R2 core snapshot first, ingest fallback).
+  - filters archive files by known core `station_ref` values (Sensor.Community `sensor_id`).
+  - parses raw observations to canonical `timeseries_id, observed_at, value` rows.
+  - derives hourly AQI helper rows and computes DAQI/EAQI index levels in-worker.
+  - writes connector parquet parts + connector manifests + day manifests for both:
+    - `history/v1/observations/...`
+    - `history/v1/aqilevels/...`
+  - unresolved/unsupported connectors are returned in `source_acquisition_pending_days`.
 
 ## Runtime Status Values
 
@@ -72,14 +77,14 @@ All fields are optional unless noted.
 
 ## Required Environment
 
-For `local_to_aqilevels` and `source_to_r2` local-write path:
+For `local_to_aqilevels`:
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
 
-For `obs_aqi_to_r2` export/write:
+For `obs_aqi_to_r2` and `source_to_r2` R2 export/write:
 
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
@@ -120,6 +125,17 @@ Source RPC paging:
 - `UK_AQ_BACKFILL_SOURCE_RPC_MAX_PAGES` (default `200`)
 - `UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE` (default `20000`)
 - `UK_AQ_BACKFILL_OBS_R2_MAX_PAGES` (default `50000`; safety ceiling for obs/aqi history export pagination)
+- `UK_AQ_BACKFILL_R2_CORE_LOOKBACK_DAYS` (default `45`)
+- `UK_AQ_BACKFILL_R2_CORE_SNAPSHOT_MAX_BYTES` (default `250000000`)
+
+Sensor.Community source adapter:
+
+- `UK_AQ_BACKFILL_SCOMM_SOURCE_ENABLED` (default `true`)
+- `UK_AQ_BACKFILL_SCOMM_CONNECTOR_CODE` (default `sensorcommunity`)
+- `UK_AQ_BACKFILL_SCOMM_ARCHIVE_BASE_URL` (default `https://archive.sensor.community`)
+- `UK_AQ_BACKFILL_SCOMM_INCLUDE_MET_FIELDS` (default `true`)
+- `UK_AQ_BACKFILL_SCOMM_ARCHIVE_TIMEOUT_MS` (default `120000`)
+- `UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT` (optional local mirror root; downloaded source CSV files are reused/written under `day_utc=YYYY-MM-DD/`)
 
 RPC names:
 
@@ -141,6 +157,7 @@ R2 history prefixes:
 
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
+- `UK_AQ_R2_HISTORY_CORE_PREFIX` (default `history/v1/core`)
 
 Ledger:
 
@@ -174,8 +191,8 @@ curl -X POST "https://<cloud-run-url>/run" \
     "trigger_mode": "manual",
     "run_mode": "source_to_r2",
     "dry_run": true,
-    "from_day_utc": "2026-02-01",
-    "to_day_utc": "2026-02-05",
-    "connector_ids": [4]
+    "from_day_utc": "2026-02-11",
+    "to_day_utc": "2026-02-15",
+    "connector_ids": [7]
   }'
 ```

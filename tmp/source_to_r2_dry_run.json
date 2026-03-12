@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "trigger_mode": "manual",
+  "run_mode": "source_to_r2",
+  "dry_run": true,
+  "force_replace": true,
+  "from_day_utc": "2026-02-15",
+  "to_day_utc": "2026-02-15",
+  "connector_ids": [
+    7
+  ],
+  "enable_r2_fallback": false,
+  "code": 0
+}
