@@ -11,6 +11,7 @@ const RPC_DEFAULT_DIAGNOSTICS = "uk_aq_rpc_observs_observations_default_diagnost
 const RPC_DROP_CANDIDATES = "uk_aq_rpc_observs_drop_candidates";
 const RPC_DROP_PARTITION = "uk_aq_rpc_observs_drop_partition";
 const RPC_DAY_HAS_ROWS = "uk_aq_rpc_observs_day_has_rows";
+const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -404,6 +405,12 @@ async function callRpc(client, fnName, params, errorLabel) {
   return data || [];
 }
 
+function isMissingDayHasRowsFunctionError(message) {
+  const normalized = String(message || "").toLowerCase();
+  return normalized.includes("uk_aq_rpc_observs_day_has_rows")
+    && normalized.includes("schema cache");
+}
+
 function encodeRfc3986(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
 }
@@ -756,15 +763,64 @@ function parseDayHasRowsRow(row) {
 }
 
 async function checkDayHasRows(observsClient, dayUtc) {
-  const rows = await callRpc(
-    observsClient,
-    RPC_DAY_HAS_ROWS,
-    {
-      p_day_utc: dayUtc,
-    },
-    `observs day has rows ${dayUtc}`,
-  );
-  return parseDayHasRowsRow(rows?.[0]);
+  try {
+    const rows = await callRpc(
+      observsClient,
+      RPC_DAY_HAS_ROWS,
+      {
+        p_day_utc: dayUtc,
+      },
+      `observs day has rows ${dayUtc}`,
+    );
+    return {
+      checked: true,
+      has_rows: parseDayHasRowsRow(rows?.[0]),
+      method: "day_has_rows_rpc",
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isMissingDayHasRowsFunctionError(message)) {
+      return {
+        checked: false,
+        has_rows: null,
+        method: "day_has_rows_rpc",
+        error: message,
+      };
+    }
+
+    const windowStart = `${dayUtc}T00:00:00.000Z`;
+    const windowEnd = `${shiftIsoDate(dayUtc, 1)}T00:00:00.000Z`;
+    try {
+      const fingerprintRows = await callRpc(
+        observsClient,
+        RPC_HOURLY_FINGERPRINT,
+        {
+          window_start: windowStart,
+          window_end: windowEnd,
+        },
+        `observs day has rows fallback via hourly fingerprint ${dayUtc}`,
+      );
+      const bucketCount = Array.isArray(fingerprintRows) ? fingerprintRows.length : 0;
+      return {
+        checked: true,
+        has_rows: bucketCount > 0,
+        method: "hourly_fingerprint_fallback",
+        fallback_bucket_count: bucketCount,
+        fallback_reason: "day_has_rows_function_missing_in_schema_cache",
+        day_has_rows_error: message,
+      };
+    } catch (fallbackError) {
+      const fallbackMessage = fallbackError instanceof Error
+        ? fallbackError.message
+        : String(fallbackError);
+      return {
+        checked: false,
+        has_rows: null,
+        method: "hourly_fingerprint_fallback",
+        error: `${message}; fallback_failed: ${fallbackMessage}`,
+      };
+    }
+  }
 }
 
 function parseDefaultDiagnosticsRow(row) {
@@ -918,22 +974,7 @@ async function runObservsPartitionMaintenance(config) {
 
     const historyManifestCheck = await historyManifestExists(candidate.partition_day_utc, config.r2);
     if (!historyManifestCheck.confirmed) {
-      const hasRowsCheck = await (async () => {
-        try {
-          const hasRows = await checkDayHasRows(observsClient, candidate.partition_day_utc);
-          return {
-            checked: true,
-            has_rows: hasRows,
-          };
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          return {
-            checked: false,
-            has_rows: null,
-            error: message,
-          };
-        }
-      })();
+      const hasRowsCheck = await checkDayHasRows(observsClient, candidate.partition_day_utc);
 
       if (hasRowsCheck.checked && hasRowsCheck.has_rows === false) {
         const dropResultRows = await callRpc(

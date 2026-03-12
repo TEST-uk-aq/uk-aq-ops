@@ -42,6 +42,7 @@ jobs:
       SCHEDULER_CRON: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_CRON || vars.GCP_INGESTDB_PRUNE_SCHEDULER_CRON || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_CRON || vars.INGESTDB_PRUNE_SCHEDULER_CRON || '0 2 * * *' }}
       SCHEDULER_TIMEZONE: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_TIMEZONE || vars.GCP_INGESTDB_PRUNE_SCHEDULER_TIMEZONE || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_TIMEZONE || vars.INGESTDB_PRUNE_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.GCP_INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.INGESTDB_PRUNE_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_ATTEMPT_DEADLINE || vars.GCP_INGESTDB_PRUNE_SCHEDULER_ATTEMPT_DEADLINE || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_ATTEMPT_DEADLINE || vars.INGESTDB_PRUNE_SCHEDULER_ATTEMPT_DEADLINE || '15m' }}
       UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT || vars.GCP_INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || vars.UK_AQ_PRUNE_DAILY_SCHEDULER_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_SCHEDULER_SERVICE_ACCOUNT || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
@@ -426,7 +427,8 @@ jobs:
               --message-body "${scheduler_body}" \
               --oidc-service-account-email "${scheduler_sa}" \
               --oidc-token-audience "${service_uri}" \
-              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}" \
+              --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}"
             echo "Updated Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
           else
             gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
@@ -439,7 +441,8 @@ jobs:
               --message-body "${scheduler_body}" \
               --oidc-service-account-email "${scheduler_sa}" \
               --oidc-token-audience "${service_uri}" \
-              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}" \
+              --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}"
             echo "Created Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
           fi
 

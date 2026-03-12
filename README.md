@@ -68,6 +68,7 @@ Primary controls:
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
 - `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
+- Scheduler attempt deadline is managed by deploy workflow variable `GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_ATTEMPT_DEADLINE` (with ingestdb alias fallbacks), default `15m`.
 
 ### 2) Observs Outbox Flush (`workers/uk_aq_observs_outbox_flush_service/server.mjs`)
 
