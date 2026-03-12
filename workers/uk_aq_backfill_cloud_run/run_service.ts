@@ -21,6 +21,8 @@ type RequestBody = {
   to_day_utc?: unknown;
   connector_ids?: unknown;
   connector_id?: unknown;
+  station_ids?: unknown;
+  station_id?: unknown;
   enable_r2_fallback?: unknown;
 };
 
@@ -42,7 +44,8 @@ function resolveTriggerMode(req: Request, body: RequestBody | null): string {
     return parseTriggerMode(queryValue, "manual");
   }
 
-  const headerValue = (req.headers.get("x-uk-aq-backfill-trigger-mode") || "").trim();
+  const headerValue = (req.headers.get("x-uk-aq-backfill-trigger-mode") || "")
+    .trim();
   if (headerValue) {
     return parseTriggerMode(headerValue, "manual");
   }
@@ -56,7 +59,8 @@ function resolveRunMode(req: Request, body: RequestBody | null): string {
     return parseRunMode(queryValue, "local_to_aqilevels");
   }
 
-  const headerValue = (req.headers.get("x-uk-aq-backfill-run-mode") || "").trim();
+  const headerValue = (req.headers.get("x-uk-aq-backfill-run-mode") || "")
+    .trim();
   if (headerValue) {
     return parseRunMode(headerValue, "local_to_aqilevels");
   }
@@ -70,7 +74,8 @@ function resolveDryRun(req: Request, body: RequestBody | null): boolean {
     return parseBooleanish(queryValue, false);
   }
 
-  const headerValue = (req.headers.get("x-uk-aq-backfill-dry-run") || "").trim();
+  const headerValue = (req.headers.get("x-uk-aq-backfill-dry-run") || "")
+    .trim();
   if (headerValue) {
     return parseBooleanish(headerValue, false);
   }
@@ -84,7 +89,8 @@ function resolveForceReplace(req: Request, body: RequestBody | null): boolean {
     return parseBooleanish(queryValue, false);
   }
 
-  const headerValue = (req.headers.get("x-uk-aq-backfill-force-replace") || "").trim();
+  const headerValue = (req.headers.get("x-uk-aq-backfill-force-replace") || "")
+    .trim();
   if (headerValue) {
     return parseBooleanish(headerValue, false);
   }
@@ -92,13 +98,17 @@ function resolveForceReplace(req: Request, body: RequestBody | null): boolean {
   return parseBooleanish(body?.force_replace, false);
 }
 
-function resolveEnableR2Fallback(req: Request, body: RequestBody | null): boolean {
+function resolveEnableR2Fallback(
+  req: Request,
+  body: RequestBody | null,
+): boolean {
   const queryValue = readStringQuery(req, "enable_r2_fallback");
   if (queryValue) {
     return parseBooleanish(queryValue, false);
   }
 
-  const headerValue = (req.headers.get("x-uk-aq-backfill-enable-r2-fallback") || "").trim();
+  const headerValue =
+    (req.headers.get("x-uk-aq-backfill-enable-r2-fallback") || "").trim();
   if (headerValue) {
     return parseBooleanish(headerValue, false);
   }
@@ -110,13 +120,18 @@ function resolveDay(raw: unknown): string | null {
   return parseIsoDayUtc(typeof raw === "string" ? raw : "");
 }
 
-function resolveFromDayUtc(req: Request, body: RequestBody | null): string | null {
+function resolveFromDayUtc(
+  req: Request,
+  body: RequestBody | null,
+): string | null {
   const queryValue = resolveDay(readStringQuery(req, "from_day_utc"));
   if (queryValue) {
     return queryValue;
   }
 
-  const headerValue = resolveDay(req.headers.get("x-uk-aq-backfill-from-day-utc") || "");
+  const headerValue = resolveDay(
+    req.headers.get("x-uk-aq-backfill-from-day-utc") || "",
+  );
   if (headerValue) {
     return headerValue;
   }
@@ -124,13 +139,18 @@ function resolveFromDayUtc(req: Request, body: RequestBody | null): string | nul
   return resolveDay(body?.from_day_utc);
 }
 
-function resolveToDayUtc(req: Request, body: RequestBody | null): string | null {
+function resolveToDayUtc(
+  req: Request,
+  body: RequestBody | null,
+): string | null {
   const queryValue = resolveDay(readStringQuery(req, "to_day_utc"));
   if (queryValue) {
     return queryValue;
   }
 
-  const headerValue = resolveDay(req.headers.get("x-uk-aq-backfill-to-day-utc") || "");
+  const headerValue = resolveDay(
+    req.headers.get("x-uk-aq-backfill-to-day-utc") || "",
+  );
   if (headerValue) {
     return headerValue;
   }
@@ -138,7 +158,10 @@ function resolveToDayUtc(req: Request, body: RequestBody | null): string | null 
   return resolveDay(body?.to_day_utc);
 }
 
-function resolveConnectorIds(req: Request, body: RequestBody | null): number[] | null {
+function resolveConnectorIds(
+  req: Request,
+  body: RequestBody | null,
+): number[] | null {
   const queryCsv = readStringQuery(req, "connector_ids");
   if (queryCsv) {
     return parseConnectorIds(queryCsv);
@@ -149,7 +172,8 @@ function resolveConnectorIds(req: Request, body: RequestBody | null): number[] |
     return parseConnectorIds(querySingle);
   }
 
-  const headerCsv = (req.headers.get("x-uk-aq-backfill-connector-ids") || "").trim();
+  const headerCsv = (req.headers.get("x-uk-aq-backfill-connector-ids") || "")
+    .trim();
   if (headerCsv) {
     return parseConnectorIds(headerCsv);
   }
@@ -162,6 +186,34 @@ function resolveConnectorIds(req: Request, body: RequestBody | null): number[] |
   return parseConnectorIds(body?.connector_id);
 }
 
+function resolveStationIds(
+  req: Request,
+  body: RequestBody | null,
+): number[] | null {
+  const queryCsv = readStringQuery(req, "station_ids");
+  if (queryCsv) {
+    return parseConnectorIds(queryCsv);
+  }
+
+  const querySingle = readStringQuery(req, "station_id");
+  if (querySingle) {
+    return parseConnectorIds(querySingle);
+  }
+
+  const headerCsv = (req.headers.get("x-uk-aq-backfill-station-ids") || "")
+    .trim();
+  if (headerCsv) {
+    return parseConnectorIds(headerCsv);
+  }
+
+  const bodyList = parseConnectorIds(body?.station_ids);
+  if (bodyList && bodyList.length) {
+    return bodyList;
+  }
+
+  return parseConnectorIds(body?.station_id);
+}
+
 async function runJob(args: {
   triggerMode: string;
   runMode: string;
@@ -170,6 +222,7 @@ async function runJob(args: {
   fromDayUtc: string | null;
   toDayUtc: string | null;
   connectorIds: number[] | null;
+  stationIds: number[] | null;
   enableR2Fallback: boolean;
 }): Promise<Deno.CommandStatus> {
   const env: Record<string, string> = {
@@ -189,6 +242,9 @@ async function runJob(args: {
   }
   if (args.connectorIds && args.connectorIds.length > 0) {
     env.UK_AQ_BACKFILL_CONNECTOR_IDS = args.connectorIds.join(",");
+  }
+  if (args.stationIds && args.stationIds.length > 0) {
+    env.UK_AQ_BACKFILL_STATION_IDS = args.stationIds.join(",");
   }
 
   const child = new Deno.Command("deno", {
@@ -253,6 +309,7 @@ serve(async (req: Request) => {
   const fromDayUtc = resolveFromDayUtc(req, body);
   const toDayUtc = resolveToDayUtc(req, body);
   const connectorIds = resolveConnectorIds(req, body);
+  const stationIds = resolveStationIds(req, body);
   const enableR2Fallback = resolveEnableR2Fallback(req, body);
 
   inFlight = true;
@@ -265,6 +322,7 @@ serve(async (req: Request) => {
       fromDayUtc,
       toDayUtc,
       connectorIds,
+      stationIds,
       enableR2Fallback,
     });
 
@@ -277,6 +335,7 @@ serve(async (req: Request) => {
       from_day_utc: fromDayUtc,
       to_day_utc: toDayUtc,
       connector_ids: connectorIds,
+      station_ids: stationIds,
       enable_r2_fallback: enableR2Fallback,
       code: status.code,
     }, status.success ? 200 : 500);

@@ -12,6 +12,7 @@ Usage:
   export UK_AQ_BACKFILL_FROM_DAY_UTC="2026-02-01"
   export UK_AQ_BACKFILL_TO_DAY_UTC="2026-02-05"
   export UK_AQ_BACKFILL_CONNECTOR_IDS="4,7"   # optional
+  export UK_AQ_BACKFILL_STATION_IDS="24665"   # optional
   export UK_AQ_BACKFILL_ENABLE_R2_FALLBACK="false" # optional
   ./scripts/gcp/uk_aq_backfill_cloud_run_call.sh
 
@@ -26,6 +27,8 @@ Required env vars:
 
 Optional env vars:
   UK_AQ_BACKFILL_CONNECTOR_IDS   (comma-separated positive integers)
+  UK_AQ_BACKFILL_STATION_IDS     (comma-separated positive integers)
+  UK_AQ_BACKFILL_STATION_ID      (single positive integer; alias)
   UK_AQ_BACKFILL_ENABLE_R2_FALLBACK  (true|false, default false)
   UK_AQ_BACKFILL_REQUEST_TIMEOUT_SECONDS (default 300)
   UK_AQ_BACKFILL_ID_TOKEN            (pre-generated bearer token; skips gcloud token call)
@@ -199,6 +202,18 @@ if [[ -n "${CONNECTOR_IDS_VALUE}" ]]; then
   fi
 fi
 
+STATION_IDS_JSON=""
+STATION_IDS_VALUE="$(trim "${UK_AQ_BACKFILL_STATION_IDS:-}")"
+if [[ -z "${STATION_IDS_VALUE}" ]]; then
+  STATION_IDS_VALUE="$(trim "${UK_AQ_BACKFILL_STATION_ID:-}")"
+fi
+if [[ -n "${STATION_IDS_VALUE}" ]]; then
+  if ! STATION_IDS_JSON="$(parse_connector_ids_list "${STATION_IDS_VALUE}")"; then
+    echo "Invalid UK_AQ_BACKFILL_STATION_IDS/UK_AQ_BACKFILL_STATION_ID: ${STATION_IDS_VALUE}" >&2
+    exit 2
+  fi
+fi
+
 REQUEST_TIMEOUT_SECONDS="$(trim "${UK_AQ_BACKFILL_REQUEST_TIMEOUT_SECONDS:-300}")"
 if ! [[ "${REQUEST_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "Invalid UK_AQ_BACKFILL_REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS}" >&2
@@ -230,6 +245,9 @@ payload_parts+=("\"enable_r2_fallback\":${ENABLE_R2_FALLBACK}")
 
 if [[ -n "${CONNECTOR_IDS_JSON}" ]]; then
   payload_parts+=("\"connector_ids\":${CONNECTOR_IDS_JSON}")
+fi
+if [[ -n "${STATION_IDS_JSON}" ]]; then
+  payload_parts+=("\"station_ids\":${STATION_IDS_JSON}")
 fi
 
 PAYLOAD='{'

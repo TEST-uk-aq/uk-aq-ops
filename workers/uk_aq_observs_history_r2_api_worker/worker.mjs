@@ -1,4 +1,4 @@
-import { parquetReadObjects } from "hyparquet";
+import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/observations";
@@ -75,7 +75,9 @@ function toIsoOrNull(raw) {
 }
 
 function cacheControlHeader(cacheSeconds) {
-  return `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds * 2}`;
+  return `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${
+    cacheSeconds * 2
+  }`;
 }
 
 function jsonResponse(payload, {
@@ -118,9 +120,14 @@ function timingSafeEqual(left, right) {
 function authorized(request, env) {
   const expected = String(env.UK_AQ_EDGE_UPSTREAM_SECRET || "").trim();
   if (!expected) {
-    return { ok: false, status: 500, error: "Missing UK_AQ_EDGE_UPSTREAM_SECRET." };
+    return {
+      ok: false,
+      status: 500,
+      error: "Missing UK_AQ_EDGE_UPSTREAM_SECRET.",
+    };
   }
-  const supplied = String(request.headers.get(UPSTREAM_AUTH_HEADER) || "").trim();
+  const supplied = String(request.headers.get(UPSTREAM_AUTH_HEADER) || "")
+    .trim();
   if (!supplied || !timingSafeEqual(supplied, expected)) {
     return { ok: false, status: 401, error: "Unauthorized." };
   }
@@ -142,7 +149,9 @@ function addUtcDays(isoDay, deltaDays) {
 function listUtcDays(startIso, endIso) {
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+  if (
+    !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs
+  ) {
     return [];
   }
   const out = [];
@@ -177,61 +186,133 @@ async function fetchJsonObjectFromR2(env, key) {
   return { exists: true, value: parsed };
 }
 
-async function fetchParquetRowsFromR2(env, key) {
+async function fetchFilteredParquetRowsFromR2(
+  env,
+  key,
+  timeseriesId,
+  rowChunkSize,
+) {
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
     return { exists: false, rows: [] };
   }
   const arrayBuffer = await object.arrayBuffer();
-  const rows = await parquetReadObjects({
-    file: arrayBuffer,
-    rowFormat: "object",
-    columns: ["timeseries_id", "observed_at", "value"],
-    compressors,
-  });
-  return { exists: true, rows: Array.isArray(rows) ? rows : [] };
-}
-
-function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
-  if (!dayManifest || typeof dayManifest !== "object") {
-    return fallbackKey;
+  const metadata = await parquetMetadataAsync(arrayBuffer, { compressors });
+  const schemaColumns = parquetSchema(metadata).children.map((column) =>
+    column.element.name
+  );
+  const timeseriesStatsIndex = schemaColumns.indexOf("timeseries_id");
+  if (timeseriesStatsIndex < 0) {
+    return { exists: true, rows: [] };
   }
-  const manifests = Array.isArray(dayManifest.connector_manifests)
-    ? dayManifest.connector_manifests
-    : [];
-  for (const entry of manifests) {
-    const entryConnectorId = Number(entry?.connector_id);
-    if (!Number.isFinite(entryConnectorId) || entryConnectorId !== connectorId) {
+
+  const outRows = [];
+  let rowGroupStart = 0;
+  for (const rowGroup of metadata.row_groups ?? []) {
+    const rowGroupRows = Number(rowGroup?.num_rows ?? 0);
+    const rowGroupEnd = rowGroupStart + rowGroupRows;
+    if (!Number.isFinite(rowGroupRows) || rowGroupRows <= 0) {
+      rowGroupStart = rowGroupEnd;
       continue;
     }
-    const entryKey = String(entry?.manifest_key || "").trim();
-    if (entryKey) {
-      return entryKey;
+    const stats = rowGroup?.columns?.[timeseriesStatsIndex]?.meta_data
+      ?.statistics;
+    const minTimeseries = Number(stats?.min_value ?? stats?.min);
+    const maxTimeseries = Number(stats?.max_value ?? stats?.max);
+    if (
+      Number.isFinite(minTimeseries) &&
+      Number.isFinite(maxTimeseries) &&
+      (timeseriesId < minTimeseries || timeseriesId > maxTimeseries)
+    ) {
+      rowGroupStart = rowGroupEnd;
+      continue;
     }
+
+    for (
+      let chunkStart = rowGroupStart;
+      chunkStart < rowGroupEnd;
+      chunkStart += rowChunkSize
+    ) {
+      const chunkEnd = Math.min(rowGroupEnd, chunkStart + rowChunkSize);
+      const timeseriesValues = await readParquetColumnValues(
+        arrayBuffer,
+        metadata,
+        "timeseries_id",
+        chunkStart,
+        chunkEnd,
+      );
+      const matchedIndexes = [];
+      for (let idx = 0; idx < timeseriesValues.length; idx += 1) {
+        const rowTimeseriesId = Number(timeseriesValues[idx]);
+        if (
+          Number.isFinite(rowTimeseriesId) && rowTimeseriesId === timeseriesId
+        ) {
+          matchedIndexes.push(idx);
+        }
+      }
+      if (matchedIndexes.length === 0) {
+        continue;
+      }
+      const observedAtValues = await readParquetColumnValues(
+        arrayBuffer,
+        metadata,
+        "observed_at",
+        chunkStart,
+        chunkEnd,
+      );
+      const valueValues = await readParquetColumnValues(
+        arrayBuffer,
+        metadata,
+        "value",
+        chunkStart,
+        chunkEnd,
+      );
+      for (const idx of matchedIndexes) {
+        if (idx >= observedAtValues.length || idx >= valueValues.length) {
+          continue;
+        }
+        outRows.push({
+          observed_at: observedAtValues[idx],
+          value: valueValues[idx],
+        });
+      }
+    }
+    rowGroupStart = rowGroupEnd;
   }
-  return fallbackKey;
+  return { exists: true, rows: outRows };
 }
 
-function normalizeValue(raw) {
-  if (raw === null || raw === undefined) {
-    return null;
-  }
-  const num = Number(raw);
-  return Number.isFinite(num) ? num : null;
+async function readParquetColumnValues(
+  file,
+  metadata,
+  columnName,
+  rowStart,
+  rowEnd,
+) {
+  let rows = [];
+  await parquetRead({
+    file,
+    metadata,
+    columns: [columnName],
+    rowStart,
+    rowEnd,
+    compressors,
+    onComplete: (columnRows) => {
+      if (Array.isArray(columnRows)) {
+        rows = columnRows;
+      }
+    },
+  });
+  return rows.map((entry) => Array.isArray(entry) ? entry[0] : undefined);
 }
 
 function appendFilteredRows(rows, {
-  timeseriesId,
   startMs,
   endMs,
   sinceMs,
   outByObservedAt,
 }) {
   for (const row of rows) {
-    const rowTimeseriesId = Number(row?.timeseries_id);
-    if (!Number.isFinite(rowTimeseriesId) || rowTimeseriesId !== timeseriesId) {
-      continue;
-    }
     const observedAt = toIsoOrNull(row?.observed_at);
     if (!observedAt) {
       continue;
@@ -251,6 +332,36 @@ function appendFilteredRows(rows, {
       value: normalizeValue(row?.value),
     });
   }
+}
+
+function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
+  if (!dayManifest || typeof dayManifest !== "object") {
+    return fallbackKey;
+  }
+  const manifests = Array.isArray(dayManifest.connector_manifests)
+    ? dayManifest.connector_manifests
+    : [];
+  for (const entry of manifests) {
+    const entryConnectorId = Number(entry?.connector_id);
+    if (
+      !Number.isFinite(entryConnectorId) || entryConnectorId !== connectorId
+    ) {
+      continue;
+    }
+    const entryKey = String(entry?.manifest_key || "").trim();
+    if (entryKey) {
+      return entryKey;
+    }
+  }
+  return fallbackKey;
+}
+
+function normalizeValue(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  const num = Number(raw);
+  return Number.isFinite(num) ? num : null;
 }
 
 function normalizeAndSortRows(rowsByObservedAt, limit) {
@@ -278,6 +389,12 @@ async function readHistoryRows({
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
   const sinceMs = sinceIso ? Date.parse(sinceIso) : Number.NaN;
+  const parquetRowChunkSize = parsePositiveInt(
+    env.UK_AQ_OBSERVS_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE,
+    5000,
+    500,
+    50000,
+  );
 
   const days = listUtcDays(startIso, endIso);
   const rowsByObservedAt = new Map();
@@ -304,7 +421,10 @@ async function readHistoryRows({
       connectorId,
       connectorManifestFallbackKey,
     );
-    const connectorManifestObject = await fetchJsonObjectFromR2(env, connectorManifestKey);
+    const connectorManifestObject = await fetchJsonObjectFromR2(
+      env,
+      connectorManifestKey,
+    );
     if (!connectorManifestObject.exists) {
       missingConnectorManifestKeys.push(connectorManifestKey);
       continue;
@@ -320,13 +440,17 @@ async function readHistoryRows({
         continue;
       }
       scannedParquetKeys.push(parquetKey);
-      const parquet = await fetchParquetRowsFromR2(env, parquetKey);
+      const parquet = await fetchFilteredParquetRowsFromR2(
+        env,
+        parquetKey,
+        timeseriesId,
+        parquetRowChunkSize,
+      );
       if (!parquet.exists) {
         missingParquetKeys.push(parquetKey);
         continue;
       }
       appendFilteredRows(parquet.rows, {
-        timeseriesId,
         startMs,
         endMs,
         sinceMs,
@@ -349,10 +473,15 @@ async function readHistoryRows({
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   if (!VALID_PATHS.has(url.pathname)) {
-    return jsonResponse({ ok: false, error: "Not found." }, { status: 404, cacheSeconds: 30 });
+    return jsonResponse({ ok: false, error: "Not found." }, {
+      status: 404,
+      cacheSeconds: 30,
+    });
   }
 
-  const timeseriesId = parseRequiredPositiveInt(url.searchParams.get("timeseries_id"));
+  const timeseriesId = parseRequiredPositiveInt(
+    url.searchParams.get("timeseries_id"),
+  );
   if (!timeseriesId) {
     return jsonResponse({
       ok: false,
@@ -360,7 +489,9 @@ async function handleRequest(request, env) {
     }, { status: 400, cacheSeconds: 30 });
   }
 
-  const connectorId = parseRequiredPositiveInt(url.searchParams.get("connector_id"));
+  const connectorId = parseRequiredPositiveInt(
+    url.searchParams.get("connector_id"),
+  );
   if (!connectorId) {
     return jsonResponse({
       ok: false,
@@ -393,7 +524,11 @@ async function handleRequest(request, env) {
     }, { status: 400, cacheSeconds: 30 });
   }
 
-  const limit = parseOptionalPositiveInt(url.searchParams.get("limit"), 1, MAX_LIMIT);
+  const limit = parseOptionalPositiveInt(
+    url.searchParams.get("limit"),
+    1,
+    MAX_LIMIT,
+  );
   if (url.searchParams.has("limit") && limit === null) {
     return jsonResponse({
       ok: false,
@@ -437,7 +572,8 @@ async function handleRequest(request, env) {
       days_scanned: historyRead.days_scanned,
       scanned_parquet_files: historyRead.scanned_parquet_files,
       missing_day_manifest_keys: historyRead.missing_day_manifest_keys,
-      missing_connector_manifest_keys: historyRead.missing_connector_manifest_keys,
+      missing_connector_manifest_keys:
+        historyRead.missing_connector_manifest_keys,
       missing_parquet_keys: historyRead.missing_parquet_keys,
     },
   }, {

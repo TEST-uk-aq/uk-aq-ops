@@ -117,6 +117,7 @@ Primary controls:
 - `GET /v1/observations` (alias: `GET /`)
 - reads only committed R2 history days/manifests under `history/v1/observations/...`
 - supports ZSTD-compressed parquet via `hyparquet-compressors` (required for current history parts)
+- applies parquet `timeseries_id` filter pushdown (row-group stats) before row materialization to reduce worker CPU/memory
 - requires `x-uk-aq-upstream-auth` matching `UK_AQ_EDGE_UPSTREAM_SECRET`
 - returns normalized `{observed_at,value}` rows for a single `timeseries_id` + `connector_id`
 - consumed by ingest edge function `uk_aq_timeseries` for old-window reads
