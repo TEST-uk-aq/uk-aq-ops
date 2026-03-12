@@ -47,6 +47,7 @@ jobs:
       UK_AQ_DB_SIZE_CLEANUP_RPC: ${{ vars.UK_AQ_DB_SIZE_CLEANUP_RPC || 'uk_aq_rpc_db_size_metric_cleanup' }}
       UK_AQ_DB_SIZE_RETENTION_DAYS: ${{ vars.UK_AQ_DB_SIZE_RETENTION_DAYS || '120' }}
       UK_AQ_SCHEMA_SIZE_SOURCE_RPC: ${{ vars.UK_AQ_SCHEMA_SIZE_SOURCE_RPC || 'uk_aq_rpc_schema_size_bytes' }}
+      UK_AQ_SCHEMA_SIZE_SOURCE_TIMEOUT_MS: ${{ vars.UK_AQ_SCHEMA_SIZE_SOURCE_TIMEOUT_MS || '120000' }}
       UK_AQ_SCHEMA_SIZE_UPSERT_RPC: ${{ vars.UK_AQ_SCHEMA_SIZE_UPSERT_RPC || 'uk_aq_rpc_schema_size_metric_upsert' }}
       UK_AQ_SCHEMA_SIZE_CLEANUP_RPC: ${{ vars.UK_AQ_SCHEMA_SIZE_CLEANUP_RPC || 'uk_aq_rpc_schema_size_metric_cleanup' }}
       UK_AQ_SCHEMA_SIZE_RETENTION_DAYS: ${{ vars.UK_AQ_SCHEMA_SIZE_RETENTION_DAYS || '120' }}
@@ -248,6 +249,7 @@ jobs:
           add_env UK_AQ_DB_SIZE_CLEANUP_RPC
           add_env UK_AQ_DB_SIZE_RETENTION_DAYS
           add_env UK_AQ_SCHEMA_SIZE_SOURCE_RPC
+          add_env UK_AQ_SCHEMA_SIZE_SOURCE_TIMEOUT_MS
           add_env UK_AQ_SCHEMA_SIZE_UPSERT_RPC
           add_env UK_AQ_SCHEMA_SIZE_CLEANUP_RPC
           add_env UK_AQ_SCHEMA_SIZE_RETENTION_DAYS

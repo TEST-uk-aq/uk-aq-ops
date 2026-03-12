@@ -10,6 +10,9 @@ type RpcResult<T> = {
   data: T | null;
   error: RpcError | null;
 };
+type RpcCallOptions = {
+  timeout_ms?: number;
+};
 
 type DbSizeSample = {
   database_label: "ingestdb" | "obs_aqidb";
@@ -83,6 +86,10 @@ const SCHEMA_SIZE_CLEANUP_RPC = (Deno.env.get("UK_AQ_SCHEMA_SIZE_CLEANUP_RPC") |
 const SCHEMA_SIZE_RETENTION_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_SCHEMA_SIZE_RETENTION_DAYS"),
   120,
+);
+const SCHEMA_SIZE_SOURCE_TIMEOUT_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_SCHEMA_SIZE_SOURCE_TIMEOUT_MS"),
+  120000,
 );
 
 const R2_DOMAIN_SIZE_UPSERT_RPC = (Deno.env.get("UK_AQ_R2_DOMAIN_SIZE_UPSERT_RPC") ||
@@ -282,8 +289,12 @@ async function postgrestRpc<T>(
   privilegedKey: string,
   rpcName: string,
   args: Record<string, unknown>,
+  options: RpcCallOptions = {},
 ): Promise<RpcResult<T>> {
   const url = `${normalizeUrl(baseUrl)}/rpc/${rpcName}`;
+  const timeoutMs = Number.isFinite(options.timeout_ms)
+    ? Math.max(0, Math.trunc(options.timeout_ms as number))
+    : 0;
   const headers: Record<string, string> = {
     apikey: privilegedKey,
     Authorization: `Bearer ${privilegedKey}`,
@@ -295,11 +306,16 @@ async function postgrestRpc<T>(
   };
 
   for (let attempt = 1; attempt <= RPC_RETRIES; attempt += 1) {
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timeoutHandle = controller
+      ? setTimeout(() => controller.abort("rpc_timeout"), timeoutMs)
+      : null;
     try {
       const response = await fetch(url, {
         method: "POST",
         headers,
         body: JSON.stringify(args),
+        signal: controller?.signal,
       });
       const contentType = (response.headers.get("content-type") || "")
         .toLowerCase();
@@ -324,12 +340,22 @@ async function postgrestRpc<T>(
         error: { message: errorMessage },
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = (error instanceof DOMException &&
+          error.name === "AbortError" &&
+          timeoutMs > 0)
+        ? `request timeout after ${timeoutMs}ms`
+        : error instanceof Error
+        ? error.message
+        : String(error);
       if (attempt < RPC_RETRIES) {
         await sleep(Math.min(5000, 1000 * attempt));
         continue;
       }
       return { data: null, error: { message } };
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
     }
   }
 
@@ -433,6 +459,7 @@ async function collectSchemaSizeSamples(
     obsSource.privileged_key,
     SCHEMA_SIZE_SOURCE_RPC,
     {},
+    { timeout_ms: SCHEMA_SIZE_SOURCE_TIMEOUT_MS },
   );
   if (result.error) {
     throw new Error(result.error.message);
@@ -616,6 +643,7 @@ async function main(): Promise<void> {
     started_at: startedAt,
     db_size_retention_days: DB_SIZE_RETENTION_DAYS,
     schema_size_retention_days: SCHEMA_SIZE_RETENTION_DAYS,
+    schema_size_source_timeout_ms: SCHEMA_SIZE_SOURCE_TIMEOUT_MS,
     r2_domain_size_retention_days: R2_DOMAIN_SIZE_RETENTION_DAYS,
     ingest_label: INGEST_DB_LABEL,
     obs_aqidb_label: OBS_AQIDB_DB_LABEL,

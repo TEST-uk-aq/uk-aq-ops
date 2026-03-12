@@ -346,7 +346,7 @@ const OBS_AQIDB_SUPABASE_URL = optionalEnv("OBS_AQIDB_SUPABASE_URL");
 const OBS_AQI_PRIVILEGED_KEY = optionalEnv("OBS_AQIDB_SECRET_KEY");
 
 const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
-const OPS_SCHEMA = (Deno.env.get("UK_AQ_BACKFILL_OPS_SCHEMA") || "uk_aq_ops").trim();
+const OPS_SCHEMA = (Deno.env.get("UK_AQ_BACKFILL_OPS_SCHEMA") || "uk_aq_public").trim();
 
 const HOURLY_FINGERPRINT_RPC = (Deno.env.get("UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC") ||
   "uk_aq_rpc_observations_hourly_fingerprint").trim();
@@ -547,6 +547,18 @@ const SCOMM_ARCHIVE_TIMEOUT_MS = parsePositiveInt(
   120000,
   5000,
   600000,
+);
+const SCOMM_ARCHIVE_FETCH_RETRIES = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SCOMM_ARCHIVE_FETCH_RETRIES"),
+  3,
+  1,
+  10,
+);
+const SCOMM_ARCHIVE_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SCOMM_ARCHIVE_RETRY_BASE_MS"),
+  1500,
+  100,
+  30000,
 );
 const SCOMM_RAW_MIRROR_ROOT = optionalEnv("UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT");
 
@@ -3274,23 +3286,46 @@ async function resolveConnectorIdByCode(connectorCodeRaw: string): Promise<numbe
 }
 
 async function fetchTextWithTimeout(url: string, timeoutMs: number): Promise<string> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "uk-aq-backfill-cloud-run",
-      },
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} for ${url}`);
+  let lastErrorMessage = `failed to fetch ${url}`;
+
+  for (let attempt = 1; attempt <= SCOMM_ARCHIVE_FETCH_RETRIES; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "uk-aq-backfill-cloud-run",
+        },
+      });
+      if (response.ok) {
+        return await response.text();
+      }
+
+      const statusMessage = `HTTP ${response.status} for ${url}`;
+      lastErrorMessage = statusMessage;
+      const canRetry = attempt < SCOMM_ARCHIVE_FETCH_RETRIES &&
+        (response.status === 408 || isRetryableStatus(response.status));
+      if (canRetry) {
+        await sleep(Math.min(15000, SCOMM_ARCHIVE_RETRY_BASE_MS * attempt));
+        continue;
+      }
+      throw new Error(statusMessage);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastErrorMessage = message;
+      if (attempt < SCOMM_ARCHIVE_FETCH_RETRIES) {
+        await sleep(Math.min(15000, SCOMM_ARCHIVE_RETRY_BASE_MS * attempt));
+        continue;
+      }
+      throw new Error(message);
+    } finally {
+      clearTimeout(timeout);
     }
-    return await response.text();
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw new Error(lastErrorMessage);
 }
 
 function parseSensorcommunityStationRefFromFilename(fileName: string): string | null {

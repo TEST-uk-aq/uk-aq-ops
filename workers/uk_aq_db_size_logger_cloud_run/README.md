@@ -37,6 +37,7 @@ and continues; it only fails when both DB sources fail in the same run.
 - `UK_AQ_DB_SIZE_RETENTION_DAYS` (default `120`)
 - `UK_AQ_DB_SIZE_RPC_RETRIES` (default `3`)
 - `UK_AQ_SCHEMA_SIZE_SOURCE_RPC` (default `uk_aq_rpc_schema_size_bytes`)
+- `UK_AQ_SCHEMA_SIZE_SOURCE_TIMEOUT_MS` (default `120000`)
 - `UK_AQ_SCHEMA_SIZE_UPSERT_RPC` (default `uk_aq_rpc_schema_size_metric_upsert`)
 - `UK_AQ_SCHEMA_SIZE_CLEANUP_RPC` (default `uk_aq_rpc_schema_size_metric_cleanup`)
 - `UK_AQ_SCHEMA_SIZE_RETENTION_DAYS` (default `120`)
