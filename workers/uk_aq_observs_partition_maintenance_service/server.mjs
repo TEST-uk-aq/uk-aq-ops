@@ -10,6 +10,7 @@ const RPC_ENFORCE_HOT_COLD_INDEXES = "uk_aq_rpc_observs_enforce_hot_cold_indexes
 const RPC_DEFAULT_DIAGNOSTICS = "uk_aq_rpc_observs_observations_default_diagnostics";
 const RPC_DROP_CANDIDATES = "uk_aq_rpc_observs_drop_candidates";
 const RPC_DROP_PARTITION = "uk_aq_rpc_observs_drop_partition";
+const RPC_DAY_HAS_ROWS = "uk_aq_rpc_observs_day_has_rows";
 
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -739,6 +740,33 @@ function normalizeDropCandidate(row) {
   };
 }
 
+function parseDayHasRowsRow(row) {
+  const value = row?.has_rows;
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return ["true", "t", "1", "yes", "y"].includes(normalized);
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0;
+  }
+  return false;
+}
+
+async function checkDayHasRows(observsClient, dayUtc) {
+  const rows = await callRpc(
+    observsClient,
+    RPC_DAY_HAS_ROWS,
+    {
+      p_day_utc: dayUtc,
+    },
+    `observs day has rows ${dayUtc}`,
+  );
+  return parseDayHasRowsRow(rows?.[0]);
+}
+
 function parseDefaultDiagnosticsRow(row) {
   const count = Number(row?.default_row_count ?? 0);
   const topOffenders = Array.isArray(row?.top_offenders)
@@ -890,6 +918,51 @@ async function runObservsPartitionMaintenance(config) {
 
     const historyManifestCheck = await historyManifestExists(candidate.partition_day_utc, config.r2);
     if (!historyManifestCheck.confirmed) {
+      const hasRowsCheck = await (async () => {
+        try {
+          const hasRows = await checkDayHasRows(observsClient, candidate.partition_day_utc);
+          return {
+            checked: true,
+            has_rows: hasRows,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            checked: false,
+            has_rows: null,
+            error: message,
+          };
+        }
+      })();
+
+      if (hasRowsCheck.checked && hasRowsCheck.has_rows === false) {
+        const dropResultRows = await callRpc(
+          observsClient,
+          RPC_DROP_PARTITION,
+          {
+            p_partition_name: candidate.partition_name,
+          },
+          `drop empty observs partition ${candidate.partition_name}`,
+        );
+        const didDrop = Boolean(dropResultRows?.[0]?.dropped);
+        if (didDrop) {
+          dropped.push({
+            partition_name: candidate.partition_name,
+            partition_day_utc: candidate.partition_day_utc,
+            history_manifest_method: "no_manifest_day_has_rows_false",
+          });
+          logStructured("INFO", "observs_partition_dropped_empty_without_manifest", {
+            run_id: runId,
+            partition_name: candidate.partition_name,
+            partition_day_utc: candidate.partition_day_utc,
+            history_manifest_method: "no_manifest_day_has_rows_false",
+            history_manifest_check: historyManifestCheck,
+            has_rows_check: hasRowsCheck,
+          });
+          continue;
+        }
+      }
+
       const skipId = randomUUID();
       const createdAt = nowIso();
       const skipPayload = {
@@ -898,6 +971,7 @@ async function runObservsPartitionMaintenance(config) {
         message: "SKIP DROP — history manifest not confirmed",
         partition: candidate,
         history_manifest_check: historyManifestCheck,
+        has_rows_check: hasRowsCheck,
         created_at: createdAt,
       };
 
@@ -924,6 +998,7 @@ async function runObservsPartitionMaintenance(config) {
         partition_day_utc: candidate.partition_day_utc,
         reason: "history_manifest_not_confirmed",
         history_manifest_check: historyManifestCheck,
+        has_rows_check: hasRowsCheck,
         dropbox_uploaded: Boolean(skipDropboxResult.uploaded),
         dropbox_path: skipDropboxResult.dropbox_path || null,
         dropbox_reason: skipDropboxResult.reason || null,
