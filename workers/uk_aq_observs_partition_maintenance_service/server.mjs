@@ -548,6 +548,124 @@ async function r2HeadDayManifest(r2, dayUtc) {
   };
 }
 
+async function r2GetManifestJson(r2, manifestKey) {
+  const request = buildAwsSignedRequest({
+    method: "GET",
+    endpoint: r2.endpoint,
+    region: r2.region,
+    accessKeyId: r2.accessKeyId,
+    secretAccessKey: r2.secretAccessKey,
+    bucket: r2.bucket,
+    objectKey: manifestKey,
+  });
+
+  const response = await fetch(request.url, {
+    method: "GET",
+    headers: request.headers,
+  });
+
+  if (response.status !== 200) {
+    const body = await readResponseText(response, 500);
+    return {
+      confirmed: false,
+      method: "get_day_manifest",
+      manifest_key: manifestKey,
+      status: response.status,
+      response_text: body,
+    };
+  }
+
+  let text = "";
+  try {
+    text = await response.text();
+  } catch {
+    return {
+      confirmed: false,
+      method: "get_day_manifest",
+      manifest_key: manifestKey,
+      status: response.status,
+      reason: "manifest_read_error",
+    };
+  }
+
+  let manifest = null;
+  try {
+    manifest = JSON.parse(text);
+  } catch {
+    return {
+      confirmed: false,
+      method: "get_day_manifest",
+      manifest_key: manifestKey,
+      status: response.status,
+      reason: "manifest_invalid_json",
+      response_text: text.slice(0, 500),
+    };
+  }
+
+  return {
+    confirmed: true,
+    method: "get_day_manifest",
+    manifest_key: manifestKey,
+    status: response.status,
+    manifest,
+  };
+}
+
+function validateManifestHash(dayUtc, manifest) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    return {
+      confirmed: false,
+      reason: "manifest_not_object",
+    };
+  }
+
+  const manifestDayUtc = typeof manifest.day_utc === "string"
+    ? manifest.day_utc.trim()
+    : "";
+  if (manifestDayUtc !== dayUtc) {
+    return {
+      confirmed: false,
+      reason: "manifest_day_mismatch",
+      manifest_day_utc: manifestDayUtc || null,
+      expected_day_utc: dayUtc,
+    };
+  }
+
+  const storedManifestHash = typeof manifest.manifest_hash === "string"
+    ? manifest.manifest_hash.trim()
+    : "";
+  if (!storedManifestHash) {
+    return {
+      confirmed: false,
+      reason: "manifest_hash_missing",
+    };
+  }
+
+  const payloadWithoutHash = { ...manifest };
+  delete payloadWithoutHash.manifest_hash;
+
+  const recomputedManifestHash = awsSha256Hex(JSON.stringify(payloadWithoutHash));
+  if (recomputedManifestHash !== storedManifestHash) {
+    return {
+      confirmed: false,
+      reason: "manifest_hash_mismatch",
+      expected_manifest_hash: recomputedManifestHash,
+      actual_manifest_hash: storedManifestHash,
+    };
+  }
+
+  const sourceRowCount = Number(manifest.source_row_count ?? 0);
+  const fileCount = Number(manifest.file_count ?? 0);
+  return {
+    confirmed: true,
+    method: "manifest_hash_validated",
+    day_utc: manifestDayUtc,
+    source_row_count: Number.isFinite(sourceRowCount) ? Math.max(0, Math.trunc(sourceRowCount)) : 0,
+    file_count: Number.isFinite(fileCount) ? Math.max(0, Math.trunc(fileCount)) : 0,
+    manifest_hash: storedManifestHash,
+  };
+}
+
 async function historyManifestExists(dayUtc, r2) {
   if (!hasRequiredR2Config(r2)) {
     return {
@@ -557,19 +675,48 @@ async function historyManifestExists(dayUtc, r2) {
   }
 
   try {
-    const manifestResult = await r2HeadDayManifest(r2, dayUtc);
-    if (manifestResult.confirmed) {
+    const headResult = await r2HeadDayManifest(r2, dayUtc);
+    if (!headResult.confirmed) {
       return {
-        confirmed: true,
-        method: manifestResult.method,
-        details: manifestResult,
+        confirmed: false,
+        reason: "history_manifest_not_confirmed",
+        details: headResult,
+      };
+    }
+
+    const getResult = await r2GetManifestJson(r2, headResult.manifest_key);
+    if (!getResult.confirmed) {
+      return {
+        confirmed: false,
+        reason: "history_manifest_not_confirmed",
+        details: getResult,
+      };
+    }
+
+    const validationResult = validateManifestHash(dayUtc, getResult.manifest);
+    if (!validationResult.confirmed) {
+      return {
+        confirmed: false,
+        reason: "history_manifest_not_confirmed",
+        details: {
+          method: "validate_day_manifest_hash",
+          manifest_key: headResult.manifest_key,
+          ...validationResult,
+        },
       };
     }
 
     return {
-      confirmed: false,
-      reason: "history_manifest_not_confirmed",
-      details: manifestResult,
+      confirmed: true,
+      method: "head_get_validate_manifest_hash",
+      details: {
+        method: "head_get_validate_manifest_hash",
+        manifest_key: headResult.manifest_key,
+        day_utc: validationResult.day_utc,
+        source_row_count: validationResult.source_row_count,
+        file_count: validationResult.file_count,
+        manifest_hash: validationResult.manifest_hash,
+      },
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
