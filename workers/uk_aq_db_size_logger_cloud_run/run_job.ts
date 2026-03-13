@@ -91,6 +91,10 @@ const SCHEMA_SIZE_SOURCE_TIMEOUT_MS = parsePositiveInt(
   Deno.env.get("UK_AQ_SCHEMA_SIZE_SOURCE_TIMEOUT_MS"),
   120000,
 );
+const SCHEMA_SIZE_CLOUD_RUN_ENABLED = parseBoolean(
+  Deno.env.get("UK_AQ_SCHEMA_SIZE_CLOUD_RUN_ENABLED"),
+  false,
+);
 
 const R2_DOMAIN_SIZE_UPSERT_RPC = (Deno.env.get("UK_AQ_R2_DOMAIN_SIZE_UPSERT_RPC") ||
   "uk_aq_rpc_r2_domain_size_metric_upsert").trim();
@@ -177,6 +181,20 @@ function parsePositiveInt(raw: string | undefined | null, fallback: number): num
     return fallback;
   }
   return Math.trunc(value);
+}
+
+function parseBoolean(raw: string | undefined | null, fallback: boolean): boolean {
+  const value = String(raw || "").trim().toLowerCase();
+  if (!value) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "y", "on"].includes(value)) {
+    return true;
+  }
+  if (["0", "false", "no", "n", "off"].includes(value)) {
+    return false;
+  }
+  return fallback;
 }
 
 function parseDatabaseLabel(
@@ -642,6 +660,7 @@ async function main(): Promise<void> {
   console.log("uk_aq_db_size_logger_start", {
     started_at: startedAt,
     db_size_retention_days: DB_SIZE_RETENTION_DAYS,
+    schema_size_cloud_run_enabled: SCHEMA_SIZE_CLOUD_RUN_ENABLED,
     schema_size_retention_days: SCHEMA_SIZE_RETENTION_DAYS,
     schema_size_source_timeout_ms: SCHEMA_SIZE_SOURCE_TIMEOUT_MS,
     r2_domain_size_retention_days: R2_DOMAIN_SIZE_RETENTION_DAYS,
@@ -694,37 +713,44 @@ async function main(): Promise<void> {
   let schemaSamples: SchemaSizeSample[] = [];
   let schemaRowsDeleted = 0;
   let schemaSourceAvailable = false;
-  try {
-    schemaSamples = await collectSchemaSizeSamples(obsSource);
-    if (schemaSamples.length === 0) {
-      warnings.push(
-        "schema_source: no valid schema size rows returned; skipping schema upsert for this run",
-      );
-    } else {
-      schemaSourceAvailable = true;
-    }
-  } catch (error) {
-    const message = warningMessage(error);
-    warnings.push(`schema_source: ${message}`);
-  }
-
-  if (!schemaSourceAvailable) {
-    warnings.push("schema_persist: skipped (source unavailable); will retry next run");
-  }
-
-  if (schemaSourceAvailable) {
+  if (SCHEMA_SIZE_CLOUD_RUN_ENABLED) {
     try {
-      for (const sample of schemaSamples) {
-        await upsertSchemaSizeSample(obsSource, sample);
+      schemaSamples = await collectSchemaSizeSamples(obsSource);
+      if (schemaSamples.length === 0) {
+        warnings.push(
+          "schema_source: no valid schema size rows returned; skipping schema upsert for this run",
+        );
+      } else {
+        schemaSourceAvailable = true;
       }
-      schemaRowsDeleted = await cleanupMetricRows(
-        obsSource,
-        SCHEMA_SIZE_CLEANUP_RPC,
-        SCHEMA_SIZE_RETENTION_DAYS,
-      );
     } catch (error) {
-      warnings.push(`schema_persist: ${warningMessage(error)}`);
+      const message = warningMessage(error);
+      warnings.push(`schema_source: ${message}`);
     }
+
+    if (!schemaSourceAvailable) {
+      warnings.push("schema_persist: skipped (source unavailable); will retry next run");
+    }
+
+    if (schemaSourceAvailable) {
+      try {
+        for (const sample of schemaSamples) {
+          await upsertSchemaSizeSample(obsSource, sample);
+        }
+        schemaRowsDeleted = await cleanupMetricRows(
+          obsSource,
+          SCHEMA_SIZE_CLEANUP_RPC,
+          SCHEMA_SIZE_RETENTION_DAYS,
+        );
+      } catch (error) {
+        warnings.push(`schema_persist: ${warningMessage(error)}`);
+      }
+    }
+  } else {
+    console.log("uk_aq_db_size_logger_schema_size_skipped", {
+      started_at: startedAt,
+      reason: "pg_cron_primary",
+    });
   }
 
   let r2DomainSamples: R2DomainSizeSample[] = [];
@@ -777,6 +803,7 @@ async function main(): Promise<void> {
     started_at: startedAt,
     ingestdb: samplesByLabel.ingestdb,
     obs_aqidb: samplesByLabel.obs_aqidb,
+    schema_size_cloud_run_enabled: SCHEMA_SIZE_CLOUD_RUN_ENABLED,
     schema_size_samples: schemaSamples,
     r2_domain_size_samples: r2DomainSamples,
     rows_deleted: rowsDeleted,

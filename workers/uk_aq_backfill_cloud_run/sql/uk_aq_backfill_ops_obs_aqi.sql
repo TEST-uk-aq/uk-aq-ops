@@ -59,7 +59,7 @@ create table if not exists uk_aq_ops.backfill_checkpoints (
   day_utc date not null,
   connector_id integer not null,
   source_kind text not null check (source_kind in ('ingestdb', 'obs_aqidb', 'r2', 'api', 'download', 'manual_file', 'none')),
-  status text not null check (status in ('complete', 'error', 'dry_run', 'skipped')),
+  status text not null check (status in ('complete', 'error', 'dry_run', 'skipped', 'stubbed')),
   rows_read bigint not null default 0,
   rows_written_aqilevels bigint not null default 0,
   objects_written_r2 bigint not null default 0,

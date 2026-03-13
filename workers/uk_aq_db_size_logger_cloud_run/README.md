@@ -3,18 +3,23 @@
 This Cloud Run service samples and persists hourly size metrics for:
 
 - DB clusters: `ingestdb`, `obs_aqidb`
-- obs_aqidb schemas: `uk_aq_observs`, `uk_aq_aqilevels`
 - R2 History domains: `observations`, `aqilevels`
 
+Schema-size metrics for `obs_aqidb` are now primarily written by a separate
+Supabase `pg_cron` job in `obs_aqidb` (`uk_aq_obs_aqidb_schema_size_metrics_hourly`).
+Cloud Run schema-size sampling is disabled by default and kept only as an
+optional fallback/manual path.
+
 DB cluster metrics are written via `uk_aq_public.uk_aq_rpc_db_size_metric_upsert`.
-Schema and R2 domain metrics are written via
-`uk_aq_public.uk_aq_rpc_schema_size_metric_upsert` and
-`uk_aq_public.uk_aq_rpc_r2_domain_size_metric_upsert`.
+R2 domain metrics are written via `uk_aq_public.uk_aq_rpc_r2_domain_size_metric_upsert`.
+If Cloud Run schema sampling is explicitly enabled, schema metrics are written via
+`uk_aq_public.uk_aq_rpc_schema_size_metric_upsert`.
 
 Write targets:
 - DB cluster metrics -> each cluster (`ingestdb`, `obs_aqidb`)
-- Schema metrics (`uk_aq_observs`, `uk_aq_aqilevels`) -> `obs_aqidb`
 - R2 domain metrics (`observations`, `aqilevels`) -> `ingestdb`
+- Schema metrics (`uk_aq_observs`, `uk_aq_aqilevels`) -> `obs_aqidb` via local `pg_cron`
+  by default, or via Cloud Run only when explicitly enabled
 
 Primary scheduling is now Supabase `pg_cron` in each DB (local sample/write).
 Cloud Run service remains available for manual/on-demand runs or fallback scheduling.
@@ -38,6 +43,7 @@ and continues; it only fails when both DB sources fail in the same run.
 - `UK_AQ_DB_SIZE_RPC_RETRIES` (default `3`)
 - `UK_AQ_SCHEMA_SIZE_SOURCE_RPC` (default `uk_aq_rpc_schema_size_bytes`)
 - `UK_AQ_SCHEMA_SIZE_SOURCE_TIMEOUT_MS` (default `120000`)
+- `UK_AQ_SCHEMA_SIZE_CLOUD_RUN_ENABLED` (default `false`; set `true` only to re-enable Cloud Run schema-size sampling/upserts)
 - `UK_AQ_SCHEMA_SIZE_UPSERT_RPC` (default `uk_aq_rpc_schema_size_metric_upsert`)
 - `UK_AQ_SCHEMA_SIZE_CLEANUP_RPC` (default `uk_aq_rpc_schema_size_metric_cleanup`)
 - `UK_AQ_SCHEMA_SIZE_RETENTION_DAYS` (default `120`)
