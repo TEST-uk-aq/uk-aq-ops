@@ -12,6 +12,7 @@ const RPC_DROP_CANDIDATES = "uk_aq_rpc_observs_drop_candidates";
 const RPC_DROP_PARTITION = "uk_aq_rpc_observs_drop_partition";
 const RPC_DAY_HAS_ROWS = "uk_aq_rpc_observs_day_has_rows";
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
+const RPC_DAY_COUNT_DELETE = "uk_aq_rpc_obs_aqidb_day_count_delete";
 
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -459,6 +460,46 @@ async function callRpcWithRetry(client, fnName, params, errorLabel, options = {}
   }
 
   return [];
+}
+
+async function deleteCurrentDayCountRow(client, dataset, dayUtc, runId) {
+  try {
+    const rows = await callRpcWithRetry(
+      client,
+      RPC_DAY_COUNT_DELETE,
+      {
+        p_dataset: dataset,
+        p_day_utc: dayUtc,
+      },
+      `delete ${dataset} day-count row ${dayUtc}`,
+    );
+    const deletedRows = Number(rows?.[0]?.deleted_rows ?? 0);
+    const normalizedDeletedRows = Number.isFinite(deletedRows) && deletedRows > 0 ? deletedRows : 0;
+    logStructured("INFO", "observs_day_count_row_deleted", {
+      run_id: runId,
+      dataset,
+      day_utc: dayUtc,
+      deleted_rows: normalizedDeletedRows,
+    });
+    return {
+      ok: true,
+      deleted_rows: normalizedDeletedRows,
+      error: null,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logStructured("WARNING", "observs_day_count_row_delete_failed", {
+      run_id: runId,
+      dataset,
+      day_utc: dayUtc,
+      message,
+    });
+    return {
+      ok: false,
+      deleted_rows: 0,
+      error: message,
+    };
+  }
 }
 
 function isMissingDayHasRowsFunctionError(message) {
@@ -1043,16 +1084,26 @@ async function runObservsPartitionMaintenance(config) {
         );
         const didDrop = Boolean(dropResultRows?.[0]?.dropped);
         if (didDrop) {
+          const dayCountDelete = await deleteCurrentDayCountRow(
+            observsClient,
+            "observs",
+            candidate.partition_day_utc,
+            runId,
+          );
           dropped.push({
             partition_name: candidate.partition_name,
             partition_day_utc: candidate.partition_day_utc,
             history_manifest_method: "no_manifest_day_has_rows_false",
+            day_count_deleted_rows: dayCountDelete.deleted_rows,
+            day_count_delete_error: dayCountDelete.error,
           });
           logStructured("INFO", "observs_partition_dropped_empty_without_manifest", {
             run_id: runId,
             partition_name: candidate.partition_name,
             partition_day_utc: candidate.partition_day_utc,
             history_manifest_method: "no_manifest_day_has_rows_false",
+            day_count_deleted_rows: dayCountDelete.deleted_rows,
+            day_count_delete_error: dayCountDelete.error,
             history_manifest_check: historyManifestCheck,
             has_rows_check: hasRowsCheck,
           });
@@ -1120,16 +1171,26 @@ async function runObservsPartitionMaintenance(config) {
     );
     const didDrop = Boolean(dropResultRows?.[0]?.dropped);
     if (didDrop) {
+      const dayCountDelete = await deleteCurrentDayCountRow(
+        observsClient,
+        "observs",
+        candidate.partition_day_utc,
+        runId,
+      );
       dropped.push({
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
         history_manifest_method: historyManifestCheck.method,
+        day_count_deleted_rows: dayCountDelete.deleted_rows,
+        day_count_delete_error: dayCountDelete.error,
       });
       logStructured("INFO", "observs_partition_dropped", {
         run_id: runId,
         partition_name: candidate.partition_name,
         partition_day_utc: candidate.partition_day_utc,
         history_manifest_method: historyManifestCheck.method,
+        day_count_deleted_rows: dayCountDelete.deleted_rows,
+        day_count_delete_error: dayCountDelete.error,
       });
     } else {
       const skip = {

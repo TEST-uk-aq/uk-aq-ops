@@ -8,6 +8,7 @@ const AQILEVELS_TIME_ZONE = "Europe/London";
 const RPC_SCHEMA = "uk_aq_public";
 const RPC_DROP_CANDIDATES = "uk_aq_rpc_aqilevels_drop_candidates";
 const RPC_DROP_DAY = "uk_aq_rpc_aqilevels_drop_day";
+const RPC_DAY_COUNT_DELETE = "uk_aq_rpc_obs_aqidb_day_count_delete";
 
 const DEFAULT_AQILEVELS_RETENTION_DAYS = 14;
 const DEFAULT_DROP_DRY_RUN = false;
@@ -254,6 +255,46 @@ async function callRpc(client, fnName, params, errorLabel) {
   return data || [];
 }
 
+async function deleteCurrentDayCountRow(client, dataset, dayUtc, runId) {
+  try {
+    const rows = await callRpc(
+      client,
+      RPC_DAY_COUNT_DELETE,
+      {
+        p_dataset: dataset,
+        p_day_utc: dayUtc,
+      },
+      `delete ${dataset} day-count row ${dayUtc}`,
+    );
+    const deletedRows = Number(rows?.[0]?.deleted_rows ?? 0);
+    const normalizedDeletedRows = Number.isFinite(deletedRows) && deletedRows > 0 ? deletedRows : 0;
+    logStructured("INFO", "aqilevels_day_count_row_deleted", {
+      run_id: runId,
+      dataset,
+      day_utc: dayUtc,
+      deleted_rows: normalizedDeletedRows,
+    });
+    return {
+      ok: true,
+      deleted_rows: normalizedDeletedRows,
+      error: null,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logStructured("WARNING", "aqilevels_day_count_row_delete_failed", {
+      run_id: runId,
+      dataset,
+      day_utc: dayUtc,
+      message,
+    });
+    return {
+      ok: false,
+      deleted_rows: 0,
+      error: message,
+    };
+  }
+}
+
 function normalizeCandidate(row) {
   const dayUtc = normalizeIsoDate(row?.day_utc);
   const hourlyRows = Number(row?.hourly_rows || 0);
@@ -408,6 +449,12 @@ async function runAqilevelsRetention(config) {
       `drop aqilevels day ${candidate.day_utc}`,
     );
     const dropResult = normalizeDropResult(dropResultRows?.[0]);
+    const dayCountDelete = await deleteCurrentDayCountRow(
+      client,
+      "aqilevels",
+      candidate.day_utc,
+      runId,
+    );
 
     totalHourlyRowsDeleted += dropResult.hourly_rows_deleted;
     totalDailyRowsDeleted += dropResult.daily_rows_deleted;
@@ -417,6 +464,8 @@ async function runAqilevelsRetention(config) {
       hourly_rows_deleted: dropResult.hourly_rows_deleted,
       daily_rows_deleted: dropResult.daily_rows_deleted,
       history_manifest_method: historyManifestCheck.method,
+      day_count_deleted_rows: dayCountDelete.deleted_rows,
+      day_count_delete_error: dayCountDelete.error,
     });
 
     logStructured("INFO", "aqilevels_retention_day_dropped", {
@@ -425,6 +474,8 @@ async function runAqilevelsRetention(config) {
       hourly_rows_deleted: dropResult.hourly_rows_deleted,
       daily_rows_deleted: dropResult.daily_rows_deleted,
       history_manifest_method: historyManifestCheck.method,
+      day_count_deleted_rows: dayCountDelete.deleted_rows,
+      day_count_delete_error: dayCountDelete.error,
     });
   }
 
