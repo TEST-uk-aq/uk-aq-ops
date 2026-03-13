@@ -23,6 +23,8 @@ Write targets:
 
 Primary scheduling is now Supabase `pg_cron` in each DB (local sample/write).
 Cloud Run service remains available for manual/on-demand runs or fallback scheduling.
+When both Cloud Run DB-size and schema-size flags are disabled, the service can
+still run only the R2 domain-size path.
 If one DB source call fails (for example, statement timeout), the run records a warning
 and continues; it only fails when both DB sources fail in the same run.
 
@@ -39,6 +41,7 @@ and continues; it only fails when both DB sources fail in the same run.
 - `UK_AQ_DB_SIZE_RPC` (default `uk_aq_rpc_database_size_bytes`)
 - `UK_AQ_DB_SIZE_UPSERT_RPC` (default `uk_aq_rpc_db_size_metric_upsert`)
 - `UK_AQ_DB_SIZE_CLEANUP_RPC` (default `uk_aq_rpc_db_size_metric_cleanup`)
+- `UK_AQ_DB_SIZE_CLOUD_RUN_ENABLED` (default `true`; set `false` to skip Cloud Run DB-size sampling/upserts and leave DB-size to local `pg_cron`)
 - `UK_AQ_DB_SIZE_RETENTION_DAYS` (default `120`)
 - `UK_AQ_DB_SIZE_RPC_RETRIES` (default `3`)
 - `UK_AQ_SCHEMA_SIZE_SOURCE_RPC` (default `uk_aq_rpc_schema_size_bytes`)

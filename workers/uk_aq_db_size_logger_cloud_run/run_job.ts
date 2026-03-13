@@ -76,6 +76,10 @@ const DB_SIZE_RETENTION_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_DB_SIZE_RETENTION_DAYS"),
   120,
 );
+const DB_SIZE_CLOUD_RUN_ENABLED = parseBoolean(
+  Deno.env.get("UK_AQ_DB_SIZE_CLOUD_RUN_ENABLED"),
+  true,
+);
 
 const SCHEMA_SIZE_SOURCE_RPC = (Deno.env.get("UK_AQ_SCHEMA_SIZE_SOURCE_RPC") ||
   "uk_aq_rpc_schema_size_bytes").trim();
@@ -659,6 +663,7 @@ async function main(): Promise<void> {
   const startedAt = new Date().toISOString();
   console.log("uk_aq_db_size_logger_start", {
     started_at: startedAt,
+    db_size_cloud_run_enabled: DB_SIZE_CLOUD_RUN_ENABLED,
     db_size_retention_days: DB_SIZE_RETENTION_DAYS,
     schema_size_cloud_run_enabled: SCHEMA_SIZE_CLOUD_RUN_ENABLED,
     schema_size_retention_days: SCHEMA_SIZE_RETENTION_DAYS,
@@ -686,28 +691,35 @@ async function main(): Promise<void> {
   };
   let dbSourceSuccessCount = 0;
 
-  for (const source of sources) {
-    try {
-      const sample = await collectDbSizeSample(
-        source.database_label,
-        source.base_url,
-        source.privileged_key,
-      );
-      await upsertDbSizeSample(source, sample);
-      const deleted = await cleanupMetricRows(source, DB_SIZE_CLEANUP_RPC, DB_SIZE_RETENTION_DAYS);
+  if (DB_SIZE_CLOUD_RUN_ENABLED) {
+    for (const source of sources) {
+      try {
+        const sample = await collectDbSizeSample(
+          source.database_label,
+          source.base_url,
+          source.privileged_key,
+        );
+        await upsertDbSizeSample(source, sample);
+        const deleted = await cleanupMetricRows(source, DB_SIZE_CLEANUP_RPC, DB_SIZE_RETENTION_DAYS);
 
-      samplesByLabel[source.database_label] = sample;
-      rowsDeletedByDb[source.database_label] = deleted;
-      dbSourceSuccessCount += 1;
-    } catch (error) {
-      warnings.push(`db_size_${source.database_label}: ${warningMessage(error)}`);
+        samplesByLabel[source.database_label] = sample;
+        rowsDeletedByDb[source.database_label] = deleted;
+        dbSourceSuccessCount += 1;
+      } catch (error) {
+        warnings.push(`db_size_${source.database_label}: ${warningMessage(error)}`);
+      }
     }
-  }
 
-  if (dbSourceSuccessCount === 0) {
-    throw new Error(
-      "db_size: failed for all sources; no db size metrics persisted",
-    );
+    if (dbSourceSuccessCount === 0) {
+      throw new Error(
+        "db_size: failed for all sources; no db size metrics persisted",
+      );
+    }
+  } else {
+    console.log("uk_aq_db_size_logger_db_size_skipped", {
+      started_at: startedAt,
+      reason: "pg_cron_primary",
+    });
   }
 
   let schemaSamples: SchemaSizeSample[] = [];
@@ -803,6 +815,7 @@ async function main(): Promise<void> {
     started_at: startedAt,
     ingestdb: samplesByLabel.ingestdb,
     obs_aqidb: samplesByLabel.obs_aqidb,
+    db_size_cloud_run_enabled: DB_SIZE_CLOUD_RUN_ENABLED,
     schema_size_cloud_run_enabled: SCHEMA_SIZE_CLOUD_RUN_ENABLED,
     schema_size_samples: schemaSamples,
     r2_domain_size_samples: r2DomainSamples,
