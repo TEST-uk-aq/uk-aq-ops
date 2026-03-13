@@ -12,6 +12,7 @@ import {
   parsePositiveInt,
   parseRunMode,
   parseTriggerMode,
+  isSourceAcquisitionPendingError,
   shiftIsoDay,
   shouldSkipCompletedDay,
   utcDayEndIso,
@@ -4642,12 +4643,18 @@ async function fetchSensorcommunityArchiveFileNames(
   dayUtc: string,
 ): Promise<string[]> {
   const indexUrl = `${SCOMM_ARCHIVE_BASE_URL}/${dayUtc}/`;
-  const html = await fetchTextWithTimeout(
-    indexUrl,
-    SCOMM_ARCHIVE_TIMEOUT_MS,
-    SCOMM_ARCHIVE_FETCH_RETRIES,
-    SCOMM_ARCHIVE_RETRY_BASE_MS,
-  );
+  let html: string;
+  try {
+    html = await fetchTextWithTimeout(
+      indexUrl,
+      SCOMM_ARCHIVE_TIMEOUT_MS,
+      SCOMM_ARCHIVE_FETCH_RETRIES,
+      SCOMM_ARCHIVE_RETRY_BASE_MS,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`sensorcommunity_archive_index_fetch_failed: ${message}`);
+  }
   const files = new Set<string>();
   const pattern = /href="([^"]+\.csv)"/gi;
   let match: RegExpExecArray | null;
@@ -4685,12 +4692,20 @@ async function fetchSensorcommunityArchiveCsv(
   }
 
   const fileUrl = `${SCOMM_ARCHIVE_BASE_URL}/${dayUtc}/${fileName}`;
-  const text = await fetchTextWithTimeout(
-    fileUrl,
-    SCOMM_ARCHIVE_TIMEOUT_MS,
-    SCOMM_ARCHIVE_FETCH_RETRIES,
-    SCOMM_ARCHIVE_RETRY_BASE_MS,
-  );
+  let text: string;
+  try {
+    text = await fetchTextWithTimeout(
+      fileUrl,
+      SCOMM_ARCHIVE_TIMEOUT_MS,
+      SCOMM_ARCHIVE_FETCH_RETRIES,
+      SCOMM_ARCHIVE_RETRY_BASE_MS,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `sensorcommunity_archive_csv_fetch_failed: ${fileName}: ${message}`,
+    );
+  }
 
   if (mirrorPath) {
     fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
@@ -7428,22 +7443,10 @@ async function runSourceToAll(
           let archiveFileNames = sensorcommunityArchiveIndexByDay.get(dayUtc) ||
             null;
           if (!archiveFileNames) {
-            try {
-              archiveFileNames = await fetchSensorcommunityArchiveFileNames(
-                dayUtc,
-              );
-              sensorcommunityArchiveIndexByDay.set(dayUtc, archiveFileNames);
-            } catch (error) {
-              const message = error instanceof Error
-                ? error.message
-                : String(error);
-              warnings.push(
-                `Failed to fetch Sensor.Community archive index for ${dayUtc}: ${message}`,
-              );
-              throw new Error(
-                `sensorcommunity_archive_index_fetch_failed: ${message}`,
-              );
-            }
+            archiveFileNames = await fetchSensorcommunityArchiveFileNames(
+              dayUtc,
+            );
+            sensorcommunityArchiveIndexByDay.set(dayUtc, archiveFileNames);
           }
 
           const lookup = await fetchSourceLookupForConnector(connectorId);
@@ -7912,6 +7915,57 @@ async function runSourceToAll(
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (isSourceAcquisitionPendingError(sourceAdapter, message)) {
+          sourceAcquisitionPendingDaySet.add(dayUtc);
+          warnings.push(
+            `Pending ${sourceAdapter} source acquisition for ${dayUtc}: ${message}`,
+          );
+          await ledgerInsertRunDay(ledgerEnabled, {
+            run_id: runId,
+            run_mode: RUN_MODE,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_kind: "download",
+            status: "stubbed",
+            rows_read: 0,
+            rows_written_aqilevels: 0,
+            objects_written_r2: 0,
+            checkpoint_json: {
+              source_adapter: sourceAdapter,
+              pending_reason: "source_acquisition",
+            },
+            error_json: { message },
+            started_at: startedAt,
+            finished_at: nowIso(),
+          });
+          await ledgerUpsertCheckpoint(ledgerEnabled, {
+            run_mode: RUN_MODE,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_kind: "download",
+            status: "stubbed",
+            rows_read: 0,
+            rows_written_aqilevels: 0,
+            objects_written_r2: 0,
+            checkpoint_json: {
+              updated_by_run_id: runId,
+              source_adapter: sourceAdapter,
+              pending_reason: "source_acquisition",
+              pending_at: nowIso(),
+            },
+            error_json: { message },
+            updated_at: nowIso(),
+          });
+          logStructured("warning", "source_to_r2_connector_day_pending", {
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_adapter: sourceAdapter,
+            pending_reason: "source_acquisition",
+            error: message,
+          });
+          continue;
+        }
         connectorDayError += 1;
         sourceFailedDaySet.add(dayUtc);
         await ledgerInsertRunDay(ledgerEnabled, {
@@ -7968,6 +8022,7 @@ async function runSourceToAll(
   const allTouchedDaySet = new Set<string>([
     ...sourceProcessedDaySet,
     ...sourceFailedDaySet,
+    ...sourceAcquisitionPendingDaySet,
   ]);
 
   return {

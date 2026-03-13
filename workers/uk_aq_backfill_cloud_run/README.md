@@ -74,13 +74,13 @@ All fields are optional unless noted.
   - optional local raw source mirrors for local runs only:
     - `UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT`
-  - unresolved/unsupported connectors are returned in `source_acquisition_pending_days`.
+  - unresolved/unsupported connectors and transient source acquisition outages are returned in `source_acquisition_pending_days`.
 
 ## Runtime Status Values
 
 - `ok`: run completed for requested scope.
 - `dry_run`: planning mode, no writes.
-- `stubbed`: run completed with intentionally unimplemented write path.
+- `stubbed`: run completed with pending source acquisition or another intentionally incomplete path.
 - `error`: run failed.
 
 ## Required Environment

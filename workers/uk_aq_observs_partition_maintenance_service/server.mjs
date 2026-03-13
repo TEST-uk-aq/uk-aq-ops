@@ -21,6 +21,8 @@ const DEFAULT_HOT_PARTITION_DAYS = 3;
 const DEFAULT_OBSERVS_RETENTION_DAYS = 14;
 const DEFAULT_DEFAULT_TOP_N = 20;
 const DEFAULT_DROP_DRY_RUN = false;
+const DEFAULT_RPC_RETRY_ATTEMPTS = 3;
+const DEFAULT_RPC_RETRY_DELAY_MS = 1500;
 
 const LONDON_DATE_FORMATTER = new Intl.DateTimeFormat("en-GB", {
   timeZone: OBSERVS_TIME_ZONE,
@@ -403,6 +405,60 @@ async function callRpc(client, fnName, params, errorLabel) {
     throw new Error(`${errorLabel} failed: ${error.message}`);
   }
   return data || [];
+}
+
+function isRetryableRpcError(message) {
+  const normalized = String(message || "").toLowerCase();
+  return normalized.includes("lock timeout")
+    || normalized.includes("deadlock detected")
+    || normalized.includes("could not serialize access due to")
+    || normalized.includes("canceling statement due to statement timeout");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function callRpcWithRetry(client, fnName, params, errorLabel, options = {}) {
+  const maxAttempts = parsePositiveInt(
+    options.maxAttempts,
+    DEFAULT_RPC_RETRY_ATTEMPTS,
+    1,
+    10,
+  );
+  const baseDelayMs = parsePositiveInt(
+    options.baseDelayMs,
+    DEFAULT_RPC_RETRY_DELAY_MS,
+    250,
+    60000,
+  );
+
+  let attempt = 0;
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    try {
+      return await callRpc(client, fnName, params, errorLabel);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const canRetry = attempt < maxAttempts && isRetryableRpcError(message);
+      if (!canRetry) {
+        throw error;
+      }
+
+      const retryDelayMs = baseDelayMs * attempt;
+      logStructured("WARNING", "observs_partition_rpc_retry", {
+        fn_name: fnName,
+        error_label: errorLabel,
+        attempt,
+        next_attempt: attempt + 1,
+        retry_delay_ms: retryDelayMs,
+        message,
+      });
+      await sleep(retryDelayMs);
+    }
+  }
+
+  return [];
 }
 
 function isMissingDayHasRowsFunctionError(message) {
@@ -874,7 +930,7 @@ async function runObservsPartitionMaintenance(config) {
     drop_dry_run: config.dropDryRun,
   });
 
-  const ensured = await callRpc(
+  const ensured = await callRpcWithRetry(
     observsClient,
     RPC_ENSURE_PARTITIONS,
     {
@@ -884,7 +940,7 @@ async function runObservsPartitionMaintenance(config) {
     "observs ensure daily partitions",
   );
 
-  const enforceResults = await callRpc(
+  const enforceResults = await callRpcWithRetry(
     observsClient,
     RPC_ENFORCE_HOT_COLD_INDEXES,
     {
@@ -977,7 +1033,7 @@ async function runObservsPartitionMaintenance(config) {
       const hasRowsCheck = await checkDayHasRows(observsClient, candidate.partition_day_utc);
 
       if (hasRowsCheck.checked && hasRowsCheck.has_rows === false) {
-        const dropResultRows = await callRpc(
+        const dropResultRows = await callRpcWithRetry(
           observsClient,
           RPC_DROP_PARTITION,
           {
@@ -1054,7 +1110,7 @@ async function runObservsPartitionMaintenance(config) {
       continue;
     }
 
-    const dropResultRows = await callRpc(
+    const dropResultRows = await callRpcWithRetry(
       observsClient,
       RPC_DROP_PARTITION,
       {

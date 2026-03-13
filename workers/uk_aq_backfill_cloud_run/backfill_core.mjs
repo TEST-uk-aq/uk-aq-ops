@@ -168,6 +168,21 @@ export function shouldSkipCompletedDay(existingStatus, forceReplace) {
   return { skip: false, reason: "needs_processing" };
 }
 
+export function isSourceAcquisitionPendingError(sourceAdapter, errorMessage) {
+  const adapter = String(sourceAdapter || "").trim().toLowerCase();
+  const message = String(errorMessage || "").trim().toLowerCase();
+  if (!(adapter && message)) {
+    return false;
+  }
+  if (adapter === "sensorcommunity") {
+    return (
+      message.startsWith("sensorcommunity_archive_index_fetch_failed:") ||
+      message.startsWith("sensorcommunity_archive_csv_fetch_failed:")
+    );
+  }
+  return false;
+}
+
 function utcDayFromDate(date) {
   return date.toISOString().slice(0, 10);
 }

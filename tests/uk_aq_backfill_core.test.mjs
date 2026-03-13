@@ -4,6 +4,7 @@ import {
   buildBackwardDayRange,
   computeRollingLocalRetentionWindow,
   isDayInRollingRetentionWindow,
+  isSourceAcquisitionPendingError,
   parseRunMode,
   shouldSkipCompletedDay,
 } from "../workers/uk_aq_backfill_cloud_run/backfill_core.mjs";
@@ -53,5 +54,36 @@ test("shouldSkipCompletedDay honors force_replace", () => {
   assert.deepEqual(
     shouldSkipCompletedDay("error", false),
     { skip: false, reason: "needs_processing" },
+  );
+});
+
+test("isSourceAcquisitionPendingError only treats known source fetch failures as pending", () => {
+  assert.equal(
+    isSourceAcquisitionPendingError(
+      "sensorcommunity",
+      "sensorcommunity_archive_index_fetch_failed: The signal has been aborted",
+    ),
+    true,
+  );
+  assert.equal(
+    isSourceAcquisitionPendingError(
+      "sensorcommunity",
+      "sensorcommunity_archive_csv_fetch_failed: 2025-12-13_sensor_123.csv: Operation timed out",
+    ),
+    true,
+  );
+  assert.equal(
+    isSourceAcquisitionPendingError(
+      "sensorcommunity",
+      "missing connector manifests for day=2025-12-13 after source_to_r2 export",
+    ),
+    false,
+  );
+  assert.equal(
+    isSourceAcquisitionPendingError(
+      "openaq",
+      "sensorcommunity_archive_index_fetch_failed: Operation timed out",
+    ),
+    false,
   );
 });
