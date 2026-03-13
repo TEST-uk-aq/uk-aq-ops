@@ -117,10 +117,17 @@ type UkAirSosDatapoint = {
   status: string | null;
 };
 
+type UkAirSosNoDataManifestEntry = {
+  timeseries_ref: string;
+  station_ref: string | null;
+  recorded_at_utc: string;
+};
+
 type UkAirSosTimeseriesFetchResult = {
   payload: unknown;
   mirror_reused: boolean;
   mirror_written: boolean;
+  no_data_manifest_reused: boolean;
 };
 
 type CoreSnapshotManifestTable = {
@@ -4917,11 +4924,107 @@ function ukAirSosMirrorFilePath(
   );
 }
 
+function ukAirSosNoDataManifestFilePath(dayUtc: string): string | null {
+  if (!IS_LOCAL_RUN || !UK_AIR_SOS_RAW_MIRROR_ROOT) {
+    return null;
+  }
+  const normalizedDay = parseIsoDayUtc(dayUtc);
+  if (!normalizedDay) {
+    return null;
+  }
+  const root = UK_AIR_SOS_RAW_MIRROR_ROOT.trim();
+  if (!root) {
+    return null;
+  }
+  return path.join(root, `day_utc=${normalizedDay}`, "_no_data_timeseries.json");
+}
+
+function isUkAirSosEmptyPayload(payload: unknown): boolean {
+  if (Array.isArray(payload)) {
+    return payload.length === 0;
+  }
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+  const record = payload as Record<string, unknown>;
+  if (Array.isArray(record.values)) {
+    return record.values.length === 0;
+  }
+  if (Array.isArray(record.data)) {
+    return record.data.length === 0;
+  }
+  return false;
+}
+
+function readUkAirSosNoDataManifest(
+  dayUtc: string,
+): Map<string, UkAirSosNoDataManifestEntry> {
+  const manifestPath = ukAirSosNoDataManifestFilePath(dayUtc);
+  if (!manifestPath || !fs.existsSync(manifestPath)) {
+    return new Map();
+  }
+
+  const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`UK-AIR SOS no-data manifest ${manifestPath} is not an object`);
+  }
+  const manifest = parsed as Record<string, unknown>;
+  const timeseriesEntries = Array.isArray(manifest.timeseries)
+    ? manifest.timeseries
+    : [];
+  const entries = new Map<string, UkAirSosNoDataManifestEntry>();
+  for (const rawEntry of timeseriesEntries) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      continue;
+    }
+    const entry = rawEntry as Record<string, unknown>;
+    const timeseriesRef = String(entry.timeseries_ref || "").trim();
+    if (!timeseriesRef) {
+      continue;
+    }
+    const stationRef = entry.station_ref == null ? null : String(entry.station_ref);
+    const recordedAtUtc = typeof entry.recorded_at_utc === "string" &&
+        entry.recorded_at_utc.trim()
+      ? entry.recorded_at_utc.trim()
+      : nowIso();
+    entries.set(timeseriesRef, {
+      timeseries_ref: timeseriesRef,
+      station_ref: stationRef,
+      recorded_at_utc: recordedAtUtc,
+    });
+  }
+  return entries;
+}
+
+function writeUkAirSosNoDataManifest(args: {
+  day_utc: string;
+  entries: Map<string, UkAirSosNoDataManifestEntry>;
+}): void {
+  const manifestPath = ukAirSosNoDataManifestFilePath(args.day_utc);
+  if (!manifestPath) {
+    return;
+  }
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  const payload = {
+    schema_version: 1,
+    day_utc: parseIsoDayUtc(args.day_utc),
+    updated_at_utc: nowIso(),
+    timeseries: Array.from(args.entries.values())
+      .sort((left, right) => left.timeseries_ref.localeCompare(right.timeseries_ref)),
+  };
+  fs.writeFileSync(
+    manifestPath,
+    `${JSON.stringify(payload, null, 2)}\n`,
+    "utf8",
+  );
+}
+
 async function fetchUkAirSosTimeseriesData(args: {
   base_url: string;
   day_utc: string;
   timeseries_ref: string;
   timespan: string;
+  known_empty_timeseries_refs?: ReadonlySet<string>;
 }): Promise<UkAirSosTimeseriesFetchResult> {
   const mirrorPath = ukAirSosMirrorFilePath(
     args.day_utc,
@@ -4933,6 +5036,7 @@ async function fetchUkAirSosTimeseriesData(args: {
         payload: JSON.parse(fs.readFileSync(mirrorPath, "utf8")) as unknown,
         mirror_reused: true,
         mirror_written: false,
+        no_data_manifest_reused: false,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4940,6 +5044,15 @@ async function fetchUkAirSosTimeseriesData(args: {
         `Failed to parse UK-AIR SOS mirror ${mirrorPath}: ${message}`,
       );
     }
+  }
+
+  if (args.known_empty_timeseries_refs?.has(args.timeseries_ref)) {
+    return {
+      payload: { values: [] },
+      mirror_reused: false,
+      mirror_written: false,
+      no_data_manifest_reused: true,
+    };
   }
 
   const url = new URL(
@@ -4955,15 +5068,21 @@ async function fetchUkAirSosTimeseriesData(args: {
     UK_AIR_SOS_FETCH_RETRIES,
     UK_AIR_SOS_RETRY_BASE_MS,
   );
-  if (mirrorPath) {
+  const shouldWriteMirror = mirrorPath && shouldWriteUkAirSosMirrorPayload(payload);
+  if (shouldWriteMirror) {
     fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
     fs.writeFileSync(mirrorPath, JSON.stringify(payload), "utf8");
   }
   return {
     payload,
     mirror_reused: false,
-    mirror_written: Boolean(mirrorPath),
+    mirror_written: Boolean(shouldWriteMirror),
+    no_data_manifest_reused: false,
   };
+}
+
+function shouldWriteUkAirSosMirrorPayload(payload: unknown): boolean {
+  return !isUkAirSosEmptyPayload(payload);
 }
 
 function parseUkAirSosTimestamp(value: unknown): string | null {
@@ -8279,6 +8398,27 @@ async function runSourceToAll(
           const dayStartIso = utcDayStartIso(dayUtc);
           const dayEndIso = utcDayEndIso(dayUtc);
           const timespan = `${dayStartIso}/${dayEndIso}`;
+          let knownNoDataTimeseriesEntries =
+            new Map<string, UkAirSosNoDataManifestEntry>();
+          try {
+            knownNoDataTimeseriesEntries = readUkAirSosNoDataManifest(dayUtc);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            logStructured(
+              "warning",
+              "source_to_r2_uk_air_sos_no_data_manifest_read_failed",
+              {
+                run_id: runId,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_adapter: "uk_air_sos",
+                error: message,
+              },
+            );
+          }
+          const knownNoDataTimeseriesRefs = new Set(
+            knownNoDataTimeseriesEntries.keys(),
+          );
 
           const timeseriesResults = await mapConcurrent(
             candidateBindings,
@@ -8290,6 +8430,7 @@ async function runSourceToAll(
                   day_utc: dayUtc,
                   timeseries_ref: binding.timeseries_ref,
                   timespan,
+                  known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
                 });
                 const datapoints = parseUkAirSosDatapoints(payload.payload);
                 const rows: SourceObservationRow[] = [];
@@ -8333,17 +8474,23 @@ async function runSourceToAll(
                     mapped_point_count: rows.length,
                     mirror_reused: payload.mirror_reused,
                     mirror_written: payload.mirror_written,
+                    no_data_manifest_reused: payload.no_data_manifest_reused,
+                    empty_payload_confirmed: isUkAirSosEmptyPayload(payload.payload),
                     skipped_outside_day: skippedOutsideDay,
                     skipped_null_value: skippedNullValue,
                   },
                 );
 
                 return {
+                  station_ref: binding.station_ref,
+                  timeseries_ref: binding.timeseries_ref,
                   rows,
                   raw_point_count: datapoints.length,
                   mapped_point_count: rows.length,
                   mirror_reused: payload.mirror_reused,
                   mirror_written: payload.mirror_written,
+                  no_data_manifest_reused: payload.no_data_manifest_reused,
+                  empty_payload_confirmed: isUkAirSosEmptyPayload(payload.payload),
                   skipped_outside_day: skippedOutsideDay,
                   skipped_null_value: skippedNullValue,
                   error_message: null as string | null,
@@ -8368,9 +8515,15 @@ async function runSourceToAll(
                   },
                 );
                 return {
+                  station_ref: binding.station_ref,
+                  timeseries_ref: binding.timeseries_ref,
                   rows: [] as SourceObservationRow[],
                   raw_point_count: 0,
                   mapped_point_count: 0,
+                  mirror_reused: false,
+                  mirror_written: false,
+                  no_data_manifest_reused: false,
+                  empty_payload_confirmed: false,
                   skipped_outside_day: 0,
                   skipped_null_value: 0,
                   error_message:
@@ -8384,6 +8537,7 @@ async function runSourceToAll(
           let totalMappedPoints = 0;
           let totalMirrorReused = 0;
           let totalMirrorWritten = 0;
+          let totalNoDataManifestReused = 0;
           let totalSkippedOutsideDay = 0;
           let totalSkippedNullValue = 0;
           const failedTimeseries: string[] = [];
@@ -8393,10 +8547,46 @@ async function runSourceToAll(
             totalMappedPoints += result.mapped_point_count;
             totalMirrorReused += result.mirror_reused ? 1 : 0;
             totalMirrorWritten += result.mirror_written ? 1 : 0;
+            totalNoDataManifestReused += result.no_data_manifest_reused ? 1 : 0;
             totalSkippedOutsideDay += result.skipped_outside_day;
             totalSkippedNullValue += result.skipped_null_value;
+            if (
+              result.empty_payload_confirmed &&
+              result.timeseries_ref &&
+              !knownNoDataTimeseriesEntries.has(result.timeseries_ref)
+            ) {
+              knownNoDataTimeseriesEntries.set(result.timeseries_ref, {
+                timeseries_ref: result.timeseries_ref,
+                station_ref: result.station_ref || null,
+                recorded_at_utc: nowIso(),
+              });
+            }
             if (result.error_message) {
               failedTimeseries.push(result.error_message);
+            }
+          }
+
+          const noDataManifestWrittenCount =
+            knownNoDataTimeseriesEntries.size - knownNoDataTimeseriesRefs.size;
+          if (noDataManifestWrittenCount > 0) {
+            try {
+              writeUkAirSosNoDataManifest({
+                day_utc: dayUtc,
+                entries: knownNoDataTimeseriesEntries,
+              });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              logStructured(
+                "warning",
+                "source_to_r2_uk_air_sos_no_data_manifest_write_failed",
+                {
+                  run_id: runId,
+                  day_utc: dayUtc,
+                  connector_id: connectorId,
+                  source_adapter: "uk_air_sos",
+                  error: message,
+                },
+              );
             }
           }
 
@@ -8417,6 +8607,10 @@ async function runSourceToAll(
             candidateBindings.length;
           sourceCheckpointJson.mirror_reused_count = totalMirrorReused;
           sourceCheckpointJson.mirror_written_count = totalMirrorWritten;
+          sourceCheckpointJson.no_data_manifest_reused_count =
+            totalNoDataManifestReused;
+          sourceCheckpointJson.no_data_manifest_written_count =
+            noDataManifestWrittenCount;
           sourceCheckpointJson.total_raw_points = totalRawPoints;
           sourceCheckpointJson.total_mapped_points = totalMappedPoints;
           sourceCheckpointJson.total_skipped_outside_day =

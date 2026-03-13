@@ -14,6 +14,9 @@ const DEFAULT_LOOKBACK_DAYS = 28;
 const MAX_LOOKBACK_DAYS = 120;
 const R2_HISTORY_DAYS_MAX_LOOKBACK_DAYS = 3660;
 const R2_HISTORY_DAYS_DEFAULT_MAX_LOOKBACK_DAYS = 120;
+const R2_HISTORY_COUNTS_DEFAULT_RANGE_DAYS = 31;
+const R2_HISTORY_COUNTS_MAX_RANGE_DAYS = 3660;
+const SUPPORTED_R2_HISTORY_COUNT_GRAINS = new Set(["day", "month"]);
 
 function corsHeaders() {
   return {
@@ -74,6 +77,32 @@ function parseIsoDay(value) {
     return null;
   }
   return trimmed;
+}
+
+function addIsoDays(day, dayDelta) {
+  const normalizedDay = parseIsoDay(day);
+  if (!normalizedDay) {
+    return null;
+  }
+  const ms = Date.parse(`${normalizedDay}T00:00:00.000Z`);
+  if (Number.isNaN(ms)) {
+    return null;
+  }
+  return new Date(ms + dayDelta * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function countInclusiveDays(fromDay, toDay) {
+  const normalizedFrom = parseIsoDay(fromDay);
+  const normalizedTo = parseIsoDay(toDay);
+  if (!normalizedFrom || !normalizedTo || normalizedFrom > normalizedTo) {
+    return 0;
+  }
+  const fromMs = Date.parse(`${normalizedFrom}T00:00:00.000Z`);
+  const toMs = Date.parse(`${normalizedTo}T00:00:00.000Z`);
+  if (Number.isNaN(fromMs) || Number.isNaN(toMs) || toMs < fromMs) {
+    return 0;
+  }
+  return Math.trunc((toMs - fromMs) / (24 * 60 * 60 * 1000)) + 1;
 }
 
 function normalizeBucketName(value) {
@@ -229,11 +258,214 @@ function buildDayCutoff(maxLookbackDays) {
 function compactHistoryIndexDomain(domainPayload) {
   return {
     days: Array.isArray(domainPayload?.days) ? domainPayload.days : [],
+    day_summaries: Array.isArray(domainPayload?.day_summaries) ? domainPayload.day_summaries : [],
     min_day_utc: domainPayload?.min_day_utc || null,
     max_day_utc: domainPayload?.max_day_utc || null,
     day_count: Number(domainPayload?.day_count || 0) || 0,
     total_rows: Number(domainPayload?.total_rows || 0) || 0,
     generated_at: domainPayload?.generated_at || null,
+  };
+}
+
+function parseConnectorIds(rawValue) {
+  if (typeof rawValue !== "string" || !rawValue.trim()) {
+    return [];
+  }
+  const values = new Set();
+  for (const token of rawValue.split(",")) {
+    const value = Number(token.trim());
+    if (!Number.isFinite(value) || value <= 0) {
+      continue;
+    }
+    values.add(Math.trunc(value));
+  }
+  return Array.from(values).sort((a, b) => a - b);
+}
+
+export function buildR2HistoryCountBuckets(fromDay, toDay, grain) {
+  const normalizedFrom = parseIsoDay(fromDay);
+  const normalizedTo = parseIsoDay(toDay);
+  if (!normalizedFrom || !normalizedTo || normalizedFrom > normalizedTo) {
+    throw new Error("Invalid from_day/to_day range");
+  }
+  if (!SUPPORTED_R2_HISTORY_COUNT_GRAINS.has(grain)) {
+    throw new Error(`Unsupported R2 history count grain: ${String(grain || "")}`);
+  }
+
+  const orderedBucketKeys = [];
+  const bucketMetaByKey = new Map();
+  let cursorDay = normalizedFrom;
+  while (cursorDay && cursorDay <= normalizedTo) {
+    const bucketKey = grain === "month" ? cursorDay.slice(0, 7) : cursorDay;
+    const current = bucketMetaByKey.get(bucketKey);
+    if (current) {
+      current.bucket_end_day_utc = cursorDay;
+      current.calendar_day_count += 1;
+    } else {
+      orderedBucketKeys.push(bucketKey);
+      bucketMetaByKey.set(bucketKey, {
+        bucket_key: bucketKey,
+        bucket_start_day_utc: cursorDay,
+        bucket_end_day_utc: cursorDay,
+        calendar_day_count: 1,
+      });
+    }
+    cursorDay = addIsoDays(cursorDay, 1);
+  }
+
+  return {
+    orderedBucketKeys,
+    bucketMetaByKey,
+  };
+}
+
+function cloneR2HistoryCountBucket(meta) {
+  return {
+    bucket_key: meta.bucket_key,
+    bucket_start_day_utc: meta.bucket_start_day_utc,
+    bucket_end_day_utc: meta.bucket_end_day_utc,
+    calendar_day_count: meta.calendar_day_count,
+    observations_rows: 0,
+    observations_present_days: 0,
+    observations_avg_rows_per_day: 0,
+    aqilevels_rows: 0,
+    aqilevels_present_days: 0,
+    aqilevels_avg_rows_per_day: 0,
+    total_rows: 0,
+    total_avg_rows_per_day: 0,
+  };
+}
+
+export function aggregateR2HistoryConnectorCounts({
+  observationsDomain,
+  aqilevelsDomain,
+  fromDay,
+  toDay,
+  grain,
+  connectorIds = [],
+}) {
+  const normalizedFrom = parseIsoDay(fromDay);
+  const normalizedTo = parseIsoDay(toDay);
+  if (!normalizedFrom || !normalizedTo || normalizedFrom > normalizedTo) {
+    throw new Error("Invalid from_day/to_day range");
+  }
+
+  const {
+    orderedBucketKeys,
+    bucketMetaByKey,
+  } = buildR2HistoryCountBuckets(normalizedFrom, normalizedTo, grain);
+  const connectorFilter = new Set(
+    Array.isArray(connectorIds)
+      ? connectorIds.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0)
+      : [],
+  );
+  const connectorMap = new Map();
+
+  const ensureConnectorEntry = (connectorId) => {
+    const key = String(connectorId);
+    let current = connectorMap.get(key);
+    if (!current) {
+      current = {
+        connector_id: connectorId,
+        bucket_count: orderedBucketKeys.length,
+        observations_total_rows: 0,
+        aqilevels_total_rows: 0,
+        total_rows: 0,
+        buckets_by_key: new Map(
+          orderedBucketKeys.map((bucketKey) => [
+            bucketKey,
+            cloneR2HistoryCountBucket(bucketMetaByKey.get(bucketKey)),
+          ]),
+        ),
+      };
+      connectorMap.set(key, current);
+    }
+    return current;
+  };
+
+  const applyDomain = (domainPayload, domainKey) => {
+    const daySummaries = Array.isArray(domainPayload?.day_summaries)
+      ? domainPayload.day_summaries
+      : [];
+    for (const summary of daySummaries) {
+      const dayUtc = parseIsoDay(summary?.day_utc);
+      if (!dayUtc || dayUtc < normalizedFrom || dayUtc > normalizedTo) {
+        continue;
+      }
+      const bucketKey = grain === "month" ? dayUtc.slice(0, 7) : dayUtc;
+      const connectors = Array.isArray(summary?.connectors) ? summary.connectors : [];
+      for (const connector of connectors) {
+        const connectorId = parseNonNegativeInt(connector?.connector_id, null);
+        const rowCount = parseNonNegativeInt(connector?.row_count, null);
+        if (!connectorId || rowCount === null) {
+          continue;
+        }
+        if (connectorFilter.size > 0 && !connectorFilter.has(connectorId)) {
+          continue;
+        }
+        const current = ensureConnectorEntry(connectorId);
+        const bucket = current.buckets_by_key.get(bucketKey);
+        if (!bucket) {
+          continue;
+        }
+        if (domainKey === "observations") {
+          bucket.observations_rows += rowCount;
+          if (rowCount > 0) {
+            bucket.observations_present_days += 1;
+          }
+          current.observations_total_rows += rowCount;
+        } else {
+          bucket.aqilevels_rows += rowCount;
+          if (rowCount > 0) {
+            bucket.aqilevels_present_days += 1;
+          }
+          current.aqilevels_total_rows += rowCount;
+        }
+      }
+    }
+  };
+
+  applyDomain(observationsDomain, "observations");
+  applyDomain(aqilevelsDomain, "aqilevels");
+
+  for (const connectorId of connectorFilter) {
+    ensureConnectorEntry(connectorId);
+  }
+
+  const connectors = Array.from(connectorMap.values())
+    .sort((a, b) => a.connector_id - b.connector_id)
+    .map((entry) => {
+      const buckets = orderedBucketKeys.map((bucketKey) => {
+        const bucket = entry.buckets_by_key.get(bucketKey) || cloneR2HistoryCountBucket(
+          bucketMetaByKey.get(bucketKey),
+        );
+        bucket.observations_avg_rows_per_day = bucket.calendar_day_count > 0
+          ? bucket.observations_rows / bucket.calendar_day_count
+          : 0;
+        bucket.aqilevels_avg_rows_per_day = bucket.calendar_day_count > 0
+          ? bucket.aqilevels_rows / bucket.calendar_day_count
+          : 0;
+        bucket.total_rows = bucket.observations_rows + bucket.aqilevels_rows;
+        bucket.total_avg_rows_per_day = bucket.calendar_day_count > 0
+          ? bucket.total_rows / bucket.calendar_day_count
+          : 0;
+        return bucket;
+      });
+      const totalRows = entry.observations_total_rows + entry.aqilevels_total_rows;
+      return {
+        connector_id: entry.connector_id,
+        bucket_count: orderedBucketKeys.length,
+        observations_total_rows: entry.observations_total_rows,
+        aqilevels_total_rows: entry.aqilevels_total_rows,
+        total_rows: totalRows,
+        buckets,
+      };
+    });
+
+  return {
+    bucket_count: orderedBucketKeys.length,
+    range_day_count: countInclusiveDays(normalizedFrom, normalizedTo),
+    connectors,
   };
 }
 
@@ -412,6 +644,91 @@ async function fetchR2HistoryDays(env, url) {
     },
     warnings,
     strict_manifests: strictManifests,
+  };
+}
+
+async function fetchR2HistoryCounts(env, url) {
+  const grainRaw = String(url.searchParams.get("grain") || "day").trim().toLowerCase();
+  const grain = SUPPORTED_R2_HISTORY_COUNT_GRAINS.has(grainRaw) ? grainRaw : "day";
+  const todayDay = new Date().toISOString().slice(0, 10);
+  const defaultToDay = todayDay;
+  const requestedToDay = parseIsoDay(url.searchParams.get("to_day"));
+  const requestedFromDay = parseIsoDay(url.searchParams.get("from_day"));
+  const toDay = requestedToDay || defaultToDay;
+  const defaultFromDay = addIsoDays(toDay, -1 * (R2_HISTORY_COUNTS_DEFAULT_RANGE_DAYS - 1));
+  const fromDay = requestedFromDay || defaultFromDay;
+  if (!fromDay || !toDay || fromDay > toDay) {
+    throw new Error("Invalid from_day/to_day for R2 history counts");
+  }
+
+  const rangeDayCount = countInclusiveDays(fromDay, toDay);
+  if (rangeDayCount <= 0 || rangeDayCount > R2_HISTORY_COUNTS_MAX_RANGE_DAYS) {
+    throw new Error(
+      `R2 history counts range must be between 1 and ${R2_HISTORY_COUNTS_MAX_RANGE_DAYS} days`,
+    );
+  }
+
+  const connectorIds = parseConnectorIds(url.searchParams.get("connector_ids") || "");
+  const bucket = resolveR2HistoryBucket(env);
+  const r2 = resolveR2Config(env, bucket);
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing R2 config for history counts API (endpoint/bucket/region/access credentials)");
+  }
+
+  const indexConfig = resolveR2HistoryIndexConfig(env);
+  const observations = compactHistoryIndexDomain(await readR2HistoryIndex({
+    r2,
+    indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
+    domain: "observations",
+    maxLookbackDays: 0,
+    todayDay,
+  }));
+  const aqilevels = compactHistoryIndexDomain(await readR2HistoryIndex({
+    r2,
+    indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
+    domain: "aqilevels",
+    maxLookbackDays: 0,
+    todayDay,
+  }));
+
+  const aggregated = aggregateR2HistoryConnectorCounts({
+    observationsDomain: observations,
+    aqilevelsDomain: aqilevels,
+    fromDay,
+    toDay,
+    grain,
+    connectorIds,
+  });
+
+  return {
+    bucket,
+    from_day_utc: fromDay,
+    to_day_utc: toDay,
+    grain,
+    connector_ids_requested: connectorIds,
+    source: "cloudflare_r2_history_index",
+    index_prefix: indexConfig.index_prefix,
+    index_keys: {
+      observations: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
+      aqilevels: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
+    },
+    domains: {
+      observations: {
+        generated_at: observations.generated_at,
+        min_day_utc: observations.min_day_utc,
+        max_day_utc: observations.max_day_utc,
+        day_count: observations.day_count,
+        total_rows: observations.total_rows,
+      },
+      aqilevels: {
+        generated_at: aqilevels.generated_at,
+        min_day_utc: aqilevels.min_day_utc,
+        max_day_utc: aqilevels.max_day_utc,
+        day_count: aqilevels.day_count,
+        total_rows: aqilevels.total_rows,
+      },
+    },
+    ...aggregated,
   };
 }
 
@@ -699,10 +1016,12 @@ export default {
     const url = new URL(request.url);
     const dbSizePaths = new Set(["/", "/db-size-metrics", "/v1/db-size-metrics"]);
     const r2HistoryDaysPaths = new Set(["/r2-history-days", "/v1/r2-history-days"]);
+    const r2HistoryCountsPaths = new Set(["/r2-history-counts", "/v1/r2-history-counts"]);
     const isDbSizePath = dbSizePaths.has(url.pathname);
     const isR2HistoryDaysPath = r2HistoryDaysPaths.has(url.pathname);
+    const isR2HistoryCountsPath = r2HistoryCountsPaths.has(url.pathname);
 
-    if (!isDbSizePath && !isR2HistoryDaysPath) {
+    if (!isDbSizePath && !isR2HistoryDaysPath && !isR2HistoryCountsPath) {
       return jsonResponse({ error: "Not found" }, 404);
     }
 
@@ -748,6 +1067,34 @@ export default {
               },
             },
             source: "cloudflare_r2_manifest_scan",
+            error: message,
+          },
+          500,
+        );
+      }
+    }
+
+    if (isR2HistoryCountsPath) {
+      try {
+        const result = await fetchR2HistoryCounts(env, url);
+        return jsonResponse({
+          generated_at: new Date().toISOString(),
+          ...result,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return jsonResponse(
+          {
+            generated_at: new Date().toISOString(),
+            bucket: null,
+            from_day_utc: null,
+            to_day_utc: null,
+            grain: null,
+            connector_ids_requested: [],
+            bucket_count: 0,
+            range_day_count: 0,
+            connectors: [],
+            source: "cloudflare_r2_history_index",
             error: message,
           },
           500,

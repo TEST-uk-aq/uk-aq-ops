@@ -11,6 +11,8 @@ Endpoint:
 - aliases: `GET /db-size-metrics`, `GET /`
 - `GET /v1/r2-history-days`
 - alias: `GET /r2-history-days`
+- `GET /v1/r2-history-counts`
+- alias: `GET /r2-history-counts`
 
 Query params:
 
@@ -52,6 +54,46 @@ R2 history-days response shape:
 - `domains.<domain>.day_count`
 - `sources.<domain>` (`cloudflare_r2_history_index` or `cloudflare_r2_manifest_scan`)
 
+R2 history-counts query params:
+
+- `from_day` (`YYYY-MM-DD`, optional; defaults to last 31 days ending today UTC)
+- `to_day` (`YYYY-MM-DD`, optional; defaults to today UTC)
+- `grain` (`day` or `month`, default `day`)
+- `connector_ids` (optional CSV filter, for example `1,3,6,7`)
+- `token` (optional; only used if `UK_AQ_DB_SIZE_API_TOKEN` is configured)
+
+R2 history-counts response shape:
+
+- `generated_at`
+- `bucket`
+- `from_day_utc`
+- `to_day_utc`
+- `grain`
+- `connector_ids_requested`
+- `bucket_count`
+- `range_day_count`
+- `index_prefix`
+- `index_keys.observations`
+- `index_keys.aqilevels`
+- `connectors[]`
+  - `connector_id`
+  - `observations_total_rows`
+  - `aqilevels_total_rows`
+  - `total_rows`
+  - `buckets[]`
+    - `bucket_key`
+    - `bucket_start_day_utc`
+    - `bucket_end_day_utc`
+    - `calendar_day_count`
+    - `observations_rows`
+    - `observations_present_days`
+    - `observations_avg_rows_per_day`
+    - `aqilevels_rows`
+    - `aqilevels_present_days`
+    - `aqilevels_avg_rows_per_day`
+    - `total_rows`
+    - `total_avg_rows_per_day`
+
 Behavior:
 
 - Reads from each configured DB view `uk_aq_public.uk_aq_db_size_metrics_hourly`:
@@ -67,6 +109,8 @@ Behavior:
   - `history/_index/observations_latest.json`
   - `history/_index/aqilevels_latest.json`
   - index prefix is configurable via `UK_AQ_R2_HISTORY_INDEX_PREFIX`
+- For `/v1/r2-history-counts`, reads the same derived R2 history index files and aggregates
+  connector row counts by day or month entirely in-memory.
 - If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that domain only:
   - lists `day_utc=YYYY-MM-DD/` common prefixes under the domain;
   - filters by `max_days` and excludes future dates.

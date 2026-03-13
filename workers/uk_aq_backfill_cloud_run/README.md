@@ -79,6 +79,12 @@ All fields are optional unless noted.
     - `UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT`
+  - SOS mirror note:
+    - non-empty upstream payloads are mirrored as per-timeseries JSON files
+    - exact empty upstream payloads such as `{"values":[]}` are tracked instead in a per-day `_no_data_timeseries.json` manifest
+    - reruns consult that no-data manifest first so known-empty SOS timeseries/day combinations are not requested again
+    - legacy empty per-timeseries mirror files can be migrated with:
+      - `node scripts/backup_r2/uk_aq_cleanup_sos_empty_mirror_files.mjs --apply`
   - unresolved/unsupported connectors and transient source acquisition outages are returned in `source_acquisition_pending_days`.
 
 ## Runtime Status Values
@@ -153,6 +159,8 @@ UK-AIR SOS source adapter:
 - `UK_AQ_BACKFILL_UK_AIR_SOS_RETRY_BASE_MS` (default `1500`)
 - `UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_CONCURRENCY` (default `5`)
 - `UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT` (optional local replay mirror for SOS JSON payloads)
+  - non-empty payloads are written as per-timeseries JSON files
+  - exact empty payloads like `{"values":[]}` are recorded in `day_utc=YYYY-MM-DD/_no_data_timeseries.json`
 
 Sensor.Community source adapter:
 
