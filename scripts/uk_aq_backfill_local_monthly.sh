@@ -93,6 +93,8 @@ DRY_RUN_RAW="$(require_env UK_AQ_BACKFILL_DRY_RUN)"
 FORCE_REPLACE_RAW="$(require_env UK_AQ_BACKFILL_FORCE_REPLACE)"
 FROM_DAY_UTC="$(require_env UK_AQ_BACKFILL_FROM_DAY_UTC)"
 TO_DAY_UTC="$(require_env UK_AQ_BACKFILL_TO_DAY_UTC)"
+REQUESTED_FROM_DAY_UTC="${FROM_DAY_UTC}"
+REQUESTED_TO_DAY_UTC="${TO_DAY_UTC}"
 
 TRIGGER_MODE="$(trim "${UK_AQ_BACKFILL_TRIGGER_MODE:-manual}")"
 ENABLE_R2_FALLBACK_RAW="$(trim "${UK_AQ_BACKFILL_ENABLE_R2_FALLBACK:-false}")"
@@ -234,6 +236,19 @@ echo "Failures: ${#failures[@]}"
 if [[ "${#failures[@]}" -gt 0 ]]; then
   printf '%s\n' "${failures[@]}" | sed 's/^/ - /'
   exit 1
+fi
+
+if [[ "${RUN_MODE}" == "source_to_r2" && "${DRY_RUN}" == "false" ]]; then
+  index_log_file="${LOG_DIR}/r2_history_index_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
+  echo ""
+  echo "=== Rebuild R2 History Index ==="
+  echo "Log: ${index_log_file}"
+  if node scripts/backup_r2/uk_aq_build_r2_history_index.mjs | tee "${index_log_file}"; then
+    echo "R2 history index rebuild: ok"
+  else
+    echo "R2 history index rebuild: failed" >&2
+    exit 1
+  fi
 fi
 
 echo "All month windows completed successfully."

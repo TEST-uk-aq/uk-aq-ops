@@ -96,7 +96,7 @@ type SourceConnectorLookup = {
   binding_by_timeseries_ref_pollutant: Map<string, SourceTimeseriesBinding>;
 };
 
-type SourceAdapterKind = "sensorcommunity" | "openaq";
+type SourceAdapterKind = "sensorcommunity" | "openaq" | "uk_air_sos";
 
 type StationRefsLookup = {
   station_refs: Set<string>;
@@ -109,6 +109,18 @@ type SourceObservationRow = {
   pollutant_code: SourcePollutantCode;
   observed_at: string;
   value: number;
+};
+
+type UkAirSosDatapoint = {
+  observed_at: string;
+  value: number | null;
+  status: string | null;
+};
+
+type UkAirSosTimeseriesFetchResult = {
+  payload: unknown;
+  mirror_reused: boolean;
+  mirror_written: boolean;
 };
 
 type CoreSnapshotManifestTable = {
@@ -613,6 +625,52 @@ const SCOMM_ARCHIVE_RETRY_BASE_MS = parsePositiveInt(
 const SCOMM_RAW_MIRROR_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT",
 );
+const UK_AIR_SOS_SOURCE_ENABLED = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_SOURCE_ENABLED"),
+  true,
+);
+const UK_AIR_SOS_CONNECTOR_CODE = (
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_CONNECTOR_CODE") || "uk_air_sos"
+).trim().toLowerCase();
+const UK_AIR_SOS_CONNECTOR_ID_FALLBACK = Number.parseInt(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_CONNECTOR_ID_FALLBACK") || "1",
+  10,
+);
+const UK_AIR_SOS_BASE_URL = (
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_BASE_URL") ||
+  "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
+).trim().replace(/\/$/, "");
+const UK_AIR_SOS_INCLUDE_MET_FIELDS = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_INCLUDE_MET_FIELDS"),
+  true,
+);
+const UK_AIR_SOS_TIMEOUT_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_TIMEOUT_MS"),
+  60000,
+  5000,
+  600000,
+);
+const UK_AIR_SOS_FETCH_RETRIES = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_RETRIES"),
+  3,
+  1,
+  10,
+);
+const UK_AIR_SOS_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_RETRY_BASE_MS"),
+  1500,
+  100,
+  30000,
+);
+const UK_AIR_SOS_FETCH_CONCURRENCY = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_CONCURRENCY"),
+  5,
+  1,
+  20,
+);
+const UK_AIR_SOS_RAW_MIRROR_ROOT = optionalEnv(
+  "UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT",
+);
 const OPENAQ_SOURCE_ENABLED = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_OPENAQ_SOURCE_ENABLED"),
   true,
@@ -803,6 +861,33 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+
+  await Promise.all(Array.from({ length: limit }, async () => {
+    while (true) {
+      const currentIndex = nextIndex;
+      if (currentIndex >= items.length) {
+        return;
+      }
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  }));
+
+  return results;
+}
+
 function isRetryableStatus(status: number): boolean {
   return status === 429 || status === 500 || status === 502 || status === 503 ||
     status === 504;
@@ -866,6 +951,7 @@ let r2CoreStationRefsByConnectorPromise:
 let r2CoreStationRefsSourceDayUtc: string | null = null;
 const sourceLookupCache = new Map<number, SourceConnectorLookup>();
 const connectorCodeCache = new Map<string, number>();
+const connectorServiceUrlCache = new Map<number, string | null>();
 const stationFilterByConnector = new Map<number, StationFilterEntry>();
 let unresolvedRequestedStationIds: number[] = [];
 let effectiveConnectorIds: number[] | null = CONNECTOR_IDS
@@ -881,6 +967,7 @@ function resetRunCaches(): void {
   r2CoreStationRefsSourceDayUtc = null;
   sourceLookupCache.clear();
   connectorCodeCache.clear();
+  connectorServiceUrlCache.clear();
   stationFilterByConnector.clear();
   unresolvedRequestedStationIds = [];
   effectiveConnectorIds = CONNECTOR_IDS ? [...CONNECTOR_IDS] : null;
@@ -4157,6 +4244,7 @@ async function loadIngestSourceLookupForConnector(
 async function loadIngestOpenaqSourceLookupForConnector(
   connectorId: number,
   candidateStationRefs: Set<string>,
+  adapterLabel = "openaq",
 ): Promise<SourceConnectorLookup | null> {
   if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
     return null;
@@ -4198,7 +4286,7 @@ async function loadIngestOpenaqSourceLookupForConnector(
         schema: SOURCE_METADATA_SCHEMA,
         table: "stations",
         query: stationQuery,
-        label: `openaq station lookup failed for connector=${connectorId}`,
+        label: `${adapterLabel} station lookup failed for connector=${connectorId}`,
       }),
       fetchAllRowsPaged({
         baseUrl: INGEST_SUPABASE_URL,
@@ -4206,7 +4294,8 @@ async function loadIngestOpenaqSourceLookupForConnector(
         schema: SOURCE_METADATA_SCHEMA,
         table: "timeseries",
         query: timeseriesQuery,
-        label: `openaq timeseries lookup failed for connector=${connectorId}`,
+        label:
+          `${adapterLabel} timeseries lookup failed for connector=${connectorId}`,
       }),
       fetchAllRowsPaged({
         baseUrl: INGEST_SUPABASE_URL,
@@ -4214,7 +4303,8 @@ async function loadIngestOpenaqSourceLookupForConnector(
         schema: SOURCE_METADATA_SCHEMA,
         table: "phenomena",
         query: phenomenaQuery,
-        label: `openaq phenomena lookup failed for connector=${connectorId}`,
+        label:
+          `${adapterLabel} phenomena lookup failed for connector=${connectorId}`,
       }),
       fetchAllRowsPaged({
         baseUrl: INGEST_SUPABASE_URL,
@@ -4223,7 +4313,7 @@ async function loadIngestOpenaqSourceLookupForConnector(
         table: "observed_properties",
         query: observedPropertiesQuery,
         label:
-          `openaq observed_properties lookup failed for connector=${connectorId}`,
+          `${adapterLabel} observed_properties lookup failed for connector=${connectorId}`,
       }),
     ]);
 
@@ -4240,6 +4330,7 @@ async function loadIngestOpenaqSourceLookupForConnector(
 async function loadR2CoreOpenaqSourceLookupForConnector(
   connectorId: number,
   candidateStationRefs: Set<string>,
+  _adapterLabel = "openaq",
 ): Promise<SourceConnectorLookup | null> {
   if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
@@ -4316,6 +4407,29 @@ async function fetchOpenaqSourceLookupForConnector(
   connectorId: number,
   candidateStationRefs: Set<string>,
 ): Promise<SourceConnectorLookup> {
+  return await fetchMetadataSourceLookupForConnector(
+    connectorId,
+    candidateStationRefs,
+    "openaq",
+  );
+}
+
+async function fetchUkAirSosSourceLookupForConnector(
+  connectorId: number,
+  candidateStationRefs: Set<string>,
+): Promise<SourceConnectorLookup> {
+  return await fetchMetadataSourceLookupForConnector(
+    connectorId,
+    candidateStationRefs,
+    "uk_air_sos",
+  );
+}
+
+async function fetchMetadataSourceLookupForConnector(
+  connectorId: number,
+  candidateStationRefs: Set<string>,
+  adapterLabel: string,
+): Promise<SourceConnectorLookup> {
   const cacheKey = connectorId;
   const cached = sourceLookupCache.get(cacheKey);
   if (cached) {
@@ -4333,6 +4447,7 @@ async function fetchOpenaqSourceLookupForConnector(
       const fromR2 = await loadR2CoreOpenaqSourceLookupForConnector(
         connectorId,
         candidateStationRefs,
+        adapterLabel,
       );
       if (fromR2 && fromR2.station_refs.size > 0) {
         sourceLookupCache.set(cacheKey, fromR2);
@@ -4357,6 +4472,7 @@ async function fetchOpenaqSourceLookupForConnector(
     const fromIngest = await loadIngestOpenaqSourceLookupForConnector(
       connectorId,
       candidateStationRefs,
+      adapterLabel,
     );
     if (fromIngest && fromIngest.station_refs.size > 0) {
       sourceLookupCache.set(cacheKey, fromIngest);
@@ -4526,6 +4642,96 @@ async function resolveConnectorIdByCode(
   return null;
 }
 
+async function resolveConnectorServiceUrl(
+  connectorId: number,
+): Promise<string | null> {
+  const cached = connectorServiceUrlCache.get(connectorId);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  if (INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY) {
+    const query = new URLSearchParams();
+    query.set("select", "service_url");
+    query.set("id", `eq.${connectorId}`);
+    query.set("limit", "1");
+    const result = await postgrestTable<Array<Record<string, unknown>>>(
+      INGEST_SUPABASE_URL,
+      INGEST_PRIVILEGED_KEY,
+      {
+        method: "GET",
+        schema: SOURCE_METADATA_SCHEMA,
+        table: "connectors",
+        query,
+      },
+    );
+    if (!result.error) {
+      const serviceUrl = String(result.data?.[0]?.service_url || "").trim();
+      if (serviceUrl) {
+        connectorServiceUrlCache.set(connectorId, serviceUrl);
+        return serviceUrl;
+      }
+    }
+  }
+
+  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+    connectorServiceUrlCache.set(connectorId, null);
+    return null;
+  }
+
+  try {
+    const snapshotInfo = await findLatestCoreSnapshotManifestInfo();
+    if (!snapshotInfo) {
+      connectorServiceUrlCache.set(connectorId, null);
+      return null;
+    }
+    const manifestObject = await r2GetObject({
+      r2: OBS_R2_CONFIG,
+      key: snapshotInfo.manifest_key,
+    });
+    const manifest = parseCoreSnapshotManifest(
+      new TextDecoder().decode(manifestObject.body),
+      snapshotInfo.manifest_key,
+    );
+    const connectorsTableKey = findCoreTableKey(manifest, "connectors");
+    if (!connectorsTableKey) {
+      connectorServiceUrlCache.set(connectorId, null);
+      return null;
+    }
+    const connectorsObject = await r2GetObject({
+      r2: OBS_R2_CONFIG,
+      key: connectorsTableKey,
+    });
+    const ndjsonText = decodeCoreTableText(
+      connectorsObject.body,
+      connectorsTableKey,
+    );
+    for (const line of ndjsonText.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      try {
+        const row = JSON.parse(trimmed) as Record<string, unknown>;
+        const rowId = Number(row.id);
+        if (Number.isInteger(rowId) && rowId === connectorId) {
+          const serviceUrl = String(row.service_url || "").trim() || null;
+          connectorServiceUrlCache.set(connectorId, serviceUrl);
+          return serviceUrl;
+        }
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    connectorServiceUrlCache.set(connectorId, null);
+    return null;
+  }
+
+  connectorServiceUrlCache.set(connectorId, null);
+  return null;
+}
+
 async function fetchTextWithTimeout(
   url: string,
   timeoutMs: number,
@@ -4550,6 +4756,66 @@ async function fetchTextWithTimeout(
       }
 
       const statusMessage = `HTTP ${response.status} for ${url}`;
+      lastErrorMessage = statusMessage;
+      const canRetry = attempt < retries &&
+        (response.status === 408 || isRetryableStatus(response.status));
+      if (canRetry) {
+        await sleep(Math.min(15000, retryBaseMs * attempt));
+        continue;
+      }
+      throw new Error(statusMessage);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastErrorMessage = message;
+      if (attempt < retries) {
+        await sleep(Math.min(15000, retryBaseMs * attempt));
+        continue;
+      }
+      throw new Error(message);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error(lastErrorMessage);
+}
+
+async function fetchJsonWithTimeout(
+  url: string,
+  timeoutMs: number,
+  retries: number,
+  retryBaseMs: number,
+): Promise<unknown> {
+  let lastErrorMessage = `failed to fetch ${url}`;
+
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "uk-aq-backfill-cloud-run",
+          Accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+        },
+      });
+      const contentType = (response.headers.get("content-type") || "")
+        .toLowerCase();
+      const payload = contentType.includes("application/json")
+        ? await response.json().catch(() => null)
+        : await response.text().catch(() => null);
+
+      if (response.ok) {
+        return payload;
+      }
+
+      const responseMessage = typeof payload === "string"
+        ? payload.trim()
+        : asErrorMessage(payload, response.status);
+      const statusMessage = responseMessage
+        ? `HTTP ${response.status} for ${url}: ${responseMessage}`
+        : `HTTP ${response.status} for ${url}`;
       lastErrorMessage = statusMessage;
       const canRetry = attempt < retries &&
         (response.status === 408 || isRetryableStatus(response.status));
@@ -4627,6 +4893,166 @@ async function fetchBytesWithTimeout(args: {
   }
 
   throw new Error(lastErrorMessage);
+}
+
+function ukAirSosMirrorFilePath(
+  dayUtc: string,
+  timeseriesRef: string,
+): string | null {
+  if (!IS_LOCAL_RUN || !UK_AIR_SOS_RAW_MIRROR_ROOT) {
+    return null;
+  }
+  const normalizedDay = parseIsoDayUtc(dayUtc);
+  if (!normalizedDay) {
+    return null;
+  }
+  const root = UK_AIR_SOS_RAW_MIRROR_ROOT.trim();
+  if (!root) {
+    return null;
+  }
+  return path.join(
+    root,
+    `day_utc=${normalizedDay}`,
+    `${encodeURIComponent(timeseriesRef)}.json`,
+  );
+}
+
+async function fetchUkAirSosTimeseriesData(args: {
+  base_url: string;
+  day_utc: string;
+  timeseries_ref: string;
+  timespan: string;
+}): Promise<UkAirSosTimeseriesFetchResult> {
+  const mirrorPath = ukAirSosMirrorFilePath(
+    args.day_utc,
+    args.timeseries_ref,
+  );
+  if (mirrorPath && fs.existsSync(mirrorPath)) {
+    try {
+      return {
+        payload: JSON.parse(fs.readFileSync(mirrorPath, "utf8")) as unknown,
+        mirror_reused: true,
+        mirror_written: false,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to parse UK-AIR SOS mirror ${mirrorPath}: ${message}`,
+      );
+    }
+  }
+
+  const url = new URL(
+    `${
+      args.base_url.replace(/\/$/, "")
+    }/timeseries/${encodeURIComponent(args.timeseries_ref)}/getData`,
+  );
+  url.searchParams.set("timespan", args.timespan);
+  url.searchParams.set("format", "tvp");
+  const payload = await fetchJsonWithTimeout(
+    url.toString(),
+    UK_AIR_SOS_TIMEOUT_MS,
+    UK_AIR_SOS_FETCH_RETRIES,
+    UK_AIR_SOS_RETRY_BASE_MS,
+  );
+  if (mirrorPath) {
+    fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
+    fs.writeFileSync(mirrorPath, JSON.stringify(payload), "utf8");
+  }
+  return {
+    payload,
+    mirror_reused: false,
+    mirror_written: Boolean(mirrorPath),
+  };
+}
+
+function parseUkAirSosTimestamp(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const timestamp = value < 1e12 ? value * 1000 : value;
+    const observedAt = new Date(timestamp);
+    return Number.isNaN(observedAt.getTime()) ? null : observedAt.toISOString();
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      const timestamp = numeric < 1e12 ? numeric * 1000 : numeric;
+      const observedAt = new Date(timestamp);
+      return Number.isNaN(observedAt.getTime()) ? null : observedAt.toISOString();
+    }
+    const observedAt = new Date(trimmed);
+    return Number.isNaN(observedAt.getTime()) ? null : observedAt.toISOString();
+  }
+  return null;
+}
+
+function parseUkAirSosDatapoints(values: unknown): UkAirSosDatapoint[] {
+  let rows = values;
+  if (!Array.isArray(rows) && rows && typeof rows === "object") {
+    const nested = (rows as Record<string, unknown>).values ||
+      (rows as Record<string, unknown>).data;
+    if (Array.isArray(nested)) {
+      rows = nested;
+    }
+  }
+  if (!Array.isArray(rows)) {
+    return [];
+  }
+
+  const datapoints: UkAirSosDatapoint[] = [];
+  for (const row of rows) {
+    let observedAtIso: string | null = null;
+    let value: number | null = null;
+    let status: string | null = null;
+
+    if (Array.isArray(row)) {
+      if (row.length < 2) {
+        continue;
+      }
+      observedAtIso = parseUkAirSosTimestamp(row[0]);
+      value = toFiniteNumber(row[1]);
+      status = row.length > 2 && row[2] != null ? String(row[2]) : null;
+    } else if (row && typeof row === "object") {
+      const record = row as Record<string, unknown>;
+      observedAtIso = parseUkAirSosTimestamp(
+        record.time ?? record.timestamp ?? record.t ?? record.dateTime ??
+          record.phenomenonTime ?? record.observed_at,
+      );
+      value = toFiniteNumber(record.value ?? record.v ?? record.result);
+      status = record.status != null ? String(record.status)
+        : record.s != null ? String(record.s)
+        : record.quality != null ? String(record.quality)
+        : record.qc != null ? String(record.qc)
+        : null;
+    } else {
+      continue;
+    }
+
+    if (!observedAtIso) {
+      continue;
+    }
+    datapoints.push({
+      observed_at: observedAtIso,
+      value,
+      status,
+    });
+  }
+
+  return datapoints;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
 }
 
 function parseSensorcommunityStationRefFromFilename(
@@ -7293,6 +7719,35 @@ async function runSourceToAll(
   const sourceFailedDaySet = new Set<string>();
   const sourceAdapterByConnectorId = new Map<number, SourceAdapterKind>();
 
+  if (UK_AIR_SOS_SOURCE_ENABLED) {
+    const resolvedUkAirSosConnectorId = await resolveConnectorIdByCode(
+      UK_AIR_SOS_CONNECTOR_CODE,
+    );
+    let ukAirSosConnectorId: number | null = null;
+    if (resolvedUkAirSosConnectorId) {
+      ukAirSosConnectorId = resolvedUkAirSosConnectorId;
+    } else if (
+      Number.isInteger(UK_AIR_SOS_CONNECTOR_ID_FALLBACK) &&
+      UK_AIR_SOS_CONNECTOR_ID_FALLBACK > 0
+    ) {
+      ukAirSosConnectorId = UK_AIR_SOS_CONNECTOR_ID_FALLBACK;
+      warnings.push(
+        `Could not resolve connector_code=${UK_AIR_SOS_CONNECTOR_CODE}; using fallback connector_id=${UK_AIR_SOS_CONNECTOR_ID_FALLBACK}.`,
+      );
+    } else {
+      warnings.push(
+        `UK-AIR SOS source adapter enabled, but connector_id could not be resolved from connector_code=${UK_AIR_SOS_CONNECTOR_CODE}; skipping UK-AIR SOS source adapter.`,
+      );
+    }
+    if (ukAirSosConnectorId) {
+      sourceAdapterByConnectorId.set(ukAirSosConnectorId, "uk_air_sos");
+    }
+  } else {
+    warnings.push(
+      "UK-AIR SOS source adapter is disabled by UK_AQ_BACKFILL_UK_AIR_SOS_SOURCE_ENABLED=false.",
+    );
+  }
+
   if (SCOMM_SOURCE_ENABLED) {
     const resolvedSensorcommunityConnectorId = await resolveConnectorIdByCode(
       SCOMM_CONNECTOR_CODE,
@@ -7527,7 +7982,7 @@ async function runSourceToAll(
           }
           candidateSourceUnits = candidateFiles.length;
           sourceCheckpointJson.candidate_files = candidateFiles.length;
-        } else {
+        } else if (sourceAdapter === "openaq") {
           const stationRefsLookup = await fetchStationRefsForConnector(
             connectorId,
           );
@@ -7724,6 +8179,253 @@ async function runSourceToAll(
             totalSkippedOutsideDay;
           sourceCheckpointJson.total_skipped_invalid_value_or_timestamp =
             totalSkippedInvalidValueOrTimestamp;
+        } else if (sourceAdapter === "uk_air_sos") {
+          const stationRefsLookup = await fetchStationRefsForConnector(
+            connectorId,
+          );
+          const requestedStationRefs = getStationFilterForConnector(connectorId)
+            ?.station_refs;
+          const candidateStationRefs = requestedStationRefs?.size
+            ? new Set(
+              Array.from(stationRefsLookup.station_refs).filter((stationRef) =>
+                requestedStationRefs.has(stationRef)
+              ),
+            )
+            : stationRefsLookup.station_refs;
+          if (candidateStationRefs.size === 0) {
+            connectorDaySkipped += 1;
+            await ledgerInsertRunDay(ledgerEnabled, {
+              run_id: runId,
+              run_mode: RUN_MODE,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_kind: "download",
+              status: "skipped",
+              rows_read: 0,
+              rows_written_aqilevels: 0,
+              objects_written_r2: 0,
+              checkpoint_json: {
+                source_adapter: sourceAdapter,
+                skip_reason: stationRefsLookup.station_refs.size === 0
+                  ? "no_candidate_station_refs"
+                  : "no_matching_station_refs",
+                station_ref_count: stationRefsLookup.station_refs.size,
+                requested_station_ref_count: requestedStationRefs?.size || null,
+              },
+              started_at: startedAt,
+              finished_at: nowIso(),
+            });
+            continue;
+          }
+
+          const lookup = await fetchUkAirSosSourceLookupForConnector(
+            connectorId,
+            candidateStationRefs,
+          );
+          const candidateBindings = Array.from(
+            lookup.binding_by_timeseries_ref.values(),
+          )
+            .filter((binding) => candidateStationRefs.has(binding.station_ref))
+            .filter((binding) =>
+              UK_AIR_SOS_INCLUDE_MET_FIELDS ||
+              binding.pollutant_code === "no2" ||
+              binding.pollutant_code === "pm25" ||
+              binding.pollutant_code === "pm10"
+            )
+            .sort((left, right) => {
+              const stationCompare = left.station_ref.localeCompare(
+                right.station_ref,
+              );
+              if (stationCompare !== 0) {
+                return stationCompare;
+              }
+              const refCompare = left.timeseries_ref.localeCompare(
+                right.timeseries_ref,
+              );
+              if (refCompare !== 0) {
+                return refCompare;
+              }
+              return left.timeseries_id - right.timeseries_id;
+            });
+
+          if (candidateBindings.length === 0) {
+            connectorDaySkipped += 1;
+            await ledgerInsertRunDay(ledgerEnabled, {
+              run_id: runId,
+              run_mode: RUN_MODE,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_kind: "download",
+              status: "skipped",
+              rows_read: 0,
+              rows_written_aqilevels: 0,
+              objects_written_r2: 0,
+              checkpoint_json: {
+                source_adapter: sourceAdapter,
+                skip_reason: "no_matching_timeseries_bindings",
+                candidate_station_ref_count: candidateStationRefs.size,
+              },
+              started_at: startedAt,
+              finished_at: nowIso(),
+            });
+            continue;
+          }
+
+          const resolvedServiceUrl = await resolveConnectorServiceUrl(
+            connectorId,
+          );
+          const sourceBaseUrl = (resolvedServiceUrl || UK_AIR_SOS_BASE_URL)
+            .replace(/\/$/, "");
+          const dayStartIso = utcDayStartIso(dayUtc);
+          const dayEndIso = utcDayEndIso(dayUtc);
+          const timespan = `${dayStartIso}/${dayEndIso}`;
+
+          const timeseriesResults = await mapConcurrent(
+            candidateBindings,
+            UK_AIR_SOS_FETCH_CONCURRENCY,
+            async (binding) => {
+              try {
+                const payload = await fetchUkAirSosTimeseriesData({
+                  base_url: sourceBaseUrl,
+                  day_utc: dayUtc,
+                  timeseries_ref: binding.timeseries_ref,
+                  timespan,
+                });
+                const datapoints = parseUkAirSosDatapoints(payload.payload);
+                const rows: SourceObservationRow[] = [];
+                let skippedOutsideDay = 0;
+                let skippedNullValue = 0;
+
+                for (const datapoint of datapoints) {
+                  if (
+                    datapoint.observed_at < dayStartIso ||
+                    datapoint.observed_at >= dayEndIso
+                  ) {
+                    skippedOutsideDay += 1;
+                    continue;
+                  }
+                  if (datapoint.value === null) {
+                    skippedNullValue += 1;
+                    continue;
+                  }
+                  rows.push({
+                    timeseries_id: binding.timeseries_id,
+                    station_id: binding.station_id,
+                    pollutant_code: binding.pollutant_code,
+                    observed_at: datapoint.observed_at,
+                    value: datapoint.value,
+                  });
+                }
+
+                logStructured(
+                  "info",
+                  "source_to_r2_uk_air_sos_timeseries_processed",
+                  {
+                    run_id: runId,
+                    day_utc: dayUtc,
+                    connector_id: connectorId,
+                    source_adapter: "uk_air_sos",
+                    station_ref: binding.station_ref,
+                    timeseries_ref: binding.timeseries_ref,
+                    timeseries_id: binding.timeseries_id,
+                    pollutant_code: binding.pollutant_code,
+                    raw_point_count: datapoints.length,
+                    mapped_point_count: rows.length,
+                    mirror_reused: payload.mirror_reused,
+                    mirror_written: payload.mirror_written,
+                    skipped_outside_day: skippedOutsideDay,
+                    skipped_null_value: skippedNullValue,
+                  },
+                );
+
+                return {
+                  rows,
+                  raw_point_count: datapoints.length,
+                  mapped_point_count: rows.length,
+                  mirror_reused: payload.mirror_reused,
+                  mirror_written: payload.mirror_written,
+                  skipped_outside_day: skippedOutsideDay,
+                  skipped_null_value: skippedNullValue,
+                  error_message: null as string | null,
+                };
+              } catch (error) {
+                const message = error instanceof Error
+                  ? error.message
+                  : String(error);
+                logStructured(
+                  "warning",
+                  "source_to_r2_uk_air_sos_timeseries_failed",
+                  {
+                    run_id: runId,
+                    day_utc: dayUtc,
+                    connector_id: connectorId,
+                    source_adapter: "uk_air_sos",
+                    station_ref: binding.station_ref,
+                    timeseries_ref: binding.timeseries_ref,
+                    timeseries_id: binding.timeseries_id,
+                    pollutant_code: binding.pollutant_code,
+                    error: message,
+                  },
+                );
+                return {
+                  rows: [] as SourceObservationRow[],
+                  raw_point_count: 0,
+                  mapped_point_count: 0,
+                  skipped_outside_day: 0,
+                  skipped_null_value: 0,
+                  error_message:
+                    `${binding.timeseries_ref} (${binding.station_ref}): ${message}`,
+                };
+              }
+            },
+          );
+
+          let totalRawPoints = 0;
+          let totalMappedPoints = 0;
+          let totalMirrorReused = 0;
+          let totalMirrorWritten = 0;
+          let totalSkippedOutsideDay = 0;
+          let totalSkippedNullValue = 0;
+          const failedTimeseries: string[] = [];
+          for (const result of timeseriesResults) {
+            observationRowsRaw.push(...result.rows);
+            totalRawPoints += result.raw_point_count;
+            totalMappedPoints += result.mapped_point_count;
+            totalMirrorReused += result.mirror_reused ? 1 : 0;
+            totalMirrorWritten += result.mirror_written ? 1 : 0;
+            totalSkippedOutsideDay += result.skipped_outside_day;
+            totalSkippedNullValue += result.skipped_null_value;
+            if (result.error_message) {
+              failedTimeseries.push(result.error_message);
+            }
+          }
+
+          if (failedTimeseries.length > 0) {
+            throw new Error(
+              `uk_air_sos_timeseries_fetch_failed: ${failedTimeseries.length} timeseries failed: ${
+                failedTimeseries.slice(0, 5).join(" | ")
+              }`,
+            );
+          }
+
+          candidateSourceUnits = candidateBindings.length;
+          sourceCheckpointJson.source_base_url = sourceBaseUrl;
+          sourceCheckpointJson.timespan = timespan;
+          sourceCheckpointJson.candidate_station_ref_count =
+            candidateStationRefs.size;
+          sourceCheckpointJson.candidate_timeseries_count =
+            candidateBindings.length;
+          sourceCheckpointJson.mirror_reused_count = totalMirrorReused;
+          sourceCheckpointJson.mirror_written_count = totalMirrorWritten;
+          sourceCheckpointJson.total_raw_points = totalRawPoints;
+          sourceCheckpointJson.total_mapped_points = totalMappedPoints;
+          sourceCheckpointJson.total_skipped_outside_day =
+            totalSkippedOutsideDay;
+          sourceCheckpointJson.total_skipped_null_value = totalSkippedNullValue;
+        } else {
+          throw new Error(
+            `unsupported source_to_r2 adapter=${sourceAdapter} for connector_id=${connectorId}`,
+          );
         }
 
         const dedupedObservationRows = dedupeSourceObservationRows(

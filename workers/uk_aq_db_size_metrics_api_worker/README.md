@@ -50,6 +50,7 @@ R2 history-days response shape:
 - `domains.<domain>.min_day_utc`
 - `domains.<domain>.max_day_utc`
 - `domains.<domain>.day_count`
+- `sources.<domain>` (`cloudflare_r2_history_index` or `cloudflare_r2_manifest_scan`)
 
 Behavior:
 
@@ -62,8 +63,12 @@ Behavior:
   - `uk_aq_public.uk_aq_schema_size_metrics_hourly`
 - Reads R2-domain size rows from ingestdb public view:
   - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
-- For `/v1/r2-history-days`, defaults to low-subrequest domain day-prefix scan:
-  - lists `day_utc=YYYY-MM-DD/` common prefixes under each domain;
+- For `/v1/r2-history-days`, first tries derived R2 history index files:
+  - `history/_index/observations_latest.json`
+  - `history/_index/aqilevels_latest.json`
+  - index prefix is configurable via `UK_AQ_R2_HISTORY_INDEX_PREFIX`
+- If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that domain only:
+  - lists `day_utc=YYYY-MM-DD/` common prefixes under the domain;
   - filters by `max_days` and excludes future dates.
 - Optional strict mode (`strict_manifests=true`):
   - verifies `<prefix>/day_utc=YYYY-MM-DD/manifest.json` exists via `HEAD` per day;
@@ -87,6 +92,7 @@ Optional:
 - `CFLARE_R2_SECRET_ACCESS_KEY` (required for `/v1/r2-history-days`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
+- `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
 
 ## Deploy (manual)
 

@@ -6,6 +6,7 @@ import {
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
 } from "./phase_b_history_r2.mjs";
+import { rebuildR2HistoryIndexes } from "../shared/uk_aq_r2_history_index.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -1777,6 +1778,40 @@ async function runPrune(config) {
     logStructured,
     runId: phaseBRunId,
   });
+  let phaseBHistoryIndexSummary = {
+    enabled: false,
+    rebuilt: false,
+    reason: "phase_b_not_completed",
+  };
+  if (!config.dryRun && phaseBHistorySummary?.enabled) {
+    try {
+      const indexSummary = await rebuildR2HistoryIndexes({
+        env: process.env,
+      });
+      phaseBHistoryIndexSummary = {
+        enabled: true,
+        rebuilt: true,
+        ...indexSummary,
+      };
+      logStructured("INFO", "phase_b_history_index_rebuild_complete", {
+        run_id: phaseBRunId,
+        bucket: indexSummary.bucket,
+        index_prefix: indexSummary.index_prefix,
+        results: indexSummary.results,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      phaseBHistoryIndexSummary = {
+        enabled: true,
+        rebuilt: false,
+        error: message,
+      };
+      logStructured("WARNING", "phase_b_history_index_rebuild_failed", {
+        run_id: phaseBRunId,
+        error: message,
+      });
+    }
+  }
 
   const overallWindow = buildWindow(
     config.maxHoursPerRun,
@@ -1794,6 +1829,7 @@ async function runPrune(config) {
       ...singleSummary,
       phase_a_recent: phaseARecentSummary,
       phase_b_history: phaseBHistorySummary,
+      phase_b_history_index: phaseBHistoryIndexSummary,
     };
   }
 
@@ -1833,6 +1869,7 @@ async function runPrune(config) {
     ...aggregateSummary,
     phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
+    phase_b_history_index: phaseBHistoryIndexSummary,
   };
   logStructured(
     "INFO",

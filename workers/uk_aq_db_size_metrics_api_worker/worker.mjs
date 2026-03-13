@@ -4,6 +4,11 @@ import {
   r2ListAllCommonPrefixes,
   r2HeadObject,
 } from "../shared/r2_sigv4.mjs";
+import {
+  buildR2HistoryIndexKey,
+  readR2HistoryIndex,
+  resolveR2HistoryIndexConfig,
+} from "../shared/uk_aq_r2_history_index.mjs";
 
 const DEFAULT_LOOKBACK_DAYS = 28;
 const MAX_LOOKBACK_DAYS = 120;
@@ -191,7 +196,8 @@ function resolveR2Config(env, bucketName) {
 }
 
 function resolveR2HistoryBucket(env) {
-  const bucket = normalizeBucketName(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "");
+  const config = resolveR2HistoryIndexConfig(env);
+  const bucket = normalizeBucketName(config.r2.bucket || "");
   if (!bucket) {
     throw new Error("Missing bucket env CFLARE_R2_BUCKET/R2_BUCKET");
   }
@@ -218,6 +224,17 @@ function buildDayCutoff(maxLookbackDays) {
   return new Date(startOfTodayUtc - maxLookbackDays * 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10);
+}
+
+function compactHistoryIndexDomain(domainPayload) {
+  return {
+    days: Array.isArray(domainPayload?.days) ? domainPayload.days : [],
+    min_day_utc: domainPayload?.min_day_utc || null,
+    max_day_utc: domainPayload?.max_day_utc || null,
+    day_count: Number(domainPayload?.day_count || 0) || 0,
+    total_rows: Number(domainPayload?.total_rows || 0) || 0,
+    generated_at: domainPayload?.generated_at || null,
+  };
 }
 
 function escapeRegex(value) {
@@ -319,21 +336,60 @@ async function fetchR2HistoryDays(env, url) {
   const aqilevelsPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels",
   );
+  const indexConfig = resolveR2HistoryIndexConfig(env);
+  const todayDay = new Date().toISOString().slice(0, 10);
+  const domainSources = {};
+  const warnings = [];
+  let observations;
+  let aqilevels;
 
-  const observations = await listCommittedDaysForDomain({
-    r2,
-    domainPrefix: observationsPrefix,
-    maxKeys,
-    maxLookbackDays,
-    strictManifests,
-  });
-  const aqilevels = await listCommittedDaysForDomain({
-    r2,
-    domainPrefix: aqilevelsPrefix,
-    maxKeys,
-    maxLookbackDays,
-    strictManifests,
-  });
+  try {
+    observations = compactHistoryIndexDomain(await readR2HistoryIndex({
+      r2,
+      indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
+      domain: "observations",
+      maxLookbackDays,
+      todayDay,
+    }));
+    domainSources.observations = "cloudflare_r2_history_index";
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    warnings.push(`observations index fallback: ${message}`);
+    observations = await listCommittedDaysForDomain({
+      r2,
+      domainPrefix: observationsPrefix,
+      maxKeys,
+      maxLookbackDays,
+      strictManifests,
+    });
+    domainSources.observations = "cloudflare_r2_manifest_scan";
+  }
+
+  try {
+    aqilevels = compactHistoryIndexDomain(await readR2HistoryIndex({
+      r2,
+      indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
+      domain: "aqilevels",
+      maxLookbackDays,
+      todayDay,
+    }));
+    domainSources.aqilevels = "cloudflare_r2_history_index";
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    warnings.push(`aqilevels index fallback: ${message}`);
+    aqilevels = await listCommittedDaysForDomain({
+      r2,
+      domainPrefix: aqilevelsPrefix,
+      maxKeys,
+      maxLookbackDays,
+      strictManifests,
+    });
+    domainSources.aqilevels = "cloudflare_r2_manifest_scan";
+  }
+
+  const source = domainSources.observations === domainSources.aqilevels
+    ? domainSources.observations
+    : "mixed";
 
   return {
     bucket,
@@ -347,7 +403,14 @@ async function fetchR2HistoryDays(env, url) {
       observations,
       aqilevels,
     },
-    source: "cloudflare_r2_manifest_scan",
+    source,
+    sources: domainSources,
+    index_prefix: indexConfig.index_prefix,
+    index_keys: {
+      observations: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
+      aqilevels: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
+    },
+    warnings,
     strict_manifests: strictManifests,
   };
 }

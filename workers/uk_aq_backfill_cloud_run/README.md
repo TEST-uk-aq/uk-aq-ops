@@ -6,7 +6,7 @@ Current implementation status (Phase 9, incremental):
 
 - `local_to_aqilevels`: implemented.
 - `obs_aqi_to_r2`: implemented (dry-run planning + non-dry R2 export/write path).
-- `source_to_r2`: implemented for Sensor.Community and OpenAQ archive-to-R2 flows (station_ref/location_id filtered by core metadata and stations universe, observations + aqilevels manifests written to R2).
+- `source_to_r2`: implemented for UK-AIR SOS, Sensor.Community, and OpenAQ source-to-R2 flows (metadata-filtered observations + aqilevels manifests written to R2).
 
 ## Endpoints
 
@@ -59,9 +59,13 @@ All fields are optional unless noted.
 
 - `source_to_r2`
   - supports source adapters:
+    - UK-AIR SOS historical backfill (`/timeseries/{timeseries_ref}/getData?timespan=<UTC_DAY>&format=tvp` against the configured SOS base URL).
     - Sensor.Community archive backfill (`https://archive.sensor.community/YYYY-MM-DD/`).
     - OpenAQ AWS archive backfill (`records/csv.gz/locationid=<LOCATION_ID>/year=<YYYY>/month=<MM>/location-<LOCATION_ID>-<YYYYMMDD>.csv.gz`).
   - resolves known station/timeseries bindings from core metadata (R2 core snapshot first, ingest fallback).
+  - UK-AIR SOS uses existing connector metadata (`stations`, `timeseries`, `phenomena`, `observed_properties`) to map:
+    - `station_ref = existing UK-AIR SOS station_ref`
+    - `timeseries_ref = existing UK-AIR SOS upstream timeseries id`
   - Sensor.Community filters by known `station_ref` (`sensor_id`).
   - OpenAQ uses candidate UK `location_id` from existing OpenAQ stations (`station_ref`) and maps source records with:
     - `station_ref = OpenAQ location_id`
@@ -72,6 +76,7 @@ All fields are optional unless noted.
     - `history/v1/observations/...`
     - `history/v1/aqilevels/...`
   - optional local raw source mirrors for local runs only:
+    - `UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT`
   - unresolved/unsupported connectors and transient source acquisition outages are returned in `source_acquisition_pending_days`.
@@ -135,6 +140,19 @@ Source RPC paging:
 - `UK_AQ_BACKFILL_OBS_R2_MAX_PAGES` (default `50000`; safety ceiling for obs/aqi history export pagination)
 - `UK_AQ_BACKFILL_R2_CORE_LOOKBACK_DAYS` (default `45`)
 - `UK_AQ_BACKFILL_R2_CORE_SNAPSHOT_MAX_BYTES` (default `250000000`)
+
+UK-AIR SOS source adapter:
+
+- `UK_AQ_BACKFILL_UK_AIR_SOS_SOURCE_ENABLED` (default `true`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_CONNECTOR_CODE` (default `uk_air_sos`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_CONNECTOR_ID_FALLBACK` (default `1`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_BASE_URL` (default `https://uk-air.defra.gov.uk/sos-ukair/api/v1`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_INCLUDE_MET_FIELDS` (default `true`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_TIMEOUT_MS` (default `60000`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_RETRIES` (default `3`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_RETRY_BASE_MS` (default `1500`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_CONCURRENCY` (default `5`)
+- `UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT` (optional local replay mirror for SOS JSON payloads)
 
 Sensor.Community source adapter:
 

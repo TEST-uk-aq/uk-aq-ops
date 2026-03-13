@@ -3,6 +3,7 @@
   "specifiers": {
     "npm:@supabase/supabase-js@^2.57.0": "2.99.0",
     "npm:apache-arrow@^21.1.0": "21.1.0",
+    "npm:hyparquet-compressors@^1.1.1": "1.1.1",
     "npm:hyparquet@^1.25.1": "1.25.1",
     "npm:parquet-wasm@~0.7.1": "0.7.1",
     "npm:pg-cursor@^2.18.0": "2.19.0_pg@8.20.0",
@@ -150,11 +151,24 @@
     "flatbuffers@25.9.23": {
       "integrity": "sha512-MI1qs7Lo4Syw0EOzUl0xjs2lsoeqFku44KpngfIduHBYvzm8h2+7K8YMQh1JtVVVrUvhLpNwqVi4DERegUJhPQ=="
     },
+    "fzstd@0.1.1": {
+      "integrity": "sha512-dkuVSOKKwh3eas5VkJy1AW1vFpet8TA/fGmVA5krThl8YcOVE/8ZIoEA1+U1vEn5ckxxhLirSdY837azmbaNHA=="
+    },
     "has-flag@4.0.0": {
       "integrity": "sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ=="
     },
+    "hyparquet-compressors@1.1.1": {
+      "integrity": "sha512-yx7aA3Rhj0YycbdV71+XznQSLAefa4cT0urpgNXy4aM6eSeCknaVDNne8y45Uz74Fb15yyXUzOStlceOJBan7A==",
+      "dependencies": [
+        "fzstd",
+        "hysnappy"
+      ]
+    },
     "hyparquet@1.25.1": {
       "integrity": "sha512-CXcN/u6RdQqsK8IphUptpAEqY8IzgwzHY+MuXX+2wpoWTumfxPVr6JYbbywsNsiAl9aEbM5sRtxkwRBa22b49w=="
+    },
+    "hysnappy@1.0.0": {
+      "integrity": "sha512-MNrC4NfwDGPb889O6gIfEtbvEZCSWUsSEhsz4Oq2FRcpGtXHfeVz3KciSPp5Pnnz1NjFMgDQNfxdJozymJEDDA=="
     },
     "iceberg-js@0.8.1": {
       "integrity": "sha512-1dhVQZXhcHje7798IVM+xoo/1ZdVfzOMIc8/rgVSijRK38EDqOJoGula9N/8ZI5RD8QTxNQtK/Gozpr+qUqRRA=="
