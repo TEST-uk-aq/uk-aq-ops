@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "core"]);
+const INDEX_DOMAIN_NAMES = Object.freeze(["observations", "aqilevels"]);
 
 function parseNonNegativeInt(rawValue, fallback) {
   const value = Number(rawValue);
@@ -28,6 +30,9 @@ const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
   aqilevels: normalizePrefix(process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels"),
   core: normalizePrefix(process.env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core"),
 });
+const DEFAULT_INDEX_PREFIX = normalizePrefix(
+  process.env.UK_AQ_R2_HISTORY_INDEX_PREFIX || "history/_index",
+);
 
 const DEFAULT_STATE_REL_PATH =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || "").trim()
@@ -271,6 +276,72 @@ function listDayFolders(rcloneBin, sourceDomainPath) {
 
 function sha256Hex(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export function buildIndexManifestRelativePath(
+  domain,
+  indexPrefix = DEFAULT_INDEX_PREFIX,
+) {
+  const normalizedDomain = String(domain || "").trim().toLowerCase();
+  if (!INDEX_DOMAIN_NAMES.includes(normalizedDomain)) {
+    throw new Error(`Invalid index domain: ${String(domain || "")}`);
+  }
+  const normalizedPrefix = normalizePrefix(indexPrefix || DEFAULT_INDEX_PREFIX);
+  if (!normalizedPrefix) {
+    return `${normalizedDomain}_latest.json`;
+  }
+  return `${normalizedPrefix}/${normalizedDomain}_latest.json`;
+}
+
+export function buildIndexManifestTargets(
+  domains,
+  indexPrefix = DEFAULT_INDEX_PREFIX,
+) {
+  return Array.from(new Set(
+    (Array.isArray(domains) ? domains : []).map((domain) =>
+      String(domain || "").trim().toLowerCase()
+    ),
+  ))
+    .filter((domain) => INDEX_DOMAIN_NAMES.includes(domain))
+    .map((domain) => ({
+      domain,
+      relative_path: buildIndexManifestRelativePath(domain, indexPrefix),
+    }));
+}
+
+export function planIndexManifestCopy({ sourceText, destText }) {
+  const normalizedSourceText = typeof sourceText === "string" ? sourceText : "";
+  if (!normalizedSourceText) {
+    return {
+      status: "missing_source",
+      copy_required: false,
+      source_hash: null,
+      dest_hash: typeof destText === "string" && destText
+        ? sha256Hex(destText)
+        : null,
+    };
+  }
+
+  const sourceHash = sha256Hex(normalizedSourceText);
+  const destHash = typeof destText === "string" && destText
+    ? sha256Hex(destText)
+    : null;
+
+  if (sourceHash === destHash) {
+    return {
+      status: "existing",
+      copy_required: false,
+      source_hash: sourceHash,
+      dest_hash: destHash,
+    };
+  }
+
+  return {
+    status: "copy_required",
+    copy_required: true,
+    source_hash: sourceHash,
+    dest_hash: destHash,
+  };
 }
 
 function parseManifestOrThrow(manifestText, manifestPath) {
@@ -524,6 +595,81 @@ function copyDayFolder(rcloneBin, sourceDayPath, destDayPath, dryRun) {
   runRclone(rcloneBin, args);
 }
 
+function copyFilePath(rcloneBin, sourcePath, destPath, dryRun) {
+  const args = [
+    "copyto",
+    sourcePath,
+    destPath,
+    "--check-first",
+  ];
+  if (dryRun) {
+    args.push("--dry-run");
+  }
+  runRclone(rcloneBin, args);
+}
+
+function syncIndexManifests(args, report) {
+  const indexTargets = buildIndexManifestTargets(
+    args.domains,
+    process.env.UK_AQ_R2_HISTORY_INDEX_PREFIX || DEFAULT_INDEX_PREFIX,
+  );
+
+  for (const target of indexTargets) {
+    const sourcePath = joinTargetPath(args.source_root, target.relative_path);
+    const destPath = joinTargetPath(args.dest_root, target.relative_path);
+    const sourceObject = rcloneCatMaybe(args.rclone_bin, sourcePath);
+    const destObject = sourceObject.found
+      ? rcloneCatMaybe(args.rclone_bin, destPath)
+      : { found: false, text: "" };
+    const plan = planIndexManifestCopy({
+      sourceText: sourceObject.found ? sourceObject.text : "",
+      destText: destObject.found ? destObject.text : "",
+    });
+
+    const summary = {
+      relative_path: target.relative_path,
+      source_path: sourcePath,
+      dest_path: destPath,
+      source_found: sourceObject.found,
+      dest_found: destObject.found,
+      status: plan.status,
+      copied: false,
+    };
+
+    if (plan.status === "missing_source") {
+      report.index_manifests[target.domain] = summary;
+      report.totals.index_manifests_missing_source += 1;
+      continue;
+    }
+
+    if (!plan.copy_required) {
+      report.index_manifests[target.domain] = summary;
+      report.totals.index_manifests_skipped_existing += 1;
+      continue;
+    }
+
+    report.totals.index_manifests_needing_copy += 1;
+    if (!args.dry_run) {
+      copyFilePath(args.rclone_bin, sourcePath, destPath, false);
+      const destVerify = rcloneCatMaybe(args.rclone_bin, destPath);
+      if (!destVerify.found) {
+        throw new Error(`Destination index manifest missing after copy: ${destPath}`);
+      }
+      const destVerifyHash = sha256Hex(destVerify.text);
+      if (destVerifyHash !== plan.source_hash) {
+        throw new Error(`Destination index manifest hash mismatch for ${destPath}`);
+      }
+      summary.status = "copied";
+      summary.copied = true;
+      report.totals.index_manifests_copied += 1;
+    } else {
+      summary.status = "planned_copy";
+    }
+
+    report.index_manifests[target.domain] = summary;
+  }
+}
+
 async function main(args) {
   const startedAt = new Date().toISOString();
 
@@ -542,12 +688,17 @@ async function main(args) {
     dry_run: args.dry_run,
     max_days_per_run: args.max_days_per_run,
     domains: {},
+    index_manifests: {},
     totals: {
       listed_days: 0,
       candidate_days: 0,
       copied_days: 0,
       skipped_existing: 0,
       skipped_incomplete: 0,
+      index_manifests_needing_copy: 0,
+      index_manifests_copied: 0,
+      index_manifests_skipped_existing: 0,
+      index_manifests_missing_source: 0,
     },
   };
 
@@ -645,27 +796,42 @@ async function main(args) {
     }
   }
 
+  syncIndexManifests(args, report);
+
   report.completed_at = new Date().toISOString();
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
 }
 
-let reportOutPath = DEFAULT_REPORT_OUT;
-let parsedArgs = null;
-
-try {
-  parsedArgs = parseArgs(process.argv.slice(2));
-  reportOutPath = parsedArgs.report_out || reportOutPath;
-  await main(parsedArgs);
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const payload = {
-    ok: false,
-    error: message,
-  };
-  if (reportOutPath) {
-    writeReport(reportOutPath, payload);
+function isMainModule(moduleUrl) {
+  if (!process.argv[1]) {
+    return false;
   }
-  console.error(JSON.stringify(payload));
-  process.exit(1);
+  return path.resolve(process.argv[1]) === fileURLToPath(moduleUrl);
+}
+
+async function runCli() {
+  let reportOutPath = DEFAULT_REPORT_OUT;
+  let parsedArgs = null;
+
+  try {
+    parsedArgs = parseArgs(process.argv.slice(2));
+    reportOutPath = parsedArgs.report_out || reportOutPath;
+    await main(parsedArgs);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const payload = {
+      ok: false,
+      error: message,
+    };
+    if (reportOutPath) {
+      writeReport(reportOutPath, payload);
+    }
+    console.error(JSON.stringify(payload));
+    process.exit(1);
+  }
+}
+
+if (isMainModule(import.meta.url)) {
+  await runCli();
 }
