@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildBackwardDayRange,
   computeRollingLocalRetentionWindow,
+  isRetryableSourceFetchError,
   isDayInRollingRetentionWindow,
   isSourceAcquisitionPendingError,
   parseRunMode,
@@ -104,6 +105,44 @@ test("isSourceAcquisitionPendingError only treats known source fetch failures as
     isSourceAcquisitionPendingError(
       "breathelondon",
       "missing connector manifests for day=2025-12-13 after source_to_r2 export",
+    ),
+    false,
+  );
+});
+
+test("isRetryableSourceFetchError only treats transient source fetch failures as retryable", () => {
+  assert.equal(
+    isRetryableSourceFetchError(
+      "uk_air_sos",
+      "uk_air_sos_timeseries_fetch_failed: 25 timeseries failed: client error (Connect): dns error: failed to lookup address information: nodename nor servname provided, or not known",
+    ),
+    true,
+  );
+  assert.equal(
+    isRetryableSourceFetchError(
+      "breathelondon",
+      "breathelondon_clarity_fetch_failed: site_code=CLDP0001 species=IPM25 day_utc=2025-01-01: HTTP 503 for https://api.breathelondon-communities.org/api/getClarityData/...",
+    ),
+    true,
+  );
+  assert.equal(
+    isRetryableSourceFetchError(
+      "sensorcommunity",
+      "sensorcommunity_archive_csv_fetch_failed: 2025-12-13_sensor_123.csv: The signal has been aborted",
+    ),
+    true,
+  );
+  assert.equal(
+    isRetryableSourceFetchError(
+      "uk_air_sos",
+      "Failed to parse UK-AIR SOS mirror /tmp/example.json: Unexpected token",
+    ),
+    false,
+  );
+  assert.equal(
+    isRetryableSourceFetchError(
+      "openaq",
+      "ENOENT: no such file or directory, open '/tmp/location-4312692-20260131.csv.gz'",
     ),
     false,
   );

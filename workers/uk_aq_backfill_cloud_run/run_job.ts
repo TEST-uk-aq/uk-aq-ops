@@ -6,6 +6,7 @@ import {
   dayRangeDaysCount,
   isDayInRollingRetentionWindow,
   isDayLikelyInIngestWindow,
+  isRetryableSourceFetchError,
   parseBooleanish,
   parseConnectorIds,
   parseIsoDayUtc,
@@ -119,6 +120,22 @@ type UkAirSosDatapoint = {
   observed_at: string;
   value: number | null;
   status: string | null;
+};
+
+type UkAirSosTimeseriesProcessResult = {
+  binding: SourceTimeseriesBinding;
+  station_ref: string;
+  timeseries_ref: string;
+  rows: SourceObservationRow[];
+  raw_point_count: number;
+  mapped_point_count: number;
+  mirror_reused: boolean;
+  mirror_written: boolean;
+  no_data_manifest_reused: boolean;
+  empty_payload_confirmed: boolean;
+  skipped_outside_day: number;
+  skipped_null_value: number;
+  error_message: string | null;
 };
 
 type UkAirSosNoDataManifestEntry = {
@@ -727,6 +744,25 @@ const UK_AIR_SOS_FETCH_CONCURRENCY = parsePositiveInt(
   5,
   1,
   20,
+);
+const UK_AIR_SOS_TIMESERIES_RETRY_ROUNDS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_TIMESERIES_RETRY_ROUNDS"),
+  2,
+  0,
+  10,
+);
+const UK_AIR_SOS_TIMESERIES_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_TIMESERIES_RETRY_BASE_MS"),
+  5000,
+  100,
+  60000,
+);
+const UK_AIR_SOS_TIMESERIES_RETRY_CONCURRENCY = Math.max(
+  1,
+  Math.min(
+    UK_AIR_SOS_FETCH_CONCURRENCY,
+    Math.floor(UK_AIR_SOS_FETCH_CONCURRENCY / 2) || 1,
+  ),
 );
 const UK_AIR_SOS_RAW_MIRROR_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT",
@@ -5221,6 +5257,135 @@ function parseUkAirSosDatapoints(values: unknown): UkAirSosDatapoint[] {
   return datapoints;
 }
 
+async function processUkAirSosTimeseriesBatch(args: {
+  run_id: string;
+  day_utc: string;
+  connector_id: number;
+  bindings: SourceTimeseriesBinding[];
+  concurrency: number;
+  base_url: string;
+  timespan: string;
+  known_empty_timeseries_refs: ReadonlySet<string>;
+  day_start_iso: string;
+  day_end_iso: string;
+  retry_round?: number;
+}): Promise<UkAirSosTimeseriesProcessResult[]> {
+  return await mapConcurrent(
+    args.bindings,
+    args.concurrency,
+    async (binding): Promise<UkAirSosTimeseriesProcessResult> => {
+      try {
+        const payload = await fetchUkAirSosTimeseriesData({
+          base_url: args.base_url,
+          day_utc: args.day_utc,
+          timeseries_ref: binding.timeseries_ref,
+          timespan: args.timespan,
+          known_empty_timeseries_refs: args.known_empty_timeseries_refs,
+        });
+        const datapoints = parseUkAirSosDatapoints(payload.payload);
+        const rows: SourceObservationRow[] = [];
+        let skippedOutsideDay = 0;
+        let skippedNullValue = 0;
+
+        for (const datapoint of datapoints) {
+          if (
+            datapoint.observed_at < args.day_start_iso ||
+            datapoint.observed_at >= args.day_end_iso
+          ) {
+            skippedOutsideDay += 1;
+            continue;
+          }
+          if (datapoint.value === null) {
+            skippedNullValue += 1;
+            continue;
+          }
+          rows.push({
+            timeseries_id: binding.timeseries_id,
+            station_id: binding.station_id,
+            pollutant_code: binding.pollutant_code,
+            observed_at: datapoint.observed_at,
+            value: datapoint.value,
+          });
+        }
+
+        const emptyPayloadConfirmed = isUkAirSosEmptyPayload(payload.payload);
+        logStructured(
+          "info",
+          "source_to_r2_uk_air_sos_timeseries_processed",
+          {
+            run_id: args.run_id,
+            day_utc: args.day_utc,
+            connector_id: args.connector_id,
+            source_adapter: "uk_air_sos",
+            station_ref: binding.station_ref,
+            timeseries_ref: binding.timeseries_ref,
+            timeseries_id: binding.timeseries_id,
+            pollutant_code: binding.pollutant_code,
+            raw_point_count: datapoints.length,
+            mapped_point_count: rows.length,
+            mirror_reused: payload.mirror_reused,
+            mirror_written: payload.mirror_written,
+            no_data_manifest_reused: payload.no_data_manifest_reused,
+            empty_payload_confirmed: emptyPayloadConfirmed,
+            skipped_outside_day: skippedOutsideDay,
+            skipped_null_value: skippedNullValue,
+            ...(args.retry_round ? { retry_round: args.retry_round } : {}),
+          },
+        );
+
+        return {
+          binding,
+          station_ref: binding.station_ref,
+          timeseries_ref: binding.timeseries_ref,
+          rows,
+          raw_point_count: datapoints.length,
+          mapped_point_count: rows.length,
+          mirror_reused: payload.mirror_reused,
+          mirror_written: payload.mirror_written,
+          no_data_manifest_reused: payload.no_data_manifest_reused,
+          empty_payload_confirmed: emptyPayloadConfirmed,
+          skipped_outside_day: skippedOutsideDay,
+          skipped_null_value: skippedNullValue,
+          error_message: null,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logStructured(
+          "warning",
+          "source_to_r2_uk_air_sos_timeseries_failed",
+          {
+            run_id: args.run_id,
+            day_utc: args.day_utc,
+            connector_id: args.connector_id,
+            source_adapter: "uk_air_sos",
+            station_ref: binding.station_ref,
+            timeseries_ref: binding.timeseries_ref,
+            timeseries_id: binding.timeseries_id,
+            pollutant_code: binding.pollutant_code,
+            error: message,
+            ...(args.retry_round ? { retry_round: args.retry_round } : {}),
+          },
+        );
+        return {
+          binding,
+          station_ref: binding.station_ref,
+          timeseries_ref: binding.timeseries_ref,
+          rows: [],
+          raw_point_count: 0,
+          mapped_point_count: 0,
+          mirror_reused: false,
+          mirror_written: false,
+          no_data_manifest_reused: false,
+          empty_payload_confirmed: false,
+          skipped_outside_day: 0,
+          skipped_null_value: 0,
+          error_message: `${binding.timeseries_ref} (${binding.station_ref}): ${message}`,
+        };
+      }
+    },
+  );
+}
+
 function toFiniteNumber(value: unknown): number | null {
   if (value === null || value === undefined) {
     return null;
@@ -8940,118 +9105,74 @@ async function runSourceToAll(
             knownNoDataTimeseriesEntries.keys(),
           );
 
-          const timeseriesResults = await mapConcurrent(
-            candidateBindings,
-            UK_AIR_SOS_FETCH_CONCURRENCY,
-            async (binding) => {
-              try {
-                const payload = await fetchUkAirSosTimeseriesData({
-                  base_url: sourceBaseUrl,
-                  day_utc: dayUtc,
-                  timeseries_ref: binding.timeseries_ref,
-                  timespan,
-                  known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
-                });
-                const datapoints = parseUkAirSosDatapoints(payload.payload);
-                const rows: SourceObservationRow[] = [];
-                let skippedOutsideDay = 0;
-                let skippedNullValue = 0;
-
-                for (const datapoint of datapoints) {
-                  if (
-                    datapoint.observed_at < dayStartIso ||
-                    datapoint.observed_at >= dayEndIso
-                  ) {
-                    skippedOutsideDay += 1;
-                    continue;
-                  }
-                  if (datapoint.value === null) {
-                    skippedNullValue += 1;
-                    continue;
-                  }
-                  rows.push({
-                    timeseries_id: binding.timeseries_id,
-                    station_id: binding.station_id,
-                    pollutant_code: binding.pollutant_code,
-                    observed_at: datapoint.observed_at,
-                    value: datapoint.value,
-                  });
-                }
-
-                logStructured(
-                  "info",
-                  "source_to_r2_uk_air_sos_timeseries_processed",
-                  {
-                    run_id: runId,
-                    day_utc: dayUtc,
-                    connector_id: connectorId,
-                    source_adapter: "uk_air_sos",
-                    station_ref: binding.station_ref,
-                    timeseries_ref: binding.timeseries_ref,
-                    timeseries_id: binding.timeseries_id,
-                    pollutant_code: binding.pollutant_code,
-                    raw_point_count: datapoints.length,
-                    mapped_point_count: rows.length,
-                    mirror_reused: payload.mirror_reused,
-                    mirror_written: payload.mirror_written,
-                    no_data_manifest_reused: payload.no_data_manifest_reused,
-                    empty_payload_confirmed: isUkAirSosEmptyPayload(payload.payload),
-                    skipped_outside_day: skippedOutsideDay,
-                    skipped_null_value: skippedNullValue,
-                  },
-                );
-
-                return {
-                  station_ref: binding.station_ref,
-                  timeseries_ref: binding.timeseries_ref,
-                  rows,
-                  raw_point_count: datapoints.length,
-                  mapped_point_count: rows.length,
-                  mirror_reused: payload.mirror_reused,
-                  mirror_written: payload.mirror_written,
-                  no_data_manifest_reused: payload.no_data_manifest_reused,
-                  empty_payload_confirmed: isUkAirSosEmptyPayload(payload.payload),
-                  skipped_outside_day: skippedOutsideDay,
-                  skipped_null_value: skippedNullValue,
-                  error_message: null as string | null,
-                };
-              } catch (error) {
-                const message = error instanceof Error
-                  ? error.message
-                  : String(error);
-                logStructured(
-                  "warning",
-                  "source_to_r2_uk_air_sos_timeseries_failed",
-                  {
-                    run_id: runId,
-                    day_utc: dayUtc,
-                    connector_id: connectorId,
-                    source_adapter: "uk_air_sos",
-                    station_ref: binding.station_ref,
-                    timeseries_ref: binding.timeseries_ref,
-                    timeseries_id: binding.timeseries_id,
-                    pollutant_code: binding.pollutant_code,
-                    error: message,
-                  },
-                );
-                return {
-                  station_ref: binding.station_ref,
-                  timeseries_ref: binding.timeseries_ref,
-                  rows: [] as SourceObservationRow[],
-                  raw_point_count: 0,
-                  mapped_point_count: 0,
-                  mirror_reused: false,
-                  mirror_written: false,
-                  no_data_manifest_reused: false,
-                  empty_payload_confirmed: false,
-                  skipped_outside_day: 0,
-                  skipped_null_value: 0,
-                  error_message:
-                    `${binding.timeseries_ref} (${binding.station_ref}): ${message}`,
-                };
-              }
-            },
-          );
+          let timeseriesResults = await processUkAirSosTimeseriesBatch({
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            bindings: candidateBindings,
+            concurrency: UK_AIR_SOS_FETCH_CONCURRENCY,
+            base_url: sourceBaseUrl,
+            timespan,
+            known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
+            day_start_iso: dayStartIso,
+            day_end_iso: dayEndIso,
+          });
+          let retryableFailedBindings = timeseriesResults
+            .filter((result) =>
+              result.error_message &&
+              isRetryableSourceFetchError("uk_air_sos", result.error_message)
+            )
+            .map((result) => result.binding);
+          for (
+            let retryRound = 1;
+            retryableFailedBindings.length > 0 &&
+              retryRound <= UK_AIR_SOS_TIMESERIES_RETRY_ROUNDS;
+            retryRound += 1
+          ) {
+            logStructured("info", "source_to_r2_uk_air_sos_retry_round", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: "uk_air_sos",
+              retry_round: retryRound,
+              retry_candidate_count: retryableFailedBindings.length,
+              retry_concurrency: UK_AIR_SOS_TIMESERIES_RETRY_CONCURRENCY,
+            });
+            await sleep(
+              Math.min(
+                60000,
+                UK_AIR_SOS_TIMESERIES_RETRY_BASE_MS * retryRound,
+              ),
+            );
+            const retriedResults = await processUkAirSosTimeseriesBatch({
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              bindings: retryableFailedBindings,
+              concurrency: UK_AIR_SOS_TIMESERIES_RETRY_CONCURRENCY,
+              base_url: sourceBaseUrl,
+              timespan,
+              known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
+              day_start_iso: dayStartIso,
+              day_end_iso: dayEndIso,
+              retry_round: retryRound,
+            });
+            const retriedByTimeseriesRef = new Map(
+              retriedResults.map((result) => [
+                result.binding.timeseries_ref,
+                result,
+              ]),
+            );
+            timeseriesResults = timeseriesResults.map((result) =>
+              retriedByTimeseriesRef.get(result.binding.timeseries_ref) || result
+            );
+            retryableFailedBindings = timeseriesResults
+              .filter((result) =>
+                result.error_message &&
+                isRetryableSourceFetchError("uk_air_sos", result.error_message)
+              )
+              .map((result) => result.binding);
+          }
 
           let totalRawPoints = 0;
           let totalMappedPoints = 0;

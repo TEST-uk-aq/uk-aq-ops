@@ -10,6 +10,43 @@ export const ALLOWED_RUN_MODES = Object.freeze([
 
 const RUN_MODE_SET = new Set(ALLOWED_RUN_MODES);
 const TRIGGER_MODE_SET = new Set(ALLOWED_TRIGGER_MODES);
+const SOURCE_FETCH_ADAPTERS = new Set([
+  "breathelondon",
+  "sensorcommunity",
+  "openaq",
+  "uk_air_sos",
+]);
+const RETRYABLE_SOURCE_FETCH_STATUS_CODES = [
+  "http 408",
+  "http 425",
+  "http 429",
+  "http 500",
+  "http 502",
+  "http 503",
+  "http 504",
+];
+const RETRYABLE_SOURCE_FETCH_ERROR_SNIPPETS = [
+  "operation timed out",
+  "timed out",
+  "dns error",
+  "failed to lookup address information",
+  "temporary failure in name resolution",
+  "nodename nor servname provided",
+  "connection reset by peer",
+  "connection reset",
+  "connection refused",
+  "network is unreachable",
+  "socket hang up",
+  "sendrequest",
+  "client error (connect)",
+  "client error (sendrequest)",
+  "the signal has been aborted",
+  "tls",
+  "econnreset",
+  "econnrefused",
+  "enotfound",
+  "eai_again",
+];
 
 export function parseRunMode(raw, fallback = "local_to_aqilevels") {
   const value = String(raw || "").trim().toLowerCase();
@@ -187,6 +224,20 @@ export function isSourceAcquisitionPendingError(sourceAdapter, errorMessage) {
     );
   }
   return false;
+}
+
+export function isRetryableSourceFetchError(sourceAdapter, errorMessage) {
+  const adapter = String(sourceAdapter || "").trim().toLowerCase();
+  const message = String(errorMessage || "").trim().toLowerCase();
+  if (!SOURCE_FETCH_ADAPTERS.has(adapter) || !message) {
+    return false;
+  }
+  if (RETRYABLE_SOURCE_FETCH_STATUS_CODES.some((code) => message.includes(code))) {
+    return true;
+  }
+  return RETRYABLE_SOURCE_FETCH_ERROR_SNIPPETS.some((snippet) =>
+    message.includes(snippet)
+  );
 }
 
 function utcDayFromDate(date) {

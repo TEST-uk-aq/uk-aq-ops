@@ -65,6 +65,9 @@ All fields are optional unless noted.
     - UK-AIR SOS historical backfill (`/timeseries/{timeseries_ref}/getData?timespan=<UTC_DAY>&format=tvp` against the configured SOS base URL).
     - Sensor.Community archive backfill (`https://archive.sensor.community/YYYY-MM-DD/`).
     - OpenAQ AWS archive backfill (`records/csv.gz/locationid=<LOCATION_ID>/year=<YYYY>/month=<MM>/location-<LOCATION_ID>-<YYYYMMDD>.csv.gz`).
+  - source fetch retry behavior:
+    - all source adapters use bounded per-request HTTP retries for transient network and retryable HTTP failures.
+    - UK-AIR SOS also retries only the residual transient failed timeseries at reduced concurrency before the connector/day is marked failed.
   - Breathe London source mapping follows existing connector metadata:
     - `station_ref = Breathe London SiteCode`
     - `timeseries_ref = <SiteCode>:IPM25|INO2`
@@ -167,6 +170,8 @@ UK-AIR SOS source adapter:
 - `UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_RETRIES` (default `3`)
 - `UK_AQ_BACKFILL_UK_AIR_SOS_RETRY_BASE_MS` (default `1500`)
 - `UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_CONCURRENCY` (default `5`)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_TIMESERIES_RETRY_ROUNDS` (default `2`; retry passes for transient failed timeseries after the per-request retry budget is exhausted)
+- `UK_AQ_BACKFILL_UK_AIR_SOS_TIMESERIES_RETRY_BASE_MS` (default `5000`; base delay in ms between SOS retry rounds)
 - `UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT` (optional local replay mirror for SOS JSON payloads)
   - non-empty payloads are written as per-timeseries JSON files
   - exact empty payloads like `{"values":[]}` are recorded in `day_utc=YYYY-MM-DD/_no_data_timeseries.json`
