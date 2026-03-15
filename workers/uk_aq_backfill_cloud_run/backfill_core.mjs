@@ -174,6 +174,12 @@ export function isSourceAcquisitionPendingError(sourceAdapter, errorMessage) {
   if (!(adapter && message)) {
     return false;
   }
+  if (adapter === "breathelondon") {
+    return (
+      message.startsWith("breathelondon_list_sensors_fetch_failed:") ||
+      message.startsWith("breathelondon_clarity_fetch_failed:")
+    );
+  }
   if (adapter === "sensorcommunity") {
     return (
       message.startsWith("sensorcommunity_archive_index_fetch_failed:") ||

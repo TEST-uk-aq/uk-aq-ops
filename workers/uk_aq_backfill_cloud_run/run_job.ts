@@ -96,7 +96,11 @@ type SourceConnectorLookup = {
   binding_by_timeseries_ref_pollutant: Map<string, SourceTimeseriesBinding>;
 };
 
-type SourceAdapterKind = "sensorcommunity" | "openaq" | "uk_air_sos";
+type SourceAdapterKind =
+  | "breathelondon"
+  | "sensorcommunity"
+  | "openaq"
+  | "uk_air_sos";
 
 type StationRefsLookup = {
   station_refs: Set<string>;
@@ -632,6 +636,55 @@ const SCOMM_ARCHIVE_RETRY_BASE_MS = parsePositiveInt(
 const SCOMM_RAW_MIRROR_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT",
 );
+const BREATHELONDON_SOURCE_ENABLED = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_BREATHELONDON_SOURCE_ENABLED"),
+  true,
+);
+const BREATHELONDON_CONNECTOR_CODE = (
+  Deno.env.get("UK_AQ_BACKFILL_BREATHELONDON_CONNECTOR_CODE") ||
+  "breathelondon"
+).trim().toLowerCase();
+const BREATHELONDON_CONNECTOR_ID_FALLBACK = Number.parseInt(
+  Deno.env.get("UK_AQ_BACKFILL_BREATHELONDON_CONNECTOR_ID_FALLBACK") || "3",
+  10,
+);
+const BREATHELONDON_BASE_URL = (
+  Deno.env.get("UK_AQ_BACKFILL_BREATHELONDON_BASE_URL") ||
+  Deno.env.get("BREATHELONDON_BASE_URL") ||
+  "https://api.breathelondon-communities.org/api"
+).trim().replace(/\/$/, "");
+const BREATHELONDON_TIMEOUT_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_BREATHELONDON_TIMEOUT_MS"),
+  60000,
+  5000,
+  600000,
+);
+const BREATHELONDON_FETCH_RETRIES = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_BREATHELONDON_FETCH_RETRIES"),
+  3,
+  1,
+  10,
+);
+const BREATHELONDON_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_BREATHELONDON_RETRY_BASE_MS"),
+  1500,
+  100,
+  30000,
+);
+const BREATHELONDON_RAW_MIRROR_ROOT = optionalEnv(
+  "UK_AQ_BACKFILL_BREATHELONDON_RAW_MIRROR_ROOT",
+);
+const BREATHELONDON_API_KEY = optionalEnv("BREATHELONDON_API_KEY");
+const BREATHELONDON_SOURCE_SPECIES = Object.freeze([
+  {
+    species: "IPM25",
+    pollutant_code: "pm25" as SourcePollutantCode,
+  },
+  {
+    species: "INO2",
+    pollutant_code: "no2" as SourcePollutantCode,
+  },
+]);
 const UK_AIR_SOS_SOURCE_ENABLED = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_SOURCE_ENABLED"),
   true,
@@ -4038,6 +4091,8 @@ function parseSourcePollutantCode(value: string): SourcePollutantCode | null {
     return null;
   }
   const compact = normalized.replace(/[^a-z0-9]+/g, "");
+  if (compact === "ino2") return "no2";
+  if (compact === "ipm25") return "pm25";
   if (compact === "no2") return "no2";
   if (compact === "pm10") return "pm10";
   if (compact === "pm25") return "pm25";
@@ -5172,6 +5227,257 @@ function toFiniteNumber(value: unknown): number | null {
   }
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function normalizeBreatheLondonSensors(
+  payload: unknown,
+): Record<string, unknown>[] {
+  if (Array.isArray(payload) && payload.length > 0 && Array.isArray(payload[0])) {
+    payload = payload[0];
+  }
+  if (Array.isArray(payload)) {
+    return payload.filter((row) => row && typeof row === "object") as Record<
+      string,
+      unknown
+    >[];
+  }
+  return [];
+}
+
+function formatBreatheLondonTimestamp(value: Date): string {
+  const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+  const pad = (num: number) => String(num).padStart(2, "0");
+  return `${weekdays[value.getUTCDay()]} ${pad(value.getUTCDate())} ${
+    months[value.getUTCMonth()]
+  } ${value.getUTCFullYear()} ${pad(value.getUTCHours())}:${
+    pad(value.getUTCMinutes())
+  }:${pad(value.getUTCSeconds())} GMT`;
+}
+
+function parseBreatheLondonObservedAtIso(value: unknown): string | null {
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+  let candidate = text;
+  if (candidate.includes(" ") && !candidate.includes("T")) {
+    candidate = candidate.replace(" ", "T");
+  }
+  if (!candidate.endsWith("Z") && !candidate.includes("+")) {
+    candidate = `${candidate}Z`;
+  }
+  const parsedMs = Date.parse(candidate);
+  if (!Number.isFinite(parsedMs)) {
+    return null;
+  }
+  return new Date(parsedMs).toISOString();
+}
+
+function sanitizeBreatheLondonMirrorSegment(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+
+function breatheLondonMirrorFilePath(
+  dayUtc: string,
+  siteCode: string,
+  species: string,
+): string | null {
+  if (!BREATHELONDON_RAW_MIRROR_ROOT) {
+    return null;
+  }
+  const normalizedDay = parseIsoDayUtc(dayUtc);
+  if (!normalizedDay) {
+    return null;
+  }
+  const root = BREATHELONDON_RAW_MIRROR_ROOT.trim();
+  if (!root) {
+    return null;
+  }
+  return path.join(
+    root,
+    `day_utc=${normalizedDay}`,
+    `${sanitizeBreatheLondonMirrorSegment(siteCode)}_${
+      sanitizeBreatheLondonMirrorSegment(species)
+    }.json`,
+  );
+}
+
+type BreatheLondonFetchResult = {
+  payload: unknown;
+  source_url: string;
+  mirror_reused: boolean;
+  mirror_written: boolean;
+};
+
+async function fetchBreatheLondonSensors(): Promise<Record<string, unknown>[]> {
+  if (!BREATHELONDON_API_KEY) {
+    throw new Error(
+      "breathelondon_list_sensors_fetch_failed: missing BREATHELONDON_API_KEY",
+    );
+  }
+  const url = new URL(`${BREATHELONDON_BASE_URL}/ListSensors`);
+  url.searchParams.set("key", BREATHELONDON_API_KEY);
+  let payload: unknown;
+  try {
+    payload = await fetchJsonWithTimeout(
+      url.toString(),
+      BREATHELONDON_TIMEOUT_MS,
+      BREATHELONDON_FETCH_RETRIES,
+      BREATHELONDON_RETRY_BASE_MS,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`breathelondon_list_sensors_fetch_failed: ${message}`);
+  }
+  return normalizeBreatheLondonSensors(payload);
+}
+
+async function fetchBreatheLondonClarityPayload(args: {
+  dayUtc: string;
+  siteCode: string;
+  species: string;
+}): Promise<BreatheLondonFetchResult> {
+  const { dayUtc, siteCode, species } = args;
+  if (!BREATHELONDON_API_KEY) {
+    throw new Error(
+      "breathelondon_clarity_fetch_failed: missing BREATHELONDON_API_KEY",
+    );
+  }
+  const dayStart = new Date(utcDayStartIso(dayUtc));
+  const dayEnd = new Date(utcDayEndIso(dayUtc));
+  const start = encodeURIComponent(formatBreatheLondonTimestamp(dayStart));
+  const end = encodeURIComponent(formatBreatheLondonTimestamp(dayEnd));
+  const url = new URL(
+    `${BREATHELONDON_BASE_URL}/getClarityData/${
+      encodeURIComponent(siteCode)
+    }/${encodeURIComponent(species)}/${start}/${end}/Hourly`,
+  );
+  url.searchParams.set("key", BREATHELONDON_API_KEY);
+  const mirrorPath = breatheLondonMirrorFilePath(dayUtc, siteCode, species);
+  if (mirrorPath && fs.existsSync(mirrorPath)) {
+    try {
+      const mirroredText = fs.readFileSync(mirrorPath, "utf8");
+      return {
+        payload: JSON.parse(mirroredText),
+        source_url: url.toString(),
+        mirror_reused: true,
+        mirror_written: false,
+      };
+    } catch {
+      // Ignore unreadable mirror files and refetch from source.
+    }
+  }
+
+  let payload: unknown;
+  try {
+    payload = await fetchJsonWithTimeout(
+      url.toString(),
+      BREATHELONDON_TIMEOUT_MS,
+      BREATHELONDON_FETCH_RETRIES,
+      BREATHELONDON_RETRY_BASE_MS,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `breathelondon_clarity_fetch_failed: site_code=${siteCode} species=${species} day_utc=${dayUtc}: ${message}`,
+    );
+  }
+
+  let mirrorWritten = false;
+  if (mirrorPath) {
+    fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
+    fs.writeFileSync(mirrorPath, JSON.stringify(payload, null, 2), "utf8");
+    mirrorWritten = true;
+  }
+
+  return {
+    payload,
+    source_url: url.toString(),
+    mirror_reused: false,
+    mirror_written: mirrorWritten,
+  };
+}
+
+function parseBreatheLondonPayloadObservations(args: {
+  dayUtc: string;
+  payload: unknown;
+  binding: SourceTimeseriesBinding;
+}): {
+  rows: SourceObservationRow[];
+  total_records: number;
+  mapped_records: number;
+  skipped_outside_day: number;
+  skipped_invalid_value_or_timestamp: number;
+} {
+  const { dayUtc, binding } = args;
+  let { payload } = args;
+  if (Array.isArray(payload) && payload.length > 0 && Array.isArray(payload[0])) {
+    payload = payload[0];
+  }
+  if (!Array.isArray(payload)) {
+    return {
+      rows: [],
+      total_records: 0,
+      mapped_records: 0,
+      skipped_outside_day: 0,
+      skipped_invalid_value_or_timestamp: 0,
+    };
+  }
+
+  const dayStartIso = utcDayStartIso(dayUtc);
+  const dayEndIso = utcDayEndIso(dayUtc);
+  const rows: SourceObservationRow[] = [];
+  let totalRecords = 0;
+  let skippedOutsideDay = 0;
+  let skippedInvalidValueOrTimestamp = 0;
+
+  for (const entry of payload) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    totalRecords += 1;
+    const observedAtIso = parseBreatheLondonObservedAtIso(
+      (entry as Record<string, unknown>).DateTime,
+    );
+    const value = toFiniteNumber((entry as Record<string, unknown>).ScaledValue);
+    if (!observedAtIso || value === null) {
+      skippedInvalidValueOrTimestamp += 1;
+      continue;
+    }
+    if (observedAtIso < dayStartIso || observedAtIso >= dayEndIso) {
+      skippedOutsideDay += 1;
+      continue;
+    }
+    rows.push({
+      timeseries_id: binding.timeseries_id,
+      station_id: binding.station_id,
+      pollutant_code: binding.pollutant_code,
+      observed_at: observedAtIso,
+      value,
+    });
+  }
+
+  return {
+    rows,
+    total_records: totalRecords,
+    mapped_records: rows.length,
+    skipped_outside_day: skippedOutsideDay,
+    skipped_invalid_value_or_timestamp: skippedInvalidValueOrTimestamp,
+  };
 }
 
 function parseSensorcommunityStationRefFromFilename(
@@ -7837,6 +8143,45 @@ async function runSourceToAll(
   const sourceProcessedDaySet = new Set<string>();
   const sourceFailedDaySet = new Set<string>();
   const sourceAdapterByConnectorId = new Map<number, SourceAdapterKind>();
+  let cachedBreatheLondonSensors: Record<string, unknown>[] | null = null;
+
+  if (BREATHELONDON_SOURCE_ENABLED) {
+    if (!BREATHELONDON_API_KEY) {
+      warnings.push(
+        "Breathe London source adapter enabled, but BREATHELONDON_API_KEY is missing; skipping Breathe London source adapter.",
+      );
+    } else {
+      const resolvedBreatheLondonConnectorId = await resolveConnectorIdByCode(
+        BREATHELONDON_CONNECTOR_CODE,
+      );
+      let breatheLondonConnectorId: number | null = null;
+      if (resolvedBreatheLondonConnectorId) {
+        breatheLondonConnectorId = resolvedBreatheLondonConnectorId;
+      } else if (
+        Number.isInteger(BREATHELONDON_CONNECTOR_ID_FALLBACK) &&
+        BREATHELONDON_CONNECTOR_ID_FALLBACK > 0
+      ) {
+        breatheLondonConnectorId = BREATHELONDON_CONNECTOR_ID_FALLBACK;
+        warnings.push(
+          `Could not resolve connector_code=${BREATHELONDON_CONNECTOR_CODE}; using fallback connector_id=${BREATHELONDON_CONNECTOR_ID_FALLBACK}.`,
+        );
+      } else {
+        warnings.push(
+          `Breathe London source adapter enabled, but connector_id could not be resolved from connector_code=${BREATHELONDON_CONNECTOR_CODE}; skipping Breathe London source adapter.`,
+        );
+      }
+      if (breatheLondonConnectorId) {
+        sourceAdapterByConnectorId.set(
+          breatheLondonConnectorId,
+          "breathelondon",
+        );
+      }
+    }
+  } else {
+    warnings.push(
+      "Breathe London source adapter is disabled by UK_AQ_BACKFILL_BREATHELONDON_SOURCE_ENABLED=false.",
+    );
+  }
 
   if (UK_AIR_SOS_SOURCE_ENABLED) {
     const resolvedUkAirSosConnectorId = await resolveConnectorIdByCode(
@@ -8013,7 +8358,182 @@ async function runSourceToAll(
         };
         let candidateSourceUnits = 0;
 
-        if (sourceAdapter === "sensorcommunity") {
+        if (sourceAdapter === "breathelondon") {
+          const lookup = await fetchSourceLookupForConnector(connectorId);
+          const requestedStationRefs = getStationFilterForConnector(connectorId)
+            ?.station_refs;
+          if (!cachedBreatheLondonSensors) {
+            cachedBreatheLondonSensors = await fetchBreatheLondonSensors();
+          }
+
+          const candidateSites = Array.from(
+            new Map(
+              cachedBreatheLondonSensors.map((sensor) => {
+                const siteCode = String(sensor.SiteCode || "").trim();
+                return [siteCode, sensor] as const;
+              }).filter(([siteCode]) => Boolean(siteCode)),
+            ).entries(),
+          )
+            .map(([siteCode, sensor]) => ({
+              site_code: siteCode,
+              sensor,
+            }))
+            .filter(({ site_code }) => lookup.station_refs.has(site_code))
+            .filter(({ site_code }) =>
+              requestedStationRefs?.size ? requestedStationRefs.has(site_code) : true
+            )
+            .sort((left, right) => left.site_code.localeCompare(right.site_code));
+
+          if (candidateSites.length === 0) {
+            connectorDaySkipped += 1;
+            await ledgerInsertRunDay(ledgerEnabled, {
+              run_id: runId,
+              run_mode: RUN_MODE,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_kind: "download",
+              status: "skipped",
+              rows_read: 0,
+              rows_written_aqilevels: 0,
+              objects_written_r2: 0,
+              checkpoint_json: {
+                source_adapter: sourceAdapter,
+                skip_reason: requestedStationRefs?.size
+                  ? "no_matching_site_codes"
+                  : "no_candidate_site_codes",
+                sensor_count: cachedBreatheLondonSensors.length,
+                lookup_station_ref_count: lookup.station_refs.size,
+                requested_station_ref_count: requestedStationRefs?.size || null,
+              },
+              started_at: startedAt,
+              finished_at: nowIso(),
+            });
+            continue;
+          }
+
+          let skippedUnknownBinding = 0;
+          const candidateRequests: Array<{
+            site_code: string;
+            species: string;
+            binding: SourceTimeseriesBinding;
+          }> = [];
+          for (const candidateSite of candidateSites) {
+            for (const speciesConfig of BREATHELONDON_SOURCE_SPECIES) {
+              const binding = lookup.binding_by_station_pollutant.get(
+                stationPollutantKey(
+                  candidateSite.site_code,
+                  speciesConfig.pollutant_code,
+                ),
+              ) || lookup.binding_by_timeseries_ref.get(
+                `${candidateSite.site_code}:${speciesConfig.species}`,
+              ) || null;
+              if (!binding) {
+                skippedUnknownBinding += 1;
+                continue;
+              }
+              candidateRequests.push({
+                site_code: candidateSite.site_code,
+                species: speciesConfig.species,
+                binding,
+              });
+            }
+          }
+
+          if (candidateRequests.length === 0) {
+            connectorDaySkipped += 1;
+            await ledgerInsertRunDay(ledgerEnabled, {
+              run_id: runId,
+              run_mode: RUN_MODE,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_kind: "download",
+              status: "skipped",
+              rows_read: 0,
+              rows_written_aqilevels: 0,
+              objects_written_r2: 0,
+              checkpoint_json: {
+                source_adapter: sourceAdapter,
+                skip_reason: "no_matching_timeseries_bindings",
+                candidate_site_count: candidateSites.length,
+                skipped_unknown_binding: skippedUnknownBinding,
+              },
+              started_at: startedAt,
+              finished_at: nowIso(),
+            });
+            continue;
+          }
+
+          let totalMirrorReused = 0;
+          let totalMirrorWritten = 0;
+          let totalRawRecords = 0;
+          let totalMappedRecords = 0;
+          let totalSkippedOutsideDay = 0;
+          let totalSkippedInvalidValueOrTimestamp = 0;
+
+          for (const request of candidateRequests) {
+            const sourceFile = await fetchBreatheLondonClarityPayload({
+              dayUtc,
+              siteCode: request.site_code,
+              species: request.species,
+            });
+            if (sourceFile.mirror_reused) {
+              totalMirrorReused += 1;
+            }
+            if (sourceFile.mirror_written) {
+              totalMirrorWritten += 1;
+            }
+
+            const parsed = parseBreatheLondonPayloadObservations({
+              dayUtc,
+              payload: sourceFile.payload,
+              binding: request.binding,
+            });
+            observationRowsRaw.push(...parsed.rows);
+            totalRawRecords += parsed.total_records;
+            totalMappedRecords += parsed.mapped_records;
+            totalSkippedOutsideDay += parsed.skipped_outside_day;
+            totalSkippedInvalidValueOrTimestamp +=
+              parsed.skipped_invalid_value_or_timestamp;
+
+            logStructured(
+              "info",
+              "source_to_r2_breathelondon_site_species_processed",
+              {
+                run_id: runId,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_adapter: "breathelondon",
+                site_code: request.site_code,
+                species: request.species,
+                source_url: sourceFile.source_url,
+                mirror_reused: sourceFile.mirror_reused,
+                mirror_written: sourceFile.mirror_written,
+                raw_records: parsed.total_records,
+                mapped_records: parsed.mapped_records,
+                skipped_outside_day: parsed.skipped_outside_day,
+                skipped_invalid_value_or_timestamp:
+                  parsed.skipped_invalid_value_or_timestamp,
+              },
+            );
+          }
+
+          candidateSourceUnits = candidateSites.length;
+          sourceCheckpointJson.source_base_url = BREATHELONDON_BASE_URL;
+          sourceCheckpointJson.sensor_count = cachedBreatheLondonSensors.length;
+          sourceCheckpointJson.candidate_site_count = candidateSites.length;
+          sourceCheckpointJson.candidate_request_count =
+            candidateRequests.length;
+          sourceCheckpointJson.mirror_reused_count = totalMirrorReused;
+          sourceCheckpointJson.mirror_written_count = totalMirrorWritten;
+          sourceCheckpointJson.total_raw_records = totalRawRecords;
+          sourceCheckpointJson.total_mapped_records = totalMappedRecords;
+          sourceCheckpointJson.total_skipped_unknown_binding =
+            skippedUnknownBinding;
+          sourceCheckpointJson.total_skipped_outside_day =
+            totalSkippedOutsideDay;
+          sourceCheckpointJson.total_skipped_invalid_value_or_timestamp =
+            totalSkippedInvalidValueOrTimestamp;
+        } else if (sourceAdapter === "sensorcommunity") {
           let archiveFileNames = sensorcommunityArchiveIndexByDay.get(dayUtc) ||
             null;
           if (!archiveFileNames) {

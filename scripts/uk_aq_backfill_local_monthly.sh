@@ -19,7 +19,8 @@ Optional env vars:
   UK_AQ_BACKFILL_STATION_ID                 optional single station filter alias
   UK_AQ_BACKFILL_MONTHLY_LOG_DIR            default: logs/backfill/monthly
   UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR      default: true
-  UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS      default: 0
+  UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS default: 0
+  UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS      legacy alias for month run interval
 
 Notes:
   - This script calls workers/uk_aq_backfill_cloud_run/run_job.ts once per month.
@@ -33,6 +34,29 @@ trim() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "${value}"
+}
+
+build_log_connector_segment() {
+  local raw
+  raw="$(trim "${1:-}")"
+  if [[ -z "${raw}" ]]; then
+    printf '%s' "all"
+    return 0
+  fi
+
+  raw="$(printf '%s' "${raw}" | tr -d '[:space:]')"
+  while [[ "${raw}" == *",,"* || "${raw}" == ,* || "${raw}" == *, ]]; do
+    raw="${raw//,,/,}"
+    raw="${raw#,}"
+    raw="${raw%,}"
+  done
+  raw="${raw//,/_}"
+  raw="${raw//[^A-Za-z0-9._-]/_}"
+  if [[ -z "${raw}" ]]; then
+    printf '%s' "all"
+    return 0
+  fi
+  printf '%s' "${raw}"
 }
 
 require_env() {
@@ -100,7 +124,7 @@ TRIGGER_MODE="$(trim "${UK_AQ_BACKFILL_TRIGGER_MODE:-manual}")"
 ENABLE_R2_FALLBACK_RAW="$(trim "${UK_AQ_BACKFILL_ENABLE_R2_FALLBACK:-false}")"
 LOG_DIR="$(trim "${UK_AQ_BACKFILL_MONTHLY_LOG_DIR:-logs/backfill/monthly}")"
 STOP_ON_ERROR_RAW="$(trim "${UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR:-true}")"
-PAUSE_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS:-0}")"
+MONTH_RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS:-0}}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2) ;;
@@ -138,11 +162,11 @@ if ! STOP_ON_ERROR="$(parse_bool "${STOP_ON_ERROR_RAW}")"; then
   exit 2
 fi
 
-if ! [[ "${PAUSE_SECONDS_RAW}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS: ${PAUSE_SECONDS_RAW}" >&2
+if ! [[ "${MONTH_RUN_INTERVAL_SECONDS_RAW}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS: ${MONTH_RUN_INTERVAL_SECONDS_RAW}" >&2
   exit 2
 fi
-PAUSE_SECONDS="${PAUSE_SECONDS_RAW}"
+MONTH_RUN_INTERVAL_SECONDS="${MONTH_RUN_INTERVAL_SECONDS_RAW}"
 
 if ! validate_day_utc "${FROM_DAY_UTC}"; then
   echo "Invalid UK_AQ_BACKFILL_FROM_DAY_UTC: ${FROM_DAY_UTC}" >&2
@@ -164,6 +188,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 mkdir -p "${LOG_DIR}"
+
+RUN_STARTED_AT_UTC="$(date -u '+%Y-%m-%d_%H-%M-%S')"
+LOG_CONNECTOR_SEGMENT="$(build_log_connector_segment "${UK_AQ_BACKFILL_CONNECTOR_IDS:-}")"
 
 if [[ -n "$(trim "${UK_AQ_BACKFILL_CONNECTOR_IDS:-}")" ]]; then
   echo "Info: UK_AQ_BACKFILL_CONNECTOR_IDS is set (${UK_AQ_BACKFILL_CONNECTOR_IDS})."
@@ -199,7 +226,7 @@ while IFS=' ' read -r month_from month_to; do
     continue
   fi
   month_count=$((month_count + 1))
-  log_file="${LOG_DIR}/${RUN_MODE}_${month_from}_to_${month_to}.log"
+  log_file="${LOG_DIR}/${RUN_MODE}_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${month_from}_to_${month_to}.log"
 
   echo ""
   echo "=== Month ${month_count}: ${month_from} -> ${month_to} ==="
@@ -224,8 +251,8 @@ while IFS=' ' read -r month_from month_to; do
     fi
   fi
 
-  if [[ "${PAUSE_SECONDS}" -gt 0 ]]; then
-    sleep "${PAUSE_SECONDS}"
+  if [[ "${MONTH_RUN_INTERVAL_SECONDS}" -gt 0 ]]; then
+    sleep "${MONTH_RUN_INTERVAL_SECONDS}"
   fi
 done <<< "${month_ranges}"
 
@@ -239,7 +266,7 @@ if [[ "${#failures[@]}" -gt 0 ]]; then
 fi
 
 if [[ "${RUN_MODE}" == "source_to_r2" && "${DRY_RUN}" == "false" ]]; then
-  index_log_file="${LOG_DIR}/r2_history_index_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
+  index_log_file="${LOG_DIR}/r2_history_index_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
   echo ""
   echo "=== Rebuild R2 History Index ==="
   echo "Log: ${index_log_file}"

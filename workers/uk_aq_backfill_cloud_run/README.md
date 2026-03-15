@@ -7,6 +7,7 @@ Current implementation status (Phase 9, incremental):
 - `local_to_aqilevels`: implemented.
 - `obs_aqi_to_r2`: implemented (dry-run planning + non-dry R2 export/write path).
 - `source_to_r2`: implemented for UK-AIR SOS, Sensor.Community, and OpenAQ source-to-R2 flows (metadata-filtered observations + aqilevels manifests written to R2).
+  - Breathe London is also implemented, using the current public `getClarityData` API path as the nearest working equivalent to the planned `/SensorData` historical flow.
 
 ## Endpoints
 
@@ -55,13 +56,19 @@ All fields are optional unless noted.
     - `dry_run=true`: returns a planning summary (`backed_up_days`, `pending_backfill_days`) where "backed up" means both observations + aqilevels day manifests exist.
     - `dry_run=false`: writes pending day manifests and connector payloads to R2.
     - `force_replace=true`: re-exports selected days/connectors and overwrites manifests.
+    - transient R2 request failures during upload/verification are retried automatically with bounded backoff before the run is marked failed.
     - run returns `error` when connector/day failures leave pending days.
 
 - `source_to_r2`
   - supports source adapters:
+    - Breathe London historical backfill (`/ListSensors` candidate sites + `/getClarityData/<SiteCode>/<Species>/<Start>/<End>/Hourly` direct API fetches).
     - UK-AIR SOS historical backfill (`/timeseries/{timeseries_ref}/getData?timespan=<UTC_DAY>&format=tvp` against the configured SOS base URL).
     - Sensor.Community archive backfill (`https://archive.sensor.community/YYYY-MM-DD/`).
     - OpenAQ AWS archive backfill (`records/csv.gz/locationid=<LOCATION_ID>/year=<YYYY>/month=<MM>/location-<LOCATION_ID>-<YYYYMMDD>.csv.gz`).
+  - Breathe London source mapping follows existing connector metadata:
+    - `station_ref = Breathe London SiteCode`
+    - `timeseries_ref = <SiteCode>:IPM25|INO2`
+  - Breathe London fetches are processed day-by-day, site-by-site, sequentially.
   - resolves known station/timeseries bindings from core metadata (R2 core snapshot first, ingest fallback).
   - UK-AIR SOS uses existing connector metadata (`stations`, `timeseries`, `phenomena`, `observed_properties`) to map:
     - `station_ref = existing UK-AIR SOS station_ref`
@@ -75,7 +82,9 @@ All fields are optional unless noted.
   - writes connector parquet parts + connector manifests + day manifests for both:
     - `history/v1/observations/...`
     - `history/v1/aqilevels/...`
-  - optional local raw source mirrors for local runs only:
+  - transient R2 request failures during upload/verification are retried automatically with bounded backoff before a connector/day is marked failed.
+  - optional raw source mirrors for replay/dev:
+    - `UK_AQ_BACKFILL_BREATHELONDON_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT`
     - `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT`
@@ -184,6 +193,18 @@ OpenAQ source adapter:
 - `UK_AQ_BACKFILL_OPENAQ_ARCHIVE_FETCH_RETRIES` (default `3`)
 - `UK_AQ_BACKFILL_OPENAQ_ARCHIVE_RETRY_BASE_MS` (default `1500`)
 - `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT` (optional local mirror root for OpenAQ `.csv.gz` replay; only used when running `run_job.ts` locally)
+
+Breathe London source adapter:
+
+- `UK_AQ_BACKFILL_BREATHELONDON_SOURCE_ENABLED` (default `true`)
+- `UK_AQ_BACKFILL_BREATHELONDON_CONNECTOR_CODE` (default `breathelondon`)
+- `UK_AQ_BACKFILL_BREATHELONDON_CONNECTOR_ID_FALLBACK` (default `3`)
+- `UK_AQ_BACKFILL_BREATHELONDON_BASE_URL` (default `https://api.breathelondon-communities.org/api`)
+- `BREATHELONDON_API_KEY` (required when Breathe London source backfill is enabled)
+- `UK_AQ_BACKFILL_BREATHELONDON_TIMEOUT_MS` (default `60000`)
+- `UK_AQ_BACKFILL_BREATHELONDON_FETCH_RETRIES` (default `3`)
+- `UK_AQ_BACKFILL_BREATHELONDON_RETRY_BASE_MS` (default `1500`)
+- `UK_AQ_BACKFILL_BREATHELONDON_RAW_MIRROR_ROOT` (optional local replay mirror; per-request JSON responses are reused/written under `day_utc=YYYY-MM-DD/`)
 
 RPC names:
 

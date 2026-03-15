@@ -60,6 +60,20 @@ test("shouldSkipCompletedDay honors force_replace", () => {
 test("isSourceAcquisitionPendingError only treats known source fetch failures as pending", () => {
   assert.equal(
     isSourceAcquisitionPendingError(
+      "breathelondon",
+      "breathelondon_list_sensors_fetch_failed: HTTP 503 for https://api.breathelondon-communities.org/api/ListSensors",
+    ),
+    true,
+  );
+  assert.equal(
+    isSourceAcquisitionPendingError(
+      "breathelondon",
+      "breathelondon_clarity_fetch_failed: site_code=CLDP0001 species=IPM25 day_utc=2025-01-01: Operation timed out",
+    ),
+    true,
+  );
+  assert.equal(
+    isSourceAcquisitionPendingError(
       "sensorcommunity",
       "sensorcommunity_archive_index_fetch_failed: The signal has been aborted",
     ),
@@ -83,6 +97,13 @@ test("isSourceAcquisitionPendingError only treats known source fetch failures as
     isSourceAcquisitionPendingError(
       "openaq",
       "sensorcommunity_archive_index_fetch_failed: Operation timed out",
+    ),
+    false,
+  );
+  assert.equal(
+    isSourceAcquisitionPendingError(
+      "breathelondon",
+      "missing connector manifests for day=2025-12-13 after source_to_r2 export",
     ),
     false,
   );

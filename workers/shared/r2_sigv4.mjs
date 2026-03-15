@@ -1,6 +1,11 @@
 import { createHash, createHmac } from "node:crypto";
 import { Buffer } from "node:buffer";
 
+const R2_RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const R2_REQUEST_MAX_ATTEMPTS = 4;
+const R2_REQUEST_RETRY_BASE_MS = 500;
+const R2_REQUEST_RETRY_MAX_MS = 5000;
+
 export function encodeRfc3986(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
 }
@@ -163,28 +168,97 @@ export async function readResponseText(response, limit = 2000) {
   return raw.length <= limit ? raw : raw.slice(0, limit);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableR2Status(status) {
+  return R2_RETRYABLE_STATUS_CODES.has(status);
+}
+
+function isRetryableR2RequestError(error) {
+  const message = String(error instanceof Error ? error.message : error || "")
+    .toLowerCase();
+  if (!message) {
+    return false;
+  }
+  return [
+    "connection reset",
+    "connection closed",
+    "broken pipe",
+    "socket hang up",
+    "econnreset",
+    "econnrefused",
+    "ehostunreach",
+    "etimedout",
+    "timed out",
+    "timeout",
+    "networkerror",
+    "network error",
+    "sendrequest",
+    "temporarily unavailable",
+    "tls",
+    "eof",
+  ].some((token) => message.includes(token));
+}
+
+function computeR2RetryDelayMs(attempt) {
+  return Math.min(
+    R2_REQUEST_RETRY_MAX_MS,
+    R2_REQUEST_RETRY_BASE_MS * (2 ** Math.max(0, attempt - 1)),
+  );
+}
+
+async function fetchR2WithRetry({ method, buildRequest, body = undefined }) {
+  for (let attempt = 1; attempt <= R2_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    const request = buildRequest();
+    try {
+      const response = await fetch(request.url, {
+        method,
+        headers: request.headers,
+        body,
+      });
+      if (
+        response.ok ||
+        !isRetryableR2Status(response.status) ||
+        attempt === R2_REQUEST_MAX_ATTEMPTS
+      ) {
+        return response;
+      }
+    } catch (error) {
+      if (
+        !isRetryableR2RequestError(error) ||
+        attempt === R2_REQUEST_MAX_ATTEMPTS
+      ) {
+        throw error;
+      }
+    }
+    await sleep(computeR2RetryDelayMs(attempt));
+  }
+
+  throw new Error("R2 request retry loop exhausted unexpectedly.");
+}
+
 export async function r2PutObject({ r2, key, body, content_type = "application/octet-stream" }) {
   const bufferBody = body instanceof Uint8Array ? body : Buffer.from(body);
   const payloadHash = createHash("sha256").update(bufferBody).digest("hex");
-  const request = buildAwsSignedRequest({
+  const response = await fetchR2WithRetry({
     method: "PUT",
-    endpoint: r2.endpoint,
-    region: r2.region,
-    accessKeyId: r2.access_key_id,
-    secretAccessKey: r2.secret_access_key,
-    bucket: r2.bucket,
-    objectKey: key,
-    payloadHash,
-    headers: {
-      "content-type": content_type,
-      "content-length": String(bufferBody.byteLength),
-    },
-  });
-
-  const response = await fetch(request.url, {
-    method: "PUT",
-    headers: request.headers,
     body: bufferBody,
+    buildRequest: () => buildAwsSignedRequest({
+      method: "PUT",
+      endpoint: r2.endpoint,
+      region: r2.region,
+      accessKeyId: r2.access_key_id,
+      secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket,
+      objectKey: key,
+      payloadHash,
+      headers: {
+        "content-type": content_type,
+        "content-length": String(bufferBody.byteLength),
+      },
+    }),
   });
   if (!response.ok) {
     const text = await readResponseText(response, 4000);
@@ -200,22 +274,20 @@ export async function r2PutObject({ r2, key, body, content_type = "application/o
 
 export async function r2CopyObject({ r2, source_key, dest_key }) {
   const copySource = `/${r2.bucket}/${source_key.split("/").map((part) => encodeRfc3986(part)).join("/")}`;
-  const request = buildAwsSignedRequest({
+  const response = await fetchR2WithRetry({
     method: "PUT",
-    endpoint: r2.endpoint,
-    region: r2.region,
-    accessKeyId: r2.access_key_id,
-    secretAccessKey: r2.secret_access_key,
-    bucket: r2.bucket,
-    objectKey: dest_key,
-    headers: {
-      "x-amz-copy-source": copySource,
-    },
-  });
-
-  const response = await fetch(request.url, {
-    method: "PUT",
-    headers: request.headers,
+    buildRequest: () => buildAwsSignedRequest({
+      method: "PUT",
+      endpoint: r2.endpoint,
+      region: r2.region,
+      accessKeyId: r2.access_key_id,
+      secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket,
+      objectKey: dest_key,
+      headers: {
+        "x-amz-copy-source": copySource,
+      },
+    }),
   });
   if (!response.ok) {
     const text = await readResponseText(response, 4000);
@@ -230,19 +302,17 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
 }
 
 export async function r2HeadObject({ r2, key }) {
-  const request = buildAwsSignedRequest({
+  const response = await fetchR2WithRetry({
     method: "HEAD",
-    endpoint: r2.endpoint,
-    region: r2.region,
-    accessKeyId: r2.access_key_id,
-    secretAccessKey: r2.secret_access_key,
-    bucket: r2.bucket,
-    objectKey: key,
-  });
-
-  const response = await fetch(request.url, {
-    method: "HEAD",
-    headers: request.headers,
+    buildRequest: () => buildAwsSignedRequest({
+      method: "HEAD",
+      endpoint: r2.endpoint,
+      region: r2.region,
+      accessKeyId: r2.access_key_id,
+      secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket,
+      objectKey: key,
+    }),
   });
 
   if (response.status === 404) {
@@ -268,19 +338,17 @@ export async function r2HeadObject({ r2, key }) {
 }
 
 export async function r2GetObject({ r2, key }) {
-  const request = buildAwsSignedRequest({
+  const response = await fetchR2WithRetry({
     method: "GET",
-    endpoint: r2.endpoint,
-    region: r2.region,
-    accessKeyId: r2.access_key_id,
-    secretAccessKey: r2.secret_access_key,
-    bucket: r2.bucket,
-    objectKey: key,
-  });
-
-  const response = await fetch(request.url, {
-    method: "GET",
-    headers: request.headers,
+    buildRequest: () => buildAwsSignedRequest({
+      method: "GET",
+      endpoint: r2.endpoint,
+      region: r2.region,
+      accessKeyId: r2.access_key_id,
+      secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket,
+      objectKey: key,
+    }),
   });
 
   if (!response.ok) {
@@ -364,20 +432,18 @@ export async function r2ListObjectsV2({
     query.delimiter = delimiter;
   }
 
-  const request = buildAwsSignedRequest({
+  const response = await fetchR2WithRetry({
     method: "GET",
-    endpoint: r2.endpoint,
-    region: r2.region,
-    accessKeyId: r2.access_key_id,
-    secretAccessKey: r2.secret_access_key,
-    bucket: r2.bucket,
-    objectKey: "",
-    query,
-  });
-
-  const response = await fetch(request.url, {
-    method: "GET",
-    headers: request.headers,
+    buildRequest: () => buildAwsSignedRequest({
+      method: "GET",
+      endpoint: r2.endpoint,
+      region: r2.region,
+      accessKeyId: r2.access_key_id,
+      secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket,
+      objectKey: "",
+      query,
+    }),
   });
 
   if (!response.ok) {
@@ -457,27 +523,25 @@ export async function r2DeleteObjects({ r2, keys }) {
   const payloadHash = createHash("sha256").update(bodyBuffer).digest("hex");
   const contentMd5 = createHash("md5").update(bodyBuffer).digest("base64");
 
-  const request = buildAwsSignedRequest({
+  const response = await fetchR2WithRetry({
     method: "POST",
-    endpoint: r2.endpoint,
-    region: r2.region,
-    accessKeyId: r2.access_key_id,
-    secretAccessKey: r2.secret_access_key,
-    bucket: r2.bucket,
-    objectKey: "",
-    query: { delete: "" },
-    payloadHash,
-    headers: {
-      "content-type": "application/xml",
-      "content-length": String(bodyBuffer.byteLength),
-      "content-md5": contentMd5,
-    },
-  });
-
-  const response = await fetch(request.url, {
-    method: "POST",
-    headers: request.headers,
     body: bodyBuffer,
+    buildRequest: () => buildAwsSignedRequest({
+      method: "POST",
+      endpoint: r2.endpoint,
+      region: r2.region,
+      accessKeyId: r2.access_key_id,
+      secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket,
+      objectKey: "",
+      query: { delete: "" },
+      payloadHash,
+      headers: {
+        "content-type": "application/xml",
+        "content-length": String(bodyBuffer.byteLength),
+        "content-md5": contentMd5,
+      },
+    }),
   });
 
   if (!response.ok) {
