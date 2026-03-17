@@ -122,7 +122,7 @@ Primary controls:
 - requires `x-uk-aq-upstream-auth` matching `UK_AQ_EDGE_UPSTREAM_SECRET`
 - returns normalized `{observed_at,value}` rows for a single `timeseries_id` + `connector_id`
 - consumed by ingest edge function `uk_aq_timeseries` for windows older than the recent obs_aqidb overlap
-- website observations now use obs_aqidb for the recent `14`-day local window by default; keep `obs_aqidb` retention at `14` days or more if that local coverage should remain available before R2 fallback
+- website observations now use ingestdb for the freshest `24` hours, `obs_aqidb` for the next `13` days inside the local `14`-day window, and R2 for older history; keep `obs_aqidb` retention at `14` days or more if that local coverage should remain available before R2 fallback
 
 ### 8) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
 
