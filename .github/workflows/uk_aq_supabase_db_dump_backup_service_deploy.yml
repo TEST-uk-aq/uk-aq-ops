@@ -1,0 +1,411 @@
+name: Deploy Supabase DB Dump Backup Cloud Run Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_supabase_db_dump_backup_service/**"
+      - "scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+      - ".github/workflows/uk_aq_supabase_db_dump_backup_service_deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: uk-aq-supabase-db-dump-backup-service-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-supabase-db-dump-backup-service:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
+      REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
+      SERVICE_NAME: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_NAME || 'uk-aq-supabase-db-dump-backup-service' }}
+      RESOURCE_LABEL: uk-aq-supabase-db-dump-backup-service
+      DB_DUMP_BACKUP_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_ACCOUNT || '' }}
+      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_TIMEOUT_SECONDS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_TIMEOUT_SECONDS || '1800' }}
+      SERVICE_CPU: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_CPU || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_CPU || '2' }}
+      SERVICE_MEMORY: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MEMORY || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MEMORY || '2Gi' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_CONCURRENCY || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_CONCURRENCY || '1' }}
+      SERVICE_MAX_INSTANCES: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MAX_INSTANCES || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MAX_INSTANCES || '1' }}
+      SERVICE_MIN_INSTANCES: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MIN_INSTANCES || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MIN_INSTANCES || '0' }}
+      SERVICE_INGRESS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_INGRESS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_INGRESS || 'internal' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ENABLED || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ENABLED || 'true' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || 'uk-aq-db-dump-backup-trigger' }}
+      SCHEDULER_CRON: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_CRON || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_CRON || '55 0 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_TIMEZONE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_TIMEZONE || 'UTC' }}
+      SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ATTEMPT_DEADLINE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ATTEMPT_DEADLINE || '1800s' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_SERVICE_ACCOUNT || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_SERVICE_ACCOUNT || '' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR: ${{ vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR || 'Supabase_Backup_db_dump' }}
+      UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS: ${{ vars.UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS || '7' }}
+      UK_AQ_INGESTDB_DB_URL_SECRET_NAME: ${{ vars.UK_AQ_INGESTDB_DB_URL_SECRET_NAME || 'UK_AQ_INGESTDB_DB_URL' }}
+      UK_AQ_OBS_AQIDB_DB_URL_SECRET_NAME: ${{ vars.UK_AQ_OBS_AQIDB_DB_URL_SECRET_NAME || 'UK_AQ_OBS_AQIDB_DB_URL' }}
+      DROPBOX_APP_KEY_SECRET_NAME: ${{ vars.DROPBOX_APP_KEY_SECRET_NAME || 'DROPBOX_APP_KEY' }}
+      DROPBOX_APP_SECRET_SECRET_NAME: ${{ vars.DROPBOX_APP_SECRET_SECRET_NAME || 'DROPBOX_APP_SECRET' }}
+      DROPBOX_REFRESH_TOKEN_SECRET_NAME: ${{ vars.DROPBOX_REFRESH_TOKEN_SECRET_NAME || 'DROPBOX_REFRESH_TOKEN' }}
+      UK_AQ_INGESTDB_DB_URL: ${{ secrets.UK_AQ_INGESTDB_DB_URL || secrets.SUPABASE_DB_URL }}
+      UK_AQ_OBS_AQIDB_DB_URL: ${{ secrets.UK_AQ_OBS_AQIDB_DB_URL || secrets.OBS_AQIDB_SUPABASE_DB_URL }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required project config
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT_ID:-}" ]; then
+            echo "Missing required repo variable: GCP_PROJECT_ID"
+            exit 1
+          fi
+          if [ -z "${UK_AQ_DROPBOX_ROOT:-}" ]; then
+            echo "Missing required repo variable: UK_AQ_DROPBOX_ROOT"
+            exit 1
+          fi
+
+      - name: Resolve runtime and scheduler service accounts
+        id: service_accounts
+        run: |
+          set -euo pipefail
+
+          validate_service_account() {
+            local label="$1"
+            local value="$2"
+            if [[ "${value}" == *$'\n'* ]] || [[ "${value}" == *$'\r'* ]]; then
+              echo "Invalid ${label}: contains newline characters."
+              exit 1
+            fi
+            if [[ "${value}" == \#* ]]; then
+              echo "Invalid ${label}: starts with '#', check repo variable value."
+              exit 1
+            fi
+            if ! [[ "${value}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.gserviceaccount\.com$ ]]; then
+              echo "Invalid ${label}: expected a gserviceaccount.com email, got '${value}'."
+              exit 1
+            fi
+          }
+
+          runtime_sa="${DB_DUMP_BACKUP_SERVICE_ACCOUNT:-}"
+          if [ -z "${runtime_sa}" ]; then
+            runtime_sa="uk-aq-ops-job@${PROJECT_ID}.iam.gserviceaccount.com"
+          fi
+          validate_service_account "runtime service account" "${runtime_sa}"
+          if [[ "${runtime_sa}" == *"-compute@developer.gserviceaccount.com" ]]; then
+            echo "Invalid runtime service account: default compute service account is not allowed."
+            exit 1
+          fi
+
+          scheduler_sa="${SCHEDULER_SERVICE_ACCOUNT:-${runtime_sa}}"
+          validate_service_account "scheduler service account" "${scheduler_sa}"
+          if [[ "${scheduler_sa}" == *"-compute@developer.gserviceaccount.com" ]]; then
+            echo "Invalid scheduler service account: default compute service account is not allowed."
+            exit 1
+          fi
+
+          printf 'runtime_sa=%s\n' "${runtime_sa}" >> "${GITHUB_OUTPUT}"
+          printf 'scheduler_sa=%s\n' "${scheduler_sa}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate Google auth config
+        run: |
+          set -euo pipefail
+          if [ -n "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" ] && [ -n "${GCP_SERVICE_ACCOUNT:-}" ]; then
+            echo "Using Workload Identity Federation auth."
+          elif [ -n "${GCP_SA_KEY:-}" ]; then
+            echo "Using Service Account key auth."
+          else
+            echo "Missing Google auth config."
+            echo "Set either:"
+            echo "1) GCP_WORKLOAD_IDENTITY_PROVIDER + GCP_SERVICE_ACCOUNT"
+            echo "or"
+            echo "2) GCP_SA_KEY"
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud (WIF)
+        if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to Google Cloud (Service Account Key fallback)
+        if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || env.GCP_SERVICE_ACCOUNT == '' }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+
+      - name: Configure gcloud project
+        run: |
+          set -euo pipefail
+          gcloud config set project "${PROJECT_ID}"
+          gcloud config set run/region "${REGION}"
+
+      - name: Verify Artifact Registry repository exists
+        run: |
+          set -euo pipefail
+          gcloud artifacts repositories describe "${REPO}" \
+            --location "${REGION}" \
+            --project "${PROJECT_ID}" >/dev/null
+
+      - name: Configure Docker auth for Artifact Registry
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push backup service image
+        id: build
+        run: |
+          set -euo pipefail
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-supabase-db-dump-backup-service:${GITHUB_SHA::12}"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          docker build -f workers/uk_aq_supabase_db_dump_backup_service/Dockerfile -t "${IMAGE}" .
+          docker push "${IMAGE}"
+
+      - name: Sync GitHub secrets to GCP Secret Manager
+        run: |
+          set -euo pipefail
+          UPSERT_SCRIPT="scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+
+          upsert_secret() {
+            local secret_name="$1"
+            local secret_value="$2"
+            local required="${3:-0}"
+
+            if [ -z "${secret_name}" ]; then
+              if [ "${required}" = "1" ]; then
+                echo "Missing required secret name."
+                exit 1
+              fi
+              return 0
+            fi
+
+            if [ -z "${secret_value}" ] && [ "${required}" = "0" ]; then
+              echo "Skipping optional secret ${secret_name} (no GitHub secret/variable value)."
+              return 0
+            fi
+
+            printf '%s' "${secret_value}" | "${UPSERT_SCRIPT}" \
+              --project "${PROJECT_ID}" \
+              --secret "${secret_name}" \
+              --required "${required}"
+          }
+
+          upsert_secret "${UK_AQ_INGESTDB_DB_URL_SECRET_NAME}" "${UK_AQ_INGESTDB_DB_URL}" 1
+          upsert_secret "${UK_AQ_OBS_AQIDB_DB_URL_SECRET_NAME}" "${UK_AQ_OBS_AQIDB_DB_URL}" 1
+          upsert_secret "${DROPBOX_APP_KEY_SECRET_NAME}" "${DROPBOX_APP_KEY}" 1
+          upsert_secret "${DROPBOX_APP_SECRET_SECRET_NAME}" "${DROPBOX_APP_SECRET}" 1
+          upsert_secret "${DROPBOX_REFRESH_TOKEN_SECRET_NAME}" "${DROPBOX_REFRESH_TOKEN}" 1
+
+      - name: Verify Secret Manager secrets exist
+        run: |
+          set -euo pipefail
+          for secret_name in \
+            "${UK_AQ_INGESTDB_DB_URL_SECRET_NAME}" \
+            "${UK_AQ_OBS_AQIDB_DB_URL_SECRET_NAME}" \
+            "${DROPBOX_APP_KEY_SECRET_NAME}" \
+            "${DROPBOX_APP_SECRET_SECRET_NAME}" \
+            "${DROPBOX_REFRESH_TOKEN_SECRET_NAME}"; do
+            gcloud secrets describe "${secret_name}" --project "${PROJECT_ID}" >/dev/null
+          done
+
+      - name: Grant runtime access to required Secret Manager secrets
+        run: |
+          set -euo pipefail
+          runtime_sa='${{ steps.service_accounts.outputs.runtime_sa }}'
+
+          for secret_name in \
+            "${UK_AQ_INGESTDB_DB_URL_SECRET_NAME}" \
+            "${UK_AQ_OBS_AQIDB_DB_URL_SECRET_NAME}" \
+            "${DROPBOX_APP_KEY_SECRET_NAME}" \
+            "${DROPBOX_APP_SECRET_SECRET_NAME}" \
+            "${DROPBOX_REFRESH_TOKEN_SECRET_NAME}"; do
+            gcloud secrets add-iam-policy-binding "${secret_name}" \
+              --project "${PROJECT_ID}" \
+              --member "serviceAccount:${runtime_sa}" \
+              --role "roles/secretmanager.secretAccessor" >/dev/null
+          done
+
+      - name: Build Cloud Run env and secret args
+        id: cloudrun_args
+        run: |
+          set -euo pipefail
+
+          add_env() {
+            local key="$1"
+            local value="${!key:-}"
+            if [ -n "${value}" ]; then
+              env_updates+=("${key}=${value}")
+            fi
+          }
+
+          add_secret_binding() {
+            local env_key="$1"
+            local secret_name="$2"
+            local required="${3:-0}"
+            if [ -z "${secret_name}" ]; then
+              if [ "${required}" = "1" ]; then
+                echo "Missing secret name for required binding ${env_key}"
+                exit 1
+              fi
+              return 0
+            fi
+            if gcloud secrets describe "${secret_name}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+              secret_updates+=("${env_key}=${secret_name}:latest")
+              return 0
+            fi
+            if [ "${required}" = "1" ]; then
+              echo "Required Secret Manager secret not found: ${secret_name}"
+              exit 1
+            fi
+          }
+
+          env_updates=()
+          add_env UK_AQ_DROPBOX_ROOT
+          add_env UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR
+          add_env UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS
+          env_updates+=("GCP_PROJECT_ID=${PROJECT_ID}")
+
+          secret_updates=()
+          add_secret_binding "UK_AQ_INGESTDB_DB_URL" "${UK_AQ_INGESTDB_DB_URL_SECRET_NAME}" 1
+          add_secret_binding "UK_AQ_OBS_AQIDB_DB_URL" "${UK_AQ_OBS_AQIDB_DB_URL_SECRET_NAME}" 1
+          add_secret_binding "DROPBOX_APP_KEY" "${DROPBOX_APP_KEY_SECRET_NAME}" 1
+          add_secret_binding "DROPBOX_APP_SECRET" "${DROPBOX_APP_SECRET_SECRET_NAME}" 1
+          add_secret_binding "DROPBOX_REFRESH_TOKEN" "${DROPBOX_REFRESH_TOKEN_SECRET_NAME}" 1
+
+          env_file="${RUNNER_TEMP}/uk-aq-supabase-db-dump-backup-service-env.yaml"
+          : > "${env_file}"
+          for kv in "${env_updates[@]}"; do
+            key="${kv%%=*}"
+            value="${kv#*=}"
+            python3 -c 'import json,sys; f=open(sys.argv[1], "a", encoding="utf-8"); print(f"{sys.argv[2]}: {json.dumps(sys.argv[3])}", file=f); f.close()' \
+              "${env_file}" "${key}" "${value}"
+          done
+
+          secret_csv="$(IFS=,; echo "${secret_updates[*]}")"
+          echo "env_file=${env_file}" >> "${GITHUB_OUTPUT}"
+          echo "secret_csv=${secret_csv}" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy Cloud Run service
+        run: |
+          set -euo pipefail
+          ENV_FILE='${{ steps.cloudrun_args.outputs.env_file }}'
+          SECRET_CSV='${{ steps.cloudrun_args.outputs.secret_csv }}'
+
+          CMD=(
+            gcloud run deploy "${SERVICE_NAME}"
+            --region "${REGION}"
+            --image "${{ steps.build.outputs.image }}"
+            --service-account "${{ steps.service_accounts.outputs.runtime_sa }}"
+            --ingress "${SERVICE_INGRESS}"
+            --timeout "${SERVICE_TIMEOUT_SECONDS}"
+            --cpu "${SERVICE_CPU}"
+            --memory "${SERVICE_MEMORY}"
+            --concurrency "${SERVICE_CONCURRENCY}"
+            --max-instances "${SERVICE_MAX_INSTANCES}"
+            --min-instances "${SERVICE_MIN_INSTANCES}"
+            --no-cpu-boost
+            --labels "job_name=${RESOURCE_LABEL}"
+            --no-allow-unauthenticated
+          )
+          if [ -n "${ENV_FILE}" ]; then
+            CMD+=(--env-vars-file "${ENV_FILE}")
+          fi
+          if [ -n "${SECRET_CSV}" ]; then
+            CMD+=(--set-secrets "${SECRET_CSV}")
+          fi
+          "${CMD[@]}"
+
+      - name: Verify service labels
+        run: |
+          set -euo pipefail
+          labels_json="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format="json(metadata.labels)")"
+          job_name_label="$(
+            python3 -c 'import json,sys; print(((json.loads(sys.stdin.read()) or {}).get("metadata", {}) or {}).get("labels", {}).get("job_name", ""))' <<<"${labels_json}"
+          )"
+          if [ "${job_name_label}" != "${RESOURCE_LABEL}" ]; then
+            echo "job_name label mismatch: expected ${RESOURCE_LABEL}, got ${job_name_label:-<missing>}"
+            exit 1
+          fi
+          echo "Verified label job_name=${job_name_label}"
+
+      - name: Ensure Cloud Scheduler trigger exists
+        run: |
+          set -euo pipefail
+
+          enabled="$(printf '%s' "${SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          scheduler_sa='${{ steps.service_accounts.outputs.scheduler_sa }}'
+
+          if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
+            if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
+              gcloud scheduler jobs pause "${SCHEDULER_JOB_NAME}" --location "${REGION}" || true
+              echo "Paused existing scheduler job ${SCHEDULER_JOB_NAME} (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
+            else
+              echo "Scheduler job ${SCHEDULER_JOB_NAME} not found; nothing to pause."
+            fi
+            exit 0
+          fi
+
+          service_uri="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+          scheduler_body='{"trigger_mode":"scheduler"}'
+          project_number="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+          scheduler_agent="service-${project_number}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+
+          gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --member "serviceAccount:${scheduler_sa}" \
+            --role "roles/run.invoker" >/dev/null
+
+          gcloud iam service-accounts add-iam-policy-binding "${scheduler_sa}" \
+            --project "${PROJECT_ID}" \
+            --member "serviceAccount:${scheduler_agent}" \
+            --role "roles/iam.serviceAccountTokenCreator" >/dev/null
+
+          if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
+            gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
+              --location "${REGION}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${service_uri}/run-backup" \
+              --http-method POST \
+              --update-headers "Content-Type=application/json" \
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+            echo "Updated Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
+          else
+            gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
+              --location "${REGION}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${service_uri}/run-backup" \
+              --http-method POST \
+              --headers "Content-Type=application/json" \
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+            echo "Created Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
+          fi
+
+      - name: Show deployed service
+        run: |
+          gcloud run services describe "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --format="yaml(metadata.name,metadata.labels,spec.template.spec.serviceAccountName,spec.template.spec.containerConcurrency,spec.template.spec.containers[0].image,spec.template.spec.containers[0].resources,status.url)"
