@@ -2,6 +2,7 @@ FROM node:20-bookworm-slim
 
 ARG SUPABASE_CLI_VERSION=2.79.0
 ARG PG_MAJOR=17
+ARG TARGETARCH
 
 WORKDIR /app
 ENV NODE_ENV=production
@@ -24,8 +25,18 @@ RUN install -d /usr/share/keyrings \
   && apt-get install -y --no-install-recommends "postgresql-client-${PG_MAJOR}" \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install --global "supabase@${SUPABASE_CLI_VERSION}" \
-  && npm cache clean --force
+RUN arch="${TARGETARCH:-$(dpkg --print-architecture)}" \
+  && case "${arch}" in \
+    amd64|arm64) cli_arch="${arch}" ;; \
+    *) echo "Unsupported architecture for Supabase CLI: ${arch}" >&2; exit 1 ;; \
+  esac \
+  && curl -fsSL -o /tmp/supabase.deb \
+    "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_${cli_arch}.deb" \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends /tmp/supabase.deb \
+  && supabase --version \
+  && rm -f /tmp/supabase.deb \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
 RUN npm install --omit=dev
