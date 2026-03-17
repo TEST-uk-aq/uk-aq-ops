@@ -11,7 +11,7 @@ Required environment variables:
 Optional environment variables:
   REGION                         Default: europe-west2
   SERVICE_NAME                   Default: uk-aq-supabase-db-dump-backup-service
-  JOB_NAME                       Default: uk-aq-supabase-db-dump-backup-trigger
+  JOB_NAME                       Default: SERVICE_NAME with trailing -service replaced by -trigger
   INVOKER_SA_NAME                Default: uk-aq-db-dump-backup-invoker
   SCHEDULE                       Default: 55 0 * * *
   TIME_ZONE                      Default: UTC
@@ -34,7 +34,15 @@ fi
 
 REGION="${REGION:-europe-west2}"
 SERVICE_NAME="${SERVICE_NAME:-uk-aq-supabase-db-dump-backup-service}"
-JOB_NAME="${JOB_NAME:-uk-aq-supabase-db-dump-backup-trigger}"
+JOB_NAME="${JOB_NAME:-}"
+if [[ -z "${JOB_NAME}" ]]; then
+  JOB_NAME="${SERVICE_NAME}"
+  if [[ "${JOB_NAME}" == *-service ]]; then
+    JOB_NAME="${JOB_NAME%-service}-trigger"
+  else
+    JOB_NAME="${JOB_NAME}-trigger"
+  fi
+fi
 INVOKER_SA_NAME="${INVOKER_SA_NAME:-uk-aq-db-dump-backup-invoker}"
 SCHEDULE="${SCHEDULE:-55 0 * * *}"
 TIME_ZONE="${TIME_ZONE:-UTC}"

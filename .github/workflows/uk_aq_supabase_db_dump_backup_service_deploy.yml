@@ -35,7 +35,7 @@ jobs:
       SERVICE_MIN_INSTANCES: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MIN_INSTANCES || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MIN_INSTANCES || '0' }}
       SERVICE_INGRESS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_INGRESS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_INGRESS || 'internal' }}
       SCHEDULER_ENABLED: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ENABLED || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ENABLED || 'true' }}
-      SCHEDULER_JOB_NAME: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || 'uk-aq-db-dump-backup-trigger' }}
+      SCHEDULER_JOB_NAME_OVERRIDE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || '' }}
       SCHEDULER_CRON: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_CRON || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_CRON || '55 0 * * *' }}
       SCHEDULER_TIMEZONE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_TIMEZONE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_TIMEZONE || 'UTC' }}
       SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ATTEMPT_DEADLINE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ATTEMPT_DEADLINE || '1800s' }}
@@ -113,8 +113,19 @@ jobs:
             exit 1
           fi
 
+          scheduler_job_name="${SCHEDULER_JOB_NAME_OVERRIDE:-}"
+          if [ -z "${scheduler_job_name}" ]; then
+            scheduler_job_name="${SERVICE_NAME}"
+            if [[ "${scheduler_job_name}" == *-service ]]; then
+              scheduler_job_name="${scheduler_job_name%-service}-trigger"
+            else
+              scheduler_job_name="${scheduler_job_name}-trigger"
+            fi
+          fi
+
           printf 'runtime_sa=%s\n' "${runtime_sa}" >> "${GITHUB_OUTPUT}"
           printf 'scheduler_sa=%s\n' "${scheduler_sa}" >> "${GITHUB_OUTPUT}"
+          printf 'scheduler_job_name=%s\n' "${scheduler_job_name}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate Google auth config
         run: |
@@ -350,13 +361,14 @@ jobs:
 
           enabled="$(printf '%s' "${SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           scheduler_sa='${{ steps.service_accounts.outputs.scheduler_sa }}'
+          scheduler_job_name='${{ steps.service_accounts.outputs.scheduler_job_name }}'
 
           if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
-            if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
-              gcloud scheduler jobs pause "${SCHEDULER_JOB_NAME}" --location "${REGION}" || true
-              echo "Paused existing scheduler job ${SCHEDULER_JOB_NAME} (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
+            if gcloud scheduler jobs describe "${scheduler_job_name}" --location "${REGION}" >/dev/null 2>&1; then
+              gcloud scheduler jobs pause "${scheduler_job_name}" --location "${REGION}" || true
+              echo "Paused existing scheduler job ${scheduler_job_name} (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
             else
-              echo "Scheduler job ${SCHEDULER_JOB_NAME} not found; nothing to pause."
+              echo "Scheduler job ${scheduler_job_name} not found; nothing to pause."
             fi
             exit 0
           fi
@@ -376,8 +388,8 @@ jobs:
             --member "serviceAccount:${scheduler_agent}" \
             --role "roles/iam.serviceAccountTokenCreator" >/dev/null
 
-          if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
-            gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
+          if gcloud scheduler jobs describe "${scheduler_job_name}" --location "${REGION}" >/dev/null 2>&1; then
+            gcloud scheduler jobs update http "${scheduler_job_name}" \
               --location "${REGION}" \
               --schedule "${SCHEDULER_CRON}" \
               --time-zone "${SCHEDULER_TIMEZONE}" \
@@ -389,9 +401,9 @@ jobs:
               --oidc-token-audience "${service_uri}" \
               --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}" \
               --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
-            echo "Updated Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
+            echo "Updated Cloud Scheduler job: ${scheduler_job_name}"
           else
-            gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
+            gcloud scheduler jobs create http "${scheduler_job_name}" \
               --location "${REGION}" \
               --schedule "${SCHEDULER_CRON}" \
               --time-zone "${SCHEDULER_TIMEZONE}" \
@@ -403,7 +415,7 @@ jobs:
               --oidc-token-audience "${service_uri}" \
               --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}" \
               --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
-            echo "Created Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
+            echo "Created Cloud Scheduler job: ${scheduler_job_name}"
           fi
 
       - name: Show deployed service
