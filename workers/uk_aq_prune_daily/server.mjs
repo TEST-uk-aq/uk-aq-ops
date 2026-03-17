@@ -13,7 +13,7 @@ const DAY_MS = 24 * HOUR_MS;
 
 const DEFAULT_DRY_RUN = true;
 const DEFAULT_MAX_HOURS_PER_RUN = 48;
-const DEFAULT_INGESTDB_RETENTION_DAYS = 7;
+const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_PHASE_A_ENABLED = true;
 const DEFAULT_PHASE_A_RECENT_DAYS = 3;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
@@ -1775,6 +1775,7 @@ async function runPrune(config) {
   const phaseBHistorySummary = await runPhaseBBackup({
     dryRun: config.dryRun,
     phaseB: config.phaseB,
+    ingestRetentionDays: config.ingestDbRetentionDays,
     logStructured,
     runId: phaseBRunId,
   });

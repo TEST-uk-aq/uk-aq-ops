@@ -4,6 +4,7 @@ import {
   HISTORY_OBSERVATIONS_COLUMNS_V2,
   buildConnectorManifestForTest,
   computeDayGateState,
+  dayWindowFromNow,
   resolvePhaseBRuntimeConfig,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
@@ -73,4 +74,18 @@ test("runtime config includes AQI levels prefix defaults", () => {
   const config = resolvePhaseBRuntimeConfig({});
   assert.equal(config.committed_prefix, "history/v1/observations");
   assert.equal(config.aqilevels_prefix, "history/v1/aqilevels");
+});
+
+test("Phase B eligibility tracks ingest retention days", () => {
+  const windowDefault = dayWindowFromNow("2026-03-17T11:00:00.000Z", 7);
+  assert.equal(windowDefault.ingest_retention_days, 7);
+  assert.equal(windowDefault.phase_b_eligible_age_days, 8);
+  assert.equal(windowDefault.latest_eligible_day_utc, "2026-03-09");
+  assert.equal(windowDefault.latest_eligible_window_end_utc, "2026-03-10T00:00:00.000Z");
+
+  const windowFiveDay = dayWindowFromNow("2026-03-17T11:00:00.000Z", 5);
+  assert.equal(windowFiveDay.ingest_retention_days, 5);
+  assert.equal(windowFiveDay.phase_b_eligible_age_days, 6);
+  assert.equal(windowFiveDay.latest_eligible_day_utc, "2026-03-11");
+  assert.equal(windowFiveDay.latest_eligible_window_end_utc, "2026-03-12T00:00:00.000Z");
 });

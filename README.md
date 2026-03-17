@@ -53,7 +53,8 @@ Required env:
 Primary controls:
 
 - `INGESTDB_PRUNE_DRY_RUN` (default `true`)
-- `INGESTDB_RETENTION_DAYS` (default `7`)
+- `INGESTDB_RETENTION_DAYS` (default `5`)
+  - Drives both the ingest delete cutoff and the latest closed UTC day that Phase B exports to R2 (`retention + 1` days old).
 - `INGESTDB_PRUNE_MAX_HOURS_PER_RUN` (default `48`)
 - `INGESTDB_PRUNE_DELETE_BATCH_SIZE` (default `50000`)
 - `INGESTDB_PRUNE_MAX_DELETE_BATCHES_PER_HOUR` (default `10`)
@@ -120,7 +121,8 @@ Primary controls:
 - applies parquet `timeseries_id` filter pushdown (row-group stats) before row materialization to reduce worker CPU/memory
 - requires `x-uk-aq-upstream-auth` matching `UK_AQ_EDGE_UPSTREAM_SECRET`
 - returns normalized `{observed_at,value}` rows for a single `timeseries_id` + `connector_id`
-- consumed by ingest edge function `uk_aq_timeseries` for old-window reads
+- consumed by ingest edge function `uk_aq_timeseries` for windows older than the recent obs_aqidb overlap
+- website observations now use obs_aqidb for the recent `14`-day local window by default; keep `obs_aqidb` retention at `14` days or more if that local coverage should remain available before R2 fallback
 
 ### 8) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
 

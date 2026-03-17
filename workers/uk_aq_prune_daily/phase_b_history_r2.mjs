@@ -28,6 +28,7 @@ const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
 const DEFAULT_COMMITTED_PREFIX = "history/v1/observations";
 const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels";
 const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
+const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 
 const HISTORY_SCHEMA_NAME = "observations";
 const HISTORY_SCHEMA_VERSION = 2;
@@ -2023,7 +2024,10 @@ async function writeRunManifest({ runtime, runSummary }) {
   return key;
 }
 
-function dayWindowFromNow(nowUtcIso) {
+export function dayWindowFromNow(
+  nowUtcIso,
+  ingestRetentionDays = DEFAULT_INGESTDB_RETENTION_DAYS,
+) {
   const now = new Date(nowUtcIso);
   const todayUtc = toIsoDateUtc(new Date(Date.UTC(
     now.getUTCFullYear(),
@@ -2034,11 +2038,21 @@ function dayWindowFromNow(nowUtcIso) {
     0,
     0,
   )));
-  const latestEligibleDayUtc = shiftIsoDay(todayUtc, -8);
+  // Phase B must finish one full UTC day earlier than the prune cutoff day.
+  const retentionDays = parsePositiveInt(
+    ingestRetentionDays,
+    DEFAULT_INGESTDB_RETENTION_DAYS,
+    1,
+    3650,
+  );
+  const phaseBEligibleAgeDays = retentionDays + 1;
+  const latestEligibleDayUtc = shiftIsoDay(todayUtc, -phaseBEligibleAgeDays);
   const latestEligibleWindowEndIso = `${shiftIsoDay(latestEligibleDayUtc, 1)}T00:00:00.000Z`;
   return {
     now_utc: now.toISOString(),
     today_utc: todayUtc,
+    ingest_retention_days: retentionDays,
+    phase_b_eligible_age_days: phaseBEligibleAgeDays,
     latest_eligible_day_utc: latestEligibleDayUtc,
     latest_eligible_window_end_utc: latestEligibleWindowEndIso,
   };
@@ -2141,6 +2155,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
 export async function runPhaseBBackup({
   dryRun,
   phaseB,
+  ingestRetentionDays = DEFAULT_INGESTDB_RETENTION_DAYS,
   logStructured,
   runId = randomUUID(),
   nowUtc = nowIso(),
@@ -2166,11 +2181,13 @@ export async function runPhaseBBackup({
     throw new Error("Phase B history export requires R2 endpoint/bucket/region/access credentials.");
   }
 
-  const window = dayWindowFromNow(nowUtc);
+  const window = dayWindowFromNow(nowUtc, ingestRetentionDays);
   const summary = {
     enabled: true,
     run_id: runId,
     now_utc: window.now_utc,
+    ingest_retention_days: window.ingest_retention_days,
+    phase_b_eligible_age_days: window.phase_b_eligible_age_days,
     latest_eligible_day_utc: window.latest_eligible_day_utc,
     latest_eligible_window_end_utc: window.latest_eligible_window_end_utc,
     dry_run: dryRun,
@@ -2193,6 +2210,8 @@ export async function runPhaseBBackup({
     run_id: runId,
     dry_run: dryRun,
     now_utc: window.now_utc,
+    ingest_retention_days: window.ingest_retention_days,
+    phase_b_eligible_age_days: window.phase_b_eligible_age_days,
     latest_eligible_day_utc: window.latest_eligible_day_utc,
     max_candidates_per_run: runtime.max_candidates_per_run,
     part_max_rows: runtime.part_max_rows,
