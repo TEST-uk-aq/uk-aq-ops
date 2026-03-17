@@ -172,7 +172,9 @@ jobs:
           set -euo pipefail
           IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-supabase-db-dump-backup-service:${GITHUB_SHA::12}"
           echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
-          docker build -f workers/uk_aq_supabase_db_dump_backup_service/Dockerfile -t "${IMAGE}" .
+          docker build --pull --progress=plain \
+            -f workers/uk_aq_supabase_db_dump_backup_service/Dockerfile \
+            -t "${IMAGE}" .
           docker push "${IMAGE}"
 
       - name: Sync GitHub secrets to GCP Secret Manager

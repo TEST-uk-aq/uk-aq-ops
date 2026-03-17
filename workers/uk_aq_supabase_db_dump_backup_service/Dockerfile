@@ -13,16 +13,19 @@ RUN apt-get update \
     curl \
     gnupg \
     gzip \
-  && install -d /usr/share/keyrings \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN install -d /usr/share/keyrings \
   && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-    | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg \
-  && echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+    | gpg --batch --yes --dearmor -o /usr/share/keyrings/postgresql.gpg \
+  && echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
     > /etc/apt/sources.list.d/pgdg.list \
   && apt-get update \
   && apt-get install -y --no-install-recommends "postgresql-client-${PG_MAJOR}" \
-  && npm install --global "supabase@${SUPABASE_CLI_VERSION}" \
-  && npm cache clean --force \
   && rm -rf /var/lib/apt/lists/*
+
+RUN npm install --global "supabase@${SUPABASE_CLI_VERSION}" \
+  && npm cache clean --force
 
 COPY package.json package-lock.json ./
 RUN npm install --omit=dev
