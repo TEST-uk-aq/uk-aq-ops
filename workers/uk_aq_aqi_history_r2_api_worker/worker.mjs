@@ -3,7 +3,8 @@ import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/aqilevels";
 const DEFAULT_CACHE_SECONDS = 300;
-const MAX_CACHE_SECONDS = 3600;
+const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
+const MAX_CACHE_SECONDS = 604800;
 const MAX_LIMIT = 20000;
 const MAX_RANGE_DAYS = 366;
 const DEFAULT_OBSAQIDB_SOURCE_OF_TRUTH_HOURS = 24 * 7;
@@ -14,6 +15,7 @@ const MAX_OBSAQIDB_TIMEOUT_MS = 30000;
 const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set(["/", "/v1/aqi-history"]);
 
@@ -88,6 +90,30 @@ function toIsoOrNull(raw) {
 
 function cacheControlHeader(cacheSeconds) {
   return `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds * 2}`;
+}
+
+function resolveCachePolicy(env, endIso) {
+  const mutableCacheSeconds = parsePositiveInt(
+    env.UK_AQ_AQI_HISTORY_R2_CACHE_MAX_AGE_SECONDS,
+    DEFAULT_CACHE_SECONDS,
+    30,
+    MAX_CACHE_SECONDS,
+  );
+  const immutableCacheSeconds = Math.max(
+    mutableCacheSeconds,
+    parsePositiveInt(
+      env.UK_AQ_AQI_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS,
+      DEFAULT_IMMUTABLE_CACHE_SECONDS,
+      30,
+      MAX_CACHE_SECONDS,
+    ),
+  );
+  const endMs = Date.parse(endIso);
+  const immutable = Number.isFinite(endMs) && endMs <= (Date.now() - AQI_HISTORY_MUTABLE_WINDOW_MS);
+  return {
+    cacheSeconds: immutable ? immutableCacheSeconds : mutableCacheSeconds,
+    cacheScope: immutable ? "immutable" : "recent",
+  };
 }
 
 function jsonResponse(payload, {
@@ -635,12 +661,8 @@ async function handleRequest(request, env) {
   const historyPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_HISTORY_PREFIX,
   ) || DEFAULT_HISTORY_PREFIX;
-  const cacheSeconds = parsePositiveInt(
-    env.UK_AQ_AQI_HISTORY_R2_CACHE_MAX_AGE_SECONDS,
-    DEFAULT_CACHE_SECONDS,
-    30,
-    MAX_CACHE_SECONDS,
-  );
+  const cachePolicy = resolveCachePolicy(env, endIso);
+  const { cacheSeconds, cacheScope } = cachePolicy;
   const obsAqiDbSourceOfTruthHours = parsePositiveInt(
     env.UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS,
     DEFAULT_OBSAQIDB_SOURCE_OF_TRUTH_HOURS,
@@ -746,6 +768,7 @@ async function handleRequest(request, env) {
     source,
     source_split_boundary_utc: splitBoundaryIso,
     source_of_truth_hours: obsAqiDbSourceOfTruthHours,
+    cache_scope: cacheScope,
     scope,
     grain,
     entity_id: String(stationId),

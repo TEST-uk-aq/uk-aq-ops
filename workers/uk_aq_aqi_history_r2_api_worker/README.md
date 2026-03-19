@@ -48,6 +48,9 @@ Serving rule:
   - a UTC day is served only when the day manifest exists.
   - no `_SUCCESS` marker or loose parquet scan fallback is used.
 - Overlapping timestamps are de-duplicated with ObsAQIDB as source-of-truth.
+- Cache policy is dynamic by requested end time:
+  - windows ending within the last 24 hours use the short live TTL
+  - windows ending more than 24 hours ago use the long immutable-history TTL
 
 Required runtime secrets for stitched mode:
 
@@ -59,6 +62,7 @@ Response:
 - returns hourly points sorted by `period_start_utc` ascending:
   - `{ period_start_utc, daqi_index_level, eaqi_index_level, station_id }`
 - includes source and coverage diagnostics (history + obs_aqidb windows/counts, plus `obs_aqidb_status` / `r2_recent_fallback_*` when live recent reads fail).
+- includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.
 
 ## Deploy (manual)

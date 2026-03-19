@@ -10,7 +10,7 @@ export interface Env {
   UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: unknown;
 }
 
-type CacheProfileName = "realtime" | "metadata" | "stations_metadata";
+type CacheProfileName = "realtime" | "metadata" | "stations_metadata" | "aqi_history_immutable";
 
 type CacheProfile = {
   edgeTtlSeconds: number;
@@ -52,6 +52,12 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
     staleIfErrorSeconds: 1800,
   },
   stations_metadata: {
+    edgeTtlSeconds: 86400,
+    browserTtlSeconds: 86400,
+    staleWhileRevalidateSeconds: 86400,
+    staleIfErrorSeconds: 604800,
+  },
+  aqi_history_immutable: {
     edgeTtlSeconds: 86400,
     browserTtlSeconds: 86400,
     staleWhileRevalidateSeconds: 86400,
@@ -101,6 +107,7 @@ const MIN_SESSION_MAX_AGE_SECONDS = 60;
 const MAX_SESSION_MAX_AGE_SECONDS = 86400;
 const UPSTREAM_RETRY_DELAY_MS = 300;
 const UPSTREAM_RETRY_STATUSES = new Set([502, 503, 504]);
+const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -247,6 +254,38 @@ function buildCacheControl(profile: CacheProfile): string {
     `stale-while-revalidate=${profile.staleWhileRevalidateSeconds}`,
     `stale-if-error=${profile.staleIfErrorSeconds}`,
   ].join(", ");
+}
+
+function parseIsoMsOrNull(value: string | null): number | null {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
+  const explicitEndMs = parseIsoMsOrNull(
+    url.searchParams.get("to_utc")
+      || url.searchParams.get("end_utc")
+      || url.searchParams.get("to")
+      || url.searchParams.get("end"),
+  );
+  if (!Number.isFinite(explicitEndMs)) {
+    return false;
+  }
+  return explicitEndMs <= (nowMs - AQI_HISTORY_MUTABLE_WINDOW_MS);
+}
+
+function resolveCacheProfileName(upstreamFunction: string, url: URL): CacheProfileName {
+  if (
+    upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM &&
+    isImmutableAqiHistoryRequest(url)
+  ) {
+    return "aqi_history_immutable";
+  }
+  return FUNCTION_PROFILE_MAP[upstreamFunction];
 }
 
 function normalizeEtag(value: string): string {
@@ -756,7 +795,7 @@ export default {
       }
     }
 
-    const profileName = FUNCTION_PROFILE_MAP[upstreamFunction];
+    const profileName = resolveCacheProfileName(upstreamFunction, url);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
 
