@@ -240,6 +240,15 @@ function buildEmptyHistoryRead() {
   };
 }
 
+function buildEmptyRecentRead(status = "not_requested", error = null) {
+  return {
+    source_path: null,
+    points: [],
+    status,
+    error,
+  };
+}
+
 function normalizeAndSortRows(rowsByPeriodStart, limit) {
   const rows = Array.from(rowsByPeriodStart.values()).sort((left, right) => {
     const leftMs = Date.parse(String(left.period_start_utc || "")) || 0;
@@ -664,21 +673,70 @@ async function handleRequest(request, env) {
     })
     : buildEmptyHistoryRead();
 
-  const recentRead = hasRecentWindow
-    ? await readRecentRowsFromObsAqiDb({
-      env,
-      stationId,
-      startIso: new Date(recentStartMs).toISOString(),
-      endIso: new Date(recentEndMs).toISOString(),
-      sinceIso,
-    })
-    : { source_path: null, points: [] };
+  let recentRead = buildEmptyRecentRead();
+  let recentHistoryFallbackRead = buildEmptyHistoryRead();
+  let recentHistoryFallbackError = null;
 
-  const points = mergePointsPreferRecent(historyRead.points, recentRead.points, limit);
-  const source = hasHistoryWindow && hasRecentWindow
-    ? "obs_aqidb_history_stitched"
-    : hasRecentWindow
-    ? "obs_aqidb_only"
+  if (hasRecentWindow) {
+    try {
+      const obsAqiRecentRead = await readRecentRowsFromObsAqiDb({
+        env,
+        stationId,
+        startIso: new Date(recentStartMs).toISOString(),
+        endIso: new Date(recentEndMs).toISOString(),
+        sinceIso,
+      });
+      recentRead = {
+        ...obsAqiRecentRead,
+        status: "live",
+        error: null,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      recentRead = buildEmptyRecentRead("history_fallback", message);
+
+      // Keep the endpoint available when the live ObsAQIDB slice is unavailable by
+      // falling back to R2 for the same recent window on a best-effort basis.
+      try {
+        recentHistoryFallbackRead = await readHistoryRows({
+          env,
+          historyPrefix,
+          stationId,
+          startIso: new Date(recentStartMs).toISOString(),
+          endIso: new Date(recentEndMs).toISOString(),
+          sinceIso,
+          limit: null,
+        });
+      } catch (fallbackError) {
+        recentHistoryFallbackError = fallbackError instanceof Error
+          ? fallbackError.message
+          : String(fallbackError);
+      }
+
+      if (
+        recentHistoryFallbackError
+        && historyRead.points.length === 0
+        && recentHistoryFallbackRead.points.length === 0
+      ) {
+        throw new Error(
+          `ObsAQIDB recent AQI failed (${message}) and R2 recent fallback failed (${recentHistoryFallbackError}).`,
+        );
+      }
+    }
+  }
+
+  const historyBackedPoints = mergePointsPreferRecent(
+    historyRead.points,
+    recentHistoryFallbackRead.points,
+    null,
+  );
+  const points = mergePointsPreferRecent(historyBackedPoints, recentRead.points, limit);
+  const source = recentRead.status === "live"
+    ? hasHistoryWindow
+      ? "obs_aqidb_history_stitched"
+      : "obs_aqidb_only"
+    : recentRead.status === "history_fallback"
+    ? "history_r2_fallback"
     : "history_only";
 
   return jsonResponse({
@@ -706,10 +764,32 @@ async function handleRequest(request, env) {
       missing_parquet_keys: historyRead.missing_parquet_keys,
       obs_aqidb_source_path: recentRead.source_path,
       obs_aqidb_row_count: recentRead.points.length,
+      obs_aqidb_status: recentRead.status,
+      obs_aqidb_error: recentRead.error,
       history_window_from_utc: hasHistoryWindow ? new Date(historyStartMs).toISOString() : null,
       history_window_to_utc: hasHistoryWindow ? new Date(historyEndMs).toISOString() : null,
       obs_aqidb_window_from_utc: hasRecentWindow ? new Date(recentStartMs).toISOString() : null,
       obs_aqidb_window_to_utc: hasRecentWindow ? new Date(recentEndMs).toISOString() : null,
+      r2_recent_fallback_used: recentRead.status === "history_fallback",
+      r2_recent_fallback_row_count: recentHistoryFallbackRead.points.length,
+      r2_recent_fallback_from_utc: recentRead.status === "history_fallback"
+        ? new Date(recentStartMs).toISOString()
+        : null,
+      r2_recent_fallback_to_utc: recentRead.status === "history_fallback"
+        ? new Date(recentEndMs).toISOString()
+        : null,
+      r2_recent_fallback_days_scanned: recentHistoryFallbackRead.days_scanned,
+      r2_recent_fallback_scanned_connector_manifests:
+        recentHistoryFallbackRead.scanned_connector_manifests,
+      r2_recent_fallback_scanned_parquet_files:
+        recentHistoryFallbackRead.scanned_parquet_files,
+      r2_recent_fallback_missing_day_manifest_keys:
+        recentHistoryFallbackRead.missing_day_manifest_keys,
+      r2_recent_fallback_missing_connector_manifest_keys:
+        recentHistoryFallbackRead.missing_connector_manifest_keys,
+      r2_recent_fallback_missing_parquet_keys:
+        recentHistoryFallbackRead.missing_parquet_keys,
+      r2_recent_fallback_error: recentHistoryFallbackError,
     },
   }, {
     status: 200,

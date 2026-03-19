@@ -43,6 +43,7 @@ R2 paths expected:
 Serving rule:
 
 - Recent period uses ObsAQIDB (default last 7 days).
+- If the ObsAQIDB read fails, the same recent window falls back to R2 history on a best-effort basis.
 - Older period uses committed R2 day manifests:
   - a UTC day is served only when the day manifest exists.
   - no `_SUCCESS` marker or loose parquet scan fallback is used.
@@ -57,7 +58,7 @@ Response:
 
 - returns hourly points sorted by `period_start_utc` ascending:
   - `{ period_start_utc, daqi_index_level, eaqi_index_level, station_id }`
-- includes source and coverage diagnostics (history + obs_aqidb windows/counts).
+- includes source and coverage diagnostics (history + obs_aqidb windows/counts, plus `obs_aqidb_status` / `r2_recent_fallback_*` when live recent reads fail).
 - sets `x-ukaq-cache: HIT|MISS`.
 
 ## Deploy (manual)
