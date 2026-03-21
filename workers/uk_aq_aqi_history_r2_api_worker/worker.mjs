@@ -88,6 +88,23 @@ function toIsoOrNull(raw) {
   return new Date(ms).toISOString();
 }
 
+function normalizeAqiPollutant(raw) {
+  const compact = String(raw || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (!compact) {
+    return null;
+  }
+  if (compact === "pm25" || compact === "particulatematter25") {
+    return "pm25";
+  }
+  if (compact === "pm10" || compact === "particulatematter10") {
+    return "pm10";
+  }
+  if (compact === "no2" || compact === "nitrogendioxide") {
+    return "no2";
+  }
+  return null;
+}
+
 function cacheControlHeader(cacheSeconds) {
   return `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds * 2}`;
 }
@@ -254,6 +271,36 @@ function maxFiniteIndex(values, maxValue) {
   return Math.max(1, Math.min(maxValue, Math.trunc(out)));
 }
 
+function normalizeFiniteIndex(value, maxValue) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+  return Math.max(1, Math.min(maxValue, Math.trunc(numeric)));
+}
+
+function getAqiFieldNamesForPollutant(pollutantKey) {
+  if (pollutantKey === "pm25") {
+    return {
+      daqiField: "daqi_pm25_rolling24h_index_level",
+      eaqiField: "eaqi_pm25_index_level",
+    };
+  }
+  if (pollutantKey === "pm10") {
+    return {
+      daqiField: "daqi_pm10_rolling24h_index_level",
+      eaqiField: "eaqi_pm10_index_level",
+    };
+  }
+  if (pollutantKey === "no2") {
+    return {
+      daqiField: "daqi_no2_index_level",
+      eaqiField: "eaqi_no2_index_level",
+    };
+  }
+  return null;
+}
+
 function buildEmptyHistoryRead() {
   return {
     points: [],
@@ -292,6 +339,7 @@ function appendFilteredRows(rows, {
   startMs,
   endMs,
   sinceMs,
+  pollutantKey,
   outByPeriodStart,
 }) {
   for (const row of rows) {
@@ -314,18 +362,38 @@ function appendFilteredRows(rows, {
       continue;
     }
 
-    const daqi = maxFiniteIndex([
-      row?.daqi_no2_index_level,
-      row?.daqi_pm25_rolling24h_index_level,
-      row?.daqi_pm10_rolling24h_index_level,
-    ], 10);
-    const eaqi = maxFiniteIndex([
-      row?.eaqi_no2_index_level,
-      row?.eaqi_pm25_index_level,
-      row?.eaqi_pm10_index_level,
-    ], 6);
+    const daqiNo2 = normalizeFiniteIndex(row?.daqi_no2_index_level, 10);
+    const daqiPm25 = normalizeFiniteIndex(row?.daqi_pm25_rolling24h_index_level, 10);
+    const daqiPm10 = normalizeFiniteIndex(row?.daqi_pm10_rolling24h_index_level, 10);
+    const eaqiNo2 = normalizeFiniteIndex(row?.eaqi_no2_index_level, 6);
+    const eaqiPm25 = normalizeFiniteIndex(row?.eaqi_pm25_index_level, 6);
+    const eaqiPm10 = normalizeFiniteIndex(row?.eaqi_pm10_index_level, 6);
+    const fieldNames = getAqiFieldNamesForPollutant(pollutantKey);
+    const daqi = fieldNames
+      ? {
+        pm25: daqiPm25,
+        pm10: daqiPm10,
+        no2: daqiNo2,
+      }[pollutantKey]
+      : maxFiniteIndex([daqiNo2, daqiPm25, daqiPm10], 10);
+    const eaqi = fieldNames
+      ? {
+        pm25: eaqiPm25,
+        pm10: eaqiPm10,
+        no2: eaqiNo2,
+      }[pollutantKey]
+      : maxFiniteIndex([eaqiNo2, eaqiPm25, eaqiPm10], 6);
 
-    if (daqi === null && eaqi === null) {
+    if (
+      daqi === null
+      && eaqi === null
+      && daqiNo2 === null
+      && daqiPm25 === null
+      && daqiPm10 === null
+      && eaqiNo2 === null
+      && eaqiPm25 === null
+      && eaqiPm10 === null
+    ) {
       continue;
     }
 
@@ -333,6 +401,12 @@ function appendFilteredRows(rows, {
       period_start_utc: periodStart,
       daqi_index_level: daqi,
       eaqi_index_level: eaqi,
+      daqi_no2_index_level: daqiNo2,
+      daqi_pm25_rolling24h_index_level: daqiPm25,
+      daqi_pm10_rolling24h_index_level: daqiPm10,
+      eaqi_no2_index_level: eaqiNo2,
+      eaqi_pm25_index_level: eaqiPm25,
+      eaqi_pm10_index_level: eaqiPm10,
       station_id: rowStationId,
     });
   }
@@ -345,6 +419,7 @@ async function readHistoryRows({
   startIso,
   endIso,
   sinceIso,
+  pollutantKey,
   limit,
 }) {
   const startMs = Date.parse(startIso);
@@ -406,6 +481,7 @@ async function readHistoryRows({
           startMs,
           endMs,
           sinceMs,
+          pollutantKey,
           outByPeriodStart: rowsByPeriodStart,
         });
       }
@@ -430,6 +506,7 @@ async function readRecentRowsFromObsAqiDb({
   startIso,
   endIso,
   sinceIso,
+  pollutantKey,
 }) {
   const baseUrl = normalizeBaseUrl(env.OBS_AQIDB_SUPABASE_URL || "");
   const apiKey = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
@@ -526,6 +603,7 @@ async function readRecentRowsFromObsAqiDb({
     startMs: Date.parse(startIso),
     endMs: Date.parse(endIso),
     sinceMs: sinceIso ? Date.parse(sinceIso) : Number.NaN,
+    pollutantKey,
     outByPeriodStart: rowsByPeriodStart,
   });
 
@@ -624,6 +702,16 @@ async function handleRequest(request, env) {
     }, { status: 400, cacheSeconds: 30 });
   }
 
+  const requestedPollutant = url.searchParams.has("pollutant")
+    ? normalizeAqiPollutant(url.searchParams.get("pollutant"))
+    : null;
+  if (url.searchParams.has("pollutant") && !requestedPollutant) {
+    return jsonResponse({
+      ok: false,
+      error: "pollutant must be one of pm25, pm10, or no2 when provided.",
+    }, { status: 400, cacheSeconds: 30 });
+  }
+
   const range = resolveTimeRange(url);
   if (!range.ok) {
     return jsonResponse({ ok: false, error: range.error }, { status: 400, cacheSeconds: 30 });
@@ -691,6 +779,7 @@ async function handleRequest(request, env) {
       startIso: new Date(historyStartMs).toISOString(),
       endIso: new Date(historyEndMs).toISOString(),
       sinceIso,
+      pollutantKey: requestedPollutant,
       limit: null,
     })
     : buildEmptyHistoryRead();
@@ -707,6 +796,7 @@ async function handleRequest(request, env) {
         startIso: new Date(recentStartMs).toISOString(),
         endIso: new Date(recentEndMs).toISOString(),
         sinceIso,
+        pollutantKey: requestedPollutant,
       });
       recentRead = {
         ...obsAqiRecentRead,
@@ -727,6 +817,7 @@ async function handleRequest(request, env) {
           startIso: new Date(recentStartMs).toISOString(),
           endIso: new Date(recentEndMs).toISOString(),
           sinceIso,
+          pollutantKey: requestedPollutant,
           limit: null,
         });
       } catch (fallbackError) {
@@ -771,6 +862,7 @@ async function handleRequest(request, env) {
     cache_scope: cacheScope,
     scope,
     grain,
+    pollutant: requestedPollutant,
     entity_id: String(stationId),
     station_id: stationId,
     query_from_utc: startIso,
