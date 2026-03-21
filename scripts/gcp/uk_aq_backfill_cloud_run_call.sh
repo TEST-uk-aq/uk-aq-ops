@@ -6,11 +6,11 @@ usage() {
 Usage:
   export UK_AQ_BACKFILL_SERVICE_URL="https://<service>-<hash>-ew.a.run.app"
   export UK_AQ_BACKFILL_TRIGGER_MODE="manual"
-  export UK_AQ_BACKFILL_RUN_MODE="local_to_aqilevels"
+  export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
   export UK_AQ_BACKFILL_DRY_RUN="false"
-  export UK_AQ_BACKFILL_FORCE_REPLACE="false"
-  export UK_AQ_BACKFILL_FROM_DAY_UTC="2026-02-01"
-  export UK_AQ_BACKFILL_TO_DAY_UTC="2026-02-05"
+  export UK_AQ_BACKFILL_FORCE_REPLACE="true"
+  export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
+  export UK_AQ_BACKFILL_TO_DAY_UTC="2025-01-31"
   export UK_AQ_BACKFILL_CONNECTOR_IDS="4,7"   # optional
   export UK_AQ_BACKFILL_STATION_IDS="24665"   # optional
   export UK_AQ_BACKFILL_ENABLE_R2_FALLBACK="false" # optional
@@ -19,7 +19,7 @@ Usage:
 Required env vars:
   UK_AQ_BACKFILL_SERVICE_URL
   UK_AQ_BACKFILL_TRIGGER_MODE   (manual|scheduler)
-  UK_AQ_BACKFILL_RUN_MODE       (local_to_aqilevels|obs_aqi_to_r2|source_to_r2)
+  UK_AQ_BACKFILL_RUN_MODE       (local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels)
   UK_AQ_BACKFILL_DRY_RUN        (true|false)
   UK_AQ_BACKFILL_FORCE_REPLACE  (true|false)
   UK_AQ_BACKFILL_FROM_DAY_UTC   (YYYY-MM-DD)
@@ -155,7 +155,7 @@ case "${TRIGGER_MODE}" in
 esac
 
 case "${RUN_MODE}" in
-  local_to_aqilevels|obs_aqi_to_r2|source_to_r2) ;;
+  local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
   *)
     echo "Invalid UK_AQ_BACKFILL_RUN_MODE: ${RUN_MODE}" >&2
     exit 2

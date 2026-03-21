@@ -39,6 +39,8 @@ R2 paths expected:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/manifest.json`
 - connector manifest:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
+- the worker resolves `station_id -> connector_id` from `uk_aq_core.stations` and reads only that connector manifest when available
+- AQI parquet reads use `station_id` row-group stats and chunked column reads instead of materializing whole parquet files
 
 Serving rule:
 
@@ -57,11 +59,19 @@ Required runtime secrets for stitched mode:
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
 
+Useful runtime vars:
+
+- `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default `168`)
+- `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS` (default `10000`)
+- `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE` (default `5000`)
+- `UK_AQ_CORE_SCHEMA` (default `uk_aq_core`)
+- `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`)
+
 Response:
 
 - returns hourly points sorted by `period_start_utc` ascending:
   - `{ period_start_utc, daqi_index_level, eaqi_index_level, station_id }`
-- includes source and coverage diagnostics (history + obs_aqidb windows/counts, plus `obs_aqidb_status` / `r2_recent_fallback_*` when live recent reads fail).
+- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `station_connector_*` lookup diagnostics, plus `obs_aqidb_status` / `r2_recent_fallback_*` when live recent reads fail).
 - includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.
 

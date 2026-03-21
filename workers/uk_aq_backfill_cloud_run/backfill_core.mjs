@@ -6,6 +6,7 @@ export const ALLOWED_RUN_MODES = Object.freeze([
   "local_to_aqilevels",
   "obs_aqi_to_r2",
   "source_to_r2",
+  "r2_history_obs_to_aqilevels",
 ]);
 
 const RUN_MODE_SET = new Set(ALLOWED_RUN_MODES);
@@ -439,6 +440,476 @@ export function mapR2ObservationRowsToSourceObservations({
     return 0;
   });
   return observations;
+}
+
+function parseIsoHour(raw) {
+  const normalized = normalizeIsoTimestamp(raw);
+  if (!normalized) {
+    return null;
+  }
+  const date = new Date(normalized);
+  date.setUTCMinutes(0, 0, 0);
+  return date.toISOString();
+}
+
+function average(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return null;
+  }
+  const total = values.reduce((sum, value) => sum + value, 0);
+  return total / values.length;
+}
+
+function sortHelperRows(rows) {
+  rows.sort((left, right) => {
+    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
+    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
+    return Number(left.station_id) - Number(right.station_id);
+  });
+  return rows;
+}
+
+function sortAqilevelHistoryRows(rows) {
+  rows.sort((left, right) => {
+    if (Number(left.station_id) !== Number(right.station_id)) {
+      return Number(left.station_id) - Number(right.station_id);
+    }
+    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
+    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
+    return 0;
+  });
+  return rows;
+}
+
+export function dedupeSourceObservationRows(rows) {
+  const byKey = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    const timeseriesId = Number(row.timeseries_id);
+    const observedAt = normalizeIsoTimestamp(row.observed_at);
+    const value = Number(row.value);
+    const stationId = Number(row.station_id);
+    const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0 || !observedAt) {
+      continue;
+    }
+    if (!Number.isInteger(stationId) || stationId <= 0) {
+      continue;
+    }
+    if (
+      !(
+        pollutantCode === "no2" || pollutantCode === "pm25" ||
+        pollutantCode === "pm10"
+      )
+    ) {
+      continue;
+    }
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    const key = `${Math.trunc(timeseriesId)}|${observedAt}`;
+    byKey.set(key, {
+      timeseries_id: Math.trunc(timeseriesId),
+      station_id: Math.trunc(stationId),
+      pollutant_code: pollutantCode,
+      observed_at: observedAt,
+      value,
+    });
+  }
+
+  const deduped = Array.from(byKey.values());
+  deduped.sort((left, right) => {
+    if (left.timeseries_id !== right.timeseries_id) {
+      return left.timeseries_id - right.timeseries_id;
+    }
+    if (left.observed_at < right.observed_at) return -1;
+    if (left.observed_at > right.observed_at) return 1;
+    return 0;
+  });
+  return deduped;
+}
+
+export function sourceObservationsToNarrowRows(rows) {
+  const grouped = new Map();
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    if (
+      !(
+        row.pollutant_code === "pm10" || row.pollutant_code === "pm25" ||
+        row.pollutant_code === "no2"
+      )
+    ) {
+      continue;
+    }
+    const stationId = Number(row.station_id);
+    const value = Number(row.value);
+    const hourIso = parseIsoHour(row.observed_at);
+    if (!Number.isInteger(stationId) || stationId <= 0 || !hourIso) {
+      continue;
+    }
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    const key = `${Math.trunc(stationId)}|${hourIso}|${row.pollutant_code}`;
+    const current = grouped.get(key) || {
+      station_id: Math.trunc(stationId),
+      timestamp_hour_utc: hourIso,
+      pollutant_code: row.pollutant_code,
+      sum: 0,
+      count: 0,
+    };
+    current.sum += value;
+    current.count += 1;
+    grouped.set(key, current);
+  }
+
+  const narrowRows = Array.from(grouped.values()).map((groupedRow) => ({
+    station_id: groupedRow.station_id,
+    timestamp_hour_utc: groupedRow.timestamp_hour_utc,
+    pollutant_code: groupedRow.pollutant_code,
+    hourly_mean_ugm3: groupedRow.count > 0
+      ? groupedRow.sum / groupedRow.count
+      : null,
+    sample_count: groupedRow.count > 0 ? groupedRow.count : null,
+  }));
+
+  narrowRows.sort((left, right) => {
+    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
+    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
+    if (left.station_id !== right.station_id) {
+      return left.station_id - right.station_id;
+    }
+    return left.pollutant_code.localeCompare(right.pollutant_code);
+  });
+  return narrowRows;
+}
+
+function computeRolling24h(helperRows) {
+  const byStation = new Map();
+  for (const row of helperRows) {
+    const stationId = Number(row.station_id);
+    const list = byStation.get(stationId) || [];
+    list.push(row);
+    byStation.set(stationId, list);
+  }
+
+  for (const rows of byStation.values()) {
+    sortHelperRows(rows);
+    for (let currentIndex = 0; currentIndex < rows.length; currentIndex += 1) {
+      const currentTs = Date.parse(rows[currentIndex].timestamp_hour_utc);
+      const pm25Values = [];
+      const pm10Values = [];
+
+      for (let previousIndex = currentIndex; previousIndex >= 0; previousIndex -= 1) {
+        const previousTs = Date.parse(rows[previousIndex].timestamp_hour_utc);
+        const diffHours = Math.trunc((currentTs - previousTs) / HOUR_MS);
+        if (diffHours > 23) {
+          break;
+        }
+        const pm25 = rows[previousIndex].pm25_hourly_mean_ugm3;
+        const pm10 = rows[previousIndex].pm10_hourly_mean_ugm3;
+        if (typeof pm25 === "number") {
+          pm25Values.push(pm25);
+        }
+        if (typeof pm10 === "number") {
+          pm10Values.push(pm10);
+        }
+      }
+
+      rows[currentIndex].pm25_rolling24h_mean_ugm3 = average(pm25Values);
+      rows[currentIndex].pm10_rolling24h_mean_ugm3 = average(pm10Values);
+    }
+  }
+}
+
+export function pivotNarrowRowsToHelperRows(narrowRows) {
+  const byKey = new Map();
+  for (const row of Array.isArray(narrowRows) ? narrowRows : []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    const stationId = Number(row.station_id);
+    const timestampHourUtc = normalizeIsoTimestamp(row.timestamp_hour_utc);
+    if (!Number.isInteger(stationId) || stationId <= 0 || !timestampHourUtc) {
+      continue;
+    }
+    const key = `${Math.trunc(stationId)}|${timestampHourUtc}`;
+    const existing = byKey.get(key) || {
+      station_id: Math.trunc(stationId),
+      timestamp_hour_utc: timestampHourUtc,
+      no2_hourly_mean_ugm3: null,
+      pm25_hourly_mean_ugm3: null,
+      pm10_hourly_mean_ugm3: null,
+      pm25_rolling24h_mean_ugm3: null,
+      pm10_rolling24h_mean_ugm3: null,
+      no2_hourly_sample_count: null,
+      pm25_hourly_sample_count: null,
+      pm10_hourly_sample_count: null,
+    };
+
+    const sampleCount = row.sample_count === null || row.sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.sample_count));
+
+    if (row.pollutant_code === "no2") {
+      existing.no2_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
+          row.hourly_mean_ugm3 === undefined
+        ? null
+        : Number(row.hourly_mean_ugm3);
+      existing.no2_hourly_sample_count = sampleCount;
+    } else if (row.pollutant_code === "pm25") {
+      existing.pm25_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
+          row.hourly_mean_ugm3 === undefined
+        ? null
+        : Number(row.hourly_mean_ugm3);
+      existing.pm25_hourly_sample_count = sampleCount;
+    } else if (row.pollutant_code === "pm10") {
+      existing.pm10_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
+          row.hourly_mean_ugm3 === undefined
+        ? null
+        : Number(row.hourly_mean_ugm3);
+      existing.pm10_hourly_sample_count = sampleCount;
+    } else {
+      continue;
+    }
+
+    byKey.set(key, existing);
+  }
+
+  const helperRows = sortHelperRows(Array.from(byKey.values()));
+  computeRolling24h(helperRows);
+  return helperRows;
+}
+
+export function narrowRowsToDayRange(helperRows, dayUtc) {
+  const dayStartIso = utcDayStartIso(dayUtc);
+  const dayEndIso = utcDayEndIso(dayUtc);
+  return sortHelperRows(
+    (Array.isArray(helperRows) ? helperRows : []).filter((row) =>
+      row.timestamp_hour_utc >= dayStartIso &&
+      row.timestamp_hour_utc < dayEndIso
+    ),
+  );
+}
+
+export function sourceObservationRowsToHelperRowsForDay(rows, dayUtc) {
+  const helperRows = pivotNarrowRowsToHelperRows(
+    sourceObservationsToNarrowRows(dedupeSourceObservationRows(rows)),
+  );
+  return narrowRowsToDayRange(helperRows, dayUtc);
+}
+
+export function helperRowsToAqilevelHistoryRows(helperRows) {
+  const rows = (Array.isArray(helperRows) ? helperRows : []).map((row) => ({
+    station_id: Number(row.station_id),
+    timestamp_hour_utc: normalizeIsoTimestamp(row.timestamp_hour_utc),
+    no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3 === null ||
+        row.no2_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.no2_hourly_mean_ugm3),
+    pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3 === null ||
+        row.pm25_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm25_hourly_mean_ugm3),
+    pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3 === null ||
+        row.pm10_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm10_hourly_mean_ugm3),
+    pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3 === null ||
+        row.pm25_rolling24h_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm25_rolling24h_mean_ugm3),
+    pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3 === null ||
+        row.pm10_rolling24h_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm10_rolling24h_mean_ugm3),
+    no2_hourly_sample_count: row.no2_hourly_sample_count === null ||
+        row.no2_hourly_sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.no2_hourly_sample_count)),
+    pm25_hourly_sample_count: row.pm25_hourly_sample_count === null ||
+        row.pm25_hourly_sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.pm25_hourly_sample_count)),
+    pm10_hourly_sample_count: row.pm10_hourly_sample_count === null ||
+        row.pm10_hourly_sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.pm10_hourly_sample_count)),
+    daqi_no2_index_level: lookupAqiIndexLevel(
+      row.no2_hourly_mean_ugm3,
+      DAQI_NO2_BREAKPOINTS,
+    ),
+    daqi_pm25_rolling24h_index_level: lookupAqiIndexLevel(
+      row.pm25_rolling24h_mean_ugm3,
+      DAQI_PM25_ROLLING24H_BREAKPOINTS,
+    ),
+    daqi_pm10_rolling24h_index_level: lookupAqiIndexLevel(
+      row.pm10_rolling24h_mean_ugm3,
+      DAQI_PM10_ROLLING24H_BREAKPOINTS,
+    ),
+    eaqi_no2_index_level: lookupAqiIndexLevel(
+      row.no2_hourly_mean_ugm3,
+      EAQI_NO2_BREAKPOINTS,
+    ),
+    eaqi_pm25_index_level: lookupAqiIndexLevel(
+      row.pm25_hourly_mean_ugm3,
+      EAQI_PM25_BREAKPOINTS,
+    ),
+    eaqi_pm10_index_level: lookupAqiIndexLevel(
+      row.pm10_hourly_mean_ugm3,
+      EAQI_PM10_BREAKPOINTS,
+    ),
+  })).filter((row) =>
+    Number.isInteger(row.station_id) && row.station_id > 0 &&
+    typeof row.timestamp_hour_utc === "string"
+  );
+
+  return sortAqilevelHistoryRows(rows);
+}
+
+export function buildAqilevelHistoryRowsForDayFromSourceObservations(rows, dayUtc) {
+  return helperRowsToAqilevelHistoryRows(
+    sourceObservationRowsToHelperRowsForDay(rows, dayUtc),
+  );
+}
+
+export function buildAqilevelHistoryRowsByDayFromSourceObservations({
+  rows,
+  fromDayUtc,
+  toDayUtc,
+}) {
+  const fromDay = parseIsoDayUtc(fromDayUtc);
+  const toDay = parseIsoDayUtc(toDayUtc);
+  if (!(fromDay && toDay)) {
+    throw new Error("Invalid day range for AQI history build");
+  }
+  if (compareIsoDay(toDay, fromDay) < 0) {
+    throw new Error("to_day_utc must be >= from_day_utc");
+  }
+
+  const helperRows = pivotNarrowRowsToHelperRows(
+    sourceObservationsToNarrowRows(dedupeSourceObservationRows(rows)),
+  );
+  const output = [];
+  let cursor = fromDay;
+  while (compareIsoDay(cursor, toDay) <= 0) {
+    output.push({
+      day_utc: cursor,
+      rows: helperRowsToAqilevelHistoryRows(
+        narrowRowsToDayRange(helperRows, cursor),
+      ),
+    });
+    cursor = shiftIsoDay(cursor, 1);
+  }
+  return output;
+}
+
+export function buildAqilevelHistoryRowsByDayFromR2ObservationRows({
+  rows,
+  bindingByTimeseriesId,
+  fromDayUtc,
+  toDayUtc,
+  stationIdFilter = null,
+}) {
+  const fromDay = parseIsoDayUtc(fromDayUtc);
+  const toDay = parseIsoDayUtc(toDayUtc);
+  if (!(fromDay && toDay)) {
+    throw new Error("Invalid day range for AQI history build");
+  }
+  const sourceRows = mapR2ObservationRowsToSourceObservations({
+    rows,
+    bindingByTimeseriesId,
+    windowStartIso: addUtcHours(utcDayStartIso(fromDay), -23),
+    windowEndIso: utcDayEndIso(toDay),
+    stationIdFilter,
+  });
+  return buildAqilevelHistoryRowsByDayFromSourceObservations({
+    rows: sourceRows,
+    fromDayUtc: fromDay,
+    toDayUtc: toDay,
+  });
+}
+
+export function extractConnectorIdsFromHistoryDayManifest(manifest) {
+  const connectorIds = new Set();
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    return [];
+  }
+
+  const connectorIdValues = Array.isArray(manifest.connector_ids)
+    ? manifest.connector_ids
+    : [];
+  for (const value of connectorIdValues) {
+    const connectorId = Number(value);
+    if (Number.isInteger(connectorId) && connectorId > 0) {
+      connectorIds.add(Math.trunc(connectorId));
+    }
+  }
+
+  const connectorManifests = Array.isArray(manifest.connector_manifests)
+    ? manifest.connector_manifests
+    : [];
+  for (const entry of connectorManifests) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    const connectorId = Number(entry.connector_id);
+    if (Number.isInteger(connectorId) && connectorId > 0) {
+      connectorIds.add(Math.trunc(connectorId));
+    }
+  }
+
+  return Array.from(connectorIds).sort((left, right) => left - right);
+}
+
+export function planAqilevelHistoryConnectorWrite({
+  forceReplace = false,
+  hasExistingManifest = false,
+  outputRowCount = 0,
+}) {
+  const existing = Boolean(hasExistingManifest);
+  const rows = Number.isFinite(Number(outputRowCount))
+    ? Math.max(0, Math.trunc(Number(outputRowCount)))
+    : 0;
+
+  if (existing && !forceReplace) {
+    return {
+      action: "skip",
+      skip_reason: "already_complete",
+      delete_existing: false,
+      write_connector_manifest: false,
+    };
+  }
+
+  if (rows > 0) {
+    return {
+      action: existing ? "replace" : "write",
+      skip_reason: null,
+      delete_existing: existing && forceReplace,
+      write_connector_manifest: true,
+    };
+  }
+
+  if (existing && forceReplace) {
+    return {
+      action: "delete",
+      skip_reason: null,
+      delete_existing: true,
+      write_connector_manifest: false,
+    };
+  }
+
+  return {
+    action: "skip",
+    skip_reason: "no_rows",
+    delete_existing: false,
+    write_connector_manifest: false,
+  };
 }
 
 export function parseConnectorIds(raw) {

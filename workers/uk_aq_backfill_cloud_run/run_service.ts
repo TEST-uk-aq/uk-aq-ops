@@ -279,7 +279,12 @@ serve(async (req: Request) => {
     return json({
       ok: true,
       service: "uk_aq_backfill_cloud_run",
-      run_modes: ["local_to_aqilevels", "obs_aqi_to_r2", "source_to_r2"],
+      run_modes: [
+        "local_to_aqilevels",
+        "obs_aqi_to_r2",
+        "source_to_r2",
+        "r2_history_obs_to_aqilevels",
+      ],
     });
   }
 

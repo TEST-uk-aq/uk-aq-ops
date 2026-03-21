@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildAqilevelHistoryRowsByDayFromR2ObservationRows,
+  buildAqilevelHistoryRowsByDayFromSourceObservations,
   buildCoveredIsoDaysForUtcRange,
   buildBackwardDayRange,
   computeRollingLocalRetentionWindow,
@@ -10,6 +12,7 @@ import {
   EAQI_NO2_BREAKPOINTS,
   EAQI_PM10_BREAKPOINTS,
   EAQI_PM25_BREAKPOINTS,
+  extractConnectorIdsFromHistoryDayManifest,
   isRetryableSourceFetchError,
   isRetryableAqilevelsWriteError,
   isDayInRollingRetentionWindow,
@@ -17,6 +20,7 @@ import {
   lookupAqiIndexLevel,
   mapR2ObservationRowsToSourceObservations,
   parseRunMode,
+  planAqilevelHistoryConnectorWrite,
   splitChunkLengthForRetry,
   shouldSkipCompletedDay,
 } from "../workers/uk_aq_backfill_cloud_run/backfill_core.mjs";
@@ -25,6 +29,10 @@ test("parseRunMode accepts valid values and falls back on invalid", () => {
   assert.equal(parseRunMode("local_to_aqilevels", "obs_aqi_to_r2"), "local_to_aqilevels");
   assert.equal(parseRunMode("OBS_AQI_TO_R2", "local_to_aqilevels"), "obs_aqi_to_r2");
   assert.equal(parseRunMode("", "source_to_r2"), "source_to_r2");
+  assert.equal(
+    parseRunMode("r2_history_obs_to_aqilevels", "local_to_aqilevels"),
+    "r2_history_obs_to_aqilevels",
+  );
   assert.equal(parseRunMode("not-a-mode", "local_to_aqilevels"), "local_to_aqilevels");
 });
 
@@ -406,4 +414,145 @@ test("mapR2ObservationRowsToSourceObservations maps parquet observations through
 test("AQI breakpoint helper keeps null and negative inputs invalid", () => {
   assert.equal(lookupAqiIndexLevel(null, EAQI_PM25_BREAKPOINTS), null);
   assert.equal(lookupAqiIndexLevel(-0.01, EAQI_PM25_BREAKPOINTS), null);
+});
+
+test("extractConnectorIdsFromHistoryDayManifest uses committed connector_ids and connector_manifests", () => {
+  assert.deepEqual(
+    extractConnectorIdsFromHistoryDayManifest({
+      connector_ids: [4, "7", 4, "bad"],
+      connector_manifests: [
+        { connector_id: 9 },
+        { connector_id: "11" },
+        { connector_id: 7 },
+      ],
+    }),
+    [4, 7, 9, 11],
+  );
+});
+
+test("planAqilevelHistoryConnectorWrite replaces when force_replace=true and skips when false", () => {
+  assert.deepEqual(
+    planAqilevelHistoryConnectorWrite({
+      forceReplace: false,
+      hasExistingManifest: true,
+      outputRowCount: 24,
+    }),
+    {
+      action: "skip",
+      skip_reason: "already_complete",
+      delete_existing: false,
+      write_connector_manifest: false,
+    },
+  );
+
+  assert.deepEqual(
+    planAqilevelHistoryConnectorWrite({
+      forceReplace: true,
+      hasExistingManifest: true,
+      outputRowCount: 24,
+    }),
+    {
+      action: "replace",
+      skip_reason: null,
+      delete_existing: true,
+      write_connector_manifest: true,
+    },
+  );
+
+  assert.deepEqual(
+    planAqilevelHistoryConnectorWrite({
+      forceReplace: true,
+      hasExistingManifest: true,
+      outputRowCount: 0,
+    }),
+    {
+      action: "delete",
+      skip_reason: null,
+      delete_existing: true,
+      write_connector_manifest: false,
+    },
+  );
+});
+
+test("AQI history builders keep rolling 24h lookback across month boundaries and clamp output days", () => {
+  const sourceRows = [
+    { timeseries_id: 2001, station_id: 501, pollutant_code: "no2", observed_at: "2025-01-31T23:05:00.000Z", value: 40 },
+    { timeseries_id: 2001, station_id: 501, pollutant_code: "no2", observed_at: "2025-01-31T23:35:00.000Z", value: 60 },
+    { timeseries_id: 2001, station_id: 501, pollutant_code: "no2", observed_at: "2025-02-01T00:10:00.000Z", value: 70 },
+    { timeseries_id: 2001, station_id: 501, pollutant_code: "no2", observed_at: "2025-02-01T00:40:00.000Z", value: 90 },
+    { timeseries_id: 2002, station_id: 501, pollutant_code: "pm25", observed_at: "2025-01-31T23:10:00.000Z", value: 24 },
+    { timeseries_id: 2002, station_id: 501, pollutant_code: "pm25", observed_at: "2025-02-01T00:10:00.000Z", value: 36 },
+    { timeseries_id: 2002, station_id: 501, pollutant_code: "pm25", observed_at: "2025-02-01T01:10:00.000Z", value: 12 },
+    { timeseries_id: 2003, station_id: 501, pollutant_code: "pm10", observed_at: "2025-01-31T23:20:00.000Z", value: 30 },
+    { timeseries_id: 2003, station_id: 501, pollutant_code: "pm10", observed_at: "2025-02-01T00:20:00.000Z", value: 60 },
+    { timeseries_id: 2003, station_id: 501, pollutant_code: "pm10", observed_at: "2025-02-01T01:20:00.000Z", value: 90 },
+    { timeseries_id: 2002, station_id: 501, pollutant_code: "pm25", observed_at: "2025-02-02T00:05:00.000Z", value: 99 },
+  ];
+
+  const output = buildAqilevelHistoryRowsByDayFromSourceObservations({
+    rows: sourceRows,
+    fromDayUtc: "2025-02-01",
+    toDayUtc: "2025-02-01",
+  });
+
+  assert.deepEqual(output.map((entry) => entry.day_utc), ["2025-02-01"]);
+  assert.equal(output[0].rows.length, 2);
+  assert.equal(output[0].rows[0].timestamp_hour_utc, "2025-02-01T00:00:00.000Z");
+  assert.equal(output[0].rows[0].pm25_rolling24h_mean_ugm3, 30);
+  assert.equal(output[0].rows[0].pm10_rolling24h_mean_ugm3, 45);
+  assert.equal(output[0].rows[0].no2_hourly_sample_count, 2);
+  assert.equal(output[0].rows[0].daqi_no2_index_level, 2);
+  assert.equal(output[0].rows[0].eaqi_no2_index_level, 4);
+  assert.equal(output[0].rows[1].timestamp_hour_utc, "2025-02-01T01:00:00.000Z");
+  assert.equal(output[0].rows[1].pm25_rolling24h_mean_ugm3, 24);
+  assert.equal(output[0].rows[1].pm10_rolling24h_mean_ugm3, 60);
+  assert.equal(output[0].rows.every((row) => row.timestamp_hour_utc < "2025-02-02T00:00:00.000Z"), true);
+});
+
+test("R2 observation AQI build matches the existing source-observation AQI path row-for-row", () => {
+  const connectorId = 4;
+  const bindingByTimeseriesId = new Map([
+    [2001, { timeseries_id: 2001, station_id: 501, station_ref: "station-501", timeseries_ref: "station-501:no2", pollutant_code: "no2" }],
+    [2002, { timeseries_id: 2002, station_id: 501, station_ref: "station-501", timeseries_ref: "station-501:pm25", pollutant_code: "pm25" }],
+    [2003, { timeseries_id: 2003, station_id: 501, station_ref: "station-501", timeseries_ref: "station-501:pm10", pollutant_code: "pm10" }],
+  ]);
+  const r2Rows = [
+    { connector_id: connectorId, timeseries_id: 2001, observed_at: "2025-01-31T23:05:00.000Z", value: 40 },
+    { connector_id: connectorId, timeseries_id: 2001, observed_at: "2025-01-31T23:35:00.000Z", value: 60 },
+    { connector_id: connectorId, timeseries_id: 2001, observed_at: "2025-02-01T00:10:00.000Z", value: 70 },
+    { connector_id: connectorId, timeseries_id: 2001, observed_at: "2025-02-01T00:40:00.000Z", value: 90 },
+    { connector_id: connectorId, timeseries_id: 2002, observed_at: "2025-01-31T23:10:00.000Z", value: 24 },
+    { connector_id: connectorId, timeseries_id: 2002, observed_at: "2025-02-01T00:10:00.000Z", value: 36 },
+    { connector_id: connectorId, timeseries_id: 2002, observed_at: "2025-02-01T01:10:00.000Z", value: 12 },
+    { connector_id: connectorId, timeseries_id: 2003, observed_at: "2025-01-31T23:20:00.000Z", value: 30 },
+    { connector_id: connectorId, timeseries_id: 2003, observed_at: "2025-02-01T00:20:00.000Z", value: 60 },
+    { connector_id: connectorId, timeseries_id: 2003, observed_at: "2025-02-01T01:20:00.000Z", value: 90 },
+  ];
+
+  const sourceRows = mapR2ObservationRowsToSourceObservations({
+    rows: r2Rows,
+    bindingByTimeseriesId,
+    windowStartIso: "2025-01-31T01:00:00.000Z",
+    windowEndIso: "2025-02-02T00:00:00.000Z",
+  });
+  const existingPathRows = buildAqilevelHistoryRowsByDayFromSourceObservations({
+    rows: sourceRows,
+    fromDayUtc: "2025-02-01",
+    toDayUtc: "2025-02-01",
+  })[0].rows.map((row) => ({ connector_id: connectorId, ...row }));
+
+  const r2PathRows = buildAqilevelHistoryRowsByDayFromR2ObservationRows({
+    rows: r2Rows,
+    bindingByTimeseriesId,
+    fromDayUtc: "2025-02-01",
+    toDayUtc: "2025-02-01",
+  })[0].rows.map((row) => ({ connector_id: connectorId, ...row }));
+
+  const sortRows = (rows) => rows.slice().sort((left, right) =>
+    left.connector_id - right.connector_id ||
+    left.station_id - right.station_id ||
+    left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc)
+  );
+
+  assert.deepEqual(sortRows(r2PathRows), sortRows(existingPathRows));
 });

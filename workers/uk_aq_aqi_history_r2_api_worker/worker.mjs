@@ -1,4 +1,4 @@
-import { parquetReadObjects } from "hyparquet";
+import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/aqilevels";
@@ -12,12 +12,26 @@ const MAX_OBSAQIDB_SOURCE_OF_TRUTH_HOURS = MAX_RANGE_DAYS * 24;
 const DEFAULT_OBSAQIDB_TIMEOUT_MS = 10000;
 const MIN_OBSAQIDB_TIMEOUT_MS = 2000;
 const MAX_OBSAQIDB_TIMEOUT_MS = 30000;
+const DEFAULT_PARQUET_ROW_CHUNK_SIZE = 5000;
+const MIN_PARQUET_ROW_CHUNK_SIZE = 500;
+const MAX_PARQUET_ROW_CHUNK_SIZE = 50000;
+const UK_AQ_CORE_SCHEMA_DEFAULT = "uk_aq_core";
 const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set(["/", "/v1/aqi-history"]);
+const AQI_PARQUET_COLUMNS = [
+  "timestamp_hour_utc",
+  "daqi_no2_index_level",
+  "daqi_pm25_rolling24h_index_level",
+  "daqi_pm10_rolling24h_index_level",
+  "eaqi_no2_index_level",
+  "eaqi_pm25_index_level",
+  "eaqi_pm10_index_level",
+];
+const stationConnectorIdCache = new Map();
 
 function corsHeaders() {
   return {
@@ -217,6 +231,26 @@ function buildConnectorManifestKey(prefix, dayUtc, connectorId) {
   return `${prefix}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
 }
 
+function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
+  if (!dayManifest || typeof dayManifest !== "object") {
+    return fallbackKey;
+  }
+  const manifests = Array.isArray(dayManifest.connector_manifests)
+    ? dayManifest.connector_manifests
+    : [];
+  for (const entry of manifests) {
+    const entryConnectorId = Number(entry?.connector_id);
+    if (!Number.isFinite(entryConnectorId) || entryConnectorId !== connectorId) {
+      continue;
+    }
+    const entryKey = String(entry?.manifest_key || "").trim();
+    if (entryKey) {
+      return entryKey;
+    }
+  }
+  return fallbackKey;
+}
+
 async function fetchJsonObjectFromR2(env, key) {
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
@@ -232,28 +266,114 @@ async function fetchJsonObjectFromR2(env, key) {
   return { exists: true, value: parsed };
 }
 
-async function fetchParquetRowsFromR2(env, key) {
+async function fetchFilteredParquetRowsFromR2(env, key, stationId, rowChunkSize) {
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
     return { exists: false, rows: [] };
   }
   const arrayBuffer = await object.arrayBuffer();
-  const rows = await parquetReadObjects({
-    file: arrayBuffer,
-    rowFormat: "object",
-    columns: [
-      "station_id",
-      "timestamp_hour_utc",
-      "daqi_no2_index_level",
-      "daqi_pm25_rolling24h_index_level",
-      "daqi_pm10_rolling24h_index_level",
-      "eaqi_no2_index_level",
-      "eaqi_pm25_index_level",
-      "eaqi_pm10_index_level",
-    ],
+  const metadata = await parquetMetadataAsync(arrayBuffer, { compressors });
+  const schemaColumns = parquetSchema(metadata).children.map((column) =>
+    column.element.name
+  );
+  const stationStatsIndex = schemaColumns.indexOf("station_id");
+  if (stationStatsIndex < 0) {
+    return { exists: true, rows: [] };
+  }
+
+  const outRows = [];
+  let rowGroupStart = 0;
+  for (const rowGroup of metadata.row_groups ?? []) {
+    const rowGroupRows = Number(rowGroup?.num_rows ?? 0);
+    const rowGroupEnd = rowGroupStart + rowGroupRows;
+    if (!Number.isFinite(rowGroupRows) || rowGroupRows <= 0) {
+      rowGroupStart = rowGroupEnd;
+      continue;
+    }
+    const stats = rowGroup?.columns?.[stationStatsIndex]?.meta_data?.statistics;
+    const minStation = Number(stats?.min_value ?? stats?.min);
+    const maxStation = Number(stats?.max_value ?? stats?.max);
+    if (
+      Number.isFinite(minStation) &&
+      Number.isFinite(maxStation) &&
+      (stationId < minStation || stationId > maxStation)
+    ) {
+      rowGroupStart = rowGroupEnd;
+      continue;
+    }
+
+    for (
+      let chunkStart = rowGroupStart;
+      chunkStart < rowGroupEnd;
+      chunkStart += rowChunkSize
+    ) {
+      const chunkEnd = Math.min(rowGroupEnd, chunkStart + rowChunkSize);
+      const stationValues = await readParquetColumnValues(
+        arrayBuffer,
+        metadata,
+        "station_id",
+        chunkStart,
+        chunkEnd,
+      );
+      const matchedIndexes = [];
+      for (let idx = 0; idx < stationValues.length; idx += 1) {
+        const rowStationId = Number(stationValues[idx]);
+        if (Number.isFinite(rowStationId) && rowStationId === stationId) {
+          matchedIndexes.push(idx);
+        }
+      }
+      if (matchedIndexes.length === 0) {
+        continue;
+      }
+
+      const columnValues = {};
+      for (const columnName of AQI_PARQUET_COLUMNS) {
+        columnValues[columnName] = await readParquetColumnValues(
+          arrayBuffer,
+          metadata,
+          columnName,
+          chunkStart,
+          chunkEnd,
+        );
+      }
+      for (const idx of matchedIndexes) {
+        const row = { station_id: stationId };
+        for (const columnName of AQI_PARQUET_COLUMNS) {
+          const values = columnValues[columnName];
+          row[columnName] = idx < values.length ? values[idx] : undefined;
+        }
+        outRows.push(row);
+      }
+    }
+
+    rowGroupStart = rowGroupEnd;
+  }
+
+  return { exists: true, rows: outRows };
+}
+
+async function readParquetColumnValues(
+  file,
+  metadata,
+  columnName,
+  rowStart,
+  rowEnd,
+) {
+  let rows = [];
+  await parquetRead({
+    file,
+    metadata,
+    columns: [columnName],
+    rowStart,
+    rowEnd,
     compressors,
+    onComplete: (columnRows) => {
+      if (Array.isArray(columnRows)) {
+        rows = columnRows;
+      }
+    },
   });
-  return { exists: true, rows: Array.isArray(rows) ? rows : [] };
+  return rows.map((entry) => Array.isArray(entry) ? entry[0] : undefined);
 }
 
 function maxFiniteIndex(values, maxValue) {
@@ -319,6 +439,118 @@ function buildEmptyRecentRead(status = "not_requested", error = null) {
     points: [],
     status,
     error,
+  };
+}
+
+async function fetchObsAqiDbArray({
+  env,
+  path,
+  schema,
+  queryParams,
+}) {
+  const baseUrl = normalizeBaseUrl(env.OBS_AQIDB_SUPABASE_URL || "");
+  const apiKey = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
+  if (!baseUrl || !apiKey) {
+    throw new Error(
+      "Missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY for recent AQI reads.",
+    );
+  }
+
+  const timeoutMs = parsePositiveInt(
+    env.UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS,
+    DEFAULT_OBSAQIDB_TIMEOUT_MS,
+    MIN_OBSAQIDB_TIMEOUT_MS,
+    MAX_OBSAQIDB_TIMEOUT_MS,
+  );
+
+  const endpoint = new URL(`${baseUrl}/rest/v1/${path}`);
+  for (const [key, value] of queryParams) {
+    endpoint.searchParams.append(key, value);
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        apikey: apiKey,
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+        "Accept-Profile": schema,
+        "x-ukaq-egress-caller": "uk_aq_aqi_history_r2_api_worker",
+      },
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(`ObsAQIDB request timed out for ${schema}.${path}.`);
+    }
+    throw new Error(`ObsAQIDB request failed for ${schema}.${path}: ${String(error)}`);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const responseText = await response.text();
+  let payload = null;
+  try {
+    payload = responseText ? JSON.parse(responseText) : null;
+  } catch (_error) {
+    payload = null;
+  }
+  if (!response.ok || !Array.isArray(payload)) {
+    const message = payload && typeof payload === "object"
+      ? (payload.message || payload.error || payload.hint || JSON.stringify(payload))
+      : responseText;
+    throw new Error(
+      `ObsAQIDB response failed for ${schema}.${path} (${response.status}): ${
+        String(message || "unknown error")
+      }`,
+    );
+  }
+
+  return {
+    source_path: `${schema}.${path}`,
+    rows: payload,
+  };
+}
+
+async function readStationConnectorIdFromObsAqiDb({
+  env,
+  stationId,
+}) {
+  if (stationConnectorIdCache.has(stationId)) {
+    const cached = stationConnectorIdCache.get(stationId) || {};
+    return {
+      source_path: String(cached.source_path || `${UK_AQ_CORE_SCHEMA_DEFAULT}.stations`),
+      connector_id: cached.connector_id ?? null,
+      cache_hit: true,
+    };
+  }
+
+  const schema = String(env.UK_AQ_CORE_SCHEMA || UK_AQ_CORE_SCHEMA_DEFAULT).trim()
+    || UK_AQ_CORE_SCHEMA_DEFAULT;
+  const result = await fetchObsAqiDbArray({
+    env,
+    path: "stations",
+    schema,
+    queryParams: [
+      ["select", "id,connector_id"],
+      ["id", `eq.${stationId}`],
+      ["limit", "1"],
+    ],
+  });
+  const firstRow = Array.isArray(result.rows) ? result.rows[0] : null;
+  const connectorId = parseRequiredPositiveInt(firstRow?.connector_id);
+  stationConnectorIdCache.set(stationId, {
+    source_path: result.source_path,
+    connector_id: connectorId,
+  });
+  return {
+    source_path: result.source_path,
+    connector_id: connectorId,
+    cache_hit: false,
   };
 }
 
@@ -415,6 +647,7 @@ function appendFilteredRows(rows, {
 async function readHistoryRows({
   env,
   historyPrefix,
+  connectorId,
   stationId,
   startIso,
   endIso,
@@ -425,6 +658,12 @@ async function readHistoryRows({
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
   const sinceMs = sinceIso ? Date.parse(sinceIso) : Number.NaN;
+  const parquetRowChunkSize = parsePositiveInt(
+    env.UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE,
+    DEFAULT_PARQUET_ROW_CHUNK_SIZE,
+    MIN_PARQUET_ROW_CHUNK_SIZE,
+    MAX_PARQUET_ROW_CHUNK_SIZE,
+  );
 
   const days = listUtcDays(startIso, endIso);
   const rowsByPeriodStart = new Map();
@@ -442,17 +681,43 @@ async function readHistoryRows({
       continue;
     }
 
-    const connectorManifestEntries = Array.isArray(dayManifestObject.value?.connector_manifests)
-      ? dayManifestObject.value.connector_manifests
-      : [];
+    const connectorManifestTargets = [];
+    if (Number.isFinite(connectorId) && connectorId > 0) {
+      const connectorManifestFallbackKey = buildConnectorManifestKey(
+        historyPrefix,
+        dayUtc,
+        connectorId,
+      );
+      connectorManifestTargets.push({
+        connector_id: connectorId,
+        manifest_key: findConnectorManifestKey(
+          dayManifestObject.value,
+          connectorId,
+          connectorManifestFallbackKey,
+        ),
+      });
+    } else {
+      const connectorManifestEntries = Array.isArray(dayManifestObject.value?.connector_manifests)
+        ? dayManifestObject.value.connector_manifests
+        : [];
+      for (const connectorManifestEntry of connectorManifestEntries) {
+        const entryConnectorId = Number(connectorManifestEntry?.connector_id);
+        if (!Number.isFinite(entryConnectorId) || entryConnectorId <= 0) {
+          continue;
+        }
+        connectorManifestTargets.push({
+          connector_id: entryConnectorId,
+          manifest_key: String(connectorManifestEntry?.manifest_key || "").trim()
+            || buildConnectorManifestKey(historyPrefix, dayUtc, entryConnectorId),
+        });
+      }
+    }
 
-    for (const connectorManifestEntry of connectorManifestEntries) {
-      const connectorId = Number(connectorManifestEntry?.connector_id);
-      if (!Number.isFinite(connectorId) || connectorId <= 0) {
+    for (const connectorManifestTarget of connectorManifestTargets) {
+      const connectorManifestKey = String(connectorManifestTarget.manifest_key || "").trim();
+      if (!connectorManifestKey) {
         continue;
       }
-      const connectorManifestKey = String(connectorManifestEntry?.manifest_key || "").trim()
-        || buildConnectorManifestKey(historyPrefix, dayUtc, connectorId);
 
       scannedConnectorManifests += 1;
       const connectorManifestObject = await fetchJsonObjectFromR2(env, connectorManifestKey);
@@ -471,7 +736,12 @@ async function readHistoryRows({
           continue;
         }
         scannedParquetKeys.add(parquetKey);
-        const parquet = await fetchParquetRowsFromR2(env, parquetKey);
+        const parquet = await fetchFilteredParquetRowsFromR2(
+          env,
+          parquetKey,
+          stationId,
+          parquetRowChunkSize,
+        );
         if (!parquet.exists) {
           missingParquetKeys.add(parquetKey);
           continue;
@@ -508,97 +778,37 @@ async function readRecentRowsFromObsAqiDb({
   sinceIso,
   pollutantKey,
 }) {
-  const baseUrl = normalizeBaseUrl(env.OBS_AQIDB_SUPABASE_URL || "");
-  const apiKey = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
-  if (!baseUrl || !apiKey) {
-    throw new Error(
-      "Missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY for recent AQI reads.",
-    );
-  }
-
   const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim()
     || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
-  const timeoutMs = parsePositiveInt(
-    env.UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS,
-    DEFAULT_OBSAQIDB_TIMEOUT_MS,
-    MIN_OBSAQIDB_TIMEOUT_MS,
-    MAX_OBSAQIDB_TIMEOUT_MS,
-  );
-
-  const endpoint = new URL(`${baseUrl}/rest/v1/uk_aq_station_aqi_hourly`);
-  endpoint.searchParams.set(
-    "select",
-    [
-      "station_id",
-      "timestamp_hour_utc",
-      "daqi_no2_index_level",
-      "daqi_pm25_rolling24h_index_level",
-      "daqi_pm10_rolling24h_index_level",
-      "eaqi_no2_index_level",
-      "eaqi_pm25_index_level",
-      "eaqi_pm10_index_level",
-    ].join(","),
-  );
-  endpoint.searchParams.append("station_id", `eq.${stationId}`);
-  endpoint.searchParams.append(
-    "timestamp_hour_utc",
-    `gte.${startIso}`,
-  );
-  endpoint.searchParams.append(
-    "timestamp_hour_utc",
-    `lt.${endIso}`,
-  );
-  if (sinceIso) {
-    endpoint.searchParams.append(
-      "timestamp_hour_utc",
-      `gt.${sinceIso}`,
-    );
-  }
-  endpoint.searchParams.set("order", "timestamp_hour_utc.asc");
-  endpoint.searchParams.set("limit", String(MAX_LIMIT));
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  let response;
-  try {
-    response = await fetch(endpoint.toString(), {
-      method: "GET",
-      headers: {
-        apikey: apiKey,
-        Authorization: `Bearer ${apiKey}`,
-        Accept: "application/json",
-        "Accept-Profile": schema,
-        "x-ukaq-egress-caller": "uk_aq_aqi_history_r2_api_worker",
-      },
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("ObsAQIDB request timed out.");
-    }
-    throw new Error(`ObsAQIDB request failed: ${String(error)}`);
-  } finally {
-    clearTimeout(timeoutId);
-  }
-
-  const responseText = await response.text();
-  let payload = null;
-  try {
-    payload = responseText ? JSON.parse(responseText) : null;
-  } catch (_error) {
-    payload = null;
-  }
-  if (!response.ok || !Array.isArray(payload)) {
-    const message = payload && typeof payload === "object"
-      ? (payload.message || payload.error || payload.hint || JSON.stringify(payload))
-      : responseText;
-    throw new Error(
-      `ObsAQIDB response failed (${response.status}): ${String(message || "unknown error")}`,
-    );
-  }
+  const result = await fetchObsAqiDbArray({
+    env,
+    path: "uk_aq_station_aqi_hourly",
+    schema,
+    queryParams: [
+      [
+        "select",
+        [
+          "station_id",
+          "timestamp_hour_utc",
+          "daqi_no2_index_level",
+          "daqi_pm25_rolling24h_index_level",
+          "daqi_pm10_rolling24h_index_level",
+          "eaqi_no2_index_level",
+          "eaqi_pm25_index_level",
+          "eaqi_pm10_index_level",
+        ].join(","),
+      ],
+      ["station_id", `eq.${stationId}`],
+      ["timestamp_hour_utc", `gte.${startIso}`],
+      ["timestamp_hour_utc", `lt.${endIso}`],
+      ...(sinceIso ? [["timestamp_hour_utc", `gt.${sinceIso}`]] : []),
+      ["order", "timestamp_hour_utc.asc"],
+      ["limit", String(MAX_LIMIT)],
+    ],
+  });
 
   const rowsByPeriodStart = new Map();
-  appendFilteredRows(payload, {
+  appendFilteredRows(result.rows, {
     stationId,
     startMs: Date.parse(startIso),
     endMs: Date.parse(endIso),
@@ -608,7 +818,7 @@ async function readRecentRowsFromObsAqiDb({
   });
 
   return {
-    source_path: `${schema}.uk_aq_station_aqi_hourly`,
+    source_path: result.source_path,
     points: normalizeAndSortRows(rowsByPeriodStart, null),
   };
 }
@@ -770,11 +980,40 @@ async function handleRequest(request, env) {
   const recentEndMs = endMs;
   const hasHistoryWindow = historyEndMs > historyStartMs;
   const hasRecentWindow = recentEndMs > recentStartMs;
+  let stationConnectorId = null;
+  let stationConnectorSourcePath = null;
+  let stationConnectorLookupError = null;
+  let stationConnectorCacheHit = false;
+  let stationConnectorLookupAttempted = false;
+
+  const resolveStationConnectorId = async () => {
+    if (stationConnectorLookupAttempted) {
+      return stationConnectorId;
+    }
+    stationConnectorLookupAttempted = true;
+    try {
+      const lookup = await readStationConnectorIdFromObsAqiDb({
+        env,
+        stationId,
+      });
+      stationConnectorId = lookup.connector_id;
+      stationConnectorSourcePath = lookup.source_path;
+      stationConnectorCacheHit = lookup.cache_hit;
+    } catch (error) {
+      stationConnectorLookupError = error instanceof Error ? error.message : String(error);
+    }
+    return stationConnectorId;
+  };
+
+  const historyConnectorId = hasHistoryWindow
+    ? await resolveStationConnectorId()
+    : null;
 
   const historyRead = hasHistoryWindow
     ? await readHistoryRows({
       env,
       historyPrefix,
+      connectorId: historyConnectorId,
       stationId,
       startIso: new Date(historyStartMs).toISOString(),
       endIso: new Date(historyEndMs).toISOString(),
@@ -810,9 +1049,11 @@ async function handleRequest(request, env) {
       // Keep the endpoint available when the live ObsAQIDB slice is unavailable by
       // falling back to R2 for the same recent window on a best-effort basis.
       try {
+        const recentFallbackConnectorId = await resolveStationConnectorId();
         recentHistoryFallbackRead = await readHistoryRows({
           env,
           historyPrefix,
+          connectorId: recentFallbackConnectorId,
           stationId,
           startIso: new Date(recentStartMs).toISOString(),
           endIso: new Date(recentEndMs).toISOString(),
@@ -877,6 +1118,12 @@ async function handleRequest(request, env) {
       missing_day_manifest_keys: historyRead.missing_day_manifest_keys,
       missing_connector_manifest_keys: historyRead.missing_connector_manifest_keys,
       missing_parquet_keys: historyRead.missing_parquet_keys,
+      station_connector_id: stationConnectorId,
+      station_connector_lookup_source_path: stationConnectorSourcePath,
+      station_connector_lookup_error: stationConnectorLookupError,
+      station_connector_lookup_cache_hit: stationConnectorLookupAttempted
+        ? stationConnectorCacheHit
+        : false,
       obs_aqidb_source_path: recentRead.source_path,
       obs_aqidb_row_count: recentRead.points.length,
       obs_aqidb_status: recentRead.status,

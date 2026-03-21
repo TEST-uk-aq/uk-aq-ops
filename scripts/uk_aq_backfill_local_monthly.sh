@@ -4,6 +4,14 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage (all available source adapters/connectors):
+  export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
+  export UK_AQ_BACKFILL_DRY_RUN="false"
+  export UK_AQ_BACKFILL_FORCE_REPLACE="true"
+  export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
+  export UK_AQ_BACKFILL_TO_DAY_UTC="2025-01-31"
+  ./scripts/uk_aq_backfill_local_monthly.sh
+
+Source adapter export to R2:
   export UK_AQ_BACKFILL_RUN_MODE="source_to_r2"
   export UK_AQ_BACKFILL_DRY_RUN="false"
   export UK_AQ_BACKFILL_FORCE_REPLACE="false"
@@ -25,6 +33,7 @@ Optional env vars:
 Notes:
   - This script calls workers/uk_aq_backfill_cloud_run/run_job.ts once per month.
   - With UK_AQ_BACKFILL_FORCE_REPLACE=false, already-backed-up connector/day outputs are skipped.
+  - r2_history_obs_to_aqilevels reads committed history/v1/observations manifests/parquet only and rewrites history/v1/aqilevels outputs.
   - Leave UK_AQ_BACKFILL_CONNECTOR_IDS unset to include all currently supported source adapters.
 USAGE
 }
@@ -127,7 +136,7 @@ STOP_ON_ERROR_RAW="$(trim "${UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR:-true}")"
 MONTH_RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS:-0}}")"
 
 case "${RUN_MODE}" in
-  local_to_aqilevels|obs_aqi_to_r2|source_to_r2) ;;
+  local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
   *)
     echo "Invalid UK_AQ_BACKFILL_RUN_MODE: ${RUN_MODE}" >&2
     exit 2
@@ -231,6 +240,11 @@ while IFS=' ' read -r month_from month_to; do
   echo ""
   echo "=== Month ${month_count}: ${month_from} -> ${month_to} ==="
   echo "Log: ${log_file}"
+  echo "Run mode: ${RUN_MODE}"
+  echo "Requested window: ${REQUESTED_FROM_DAY_UTC} -> ${REQUESTED_TO_DAY_UTC}"
+  echo "Actual month window: ${month_from} -> ${month_to}"
+  echo "Connector filter: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
+  echo "Force replace: ${FORCE_REPLACE}"
 
   export UK_AQ_BACKFILL_TRIGGER_MODE="${TRIGGER_MODE}"
   export UK_AQ_BACKFILL_RUN_MODE="${RUN_MODE}"
@@ -265,7 +279,7 @@ if [[ "${#failures[@]}" -gt 0 ]]; then
   exit 1
 fi
 
-if [[ "${RUN_MODE}" == "source_to_r2" && "${DRY_RUN}" == "false" ]]; then
+if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MODE}" == "r2_history_obs_to_aqilevels" ) ]]; then
   index_log_file="${LOG_DIR}/r2_history_index_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
   echo ""
   echo "=== Rebuild R2 History Index ==="

@@ -8,6 +8,7 @@ Current implementation status (Phase 9, incremental):
 - `obs_aqi_to_r2`: implemented (dry-run planning + non-dry R2 export/write path).
 - `source_to_r2`: implemented for UK-AIR SOS, Sensor.Community, and OpenAQ source-to-R2 flows (metadata-filtered observations + aqilevels manifests written to R2).
   - Breathe London is also implemented, using the current public `getClarityData` API path as the nearest working equivalent to the planned `/SensorData` historical flow.
+- `r2_history_obs_to_aqilevels`: implemented for AQI rebuild directly from committed `history/v1/observations` parquet/manifests, writing refreshed committed AQI history back to `history/v1/aqilevels`.
 
 ## Endpoints
 
@@ -78,6 +79,13 @@ All fields are optional unless noted.
     - `timeseries_ref = existing UK-AIR SOS upstream timeseries id`
   - Sensor.Community filters by known `station_ref` (`sensor_id`).
   - OpenAQ uses candidate UK `location_id` from existing OpenAQ stations (`station_ref`) and maps source records with:
+
+- `r2_history_obs_to_aqilevels`
+  - discovers day+connector scope from committed observation day manifests only.
+  - reads committed observation parquet parts from `history/v1/observations/...`.
+  - reuses the existing AQI derivation path for hourly means, rolling 24-hour PM means, sample counts, and DAQI/EAQI levels.
+  - writes committed AQI parquet parts plus connector/day manifests back to `history/v1/aqilevels/...`.
+  - `force_replace=true` removes old AQI connector payloads for the targeted day+connector and rebuilds the AQI day manifest from the refreshed connector manifests.
     - `station_ref = OpenAQ location_id`
     - `timeseries_ref = OpenAQ sensor_id`
   - parses raw observations to canonical `timeseries_id, observed_at, value` rows.

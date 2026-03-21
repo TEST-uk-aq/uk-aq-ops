@@ -142,6 +142,7 @@ Primary controls:
   - `local_to_aqilevels` (Phase 1 implemented)
   - `obs_aqi_to_r2` (implemented: dry-run planning + non-dry R2 export for both `observations` and `aqilevels` domains)
   - `source_to_r2` (Phase 1 stubbed)
+  - `r2_history_obs_to_aqilevels` (implemented: reads committed `history/v1/observations` parquet/manifests and rewrites committed `history/v1/aqilevels` without obs_aqidb reads)
 - `local_to_aqilevels` behavior:
   - UTC-day backfill with newest day first
   - optional connector filter
@@ -151,6 +152,11 @@ Primary controls:
   - retryable hourly AQI write timeouts now split the affected batch into smaller chunks automatically before the connector/day is failed
   - default skip if checkpoint already complete; `force_replace` bypasses skip
   - dry-run support with write estimates
+- `r2_history_obs_to_aqilevels` behavior:
+  - uses committed observations day manifests as the source of truth for which day+connector partitions exist
+  - reads only `history/v1/observations/...` parquet parts plus the prior-hour lookback needed for rolling 24-hour AQI values
+  - writes compatible `history/v1/aqilevels/...` connector/day manifests back to the committed AQI tree
+  - `force_replace=true` removes old AQI connector objects for the targeted day+connector and rebuilds the AQI day manifest from the refreshed connector manifests
 - minimal run/day/checkpoint ledger wiring in `uk_aq_ops` (if schema is applied)
 
 ### 10) Cache Proxy Worker (`workers/uk_aq_cache_proxy/src/index.ts`)
