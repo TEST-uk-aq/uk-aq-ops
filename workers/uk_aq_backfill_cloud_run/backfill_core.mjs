@@ -47,6 +47,99 @@ const RETRYABLE_SOURCE_FETCH_ERROR_SNIPPETS = [
   "enotfound",
   "eai_again",
 ];
+const RETRYABLE_AQILEVELS_WRITE_ERROR_SNIPPETS = [
+  "statement timeout",
+  "canceling statement due to statement timeout",
+  "http 504",
+  "gateway timeout",
+];
+
+export const DAQI_NO2_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 67, level: 1 },
+  { low: 67, high: 134, level: 2 },
+  { low: 134, high: 200, level: 3 },
+  { low: 200, high: 267, level: 4 },
+  { low: 267, high: 334, level: 5 },
+  { low: 334, high: 400, level: 6 },
+  { low: 400, high: 467, level: 7 },
+  { low: 467, high: 534, level: 8 },
+  { low: 534, high: 600, level: 9 },
+  { low: 600, high: null, level: 10 },
+]);
+
+export const DAQI_PM25_ROLLING24H_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 11, level: 1 },
+  { low: 11, high: 23, level: 2 },
+  { low: 23, high: 35, level: 3 },
+  { low: 35, high: 41, level: 4 },
+  { low: 41, high: 47, level: 5 },
+  { low: 47, high: 53, level: 6 },
+  { low: 53, high: 58, level: 7 },
+  { low: 58, high: 64, level: 8 },
+  { low: 64, high: 70, level: 9 },
+  { low: 70, high: null, level: 10 },
+]);
+
+export const DAQI_PM10_ROLLING24H_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 16, level: 1 },
+  { low: 16, high: 33, level: 2 },
+  { low: 33, high: 50, level: 3 },
+  { low: 50, high: 58, level: 4 },
+  { low: 58, high: 66, level: 5 },
+  { low: 66, high: 75, level: 6 },
+  { low: 75, high: 83, level: 7 },
+  { low: 83, high: 91, level: 8 },
+  { low: 91, high: 100, level: 9 },
+  { low: 100, high: null, level: 10 },
+]);
+
+export const EAQI_NO2_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 10, level: 1 },
+  { low: 10, high: 25, level: 2 },
+  { low: 25, high: 60, level: 3 },
+  { low: 60, high: 100, level: 4 },
+  { low: 100, high: 150, level: 5 },
+  { low: 150, high: null, level: 6 },
+]);
+
+export const EAQI_PM25_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 5, level: 1 },
+  { low: 5, high: 15, level: 2 },
+  { low: 15, high: 50, level: 3 },
+  { low: 50, high: 90, level: 4 },
+  { low: 90, high: 140, level: 5 },
+  { low: 140, high: null, level: 6 },
+]);
+
+export const EAQI_PM10_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 15, level: 1 },
+  { low: 15, high: 45, level: 2 },
+  { low: 45, high: 120, level: 3 },
+  { low: 120, high: 195, level: 4 },
+  { low: 195, high: 270, level: 5 },
+  { low: 270, high: null, level: 6 },
+]);
+
+export function lookupAqiIndexLevel(value, breakpoints) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
+  }
+  if (!Array.isArray(breakpoints) || breakpoints.length === 0) {
+    return null;
+  }
+  const firstLow = Number(breakpoints[0]?.low);
+  if (!Number.isFinite(firstLow) || value < firstLow) {
+    return null;
+  }
+  // Breakpoints are matched by ordered inclusive upper bound so decimal values
+  // between published integer legend thresholds still resolve without gaps.
+  for (const breakpoint of breakpoints) {
+    if (breakpoint.high === null || value <= breakpoint.high) {
+      return breakpoint.level;
+    }
+  }
+  return null;
+}
 
 export function parseRunMode(raw, fallback = "local_to_aqilevels") {
   const value = String(raw || "").trim().toLowerCase();
@@ -94,6 +187,30 @@ export function parsePositiveInt(raw, fallback, min = 1, max = 1_000_000) {
     return max;
   }
   return intValue;
+}
+
+export function isRetryableAqilevelsWriteError(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (!value) {
+    return false;
+  }
+  return RETRYABLE_AQILEVELS_WRITE_ERROR_SNIPPETS.some((snippet) =>
+    value.includes(snippet)
+  );
+}
+
+export function splitChunkLengthForRetry(chunkLength, minChunkLength = 1) {
+  const normalizedLength = Math.trunc(Number(chunkLength));
+  const normalizedMin = Math.max(1, Math.trunc(Number(minChunkLength) || 1));
+  if (!Number.isFinite(normalizedLength) || normalizedLength <= normalizedMin) {
+    return null;
+  }
+  const leftLength = Math.ceil(normalizedLength / 2);
+  const rightLength = normalizedLength - leftLength;
+  if (leftLength < 1 || rightLength < 1) {
+    return null;
+  }
+  return [leftLength, rightLength];
 }
 
 export function parseIsoDayUtc(raw) {
@@ -165,6 +282,163 @@ export function normalizeDayRange({ fromDayUtc, toDayUtc, defaultDayUtc }) {
     from_day_utc: normalizedFrom,
     to_day_utc: normalizedTo,
   };
+}
+
+function normalizeIsoTimestamp(raw) {
+  if (raw instanceof Date) {
+    if (Number.isNaN(raw.getTime())) {
+      return null;
+    }
+    return raw.toISOString();
+  }
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) {
+      return null;
+    }
+    return new Date(raw).toISOString();
+  }
+  const text = String(raw || "").trim();
+  if (!text) {
+    return null;
+  }
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return new Date(parsed).toISOString();
+}
+
+export function buildCoveredIsoDaysForUtcRange(
+  windowStartIso,
+  windowEndExclusiveIso,
+) {
+  const normalizedStartIso = normalizeIsoTimestamp(windowStartIso);
+  const normalizedEndIso = normalizeIsoTimestamp(windowEndExclusiveIso);
+  if (!(normalizedStartIso && normalizedEndIso)) {
+    throw new Error("Invalid UTC timestamp range");
+  }
+  if (normalizedEndIso <= normalizedStartIso) {
+    return [];
+  }
+
+  const startDay = parseIsoDayUtc(normalizedStartIso.slice(0, 10));
+  const endExclusiveDay = parseIsoDayUtc(normalizedEndIso.slice(0, 10));
+  if (!(startDay && endExclusiveDay)) {
+    throw new Error("Invalid UTC day range");
+  }
+
+  const lastIncludedDay = shiftIsoDay(endExclusiveDay, -1);
+  if (compareIsoDay(lastIncludedDay, startDay) < 0) {
+    return [];
+  }
+
+  const days = [];
+  let cursor = startDay;
+  while (compareIsoDay(cursor, lastIncludedDay) <= 0) {
+    days.push(cursor);
+    cursor = shiftIsoDay(cursor, 1);
+  }
+  return days;
+}
+
+export function mapR2ObservationRowsToSourceObservations({
+  rows,
+  bindingByTimeseriesId,
+  windowStartIso,
+  windowEndIso,
+  stationIdFilter = null,
+}) {
+  if (!(bindingByTimeseriesId instanceof Map)) {
+    throw new Error("bindingByTimeseriesId must be a Map");
+  }
+
+  const normalizedStartIso = normalizeIsoTimestamp(windowStartIso);
+  const normalizedEndIso = normalizeIsoTimestamp(windowEndIso);
+  if (!(normalizedStartIso && normalizedEndIso)) {
+    throw new Error("Invalid UTC timestamp range");
+  }
+
+  const stationFilter = Array.isArray(stationIdFilter)
+    ? new Set(
+      stationIdFilter
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+        .map((value) => Math.trunc(value)),
+    )
+    : stationIdFilter instanceof Set
+    ? new Set(
+      Array.from(stationIdFilter)
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+        .map((value) => Math.trunc(value)),
+    )
+    : null;
+
+  const observations = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    const timeseriesId = Number(row.timeseries_id);
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) {
+      continue;
+    }
+    const binding = bindingByTimeseriesId.get(Math.trunc(timeseriesId));
+    if (!binding) {
+      continue;
+    }
+    if (
+      !(
+        binding.pollutant_code === "no2" || binding.pollutant_code === "pm25" ||
+        binding.pollutant_code === "pm10"
+      )
+    ) {
+      continue;
+    }
+    if (
+      stationFilter && !stationFilter.has(Math.trunc(Number(binding.station_id)))
+    ) {
+      continue;
+    }
+    const observedAtIso = normalizeIsoTimestamp(row.observed_at);
+    if (!observedAtIso) {
+      continue;
+    }
+    if (
+      observedAtIso < normalizedStartIso || observedAtIso >= normalizedEndIso
+    ) {
+      continue;
+    }
+    const rawValue = row.value;
+    if (
+      rawValue === null || rawValue === undefined ||
+      (typeof rawValue === "string" && !rawValue.trim())
+    ) {
+      continue;
+    }
+    const value = Number(rawValue);
+    if (!Number.isFinite(value) || value < 0) {
+      continue;
+    }
+
+    observations.push({
+      timeseries_id: Math.trunc(timeseriesId),
+      station_id: Math.trunc(Number(binding.station_id)),
+      pollutant_code: binding.pollutant_code,
+      observed_at: observedAtIso,
+      value,
+    });
+  }
+
+  observations.sort((left, right) => {
+    if (left.timeseries_id !== right.timeseries_id) {
+      return left.timeseries_id - right.timeseries_id;
+    }
+    if (left.observed_at < right.observed_at) return -1;
+    if (left.observed_at > right.observed_at) return 1;
+    return 0;
+  });
+  return observations;
 }
 
 export function parseConnectorIds(raw) {

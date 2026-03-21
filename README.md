@@ -145,7 +145,10 @@ Primary controls:
 - `local_to_aqilevels` behavior:
   - UTC-day backfill with newest day first
   - optional connector filter
-  - source priority: ingest -> obs_aqidb -> explicit R2 History fallback
+  - source priority: ingest -> obs_aqidb -> explicit R2 observations-history fallback
+  - when `UK_AQ_BACKFILL_ENABLE_R2_FALLBACK=true`, historical all-connector runs can discover connector ids from committed observations day manifests in R2 even when local DB fingerprint counts are empty for those days
+  - R2 fallback rebuilds source hourly rows from committed `history/v1/observations/...` parquet for the target day plus the prior UTC day needed for the AQI rolling 24-hour lookback window
+  - retryable hourly AQI write timeouts now split the affected batch into smaller chunks automatically before the connector/day is failed
   - default skip if checkpoint already complete; `force_replace` bypasses skip
   - dry-run support with write estimates
 - minimal run/day/checkpoint ledger wiring in `uk_aq_ops` (if schema is applied)
@@ -259,5 +262,6 @@ Apply in Supabase SQL editor:
 - `system_docs/uk-aq-aqilevels-retention.md`
 - `system_docs/uk-aq-station-aqi-hourly.md`
 - `system_docs/uk-aq-backfill-cloud-run.md`
+- `system_docs/uk-aq-r2-history-layout.md`
 - `system_docs/uk-aq-r2-history-dropbox-backup.md`
 - `system_docs/uk-aq-cache-proxy.md`
