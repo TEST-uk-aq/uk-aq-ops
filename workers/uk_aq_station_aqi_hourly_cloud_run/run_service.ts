@@ -3,7 +3,7 @@ import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 const PORT = Number(Deno.env.get("PORT") || "8000");
 const RUN_JOB_SCRIPT = "/app/workers/uk_aq_station_aqi_hourly_cloud_run/run_job.ts";
 const ALLOWED_TRIGGER_MODES = new Set(["scheduler", "manual"]);
-const ALLOWED_RUN_MODES = new Set(["sync_hourly", "backfill"]);
+const ALLOWED_RUN_MODES = new Set(["sync_hourly", "backfill", "reconcile_short", "reconcile_deep"]);
 
 let inFlight = false;
 

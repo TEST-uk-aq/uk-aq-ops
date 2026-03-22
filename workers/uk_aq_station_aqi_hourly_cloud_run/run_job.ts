@@ -5,7 +5,7 @@ type RpcResult<T> = {
   error: RpcError | null;
 };
 
-type RunMode = "sync_hourly" | "backfill";
+type RunMode = "sync_hourly" | "backfill" | "reconcile_short" | "reconcile_deep";
 
 type HelperRow = {
   station_id: number;
@@ -64,6 +64,14 @@ const RUN_CLEANUP_RPC = (Deno.env.get("UK_AQ_AQI_RUN_CLEANUP_RPC") ||
   "uk_aq_rpc_aqi_compute_runs_cleanup").trim();
 
 const RUN_MODE = parseRunMode(Deno.env.get("UK_AQ_AQI_RUN_MODE"), "sync_hourly");
+const RECONCILE_SHORT_HOURS = parsePositiveInt(
+  Deno.env.get("UK_AQ_AQI_RECONCILE_SHORT_HOURS"),
+  8,
+);
+const RECONCILE_DEEP_HOURS = parsePositiveInt(
+  Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_HOURS"),
+  36,
+);
 const TRIGGER_MODE = (Deno.env.get("UK_AQ_AQI_TRIGGER_MODE") || "manual").trim() || "manual";
 const MATURITY_DELAY_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_MATURITY_DELAY_HOURS"),
@@ -120,7 +128,12 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 
 function parseRunMode(raw: string | undefined, fallback: RunMode): RunMode {
   const value = (raw || "").trim().toLowerCase();
-  if (value === "sync_hourly" || value === "backfill") {
+  if (
+    value === "sync_hourly" ||
+    value === "backfill" ||
+    value === "reconcile_short" ||
+    value === "reconcile_deep"
+  ) {
     return value;
   }
   return fallback;
@@ -252,6 +265,14 @@ function hourIso(date: Date): string {
   return floorUtcHour(date).toISOString();
 }
 
+function buildRollingWindow(referenceHourEnd: Date, hours: number): SyncWindow {
+  return {
+    hourEndStartExclusive: addHours(referenceHourEnd, -hours),
+    hourEndEndInclusive: referenceHourEnd,
+    referenceHourEnd,
+  };
+}
+
 function runWindow(nowUtc: Date): SyncWindow {
   const totalDelayMs =
     MATURITY_DELAY_HOURS * ONE_HOUR_MS + MATURITY_DELAY_BUFFER_MINUTES * ONE_MINUTE_MS;
@@ -273,11 +294,15 @@ function runWindow(nowUtc: Date): SyncWindow {
     };
   }
 
-  return {
-    hourEndStartExclusive: addHours(targetHourEnd, -1),
-    hourEndEndInclusive: targetHourEnd,
-    referenceHourEnd: targetHourEnd,
-  };
+  if (RUN_MODE === "reconcile_short") {
+    return buildRollingWindow(targetHourEnd, RECONCILE_SHORT_HOURS);
+  }
+
+  if (RUN_MODE === "reconcile_deep") {
+    return buildRollingWindow(targetHourEnd, RECONCILE_DEEP_HOURS);
+  }
+
+  return buildRollingWindow(targetHourEnd, 1);
 }
 
 function toNullableNumber(value: unknown): number | null {
@@ -483,7 +508,7 @@ async function main(): Promise<void> {
   }
 
   const durationMs = Date.now() - startedAt;
-  const deepReconcileEffective = null;
+  const deepReconcileEffective = RUN_MODE === "reconcile_deep";
 
   const runLogResult = await postgrestRpc<unknown>(
     OBS_AQIDB_SUPABASE_URL,

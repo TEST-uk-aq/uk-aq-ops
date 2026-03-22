@@ -39,6 +39,12 @@ jobs:
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_STATION_AQI_HOURLY_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
       SCHEDULER_JOB_NAME: ${{ vars.GCP_STATION_AQI_HOURLY_JOB_NAME || 'uk-aq-station-aqi-hourly-trigger' }}
       SCHEDULER_CRON: ${{ vars.GCP_STATION_AQI_HOURLY_CRON || '20 * * * *' }}
+      RECONCILE_SHORT_SCHEDULER_ENABLED: ${{ vars.GCP_STATION_AQI_HOURLY_RECONCILE_SHORT_SCHEDULER_ENABLED || 'false' }}
+      RECONCILE_SHORT_SCHEDULER_JOB_NAME: ${{ vars.GCP_STATION_AQI_HOURLY_RECONCILE_SHORT_JOB_NAME || 'uk-aq-station-aqi-reconcile-short-trigger' }}
+      RECONCILE_SHORT_SCHEDULER_CRON: ${{ vars.GCP_STATION_AQI_HOURLY_RECONCILE_SHORT_CRON || '35 * * * *' }}
+      RECONCILE_DEEP_SCHEDULER_ENABLED: ${{ vars.GCP_STATION_AQI_HOURLY_RECONCILE_DEEP_SCHEDULER_ENABLED || 'false' }}
+      RECONCILE_DEEP_SCHEDULER_JOB_NAME: ${{ vars.GCP_STATION_AQI_HOURLY_RECONCILE_DEEP_JOB_NAME || 'uk-aq-station-aqi-reconcile-deep-trigger' }}
+      RECONCILE_DEEP_SCHEDULER_CRON: ${{ vars.GCP_STATION_AQI_HOURLY_RECONCILE_DEEP_CRON || '50 */6 * * *' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
@@ -49,6 +55,8 @@ jobs:
       UK_AQ_AQI_RUN_CLEANUP_RPC: ${{ vars.UK_AQ_AQI_RUN_CLEANUP_RPC || 'uk_aq_rpc_aqi_compute_runs_cleanup' }}
       UK_AQ_AQI_MATURITY_DELAY_HOURS: ${{ vars.UK_AQ_AQI_MATURITY_DELAY_HOURS || '3' }}
       UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES: ${{ vars.UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES || '10' }}
+      UK_AQ_AQI_RECONCILE_SHORT_HOURS: ${{ vars.UK_AQ_AQI_RECONCILE_SHORT_HOURS || '8' }}
+      UK_AQ_AQI_RECONCILE_DEEP_HOURS: ${{ vars.UK_AQ_AQI_RECONCILE_DEEP_HOURS || '36' }}
       UK_AQ_AQI_RPC_RETRIES: ${{ vars.UK_AQ_AQI_RPC_RETRIES || '3' }}
       UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE: ${{ vars.UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE || '2000' }}
       UK_AQ_AQI_RUN_LOG_RETENTION_DAYS: ${{ vars.UK_AQ_AQI_RUN_LOG_RETENTION_DAYS || '7' }}
@@ -235,6 +243,8 @@ jobs:
           add_env UK_AQ_AQI_RUN_CLEANUP_RPC
           add_env UK_AQ_AQI_MATURITY_DELAY_HOURS
           add_env UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES
+          add_env UK_AQ_AQI_RECONCILE_SHORT_HOURS
+          add_env UK_AQ_AQI_RECONCILE_DEEP_HOURS
           add_env UK_AQ_AQI_RPC_RETRIES
           add_env UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE
           add_env UK_AQ_AQI_RUN_LOG_RETENTION_DAYS
@@ -303,7 +313,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          enabled="$(printf '%s' "${SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          is_truthy() {
+            local value
+            value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+            [ "${value}" = "true" ] || [ "${value}" = "1" ] || [ "${value}" = "yes" ]
+          }
 
           maybe_pause() {
             local job_name="$1"
@@ -313,8 +327,10 @@ jobs:
             fi
           }
 
-          if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
+          if ! is_truthy "${SCHEDULER_ENABLED}"; then
             maybe_pause "${SCHEDULER_JOB_NAME}"
+            maybe_pause "${RECONCILE_SHORT_SCHEDULER_JOB_NAME}"
+            maybe_pause "${RECONCILE_DEEP_SCHEDULER_JOB_NAME}"
             echo "Scheduler disabled (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
             exit 0
           fi
@@ -361,7 +377,22 @@ jobs:
             fi
           }
 
+          ensure_or_pause_job() {
+            local enabled_flag="$1"
+            local job_name="$2"
+            local cron="$3"
+            local body="$4"
+
+            if is_truthy "${enabled_flag}"; then
+              ensure_job "${job_name}" "${cron}" "${body}"
+            else
+              maybe_pause "${job_name}"
+            fi
+          }
+
           ensure_job "${SCHEDULER_JOB_NAME}" "${SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"sync_hourly"}'
+          ensure_or_pause_job "${RECONCILE_SHORT_SCHEDULER_ENABLED}" "${RECONCILE_SHORT_SCHEDULER_JOB_NAME}" "${RECONCILE_SHORT_SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_short"}'
+          ensure_or_pause_job "${RECONCILE_DEEP_SCHEDULER_ENABLED}" "${RECONCILE_DEEP_SCHEDULER_JOB_NAME}" "${RECONCILE_DEEP_SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_deep"}'
 
       - name: Show deployed service
         run: |
