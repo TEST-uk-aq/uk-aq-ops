@@ -37,6 +37,13 @@ type RollupMetrics = {
   monthly_rows_upserted: number;
 };
 
+type HelperRefreshMetrics = {
+  source_rows: number;
+  rows_upserted: number;
+  station_hours_changed: number;
+  max_changed_lag_hours: number | null;
+};
+
 type SyncWindow = {
   hourEndStartExclusive: Date;
   hourEndEndInclusive: Date;
@@ -53,6 +60,7 @@ const OBS_AQIDB_SUPABASE_URL = requiredEnv("OBS_AQIDB_SUPABASE_URL");
 const OBS_AQI_PRIVILEGED_KEY = requiredEnv("OBS_AQIDB_SECRET_KEY");
 
 const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
+const HELPER_UPSERT_RPC = "uk_aq_rpc_station_aqi_hourly_helper_upsert";
 const HELPER_WINDOW_RPC = (Deno.env.get("UK_AQ_AQI_HELPER_WINDOW_RPC") ||
   "uk_aq_rpc_station_aqi_hourly_helper_window").trim();
 const HOURLY_UPSERT_RPC = (Deno.env.get("UK_AQ_AQI_HOURLY_UPSERT_RPC") ||
@@ -402,6 +410,19 @@ function parseRollupMetrics(payload: unknown): RollupMetrics {
   };
 }
 
+function parseHelperRefreshMetrics(payload: unknown): HelperRefreshMetrics {
+  if (!Array.isArray(payload) || payload.length === 0) {
+    throw new Error("helper upsert RPC returned no rows");
+  }
+  const row = payload[0] as Record<string, unknown>;
+  return {
+    source_rows: toSafeInt(row.source_rows),
+    rows_upserted: toSafeInt(row.rows_upserted),
+    station_hours_changed: toSafeInt(row.station_hours_changed),
+    max_changed_lag_hours: toNullableNumber(row.max_changed_lag_hours),
+  };
+}
+
 function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   if (rows.length === 0) {
     return [];
@@ -439,6 +460,32 @@ async function fetchHelperRowsPage(window: SyncWindow, offset: number): Promise<
   return parseHelperRows(result.data);
 }
 
+function shouldRefreshHelperWindow(): boolean {
+  return RUN_MODE === "reconcile_short" || RUN_MODE === "reconcile_deep";
+}
+
+async function refreshHelperWindow(window: SyncWindow): Promise<HelperRefreshMetrics> {
+  const args: Record<string, unknown> = {
+    p_hour_end_start_exclusive: hourIso(window.hourEndStartExclusive),
+    p_hour_end_end_inclusive: hourIso(window.hourEndEndInclusive),
+    p_reference_hour_end_utc: hourIso(window.referenceHourEnd),
+  };
+  if (STATION_IDS && STATION_IDS.length > 0) {
+    args.p_station_ids = STATION_IDS;
+  }
+
+  const result = await postgrestRpc<unknown>(
+    INGEST_SUPABASE_URL,
+    INGEST_PRIVILEGED_KEY,
+    HELPER_UPSERT_RPC,
+    args,
+  );
+  if (result.error) {
+    throw new Error(`helper upsert RPC failed: ${result.error.message}`);
+  }
+  return parseHelperRefreshMetrics(result.data);
+}
+
 async function main(): Promise<void> {
   const startedAt = Date.now();
   const nowUtc = new Date();
@@ -457,10 +504,15 @@ async function main(): Promise<void> {
   let dailyRowsUpserted = 0;
   let monthlyRowsUpserted = 0;
   let helperPagesFetched = 0;
+  let helperRefreshMetrics: HelperRefreshMetrics | null = null;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
 
   try {
+    if (shouldRefreshHelperWindow()) {
+      helperRefreshMetrics = await refreshHelperWindow(window);
+    }
+
     const stationIds = new Set<number>();
     let helperOffset = 0;
 
@@ -601,6 +653,10 @@ async function main(): Promise<void> {
     daily_rows_upserted: dailyRowsUpserted,
     monthly_rows_upserted: monthlyRowsUpserted,
     helper_pages_fetched: helperPagesFetched,
+    helper_refresh_source_rows: helperRefreshMetrics?.source_rows ?? null,
+    helper_refresh_rows_upserted: helperRefreshMetrics?.rows_upserted ?? null,
+    helper_refresh_station_hours_changed: helperRefreshMetrics?.station_hours_changed ?? null,
+    helper_refresh_max_changed_lag_hours: helperRefreshMetrics?.max_changed_lag_hours ?? null,
     duration_ms: durationMs,
     error: errorMessage,
   };
