@@ -44,6 +44,12 @@ type HelperRefreshMetrics = {
   max_changed_lag_hours: number | null;
 };
 
+type FilteredHelperRows = {
+  rows: HelperRow[];
+  missingStationIds: number[];
+  skippedRowCount: number;
+};
+
 type SyncWindow = {
   hourEndStartExclusive: Date;
   hourEndEndInclusive: Date;
@@ -53,6 +59,7 @@ type SyncWindow = {
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
 const HELPER_WINDOW_RPC_PAGE_SIZE = 1000;
+const OBS_STATION_LOOKUP_CHUNK_SIZE = 200;
 
 const INGEST_SUPABASE_URL = requiredEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = requiredEnvAny(["SB_SECRET_KEY"]);
@@ -100,9 +107,13 @@ const RUN_LOG_RETENTION_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_RUN_LOG_RETENTION_DAYS"),
   7,
 );
+const OBS_STATION_LOOKUP_VIEW = (
+  Deno.env.get("UK_AQ_AQI_OBS_STATION_LOOKUP_VIEW") || "uk_aq_station_connector_lookup"
+).trim();
 const FROM_HOUR_UTC = optionalEnv("UK_AQ_AQI_FROM_HOUR_UTC");
 const TO_HOUR_UTC = optionalEnv("UK_AQ_AQI_TO_HOUR_UTC");
 const STATION_IDS = parseStationIdsCsv(optionalEnv("UK_AQ_AQI_STATION_IDS_CSV"));
+const obsStationExistsCache = new Map<number, boolean>();
 
 function requiredEnv(name: string): string {
   const value = (Deno.env.get(name) || "").trim();
@@ -434,6 +445,116 @@ function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
+async function fetchKnownObsStationIds(stationIds: number[]): Promise<Set<number>> {
+  const requestedIds = Array.from(new Set(
+    stationIds
+      .filter((stationId) => Number.isInteger(stationId) && stationId > 0)
+      .map((stationId) => Math.trunc(stationId)),
+  ));
+  if (requestedIds.length === 0) {
+    return new Set<number>();
+  }
+
+  const unresolvedIds = requestedIds.filter((stationId) => !obsStationExistsCache.has(stationId));
+  for (const chunk of chunkRows(unresolvedIds, OBS_STATION_LOOKUP_CHUNK_SIZE)) {
+    const query = new URLSearchParams();
+    query.set("select", "station_id");
+    query.set("station_id", `in.(${chunk.join(",")})`);
+    const url = `${normalizeUrl(OBS_AQIDB_SUPABASE_URL)}/${OBS_STATION_LOOKUP_VIEW}?${query.toString()}`;
+    const headers: Record<string, string> = {
+      apikey: OBS_AQI_PRIVILEGED_KEY,
+      Authorization: `Bearer ${OBS_AQI_PRIVILEGED_KEY}`,
+      Accept: "application/json",
+      "Accept-Profile": RPC_SCHEMA,
+      "x-ukaq-egress-caller": "uk_aq_station_aqi_hourly_cloud_run",
+    };
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers,
+    });
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const payload = contentType.includes("application/json")
+      ? await response.json().catch(() => null)
+      : await response.text().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(
+        `obs station lookup failed for ${OBS_STATION_LOOKUP_VIEW}: ${asErrorMessage(payload, response.status)}`,
+      );
+    }
+
+    const foundIds = new Set<number>();
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          continue;
+        }
+        const stationId = Number((item as Record<string, unknown>).station_id);
+        if (Number.isInteger(stationId) && stationId > 0) {
+          foundIds.add(Math.trunc(stationId));
+        }
+      }
+    }
+
+    for (const stationId of chunk) {
+      obsStationExistsCache.set(stationId, foundIds.has(stationId));
+    }
+  }
+
+  const existingIds = new Set<number>();
+  for (const stationId of requestedIds) {
+    if (obsStationExistsCache.get(stationId)) {
+      existingIds.add(stationId);
+    }
+  }
+  return existingIds;
+}
+
+async function filterHelperRowsForKnownObsStations(
+  helperRows: HelperRow[],
+): Promise<FilteredHelperRows> {
+  if (helperRows.length === 0) {
+    return {
+      rows: helperRows,
+      missingStationIds: [],
+      skippedRowCount: 0,
+    };
+  }
+
+  const existingStationIds = await fetchKnownObsStationIds(
+    helperRows.map((row) => row.station_id),
+  );
+  if (existingStationIds.size === 0) {
+    return {
+      rows: [],
+      missingStationIds: Array.from(new Set(helperRows.map((row) => row.station_id))).sort(
+        (a, b) => a - b,
+      ),
+      skippedRowCount: helperRows.length,
+    };
+  }
+
+  const filteredRows: HelperRow[] = [];
+  const missingStationIds = new Set<number>();
+  let skippedRowCount = 0;
+
+  for (const row of helperRows) {
+    if (existingStationIds.has(row.station_id)) {
+      filteredRows.push(row);
+      continue;
+    }
+    skippedRowCount += 1;
+    missingStationIds.add(row.station_id);
+  }
+
+  return {
+    rows: filteredRows,
+    missingStationIds: Array.from(missingStationIds).sort((a, b) => a - b),
+    skippedRowCount,
+  };
+}
+
 async function fetchHelperRowsPage(window: SyncWindow, offset: number): Promise<HelperRow[]> {
   const args: Record<string, unknown> = {
     p_hour_end_start_exclusive: hourIso(window.hourEndStartExclusive),
@@ -504,6 +625,8 @@ async function main(): Promise<void> {
   let dailyRowsUpserted = 0;
   let monthlyRowsUpserted = 0;
   let helperPagesFetched = 0;
+  let skippedMissingStationRows = 0;
+  const skippedMissingStationIds = new Set<number>();
   let helperRefreshMetrics: HelperRefreshMetrics | null = null;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
@@ -517,15 +640,22 @@ async function main(): Promise<void> {
     let helperOffset = 0;
 
     while (true) {
-      const helperRows = await fetchHelperRowsPage(window, helperOffset);
+      const rawHelperRows = await fetchHelperRowsPage(window, helperOffset);
       helperPagesFetched += 1;
-      sourceRowsCount += helperRows.length;
-      candidateStationHours += helperRows.length;
+      sourceRowsCount += rawHelperRows.length;
+      candidateStationHours += rawHelperRows.length;
 
-      if (helperRows.length === 0) {
+      if (rawHelperRows.length === 0) {
         break;
       }
 
+      const filteredHelperRows = await filterHelperRowsForKnownObsStations(rawHelperRows);
+      skippedMissingStationRows += filteredHelperRows.skippedRowCount;
+      for (const stationId of filteredHelperRows.missingStationIds) {
+        skippedMissingStationIds.add(stationId);
+      }
+
+      const helperRows = filteredHelperRows.rows;
       const chunks = chunkRows(helperRows, Math.max(100, HOURLY_UPSERT_CHUNK_SIZE));
       for (const chunk of chunks) {
         const upsertResult = await postgrestRpc<unknown>(
@@ -557,10 +687,22 @@ async function main(): Promise<void> {
         stationIds.add(row.station_id);
       }
 
-      if (helperRows.length < HELPER_WINDOW_RPC_PAGE_SIZE) {
+      if (rawHelperRows.length < HELPER_WINDOW_RPC_PAGE_SIZE) {
         break;
       }
       helperOffset += HELPER_WINDOW_RPC_PAGE_SIZE;
+    }
+
+    if (skippedMissingStationIds.size > 0) {
+      console.warn(JSON.stringify({
+        level: "warning",
+        event: "aqi_missing_obs_station_ids_skipped",
+        window_start_utc: hourIso(window.hourEndStartExclusive),
+        window_end_utc: hourIso(window.hourEndEndInclusive),
+        missing_station_id_count: skippedMissingStationIds.size,
+        skipped_row_count: skippedMissingStationRows,
+        sample_station_ids: Array.from(skippedMissingStationIds).slice(0, 20),
+      }));
     }
 
     if (stationIds.size > 0) {
@@ -653,6 +795,9 @@ async function main(): Promise<void> {
     daily_rows_upserted: dailyRowsUpserted,
     monthly_rows_upserted: monthlyRowsUpserted,
     helper_pages_fetched: helperPagesFetched,
+    skipped_missing_station_rows: skippedMissingStationRows,
+    skipped_missing_station_id_count: skippedMissingStationIds.size,
+    skipped_missing_station_ids_sample: Array.from(skippedMissingStationIds).slice(0, 20),
     helper_refresh_source_rows: helperRefreshMetrics?.source_rows ?? null,
     helper_refresh_rows_upserted: helperRefreshMetrics?.rows_upserted ?? null,
     helper_refresh_station_hours_changed: helperRefreshMetrics?.station_hours_changed ?? null,
