@@ -2,7 +2,7 @@
 
 Syncs precomputed station-hour AQI helper rows from ingest DB into Obs AQI DB (hourly upsert + daily/monthly rollup refresh).
 
-Helper rows carry means/sample counts; AQI index levels are computed in the Obs AQI hourly upsert RPC.
+Helper rows carry means/sample counts; AQI index levels are computed in the Obs AQI hourly upsert RPC. The worker now supports short and deep reconciliation windows so late-arriving observations can repair recent AQI stripe gaps without changing the normal hourly sync path.
 
 ## Endpoints
 
@@ -24,6 +24,8 @@ Helper rows carry means/sample counts; AQI index levels are computed in the Obs 
 ## Run Modes
 
 - `sync_hourly`: latest mature hour-end window only
+- `reconcile_short`: recent rolling window ending at the same mature hour-end, default `8` hours
+- `reconcile_deep`: recent rolling window ending at the same mature hour-end, default `36` hours
 - `backfill`: explicit hour-end range using `from_hour_utc` + `to_hour_utc`
 
 ## Required Environment
@@ -38,9 +40,11 @@ Helper rows carry means/sample counts; AQI index levels are computed in the Obs 
 - `UK_AQ_AQI_MATURITY_DELAY_HOURS` (default `3`)
 - `UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES` (default `10`)
 - `UK_AQ_AQI_RUN_MODE` (default `sync_hourly`)
+- `UK_AQ_AQI_RECONCILE_SHORT_HOURS` (default `8`)
+- `UK_AQ_AQI_RECONCILE_DEEP_HOURS` (default `36`)
 - `UK_AQ_AQI_FROM_HOUR_UTC` (backfill)
 - `UK_AQ_AQI_TO_HOUR_UTC` (backfill)
-- `UK_AQ_AQI_STATION_IDS_CSV` (optional station filter)
+- `UK_AQ_AQI_STATION_IDS_CSV` (optional station filter; applies to manual targeted runs, including backfill/reconciliation)
 
 ## RPC Names
 
