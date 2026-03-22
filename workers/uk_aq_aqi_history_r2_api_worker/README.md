@@ -39,7 +39,7 @@ R2 paths expected:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/manifest.json`
 - connector manifest:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
-- the worker resolves `station_id -> connector_id` from `uk_aq_core.stations` and reads only that connector manifest when available
+- the worker resolves `station_id -> connector_id` from `uk_aq_public.uk_aq_station_connector_lookup` and reads only that connector manifest when available
 - AQI parquet reads use `station_id` row-group stats and chunked column reads instead of materializing whole parquet files
 
 Serving rule:
@@ -64,7 +64,6 @@ Useful runtime vars:
 - `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default `168`)
 - `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS` (default `10000`)
 - `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE` (default `5000`)
-- `UK_AQ_CORE_SCHEMA` (default `uk_aq_core`)
 - `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`)
 
 Response:

@@ -15,13 +15,13 @@ const MAX_OBSAQIDB_TIMEOUT_MS = 30000;
 const DEFAULT_PARQUET_ROW_CHUNK_SIZE = 5000;
 const MIN_PARQUET_ROW_CHUNK_SIZE = 500;
 const MAX_PARQUET_ROW_CHUNK_SIZE = 50000;
-const UK_AQ_CORE_SCHEMA_DEFAULT = "uk_aq_core";
 const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set(["/", "/v1/aqi-history"]);
+const STATION_CONNECTOR_LOOKUP_VIEW = "uk_aq_station_connector_lookup";
 const AQI_PARQUET_COLUMNS = [
   "timestamp_hour_utc",
   "daqi_no2_index_level",
@@ -523,21 +523,24 @@ async function readStationConnectorIdFromObsAqiDb({
   if (stationConnectorIdCache.has(stationId)) {
     const cached = stationConnectorIdCache.get(stationId) || {};
     return {
-      source_path: String(cached.source_path || `${UK_AQ_CORE_SCHEMA_DEFAULT}.stations`),
+      source_path: String(
+        cached.source_path
+          || `${UK_AQ_PUBLIC_SCHEMA_DEFAULT}.${STATION_CONNECTOR_LOOKUP_VIEW}`,
+      ),
       connector_id: cached.connector_id ?? null,
       cache_hit: true,
     };
   }
 
-  const schema = String(env.UK_AQ_CORE_SCHEMA || UK_AQ_CORE_SCHEMA_DEFAULT).trim()
-    || UK_AQ_CORE_SCHEMA_DEFAULT;
+  const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim()
+    || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
   const result = await fetchObsAqiDbArray({
     env,
-    path: "stations",
+    path: STATION_CONNECTOR_LOOKUP_VIEW,
     schema,
     queryParams: [
-      ["select", "id,connector_id"],
-      ["id", `eq.${stationId}`],
+      ["select", "station_id,connector_id"],
+      ["station_id", `eq.${stationId}`],
       ["limit", "1"],
     ],
   });
