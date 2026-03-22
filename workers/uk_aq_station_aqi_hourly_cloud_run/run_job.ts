@@ -45,6 +45,7 @@ type SyncWindow = {
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
+const HELPER_WINDOW_RPC_PAGE_SIZE = 1000;
 
 const INGEST_SUPABASE_URL = requiredEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = requiredEnvAny(["SB_SECRET_KEY"]);
@@ -187,8 +188,10 @@ async function postgrestRpc<T>(
   privilegedKey: string,
   rpcName: string,
   args: Record<string, unknown>,
+  query?: URLSearchParams,
 ): Promise<RpcResult<T>> {
-  const url = `${normalizeUrl(baseUrl)}/rpc/${rpcName}`;
+  const queryString = query && query.toString() ? `?${query.toString()}` : "";
+  const url = `${normalizeUrl(baseUrl)}/rpc/${rpcName}${queryString}`;
   const headers: Record<string, string> = {
     apikey: privilegedKey,
     Authorization: `Bearer ${privilegedKey}`,
@@ -410,7 +413,7 @@ function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
-async function fetchHelperRows(window: SyncWindow): Promise<HelperRow[]> {
+async function fetchHelperRowsPage(window: SyncWindow, offset: number): Promise<HelperRow[]> {
   const args: Record<string, unknown> = {
     p_hour_end_start_exclusive: hourIso(window.hourEndStartExclusive),
     p_hour_end_end_inclusive: hourIso(window.hourEndEndInclusive),
@@ -418,12 +421,17 @@ async function fetchHelperRows(window: SyncWindow): Promise<HelperRow[]> {
   if (STATION_IDS && STATION_IDS.length > 0) {
     args.p_station_ids = STATION_IDS;
   }
+  const query = new URLSearchParams({
+    limit: String(HELPER_WINDOW_RPC_PAGE_SIZE),
+    offset: String(offset),
+  });
 
   const result = await postgrestRpc<unknown>(
     INGEST_SUPABASE_URL,
     INGEST_PRIVILEGED_KEY,
     HELPER_WINDOW_RPC,
     args,
+    query,
   );
   if (result.error) {
     throw new Error(`helper window RPC failed: ${result.error.message}`);
@@ -448,15 +456,24 @@ async function main(): Promise<void> {
   let maxChangedLagHours: number | null = null;
   let dailyRowsUpserted = 0;
   let monthlyRowsUpserted = 0;
+  let helperPagesFetched = 0;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
 
   try {
-    const helperRows = await fetchHelperRows(window);
-    sourceRowsCount = helperRows.length;
-    candidateStationHours = helperRows.length;
+    const stationIds = new Set<number>();
+    let helperOffset = 0;
 
-    if (helperRows.length > 0) {
+    while (true) {
+      const helperRows = await fetchHelperRowsPage(window, helperOffset);
+      helperPagesFetched += 1;
+      sourceRowsCount += helperRows.length;
+      candidateStationHours += helperRows.length;
+
+      if (helperRows.length === 0) {
+        break;
+      }
+
       const chunks = chunkRows(helperRows, Math.max(100, HOURLY_UPSERT_CHUNK_SIZE));
       for (const chunk of chunks) {
         const upsertResult = await postgrestRpc<unknown>(
@@ -484,7 +501,17 @@ async function main(): Promise<void> {
         }
       }
 
-      const stationIds = Array.from(new Set(helperRows.map((row) => row.station_id)));
+      for (const row of helperRows) {
+        stationIds.add(row.station_id);
+      }
+
+      if (helperRows.length < HELPER_WINDOW_RPC_PAGE_SIZE) {
+        break;
+      }
+      helperOffset += HELPER_WINDOW_RPC_PAGE_SIZE;
+    }
+
+    if (stationIds.size > 0) {
       const rollupResult = await postgrestRpc<unknown>(
         OBS_AQIDB_SUPABASE_URL,
         OBS_AQI_PRIVILEGED_KEY,
@@ -492,7 +519,7 @@ async function main(): Promise<void> {
         {
           p_start_hour_utc: hourIso(window.hourEndStartExclusive),
           p_end_hour_utc: hourIso(window.hourEndEndInclusive),
-          p_station_ids: stationIds,
+          p_station_ids: Array.from(stationIds),
         },
       );
       if (rollupResult.error) {
@@ -573,6 +600,7 @@ async function main(): Promise<void> {
     max_changed_lag_hours: maxChangedLagHours,
     daily_rows_upserted: dailyRowsUpserted,
     monthly_rows_upserted: monthlyRowsUpserted,
+    helper_pages_fetched: helperPagesFetched,
     duration_ms: durationMs,
     error: errorMessage,
   };

@@ -2,7 +2,7 @@
 
 Syncs precomputed station-hour AQI helper rows from ingest DB into Obs AQI DB (hourly upsert + daily/monthly rollup refresh).
 
-Helper rows carry means/sample counts; AQI index levels are computed in the Obs AQI hourly upsert RPC. The worker now supports short and deep reconciliation windows so late-arriving observations can repair recent AQI stripe gaps without changing the normal hourly sync path.
+Helper rows carry means/sample counts; AQI index levels are computed in the Obs AQI hourly upsert RPC. The worker now supports short and deep reconciliation windows so late-arriving observations can repair recent AQI stripe gaps without changing the normal hourly sync path. Helper-window RPC reads are paginated to avoid the PostgREST 1000-row response cap on table-valued RPC results.
 
 ## Endpoints
 
