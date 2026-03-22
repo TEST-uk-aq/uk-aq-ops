@@ -30,17 +30,31 @@ R2 paths expected:
   - `${UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX}/day_utc=YYYY-MM-DD/manifest.json`
 - connector manifest:
   - `${UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
+- optional timeseries index (fast-path):
+  - `${UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
 
 Serving rule:
 
 - a UTC day is served only when the day manifest exists (committed history rule).
 - no `_SUCCESS` marker or loose parquet scan fallback is used.
+- when the optional timeseries index exists, file selection is narrowed by `min_timeseries_id/max_timeseries_id` before parquet reads.
+- if the optional timeseries index is missing/invalid for a day+connector, the worker falls back to connector manifest file scanning.
 
 Response:
 
 - returns `{ observed_at, value }` rows sorted by `observed_at` ascending.
 - includes coverage diagnostics (`missing_day_manifest_keys`, etc.).
+- includes `coverage.timeseries_index` diagnostics for index hit/miss/fallback visibility.
 - sets `x-ukaq-cache: HIT|MISS`.
+
+Optional env:
+
+- `UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_ENABLED` (`true|false`, default `true`)
+- `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
+- `UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_PREFIX`
+  (default `${UK_AQ_R2_HISTORY_INDEX_PREFIX}/observations_timeseries`)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX`
+  (legacy alias fallback for shared index prefix wiring)
 
 ## Deploy (manual)
 

@@ -12,6 +12,10 @@ test("buildIndexManifestRelativePath normalizes the configured prefix", () => {
     "history/_index/observations_latest.json",
   );
   assert.equal(
+    buildIndexManifestRelativePath("observations_timeseries", "history/_index"),
+    "history/_index/observations_timeseries_latest.json",
+  );
+  assert.equal(
     buildIndexManifestRelativePath("aqilevels", "history/_index"),
     "history/_index/aqilevels_latest.json",
   );
@@ -27,6 +31,10 @@ test("buildIndexManifestTargets keeps only indexed domains and de-dupes them", (
       {
         domain: "observations",
         relative_path: "history/_index/observations_latest.json",
+      },
+      {
+        domain: "observations_timeseries",
+        relative_path: "history/_index/observations_timeseries_latest.json",
       },
       {
         domain: "aqilevels",

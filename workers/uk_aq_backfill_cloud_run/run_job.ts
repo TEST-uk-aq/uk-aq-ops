@@ -274,6 +274,10 @@ type ObsHistoryFileEntry = {
   row_count: number;
   bytes: number;
   etag_or_hash: string | null;
+  min_timeseries_id?: number | null;
+  max_timeseries_id?: number | null;
+  min_observed_at?: string | null;
+  max_observed_at?: string | null;
 };
 
 type ObsConnectorManifest = {
@@ -1943,6 +1947,50 @@ function statsFromFileEntries(
   };
 }
 
+function summarizeObservationPartRows(
+  rows: ObsHistoryParquetRow[],
+): {
+  min_timeseries_id: number | null;
+  max_timeseries_id: number | null;
+  min_observed_at: string | null;
+  max_observed_at: string | null;
+} {
+  let minTimeseriesId: number | null = null;
+  let maxTimeseriesId: number | null = null;
+  let minObservedAt: string | null = null;
+  let maxObservedAt: string | null = null;
+
+  for (const row of rows) {
+    const timeseriesId = Number(row.timeseries_id);
+    if (Number.isFinite(timeseriesId) && timeseriesId > 0) {
+      const normalizedTimeseriesId = Math.trunc(timeseriesId);
+      if (minTimeseriesId === null || normalizedTimeseriesId < minTimeseriesId) {
+        minTimeseriesId = normalizedTimeseriesId;
+      }
+      if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
+        maxTimeseriesId = normalizedTimeseriesId;
+      }
+    }
+
+    const observedAt = typeof row.observed_at === "string" ? row.observed_at : null;
+    if (observedAt) {
+      if (!minObservedAt || observedAt < minObservedAt) {
+        minObservedAt = observedAt;
+      }
+      if (!maxObservedAt || observedAt > maxObservedAt) {
+        maxObservedAt = observedAt;
+      }
+    }
+  }
+
+  return {
+    min_timeseries_id: minTimeseriesId,
+    max_timeseries_id: maxTimeseriesId,
+    min_observed_at: minObservedAt,
+    max_observed_at: maxObservedAt,
+  };
+}
+
 function withManifestHash<T extends Record<string, unknown>>(
   payloadWithoutHash: T,
 ): T & { manifest_hash: string } {
@@ -2007,6 +2055,10 @@ function createObsDayManifest(args: {
       bytes: entry.bytes,
       row_count: entry.row_count,
       etag_or_hash: entry.etag_or_hash,
+      min_timeseries_id: entry.min_timeseries_id ?? null,
+      max_timeseries_id: entry.max_timeseries_id ?? null,
+      min_observed_at: entry.min_observed_at ?? null,
+      max_observed_at: entry.max_observed_at ?? null,
     }))
   );
   const parquetObjectKeys = Array.from(new Set(files.map((entry) => entry.key)))
@@ -2425,6 +2477,18 @@ async function loadExistingConnectorManifest(
           item.etag_or_hash === null || item.etag_or_hash === undefined
             ? null
             : String(item.etag_or_hash),
+        min_timeseries_id: Number.isFinite(Number(item.min_timeseries_id))
+          ? Math.trunc(Number(item.min_timeseries_id))
+          : null,
+        max_timeseries_id: Number.isFinite(Number(item.max_timeseries_id))
+          ? Math.trunc(Number(item.max_timeseries_id))
+          : null,
+        min_observed_at: typeof item.min_observed_at === "string"
+          ? item.min_observed_at
+          : null,
+        max_observed_at: typeof item.max_observed_at === "string"
+          ? item.max_observed_at
+          : null,
       };
     })
     .filter((value): value is ObsHistoryFileEntry => value !== null);
@@ -2534,6 +2598,7 @@ async function exportObsConnectorDayToR2(args: {
     if (!head.exists) {
       throw new Error(`Missing parquet part after upload: ${partKey}`);
     }
+    const partSummary = summarizeObservationPartRows(partRows);
     fileEntries.push({
       key: partKey,
       row_count: partRows.length,
@@ -2541,6 +2606,10 @@ async function exportObsConnectorDayToR2(args: {
         ? Math.trunc(head.bytes)
         : Math.trunc(putResult.bytes),
       etag_or_hash: head.etag || putResult.etag || null,
+      min_timeseries_id: partSummary.min_timeseries_id,
+      max_timeseries_id: partSummary.max_timeseries_id,
+      min_observed_at: partSummary.min_observed_at,
+      max_observed_at: partSummary.max_observed_at,
     });
     partIndex += 1;
   };
@@ -2923,6 +2992,7 @@ async function exportObsConnectorRowsToR2(args: {
       observed_at: row.observed_at,
       value: row.value,
     }));
+    const partSummary = summarizeObservationPartRows(parquetRows);
     const partKey = buildObsPartKey(args.day_utc, args.connector_id, partIndex);
     const putResult = await r2PutObject({
       r2: OBS_R2_CONFIG,
@@ -2941,6 +3011,10 @@ async function exportObsConnectorRowsToR2(args: {
         ? Math.trunc(head.bytes)
         : Math.trunc(putResult.bytes),
       etag_or_hash: head.etag || putResult.etag || null,
+      min_timeseries_id: partSummary.min_timeseries_id,
+      max_timeseries_id: partSummary.max_timeseries_id,
+      min_observed_at: partSummary.min_observed_at,
+      max_observed_at: partSummary.max_observed_at,
     });
   }
 

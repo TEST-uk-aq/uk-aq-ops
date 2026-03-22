@@ -2,6 +2,8 @@ import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/observations";
+const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
+const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "observations_timeseries";
 const DEFAULT_CACHE_SECONDS = 300;
 const MAX_CACHE_SECONDS = 3600;
 const MAX_LIMIT = 20000;
@@ -48,6 +50,20 @@ function parseOptionalPositiveInt(raw, min = 1, max = 100000) {
     return null;
   }
   return value;
+}
+
+function parseOptionalBoolean(raw, fallback) {
+  if (raw === null || raw === undefined || String(raw).trim() === "") {
+    return fallback;
+  }
+  const value = String(raw).trim().toLowerCase();
+  if (value === "true" || value === "1" || value === "yes" || value === "on") {
+    return true;
+  }
+  if (value === "false" || value === "0" || value === "no" || value === "off") {
+    return false;
+  }
+  return fallback;
 }
 
 function parseRequiredPositiveInt(raw) {
@@ -169,6 +185,10 @@ function buildDayManifestKey(prefix, dayUtc) {
 
 function buildConnectorManifestKey(prefix, dayUtc, connectorId) {
   return `${prefix}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
+}
+
+function buildTimeseriesConnectorIndexKey(indexPrefix, dayUtc, connectorId) {
+  return `${indexPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
 }
 
 async function fetchJsonObjectFromR2(env, key) {
@@ -356,6 +376,50 @@ function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
   return fallbackKey;
 }
 
+function extractParquetKeysFromTimeseriesIndex(indexPayload, timeseriesId) {
+  const files = Array.isArray(indexPayload?.files) ? indexPayload.files : [];
+  const allKeys = [];
+  let indexedFileCount = 0;
+  let filesWithUnknownRange = 0;
+  let allFilesRangeBounded = files.length > 0;
+
+  for (const entry of files) {
+    const key = String(entry?.key || "").trim();
+    if (!key) {
+      continue;
+    }
+    const minTimeseriesId = Number(entry?.min_timeseries_id);
+    const maxTimeseriesId = Number(entry?.max_timeseries_id);
+    const hasRange =
+      Number.isFinite(minTimeseriesId) &&
+      Number.isFinite(maxTimeseriesId) &&
+      minTimeseriesId > 0 &&
+      maxTimeseriesId > 0 &&
+      maxTimeseriesId >= minTimeseriesId;
+
+    if (!hasRange) {
+      allFilesRangeBounded = false;
+      filesWithUnknownRange += 1;
+      allKeys.push(key);
+      continue;
+    }
+
+    indexedFileCount += 1;
+    if (timeseriesId >= minTimeseriesId && timeseriesId <= maxTimeseriesId) {
+      allKeys.push(key);
+    }
+  }
+
+  const dedupedKeys = Array.from(new Set(allKeys));
+  return {
+    keys: dedupedKeys,
+    file_count: files.length,
+    indexed_file_count: indexedFileCount,
+    unknown_range_file_count: filesWithUnknownRange,
+    all_files_range_bounded: allFilesRangeBounded,
+  };
+}
+
 function normalizeValue(raw) {
   if (raw === null || raw === undefined) {
     return null;
@@ -395,6 +459,18 @@ async function readHistoryRows({
     500,
     50000,
   );
+  const historyIndexPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_INDEX_PREFIX || DEFAULT_HISTORY_INDEX_PREFIX,
+  ) || DEFAULT_HISTORY_INDEX_PREFIX;
+  const timeseriesIndexPrefix = normalizePrefix(
+    env.UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_PREFIX ||
+      env.UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX ||
+      `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`,
+  ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`;
+  const timeseriesIndexEnabled = parseOptionalBoolean(
+    env.UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_ENABLED,
+    true,
+  );
 
   const days = listUtcDays(startIso, endIso);
   const rowsByObservedAt = new Map();
@@ -402,6 +478,14 @@ async function readHistoryRows({
   const missingConnectorManifestKeys = [];
   const missingParquetKeys = [];
   const scannedParquetKeys = [];
+  const timeseriesIndexScannedKeys = [];
+  const timeseriesIndexMissingKeys = [];
+  const timeseriesIndexWarnings = [];
+  let timeseriesIndexHitCount = 0;
+  let timeseriesIndexMissCount = 0;
+  let timeseriesIndexSkippedByRangeDays = 0;
+  let timeseriesIndexIndexedFileCount = 0;
+  let timeseriesIndexUnknownRangeFileCount = 0;
 
   for (const dayUtc of days) {
     const dayManifestKey = buildDayManifestKey(historyPrefix, dayUtc);
@@ -421,24 +505,68 @@ async function readHistoryRows({
       connectorId,
       connectorManifestFallbackKey,
     );
-    const connectorManifestObject = await fetchJsonObjectFromR2(
-      env,
-      connectorManifestKey,
-    );
-    if (!connectorManifestObject.exists) {
-      missingConnectorManifestKeys.push(connectorManifestKey);
-      continue;
+    let parquetKeys = null;
+
+    if (timeseriesIndexEnabled) {
+      const connectorIndexKey = buildTimeseriesConnectorIndexKey(
+        timeseriesIndexPrefix,
+        dayUtc,
+        connectorId,
+      );
+      timeseriesIndexScannedKeys.push(connectorIndexKey);
+      try {
+        const connectorIndexObject = await fetchJsonObjectFromR2(
+          env,
+          connectorIndexKey,
+        );
+        if (connectorIndexObject.exists) {
+          timeseriesIndexHitCount += 1;
+          const extraction = extractParquetKeysFromTimeseriesIndex(
+            connectorIndexObject.value,
+            timeseriesId,
+          );
+          timeseriesIndexIndexedFileCount += extraction.indexed_file_count;
+          timeseriesIndexUnknownRangeFileCount +=
+            extraction.unknown_range_file_count;
+          parquetKeys = extraction.keys;
+          if (
+            extraction.all_files_range_bounded && extraction.keys.length === 0
+          ) {
+            timeseriesIndexSkippedByRangeDays += 1;
+            continue;
+          }
+        } else {
+          timeseriesIndexMissCount += 1;
+          timeseriesIndexMissingKeys.push(connectorIndexKey);
+        }
+      } catch (error) {
+        timeseriesIndexMissCount += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        timeseriesIndexWarnings.push(
+          `Optional timeseries index read failed for ${connectorIndexKey}: ${message}`,
+        );
+      }
     }
 
-    const files = Array.isArray(connectorManifestObject.value?.files)
-      ? connectorManifestObject.value.files
-      : [];
-
-    for (const fileEntry of files) {
-      const parquetKey = String(fileEntry?.key || "").trim();
-      if (!parquetKey) {
+    if (parquetKeys === null) {
+      const connectorManifestObject = await fetchJsonObjectFromR2(
+        env,
+        connectorManifestKey,
+      );
+      if (!connectorManifestObject.exists) {
+        missingConnectorManifestKeys.push(connectorManifestKey);
         continue;
       }
+
+      const files = Array.isArray(connectorManifestObject.value?.files)
+        ? connectorManifestObject.value.files
+        : [];
+      parquetKeys = files.map((fileEntry) =>
+        String(fileEntry?.key || "").trim()
+      ).filter(Boolean);
+    }
+
+    for (const parquetKey of parquetKeys) {
       scannedParquetKeys.push(parquetKey);
       const parquet = await fetchFilteredParquetRowsFromR2(
         env,
@@ -467,6 +595,18 @@ async function readHistoryRows({
     missing_day_manifest_keys: missingDayManifestKeys,
     missing_connector_manifest_keys: missingConnectorManifestKeys,
     missing_parquet_keys: missingParquetKeys,
+    timeseries_index: {
+      enabled: timeseriesIndexEnabled,
+      prefix: timeseriesIndexPrefix,
+      scanned_connector_index_keys: timeseriesIndexScannedKeys.length,
+      hit_count: timeseriesIndexHitCount,
+      miss_count: timeseriesIndexMissCount,
+      skipped_days_by_file_range: timeseriesIndexSkippedByRangeDays,
+      indexed_file_count_seen: timeseriesIndexIndexedFileCount,
+      unknown_range_file_count_seen: timeseriesIndexUnknownRangeFileCount,
+      missing_connector_index_keys: timeseriesIndexMissingKeys,
+      warnings: timeseriesIndexWarnings,
+    },
   };
 }
 
@@ -575,6 +715,7 @@ async function handleRequest(request, env) {
       missing_connector_manifest_keys:
         historyRead.missing_connector_manifest_keys,
       missing_parquet_keys: historyRead.missing_parquet_keys,
+      timeseries_index: historyRead.timeseries_index,
     },
   }, {
     status: 200,

@@ -7,7 +7,11 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "core"]);
-const INDEX_DOMAIN_NAMES = Object.freeze(["observations", "aqilevels"]);
+const INDEX_DOMAIN_NAMES = Object.freeze([
+  "observations",
+  "aqilevels",
+  "observations_timeseries",
+]);
 
 function parseNonNegativeInt(rawValue, fallback) {
   const value = Number(rawValue);
@@ -297,12 +301,25 @@ export function buildIndexManifestTargets(
   domains,
   indexPrefix = DEFAULT_INDEX_PREFIX,
 ) {
-  return Array.from(new Set(
+  const requestedDomains = Array.from(new Set(
     (Array.isArray(domains) ? domains : []).map((domain) =>
       String(domain || "").trim().toLowerCase()
     ),
-  ))
-    .filter((domain) => INDEX_DOMAIN_NAMES.includes(domain))
+  ));
+
+  const expandedDomains = new Set();
+  for (const domain of requestedDomains) {
+    if (domain === "observations") {
+      expandedDomains.add("observations");
+      expandedDomains.add("observations_timeseries");
+      continue;
+    }
+    if (INDEX_DOMAIN_NAMES.includes(domain)) {
+      expandedDomains.add(domain);
+    }
+  }
+
+  return Array.from(expandedDomains)
     .map((domain) => ({
       domain,
       relative_path: buildIndexManifestRelativePath(domain, indexPrefix),

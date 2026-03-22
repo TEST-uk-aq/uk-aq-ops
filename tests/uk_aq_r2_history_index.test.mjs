@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildR2HistoryObservationsTimeseriesConnectorIndexKey,
+  buildR2HistoryObservationsTimeseriesLatestKey,
   buildDaySummaryFromManifest,
   buildDomainIndexPayload,
   normalizeR2HistoryIndexDomain,
@@ -113,4 +115,23 @@ test("resolveR2HistoryIndexConfig uses deploy bucket mapping when explicit bucke
   assert.equal(config.deploy_env, "stage");
   assert.equal(config.r2.bucket, "uk-aq-history-stage");
   assert.equal(config.index_prefix, "history/_index");
+  assert.equal(
+    config.observations_timeseries_index_prefix,
+    "history/_index/observations_timeseries",
+  );
+});
+
+test("observations timeseries index keys follow expected history/_index layout", () => {
+  const latestKey = buildR2HistoryObservationsTimeseriesLatestKey("history/_index");
+  const connectorKey = buildR2HistoryObservationsTimeseriesConnectorIndexKey(
+    "history/_index/observations_timeseries",
+    "2026-03-22",
+    6,
+  );
+
+  assert.equal(latestKey, "history/_index/observations_timeseries_latest.json");
+  assert.equal(
+    connectorKey,
+    "history/_index/observations_timeseries/day_utc=2026-03-22/connector_id=6/manifest.json",
+  );
 });

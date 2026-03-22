@@ -4,6 +4,9 @@ compatibility_date = "2026-03-09"
 
 [vars]
 UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
+UK_AQ_R2_HISTORY_INDEX_PREFIX = "history/_index"
+UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
+UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_ENABLED = "true"
 UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS = "300"
 
 [[r2_buckets]]

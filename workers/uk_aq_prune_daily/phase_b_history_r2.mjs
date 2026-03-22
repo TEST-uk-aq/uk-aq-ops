@@ -225,6 +225,38 @@ function statsFromFileEntries(fileEntries, totalRows) {
   };
 }
 
+function summarizeObservationPartRows(rows) {
+  let minTimeseriesId = null;
+  let maxTimeseriesId = null;
+  let minObservedAt = null;
+  let maxObservedAt = null;
+
+  for (const row of rows) {
+    const timeseriesId = Number(row.timeseries_id);
+    if (Number.isFinite(timeseriesId) && timeseriesId > 0) {
+      const normalizedTimeseriesId = Math.trunc(timeseriesId);
+      if (minTimeseriesId === null || normalizedTimeseriesId < minTimeseriesId) {
+        minTimeseriesId = normalizedTimeseriesId;
+      }
+      if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
+        maxTimeseriesId = normalizedTimeseriesId;
+      }
+    }
+    const observedAt = typeof row.observed_at === "string" ? row.observed_at : null;
+    if (observedAt) {
+      minObservedAt = minIso(minObservedAt, observedAt);
+      maxObservedAt = maxIso(maxObservedAt, observedAt);
+    }
+  }
+
+  return {
+    min_timeseries_id: minTimeseriesId,
+    max_timeseries_id: maxTimeseriesId,
+    min_observed_at: minObservedAt,
+    max_observed_at: maxObservedAt,
+  };
+}
+
 function uniqueSorted(values) {
   return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
 }
@@ -335,12 +367,26 @@ function toResumePartEntry(value, index) {
   const etagOrHash = value.etag_or_hash === null || value.etag_or_hash === undefined
     ? null
     : String(value.etag_or_hash);
+  const minTimeseriesId = Number(value.min_timeseries_id);
+  const maxTimeseriesId = Number(value.max_timeseries_id);
+  const minObservedAt = typeof value.min_observed_at === "string"
+    ? value.min_observed_at
+    : null;
+  const maxObservedAt = typeof value.max_observed_at === "string"
+    ? value.max_observed_at
+    : null;
 
   return {
     key,
     row_count: Math.trunc(rowCount),
     bytes: Math.trunc(bytes),
     etag_or_hash: etagOrHash,
+    min_timeseries_id:
+      Number.isFinite(minTimeseriesId) && minTimeseriesId > 0 ? Math.trunc(minTimeseriesId) : null,
+    max_timeseries_id:
+      Number.isFinite(maxTimeseriesId) && maxTimeseriesId > 0 ? Math.trunc(maxTimeseriesId) : null,
+    min_observed_at: minObservedAt,
+    max_observed_at: maxObservedAt,
   };
 }
 
@@ -895,6 +941,10 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
       bytes: entry.bytes,
       row_count: entry.row_count,
       etag_or_hash: entry.etag_or_hash,
+      min_timeseries_id: entry.min_timeseries_id ?? null,
+      max_timeseries_id: entry.max_timeseries_id ?? null,
+      min_observed_at: entry.min_observed_at ?? null,
+      max_observed_at: entry.max_observed_at ?? null,
     }))
   );
 
@@ -1148,11 +1198,16 @@ async function writeCommittedPartAndCheckpoint({
     ? Math.trunc(head.bytes)
     : Math.trunc(putResult.bytes);
   const etagOrHash = head.etag || putResult.etag || null;
+  const partSummary = summarizeObservationPartRows(rows);
   const partEntry = {
     key: committedKey,
     row_count: rows.length,
     bytes,
     etag_or_hash: etagOrHash,
+    min_timeseries_id: partSummary.min_timeseries_id,
+    max_timeseries_id: partSummary.max_timeseries_id,
+    min_observed_at: partSummary.min_observed_at,
+    max_observed_at: partSummary.max_observed_at,
   };
   const nextParts = [...committedParts, partEntry];
   const nextObservedRows = observedRows + BigInt(rows.length);
