@@ -11,9 +11,11 @@ const INDEX_DOMAIN_NAMES = Object.freeze([
   "observations",
   "aqilevels",
   "observations_timeseries",
+  "aqilevels_timeseries",
 ]);
 const INDEX_TREE_DOMAIN_NAMES = Object.freeze([
   "observations_timeseries",
+  "aqilevels_timeseries",
 ]);
 
 function parseNonNegativeInt(rawValue, fallback) {
@@ -317,6 +319,11 @@ export function buildIndexManifestTargets(
       expandedDomains.add("observations_timeseries");
       continue;
     }
+    if (domain === "aqilevels") {
+      expandedDomains.add("aqilevels");
+      expandedDomains.add("aqilevels_timeseries");
+      continue;
+    }
     if (INDEX_DOMAIN_NAMES.includes(domain)) {
       expandedDomains.add(domain);
     }
@@ -358,6 +365,10 @@ export function buildIndexDomainTreeTargets(
   for (const domain of requestedDomains) {
     if (domain === "observations" || domain === "observations_timeseries") {
       expandedDomains.add("observations_timeseries");
+      continue;
+    }
+    if (domain === "aqilevels" || domain === "aqilevels_timeseries") {
+      expandedDomains.add("aqilevels_timeseries");
     }
   }
 
