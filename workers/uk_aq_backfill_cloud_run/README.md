@@ -41,6 +41,9 @@ All fields are optional unless noted.
     - ingest DB for likely in-retention days.
     - obs_aqidb for older local days.
     - optional R2 fallback only when explicitly enabled.
+  - source lookup resolves from metadata tables (`stations`, `timeseries`, `phenomena`, `observed_properties`) first.
+    - fallback keeps legacy `timeseries_ref` parsing for older connector shapes.
+    - numeric `timeseries_ref` values are supported through metadata-first lookup.
   - default skip when checkpoint is already complete.
   - `force_replace=true` bypasses checkpoint skip.
   - writes Obs AQI hourly + rollups via AQI RPCs.
@@ -52,7 +55,9 @@ All fields are optional unless noted.
   - exports from `obs_aqidb` into both domains:
     - observations rows -> `history/v1/observations/...`
     - AQI hourly rows -> `history/v1/aqilevels/...`
+    - AQI parquet rows are normalized (`pollutant_code`, `hourly_mean_ugm3`, `rolling24h_mean_ugm3`, `daqi_index_level`, `eaqi_index_level`).
   - each domain writes connector parquet part files, connector manifests, and a day manifest.
+    - AQI connector manifest file entries include `pollutant_codes` for lightweight timeseries-index pruning.
   - behavior:
     - `dry_run=true`: returns a planning summary (`backed_up_days`, `pending_backfill_days`) where "backed up" means both observations + aqilevels day manifests exist.
     - `dry_run=false`: writes pending day manifests and connector payloads to R2.

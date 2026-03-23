@@ -399,9 +399,13 @@ function buildObservationTimeseriesConnectorIndexPayload({
   let minTimeseriesId = null;
   let maxTimeseriesId = null;
   let indexedFileCount = 0;
+  const availablePollutants = new Set();
   for (const file of files) {
     const fileMin = parsePositiveId(file.min_timeseries_id);
     const fileMax = parsePositiveId(file.max_timeseries_id);
+    for (const pollutantCode of (Array.isArray(file.pollutant_codes) ? file.pollutant_codes : [])) {
+      availablePollutants.add(pollutantCode);
+    }
     if (fileMin && fileMax) {
       indexedFileCount += 1;
       if (!minTimeseriesId || fileMin < minTimeseriesId) {
@@ -435,6 +439,7 @@ function buildObservationTimeseriesConnectorIndexPayload({
     file_count: files.length,
     indexed_file_count: indexedFileCount,
     index_coverage: indexedFileCount === files.length ? "complete" : "partial",
+    available_pollutants: Array.from(availablePollutants).sort((a, b) => a.localeCompare(b)),
     min_timeseries_id: minTimeseriesId,
     max_timeseries_id: maxTimeseriesId,
     files,
@@ -462,6 +467,11 @@ function normalizeAqilevelTimeseriesIndexFileEntry(entry) {
   )
     ? null
     : maxTimeseriesId;
+  const pollutantCodes = Array.from(new Set(
+    (Array.isArray(entry.pollutant_codes) ? entry.pollutant_codes : [])
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => value === "pm25" || value === "pm10" || value === "no2"),
+  )).sort((a, b) => a.localeCompare(b));
   return {
     key,
     row_count: parseNonNegativeInt(entry.row_count) || 0,
@@ -469,6 +479,7 @@ function normalizeAqilevelTimeseriesIndexFileEntry(entry) {
     etag_or_hash: typeof entry.etag_or_hash === "string" && entry.etag_or_hash.trim()
       ? entry.etag_or_hash.trim()
       : null,
+    pollutant_codes: pollutantCodes,
     min_timeseries_id: normalizedMinTimeseriesId,
     max_timeseries_id: normalizedMaxTimeseriesId,
     min_timestamp_hour_utc: toIsoOrNull(entry.min_timestamp_hour_utc),
