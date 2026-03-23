@@ -610,10 +610,7 @@ const ALLOW_STUB_MODES = parseBooleanish(
 const CONNECTOR_IDS = parseConnectorIds(
   optionalEnv("UK_AQ_BACKFILL_CONNECTOR_IDS"),
 );
-const REQUESTED_STATION_IDS = parseConnectorIds(
-  optionalEnv("UK_AQ_BACKFILL_STATION_IDS") ??
-    optionalEnv("UK_AQ_BACKFILL_STATION_ID"),
-);
+const REQUESTED_STATION_IDS: number[] | null = null;
 const REQUESTED_TIMESERIES_IDS = parseConnectorIds(
   optionalEnv("UK_AQ_BACKFILL_TIMESERIES_IDS") ??
     optionalEnv("UK_AQ_BACKFILL_TIMESERIES_ID"),
@@ -705,7 +702,7 @@ const LOCAL_TIMEZONE =
   (Deno.env.get("UK_AQ_BACKFILL_LOCAL_TIMEZONE") || "Europe/London")
     .trim();
 const STATION_ID_PAGE_SIZE = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE"),
+  Deno.env.get("UK_AQ_BACKFILL_TIMESERIES_ID_PAGE_SIZE"),
   1000,
   100,
   10000,

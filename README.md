@@ -18,7 +18,7 @@ Each gcloud-facing service now lives under `workers/`:
 - `workers/uk_aq_observs_partition_maintenance_service/server.mjs`
 - `workers/uk_aq_aqilevels_retention_service/server.mjs`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
-- `workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`
+- `workers/uk_aq_timeseries_aqi_hourly_cloud_run/run_service.ts`
 - `workers/uk_aq_backfill_cloud_run/run_service.ts`
 
 Cloudflare edge workers in this repo:
@@ -124,13 +124,13 @@ Primary controls:
 - consumed by ingest edge function `uk_aq_timeseries` for windows older than the recent obs_aqidb overlap
 - website observations now use ingestdb for the freshest `24` hours, `obs_aqidb` for the next `13` days inside the local `14`-day window, and R2 for older history; keep `obs_aqidb` retention at `14` days or more if that local coverage should remain available before R2 fallback
 
-### 8) Station AQI Hourly Worker (`workers/uk_aq_station_aqi_hourly_cloud_run/run_service.ts`)
+### 8) Timeseries AQI Hourly Worker (`workers/uk_aq_timeseries_aqi_hourly_cloud_run/run_service.ts`)
 
 - `GET /` health
 - `POST /` executes AQI run job
-- reads station-hour pollutant means from ingest RPC
+- reads timeseries-hour pollutant means from ingest RPC
 - computes pollutant-specific DAQI + EAQI levels (PM DAQI uses rolling 24h mean)
-- upserts `station_aqi_hourly` and refreshes daily/monthly rollups in `uk_aq_aqilevels`
+- upserts `timeseries_aqi_hourly` and refreshes daily/monthly rollups in `uk_aq_aqilevels`
 - logs run telemetry (`aqi_compute_runs`) with 7-day retention cleanup
 
 ### 9) Backfill Worker (`workers/uk_aq_backfill_cloud_run/run_service.ts`)
@@ -256,7 +256,7 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_aqilevels_retention_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
-- `/.github/workflows/uk_aq_station_aqi_hourly_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_timeseries_aqi_hourly_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_r2_history_dropbox_backup.yml`
 - `/.github/workflows/uk_aq_cache_proxy_deploy.yml`
 
@@ -266,7 +266,7 @@ Apply in Supabase SQL editor:
 - `system_docs/uk-aq-observs-outbox-flush-service.md`
 - `system_docs/uk-aq-observs-partition-maintenance.md`
 - `system_docs/uk-aq-aqilevels-retention.md`
-- `system_docs/uk-aq-station-aqi-hourly.md`
+- `system_docs/uk-aq-timeseries-aqi-hourly.md`
 - `system_docs/uk-aq-backfill-cloud-run.md`
 - `system_docs/uk-aq-r2-history-layout.md`
 - `system_docs/uk-aq-r2-history-dropbox-backup.md`

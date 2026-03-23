@@ -2,7 +2,7 @@
 
 Cloudflare Worker for AQI history reads with stitched sources:
 
-- recent data from `obs_aqidb` (`uk_aq_public.uk_aq_timeseries_aqi_hourly`)
+- recent data from `obs_aqidb` (`uk_aq_public.uk_aq_station_aqi_hourly`)
 - older data from R2 History
 
 Routes:

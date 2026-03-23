@@ -785,7 +785,7 @@ async function readRecentRowsFromObsAqiDb({
     || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
   const result = await fetchObsAqiDbArray({
     env,
-    path: "uk_aq_timeseries_aqi_hourly",
+    path: "uk_aq_station_aqi_hourly",
     schema,
     queryParams: [
       [

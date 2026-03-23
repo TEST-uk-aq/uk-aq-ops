@@ -23,8 +23,8 @@ Optional env vars:
   UK_AQ_BACKFILL_TRIGGER_MODE               default: manual
   UK_AQ_BACKFILL_ENABLE_R2_FALLBACK         default: false
   UK_AQ_BACKFILL_CONNECTOR_IDS              optional CSV filter (unset for all available adapters)
-  UK_AQ_BACKFILL_STATION_IDS                optional CSV station filter
-  UK_AQ_BACKFILL_STATION_ID                 optional single station filter alias
+  UK_AQ_BACKFILL_TIMESERIES_IDS             optional CSV timeseries filter
+  UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
   UK_AQ_BACKFILL_MONTHLY_LOG_DIR            default: logs/backfill/monthly
   UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR      default: true
   UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS default: 0

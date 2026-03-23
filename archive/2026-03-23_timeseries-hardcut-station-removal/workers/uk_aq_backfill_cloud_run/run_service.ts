@@ -21,6 +21,8 @@ type RequestBody = {
   to_day_utc?: unknown;
   connector_ids?: unknown;
   connector_id?: unknown;
+  station_ids?: unknown;
+  station_id?: unknown;
   enable_r2_fallback?: unknown;
 };
 
@@ -184,6 +186,34 @@ function resolveConnectorIds(
   return parseConnectorIds(body?.connector_id);
 }
 
+function resolveStationIds(
+  req: Request,
+  body: RequestBody | null,
+): number[] | null {
+  const queryCsv = readStringQuery(req, "station_ids");
+  if (queryCsv) {
+    return parseConnectorIds(queryCsv);
+  }
+
+  const querySingle = readStringQuery(req, "station_id");
+  if (querySingle) {
+    return parseConnectorIds(querySingle);
+  }
+
+  const headerCsv = (req.headers.get("x-uk-aq-backfill-station-ids") || "")
+    .trim();
+  if (headerCsv) {
+    return parseConnectorIds(headerCsv);
+  }
+
+  const bodyList = parseConnectorIds(body?.station_ids);
+  if (bodyList && bodyList.length) {
+    return bodyList;
+  }
+
+  return parseConnectorIds(body?.station_id);
+}
+
 async function runJob(args: {
   triggerMode: string;
   runMode: string;
@@ -192,6 +222,7 @@ async function runJob(args: {
   fromDayUtc: string | null;
   toDayUtc: string | null;
   connectorIds: number[] | null;
+  stationIds: number[] | null;
   enableR2Fallback: boolean;
 }): Promise<Deno.CommandStatus> {
   const env: Record<string, string> = {
@@ -211,6 +242,9 @@ async function runJob(args: {
   }
   if (args.connectorIds && args.connectorIds.length > 0) {
     env.UK_AQ_BACKFILL_CONNECTOR_IDS = args.connectorIds.join(",");
+  }
+  if (args.stationIds && args.stationIds.length > 0) {
+    env.UK_AQ_BACKFILL_STATION_IDS = args.stationIds.join(",");
   }
 
   const child = new Deno.Command("deno", {
@@ -280,6 +314,7 @@ serve(async (req: Request) => {
   const fromDayUtc = resolveFromDayUtc(req, body);
   const toDayUtc = resolveToDayUtc(req, body);
   const connectorIds = resolveConnectorIds(req, body);
+  const stationIds = resolveStationIds(req, body);
   const enableR2Fallback = resolveEnableR2Fallback(req, body);
 
   inFlight = true;
@@ -292,6 +327,7 @@ serve(async (req: Request) => {
       fromDayUtc,
       toDayUtc,
       connectorIds,
+      stationIds,
       enableR2Fallback,
     });
 
@@ -304,6 +340,7 @@ serve(async (req: Request) => {
       from_day_utc: fromDayUtc,
       to_day_utc: toDayUtc,
       connector_ids: connectorIds,
+      station_ids: stationIds,
       enable_r2_fallback: enableR2Fallback,
       code: status.code,
     }, status.success ? 200 : 500);

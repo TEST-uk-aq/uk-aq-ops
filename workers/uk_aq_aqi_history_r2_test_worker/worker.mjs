@@ -523,7 +523,7 @@ async function handleSupabaseDataRequest(request, env) {
   params.set("order", "timestamp_hour_utc.asc");
   params.set("limit", String(rowLimit));
 
-  const supabaseResponse = await fetch(`${baseUrl}/rest/v1/uk_aq_station_aqi_hourly?${params.toString()}`, {
+  const supabaseResponse = await fetch(`${baseUrl}/rest/v1/uk_aq_timeseries_aqi_hourly?${params.toString()}`, {
     method: "GET",
     headers: postgrestHeaders(key, schema),
   });
@@ -553,7 +553,7 @@ async function handleSupabaseDataRequest(request, env) {
     entity_id: String(stationId),
     query_from_utc: fromIso,
     query_to_utc: toIso,
-    source_path: `${schema}.uk_aq_station_aqi_hourly`,
+    source_path: `${schema}.uk_aq_timeseries_aqi_hourly`,
     object_bytes: null,
     object_etag: null,
     row_count: points.length,

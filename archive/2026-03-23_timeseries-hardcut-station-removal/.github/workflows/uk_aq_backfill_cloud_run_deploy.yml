@@ -53,9 +53,9 @@ jobs:
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
       UK_AQ_BACKFILL_OPS_SCHEMA: ${{ vars.UK_AQ_BACKFILL_OPS_SCHEMA || 'uk_aq_ops' }}
       UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC: ${{ vars.UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC || 'uk_aq_rpc_observations_hourly_fingerprint' }}
-      UK_AQ_BACKFILL_SOURCE_RPC: ${{ vars.UK_AQ_BACKFILL_SOURCE_RPC || 'uk_aq_rpc_timeseries_aqi_hourly_source' }}
-      UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC: ${{ vars.UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC || 'uk_aq_rpc_timeseries_aqi_hourly_upsert' }}
-      UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC: ${{ vars.UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC || 'uk_aq_rpc_timeseries_aqi_rollups_refresh' }}
+      UK_AQ_BACKFILL_SOURCE_RPC: ${{ vars.UK_AQ_BACKFILL_SOURCE_RPC || 'uk_aq_rpc_station_aqi_hourly_source' }}
+      UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC: ${{ vars.UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC || 'uk_aq_rpc_station_aqi_hourly_upsert' }}
+      UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC: ${{ vars.UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC || 'uk_aq_rpc_station_aqi_rollups_refresh' }}
       UK_AQ_BACKFILL_RPC_RETRIES: ${{ vars.UK_AQ_BACKFILL_RPC_RETRIES || '3' }}
       UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE: ${{ vars.UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE || '2000' }}
       UK_AQ_BACKFILL_INGEST_RETENTION_DAYS: ${{ vars.UK_AQ_BACKFILL_INGEST_RETENTION_DAYS || '7' }}

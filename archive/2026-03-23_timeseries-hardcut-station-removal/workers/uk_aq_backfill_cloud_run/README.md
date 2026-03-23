@@ -154,7 +154,7 @@ Retention / iteration:
 - `UK_AQ_BACKFILL_INGEST_RETENTION_DAYS` (default `7`)
 - `UK_AQ_BACKFILL_OBS_AQI_LOCAL_RETENTION_DAYS` (default `31`)
 - `UK_AQ_BACKFILL_LOCAL_TIMEZONE` (default `Europe/London`)
-- `UK_AQ_BACKFILL_TIMESERIES_ID_PAGE_SIZE` (default `1000`)
+- `UK_AQ_BACKFILL_STATION_ID_PAGE_SIZE` (default `1000`)
 - `UK_AQ_BACKFILL_HOURLY_UPSERT_CHUNK_SIZE` (default `2000`)
 - `UK_AQ_BACKFILL_RPC_RETRIES` (default `3`)
 
@@ -222,9 +222,9 @@ Breathe London source adapter:
 RPC names:
 
 - `UK_AQ_BACKFILL_HOURLY_FINGERPRINT_RPC` (default `uk_aq_rpc_observations_hourly_fingerprint`)
-- `UK_AQ_BACKFILL_SOURCE_RPC` (default `uk_aq_rpc_timeseries_aqi_hourly_source`)
-- `UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC` (default `uk_aq_rpc_timeseries_aqi_hourly_upsert`)
-- `UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC` (default `uk_aq_rpc_timeseries_aqi_rollups_refresh`)
+- `UK_AQ_BACKFILL_SOURCE_RPC` (default `uk_aq_rpc_station_aqi_hourly_source`)
+- `UK_AQ_BACKFILL_AQILEVELS_HOURLY_UPSERT_RPC` (default `uk_aq_rpc_station_aqi_hourly_upsert`)
+- `UK_AQ_BACKFILL_AQILEVELS_ROLLUP_REFRESH_RPC` (default `uk_aq_rpc_station_aqi_rollups_refresh`)
 - `UK_AQ_BACKFILL_OBS_R2_SOURCE_RPC` (default `uk_aq_rpc_observs_history_day_rows`; falls back to direct `uk_aq_observs.observations` table query when missing)
 - `UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC` (default `uk_aq_rpc_aqilevels_history_day_rows`)
 - `UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC` (default `uk_aq_rpc_aqilevels_history_day_connector_counts`)

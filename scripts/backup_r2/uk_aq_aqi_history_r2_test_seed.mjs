@@ -604,7 +604,7 @@ async function fetchStationHourlyRows({ baseUrl, key, sinceIso }) {
     baseUrl,
     key,
     schema: "uk_aq_public",
-    table: "uk_aq_station_aqi_hourly",
+    table: "uk_aq_timeseries_aqi_hourly",
     select: [
       "station_id",
       "timestamp_hour_utc",
