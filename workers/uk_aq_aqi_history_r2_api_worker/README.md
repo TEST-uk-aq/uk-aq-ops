@@ -40,6 +40,10 @@ R2 paths expected:
 - connector manifest:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
 - the worker resolves `station_id -> connector_id` from `uk_aq_public.uk_aq_station_connector_lookup` and reads only that connector manifest when available
+- optional AQI timeseries index (fast-path):
+  - `${UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
+  - the worker resolves station timeseries ids from `uk_aq_core.timeseries` and narrows parquet file scans using each file's `min_timeseries_id/max_timeseries_id`
+  - if the optional index is missing/invalid for a day+connector, it falls back to connector manifest file scanning
 - AQI parquet reads use `station_id` row-group stats and chunked column reads instead of materializing whole parquet files
 
 Serving rule:
@@ -64,13 +68,17 @@ Useful runtime vars:
 - `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default `168`)
 - `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS` (default `10000`)
 - `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE` (default `5000`)
+- `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
+- `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX` (default `history/_index/aqilevels_timeseries`)
+- `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED` (default `true`)
 - `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`)
+- `UK_AQ_CORE_SCHEMA` (default `uk_aq_core`)
 
 Response:
 
 - returns hourly points sorted by `period_start_utc` ascending:
   - `{ period_start_utc, daqi_index_level, eaqi_index_level, station_id }`
-- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `station_connector_*` lookup diagnostics, plus `obs_aqidb_status` / `r2_recent_fallback_*` when live recent reads fail).
+- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `station_connector_*` and `station_timeseries_*` lookup diagnostics, `coverage.timeseries_index`, plus `obs_aqidb_status` / `r2_recent_fallback_*` when live recent reads fail).
 - includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.
 
