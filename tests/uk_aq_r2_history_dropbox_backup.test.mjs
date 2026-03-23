@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildIndexDomainTreeRelativePath,
+  buildIndexDomainTreeTargets,
   buildIndexManifestRelativePath,
   buildIndexManifestTargets,
   planIndexManifestCopy,
@@ -39,6 +41,28 @@ test("buildIndexManifestTargets keeps only indexed domains and de-dupes them", (
       {
         domain: "aqilevels",
         relative_path: "history/_index/aqilevels_latest.json",
+      },
+    ],
+  );
+});
+
+test("buildIndexDomainTreeRelativePath normalizes the configured prefix", () => {
+  assert.equal(
+    buildIndexDomainTreeRelativePath("observations_timeseries", "/history/_index/"),
+    "history/_index/observations_timeseries",
+  );
+});
+
+test("buildIndexDomainTreeTargets expands observations into observations_timeseries tree", () => {
+  assert.deepEqual(
+    buildIndexDomainTreeTargets(
+      ["observations", "core", "aqilevels", "observations"],
+      "history/_index",
+    ),
+    [
+      {
+        domain: "observations_timeseries",
+        relative_path: "history/_index/observations_timeseries",
       },
     ],
   );

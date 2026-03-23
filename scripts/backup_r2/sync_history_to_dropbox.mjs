@@ -12,6 +12,9 @@ const INDEX_DOMAIN_NAMES = Object.freeze([
   "aqilevels",
   "observations_timeseries",
 ]);
+const INDEX_TREE_DOMAIN_NAMES = Object.freeze([
+  "observations_timeseries",
+]);
 
 function parseNonNegativeInt(rawValue, fallback) {
   const value = Number(rawValue);
@@ -326,6 +329,45 @@ export function buildIndexManifestTargets(
     }));
 }
 
+export function buildIndexDomainTreeRelativePath(
+  domain,
+  indexPrefix = DEFAULT_INDEX_PREFIX,
+) {
+  const normalizedDomain = String(domain || "").trim().toLowerCase();
+  if (!INDEX_TREE_DOMAIN_NAMES.includes(normalizedDomain)) {
+    throw new Error(`Invalid index tree domain: ${String(domain || "")}`);
+  }
+  const normalizedPrefix = normalizePrefix(indexPrefix || DEFAULT_INDEX_PREFIX);
+  if (!normalizedPrefix) {
+    return normalizedDomain;
+  }
+  return `${normalizedPrefix}/${normalizedDomain}`;
+}
+
+export function buildIndexDomainTreeTargets(
+  domains,
+  indexPrefix = DEFAULT_INDEX_PREFIX,
+) {
+  const requestedDomains = Array.from(new Set(
+    (Array.isArray(domains) ? domains : []).map((domain) =>
+      String(domain || "").trim().toLowerCase()
+    ),
+  ));
+
+  const expandedDomains = new Set();
+  for (const domain of requestedDomains) {
+    if (domain === "observations" || domain === "observations_timeseries") {
+      expandedDomains.add("observations_timeseries");
+    }
+  }
+
+  return Array.from(expandedDomains)
+    .map((domain) => ({
+      domain,
+      relative_path: buildIndexDomainTreeRelativePath(domain, indexPrefix),
+    }));
+}
+
 export function planIndexManifestCopy({ sourceText, destText }) {
   const normalizedSourceText = typeof sourceText === "string" ? sourceText : "";
   if (!normalizedSourceText) {
@@ -625,6 +667,27 @@ function copyFilePath(rcloneBin, sourcePath, destPath, dryRun) {
   runRclone(rcloneBin, args);
 }
 
+function rclonePathExists(rcloneBin, targetPath) {
+  const result = runRclone(
+    rcloneBin,
+    ["lsf", targetPath, "--max-depth", "1"],
+    { allow_failure: true },
+  );
+  if (result.status === 0) {
+    return true;
+  }
+  const combined = `${result.stderr}\n${result.stdout}`;
+  if (isRcloneNotFoundMessage(combined)) {
+    return false;
+  }
+  throw new Error(
+    [
+      `Failed to list path: ${targetPath}`,
+      combined.trim(),
+    ].filter(Boolean).join("\n"),
+  );
+}
+
 function syncIndexManifests(args, report) {
   const indexTargets = buildIndexManifestTargets(
     args.domains,
@@ -687,6 +750,46 @@ function syncIndexManifests(args, report) {
   }
 }
 
+function syncIndexDomainTrees(args, report) {
+  const indexTreeTargets = buildIndexDomainTreeTargets(
+    args.domains,
+    process.env.UK_AQ_R2_HISTORY_INDEX_PREFIX || DEFAULT_INDEX_PREFIX,
+  );
+
+  for (const target of indexTreeTargets) {
+    const sourcePath = joinTargetPath(args.source_root, target.relative_path);
+    const destPath = joinTargetPath(args.dest_root, target.relative_path);
+    const sourceFound = rclonePathExists(args.rclone_bin, sourcePath);
+
+    const summary = {
+      relative_path: target.relative_path,
+      source_path: sourcePath,
+      dest_path: destPath,
+      source_found: sourceFound,
+      status: sourceFound ? "copy_required" : "missing_source",
+      copied: false,
+    };
+
+    if (!sourceFound) {
+      report.index_trees[target.domain] = summary;
+      report.totals.index_trees_missing_source += 1;
+      continue;
+    }
+
+    report.totals.index_trees_needing_copy += 1;
+    if (!args.dry_run) {
+      copyDayFolder(args.rclone_bin, sourcePath, destPath, false);
+      summary.status = "copied";
+      summary.copied = true;
+      report.totals.index_trees_copied += 1;
+    } else {
+      summary.status = "planned_copy";
+    }
+
+    report.index_trees[target.domain] = summary;
+  }
+}
+
 async function main(args) {
   const startedAt = new Date().toISOString();
 
@@ -706,6 +809,7 @@ async function main(args) {
     max_days_per_run: args.max_days_per_run,
     domains: {},
     index_manifests: {},
+    index_trees: {},
     totals: {
       listed_days: 0,
       candidate_days: 0,
@@ -716,6 +820,9 @@ async function main(args) {
       index_manifests_copied: 0,
       index_manifests_skipped_existing: 0,
       index_manifests_missing_source: 0,
+      index_trees_needing_copy: 0,
+      index_trees_copied: 0,
+      index_trees_missing_source: 0,
     },
   };
 
@@ -814,6 +921,7 @@ async function main(args) {
   }
 
   syncIndexManifests(args, report);
+  syncIndexDomainTrees(args, report);
 
   report.completed_at = new Date().toISOString();
   writeReport(args.report_out, report);
