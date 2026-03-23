@@ -464,15 +464,15 @@ function sortHelperRows(rows) {
   rows.sort((left, right) => {
     if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
     if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
-    return Number(left.timeseries_id) - Number(right.timeseries_id);
+    return Number(left.station_id) - Number(right.station_id);
   });
   return rows;
 }
 
 function sortAqilevelHistoryRows(rows) {
   rows.sort((left, right) => {
-    if (Number(left.timeseries_id) !== Number(right.timeseries_id)) {
-      return Number(left.timeseries_id) - Number(right.timeseries_id);
+    if (Number(left.station_id) !== Number(right.station_id)) {
+      return Number(left.station_id) - Number(right.station_id);
     }
     if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
     if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
@@ -546,26 +546,18 @@ export function sourceObservationsToNarrowRows(rows) {
     ) {
       continue;
     }
-    const timeseriesId = Number(row.timeseries_id);
     const stationId = Number(row.station_id);
     const value = Number(row.value);
     const hourIso = parseIsoHour(row.observed_at);
-    if (
-      !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
-      !Number.isInteger(stationId) || stationId <= 0 || !hourIso
-    ) {
+    if (!Number.isInteger(stationId) || stationId <= 0 || !hourIso) {
       continue;
     }
     if (!Number.isFinite(value)) {
       continue;
     }
-    const key = `${Math.trunc(timeseriesId)}|${hourIso}`;
+    const key = `${Math.trunc(stationId)}|${hourIso}|${row.pollutant_code}`;
     const current = grouped.get(key) || {
-      timeseries_id: Math.trunc(timeseriesId),
       station_id: Math.trunc(stationId),
-      connector_id: Number.isInteger(Number(row.connector_id)) && Number(row.connector_id) > 0
-        ? Math.trunc(Number(row.connector_id))
-        : null,
       timestamp_hour_utc: hourIso,
       pollutant_code: row.pollutant_code,
       sum: 0,
@@ -577,9 +569,7 @@ export function sourceObservationsToNarrowRows(rows) {
   }
 
   const narrowRows = Array.from(grouped.values()).map((groupedRow) => ({
-    timeseries_id: groupedRow.timeseries_id,
     station_id: groupedRow.station_id,
-    connector_id: groupedRow.connector_id,
     timestamp_hour_utc: groupedRow.timestamp_hour_utc,
     pollutant_code: groupedRow.pollutant_code,
     hourly_mean_ugm3: groupedRow.count > 0
@@ -591,8 +581,8 @@ export function sourceObservationsToNarrowRows(rows) {
   narrowRows.sort((left, right) => {
     if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
     if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
-    if (left.timeseries_id !== right.timeseries_id) {
-      return left.timeseries_id - right.timeseries_id;
+    if (left.station_id !== right.station_id) {
+      return left.station_id - right.station_id;
     }
     return left.pollutant_code.localeCompare(right.pollutant_code);
   });
@@ -600,15 +590,15 @@ export function sourceObservationsToNarrowRows(rows) {
 }
 
 function computeRolling24h(helperRows) {
-  const byTimeseries = new Map();
+  const byStation = new Map();
   for (const row of helperRows) {
-    const timeseriesId = Number(row.timeseries_id);
-    const list = byTimeseries.get(timeseriesId) || [];
+    const stationId = Number(row.station_id);
+    const list = byStation.get(stationId) || [];
     list.push(row);
-    byTimeseries.set(timeseriesId, list);
+    byStation.set(stationId, list);
   }
 
-  for (const rows of byTimeseries.values()) {
+  for (const rows of byStation.values()) {
     sortHelperRows(rows);
     for (let currentIndex = 0; currentIndex < rows.length; currentIndex += 1) {
       const currentTs = Date.parse(rows[currentIndex].timestamp_hour_utc);
@@ -643,58 +633,47 @@ export function pivotNarrowRowsToHelperRows(narrowRows) {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
       continue;
     }
-    const timeseriesId = Number(row.timeseries_id);
     const stationId = Number(row.station_id);
-    const connectorId = Number(row.connector_id);
     const timestampHourUtc = normalizeIsoTimestamp(row.timestamp_hour_utc);
-    const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
-    if (
-      !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
-      !Number.isInteger(stationId) || stationId <= 0 ||
-      !timestampHourUtc ||
-      !(pollutantCode === "no2" || pollutantCode === "pm25" || pollutantCode === "pm10")
-    ) {
+    if (!Number.isInteger(stationId) || stationId <= 0 || !timestampHourUtc) {
       continue;
     }
-    const key = `${Math.trunc(timeseriesId)}|${timestampHourUtc}`;
+    const key = `${Math.trunc(stationId)}|${timestampHourUtc}`;
     const existing = byKey.get(key) || {
-      timeseries_id: Math.trunc(timeseriesId),
       station_id: Math.trunc(stationId),
-      connector_id: Number.isInteger(connectorId) && connectorId > 0
-        ? Math.trunc(connectorId)
-        : null,
-      pollutant_code: pollutantCode,
       timestamp_hour_utc: timestampHourUtc,
       no2_hourly_mean_ugm3: null,
       pm25_hourly_mean_ugm3: null,
       pm10_hourly_mean_ugm3: null,
       pm25_rolling24h_mean_ugm3: null,
       pm10_rolling24h_mean_ugm3: null,
-      hourly_sample_count: null,
+      no2_hourly_sample_count: null,
+      pm25_hourly_sample_count: null,
+      pm10_hourly_sample_count: null,
     };
 
     const sampleCount = row.sample_count === null || row.sample_count === undefined
       ? null
       : Math.trunc(Number(row.sample_count));
 
-    if (pollutantCode === "no2") {
+    if (row.pollutant_code === "no2") {
       existing.no2_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
           row.hourly_mean_ugm3 === undefined
         ? null
         : Number(row.hourly_mean_ugm3);
-      existing.hourly_sample_count = sampleCount;
-    } else if (pollutantCode === "pm25") {
+      existing.no2_hourly_sample_count = sampleCount;
+    } else if (row.pollutant_code === "pm25") {
       existing.pm25_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
           row.hourly_mean_ugm3 === undefined
         ? null
         : Number(row.hourly_mean_ugm3);
-      existing.hourly_sample_count = sampleCount;
-    } else if (pollutantCode === "pm10") {
+      existing.pm25_hourly_sample_count = sampleCount;
+    } else if (row.pollutant_code === "pm10") {
       existing.pm10_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
           row.hourly_mean_ugm3 === undefined
         ? null
         : Number(row.hourly_mean_ugm3);
-      existing.hourly_sample_count = sampleCount;
+      existing.pm10_hourly_sample_count = sampleCount;
     } else {
       continue;
     }
@@ -727,12 +706,7 @@ export function sourceObservationRowsToHelperRowsForDay(rows, dayUtc) {
 
 export function helperRowsToAqilevelHistoryRows(helperRows) {
   const rows = (Array.isArray(helperRows) ? helperRows : []).map((row) => ({
-    timeseries_id: Number(row.timeseries_id),
     station_id: Number(row.station_id),
-    connector_id: row.connector_id === null || row.connector_id === undefined
-      ? null
-      : Number(row.connector_id),
-    pollutant_code: String(row.pollutant_code || "").trim().toLowerCase(),
     timestamp_hour_utc: normalizeIsoTimestamp(row.timestamp_hour_utc),
     no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3 === null ||
         row.no2_hourly_mean_ugm3 === undefined
@@ -754,12 +728,18 @@ export function helperRowsToAqilevelHistoryRows(helperRows) {
         row.pm10_rolling24h_mean_ugm3 === undefined
       ? null
       : Number(row.pm10_rolling24h_mean_ugm3),
-    hourly_sample_count: row.hourly_sample_count === null ||
-        row.hourly_sample_count === undefined
+    no2_hourly_sample_count: row.no2_hourly_sample_count === null ||
+        row.no2_hourly_sample_count === undefined
       ? null
-      : Math.trunc(Number(row.hourly_sample_count)),
-    daqi_index_level: null,
-    eaqi_index_level: null,
+      : Math.trunc(Number(row.no2_hourly_sample_count)),
+    pm25_hourly_sample_count: row.pm25_hourly_sample_count === null ||
+        row.pm25_hourly_sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.pm25_hourly_sample_count)),
+    pm10_hourly_sample_count: row.pm10_hourly_sample_count === null ||
+        row.pm10_hourly_sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.pm10_hourly_sample_count)),
     daqi_no2_index_level: lookupAqiIndexLevel(
       row.no2_hourly_mean_ugm3,
       DAQI_NO2_BREAKPOINTS,
@@ -785,30 +765,9 @@ export function helperRowsToAqilevelHistoryRows(helperRows) {
       EAQI_PM10_BREAKPOINTS,
     ),
   })).filter((row) =>
-    Number.isInteger(row.timeseries_id) && row.timeseries_id > 0 &&
     Number.isInteger(row.station_id) && row.station_id > 0 &&
-    (row.pollutant_code === "no2" || row.pollutant_code === "pm25" || row.pollutant_code === "pm10") &&
     typeof row.timestamp_hour_utc === "string"
   );
-
-  for (const row of rows) {
-    const daqiCandidates = [
-      row.daqi_no2_index_level,
-      row.daqi_pm25_rolling24h_index_level,
-      row.daqi_pm10_rolling24h_index_level,
-    ].filter((value) => Number.isFinite(value));
-    row.daqi_index_level = daqiCandidates.length > 0
-      ? Math.max(...daqiCandidates)
-      : null;
-    const eaqiCandidates = [
-      row.eaqi_no2_index_level,
-      row.eaqi_pm25_index_level,
-      row.eaqi_pm10_index_level,
-    ].filter((value) => Number.isFinite(value));
-    row.eaqi_index_level = eaqiCandidates.length > 0
-      ? Math.max(...eaqiCandidates)
-      : null;
-  }
 
   return sortAqilevelHistoryRows(rows);
 }

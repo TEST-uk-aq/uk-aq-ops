@@ -25,8 +25,6 @@ function usage() {
     "  UK_AQ_R2_HISTORY_INDEX_PREFIX          default: history/_index",
     "  UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX",
     "                                         default: history/_index/observations_timeseries",
-    "  UK_AQ_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX",
-    "                                         default: history/_index/aqilevels_timeseries",
     "  UK_AQ_R2_HISTORY_INDEX_FETCH_CONCURRENCY",
     "  UK_AQ_R2_HISTORY_INDEX_MAX_KEYS",
   ].join("\n"));

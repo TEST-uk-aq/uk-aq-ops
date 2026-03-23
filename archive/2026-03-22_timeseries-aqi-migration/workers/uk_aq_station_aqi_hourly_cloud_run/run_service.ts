@@ -12,7 +12,7 @@ type RequestBody = {
   run_mode?: unknown;
   from_hour_utc?: unknown;
   to_hour_utc?: unknown;
-  timeseries_ids?: unknown;
+  station_ids?: unknown;
 };
 
 function parseTriggerMode(req: Request, body: RequestBody | null): string {
@@ -72,7 +72,7 @@ function parseIsoHour(value: unknown): string | null {
   return date.toISOString();
 }
 
-function parseTimeseriesIdsCsv(value: unknown): string | null {
+function parseStationIdsCsv(value: unknown): string | null {
   if (Array.isArray(value)) {
     const ids = value
       .map((entry) => Number(entry))
@@ -104,7 +104,7 @@ async function runJob(
   runMode: string,
   fromHourUtc: string | null,
   toHourUtc: string | null,
-  timeseriesIdsCsv: string | null,
+  stationIdsCsv: string | null,
 ): Promise<Deno.CommandStatus> {
   const env: Record<string, string> = {
     ...Deno.env.toObject(),
@@ -118,8 +118,8 @@ async function runJob(
   if (toHourUtc) {
     env.UK_AQ_AQI_TO_HOUR_UTC = toHourUtc;
   }
-  if (timeseriesIdsCsv) {
-    env.UK_AQ_AQI_TIMESERIES_IDS_CSV = timeseriesIdsCsv;
+  if (stationIdsCsv) {
+    env.UK_AQ_AQI_STATION_IDS_CSV = stationIdsCsv;
   }
 
   const child = new Deno.Command("deno", {
@@ -145,7 +145,7 @@ serve(async (req: Request) => {
     return new Response(
       JSON.stringify({
         ok: true,
-        service: "uk_aq_timeseries_aqi_hourly_cloud_run",
+        service: "uk_aq_station_aqi_hourly_cloud_run",
       }),
       {
         status: 200,
@@ -182,7 +182,7 @@ serve(async (req: Request) => {
   const runMode = parseRunMode(req, body);
   const fromHourUtc = parseIsoHour(body?.from_hour_utc);
   const toHourUtc = parseIsoHour(body?.to_hour_utc);
-  const timeseriesIdsCsv = parseTimeseriesIdsCsv(body?.timeseries_ids);
+  const stationIdsCsv = parseStationIdsCsv(body?.station_ids);
 
   inFlight = true;
   try {
@@ -191,7 +191,7 @@ serve(async (req: Request) => {
       runMode,
       fromHourUtc,
       toHourUtc,
-      timeseriesIdsCsv,
+      stationIdsCsv,
     );
 
     return new Response(
@@ -201,7 +201,7 @@ serve(async (req: Request) => {
         run_mode: runMode,
         from_hour_utc: fromHourUtc,
         to_hour_utc: toHourUtc,
-        timeseries_ids_csv: timeseriesIdsCsv,
+        station_ids_csv: stationIdsCsv,
         code: status.code,
       }),
       {

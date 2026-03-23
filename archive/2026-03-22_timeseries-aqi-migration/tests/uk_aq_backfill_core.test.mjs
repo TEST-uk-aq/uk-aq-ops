@@ -496,40 +496,17 @@ test("AQI history builders keep rolling 24h lookback across month boundaries and
   });
 
   assert.deepEqual(output.map((entry) => entry.day_utc), ["2025-02-01"]);
-  assert.equal(output[0].rows.length, 5);
-
-  const no2Row = output[0].rows.find((row) =>
-    row.timeseries_id === 2001 && row.timestamp_hour_utc === "2025-02-01T00:00:00.000Z"
-  );
-  assert.ok(no2Row);
-  assert.equal(no2Row.pollutant_code, "no2");
-  assert.equal(no2Row.hourly_sample_count, 2);
-  assert.equal(no2Row.daqi_no2_index_level, 2);
-  assert.equal(no2Row.eaqi_no2_index_level, 4);
-
-  const pm25Rows = output[0].rows
-    .filter((row) => row.timeseries_id === 2002)
-    .sort((left, right) => left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc));
-  assert.equal(pm25Rows.length, 2);
-  assert.equal(pm25Rows[0].timestamp_hour_utc, "2025-02-01T00:00:00.000Z");
-  assert.equal(pm25Rows[0].pollutant_code, "pm25");
-  assert.equal(pm25Rows[0].pm25_rolling24h_mean_ugm3, 30);
-  assert.equal(pm25Rows[1].timestamp_hour_utc, "2025-02-01T01:00:00.000Z");
-  assert.equal(pm25Rows[1].pm25_rolling24h_mean_ugm3, 24);
-
-  const pm10Rows = output[0].rows
-    .filter((row) => row.timeseries_id === 2003)
-    .sort((left, right) => left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc));
-  assert.equal(pm10Rows.length, 2);
-  assert.equal(pm10Rows[0].timestamp_hour_utc, "2025-02-01T00:00:00.000Z");
-  assert.equal(pm10Rows[0].pm10_rolling24h_mean_ugm3, 45);
-  assert.equal(pm10Rows[1].timestamp_hour_utc, "2025-02-01T01:00:00.000Z");
-  assert.equal(pm10Rows[1].pm10_rolling24h_mean_ugm3, 60);
-
-  assert.equal(
-    output[0].rows.every((row) => row.timestamp_hour_utc < "2025-02-02T00:00:00.000Z"),
-    true,
-  );
+  assert.equal(output[0].rows.length, 2);
+  assert.equal(output[0].rows[0].timestamp_hour_utc, "2025-02-01T00:00:00.000Z");
+  assert.equal(output[0].rows[0].pm25_rolling24h_mean_ugm3, 30);
+  assert.equal(output[0].rows[0].pm10_rolling24h_mean_ugm3, 45);
+  assert.equal(output[0].rows[0].no2_hourly_sample_count, 2);
+  assert.equal(output[0].rows[0].daqi_no2_index_level, 2);
+  assert.equal(output[0].rows[0].eaqi_no2_index_level, 4);
+  assert.equal(output[0].rows[1].timestamp_hour_utc, "2025-02-01T01:00:00.000Z");
+  assert.equal(output[0].rows[1].pm25_rolling24h_mean_ugm3, 24);
+  assert.equal(output[0].rows[1].pm10_rolling24h_mean_ugm3, 60);
+  assert.equal(output[0].rows.every((row) => row.timestamp_hour_utc < "2025-02-02T00:00:00.000Z"), true);
 });
 
 test("R2 observation AQI build matches the existing source-observation AQI path row-for-row", () => {

@@ -8,10 +8,7 @@ type RpcResult<T> = {
 type RunMode = "sync_hourly" | "backfill" | "reconcile_short" | "reconcile_deep";
 
 type HelperRow = {
-  timeseries_id: number;
-  station_id: number | null;
-  connector_id: number;
-  pollutant_code: "no2" | "pm25" | "pm10";
+  station_id: number;
   timestamp_hour_utc: string;
 
   no2_hourly_mean_ugm3: number | null;
@@ -20,7 +17,9 @@ type HelperRow = {
   pm25_rolling24h_mean_ugm3: number | null;
   pm10_rolling24h_mean_ugm3: number | null;
 
-  hourly_sample_count: number | null;
+  no2_hourly_sample_count: number | null;
+  pm25_hourly_sample_count: number | null;
+  pm10_hourly_sample_count: number | null;
 };
 
 type HourlyUpsertMetrics = {
@@ -28,8 +27,8 @@ type HourlyUpsertMetrics = {
   rows_changed: number;
   rows_inserted: number;
   rows_updated: number;
-  timeseries_hours_changed: number;
-  timeseries_hours_changed_gt_cutoff: number;
+  station_hours_changed: number;
+  station_hours_changed_gt_cutoff: number;
   max_changed_lag_hours: number | null;
 };
 
@@ -41,8 +40,14 @@ type RollupMetrics = {
 type HelperRefreshMetrics = {
   source_rows: number;
   rows_upserted: number;
-  timeseries_hours_changed: number;
+  station_hours_changed: number;
   max_changed_lag_hours: number | null;
+};
+
+type FilteredHelperRows = {
+  rows: HelperRow[];
+  missingStationIds: number[];
+  skippedRowCount: number;
 };
 
 type SyncWindow = {
@@ -54,6 +59,7 @@ type SyncWindow = {
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
 const HELPER_WINDOW_RPC_PAGE_SIZE = 1000;
+const OBS_STATION_LOOKUP_CHUNK_SIZE = 200;
 
 const INGEST_SUPABASE_URL = requiredEnv("SUPABASE_URL");
 const INGEST_PRIVILEGED_KEY = requiredEnvAny(["SB_SECRET_KEY"]);
@@ -61,13 +67,13 @@ const OBS_AQIDB_SUPABASE_URL = requiredEnv("OBS_AQIDB_SUPABASE_URL");
 const OBS_AQI_PRIVILEGED_KEY = requiredEnv("OBS_AQIDB_SECRET_KEY");
 
 const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
-const HELPER_UPSERT_RPC = "uk_aq_rpc_timeseries_aqi_hourly_helper_upsert";
+const HELPER_UPSERT_RPC = "uk_aq_rpc_station_aqi_hourly_helper_upsert";
 const HELPER_WINDOW_RPC = (Deno.env.get("UK_AQ_AQI_HELPER_WINDOW_RPC") ||
-  "uk_aq_rpc_timeseries_aqi_hourly_helper_window").trim();
+  "uk_aq_rpc_station_aqi_hourly_helper_window").trim();
 const HOURLY_UPSERT_RPC = (Deno.env.get("UK_AQ_AQI_HOURLY_UPSERT_RPC") ||
-  "uk_aq_rpc_timeseries_aqi_hourly_upsert").trim();
+  "uk_aq_rpc_station_aqi_hourly_upsert").trim();
 const ROLLUP_REFRESH_RPC = (Deno.env.get("UK_AQ_AQI_ROLLUP_REFRESH_RPC") ||
-  "uk_aq_rpc_timeseries_aqi_rollups_refresh").trim();
+  "uk_aq_rpc_station_aqi_rollups_refresh").trim();
 const RUN_LOG_RPC = (Deno.env.get("UK_AQ_AQI_RUN_LOG_RPC") ||
   "uk_aq_rpc_aqi_compute_run_log").trim();
 const RUN_CLEANUP_RPC = (Deno.env.get("UK_AQ_AQI_RUN_CLEANUP_RPC") ||
@@ -101,9 +107,13 @@ const RUN_LOG_RETENTION_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_RUN_LOG_RETENTION_DAYS"),
   7,
 );
+const OBS_STATION_LOOKUP_VIEW = (
+  Deno.env.get("UK_AQ_AQI_OBS_STATION_LOOKUP_VIEW") || "uk_aq_station_connector_lookup"
+).trim();
 const FROM_HOUR_UTC = optionalEnv("UK_AQ_AQI_FROM_HOUR_UTC");
 const TO_HOUR_UTC = optionalEnv("UK_AQ_AQI_TO_HOUR_UTC");
-const TIMESERIES_IDS = parseTimeseriesIdsCsv(optionalEnv("UK_AQ_AQI_TIMESERIES_IDS_CSV"));
+const STATION_IDS = parseStationIdsCsv(optionalEnv("UK_AQ_AQI_STATION_IDS_CSV"));
+const obsStationExistsCache = new Map<number, boolean>();
 
 function requiredEnv(name: string): string {
   const value = (Deno.env.get(name) || "").trim();
@@ -149,7 +159,7 @@ function parseRunMode(raw: string | undefined, fallback: RunMode): RunMode {
   return fallback;
 }
 
-function parseTimeseriesIdsCsv(raw: string | null): number[] | null {
+function parseStationIdsCsv(raw: string | null): number[] | null {
   if (!raw) {
     return null;
   }
@@ -208,7 +218,7 @@ async function postgrestRpc<T>(
     Accept: "application/json",
     "Accept-Profile": RPC_SCHEMA,
     "Content-Profile": RPC_SCHEMA,
-    "x-ukaq-egress-caller": "uk_aq_timeseries_aqi_hourly_cloud_run",
+    "x-ukaq-egress-caller": "uk_aq_station_aqi_hourly_cloud_run",
   };
 
   for (let attempt = 1; attempt <= RPC_RETRIES; attempt += 1) {
@@ -347,43 +357,30 @@ function parseHelperRows(payload: unknown): HelperRow[] {
       continue;
     }
     const row = item as Record<string, unknown>;
-    const timeseriesId = Number(row.timeseries_id);
-    const connectorId = Number(row.connector_id);
-    const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
-    const stationId = row.station_id === null || row.station_id === undefined
-      ? null
-      : Number(row.station_id);
+    const stationId = Number(row.station_id);
     const timestampRaw = String(row.timestamp_hour_utc || "").trim();
-    if (
-      !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
-      !Number.isInteger(connectorId) || connectorId <= 0 ||
-      (pollutantCode !== "no2" && pollutantCode !== "pm25" && pollutantCode !== "pm10") ||
-      Number.isNaN(Date.parse(timestampRaw))
-    ) {
+    if (!Number.isInteger(stationId) || stationId <= 0 || Number.isNaN(Date.parse(timestampRaw))) {
       continue;
     }
 
     rows.push({
-      timeseries_id: Math.trunc(timeseriesId),
-      station_id: Number.isInteger(stationId) && stationId !== null && stationId > 0
-        ? Math.trunc(stationId)
-        : null,
-      connector_id: Math.trunc(connectorId),
-      pollutant_code: pollutantCode as "no2" | "pm25" | "pm10",
+      station_id: Math.trunc(stationId),
       timestamp_hour_utc: hourIso(new Date(Date.parse(timestampRaw))),
       no2_hourly_mean_ugm3: toNullableNumber(row.no2_hourly_mean_ugm3),
       pm25_hourly_mean_ugm3: toNullableNumber(row.pm25_hourly_mean_ugm3),
       pm10_hourly_mean_ugm3: toNullableNumber(row.pm10_hourly_mean_ugm3),
       pm25_rolling24h_mean_ugm3: toNullableNumber(row.pm25_rolling24h_mean_ugm3),
       pm10_rolling24h_mean_ugm3: toNullableNumber(row.pm10_rolling24h_mean_ugm3),
-      hourly_sample_count: toNullableInt(row.hourly_sample_count),
+      no2_hourly_sample_count: toNullableInt(row.no2_hourly_sample_count),
+      pm25_hourly_sample_count: toNullableInt(row.pm25_hourly_sample_count),
+      pm10_hourly_sample_count: toNullableInt(row.pm10_hourly_sample_count),
     });
   }
 
   rows.sort((a, b) => {
     if (a.timestamp_hour_utc < b.timestamp_hour_utc) return -1;
     if (a.timestamp_hour_utc > b.timestamp_hour_utc) return 1;
-    return a.timeseries_id - b.timeseries_id;
+    return a.station_id - b.station_id;
   });
 
   return rows;
@@ -407,12 +404,8 @@ function parseHourlyUpsertMetrics(payload: unknown): HourlyUpsertMetrics {
     rows_changed: toSafeInt(row.rows_changed),
     rows_inserted: toSafeInt(row.rows_inserted),
     rows_updated: toSafeInt(row.rows_updated),
-    timeseries_hours_changed: toSafeInt(
-      row.timeseries_hours_changed ?? row.station_hours_changed,
-    ),
-    timeseries_hours_changed_gt_cutoff: toSafeInt(
-      row.timeseries_hours_changed_gt_cutoff ?? row.station_hours_changed_gt_cutoff,
-    ),
+    station_hours_changed: toSafeInt(row.station_hours_changed),
+    station_hours_changed_gt_cutoff: toSafeInt(row.station_hours_changed_gt_cutoff),
     max_changed_lag_hours: toNullableNumber(row.max_changed_lag_hours),
   };
 }
@@ -436,9 +429,7 @@ function parseHelperRefreshMetrics(payload: unknown): HelperRefreshMetrics {
   return {
     source_rows: toSafeInt(row.source_rows),
     rows_upserted: toSafeInt(row.rows_upserted),
-    timeseries_hours_changed: toSafeInt(
-      row.timeseries_hours_changed ?? row.station_hours_changed,
-    ),
+    station_hours_changed: toSafeInt(row.station_hours_changed),
     max_changed_lag_hours: toNullableNumber(row.max_changed_lag_hours),
   };
 }
@@ -454,13 +445,123 @@ function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
+async function fetchKnownObsStationIds(stationIds: number[]): Promise<Set<number>> {
+  const requestedIds = Array.from(new Set(
+    stationIds
+      .filter((stationId) => Number.isInteger(stationId) && stationId > 0)
+      .map((stationId) => Math.trunc(stationId)),
+  ));
+  if (requestedIds.length === 0) {
+    return new Set<number>();
+  }
+
+  const unresolvedIds = requestedIds.filter((stationId) => !obsStationExistsCache.has(stationId));
+  for (const chunk of chunkRows(unresolvedIds, OBS_STATION_LOOKUP_CHUNK_SIZE)) {
+    const query = new URLSearchParams();
+    query.set("select", "station_id");
+    query.set("station_id", `in.(${chunk.join(",")})`);
+    const url = `${normalizeUrl(OBS_AQIDB_SUPABASE_URL)}/${OBS_STATION_LOOKUP_VIEW}?${query.toString()}`;
+    const headers: Record<string, string> = {
+      apikey: OBS_AQI_PRIVILEGED_KEY,
+      Authorization: `Bearer ${OBS_AQI_PRIVILEGED_KEY}`,
+      Accept: "application/json",
+      "Accept-Profile": RPC_SCHEMA,
+      "x-ukaq-egress-caller": "uk_aq_station_aqi_hourly_cloud_run",
+    };
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers,
+    });
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const payload = contentType.includes("application/json")
+      ? await response.json().catch(() => null)
+      : await response.text().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(
+        `obs station lookup failed for ${OBS_STATION_LOOKUP_VIEW}: ${asErrorMessage(payload, response.status)}`,
+      );
+    }
+
+    const foundIds = new Set<number>();
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          continue;
+        }
+        const stationId = Number((item as Record<string, unknown>).station_id);
+        if (Number.isInteger(stationId) && stationId > 0) {
+          foundIds.add(Math.trunc(stationId));
+        }
+      }
+    }
+
+    for (const stationId of chunk) {
+      obsStationExistsCache.set(stationId, foundIds.has(stationId));
+    }
+  }
+
+  const existingIds = new Set<number>();
+  for (const stationId of requestedIds) {
+    if (obsStationExistsCache.get(stationId)) {
+      existingIds.add(stationId);
+    }
+  }
+  return existingIds;
+}
+
+async function filterHelperRowsForKnownObsStations(
+  helperRows: HelperRow[],
+): Promise<FilteredHelperRows> {
+  if (helperRows.length === 0) {
+    return {
+      rows: helperRows,
+      missingStationIds: [],
+      skippedRowCount: 0,
+    };
+  }
+
+  const existingStationIds = await fetchKnownObsStationIds(
+    helperRows.map((row) => row.station_id),
+  );
+  if (existingStationIds.size === 0) {
+    return {
+      rows: [],
+      missingStationIds: Array.from(new Set(helperRows.map((row) => row.station_id))).sort(
+        (a, b) => a - b,
+      ),
+      skippedRowCount: helperRows.length,
+    };
+  }
+
+  const filteredRows: HelperRow[] = [];
+  const missingStationIds = new Set<number>();
+  let skippedRowCount = 0;
+
+  for (const row of helperRows) {
+    if (existingStationIds.has(row.station_id)) {
+      filteredRows.push(row);
+      continue;
+    }
+    skippedRowCount += 1;
+    missingStationIds.add(row.station_id);
+  }
+
+  return {
+    rows: filteredRows,
+    missingStationIds: Array.from(missingStationIds).sort((a, b) => a - b),
+    skippedRowCount,
+  };
+}
+
 async function fetchHelperRowsPage(window: SyncWindow, offset: number): Promise<HelperRow[]> {
   const args: Record<string, unknown> = {
     p_hour_end_start_exclusive: hourIso(window.hourEndStartExclusive),
     p_hour_end_end_inclusive: hourIso(window.hourEndEndInclusive),
   };
-  if (TIMESERIES_IDS && TIMESERIES_IDS.length > 0) {
-    args.p_timeseries_ids = TIMESERIES_IDS;
+  if (STATION_IDS && STATION_IDS.length > 0) {
+    args.p_station_ids = STATION_IDS;
   }
   const query = new URLSearchParams({
     limit: String(HELPER_WINDOW_RPC_PAGE_SIZE),
@@ -490,8 +591,8 @@ async function refreshHelperWindow(window: SyncWindow): Promise<HelperRefreshMet
     p_hour_end_end_inclusive: hourIso(window.hourEndEndInclusive),
     p_reference_hour_end_utc: hourIso(window.referenceHourEnd),
   };
-  if (TIMESERIES_IDS && TIMESERIES_IDS.length > 0) {
-    args.p_timeseries_ids = TIMESERIES_IDS;
+  if (STATION_IDS && STATION_IDS.length > 0) {
+    args.p_station_ids = STATION_IDS;
   }
 
   const result = await postgrestRpc<unknown>(
@@ -515,15 +616,17 @@ async function main(): Promise<void> {
   const lateCutoffHour = addHours(referenceHourStart, -LATE_CHANGE_CUTOFF_HOURS);
 
   let sourceRowsCount = 0;
-  let candidateTimeseriesHours = 0;
+  let candidateStationHours = 0;
   let rowsUpserted = 0;
   let rowsChanged = 0;
-  let timeseriesHoursChanged = 0;
-  let timeseriesHoursChangedGt36h = 0;
+  let stationHoursChanged = 0;
+  let stationHoursChangedGt36h = 0;
   let maxChangedLagHours: number | null = null;
   let dailyRowsUpserted = 0;
   let monthlyRowsUpserted = 0;
   let helperPagesFetched = 0;
+  let skippedMissingStationRows = 0;
+  const skippedMissingStationIds = new Set<number>();
   let helperRefreshMetrics: HelperRefreshMetrics | null = null;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
@@ -533,19 +636,26 @@ async function main(): Promise<void> {
       helperRefreshMetrics = await refreshHelperWindow(window);
     }
 
-    const timeseriesIds = new Set<number>();
+    const stationIds = new Set<number>();
     let helperOffset = 0;
 
     while (true) {
-      const helperRows = await fetchHelperRowsPage(window, helperOffset);
+      const rawHelperRows = await fetchHelperRowsPage(window, helperOffset);
       helperPagesFetched += 1;
-      sourceRowsCount += helperRows.length;
-      candidateTimeseriesHours += helperRows.length;
+      sourceRowsCount += rawHelperRows.length;
+      candidateStationHours += rawHelperRows.length;
 
-      if (helperRows.length === 0) {
+      if (rawHelperRows.length === 0) {
         break;
       }
 
+      const filteredHelperRows = await filterHelperRowsForKnownObsStations(rawHelperRows);
+      skippedMissingStationRows += filteredHelperRows.skippedRowCount;
+      for (const stationId of filteredHelperRows.missingStationIds) {
+        skippedMissingStationIds.add(stationId);
+      }
+
+      const helperRows = filteredHelperRows.rows;
       const chunks = chunkRows(helperRows, Math.max(100, HOURLY_UPSERT_CHUNK_SIZE));
       for (const chunk of chunks) {
         const upsertResult = await postgrestRpc<unknown>(
@@ -564,8 +674,8 @@ async function main(): Promise<void> {
         const metrics = parseHourlyUpsertMetrics(upsertResult.data);
         rowsUpserted += metrics.rows_changed;
         rowsChanged += metrics.rows_changed;
-        timeseriesHoursChanged += metrics.timeseries_hours_changed;
-        timeseriesHoursChangedGt36h += metrics.timeseries_hours_changed_gt_cutoff;
+        stationHoursChanged += metrics.station_hours_changed;
+        stationHoursChangedGt36h += metrics.station_hours_changed_gt_cutoff;
         if (metrics.max_changed_lag_hours !== null) {
           maxChangedLagHours = maxChangedLagHours === null
             ? metrics.max_changed_lag_hours
@@ -574,16 +684,28 @@ async function main(): Promise<void> {
       }
 
       for (const row of helperRows) {
-        timeseriesIds.add(row.timeseries_id);
+        stationIds.add(row.station_id);
       }
 
-      if (helperRows.length < HELPER_WINDOW_RPC_PAGE_SIZE) {
+      if (rawHelperRows.length < HELPER_WINDOW_RPC_PAGE_SIZE) {
         break;
       }
       helperOffset += HELPER_WINDOW_RPC_PAGE_SIZE;
     }
 
-    if (timeseriesIds.size > 0) {
+    if (skippedMissingStationIds.size > 0) {
+      console.warn(JSON.stringify({
+        level: "warning",
+        event: "aqi_missing_obs_station_ids_skipped",
+        window_start_utc: hourIso(window.hourEndStartExclusive),
+        window_end_utc: hourIso(window.hourEndEndInclusive),
+        missing_station_id_count: skippedMissingStationIds.size,
+        skipped_row_count: skippedMissingStationRows,
+        sample_station_ids: Array.from(skippedMissingStationIds).slice(0, 20),
+      }));
+    }
+
+    if (stationIds.size > 0) {
       const rollupResult = await postgrestRpc<unknown>(
         OBS_AQIDB_SUPABASE_URL,
         OBS_AQI_PRIVILEGED_KEY,
@@ -591,7 +713,7 @@ async function main(): Promise<void> {
         {
           p_start_hour_utc: hourIso(window.hourEndStartExclusive),
           p_end_hour_utc: hourIso(window.hourEndEndInclusive),
-          p_timeseries_ids: Array.from(timeseriesIds),
+          p_station_ids: Array.from(stationIds),
         },
       );
       if (rollupResult.error) {
@@ -619,11 +741,11 @@ async function main(): Promise<void> {
       p_window_start_utc: hourIso(window.hourEndStartExclusive),
       p_window_end_utc: hourIso(window.hourEndEndInclusive),
       p_source_rows: sourceRowsCount,
-      p_candidate_station_hours: candidateTimeseriesHours,
+      p_candidate_station_hours: candidateStationHours,
       p_rows_upserted: rowsUpserted,
       p_rows_changed: rowsChanged,
-      p_station_hours_changed: timeseriesHoursChanged,
-      p_station_hours_changed_gt_36h: timeseriesHoursChangedGt36h,
+      p_station_hours_changed: stationHoursChanged,
+      p_station_hours_changed_gt_36h: stationHoursChangedGt36h,
       p_max_changed_lag_hours: maxChangedLagHours,
       p_deep_reconcile_effective: deepReconcileEffective,
       p_daily_rows_upserted: dailyRowsUpserted,
@@ -664,18 +786,21 @@ async function main(): Promise<void> {
     window_start_utc: hourIso(window.hourEndStartExclusive),
     window_end_utc: hourIso(window.hourEndEndInclusive),
     source_rows: sourceRowsCount,
-    candidate_timeseries_hours: candidateTimeseriesHours,
+    candidate_station_hours: candidateStationHours,
     rows_upserted: rowsUpserted,
     rows_changed: rowsChanged,
-    timeseries_hours_changed: timeseriesHoursChanged,
-    timeseries_hours_changed_gt_36h: timeseriesHoursChangedGt36h,
+    station_hours_changed: stationHoursChanged,
+    station_hours_changed_gt_36h: stationHoursChangedGt36h,
     max_changed_lag_hours: maxChangedLagHours,
     daily_rows_upserted: dailyRowsUpserted,
     monthly_rows_upserted: monthlyRowsUpserted,
     helper_pages_fetched: helperPagesFetched,
+    skipped_missing_station_rows: skippedMissingStationRows,
+    skipped_missing_station_id_count: skippedMissingStationIds.size,
+    skipped_missing_station_ids_sample: Array.from(skippedMissingStationIds).slice(0, 20),
     helper_refresh_source_rows: helperRefreshMetrics?.source_rows ?? null,
     helper_refresh_rows_upserted: helperRefreshMetrics?.rows_upserted ?? null,
-    helper_refresh_timeseries_hours_changed: helperRefreshMetrics?.timeseries_hours_changed ?? null,
+    helper_refresh_station_hours_changed: helperRefreshMetrics?.station_hours_changed ?? null,
     helper_refresh_max_changed_lag_hours: helperRefreshMetrics?.max_changed_lag_hours ?? null,
     duration_ms: durationMs,
     error: errorMessage,

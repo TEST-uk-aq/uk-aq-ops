@@ -34,8 +34,8 @@ const HISTORY_SCHEMA_NAME = "observations";
 const HISTORY_SCHEMA_VERSION = 2;
 const WRITER_VERSION = "parquet-wasm-zstd-v2";
 const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels";
-const HISTORY_AQILEVELS_SCHEMA_VERSION = 2;
-const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v2";
+const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
+const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v1";
 const AQILEVELS_CONNECTOR_COUNTS_RPC = "uk_aq_rpc_aqilevels_history_day_connector_counts";
 const AQILEVELS_ROWS_RPC = "uk_aq_rpc_aqilevels_history_day_rows";
 const DEFAULT_RPC_SCHEMA = "uk_aq_public";
@@ -57,18 +57,16 @@ export const HISTORY_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
 const HISTORY_OBSERVATIONS_COLUMNS = HISTORY_OBSERVATIONS_COLUMNS_V2;
 const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "connector_id",
-  "timeseries_id",
   "station_id",
-  "pollutant_code",
   "timestamp_hour_utc",
   "no2_hourly_mean_ugm3",
   "pm25_hourly_mean_ugm3",
   "pm10_hourly_mean_ugm3",
   "pm25_rolling24h_mean_ugm3",
   "pm10_rolling24h_mean_ugm3",
-  "hourly_sample_count",
-  "daqi_index_level",
-  "eaqi_index_level",
+  "no2_hourly_sample_count",
+  "pm25_hourly_sample_count",
+  "pm10_hourly_sample_count",
   "daqi_no2_index_level",
   "daqi_pm25_rolling24h_index_level",
   "daqi_pm10_rolling24h_index_level",
@@ -259,40 +257,6 @@ function summarizeObservationPartRows(rows) {
   };
 }
 
-function summarizeAqilevelPartRows(rows) {
-  let minTimeseriesId = null;
-  let maxTimeseriesId = null;
-  let minTimestampHourUtc = null;
-  let maxTimestampHourUtc = null;
-
-  for (const row of rows) {
-    const timeseriesId = Number(row.timeseries_id);
-    if (Number.isFinite(timeseriesId) && timeseriesId > 0) {
-      const normalizedTimeseriesId = Math.trunc(timeseriesId);
-      if (minTimeseriesId === null || normalizedTimeseriesId < minTimeseriesId) {
-        minTimeseriesId = normalizedTimeseriesId;
-      }
-      if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
-        maxTimeseriesId = normalizedTimeseriesId;
-      }
-    }
-    const timestampHourUtc = typeof row.timestamp_hour_utc === "string"
-      ? row.timestamp_hour_utc
-      : null;
-    if (timestampHourUtc) {
-      minTimestampHourUtc = minIso(minTimestampHourUtc, timestampHourUtc);
-      maxTimestampHourUtc = maxIso(maxTimestampHourUtc, timestampHourUtc);
-    }
-  }
-
-  return {
-    min_timeseries_id: minTimeseriesId,
-    max_timeseries_id: maxTimeseriesId,
-    min_timestamp_hour_utc: minTimestampHourUtc,
-    max_timestamp_hour_utc: maxTimestampHourUtc,
-  };
-}
-
 function uniqueSorted(values) {
   return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
 }
@@ -411,12 +375,6 @@ function toResumePartEntry(value, index) {
   const maxObservedAt = typeof value.max_observed_at === "string"
     ? value.max_observed_at
     : null;
-  const minTimestampHourUtc = typeof value.min_timestamp_hour_utc === "string"
-    ? value.min_timestamp_hour_utc
-    : null;
-  const maxTimestampHourUtc = typeof value.max_timestamp_hour_utc === "string"
-    ? value.max_timestamp_hour_utc
-    : null;
 
   return {
     key,
@@ -429,8 +387,6 @@ function toResumePartEntry(value, index) {
       Number.isFinite(maxTimeseriesId) && maxTimeseriesId > 0 ? Math.trunc(maxTimeseriesId) : null,
     min_observed_at: minObservedAt,
     max_observed_at: maxObservedAt,
-    min_timestamp_hour_utc: minTimestampHourUtc,
-    max_timestamp_hour_utc: maxTimestampHourUtc,
   };
 }
 
@@ -1042,8 +998,6 @@ function createAqilevelConnectorManifest({
   connectorId,
   runId,
   sourceRowCount,
-  minTimeseriesId,
-  maxTimeseriesId,
   minTimestampHourUtc,
   maxTimestampHourUtc,
   fileEntries,
@@ -1052,28 +1006,6 @@ function createAqilevelConnectorManifest({
 }) {
   const parquetObjectKeys = fileEntries.map((entry) => entry.key);
   const totalBytes = fileEntries.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const resolvedMinTimeseriesId = Number.isFinite(Number(minTimeseriesId))
-    && Number(minTimeseriesId) > 0
-    ? Math.trunc(Number(minTimeseriesId))
-    : fileEntries.reduce((current, entry) => {
-      const value = Number(entry.min_timeseries_id);
-      if (!Number.isFinite(value) || value <= 0) {
-        return current;
-      }
-      const normalized = Math.trunc(value);
-      return current === null ? normalized : Math.min(current, normalized);
-    }, null);
-  const resolvedMaxTimeseriesId = Number.isFinite(Number(maxTimeseriesId))
-    && Number(maxTimeseriesId) > 0
-    ? Math.trunc(Number(maxTimeseriesId))
-    : fileEntries.reduce((current, entry) => {
-      const value = Number(entry.max_timeseries_id);
-      if (!Number.isFinite(value) || value <= 0) {
-        return current;
-      }
-      const normalized = Math.trunc(value);
-      return current === null ? normalized : Math.max(current, normalized);
-    }, null);
   const stats = statsFromFileEntries(fileEntries, sourceRowCount);
 
   return withManifestHash({
@@ -1081,8 +1013,6 @@ function createAqilevelConnectorManifest({
     connector_id: connectorId,
     run_id: runId,
     source_row_count: Number(sourceRowCount),
-    min_timeseries_id: resolvedMinTimeseriesId,
-    max_timeseries_id: resolvedMaxTimeseriesId,
     min_timestamp_hour_utc: minTimestampHourUtc,
     max_timestamp_hour_utc: maxTimestampHourUtc,
     parquet_object_keys: parquetObjectKeys,
@@ -1107,10 +1037,6 @@ function createAqilevelDayManifest({ dayUtc, runId, connectorManifests, writerGi
       bytes: entry.bytes,
       row_count: entry.row_count,
       etag_or_hash: entry.etag_or_hash,
-      min_timeseries_id: entry.min_timeseries_id ?? null,
-      max_timeseries_id: entry.max_timeseries_id ?? null,
-      min_timestamp_hour_utc: entry.min_timestamp_hour_utc ?? null,
-      max_timestamp_hour_utc: entry.max_timestamp_hour_utc ?? null,
     }))
   );
 
@@ -1118,22 +1044,6 @@ function createAqilevelDayManifest({ dayUtc, runId, connectorManifests, writerGi
   const totalRows = connectorManifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
   const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
   const connectorIds = connectorManifests.map((manifest) => Number(manifest.connector_id));
-  const minTimeseriesId = connectorManifests.reduce((current, manifest) => {
-    const value = Number(manifest.min_timeseries_id);
-    if (!Number.isFinite(value) || value <= 0) {
-      return current;
-    }
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.min(current, normalized);
-  }, null);
-  const maxTimeseriesId = connectorManifests.reduce((current, manifest) => {
-    const value = Number(manifest.max_timeseries_id);
-    if (!Number.isFinite(value) || value <= 0) {
-      return current;
-    }
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.max(current, normalized);
-  }, null);
 
   const minTimestampHourUtc = connectorManifests.reduce(
     (current, manifest) => minIso(current, manifest.min_timestamp_hour_utc || null),
@@ -1152,8 +1062,6 @@ function createAqilevelDayManifest({ dayUtc, runId, connectorManifests, writerGi
     connector_ids: connectorIds,
     run_id: runId,
     source_row_count: totalRows,
-    min_timeseries_id: minTimeseriesId,
-    max_timeseries_id: maxTimeseriesId,
     min_timestamp_hour_utc: minTimestampHourUtc,
     max_timestamp_hour_utc: maxTimestampHourUtc,
     parquet_object_keys: parquetObjectKeys,
@@ -1164,8 +1072,6 @@ function createAqilevelDayManifest({ dayUtc, runId, connectorManifests, writerGi
       connector_id: manifest.connector_id,
       manifest_key: manifest.manifest_key,
       source_row_count: manifest.source_row_count,
-      min_timeseries_id: manifest.min_timeseries_id ?? null,
-      max_timeseries_id: manifest.max_timeseries_id ?? null,
       file_count: manifest.file_count,
       total_bytes: manifest.total_bytes,
     })),
@@ -1217,18 +1123,16 @@ function rowsToAqilevelParquetBuffer(rows, writerProperties) {
   ensureParquetWasmInitialized();
   const table = arrow.tableFromArrays({
     connector_id: rows.map((row) => Number(row.connector_id)),
-    timeseries_id: rows.map((row) => Number(row.timeseries_id)),
     station_id: rows.map((row) => Number(row.station_id)),
-    pollutant_code: rows.map((row) => String(row.pollutant_code || "")),
     timestamp_hour_utc: rows.map((row) => new Date(row.timestamp_hour_utc)),
     no2_hourly_mean_ugm3: rows.map((row) => row.no2_hourly_mean_ugm3),
     pm25_hourly_mean_ugm3: rows.map((row) => row.pm25_hourly_mean_ugm3),
     pm10_hourly_mean_ugm3: rows.map((row) => row.pm10_hourly_mean_ugm3),
     pm25_rolling24h_mean_ugm3: rows.map((row) => row.pm25_rolling24h_mean_ugm3),
     pm10_rolling24h_mean_ugm3: rows.map((row) => row.pm10_rolling24h_mean_ugm3),
-    hourly_sample_count: rows.map((row) => row.hourly_sample_count),
-    daqi_index_level: rows.map((row) => row.daqi_index_level),
-    eaqi_index_level: rows.map((row) => row.eaqi_index_level),
+    no2_hourly_sample_count: rows.map((row) => row.no2_hourly_sample_count),
+    pm25_hourly_sample_count: rows.map((row) => row.pm25_hourly_sample_count),
+    pm10_hourly_sample_count: rows.map((row) => row.pm10_hourly_sample_count),
     daqi_no2_index_level: rows.map((row) => row.daqi_no2_index_level),
     daqi_pm25_rolling24h_index_level: rows.map((row) => row.daqi_pm25_rolling24h_index_level),
     daqi_pm10_rolling24h_index_level: rows.map((row) => row.daqi_pm10_rolling24h_index_level),
@@ -1508,12 +1412,6 @@ function toAqilevelConnectorCountRow(row) {
   return {
     connector_id: Number(row.connector_id),
     expected_row_count: parseBigInt(expectedRowCountValue, "aqi_expected_row_count"),
-    min_timeseries_id: Number.isFinite(Number(row.min_timeseries_id))
-      ? Math.max(1, Math.trunc(Number(row.min_timeseries_id)))
-      : null,
-    max_timeseries_id: Number.isFinite(Number(row.max_timeseries_id))
-      ? Math.max(1, Math.trunc(Number(row.max_timeseries_id)))
-      : null,
     min_timestamp_hour_utc: row.min_timestamp_hour_utc
       ? new Date(row.min_timestamp_hour_utc).toISOString()
       : null,
@@ -1534,24 +1432,12 @@ function hasAqilevelSourceConfig(runtime) {
   );
 }
 
-function normalizeAqilevelHistoryRow(row, connectorIdFallback = null) {
+function normalizeAqilevelHistoryRow(row) {
   if (!row || typeof row !== "object" || Array.isArray(row)) {
     return null;
   }
-  const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
   const parsed = {
-    timeseries_id: Number(row.timeseries_id),
     station_id: Number(row.station_id),
-    connector_id: Number.isFinite(Number(row.connector_id)) && Number(row.connector_id) > 0
-      ? Number(row.connector_id)
-      : Number.isFinite(Number(connectorIdFallback)) && Number(connectorIdFallback) > 0
-      ? Number(connectorIdFallback)
-      : null,
-    pollutant_code: (
-      pollutantCode === "no2" || pollutantCode === "pm25" || pollutantCode === "pm10"
-    )
-      ? pollutantCode
-      : null,
     timestamp_hour_utc: row.timestamp_hour_utc ? new Date(row.timestamp_hour_utc).toISOString() : null,
     no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3 === null || row.no2_hourly_mean_ugm3 === undefined
       ? null
@@ -1568,15 +1454,15 @@ function normalizeAqilevelHistoryRow(row, connectorIdFallback = null) {
     pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3 === null || row.pm10_rolling24h_mean_ugm3 === undefined
       ? null
       : Number(row.pm10_rolling24h_mean_ugm3),
-    hourly_sample_count: row.hourly_sample_count === null || row.hourly_sample_count === undefined
+    no2_hourly_sample_count: row.no2_hourly_sample_count === null || row.no2_hourly_sample_count === undefined
       ? null
-      : Number(row.hourly_sample_count),
-    daqi_index_level: row.daqi_index_level === null || row.daqi_index_level === undefined
+      : Number(row.no2_hourly_sample_count),
+    pm25_hourly_sample_count: row.pm25_hourly_sample_count === null || row.pm25_hourly_sample_count === undefined
       ? null
-      : Number(row.daqi_index_level),
-    eaqi_index_level: row.eaqi_index_level === null || row.eaqi_index_level === undefined
+      : Number(row.pm25_hourly_sample_count),
+    pm10_hourly_sample_count: row.pm10_hourly_sample_count === null || row.pm10_hourly_sample_count === undefined
       ? null
-      : Number(row.eaqi_index_level),
+      : Number(row.pm10_hourly_sample_count),
     daqi_no2_index_level: row.daqi_no2_index_level === null || row.daqi_no2_index_level === undefined
       ? null
       : Number(row.daqi_no2_index_level),
@@ -1599,13 +1485,7 @@ function normalizeAqilevelHistoryRow(row, connectorIdFallback = null) {
       : Number(row.eaqi_pm10_index_level),
   };
 
-  if (
-    !Number.isFinite(parsed.timeseries_id) || parsed.timeseries_id <= 0 ||
-    !Number.isFinite(parsed.station_id) || parsed.station_id <= 0 ||
-    !Number.isFinite(parsed.connector_id) || parsed.connector_id <= 0 ||
-    !parsed.pollutant_code ||
-    !parsed.timestamp_hour_utc
-  ) {
+  if (!Number.isFinite(parsed.station_id) || parsed.station_id <= 0 || !parsed.timestamp_hour_utc) {
     return null;
   }
   return parsed;
@@ -1632,7 +1512,7 @@ async function fetchAqilevelConnectorCounts(runtime, dayUtc) {
     .filter((row) => Number.isInteger(row.connector_id) && row.connector_id > 0 && row.expected_row_count > 0n);
 }
 
-async function fetchAqilevelRowsPage(runtime, { dayUtc, connectorId, afterTimeseriesId, afterTimestampHourUtc, limit }) {
+async function fetchAqilevelRowsPage(runtime, { dayUtc, connectorId, afterStationId, afterTimestampHourUtc, limit }) {
   const payload = await postgrestRpc({
     baseUrl: runtime.aqilevels_source.base_url,
     privilegedKey: runtime.aqilevels_source.privileged_key,
@@ -1641,7 +1521,7 @@ async function fetchAqilevelRowsPage(runtime, { dayUtc, connectorId, afterTimese
     payload: {
       p_day_utc: dayUtc,
       p_connector_id: connectorId,
-      p_after_timeseries_id: afterTimeseriesId,
+      p_after_station_id: afterStationId,
       p_after_timestamp_hour_utc: afterTimestampHourUtc,
       p_limit: limit,
     },
@@ -1653,7 +1533,7 @@ async function fetchAqilevelRowsPage(runtime, { dayUtc, connectorId, afterTimese
 
   const normalized = [];
   for (const row of payload) {
-    const parsed = normalizeAqilevelHistoryRow(row, connectorId);
+    const parsed = normalizeAqilevelHistoryRow(row);
     if (parsed) {
       normalized.push(parsed);
     }
@@ -1703,7 +1583,7 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
   let totalBytes = 0n;
   let minTimestampHourUtc = null;
   let maxTimestampHourUtc = null;
-  let cursorAfterTimeseriesId = null;
+  let cursorAfterStationId = null;
   let cursorAfterTimestampHourUtc = null;
   let pageCount = 0;
 
@@ -1713,7 +1593,6 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     }
     const partRows = pendingRows;
     pendingRows = [];
-    const partSummary = summarizeAqilevelPartRows(partRows);
 
     const partKey = buildPartKey(runtime.aqilevels_prefix, dayUtc, connectorId, partIndex);
     const parquetBuffer = rowsToAqilevelParquetBuffer(
@@ -1740,10 +1619,6 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
       row_count: partRows.length,
       bytes,
       etag_or_hash: etagOrHash,
-      min_timeseries_id: partSummary.min_timeseries_id,
-      max_timeseries_id: partSummary.max_timeseries_id,
-      min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
-      max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
     });
     partIndex += 1;
     observedRows += BigInt(partRows.length);
@@ -1761,7 +1636,7 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     const pageRows = await fetchAqilevelRowsPage(runtime, {
       dayUtc,
       connectorId,
-      afterTimeseriesId: cursorAfterTimeseriesId,
+      afterStationId: cursorAfterStationId,
       afterTimestampHourUtc: cursorAfterTimestampHourUtc,
       limit: runtime.cursor_fetch_rows,
     });
@@ -1779,18 +1654,16 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
 
       pendingRows.push({
         connector_id: connectorId,
-        timeseries_id: row.timeseries_id,
         station_id: row.station_id,
-        pollutant_code: row.pollutant_code,
         timestamp_hour_utc: row.timestamp_hour_utc,
         no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3,
         pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3,
         pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3,
         pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3,
         pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3,
-        hourly_sample_count: row.hourly_sample_count,
-        daqi_index_level: row.daqi_index_level,
-        eaqi_index_level: row.eaqi_index_level,
+        no2_hourly_sample_count: row.no2_hourly_sample_count,
+        pm25_hourly_sample_count: row.pm25_hourly_sample_count,
+        pm10_hourly_sample_count: row.pm10_hourly_sample_count,
         daqi_no2_index_level: row.daqi_no2_index_level,
         daqi_pm25_rolling24h_index_level: row.daqi_pm25_rolling24h_index_level,
         daqi_pm10_rolling24h_index_level: row.daqi_pm10_rolling24h_index_level,
@@ -1805,16 +1678,16 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     }
 
     const last = pageRows[pageRows.length - 1];
-    const nextAfterTimeseriesId = Number(last.timeseries_id);
+    const nextAfterStationId = Number(last.station_id);
     const nextAfterTimestampHourUtc = String(last.timestamp_hour_utc);
-    const cursorUnchanged = nextAfterTimeseriesId === cursorAfterTimeseriesId
+    const cursorUnchanged = nextAfterStationId === cursorAfterStationId
       && nextAfterTimestampHourUtc === cursorAfterTimestampHourUtc;
     if (cursorUnchanged) {
       throw new Error(
         `AQI source RPC cursor did not advance for day=${dayUtc} connector=${connectorId}`,
       );
     }
-    cursorAfterTimeseriesId = nextAfterTimeseriesId;
+    cursorAfterStationId = nextAfterStationId;
     cursorAfterTimestampHourUtc = nextAfterTimestampHourUtc;
   }
 
@@ -1834,8 +1707,6 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     connectorId,
     runId: runtime.run_id,
     sourceRowCount: Number(observedRows),
-    minTimeseriesId: connector.min_timeseries_id ?? null,
-    maxTimeseriesId: connector.max_timeseries_id ?? null,
     minTimestampHourUtc: minTimestampHourUtc || connector.min_timestamp_hour_utc || null,
     maxTimestampHourUtc: maxTimestampHourUtc || connector.max_timestamp_hour_utc || null,
     fileEntries,
