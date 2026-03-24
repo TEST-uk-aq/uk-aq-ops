@@ -65,6 +65,8 @@ jobs:
       UK_AQ_R2_HISTORY_STAGING_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_STAGING_PREFIX || 'history/v1/_ops/observations/staging' }}
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_RUNS_PREFIX || 'history/v1/_ops/observations/runs' }}
+      UK_AQ_CHART_METRICS_RETENTION_DAYS: ${{ vars.UK_AQ_CHART_METRICS_RETENTION_DAYS || '90' }}
+      UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS: ${{ vars.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS || '7' }}
       R2_BUCKET_PROD: ${{ vars.R2_BUCKET_PROD || '' }}
       R2_BUCKET_STAGE: ${{ vars.R2_BUCKET_STAGE || '' }}
       R2_BUCKET_DEV: ${{ vars.R2_BUCKET_DEV || '' }}
@@ -314,6 +316,8 @@ jobs:
           env_updates+=("UK_AQ_R2_HISTORY_STAGING_PREFIX=${UK_AQ_R2_HISTORY_STAGING_PREFIX}")
           env_updates+=("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX=${UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX}")
           env_updates+=("UK_AQ_R2_HISTORY_RUNS_PREFIX=${UK_AQ_R2_HISTORY_RUNS_PREFIX}")
+          env_updates+=("UK_AQ_CHART_METRICS_RETENTION_DAYS=${UK_AQ_CHART_METRICS_RETENTION_DAYS}")
+          env_updates+=("UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS=${UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS}")
           env_updates+=("CFLARE_R2_ENDPOINT=${CFLARE_R2_ENDPOINT}")
           env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
           if [ -n "${R2_BUCKET_PROD:-}" ]; then

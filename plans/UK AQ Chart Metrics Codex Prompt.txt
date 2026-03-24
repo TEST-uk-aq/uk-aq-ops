@@ -1,0 +1,324 @@
+You are working in the `uk-aq` and `uk-aq-ops` repos.
+
+Goal:
+Add real-user chart load telemetry for the station chart so we can measure how long different timescales take to load for observations and AQI levels, and whether cache was used. Store raw per-load summary rows in `obs_aqidb`, and also maintain a UTC daily rollup table split by key dimensions.
+
+Important constraints:
+- Real-user only. Do not add any synthetic benchmarking, Playwright, cron browser tests, or similar.
+- UTC everywhere for telemetry storage and aggregation.
+- No localhost-specific work is needed.
+- Production and test are separate repos / separate Supabase / separate Cloudflare environments, so do not add an environment field just for that.
+- Do not add a visible debug panel.
+- Log all chart loads for now, but structure the code so later sampling can be introduced easily.
+- The telemetry endpoint should be lightweight and independent of Turnstile unless there is a clear security need. Use validation and rate limiting instead of coupling telemetry delivery to Turnstile.
+- Store anonymous IDs only. Do not store IP address, user agent raw string, or any personal identifiers in the database.
+- Keep one raw summary row per chart load attempt. Do not create a detailed per-event table in this first version.
+- Log both success and failure cases.
+- Anything outside the website should go in `uk-aq-ops`.
+- Follow existing repo conventions, naming, structure, and AGENTS guidance if present.
+
+What to implement
+
+## 1) Website repo: add client-side chart telemetry
+In the `uk-aq` website repo, update the station chart HTML / JS so that each chart load attempt creates one telemetry summary object and sends it to a new ops endpoint.
+
+Target page:
+- the station chart page / code used by `uk_aq_stations_chart.html`
+
+Instrument the existing load flow so timings are measured with `performance.now()` and captured into a single summary object for each chart load attempt.
+
+Log these chart actions as `load_reason`:
+- `initial`
+- `station_change`
+- `timescale_change`
+- `pollutant_change`
+- `refresh`
+
+Use anonymous IDs:
+- `page_view_id`: random UUID created once per page view
+- `request_group_id`: random UUID created once per chart load attempt
+- optional `session_id`: anonymous short-lived random UUID persisted locally if useful, but do not make it personally identifying
+
+Do not add a visible metrics UI.
+
+### Telemetry fields to capture from the browser
+Capture as many of these as the existing chart flow can support cleanly:
+
+Identity / dimensions:
+- `page_name` = `uk_aq_stations_chart`
+- `page_view_id`
+- `request_group_id`
+- `session_id` if implemented
+- `load_reason`
+- `station_id` if known
+- `timeseries_id` if known
+- `station_label` or similar non-sensitive identifier if already present and useful
+- `pollutant`
+- `window_label` such as `12h`, `24h`, `7d`, `31d`, `90d`, `custom`
+
+Outcome:
+- `success` boolean
+- `error_stage` nullable text
+- `error_message` nullable text, truncated / sanitized so it stays short and contains no sensitive info
+
+Timings in milliseconds:
+- `total_load_ms`
+- `time_to_first_obs_response_ms`
+- `time_to_first_obs_render_ms`
+- `time_to_obs_complete_ms`
+- `time_to_aqi_complete_ms`
+- `time_to_chart_ready_ms`
+- `cache_session_init_ms` if applicable from the current flow
+- `turnstile_ms` only if this can be captured naturally without forcing telemetry to depend on Turnstile
+
+Observation load detail:
+- `obs_chunk_count`
+- `obs_network_request_count`
+- `obs_total_points`
+- `obs_used_local_cache` boolean
+- `obs_used_etag` boolean if applicable
+- `obs_received_304` boolean if applicable
+- `obs_cache_mode` text, e.g. one of:
+  - `local_only`
+  - `local_plus_refresh`
+  - `network_full`
+  - `network_chunked`
+  - `unknown`
+
+AQI load detail:
+- `aqi_supported` boolean
+- `aqi_network_request_count`
+- `aqi_total_points`
+- `aqi_used_local_cache` boolean
+- `aqi_received_304` boolean if applicable later, otherwise wire structure so it can be added later
+
+Overall cache classification:
+- `cache_session_was_warm` boolean if determinable
+- `overall_cache_class` text, one of:
+  - `cold`
+  - `warm_local`
+  - `warm_http_304`
+  - `mixed`
+  - `bypass`
+  - `unknown`
+
+Optional light device/network info if safely available and non-sensitive:
+- `network_effective_type`
+- `device_memory_gb`
+- `hardware_concurrency`
+
+App versioning:
+- include a lightweight `app_version` or `git_sha` field if there is already a clean way to expose this in the website build/runtime; otherwise leave a TODO note rather than inventing something messy
+
+### Browser instrumentation requirements
+- Reuse the current chart flow and attach telemetry at the natural load boundaries rather than rewriting chart logic.
+- Ensure each chart load attempt emits at most one telemetry payload.
+- Send telemetry after completion and also on failure paths.
+- Prefer `navigator.sendBeacon()` for delivery.
+- Add a fallback using `fetch(..., { keepalive: true })`.
+- Do not block chart rendering on telemetry.
+- Do not let telemetry errors break the chart.
+- Keep payload compact.
+- Structure code so sampling can be introduced later with one obvious gate, but do not sample yet.
+
+### Cache classification rules
+Implement cache classification clearly and centrally so future changes are easy:
+- `obs_used_local_cache`: true when observations were available from local/browser cache before or instead of a network result
+- `aqi_used_local_cache`: same idea for AQI
+- `obs_received_304`: true when observation fetch was validated with ETag and got 304
+- `cache_session_was_warm`: true when the existing cache/session warm-up was already satisfied
+- `overall_cache_class`:
+  - `warm_local` when local/browser cached data materially served the load and there was no obvious cold fetch dominance
+  - `warm_http_304` when HTTP validation / 304 materially served the load
+  - `mixed` when both cache-assisted and network fetch behaviour are involved
+  - `cold` when it is effectively a fresh network-driven load
+  - `bypass` if a no-cache / forced-refresh style path exists
+  - `unknown` as safe fallback
+
+Use pragmatic logic and add comments documenting the exact rules.
+
+## 2) Ops repo: add telemetry ingest endpoint
+In `uk-aq-ops`, add a lightweight endpoint to receive chart telemetry from the website and insert it into `obs_aqidb`.
+
+Requirements:
+- Add a dedicated endpoint for chart metrics ingestion
+- Validate payload shape and types strictly
+- Reject oversized payloads
+- Add lightweight rate limiting appropriate for a public write endpoint
+- Return success quickly
+- Do not require Turnstile unless absolutely necessary
+- Keep endpoint logic small and robust
+- Log server-side ingestion failures appropriately without leaking sensitive info
+- Insert one row into the raw metrics table per accepted telemetry payload
+- Use UTC timestamps from server side for `created_at`
+
+Please follow existing API / service patterns in `uk-aq-ops`. Put new code in the ops repo, not the website repo.
+
+## 3) Database: raw telemetry table in obs_aqidb
+Add schema / migration work for a new raw table in `obs_aqidb`.
+
+Suggested schema name:
+- use the appropriate existing schema conventions in the project
+- if there is an ops/admin schema already used for operational tables, prefer that
+
+Suggested table name:
+- `chart_load_metrics`
+
+Create a raw summary table with one row per chart load attempt.
+
+Recommended columns:
+- `id bigserial primary key`
+- `created_at timestamptz not null default now()`
+- `page_name text not null`
+- `page_view_id uuid not null`
+- `request_group_id uuid not null`
+- `session_id uuid null`
+- `load_reason text not null`
+- `station_id bigint null`
+- `timeseries_id bigint null`
+- `station_label text null`
+- `pollutant text null`
+- `window_label text null`
+- `success boolean not null`
+- `error_stage text null`
+- `error_message text null`
+- `total_load_ms integer null`
+- `time_to_first_obs_response_ms integer null`
+- `time_to_first_obs_render_ms integer null`
+- `time_to_obs_complete_ms integer null`
+- `time_to_aqi_complete_ms integer null`
+- `time_to_chart_ready_ms integer null`
+- `cache_session_init_ms integer null`
+- `turnstile_ms integer null`
+- `obs_chunk_count integer null`
+- `obs_network_request_count integer null`
+- `obs_total_points integer null`
+- `obs_used_local_cache boolean null`
+- `obs_used_etag boolean null`
+- `obs_received_304 boolean null`
+- `obs_cache_mode text null`
+- `aqi_supported boolean null`
+- `aqi_network_request_count integer null`
+- `aqi_total_points integer null`
+- `aqi_used_local_cache boolean null`
+- `aqi_received_304 boolean null`
+- `cache_session_was_warm boolean null`
+- `overall_cache_class text null`
+- `network_effective_type text null`
+- `device_memory_gb numeric null`
+- `hardware_concurrency integer null`
+- `app_version text null`
+
+Add sensible constraints/checks where appropriate, but do not overcomplicate:
+- non-negative integer timing/count checks where reasonable
+- constrained text enums as check constraints only if that matches repo style, otherwise keep flexible with documented allowed values
+
+Add useful indexes for expected analysis:
+- `created_at desc`
+- `(load_reason, created_at desc)`
+- `(window_label, created_at desc)`
+- `(pollutant, created_at desc)`
+- `(success, created_at desc)`
+- `(overall_cache_class, created_at desc)`
+- optionally `(station_id, timeseries_id, created_at desc)` if consistent with expected analysis
+
+Retention:
+- Raw table retention should be 90 days
+- Implement this via ops, not by relying on manual cleanup
+- Add the corresponding ops cleanup task or extend an existing retention workflow in `uk-aq-ops`
+
+## 4) Database: UTC daily rollup table
+Add a second table for UTC daily rollups derived from the raw telemetry.
+
+This table should be split by:
+- `day_utc`
+- `load_reason`
+- `window_label`
+- `pollutant`
+- `success`
+- `overall_cache_class`
+
+Suggested table name:
+- `chart_load_metrics_daily`
+
+Recommended columns:
+- `day_utc date not null`
+- `load_reason text not null`
+- `window_label text null`
+- `pollutant text null`
+- `success boolean not null`
+- `overall_cache_class text null`
+- `sample_count bigint not null`
+- `avg_total_load_ms numeric null`
+- `avg_time_to_first_obs_response_ms numeric null`
+- `avg_time_to_first_obs_render_ms numeric null`
+- `avg_time_to_obs_complete_ms numeric null`
+- `avg_time_to_aqi_complete_ms numeric null`
+- `avg_time_to_chart_ready_ms numeric null`
+- `avg_obs_chunk_count numeric null`
+- `avg_obs_network_request_count numeric null`
+- `avg_obs_total_points numeric null`
+- `avg_aqi_network_request_count numeric null`
+- `avg_aqi_total_points numeric null`
+- `pct_obs_used_local_cache numeric null`
+- `pct_aqi_used_local_cache numeric null`
+- `pct_obs_received_304 numeric null`
+- `pct_cache_session_was_warm numeric null`
+- optional `p50_total_load_ms`, `p90_total_load_ms` if easy and consistent with existing SQL style, otherwise skip for first version
+- `updated_at timestamptz not null default now()`
+
+Primary key / uniqueness:
+- unique on `(day_utc, load_reason, window_label, pollutant, success, overall_cache_class)`
+
+Rollup basis:
+- always UTC day derived from raw `created_at`
+
+Rollup maintenance:
+- implement in `uk-aq-ops`
+- use an idempotent upsert approach
+- refresh recent days repeatedly to allow for late-arriving events, for example recompute the last few UTC days each run
+- keep this simple and reliable
+
+## 5) Ops jobs for retention and daily rollups
+In `uk-aq-ops`, add the required operational work:
+
+### Raw retention job
+- delete raw rows older than 90 days
+- keep this UTC-safe
+- hook into an existing daily maintenance flow if appropriate, otherwise add a small dedicated maintenance path
+
+### Daily rollup refresh job
+- recompute / upsert the UTC daily rollup table
+- refresh a small recent window each run, e.g. last 3 to 7 UTC days, so late arrivals are handled safely
+- keep logic idempotent
+
+If there is already a daily ops framework / scheduler pattern in `uk-aq-ops`, reuse it.
+
+## 6) Output expected from you
+Please make the code changes across the relevant repos and include:
+
+1. A brief implementation summary
+2. The files changed
+3. Any schema migrations added
+4. Any ops routes/jobs added
+5. Any assumptions or caveats
+6. Example SQL queries for checking the telemetry after deploy, such as:
+   - average total load by window over last 7 days
+   - cold vs warm cache comparison
+   - observation vs AQI timing comparison
+   - failure counts by day
+   - top slowest window / pollutant combinations
+
+## 7) Important design guidance
+- Keep the first version simple and robust
+- Do not invent synthetic tests
+- Do not overengineer privacy or fingerprinting
+- Do not couple telemetry to Turnstile unless clearly necessary
+- Do not add a visible on-page debug panel
+- Do not create a noisy event-stream table
+- Do not let telemetry break chart loading
+- Make future sampling easy to add
+- Keep naming consistent with the UK AQ project style
+- Keep everything UTC unless the existing chart UI specifically needs BST for display only
+
+Before coding, inspect the existing station chart flow and reuse its current fetch/render boundaries so telemetry reflects real behaviour rather than guessed phases.

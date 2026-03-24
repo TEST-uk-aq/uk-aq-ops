@@ -28,6 +28,10 @@ const DEFAULT_REPAIR_FETCH_PAGE_SIZE = 1_000;
 const MAX_REPAIR_FETCH_PAGES = 500;
 const PREVIEW_LIMIT = 25;
 const RPC_SCHEMA = "uk_aq_public";
+const DEFAULT_CHART_METRICS_RETENTION_DAYS = 90;
+const DEFAULT_CHART_METRICS_DAILY_REFRESH_DAYS = 7;
+const DEFAULT_CHART_METRICS_CLEANUP_RPC = "uk_aq_rpc_chart_load_metrics_cleanup";
+const DEFAULT_CHART_METRICS_DAILY_REFRESH_RPC = "uk_aq_rpc_chart_load_metrics_daily_refresh";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_DELETE_HOUR_BUCKET = "uk_aq_rpc_observations_delete_hour_bucket";
@@ -1768,6 +1772,68 @@ async function runPhaseARecent(config) {
   return aggregateSummary;
 }
 
+async function runChartLoadMetricsMaintenance(config) {
+  if (config.dryRun) {
+    return {
+      enabled: false,
+      skipped: true,
+      reason: "dry_run",
+    };
+  }
+
+  const retentionDays = parsePositiveInt(
+    process.env.UK_AQ_CHART_METRICS_RETENTION_DAYS,
+    DEFAULT_CHART_METRICS_RETENTION_DAYS,
+    1,
+    3650,
+  );
+  const refreshDays = parsePositiveInt(
+    process.env.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS,
+    DEFAULT_CHART_METRICS_DAILY_REFRESH_DAYS,
+    1,
+    31,
+  );
+  const cleanupRpc = (process.env.UK_AQ_CHART_METRICS_CLEANUP_RPC || DEFAULT_CHART_METRICS_CLEANUP_RPC).trim();
+  const dailyRefreshRpc = (process.env.UK_AQ_CHART_METRICS_DAILY_REFRESH_RPC || DEFAULT_CHART_METRICS_DAILY_REFRESH_RPC)
+    .trim();
+
+  const observsClient = createClient(config.observsSupabaseUrl, config.observsSecretKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    db: { schema: RPC_SCHEMA },
+  });
+
+  const cleanupResult = await observsClient.schema(RPC_SCHEMA).rpc(cleanupRpc, {
+    p_retention_days: retentionDays,
+  });
+  if (cleanupResult.error) {
+    throw new Error(`chart metrics cleanup RPC failed: ${cleanupResult.error.message}`);
+  }
+  const cleanupRowsDeleted = Number(cleanupResult.data?.[0]?.rows_deleted ?? 0);
+
+  const refreshResult = await observsClient.schema(RPC_SCHEMA).rpc(dailyRefreshRpc, {
+    p_recent_days: refreshDays,
+  });
+  if (refreshResult.error) {
+    throw new Error(`chart metrics daily refresh RPC failed: ${refreshResult.error.message}`);
+  }
+  const refreshRow = refreshResult.data?.[0] || {};
+  const summary = {
+    enabled: true,
+    skipped: false,
+    retention_days: retentionDays,
+    refresh_days: refreshDays,
+    cleanup_rpc: cleanupRpc,
+    daily_refresh_rpc: dailyRefreshRpc,
+    raw_rows_deleted: Number.isFinite(cleanupRowsDeleted) ? cleanupRowsDeleted : 0,
+    daily_rows_upserted: Number(refreshRow.rows_upserted ?? 0),
+    daily_days_refreshed: Number(refreshRow.days_refreshed ?? refreshDays),
+    daily_refreshed_from_day_utc: refreshRow.refreshed_from_day_utc ?? null,
+    daily_refreshed_to_day_utc: refreshRow.refreshed_to_day_utc ?? null,
+  };
+  logStructured("INFO", "chart_load_metrics_maintenance_summary", summary);
+  return summary;
+}
+
 async function runPrune(config) {
   const phaseARecentSummary = await runPhaseARecent(config);
 
@@ -1814,6 +1880,25 @@ async function runPrune(config) {
     }
   }
 
+  let chartLoadMetricsSummary = {
+    enabled: false,
+    skipped: true,
+    reason: "not_started",
+  };
+  try {
+    chartLoadMetricsSummary = await runChartLoadMetricsMaintenance(config);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    chartLoadMetricsSummary = {
+      enabled: true,
+      skipped: false,
+      error: message,
+    };
+    logStructured("WARNING", "chart_load_metrics_maintenance_failed", {
+      error: message,
+    });
+  }
+
   const overallWindow = buildWindow(
     config.maxHoursPerRun,
     config.ingestDbRetentionDays,
@@ -1831,6 +1916,7 @@ async function runPrune(config) {
       phase_a_recent: phaseARecentSummary,
       phase_b_history: phaseBHistorySummary,
       phase_b_history_index: phaseBHistoryIndexSummary,
+      chart_load_metrics: chartLoadMetricsSummary,
     };
   }
 
@@ -1871,6 +1957,7 @@ async function runPrune(config) {
     phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
     phase_b_history_index: phaseBHistoryIndexSummary,
+    chart_load_metrics: chartLoadMetricsSummary,
   };
   logStructured(
     "INFO",

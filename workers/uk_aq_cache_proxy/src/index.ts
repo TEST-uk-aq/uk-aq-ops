@@ -1,6 +1,8 @@
 export interface Env {
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
+  OBS_AQIDB_SUPABASE_URL: unknown;
+  OBS_AQIDB_SECRET_KEY: unknown;
   UK_AQ_AQI_HISTORY_R2_API_URL: unknown;
   UK_AQ_CACHE_ALLOWED_ORIGINS: unknown;
   UK_AQ_EDGE_ACCESS_TOKEN_SECRET: unknown;
@@ -8,6 +10,9 @@ export interface Env {
   UK_AQ_CACHE_BYPASS_SECRET: unknown;
   UK_AQ_TURNSTILE_SECRET_KEY: unknown;
   UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: unknown;
+  UK_AQ_CHART_METRICS_RPC: unknown;
+  UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE: unknown;
+  UK_AQ_CHART_METRICS_MAX_BODY_BYTES: unknown;
 }
 
 type CacheProfileName = "realtime" | "metadata" | "stations_metadata" | "aqi_history_immutable";
@@ -36,6 +41,58 @@ type AccessTokenPayload = {
 type TurnstileVerifyResponse = {
   success?: boolean;
   "error-codes"?: string[];
+};
+
+type ExecutionContext = {
+  waitUntil(promise: Promise<unknown>): void;
+};
+
+type ChartLoadReason = "initial" | "station_change" | "timescale_change" | "pollutant_change" | "refresh";
+
+type ChartObsCacheMode = "local_only" | "local_plus_refresh" | "network_full" | "network_chunked" | "unknown";
+
+type ChartOverallCacheClass = "cold" | "warm_local" | "warm_http_304" | "mixed" | "bypass" | "unknown";
+
+type ChartMetricsPayload = {
+  page_name: "uk_aq_stations_chart";
+  page_view_id: string;
+  request_group_id: string;
+  session_id: string | null;
+  load_reason: ChartLoadReason;
+  station_id: number | null;
+  timeseries_id: number | null;
+  station_label: string | null;
+  pollutant: string | null;
+  window_label: string | null;
+  success: boolean;
+  error_stage: string | null;
+  error_message: string | null;
+  total_load_ms: number | null;
+  time_to_first_obs_response_ms: number | null;
+  time_to_first_obs_render_ms: number | null;
+  time_to_obs_complete_ms: number | null;
+  time_to_aqi_complete_ms: number | null;
+  time_to_chart_ready_ms: number | null;
+  cache_session_init_ms: number | null;
+  turnstile_ms: number | null;
+  obs_chunk_count: number | null;
+  obs_network_request_count: number | null;
+  obs_total_points: number | null;
+  obs_used_local_cache: boolean | null;
+  obs_used_etag: boolean | null;
+  obs_received_304: boolean | null;
+  obs_cache_mode: ChartObsCacheMode | null;
+  aqi_supported: boolean | null;
+  aqi_network_request_count: number | null;
+  aqi_total_points: number | null;
+  aqi_used_local_cache: boolean | null;
+  aqi_received_304: boolean | null;
+  cache_session_was_warm: boolean | null;
+  overall_cache_class: ChartOverallCacheClass | null;
+  network_effective_type: string | null;
+  device_memory_gb: number | null;
+  hardware_concurrency: number | null;
+  app_version: string | null;
 };
 
 const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
@@ -90,6 +147,7 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
 const API_PREFIX = "/api/aq/";
 const SESSION_START_PATH = "/api/aq/session/start";
 const SESSION_END_PATH = "/api/aq/session/end";
+const CHART_METRICS_PATH = "/api/aq/chart-metrics";
 const SESSION_COOKIE_NAME = "uk_aq_edge_session";
 const SESSION_INIT_HEADER = "X-UK-AQ-Session-Init";
 const CACHE_BYPASS_QUERY = "cache";
@@ -108,9 +166,16 @@ const MAX_SESSION_MAX_AGE_SECONDS = 86400;
 const UPSTREAM_RETRY_DELAY_MS = 300;
 const UPSTREAM_RETRY_STATUSES = new Set([502, 503, 504]);
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
+const CHART_METRICS_DEFAULT_MAX_BODY_BYTES = 8 * 1024;
+const CHART_METRICS_DEFAULT_RATE_LIMIT_PER_MINUTE = 60;
+const CHART_METRICS_MAX_TRACKED_KEYS = 5_000;
+const CHART_METRICS_RATE_WINDOW_MS = 60 * 1000;
+const DEFAULT_CHART_METRICS_RPC = "uk_aq_rpc_chart_load_metrics_insert";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+
+const chartMetricsRateState = new Map<string, { windowStartMs: number; count: number }>();
 
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/$/, "");
@@ -142,6 +207,17 @@ function parseIntInRange(value: string, fallback: number, min: number, max: numb
   }
   const rounded = Math.floor(parsed);
   return Math.min(max, Math.max(min, rounded));
+}
+
+class RequestValidationError extends Error {
+  status: number;
+  code: string;
+
+  constructor(status: number, code: string) {
+    super(code);
+    this.status = status;
+    this.code = code;
+  }
 }
 
 function normalizeOrigin(value: string | null): string | null {
@@ -246,6 +322,392 @@ function addCorsHeaders(headers: Headers, requestOrigin: string | null, allowedO
   appendVary(headers, "Origin");
 }
 
+function compactChartMetricPayload(metric: ChartMetricsPayload): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  (Object.entries(metric) as Array<[keyof ChartMetricsPayload, ChartMetricsPayload[keyof ChartMetricsPayload]]>)
+    .forEach(([key, value]) => {
+      if (value !== undefined) {
+        payload[key] = value;
+      }
+    });
+  return payload;
+}
+
+function trimTextOrNull(value: unknown, maxLength: number): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const cleaned = value.replace(/[\u0000-\u001F\u007F]+/g, " ").trim();
+  if (!cleaned) {
+    return null;
+  }
+  return cleaned.length <= maxLength ? cleaned : cleaned.slice(0, maxLength);
+}
+
+function parseUuidOrThrow(value: unknown, fieldName: string): string {
+  const parsed = trimTextOrNull(value, 64);
+  if (!parsed) {
+    throw new RequestValidationError(400, `${fieldName}_required`);
+  }
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed)
+  ) {
+    throw new RequestValidationError(400, `${fieldName}_invalid`);
+  }
+  return parsed.toLowerCase();
+}
+
+function parseBooleanOrNull(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
+  }
+  return null;
+}
+
+function parseBooleanRequired(value: unknown, fieldName: string): boolean {
+  const parsed = parseBooleanOrNull(value);
+  if (parsed === null) {
+    throw new RequestValidationError(400, `${fieldName}_required`);
+  }
+  return parsed;
+}
+
+function parseIntegerOrNull(
+  value: unknown,
+  fieldName: string,
+  min: number,
+  max: number,
+): number | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    throw new RequestValidationError(400, `${fieldName}_invalid`);
+  }
+  if (parsed < min || parsed > max) {
+    throw new RequestValidationError(400, `${fieldName}_out_of_range`);
+  }
+  return parsed;
+}
+
+function parseFiniteNumberOrNull(
+  value: unknown,
+  fieldName: string,
+  min: number,
+  max: number,
+): number | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new RequestValidationError(400, `${fieldName}_invalid`);
+  }
+  if (parsed < min || parsed > max) {
+    throw new RequestValidationError(400, `${fieldName}_out_of_range`);
+  }
+  return parsed;
+}
+
+function parseChartLoadReason(value: unknown): ChartLoadReason {
+  const parsed = trimTextOrNull(value, 64);
+  if (!parsed) {
+    throw new RequestValidationError(400, "load_reason_required");
+  }
+  const allowed: ChartLoadReason[] = [
+    "initial",
+    "station_change",
+    "timescale_change",
+    "pollutant_change",
+    "refresh",
+  ];
+  if (!allowed.includes(parsed as ChartLoadReason)) {
+    throw new RequestValidationError(400, "load_reason_invalid");
+  }
+  return parsed as ChartLoadReason;
+}
+
+function parseChartObsCacheMode(value: unknown): ChartObsCacheMode | null {
+  const parsed = trimTextOrNull(value, 64);
+  if (!parsed) {
+    return null;
+  }
+  const allowed: ChartObsCacheMode[] = [
+    "local_only",
+    "local_plus_refresh",
+    "network_full",
+    "network_chunked",
+    "unknown",
+  ];
+  if (!allowed.includes(parsed as ChartObsCacheMode)) {
+    throw new RequestValidationError(400, "obs_cache_mode_invalid");
+  }
+  return parsed as ChartObsCacheMode;
+}
+
+function parseChartOverallCacheClass(value: unknown): ChartOverallCacheClass | null {
+  const parsed = trimTextOrNull(value, 64);
+  if (!parsed) {
+    return null;
+  }
+  const allowed: ChartOverallCacheClass[] = [
+    "cold",
+    "warm_local",
+    "warm_http_304",
+    "mixed",
+    "bypass",
+    "unknown",
+  ];
+  if (!allowed.includes(parsed as ChartOverallCacheClass)) {
+    throw new RequestValidationError(400, "overall_cache_class_invalid");
+  }
+  return parsed as ChartOverallCacheClass;
+}
+
+function parseChartMetricsPayload(payload: unknown): ChartMetricsPayload {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new RequestValidationError(400, "invalid_payload");
+  }
+  const metric = payload as Record<string, unknown>;
+  const pageName = trimTextOrNull(metric.page_name, 64);
+  if (pageName !== "uk_aq_stations_chart") {
+    throw new RequestValidationError(400, "page_name_invalid");
+  }
+  return {
+    page_name: "uk_aq_stations_chart",
+    page_view_id: parseUuidOrThrow(metric.page_view_id, "page_view_id"),
+    request_group_id: parseUuidOrThrow(metric.request_group_id, "request_group_id"),
+    session_id: metric.session_id === null || metric.session_id === undefined
+      ? null
+      : parseUuidOrThrow(metric.session_id, "session_id"),
+    load_reason: parseChartLoadReason(metric.load_reason),
+    station_id: parseIntegerOrNull(metric.station_id, "station_id", 1, 2_147_483_647),
+    timeseries_id: parseIntegerOrNull(metric.timeseries_id, "timeseries_id", 1, 2_147_483_647),
+    station_label: trimTextOrNull(metric.station_label, 180),
+    pollutant: trimTextOrNull(metric.pollutant, 64),
+    window_label: trimTextOrNull(metric.window_label, 32),
+    success: parseBooleanRequired(metric.success, "success"),
+    error_stage: trimTextOrNull(metric.error_stage, 64),
+    error_message: trimTextOrNull(metric.error_message, 240),
+    total_load_ms: parseIntegerOrNull(metric.total_load_ms, "total_load_ms", 0, 600_000),
+    time_to_first_obs_response_ms: parseIntegerOrNull(
+      metric.time_to_first_obs_response_ms,
+      "time_to_first_obs_response_ms",
+      0,
+      600_000,
+    ),
+    time_to_first_obs_render_ms: parseIntegerOrNull(
+      metric.time_to_first_obs_render_ms,
+      "time_to_first_obs_render_ms",
+      0,
+      600_000,
+    ),
+    time_to_obs_complete_ms: parseIntegerOrNull(metric.time_to_obs_complete_ms, "time_to_obs_complete_ms", 0, 600_000),
+    time_to_aqi_complete_ms: parseIntegerOrNull(metric.time_to_aqi_complete_ms, "time_to_aqi_complete_ms", 0, 600_000),
+    time_to_chart_ready_ms: parseIntegerOrNull(metric.time_to_chart_ready_ms, "time_to_chart_ready_ms", 0, 600_000),
+    cache_session_init_ms: parseIntegerOrNull(metric.cache_session_init_ms, "cache_session_init_ms", 0, 120_000),
+    turnstile_ms: parseIntegerOrNull(metric.turnstile_ms, "turnstile_ms", 0, 120_000),
+    obs_chunk_count: parseIntegerOrNull(metric.obs_chunk_count, "obs_chunk_count", 0, 5000),
+    obs_network_request_count: parseIntegerOrNull(
+      metric.obs_network_request_count,
+      "obs_network_request_count",
+      0,
+      5000,
+    ),
+    obs_total_points: parseIntegerOrNull(metric.obs_total_points, "obs_total_points", 0, 5_000_000),
+    obs_used_local_cache: parseBooleanOrNull(metric.obs_used_local_cache),
+    obs_used_etag: parseBooleanOrNull(metric.obs_used_etag),
+    obs_received_304: parseBooleanOrNull(metric.obs_received_304),
+    obs_cache_mode: parseChartObsCacheMode(metric.obs_cache_mode),
+    aqi_supported: parseBooleanOrNull(metric.aqi_supported),
+    aqi_network_request_count: parseIntegerOrNull(
+      metric.aqi_network_request_count,
+      "aqi_network_request_count",
+      0,
+      5000,
+    ),
+    aqi_total_points: parseIntegerOrNull(metric.aqi_total_points, "aqi_total_points", 0, 100_000),
+    aqi_used_local_cache: parseBooleanOrNull(metric.aqi_used_local_cache),
+    aqi_received_304: parseBooleanOrNull(metric.aqi_received_304),
+    cache_session_was_warm: parseBooleanOrNull(metric.cache_session_was_warm),
+    overall_cache_class: parseChartOverallCacheClass(metric.overall_cache_class),
+    network_effective_type: trimTextOrNull(metric.network_effective_type, 32),
+    device_memory_gb: parseFiniteNumberOrNull(metric.device_memory_gb, "device_memory_gb", 0, 2048),
+    hardware_concurrency: parseIntegerOrNull(metric.hardware_concurrency, "hardware_concurrency", 0, 512),
+    app_version: trimTextOrNull(metric.app_version, 64),
+  };
+}
+
+function parseClientIp(request: Request): string {
+  const candidate = (request.headers.get("CF-Connecting-IP") ?? "").trim();
+  if (!candidate) {
+    return "unknown";
+  }
+  return candidate.toLowerCase();
+}
+
+function applyChartMetricsRateLimit(rateKey: string, maxPerMinute: number): boolean {
+  const nowMs = Date.now();
+  for (const [key, state] of chartMetricsRateState.entries()) {
+    if (nowMs - state.windowStartMs >= CHART_METRICS_RATE_WINDOW_MS) {
+      chartMetricsRateState.delete(key);
+    }
+  }
+  if (chartMetricsRateState.size > CHART_METRICS_MAX_TRACKED_KEYS) {
+    const overflow = chartMetricsRateState.size - CHART_METRICS_MAX_TRACKED_KEYS;
+    let removed = 0;
+    for (const key of chartMetricsRateState.keys()) {
+      chartMetricsRateState.delete(key);
+      removed += 1;
+      if (removed >= overflow) {
+        break;
+      }
+    }
+  }
+  const current = chartMetricsRateState.get(rateKey);
+  if (!current || nowMs - current.windowStartMs >= CHART_METRICS_RATE_WINDOW_MS) {
+    chartMetricsRateState.set(rateKey, { windowStartMs: nowMs, count: 1 });
+    return true;
+  }
+  if (current.count >= maxPerMinute) {
+    return false;
+  }
+  current.count += 1;
+  chartMetricsRateState.set(rateKey, current);
+  return true;
+}
+
+async function readJsonBodyWithLimit(request: Request, maxBytes: number): Promise<unknown> {
+  const contentLengthHeader = request.headers.get("Content-Length");
+  if (contentLengthHeader) {
+    const contentLength = Number(contentLengthHeader);
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      throw new RequestValidationError(413, "payload_too_large");
+    }
+  }
+  const raw = await request.text();
+  const bodyBytes = textEncoder.encode(raw).byteLength;
+  if (bodyBytes > maxBytes) {
+    throw new RequestValidationError(413, "payload_too_large");
+  }
+  if (!raw.trim()) {
+    throw new RequestValidationError(400, "payload_required");
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (_err) {
+    throw new RequestValidationError(400, "invalid_json");
+  }
+}
+
+async function insertChartMetric(
+  env: Env,
+  payload: ChartMetricsPayload,
+): Promise<{ ok: true } | { ok: false; status: number; reason: string }> {
+  const obsAqIdbSupabaseUrl = (await readSecret(env.OBS_AQIDB_SUPABASE_URL)).trim();
+  const obsAqIdbSecretKey = (await readSecret(env.OBS_AQIDB_SECRET_KEY)).trim();
+  if (!obsAqIdbSupabaseUrl || !obsAqIdbSecretKey) {
+    return { ok: false, status: 500, reason: "missing_chart_metrics_db_config" };
+  }
+  const rpcName = (
+    await readSecret(env.UK_AQ_CHART_METRICS_RPC)
+  ).trim() || DEFAULT_CHART_METRICS_RPC;
+  const rpcUrl = `${normalizeBaseUrl(obsAqIdbSupabaseUrl)}/rest/v1/rpc/${rpcName}`;
+  let response: Response;
+  try {
+    response = await fetch(rpcUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "apikey": obsAqIdbSecretKey,
+        "Authorization": `Bearer ${obsAqIdbSecretKey}`,
+      },
+      body: JSON.stringify({
+        p_metric: compactChartMetricPayload(payload),
+      }),
+    });
+  } catch (_err) {
+    return { ok: false, status: 502, reason: "chart_metrics_db_unreachable" };
+  }
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const text = await response.text();
+      detail = text.slice(0, 200);
+    } catch (_err) {
+      detail = "";
+    }
+    console.error("chart_metrics_insert_failed", {
+      status: response.status,
+      detail,
+    });
+    return { ok: false, status: 502, reason: "chart_metrics_db_insert_failed" };
+  }
+  return { ok: true };
+}
+
+async function handleChartMetricsIngest(
+  request: Request,
+  env: Env,
+  requestOrigin: string | null,
+  allowedOrigins: Set<string>,
+): Promise<Response> {
+  if (request.method !== "POST") {
+    return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
+  }
+
+  const rateLimitPerMinute = parseIntInRange(
+    await readSecret(env.UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE),
+    CHART_METRICS_DEFAULT_RATE_LIMIT_PER_MINUTE,
+    10,
+    500,
+  );
+  const maxBodyBytes = parseIntInRange(
+    await readSecret(env.UK_AQ_CHART_METRICS_MAX_BODY_BYTES),
+    CHART_METRICS_DEFAULT_MAX_BODY_BYTES,
+    1024,
+    256 * 1024,
+  );
+  const rateKey = `${requestOrigin ?? "unknown"}|${parseClientIp(request)}`;
+  if (!applyChartMetricsRateLimit(rateKey, rateLimitPerMinute)) {
+    return makeErrorResponse(429, "rate_limited", requestOrigin, allowedOrigins);
+  }
+
+  let parsedPayload: ChartMetricsPayload;
+  try {
+    const body = await readJsonBodyWithLimit(request, maxBodyBytes);
+    parsedPayload = parseChartMetricsPayload(body);
+  } catch (error) {
+    if (error instanceof RequestValidationError) {
+      return makeErrorResponse(error.status, error.code, requestOrigin, allowedOrigins);
+    }
+    return makeErrorResponse(400, "invalid_payload", requestOrigin, allowedOrigins);
+  }
+
+  const insertResult = await insertChartMetric(env, parsedPayload);
+  if (!insertResult.ok) {
+    return makeErrorResponse(insertResult.status, insertResult.reason, requestOrigin, allowedOrigins);
+  }
+
+  const headers = new Headers({
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  addCorsHeaders(headers, requestOrigin, allowedOrigins);
+  return new Response(JSON.stringify({ ok: true }), { status: 202, headers });
+}
+
 function buildCacheControl(profile: CacheProfile): string {
   return [
     "public",
@@ -272,7 +734,7 @@ function isImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
       || url.searchParams.get("to")
       || url.searchParams.get("end"),
   );
-  if (!Number.isFinite(explicitEndMs)) {
+  if (explicitEndMs === null || !Number.isFinite(explicitEndMs)) {
     return false;
   }
   return explicitEndMs <= (nowMs - AQI_HISTORY_MUTABLE_WINDOW_MS);
@@ -685,6 +1147,16 @@ export default {
       return makeOptionsResponse(requestOrigin, allowedOrigins);
     }
 
+    if (url.pathname === CHART_METRICS_PATH) {
+      if (requestOrigin === null) {
+        return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
+      }
+      if (!isOriginAllowed(requestOrigin, allowedOrigins)) {
+        return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
+      }
+      return handleChartMetricsIngest(request, env, requestOrigin, allowedOrigins);
+    }
+
     const tokenSecret = await readSecret(env.UK_AQ_EDGE_ACCESS_TOKEN_SECRET);
     if (!tokenSecret) {
       return makeErrorResponse(500, "missing_edge_access_secret", requestOrigin, allowedOrigins);
@@ -814,7 +1286,7 @@ export default {
     }
 
     const shouldUseCache = shouldCacheRequest(request, bypassRequested);
-    const cache = caches.default;
+    const cache = (caches as unknown as { default: Cache }).default;
     const cacheKey = new Request(url.toString(), { method: "GET" });
 
     if (shouldUseCache && request.method === "GET") {

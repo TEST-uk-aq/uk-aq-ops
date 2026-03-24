@@ -8,6 +8,8 @@ enabled = true
 # Runtime secrets expected:
 # - SUPABASE_URL
 # - SB_PUBLISHABLE_DEFAULT_KEY
+# - OBS_AQIDB_SUPABASE_URL
+# - OBS_AQIDB_SECRET_KEY
 # - UK_AQ_CACHE_ALLOWED_ORIGINS
 # - UK_AQ_EDGE_ACCESS_TOKEN_SECRET
 # - UK_AQ_EDGE_UPSTREAM_SECRET
@@ -15,6 +17,9 @@ enabled = true
 # - UK_AQ_TURNSTILE_SECRET_KEY
 # Runtime variables:
 # - UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS (optional)
+# - UK_AQ_CHART_METRICS_RPC (optional)
+# - UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE (optional)
+# - UK_AQ_CHART_METRICS_MAX_BODY_BYTES (optional)
 #
 # Route binding is configured in Cloudflare dashboard or via wrangler CLI.
 # Recommended hostnames:
