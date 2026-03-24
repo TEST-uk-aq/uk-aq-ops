@@ -18,15 +18,14 @@ const DEFAULT_PARQUET_ROW_CHUNK_SIZE = 5000;
 const MIN_PARQUET_ROW_CHUNK_SIZE = 500;
 const MAX_PARQUET_ROW_CHUNK_SIZE = 50000;
 const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
-const TIMESERIES_LOOKUP_MAX_ROWS = 50000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set(["/", "/v1/aqi-history"]);
-const STATION_CONNECTOR_LOOKUP_VIEW = "uk_aq_station_connector_lookup";
 const TIMESERIES_AQI_HOURLY_VIEW = "uk_aq_timeseries_aqi_hourly";
 const AQI_PARQUET_COLUMNS = [
+  "timeseries_id",
   "timestamp_hour_utc",
   "pollutant_code",
   "daqi_index_level",
@@ -38,8 +37,7 @@ const AQI_PARQUET_COLUMNS = [
   "eaqi_pm25_index_level",
   "eaqi_pm10_index_level",
 ];
-const stationConnectorIdCache = new Map();
-const stationTimeseriesIdsCache = new Map();
+const timeseriesWindowContextCache = new Map();
 
 function corsHeaders() {
   return {
@@ -292,18 +290,42 @@ async function fetchJsonObjectFromR2(env, key) {
   return { exists: true, value: parsed };
 }
 
-async function fetchFilteredParquetRowsFromR2(env, key, stationId, rowChunkSize) {
+async function fetchFilteredParquetRowsFromR2(
+  env,
+  key,
+  stationId,
+  rowChunkSize,
+  targetTimeseriesIds = null,
+) {
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
     return { exists: false, rows: [] };
   }
+  const hasStationFilter = Number.isFinite(Number(stationId)) && Number(stationId) > 0;
+  const normalizedStationId = hasStationFilter ? Math.trunc(Number(stationId)) : null;
+  const normalizedTimeseriesIds = Array.isArray(targetTimeseriesIds)
+    ? Array.from(
+      new Set(
+        targetTimeseriesIds
+          .map((value) => parseRequiredPositiveInt(value))
+          .filter((value) => Number.isFinite(value) && value > 0),
+      ),
+    )
+    : [];
+  const hasTimeseriesFilter = normalizedTimeseriesIds.length > 0;
+  const targetTimeseriesSet = hasTimeseriesFilter ? new Set(normalizedTimeseriesIds) : null;
+  if (!hasStationFilter && !hasTimeseriesFilter) {
+    return { exists: true, rows: [] };
+  }
+
   const arrayBuffer = await object.arrayBuffer();
   const metadata = await parquetMetadataAsync(arrayBuffer, { compressors });
   const schemaColumns = parquetSchema(metadata).children.map((column) =>
     column.element.name
   );
   const stationStatsIndex = schemaColumns.indexOf("station_id");
-  if (stationStatsIndex < 0) {
+  const timeseriesStatsIndex = schemaColumns.indexOf("timeseries_id");
+  if ((hasStationFilter && stationStatsIndex < 0) || (hasTimeseriesFilter && timeseriesStatsIndex < 0)) {
     return { exists: true, rows: [] };
   }
 
@@ -319,13 +341,34 @@ async function fetchFilteredParquetRowsFromR2(env, key, stationId, rowChunkSize)
     const stats = rowGroup?.columns?.[stationStatsIndex]?.meta_data?.statistics;
     const minStation = Number(stats?.min_value ?? stats?.min);
     const maxStation = Number(stats?.max_value ?? stats?.max);
-    if (
-      Number.isFinite(minStation) &&
-      Number.isFinite(maxStation) &&
-      (stationId < minStation || stationId > maxStation)
-    ) {
-      rowGroupStart = rowGroupEnd;
-      continue;
+    if (hasStationFilter) {
+      if (
+        Number.isFinite(minStation) &&
+        Number.isFinite(maxStation) &&
+        (normalizedStationId < minStation || normalizedStationId > maxStation)
+      ) {
+        rowGroupStart = rowGroupEnd;
+        continue;
+      }
+    }
+
+    if (hasTimeseriesFilter) {
+      const tsStats = rowGroup?.columns?.[timeseriesStatsIndex]?.meta_data?.statistics;
+      const minTimeseries = Number(tsStats?.min_value ?? tsStats?.min);
+      const maxTimeseries = Number(tsStats?.max_value ?? tsStats?.max);
+      if (Number.isFinite(minTimeseries) && Number.isFinite(maxTimeseries)) {
+        let intersects = false;
+        for (const targetTimeseriesId of normalizedTimeseriesIds) {
+          if (targetTimeseriesId >= minTimeseries && targetTimeseriesId <= maxTimeseries) {
+            intersects = true;
+            break;
+          }
+        }
+        if (!intersects) {
+          rowGroupStart = rowGroupEnd;
+          continue;
+        }
+      }
     }
 
     for (
@@ -334,19 +377,44 @@ async function fetchFilteredParquetRowsFromR2(env, key, stationId, rowChunkSize)
       chunkStart += rowChunkSize
     ) {
       const chunkEnd = Math.min(rowGroupEnd, chunkStart + rowChunkSize);
-      const stationValues = await readParquetColumnValues(
-        arrayBuffer,
-        metadata,
-        "station_id",
-        chunkStart,
-        chunkEnd,
-      );
+      const stationValues = hasStationFilter
+        ? await readParquetColumnValues(
+          arrayBuffer,
+          metadata,
+          "station_id",
+          chunkStart,
+          chunkEnd,
+        )
+        : [];
+      const timeseriesValues = hasTimeseriesFilter
+        ? await readParquetColumnValues(
+          arrayBuffer,
+          metadata,
+          "timeseries_id",
+          chunkStart,
+          chunkEnd,
+        )
+        : [];
       const matchedIndexes = [];
-      for (let idx = 0; idx < stationValues.length; idx += 1) {
-        const rowStationId = Number(stationValues[idx]);
-        if (Number.isFinite(rowStationId) && rowStationId === stationId) {
-          matchedIndexes.push(idx);
+      const chunkLength = hasStationFilter
+        ? stationValues.length
+        : hasTimeseriesFilter
+        ? timeseriesValues.length
+        : 0;
+      for (let idx = 0; idx < chunkLength; idx += 1) {
+        if (hasStationFilter) {
+          const rowStationId = Number(stationValues[idx]);
+          if (!Number.isFinite(rowStationId) || rowStationId !== normalizedStationId) {
+            continue;
+          }
         }
+        if (hasTimeseriesFilter) {
+          const rowTimeseriesId = parseRequiredPositiveInt(timeseriesValues[idx]);
+          if (!Number.isFinite(rowTimeseriesId) || !targetTimeseriesSet.has(rowTimeseriesId)) {
+            continue;
+          }
+        }
+        matchedIndexes.push(idx);
       }
       if (matchedIndexes.length === 0) {
         continue;
@@ -366,7 +434,13 @@ async function fetchFilteredParquetRowsFromR2(env, key, stationId, rowChunkSize)
         );
       }
       for (const idx of matchedIndexes) {
-        const row = { station_id: stationId };
+        const row = {};
+        if (hasStationFilter) {
+          row.station_id = normalizedStationId;
+        }
+        if (hasTimeseriesFilter && normalizedTimeseriesIds.length === 1) {
+          row.timeseries_id = normalizedTimeseriesIds[0];
+        }
         for (const columnName of availableColumns) {
           const values = columnValues[columnName];
           row[columnName] = idx < values.length ? values[idx] : undefined;
@@ -449,7 +523,7 @@ function buildEmptyHistoryRead() {
       unknown_range_file_count_seen: 0,
       missing_connector_index_keys: [],
       warnings: [],
-      station_timeseries_id_count: 0,
+      target_timeseries_id_count: 0,
     },
   };
 }
@@ -537,111 +611,66 @@ async function fetchObsAqiDbArray({
   };
 }
 
-async function readStationConnectorIdFromObsAqiDb({
-  env,
-  stationId,
-}) {
-  if (stationConnectorIdCache.has(stationId)) {
-    const cached = stationConnectorIdCache.get(stationId) || {};
-    return {
-      source_path: String(
-        cached.source_path
-          || `${UK_AQ_PUBLIC_SCHEMA_DEFAULT}.${STATION_CONNECTOR_LOOKUP_VIEW}`,
-      ),
-      connector_id: cached.connector_id ?? null,
-      cache_hit: true,
-    };
-  }
-
-  const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim()
-    || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
-  const result = await fetchObsAqiDbArray({
-    env,
-    path: STATION_CONNECTOR_LOOKUP_VIEW,
-    schema,
-    queryParams: [
-      ["select", "station_id,connector_id"],
-      ["station_id", `eq.${stationId}`],
-      ["limit", "1"],
-    ],
-  });
-  const firstRow = Array.isArray(result.rows) ? result.rows[0] : null;
-  const connectorId = parseRequiredPositiveInt(firstRow?.connector_id);
-  stationConnectorIdCache.set(stationId, {
-    source_path: result.source_path,
-    connector_id: connectorId,
-  });
-  return {
-    source_path: result.source_path,
-    connector_id: connectorId,
-    cache_hit: false,
-  };
-}
-
-function buildStationTimeseriesCacheKey(stationId, connectorId, startIso, endIso) {
-  const stationPart = Number.isFinite(Number(stationId)) ? Math.trunc(Number(stationId)) : 0;
-  const connectorPart = Number.isFinite(Number(connectorId)) ? Math.trunc(Number(connectorId)) : 0;
+function buildTimeseriesWindowContextCacheKey(timeseriesId, startIso, endIso) {
+  const timeseriesPart = Number.isFinite(Number(timeseriesId)) ? Math.trunc(Number(timeseriesId)) : 0;
   const startMs = Date.parse(String(startIso || ""));
   const endMs = Date.parse(String(endIso || ""));
   const startDay = Number.isFinite(startMs) ? toUtcDayFromMs(startMs) : "na";
   const endDay = Number.isFinite(endMs) ? toUtcDayFromMs(endMs) : "na";
-  return `${stationPart}:${connectorPart > 0 ? connectorPart : "all"}:${startDay}:${endDay}`;
+  return `${timeseriesPart}:${startDay}:${endDay}`;
 }
 
-async function readStationTimeseriesIdsFromObsAqiDb({
+async function readTimeseriesWindowContextFromObsAqiDb({
   env,
-  stationId,
-  connectorId,
+  timeseriesId,
   startIso,
   endIso,
 }) {
-  const cacheKey = buildStationTimeseriesCacheKey(stationId, connectorId, startIso, endIso);
-  if (stationTimeseriesIdsCache.has(cacheKey)) {
-    const cached = stationTimeseriesIdsCache.get(cacheKey) || {};
+  const cacheKey = buildTimeseriesWindowContextCacheKey(timeseriesId, startIso, endIso);
+  if (timeseriesWindowContextCache.has(cacheKey)) {
+    const cached = timeseriesWindowContextCache.get(cacheKey) || {};
     return {
       source_path: String(cached.source_path || `${UK_AQ_PUBLIC_SCHEMA_DEFAULT}.${TIMESERIES_AQI_HOURLY_VIEW}`),
       timeseries_ids: Array.isArray(cached.timeseries_ids) ? cached.timeseries_ids : [],
+      station_id: parseRequiredPositiveInt(cached.station_id) || null,
+      connector_id: parseRequiredPositiveInt(cached.connector_id) || null,
       cache_hit: true,
     };
   }
 
   const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim()
     || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
-  const queryParams = [
-    ["select", "timeseries_id"],
-    ["station_id", `eq.${stationId}`],
-    ["timestamp_hour_utc", `gte.${startIso}`],
-    ["timestamp_hour_utc", `lt.${endIso}`],
-    ["order", "timeseries_id.asc"],
-    ["limit", String(TIMESERIES_LOOKUP_MAX_ROWS)],
-  ];
-  if (Number.isFinite(Number(connectorId)) && Number(connectorId) > 0) {
-    queryParams.push(["connector_id", `eq.${Math.trunc(Number(connectorId))}`]);
-  }
-
+  const parsedTimeseriesId = parseRequiredPositiveInt(timeseriesId);
   const result = await fetchObsAqiDbArray({
     env,
     path: TIMESERIES_AQI_HOURLY_VIEW,
     schema,
-    queryParams,
+    queryParams: [
+      ["select", "timeseries_id,station_id,connector_id,timestamp_hour_utc"],
+      ["timeseries_id", `eq.${parsedTimeseriesId}`],
+      ["timestamp_hour_utc", `gte.${startIso}`],
+      ["timestamp_hour_utc", `lt.${endIso}`],
+      ["order", "timestamp_hour_utc.desc"],
+      ["limit", "1"],
+    ],
   });
 
-  const timeseriesIds = Array.from(
-    new Set(
-      (Array.isArray(result.rows) ? result.rows : [])
-        .map((row) => parseRequiredPositiveInt(row?.timeseries_id))
-        .filter((id) => Number.isFinite(id) && id > 0),
-    ),
-  ).sort((a, b) => a - b);
+  const firstRow = Array.isArray(result.rows) ? result.rows[0] : null;
+  const hasWindowRow = Boolean(firstRow);
+  const windowStationId = parseRequiredPositiveInt(firstRow?.station_id) || null;
+  const windowConnectorId = parseRequiredPositiveInt(firstRow?.connector_id) || null;
+  const windowTimeseriesIds = hasWindowRow ? [parsedTimeseriesId] : [];
 
-  stationTimeseriesIdsCache.set(cacheKey, {
+  const context = {
     source_path: result.source_path,
-    timeseries_ids: timeseriesIds,
-  });
+    timeseries_ids: windowTimeseriesIds,
+    station_id: windowStationId,
+    connector_id: windowConnectorId,
+  };
+  timeseriesWindowContextCache.set(cacheKey, context);
 
   return {
-    source_path: result.source_path,
-    timeseries_ids: timeseriesIds,
+    ...context,
     cache_hit: false,
   };
 }
@@ -659,16 +688,35 @@ function normalizeAndSortRows(rowsByPeriodStart, limit) {
 }
 
 function appendFilteredRows(rows, {
-  stationId,
+  stationId = null,
+  targetTimeseriesIds = null,
   startMs,
   endMs,
   sinceMs,
   pollutantKey,
   outByPeriodStart,
 }) {
+  const normalizedStationId = parseRequiredPositiveInt(stationId);
+  const hasStationFilter = Number.isFinite(normalizedStationId) && normalizedStationId > 0;
+  const normalizedTimeseriesIds = Array.isArray(targetTimeseriesIds)
+    ? Array.from(
+      new Set(
+        targetTimeseriesIds
+          .map((value) => parseRequiredPositiveInt(value))
+          .filter((value) => Number.isFinite(value) && value > 0),
+      ),
+    )
+    : [];
+  const hasTimeseriesFilter = normalizedTimeseriesIds.length > 0;
+  const targetTimeseriesIdSet = hasTimeseriesFilter ? new Set(normalizedTimeseriesIds) : null;
+
   for (const row of rows) {
-    const rowStationId = Number(row?.station_id);
-    if (!Number.isFinite(rowStationId) || rowStationId !== stationId) {
+    const rowStationId = parseRequiredPositiveInt(row?.station_id);
+    if (hasStationFilter && rowStationId !== normalizedStationId) {
+      continue;
+    }
+    const rowTimeseriesId = parseRequiredPositiveInt(row?.timeseries_id);
+    if (hasTimeseriesFilter && (!rowTimeseriesId || !targetTimeseriesIdSet.has(rowTimeseriesId))) {
       continue;
     }
     const periodStart = toIsoOrNull(row?.timestamp_hour_utc || row?.period_start_utc);
@@ -744,7 +792,12 @@ function appendFilteredRows(rows, {
       eaqi_pm25_index_level: null,
       eaqi_pm10_index_level: null,
       station_id: rowStationId,
+      timeseries_id: rowTimeseriesId,
     };
+
+    if (!existing.timeseries_id && rowTimeseriesId) {
+      existing.timeseries_id = rowTimeseriesId;
+    }
 
     existing.daqi_no2_index_level = maxFiniteIndex(
       [existing.daqi_no2_index_level, rowDaqiNo2],
@@ -799,12 +852,12 @@ function appendFilteredRows(rows, {
 
 function extractParquetKeysFromTimeseriesIndex(
   indexPayload,
-  stationTimeseriesIds,
+  targetTimeseriesIds,
   pollutantKey,
 ) {
   const files = Array.isArray(indexPayload?.files) ? indexPayload.files : [];
-  const requestedIds = Array.isArray(stationTimeseriesIds)
-    ? stationTimeseriesIds.filter((value) => Number.isFinite(Number(value)) && Number(value) > 0)
+  const requestedIds = Array.isArray(targetTimeseriesIds)
+    ? targetTimeseriesIds.filter((value) => Number.isFinite(Number(value)) && Number(value) > 0)
       .map((value) => Math.trunc(Number(value)))
     : [];
   const allKeys = [];
@@ -871,8 +924,8 @@ async function readHistoryRows({
   env,
   historyPrefix,
   connectorId,
-  stationTimeseriesIds,
-  stationId,
+  targetTimeseriesIds,
+  targetStationId = null,
   startIso,
   endIso,
   sinceIso,
@@ -900,12 +953,12 @@ async function readHistoryRows({
     env.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED,
     true,
   );
-  const stationTimeseriesIdCount = Array.isArray(stationTimeseriesIds)
-    ? stationTimeseriesIds.length
+  const targetTimeseriesIdCount = Array.isArray(targetTimeseriesIds)
+    ? targetTimeseriesIds.length
     : 0;
 
   const days = listUtcDays(startIso, endIso);
-  if (Array.isArray(stationTimeseriesIds) && stationTimeseriesIds.length === 0) {
+  if (Array.isArray(targetTimeseriesIds) && targetTimeseriesIds.length === 0) {
     return {
       points: [],
       days_scanned: days.length,
@@ -926,9 +979,9 @@ async function readHistoryRows({
         unknown_range_file_count_seen: 0,
         missing_connector_index_keys: [],
         warnings: [
-          "No AQI timeseries IDs found for station in requested window; skipped R2 history scan.",
+          "No AQI timeseries IDs found in requested window; skipped R2 history scan.",
         ],
-        station_timeseries_id_count: 0,
+        target_timeseries_id_count: 0,
       },
     };
   }
@@ -1010,7 +1063,7 @@ async function readHistoryRows({
             timeseriesIndexHitCount += 1;
             const extraction = extractParquetKeysFromTimeseriesIndex(
               connectorIndexObject.value,
-              stationTimeseriesIds,
+              targetTimeseriesIds,
               pollutantKey,
             );
             timeseriesIndexIndexedFileCount += extraction.indexed_file_count;
@@ -1056,15 +1109,17 @@ async function readHistoryRows({
         const parquet = await fetchFilteredParquetRowsFromR2(
           env,
           parquetKey,
-          stationId,
+          targetStationId,
           parquetRowChunkSize,
+          targetTimeseriesIds,
         );
         if (!parquet.exists) {
           missingParquetKeys.add(parquetKey);
           continue;
         }
         appendFilteredRows(parquet.rows, {
-          stationId,
+          stationId: targetStationId,
+          targetTimeseriesIds,
           startMs,
           endMs,
           sinceMs,
@@ -1096,14 +1151,14 @@ async function readHistoryRows({
       unknown_range_file_count_seen: timeseriesIndexUnknownRangeFileCount,
       missing_connector_index_keys: timeseriesIndexMissingKeys,
       warnings: timeseriesIndexWarnings,
-      station_timeseries_id_count: stationTimeseriesIdCount,
+      target_timeseries_id_count: targetTimeseriesIdCount,
     },
   };
 }
 
 async function readRecentRowsFromObsAqiDb({
   env,
-  stationId,
+  timeseriesId,
   startIso,
   endIso,
   sinceIso,
@@ -1119,7 +1174,9 @@ async function readRecentRowsFromObsAqiDb({
       [
         "select",
         [
+          "timeseries_id",
           "station_id",
+          "connector_id",
           "timestamp_hour_utc",
           "pollutant_code",
           "daqi_index_level",
@@ -1132,7 +1189,7 @@ async function readRecentRowsFromObsAqiDb({
           "eaqi_pm10_index_level",
         ].join(","),
       ],
-      ["station_id", `eq.${stationId}`],
+      ["timeseries_id", `eq.${timeseriesId}`],
       ["timestamp_hour_utc", `gte.${startIso}`],
       ["timestamp_hour_utc", `lt.${endIso}`],
       ...(sinceIso ? [["timestamp_hour_utc", `gt.${sinceIso}`]] : []),
@@ -1143,7 +1200,8 @@ async function readRecentRowsFromObsAqiDb({
 
   const rowsByPeriodStart = new Map();
   appendFilteredRows(result.rows, {
-    stationId,
+    stationId: null,
+    targetTimeseriesIds: [timeseriesId],
     startMs: Date.parse(startIso),
     endMs: Date.parse(endIso),
     sinceMs: sinceIso ? Date.parse(sinceIso) : Number.NaN,
@@ -1218,11 +1276,11 @@ async function handleRequest(request, env) {
     return jsonResponse({ ok: false, error: "Not found." }, { status: 404, cacheSeconds: 30 });
   }
 
-  const scope = String(url.searchParams.get("scope") || "station").trim().toLowerCase();
-  if (scope !== "station") {
+  const scope = String(url.searchParams.get("scope") || "timeseries").trim().toLowerCase();
+  if (scope !== "timeseries") {
     return jsonResponse({
       ok: false,
-      error: "scope must be station.",
+      error: "scope must be timeseries.",
     }, { status: 400, cacheSeconds: 30 });
   }
 
@@ -1234,15 +1292,15 @@ async function handleRequest(request, env) {
     }, { status: 400, cacheSeconds: 30 });
   }
 
-  const stationId = parseRequiredPositiveInt(
-    url.searchParams.get("station_id")
+  const timeseriesId = parseRequiredPositiveInt(
+    url.searchParams.get("timeseries_id")
       || url.searchParams.get("entity")
       || url.searchParams.get("entity_id"),
   );
-  if (!stationId) {
+  if (!timeseriesId) {
     return jsonResponse({
       ok: false,
-      error: "station_id (or entity/entity_id) must be a positive integer.",
+      error: "timeseries_id (or entity/entity_id) must be a positive integer.",
     }, { status: 400, cacheSeconds: 30 });
   }
 
@@ -1314,74 +1372,75 @@ async function handleRequest(request, env) {
   const recentEndMs = endMs;
   const hasHistoryWindow = historyEndMs > historyStartMs;
   const hasRecentWindow = recentEndMs > recentStartMs;
-  let stationConnectorId = null;
-  let stationConnectorSourcePath = null;
-  let stationConnectorLookupError = null;
-  let stationConnectorCacheHit = false;
-  let stationConnectorLookupAttempted = false;
-  let stationTimeseriesSourcePath = null;
-  let stationTimeseriesLookupError = null;
-  let stationTimeseriesLookupCacheHit = false;
-  let stationTimeseriesLookupAttempted = false;
-  let stationTimeseriesIds = null;
+  let windowContextSourcePath = null;
+  let windowContextLookupError = null;
+  let windowContextLookupCacheHit = false;
+  let windowContextLookupAttempted = false;
+  let targetConnectorId = null;
+  let targetStationId = null;
+  let targetTimeseriesIds = [timeseriesId];
 
-  const resolveStationConnectorId = async () => {
-    if (stationConnectorLookupAttempted) {
-      return stationConnectorId;
+  const resolveTimeseriesWindowContext = async () => {
+    if (windowContextLookupAttempted) {
+      return {
+        connector_id: targetConnectorId,
+        station_id: targetStationId,
+        timeseries_ids: targetTimeseriesIds,
+      };
     }
-    stationConnectorLookupAttempted = true;
+    windowContextLookupAttempted = true;
     try {
-      const lookup = await readStationConnectorIdFromObsAqiDb({
+      const lookup = await readTimeseriesWindowContextFromObsAqiDb({
         env,
-        stationId,
-      });
-      stationConnectorId = lookup.connector_id;
-      stationConnectorSourcePath = lookup.source_path;
-      stationConnectorCacheHit = lookup.cache_hit;
-    } catch (error) {
-      stationConnectorLookupError = error instanceof Error ? error.message : String(error);
-    }
-    return stationConnectorId;
-  };
-
-  const resolveStationTimeseriesIds = async () => {
-    if (stationTimeseriesLookupAttempted) {
-      return stationTimeseriesIds;
-    }
-    stationTimeseriesLookupAttempted = true;
-    try {
-      const lookupConnectorId = await resolveStationConnectorId();
-      const lookup = await readStationTimeseriesIdsFromObsAqiDb({
-        env,
-        stationId,
-        connectorId: lookupConnectorId,
+        timeseriesId,
         startIso,
         endIso,
       });
-      stationTimeseriesIds = lookup.timeseries_ids;
-      stationTimeseriesSourcePath = lookup.source_path;
-      stationTimeseriesLookupCacheHit = lookup.cache_hit;
+      windowContextSourcePath = lookup.source_path;
+      windowContextLookupCacheHit = lookup.cache_hit;
+      targetConnectorId = parseRequiredPositiveInt(lookup.connector_id);
+      targetStationId = parseRequiredPositiveInt(lookup.station_id);
+      const windowTimeseriesIds = Array.isArray(lookup.timeseries_ids)
+        ? lookup.timeseries_ids
+          .map((value) => parseRequiredPositiveInt(value))
+          .filter((value) => Number.isFinite(value) && value > 0)
+        : [];
+      targetTimeseriesIds = windowTimeseriesIds.length > 0
+        ? Array.from(new Set(windowTimeseriesIds))
+        : [timeseriesId];
     } catch (error) {
-      stationTimeseriesLookupError = error instanceof Error ? error.message : String(error);
-      stationTimeseriesIds = null;
+      windowContextLookupError = error instanceof Error ? error.message : String(error);
+      targetConnectorId = null;
+      targetStationId = null;
+      targetTimeseriesIds = [timeseriesId];
     }
-    return stationTimeseriesIds;
+
+    return {
+      connector_id: targetConnectorId,
+      station_id: targetStationId,
+      timeseries_ids: targetTimeseriesIds,
+    };
   };
 
-  const historyConnectorId = hasHistoryWindow
-    ? await resolveStationConnectorId()
-    : null;
-  const historyStationTimeseriesIds = hasHistoryWindow
-    ? await resolveStationTimeseriesIds()
-    : [];
+  const historyContext = hasHistoryWindow
+    ? await resolveTimeseriesWindowContext()
+    : {
+      connector_id: null,
+      station_id: null,
+      timeseries_ids: [timeseriesId],
+    };
+  const historyConnectorId = parseRequiredPositiveInt(historyContext.connector_id);
+  const historyTargetTimeseriesIds = Array.isArray(historyContext.timeseries_ids)
+    ? historyContext.timeseries_ids
+    : [timeseriesId];
 
   const historyRead = hasHistoryWindow
     ? await readHistoryRows({
       env,
       historyPrefix,
       connectorId: historyConnectorId,
-      stationTimeseriesIds: historyStationTimeseriesIds,
-      stationId,
+      targetTimeseriesIds: historyTargetTimeseriesIds,
+      targetStationId: null,
       startIso: new Date(historyStartMs).toISOString(),
       endIso: new Date(historyEndMs).toISOString(),
       sinceIso,
@@ -1398,7 +1457,7 @@ async function handleRequest(request, env) {
     try {
       const obsAqiRecentRead = await readRecentRowsFromObsAqiDb({
         env,
-        stationId,
+        timeseriesId,
         startIso: new Date(recentStartMs).toISOString(),
         endIso: new Date(recentEndMs).toISOString(),
         sinceIso,
@@ -1416,14 +1475,17 @@ async function handleRequest(request, env) {
       // Keep the endpoint available when the live ObsAQIDB slice is unavailable by
       // falling back to R2 for the same recent window on a best-effort basis.
       try {
-        const recentFallbackConnectorId = await resolveStationConnectorId();
-        const recentFallbackStationTimeseriesIds = await resolveStationTimeseriesIds();
+        const recentContext = await resolveTimeseriesWindowContext();
+        const recentFallbackConnectorId = parseRequiredPositiveInt(recentContext.connector_id);
+        const recentFallbackTargetTimeseriesIds = Array.isArray(recentContext.timeseries_ids)
+          ? recentContext.timeseries_ids
+          : [timeseriesId];
         recentHistoryFallbackRead = await readHistoryRows({
           env,
           historyPrefix,
           connectorId: recentFallbackConnectorId,
-          stationTimeseriesIds: recentFallbackStationTimeseriesIds,
-          stationId,
+          targetTimeseriesIds: recentFallbackTargetTimeseriesIds,
+          targetStationId: null,
           startIso: new Date(recentStartMs).toISOString(),
           endIso: new Date(recentEndMs).toISOString(),
           sinceIso,
@@ -1473,8 +1535,10 @@ async function handleRequest(request, env) {
     scope,
     grain,
     pollutant: requestedPollutant,
-    entity_id: String(stationId),
-    station_id: stationId,
+    entity_id: String(timeseriesId),
+    timeseries_id: timeseriesId,
+    station_id: targetStationId,
+    connector_id: targetConnectorId,
     query_from_utc: startIso,
     query_to_utc: endIso,
     since_utc: sinceIso,
@@ -1487,19 +1551,15 @@ async function handleRequest(request, env) {
       missing_day_manifest_keys: historyRead.missing_day_manifest_keys,
       missing_connector_manifest_keys: historyRead.missing_connector_manifest_keys,
       missing_parquet_keys: historyRead.missing_parquet_keys,
-      station_connector_id: stationConnectorId,
-      station_connector_lookup_source_path: stationConnectorSourcePath,
-      station_connector_lookup_error: stationConnectorLookupError,
-      station_connector_lookup_cache_hit: stationConnectorLookupAttempted
-        ? stationConnectorCacheHit
+      target_connector_id: targetConnectorId,
+      target_station_id: targetStationId,
+      timeseries_window_context_lookup_source_path: windowContextSourcePath,
+      timeseries_window_context_lookup_error: windowContextLookupError,
+      timeseries_window_context_lookup_cache_hit: windowContextLookupAttempted
+        ? windowContextLookupCacheHit
         : false,
-      station_timeseries_lookup_source_path: stationTimeseriesSourcePath,
-      station_timeseries_lookup_error: stationTimeseriesLookupError,
-      station_timeseries_lookup_cache_hit: stationTimeseriesLookupAttempted
-        ? stationTimeseriesLookupCacheHit
-        : false,
-      station_timeseries_id_count: Array.isArray(stationTimeseriesIds)
-        ? stationTimeseriesIds.length
+      target_timeseries_id_count: Array.isArray(targetTimeseriesIds)
+        ? targetTimeseriesIds.length
         : 0,
       timeseries_index: historyRead.timeseries_index,
       obs_aqidb_source_path: recentRead.source_path,
