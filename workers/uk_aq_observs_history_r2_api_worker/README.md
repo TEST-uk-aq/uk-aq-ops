@@ -37,14 +37,16 @@ Serving rule:
 
 - a UTC day is served only when the day manifest exists (committed history rule).
 - no `_SUCCESS` marker or loose parquet scan fallback is used.
-- when the optional timeseries index exists, file selection is narrowed by `min_timeseries_id/max_timeseries_id` before parquet reads.
+- when the optional timeseries index exists, file selection is narrowed by:
+  - `min_timeseries_id/max_timeseries_id`
+  - and, when present in index file metadata, `min_observed_at/max_observed_at` overlap with the requested time window (`start_utc`/`end_utc`/`since_utc`)
 - if the optional timeseries index is missing/invalid for a day+connector, the worker falls back to connector manifest file scanning.
 
 Response:
 
 - returns `{ observed_at, value }` rows sorted by `observed_at` ascending.
 - includes coverage diagnostics (`missing_day_manifest_keys`, etc.).
-- includes `coverage.timeseries_index` diagnostics for index hit/miss/fallback visibility.
+- includes `coverage.timeseries_index` diagnostics for index hit/miss/fallback visibility, including `skipped_files_by_time_range`.
 - sets `x-ukaq-cache: HIT|MISS`.
 
 Optional env:

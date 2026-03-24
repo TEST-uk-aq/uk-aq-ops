@@ -90,6 +90,14 @@ function toIsoOrNull(raw) {
   return new Date(ms).toISOString();
 }
 
+function parseMsOrNaN(raw) {
+  if (raw === null || raw === undefined || String(raw).trim() === "") {
+    return Number.NaN;
+  }
+  const ms = Date.parse(String(raw).trim());
+  return Number.isFinite(ms) ? ms : Number.NaN;
+}
+
 function cacheControlHeader(cacheSeconds) {
   return `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${
     cacheSeconds * 2
@@ -376,11 +384,17 @@ function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
   return fallbackKey;
 }
 
-function extractParquetKeysFromTimeseriesIndex(indexPayload, timeseriesId) {
+function extractParquetKeysFromTimeseriesIndex(
+  indexPayload,
+  timeseriesId,
+  effectiveStartMs,
+  endMs,
+) {
   const files = Array.isArray(indexPayload?.files) ? indexPayload.files : [];
   const allKeys = [];
   let indexedFileCount = 0;
   let filesWithUnknownRange = 0;
+  let filesSkippedByTimeRange = 0;
   let allFilesRangeBounded = files.length > 0;
 
   for (const entry of files) {
@@ -404,6 +418,20 @@ function extractParquetKeysFromTimeseriesIndex(indexPayload, timeseriesId) {
       continue;
     }
 
+    const fileMinObservedMs = parseMsOrNaN(entry?.min_observed_at);
+    const fileMaxObservedMs = parseMsOrNaN(entry?.max_observed_at);
+    const hasTimeRange = Number.isFinite(fileMinObservedMs) &&
+      Number.isFinite(fileMaxObservedMs) &&
+      fileMaxObservedMs >= fileMinObservedMs;
+    if (hasTimeRange) {
+      // Query window is [effectiveStartMs, endMs). File range is [min, max].
+      // Skip when there is definitely no overlap.
+      if (fileMaxObservedMs < effectiveStartMs || fileMinObservedMs >= endMs) {
+        filesSkippedByTimeRange += 1;
+        continue;
+      }
+    }
+
     indexedFileCount += 1;
     if (timeseriesId >= minTimeseriesId && timeseriesId <= maxTimeseriesId) {
       allKeys.push(key);
@@ -416,6 +444,7 @@ function extractParquetKeysFromTimeseriesIndex(indexPayload, timeseriesId) {
     file_count: files.length,
     indexed_file_count: indexedFileCount,
     unknown_range_file_count: filesWithUnknownRange,
+    skipped_by_time_range_file_count: filesSkippedByTimeRange,
     all_files_range_bounded: allFilesRangeBounded,
   };
 }
@@ -453,6 +482,9 @@ async function readHistoryRows({
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
   const sinceMs = sinceIso ? Date.parse(sinceIso) : Number.NaN;
+  const effectiveStartMs = Number.isFinite(sinceMs)
+    ? Math.max(startMs, sinceMs + 1)
+    : startMs;
   const parquetRowChunkSize = parsePositiveInt(
     env.UK_AQ_OBSERVS_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE,
     5000,
@@ -484,6 +516,7 @@ async function readHistoryRows({
   let timeseriesIndexHitCount = 0;
   let timeseriesIndexMissCount = 0;
   let timeseriesIndexSkippedByRangeDays = 0;
+  let timeseriesIndexSkippedByTimeRangeFiles = 0;
   let timeseriesIndexIndexedFileCount = 0;
   let timeseriesIndexUnknownRangeFileCount = 0;
 
@@ -524,10 +557,14 @@ async function readHistoryRows({
           const extraction = extractParquetKeysFromTimeseriesIndex(
             connectorIndexObject.value,
             timeseriesId,
+            effectiveStartMs,
+            endMs,
           );
           timeseriesIndexIndexedFileCount += extraction.indexed_file_count;
           timeseriesIndexUnknownRangeFileCount +=
             extraction.unknown_range_file_count;
+          timeseriesIndexSkippedByTimeRangeFiles +=
+            extraction.skipped_by_time_range_file_count;
           parquetKeys = extraction.keys;
           if (
             extraction.all_files_range_bounded && extraction.keys.length === 0
@@ -602,6 +639,7 @@ async function readHistoryRows({
       hit_count: timeseriesIndexHitCount,
       miss_count: timeseriesIndexMissCount,
       skipped_days_by_file_range: timeseriesIndexSkippedByRangeDays,
+      skipped_files_by_time_range: timeseriesIndexSkippedByTimeRangeFiles,
       indexed_file_count_seen: timeseriesIndexIndexedFileCount,
       unknown_range_file_count_seen: timeseriesIndexUnknownRangeFileCount,
       missing_connector_index_keys: timeseriesIndexMissingKeys,
