@@ -302,6 +302,7 @@ async function fetchFilteredParquetRowsFromR2(
   stationId,
   rowChunkSize,
   targetTimeseriesIds = null,
+  payloadColumns = AQI_PARQUET_COLUMNS,
 ) {
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
@@ -335,7 +336,10 @@ async function fetchFilteredParquetRowsFromR2(
     return { exists: true, rows: [] };
   }
 
-  const availableColumns = AQI_PARQUET_COLUMNS.filter((columnName) =>
+  const requestedPayloadColumns = Array.isArray(payloadColumns) && payloadColumns.length > 0
+    ? payloadColumns
+    : AQI_PARQUET_COLUMNS;
+  const availableColumns = requestedPayloadColumns.filter((columnName) =>
     schemaColumns.includes(columnName)
   );
   const filterColumns = Array.from(
@@ -470,6 +474,35 @@ async function fetchFilteredParquetRowsFromR2(
   }
 
   return { exists: true, rows: outRows };
+}
+
+function resolveAqiParquetPayloadColumns(pollutantKey) {
+  const baseColumns = [
+    "timeseries_id",
+    "timestamp_hour_utc",
+    "pollutant_code",
+    "daqi_index_level",
+    "eaqi_index_level",
+  ];
+  if (pollutantKey === "pm25") {
+    return baseColumns.concat([
+      "daqi_pm25_rolling24h_index_level",
+      "eaqi_pm25_index_level",
+    ]);
+  }
+  if (pollutantKey === "pm10") {
+    return baseColumns.concat([
+      "daqi_pm10_rolling24h_index_level",
+      "eaqi_pm10_index_level",
+    ]);
+  }
+  if (pollutantKey === "no2") {
+    return baseColumns.concat([
+      "daqi_no2_index_level",
+      "eaqi_no2_index_level",
+    ]);
+  }
+  return AQI_PARQUET_COLUMNS;
 }
 
 function getParquetRowValue(rowEntry, columnName, columnIndexByName) {
@@ -1023,6 +1056,7 @@ async function readHistoryRows({
     MIN_MAX_SCAN_ELAPSED_MS,
     MAX_MAX_SCAN_ELAPSED_MS,
   );
+  const parquetPayloadColumns = resolveAqiParquetPayloadColumns(pollutantKey);
   const targetTimeseriesIdCount = Array.isArray(targetTimeseriesIds)
     ? targetTimeseriesIds.length
     : 0;
@@ -1241,6 +1275,7 @@ async function readHistoryRows({
           targetStationId,
           parquetRowChunkSize,
           targetTimeseriesIds,
+          parquetPayloadColumns,
         );
         if (!parquet.exists) {
           missingParquetKeys.add(parquetKey);
