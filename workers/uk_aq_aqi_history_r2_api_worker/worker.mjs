@@ -905,6 +905,34 @@ async function readHistoryRows({
     : 0;
 
   const days = listUtcDays(startIso, endIso);
+  if (Array.isArray(stationTimeseriesIds) && stationTimeseriesIds.length === 0) {
+    return {
+      points: [],
+      days_scanned: days.length,
+      scanned_connector_manifests: 0,
+      scanned_parquet_files: 0,
+      missing_day_manifest_keys: [],
+      missing_connector_manifest_keys: [],
+      missing_parquet_keys: [],
+      timeseries_index: {
+        enabled: timeseriesIndexEnabled,
+        prefix: timeseriesIndexPrefix,
+        scanned_connector_index_keys: 0,
+        hit_count: 0,
+        miss_count: 0,
+        skipped_days_by_file_range: 0,
+        skipped_files_by_pollutant: 0,
+        indexed_file_count_seen: 0,
+        unknown_range_file_count_seen: 0,
+        missing_connector_index_keys: [],
+        warnings: [
+          "No AQI timeseries IDs found for station in requested window; skipped R2 history scan.",
+        ],
+        station_timeseries_id_count: 0,
+      },
+    };
+  }
+
   const rowsByPeriodStart = new Map();
   const missingDayManifestKeys = [];
   const missingConnectorManifestKeys = new Set();
@@ -1295,7 +1323,7 @@ async function handleRequest(request, env) {
   let stationTimeseriesLookupError = null;
   let stationTimeseriesLookupCacheHit = false;
   let stationTimeseriesLookupAttempted = false;
-  let stationTimeseriesIds = [];
+  let stationTimeseriesIds = null;
 
   const resolveStationConnectorId = async () => {
     if (stationConnectorLookupAttempted) {
@@ -1335,7 +1363,7 @@ async function handleRequest(request, env) {
       stationTimeseriesLookupCacheHit = lookup.cache_hit;
     } catch (error) {
       stationTimeseriesLookupError = error instanceof Error ? error.message : String(error);
-      stationTimeseriesIds = [];
+      stationTimeseriesIds = null;
     }
     return stationTimeseriesIds;
   };
@@ -1470,7 +1498,9 @@ async function handleRequest(request, env) {
       station_timeseries_lookup_cache_hit: stationTimeseriesLookupAttempted
         ? stationTimeseriesLookupCacheHit
         : false,
-      station_timeseries_id_count: stationTimeseriesIds.length,
+      station_timeseries_id_count: Array.isArray(stationTimeseriesIds)
+        ? stationTimeseriesIds.length
+        : 0,
       timeseries_index: historyRead.timeseries_index,
       obs_aqidb_source_path: recentRead.source_path,
       obs_aqidb_row_count: recentRead.points.length,
