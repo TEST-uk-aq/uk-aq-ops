@@ -45,12 +45,23 @@ Serving rule:
 Response:
 
 - returns `{ observed_at, value }` rows sorted by `observed_at` ascending.
+- includes `cache_scope` (`recent` or `immutable`) for cache policy visibility.
 - includes coverage diagnostics (`missing_day_manifest_keys`, etc.).
 - includes `coverage.timeseries_index` diagnostics for index hit/miss/fallback visibility, including `skipped_files_by_time_range`.
 - sets `x-ukaq-cache: HIT|MISS`.
 
+Cache behavior:
+
+- cache key is canonicalized to `/v1/observations` with normalized query params:
+  - `timeseries_id`, `connector_id`, `start_utc`, `end_utc`, optional `since_utc`, optional `limit`
+- equivalent request forms (including `/` alias or non-canonical timestamp text that resolves to the same ISO value) share the same cache entry.
+- recent window cache TTL uses `UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS` (default `300`).
+- immutable window cache TTL uses `UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS` (default `86400`), applied when `end_utc` is older than 24 hours.
+
 Optional env:
 
+- `UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS` (default `300`, clamp `30..604800`)
+- `UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS` (default `86400`, clamp `30..604800`)
 - `UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_ENABLED` (`true|false`, default `true`)
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
 - `UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_PREFIX`

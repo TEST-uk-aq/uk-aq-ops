@@ -5,10 +5,13 @@ const DEFAULT_HISTORY_PREFIX = "history/v1/observations";
 const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "observations_timeseries";
 const DEFAULT_CACHE_SECONDS = 300;
-const MAX_CACHE_SECONDS = 3600;
+const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
+const MAX_CACHE_SECONDS = 604800;
 const MAX_LIMIT = 20000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
+const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const OBS_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
 const VALID_PATHS = new Set(["/", "/v1/observations"]);
 
 function corsHeaders() {
@@ -102,6 +105,31 @@ function cacheControlHeader(cacheSeconds) {
   return `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${
     cacheSeconds * 2
   }`;
+}
+
+function resolveCachePolicy(env, endIso) {
+  const mutableCacheSeconds = parsePositiveInt(
+    env.UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS,
+    DEFAULT_CACHE_SECONDS,
+    30,
+    MAX_CACHE_SECONDS,
+  );
+  const immutableCacheSeconds = Math.max(
+    mutableCacheSeconds,
+    parsePositiveInt(
+      env.UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS,
+      DEFAULT_IMMUTABLE_CACHE_SECONDS,
+      30,
+      MAX_CACHE_SECONDS,
+    ),
+  );
+  const endMs = Date.parse(endIso);
+  const immutable = Number.isFinite(endMs) &&
+    endMs <= (Date.now() - OBS_HISTORY_MUTABLE_WINDOW_MS);
+  return {
+    cacheSeconds: immutable ? immutableCacheSeconds : mutableCacheSeconds,
+    cacheScope: immutable ? "immutable" : "recent",
+  };
 }
 
 function jsonResponse(payload, {
@@ -384,6 +412,110 @@ function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
   return fallbackKey;
 }
 
+function parseObservationsRequest(url) {
+  if (!VALID_PATHS.has(url.pathname)) {
+    return { ok: false, status: 404, error: "Not found." };
+  }
+
+  const timeseriesId = parseRequiredPositiveInt(
+    url.searchParams.get("timeseries_id"),
+  );
+  if (!timeseriesId) {
+    return {
+      ok: false,
+      status: 400,
+      error: "timeseries_id must be a positive integer.",
+    };
+  }
+
+  const connectorId = parseRequiredPositiveInt(
+    url.searchParams.get("connector_id"),
+  );
+  if (!connectorId) {
+    return {
+      ok: false,
+      status: 400,
+      error: "connector_id must be a positive integer.",
+    };
+  }
+
+  const startIso = toIsoOrNull(url.searchParams.get("start_utc"));
+  const endIso = toIsoOrNull(url.searchParams.get("end_utc"));
+  if (!startIso || !endIso) {
+    return {
+      ok: false,
+      status: 400,
+      error: "start_utc and end_utc must be valid ISO timestamps.",
+    };
+  }
+  if (Date.parse(endIso) <= Date.parse(startIso)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "end_utc must be greater than start_utc.",
+    };
+  }
+
+  const sinceIso = url.searchParams.has("since_utc")
+    ? toIsoOrNull(url.searchParams.get("since_utc"))
+    : null;
+  if (url.searchParams.has("since_utc") && !sinceIso) {
+    return {
+      ok: false,
+      status: 400,
+      error: "since_utc must be a valid ISO timestamp when provided.",
+    };
+  }
+
+  const limit = parseOptionalPositiveInt(
+    url.searchParams.get("limit"),
+    1,
+    MAX_LIMIT,
+  );
+  if (url.searchParams.has("limit") && limit === null) {
+    return {
+      ok: false,
+      status: 400,
+      error: `limit must be an integer between 1 and ${MAX_LIMIT}.`,
+    };
+  }
+
+  return {
+    ok: true,
+    timeseriesId,
+    connectorId,
+    startIso,
+    endIso,
+    sinceIso,
+    limit,
+  };
+}
+
+function buildCanonicalCacheKey(requestUrl, {
+  timeseriesId,
+  connectorId,
+  startIso,
+  endIso,
+  sinceIso,
+  limit,
+}) {
+  const cacheUrl = new URL(requestUrl);
+  cacheUrl.pathname = "/v1/observations";
+  cacheUrl.search = "";
+  cacheUrl.hash = "";
+  cacheUrl.searchParams.set("timeseries_id", String(timeseriesId));
+  cacheUrl.searchParams.set("connector_id", String(connectorId));
+  cacheUrl.searchParams.set("start_utc", startIso);
+  cacheUrl.searchParams.set("end_utc", endIso);
+  if (sinceIso) {
+    cacheUrl.searchParams.set("since_utc", sinceIso);
+  }
+  if (limit !== null) {
+    cacheUrl.searchParams.set("limit", String(limit));
+  }
+  return new Request(cacheUrl.toString(), { method: "GET" });
+}
+
 function extractParquetKeysFromTimeseriesIndex(
   indexPayload,
   timeseriesId,
@@ -648,81 +780,20 @@ async function readHistoryRows({
   };
 }
 
-async function handleRequest(request, env) {
-  const url = new URL(request.url);
-  if (!VALID_PATHS.has(url.pathname)) {
-    return jsonResponse({ ok: false, error: "Not found." }, {
-      status: 404,
-      cacheSeconds: 30,
-    });
-  }
-
-  const timeseriesId = parseRequiredPositiveInt(
-    url.searchParams.get("timeseries_id"),
-  );
-  if (!timeseriesId) {
-    return jsonResponse({
-      ok: false,
-      error: "timeseries_id must be a positive integer.",
-    }, { status: 400, cacheSeconds: 30 });
-  }
-
-  const connectorId = parseRequiredPositiveInt(
-    url.searchParams.get("connector_id"),
-  );
-  if (!connectorId) {
-    return jsonResponse({
-      ok: false,
-      error: "connector_id must be a positive integer.",
-    }, { status: 400, cacheSeconds: 30 });
-  }
-
-  const startIso = toIsoOrNull(url.searchParams.get("start_utc"));
-  const endIso = toIsoOrNull(url.searchParams.get("end_utc"));
-  if (!startIso || !endIso) {
-    return jsonResponse({
-      ok: false,
-      error: "start_utc and end_utc must be valid ISO timestamps.",
-    }, { status: 400, cacheSeconds: 30 });
-  }
-  if (Date.parse(endIso) <= Date.parse(startIso)) {
-    return jsonResponse({
-      ok: false,
-      error: "end_utc must be greater than start_utc.",
-    }, { status: 400, cacheSeconds: 30 });
-  }
-
-  const sinceIso = url.searchParams.has("since_utc")
-    ? toIsoOrNull(url.searchParams.get("since_utc"))
-    : null;
-  if (url.searchParams.has("since_utc") && !sinceIso) {
-    return jsonResponse({
-      ok: false,
-      error: "since_utc must be a valid ISO timestamp when provided.",
-    }, { status: 400, cacheSeconds: 30 });
-  }
-
-  const limit = parseOptionalPositiveInt(
-    url.searchParams.get("limit"),
-    1,
-    MAX_LIMIT,
-  );
-  if (url.searchParams.has("limit") && limit === null) {
-    return jsonResponse({
-      ok: false,
-      error: `limit must be an integer between 1 and ${MAX_LIMIT}.`,
-    }, { status: 400, cacheSeconds: 30 });
-  }
-
+async function handleRequest(requestParams, env) {
+  const {
+    timeseriesId,
+    connectorId,
+    startIso,
+    endIso,
+    sinceIso,
+    limit,
+  } = requestParams;
   const historyPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || DEFAULT_HISTORY_PREFIX,
   ) || DEFAULT_HISTORY_PREFIX;
-  const cacheSeconds = parsePositiveInt(
-    env.UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS,
-    DEFAULT_CACHE_SECONDS,
-    30,
-    MAX_CACHE_SECONDS,
-  );
+  const cachePolicy = resolveCachePolicy(env, endIso);
+  const { cacheSeconds, cacheScope } = cachePolicy;
 
   const historyRead = await readHistoryRows({
     env,
@@ -744,6 +815,7 @@ async function handleRequest(request, env) {
     start_utc: startIso,
     end_utc: endIso,
     since_utc: sinceIso,
+    cache_scope: cacheScope,
     row_count: historyRead.rows.length,
     rows: historyRead.rows,
     coverage: {
@@ -785,7 +857,16 @@ export default {
       });
     }
 
-    const cacheKey = new Request(request.url, { method: "GET" });
+    const requestUrl = new URL(request.url);
+    const requestParams = parseObservationsRequest(requestUrl);
+    if (!requestParams.ok) {
+      return jsonResponse({ ok: false, error: requestParams.error }, {
+        status: requestParams.status,
+        cacheSeconds: 30,
+      });
+    }
+
+    const cacheKey = buildCanonicalCacheKey(request.url, requestParams);
     const cached = await caches.default.match(cacheKey);
     if (cached) {
       return withCacheMarker(cached, "HIT");
@@ -793,7 +874,7 @@ export default {
 
     let response;
     try {
-      response = await handleRequest(request, env);
+      response = await handleRequest(requestParams, env);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       response = jsonResponse({ ok: false, error: message }, {
