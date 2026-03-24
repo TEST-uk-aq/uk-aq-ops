@@ -11,6 +11,7 @@ export interface Env {
   UK_AQ_TURNSTILE_SECRET_KEY: unknown;
   UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: unknown;
   UK_AQ_CHART_METRICS_RPC: unknown;
+  UK_AQ_CHART_METRICS_RPC_SCHEMA: unknown;
   UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE: unknown;
   UK_AQ_CHART_METRICS_MAX_BODY_BYTES: unknown;
 }
@@ -173,6 +174,7 @@ const CHART_METRICS_DEFAULT_RATE_LIMIT_PER_MINUTE = 60;
 const CHART_METRICS_MAX_TRACKED_KEYS = 5_000;
 const CHART_METRICS_RATE_WINDOW_MS = 60 * 1000;
 const DEFAULT_CHART_METRICS_RPC = "uk_aq_rpc_chart_load_metrics_insert";
+const DEFAULT_CHART_METRICS_RPC_SCHEMA = "uk_aq_public";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -628,6 +630,9 @@ async function insertChartMetric(
   const rpcName = (
     await readSecret(env.UK_AQ_CHART_METRICS_RPC)
   ).trim() || DEFAULT_CHART_METRICS_RPC;
+  const rpcSchema = (
+    await readSecret(env.UK_AQ_CHART_METRICS_RPC_SCHEMA)
+  ).trim() || DEFAULT_CHART_METRICS_RPC_SCHEMA;
   const rpcUrl = `${normalizeBaseUrl(obsAqIdbSupabaseUrl)}/rest/v1/rpc/${rpcName}`;
   let response: Response;
   try {
@@ -636,6 +641,8 @@ async function insertChartMetric(
       headers: {
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "Accept-Profile": rpcSchema,
+        "Content-Profile": rpcSchema,
         "apikey": obsAqIdbSecretKey,
         "Authorization": `Bearer ${obsAqIdbSecretKey}`,
       },

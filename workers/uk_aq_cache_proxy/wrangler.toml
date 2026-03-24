@@ -18,6 +18,7 @@ enabled = true
 # Runtime variables:
 # - UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS (optional)
 # - UK_AQ_CHART_METRICS_RPC (optional)
+# - UK_AQ_CHART_METRICS_RPC_SCHEMA (optional, default: uk_aq_public)
 # - UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE (optional)
 # - UK_AQ_CHART_METRICS_MAX_BODY_BYTES (optional)
 #
