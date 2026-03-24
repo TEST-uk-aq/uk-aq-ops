@@ -338,16 +338,20 @@ async function fetchFilteredParquetRowsFromR2(
   const availableColumns = AQI_PARQUET_COLUMNS.filter((columnName) =>
     schemaColumns.includes(columnName)
   );
-  const readColumns = Array.from(
+  const filterColumns = Array.from(
     new Set(
       [
         hasStationFilter ? "station_id" : null,
         hasTimeseriesFilter ? "timeseries_id" : null,
-        ...availableColumns,
       ].filter(Boolean),
     ),
   );
-  const readColumnIndexByName = new Map(readColumns.map((columnName, idx) => [columnName, idx]));
+  const filterColumnIndexByName = new Map(
+    filterColumns.map((columnName, idx) => [columnName, idx])
+  );
+  const payloadColumnIndexByName = new Map(
+    availableColumns.map((columnName, idx) => [columnName, idx])
+  );
 
   const outRows = [];
   let rowGroupStart = 0;
@@ -397,35 +401,57 @@ async function fetchFilteredParquetRowsFromR2(
       chunkStart += rowChunkSize
     ) {
       const chunkEnd = Math.min(rowGroupEnd, chunkStart + rowChunkSize);
-      const chunkRows = await readParquetRowsForColumns(
-        arrayBuffer,
-        metadata,
-        readColumns,
-        chunkStart,
-        chunkEnd,
-      );
-      if (chunkRows.length === 0) {
+      const matchedIndexes = [];
+      if (filterColumns.length > 0) {
+        const filterRows = await readParquetRowsForColumns(
+          arrayBuffer,
+          metadata,
+          filterColumns,
+          chunkStart,
+          chunkEnd,
+        );
+        if (filterRows.length === 0) {
+          continue;
+        }
+        for (let idx = 0; idx < filterRows.length; idx += 1) {
+          const rowEntry = filterRows[idx];
+          if (hasStationFilter) {
+            const rowStationId = Number(
+              getParquetRowValue(rowEntry, "station_id", filterColumnIndexByName),
+            );
+            if (!Number.isFinite(rowStationId) || rowStationId !== normalizedStationId) {
+              continue;
+            }
+          }
+          if (hasTimeseriesFilter) {
+            const rowTimeseriesId = parseRequiredPositiveInt(
+              getParquetRowValue(rowEntry, "timeseries_id", filterColumnIndexByName),
+            );
+            if (!Number.isFinite(rowTimeseriesId) || !targetTimeseriesSet.has(rowTimeseriesId)) {
+              continue;
+            }
+          }
+          matchedIndexes.push(idx);
+        }
+      }
+
+      if (matchedIndexes.length === 0) {
         continue;
       }
 
-      for (const rowEntry of chunkRows) {
-        if (hasStationFilter) {
-          const rowStationId = Number(
-            getParquetRowValue(rowEntry, "station_id", readColumnIndexByName),
-          );
-          if (!Number.isFinite(rowStationId) || rowStationId !== normalizedStationId) {
-            continue;
-          }
-        }
-        if (hasTimeseriesFilter) {
-          const rowTimeseriesId = parseRequiredPositiveInt(
-            getParquetRowValue(rowEntry, "timeseries_id", readColumnIndexByName),
-          );
-          if (!Number.isFinite(rowTimeseriesId) || !targetTimeseriesSet.has(rowTimeseriesId)) {
-            continue;
-          }
-        }
+      const payloadRows = await readParquetRowsForColumns(
+        arrayBuffer,
+        metadata,
+        availableColumns,
+        chunkStart,
+        chunkEnd,
+      );
+      if (payloadRows.length === 0) {
+        continue;
+      }
 
+      for (const idx of matchedIndexes) {
+        const rowEntry = idx < payloadRows.length ? payloadRows[idx] : null;
         const row = {};
         if (hasStationFilter) {
           row.station_id = normalizedStationId;
@@ -434,7 +460,7 @@ async function fetchFilteredParquetRowsFromR2(
           row.timeseries_id = normalizedTimeseriesIds[0];
         }
         for (const columnName of availableColumns) {
-          row[columnName] = getParquetRowValue(rowEntry, columnName, readColumnIndexByName);
+          row[columnName] = getParquetRowValue(rowEntry, columnName, payloadColumnIndexByName);
         }
         outRows.push(row);
       }

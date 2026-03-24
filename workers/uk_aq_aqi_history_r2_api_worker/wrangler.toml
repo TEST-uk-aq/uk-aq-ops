@@ -2,16 +2,34 @@ name = "uk-aq-aqi-history-r2-api"
 main = "worker.mjs"
 compatibility_date = "2026-03-11"
 
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
 [vars]
 UK_AQ_R2_HISTORY_AQILEVELS_PREFIX = "history/v1/aqilevels"
 UK_AQ_R2_HISTORY_INDEX_PREFIX = "history/_index"
 UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX = "history/_index/aqilevels_timeseries"
 UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED = "true"
+UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX = "true"
 UK_AQ_AQI_HISTORY_R2_CACHE_MAX_AGE_SECONDS = "300"
 UK_AQ_AQI_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS = "86400"
 UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS = "168"
 UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS = "10000"
-UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE = "5000"
+UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE = "20000"
+UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST = "120"
+UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS = "12000"
 UK_AQ_PUBLIC_SCHEMA = "uk_aq_public"
 
 [[r2_buckets]]
