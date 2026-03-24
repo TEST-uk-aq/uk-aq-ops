@@ -641,15 +641,43 @@ const HOURLY_UPSERT_MIN_CHUNK_SIZE = Math.min(
     10000,
   ),
 );
-const OBS_R2_PART_MAX_ROWS = parsePositiveInt(
+const R2_HISTORY_PART_MAX_ROWS = parsePositiveInt(
   Deno.env.get("UK_AQ_R2_HISTORY_PART_MAX_ROWS"),
   1000000,
   1000,
   5000000,
 );
-const OBS_R2_ROW_GROUP_SIZE = parsePositiveInt(
+const R2_HISTORY_ROW_GROUP_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_R2_HISTORY_ROW_GROUP_SIZE"),
   100000,
+  10000,
+  2000000,
+);
+const OBS_R2_PART_MAX_ROWS = parsePositiveInt(
+  Deno.env.get("UK_AQ_R2_HISTORY_OBSERVATIONS_PART_MAX_ROWS") ||
+    Deno.env.get("UK_AQ_R2_HISTORY_PART_MAX_ROWS"),
+  500000,
+  1000,
+  5000000,
+);
+const OBS_R2_ROW_GROUP_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_R2_HISTORY_OBSERVATIONS_ROW_GROUP_SIZE") ||
+    Deno.env.get("UK_AQ_R2_HISTORY_ROW_GROUP_SIZE"),
+  50000,
+  10000,
+  2000000,
+);
+const AQI_R2_PART_MAX_ROWS = parsePositiveInt(
+  Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_PART_MAX_ROWS") ||
+    Deno.env.get("UK_AQ_R2_HISTORY_PART_MAX_ROWS"),
+  R2_HISTORY_PART_MAX_ROWS,
+  1000,
+  5000000,
+);
+const AQI_R2_ROW_GROUP_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_ROW_GROUP_SIZE") ||
+    Deno.env.get("UK_AQ_R2_HISTORY_ROW_GROUP_SIZE"),
+  R2_HISTORY_ROW_GROUP_SIZE,
   10000,
   2000000,
 );
@@ -2491,7 +2519,7 @@ function rowsToAqiParquetBuffer(
   }).writeParquet(
     wasmTable,
     parquetWriterProperties(
-      OBS_R2_ROW_GROUP_SIZE,
+      AQI_R2_ROW_GROUP_SIZE,
       HISTORY_AQILEVELS_WRITER_VERSION,
     ),
   );
@@ -3000,7 +3028,7 @@ async function exportAqiConnectorDayToR2(args: {
         daqi_index_level: row.daqi_index_level,
         eaqi_index_level: row.eaqi_index_level,
       });
-      if (parquetRowsBuffer.length >= OBS_R2_PART_MAX_ROWS) {
+      if (parquetRowsBuffer.length >= AQI_R2_PART_MAX_ROWS) {
         await flushPart();
       }
     }
@@ -3201,7 +3229,7 @@ async function exportAqiConnectorRowsToR2(args: {
   let minTimestampHourUtc: string | null = null;
   let maxTimestampHourUtc: string | null = null;
 
-  const rowChunks = chunkRows(sortedRows, OBS_R2_PART_MAX_ROWS);
+  const rowChunks = chunkRows(sortedRows, AQI_R2_PART_MAX_ROWS);
   for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
     const chunk = rowChunks[partIndex];
     if (!chunk.length) {
@@ -8012,6 +8040,8 @@ async function runObservsToR2(
       day_utc: dayUtc,
       connector_filter: effectiveConnectorIds,
       force_replace: FORCE_REPLACE,
+      part_max_rows: OBS_R2_PART_MAX_ROWS,
+      row_group_size: OBS_R2_ROW_GROUP_SIZE,
     });
 
     const connectorCounts = await fetchConnectorCountsForDay(
@@ -8439,6 +8469,8 @@ async function runObservsToR2(
       day_utc: dayUtc,
       connector_filter: effectiveConnectorIds,
       force_replace: FORCE_REPLACE,
+      part_max_rows: AQI_R2_PART_MAX_ROWS,
+      row_group_size: AQI_R2_ROW_GROUP_SIZE,
     });
 
     for (const connectorId of targetConnectors) {
@@ -10750,6 +10782,10 @@ async function main(): Promise<void> {
     ingest_retention_days: INGEST_RETENTION_DAYS,
     observs_local_retention_days: OBS_AQI_LOCAL_RETENTION_DAYS,
     local_timezone: LOCAL_TIMEZONE,
+    observations_part_max_rows: OBS_R2_PART_MAX_ROWS,
+    observations_row_group_size: OBS_R2_ROW_GROUP_SIZE,
+    aqilevels_part_max_rows: AQI_R2_PART_MAX_ROWS,
+    aqilevels_row_group_size: AQI_R2_ROW_GROUP_SIZE,
     allow_stub_modes: ALLOW_STUB_MODES,
     ledger_enabled: ledgerEnabled,
   });

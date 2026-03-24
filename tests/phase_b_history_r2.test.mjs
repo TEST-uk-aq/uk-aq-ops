@@ -74,6 +74,27 @@ test("runtime config includes AQI levels prefix defaults", () => {
   const config = resolvePhaseBRuntimeConfig({});
   assert.equal(config.committed_prefix, "history/v1/observations");
   assert.equal(config.aqilevels_prefix, "history/v1/aqilevels");
+  assert.equal(config.observations_part_max_rows, 500000);
+  assert.equal(config.observations_row_group_size, 50000);
+  assert.equal(config.aqilevels_part_max_rows, 1000000);
+  assert.equal(config.aqilevels_row_group_size, 100000);
+});
+
+test("runtime config supports domain-specific parquet geometry overrides", () => {
+  const config = resolvePhaseBRuntimeConfig({
+    UK_AQ_R2_HISTORY_PART_MAX_ROWS: "900000",
+    UK_AQ_R2_HISTORY_ROW_GROUP_SIZE: "90000",
+    UK_AQ_R2_HISTORY_OBSERVATIONS_PART_MAX_ROWS: "250000",
+    UK_AQ_R2_HISTORY_OBSERVATIONS_ROW_GROUP_SIZE: "25000",
+    UK_AQ_R2_HISTORY_AQILEVELS_PART_MAX_ROWS: "1200000",
+    UK_AQ_R2_HISTORY_AQILEVELS_ROW_GROUP_SIZE: "120000",
+  });
+  assert.equal(config.part_max_rows, 900000);
+  assert.equal(config.row_group_size, 90000);
+  assert.equal(config.observations_part_max_rows, 250000);
+  assert.equal(config.observations_row_group_size, 25000);
+  assert.equal(config.aqilevels_part_max_rows, 1200000);
+  assert.equal(config.aqilevels_row_group_size, 120000);
 });
 
 test("Phase B eligibility tracks ingest retention days", () => {

@@ -19,8 +19,12 @@ import {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PART_MAX_ROWS = 1_000_000;
+const DEFAULT_OBSERVATIONS_PART_MAX_ROWS = 500_000;
+const DEFAULT_AQILEVELS_PART_MAX_ROWS = DEFAULT_PART_MAX_ROWS;
 const DEFAULT_CURSOR_FETCH_ROWS = 20_000;
 const DEFAULT_ROW_GROUP_SIZE = 100_000;
+const DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE = 50_000;
+const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
 const DEFAULT_AQILEVELS_SOURCE_MAX_PAGES = 50_000;
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
@@ -1277,7 +1281,10 @@ async function writeCommittedPartAndCheckpoint({
   observedRows,
   totalBytes,
 }) {
-  const parquetBuffer = rowsToParquetBuffer(rows, parquetWriterProperties(runtime.row_group_size));
+  const parquetBuffer = rowsToParquetBuffer(
+    rows,
+    parquetWriterProperties(runtime.observations_row_group_size),
+  );
   const committedKey = buildPartKey(runtime.committed_prefix, dayUtc, connectorId, partIndex);
   const putResult = await r2PutObject({
     r2: runtime.r2,
@@ -1413,7 +1420,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
             value: row.value,
           });
 
-          if (pendingRows.length >= runtime.part_max_rows) {
+          if (pendingRows.length >= runtime.observations_part_max_rows) {
             const flushed = await writeCommittedPartAndCheckpoint({
               streamClient,
               runtime,
@@ -1718,7 +1725,10 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     const partKey = buildPartKey(runtime.aqilevels_prefix, dayUtc, connectorId, partIndex);
     const parquetBuffer = rowsToAqilevelParquetBuffer(
       partRows,
-      parquetWriterProperties(runtime.row_group_size, HISTORY_AQILEVELS_WRITER_VERSION),
+      parquetWriterProperties(
+        runtime.aqilevels_row_group_size,
+        HISTORY_AQILEVELS_WRITER_VERSION,
+      ),
     );
     const putResult = await r2PutObject({
       r2: runtime.r2,
@@ -1799,7 +1809,7 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
         eaqi_pm10_index_level: row.eaqi_pm10_index_level,
       });
 
-      if (pendingRows.length >= runtime.part_max_rows) {
+      if (pendingRows.length >= runtime.aqilevels_part_max_rows) {
         await flushPart();
       }
     }
@@ -2272,6 +2282,18 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   const runsPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
   );
+  const sharedPartMaxRows = parsePositiveInt(
+    env.UK_AQ_R2_HISTORY_PART_MAX_ROWS,
+    DEFAULT_PART_MAX_ROWS,
+    1,
+    5_000_000,
+  );
+  const sharedRowGroupSize = parsePositiveInt(
+    env.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE,
+    DEFAULT_ROW_GROUP_SIZE,
+    10_000,
+    2_000_000,
+  );
 
   return {
     deploy_env: deployEnv,
@@ -2284,21 +2306,35 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
       secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
     },
-    part_max_rows: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_PART_MAX_ROWS,
-      DEFAULT_PART_MAX_ROWS,
-      1,
-      5_000_000,
-    ),
+    part_max_rows: sharedPartMaxRows,
     cursor_fetch_rows: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS,
       DEFAULT_CURSOR_FETCH_ROWS,
       1_000,
       500_000,
     ),
-    row_group_size: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE,
-      DEFAULT_ROW_GROUP_SIZE,
+    row_group_size: sharedRowGroupSize,
+    observations_part_max_rows: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_OBSERVATIONS_PART_MAX_ROWS || env.UK_AQ_R2_HISTORY_PART_MAX_ROWS,
+      DEFAULT_OBSERVATIONS_PART_MAX_ROWS,
+      1,
+      5_000_000,
+    ),
+    observations_row_group_size: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_OBSERVATIONS_ROW_GROUP_SIZE || env.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE,
+      DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE,
+      10_000,
+      2_000_000,
+    ),
+    aqilevels_part_max_rows: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_AQILEVELS_PART_MAX_ROWS || env.UK_AQ_R2_HISTORY_PART_MAX_ROWS,
+      DEFAULT_AQILEVELS_PART_MAX_ROWS,
+      1,
+      5_000_000,
+    ),
+    aqilevels_row_group_size: parsePositiveInt(
+      env.UK_AQ_R2_HISTORY_AQILEVELS_ROW_GROUP_SIZE || env.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE,
+      DEFAULT_AQILEVELS_ROW_GROUP_SIZE,
       10_000,
       2_000_000,
     ),
@@ -2399,8 +2435,12 @@ export async function runPhaseBBackup({
     latest_eligible_day_utc: window.latest_eligible_day_utc,
     max_candidates_per_run: runtime.max_candidates_per_run,
     part_max_rows: runtime.part_max_rows,
+    observations_part_max_rows: runtime.observations_part_max_rows,
+    aqilevels_part_max_rows: runtime.aqilevels_part_max_rows,
     cursor_fetch_rows: runtime.cursor_fetch_rows,
     row_group_size: runtime.row_group_size,
+    observations_row_group_size: runtime.observations_row_group_size,
+    aqilevels_row_group_size: runtime.aqilevels_row_group_size,
     deploy_env: runtime.deploy_env,
     r2_bucket: runtime.r2.bucket,
     observations_prefix: runtime.committed_prefix,
