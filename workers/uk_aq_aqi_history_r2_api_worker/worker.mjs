@@ -17,6 +17,12 @@ const MAX_OBSAQIDB_TIMEOUT_MS = 30000;
 const DEFAULT_PARQUET_ROW_CHUNK_SIZE = 5000;
 const MIN_PARQUET_ROW_CHUNK_SIZE = 500;
 const MAX_PARQUET_ROW_CHUNK_SIZE = 50000;
+const DEFAULT_MAX_PARQUET_FILES_PER_REQUEST = 200;
+const MIN_MAX_PARQUET_FILES_PER_REQUEST = 10;
+const MAX_MAX_PARQUET_FILES_PER_REQUEST = 5000;
+const DEFAULT_MAX_SCAN_ELAPSED_MS = 18000;
+const MIN_MAX_SCAN_ELAPSED_MS = 1000;
+const MAX_MAX_SCAN_ELAPSED_MS = 120000;
 const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -951,6 +957,7 @@ async function readHistoryRows({
   pollutantKey,
   limit,
 }) {
+  const scanStartedAtMs = Date.now();
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
   const sinceMs = sinceIso ? Date.parse(sinceIso) : Number.NaN;
@@ -971,6 +978,22 @@ async function readHistoryRows({
   const timeseriesIndexEnabled = parseOptionalBoolean(
     env.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED,
     true,
+  );
+  const requireTimeseriesIndex = parseOptionalBoolean(
+    env.UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX,
+    true,
+  );
+  const maxParquetFilesPerRequest = parsePositiveInt(
+    env.UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST,
+    DEFAULT_MAX_PARQUET_FILES_PER_REQUEST,
+    MIN_MAX_PARQUET_FILES_PER_REQUEST,
+    MAX_MAX_PARQUET_FILES_PER_REQUEST,
+  );
+  const maxScanElapsedMs = parsePositiveInt(
+    env.UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS,
+    DEFAULT_MAX_SCAN_ELAPSED_MS,
+    MIN_MAX_SCAN_ELAPSED_MS,
+    MAX_MAX_SCAN_ELAPSED_MS,
   );
   const targetTimeseriesIdCount = Array.isArray(targetTimeseriesIds)
     ? targetTimeseriesIds.length
@@ -1048,8 +1071,20 @@ async function readHistoryRows({
   let timeseriesIndexSkippedByPollutantFiles = 0;
   let timeseriesIndexIndexedFileCount = 0;
   let timeseriesIndexUnknownRangeFileCount = 0;
+  let scanStoppedReason = null;
+
+  const isScanBudgetExceeded = () => {
+    if (Date.now() - scanStartedAtMs > maxScanElapsedMs) {
+      scanStoppedReason = `scan_elapsed_ms_budget_exceeded:${maxScanElapsedMs}`;
+      return true;
+    }
+    return false;
+  };
 
   for (const dayUtc of days) {
+    if (isScanBudgetExceeded()) {
+      break;
+    }
     const dayManifestKey = buildDayManifestKey(historyPrefix, dayUtc);
     const dayManifestObject = await fetchJsonObjectFromR2(env, dayManifestKey);
     if (!dayManifestObject.exists) {
@@ -1090,6 +1125,9 @@ async function readHistoryRows({
     }
 
     for (const connectorManifestTarget of connectorManifestTargets) {
+      if (isScanBudgetExceeded()) {
+        break;
+      }
       const connectorManifestKey = String(connectorManifestTarget.manifest_key || "").trim();
       if (!connectorManifestKey) {
         continue;
@@ -1124,6 +1162,12 @@ async function readHistoryRows({
           } else {
             timeseriesIndexMissCount += 1;
             timeseriesIndexMissingKeys.push(connectorIndexKey);
+            if (requireTimeseriesIndex && targetTimeseriesIdCount > 0) {
+              timeseriesIndexWarnings.push(
+                `Skipped fallback manifest scan for ${connectorIndexKey}: timeseries index is required.`,
+              );
+              continue;
+            }
           }
         } catch (error) {
           timeseriesIndexMissCount += 1;
@@ -1131,6 +1175,9 @@ async function readHistoryRows({
           timeseriesIndexWarnings.push(
             `Optional timeseries index read failed for ${connectorIndexKey}: ${message}`,
           );
+          if (requireTimeseriesIndex && targetTimeseriesIdCount > 0) {
+            continue;
+          }
         }
       }
 
@@ -1149,8 +1196,15 @@ async function readHistoryRows({
       }
 
       for (const parquetKey of parquetKeys) {
+        if (isScanBudgetExceeded()) {
+          break;
+        }
         if (!parquetKey) {
           continue;
+        }
+        if (scannedParquetKeys.size >= maxParquetFilesPerRequest) {
+          scanStoppedReason = `max_parquet_files_budget_exceeded:${maxParquetFilesPerRequest}`;
+          break;
         }
         scannedParquetKeys.add(parquetKey);
         const parquet = await fetchFilteredParquetRowsFromR2(
@@ -1175,6 +1229,13 @@ async function readHistoryRows({
         });
       }
     }
+    if (scanStoppedReason) {
+      break;
+    }
+  }
+
+  if (scanStoppedReason) {
+    timeseriesIndexWarnings.push(`History scan stopped early: ${scanStoppedReason}`);
   }
 
   const points = normalizeAndSortRows(rowsByPeriodStart, limit);
@@ -1199,6 +1260,10 @@ async function readHistoryRows({
       missing_connector_index_keys: timeseriesIndexMissingKeys,
       warnings: timeseriesIndexWarnings,
       target_timeseries_id_count: targetTimeseriesIdCount,
+      require_timeseries_index: requireTimeseriesIndex,
+      max_parquet_files_per_request: maxParquetFilesPerRequest,
+      max_scan_elapsed_ms: maxScanElapsedMs,
+      scan_stopped_reason: scanStoppedReason,
     },
   };
 }
