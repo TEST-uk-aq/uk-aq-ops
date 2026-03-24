@@ -42,7 +42,7 @@ R2 paths expected:
 - the worker resolves `station_id -> connector_id` from `uk_aq_public.uk_aq_station_connector_lookup` and reads only that connector manifest when available
 - optional AQI timeseries index (fast-path):
   - `${UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
-  - the worker resolves station timeseries ids from `uk_aq_core.timeseries` and narrows parquet file scans using each file's `min_timeseries_id/max_timeseries_id`
+  - the worker resolves station timeseries ids from `uk_aq_public.uk_aq_timeseries_aqi_hourly` for the requested window and narrows parquet file scans using each file's `min_timeseries_id/max_timeseries_id`
   - if the optional index is missing/invalid for a day+connector, it falls back to connector manifest file scanning
 - AQI parquet reads use `station_id` row-group stats and chunked column reads instead of materializing whole parquet files
 
@@ -72,7 +72,6 @@ Useful runtime vars:
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX` (default `history/_index/aqilevels_timeseries`)
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED` (default `true`)
 - `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`)
-- `UK_AQ_CORE_SCHEMA` (default `uk_aq_core`)
 
 Response:
 

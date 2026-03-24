@@ -18,14 +18,14 @@ const DEFAULT_PARQUET_ROW_CHUNK_SIZE = 5000;
 const MIN_PARQUET_ROW_CHUNK_SIZE = 500;
 const MAX_PARQUET_ROW_CHUNK_SIZE = 50000;
 const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
-const UK_AQ_CORE_SCHEMA_DEFAULT = "uk_aq_core";
+const TIMESERIES_LOOKUP_MAX_ROWS = 50000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set(["/", "/v1/aqi-history"]);
 const STATION_CONNECTOR_LOOKUP_VIEW = "uk_aq_station_connector_lookup";
-const TIMESERIES_TABLE = "timeseries";
+const TIMESERIES_AQI_HOURLY_VIEW = "uk_aq_timeseries_aqi_hourly";
 const AQI_PARQUET_COLUMNS = [
   "timestamp_hour_utc",
   "pollutant_code",
@@ -578,34 +578,42 @@ async function readStationConnectorIdFromObsAqiDb({
   };
 }
 
-function buildStationTimeseriesCacheKey(stationId, connectorId) {
+function buildStationTimeseriesCacheKey(stationId, connectorId, startIso, endIso) {
   const stationPart = Number.isFinite(Number(stationId)) ? Math.trunc(Number(stationId)) : 0;
   const connectorPart = Number.isFinite(Number(connectorId)) ? Math.trunc(Number(connectorId)) : 0;
-  return `${stationPart}:${connectorPart > 0 ? connectorPart : "all"}`;
+  const startMs = Date.parse(String(startIso || ""));
+  const endMs = Date.parse(String(endIso || ""));
+  const startDay = Number.isFinite(startMs) ? toUtcDayFromMs(startMs) : "na";
+  const endDay = Number.isFinite(endMs) ? toUtcDayFromMs(endMs) : "na";
+  return `${stationPart}:${connectorPart > 0 ? connectorPart : "all"}:${startDay}:${endDay}`;
 }
 
 async function readStationTimeseriesIdsFromObsAqiDb({
   env,
   stationId,
   connectorId,
+  startIso,
+  endIso,
 }) {
-  const cacheKey = buildStationTimeseriesCacheKey(stationId, connectorId);
+  const cacheKey = buildStationTimeseriesCacheKey(stationId, connectorId, startIso, endIso);
   if (stationTimeseriesIdsCache.has(cacheKey)) {
     const cached = stationTimeseriesIdsCache.get(cacheKey) || {};
     return {
-      source_path: String(cached.source_path || `${UK_AQ_CORE_SCHEMA_DEFAULT}.${TIMESERIES_TABLE}`),
+      source_path: String(cached.source_path || `${UK_AQ_PUBLIC_SCHEMA_DEFAULT}.${TIMESERIES_AQI_HOURLY_VIEW}`),
       timeseries_ids: Array.isArray(cached.timeseries_ids) ? cached.timeseries_ids : [],
       cache_hit: true,
     };
   }
 
-  const schema = String(env.UK_AQ_CORE_SCHEMA || UK_AQ_CORE_SCHEMA_DEFAULT).trim()
-    || UK_AQ_CORE_SCHEMA_DEFAULT;
+  const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim()
+    || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
   const queryParams = [
-    ["select", "id"],
+    ["select", "timeseries_id"],
     ["station_id", `eq.${stationId}`],
-    ["order", "id.asc"],
-    ["limit", "20000"],
+    ["timestamp_hour_utc", `gte.${startIso}`],
+    ["timestamp_hour_utc", `lt.${endIso}`],
+    ["order", "timeseries_id.asc"],
+    ["limit", String(TIMESERIES_LOOKUP_MAX_ROWS)],
   ];
   if (Number.isFinite(Number(connectorId)) && Number(connectorId) > 0) {
     queryParams.push(["connector_id", `eq.${Math.trunc(Number(connectorId))}`]);
@@ -613,7 +621,7 @@ async function readStationTimeseriesIdsFromObsAqiDb({
 
   const result = await fetchObsAqiDbArray({
     env,
-    path: TIMESERIES_TABLE,
+    path: TIMESERIES_AQI_HOURLY_VIEW,
     schema,
     queryParams,
   });
@@ -621,7 +629,7 @@ async function readStationTimeseriesIdsFromObsAqiDb({
   const timeseriesIds = Array.from(
     new Set(
       (Array.isArray(result.rows) ? result.rows : [])
-        .map((row) => parseRequiredPositiveInt(row?.id))
+        .map((row) => parseRequiredPositiveInt(row?.timeseries_id))
         .filter((id) => Number.isFinite(id) && id > 0),
     ),
   ).sort((a, b) => a - b);
@@ -1319,6 +1327,8 @@ async function handleRequest(request, env) {
         env,
         stationId,
         connectorId: lookupConnectorId,
+        startIso,
+        endIso,
       });
       stationTimeseriesIds = lookup.timeseries_ids;
       stationTimeseriesSourcePath = lookup.source_path;
