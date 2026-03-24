@@ -641,7 +641,7 @@ async function readTimeseriesWindowContextFromObsAqiDb({
   const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim()
     || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
   const parsedTimeseriesId = parseRequiredPositiveInt(timeseriesId);
-  const result = await fetchObsAqiDbArray({
+  const windowResult = await fetchObsAqiDbArray({
     env,
     path: TIMESERIES_AQI_HOURLY_VIEW,
     schema,
@@ -654,18 +654,37 @@ async function readTimeseriesWindowContextFromObsAqiDb({
       ["limit", "1"],
     ],
   });
+  let firstRow = Array.isArray(windowResult.rows) ? windowResult.rows[0] : null;
+  let sourcePath = windowResult.source_path;
+  if (!firstRow) {
+    // Fallback: resolve connector/station context from the latest known row for
+    // this timeseries so history scans remain connector-targeted even when the
+    // requested window currently has no AQI rows.
+    const latestResult = await fetchObsAqiDbArray({
+      env,
+      path: TIMESERIES_AQI_HOURLY_VIEW,
+      schema,
+      queryParams: [
+        ["select", "timeseries_id,station_id,connector_id,timestamp_hour_utc"],
+        ["timeseries_id", `eq.${parsedTimeseriesId}`],
+        ["order", "timestamp_hour_utc.desc"],
+        ["limit", "1"],
+      ],
+    });
+    firstRow = Array.isArray(latestResult.rows) ? latestResult.rows[0] : null;
+    sourcePath = latestResult.source_path;
+  }
 
-  const firstRow = Array.isArray(result.rows) ? result.rows[0] : null;
-  const hasWindowRow = Boolean(firstRow);
-  const windowStationId = parseRequiredPositiveInt(firstRow?.station_id) || null;
-  const windowConnectorId = parseRequiredPositiveInt(firstRow?.connector_id) || null;
-  const windowTimeseriesIds = hasWindowRow ? [parsedTimeseriesId] : [];
+  const hasTimeseriesRow = Boolean(firstRow);
+  const resolvedStationId = parseRequiredPositiveInt(firstRow?.station_id) || null;
+  const resolvedConnectorId = parseRequiredPositiveInt(firstRow?.connector_id) || null;
+  const resolvedTimeseriesIds = hasTimeseriesRow ? [parsedTimeseriesId] : [];
 
   const context = {
-    source_path: result.source_path,
-    timeseries_ids: windowTimeseriesIds,
-    station_id: windowStationId,
-    connector_id: windowConnectorId,
+    source_path: sourcePath,
+    timeseries_ids: resolvedTimeseriesIds,
+    station_id: resolvedStationId,
+    connector_id: resolvedConnectorId,
   };
   timeseriesWindowContextCache.set(cacheKey, context);
 
@@ -982,6 +1001,34 @@ async function readHistoryRows({
           "No AQI timeseries IDs found in requested window; skipped R2 history scan.",
         ],
         target_timeseries_id_count: 0,
+      },
+    };
+  }
+
+  if (!Number.isFinite(Number(connectorId)) || Number(connectorId) <= 0) {
+    return {
+      points: [],
+      days_scanned: days.length,
+      scanned_connector_manifests: 0,
+      scanned_parquet_files: 0,
+      missing_day_manifest_keys: [],
+      missing_connector_manifest_keys: [],
+      missing_parquet_keys: [],
+      timeseries_index: {
+        enabled: timeseriesIndexEnabled,
+        prefix: timeseriesIndexPrefix,
+        scanned_connector_index_keys: 0,
+        hit_count: 0,
+        miss_count: 0,
+        skipped_days_by_file_range: 0,
+        skipped_files_by_pollutant: 0,
+        indexed_file_count_seen: 0,
+        unknown_range_file_count_seen: 0,
+        missing_connector_index_keys: [],
+        warnings: [
+          "No connector context available for target timeseries; skipped R2 history scan.",
+        ],
+        target_timeseries_id_count: targetTimeseriesIdCount,
       },
     };
   }
