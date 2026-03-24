@@ -166,7 +166,9 @@ const MAX_SESSION_MAX_AGE_SECONDS = 86400;
 const UPSTREAM_RETRY_DELAY_MS = 300;
 const UPSTREAM_RETRY_STATUSES = new Set([502, 503, 504]);
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
-const CHART_METRICS_DEFAULT_MAX_BODY_BYTES = 8 * 1024;
+const CHART_METRICS_MIN_BODY_BYTES = 4 * 1024;
+const CHART_METRICS_DEFAULT_MAX_BODY_BYTES = 16 * 1024;
+const CHART_METRICS_MAX_BODY_BYTES = 256 * 1024;
 const CHART_METRICS_DEFAULT_RATE_LIMIT_PER_MINUTE = 60;
 const CHART_METRICS_MAX_TRACKED_KEYS = 5_000;
 const CHART_METRICS_RATE_WINDOW_MS = 60 * 1000;
@@ -201,7 +203,11 @@ async function readSecret(value: unknown): Promise<string> {
 }
 
 function parseIntInRange(value: string, fallback: number, min: number, max: number): number {
-  const parsed = Number(value);
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return fallback;
+  }
+  const parsed = Number(normalized);
   if (!Number.isFinite(parsed)) {
     return fallback;
   }
@@ -660,6 +666,7 @@ async function insertChartMetric(
 async function handleChartMetricsIngest(
   request: Request,
   env: Env,
+  ctx: ExecutionContext,
   requestOrigin: string | null,
   allowedOrigins: Set<string>,
 ): Promise<Response> {
@@ -676,8 +683,8 @@ async function handleChartMetricsIngest(
   const maxBodyBytes = parseIntInRange(
     await readSecret(env.UK_AQ_CHART_METRICS_MAX_BODY_BYTES),
     CHART_METRICS_DEFAULT_MAX_BODY_BYTES,
-    1024,
-    256 * 1024,
+    CHART_METRICS_MIN_BODY_BYTES,
+    CHART_METRICS_MAX_BODY_BYTES,
   );
   const rateKey = `${requestOrigin ?? "unknown"}|${parseClientIp(request)}`;
   if (!applyChartMetricsRateLimit(rateKey, rateLimitPerMinute)) {
@@ -695,10 +702,15 @@ async function handleChartMetricsIngest(
     return makeErrorResponse(400, "invalid_payload", requestOrigin, allowedOrigins);
   }
 
-  const insertResult = await insertChartMetric(env, parsedPayload);
-  if (!insertResult.ok) {
-    return makeErrorResponse(insertResult.status, insertResult.reason, requestOrigin, allowedOrigins);
-  }
+  ctx.waitUntil((async () => {
+    const insertResult = await insertChartMetric(env, parsedPayload);
+    if (!insertResult.ok) {
+      console.error("chart_metrics_insert_failed_async", {
+        status: insertResult.status,
+        reason: insertResult.reason,
+      });
+    }
+  })());
 
   const headers = new Headers({
     "Content-Type": "application/json; charset=utf-8",
@@ -1154,7 +1166,7 @@ export default {
       if (!isOriginAllowed(requestOrigin, allowedOrigins)) {
         return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
       }
-      return handleChartMetricsIngest(request, env, requestOrigin, allowedOrigins);
+      return handleChartMetricsIngest(request, env, ctx, requestOrigin, allowedOrigins);
     }
 
     const tokenSecret = await readSecret(env.UK_AQ_EDGE_ACCESS_TOKEN_SECRET);
