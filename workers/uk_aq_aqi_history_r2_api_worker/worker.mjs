@@ -335,6 +335,20 @@ async function fetchFilteredParquetRowsFromR2(
     return { exists: true, rows: [] };
   }
 
+  const availableColumns = AQI_PARQUET_COLUMNS.filter((columnName) =>
+    schemaColumns.includes(columnName)
+  );
+  const readColumns = Array.from(
+    new Set(
+      [
+        hasStationFilter ? "station_id" : null,
+        hasTimeseriesFilter ? "timeseries_id" : null,
+        ...availableColumns,
+      ].filter(Boolean),
+    ),
+  );
+  const readColumnIndexByName = new Map(readColumns.map((columnName, idx) => [columnName, idx]));
+
   const outRows = [];
   let rowGroupStart = 0;
   for (const rowGroup of metadata.row_groups ?? []) {
@@ -383,63 +397,35 @@ async function fetchFilteredParquetRowsFromR2(
       chunkStart += rowChunkSize
     ) {
       const chunkEnd = Math.min(rowGroupEnd, chunkStart + rowChunkSize);
-      const stationValues = hasStationFilter
-        ? await readParquetColumnValues(
-          arrayBuffer,
-          metadata,
-          "station_id",
-          chunkStart,
-          chunkEnd,
-        )
-        : [];
-      const timeseriesValues = hasTimeseriesFilter
-        ? await readParquetColumnValues(
-          arrayBuffer,
-          metadata,
-          "timeseries_id",
-          chunkStart,
-          chunkEnd,
-        )
-        : [];
-      const matchedIndexes = [];
-      const chunkLength = hasStationFilter
-        ? stationValues.length
-        : hasTimeseriesFilter
-        ? timeseriesValues.length
-        : 0;
-      for (let idx = 0; idx < chunkLength; idx += 1) {
+      const chunkRows = await readParquetRowsForColumns(
+        arrayBuffer,
+        metadata,
+        readColumns,
+        chunkStart,
+        chunkEnd,
+      );
+      if (chunkRows.length === 0) {
+        continue;
+      }
+
+      for (const rowEntry of chunkRows) {
         if (hasStationFilter) {
-          const rowStationId = Number(stationValues[idx]);
+          const rowStationId = Number(
+            getParquetRowValue(rowEntry, "station_id", readColumnIndexByName),
+          );
           if (!Number.isFinite(rowStationId) || rowStationId !== normalizedStationId) {
             continue;
           }
         }
         if (hasTimeseriesFilter) {
-          const rowTimeseriesId = parseRequiredPositiveInt(timeseriesValues[idx]);
+          const rowTimeseriesId = parseRequiredPositiveInt(
+            getParquetRowValue(rowEntry, "timeseries_id", readColumnIndexByName),
+          );
           if (!Number.isFinite(rowTimeseriesId) || !targetTimeseriesSet.has(rowTimeseriesId)) {
             continue;
           }
         }
-        matchedIndexes.push(idx);
-      }
-      if (matchedIndexes.length === 0) {
-        continue;
-      }
 
-      const columnValues = {};
-      const availableColumns = AQI_PARQUET_COLUMNS.filter((columnName) =>
-        schemaColumns.includes(columnName)
-      );
-      for (const columnName of availableColumns) {
-        columnValues[columnName] = await readParquetColumnValues(
-          arrayBuffer,
-          metadata,
-          columnName,
-          chunkStart,
-          chunkEnd,
-        );
-      }
-      for (const idx of matchedIndexes) {
         const row = {};
         if (hasStationFilter) {
           row.station_id = normalizedStationId;
@@ -448,8 +434,7 @@ async function fetchFilteredParquetRowsFromR2(
           row.timeseries_id = normalizedTimeseriesIds[0];
         }
         for (const columnName of availableColumns) {
-          const values = columnValues[columnName];
-          row[columnName] = idx < values.length ? values[idx] : undefined;
+          row[columnName] = getParquetRowValue(rowEntry, columnName, readColumnIndexByName);
         }
         outRows.push(row);
       }
@@ -461,18 +446,35 @@ async function fetchFilteredParquetRowsFromR2(
   return { exists: true, rows: outRows };
 }
 
-async function readParquetColumnValues(
+function getParquetRowValue(rowEntry, columnName, columnIndexByName) {
+  const columnIndex = columnIndexByName.get(columnName);
+  if (!Number.isFinite(columnIndex)) {
+    return undefined;
+  }
+  if (Array.isArray(rowEntry)) {
+    return rowEntry[columnIndex];
+  }
+  if (rowEntry && typeof rowEntry === "object") {
+    return rowEntry[columnName];
+  }
+  return columnIndex === 0 ? rowEntry : undefined;
+}
+
+async function readParquetRowsForColumns(
   file,
   metadata,
-  columnName,
+  columns,
   rowStart,
   rowEnd,
 ) {
+  if (!Array.isArray(columns) || columns.length === 0 || rowEnd <= rowStart) {
+    return [];
+  }
   let rows = [];
   await parquetRead({
     file,
     metadata,
-    columns: [columnName],
+    columns,
     rowStart,
     rowEnd,
     compressors,
@@ -482,7 +484,7 @@ async function readParquetColumnValues(
       }
     },
   });
-  return rows.map((entry) => Array.isArray(entry) ? entry[0] : undefined);
+  return rows;
 }
 
 function maxFiniteIndex(values, maxValue) {

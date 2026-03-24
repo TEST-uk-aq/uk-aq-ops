@@ -164,8 +164,15 @@ const TOKEN_MAX_LIFETIME_SECONDS = 86400;
 const DEFAULT_SESSION_MAX_AGE_SECONDS = 900;
 const MIN_SESSION_MAX_AGE_SECONDS = 60;
 const MAX_SESSION_MAX_AGE_SECONDS = 86400;
+const DEFAULT_UPSTREAM_MAX_ATTEMPTS = 2;
 const UPSTREAM_RETRY_DELAY_MS = 300;
+const AQI_HISTORY_UPSTREAM_MAX_ATTEMPTS = 6;
+const AQI_HISTORY_UPSTREAM_RETRY_DELAY_MS = 700;
 const UPSTREAM_RETRY_STATUSES = new Set([502, 503, 504]);
+const HOUR_MS = 60 * 60 * 1000;
+const AQI_HISTORY_CANONICALIZE_MIN_WINDOW_MS = 3 * 24 * HOUR_MS;
+const AQI_HISTORY_START_KEYS = ["from_utc", "start_utc", "from", "start"] as const;
+const AQI_HISTORY_END_KEYS = ["to_utc", "end_utc", "to", "end"] as const;
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const CHART_METRICS_MIN_BODY_BYTES = 4 * 1024;
 const CHART_METRICS_DEFAULT_MAX_BODY_BYTES = 16 * 1024;
@@ -746,6 +753,53 @@ function parseIsoMsOrNull(value: string | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function getFirstSearchParam(url: URL, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = url.searchParams.get(key);
+    if (String(value ?? "").trim()) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function canonicalizeAqiHistoryRequestUrl(url: URL, upstreamFunction: string): URL {
+  const normalized = new URL(url.toString());
+  if (upstreamFunction !== EXTERNAL_AQI_HISTORY_UPSTREAM) {
+    return normalized;
+  }
+
+  const startMs = parseIsoMsOrNull(getFirstSearchParam(normalized, AQI_HISTORY_START_KEYS));
+  const endMs = parseIsoMsOrNull(getFirstSearchParam(normalized, AQI_HISTORY_END_KEYS));
+  if (startMs === null || endMs === null || endMs <= startMs) {
+    return normalized;
+  }
+
+  if ((endMs - startMs) < AQI_HISTORY_CANONICALIZE_MIN_WINDOW_MS) {
+    return normalized;
+  }
+
+  const canonicalStartMs = Math.floor(startMs / HOUR_MS) * HOUR_MS;
+  const canonicalEndMs = Math.floor(endMs / HOUR_MS) * HOUR_MS;
+  if (!Number.isFinite(canonicalStartMs) || !Number.isFinite(canonicalEndMs) || canonicalEndMs <= canonicalStartMs) {
+    return normalized;
+  }
+
+  const canonicalStartIso = new Date(canonicalStartMs).toISOString();
+  const canonicalEndIso = new Date(canonicalEndMs).toISOString();
+  for (const key of AQI_HISTORY_START_KEYS) {
+    if (normalized.searchParams.has(key)) {
+      normalized.searchParams.set(key, canonicalStartIso);
+    }
+  }
+  for (const key of AQI_HISTORY_END_KEYS) {
+    if (normalized.searchParams.has(key)) {
+      normalized.searchParams.set(key, canonicalEndIso);
+    }
+  }
+  return normalized;
+}
+
 function isImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
   const explicitEndMs = parseIsoMsOrNull(
     url.searchParams.get("to_utc")
@@ -833,35 +887,55 @@ type UpstreamFetchResult =
   | {
     response: Response;
     retried: false;
+    attempts: number;
   }
   | {
     response: Response;
     retried: true;
     retryReason: "status" | "network";
+    attempts: number;
   };
 
 async function fetchUpstreamWithRetry(
   url: string,
   init: RequestInit,
   method: string,
+  maxAttempts = DEFAULT_UPSTREAM_MAX_ATTEMPTS,
+  retryDelayMs = UPSTREAM_RETRY_DELAY_MS,
 ): Promise<UpstreamFetchResult> {
   const canRetry = isSafeRequestMethod(method);
-  try {
-    const firstResponse = await fetch(url, init);
-    if (!canRetry || !shouldRetryUpstreamStatus(firstResponse.status)) {
-      return { response: firstResponse, retried: false };
+  const normalizedAttempts = canRetry ? Math.max(1, Math.floor(maxAttempts)) : 1;
+  let retriedForStatus = false;
+  let retriedForNetwork = false;
+
+  for (let attempt = 1; attempt <= normalizedAttempts; attempt += 1) {
+    try {
+      const response = await fetch(url, init);
+      const shouldRetry = canRetry && shouldRetryUpstreamStatus(response.status) && attempt < normalizedAttempts;
+      if (!shouldRetry) {
+        if (attempt === 1) {
+          return { response, retried: false, attempts: 1 };
+        }
+        return {
+          response,
+          retried: true,
+          retryReason: retriedForNetwork ? "network" : "status",
+          attempts: attempt,
+        };
+      }
+      retriedForStatus = true;
+    } catch (error) {
+      if (!canRetry || attempt >= normalizedAttempts) {
+        throw error;
+      }
+      retriedForNetwork = true;
     }
-    await sleep(UPSTREAM_RETRY_DELAY_MS);
-    const secondResponse = await fetch(url, init);
-    return { response: secondResponse, retried: true, retryReason: "status" };
-  } catch (firstError) {
-    if (!canRetry) {
-      throw firstError;
-    }
-    await sleep(UPSTREAM_RETRY_DELAY_MS);
-    const secondResponse = await fetch(url, init);
-    return { response: secondResponse, retried: true, retryReason: "network" };
+
+    // Linear backoff gives the upstream worker time to warm caches/isolates after transient 5xx.
+    await sleep(retryDelayMs * attempt);
   }
+
+  throw new Error("unreachable_upstream_retry_state");
 }
 
 function resolveUpstreamFunction(pathname: string): string | null {
@@ -1286,7 +1360,8 @@ export default {
       }
     }
 
-    const profileName = resolveCacheProfileName(upstreamFunction, url);
+    const normalizedRequestUrl = canonicalizeAqiHistoryRequestUrl(url, upstreamFunction);
+    const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
 
@@ -1306,7 +1381,7 @@ export default {
 
     const shouldUseCache = shouldCacheRequest(request, bypassRequested);
     const cache = (caches as unknown as { default: Cache }).default;
-    const cacheKey = new Request(url.toString(), { method: "GET" });
+    const cacheKey = new Request(normalizedRequestUrl.toString(), { method: "GET" });
 
     if (shouldUseCache && request.method === "GET") {
       const cachedResponse = await cache.match(cacheKey);
@@ -1352,7 +1427,7 @@ export default {
         allowedOrigins,
       );
     }
-    upstreamUrl.search = url.search;
+    upstreamUrl.search = normalizedRequestUrl.search;
 
     const upstreamHeaders = new Headers();
     if (!usingExternalAqiHistoryUpstream) {
@@ -1376,7 +1451,14 @@ export default {
     let upstreamResponse: Response;
     let upstreamRetried = false;
     let upstreamRetryReason: "status" | "network" | null = null;
+    let upstreamAttemptCount = 1;
     try {
+      const upstreamMaxAttempts = usingExternalAqiHistoryUpstream
+        ? AQI_HISTORY_UPSTREAM_MAX_ATTEMPTS
+        : DEFAULT_UPSTREAM_MAX_ATTEMPTS;
+      const upstreamRetryDelayMs = usingExternalAqiHistoryUpstream
+        ? AQI_HISTORY_UPSTREAM_RETRY_DELAY_MS
+        : UPSTREAM_RETRY_DELAY_MS;
       const fetchResult = await fetchUpstreamWithRetry(
         upstreamUrl.toString(),
         {
@@ -1384,9 +1466,12 @@ export default {
           headers: upstreamHeaders,
         },
         request.method,
+        upstreamMaxAttempts,
+        upstreamRetryDelayMs,
       );
       upstreamResponse = fetchResult.response;
       upstreamRetried = fetchResult.retried;
+      upstreamAttemptCount = fetchResult.attempts;
       if (fetchResult.retried) {
         upstreamRetryReason = fetchResult.retryReason;
       }
@@ -1401,6 +1486,7 @@ export default {
     if (upstreamRetried && upstreamRetryReason) {
       responseHeaders.set("X-UK-AQ-Upstream-Retry", upstreamRetryReason);
     }
+    responseHeaders.set("X-UK-AQ-Upstream-Attempts", String(upstreamAttemptCount));
     if (upstreamResponse.status === 200) {
       responseHeaders.set("Cache-Control", buildCacheControl(profile));
     }
