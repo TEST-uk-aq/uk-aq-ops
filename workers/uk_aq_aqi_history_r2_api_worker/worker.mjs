@@ -299,7 +299,6 @@ async function fetchJsonObjectFromR2(env, key) {
 async function fetchFilteredParquetRowsFromR2(
   env,
   key,
-  stationId,
   rowChunkSize,
   targetTimeseriesIds = null,
   payloadColumns = AQI_PARQUET_COLUMNS,
@@ -308,8 +307,6 @@ async function fetchFilteredParquetRowsFromR2(
   if (!object) {
     return { exists: false, rows: [] };
   }
-  const hasStationFilter = Number.isFinite(Number(stationId)) && Number(stationId) > 0;
-  const normalizedStationId = hasStationFilter ? Math.trunc(Number(stationId)) : null;
   const normalizedTimeseriesIds = Array.isArray(targetTimeseriesIds)
     ? Array.from(
       new Set(
@@ -321,7 +318,7 @@ async function fetchFilteredParquetRowsFromR2(
     : [];
   const hasTimeseriesFilter = normalizedTimeseriesIds.length > 0;
   const targetTimeseriesSet = hasTimeseriesFilter ? new Set(normalizedTimeseriesIds) : null;
-  if (!hasStationFilter && !hasTimeseriesFilter) {
+  if (!hasTimeseriesFilter) {
     return { exists: true, rows: [] };
   }
 
@@ -330,9 +327,8 @@ async function fetchFilteredParquetRowsFromR2(
   const schemaColumns = parquetSchema(metadata).children.map((column) =>
     column.element.name
   );
-  const stationStatsIndex = schemaColumns.indexOf("station_id");
   const timeseriesStatsIndex = schemaColumns.indexOf("timeseries_id");
-  if ((hasStationFilter && stationStatsIndex < 0) || (hasTimeseriesFilter && timeseriesStatsIndex < 0)) {
+  if (timeseriesStatsIndex < 0) {
     return { exists: true, rows: [] };
   }
 
@@ -345,7 +341,6 @@ async function fetchFilteredParquetRowsFromR2(
   const filterColumns = Array.from(
     new Set(
       [
-        hasStationFilter ? "station_id" : null,
         hasTimeseriesFilter ? "timeseries_id" : null,
       ].filter(Boolean),
     ),
@@ -365,19 +360,6 @@ async function fetchFilteredParquetRowsFromR2(
     if (!Number.isFinite(rowGroupRows) || rowGroupRows <= 0) {
       rowGroupStart = rowGroupEnd;
       continue;
-    }
-    const stats = rowGroup?.columns?.[stationStatsIndex]?.meta_data?.statistics;
-    const minStation = Number(stats?.min_value ?? stats?.min);
-    const maxStation = Number(stats?.max_value ?? stats?.max);
-    if (hasStationFilter) {
-      if (
-        Number.isFinite(minStation) &&
-        Number.isFinite(maxStation) &&
-        (normalizedStationId < minStation || normalizedStationId > maxStation)
-      ) {
-        rowGroupStart = rowGroupEnd;
-        continue;
-      }
     }
 
     if (hasTimeseriesFilter) {
@@ -419,14 +401,6 @@ async function fetchFilteredParquetRowsFromR2(
         }
         for (let idx = 0; idx < filterRows.length; idx += 1) {
           const rowEntry = filterRows[idx];
-          if (hasStationFilter) {
-            const rowStationId = Number(
-              getParquetRowValue(rowEntry, "station_id", filterColumnIndexByName),
-            );
-            if (!Number.isFinite(rowStationId) || rowStationId !== normalizedStationId) {
-              continue;
-            }
-          }
           if (hasTimeseriesFilter) {
             const rowTimeseriesId = parseRequiredPositiveInt(
               getParquetRowValue(rowEntry, "timeseries_id", filterColumnIndexByName),
@@ -457,9 +431,6 @@ async function fetchFilteredParquetRowsFromR2(
       for (const idx of matchedIndexes) {
         const rowEntry = idx < payloadRows.length ? payloadRows[idx] : null;
         const row = {};
-        if (hasStationFilter) {
-          row.station_id = normalizedStationId;
-        }
         if (hasTimeseriesFilter && normalizedTimeseriesIds.length === 1) {
           row.timeseries_id = normalizedTimeseriesIds[0];
         }
@@ -591,6 +562,7 @@ function buildEmptyHistoryRead() {
       missing_connector_index_keys: [],
       warnings: [],
       target_timeseries_id_count: 0,
+      scan_stopped_reason: null,
     },
   };
 }
@@ -774,7 +746,6 @@ function normalizeAndSortRows(rowsByPeriodStart, limit) {
 }
 
 function appendFilteredRows(rows, {
-  stationId = null,
   targetTimeseriesIds = null,
   startMs,
   endMs,
@@ -782,8 +753,6 @@ function appendFilteredRows(rows, {
   pollutantKey,
   outByPeriodStart,
 }) {
-  const normalizedStationId = parseRequiredPositiveInt(stationId);
-  const hasStationFilter = Number.isFinite(normalizedStationId) && normalizedStationId > 0;
   const normalizedTimeseriesIds = Array.isArray(targetTimeseriesIds)
     ? Array.from(
       new Set(
@@ -798,9 +767,6 @@ function appendFilteredRows(rows, {
 
   for (const row of rows) {
     const rowStationId = parseRequiredPositiveInt(row?.station_id);
-    if (hasStationFilter && rowStationId !== normalizedStationId) {
-      continue;
-    }
     const rowTimeseriesId = parseRequiredPositiveInt(row?.timeseries_id);
     if (hasTimeseriesFilter && (!rowTimeseriesId || !targetTimeseriesIdSet.has(rowTimeseriesId))) {
       continue;
@@ -1011,7 +977,6 @@ async function readHistoryRows({
   historyPrefix,
   connectorId,
   targetTimeseriesIds,
-  targetStationId = null,
   startIso,
   endIso,
   sinceIso,
@@ -1062,6 +1027,7 @@ async function readHistoryRows({
     : 0;
 
   const days = listUtcDays(startIso, endIso);
+  const daysToScan = days.slice().reverse();
   if (Array.isArray(targetTimeseriesIds) && targetTimeseriesIds.length === 0) {
     return {
       points: [],
@@ -1143,7 +1109,7 @@ async function readHistoryRows({
     return false;
   };
 
-  for (const dayUtc of days) {
+  for (const dayUtc of daysToScan) {
     if (isScanBudgetExceeded()) {
       break;
     }
@@ -1272,7 +1238,6 @@ async function readHistoryRows({
         const parquet = await fetchFilteredParquetRowsFromR2(
           env,
           parquetKey,
-          targetStationId,
           parquetRowChunkSize,
           targetTimeseriesIds,
           parquetPayloadColumns,
@@ -1282,7 +1247,6 @@ async function readHistoryRows({
           continue;
         }
         appendFilteredRows(parquet.rows, {
-          stationId: targetStationId,
           targetTimeseriesIds,
           startMs,
           endMs,
@@ -1375,7 +1339,6 @@ async function readRecentRowsFromObsAqiDb({
 
   const rowsByPeriodStart = new Map();
   appendFilteredRows(result.rows, {
-    stationId: null,
     targetTimeseriesIds: [timeseriesId],
     startMs: Date.parse(startIso),
     endMs: Date.parse(endIso),
@@ -1615,7 +1578,6 @@ async function handleRequest(request, env) {
       historyPrefix,
       connectorId: historyConnectorId,
       targetTimeseriesIds: historyTargetTimeseriesIds,
-      targetStationId: null,
       startIso: new Date(historyStartMs).toISOString(),
       endIso: new Date(historyEndMs).toISOString(),
       sinceIso,
@@ -1660,7 +1622,6 @@ async function handleRequest(request, env) {
           historyPrefix,
           connectorId: recentFallbackConnectorId,
           targetTimeseriesIds: recentFallbackTargetTimeseriesIds,
-          targetStationId: null,
           startIso: new Date(recentStartMs).toISOString(),
           endIso: new Date(recentEndMs).toISOString(),
           sinceIso,
@@ -1698,6 +1659,13 @@ async function handleRequest(request, env) {
     : recentRead.status === "history_fallback"
     ? "history_r2_fallback"
     : "history_only";
+  const historyScanStoppedReason = historyRead?.timeseries_index?.scan_stopped_reason || null;
+  const recentFallbackScanStoppedReason =
+    recentHistoryFallbackRead?.timeseries_index?.scan_stopped_reason || null;
+  const historyScanComplete = historyScanStoppedReason === null;
+  const recentFallbackScanComplete = recentFallbackScanStoppedReason === null;
+  const responseComplete = historyScanComplete
+    && (recentRead.status !== "history_fallback" || recentFallbackScanComplete);
 
   return jsonResponse({
     ok: true,
@@ -1718,6 +1686,7 @@ async function handleRequest(request, env) {
     query_to_utc: endIso,
     since_utc: sinceIso,
     row_count: points.length,
+    response_complete: responseComplete,
     points,
     coverage: {
       days_scanned: historyRead.days_scanned,
@@ -1736,6 +1705,8 @@ async function handleRequest(request, env) {
       target_timeseries_id_count: Array.isArray(targetTimeseriesIds)
         ? targetTimeseriesIds.length
         : 0,
+      history_scan_complete: historyScanComplete,
+      history_scan_stopped_reason: historyScanStoppedReason,
       timeseries_index: historyRead.timeseries_index,
       obs_aqidb_source_path: recentRead.source_path,
       obs_aqidb_row_count: recentRead.points.length,
@@ -1764,6 +1735,8 @@ async function handleRequest(request, env) {
         recentHistoryFallbackRead.missing_connector_manifest_keys,
       r2_recent_fallback_missing_parquet_keys:
         recentHistoryFallbackRead.missing_parquet_keys,
+      r2_recent_fallback_scan_complete: recentFallbackScanComplete,
+      r2_recent_fallback_scan_stopped_reason: recentFallbackScanStoppedReason,
       r2_recent_fallback_timeseries_index: recentHistoryFallbackRead.timeseries_index,
       r2_recent_fallback_error: recentHistoryFallbackError,
     },
