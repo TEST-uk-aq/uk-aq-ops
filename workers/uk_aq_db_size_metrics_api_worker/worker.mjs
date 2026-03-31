@@ -17,6 +17,8 @@ const R2_HISTORY_DAYS_DEFAULT_MAX_LOOKBACK_DAYS = 120;
 const R2_HISTORY_COUNTS_DEFAULT_RANGE_DAYS = 31;
 const R2_HISTORY_COUNTS_MAX_RANGE_DAYS = 3660;
 const SUPPORTED_R2_HISTORY_COUNT_GRAINS = new Set(["day", "month"]);
+const POSTGREST_PAGE_SIZE = 1000;
+const POSTGREST_MAX_PAGES = 50;
 
 function corsHeaders() {
   return {
@@ -735,44 +737,14 @@ async function fetchR2HistoryCounts(env, url) {
 async function fetchDbSizeRowsForSource(env, source, lookbackDays) {
   const publicSchema = String(env.UK_AQ_PUBLIC_SCHEMA || "uk_aq_public").trim() || "uk_aq_public";
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
-  const query = new URLSearchParams({
+  const payload = await fetchPostgrestRows({
+    baseUrl: source.baseUrl,
+    key: source.key,
+    publicSchema,
+    viewName: "uk_aq_db_size_metrics_hourly",
     select: "bucket_hour,database_label,database_name,size_bytes,oldest_observed_at,recorded_at",
-    bucket_hour: `gte.${since}`,
-    order: "bucket_hour.asc",
-    limit: "5000",
+    since,
   });
-
-  const response = await fetch(`${source.baseUrl}/rest/v1/uk_aq_db_size_metrics_hourly?${query.toString()}`, {
-    method: "GET",
-    headers: {
-      apikey: source.key,
-      Authorization: `Bearer ${source.key}`,
-      Accept: "application/json",
-      "Accept-Profile": publicSchema,
-      "x-ukaq-egress-caller": "uk_aq_db_size_metrics_api_worker",
-    },
-  });
-
-  const text = await response.text();
-  let payload = null;
-  try {
-    payload = text ? JSON.parse(text) : null;
-  } catch (_error) {
-    payload = null;
-  }
-
-  if (!response.ok) {
-    const message =
-      (payload && typeof payload === "object" && !Array.isArray(payload) && (payload.message || payload.error_description || payload.error)) ||
-      (typeof text === "string" ? text.slice(0, 400) : "") ||
-      `HTTP ${response.status}`;
-    throw new Error(`Supabase db-size fetch failed (${response.status}): ${String(message)}`);
-  }
-
-  if (!Array.isArray(payload)) {
-    throw new Error("Supabase db-size fetch returned non-array payload");
-  }
-
   return normalizeDbSizeRows(payload, source.label);
 }
 
@@ -885,45 +857,86 @@ async function fetchMetricViewRowsFromSource({
   }
 
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
-  const query = new URLSearchParams({
-    select,
-    bucket_hour: `gte.${since}`,
-    order: "bucket_hour.asc",
-    limit: "5000",
-  });
-
-  const response = await fetch(`${sourceUrl.replace(/\/$/, "")}/rest/v1/${viewName}?${query.toString()}`, {
-    method: "GET",
-    headers: {
-      apikey: sourceKey,
-      Authorization: `Bearer ${sourceKey}`,
-      Accept: "application/json",
-      "Accept-Profile": publicSchema,
-      "x-ukaq-egress-caller": "uk_aq_db_size_metrics_api_worker",
-    },
-  });
-
-  const text = await response.text();
-  let payload = null;
   try {
-    payload = text ? JSON.parse(text) : null;
-  } catch (_error) {
-    payload = null;
+    const payload = await fetchPostgrestRows({
+      baseUrl: sourceUrl,
+      key: sourceKey,
+      publicSchema,
+      viewName,
+      select,
+      since,
+    });
+    return { rows: normalizeFn(payload), warning: null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { rows: [], warning: `${sourceLabel}/${viewName}: ${message}` };
+  }
+}
+
+async function fetchPostgrestRows({
+  baseUrl,
+  key,
+  publicSchema,
+  viewName,
+  select,
+  since,
+}) {
+  const normalizedBaseUrl = String(baseUrl || "").replace(/\/$/, "");
+  const allRows = [];
+  let offset = 0;
+
+  for (let page = 0; page < POSTGREST_MAX_PAGES; page += 1) {
+    const query = new URLSearchParams({
+      select,
+      bucket_hour: `gte.${since}`,
+      order: "bucket_hour.asc",
+      limit: String(POSTGREST_PAGE_SIZE),
+      offset: String(offset),
+    });
+    const response = await fetch(`${normalizedBaseUrl}/rest/v1/${viewName}?${query.toString()}`, {
+      method: "GET",
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        Accept: "application/json",
+        "Accept-Profile": publicSchema,
+        "x-ukaq-egress-caller": "uk_aq_db_size_metrics_api_worker",
+      },
+    });
+
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch (_error) {
+      payload = null;
+    }
+
+    if (!response.ok) {
+      const message =
+        (payload &&
+          typeof payload === "object" &&
+          !Array.isArray(payload) &&
+          (payload.message || payload.error_description || payload.error)) ||
+        (typeof text === "string" ? text.slice(0, 400) : "") ||
+        `HTTP ${response.status}`;
+      throw new Error(`Supabase ${viewName} fetch failed (${response.status}): ${String(message)}`);
+    }
+
+    if (!Array.isArray(payload)) {
+      throw new Error(`Supabase ${viewName} fetch returned non-array payload`);
+    }
+
+    allRows.push(...payload);
+    if (payload.length < POSTGREST_PAGE_SIZE) {
+      return allRows;
+    }
+    offset += POSTGREST_PAGE_SIZE;
   }
 
-  if (!response.ok) {
-    const message =
-      (payload && typeof payload === "object" && !Array.isArray(payload) && (payload.message || payload.error_description || payload.error)) ||
-      (typeof text === "string" ? text.slice(0, 400) : "") ||
-      `HTTP ${response.status}`;
-    return { rows: [], warning: `${sourceLabel}/${viewName}: ${String(message)}` };
-  }
-
-  if (!Array.isArray(payload)) {
-    return { rows: [], warning: `${sourceLabel}/${viewName}: non-array payload` };
-  }
-
-  return { rows: normalizeFn(payload), warning: null };
+  throw new Error(
+    `Supabase ${viewName} fetch exceeded pagination safety cap (${POSTGREST_PAGE_SIZE * POSTGREST_MAX_PAGES} rows)`,
+  );
 }
 
 async function fetchSchemaSizeRows(env, lookbackDays) {

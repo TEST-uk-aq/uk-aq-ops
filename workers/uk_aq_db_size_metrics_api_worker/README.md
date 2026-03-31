@@ -105,6 +105,7 @@ Behavior:
   - `uk_aq_public.uk_aq_schema_size_metrics_hourly`
 - Reads R2-domain size rows from ingestdb public view:
   - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
+- PostgREST reads are paginated (`limit`/`offset`, 1000 rows per page) so larger lookback windows still include newest buckets when the project row cap is 1000.
 - For `/v1/r2-history-days`, first tries derived R2 history index files:
   - `history/_index/observations_latest.json`
   - `history/_index/aqilevels_latest.json`
