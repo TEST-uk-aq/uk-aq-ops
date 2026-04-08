@@ -9,6 +9,7 @@ Main components:
 - `dashboard/` static single-page front end (GitHub Pages)
 - `api/worker/` Cloudflare Worker API/proxy (`/api/*`)
 - `local/dashboard/server/uk_aq_dashboard_local.py` migrated backend API (source-compatible with existing local dashboard contract)
+  - hosted target: Cloud Run service deployed by `.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml`
 - `station_snapshot/` local station snapshot front end
 - `local/station_snapshot/server/uk_aq_station_snapshot_local.py` migrated local station snapshot backend API
 

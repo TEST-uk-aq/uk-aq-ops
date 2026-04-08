@@ -27,6 +27,21 @@ Cloudflare edge workers in this repo:
 - `workers/uk_aq_observs_history_r2_api_worker/worker.mjs`
 - `workers/uk_aq_cache_proxy/src/index.ts`
 
+Cloudflare deploy model (Option A):
+
+- domain workers deploy with:
+  - var `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
+  - secret `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
+- R2 workers deploy with:
+  - var `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`
+  - secret `UK_AQ_R2_CLOUDFLARE_API_TOKEN`
+- set worker-name vars to keep test/live side-by-side in one account:
+  - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
+  - `UK_AQ_CACHE_WORKER_NAME`
+  - `UK_AQ_DB_R2_METRICS_API_WORKER_NAME`
+  - `UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME`
+  - `UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME`
+
 ## Dashboard (hosted + local)
 
 Dashboard paths:
@@ -208,6 +223,21 @@ Primary controls:
 - Upstream auth header:
   - injects `X-UK-AQ-Upstream-Auth` using `UK_AQ_EDGE_UPSTREAM_SECRET`.
 
+### 11) Dashboard Backend Cloud Run (`local/dashboard/server/uk_aq_dashboard_local.py`)
+
+- deploys the migrated Python dashboard backend as a Cloud Run service
+- serves compatibility API routes used by the hosted dashboard worker:
+  - `/api/dashboard`
+  - `/api/storage_coverage`
+  - `/api/r2_metrics`
+  - `/api/r2_connector_counts`
+  - `/api/connectors`
+  - `/api/dispatcher_settings`
+- service is deployed as public (`allow-unauthenticated`) so Cloudflare Worker can call it
+- optional bearer auth on `/api/*` is enforced when `DASHBOARD_UPSTREAM_BEARER_TOKEN` is configured
+- deployed URL is printed in workflow logs and should be set as repo variable:
+  - `DASHBOARD_UPSTREAM_BASE_URL`
+
 ## Local run
 
 ```bash
@@ -289,6 +319,7 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_aqilevels_retention_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_timeseries_aqi_hourly_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_r2_history_dropbox_backup.yml`
 - `/.github/workflows/uk_aq_cache_proxy_deploy.yml`

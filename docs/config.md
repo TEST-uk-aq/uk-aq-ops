@@ -29,6 +29,44 @@ Worker runtime:
 
 Store worker secrets in Cloudflare Worker secrets.
 
+Dashboard backend Cloud Run runtime:
+
+- required:
+  - `SUPABASE_URL`
+  - `SB_SECRET_KEY`
+  - `OBS_AQIDB_SUPABASE_URL`
+  - `OBS_AQIDB_SECRET_KEY`
+- commonly used:
+  - `UK_AQ_DB_SIZE_API_URL`
+  - `UK_AQ_DB_SIZE_API_TOKEN` (optional; for external DB size API auth)
+  - `DASHBOARD_UPSTREAM_BEARER_TOKEN` (optional; when set, `/api/*` requires bearer auth)
+- optional:
+  - `UK_AQ_R2_HISTORY_DAYS_API_URL`
+  - `UK_AQ_R2_HISTORY_COUNTS_API_URL`
+  - `UK_AQ_R2_HISTORY_DAYS_API_TOKEN`
+  - `UK_AQ_R2_HISTORY_COUNTS_API_TOKEN`
+  - `CLOUDFLARE_ACCOUNT_ID`
+  - `CFLARE_API_READ_TOKEN`
+
+## Worker deploy credentials (GitHub Actions)
+
+Option A split used in this repo:
+
+- Domain workers:
+  - var: `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
+  - secret: `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
+- R2 workers:
+  - var: `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`
+  - secret: `UK_AQ_R2_CLOUDFLARE_API_TOKEN`
+
+Recommended worker-name vars for test/live side-by-side deployments:
+
+- `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
+- `UK_AQ_CACHE_WORKER_NAME`
+- `UK_AQ_DB_R2_METRICS_API_WORKER_NAME`
+- `UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME`
+- `UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME`
+
 ## What belongs where
 
 Browser config (`config.js`):
@@ -62,4 +100,3 @@ Live:
 
 - Generate config in live repo using live variables.
 - Point Worker to live upstream backend.
-

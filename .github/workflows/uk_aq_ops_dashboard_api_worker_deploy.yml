@@ -15,6 +15,10 @@ permissions:
 jobs:
   deploy-worker:
     runs-on: ubuntu-latest
+    env:
+      UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api' }}
+      UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,31 +36,43 @@ jobs:
         working-directory: api/worker
         run: npm run check
 
+      - name: Validate Cloudflare credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN}" ]; then
+            echo "Missing secret UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Missing variable UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID."
+            exit 1
+          fi
+
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: api/worker
-          command: deploy
+          command: deploy --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}
 
       - name: Set Worker secrets
         working-directory: api/worker
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           secrets_json="$(jq -n \
             --arg DASHBOARD_UPSTREAM_BASE_URL "${{ vars.DASHBOARD_UPSTREAM_BASE_URL }}" \
             --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN }}" \
             '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN} | with_entries(select(.value != ""))')"
-          printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-ops-dashboard-api
+          printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"
 
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: api/worker
-          command: deploy
+          command: deploy --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}

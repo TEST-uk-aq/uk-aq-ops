@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import secrets
 import threading
 import warnings
 from datetime import date, datetime, timedelta, timezone
@@ -3050,6 +3051,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/") and not self._authorize_api_request():
+                return
             if parsed.path in ("/", "/index.html"):
                 self._serve_html()
                 return
@@ -3077,6 +3080,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/") and not self._authorize_api_request():
+                return
             if parsed.path == "/api/connectors":
                 self._update_connectors()
                 return
@@ -3091,6 +3096,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         return
+
+    def _authorize_api_request(self) -> bool:
+        required_token = str(getattr(self.server, "upstream_bearer_token", "") or "").strip()
+        if not required_token:
+            return True
+        auth_header = str(self.headers.get("Authorization") or "").strip()
+        expected_header = f"Bearer {required_token}"
+        if secrets.compare_digest(auth_header, expected_header):
+            return True
+
+        payload = json.dumps({"error": "Unauthorized"}, indent=2)
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("WWW-Authenticate", 'Bearer realm="uk-aq-dashboard-backend"')
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
+        return False
 
     def _serve_html(self) -> None:
         html_path: Path = self.server.html_path
@@ -3489,6 +3512,7 @@ def main() -> None:
     server.base_url = base_url
     server.service_role_key = service_role_key
     server.html_path = html_path
+    server.upstream_bearer_token = str(os.getenv("DASHBOARD_UPSTREAM_BEARER_TOKEN") or "").strip()
 
     print(f"UK AQ dashboard running at http://{args.host}:{args.port}")
     server.serve_forever()

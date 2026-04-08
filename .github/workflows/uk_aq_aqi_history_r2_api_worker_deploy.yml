@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME || 'uk-aq-aqi-history-r2-api' }}
-      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID || '' }}
-      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,11 +27,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN}" ]; then
-            echo "Missing secret UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN (or fallback CLOUDFLARE_API_TOKEN)."
+            echo "Missing secret UK_AQ_R2_CLOUDFLARE_API_TOKEN."
             exit 1
           fi
           if [ -z "${UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID}" ]; then
-            echo "Missing variable UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID (or fallback CLOUDFLARE_ACCOUNT_ID)."
+            echo "Missing variable UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID."
             exit 1
           fi
           if [ -z "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" ]; then
