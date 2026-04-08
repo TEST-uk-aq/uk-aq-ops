@@ -6,3 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 UKAQ_PROXY_ROUTE_PREFIX = "/api"
 # DASHBOARD_UPSTREAM_BASE_URL = "https://example.internal"
+
+[[routes]]
+pattern = "cic-test-uk-aq-admin.chronicillnesschannel.co.uk/api/*"
+zone_name = "chronicillnesschannel.co.uk"
