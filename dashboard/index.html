@@ -1169,6 +1169,10 @@
         color: #9b2c2c;
         font-family: "IBM Plex Mono", ui-monospace, monospace;
         font-size: 12px;
+        max-width: 100%;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
       }
 
       @keyframes float-in {
@@ -1216,7 +1220,7 @@
   <body>
     <div class="shell">
       <header>
-        <h1 id="dashboard-title">UK AQ Local Dashboard</h1>
+        <h1 id="dashboard-title">UK AQ Dashboard</h1>
         <p id="dashboard-subtitle">
           Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates
           from your local API.
@@ -1940,6 +1944,38 @@
         errorEl.textContent = text || "";
       }
 
+      function buildResponseErrorMessage(resp, payload, text) {
+        const payloadMessage =
+          payload &&
+          typeof payload === "object" &&
+          (payload.error || payload.message);
+        if (payloadMessage) {
+          return String(payloadMessage);
+        }
+
+        const rawText = String(text || "").trim();
+        if (!rawText) {
+          return `Request failed (${resp.status})`;
+        }
+
+        const isHtmlResponse =
+          /^<!doctype html/i.test(rawText) ||
+          /<html[\s>]/i.test(rawText) ||
+          /<title>/i.test(rawText);
+        if (isHtmlResponse) {
+          if (resp.status === 404) {
+            return "API route not found (404). Check Cloudflare route for /api/* and Worker deployment.";
+          }
+          return `API request failed (${resp.status}) and returned HTML instead of JSON.`;
+        }
+
+        const singleLine = rawText.replace(/\s+/g, " ").trim();
+        if (singleLine.length > 260) {
+          return `${singleLine.slice(0, 260)}...`;
+        }
+        return singleLine;
+      }
+
       function clearRefreshTimer() {
         if (refreshTimer) {
           clearInterval(refreshTimer);
@@ -2500,10 +2536,7 @@
             payload = null;
           }
           if (!resp.ok) {
-            const message =
-              (payload && (payload.error || payload.message)) ||
-              text ||
-              `Request failed (${resp.status})`;
+            const message = buildResponseErrorMessage(resp, payload, text);
             throw new Error(message);
           }
           latestDashboardData.r2_usage = payload ? payload.r2_usage : null;
@@ -3798,10 +3831,7 @@
             payload = null;
           }
           if (!resp.ok) {
-            const message =
-              (payload && (payload.error || payload.message)) ||
-              text ||
-              `Request failed (${resp.status})`;
+            const message = buildResponseErrorMessage(resp, payload, text);
             throw new Error(message);
           }
           if (requestId !== r2ConnectorCountsLoadSequence) {
@@ -4133,7 +4163,7 @@
               });
               if (!resp.ok) {
                 const text = await resp.text();
-                throw new Error(text || `Request failed (${resp.status})`);
+                throw new Error(buildResponseErrorMessage(resp, null, text));
               }
               await loadDashboard();
             } catch (err) {
@@ -4190,7 +4220,7 @@
               });
               if (!resp.ok) {
                 const text = await resp.text();
-                throw new Error(text || `Request failed (${resp.status})`);
+                throw new Error(buildResponseErrorMessage(resp, null, text));
               }
               await loadDashboard();
             } catch (err) {
@@ -4279,10 +4309,7 @@
             payload = null;
           }
           if (!resp.ok) {
-            const message =
-              (payload && (payload.error || payload.message)) ||
-              text ||
-              `Request failed (${resp.status})`;
+            const message = buildResponseErrorMessage(resp, payload, text);
             throw new Error(message);
           }
           if (requestId !== storageCoverageLoadSequence) {
@@ -4347,10 +4374,7 @@
             payload = null;
           }
           if (!resp.ok) {
-            const message =
-              (payload && (payload.error || payload.message)) ||
-              text ||
-              `Request failed (${resp.status})`;
+            const message = buildResponseErrorMessage(resp, payload, text);
             throw new Error(message);
           }
           if (loadId !== dashboardLoadSequence) {
