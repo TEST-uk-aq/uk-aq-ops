@@ -1,0 +1,438 @@
+You are working in the UK-AQ Ops codebase.
+
+Goal:
+Create the live production-hosted version of the existing local UK AQ ops dashboard, with the same UI and behaviour as the current local dashboard, but hosted via GitHub Pages and using a small API/proxy for all data access.
+
+This dashboard is for monitoring the UK AQ system only. It is not for viewing or exploring air quality data. It is an ops/admin dashboard for feed health, database usage, history/manifests, and related system monitoring.
+
+Non-negotiable requirements:
+- The live dashboard must be functionally and visually the same as the current local dashboard.
+- Do not redesign the dashboard.
+- Do not add new dashboard features unless needed for hosting/config/API migration.
+- Keep the same layout, cards, labels, refresh controls, polling behaviour, terminology, and fixed-width desktop presentation.
+- Cloudflare Zero Trust handles access control. There must be no in-app login screen or auth UI.
+- Front end must be static and suitable for GitHub Pages.
+- All live and historical data access must go through a small API/proxy from the start.
+- V1 is desktop-first and fixed width.
+- Do not add a mobile redesign yet.
+- Do not add a new error-handling UX yet. Keep front-end behaviour aligned with the local dashboard for now.
+- Do not expose secrets in browser code or shipped config.
+- Use British English in comments/docs where wording matters.
+- Do not use em dashes in any docs or copy.
+
+Architecture decisions already made:
+- Single admin only.
+- App access is protected by Cloudflare Zero Trust on the subdomain.
+- Dashboard will live at the root of the subdomain:
+  Test - https://cic-test-uk-aq-admin.chronicillnesschannel.co.uk/
+  Live - https://uk-aq-admin.chronicillnesschannel.co.uk/
+  This current build is on the Test enviroment, but will be copied to the Live repo later. 
+- Front end should live in the UK-AQ Ops repo.
+- Test and live are in different GitHub repos with different GitHub variables/secrets.
+- Front end is GitHub Pages.
+- API/proxy should be built from the start.
+- Root-of-subdomain hosting, not a repo path.
+- Fixed-width desktop layout for V1.
+- Refresh behaviour should stay the same as the local dashboard.
+- Current local behaviour around errors can stay as-is for now.
+
+First implementation step, before anything else:
+1. Move the current local dashboard out of the ingest repo and into the UK-AQ Ops repo.
+   - This is required as the first task.
+   - Preserve behaviour during the move.
+   - Preserve file history where practical.
+   - Keep the local runnable version working after the move.
+   - The live/dashboard work must then be built from that migrated dashboard code, not from a parallel rewrite.
+
+What to build
+
+1. Migrate local dashboard into UK-AQ Ops repo
+- Identify the current local dashboard files in the ingest repo.
+- Move or copy them into a clear location in the UK-AQ Ops repo, preserving structure where sensible.
+- Prefer a structure that allows one shared front-end codebase for local and hosted versions.
+- Add or update any local run instructions/scripts needed so the local version still works after the move.
+- Minimise logic changes during this migration step.
+- If there are hard-coded paths or assumptions tied to the ingest repo, refactor them carefully.
+
+2. Create production-ready repo structure in UK-AQ Ops repo
+Recommended target structure:
+
+uk-aq-ops/
+  dashboard/
+    index.html
+    assets/
+      css/
+      js/
+      img/
+      config.js   # generated at build time, browser-safe only
+    README.md
+
+  api/
+    worker/
+      src/
+        index.ts
+        routes/
+        lib/
+      package.json
+      tsconfig.json
+      wrangler.toml
+      README.md
+
+  local/
+    dashboard/
+      # local runnable dashboard version or local entrypoint/wrapper
+    scripts/
+      # local helpers if needed
+
+  docs/
+    architecture.md
+    config.md
+    deployment.md
+
+Adjust the exact structure if needed, but keep the same separation of concerns:
+- dashboard = static front end
+- api = proxy/backend
+- local = local dev/run support
+- docs = deployment and architecture notes
+
+3. Front-end requirements
+- Keep the current dashboard as plain HTML/CSS/JS if that is what it is already.
+- Do not rewrite into React or another framework unless absolutely necessary.
+- Single-page dashboard only.
+- Avoid history API routing.
+- Fixed-width desktop layout.
+- Same UI and behaviour as local.
+- Same refresh controls and polling options as local.
+- Same cards/panels/data groupings as local.
+- Same labels and terminology as local.
+- Same default visible sections as local.
+- Avoid introducing visual drift.
+
+4. Hosting model
+- Front end must be deployable to GitHub Pages.
+- It will be served at the root of the subdomain.
+- Assume Cloudflare will sit in front of the subdomain and protect access with Zero Trust.
+- There must be no in-app authentication flow.
+- Ensure asset paths work correctly for root-of-subdomain hosting.
+
+5. API/proxy requirements
+Build a small API/proxy from the start.
+
+Recommended platform:
+- Cloudflare Workers
+
+Recommended route shape:
+- /api/*
+
+Recommended deployment shape:
+- GitHub Pages serves /
+- Cloudflare routes /api/* to the Worker
+
+API responsibilities:
+- Hold real secrets server-side
+- Query live data sources such as Supabase / database / existing operational sources
+- Query historical/manifests data such as R2 indexes/manifests/history metadata
+- Return only the JSON needed by the dashboard
+- Normalise upstream data as needed
+- Keep front-end data shape aligned with the local dashboard as much as possible
+
+Important:
+- Do not let the browser fetch private R2 or secret-bearing endpoints directly
+- All live and historical data access should go through the API/proxy in V1
+
+6. Security rules
+Browser code must never receive:
+- Supabase service role key
+- R2 private credentials
+- Cloudflare API tokens
+- database admin credentials
+- any secret that can write, delete, or bypass auth
+
+Browser code may receive only:
+- browser-safe config
+- API base URL
+- non-sensitive display/config values
+
+Treat the browser as untrusted even though access is behind Zero Trust.
+
+7. Config strategy
+Use environment-specific generated config for the front end.
+
+Generate:
+dashboard/assets/config.js
+
+Example shape:
+window.UKAQ_OPS_CONFIG = {
+  envName: "live",
+  apiBaseUrl: "/api",
+  dashboardTitle: "UK AQ Ops",
+  defaultRefreshSeconds: 60
+};
+
+Requirements:
+- Keep browser-safe config only
+- Use GitHub repo variables/secrets at build time to generate config.js
+- Test and live repos can each generate their own config.js values
+- Keep config differences centralised in one place
+
+Local version should use equivalent local config, for example pointing apiBaseUrl to a local server or local Worker dev endpoint.
+
+8. API route recommendations
+Implement a thin but clean route structure. Adjust naming only if needed to match the existing local dashboard expectations.
+
+Recommended routes:
+- GET /api/health
+- GET /api/status/summary
+- GET /api/status/feeds
+- GET /api/status/db
+- GET /api/status/history
+- GET /api/history/manifests
+- GET /api/history/runs
+
+Route purposes:
+- /api/health
+  - simple uptime/health response for the API itself
+- /api/status/summary
+  - top-level summary for key dashboard cards
+- /api/status/feeds
+  - feed/source operational status
+- /api/status/db
+  - DB usage/storage/size metrics needed by the dashboard
+- /api/status/history
+  - history/manifests/R2 health summary
+- /api/history/manifests
+  - structured manifest/index data for history panels
+- /api/history/runs
+  - ingestion/backfill/run metadata if the local dashboard uses this
+
+Use a consistent JSON envelope:
+Success:
+{
+  "ok": true,
+  "generatedAt": "2026-04-08T12:00:00Z",
+  "data": { ... }
+}
+
+Failure:
+{
+  "ok": false,
+  "generatedAt": "2026-04-08T12:00:00Z",
+  "error": {
+    "code": "UPSTREAM_TIMEOUT",
+    "message": "Timed out fetching manifest index"
+  }
+}
+
+Even if the front end does not yet surface these errors nicely, keep the API structured properly.
+
+9. Data-source rules
+Live data:
+- Access via API/proxy from database / Supabase / production operational sources
+- Do not expose direct secret-bearing browser access
+
+Historical data:
+- Access via API/proxy from R2 indexes/manifests/history files
+- Do not expose private bucket credentials or direct private object access to the browser
+
+10. Preserve parity with local dashboard
+This is critical.
+
+“Exactly the same” means:
+- same page structure
+- same cards/panels
+- same labels/text
+- same refresh controls
+- same polling/refresh behaviour
+- same section ordering
+- same visible data fields
+- same fixed-width layout
+- same general styling and spacing
+- same default behaviour when sections load
+- same existing limited error behaviour
+
+Allowed differences:
+- config loading
+- data source transport layer
+- hostnames/paths
+- deployment scripts
+- internal refactoring required to support GitHub Pages and the API/proxy
+
+Not allowed:
+- redesign
+- switching to a very different framework for no reason
+- changing dashboard UX
+- adding unrelated features
+- changing terminology
+- exposing secrets in front-end code
+
+11. Error behaviour for V1
+- Keep front-end error handling behaviour aligned with the current local dashboard
+- Do not build a new error UX yet
+- API should still return structured errors for future enhancement
+
+12. Caching and freshness
+Front end:
+- no service worker in V1
+- avoid stale deploy problems
+- use hashed assets if a build step exists, or otherwise ensure deploys invalidate stale browser assets sensibly
+
+Config:
+- config.js should be easy to regenerate per environment
+
+API:
+- keep caching conservative
+- /api/health should not be cached
+- /api/status/* should be uncached or very short-lived
+- /api/history/* can have short caching only if safe and it does not break dashboard freshness expectations
+
+13. Deployment requirements
+
+Dashboard deployment:
+- GitHub Actions workflow to deploy dashboard/ to GitHub Pages
+
+API deployment:
+- separate GitHub Actions workflow to deploy the Cloudflare Worker
+
+Assume:
+- main branch in live repo deploys live
+- test repo deploys test
+
+14. GitHub Actions requirements
+
+Create or update workflows for:
+
+A. Dashboard build/deploy
+- install dependencies if needed
+- generate dashboard/assets/config.js from GitHub vars/secrets
+- build if applicable
+- deploy to GitHub Pages
+
+B. API build/deploy
+- install dependencies
+- lint/typecheck/test if set up
+- deploy Worker
+- use server-side secrets/bindings for sensitive config
+
+15. Environment variables and secrets
+Front-end build variables, browser-safe only, examples:
+- UKAQ_ENV_NAME
+- UKAQ_DASHBOARD_TITLE
+- UKAQ_API_BASE_URL
+
+Server-side Worker secrets/bindings, examples:
+- SUPABASE_URL
+- SUPABASE_SERVICE_ROLE_KEY
+- R2_ACCESS_KEY_ID
+- R2_SECRET_ACCESS_KEY
+- R2_BUCKET_NAME
+- R2_ACCOUNT_ID
+- any other upstream secrets required
+
+Prefer Cloudflare secret/binding storage for Worker secrets where possible.
+
+16. Documentation to add
+Create or update:
+
+docs/architecture.md
+Include:
+- system overview
+- hosting layout
+- trust boundaries
+- GitHub Pages + Worker architecture
+- Cloudflare Zero Trust position
+- data flow
+
+docs/config.md
+Include:
+- front-end browser-safe config values
+- server-side secrets
+- what belongs where
+- local vs test vs live config notes
+
+docs/deployment.md
+Include:
+- local run instructions after migration
+- GitHub Pages deployment steps
+- Worker deployment steps
+- Cloudflare routing notes for /api/*
+- Zero Trust notes for protecting the subdomain
+
+17. Testing and validation
+Add or document a validation checklist covering:
+
+A. Migration validation
+- local dashboard still runs after move from ingest repo to ops repo
+- no feature loss from migration
+- same cards/panels still present locally
+
+B. Front-end parity validation
+- hosted version visually matches local
+- same controls and labels
+- same fixed-width layout
+- same refresh controls
+- same visible data shape
+
+C. API contract validation
+- all routes return valid JSON
+- expected data shape for dashboard consumption
+- predictable behaviour on upstream failures
+
+D. End-to-end smoke test
+- dashboard loads behind Zero Trust
+- API calls succeed from hosted app
+- refresh still works
+- no secrets exposed in page source, built JS, or browser network panel
+
+18. Non-goals for V1
+Do not add:
+- a mobile redesign
+- user management
+- CMS/content tools
+- analytics dashboard features
+- AQ explorer/public charting features
+- a new global error UX
+- browser-direct secret-bearing access
+- unnecessary framework rewrites
+
+19. Preferred implementation approach
+Work in phases, in this order:
+
+Phase 1
+- move local dashboard from ingest repo to UK-AQ Ops repo
+- keep it runnable locally
+- stabilise paths/config after move
+
+Phase 2
+- refactor front-end for shared local/hosted config
+- isolate browser-safe config
+- prepare dashboard for static hosting
+
+Phase 3
+- build Cloudflare Worker API/proxy
+- implement initial routes needed by the existing dashboard
+- wire front end to API/proxy instead of local-only data fetching
+
+Phase 4
+- add GitHub Pages deployment workflow
+- add Worker deployment workflow
+- document deployment/config
+
+Phase 5
+- verify hosted dashboard matches local dashboard
+- fix any parity drift
+- keep changes minimal and targeted
+
+20. Output required from this task
+Make the code changes directly where possible, and also provide:
+- a short summary of what was changed
+- any assumptions made
+- any places where exact parity could not yet be completed
+- any manual Cloudflare/GitHub setup steps still required outside the repo
+
+Important working style instructions:
+- Make conservative changes
+- Prefer reusing and relocating existing code over rewriting
+- Preserve exact dashboard behaviour where possible
+- Keep front-end and API code clean and well-commented
+- Do not introduce unnecessary dependencies
+- Flag any place where the current local dashboard relies on assumptions that are unsafe for static hosting

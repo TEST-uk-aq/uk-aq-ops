@@ -1,0 +1,62 @@
+name: Deploy UK AQ Ops Dashboard API Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "api/worker/**"
+      - ".github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install worker dependencies
+        working-directory: api/worker
+        run: npm ci
+
+      - name: Type check worker
+        working-directory: api/worker
+        run: npm run check
+
+      - name: Deploy Worker (base)
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: api/worker
+          command: deploy
+
+      - name: Set Worker secrets
+        working-directory: api/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg DASHBOARD_UPSTREAM_BASE_URL "${{ vars.DASHBOARD_UPSTREAM_BASE_URL }}" \
+            --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN }}" \
+            '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN} | with_entries(select(.value != ""))')"
+          printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-ops-dashboard-api
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: api/worker
+          command: deploy

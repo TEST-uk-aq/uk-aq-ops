@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UK AQ Station Snapshot</title>
+  <style>
+    :root {
+      --bg: #f3f6fb;
+      --panel: #ffffff;
+      --text: #10243b;
+      --muted: #5e6f82;
+      --line: #d8e0ea;
+      --accent: #145da0;
+      --warn: #8b1e3f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background: linear-gradient(160deg, #eef4ff, #f7fbff 50%, #edf7f2);
+      color: var(--text);
+    }
+    main {
+      width: 100%;
+      margin: 0;
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    h1, h2 {
+      margin: 0 0 10px;
+      font-weight: 650;
+    }
+    h1 { font-size: 1.3rem; }
+    h2 { font-size: 1.05rem; }
+    .row {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      margin-bottom: 10px;
+    }
+    .row.controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 10px;
+    }
+    .control {
+      flex: 0 0 auto;
+    }
+    label {
+      font-size: 0.85rem;
+      color: var(--muted);
+      display: block;
+      margin-bottom: 4px;
+    }
+    input, select, textarea, button {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid #c4d1df;
+      background: #fff;
+      padding: 8px 9px;
+      font: inherit;
+      color: inherit;
+    }
+    textarea { min-height: 64px; resize: vertical; }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: 0;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { filter: brightness(0.95); }
+    #edgeUrl { width: 420px; max-width: 100%; }
+    #stationId { width: 120px; max-width: 100%; }
+    #stationRef { width: 180px; max-width: 100%; }
+    #window { width: 90px; max-width: 100%; }
+    #obsLimit { width: 120px; max-width: 100%; }
+    #timeseriesSelect { width: 560px; max-width: 100%; }
+    #loadBtn { width: 220px; max-width: 100%; }
+    .status {
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      background: #ecf2fb;
+      color: #224;
+      border: 1px solid #d4e1f3;
+      white-space: pre-wrap;
+    }
+    .status.error {
+      background: #fff2f5;
+      border-color: #efc0cf;
+      color: var(--warn);
+    }
+    .counts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .pill {
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid #d2deea;
+      background: #f3f8ff;
+      font-size: 0.8rem;
+    }
+    table {
+      width: max-content;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 5px 15px;
+      vertical-align: top;
+      text-align: left;
+      white-space: nowrap;
+      overflow-wrap: normal;
+    }
+    th.wrap-col,
+    td.wrap-col {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      min-width: 280px;
+    }
+    th {
+      background: #f5f8fc;
+      position: sticky;
+      top: 0;
+    }
+    .table-wrap {
+      max-height: 360px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .card.tight {
+      justify-self: start;
+      width: max-content;
+      max-width: 100%;
+    }
+    .card.tight .table-wrap {
+      width: max-content;
+      max-width: 100%;
+      display: inline-block;
+    }
+    pre {
+      margin: 0;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>Station Snapshot Dashboard (Local: ingestdb + ObsAQIDB)</h1>
+      <div class="row controls">
+        <div class="control">
+          <label for="edgeUrl">Edge URL (fallback/info)</label>
+          <input id="edgeUrl" type="text" />
+        </div>
+        <div class="control">
+          <label for="stationId">station_id</label>
+          <input id="stationId" type="text" placeholder="e.g. 1234" />
+        </div>
+        <div class="control">
+          <label for="stationRef">station_ref</label>
+          <input id="stationRef" type="text" placeholder="e.g. GB123" />
+        </div>
+        <div class="control">
+          <label for="window">window</label>
+          <select id="window">
+            <option value="6h">6h</option>
+            <option value="24h" selected>24h</option>
+            <option value="7d">7d</option>
+            <option value="21d">21d</option>
+            <option value="31d">31d</option>
+            <option value="90d">90d</option>
+          </select>
+        </div>
+        <div class="control">
+          <label for="obsLimit">obs_limit</label>
+          <select id="obsLimit">
+            <option value="all" selected>all</option>
+            <option value="100">100</option>
+            <option value="1000">1000</option>
+            <option value="5000">5000</option>
+            <option value="10000">10000</option>
+          </select>
+        </div>
+      </div>
+      <div class="row controls">
+        <div class="control">
+          <label for="timeseriesSelect">timeseries_id (from loaded station)</label>
+          <select id="timeseriesSelect" disabled>
+            <option value="">Load station first</option>
+          </select>
+        </div>
+        <div class="control">
+          <button id="loadBtn" type="button">Load Snapshot</button>
+        </div>
+      </div>
+      <div id="status" class="status">Ready.</div>
+    </section>
+
+    <section class="card">
+      <h2>Counts</h2>
+      <div id="counts" class="counts"></div>
+    </section>
+
+    <section class="card">
+      <h2>Meta</h2>
+      <pre id="metaJson">{}</pre>
+    </section>
+
+    <section class="card tight">
+      <h2>station</h2>
+      <div class="table-wrap"><table id="stationsTable"></table></div>
+    </section>
+
+    <section class="card">
+      <h2>timeseries (ingestdb: uk_aq_core.timeseries)</h2>
+      <div class="table-wrap"><table id="timeseriesTable"></table></div>
+    </section>
+
+    <section class="card">
+      <h2>station_checkpoints (ingestdb: uk_aq_raw.openaq_station_checkpoints)</h2>
+      <div class="table-wrap"><table id="stationCheckpointTable"></table></div>
+    </section>
+
+    <section class="card">
+      <h2>timeseries_checkpoints (ingestdb: uk_aq_raw.openaq_timeseries_checkpoints)</h2>
+      <div class="table-wrap"><table id="timeseriesCheckpointTable"></table></div>
+    </section>
+
+    <section class="card tight">
+      <h2>ingestdb observations (selected timeseries, newest first)</h2>
+      <div class="table-wrap"><table id="observationTable"></table></div>
+    </section>
+
+    <section class="card tight">
+      <h2>ingestdb observations (all station timeseries, newest first)</h2>
+      <div class="table-wrap"><table id="observationAllTable"></table></div>
+    </section>
+
+    <section class="card tight">
+      <h2>ObsAQIDB observs (selected timeseries, newest first)</h2>
+      <div class="table-wrap"><table id="obsAqidbObservationTable"></table></div>
+    </section>
+
+    <section class="card tight">
+      <h2>ObsAQIDB observs (all station timeseries, newest first)</h2>
+      <div class="table-wrap"><table id="obsAqidbObservationAllTable"></table></div>
+    </section>
+
+    <section class="card">
+      <h2>ObsAQIDB AQI hourly (uk_aq_aqilevels.timeseries_aqi_hourly)</h2>
+      <div class="table-wrap"><table id="obsAqidbAqiHourlyTable"></table></div>
+    </section>
+
+    <section class="card">
+      <h2>ObsAQIDB AQI daily (uk_aq_aqilevels.timeseries_aqi_daily)</h2>
+      <div class="table-wrap"><table id="obsAqidbAqiDailyTable"></table></div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      snapshot: null,
+      loading: false,
+      snapshotMode: "unknown",
+    };
+
+    const el = {
+      edgeUrl: document.getElementById("edgeUrl"),
+      stationId: document.getElementById("stationId"),
+      stationRef: document.getElementById("stationRef"),
+      window: document.getElementById("window"),
+      obsLimit: document.getElementById("obsLimit"),
+      timeseriesSelect: document.getElementById("timeseriesSelect"),
+      loadBtn: document.getElementById("loadBtn"),
+      status: document.getElementById("status"),
+      counts: document.getElementById("counts"),
+      metaJson: document.getElementById("metaJson"),
+      stationsTable: document.getElementById("stationsTable"),
+      timeseriesTable: document.getElementById("timeseriesTable"),
+      stationCheckpointTable: document.getElementById("stationCheckpointTable"),
+      timeseriesCheckpointTable: document.getElementById("timeseriesCheckpointTable"),
+      observationTable: document.getElementById("observationTable"),
+      observationAllTable: document.getElementById("observationAllTable"),
+      obsAqidbObservationTable: document.getElementById("obsAqidbObservationTable"),
+      obsAqidbObservationAllTable: document.getElementById("obsAqidbObservationAllTable"),
+      obsAqidbAqiHourlyTable: document.getElementById("obsAqidbAqiHourlyTable"),
+      obsAqidbAqiDailyTable: document.getElementById("obsAqidbAqiDailyTable"),
+    };
+
+    function setStatus(message, isError = false) {
+      el.status.textContent = message;
+      el.status.className = isError ? "status error" : "status";
+    }
+
+    function asText(value) {
+      if (value === null || value === undefined) return "";
+      if (typeof value === "object") return JSON.stringify(value);
+      const text = String(value);
+      return formatDatetimeText(text);
+    }
+
+    function formatDatetimeText(text) {
+      const datetimeMatch = String(text).match(
+        /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/
+      );
+      return datetimeMatch ? `${datetimeMatch[1]} ${datetimeMatch[2]}` : String(text);
+    }
+
+    function formatDatetimeFields(value) {
+      if (Array.isArray(value)) {
+        return value.map((item) => formatDatetimeFields(item));
+      }
+      if (value && typeof value === "object") {
+        const out = {};
+        Object.keys(value).forEach((key) => {
+          out[key] = formatDatetimeFields(value[key]);
+        });
+        return out;
+      }
+      if (typeof value === "string") {
+        return formatDatetimeText(value);
+      }
+      return value;
+    }
+
+    function isWrapColumn(columnName) {
+      const key = String(columnName || "").toLowerCase();
+      return key.includes("interval") || key.includes("lag") || key.includes("counts");
+    }
+
+    function renderKeyValueTable(table, rowObj) {
+      table.innerHTML = "";
+      const header = document.createElement("tr");
+      header.innerHTML = "<th>column</th><th>value</th>";
+      table.appendChild(header);
+
+      if (!rowObj || typeof rowObj !== "object") {
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td colspan=\"2\">No row</td>";
+        table.appendChild(tr);
+        return;
+      }
+
+      Object.keys(rowObj).forEach((key) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${key}</td><td>${asText(rowObj[key])}</td>`;
+        table.appendChild(tr);
+      });
+    }
+
+    function renderRowsTable(table, rows) {
+      table.innerHTML = "";
+      if (!Array.isArray(rows) || rows.length === 0) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td>No rows</td>";
+        table.appendChild(tr);
+        return;
+      }
+
+      const keys = Array.from(
+        rows.reduce((set, row) => {
+          Object.keys(row || {}).forEach((k) => set.add(k));
+          return set;
+        }, new Set())
+      );
+
+      const header = document.createElement("tr");
+      header.innerHTML = keys
+        .map((k) => `<th class="${isWrapColumn(k) ? "wrap-col" : ""}">${k}</th>`)
+        .join("");
+      table.appendChild(header);
+
+      rows.forEach((row) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = keys
+          .map((k) => `<td class="${isWrapColumn(k) ? "wrap-col" : ""}">${asText((row || {})[k])}</td>`)
+          .join("");
+        table.appendChild(tr);
+      });
+    }
+
+    function renderCounts(snapshot) {
+      const data = [
+        ["timeseries", (snapshot.timeseries || []).length],
+        ["stations_checkpoints", (snapshot.stations_checkpoints || []).length],
+        ["timeseries_checkpoints", (snapshot.timeseries_checkpoints || []).length],
+        ["ingest_obs_selected", (snapshot.observations || []).length],
+        ["ingest_obs_all", (snapshot.observations_all || []).length],
+        ["obs_aqidb_obs_selected", (snapshot.obs_aqidb_observations || []).length],
+        ["obs_aqidb_obs_all", (snapshot.obs_aqidb_observations_all || []).length],
+        ["obs_aqidb_aqi_hourly", (snapshot.obs_aqidb_timeseries_aqi_hourly || []).length],
+        ["obs_aqidb_aqi_daily", (snapshot.obs_aqidb_timeseries_aqi_daily || []).length],
+      ];
+      el.counts.innerHTML = data
+        .map(([label, value]) => `<span class="pill">${label}: ${value}</span>`)
+        .join("");
+    }
+
+    function renderTimeseriesSelect(snapshot) {
+      const timeseries = Array.isArray(snapshot.timeseries) ? snapshot.timeseries : [];
+      const selectedId = snapshot.selected_timeseries_id == null ? "" : String(snapshot.selected_timeseries_id);
+      el.timeseriesSelect.innerHTML = "";
+
+      const defaultOption = document.createElement("option");
+      defaultOption.value = "";
+      defaultOption.textContent = "(default selection)";
+      el.timeseriesSelect.appendChild(defaultOption);
+
+      timeseries.forEach((row) => {
+        const option = document.createElement("option");
+        const idText = row && row.id != null ? String(row.id) : "";
+        option.value = idText;
+        option.textContent = idText
+          ? `${idText} | ${row.timeseries_ref || ""} | ${row.label || ""}`
+          : JSON.stringify(row);
+        el.timeseriesSelect.appendChild(option);
+      });
+
+      el.timeseriesSelect.disabled = timeseries.length === 0;
+      if (selectedId) {
+        el.timeseriesSelect.value = selectedId;
+      } else {
+        el.timeseriesSelect.value = "";
+      }
+    }
+
+    function renderSnapshot(snapshot) {
+      state.snapshot = snapshot;
+      renderCounts(snapshot);
+      el.metaJson.textContent = JSON.stringify(formatDatetimeFields(snapshot.meta || {}), null, 2);
+      renderKeyValueTable(el.stationsTable, snapshot.station || null);
+      renderRowsTable(el.timeseriesTable, snapshot.timeseries || []);
+      renderRowsTable(el.stationCheckpointTable, snapshot.stations_checkpoints || []);
+      renderRowsTable(el.timeseriesCheckpointTable, snapshot.timeseries_checkpoints || []);
+      renderRowsTable(el.observationTable, snapshot.observations || []);
+      renderRowsTable(el.observationAllTable, snapshot.observations_all || []);
+      renderRowsTable(el.obsAqidbObservationTable, snapshot.obs_aqidb_observations || []);
+      renderRowsTable(el.obsAqidbObservationAllTable, snapshot.obs_aqidb_observations_all || []);
+      renderRowsTable(el.obsAqidbAqiHourlyTable, snapshot.obs_aqidb_timeseries_aqi_hourly || []);
+      renderRowsTable(el.obsAqidbAqiDailyTable, snapshot.obs_aqidb_timeseries_aqi_daily || []);
+      renderTimeseriesSelect(snapshot);
+    }
+
+    function buildSnapshotUrl(overrideTimeseriesId = null) {
+      const url = new URL("/api/snapshot", window.location.origin);
+      const stationId = (el.stationId.value || "").trim();
+      const stationRef = (el.stationRef.value || "").trim();
+      const selectedTimeseries = overrideTimeseriesId === null
+        ? (el.timeseriesSelect.value || "").trim()
+        : String(overrideTimeseriesId || "").trim();
+
+      if (!stationId && !stationRef) {
+        throw new Error("station_id or station_ref is required.");
+      }
+      if (stationId) url.searchParams.set("station_id", stationId);
+      if (stationRef) url.searchParams.set("station_ref", stationRef);
+      if (selectedTimeseries) url.searchParams.set("timeseries_id", selectedTimeseries);
+      url.searchParams.set("window", el.window.value);
+      url.searchParams.set("obs_limit", el.obsLimit.value || "all");
+      return url.toString();
+    }
+
+    async function loadSnapshot(overrideTimeseriesId = null) {
+      if (state.loading) return;
+      state.loading = true;
+      el.loadBtn.disabled = true;
+      setStatus("Loading snapshot...");
+
+      try {
+        const url = buildSnapshotUrl(overrideTimeseriesId);
+        const response = await fetch(url, { cache: "no-store" });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const msg = payload && payload.error ? payload.error : `HTTP ${response.status}`;
+          throw new Error(msg);
+        }
+        renderSnapshot(payload);
+        const selected = payload.selected_timeseries_id == null ? "none" : payload.selected_timeseries_id;
+        setStatus(`Loaded. mode=${state.snapshotMode}, selected_timeseries_id=${selected}`);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : String(err), true);
+      } finally {
+        state.loading = false;
+        el.loadBtn.disabled = false;
+      }
+    }
+
+    async function loadConfig() {
+      try {
+        const response = await fetch("/api/config", { cache: "no-store" });
+        if (!response.ok) {
+          return;
+        }
+        const config = await response.json();
+        if (config.edge_url) {
+          el.edgeUrl.value = config.edge_url;
+        }
+        if (config.default_station_id) {
+          el.stationId.value = String(config.default_station_id).trim();
+        }
+        if (config.default_obs_limit && ["all", "100", "1000", "5000", "10000"].includes(String(config.default_obs_limit))) {
+          el.obsLimit.value = String(config.default_obs_limit);
+        }
+        if (config.snapshot_mode) {
+          state.snapshotMode = String(config.snapshot_mode);
+        }
+      } catch (_err) {
+        return;
+      }
+    }
+
+    el.loadBtn.addEventListener("click", () => loadSnapshot(""));
+    el.timeseriesSelect.addEventListener("change", () => {
+      if (el.timeseriesSelect.disabled) return;
+      loadSnapshot(el.timeseriesSelect.value);
+    });
+
+    async function init() {
+      await loadConfig();
+      await loadSnapshot("");
+    }
+
+    init();
+  </script>
+</body>
+</html>

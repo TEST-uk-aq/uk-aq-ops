@@ -1,0 +1,4442 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>UK AQ Local Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg-base: #f9f3e7;
+        --bg-accent: #f4e3c2;
+        --ink: #1f1c16;
+        --ink-soft: #4b443a;
+        --card: #fffaf1;
+        --border: #e4d6be;
+        --accent: #d0632c;
+        --accent-2: #1f7a7a;
+        --accent-3: #87562c;
+        --accent-4: #a8b2c1;
+        --accent-5: #d8c8a8;
+        --shadow: 0 20px 40px rgba(34, 24, 12, 0.12);
+        --color-ingest-db: #FE2E2E;
+        --color-r2-observs: #F48021;
+        --color-r2-aqilevels: #F4C04B;
+        --color-obsaqi-observs: #3C82F5;
+        --color-obsaqi-aqilevels: #61D836;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 20% 20%, rgba(214, 115, 44, 0.15), transparent 50%),
+          radial-gradient(circle at 80% 0%, rgba(31, 122, 122, 0.18), transparent 45%),
+          linear-gradient(135deg, var(--bg-base), var(--bg-accent));
+        min-height: 100vh;
+        padding: 32px 20px 40px;
+      }
+
+      .shell {
+        max-width: 1100px;
+        margin: 0 auto;
+        display: grid;
+        gap: 24px;
+        position: relative;
+      }
+
+      header {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: 24px 24px 20px;
+        box-shadow: var(--shadow);
+        display: grid;
+        gap: 16px;
+        animation: float-in 0.6s ease both;
+      }
+
+      header h1 {
+        margin: 0;
+        font-size: clamp(28px, 4vw, 38px);
+        letter-spacing: -0.02em;
+      }
+
+      header p {
+        margin: 0;
+        color: var(--ink-soft);
+        max-width: 740px;
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px 24px;
+        align-items: center;
+      }
+
+      .meta-left {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .meta-status {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 13px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(31, 122, 122, 0.1);
+        color: var(--accent-2);
+      }
+
+      .meta-note {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 13px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(32, 29, 29, 0.06);
+        color: var(--ink-soft);
+      }
+
+      .refresh-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 16px;
+        align-items: center;
+      }
+
+      .refresh-controls span {
+        font-weight: 600;
+        color: var(--ink-soft);
+      }
+
+      .refresh-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .refresh-pill {
+        position: relative;
+      }
+
+      .refresh-pill input {
+        position: absolute;
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .refresh-pill label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: #fff;
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+
+      .refresh-pill input:checked + label {
+        background: var(--ink);
+        color: #fff;
+        border-color: var(--ink);
+      }
+
+      .refresh-button {
+        border: none;
+        background: var(--accent);
+        color: #fff;
+        padding: 8px 14px;
+        border-radius: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+
+      .refresh-button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 16px rgba(208, 99, 44, 0.25);
+      }
+
+      .grid {
+        display: grid;
+        gap: 22px;
+      }
+
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: 20px 22px 24px;
+        box-shadow: var(--shadow);
+        animation: rise-in 0.55s ease both;
+      }
+
+      .panel h2 {
+        margin: 0 0 14px;
+        font-size: 22px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .chip {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(208, 99, 44, 0.12);
+        color: var(--accent);
+      }
+
+      .panel-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .dispatch-filters {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .dispatch-filter {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+      }
+
+      .dispatch-filter select {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--ink);
+        padding: 6px 9px;
+        font-size: 13px;
+        font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      }
+
+      .db-size-legend-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+
+      .db-size-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-bottom: 0;
+        flex: 1 1 520px;
+        min-width: 0;
+      }
+
+      .db-size-timezone-note {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        color: var(--ink-soft);
+        margin-left: auto;
+        white-space: nowrap;
+      }
+
+      .db-size-item {
+        display: inline-flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 2px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .db-size-item-title {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .db-size-item-min {
+        padding-left: 18px;
+        font-size: 11px;
+        color: #6b6255;
+      }
+
+      .db-size-oldest-row {
+        margin: 2px 0 12px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .db-size-swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+      }
+
+      .db-size-chart-wrap {
+        width: 100%;
+        height: 290px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.68);
+        overflow: hidden;
+        position: relative;
+      }
+
+      .db-size-chart {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      .db-size-tooltip-hit {
+        cursor: pointer;
+      }
+
+      .db-size-stacked-tooltip-hit {
+        cursor: pointer;
+      }
+
+      .db-size-hover-tooltip {
+        position: absolute;
+        left: 0;
+        top: 0;
+        transform: translateX(-50%);
+        background: rgba(31, 28, 22, 0.94);
+        color: #fff;
+        border-radius: 10px;
+        padding: 7px 9px;
+        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.18);
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        white-space: nowrap;
+        pointer-events: none;
+        opacity: 0;
+        visibility: hidden;
+        z-index: 4;
+      }
+
+      .db-size-hover-tooltip.visible {
+        opacity: 1;
+        visibility: visible;
+      }
+
+      .db-size-hover-tooltip div + div {
+        margin-top: 2px;
+      }
+
+      .db-size-empty {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--ink-soft);
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+      }
+
+      .db-size-subchart {
+        margin-top: 12px;
+      }
+
+      .db-size-subchart h3 {
+        margin: 0 0 8px;
+        font-size: 13px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--ink-soft);
+      }
+
+      .db-size-sublegend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 8px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .r2-usage-wrap {
+        margin-top: 12px;
+        display: grid;
+        gap: 10px;
+      }
+
+      .r2-window-heading {
+        font-weight: 600;
+        color: var(--ink-soft);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+      }
+
+      .r2-usage-row {
+        display: grid;
+        gap: 6px;
+      }
+
+      .r2-usage-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+        flex-wrap: wrap;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .r2-usage-bar {
+        height: 12px;
+        border-radius: 999px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.85);
+      }
+
+      .r2-usage-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: var(--accent-2);
+        transition: width 0.25s ease;
+      }
+
+      .r2-usage-sub {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 11px;
+        color: var(--ink-soft);
+      }
+
+      .r2-usage-sub-split {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .r2-usage-sub-right {
+        margin-left: auto;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .r2-usage-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .r2-usage-meta .r2-usage-sub {
+        margin-right: auto;
+      }
+
+      .r2-refresh-button {
+        padding: 6px 10px;
+        font-size: 12px;
+        border-radius: 10px;
+      }
+
+      .coverage-calendar-panel {
+        background: #ffffff;
+        border-color: #d7d7d7;
+        box-shadow: 0 12px 28px rgba(22, 20, 16, 0.1);
+      }
+
+      .coverage-calendar-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+      }
+
+      .coverage-calendar-title {
+        margin: 0;
+        font-size: clamp(26px, 3.6vw, 44px);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .coverage-calendar-nav {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .coverage-calendar-view {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-right: 4px;
+      }
+
+      .coverage-calendar-view-label {
+        font-size: 12px;
+        font-weight: 700;
+        color: #3f3a33;
+      }
+
+      .coverage-calendar-view-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .coverage-calendar-view-btn {
+        min-width: 72px;
+        border: 1px solid #F37F22;
+        border-radius: 10px;
+        background: #ffffff;
+        color: #1f1c16;
+        font-family: "IBM Plex Sans", "Inter", ui-sans-serif, system-ui, sans-serif;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 7px 12px;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+      }
+
+      .coverage-calendar-view-btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 0 0 3px rgba(243, 127, 34, 0.22), 0 6px 14px rgba(22, 20, 16, 0.2);
+      }
+
+      .coverage-calendar-view-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(243, 127, 34, 0.28), 0 6px 14px rgba(22, 20, 16, 0.2);
+      }
+
+      .coverage-calendar-view-btn.is-active {
+        background: #F37F22;
+        border-color: #F37F22;
+        color: #ffffff;
+        cursor: default;
+        pointer-events: none;
+        box-shadow: none;
+      }
+
+      .coverage-calendar-view-btn.is-active:hover,
+      .coverage-calendar-view-btn.is-active:focus-visible {
+        transform: none;
+        box-shadow: none;
+      }
+
+      .coverage-calendar-nav-btn {
+        border: none;
+        border-radius: 12px;
+        background: #151515;
+        color: #ffffff;
+        font-family: "IBM Plex Sans", "Inter", ui-sans-serif, system-ui, sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+        padding: 8px 14px;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+
+      .coverage-calendar-nav-btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 0 0 3px rgba(31, 122, 122, 0.22), 0 8px 16px rgba(22, 20, 16, 0.3);
+      }
+
+      .coverage-calendar-nav-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(31, 122, 122, 0.28), 0 8px 16px rgba(22, 20, 16, 0.3);
+      }
+
+      .coverage-calendar-grid {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .coverage-day-cell {
+        min-height: 160px;
+        border: 1px solid #dddddd;
+        border-radius: 12px;
+        background: #ffffff;
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .coverage-day-cell.is-outside {
+        background: #f6f6f6;
+        color: #9b9489;
+      }
+
+      .coverage-day-cell.is-outside .coverage-day-weekday {
+        color: #8f877b;
+      }
+
+      .coverage-day-cell.is-today {
+        border-color: #1f1c16;
+        box-shadow: inset 0 0 0 1px #1f1c16;
+      }
+
+      .coverage-day-title {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        line-height: 1.1;
+      }
+
+      .coverage-day-number {
+        font-size: 21px;
+        font-weight: 700;
+      }
+
+      .coverage-day-weekday {
+        font-size: 13px;
+        color: #4a4a4a;
+      }
+
+      .coverage-bars {
+        margin-top: 0;
+        flex: 1 1 auto;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+      }
+
+      .coverage-bar-slot {
+        min-height: 0;
+        display: flex;
+        align-items: center;
+      }
+
+      .coverage-bar {
+        display: flex;
+        align-items: center;
+        width: 100%;
+        height: 100%;
+        min-height: 12px;
+        box-sizing: border-box;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      .coverage-bar.is-half {
+        width: 48%;
+      }
+
+      .coverage-bar-label {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: flex-start;
+        width: 100%;
+        height: 100%;
+        padding: 2px 8px;
+        color: #ffffff;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.1;
+        overflow: hidden;
+        text-shadow: 0 1px 1px rgba(0, 0, 0, 0.45);
+        pointer-events: none;
+      }
+
+      .coverage-bar-label-primary {
+        display: block;
+        width: 100%;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .coverage-bar-label-primary.with-icon {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+      }
+
+      .coverage-bar-label-primary-icon {
+        width: 12px;
+        height: 12px;
+        display: inline-block;
+        flex: 0 0 auto;
+      }
+
+      .coverage-bar-label-primary-text {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .coverage-bar-label.has-secondary .coverage-bar-label-primary {
+        font-size: 12px;
+      }
+
+      .coverage-bar-label-secondary {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        margin-top: 1px;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1;
+        white-space: nowrap;
+        opacity: 0.95;
+      }
+
+      .coverage-bar-label-secondary.is-dropbox-badge {
+        color: #ffffff;
+      }
+
+      .coverage-bar-label-secondary-icon {
+        width: 12px;
+        height: 12px;
+        display: inline-block;
+      }
+
+      .coverage-bar-label-secondary-icon.is-dropbox-blue {
+        filter: none !important;
+        opacity: 1;
+      }
+
+      .coverage-bar-ingest {
+        background: var(--color-ingest-db);
+      }
+
+      .coverage-bar-r2-observs {
+        background: var(--color-r2-observs);
+      }
+
+      .coverage-bar-r2-aqilevels {
+        background: var(--color-r2-aqilevels);
+      }
+
+      .coverage-bar-obsaqi-observs {
+        background: var(--color-obsaqi-observs);
+      }
+
+      .coverage-bar-obsaqi-aqilevels {
+        background: var(--color-obsaqi-aqilevels);
+      }
+
+      .coverage-bar-dropbox-only-observs {
+        background: #ffffff;
+        border: 1px solid var(--color-r2-observs);
+      }
+
+      .coverage-bar-dropbox-only-aqilevels {
+        background: #ffffff;
+        border: 1px solid var(--color-r2-aqilevels);
+      }
+
+      .coverage-bar-dropbox-only-observs .coverage-bar-label,
+      .coverage-bar-dropbox-only-aqilevels .coverage-bar-label {
+        color: #000000;
+        text-shadow: none;
+      }
+
+      .coverage-bar-aqilevels-striped {
+        background: repeating-linear-gradient(
+          45deg,
+          var(--color-r2-aqilevels) 0 22px,
+          var(--color-obsaqi-aqilevels) 22px 44px
+        );
+      }
+
+      .coverage-year-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 10px;
+      }
+
+      .coverage-connector-counts-section {
+        margin-top: 18px;
+        border-top: 1px solid #e4d7c5;
+        padding-top: 18px;
+      }
+
+      .coverage-connector-counts-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 10px;
+      }
+
+      .coverage-connector-counts-title {
+        margin: 0;
+        font-size: 19px;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+
+      .coverage-connector-counts-note {
+        margin-bottom: 14px;
+        color: #5f574c;
+        font-size: 13px;
+      }
+
+      .coverage-connector-chart-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+
+      .coverage-connector-chart-card {
+        border: 1px solid #e4d7c5;
+        border-radius: 14px;
+        background: #fffdf8;
+        padding: 12px 12px 10px;
+      }
+
+      .coverage-connector-chart-head {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .coverage-connector-chart-head h3 {
+        margin: 0;
+        font-size: 15px;
+        line-height: 1.2;
+      }
+
+      .coverage-connector-chart-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 10px;
+        font-size: 11px;
+        color: #5f574c;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+      }
+
+      .coverage-connector-chart-legend span {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .coverage-connector-chart-swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        display: inline-block;
+        flex: 0 0 auto;
+      }
+
+      .coverage-connector-chart-wrap {
+        min-height: 210px;
+      }
+
+      .coverage-connector-chart-svg {
+        width: 100%;
+        height: 210px;
+        display: block;
+      }
+
+      .coverage-connector-chart-empty {
+        min-height: 210px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        color: #6b6255;
+        font-size: 13px;
+        padding: 10px;
+        border-radius: 12px;
+        background: #fffaf1;
+        border: 1px dashed #d9cbb4;
+      }
+
+      .coverage-year-month {
+        border: 1px solid #dddddd;
+        border-radius: 12px;
+        background: #ffffff;
+        padding: 8px;
+      }
+
+      .coverage-year-month-title {
+        margin: 0 0 6px;
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1.2;
+      }
+
+      .coverage-year-weekdays {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 3px;
+        margin-bottom: 4px;
+      }
+
+      .coverage-year-weekday {
+        font-size: 10px;
+        font-weight: 700;
+        color: #7f7769;
+        text-align: center;
+      }
+
+      .coverage-year-days {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 3px;
+      }
+
+      .coverage-year-day {
+        border: 1px solid #dddddd;
+        border-radius: 7px;
+        background: #ffffff;
+        aspect-ratio: 1 / 1;
+        padding: 2px;
+      }
+
+      .coverage-year-day.is-outside {
+        background: #f6f6f6;
+        border-color: #ececec;
+      }
+
+      .coverage-year-day.is-today {
+        border-color: #1f1c16;
+      }
+
+      .coverage-square-grid {
+        width: 100%;
+        height: 100%;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-rows: repeat(2, minmax(0, 1fr));
+        gap: 2px;
+      }
+
+      .coverage-square {
+        border-radius: 3px;
+        min-height: 0;
+      }
+
+      .coverage-square-dropbox-only-observs,
+      .coverage-square-dropbox-only-aqilevels {
+        background-color: #ffffff;
+        box-sizing: border-box;
+      }
+
+      .coverage-square-dropbox-only-observs {
+        border: 1px solid var(--color-r2-observs);
+      }
+
+      .coverage-square-dropbox-only-aqilevels {
+        border: 1px solid var(--color-r2-aqilevels);
+      }
+
+      .coverage-square.has-backup-icon {
+        background-image: url("/assets/dropbox-icon.svg");
+        background-repeat: no-repeat;
+        background-position: center;
+        background-size: 88% 88%;
+      }
+
+      .coverage-square.is-empty {
+        background: transparent;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        background: rgba(31, 122, 122, 0.12);
+        color: var(--accent-2);
+      }
+
+      .status-pill.succeeded {
+        background: rgba(47, 143, 91, 0.15);
+        color: #2f8f5b;
+      }
+
+      .status-pill.failed,
+      .status-pill.error {
+        background: rgba(211, 74, 63, 0.16);
+        color: #b0322a;
+      }
+
+      .status-pill.skipped {
+        background: rgba(245, 193, 74, 0.18);
+        color: #a56800;
+      }
+
+      .status-pill.running {
+        background: rgba(31, 122, 122, 0.14);
+        color: var(--accent-2);
+      }
+
+      .status-pill.partial {
+        background: rgba(47, 143, 91, 0.15);
+        color: #2f8f5b;
+        text-transform: none;
+        flex-direction: column;
+        align-items: center;
+        gap: 1px;
+        line-height: 1.1;
+        text-align: center;
+      }
+
+      .status-stack {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .status-detail {
+        white-space: nowrap;
+      }
+
+      .runtime-pill {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 11px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(245, 193, 74, 0.18);
+        color: #a56800;
+      }
+
+      .runtime-pill.overdue {
+        background: rgba(211, 74, 63, 0.16);
+        color: #b0322a;
+      }
+
+      .metric-note {
+        display: inline-block;
+        max-width: 88px;
+        line-height: 1.2;
+        color: var(--ink-soft);
+      }
+
+      .settings-actions {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 12px;
+      }
+
+      .settings-inline {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      .settings-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+      }
+
+      .settings-button {
+        border: none;
+        background: var(--accent-2);
+        color: #fff;
+        padding: 8px 14px;
+        border-radius: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+
+      .settings-button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 16px rgba(31, 122, 122, 0.25);
+      }
+
+      .settings-input,
+      .settings-select {
+        width: 100%;
+        padding: 6px 8px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #fff;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+      }
+
+      th,
+      td {
+        text-align: left;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      th {
+        font-weight: 600;
+        color: var(--ink-soft);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+
+      tbody tr:hover {
+        background: rgba(244, 227, 194, 0.45);
+      }
+
+      .connector-name {
+        font-weight: 600;
+      }
+
+      .bucket-bar {
+        display: flex;
+        height: 10px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: #efe4cf;
+        min-width: 140px;
+      }
+
+      .seg {
+        height: 100%;
+      }
+
+      .seg-0 {
+        background: #2f8f5b;
+      }
+
+      .seg-1 {
+        background: #f5c14a;
+      }
+
+      .seg-2 {
+        background: #e57a2f;
+      }
+
+      .seg-3 {
+        background: #d34a3f;
+      }
+
+      .seg-4 {
+        background: #7b3bb5;
+      }
+
+      .footnote {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .error {
+        margin-top: 8px;
+        color: #9b2c2c;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+      }
+
+      @keyframes float-in {
+        from {
+          opacity: 0;
+          transform: translateY(-10px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @keyframes rise-in {
+        from {
+          opacity: 0;
+          transform: translateY(12px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 900px) {
+        th:nth-child(n + 5),
+        td:nth-child(n + 5) {
+          display: none;
+        }
+
+        .db-size-chart-wrap {
+          height: 240px;
+        }
+
+        .coverage-calendar-nav {
+          width: 100%;
+        }
+
+        .coverage-year-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header>
+        <h1 id="dashboard-title">UK AQ Local Dashboard</h1>
+        <p id="dashboard-subtitle">
+          Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates
+          from your local API.
+        </p>
+        <div class="meta">
+          <div class="meta-left">
+            <span class="meta-status" id="status">Waiting for data...</span>
+            <span class="meta-note" id="data-meta">Project n/a</span>
+          </div>
+          <div class="refresh-controls">
+            <span>Refresh</span>
+            <div class="refresh-group" id="refresh-group">
+              <span class="refresh-pill">
+                <input type="radio" name="refresh" id="refresh-1" value="60" />
+                <label for="refresh-1">1 min</label>
+              </span>
+              <span class="refresh-pill">
+                <input type="radio" name="refresh" id="refresh-5" value="300" checked />
+                <label for="refresh-5">5 min</label>
+              </span>
+              <span class="refresh-pill">
+                <input type="radio" name="refresh" id="refresh-10" value="600" />
+                <label for="refresh-10">10 min</label>
+              </span>
+              <span class="refresh-pill">
+                <input type="radio" name="refresh" id="refresh-30" value="1800" />
+                <label for="refresh-30">30 min</label>
+              </span>
+              <span class="refresh-pill">
+                <input type="radio" name="refresh" id="refresh-60" value="3600" />
+                <label for="refresh-60">60 min</label>
+              </span>
+            </div>
+            <button class="refresh-button" id="refresh-now">Refresh now</button>
+          </div>
+        </div>
+        <div class="error" id="error"></div>
+      </header>
+
+      <div class="grid" id="dashboard"></div>
+    </div>
+
+    <script src="/assets/config.js"></script>
+    <script>
+      const DEFAULT_CONFIG = {
+        envName: "local",
+        apiBaseUrl: "/api",
+        dashboardTitle: "UK AQ Local Dashboard",
+        dashboardSubtitle:
+          "Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates from your local API.",
+        defaultRefreshSeconds: 300,
+      };
+      const runtimeConfig =
+        window.UKAQ_OPS_CONFIG && typeof window.UKAQ_OPS_CONFIG === "object"
+          ? { ...DEFAULT_CONFIG, ...window.UKAQ_OPS_CONFIG }
+          : DEFAULT_CONFIG;
+      const API_BASE_URL = String(runtimeConfig.apiBaseUrl || "/api")
+        .trim()
+        .replace(/\/+$/, "");
+
+      function buildApiUrl(path, params) {
+        const cleanPath = String(path || "").replace(/^\/+/, "");
+        const base = API_BASE_URL || "/api";
+        const url = `${base}/${cleanPath}`;
+        if (!params) {
+          return url;
+        }
+        const query = typeof params === "string" ? params : params.toString();
+        return query ? `${url}?${query}` : url;
+      }
+
+      const dashboardEl = document.getElementById("dashboard");
+      const dashboardTitleEl = document.getElementById("dashboard-title");
+      const dashboardSubtitleEl = document.getElementById("dashboard-subtitle");
+      const statusEl = document.getElementById("status");
+      const dataMetaEl = document.getElementById("data-meta");
+      const errorEl = document.getElementById("error");
+      const refreshGroup = document.getElementById("refresh-group");
+      const refreshNowBtn = document.getElementById("refresh-now");
+      let refreshTimer = null;
+      let refreshSeconds = Number(runtimeConfig.defaultRefreshSeconds) || 300;
+      let wasInactive = document.hidden || !document.hasFocus();
+      if (!Number.isFinite(refreshSeconds) || refreshSeconds <= 0) {
+        refreshSeconds = 300;
+      }
+      if (dashboardTitleEl) {
+        dashboardTitleEl.textContent = runtimeConfig.dashboardTitle || DEFAULT_CONFIG.dashboardTitle;
+      }
+      if (dashboardSubtitleEl) {
+        dashboardSubtitleEl.textContent = runtimeConfig.dashboardSubtitle || DEFAULT_CONFIG.dashboardSubtitle;
+      }
+      if (document && document.title) {
+        document.title = runtimeConfig.dashboardTitle || DEFAULT_CONFIG.dashboardTitle;
+      }
+
+      const bucketOrder = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"];
+      const DISPATCH_CONNECTOR_OPTIONS = [
+        { value: "all", label: "All" },
+        { value: "uk_air_sos", label: "UK-AIR SOS" },
+        { value: "sensorcommunity", label: "Sensor.Community" },
+        { value: "breathelondon", label: "Breathe London" },
+        { value: "openaq", label: "OpenAQ" },
+      ];
+      const DISPATCH_LOOKBACK_OPTIONS = [
+        { value: 10, label: "10mins" },
+        { value: 30, label: "30mins" },
+        { value: 60, label: "60mins" },
+        { value: 120, label: "120mins" },
+        { value: 240, label: "240mins" },
+      ];
+      const DISPATCH_CONNECTOR_STORAGE_KEY = "uk_aq_dispatch_connector";
+      const DISPATCH_LOOKBACK_STORAGE_KEY = "uk_aq_dispatch_lookback_mins";
+      const DISPATCH_CURSOR_STORAGE_KEY = "uk_aq_dispatch_cursor";
+      const DB_SIZE_PERIOD_OPTIONS = [
+        { value: 6, label: "6 hours" },
+        { value: 12, label: "12 hours" },
+        { value: 24, label: "24 hours" },
+        { value: 48, label: "48 hours" },
+        { value: 168, label: "7 days" },
+        { value: 336, label: "14 days" },
+        { value: 672, label: "28 days" },
+      ];
+      const DB_SIZE_PERIOD_STORAGE_KEY = "uk_aq_db_size_period_hours";
+      const DB_LINE_CHART_Y_MAX_MB = 500;
+      const COLOR_INGEST_DB = "#FE2E2E";
+      const COLOR_R2_OBSERVS = "#F48021";
+      const COLOR_R2_AQILEVELS = "#F4C04B";
+      const COLOR_OBSAQI_OBSERVS = "#3C82F5";
+      const COLOR_OBSAQI_AQILEVELS = "#61D836";
+      const DASHBOARD_DROPBOX_ICON_PATH = "/assets/dropbox-icon.svg";
+      const STORAGE_COVERAGE_MONTH_STORAGE_KEY = "uk_aq_storage_coverage_month";
+      const STORAGE_COVERAGE_MODE_STORAGE_KEY = "uk_aq_storage_coverage_mode";
+      const STORAGE_COVERAGE_MODE_VALUES = new Set(["month", "year"]);
+      const R2_CONNECTOR_COUNTS_MODE_STORAGE_KEY = "uk_aq_r2_connector_counts_mode";
+      const R2_CONNECTOR_COUNTS_MODE_VALUES = new Set(["stacked", "observs", "aqi"]);
+      const R2_CONNECTOR_COUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+      const STORAGE_COVERAGE_ERROR_PREFIX = "Storage coverage calendar failed to load:";
+      const R2_CONNECTOR_COUNTS_ERROR_PREFIX = "R2 connector counts failed to load:";
+      const DAY_MS = 24 * 60 * 60 * 1000;
+      const COVERAGE_WEEKDAY_NAMES = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+      ];
+      const COVERAGE_WEEKDAY_ABBREVIATIONS = ["M", "T", "W", "T", "F", "S", "S"];
+      let dispatchConnectorFilter = "all";
+      let dispatchLookbackMinutes = 30;
+      let dispatchCursor = null;
+      let dbSizePeriodHours = 24;
+      let storageCoverageMonthCursor = null;
+      let storageCoverageMode = "month";
+      let r2ConnectorCountsMode = "stacked";
+      let latestDashboardData = null;
+      let latestR2ConnectorCounts = null;
+      let dashboardLoadSequence = 0;
+      let storageCoverageLoadSequence = 0;
+      let r2ConnectorCountsLoadSequence = 0;
+      const R2_CONNECTOR_CHARTS = [
+        {
+          connectorId: 1,
+          title: "UK-AIR-SOS",
+          observsColor: "#013566",
+          aqiColor: "#015FA4",
+        },
+        {
+          connectorId: 3,
+          title: "Breathe London",
+          observsColor: "#007A6C",
+          aqiColor: "#279F8D",
+        },
+        {
+          connectorId: 6,
+          title: "Open AQ",
+          observsColor: "#000000",
+          aqiColor: "#1A8BFF",
+        },
+        {
+          connectorId: 7,
+          title: "Sensor.Community",
+          observsColor: "#000000",
+          aqiColor: "#6ECE98",
+        },
+      ];
+
+      try {
+        const storedConnector = localStorage.getItem(DISPATCH_CONNECTOR_STORAGE_KEY);
+        if (storedConnector && DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === storedConnector)) {
+          dispatchConnectorFilter = storedConnector;
+        }
+        const storedLookback = Number(localStorage.getItem(DISPATCH_LOOKBACK_STORAGE_KEY));
+        if (
+          Number.isFinite(storedLookback) &&
+          DISPATCH_LOOKBACK_OPTIONS.some((opt) => opt.value === storedLookback)
+        ) {
+          dispatchLookbackMinutes = storedLookback;
+        }
+        const storedCursor = localStorage.getItem(DISPATCH_CURSOR_STORAGE_KEY);
+        if (storedCursor) {
+          dispatchCursor = storedCursor;
+        }
+        const storedDbSizePeriod = Number(localStorage.getItem(DB_SIZE_PERIOD_STORAGE_KEY));
+        if (
+          Number.isFinite(storedDbSizePeriod) &&
+          DB_SIZE_PERIOD_OPTIONS.some((opt) => opt.value === storedDbSizePeriod)
+        ) {
+          dbSizePeriodHours = storedDbSizePeriod;
+        }
+        const storedCoverageMonth = localStorage.getItem(STORAGE_COVERAGE_MONTH_STORAGE_KEY);
+        const parsedCoverageMonth = parseCoverageMonthStorageKey(storedCoverageMonth);
+        if (parsedCoverageMonth) {
+          storageCoverageMonthCursor = parsedCoverageMonth;
+        }
+        const storedCoverageMode = localStorage.getItem(STORAGE_COVERAGE_MODE_STORAGE_KEY);
+        if (storedCoverageMode && STORAGE_COVERAGE_MODE_VALUES.has(storedCoverageMode)) {
+          storageCoverageMode = storedCoverageMode;
+        }
+        const storedR2ConnectorCountsMode = localStorage.getItem(R2_CONNECTOR_COUNTS_MODE_STORAGE_KEY);
+        if (
+          storedR2ConnectorCountsMode &&
+          R2_CONNECTOR_COUNTS_MODE_VALUES.has(storedR2ConnectorCountsMode)
+        ) {
+          r2ConnectorCountsMode = storedR2ConnectorCountsMode;
+        }
+      } catch (_err) {
+        // Ignore storage read issues and use defaults.
+      }
+      if (!storageCoverageMonthCursor) {
+        storageCoverageMonthCursor = startOfUtcMonth(new Date());
+      }
+
+      function escapeHtml(value) {
+        return String(value || "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function formatTime(value) {
+        if (!value) return "n/a";
+        return formatDateTimeDdMmYyyyHhMmSs(value);
+      }
+
+      function formatDateTimeDdMmYyyyHhMmSs(value) {
+        if (!value) return "n/a";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "n/a";
+        const pad = (num) => String(num).padStart(2, "0");
+        return `${pad(date.getUTCDate())}/${pad(date.getUTCMonth() + 1)}/${date.getUTCFullYear()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+      }
+
+      function formatLocalTimezoneLabel(date) {
+        const utcOffsetMinutes = -date.getTimezoneOffset();
+        if (utcOffsetMinutes === 0) {
+          return "UTC";
+        }
+        if (utcOffsetMinutes === 60) {
+          return "BST (UTC+1hr)";
+        }
+        const sign = utcOffsetMinutes >= 0 ? "+" : "-";
+        const absoluteMinutes = Math.abs(utcOffsetMinutes);
+        const hours = Math.floor(absoluteMinutes / 60);
+        const minutes = absoluteMinutes % 60;
+        if (minutes === 0) {
+          return `UTC${sign}${hours}hr`;
+        }
+        return `UTC${sign}${hours}h${String(minutes).padStart(2, "0")}m`;
+      }
+
+      function formatDateTimeLocalWithTimezone(value) {
+        if (!value) return "n/a";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "n/a";
+        const pad = (num) => String(num).padStart(2, "0");
+        const timestamp = `${pad(date.getDate())}/${pad(date.getMonth() + 1)}/${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        return `${timestamp} ${formatLocalTimezoneLabel(date)}`;
+      }
+
+      function formatDateDdMmYyyy(value) {
+        if (!value) return null;
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return null;
+        const pad = (num) => String(num).padStart(2, "0");
+        return `${pad(date.getUTCDate())}/${pad(date.getUTCMonth() + 1)}/${date.getUTCFullYear()}`;
+      }
+
+      function parseUtcDayMs(value) {
+        if (!value) return null;
+        const raw = String(value).trim();
+        const dayMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (dayMatch) {
+          const year = Number(dayMatch[1]);
+          const month = Number(dayMatch[2]) - 1;
+          const day = Number(dayMatch[3]);
+          return Date.UTC(year, month, day);
+        }
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return null;
+        return Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate());
+      }
+
+      function startOfUtcDay(date) {
+        return new Date(Date.UTC(
+          date.getUTCFullYear(),
+          date.getUTCMonth(),
+          date.getUTCDate(),
+          0,
+          0,
+          0,
+          0,
+        ));
+      }
+
+      function startOfUtcMonth(date) {
+        return new Date(Date.UTC(
+          date.getUTCFullYear(),
+          date.getUTCMonth(),
+          1,
+          0,
+          0,
+          0,
+          0,
+        ));
+      }
+
+      function addUtcDays(date, days) {
+        return new Date(date.getTime() + days * DAY_MS);
+      }
+
+      function addUtcMonths(date, months) {
+        return new Date(Date.UTC(
+          date.getUTCFullYear(),
+          date.getUTCMonth() + months,
+          1,
+          0,
+          0,
+          0,
+          0,
+        ));
+      }
+
+      function toUtcDateKey(date) {
+        const year = date.getUTCFullYear();
+        const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+        const day = String(date.getUTCDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
+      }
+
+      function parseUtcDateKey(dateKey) {
+        const match = String(dateKey || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!match) return null;
+        const year = Number(match[1]);
+        const month = Number(match[2]) - 1;
+        const day = Number(match[3]);
+        return new Date(Date.UTC(year, month, day, 0, 0, 0, 0));
+      }
+
+      function formatCoverageMonthStorageKey(date) {
+        const year = date.getUTCFullYear();
+        const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+        return `${year}-${month}`;
+      }
+
+      function parseCoverageMonthStorageKey(value) {
+        const match = String(value || "").trim().match(/^(\d{4})-(\d{2})$/);
+        if (!match) return null;
+        const year = Number(match[1]);
+        const month = Number(match[2]) - 1;
+        if (!Number.isFinite(year) || !Number.isFinite(month) || month < 0 || month > 11) {
+          return null;
+        }
+        return new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+      }
+
+      function sameUtcMonth(left, right) {
+        return (
+          left.getUTCFullYear() === right.getUTCFullYear() &&
+          left.getUTCMonth() === right.getUTCMonth()
+        );
+      }
+
+      function formatCoverageMonthTitle(monthStartUtc) {
+        return monthStartUtc.toLocaleString(undefined, {
+          month: "long",
+          year: "numeric",
+          timeZone: "UTC",
+        });
+      }
+
+      function formatCoverageYearTitle(dateUtc) {
+        return String(dateUtc.getUTCFullYear());
+      }
+
+      function formatCoverageMonthShortTitle(monthStartUtc) {
+        return monthStartUtc.toLocaleString(undefined, {
+          month: "short",
+          timeZone: "UTC",
+        });
+      }
+
+      function formatDbOldestDayLabel(value) {
+        const formatted = formatDateDdMmYyyy(value);
+        if (!formatted) {
+          return ">=--/--/----";
+        }
+        return `>=${formatted}`;
+      }
+
+      function formatCount(value) {
+        if (value === null || value === undefined || Number.isNaN(Number(value))) {
+          return "n/a";
+        }
+        return Number(value).toLocaleString();
+      }
+
+      function formatCompactCount(value) {
+        if (value === null || value === undefined || Number.isNaN(Number(value))) {
+          return "n/a";
+        }
+        const numeric = Number(value);
+        const abs = Math.abs(numeric);
+        if (abs >= 1_000_000) {
+          return `${(numeric / 1_000_000).toFixed(abs >= 10_000_000 ? 0 : 1)}M`;
+        }
+        if (abs >= 1_000) {
+          return `${(numeric / 1_000).toFixed(abs >= 10_000 ? 0 : 1)}k`;
+        }
+        return Math.round(numeric).toLocaleString();
+      }
+
+      function formatRowRate(value) {
+        if (value === null || value === undefined || Number.isNaN(Number(value))) {
+          return "n/a";
+        }
+        const numeric = Number(value);
+        if (Math.abs(numeric) >= 100) {
+          return Math.round(numeric).toLocaleString();
+        }
+        return numeric.toFixed(1);
+      }
+
+      function formatMonthYearLabel(dayValue) {
+        const date = parseUtcDateKey(dayValue);
+        if (!date) {
+          return String(dayValue || "");
+        }
+        return date.toLocaleString(undefined, {
+          month: "short",
+          year: "numeric",
+          timeZone: "UTC",
+        });
+      }
+
+      function formatMonthShortLabel(dayValue) {
+        const date = parseUtcDateKey(dayValue);
+        if (!date) {
+          return String(dayValue || "");
+        }
+        return date.toLocaleString(undefined, {
+          month: "short",
+          timeZone: "UTC",
+        });
+      }
+
+      function formatMegabytes(valueMb) {
+        if (valueMb === null || valueMb === undefined || Number.isNaN(Number(valueMb))) {
+          return "n/a";
+        }
+        const value = Number(valueMb);
+        if (Math.abs(value) >= 100) {
+          return Math.round(value).toLocaleString();
+        }
+        return value.toFixed(1);
+      }
+
+      function formatGigabytes(valueGb) {
+        if (valueGb === null || valueGb === undefined || Number.isNaN(Number(valueGb))) {
+          return "n/a";
+        }
+        return Number(valueGb).toFixed(2);
+      }
+
+      function formatBytesBestFit(valueBytes) {
+        if (valueBytes === null || valueBytes === undefined || Number.isNaN(Number(valueBytes))) {
+          return "n/a";
+        }
+        const value = Number(valueBytes);
+        const abs = Math.abs(value);
+        if (abs < 1000) {
+          return `${Math.round(value)} bytes`;
+        }
+        const units = [
+          { threshold: 1e12, label: "TB" },
+          { threshold: 1e9, label: "GB" },
+          { threshold: 1e6, label: "MB" },
+          { threshold: 1e3, label: "kb" },
+        ];
+        for (const unit of units) {
+          if (abs >= unit.threshold) {
+            return `${(value / unit.threshold).toFixed(2)}${unit.label}`;
+          }
+        }
+        return `${Math.round(value)} bytes`;
+      }
+
+      function asNumber(value) {
+        if (value === null || value === undefined) return null;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+
+      function asObject(value) {
+        return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+      }
+
+      function payloadNumber(payload, keys) {
+        if (!payload) return null;
+        for (const key of keys) {
+          if (Object.prototype.hasOwnProperty.call(payload, key)) {
+            const value = asNumber(payload[key]);
+            if (value !== null) return value;
+          }
+        }
+        return null;
+      }
+
+      function isNoStationRefsRun(run) {
+        return (run && String(run.run_message || "").toLowerCase() === "no_station_refs");
+      }
+
+      function resolveStationCount(run) {
+        if (isNoStationRefsRun(run)) {
+          return 0;
+        }
+        const direct = asNumber(run && run.stations_updated);
+        const payload = asObject(run && run.response_payload);
+        const payloadStations = payloadNumber(payload, [
+          "stations_polled",
+          "stations_processed",
+          "stations_selected",
+          "stations_requested",
+          "stations_updated",
+          "stations",
+        ]);
+        if (direct !== null) {
+          // Backward-compatible fallback: some historical rows stored 0 even when stations were polled.
+          if (direct === 0 && payloadStations !== null && payloadStations > 0) {
+            return payloadStations;
+          }
+          return direct;
+        }
+        return payloadStations;
+      }
+
+      function resolveGapStationsPolled(run) {
+        const payload = asObject(run && run.response_payload);
+        if (!payload) {
+          return null;
+        }
+        return payloadNumber(payload, ["gap_stations_polled"]);
+      }
+
+      function resolveObservationCount(run) {
+        const direct = asNumber(run && run.observations_upserted);
+        if (direct !== null) {
+          return direct;
+        }
+        const payload = asObject(run && run.response_payload);
+        return payloadNumber(payload, [
+          "observations_upserted",
+          "observations",
+        ]);
+      }
+
+      function partialRunDetail(run) {
+        const rateLimitReasons = new Set([
+          "remaining_low",
+          "rate_limit_429",
+          "rate_limit_guard",
+        ]);
+        const budgetReasons = new Set([
+          "runtime_budget_exceeded",
+          "max_requests_per_run",
+          "request_budget_limited",
+        ]);
+        const payload = asObject(run && run.response_payload);
+        const stoppedReason = String((payload && payload.stopped_reason) || "").toLowerCase();
+        if (rateLimitReasons.has(stoppedReason)) {
+          return "Rate-limit";
+        }
+        if (payload && payload.partial === true) {
+          return "Budget Limit";
+        }
+        if (budgetReasons.has(stoppedReason)) {
+          return "Budget Limit";
+        }
+        const message = String(run && run.run_message || "").toLowerCase();
+        if (rateLimitReasons.has(message)) {
+          return "Rate-limit";
+        }
+        if (budgetReasons.has(message)) {
+          return "Budget Limit";
+        }
+        return null;
+      }
+
+      function statusMeta(run) {
+        const partialDetail = partialRunDetail(run);
+        if (partialDetail || String(run && run.run_status || "").toLowerCase() === "partial") {
+          return { className: "partial", label: "Partial Run", detail: partialDetail || "Budget Limit" };
+        }
+        const raw = (run && run.run_status) || "unknown";
+        return { className: String(raw).toLowerCase(), label: raw, detail: null };
+      }
+
+      function hasNoNewData(run) {
+        if (String(run && run.run_status || "").toLowerCase() !== "succeeded") {
+          return false;
+        }
+        if (isNoStationRefsRun(run)) {
+          return false;
+        }
+        const stationCount = resolveStationCount(run);
+        if (stationCount === null || stationCount <= 0) {
+          return false;
+        }
+        const observations = resolveObservationCount(run);
+        const series = asNumber(run && run.series_polled) ?? asNumber(run && run.timeseries_updated);
+        if (observations === 0 && series === 0) {
+          return true;
+        }
+        const connectorCode = String(run && run.connector_code || "").toLowerCase();
+        if (connectorCode === "breathelondon" && observations === null && series === 0) {
+          return true;
+        }
+        return false;
+      }
+
+      function formatStations(run) {
+        const stationCount = resolveStationCount(run);
+        const gapStationsPolled = resolveGapStationsPolled(run);
+        if (stationCount !== null) {
+          const base = formatCount(stationCount);
+          if (gapStationsPolled !== null && gapStationsPolled > 0) {
+            return `${base}<br><span class="metric-note">(${formatCount(gapStationsPolled)} GAP)</span>`;
+          }
+          return base;
+        }
+        if (run.series_polled !== null && run.series_polled !== undefined) {
+          return `${formatCount(run.series_polled)} series`;
+        }
+        return "n/a";
+      }
+
+      function formatObservations(run) {
+        if (hasNoNewData(run)) {
+          return `<span class="metric-note">No new data</span>`;
+        }
+        const observations = resolveObservationCount(run);
+        return formatCount(observations);
+      }
+
+      function formatSeries(run) {
+        if (run.series_polled !== null && run.series_polled !== undefined) {
+          return formatCount(run.series_polled);
+        }
+        if (run.timeseries_updated !== null && run.timeseries_updated !== undefined) {
+          return formatCount(run.timeseries_updated);
+        }
+        return "n/a";
+      }
+
+      function formatMinutes(value) {
+        if (value === null || value === undefined || Number.isNaN(Number(value))) {
+          return null;
+        }
+        return `${Number(value)}m`;
+      }
+
+      function formatDurationSeconds(totalSeconds) {
+        if (totalSeconds === null || totalSeconds === undefined || Number.isNaN(Number(totalSeconds))) {
+          return null;
+        }
+        const rounded = Math.max(0, Math.round(Number(totalSeconds)));
+        const minutes = Math.floor(rounded / 60);
+        const seconds = rounded % 60;
+        return `${minutes}m ${seconds}s`;
+      }
+
+      function calcDurationMinutes(run) {
+        const startRaw = run.run_started_at;
+        const endRaw = run.run_ended_at;
+        if (startRaw && endRaw) {
+          const start = new Date(startRaw).getTime();
+          const end = new Date(endRaw).getTime();
+          if (!Number.isNaN(start) && !Number.isNaN(end) && end >= start) {
+            return (end - start) / 60000;
+          }
+        }
+        if (run.in_flight_minutes !== null && run.in_flight_minutes !== undefined) {
+          return Number(run.in_flight_minutes);
+        }
+        return null;
+      }
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function setDataMeta(payload) {
+        const projectRef = payload && payload.project_ref ? payload.project_ref : "n/a";
+        dataMetaEl.textContent = `Project ${projectRef}`;
+      }
+
+      function setError(text) {
+        errorEl.textContent = text || "";
+      }
+
+      function clearRefreshTimer() {
+        if (refreshTimer) {
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }
+      }
+
+      function isPageActive() {
+        return !document.hidden && document.hasFocus();
+      }
+
+      function startRefreshTimer() {
+        clearRefreshTimer();
+        if (!isPageActive()) {
+          return;
+        }
+        refreshTimer = setInterval(() => {
+          if (!isPageActive()) {
+            return;
+          }
+          loadDashboard();
+        }, refreshSeconds * 1000);
+      }
+
+      function setRefreshInterval(seconds) {
+        refreshSeconds = seconds;
+        startRefreshTimer();
+      }
+
+      function handleActivityChange() {
+        if (!isPageActive()) {
+          clearRefreshTimer();
+          wasInactive = true;
+          return;
+        }
+        startRefreshTimer();
+        if (wasInactive) {
+          loadDashboard();
+          wasInactive = false;
+        }
+      }
+
+      function renderPanel(pollutant) {
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.innerHTML = `
+          <h2>${pollutant.label} <span class="chip">${pollutant.key}</span></h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Connector</th>
+                <th>Stations</th>
+                <th>Active</th>
+                <th>0-3</th>
+                <th>3-6</th>
+                <th>6-24</th>
+                <th>1-7</th>
+                <th>7+</th>
+                <th>Trend</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${pollutant.connectors
+                .map((row) => {
+                  const total = row.stations_with_pollutant || 0;
+                  const active = row.active_stations_with_pollutant || 0;
+                  const bucketCounts = bucketOrder.map((bucket) => row.buckets[bucket] || 0);
+                  const segments = bucketCounts
+                    .map((count, idx) => {
+                      const pct = total ? (count / total) * 100 : 0;
+                      const label = `${bucketOrder[idx]}: ${count}`;
+                      return `<span class="seg seg-${idx}" style="width:${pct}%" title="${label}"></span>`;
+                    })
+                    .join("");
+                  return `
+                    <tr>
+                      <td class="connector-name">${row.label}</td>
+                      <td>${total}</td>
+                      <td>${active}</td>
+                      <td>${bucketCounts[0]}</td>
+                      <td>${bucketCounts[1]}</td>
+                      <td>${bucketCounts[2]}</td>
+                      <td>${bucketCounts[3]}</td>
+                      <td>${bucketCounts[4]}</td>
+                      <td><div class="bucket-bar">${segments}</div></td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+          <div class="footnote">Buckets are based on timeseries last_value_at timestamps.</div>
+        `;
+        return panel;
+      }
+
+      function renderDispatchPanel(runs) {
+        const filteredRuns = (Array.isArray(runs) ? runs : []).filter((run) => {
+          const connectorCode = String((run && run.connector_code) || "").toLowerCase();
+          if (dispatchConnectorFilter !== "all" && connectorCode !== dispatchConnectorFilter) {
+            return false;
+          }
+          if (dispatchLookbackMinutes <= 0) {
+            return true;
+          }
+          const timestamp = run.run_timestamp || run.run_ended_at || run.run_started_at;
+          if (!timestamp) {
+            return false;
+          }
+          const runMs = new Date(timestamp).getTime();
+          if (Number.isNaN(runMs)) {
+            return false;
+          }
+          const cutoffMs = Date.now() - dispatchLookbackMinutes * 60 * 1000;
+          return runMs >= cutoffMs;
+        });
+
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.innerHTML = `
+          <h2 class="panel-heading">
+            <span>Dispatcher Feed</span>
+            <div class="dispatch-filters">
+              <label class="dispatch-filter" for="dispatch-connector-filter">
+                Connector
+                <select id="dispatch-connector-filter">
+                  ${DISPATCH_CONNECTOR_OPTIONS
+                    .map((opt) => `<option value="${opt.value}" ${opt.value === dispatchConnectorFilter ? "selected" : ""}>${opt.label}</option>`)
+                    .join("")}
+                </select>
+              </label>
+              <label class="dispatch-filter" for="dispatch-lookback-filter">
+                Lookback
+                <select id="dispatch-lookback-filter">
+                  ${DISPATCH_LOOKBACK_OPTIONS
+                    .map((opt) => `<option value="${opt.value}" ${opt.value === dispatchLookbackMinutes ? "selected" : ""}>${opt.label}</option>`)
+                    .join("")}
+                </select>
+              </label>
+            </div>
+          </h2>
+          <table class="dispatch-table">
+            <thead>
+              <tr>
+                <th>Connector</th>
+                <th>Status</th>
+                <th>Duration</th>
+                <th>Updated</th>
+                <th>Last observed</th>
+                <th>Stations</th>
+                <th>Observations</th>
+                <th>Series</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filteredRuns.length
+                ? filteredRuns
+                .map((run) => {
+                  const status = statusMeta(run);
+                  const timestamp = run.run_timestamp || run.run_ended_at || run.run_started_at;
+                  const minutes = formatMinutes(run.in_flight_minutes);
+                  const durationMinutes = calcDurationMinutes(run);
+                  const duration = durationMinutes === null ? null : formatDurationSeconds(durationMinutes * 60);
+                  const runtimeBadge = minutes
+                    ? `<span class="runtime-pill ${
+                        Number(run.in_flight_minutes) >= 5 ? "overdue" : ""
+                      }">${minutes}</span>`
+                    : "";
+                  return `
+                    <tr>
+                      <td class="connector-name">${run.connector_label || run.connector_code || "Unknown"}</td>
+                      <td>
+                        <div class="status-stack">
+                          <span class="status-pill ${status.className}">${status.label}${status.detail ? `<br><span class="status-detail">${status.detail}</span>` : ""}</span>
+                          ${runtimeBadge}
+                        </div>
+                      </td>
+                      <td>${duration || "n/a"}</td>
+                      <td>${formatTime(timestamp)}</td>
+                      <td>${formatTime(run.last_observed_at)}</td>
+                      <td>${formatStations(run)}</td>
+                      <td>${formatObservations(run)}</td>
+                      <td>${formatSeries(run)}</td>
+                    </tr>
+                  `;
+                })
+                .join("")
+                : `<tr><td colspan="8">No runs found for selected filters.</td></tr>`}
+            </tbody>
+          </table>
+          <div class="footnote">Ordered by most recent run end time. Filters persist across refresh. Times in UTC.</div>
+        `;
+
+        const connectorSelect = panel.querySelector("#dispatch-connector-filter");
+        if (connectorSelect) {
+          connectorSelect.addEventListener("change", (event) => {
+            const nextValue = String(event.target.value || "all");
+            if (!DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === nextValue)) {
+              return;
+            }
+            dispatchConnectorFilter = nextValue;
+            try {
+              localStorage.setItem(DISPATCH_CONNECTOR_STORAGE_KEY, dispatchConnectorFilter);
+            } catch (_err) {
+              // Ignore storage write issues.
+            }
+            loadDashboard();
+          });
+        }
+        const lookbackSelect = panel.querySelector("#dispatch-lookback-filter");
+        if (lookbackSelect) {
+          lookbackSelect.addEventListener("change", (event) => {
+            const nextMinutes = Number(event.target.value);
+            if (
+              !Number.isFinite(nextMinutes) ||
+              !DISPATCH_LOOKBACK_OPTIONS.some((opt) => opt.value === nextMinutes)
+            ) {
+              return;
+            }
+            dispatchLookbackMinutes = nextMinutes;
+            try {
+              localStorage.setItem(DISPATCH_LOOKBACK_STORAGE_KEY, String(dispatchLookbackMinutes));
+            } catch (_err) {
+              // Ignore storage write issues.
+            }
+            loadDashboard();
+          });
+        }
+
+        return panel;
+      }
+
+      function buildDbPath(points, key, xFor, yFor) {
+        let path = "";
+        let started = false;
+        points.forEach((point) => {
+          const value = point[key];
+          if (value === null || value === undefined || Number.isNaN(Number(value))) {
+            return;
+          }
+          const command = started ? "L" : "M";
+          path += `${command}${xFor(point.ms).toFixed(2)},${yFor(Number(value)).toFixed(2)} `;
+          started = true;
+        });
+        return path.trim();
+      }
+
+      function getSingleSeriesPoint(points, key) {
+        const valid = points.filter((point) => {
+          const value = point[key];
+          return value !== null && value !== undefined && !Number.isNaN(Number(value));
+        });
+        return valid.length === 1 ? valid[0] : null;
+      }
+
+      function computeAxisMax(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric) || numeric <= 0) {
+          return 1;
+        }
+        const magnitude = 10 ** Math.floor(Math.log10(numeric));
+        const normalized = numeric / magnitude;
+        const niceSteps = [1, 2, 2.5, 5, 10];
+        const step = niceSteps.find((candidate) => candidate >= normalized) || 10;
+        return Math.max(1, step * magnitude);
+      }
+
+      function buildYAxisTicks(axisMax, tickCount = 5) {
+        const ticks = [];
+        const maxValue = Math.max(1, Number(axisMax) || 1);
+        for (let idx = 0; idx <= tickCount; idx += 1) {
+          ticks.push((maxValue / tickCount) * idx);
+        }
+        return ticks;
+      }
+
+      function buildStackedAreaPath(points, key, priorKeys, xFor, yFor) {
+        if (!Array.isArray(points) || points.length === 0) {
+          return "";
+        }
+        const topPoints = points.map((point) => {
+          const priorSum = priorKeys.reduce((sum, priorKey) => sum + Number(point[priorKey] || 0), 0);
+          const value = Number(point[key] || 0);
+          return {
+            x: xFor(point.ms),
+            top: yFor(priorSum + value),
+            bottom: yFor(priorSum),
+          };
+        });
+        const hasVisible = topPoints.some((point) => Math.abs(point.top - point.bottom) > 0.1);
+        if (!hasVisible) {
+          return "";
+        }
+        const upper = topPoints
+          .map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(2)},${point.top.toFixed(2)}`)
+          .join(" ");
+        const lower = [...topPoints]
+          .reverse()
+          .map((point) => `L${point.x.toFixed(2)},${point.bottom.toFixed(2)}`)
+          .join(" ");
+        return `${upper} ${lower} Z`;
+      }
+
+      function buildStackedMetricPoints(rows, dimensionKey, allowedKeys, cutoffMs) {
+        const allowed = new Set(allowedKeys);
+        const pointMap = new Map();
+        (Array.isArray(rows) ? rows : []).forEach((row) => {
+          const key = String((row && row[dimensionKey]) || "").toLowerCase().trim();
+          if (!allowed.has(key)) {
+            return;
+          }
+          const timestamp = (row && (row.bucket_hour || row.recorded_at)) || null;
+          const ms = new Date(timestamp || "").getTime();
+          if (Number.isNaN(ms) || ms < cutoffMs) {
+            return;
+          }
+          const sizeBytes = asNumber(row && row.size_bytes);
+          if (sizeBytes === null || sizeBytes < 0) {
+            return;
+          }
+          const bucketKey = String(ms);
+          const point = pointMap.get(bucketKey) || { ms };
+          allowedKeys.forEach((seriesKey) => {
+            if (point[seriesKey] === undefined) {
+              point[seriesKey] = 0;
+            }
+          });
+          point[key] = sizeBytes / 1000000;
+          pointMap.set(bucketKey, point);
+        });
+        return Array.from(pointMap.values())
+          .sort((a, b) => a.ms - b.ms)
+          .map((point) => {
+            const normalized = { ms: point.ms };
+            allowedKeys.forEach((seriesKey) => {
+              const value = asNumber(point[seriesKey]);
+              normalized[seriesKey] = value === null ? 0 : Math.max(0, value);
+            });
+            return normalized;
+          });
+      }
+
+      function buildStackedTooltipTargets(points, seriesDefs, xFor, chartLeft, chartRight, chartTop, chartBottom) {
+        if (!Array.isArray(points) || points.length === 0 || !Array.isArray(seriesDefs) || !seriesDefs.length) {
+          return "";
+        }
+        const xPositions = points.map((point) => xFor(point.ms));
+        const hitHeight = Math.max(0, chartBottom - chartTop);
+        return points
+          .map((point, index) => {
+            const currentX = xPositions[index];
+            const leftBound = index === 0 ? chartLeft : (xPositions[index - 1] + currentX) / 2;
+            const rightBound = index === points.length - 1
+              ? chartRight
+              : (currentX + xPositions[index + 1]) / 2;
+            const width = Math.max(1, rightBound - leftBound);
+            const bucketLabel = formatTime(point.ms);
+            const seriesPayload = seriesDefs.map((series) => {
+              const value = Number(point[series.key] || 0);
+              return {
+                label: series.label,
+                size: `${formatMegabytes(value)} MB`,
+                value_mb: value,
+              };
+            });
+            return `
+              <rect
+                class="db-size-stacked-tooltip-hit"
+                x="${leftBound.toFixed(2)}"
+                y="${chartTop.toFixed(2)}"
+                width="${width.toFixed(2)}"
+                height="${hitHeight.toFixed(2)}"
+                fill="#000000"
+                fill-opacity="0.001"
+                stroke="none"
+                pointer-events="all"
+                data-bucket="${escapeHtml(bucketLabel)}"
+                data-series-json="${escapeHtml(encodeURIComponent(JSON.stringify(seriesPayload)))}"
+              />
+            `;
+          })
+          .join("");
+      }
+
+      function buildDbTooltipTargets(points, key, label, color, xFor, yFor) {
+        return points
+          .map((point) => {
+            const value = point[key];
+            if (value === null || value === undefined || Number.isNaN(Number(value))) {
+              return "";
+            }
+            const bucketLabel = formatTime(point.ms);
+            const sizeLabel = `${formatMegabytes(Number(value))} MB`;
+            const oldestKey = `${key}_oldest_observed_at`;
+            const oldestDayLabel = formatDbOldestDayLabel(point[oldestKey] || null);
+            return `
+              <circle
+                class="db-size-tooltip-hit"
+                cx="${xFor(point.ms).toFixed(2)}"
+                cy="${yFor(Number(value)).toFixed(2)}"
+                r="7"
+                fill="${color}"
+                fill-opacity="0.001"
+                stroke="none"
+                pointer-events="all"
+                data-label="${escapeHtml(label)}"
+                data-bucket="${escapeHtml(bucketLabel)}"
+                data-size="${escapeHtml(sizeLabel)}"
+                data-oldest-day="${escapeHtml(oldestDayLabel)}"
+              />
+            `;
+          })
+          .join("");
+      }
+
+      function bindDbSizeTooltips(panel) {
+        const chartWrap = panel.querySelector(".db-size-chart-wrap");
+        const tooltip = panel.querySelector(".db-size-hover-tooltip");
+        const targets = panel.querySelectorAll(".db-size-tooltip-hit");
+        if (!chartWrap || !tooltip || targets.length === 0) {
+          return;
+        }
+
+        function positionTooltip(clientX, clientY) {
+          const wrapRect = chartWrap.getBoundingClientRect();
+          const localY = clientY - wrapRect.top;
+          const halfWidth = Math.max(30, tooltip.offsetWidth / 2 + 8);
+          const x = Math.max(halfWidth, Math.min(wrapRect.width - halfWidth, clientX - wrapRect.left));
+          const tooltipHeight = Math.max(20, tooltip.offsetHeight);
+          const y = Math.max(8, Math.min(wrapRect.height - tooltipHeight - 8, localY + 10));
+          tooltip.style.left = `${x}px`;
+          tooltip.style.top = `${y}px`;
+        }
+
+        function showTooltip(event) {
+          const target = event.currentTarget;
+          const label = target.getAttribute("data-label") || "";
+          const bucket = target.getAttribute("data-bucket") || "";
+          const size = target.getAttribute("data-size") || "";
+          const oldestDay = target.getAttribute("data-oldest-day") || ">=--/--/----";
+          tooltip.innerHTML = `
+            <div>${escapeHtml(label)}</div>
+            <div>Bucket: ${escapeHtml(bucket)}</div>
+            <div>Cluster size: ${escapeHtml(size)}</div>
+            <div>Oldest day: ${escapeHtml(oldestDay)}</div>
+          `;
+          tooltip.classList.add("visible");
+          positionTooltip(event.clientX, event.clientY);
+        }
+
+        function moveTooltip(event) {
+          if (!tooltip.classList.contains("visible")) {
+            return;
+          }
+          positionTooltip(event.clientX, event.clientY);
+        }
+
+        function hideTooltip() {
+          tooltip.classList.remove("visible");
+        }
+
+        targets.forEach((target) => {
+          target.addEventListener("mouseenter", showTooltip);
+          target.addEventListener("mousemove", moveTooltip);
+          target.addEventListener("mouseleave", hideTooltip);
+        });
+        chartWrap.addEventListener("mouseleave", hideTooltip);
+      }
+
+      function bindStackedDbSizeTooltips(panel) {
+        const chartWraps = panel.querySelectorAll(".db-size-subchart .db-size-chart-wrap");
+        chartWraps.forEach((chartWrap) => {
+          const tooltip = chartWrap.querySelector(".db-size-hover-tooltip");
+          const targets = chartWrap.querySelectorAll(".db-size-stacked-tooltip-hit");
+          if (!tooltip || targets.length === 0) {
+            return;
+          }
+
+          function positionTooltip(clientX, clientY) {
+            const wrapRect = chartWrap.getBoundingClientRect();
+            const localY = clientY - wrapRect.top;
+            const halfWidth = Math.max(30, tooltip.offsetWidth / 2 + 8);
+            const x = Math.max(halfWidth, Math.min(wrapRect.width - halfWidth, clientX - wrapRect.left));
+            const tooltipHeight = Math.max(20, tooltip.offsetHeight);
+            const y = Math.max(8, Math.min(wrapRect.height - tooltipHeight - 8, localY + 10));
+            tooltip.style.left = `${x}px`;
+            tooltip.style.top = `${y}px`;
+          }
+
+          function showTooltip(event) {
+            const target = event.currentTarget;
+            const bucket = target.getAttribute("data-bucket") || "";
+            const encoded = target.getAttribute("data-series-json") || "";
+            let rows = [];
+            try {
+              const parsed = JSON.parse(decodeURIComponent(encoded));
+              if (Array.isArray(parsed)) {
+                rows = parsed;
+              }
+            } catch (_err) {
+              rows = [];
+            }
+            const rowMarkup = rows
+              .map((row) => {
+                const label = row && row.label ? String(row.label) : "series";
+                const size = row && row.size ? String(row.size) : "0 MB";
+                return `<div>${escapeHtml(label)}: ${escapeHtml(size)}</div>`;
+              })
+              .join("");
+            const totalMb = rows.reduce((sum, row) => {
+              const value = Number(row && row.value_mb);
+              if (!Number.isFinite(value)) {
+                return sum;
+              }
+              return sum + value;
+            }, 0);
+            tooltip.innerHTML = `<div>Bucket: ${escapeHtml(bucket)}</div>${rowMarkup}<div>Total: ${escapeHtml(`${formatMegabytes(totalMb)} MB`)}</div>`;
+            tooltip.classList.add("visible");
+            positionTooltip(event.clientX, event.clientY);
+          }
+
+          function moveTooltip(event) {
+            if (!tooltip.classList.contains("visible")) {
+              return;
+            }
+            positionTooltip(event.clientX, event.clientY);
+          }
+
+          function hideTooltip() {
+            tooltip.classList.remove("visible");
+          }
+
+          targets.forEach((target) => {
+            target.addEventListener("mouseenter", showTooltip);
+            target.addEventListener("mousemove", moveTooltip);
+            target.addEventListener("mouseleave", hideTooltip);
+          });
+          chartWrap.addEventListener("mouseleave", hideTooltip);
+        });
+      }
+
+      async function refreshR2MetricsOnly() {
+        if (!latestDashboardData) {
+          return;
+        }
+        setError("");
+        setStatus("Refreshing R2 metrics...");
+        try {
+          const params = new URLSearchParams();
+          params.set("force", "1");
+          params.set("t", String(Date.now()));
+          const resp = await fetch(buildApiUrl("r2_metrics", params));
+          const text = await resp.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(text);
+          } catch (_err) {
+            payload = null;
+          }
+          if (!resp.ok) {
+            const message =
+              (payload && (payload.error || payload.message)) ||
+              text ||
+              `Request failed (${resp.status})`;
+            throw new Error(message);
+          }
+          latestDashboardData.r2_usage = payload ? payload.r2_usage : null;
+          latestDashboardData.r2_usage_error = payload ? payload.r2_usage_error : null;
+          latestDashboardData.r2_backup_window = payload ? payload.r2_backup_window : null;
+          latestDashboardData.r2_backup_window_error = payload ? payload.r2_backup_window_error : null;
+          const nextPanel = renderDbSizePanel(
+            latestDashboardData.db_size_metrics,
+            latestDashboardData.db_size_metrics_error,
+            latestDashboardData.schema_size_metrics,
+            latestDashboardData.schema_size_metrics_error,
+            latestDashboardData.r2_domain_size_metrics,
+            latestDashboardData.r2_domain_size_metrics_error,
+            latestDashboardData.r2_usage,
+            latestDashboardData.r2_usage_error,
+            latestDashboardData.r2_backup_window,
+            latestDashboardData.r2_backup_window_error,
+          );
+          const currentPanel = dashboardEl.querySelector('[data-panel="db-size"]');
+          if (currentPanel) {
+            currentPanel.replaceWith(nextPanel);
+          } else {
+            dashboardEl.appendChild(nextPanel);
+          }
+          const generatedAt = (payload && payload.generated_at) || new Date().toISOString();
+          setStatus(`R2 metrics refreshed ${formatDateTimeLocalWithTimezone(generatedAt)}`);
+        } catch (err) {
+          setError(err.message || String(err));
+          setStatus("Error");
+        }
+      }
+
+      function renderDbSizePanel(
+        dbRows,
+        dbSourceError,
+        schemaRows,
+        schemaSourceError,
+        r2DomainRows,
+        r2DomainSourceError,
+        r2Usage,
+        r2Error,
+        r2BackupWindow,
+        r2BackupWindowError,
+      ) {
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.dataset.panel = "db-size";
+
+        const cutoffMs = Date.now() - dbSizePeriodHours * 60 * 60 * 1000;
+        const pointMap = new Map();
+        const oldestByLabel = new Map();
+        (Array.isArray(dbRows) ? dbRows : []).forEach((row) => {
+          let label = String((row && row.database_label) || "").toLowerCase().trim();
+          if (label === "obs_aqidb") {
+            label = "obs_aqidb";
+          }
+          if (label !== "ingestdb" && label !== "obs_aqidb") {
+            return;
+          }
+          const sampleTimestamp = row.recorded_at || row.bucket_hour;
+          const sampleMs = new Date(sampleTimestamp).getTime();
+          const oldestObservedAt = row.oldest_observed_at;
+          const oldestMs = new Date(oldestObservedAt || "").getTime();
+          if (!Number.isNaN(sampleMs) && !Number.isNaN(oldestMs)) {
+            const currentOldest = oldestByLabel.get(label);
+            if (!currentOldest || sampleMs >= currentOldest.sampleMs) {
+              oldestByLabel.set(label, {
+                sampleMs,
+                oldestObservedAt,
+              });
+            }
+          }
+          const timestamp = row.bucket_hour || row.recorded_at;
+          const ms = new Date(timestamp).getTime();
+          if (Number.isNaN(ms) || ms < cutoffMs) {
+            return;
+          }
+          const sizeBytes = asNumber(row.size_bytes);
+          if (sizeBytes === null || sizeBytes < 0) {
+            return;
+          }
+          const key = String(ms);
+          const point = pointMap.get(key) || { ms, ingestdb: null, obs_aqidb: null };
+          point[label] = sizeBytes / 1000000;
+          point[`${label}_oldest_observed_at`] = oldestObservedAt || null;
+          pointMap.set(key, point);
+        });
+
+        const schemaOldestByName = new Map();
+        (Array.isArray(schemaRows) ? schemaRows : []).forEach((row) => {
+          const schemaName = String((row && row.schema_name) || "").toLowerCase();
+          if (schemaName !== "uk_aq_observs" && schemaName !== "uk_aq_aqilevels") {
+            return;
+          }
+          const sampleTimestamp = (row && (row.recorded_at || row.bucket_hour)) || null;
+          const sampleMs = new Date(sampleTimestamp || "").getTime();
+          const oldestObservedAt = row && row.oldest_observed_at;
+          const oldestMs = new Date(oldestObservedAt || "").getTime();
+          if (Number.isNaN(sampleMs) || Number.isNaN(oldestMs)) {
+            return;
+          }
+          const current = schemaOldestByName.get(schemaName);
+          if (!current || sampleMs >= current.sampleMs) {
+            schemaOldestByName.set(schemaName, {
+              sampleMs,
+              oldestObservedAt,
+            });
+          }
+        });
+        const observsOldestDayLabel = formatDbOldestDayLabel(
+          (schemaOldestByName.get("uk_aq_observs") || {}).oldestObservedAt,
+        );
+        const aqilevelsOldestDayLabel = formatDbOldestDayLabel(
+          (schemaOldestByName.get("uk_aq_aqilevels") || {}).oldestObservedAt,
+        );
+        const ingestOldestDayLabel = formatDbOldestDayLabel(
+          (oldestByLabel.get("ingestdb") || {}).oldestObservedAt,
+        );
+
+        const points = Array.from(pointMap.values()).sort((a, b) => a.ms - b.ms);
+        const maxObservedMb = points.reduce((max, point) => {
+          const ingest = point.ingestdb === null ? 0 : Number(point.ingestdb);
+          const obsAqi = point.obs_aqidb === null ? 0 : Number(point.obs_aqidb);
+          return Math.max(max, ingest, obsAqi);
+        }, 0);
+        const yAxisMaxMb = DB_LINE_CHART_Y_MAX_MB;
+
+        let chartMarkup = `<div class="db-size-empty">No DB cluster size samples in the selected period.</div>`;
+        if (points.length > 0) {
+          const width = 960;
+          const height = 300;
+          const margin = { top: 16, right: 18, bottom: 36, left: 56 };
+          const innerWidth = width - margin.left - margin.right;
+          const innerHeight = height - margin.top - margin.bottom;
+
+          const minX = points[0].ms;
+          const maxX = points[points.length - 1].ms;
+          const spanX = Math.max(1, maxX - minX);
+          const xFor = (ms) => margin.left + ((ms - minX) / spanX) * innerWidth;
+          const yFor = (valueMb) => {
+            const capped = Math.max(0, Math.min(yAxisMaxMb, Number(valueMb)));
+            return margin.top + (1 - capped / yAxisMaxMb) * innerHeight;
+          };
+
+          const yTicks = buildYAxisTicks(yAxisMaxMb, 5);
+          const xTicks = [minX, minX + spanX / 2, maxX];
+
+          const ingestPath = buildDbPath(points, "ingestdb", xFor, yFor);
+          const obsAqiPath = buildDbPath(points, "obs_aqidb", xFor, yFor);
+          const ingestSinglePoint = getSingleSeriesPoint(points, "ingestdb");
+          const obsAqiSinglePoint = getSingleSeriesPoint(points, "obs_aqidb");
+          const ingestTooltipTargets = buildDbTooltipTargets(
+            points,
+            "ingestdb",
+            "Ingest DB cluster",
+            COLOR_INGEST_DB,
+            xFor,
+            yFor,
+          );
+          const obsAqiTooltipTargets = buildDbTooltipTargets(
+            points,
+            "obs_aqidb",
+            "Observs & AQI DB Cluster",
+            COLOR_OBSAQI_OBSERVS,
+            xFor,
+            yFor,
+          );
+
+          chartMarkup = `
+            <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Ingest and Observs/AQI DB cluster size trend">
+              ${yTicks
+                .map((tick) => {
+                  const y = yFor(tick);
+                  return `
+                    <line x1="${margin.left}" y1="${y}" x2="${width - margin.right}" y2="${y}" stroke="#e7dbc7" stroke-width="1" />
+                    <text x="${margin.left - 8}" y="${y + 4}" text-anchor="end" fill="#6b6255" font-size="11" font-family="IBM Plex Mono, ui-monospace, monospace">${formatMegabytes(tick)}</text>
+                  `;
+                })
+                .join("")}
+              <line x1="${margin.left}" y1="${height - margin.bottom}" x2="${width - margin.right}" y2="${height - margin.bottom}" stroke="#bfae91" stroke-width="1.3" />
+              ${xTicks
+                .map((tick, idx) => {
+                  const x = xFor(tick);
+                  const anchor = idx === 0 ? "start" : idx === xTicks.length - 1 ? "end" : "middle";
+                  return `
+                    <line x1="${x}" y1="${height - margin.bottom}" x2="${x}" y2="${height - margin.bottom + 5}" stroke="#bfae91" stroke-width="1" />
+                    <text x="${x}" y="${height - margin.bottom + 20}" text-anchor="${anchor}" fill="#6b6255" font-size="11" font-family="IBM Plex Mono, ui-monospace, monospace">${formatTime(tick)}</text>
+                  `;
+                })
+                .join("")}
+              ${ingestPath ? `<path d="${ingestPath}" fill="none" stroke="${COLOR_INGEST_DB}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" />` : ""}
+              ${obsAqiPath ? `<path d="${obsAqiPath}" fill="none" stroke="${COLOR_OBSAQI_OBSERVS}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" />` : ""}
+              ${ingestTooltipTargets}
+              ${obsAqiTooltipTargets}
+              ${ingestSinglePoint ? `<circle cx="${xFor(ingestSinglePoint.ms).toFixed(2)}" cy="${yFor(Number(ingestSinglePoint.ingestdb)).toFixed(2)}" r="3.5" fill="${COLOR_INGEST_DB}" />` : ""}
+              ${obsAqiSinglePoint ? `<circle cx="${xFor(obsAqiSinglePoint.ms).toFixed(2)}" cy="${yFor(Number(obsAqiSinglePoint.obs_aqidb)).toFixed(2)}" r="3.5" fill="${COLOR_OBSAQI_OBSERVS}" />` : ""}
+            </svg>
+          `;
+        }
+
+        const maxNote = maxObservedMb > yAxisMaxMb
+          ? `Line chart fixed at ${formatMegabytes(yAxisMaxMb)} MB (max observed ${formatMegabytes(maxObservedMb)} MB).`
+          : `Line chart fixed at ${formatMegabytes(yAxisMaxMb)} MB.`;
+
+        const renderStackedChart = ({
+          title,
+          points,
+          seriesDefs,
+          stackOrderKeys,
+          ariaLabel,
+          emptyLabel,
+        }) => {
+          if (!Array.isArray(points) || points.length === 0) {
+            return `
+              <div class="db-size-subchart">
+                <h3>${escapeHtml(title)}</h3>
+                <div class="db-size-chart-wrap">
+                  <div class="db-size-empty">${escapeHtml(emptyLabel)}</div>
+                </div>
+              </div>
+            `;
+          }
+
+          const width = 960;
+          const height = 260;
+          const margin = { top: 16, right: 18, bottom: 36, left: 56 };
+          const innerWidth = width - margin.left - margin.right;
+          const innerHeight = height - margin.top - margin.bottom;
+          const minX = points[0].ms;
+          const maxX = points[points.length - 1].ms;
+          const spanX = Math.max(1, maxX - minX);
+          const xFor = (ms) => margin.left + ((ms - minX) / spanX) * innerWidth;
+          const maxStack = points.reduce((max, point) => {
+            const total = seriesDefs.reduce((sum, series) => sum + Number(point[series.key] || 0), 0);
+            return Math.max(max, total);
+          }, 0);
+          const yMax = computeAxisMax(maxStack);
+          const yFor = (valueMb) => {
+            const capped = Math.max(0, Math.min(yMax, Number(valueMb)));
+            return margin.top + (1 - capped / yMax) * innerHeight;
+          };
+          const yTicks = buildYAxisTicks(yMax, 5);
+          const xTicks = [minX, minX + spanX / 2, maxX];
+          const stackedSeriesDefs = (() => {
+            const requestedOrder = Array.isArray(stackOrderKeys) ? stackOrderKeys : [];
+            const byKey = new Map(seriesDefs.map((series) => [series.key, series]));
+            const used = new Set();
+            const ordered = [];
+            requestedOrder.forEach((key) => {
+              const series = byKey.get(key);
+              if (series && !used.has(series.key)) {
+                ordered.push(series);
+                used.add(series.key);
+              }
+            });
+            seriesDefs.forEach((series) => {
+              if (!used.has(series.key)) {
+                ordered.push(series);
+                used.add(series.key);
+              }
+            });
+            return ordered;
+          })();
+
+          const paths = stackedSeriesDefs
+            .map((series, index) => {
+              const priorKeys = stackedSeriesDefs.slice(0, index).map((entry) => entry.key);
+              const path = buildStackedAreaPath(points, series.key, priorKeys, xFor, yFor);
+              if (!path) {
+                return "";
+              }
+              return `<path d="${path}" fill="${series.color}" fill-opacity="0.68" stroke="${series.color}" stroke-width="1.1" />`;
+            })
+            .join("");
+          const stackedTooltipTargets = buildStackedTooltipTargets(
+            points,
+            seriesDefs,
+            xFor,
+            margin.left,
+            width - margin.right,
+            margin.top,
+            height - margin.bottom,
+          );
+
+          return `
+            <div class="db-size-subchart">
+              <h3>${escapeHtml(title)}</h3>
+              <div class="db-size-chart-wrap">
+                <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(ariaLabel)}">
+                  ${yTicks
+                    .map((tick) => {
+                      const y = yFor(tick);
+                      return `
+                        <line x1="${margin.left}" y1="${y}" x2="${width - margin.right}" y2="${y}" stroke="#e7dbc7" stroke-width="1" />
+                        <text x="${margin.left - 8}" y="${y + 4}" text-anchor="end" fill="#6b6255" font-size="11" font-family="IBM Plex Mono, ui-monospace, monospace">${formatMegabytes(tick)}</text>
+                      `;
+                    })
+                    .join("")}
+                  <line x1="${margin.left}" y1="${height - margin.bottom}" x2="${width - margin.right}" y2="${height - margin.bottom}" stroke="#bfae91" stroke-width="1.3" />
+                  ${xTicks
+                    .map((tick, idx) => {
+                      const x = xFor(tick);
+                      const anchor = idx === 0 ? "start" : idx === xTicks.length - 1 ? "end" : "middle";
+                      return `
+                        <line x1="${x}" y1="${height - margin.bottom}" x2="${x}" y2="${height - margin.bottom + 5}" stroke="#bfae91" stroke-width="1" />
+                        <text x="${x}" y="${height - margin.bottom + 20}" text-anchor="${anchor}" fill="#6b6255" font-size="11" font-family="IBM Plex Mono, ui-monospace, monospace">${formatTime(tick)}</text>
+                      `;
+                    })
+                    .join("")}
+                  ${paths}
+                  ${stackedTooltipTargets}
+                </svg>
+                <div class="db-size-hover-tooltip" aria-hidden="true"></div>
+              </div>
+              <div class="db-size-sublegend">
+                ${seriesDefs
+                  .map((series) => `<span class="db-size-item-title"><span class="db-size-swatch" style="background:${series.color}"></span>${escapeHtml(series.label)}</span>`)
+                  .join("")}
+              </div>
+            </div>
+          `;
+        };
+
+        const schemaPoints = buildStackedMetricPoints(
+          schemaRows,
+          "schema_name",
+          ["uk_aq_observs", "uk_aq_aqilevels"],
+          cutoffMs,
+        );
+        const schemaChartMarkup = renderStackedChart({
+          title: "obs_aqidb schema sizes (MB)",
+          points: schemaPoints,
+          ariaLabel: "obs_aqidb schema size stacked area chart",
+          emptyLabel: "No schema size samples in the selected period.",
+          seriesDefs: [
+            { key: "uk_aq_observs", label: "uk_aq_observs", color: COLOR_OBSAQI_OBSERVS },
+            { key: "uk_aq_aqilevels", label: "uk_aq_aqilevels", color: COLOR_OBSAQI_AQILEVELS },
+          ],
+          stackOrderKeys: ["uk_aq_aqilevels", "uk_aq_observs"],
+        });
+
+        const r2DomainPoints = buildStackedMetricPoints(
+          r2DomainRows,
+          "domain_name",
+          ["observations", "aqilevels"],
+          cutoffMs,
+        );
+        const r2DomainChartMarkup = renderStackedChart({
+          title: "R2 History domain sizes (MB)",
+          points: r2DomainPoints,
+          ariaLabel: "R2 history domain size stacked area chart",
+          emptyLabel: "No R2 domain size samples in the selected period.",
+          seriesDefs: [
+            { key: "observations", label: "observations", color: COLOR_R2_OBSERVS },
+            { key: "aqilevels", label: "aqilevels", color: COLOR_R2_AQILEVELS },
+          ],
+          stackOrderKeys: ["aqilevels", "observations"],
+        });
+
+        const r2UsageObject = asObject(r2Usage);
+        const r2BackupWindowObject = asObject(r2BackupWindow);
+        const backupWindowMin = formatDateDdMmYyyy(
+          r2BackupWindowObject ? r2BackupWindowObject.min_day_utc : null,
+        ) || "--/--/----";
+        const backupWindowMax = formatDateDdMmYyyy(
+          r2BackupWindowObject ? r2BackupWindowObject.max_day_utc : null,
+        ) || "--/--/----";
+        const backupWindowMinDayMs = parseUtcDayMs(
+          r2BackupWindowObject ? r2BackupWindowObject.min_day_utc : null,
+        );
+        const backupWindowMaxDayMs = parseUtcDayMs(
+          r2BackupWindowObject ? r2BackupWindowObject.max_day_utc : null,
+        );
+        const backupWindowDayCountRaw = r2BackupWindowObject
+          ? Number(r2BackupWindowObject.day_count)
+          : NaN;
+        let backupWindowDays = Number.isFinite(backupWindowDayCountRaw)
+          ? Math.max(0, Math.trunc(backupWindowDayCountRaw))
+          : null;
+        let backupWindowYears = null;
+        if (backupWindowDays === null) {
+          if (
+            backupWindowMinDayMs !== null &&
+            backupWindowMaxDayMs !== null &&
+            backupWindowMaxDayMs >= backupWindowMinDayMs
+          ) {
+            backupWindowDays = Math.floor(
+              (backupWindowMaxDayMs - backupWindowMinDayMs) / (24 * 60 * 60 * 1000),
+            ) + 1;
+          }
+        }
+        if (backupWindowDays !== null) {
+          backupWindowYears = backupWindowDays / 365.25;
+        }
+        const backupWindowLabel = `CLOUDFLARE R2 HISTORY WINDOW - ${backupWindowMin} -> ${backupWindowMax} - ${backupWindowDays !== null ? backupWindowDays : "n/a"} Days - ${backupWindowYears !== null ? backupWindowYears.toFixed(1) : "n/a"} Years`;
+        const r2LimitsResetLabel = "Limits are per calendar month";
+        const r2Rows = [];
+        let r2LastUpdate = "n/a";
+        const addUsageRow = (title, summaryText, percentValue, subText, subRightText) => {
+          const fillPct = Math.min(100, Math.max(0, Number(percentValue)));
+          let subMarkup = "";
+          if (subText || subRightText) {
+            if (subRightText) {
+              subMarkup = `
+                <div class="r2-usage-sub r2-usage-sub-split">
+                  <span>${escapeHtml(subText || "")}</span>
+                  <span class="r2-usage-sub-right">${escapeHtml(String(subRightText))}</span>
+                </div>
+              `;
+            } else {
+              subMarkup = `<div class="r2-usage-sub">${escapeHtml(subText || "")}</div>`;
+            }
+          }
+          r2Rows.push(`
+            <div class="r2-usage-row">
+              <div class="r2-usage-head">
+                <span>${escapeHtml(title)}</span>
+                <span>${escapeHtml(summaryText)}</span>
+              </div>
+              <div class="r2-usage-bar" role="img" aria-label="${escapeHtml(title)} usage">
+                <div class="r2-usage-fill" style="width:${fillPct.toFixed(2)}%"></div>
+              </div>
+              ${subMarkup}
+            </div>
+          `);
+        };
+        const addUnavailableRow = (title, errorText) => {
+          const suffix = errorText ? `: ${String(errorText)}` : "";
+          r2Rows.push(`
+            <div class="r2-usage-row">
+              <div class="r2-usage-sub">${escapeHtml(`${title} unavailable${suffix}`)}</div>
+            </div>
+          `);
+        };
+        if (r2UsageObject) {
+          r2LastUpdate = formatDateTimeLocalWithTimezone(r2UsageObject.as_of_utc);
+
+          const usedGb = asNumber(r2UsageObject.standard_used_gb);
+          const usedBytes = asNumber(r2UsageObject.standard_used_bytes);
+          const freeTierGb = asNumber(r2UsageObject.free_tier_gb);
+          const storagePercent = asNumber(r2UsageObject.percent_of_free_tier);
+          const objects = asNumber(r2UsageObject.standard_objects);
+          if (usedGb !== null && freeTierGb !== null && storagePercent !== null) {
+            addUsageRow(
+              "R2 Standard free tier (storage)",
+              `${formatGigabytes(usedGb)} GB / ${formatGigabytes(freeTierGb)} GB (${Math.round(storagePercent)}%)`,
+              storagePercent,
+              objects !== null ? `Objects: ${formatCount(objects)}` : "",
+              usedBytes !== null ? `Size: ${formatBytesBestFit(usedBytes)}` : "",
+            );
+          } else {
+            addUnavailableRow("R2 Standard free tier (storage)", r2Error);
+          }
+
+          const classAUsed = asNumber(r2UsageObject.class_a_used_requests);
+          const classAFree = asNumber(r2UsageObject.class_a_free_tier_requests);
+          const classAPercent = asNumber(r2UsageObject.class_a_percent_of_free_tier);
+          if (classAUsed !== null && classAFree !== null && classAPercent !== null) {
+            addUsageRow(
+              "R2 Class A free tier",
+              `${formatCount(classAUsed)} / ${formatCount(classAFree)} (${Math.round(classAPercent)}%)`,
+              classAPercent,
+              "Write/list-multipart operations",
+            );
+          } else {
+            addUnavailableRow("R2 Class A free tier", r2UsageObject.class_ops_error);
+          }
+
+          const classBUsed = asNumber(r2UsageObject.class_b_used_requests);
+          const classBFree = asNumber(r2UsageObject.class_b_free_tier_requests);
+          const classBPercent = asNumber(r2UsageObject.class_b_percent_of_free_tier);
+          if (classBUsed !== null && classBFree !== null && classBPercent !== null) {
+            addUsageRow(
+              "R2 Class B free tier",
+              `${formatCount(classBUsed)} / ${formatCount(classBFree)} (${Math.round(classBPercent)}%)`,
+              classBPercent,
+              "Read operations",
+              r2LimitsResetLabel,
+            );
+          } else {
+            addUnavailableRow("R2 Class B free tier", r2UsageObject.class_ops_error);
+          }
+        } else {
+          addUnavailableRow("R2 usage", r2Error);
+        }
+        const r2UsageMarkup = `
+          <div class="r2-usage-wrap">
+            <div class="r2-window-heading">${escapeHtml(backupWindowLabel)}</div>
+            ${r2Rows.join("")}
+            <div class="r2-usage-meta">
+              <div class="r2-usage-sub">R2 Metrics updated every hour. Last update: ${escapeHtml(r2LastUpdate)}</div>
+              ${r2BackupWindowError ? `<div class="r2-usage-sub">Backup window source warning: ${escapeHtml(r2BackupWindowError)}</div>` : ""}
+              <button class="settings-button r2-refresh-button" id="refresh-r2-metrics" type="button">Refresh R2 metrics</button>
+            </div>
+          </div>
+        `;
+        const sourceWarnings = [];
+        if (dbSourceError) {
+          sourceWarnings.push(`DB metrics source warning: ${dbSourceError}`);
+        }
+        if (schemaSourceError) {
+          sourceWarnings.push(`Schema metrics source warning: ${schemaSourceError}`);
+        }
+        if (r2DomainSourceError) {
+          sourceWarnings.push(`R2 domain metrics source warning: ${r2DomainSourceError}`);
+        }
+        const sourceWarningMarkup = sourceWarnings
+          .map((message) => `<div class="footnote">${escapeHtml(message)}</div>`)
+          .join("");
+
+        panel.innerHTML = `
+          <h2 class="panel-heading">
+            <span>DB Cluster Size Trend</span>
+            <div class="dispatch-filters">
+              <label class="dispatch-filter" for="db-size-period-filter">
+                Time period
+                <select id="db-size-period-filter">
+                  ${DB_SIZE_PERIOD_OPTIONS
+                    .map((opt) => `<option value="${opt.value}" ${opt.value === dbSizePeriodHours ? "selected" : ""}>${opt.label}</option>`)
+                    .join("")}
+                </select>
+              </label>
+            </div>
+          </h2>
+          <div class="db-size-legend-row">
+            <div class="db-size-legend">
+              <span class="db-size-item">
+              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_INGEST_DB}"></span>Ingest DB Cluster</span>
+              <span class="db-size-item-min">${escapeHtml(ingestOldestDayLabel)}</span>
+            </span>
+            <span class="db-size-item">
+              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_OBSAQI_OBSERVS}"></span>Observs &amp; AQI DB Cluster</span>
+              <span class="db-size-item-min">uk_aq_observs ${escapeHtml(observsOldestDayLabel)}&nbsp;&nbsp;&nbsp;uk_aq_aqilevels ${escapeHtml(aqilevelsOldestDayLabel)}</span>
+            </span>
+            </div>
+            <strong class="db-size-timezone-note">Times in UTC</strong>
+          </div>
+          <div class="db-size-chart-wrap">${chartMarkup}<div class="db-size-hover-tooltip" aria-hidden="true"></div></div>
+          ${schemaChartMarkup}
+          ${r2DomainChartMarkup}
+          ${r2UsageMarkup}
+          ${sourceWarningMarkup}
+        `;
+
+        bindDbSizeTooltips(panel);
+        bindStackedDbSizeTooltips(panel);
+
+        const periodSelect = panel.querySelector("#db-size-period-filter");
+        if (periodSelect) {
+          periodSelect.addEventListener("change", (event) => {
+            const nextHours = Number(event.target.value);
+            if (
+              !Number.isFinite(nextHours) ||
+              !DB_SIZE_PERIOD_OPTIONS.some((opt) => opt.value === nextHours)
+            ) {
+              return;
+            }
+            dbSizePeriodHours = nextHours;
+            try {
+              localStorage.setItem(DB_SIZE_PERIOD_STORAGE_KEY, String(dbSizePeriodHours));
+            } catch (_err) {
+              // Ignore storage write issues.
+            }
+            loadDashboard();
+          });
+        }
+
+        const refreshR2Button = panel.querySelector("#refresh-r2-metrics");
+        if (refreshR2Button) {
+          refreshR2Button.addEventListener("click", () => {
+            refreshR2MetricsOnly();
+          });
+        }
+
+        return panel;
+      }
+
+      /**
+       * @typedef {Object} DayCoverage
+       * @property {string} date
+       * @property {boolean} ingest
+       * @property {boolean} obsAqiObservs
+       * @property {boolean} obsAqiAqilevels
+       * @property {boolean} r2Observs
+       * @property {boolean} r2Aqilevels
+       * @property {boolean=} isToday
+       */
+
+      function normalizeDayCoverageRows(rows) {
+        if (!Array.isArray(rows)) {
+          return [];
+        }
+        return rows
+          .map((row) => {
+            const dateObj = parseUtcDateKey(row && row.date);
+            if (!dateObj) {
+              return null;
+            }
+            const obsAqiObservs = row && row.obs_aqi_observs !== undefined
+              ? Boolean(row.obs_aqi_observs)
+              : Boolean(row && row.observs);
+            const obsAqiAqilevels = row && row.obs_aqi_aqilevels !== undefined
+              ? Boolean(row.obs_aqi_aqilevels)
+              : Boolean(row && row.aqilevels);
+            const r2Observs = row && row.r2_observs !== undefined
+              ? Boolean(row.r2_observs)
+              : Boolean(row && row.r2);
+            const r2Aqilevels = row && row.r2_aqilevels !== undefined
+              ? Boolean(row.r2_aqilevels)
+              : false;
+            const dropboxObservs = row && row.dropbox_observs !== undefined
+              ? Boolean(row.dropbox_observs)
+              : false;
+            const dropboxAqilevels = row && row.dropbox_aqilevels !== undefined
+              ? Boolean(row.dropbox_aqilevels)
+              : false;
+            const ingest = Boolean(row && row.ingest) && !r2Observs;
+            return {
+              date: toUtcDateKey(dateObj),
+              ingest,
+              obsAqiObservs,
+              obsAqiAqilevels,
+              r2Observs,
+              r2Aqilevels,
+              dropboxObservs,
+              dropboxAqilevels,
+              isToday: Boolean(row && row.isToday),
+            };
+          })
+          .filter(Boolean);
+      }
+
+      function resolveCoverageRowsForMonth(_monthStartUtc, serverCoverageRows) {
+        const normalizedRows = normalizeDayCoverageRows(serverCoverageRows);
+        return { rows: normalizedRows, source: "api" };
+      }
+
+      function buildCoverageCalendarCells(monthStartUtc, dayCoverageRows, includeTodayCoverage = false) {
+        const todayKey = toUtcDateKey(startOfUtcDay(new Date()));
+        const coverageByDate = new Map(
+          dayCoverageRows.map((row) => [row.date, row]),
+        );
+        const monthEndUtc = addUtcDays(addUtcMonths(monthStartUtc, 1), -1);
+        const leadingDays = (monthStartUtc.getUTCDay() + 6) % 7;
+        const trailingDays = 6 - ((monthEndUtc.getUTCDay() + 6) % 7);
+        const gridStartUtc = addUtcDays(monthStartUtc, -leadingDays);
+        const gridEndUtc = addUtcDays(monthEndUtc, trailingDays);
+
+        const cells = [];
+        for (
+          let cursor = new Date(gridStartUtc.getTime());
+          cursor <= gridEndUtc;
+          cursor = addUtcDays(cursor, 1)
+        ) {
+          const dateKey = toUtcDateKey(cursor);
+          const weekdayIndex = (cursor.getUTCDay() + 6) % 7;
+          const row = coverageByDate.get(dateKey) || {
+            date: dateKey,
+            ingest: false,
+            obsAqiObservs: false,
+            obsAqiAqilevels: false,
+            r2Observs: false,
+            r2Aqilevels: false,
+            dropboxObservs: false,
+            dropboxAqilevels: false,
+            isToday: dateKey === todayKey,
+          };
+          const isToday = Boolean(row.isToday) || dateKey === todayKey;
+          const showCoverage = includeTodayCoverage || !isToday;
+          cells.push({
+            date: new Date(cursor.getTime()),
+            dateKey,
+            isInMonth: sameUtcMonth(cursor, monthStartUtc),
+            dayNumber: cursor.getUTCDate(),
+            weekdayLabel: COVERAGE_WEEKDAY_NAMES[weekdayIndex],
+            coverage: {
+              date: row.date,
+              ingest: showCoverage && Boolean(row.ingest),
+              obsAqiObservs: showCoverage && Boolean(row.obsAqiObservs),
+              obsAqiAqilevels: showCoverage && Boolean(row.obsAqiAqilevels),
+              r2Observs: showCoverage && Boolean(row.r2Observs),
+              r2Aqilevels: showCoverage && Boolean(row.r2Aqilevels),
+              dropboxObservs: showCoverage && Boolean(row.dropboxObservs),
+              dropboxAqilevels: showCoverage && Boolean(row.dropboxAqilevels),
+              isToday,
+            },
+          });
+        }
+        return cells;
+      }
+
+      function summarizeCoverageSources(coverage) {
+        const sources = [];
+        if (coverage.ingest) {
+          sources.push("Ingest DB");
+        }
+        if (coverage.r2Observs) {
+          sources.push("R2 History - Obs");
+        }
+        if (coverage.r2Aqilevels) {
+          sources.push("R2 History - AQI");
+        }
+        if (coverage.obsAqiObservs) {
+          sources.push("ObsAQI DB - Obs");
+        }
+        if (coverage.obsAqiAqilevels) {
+          sources.push("ObsAQI DB - AQI");
+        }
+        if (coverage.dropboxObservs) {
+          sources.push("Backup - Obs");
+        }
+        if (coverage.dropboxAqilevels) {
+          sources.push("Backup - AQI");
+        }
+        return sources;
+      }
+
+      function resolveCoverageBarLayers(coverage) {
+        let topLayer = coverage.r2Observs
+          ? { key: "r2-observs", label: "R2 History - Obs", className: "coverage-bar-r2-observs", dropboxDomain: "observations" }
+          : coverage.dropboxObservs
+            ? {
+                key: "dropbox-observs",
+                label: "Backup - Obs",
+                className: "coverage-bar-dropbox-only-observs",
+                dropboxDomain: "observations",
+                dropboxOnly: true,
+                primaryDropboxIcon: true,
+              }
+          : coverage.ingest
+            ? { key: "ingest", label: "Ingest DB", className: "coverage-bar-ingest" }
+            : null;
+        let middleLayer = coverage.obsAqiObservs
+          ? { key: "obsaqi-observs", label: "ObsAQI DB - Obs", className: "coverage-bar-obsaqi-observs" }
+          : null;
+        let bottomLayer = null;
+        if (coverage.r2Aqilevels && coverage.obsAqiAqilevels) {
+          bottomLayer = {
+            key: "aqilevels-striped",
+            label: "R2 History - AQI + ObsAQI DB - AQI",
+            className: "coverage-bar-aqilevels-striped",
+            dropboxDomain: "both",
+            hideLabel: true,
+          };
+        } else if (coverage.r2Aqilevels) {
+          bottomLayer = {
+            key: "r2-aqilevels",
+            label: "R2 History - AQI",
+            className: "coverage-bar-r2-aqilevels",
+            dropboxDomain: "aqilevels",
+          };
+        } else if (coverage.dropboxAqilevels) {
+          bottomLayer = {
+            key: "dropbox-aqilevels",
+            label: "Backup - AQI",
+            className: "coverage-bar-dropbox-only-aqilevels",
+            dropboxDomain: "aqilevels",
+            dropboxOnly: true,
+            primaryDropboxIcon: true,
+          };
+        } else if (coverage.obsAqiAqilevels) {
+          bottomLayer = {
+            key: "obsaqi-aqilevels",
+            label: "ObsAQI DB - AQI",
+            className: "coverage-bar-obsaqi-aqilevels",
+          };
+        }
+        if (
+          !middleLayer &&
+          topLayer &&
+          (topLayer.key === "r2-observs" || topLayer.key === "dropbox-observs") &&
+          bottomLayer &&
+          (bottomLayer.key === "r2-aqilevels" || bottomLayer.key === "dropbox-aqilevels")
+        ) {
+          middleLayer = bottomLayer;
+          bottomLayer = null;
+        }
+        return { topLayer, middleLayer, bottomLayer };
+      }
+
+      function coverageLayerHasDropboxBackup(layer, coverage) {
+        if (!layer || !coverage || layer.dropboxOnly) {
+          return false;
+        }
+        if (layer.dropboxDomain === "observations") {
+          return Boolean(coverage.dropboxObservs);
+        }
+        if (layer.dropboxDomain === "aqilevels") {
+          return Boolean(coverage.dropboxAqilevels);
+        }
+        if (layer.dropboxDomain === "both") {
+          return Boolean(coverage.dropboxObservs) && Boolean(coverage.dropboxAqilevels);
+        }
+        return false;
+      }
+
+      function resolveCoverageSquareLayers(coverage) {
+        const slots = [null, null, null, null];
+        if (coverage.isToday) {
+          return slots;
+        }
+        if (coverage.ingest) {
+          slots[0] = { key: "ingest", label: "Ingest DB", className: "coverage-bar-ingest" };
+          if (coverage.obsAqiObservs) {
+            slots[2] = {
+              key: "obsaqi-observs-bottom",
+              label: "ObsAQI DB - Obs",
+              className: "coverage-bar-obsaqi-observs",
+            };
+          }
+          if (coverage.obsAqiAqilevels) {
+            slots[3] = {
+              key: "obsaqi-aqilevels-bottom",
+              label: "ObsAQI DB - AQI",
+              className: "coverage-bar-obsaqi-aqilevels",
+            };
+          }
+          return slots;
+        }
+        if (coverage.obsAqiObservs) {
+          slots[0] = {
+            key: "obsaqi-observs-top",
+            label: "ObsAQI DB - Obs",
+            className: "coverage-bar-obsaqi-observs",
+          };
+        }
+        if (coverage.obsAqiAqilevels) {
+          slots[1] = {
+            key: "obsaqi-aqilevels-top",
+            label: "ObsAQI DB - AQI",
+            className: "coverage-bar-obsaqi-aqilevels",
+          };
+        }
+        if (coverage.r2Observs) {
+          slots[2] = {
+            key: "r2-observs-bottom",
+            label: "R2 History - Obs",
+            className: "coverage-bar-r2-observs",
+            dropboxDomain: "observations",
+          };
+        } else if (coverage.dropboxObservs) {
+          slots[2] = {
+            key: "dropbox-observs-bottom",
+            label: "Backup - Obs",
+            className: "coverage-square-dropbox-only-observs",
+            dropboxDomain: "observations",
+            forceBackupIcon: true,
+          };
+        }
+        if (coverage.r2Aqilevels) {
+          slots[3] = {
+            key: "r2-aqilevels-bottom",
+            label: "R2 History - AQI",
+            className: "coverage-bar-r2-aqilevels",
+            dropboxDomain: "aqilevels",
+          };
+        } else if (coverage.dropboxAqilevels) {
+          slots[3] = {
+            key: "dropbox-aqilevels-bottom",
+            label: "Backup - AQI",
+            className: "coverage-square-dropbox-only-aqilevels",
+            dropboxDomain: "aqilevels",
+            forceBackupIcon: true,
+          };
+        }
+        return slots;
+      }
+
+      function formatCoverageDayTooltip(cell) {
+        const cellSources = summarizeCoverageSources(cell.coverage);
+        if (cell.coverage.isToday && !cellSources.length) {
+          return `${cell.dateKey} • Today excluded (complete days only)`;
+        }
+        if (!cellSources.length) {
+          return `${cell.dateKey} • No data in storage layers`;
+        }
+        return `${cell.dateKey} • Sources: ${cellSources.join(", ")}`;
+      }
+
+      function renderCoverageYearGrid(yearStartUtc, dayCoverageRows) {
+        const monthMarkup = Array.from({ length: 12 }, (_, monthOffset) => {
+          const monthStartUtc = addUtcMonths(yearStartUtc, monthOffset);
+          const monthCells = buildCoverageCalendarCells(monthStartUtc, dayCoverageRows);
+          const weekdayMarkup = COVERAGE_WEEKDAY_ABBREVIATIONS
+            .map((weekdayLabel) => `<span class="coverage-year-weekday">${weekdayLabel}</span>`)
+            .join("");
+          const dayMarkup = monthCells
+            .map((cell) => {
+              const outsideClass = cell.isInMonth ? "" : " is-outside";
+              const todayClass = cell.coverage.isToday ? " is-today" : "";
+              const slotLayers = cell.isInMonth
+                ? resolveCoverageSquareLayers(cell.coverage)
+                : [null, null, null, null];
+              const squaresMarkup = slotLayers
+                .map((layer) => {
+                  if (!layer) {
+                    return '<span class="coverage-square is-empty"></span>';
+                  }
+                  const hasBackupIcon = layer.forceBackupIcon || coverageLayerHasDropboxBackup(layer, cell.coverage);
+                  const backupClass = hasBackupIcon ? " has-backup-icon" : "";
+                  const squareTitle = hasBackupIcon ? `${layer.label} • Backup` : layer.label;
+                  return `<span class="coverage-square ${layer.className}${backupClass}" title="${escapeHtml(squareTitle)}"></span>`;
+                })
+                .join("");
+              return `
+                <div class="coverage-year-day${outsideClass}${todayClass}" title="${escapeHtml(formatCoverageDayTooltip(cell))}">
+                  <div class="coverage-square-grid">${squaresMarkup}</div>
+                </div>
+              `;
+            })
+            .join("");
+          return `
+            <section class="coverage-year-month">
+              <h3 class="coverage-year-month-title">${escapeHtml(formatCoverageMonthShortTitle(monthStartUtc))}</h3>
+              <div class="coverage-year-weekdays">${weekdayMarkup}</div>
+              <div class="coverage-year-days">${dayMarkup}</div>
+            </section>
+          `;
+        }).join("");
+        return `<div class="coverage-year-grid">${monthMarkup}</div>`;
+      }
+
+      function formatR2CountAxisValue(value) {
+        if (value === null || value === undefined || Number.isNaN(Number(value))) {
+          return "n/a";
+        }
+        const numeric = Number(value);
+        const abs = Math.abs(numeric);
+        if (abs >= 1000) {
+          return formatCompactCount(numeric);
+        }
+        if (abs >= 100) {
+          return Math.round(numeric).toLocaleString();
+        }
+        if (abs >= 10) {
+          return numeric.toFixed(0);
+        }
+        return numeric.toFixed(1);
+      }
+
+      function buildR2ConnectorCountsRequest(monthStartUtc, isYearMode) {
+        if (isYearMode) {
+          const yearStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
+          const yearEndUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 11, 31, 0, 0, 0, 0));
+          const fromDay = toUtcDateKey(yearStartUtc);
+          const toDay = toUtcDateKey(yearEndUtc);
+          return {
+            requestKey: `month:${fromDay}:${toDay}`,
+            fromDay,
+            toDay,
+            grain: "month",
+          };
+        }
+        const fromDay = toUtcDateKey(monthStartUtc);
+        const toDay = toUtcDateKey(addUtcDays(addUtcMonths(monthStartUtc, 1), -1));
+        return {
+          requestKey: `day:${fromDay}:${toDay}`,
+          fromDay,
+          toDay,
+          grain: "day",
+        };
+      }
+
+      function findR2ConnectorCountsEntry(payload, connectorId) {
+        if (!payload || !Array.isArray(payload.connectors)) {
+          return null;
+        }
+        return payload.connectors.find((entry) => Number(entry.connector_id) === Number(connectorId)) || null;
+      }
+
+      function resolveR2ConnectorChartConfigs(payload) {
+        const seen = new Set();
+        const resolved = [];
+        R2_CONNECTOR_CHARTS.forEach((entry) => {
+          seen.add(entry.connectorId);
+          resolved.push(entry);
+        });
+        const payloadIds = Array.isArray(payload?.connectors)
+          ? payload.connectors
+            .map((entry) => Number(entry && entry.connector_id))
+            .filter((value) => Number.isFinite(value) && value > 0)
+            .sort((a, b) => a - b)
+          : [];
+        payloadIds.forEach((connectorId) => {
+          if (seen.has(connectorId)) {
+            return;
+          }
+          seen.add(connectorId);
+          resolved.push({
+            connectorId,
+            title: `Connector ${connectorId}`,
+            observsColor: "#4B443A",
+            aqiColor: "#A08D74",
+          });
+        });
+        return resolved;
+      }
+
+      function buildEmptyConnectorBuckets(request) {
+        const buckets = [];
+        let cursorDay = request.fromDay;
+        while (cursorDay && cursorDay <= request.toDay) {
+          const bucketKey = request.grain === "month" ? cursorDay.slice(0, 7) : cursorDay;
+          const current = buckets[buckets.length - 1];
+          if (current && current.bucket_key === bucketKey) {
+            current.bucket_end_day_utc = cursorDay;
+            current.calendar_day_count += 1;
+          } else {
+            buckets.push({
+              bucket_key: bucketKey,
+              bucket_start_day_utc: cursorDay,
+              bucket_end_day_utc: cursorDay,
+              calendar_day_count: 1,
+              observations_rows: 0,
+              observations_present_days: 0,
+              observations_avg_rows_per_day: 0,
+              aqilevels_rows: 0,
+              aqilevels_present_days: 0,
+              aqilevels_avg_rows_per_day: 0,
+              total_rows: 0,
+              total_avg_rows_per_day: 0,
+            });
+          }
+          cursorDay = addUtcDays(parseUtcDateKey(cursorDay), 1);
+          cursorDay = cursorDay ? toUtcDateKey(cursorDay) : null;
+        }
+        return buckets;
+      }
+
+      function normalizeR2ConnectorBuckets(entry, request) {
+        const buckets = Array.isArray(entry?.buckets) ? entry.buckets : [];
+        if (buckets.length > 0) {
+          return buckets;
+        }
+        return buildEmptyConnectorBuckets(request);
+      }
+
+      function buildR2ConnectorBucketTooltip(config, bucket, isYearMode) {
+        const obsRows = Number(bucket?.observations_rows || 0);
+        const aqiRows = Number(bucket?.aqilevels_rows || 0);
+        const totalRows = obsRows + aqiRows;
+        const periodLabel = isYearMode
+          ? formatMonthYearLabel(bucket?.bucket_start_day_utc)
+          : (formatDateDdMmYyyy(bucket?.bucket_start_day_utc) || String(bucket?.bucket_start_day_utc || ""));
+        if (isYearMode) {
+          return [
+            config.title,
+            periodLabel,
+            `Obs avg/day: ${formatRowRate(bucket?.observations_avg_rows_per_day || 0)}`,
+            `AQI avg/day: ${formatRowRate(bucket?.aqilevels_avg_rows_per_day || 0)}`,
+            `Obs rows: ${formatCount(obsRows)}`,
+            `AQI rows: ${formatCount(aqiRows)}`,
+            `Total rows: ${formatCount(totalRows)}`,
+            `Calendar days: ${formatCount(bucket?.calendar_day_count || 0)}`,
+          ].join("\n");
+        }
+        return [
+          config.title,
+          periodLabel,
+          `Obs rows: ${formatCount(obsRows)}`,
+          `AQI rows: ${formatCount(aqiRows)}`,
+          `Total rows: ${formatCount(totalRows)}`,
+        ].join("\n");
+      }
+
+      function buildR2ConnectorChartSvg({ connectorConfig, entry, request, isYearMode }) {
+        const buckets = normalizeR2ConnectorBuckets(entry, request);
+        const displayMode = r2ConnectorCountsMode;
+        const width = 960;
+        const height = 210;
+        const margin = { top: 10, right: 10, bottom: 28, left: 44 };
+        const innerWidth = width - margin.left - margin.right;
+        const innerHeight = height - margin.top - margin.bottom;
+        const baselineY = height - margin.bottom;
+        const bucketCount = Math.max(1, buckets.length);
+        const stepX = innerWidth / bucketCount;
+        const barWidth = Math.max(1.5, stepX * 0.72);
+
+        const seriesValues = buckets.map((bucket) => {
+          const obsValue = isYearMode
+            ? Number(bucket?.observations_avg_rows_per_day || 0)
+            : Number(bucket?.observations_rows || 0);
+          const aqiValue = isYearMode
+            ? Number(bucket?.aqilevels_avg_rows_per_day || 0)
+            : Number(bucket?.aqilevels_rows || 0);
+          return {
+            observations: obsValue,
+            aqilevels: aqiValue,
+            total: obsValue + aqiValue,
+          };
+        });
+        const maxValue = seriesValues.reduce((max, value) => {
+          if (displayMode === "observs") {
+            return Math.max(max, value.observations);
+          }
+          if (displayMode === "aqi") {
+            return Math.max(max, value.aqilevels);
+          }
+          return Math.max(max, value.total);
+        }, 0);
+
+        if (maxValue <= 0) {
+          return `<div class="coverage-connector-chart-empty">No R2 rows in the selected period.</div>`;
+        }
+
+        const yMax = computeAxisMax(maxValue);
+        const yFor = (value) => margin.top + (1 - (Number(value) || 0) / yMax) * innerHeight;
+        const yTicks = buildYAxisTicks(yMax, 4);
+
+        const barsMarkup = buckets.map((bucket, index) => {
+          const x = margin.left + index * stepX + (stepX - barWidth) / 2;
+          const obsValue = seriesValues[index].observations;
+          const aqiValue = seriesValues[index].aqilevels;
+          const tooltip = escapeHtml(buildR2ConnectorBucketTooltip(connectorConfig, bucket, isYearMode));
+
+          if (displayMode === "observs" || displayMode === "aqi") {
+            const value = displayMode === "observs" ? obsValue : aqiValue;
+            const y = yFor(value);
+            const barHeight = Math.max(0, baselineY - y);
+            const color = displayMode === "observs"
+              ? connectorConfig.observsColor
+              : connectorConfig.aqiColor;
+            return `
+              <g>
+                <title>${tooltip}</title>
+                <rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${barHeight.toFixed(2)}" rx="3" fill="${color}" />
+              </g>
+            `;
+          }
+
+          const aqiTopY = yFor(aqiValue);
+          const totalTopY = yFor(aqiValue + obsValue);
+          const aqiHeight = Math.max(0, baselineY - aqiTopY);
+          const obsHeight = Math.max(0, aqiTopY - totalTopY);
+          return `
+            <g>
+              <title>${tooltip}</title>
+              <rect x="${x.toFixed(2)}" y="${aqiTopY.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${aqiHeight.toFixed(2)}" rx="3" fill="${connectorConfig.aqiColor}" />
+              <rect x="${x.toFixed(2)}" y="${totalTopY.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${obsHeight.toFixed(2)}" rx="3" fill="${connectorConfig.observsColor}" />
+            </g>
+          `;
+        }).join("");
+
+        const xLabelsMarkup = buckets.map((bucket, index) => {
+          const x = margin.left + index * stepX + stepX / 2;
+          const label = isYearMode
+            ? formatMonthShortLabel(bucket?.bucket_start_day_utc)
+            : String((bucket?.bucket_start_day_utc || "").slice(-2)).replace(/^0/, "");
+          return `
+            <text x="${x.toFixed(2)}" y="${height - 8}" text-anchor="middle" fill="#6b6255" font-size="10" font-family="IBM Plex Mono, ui-monospace, monospace">${escapeHtml(label)}</text>
+          `;
+        }).join("");
+
+        return `
+          <svg class="coverage-connector-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(connectorConfig.title)} R2 connector row counts">
+            ${yTicks.map((tick) => {
+              const y = yFor(tick);
+              return `
+                <line x1="${margin.left}" y1="${y.toFixed(2)}" x2="${width - margin.right}" y2="${y.toFixed(2)}" stroke="#e8ddcd" stroke-width="1" />
+                <text x="${margin.left - 6}" y="${(y + 4).toFixed(2)}" text-anchor="end" fill="#6b6255" font-size="10" font-family="IBM Plex Mono, ui-monospace, monospace">${escapeHtml(formatR2CountAxisValue(tick))}</text>
+              `;
+            }).join("")}
+            <line x1="${margin.left}" y1="${baselineY}" x2="${width - margin.right}" y2="${baselineY}" stroke="#bfae91" stroke-width="1.2" />
+            ${barsMarkup}
+            ${xLabelsMarkup}
+          </svg>
+        `;
+      }
+
+      function renderR2ConnectorCountsBody(container, request, isYearMode, payload, errorMessage = "", isLoading = false) {
+        const chartConfigs = resolveR2ConnectorChartConfigs(payload);
+        const sectionTitle = "R2 connector row counts";
+        const toggleMarkup = Array.from(R2_CONNECTOR_COUNTS_MODE_VALUES).map((mode) => {
+          const active = mode === r2ConnectorCountsMode;
+          const label = mode === "stacked" ? "Stacked" : mode === "observs" ? "Observs" : "AQI";
+          return `
+            <button
+              type="button"
+              class="coverage-calendar-view-btn${active ? " is-active" : ""}"
+              data-action="r2-counts-mode"
+              data-mode="${mode}"
+              ${active ? "disabled aria-pressed=\"true\"" : "aria-pressed=\"false\""}
+            >${label}</button>
+          `;
+        }).join("");
+
+        let bodyMarkup = `<div class="coverage-connector-chart-empty">Loading R2 connector counts...</div>`;
+        if (errorMessage) {
+          bodyMarkup = `<div class="coverage-connector-chart-empty">Failed to load R2 connector counts: ${escapeHtml(errorMessage)}</div>`;
+        } else if (!isLoading) {
+          const cardsMarkup = chartConfigs.map((config) => {
+            const entry = findR2ConnectorCountsEntry(payload, config.connectorId);
+            const chartTitle = `${config.title} - Connector Id ${config.connectorId}`;
+            const svgMarkup = buildR2ConnectorChartSvg({
+              connectorConfig: config,
+              entry,
+              request,
+              isYearMode,
+            });
+            return `
+              <article class="coverage-connector-chart-card">
+                <div class="coverage-connector-chart-head">
+                  <h3>${escapeHtml(chartTitle)}</h3>
+                  <div class="coverage-connector-chart-legend">
+                    <span><span class="coverage-connector-chart-swatch" style="background:${config.observsColor}"></span>Observs</span>
+                    <span><span class="coverage-connector-chart-swatch" style="background:${config.aqiColor}"></span>AQI</span>
+                  </div>
+                </div>
+                <div class="coverage-connector-chart-wrap">${svgMarkup}</div>
+              </article>
+            `;
+          }).join("");
+          bodyMarkup = `<div class="coverage-connector-chart-grid">${cardsMarkup}</div>`;
+        }
+
+        const subtitle = isYearMode
+          ? "Year view shows monthly average rows per day. Stacked mode places AQI on the bottom and Observs on the top."
+          : "Month view shows daily row totals. Stacked mode places AQI on the bottom and Observs on the top.";
+
+        container.innerHTML = `
+          <div class="coverage-connector-counts-head">
+            <h3 class="coverage-connector-counts-title">${escapeHtml(sectionTitle)}</h3>
+            <div class="coverage-calendar-view">
+              <span class="coverage-calendar-view-label">Series</span>
+              <span class="coverage-calendar-view-toggle" role="group" aria-label="R2 connector count display mode">
+                ${toggleMarkup}
+              </span>
+            </div>
+          </div>
+          <div class="coverage-connector-counts-note">${escapeHtml(subtitle)}</div>
+          ${bodyMarkup}
+        `;
+
+        const modeButtons = Array.from(container.querySelectorAll('[data-action="r2-counts-mode"]'));
+        modeButtons.forEach((button) => {
+          button.addEventListener("click", () => {
+            const requestedMode = String(button.dataset.mode || "");
+            if (!R2_CONNECTOR_COUNTS_MODE_VALUES.has(requestedMode) || requestedMode === r2ConnectorCountsMode) {
+              return;
+            }
+            r2ConnectorCountsMode = requestedMode;
+            try {
+              localStorage.setItem(R2_CONNECTOR_COUNTS_MODE_STORAGE_KEY, r2ConnectorCountsMode);
+            } catch (_err) {
+              // Ignore localStorage write failures.
+            }
+            const cachedPayload = latestR2ConnectorCounts && latestR2ConnectorCounts.requestKey === request.requestKey
+              ? latestR2ConnectorCounts.payload
+              : payload;
+            renderR2ConnectorCountsBody(
+              container,
+              request,
+              isYearMode,
+              cachedPayload,
+              errorMessage,
+              isLoading,
+            );
+          });
+        });
+      }
+
+      async function loadR2ConnectorCounts(container, { monthStartUtc, isYearMode, forceRefresh = false }) {
+        const requestId = ++r2ConnectorCountsLoadSequence;
+        const request = buildR2ConnectorCountsRequest(monthStartUtc, isYearMode);
+        container.dataset.requestKey = request.requestKey;
+        const cached = !forceRefresh
+          && latestR2ConnectorCounts
+          && latestR2ConnectorCounts.requestKey === request.requestKey
+          && Number.isFinite(Number(latestR2ConnectorCounts.fetchedAtMs))
+          && (Date.now() - Number(latestR2ConnectorCounts.fetchedAtMs)) < R2_CONNECTOR_COUNTS_CACHE_TTL_MS
+          ? latestR2ConnectorCounts.payload
+          : null;
+        if (cached) {
+          renderR2ConnectorCountsBody(container, request, isYearMode, cached);
+          return;
+        }
+
+        renderR2ConnectorCountsBody(container, request, isYearMode, null, "", true);
+        try {
+          const params = new URLSearchParams({
+            from_day: request.fromDay,
+            to_day: request.toDay,
+            grain: request.grain,
+            t: String(Date.now()),
+          });
+          const resp = await fetch(buildApiUrl("r2_connector_counts", params));
+          const text = await resp.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(text);
+          } catch (_err) {
+            payload = null;
+          }
+          if (!resp.ok) {
+            const message =
+              (payload && (payload.error || payload.message)) ||
+              text ||
+              `Request failed (${resp.status})`;
+            throw new Error(message);
+          }
+          if (requestId !== r2ConnectorCountsLoadSequence) {
+            return;
+          }
+          if (!document.body.contains(container) || container.dataset.requestKey !== request.requestKey) {
+            return;
+          }
+          latestR2ConnectorCounts = {
+            requestKey: request.requestKey,
+            payload,
+            fetchedAtMs: Date.now(),
+          };
+          renderR2ConnectorCountsBody(container, request, isYearMode, payload);
+          if (String(errorEl.textContent || "").startsWith(R2_CONNECTOR_COUNTS_ERROR_PREFIX)) {
+            setError("");
+          }
+        } catch (error) {
+          if (requestId !== r2ConnectorCountsLoadSequence) {
+            return;
+          }
+          if (!document.body.contains(container) || container.dataset.requestKey !== request.requestKey) {
+            return;
+          }
+          const message = error && error.message ? error.message : String(error);
+          renderR2ConnectorCountsBody(container, request, isYearMode, null, message, false);
+          setError(`${R2_CONNECTOR_COUNTS_ERROR_PREFIX} ${message}`);
+        }
+      }
+
+      function renderStorageCoverageCalendarPanel(serverCoverageRows, options = {}) {
+        const forceConnectorCountsRefresh = Boolean(options.forceConnectorCountsRefresh);
+        const monthStartUtc = storageCoverageMonthCursor || startOfUtcMonth(new Date());
+        const resolved = resolveCoverageRowsForMonth(monthStartUtc, serverCoverageRows);
+        const panel = document.createElement("section");
+        panel.className = "panel coverage-calendar-panel";
+        panel.dataset.panel = "storage-coverage";
+        const isYearMode = storageCoverageMode === "year";
+        const navStepMonths = isYearMode ? 12 : 1;
+        const titleText = isYearMode
+          ? formatCoverageYearTitle(monthStartUtc)
+          : formatCoverageMonthTitle(monthStartUtc);
+        const previousLabel = isYearMode ? "&lt; Previous Year" : "&lt; Previous";
+        const nextLabel = isYearMode ? "Next Year &gt;" : "Next &gt;";
+
+        let bodyMarkup = "";
+        let footnoteText = "";
+        if (isYearMode) {
+          const yearStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
+          bodyMarkup = renderCoverageYearGrid(yearStartUtc, resolved.rows);
+          footnoteText = "Squares only and complete days only (today excluded). With ingest: red top-left and blue/green on the bottom row. Without ingest: blue/green on top row and R2 orange/yellow on bottom row. Dropbox-only backup days render as white squares with orange/yellow borders and a blue Dropbox icon.";
+        } else {
+          const calendarCells = buildCoverageCalendarCells(monthStartUtc, resolved.rows, true);
+          const cellsMarkup = calendarCells
+            .map((cell) => {
+              const { topLayer, middleLayer, bottomLayer } = resolveCoverageBarLayers(cell.coverage);
+              const outsideClass = cell.isInMonth ? "" : " is-outside";
+              const todayClass = cell.coverage.isToday ? " is-today" : "";
+              const dayTooltip = formatCoverageDayTooltip(cell);
+
+              const renderBar = (layer) => {
+                if (!layer) return "";
+                const isToday = cell.coverage.isToday;
+                const halfClass = isToday ? " is-half" : "";
+                const hasDropboxBackup = !isToday && coverageLayerHasDropboxBackup(layer, cell.coverage);
+                const backupBadgeMarkup = hasDropboxBackup
+                  ? `<span class="coverage-bar-label-secondary is-dropbox-badge"><img class="coverage-bar-label-secondary-icon is-dropbox-blue" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true">Backup</span>`
+                  : "";
+                const primaryLabelMarkup = layer.primaryDropboxIcon
+                  ? `<span class="coverage-bar-label-primary with-icon"><img class="coverage-bar-label-primary-icon" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true"><span class="coverage-bar-label-primary-text">${escapeHtml(layer.label)}</span></span>`
+                  : `<span class="coverage-bar-label-primary">${escapeHtml(layer.label)}</span>`;
+                let labelMarkup = "";
+                if (!isToday && layer.hideLabel && backupBadgeMarkup) {
+                  labelMarkup = `<span class="coverage-bar-label">${backupBadgeMarkup}</span>`;
+                } else if (!isToday && !layer.hideLabel && layer.label) {
+                  labelMarkup = `<span class="coverage-bar-label${hasDropboxBackup ? " has-secondary" : ""}">${primaryLabelMarkup}${backupBadgeMarkup}</span>`;
+                }
+                return `<span class="coverage-bar ${layer.className}${halfClass}" title="${escapeHtml(layer.label)}">${labelMarkup}</span>`;
+              };
+
+              return `
+                <div class="coverage-day-cell${outsideClass}${todayClass}" title="${escapeHtml(dayTooltip)}">
+                  <div class="coverage-day-title">
+                    <span class="coverage-day-number">${cell.dayNumber}</span>
+                    <span class="coverage-day-weekday">${escapeHtml(cell.weekdayLabel)}</span>
+                  </div>
+                  <div class="coverage-bars">
+                    <div class="coverage-bar-slot">${renderBar(topLayer)}</div>
+                    <div class="coverage-bar-slot">${renderBar(middleLayer)}</div>
+                    <div class="coverage-bar-slot">${renderBar(bottomLayer)}</div>
+                  </div>
+                </div>
+              `;
+            })
+            .join("");
+          bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
+          footnoteText = "Top: Ingest DB (red), R2 History - Obs (orange), or Dropbox-only Backup - Obs (white with orange border). Middle: ObsAQI DB - Obs (blue). Bottom: AQI (yellow/green, striped when both R2 + ObsAQI are present) or Dropbox-only Backup - AQI (white with yellow border). R2 bars with Dropbox copy show a second line (blue Dropbox icon + Backup). Today shows half-width bars.";
+        }
+
+        panel.innerHTML = `
+          <div class="coverage-calendar-head">
+            <h2 class="coverage-calendar-title">${escapeHtml(titleText)}</h2>
+            <div class="coverage-calendar-nav">
+              <span class="coverage-calendar-view">
+                <span class="coverage-calendar-view-label">View</span>
+                <span class="coverage-calendar-view-toggle" role="group" aria-label="Coverage calendar view">
+                  <button
+                    type="button"
+                    class="coverage-calendar-view-btn${isYearMode ? " is-active" : ""}"
+                    data-action="coverage-mode"
+                    data-mode="year"
+                    ${isYearMode ? "disabled aria-pressed=\"true\"" : "aria-pressed=\"false\""}
+                  >Year</button>
+                  <button
+                    type="button"
+                    class="coverage-calendar-view-btn${isYearMode ? "" : " is-active"}"
+                    data-action="coverage-mode"
+                    data-mode="month"
+                    ${isYearMode ? "aria-pressed=\"false\"" : "disabled aria-pressed=\"true\""}
+                  >Month</button>
+                </span>
+              </span>
+              <button type="button" class="coverage-calendar-nav-btn" data-action="today-period">Today</button>
+              <button type="button" class="settings-button r2-refresh-button" data-action="force-refresh">Force Refresh</button>
+              <button type="button" class="coverage-calendar-nav-btn" data-action="prev-period">${previousLabel}</button>
+              <button type="button" class="coverage-calendar-nav-btn" data-action="next-period">${nextLabel}</button>
+            </div>
+          </div>
+          ${bodyMarkup}
+          <div class="footnote">${escapeHtml(footnoteText)}</div>
+          <div class="coverage-connector-counts-section" data-role="r2-connector-counts"></div>
+        `;
+
+        const handlePeriodChange = (monthDelta) => {
+          storageCoverageMonthCursor = addUtcMonths(monthStartUtc, monthDelta);
+          try {
+            localStorage.setItem(
+              STORAGE_COVERAGE_MONTH_STORAGE_KEY,
+              formatCoverageMonthStorageKey(storageCoverageMonthCursor),
+            );
+          } catch (_err) {
+            // Ignore localStorage write failures.
+          }
+          const nextPanel = renderStorageCoverageCalendarPanel(serverCoverageRows);
+          panel.replaceWith(nextPanel);
+        };
+
+        const forceRefreshButton = panel.querySelector('[data-action="force-refresh"]');
+        const todayButton = panel.querySelector('[data-action="today-period"]');
+        const prevButton = panel.querySelector('[data-action="prev-period"]');
+        const nextButton = panel.querySelector('[data-action="next-period"]');
+        const modeButtons = Array.from(panel.querySelectorAll('[data-action="coverage-mode"]'));
+        if (forceRefreshButton) {
+          forceRefreshButton.addEventListener("click", async () => {
+            forceRefreshButton.disabled = true;
+            forceRefreshButton.textContent = "Force Refreshing...";
+            try {
+              await loadDashboard({ forceRefresh: true });
+            } finally {
+              if (document.body.contains(forceRefreshButton)) {
+                forceRefreshButton.disabled = false;
+                forceRefreshButton.textContent = "Force Refresh";
+              }
+            }
+          });
+        }
+        if (todayButton) {
+          todayButton.addEventListener("click", () => {
+            const now = new Date();
+            storageCoverageMonthCursor = isYearMode
+              ? new Date(Date.UTC(now.getUTCFullYear(), 0, 1, 0, 0, 0, 0))
+              : startOfUtcMonth(now);
+            try {
+              localStorage.setItem(
+                STORAGE_COVERAGE_MONTH_STORAGE_KEY,
+                formatCoverageMonthStorageKey(storageCoverageMonthCursor),
+              );
+            } catch (_err) {
+              // Ignore localStorage write failures.
+            }
+            const nextPanel = renderStorageCoverageCalendarPanel(serverCoverageRows);
+            panel.replaceWith(nextPanel);
+          });
+        }
+        if (prevButton) {
+          prevButton.addEventListener("click", () => handlePeriodChange(-1 * navStepMonths));
+        }
+        if (nextButton) {
+          nextButton.addEventListener("click", () => handlePeriodChange(1 * navStepMonths));
+        }
+        if (modeButtons.length > 0) {
+          modeButtons.forEach((modeButton) => {
+            modeButton.addEventListener("click", () => {
+              const requestedMode = String(modeButton.dataset.mode || "");
+              if (!STORAGE_COVERAGE_MODE_VALUES.has(requestedMode)) {
+                return;
+              }
+              if (requestedMode === storageCoverageMode) {
+                return;
+              }
+              storageCoverageMode = requestedMode;
+              try {
+                localStorage.setItem(STORAGE_COVERAGE_MODE_STORAGE_KEY, storageCoverageMode);
+              } catch (_err) {
+                // Ignore localStorage write failures.
+              }
+              const nextPanel = renderStorageCoverageCalendarPanel(serverCoverageRows);
+              panel.replaceWith(nextPanel);
+            });
+          });
+        }
+
+        const connectorCountsContainer = panel.querySelector('[data-role="r2-connector-counts"]');
+        if (connectorCountsContainer) {
+          void loadR2ConnectorCounts(connectorCountsContainer, {
+            monthStartUtc,
+            isYearMode,
+            forceRefresh: forceConnectorCountsRefresh,
+          });
+        }
+
+        return panel;
+      }
+
+      function renderConnectorSettingsPanel(connectors) {
+        const schedulerBackendAllowlist = new Set(["uk_air_sos", "sensorcommunity", "breathelondon", "openaq"]);
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.innerHTML = `
+          <h2>Polling settings <span class="chip">i</span></h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Connector</th>
+                <th>Poll enabled</th>
+                <th>Interval (min)</th>
+                <th>Window (hrs)</th>
+                <th>Batch size</th>
+                <th>Scheduler backend</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${connectors
+                .map((row) => {
+                  const label = row.display_name || row.label || row.connector_code || "";
+                  const enabled = row.poll_enabled === true
+                    ? "true"
+                    : row.poll_enabled === false
+                      ? "false"
+                      : "";
+                  const interval = row.poll_interval_minutes ?? "";
+                  const windowHours = row.poll_window_hours ?? "";
+                  const batchSize = row.poll_timeseries_batch_size ?? "";
+                  const connectorCode = row.connector_code || "";
+                  const schedulerBackend = row.scheduler_backend || "supabase_function";
+                  const schedulerDisabled = schedulerBackendAllowlist.has(connectorCode) ? "" : "disabled";
+                  return `
+                    <tr data-connector-id="${row.id}" data-connector-code="${connectorCode}">
+                      <td class="connector-name">${label}</td>
+                      <td>
+                        <select class="settings-select" data-field="poll_enabled">
+                          <option value="" ${enabled === "" ? "selected" : ""}>NULL</option>
+                          <option value="true" ${enabled === "true" ? "selected" : ""}>TRUE</option>
+                          <option value="false" ${enabled === "false" ? "selected" : ""}>FALSE</option>
+                        </select>
+                      </td>
+                      <td>
+                        <input class="settings-input" data-field="poll_interval_minutes" type="number" min="0" step="1" value="${interval}" />
+                      </td>
+                      <td>
+                        <input class="settings-input" data-field="poll_window_hours" type="number" min="0" step="1" value="${windowHours}" />
+                      </td>
+                      <td>
+                        <input class="settings-input" data-field="poll_timeseries_batch_size" type="number" min="0" step="1" value="${batchSize}" />
+                      </td>
+                      <td>
+                        <select class="settings-select" data-field="scheduler_backend" ${schedulerDisabled}>
+                          <option value="supabase_function" ${schedulerBackend === "supabase_function" ? "selected" : ""}>supabase_function</option>
+                          <option value="google_cloud_run" ${schedulerBackend === "google_cloud_run" ? "selected" : ""}>google_cloud_run</option>
+                        </select>
+                      </td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+          <div class="footnote">Scheduler backend toggle is currently active for UK-AIR SOS, Sensor.Community, Breathe London, and OpenAQ.</div>
+          <div class="settings-actions">
+            <button class="settings-button" id="commit-settings">Commit changes</button>
+          </div>
+        `;
+
+        const commitButton = panel.querySelector("#commit-settings");
+        if (commitButton) {
+          commitButton.addEventListener("click", async () => {
+            const rows = Array.from(panel.querySelectorAll("tbody tr"));
+            const updates = rows.map((rowEl) => {
+              const connectorId = rowEl.getAttribute("data-connector-id");
+              const connectorCode = rowEl.getAttribute("data-connector-code");
+              const getValue = (field) => {
+                const input = rowEl.querySelector(`[data-field="${field}"]`);
+                return input ? input.value : "";
+              };
+              const parseOptionalNumber = (value) => {
+                if (value === "" || value === null || value === undefined) return null;
+                const parsed = Number(value);
+                return Number.isFinite(parsed) ? Math.floor(parsed) : null;
+              };
+              const enabled = getValue("poll_enabled");
+              return {
+                id: connectorId ? Number(connectorId) : null,
+                connector_code: connectorCode || null,
+                poll_enabled: enabled === "true" ? true : enabled === "false" ? false : null,
+                poll_interval_minutes: parseOptionalNumber(getValue("poll_interval_minutes")),
+                poll_window_hours: parseOptionalNumber(getValue("poll_window_hours")),
+                poll_timeseries_batch_size: parseOptionalNumber(getValue("poll_timeseries_batch_size")),
+                scheduler_backend: getValue("scheduler_backend") || "supabase_function",
+              };
+            }).filter((row) => row.id !== null);
+
+            setError("");
+            setStatus("Saving settings...");
+            try {
+              const resp = await fetch(buildApiUrl("connectors"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ updates }),
+              });
+              if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(text || `Request failed (${resp.status})`);
+              }
+              await loadDashboard();
+            } catch (err) {
+              setError(err.message || String(err));
+              setStatus("Error");
+            }
+          });
+        }
+        return panel;
+      }
+
+      function renderDispatcherSettingsPanel(settings) {
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        const parallel = Boolean(settings.dispatcher_parallel_ingest);
+        const maxRuns = Number.isFinite(Number(settings.max_runs_per_dispatch_call))
+          ? Number(settings.max_runs_per_dispatch_call)
+          : 1;
+        const updatedAt = settings.updated_at ? formatTime(settings.updated_at) : "n/a";
+        panel.innerHTML = `
+          <h2>Supabase Edge Functions Dispatcher Settings <span class="chip">i</span></h2>
+          <div class="settings-inline">
+            <label class="settings-toggle">
+              <input type="checkbox" id="dispatcher-parallel" ${parallel ? "checked" : ""} />
+              Parallel ingest
+            </label>
+            <label>
+              Max runs per call
+              <input class="settings-input" id="dispatcher-max-runs" type="number" min="1" step="1" value="${maxRuns}" />
+            </label>
+            <span class="meta-note">Last updated: ${updatedAt}</span>
+          </div>
+          <div class="settings-actions">
+            <button class="settings-button" id="commit-dispatcher-settings">Save dispatcher settings</button>
+          </div>
+        `;
+
+        const commitButton = panel.querySelector("#commit-dispatcher-settings");
+        if (commitButton) {
+          commitButton.addEventListener("click", async () => {
+            const parallelEl = panel.querySelector("#dispatcher-parallel");
+            const maxRunsEl = panel.querySelector("#dispatcher-max-runs");
+            const maxRunsValue = maxRunsEl ? Number(maxRunsEl.value) : 1;
+            setError("");
+            setStatus("Saving dispatcher settings...");
+            try {
+              const resp = await fetch(buildApiUrl("dispatcher_settings"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  dispatcher_parallel_ingest: Boolean(parallelEl && parallelEl.checked),
+                  max_runs_per_dispatch_call: Number.isFinite(maxRunsValue) ? maxRunsValue : 1,
+                }),
+              });
+              if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(text || `Request failed (${resp.status})`);
+              }
+              await loadDashboard();
+            } catch (err) {
+              setError(err.message || String(err));
+              setStatus("Error");
+            }
+          });
+        }
+
+        return panel;
+      }
+
+      function shouldShowDispatcherSettings(connectors) {
+        if (!Array.isArray(connectors) || connectors.length === 0) {
+          return true;
+        }
+        const allGoogleCloudRun = connectors.every((row) => {
+          const backend = String(
+            (row && row.scheduler_backend) || "supabase_function"
+          ).toLowerCase();
+          return backend === "google_cloud_run";
+        });
+        return !allGoogleCloudRun;
+      }
+
+      function upsertStorageCoveragePanel(nextPanel) {
+        const currentPanel = dashboardEl.querySelector('[data-panel="storage-coverage"]');
+        if (currentPanel) {
+          currentPanel.replaceWith(nextPanel);
+          return;
+        }
+        dashboardEl.appendChild(nextPanel);
+      }
+
+      function renderStorageCoverageLoadingPanel(message = "Refreshing calendar...") {
+        const panel = document.createElement("section");
+        panel.className = "panel coverage-calendar-panel";
+        panel.dataset.panel = "storage-coverage";
+        panel.innerHTML = `
+          <h2>Storage coverage calendar</h2>
+          <div class="footnote">${escapeHtml(message)}</div>
+        `;
+        return panel;
+      }
+
+      function renderStorageCoverageErrorPanel(message, options = {}) {
+        const forceRefresh = Boolean(options.forceRefresh);
+        const parentLoadId = Number(options.parentLoadId) || dashboardLoadSequence;
+        const panel = document.createElement("section");
+        panel.className = "panel coverage-calendar-panel";
+        panel.dataset.panel = "storage-coverage";
+        panel.innerHTML = `
+          <h2>Storage coverage calendar</h2>
+          <div class="footnote">Failed to load calendar data: ${escapeHtml(message || "unknown error")}</div>
+          <div class="settings-actions">
+            <button class="settings-button" data-action="retry-storage-coverage">Retry calendar load</button>
+          </div>
+        `;
+        const retryButton = panel.querySelector('[data-action="retry-storage-coverage"]');
+        if (retryButton) {
+          retryButton.addEventListener("click", () => {
+            loadStorageCoverage({ forceRefresh, parentLoadId });
+          });
+        }
+        return panel;
+      }
+
+      async function loadStorageCoverage(options = {}) {
+        const forceRefresh = Boolean(options.forceRefresh);
+        const parentLoadId = Number(options.parentLoadId) || 0;
+        const requestId = ++storageCoverageLoadSequence;
+        const loadingLabel = forceRefresh ? "Force refreshing calendar..." : "Refreshing calendar...";
+        upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel(loadingLabel));
+        try {
+          const params = new URLSearchParams();
+          params.set("t", String(Date.now()));
+          if (forceRefresh) {
+            params.set("force", "1");
+          }
+          const resp = await fetch(buildApiUrl("storage_coverage", params));
+          const text = await resp.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(text);
+          } catch (_err) {
+            payload = null;
+          }
+          if (!resp.ok) {
+            const message =
+              (payload && (payload.error || payload.message)) ||
+              text ||
+              `Request failed (${resp.status})`;
+            throw new Error(message);
+          }
+          if (requestId !== storageCoverageLoadSequence) {
+            return;
+          }
+          if (parentLoadId && parentLoadId !== dashboardLoadSequence) {
+            return;
+          }
+          const data = payload || {};
+          const coverageRows = Array.isArray(data.storage_coverage_days)
+            ? data.storage_coverage_days
+            : [];
+          if (latestDashboardData && typeof latestDashboardData === "object") {
+            latestDashboardData.storage_coverage_days = coverageRows;
+            latestDashboardData.storage_coverage_source =
+              data.storage_coverage_source || "live_per_day_presence";
+          }
+          upsertStorageCoveragePanel(
+            renderStorageCoverageCalendarPanel(coverageRows, {
+              forceConnectorCountsRefresh: forceRefresh,
+            }),
+          );
+          if (String(errorEl.textContent || "").startsWith(STORAGE_COVERAGE_ERROR_PREFIX)) {
+            setError("");
+          }
+        } catch (err) {
+          if (requestId !== storageCoverageLoadSequence) {
+            return;
+          }
+          if (parentLoadId && parentLoadId !== dashboardLoadSequence) {
+            return;
+          }
+          const message = err.message || String(err);
+          upsertStorageCoveragePanel(
+            renderStorageCoverageErrorPanel(message, { forceRefresh, parentLoadId }),
+          );
+          setError(`${STORAGE_COVERAGE_ERROR_PREFIX} ${message}`);
+        }
+      }
+
+      async function loadDashboard(options = {}) {
+        const forceRefresh = Boolean(options.forceRefresh);
+        const loadId = ++dashboardLoadSequence;
+        setError("");
+        setStatus(forceRefresh ? "Force refreshing..." : "Loading...");
+        try {
+          const params = new URLSearchParams();
+          params.set("t", String(Date.now()));
+          params.set("include_storage_coverage", "0");
+          if (forceRefresh) {
+            params.set("force", "1");
+          }
+          if (dispatchCursor) {
+            params.set("dispatch_cursor", dispatchCursor);
+          }
+          const resp = await fetch(buildApiUrl("dashboard", params));
+          const text = await resp.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(text);
+          } catch (err) {
+            payload = null;
+          }
+          if (!resp.ok) {
+            const message =
+              (payload && (payload.error || payload.message)) ||
+              text ||
+              `Request failed (${resp.status})`;
+            throw new Error(message);
+          }
+          if (loadId !== dashboardLoadSequence) {
+            return;
+          }
+          const data = payload || {};
+          latestDashboardData = data;
+          if (typeof data.dispatch_cursor === "string" && data.dispatch_cursor) {
+            dispatchCursor = data.dispatch_cursor;
+            try {
+              localStorage.setItem(DISPATCH_CURSOR_STORAGE_KEY, dispatchCursor);
+            } catch (_err) {
+              // Ignore storage write issues.
+            }
+          }
+          dashboardEl.innerHTML = "";
+          if (Array.isArray(data.connectors_settings)) {
+            dashboardEl.appendChild(renderConnectorSettingsPanel(data.connectors_settings));
+          }
+          if (
+            data.dispatcher_settings &&
+            shouldShowDispatcherSettings(data.connectors_settings)
+          ) {
+            dashboardEl.appendChild(renderDispatcherSettingsPanel(data.dispatcher_settings));
+          }
+          if (Array.isArray(data.dispatch_runs)) {
+            dashboardEl.appendChild(renderDispatchPanel(data.dispatch_runs));
+          }
+          (Array.isArray(data.pollutants) ? data.pollutants : []).forEach((pollutant) => {
+            dashboardEl.appendChild(renderPanel(pollutant));
+          });
+          dashboardEl.appendChild(
+            renderDbSizePanel(
+              data.db_size_metrics,
+              data.db_size_metrics_error,
+              data.schema_size_metrics,
+              data.schema_size_metrics_error,
+              data.r2_domain_size_metrics,
+              data.r2_domain_size_metrics_error,
+              data.r2_usage,
+              data.r2_usage_error,
+              data.r2_backup_window,
+              data.r2_backup_window_error,
+            ),
+          );
+          upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel("Refreshing calendar..."));
+          setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}`);
+          setDataMeta(data);
+          void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
+        } catch (err) {
+          if (loadId !== dashboardLoadSequence) {
+            return;
+          }
+          setError(err.message || String(err));
+          setStatus("Error");
+        }
+      }
+
+      refreshGroup.addEventListener("change", (event) => {
+        if (event.target && event.target.name === "refresh") {
+          const value = Number(event.target.value);
+          if (Number.isFinite(value) && value > 0) {
+            setRefreshInterval(value);
+          }
+        }
+      });
+
+      refreshNowBtn.addEventListener("click", () => {
+        loadDashboard();
+      });
+
+      document.addEventListener("visibilitychange", handleActivityChange);
+      window.addEventListener("focus", handleActivityChange);
+      window.addEventListener("blur", handleActivityChange);
+
+      const refreshChoice = refreshGroup.querySelector(
+        `input[name="refresh"][value="${String(refreshSeconds)}"]`,
+      );
+      if (refreshChoice) {
+        refreshChoice.checked = true;
+      }
+
+      setRefreshInterval(refreshSeconds);
+      if (isPageActive()) {
+        loadDashboard();
+      }
+    </script>
+  </body>
+</html>

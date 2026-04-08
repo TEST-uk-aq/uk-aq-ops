@@ -27,6 +27,35 @@ Cloudflare edge workers in this repo:
 - `workers/uk_aq_observs_history_r2_api_worker/worker.mjs`
 - `workers/uk_aq_cache_proxy/src/index.ts`
 
+## Dashboard (hosted + local)
+
+Dashboard paths:
+
+- Static front end: `dashboard/`
+- Config generator: `scripts/dashboard/generate_dashboard_config.mjs`
+- Migrated backend API: `local/dashboard/server/uk_aq_dashboard_local.py`
+- Local launcher: `local/scripts/run_dashboard_local.sh`
+- Station snapshot front end: `station_snapshot/`
+- Station snapshot backend API: `local/station_snapshot/server/uk_aq_station_snapshot_local.py`
+- Station snapshot launcher: `local/scripts/run_station_snapshot_local.sh`
+- Hosted proxy worker: `api/worker/`
+- Combined local start/stop wrappers: `./dev_dashboards.sh` and `./dev_dashboards_stop.sh`
+
+Local dashboard run:
+
+```bash
+npm run dashboard:config
+npm run dashboard:local
+npm run station-snapshot:local
+```
+
+Run both dashboards together:
+
+```bash
+npm run dashboards:start
+npm run dashboards:stop
+```
+
 ## Services
 
 ### 1) UK AQ Prune Daily (`workers/uk_aq_prune_daily/server.mjs`)

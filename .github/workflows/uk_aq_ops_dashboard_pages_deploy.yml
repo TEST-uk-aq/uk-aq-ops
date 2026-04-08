@@ -1,0 +1,62 @@
+name: Deploy UK AQ Ops Dashboard (Pages)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "dashboard/**"
+      - "scripts/dashboard/**"
+      - ".github/workflows/uk_aq_ops_dashboard_pages_deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: uk-aq-ops-dashboard-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate browser-safe dashboard config
+        env:
+          UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME }}
+          UKAQ_API_BASE_URL: ${{ vars.UKAQ_API_BASE_URL }}
+          UKAQ_DASHBOARD_TITLE: ${{ vars.UKAQ_DASHBOARD_TITLE }}
+          UKAQ_DASHBOARD_SUBTITLE: ${{ vars.UKAQ_DASHBOARD_SUBTITLE }}
+          UKAQ_DEFAULT_REFRESH_SECONDS: ${{ vars.UKAQ_DEFAULT_REFRESH_SECONDS }}
+          UKAQ_CONFIG_OUT_PATH: dashboard/assets/config.js
+        run: |
+          node scripts/dashboard/generate_dashboard_config.mjs
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dashboard
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

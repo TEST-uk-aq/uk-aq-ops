@@ -1,0 +1,14 @@
+{
+  "name": "uk-aq-ops-dashboard-api-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "wrangler": "^4.42.0"
+  }
+}

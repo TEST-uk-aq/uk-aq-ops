@@ -1,0 +1,8 @@
+name = "uk-aq-ops-dashboard-api"
+main = "src/index.ts"
+compatibility_date = "2026-04-08"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+UKAQ_PROXY_ROUTE_PREFIX = "/api"
+# DASHBOARD_UPSTREAM_BASE_URL = "https://example.internal"
