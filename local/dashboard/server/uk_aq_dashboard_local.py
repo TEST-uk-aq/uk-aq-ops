@@ -98,6 +98,12 @@ UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH = str(
 UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE = str(
     os.getenv("UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE") or ""
 ).strip()
+DROPBOX_APP_KEY = str(os.getenv("DROPBOX_APP_KEY") or "").strip()
+DROPBOX_APP_SECRET = str(os.getenv("DROPBOX_APP_SECRET") or "").strip()
+DROPBOX_REFRESH_TOKEN = str(os.getenv("DROPBOX_REFRESH_TOKEN") or "").strip()
+DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token"
+DROPBOX_CONTENT_API_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download"
+DROPBOX_API_TIMEOUT_SECONDS = 30
 IN_FLIGHT_WARN_MINUTES = 5
 IN_FLIGHT_MAX_AGE_MINUTES = 180
 SCHEDULER_BACKEND_SUPABASE_FUNCTION = "supabase_function"
@@ -1376,6 +1382,132 @@ def _parse_iso_day(value: Any) -> Optional[date]:
         return None
 
 
+def _empty_dropbox_backup_days() -> Dict[str, Set[date]]:
+    return {
+        "observations": set(),
+        "aqilevels": set(),
+    }
+
+
+def _normalize_dropbox_path(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    with_leading = value if value.startswith("/") else f"/{value}"
+    return with_leading.rstrip("/")
+
+
+def _resolve_dropbox_state_remote_path() -> str:
+    root = str(UK_AQ_DROPBOX_ROOT or "").strip().strip("/")
+    history_dir = str(UK_AQ_R2_HISTORY_DROPBOX_DIR or "").strip().strip("/")
+    state_rel = str(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH or "").strip().strip("/")
+    path_parts = [part for part in (root, history_dir, state_rel) if part]
+    if not path_parts:
+        return ""
+    return "/" + "/".join(path_parts)
+
+
+def _extract_dropbox_backup_days(
+    raw_state: Any,
+) -> Tuple[Dict[str, Set[date]], Optional[str]]:
+    domain_days = _empty_dropbox_backup_days()
+    if not isinstance(raw_state, dict):
+        return domain_days, "Dropbox checkpoint is not a JSON object"
+
+    raw_domains = raw_state.get("domains")
+    domains = raw_domains if isinstance(raw_domains, dict) else {}
+    for domain_name in ("observations", "aqilevels"):
+        raw_domain = domains.get(domain_name)
+        if not isinstance(raw_domain, dict):
+            continue
+        raw_day_map = raw_domain.get("days")
+        day_map = raw_day_map if isinstance(raw_day_map, dict) else {}
+        for day_text in day_map.keys():
+            parsed_day = _parse_iso_day(day_text)
+            if parsed_day is not None:
+                domain_days[domain_name].add(parsed_day)
+
+    return domain_days, None
+
+
+def _fetch_dropbox_access_token() -> Tuple[Optional[str], Optional[str]]:
+    creds_present = [bool(DROPBOX_APP_KEY), bool(DROPBOX_APP_SECRET), bool(DROPBOX_REFRESH_TOKEN)]
+    if not any(creds_present):
+        return None, None
+    if not all(creds_present):
+        return None, "Dropbox credentials incomplete (DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN required)"
+
+    try:
+        resp = requests.post(
+            DROPBOX_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": DROPBOX_REFRESH_TOKEN,
+                "client_id": DROPBOX_APP_KEY,
+                "client_secret": DROPBOX_APP_SECRET,
+            },
+            timeout=DROPBOX_API_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return None, f"Dropbox token request failed ({exc.__class__.__name__})"
+
+    if not resp.ok:
+        detail = _safe_response_text(resp)
+        if detail:
+            return None, f"Dropbox token request failed ({resp.status_code}): {detail}"
+        return None, f"Dropbox token request failed ({resp.status_code})"
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None, "Dropbox token response was not valid JSON"
+    token = str((payload or {}).get("access_token") or "").strip()
+    if not token:
+        return None, "Dropbox token response missing access_token"
+    return token, None
+
+
+def _load_dropbox_backup_days_remote() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
+    domain_days = _empty_dropbox_backup_days()
+    remote_path = _resolve_dropbox_state_remote_path()
+    if not remote_path:
+        return domain_days, None, None
+
+    path_ref = f"dropbox:{remote_path}"
+    access_token, token_error = _fetch_dropbox_access_token()
+    if token_error:
+        return domain_days, path_ref, token_error
+    if not access_token:
+        return domain_days, None, None
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Dropbox-API-Arg": json.dumps({"path": remote_path}),
+    }
+    try:
+        resp = requests.post(
+            DROPBOX_CONTENT_API_DOWNLOAD_URL,
+            headers=headers,
+            timeout=DROPBOX_API_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return domain_days, path_ref, f"Dropbox checkpoint download failed ({exc.__class__.__name__})"
+
+    if not resp.ok:
+        detail = _safe_response_text(resp)
+        if detail:
+            return domain_days, path_ref, f"Dropbox checkpoint download failed ({resp.status_code}): {detail}"
+        return domain_days, path_ref, f"Dropbox checkpoint download failed ({resp.status_code})"
+
+    try:
+        raw_state = json.loads(resp.text)
+    except Exception as exc:  # noqa: BLE001
+        return domain_days, path_ref, f"Dropbox checkpoint parse failed ({exc.__class__.__name__})"
+
+    parsed_days, parse_error = _extract_dropbox_backup_days(raw_state)
+    return parsed_days, path_ref, parse_error
+
+
 def _candidate_dropbox_state_paths() -> List[Path]:
     candidates: List[Path] = []
     seen: Set[str] = set()
@@ -1444,10 +1576,7 @@ def _candidate_dropbox_state_paths() -> List[Path]:
 
 
 def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
-    domain_days: Dict[str, Set[date]] = {
-        "observations": set(),
-        "aqilevels": set(),
-    }
+    domain_days = _empty_dropbox_backup_days()
     for candidate in _candidate_dropbox_state_paths():
         if not candidate.is_file():
             continue
@@ -1455,21 +1584,13 @@ def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Op
             raw_state = json.loads(candidate.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             return domain_days, str(candidate), f"Dropbox checkpoint parse failed ({exc.__class__.__name__})"
-        if not isinstance(raw_state, dict):
-            return domain_days, str(candidate), "Dropbox checkpoint is not a JSON object"
-        raw_domains = raw_state.get("domains")
-        domains = raw_domains if isinstance(raw_domains, dict) else {}
-        for domain_name in ("observations", "aqilevels"):
-            raw_domain = domains.get(domain_name)
-            if not isinstance(raw_domain, dict):
-                continue
-            raw_day_map = raw_domain.get("days")
-            day_map = raw_day_map if isinstance(raw_day_map, dict) else {}
-            for day_text in day_map.keys():
-                parsed_day = _parse_iso_day(day_text)
-                if parsed_day is not None:
-                    domain_days[domain_name].add(parsed_day)
-        return domain_days, str(candidate), None
+        parsed_days, parse_error = _extract_dropbox_backup_days(raw_state)
+        return parsed_days, str(candidate), parse_error
+
+    remote_days, remote_path, remote_error = _load_dropbox_backup_days_remote()
+    if remote_path or remote_error:
+        return remote_days, remote_path, remote_error
+
     return domain_days, None, None
 
 

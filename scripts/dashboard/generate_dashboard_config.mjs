@@ -13,7 +13,7 @@ const defaultRefreshSeconds = Number.parseInt(
 const config = {
   envName: String(process.env.UKAQ_ENV_NAME || "local"),
   apiBaseUrl: String(process.env.UKAQ_API_BASE_URL || "/api"),
-  dashboardTitle: String(process.env.UKAQ_DASHBOARD_TITLE || "UK AQ Local Dashboard"),
+  dashboardTitle: String(process.env.UKAQ_DASHBOARD_TITLE || "UK AQ Dashboard"),
   dashboardSubtitle: String(
     process.env.UKAQ_DASHBOARD_SUBTITLE ||
       "Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates from your local API.",
