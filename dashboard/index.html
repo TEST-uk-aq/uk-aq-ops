@@ -2420,7 +2420,7 @@
           tooltip.innerHTML = `
             <div>${escapeHtml(label)}</div>
             <div>Bucket: ${escapeHtml(bucket)}</div>
-            <div>Cluster size: ${escapeHtml(size)}</div>
+            <div>DB size: ${escapeHtml(size)}</div>
             <div>Oldest day: ${escapeHtml(oldestDay)}</div>
           `;
           tooltip.classList.add("visible");
@@ -2665,7 +2665,7 @@
         }, 0);
         const yAxisMaxMb = DB_LINE_CHART_Y_MAX_MB;
 
-        let chartMarkup = `<div class="db-size-empty">No DB cluster size samples in the selected period.</div>`;
+        let chartMarkup = `<div class="db-size-empty">No DB size samples in the selected period.</div>`;
         if (points.length > 0) {
           const width = 960;
           const height = 300;
@@ -2692,7 +2692,7 @@
           const ingestTooltipTargets = buildDbTooltipTargets(
             points,
             "ingestdb",
-            "Ingest DB cluster",
+            "Ingest DB",
             COLOR_INGEST_DB,
             xFor,
             yFor,
@@ -2700,14 +2700,14 @@
           const obsAqiTooltipTargets = buildDbTooltipTargets(
             points,
             "obs_aqidb",
-            "Observs & AQI DB Cluster",
+            "Observs & AQI DB",
             COLOR_OBSAQI_OBSERVS,
             xFor,
             yFor,
           );
 
           chartMarkup = `
-            <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Ingest and Observs/AQI DB cluster size trend">
+            <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Ingest and Observs/AQI DB size trend">
               ${yTicks
                 .map((tick) => {
                   const y = yFor(tick);
@@ -3050,7 +3050,7 @@
 
         panel.innerHTML = `
           <h2 class="panel-heading">
-            <span>DB Cluster Size Trend</span>
+            <span>DB Size Trend</span>
             <div class="dispatch-filters">
               <label class="dispatch-filter" for="db-size-period-filter">
                 Time period
@@ -3065,11 +3065,11 @@
           <div class="db-size-legend-row">
             <div class="db-size-legend">
               <span class="db-size-item">
-              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_INGEST_DB}"></span>Ingest DB Cluster</span>
+              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_INGEST_DB}"></span>Ingest DB</span>
               <span class="db-size-item-min">${escapeHtml(ingestOldestDayLabel)}</span>
             </span>
             <span class="db-size-item">
-              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_OBSAQI_OBSERVS}"></span>Observs &amp; AQI DB Cluster</span>
+              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_OBSAQI_OBSERVS}"></span>Observs &amp; AQI DB</span>
               <span class="db-size-item-min">uk_aq_observs ${escapeHtml(observsOldestDayLabel)}&nbsp;&nbsp;&nbsp;uk_aq_aqilevels ${escapeHtml(aqilevelsOldestDayLabel)}</span>
             </span>
             </div>

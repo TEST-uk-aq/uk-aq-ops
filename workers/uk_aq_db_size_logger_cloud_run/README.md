@@ -2,7 +2,7 @@
 
 This Cloud Run service samples and persists hourly size metrics for:
 
-- DB clusters: `ingestdb`, `obs_aqidb`
+- Databases: `ingestdb`, `obs_aqidb`
 - R2 History domains: `observations`, `aqilevels`
 
 Schema-size metrics for `obs_aqidb` are now primarily written by a separate
@@ -10,13 +10,13 @@ Supabase `pg_cron` job in `obs_aqidb` (`uk_aq_obs_aqidb_schema_size_metrics_hour
 Cloud Run schema-size sampling is disabled by default and kept only as an
 optional fallback/manual path.
 
-DB cluster metrics are written via `uk_aq_public.uk_aq_rpc_db_size_metric_upsert`.
+DB size metrics are written via `uk_aq_public.uk_aq_rpc_db_size_metric_upsert`.
 R2 domain metrics are written via `uk_aq_public.uk_aq_rpc_r2_domain_size_metric_upsert`.
 If Cloud Run schema sampling is explicitly enabled, schema metrics are written via
 `uk_aq_public.uk_aq_rpc_schema_size_metric_upsert`.
 
 Write targets:
-- DB cluster metrics -> each cluster (`ingestdb`, `obs_aqidb`)
+- DB size metrics -> each database (`ingestdb`, `obs_aqidb`)
 - R2 domain metrics (`observations`, `aqilevels`) -> `ingestdb`
 - Schema metrics (`uk_aq_observs`, `uk_aq_aqilevels`) -> `obs_aqidb` via local `pg_cron`
   by default, or via Cloud Run only when explicitly enabled
