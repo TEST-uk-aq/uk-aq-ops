@@ -42,6 +42,12 @@ if [[ -z "${SUPABASE_URL:-}" && -n "${SB_SUPABASE_URL:-}" ]]; then
   export SUPABASE_URL="$SB_SUPABASE_URL"
 fi
 
+# Local dashboard should not require upstream bearer auth by default, even if
+# the token exists in .env for hosted deployments.
+if [[ "${DASHBOARD_LOCAL_ENFORCE_BEARER_AUTH:-false}" != "true" ]]; then
+  export DASHBOARD_UPSTREAM_BEARER_TOKEN=""
+fi
+
 missing_vars=()
 [[ -n "${SUPABASE_URL:-}" ]] || missing_vars+=("SUPABASE_URL")
 [[ -n "${SB_SECRET_KEY:-}" ]] || missing_vars+=("SB_SECRET_KEY")

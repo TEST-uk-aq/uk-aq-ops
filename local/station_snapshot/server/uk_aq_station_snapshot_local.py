@@ -1284,6 +1284,12 @@ class StationSnapshotHandler(BaseHTTPRequestHandler):
         if parsed.path in ("/", "/index.html"):
             self._serve_html()
             return
+        if parsed.path == "/favicon.ico":
+            self._serve_asset("favicon.png")
+            return
+        if parsed.path.startswith("/assets/"):
+            self._serve_asset(parsed.path[len("/assets/"):])
+            return
         if parsed.path == "/api/config":
             self._serve_config()
             return
@@ -1319,6 +1325,52 @@ class StationSnapshotHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(content.encode("utf-8"))
+
+    def _serve_asset(self, relative_path: str) -> None:
+        safe_relative = relative_path.strip().lstrip("/")
+        if not safe_relative:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        root_dir = self.server.html_path.parent.resolve()
+        asset_root = (root_dir / "assets").resolve()
+        asset_path = (asset_root / safe_relative).resolve()
+        try:
+            asset_path.relative_to(asset_root)
+        except ValueError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if not asset_path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        suffix = asset_path.suffix.lower()
+        if suffix == ".svg":
+            content_type = "image/svg+xml"
+        elif suffix == ".png":
+            content_type = "image/png"
+        elif suffix == ".js":
+            content_type = "text/javascript; charset=utf-8"
+        elif suffix == ".css":
+            content_type = "text/css; charset=utf-8"
+        elif suffix in {".htm", ".html"}:
+            content_type = "text/html; charset=utf-8"
+        elif suffix == ".json":
+            content_type = "application/json; charset=utf-8"
+        else:
+            content_type = "application/octet-stream"
+
+        try:
+            content = asset_path.read_bytes()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(content)
 
     def _serve_config(self) -> None:
         access_token = ""

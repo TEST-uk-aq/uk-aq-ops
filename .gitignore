@@ -10,3 +10,4 @@ workers/GCP-vars/astute-lyceum-484111-k5-245477747bc3.json
 /node_modules 2
 nohup.out
 nohup_MBAir.out
+.dashboards.pids

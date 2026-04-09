@@ -17,6 +17,11 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8045}"
 HTML_PATH="${UKAQ_DASHBOARD_HTML:-dashboard/index.html}"
 
+# Local run should not enforce hosted bearer auth unless explicitly requested.
+if [[ "${DASHBOARD_LOCAL_ENFORCE_BEARER_AUTH:-false}" != "true" ]]; then
+  export DASHBOARD_UPSTREAM_BEARER_TOKEN=""
+fi
+
 exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_local.py \
   --host "$HOST" \
   --port "$PORT" \

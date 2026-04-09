@@ -3177,6 +3177,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path in ("/", "/index.html"):
                 self._serve_html()
                 return
+            if parsed.path == "/favicon.ico":
+                self._serve_asset("favicon.png")
+                return
             if parsed.path.startswith("/assets/"):
                 self._serve_asset(parsed.path[len("/assets/"):])
                 return
@@ -3254,10 +3257,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not safe_relative:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+
         root_dir = self.server.html_path.parent.resolve()
-        asset_path = (root_dir / safe_relative).resolve()
+        asset_root = (root_dir / "assets").resolve()
+        asset_path = (asset_root / safe_relative).resolve()
         try:
-            asset_path.relative_to(root_dir)
+            asset_path.relative_to(asset_root)
         except ValueError:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
