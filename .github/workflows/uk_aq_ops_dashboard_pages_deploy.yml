@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "dashboard/**"
+      - "station_snapshot/**"
       - "scripts/dashboard/**"
       - ".github/workflows/uk_aq_ops_dashboard_pages_deploy.yml"
   workflow_dispatch:
@@ -45,10 +46,21 @@ jobs:
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
+      - name: Assemble Pages artifact
+        run: |
+          set -euo pipefail
+          rm -rf _pages
+          mkdir -p _pages/station_snapshot
+          cp -R dashboard/. _pages/
+          cp -R station_snapshot/. _pages/station_snapshot/
+          if [ -f CNAME ]; then
+            cp CNAME _pages/CNAME
+          fi
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: dashboard
+          path: _pages
 
   deploy:
     runs-on: ubuntu-latest
