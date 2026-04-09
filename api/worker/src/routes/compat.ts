@@ -2,6 +2,8 @@ import { errorEnvelope } from "../lib/http";
 import { proxyToUpstream, type WorkerEnv } from "../lib/upstream";
 
 const GET_ROUTES = new Set([
+  "/api/config",
+  "/api/snapshot",
   "/api/dashboard",
   "/api/storage_coverage",
   "/api/r2_metrics",

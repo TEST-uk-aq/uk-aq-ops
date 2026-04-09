@@ -85,6 +85,11 @@ OBS_AQIDB_SUPABASE_URL = str(os.getenv("OBS_AQIDB_SUPABASE_URL") or "").strip()
 OBS_AQIDB_SECRET_KEY = str(os.getenv("OBS_AQIDB_SECRET_KEY") or "").strip()
 PUBLIC_SCHEMA = os.getenv("UK_AQ_PUBLIC_SCHEMA", "uk_aq_public")
 R2_BACKUP_WINDOW_RPC = os.getenv("UK_AQ_R2_HISTORY_WINDOW_RPC", "uk_aq_rpc_r2_history_window")
+STATION_SNAPSHOT_RPC = os.getenv("UK_AQ_STATION_SNAPSHOT_RPC", "uk_aq_station_snapshot")
+STATION_SNAPSHOT_DEFAULT_STATION_ID = str(os.getenv("CLEANAIRSURB_ST_ID") or "").strip()
+STATION_SNAPSHOT_DEFAULT_OBS_LIMIT = str(
+    os.getenv("UK_AQ_STATION_SNAPSHOT_DEFAULT_OBS_LIMIT") or "all"
+).strip().lower()
 UK_AQ_DROPBOX_ROOT = str(os.getenv("UK_AQ_DROPBOX_ROOT") or "CIC-Test").strip()
 UK_AQ_DROPBOX_LOCAL_ROOT = str(os.getenv("UK_AQ_DROPBOX_LOCAL_ROOT") or "").strip()
 UK_AQ_DROPBOX_APP_FOLDER = str(os.getenv("UK_AQ_DROPBOX_APP_FOLDER") or "").strip()
@@ -640,6 +645,27 @@ def _fetch_json(url: str, headers: Dict[str, str], params: Dict[str, str]) -> Li
         )
     payload = resp.json()
     return payload if isinstance(payload, list) else []
+
+
+def _post_json_object(
+    url: str,
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    resp = requests.post(url, headers=headers, json=body, timeout=60)
+    if not resp.ok:
+        payload_keys = sorted(body.keys())
+        raise RuntimeError(
+            (
+                "PostgREST POST error "
+                f"{resp.status_code} at {_request_path(url)} "
+                f"(payload_keys={payload_keys}): {_safe_response_text(resp)}"
+            )
+        )
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("PostgREST RPC payload is not an object")
+    return payload
 
 
 def _patch_json(
@@ -2529,6 +2555,102 @@ def _to_postgrest_ts(value: datetime) -> str:
     )
 
 
+def _parse_snapshot_station_id(raw_value: str) -> Optional[int]:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("station_id must be a non-negative integer")
+    return parsed
+
+
+def _parse_snapshot_station_ref(raw_value: str) -> Optional[str]:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    return value
+
+
+def _parse_snapshot_timeseries_id(raw_value: str) -> Optional[int]:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    parsed = int(value)
+    if parsed < -2147483648 or parsed > 2147483647:
+        raise ValueError("timeseries_id is out of int4 range")
+    return parsed
+
+
+def _parse_snapshot_window(raw_value: str) -> str:
+    normalized = (raw_value or "").strip().lower() or "24h"
+    if normalized not in {"6h", "24h", "7d", "21d", "31d", "90d"}:
+        raise ValueError("window must be one of: 6h, 24h, 7d, 21d, 31d, 90d")
+    return normalized
+
+
+def _parse_snapshot_obs_limit(raw_value: str) -> Optional[int]:
+    normalized = (raw_value or "").strip().lower()
+    if not normalized or normalized == "all":
+        return None
+    parsed = int(normalized)
+    if parsed <= 0:
+        raise ValueError("obs_limit must be a positive integer or 'all'")
+    return parsed
+
+
+def _rpc_obs_limit(obs_limit: Optional[int]) -> int:
+    if obs_limit is None:
+        return 1000
+    return 1000 if obs_limit >= 1000 else 100
+
+
+def _build_station_snapshot_payload(
+    base_url: str,
+    service_role_key: str,
+    station_id: Optional[int],
+    station_ref: Optional[str],
+    timeseries_id: Optional[int],
+    window: str,
+    obs_limit: Optional[int],
+) -> Dict[str, Any]:
+    headers = _postgrest_headers(service_role_key, schema=PUBLIC_SCHEMA)
+    headers["Content-Type"] = "application/json"
+    payload = _post_json_object(
+        f"{base_url}/rpc/{STATION_SNAPSHOT_RPC}",
+        headers,
+        {
+            "p_station_id": station_id,
+            "p_station_ref": station_ref,
+            "p_timeseries_id": timeseries_id,
+            "p_window": window,
+            "p_obs_limit": _rpc_obs_limit(obs_limit),
+        },
+    )
+
+    observations = payload.get("observations")
+    if not isinstance(observations, list):
+        observations = []
+        payload["observations"] = observations
+
+    # Keep the hosted payload compatible with the station_snapshot frontend shape.
+    payload.setdefault("observations_all", list(observations))
+    payload.setdefault("obs_aqidb_observations", [])
+    payload.setdefault("obs_aqidb_observations_all", [])
+    payload.setdefault("obs_aqidb_timeseries_aqi_hourly", [])
+    payload.setdefault("obs_aqidb_timeseries_aqi_daily", [])
+
+    meta_value = payload.get("meta")
+    if not isinstance(meta_value, dict):
+        meta_value = {}
+        payload["meta"] = meta_value
+    meta_value.setdefault("ingest_source", "service_role_postgrest_rpc")
+    meta_value.setdefault("obs_aqidb_source", "unavailable")
+    meta_value.setdefault("requested_obs_limit", "all" if obs_limit is None else obs_limit)
+
+    return payload
+
+
 def _dispatch_run_timestamp(row: Dict[str, Any]) -> Optional[datetime]:
     return _parse_timestamp(
         (row.get("run_ended_at") if isinstance(row, dict) else None)
@@ -3183,6 +3305,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/assets/"):
                 self._serve_asset(parsed.path[len("/assets/"):])
                 return
+            if parsed.path == "/api/config":
+                self._serve_snapshot_config()
+                return
+            if parsed.path == "/api/snapshot":
+                self._serve_station_snapshot(parsed)
+                return
             if parsed.path == "/api/r2_metrics":
                 self._serve_r2_metrics(parsed)
                 return
@@ -3322,6 +3450,97 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         payload = json.dumps(data, indent=2)
         self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
+
+    def _serve_snapshot_config(self) -> None:
+        default_obs_limit = STATION_SNAPSHOT_DEFAULT_OBS_LIMIT
+        if default_obs_limit not in {"all", "100", "1000", "5000", "10000"}:
+            default_obs_limit = "all"
+
+        payload = json.dumps(
+            {
+                "edge_url": f"{self.server.base_url}/rpc/{STATION_SNAPSHOT_RPC}",
+                "default_station_id": STATION_SNAPSHOT_DEFAULT_STATION_ID,
+                "snapshot_mode": "service_role_postgrest_rpc",
+                "has_obs_aqidb": False,
+                "default_obs_limit": default_obs_limit,
+            },
+            indent=2,
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
+
+    def _serve_station_snapshot(self, parsed) -> None:
+        query = parse_qs(parsed.query or "", keep_blank_values=False)
+
+        station_id_raw = (query.get("station_id") or [STATION_SNAPSHOT_DEFAULT_STATION_ID])[0]
+        station_ref_raw = (query.get("station_ref") or [""])[0]
+        timeseries_id_raw = (query.get("timeseries_id") or [""])[0]
+        window_raw = (query.get("window") or ["24h"])[0]
+        obs_limit_raw = (query.get("obs_limit") or [STATION_SNAPSHOT_DEFAULT_OBS_LIMIT])[0]
+
+        try:
+            station_id = _parse_snapshot_station_id(station_id_raw)
+            station_ref = _parse_snapshot_station_ref(station_ref_raw)
+            timeseries_id = _parse_snapshot_timeseries_id(timeseries_id_raw)
+            window = _parse_snapshot_window(window_raw)
+            obs_limit = _parse_snapshot_obs_limit(obs_limit_raw)
+        except (TypeError, ValueError) as exc:
+            payload = json.dumps({"error": str(exc)}, indent=2)
+            self.send_response(HTTPStatus.BAD_REQUEST)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        if station_id is None and not station_ref:
+            payload = json.dumps({"error": "station_id or station_ref is required."}, indent=2)
+            self.send_response(HTTPStatus.BAD_REQUEST)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        try:
+            payload_obj = _build_station_snapshot_payload(
+                self.server.base_url,
+                self.server.service_role_key,
+                station_id,
+                station_ref,
+                timeseries_id,
+                window,
+                obs_limit,
+            )
+        except Exception as exc:
+            payload = json.dumps({"error": str(exc)}, indent=2)
+            self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        if payload_obj.get("station") is None:
+            payload_obj = {"error": "Station not found.", **payload_obj}
+            status = HTTPStatus.NOT_FOUND
+        else:
+            status = HTTPStatus.OK
+
+        payload = json.dumps(payload_obj, indent=2)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")

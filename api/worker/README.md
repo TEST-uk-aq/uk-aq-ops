@@ -12,6 +12,8 @@ Cloudflare Worker API/proxy for the hosted UK AQ ops dashboard.
 
 Compatibility routes (for existing dashboard parity):
 
+- `GET /api/config`
+- `GET /api/snapshot`
 - `GET /api/dashboard`
 - `GET /api/storage_coverage`
 - `GET /api/r2_metrics`

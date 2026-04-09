@@ -45,6 +45,7 @@ jobs:
       UK_AQ_R2_HISTORY_WINDOW_RPC: ${{ vars.UK_AQ_R2_HISTORY_WINDOW_RPC || 'uk_aq_rpc_r2_history_window' }}
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
+      CLEANAIRSURB_ST_ID: ${{ vars.CLEANAIRSURB_ST_ID || '' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || '' }}
       UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '' }}
@@ -258,6 +259,7 @@ jobs:
           add_env UK_AQ_R2_HISTORY_WINDOW_RPC
           add_env UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
           add_env UK_AQ_R2_HISTORY_AQILEVELS_PREFIX
+          add_env CLEANAIRSURB_ST_ID
           add_env UK_AQ_DROPBOX_ROOT
           add_env UK_AQ_R2_HISTORY_DROPBOX_DIR
           add_env UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH
