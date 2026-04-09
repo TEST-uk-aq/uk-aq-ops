@@ -223,6 +223,21 @@ query R2StorageNow($accountTag: string!, $startDate: Time!, $endDate: Time!) {
   }
 }
 """
+try:
+    _raw_station_snapshot_page_size = int(
+        os.getenv("UK_AQ_STATION_SNAPSHOT_PAGE_SIZE", "1000")
+    )
+except ValueError:
+    _raw_station_snapshot_page_size = 1000
+STATION_SNAPSHOT_PAGE_SIZE = max(100, _raw_station_snapshot_page_size)
+
+try:
+    _raw_station_snapshot_max_rows = int(
+        os.getenv("UK_AQ_STATION_SNAPSHOT_MAX_ROWS", "200000")
+    )
+except ValueError:
+    _raw_station_snapshot_max_rows = 200000
+STATION_SNAPSHOT_MAX_ROWS = max(1000, _raw_station_snapshot_max_rows)
 
 
 def _dashboard_cache_bucket(include_storage_coverage: bool) -> str:
@@ -677,6 +692,27 @@ def _post_json_object(
     return payload
 
 
+def _post_json_list(
+    url: str,
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    resp = requests.post(url, headers=headers, json=body, timeout=60)
+    if not resp.ok:
+        payload_keys = sorted(body.keys())
+        raise RuntimeError(
+            (
+                "PostgREST POST error "
+                f"{resp.status_code} at {_request_path(url)} "
+                f"(payload_keys={payload_keys}): {_safe_response_text(resp)}"
+            )
+        )
+    payload = resp.json()
+    if not isinstance(payload, list):
+        return []
+    return [row for row in payload if isinstance(row, dict)]
+
+
 def _patch_json(
     base_url: str,
     table: str,
@@ -724,6 +760,40 @@ def _fetch_all(
             break
         offset += limit
     return rows
+
+
+def _fetch_all_limited(
+    base_url: str,
+    headers: Dict[str, str],
+    table: str,
+    params: Dict[str, str],
+    *,
+    page_size: int,
+    max_rows: int,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    truncated = False
+    safe_page_size = max(1, page_size)
+    safe_max_rows = max(1, max_rows)
+
+    while True:
+        if len(rows) >= safe_max_rows:
+            truncated = True
+            rows = rows[:safe_max_rows]
+            break
+
+        current_limit = min(safe_page_size, safe_max_rows - len(rows))
+        batch_params = dict(params)
+        batch_params["limit"] = str(current_limit)
+        batch_params["offset"] = str(offset)
+        batch = _fetch_json(f"{base_url}/{table}", headers, batch_params)
+        rows.extend(batch)
+        if len(batch) < current_limit:
+            break
+        offset += len(batch)
+
+    return rows, truncated
 
 
 def _fetch_ingest_runs(
@@ -2614,6 +2684,314 @@ def _rpc_obs_limit(obs_limit: Optional[int]) -> int:
     return 1000 if obs_limit >= 1000 else 100
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _postgrest_rpc_list(
+    rest_url: str,
+    api_key: str,
+    schema: str,
+    rpc_name: str,
+    body: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    headers = _postgrest_headers(api_key, write=True, schema=schema)
+    headers["Content-Type"] = "application/json"
+    return _post_json_list(f"{rest_url}/rpc/{rpc_name}", headers, body)
+
+
+def _fetch_obs_aqidb_observations_via_rpc(
+    obs_rest_url: str,
+    obs_key: str,
+    timeseries_rows: List[Dict[str, Any]],
+    window_start_iso: str,
+    window_end_iso: str,
+    max_rows: int,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    start_dt_raw = _parse_timestamp(window_start_iso)
+    end_dt_raw = _parse_timestamp(window_end_iso)
+    if start_dt_raw is None or end_dt_raw is None:
+        return [], False
+    start_dt = _as_utc(start_dt_raw)
+    end_dt = _as_utc(end_dt_raw)
+    if end_dt < start_dt:
+        return [], False
+
+    timeseries_to_connector: Dict[int, int] = {}
+    for row in timeseries_rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            timeseries_id = int(row.get("id"))
+            connector_id = int(row.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        if connector_id <= 0:
+            continue
+        timeseries_to_connector[timeseries_id] = connector_id
+    if not timeseries_to_connector:
+        return [], False
+
+    connector_ids = sorted(set(timeseries_to_connector.values()))
+    rpc_limit = 20000
+    safe_max_rows = max(1, max_rows)
+    rows: List[Dict[str, Any]] = []
+    truncated = False
+    day_cursor = start_dt.date()
+    end_day = end_dt.date()
+
+    while day_cursor <= end_day and not truncated:
+        day_iso = day_cursor.isoformat()
+        for connector_id in connector_ids:
+            target_timeseries_ids = sorted(
+                ts_id
+                for ts_id, ts_connector_id in timeseries_to_connector.items()
+                if ts_connector_id == connector_id
+            )
+            if not target_timeseries_ids:
+                continue
+            target_timeseries_set = set(target_timeseries_ids)
+            min_target_timeseries_id = target_timeseries_ids[0]
+            max_target_timeseries_id = target_timeseries_ids[-1]
+
+            # Cursor-seek close to the target station timeseries range so we don't
+            # exhaust max_rows on unrelated connector rows.
+            after_timeseries_id: Optional[int] = max(
+                min_target_timeseries_id - 1,
+                -2147483648,
+            )
+            after_observed_at: Optional[str] = "0001-01-01T00:00:00Z"
+            while True:
+                rpc_body: Dict[str, Any] = {
+                    "p_day_utc": day_iso,
+                    "p_connector_id": connector_id,
+                    "p_after_timeseries_id": after_timeseries_id,
+                    "p_after_observed_at": after_observed_at,
+                    "p_limit": rpc_limit,
+                }
+
+                batch = _postgrest_rpc_list(
+                    rest_url=obs_rest_url,
+                    api_key=obs_key,
+                    schema=PUBLIC_SCHEMA,
+                    rpc_name="uk_aq_rpc_observs_history_day_rows",
+                    body=rpc_body,
+                )
+                if not batch:
+                    break
+
+                for item in batch:
+                    try:
+                        timeseries_id = int(item.get("timeseries_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    if timeseries_id not in target_timeseries_set:
+                        continue
+                    observed_at_raw = _parse_timestamp(str(item.get("observed_at") or ""))
+                    if observed_at_raw is None:
+                        continue
+                    observed_at = _as_utc(observed_at_raw)
+                    if observed_at < start_dt or observed_at > end_dt:
+                        continue
+                    rows.append(
+                        {
+                            "connector_id": connector_id,
+                            "timeseries_id": timeseries_id,
+                            "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+                            "value": item.get("value"),
+                        }
+                    )
+                    if len(rows) >= safe_max_rows:
+                        rows = rows[:safe_max_rows]
+                        truncated = True
+                        break
+
+                if truncated:
+                    break
+                if len(batch) < rpc_limit:
+                    break
+
+                last_row = batch[-1]
+                try:
+                    after_timeseries_id = int(last_row.get("timeseries_id"))
+                    after_observed_at = str(last_row.get("observed_at") or "").strip()
+                except (TypeError, ValueError):
+                    break
+                if not after_observed_at:
+                    break
+                if after_timeseries_id > max_target_timeseries_id:
+                    break
+
+            if truncated:
+                break
+        day_cursor += timedelta(days=1)
+
+    rows.sort(key=lambda row: str(row.get("observed_at") or ""), reverse=True)
+    return rows, truncated
+
+
+def _augment_snapshot_with_obs_aqidb(
+    payload: Dict[str, Any],
+    obs_rest_url: str,
+    obs_key: str,
+    obs_limit: Optional[int],
+    page_size: int,
+    max_rows: int,
+) -> None:
+    station = payload.get("station")
+    if not isinstance(station, dict):
+        return
+
+    meta = payload.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["meta"] = meta
+
+    payload["obs_aqidb_observations"] = []
+    payload["obs_aqidb_observations_all"] = []
+    payload["obs_aqidb_timeseries_aqi_hourly"] = []
+    payload["obs_aqidb_timeseries_aqi_daily"] = []
+
+    if not obs_rest_url or not obs_key:
+        meta["obs_aqidb_source"] = "unavailable"
+        meta["obs_aqidb_error"] = (
+            "ObsAQIDB is not configured (set OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY)."
+        )
+        return
+
+    window_start_iso = str(meta.get("window_start") or "").strip()
+    window_end_iso = str(meta.get("window_end") or "").strip()
+    window_start_day = window_start_iso[:10] if len(window_start_iso) >= 10 else ""
+    window_end_day = window_end_iso[:10] if len(window_end_iso) >= 10 else ""
+
+    timeseries_rows = payload.get("timeseries")
+    timeseries_rows_safe = timeseries_rows if isinstance(timeseries_rows, list) else []
+    timeseries_ids: List[int] = []
+    for row in timeseries_rows_safe:
+        if not isinstance(row, dict):
+            continue
+        try:
+            timeseries_ids.append(int(row.get("id")))
+        except (TypeError, ValueError):
+            continue
+    timeseries_ids = sorted(set(timeseries_ids))
+
+    selected_timeseries_id_raw = payload.get("selected_timeseries_id")
+    selected_timeseries_id: Optional[int] = None
+    try:
+        if selected_timeseries_id_raw is not None:
+            selected_timeseries_id = int(selected_timeseries_id_raw)
+    except (TypeError, ValueError):
+        selected_timeseries_id = None
+
+    obs_aqidb_errors: List[str] = []
+    obs_aqidb_truncated = False
+    meta["obs_aqidb_source"] = "service_role_postgrest_rpc_views"
+
+    if timeseries_ids and window_start_iso and window_end_iso:
+        try:
+            obs_all_rows, obs_all_truncated = _fetch_obs_aqidb_observations_via_rpc(
+                obs_rest_url=obs_rest_url,
+                obs_key=obs_key,
+                timeseries_rows=timeseries_rows_safe,
+                window_start_iso=window_start_iso,
+                window_end_iso=window_end_iso,
+                max_rows=max_rows,
+            )
+            if obs_limit is not None and len(obs_all_rows) > obs_limit:
+                obs_all_rows = obs_all_rows[:obs_limit]
+                obs_all_truncated = True
+
+            if selected_timeseries_id is not None:
+                obs_selected_rows = [
+                    row for row in obs_all_rows
+                    if int(row.get("timeseries_id") or -1) == selected_timeseries_id
+                ]
+            else:
+                obs_selected_rows = []
+            obs_selected_truncated = False
+            if obs_limit is not None and len(obs_selected_rows) > obs_limit:
+                obs_selected_rows = obs_selected_rows[:obs_limit]
+                obs_selected_truncated = True
+
+            payload["obs_aqidb_observations_all"] = obs_all_rows
+            payload["obs_aqidb_observations"] = obs_selected_rows
+            obs_aqidb_truncated = bool(
+                obs_aqidb_truncated
+                or obs_all_truncated
+                or obs_selected_truncated
+            )
+        except Exception as exc:
+            obs_aqidb_errors.append(str(exc))
+
+    if timeseries_ids and window_start_day and window_end_day:
+        timeseries_filter = "in.(" + ",".join(str(ts_id) for ts_id in timeseries_ids) + ")"
+        headers = _postgrest_headers(obs_key, schema=PUBLIC_SCHEMA)
+
+        try:
+            hourly_rows, hourly_truncated = _fetch_all_limited(
+                obs_rest_url,
+                headers,
+                "uk_aq_timeseries_aqi_hourly",
+                {
+                    "timeseries_id": timeseries_filter,
+                    "and": f"(timestamp_hour_utc.gte.{window_start_iso},timestamp_hour_utc.lte.{window_end_iso})",
+                    "select": "*",
+                    "order": "timestamp_hour_utc.desc,timeseries_id.asc",
+                },
+                page_size=page_size,
+                max_rows=max_rows,
+            )
+            payload["obs_aqidb_timeseries_aqi_hourly"] = hourly_rows
+            obs_aqidb_truncated = bool(obs_aqidb_truncated or hourly_truncated)
+        except Exception as exc:
+            obs_aqidb_errors.append(str(exc))
+
+        try:
+            daily_rows, daily_truncated = _fetch_all_limited(
+                obs_rest_url,
+                headers,
+                "uk_aq_timeseries_aqi_daily",
+                {
+                    "timeseries_id": timeseries_filter,
+                    "and": f"(observed_day.gte.{window_start_day},observed_day.lte.{window_end_day})",
+                    "select": "*",
+                    "order": "observed_day.desc,timeseries_id.asc,standard_code.asc,pollutant_code.asc",
+                },
+                page_size=page_size,
+                max_rows=max_rows,
+            )
+            payload["obs_aqidb_timeseries_aqi_daily"] = daily_rows
+            obs_aqidb_truncated = bool(obs_aqidb_truncated or daily_truncated)
+        except Exception as exc:
+            obs_aqidb_errors.append(str(exc))
+
+    any_obs_aqidb_rows = any(
+        [
+            payload["obs_aqidb_observations"],
+            payload["obs_aqidb_observations_all"],
+            payload["obs_aqidb_timeseries_aqi_hourly"],
+            payload["obs_aqidb_timeseries_aqi_daily"],
+        ]
+    )
+    if not any_obs_aqidb_rows and obs_aqidb_errors:
+        meta["obs_aqidb_source"] = "error"
+        meta["obs_aqidb_error"] = "; ".join(obs_aqidb_errors)
+        return
+
+    meta["obs_aqidb_truncated"] = bool(obs_aqidb_truncated)
+    meta["obs_aqidb_counts"] = {
+        "observations_selected": len(payload["obs_aqidb_observations"]),
+        "observations_all": len(payload["obs_aqidb_observations_all"]),
+        "timeseries_aqi_hourly": len(payload["obs_aqidb_timeseries_aqi_hourly"]),
+        "timeseries_aqi_daily": len(payload["obs_aqidb_timeseries_aqi_daily"]),
+    }
+    if obs_aqidb_errors:
+        meta["obs_aqidb_warning"] = "; ".join(obs_aqidb_errors)
+
+
 def _build_station_snapshot_payload(
     base_url: str,
     service_role_key: str,
@@ -2657,6 +3035,24 @@ def _build_station_snapshot_payload(
     meta_value.setdefault("ingest_source", "service_role_postgrest_rpc")
     meta_value.setdefault("obs_aqidb_source", "unavailable")
     meta_value.setdefault("requested_obs_limit", "all" if obs_limit is None else obs_limit)
+
+    obs_rest_url = ""
+    if OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY:
+        try:
+            obs_rest_url = _ensure_allowed_base_url(
+                f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
+            )
+        except Exception:
+            obs_rest_url = ""
+
+    _augment_snapshot_with_obs_aqidb(
+        payload=payload,
+        obs_rest_url=obs_rest_url,
+        obs_key=OBS_AQIDB_SECRET_KEY,
+        obs_limit=obs_limit,
+        page_size=STATION_SNAPSHOT_PAGE_SIZE,
+        max_rows=STATION_SNAPSHOT_MAX_ROWS,
+    )
 
     return payload
 
@@ -3478,7 +3874,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "edge_url": f"{self.server.base_url}/rpc/{rpc_name}",
                 "default_station_id": default_station_id,
                 "snapshot_mode": "service_role_postgrest_rpc",
-                "has_obs_aqidb": False,
+                "has_obs_aqidb": bool(OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY),
                 "default_obs_limit": default_obs_limit,
             },
             indent=2,
