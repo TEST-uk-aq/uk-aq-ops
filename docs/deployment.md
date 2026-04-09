@@ -57,7 +57,7 @@ What it does:
 
 1. Builds `local/dashboard/server/Dockerfile`.
 2. Pushes the image to Artifact Registry.
-3. Deploys `local/dashboard/server/uk_aq_dashboard_local.py` to Cloud Run.
+3. Deploys `local/dashboard/server/uk_aq_dashboard_api.py` to Cloud Run.
 4. Prints the Cloud Run service URL in logs.
 
 After deploy:

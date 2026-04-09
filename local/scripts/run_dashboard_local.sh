@@ -22,7 +22,7 @@ if [[ "${DASHBOARD_LOCAL_ENFORCE_BEARER_AUTH:-false}" != "true" ]]; then
   export DASHBOARD_UPSTREAM_BEARER_TOKEN=""
 fi
 
-exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_local.py \
+exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_api.py \
   --host "$HOST" \
   --port "$PORT" \
   --html "$HTML_PATH"

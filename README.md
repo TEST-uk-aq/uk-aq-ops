@@ -48,7 +48,7 @@ Dashboard paths:
 
 - Static front end: `dashboard/`
 - Config generator: `scripts/dashboard/generate_dashboard_config.mjs`
-- Migrated backend API: `local/dashboard/server/uk_aq_dashboard_local.py`
+- Migrated backend API: `local/dashboard/server/uk_aq_dashboard_api.py`
 - Local launcher: `local/scripts/run_dashboard_local.sh`
 - Station snapshot front end: `station_snapshot/`
 - Station snapshot backend API: `local/station_snapshot/server/uk_aq_station_snapshot_local.py`
@@ -223,7 +223,7 @@ Primary controls:
 - Upstream auth header:
   - injects `X-UK-AQ-Upstream-Auth` using `UK_AQ_EDGE_UPSTREAM_SECRET`.
 
-### 11) Dashboard Backend Cloud Run (`local/dashboard/server/uk_aq_dashboard_local.py`)
+### 11) Dashboard Backend Cloud Run (`local/dashboard/server/uk_aq_dashboard_api.py`)
 
 - deploys the migrated Python dashboard backend as a Cloud Run service
 - serves compatibility API routes used by the hosted dashboard worker:

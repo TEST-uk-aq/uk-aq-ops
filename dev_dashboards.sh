@@ -82,7 +82,7 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-"$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_local.py --host "$HOST" --port "$SCHEDULER_PORT" >>"$SCHED_LOG" 2>&1 &
+"$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_api.py --host "$HOST" --port "$SCHEDULER_PORT" >>"$SCHED_LOG" 2>&1 &
 SCHED_PID=$!
 
 "$PYTHON_BIN" local/station_snapshot/server/uk_aq_station_snapshot_local.py --host "$HOST" --port "$SNAPSHOT_PORT" >>"$SNAP_LOG" 2>&1 &

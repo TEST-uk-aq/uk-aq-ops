@@ -85,11 +85,6 @@ OBS_AQIDB_SUPABASE_URL = str(os.getenv("OBS_AQIDB_SUPABASE_URL") or "").strip()
 OBS_AQIDB_SECRET_KEY = str(os.getenv("OBS_AQIDB_SECRET_KEY") or "").strip()
 PUBLIC_SCHEMA = os.getenv("UK_AQ_PUBLIC_SCHEMA", "uk_aq_public")
 R2_BACKUP_WINDOW_RPC = os.getenv("UK_AQ_R2_HISTORY_WINDOW_RPC", "uk_aq_rpc_r2_history_window")
-STATION_SNAPSHOT_RPC = os.getenv("UK_AQ_STATION_SNAPSHOT_RPC", "uk_aq_station_snapshot")
-STATION_SNAPSHOT_DEFAULT_STATION_ID = str(os.getenv("CLEANAIRSURB_ST_ID") or "").strip()
-STATION_SNAPSHOT_DEFAULT_OBS_LIMIT = str(
-    os.getenv("UK_AQ_STATION_SNAPSHOT_DEFAULT_OBS_LIMIT") or "all"
-).strip().lower()
 UK_AQ_DROPBOX_ROOT = str(os.getenv("UK_AQ_DROPBOX_ROOT") or "CIC-Test").strip()
 UK_AQ_DROPBOX_LOCAL_ROOT = str(os.getenv("UK_AQ_DROPBOX_LOCAL_ROOT") or "").strip()
 UK_AQ_DROPBOX_APP_FOLDER = str(os.getenv("UK_AQ_DROPBOX_APP_FOLDER") or "").strip()
@@ -268,6 +263,20 @@ def _load_env(path: Path) -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+def _station_snapshot_rpc_name() -> str:
+    value = str(os.getenv("UK_AQ_STATION_SNAPSHOT_RPC") or "uk_aq_station_snapshot").strip()
+    return value or "uk_aq_station_snapshot"
+
+
+def _station_snapshot_default_station_id() -> str:
+    return str(os.getenv("CLEANAIRSURB_ST_ID") or "").strip()
+
+
+def _station_snapshot_default_obs_limit() -> str:
+    value = str(os.getenv("UK_AQ_STATION_SNAPSHOT_DEFAULT_OBS_LIMIT") or "all").strip().lower()
+    return value or "all"
 
 
 def _postgrest_headers(
@@ -2614,10 +2623,11 @@ def _build_station_snapshot_payload(
     window: str,
     obs_limit: Optional[int],
 ) -> Dict[str, Any]:
-    headers = _postgrest_headers(service_role_key, schema=PUBLIC_SCHEMA)
+    rpc_name = _station_snapshot_rpc_name()
+    headers = _postgrest_headers(service_role_key, write=True, schema=PUBLIC_SCHEMA)
     headers["Content-Type"] = "application/json"
     payload = _post_json_object(
-        f"{base_url}/rpc/{STATION_SNAPSHOT_RPC}",
+        f"{base_url}/rpc/{rpc_name}",
         headers,
         {
             "p_station_id": station_id,
@@ -3457,14 +3467,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload.encode("utf-8"))
 
     def _serve_snapshot_config(self) -> None:
-        default_obs_limit = STATION_SNAPSHOT_DEFAULT_OBS_LIMIT
+        default_station_id = _station_snapshot_default_station_id()
+        default_obs_limit = _station_snapshot_default_obs_limit()
+        rpc_name = _station_snapshot_rpc_name()
         if default_obs_limit not in {"all", "100", "1000", "5000", "10000"}:
             default_obs_limit = "all"
 
         payload = json.dumps(
             {
-                "edge_url": f"{self.server.base_url}/rpc/{STATION_SNAPSHOT_RPC}",
-                "default_station_id": STATION_SNAPSHOT_DEFAULT_STATION_ID,
+                "edge_url": f"{self.server.base_url}/rpc/{rpc_name}",
+                "default_station_id": default_station_id,
                 "snapshot_mode": "service_role_postgrest_rpc",
                 "has_obs_aqidb": False,
                 "default_obs_limit": default_obs_limit,
@@ -3481,11 +3493,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_station_snapshot(self, parsed) -> None:
         query = parse_qs(parsed.query or "", keep_blank_values=False)
 
-        station_id_raw = (query.get("station_id") or [STATION_SNAPSHOT_DEFAULT_STATION_ID])[0]
+        default_station_id = _station_snapshot_default_station_id()
+        default_obs_limit = _station_snapshot_default_obs_limit()
+        station_id_raw = (query.get("station_id") or [default_station_id])[0]
         station_ref_raw = (query.get("station_ref") or [""])[0]
         timeseries_id_raw = (query.get("timeseries_id") or [""])[0]
         window_raw = (query.get("window") or ["24h"])[0]
-        obs_limit_raw = (query.get("obs_limit") or [STATION_SNAPSHOT_DEFAULT_OBS_LIMIT])[0]
+        obs_limit_raw = (query.get("obs_limit") or [default_obs_limit])[0]
 
         try:
             station_id = _parse_snapshot_station_id(station_id_raw)

@@ -4,7 +4,7 @@ This directory holds the migrated Python backend API used by the dashboard.
 
 Primary file:
 
-- `server/uk_aq_dashboard_local.py`
+- `server/uk_aq_dashboard_api.py`
 - `server/Dockerfile` (Cloud Run image build)
 
 Run locally from repo root:
