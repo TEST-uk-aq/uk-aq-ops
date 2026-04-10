@@ -1,9 +1,15 @@
-import { errorEnvelope, withCorsAndNoStore } from "./http";
+import { errorEnvelope, withCorsAndCacheControl, withCorsAndNoStore } from "./http";
 
 export type WorkerEnv = {
   DASHBOARD_UPSTREAM_BASE_URL?: string;
   DASHBOARD_UPSTREAM_BEARER_TOKEN?: string;
   UKAQ_PROXY_ROUTE_PREFIX?: string;
+};
+
+export type ProxyCacheOptions = {
+  cacheTtlSeconds?: number;
+  staleWhileRevalidateSeconds?: number;
+  bypassCache?: boolean;
 };
 
 export class UpstreamError extends Error {
@@ -15,6 +21,10 @@ export class UpstreamError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+function defaultEdgeCache(): Cache {
+  return (caches as unknown as { default: Cache }).default;
 }
 
 function resolveBaseUrl(env: WorkerEnv): string {
@@ -46,6 +56,7 @@ export async function proxyToUpstream(
   request: Request,
   env: WorkerEnv,
   upstreamPathname: string,
+  cacheOptions?: ProxyCacheOptions,
 ): Promise<Response> {
   const incomingUrl = new URL(request.url);
   const upstreamUrl = buildUpstreamUrl(env, upstreamPathname, incomingUrl.search);
@@ -66,6 +77,27 @@ export async function proxyToUpstream(
     body = await request.arrayBuffer();
   }
 
+  const cacheTtlSeconds = Math.max(0, Number(cacheOptions?.cacheTtlSeconds || 0));
+  const staleWhileRevalidateSeconds = Math.max(
+    0,
+    Number(cacheOptions?.staleWhileRevalidateSeconds || 0),
+  );
+  const useEdgeCache = method === "GET" && cacheTtlSeconds > 0;
+  const bypassCache = Boolean(cacheOptions?.bypassCache);
+  const cacheControl = useEdgeCache && !bypassCache
+    ? `public, max-age=${cacheTtlSeconds}, s-maxage=${cacheTtlSeconds}, stale-while-revalidate=${staleWhileRevalidateSeconds}`
+    : "no-store";
+  const cacheKey = new Request(incomingUrl.toString(), { method: "GET" });
+
+  if (useEdgeCache && !bypassCache) {
+    const cached = await defaultEdgeCache().match(cacheKey);
+    if (cached) {
+      const hit = withCorsAndCacheControl(cached, cacheControl);
+      hit.headers.set("X-UKAQ-Worker-Cache", "HIT");
+      return hit;
+    }
+  }
+
   let upstreamResp: Response;
   try {
     upstreamResp = await fetch(upstreamUrl, {
@@ -78,7 +110,17 @@ export async function proxyToUpstream(
     return errorEnvelope("UPSTREAM_UNREACHABLE", `Failed to reach upstream API: ${detail}`, 502);
   }
 
-  return withCorsAndNoStore(upstreamResp);
+  if (!useEdgeCache) {
+    return withCorsAndNoStore(upstreamResp);
+  }
+
+  const missResponse = withCorsAndCacheControl(upstreamResp, cacheControl);
+  missResponse.headers.set("X-UKAQ-Worker-Cache", bypassCache ? "BYPASS" : "MISS");
+
+  if (!bypassCache && upstreamResp.ok) {
+    await defaultEdgeCache().put(cacheKey, missResponse.clone());
+  }
+  return missResponse;
 }
 
 export async function fetchUpstreamJson(

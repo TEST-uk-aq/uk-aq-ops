@@ -60,6 +60,19 @@ What it does:
 3. Deploys `local/dashboard/server/uk_aq_dashboard_api.py` to Cloud Run.
 4. Prints the Cloud Run service URL in logs.
 
+Current default Cloud Run sizing (overridable by repo vars):
+
+- `SERVICE_CPU=0.25`
+- `SERVICE_MEMORY=512Mi`
+- `SERVICE_CONCURRENCY=10`
+- `SERVICE_MAX_INSTANCES=1`
+- `SERVICE_MIN_INSTANCES=0`
+
+R2 metrics auth inputs for backend:
+
+- account id: `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` (fallback `CLOUDFLARE_ACCOUNT_ID`)
+- token: `UK_AQ_R2_CLOUDFLARE_API_TOKEN` (fallback `CFLARE_API_READ_TOKEN`)
+
 After deploy:
 
 1. Copy the service URL from workflow logs.

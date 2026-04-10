@@ -21,6 +21,20 @@ Compatibility routes (for existing dashboard parity):
 - `POST /api/connectors`
 - `POST /api/dispatcher_settings`
 
+Edge caching is enabled for compatibility `GET` routes to reduce Cloud Run hits:
+
+- `/api/config`: 10 minutes
+- `/api/snapshot`: 30 seconds
+- `/api/dashboard`: 60 seconds
+- `/api/storage_coverage`: 5 minutes
+- `/api/r2_metrics`: 5 minutes
+- `/api/r2_connector_counts`: 5 minutes
+
+Cache bypass:
+
+- add `?force=1` (or `refresh=1` / `nocache=1`) to bypass edge cache
+- `t=<timestamp>` or `ts=<timestamp>` also bypasses cache
+
 Structured routes (JSON envelope):
 
 - `GET /api/health`

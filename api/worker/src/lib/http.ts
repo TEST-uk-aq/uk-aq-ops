@@ -53,9 +53,9 @@ export function errorEnvelope(code: string, message: string, status = 500): Resp
   );
 }
 
-export function withCorsAndNoStore(resp: Response): Response {
+export function withCorsAndCacheControl(resp: Response, cacheControl: string): Response {
   const headers = new Headers(resp.headers);
-  headers.set("Cache-Control", "no-store");
+  headers.set("Cache-Control", cacheControl);
   for (const [key, value] of Object.entries(CORS_HEADERS)) {
     headers.set(key, value);
   }
@@ -64,6 +64,10 @@ export function withCorsAndNoStore(resp: Response): Response {
     statusText: resp.statusText,
     headers,
   });
+}
+
+export function withCorsAndNoStore(resp: Response): Response {
+  return withCorsAndCacheControl(resp, "no-store");
 }
 
 export function optionsResponse(): Response {
