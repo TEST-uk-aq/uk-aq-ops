@@ -2414,10 +2414,22 @@ def _fetch_r2_backup_window(
 
 
 def _fetch_r2_account_metrics(now: datetime) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    account_id = str(os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
-    api_token = str(os.getenv("CFLARE_API_READ_TOKEN") or "").strip()
+    account_id = str(
+        os.getenv("UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID")
+        or os.getenv("CLOUDFLARE_ACCOUNT_ID")
+        or ""
+    ).strip()
+    api_token = str(
+        os.getenv("UK_AQ_R2_CLOUDFLARE_API_TOKEN")
+        or os.getenv("CFLARE_API_READ_TOKEN")
+        or ""
+    ).strip()
     if not account_id or not api_token:
-        return None, "missing CLOUDFLARE_ACCOUNT_ID or CFLARE_API_READ_TOKEN"
+        return (
+            None,
+            "missing UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_ACCOUNT_ID or "
+            "UK_AQ_R2_CLOUDFLARE_API_TOKEN/CFLARE_API_READ_TOKEN",
+        )
 
     free_tier_raw = str(os.getenv("UK_AQ_R2_FREE_TIER_GB", "10")).strip()
     free_tier_gb = _safe_number(free_tier_raw)
