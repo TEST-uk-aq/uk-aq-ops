@@ -1222,7 +1222,11 @@ function rowsToAqilevelParquetBuffer(rows, writerProperties) {
   const table = arrow.tableFromArrays({
     connector_id: rows.map((row) => Number(row.connector_id)),
     timeseries_id: rows.map((row) => Number(row.timeseries_id)),
-    station_id: rows.map((row) => Number(row.station_id)),
+    station_id: rows.map((row) => (
+      row.station_id === null || row.station_id === undefined
+        ? null
+        : Number(row.station_id)
+    )),
     pollutant_code: rows.map((row) => String(row.pollutant_code || "")),
     timestamp_hour_utc: rows.map((row) => new Date(row.timestamp_hour_utc)),
     no2_hourly_mean_ugm3: rows.map((row) => row.no2_hourly_mean_ugm3),
@@ -1546,9 +1550,14 @@ function normalizeAqilevelHistoryRow(row, connectorIdFallback = null) {
     return null;
   }
   const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
+  const stationIdRaw = row.station_id;
+  const stationIdValue = stationIdRaw === null || stationIdRaw === undefined || stationIdRaw === ""
+    ? null
+    : Number(stationIdRaw);
   const parsed = {
     timeseries_id: Number(row.timeseries_id),
-    station_id: Number(row.station_id),
+    station_id:
+      Number.isFinite(stationIdValue) && stationIdValue > 0 ? Math.trunc(stationIdValue) : null,
     connector_id: Number.isFinite(Number(row.connector_id)) && Number(row.connector_id) > 0
       ? Number(row.connector_id)
       : Number.isFinite(Number(connectorIdFallback)) && Number(connectorIdFallback) > 0
@@ -1608,7 +1617,6 @@ function normalizeAqilevelHistoryRow(row, connectorIdFallback = null) {
 
   if (
     !Number.isFinite(parsed.timeseries_id) || parsed.timeseries_id <= 0 ||
-    !Number.isFinite(parsed.station_id) || parsed.station_id <= 0 ||
     !Number.isFinite(parsed.connector_id) || parsed.connector_id <= 0 ||
     !parsed.pollutant_code ||
     !parsed.timestamp_hour_utc

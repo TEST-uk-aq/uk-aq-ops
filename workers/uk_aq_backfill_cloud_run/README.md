@@ -56,6 +56,7 @@ All fields are optional unless noted.
     - observations rows -> `history/v1/observations/...`
     - AQI hourly rows -> `history/v1/aqilevels/...`
     - AQI parquet rows are normalized (`pollutant_code`, `hourly_mean_ugm3`, `rolling24h_mean_ugm3`, `daqi_index_level`, `eaqi_index_level`).
+    - AQI export preserves rows when `station_id` is null so connector/day counts stay consistent with source RPC totals.
   - each domain writes connector parquet part files, connector manifests, and a day manifest.
     - AQI connector manifest file entries include `pollutant_codes` for lightweight timeseries-index pruning.
   - behavior:

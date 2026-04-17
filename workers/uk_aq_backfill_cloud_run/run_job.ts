@@ -235,7 +235,7 @@ type ObsHistoryParquetRow = {
 
 type AqilevelsHistoryRow = {
   timeseries_id: number;
-  station_id: number;
+  station_id: number | null;
   connector_id: number;
   pollutant_code: "no2" | "pm25" | "pm10";
   timestamp_hour_utc: string;
@@ -249,7 +249,7 @@ type AqilevelsHistoryRow = {
 type AqilevelsHistoryParquetRow = {
   connector_id: number;
   timeseries_id: number;
-  station_id: number;
+  station_id: number | null;
   pollutant_code: "no2" | "pm25" | "pm10";
   timestamp_hour_utc: string;
   hourly_mean_ugm3: number | null;
@@ -1759,7 +1759,13 @@ function normalizeAqilevelsHistoryRows(
     }
     const record = item as Record<string, unknown>;
     const timeseriesId = Number(record.timeseries_id);
-    const stationId = Number(record.station_id);
+    const stationIdRaw = record.station_id;
+    const stationIdValue = stationIdRaw === null || stationIdRaw === undefined || stationIdRaw === ""
+      ? null
+      : Number(stationIdRaw);
+    const stationId = Number.isInteger(stationIdValue) && Number(stationIdValue) > 0
+      ? Math.trunc(Number(stationIdValue))
+      : null;
     const connectorIdRaw = Number(record.connector_id);
     const connectorId = Number.isInteger(connectorIdRaw) && connectorIdRaw > 0
       ? Math.trunc(connectorIdRaw)
@@ -1777,7 +1783,6 @@ function normalizeAqilevelsHistoryRows(
     const timestampMs = Date.parse(timestampRaw);
     if (
       !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
-      !Number.isInteger(stationId) || stationId <= 0 ||
       connectorId === null || connectorId <= 0 ||
       !pollutantCode ||
       !Number.isFinite(timestampMs)
@@ -1803,7 +1808,7 @@ function normalizeAqilevelsHistoryRows(
 
     rows.push({
       timeseries_id: Math.trunc(timeseriesId),
-      station_id: Math.trunc(stationId),
+      station_id: stationId,
       connector_id: connectorId,
       pollutant_code: pollutantCode,
       timestamp_hour_utc: timestamp.toISOString(),
@@ -6630,7 +6635,9 @@ function helperRowsToAqilevelHistoryRows(
 
     normalizedRows.push({
       timeseries_id: Number(row.timeseries_id),
-      station_id: Number(row.station_id),
+      station_id: row.station_id === null || row.station_id === undefined
+        ? null
+        : Number(row.station_id),
       connector_id: Number(row.connector_id),
       pollutant_code: pollutantCode,
       timestamp_hour_utc: String(row.timestamp_hour_utc || ""),
@@ -6645,8 +6652,13 @@ function helperRowsToAqilevelHistoryRows(
   return normalizedRows.filter((row) =>
     Number.isInteger(row.timeseries_id) &&
     row.timeseries_id > 0 &&
-    Number.isInteger(row.station_id) &&
-    row.station_id > 0 &&
+    (
+      row.station_id === null
+      || (
+        Number.isInteger(row.station_id) &&
+        row.station_id > 0
+      )
+    ) &&
     Number.isInteger(row.connector_id) &&
     row.connector_id > 0 &&
     !!parseIsoHour(row.timestamp_hour_utc)
