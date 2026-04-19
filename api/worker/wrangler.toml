@@ -8,5 +8,5 @@ UKAQ_PROXY_ROUTE_PREFIX = "/api"
 # DASHBOARD_UPSTREAM_BASE_URL = "https://example.internal"
 
 [[routes]]
-pattern = "cic-test-uk-aq-admin.chronicillnesschannel.co.uk/api/*"
+pattern = "__UK_AQ_OPS_ADMIN_HOSTNAME__/api/*"
 zone_name = "chronicillnesschannel.co.uk"

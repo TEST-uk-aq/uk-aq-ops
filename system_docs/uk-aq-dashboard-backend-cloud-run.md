@@ -47,6 +47,13 @@ Common optional settings:
 - `DROPBOX_APP_SECRET`
 - `DROPBOX_REFRESH_TOKEN`
 
+Optional secret binding behavior:
+
+- The deploy workflow now mounts optional Secret Manager env bindings only when the
+  corresponding value is configured in that deployment (for example API URL + token,
+  bearer token enabled, or full Dropbox credential set).
+- Required DB keys (`SB_SECRET_KEY`, `OBS_AQIDB_SECRET_KEY`) are always mounted.
+
 Dropbox status note:
 
 - If local checkpoint file discovery fails (for example in Cloud Run), the backend now fetches

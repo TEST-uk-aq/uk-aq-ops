@@ -15,6 +15,8 @@ This checklist is for immediate Cloud Run/Scheduler cost control without changin
 1. Billing report: group by service, compare `Cloud Run` daily cost before/after deploy.
 2. Cloud Run metrics: request count and container instance time for `uk-aq-dashboard-backend`.
 3. Confirm no increase in error rate on `/api/dashboard` and `/api/r2_metrics`.
+4. Secret Manager: verify `Secret Manager Secret Access Operations` drops after deploy
+   (optional secrets are now only mounted when configured).
 
 ## 3) Pause non-essential scheduler jobs (only where safe)
 

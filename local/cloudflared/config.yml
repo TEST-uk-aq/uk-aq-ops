@@ -1,0 +1,23 @@
+# Cloudflare Tunnel config — copy to ~/.cloudflared/config.yml after setup.
+#
+# Setup steps (one-time):
+#   brew install cloudflare/cloudflare/cloudflared
+#   cloudflared tunnel login
+#   cloudflared tunnel create uk-aq-local
+#   # Note the UUID printed above, paste it below.
+#   cloudflared tunnel route dns uk-aq-local cic-test-uk-aq-admin.chronicillnesschannel.co.uk
+#   cloudflared tunnel route dns uk-aq-local uk-aq-admin.chronicillnesschannel.co.uk
+#
+# Then copy this file:
+#   cp local/cloudflared/config.yml ~/.cloudflared/config.yml
+#   # Edit ~/.cloudflared/config.yml to set the real tunnel UUID.
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /Users/mikehinford/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: cic-test-uk-aq-admin.chronicillnesschannel.co.uk
+    service: http://127.0.0.1:8000
+  - hostname: uk-aq-admin.chronicillnesschannel.co.uk
+    service: http://127.0.0.1:8001
+  - service: http_status:404
