@@ -15,6 +15,8 @@
     "start:supabase-db-dump-backup": "node workers/uk_aq_supabase_db_dump_backup_service/server.mjs",
     "dashboard:config": "node scripts/dashboard/generate_dashboard_config.mjs",
     "dashboard:local": "local/scripts/run_dashboard_local.sh",
+    "dashboard:test": "local/scripts/run_dashboard_test.sh",
+    "dashboard:live": "local/scripts/run_dashboard_live.sh",
     "station-snapshot:local": "local/scripts/run_station_snapshot_local.sh",
     "dashboards:start": "./dev_dashboards.sh",
     "dashboards:stop": "./dev_dashboards_stop.sh",

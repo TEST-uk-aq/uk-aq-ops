@@ -21,6 +21,7 @@ jobs:
       UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || 'uk-aq-observs-history-r2-api' }}
       UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_R2_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,6 +46,15 @@ jobs:
             echo "Missing variable UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID."
             exit 1
           fi
+          if [ -z "${CFLARE_R2_BUCKET}" ]; then
+            echo "Missing variable CFLARE_R2_BUCKET."
+            exit 1
+          fi
+
+      - name: Substitute wrangler.toml placeholders
+        run: |
+          set -euo pipefail
+          sed -i "s|__CFLARE_R2_BUCKET__|${CFLARE_R2_BUCKET}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
 
       - name: Set Worker secrets
         working-directory: workers/uk_aq_observs_history_r2_api_worker

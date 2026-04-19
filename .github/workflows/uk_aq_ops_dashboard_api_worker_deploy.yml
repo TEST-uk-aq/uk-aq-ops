@@ -19,6 +19,7 @@ jobs:
       UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api' }}
       UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_OPS_ADMIN_HOSTNAME: ${{ vars.UK_AQ_OPS_ADMIN_HOSTNAME || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,6 +48,15 @@ jobs:
             echo "Missing variable UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID."
             exit 1
           fi
+          if [ -z "${UK_AQ_OPS_ADMIN_HOSTNAME}" ]; then
+            echo "Missing variable UK_AQ_OPS_ADMIN_HOSTNAME."
+            exit 1
+          fi
+
+      - name: Substitute wrangler.toml placeholders
+        run: |
+          set -euo pipefail
+          sed -i "s|__UK_AQ_OPS_ADMIN_HOSTNAME__|${UK_AQ_OPS_ADMIN_HOSTNAME}|g" api/worker/wrangler.toml
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65

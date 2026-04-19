@@ -12,5 +12,5 @@ UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS = "86400"
 
 [[r2_buckets]]
 binding = "UK_AQ_HISTORY_BUCKET"
-bucket_name = "uk-aq-history-cic-test"
-preview_bucket_name = "uk-aq-history-cic-test"
+bucket_name = "__CFLARE_R2_BUCKET__"
+preview_bucket_name = "__CFLARE_R2_BUCKET__"
