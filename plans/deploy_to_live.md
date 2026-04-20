@@ -281,6 +281,7 @@ Apply full schema SQL to both live Supabase projects. No migrations needed — b
 
 ```bash
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_core_schema.sql
+psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_raw_schema.sql
 ```
 
 ### 2.2 Deploy obs_aqidb schema
@@ -322,64 +323,53 @@ Copy `uk_aq_core` metadata from test to live, preserving all PKs.
 
 See also: `system_docs/deploy_into_live/populate-live-core-db-from-test.md`
 
-### 3.1 Export from test (preserving IDs)
+### 3.1–3.5 Run the copy script
 
-Export tables in FK dependency order:
+Uses `psql \copy` (CSV) — works through the Supabase session pooler without requiring a direct DB connection. Handles export, import, `poll_enabled = false`, sequence reset, and validation in one pass.
 
-```bash
-TABLE_LIST="uk_aq_core.categories uk_aq_core.observed_properties uk_aq_core.phenomena \
-  uk_aq_core.offerings uk_aq_core.features uk_aq_core.procedures \
-  uk_aq_core.uk_aq_networks uk_aq_core.uk_air_sos_networks \
-  uk_aq_core.uk_air_sos_network_pollutants uk_aq_core.connectors \
-  uk_aq_core.stations uk_aq_core.station_metadata \
-  uk_aq_core.station_network_memberships uk_aq_core.timeseries"
-
-pg_dump $TEST_SUPABASE_DB_URL \
-  --no-owner --no-acl --column-inserts \
-  $(echo $TABLE_LIST | sed 's/ / -t /g' | sed 's/^/-t /') \
-  > /tmp/uk_aq_core_export.sql
-```
-
-### 3.2 Import into live
+**Required env vars:**
+- `SUPABASE_DB_URL` — test ingestdb (source); already set in `.env`
+- `LIVE_INGESTDB_SUPABASE_DB_URL` — live ingestdb pooler URL (dest)
 
 ```bash
-psql $LIVE_SUPABASE_DB_URL < /tmp/uk_aq_core_export.sql
+# From ops repo root:
+scripts/uk_aq_copy_core_to_live.sh
+
+# To also copy uk_aq_raw.uk_air_sos_station_refs (station→UK Air ID mapping):
+scripts/uk_aq_copy_core_to_live.sh --include-station-refs
+
+# Dry-run (export only, no writes to live):
+scripts/uk_aq_copy_core_to_live.sh --dry-run
 ```
 
-### 3.3 Set connectors to paused
+**uk_aq_raw tables — what to copy and what to skip:**
+- `uk_air_sos_station_refs`: copy with `--include-station-refs` (preserves station→UK Air ID mapping; avoids re-running station matching on first ingest)
+- All `*_checkpoints` tables: skip — start empty, ingest rebuilds them
+- `uk_air_sos_site_register`, `laqn_site_register`: skip — repopulated from source on first ingest run
+- `observation_rpc_metrics_minute`, `error_logs`: skip — operational/logs, start fresh
 
+**obs_aqidb tables — no direct copy needed:**
+- `uk_aq_public.*` mirror tables: populated by running `schemas/obs_aqi_db/uk_aq_core_mirror_rpcs.sql` against live obs_aqidb after this phase (see Phase 3.6 below)
+- `uk_aq_observs.observations`: starts empty — populated by Phase 4 R2 restore + ongoing ingest
+- `uk_aq_aqilevels.*`: starts empty — recomputed by the AQI hourly job once ingest is live
+
+### 3.6 Populate obs_aqidb mirror tables
+
+After the core copy completes, run the mirror RPCs to sync `uk_aq_public.*` in obs_aqidb:
+
+```bash
+psql $LIVE_OBS_AQIDB_DB_URL < schemas/obs_aqi_db/uk_aq_core_mirror_rpcs.sql
+```
+
+Then verify:
 ```sql
-UPDATE uk_aq_core.connectors SET poll_enabled = false;
+-- Run against live obs_aqidb
+SELECT count(*) FROM uk_aq_public.stations;
+SELECT count(*) FROM uk_aq_public.timeseries;
+SELECT count(*) FROM uk_aq_public.connectors;
 ```
 
-### 3.4 Reset identity sequences
-
-```sql
--- Run for each identity-backed table
-SELECT setval(pg_get_serial_sequence('uk_aq_core.connectors', 'id'), max(id)) FROM uk_aq_core.connectors;
-SELECT setval(pg_get_serial_sequence('uk_aq_core.stations', 'id'), max(id)) FROM uk_aq_core.stations;
-SELECT setval(pg_get_serial_sequence('uk_aq_core.timeseries', 'id'), max(id)) FROM uk_aq_core.timeseries;
-SELECT setval(pg_get_serial_sequence('uk_aq_core.categories', 'id'), max(id)) FROM uk_aq_core.categories;
-SELECT setval(pg_get_serial_sequence('uk_aq_core.phenomena', 'id'), max(id)) FROM uk_aq_core.phenomena;
-SELECT setval(pg_get_serial_sequence('uk_aq_core.offerings', 'id'), max(id)) FROM uk_aq_core.offerings;
-SELECT setval(pg_get_serial_sequence('uk_aq_core.features', 'id'), max(id)) FROM uk_aq_core.features;
-SELECT setval(pg_get_serial_sequence('uk_aq_core.procedures', 'id'), max(id)) FROM uk_aq_core.procedures;
--- Add other identity tables as needed (see seeds/uk_aq_connectors_seed.sql for pattern)
-```
-
-### 3.5 Validate
-
-```sql
--- Spot-check known IDs match test
-SELECT id, connector_code FROM uk_aq_core.connectors ORDER BY id LIMIT 10;
-SELECT id, station_ref FROM uk_aq_core.stations ORDER BY id LIMIT 10;
-SELECT id, timeseries_ref FROM uk_aq_core.timeseries ORDER BY id LIMIT 10;
-
--- Check row counts match test
-SELECT 'connectors' AS t, count(*) FROM uk_aq_core.connectors
-UNION ALL SELECT 'stations', count(*) FROM uk_aq_core.stations
-UNION ALL SELECT 'timeseries', count(*) FROM uk_aq_core.timeseries;
-```
+Row counts should match live ingestdb `uk_aq_core` counts.
 
 ---
 
