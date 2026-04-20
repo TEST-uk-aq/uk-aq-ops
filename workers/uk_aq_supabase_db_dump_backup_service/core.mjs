@@ -462,7 +462,7 @@ function resolveConfig() {
       },
       obs_aqidb: {
         name: "obs_aqidb",
-        dbUrl: requiredEnv("UK_AQ_OBS_AQIDB_DB_URL"),
+        dbUrl: requiredEnv("OBS_AQIDB_SUPABASE_DB_URL"),
       },
     },
     dropbox: {
