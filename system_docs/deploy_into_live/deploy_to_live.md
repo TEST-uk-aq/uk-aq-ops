@@ -414,6 +414,8 @@ rclone copy \
 
 Verify the expected files would be copied.
 
+Note - rclone transfers files based on the file size and last modified time to determine whether a file needs to be copied or updated. (Deletes if not in source too.)
+
 ### 4.3 Copy observations and aqilevels
 
 ```bash

@@ -2749,6 +2749,7 @@
           stackOrderKeys,
           ariaLabel,
           emptyLabel,
+          yMaxOverride,
         }) => {
           if (!Array.isArray(points) || points.length === 0) {
             return `
@@ -2774,7 +2775,7 @@
             const total = seriesDefs.reduce((sum, series) => sum + Number(point[series.key] || 0), 0);
             return Math.max(max, total);
           }, 0);
-          const yMax = computeAxisMax(maxStack);
+          const yMax = yMaxOverride != null ? yMaxOverride : computeAxisMax(maxStack);
           const yFor = (valueMb) => {
             const capped = Math.max(0, Math.min(yMax, Number(valueMb)));
             return margin.top + (1 - capped / yMax) * innerHeight;
@@ -2877,6 +2878,7 @@
             { key: "uk_aq_aqilevels", label: "uk_aq_aqilevels", color: COLOR_OBSAQI_AQILEVELS },
           ],
           stackOrderKeys: ["uk_aq_aqilevels", "uk_aq_observs"],
+          yMaxOverride: 500,
         });
 
         const r2DomainPoints = buildStackedMetricPoints(

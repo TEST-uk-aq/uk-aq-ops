@@ -86,6 +86,9 @@ EXCLUDES=(
   --exclude='AGENTS.md'
   --exclude='README_CROSS_REPO.md'
   --exclude='requirements-dev.txt'
+
+  # Website favicon images
+  --exclude='favicon.png'
 )
 
 # ── Sync function ─────────────────────────────────────────────────────────────
