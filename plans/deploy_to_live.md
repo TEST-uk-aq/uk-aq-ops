@@ -282,7 +282,12 @@ Apply full schema SQL to both live Supabase projects. No migrations needed — b
 ```bash
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_core_schema.sql
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_raw_schema.sql
+psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_ops_schema.sql
+psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_public_views.sql
+psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_security.sql
 ```
+
+> **Note:** `uk_aq_public` must exist in ingestdb (not just obs_aqidb) because it is listed in the PostgREST exposed schemas. If it is missing, PostgREST cannot build its schema cache and returns `PGRST002` for all requests.
 
 ### 2.2 Deploy obs_aqidb schema
 
@@ -364,9 +369,9 @@ psql $LIVE_OBS_AQIDB_DB_URL < schemas/obs_aqi_db/uk_aq_core_mirror_rpcs.sql
 Then verify:
 ```sql
 -- Run against live obs_aqidb
-SELECT count(*) FROM uk_aq_public.stations;
-SELECT count(*) FROM uk_aq_public.timeseries;
-SELECT count(*) FROM uk_aq_public.connectors;
+SELECT count(*) FROM uk_aq_core.stations;
+SELECT count(*) FROM uk_aq_core.timeseries;
+SELECT count(*) FROM uk_aq_core.connectors;
 ```
 
 Row counts should match live ingestdb `uk_aq_core` counts.
@@ -401,8 +406,8 @@ rclone config create uk_aq_r2_live s3 \
 
 ```bash
 rclone copy \
-  uk_aq_r2_test:<TEST_BUCKET>/history/v1/observations \
-  uk_aq_r2_live:<LIVE_BUCKET>/history/v1/observations \
+  uk_aq_r2_test:uk-aq-history-cic-test/history/v1/observations \
+  uk_aq_r2_live:uk-aq-history-live/history/v1/observations \
   --include "day_utc=YYYY-MM-DD/**" \
   --dry-run --progress
 ```
@@ -413,13 +418,13 @@ Verify the expected files would be copied.
 
 ```bash
 rclone copy \
-  uk_aq_r2_test:<TEST_BUCKET>/history/v1/observations \
-  uk_aq_r2_live:<LIVE_BUCKET>/history/v1/observations \
+  uk_aq_r2_test:uk-aq-history-cic-test/history/v1/observations \
+  uk_aq_r2_live:uk-aq-history-live/history/v1/observations \
   --progress --transfers 8
 
 rclone copy \
-  uk_aq_r2_test:<TEST_BUCKET>/history/v1/aqilevels \
-  uk_aq_r2_live:<LIVE_BUCKET>/history/v1/aqilevels \
+  uk_aq_r2_test:uk-aq-history-cic-test/history/v1/aqilevels \
+  uk_aq_r2_live:uk-aq-history-live/history/v1/aqilevels \
   --progress --transfers 8
 ```
 
@@ -445,10 +450,10 @@ node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --domain both
 
 ```bash
 # Confirm day manifests exist
-rclone ls uk_aq_r2_live:<LIVE_BUCKET>/history/v1/observations/ | grep manifest | tail -5
+rclone ls uk_aq_r2_live:uk-aq-history-live/history/v1/observations/ | grep manifest | tail -5
 
 # Confirm index files written
-rclone ls uk_aq_r2_live:<LIVE_BUCKET>/history/_index/
+rclone ls uk_aq_r2_live:uk-aq-history-live/history/_index/
 ```
 
 Check that `observations_latest.json`, `aqilevels_latest.json`, and `observations_timeseries_latest.json` are present.

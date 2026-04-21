@@ -7,11 +7,17 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/local/scripts/run_dashboard_live.sh</string>
+        <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/LIVE UK AQ Networks/LIVE-uk-aq-ops/local/scripts/run_dashboard.sh</string>
     </array>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PORT</key>
+        <string>8001</string>
+    </dict>
+
     <key>WorkingDirectory</key>
-    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops</string>
+    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/LIVE UK AQ Networks/LIVE-uk-aq-ops</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -23,9 +29,9 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/logs/dashboard_live.log</string>
+    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/LIVE UK AQ Networks/LIVE-uk-aq-ops/logs/dashboard_live.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/logs/dashboard_live.log</string>
+    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/LIVE UK AQ Networks/LIVE-uk-aq-ops/logs/dashboard_live.log</string>
 </dict>
 </plist>

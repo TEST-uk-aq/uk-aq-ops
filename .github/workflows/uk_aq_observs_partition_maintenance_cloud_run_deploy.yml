@@ -330,6 +330,7 @@ jobs:
             --max-instances "${SERVICE_MAX_INSTANCES}" \
             --min-instances "${SERVICE_MIN_INSTANCES}" \
             --no-cpu-boost \
+            --cpu-throttling \
             --labels "job_name=${RESOURCE_LABEL},service_name=${SERVICE_NAME}" \
             --no-allow-unauthenticated \
             --env-vars-file "${{ steps.cloudrun_args.outputs.env_file }}" \
