@@ -2298,9 +2298,87 @@ def _fetch_r2_history_days_from_external_api(
     return day_sets, r2_window, bucket_value, None
 
 
+def _fetch_r2_history_days_from_supabase(
+    base_url: str,
+    service_role_key: str,
+) -> Tuple[
+    Optional[Dict[str, Set[date]]],
+    Optional[Dict[str, Any]],
+    Optional[str],
+    Optional[str],
+]:
+    public_headers = {
+        "apikey": service_role_key,
+        "Authorization": f"Bearer {service_role_key}",
+        "Accept-Profile": PUBLIC_SCHEMA,
+    }
+
+    try:
+        window_rows = _fetch_json(
+            f"{base_url}/rpc/uk_aq_rpc_r2_history_window",
+            public_headers,
+            {},
+        )
+    except Exception as exc:
+        return None, None, None, f"R2 history-days Supabase window RPC failed: {exc}"
+
+    if not window_rows or not isinstance(window_rows, list):
+        return None, None, None, "R2 history-days Supabase window RPC returned empty"
+
+    row = window_rows[0] if isinstance(window_rows[0], dict) else {}
+    min_day = _parse_iso_day(row.get("min_day_utc"))
+    max_day = _parse_iso_day(row.get("max_day_utc"))
+
+    if min_day is None or max_day is None:
+        empty_sets: Dict[str, Set[date]] = {"observations": set(), "aqilevels": set()}
+        empty_window: Dict[str, Any] = {
+            "min_day_utc": None,
+            "max_day_utc": None,
+            "day_count": 0,
+            "observations_day_count": 0,
+            "aqilevels_day_count": 0,
+            "count_basis": "supabase_prune_day_gates",
+        }
+        return empty_sets, empty_window, "supabase_prune_day_gates", None
+
+    try:
+        day_rows = _fetch_json(
+            f"{base_url}/rpc/uk_aq_rpc_r2_history_days_by_domain",
+            public_headers,
+            {"p_from_day_utc": min_day.isoformat(), "p_to_day_utc": max_day.isoformat()},
+        )
+    except Exception as exc:
+        return None, None, None, f"R2 history-days Supabase days-by-domain RPC failed: {exc}"
+
+    day_sets: Dict[str, Set[date]] = {"observations": set(), "aqilevels": set()}
+    for r in day_rows or []:
+        if not isinstance(r, dict):
+            continue
+        d = _parse_iso_day(r.get("day_utc"))
+        domain = str(r.get("domain_name") or "").strip().lower()
+        if d is not None and domain in day_sets:
+            day_sets[domain].add(d)
+
+    observations_days = day_sets["observations"]
+    aqilevels_days = day_sets["aqilevels"]
+    overlap_days = observations_days & aqilevels_days
+
+    r2_window: Dict[str, Any] = {
+        "min_day_utc": min(overlap_days).isoformat() if overlap_days else None,
+        "max_day_utc": max(overlap_days).isoformat() if overlap_days else None,
+        "day_count": len(overlap_days),
+        "observations_day_count": len(observations_days),
+        "aqilevels_day_count": len(aqilevels_days),
+        "count_basis": "supabase_prune_day_gates",
+    }
+    return day_sets, r2_window, "supabase_prune_day_gates", None
+
+
 def _get_r2_history_days_cached(
     *,
     force_refresh: bool = False,
+    base_url: Optional[str] = None,
+    service_role_key: Optional[str] = None,
 ) -> Tuple[
     Optional[Dict[str, Set[date]]],
     Optional[Dict[str, Any]],
@@ -2323,6 +2401,12 @@ def _get_r2_history_days_cached(
             )
 
     day_sets, r2_window, bucket_value, error = _fetch_r2_history_days_from_external_api()
+    if error is not None and base_url and service_role_key:
+        sb_day_sets, sb_window, sb_bucket, sb_error = _fetch_r2_history_days_from_supabase(
+            base_url, service_role_key
+        )
+        if sb_error is None and sb_day_sets is not None:
+            day_sets, r2_window, bucket_value, error = sb_day_sets, sb_window, sb_bucket, None
     with CACHE_LOCK:
         R2_HISTORY_DAYS_CACHE_STATE["day_sets"] = day_sets
         R2_HISTORY_DAYS_CACHE_STATE["window"] = r2_window
@@ -3246,7 +3330,11 @@ def _fetch_storage_coverage_context(
         r2_backup_window_from_history_days,
         r2_history_days_bucket,
         r2_history_days_error,
-    ) = _get_r2_history_days_cached(force_refresh=False)
+    ) = _get_r2_history_days_cached(
+        force_refresh=False,
+        base_url=base_url,
+        service_role_key=str(headers.get("apikey") or ""),
+    )
     r2_backup_window_rpc, r2_backup_window_rpc_error = _fetch_r2_backup_window(
         base_url,
         headers,
@@ -4011,7 +4099,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 r2_backup_window_from_history_days,
                 r2_history_days_bucket,
                 r2_history_days_error,
-            ) = _get_r2_history_days_cached(force_refresh=False)
+            ) = _get_r2_history_days_cached(
+                force_refresh=False,
+                base_url=self.server.base_url,
+                service_role_key=self.server.service_role_key,
+            )
             r2_backup_window_rpc, r2_backup_window_rpc_error = _fetch_r2_backup_window(
                 self.server.base_url,
                 headers,
