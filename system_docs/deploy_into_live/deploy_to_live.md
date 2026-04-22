@@ -282,6 +282,8 @@ Apply full schema SQL to both live Supabase projects. No migrations needed — b
 ```bash
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_core_schema.sql
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_raw_schema.sql
+psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_aqilevels_schema.sql
+psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_rpc.sql
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_ops_schema.sql
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_public_views.sql
 psql $LIVE_SUPABASE_DB_URL < schemas/ingest_db/uk_aq_security.sql
@@ -360,11 +362,24 @@ scripts/uk_aq_copy_core_to_live.sh --dry-run
 
 ### 3.6 Populate obs_aqidb mirror tables
 
-After the core copy completes, run the mirror RPCs to sync `uk_aq_public.*` in obs_aqidb:
+After the core copy completes, first deploy the mirror RPC functions to live obs_aqidb (these are what the sync script calls to write into obs_aqidb):
 
 ```bash
 psql $LIVE_OBS_AQIDB_DB_URL < schemas/obs_aqi_db/uk_aq_core_mirror_rpcs.sql
 ```
+
+Then run the sync script to copy `uk_aq_core.*` data from live ingestdb into live obs_aqidb. Run from the live ingest repo root with live env vars loaded:
+
+```bash
+# From LIVE-uk-aq-ingest repo root
+SRC_SUPABASE_URL=$SUPABASE_URL \
+SRC_SECRET_KEY=$SB_SECRET_KEY \
+DST_SUPABASE_URL=$OBS_AQIDB_SUPABASE_URL \
+DST_SECRET_KEY=$OBS_AQIDB_SECRET_KEY \
+python3 scripts/stations_daily/sync_obs_aqidb_uk_aq_core.py
+```
+
+Alternatively, trigger via `uk_aq_stations_daily.yml` → Run workflow on the live ingest repo (the workflow runs the same script with the same env vars).
 
 Then verify:
 ```sql
@@ -375,6 +390,8 @@ SELECT count(*) FROM uk_aq_core.connectors;
 ```
 
 Row counts should match live ingestdb `uk_aq_core` counts.
+
+> **Important:** `uk_aq_core.timeseries` in obs_aqidb must be populated before the AQI hourly worker runs. The `timeseries_aqi_hourly` table has a FK to `uk_aq_core.timeseries(id)` — if the mirror is empty, every AQI insert will fail with a FK constraint violation.
 
 ---
 
@@ -663,7 +680,7 @@ No unexpected errors.
 
 ### 8.5 Run stations daily workflow
 
-Trigger `uk_air_stations_daily.yml` manually to sync station metadata and mirror to obs_aqidb.
+Trigger `uk_aq_stations_daily.yml` manually to sync station metadata and mirror to obs_aqidb.
 
 ### 8.6 Test the website
 
