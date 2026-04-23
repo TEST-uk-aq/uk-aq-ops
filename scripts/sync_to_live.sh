@@ -63,7 +63,7 @@ EXCLUDES=(
   # Ops management docs (test-env specific)
   --exclude='env-vars-master.csv'
   --exclude='env-vars-master*.numbers'
-  --exclude='config/uk_aq_github_env_targets.csv'
+  #--exclude='config/uk_aq_github_env_targets.csv'
 
   # Local machine setup (contain hardcoded test paths)
   --exclude='local/launchd/'
@@ -87,7 +87,8 @@ EXCLUDES=(
   --exclude='README_CROSS_REPO.md'
   --exclude='requirements-dev.txt'
 
-  # Website favicon images
+  # Website favicon images (different between live and test)
+  --exclude='favicon.ico'
   --exclude='favicon.png'
 )
 
