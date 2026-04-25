@@ -17,6 +17,7 @@ export interface Env {
   UK_AQ_CHART_METRICS_MAX_BODY_BYTES: unknown;
 }
 
+
 type CacheProfileName = "realtime" | "metadata" | "stations_metadata" | "aqi_history_immutable";
 
 type CacheProfile = {
