@@ -17,6 +17,7 @@ enabled = true
 # - UK_AQ_TURNSTILE_SECRET_KEY
 # Runtime variables:
 # - UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS (optional)
+# - UK_AQ_LOCAL_DEV_BYPASS_ENABLED (optional; set true/1 in test only)
 # - UK_AQ_CHART_METRICS_RPC (optional)
 # - UK_AQ_CHART_METRICS_RPC_SCHEMA (optional, default: uk_aq_public)
 # - UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE (optional)
