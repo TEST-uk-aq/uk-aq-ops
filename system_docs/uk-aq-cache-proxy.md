@@ -49,6 +49,7 @@ Variables:
 - `UK_AQ_CACHE_ALLOWED_ORIGINS`
 - `UK_AQ_CACHE_WORKER_NAME` (recommended; e.g. `uk-aq-cache-test` / `uk-aq-cache-live`)
 - `UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS` (optional)
+- `UK_AQ_LOCAL_DEV_BYPASS_ENABLED` (optional; set `true`/`1` in test only, leave unset in live)
 
 Secrets:
 

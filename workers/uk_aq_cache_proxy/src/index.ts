@@ -8,6 +8,7 @@ export interface Env {
   UK_AQ_EDGE_ACCESS_TOKEN_SECRET: unknown;
   UK_AQ_EDGE_UPSTREAM_SECRET: unknown;
   UK_AQ_CACHE_BYPASS_SECRET: unknown;
+  UK_AQ_LOCAL_DEV_BYPASS_ENABLED: unknown;
   UK_AQ_TURNSTILE_SECRET_KEY: unknown;
   UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: unknown;
   UK_AQ_CHART_METRICS_RPC: unknown;
@@ -223,6 +224,11 @@ function parseIntInRange(value: string, fallback: number, min: number, max: numb
   }
   const rounded = Math.floor(parsed);
   return Math.min(max, Math.max(min, rounded));
+}
+
+function parseBooleanFlag(value: string): boolean {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
 class RequestValidationError extends Error {
@@ -1235,9 +1241,10 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const requestOrigin = resolveRequestOrigin(request, url);
-    // Local dev proxy escape hatch: bypass origin + session checks on trusted server-side requests.
+    // Local dev proxy escape hatch: bypass origin + session checks only when explicitly enabled.
     const cacheBypassSecret = await readSecret(env.UK_AQ_CACHE_BYPASS_SECRET);
-    const isLocalDevRequest = hasValidLocalDevBypassHeader(request, cacheBypassSecret);
+    const localDevBypassEnabled = parseBooleanFlag(await readSecret(env.UK_AQ_LOCAL_DEV_BYPASS_ENABLED));
+    const isLocalDevRequest = localDevBypassEnabled && hasValidLocalDevBypassHeader(request, cacheBypassSecret);
 
     const allowedOriginsRaw = await readSecret(env.UK_AQ_CACHE_ALLOWED_ORIGINS);
     const allowedOrigins = parseAllowedOrigins(allowedOriginsRaw);
