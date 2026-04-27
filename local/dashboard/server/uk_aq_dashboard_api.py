@@ -1788,7 +1788,9 @@ def _build_live_storage_coverage_days(
     oldest_by_label = _latest_oldest_day_by_label(db_size_metrics)
     oldest_by_schema = _latest_oldest_day_by_schema(schema_size_metrics)
 
-    ingest_days = set(day_sets.get("ingestdb") or set())
+    ingest_days_raw = day_sets.get("ingestdb")
+    has_explicit_ingest_days = isinstance(ingest_days_raw, set)
+    ingest_days = set(ingest_days_raw or set()) if has_explicit_ingest_days else set()
     observs_days_raw = day_sets.get("obs_aqidb")
     has_explicit_observs_days = isinstance(observs_days_raw, set)
     observs_days = set(observs_days_raw or set()) if has_explicit_observs_days else set()
@@ -1796,7 +1798,15 @@ def _build_live_storage_coverage_days(
     has_explicit_aqilevels_days = isinstance(aqilevels_days_raw, set)
     aqilevels_days = set(aqilevels_days_raw or set()) if has_explicit_aqilevels_days else set()
 
-    ingest_start = min(ingest_days) if ingest_days else oldest_by_label.get("ingestdb")
+    ingest_start = (
+        min(ingest_days)
+        if has_explicit_ingest_days and ingest_days
+        else (
+            None
+            if has_explicit_ingest_days
+            else oldest_by_label.get("ingestdb")
+        )
+    )
     observs_start = (
         min(observs_days)
         if has_explicit_observs_days and observs_days
@@ -1851,7 +1861,7 @@ def _build_live_storage_coverage_days(
             cursor <= today_utc
             and (
                 (cursor in ingest_days)
-                if ingest_days
+                if has_explicit_ingest_days
                 else (ingest_start and ingest_start <= cursor <= today_utc)
             )
         )
@@ -1939,7 +1949,12 @@ def _get_storage_coverage_days_cached(
         return cached_rows
 
     now_utc = now.astimezone(timezone.utc)
-    day_sets = _fetch_storage_day_sets()
+    day_sets = _fetch_storage_day_sets(
+        base_url=base_url,
+        service_role_key=service_role_key,
+        db_size_metrics=db_size_metrics,
+        now=now_utc,
+    )
     rows = _build_live_storage_coverage_days(
         now=now_utc,
         db_size_metrics=db_size_metrics,
@@ -1957,10 +1972,82 @@ def _get_storage_coverage_days_cached(
     return rows
 
 
-def _fetch_storage_day_sets() -> Dict[str, Set[date]]:
-    day_sets: Dict[str, Set[date]] = {"ingestdb": set()}
-    # Keep ingest on oldest_observed_at range logic.
-    day_sets["ingestdb"] = set()
+def _fetch_ingest_observation_days(
+    base_url: str,
+    service_role_key: str,
+    db_size_metrics: Optional[List[Dict[str, Any]]],
+    now: datetime,
+) -> Optional[Set[date]]:
+    if not base_url or not service_role_key:
+        return None
+
+    oldest_day = _latest_oldest_day_by_label(db_size_metrics).get("ingestdb")
+    if oldest_day is None:
+        return set()
+
+    today_utc = now.astimezone(timezone.utc).date()
+    if oldest_day > today_utc:
+        return set()
+
+    try:
+        safe_base_url = _ensure_allowed_base_url(base_url)
+    except Exception:
+        return None
+
+    url = f"{safe_base_url}/rpc/uk_aq_rpc_observations_hourly_fingerprint"
+    headers = _postgrest_headers(service_role_key, schema=PUBLIC_SCHEMA)
+
+    days_with_rows: Set[date] = set()
+    cursor = oldest_day
+    while cursor <= today_utc:
+        next_day_utc = cursor + timedelta(days=1)
+        try:
+            batch = _fetch_json(
+                url,
+                headers,
+                {
+                    "window_start": f"{cursor.isoformat()}T00:00:00Z",
+                    "window_end": f"{next_day_utc.isoformat()}T00:00:00Z",
+                    "select": "hour_start,observation_count",
+                    "order": "hour_start.asc",
+                    "limit": "1",
+                    "offset": "0",
+                },
+            )
+        except Exception:
+            return None
+
+        first_row = batch[0] if batch and isinstance(batch[0], dict) else None
+        if first_row:
+            try:
+                observation_count = int(first_row.get("observation_count") or 0)
+            except (TypeError, ValueError):
+                observation_count = 0
+            if observation_count > 0:
+                days_with_rows.add(cursor)
+
+        cursor = next_day_utc
+
+    return days_with_rows
+
+
+def _fetch_storage_day_sets(
+    *,
+    base_url: str,
+    service_role_key: str,
+    db_size_metrics: Optional[List[Dict[str, Any]]],
+    now: datetime,
+) -> Dict[str, Set[date]]:
+    day_sets: Dict[str, Set[date]] = {}
+    ingest_days = _fetch_ingest_observation_days(
+        base_url=base_url,
+        service_role_key=service_role_key,
+        db_size_metrics=db_size_metrics,
+        now=now,
+    )
+    if ingest_days is not None:
+        day_sets["ingestdb"] = ingest_days
+
     observs_days = _fetch_obs_aqi_observs_row_days()
     if observs_days is not None:
         day_sets["obs_aqidb"] = observs_days
