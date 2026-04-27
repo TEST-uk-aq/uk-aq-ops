@@ -3,6 +3,9 @@
 Cloudflare Worker that resolves UK postcodes to latitude/longitude by reading
 small shard JSON objects from Cloudflare R2.
 
+This worker is intended to be called by the cache proxy/app backend, not directly
+from browsers. Requests must include a valid upstream auth header.
+
 Routes:
 
 - `GET /v1/postcode_lookup`
@@ -22,6 +25,8 @@ Response:
   - `404` with `{ ok: false, error: "postcode_not_found", ... }`
 - shard unavailable/missing:
   - `503` with `{ ok: false, error: "postcode_lookup_unavailable", ... }`
+- unauthorized:
+  - `401` with `{ ok: false, error: "unauthorized", ... }`
 
 Caching:
 
@@ -33,6 +38,11 @@ Required runtime config:
 
 - R2 binding: `UK_AQ_POSTCODE_LOOKUP_BUCKET`
 - `UK_AQ_POSTCODE_R2_PREFIX` (default `v1`)
+- `UK_AQ_EDGE_UPSTREAM_SECRET`
+
+Required request header:
+
+- `x-uk-aq-upstream-auth: <UK_AQ_EDGE_UPSTREAM_SECRET>`
 
 Deploy:
 

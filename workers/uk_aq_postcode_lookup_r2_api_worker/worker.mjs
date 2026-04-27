@@ -7,6 +7,7 @@ import {
 const DEFAULT_POSTCODE_PREFIX = "v1";
 const SUCCESS_CACHE_CONTROL = "public, max-age=86400";
 const SHARD_CACHE_MAX_ENTRIES = 32;
+const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set([
   "/",
   "/v1/postcode_lookup",
@@ -24,7 +25,7 @@ function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, x-uk-aq-upstream-auth",
   };
 }
 
@@ -135,6 +136,45 @@ function getLatLonFromShard(postcodes, postcode) {
   return { lat, lon };
 }
 
+function timingSafeEqual(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  let mismatch = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    mismatch |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+function authorized(request, env) {
+  const expected = String(env?.UK_AQ_EDGE_UPSTREAM_SECRET || "").trim();
+  if (!expected) {
+    return {
+      ok: false,
+      status: 500,
+      payload: {
+        ok: false,
+        error: "postcode_lookup_unavailable",
+        message: "Postcode lookup is temporarily unavailable.",
+      },
+    };
+  }
+  const supplied = String(request.headers.get(UPSTREAM_AUTH_HEADER) || "").trim();
+  if (!supplied || !timingSafeEqual(supplied, expected)) {
+    return {
+      ok: false,
+      status: 401,
+      payload: {
+        ok: false,
+        error: "unauthorized",
+        message: "Unauthorized.",
+      },
+    };
+  }
+  return { ok: true };
+}
+
 export async function handlePostcodeLookupRequest(request, env) {
   if (request.method !== "GET") {
     return jsonResponse(
@@ -236,6 +276,11 @@ export default {
           ...corsHeaders(),
         },
       });
+    }
+
+    const authResult = authorized(request, env);
+    if (!authResult.ok) {
+      return jsonResponse(authResult.payload, authResult.status, "no-store");
     }
 
     return handlePostcodeLookupRequest(request, env);
