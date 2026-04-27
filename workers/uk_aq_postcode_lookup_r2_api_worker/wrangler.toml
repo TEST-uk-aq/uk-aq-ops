@@ -1,0 +1,11 @@
+name = "uk-aq-postcode-lookup-r2-api"
+main = "worker.mjs"
+compatibility_date = "2026-04-27"
+
+[vars]
+UK_AQ_POSTCODE_R2_PREFIX = "v1"
+
+[[r2_buckets]]
+binding = "UK_AQ_POSTCODE_LOOKUP_BUCKET"
+bucket_name = "__CFLARE_R2_BUCKET__"
+preview_bucket_name = "__CFLARE_R2_BUCKET__"

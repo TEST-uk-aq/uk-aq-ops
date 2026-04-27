@@ -4,6 +4,7 @@ export interface Env {
   OBS_AQIDB_SUPABASE_URL: unknown;
   OBS_AQIDB_SECRET_KEY: unknown;
   UK_AQ_AQI_HISTORY_R2_API_URL: unknown;
+  UK_AQ_POSTCODE_LOOKUP_R2_API_URL: unknown;
   UK_AQ_CACHE_ALLOWED_ORIGINS: unknown;
   UK_AQ_EDGE_ACCESS_TOKEN_SECRET: unknown;
   UK_AQ_EDGE_UPSTREAM_SECRET: unknown;
@@ -18,7 +19,7 @@ export interface Env {
 }
 
 
-type CacheProfileName = "realtime" | "metadata" | "stations_metadata" | "aqi_history_immutable";
+type CacheProfileName = "realtime" | "metadata" | "stations_metadata" | "aqi_history_immutable" | "postcode_lookup";
 
 type CacheProfile = {
   edgeTtlSeconds: number;
@@ -123,9 +124,16 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
     staleWhileRevalidateSeconds: 86400,
     staleIfErrorSeconds: 604800,
   },
+  postcode_lookup: {
+    edgeTtlSeconds: 86400,
+    browserTtlSeconds: 86400,
+    staleWhileRevalidateSeconds: 86400,
+    staleIfErrorSeconds: 604800,
+  },
 };
 
 const EXTERNAL_AQI_HISTORY_UPSTREAM = "__uk_aq_aqi_history_r2_api__";
+const EXTERNAL_POSTCODE_LOOKUP_UPSTREAM = "__uk_aq_postcode_lookup_r2_api__";
 
 const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_latest: "realtime",
@@ -135,6 +143,7 @@ const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_la_hex: "metadata",
   uk_aq_pcon_hex: "metadata",
   [EXTERNAL_AQI_HISTORY_UPSTREAM]: "realtime",
+  [EXTERNAL_POSTCODE_LOOKUP_UPSTREAM]: "postcode_lookup",
 };
 
 const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> = {
@@ -145,6 +154,8 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
   "la-hex": "uk_aq_la_hex",
   "pcon-hex": "uk_aq_pcon_hex",
   "aqi-history": EXTERNAL_AQI_HISTORY_UPSTREAM,
+  postcode_lookup: EXTERNAL_POSTCODE_LOOKUP_UPSTREAM,
+  "postcode-lookup": EXTERNAL_POSTCODE_LOOKUP_UPSTREAM,
 };
 
 const API_PREFIX = "/api/aq/";
@@ -1386,16 +1397,22 @@ export default {
     const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
+    const usingExternalPostcodeLookupUpstream = upstreamFunction === EXTERNAL_POSTCODE_LOOKUP_UPSTREAM;
+    const usingExternalUpstream = usingExternalAqiHistoryUpstream || usingExternalPostcodeLookupUpstream;
 
     const supabaseUrl = await readSecret(env.SUPABASE_URL);
     const supabasePublishableKey = await readSecret(env.SB_PUBLISHABLE_DEFAULT_KEY);
     const aqiHistoryUpstreamUrl = await readSecret(env.UK_AQ_AQI_HISTORY_R2_API_URL);
+    const postcodeLookupUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_LOOKUP_R2_API_URL);
     const upstreamAuthSecret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-    if (!usingExternalAqiHistoryUpstream && (!supabaseUrl || !supabasePublishableKey)) {
+    if (!usingExternalUpstream && (!supabaseUrl || !supabasePublishableKey)) {
       return makeErrorResponse(500, "missing_worker_secrets", requestOrigin, allowedOrigins);
     }
     if (usingExternalAqiHistoryUpstream && !aqiHistoryUpstreamUrl) {
       return makeErrorResponse(500, "missing_aqi_history_upstream_url", requestOrigin, allowedOrigins);
+    }
+    if (usingExternalPostcodeLookupUpstream && !postcodeLookupUpstreamUrl) {
+      return makeErrorResponse(500, "missing_postcode_lookup_upstream_url", requestOrigin, allowedOrigins);
     }
     if (!upstreamAuthSecret) {
       return makeErrorResponse(500, "missing_upstream_auth_secret", requestOrigin, allowedOrigins);
@@ -1440,11 +1457,17 @@ export default {
     try {
       upstreamUrl = usingExternalAqiHistoryUpstream
         ? new URL(normalizeBaseUrl(aqiHistoryUpstreamUrl))
+        : usingExternalPostcodeLookupUpstream
+        ? new URL(normalizeBaseUrl(postcodeLookupUpstreamUrl))
         : new URL(`${normalizeBaseUrl(supabaseUrl)}/functions/v1/${upstreamFunction}`);
     } catch (_err) {
       return makeErrorResponse(
         500,
-        usingExternalAqiHistoryUpstream ? "invalid_aqi_history_upstream_url" : "invalid_upstream_url",
+        usingExternalAqiHistoryUpstream
+          ? "invalid_aqi_history_upstream_url"
+          : usingExternalPostcodeLookupUpstream
+          ? "invalid_postcode_lookup_upstream_url"
+          : "invalid_upstream_url",
         requestOrigin,
         allowedOrigins,
       );
@@ -1452,7 +1475,7 @@ export default {
     upstreamUrl.search = normalizedRequestUrl.search;
 
     const upstreamHeaders = new Headers();
-    if (!usingExternalAqiHistoryUpstream) {
+    if (!usingExternalUpstream) {
       upstreamHeaders.set("apikey", supabasePublishableKey);
       upstreamHeaders.set("Authorization", `Bearer ${supabasePublishableKey}`);
     }

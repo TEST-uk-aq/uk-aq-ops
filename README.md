@@ -25,6 +25,7 @@ Cloudflare edge workers in this repo:
 
 - `workers/uk_aq_db_size_metrics_api_worker/worker.mjs`
 - `workers/uk_aq_observs_history_r2_api_worker/worker.mjs`
+- `workers/uk_aq_postcode_lookup_r2_api_worker/worker.mjs`
 - `workers/uk_aq_cache_proxy/src/index.ts`
 
 Cloudflare deploy model (Option A):
@@ -41,6 +42,7 @@ Cloudflare deploy model (Option A):
   - `UK_AQ_DB_R2_METRICS_API_WORKER_NAME`
   - `UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME`
   - `UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME`
+  - `UK_AQ_POSTCODE_LOOKUP_R2_API_WORKER_NAME`
 
 ## Dashboard (hosted + local)
 
@@ -220,6 +222,7 @@ Primary controls:
   - `/api/aq/stations`
   - `/api/aq/la-hex`
   - `/api/aq/pcon-hex`
+  - `/api/aq/postcode_lookup`
 - Upstream auth header:
   - injects `X-UK-AQ-Upstream-Auth` using `UK_AQ_EDGE_UPSTREAM_SECRET`.
 
