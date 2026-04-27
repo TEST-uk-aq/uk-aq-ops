@@ -3,7 +3,7 @@ main = "worker.mjs"
 compatibility_date = "2026-04-27"
 
 [vars]
-UK_AQ_POSTCODE_R2_PREFIX = "v1"
+UK_AQ_POSTCODE_R2_PREFIX = "__UK_AQ_POSTCODE_R2_PREFIX__"
 
 [[r2_buckets]]
 binding = "UK_AQ_POSTCODE_LOOKUP_BUCKET"

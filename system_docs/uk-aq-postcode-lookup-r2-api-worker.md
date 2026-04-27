@@ -50,14 +50,14 @@ Error cases:
 
 Variables:
 
-- `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`
-- `CFLARE_R2_BUCKET`
+- `UK_AQ_POSTCODE_R2_CLOUDFLARE_ACCOUNT_ID` (optional; falls back to `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`)
+- `UK_AQ_POSTCODE_R2_BUCKET` (optional; falls back to `CFLARE_R2_BUCKET`)
 - `UK_AQ_POSTCODE_LOOKUP_R2_API_WORKER_NAME` (optional)
 - `UK_AQ_POSTCODE_R2_PREFIX` (optional, default `v1`)
 
 Secrets:
 
-- `UK_AQ_R2_CLOUDFLARE_API_TOKEN`
+- `UK_AQ_POSTCODE_R2_CLOUDFLARE_API_TOKEN` (optional; falls back to `UK_AQ_R2_CLOUDFLARE_API_TOKEN`)
 
 ## Notes
 
