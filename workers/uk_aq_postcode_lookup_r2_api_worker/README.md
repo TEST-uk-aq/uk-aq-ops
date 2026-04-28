@@ -10,7 +10,7 @@ Data is read from compact R2 JSON objects:
 - exact shards: `v1/shards/<AREA>.json`
 - suggest shards: `v1/suggest/<AREA>.json`
 - area/town index: `v1/area_town_index.json`
-- 1-2 char hints: `v1/postcode_prefix_hints.json`
+- 1-2 char prefix table (sampled postcodes + hint fallbacks): `v1/postcode_prefix_hints.json`
 
 ## Routes
 
@@ -70,7 +70,8 @@ Request:
 Behavior:
 
 - `q` length `0`: returns empty list
-- `q` length `1` or `2`: returns prefix hints from `postcode_prefix_hints.json` (no suggest shard read)
+- `q` length `1` or `2`: returns sampled real postcode rows from `postcode_prefix_hints.json` (no suggest shard read)
+- fallback: if sampled rows are missing, returns prefix-count hints from `postcode_prefix_hints.json`
 - `q` length `>=3`: reads one suggest shard (`suggest/<AREA>.json`) and filters by prefix
 - `limit` default `6`, capped at `10`
 

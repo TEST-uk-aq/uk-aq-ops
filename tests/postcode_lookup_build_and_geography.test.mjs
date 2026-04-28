@@ -112,6 +112,7 @@ test("build output includes exact/suggest shards plus area_town index with dedup
     const ecExact = JSON.parse(await fs.promises.readFile(path.join(outputDir, "shards", "EC.json"), "utf8"));
     const swSuggest = JSON.parse(await fs.promises.readFile(path.join(outputDir, "suggest", "SW.json"), "utf8"));
     const areaTownIndex = JSON.parse(await fs.promises.readFile(path.join(outputDir, "area_town_index.json"), "utf8"));
+    const prefixHints = JSON.parse(await fs.promises.readFile(path.join(outputDir, "postcode_prefix_hints.json"), "utf8"));
 
     assert.equal(swExact.schema_version, 2);
     assert.deepEqual(swExact.columns, ["lat", "lon", "pcon_code", "la_code", "area_town_id"]);
@@ -138,6 +139,12 @@ test("build output includes exact/suggest shards plus area_town index with dedup
 
     assert.equal(areaTownIndex.values[String(swRowA[4])][0], "Westminster");
     assert.equal(areaTownIndex.values[String(swRowA[4])][1], "London");
+
+    assert.equal(Array.isArray(prefixHints.postcode_samples_1.S), true);
+    assert.equal(Array.isArray(prefixHints.postcode_samples_2.SW), true);
+    assert.equal(prefixHints.postcode_samples_2.SW[0][0], "SW1A1AA");
+    assert.equal(prefixHints.postcode_samples_2.SW[0][1], "SW1A 1AA");
+    assert.equal(typeof prefixHints.postcode_samples_2.SW[0][2], "number");
 
     assert.equal(manifest.unique_area_town_combo_count, 2);
     assert.equal(manifest.exact_shard_count, 2);

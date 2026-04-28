@@ -45,6 +45,7 @@ const LA_COLUMN_CANDIDATES = [
 ];
 
 const DEFAULT_PREFIX = normalizePrefix(process.env.UK_AQ_POSTCODE_R2_PREFIX || "v1");
+const MAX_PREFIX_SAMPLE_ROWS = 24;
 const DEFAULT_INPUT_PATH = String(
   process.env.UK_AQ_POSTCODE_ONSPD_CSV_PATH
     || process.env.UK_AQ_POSTCODE_INPUT_CSV
@@ -267,9 +268,46 @@ function sortHints(hints) {
   });
 }
 
-function buildPrefixHints({ firstCharCounts, firstTwoCharCounts, areaCounts, outwardCounts }) {
+function compareSampleRows(left, right) {
+  return String(left?.[0] || "").localeCompare(String(right?.[0] || ""));
+}
+
+function addPrefixSample(sampleMap, prefix, rowValue, maxRows = MAX_PREFIX_SAMPLE_ROWS) {
+  if (!prefix) {
+    return;
+  }
+  const postcodeNormalised = String(rowValue?.[0] || "").trim().toUpperCase();
+  if (!postcodeNormalised) {
+    return;
+  }
+  const bucket = sampleMap.get(prefix) || [];
+  if (bucket.some((row) => String(row?.[0] || "").toUpperCase() === postcodeNormalised)) {
+    return;
+  }
+  let insertAt = bucket.findIndex((row) => compareSampleRows([postcodeNormalised], row) < 0);
+  if (insertAt < 0) {
+    insertAt = bucket.length;
+  }
+  bucket.splice(insertAt, 0, rowValue);
+  if (bucket.length > maxRows) {
+    bucket.length = maxRows;
+  }
+  sampleMap.set(prefix, bucket);
+}
+
+function buildPrefixHints({
+  firstCharCounts,
+  firstTwoCharCounts,
+  areaCounts,
+  outwardCounts,
+  prefix1Samples,
+  prefix2Samples,
+  areaTownIdByPairKey,
+}) {
   const prefixes1 = {};
   const prefixes2 = {};
+  const postcodeSamples1 = {};
+  const postcodeSamples2 = {};
 
   for (const [query, totalCount] of Array.from(firstCharCounts.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
     const seen = new Set();
@@ -309,10 +347,38 @@ function buildPrefixHints({ firstCharCounts, firstTwoCharCounts, areaCounts, out
     prefixes2[query] = [...hints, ...sortHints(outwardHints)].slice(0, 20);
   }
 
+  for (const [query, rows] of Array.from(prefix1Samples.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+    postcodeSamples1[query] = rows
+      .slice()
+      .sort(compareSampleRows)
+      .slice(0, MAX_PREFIX_SAMPLE_ROWS)
+      .map((row) => [
+        String(row?.[0] || "").trim().toUpperCase(),
+        String(row?.[1] || "").trim(),
+        areaTownIdByPairKey.get(row?.[2]) ?? 0,
+      ])
+      .filter((row) => row[0] && row[1]);
+  }
+
+  for (const [query, rows] of Array.from(prefix2Samples.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+    postcodeSamples2[query] = rows
+      .slice()
+      .sort(compareSampleRows)
+      .slice(0, MAX_PREFIX_SAMPLE_ROWS)
+      .map((row) => [
+        String(row?.[0] || "").trim().toUpperCase(),
+        String(row?.[1] || "").trim(),
+        areaTownIdByPairKey.get(row?.[2]) ?? 0,
+      ])
+      .filter((row) => row[0] && row[1]);
+  }
+
   return {
     schema_version: 1,
     prefixes_1: prefixes1,
     prefixes_2: prefixes2,
+    postcode_samples_1: postcodeSamples1,
+    postcode_samples_2: postcodeSamples2,
   };
 }
 
@@ -366,6 +432,8 @@ export async function buildPostcodeLookupFromOnspd({
   const firstTwoCharCounts = new Map();
   const areaCounts = new Map();
   const outwardCounts = new Map();
+  const prefix1Samples = new Map();
+  const prefix2Samples = new Map();
 
   let skippedCount = 0;
   let duplicateCount = 0;
@@ -450,16 +518,19 @@ export async function buildPostcodeLookupFromOnspd({
       suggestShardMap = new Map();
       suggestShardMaps.set(area, suggestShardMap);
     }
-    suggestShardMap.set(postcodeNormalised, [postcodeNormalised, formatPostcode(postcodeNormalised), areaTownPairKey]);
+    const formattedPostcode = formatPostcode(postcodeNormalised);
+    suggestShardMap.set(postcodeNormalised, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
 
     const firstChar = postcodeNormalised.slice(0, 1);
     if (firstChar) {
       incrementCount(firstCharCounts, firstChar);
+      addPrefixSample(prefix1Samples, firstChar, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
     }
 
     const firstTwoChars = postcodeNormalised.slice(0, 2);
     if (firstTwoChars) {
       incrementCount(firstTwoCharCounts, firstTwoChars);
+      addPrefixSample(prefix2Samples, firstTwoChars, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
     }
 
     const outward = getOutwardPrefix(postcodeNormalised);
@@ -590,6 +661,9 @@ export async function buildPostcodeLookupFromOnspd({
     firstTwoCharCounts,
     areaCounts,
     outwardCounts,
+    prefix1Samples,
+    prefix2Samples,
+    areaTownIdByPairKey,
   });
   const prefixHintsPayload = {
     ...prefixHints,

@@ -123,7 +123,8 @@ Website-facing proxy route can expose these under `/api/aq/...` as needed.
 ## Suggest behavior
 
 - `q` length `0`: returns empty
-- `q` length `1` or `2`: returns prefix hints from `postcode_prefix_hints.json`
+- `q` length `1` or `2`: returns sampled real postcode rows from `postcode_prefix_hints.json` (`postcode_samples_1` / `postcode_samples_2`) without reading suggest shards
+- if sample rows are missing for a prefix, falls back to prefix-count hints from `prefixes_1` / `prefixes_2`
 - `q` length `>=3`: reads one `suggest/<AREA>.json` shard and filters rows
 - `limit` default `6`, capped at `10`
 

@@ -34,7 +34,15 @@ let areaTownIndexCacheKey = "";
 let areaTownIndexCacheState = { status: "uninitialized", values: null };
 
 let prefixHintsCacheKey = "";
-let prefixHintsCacheState = { status: "uninitialized", hints: { prefixes_1: {}, prefixes_2: {} } };
+let prefixHintsCacheState = {
+  status: "uninitialized",
+  hints: {
+    prefixes_1: {},
+    prefixes_2: {},
+    postcode_samples_1: {},
+    postcode_samples_2: {},
+  },
+};
 
 function normalizePrefix(raw) {
   return String(raw || "").trim().replace(/^\/+|\/+$/g, "");
@@ -224,6 +232,36 @@ function getSuggestMatchRank(queryNormalised, postcodeNormalised) {
   return 3;
 }
 
+function parsePostcodeSampleRow(row) {
+  if (Array.isArray(row)) {
+    const postcodeNormalised = String(row[0] || "").trim().toUpperCase();
+    const postcodeDisplay = String(row[1] || "").trim() || formatPostcode(postcodeNormalised);
+    const areaTownId = parseAreaTownId(row[2]);
+    if (!postcodeNormalised) {
+      return null;
+    }
+    return {
+      postcode_normalised: postcodeNormalised,
+      postcode: postcodeDisplay,
+      area_town_id: areaTownId,
+    };
+  }
+  if (row && typeof row === "object") {
+    const postcodeNormalised = String(row.n || row.postcode_normalised || "").trim().toUpperCase();
+    const postcodeDisplay = String(row.p || row.postcode || "").trim() || formatPostcode(postcodeNormalised);
+    const areaTownId = parseAreaTownId(row.at || row.area_town_id);
+    if (!postcodeNormalised) {
+      return null;
+    }
+    return {
+      postcode_normalised: postcodeNormalised,
+      postcode: postcodeDisplay,
+      area_town_id: areaTownId,
+    };
+  }
+  return null;
+}
+
 function valuesEqualInsensitive(left, right) {
   return String(left || "").trim().toLowerCase() === String(right || "").trim().toLowerCase();
 }
@@ -382,7 +420,12 @@ async function readPrefixHints(env, prefix) {
     prefixHintsCacheKey = cacheKey;
     prefixHintsCacheState = {
       status: readResult.unavailable ? "unavailable" : "missing",
-      hints: { prefixes_1: {}, prefixes_2: {} },
+      hints: {
+        prefixes_1: {},
+        prefixes_2: {},
+        postcode_samples_1: {},
+        postcode_samples_2: {},
+      },
     };
     return prefixHintsCacheState;
   }
@@ -390,6 +433,12 @@ async function readPrefixHints(env, prefix) {
   const payload = readResult.payload && typeof readResult.payload === "object" ? readResult.payload : {};
   const prefixes1 = payload.prefixes_1 && typeof payload.prefixes_1 === "object" ? payload.prefixes_1 : {};
   const prefixes2 = payload.prefixes_2 && typeof payload.prefixes_2 === "object" ? payload.prefixes_2 : {};
+  const postcodeSamples1 = payload.postcode_samples_1 && typeof payload.postcode_samples_1 === "object"
+    ? payload.postcode_samples_1
+    : {};
+  const postcodeSamples2 = payload.postcode_samples_2 && typeof payload.postcode_samples_2 === "object"
+    ? payload.postcode_samples_2
+    : {};
 
   prefixHintsCacheKey = cacheKey;
   prefixHintsCacheState = {
@@ -397,6 +446,8 @@ async function readPrefixHints(env, prefix) {
     hints: {
       prefixes_1: prefixes1,
       prefixes_2: prefixes2,
+      postcode_samples_1: postcodeSamples1,
+      postcode_samples_2: postcodeSamples2,
     },
   };
   return prefixHintsCacheState;
@@ -598,6 +649,43 @@ export async function handlePostcodeSuggestRequest(request, env) {
         503,
         "no-store",
       );
+    }
+
+    const areaTownIndex = await readAreaTownIndex(env, prefix);
+    const sampleList = queryNormalised.length === 1
+      ? hintsState.hints.postcode_samples_1[queryNormalised]
+      : hintsState.hints.postcode_samples_2[queryNormalised];
+    const sampledPostcodes = Array.isArray(sampleList)
+      ? sampleList
+          .map((row) => parsePostcodeSampleRow(row))
+          .filter((row) => row && row.postcode_normalised)
+      : [];
+
+    if (sampledPostcodes.length > 0) {
+      const results = sampledPostcodes.slice(0, limit).map((row) => {
+        const areaTown = lookupAreaTown(areaTownIndex.values, row.area_town_id);
+        return {
+          type: "postcode",
+          postcode: row.postcode,
+          postcode_normalised: row.postcode_normalised,
+          area_town_id: row.area_town_id,
+          area_name: areaTown.area_name,
+          post_town: areaTown.post_town,
+          label: buildPostcodeLabel(row.postcode, areaTown.area_name, areaTown.post_town),
+        };
+      });
+
+      const payload = {
+        ok: true,
+        query: queryRaw,
+        query_normalised: queryNormalised,
+        source: "postcode_prefix_samples",
+        results,
+      };
+      if (areaTownIndex.status !== "ok") {
+        payload.warning = "area_town_index_unavailable";
+      }
+      return jsonResponse(payload, 200, SUCCESS_CACHE_CONTROL);
     }
 
     const hintList = queryNormalised.length === 1

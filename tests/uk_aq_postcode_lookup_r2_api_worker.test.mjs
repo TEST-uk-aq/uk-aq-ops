@@ -89,6 +89,20 @@ function buildBaseObjects() {
           { prefix: "BS3", label: "BS3 postcodes", count: 15 },
         ],
       },
+      postcode_samples_1: {
+        B: [
+          ["BS11AA", "BS1 1AA", 41],
+          ["BS11AB", "BS1 1AB", 41],
+          ["BT11AA", "BT1 1AA", 0],
+        ],
+      },
+      postcode_samples_2: {
+        BS: [
+          ["BS11AA", "BS1 1AA", 41],
+          ["BS11AB", "BS1 1AB", 41],
+          ["BS200AA", "BS20 0AA", 41],
+        ],
+      },
     },
   };
 }
@@ -243,7 +257,7 @@ test("suggest endpoint returns decorated postcode results with default max limit
   assert.equal(payload.results[2].postcode_normalised, "BS200AA");
 });
 
-test("suggest endpoint q length 1 and 2 uses prefix hints and does not read suggest shard", async () => {
+test("suggest endpoint q length 1 and 2 uses postcode prefix samples and does not read suggest shard", async () => {
   const { env, getCalls, prefix } = createEnvWithObjects(buildBaseObjects());
 
   const response1 = await handlePostcodeSuggestRequest(
@@ -261,13 +275,49 @@ test("suggest endpoint q length 1 and 2 uses prefix hints and does not read sugg
   const payload1 = await response1.json();
   const payload2 = await response2.json();
 
-  assert.equal(payload1.source, "postcode_prefix_hints");
-  assert.equal(payload2.source, "postcode_prefix_hints");
-  assert.equal(payload1.results[0].type, "postcode_hint");
-  assert.equal(payload2.results[0].type, "postcode_hint");
+  assert.equal(payload1.source, "postcode_prefix_samples");
+  assert.equal(payload2.source, "postcode_prefix_samples");
+  assert.equal(payload1.results[0].type, "postcode");
+  assert.equal(payload2.results[0].type, "postcode");
+  assert.equal(payload1.results[0].postcode, "BS1 1AA");
+  assert.equal(payload2.results[0].postcode, "BS1 1AA");
 
   const suggestReads = getCalls.filter((key) => key === `${prefix}/suggest/BS.json`);
   assert.equal(suggestReads.length, 0);
+});
+
+test("suggest endpoint q length 1 and 2 falls back to prefix hint counts when sample table is missing", async () => {
+  const { env } = createEnvWithObjects({
+    "v1/postcode_prefix_hints.json": {
+      schema_version: 1,
+      prefixes_1: {
+        B: [
+          { prefix: "B", label: "B postcodes", count: 100 },
+          { prefix: "BS", label: "BS postcodes", count: 50 },
+        ],
+      },
+      prefixes_2: {
+        BS: [
+          { prefix: "BS", label: "BS postcodes", count: 50 },
+          { prefix: "BS2", label: "BS2 postcodes", count: 20 },
+        ],
+      },
+    },
+    "v1/area_town_index.json": {
+      schema_version: 1,
+      columns: ["area_name", "post_town"],
+      values: { 0: [null, null] },
+    },
+  });
+
+  const response = await handlePostcodeSuggestRequest(
+    new Request("https://example.test/v1/postcode_suggest?q=B&limit=10"),
+    env,
+  );
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.source, "postcode_prefix_hints");
+  assert.equal(payload.results[0].type, "postcode_hint");
 });
 
 test("suggest endpoint returns 400 for invalid query", async () => {
