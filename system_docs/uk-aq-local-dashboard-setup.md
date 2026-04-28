@@ -113,6 +113,38 @@ Leave live worker URLs empty if not yet deployed.
 
 ---
 
+## Dashboard config refresh quick steps
+
+Use this when `dashboard/assets/config.js` still shows old values (for example test labels on live).
+
+1. Update the correct repo `.env` (`CIC-test-uk-aq-ops` for test, `LIVE-uk-aq-ops` for live).
+2. Regenerate `dashboard/assets/config.js` from that repo's `.env`:
+
+```bash
+# Example: live repo
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/LIVE UK AQ Networks/LIVE-uk-aq-ops"
+set -a
+source .env
+set +a
+node scripts/dashboard/generate_dashboard_config.mjs
+```
+
+3. If the dashboard is launchd-managed, reload it so startup regeneration also runs with the same `.env`:
+
+```bash
+# Example: live service
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/LIVE UK AQ Networks/LIVE-uk-aq-ops"
+./local/launchd/install_launchd.sh
+```
+
+4. Hard refresh the browser and verify:
+
+```bash
+curl -s http://127.0.0.1:8001/assets/config.js | head
+```
+
+---
+
 ## Storage Coverage Day Presence
 
 - Ingest DB day presence in the calendar now uses exact per-day checks via

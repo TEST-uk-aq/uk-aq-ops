@@ -123,7 +123,12 @@ async function readShardFromR2(env, prefix, shard) {
   };
 }
 
-function getLatLonFromShard(postcodes, postcode) {
+function parseCodeOrNull(value) {
+  const compact = String(value || "").trim().toUpperCase();
+  return compact || null;
+}
+
+function getLookupRecordFromShard(postcodes, postcode) {
   const value = postcodes[postcode];
   if (!Array.isArray(value) || value.length < 2) {
     return null;
@@ -133,7 +138,9 @@ function getLatLonFromShard(postcodes, postcode) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return null;
   }
-  return { lat, lon };
+  const pconCode = parseCodeOrNull(value[2]);
+  const laCode = parseCodeOrNull(value[3]);
+  return { lat, lon, pcon_code: pconCode, la_code: laCode };
 }
 
 function timingSafeEqual(left, right) {
@@ -226,8 +233,8 @@ export async function handlePostcodeLookupRequest(request, env) {
     );
   }
 
-  const coords = getLatLonFromShard(shardLookup.postcodes, postcodeNormalised);
-  if (!coords) {
+  const lookupRecord = getLookupRecordFromShard(shardLookup.postcodes, postcodeNormalised);
+  if (!lookupRecord) {
     return jsonResponse(
       {
         ok: false,
@@ -244,8 +251,10 @@ export async function handlePostcodeLookupRequest(request, env) {
       ok: true,
       postcode: formatPostcode(postcodeNormalised),
       postcode_normalised: postcodeNormalised,
-      lat: coords.lat,
-      lon: coords.lon,
+      lat: lookupRecord.lat,
+      lon: lookupRecord.lon,
+      pcon_code: lookupRecord.pcon_code,
+      la_code: lookupRecord.la_code,
       source: shardLookup.source || "ONSPD",
     },
     200,

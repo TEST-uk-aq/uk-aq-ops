@@ -1,6 +1,7 @@
 # UK AQ Postcode Lookup R2 API Worker
 
-Cloudflare Worker that resolves UK postcodes to latitude/longitude by reading
+Cloudflare Worker that resolves UK postcodes to latitude/longitude plus
+PCON/LA geography codes by reading
 small shard JSON objects from Cloudflare R2.
 
 This worker is intended to be called by the cache proxy/app backend, not directly
@@ -18,7 +19,7 @@ Query params:
 Response:
 
 - success:
-  - `{ ok: true, postcode, postcode_normalised, lat, lon, source }`
+  - `{ ok: true, postcode, postcode_normalised, lat, lon, pcon_code, la_code, source }`
 - invalid postcode:
   - `400` with `{ ok: false, error: "invalid_postcode", ... }`
 - postcode not found:
@@ -33,6 +34,12 @@ Caching:
 - successful lookups: `Cache-Control: public, max-age=86400`
 - errors: `Cache-Control: no-store`
 - shard JSON is cached in-memory using a bounded map (max 32 shards)
+
+Data contract notes:
+
+- Worker returns `pcon_code` and `la_code` when present in shards.
+- Worker does not return `pcon_name` or `la_name`.
+- Website/UI name labels are resolved separately from local map geometry files.
 
 Required runtime config:
 

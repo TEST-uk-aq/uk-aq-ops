@@ -31,21 +31,32 @@ import json
 import os
 from pathlib import Path
 
+def strip_wrapping_quotes(value: str) -> str:
+    text = str(value)
+    while len(text) >= 2 and (
+        (text[0] == '"' and text[-1] == '"')
+        or (text[0] == "'" and text[-1] == "'")
+    ):
+        text = text[1:-1]
+    return text
+
 try:
-    refresh_seconds = int(str(os.getenv("UKAQ_DEFAULT_REFRESH_SECONDS", "300")).strip())
+    refresh_seconds = int(strip_wrapping_quotes(str(os.getenv("UKAQ_DEFAULT_REFRESH_SECONDS", "300"))).strip())
 except ValueError:
     refresh_seconds = 300
 if refresh_seconds <= 0:
     refresh_seconds = 300
 
 config = {
-    "envName": str(os.getenv("UKAQ_ENV_NAME", "local")),
-    "apiBaseUrl": str(os.getenv("UKAQ_API_BASE_URL", "/api")),
-    "dashboardTitle": str(os.getenv("UKAQ_DASHBOARD_TITLE", "UK AQ Dashboard")),
-    "dashboardSubtitle": str(
-        os.getenv(
-            "UKAQ_DASHBOARD_SUBTITLE",
-            "Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates from your local API.",
+    "envName": strip_wrapping_quotes(str(os.getenv("UKAQ_ENV_NAME", "local"))),
+    "apiBaseUrl": strip_wrapping_quotes(str(os.getenv("UKAQ_API_BASE_URL", "/api"))),
+    "dashboardTitle": strip_wrapping_quotes(str(os.getenv("UKAQ_DASHBOARD_TITLE", "UK AQ Dashboard"))),
+    "dashboardSubtitle": strip_wrapping_quotes(
+        str(
+            os.getenv(
+                "UKAQ_DASHBOARD_SUBTITLE",
+                "Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates from your local API.",
+            )
         )
     ),
     "defaultRefreshSeconds": refresh_seconds,

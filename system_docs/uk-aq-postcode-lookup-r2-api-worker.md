@@ -5,7 +5,7 @@ Deploy workflow: `.github/workflows/uk_aq_postcode_lookup_r2_api_worker_deploy.y
 
 ## Purpose
 
-- Resolve UK postcode queries to lat/lon for website map/search usage.
+- Resolve UK postcode queries to lat/lon plus PCON/LA codes for website map/search usage.
 - Read only one postcode-area shard from R2 per request.
 - Avoid loading a full UK postcode dataset into Worker memory.
 - Restrict direct access so only trusted app/proxy calls are accepted.
@@ -28,7 +28,14 @@ Success (`200`):
 - `postcode_normalised` (uppercase, no spaces)
 - `lat`
 - `lon`
+- `pcon_code` (nullable)
+- `la_code` (nullable)
 - `source` (`ONSPD`)
+
+Not returned:
+
+- `pcon_name`
+- `la_name`
 
 Error cases:
 
@@ -70,6 +77,10 @@ Secrets:
 ## Notes
 
 - Build/upload pipeline lives under `scripts/postcodes/`.
+- Shard build source currently used: `ONSPD_MAY_2025_UK.csv`.
+- Shard row format is compact: `[lat, lon, pcon_code, la_code]`.
+- Compatibility gate script:
+  - `npm run postcode:check-geography -- --postcode-dir ... --pcon-geojson ... --la-geojson ...`
 - Browser/frontend should call cache proxy route `/api/aq/postcode_lookup` rather than calling this worker directly.
 - Cache proxy should target this worker URL via:
   - `UK_AQ_POSTCODE_LOOKUP_R2_API_URL=https://<worker-host>/v1/postcode_lookup`
