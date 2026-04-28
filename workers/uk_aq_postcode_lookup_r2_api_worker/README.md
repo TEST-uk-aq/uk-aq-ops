@@ -1,57 +1,115 @@
 # UK AQ Postcode Lookup R2 API Worker
 
-Cloudflare Worker that resolves UK postcodes to latitude/longitude plus
-PCON/LA geography codes by reading
-small shard JSON objects from Cloudflare R2.
+Cloudflare Worker that serves:
 
-This worker is intended to be called by the cache proxy/app backend, not directly
-from browsers. Requests must include a valid upstream auth header.
+- exact postcode lookup (`/postcode_lookup`)
+- postcode autocomplete (`/postcode_suggest`)
 
-Routes:
+Data is read from compact R2 JSON objects:
+
+- exact shards: `v1/shards/<AREA>.json`
+- suggest shards: `v1/suggest/<AREA>.json`
+- area/town index: `v1/area_town_index.json`
+- 1-2 char hints: `v1/postcode_prefix_hints.json`
+
+## Routes
+
+Exact lookup:
 
 - `GET /v1/postcode_lookup`
+- alias: `GET /api/postcode_lookup`
 - alias: `GET /`
 
-Query params:
+Suggest:
 
-- `postcode` (required)
+- `GET /v1/postcode_suggest`
+- alias: `GET /api/postcode_suggest`
 
-Response:
+## Auth
 
-- success:
-  - `{ ok: true, postcode, postcode_normalised, lat, lon, pcon_code, la_code, source }`
-- invalid postcode:
-  - `400` with `{ ok: false, error: "invalid_postcode", ... }`
-- postcode not found:
-  - `404` with `{ ok: false, error: "postcode_not_found", ... }`
-- shard unavailable/missing:
-  - `503` with `{ ok: false, error: "postcode_lookup_unavailable", ... }`
-- unauthorized:
-  - `401` with `{ ok: false, error: "unauthorized", ... }`
+This worker is intended for trusted upstream calls, not direct public browser use.
 
-Caching:
+Required header:
 
-- successful lookups: `Cache-Control: public, max-age=86400`
-- errors: `Cache-Control: no-store`
-- shard JSON is cached in-memory using a bounded map (max 32 shards)
+- `x-uk-aq-upstream-auth: <UK_AQ_EDGE_UPSTREAM_SECRET>`
 
-Data contract notes:
+## Exact lookup response
 
-- Worker returns `pcon_code` and `la_code` when present in shards.
-- Worker does not return `pcon_name` or `la_name`.
-- Website/UI name labels are resolved separately from local map geometry files.
+Success example:
 
-Required runtime config:
+```json
+{
+  "ok": true,
+  "postcode": "BS2 1AA",
+  "postcode_normalised": "BS21AA",
+  "lat": 51.45,
+  "lon": -2.58,
+  "pcon_code": "E14000001",
+  "la_code": "E06000001",
+  "area_town_id": 41,
+  "area_name": "Emersons Green",
+  "post_town": "Bristol",
+  "label": "BS2 1AA, Emersons Green, Bristol",
+  "source": "ONSPD"
+}
+```
+
+Errors:
+
+- `400` invalid postcode
+- `404` postcode not found
+- `503` lookup unavailable
+- `401` unauthorized
+
+## Suggest response
+
+Request:
+
+- `GET /v1/postcode_suggest?q=BS2&limit=6`
+
+Behavior:
+
+- `q` length `0`: returns empty list
+- `q` length `1` or `2`: returns prefix hints from `postcode_prefix_hints.json` (no suggest shard read)
+- `q` length `>=3`: reads one suggest shard (`suggest/<AREA>.json`) and filters by prefix
+- `limit` default `6`, capped at `10`
+
+Success example:
+
+```json
+{
+  "ok": true,
+  "query": "BS2",
+  "query_normalised": "BS2",
+  "source": "postcode_suggest_shard",
+  "results": [
+    {
+      "type": "postcode",
+      "postcode": "BS2 1AA",
+      "postcode_normalised": "BS21AA",
+      "area_town_id": 41,
+      "area_name": "Emersons Green",
+      "post_town": "Bristol",
+      "label": "BS2 1AA, Emersons Green, Bristol"
+    }
+  ]
+}
+```
+
+## Caching
+
+- success responses: `Cache-Control: public, max-age=86400`
+- error responses: `Cache-Control: no-store`
+- in-memory LRU cache for exact and suggest shards
+- in-memory cached `area_town_index` and `postcode_prefix_hints`
+
+## Runtime config
 
 - R2 binding: `UK_AQ_POSTCODE_LOOKUP_BUCKET`
 - `UK_AQ_POSTCODE_R2_PREFIX` (default `v1`)
 - `UK_AQ_EDGE_UPSTREAM_SECRET`
 
-Required request header:
-
-- `x-uk-aq-upstream-auth: <UK_AQ_EDGE_UPSTREAM_SECRET>`
-
-Deploy:
+## Deploy
 
 ```bash
 cd workers/uk_aq_postcode_lookup_r2_api_worker

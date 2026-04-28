@@ -5,7 +5,19 @@ import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 
 import {
-  buildPostcodeShardObjectKey,
+  detectAreaTownColumns,
+  loadAreaTownLookups,
+  parseAreaTownPairKey,
+  parseCsvLine as parseCsvLineShared,
+  createAreaTownPairKey,
+  resolveAreaAndPostTown,
+} from "./lib/area_town_resolver.mjs";
+import {
+  buildPostcodeAreaTownIndexObjectKey,
+  buildPostcodeExactShardObjectKey,
+  buildPostcodePrefixHintsObjectKey,
+  buildPostcodeSuggestShardObjectKey,
+  formatPostcode,
   getPostcodeShard,
   normalisePostcode,
 } from "../../workers/shared/postcode_lookup.mjs";
@@ -49,6 +61,11 @@ function normalizePrefix(value) {
   return String(value || "").trim().replace(/^\/+|\/+$/g, "");
 }
 
+function defaultOnspdRoot(inputPath) {
+  const resolvedInput = path.resolve(String(inputPath || ""));
+  return path.resolve(path.dirname(path.dirname(resolvedInput)));
+}
+
 function usage() {
   console.log(
     [
@@ -61,6 +78,7 @@ function usage() {
       "Optional:",
       "  --output <dir>                Output directory (default: tmp/postcode_lookup_v1)",
       "  --prefix <r2-prefix>          Prefix written into manifest object_key fields (default: v1)",
+      "  --onspd-root <dir>            ONSPD root folder (contains Documents/ lookups)",
       "  --source-version <value>      Override source version label in manifest (for example ONSPD_MAY_2025)",
       "  -h, --help",
       "",
@@ -77,6 +95,7 @@ function parseArgs(argv) {
     input: DEFAULT_INPUT_PATH,
     output: DEFAULT_OUTPUT_DIR,
     prefix: DEFAULT_PREFIX,
+    onspd_root: "",
     source_version: "",
   };
 
@@ -94,6 +113,11 @@ function parseArgs(argv) {
     }
     if (arg === "--prefix") {
       args.prefix = normalizePrefix(argv[i + 1]);
+      i += 1;
+      continue;
+    }
+    if (arg === "--onspd-root") {
+      args.onspd_root = String(argv[i + 1] || "").trim();
       i += 1;
       continue;
     }
@@ -122,34 +146,7 @@ function parseArgs(argv) {
 }
 
 export function parseCsvLine(line) {
-  const values = [];
-  let current = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i];
-
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i += 1;
-      } else {
-        inQuotes = !inQuotes;
-      }
-      continue;
-    }
-
-    if (ch === "," && !inQuotes) {
-      values.push(current);
-      current = "";
-      continue;
-    }
-
-    current += ch;
-  }
-
-  values.push(current);
-  return values;
+  return parseCsvLineShared(line);
 }
 
 export function normalizeHeaderName(name) {
@@ -171,8 +168,8 @@ function findColumn(headerNames, rawHeaders, candidates, label) {
     }
   }
   throw new Error(
-    `Unable to detect ${label} column in header row. ` +
-    `Expected one of: ${candidates.join(", ")}.`,
+    `Unable to detect ${label} column in header row. `
+    + `Expected one of: ${candidates.join(", ")}.`,
   );
 }
 
@@ -210,12 +207,15 @@ export function detectOnspdColumns(rawHeaders) {
     "local authority code",
   );
 
+  const areaTownColumns = detectAreaTownColumns(rawHeaders);
+
   return {
     postcode,
     lat,
     lon,
     pcon,
     la,
+    ...areaTownColumns,
   };
 }
 
@@ -246,6 +246,76 @@ async function writeJsonFile(filePath, payload) {
   await fs.promises.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
+function toCountedHint(prefix, count) {
+  return {
+    prefix,
+    label: `${prefix} postcodes`,
+    count,
+  };
+}
+
+function incrementCount(counter, key, amount = 1) {
+  counter.set(key, (counter.get(key) || 0) + amount);
+}
+
+function sortHints(hints) {
+  return hints.sort((a, b) => {
+    if (b.count !== a.count) {
+      return b.count - a.count;
+    }
+    return a.prefix.localeCompare(b.prefix);
+  });
+}
+
+function buildPrefixHints({ firstCharCounts, firstTwoCharCounts, areaCounts, outwardCounts }) {
+  const prefixes1 = {};
+  const prefixes2 = {};
+
+  for (const [query, totalCount] of Array.from(firstCharCounts.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+    const seen = new Set();
+    const hints = [];
+
+    seen.add(query);
+    hints.push(toCountedHint(query, totalCount));
+
+    const areaHints = [];
+    for (const [area, areaCount] of areaCounts.entries()) {
+      if (!area.startsWith(query) || seen.has(area)) {
+        continue;
+      }
+      areaHints.push(toCountedHint(area, areaCount));
+      seen.add(area);
+    }
+
+    prefixes1[query] = [...hints, ...sortHints(areaHints)].slice(0, 20);
+  }
+
+  for (const [query, totalCount] of Array.from(firstTwoCharCounts.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+    const seen = new Set();
+    const hints = [];
+
+    seen.add(query);
+    hints.push(toCountedHint(query, totalCount));
+
+    const outwardHints = [];
+    for (const [outward, outwardCount] of outwardCounts.entries()) {
+      if (!outward.startsWith(query) || outward.length <= query.length || seen.has(outward)) {
+        continue;
+      }
+      outwardHints.push(toCountedHint(outward, outwardCount));
+      seen.add(outward);
+    }
+
+    prefixes2[query] = [...hints, ...sortHints(outwardHints)].slice(0, 20);
+  }
+
+  return {
+    schema_version: 1,
+    prefixes_1: prefixes1,
+    prefixes_2: prefixes2,
+  };
+}
+
 export function inferOnspdSourceVersion(inputPath) {
   const base = path.basename(String(inputPath || "")).toUpperCase();
   const match = base.match(/ONSPD[_-]?([A-Z]{3})[_-]?(\d{4})/);
@@ -258,13 +328,27 @@ export function inferOnspdSourceVersion(inputPath) {
   return "ONSPD_UNKNOWN";
 }
 
+function getOutwardPrefix(normalisedPostcode) {
+  if (typeof normalisedPostcode !== "string") {
+    return "";
+  }
+  if (normalisedPostcode.length <= 3) {
+    return normalisedPostcode;
+  }
+  return normalisedPostcode.slice(0, -3);
+}
+
 export async function buildPostcodeLookupFromOnspd({
   inputPath,
   outputDir,
   prefix,
   sourceVersion,
+  onspdRoot,
 }) {
   const generatedAt = new Date().toISOString();
+  const docsRoot = path.resolve(onspdRoot || defaultOnspdRoot(inputPath));
+  const { lookupInfos, lookupById, lookup_root: lookupRoot } = await loadAreaTownLookups(docsRoot);
+
   const stream = fs.createReadStream(inputPath, { encoding: "utf8" });
   const rl = readline.createInterface({
     input: stream,
@@ -275,11 +359,20 @@ export async function buildPostcodeLookupFromOnspd({
   let lineNumber = 0;
   let columns = null;
 
-  const shardMaps = new Map();
+  const exactShardMaps = new Map();
+  const suggestShardMaps = new Map();
+  const areaTownPairs = new Set();
+  const firstCharCounts = new Map();
+  const firstTwoCharCounts = new Map();
+  const areaCounts = new Map();
+  const outwardCounts = new Map();
+
   let skippedCount = 0;
   let duplicateCount = 0;
   let missingPconCodeCount = 0;
   let missingLaCodeCount = 0;
+  let missingAreaNameCount = 0;
+  let missingPostTownCount = 0;
 
   for await (const rawLine of rl) {
     lineNumber += 1;
@@ -298,8 +391,8 @@ export async function buildPostcodeLookupFromOnspd({
     }
 
     const row = parseCsvLine(line);
-    const postcode = normalisePostcode(row[columns.postcode.index] || "");
-    if (!postcode) {
+    const postcodeNormalised = normalisePostcode(row[columns.postcode.index] || "");
+    if (!postcodeNormalised) {
       skippedCount += 1;
       continue;
     }
@@ -320,38 +413,116 @@ export async function buildPostcodeLookupFromOnspd({
       missingLaCodeCount += 1;
     }
 
-    const shard = getPostcodeShard(postcode);
-    if (!shard) {
+    const area = getPostcodeShard(postcodeNormalised);
+    if (!area) {
       skippedCount += 1;
       continue;
     }
 
-    let shardMap = shardMaps.get(shard);
-    if (!shardMap) {
-      shardMap = new Map();
-      shardMaps.set(shard, shardMap);
+    const resolvedAreaTown = resolveAreaAndPostTown({
+      row,
+      columns,
+      lookupById,
+    });
+    if (!resolvedAreaTown.area_name) {
+      missingAreaNameCount += 1;
+    }
+    if (!resolvedAreaTown.post_town) {
+      missingPostTownCount += 1;
     }
 
-    if (shardMap.has(postcode)) {
+    const areaTownPairKey = createAreaTownPairKey(resolvedAreaTown.area_name, resolvedAreaTown.post_town);
+    areaTownPairs.add(areaTownPairKey);
+
+    let exactShardMap = exactShardMaps.get(area);
+    if (!exactShardMap) {
+      exactShardMap = new Map();
+      exactShardMaps.set(area, exactShardMap);
+    }
+
+    if (exactShardMap.has(postcodeNormalised)) {
       duplicateCount += 1;
     }
-    shardMap.set(postcode, [lat, lon, pconCode, laCode]);
+    exactShardMap.set(postcodeNormalised, [lat, lon, pconCode, laCode, areaTownPairKey]);
+
+    let suggestShardMap = suggestShardMaps.get(area);
+    if (!suggestShardMap) {
+      suggestShardMap = new Map();
+      suggestShardMaps.set(area, suggestShardMap);
+    }
+    suggestShardMap.set(postcodeNormalised, [postcodeNormalised, formatPostcode(postcodeNormalised), areaTownPairKey]);
+
+    const firstChar = postcodeNormalised.slice(0, 1);
+    if (firstChar) {
+      incrementCount(firstCharCounts, firstChar);
+    }
+
+    const firstTwoChars = postcodeNormalised.slice(0, 2);
+    if (firstTwoChars) {
+      incrementCount(firstTwoCharCounts, firstTwoChars);
+    }
+
+    const outward = getOutwardPrefix(postcodeNormalised);
+    if (outward) {
+      incrementCount(outwardCounts, outward);
+    }
+
+    incrementCount(areaCounts, area);
   }
 
   if (!headerParsed || !columns) {
     throw new Error("Input CSV appears empty; no header row was found.");
   }
 
-  const shardCodes = Array.from(shardMaps.keys()).sort((a, b) => a.localeCompare(b));
-  const shardsManifest = {};
-  let postcodeCount = 0;
-
   await fs.promises.mkdir(outputDir, { recursive: true });
 
-  for (const shard of shardCodes) {
-    const shardMap = shardMaps.get(shard) || new Map();
+  const areaTownIdByPairKey = new Map();
+  const sortedPairKeys = Array.from(areaTownPairs).sort((left, right) => {
+    const leftPair = parseAreaTownPairKey(left);
+    const rightPair = parseAreaTownPairKey(right);
+    const leftArea = String(leftPair.area_name || "");
+    const rightArea = String(rightPair.area_name || "");
+    const areaCmp = leftArea.localeCompare(rightArea);
+    if (areaCmp !== 0) {
+      return areaCmp;
+    }
+    const leftTown = String(leftPair.post_town || "");
+    const rightTown = String(rightPair.post_town || "");
+    return leftTown.localeCompare(rightTown);
+  });
+
+  const areaTownValues = {
+    0: [null, null],
+  };
+  let nextAreaTownId = 1;
+  for (const pairKey of sortedPairKeys) {
+    const pair = parseAreaTownPairKey(pairKey);
+    if (!pair.area_name && !pair.post_town) {
+      areaTownIdByPairKey.set(pairKey, 0);
+      continue;
+    }
+    const id = nextAreaTownId;
+    nextAreaTownId += 1;
+    areaTownIdByPairKey.set(pairKey, id);
+    areaTownValues[String(id)] = [pair.area_name || null, pair.post_town || null];
+  }
+
+  const exactShardCodes = Array.from(exactShardMaps.keys()).sort((a, b) => a.localeCompare(b));
+  const suggestShardCodes = Array.from(suggestShardMaps.keys()).sort((a, b) => a.localeCompare(b));
+  const exactShardsManifest = {};
+  const suggestShardsManifest = {};
+  let postcodeCount = 0;
+
+  for (const shard of exactShardCodes) {
+    const shardMap = exactShardMaps.get(shard) || new Map();
     const sortedEntries = Array.from(shardMap.entries()).sort((a, b) => a[0].localeCompare(b[0]));
     postcodeCount += sortedEntries.length;
+
+    const postcodes = {};
+    for (const [postcodeNormalised, rowValue] of sortedEntries) {
+      const areaTownId = areaTownIdByPairKey.get(rowValue[4]) ?? 0;
+      postcodes[postcodeNormalised] = [rowValue[0], rowValue[1], rowValue[2], rowValue[3], areaTownId];
+    }
 
     const shardPayload = {
       schema_version: 2,
@@ -359,30 +530,96 @@ export async function buildPostcodeLookupFromOnspd({
       source: "ONSPD",
       source_version: sourceVersion,
       shard,
-      postcodes: Object.fromEntries(sortedEntries),
+      columns: ["lat", "lon", "pcon_code", "la_code", "area_town_id"],
+      postcodes,
     };
 
-    await writeJsonFile(path.join(outputDir, `${shard}.json`), shardPayload);
-
-    const objectKey = buildPostcodeShardObjectKey(prefix, shard);
-    shardsManifest[shard] = {
+    const relativePath = path.posix.join("shards", `${shard}.json`);
+    const objectKey = buildPostcodeExactShardObjectKey(prefix, shard);
+    await writeJsonFile(path.join(outputDir, relativePath), shardPayload);
+    exactShardsManifest[shard] = {
       postcode_count: sortedEntries.length,
       object_key: objectKey,
+      relative_path: relativePath,
     };
   }
+
+  for (const shard of suggestShardCodes) {
+    const shardMap = suggestShardMaps.get(shard) || new Map();
+    const sortedRows = Array.from(shardMap.values())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map((rowValue) => [
+        rowValue[0],
+        rowValue[1],
+        areaTownIdByPairKey.get(rowValue[2]) ?? 0,
+      ]);
+
+    const shardPayload = {
+      schema_version: 1,
+      generated_at_utc: generatedAt,
+      source: "ONSPD",
+      source_version: sourceVersion,
+      postcode_area: shard,
+      columns: ["n", "p", "at"],
+      rows: sortedRows,
+    };
+
+    const relativePath = path.posix.join("suggest", `${shard}.json`);
+    const objectKey = buildPostcodeSuggestShardObjectKey(prefix, shard);
+    await writeJsonFile(path.join(outputDir, relativePath), shardPayload);
+    suggestShardsManifest[shard] = {
+      postcode_count: sortedRows.length,
+      object_key: objectKey,
+      relative_path: relativePath,
+    };
+  }
+
+  const areaTownIndex = {
+    schema_version: 1,
+    generated_at_utc: generatedAt,
+    source: "ONSPD",
+    source_version: sourceVersion,
+    columns: ["area_name", "post_town"],
+    values: areaTownValues,
+  };
+  const areaTownRelativePath = "area_town_index.json";
+  await writeJsonFile(path.join(outputDir, areaTownRelativePath), areaTownIndex);
+
+  const prefixHints = buildPrefixHints({
+    firstCharCounts,
+    firstTwoCharCounts,
+    areaCounts,
+    outwardCounts,
+  });
+  const prefixHintsPayload = {
+    ...prefixHints,
+    generated_at_utc: generatedAt,
+    source: "ONSPD",
+    source_version: sourceVersion,
+  };
+  const prefixHintsRelativePath = "postcode_prefix_hints.json";
+  await writeJsonFile(path.join(outputDir, prefixHintsRelativePath), prefixHintsPayload);
 
   const manifest = {
     schema_version: 2,
     generated_at_utc: generatedAt,
     source: "ONSPD",
     source_version: sourceVersion,
-    shard_count: shardCodes.length,
+    shard_count: exactShardCodes.length,
+    exact_shard_count: exactShardCodes.length,
+    suggest_shard_count: suggestShardCodes.length,
     postcode_count: postcodeCount,
     skipped_count: skippedCount,
     duplicate_count: duplicateCount,
     missing_pcon_code_count: missingPconCodeCount,
     missing_la_code_count: missingLaCodeCount,
+    missing_area_name_count: missingAreaNameCount,
+    missing_post_town_count: missingPostTownCount,
+    area_town_index_count: Object.keys(areaTownValues).length,
+    unique_area_town_combo_count: Object.keys(areaTownValues).length - 1,
     input_csv_path: inputPath,
+    onspd_root: docsRoot,
+    lookup_root: lookupRoot,
     output_dir: outputDir,
     postcode_field: columns.postcode.field,
     latitude_field: columns.lat.field,
@@ -399,7 +636,44 @@ export async function buildPostcodeLookupFromOnspd({
         contains_names: false,
       },
     },
-    shards: sortObjectKeys(shardsManifest),
+    area_town_fields: {
+      ctry: columns.ctry.field,
+      buasd24: columns.buasd24.field,
+      bua24: columns.bua24.field,
+      parish: columns.parish.field,
+      osward: columns.osward.field,
+      oslaua: columns.oslaua.field,
+      ttwa: columns.ttwa.field,
+      post_town: columns.post_town.field,
+    },
+    exact_shard_layout: {
+      columns: ["lat", "lon", "pcon_code", "la_code", "area_town_id"],
+      object_key_template: `${normalizePrefix(prefix)}/shards/{AREA}.json`,
+    },
+    suggest_shard_layout: {
+      columns: ["n", "p", "at"],
+      object_key_template: `${normalizePrefix(prefix)}/suggest/{AREA}.json`,
+    },
+    objects: {
+      area_town_index: buildPostcodeAreaTownIndexObjectKey(prefix),
+      area_town_index_relative_path: areaTownRelativePath,
+      postcode_prefix_hints: buildPostcodePrefixHintsObjectKey(prefix),
+      postcode_prefix_hints_relative_path: prefixHintsRelativePath,
+      exact_shards_prefix: `${normalizePrefix(prefix)}/shards/`,
+      suggest_shards_prefix: `${normalizePrefix(prefix)}/suggest/`,
+    },
+    lookup_files: lookupInfos.map((info) => ({
+      id: info.id,
+      found: info.found,
+      file_path: info.file_path,
+      code_column: info.code_column,
+      name_column: info.name_column,
+      note: info.note,
+      mapped_count: info.mapped_count,
+    })),
+    shards: sortObjectKeys(exactShardsManifest),
+    exact_shards: sortObjectKeys(exactShardsManifest),
+    suggest_shards: sortObjectKeys(suggestShardsManifest),
   };
 
   await writeJsonFile(path.join(outputDir, "manifest.json"), manifest);
@@ -411,11 +685,13 @@ export async function main(argv = process.argv.slice(2)) {
   const inputPath = path.resolve(args.input);
   const outputDir = path.resolve(args.output);
   const sourceVersion = args.source_version || inferOnspdSourceVersion(inputPath);
+  const onspdRoot = path.resolve(args.onspd_root || defaultOnspdRoot(inputPath));
   const manifest = await buildPostcodeLookupFromOnspd({
     inputPath,
     outputDir,
     prefix: args.prefix,
     sourceVersion,
+    onspdRoot,
   });
 
   console.log(
@@ -425,14 +701,19 @@ export async function main(argv = process.argv.slice(2)) {
         source: manifest.source,
         source_version: manifest.source_version,
         input_csv_path: manifest.input_csv_path,
+        onspd_root: manifest.onspd_root,
         output_dir: manifest.output_dir,
         r2_prefix: args.prefix,
-        shard_count: manifest.shard_count,
+        exact_shard_count: manifest.exact_shard_count,
+        suggest_shard_count: manifest.suggest_shard_count,
         postcode_count: manifest.postcode_count,
+        unique_area_town_combo_count: manifest.unique_area_town_combo_count,
         skipped_count: manifest.skipped_count,
         duplicate_count: manifest.duplicate_count,
         missing_pcon_code_count: manifest.missing_pcon_code_count,
         missing_la_code_count: manifest.missing_la_code_count,
+        missing_area_name_count: manifest.missing_area_name_count,
+        missing_post_town_count: manifest.missing_post_town_count,
         pcon_field: manifest.geography_codes.pcon.field,
         la_field: manifest.geography_codes.la.field,
       },

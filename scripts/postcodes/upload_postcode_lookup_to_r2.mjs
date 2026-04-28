@@ -7,7 +7,6 @@ import {
   normalizePrefix,
   r2PutObject,
 } from "../../workers/shared/r2_sigv4.mjs";
-import { buildPostcodeShardObjectKey } from "../../workers/shared/postcode_lookup.mjs";
 
 const DEFAULT_INPUT_DIR = String(
   process.env.UK_AQ_POSTCODE_LOOKUP_OUTPUT_DIR
@@ -153,25 +152,197 @@ async function readFileBuffer(filePath) {
 }
 
 function inferPrefixFromManifest(manifest) {
-  const shards = manifest && typeof manifest === "object" && manifest.shards && typeof manifest.shards === "object"
-    ? manifest.shards
-    : null;
-  if (!shards) {
+  function stripKnownSuffix(key) {
+    const normalized = String(key || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!normalized) {
+      return "";
+    }
+    const suffixes = [
+      "/area_town_index.json",
+      "/postcode_prefix_hints.json",
+      "/manifest.json",
+      "/shards",
+      "/suggest",
+    ];
+    for (const suffix of suffixes) {
+      if (normalized.endsWith(suffix)) {
+        return normalizePrefix(normalized.slice(0, -suffix.length));
+      }
+    }
+    return normalizePrefix(normalized);
+  }
+
+  const objectCandidates = [
+    manifest?.objects?.area_town_index,
+    manifest?.objects?.postcode_prefix_hints,
+    manifest?.objects?.exact_shards_prefix,
+    manifest?.objects?.suggest_shards_prefix,
+  ].filter(Boolean);
+
+  for (const objectKey of objectCandidates) {
+    const inferred = stripKnownSuffix(objectKey);
+    if (inferred) {
+      return inferred;
+    }
+  }
+
+  const exactShards = manifest?.exact_shards;
+  const legacyShards = manifest?.shards;
+  const shardMap = exactShards && typeof exactShards === "object" ? exactShards : legacyShards;
+  if (!shardMap || typeof shardMap !== "object") {
     return "";
   }
-  for (const [shard, info] of Object.entries(shards)) {
-    const objectKey = String(info && info.object_key ? info.object_key : "").trim();
-    const suffix = `/${String(shard || "").trim().toUpperCase()}.json`;
-    if (!objectKey || !suffix || !objectKey.toUpperCase().endsWith(suffix.toUpperCase())) {
+
+  for (const [shard, info] of Object.entries(shardMap)) {
+    const objectKey = String(info?.object_key || "").trim();
+    if (!objectKey) {
       continue;
     }
-    const prefix = objectKey.slice(0, objectKey.length - suffix.length);
-    const normalized = normalizePrefix(prefix);
-    if (normalized) {
-      return normalized;
+    const shardCode = String(shard || "").trim().toUpperCase();
+    const cleanedKey = objectKey.replace(/^\/+|\/+$/g, "");
+    const fallbackSuffixes = [
+      `/shards/${shardCode}.json`,
+      `/suggest/${shardCode}.json`,
+      `/${shardCode}.json`,
+    ];
+    for (const suffix of fallbackSuffixes) {
+      if (shardCode && cleanedKey.toUpperCase().endsWith(suffix.toUpperCase())) {
+        return normalizePrefix(cleanedKey.slice(0, -suffix.length));
+      }
     }
   }
   return "";
+}
+
+function buildObjectKey(prefix, relativePath) {
+  const normalizedPrefix = normalizePrefix(prefix);
+  const normalizedRelativePath = String(relativePath || "").trim().replace(/^\/+/, "");
+  if (!normalizedPrefix || !normalizedRelativePath) {
+    return "";
+  }
+  return `${normalizedPrefix}/${normalizedRelativePath}`;
+}
+
+function addPlanEntry(plan, seen, type, code, relativePath) {
+  const normalizedRelativePath = String(relativePath || "").trim().replace(/^\/+/, "");
+  if (!normalizedRelativePath) {
+    return;
+  }
+  if (seen.has(normalizedRelativePath)) {
+    return;
+  }
+  seen.add(normalizedRelativePath);
+  plan.push({ type, code, relative_path: normalizedRelativePath });
+}
+
+function buildUploadPlan(manifest) {
+  const plan = [];
+  const seen = new Set();
+
+  const exactShards = manifest?.exact_shards && typeof manifest.exact_shards === "object"
+    ? manifest.exact_shards
+    : manifest?.shards && typeof manifest.shards === "object"
+      ? manifest.shards
+      : null;
+  if (exactShards) {
+    for (const [shard, info] of Object.entries(exactShards).sort((a, b) => a[0].localeCompare(b[0]))) {
+      const relativePath = String(info?.relative_path || `shards/${shard}.json`).trim();
+      addPlanEntry(plan, seen, "exact_shard", shard, relativePath);
+    }
+  }
+
+  const suggestShards = manifest?.suggest_shards && typeof manifest.suggest_shards === "object"
+    ? manifest.suggest_shards
+    : null;
+  if (suggestShards) {
+    for (const [shard, info] of Object.entries(suggestShards).sort((a, b) => a[0].localeCompare(b[0]))) {
+      const relativePath = String(info?.relative_path || `suggest/${shard}.json`).trim();
+      addPlanEntry(plan, seen, "suggest_shard", shard, relativePath);
+    }
+  }
+
+  const areaTownRelativePath = String(
+    manifest?.objects?.area_town_index_relative_path
+      || "area_town_index.json",
+  ).trim();
+  addPlanEntry(plan, seen, "area_town_index", null, areaTownRelativePath);
+
+  const prefixHintsRelativePath = String(
+    manifest?.objects?.postcode_prefix_hints_relative_path
+      || "postcode_prefix_hints.json",
+  ).trim();
+  addPlanEntry(plan, seen, "postcode_prefix_hints", null, prefixHintsRelativePath);
+
+  if (plan.length === 0) {
+    throw new Error("manifest.json does not describe any upload objects.");
+  }
+  return plan;
+}
+
+async function assertFilesExist(inputDir, plan) {
+  for (const item of plan) {
+    const filePath = path.join(inputDir, item.relative_path);
+    // eslint-disable-next-line no-await-in-loop
+    const stat = await fs.promises.stat(filePath).catch(() => null);
+    if (!stat || !stat.isFile()) {
+      throw new Error(`Missing expected file from manifest: ${filePath}`);
+    }
+  }
+}
+
+function buildUploadManifest(manifest, prefix, plan, generatedAt) {
+  const uploadedManifest = {
+    ...manifest,
+    generated_at_utc: manifest.generated_at_utc || generatedAt,
+    uploaded_at_utc: generatedAt,
+    source: manifest.source || "ONSPD",
+    objects: {
+      ...(manifest.objects || {}),
+      area_town_index: buildObjectKey(prefix, "area_town_index.json"),
+      area_town_index_relative_path: "area_town_index.json",
+      postcode_prefix_hints: buildObjectKey(prefix, "postcode_prefix_hints.json"),
+      postcode_prefix_hints_relative_path: "postcode_prefix_hints.json",
+      exact_shards_prefix: buildObjectKey(prefix, "shards/") || `${normalizePrefix(prefix)}/shards/`,
+      suggest_shards_prefix: buildObjectKey(prefix, "suggest/") || `${normalizePrefix(prefix)}/suggest/`,
+    },
+    shards: {},
+    exact_shards: {},
+    suggest_shards: {},
+  };
+
+  for (const item of plan) {
+    const objectKey = buildObjectKey(prefix, item.relative_path);
+    if (item.type === "exact_shard") {
+      uploadedManifest.shards[item.code] = {
+        ...(manifest?.shards?.[item.code] || manifest?.exact_shards?.[item.code] || {}),
+        object_key: objectKey,
+        relative_path: item.relative_path,
+      };
+      uploadedManifest.exact_shards[item.code] = {
+        ...(manifest?.exact_shards?.[item.code] || manifest?.shards?.[item.code] || {}),
+        object_key: objectKey,
+        relative_path: item.relative_path,
+      };
+      continue;
+    }
+    if (item.type === "suggest_shard") {
+      uploadedManifest.suggest_shards[item.code] = {
+        ...(manifest?.suggest_shards?.[item.code] || {}),
+        object_key: objectKey,
+        relative_path: item.relative_path,
+      };
+    }
+  }
+
+  uploadedManifest.shard_count = Number(uploadedManifest.shard_count || Object.keys(uploadedManifest.shards).length);
+  uploadedManifest.exact_shard_count = Number(
+    uploadedManifest.exact_shard_count || Object.keys(uploadedManifest.exact_shards).length,
+  );
+  uploadedManifest.suggest_shard_count = Number(
+    uploadedManifest.suggest_shard_count || Object.keys(uploadedManifest.suggest_shards).length,
+  );
+
+  return uploadedManifest;
 }
 
 async function main() {
@@ -187,73 +358,51 @@ async function main() {
   }
 
   const manifest = await readJsonFile(manifestPath);
-  const sourceShards = manifest && typeof manifest === "object" && manifest.shards && typeof manifest.shards === "object"
-    ? manifest.shards
-    : null;
-  if (!sourceShards) {
-    throw new Error("manifest.json is missing shards object.");
-  }
-
-  const shardCodes = Object.keys(sourceShards).sort((a, b) => a.localeCompare(b));
-  if (shardCodes.length === 0) {
-    throw new Error("manifest.json contains no shards.");
-  }
-
   const prefix = args.prefix_override || inferPrefixFromManifest(manifest) || DEFAULT_PREFIX;
   if (!prefix) {
     throw new Error("R2 prefix cannot be empty.");
   }
+
+  const plan = buildUploadPlan(manifest);
+  await assertFilesExist(inputDir, plan);
+
   const generatedAt = new Date().toISOString();
   let totalUploadedBytes = 0;
   let uploadedObjects = 0;
 
-  const uploadManifest = {
-    ...manifest,
-    generated_at_utc: manifest.generated_at_utc || generatedAt,
-    uploaded_at_utc: generatedAt,
-    source: "ONSPD",
-    shards: {},
-  };
+  for (const item of plan) {
+    const filePath = path.join(inputDir, item.relative_path);
+    const objectKey = buildObjectKey(prefix, item.relative_path);
+    const buffer = await readFileBuffer(filePath);
 
-  for (const shard of shardCodes) {
-    const shardFilePath = path.join(inputDir, `${shard}.json`);
-    const shardObjectKey = buildPostcodeShardObjectKey(prefix, shard);
-    if (!shardObjectKey) {
-      throw new Error(`Failed to build object key for shard ${shard}.`);
-    }
-
-    const shardFileBuffer = await readFileBuffer(shardFilePath);
     if (!args.dry_run) {
+      // eslint-disable-next-line no-await-in-loop
       const uploadResult = await r2PutObject({
         r2,
-        key: shardObjectKey,
-        body: shardFileBuffer,
+        key: objectKey,
+        body: buffer,
         content_type: "application/json; charset=utf-8",
       });
       totalUploadedBytes += uploadResult.bytes;
       uploadedObjects += 1;
     } else {
-      totalUploadedBytes += shardFileBuffer.byteLength;
+      totalUploadedBytes += buffer.byteLength;
       uploadedObjects += 1;
     }
-
-    const shardInfo = sourceShards[shard];
-    uploadManifest.shards[shard] = {
-      postcode_count: Number(shardInfo?.postcode_count || 0),
-      object_key: shardObjectKey,
-    };
   }
 
-  const manifestObjectKey = `${prefix}/manifest.json`;
+  const uploadManifest = buildUploadManifest(manifest, prefix, plan, generatedAt);
+  const manifestObjectKey = `${normalizePrefix(prefix)}/manifest.json`;
   const manifestBuffer = Buffer.from(`${JSON.stringify(uploadManifest, null, 2)}\n`, "utf8");
+
   if (!args.dry_run) {
-    const manifestUploadResult = await r2PutObject({
+    const uploadResult = await r2PutObject({
       r2,
       key: manifestObjectKey,
       body: manifestBuffer,
       content_type: "application/json; charset=utf-8",
     });
-    totalUploadedBytes += manifestUploadResult.bytes;
+    totalUploadedBytes += uploadResult.bytes;
     uploadedObjects += 1;
   } else {
     totalUploadedBytes += manifestBuffer.byteLength;
@@ -267,8 +416,10 @@ async function main() {
         dry_run: args.dry_run,
         bucket: r2.bucket,
         prefix,
-        shard_count: Number(manifest.shard_count || shardCodes.length),
-        postcode_count: Number(manifest.postcode_count || 0),
+        exact_shard_count: Number(uploadManifest.exact_shard_count || 0),
+        suggest_shard_count: Number(uploadManifest.suggest_shard_count || 0),
+        postcode_count: Number(uploadManifest.postcode_count || 0),
+        area_town_index_count: Number(uploadManifest.area_town_index_count || 0),
         uploaded_objects: uploadedObjects,
         uploaded_bytes: totalUploadedBytes,
       },

@@ -27,6 +27,7 @@
     "backup:sync-history-dropbox": "node scripts/backup_r2/sync_history_to_dropbox.mjs",
     "backup:snapshot-core-r2": "node scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs",
     "postcode:build": "node scripts/postcodes/build_postcode_lookup_from_onspd.mjs",
+    "postcode:inspect-area-post-town": "node scripts/postcodes/inspect_onspd_area_post_town.mjs",
     "postcode:check-geography": "node scripts/postcodes/check_postcode_geography_versions.mjs",
     "postcode:upload": "node scripts/postcodes/upload_postcode_lookup_to_r2.mjs",
     "geo:resolve-dropbox": "python3 scripts/geography/resolve_dropbox_geojson.py",

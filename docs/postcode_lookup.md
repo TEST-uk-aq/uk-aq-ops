@@ -1,30 +1,74 @@
-# UK Postcode Lookup (R2 Shards + Worker API)
+# UK Postcode Lookup (R2 Exact + Suggest Shards)
 
 ## Data source
 
-- Source dataset: **ONS Postcode Directory (ONSPD)** CSV.
-- Current source version in use: **ONSPD_MAY_2025**.
-- ONSPD is preferred because it covers the full UK, including Northern Ireland.
+- Source dataset: **ONS Postcode Directory (ONSPD)** CSV
+- Current source version: **ONSPD_MAY_2025**
+- ONSPD is used because it covers the full UK, including Northern Ireland.
 
-## Why shard files in R2
+## Why split exact vs suggest
 
-- The Worker does not load one giant postcode CSV/object into memory.
-- Local build pre-generates small shard JSON files by postcode area (for example `SW.json`, `EC.json`, `BT.json`).
-- Lookup reads only one shard from R2 per request.
+- Exact lookup and autocomplete have different access patterns.
+- Exact lookup needs lat/lon and geography codes.
+- Suggest lookup needs compact prefix search rows.
+- Worker reads one small shard per request instead of loading a giant dataset.
 
-## Data stored per postcode
+## R2 object layout
 
-- Stored values are compact arrays:
-  - `[lat, lon, pcon_code, la_code]`
-- `pcon_code` and `la_code` may be `null` when source row codes are missing.
-- `pcon_name` and `la_name` are intentionally **not** stored in R2.
+Using prefix `v1`:
 
-Reason:
+- `v1/manifest.json`
+- `v1/area_town_index.json`
+- `v1/postcode_prefix_hints.json`
+- `v1/shards/<AREA>.json` (exact)
+- `v1/suggest/<AREA>.json` (autocomplete)
 
-- Website map names are resolved from local PCON HexJSON / LA GeoJSON files in the website repo.
-- Postcode lookup stays compact and code-only.
+## Exact shard format
 
-## Build shard files locally
+Each exact shard stores postcode key -> compact value:
+
+- `[lat, lon, pcon_code, la_code, area_town_id]`
+
+Exact rows intentionally do **not** store:
+
+- `area_name`
+- `post_town`
+
+## Suggest shard format
+
+Each suggest shard stores rows in compact array form:
+
+- columns: `n`, `p`, `at`
+- row: `[postcode_normalised, postcode_display, area_town_id]`
+
+Suggest rows intentionally do **not** store:
+
+- lat/lon
+- pcon/la codes
+- area/town strings
+
+## Area/Town index
+
+`area_town_index.json` stores de-duplicated strings:
+
+- `area_town_id -> [area_name, post_town]`
+
+This avoids repeating area/town text across ~2.7 million postcode rows.
+
+## Area and post town derivation
+
+Area and post town are ONSPD-derived, not Royal Mail PAF post town values.
+
+Current logic:
+
+- England/Wales area: `BUASD24 -> BUA24 -> PARISH -> OSWARD -> OSLAUA`
+- Scotland area: `OSWARD -> OSLAUA`
+- NI area: `OSWARD -> OSLAUA`
+- post_town fallback: `TTWA -> BUA24 -> OSLAUA -> OSCTY`
+
+Pseudo/missing codes are ignored.
+
+## Build
 
 ```bash
 cd CIC-test-uk-aq-ops
@@ -32,38 +76,14 @@ cd CIC-test-uk-aq-ops
 npm run postcode:build -- \
   --input "/Users/mikehinford/Dropbox/Projects/CIC Website/Resources - Main - CIC Web/Postcode lookup/ONSPD_MAY_2025/Data/ONSPD_MAY_2025_UK.csv" \
   --output "tmp/postcode_lookup_v1" \
-  --prefix "postcode_lookup/v1"
+  --prefix "v1"
 ```
 
-Output:
+Optional:
 
-- `tmp/postcode_lookup_v1/manifest.json`
-- `tmp/postcode_lookup_v1/<AREA>.json` shard files
+- `--onspd-root "/path/to/ONSPD_MAY_2025"`
 
-Manifest includes:
-
-- detected source fields (postcode/lat/lon/pcon/la)
-- `missing_pcon_code_count`
-- `missing_la_code_count`
-- `geography_codes` metadata (`contains_names: false`)
-
-## Check postcode vs website geography compatibility
-
-```bash
-cd CIC-test-uk-aq-ops
-
-npm run postcode:check-geography -- \
-  --postcode-dir "tmp/postcode_lookup_v1" \
-  --pcon-geojson "/path/to/website/pcon.geojson-or-hexjson" \
-  --la-geojson "/path/to/website/la.geojson-or-hexjson"
-```
-
-Behavior:
-
-- Fails (exit non-zero) if any postcode lookup `pcon_code`/`la_code` is missing from website geography files.
-- Warns (does not fail) if website geography includes extra codes not present in postcode lookup output.
-
-## Upload shard files to R2
+## Upload
 
 ```bash
 cd CIC-test-uk-aq-ops
@@ -72,38 +92,51 @@ npm run postcode:upload -- \
   --input-dir "tmp/postcode_lookup_v1"
 ```
 
-## API endpoint
+## API endpoints
 
-Website-facing route (cache proxy):
+Underlying worker routes:
 
-- `GET /api/aq/postcode_lookup?postcode=SW1A%201AA`
+- exact: `GET /v1/postcode_lookup?postcode=BS2%201AA`
+- suggest: `GET /v1/postcode_suggest?q=BS2`
 
-Underlying R2 Worker route:
+Website-facing proxy route can expose these under `/api/aq/...` as needed.
 
-- `GET /v1/postcode_lookup?postcode=SW1A%201AA`
-
-Successful response:
+## Exact lookup response example
 
 ```json
 {
   "ok": true,
-  "postcode": "SW1A 1AA",
-  "postcode_normalised": "SW1A1AA",
-  "lat": 51.501009,
-  "lon": -0.141588,
-  "pcon_code": "E14001530",
-  "la_code": "E09000033",
+  "postcode": "BS2 1AA",
+  "postcode_normalised": "BS21AA",
+  "lat": 51.45,
+  "lon": -2.58,
+  "pcon_code": "E14000001",
+  "la_code": "E06000001",
+  "area_town_id": 41,
+  "area_name": "Emersons Green",
+  "post_town": "Bristol",
+  "label": "BS2 1AA, Emersons Green, Bristol",
   "source": "ONSPD"
 }
 ```
 
-Error responses:
+## Suggest behavior
 
-- `400` invalid postcode -> `invalid_postcode`
-- `404` postcode missing from shard -> `postcode_not_found`
-- `503` shard/object unavailable -> `postcode_lookup_unavailable`
+- `q` length `0`: returns empty
+- `q` length `1` or `2`: returns prefix hints from `postcode_prefix_hints.json`
+- `q` length `>=3`: reads one `suggest/<AREA>.json` shard and filters rows
+- `limit` default `6`, capped at `10`
 
-Cache headers:
+## Caching
+
+Worker-side in-memory caches:
+
+- exact shards
+- suggest shards
+- `area_town_index.json`
+- `postcode_prefix_hints.json`
+
+Response caching:
 
 - success: `Cache-Control: public, max-age=86400`
-- error: `Cache-Control: no-store`
+- errors: `Cache-Control: no-store`

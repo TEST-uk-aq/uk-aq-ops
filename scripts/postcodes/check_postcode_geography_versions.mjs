@@ -236,15 +236,26 @@ function extractPostcodeRowCodes(rowValue) {
 }
 
 function listShardFilesFromManifest(postcodeDir, manifest) {
-  const shards = manifest && typeof manifest === "object" && manifest.shards && typeof manifest.shards === "object"
-    ? manifest.shards
+  const exactShards = manifest && typeof manifest === "object" && manifest.exact_shards && typeof manifest.exact_shards === "object"
+    ? manifest.exact_shards
     : null;
+  const shards = exactShards
+    || (manifest && typeof manifest === "object" && manifest.shards && typeof manifest.shards === "object"
+      ? manifest.shards
+      : null);
   if (!shards) {
     return [];
   }
   return Object.keys(shards)
     .sort((a, b) => a.localeCompare(b))
-    .map((shard) => path.join(postcodeDir, `${shard}.json`));
+    .map((shard) => {
+      const info = shards[shard];
+      const relativePath = String(info && info.relative_path ? info.relative_path : "").trim();
+      if (relativePath) {
+        return path.join(postcodeDir, relativePath);
+      }
+      return path.join(postcodeDir, `${shard}.json`);
+    });
 }
 
 async function listShardFiles(postcodeDir) {
@@ -261,13 +272,26 @@ async function listShardFiles(postcodeDir) {
     }
   }
 
-  const entries = await fs.promises.readdir(postcodeDir, { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isFile())
-    .map((entry) => entry.name)
-    .filter((name) => name.endsWith(".json") && name !== "manifest.json")
-    .sort((a, b) => a.localeCompare(b))
-    .map((name) => path.join(postcodeDir, name));
+  const output = [];
+  async function walk(dir) {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      if (!entry.name.endsWith(".json") || entry.name === "manifest.json") {
+        continue;
+      }
+      output.push(fullPath);
+    }
+  }
+  await walk(postcodeDir);
+  return output.sort((a, b) => a.localeCompare(b));
 }
 
 export async function collectPostcodeCodesFromLookupDir(postcodeDir) {

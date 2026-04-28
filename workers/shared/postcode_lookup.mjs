@@ -43,3 +43,37 @@ export function buildPostcodeShardObjectKey(prefix, shard) {
   }
   return `${normalizedPrefix}/${normalizedShard}.json`;
 }
+
+export function buildPostcodeExactShardObjectKey(prefix, shard) {
+  const normalizedPrefix = String(prefix || "").trim().replace(/^\/+|\/+$/g, "");
+  const normalizedShard = String(shard || "").trim().toUpperCase();
+  if (!normalizedPrefix || !normalizedShard) {
+    return null;
+  }
+  return `${normalizedPrefix}/shards/${normalizedShard}.json`;
+}
+
+export function buildPostcodeSuggestShardObjectKey(prefix, shard) {
+  const normalizedPrefix = String(prefix || "").trim().replace(/^\/+|\/+$/g, "");
+  const normalizedShard = String(shard || "").trim().toUpperCase();
+  if (!normalizedPrefix || !normalizedShard) {
+    return null;
+  }
+  return `${normalizedPrefix}/suggest/${normalizedShard}.json`;
+}
+
+export function buildPostcodeAreaTownIndexObjectKey(prefix) {
+  const normalizedPrefix = String(prefix || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!normalizedPrefix) {
+    return null;
+  }
+  return `${normalizedPrefix}/area_town_index.json`;
+}
+
+export function buildPostcodePrefixHintsObjectKey(prefix) {
+  const normalizedPrefix = String(prefix || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!normalizedPrefix) {
+    return null;
+  }
+  return `${normalizedPrefix}/postcode_prefix_hints.json`;
+}
