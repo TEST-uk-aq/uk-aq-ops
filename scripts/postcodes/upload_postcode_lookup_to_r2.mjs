@@ -24,7 +24,7 @@ function usage() {
       "",
       "Options:",
       "  --input-dir <dir>            Directory with manifest.json + shard JSON files",
-      "  --prefix <r2-prefix>         R2 key prefix (default: v1)",
+      "  --prefix <r2-prefix>         R2 key prefix (default: from manifest.json, else UK_AQ_POSTCODE_R2_PREFIX, else v1)",
       "  --bucket <bucket>            Override bucket name",
       "  --endpoint <url>             Override R2 endpoint URL",
       "  --dry-run                    Validate and print plan only",
@@ -47,7 +47,7 @@ function usage() {
 function parseArgs(argv) {
   const args = {
     input_dir: DEFAULT_INPUT_DIR,
-    prefix: DEFAULT_PREFIX,
+    prefix_override: "",
     bucket_override: "",
     endpoint_override: "",
     dry_run: false,
@@ -61,7 +61,7 @@ function parseArgs(argv) {
       continue;
     }
     if (arg === "--prefix") {
-      args.prefix = normalizePrefix(argv[i + 1]);
+      args.prefix_override = normalizePrefix(argv[i + 1]);
       i += 1;
       continue;
     }
@@ -88,9 +88,6 @@ function parseArgs(argv) {
 
   if (!args.input_dir) {
     throw new Error("Input directory is required. Set --input-dir or UK_AQ_POSTCODE_LOOKUP_OUTPUT_DIR.");
-  }
-  if (!args.prefix) {
-    throw new Error("R2 prefix cannot be empty.");
   }
   return args;
 }
@@ -155,6 +152,28 @@ async function readFileBuffer(filePath) {
   return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 }
 
+function inferPrefixFromManifest(manifest) {
+  const shards = manifest && typeof manifest === "object" && manifest.shards && typeof manifest.shards === "object"
+    ? manifest.shards
+    : null;
+  if (!shards) {
+    return "";
+  }
+  for (const [shard, info] of Object.entries(shards)) {
+    const objectKey = String(info && info.object_key ? info.object_key : "").trim();
+    const suffix = `/${String(shard || "").trim().toUpperCase()}.json`;
+    if (!objectKey || !suffix || !objectKey.toUpperCase().endsWith(suffix.toUpperCase())) {
+      continue;
+    }
+    const prefix = objectKey.slice(0, objectKey.length - suffix.length);
+    const normalized = normalizePrefix(prefix);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const inputDir = path.resolve(args.input_dir);
@@ -180,7 +199,10 @@ async function main() {
     throw new Error("manifest.json contains no shards.");
   }
 
-  const prefix = args.prefix;
+  const prefix = args.prefix_override || inferPrefixFromManifest(manifest) || DEFAULT_PREFIX;
+  if (!prefix) {
+    throw new Error("R2 prefix cannot be empty.");
+  }
   const generatedAt = new Date().toISOString();
   let totalUploadedBytes = 0;
   let uploadedObjects = 0;
