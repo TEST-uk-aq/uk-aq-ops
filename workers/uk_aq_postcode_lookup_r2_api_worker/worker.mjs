@@ -196,6 +196,34 @@ function parseSuggestLimit(url) {
   return Math.max(1, Math.min(MAX_SUGGEST_LIMIT, parsed));
 }
 
+function getOutwardFromPostcodeNormalised(postcodeNormalised) {
+  const compact = String(postcodeNormalised || "").trim().toUpperCase();
+  if (!compact) {
+    return "";
+  }
+  if (compact.length <= 3) {
+    return compact;
+  }
+  return compact.slice(0, -3);
+}
+
+function getSuggestMatchRank(queryNormalised, postcodeNormalised) {
+  const outward = getOutwardFromPostcodeNormalised(postcodeNormalised);
+  if (!outward) {
+    return 4;
+  }
+  if (outward === queryNormalised) {
+    return 0;
+  }
+  if (outward.startsWith(queryNormalised)) {
+    return 1;
+  }
+  if (queryNormalised.startsWith(outward)) {
+    return 2;
+  }
+  return 3;
+}
+
 function valuesEqualInsensitive(left, right) {
   return String(left || "").trim().toLowerCase() === String(right || "").trim().toLowerCase();
 }
@@ -640,7 +668,7 @@ export async function handlePostcodeSuggestRequest(request, env) {
   }
 
   const areaTownIndex = await readAreaTownIndex(env, prefix);
-  const results = [];
+  const matches = [];
   for (const row of suggestShard.rows) {
     const postcodeNormalised = String(row[0] || "").trim().toUpperCase();
     if (!postcodeNormalised.startsWith(queryNormalised)) {
@@ -651,7 +679,10 @@ export async function handlePostcodeSuggestRequest(request, env) {
     const areaTownId = parseAreaTownId(row[2]);
     const areaTown = lookupAreaTown(areaTownIndex.values, areaTownId);
 
-    results.push({
+    matches.push({
+      rank: getSuggestMatchRank(queryNormalised, postcodeNormalised),
+      postcode_normalised: postcodeNormalised,
+      payload: {
       type: "postcode",
       postcode: postcodeDisplay,
       postcode_normalised: postcodeNormalised,
@@ -659,12 +690,18 @@ export async function handlePostcodeSuggestRequest(request, env) {
       area_name: areaTown.area_name,
       post_town: areaTown.post_town,
       label: buildPostcodeLabel(postcodeDisplay, areaTown.area_name, areaTown.post_town),
+      },
     });
-
-    if (results.length >= limit) {
-      break;
-    }
   }
+
+  matches.sort((left, right) => {
+    if (left.rank !== right.rank) {
+      return left.rank - right.rank;
+    }
+    return left.postcode_normalised.localeCompare(right.postcode_normalised);
+  });
+
+  const results = matches.slice(0, limit).map((item) => item.payload);
 
   const payload = {
     ok: true,

@@ -59,6 +59,7 @@ function buildBaseObjects() {
       postcode_area: "BS",
       columns: ["n", "p", "at"],
       rows: [
+        ["BS200AA", "BS20 0AA", 41],
         ["BS21AA", "BS2 1AA", 41],
         ["BS21AB", "BS2 1AB", 41],
         ["BS375BA", "BS37 5BA", 42],
@@ -228,7 +229,7 @@ test("suggest endpoint returns decorated postcode results with default max limit
   const payload = await response.json();
   assert.equal(payload.ok, true);
   assert.equal(payload.query_normalised, "BS2");
-  assert.equal(payload.results.length, 2);
+  assert.equal(payload.results.length, 3);
   assert.deepEqual(payload.results[0], {
     type: "postcode",
     postcode: "BS2 1AA",
@@ -238,6 +239,8 @@ test("suggest endpoint returns decorated postcode results with default max limit
     post_town: "Bristol",
     label: "BS2 1AA, Emersons Green, Bristol",
   });
+  assert.equal(payload.results[1].postcode_normalised, "BS21AB");
+  assert.equal(payload.results[2].postcode_normalised, "BS200AA");
 });
 
 test("suggest endpoint q length 1 and 2 uses prefix hints and does not read suggest shard", async () => {
