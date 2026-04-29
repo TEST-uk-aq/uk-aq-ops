@@ -35,6 +35,7 @@ test("build parser detects postcode/lat/lon/pcon/la columns from ONSPD-style hea
     "pcds",
     "lat",
     "long",
+    "doterm",
     "pcon",
     "oslaua",
     "ctry",
@@ -45,6 +46,7 @@ test("build parser detects postcode/lat/lon/pcon/la columns from ONSPD-style hea
   assert.equal(columns.postcode.field, "pcds");
   assert.equal(columns.lat.field, "lat");
   assert.equal(columns.lon.field, "long");
+  assert.equal(columns.doterm.field, "doterm");
   assert.equal(columns.pcon.field, "pcon");
   assert.equal(columns.la.field, "oslaua");
   assert.equal(columns.ctry.field, "ctry");
@@ -92,11 +94,12 @@ test("build output includes exact/suggest shards plus area_town index with dedup
     ].join("\n") + "\n");
 
     const csvLines = [
-      "pcd,pcd2,pcds,lat,long,pcon,oslaua,ctry,bua24,parish,osward,ttwa",
-      "SW1A1AA,SW1A1AA,SW1A 1AA,51.501009,-0.141588,E14001530,E09000033,E92000001,E63000001,E04000001,E05000001,E30000001",
-      "SW1A1AB,SW1A1AB,SW1A 1AB,51.501100,-0.141700,E14001530,E09000033,E92000001,E63000001,E04000001,E05000001,E30000001",
-      "EC1A1BB,EC1A1BB,EC1A 1BB,51.520200,-0.097100,,E09000001,E92000001,E63000002,E04000002,E05000002,E30000002",
-      "BADROW,BADROW,BADROW,not-a-lat,not-a-lon,E14000000,E09000000,E92000001,E63000001,E04000001,E05000001,E30000001",
+      "pcd,pcd2,pcds,lat,long,doterm,pcon,oslaua,ctry,bua24,parish,osward,ttwa",
+      "SW1A1AA,SW1A1AA,SW1A 1AA,51.501009,-0.141588,,E14001530,E09000033,E92000001,E63000001,E04000001,E05000001,E30000001",
+      "SW1A1AB,SW1A1AB,SW1A 1AB,51.501100,-0.141700,,E14001530,E09000033,E92000001,E63000001,E04000001,E05000001,E30000001",
+      "EC1A1BB,EC1A1BB,EC1A 1BB,51.520200,-0.097100,,,E09000001,E92000001,E63000002,E04000002,E05000002,E30000002",
+      "SW1A1ZZ,SW1A1ZZ,SW1A 1ZZ,51.500000,-0.120000,202402,E14001530,E09000033,E92000001,E63000001,E04000001,E05000001,E30000001",
+      "BADROW,BADROW,BADROW,not-a-lat,not-a-lon,,E14000000,E09000000,E92000001,E63000001,E04000001,E05000001,E30000001",
     ];
     await writeText(inputCsvPath, `${csvLines.join("\n")}\n`);
 
@@ -140,17 +143,21 @@ test("build output includes exact/suggest shards plus area_town index with dedup
     assert.equal(areaTownIndex.values[String(swRowA[4])][0], "Westminster");
     assert.equal(areaTownIndex.values[String(swRowA[4])][1], "London");
 
+    assert.equal(swExact.postcodes.SW1A1ZZ, undefined);
     assert.equal(Array.isArray(prefixHints.postcode_samples_1.S), true);
     assert.equal(Array.isArray(prefixHints.postcode_samples_2.SW), true);
     assert.equal(prefixHints.postcode_samples_2.SW[0][0], "SW1A1AA");
     assert.equal(prefixHints.postcode_samples_2.SW[0][1], "SW1A 1AA");
     assert.equal(typeof prefixHints.postcode_samples_2.SW[0][2], "number");
+    assert.equal("prefixes_1" in prefixHints, false);
+    assert.equal("prefixes_2" in prefixHints, false);
 
     assert.equal(manifest.unique_area_town_combo_count, 2);
     assert.equal(manifest.exact_shard_count, 2);
     assert.equal(manifest.suggest_shard_count, 2);
     assert.equal(manifest.missing_area_name_count, 0);
     assert.equal(manifest.missing_post_town_count, 0);
+    assert.equal(manifest.terminated_postcode_skipped_count, 1);
 
     const swText = await fs.promises.readFile(path.join(outputDir, "shards", "SW.json"), "utf8");
     const suggestText = await fs.promises.readFile(path.join(outputDir, "suggest", "SW.json"), "utf8");

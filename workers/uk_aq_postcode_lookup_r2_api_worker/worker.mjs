@@ -37,8 +37,6 @@ let prefixHintsCacheKey = "";
 let prefixHintsCacheState = {
   status: "uninitialized",
   hints: {
-    prefixes_1: {},
-    prefixes_2: {},
     postcode_samples_1: {},
     postcode_samples_2: {},
   },
@@ -421,8 +419,6 @@ async function readPrefixHints(env, prefix) {
     prefixHintsCacheState = {
       status: readResult.unavailable ? "unavailable" : "missing",
       hints: {
-        prefixes_1: {},
-        prefixes_2: {},
         postcode_samples_1: {},
         postcode_samples_2: {},
       },
@@ -431,8 +427,6 @@ async function readPrefixHints(env, prefix) {
   }
 
   const payload = readResult.payload && typeof readResult.payload === "object" ? readResult.payload : {};
-  const prefixes1 = payload.prefixes_1 && typeof payload.prefixes_1 === "object" ? payload.prefixes_1 : {};
-  const prefixes2 = payload.prefixes_2 && typeof payload.prefixes_2 === "object" ? payload.prefixes_2 : {};
   const postcodeSamples1 = payload.postcode_samples_1 && typeof payload.postcode_samples_1 === "object"
     ? payload.postcode_samples_1
     : {};
@@ -444,8 +438,6 @@ async function readPrefixHints(env, prefix) {
   prefixHintsCacheState = {
     status: "ok",
     hints: {
-      prefixes_1: prefixes1,
-      prefixes_2: prefixes2,
       postcode_samples_1: postcodeSamples1,
       postcode_samples_2: postcodeSamples2,
     },
@@ -661,54 +653,31 @@ export async function handlePostcodeSuggestRequest(request, env) {
           .filter((row) => row && row.postcode_normalised)
       : [];
 
-    if (sampledPostcodes.length > 0) {
-      const results = sampledPostcodes.slice(0, limit).map((row) => {
-        const areaTown = lookupAreaTown(areaTownIndex.values, row.area_town_id);
-        return {
-          type: "postcode",
-          postcode: row.postcode,
-          postcode_normalised: row.postcode_normalised,
-          area_town_id: row.area_town_id,
-          area_name: areaTown.area_name,
-          post_town: areaTown.post_town,
-          label: buildPostcodeLabel(row.postcode, areaTown.area_name, areaTown.post_town),
-        };
-      });
-
-      const payload = {
-        ok: true,
-        query: queryRaw,
-        query_normalised: queryNormalised,
-        source: "postcode_prefix_samples",
-        results,
+    const results = sampledPostcodes.slice(0, limit).map((row) => {
+      const areaTown = lookupAreaTown(areaTownIndex.values, row.area_town_id);
+      return {
+        type: "postcode",
+        postcode: row.postcode,
+        postcode_normalised: row.postcode_normalised,
+        area_town_id: row.area_town_id,
+        area_name: areaTown.area_name,
+        post_town: areaTown.post_town,
+        label: buildPostcodeLabel(row.postcode, areaTown.area_name, areaTown.post_town),
       };
-      if (areaTownIndex.status !== "ok") {
-        payload.warning = "area_town_index_unavailable";
-      }
-      return jsonResponse(payload, 200, SUCCESS_CACHE_CONTROL);
+    });
+
+    const payload = {
+      ok: true,
+      query: queryRaw,
+      query_normalised: queryNormalised,
+      source: "postcode_prefix_samples",
+      results,
+    };
+    if (areaTownIndex.status !== "ok") {
+      payload.warning = "area_town_index_unavailable";
     }
-
-    const hintList = queryNormalised.length === 1
-      ? hintsState.hints.prefixes_1[queryNormalised]
-      : hintsState.hints.prefixes_2[queryNormalised];
-
-    const results = Array.isArray(hintList)
-      ? hintList.slice(0, limit).map((item) => ({
-        type: "postcode_hint",
-        prefix: String(item?.prefix || "").toUpperCase(),
-        label: String(item?.label || "").trim() || `${String(item?.prefix || "").toUpperCase()} postcodes`,
-        count: Number(item?.count || 0),
-      })).filter((item) => item.prefix)
-      : [];
-
     return jsonResponse(
-      {
-        ok: true,
-        query: queryRaw,
-        query_normalised: queryNormalised,
-        source: "postcode_prefix_hints",
-        results,
-      },
+      payload,
       200,
       SUCCESS_CACHE_CONTROL,
     );

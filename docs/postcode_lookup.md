@@ -5,6 +5,7 @@
 - Source dataset: **ONS Postcode Directory (ONSPD)** CSV
 - Current source version: **ONSPD_MAY_2025**
 - ONSPD is used because it covers the full UK, including Northern Ireland.
+- Build excludes terminated postcodes where `DOTERM` is populated.
 
 ## Why split exact vs suggest
 
@@ -82,6 +83,7 @@ npm run postcode:build -- \
 Optional:
 
 - `--onspd-root "/path/to/ONSPD_MAY_2025"`
+- build clears the output directory first.
 
 ## Upload
 
@@ -91,6 +93,11 @@ cd CIC-test-uk-aq-ops
 npm run postcode:upload -- \
   --input-dir "tmp/postcode_lookup_v1"
 ```
+
+Default upload behavior:
+
+- clears existing objects under the target prefix (for example `v1/`) before uploading
+- use `--skip-clear-prefix` only if you explicitly want to preserve existing keys
 
 ## API endpoints
 
@@ -124,7 +131,7 @@ Website-facing proxy route can expose these under `/api/aq/...` as needed.
 
 - `q` length `0`: returns empty
 - `q` length `1` or `2`: returns sampled real postcode rows from `postcode_prefix_hints.json` (`postcode_samples_1` / `postcode_samples_2`) without reading suggest shards
-- if sample rows are missing for a prefix, falls back to prefix-count hints from `prefixes_1` / `prefixes_2`
+- no count-based hint rows are returned
 - `q` length `>=3`: reads one `suggest/<AREA>.json` shard and filters rows
 - `limit` default `6`, capped at `10`
 

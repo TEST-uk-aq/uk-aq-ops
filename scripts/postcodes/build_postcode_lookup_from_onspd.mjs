@@ -25,6 +25,7 @@ import {
 const POSTCODE_COLUMN_CANDIDATES = ["pcds", "postcode", "pcd2", "pcd", "pcd7", "pcd8"];
 const LATITUDE_COLUMN_CANDIDATES = ["lat", "latitude"];
 const LONGITUDE_COLUMN_CANDIDATES = ["long", "longitude", "lon", "lng"];
+const DOTERM_COLUMN_CANDIDATES = ["doterm", "dateoftermination"];
 const PCON_COLUMN_CANDIDATES = [
   "pcon24cd",
   "pcon23cd",
@@ -174,6 +175,22 @@ function findColumn(headerNames, rawHeaders, candidates, label) {
   );
 }
 
+function findOptionalColumn(headerNames, rawHeaders, candidates) {
+  for (const candidate of candidates) {
+    const idx = headerNames.indexOf(candidate);
+    if (idx >= 0) {
+      return {
+        index: idx,
+        field: String(rawHeaders[idx] || "").replace(/^\uFEFF/, "").trim(),
+      };
+    }
+  }
+  return {
+    index: -1,
+    field: null,
+  };
+}
+
 export function detectOnspdColumns(rawHeaders) {
   const headerNames = rawHeaders.map(normalizeHeaderName);
 
@@ -195,6 +212,11 @@ export function detectOnspdColumns(rawHeaders) {
     LONGITUDE_COLUMN_CANDIDATES,
     "longitude",
   );
+  const doterm = findOptionalColumn(
+    headerNames,
+    rawHeaders,
+    DOTERM_COLUMN_CANDIDATES,
+  );
   const pcon = findColumn(
     headerNames,
     rawHeaders,
@@ -214,6 +236,7 @@ export function detectOnspdColumns(rawHeaders) {
     postcode,
     lat,
     lon,
+    doterm,
     pcon,
     la,
     ...areaTownColumns,
@@ -236,6 +259,18 @@ function parseCodeOrNull(raw) {
   return compact || null;
 }
 
+function isDefunctPostcodeDoterm(raw) {
+  const value = String(raw ?? "").trim();
+  if (!value) {
+    return false;
+  }
+  const numeric = value.replace(/\D+/g, "");
+  if (numeric.length === 6) {
+    return true;
+  }
+  return true;
+}
+
 function sortObjectKeys(obj) {
   return Object.fromEntries(
     Object.entries(obj).sort((a, b) => a[0].localeCompare(b[0])),
@@ -245,27 +280,6 @@ function sortObjectKeys(obj) {
 async function writeJsonFile(filePath, payload) {
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
   await fs.promises.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-}
-
-function toCountedHint(prefix, count) {
-  return {
-    prefix,
-    label: `${prefix} postcodes`,
-    count,
-  };
-}
-
-function incrementCount(counter, key, amount = 1) {
-  counter.set(key, (counter.get(key) || 0) + amount);
-}
-
-function sortHints(hints) {
-  return hints.sort((a, b) => {
-    if (b.count !== a.count) {
-      return b.count - a.count;
-    }
-    return a.prefix.localeCompare(b.prefix);
-  });
 }
 
 function compareSampleRows(left, right) {
@@ -296,56 +310,12 @@ function addPrefixSample(sampleMap, prefix, rowValue, maxRows = MAX_PREFIX_SAMPL
 }
 
 function buildPrefixHints({
-  firstCharCounts,
-  firstTwoCharCounts,
-  areaCounts,
-  outwardCounts,
   prefix1Samples,
   prefix2Samples,
   areaTownIdByPairKey,
 }) {
-  const prefixes1 = {};
-  const prefixes2 = {};
   const postcodeSamples1 = {};
   const postcodeSamples2 = {};
-
-  for (const [query, totalCount] of Array.from(firstCharCounts.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
-    const seen = new Set();
-    const hints = [];
-
-    seen.add(query);
-    hints.push(toCountedHint(query, totalCount));
-
-    const areaHints = [];
-    for (const [area, areaCount] of areaCounts.entries()) {
-      if (!area.startsWith(query) || seen.has(area)) {
-        continue;
-      }
-      areaHints.push(toCountedHint(area, areaCount));
-      seen.add(area);
-    }
-
-    prefixes1[query] = [...hints, ...sortHints(areaHints)].slice(0, 20);
-  }
-
-  for (const [query, totalCount] of Array.from(firstTwoCharCounts.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
-    const seen = new Set();
-    const hints = [];
-
-    seen.add(query);
-    hints.push(toCountedHint(query, totalCount));
-
-    const outwardHints = [];
-    for (const [outward, outwardCount] of outwardCounts.entries()) {
-      if (!outward.startsWith(query) || outward.length <= query.length || seen.has(outward)) {
-        continue;
-      }
-      outwardHints.push(toCountedHint(outward, outwardCount));
-      seen.add(outward);
-    }
-
-    prefixes2[query] = [...hints, ...sortHints(outwardHints)].slice(0, 20);
-  }
 
   for (const [query, rows] of Array.from(prefix1Samples.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
     postcodeSamples1[query] = rows
@@ -375,8 +345,6 @@ function buildPrefixHints({
 
   return {
     schema_version: 1,
-    prefixes_1: prefixes1,
-    prefixes_2: prefixes2,
     postcode_samples_1: postcodeSamples1,
     postcode_samples_2: postcodeSamples2,
   };
@@ -394,16 +362,6 @@ export function inferOnspdSourceVersion(inputPath) {
   return "ONSPD_UNKNOWN";
 }
 
-function getOutwardPrefix(normalisedPostcode) {
-  if (typeof normalisedPostcode !== "string") {
-    return "";
-  }
-  if (normalisedPostcode.length <= 3) {
-    return normalisedPostcode;
-  }
-  return normalisedPostcode.slice(0, -3);
-}
-
 export async function buildPostcodeLookupFromOnspd({
   inputPath,
   outputDir,
@@ -414,6 +372,11 @@ export async function buildPostcodeLookupFromOnspd({
   const generatedAt = new Date().toISOString();
   const docsRoot = path.resolve(onspdRoot || defaultOnspdRoot(inputPath));
   const { lookupInfos, lookupById, lookup_root: lookupRoot } = await loadAreaTownLookups(docsRoot);
+  const resolvedOutputDir = path.resolve(outputDir);
+  if (resolvedOutputDir === path.parse(resolvedOutputDir).root) {
+    throw new Error(`Refusing to clear output dir root path: ${resolvedOutputDir}`);
+  }
+  await fs.promises.rm(resolvedOutputDir, { recursive: true, force: true });
 
   const stream = fs.createReadStream(inputPath, { encoding: "utf8" });
   const rl = readline.createInterface({
@@ -428,10 +391,6 @@ export async function buildPostcodeLookupFromOnspd({
   const exactShardMaps = new Map();
   const suggestShardMaps = new Map();
   const areaTownPairs = new Set();
-  const firstCharCounts = new Map();
-  const firstTwoCharCounts = new Map();
-  const areaCounts = new Map();
-  const outwardCounts = new Map();
   const prefix1Samples = new Map();
   const prefix2Samples = new Map();
 
@@ -441,6 +400,7 @@ export async function buildPostcodeLookupFromOnspd({
   let missingLaCodeCount = 0;
   let missingAreaNameCount = 0;
   let missingPostTownCount = 0;
+  let terminatedPostcodeSkippedCount = 0;
 
   for await (const rawLine of rl) {
     lineNumber += 1;
@@ -459,6 +419,11 @@ export async function buildPostcodeLookupFromOnspd({
     }
 
     const row = parseCsvLine(line);
+    if (columns.doterm.index >= 0 && isDefunctPostcodeDoterm(row[columns.doterm.index])) {
+      terminatedPostcodeSkippedCount += 1;
+      continue;
+    }
+
     const postcodeNormalised = normalisePostcode(row[columns.postcode.index] || "");
     if (!postcodeNormalised) {
       skippedCount += 1;
@@ -523,29 +488,20 @@ export async function buildPostcodeLookupFromOnspd({
 
     const firstChar = postcodeNormalised.slice(0, 1);
     if (firstChar) {
-      incrementCount(firstCharCounts, firstChar);
       addPrefixSample(prefix1Samples, firstChar, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
     }
 
     const firstTwoChars = postcodeNormalised.slice(0, 2);
     if (firstTwoChars) {
-      incrementCount(firstTwoCharCounts, firstTwoChars);
       addPrefixSample(prefix2Samples, firstTwoChars, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
     }
-
-    const outward = getOutwardPrefix(postcodeNormalised);
-    if (outward) {
-      incrementCount(outwardCounts, outward);
-    }
-
-    incrementCount(areaCounts, area);
   }
 
   if (!headerParsed || !columns) {
     throw new Error("Input CSV appears empty; no header row was found.");
   }
 
-  await fs.promises.mkdir(outputDir, { recursive: true });
+  await fs.promises.mkdir(resolvedOutputDir, { recursive: true });
 
   const areaTownIdByPairKey = new Map();
   const sortedPairKeys = Array.from(areaTownPairs).sort((left, right) => {
@@ -607,7 +563,7 @@ export async function buildPostcodeLookupFromOnspd({
 
     const relativePath = path.posix.join("shards", `${shard}.json`);
     const objectKey = buildPostcodeExactShardObjectKey(prefix, shard);
-    await writeJsonFile(path.join(outputDir, relativePath), shardPayload);
+    await writeJsonFile(path.join(resolvedOutputDir, relativePath), shardPayload);
     exactShardsManifest[shard] = {
       postcode_count: sortedEntries.length,
       object_key: objectKey,
@@ -637,7 +593,7 @@ export async function buildPostcodeLookupFromOnspd({
 
     const relativePath = path.posix.join("suggest", `${shard}.json`);
     const objectKey = buildPostcodeSuggestShardObjectKey(prefix, shard);
-    await writeJsonFile(path.join(outputDir, relativePath), shardPayload);
+    await writeJsonFile(path.join(resolvedOutputDir, relativePath), shardPayload);
     suggestShardsManifest[shard] = {
       postcode_count: sortedRows.length,
       object_key: objectKey,
@@ -654,13 +610,9 @@ export async function buildPostcodeLookupFromOnspd({
     values: areaTownValues,
   };
   const areaTownRelativePath = "area_town_index.json";
-  await writeJsonFile(path.join(outputDir, areaTownRelativePath), areaTownIndex);
+  await writeJsonFile(path.join(resolvedOutputDir, areaTownRelativePath), areaTownIndex);
 
   const prefixHints = buildPrefixHints({
-    firstCharCounts,
-    firstTwoCharCounts,
-    areaCounts,
-    outwardCounts,
     prefix1Samples,
     prefix2Samples,
     areaTownIdByPairKey,
@@ -672,7 +624,7 @@ export async function buildPostcodeLookupFromOnspd({
     source_version: sourceVersion,
   };
   const prefixHintsRelativePath = "postcode_prefix_hints.json";
-  await writeJsonFile(path.join(outputDir, prefixHintsRelativePath), prefixHintsPayload);
+  await writeJsonFile(path.join(resolvedOutputDir, prefixHintsRelativePath), prefixHintsPayload);
 
   const manifest = {
     schema_version: 2,
@@ -689,15 +641,17 @@ export async function buildPostcodeLookupFromOnspd({
     missing_la_code_count: missingLaCodeCount,
     missing_area_name_count: missingAreaNameCount,
     missing_post_town_count: missingPostTownCount,
+    terminated_postcode_skipped_count: terminatedPostcodeSkippedCount,
     area_town_index_count: Object.keys(areaTownValues).length,
     unique_area_town_combo_count: Object.keys(areaTownValues).length - 1,
     input_csv_path: inputPath,
     onspd_root: docsRoot,
     lookup_root: lookupRoot,
-    output_dir: outputDir,
+    output_dir: resolvedOutputDir,
     postcode_field: columns.postcode.field,
     latitude_field: columns.lat.field,
     longitude_field: columns.lon.field,
+    doterm_field: columns.doterm.field,
     geography_codes: {
       pcon: {
         field: columns.pcon.field,
@@ -750,7 +704,7 @@ export async function buildPostcodeLookupFromOnspd({
     suggest_shards: sortObjectKeys(suggestShardsManifest),
   };
 
-  await writeJsonFile(path.join(outputDir, "manifest.json"), manifest);
+  await writeJsonFile(path.join(resolvedOutputDir, "manifest.json"), manifest);
   return manifest;
 }
 
@@ -788,6 +742,7 @@ export async function main(argv = process.argv.slice(2)) {
         missing_la_code_count: manifest.missing_la_code_count,
         missing_area_name_count: manifest.missing_area_name_count,
         missing_post_town_count: manifest.missing_post_town_count,
+        terminated_postcode_skipped_count: manifest.terminated_postcode_skipped_count,
         pcon_field: manifest.geography_codes.pcon.field,
         la_field: manifest.geography_codes.la.field,
       },

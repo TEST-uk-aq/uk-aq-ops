@@ -5,6 +5,8 @@ import path from "node:path";
 import {
   hasRequiredR2Config,
   normalizePrefix,
+  r2DeleteObjects,
+  r2ListAllObjects,
   r2PutObject,
 } from "../../workers/shared/r2_sigv4.mjs";
 
@@ -26,6 +28,7 @@ function usage() {
       "  --prefix <r2-prefix>         R2 key prefix (default: from manifest.json, else UK_AQ_POSTCODE_R2_PREFIX, else v1)",
       "  --bucket <bucket>            Override bucket name",
       "  --endpoint <url>             Override R2 endpoint URL",
+      "  --skip-clear-prefix          Do not clear existing objects under prefix before upload",
       "  --dry-run                    Validate and print plan only",
       "  -h, --help",
       "",
@@ -49,6 +52,7 @@ function parseArgs(argv) {
     prefix_override: "",
     bucket_override: "",
     endpoint_override: "",
+    skip_clear_prefix: false,
     dry_run: false,
   };
 
@@ -76,6 +80,10 @@ function parseArgs(argv) {
     }
     if (arg === "--dry-run") {
       args.dry_run = true;
+      continue;
+    }
+    if (arg === "--skip-clear-prefix") {
+      args.skip_clear_prefix = true;
       continue;
     }
     if (arg === "-h" || arg === "--help") {
@@ -369,6 +377,32 @@ async function main() {
   const generatedAt = new Date().toISOString();
   let totalUploadedBytes = 0;
   let uploadedObjects = 0;
+  let clearedObjects = 0;
+
+  const clearPrefix = normalizePrefix(prefix);
+  if (!args.skip_clear_prefix) {
+    const clearPrefixPath = `${clearPrefix}/`;
+    if (!args.dry_run) {
+      const existingObjects = await r2ListAllObjects({ r2, prefix: clearPrefixPath });
+      const keysToDelete = existingObjects.map((entry) => String(entry?.key || "").trim()).filter(Boolean);
+      const chunkSize = 1000;
+      for (let i = 0; i < keysToDelete.length; i += chunkSize) {
+        const chunk = keysToDelete.slice(i, i + chunkSize);
+        // eslint-disable-next-line no-await-in-loop
+        const deleteResult = await r2DeleteObjects({ r2, keys: chunk });
+        if (Array.isArray(deleteResult.errors) && deleteResult.errors.length > 0) {
+          const firstError = deleteResult.errors[0];
+          throw new Error(
+            `R2 prefix clear failed for key=${firstError.key} code=${firstError.code} message=${firstError.message}`,
+          );
+        }
+        clearedObjects += Number(deleteResult.deleted_count || 0);
+      }
+    } else {
+      const existingObjects = await r2ListAllObjects({ r2, prefix: clearPrefixPath });
+      clearedObjects = existingObjects.length;
+    }
+  }
 
   for (const item of plan) {
     const filePath = path.join(inputDir, item.relative_path);
@@ -420,6 +454,7 @@ async function main() {
         suggest_shard_count: Number(uploadManifest.suggest_shard_count || 0),
         postcode_count: Number(uploadManifest.postcode_count || 0),
         area_town_index_count: Number(uploadManifest.area_town_index_count || 0),
+        cleared_objects_before_upload: clearedObjects,
         uploaded_objects: uploadedObjects,
         uploaded_bytes: totalUploadedBytes,
       },

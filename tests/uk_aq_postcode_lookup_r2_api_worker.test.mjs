@@ -76,19 +76,6 @@ function buildBaseObjects() {
     },
     "v1/postcode_prefix_hints.json": {
       schema_version: 1,
-      prefixes_1: {
-        B: [
-          { prefix: "B", label: "B postcodes", count: 100 },
-          { prefix: "BS", label: "BS postcodes", count: 50 },
-        ],
-      },
-      prefixes_2: {
-        BS: [
-          { prefix: "BS", label: "BS postcodes", count: 50 },
-          { prefix: "BS2", label: "BS2 postcodes", count: 20 },
-          { prefix: "BS3", label: "BS3 postcodes", count: 15 },
-        ],
-      },
       postcode_samples_1: {
         B: [
           ["BS11AA", "BS1 1AA", 41],
@@ -286,22 +273,12 @@ test("suggest endpoint q length 1 and 2 uses postcode prefix samples and does no
   assert.equal(suggestReads.length, 0);
 });
 
-test("suggest endpoint q length 1 and 2 falls back to prefix hint counts when sample table is missing", async () => {
+test("suggest endpoint q length 1 and 2 returns empty when sample table is missing", async () => {
   const { env } = createEnvWithObjects({
     "v1/postcode_prefix_hints.json": {
       schema_version: 1,
-      prefixes_1: {
-        B: [
-          { prefix: "B", label: "B postcodes", count: 100 },
-          { prefix: "BS", label: "BS postcodes", count: 50 },
-        ],
-      },
-      prefixes_2: {
-        BS: [
-          { prefix: "BS", label: "BS postcodes", count: 50 },
-          { prefix: "BS2", label: "BS2 postcodes", count: 20 },
-        ],
-      },
+      postcode_samples_1: {},
+      postcode_samples_2: {},
     },
     "v1/area_town_index.json": {
       schema_version: 1,
@@ -316,8 +293,8 @@ test("suggest endpoint q length 1 and 2 falls back to prefix hint counts when sa
   );
   assert.equal(response.status, 200);
   const payload = await response.json();
-  assert.equal(payload.source, "postcode_prefix_hints");
-  assert.equal(payload.results[0].type, "postcode_hint");
+  assert.equal(payload.source, "postcode_prefix_samples");
+  assert.equal(payload.results.length, 0);
 });
 
 test("suggest endpoint returns 400 for invalid query", async () => {

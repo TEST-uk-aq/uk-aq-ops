@@ -71,7 +71,7 @@ Behavior:
 
 - `q` length `0`: returns empty list
 - `q` length `1` or `2`: returns sampled real postcode rows from `postcode_prefix_hints.json` (no suggest shard read)
-- fallback: if sampled rows are missing, returns prefix-count hints from `postcode_prefix_hints.json`
+- no count-based hint rows are returned
 - `q` length `>=3`: reads one suggest shard (`suggest/<AREA>.json`) and filters by prefix
 - `limit` default `6`, capped at `10`
 
@@ -109,6 +109,10 @@ Success example:
 - R2 binding: `UK_AQ_POSTCODE_LOOKUP_BUCKET`
 - `UK_AQ_POSTCODE_R2_PREFIX` (default `v1`)
 - `UK_AQ_EDGE_UPSTREAM_SECRET`
+
+## Data notes
+
+- Terminated postcodes are filtered out at build time using ONSPD `DOTERM` (non-blank means terminated).
 
 ## Deploy
 
