@@ -16,6 +16,7 @@ const DEFAULT_INPUT_DIR = String(
     || "tmp/postcode_lookup_v1",
 ).trim();
 const DEFAULT_PREFIX = normalizePrefix(process.env.UK_AQ_POSTCODE_R2_PREFIX || "v1");
+const DEFAULT_CACHE_PURGE_PATHS = ["/api/aq/postcode_suggest", "/api/aq/postcode-suggest"];
 
 function usage() {
   console.log(
@@ -29,6 +30,10 @@ function usage() {
       "  --bucket <bucket>            Override bucket name",
       "  --endpoint <url>             Override R2 endpoint URL",
       "  --skip-clear-prefix          Do not clear existing objects under prefix before upload",
+      "  --skip-cache-purge           Do not purge cache-proxy postcode suggest cache after upload",
+      "  --cache-zone-id <zone-id>    Cloudflare zone id for targeted purge",
+      "  --cache-purge-origin <url>   Origin to purge (repeatable). Example: https://cic-test.chronicillnesschannel.co.uk",
+      "  --cache-purge-path <path>    Prefix path to purge (repeatable). Default: /api/aq/postcode_suggest and /api/aq/postcode-suggest",
       "  --dry-run                    Validate and print plan only",
       "  -h, --help",
       "",
@@ -42,6 +47,10 @@ function usage() {
       "  CLOUDFLARE_R2_ACCESS_KEY_ID / CFLARE_R2_ACCESS_KEY_ID / R2_ACCESS_KEY_ID",
       "  CLOUDFLARE_R2_SECRET_ACCESS_KEY / CFLARE_R2_SECRET_ACCESS_KEY / R2_SECRET_ACCESS_KEY",
       "  UK_AQ_POSTCODE_R2_REGION / CFLARE_R2_REGION / R2_REGION (default: auto)",
+      "",
+      "Optional cache purge env vars:",
+      "  UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN / UK_AQ_CACHE_CLOUDFLARE_API_TOKEN / CLOUDFLARE_API_TOKEN",
+      "  UK_AQ_CACHE_ALLOWED_ORIGINS (fallback origin list for purge hosts)",
     ].join("\n"),
   );
 }
@@ -53,6 +62,10 @@ function parseArgs(argv) {
     bucket_override: "",
     endpoint_override: "",
     skip_clear_prefix: false,
+    skip_cache_purge: false,
+    cache_zone_id: "",
+    cache_purge_origins: [],
+    cache_purge_paths: [],
     dry_run: false,
   };
 
@@ -82,8 +95,33 @@ function parseArgs(argv) {
       args.dry_run = true;
       continue;
     }
+    if (arg === "--skip-cache-purge") {
+      args.skip_cache_purge = true;
+      continue;
+    }
     if (arg === "--skip-clear-prefix") {
       args.skip_clear_prefix = true;
+      continue;
+    }
+    if (arg === "--cache-zone-id") {
+      args.cache_zone_id = String(argv[i + 1] || "").trim();
+      i += 1;
+      continue;
+    }
+    if (arg === "--cache-purge-origin") {
+      const origin = String(argv[i + 1] || "").trim();
+      if (origin) {
+        args.cache_purge_origins.push(origin);
+      }
+      i += 1;
+      continue;
+    }
+    if (arg === "--cache-purge-path") {
+      const purgePath = String(argv[i + 1] || "").trim();
+      if (purgePath) {
+        args.cache_purge_paths.push(purgePath);
+      }
+      i += 1;
       continue;
     }
     if (arg === "-h" || arg === "--help") {
@@ -146,6 +184,219 @@ function buildR2Config(args) {
         || process.env.R2_SECRET_ACCESS_KEY
         || "",
     ).trim(),
+  };
+}
+
+function parseCsvList(input) {
+  return String(input || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function normalizeHostInput(input) {
+  const value = String(input || "").trim();
+  if (!value) {
+    return "";
+  }
+  try {
+    const url = new URL(value);
+    return String(url.hostname || "").trim().toLowerCase();
+  } catch (_err) {
+    return value.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").trim().toLowerCase();
+  }
+}
+
+function isLocalHost(host) {
+  const normalized = String(host || "").trim().toLowerCase();
+  return normalized === "localhost"
+    || normalized === "127.0.0.1"
+    || normalized === "::1"
+    || normalized.endsWith(".local");
+}
+
+function collectCachePurgeHosts(args) {
+  const fromArgs = Array.isArray(args.cache_purge_origins) ? args.cache_purge_origins : [];
+  const fromEnv = parseCsvList(process.env.UK_AQ_CACHE_ALLOWED_ORIGINS);
+  const rawValues = fromArgs.length ? fromArgs : fromEnv;
+  const hosts = new Set();
+  for (const value of rawValues) {
+    const host = normalizeHostInput(value);
+    if (!host || isLocalHost(host)) {
+      continue;
+    }
+    hosts.add(host);
+  }
+  return Array.from(hosts).sort();
+}
+
+function collectCachePurgePaths(args) {
+  const fromArgs = Array.isArray(args.cache_purge_paths) ? args.cache_purge_paths : [];
+  const rawValues = fromArgs.length ? fromArgs : DEFAULT_CACHE_PURGE_PATHS;
+  const paths = new Set();
+  for (const value of rawValues) {
+    let normalized = String(value || "").trim();
+    if (!normalized) {
+      continue;
+    }
+    if (!normalized.startsWith("/")) {
+      normalized = `/${normalized}`;
+    }
+    paths.add(normalized);
+  }
+  return Array.from(paths).sort();
+}
+
+function resolveCloudflareApiToken() {
+  return String(
+    process.env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN
+      || process.env.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN
+      || process.env.CLOUDFLARE_API_TOKEN
+      || "",
+  ).trim();
+}
+
+function resolveCloudflareZoneId(args) {
+  return String(
+    args.cache_zone_id || "",
+  ).trim();
+}
+
+function buildZoneNameCandidates(host) {
+  const normalized = String(host || "").trim().toLowerCase();
+  if (!normalized) {
+    return [];
+  }
+  const labels = normalized.split(".").filter(Boolean);
+  const candidates = [];
+  for (let i = 0; i <= labels.length - 2; i += 1) {
+    const value = labels.slice(i).join(".");
+    if (!value) {
+      continue;
+    }
+    candidates.push(value);
+  }
+  return Array.from(new Set(candidates));
+}
+
+async function cfApiRequest({ token, method, pathWithQuery, body }) {
+  const response = await fetch(`https://api.cloudflare.com/client/v4${pathWithQuery}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload?.success) {
+    const errorMessage = payload?.errors?.[0]?.message || payload?.messages?.[0]?.message || `HTTP ${response.status}`;
+    throw new Error(`Cloudflare API ${method} ${pathWithQuery} failed: ${errorMessage}`);
+  }
+  return payload;
+}
+
+async function autoResolveZoneId(token, hosts) {
+  const zoneCandidates = new Set();
+  for (const host of hosts) {
+    for (const candidate of buildZoneNameCandidates(host)) {
+      zoneCandidates.add(candidate);
+    }
+  }
+  for (const zoneName of zoneCandidates) {
+    // eslint-disable-next-line no-await-in-loop
+    const payload = await cfApiRequest({
+      token,
+      method: "GET",
+      pathWithQuery: `/zones?name=${encodeURIComponent(zoneName)}&status=active&match=all&per_page=1`,
+    });
+    const zone = Array.isArray(payload?.result) ? payload.result[0] : null;
+    const zoneId = String(zone?.id || "").trim();
+    if (zoneId) {
+      return { zone_id: zoneId, zone_name: String(zone?.name || zoneName) };
+    }
+  }
+  return { zone_id: "", zone_name: "" };
+}
+
+function buildPurgePrefixes(hosts, paths) {
+  const prefixes = [];
+  for (const host of hosts) {
+    for (const routePath of paths) {
+      prefixes.push(`${host}${routePath}`);
+    }
+  }
+  return Array.from(new Set(prefixes));
+}
+
+async function purgePostcodeSuggestCache(args) {
+  const hosts = collectCachePurgeHosts(args);
+  if (!hosts.length) {
+    return {
+      attempted: false,
+      reason: "no_hosts_configured",
+    };
+  }
+
+  const token = resolveCloudflareApiToken();
+  if (!token) {
+    return {
+      attempted: false,
+      reason: "missing_cloudflare_api_token",
+      hosts,
+    };
+  }
+
+  let zoneId = resolveCloudflareZoneId(args);
+  let resolvedZoneName = "";
+  if (!zoneId) {
+    const resolved = await autoResolveZoneId(token, hosts);
+    zoneId = resolved.zone_id;
+    resolvedZoneName = resolved.zone_name;
+  }
+  if (!zoneId) {
+    return {
+      attempted: false,
+      reason: "zone_id_not_found",
+      hosts,
+    };
+  }
+
+  const paths = collectCachePurgePaths(args);
+  const prefixes = buildPurgePrefixes(hosts, paths);
+  if (!prefixes.length) {
+    return {
+      attempted: false,
+      reason: "no_prefixes_to_purge",
+      hosts,
+      zone_id: zoneId,
+      zone_name: resolvedZoneName,
+    };
+  }
+
+  const maxBatchSize = 30;
+  let batches = 0;
+  for (let i = 0; i < prefixes.length; i += maxBatchSize) {
+    const batch = prefixes.slice(i, i + maxBatchSize);
+    // eslint-disable-next-line no-await-in-loop
+    await cfApiRequest({
+      token,
+      method: "POST",
+      pathWithQuery: `/zones/${encodeURIComponent(zoneId)}/purge_cache`,
+      body: { prefixes: batch },
+    });
+    batches += 1;
+  }
+
+  return {
+    attempted: true,
+    success: true,
+    zone_id: zoneId,
+    zone_name: resolvedZoneName || null,
+    host_count: hosts.length,
+    prefix_count: prefixes.length,
+    batch_count: batches,
+    prefixes,
   };
 }
 
@@ -378,6 +629,10 @@ async function main() {
   let totalUploadedBytes = 0;
   let uploadedObjects = 0;
   let clearedObjects = 0;
+  let cachePurge = {
+    attempted: false,
+    reason: "not_requested",
+  };
 
   const clearPrefix = normalizePrefix(prefix);
   if (!args.skip_clear_prefix) {
@@ -443,6 +698,28 @@ async function main() {
     uploadedObjects += 1;
   }
 
+  if (!args.dry_run && !args.skip_cache_purge) {
+    // Temporarily disabled: cache purge is being handled manually in Cloudflare.
+    cachePurge = {
+      attempted: false,
+      reason: "disabled_manual_purge",
+    };
+    // cachePurge = await purgePostcodeSuggestCache(args);
+    // if (!cachePurge.attempted) {
+    //   console.warn(`cache purge skipped: ${cachePurge.reason}`);
+    // }
+  } else if (args.dry_run) {
+    cachePurge = {
+      attempted: false,
+      reason: "dry_run",
+    };
+  } else if (args.skip_cache_purge) {
+    cachePurge = {
+      attempted: false,
+      reason: "skip_cache_purge_flag",
+    };
+  }
+
   console.log(
     JSON.stringify(
       {
@@ -457,6 +734,7 @@ async function main() {
         cleared_objects_before_upload: clearedObjects,
         uploaded_objects: uploadedObjects,
         uploaded_bytes: totalUploadedBytes,
+        cache_purge: cachePurge,
       },
       null,
       2,

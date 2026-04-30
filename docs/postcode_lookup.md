@@ -97,7 +97,15 @@ npm run postcode:upload -- \
 Default upload behavior:
 
 - clears existing objects under the target prefix (for example `v1/`) before uploading
+- automatic cache purge is currently disabled in the upload script (manual purge in Cloudflare is used)
 - use `--skip-clear-prefix` only if you explicitly want to preserve existing keys
+- use `--skip-cache-purge` only when you intentionally want to keep existing cached suggest responses
+
+Optional cache purge overrides:
+
+- `--cache-purge-origin https://cic-test.chronicillnesschannel.co.uk` (repeatable)
+- `--cache-zone-id <cloudflare-zone-id>`
+- `--cache-purge-path /api/aq/postcode_suggest` (repeatable)
 
 ## API endpoints
 
