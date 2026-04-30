@@ -9,6 +9,12 @@
 - Never suggest disabling, skipping, or reducing Phase B backup coverage to lower egress or cost.
 - Egress optimizations must preserve full backup integrity and intended backup behavior.
 
+## Archive Execution Policy
+
+- Archive paths are retired for active execution.
+- Active scripts, workers, services, and runner-path defaults must only target non-archive paths.
+- Do not add archive fallbacks for active runtime code paths.
+
 ## Schema Placement Policy
 
 - Canonical SQL DDL belongs in the schema repo (`.../CIC-test-uk-aq-schema/schemas/...`), not only in ops worker directories.

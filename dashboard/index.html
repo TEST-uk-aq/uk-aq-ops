@@ -1738,6 +1738,30 @@
         return Number.isFinite(parsed) ? parsed : null;
       }
 
+      function asBoolean(value) {
+        if (value === true || value === false) {
+          return value;
+        }
+        if (value === null || value === undefined) {
+          return null;
+        }
+        if (typeof value === "number") {
+          if (value === 1) return true;
+          if (value === 0) return false;
+          return null;
+        }
+        if (typeof value === "string") {
+          const normalized = value.trim().toLowerCase();
+          if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "y" || normalized === "on") {
+            return true;
+          }
+          if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "n" || normalized === "off") {
+            return false;
+          }
+        }
+        return null;
+      }
+
       function asObject(value) {
         return value && typeof value === "object" && !Array.isArray(value) ? value : null;
       }
@@ -1806,6 +1830,7 @@
           "remaining_low",
           "rate_limit_429",
           "rate_limit_guard",
+          "hourly_rate_limit_guard",
         ]);
         const budgetReasons = new Set([
           "runtime_budget_exceeded",
@@ -1814,7 +1839,14 @@
         ]);
         const payload = asObject(run && run.response_payload);
         const stoppedReason = String((payload && payload.stopped_reason) || "").toLowerCase();
+        const rateLimitStopReason = String((payload && payload.rate_limit_stop_reason) || "").toLowerCase();
         if (rateLimitReasons.has(stoppedReason)) {
+          return "Rate-limit";
+        }
+        if (rateLimitReasons.has(rateLimitStopReason)) {
+          return "Rate-limit";
+        }
+        if (payload && asBoolean(payload.rate_limit_stop)) {
           return "Rate-limit";
         }
         if (payload && payload.partial === true) {
@@ -1823,23 +1855,75 @@
         if (budgetReasons.has(stoppedReason)) {
           return "Budget Limit";
         }
+        const gapRequestsSkippedBudget = payloadNumber(payload, ["gap_requests_skipped_budget"]);
+        if (gapRequestsSkippedBudget !== null && gapRequestsSkippedBudget > 0) {
+          return "Budget Limit";
+        }
+        const requestsTotal = payloadNumber(payload, ["requests_total"]);
+        const maxRequestsPerRun = payloadNumber(payload, ["max_requests_per_run"]);
+        if (
+          requestsTotal !== null &&
+          maxRequestsPerRun !== null &&
+          maxRequestsPerRun > 0 &&
+          requestsTotal >= maxRequestsPerRun
+        ) {
+          return "Budget Limit";
+        }
         const message = String(run && run.run_message || "").toLowerCase();
         if (rateLimitReasons.has(message)) {
+          return "Rate-limit";
+        }
+        if (message.includes("rate limit")) {
           return "Rate-limit";
         }
         if (budgetReasons.has(message)) {
           return "Budget Limit";
         }
+        if (message.includes("budget limit") || message.includes("request budget")) {
+          return "Budget Limit";
+        }
+        return null;
+      }
+
+      function skippedRunDetail(run) {
+        const rawStatus = String(run && run.run_status || "").toLowerCase();
+        if (rawStatus !== "skipped") {
+          return null;
+        }
+        const payload = asObject(run && run.response_payload);
+        const stoppedReason = String((payload && payload.stopped_reason) || "").toLowerCase();
+        const skippedReason = String((payload && payload.skipped_reason) || "").toLowerCase();
+        const message = String(run && run.run_message || "").toLowerCase();
+        if (
+          stoppedReason === "hourly_rate_limit_guard" ||
+          message.includes("hourly limit")
+        ) {
+          return "Hourly Limit";
+        }
+        if (
+          stoppedReason === "no_station_refs" ||
+          skippedReason === "insufficient_non_gap_stations_no_gap" ||
+          skippedReason === "insufficient_gap_and_non_gap_stations" ||
+          message === "no_station_refs" ||
+          message.includes("insufficient")
+        ) {
+          return "No Eligible Stations";
+        }
         return null;
       }
 
       function statusMeta(run) {
+        const raw = String(run && run.run_status || "unknown");
+        const rawLower = raw.toLowerCase();
+        const skippedDetail = skippedRunDetail(run);
+        if (rawLower === "skipped" && skippedDetail) {
+          return { className: "skipped", label: "Skipped", detail: skippedDetail };
+        }
         const partialDetail = partialRunDetail(run);
-        if (partialDetail || String(run && run.run_status || "").toLowerCase() === "partial") {
+        if (partialDetail || rawLower === "partial") {
           return { className: "partial", label: "Partial Run", detail: partialDetail || "Budget Limit" };
         }
-        const raw = (run && run.run_status) || "unknown";
-        return { className: String(raw).toLowerCase(), label: raw, detail: null };
+        return { className: rawLower, label: raw, detail: null };
       }
 
       function hasNoNewData(run) {

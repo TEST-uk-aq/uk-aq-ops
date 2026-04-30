@@ -34,6 +34,7 @@ const PCON_COLUMN_CANDIDATES = [
   "pconcode",
 ];
 const LA_COLUMN_CANDIDATES = [
+  "lad25cd",
   "lad24cd",
   "lad23cd",
   "lad22cd",

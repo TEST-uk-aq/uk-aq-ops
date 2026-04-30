@@ -20,7 +20,7 @@ Source adapter export to R2:
   ./scripts/uk_aq_backfill_local_monthly.sh
 
 Optional env vars:
-  UK_AQ_BACKFILL_TRIGGER_MODE               default: manual
+  UK_AQ_BACKFILL_RUN_JOB_PATH               optional path override for run_job.ts
   UK_AQ_BACKFILL_ENABLE_R2_FALLBACK         default: false
   UK_AQ_BACKFILL_CONNECTOR_IDS              optional CSV filter (unset for all available adapters)
   UK_AQ_BACKFILL_TIMESERIES_IDS             optional CSV timeseries filter
@@ -28,10 +28,14 @@ Optional env vars:
   UK_AQ_BACKFILL_MONTHLY_LOG_DIR            default: logs/backfill/monthly
   UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR      default: true
   UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS default: 0
+  UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE  default: 0 (disabled)
+  UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR    default: 0 (disabled)
   UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS      legacy alias for month run interval
 
 Notes:
-  - This script calls workers/uk_aq_backfill_cloud_run/run_job.ts once per month.
+  - This script is local/manual-only and always sets UK_AQ_BACKFILL_TRIGGER_MODE=manual.
+  - This script calls the active local backfill run_job.ts once per month.
+  - Archive paths are retired and are never valid runner paths for active runs.
   - With UK_AQ_BACKFILL_FORCE_REPLACE=false, already-backed-up connector/day outputs are skipped.
   - r2_history_obs_to_aqilevels reads committed history/v1/observations manifests/parquet only and rewrites history/v1/aqilevels outputs.
   - Leave UK_AQ_BACKFILL_CONNECTOR_IDS unset to include all currently supported source adapters.
@@ -116,6 +120,109 @@ PY
   return 0
 }
 
+resolve_run_job_path() {
+  local repo_root="${1}"
+  local override_raw
+  override_raw="$(trim "${UK_AQ_BACKFILL_RUN_JOB_PATH:-}")"
+  if [[ -n "${override_raw}" ]]; then
+    local override_path="${override_raw}"
+    if [[ "${override_path}" != /* ]]; then
+      override_path="${repo_root}/${override_path}"
+    fi
+    if [[ "${override_path}" == *"/archive/"* || "${override_path}" == */archive/* ]]; then
+      echo "Invalid UK_AQ_BACKFILL_RUN_JOB_PATH (archive paths are retired): ${override_raw}" >&2
+      return 1
+    fi
+    if [[ ! -f "${override_path}" ]]; then
+      echo "Invalid UK_AQ_BACKFILL_RUN_JOB_PATH (file not found): ${override_raw}" >&2
+      return 1
+    fi
+    printf '%s' "${override_path}"
+    return 0
+  fi
+
+  local active_runner="${repo_root}/workers/uk_aq_backfill_cloud_run/run_job.ts"
+  if [[ ! -f "${active_runner}" ]]; then
+    echo "Active backfill runner not found: ${active_runner}" >&2
+    return 1
+  fi
+  printf '%s' "${active_runner}"
+  return 0
+}
+
+prune_recent_run_starts() {
+  local now_epoch="${1}"
+  local cutoff=$((now_epoch - 3599))
+  local pruned=()
+  local ts
+  for ts in "${RUN_START_EPOCHS[@]:-}"; do
+    if (( ts >= cutoff )); then
+      pruned+=("${ts}")
+    fi
+  done
+  RUN_START_EPOCHS=("${pruned[@]}")
+}
+
+count_recent_run_starts() {
+  local now_epoch="${1}"
+  local window_seconds="${2}"
+  local cutoff=$((now_epoch - window_seconds + 1))
+  local count=0
+  local ts
+  for ts in "${RUN_START_EPOCHS[@]:-}"; do
+    if (( ts >= cutoff )); then
+      count=$((count + 1))
+    fi
+  done
+  printf '%s' "${count}"
+}
+
+oldest_recent_run_start() {
+  local now_epoch="${1}"
+  local window_seconds="${2}"
+  local cutoff=$((now_epoch - window_seconds + 1))
+  local ts
+  for ts in "${RUN_START_EPOCHS[@]:-}"; do
+    if (( ts >= cutoff )); then
+      printf '%s' "${ts}"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+enforce_run_rate_limit() {
+  local limit="${1}"
+  local window_seconds="${2}"
+  local label="${3}"
+  if (( limit <= 0 )); then
+    return 0
+  fi
+
+  while true; do
+    local now_epoch
+    now_epoch="$(date +%s)"
+    prune_recent_run_starts "${now_epoch}"
+    local current_count
+    current_count="$(count_recent_run_starts "${now_epoch}" "${window_seconds}")"
+    if (( current_count < limit )); then
+      return 0
+    fi
+
+    local oldest_ts
+    oldest_ts="$(oldest_recent_run_start "${now_epoch}" "${window_seconds}")"
+    local wait_seconds=1
+    if [[ -n "${oldest_ts}" ]]; then
+      wait_seconds=$((window_seconds - (now_epoch - oldest_ts) + 1))
+      if (( wait_seconds < 1 )); then
+        wait_seconds=1
+      fi
+    fi
+    echo "Rate limit (${label}) reached (${current_count}/${limit} in ${window_seconds}s). Sleeping ${wait_seconds}s..."
+    sleep "${wait_seconds}"
+  done
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -128,25 +235,19 @@ FROM_DAY_UTC="$(require_env UK_AQ_BACKFILL_FROM_DAY_UTC)"
 TO_DAY_UTC="$(require_env UK_AQ_BACKFILL_TO_DAY_UTC)"
 REQUESTED_FROM_DAY_UTC="${FROM_DAY_UTC}"
 REQUESTED_TO_DAY_UTC="${TO_DAY_UTC}"
+REQUESTED_TRIGGER_MODE="$(trim "${UK_AQ_BACKFILL_TRIGGER_MODE:-manual}")"
 
-TRIGGER_MODE="$(trim "${UK_AQ_BACKFILL_TRIGGER_MODE:-manual}")"
 ENABLE_R2_FALLBACK_RAW="$(trim "${UK_AQ_BACKFILL_ENABLE_R2_FALLBACK:-false}")"
 LOG_DIR="$(trim "${UK_AQ_BACKFILL_MONTHLY_LOG_DIR:-logs/backfill/monthly}")"
 STOP_ON_ERROR_RAW="$(trim "${UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR:-true}")"
 MONTH_RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS:-0}}")"
+MONTH_MAX_RUNS_PER_MINUTE_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE:-0}")"
+MONTH_MAX_RUNS_PER_HOUR_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR:-0}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
   *)
     echo "Invalid UK_AQ_BACKFILL_RUN_MODE: ${RUN_MODE}" >&2
-    exit 2
-    ;;
-esac
-
-case "${TRIGGER_MODE}" in
-  manual|scheduler) ;;
-  *)
-    echo "Invalid UK_AQ_BACKFILL_TRIGGER_MODE: ${TRIGGER_MODE}" >&2
     exit 2
     ;;
 esac
@@ -177,6 +278,18 @@ if ! [[ "${MONTH_RUN_INTERVAL_SECONDS_RAW}" =~ ^[0-9]+$ ]]; then
 fi
 MONTH_RUN_INTERVAL_SECONDS="${MONTH_RUN_INTERVAL_SECONDS_RAW}"
 
+if ! [[ "${MONTH_MAX_RUNS_PER_MINUTE_RAW}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE: ${MONTH_MAX_RUNS_PER_MINUTE_RAW}" >&2
+  exit 2
+fi
+MONTH_MAX_RUNS_PER_MINUTE="${MONTH_MAX_RUNS_PER_MINUTE_RAW}"
+
+if ! [[ "${MONTH_MAX_RUNS_PER_HOUR_RAW}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR: ${MONTH_MAX_RUNS_PER_HOUR_RAW}" >&2
+  exit 2
+fi
+MONTH_MAX_RUNS_PER_HOUR="${MONTH_MAX_RUNS_PER_HOUR_RAW}"
+
 if ! validate_day_utc "${FROM_DAY_UTC}"; then
   echo "Invalid UK_AQ_BACKFILL_FROM_DAY_UTC: ${FROM_DAY_UTC}" >&2
   exit 2
@@ -195,6 +308,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+if [[ -n "${REQUESTED_TRIGGER_MODE}" && "${REQUESTED_TRIGGER_MODE}" != "manual" ]]; then
+  echo "Info: ignoring UK_AQ_BACKFILL_TRIGGER_MODE=${REQUESTED_TRIGGER_MODE}; local script always runs with trigger_mode=manual." >&2
+fi
+TRIGGER_MODE="manual"
+RUN_JOB_PATH="$(resolve_run_job_path "${REPO_ROOT}")"
 
 mkdir -p "${LOG_DIR}"
 
@@ -228,6 +346,7 @@ PY
 )"
 
 declare -a failures=()
+declare -a RUN_START_EPOCHS=()
 month_count=0
 
 while IFS=' ' read -r month_from month_to; do
@@ -245,6 +364,7 @@ while IFS=' ' read -r month_from month_to; do
   echo "Actual month window: ${month_from} -> ${month_to}"
   echo "Connector filter: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
   echo "Force replace: ${FORCE_REPLACE}"
+  echo "Runner: ${RUN_JOB_PATH}"
 
   export UK_AQ_BACKFILL_TRIGGER_MODE="${TRIGGER_MODE}"
   export UK_AQ_BACKFILL_RUN_MODE="${RUN_MODE}"
@@ -254,8 +374,12 @@ while IFS=' ' read -r month_from month_to; do
   export UK_AQ_BACKFILL_FROM_DAY_UTC="${month_from}"
   export UK_AQ_BACKFILL_TO_DAY_UTC="${month_to}"
 
+  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_MINUTE}" 60 "monthly-run per-minute"
+  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_HOUR}" 3600 "monthly-run per-hour"
+  RUN_START_EPOCHS+=("$(date +%s)")
+
   if deno run --allow-env --allow-net --allow-read --allow-write --allow-run \
-    workers/uk_aq_backfill_cloud_run/run_job.ts | tee "${log_file}"; then
+    "${RUN_JOB_PATH}" | tee "${log_file}"; then
     echo "Month ${month_from} -> ${month_to}: ok"
   else
     echo "Month ${month_from} -> ${month_to}: failed" >&2
