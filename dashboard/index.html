@@ -1000,6 +1000,12 @@
       .status-pill.skipped {
         background: rgba(245, 193, 74, 0.18);
         color: #a56800;
+        text-transform: none;
+        flex-direction: column;
+        align-items: center;
+        gap: 1px;
+        line-height: 1.1;
+        text-align: center;
       }
 
       .status-pill.running {
@@ -1907,7 +1913,7 @@
           message === "no_station_refs" ||
           message.includes("insufficient")
         ) {
-          return "No Eligible Stations";
+          return "Insufficient Stations";
         }
         return null;
       }
@@ -1923,7 +1929,8 @@
         if (partialDetail || rawLower === "partial") {
           return { className: "partial", label: "Partial Run", detail: partialDetail || "Budget Limit" };
         }
-        return { className: rawLower, label: raw, detail: null };
+        const normalizedLabel = rawLower === "skipped" ? "Skipped" : raw;
+        return { className: rawLower, label: normalizedLabel, detail: null };
       }
 
       function hasNoNewData(run) {
