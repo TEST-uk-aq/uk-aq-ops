@@ -90,6 +90,9 @@ EXCLUDES=(
   # Website favicon images (different between live and test)
   --exclude='favicon.ico'
   --exclude='favicon.png'
+  
+  # Dashboard config
+  --exclude='dashboard/assets/config.js'
 )
 
 # ── Sync function ─────────────────────────────────────────────────────────────
