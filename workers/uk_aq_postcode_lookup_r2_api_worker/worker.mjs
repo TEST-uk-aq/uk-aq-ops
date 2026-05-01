@@ -25,7 +25,12 @@ const SUGGEST_PATHS = new Set([
   "/api/postcode-suggest",
 ]);
 
-const VALID_PATHS = new Set([...LOOKUP_PATHS, ...SUGGEST_PATHS]);
+const HINTS_PATHS = new Set([
+  "/v1/postcode_prefix_hints",
+  "/api/postcode_prefix_hints",
+]);
+
+const VALID_PATHS = new Set([...LOOKUP_PATHS, ...SUGGEST_PATHS, ...HINTS_PATHS]);
 
 const exactShardCache = new Map();
 const suggestShardCache = new Map();
@@ -774,6 +779,58 @@ export async function handlePostcodeSuggestRequest(request, env) {
   return jsonResponse(payload, 200, SUCCESS_CACHE_CONTROL);
 }
 
+export async function handlePostcodePrefixHintsRequest(request, env) {
+  if (request.method !== "GET") {
+    return jsonResponse(
+      { ok: false, error: "method_not_allowed", message: "Only GET is supported." },
+      405,
+      "no-store",
+    );
+  }
+
+  const prefix = normalizePrefix(env?.UK_AQ_POSTCODE_R2_PREFIX || DEFAULT_POSTCODE_PREFIX);
+  const hintsState = await readPrefixHints(env, prefix);
+  if (hintsState.status === "unavailable") {
+    return jsonResponse(
+      { ok: false, error: "postcode_lookup_unavailable", message: "Postcode lookup is temporarily unavailable." },
+      503,
+      "no-store",
+    );
+  }
+
+  const areaTownIndex = await readAreaTownIndex(env, prefix);
+
+  function enrichSamples(samplesMap) {
+    const result = {};
+    for (const [key, sampleList] of Object.entries(samplesMap)) {
+      if (!Array.isArray(sampleList)) continue;
+      result[key] = sampleList
+        .map((row) => parsePostcodeSampleRow(row))
+        .filter((row) => row && row.postcode_normalised)
+        .map((row) => {
+          const areaTown = lookupAreaTown(areaTownIndex.values, row.area_town_id);
+          return {
+            postcode: row.postcode,
+            postcode_normalised: row.postcode_normalised,
+            area_name: areaTown.area_name,
+            post_town: areaTown.post_town,
+          };
+        });
+    }
+    return result;
+  }
+
+  const payload = {
+    ok: true,
+    postcode_samples_1: enrichSamples(hintsState.hints.postcode_samples_1),
+    postcode_samples_2: enrichSamples(hintsState.hints.postcode_samples_2),
+  };
+  if (areaTownIndex.status !== "ok") {
+    payload.warning = "area_town_index_unavailable";
+  }
+  return jsonResponse(payload, 200, SUCCESS_CACHE_CONTROL);
+}
+
 export default {
   async fetch(request, env) {
     const pathname = new URL(request.url).pathname;
@@ -806,6 +863,10 @@ export default {
 
     if (SUGGEST_PATHS.has(pathname)) {
       return handlePostcodeSuggestRequest(request, env);
+    }
+
+    if (HINTS_PATHS.has(pathname)) {
+      return handlePostcodePrefixHintsRequest(request, env);
     }
 
     return handlePostcodeLookupRequest(request, env);

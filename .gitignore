@@ -14,3 +14,4 @@ env-vars-master.csv
 nohup.out
 nohup_MBAir.out
 .dashboards.pids
+/logs2

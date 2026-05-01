@@ -136,6 +136,7 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
 const EXTERNAL_AQI_HISTORY_UPSTREAM = "__uk_aq_aqi_history_r2_api__";
 const EXTERNAL_POSTCODE_LOOKUP_UPSTREAM = "__uk_aq_postcode_lookup_r2_api__";
 const EXTERNAL_POSTCODE_SUGGEST_UPSTREAM = "__uk_aq_postcode_suggest_r2_api__";
+const EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM = "__uk_aq_postcode_prefix_hints_r2_api__";
 
 const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_latest: "realtime",
@@ -147,6 +148,7 @@ const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   [EXTERNAL_AQI_HISTORY_UPSTREAM]: "realtime",
   [EXTERNAL_POSTCODE_LOOKUP_UPSTREAM]: "postcode_lookup",
   [EXTERNAL_POSTCODE_SUGGEST_UPSTREAM]: "postcode_lookup",
+  [EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM]: "postcode_lookup",
 };
 
 const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> = {
@@ -161,6 +163,8 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
   "postcode-lookup": EXTERNAL_POSTCODE_LOOKUP_UPSTREAM,
   postcode_suggest: EXTERNAL_POSTCODE_SUGGEST_UPSTREAM,
   "postcode-suggest": EXTERNAL_POSTCODE_SUGGEST_UPSTREAM,
+  postcode_prefix_hints: EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM,
+  "postcode-prefix-hints": EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM,
 };
 
 const API_PREFIX = "/api/aq/";
@@ -1404,13 +1408,25 @@ export default {
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
     const usingExternalPostcodeLookupUpstream = upstreamFunction === EXTERNAL_POSTCODE_LOOKUP_UPSTREAM;
     const usingExternalPostcodeSuggestUpstream = upstreamFunction === EXTERNAL_POSTCODE_SUGGEST_UPSTREAM;
-    const usingExternalUpstream = usingExternalAqiHistoryUpstream || usingExternalPostcodeLookupUpstream || usingExternalPostcodeSuggestUpstream;
+    const usingExternalPostcodePrefixHintsUpstream = upstreamFunction === EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM;
+    const usingExternalUpstream = usingExternalAqiHistoryUpstream || usingExternalPostcodeLookupUpstream || usingExternalPostcodeSuggestUpstream || usingExternalPostcodePrefixHintsUpstream;
 
     const supabaseUrl = await readSecret(env.SUPABASE_URL);
     const supabasePublishableKey = await readSecret(env.SB_PUBLISHABLE_DEFAULT_KEY);
     const aqiHistoryUpstreamUrl = await readSecret(env.UK_AQ_AQI_HISTORY_R2_API_URL);
     const postcodeLookupUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_LOOKUP_R2_API_URL);
     const postcodeSuggestUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_SUGGEST_R2_API_URL);
+    // Derive hints URL from suggest URL (same worker, different path)
+    let postcodePrefixHintsUpstreamUrl = "";
+    if (postcodeSuggestUpstreamUrl) {
+      try {
+        const hintsBase = new URL(normalizeBaseUrl(postcodeSuggestUpstreamUrl));
+        hintsBase.pathname = "/v1/postcode_prefix_hints";
+        postcodePrefixHintsUpstreamUrl = hintsBase.toString();
+      } catch (_err) {
+        // caught below during URL construction
+      }
+    }
     const upstreamAuthSecret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
     if (!usingExternalUpstream && (!supabaseUrl || !supabasePublishableKey)) {
       return makeErrorResponse(500, "missing_worker_secrets", requestOrigin, allowedOrigins);
@@ -1422,6 +1438,9 @@ export default {
       return makeErrorResponse(500, "missing_postcode_lookup_upstream_url", requestOrigin, allowedOrigins);
     }
     if (usingExternalPostcodeSuggestUpstream && !postcodeSuggestUpstreamUrl) {
+      return makeErrorResponse(500, "missing_postcode_suggest_upstream_url", requestOrigin, allowedOrigins);
+    }
+    if (usingExternalPostcodePrefixHintsUpstream && !postcodeSuggestUpstreamUrl) {
       return makeErrorResponse(500, "missing_postcode_suggest_upstream_url", requestOrigin, allowedOrigins);
     }
     if (!upstreamAuthSecret) {
@@ -1471,6 +1490,8 @@ export default {
         ? new URL(normalizeBaseUrl(postcodeLookupUpstreamUrl))
         : usingExternalPostcodeSuggestUpstream
         ? new URL(normalizeBaseUrl(postcodeSuggestUpstreamUrl))
+        : usingExternalPostcodePrefixHintsUpstream
+        ? new URL(normalizeBaseUrl(postcodePrefixHintsUpstreamUrl))
         : new URL(`${normalizeBaseUrl(supabaseUrl)}/functions/v1/${upstreamFunction}`);
     } catch (_err) {
       return makeErrorResponse(
@@ -1480,6 +1501,8 @@ export default {
           : usingExternalPostcodeLookupUpstream
           ? "invalid_postcode_lookup_upstream_url"
           : usingExternalPostcodeSuggestUpstream
+          ? "invalid_postcode_suggest_upstream_url"
+          : usingExternalPostcodePrefixHintsUpstream
           ? "invalid_postcode_suggest_upstream_url"
           : "invalid_upstream_url",
         requestOrigin,
