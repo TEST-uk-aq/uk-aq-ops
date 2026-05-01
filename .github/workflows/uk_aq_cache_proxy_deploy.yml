@@ -43,19 +43,27 @@ jobs:
           workingDirectory: workers/uk_aq_cache_proxy
           command: deploy --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
 
-      - name: Validate required Worker secrets
+      - name: Validate required Worker secrets and vars
         run: |
           set -euo pipefail
-          missing=()
-          [ -z "${{ secrets.UK_AQ_EDGE_ACCESS_TOKEN_SECRET }}" ] && missing+=("UK_AQ_EDGE_ACCESS_TOKEN_SECRET")
-          [ -z "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" ]     && missing+=("UK_AQ_EDGE_UPSTREAM_SECRET")
-          [ -z "${{ secrets.UK_AQ_CACHE_BYPASS_SECRET }}" ]      && missing+=("UK_AQ_CACHE_BYPASS_SECRET")
-          [ -z "${{ secrets.UK_AQ_TURNSTILE_SECRET_KEY }}" ]     && missing+=("UK_AQ_TURNSTILE_SECRET_KEY")
-          [ -z "${{ secrets.OBS_AQIDB_SECRET_KEY }}" ]           && missing+=("OBS_AQIDB_SECRET_KEY")
-          [ -z "${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}" ]     && missing+=("SB_PUBLISHABLE_DEFAULT_KEY")
-          if [ ${#missing[@]} -gt 0 ]; then
+          missing_secrets=()
+          missing_vars=()
+          [ -z "${{ secrets.UK_AQ_EDGE_ACCESS_TOKEN_SECRET }}" ] && missing_secrets+=("UK_AQ_EDGE_ACCESS_TOKEN_SECRET")
+          [ -z "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" ]     && missing_secrets+=("UK_AQ_EDGE_UPSTREAM_SECRET")
+          [ -z "${{ secrets.UK_AQ_CACHE_BYPASS_SECRET }}" ]      && missing_secrets+=("UK_AQ_CACHE_BYPASS_SECRET")
+          [ -z "${{ secrets.UK_AQ_TURNSTILE_SECRET_KEY }}" ]     && missing_secrets+=("UK_AQ_TURNSTILE_SECRET_KEY")
+          [ -z "${{ secrets.OBS_AQIDB_SECRET_KEY }}" ]           && missing_secrets+=("OBS_AQIDB_SECRET_KEY")
+          [ -z "${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}" ]     && missing_secrets+=("SB_PUBLISHABLE_DEFAULT_KEY")
+          [ -z "${{ vars.UK_AQ_POSTCODE_LOOKUP_R2_API_URL }}" ]  && missing_vars+=("UK_AQ_POSTCODE_LOOKUP_R2_API_URL")
+          [ -z "${{ vars.UK_AQ_POSTCODE_SUGGEST_R2_API_URL }}" ] && missing_vars+=("UK_AQ_POSTCODE_SUGGEST_R2_API_URL")
+          if [ ${#missing_secrets[@]} -gt 0 ]; then
             echo "Missing required GitHub secrets:"
-            printf '  - %s\n' "${missing[@]}"
+            printf '  - %s\n' "${missing_secrets[@]}"
+            exit 1
+          fi
+          if [ ${#missing_vars[@]} -gt 0 ]; then
+            echo "Missing required GitHub variables:"
+            printf '  - %s\n' "${missing_vars[@]}"
             exit 1
           fi
 
