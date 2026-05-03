@@ -327,6 +327,8 @@ function buildPrefixHints({
         String(row?.[0] || "").trim().toUpperCase(),
         String(row?.[1] || "").trim(),
         areaTownIdByPairKey.get(row?.[2]) ?? 0,
+        parseCodeOrNull(row?.[3]),
+        parseCodeOrNull(row?.[4]),
       ])
       .filter((row) => row[0] && row[1]);
   }
@@ -340,6 +342,8 @@ function buildPrefixHints({
         String(row?.[0] || "").trim().toUpperCase(),
         String(row?.[1] || "").trim(),
         areaTownIdByPairKey.get(row?.[2]) ?? 0,
+        parseCodeOrNull(row?.[3]),
+        parseCodeOrNull(row?.[4]),
       ])
       .filter((row) => row[0] && row[1]);
   }
@@ -485,16 +489,16 @@ export async function buildPostcodeLookupFromOnspd({
       suggestShardMaps.set(area, suggestShardMap);
     }
     const formattedPostcode = formatPostcode(postcodeNormalised);
-    suggestShardMap.set(postcodeNormalised, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
+    suggestShardMap.set(postcodeNormalised, [postcodeNormalised, formattedPostcode, areaTownPairKey, pconCode, laCode]);
 
     const firstChar = postcodeNormalised.slice(0, 1);
     if (firstChar) {
-      addPrefixSample(prefix1Samples, firstChar, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
+      addPrefixSample(prefix1Samples, firstChar, [postcodeNormalised, formattedPostcode, areaTownPairKey, pconCode, laCode]);
     }
 
     const firstTwoChars = postcodeNormalised.slice(0, 2);
     if (firstTwoChars) {
-      addPrefixSample(prefix2Samples, firstTwoChars, [postcodeNormalised, formattedPostcode, areaTownPairKey]);
+      addPrefixSample(prefix2Samples, firstTwoChars, [postcodeNormalised, formattedPostcode, areaTownPairKey, pconCode, laCode]);
     }
   }
 
@@ -580,6 +584,8 @@ export async function buildPostcodeLookupFromOnspd({
         rowValue[0],
         rowValue[1],
         areaTownIdByPairKey.get(rowValue[2]) ?? 0,
+        parseCodeOrNull(rowValue[3]),
+        parseCodeOrNull(rowValue[4]),
       ]);
 
     const shardPayload = {
@@ -588,7 +594,7 @@ export async function buildPostcodeLookupFromOnspd({
       source: "ONSPD",
       source_version: sourceVersion,
       postcode_area: shard,
-      columns: ["n", "p", "at"],
+      columns: ["n", "p", "at", "pc", "la"],
       rows: sortedRows,
     };
 
@@ -680,7 +686,7 @@ export async function buildPostcodeLookupFromOnspd({
       object_key_template: `${normalizePrefix(prefix)}/shards/{AREA}.json`,
     },
     suggest_shard_layout: {
-      columns: ["n", "p", "at"],
+      columns: ["n", "p", "at", "pc", "la"],
       object_key_template: `${normalizePrefix(prefix)}/suggest/{AREA}.json`,
     },
     objects: {

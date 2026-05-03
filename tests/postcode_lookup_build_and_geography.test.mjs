@@ -120,7 +120,7 @@ test("build output includes exact/suggest shards plus area_town index with dedup
     assert.equal(swExact.schema_version, 2);
     assert.deepEqual(swExact.columns, ["lat", "lon", "pcon_code", "la_code", "area_town_id"]);
     assert.equal(swSuggest.schema_version, 1);
-    assert.deepEqual(swSuggest.columns, ["n", "p", "at"]);
+    assert.deepEqual(swSuggest.columns, ["n", "p", "at", "pc", "la"]);
 
     const swRowA = swExact.postcodes.SW1A1AA;
     const swRowB = swExact.postcodes.SW1A1AB;
@@ -138,9 +138,9 @@ test("build output includes exact/suggest shards plus area_town index with dedup
     assert.notEqual(ecRow[4], swRowA[4]);
 
     const swSuggestRow = swSuggest.rows.find((row) => row[0] === "SW1A1AA");
-    assert.deepEqual(swSuggestRow, ["SW1A1AA", "SW1A 1AA", swRowA[4]]);
+    assert.deepEqual(swSuggestRow, ["SW1A1AA", "SW1A 1AA", swRowA[4], "E14001530", "E09000033"]);
 
-    assert.equal(areaTownIndex.values[String(swRowA[4])][0], "Westminster");
+    assert.equal(areaTownIndex.values[String(swRowA[4])][0], "Parish A");
     assert.equal(areaTownIndex.values[String(swRowA[4])][1], "London");
 
     assert.equal(swExact.postcodes.SW1A1ZZ, undefined);
@@ -149,6 +149,8 @@ test("build output includes exact/suggest shards plus area_town index with dedup
     assert.equal(prefixHints.postcode_samples_2.SW[0][0], "SW1A1AA");
     assert.equal(prefixHints.postcode_samples_2.SW[0][1], "SW1A 1AA");
     assert.equal(typeof prefixHints.postcode_samples_2.SW[0][2], "number");
+    assert.equal(prefixHints.postcode_samples_2.SW[0][3], "E14001530");
+    assert.equal(prefixHints.postcode_samples_2.SW[0][4], "E09000033");
     assert.equal("prefixes_1" in prefixHints, false);
     assert.equal("prefixes_2" in prefixHints, false);
 
@@ -164,8 +166,8 @@ test("build output includes exact/suggest shards plus area_town index with dedup
     assert.equal(swText.includes("area_name"), false);
     assert.equal(swText.includes("post_town"), false);
     assert.equal(suggestText.includes("lat"), false);
-    assert.equal(suggestText.includes("pcon_code"), false);
-    assert.equal(suggestText.includes("la_code"), false);
+    assert.equal(suggestText.includes("E14001530"), true);
+    assert.equal(suggestText.includes("E09000033"), true);
   });
 });
 

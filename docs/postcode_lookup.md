@@ -39,13 +39,12 @@ Exact rows intentionally do **not** store:
 
 Each suggest shard stores rows in compact array form:
 
-- columns: `n`, `p`, `at`
-- row: `[postcode_normalised, postcode_display, area_town_id]`
+- columns: `n`, `p`, `at`, `pc`, `la`
+- row: `[postcode_normalised, postcode_display, area_town_id, pcon_code, la_code]`
 
 Suggest rows intentionally do **not** store:
 
 - lat/lon
-- pcon/la codes
 - area/town strings
 
 ## Area/Town index

@@ -89,6 +89,8 @@ Success example:
       "postcode": "BS2 1AA",
       "postcode_normalised": "BS21AA",
       "area_town_id": 41,
+      "pcon_code": "E14000001",
+      "la_code": "E06000001",
       "area_name": "Emersons Green",
       "post_town": "Bristol",
       "label": "BS2 1AA, Emersons Green, Bristol"

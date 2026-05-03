@@ -247,6 +247,8 @@ function parsePostcodeSampleRow(row) {
       postcode_normalised: postcodeNormalised,
       postcode: postcodeDisplay,
       area_town_id: areaTownId,
+      pcon_code: parseCodeOrNull(row[3]),
+      la_code: parseCodeOrNull(row[4]),
     };
   }
   if (row && typeof row === "object") {
@@ -260,6 +262,8 @@ function parsePostcodeSampleRow(row) {
       postcode_normalised: postcodeNormalised,
       postcode: postcodeDisplay,
       area_town_id: areaTownId,
+      pcon_code: parseCodeOrNull(row.pc || row.pcon_code || row.pcon),
+      la_code: parseCodeOrNull(row.la || row.la_code),
     };
   }
   return null;
@@ -665,6 +669,8 @@ export async function handlePostcodeSuggestRequest(request, env) {
         postcode: row.postcode,
         postcode_normalised: row.postcode_normalised,
         area_town_id: row.area_town_id,
+        pcon_code: row.pcon_code,
+        la_code: row.la_code,
         area_name: areaTown.area_name,
         post_town: areaTown.post_town,
         label: buildPostcodeLabel(row.postcode, areaTown.area_name, areaTown.post_town),
@@ -739,6 +745,8 @@ export async function handlePostcodeSuggestRequest(request, env) {
 
     const postcodeDisplay = String(row[1] || "").trim() || formatPostcode(postcodeNormalised);
     const areaTownId = parseAreaTownId(row[2]);
+    const pconCode = parseCodeOrNull(row[3]);
+    const laCode = parseCodeOrNull(row[4]);
     const areaTown = lookupAreaTown(areaTownIndex.values, areaTownId);
 
     matches.push({
@@ -749,6 +757,8 @@ export async function handlePostcodeSuggestRequest(request, env) {
       postcode: postcodeDisplay,
       postcode_normalised: postcodeNormalised,
       area_town_id: areaTownId,
+      pcon_code: pconCode,
+      la_code: laCode,
       area_name: areaTown.area_name,
       post_town: areaTown.post_town,
       label: buildPostcodeLabel(postcodeDisplay, areaTown.area_name, areaTown.post_town),
@@ -812,6 +822,8 @@ export async function handlePostcodePrefixHintsRequest(request, env) {
           return {
             postcode: row.postcode,
             postcode_normalised: row.postcode_normalised,
+            pcon_code: row.pcon_code,
+            la_code: row.la_code,
             area_name: areaTown.area_name,
             post_town: areaTown.post_town,
           };

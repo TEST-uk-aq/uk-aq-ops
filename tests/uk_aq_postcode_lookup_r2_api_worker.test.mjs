@@ -7,6 +7,7 @@ import {
 } from "../workers/shared/postcode_lookup.mjs";
 import postcodeLookupWorker, {
   handlePostcodeLookupRequest,
+  handlePostcodePrefixHintsRequest,
   handlePostcodeSuggestRequest,
 } from "../workers/uk_aq_postcode_lookup_r2_api_worker/worker.mjs";
 
@@ -57,12 +58,12 @@ function buildBaseObjects() {
     "v1/suggest/BS.json": {
       schema_version: 1,
       postcode_area: "BS",
-      columns: ["n", "p", "at"],
+      columns: ["n", "p", "at", "pc", "la"],
       rows: [
-        ["BS200AA", "BS20 0AA", 41],
-        ["BS21AA", "BS2 1AA", 41],
-        ["BS21AB", "BS2 1AB", 41],
-        ["BS375BA", "BS37 5BA", 42],
+        ["BS200AA", "BS20 0AA", 41, "E14000001", "E06000001"],
+        ["BS21AA", "BS2 1AA", 41, "E14000001", "E06000001"],
+        ["BS21AB", "BS2 1AB", 41, "E14000001", "E06000001"],
+        ["BS375BA", "BS37 5BA", 42, "E14001545", "E06000025"],
       ],
     },
     "v1/area_town_index.json": {
@@ -78,16 +79,16 @@ function buildBaseObjects() {
       schema_version: 1,
       postcode_samples_1: {
         B: [
-          ["BS11AA", "BS1 1AA", 41],
-          ["BS11AB", "BS1 1AB", 41],
-          ["BT11AA", "BT1 1AA", 0],
+          ["BS11AA", "BS1 1AA", 41, "E14000001", "E06000001"],
+          ["BS11AB", "BS1 1AB", 41, "E14000001", "E06000001"],
+          ["BT11AA", "BT1 1AA", 0, "N06000001", "N09000003"],
         ],
       },
       postcode_samples_2: {
         BS: [
-          ["BS11AA", "BS1 1AA", 41],
-          ["BS11AB", "BS1 1AB", 41],
-          ["BS200AA", "BS20 0AA", 41],
+          ["BS11AA", "BS1 1AA", 41, "E14000001", "E06000001"],
+          ["BS11AB", "BS1 1AB", 41, "E14000001", "E06000001"],
+          ["BS200AA", "BS20 0AA", 41, "E14000001", "E06000001"],
         ],
       },
     },
@@ -236,6 +237,8 @@ test("suggest endpoint returns decorated postcode results with default max limit
     postcode: "BS2 1AA",
     postcode_normalised: "BS21AA",
     area_town_id: 41,
+    pcon_code: "E14000001",
+    la_code: "E06000001",
     area_name: "Emersons Green",
     post_town: "Bristol",
     label: "BS2 1AA, Emersons Green, Bristol",
@@ -268,9 +271,32 @@ test("suggest endpoint q length 1 and 2 uses postcode prefix samples and does no
   assert.equal(payload2.results[0].type, "postcode");
   assert.equal(payload1.results[0].postcode, "BS1 1AA");
   assert.equal(payload2.results[0].postcode, "BS1 1AA");
+  assert.equal(payload1.results[0].pcon_code, "E14000001");
+  assert.equal(payload1.results[0].la_code, "E06000001");
+  assert.equal(payload2.results[0].pcon_code, "E14000001");
+  assert.equal(payload2.results[0].la_code, "E06000001");
 
   const suggestReads = getCalls.filter((key) => key === `${prefix}/suggest/BS.json`);
   assert.equal(suggestReads.length, 0);
+});
+
+test("prefix hints endpoint returns decorated rows with geography codes", async () => {
+  const { env } = createEnvWithObjects(buildBaseObjects());
+
+  const response = await handlePostcodePrefixHintsRequest(
+    new Request("https://example.test/v1/postcode_prefix_hints"),
+    env,
+  );
+  assert.equal(response.status, 200);
+
+  const payload = await response.json();
+  const firstRow = payload.postcode_samples_1.B[0];
+  assert.equal(firstRow.postcode, "BS1 1AA");
+  assert.equal(firstRow.postcode_normalised, "BS11AA");
+  assert.equal(firstRow.pcon_code, "E14000001");
+  assert.equal(firstRow.la_code, "E06000001");
+  assert.equal(firstRow.area_name, "Emersons Green");
+  assert.equal(firstRow.post_town, "Bristol");
 });
 
 test("suggest endpoint q length 1 and 2 returns empty when sample table is missing", async () => {
