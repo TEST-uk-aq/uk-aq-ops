@@ -9,3 +9,13 @@ Implement daily observations partition maintenance
 
 
 Test
+
+Population ingest
+
+PCON/LA find function, move from Aiven to R2
+
+Advanced Search to show all results. 
+
+Show all networks in network summary even when there are no sensors. Clearly show there are no sensors.
+
+Check why observs partition maintenance seems to give 15 days instead of 14. 
