@@ -2,8 +2,6 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { createClient } from "@supabase/supabase-js";
 
-const OBSERVS_TIME_ZONE = "Europe/London";
-
 const RPC_SCHEMA = "uk_aq_public";
 const RPC_ENSURE_PARTITIONS = "uk_aq_rpc_observs_ensure_daily_partitions";
 const RPC_ENFORCE_HOT_COLD_INDEXES = "uk_aq_rpc_observs_enforce_hot_cold_indexes";
@@ -24,24 +22,6 @@ const DEFAULT_DEFAULT_TOP_N = 20;
 const DEFAULT_DROP_DRY_RUN = false;
 const DEFAULT_RPC_RETRY_ATTEMPTS = 3;
 const DEFAULT_RPC_RETRY_DELAY_MS = 1500;
-
-const LONDON_DATE_FORMATTER = new Intl.DateTimeFormat("en-GB", {
-  timeZone: OBSERVS_TIME_ZONE,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-});
-
-const LONDON_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-GB", {
-  timeZone: OBSERVS_TIME_ZONE,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hourCycle: "h23",
-});
 
 function nowIso() {
   return new Date().toISOString();
@@ -254,90 +234,10 @@ function minIsoDate(a, b) {
   return a <= b ? a : b;
 }
 
-function partsToDate(parts) {
-  const map = {};
-  for (const part of parts) {
-    if (part.type !== "literal") {
-      map[part.type] = Number(part.value);
-    }
-  }
-  return {
-    year: map.year,
-    month: map.month,
-    day: map.day,
-    hour: map.hour,
-    minute: map.minute,
-    second: map.second,
-  };
-}
-
-function getLondonDateParts(date) {
-  const parts = LONDON_DATE_FORMATTER.formatToParts(date);
-  const map = {};
-  for (const part of parts) {
-    if (part.type !== "literal") {
-      map[part.type] = Number(part.value);
-    }
-  }
-  return {
-    year: map.year,
-    month: map.month,
-    day: map.day,
-  };
-}
-
-function shiftLocalDateParts(parts, dayDelta) {
-  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0, 0));
-  date.setUTCDate(date.getUTCDate() + dayDelta);
-  return {
-    year: date.getUTCFullYear(),
-    month: date.getUTCMonth() + 1,
-    day: date.getUTCDate(),
-  };
-}
-
-function getTimeZoneOffsetMs(utcInstant, formatter) {
-  const local = partsToDate(formatter.formatToParts(utcInstant));
-  const asUtc = Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute, local.second, 0);
-  return asUtc - utcInstant.getTime();
-}
-
-function zonedLocalDateTimeToUtc(localParts, timeZoneFormatter) {
-  const localEpochGuess = Date.UTC(
-    localParts.year,
-    localParts.month - 1,
-    localParts.day,
-    localParts.hour || 0,
-    localParts.minute || 0,
-    localParts.second || 0,
-    0,
-  );
-  let utcEpoch = localEpochGuess;
-  for (let i = 0; i < 3; i += 1) {
-    const offsetMs = getTimeZoneOffsetMs(new Date(utcEpoch), timeZoneFormatter);
-    const candidate = localEpochGuess - offsetMs;
-    if (candidate === utcEpoch) {
-      break;
-    }
-    utcEpoch = candidate;
-  }
-  return new Date(utcEpoch);
-}
-
 function computeRetentionCutoffUtc(now, retentionDays) {
-  const londonToday = getLondonDateParts(now);
-  const earliestKeptLocalDate = shiftLocalDateParts(londonToday, -retentionDays);
-  return zonedLocalDateTimeToUtc(
-    {
-      year: earliestKeptLocalDate.year,
-      month: earliestKeptLocalDate.month,
-      day: earliestKeptLocalDate.day,
-      hour: 0,
-      minute: 0,
-      second: 0,
-    },
-    LONDON_DATE_TIME_FORMATTER,
-  );
+  const todayUtc = isoDateFromUtc(now);
+  const earliestKeptUtcDay = shiftIsoDate(todayUtc, -retentionDays);
+  return utcMidnightFromIsoDate(earliestKeptUtcDay);
 }
 
 function buildObservsConfig(url) {
