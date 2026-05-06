@@ -191,8 +191,8 @@ jobs:
       - name: Report daily task health
         if: always()
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SB_SECRET_KEY }}
           DAILY_TASK_KEY: ops.r2_history_dropbox_backup
           JOB_STATUS: ${{ job.status }}
         run: node scripts/report_daily_task_health.mjs
