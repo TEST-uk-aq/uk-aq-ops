@@ -10,7 +10,7 @@ This deploys a dedicated Cloud Run service that maintains `uk_aq_observs.observa
   - hot: previous 2 UTC days + today + next 3 UTC days -> unique btree on `(connector_id, timeseries_id, observed_at)` + BRIN(observed_at)
   - cold: BRIN(observed_at) only
 - default partition diagnostics (`count`, min/max observed_at, top offenders)
-- retention drops based on DST-aware cutoff from Europe/London local days (configured retention window)
+- retention drops based on strict UTC-day cutoff (keeps the last `OBS_AQIDB_OBSERVS_RETENTION_DAYS` full UTC days)
 - R2 History manifest gate before each drop:
   - HEAD `history/v1/observations/day_utc=YYYY-MM-DD/manifest.json` in Cloudflare R2
   - GET the same `manifest.json` and validate:
