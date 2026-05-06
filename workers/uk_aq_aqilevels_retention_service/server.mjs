@@ -3,8 +3,6 @@ import { randomUUID } from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
 import { hasRequiredR2Config, r2HeadObject } from "../shared/r2_sigv4.mjs";
 
-const AQILEVELS_TIME_ZONE = "Europe/London";
-
 const RPC_SCHEMA = "uk_aq_public";
 const RPC_DROP_CANDIDATES = "uk_aq_rpc_aqilevels_drop_candidates";
 const RPC_DROP_DAY = "uk_aq_rpc_aqilevels_drop_day";
@@ -12,24 +10,6 @@ const RPC_DAY_COUNT_DELETE = "uk_aq_rpc_obs_aqidb_day_count_delete";
 
 const DEFAULT_AQILEVELS_RETENTION_DAYS = 14;
 const DEFAULT_DROP_DRY_RUN = false;
-
-const LONDON_DATE_FORMATTER = new Intl.DateTimeFormat("en-GB", {
-  timeZone: AQILEVELS_TIME_ZONE,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-});
-
-const LONDON_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-GB", {
-  timeZone: AQILEVELS_TIME_ZONE,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hourCycle: "h23",
-});
 
 function nowIso() {
   return new Date().toISOString();
@@ -122,90 +102,25 @@ function normalizeIsoDate(value) {
   return parsed.toISOString().slice(0, 10);
 }
 
-function partsToDate(parts) {
-  const map = {};
-  for (const part of parts) {
-    if (part.type !== "literal") {
-      map[part.type] = Number(part.value);
-    }
-  }
-  return {
-    year: map.year,
-    month: map.month,
-    day: map.day,
-    hour: map.hour,
-    minute: map.minute,
-    second: map.second,
-  };
+function utcMidnightFromIsoDate(isoDate) {
+  const [year, month, day] = isoDate.split("-").map((part) => Number(part));
+  return new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
 }
 
-function getLondonDateParts(date) {
-  const parts = LONDON_DATE_FORMATTER.formatToParts(date);
-  const map = {};
-  for (const part of parts) {
-    if (part.type !== "literal") {
-      map[part.type] = Number(part.value);
-    }
-  }
-  return {
-    year: map.year,
-    month: map.month,
-    day: map.day,
-  };
+function isoDateFromUtc(date) {
+  return date.toISOString().slice(0, 10);
 }
 
-function shiftLocalDateParts(parts, dayDelta) {
-  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0, 0));
+function shiftIsoDate(isoDate, dayDelta) {
+  const date = utcMidnightFromIsoDate(isoDate);
   date.setUTCDate(date.getUTCDate() + dayDelta);
-  return {
-    year: date.getUTCFullYear(),
-    month: date.getUTCMonth() + 1,
-    day: date.getUTCDate(),
-  };
-}
-
-function getTimeZoneOffsetMs(utcInstant, formatter) {
-  const local = partsToDate(formatter.formatToParts(utcInstant));
-  const asUtc = Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute, local.second, 0);
-  return asUtc - utcInstant.getTime();
-}
-
-function zonedLocalDateTimeToUtc(localParts, timeZoneFormatter) {
-  const localEpochGuess = Date.UTC(
-    localParts.year,
-    localParts.month - 1,
-    localParts.day,
-    localParts.hour || 0,
-    localParts.minute || 0,
-    localParts.second || 0,
-    0,
-  );
-  let utcEpoch = localEpochGuess;
-  for (let i = 0; i < 3; i += 1) {
-    const offsetMs = getTimeZoneOffsetMs(new Date(utcEpoch), timeZoneFormatter);
-    const candidate = localEpochGuess - offsetMs;
-    if (candidate === utcEpoch) {
-      break;
-    }
-    utcEpoch = candidate;
-  }
-  return new Date(utcEpoch);
+  return isoDateFromUtc(date);
 }
 
 function computeRetentionCutoffUtc(now, retentionDays) {
-  const londonToday = getLondonDateParts(now);
-  const earliestKeptLocalDate = shiftLocalDateParts(londonToday, -retentionDays);
-  return zonedLocalDateTimeToUtc(
-    {
-      year: earliestKeptLocalDate.year,
-      month: earliestKeptLocalDate.month,
-      day: earliestKeptLocalDate.day,
-      hour: 0,
-      minute: 0,
-      second: 0,
-    },
-    LONDON_DATE_TIME_FORMATTER,
-  );
+  const todayUtc = isoDateFromUtc(now);
+  const earliestKeptUtcDay = shiftIsoDate(todayUtc, -retentionDays);
+  return utcMidnightFromIsoDate(earliestKeptUtcDay);
 }
 
 function buildConfig(url) {
