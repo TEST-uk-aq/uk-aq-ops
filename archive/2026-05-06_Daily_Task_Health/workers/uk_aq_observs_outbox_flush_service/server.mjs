@@ -1,0 +1,433 @@
+import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import { createClient } from "@supabase/supabase-js";
+
+const DEFAULT_FLUSH_CLAIM_BATCH_LIMIT = 20;
+const DEFAULT_MAX_FLUSH_BATCHES = 30;
+const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
+const DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS = 1_000;
+const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
+const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
+const RPC_SCHEMA = "uk_aq_public";
+
+const RPC_OUTBOX_CLAIM = "uk_aq_rpc_observs_outbox_claim";
+const RPC_OUTBOX_RESOLVE = "uk_aq_rpc_observs_outbox_resolve";
+const RPC_OBSERVS_UPSERT = "uk_aq_rpc_observs_observations_upsert";
+const RPC_OBSERVS_RECEIPTS_UPSERT = "uk_aq_rpc_observs_sync_receipt_daily_upsert";
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function logStructured(severity, event, details = {}) {
+  const payload = {
+    severity,
+    event,
+    timestamp: nowIso(),
+    ...details,
+  };
+  const line = JSON.stringify(payload);
+  if (severity === "ERROR") {
+    console.error(line);
+    return;
+  }
+  if (severity === "WARNING") {
+    console.warn(line);
+    return;
+  }
+  console.log(line);
+}
+
+function parsePositiveInt(raw, fallback, min = 1, max = 1_000_000) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  const intValue = Math.trunc(value);
+  if (intValue < min) {
+    return min;
+  }
+  if (intValue > max) {
+    return max;
+  }
+  return intValue;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function observsUpsertErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 400 ? `${message.slice(0, 397)}...` : message;
+}
+
+function isObservsStatementTimeoutError(message) {
+  return /statement timeout|canceling statement due to statement timeout/i.test(message);
+}
+
+function isRetryableObservsUpsertError(message) {
+  const normalized = message.toLowerCase();
+  return (
+    isObservsStatementTimeoutError(normalized)
+    || normalized.includes("deadlock detected")
+    || normalized.includes("could not serialize access due to")
+    || normalized.includes("connection terminated")
+    || normalized.includes("connection reset")
+    || normalized.includes("http 429")
+    || normalized.includes("http 500")
+    || normalized.includes("http 502")
+    || normalized.includes("http 503")
+    || normalized.includes("http 504")
+  );
+}
+
+function requiredEnvAny(names) {
+  for (const name of names) {
+    const value = (process.env[name] || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+  throw new Error(`Missing required environment variable: one of ${names.join(", ")}`);
+}
+
+function toIso(value, fieldName) {
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid timestamp for ${fieldName}: ${String(value)}`);
+  }
+  return date.toISOString();
+}
+
+function toBigInt(value, fieldName) {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (value === null || value === undefined || value === "") {
+    throw new Error(`Missing bigint for ${fieldName}`);
+  }
+  try {
+    return BigInt(String(value));
+  } catch {
+    throw new Error(`Invalid bigint for ${fieldName}: ${String(value)}`);
+  }
+}
+
+function toBigIntString(value, fieldName) {
+  return toBigInt(value, fieldName).toString();
+}
+
+function toIntField(value, fieldName) {
+  const number = Number(value ?? 0);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new Error(`Invalid integer for ${fieldName}: ${String(value)}`);
+  }
+  return Math.trunc(number);
+}
+
+function parseFloat8Hex(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const hex = String(value).trim().toLowerCase();
+  if (!/^[0-9a-f]{16}$/.test(hex)) {
+    return null;
+  }
+  const parsed = Buffer.from(hex, "hex").readDoubleBE(0);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function toObservedDay(observedAtIso) {
+  return observedAtIso.slice(0, 10);
+}
+
+function normalizeObservsRows(inputRows) {
+  const deduped = new Map();
+  for (const row of inputRows) {
+    const connectorId = toBigIntString(row.connector_id, "observs_row.connector_id");
+    const timeseriesId = toBigIntString(row.timeseries_id, "observs_row.timeseries_id");
+    const observedAt = toIso(row.observed_at, "observs_row.observed_at");
+    const valueFromHex = parseFloat8Hex(row.value_float8_hex);
+    const value = valueFromHex ?? (row.value === undefined ? null : row.value);
+    const status = row.status === undefined ? null : row.status;
+    const key = `${connectorId}|${timeseriesId}|${observedAt}`;
+    deduped.set(key, {
+      connector_id: connectorId,
+      timeseries_id: timeseriesId,
+      observed_at: observedAt,
+      value,
+      status,
+    });
+  }
+  return Array.from(deduped.values());
+}
+
+function buildReceiptRows(observsRows) {
+  const deduped = new Map();
+  for (const row of observsRows) {
+    const key = `${row.connector_id}|${row.timeseries_id}|${toObservedDay(row.observed_at)}`;
+    deduped.set(key, {
+      connector_id: row.connector_id,
+      timeseries_id: row.timeseries_id,
+      observed_day: toObservedDay(row.observed_at),
+    });
+  }
+  return Array.from(deduped.values());
+}
+
+async function upsertObservsRowsChunk(observsClient, rows) {
+  const upsertResult = await observsClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_UPSERT, {
+    rows,
+  });
+  if (upsertResult.error) {
+    throw new Error(upsertResult.error.message || "unknown_observs_upsert_error");
+  }
+  const upsertRow = Array.isArray(upsertResult.data) ? upsertResult.data[0] : upsertResult.data;
+  return toIntField(
+    upsertRow?.observations_upserted ?? rows.length,
+    "observations_upserted",
+  );
+}
+
+async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0) {
+  let lastMessage = "unknown_observs_upsert_error";
+
+  for (let attempt = 1; attempt <= DEFAULT_OBSERVS_UPSERT_RPC_RETRIES; attempt += 1) {
+    try {
+      return await upsertObservsRowsChunk(observsClient, rows);
+    } catch (error) {
+      lastMessage = observsUpsertErrorMessage(error);
+      if (
+        attempt < DEFAULT_OBSERVS_UPSERT_RPC_RETRIES
+        && isRetryableObservsUpsertError(lastMessage)
+      ) {
+        await sleep(Math.min(5_000, DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS * attempt));
+        continue;
+      }
+      break;
+    }
+  }
+
+  if (
+    isObservsStatementTimeoutError(lastMessage)
+    && splitDepth < DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH
+    && rows.length >= DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS * 2
+  ) {
+    const midpoint = Math.floor(rows.length / 2);
+    const leftRows = rows.slice(0, midpoint);
+    const rightRows = rows.slice(midpoint);
+    if (!leftRows.length || !rightRows.length) {
+      throw new Error(`observs upsert failed: ${lastMessage}`);
+    }
+    const leftUpserted = await upsertObservsRowsWithFallback(
+      observsClient,
+      leftRows,
+      splitDepth + 1,
+    );
+    const rightUpserted = await upsertObservsRowsWithFallback(
+      observsClient,
+      rightRows,
+      splitDepth + 1,
+    );
+    return leftUpserted + rightUpserted;
+  }
+
+  throw new Error(`observs upsert failed: ${lastMessage}`);
+}
+
+async function flushObservsOutbox(mainClient, observsClient, claimBatchLimit, maxFlushBatches) {
+  const summary = {
+    batches_run: 0,
+    claimed_entries: 0,
+    delivered_rows: 0,
+    failed_entries: 0,
+    receipts_upserted: 0,
+    rows_resolved: 0,
+    drained: false,
+  };
+
+  for (let batch = 1; batch <= maxFlushBatches; batch += 1) {
+    const claimResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OUTBOX_CLAIM, {
+      batch_limit: claimBatchLimit,
+    });
+    if (claimResult.error) {
+      throw new Error(`outbox claim RPC failed: ${claimResult.error.message}`);
+    }
+
+    const entries = Array.isArray(claimResult.data) ? claimResult.data : [];
+    if (!entries.length) {
+      summary.drained = true;
+      break;
+    }
+    summary.batches_run = batch;
+    summary.claimed_entries += entries.length;
+
+    const observsRows = normalizeObservsRows(
+      entries.flatMap((entry) => (Array.isArray(entry.payload) ? entry.payload : [])),
+    );
+
+    const resolutions = [];
+    if (!observsRows.length) {
+      for (const entry of entries) {
+        resolutions.push({ id: entry.id, ok: true });
+      }
+    } else {
+      try {
+        summary.delivered_rows += await upsertObservsRowsWithFallback(observsClient, observsRows);
+
+        const receiptRows = buildReceiptRows(observsRows);
+        if (receiptRows.length) {
+          const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_RECEIPTS_UPSERT, {
+            rows: receiptRows,
+          });
+          if (receiptResult.error) {
+            throw new Error(`observs receipts upsert failed: ${receiptResult.error.message}`);
+          }
+          const receiptRow = Array.isArray(receiptResult.data)
+            ? receiptResult.data[0]
+            : receiptResult.data;
+          summary.receipts_upserted += toIntField(
+            receiptRow?.rows_upserted ?? receiptRows.length,
+            "rows_upserted",
+          );
+        }
+
+        for (const entry of entries) {
+          resolutions.push({ id: entry.id, ok: true });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        summary.failed_entries += entries.length;
+        for (const entry of entries) {
+          resolutions.push({ id: entry.id, ok: false, error: message });
+        }
+      }
+    }
+
+    if (resolutions.length) {
+      const resolveResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OUTBOX_RESOLVE, {
+        resolutions,
+      });
+      if (resolveResult.error) {
+        throw new Error(`outbox resolve RPC failed: ${resolveResult.error.message}`);
+      }
+      const resolveRow = Array.isArray(resolveResult.data) ? resolveResult.data[0] : resolveResult.data;
+      summary.rows_resolved += toIntField(
+        resolveRow?.rows_resolved ?? resolutions.length,
+        "rows_resolved",
+      );
+    }
+  }
+
+  return {
+    ...summary,
+    max_flush_batches_reached: !summary.drained,
+    alert_condition: summary.failed_entries > 0 || !summary.drained,
+  };
+}
+
+function buildRunConfig(url) {
+  const params = url.searchParams;
+  return {
+    supabaseUrl: requiredEnvAny(["SUPABASE_URL", "SB_URL"]),
+    observsSupabaseUrl: requiredEnvAny(["OBS_AQIDB_SUPABASE_URL"]),
+    ingestSecretKey: requiredEnvAny(["SB_SECRET_KEY"]),
+    observsSecretKey: requiredEnvAny(["OBS_AQIDB_SECRET_KEY"]),
+    flushClaimBatchLimit: parsePositiveInt(
+      params.get("flushClaimBatchLimit") ?? process.env.FLUSH_CLAIM_BATCH_LIMIT,
+      DEFAULT_FLUSH_CLAIM_BATCH_LIMIT,
+      1,
+      1_000,
+    ),
+    maxFlushBatches: parsePositiveInt(
+      params.get("maxFlushBatches") ?? process.env.MAX_FLUSH_BATCHES,
+      DEFAULT_MAX_FLUSH_BATCHES,
+      1,
+      1_000,
+    ),
+  };
+}
+
+function jsonResponse(res, statusCode, payload) {
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
+}
+
+async function runFlush(config) {
+  const runId = randomUUID();
+  const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    db: { schema: RPC_SCHEMA },
+  });
+  const observsClient = createClient(config.observsSupabaseUrl, config.observsSecretKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    db: { schema: RPC_SCHEMA },
+  });
+
+  logStructured("INFO", "observs_outbox_flush_service_run_start", {
+    run_id: runId,
+    flush_claim_batch_limit: config.flushClaimBatchLimit,
+    max_flush_batches: config.maxFlushBatches,
+  });
+
+  const summary = await flushObservsOutbox(
+    ingestClient,
+    observsClient,
+    config.flushClaimBatchLimit,
+    config.maxFlushBatches,
+  );
+  const payload = { run_id: runId, ...summary };
+
+  if (summary.alert_condition) {
+    logStructured("WARNING", "observs_outbox_flush_service_run_warning", payload);
+  } else {
+    logStructured("INFO", "observs_outbox_flush_service_run_summary", payload);
+  }
+
+  return payload;
+}
+
+const server = createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+    if (url.pathname === "/healthz") {
+      jsonResponse(res, 200, { ok: true, now: nowIso() });
+      return;
+    }
+    if (url.pathname !== "/run") {
+      jsonResponse(res, 404, { error: "not_found" });
+      return;
+    }
+    if (req.method !== "POST") {
+      jsonResponse(res, 405, { error: "method_not_allowed", message: "Use POST /run" });
+      return;
+    }
+
+    const config = buildRunConfig(url);
+    const summary = await runFlush(config);
+    jsonResponse(res, 200, summary);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const errorId = randomUUID();
+    logStructured("ERROR", "observs_outbox_flush_service_run_error", {
+      error_id: errorId,
+      message,
+    });
+    jsonResponse(res, 500, {
+      error: "observs_outbox_flush_service_run_error",
+      message: "Internal error. See logs with error_id.",
+      error_id: errorId,
+    });
+  }
+});
+
+const port = parsePositiveInt(process.env.PORT, 8080, 1, 65535);
+server.listen(port, () => {
+  logStructured("INFO", "observs_outbox_flush_service_started", {
+    port,
+    default_flush_claim_batch_limit: DEFAULT_FLUSH_CLAIM_BATCH_LIMIT,
+    default_max_flush_batches: DEFAULT_MAX_FLUSH_BATCHES,
+  });
+});

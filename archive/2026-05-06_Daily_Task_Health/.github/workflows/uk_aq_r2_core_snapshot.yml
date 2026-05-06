@@ -1,0 +1,129 @@
+name: UK AQ R2 Core Snapshot
+
+on:
+  schedule:
+    - cron: "15 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build snapshot manifest but do not write to R2"
+        required: false
+        default: false
+        type: boolean
+      day_utc:
+        description: "Optional snapshot day override (YYYY-MM-DD). Blank = today UTC."
+        required: false
+        default: ""
+        type: string
+      tables:
+        description: "Optional comma-separated table list override"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-r2-core-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot-core-to-r2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      UK_AQ_INGEST_DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
+      UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS: ${{ vars.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS || '5000' }}
+
+      INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      INPUT_DAY_UTC: ${{ github.event.inputs.day_utc || '' }}
+      INPUT_TABLES: ${{ github.event.inputs.tables || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          required_vars=(
+            UK_AQ_INGEST_DATABASE_URL
+            CFLARE_R2_ENDPOINT
+            CFLARE_R2_BUCKET
+            CFLARE_R2_ACCESS_KEY_ID
+            CFLARE_R2_SECRET_ACCESS_KEY
+            UK_AQ_R2_HISTORY_CORE_PREFIX
+          )
+
+          missing=0
+          for key in "${required_vars[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required value: ${key}" >&2
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          day_utc="$(printf "%s" "${INPUT_DAY_UTC}" | tr -d '\r\n' | xargs)"
+          case "${day_utc}" in
+            ""|"null"|"NULL"|"none"|"NONE"|"all"|"ALL"|"\"\""|"''")
+              day_utc=""
+              ;;
+          esac
+          if [ -n "${day_utc}" ] && ! printf "%s" "${day_utc}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            echo "day_utc must be YYYY-MM-DD when provided." >&2
+            exit 1
+          fi
+          echo "NORMALIZED_DAY_UTC=${day_utc}" >> "$GITHUB_ENV"
+
+      - name: Build and upload core snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+
+          cmd=(
+            node scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs
+            --report-out "tmp/uk_aq_core_snapshot_to_r2_report.json"
+          )
+
+          if [ -n "${NORMALIZED_DAY_UTC:-}" ]; then
+            cmd+=(--day-utc "${NORMALIZED_DAY_UTC}")
+          fi
+
+          tables="$(printf "%s" "${INPUT_TABLES}" | tr -d '\r\n' | xargs)"
+          if [ -n "${tables}" ]; then
+            cmd+=(--tables "${tables}")
+          fi
+
+          if [ "${INPUT_DRY_RUN}" = "true" ]; then
+            cmd+=(--dry-run)
+          fi
+
+          echo "Running: ${cmd[*]}"
+          "${cmd[@]}"
+
+      - name: Upload snapshot report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-r2-core-snapshot-report
+          path: tmp/uk_aq_core_snapshot_to_r2_report.json
+          if-no-files-found: ignore
