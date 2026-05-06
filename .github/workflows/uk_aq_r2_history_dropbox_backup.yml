@@ -187,3 +187,12 @@ jobs:
           name: uk-aq-r2-history-dropbox-backup-report
           path: tmp/r2_history_dropbox_backup_report.json
           if-no-files-found: ignore
+
+      - name: Report daily task health
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DAILY_TASK_KEY: ops.r2_history_dropbox_backup
+          JOB_STATUS: ${{ job.status }}
+        run: node scripts/report_daily_task_health.mjs
