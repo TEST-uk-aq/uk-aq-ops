@@ -6,6 +6,7 @@ import {
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
 } from "./phase_b_history_r2.mjs";
+import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
 import { rebuildR2HistoryIndexes } from "../shared/uk_aq_r2_history_index.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -100,6 +101,72 @@ function sleep(ms) {
 function observsUpsertErrorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.length > 400 ? `${message.slice(0, 397)}...` : message;
+}
+
+function pickCount(summary, names) {
+  for (const name of names) {
+    const value = summary?.[name];
+    if (value !== undefined && value !== null) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function compactPruneHealthSummary(summary = {}) {
+  return {
+    mode: summary.mode,
+    dry_run: summary.mode === "dry-run" || undefined,
+    window_start_utc: summary.window_start,
+    window_end_utc: summary.window_end,
+    ingest_bucket_count: summary.ingest_bucket_count,
+    observs_bucket_count: summary.observs_bucket_count,
+    deletable_bucket_count: summary.deletable_bucket_count,
+    deleted_bucket_count: pickCount(summary, ["deleted_bucket_count", "deleted_after_repair_bucket_count"]),
+    deleted_rows: pickCount(summary, ["total_deleted_rows", "total_deleted_after_repair_rows"]),
+    mismatch_count: summary.mismatch_count,
+    mismatch_after_repair_count: summary.mismatch_after_repair_count,
+    backup_gate_blocked_bucket_count: pickCount(summary, [
+      "history_gate_blocked_bucket_count",
+      "history_gate_blocked_after_repair_bucket_count",
+    ]),
+    delete_error_count: pickCount(summary, ["delete_error_count", "delete_after_repair_error_count"]),
+    repair_replay_count: summary.repair_replay_success_count,
+    repair_replay_error_count: summary.repair_replay_error_count,
+    alert_condition_count: summary.alert_condition_count,
+    phase_a_recent: summary.phase_a_recent
+      ? {
+        skipped: summary.phase_a_recent.skipped,
+        enabled: summary.phase_a_recent.enabled,
+        mismatch_count: summary.phase_a_recent.mismatch_count,
+        mismatch_after_repair_count: summary.phase_a_recent.mismatch_after_repair_count,
+        repair_replay_success_count: summary.phase_a_recent.repair_replay_success_count,
+      }
+      : undefined,
+    phase_b_history: summary.phase_b_history
+      ? {
+        enabled: summary.phase_b_history.enabled,
+        ok: summary.phase_b_history.ok,
+        run_id: summary.phase_b_history.run_id,
+        error_count: summary.phase_b_history.error_count,
+      }
+      : undefined,
+    chart_load_metrics: summary.chart_load_metrics
+      ? {
+        enabled: summary.chart_load_metrics.enabled,
+        skipped: summary.chart_load_metrics.skipped,
+        raw_rows_deleted: summary.chart_load_metrics.raw_rows_deleted,
+        daily_rows_upserted: summary.chart_load_metrics.daily_rows_upserted,
+        error: summary.chart_load_metrics.error,
+      }
+      : undefined,
+    warnings: [
+      summary.cap_warning_count ? `delete cap warnings: ${summary.cap_warning_count}` : null,
+      summary.cap_after_repair_warning_count
+        ? `delete-after-repair cap warnings: ${summary.cap_after_repair_warning_count}`
+        : null,
+    ].filter(Boolean),
+  };
 }
 
 function isObservsStatementTimeoutError(message) {
@@ -1989,7 +2056,22 @@ const server = createServer(async (req, res) => {
     }
 
     const config = buildRunConfig(url);
-    const summary = await runPrune(config);
+    const summary = await withDailyTaskRun(
+      {
+        task_key: "ops.prune_daily",
+        source_repo: "uk-aq-ops",
+        source_worker: "uk_aq_prune_daily",
+        startSummary: {
+          dry_run: config.dryRun,
+          max_hours_per_run: config.maxHoursPerRun,
+          ingestdb_retention_days: config.ingestDbRetentionDays,
+          phase_a_enabled: config.phaseAEnabled,
+          phase_b_enabled: Boolean(config.phaseB?.enabled),
+        },
+        buildFinishedSummary: compactPruneHealthSummary,
+      },
+      () => runPrune(config),
+    );
     jsonResponse(res, 200, summary);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

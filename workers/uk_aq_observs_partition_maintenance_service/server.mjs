@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { createClient } from "@supabase/supabase-js";
+import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
 
 const RPC_SCHEMA = "uk_aq_public";
 const RPC_ENSURE_PARTITIONS = "uk_aq_rpc_observs_ensure_daily_partitions";
@@ -73,6 +74,37 @@ function parsePositiveInt(raw, fallback, min = 1, max = 1_000_000) {
     return max;
   }
   return intValue;
+}
+
+function compactObservsPartitionHealthSummary(summary = {}) {
+  const warnings = [];
+  if (summary.default_partition_diagnostics?.default_row_count > 0) {
+    warnings.push(`default partition rows: ${summary.default_partition_diagnostics.default_row_count}`);
+  }
+  if (summary.skipped_count > 0) {
+    warnings.push(`skipped drops: ${summary.skipped_count}`);
+  }
+
+  return {
+    dry_run: summary.drop_dry_run,
+    target_schema: "uk_aq_observs",
+    target_table: "observations",
+    hot_start_day_utc: summary.hot_start_day_utc,
+    hot_end_day_utc: summary.hot_end_day_utc,
+    ensure_start_day_utc: summary.ensure_start_day_utc,
+    ensure_end_day_utc: summary.ensure_end_day_utc,
+    retention_cutoff_utc: summary.retention_cutoff_utc,
+    partitions_checked: summary.drop_candidate_count,
+    partitions_created: summary.ensured_partition_count,
+    partitions_already_existing: undefined,
+    partitions_missing: undefined,
+    partitions_repaired: summary.index_enforcement_count,
+    rows_affected: undefined,
+    dropped_count: summary.dropped_count,
+    skipped_count: summary.skipped_count,
+    default_row_count: summary.default_partition_diagnostics?.default_row_count,
+    warnings,
+  };
 }
 
 function requiredEnvAny(names) {
@@ -1158,7 +1190,21 @@ const server = createServer(async (req, res) => {
     }
 
     const config = buildObservsConfig(url);
-    const summary = await runObservsPartitionMaintenance(config);
+    const summary = await withDailyTaskRun(
+      {
+        task_key: "ops.observs_partition_maintenance",
+        source_repo: "uk-aq-ops",
+        source_worker: "uk_aq_observs_partition_maintenance_service",
+        startSummary: {
+          drop_dry_run: config.dropDryRun,
+          future_partition_days: config.futurePartitionDays,
+          hot_partition_days: config.hotPartitionDays,
+          observs_retention_days: config.observsRetentionDays,
+        },
+        buildFinishedSummary: compactObservsPartitionHealthSummary,
+      },
+      () => runObservsPartitionMaintenance(config),
+    );
     jsonResponse(res, 200, summary);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
