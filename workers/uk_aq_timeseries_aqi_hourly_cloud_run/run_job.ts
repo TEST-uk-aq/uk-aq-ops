@@ -45,6 +45,15 @@ type HelperRefreshMetrics = {
   max_changed_lag_hours: number | null;
 };
 
+type StationLinkHealthMetrics = {
+  null_station_rows: number;
+  mismatched_station_rows: number;
+  null_station_timeseries: number;
+  mismatched_station_timeseries: number;
+  sample_null_timeseries_ids: number[];
+  sample_mismatched_timeseries_ids: number[];
+};
+
 type SyncWindow = {
   hourEndStartExclusive: Date;
   hourEndEndInclusive: Date;
@@ -68,6 +77,7 @@ const HOURLY_UPSERT_RPC = (Deno.env.get("UK_AQ_AQI_HOURLY_UPSERT_RPC") ||
   "uk_aq_rpc_timeseries_aqi_hourly_upsert").trim();
 const ROLLUP_REFRESH_RPC = (Deno.env.get("UK_AQ_AQI_ROLLUP_REFRESH_RPC") ||
   "uk_aq_rpc_timeseries_aqi_rollups_refresh").trim();
+const STATION_LINK_HEALTH_RPC = "uk_aq_rpc_timeseries_aqi_station_link_health";
 const RUN_LOG_RPC = (Deno.env.get("UK_AQ_AQI_RUN_LOG_RPC") ||
   "uk_aq_rpc_aqi_compute_run_log").trim();
 const RUN_CLEANUP_RPC = (Deno.env.get("UK_AQ_AQI_RUN_CLEANUP_RPC") ||
@@ -443,6 +453,35 @@ function parseHelperRefreshMetrics(payload: unknown): HelperRefreshMetrics {
   };
 }
 
+function parseIntArray(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const out: number[] = [];
+  for (const item of value) {
+    const parsed = Number(item);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      out.push(Math.trunc(parsed));
+    }
+  }
+  return out;
+}
+
+function parseStationLinkHealthMetrics(payload: unknown): StationLinkHealthMetrics {
+  if (!Array.isArray(payload) || payload.length === 0) {
+    throw new Error("station link health RPC returned no rows");
+  }
+  const row = payload[0] as Record<string, unknown>;
+  return {
+    null_station_rows: toSafeInt(row.null_station_rows),
+    mismatched_station_rows: toSafeInt(row.mismatched_station_rows),
+    null_station_timeseries: toSafeInt(row.null_station_timeseries),
+    mismatched_station_timeseries: toSafeInt(row.mismatched_station_timeseries),
+    sample_null_timeseries_ids: parseIntArray(row.sample_null_timeseries_ids),
+    sample_mismatched_timeseries_ids: parseIntArray(row.sample_mismatched_timeseries_ids),
+  };
+}
+
 function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   if (rows.length === 0) {
     return [];
@@ -525,6 +564,7 @@ async function main(): Promise<void> {
   let monthlyRowsUpserted = 0;
   let helperPagesFetched = 0;
   let helperRefreshMetrics: HelperRefreshMetrics | null = null;
+  let stationLinkHealth: StationLinkHealthMetrics | null = null;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
 
@@ -600,6 +640,45 @@ async function main(): Promise<void> {
       const rollupMetrics = parseRollupMetrics(rollupResult.data);
       dailyRowsUpserted = rollupMetrics.daily_rows_upserted;
       monthlyRowsUpserted = rollupMetrics.monthly_rows_upserted;
+
+      const healthResult = await postgrestRpc<unknown>(
+        OBS_AQIDB_SUPABASE_URL,
+        OBS_AQI_PRIVILEGED_KEY,
+        STATION_LINK_HEALTH_RPC,
+        {
+          p_start_hour_utc: hourIso(window.hourEndStartExclusive),
+          p_end_hour_utc: hourIso(window.hourEndEndInclusive),
+          p_timeseries_ids: Array.from(timeseriesIds),
+        },
+      );
+      if (healthResult.error) {
+        console.error(JSON.stringify({
+          level: "error",
+          event: "aqi_station_link_health_rpc_failed",
+          message: healthResult.error.message,
+        }));
+      } else {
+        stationLinkHealth = parseStationLinkHealthMetrics(healthResult.data);
+        if (
+          stationLinkHealth.null_station_rows > 0 ||
+          stationLinkHealth.mismatched_station_rows > 0
+        ) {
+          console.error(JSON.stringify({
+            level: "error",
+            event: "aqi_station_link_anomaly",
+            run_mode: RUN_MODE,
+            trigger_mode: TRIGGER_MODE,
+            window_start_utc: hourIso(window.hourEndStartExclusive),
+            window_end_utc: hourIso(window.hourEndEndInclusive),
+            null_station_rows: stationLinkHealth.null_station_rows,
+            mismatched_station_rows: stationLinkHealth.mismatched_station_rows,
+            null_station_timeseries: stationLinkHealth.null_station_timeseries,
+            mismatched_station_timeseries: stationLinkHealth.mismatched_station_timeseries,
+            sample_null_timeseries_ids: stationLinkHealth.sample_null_timeseries_ids,
+            sample_mismatched_timeseries_ids: stationLinkHealth.sample_mismatched_timeseries_ids,
+          }));
+        }
+      }
     }
   } catch (error) {
     runStatus = "error";
@@ -677,6 +756,13 @@ async function main(): Promise<void> {
     helper_refresh_rows_upserted: helperRefreshMetrics?.rows_upserted ?? null,
     helper_refresh_timeseries_hours_changed: helperRefreshMetrics?.timeseries_hours_changed ?? null,
     helper_refresh_max_changed_lag_hours: helperRefreshMetrics?.max_changed_lag_hours ?? null,
+    station_link_null_rows: stationLinkHealth?.null_station_rows ?? null,
+    station_link_mismatched_rows: stationLinkHealth?.mismatched_station_rows ?? null,
+    station_link_null_timeseries: stationLinkHealth?.null_station_timeseries ?? null,
+    station_link_mismatched_timeseries: stationLinkHealth?.mismatched_station_timeseries ?? null,
+    station_link_sample_null_timeseries_ids: stationLinkHealth?.sample_null_timeseries_ids ?? null,
+    station_link_sample_mismatched_timeseries_ids:
+      stationLinkHealth?.sample_mismatched_timeseries_ids ?? null,
     duration_ms: durationMs,
     error: errorMessage,
   };

@@ -94,6 +94,7 @@ EXCLUDES=(
   --exclude='AGENTS.md'
   --exclude='README_CROSS_REPO.md'
   --exclude='requirements-dev.txt'
+  --exclude='uk_aq_copy_core_to_live*'
 
   # Website favicon images (different between live and test)
   --exclude='favicon.ico'
