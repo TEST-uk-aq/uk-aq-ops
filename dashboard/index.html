@@ -1299,6 +1299,43 @@
         return query ? `${url}?${query}` : url;
       }
 
+      const ACCESS_LOGIN_REDIRECT_KEY = "uk_aq_dashboard_access_login_redirect_ts";
+      const ACCESS_LOGIN_REDIRECT_COOLDOWN_MS = 10000;
+
+      function isLikelyAccessFetchFailure(error) {
+        if (!(error instanceof TypeError)) {
+          return false;
+        }
+        const message = String(error.message || "").toLowerCase();
+        return message.includes("failed to fetch") || message.includes("networkerror");
+      }
+
+      function maybeRedirectToAccessLogin(error, requestUrl) {
+        if (!isLikelyAccessFetchFailure(error)) {
+          return false;
+        }
+        if ((window.location.hostname || "").endsWith(".cloudflareaccess.com")) {
+          return false;
+        }
+        const requestText = String(requestUrl || "");
+        if (requestText && !requestText.includes("/api/")) {
+          return false;
+        }
+        try {
+          const now = Date.now();
+          const last = Number(sessionStorage.getItem(ACCESS_LOGIN_REDIRECT_KEY) || "0");
+          if (Number.isFinite(last) && now - last < ACCESS_LOGIN_REDIRECT_COOLDOWN_MS) {
+            return false;
+          }
+          sessionStorage.setItem(ACCESS_LOGIN_REDIRECT_KEY, String(now));
+        } catch (_err) {
+          // Ignore storage failures and continue with redirect.
+        }
+        const redirectPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+        window.location.assign(redirectPath || window.location.href);
+        return true;
+      }
+
       const dashboardEl = document.getElementById("dashboard");
       const dashboardTitleEl = document.getElementById("dashboard-title");
       const dashboardSubtitleEl = document.getElementById("dashboard-subtitle");
@@ -4394,7 +4431,8 @@
           if (forceRefresh) {
             params.set("force", "1");
           }
-          const resp = await fetch(buildApiUrl("storage_coverage", params));
+          const storageCoverageUrl = buildApiUrl("storage_coverage", params);
+          const resp = await fetch(storageCoverageUrl);
           const text = await resp.text();
           let payload = null;
           try {
@@ -4436,6 +4474,11 @@
           if (parentLoadId && parentLoadId !== dashboardLoadSequence) {
             return;
           }
+          if (maybeRedirectToAccessLogin(err, buildApiUrl("storage_coverage"))) {
+            setStatus("Cloudflare Access login required. Redirecting...");
+            setError("Cloudflare Access login required. Redirecting...");
+            return;
+          }
           const message = err.message || String(err);
           upsertStorageCoveragePanel(
             renderStorageCoverageErrorPanel(message, { forceRefresh, parentLoadId }),
@@ -4459,7 +4502,8 @@
           if (dispatchCursor) {
             params.set("dispatch_cursor", dispatchCursor);
           }
-          const resp = await fetch(buildApiUrl("dashboard", params));
+          const dashboardUrl = buildApiUrl("dashboard", params);
+          const resp = await fetch(dashboardUrl);
           const text = await resp.text();
           let payload = null;
           try {
@@ -4520,6 +4564,11 @@
           void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
         } catch (err) {
           if (loadId !== dashboardLoadSequence) {
+            return;
+          }
+          if (maybeRedirectToAccessLogin(err, buildApiUrl("dashboard"))) {
+            setStatus("Cloudflare Access login required. Redirecting...");
+            setError("Cloudflare Access login required. Redirecting...");
             return;
           }
           setError(err.message || String(err));
