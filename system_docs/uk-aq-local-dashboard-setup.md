@@ -156,6 +156,20 @@ curl -s http://127.0.0.1:8001/assets/config.js | head
 
 ---
 
+## Cloudflare Access Session Expiry Recovery
+
+- Dashboard API fetches (`/api/dashboard`, `/api/storage_coverage`) can fail with browser
+  `TypeError: Failed to fetch` + CORS messages when a Cloudflare Access session expires
+  after the tab is dormant.
+- The dashboard frontend now treats that failure pattern as an auth-expiry signal and
+  triggers a top-level reload redirect so Cloudflare Access can re-authenticate.
+- Redirect attempts are throttled in `sessionStorage` (10 seconds) to avoid redirect loops.
+- If this still repeats continuously, verify Cloudflare Access app/session settings for both:
+  - `cic-test-uk-aq-admin.chronicillnesschannel.co.uk`
+  - `uk-aq-admin.chronicillnesschannel.co.uk`
+
+---
+
 ## Install launchd services
 
 ### Test (dashboard + cloudflared tunnel)
