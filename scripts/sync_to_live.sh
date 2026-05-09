@@ -102,6 +102,8 @@ EXCLUDES=(
   
   # Dashboard config
   --exclude='dashboard/assets/config.js'
+ 
+  --exclude='*.zip'
 )
 
 # ── Sync function ─────────────────────────────────────────────────────────────

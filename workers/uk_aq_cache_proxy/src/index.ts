@@ -4,6 +4,7 @@ export interface Env {
   OBS_AQIDB_SUPABASE_URL: unknown;
   OBS_AQIDB_SECRET_KEY: unknown;
   UK_AQ_AQI_HISTORY_R2_API_URL: unknown;
+  UK_AQ_LATEST_SNAPSHOT_R2_API_URL: unknown;
   UK_AQ_POSTCODE_LOOKUP_R2_API_URL: unknown;
   UK_AQ_POSTCODE_SUGGEST_R2_API_URL: unknown;
   UK_AQ_CACHE_ALLOWED_ORIGINS: unknown;
@@ -134,6 +135,7 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
 };
 
 const EXTERNAL_AQI_HISTORY_UPSTREAM = "__uk_aq_aqi_history_r2_api__";
+const EXTERNAL_LATEST_SNAPSHOT_UPSTREAM = "__uk_aq_latest_snapshot_r2_api__";
 const EXTERNAL_POSTCODE_LOOKUP_UPSTREAM = "__uk_aq_postcode_lookup_r2_api__";
 const EXTERNAL_POSTCODE_SUGGEST_UPSTREAM = "__uk_aq_postcode_suggest_r2_api__";
 const EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM = "__uk_aq_postcode_prefix_hints_r2_api__";
@@ -146,6 +148,7 @@ const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_la_hex: "metadata",
   uk_aq_pcon_hex: "metadata",
   [EXTERNAL_AQI_HISTORY_UPSTREAM]: "realtime",
+  [EXTERNAL_LATEST_SNAPSHOT_UPSTREAM]: "realtime",
   [EXTERNAL_POSTCODE_LOOKUP_UPSTREAM]: "postcode_lookup",
   [EXTERNAL_POSTCODE_SUGGEST_UPSTREAM]: "postcode_lookup",
   [EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM]: "postcode_lookup",
@@ -159,6 +162,7 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
   "la-hex": "uk_aq_la_hex",
   "pcon-hex": "uk_aq_pcon_hex",
   "aqi-history": EXTERNAL_AQI_HISTORY_UPSTREAM,
+  "latest-snapshot": EXTERNAL_LATEST_SNAPSHOT_UPSTREAM,
   postcode_lookup: EXTERNAL_POSTCODE_LOOKUP_UPSTREAM,
   "postcode-lookup": EXTERNAL_POSTCODE_LOOKUP_UPSTREAM,
   postcode_suggest: EXTERNAL_POSTCODE_SUGGEST_UPSTREAM,
@@ -1406,14 +1410,21 @@ export default {
     const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
+    const usingExternalLatestSnapshotUpstream = upstreamFunction === EXTERNAL_LATEST_SNAPSHOT_UPSTREAM;
     const usingExternalPostcodeLookupUpstream = upstreamFunction === EXTERNAL_POSTCODE_LOOKUP_UPSTREAM;
     const usingExternalPostcodeSuggestUpstream = upstreamFunction === EXTERNAL_POSTCODE_SUGGEST_UPSTREAM;
     const usingExternalPostcodePrefixHintsUpstream = upstreamFunction === EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM;
-    const usingExternalUpstream = usingExternalAqiHistoryUpstream || usingExternalPostcodeLookupUpstream || usingExternalPostcodeSuggestUpstream || usingExternalPostcodePrefixHintsUpstream;
+    const usingExternalUpstream =
+      usingExternalAqiHistoryUpstream ||
+      usingExternalLatestSnapshotUpstream ||
+      usingExternalPostcodeLookupUpstream ||
+      usingExternalPostcodeSuggestUpstream ||
+      usingExternalPostcodePrefixHintsUpstream;
 
     const supabaseUrl = await readSecret(env.SUPABASE_URL);
     const supabasePublishableKey = await readSecret(env.SB_PUBLISHABLE_DEFAULT_KEY);
     const aqiHistoryUpstreamUrl = await readSecret(env.UK_AQ_AQI_HISTORY_R2_API_URL);
+    const latestSnapshotUpstreamUrl = await readSecret(env.UK_AQ_LATEST_SNAPSHOT_R2_API_URL);
     const postcodeLookupUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_LOOKUP_R2_API_URL);
     const postcodeSuggestUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_SUGGEST_R2_API_URL);
     // Derive hints URL from suggest URL (same worker, different path)
@@ -1433,6 +1444,9 @@ export default {
     }
     if (usingExternalAqiHistoryUpstream && !aqiHistoryUpstreamUrl) {
       return makeErrorResponse(500, "missing_aqi_history_upstream_url", requestOrigin, allowedOrigins);
+    }
+    if (usingExternalLatestSnapshotUpstream && !latestSnapshotUpstreamUrl) {
+      return makeErrorResponse(500, "missing_latest_snapshot_upstream_url", requestOrigin, allowedOrigins);
     }
     if (usingExternalPostcodeLookupUpstream && !postcodeLookupUpstreamUrl) {
       return makeErrorResponse(500, "missing_postcode_lookup_upstream_url", requestOrigin, allowedOrigins);
@@ -1486,6 +1500,8 @@ export default {
     try {
       upstreamUrl = usingExternalAqiHistoryUpstream
         ? new URL(normalizeBaseUrl(aqiHistoryUpstreamUrl))
+        : usingExternalLatestSnapshotUpstream
+        ? new URL(normalizeBaseUrl(latestSnapshotUpstreamUrl))
         : usingExternalPostcodeLookupUpstream
         ? new URL(normalizeBaseUrl(postcodeLookupUpstreamUrl))
         : usingExternalPostcodeSuggestUpstream
@@ -1498,6 +1514,8 @@ export default {
         500,
         usingExternalAqiHistoryUpstream
           ? "invalid_aqi_history_upstream_url"
+          : usingExternalLatestSnapshotUpstream
+          ? "invalid_latest_snapshot_upstream_url"
           : usingExternalPostcodeLookupUpstream
           ? "invalid_postcode_lookup_upstream_url"
           : usingExternalPostcodeSuggestUpstream

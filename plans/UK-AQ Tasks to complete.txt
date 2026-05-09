@@ -1,14 +1,23 @@
 Tasks to complete
 
-Live
-Implement daily prune
-Implement daily observations partition maintenance
+GCP Billing on both systems
 
+Live
 
 
 
 
 Test
+
+Implement R2 snapshot to reduce sbase egress
+uk-aq-ops/plans/uk-aq-r2-snapshots-realtime-updates-plan-DRAFT.md
+
+Play timelapse of hex-map over the last week?
+
+
+Later
+Implement realtime updates in the same plan
+uk-aq-ops/plans/uk-aq-r2-snapshots-realtime-updates-plan-DRAFT.md
 
 Population ingest
 
@@ -18,4 +27,11 @@ Advanced Search to show all results.
 
 Show all networks in network summary even when there are no sensors. Clearly show there are no sensors.
 
-Check why observs partition maintenance seems to give 15 days instead of 14. 
+Info button next networks title (or network name)
+
+
+Sensor list in map mode, could have select circles, so that you can change average. Is this worth asking people if it's needed?
+
+
+
+Consolidate 2 sbase DBs into one. Will probably have to have 2 or 3 days data only??
