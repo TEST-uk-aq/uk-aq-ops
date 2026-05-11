@@ -9,6 +9,15 @@ Live
 
 Test
 
+
+Auto-backfill to check and correct history. OpenAQ uses AWS files.
+Just have it check R2. Can use Dropbox R2 backups for checking. 
+
+Disable sensors that show readings that are too high. scomm Lower Frankton - SY11 4PB - 73414
+
+Line chart. Mouse over greys out non-selected lines, and show selected. 
+Need a zoom as well. And a way to scan left and right. 
+
 Implement R2 snapshot to reduce sbase egress
 uk-aq-ops/plans/uk-aq-r2-snapshots-realtime-updates-plan-DRAFT.md
 
