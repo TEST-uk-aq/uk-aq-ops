@@ -62,10 +62,10 @@ PATH_VARS_FOR_GUARDRAILS = (
     "UK_AQ_BACKFILL_ENV_FILE",
 )
 
-# (start_offset_back, end_offset_back) in days. The 4-day upper-bound buffer
-# gives OpenAQ's 72-hour publication delay room to settle.
+# (start_offset_back, end_offset_back) in days.
+# Daily uses a 6-day upper-bound buffer; weekly/monthly remain at 4 days.
 PROFILE_WINDOWS_DAYS = {
-    "daily":   (21,  4),
+    "daily":   (21,  6),
     "weekly":  (120, 4),
     "monthly": (730, 4),
 }
@@ -79,7 +79,7 @@ PROFILE_WINDOWS_DAYS = {
 # (and by source_file_state / source_file_events).
 SOURCE_KEY_BY_CONNECTOR_CODE = {
     "openaq": "openaq",
-    "sensorcommunity": "sensor-community",
+    "sensorcommunity": "sensorcommunity",
 }
 
 # Subset of core tables that the integrity DB needs. Other tables in the
@@ -2156,7 +2156,7 @@ def check_openaq(
 #   issuing a per-file HEAD.
 # - Index parse uses a simple regex over the standard nginx-style listing.
 
-SC_SOURCE_KEY = "sensor-community"
+SC_SOURCE_KEY = "sensorcommunity"
 SC_DEFAULT_BASE_URL = "https://archive.sensor.community"
 SC_REMOTE_SCHEME = "https"
 SC_INDEX_FILENAME_RE = re.compile(
@@ -2174,7 +2174,7 @@ def _sc_object_url(base_url: str, day: dt.date, filename: str) -> str:
 
 
 def _sc_source_file_key(sensor_id: str, day: dt.date) -> str:
-    return f"sensor-community:{sensor_id}:{day.isoformat()}"
+    return f"sensorcommunity:{sensor_id}:{day.isoformat()}"
 
 
 def _sc_cache_path(cache_root: Path, day: dt.date, filename: str) -> Path:
@@ -2485,12 +2485,12 @@ def _check_one_sc_file(
         _record_source_file_timeseries_counts(conn, sfk, counts_by_id, now_iso)
         if unmatched:
             log.info(
-                "sensor-community counts: sensor=%s day=%s %d ref(s) unmatched in core (e.g. %s)",
+                "sensorcommunity counts: sensor=%s day=%s %d ref(s) unmatched in core (e.g. %s)",
                 sensor_id, day.isoformat(), len(unmatched), unmatched[0],
             )
     except Exception as exc:
         log.warning(
-            "sensor-community counts: parse failed sensor=%s day=%s: %s",
+            "sensorcommunity counts: parse failed sensor=%s day=%s: %s",
             sensor_id, day.isoformat(), exc,
         )
 
@@ -2524,7 +2524,7 @@ def _check_one_sc_file(
         (SC_SOURCE_KEY, event_id),
     )
     log.info(
-        "sensor-community %s sensor=%s day=%s sha=%s..%s bytes=%s",
+        "sensorcommunity %s sensor=%s day=%s sha=%s..%s bytes=%s",
         event_type, sensor_id, day.isoformat(),
         sha_csv[:8], sha_csv[-4:], bytes_downloaded,
     )
@@ -2578,26 +2578,26 @@ def check_sensor_community(
 
     if not from_day or not to_day:
         metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
-        log.warning("sensor-community: skipped — %s", metrics["skipped_reason"])
+        log.warning("sensorcommunity: skipped — %s", metrics["skipped_reason"])
         return metrics
 
     sensors = _sc_distinct_sensor_ids(conn)
     if not sensors:
-        metrics["skipped_reason"] = "no sensor-community sensors in source_station_timeseries_lookup"
-        log.warning("sensor-community: skipped — %s", metrics["skipped_reason"])
+        metrics["skipped_reason"] = "no sensorcommunity sensors in source_station_timeseries_lookup"
+        log.warning("sensorcommunity: skipped — %s", metrics["skipped_reason"])
         return metrics
 
     days = _date_range_inclusive(from_day, to_day)
     if not days:
         metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
-        log.warning("sensor-community: skipped — %s", metrics["skipped_reason"])
+        log.warning("sensorcommunity: skipped — %s", metrics["skipped_reason"])
         return metrics
 
     metrics["sensors"] = len(sensors)
     metrics["days"] = len(days)
     metrics["ran"] = True
     log.info(
-        "sensor-community: starting sensors=%s days=%s base_url=%s%s",
+        "sensorcommunity: starting sensors=%s days=%s base_url=%s%s",
         len(sensors), len(days), base_url,
         " (dry-run)" if dry_run else "",
     )
@@ -2606,17 +2606,17 @@ def check_sensor_community(
         sample = [_sc_day_url(base_url, d) for d in days[:3]]
         metrics["sample_urls"] = sample
         log.info(
-            "sensor-community dry-run: would fetch %s indexes; sample=%s",
+            "sensorcommunity dry-run: would fetch %s indexes; sample=%s",
             len(days), sample,
         )
         return metrics
 
     tmp_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
-    cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / "sensor-community"
+    cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / "sensorcommunity"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     cache_root.mkdir(parents=True, exist_ok=True)
     db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
-    log.info("sensor-community: concurrency=%s", concurrency)
+    log.info("sensorcommunity: concurrency=%s", concurrency)
 
     # Phase A (sequential, per day): fetch the day's index. ~18 fetches for
     # a daily window — small enough that parallelism here isn't worth it.
@@ -2630,7 +2630,7 @@ def check_sensor_community(
         except Exception as exc:
             metrics["errors"] += 1
             log.warning(
-                "sensor-community: index fetch failed for day=%s: %s", day, exc,
+                "sensorcommunity: index fetch failed for day=%s: %s", day, exc,
             )
             continue
         for sensor_id in sensors:
@@ -2653,7 +2653,7 @@ def check_sensor_community(
                 result = fut.result()
             except Exception as exc:
                 metrics["errors"] += 1
-                log.warning("sensor-community worker raised: %s", exc)
+                log.warning("sensorcommunity worker raised: %s", exc)
                 continue
             outcome = result.get("outcome")
             if outcome == "stopped":
@@ -2678,7 +2678,7 @@ def check_sensor_community(
                     day_obj = dt.date.fromisoformat(result["day"])
                     cmd = _planned_backfill_command(env, result["timeseries_ids"], day_obj)
                     metrics["planned_backfills"].append(cmd)
-                    log.info("sensor-community planned backfill: %s", cmd)
+                    log.info("sensorcommunity planned backfill: %s", cmd)
             bytes_added = int(result.get("downloaded_bytes") or 0)
             if bytes_added:
                 metrics["downloaded_bytes"] += bytes_added
@@ -2690,7 +2690,7 @@ def check_sensor_community(
     if limits.should_stop():
         metrics["stopped_for"] = limits.stopped_for
         log.warning(
-            "sensor-community: stopped early due to limit=%s", limits.stopped_for,
+            "sensorcommunity: stopped early due to limit=%s", limits.stopped_for,
         )
 
     # Phase 4 batched backfill, same shape as OpenAQ.
@@ -2705,7 +2705,7 @@ def check_sensor_community(
         for day_iso in sorted(by_day):
             if limits.should_stop():
                 log.warning(
-                    "sensor-community backfill: stopping early (%s) — %s days skipped",
+                    "sensorcommunity backfill: stopping early (%s) — %s days skipped",
                     limits.stopped_for,
                     len([d for d in by_day if d > day_iso]),
                 )
@@ -2713,7 +2713,7 @@ def check_sensor_community(
             group = by_day[day_iso]
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             log.info(
-                "sensor-community backfill batch day=%s files=%s total_timeseries_ids=%s",
+                "sensorcommunity backfill batch day=%s files=%s total_timeseries_ids=%s",
                 day_iso, len(group), len(union_ids),
             )
             bf = run_narrow_backfill(
@@ -2743,7 +2743,7 @@ def check_sensor_community(
                 metrics["backfills_failed"] += 1
 
     log.info(
-        "sensor-community: done %s",
+        "sensorcommunity: done %s",
         {k: v for k, v in metrics.items() if k not in ("changed_files", "planned_backfills", "sample_urls")},
     )
     return metrics
@@ -2828,10 +2828,10 @@ def run_r2_cross_checks(
 
     source_keys_by_filter = {
         "openaq": ("openaq",),
-        "sensor-community": ("sensor-community",),
-        "all": ("openaq", "sensor-community"),
+        "sensorcommunity": ("sensorcommunity",),
+        "all": ("openaq", "sensorcommunity"),
     }
-    source_keys = source_keys_by_filter.get(source_filter, ("openaq", "sensor-community"))
+    source_keys = source_keys_by_filter.get(source_filter, ("openaq", "sensorcommunity"))
 
     where = [
         "s.env_name = ?",
@@ -3042,7 +3042,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--source",
         default="all",
-        choices=["openaq", "sensor-community", "all"],
+        choices=["openaq", "sensorcommunity", "all"],
         help="Source adapter filter (also scopes cross-check source rows).",
     )
     p.add_argument("--from-day", dest="from_day", default=None,
@@ -3271,7 +3271,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             lines.append(f"- Skipped reason: {sc['skipped_reason']}")
         sc_changed = sc.get("changed_files") or []
         if sc_changed:
-            lines.extend(["", "### Changed files (sensor-community)", ""])
+            lines.extend(["", "### Changed files (sensorcommunity)", ""])
             for entry in sc_changed[:50]:
                 lines.append(
                     f"- {entry['sensor_id']} / {entry['day']} "
@@ -3513,10 +3513,10 @@ def main(argv: list[str]) -> int:
                 concurrency=max(1, int(args.concurrency)),
             )
 
-        run_sc = args.source in {"sensor-community", "all"} and snapshot_ok
-        if args.source in {"sensor-community", "all"} and not run_sc:
+        run_sc = args.source in {"sensorcommunity", "all"} and snapshot_ok
+        if args.source in {"sensorcommunity", "all"} and not run_sc:
             log.warning(
-                "sensor-community: skipped because core snapshot status=%s (need imported/reused)",
+                "sensorcommunity: skipped because core snapshot status=%s (need imported/reused)",
                 snapshot_result["status"],
             )
         if run_sc:
@@ -3603,7 +3603,7 @@ def main(argv: list[str]) -> int:
             )
 
         for adapter_name, adapter_metrics in (("openaq", openaq_metrics),
-                                              ("sensor-community", sc_metrics)):
+                                              ("sensorcommunity", sc_metrics)):
             if adapter_metrics.get("ran"):
                 notes_parts.append(
                     f"{adapter_name} head_checked={adapter_metrics.get('head_checked', 0)} "
