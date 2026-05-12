@@ -86,5 +86,23 @@ system doc.
     `first_seen`/`first_seen_missing`/`disappeared`/`reappeared`/`changed`
     events. `--max-download-mb` and `--max-runtime-minutes` enforce
     cooperative limits (run ends with `status=stopped_limit`).
-    `--run-backfill` prints the planned narrow command (Phase 4 wires real exec).
-  - Sensor.Community adapter and real backfill execution land in Phases 4 / 5.
+    `--run-backfill` invokes `UK_AQ_BACKFILL_WRAPPER` (Phase 4):
+    sources `UK_AQ_BACKFILL_ENV_FILE`, sets
+    `RUN_MODE=source_to_r2 / DRY_RUN=false / FORCE_REPLACE=true /
+    TIMESERIES_IDS=<csv> / FROM=TO=<day>`, runs via `bash` with a
+    30-min safety timeout. Changed files are **batched per day** —
+    one wrapper call per day with the union of affected timeseries
+    IDs. Records `backfill_triggered / backfill_timeseries_ids /
+    backfill_status` on each event row, full stdout/stderr to
+    `state/<ENV>/logs/backfill/<run_compact>/day_<YYYY-MM-DD>.log`,
+    and `backfills_triggered / backfills_ok / backfills_failed` on
+    the run row. Failed backfills bump `errors_count`.
+  - Phase 5: Sensor.Community adapter — fetches the daily archive
+    index `https://archive.sensor.community/<YYYY-MM-DD>/`
+    (overridable via `UK_AQ_HISTORY_INTEGRITY_SENSOR_COMMUNITY_BASE_URL`),
+    parses HTML for `sensor_id -> filename`, then HEAD/download/hash
+    each matched file. Plain CSV (no gzip).
+    `state/<ENV>/source-cache/sensor-community/<YYYY-MM-DD>/<filename>.csv`.
+    Backfills are batched per day at the end of the SC scan, identical
+    to the OpenAQ flow. `--max-download-mb` / `--max-runtime-minutes`
+    span both adapters via a shared `LimitTracker`.

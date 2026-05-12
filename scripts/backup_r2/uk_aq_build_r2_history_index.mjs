@@ -10,6 +10,10 @@ function usage() {
     "  --domain observations|aqilevels|both   Domain filter (default: both)",
     "  --fetch-concurrency <n>                 Override manifest fetch concurrency",
     "  --max-keys <n>                          Override R2 list page size",
+    "  --compute-missing-timeseries-counts     For days whose connector manifest lacks",
+    "                                          timeseries_row_counts, read each parquet,",
+    "                                          compute per-timeseries counts, patch the",
+    "                                          manifest (new manifest_hash), and re-upload.",
     "  -h, --help                              Show this help",
     "",
     "Required env:",
@@ -45,6 +49,7 @@ function parseArgs(argv) {
     domains: ["observations", "aqilevels"],
     fetchConcurrency: undefined,
     maxKeys: undefined,
+    computeMissingTimeseriesCounts: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -72,6 +77,10 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (arg === "--compute-missing-timeseries-counts") {
+      args.computeMissingTimeseriesCounts = true;
+      continue;
+    }
     if (arg === "-h" || arg === "--help") {
       usage();
       process.exit(0);
@@ -89,6 +98,7 @@ async function main() {
     domains: args.domains,
     fetchConcurrency: args.fetchConcurrency,
     maxKeys: args.maxKeys,
+    computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
   });
   process.stdout.write(`${JSON.stringify({ ok: true, ...summary }, null, 2)}\n`);
 }

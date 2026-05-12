@@ -177,7 +177,7 @@ UK_AQ_HISTORY_INTEGRITY_LOG_DIR="/Users/mikehinford/uk-aq-history-integrity/stat
 UK_AQ_HISTORY_INTEGRITY_REPORT_DIR="/Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/reports"
 UK_AQ_HISTORY_INTEGRITY_LOCK_DIR="/Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/locks"
 
-UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/history-integrity/uk_aq_history_integrity.sqlite"
+UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/uk-aq-history-integrity/uk_aq_history_integrity.sqlite"
 
 UK_AQ_R2_HISTORY_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/r2-history"
 UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/r2-history/history/v1/core"
@@ -208,7 +208,7 @@ UK_AQ_HISTORY_INTEGRITY_LOG_DIR="/Users/mikehinford/uk-aq-history-integrity/stat
 UK_AQ_HISTORY_INTEGRITY_REPORT_DIR="/Users/mikehinford/uk-aq-history-integrity/state/LIVE/reports"
 UK_AQ_HISTORY_INTEGRITY_LOCK_DIR="/Users/mikehinford/uk-aq-history-integrity/state/LIVE/locks"
 
-UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/LIVE/history-integrity/uk_aq_history_integrity.sqlite"
+UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/LIVE/uk-aq-history-integrity/uk_aq_history_integrity.sqlite"
 
 UK_AQ_R2_HISTORY_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/LIVE/r2-history"
 UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/LIVE/r2-history/history/v1/core"
@@ -789,7 +789,7 @@ The live DB is written here:
 After a successful run, copy the closed DB to:
 
 ```text
-/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/<ENV>/history-integrity/uk_aq_history_integrity.sqlite
+/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/<ENV>/uk-aq-history-integrity/uk_aq_history_integrity.sqlite
 ```
 
 Do not run SQLite directly from Dropbox.
@@ -1125,6 +1125,190 @@ Requirements:
 - Use local core lookup from SQLite, not Supabase or live R2.
 - Track downloaded bytes/runtime and include in reports.
 - Do not run broad repairs by default.
+```
+
+### Phase 5.5 — Adapter concurrency
+
+Goal:
+
+Speed up cold runs by issuing parallel HEAD/GET requests instead of strict
+sequential. A typical CIC-Test daily window is ~14k OpenAQ HEADs;
+sequential takes hours, parallel should take minutes.
+
+Prompt:
+
+```text
+Repo: uk-aq-ops.
+
+Please implement Phase 5.5 of the UK-AQ History Integrity system: adapter
+concurrency.
+
+Use:
+docs/uk-aq-history-integrity-system-doc-v2.md
+
+Build on Phase 5.
+
+Requirements:
+- Replace the strict sequential per-file loop in check_openaq and
+  check_sensor_community with a bounded thread pool
+  (concurrent.futures.ThreadPoolExecutor).
+- Worker count is configurable via --concurrency N (default 8); env var
+  UK_AQ_HISTORY_INTEGRITY_CONCURRENCY may set the default.
+- Workers do HEAD/GET/hash work. SQLite writes (state upsert + event
+  insert) happen on the main thread to keep one writer and preserve the
+  per-file commit invariant.
+- LimitTracker becomes thread-safe. should_stop() is called at submit
+  time AND inside each worker before issuing the request; once tripped,
+  no new tasks are scheduled and in-flight tasks finish cleanly.
+- Order of completion is non-deterministic; the report should not assume
+  any ordering. Sort the changed_files list before emitting the report.
+- Backfill batching (Phase 4 Pass 2) is unaffected: the batched phase
+  runs after the parallel scan completes.
+- Polite default: small per-request timeout already present; no need to
+  add jitter unless the archive proves rate-limited.
+- Update docs and the operational notes.
+```
+
+### Phase 6.5 — R2 cross-check (per-timeseries row counts)
+
+Goal:
+
+Detect missing or partial observations in R2 history by comparing
+per-(timeseries, day) row counts between two cheap-to-read sources of
+truth: the R2 history index manifest, and a count derived from the
+upstream archive file at ingest time. No parquet reads required.
+
+Motivation:
+
+Phases 3 / 5 detect when an upstream source changes after we last
+processed it. They do not detect cases where R2 history has fewer rows
+than the upstream archive provides (silent ingest drops, partial
+backfills, deleted parquet files, etc.). Phase 6.5 closes that gap.
+
+Done in two passes so the foundation lands before the verification
+pass needs it.
+
+#### Pass A — Foundation
+
+Prompt:
+
+```text
+Repo: uk-aq-ops (R2 builder) + uk-aq-ops (integrity adapters).
+
+Please implement Phase 6.5 Pass A of the UK-AQ History Integrity system.
+
+Use:
+docs/uk-aq-history-integrity-system-doc-v2.md
+
+Requirements:
+
+1. R2 history index builder change
+   - In scripts/backup_r2/uk_aq_build_r2_history_index.mjs (or wherever
+     the observations_timeseries/day_utc=Y/connector_id=X/manifest.json
+     is generated), aggregate per-timeseries row counts across the
+     connector/day's parquet files and add them to the manifest:
+       timeseries_row_counts: { "<ts_id>": <count>, ... }
+   - Keep schema_version bumped or add a feature flag so older
+     consumers don't break.
+   - Backfill old day manifests opportunistically (optional flag), so
+     historical days gain counts on next index rebuild.
+
+2. History integrity adapters source-side row counts
+   - New normalised SQLite table:
+       source_file_timeseries_counts (
+         source_file_key TEXT NOT NULL,
+         timeseries_id   INTEGER NOT NULL,
+         row_count       INTEGER NOT NULL,
+         counted_at_utc  TEXT NOT NULL,
+         PRIMARY KEY (source_file_key, timeseries_id)
+       )
+   - On every source download (first_seen / changed / reappeared), parse
+     the CSV/csv.gz once and compute per-timeseries row counts. For
+     OpenAQ each row maps to a single parameter -> timeseries; for
+     Sensor.Community each row contributes to N timeseries (one per
+     non-null measurement column).
+   - Delete + re-insert rows for the affected source_file_key in one
+     transaction so partial state is impossible.
+   - Counts persist across runs; unchanged-metadata HEADs reuse them.
+   - No automatic deletion of cached source files beyond current rules.
+
+3. Tests / verification
+   - Synthetic OpenAQ CSV with 24 PM2.5 rows + 12 NO2 rows -> table has
+     two entries with correct counts.
+   - Synthetic SC CSV with 144 rows × 2 measurement columns -> two
+     timeseries entries each with row_count=144.
+
+4. Docs
+   - Update system doc with the new table + R2 manifest field.
+   - No CLI flag changes in Pass A.
+
+Pass A leaves the comparison/alerting to Pass B; this pass just records
+the data.
+```
+
+#### Pass B — Cross-check pass
+
+Prompt:
+
+```text
+Repo: uk-aq-ops.
+
+Please implement Phase 6.5 Pass B of the UK-AQ History Integrity system.
+
+Use:
+docs/uk-aq-history-integrity-system-doc-v2.md
+
+Build on Phase 6.5 Pass A (source_file_timeseries_counts populated;
+R2 manifests carry timeseries_row_counts).
+
+Requirements:
+
+1. After the OpenAQ and Sensor.Community scans complete, run a
+   cross-check pass:
+   - For each (connector_id, day) in the window, read the R2 manifest
+     from UK_AQ_R2_HISTORY_DROPBOX_ROOT (no live R2; respect the
+     local-Dropbox-backup-only rule).
+   - For each (timeseries_id, day) that has rows in
+     source_file_timeseries_counts, look up the R2 count from the
+     manifest's timeseries_row_counts.
+   - Record the comparison in a new SQLite table:
+       cross_checks (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         run_id INTEGER NOT NULL,
+         env_name TEXT NOT NULL,
+         connector_id INTEGER NOT NULL,
+         day_utc TEXT NOT NULL,
+         timeseries_id INTEGER NOT NULL,
+         source_row_count INTEGER,
+         r2_row_count INTEGER,
+         delta INTEGER,
+         status TEXT NOT NULL,
+         checked_at_utc TEXT NOT NULL,
+         notes TEXT
+       )
+   - status values:
+       ok               — counts match
+       source_only      — source has rows, R2 has none / no manifest
+       r2_only          — R2 has rows, source has none
+       mismatch         — both have rows, counts differ
+       r2_manifest_missing — manifest not found for the (connector, day)
+   - Include cross_checks counters in the run row and the report:
+       cross_checks_total, cross_checks_ok, cross_checks_mismatch,
+       cross_checks_source_only, cross_checks_r2_only,
+       cross_checks_r2_manifest_missing.
+   - Sort the report's per-discrepancy list deterministically.
+
+2. CLI
+   - Add --skip-cross-check to disable the pass (debug/recovery).
+   - Cross-check runs by default; no opt-in required.
+
+3. Tests
+   - Synthetic manifest with matching/mismatched counts; verify each
+     status path.
+
+4. Docs
+   - Update system doc Implementation Status; mark Phase 6.5 DONE when
+     both passes land.
 ```
 
 ### Phase 6 — Monitoring, limits, and reports polish

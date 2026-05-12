@@ -41,7 +41,7 @@ uk-aq-ops/scripts/uk-aq-history-integrity/
     LIVE.env.example
 ```
 
-Deployed root on the old MacBook Pro:
+Deployed root on the MacBook Pro:
 
 ```text
 /Users/mikehinford/uk-aq-history-integrity/
@@ -75,6 +75,14 @@ wrapper and env file.
 
 The live SQLite DBs stay outside Dropbox during writes. After a successful run,
 the closed DB is copied to the relevant Dropbox destination.
+
+By convention `UK_AQ_HISTORY_INTEGRITY_LOG_DIR` and
+`UK_AQ_HISTORY_INTEGRITY_REPORT_DIR` point at the Dropbox
+`<ENV>/uk-aq-history-integrity/{logs,reports}/` paths (append-only text, safe on
+Dropbox). This lets logs be tailed remotely without logging into the host.
+The SQLite DB, source-cache, tmp downloads, and the per-env lock dir must
+stay local — they contain binary state and sidecar files that conflict
+with Dropbox sync.
 
 ---
 
@@ -180,7 +188,7 @@ UK_AQ_HISTORY_INTEGRITY_LOG_DIR="/Users/mikehinford/uk-aq-history-integrity/stat
 UK_AQ_HISTORY_INTEGRITY_REPORT_DIR="/Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/reports"
 UK_AQ_HISTORY_INTEGRITY_LOCK_DIR="/Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/locks"
 
-UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/history-integrity/uk_aq_history_integrity.sqlite"
+UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/uk-aq-history-integrity/uk_aq_history_integrity.sqlite"
 
 UK_AQ_R2_HISTORY_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/r2-history"
 UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/r2-history/history/v1/core"
@@ -331,9 +339,10 @@ Python interpreter defaults to `python3`; override with
 --to-day YYYY-MM-DD                     (manual profile or override)
 --dry-run                               No DB writes / no remote calls; logs the snapshot and OpenAQ plan.
 --check-only                            (Phase 5 wires Sensor.Community; OpenAQ already check-only by default)
---run-backfill                          Print the planned narrow backfill command per changed file (Phase 4 wires actual execution).
+--run-backfill                          Invoke UK_AQ_BACKFILL_WRAPPER per changed file (narrow timeseries × day); no-op under --dry-run.
 --max-download-mb N                     Soft cap on per-run downloaded MB (cooperative; checked before each request).
 --max-runtime-minutes N                 Soft cap on per-run runtime minutes (cooperative; checked before each request).
+--concurrency N                         Worker count for the per-file thread pool (default 8; UK_AQ_HISTORY_INTEGRITY_CONCURRENCY overrides). 1 = strict sequential.
 --force-snapshot-import                 Re-import the core snapshot even if its manifest hash is unchanged.
 --skip-snapshot-import                  Debug/recovery: skip the Phase 2 import for this run.
 --verbose
@@ -746,17 +755,18 @@ For each relevant archive file:
 
 ### Difference from OpenAQ
 
-Sensor.Community may not map one remote file to exactly one station/day in the
-same way OpenAQ does. The adapter must support:
+The daily archive is plain CSV (not gzipped) so the adapter writes the
+canonical SHA-256 to both `sha256_downloaded` and `sha256_uncompressed`.
 
-```text
-one file -> one station/day
-one file -> many stations/day
-one file -> one date range
-```
+Filenames embed `sensor_type` (e.g. `2026-05-03_sds011_sensor_55555.csv`),
+which we don't carry in the core snapshot. Rather than extending the
+import, the adapter fetches the day's directory listing once per day and
+maps `sensor_id -> filename` from the parsed HTML. Sensors absent from
+the index are recorded as missing without a per-file HEAD.
 
-The generic DB model therefore stores both `day_utc` and a
-`date_range_start_utc` / `date_range_end_utc` pair.
+The generic DB model still stores `date_range_start_utc` /
+`date_range_end_utc` for future monthly-archive support, but the daily
+adapter only sets `day_utc`.
 
 ---
 
@@ -889,7 +899,7 @@ The live DB is written here:
 After a successful run, copy the closed DB to:
 
 ```text
-/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/<ENV>/history-integrity/uk_aq_history_integrity.sqlite
+/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/<ENV>/uk-aq-history-integrity/uk_aq_history_integrity.sqlite
 ```
 
 Do not run SQLite directly from Dropbox. SQLite may use sidecar files during
@@ -1003,6 +1013,33 @@ backfill calls, warnings, and errors.
 
 ---
 
+## Operational notes
+
+- **`--verbose`** bumps the Python log level from INFO to DEBUG. The source
+  adapters currently emit no DEBUG-level lines, so the flag has no visible
+  effect today. Keep it on if you want future DEBUG output for free; drop it
+  if you want shorter logs.
+- **Crash-safe per-file commit.** The OpenAQ and Sensor.Community loops
+  `conn.commit()` after each file's state/event upsert (and after each
+  batched backfill call). If a run is interrupted (Ctrl-C, laptop sleep,
+  network drop) the SQLite DB stays consistent: every file that completed
+  is recorded; in-flight downloads in `state/<ENV>/tmp/` are abandoned.
+  The next run picks up cleanly.
+- **Concurrent HEAD/GET (default 8 workers).** Both adapters submit
+  per-file work to a `ThreadPoolExecutor`; SQLite writes stay on the
+  main thread. Tune with `--concurrency N` or
+  `UK_AQ_HISTORY_INTEGRITY_CONCURRENCY`. `--concurrency 1` reproduces
+  strict-sequential behaviour for debugging. A cold daily window
+  (~14 K HEADs) typically completes in a few minutes at the default.
+- **Resume cost.** Re-running over the same window still issues every
+  HEAD, but only downloads files whose ETag, Content-Length, or
+  Last-Modified changed. On stable archives this means thousands of
+  HEADs and almost no GETs — the run completes much faster than the
+  cold one. `--force-snapshot-import` does not affect this; it only
+  re-imports the core snapshot.
+
+---
+
 ## Failure behaviour
 
 Fail safe:
@@ -1087,17 +1124,189 @@ Delivered:
 - Run report includes an OpenAQ section with per-changed-file event IDs,
   timeseries IDs, and (where applicable) the planned commands.
 
-### Phase 4 — Narrow backfill runner (PLANNED)
+### Phase 4 — Narrow backfill runner (DONE)
 
-Goal: resolve changed OpenAQ files to timeseries IDs and invoke
-`UK_AQ_BACKFILL_WRAPPER` with `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`,
-narrow `UK_AQ_BACKFILL_TIMESERIES_IDS`, and per-day from/to bounds.
-Verify the wrapper supports `UK_AQ_BACKFILL_TIMESERIES_IDS`; add if missing.
+Pass 1 (subprocess invocation + per-event recording):
 
-### Phase 5 — Sensor.Community adapter (PLANNED)
+- When the OpenAQ adapter emits a `changed` / `first_seen` / `reappeared`
+  event and `--run-backfill` is set (and `--dry-run` is not), the
+  integrity runner invokes `UK_AQ_BACKFILL_WRAPPER` via `bash`
+  with a fresh subprocess env:
+  - vars sourced from `UK_AQ_BACKFILL_ENV_FILE` (bash-ish parser: handles
+    `export`, quoted values, `#` comments)
+  - `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`
+  - `UK_AQ_BACKFILL_DRY_RUN=false`
+  - `UK_AQ_BACKFILL_FORCE_REPLACE=true`
+  - `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>` / `UK_AQ_BACKFILL_TO_DAY_UTC=<day>` (same day)
+  - `UK_AQ_BACKFILL_TIMESERIES_IDS=<csv>`
+  - `UK_AQ_BACKFILL_TRIGGER_MODE=manual`
+- Per-backfill result recorded on the `source_file_events` row:
+  `backfill_triggered`, `backfill_timeseries_ids`,
+  `backfill_status ∈ {ok, error, timeout, no_wrapper, no_env_file,
+  no_timeseries_ids, spawn_error}`, plus exit code, log path, and
+  stdout/stderr tail (4 KB each) in `notes`.
+- Hard guardrails enforced by construction:
+  - No invocation in `--dry-run` (only the planned command is logged).
+  - No invocation without `--run-backfill`.
+  - Connector-wide force-replace is never used.
+- 1800 s per-call safety timeout (`subprocess.TimeoutExpired` →
+  `status=timeout`).
 
-Goal: HTTP-archive equivalent of Phase 3 / 4 using the same generic
-SQLite tables and reporting.
+Pass 2 (batching, logs, monitoring):
+
+- **Batched by day.** The OpenAQ HEAD/download loop now finishes first;
+  the backfill phase runs afterward, grouping changed files by
+  `day_utc`. Each day fires **one** wrapper call with the **union** of
+  the affected timeseries IDs from all locations that changed that day.
+  Per-event `backfill_timeseries_ids` stays the per-location subset;
+  `backfill_status` is shared across the batch and the event's `notes`
+  records `batch: files=<N> total_timeseries_ids=<U>`.
+- **Per-call log files** written to
+  `state/<ENV>/logs/backfill/<run_compact>/day_<YYYY-MM-DD>.log` with
+  header (wrapper, env file, day, timeseries IDs, exit code, status)
+  followed by full stdout/stderr. Path is also stored in the event's
+  `notes`.
+- **First-class run-row columns.** `integrity_runs` now carries
+  `backfills_triggered` (attempted batches), `backfills_ok`, and
+  `backfills_failed`. Backfill failures continue to bump `errors_count`.
+- **Limit-aware.** The backfill phase re-checks
+  `LimitTracker.should_stop()` before each batch and exits cleanly when
+  a soft cap trips; remaining days are skipped (their events stay with
+  `backfill_status` unset).
+- **Real-wrapper integration verified.** Smoke test invokes the actual
+  `scripts/uk_aq_backfill_local_monthly.sh` via the integrity runner —
+  the wrapper passes its `require_env` checks (proving env injection
+  matches the wrapper's contract) and we capture the downstream
+  exit/stderr in the per-call log file.
+
+### Phase 5 — Sensor.Community adapter (DONE)
+
+Delivered:
+
+- HTTP fetch of the daily directory listing
+  `https://archive.sensor.community/<YYYY-MM-DD>/` (overridable via
+  `UK_AQ_HISTORY_INTEGRITY_SENSOR_COMMUNITY_BASE_URL`). One index fetch
+  per day; the HTML is parsed with a single regex over
+  `<a href="<YYYY-MM-DD>_<sensor_type>_sensor_<sensor_id>.csv">`.
+- Per-sensor workflow mirrors the OpenAQ adapter:
+  - sensors absent from the day's index are recorded as missing
+    (no per-file HEAD; saves round trips)
+  - sensors present trigger `HEAD <file>` against the archive,
+    then `GET` only when ETag/Content-Length/Last-Modified differ
+    from the prior `source_file_state` row
+  - SHA-256 over the CSV bytes (no gzip; both
+    `sha256_downloaded` and `sha256_uncompressed` carry the canonical
+    value for cross-source consistency)
+- State / event semantics identical to OpenAQ
+  (`first_seen / first_seen_missing / disappeared / reappeared / changed`);
+  rows in `source_file_state` and `source_file_events` are stamped with
+  `source_key='sensor-community'`.
+- Source-cache layout: `state/<ENV>/source-cache/sensor-community/<YYYY-MM-DD>/<filename>.csv`.
+- Backfill batching (Phase 4 Pass 2 logic) runs at the end of the SC
+  scan: changed files grouped by `day_utc`, single wrapper call per day
+  with the union of timeseries IDs, per-call log file under
+  `state/<ENV>/logs/backfill/<run_compact>/sc_day_<YYYY-MM-DD>.log`.
+- Run row aggregates counters across both adapters: `files_head_checked`,
+  `files_downloaded`, `files_changed`, `files_missing`,
+  `downloaded_bytes`, `backfills_triggered / ok / failed`, etc.
+- Soft `--max-download-mb` and `--max-runtime-minutes` apply across both
+  adapters via a single shared `LimitTracker`.
+
+### Phase 5.5 — Adapter concurrency (DONE — see implementation notes below)
+
+Reason: a cold CIC-Test daily run is ~14k OpenAQ HEADs; sequential
+takes hours, parallel takes minutes. Most of the time per request is
+network round-trip, not CPU.
+
+Delivered:
+
+- Per-day inner loop in both `check_openaq` and
+  `check_sensor_community` runs through a bounded
+  `concurrent.futures.ThreadPoolExecutor`. Workers issue HEAD/GET and
+  hash; SQLite writes (`source_file_state` upsert + `source_file_events`
+  insert) happen on the main thread to keep one writer and preserve the
+  per-file `commit()` invariant.
+- New CLI flag `--concurrency N` (default 8). Default overridable via
+  env var `UK_AQ_HISTORY_INTEGRITY_CONCURRENCY`. `--concurrency 1`
+  reproduces the old strict-sequential behaviour for debugging.
+- `LimitTracker` is now thread-safe (an internal `threading.Lock`). It
+  is checked both before submitting each task and inside each worker
+  before issuing the request, so an in-flight worker's bytes are
+  accounted for and no new tasks are scheduled once a limit trips.
+- Completion order is non-deterministic; the run report sorts
+  `changed_files` deterministically before writing.
+- Phase 4 Pass 2 batched backfill phase is unaffected (still runs
+  serially after the parallel scan completes).
+
+### Phase 6.5 — R2 cross-check (Pass A DONE; Pass B PLANNED)
+
+Goal: detect missing or partial observations in R2 history by
+comparing per-(timeseries, day) row counts between the upstream archive
+file (counted at ingest time) and the R2 history index manifest.
+
+Closes the gap Phases 3 / 5 leave open: those detect when *upstream*
+changes; this detects when *R2* is missing or short of rows the
+upstream archive contains.
+
+**Pass A — Foundation (DONE):**
+
+- The connector-day R2 manifest writer in
+  `workers/uk_aq_prune_daily/phase_b_history_r2.mjs` now computes
+  per-timeseries row counts at the parquet write site and stores them as
+  a single top-level map on connector/day manifests:
+  `timeseries_row_counts: { "<ts_id>": <count> }`.
+  Per-file `files[].timeseries_row_counts` is no longer written to keep
+  manifest size lower.
+- The index builder in `workers/shared/uk_aq_r2_history_index.mjs`
+  reads the top-level field from source connector manifests, surfacing it
+  on the per-day-per-connector index manifest
+  (`history/_index/observations_timeseries/day_utc=Y/connector_id=X/manifest.json`).
+  For backward compatibility with older manifests, it can still fall back
+  to per-file aggregation if legacy `files[].timeseries_row_counts` is
+  present.
+- **Historical backfill.** The index-rebuild CLI gained
+  `--compute-missing-timeseries-counts`: when set, for any connector
+  manifest lacking `timeseries_row_counts`, the rebuild reads each
+  parquet file referenced by the manifest, computes per-timeseries
+  counts, patches the manifest in place (new `manifest_hash`), and
+  re-uploads. This makes the new field retroactively available for
+  every day with parquets in R2, independent of ingest retention.
+  Standalone run:
+  ```bash
+  node scripts/backup_r2/uk_aq_build_r2_history_index.mjs \
+    --domain observations --compute-missing-timeseries-counts
+  ```
+  Reads `parquet-wasm` (already a dep). Idempotent — re-runs on a
+  patched day skip the parquet reads.
+- A new normalised SQLite table records source-side counts:
+  ```sql
+  CREATE TABLE source_file_timeseries_counts (
+    source_file_key TEXT NOT NULL,
+    timeseries_id   INTEGER NOT NULL,
+    row_count       INTEGER NOT NULL,
+    counted_at_utc  TEXT NOT NULL,
+    PRIMARY KEY (source_file_key, timeseries_id)
+  );
+  ```
+- On every source download (`first_seen` / `changed` / `reappeared`),
+  the adapter parses the CSV once and bulk-replaces the rows for that
+  `source_file_key`. Counts persist across runs; unchanged-metadata
+  HEADs reuse the prior recording (source bytes haven't changed → counts
+  are still authoritative).
+- No CLI changes, no comparison logic yet.
+
+**Pass B — Cross-check pass:**
+
+- After the OpenAQ + Sensor.Community scans, a new pass walks every
+  `(timeseries_id, day_utc)` with a row in
+  `source_file_timeseries_counts`, reads the R2 manifest from the local
+  Dropbox R2 history backup, and compares counts.
+- Outcomes recorded in a new `cross_checks` table with status
+  `ok | source_only | r2_only | mismatch | r2_manifest_missing`.
+- Run row and report grow `cross_checks_total / ok / mismatch /
+  source_only / r2_only / r2_manifest_missing` counters.
+- New CLI flag `--skip-cross-check` for debug/recovery; pass runs by
+  default.
 
 ### Phase 6 — Monitoring, limits, and reports polish (PLANNED)
 
