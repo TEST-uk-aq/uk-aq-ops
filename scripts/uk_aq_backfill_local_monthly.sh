@@ -160,7 +160,11 @@ prune_recent_run_starts() {
       pruned+=("${ts}")
     fi
   done
-  RUN_START_EPOCHS=("${pruned[@]}")
+  if [[ "${#pruned[@]}" -gt 0 ]]; then
+    RUN_START_EPOCHS=("${pruned[@]}")
+  else
+    RUN_START_EPOCHS=()
+  fi
 }
 
 count_recent_run_starts() {
