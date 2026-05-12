@@ -1238,7 +1238,7 @@ Delivered:
 - Phase 4 Pass 2 batched backfill phase is unaffected (still runs
   serially after the parallel scan completes).
 
-### Phase 6.5 — R2 cross-check (Pass A DONE; Pass B PLANNED)
+### Phase 6.5 — R2 cross-check (DONE)
 
 Goal: detect missing or partial observations in R2 history by
 comparing per-(timeseries, day) row counts between the upstream archive
@@ -1295,12 +1295,13 @@ upstream archive contains.
   are still authoritative).
 - No CLI changes, no comparison logic yet.
 
-**Pass B — Cross-check pass:**
+**Pass B — Cross-check pass (DONE):**
 
 - After the OpenAQ + Sensor.Community scans, a new pass walks every
-  `(timeseries_id, day_utc)` with a row in
-  `source_file_timeseries_counts`, reads the R2 manifest from the local
-  Dropbox R2 history backup, and compares counts.
+  `(connector_id, day_utc, timeseries_id)` with source-side rows from
+  `source_file_timeseries_counts`, reads local Dropbox-backed
+  `history/_index/observations_timeseries/.../manifest.json`, and compares
+  `timeseries_row_counts`.
 - Outcomes recorded in a new `cross_checks` table with status
   `ok | source_only | r2_only | mismatch | r2_manifest_missing`.
 - Run row and report grow `cross_checks_total / ok / mismatch /

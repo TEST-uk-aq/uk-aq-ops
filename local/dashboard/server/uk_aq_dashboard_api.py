@@ -804,7 +804,7 @@ def _fetch_ingest_runs(
     limit: int = DISPATCH_FETCH_LIMIT,
 ) -> List[Dict[str, Any]]:
     params: Dict[str, str] = {
-        "select": "id,connector_id,connector_code,run_started_at,run_ended_at,run_status,run_message,last_observed_at,stations_updated,observations_upserted,timeseries_updated,series_polled,response_payload,created_at",
+        "select": "id,connector_id,connector_code,run_started_at,run_ended_at,run_status,run_message,last_observed_at,stations_updated,observations_upserted,timeseries_updated,series_polled,response_status,response_payload,created_at",
         "order": "created_at.desc.nullslast",
         "limit": str(limit),
     }

@@ -1868,7 +1868,44 @@
         ]);
       }
 
+      function hasHttp502GatewayFailure(run) {
+        const payload = asObject(run && run.response_payload);
+        const responseStatus = asNumber(run && run.response_status);
+        if (responseStatus === 502) {
+          return true;
+        }
+        const upstreamStatus = payloadNumber(payload, ["upstream_status", "response_status", "status_code"]);
+        if (upstreamStatus === 502) {
+          return true;
+        }
+        const message = String(run && run.run_message || "").toLowerCase();
+        if (
+          message.includes("http 502") ||
+          message.includes("status 502") ||
+          message.includes("bad gateway") ||
+          message.includes("gateway failure")
+        ) {
+          return true;
+        }
+        const upstreamError = String((payload && payload.upstream_error) || "").toLowerCase();
+        if (upstreamError.includes("http 502") || upstreamError.includes("bad gateway")) {
+          return true;
+        }
+        const payloadError = String((payload && payload.error) || "").toLowerCase();
+        if (payloadError.includes("http 502") || payloadError.includes("bad gateway")) {
+          return true;
+        }
+        const errors = payload && Array.isArray(payload.errors) ? payload.errors : [];
+        return errors.some((entry) =>
+          String(entry || "").toLowerCase().includes("http 502") ||
+          String(entry || "").toLowerCase().includes("bad gateway")
+        );
+      }
+
       function partialRunDetail(run) {
+        if (hasHttp502GatewayFailure(run)) {
+          return "HTTP 502 Gateway Failure";
+        }
         const rateLimitReasons = new Set([
           "remaining_low",
           "rate_limit_429",
@@ -1964,7 +2001,13 @@
         }
         const partialDetail = partialRunDetail(run);
         if (partialDetail || rawLower === "partial") {
+          if (partialDetail === "HTTP 502 Gateway Failure") {
+            return { className: "failed", label: "Failed", detail: partialDetail };
+          }
           return { className: "partial", label: "Partial Run", detail: partialDetail || "Budget Limit" };
+        }
+        if (hasHttp502GatewayFailure(run)) {
+          return { className: "failed", label: "Failed", detail: "HTTP 502 Gateway Failure" };
         }
         const normalizedLabel = rawLower === "skipped" ? "Skipped" : raw;
         return { className: rawLower, label: normalizedLabel, detail: null };
