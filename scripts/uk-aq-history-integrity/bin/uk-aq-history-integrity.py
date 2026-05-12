@@ -193,6 +193,28 @@ CREATE TABLE IF NOT EXISTS source_file_timeseries_counts (
 CREATE INDEX IF NOT EXISTS idx_sftc_timeseries
   ON source_file_timeseries_counts(timeseries_id);
 
+-- Phase 6.5 Pass B: per-run source-vs-R2 comparison outcomes at
+-- (connector_id, day_utc, timeseries_id) granularity.
+CREATE TABLE IF NOT EXISTS cross_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  env_name TEXT NOT NULL,
+  connector_id INTEGER NOT NULL,
+  day_utc TEXT NOT NULL,
+  timeseries_id INTEGER NOT NULL,
+  source_row_count INTEGER,
+  r2_row_count INTEGER,
+  delta INTEGER,
+  status TEXT NOT NULL,
+  checked_at_utc TEXT NOT NULL,
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cross_checks_run
+  ON cross_checks(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_cross_checks_day_connector
+  ON cross_checks(day_utc, connector_id, timeseries_id);
+
 CREATE TABLE IF NOT EXISTS source_file_state (
   source_file_key TEXT PRIMARY KEY,
 
@@ -295,6 +317,12 @@ CREATE TABLE IF NOT EXISTS integrity_runs (
   runtime_seconds REAL DEFAULT 0,
 
   backfills_triggered INTEGER DEFAULT 0,
+  cross_checks_total INTEGER DEFAULT 0,
+  cross_checks_ok INTEGER DEFAULT 0,
+  cross_checks_mismatch INTEGER DEFAULT 0,
+  cross_checks_source_only INTEGER DEFAULT 0,
+  cross_checks_r2_only INTEGER DEFAULT 0,
+  cross_checks_r2_manifest_missing INTEGER DEFAULT 0,
 
   warnings_count INTEGER DEFAULT 0,
   errors_count INTEGER DEFAULT 0,
@@ -2721,6 +2749,277 @@ def check_sensor_community(
     return metrics
 
 
+R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
+CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
+
+
+def _normalize_timeseries_row_counts(raw: Any) -> dict[int, int]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, int] = {}
+    for raw_ts_id, raw_count in raw.items():
+        try:
+            ts_id = int(str(raw_ts_id).strip())
+        except (TypeError, ValueError):
+            continue
+        if ts_id <= 0:
+            continue
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if count < 0:
+            continue
+        out[ts_id] = count
+    return out
+
+
+def _read_r2_timeseries_manifest_counts(
+    r2_history_root: Path,
+    manifest_prefix: str,
+    day_utc: str,
+    connector_id: int,
+) -> tuple[dict[int, int] | None, str | None]:
+    manifest_path = (
+        r2_history_root
+        / manifest_prefix
+        / f"day_utc={day_utc}"
+        / f"connector_id={int(connector_id)}"
+        / "manifest.json"
+    )
+    if not manifest_path.is_file():
+        return None, f"manifest_missing:{manifest_path}"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"manifest_invalid_json:{manifest_path}:{exc}"
+    counts = _normalize_timeseries_row_counts(payload.get("timeseries_row_counts"))
+    return counts, None
+
+
+def run_r2_cross_checks(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    env_name: str,
+    source_filter: str,
+    from_day: str | None,
+    to_day: str | None,
+    r2_history_root: str | None,
+    r2_manifest_prefix: str | None,
+    checked_at_utc: str,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Phase 6.5 Pass B: compare source_file_timeseries_counts against local
+    R2 observations_timeseries index manifests.
+    """
+    if not r2_history_root:
+        raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
+    root = Path(r2_history_root)
+    if not root.is_dir():
+        raise RuntimeError(f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {root}")
+    manifest_prefix = (
+        str(r2_manifest_prefix or R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX)
+        .strip()
+        .strip("/")
+    )
+    if not manifest_prefix:
+        raise RuntimeError("R2 observations_timeseries manifest prefix is empty")
+
+    source_keys_by_filter = {
+        "openaq": ("openaq",),
+        "sensor-community": ("sensor-community",),
+        "all": ("openaq", "sensor-community"),
+    }
+    source_keys = source_keys_by_filter.get(source_filter, ("openaq", "sensor-community"))
+
+    where = [
+        "s.env_name = ?",
+        "s.day_utc IS NOT NULL",
+        "c.row_count > 0",
+        f"s.source_key IN ({','.join('?' for _ in source_keys)})",
+    ]
+    params: list[Any] = [env_name, *source_keys]
+    if from_day:
+        where.append("s.day_utc >= ?")
+        params.append(from_day)
+    if to_day:
+        where.append("s.day_utc <= ?")
+        params.append(to_day)
+    where_sql = " AND ".join(where)
+
+    rows = conn.execute(
+        f"""
+        SELECT
+          l.connector_id,
+          s.day_utc,
+          c.timeseries_id,
+          SUM(c.row_count) AS source_row_count
+        FROM source_file_timeseries_counts c
+        JOIN source_file_state s
+          ON s.source_file_key = c.source_file_key
+        JOIN source_station_timeseries_lookup l
+          ON l.source_key = s.source_key
+         AND l.source_location_id = s.source_location_id
+         AND l.timeseries_id = c.timeseries_id
+        WHERE {where_sql}
+        GROUP BY l.connector_id, s.day_utc, c.timeseries_id
+        ORDER BY s.day_utc, l.connector_id, c.timeseries_id
+        """,
+        tuple(params),
+    ).fetchall()
+
+    grouped: dict[tuple[str, int], dict[int, int]] = {}
+    for connector_id, day_utc, timeseries_id, source_row_count in rows:
+        if not day_utc:
+            continue
+        key = (str(day_utc), int(connector_id))
+        per_ts = grouped.setdefault(key, {})
+        per_ts[int(timeseries_id)] = int(source_row_count or 0)
+
+    status_counts = {
+        "ok": 0,
+        "mismatch": 0,
+        "source_only": 0,
+        "r2_only": 0,
+        "r2_manifest_missing": 0,
+    }
+    discrepancy_total = 0
+    discrepancies: list[dict[str, Any]] = []
+    insert_rows: list[tuple[Any, ...]] = []
+    manifest_missing_days = 0
+
+    for day_utc, connector_id in sorted(grouped.keys()):
+        source_counts = grouped[(day_utc, connector_id)]
+        r2_counts, manifest_error = _read_r2_timeseries_manifest_counts(
+            root, manifest_prefix, day_utc, connector_id,
+        )
+        if r2_counts is None:
+            manifest_missing_days += 1
+            for timeseries_id, source_row_count in sorted(source_counts.items()):
+                status = "r2_manifest_missing"
+                status_counts[status] += 1
+                discrepancy_total += 1
+                entry = {
+                    "status": status,
+                    "connector_id": connector_id,
+                    "day_utc": day_utc,
+                    "timeseries_id": timeseries_id,
+                    "source_row_count": source_row_count,
+                    "r2_row_count": None,
+                    "delta": None,
+                    "notes": manifest_error,
+                }
+                if len(discrepancies) < CROSS_CHECK_MAX_REPORT_DISCREPANCIES:
+                    discrepancies.append(entry)
+                insert_rows.append((
+                    run_id, env_name, connector_id, day_utc, timeseries_id,
+                    source_row_count, None, None, status, checked_at_utc,
+                    manifest_error,
+                ))
+            continue
+
+        for timeseries_id in sorted(set(source_counts) | set(r2_counts)):
+            source_row_count = source_counts.get(timeseries_id)
+            r2_row_count = r2_counts.get(timeseries_id)
+            delta: int | None
+            notes: str | None = None
+            if source_row_count is None and r2_row_count is None:
+                continue
+            if source_row_count is None:
+                status = "r2_only"
+                delta = -int(r2_row_count or 0)
+                notes = "timeseries present in R2 manifest but absent from source counts"
+            elif r2_row_count is None:
+                status = "source_only"
+                delta = int(source_row_count)
+                notes = "timeseries present in source counts but absent from R2 manifest"
+            else:
+                delta = int(source_row_count) - int(r2_row_count)
+                status = "ok" if delta == 0 else "mismatch"
+
+            status_counts[status] += 1
+            insert_rows.append((
+                run_id,
+                env_name,
+                connector_id,
+                day_utc,
+                timeseries_id,
+                source_row_count,
+                r2_row_count,
+                delta,
+                status,
+                checked_at_utc,
+                notes,
+            ))
+            if status != "ok":
+                discrepancy_total += 1
+                entry = {
+                    "status": status,
+                    "connector_id": connector_id,
+                    "day_utc": day_utc,
+                    "timeseries_id": timeseries_id,
+                    "source_row_count": source_row_count,
+                    "r2_row_count": r2_row_count,
+                    "delta": delta,
+                    "notes": notes,
+                }
+                if len(discrepancies) < CROSS_CHECK_MAX_REPORT_DISCREPANCIES:
+                    discrepancies.append(entry)
+
+    if insert_rows:
+        conn.executemany(
+            """
+            INSERT INTO cross_checks (
+              run_id, env_name, connector_id, day_utc, timeseries_id,
+              source_row_count, r2_row_count, delta, status, checked_at_utc, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            insert_rows,
+        )
+        conn.commit()
+
+    discrepancies.sort(
+        key=lambda e: (
+            str(e.get("day_utc") or ""),
+            int(e.get("connector_id") or 0),
+            int(e.get("timeseries_id") or 0),
+            str(e.get("status") or ""),
+        )
+    )
+
+    metrics = {
+        "ran": True,
+        "skipped_reason": None,
+        "source_rows": len(rows),
+        "connector_days": len(grouped),
+        "manifests_missing_days": manifest_missing_days,
+        "cross_checks_total": sum(status_counts.values()),
+        "cross_checks_ok": status_counts["ok"],
+        "cross_checks_mismatch": status_counts["mismatch"],
+        "cross_checks_source_only": status_counts["source_only"],
+        "cross_checks_r2_only": status_counts["r2_only"],
+        "cross_checks_r2_manifest_missing": status_counts["r2_manifest_missing"],
+        "discrepancy_total": discrepancy_total,
+        "discrepancies_truncated_to": CROSS_CHECK_MAX_REPORT_DISCREPANCIES,
+        "discrepancies": discrepancies,
+        "r2_history_root": str(root),
+        "manifest_prefix": manifest_prefix,
+    }
+    log.info(
+        "cross-check done total=%s ok=%s mismatch=%s source_only=%s r2_only=%s manifest_missing=%s connector_days=%s source_rows=%s",
+        metrics["cross_checks_total"],
+        metrics["cross_checks_ok"],
+        metrics["cross_checks_mismatch"],
+        metrics["cross_checks_source_only"],
+        metrics["cross_checks_r2_only"],
+        metrics["cross_checks_r2_manifest_missing"],
+        metrics["connector_days"],
+        metrics["source_rows"],
+    )
+    return metrics
+
+
 def fmt_iso(t: dt.datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -2744,7 +3043,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--source",
         default="all",
         choices=["openaq", "sensor-community", "all"],
-        help="Source adapter filter (Phase 1: recorded only; no checks yet).",
+        help="Source adapter filter (also scopes cross-check source rows).",
     )
     p.add_argument("--from-day", dest="from_day", default=None,
                    help="YYYY-MM-DD lower bound (manual profile or override).")
@@ -2779,6 +3078,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip the core snapshot import for this run (debug/recovery). "
              "Source adapters added in later phases will fail without a lookup.",
+    )
+    p.add_argument(
+        "--skip-cross-check",
+        action="store_true",
+        help="Skip Phase 6.5 Pass B source-vs-R2 count cross-check (debug/recovery).",
     )
     return p.parse_args(argv)
 
@@ -2863,6 +3167,12 @@ def open_db(db_path: str) -> sqlite3.Connection:
     ensure_columns(conn, "integrity_runs", {
         "backfills_ok": "INTEGER DEFAULT 0",
         "backfills_failed": "INTEGER DEFAULT 0",
+        "cross_checks_total": "INTEGER DEFAULT 0",
+        "cross_checks_ok": "INTEGER DEFAULT 0",
+        "cross_checks_mismatch": "INTEGER DEFAULT 0",
+        "cross_checks_source_only": "INTEGER DEFAULT 0",
+        "cross_checks_r2_only": "INTEGER DEFAULT 0",
+        "cross_checks_r2_manifest_missing": "INTEGER DEFAULT 0",
     })
     conn.commit()
     return conn
@@ -3014,6 +3324,43 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.append(f"... {len(planned) - 20} more")
         lines.append("")
 
+    cc = s.get("cross_check") or {}
+    if cc.get("ran") or cc.get("skipped_reason"):
+        lines.extend([
+            "## R2 Cross-check",
+            "",
+            f"- Ran:                      {bool(cc.get('ran'))}",
+            f"- Source rows:              {cc.get('source_rows', 0)}",
+            f"- Connector-days:           {cc.get('connector_days', 0)}",
+            f"- Missing manifests:        {cc.get('manifests_missing_days', 0)}",
+            f"- cross_checks_total:       {cc.get('cross_checks_total', 0)}",
+            f"- cross_checks_ok:          {cc.get('cross_checks_ok', 0)}",
+            f"- cross_checks_mismatch:    {cc.get('cross_checks_mismatch', 0)}",
+            f"- cross_checks_source_only: {cc.get('cross_checks_source_only', 0)}",
+            f"- cross_checks_r2_only:     {cc.get('cross_checks_r2_only', 0)}",
+            f"- cross_checks_r2_manifest_missing: {cc.get('cross_checks_r2_manifest_missing', 0)}",
+        ])
+        if cc.get("skipped_reason"):
+            lines.append(f"- Skipped reason:           {cc['skipped_reason']}")
+        discrepancies = cc.get("discrepancies") or []
+        if discrepancies:
+            lines.extend(["", "### Discrepancies", ""])
+            for entry in discrepancies:
+                lines.append(
+                    f"- {entry.get('status')} connector={entry.get('connector_id')} "
+                    f"day={entry.get('day_utc')} timeseries={entry.get('timeseries_id')} "
+                    f"source={entry.get('source_row_count')} r2={entry.get('r2_row_count')} "
+                    f"delta={entry.get('delta')}"
+                )
+            shown = len(discrepancies)
+            total = int(cc.get("discrepancy_total", shown) or shown)
+            if total > shown:
+                lines.append(
+                    f"- ... {total - shown} more "
+                    f"(report cap={cc.get('discrepancies_truncated_to', shown)})"
+                )
+        lines.append("")
+
     lines.extend(["## Metrics", ""])
     m = s.get("metrics", {})
     for key in (
@@ -3026,6 +3373,12 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "downloaded_mb",
         "runtime_seconds",
         "backfills_triggered",
+        "cross_checks_total",
+        "cross_checks_ok",
+        "cross_checks_mismatch",
+        "cross_checks_source_only",
+        "cross_checks_r2_only",
+        "cross_checks_r2_manifest_missing",
         "warnings_count",
         "errors_count",
     ):
@@ -3094,7 +3447,7 @@ def main(argv: list[str]) -> int:
             (
                 started_iso, args.env, args.profile, args.source,
                 from_day, to_day, "running",
-                "phase2: core snapshot import; no source adapters yet.",
+                "history integrity run in progress.",
             ),
         )
         run_id = cur.lastrowid
@@ -3143,6 +3496,7 @@ def main(argv: list[str]) -> int:
         empty_metrics = {"ran": False, "skipped_reason": None}
         openaq_metrics: dict[str, Any] = dict(empty_metrics)
         sc_metrics: dict[str, Any] = dict(empty_metrics)
+        cross_check_metrics: dict[str, Any] = dict(empty_metrics)
 
         run_openaq = args.source in {"openaq", "all"} and snapshot_ok
         if args.source in {"openaq", "all"} and not run_openaq:
@@ -3172,6 +3526,37 @@ def main(argv: list[str]) -> int:
                 dry_run=args.dry_run, run_backfill=args.run_backfill,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
+            )
+
+        if args.skip_cross_check:
+            cross_check_metrics = {
+                "ran": False,
+                "skipped_reason": "skipped by --skip-cross-check",
+            }
+            log.warning("cross-check: skipped by --skip-cross-check")
+        elif not snapshot_ok:
+            cross_check_metrics = {
+                "ran": False,
+                "skipped_reason": (
+                    "core snapshot not ready "
+                    f"(status={snapshot_result['status']}; need imported/reused)"
+                ),
+            }
+            log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
+        else:
+            cross_check_metrics = run_r2_cross_checks(
+                conn=conn,
+                run_id=int(run_id),
+                env_name=args.env,
+                source_filter=args.source,
+                from_day=from_day,
+                to_day=to_day,
+                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                r2_manifest_prefix=os.environ.get(
+                    "UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX"
+                ),
+                checked_at_utc=fmt_iso(utc_now()),
+                log=log,
             )
 
         any_adapter_ran = openaq_metrics.get("ran") or sc_metrics.get("ran")
@@ -3233,6 +3618,18 @@ def main(argv: list[str]) -> int:
                     notes_parts.append(f"{adapter_name} stopped_for={adapter_metrics['stopped_for']}")
             elif adapter_metrics.get("skipped_reason"):
                 notes_parts.append(f"{adapter_name} skipped: {adapter_metrics['skipped_reason']}")
+        if cross_check_metrics.get("ran"):
+            notes_parts.append(
+                "cross-check "
+                f"total={cross_check_metrics.get('cross_checks_total', 0)} "
+                f"ok={cross_check_metrics.get('cross_checks_ok', 0)} "
+                f"mismatch={cross_check_metrics.get('cross_checks_mismatch', 0)} "
+                f"source_only={cross_check_metrics.get('cross_checks_source_only', 0)} "
+                f"r2_only={cross_check_metrics.get('cross_checks_r2_only', 0)} "
+                f"manifest_missing={cross_check_metrics.get('cross_checks_r2_manifest_missing', 0)}"
+            )
+        elif cross_check_metrics.get("skipped_reason"):
+            notes_parts.append(f"cross-check skipped: {cross_check_metrics['skipped_reason']}")
 
         notes = "; ".join(notes_parts) + "."
 
@@ -3245,6 +3642,8 @@ def main(argv: list[str]) -> int:
         if openaq_metrics.get("skipped_reason"):
             warnings_count_total += 1
         if sc_metrics.get("skipped_reason"):
+            warnings_count_total += 1
+        if cross_check_metrics.get("skipped_reason"):
             warnings_count_total += 1
         if openaq_metrics.get("stopped_for"):
             warnings_count_total += 1
@@ -3263,6 +3662,14 @@ def main(argv: list[str]) -> int:
             "backfills_triggered": _sum("backfills_attempted"),
             "backfills_ok": _sum("backfills_ok"),
             "backfills_failed": _sum("backfills_failed"),
+            "cross_checks_total": int(cross_check_metrics.get("cross_checks_total", 0) or 0),
+            "cross_checks_ok": int(cross_check_metrics.get("cross_checks_ok", 0) or 0),
+            "cross_checks_mismatch": int(cross_check_metrics.get("cross_checks_mismatch", 0) or 0),
+            "cross_checks_source_only": int(cross_check_metrics.get("cross_checks_source_only", 0) or 0),
+            "cross_checks_r2_only": int(cross_check_metrics.get("cross_checks_r2_only", 0) or 0),
+            "cross_checks_r2_manifest_missing": int(
+                cross_check_metrics.get("cross_checks_r2_manifest_missing", 0) or 0
+            ),
             "warnings_count": warnings_count_total,
             "errors_count": errors_count,
             "snapshot_status": snapshot_result["status"],
@@ -3301,6 +3708,12 @@ def main(argv: list[str]) -> int:
               backfills_triggered = ?,
               backfills_ok = ?,
               backfills_failed = ?,
+              cross_checks_total = ?,
+              cross_checks_ok = ?,
+              cross_checks_mismatch = ?,
+              cross_checks_source_only = ?,
+              cross_checks_r2_only = ?,
+              cross_checks_r2_manifest_missing = ?,
               warnings_count = warnings_count + ?,
               errors_count = errors_count + ?,
               notes = ?
@@ -3318,6 +3731,12 @@ def main(argv: list[str]) -> int:
                 metrics["backfills_triggered"],
                 metrics["backfills_ok"],
                 metrics["backfills_failed"],
+                metrics["cross_checks_total"],
+                metrics["cross_checks_ok"],
+                metrics["cross_checks_mismatch"],
+                metrics["cross_checks_source_only"],
+                metrics["cross_checks_r2_only"],
+                metrics["cross_checks_r2_manifest_missing"],
                 warnings_count_total,
                 errors_count,
                 notes,
@@ -3337,6 +3756,7 @@ def main(argv: list[str]) -> int:
             "run_backfill": args.run_backfill,
             "force_snapshot_import": args.force_snapshot_import,
             "skip_snapshot_import": args.skip_snapshot_import,
+            "skip_cross_check": args.skip_cross_check,
             "max_download_mb": args.max_download_mb,
             "max_runtime_minutes": args.max_runtime_minutes,
             "started_at_utc": started_iso,
@@ -3348,6 +3768,7 @@ def main(argv: list[str]) -> int:
             "snapshot": snapshot_result,
             "openaq": openaq_metrics,
             "sensor_community": sc_metrics,
+            "cross_check": cross_check_metrics,
             "metrics": metrics,
             "notes": notes,
         }
