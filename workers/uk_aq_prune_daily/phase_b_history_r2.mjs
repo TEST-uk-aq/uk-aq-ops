@@ -236,6 +236,9 @@ function summarizeObservationPartRows(rows) {
   let maxTimeseriesId = null;
   let minObservedAt = null;
   let maxObservedAt = null;
+  // Phase 6.5 Pass A: per-timeseries row counts. Cheaper for downstream
+  // integrity checks to consume than reading parquets.
+  const timeseriesRowCounts = {};
 
   for (const row of rows) {
     const timeseriesId = Number(row.timeseries_id);
@@ -247,6 +250,8 @@ function summarizeObservationPartRows(rows) {
       if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
         maxTimeseriesId = normalizedTimeseriesId;
       }
+      const key = String(normalizedTimeseriesId);
+      timeseriesRowCounts[key] = (timeseriesRowCounts[key] || 0) + 1;
     }
     const observedAt = typeof row.observed_at === "string" ? row.observed_at : null;
     if (observedAt) {
@@ -260,7 +265,24 @@ function summarizeObservationPartRows(rows) {
     max_timeseries_id: maxTimeseriesId,
     min_observed_at: minObservedAt,
     max_observed_at: maxObservedAt,
+    timeseries_row_counts: timeseriesRowCounts,
   };
+}
+
+function normalizeTimeseriesRowCountsMap(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const id = Number(key);
+    const count = Number(value);
+    if (!Number.isFinite(id) || id <= 0 || !Number.isFinite(count) || count <= 0) {
+      continue;
+    }
+    out[String(Math.trunc(id))] = Math.trunc(count);
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 function summarizeAqilevelPartRows(rows) {
@@ -421,6 +443,7 @@ function toResumePartEntry(value, index) {
   const maxTimestampHourUtc = typeof value.max_timestamp_hour_utc === "string"
     ? value.max_timestamp_hour_utc
     : null;
+  const timeseriesRowCounts = normalizeTimeseriesRowCountsMap(value.timeseries_row_counts);
 
   return {
     key,
@@ -435,6 +458,7 @@ function toResumePartEntry(value, index) {
     max_observed_at: maxObservedAt,
     min_timestamp_hour_utc: minTimestampHourUtc,
     max_timestamp_hour_utc: maxTimestampHourUtc,
+    timeseries_row_counts: timeseriesRowCounts,
   };
 }
 
@@ -941,6 +965,35 @@ do update set
   );
 }
 
+function aggregateTimeseriesRowCounts(entriesWithCounts) {
+  // Sum any top-level/per-file `timeseries_row_counts` maps into one map.
+  // Returns null if no entry carries the field.
+  const out = {};
+  let sawAny = false;
+  for (const entry of entriesWithCounts) {
+    const map = entry && entry.timeseries_row_counts;
+    if (!map || typeof map !== "object") continue;
+    sawAny = true;
+    for (const [key, value] of Object.entries(map)) {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      out[key] = (out[key] || 0) + Math.trunc(n);
+    }
+  }
+  return sawAny ? out : null;
+}
+
+function stripTimeseriesCountsFromFileEntries(fileEntries) {
+  return (Array.isArray(fileEntries) ? fileEntries : []).map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return entry;
+    }
+    const { timeseries_row_counts: _ignored, ...rest } = entry;
+    return rest;
+  });
+}
+
+
 function createConnectorManifest({
   dayUtc,
   connectorId,
@@ -952,9 +1005,11 @@ function createConnectorManifest({
   writerGitSha,
   backedUpAtUtc,
 }) {
-  const parquetObjectKeys = fileEntries.map((entry) => entry.key);
-  const totalBytes = fileEntries.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const stats = statsFromFileEntries(fileEntries, sourceRowCount);
+  const manifestFileEntries = stripTimeseriesCountsFromFileEntries(fileEntries);
+  const parquetObjectKeys = manifestFileEntries.map((entry) => entry.key);
+  const totalBytes = manifestFileEntries.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const stats = statsFromFileEntries(manifestFileEntries, sourceRowCount);
+  const timeseriesRowCounts = aggregateTimeseriesRowCounts(fileEntries);
 
   return withManifestHash({
     day_utc: dayUtc,
@@ -966,13 +1021,14 @@ function createConnectorManifest({
     parquet_object_keys: parquetObjectKeys,
     file_count: fileEntries.length,
     total_bytes: totalBytes,
-    files: fileEntries,
+    files: manifestFileEntries,
     history_schema_name: HISTORY_SCHEMA_NAME,
     history_schema_version: HISTORY_SCHEMA_VERSION,
     columns: HISTORY_OBSERVATIONS_COLUMNS,
     writer_version: WRITER_VERSION,
     writer_git_sha: writerGitSha,
     ...stats,
+    timeseries_row_counts: timeseriesRowCounts,
     backed_up_at_utc: backedUpAtUtc,
   });
 }
@@ -982,7 +1038,7 @@ export function buildConnectorManifestForTest(args) {
 }
 
 function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, backedUpAtUtc }) {
-  const files = connectorManifests.flatMap((manifest) =>
+  const sourceFiles = connectorManifests.flatMap((manifest) =>
     (Array.isArray(manifest.files) ? manifest.files : []).map((entry) => ({
       connector_id: manifest.connector_id,
       key: entry.key,
@@ -993,13 +1049,18 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
       max_timeseries_id: entry.max_timeseries_id ?? null,
       min_observed_at: entry.min_observed_at ?? null,
       max_observed_at: entry.max_observed_at ?? null,
+      timeseries_row_counts: entry.timeseries_row_counts || null,
     }))
   );
+  const files = stripTimeseriesCountsFromFileEntries(sourceFiles);
 
   const parquetObjectKeys = uniqueSorted(files.map((entry) => entry.key));
   const totalRows = connectorManifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
   const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
   const connectorIds = connectorManifests.map((manifest) => Number(manifest.connector_id));
+  const timeseriesRowCounts =
+    aggregateTimeseriesRowCounts(connectorManifests)
+    ?? aggregateTimeseriesRowCounts(sourceFiles);
 
   const minObservedAt = connectorManifests.reduce(
     (current, manifest) => minIso(current, manifest.min_observed_at || null),
@@ -1024,6 +1085,7 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
     file_count: files.length,
     total_bytes: totalBytes,
     files,
+    timeseries_row_counts: timeseriesRowCounts,
     connector_manifests: connectorManifests.map((manifest) => ({
       connector_id: manifest.connector_id,
       manifest_key: manifest.manifest_key,
@@ -1315,6 +1377,7 @@ async function writeCommittedPartAndCheckpoint({
     max_timeseries_id: partSummary.max_timeseries_id,
     min_observed_at: partSummary.min_observed_at,
     max_observed_at: partSummary.max_observed_at,
+    timeseries_row_counts: partSummary.timeseries_row_counts,
   };
   const nextParts = [...committedParts, partEntry];
   const nextObservedRows = observedRows + BigInt(rows.length);

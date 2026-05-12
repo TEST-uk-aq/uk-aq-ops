@@ -4,7 +4,58 @@ import {
   r2GetObject,
   r2ListAllCommonPrefixes,
   r2PutObject,
+  sha256Hex,
 } from "./r2_sigv4.mjs";
+
+// Phase 6.5 Pass A backfill (Path 2): parquet-wasm + arrow read paths.
+// Imported lazily on first use so the module's cold-start cost stays low
+// when the backfill flag is not set.
+let _parquetWasm = null;
+let _arrow = null;
+let _parquetWasmInit = false;
+async function ensureParquetTooling() {
+  if (_parquetWasm && _arrow && _parquetWasmInit) return;
+  if (!_parquetWasm) {
+    _parquetWasm = await import("parquet-wasm/esm");
+  }
+  if (!_arrow) {
+    _arrow = await import("apache-arrow");
+  }
+  if (!_parquetWasmInit) {
+    // The wasm module needs to be initialised once before use. parquet-wasm
+    // exposes a default initialiser; some builds also accept a wasm path.
+    if (typeof _parquetWasm.default === "function") {
+      let initError = null;
+      try {
+        const path = await import("node:path");
+        const url = await import("node:url");
+        const moduleDir = path.dirname(url.fileURLToPath(import.meta.url));
+        const wasmPath = path.resolve(
+          moduleDir,
+          "../../node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm",
+        );
+        const fs = await import("node:fs/promises");
+        const bytes = await fs.readFile(wasmPath);
+        await _parquetWasm.default({ module_or_path: bytes });
+      } catch (error) {
+        initError = error;
+        // Fall back to default init (built-in resolution).
+        try {
+          await _parquetWasm.default();
+        } catch (fallbackError) {
+          const primaryMessage = initError instanceof Error ? initError.message : String(initError);
+          const fallbackMessage = fallbackError instanceof Error
+            ? fallbackError.message
+            : String(fallbackError);
+          throw new Error(
+            `Failed to initialize parquet-wasm (bytes init: ${primaryMessage}; default init: ${fallbackMessage})`,
+          );
+        }
+      }
+    }
+    _parquetWasmInit = true;
+  }
+}
 
 export const DEFAULT_R2_HISTORY_INDEX_PREFIX = "history/_index";
 export const DEFAULT_R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations";
@@ -380,6 +431,138 @@ function normalizeObservationTimeseriesIndexFileEntry(entry) {
   };
 }
 
+
+// Phase 6.5 Pass A: normalise the per-file {ts_id: count} map.
+// Returns null if absent / unparseable so downstream code can detect
+// "old writer" manifests.
+function normalizeTimeseriesRowCounts(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const id = parsePositiveId(key);
+    const n = parseNonNegativeInt(value);
+    if (id && n !== null && n > 0) {
+      out[String(id)] = n;
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+
+function aggregateTimeseriesRowCountsFromFiles(files) {
+  const out = {};
+  let sawAny = false;
+  for (const file of files) {
+    const map = file && file.timeseries_row_counts;
+    if (!map || typeof map !== "object") continue;
+    sawAny = true;
+    for (const [key, value] of Object.entries(map)) {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      out[key] = (out[key] || 0) + Math.trunc(n);
+    }
+  }
+  return sawAny ? out : null;
+}
+
+
+// Phase 6.5 Pass A backfill (Path 2): read a single parquet from R2 and
+// return per-timeseries row counts. The parquet schema is
+// `connector_id, timeseries_id, observed_at, value` (see phase_b
+// `rowsToParquetBuffer`); we only need the timeseries_id column.
+async function readParquetTimeseriesRowCounts({ r2, key }) {
+  await ensureParquetTooling();
+  const obj = await r2GetObject({ r2, key });
+  const bytes = obj.body instanceof Buffer ? obj.body : Buffer.from(obj.body);
+  const wasmTable = _parquetWasm.readParquet(bytes);
+  const ipcBytes = wasmTable.intoIPCStream();
+  const table = _arrow.tableFromIPC(ipcBytes);
+  const tsVector = table.getChild("timeseries_id");
+  const counts = {};
+  if (!tsVector) return counts;
+  for (const value of tsVector) {
+    if (value === null || value === undefined) continue;
+    const id = Number(value);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    const key = String(Math.trunc(id));
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+
+// Phase 6.5 Pass A backfill: aggregate per-file counts across all parquet
+// files referenced by a connector manifest. Returns null on outright
+// failure so callers can preserve the existing manifest unchanged.
+async function computeConnectorManifestTimeseriesCounts({
+  r2,
+  connectorManifest,
+  warningsSink,
+  dayUtc,
+  connectorId,
+}) {
+  const files = Array.isArray(connectorManifest?.files) ? connectorManifest.files : [];
+  if (!files.length) return {};
+  const out = {};
+  for (const entry of files) {
+    const key = typeof entry?.key === "string" ? entry.key : null;
+    if (!key) continue;
+    try {
+      const fileCounts = await readParquetTimeseriesRowCounts({ r2, key });
+      for (const [tsId, n] of Object.entries(fileCounts)) {
+        out[tsId] = (out[tsId] || 0) + n;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warningsSink?.push?.(
+        `Skipped parquet row-count read day=${dayUtc} connector=${connectorId} key=${key}: ${message}`,
+      );
+    }
+  }
+  return out;
+}
+
+
+// Phase 6.5 Pass A backfill: patch an existing connector manifest in
+// place to add `timeseries_row_counts`, recompute manifest_hash, and
+// re-upload. Idempotent: if the field is already populated, no-op.
+async function maybePatchConnectorManifestWithCounts({
+  r2,
+  manifestKey,
+  connectorManifest,
+  warningsSink,
+  dayUtc,
+  connectorId,
+}) {
+  if (normalizeTimeseriesRowCounts(connectorManifest?.timeseries_row_counts)) {
+    return connectorManifest;
+  }
+  if (!connectorManifest || typeof connectorManifest !== "object") {
+    return connectorManifest;
+  }
+  const counts = await computeConnectorManifestTimeseriesCounts({
+    r2, connectorManifest, warningsSink, dayUtc, connectorId,
+  });
+  if (!counts || Object.keys(counts).length === 0) {
+    return connectorManifest;
+  }
+  const { manifest_hash: _oldHash, ...payloadWithoutHash } = connectorManifest;
+  const patchedWithoutHash = {
+    ...payloadWithoutHash,
+    timeseries_row_counts: counts,
+  };
+  const newHash = sha256Hex(JSON.stringify(patchedWithoutHash));
+  const patched = { ...patchedWithoutHash, manifest_hash: newHash };
+  await r2PutObject({
+    r2,
+    key: manifestKey,
+    body: `${JSON.stringify(patched, null, 2)}\n`,
+    content_type: "application/json; charset=utf-8",
+  });
+  return patched;
+}
+
+
 function buildObservationTimeseriesConnectorIndexPayload({
   dayUtc,
   connectorId,
@@ -419,6 +602,14 @@ function buildObservationTimeseriesConnectorIndexPayload({
 
   const sourceRowCount = parseNonNegativeInt(connectorManifest?.source_row_count)
     ?? files.reduce((sum, file) => sum + file.row_count, 0);
+  // Prefer the manifest's pre-aggregated map. For backward compatibility
+  // with older manifests that only had per-file maps, fall back to
+  // summing `connectorManifest.files[*].timeseries_row_counts`.
+  const timeseriesRowCounts =
+    normalizeTimeseriesRowCounts(connectorManifest?.timeseries_row_counts)
+    ?? aggregateTimeseriesRowCountsFromFiles(
+      Array.isArray(connectorManifest?.files) ? connectorManifest.files : [],
+    );
 
   return {
     schema_version: OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION,
@@ -436,6 +627,7 @@ function buildObservationTimeseriesConnectorIndexPayload({
         ? connectorManifest.manifest_hash.trim()
         : null,
     source_row_count: sourceRowCount,
+    timeseries_row_counts: timeseriesRowCounts,
     file_count: files.length,
     indexed_file_count: indexedFileCount,
     index_coverage: indexedFileCount === files.length ? "complete" : "partial",
@@ -884,6 +1076,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
   generatedAt = new Date().toISOString(),
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   maxKeys = DEFAULT_MAX_KEYS,
+  computeMissingTimeseriesCounts = false,
 }) {
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for R2 observations timeseries index rebuild");
@@ -930,7 +1123,17 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
         fetchConcurrency,
         async (target) => {
           try {
-            const connectorManifestObject = await fetchJsonObjectFromR2(r2, target.manifest_key);
+            let connectorManifestObject = await fetchJsonObjectFromR2(r2, target.manifest_key);
+            if (computeMissingTimeseriesCounts) {
+              connectorManifestObject = await maybePatchConnectorManifestWithCounts({
+                r2,
+                manifestKey: target.manifest_key,
+                connectorManifest: connectorManifestObject,
+                warningsSink: warnings,
+                dayUtc,
+                connectorId: target.connector_id,
+              });
+            }
             const payload = buildObservationTimeseriesConnectorIndexPayload({
               dayUtc,
               connectorId: target.connector_id,
@@ -1233,6 +1436,7 @@ export async function rebuildR2HistoryIndexes({
   generatedAt = new Date().toISOString(),
   fetchConcurrency,
   maxKeys,
+  computeMissingTimeseriesCounts = false,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
@@ -1277,6 +1481,7 @@ export async function rebuildR2HistoryIndexes({
         generatedAt,
         fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
         maxKeys: maxKeys || config.max_keys,
+        computeMissingTimeseriesCounts,
       });
     }
     if (domain === "aqilevels") {

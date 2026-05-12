@@ -15,16 +15,19 @@ in Phases 5/4/7.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import gzip
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -174,6 +177,21 @@ CREATE INDEX IF NOT EXISTS idx_lookup_station
   ON source_station_timeseries_lookup(station_id);
 CREATE INDEX IF NOT EXISTS idx_lookup_source_loc
   ON source_station_timeseries_lookup(source_key, source_location_id);
+
+-- Phase 6.5 Pass A: per-(source_file, timeseries) row counts derived from
+-- the upstream archive file at ingest time. Recorded only when we download
+-- (first_seen / changed / reappeared); unchanged metadata reuses the
+-- previously stored values since the source bytes haven't changed.
+CREATE TABLE IF NOT EXISTS source_file_timeseries_counts (
+  source_file_key TEXT NOT NULL,
+  timeseries_id   INTEGER NOT NULL,
+  row_count       INTEGER NOT NULL,
+  counted_at_utc  TEXT NOT NULL,
+  PRIMARY KEY (source_file_key, timeseries_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sftc_timeseries
+  ON source_file_timeseries_counts(timeseries_id);
 
 CREATE TABLE IF NOT EXISTS source_file_state (
   source_file_key TEXT PRIMARY KEY,
@@ -810,14 +828,99 @@ OPENAQ_REMOTE_SCHEME = "s3"
 OPENAQ_HTTP_TIMEOUT_SECONDS = 30
 
 
+DEFAULT_CONCURRENCY = 8
+
+
+# Thread-local SQLite connection pool. ThreadPoolExecutor reuses worker
+# threads across tasks; each worker lazily opens its own sqlite3 connection
+# the first time it's used. SQLite WAL mode handles concurrent readers and
+# serializes writers natively, so no application-level lock is required.
+_THREAD_DB = threading.local()
+
+
+def _worker_db_conn(db_path: str) -> sqlite3.Connection:
+    conn = getattr(_THREAD_DB, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(db_path, timeout=60)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        _THREAD_DB.conn = conn
+    return conn
+
+
+def _copy_db_to_dropbox(
+    env: dict[str, str],
+    conn: sqlite3.Connection,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Copy the working SQLite DB to UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH.
+
+    Runs a `wal_checkpoint(TRUNCATE)` to absorb the WAL into the main file
+    first, then atomically replaces the destination via a sibling `.tmp`.
+    Safe to call with the connection still open (no writes are in flight
+    by this point in the run).
+
+    Returns {"status": "ok"|"skipped"|"error", "src", "dst", "bytes", "error"}.
+    """
+    result: dict[str, Any] = {
+        "status": "skipped",
+        "src": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+        "dst": os.environ.get("UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH"),
+        "bytes": 0,
+        "error": None,
+    }
+    dst_str = result["dst"]
+    if not dst_str:
+        result["error"] = "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH not set"
+        log.info("dropbox db copy skipped: %s", result["error"])
+        return result
+
+    src_path = Path(result["src"])
+    if not src_path.is_file():
+        result["status"] = "error"
+        result["error"] = f"source DB not found: {src_path}"
+        log.warning("dropbox db copy: %s", result["error"])
+        return result
+
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as exc:
+        log.warning("dropbox db copy: wal_checkpoint failed: %s", exc)
+
+    dst_path = Path(dst_str)
+    tmp_path = dst_path.with_name(dst_path.name + ".tmp")
+    try:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        if tmp_path.exists():
+            tmp_path.unlink()
+        shutil.copy2(src_path, tmp_path)
+        os.replace(tmp_path, dst_path)
+        result["status"] = "ok"
+        result["bytes"] = dst_path.stat().st_size
+        log.info(
+            "dropbox db copied: %s -> %s (%s bytes)",
+            src_path, dst_path, result["bytes"],
+        )
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        log.warning("dropbox db copy failed: %s", exc)
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+    return result
+
+
 class LimitTracker:
     """Soft per-run limits: downloaded bytes and runtime minutes.
 
-    The OpenAQ loop checks `should_stop()` before initiating each HEAD/GET.
-    When a limit trips, the current file is allowed to finish — the loop
-    exits cleanly on the next iteration and the run records status
-    `stopped_limit`. Limit checks are advisory; nothing actually aborts an
-    in-flight download mid-chunk.
+    Thread-safe. The adapter loops check `should_stop()` before submitting a
+    new task and again inside each worker before issuing the request. When a
+    limit trips, no new tasks are scheduled and in-flight tasks complete
+    naturally; the run records status `stopped_limit`. Limit checks are
+    advisory — nothing aborts an in-flight download mid-chunk.
     """
 
     def __init__(
@@ -835,23 +938,26 @@ class LimitTracker:
         self.started_mono = started_mono
         self.bytes_downloaded = 0
         self.stopped_for: str | None = None  # "download_mb" | "runtime_minutes"
+        self._lock = threading.Lock()
 
     def add_bytes(self, n: int) -> None:
-        self.bytes_downloaded += int(n)
+        with self._lock:
+            self.bytes_downloaded += int(n)
 
     def should_stop(self) -> bool:
-        if self.stopped_for:
-            return True
-        if self.max_bytes is not None and self.bytes_downloaded >= self.max_bytes:
-            self.stopped_for = "download_mb"
-            return True
-        if (
-            self.max_seconds is not None
-            and (time.monotonic() - self.started_mono) >= self.max_seconds
-        ):
-            self.stopped_for = "runtime_minutes"
-            return True
-        return False
+        with self._lock:
+            if self.stopped_for:
+                return True
+            if self.max_bytes is not None and self.bytes_downloaded >= self.max_bytes:
+                self.stopped_for = "download_mb"
+                return True
+            if (
+                self.max_seconds is not None
+                and (time.monotonic() - self.started_mono) >= self.max_seconds
+            ):
+                self.stopped_for = "runtime_minutes"
+                return True
+            return False
 
 
 def _http_head(url: str, timeout: int = OPENAQ_HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
@@ -917,6 +1023,142 @@ def _sha256_uncompressed_gzip(path: Path, chunk_size: int = 65536) -> str:
                 break
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.5 Pass A — per-(source_file, timeseries) row count parsers.
+# These parse a freshly-downloaded source file once and return a mapping of
+# timeseries_id -> row_count. Caller persists into source_file_timeseries_counts.
+# ---------------------------------------------------------------------------
+
+# Sensor.Community CSV measurement columns -> the suffix appended to
+# timeseries_ref by uk-aq-ingest (see
+# scripts/sensorcommunity/sensorcommunity_backfill_timeseries_phenomena.py).
+SC_COLUMN_TO_REF_SUFFIX = {
+    "P1": ":pm10",
+    "P2": ":pm2.5",
+    "temperature": ":temperature",
+    "humidity": ":humidity",
+    "pressure": ":pressure",
+}
+
+
+def _openaq_parse_per_timeseries_counts(
+    csv_gz_path: Path,
+) -> dict[str, int]:
+    """OpenAQ CSV (gzipped). Each row carries a `sensors_id` column whose
+    value equals the corresponding `timeseries_ref` in the core snapshot.
+    Returns {timeseries_ref: row_count}."""
+    import csv
+    counts: dict[str, int] = {}
+    with gzip.open(csv_gz_path, "rt", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        sensor_col = None
+        for candidate in ("sensors_id", "sensor_id"):
+            if reader.fieldnames and candidate in reader.fieldnames:
+                sensor_col = candidate
+                break
+        if sensor_col is None:
+            return counts
+        for row in reader:
+            ref = (row.get(sensor_col) or "").strip()
+            if not ref:
+                continue
+            counts[ref] = counts.get(ref, 0) + 1
+    return counts
+
+
+def _sc_parse_per_timeseries_counts(
+    csv_path: Path,
+    sensor_id: str,
+) -> dict[str, int]:
+    """Sensor.Community CSV (plain, ';'-delimited). For each row, each known
+    measurement column contributes 1 to its mapped timeseries when the cell
+    is non-empty. The timeseries_ref is the sensor_id with the column's
+    pollutant suffix appended.
+
+    Returns {timeseries_ref: row_count}.
+    """
+    import csv
+    counts: dict[str, int] = {}
+    with csv_path.open("rt", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=";")
+        if not reader.fieldnames:
+            return counts
+        measurement_cols = [c for c in reader.fieldnames if c in SC_COLUMN_TO_REF_SUFFIX]
+        if not measurement_cols:
+            return counts
+        for row in reader:
+            for col in measurement_cols:
+                cell = row.get(col)
+                if cell is None:
+                    continue
+                cell_s = cell.strip() if isinstance(cell, str) else ""
+                if cell_s == "":
+                    continue
+                ref = f"{sensor_id}{SC_COLUMN_TO_REF_SUFFIX[col]}"
+                counts[ref] = counts.get(ref, 0) + 1
+    return counts
+
+
+def _resolve_ts_refs_to_ids(
+    conn: sqlite3.Connection,
+    source_key: str,
+    refs: Iterable[str],
+) -> dict[str, int]:
+    """Look up timeseries_id for a set of timeseries_refs scoped to the
+    connector that owns this source. Returns {ref: timeseries_id}; refs
+    with no matching row are absent (caller decides how to log)."""
+    refs_list = sorted({str(r) for r in refs if r})
+    if not refs_list:
+        return {}
+    connector_code = next(
+        (code for code, sk in SOURCE_KEY_BY_CONNECTOR_CODE.items() if sk == source_key),
+        None,
+    )
+    if connector_code is None:
+        return {}
+    placeholders = ",".join("?" for _ in refs_list)
+    out: dict[str, int] = {}
+    rows = conn.execute(
+        f"""
+        SELECT t.timeseries_ref, t.id
+        FROM core_timeseries_snapshot t
+        JOIN core_connectors_snapshot c ON c.id = t.connector_id
+        WHERE c.connector_code = ?
+          AND t.timeseries_ref IN ({placeholders})
+        """,
+        (connector_code, *refs_list),
+    ).fetchall()
+    for ref, ts_id in rows:
+        out[str(ref)] = int(ts_id)
+    return out
+
+
+def _record_source_file_timeseries_counts(
+    conn: sqlite3.Connection,
+    source_file_key: str,
+    counts_by_ts_id: dict[int, int],
+    now_iso: str,
+) -> None:
+    """Replace the (source_file_key, *) rows in source_file_timeseries_counts."""
+    conn.execute(
+        "DELETE FROM source_file_timeseries_counts WHERE source_file_key = ?",
+        (source_file_key,),
+    )
+    if not counts_by_ts_id:
+        return
+    conn.executemany(
+        """
+        INSERT INTO source_file_timeseries_counts
+          (source_file_key, timeseries_id, row_count, counted_at_utc)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (source_file_key, ts_id, count, now_iso)
+            for ts_id, count in sorted(counts_by_ts_id.items())
+        ],
+    )
 
 
 def _openaq_object_key(location_id: str, day: dt.date) -> str:
@@ -1143,6 +1385,45 @@ def _metadata_changed(prior: dict[str, Any], head: dict[str, Any]) -> bool:
     )
 
 
+def _check_one_openaq_file_threadsafe(
+    db_path: str,
+    env_name: str,
+    base_url: str,
+    location_id: str,
+    day: dt.date,
+    tmp_dir: Path,
+    cache_root: Path,
+    log: logging.Logger,
+    limits: LimitTracker | None = None,
+) -> dict[str, Any]:
+    """Worker entrypoint: opens a thread-local connection, calls the inner
+    function, commits, and enriches the result with location_id + day so the
+    main thread can correlate completions in any order."""
+    if limits is not None and limits.should_stop():
+        return {
+            "outcome": "stopped",
+            "location_id": location_id,
+            "day": day.isoformat(),
+            "downloaded_bytes": 0,
+            "event_id": None,
+            "event_type": None,
+            "timeseries_ids": [],
+        }
+    conn = _worker_db_conn(db_path)
+    try:
+        result = _check_one_openaq_file(
+            conn, env_name, base_url, location_id, day, tmp_dir, cache_root, log,
+        )
+    finally:
+        try:
+            conn.commit()
+        except sqlite3.Error:
+            pass
+    result["location_id"] = location_id
+    result["day"] = day.isoformat()
+    return result
+
+
 def _check_one_openaq_file(
     conn: sqlite3.Connection,
     env_name: str,
@@ -1153,20 +1434,7 @@ def _check_one_openaq_file(
     cache_root: Path,
     log: logging.Logger,
 ) -> dict[str, Any]:
-    """Run HEAD + (optional) download + hash for a single OpenAQ file.
-
-    Returns:
-      {
-        "outcome": one of "missing_first_seen" | "missing_disappeared"
-                   | "still_missing" | "first_seen" | "reappeared"
-                   | "unchanged_metadata" | "unchanged_content"
-                   | "changed" | "error",
-        "downloaded_bytes": int,
-        "event_id": int | None,
-        "event_type": str | None,
-        "timeseries_ids": list[int],
-      }
-    """
+    """Run HEAD + (optional) download + hash for a single OpenAQ file."""
     url = _openaq_url(base_url, location_id, day)
     sfk = _openaq_source_file_key(location_id, day)
     now_iso = fmt_iso(utc_now())
@@ -1327,6 +1595,32 @@ def _check_one_openaq_file(
         cache_path.unlink()
     shutil.move(str(tmp_path), str(cache_path))
 
+    # Phase 6.5 Pass A: parse the just-cached CSV once and record per-
+    # timeseries row counts. We do this before _insert_event so a single
+    # transaction (committed by the threadsafe wrapper) covers both.
+    try:
+        ref_counts = _openaq_parse_per_timeseries_counts(cache_path)
+        ref_to_id = _resolve_ts_refs_to_ids(conn, OPENAQ_SOURCE_KEY, ref_counts.keys())
+        counts_by_id: dict[int, int] = {}
+        unmatched: list[str] = []
+        for ref, n in ref_counts.items():
+            ts_id = ref_to_id.get(ref)
+            if ts_id is None:
+                unmatched.append(ref)
+                continue
+            counts_by_id[ts_id] = counts_by_id.get(ts_id, 0) + n
+        _record_source_file_timeseries_counts(conn, sfk, counts_by_id, now_iso)
+        if unmatched:
+            log.info(
+                "openaq counts: loc=%s day=%s %d ref(s) unmatched in core (e.g. %s)",
+                location_id, day.isoformat(), len(unmatched), unmatched[0],
+            )
+    except Exception as exc:
+        log.warning(
+            "openaq counts: parse failed loc=%s day=%s: %s",
+            location_id, day.isoformat(), exc,
+        )
+
     _upsert_state(
         conn, source_file_key=sfk, env_name=env_name, remote_url=url,
         location_id=location_id, day=day,
@@ -1434,12 +1728,17 @@ def run_narrow_backfill(
     day: dt.date,
     log: logging.Logger,
     timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
+    log_dir: Path | None = None,
+    log_label: str | None = None,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local_monthly.sh` for one (timeseries-ids, day).
 
     Returns a result dict suitable for recording on the source_file_events
     row: status in {ok, error, no_wrapper, no_env_file, no_timeseries_ids,
     spawn_error, timeout}, plus exit_code/duration/stdout_tail/stderr_tail/error.
+
+    When log_dir is set, full stdout+stderr is also written to a file under
+    that directory and the path is returned in `log_path`.
     """
     result: dict[str, Any] = {
         "status": None,
@@ -1449,6 +1748,7 @@ def run_narrow_backfill(
         "env_file_path": env_file_path,
         "stdout_tail": "",
         "stderr_tail": "",
+        "log_path": None,
         "error": None,
     }
     if not timeseries_ids:
@@ -1494,6 +1794,9 @@ def run_narrow_backfill(
         "backfill invoke wrapper=%s day=%s timeseries_ids=%s",
         wrapper_path, iso, sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
     )
+
+    stdout_text = ""
+    stderr_text = ""
     try:
         proc = subprocess.run(
             ["bash", wrapper_path],
@@ -1503,20 +1806,49 @@ def run_narrow_backfill(
             timeout=timeout_seconds,
             check=False,
         )
+        stdout_text = proc.stdout or ""
+        stderr_text = proc.stderr or ""
         result["exit_code"] = proc.returncode
-        result["stdout_tail"] = _tail_bytes(proc.stdout)
-        result["stderr_tail"] = _tail_bytes(proc.stderr)
         result["status"] = "ok" if proc.returncode == 0 else "error"
         if proc.returncode != 0:
             result["error"] = f"wrapper exit_code={proc.returncode}"
     except subprocess.TimeoutExpired as exc:
         result["status"] = "timeout"
         result["error"] = f"wrapper timed out after {timeout_seconds}s"
-        result["stdout_tail"] = _tail_bytes(exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, (bytes, bytearray)) else (exc.stdout or ""))
-        result["stderr_tail"] = _tail_bytes(exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, (bytes, bytearray)) else (exc.stderr or ""))
+        if isinstance(exc.stdout, (bytes, bytearray)):
+            stdout_text = exc.stdout.decode("utf-8", errors="replace")
+        else:
+            stdout_text = exc.stdout or ""
+        if isinstance(exc.stderr, (bytes, bytearray)):
+            stderr_text = exc.stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = exc.stderr or ""
     except OSError as exc:
         result["status"] = "spawn_error"
         result["error"] = f"spawn failed: {exc}"
+
+    result["stdout_tail"] = _tail_bytes(stdout_text)
+    result["stderr_tail"] = _tail_bytes(stderr_text)
+
+    if log_dir is not None and (stdout_text or stderr_text or result["status"]):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        label = log_label or f"day_{iso}"
+        log_path = log_dir / f"{label}.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as fh:
+                fh.write(f"# wrapper: {wrapper_path}\n")
+                fh.write(f"# env_file: {env_file_path}\n")
+                fh.write(f"# day: {iso}\n")
+                fh.write(f"# timeseries_ids: {sub_env['UK_AQ_BACKFILL_TIMESERIES_IDS']}\n")
+                fh.write(f"# exit_code: {result['exit_code']}\n")
+                fh.write(f"# status: {result['status']}\n")
+                fh.write("\n# === STDOUT ===\n")
+                fh.write(stdout_text)
+                fh.write("\n# === STDERR ===\n")
+                fh.write(stderr_text)
+            result["log_path"] = str(log_path)
+        except OSError as exc:
+            log.warning("backfill log_path write failed: %s", exc)
 
     result["duration_seconds"] = round(time.monotonic() - started, 3)
     log.info(
@@ -1531,13 +1863,18 @@ def _record_backfill_on_event(
     event_id: int,
     timeseries_ids: list[int],
     backfill: dict[str, Any],
+    batch_info: dict[str, Any] | None = None,
 ) -> None:
-    """Update the source_file_events row with backfill outcome columns."""
+    """Update the source_file_events row with backfill outcome columns.
+
+    `timeseries_ids` is the per-event subset (the IDs belonging to this
+    file's `source_location_id`). `batch_info`, when set, captures the
+    larger invocation context — total IDs in the batch and the count of
+    sibling files. Useful when multiple changed files share a day.
+    """
     ids_csv = ",".join(str(t) for t in timeseries_ids) if timeseries_ids else None
     status = backfill.get("status") or "unknown"
     triggered_flag = 1 if status in {"ok", "error", "timeout"} else 0
-    # Combine the run-level error with output tails into the notes column so
-    # we can audit without keeping a separate logfile per backfill.
     notes_parts: list[str] = []
     if backfill.get("error"):
         notes_parts.append(f"error={backfill['error']}")
@@ -1547,6 +1884,13 @@ def _record_backfill_on_event(
         notes_parts.append(f"exit_code={backfill['exit_code']}")
     if backfill.get("duration_seconds"):
         notes_parts.append(f"duration_s={backfill['duration_seconds']}")
+    if backfill.get("log_path"):
+        notes_parts.append(f"log={backfill['log_path']}")
+    if batch_info:
+        notes_parts.append(
+            f"batch: files={batch_info.get('files', 1)} "
+            f"total_timeseries_ids={batch_info.get('total_timeseries_ids', len(timeseries_ids))}"
+        )
     if backfill.get("stdout_tail"):
         notes_parts.append("stdout_tail:\n" + backfill["stdout_tail"])
     if backfill.get("stderr_tail"):
@@ -1580,6 +1924,8 @@ def check_openaq(
     run_backfill: bool,
     limits: LimitTracker,
     log: logging.Logger,
+    run_compact: str,
+    concurrency: int = DEFAULT_CONCURRENCY,
 ) -> dict[str, Any]:
     """Iterate distinct OpenAQ locations × days; run per-file workflow.
 
@@ -1651,73 +1997,727 @@ def check_openaq(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    for loc in locations:
-        if limits.should_stop():
-            break
-        for day in days:
+    db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
+    log.info("openaq: concurrency=%s", concurrency)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures: list[concurrent.futures.Future] = []
+        for loc in locations:
             if limits.should_stop():
                 break
+            for day in days:
+                if limits.should_stop():
+                    break
+                futures.append(ex.submit(
+                    _check_one_openaq_file_threadsafe,
+                    db_path, env_name, base_url, loc, day,
+                    tmp_dir, cache_root, log, limits,
+                ))
+
+        for fut in concurrent.futures.as_completed(futures):
             try:
-                result = _check_one_openaq_file(
-                    conn, env_name, base_url, loc, day, tmp_dir, cache_root, log,
-                )
-                conn.commit()
-                metrics["head_checked"] += 1
-                outcome = result["outcome"]
-                if outcome in {"missing_first_seen", "missing_disappeared", "still_missing"}:
-                    metrics["missing"] += 1
-                if outcome == "unchanged_content":
-                    metrics["downloaded"] += 1
-                    metrics["unchanged_after_download"] += 1
-                if outcome in {"changed", "first_seen", "reappeared"}:
-                    metrics["downloaded"] += 1
-                    metrics["changed"] += 1
-                    metrics["changed_files"].append({
-                        "location_id": loc,
-                        "day": day.isoformat(),
-                        "event_id": result["event_id"],
-                        "event_type": result["event_type"],
-                        "timeseries_ids": result["timeseries_ids"],
-                    })
-                    if run_backfill:
-                        cmd = _planned_backfill_command(env, result["timeseries_ids"], day)
-                        metrics["planned_backfills"].append(cmd)
-                        log.info("openaq planned backfill: %s", cmd)
-                        if not dry_run and result.get("event_id"):
-                            bf = run_narrow_backfill(
-                                wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
-                                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                                timeseries_ids=result["timeseries_ids"],
-                                day=day,
-                                log=log,
-                            )
-                            _record_backfill_on_event(
-                                conn, int(result["event_id"]),
-                                result["timeseries_ids"], bf,
-                            )
-                            conn.commit()
-                            metrics["backfills_attempted"] += 1
-                            if bf["status"] == "ok":
-                                metrics["backfills_ok"] += 1
-                            else:
-                                metrics["backfills_failed"] += 1
-                bytes_added = int(result.get("downloaded_bytes") or 0)
-                if bytes_added:
-                    metrics["downloaded_bytes"] += bytes_added
-                    limits.add_bytes(bytes_added)
+                result = fut.result()
             except Exception as exc:
-                conn.rollback()
                 metrics["errors"] += 1
-                log.warning(
-                    "openaq error loc=%s day=%s url=%s: %s",
-                    loc, day, _openaq_url(base_url, loc, day), exc,
-                )
+                log.warning("openaq worker raised: %s", exc)
+                continue
+            outcome = result.get("outcome")
+            if outcome == "stopped":
+                continue
+            metrics["head_checked"] += 1
+            if outcome in {"missing_first_seen", "missing_disappeared", "still_missing"}:
+                metrics["missing"] += 1
+            if outcome == "unchanged_content":
+                metrics["downloaded"] += 1
+                metrics["unchanged_after_download"] += 1
+            if outcome in {"changed", "first_seen", "reappeared"}:
+                metrics["downloaded"] += 1
+                metrics["changed"] += 1
+                metrics["changed_files"].append({
+                    "location_id": result["location_id"],
+                    "day": result["day"],
+                    "event_id": result["event_id"],
+                    "event_type": result["event_type"],
+                    "timeseries_ids": result["timeseries_ids"],
+                })
+                if run_backfill:
+                    day_obj = dt.date.fromisoformat(result["day"])
+                    cmd = _planned_backfill_command(env, result["timeseries_ids"], day_obj)
+                    metrics["planned_backfills"].append(cmd)
+                    log.info("openaq planned backfill: %s", cmd)
+            bytes_added = int(result.get("downloaded_bytes") or 0)
+            if bytes_added:
+                metrics["downloaded_bytes"] += bytes_added
+                limits.add_bytes(bytes_added)
+
+    # Sort for deterministic reports (completion order is non-deterministic).
+    metrics["changed_files"].sort(key=lambda e: (e["day"], e["location_id"]))
+    metrics["planned_backfills"].sort()
 
     if limits.should_stop():
         metrics["stopped_for"] = limits.stopped_for
         log.warning("openaq: stopped early due to limit=%s", limits.stopped_for)
 
+    # ---- Phase 4 Pass 2: batched backfill phase ----
+    # All HEAD/download work is complete. Group changed files by day, union
+    # the per-location timeseries IDs, and invoke the wrapper once per day.
+    if run_backfill and not dry_run and metrics["changed_files"]:
+        backfill_log_dir = (
+            Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
+        )
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for entry in metrics["changed_files"]:
+            by_day.setdefault(entry["day"], []).append(entry)
+        for day_iso in sorted(by_day):
+            if limits.should_stop():
+                log.warning(
+                    "backfill phase: stopping early (%s) — %s days skipped",
+                    limits.stopped_for,
+                    len([d for d in by_day if d > day_iso]),
+                )
+                break
+            group = by_day[day_iso]
+            union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
+            log.info(
+                "backfill batch day=%s files=%s total_timeseries_ids=%s",
+                day_iso, len(group), len(union_ids),
+            )
+            bf = run_narrow_backfill(
+                wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                timeseries_ids=union_ids,
+                day=dt.date.fromisoformat(day_iso),
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=f"day_{day_iso}",
+            )
+            for entry in group:
+                if entry.get("event_id"):
+                    _record_backfill_on_event(
+                        conn, int(entry["event_id"]),
+                        entry["timeseries_ids"], bf,
+                        batch_info={
+                            "files": len(group),
+                            "total_timeseries_ids": len(union_ids),
+                        },
+                    )
+            conn.commit()
+            metrics["backfills_attempted"] += 1
+            if bf["status"] == "ok":
+                metrics["backfills_ok"] += 1
+            else:
+                metrics["backfills_failed"] += 1
+
     log.info("openaq: done %s", {k: v for k, v in metrics.items() if k not in ("changed_files", "planned_backfills", "sample_urls")})
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Sensor.Community adapter
+# ---------------------------------------------------------------------------
+#
+# Archive layout (daily):
+#   https://archive.sensor.community/<YYYY-MM-DD>/<YYYY-MM-DD>_<sensor_type>_sensor_<sensor_id>.csv
+#
+# Unlike OpenAQ:
+# - Files are plain CSV (no gzip). sha256_downloaded == sha256_uncompressed.
+# - Filename includes the sensor_type, which we don't carry per-station in
+#   the core snapshot. We discover filenames by fetching the day's directory
+#   index (one HTTP request per day) and parsing the HTML for sensor_id ->
+#   filename. Sensors absent from the index are recorded as missing without
+#   issuing a per-file HEAD.
+# - Index parse uses a simple regex over the standard nginx-style listing.
+
+SC_SOURCE_KEY = "sensor-community"
+SC_DEFAULT_BASE_URL = "https://archive.sensor.community"
+SC_REMOTE_SCHEME = "https"
+SC_INDEX_FILENAME_RE = re.compile(
+    r'href="((\d{4}-\d{2}-\d{2})_([A-Za-z0-9_]+)_sensor_(\d+)\.csv)"'
+)
+SC_HTTP_TIMEOUT_SECONDS = 60
+
+
+def _sc_day_url(base_url: str, day: dt.date) -> str:
+    return f"{base_url.rstrip('/')}/{day.isoformat()}/"
+
+
+def _sc_object_url(base_url: str, day: dt.date, filename: str) -> str:
+    return f"{base_url.rstrip('/')}/{day.isoformat()}/{filename}"
+
+
+def _sc_source_file_key(sensor_id: str, day: dt.date) -> str:
+    return f"sensor-community:{sensor_id}:{day.isoformat()}"
+
+
+def _sc_cache_path(cache_root: Path, day: dt.date, filename: str) -> Path:
+    return cache_root / day.isoformat() / filename
+
+
+def _sc_distinct_sensor_ids(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT source_location_id
+        FROM source_station_timeseries_lookup
+        WHERE source_key = ?
+        ORDER BY source_location_id
+        """,
+        (SC_SOURCE_KEY,),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _sc_lookup_timeseries_for_sensor(
+    conn: sqlite3.Connection, sensor_id: str
+) -> list[int]:
+    rows = conn.execute(
+        """
+        SELECT timeseries_id
+        FROM source_station_timeseries_lookup
+        WHERE source_key = ? AND source_location_id = ?
+        ORDER BY timeseries_id
+        """,
+        (SC_SOURCE_KEY, sensor_id),
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def _sc_fetch_day_index(
+    base_url: str, day: dt.date, timeout: int = SC_HTTP_TIMEOUT_SECONDS
+) -> dict[str, str]:
+    """GET the day's directory listing and parse it for sensor files.
+
+    Returns {sensor_id: filename}. If multiple files match a sensor_id (rare),
+    keeps the first. Raises on network error or non-200.
+    """
+    url = _sc_day_url(base_url, day)
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"GET {url} returned {resp.status}")
+        body = resp.read()
+    text = body.decode("utf-8", errors="replace")
+    out: dict[str, str] = {}
+    for match in SC_INDEX_FILENAME_RE.finditer(text):
+        filename = match.group(1)
+        sensor_id = match.group(4)
+        out.setdefault(sensor_id, filename)
+    return out
+
+
+def _sha256_of_csv(path: Path) -> str:
+    digest, _ = sha256_of_file(path)
+    return digest
+
+
+def _check_one_sc_file_threadsafe(
+    db_path: str,
+    env_name: str,
+    base_url: str,
+    sensor_id: str,
+    day: dt.date,
+    filename_in_index: str | None,
+    tmp_dir: Path,
+    cache_root: Path,
+    log: logging.Logger,
+    limits: LimitTracker | None = None,
+) -> dict[str, Any]:
+    """Worker entrypoint mirroring `_check_one_openaq_file_threadsafe`."""
+    if limits is not None and limits.should_stop():
+        return {
+            "outcome": "stopped",
+            "sensor_id": sensor_id,
+            "day": day.isoformat(),
+            "downloaded_bytes": 0,
+            "event_id": None,
+            "event_type": None,
+            "timeseries_ids": [],
+        }
+    conn = _worker_db_conn(db_path)
+    try:
+        result = _check_one_sc_file(
+            conn, env_name, base_url, sensor_id, day, filename_in_index,
+            tmp_dir, cache_root, log,
+        )
+    finally:
+        try:
+            conn.commit()
+        except sqlite3.Error:
+            pass
+    result["sensor_id"] = sensor_id
+    result["day"] = day.isoformat()
+    return result
+
+
+def _check_one_sc_file(
+    conn: sqlite3.Connection,
+    env_name: str,
+    base_url: str,
+    sensor_id: str,
+    day: dt.date,
+    filename_in_index: str | None,
+    tmp_dir: Path,
+    cache_root: Path,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Per-sensor/day workflow. Mirrors `_check_one_openaq_file` but:
+    - skips HEAD entirely when not in index (avoids issuing per-file 404s),
+    - treats the CSV as canonical bytes (sha256_downloaded == sha256_uncompressed).
+    """
+    sfk = _sc_source_file_key(sensor_id, day)
+    now_iso = fmt_iso(utc_now())
+    prior = _fetch_prior_state(conn, sfk)
+    timeseries_ids = _sc_lookup_timeseries_for_sensor(conn, sensor_id)
+
+    # No file in index for this day = missing.
+    if filename_in_index is None:
+        empty_head = {"status": 404, "etag": None, "content_length": None, "last_modified": None}
+        # Reuse the OpenAQ path-encoded URL as a stable URL even when absent.
+        # We don't know the filename, so record the day URL.
+        url_for_state = _sc_day_url(base_url, day)
+        if prior is None:
+            _upsert_state(
+                conn, source_file_key=sfk, env_name=env_name, remote_url=url_for_state,
+                location_id=sensor_id, day=day,
+                head={"etag": None, "content_length": None, "last_modified": None},
+                exists_remote=False,
+                sha256_downloaded=None, sha256_uncompressed=None,
+                local_cached_path=None,
+                now_iso=now_iso, last_changed_at=None,
+                last_status="missing",
+            )
+            # Override remote_scheme since _upsert_state writes the OpenAQ default
+            conn.execute(
+                "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
+                (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
+            )
+            event_id = _insert_event(
+                conn, event_type="first_seen_missing", env_name=env_name,
+                source_file_key=sfk, remote_url=url_for_state,
+                location_id=sensor_id, day=day,
+                prior=None, head=empty_head,
+                new_sha_downloaded=None, new_sha_uncompressed=None,
+                downloaded_bytes=0, hash_runtime_ms=0, now_iso=now_iso,
+            )
+            conn.execute(
+                "UPDATE source_file_events SET source_key=? WHERE id=?",
+                (SC_SOURCE_KEY, event_id),
+            )
+            return {
+                "outcome": "missing_first_seen", "downloaded_bytes": 0,
+                "event_id": event_id, "event_type": "first_seen_missing",
+                "timeseries_ids": timeseries_ids,
+            }
+        if prior["exists_remote"] == 1:
+            _upsert_state(
+                conn, source_file_key=sfk, env_name=env_name, remote_url=url_for_state,
+                location_id=sensor_id, day=day,
+                head={"etag": None, "content_length": None, "last_modified": None},
+                exists_remote=False,
+                sha256_downloaded=None, sha256_uncompressed=None,
+                local_cached_path=None,
+                now_iso=now_iso, last_changed_at=now_iso,
+                last_status="missing",
+            )
+            conn.execute(
+                "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
+                (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
+            )
+            event_id = _insert_event(
+                conn, event_type="disappeared", env_name=env_name,
+                source_file_key=sfk, remote_url=url_for_state,
+                location_id=sensor_id, day=day,
+                prior=prior, head=empty_head,
+                new_sha_downloaded=None, new_sha_uncompressed=None,
+                downloaded_bytes=0, hash_runtime_ms=0, now_iso=now_iso,
+            )
+            conn.execute(
+                "UPDATE source_file_events SET source_key=? WHERE id=?",
+                (SC_SOURCE_KEY, event_id),
+            )
+            return {
+                "outcome": "missing_disappeared", "downloaded_bytes": 0,
+                "event_id": event_id, "event_type": "disappeared",
+                "timeseries_ids": timeseries_ids,
+            }
+        # already missing — just bump last_checked
+        _upsert_state(
+            conn, source_file_key=sfk, env_name=env_name, remote_url=url_for_state,
+            location_id=sensor_id, day=day,
+            head={"etag": None, "content_length": None, "last_modified": None},
+            exists_remote=False,
+            sha256_downloaded=None, sha256_uncompressed=None,
+            local_cached_path=None,
+            now_iso=now_iso, last_changed_at=None,
+            last_status="missing",
+        )
+        conn.execute(
+            "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
+            (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
+        )
+        return {
+            "outcome": "still_missing", "downloaded_bytes": 0,
+            "event_id": None, "event_type": None,
+            "timeseries_ids": timeseries_ids,
+        }
+
+    # File present in index: HEAD + maybe download.
+    url = _sc_object_url(base_url, day, filename_in_index)
+    head = _http_head(url)
+    if head["status"] != 200:
+        # Index said it exists but HEAD disagreed — record as error-class missing.
+        raise RuntimeError(f"HEAD {url} returned {head['status']} despite index listing")
+
+    is_first_seen = prior is None
+    was_missing = prior is not None and prior["exists_remote"] == 0
+    needs_download = is_first_seen or was_missing or _metadata_changed(prior, head)
+
+    if not needs_download:
+        _upsert_state(
+            conn, source_file_key=sfk, env_name=env_name, remote_url=url,
+            location_id=sensor_id, day=day,
+            head=head, exists_remote=True,
+            sha256_downloaded=prior["sha256_downloaded"],
+            sha256_uncompressed=prior["sha256_uncompressed"],
+            local_cached_path=None,
+            now_iso=now_iso, last_changed_at=None,
+            last_status="unchanged",
+        )
+        conn.execute(
+            "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
+            (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
+        )
+        return {
+            "outcome": "unchanged_metadata", "downloaded_bytes": 0,
+            "event_id": None, "event_type": None,
+            "timeseries_ids": timeseries_ids,
+        }
+
+    tmp_path = tmp_dir / f"sc-{sensor_id}-{day.strftime('%Y%m%d')}.csv"
+    if tmp_path.exists():
+        tmp_path.unlink()
+    bytes_downloaded = _http_get_to_file(url, tmp_path)
+    hash_start = time.monotonic()
+    sha_csv = _sha256_of_csv(tmp_path)
+    hash_runtime_ms = int((time.monotonic() - hash_start) * 1000)
+
+    content_changed = (
+        prior is None
+        or prior.get("sha256_uncompressed") is None
+        or prior["sha256_uncompressed"] != sha_csv
+    )
+    state_changed = is_first_seen or was_missing or content_changed
+
+    if not state_changed:
+        tmp_path.unlink(missing_ok=True)
+        _upsert_state(
+            conn, source_file_key=sfk, env_name=env_name, remote_url=url,
+            location_id=sensor_id, day=day,
+            head=head, exists_remote=True,
+            sha256_downloaded=sha_csv,
+            sha256_uncompressed=sha_csv,
+            local_cached_path=None,
+            now_iso=now_iso, last_changed_at=None,
+            last_status="unchanged",
+        )
+        conn.execute(
+            "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
+            (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
+        )
+        return {
+            "outcome": "unchanged_content", "downloaded_bytes": bytes_downloaded,
+            "event_id": None, "event_type": None,
+            "timeseries_ids": timeseries_ids,
+        }
+
+    event_type = (
+        "first_seen" if is_first_seen
+        else "reappeared" if was_missing
+        else "changed"
+    )
+    cache_path = _sc_cache_path(cache_root, day, filename_in_index)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if cache_path.exists():
+        cache_path.unlink()
+    shutil.move(str(tmp_path), str(cache_path))
+
+    # Phase 6.5 Pass A: per-timeseries row counts. Each non-empty
+    # measurement cell contributes 1 to the timeseries whose timeseries_ref
+    # is sensor_id + ":<pollutant>".
+    try:
+        ref_counts = _sc_parse_per_timeseries_counts(cache_path, sensor_id)
+        ref_to_id = _resolve_ts_refs_to_ids(conn, SC_SOURCE_KEY, ref_counts.keys())
+        counts_by_id: dict[int, int] = {}
+        unmatched: list[str] = []
+        for ref, n in ref_counts.items():
+            ts_id = ref_to_id.get(ref)
+            if ts_id is None:
+                unmatched.append(ref)
+                continue
+            counts_by_id[ts_id] = counts_by_id.get(ts_id, 0) + n
+        _record_source_file_timeseries_counts(conn, sfk, counts_by_id, now_iso)
+        if unmatched:
+            log.info(
+                "sensor-community counts: sensor=%s day=%s %d ref(s) unmatched in core (e.g. %s)",
+                sensor_id, day.isoformat(), len(unmatched), unmatched[0],
+            )
+    except Exception as exc:
+        log.warning(
+            "sensor-community counts: parse failed sensor=%s day=%s: %s",
+            sensor_id, day.isoformat(), exc,
+        )
+
+    _upsert_state(
+        conn, source_file_key=sfk, env_name=env_name, remote_url=url,
+        location_id=sensor_id, day=day,
+        head=head, exists_remote=True,
+        sha256_downloaded=sha_csv,
+        sha256_uncompressed=sha_csv,
+        local_cached_path=str(cache_path),
+        now_iso=now_iso, last_changed_at=now_iso,
+        last_status=event_type,
+    )
+    conn.execute(
+        "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
+        (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
+    )
+    event_id = _insert_event(
+        conn, event_type=event_type, env_name=env_name,
+        source_file_key=sfk, remote_url=url,
+        location_id=sensor_id, day=day,
+        prior=prior, head=head,
+        new_sha_downloaded=sha_csv, new_sha_uncompressed=sha_csv,
+        downloaded_bytes=bytes_downloaded, hash_runtime_ms=hash_runtime_ms,
+        now_iso=now_iso,
+        notes=("content unchanged from prior version (state-only transition)"
+               if not content_changed else None),
+    )
+    conn.execute(
+        "UPDATE source_file_events SET source_key=? WHERE id=?",
+        (SC_SOURCE_KEY, event_id),
+    )
+    log.info(
+        "sensor-community %s sensor=%s day=%s sha=%s..%s bytes=%s",
+        event_type, sensor_id, day.isoformat(),
+        sha_csv[:8], sha_csv[-4:], bytes_downloaded,
+    )
+    return {
+        "outcome": event_type,
+        "downloaded_bytes": bytes_downloaded,
+        "event_id": event_id, "event_type": event_type,
+        "timeseries_ids": timeseries_ids,
+    }
+
+
+def check_sensor_community(
+    conn: sqlite3.Connection,
+    env_name: str,
+    env: dict[str, str],
+    from_day: str | None,
+    to_day: str | None,
+    *,
+    dry_run: bool,
+    run_backfill: bool,
+    limits: LimitTracker,
+    log: logging.Logger,
+    run_compact: str,
+    concurrency: int = DEFAULT_CONCURRENCY,
+) -> dict[str, Any]:
+    """Iterate days × distinct SC sensor IDs from the lookup; one index fetch per day."""
+    metrics: dict[str, Any] = {
+        "ran": False,
+        "stopped_for": None,
+        "sensors": 0,
+        "days": 0,
+        "index_fetched": 0,
+        "head_checked": 0,
+        "downloaded": 0,
+        "changed": 0,
+        "unchanged_after_download": 0,
+        "missing": 0,
+        "errors": 0,
+        "downloaded_bytes": 0,
+        "changed_files": [],
+        "planned_backfills": [],
+        "backfills_attempted": 0,
+        "backfills_ok": 0,
+        "backfills_failed": 0,
+        "skipped_reason": None,
+    }
+
+    base_url = os.environ.get(
+        "UK_AQ_HISTORY_INTEGRITY_SENSOR_COMMUNITY_BASE_URL", SC_DEFAULT_BASE_URL
+    )
+
+    if not from_day or not to_day:
+        metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
+        log.warning("sensor-community: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
+    sensors = _sc_distinct_sensor_ids(conn)
+    if not sensors:
+        metrics["skipped_reason"] = "no sensor-community sensors in source_station_timeseries_lookup"
+        log.warning("sensor-community: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
+    days = _date_range_inclusive(from_day, to_day)
+    if not days:
+        metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
+        log.warning("sensor-community: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
+    metrics["sensors"] = len(sensors)
+    metrics["days"] = len(days)
+    metrics["ran"] = True
+    log.info(
+        "sensor-community: starting sensors=%s days=%s base_url=%s%s",
+        len(sensors), len(days), base_url,
+        " (dry-run)" if dry_run else "",
+    )
+
+    if dry_run:
+        sample = [_sc_day_url(base_url, d) for d in days[:3]]
+        metrics["sample_urls"] = sample
+        log.info(
+            "sensor-community dry-run: would fetch %s indexes; sample=%s",
+            len(days), sample,
+        )
+        return metrics
+
+    tmp_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
+    cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / "sensor-community"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
+    log.info("sensor-community: concurrency=%s", concurrency)
+
+    # Phase A (sequential, per day): fetch the day's index. ~18 fetches for
+    # a daily window — small enough that parallelism here isn't worth it.
+    work_items: list[tuple[str, dt.date, str | None]] = []
+    for day in days:
+        if limits.should_stop():
+            break
+        try:
+            index = _sc_fetch_day_index(base_url, day)
+            metrics["index_fetched"] += 1
+        except Exception as exc:
+            metrics["errors"] += 1
+            log.warning(
+                "sensor-community: index fetch failed for day=%s: %s", day, exc,
+            )
+            continue
+        for sensor_id in sensors:
+            work_items.append((sensor_id, day, index.get(sensor_id)))
+
+    # Phase B (parallel, per (sensor, day)): HEAD/GET/hash via thread pool.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures: list[concurrent.futures.Future] = []
+        for sensor_id, day, filename in work_items:
+            if limits.should_stop():
+                break
+            futures.append(ex.submit(
+                _check_one_sc_file_threadsafe,
+                db_path, env_name, base_url, sensor_id, day, filename,
+                tmp_dir, cache_root, log, limits,
+            ))
+
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                metrics["errors"] += 1
+                log.warning("sensor-community worker raised: %s", exc)
+                continue
+            outcome = result.get("outcome")
+            if outcome == "stopped":
+                continue
+            metrics["head_checked"] += 1
+            if outcome in {"missing_first_seen", "missing_disappeared", "still_missing"}:
+                metrics["missing"] += 1
+            if outcome == "unchanged_content":
+                metrics["downloaded"] += 1
+                metrics["unchanged_after_download"] += 1
+            if outcome in {"changed", "first_seen", "reappeared"}:
+                metrics["downloaded"] += 1
+                metrics["changed"] += 1
+                metrics["changed_files"].append({
+                    "sensor_id": result["sensor_id"],
+                    "day": result["day"],
+                    "event_id": result["event_id"],
+                    "event_type": result["event_type"],
+                    "timeseries_ids": result["timeseries_ids"],
+                })
+                if run_backfill:
+                    day_obj = dt.date.fromisoformat(result["day"])
+                    cmd = _planned_backfill_command(env, result["timeseries_ids"], day_obj)
+                    metrics["planned_backfills"].append(cmd)
+                    log.info("sensor-community planned backfill: %s", cmd)
+            bytes_added = int(result.get("downloaded_bytes") or 0)
+            if bytes_added:
+                metrics["downloaded_bytes"] += bytes_added
+                limits.add_bytes(bytes_added)
+
+    metrics["changed_files"].sort(key=lambda e: (e["day"], e["sensor_id"]))
+    metrics["planned_backfills"].sort()
+
+    if limits.should_stop():
+        metrics["stopped_for"] = limits.stopped_for
+        log.warning(
+            "sensor-community: stopped early due to limit=%s", limits.stopped_for,
+        )
+
+    # Phase 4 batched backfill, same shape as OpenAQ.
+    if run_backfill and not dry_run and metrics["changed_files"]:
+        backfill_log_dir = (
+            Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"])
+            / "backfill" / run_compact
+        )
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for entry in metrics["changed_files"]:
+            by_day.setdefault(entry["day"], []).append(entry)
+        for day_iso in sorted(by_day):
+            if limits.should_stop():
+                log.warning(
+                    "sensor-community backfill: stopping early (%s) — %s days skipped",
+                    limits.stopped_for,
+                    len([d for d in by_day if d > day_iso]),
+                )
+                break
+            group = by_day[day_iso]
+            union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
+            log.info(
+                "sensor-community backfill batch day=%s files=%s total_timeseries_ids=%s",
+                day_iso, len(group), len(union_ids),
+            )
+            bf = run_narrow_backfill(
+                wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                timeseries_ids=union_ids,
+                day=dt.date.fromisoformat(day_iso),
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=f"sc_day_{day_iso}",
+            )
+            for entry in group:
+                if entry.get("event_id"):
+                    _record_backfill_on_event(
+                        conn, int(entry["event_id"]),
+                        entry["timeseries_ids"], bf,
+                        batch_info={
+                            "files": len(group),
+                            "total_timeseries_ids": len(union_ids),
+                        },
+                    )
+            conn.commit()
+            metrics["backfills_attempted"] += 1
+            if bf["status"] == "ok":
+                metrics["backfills_ok"] += 1
+            else:
+                metrics["backfills_failed"] += 1
+
+    log.info(
+        "sensor-community: done %s",
+        {k: v for k, v in metrics.items() if k not in ("changed_files", "planned_backfills", "sample_urls")},
+    )
     return metrics
 
 
@@ -1758,6 +2758,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--max-download-mb", type=int, default=None)
     p.add_argument("--max-runtime-minutes", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
+    default_concurrency = int(os.environ.get(
+        "UK_AQ_HISTORY_INTEGRITY_CONCURRENCY", DEFAULT_CONCURRENCY,
+    ))
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=default_concurrency,
+        help=f"Worker count for the per-file thread pool (default {default_concurrency}; "
+             "1 = strict sequential).",
+    )
     p.add_argument(
         "--force-snapshot-import",
         action="store_true",
@@ -1850,6 +2860,10 @@ def open_db(db_path: str) -> sqlite3.Connection:
         "snapshot_day_utc": "TEXT",
         "bytes_read": "INTEGER DEFAULT 0",
     })
+    ensure_columns(conn, "integrity_runs", {
+        "backfills_ok": "INTEGER DEFAULT 0",
+        "backfills_failed": "INTEGER DEFAULT 0",
+    })
     conn.commit()
     return conn
 
@@ -1922,6 +2936,41 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     lines.append(f"  - {table}: {tables[table]}")
         if snap.get("error"):
             lines.append(f"- Error:         {snap['error']}")
+        lines.append("")
+
+    sc = s.get("sensor_community") or {}
+    if sc.get("ran") or sc.get("skipped_reason"):
+        lines.extend([
+            "## Sensor.Community",
+            "",
+            f"- Ran:            {bool(sc.get('ran'))}",
+            f"- Sensors:        {sc.get('sensors', 0)}",
+            f"- Days:           {sc.get('days', 0)}",
+            f"- Index fetches:  {sc.get('index_fetched', 0)}",
+            f"- HEAD checked:   {sc.get('head_checked', 0)}",
+            f"- Downloaded:     {sc.get('downloaded', 0)}",
+            f"- Changed:        {sc.get('changed', 0)}",
+            f"- Unchanged DL:   {sc.get('unchanged_after_download', 0)}",
+            f"- Missing:        {sc.get('missing', 0)}",
+            f"- Errors:         {sc.get('errors', 0)}",
+            f"- Downloaded MB:  {round(sc.get('downloaded_bytes', 0) / (1024 * 1024), 4)}",
+            f"- Stopped for:    {sc.get('stopped_for') or '(none)'}",
+            f"- Backfills:      attempted={sc.get('backfills_attempted', 0)} ok={sc.get('backfills_ok', 0)} failed={sc.get('backfills_failed', 0)}",
+        ])
+        if sc.get("skipped_reason"):
+            lines.append(f"- Skipped reason: {sc['skipped_reason']}")
+        sc_changed = sc.get("changed_files") or []
+        if sc_changed:
+            lines.extend(["", "### Changed files (sensor-community)", ""])
+            for entry in sc_changed[:50]:
+                lines.append(
+                    f"- {entry['sensor_id']} / {entry['day']} "
+                    f"(event_id={entry.get('event_id')}, "
+                    f"type={entry.get('event_type')}, "
+                    f"timeseries={entry.get('timeseries_ids')})"
+                )
+            if len(sc_changed) > 50:
+                lines.append(f"- ... {len(sc_changed) - 50} more")
         lines.append("")
 
     oq = s.get("openaq") or {}
@@ -2082,41 +3131,56 @@ def main(argv: list[str]) -> int:
             if snapshot_result["status"] in {"missing_root", "no_snapshot"}:
                 warnings_delta += 1
 
-        # Phase 3: OpenAQ adapter (Sensor.Community lands in Phase 5).
+        # Phase 3 / Phase 5: source adapters share a single LimitTracker
+        # so soft caps cover the whole run, not per-adapter.
         limits = LimitTracker(
             max_download_mb=args.max_download_mb,
             max_runtime_minutes=args.max_runtime_minutes,
             started_mono=started_mono,
         )
-        openaq_metrics: dict[str, Any] = {"ran": False, "skipped_reason": None}
-        run_openaq = (
-            args.source in {"openaq", "all"}
-            and snapshot_result["status"] in {"imported", "reused"}
-        )
+        snapshot_ok = snapshot_result["status"] in {"imported", "reused"}
+
+        empty_metrics = {"ran": False, "skipped_reason": None}
+        openaq_metrics: dict[str, Any] = dict(empty_metrics)
+        sc_metrics: dict[str, Any] = dict(empty_metrics)
+
+        run_openaq = args.source in {"openaq", "all"} and snapshot_ok
         if args.source in {"openaq", "all"} and not run_openaq:
             log.warning(
                 "openaq: skipped because core snapshot status=%s (need imported/reused)",
                 snapshot_result["status"],
             )
-
         if run_openaq:
             openaq_metrics = check_openaq(
-                conn=conn,
-                env_name=args.env,
-                env=env,
-                from_day=from_day,
-                to_day=to_day,
-                dry_run=args.dry_run,
-                run_backfill=args.run_backfill,
-                limits=limits,
-                log=log,
+                conn=conn, env_name=args.env, env=env,
+                from_day=from_day, to_day=to_day,
+                dry_run=args.dry_run, run_backfill=args.run_backfill,
+                limits=limits, log=log, run_compact=run_compact,
+                concurrency=max(1, int(args.concurrency)),
             )
 
+        run_sc = args.source in {"sensor-community", "all"} and snapshot_ok
+        if args.source in {"sensor-community", "all"} and not run_sc:
+            log.warning(
+                "sensor-community: skipped because core snapshot status=%s (need imported/reused)",
+                snapshot_result["status"],
+            )
+        if run_sc:
+            sc_metrics = check_sensor_community(
+                conn=conn, env_name=args.env, env=env,
+                from_day=from_day, to_day=to_day,
+                dry_run=args.dry_run, run_backfill=args.run_backfill,
+                limits=limits, log=log, run_compact=run_compact,
+                concurrency=max(1, int(args.concurrency)),
+            )
+
+        any_adapter_ran = openaq_metrics.get("ran") or sc_metrics.get("ran")
+        any_stopped = openaq_metrics.get("stopped_for") or sc_metrics.get("stopped_for")
+
         # Decide top-level run status.
-        snapshot_ok = snapshot_result["status"] in {"imported", "reused"}
-        if openaq_metrics.get("stopped_for"):
+        if any_stopped:
             status = "stopped_limit"
-        elif openaq_metrics.get("ran"):
+        elif any_adapter_ran:
             status = "ok"
         elif args.dry_run:
             status = "noop"
@@ -2153,49 +3217,52 @@ def main(argv: list[str]) -> int:
                 f"snapshot {snapshot_result['status']}: {snapshot_result.get('error')}"
             )
 
-        if openaq_metrics.get("ran"):
-            notes_parts.append(
-                f"openaq head_checked={openaq_metrics['head_checked']} "
-                f"changed={openaq_metrics['changed']} missing={openaq_metrics['missing']} "
-                f"downloaded_bytes={openaq_metrics['downloaded_bytes']} "
-                f"errors={openaq_metrics['errors']} "
-                f"backfills_attempted={openaq_metrics.get('backfills_attempted', 0)} "
-                f"backfills_ok={openaq_metrics.get('backfills_ok', 0)} "
-                f"backfills_failed={openaq_metrics.get('backfills_failed', 0)}"
-            )
-            if openaq_metrics.get("stopped_for"):
-                notes_parts.append(f"openaq stopped_for={openaq_metrics['stopped_for']}")
-        elif args.source in {"openaq", "all"} and openaq_metrics.get("skipped_reason"):
-            notes_parts.append(f"openaq skipped: {openaq_metrics['skipped_reason']}")
+        for adapter_name, adapter_metrics in (("openaq", openaq_metrics),
+                                              ("sensor-community", sc_metrics)):
+            if adapter_metrics.get("ran"):
+                notes_parts.append(
+                    f"{adapter_name} head_checked={adapter_metrics.get('head_checked', 0)} "
+                    f"changed={adapter_metrics.get('changed', 0)} missing={adapter_metrics.get('missing', 0)} "
+                    f"downloaded_bytes={adapter_metrics.get('downloaded_bytes', 0)} "
+                    f"errors={adapter_metrics.get('errors', 0)} "
+                    f"backfills_attempted={adapter_metrics.get('backfills_attempted', 0)} "
+                    f"backfills_ok={adapter_metrics.get('backfills_ok', 0)} "
+                    f"backfills_failed={adapter_metrics.get('backfills_failed', 0)}"
+                )
+                if adapter_metrics.get("stopped_for"):
+                    notes_parts.append(f"{adapter_name} stopped_for={adapter_metrics['stopped_for']}")
+            elif adapter_metrics.get("skipped_reason"):
+                notes_parts.append(f"{adapter_name} skipped: {adapter_metrics['skipped_reason']}")
 
         notes = "; ".join(notes_parts) + "."
 
-        # File-checker counters come from the OpenAQ adapter (Sensor.Community
-        # will add to these in Phase 5; this is a sum rather than per-source).
-        downloaded_bytes_total = int(openaq_metrics.get("downloaded_bytes", 0))
-        errors_count = int(openaq_metrics.get("errors", 0)) + int(
-            openaq_metrics.get("backfills_failed", 0)
-        )
-        warnings_count_total = warnings_delta + (
-            1 if openaq_metrics.get("skipped_reason") else 0
-        )
+        def _sum(key: str) -> int:
+            return int(openaq_metrics.get(key, 0)) + int(sc_metrics.get(key, 0))
+
+        downloaded_bytes_total = _sum("downloaded_bytes")
+        errors_count = _sum("errors") + _sum("backfills_failed")
+        warnings_count_total = warnings_delta
+        if openaq_metrics.get("skipped_reason"):
+            warnings_count_total += 1
+        if sc_metrics.get("skipped_reason"):
+            warnings_count_total += 1
         if openaq_metrics.get("stopped_for"):
+            warnings_count_total += 1
+        if sc_metrics.get("stopped_for"):
             warnings_count_total += 1
 
         metrics: dict[str, Any] = {
-            "files_head_checked": int(openaq_metrics.get("head_checked", 0)),
-            "files_downloaded": int(openaq_metrics.get("downloaded", 0)),
-            "files_changed": int(openaq_metrics.get("changed", 0)),
-            "files_unchanged_after_download": int(
-                openaq_metrics.get("unchanged_after_download", 0)
-            ),
-            "files_missing": int(openaq_metrics.get("missing", 0)),
+            "files_head_checked": _sum("head_checked"),
+            "files_downloaded": _sum("downloaded"),
+            "files_changed": _sum("changed"),
+            "files_unchanged_after_download": _sum("unchanged_after_download"),
+            "files_missing": _sum("missing"),
             "downloaded_bytes": downloaded_bytes_total,
             "downloaded_mb": round(downloaded_bytes_total / (1024 * 1024), 4),
             "runtime_seconds": 0.0,
-            "backfills_triggered": int(openaq_metrics.get("backfills_attempted", 0)),
-            "backfills_ok": int(openaq_metrics.get("backfills_ok", 0)),
-            "backfills_failed": int(openaq_metrics.get("backfills_failed", 0)),
+            "backfills_triggered": _sum("backfills_attempted"),
+            "backfills_ok": _sum("backfills_ok"),
+            "backfills_failed": _sum("backfills_failed"),
             "warnings_count": warnings_count_total,
             "errors_count": errors_count,
             "snapshot_status": snapshot_result["status"],
@@ -2207,6 +3274,10 @@ def main(argv: list[str]) -> int:
             "openaq_stopped_for": openaq_metrics.get("stopped_for"),
             "openaq_locations": openaq_metrics.get("locations", 0),
             "openaq_days": openaq_metrics.get("days", 0),
+            "sensor_community_stopped_for": sc_metrics.get("stopped_for"),
+            "sensor_community_sensors": sc_metrics.get("sensors", 0),
+            "sensor_community_days": sc_metrics.get("days", 0),
+            "sensor_community_index_fetched": sc_metrics.get("index_fetched", 0),
         }
 
         finished_at = utc_now()
@@ -2228,6 +3299,8 @@ def main(argv: list[str]) -> int:
               downloaded_bytes = ?,
               downloaded_mb = ?,
               backfills_triggered = ?,
+              backfills_ok = ?,
+              backfills_failed = ?,
               warnings_count = warnings_count + ?,
               errors_count = errors_count + ?,
               notes = ?
@@ -2243,6 +3316,8 @@ def main(argv: list[str]) -> int:
                 metrics["downloaded_bytes"],
                 metrics["downloaded_mb"],
                 metrics["backfills_triggered"],
+                metrics["backfills_ok"],
+                metrics["backfills_failed"],
                 warnings_count_total,
                 errors_count,
                 notes,
@@ -2272,9 +3347,24 @@ def main(argv: list[str]) -> int:
             "log_path": str(log_path),
             "snapshot": snapshot_result,
             "openaq": openaq_metrics,
+            "sensor_community": sc_metrics,
             "metrics": metrics,
             "notes": notes,
         }
+        # Dropbox DB copy on any non-error exit. Failures here are warnings,
+        # not run failures — the local DB is the source of truth.
+        db_copy = _copy_db_to_dropbox(env, conn, log)
+        summary["dropbox_db_copy"] = db_copy
+        if run_id is not None:
+            try:
+                conn.execute(
+                    "UPDATE integrity_runs SET notes = COALESCE(notes, '') || ? WHERE id = ?",
+                    (f" dropbox_db_copy={db_copy['status']}.", run_id),
+                )
+                conn.commit()
+            except sqlite3.Error:
+                pass
+
         json_path, md_path = write_reports(
             env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
         )
