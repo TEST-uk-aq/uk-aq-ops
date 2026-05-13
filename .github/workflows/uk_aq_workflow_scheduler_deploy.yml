@@ -35,7 +35,7 @@ jobs:
             exit 1
           fi
 
-      - name: Prepare wrangler.toml
+      - name: Prepare scheduler config
         run: |
           set -euo pipefail
           if [ -z "${GITHUB_REPOSITORY_OWNER:-}" ]; then
@@ -43,8 +43,36 @@ jobs:
             exit 1
           fi
           sed -i "s/YOUR_GITHUB_OWNER/${GITHUB_REPOSITORY_OWNER}/g" cloudflare/workflow-scheduler/worker.js
-          cp cloudflare/workflow-scheduler/wrangler.toml.example cloudflare/workflow-scheduler/wrangler.toml
+          if [ ! -f cloudflare/workflow-scheduler/wrangler.toml ]; then
+            echo "Missing cloudflare/workflow-scheduler/wrangler.toml."
+            exit 1
+          fi
           sed -i "s/^name = .*/name = \"${UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME}\"/" cloudflare/workflow-scheduler/wrangler.toml
+
+      - name: Validate scheduler cron alignment
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          worker_text = Path("cloudflare/workflow-scheduler/worker.js").read_text(encoding="utf-8")
+          wrangler_text = Path("cloudflare/workflow-scheduler/wrangler.toml").read_text(encoding="utf-8")
+
+          worker_crons = re.findall(r'cron:\s*"([^"]+)"', worker_text)
+
+          match = re.search(r'crons\s*=\s*\[(.*?)\]', wrangler_text, re.S)
+          if not match:
+              raise SystemExit("No [triggers].crons array found in wrangler.toml")
+          wrangler_crons = re.findall(r'"([^"]+)"', match.group(1))
+
+          if worker_crons != wrangler_crons:
+              raise SystemExit(
+                  "Scheduler cron mismatch between worker.js and wrangler.toml:\\n"
+                  f"worker.js: {worker_crons}\\nwrangler.toml: {wrangler_crons}"
+              )
+
+          print(f"Cron alignment OK: {worker_crons}")
+          PY
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65

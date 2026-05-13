@@ -8,7 +8,7 @@ Configured in `worker.js` (`JOBS` array):
 - `0 3 * * *` -> ingest `uk_aq_stations_daily.yml`
 - `15 4 * * *` -> ops `uk_aq_r2_core_snapshot.yml`
 - `35 4 * * *` -> ops `uk_aq_r2_history_dropbox_backup.yml`
-- `49 5 * * *` -> ops `uk_aq_dropbox_prune_raw.yml`
+- `0 9 * * *` -> ops `uk_aq_dropbox_prune_raw.yml`
 
 Each deployment/account should edit `owner`, `repo`, and `ref` values for its own environment.
 
@@ -26,11 +26,9 @@ Optional secret for manual HTTP trigger endpoint:
 
 ## Setup
 
-1. Copy config:
-```bash
-cd cloudflare/workflow-scheduler
-cp wrangler.toml.example wrangler.toml
-```
+1. Edit scheduler config:
+- `wrangler.toml` is the committed trigger source for schedule changes.
+- `worker.js` holds the cron->workflow mapping and must stay aligned with `wrangler.toml`.
 2. Edit `worker.js` `JOBS` entries (`owner`, `repo`, `ref`) for this account/environment.
 3. Deploy secret:
 ```bash
@@ -44,14 +42,14 @@ wrangler deploy
 - `0 3 * * *`
 - `15 4 * * *`
 - `35 4 * * *`
-- `49 5 * * *`
+- `0 9 * * *`
 
 ## GitHub Actions Deploy (Ops Repo)
 
 Manual deploy workflow:
 - `.github/workflows/uk_aq_workflow_scheduler_deploy.yml`
-- It auto-creates `cloudflare/workflow-scheduler/wrangler.toml` from `wrangler.toml.example` during the run.
 - It auto-replaces `YOUR_GITHUB_OWNER` in `worker.js` with the deploy repo owner (`github.repository_owner`) during the run.
+- It validates that `worker.js` cron values exactly match `wrangler.toml` before deploy.
 
 Required GitHub repo configuration for that workflow:
 - Secret: `CLOUDFLARE_ACCOUNT_ID`
