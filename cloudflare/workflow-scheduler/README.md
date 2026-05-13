@@ -51,6 +51,7 @@ wrangler deploy
 Manual deploy workflow:
 - `.github/workflows/uk_aq_workflow_scheduler_deploy.yml`
 - It auto-creates `cloudflare/workflow-scheduler/wrangler.toml` from `wrangler.toml.example` during the run.
+- It auto-replaces `YOUR_GITHUB_OWNER` in `worker.js` with the deploy repo owner (`github.repository_owner`) during the run.
 
 Required GitHub repo configuration for that workflow:
 - Secret: `CLOUDFLARE_ACCOUNT_ID`

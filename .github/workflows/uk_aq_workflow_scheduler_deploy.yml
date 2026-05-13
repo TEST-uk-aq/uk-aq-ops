@@ -38,6 +38,11 @@ jobs:
       - name: Prepare wrangler.toml
         run: |
           set -euo pipefail
+          if [ -z "${GITHUB_REPOSITORY_OWNER:-}" ]; then
+            echo "Missing GITHUB_REPOSITORY_OWNER from GitHub Actions context."
+            exit 1
+          fi
+          sed -i "s/YOUR_GITHUB_OWNER/${GITHUB_REPOSITORY_OWNER}/g" cloudflare/workflow-scheduler/worker.js
           cp cloudflare/workflow-scheduler/wrangler.toml.example cloudflare/workflow-scheduler/wrangler.toml
           sed -i "s/^name = .*/name = \"${UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME}\"/" cloudflare/workflow-scheduler/wrangler.toml
 
