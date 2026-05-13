@@ -27,7 +27,7 @@ const JOBS = [
     ref: "main",
   },
   {
-    cron: "49 5 * * *",
+    cron: "0 9 * * *",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_dropbox_prune_raw.yml",
