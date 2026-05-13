@@ -5,10 +5,11 @@ compatibility_date = "2026-05-13"
 # Single schedule source of truth.
 # Edit only these cron lines when changing run times.
 # Format: "<cron>", # job_key: <job_key> | <repo>/<workflow_file>
+# Schedule is in UTC
 [triggers]
 crons = [
-  "0 3 * * *",   # 03:00UTC - job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
-  "15 4 * * *",  # 04:15UTC - job_key: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "35 18 * * *",  # 04:35UTC - job_key: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "49 5 * * *",  # 05:49UTC - job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
+  "0 3 * * *",   # job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
+  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "49 5 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]
