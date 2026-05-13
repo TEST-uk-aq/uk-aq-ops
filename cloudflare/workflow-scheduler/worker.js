@@ -1,34 +1,46 @@
 /**
  * Cloudflare Worker scheduler for GitHub Actions workflow_dispatch.
  *
- * Edit JOBS per deployment (CIC-Test or LIVE) and keep wrangler cron triggers
- * aligned with the cron values listed here.
+ * DO NOT edit schedules in this file.
+ * Edit only cloudflare/workflow-scheduler/wrangler.toml.
+ *
+ * Notes:
+ * - Cron values are generated into this file at deploy time from wrangler.toml.
+ * - YOUR_GITHUB_OWNER is replaced at deploy with github.repository_owner.
  */
+const CRON_BY_JOB_KEY = Object.freeze({
+  /* DEPLOY_CRON_MAP_START */
+  /* DEPLOY_CRON_MAP_END */
+});
+
 const JOBS = [
+  // job_key: uk_aq_stations_daily
   {
-    cron: "0 3 * * *",
+    job_key: "uk_aq_stations_daily",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ingest",
     workflow_file: "uk_aq_stations_daily.yml",
     ref: "main",
   },
+  // job_key: uk_aq_r2_core_snapshot
   {
-    cron: "15 4 * * *",
+    job_key: "uk_aq_r2_core_snapshot",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_r2_core_snapshot.yml",
     ref: "main",
   },
+  // job_key: uk_aq_r2_history_dropbox_backup
   {
-    cron: "35 4 * * *",
+    job_key: "uk_aq_r2_history_dropbox_backup",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
     ref: "main",
   },
+  // job_key: uk_aq_dropbox_prune_raw
   {
-    // Cron values are synchronized from wrangler.toml during deploy.
-    cron: "22 9 * * *",
+    job_key: "uk_aq_dropbox_prune_raw",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_dropbox_prune_raw.yml",
@@ -43,11 +55,27 @@ function workflowDispatchUrl(job) {
   return `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`;
 }
 
+function jobsForCron(cronExpression) {
+  const matchingKeys = new Set(
+    Object.entries(CRON_BY_JOB_KEY)
+      .filter(([, cron]) => cron === cronExpression)
+      .map(([jobKey]) => jobKey),
+  );
+
+  if (matchingKeys.size === 0) {
+    return [];
+  }
+
+  return JOBS.filter((job) => matchingKeys.has(job.job_key));
+}
+
 async function dispatchWorkflow(job, token) {
   const url = workflowDispatchUrl(job);
   const label = `${job.owner}/${job.repo}:${job.workflow_file}@${job.ref}`;
 
-  console.log(`[workflow-scheduler] dispatching workflow=${label}`);
+  console.log(
+    `[workflow-scheduler] dispatching job_key=${job.job_key} workflow=${label}`,
+  );
 
   const response = await fetch(url, {
     method: "POST",
@@ -62,15 +90,17 @@ async function dispatchWorkflow(job, token) {
   });
 
   console.log(
-    `[workflow-scheduler] github response workflow=${label} status=${response.status}`,
+    `[workflow-scheduler] github response job_key=${job.job_key} workflow=${label} status=${response.status}`,
   );
 
   if (!response.ok) {
     const errorBody = (await response.text()).slice(0, 4000);
     console.log(
-      `[workflow-scheduler] github error workflow=${label} body=${errorBody}`,
+      `[workflow-scheduler] github error job_key=${job.job_key} workflow=${label} body=${errorBody}`,
     );
-    throw new Error(`GitHub dispatch failed for ${label} (status ${response.status})`);
+    throw new Error(
+      `GitHub dispatch failed for job_key=${job.job_key} workflow=${label} (status ${response.status})`,
+    );
   }
 }
 
@@ -82,15 +112,15 @@ async function runCron(cronExpression, env) {
     throw new Error("Missing required Worker secret: GITHUB_WORKFLOW_DISPATCH_TOKEN");
   }
 
-  const jobsForCron = JOBS.filter((job) => job.cron === cronExpression);
-  if (jobsForCron.length === 0) {
+  const jobs = jobsForCron(cronExpression);
+  if (jobs.length === 0) {
     console.log(
-      `[workflow-scheduler] no configured jobs matched cron=${cronExpression}`,
+      `[workflow-scheduler] no configured jobs matched cron=${cronExpression}; cron map keys=${Object.keys(CRON_BY_JOB_KEY).join(",")}`,
     );
     return;
   }
 
-  for (const job of jobsForCron) {
+  for (const job of jobs) {
     await dispatchWorkflow(job, token);
   }
 }

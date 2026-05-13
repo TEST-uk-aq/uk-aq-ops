@@ -2,16 +2,13 @@ name = "uk-aq-workflow-scheduler"
 main = "worker.js"
 compatibility_date = "2026-05-13"
 
-# Example config for new deployments. Active deploys use wrangler.toml.
-# Keep these triggers aligned with JOBS[].cron in worker.js.
-# 0 3 * * *  -> uk-aq-ingest / uk_aq_stations_daily.yml
-# 15 4 * * * -> uk-aq-ops / uk_aq_r2_core_snapshot.yml
-# 35 4 * * * -> uk-aq-ops / uk_aq_r2_history_dropbox_backup.yml
-# 22 9 * * * -> uk-aq-ops / uk_aq_dropbox_prune_raw.yml
+# Example config for new deployments.
+# Active deploys use wrangler.toml in this same folder.
+# Keep job_key values in sync with worker.js JOBS[].job_key.
 [triggers]
 crons = [
-  "0 3 * * *",
-  "15 4 * * *",
-  "35 4 * * *",
-  "22 9 * * *",
+  "0 3 * * *",   # job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
+  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "22 9 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]

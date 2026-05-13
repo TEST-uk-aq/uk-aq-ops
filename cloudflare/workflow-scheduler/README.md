@@ -1,79 +1,71 @@
 # Cloudflare Workflow Scheduler (GitHub Actions)
 
-This Worker replaces selected GitHub cron schedules by calling GitHub `workflow_dispatch` via API.
+This Worker replaces selected GitHub cron schedules by calling GitHub `workflow_dispatch`.
 
-## What It Schedules
+## One-Place Schedule Edits
 
-Configured in `wrangler.toml` `[triggers].crons` and mapped to workflows by `JOBS` order in `worker.js`:
-- `0 3 * * *` -> ingest `uk_aq_stations_daily.yml`
-- `15 4 * * *` -> ops `uk_aq_r2_core_snapshot.yml`
-- `35 4 * * *` -> ops `uk_aq_r2_history_dropbox_backup.yml`
-- `22 9 * * *` -> ops `uk_aq_dropbox_prune_raw.yml`
+Change schedule times only in:
+- `cloudflare/workflow-scheduler/wrangler.toml`
 
-Each deployment/account should edit `owner`, `repo`, and `ref` values for its own environment.
+Each cron line must include `job_key` comment:
+
+```toml
+[triggers]
+crons = [
+  "0 3 * * *",   # job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
+  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "22 9 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
+]
+```
+
+`worker.js` does not store literal cron values in source. Deploy injects the cron map from `wrangler.toml` by `job_key`.
+
+## How Routing Works
+
+1. Cloudflare fires `scheduled()` and passes only the cron string (no job name).
+2. Deploy workflow builds `job_key -> cron` map from `wrangler.toml` comments.
+3. Worker matches received cron string to job keys, then dispatches matching workflows.
 
 ## Required Secret
 
-Set a Worker secret (never hard-code in source):
+Worker secret:
 - `GITHUB_WORKFLOW_DISPATCH_TOKEN`
 
-Token options:
-- Fine-grained PAT with repository access and **Actions: Read and write** for the target repos.
-- Or GitHub App installation token with equivalent workflow dispatch capability.
+Use a PAT or GitHub App token with repo access and Actions write permission for dispatch.
 
-Optional secret for manual HTTP trigger endpoint:
+Optional Worker secret:
 - `MANUAL_TRIGGER_KEY` (enables `GET /run?cron=...&key=...`)
 
-## Setup
+## Deploy Workflow (Ops Repo)
 
-1. Edit scheduler times in one place:
-- Update only `wrangler.toml` `[triggers].crons` when changing schedule times.
-2. Edit `worker.js` only for workflow routing metadata (`owner`, `repo`, `workflow_file`, `ref`).
-3. Deploy secret:
-```bash
-wrangler secret put GITHUB_WORKFLOW_DISPATCH_TOKEN
-```
-4. Deploy Worker:
-```bash
-wrangler deploy
-```
-5. Confirm cron triggers in `wrangler.toml`:
-- `0 3 * * *`
-- `15 4 * * *`
-- `35 4 * * *`
-- `0 9 * * *`
-
-## GitHub Actions Deploy (Ops Repo)
-
-Deploy workflow:
+Workflow:
 - `.github/workflows/uk_aq_workflow_scheduler_deploy.yml`
-- Auto-deploys on pushes to `main` when `cloudflare/workflow-scheduler/**` changes.
-- Also supports manual `workflow_dispatch`.
-- It auto-replaces `YOUR_GITHUB_OWNER` in `worker.js` with the deploy repo owner (`github.repository_owner`) during the run.
-- It auto-syncs `worker.js` cron values from `wrangler.toml` before deploy.
-- It validates final cron alignment before deploy.
 
-Required GitHub repo configuration for that workflow:
-- Secret: `CLOUDFLARE_ACCOUNT_ID`
-- Secret: `CLOUDFLARE_API_TOKEN`
-- Secret: `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN`
+Behavior:
+- Runs on push to `main` for `cloudflare/workflow-scheduler/**` changes, or manual dispatch.
+- Replaces `YOUR_GITHUB_OWNER` with `github.repository_owner` during deploy.
+- Injects cron map into `worker.js` from `wrangler.toml`.
+- Validates `job_key` coverage and map alignment before deploy.
+
+Required GitHub repo secrets:
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_API_TOKEN`
+- `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN`
 
 Optional:
 - Variable: `UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME` (default `uk-aq-workflow-scheduler`)
 - Secret: `UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY`
 
-## Testing
+## Logging
 
-1. Trigger a scheduled event manually from Cloudflare Worker dashboard (`Run` on a scheduled trigger), temporarily set a near-future cron, or call `/run` if `MANUAL_TRIGGER_KEY` is configured.
-2. Check Worker logs for:
+Worker logs include:
 - received cron expression
-- workflow dispatch target
-- GitHub response status
+- `job_key` and workflow being dispatched
+- GitHub API response status
 - GitHub error response body (if any)
-3. Verify run appears in GitHub Actions for the target workflow.
 
-## Operational Notes
+## Ops Notes
 
-- Keep `workflow_dispatch` enabled in the workflow files for manual fallback.
-- If Cloudflare scheduling fails, run the workflow manually in GitHub Actions (`Run workflow`).
-- CIC-Test and LIVE should use separate Cloudflare accounts and separate Worker deployments/tokens.
+- Keep `workflow_dispatch` enabled in scheduled workflows for manual fallback.
+- CIC-Test and LIVE use separate Cloudflare accounts and separate Worker deployments.

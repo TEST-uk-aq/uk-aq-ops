@@ -48,41 +48,82 @@ jobs:
             echo "Missing GITHUB_REPOSITORY_OWNER from GitHub Actions context."
             exit 1
           fi
-          sed -i "s/YOUR_GITHUB_OWNER/${GITHUB_REPOSITORY_OWNER}/g" cloudflare/workflow-scheduler/worker.js
+
           if [ ! -f cloudflare/workflow-scheduler/wrangler.toml ]; then
             echo "Missing cloudflare/workflow-scheduler/wrangler.toml."
             exit 1
           fi
+
+          sed -i "s/YOUR_GITHUB_OWNER/${GITHUB_REPOSITORY_OWNER}/g" cloudflare/workflow-scheduler/worker.js
           sed -i "s/^name = .*/name = \"${UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME}\"/" cloudflare/workflow-scheduler/wrangler.toml
+
           python3 - <<'PY'
           import re
-          import tomllib
           from pathlib import Path
 
           wrangler_path = Path("cloudflare/workflow-scheduler/wrangler.toml")
           worker_path = Path("cloudflare/workflow-scheduler/worker.js")
 
-          wrangler = tomllib.loads(wrangler_path.read_text(encoding="utf-8"))
-          crons = wrangler.get("triggers", {}).get("crons", [])
-          if not isinstance(crons, list) or not all(isinstance(v, str) for v in crons):
-              raise SystemExit("wrangler.toml [triggers].crons must be a list of strings")
-
+          wrangler_text = wrangler_path.read_text(encoding="utf-8")
           worker_text = worker_path.read_text(encoding="utf-8")
-          matches = list(re.finditer(r'cron:\s*"[^"]+"', worker_text))
-          if len(matches) != len(crons):
+
+          match = re.search(r'crons\s*=\s*\[(.*?)\]', wrangler_text, re.S)
+          if not match:
+              raise SystemExit("No [triggers].crons array found in wrangler.toml")
+
+          cron_map = {}
+          cron_block = match.group(1)
+          for raw_line in cron_block.splitlines():
+              line = raw_line.strip()
+              if not line:
+                  continue
+              cron_match = re.match(
+                  r'"([^"]+)"\s*,?\s*#\s*job_key:\s*([A-Za-z0-9_-]+)\b',
+                  line,
+              )
+              if not cron_match:
+                  raise SystemExit(
+                      "Each cron line in wrangler.toml must include '# job_key: <key>' comment. "
+                      f"Invalid line: {raw_line.strip()}"
+                  )
+              cron_value, job_key = cron_match.groups()
+              if job_key in cron_map:
+                  raise SystemExit(f"Duplicate job_key in wrangler.toml cron comments: {job_key}")
+              cron_map[job_key] = cron_value
+
+          worker_job_keys = re.findall(r'job_key:\s*"([A-Za-z0-9_-]+)"', worker_text)
+          if not worker_job_keys:
+              raise SystemExit("No JOBS job_key entries found in worker.js")
+
+          wrangler_keys = set(cron_map.keys())
+          worker_keys = set(worker_job_keys)
+          if wrangler_keys != worker_keys:
               raise SystemExit(
-                  f"worker.js has {len(matches)} jobs but wrangler.toml has {len(crons)} cron triggers"
+                  "Job key mismatch between worker.js and wrangler.toml. "
+                  f"worker keys={sorted(worker_keys)} wrangler keys={sorted(wrangler_keys)}"
               )
 
-          chunks = []
-          last = 0
-          for idx, m in enumerate(matches):
-              chunks.append(worker_text[last:m.start()])
-              chunks.append(f'cron: "{crons[idx]}"')
-              last = m.end()
-          chunks.append(worker_text[last:])
-          worker_path.write_text("".join(chunks), encoding="utf-8")
-          print(f"Applied wrangler cron schedule into worker.js: {crons}")
+          map_lines = [f'  "{job_key}": "{cron_map[job_key]}",' for job_key in worker_job_keys]
+          generated_block = "\n".join([
+              "/* DEPLOY_CRON_MAP_START */",
+              *map_lines,
+              "  /* DEPLOY_CRON_MAP_END */",
+          ])
+
+          updated_worker = re.sub(
+              r'/\* DEPLOY_CRON_MAP_START \*/.*?/\* DEPLOY_CRON_MAP_END \*/',
+              generated_block,
+              worker_text,
+              flags=re.S,
+          )
+
+          if updated_worker == worker_text:
+              raise SystemExit(
+                  "Failed to inject cron map. Missing DEPLOY_CRON_MAP markers in worker.js"
+              )
+
+          worker_path.write_text(updated_worker, encoding="utf-8")
+          print(f"Prepared deploy cron map: {cron_map}")
           PY
 
       - name: Validate scheduler cron alignment
@@ -91,23 +132,50 @@ jobs:
           import re
           from pathlib import Path
 
-          worker_text = Path("cloudflare/workflow-scheduler/worker.js").read_text(encoding="utf-8")
           wrangler_text = Path("cloudflare/workflow-scheduler/wrangler.toml").read_text(encoding="utf-8")
+          worker_text = Path("cloudflare/workflow-scheduler/worker.js").read_text(encoding="utf-8")
 
-          worker_crons = re.findall(r'cron:\s*"([^"]+)"', worker_text)
-
-          match = re.search(r'crons\s*=\s*\[(.*?)\]', wrangler_text, re.S)
-          if not match:
+          wrangler_match = re.search(r'crons\s*=\s*\[(.*?)\]', wrangler_text, re.S)
+          if not wrangler_match:
               raise SystemExit("No [triggers].crons array found in wrangler.toml")
-          wrangler_crons = re.findall(r'"([^"]+)"', match.group(1))
 
-          if worker_crons != wrangler_crons:
+          wrangler_map = {}
+          for raw_line in wrangler_match.group(1).splitlines():
+              line = raw_line.strip()
+              if not line:
+                  continue
+              m = re.match(r'"([^"]+)"\s*,?\s*#\s*job_key:\s*([A-Za-z0-9_-]+)\b', line)
+              if not m:
+                  raise SystemExit(f"Invalid wrangler cron line: {line}")
+              cron, key = m.groups()
+              wrangler_map[key] = cron
+
+          block_match = re.search(
+              r'/\* DEPLOY_CRON_MAP_START \*/(.*?)/\* DEPLOY_CRON_MAP_END \*/',
+              worker_text,
+              re.S,
+          )
+          if not block_match:
+              raise SystemExit("Missing DEPLOY_CRON_MAP marker block in worker.js")
+
+          worker_map = dict(
+              re.findall(r'"([A-Za-z0-9_-]+)"\s*:\s*"([^"]+)"', block_match.group(1))
+          )
+
+          if worker_map != wrangler_map:
               raise SystemExit(
-                  "Scheduler cron mismatch between worker.js and wrangler.toml:\\n"
-                  f"worker.js: {worker_crons}\\nwrangler.toml: {wrangler_crons}"
+                  "Scheduler mapping mismatch between worker.js deploy map and wrangler.toml.\n"
+                  f"worker_map={worker_map}\nwrangler_map={wrangler_map}"
               )
 
-          print(f"Cron alignment OK: {worker_crons}")
+          job_keys = set(re.findall(r'job_key:\s*"([A-Za-z0-9_-]+)"', worker_text))
+          if job_keys != set(worker_map.keys()):
+              raise SystemExit(
+                  "worker.js JOBS keys mismatch deploy map keys.\n"
+                  f"jobs={sorted(job_keys)} map={sorted(worker_map.keys())}"
+              )
+
+          print(f"Cron alignment OK by job_key: {worker_map}")
           PY
 
       - name: Deploy Worker (base)

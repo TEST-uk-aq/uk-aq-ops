@@ -2,15 +2,14 @@ name = "uk-aq-workflow-scheduler"
 main = "worker.js"
 compatibility_date = "2026-05-13"
 
-# Trigger schedule map (UTC):
-# 0 3 * * *  -> uk-aq-ingest / uk_aq_stations_daily.yml
-# 15 4 * * * -> uk-aq-ops / uk_aq_r2_core_snapshot.yml
-# 35 4 * * * -> uk-aq-ops / uk_aq_r2_history_dropbox_backup.yml
-# 49 5 * * * -> uk-aq-ops / uk_aq_dropbox_prune_raw.yml
+# Single schedule source of truth.
+# Edit only these cron lines when changing run times.
+# Format: "<cron>", # job_key: <job_key> | <repo>/<workflow_file>
+# Schedule is in UTC
 [triggers]
 crons = [
-  "0 3 * * *",
-  "15 4 * * *",
-  "35 4 * * *",
-  "0 10 * * *",
+  "0 3 * * *",   # job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
+  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "05 11 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]
