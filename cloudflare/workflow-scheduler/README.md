@@ -4,11 +4,11 @@ This Worker replaces selected GitHub cron schedules by calling GitHub `workflow_
 
 ## What It Schedules
 
-Configured in `worker.js` (`JOBS` array):
+Configured in `wrangler.toml` `[triggers].crons` and mapped to workflows by `JOBS` order in `worker.js`:
 - `0 3 * * *` -> ingest `uk_aq_stations_daily.yml`
 - `15 4 * * *` -> ops `uk_aq_r2_core_snapshot.yml`
 - `35 4 * * *` -> ops `uk_aq_r2_history_dropbox_backup.yml`
-- `0 9 * * *` -> ops `uk_aq_dropbox_prune_raw.yml`
+- `22 9 * * *` -> ops `uk_aq_dropbox_prune_raw.yml`
 
 Each deployment/account should edit `owner`, `repo`, and `ref` values for its own environment.
 
@@ -26,10 +26,9 @@ Optional secret for manual HTTP trigger endpoint:
 
 ## Setup
 
-1. Edit scheduler config:
-- `wrangler.toml` is the committed trigger source for schedule changes.
-- `worker.js` holds the cron->workflow mapping and must stay aligned with `wrangler.toml`.
-2. Edit `worker.js` `JOBS` entries (`owner`, `repo`, `ref`) for this account/environment.
+1. Edit scheduler times in one place:
+- Update only `wrangler.toml` `[triggers].crons` when changing schedule times.
+2. Edit `worker.js` only for workflow routing metadata (`owner`, `repo`, `workflow_file`, `ref`).
 3. Deploy secret:
 ```bash
 wrangler secret put GITHUB_WORKFLOW_DISPATCH_TOKEN
@@ -46,10 +45,13 @@ wrangler deploy
 
 ## GitHub Actions Deploy (Ops Repo)
 
-Manual deploy workflow:
+Deploy workflow:
 - `.github/workflows/uk_aq_workflow_scheduler_deploy.yml`
+- Auto-deploys on pushes to `main` when `cloudflare/workflow-scheduler/**` changes.
+- Also supports manual `workflow_dispatch`.
 - It auto-replaces `YOUR_GITHUB_OWNER` in `worker.js` with the deploy repo owner (`github.repository_owner`) during the run.
-- It validates that `worker.js` cron values exactly match `wrangler.toml` before deploy.
+- It auto-syncs `worker.js` cron values from `wrangler.toml` before deploy.
+- It validates final cron alignment before deploy.
 
 Required GitHub repo configuration for that workflow:
 - Secret: `CLOUDFLARE_ACCOUNT_ID`

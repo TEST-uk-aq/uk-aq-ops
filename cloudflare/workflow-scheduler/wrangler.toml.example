@@ -7,11 +7,11 @@ compatibility_date = "2026-05-13"
 # 0 3 * * *  -> uk-aq-ingest / uk_aq_stations_daily.yml
 # 15 4 * * * -> uk-aq-ops / uk_aq_r2_core_snapshot.yml
 # 35 4 * * * -> uk-aq-ops / uk_aq_r2_history_dropbox_backup.yml
-# 0 9 * * *  -> uk-aq-ops / uk_aq_dropbox_prune_raw.yml
+# 22 9 * * * -> uk-aq-ops / uk_aq_dropbox_prune_raw.yml
 [triggers]
 crons = [
   "0 3 * * *",
   "15 4 * * *",
   "35 4 * * *",
-  "0 9 * * *",
+  "22 9 * * *",
 ]

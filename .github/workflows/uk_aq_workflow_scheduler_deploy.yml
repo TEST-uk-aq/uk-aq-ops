@@ -1,6 +1,12 @@
 name: Deploy uk_aq_workflow_scheduler Worker
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cloudflare/workflow-scheduler/**"
+      - ".github/workflows/uk_aq_workflow_scheduler_deploy.yml"
   workflow_dispatch:
 
 permissions:
@@ -48,6 +54,36 @@ jobs:
             exit 1
           fi
           sed -i "s/^name = .*/name = \"${UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME}\"/" cloudflare/workflow-scheduler/wrangler.toml
+          python3 - <<'PY'
+          import re
+          import tomllib
+          from pathlib import Path
+
+          wrangler_path = Path("cloudflare/workflow-scheduler/wrangler.toml")
+          worker_path = Path("cloudflare/workflow-scheduler/worker.js")
+
+          wrangler = tomllib.loads(wrangler_path.read_text(encoding="utf-8"))
+          crons = wrangler.get("triggers", {}).get("crons", [])
+          if not isinstance(crons, list) or not all(isinstance(v, str) for v in crons):
+              raise SystemExit("wrangler.toml [triggers].crons must be a list of strings")
+
+          worker_text = worker_path.read_text(encoding="utf-8")
+          matches = list(re.finditer(r'cron:\s*"[^"]+"', worker_text))
+          if len(matches) != len(crons):
+              raise SystemExit(
+                  f"worker.js has {len(matches)} jobs but wrangler.toml has {len(crons)} cron triggers"
+              )
+
+          chunks = []
+          last = 0
+          for idx, m in enumerate(matches):
+              chunks.append(worker_text[last:m.start()])
+              chunks.append(f'cron: "{crons[idx]}"')
+              last = m.end()
+          chunks.append(worker_text[last:])
+          worker_path.write_text("".join(chunks), encoding="utf-8")
+          print(f"Applied wrangler cron schedule into worker.js: {crons}")
+          PY
 
       - name: Validate scheduler cron alignment
         run: |
