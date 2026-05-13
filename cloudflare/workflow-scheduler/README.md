@@ -55,7 +55,7 @@ Manual deploy workflow:
 Required GitHub repo configuration for that workflow:
 - Secret: `CLOUDFLARE_ACCOUNT_ID`
 - Secret: `CLOUDFLARE_API_TOKEN`
-- Reserved secret: `GITHUB_TOKEN`
+- Secret: `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN`
 
 Optional:
 - Variable: `UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME` (default `uk-aq-workflow-scheduler`)

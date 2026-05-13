@@ -13,7 +13,7 @@ jobs:
       UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME: ${{ vars.UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME || 'uk-aq-workflow-scheduler' }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
-      GITHUB_TOKEN: ${{ github.token }}
+      UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN: ${{ secrets.UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN || '' }}
       UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY: ${{ secrets.UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY || '' }}
     steps:
       - name: Checkout
@@ -30,8 +30,8 @@ jobs:
             echo "Missing secret CLOUDFLARE_ACCOUNT_ID."
             exit 1
           fi
-          if [ -z "${GITHUB_TOKEN}" ]; then
-            echo "Missing reserved secret GITHUB_TOKEN."
+          if [ -z "${UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN}" ]; then
+            echo "Missing secret UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN."
             exit 1
           fi
 
@@ -54,7 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           secrets_json="$(jq -n \
-            --arg GITHUB_WORKFLOW_DISPATCH_TOKEN "${GITHUB_TOKEN}" \
+            --arg GITHUB_WORKFLOW_DISPATCH_TOKEN "${UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN}" \
             --arg MANUAL_TRIGGER_KEY "${UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY}" \
             '{GITHUB_WORKFLOW_DISPATCH_TOKEN: $GITHUB_WORKFLOW_DISPATCH_TOKEN, MANUAL_TRIGGER_KEY: $MANUAL_TRIGGER_KEY} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
