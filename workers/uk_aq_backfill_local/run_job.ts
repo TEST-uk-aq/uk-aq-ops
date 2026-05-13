@@ -542,6 +542,10 @@ const AQI_R2_HISTORY_PREFIX = normalizePrefix(
 const CORE_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
 ) || "history/v1/core";
+const R2_HISTORY_DROPBOX_ROOT = optionalEnvAny([
+  "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
+  "UK_AQ_BACKFILL_R2_HISTORY_DROPBOX_ROOT",
+]);
 const OBS_R2_WRITER_GIT_SHA = (Deno.env.get("GITHUB_SHA") || "").trim() || null;
 const OBS_R2_CONFIG = {
   endpoint:
@@ -575,8 +579,11 @@ const ENABLE_R2_FALLBACK = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_ENABLE_R2_FALLBACK"),
   false,
 );
-const SHOULD_USE_R2_CORE_METADATA = RUN_MODE === "source_to_r2" ||
-  RUN_MODE === "r2_history_obs_to_aqilevels" || ENABLE_R2_FALLBACK;
+const SHOULD_USE_R2_CORE_METADATA = true;
+const SOURCE_TO_R2_TARGETED_MERGE = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_SOURCE_TO_R2_TARGETED_MERGE"),
+  true,
+);
 const ALLOW_STUB_MODES = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_ALLOW_STUB_MODES"),
   false,
@@ -1521,6 +1528,43 @@ function buildAqiPartKey(
   return `${buildAqiConnectorPrefix(dayUtc, connectorId)}/part-${
     String(partIndex).padStart(5, "0")
   }.parquet`;
+}
+
+function resolveLocalHistoryPathForR2Key(key: string): string | null {
+  const root = (R2_HISTORY_DROPBOX_ROOT || "").trim();
+  if (!root) {
+    return null;
+  }
+  const normalizedKey = String(key || "").trim().replace(/^\/+/, "");
+  if (!normalizedKey) {
+    return null;
+  }
+  return path.join(root, normalizedKey);
+}
+
+function loadLocalHistoryObjectBytesByR2Key(key: string): Uint8Array | null {
+  const localPath = resolveLocalHistoryPathForR2Key(key);
+  if (!localPath || !fs.existsSync(localPath)) {
+    return null;
+  }
+  return fs.readFileSync(localPath);
+}
+
+async function loadHistoryObjectBytesByR2Key(key: string): Promise<{
+  body: Uint8Array;
+  source: "dropbox" | "r2";
+}> {
+  const localBody = loadLocalHistoryObjectBytesByR2Key(key);
+  if (localBody) {
+    return { body: localBody, source: "dropbox" };
+  }
+  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+    throw new Error(
+      `history object unavailable in local Dropbox backup and R2 credentials are missing: ${key}`,
+    );
+  }
+  const object = await r2GetObject({ r2: OBS_R2_CONFIG, key });
+  return { body: object.body, source: "r2" };
 }
 
 function dayBoundsFromIsoDay(
@@ -3704,9 +3748,9 @@ function findCoreTableKey(
 }
 
 async function findLatestCoreSnapshotManifestInfo(): Promise<
-  { day_utc: string; manifest_key: string } | null
+  { day_utc: string; manifest_key: string; source: "dropbox" | "r2" } | null
 > {
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
   }
 
@@ -3714,11 +3758,23 @@ async function findLatestCoreSnapshotManifestInfo(): Promise<
   for (let offset = 0; offset <= R2_CORE_LOOKBACK_DAYS; offset += 1) {
     const dayUtc = shiftIsoDay(todayUtc, -offset);
     const manifestKey = buildCoreDayManifestKey(dayUtc);
+    const localPath = resolveLocalHistoryPathForR2Key(manifestKey);
+    if (localPath && fs.existsSync(localPath)) {
+      return {
+        day_utc: dayUtc,
+        manifest_key: manifestKey,
+        source: "dropbox",
+      };
+    }
+    if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+      continue;
+    }
     const head = await r2HeadObject({ r2: OBS_R2_CONFIG, key: manifestKey });
     if (head.exists) {
       return {
         day_utc: dayUtc,
         manifest_key: manifestKey,
+        source: "r2",
       };
     }
   }
@@ -4024,7 +4080,7 @@ async function loadR2CoreStationIdsByConnector(): Promise<
   if (!SHOULD_USE_R2_CORE_METADATA) {
     return null;
   }
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
   }
   if (r2CoreStationIdsByConnectorPromise) {
@@ -4038,14 +4094,14 @@ async function loadR2CoreStationIdsByConnector(): Promise<
         logStructured("warning", "backfill_core_snapshot_manifest_missing", {
           core_prefix: CORE_R2_HISTORY_PREFIX,
           lookback_days: R2_CORE_LOOKBACK_DAYS,
+          local_dropbox_root: R2_HISTORY_DROPBOX_ROOT,
         });
         return null;
       }
 
-      const manifestObject = await r2GetObject({
-        r2: OBS_R2_CONFIG,
-        key: snapshotInfo.manifest_key,
-      });
+      const manifestObject = await loadHistoryObjectBytesByR2Key(
+        snapshotInfo.manifest_key,
+      );
       const manifestText = new TextDecoder().decode(manifestObject.body);
       const manifest = parseCoreSnapshotManifest(
         manifestText,
@@ -4064,10 +4120,9 @@ async function loadR2CoreStationIdsByConnector(): Promise<
         return null;
       }
 
-      const timeseriesObject = await r2GetObject({
-        r2: OBS_R2_CONFIG,
-        key: timeseriesTableKey,
-      });
+      const timeseriesObject = await loadHistoryObjectBytesByR2Key(
+        timeseriesTableKey,
+      );
       const ndjsonText = decodeCoreTableText(
         timeseriesObject.body,
         timeseriesTableKey,
@@ -4082,6 +4137,8 @@ async function loadR2CoreStationIdsByConnector(): Promise<
       logStructured("info", "backfill_core_snapshot_loaded", {
         snapshot_day_utc: r2CoreStationIdsSourceDayUtc,
         manifest_key: snapshotInfo.manifest_key,
+        snapshot_source: snapshotInfo.source,
+        object_source: manifestObject.source,
         timeseries_table_key: timeseriesTableKey,
         connector_count: byConnector.size,
         station_id_count: totalStationIds,
@@ -4107,7 +4164,7 @@ async function loadR2CoreStationRefsByConnector(): Promise<
   if (!SHOULD_USE_R2_CORE_METADATA) {
     return null;
   }
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
   }
   if (r2CoreStationRefsByConnectorPromise) {
@@ -4121,10 +4178,9 @@ async function loadR2CoreStationRefsByConnector(): Promise<
         return null;
       }
 
-      const manifestObject = await r2GetObject({
-        r2: OBS_R2_CONFIG,
-        key: snapshotInfo.manifest_key,
-      });
+      const manifestObject = await loadHistoryObjectBytesByR2Key(
+        snapshotInfo.manifest_key,
+      );
       const manifestText = new TextDecoder().decode(manifestObject.body);
       const manifest = parseCoreSnapshotManifest(
         manifestText,
@@ -4135,10 +4191,9 @@ async function loadR2CoreStationRefsByConnector(): Promise<
         return null;
       }
 
-      const stationsObject = await r2GetObject({
-        r2: OBS_R2_CONFIG,
-        key: stationsTableKey,
-      });
+      const stationsObject = await loadHistoryObjectBytesByR2Key(
+        stationsTableKey,
+      );
       const ndjsonText = decodeCoreTableText(
         stationsObject.body,
         stationsTableKey,
@@ -4273,7 +4328,7 @@ async function fetchStationRefsForConnector(
     };
     stationRefsCache.set(connectorId, lookup);
     if (lookup.source === "ingestdb" && shouldTryR2Core) {
-      logStructured("info", "backfill_station_refs_resolved", {
+      logStructured("warning", "backfill_station_refs_r2_core_fallback", {
         connector_id: connectorId,
         metadata_source: "ingestdb_fallback",
         station_ref_count: stationRefs.size,
@@ -4403,7 +4458,7 @@ async function fetchStationIdsForConnector(
   stationIdCache.set(connectorId, lookup);
 
   if (lookup.source === "ingestdb" && shouldTryR2Core) {
-    logStructured("info", "backfill_station_ids_resolved", {
+    logStructured("warning", "backfill_station_ids_r2_core_fallback", {
       connector_id: connectorId,
       metadata_source: "ingestdb_fallback",
       station_id_count: sorted.length,
@@ -4544,7 +4599,7 @@ function buildSourceLookupFromTimeseriesRows(
 async function loadR2CoreSourceLookupForConnector(
   connectorId: number,
 ): Promise<SourceConnectorLookup | null> {
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
   }
 
@@ -4552,10 +4607,9 @@ async function loadR2CoreSourceLookupForConnector(
   if (!snapshotInfo) {
     return null;
   }
-  const manifestObject = await r2GetObject({
-    r2: OBS_R2_CONFIG,
-    key: snapshotInfo.manifest_key,
-  });
+  const manifestObject = await loadHistoryObjectBytesByR2Key(
+    snapshotInfo.manifest_key,
+  );
   const manifest = parseCoreSnapshotManifest(
     new TextDecoder().decode(manifestObject.body),
     snapshotInfo.manifest_key,
@@ -4565,10 +4619,9 @@ async function loadR2CoreSourceLookupForConnector(
     return null;
   }
 
-  const timeseriesObject = await r2GetObject({
-    r2: OBS_R2_CONFIG,
-    key: timeseriesTableKey,
-  });
+  const timeseriesObject = await loadHistoryObjectBytesByR2Key(
+    timeseriesTableKey,
+  );
   const ndjsonText = decodeCoreTableText(
     timeseriesObject.body,
     timeseriesTableKey,
@@ -4741,7 +4794,7 @@ async function loadR2CoreOpenaqSourceLookupForConnector(
   candidateStationRefs: Set<string>,
   _adapterLabel = "openaq",
 ): Promise<SourceConnectorLookup | null> {
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
   }
 
@@ -4749,10 +4802,9 @@ async function loadR2CoreOpenaqSourceLookupForConnector(
   if (!snapshotInfo) {
     return null;
   }
-  const manifestObject = await r2GetObject({
-    r2: OBS_R2_CONFIG,
-    key: snapshotInfo.manifest_key,
-  });
+  const manifestObject = await loadHistoryObjectBytesByR2Key(
+    snapshotInfo.manifest_key,
+  );
   const manifest = parseCoreSnapshotManifest(
     new TextDecoder().decode(manifestObject.body),
     snapshotInfo.manifest_key,
@@ -4777,10 +4829,10 @@ async function loadR2CoreOpenaqSourceLookupForConnector(
     phenomenaObject,
     observedPropertiesObject,
   ] = await Promise.all([
-    r2GetObject({ r2: OBS_R2_CONFIG, key: stationsTableKey }),
-    r2GetObject({ r2: OBS_R2_CONFIG, key: timeseriesTableKey }),
-    r2GetObject({ r2: OBS_R2_CONFIG, key: phenomenaTableKey }),
-    r2GetObject({ r2: OBS_R2_CONFIG, key: observedPropertiesTableKey }),
+    loadHistoryObjectBytesByR2Key(stationsTableKey),
+    loadHistoryObjectBytesByR2Key(timeseriesTableKey),
+    loadHistoryObjectBytesByR2Key(phenomenaTableKey),
+    loadHistoryObjectBytesByR2Key(observedPropertiesTableKey),
   ]);
 
   const stationRows = parseCoreTableRows(
@@ -4885,7 +4937,10 @@ async function fetchMetadataSourceLookupForConnector(
     );
     if (fromIngest && fromIngest.station_refs.size > 0) {
       sourceLookupCache.set(cacheKey, fromIngest);
-      logStructured("info", "source_lookup_resolved", {
+      logStructured(
+        shouldTryR2Core ? "warning" : "info",
+        "source_lookup_resolved",
+        {
         connector_id: connectorId,
         metadata_source: "ingestdb",
         station_ref_count: fromIngest.station_refs.size,
@@ -4987,7 +5042,10 @@ async function fetchSourceLookupForConnector(
       fromIngestMetadata.binding_by_station_pollutant.size > 0
     ) {
       sourceLookupCache.set(connectorId, fromIngestMetadata);
-      logStructured("info", "source_lookup_resolved", {
+      logStructured(
+        shouldTryR2Core ? "warning" : "info",
+        "source_lookup_resolved",
+        {
         connector_id: connectorId,
         metadata_source: "ingestdb_metadata",
         station_ref_count: fromIngestMetadata.station_refs.size,
@@ -5013,7 +5071,10 @@ async function fetchSourceLookupForConnector(
       fromIngestLegacy.binding_by_station_pollutant.size > 0
     ) {
       sourceLookupCache.set(connectorId, fromIngestLegacy);
-      logStructured("info", "source_lookup_resolved", {
+      logStructured(
+        shouldTryR2Core ? "warning" : "info",
+        "source_lookup_resolved",
+        {
         connector_id: connectorId,
         metadata_source: "ingestdb_legacy_ref",
         station_ref_count: fromIngestLegacy.station_refs.size,
@@ -5100,7 +5161,7 @@ async function resolveConnectorIdByCode(
     }
   }
 
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     return null;
   }
   try {
@@ -5108,10 +5169,9 @@ async function resolveConnectorIdByCode(
     if (!snapshotInfo) {
       return null;
     }
-    const manifestObject = await r2GetObject({
-      r2: OBS_R2_CONFIG,
-      key: snapshotInfo.manifest_key,
-    });
+    const manifestObject = await loadHistoryObjectBytesByR2Key(
+      snapshotInfo.manifest_key,
+    );
     const manifest = parseCoreSnapshotManifest(
       new TextDecoder().decode(manifestObject.body),
       snapshotInfo.manifest_key,
@@ -5120,10 +5180,9 @@ async function resolveConnectorIdByCode(
     if (!connectorsTableKey) {
       return null;
     }
-    const connectorsObject = await r2GetObject({
-      r2: OBS_R2_CONFIG,
-      key: connectorsTableKey,
-    });
+    const connectorsObject = await loadHistoryObjectBytesByR2Key(
+      connectorsTableKey,
+    );
     const ndjsonText = decodeCoreTableText(
       connectorsObject.body,
       connectorsTableKey,
@@ -5182,7 +5241,7 @@ async function resolveConnectorServiceUrl(
     }
   }
 
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
     connectorServiceUrlCache.set(connectorId, null);
     return null;
   }
@@ -5193,10 +5252,9 @@ async function resolveConnectorServiceUrl(
       connectorServiceUrlCache.set(connectorId, null);
       return null;
     }
-    const manifestObject = await r2GetObject({
-      r2: OBS_R2_CONFIG,
-      key: snapshotInfo.manifest_key,
-    });
+    const manifestObject = await loadHistoryObjectBytesByR2Key(
+      snapshotInfo.manifest_key,
+    );
     const manifest = parseCoreSnapshotManifest(
       new TextDecoder().decode(manifestObject.body),
       snapshotInfo.manifest_key,
@@ -5206,10 +5264,9 @@ async function resolveConnectorServiceUrl(
       connectorServiceUrlCache.set(connectorId, null);
       return null;
     }
-    const connectorsObject = await r2GetObject({
-      r2: OBS_R2_CONFIG,
-      key: connectorsTableKey,
-    });
+    const connectorsObject = await loadHistoryObjectBytesByR2Key(
+      connectorsTableKey,
+    );
     const ndjsonText = decodeCoreTableText(
       connectorsObject.body,
       connectorsTableKey,
@@ -6999,6 +7056,278 @@ function parquetKeysFromConnectorManifest(
     }
   }
   return Array.from(keys).sort((left, right) => left.localeCompare(right));
+}
+
+function parseHistoryIsoTimestamp(value: unknown): string | null {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  if (typeof value === "string") {
+    const parsedMs = Date.parse(value);
+    if (!Number.isNaN(parsedMs)) {
+      return new Date(parsedMs).toISOString();
+    }
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  return null;
+}
+
+async function readObsHistoryRowsFromParquetBytes(
+  bytes: Uint8Array,
+): Promise<ObsHistoryRow[]> {
+  const file = toArrayBufferView(bytes);
+  const metadata = await parquetMetadataAsync(file);
+  const rowCount = Math.max(0, Number(metadata.num_rows || 0));
+  if (!rowCount) {
+    return [];
+  }
+  const [timeseriesValues, observedAtValues, valueValues] = await Promise.all([
+    readParquetColumnValues(file, metadata, "timeseries_id", 0, rowCount),
+    readParquetColumnValues(file, metadata, "observed_at", 0, rowCount),
+    readParquetColumnValues(file, metadata, "value", 0, rowCount),
+  ]);
+
+  const rows: ObsHistoryRow[] = [];
+  const length = Math.min(
+    timeseriesValues.length,
+    observedAtValues.length,
+    valueValues.length,
+  );
+  for (let index = 0; index < length; index += 1) {
+    const timeseriesId = Number(timeseriesValues[index]);
+    const observedAtIso = parseHistoryIsoTimestamp(observedAtValues[index]);
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0 || !observedAtIso) {
+      continue;
+    }
+    rows.push({
+      timeseries_id: Math.trunc(timeseriesId),
+      observed_at: observedAtIso,
+      value: toSafeNumber(valueValues[index]),
+    });
+  }
+  return rows;
+}
+
+async function readAqiHistoryRowsFromParquetBytes(
+  bytes: Uint8Array,
+): Promise<AqilevelsHistoryRow[]> {
+  const file = toArrayBufferView(bytes);
+  const metadata = await parquetMetadataAsync(file);
+  const rowCount = Math.max(0, Number(metadata.num_rows || 0));
+  if (!rowCount) {
+    return [];
+  }
+
+  const [
+    timeseriesValues,
+    stationValues,
+    pollutantValues,
+    timestampValues,
+    hourlyValues,
+    rollingValues,
+    sampleValues,
+    daqiValues,
+    eaqiValues,
+  ] = await Promise.all([
+    readParquetColumnValues(file, metadata, "timeseries_id", 0, rowCount),
+    readParquetColumnValues(file, metadata, "station_id", 0, rowCount),
+    readParquetColumnValues(file, metadata, "pollutant_code", 0, rowCount),
+    readParquetColumnValues(file, metadata, "timestamp_hour_utc", 0, rowCount),
+    readParquetColumnValues(file, metadata, "hourly_mean_ugm3", 0, rowCount),
+    readParquetColumnValues(file, metadata, "rolling24h_mean_ugm3", 0, rowCount),
+    readParquetColumnValues(file, metadata, "hourly_sample_count", 0, rowCount),
+    readParquetColumnValues(file, metadata, "daqi_index_level", 0, rowCount),
+    readParquetColumnValues(file, metadata, "eaqi_index_level", 0, rowCount),
+  ]);
+
+  const rows: AqilevelsHistoryRow[] = [];
+  const length = Math.min(
+    timeseriesValues.length,
+    stationValues.length,
+    pollutantValues.length,
+    timestampValues.length,
+    hourlyValues.length,
+    rollingValues.length,
+    sampleValues.length,
+    daqiValues.length,
+    eaqiValues.length,
+  );
+  for (let index = 0; index < length; index += 1) {
+    const timeseriesId = Number(timeseriesValues[index]);
+    const timestampHourUtc = parseHistoryIsoTimestamp(timestampValues[index]);
+    const pollutant = parsePollutantCode(pollutantValues[index]);
+    if (
+      !Number.isInteger(timeseriesId) ||
+      timeseriesId <= 0 ||
+      !timestampHourUtc ||
+      !pollutant
+    ) {
+      continue;
+    }
+    const stationIdRaw = Number(stationValues[index]);
+    rows.push({
+      timeseries_id: Math.trunc(timeseriesId),
+      station_id: Number.isInteger(stationIdRaw) && stationIdRaw > 0
+        ? Math.trunc(stationIdRaw)
+        : null,
+      connector_id: 0,
+      pollutant_code: pollutant,
+      timestamp_hour_utc: timestampHourUtc,
+      hourly_mean_ugm3: toSafeNumber(hourlyValues[index]),
+      rolling24h_mean_ugm3: toSafeNumber(rollingValues[index]),
+      hourly_sample_count: toSafeNumber(sampleValues[index]),
+      daqi_index_level: toSafeNumber(daqiValues[index]),
+      eaqi_index_level: toSafeNumber(eaqiValues[index]),
+    });
+  }
+  return rows;
+}
+
+function parseParquetKeysFromManifestRecord(
+  manifestRecord: Record<string, unknown>,
+): string[] {
+  const keys = new Set<string>();
+  const parquetObjectKeys = Array.isArray(manifestRecord.parquet_object_keys)
+    ? manifestRecord.parquet_object_keys
+    : [];
+  for (const keyRaw of parquetObjectKeys) {
+    const key = String(keyRaw || "").trim();
+    if (key) {
+      keys.add(key);
+    }
+  }
+  const files = Array.isArray(manifestRecord.files) ? manifestRecord.files : [];
+  for (const fileRaw of files) {
+    if (!fileRaw || typeof fileRaw !== "object" || Array.isArray(fileRaw)) {
+      continue;
+    }
+    const key = String((fileRaw as Record<string, unknown>).key || "").trim();
+    if (key) {
+      keys.add(key);
+    }
+  }
+  return Array.from(keys).sort((left, right) => left.localeCompare(right));
+}
+
+async function loadObsRowsForConnectorDayFromLocalHistory(
+  dayUtc: string,
+  connectorId: number,
+): Promise<ObsHistoryRow[] | null> {
+  const manifestKey = buildObsConnectorManifestKey(dayUtc, connectorId);
+  const manifestBytes = loadLocalHistoryObjectBytesByR2Key(manifestKey);
+  if (!manifestBytes) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(manifestBytes));
+  } catch {
+    throw new Error(`Invalid local observation manifest JSON: ${manifestKey}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid local observation manifest object: ${manifestKey}`);
+  }
+  const parquetKeys = parseParquetKeysFromManifestRecord(
+    parsed as Record<string, unknown>,
+  );
+  const rows: ObsHistoryRow[] = [];
+  for (const parquetKey of parquetKeys) {
+    const parquetBytes = loadLocalHistoryObjectBytesByR2Key(parquetKey);
+    if (!parquetBytes) {
+      logStructured("warning", "source_to_r2_merge_local_parquet_missing", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        parquet_key: parquetKey,
+      });
+      continue;
+    }
+    const parsedRows = await readObsHistoryRowsFromParquetBytes(parquetBytes);
+    rows.push(...parsedRows);
+  }
+  return rows;
+}
+
+async function loadAqiRowsForConnectorDayFromLocalHistory(
+  dayUtc: string,
+  connectorId: number,
+): Promise<AqilevelsHistoryRow[] | null> {
+  const manifestKey = buildAqiConnectorManifestKey(dayUtc, connectorId);
+  const manifestBytes = loadLocalHistoryObjectBytesByR2Key(manifestKey);
+  if (!manifestBytes) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(manifestBytes));
+  } catch {
+    throw new Error(`Invalid local AQI manifest JSON: ${manifestKey}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid local AQI manifest object: ${manifestKey}`);
+  }
+  const parquetKeys = parseParquetKeysFromManifestRecord(
+    parsed as Record<string, unknown>,
+  );
+  const rows: AqilevelsHistoryRow[] = [];
+  for (const parquetKey of parquetKeys) {
+    const parquetBytes = loadLocalHistoryObjectBytesByR2Key(parquetKey);
+    if (!parquetBytes) {
+      logStructured("warning", "source_to_r2_merge_local_aqi_parquet_missing", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        parquet_key: parquetKey,
+      });
+      continue;
+    }
+    const parsedRows = await readAqiHistoryRowsFromParquetBytes(parquetBytes);
+    for (const row of parsedRows) {
+      rows.push({ ...row, connector_id: connectorId });
+    }
+  }
+  return rows;
+}
+
+function dedupeObsHistoryRows(rows: ObsHistoryRow[]): ObsHistoryRow[] {
+  const byKey = new Map<string, ObsHistoryRow>();
+  for (const row of rows) {
+    const key = `${row.timeseries_id}|${row.observed_at}`;
+    byKey.set(key, row);
+  }
+  return Array.from(byKey.values()).sort((left, right) => {
+    if (left.timeseries_id !== right.timeseries_id) {
+      return left.timeseries_id - right.timeseries_id;
+    }
+    if (left.observed_at < right.observed_at) return -1;
+    if (left.observed_at > right.observed_at) return 1;
+    return 0;
+  });
+}
+
+function dedupeAqiHistoryRows(
+  rows: AqilevelsHistoryRow[],
+): AqilevelsHistoryRow[] {
+  const byKey = new Map<string, AqilevelsHistoryRow>();
+  for (const row of rows) {
+    const key =
+      `${row.timeseries_id}|${row.pollutant_code}|${row.timestamp_hour_utc}`;
+    byKey.set(key, row);
+  }
+  return Array.from(byKey.values()).sort((left, right) => {
+    if (left.timeseries_id !== right.timeseries_id) {
+      return left.timeseries_id - right.timeseries_id;
+    }
+    if (left.pollutant_code < right.pollutant_code) return -1;
+    if (left.pollutant_code > right.pollutant_code) return 1;
+    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
+    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
+    return 0;
+  });
 }
 
 async function fetchSourceObservationRowsForConnectorFromR2ObservationHistory(
@@ -10445,14 +10774,100 @@ async function runSourceToAll(
         );
         rowsRead += dedupedObservationRows.length;
 
-        const obsHistoryRows = sourceObservationsToObsHistoryRows(
+        let obsHistoryRows = sourceObservationsToObsHistoryRows(
           dedupedObservationRows,
         );
-        const helperRows = sourceObservationRowsToHelperRowsForDay(
-          dedupedObservationRows,
-          dayUtc,
-        );
-        const aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
+        let aqilevelRows: AqilevelsHistoryRow[] = [];
+
+        if (
+          SOURCE_TO_R2_TARGETED_MERGE &&
+          REQUESTED_TIMESERIES_IDS &&
+          REQUESTED_TIMESERIES_IDS.length > 0
+        ) {
+          const connectorLookup = await fetchSourceLookupForConnector(connectorId);
+          const requestedSet = new Set(REQUESTED_TIMESERIES_IDS);
+          const targetedTimeseriesIds = sortedUniquePositiveInts(
+            Array.from(requestedSet).filter((timeseriesId) =>
+              connectorLookup.binding_by_timeseries_id.has(timeseriesId)
+            ),
+          );
+          if (targetedTimeseriesIds.length > 0) {
+            const targetedSet = new Set(targetedTimeseriesIds);
+            const localObsRows = await loadObsRowsForConnectorDayFromLocalHistory(
+              dayUtc,
+              connectorId,
+            );
+            const localAqiRows = await loadAqiRowsForConnectorDayFromLocalHistory(
+              dayUtc,
+              connectorId,
+            );
+            if (!localObsRows || !localAqiRows) {
+              throw new Error(
+                `source_to_r2 targeted merge requires local Dropbox history manifests for day=${dayUtc} connector=${connectorId}`,
+              );
+            }
+
+            const replacementObsRows = obsHistoryRows.filter((row) =>
+              targetedSet.has(row.timeseries_id)
+            );
+            const preservedObsRows = localObsRows.filter((row) =>
+              !targetedSet.has(row.timeseries_id)
+            );
+            obsHistoryRows = dedupeObsHistoryRows([
+              ...preservedObsRows,
+              ...replacementObsRows,
+            ]);
+
+            const mergedSourceRows = mapR2ObservationRowsToSourceObservations({
+              rows: obsHistoryRows.map((row) => ({
+                timeseries_id: row.timeseries_id,
+                observed_at: row.observed_at,
+                value: row.value,
+              })),
+              bindingByTimeseriesId: connectorLookup.binding_by_timeseries_id,
+              windowStartIso: utcDayStartIso(dayUtc),
+              windowEndIso: utcDayStartIso(shiftIsoDay(dayUtc, 1)),
+            });
+            const replacementAqiRows = helperRowsToAqilevelHistoryRows(
+              sourceObservationRowsToHelperRowsForDay(
+                mergedSourceRows.filter((row) =>
+                  targetedSet.has(row.timeseries_id)
+                ),
+                dayUtc,
+              ),
+            );
+            const preservedAqiRows = localAqiRows.filter((row) =>
+              !targetedSet.has(row.timeseries_id)
+            );
+            aqilevelRows = dedupeAqiHistoryRows([
+              ...preservedAqiRows,
+              ...replacementAqiRows,
+            ]).map((row) => ({ ...row, connector_id: connectorId }));
+
+            sourceCheckpointJson.targeted_merge = true;
+            sourceCheckpointJson.targeted_timeseries_ids = targetedTimeseriesIds;
+            sourceCheckpointJson.targeted_replacement_obs_rows =
+              replacementObsRows.length;
+            sourceCheckpointJson.targeted_preserved_obs_rows =
+              preservedObsRows.length;
+            sourceCheckpointJson.targeted_replacement_aqi_rows =
+              replacementAqiRows.length;
+            sourceCheckpointJson.targeted_preserved_aqi_rows =
+              preservedAqiRows.length;
+          } else {
+            const helperRows = sourceObservationRowsToHelperRowsForDay(
+              dedupedObservationRows,
+              dayUtc,
+            );
+            aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
+          }
+        } else {
+          const helperRows = sourceObservationRowsToHelperRowsForDay(
+            dedupedObservationRows,
+            dayUtc,
+          );
+          aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
+        }
         rowsWrittenAqilevels += aqilevelRows.length;
 
         if (obsHistoryRows.length === 0 || aqilevelRows.length === 0) {
@@ -10798,6 +11213,9 @@ async function main(): Promise<void> {
     observations_row_group_size: OBS_R2_ROW_GROUP_SIZE,
     aqilevels_part_max_rows: AQI_R2_PART_MAX_ROWS,
     aqilevels_row_group_size: AQI_R2_ROW_GROUP_SIZE,
+    source_to_r2_targeted_merge: SOURCE_TO_R2_TARGETED_MERGE,
+    requested_timeseries_ids: REQUESTED_TIMESERIES_IDS,
+    r2_history_dropbox_root: R2_HISTORY_DROPBOX_ROOT,
     allow_stub_modes: ALLOW_STUB_MODES,
     ledger_enabled: ledgerEnabled,
   });

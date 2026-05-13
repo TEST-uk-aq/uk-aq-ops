@@ -9,7 +9,7 @@ Usage (all available source adapters/connectors):
   export UK_AQ_BACKFILL_FORCE_REPLACE="true"
   export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
   export UK_AQ_BACKFILL_TO_DAY_UTC="2025-01-31"
-  ./scripts/uk_aq_backfill_local_monthly.sh
+  ./scripts/uk_aq_backfill_local.sh
 
 Source adapter export to R2:
   export UK_AQ_BACKFILL_RUN_MODE="source_to_r2"
@@ -17,7 +17,7 @@ Source adapter export to R2:
   export UK_AQ_BACKFILL_FORCE_REPLACE="false"
   export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
   export UK_AQ_BACKFILL_TO_DAY_UTC="2025-12-31"
-  ./scripts/uk_aq_backfill_local_monthly.sh
+  ./scripts/uk_aq_backfill_local.sh
 
 Optional env vars:
   UK_AQ_BACKFILL_RUN_JOB_PATH               optional path override for run_job.ts
@@ -25,16 +25,16 @@ Optional env vars:
   UK_AQ_BACKFILL_CONNECTOR_IDS              optional CSV filter (unset for all available adapters)
   UK_AQ_BACKFILL_TIMESERIES_IDS             optional CSV timeseries filter
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
-  UK_AQ_BACKFILL_MONTHLY_LOG_DIR            default: logs/backfill/monthly
-  UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR      default: true
-  UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS default: 0
-  UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE  default: 0 (disabled)
-  UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR    default: 0 (disabled)
-  UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS      legacy alias for month run interval
+  UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: logs/backfill/local
+  UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true
+  UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS       default: 0
+  UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE        default: 0 (disabled)
+  UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR          default: 0 (disabled)
+  UK_AQ_BACKFILL_PAUSE_SECONDS              legacy alias for run interval
 
 Notes:
   - This script is local/manual-only and always sets UK_AQ_BACKFILL_TRIGGER_MODE=manual.
-  - This script calls the active local backfill run_job.ts once per month.
+  - This script calls the active local backfill run_job.ts in day windows (internally chunked for pacing).
   - Archive paths are retired and are never valid runner paths for active runs.
   - With UK_AQ_BACKFILL_FORCE_REPLACE=false, already-backed-up connector/day outputs are skipped.
   - r2_history_obs_to_aqilevels reads committed history/v1/observations manifests/parquet only and rewrites history/v1/aqilevels outputs.
@@ -141,7 +141,7 @@ resolve_run_job_path() {
     return 0
   fi
 
-  local active_runner="${repo_root}/workers/uk_aq_backfill_cloud_run/run_job.ts"
+  local active_runner="${repo_root}/workers/uk_aq_backfill_local/run_job.ts"
   if [[ ! -f "${active_runner}" ]]; then
     echo "Active backfill runner not found: ${active_runner}" >&2
     return 1
@@ -242,11 +242,11 @@ REQUESTED_TO_DAY_UTC="${TO_DAY_UTC}"
 REQUESTED_TRIGGER_MODE="$(trim "${UK_AQ_BACKFILL_TRIGGER_MODE:-manual}")"
 
 ENABLE_R2_FALLBACK_RAW="$(trim "${UK_AQ_BACKFILL_ENABLE_R2_FALLBACK:-false}")"
-LOG_DIR="$(trim "${UK_AQ_BACKFILL_MONTHLY_LOG_DIR:-logs/backfill/monthly}")"
-STOP_ON_ERROR_RAW="$(trim "${UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR:-true}")"
-MONTH_RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS:-0}}")"
-MONTH_MAX_RUNS_PER_MINUTE_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE:-0}")"
-MONTH_MAX_RUNS_PER_HOUR_RAW="$(trim "${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR:-0}")"
+LOG_DIR="$(trim "${UK_AQ_BACKFILL_LOCAL_LOG_DIR:-${UK_AQ_BACKFILL_MONTHLY_LOG_DIR:-logs/backfill/local}}")"
+STOP_ON_ERROR_RAW="$(trim "${UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR:-${UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR:-true}}")"
+MONTH_RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_PAUSE_SECONDS:-${UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS:-0}}}}")"
+MONTH_MAX_RUNS_PER_MINUTE_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE:-${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE:-0}}")"
+MONTH_MAX_RUNS_PER_HOUR_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR:-${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR:-0}}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
@@ -272,12 +272,12 @@ if ! ENABLE_R2_FALLBACK="$(parse_bool "${ENABLE_R2_FALLBACK_RAW}")"; then
 fi
 
 if ! STOP_ON_ERROR="$(parse_bool "${STOP_ON_ERROR_RAW}")"; then
-  echo "Invalid UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR: ${STOP_ON_ERROR_RAW}" >&2
+  echo "Invalid UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR: ${STOP_ON_ERROR_RAW}" >&2
   exit 2
 fi
 
 if ! [[ "${MONTH_RUN_INTERVAL_SECONDS_RAW}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS: ${MONTH_RUN_INTERVAL_SECONDS_RAW}" >&2
+  echo "Invalid UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS: ${MONTH_RUN_INTERVAL_SECONDS_RAW}" >&2
   exit 2
 fi
 MONTH_RUN_INTERVAL_SECONDS="${MONTH_RUN_INTERVAL_SECONDS_RAW}"
@@ -361,11 +361,11 @@ while IFS=' ' read -r month_from month_to; do
   log_file="${LOG_DIR}/${RUN_MODE}_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${month_from}_to_${month_to}.log"
 
   echo ""
-  echo "=== Month ${month_count}: ${month_from} -> ${month_to} ==="
+  echo "=== Window ${month_count}: ${month_from} -> ${month_to} ==="
   echo "Log: ${log_file}"
   echo "Run mode: ${RUN_MODE}"
   echo "Requested window: ${REQUESTED_FROM_DAY_UTC} -> ${REQUESTED_TO_DAY_UTC}"
-  echo "Actual month window: ${month_from} -> ${month_to}"
+  echo "Actual window: ${month_from} -> ${month_to}"
   echo "Connector filter: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
   echo "Force replace: ${FORCE_REPLACE}"
   echo "Runner: ${RUN_JOB_PATH}"
@@ -378,15 +378,15 @@ while IFS=' ' read -r month_from month_to; do
   export UK_AQ_BACKFILL_FROM_DAY_UTC="${month_from}"
   export UK_AQ_BACKFILL_TO_DAY_UTC="${month_to}"
 
-  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_MINUTE}" 60 "monthly-run per-minute"
-  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_HOUR}" 3600 "monthly-run per-hour"
+  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_MINUTE}" 60 "local-backfill per-minute"
+  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_HOUR}" 3600 "local-backfill per-hour"
   RUN_START_EPOCHS+=("$(date +%s)")
 
   if deno run --allow-env --allow-net --allow-read --allow-write --allow-run \
     "${RUN_JOB_PATH}" | tee "${log_file}"; then
-    echo "Month ${month_from} -> ${month_to}: ok"
+    echo "Window ${month_from} -> ${month_to}: ok"
   else
-    echo "Month ${month_from} -> ${month_to}: failed" >&2
+    echo "Window ${month_from} -> ${month_to}: failed" >&2
     failures+=("${month_from}..${month_to}")
     if [[ "${STOP_ON_ERROR}" == "true" ]]; then
       break
@@ -399,8 +399,8 @@ while IFS=' ' read -r month_from month_to; do
 done <<< "${month_ranges}"
 
 echo ""
-echo "=== Monthly Backfill Summary ==="
-echo "Months attempted: ${month_count}"
+echo "=== Local Backfill Summary ==="
+echo "Windows attempted: ${month_count}"
 echo "Failures: ${#failures[@]}"
 if [[ "${#failures[@]}" -gt 0 ]]; then
   printf '%s\n' "${failures[@]}" | sed 's/^/ - /'
@@ -420,4 +420,4 @@ if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MOD
   fi
 fi
 
-echo "All month windows completed successfully."
+echo "All windows completed successfully."
