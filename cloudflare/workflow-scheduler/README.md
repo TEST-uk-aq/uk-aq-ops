@@ -46,6 +46,21 @@ wrangler deploy
 - `35 4 * * *`
 - `49 5 * * *`
 
+## GitHub Actions Deploy (Ops Repo)
+
+Manual deploy workflow:
+- `.github/workflows/uk_aq_workflow_scheduler_deploy.yml`
+- It auto-creates `cloudflare/workflow-scheduler/wrangler.toml` from `wrangler.toml.example` during the run.
+
+Required GitHub repo configuration for that workflow:
+- Secret: `CLOUDFLARE_ACCOUNT_ID`
+- Secret: `CLOUDFLARE_API_TOKEN`
+- Reserved secret: `GITHUB_TOKEN`
+
+Optional:
+- Variable: `UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME` (default `uk-aq-workflow-scheduler`)
+- Secret: `UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY`
+
 ## Testing
 
 1. Trigger a scheduled event manually from Cloudflare Worker dashboard (`Run` on a scheduled trigger), temporarily set a near-future cron, or call `/run` if `MANUAL_TRIGGER_KEY` is configured.
