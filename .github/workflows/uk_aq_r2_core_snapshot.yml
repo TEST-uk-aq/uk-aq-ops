@@ -1,8 +1,11 @@
 name: UK AQ R2 Core Snapshot
 
 on:
-  schedule:
-    - cron: "15 4 * * *"
+  # Intended external schedule:
+  #   04:15 UTC daily via Cloudflare Worker
+  # Previous GitHub cron:
+  #   schedule:
+  #     - cron: "15 4 * * *"
   workflow_dispatch:
     inputs:
       dry_run:

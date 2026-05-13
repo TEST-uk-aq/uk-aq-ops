@@ -1,8 +1,11 @@
 name: UK AQ R2 History Dropbox Backup
 
 on:
-  schedule:
-    - cron: "35 4 * * *"
+  # Intended external schedule:
+  #   04:35 UTC daily via Cloudflare Worker
+  # Previous GitHub cron:
+  #   schedule:
+  #     - cron: "35 4 * * *"
   workflow_dispatch:
     inputs:
       dry_run:

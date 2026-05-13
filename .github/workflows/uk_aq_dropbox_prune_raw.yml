@@ -1,12 +1,19 @@
 name: UK AQ Dropbox Prune Raw Data
 
 on:
-  schedule:
-    - cron: "49 5 * * *"
+  # Intended external schedule:
+  #   05:49 UTC daily via Cloudflare Worker
+  # Previous GitHub cron:
+  #   schedule:
+  #     - cron: "49 5 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: uk-aq-dropbox-prune-raw
+  cancel-in-progress: false
 
 jobs:
   prune-dropbox-raw-data:

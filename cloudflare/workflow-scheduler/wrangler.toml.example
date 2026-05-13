@@ -1,0 +1,13 @@
+name = "uk-aq-workflow-scheduler"
+main = "worker.js"
+compatibility_date = "2026-05-13"
+
+# Configure one deployment per Cloudflare account/environment (CIC-Test or LIVE).
+# Keep these triggers aligned with JOBS[].cron in worker.js.
+[triggers]
+crons = [
+  "0 3 * * *",
+  "15 4 * * *",
+  "35 4 * * *",
+  "49 5 * * *",
+]
