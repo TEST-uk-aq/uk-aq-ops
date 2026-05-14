@@ -31,6 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -45,9 +46,11 @@ REQUIRED_ENV_VARS = (
     "UK_AQ_HISTORY_INTEGRITY_LOG_DIR",
     "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR",
     "UK_AQ_HISTORY_INTEGRITY_LOCK_DIR",
+    "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT",
 )
 
 PATH_VARS_FOR_GUARDRAILS = (
+    "UK_AQ_HISTORY_INTEGRITY_ROOT",
     "UK_AQ_HISTORY_INTEGRITY_STATE_DIR",
     "UK_AQ_HISTORY_INTEGRITY_DB_PATH",
     "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR",
@@ -58,6 +61,8 @@ PATH_VARS_FOR_GUARDRAILS = (
     "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH",
     "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
     "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT",
+    "UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER",
+    "UK_AQ_INTEGRITY_BACKFILL_WRAPPER",
     "UK_AQ_BACKFILL_WRAPPER",
     "UK_AQ_BACKFILL_ENV_FILE",
 )
@@ -70,6 +75,17 @@ PROFILE_START_WINDOWS_DAYS = {
 }
 
 DEFAULT_INGESTDB_RETENTION_DAYS = 5
+
+
+def resolve_integrity_backfill_wrapper() -> str:
+    for name in (
+        "UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER",
+        "UK_AQ_INTEGRITY_BACKFILL_WRAPPER",
+    ):
+        raw = str(os.environ.get(name, "")).strip()
+        if raw:
+            return raw
+    return ""
 
 # ---------------------------------------------------------------------------
 # Phase 2 — core snapshot import
@@ -216,6 +232,30 @@ CREATE INDEX IF NOT EXISTS idx_cross_checks_run
 CREATE INDEX IF NOT EXISTS idx_cross_checks_day_connector
   ON cross_checks(day_utc, connector_id, timeseries_id);
 
+CREATE TABLE IF NOT EXISTS aqi_rebuild_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  env_name TEXT NOT NULL,
+  connector_id INTEGER NOT NULL,
+  day_utc TEXT NOT NULL,
+
+  reason TEXT NOT NULL,
+  source_mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+
+  requested_timeseries_ids TEXT,
+  notes TEXT,
+
+  created_at_utc TEXT NOT NULL,
+  started_at_utc TEXT,
+  finished_at_utc TEXT,
+
+  UNIQUE(run_id, connector_id, day_utc)
+);
+
+CREATE INDEX IF NOT EXISTS idx_aqi_rebuild_queue_run_status
+  ON aqi_rebuild_queue(run_id, status, connector_id, day_utc);
+
 CREATE TABLE IF NOT EXISTS source_file_state (
   source_file_key TEXT PRIMARY KEY,
 
@@ -324,6 +364,22 @@ CREATE TABLE IF NOT EXISTS integrity_runs (
   cross_checks_source_only INTEGER DEFAULT 0,
   cross_checks_r2_only INTEGER DEFAULT 0,
   cross_checks_r2_manifest_missing INTEGER DEFAULT 0,
+  observation_backfills_attempted INTEGER DEFAULT 0,
+  observation_backfills_ok INTEGER DEFAULT 0,
+  observation_backfills_failed INTEGER DEFAULT 0,
+  aqi_rebuilds_queued_from_obs_repair INTEGER DEFAULT 0,
+  aqi_health_connector_days_checked INTEGER DEFAULT 0,
+  aqi_health_rebuilds_queued INTEGER DEFAULT 0,
+  aqi_health_skipped_already_obs_repaired INTEGER DEFAULT 0,
+  aqi_health_manifest_missing INTEGER DEFAULT 0,
+  aqi_health_manifest_stale INTEGER DEFAULT 0,
+  aqi_health_manifest_empty INTEGER DEFAULT 0,
+  aqi_health_previous_rebuild_failed INTEGER DEFAULT 0,
+  aqi_rebuilds_queued_total INTEGER DEFAULT 0,
+  aqi_rebuilds_attempted INTEGER DEFAULT 0,
+  aqi_rebuilds_complete INTEGER DEFAULT 0,
+  aqi_rebuilds_failed INTEGER DEFAULT 0,
+  aqi_rebuilds_skipped INTEGER DEFAULT 0,
 
   warnings_count INTEGER DEFAULT 0,
   errors_count INTEGER DEFAULT 0,
@@ -855,6 +911,11 @@ OPENAQ_SOURCE_KEY = "openaq"
 OPENAQ_DEFAULT_BASE_URL = "https://openaq-data-archive.s3.amazonaws.com"
 OPENAQ_REMOTE_SCHEME = "s3"
 OPENAQ_HTTP_TIMEOUT_SECONDS = 30
+HTTP_RETRY_ATTEMPTS = 3
+HTTP_RETRY_BASE_SECONDS = 0.5
+HTTP_RETRY_MAX_SECONDS = 3.0
+RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_OS_ERRNOS = {54, 60, 104, 110, 111, 10054, 10060}
 
 
 DEFAULT_CONCURRENCY = 8
@@ -996,13 +1057,28 @@ def _http_head(url: str, timeout: int = OPENAQ_HTTP_TIMEOUT_SECONDS) -> dict[str
     headers rather than raising — 404 is a normal outcome for absent files.
     """
     req = urllib.request.Request(url, method="HEAD")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            headers = dict(resp.headers)
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        headers = dict(e.headers or {})
-        status = e.code
+    headers: dict[str, Any] = {}
+    status: int | None = None
+    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                headers = dict(resp.headers)
+                status = resp.status
+            break
+        except urllib.error.HTTPError as e:
+            if _is_retryable_url_error(e) and attempt < HTTP_RETRY_ATTEMPTS:
+                _sleep_http_retry("HEAD", url, attempt, e)
+                continue
+            headers = dict(e.headers or {})
+            status = e.code
+            break
+        except Exception as e:
+            if _is_retryable_url_error(e) and attempt < HTTP_RETRY_ATTEMPTS:
+                _sleep_http_retry("HEAD", url, attempt, e)
+                continue
+            raise
+    if status is None:
+        raise RuntimeError(f"HEAD {url} failed with unknown status")
 
     cl_raw = headers.get("Content-Length")
     try:
@@ -1029,18 +1105,72 @@ def _http_get_to_file(
     accept the result based on Content-Length signaled in the HEAD."""
     req = urllib.request.Request(url, method="GET")
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    bytes_written = 0
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"GET {url} returned {resp.status}")
-        with dest_path.open("wb") as fh:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                bytes_written += len(chunk)
-    return bytes_written
+    tmp_path = dest_path.with_name(dest_path.name + ".part")
+    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+        bytes_written = 0
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"GET {url} returned {resp.status}")
+                with tmp_path.open("wb") as fh:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        bytes_written += len(chunk)
+            os.replace(tmp_path, dest_path)
+            return bytes_written
+        except Exception as e:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            if _is_retryable_url_error(e) and attempt < HTTP_RETRY_ATTEMPTS:
+                _sleep_http_retry("GET", url, attempt, e)
+                continue
+            raise
+    raise RuntimeError(f"GET {url} failed after retries")
+
+
+def _is_retryable_url_error(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(exc.code) in RETRYABLE_HTTP_STATUS_CODES
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, BaseException):
+            return _is_retryable_url_error(reason)
+        reason_text = str(reason).lower()
+        return (
+            "timed out" in reason_text
+            or "connection reset by peer" in reason_text
+            or "temporarily unavailable" in reason_text
+        )
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, ConnectionError):
+        return True
+    if isinstance(exc, OSError):
+        if exc.errno in RETRYABLE_OS_ERRNOS:
+            return True
+        text = str(exc).lower()
+        return "connection reset by peer" in text or "timed out" in text
+    return False
+
+
+def _sleep_http_retry(operation: str, url: str, attempt: int, exc: BaseException) -> None:
+    delay = min(HTTP_RETRY_MAX_SECONDS, HTTP_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    logging.getLogger(__name__).debug(
+        "%s retry %s/%s url=%s delay=%.2fs error=%s",
+        operation,
+        attempt,
+        HTTP_RETRY_ATTEMPTS,
+        url,
+        delay,
+        exc,
+    )
+    time.sleep(delay)
 
 
 def _sha256_uncompressed_gzip(path: Path, chunk_size: int = 65536) -> str:
@@ -1688,27 +1818,25 @@ def _planned_backfill_command(
     env: dict[str, str],
     timeseries_ids: list[int],
     day: dt.date,
+    connector_ids: list[int] | None = None,
+    output_scope: str | None = None,
 ) -> str:
-    wrapper_raw = str(
-        env.get("UK_AQ_BACKFILL_WRAPPER")
-        or os.environ.get("UK_AQ_BACKFILL_WRAPPER")
-        or ""
-    ).strip()
+    wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
         env.get("UK_AQ_BACKFILL_ENV_FILE")
         or os.environ.get("UK_AQ_BACKFILL_ENV_FILE")
         or "<UK_AQ_BACKFILL_ENV_FILE unset>"
     ).strip()
-    if not wrapper_raw:
-        wrapper = "<UK_AQ_BACKFILL_WRAPPER unset>"
-    else:
-        wrapper = wrapper_raw
+    wrapper = wrapper_raw or "<integrity backfill wrapper unset>"
+    connector_csv = ",".join(str(c) for c in (connector_ids or []) if int(c) > 0)
     ids_csv = ",".join(str(t) for t in timeseries_ids)
     iso = day.isoformat()
     return (
         f"UK_AQ_BACKFILL_RUN_MODE=source_to_r2 "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
         f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
+        f"{f'UK_AQ_BACKFILL_OUTPUT_SCOPE={output_scope} ' if output_scope else ''}"
+        f"{f'UK_AQ_BACKFILL_CONNECTOR_IDS={connector_csv} ' if connector_csv else ''}"
         f"UK_AQ_BACKFILL_TIMESERIES_IDS={ids_csv} "
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
@@ -1731,6 +1859,45 @@ def _load_env_file(path: Path) -> dict[str, str]:
     """Parse a bash-style KEY=VALUE env file. Strips matching surrounding
     single or double quotes. Skips blank lines and #-comments. Tolerates an
     optional leading 'export '."""
+    def _strip_inline_comment(value: str) -> str:
+        in_single = False
+        in_double = False
+        escaped = False
+        out: list[str] = []
+        prev = ""
+        for i, ch in enumerate(value):
+            if in_single:
+                if ch == "'":
+                    in_single = False
+                out.append(ch)
+                prev = ch
+                continue
+            if in_double:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_double = False
+                out.append(ch)
+                prev = ch
+                continue
+            if ch == "'":
+                in_single = True
+                out.append(ch)
+                prev = ch
+                continue
+            if ch == '"':
+                in_double = True
+                out.append(ch)
+                prev = ch
+                continue
+            if ch == "#" and (i == 0 or prev.isspace()):
+                break
+            out.append(ch)
+            prev = ch
+        return "".join(out).strip()
+
     out: dict[str, str] = {}
     with path.open() as fh:
         for raw in fh:
@@ -1741,7 +1908,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
             key = key.strip()
             if key.startswith("export "):
                 key = key[len("export "):].strip()
-            val = val.strip()
+            val = _strip_inline_comment(val)
             if len(val) >= 2 and (
                 (val.startswith('"') and val.endswith('"'))
                 or (val.startswith("'") and val.endswith("'"))
@@ -1750,6 +1917,20 @@ def _load_env_file(path: Path) -> dict[str, str]:
             if key:
                 out[key] = val
     return out
+
+
+def _summarize_loaded_backfill_env_keys(loaded: dict[str, str]) -> list[str]:
+    return sorted(
+        key
+        for key in (
+            "UK_AQ_BACKFILL_RUN_MODE",
+            "UK_AQ_BACKFILL_OUTPUT_SCOPE",
+            "UK_AQ_BACKFILL_RUN_JOB_PATH",
+            "INGESTDB_RETENTION_DAYS",
+            "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
+        )
+        if key in loaded
+    )
 
 
 def _tail_bytes(text: str, limit: int = BACKFILL_OUTPUT_TAIL_BYTES) -> str:
@@ -1765,12 +1946,15 @@ def run_narrow_backfill(
     *,
     wrapper_path: str | None,
     env_file_path: str | None,
+    env_name: str,
     timeseries_ids: list[int],
+    connector_ids: list[int] | None = None,
     day: dt.date,
     log: logging.Logger,
     timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
     log_dir: Path | None = None,
     log_label: str | None = None,
+    output_scope: str | None = None,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one (timeseries-ids, day).
 
@@ -1812,9 +1996,12 @@ def run_narrow_backfill(
             result["error"] = f"env file not found: {env_file_path}"
             return result
         loaded = _load_env_file(Path(env_file_path))
+        interesting_keys = _summarize_loaded_backfill_env_keys(loaded)
         log.info(
-            "backfill loading env_file=%s vars=%s",
-            env_file_path, sorted(loaded.keys()),
+            "backfill loading env_file=%s var_count=%s keys=%s",
+            env_file_path,
+            len(loaded),
+            interesting_keys,
         )
         sub_env.update(loaded)
 
@@ -1823,12 +2010,16 @@ def run_narrow_backfill(
         "UK_AQ_BACKFILL_RUN_MODE": "source_to_r2",
         "UK_AQ_BACKFILL_DRY_RUN": "false",
         "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
+        "UK_AQ_BACKFILL_OUTPUT_SCOPE": output_scope or "default",
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TIMESERIES_IDS": ",".join(str(t) for t in timeseries_ids),
         # Always force trigger_mode=manual (wrapper enforces this anyway).
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
     })
+    connector_csv = ",".join(str(c) for c in (connector_ids or []) if int(c) > 0)
+    if connector_csv:
+        sub_env["UK_AQ_BACKFILL_CONNECTOR_IDS"] = connector_csv
     # Reuse integrity OpenAQ local source-cache as the backfill mirror root
     # unless backfill-specific mirror root is already explicitly set.
     if not (sub_env.get("UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT") or "").strip():
@@ -1842,15 +2033,38 @@ def run_narrow_backfill(
 
     started = time.monotonic()
     log.info(
-        "backfill invoke wrapper=%s day=%s timeseries_ids=%s",
-        wrapper_path, iso, sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
+        "backfill invoke wrapper=%s day=%s connector_ids=%s timeseries_ids=%s",
+        wrapper_path,
+        iso,
+        sub_env.get("UK_AQ_BACKFILL_CONNECTOR_IDS", "all"),
+        sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
     )
+
+    wrapper_name = Path(wrapper_path).name
+    cmd = ["bash", wrapper_path]
+    if wrapper_name == "uk_aq_integrity_backfill.sh":
+        cmd = [
+            "bash",
+            wrapper_path,
+            "--env",
+            env_name,
+            "--observs-only",
+            "--from-day",
+            iso,
+            "--to-day",
+            iso,
+            "--timeseries-ids",
+            sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
+        ]
+        if connector_csv:
+            first_connector = connector_csv.split(",", 1)[0]
+            cmd.extend(["--connector-id", first_connector])
 
     stdout_text = ""
     stderr_text = ""
     try:
         proc = subprocess.run(
-            ["bash", wrapper_path],
+            cmd,
             env=sub_env,
             capture_output=True,
             text=True,
@@ -1890,7 +2104,10 @@ def run_narrow_backfill(
                 fh.write(f"# wrapper: {wrapper_path}\n")
                 fh.write(f"# env_file: {env_file_path}\n")
                 fh.write(f"# day: {iso}\n")
+                fh.write(f"# connector_ids: {sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n")
                 fh.write(f"# timeseries_ids: {sub_env['UK_AQ_BACKFILL_TIMESERIES_IDS']}\n")
+                fh.write(f"# output_scope: {sub_env.get('UK_AQ_BACKFILL_OUTPUT_SCOPE', 'default')}\n")
+                fh.write(f"# command: {' '.join(cmd)}\n")
                 fh.write(f"# exit_code: {result['exit_code']}\n")
                 fh.write(f"# status: {result['status']}\n")
                 fh.write("\n# === STDOUT ===\n")
@@ -2051,6 +2268,9 @@ def check_openaq(
     db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
     log.info("openaq: concurrency=%s", concurrency)
 
+    progress = SingleLineProgress("openaq progress")
+    total_tasks = 0
+    completed_tasks = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
         futures: list[concurrent.futures.Future] = []
         for loc in locations:
@@ -2064,16 +2284,42 @@ def check_openaq(
                     db_path, env_name, base_url, loc, day,
                     tmp_dir, cache_root, log, limits,
                 ))
+        total_tasks = len(futures)
+        progress.update(
+            (
+                f"0/{total_tasks} checked=0 changed=0 downloaded=0 "
+                f"missing=0 errors=0 planned_backfills=0"
+            ),
+            force=True,
+        )
 
         for fut in concurrent.futures.as_completed(futures):
+            completed_tasks += 1
             try:
                 result = fut.result()
             except Exception as exc:
                 metrics["errors"] += 1
                 log.warning("openaq worker raised: %s", exc)
+                progress.update(
+                    (
+                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills={len(metrics['planned_backfills'])}"
+                    ),
+                )
                 continue
             outcome = result.get("outcome")
             if outcome == "stopped":
+                progress.update(
+                    (
+                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills={len(metrics['planned_backfills'])} "
+                        f"stopped_for={limits.stopped_for or 'n/a'}"
+                    ),
+                )
                 continue
             metrics["head_checked"] += 1
             if outcome in {"missing_first_seen", "missing_disappeared", "still_missing"}:
@@ -2100,6 +2346,24 @@ def check_openaq(
             if bytes_added:
                 metrics["downloaded_bytes"] += bytes_added
                 limits.add_bytes(bytes_added)
+            progress.update(
+                (
+                    f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                    f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                    f"missing={metrics['missing']} errors={metrics['errors']} "
+                    f"planned_backfills={len(metrics['planned_backfills'])}"
+                ),
+            )
+    progress.update(
+        (
+            f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+            f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+            f"missing={metrics['missing']} errors={metrics['errors']} "
+            f"planned_backfills={len(metrics['planned_backfills'])}"
+        ),
+        force=True,
+    )
+    progress.finish()
 
     # Sort for deterministic reports (completion order is non-deterministic).
     metrics["changed_files"].sort(key=lambda e: (e["day"], e["location_id"]))
@@ -2119,6 +2383,13 @@ def check_openaq(
         by_day: dict[str, list[dict[str, Any]]] = {}
         for entry in metrics["changed_files"]:
             by_day.setdefault(entry["day"], []).append(entry)
+        backfill_progress = SingleLineProgress("openaq backfill")
+        total_backfill_days = len(by_day)
+        done_backfill_days = 0
+        backfill_progress.update(
+            f"0/{total_backfill_days} attempted=0 ok=0 failed=0",
+            force=True,
+        )
         for day_iso in sorted(by_day):
             if limits.should_stop():
                 log.warning(
@@ -2134,8 +2405,9 @@ def check_openaq(
                 day_iso, len(group), len(union_ids),
             )
             bf = run_narrow_backfill(
-                wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
+                wrapper_path=resolve_integrity_backfill_wrapper(),
                 env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
                 timeseries_ids=union_ids,
                 day=dt.date.fromisoformat(day_iso),
                 log=log,
@@ -2158,6 +2430,25 @@ def check_openaq(
                 metrics["backfills_ok"] += 1
             else:
                 metrics["backfills_failed"] += 1
+            done_backfill_days += 1
+            backfill_progress.update(
+                (
+                    f"{done_backfill_days}/{total_backfill_days} "
+                    f"attempted={metrics['backfills_attempted']} "
+                    f"ok={metrics['backfills_ok']} "
+                    f"failed={metrics['backfills_failed']}"
+                ),
+            )
+        backfill_progress.update(
+            (
+                f"{done_backfill_days}/{total_backfill_days} "
+                f"attempted={metrics['backfills_attempted']} "
+                f"ok={metrics['backfills_ok']} "
+                f"failed={metrics['backfills_failed']}"
+            ),
+            force=True,
+        )
+        backfill_progress.finish()
 
     log.info("openaq: done %s", {k: v for k, v in metrics.items() if k not in ("changed_files", "planned_backfills", "sample_urls")})
     return metrics
@@ -2670,16 +2961,44 @@ def check_sensor_community(
                 db_path, env_name, base_url, sensor_id, day, filename,
                 tmp_dir, cache_root, log, limits,
             ))
+        total_tasks = len(futures)
+        completed_tasks = 0
+        progress = SingleLineProgress("sensorcommunity progress")
+        progress.update(
+            (
+                f"0/{total_tasks} checked=0 changed=0 downloaded=0 "
+                f"missing=0 errors=0 planned_backfills=0"
+            ),
+            force=True,
+        )
 
         for fut in concurrent.futures.as_completed(futures):
+            completed_tasks += 1
             try:
                 result = fut.result()
             except Exception as exc:
                 metrics["errors"] += 1
                 log.warning("sensorcommunity worker raised: %s", exc)
+                progress.update(
+                    (
+                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills={len(metrics['planned_backfills'])}"
+                    ),
+                )
                 continue
             outcome = result.get("outcome")
             if outcome == "stopped":
+                progress.update(
+                    (
+                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills={len(metrics['planned_backfills'])} "
+                        f"stopped_for={limits.stopped_for or 'n/a'}"
+                    ),
+                )
                 continue
             metrics["head_checked"] += 1
             if outcome in {"missing_first_seen", "missing_disappeared", "still_missing"}:
@@ -2706,6 +3025,24 @@ def check_sensor_community(
             if bytes_added:
                 metrics["downloaded_bytes"] += bytes_added
                 limits.add_bytes(bytes_added)
+            progress.update(
+                (
+                    f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                    f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                    f"missing={metrics['missing']} errors={metrics['errors']} "
+                    f"planned_backfills={len(metrics['planned_backfills'])}"
+                ),
+            )
+    progress.update(
+        (
+            f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+            f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+            f"missing={metrics['missing']} errors={metrics['errors']} "
+            f"planned_backfills={len(metrics['planned_backfills'])}"
+        ),
+        force=True,
+    )
+    progress.finish()
 
     metrics["changed_files"].sort(key=lambda e: (e["day"], e["sensor_id"]))
     metrics["planned_backfills"].sort()
@@ -2725,6 +3062,13 @@ def check_sensor_community(
         by_day: dict[str, list[dict[str, Any]]] = {}
         for entry in metrics["changed_files"]:
             by_day.setdefault(entry["day"], []).append(entry)
+        backfill_progress = SingleLineProgress("sensorcommunity backfill")
+        total_backfill_days = len(by_day)
+        done_backfill_days = 0
+        backfill_progress.update(
+            f"0/{total_backfill_days} attempted=0 ok=0 failed=0",
+            force=True,
+        )
         for day_iso in sorted(by_day):
             if limits.should_stop():
                 log.warning(
@@ -2740,8 +3084,9 @@ def check_sensor_community(
                 day_iso, len(group), len(union_ids),
             )
             bf = run_narrow_backfill(
-                wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
+                wrapper_path=resolve_integrity_backfill_wrapper(),
                 env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
                 timeseries_ids=union_ids,
                 day=dt.date.fromisoformat(day_iso),
                 log=log,
@@ -2764,6 +3109,25 @@ def check_sensor_community(
                 metrics["backfills_ok"] += 1
             else:
                 metrics["backfills_failed"] += 1
+            done_backfill_days += 1
+            backfill_progress.update(
+                (
+                    f"{done_backfill_days}/{total_backfill_days} "
+                    f"attempted={metrics['backfills_attempted']} "
+                    f"ok={metrics['backfills_ok']} "
+                    f"failed={metrics['backfills_failed']}"
+                ),
+            )
+        backfill_progress.update(
+            (
+                f"{done_backfill_days}/{total_backfill_days} "
+                f"attempted={metrics['backfills_attempted']} "
+                f"ok={metrics['backfills_ok']} "
+                f"failed={metrics['backfills_failed']}"
+            ),
+            force=True,
+        )
+        backfill_progress.finish()
 
     log.info(
         "sensorcommunity: done %s",
@@ -2773,6 +3137,10 @@ def check_sensor_community(
 
 
 R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
+R2_AQILEVELS_PREFIX = "history/v1/aqilevels"
+AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME = "aqilevels"
+AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION = 2
+AQILEVELS_EXPECTED_WRITER_VERSION = "parquet-wasm-zstd-v2"
 CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
 
 
@@ -3048,25 +3416,45 @@ def _collect_cross_check_backfill_targets(
     conn: sqlite3.Connection,
     *,
     run_id: int,
-    statuses: tuple[str, ...] = ("mismatch", "source_only"),
-) -> dict[str, list[int]]:
+    source_filter: str = "all",
+    statuses: tuple[str, ...] = ("mismatch", "source_only", "r2_manifest_missing"),
+) -> dict[tuple[str, int], list[int]]:
     if not statuses:
         return {}
+    source_codes_by_filter = {
+        "openaq": ("openaq",),
+        "sensorcommunity": ("sensorcommunity", "sensor-community"),
+        "sensor-community": ("sensorcommunity", "sensor-community"),
+        "all": ("openaq", "sensorcommunity", "sensor-community"),
+    }
+    connector_codes = source_codes_by_filter.get(
+        source_filter,
+        ("openaq", "sensorcommunity", "sensor-community"),
+    )
     placeholders = ",".join("?" for _ in statuses)
+    connector_placeholders = ",".join("?" for _ in connector_codes)
     rows = conn.execute(
         f"""
-        SELECT day_utc, timeseries_id
-        FROM cross_checks
-        WHERE run_id = ?
-          AND status IN ({placeholders})
-          AND day_utc IS NOT NULL
-        ORDER BY day_utc, timeseries_id
+        SELECT x.day_utc, x.connector_id, x.timeseries_id
+        FROM cross_checks x
+        JOIN core_connectors_snapshot c ON c.id = x.connector_id
+        WHERE x.run_id = ?
+          AND x.status IN ({placeholders})
+          AND x.day_utc IS NOT NULL
+          AND c.connector_code IN ({connector_placeholders})
+        ORDER BY x.day_utc, x.connector_id, x.timeseries_id
         """,
-        (run_id, *statuses),
+        (run_id, *statuses, *connector_codes),
     ).fetchall()
-    grouped: dict[str, set[int]] = {}
-    for day_utc, ts_id in rows:
+    grouped: dict[tuple[str, int], set[int]] = {}
+    for day_utc, connector_id, ts_id in rows:
         if not day_utc:
+            continue
+        try:
+            parsed_connector_id = int(connector_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_connector_id <= 0:
             continue
         try:
             parsed = int(ts_id)
@@ -3074,22 +3462,207 @@ def _collect_cross_check_backfill_targets(
             continue
         if parsed <= 0:
             continue
-        grouped.setdefault(str(day_utc), set()).add(parsed)
-    return {day: sorted(values) for day, values in sorted(grouped.items())}
+        grouped.setdefault((str(day_utc), parsed_connector_id), set()).add(parsed)
+    return {
+        key: sorted(values)
+        for key, values in sorted(grouped.items(), key=lambda item: item[0])
+    }
+
+
+def _parse_csv_ints(value: str | None) -> set[int]:
+    out: set[int] = set()
+    if not value:
+        return out
+    for token in str(value).split(","):
+        cleaned = token.strip()
+        if not cleaned:
+            continue
+        try:
+            parsed = int(cleaned)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            out.add(parsed)
+    return out
+
+
+def _parse_reason_tokens(reason: str | None) -> set[str]:
+    out: set[str] = set()
+    if not reason:
+        return out
+    normalized = str(reason).replace("|", ",")
+    for token in normalized.split(","):
+        cleaned = token.strip()
+        if cleaned:
+            out.add(cleaned)
+    return out
+
+
+def _merge_reason_tokens(existing: str | None, incoming: str) -> str:
+    merged = _parse_reason_tokens(existing)
+    merged.update(_parse_reason_tokens(incoming))
+    if not merged:
+        return incoming
+    return ",".join(sorted(merged))
+
+
+def _merge_csv_ids(existing: str | None, new_ids: list[int]) -> str | None:
+    merged = _parse_csv_ints(existing)
+    for ts_id in new_ids:
+        if int(ts_id) > 0:
+            merged.add(int(ts_id))
+    if not merged:
+        return None
+    return ",".join(str(ts_id) for ts_id in sorted(merged))
+
+
+def _merge_notes(existing: str | None, extra: str | None) -> str | None:
+    base = (existing or "").strip()
+    add = (extra or "").strip()
+    if not base:
+        return add or None
+    if not add:
+        return base
+    if add in base:
+        return base
+    return f"{base} | {add}"
+
+
+def _queue_aqi_rebuild(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    connector_id: int,
+    day_utc: str,
+    reason: str,
+    source_mode: str,
+    requested_timeseries_ids: list[int],
+    queue_note: str | None,
+    log: logging.Logger,
+) -> str:
+    now_iso = fmt_iso(utc_now())
+    merged_ids_csv = _merge_csv_ids(None, requested_timeseries_ids)
+
+    existing = conn.execute(
+        """
+        SELECT id, reason, source_mode, requested_timeseries_ids, notes
+        FROM aqi_rebuild_queue
+        WHERE run_id = ? AND connector_id = ? AND day_utc = ?
+        """,
+        (run_id, connector_id, day_utc),
+    ).fetchone()
+
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO aqi_rebuild_queue (
+              run_id, env_name, connector_id, day_utc,
+              reason, source_mode, status,
+              requested_timeseries_ids, notes,
+              created_at_utc, started_at_utc, finished_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                run_id,
+                env_name,
+                connector_id,
+                day_utc,
+                reason,
+                source_mode,
+                "queued",
+                merged_ids_csv,
+                queue_note,
+                now_iso,
+            ),
+        )
+        conn.commit()
+        log.info(
+            "queued AQI rebuild run_id=%s connector_id=%s day=%s reason=%s source_mode=%s",
+            run_id,
+            connector_id,
+            day_utc,
+            reason,
+            source_mode,
+        )
+        return "inserted"
+
+    queue_id, existing_reason, existing_source_mode, existing_ids_csv, existing_notes = existing
+    updated_ids_csv = _merge_csv_ids(existing_ids_csv, requested_timeseries_ids)
+    updated_notes = _merge_notes(existing_notes, queue_note)
+    merged_reason = _merge_reason_tokens(existing_reason, reason)
+    merged_source_mode = existing_source_mode or source_mode
+    conn.execute(
+        """
+        UPDATE aqi_rebuild_queue
+        SET reason = ?,
+            source_mode = ?,
+            requested_timeseries_ids = ?,
+            notes = ?
+        WHERE id = ?
+        """,
+        (merged_reason, merged_source_mode, updated_ids_csv, updated_notes, int(queue_id)),
+    )
+    conn.commit()
+    log.info(
+        "merged AQI rebuild queue row id=%s connector_id=%s day=%s reason=%s",
+        queue_id,
+        connector_id,
+        day_utc,
+        merged_reason,
+    )
+    return "merged"
+
+
+def _queue_aqi_rebuild_from_obs_repair(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    connector_id: int,
+    day_utc: str,
+    requested_timeseries_ids: list[int],
+    queue_note: str | None,
+    log: logging.Logger,
+) -> str:
+    return _queue_aqi_rebuild(
+        conn=conn,
+        run_id=run_id,
+        env_name=env_name,
+        connector_id=connector_id,
+        day_utc=day_utc,
+        reason="obs_repaired",
+        source_mode="live_r2",
+        requested_timeseries_ids=requested_timeseries_ids,
+        queue_note=queue_note,
+        log=log,
+    )
 
 
 def run_cross_check_backfills(
     *,
     conn: sqlite3.Connection,
     run_id: int,
+    env_name: str,
     run_compact: str,
     env: dict[str, str],
+    source_filter: str,
     dry_run: bool,
     run_backfill: bool,
     limits: LimitTracker,
     log: logging.Logger,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
+        "observation_backfill_candidate_days": 0,
+        "observation_backfill_candidate_timeseries_ids": 0,
+        "observation_backfills_attempted": 0,
+        "observation_backfills_ok": 0,
+        "observation_backfills_failed": 0,
+        "aqi_rebuilds_queued_from_obs_repair": 0,
+        "planned_observation_backfills": [],
+        "planned_aqi_rebuilds": [],
+        "planned_aqi_rebuild_connector_days": [],
+        # Backward-compatible aliases used by existing reports/notes.
         "backfill_candidate_days": 0,
         "backfill_candidate_timeseries_ids": 0,
         "backfills_attempted": 0,
@@ -3100,56 +3673,820 @@ def run_cross_check_backfills(
     if not run_backfill:
         return metrics
 
-    targets_by_day = _collect_cross_check_backfill_targets(conn, run_id=run_id)
-    metrics["backfill_candidate_days"] = len(targets_by_day)
-    metrics["backfill_candidate_timeseries_ids"] = sum(
-        len(ids) for ids in targets_by_day.values()
+    targets_by_day_connector = _collect_cross_check_backfill_targets(
+        conn,
+        run_id=run_id,
+        source_filter=source_filter,
     )
-    if not targets_by_day:
+    metrics["observation_backfill_candidate_days"] = len(
+        {day_iso for day_iso, _ in targets_by_day_connector.keys()}
+    )
+    metrics["observation_backfill_candidate_timeseries_ids"] = sum(
+        len(ids) for ids in targets_by_day_connector.values()
+    )
+    metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
+    metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
+    if not targets_by_day_connector:
         log.info(
-            "cross-check backfill: no mismatch/source_only candidates for run_id=%s",
+            "cross-check observation repair: no mismatch/source_only/r2_manifest_missing candidates for run_id=%s source=%s",
             run_id,
+            source_filter,
         )
         return metrics
 
     backfill_log_dir = (
         Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     )
-    for day_iso, ts_ids in sorted(targets_by_day.items()):
+    queued_aqi_rebuild_keys: set[tuple[str, int]] = set()
+    for (day_iso, connector_id), ts_ids in sorted(targets_by_day_connector.items()):
         day_obj = dt.date.fromisoformat(day_iso)
-        cmd = _planned_backfill_command(env, ts_ids, day_obj)
+        cmd = _planned_backfill_command(
+            env,
+            ts_ids,
+            day_obj,
+            connector_ids=[connector_id],
+            output_scope="observations_only",
+        )
+        metrics["planned_observation_backfills"].append(cmd)
         metrics["planned_backfills"].append(cmd)
-        log.info("cross-check planned backfill: %s", cmd)
+        log.info("cross-check planned observation repair: %s", cmd)
+        queue_entry = (
+            f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired "
+            f"source_mode=live_r2 timeseries_ids={','.join(str(ts_id) for ts_id in ts_ids)}"
+        )
+        metrics["planned_aqi_rebuilds"].append(queue_entry)
+        metrics["planned_aqi_rebuild_connector_days"].append({
+            "day_utc": day_iso,
+            "connector_id": connector_id,
+            "reasons": ["obs_repaired"],
+            "notes": queue_entry,
+        })
         if dry_run:
+            queued_aqi_rebuild_keys.add((day_iso, connector_id))
             continue
         if limits.should_stop():
             log.warning(
-                "cross-check backfill: stopping early due to limit=%s",
+                "cross-check observation repair: stopping early due to limit=%s",
                 limits.stopped_for,
             )
             break
         bf = run_narrow_backfill(
-            wrapper_path=os.environ.get("UK_AQ_BACKFILL_WRAPPER"),
+            wrapper_path=resolve_integrity_backfill_wrapper(),
             env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+            env_name=env_name,
             timeseries_ids=ts_ids,
+            connector_ids=[connector_id],
             day=day_obj,
             log=log,
             log_dir=backfill_log_dir,
-            log_label=f"cc_day_{day_iso}",
+            log_label=f"cc_day_{day_iso}_connector_{connector_id}",
+            output_scope="observations_only",
         )
+        metrics["observation_backfills_attempted"] += 1
         metrics["backfills_attempted"] += 1
         if bf["status"] == "ok":
+            metrics["observation_backfills_ok"] += 1
             metrics["backfills_ok"] += 1
+            queued = _queue_aqi_rebuild_from_obs_repair(
+                conn=conn,
+                run_id=run_id,
+                env_name=env_name,
+                connector_id=connector_id,
+                day_utc=day_iso,
+                requested_timeseries_ids=ts_ids,
+                queue_note=(
+                    f"queued_from_cross_check day={day_iso} connector_id={connector_id}"
+                ),
+                log=log,
+            )
+            if queued in {"inserted", "merged"}:
+                if queued == "inserted":
+                    queued_aqi_rebuild_keys.add((day_iso, connector_id))
         else:
+            metrics["observation_backfills_failed"] += 1
             metrics["backfills_failed"] += 1
 
+    metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued_aqi_rebuild_keys)
+
     log.info(
-        "cross-check backfill: candidates_days=%s candidates_timeseries_ids=%s attempted=%s ok=%s failed=%s",
-        metrics["backfill_candidate_days"],
-        metrics["backfill_candidate_timeseries_ids"],
-        metrics["backfills_attempted"],
-        metrics["backfills_ok"],
-        metrics["backfills_failed"],
+        "cross-check observation-repair: candidate_days=%s candidate_timeseries_ids=%s attempted=%s ok=%s failed=%s queued_aqi_rebuilds=%s",
+        metrics["observation_backfill_candidate_days"],
+        metrics["observation_backfill_candidate_timeseries_ids"],
+        metrics["observation_backfills_attempted"],
+        metrics["observation_backfills_ok"],
+        metrics["observation_backfills_failed"],
+        metrics["aqi_rebuilds_queued_from_obs_repair"],
+    )
+    return metrics
+
+
+def _safe_non_negative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _load_obs_repaired_queue_keys(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    rows = conn.execute(
+        """
+        SELECT day_utc, connector_id, reason
+        FROM aqi_rebuild_queue
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchall()
+    for day_utc, connector_id, reason in rows:
+        if "obs_repaired" not in _parse_reason_tokens(reason):
+            continue
+        if not day_utc:
+            continue
+        try:
+            parsed_connector_id = int(connector_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_connector_id <= 0:
+            continue
+        keys.add((str(day_utc), parsed_connector_id))
+    return keys
+
+
+def _load_previous_aqi_rebuild_status(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    env_name: str,
+    connector_id: int,
+    day_utc: str,
+) -> tuple[str | None, int | None]:
+    row = conn.execute(
+        """
+        SELECT status, run_id
+        FROM aqi_rebuild_queue
+        WHERE env_name = ?
+          AND connector_id = ?
+          AND day_utc = ?
+          AND run_id <> ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (env_name, connector_id, day_utc, run_id),
+    ).fetchone()
+    if not row:
+        return None, None
+    status = str(row[0]).strip() if row[0] is not None else None
+    prev_run_id = int(row[1]) if row[1] is not None else None
+    return status, prev_run_id
+
+
+def run_aqi_health_checks(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    env_name: str,
+    r2_history_root: str | None,
+    r2_aqilevels_prefix: str | None,
+    dry_run: bool,
+    run_backfill: bool,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "aqi_health_ran": False,
+        "aqi_health_skipped_reason": None,
+        "aqi_health_connector_days_checked": 0,
+        "aqi_health_rebuilds_queued": 0,
+        "aqi_health_skipped_already_obs_repaired": 0,
+        "aqi_health_manifest_missing": 0,
+        "aqi_health_manifest_stale": 0,
+        "aqi_health_manifest_empty": 0,
+        "aqi_health_previous_rebuild_failed": 0,
+        "queued_aqi_only_connector_days": [],
+    }
+    if not run_backfill:
+        metrics["aqi_health_skipped_reason"] = "skipped because --run-backfill not set"
+        return metrics
+    if not r2_history_root:
+        metrics["aqi_health_skipped_reason"] = "UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set"
+        return metrics
+    root = Path(r2_history_root)
+    if not root.is_dir():
+        metrics["aqi_health_skipped_reason"] = f"R2 history root is not a directory: {root}"
+        return metrics
+    aqilevels_prefix = str(r2_aqilevels_prefix or R2_AQILEVELS_PREFIX).strip().strip("/")
+    if not aqilevels_prefix:
+        metrics["aqi_health_skipped_reason"] = "AQI history prefix is empty"
+        return metrics
+
+    obs_repaired_keys = _load_obs_repaired_queue_keys(conn, run_id=run_id)
+    candidate_rows = conn.execute(
+        """
+        SELECT
+          day_utc,
+          connector_id,
+          SUM(CASE WHEN source_row_count > 0 THEN source_row_count ELSE 0 END) AS source_row_count
+        FROM cross_checks
+        WHERE run_id = ?
+          AND day_utc IS NOT NULL
+        GROUP BY day_utc, connector_id
+        HAVING SUM(CASE WHEN source_row_count > 0 THEN source_row_count ELSE 0 END) > 0
+        ORDER BY day_utc, connector_id
+        """,
+        (run_id,),
+    ).fetchall()
+
+    queued_keys: set[tuple[str, int]] = set()
+    queued_rows: list[dict[str, Any]] = []
+
+    for day_utc, connector_id, source_row_count in candidate_rows:
+        if not day_utc:
+            continue
+        day_iso = str(day_utc)
+        try:
+            parsed_connector_id = int(connector_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_connector_id <= 0:
+            continue
+
+        key = (day_iso, parsed_connector_id)
+        if key in obs_repaired_keys:
+            metrics["aqi_health_skipped_already_obs_repaired"] += 1
+            continue
+
+        metrics["aqi_health_connector_days_checked"] += 1
+
+        reasons: set[str] = set()
+        notes: list[str] = []
+
+        previous_status, previous_run_id = _load_previous_aqi_rebuild_status(
+            conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=parsed_connector_id,
+            day_utc=day_iso,
+        )
+        if previous_status in {"failed", "queued", "running"}:
+            reasons.add("previous_rebuild_failed_or_pending")
+            notes.append(
+                f"previous_queue_status={previous_status} previous_run_id={previous_run_id}"
+            )
+            metrics["aqi_health_previous_rebuild_failed"] += 1
+
+        manifest_path = (
+            root
+            / aqilevels_prefix
+            / f"day_utc={day_iso}"
+            / f"connector_id={parsed_connector_id}"
+            / "manifest.json"
+        )
+        payload: dict[str, Any] | None = None
+        if not manifest_path.is_file():
+            reasons.add("manifest_missing")
+            notes.append(f"manifest_missing:{manifest_path}")
+            metrics["aqi_health_manifest_missing"] += 1
+        else:
+            try:
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    payload = raw
+                else:
+                    reasons.add("manifest_stale")
+                    notes.append("manifest_invalid:root_not_object")
+                    metrics["aqi_health_manifest_stale"] += 1
+            except Exception as exc:
+                reasons.add("manifest_stale")
+                notes.append(f"manifest_invalid_json:{exc}")
+                metrics["aqi_health_manifest_stale"] += 1
+
+        if payload is not None:
+            schema_name = str(payload.get("history_schema_name") or "").strip()
+            schema_version = _safe_non_negative_int(payload.get("history_schema_version"))
+            writer_version = str(payload.get("writer_version") or "").strip()
+            if (
+                schema_name != AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME
+                or schema_version != AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION
+                or writer_version != AQILEVELS_EXPECTED_WRITER_VERSION
+            ):
+                reasons.add("manifest_stale")
+                notes.append(
+                    "manifest_schema_mismatch:"
+                    f"schema_name={schema_name or '<missing>'}"
+                    f",schema_version={schema_version}"
+                    f",writer_version={writer_version or '<missing>'}"
+                )
+                metrics["aqi_health_manifest_stale"] += 1
+
+            manifest_rows = _safe_non_negative_int(payload.get("source_row_count"))
+            if manifest_rows is None:
+                manifest_rows = _safe_non_negative_int(payload.get("total_rows"))
+            source_rows = _safe_non_negative_int(source_row_count) or 0
+            if source_rows > 0 and (manifest_rows is None or manifest_rows == 0):
+                reasons.add("manifest_empty")
+                notes.append(
+                    f"manifest_empty:source_rows={source_rows} manifest_rows={manifest_rows}"
+                )
+                metrics["aqi_health_manifest_empty"] += 1
+
+        if not reasons:
+            continue
+
+        queue_note = "; ".join(notes) if notes else None
+        queued_row = {
+            "day_utc": day_iso,
+            "connector_id": parsed_connector_id,
+            "reasons": sorted(reasons),
+            "notes": queue_note,
+        }
+
+        if dry_run:
+            queued_keys.add(key)
+            queued_rows.append(queued_row)
+            continue
+
+        action = _queue_aqi_rebuild(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=parsed_connector_id,
+            day_utc=day_iso,
+            reason="aqi_health_check",
+            source_mode="live_r2",
+            requested_timeseries_ids=[],
+            queue_note=queue_note,
+            log=log,
+        )
+        if action in {"inserted", "merged"}:
+            queued_rows.append(queued_row)
+        if action == "inserted":
+            queued_keys.add(key)
+
+    metrics["aqi_health_ran"] = True
+    metrics["aqi_health_rebuilds_queued"] = len(queued_keys)
+    metrics["queued_aqi_only_connector_days"] = sorted(
+        queued_rows,
+        key=lambda row: (str(row.get("day_utc") or ""), int(row.get("connector_id") or 0)),
+    )
+    log.info(
+        "aqi-health-check done checked=%s queued=%s skipped_obs_repaired=%s manifest_missing=%s manifest_stale=%s manifest_empty=%s previous_rebuild_failed=%s",
+        metrics["aqi_health_connector_days_checked"],
+        metrics["aqi_health_rebuilds_queued"],
+        metrics["aqi_health_skipped_already_obs_repaired"],
+        metrics["aqi_health_manifest_missing"],
+        metrics["aqi_health_manifest_stale"],
+        metrics["aqi_health_manifest_empty"],
+        metrics["aqi_health_previous_rebuild_failed"],
+    )
+    return metrics
+
+
+def _planned_aqi_rebuild_command(
+    env: dict[str, str],
+    connector_id: int,
+    day: dt.date,
+) -> str:
+    wrapper_raw = resolve_integrity_backfill_wrapper()
+    env_file = str(
+        env.get("UK_AQ_BACKFILL_ENV_FILE")
+        or os.environ.get("UK_AQ_BACKFILL_ENV_FILE")
+        or "<UK_AQ_BACKFILL_ENV_FILE unset>"
+    ).strip()
+    wrapper = wrapper_raw or "<integrity backfill wrapper unset>"
+    iso = day.isoformat()
+    return (
+        f"UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels "
+        f"UK_AQ_BACKFILL_DRY_RUN=false "
+        f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
+        f"UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only "
+        f"UK_AQ_BACKFILL_CONNECTOR_IDS={int(connector_id)} "
+        f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
+        f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
+        f"UK_AQ_BACKFILL_ENV_FILE={env_file} "
+        f"{wrapper}"
+    )
+
+
+def run_aqi_rebuild_backfill(
+    *,
+    wrapper_path: str | None,
+    env_file_path: str | None,
+    env_name: str,
+    connector_id: int,
+    day: dt.date,
+    log: logging.Logger,
+    timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
+    log_dir: Path | None = None,
+    log_label: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": None,
+        "exit_code": None,
+        "duration_seconds": 0.0,
+        "wrapper_path": wrapper_path,
+        "env_file_path": env_file_path,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "log_path": None,
+        "error": None,
+    }
+    if not wrapper_path:
+        result["status"] = "no_wrapper"
+        result["error"] = "UK_AQ_BACKFILL_WRAPPER is not set"
+        return result
+    if not Path(wrapper_path).is_file():
+        result["status"] = "no_wrapper"
+        result["error"] = f"wrapper not found: {wrapper_path}"
+        return result
+
+    sub_env: dict[str, str] = {**os.environ}
+    if env_file_path:
+        if not Path(env_file_path).is_file():
+            result["status"] = "no_env_file"
+            result["error"] = f"env file not found: {env_file_path}"
+            return result
+        loaded = _load_env_file(Path(env_file_path))
+        interesting_keys = _summarize_loaded_backfill_env_keys(loaded)
+        log.info(
+            "aqi rebuild loading env_file=%s var_count=%s keys=%s",
+            env_file_path,
+            len(loaded),
+            interesting_keys,
+        )
+        sub_env.update(loaded)
+
+    iso = day.isoformat()
+    sub_env.update({
+        "UK_AQ_BACKFILL_RUN_MODE": "r2_history_obs_to_aqilevels",
+        "UK_AQ_BACKFILL_DRY_RUN": "false",
+        "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
+        "UK_AQ_BACKFILL_OUTPUT_SCOPE": "aqilevels_only",
+        "UK_AQ_BACKFILL_CONNECTOR_IDS": str(int(connector_id)),
+        "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
+        "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
+        "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
+    })
+    sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
+    sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_ID", None)
+
+    wrapper_name = Path(wrapper_path).name
+    cmd = ["bash", wrapper_path]
+    if wrapper_name == "uk_aq_integrity_backfill.sh":
+        cmd = [
+            "bash",
+            wrapper_path,
+            "--env",
+            env_name,
+            "--aqi-only",
+            "--connector-id",
+            str(int(connector_id)),
+            "--from-day",
+            iso,
+            "--to-day",
+            iso,
+        ]
+
+    started = time.monotonic()
+    log.info(
+        "aqi rebuild invoke wrapper=%s day=%s connector_id=%s",
+        wrapper_path,
+        iso,
+        connector_id,
+    )
+
+    stdout_text = ""
+    stderr_text = ""
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=sub_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        stdout_text = proc.stdout or ""
+        stderr_text = proc.stderr or ""
+        result["exit_code"] = proc.returncode
+        result["status"] = "ok" if proc.returncode == 0 else "error"
+        if proc.returncode != 0:
+            result["error"] = f"wrapper exit_code={proc.returncode}"
+    except subprocess.TimeoutExpired as exc:
+        result["status"] = "timeout"
+        result["error"] = f"wrapper timed out after {timeout_seconds}s"
+        if isinstance(exc.stdout, (bytes, bytearray)):
+            stdout_text = exc.stdout.decode("utf-8", errors="replace")
+        else:
+            stdout_text = exc.stdout or ""
+        if isinstance(exc.stderr, (bytes, bytearray)):
+            stderr_text = exc.stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = exc.stderr or ""
+    except OSError as exc:
+        result["status"] = "spawn_error"
+        result["error"] = f"spawn failed: {exc}"
+
+    result["stdout_tail"] = _tail_bytes(stdout_text)
+    result["stderr_tail"] = _tail_bytes(stderr_text)
+
+    if log_dir is not None and (stdout_text or stderr_text or result["status"]):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        label = log_label or f"aqi_day_{iso}_connector_{int(connector_id)}"
+        log_path = log_dir / f"{label}.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as fh:
+                fh.write(f"# wrapper: {wrapper_path}\n")
+                fh.write(f"# env_file: {env_file_path}\n")
+                fh.write(f"# day: {iso}\n")
+                fh.write(f"# connector_id: {int(connector_id)}\n")
+                fh.write("# run_mode: r2_history_obs_to_aqilevels\n")
+                fh.write("# output_scope: aqilevels_only\n")
+                fh.write(f"# command: {' '.join(cmd)}\n")
+                fh.write(f"# exit_code: {result['exit_code']}\n")
+                fh.write(f"# status: {result['status']}\n")
+                fh.write("\n# === STDOUT ===\n")
+                fh.write(stdout_text)
+                fh.write("\n# === STDERR ===\n")
+                fh.write(stderr_text)
+            result["log_path"] = str(log_path)
+        except OSError as exc:
+            log.warning("aqi rebuild log_path write failed: %s", exc)
+
+    result["duration_seconds"] = round(time.monotonic() - started, 3)
+    log.info(
+        "aqi rebuild done status=%s exit_code=%s duration=%.3fs",
+        result["status"], result["exit_code"], result["duration_seconds"],
+    )
+    return result
+
+
+def run_aqi_rebuild_queue_execution(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    env_name: str,
+    run_compact: str,
+    env: dict[str, str],
+    dry_run: bool,
+    run_backfill: bool,
+    limits: LimitTracker,
+    log: logging.Logger,
+    dry_run_planned_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "aqi_rebuild_ran": False,
+        "aqi_rebuild_skipped_reason": None,
+        "aqi_rebuilds_queued_total": 0,
+        "aqi_rebuilds_attempted": 0,
+        "aqi_rebuilds_complete": 0,
+        "aqi_rebuilds_failed": 0,
+        "aqi_rebuilds_skipped": 0,
+        "planned_aqi_rebuild_commands": [],
+        "aqi_rebuild_results": [],
+    }
+    if not run_backfill:
+        metrics["aqi_rebuild_skipped_reason"] = "skipped because --run-backfill not set"
+        return metrics
+
+    queue_rows = conn.execute(
+        """
+        SELECT id, connector_id, day_utc, reason, source_mode, status, notes
+        FROM aqi_rebuild_queue
+        WHERE run_id = ?
+          AND status = 'queued'
+          AND day_utc IS NOT NULL
+        ORDER BY day_utc, connector_id, id
+        """,
+        (run_id,),
+    ).fetchall()
+
+    by_key: dict[tuple[str, int], list[tuple[Any, ...]]] = {}
+    for row in queue_rows:
+        row_id, connector_id, day_utc, *_ = row
+        try:
+            parsed_connector_id = int(connector_id)
+        except (TypeError, ValueError):
+            log.warning("aqi rebuild queue row id=%s has invalid connector_id=%r", row_id, connector_id)
+            metrics["aqi_rebuilds_skipped"] += 1
+            continue
+        if parsed_connector_id <= 0:
+            metrics["aqi_rebuilds_skipped"] += 1
+            continue
+        key = (str(day_utc), parsed_connector_id)
+        by_key.setdefault(key, []).append(row)
+
+    metrics["aqi_rebuilds_queued_total"] = len(by_key)
+    if dry_run and metrics["aqi_rebuilds_queued_total"] == 0 and dry_run_planned_rows:
+        seed_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in dry_run_planned_rows:
+            day_iso = str(row.get("day_utc") or "").strip()
+            if not day_iso:
+                continue
+            try:
+                connector_id = int(row.get("connector_id"))
+            except (TypeError, ValueError):
+                continue
+            if connector_id <= 0:
+                continue
+            key = (day_iso, connector_id)
+            current = seed_by_key.get(key)
+            row_reasons = _parse_reason_tokens(",".join(str(v) for v in (row.get("reasons") or [])))
+            if not row_reasons and row.get("reason"):
+                row_reasons = _parse_reason_tokens(str(row.get("reason")))
+            if current is None:
+                seed_by_key[key] = {
+                    "day_utc": day_iso,
+                    "connector_id": connector_id,
+                    "reasons": sorted(row_reasons),
+                }
+                continue
+            merged = _parse_reason_tokens(",".join(current.get("reasons") or []))
+            merged.update(row_reasons)
+            current["reasons"] = sorted(merged)
+
+        for (day_iso, connector_id), seed in sorted(seed_by_key.items(), key=lambda item: item[0]):
+            planned_cmd = _planned_aqi_rebuild_command(
+                env,
+                connector_id,
+                dt.date.fromisoformat(day_iso),
+            )
+            metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
+            metrics["aqi_rebuild_results"].append({
+                "queue_row_ids": [],
+                "connector_id": connector_id,
+                "day_utc": day_iso,
+                "reasons": seed.get("reasons") or [],
+                "status": "planned",
+                "source_mode": "live_r2",
+                "error": None,
+                "log_path": None,
+            })
+        metrics["aqi_rebuilds_queued_total"] = len(seed_by_key)
+        metrics["aqi_rebuild_ran"] = True
+        return metrics
+
+    if not by_key:
+        metrics["aqi_rebuild_ran"] = True
+        return metrics
+
+    backfill_log_dir = (
+        Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
+    )
+    for (day_iso, connector_id), rows_for_key in sorted(by_key.items(), key=lambda item: item[0]):
+        day_obj = dt.date.fromisoformat(day_iso)
+        merged_reasons: set[str] = set()
+        for row in rows_for_key:
+            merged_reasons.update(_parse_reason_tokens(row[3]))
+        reasons_sorted = sorted(merged_reasons)
+        primary_row = rows_for_key[0]
+        duplicate_rows = rows_for_key[1:]
+        row_ids = [int(row[0]) for row in rows_for_key if row[0] is not None]
+
+        planned_cmd = _planned_aqi_rebuild_command(env, connector_id, day_obj)
+        metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
+
+        if duplicate_rows:
+            metrics["aqi_rebuilds_skipped"] += len(duplicate_rows)
+            if not dry_run:
+                now_iso = fmt_iso(utc_now())
+                for dup in duplicate_rows:
+                    dup_id = int(dup[0])
+                    merged_note = _merge_notes(
+                        dup[6],
+                        f"skipped duplicate queue key; executed by queue_row_id={int(primary_row[0])}",
+                    )
+                    conn.execute(
+                        """
+                        UPDATE aqi_rebuild_queue
+                        SET status = 'skipped',
+                            finished_at_utc = ?,
+                            notes = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso, merged_note, dup_id),
+                    )
+                conn.commit()
+
+        if dry_run:
+            metrics["aqi_rebuild_results"].append({
+                "queue_row_ids": row_ids,
+                "connector_id": connector_id,
+                "day_utc": day_iso,
+                "reasons": reasons_sorted,
+                "status": "planned",
+                "source_mode": "live_r2",
+                "error": None,
+                "log_path": None,
+            })
+            continue
+
+        if limits.should_stop():
+            metrics["aqi_rebuilds_skipped"] += 1
+            metrics["aqi_rebuild_results"].append({
+                "queue_row_ids": row_ids,
+                "connector_id": connector_id,
+                "day_utc": day_iso,
+                "reasons": reasons_sorted,
+                "status": "skipped_limit",
+                "source_mode": "live_r2",
+                "error": f"stopped_for={limits.stopped_for}",
+                "log_path": None,
+            })
+            continue
+
+        started_iso = fmt_iso(utc_now())
+        primary_row_id = int(primary_row[0])
+        conn.execute(
+            """
+            UPDATE aqi_rebuild_queue
+            SET status = 'running',
+                started_at_utc = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (
+                started_iso,
+                _merge_notes(primary_row[6], f"rebuild_started_at={started_iso}"),
+                primary_row_id,
+            ),
+        )
+        conn.commit()
+
+        bf = run_aqi_rebuild_backfill(
+            wrapper_path=resolve_integrity_backfill_wrapper(),
+            env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+            env_name=env_name,
+            connector_id=connector_id,
+            day=day_obj,
+            log=log,
+            log_dir=backfill_log_dir,
+            log_label=f"aqi_day_{day_iso}_connector_{connector_id}",
+        )
+        metrics["aqi_rebuilds_attempted"] += 1
+
+        finished_iso = fmt_iso(utc_now())
+        if bf["status"] == "ok":
+            metrics["aqi_rebuilds_complete"] += 1
+            conn.execute(
+                """
+                UPDATE aqi_rebuild_queue
+                SET status = 'complete',
+                    finished_at_utc = ?,
+                    notes = ?
+                WHERE id = ?
+                """,
+                (
+                    finished_iso,
+                    _merge_notes(primary_row[6], "aqi_rebuild_complete"),
+                    primary_row_id,
+                ),
+            )
+            final_status = "complete"
+            error_text = None
+        else:
+            metrics["aqi_rebuilds_failed"] += 1
+            failure_note = _merge_notes(
+                primary_row[6],
+                f"aqi_rebuild_failed status={bf.get('status')} error={bf.get('error')}",
+            )
+            conn.execute(
+                """
+                UPDATE aqi_rebuild_queue
+                SET status = 'failed',
+                    finished_at_utc = ?,
+                    notes = ?
+                WHERE id = ?
+                """,
+                (finished_iso, failure_note, primary_row_id),
+            )
+            final_status = "failed"
+            error_text = str(bf.get("error") or bf.get("status") or "unknown")
+        conn.commit()
+
+        metrics["aqi_rebuild_results"].append({
+            "queue_row_ids": row_ids,
+            "connector_id": connector_id,
+            "day_utc": day_iso,
+            "reasons": reasons_sorted,
+            "status": final_status,
+            "source_mode": "live_r2",
+            "error": error_text,
+            "log_path": bf.get("log_path"),
+        })
+
+    metrics["aqi_rebuild_ran"] = True
+    metrics["aqi_rebuild_results"] = sorted(
+        metrics["aqi_rebuild_results"],
+        key=lambda row: (
+            str(row.get("day_utc") or ""),
+            int(row.get("connector_id") or 0),
+        ),
     )
     return metrics
 
@@ -3273,6 +4610,442 @@ def ensure_dirs(env: dict[str, str]) -> None:
         Path(env[var]).mkdir(parents=True, exist_ok=True)
 
 
+def _check_writable_dir(path: str, label: str, errors: list[str]) -> None:
+    p = Path(path)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        errors.append(
+            f"{label} cannot be created: {path} ({exc})",
+        )
+        return
+    if not p.is_dir():
+        errors.append(f"{label} is not a directory: {path}")
+        return
+    if not os.access(p, os.W_OK):
+        errors.append(f"{label} is not writable: {path}")
+
+
+def _check_parent_writable(path: str, label: str, errors: list[str]) -> None:
+    parent = Path(path).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        errors.append(
+            f"{label} parent cannot be created: {parent} ({exc})",
+        )
+        return
+    if not os.access(parent, os.W_OK):
+        errors.append(f"{label} parent is not writable: {parent}")
+
+
+def _looks_like_snapshot_root(root: Path) -> bool:
+    # Lightweight heuristic to avoid deep scans on large trees.
+    likely_dir_names = {"history", "v1", "core"}
+    likely_file_names = {"manifest.json"}
+    likely_suffixes = {".parquet", ".json"}
+    checked = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        checked += 1
+        if checked > 300:
+            break
+        for dirname in dirnames:
+            if dirname in likely_dir_names:
+                return True
+        for name in filenames:
+            if name in likely_file_names:
+                return True
+            if Path(name).suffix.lower() in likely_suffixes:
+                return True
+    return False
+
+
+def _looks_like_r2_history_root(root: Path) -> bool:
+    candidates = (
+        root / "history",
+        root / "history" / "v1",
+        root / "history" / "_index",
+    )
+    if any(path.exists() for path in candidates):
+        return True
+    # Fallback heuristic for older/local layouts.
+    checked = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        checked += 1
+        if checked > 400:
+            break
+        if "observations_timeseries" in dirpath or "aqilevels_station" in dirpath:
+            return True
+        if any(name.endswith(".json") for name in filenames):
+            return True
+    return False
+
+
+def _parse_iso_day(day_value: str, field_name: str, errors: list[str]) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(day_value)
+    except ValueError:
+        errors.append(
+            f"{field_name} must be YYYY-MM-DD, got '{day_value}'.",
+        )
+        return None
+
+
+def _is_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _collect_guardrail_errors(cli_env: str, env: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    if env["UK_AQ_ENV_NAME"] != cli_env:
+        errors.append(
+            f"--env={cli_env} but UK_AQ_ENV_NAME={env['UK_AQ_ENV_NAME']}. Refusing to run.",
+        )
+    other = "LIVE" if cli_env == "CIC-Test" else "CIC-Test"
+    fragment = f"/{other}/"
+    for var in PATH_VARS_FOR_GUARDRAILS:
+        val = os.environ.get(var, "")
+        if val and fragment in val:
+            errors.append(
+                f"--env={cli_env} but {var}={val} contains '{fragment}'. Refusing to run.",
+            )
+
+    state_dir = env["UK_AQ_HISTORY_INTEGRITY_STATE_DIR"].rstrip("/")
+    db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
+    if not db_path.startswith(state_dir + "/"):
+        errors.append(
+            f"UK_AQ_HISTORY_INTEGRITY_DB_PATH={db_path} is not inside "
+            f"UK_AQ_HISTORY_INTEGRITY_STATE_DIR={env['UK_AQ_HISTORY_INTEGRITY_STATE_DIR']}. Refusing to run.",
+        )
+    return errors
+
+
+def _detect_integrity_wrapper_capabilities(
+    wrapper_path: Path,
+    env_name: str,
+) -> tuple[bool, bool]:
+    # Returns (supports_observs_only, supports_aqi_only)
+    try:
+        proc = subprocess.run(
+            [str(wrapper_path), "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=8,
+            check=False,
+            env={**os.environ, "UK_AQ_ENV_NAME": env_name},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return (False, False)
+    text = proc.stdout or ""
+    return ("--observs-only" in text, "--aqi-only" in text)
+
+
+def collect_preflight_errors(
+    args: argparse.Namespace,
+    env: dict[str, str],
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    guardrail_errors = _collect_guardrail_errors(args.env, env)
+    errors.extend(guardrail_errors)
+
+    for dir_var in (
+        "UK_AQ_HISTORY_INTEGRITY_STATE_DIR",
+        "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR",
+        "UK_AQ_HISTORY_INTEGRITY_TMP_DIR",
+        "UK_AQ_HISTORY_INTEGRITY_LOG_DIR",
+        "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR",
+        "UK_AQ_HISTORY_INTEGRITY_LOCK_DIR",
+    ):
+        _check_writable_dir(env[dir_var], dir_var, errors)
+
+    db_path = Path(env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
+    if "/Dropbox/" in str(db_path):
+        errors.append(
+            "UK_AQ_HISTORY_INTEGRITY_DB_PATH must be local (non-Dropbox).",
+        )
+    _check_parent_writable(str(db_path), "UK_AQ_HISTORY_INTEGRITY_DB_PATH", errors)
+
+    db_copy_path = str(os.environ.get("UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH", "")).strip()
+    if db_copy_path and str(db_path) == db_copy_path:
+        errors.append(
+            "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH must differ from UK_AQ_HISTORY_INTEGRITY_DB_PATH.",
+        )
+    if db_copy_path:
+        _check_parent_writable(
+            db_copy_path,
+            "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH",
+            errors,
+        )
+
+    if db_path.exists():
+        if not os.access(db_path, os.R_OK):
+            errors.append(f"live DB exists but is not readable: {db_path}")
+        if not os.access(db_path, os.W_OK):
+            errors.append(f"live DB exists but is not writable: {db_path}")
+    else:
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(db_path, "a", encoding="utf-8"):
+                pass
+            db_path.unlink(missing_ok=True)
+        except OSError as exc:
+            errors.append(f"live DB cannot be created at {db_path} ({exc})")
+
+    wal_path = db_path.with_name(db_path.name + "-wal")
+    shm_path = db_path.with_name(db_path.name + "-shm")
+    sidecars = [str(p) for p in (wal_path, shm_path) if p.exists()]
+    if sidecars:
+        warnings.append(f"SQLite sidecar files present: {', '.join(sidecars)}")
+
+    if args.max_download_mb is not None and args.max_download_mb <= 0:
+        errors.append("--max-download-mb must be a positive integer when supplied.")
+    if args.max_runtime_minutes is not None and args.max_runtime_minutes <= 0:
+        errors.append("--max-runtime-minutes must be a positive integer when supplied.")
+    if args.concurrency <= 0:
+        errors.append("--concurrency must be a positive integer.")
+
+    parsed_from: dt.date | None = None
+    parsed_to: dt.date | None = None
+    if args.from_day:
+        parsed_from = _parse_iso_day(args.from_day, "--from-day", errors)
+    if args.to_day:
+        parsed_to = _parse_iso_day(args.to_day, "--to-day", errors)
+    if args.profile == "manual" and (not args.from_day or not args.to_day):
+        errors.append("manual profile requires both --from-day and --to-day.")
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        errors.append("--from-day must be less than or equal to --to-day.")
+
+    snapshot_root = Path(env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"])
+    if not snapshot_root.exists():
+        errors.append(
+            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT does not exist: {snapshot_root}. "
+            "Has Dropbox finished syncing the core snapshot backup?",
+        )
+    elif not snapshot_root.is_dir():
+        errors.append(
+            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT is not a directory: {snapshot_root}",
+        )
+    elif not os.access(snapshot_root, os.R_OK):
+        errors.append(
+            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT is not readable: {snapshot_root}",
+        )
+    elif not _looks_like_snapshot_root(snapshot_root):
+        errors.append(
+            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT does not look like a snapshot history root: {snapshot_root}. "
+            "Has Dropbox finished syncing the core snapshot backup?",
+        )
+
+    cross_check_enabled = not args.skip_cross_check
+    if cross_check_enabled:
+        r2_root_raw = str(os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "")).strip()
+        if not r2_root_raw:
+            errors.append(
+                "UK_AQ_R2_HISTORY_DROPBOX_ROOT is required while cross-check is enabled.",
+            )
+        else:
+            r2_root = Path(r2_root_raw)
+            if not r2_root.exists():
+                errors.append(
+                    f"UK_AQ_R2_HISTORY_DROPBOX_ROOT does not exist: {r2_root}. "
+                    "Has Dropbox finished syncing the R2 history backup?",
+                )
+            elif not r2_root.is_dir():
+                errors.append(
+                    f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {r2_root}",
+                )
+            elif not os.access(r2_root, os.R_OK):
+                errors.append(
+                    f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not readable: {r2_root}",
+                )
+            elif not _looks_like_r2_history_root(r2_root):
+                errors.append(
+                    f"UK_AQ_R2_HISTORY_DROPBOX_ROOT does not look like an R2 history backup root: {r2_root}.",
+                )
+
+    # Source adapter dependency checks (local import only; no network in preflight).
+    if args.source in {"openaq", "all", "sensor-community", "sensorcommunity"}:
+        for module_name in ("gzip", "hashlib", "urllib.request", "sqlite3"):
+            try:
+                __import__(module_name)
+            except Exception as exc:  # pragma: no cover - defensive
+                errors.append(f"required Python module '{module_name}' failed to import ({exc}).")
+
+    if args.run_backfill:
+        wrapper_raw = resolve_integrity_backfill_wrapper()
+        if not wrapper_raw:
+            errors.append(
+                "Backfill wrapper is required when --run-backfill is used, but none of "
+                "UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER / UK_AQ_INTEGRITY_BACKFILL_WRAPPER is set.",
+            )
+        else:
+            wrapper_path = Path(wrapper_raw)
+            if not wrapper_path.exists():
+                errors.append(f"integrity backfill wrapper does not exist: {wrapper_path}")
+            elif not wrapper_path.is_file():
+                errors.append(f"integrity backfill wrapper is not a regular file: {wrapper_path}")
+            elif not os.access(wrapper_path, os.X_OK):
+                errors.append(f"integrity backfill wrapper is not executable: {wrapper_path}")
+
+        env_file_raw = str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")).strip()
+        loaded_backfill_env: dict[str, str] = {}
+        if not env_file_raw:
+            errors.append(
+                "UK_AQ_BACKFILL_ENV_FILE is required when --run-backfill is used, but it is not set.",
+            )
+        else:
+            env_file_path = Path(env_file_raw)
+            if not env_file_path.exists():
+                errors.append(f"UK_AQ_BACKFILL_ENV_FILE does not exist: {env_file_path}")
+            elif not env_file_path.is_file():
+                errors.append(f"UK_AQ_BACKFILL_ENV_FILE is not a regular file: {env_file_path}")
+            elif not os.access(env_file_path, os.R_OK):
+                errors.append(f"UK_AQ_BACKFILL_ENV_FILE is not readable: {env_file_path}")
+            else:
+                loaded_backfill_env = _load_env_file(env_file_path)
+
+        if env_file_raw:
+            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
+            if f"/{other_env}/" in env_file_raw:
+                errors.append(
+                    f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
+                )
+
+        nested_wrapper = loaded_backfill_env.get("UK_AQ_BACKFILL_WRAPPER", "").strip()
+        wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh" if wrapper_raw else False
+        if wrapper_is_integrity and not nested_wrapper:
+            errors.append(
+                "UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is required when the integrity wrapper is used, but it is not set.",
+            )
+        if nested_wrapper:
+            nested_wrapper_path = Path(nested_wrapper)
+            if not nested_wrapper_path.exists():
+                errors.append(
+                    f"UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE does not exist: {nested_wrapper_path}",
+                )
+            elif not nested_wrapper_path.is_file():
+                errors.append(
+                    f"UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is not a regular file: {nested_wrapper_path}",
+                )
+            elif not os.access(nested_wrapper_path, os.X_OK):
+                errors.append(
+                    f"UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is not executable: {nested_wrapper_path}",
+                )
+            if f"/{'LIVE' if args.env == 'CIC-Test' else 'CIC-Test'}/" in nested_wrapper:
+                errors.append(
+                    f"--env {args.env} but nested UK_AQ_BACKFILL_WRAPPER contains the other env path: {nested_wrapper}",
+                )
+            if wrapper_raw:
+                outer_wrapper_path = Path(wrapper_raw)
+                try:
+                    same_wrapper = (
+                        nested_wrapper_path.resolve(strict=False)
+                        == outer_wrapper_path.resolve(strict=False)
+                    )
+                except OSError:
+                    same_wrapper = str(nested_wrapper_path) == str(outer_wrapper_path)
+                if same_wrapper:
+                    errors.append(
+                        "nested UK_AQ_BACKFILL_WRAPPER resolves to the integrity wrapper path; this would recurse. "
+                        "Set UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE to the real backfill runner "
+                        "(for example scripts/uk_aq_backfill_local.sh).",
+                    )
+
+        for opt_name in (
+            "UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER",
+            "UK_AQ_INTEGRITY_BACKFILL_WRAPPER",
+        ):
+            opt_raw = str(os.environ.get(opt_name, "")).strip()
+            if not opt_raw:
+                continue
+            opt_path = Path(opt_raw)
+            if not opt_path.exists():
+                errors.append(f"{opt_name} does not exist: {opt_path}")
+            elif not opt_path.is_file():
+                errors.append(f"{opt_name} is not a regular file: {opt_path}")
+            elif not os.access(opt_path, os.X_OK):
+                errors.append(f"{opt_name} is not executable: {opt_path}")
+
+        if wrapper_raw:
+            wrapper_path = Path(wrapper_raw)
+            supports_obs, supports_aqi = _detect_integrity_wrapper_capabilities(
+                wrapper_path=wrapper_path,
+                env_name=args.env,
+            )
+            if not supports_obs or not supports_aqi:
+                supports_output_scope = _is_truthy(
+                    os.environ.get("UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE"),
+                )
+                supports_aqi_mode = _is_truthy(
+                    os.environ.get("UK_AQ_BACKFILL_SUPPORTS_R2_HISTORY_OBS_TO_AQILEVELS"),
+                )
+                if not supports_output_scope:
+                    errors.append(
+                        "Backfill capability check failed: output-scope support not detected. "
+                        "Set UK_AQ_BACKFILL_SUPPORTS_OUTPUT_SCOPE=true or use a wrapper exposing --observs-only/--aqi-only.",
+                    )
+                if not supports_aqi_mode:
+                    errors.append(
+                        "Backfill capability check failed: AQI rebuild mode support not detected. "
+                        "Set UK_AQ_BACKFILL_SUPPORTS_R2_HISTORY_OBS_TO_AQILEVELS=true.",
+                    )
+
+    window_from, window_to = compute_window(
+        args.profile, args.from_day, args.to_day, os.environ,
+    )
+
+    summary = {
+        "env": args.env,
+        "profile": args.profile,
+        "source": args.source,
+        "from_day": window_from,
+        "to_day": window_to,
+        "check_only": bool(args.check_only),
+        "dry_run": bool(args.dry_run),
+        "run_backfill": bool(args.run_backfill),
+        "cross_check_enabled": not args.skip_cross_check,
+        "paths": {
+            "root": env["UK_AQ_HISTORY_INTEGRITY_ROOT"],
+            "state_dir": env["UK_AQ_HISTORY_INTEGRITY_STATE_DIR"],
+            "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+            "snapshot_root": env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"],
+            "r2_history_root": str(os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "")),
+            "backfill_wrapper": resolve_integrity_backfill_wrapper(),
+            "backfill_env_file": str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")),
+        },
+    }
+    return errors, warnings, summary
+
+
+def run_preflight_or_die(
+    args: argparse.Namespace,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    errors, warnings, summary = collect_preflight_errors(args, env)
+    print(
+        "preflight: "
+        f"env={summary['env']} profile={summary['profile']} source={summary['source']} "
+        f"window={summary['from_day']}..{summary['to_day']} "
+        f"check_only={summary['check_only']} dry_run={summary['dry_run']} "
+        f"run_backfill={summary['run_backfill']} cross_check_enabled={summary['cross_check_enabled']}"
+    )
+    print(
+        "preflight paths: "
+        f"state={summary['paths']['state_dir']} db={summary['paths']['db_path']} "
+        f"snapshot={summary['paths']['snapshot_root']} r2={summary['paths']['r2_history_root'] or '<unset>'} "
+        f"wrapper={summary['paths']['backfill_wrapper'] or '<unset>'}"
+    )
+    for warning in warnings:
+        print(f"WARNING preflight: {warning}")
+    if errors:
+        for err in errors:
+            print(f"ERROR preflight: {err}", file=sys.stderr)
+        sys.exit(7)
+    return summary
+
+
 def resolve_integrity_end_back_days(env: Mapping[str, str] | None = None) -> int:
     source = env if env is not None else os.environ
     raw_retention = str(source.get("INGESTDB_RETENTION_DAYS", "")).strip()
@@ -3316,6 +5089,67 @@ def compute_window(
     return (from_day or default_from, to_day or default_to)
 
 
+CONSOLE_PROGRESS_UPDATE_SECONDS = 0.2
+
+
+class ConsoleNoiseFilter(logging.Filter):
+    """Keep console output compact while preserving full file logs."""
+
+    _blocked_prefixes = (
+        "openaq first_seen ",
+        "openaq changed ",
+        "openaq reappeared ",
+        "sensorcommunity first_seen ",
+        "sensorcommunity changed ",
+        "sensorcommunity reappeared ",
+        "openaq planned backfill: ",
+        "sensorcommunity planned backfill: ",
+        "cross-check planned observation repair: ",
+        "backfill loading env_file=",
+        "backfill invoke wrapper=",
+        "backfill done status=",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        for prefix in self._blocked_prefixes:
+            if msg.startswith(prefix):
+                return False
+        return True
+
+
+class SingleLineProgress:
+    """Terminal one-line progress reporter.
+
+    Uses carriage-return updates so the screen stays concise.
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._last_emit_mono = 0.0
+        self._last_width = 0
+        self._active = False
+
+    def update(self, text: str, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_emit_mono) < CONSOLE_PROGRESS_UPDATE_SECONDS:
+            return
+        self._last_emit_mono = now
+        line = f"{self.label}: {text}"
+        pad = max(0, self._last_width - len(line))
+        sys.stdout.write("\r" + line + (" " * pad))
+        sys.stdout.flush()
+        self._last_width = len(line)
+        self._active = True
+
+    def finish(self) -> None:
+        if not self._active:
+            return
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._active = False
+
+
 def open_db(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -3336,6 +5170,22 @@ def open_db(db_path: str) -> sqlite3.Connection:
         "cross_checks_source_only": "INTEGER DEFAULT 0",
         "cross_checks_r2_only": "INTEGER DEFAULT 0",
         "cross_checks_r2_manifest_missing": "INTEGER DEFAULT 0",
+        "observation_backfills_attempted": "INTEGER DEFAULT 0",
+        "observation_backfills_ok": "INTEGER DEFAULT 0",
+        "observation_backfills_failed": "INTEGER DEFAULT 0",
+        "aqi_rebuilds_queued_from_obs_repair": "INTEGER DEFAULT 0",
+        "aqi_health_connector_days_checked": "INTEGER DEFAULT 0",
+        "aqi_health_rebuilds_queued": "INTEGER DEFAULT 0",
+        "aqi_health_skipped_already_obs_repaired": "INTEGER DEFAULT 0",
+        "aqi_health_manifest_missing": "INTEGER DEFAULT 0",
+        "aqi_health_manifest_stale": "INTEGER DEFAULT 0",
+        "aqi_health_manifest_empty": "INTEGER DEFAULT 0",
+        "aqi_health_previous_rebuild_failed": "INTEGER DEFAULT 0",
+        "aqi_rebuilds_queued_total": "INTEGER DEFAULT 0",
+        "aqi_rebuilds_attempted": "INTEGER DEFAULT 0",
+        "aqi_rebuilds_complete": "INTEGER DEFAULT 0",
+        "aqi_rebuilds_failed": "INTEGER DEFAULT 0",
+        "aqi_rebuilds_skipped": "INTEGER DEFAULT 0",
     })
     conn.commit()
     return conn
@@ -3366,6 +5216,7 @@ def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
     sh.setLevel(level)
+    sh.addFilter(ConsoleNoiseFilter())
     root.addHandler(sh)
 
     return log_path
@@ -3502,18 +5353,68 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- cross_checks_source_only: {cc.get('cross_checks_source_only', 0)}",
             f"- cross_checks_r2_only:     {cc.get('cross_checks_r2_only', 0)}",
             f"- cross_checks_r2_manifest_missing: {cc.get('cross_checks_r2_manifest_missing', 0)}",
-            f"- Backfill candidates:       days={cc.get('backfill_candidate_days', 0)} timeseries_ids={cc.get('backfill_candidate_timeseries_ids', 0)}",
-            f"- Backfills:                 attempted={cc.get('backfills_attempted', 0)} ok={cc.get('backfills_ok', 0)} failed={cc.get('backfills_failed', 0)}",
+            f"- Observation repair candidates: days={cc.get('observation_backfill_candidate_days', cc.get('backfill_candidate_days', 0))} timeseries_ids={cc.get('observation_backfill_candidate_timeseries_ids', cc.get('backfill_candidate_timeseries_ids', 0))}",
+            f"- Observation repairs:       attempted={cc.get('observation_backfills_attempted', cc.get('backfills_attempted', 0))} ok={cc.get('observation_backfills_ok', cc.get('backfills_ok', 0))} failed={cc.get('observation_backfills_failed', cc.get('backfills_failed', 0))}",
+            f"- AQI rebuilds queued:       {cc.get('aqi_rebuilds_queued_from_obs_repair', 0)}",
+            f"- AQI health checked connector-days: {cc.get('aqi_health_connector_days_checked', 0)}",
+            f"- AQI health rebuilds queued:        {cc.get('aqi_health_rebuilds_queued', 0)}",
+            f"- AQI health skipped obs-repaired:   {cc.get('aqi_health_skipped_already_obs_repaired', 0)}",
+            f"- AQI health manifest missing:       {cc.get('aqi_health_manifest_missing', 0)}",
+            f"- AQI health manifest stale:         {cc.get('aqi_health_manifest_stale', 0)}",
+            f"- AQI health manifest empty:         {cc.get('aqi_health_manifest_empty', 0)}",
+            f"- AQI health previous rebuild failed:{cc.get('aqi_health_previous_rebuild_failed', 0)}",
+            f"- AQI health ran:                    {bool(cc.get('aqi_health_ran'))}",
+            f"- AQI rebuild queued total:          {cc.get('aqi_rebuilds_queued_total', 0)}",
+            f"- AQI rebuild attempted:             {cc.get('aqi_rebuilds_attempted', 0)}",
+            f"- AQI rebuild complete:              {cc.get('aqi_rebuilds_complete', 0)}",
+            f"- AQI rebuild failed:                {cc.get('aqi_rebuilds_failed', 0)}",
+            f"- AQI rebuild skipped:               {cc.get('aqi_rebuilds_skipped', 0)}",
+            f"- AQI rebuild ran:                   {bool(cc.get('aqi_rebuild_ran'))}",
         ])
+        if cc.get("aqi_health_skipped_reason"):
+            lines.append(f"- AQI health skipped reason:        {cc.get('aqi_health_skipped_reason')}")
+        if cc.get("aqi_rebuild_skipped_reason"):
+            lines.append(f"- AQI rebuild skipped reason:       {cc.get('aqi_rebuild_skipped_reason')}")
         if cc.get("skipped_reason"):
             lines.append(f"- Skipped reason:           {cc['skipped_reason']}")
-        cc_planned = cc.get("planned_backfills") or []
+        cc_planned = cc.get("planned_observation_backfills") or cc.get("planned_backfills") or []
         if cc_planned:
-            lines.extend(["", "### Planned backfill commands from cross-check", ""])
+            lines.extend(["", "### Planned observation repair commands from cross-check", ""])
             for cmd in cc_planned[:20]:
                 lines.extend(["```bash", cmd, "```"])
             if len(cc_planned) > 20:
                 lines.append(f"... {len(cc_planned) - 20} more")
+        planned_aqi = cc.get("planned_aqi_rebuilds") or []
+        if planned_aqi:
+            lines.extend(["", "### Planned AQI rebuild queue entries from cross-check", ""])
+            for entry in planned_aqi[:50]:
+                lines.append(f"- {entry}")
+            if len(planned_aqi) > 50:
+                lines.append(f"- ... {len(planned_aqi) - 50} more")
+        aqi_only_queued = cc.get("queued_aqi_only_connector_days") or []
+        if aqi_only_queued:
+            lines.extend(["", "### AQI-only queued connector-days (Phase 6.7)", ""])
+            for entry in aqi_only_queued:
+                lines.append(
+                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
+                    f"reasons={entry.get('reasons')} notes={entry.get('notes')}"
+                )
+        planned_aqi_rebuilds = cc.get("planned_aqi_rebuild_commands") or []
+        if planned_aqi_rebuilds:
+            lines.extend(["", "### Planned AQI rebuild commands (Phase 6.8)", ""])
+            for cmd in planned_aqi_rebuilds[:50]:
+                lines.extend(["```bash", cmd, "```"])
+            if len(planned_aqi_rebuilds) > 50:
+                lines.append(f"... {len(planned_aqi_rebuilds) - 50} more")
+        aqi_rebuild_results = cc.get("aqi_rebuild_results") or []
+        if aqi_rebuild_results:
+            lines.extend(["", "### AQI rebuild results (Phase 6.8)", ""])
+            for entry in aqi_rebuild_results:
+                lines.append(
+                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
+                    f"status={entry.get('status')} reasons={entry.get('reasons')} "
+                    f"error={entry.get('error')} log_path={entry.get('log_path')}"
+                )
         discrepancies = cc.get("discrepancies") or []
         if discrepancies:
             lines.extend(["", "### Discrepancies", ""])
@@ -3551,6 +5452,22 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "cross_checks_source_only",
         "cross_checks_r2_only",
         "cross_checks_r2_manifest_missing",
+        "observation_backfills_attempted",
+        "observation_backfills_ok",
+        "observation_backfills_failed",
+        "aqi_rebuilds_queued_from_obs_repair",
+        "aqi_health_connector_days_checked",
+        "aqi_health_rebuilds_queued",
+        "aqi_health_skipped_already_obs_repaired",
+        "aqi_health_manifest_missing",
+        "aqi_health_manifest_stale",
+        "aqi_health_manifest_empty",
+        "aqi_health_previous_rebuild_failed",
+        "aqi_rebuilds_queued_total",
+        "aqi_rebuilds_attempted",
+        "aqi_rebuilds_complete",
+        "aqi_rebuilds_failed",
+        "aqi_rebuilds_skipped",
         "warnings_count",
         "errors_count",
     ):
@@ -3581,8 +5498,7 @@ def main(argv: list[str]) -> int:
         # Accept either token; normalize internally for existing branch logic.
         args.source = "sensorcommunity"
     env = load_env_or_die()
-    validate_guardrails(args.env, env)
-    ensure_dirs(env)
+    preflight_summary = run_preflight_or_die(args, env)
 
     started_mono = time.monotonic()
     started_at = utc_now()
@@ -3601,6 +5517,7 @@ def main(argv: list[str]) -> int:
     )
     log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
     log.info("log_file=%s", log_path)
+    log.info("preflight summary=%s", preflight_summary)
 
     end_back_days = resolve_integrity_end_back_days(os.environ)
     from_day, to_day = compute_window(
@@ -3746,14 +5663,43 @@ def main(argv: list[str]) -> int:
             cc_backfill_metrics = run_cross_check_backfills(
                 conn=conn,
                 run_id=int(run_id),
+                env_name=args.env,
                 run_compact=run_compact,
                 env=env,
+                source_filter=args.source,
                 dry_run=args.dry_run,
                 run_backfill=args.run_backfill,
                 limits=limits,
                 log=log,
             )
             cross_check_metrics.update(cc_backfill_metrics)
+            aqi_health_metrics = run_aqi_health_checks(
+                conn=conn,
+                run_id=int(run_id),
+                env_name=args.env,
+                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                r2_aqilevels_prefix=os.environ.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX"),
+                dry_run=args.dry_run,
+                run_backfill=args.run_backfill,
+                log=log,
+            )
+            cross_check_metrics.update(aqi_health_metrics)
+            aqi_rebuild_metrics = run_aqi_rebuild_queue_execution(
+                conn=conn,
+                run_id=int(run_id),
+                env_name=args.env,
+                run_compact=run_compact,
+                env=env,
+                dry_run=args.dry_run,
+                run_backfill=args.run_backfill,
+                limits=limits,
+                log=log,
+                dry_run_planned_rows=[
+                    *(cross_check_metrics.get("planned_aqi_rebuild_connector_days") or []),
+                    *(cross_check_metrics.get("queued_aqi_only_connector_days") or []),
+                ],
+            )
+            cross_check_metrics.update(aqi_rebuild_metrics)
 
         any_adapter_ran = openaq_metrics.get("ran") or sc_metrics.get("ran")
         any_stopped = openaq_metrics.get("stopped_for") or sc_metrics.get("stopped_for")
@@ -3826,13 +5772,42 @@ def main(argv: list[str]) -> int:
             )
             if args.run_backfill:
                 notes_parts.append(
-                    "cross-check-backfill "
-                    f"candidates_days={cross_check_metrics.get('backfill_candidate_days', 0)} "
-                    f"candidates_timeseries_ids={cross_check_metrics.get('backfill_candidate_timeseries_ids', 0)} "
-                    f"attempted={cross_check_metrics.get('backfills_attempted', 0)} "
-                    f"ok={cross_check_metrics.get('backfills_ok', 0)} "
-                    f"failed={cross_check_metrics.get('backfills_failed', 0)}"
+                    "cross-check-observation-repair "
+                    f"candidates_days={cross_check_metrics.get('observation_backfill_candidate_days', cross_check_metrics.get('backfill_candidate_days', 0))} "
+                    f"candidates_timeseries_ids={cross_check_metrics.get('observation_backfill_candidate_timeseries_ids', cross_check_metrics.get('backfill_candidate_timeseries_ids', 0))} "
+                    f"attempted={cross_check_metrics.get('observation_backfills_attempted', cross_check_metrics.get('backfills_attempted', 0))} "
+                    f"ok={cross_check_metrics.get('observation_backfills_ok', cross_check_metrics.get('backfills_ok', 0))} "
+                    f"failed={cross_check_metrics.get('observation_backfills_failed', cross_check_metrics.get('backfills_failed', 0))} "
+                    f"aqi_rebuilds_queued={cross_check_metrics.get('aqi_rebuilds_queued_from_obs_repair', 0)}"
                 )
+                notes_parts.append(
+                    "aqi-health-check "
+                    f"checked={cross_check_metrics.get('aqi_health_connector_days_checked', 0)} "
+                    f"queued={cross_check_metrics.get('aqi_health_rebuilds_queued', 0)} "
+                    f"skipped_obs_repaired={cross_check_metrics.get('aqi_health_skipped_already_obs_repaired', 0)} "
+                    f"manifest_missing={cross_check_metrics.get('aqi_health_manifest_missing', 0)} "
+                    f"manifest_stale={cross_check_metrics.get('aqi_health_manifest_stale', 0)} "
+                    f"manifest_empty={cross_check_metrics.get('aqi_health_manifest_empty', 0)} "
+                    f"previous_rebuild_failed={cross_check_metrics.get('aqi_health_previous_rebuild_failed', 0)}"
+                )
+                if cross_check_metrics.get("aqi_health_skipped_reason"):
+                    notes_parts.append(
+                        "aqi-health-check-skipped "
+                        f"reason={cross_check_metrics.get('aqi_health_skipped_reason')}"
+                    )
+                notes_parts.append(
+                    "aqi-rebuild-execution "
+                    f"queued_total={cross_check_metrics.get('aqi_rebuilds_queued_total', 0)} "
+                    f"attempted={cross_check_metrics.get('aqi_rebuilds_attempted', 0)} "
+                    f"complete={cross_check_metrics.get('aqi_rebuilds_complete', 0)} "
+                    f"failed={cross_check_metrics.get('aqi_rebuilds_failed', 0)} "
+                    f"skipped={cross_check_metrics.get('aqi_rebuilds_skipped', 0)}"
+                )
+                if cross_check_metrics.get("aqi_rebuild_skipped_reason"):
+                    notes_parts.append(
+                        "aqi-rebuild-execution-skipped "
+                        f"reason={cross_check_metrics.get('aqi_rebuild_skipped_reason')}"
+                    )
         elif cross_check_metrics.get("skipped_reason"):
             notes_parts.append(f"cross-check skipped: {cross_check_metrics['skipped_reason']}")
 
@@ -3841,12 +5816,71 @@ def main(argv: list[str]) -> int:
         def _sum(key: str) -> int:
             return int(openaq_metrics.get(key, 0)) + int(sc_metrics.get(key, 0))
 
-        cross_check_backfills_attempted = int(cross_check_metrics.get("backfills_attempted", 0) or 0)
-        cross_check_backfills_ok = int(cross_check_metrics.get("backfills_ok", 0) or 0)
-        cross_check_backfills_failed = int(cross_check_metrics.get("backfills_failed", 0) or 0)
+        cross_check_backfills_attempted = int(
+            cross_check_metrics.get(
+                "observation_backfills_attempted",
+                cross_check_metrics.get("backfills_attempted", 0),
+            ) or 0
+        )
+        cross_check_backfills_ok = int(
+            cross_check_metrics.get(
+                "observation_backfills_ok",
+                cross_check_metrics.get("backfills_ok", 0),
+            ) or 0
+        )
+        cross_check_backfills_failed = int(
+            cross_check_metrics.get(
+                "observation_backfills_failed",
+                cross_check_metrics.get("backfills_failed", 0),
+            ) or 0
+        )
+        aqi_rebuilds_queued_from_obs_repair = int(
+            cross_check_metrics.get("aqi_rebuilds_queued_from_obs_repair", 0) or 0
+        )
+        aqi_health_connector_days_checked = int(
+            cross_check_metrics.get("aqi_health_connector_days_checked", 0) or 0
+        )
+        aqi_health_rebuilds_queued = int(
+            cross_check_metrics.get("aqi_health_rebuilds_queued", 0) or 0
+        )
+        aqi_health_skipped_already_obs_repaired = int(
+            cross_check_metrics.get("aqi_health_skipped_already_obs_repaired", 0) or 0
+        )
+        aqi_health_manifest_missing = int(
+            cross_check_metrics.get("aqi_health_manifest_missing", 0) or 0
+        )
+        aqi_health_manifest_stale = int(
+            cross_check_metrics.get("aqi_health_manifest_stale", 0) or 0
+        )
+        aqi_health_manifest_empty = int(
+            cross_check_metrics.get("aqi_health_manifest_empty", 0) or 0
+        )
+        aqi_health_previous_rebuild_failed = int(
+            cross_check_metrics.get("aqi_health_previous_rebuild_failed", 0) or 0
+        )
+        aqi_rebuilds_queued_total = int(
+            cross_check_metrics.get("aqi_rebuilds_queued_total", 0) or 0
+        )
+        aqi_rebuilds_attempted = int(
+            cross_check_metrics.get("aqi_rebuilds_attempted", 0) or 0
+        )
+        aqi_rebuilds_complete = int(
+            cross_check_metrics.get("aqi_rebuilds_complete", 0) or 0
+        )
+        aqi_rebuilds_failed = int(
+            cross_check_metrics.get("aqi_rebuilds_failed", 0) or 0
+        )
+        aqi_rebuilds_skipped = int(
+            cross_check_metrics.get("aqi_rebuilds_skipped", 0) or 0
+        )
 
         downloaded_bytes_total = _sum("downloaded_bytes")
-        errors_count = _sum("errors") + _sum("backfills_failed") + cross_check_backfills_failed
+        errors_count = (
+            _sum("errors")
+            + _sum("backfills_failed")
+            + cross_check_backfills_failed
+            + aqi_rebuilds_failed
+        )
         warnings_count_total = warnings_delta
         if openaq_metrics.get("skipped_reason"):
             warnings_count_total += 1
@@ -3879,6 +5913,22 @@ def main(argv: list[str]) -> int:
             "cross_checks_r2_manifest_missing": int(
                 cross_check_metrics.get("cross_checks_r2_manifest_missing", 0) or 0
             ),
+            "observation_backfills_attempted": cross_check_backfills_attempted,
+            "observation_backfills_ok": cross_check_backfills_ok,
+            "observation_backfills_failed": cross_check_backfills_failed,
+            "aqi_rebuilds_queued_from_obs_repair": aqi_rebuilds_queued_from_obs_repair,
+            "aqi_health_connector_days_checked": aqi_health_connector_days_checked,
+            "aqi_health_rebuilds_queued": aqi_health_rebuilds_queued,
+            "aqi_health_skipped_already_obs_repaired": aqi_health_skipped_already_obs_repaired,
+            "aqi_health_manifest_missing": aqi_health_manifest_missing,
+            "aqi_health_manifest_stale": aqi_health_manifest_stale,
+            "aqi_health_manifest_empty": aqi_health_manifest_empty,
+            "aqi_health_previous_rebuild_failed": aqi_health_previous_rebuild_failed,
+            "aqi_rebuilds_queued_total": aqi_rebuilds_queued_total,
+            "aqi_rebuilds_attempted": aqi_rebuilds_attempted,
+            "aqi_rebuilds_complete": aqi_rebuilds_complete,
+            "aqi_rebuilds_failed": aqi_rebuilds_failed,
+            "aqi_rebuilds_skipped": aqi_rebuilds_skipped,
             "warnings_count": warnings_count_total,
             "errors_count": errors_count,
             "snapshot_status": snapshot_result["status"],
@@ -3923,6 +5973,22 @@ def main(argv: list[str]) -> int:
               cross_checks_source_only = ?,
               cross_checks_r2_only = ?,
               cross_checks_r2_manifest_missing = ?,
+              observation_backfills_attempted = ?,
+              observation_backfills_ok = ?,
+              observation_backfills_failed = ?,
+              aqi_rebuilds_queued_from_obs_repair = ?,
+              aqi_health_connector_days_checked = ?,
+              aqi_health_rebuilds_queued = ?,
+              aqi_health_skipped_already_obs_repaired = ?,
+              aqi_health_manifest_missing = ?,
+              aqi_health_manifest_stale = ?,
+              aqi_health_manifest_empty = ?,
+              aqi_health_previous_rebuild_failed = ?,
+              aqi_rebuilds_queued_total = ?,
+              aqi_rebuilds_attempted = ?,
+              aqi_rebuilds_complete = ?,
+              aqi_rebuilds_failed = ?,
+              aqi_rebuilds_skipped = ?,
               warnings_count = warnings_count + ?,
               errors_count = errors_count + ?,
               notes = ?
@@ -3946,6 +6012,22 @@ def main(argv: list[str]) -> int:
                 metrics["cross_checks_source_only"],
                 metrics["cross_checks_r2_only"],
                 metrics["cross_checks_r2_manifest_missing"],
+                metrics["observation_backfills_attempted"],
+                metrics["observation_backfills_ok"],
+                metrics["observation_backfills_failed"],
+                metrics["aqi_rebuilds_queued_from_obs_repair"],
+                metrics["aqi_health_connector_days_checked"],
+                metrics["aqi_health_rebuilds_queued"],
+                metrics["aqi_health_skipped_already_obs_repaired"],
+                metrics["aqi_health_manifest_missing"],
+                metrics["aqi_health_manifest_stale"],
+                metrics["aqi_health_manifest_empty"],
+                metrics["aqi_health_previous_rebuild_failed"],
+                metrics["aqi_rebuilds_queued_total"],
+                metrics["aqi_rebuilds_attempted"],
+                metrics["aqi_rebuilds_complete"],
+                metrics["aqi_rebuilds_failed"],
+                metrics["aqi_rebuilds_skipped"],
                 warnings_count_total,
                 errors_count,
                 notes,

@@ -34,7 +34,8 @@
     "geo:resolve-dropbox": "python3 scripts/geography/resolve_dropbox_geojson.py",
     "geo:build-shards": "node scripts/geography/build_pcon_la_lookup_shards.mjs",
     "geo:upload-shards": "node scripts/geography/upload_pcon_la_lookup_shards_to_r2.mjs",
-    "geo:compare-aiven": "python3 scripts/geography/compare_r2_geo_lookup_with_aiven.py"
+    "geo:compare-aiven": "python3 scripts/geography/compare_r2_geo_lookup_with_aiven.py",
+    "check:timeseries-v2-skeleton": "node scripts/uk_aq_cache_proxy/check_timeseries_v2_skeleton.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",

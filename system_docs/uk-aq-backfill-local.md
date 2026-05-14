@@ -45,6 +45,7 @@ Primary (preferred) env vars:
 - `UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE` (default `0`, disabled)
 - `UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR` (default `0`, disabled)
 - `UK_AQ_BACKFILL_PAUSE_SECONDS` (legacy alias for run interval)
+- `UK_AQ_BACKFILL_OUTPUT_SCOPE` (default `default`)
 
 ## Metadata source rules
 
@@ -106,25 +107,42 @@ For each `(day_utc, connector_id)`:
 If local Dropbox baseline manifests are missing for targeted merge,
 backfill fails that connector/day to avoid destructive partial rewrite.
 
-## AQI handling
+## AQI handling / output scope
 
-In `source_to_r2`, AQI outputs are always rebuilt alongside observations for
-successful connector/day writes.
+`UK_AQ_BACKFILL_OUTPUT_SCOPE` controls which outputs are allowed:
 
-For targeted merge mode:
+- `default`
+  - Existing behavior.
+  - `source_to_r2` writes observations and AQI history outputs.
+  - `r2_history_obs_to_aqilevels` rebuilds AQI history outputs.
+- `observations_only` (valid only with `source_to_r2`)
+  - Writes observation history outputs only.
+  - Does not build/export/write AQI history parquet/manifests.
+  - Skip guard only checks observation rows (`obsHistoryRows.length`).
+- `aqilevels_only` (valid only with `r2_history_obs_to_aqilevels`)
+  - Rebuilds AQI history outputs only from committed R2 observation history.
 
-- non-target AQI rows are preserved from local backup
-- target AQI rows are recomputed from replacement observation rows
+Invalid run-mode/output-scope combinations fail before any R2 mutation.
 
 ## Key env vars for integrity-triggered runs
 
 Integrity uses wrapper + env file and sets:
 
 - `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`
+- `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only`
 - `UK_AQ_BACKFILL_FORCE_REPLACE=true`
 - `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>`
 - `UK_AQ_BACKFILL_TO_DAY_UTC=<day>`
 - `UK_AQ_BACKFILL_TIMESERIES_IDS=<csv>`
+
+AQI rebuild pass uses:
+
+- `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`
+- `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`
+- `UK_AQ_BACKFILL_FORCE_REPLACE=true`
+- `UK_AQ_BACKFILL_CONNECTOR_IDS=<connector_id>`
+- `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>`
+- `UK_AQ_BACKFILL_TO_DAY_UTC=<day>`
 
 Recommended supporting vars in the backfill env file:
 

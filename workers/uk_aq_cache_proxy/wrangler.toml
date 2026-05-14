@@ -23,6 +23,10 @@ enabled = true
 # - UK_AQ_CHART_METRICS_RPC_SCHEMA (optional, default: uk_aq_public)
 # - UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE (optional)
 # - UK_AQ_CHART_METRICS_MAX_BODY_BYTES (optional)
+# - UK_AQ_TIMESERIES_V2_ENABLED (optional; default false)
+# - UK_AQ_TIMESERIES_PROXY_FIRST (optional; default false)
+# - UK_AQ_TIMESERIES_R2_FIRST (optional; default false; reserved for stitch phase)
+# - UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE (optional; default false; reserved for stitch phase)
 #
 # Route binding is configured in Cloudflare dashboard or via wrangler CLI.
 # Recommended hostnames:

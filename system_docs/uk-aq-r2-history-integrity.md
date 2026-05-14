@@ -221,10 +221,13 @@ UK_AQ_HISTORY_INTEGRITY_TMP_DIR
 UK_AQ_HISTORY_INTEGRITY_LOG_DIR
 UK_AQ_HISTORY_INTEGRITY_REPORT_DIR
 UK_AQ_HISTORY_INTEGRITY_LOCK_DIR
+UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT
 ```
 
-The Dropbox / backfill vars are not required for Phase 1; they become required
-when the corresponding phase runs.
+Additional vars are required conditionally by preflight, for example:
+
+- `UK_AQ_R2_HISTORY_DROPBOX_ROOT` when cross-check is enabled (default).
+- `UK_AQ_BACKFILL_WRAPPER` + `UK_AQ_BACKFILL_ENV_FILE` when `--run-backfill` is set.
 
 ---
 
@@ -298,6 +301,7 @@ ERROR: --env=LIVE but UK_AQ_HISTORY_INTEGRITY_DB_PATH=/.../state/CIC-Test/... co
 4  guardrail failure (name mismatch / cross-env path / DB outside state dir)
 5  lock held (live or stale)
 6  python entrypoint missing
+7  python preflight failed
 ```
 
 ---
@@ -322,9 +326,14 @@ The launcher is a thin shell wrapper that:
 2. Loads `<UK_AQ_HISTORY_INTEGRITY_ROOT>/env/<ENV>.env`. The root defaults to
    the parent of `bin/`; override with `UK_AQ_HISTORY_INTEGRITY_ROOT`.
 3. Validates required env vars and environment/path guardrails.
-4. Creates required directories.
-5. Acquires a per-environment PID lock.
-6. Invokes the Python entrypoint, then cleans up the lock on EXIT/INT/TERM.
+4. Runs structural preflight checks (writable paths, DB parent, optional backfill
+   wrapper/env checks when `--run-backfill` is selected).
+5. Creates required directories.
+6. Acquires a per-environment PID lock.
+7. Invokes the Python entrypoint, then cleans up the lock on EXIT/INT/TERM.
+
+Python then runs a stricter preflight phase (before any SQLite writes, source
+checks/downloads, cross-checks, or backfill calls).
 
 Python interpreter defaults to `python3`; override with
 `UK_AQ_HISTORY_INTEGRITY_PYTHON`.
@@ -384,25 +393,30 @@ Default date windows (UTC dates):
 ```text
 daily:
   from = today - 21 days
-  to   = today - 6 days
+  to   = today - (INGESTDB_RETENTION_DAYS + 1)
 
 weekly:
   from = today - 120 days
-  to   = today - 4 days
+  to   = today - (INGESTDB_RETENTION_DAYS + 1)
 
 monthly:
   from = today - 730 days
-  to   = today - 4 days
+  to   = today - (INGESTDB_RETENTION_DAYS + 1)
 ```
 
-Daily uses `today - 6 days` as the upper bound. Weekly/monthly use
-`today - 4 days`. These buffers give headroom beyond OpenAQ's 72-hour
-publication delay. `today` is computed in UTC.
+`INGESTDB_RETENTION_DAYS` is resolved in this order:
+
+1. `INGESTDB_RETENTION_DAYS` from the current process environment.
+2. If unset, `INGESTDB_RETENTION_DAYS` loaded from `UK_AQ_BACKFILL_ENV_FILE`.
+3. If still unset/invalid/non-positive, default `5`.
+
+So the default upper bound is `today - 6 days` for **all** scheduled profiles.
+`today` is computed in UTC.
 
 `--from-day` / `--to-day` always override the profile defaults if supplied.
 
-Manual profile without `--from-day` and `--to-day` is allowed but logs a
-warning and uses an open-ended window.
+Manual profile requires both `--from-day` and `--to-day`; preflight hard-fails
+if either is missing.
 
 ---
 
@@ -949,19 +963,24 @@ Backfill is attempted only when all conditions are true:
 2. `--dry-run` is **not** set.
 3. At least one source-change event exists (`first_seen`/`reappeared`/`changed`)
    **or** at least one cross-check discrepancy exists with status
-   `mismatch` or `source_only`.
+   `mismatch`, `source_only`, or `r2_manifest_missing`.
 
 Execution shape:
 
 - The run first completes source checks/downloads.
-- It then runs two independent batched backfill phases (both day-grouped):
+- It then runs integrity backfill orchestration phases:
   - source-change batches from adapter events (`first_seen`/`reappeared`/`changed`)
-  - cross-check discrepancy batches from `cross_checks` statuses
-    `mismatch`/`source_only`
-- Each phase calls the wrapper once per day with the union of affected
+  - cross-check observation-repair batches from `cross_checks` statuses
+    `mismatch`/`source_only`/`r2_manifest_missing` (grouped by day+connector)
+  - AQI-only health checks that queue connector/day AQI rebuild work
+- Source-change phases call the wrapper once per day with the union of affected
   `timeseries_ids` for that day.
+- Cross-check observation-repair calls are one per day+connector with
+  observations-only scope.
+- AQI-only issues are queued for `r2_history_obs_to_aqilevels` (not
+  `source_to_r2`).
 
-`r2_only` and `r2_manifest_missing` do **not** trigger backfill.
+`r2_only` does **not** trigger observation repair.
 
 So if a run ends with `backfills_attempted=0`, it means no eligible
 source-change and no eligible cross-check discrepancy was found in the
@@ -1393,27 +1412,96 @@ upstream archive contains.
 - New CLI flag `--skip-cross-check` for debug/recovery; pass runs by
   default.
 
-**Pass C — Cross-check triggered backfill (DONE):**
+**Pass C / Phase 6.6 — Observation repair + AQI queue (DONE):**
 
-- When `--run-backfill` is set, the integrity runner now derives
-  additional backfill candidates directly from `cross_checks` rows for
-  the current `run_id` where `status IN ('mismatch', 'source_only')`.
-- Candidates are grouped by `day_utc`; each day is executed as a single
-  wrapper call with the union of candidate `timeseries_id`s.
-- This phase is dry-run safe:
-  - under `--dry-run`, commands are logged as planned and never executed
-  - under normal mode, wrapper execution records attempted/ok/failed
-    counters and contributes to run-level `backfills_*` totals.
-- `r2_only` and `r2_manifest_missing` are intentionally excluded from
-  auto-repair triggers.
+- When `--run-backfill` is set, the integrity runner derives observation
+  repair candidates directly from `cross_checks` rows for the current
+  `run_id` where
+  `status IN ('mismatch', 'source_only', 'r2_manifest_missing')`.
+- Candidates are grouped by `(day_utc, connector_id)`; each group runs
+  one targeted `source_to_r2` repair call with explicit
+  `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only`.
+- After each successful observation repair, the runner queues AQI
+  rebuild work into SQLite table `aqi_rebuild_queue`, deduplicated by
+  `(run_id, connector_id, day_utc)`:
+  - `reason = obs_repaired`
+  - `source_mode = live_r2`
+  - `status = queued`
+  - duplicate queue attempts merge `requested_timeseries_ids` + notes.
+- Observation repair status is tracked separately from AQI rebuild
+  status via run/report counters:
+  - `observation_backfills_attempted`
+  - `observation_backfills_ok`
+  - `observation_backfills_failed`
+  - `aqi_rebuilds_queued_from_obs_repair`
+- Dry-run safety:
+  - under `--dry-run`, planned observation repair commands and planned
+    AQI queue entries are reported
+  - remote backfill outputs are not mutated.
+- `r2_only` remains excluded from auto observation repair.
 
-### Phase 6 — Monitoring, limits, and reports polish (PLANNED)
+**Phase 6.7 — AQI-only health check + queueing (DONE):**
+
+- After Phase 6.6 observation repair queueing, integrity now runs an AQI
+  health pass for connector/days in the current run window where source
+  observations exist.
+- Connector/days already queued with `obs_repaired` in the current run
+  are skipped from AQI-only queueing to avoid duplicate rebuild work.
+- AQI health checks are connector/day-oriented and inspect local Dropbox
+  R2 AQI connector manifests under `history/v1/aqilevels/...`:
+  - manifest missing
+  - manifest stale (schema/writer metadata mismatch or invalid manifest)
+  - manifest empty (`source_row_count`/`total_rows` zero while source
+    observations exist for that connector/day)
+  - previous AQI rebuild queue status indicates failed/pending from a
+    prior run
+- AQI-only candidates are queued into `aqi_rebuild_queue` with:
+  - `reason = aqi_health_check` (merged with existing reasons on dedupe)
+  - `source_mode = live_r2`
+  - `status = queued`
+- Queueing is deduplicated by `(run_id, connector_id, day_utc)` with
+  merged reason/note fields.
+- Reports now include Phase 6.7 counters and a deterministic list of
+  queued AQI-only connector/days.
+- AQI-only health issues queue AQI rebuild work for
+  `r2_history_obs_to_aqilevels`; they do not trigger `source_to_r2`.
+
+**Phase 6.8 — Deduplicated AQI rebuild execution (DONE):**
+
+- The runner now executes queued AQI rebuild work once per
+  `(connector_id, day_utc)` from `aqi_rebuild_queue` for the current run.
+- Phase 6.8 execution uses:
+  - `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`
+  - `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`
+  - `UK_AQ_BACKFILL_FORCE_REPLACE=true`
+  - `UK_AQ_BACKFILL_CONNECTOR_IDS=<connector_id>`
+  - `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>`
+  - `UK_AQ_BACKFILL_TO_DAY_UTC=<day>`
+- Queue row lifecycle:
+  - `queued -> running -> complete`
+  - `queued -> running -> failed`
+  - duplicate queue rows for the same connector/day are marked `skipped`.
+- Observation repair status is not changed by AQI rebuild failures; AQI
+  failures remain separate repair debt.
+- Dry-run emits planned AQI rebuild commands and deterministic planned
+  result rows without mutating queue statuses or R2.
+- Reports include:
+  - `aqi_rebuilds_queued_total`
+  - `aqi_rebuilds_attempted`
+  - `aqi_rebuilds_complete`
+  - `aqi_rebuilds_failed`
+  - `aqi_rebuilds_skipped`
+  - per-connector/day result rows with reasons and log paths.
+- Future Phase 6.8 v2 remains open: AQI-only jobs may later use Dropbox
+  backup input when safe; v1 always uses live R2.
+
+### Phase 7 — Monitoring, limits, and reports polish (PLANNED)
 
 Goal: enforce `--max-download-mb` and `--max-runtime-minutes` cleanly,
 record top largest downloads, surface repeated-limit recommendations in
 reports.
 
-### Phase 7 — API-based source adapters (PLANNED)
+### Phase 8 — API-based source adapters (PLANNED)
 
 Goal: UK-AIR-SOS and Breathe London canonicalisation and hashing.
 

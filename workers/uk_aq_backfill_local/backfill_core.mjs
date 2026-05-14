@@ -8,9 +8,15 @@ export const ALLOWED_RUN_MODES = Object.freeze([
   "source_to_r2",
   "r2_history_obs_to_aqilevels",
 ]);
+export const ALLOWED_BACKFILL_OUTPUT_SCOPES = Object.freeze([
+  "default",
+  "observations_only",
+  "aqilevels_only",
+]);
 
 const RUN_MODE_SET = new Set(ALLOWED_RUN_MODES);
 const TRIGGER_MODE_SET = new Set(ALLOWED_TRIGGER_MODES);
+const BACKFILL_OUTPUT_SCOPE_SET = new Set(ALLOWED_BACKFILL_OUTPUT_SCOPES);
 const SOURCE_FETCH_ADAPTERS = new Set([
   "breathelondon",
   "sensorcommunity",
@@ -156,6 +162,14 @@ export function parseTriggerMode(raw, fallback = "manual") {
     return value;
   }
   return TRIGGER_MODE_SET.has(fallback) ? fallback : "manual";
+}
+
+export function parseBackfillOutputScope(raw, fallback = "default") {
+  const value = String(raw || "").trim().toLowerCase();
+  if (BACKFILL_OUTPUT_SCOPE_SET.has(value)) {
+    return value;
+  }
+  return BACKFILL_OUTPUT_SCOPE_SET.has(fallback) ? fallback : "default";
 }
 
 export function parseBooleanish(raw, fallback = false) {

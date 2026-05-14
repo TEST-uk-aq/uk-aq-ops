@@ -41,6 +41,10 @@
 - `scripts/uk_aq_backfill_local.sh`
   - Runs local backfill (`local_to_aqilevels`, `obs_aqi_to_r2`, `source_to_r2`, `r2_history_obs_to_aqilevels`).
   - Always forces `UK_AQ_BACKFILL_TRIGGER_MODE=manual` for local runs.
+  - Supports `UK_AQ_BACKFILL_OUTPUT_SCOPE`:
+    - `default` (existing behavior)
+    - `observations_only` (valid with `source_to_r2` only)
+    - `aqilevels_only` (valid with `r2_history_obs_to_aqilevels` only)
   - Resolves the backfill runner from:
     - `UK_AQ_BACKFILL_RUN_JOB_PATH` (optional override), else
     - `workers/uk_aq_backfill_local/run_job.ts`.
@@ -108,3 +112,19 @@ system doc.
     Backfills are batched per day at the end of the SC scan, identical
     to the OpenAQ flow. `--max-download-mb` / `--max-runtime-minutes`
     span both adapters via a shared `LimitTracker`.
+
+- `scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh`
+  - Integrity-specific wrapper around `UK_AQ_BACKFILL_WRAPPER`.
+  - Requires `--env CIC-Test|LIVE`, `--from-day`, `--to-day`, and exactly one mode:
+    - `--observs-only` with required `--timeseries-ids` (optional `--connector-id`)
+    - `--aqi-only` with required `--connector-id`
+  - Loads `<ROOT>/env/<ENV>.env` and then sources `UK_AQ_BACKFILL_ENV_FILE`.
+  - Enforces strict mode/output scope mapping:
+    - `observs-only` -> `UK_AQ_BACKFILL_RUN_MODE=source_to_r2` + `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only`
+    - `aqi-only` -> `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels` + `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`
+
+## Cache proxy checks
+
+- `scripts/uk_aq_cache_proxy/check_timeseries_v2_skeleton.mjs`
+  - Lightweight normalization checks for `/api/aq/timeseries?v=2` skeleton behavior.
+  - Verifies flag gating, canonical query normalization (`timeseries_id`, `window`, `since`, `start_utc`, `end_utc`, `format`, `v`), and cache-buster stripping behavior.
