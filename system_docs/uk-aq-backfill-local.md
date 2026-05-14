@@ -39,21 +39,12 @@ The runner supports these modes:
 
 Primary (preferred) env vars:
 
-- `UK_AQ_BACKFILL_LOCAL_LOG_DIR` (default `logs/backfill/local`)
+- `UK_AQ_BACKFILL_LOCAL_LOG_DIR` (default `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/<UK_AQ_DROPBOX_ROOT>/uk-aq-backfill-local-logs`, falling back to `.../CIC-Test/...` when `UK_AQ_DROPBOX_ROOT` is unset)
 - `UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR` (default `true`)
 - `UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS` (default `0`)
 - `UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE` (default `0`, disabled)
 - `UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR` (default `0`, disabled)
 - `UK_AQ_BACKFILL_PAUSE_SECONDS` (legacy alias for run interval)
-
-Compatibility aliases still accepted:
-
-- `UK_AQ_BACKFILL_MONTHLY_LOG_DIR`
-- `UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR`
-- `UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS`
-- `UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE`
-- `UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR`
-- `UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS`
 
 ## Metadata source rules
 
@@ -101,14 +92,16 @@ Targeted merge is used when all are true:
 For each `(day_utc, connector_id)`:
 
 1. Fetch source rows for the requested day.
-2. Read existing local Dropbox observations + AQI connector manifests/parquet.
-3. Split data by target timeseries IDs:
+2. If `UK_AQ_BACKFILL_TIMESERIES_IDS` is set, pre-filter OpenAQ location/day
+   source fetches to only locations mapped to those requested timeseries IDs.
+3. Read existing local Dropbox observations + AQI connector manifests/parquet.
+4. Split data by target timeseries IDs:
    - preserve non-target rows from local history
    - replace target rows with newly-built source rows
-4. Rebuild merged observations parquet + manifest.
-5. Rebuild merged AQI parquet + manifest.
-6. Upload merged connector outputs to live R2 (replace connector/day objects).
-7. Rebuild day-level manifests from connector manifests.
+5. Rebuild merged observations parquet + manifest.
+6. Rebuild merged AQI parquet + manifest.
+7. Upload merged connector outputs to live R2 (replace connector/day objects).
+8. Rebuild day-level manifests from connector manifests.
 
 If local Dropbox baseline manifests are missing for targeted merge,
 backfill fails that connector/day to avoid destructive partial rewrite.
@@ -136,7 +129,14 @@ Integrity uses wrapper + env file and sets:
 Recommended supporting vars in the backfill env file:
 
 - `UK_AQ_R2_HISTORY_DROPBOX_ROOT=<absolute local Dropbox backup root>`
+- `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT=<absolute local OpenAQ cache root>`
 - `CFLARE_R2_*` / `R2_*` credentials for live write
+
+For `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT`, backfill can reuse either local
+cache layout:
+
+- `day_utc=YYYY-MM-DD/location-<location_id>-YYYYMMDD.csv.gz`
+- `locationid=<location_id>/year=YYYY/month=MM/location-<location_id>-YYYYMMDD.csv.gz`
 
 ## Outputs
 

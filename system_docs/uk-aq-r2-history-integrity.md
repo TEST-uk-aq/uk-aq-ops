@@ -339,7 +339,7 @@ Python interpreter defaults to `python3`; override with
 --to-day YYYY-MM-DD                     (manual profile or override)
 --dry-run                               No DB writes / no remote calls; logs the snapshot and OpenAQ plan.
 --check-only                            (Phase 5 wires Sensor.Community; OpenAQ already check-only by default)
---run-backfill                          Invoke UK_AQ_BACKFILL_WRAPPER for changed-day batches (union timeseries IDs per day); no-op under --dry-run.
+--run-backfill                          Invoke UK_AQ_BACKFILL_WRAPPER for eligible changed-day and cross-check batches (union timeseries IDs per day); no-op under --dry-run.
 --max-download-mb N                     Soft cap on per-run downloaded MB (cooperative; checked before each request).
 --max-runtime-minutes N                 Soft cap on per-run runtime minutes (cooperative; checked before each request).
 --concurrency N                         Worker count for the per-file thread pool (default 8; UK_AQ_HISTORY_INTEGRITY_CONCURRENCY overrides). 1 = strict sequential.
@@ -347,6 +347,25 @@ Python interpreter defaults to `python3`; override with
 --skip-snapshot-import                  Debug/recovery: skip the Phase 2 import for this run.
 --verbose
 ```
+
+### Flag behavior matrix
+
+Current runtime behavior for OpenAQ integrity runs:
+
+| Flags | Remote HEAD/download checks | Change detection + DB writes | Backfill wrapper execution | Planned backfill commands logged |
+|---|---|---|---|---|
+| none | Yes | Yes | No | No |
+| `--run-backfill` | Yes | Yes | Yes (for changed files and cross-check `mismatch`/`source_only`) | Yes |
+| `--dry-run` | No | No | No | No |
+| `--dry-run --run-backfill` | No | No | No | Yes (cross-check candidates only) |
+| `--check-only` | Same as corresponding row above | Same as corresponding row above | Same as corresponding row above | Same as corresponding row above |
+
+Notes:
+
+- `--dry-run` exits the OpenAQ adapter before per-file checks, so there is no
+  changed-file set to plan/execute backfills from.
+- `--check-only` is currently recorded in run metadata/report output, but it
+  does not change control flow beyond the `--run-backfill` gate.
 
 Example commands:
 
@@ -928,17 +947,25 @@ Backfill is attempted only when all conditions are true:
 
 1. `--run-backfill` is set.
 2. `--dry-run` is **not** set.
-3. At least one source-change event exists (`first_seen`/`reappeared`/`changed`).
+3. At least one source-change event exists (`first_seen`/`reappeared`/`changed`)
+   **or** at least one cross-check discrepancy exists with status
+   `mismatch` or `source_only`.
 
 Execution shape:
 
 - The run first completes source checks/downloads.
-- It then groups source-change events by `day_utc`.
-- It calls the wrapper once per day with the union of affected
+- It then runs two independent batched backfill phases (both day-grouped):
+  - source-change batches from adapter events (`first_seen`/`reappeared`/`changed`)
+  - cross-check discrepancy batches from `cross_checks` statuses
+    `mismatch`/`source_only`
+- Each phase calls the wrapper once per day with the union of affected
   `timeseries_ids` for that day.
 
-So if a run ends with `backfills_attempted=0`, it means no source-change
-events were found in the scanned window (even if `--run-backfill` was set).
+`r2_only` and `r2_manifest_missing` do **not** trigger backfill.
+
+So if a run ends with `backfills_attempted=0`, it means no eligible
+source-change and no eligible cross-check discrepancy was found in the
+scanned window (even if `--run-backfill` was set).
 
 ---
 
@@ -1173,8 +1200,9 @@ Delivered:
 - `LimitTracker` enforces `--max-download-mb` and
   `--max-runtime-minutes` cooperatively: the loop checks before each
   request and exits cleanly, marking the run `status=stopped_limit`.
-- `--run-backfill` prints the planned narrow backfill command per
-  changed file but does not execute it (Phase 4 wires the real call).
+- When `--run-backfill` is set (and `--dry-run` is not), backfill
+  executes in a later batched phase (one call per day using unioned
+  timeseries IDs).
 - Run report includes an OpenAQ section with per-changed-file event IDs,
   timeseries IDs, and (where applicable) the planned commands.
 
@@ -1194,6 +1222,8 @@ Pass 1 (subprocess invocation + per-event recording):
   - `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>` / `UK_AQ_BACKFILL_TO_DAY_UTC=<day>` (same day)
   - `UK_AQ_BACKFILL_TIMESERIES_IDS=<csv>`
   - `UK_AQ_BACKFILL_TRIGGER_MODE=manual`
+  - if `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT` is unset, integrity auto-sets
+    it to `<UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR>/openaq` for that call
 - Per-backfill result recorded on the `source_file_events` row:
   `backfill_triggered`, `backfill_timeseries_ids`,
   `backfill_status ∈ {ok, error, timeout, no_wrapper, no_env_file,
@@ -1362,6 +1392,20 @@ upstream archive contains.
   source_only / r2_only / r2_manifest_missing` counters.
 - New CLI flag `--skip-cross-check` for debug/recovery; pass runs by
   default.
+
+**Pass C — Cross-check triggered backfill (DONE):**
+
+- When `--run-backfill` is set, the integrity runner now derives
+  additional backfill candidates directly from `cross_checks` rows for
+  the current `run_id` where `status IN ('mismatch', 'source_only')`.
+- Candidates are grouped by `day_utc`; each day is executed as a single
+  wrapper call with the union of candidate `timeseries_id`s.
+- This phase is dry-run safe:
+  - under `--dry-run`, commands are logged as planned and never executed
+  - under normal mode, wrapper execution records attempted/ok/failed
+    counters and contributes to run-level `backfills_*` totals.
+- `r2_only` and `r2_manifest_missing` are intentionally excluded from
+  auto-repair triggers.
 
 ### Phase 6 — Monitoring, limits, and reports polish (PLANNED)
 

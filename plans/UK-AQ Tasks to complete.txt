@@ -23,6 +23,8 @@ uk-aq-ops/plans/uk-aq-r2-snapshots-realtime-updates-plan-DRAFT.md
 
 Play timelapse of hex-map over the last week?
 
+Change Live pill to a small status bar to show when refresh is going to happen. 1 min countdown
+
 
 Later
 Implement realtime updates in the same plan
