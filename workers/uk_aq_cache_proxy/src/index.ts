@@ -1,6 +1,19 @@
+import {
+  buildMissingDaySlices,
+  computeCoverageFromRows,
+  computeNextSince,
+  detectGapRanges,
+  mergeAndDedupeRows,
+  mergeSlices,
+  normalizeObservedRow,
+  resolveTimeseriesWindowBounds,
+  subtractCoveredTailInterval,
+} from "./timeseries_v2_stitch.mjs";
+
 export interface Env {
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
+  SB_SECRET_KEY: unknown;
   OBS_AQIDB_SUPABASE_URL: unknown;
   OBS_AQIDB_SECRET_KEY: unknown;
   UK_AQ_AQI_HISTORY_R2_API_URL: unknown;
@@ -22,6 +35,22 @@ export interface Env {
   UK_AQ_TIMESERIES_PROXY_FIRST: unknown;
   UK_AQ_TIMESERIES_R2_FIRST: unknown;
   UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE: unknown;
+  UK_AQ_OBSERVS_HISTORY_R2_API_URL: unknown;
+  UK_AQ_TIMESERIES_R2_MANIFEST_URL: unknown;
+  UK_AQ_TIMESERIES_R2_INDEX_URL: unknown;
+  UK_AQ_TIMESERIES_MAX_WINDOW_DAYS: unknown;
+  UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST: unknown;
+  UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS: unknown;
+  UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES: unknown;
+  UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR: unknown;
+  UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR: unknown;
+  UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS: unknown;
+  UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS: unknown;
+  UK_AQ_TIMESERIES_RECENT_SWR_SECONDS: unknown;
+  UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS: unknown;
+  UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS: unknown;
+  UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS: unknown;
+  UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS: unknown;
 }
 
 
@@ -227,6 +256,12 @@ const TIMESERIES_V2_PRIMARY_QUERY_KEYS = [
   "format",
   "v",
 ] as const;
+const TIMESERIES_V2_DEFAULT_MAX_WINDOW_DAYS = 90;
+const TIMESERIES_V2_MAX_WINDOW_DAYS_LIMIT = 365;
+const TIMESERIES_V2_DEFAULT_MAX_R2_OBJECTS_PER_REQUEST = 120;
+const TIMESERIES_V2_DEFAULT_MAX_SUPABASE_TAIL_HOURS = 168;
+const TIMESERIES_V2_DEFAULT_INCREMENTAL_OVERLAP_MINUTES = 180;
+const TIMESERIES_V2_MAX_INCREMENTAL_OVERLAP_MINUTES = 720;
 
 type TimeseriesV2Flags = {
   enabled: boolean;
@@ -242,14 +277,53 @@ type TimeseriesV2CanonicalizeResult = {
 
 type TimeseriesV2EnvelopeMeta = {
   source_mode: string;
+  r2_coverage_start?: string | null;
   r2_coverage_end: string | null;
   ingest_tail_start: string | null;
+  ingest_tail_end?: string | null;
   has_gap: boolean | null;
+  gap_ranges?: Array<{ start_utc: string; end_utc: string }>;
   row_count: number | null;
   r2_row_count: number | null;
   ingest_row_count: number | null;
   deduped_row_count: number | null;
+  next_since?: string | null;
+  r2_errors?: string[];
+  ingest_errors?: string[];
   cache_status: "MISS" | "HIT" | "BYPASS";
+};
+
+type TimeseriesV2RuntimeConfig = {
+  maxWindowDays: number;
+  maxR2ObjectsPerRequest: number;
+  maxSupabaseTailHours: number;
+  incrementalOverlapMinutes: number;
+  partialOnR2Error: boolean;
+  partialOnIngestError: boolean;
+  recentEdgeTtlSeconds: number;
+  recentBrowserTtlSeconds: number;
+  recentSwrSeconds: number;
+  historicalEdgeTtlSeconds: number;
+  historicalBrowserTtlSeconds: number;
+  historicalSwrSeconds: number;
+  staleIfErrorSeconds: number;
+  r2ManifestUrl: string;
+  r2IndexUrl: string;
+};
+
+type TimeseriesV2RequestWindow = {
+  timeseriesId: number;
+  requestStartMs: number;
+  requestEndMs: number;
+  requestSinceIso: string | null;
+  normalizedWindowLabel: string | null;
+};
+
+type TimeseriesV2StitchResult = {
+  envelope: Record<string, unknown>;
+  meta: TimeseriesV2EnvelopeMeta;
+  sourceMode: string;
+  cacheControl: string;
 };
 
 const textEncoder = new TextEncoder();
@@ -407,7 +481,10 @@ function addCorsHeaders(headers: Headers, requestOrigin: string | null, allowedO
     "Content-Type,If-None-Match,If-Modified-Since,X-UK-AQ-Bypass-Token,X-UK-AQ-Session-Init,CF-Turnstile-Token",
   );
   headers.set("Access-Control-Max-Age", "86400");
-  headers.set("Access-Control-Expose-Headers", "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile");
+  headers.set(
+    "Access-Control-Expose-Headers",
+    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version",
+  );
   appendVary(headers, "Origin");
 }
 
@@ -943,49 +1020,309 @@ function canonicalizeTimeseriesV2RequestUrl(url: URL, allowCacheBypassParams: bo
   return { url: normalized, strippedCacheBusters };
 }
 
-async function buildTimeseriesV2EnvelopeResponse(
-  upstreamResponse: Response,
-  requestUrl: URL,
-  cacheStatus: "MISS" | "HIT" | "BYPASS",
-): Promise<{ bodyText: string; meta: TimeseriesV2EnvelopeMeta } | null> {
-  if (upstreamResponse.status !== 200) {
-    return null;
+function parseTimeseriesRowsFromPayload(payload: unknown, sourceLabel: "r2" | "ingest"): Array<Record<string, unknown>> {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+  const payloadRecord = payload as Record<string, unknown>;
+  const rows: Array<Record<string, unknown>> = [];
+  if (Array.isArray(payloadRecord.data)) {
+    for (const item of payloadRecord.data) {
+      const normalized = normalizeObservedRow(item, sourceLabel) as Record<string, unknown> | null;
+      if (normalized) {
+        rows.push(normalized);
+      }
+    }
+    return rows;
+  }
+  if (Array.isArray(payloadRecord.rows)) {
+    for (const item of payloadRecord.rows) {
+      const normalized = normalizeObservedRow(item, sourceLabel) as Record<string, unknown> | null;
+      if (normalized) {
+        rows.push(normalized);
+      }
+    }
+  }
+  return rows;
+}
+
+function buildTimeseriesV2RuntimeConfig(env: Env): TimeseriesV2RuntimeConfig {
+  const maxWindowDays = parseIntInRange(
+    String(env.UK_AQ_TIMESERIES_MAX_WINDOW_DAYS ?? ""),
+    TIMESERIES_V2_DEFAULT_MAX_WINDOW_DAYS,
+    1,
+    TIMESERIES_V2_MAX_WINDOW_DAYS_LIMIT,
+  );
+  return {
+    maxWindowDays,
+    maxR2ObjectsPerRequest: parseIntInRange(
+      String(env.UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST ?? ""),
+      TIMESERIES_V2_DEFAULT_MAX_R2_OBJECTS_PER_REQUEST,
+      1,
+      2000,
+    ),
+    maxSupabaseTailHours: parseIntInRange(
+      String(env.UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS ?? ""),
+      TIMESERIES_V2_DEFAULT_MAX_SUPABASE_TAIL_HOURS,
+      1,
+      maxWindowDays * 24,
+    ),
+    incrementalOverlapMinutes: parseIntInRange(
+      String(env.UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES ?? ""),
+      TIMESERIES_V2_DEFAULT_INCREMENTAL_OVERLAP_MINUTES,
+      0,
+      TIMESERIES_V2_MAX_INCREMENTAL_OVERLAP_MINUTES,
+    ),
+    partialOnR2Error: parseBooleanFlag(String(env.UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR ?? "true")),
+    partialOnIngestError: parseBooleanFlag(String(env.UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR ?? "false")),
+    recentEdgeTtlSeconds: parseIntInRange(String(env.UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS ?? ""), 60, 0, 604800),
+    recentBrowserTtlSeconds: parseIntInRange(String(env.UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS ?? ""), 60, 0, 604800),
+    recentSwrSeconds: parseIntInRange(String(env.UK_AQ_TIMESERIES_RECENT_SWR_SECONDS ?? ""), 60, 0, 604800),
+    historicalEdgeTtlSeconds: parseIntInRange(
+      String(env.UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS ?? ""),
+      86400,
+      0,
+      604800,
+    ),
+    historicalBrowserTtlSeconds: parseIntInRange(
+      String(env.UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS ?? ""),
+      86400,
+      0,
+      604800,
+    ),
+    historicalSwrSeconds: parseIntInRange(String(env.UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS ?? ""), 86400, 0, 604800),
+    staleIfErrorSeconds: parseIntInRange(String(env.UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS ?? ""), 300, 0, 604800),
+    r2ManifestUrl: String(env.UK_AQ_TIMESERIES_R2_MANIFEST_URL ?? "").trim(),
+    r2IndexUrl: String(env.UK_AQ_TIMESERIES_R2_INDEX_URL ?? "").trim(),
+  };
+}
+
+function buildTimeseriesV2RequestWindow(requestUrl: URL, runtime: TimeseriesV2RuntimeConfig): TimeseriesV2RequestWindow {
+  const timeseriesIdText = parsePositiveIntegerStringOrNull(requestUrl.searchParams.get("timeseries_id"));
+  if (!timeseriesIdText) {
+    throw new RequestValidationError(400, "timeseries_id_required");
+  }
+  const rawWindow = String(requestUrl.searchParams.get("window") ?? "").trim().toLowerCase();
+  const startUtc = getFirstSearchParam(requestUrl, ["start_utc", "start"]);
+  const endUtc = getFirstSearchParam(requestUrl, ["end_utc", "end"]);
+  const since = normalizeIsoOrNull(requestUrl.searchParams.get("since"))
+    ?? (String(requestUrl.searchParams.get("since") ?? "").trim() || null);
+
+  const bounds = resolveTimeseriesWindowBounds({
+    nowMs: Date.now(),
+    windowLabel: rawWindow,
+    startUtc,
+    endUtc,
+    maxWindowDays: runtime.maxWindowDays,
+  }) as { startMs: number; endMs: number; normalizedWindowLabel: string | null };
+
+  if (!Number.isFinite(bounds.startMs) || !Number.isFinite(bounds.endMs) || bounds.endMs <= bounds.startMs) {
+    throw new RequestValidationError(400, "invalid_window");
   }
 
-  const contentType = String(upstreamResponse.headers.get("Content-Type") ?? "").toLowerCase();
-  if (!contentType.includes("application/json")) {
+  return {
+    timeseriesId: Number(timeseriesIdText),
+    requestStartMs: bounds.startMs,
+    requestEndMs: bounds.endMs,
+    requestSinceIso: since,
+    normalizedWindowLabel: bounds.normalizedWindowLabel,
+  };
+}
+
+async function loadTimeseriesConnectorId(
+  supabaseUrl: string,
+  sbSecretKey: string,
+  timeseriesId: number,
+): Promise<number | null> {
+  if (!supabaseUrl || !sbSecretKey) {
     return null;
   }
-
-  let payload: unknown;
+  const endpoint = new URL(`${normalizeBaseUrl(supabaseUrl)}/rest/v1/timeseries`);
+  endpoint.searchParams.set("select", "connector_id");
+  endpoint.searchParams.set("id", `eq.${timeseriesId}`);
+  endpoint.searchParams.set("limit", "1");
+  let response: Response;
   try {
-    payload = await upstreamResponse.clone().json();
+    response = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "Accept-Profile": "uk_aq_core",
+        "apikey": sbSecretKey,
+        "Authorization": `Bearer ${sbSecretKey}`,
+      },
+    });
   } catch (_err) {
     return null;
   }
-
-  if (!payload || typeof payload !== "object") {
+  if (!response.ok) {
     return null;
   }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (_err) {
+    return null;
+  }
+  const row = Array.isArray(payload) && payload.length > 0 ? payload[0] : null;
+  const connectorId = Number((row as Record<string, unknown> | null)?.connector_id);
+  if (!Number.isFinite(connectorId) || connectorId <= 0) {
+    return null;
+  }
+  return Math.trunc(connectorId);
+}
 
-  const payloadRecord = payload as Record<string, unknown>;
+async function fetchTimeseriesOriginPayload(
+  supabaseUrl: string,
+  supabasePublishableKey: string,
+  upstreamAuthSecret: string,
+  params: {
+    timeseriesId: number;
+    startUtc: string;
+    endUtc: string;
+    sinceUtc: string | null;
+  },
+): Promise<Record<string, unknown>> {
+  const endpoint = new URL(`${normalizeBaseUrl(supabaseUrl)}/functions/v1/${TIMESERIES_UPSTREAM_FUNCTION}`);
+  endpoint.searchParams.set("timeseries_id", String(params.timeseriesId));
+  endpoint.searchParams.set("start_utc", params.startUtc);
+  endpoint.searchParams.set("end_utc", params.endUtc);
+  endpoint.searchParams.set("format", "objects");
+  if (params.sinceUtc) {
+    endpoint.searchParams.set("since", params.sinceUtc);
+  }
+  const response = await fetch(endpoint.toString(), {
+    method: "GET",
+    headers: {
+      "Accept": "application/json",
+      "apikey": supabasePublishableKey,
+      "Authorization": `Bearer ${supabasePublishableKey}`,
+      [UPSTREAM_AUTH_HEADER]: upstreamAuthSecret,
+    },
+  });
+  const text = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch (_err) {
+    payload = null;
+  }
+  if (!response.ok || !payload || typeof payload !== "object") {
+    throw new Error(`timeseries_origin_failed_${response.status}`);
+  }
+  return payload as Record<string, unknown>;
+}
+
+async function fetchR2ObservationsPayload(
+  r2ApiUrl: string,
+  upstreamAuthSecret: string,
+  params: {
+    timeseriesId: number;
+    connectorId: number;
+    startUtc: string;
+    endUtc: string;
+    sinceUtc: string | null;
+    limitRows: number;
+  },
+): Promise<Record<string, unknown>> {
+  const endpoint = new URL(r2ApiUrl);
+  if (!endpoint.pathname || endpoint.pathname === "/") {
+    endpoint.pathname = "/v1/observations";
+  }
+  endpoint.searchParams.set("timeseries_id", String(params.timeseriesId));
+  endpoint.searchParams.set("connector_id", String(params.connectorId));
+  endpoint.searchParams.set("start_utc", params.startUtc);
+  endpoint.searchParams.set("end_utc", params.endUtc);
+  if (params.sinceUtc) {
+    endpoint.searchParams.set("since_utc", params.sinceUtc);
+  }
+  endpoint.searchParams.set("limit", String(Math.max(1, params.limitRows)));
+  const response = await fetch(endpoint.toString(), {
+    method: "GET",
+    headers: {
+      "Accept": "application/json",
+      [UPSTREAM_AUTH_HEADER]: upstreamAuthSecret,
+    },
+  });
+  const text = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch (_err) {
+    payload = null;
+  }
+  if (!response.ok || !payload || typeof payload !== "object") {
+    throw new Error(`r2_history_failed_${response.status}`);
+  }
+  return payload as Record<string, unknown>;
+}
+
+function toIsoSafe(valueMs: number): string {
+  return new Date(valueMs).toISOString();
+}
+
+function applySinceOverlap(sinceIso: string | null, overlapMinutes: number, lowerBoundMs: number): string | null {
+  const sinceMs = parseIsoMsOrNull(sinceIso);
+  if (!Number.isFinite(sinceMs)) {
+    return null;
+  }
+  const overlapMs = Math.max(0, overlapMinutes) * 60 * 1000;
+  const adjusted = Math.max(lowerBoundMs, sinceMs - overlapMs);
+  return new Date(adjusted).toISOString();
+}
+
+function buildTimeseriesV2CacheControl(sourceMode: string, runtime: TimeseriesV2RuntimeConfig): string {
+  const isHistorical = sourceMode === "r2_only";
+  const browserTtl = isHistorical ? runtime.historicalBrowserTtlSeconds : runtime.recentBrowserTtlSeconds;
+  const edgeTtl = isHistorical ? runtime.historicalEdgeTtlSeconds : runtime.recentEdgeTtlSeconds;
+  const swr = isHistorical ? runtime.historicalSwrSeconds : runtime.recentSwrSeconds;
+  return [
+    "public",
+    `max-age=${browserTtl}`,
+    `s-maxage=${edgeTtl}`,
+    `stale-while-revalidate=${swr}`,
+    `stale-if-error=${runtime.staleIfErrorSeconds}`,
+  ].join(", ");
+}
+
+async function buildTimeseriesV2Etag(bodyText: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(bodyText));
+  const bytes = new Uint8Array(digest);
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+  const encoded = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return `"ts-v2-${encoded}"`;
+}
+
+function buildTimeseriesV2FallbackEnvelope(
+  requestUrl: URL,
+  payloadRecord: Record<string, unknown>,
+  cacheStatus: "MISS" | "HIT" | "BYPASS",
+  sourceMode = "origin_only_v2_wrapper",
+  r2Errors: string[] = [],
+  ingestErrors: string[] = [],
+): TimeseriesV2StitchResult {
   const data = Array.isArray(payloadRecord.data) ? payloadRecord.data : [];
   const requestStartUtc = String(requestUrl.searchParams.get("start_utc") ?? "").trim() || null;
   const requestEndUtc = String(requestUrl.searchParams.get("end_utc") ?? "").trim() || null;
   const requestWindow = String(requestUrl.searchParams.get("window") ?? "").trim() || null;
   const requestSince = String(requestUrl.searchParams.get("since") ?? "").trim() || null;
   const meta: TimeseriesV2EnvelopeMeta = {
-    source_mode: "origin_only_v2_wrapper",
+    source_mode: sourceMode,
+    r2_coverage_start: null,
     r2_coverage_end: null,
     ingest_tail_start: null,
+    ingest_tail_end: null,
     has_gap: null,
+    gap_ranges: [],
     row_count: data.length,
     r2_row_count: null,
     ingest_row_count: data.length,
     deduped_row_count: 0,
+    next_since: payloadRecord.next_since ? String(payloadRecord.next_since) : null,
     cache_status: cacheStatus,
+    r2_errors: r2Errors,
+    ingest_errors: ingestErrors,
   };
-
   const envelope = {
     schema_version: 2,
     timeseries_id: Number(requestUrl.searchParams.get("timeseries_id") ?? 0) || null,
@@ -997,13 +1334,241 @@ async function buildTimeseriesV2EnvelopeResponse(
     },
     data,
     meta,
-    // Preserve compatibility with existing frontend parsing during migration.
     data_format: payloadRecord.data_format ?? "objects",
     columns: Array.isArray(payloadRecord.columns) ? payloadRecord.columns : ["observed_at", "value"],
     next_since: payloadRecord.next_since ?? null,
     guideline: payloadRecord.guideline ?? null,
   };
-  return { bodyText: JSON.stringify(envelope), meta };
+  return {
+    envelope,
+    meta,
+    sourceMode: sourceMode,
+    cacheControl: [
+      "public",
+      "max-age=60",
+      "s-maxage=60",
+      "stale-while-revalidate=60",
+      "stale-if-error=300",
+    ].join(", "),
+  };
+}
+
+async function stitchTimeseriesV2FromR2AndIngest(
+  requestUrl: URL,
+  cacheStatus: "MISS" | "HIT" | "BYPASS",
+  env: Env,
+  flags: TimeseriesV2Flags,
+  deps: {
+    supabaseUrl: string;
+    supabasePublishableKey: string;
+    upstreamAuthSecret: string;
+    r2HistoryApiUrl: string;
+    sbSecretKey: string;
+  },
+): Promise<TimeseriesV2StitchResult> {
+  const runtime = buildTimeseriesV2RuntimeConfig(env);
+  const requestWindow = buildTimeseriesV2RequestWindow(requestUrl, runtime);
+  const requestStartUtc = toIsoSafe(requestWindow.requestStartMs);
+  const requestEndUtc = toIsoSafe(requestWindow.requestEndMs);
+  const overlapSince = applySinceOverlap(
+    requestWindow.requestSinceIso,
+    runtime.incrementalOverlapMinutes,
+    requestWindow.requestStartMs,
+  );
+  const r2Errors: string[] = [];
+  const ingestErrors: string[] = [];
+
+  const originPayload = await fetchTimeseriesOriginPayload(
+    deps.supabaseUrl,
+    deps.supabasePublishableKey,
+    deps.upstreamAuthSecret,
+    {
+      timeseriesId: requestWindow.timeseriesId,
+      startUtc: requestStartUtc,
+      endUtc: requestEndUtc,
+      sinceUtc: requestWindow.requestSinceIso,
+    },
+  );
+
+  if (!flags.r2First) {
+    return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
+  }
+
+  if (!deps.r2HistoryApiUrl) {
+    return buildTimeseriesV2FallbackEnvelope(
+      requestUrl,
+      originPayload,
+      cacheStatus,
+      "origin_only_v2_wrapper_r2_unconfigured",
+      ["r2_history_api_url_missing"],
+      [],
+    );
+  }
+
+  const connectorId = await loadTimeseriesConnectorId(
+    deps.supabaseUrl,
+    deps.sbSecretKey,
+    requestWindow.timeseriesId,
+  );
+  if (connectorId === null || !deps.r2HistoryApiUrl) {
+    return buildTimeseriesV2FallbackEnvelope(
+      requestUrl,
+      originPayload,
+      cacheStatus,
+      "origin_only_v2_wrapper_connector_unresolved",
+      ["connector_lookup_unavailable"],
+      [],
+    );
+  }
+
+  let r2Payload: Record<string, unknown> | null = null;
+  let r2Rows: Array<Record<string, unknown>> = [];
+  try {
+    r2Payload = await fetchR2ObservationsPayload(
+      deps.r2HistoryApiUrl,
+      deps.upstreamAuthSecret,
+      {
+        timeseriesId: requestWindow.timeseriesId,
+        connectorId,
+          startUtc: requestStartUtc,
+          endUtc: requestEndUtc,
+          sinceUtc: overlapSince,
+          limitRows: runtime.maxR2ObjectsPerRequest,
+        },
+      );
+    r2Rows = parseTimeseriesRowsFromPayload(r2Payload, "r2");
+  } catch (error) {
+    r2Errors.push(error instanceof Error ? error.message : String(error));
+    if (!runtime.partialOnR2Error) {
+      throw error;
+    }
+  }
+
+  const coverage = computeCoverageFromRows(r2Rows) as { coverageStart: string | null; coverageEnd: string | null };
+  const tail = subtractCoveredTailInterval(
+    requestWindow.requestStartMs,
+    requestWindow.requestEndMs,
+    coverage.coverageEnd,
+  ) as { tailStartMs: number; tailEndMs: number };
+  const maxTailSpanMs = runtime.maxSupabaseTailHours * HOUR_MS;
+
+  const missingKeys = [
+    ...(
+      ((r2Payload?.coverage as Record<string, unknown> | undefined)?.missing_day_manifest_keys as unknown[]) || []
+    ),
+    ...(
+      ((r2Payload?.coverage as Record<string, unknown> | undefined)?.missing_connector_manifest_keys as unknown[]) || []
+    ),
+    ...(
+      ((r2Payload?.coverage as Record<string, unknown> | undefined)?.missing_parquet_keys as unknown[]) || []
+    ),
+  ].map((item) => String(item ?? "")).filter(Boolean);
+
+  const missingSlices = buildMissingDaySlices(
+    missingKeys,
+    requestWindow.requestStartMs,
+    requestWindow.requestEndMs,
+  ) as Array<{ startMs: number; endMs: number; reason: string }>;
+  const ingestSlices = mergeSlices([
+    ...(tail.tailEndMs > tail.tailStartMs ? [{ startMs: tail.tailStartMs, endMs: tail.tailEndMs, reason: "tail_after_r2" }] : []),
+    ...missingSlices,
+  ]) as Array<{ startMs: number; endMs: number; reason: string }>;
+
+  const ingestRows: Array<Record<string, unknown>> = [];
+  for (const slice of ingestSlices) {
+    if ((slice.endMs - slice.startMs) > maxTailSpanMs) {
+      continue;
+    }
+    try {
+      const payload = await fetchTimeseriesOriginPayload(
+        deps.supabaseUrl,
+        deps.supabasePublishableKey,
+        deps.upstreamAuthSecret,
+        {
+          timeseriesId: requestWindow.timeseriesId,
+          startUtc: toIsoSafe(slice.startMs),
+          endUtc: toIsoSafe(slice.endMs),
+          sinceUtc: overlapSince,
+        },
+      );
+      ingestRows.push(...parseTimeseriesRowsFromPayload(payload, "ingest"));
+    } catch (error) {
+      ingestErrors.push(`${slice.reason}:${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (ingestErrors.length > 0 && !runtime.partialOnIngestError) {
+    if (r2Rows.length === 0 || (tail.tailEndMs > tail.tailStartMs)) {
+      throw new Error("ingest_tail_fetch_failed");
+    }
+  }
+
+  const merged = mergeAndDedupeRows(
+    r2Rows,
+    ingestRows,
+    flags.allowIngestOverwrite,
+  ) as { merged: Array<Record<string, unknown>>; deduped: number };
+  const gapInfo = detectGapRanges(
+    merged.merged,
+    requestWindow.requestStartMs,
+    requestWindow.requestEndMs,
+    requestWindow.normalizedWindowLabel ?? "24h",
+  ) as { hasGap: boolean; gapRanges: Array<{ start_utc: string; end_utc: string }> };
+  const nextSince = computeNextSince(merged.merged, requestWindow.requestSinceIso);
+
+  let sourceMode = "r2_plus_ingest_tail";
+  if (r2Rows.length > 0 && ingestRows.length === 0) {
+    sourceMode = "r2_only";
+  } else if (r2Rows.length === 0 && ingestRows.length > 0) {
+    sourceMode = "ingest_only_fallback";
+  } else if (ingestSlices.some((slice) => slice.reason !== "tail_after_r2")) {
+    sourceMode = "r2_plus_ingest_tail_and_repairs";
+  }
+  if (r2Errors.length > 0 && ingestRows.length > 0) {
+    sourceMode = "ingest_only_on_r2_error";
+  }
+
+  const meta: TimeseriesV2EnvelopeMeta = {
+    source_mode: sourceMode,
+    r2_coverage_start: coverage.coverageStart,
+    r2_coverage_end: coverage.coverageEnd,
+    ingest_tail_start: tail.tailEndMs > tail.tailStartMs ? toIsoSafe(tail.tailStartMs) : null,
+    ingest_tail_end: tail.tailEndMs > tail.tailStartMs ? toIsoSafe(tail.tailEndMs) : null,
+    has_gap: gapInfo.hasGap,
+    gap_ranges: gapInfo.gapRanges,
+    row_count: merged.merged.length,
+    r2_row_count: r2Rows.length,
+    ingest_row_count: ingestRows.length,
+    deduped_row_count: merged.deduped,
+    next_since: nextSince,
+    cache_status: cacheStatus,
+    r2_errors: r2Errors,
+    ingest_errors: ingestErrors,
+  };
+
+  const envelope = {
+    schema_version: 2,
+    timeseries_id: requestWindow.timeseriesId,
+    request: {
+      window: requestWindow.normalizedWindowLabel,
+      start_utc: requestStartUtc,
+      end_utc: requestEndUtc,
+      since: requestWindow.requestSinceIso,
+    },
+    data: merged.merged,
+    meta,
+    data_format: "objects",
+    columns: ["observed_at", "value", "source"],
+    next_since: nextSince,
+    guideline: originPayload.guideline ?? null,
+  };
+
+  return {
+    envelope,
+    meta,
+    sourceMode,
+    cacheControl: buildTimeseriesV2CacheControl(sourceMode, runtime),
+  };
 }
 
 function canonicalizeAqiHistoryRequestUrl(url: URL, upstreamFunction: string): URL {
@@ -1646,7 +2211,9 @@ export default {
 
     const supabaseUrl = await readSecret(env.SUPABASE_URL);
     const supabasePublishableKey = await readSecret(env.SB_PUBLISHABLE_DEFAULT_KEY);
+    const sbSecretKey = await readSecret(env.SB_SECRET_KEY);
     const aqiHistoryUpstreamUrl = await readSecret(env.UK_AQ_AQI_HISTORY_R2_API_URL);
+    const observsHistoryR2ApiUrl = await readSecret(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL);
     const latestSnapshotUpstreamUrl = await readSecret(env.UK_AQ_LATEST_SNAPSHOT_R2_API_URL);
     const postcodeLookupUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_LOOKUP_R2_API_URL);
     const postcodeSuggestUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_SUGGEST_R2_API_URL);
@@ -1731,6 +2298,76 @@ export default {
           headers: hitHeaders,
         });
       }
+    }
+
+    if (useTimeseriesV2Skeleton) {
+      const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
+      let stitched: TimeseriesV2StitchResult;
+      try {
+        stitched = await stitchTimeseriesV2FromR2AndIngest(
+          normalizedRequestUrl,
+          cacheStatusLabel,
+          env,
+          timeseriesV2Flags,
+          {
+            supabaseUrl,
+            supabasePublishableKey,
+            upstreamAuthSecret,
+            r2HistoryApiUrl: observsHistoryR2ApiUrl,
+            sbSecretKey,
+          },
+        );
+      } catch (error) {
+        if (error instanceof RequestValidationError) {
+          return makeErrorResponse(error.status, error.code, requestOrigin, allowedOrigins);
+        }
+        return makeErrorResponse(502, "timeseries_v2_stitch_failed", requestOrigin, allowedOrigins);
+      }
+
+      const bodyText = JSON.stringify(stitched.envelope);
+      const etag = await buildTimeseriesV2Etag(bodyText);
+      const responseHeaders = new Headers();
+      responseHeaders.set("Content-Type", "application/json; charset=utf-8");
+      responseHeaders.set("Cache-Control", stitched.cacheControl);
+      responseHeaders.set("ETag", etag);
+      responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
+      responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
+      responseHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
+      responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", stitched.meta.source_mode);
+      responseHeaders.set("X-UK-AQ-Has-Gap", String(stitched.meta.has_gap));
+      if (stitched.meta.r2_coverage_end) {
+        responseHeaders.set("X-UK-AQ-R2-Coverage-End", stitched.meta.r2_coverage_end);
+      }
+      if (stitched.meta.ingest_tail_start) {
+        responseHeaders.set("X-UK-AQ-Ingest-Tail-Start", stitched.meta.ingest_tail_start);
+      }
+      if (stitched.meta.r2_row_count !== null) {
+        responseHeaders.set("X-UK-AQ-R2-Rows", String(stitched.meta.r2_row_count));
+      }
+      if (stitched.meta.ingest_row_count !== null) {
+        responseHeaders.set("X-UK-AQ-Ingest-Rows", String(stitched.meta.ingest_row_count));
+      }
+      if (timeseriesV2Canonicalized && timeseriesV2Canonicalized.strippedCacheBusters.length) {
+        responseHeaders.set(
+          "X-UK-AQ-Timeseries-Stripped-Params",
+          timeseriesV2Canonicalized.strippedCacheBusters.join(","),
+        );
+      }
+      addCorsHeaders(responseHeaders, requestOrigin, allowedOrigins);
+
+      if (matchesIfNoneMatch(request.headers.get("If-None-Match"), etag)) {
+        const notModifiedHeaders = new Headers(responseHeaders);
+        return new Response(null, { status: 304, headers: notModifiedHeaders });
+      }
+
+      const stitchedResponse = new Response(bodyText, {
+        status: 200,
+        headers: responseHeaders,
+      });
+      if (shouldUseCache && request.method === "GET") {
+        ctx.waitUntil(cache.put(cacheKey, stitchedResponse.clone()));
+      }
+      return stitchedResponse;
     }
 
     let upstreamUrl: URL;
@@ -1836,30 +2473,7 @@ export default {
     if (upstreamResponse.status === 200) {
       responseHeaders.set("Cache-Control", buildCacheControl(profile));
     }
-    let responseBody: BodyInit | null = upstreamResponse.body;
-    if (useTimeseriesV2Skeleton) {
-      responseHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
-      if (timeseriesV2Canonicalized && timeseriesV2Canonicalized.strippedCacheBusters.length) {
-        responseHeaders.set(
-          "X-UK-AQ-Timeseries-Stripped-Params",
-          timeseriesV2Canonicalized.strippedCacheBusters.join(","),
-        );
-      }
-      const wrapped = await buildTimeseriesV2EnvelopeResponse(
-        upstreamResponse,
-        normalizedRequestUrl,
-        cacheStatusLabel,
-      );
-      if (wrapped) {
-        responseBody = wrapped.bodyText;
-        responseHeaders.set("Content-Type", "application/json; charset=utf-8");
-        responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", wrapped.meta.source_mode);
-        responseHeaders.set("X-UK-AQ-Has-Gap", String(wrapped.meta.has_gap));
-      } else {
-        responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", "origin_only_v2_wrapper");
-        responseHeaders.set("X-UK-AQ-Has-Gap", "null");
-      }
-    }
+    const responseBody: BodyInit | null = upstreamResponse.body;
     addCorsHeaders(responseHeaders, requestOrigin, allowedOrigins);
 
     const response = new Response(responseBody, {
