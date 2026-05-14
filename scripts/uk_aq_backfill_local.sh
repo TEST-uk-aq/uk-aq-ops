@@ -25,7 +25,7 @@ Optional env vars:
   UK_AQ_BACKFILL_CONNECTOR_IDS              optional CSV filter (unset for all available adapters)
   UK_AQ_BACKFILL_TIMESERIES_IDS             optional CSV timeseries filter
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
-  UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: logs/backfill/local
+  UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_DROPBOX_ROOT/uk-aq-backfill-local-logs
   UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true
   UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS       default: 0
   UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE        default: 0 (disabled)
@@ -47,6 +47,21 @@ trim() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "${value}"
+}
+
+build_default_log_dir() {
+  local env_root
+  env_root="$(trim "${UK_AQ_DROPBOX_ROOT:-}")"
+  while [[ "${env_root}" == /* ]]; do
+    env_root="${env_root#/}"
+  done
+  while [[ "${env_root}" == */ ]]; do
+    env_root="${env_root%/}"
+  done
+  if [[ -z "${env_root}" ]]; then
+    env_root="CIC-Test"
+  fi
+  printf '/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/%s/uk-aq-backfill-local-logs' "${env_root}"
 }
 
 build_log_connector_segment() {
@@ -242,11 +257,12 @@ REQUESTED_TO_DAY_UTC="${TO_DAY_UTC}"
 REQUESTED_TRIGGER_MODE="$(trim "${UK_AQ_BACKFILL_TRIGGER_MODE:-manual}")"
 
 ENABLE_R2_FALLBACK_RAW="$(trim "${UK_AQ_BACKFILL_ENABLE_R2_FALLBACK:-false}")"
-LOG_DIR="$(trim "${UK_AQ_BACKFILL_LOCAL_LOG_DIR:-${UK_AQ_BACKFILL_MONTHLY_LOG_DIR:-logs/backfill/local}}")"
-STOP_ON_ERROR_RAW="$(trim "${UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR:-${UK_AQ_BACKFILL_MONTHLY_STOP_ON_ERROR:-true}}")"
-MONTH_RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_MONTH_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_PAUSE_SECONDS:-${UK_AQ_BACKFILL_MONTHLY_PAUSE_SECONDS:-0}}}}")"
-MONTH_MAX_RUNS_PER_MINUTE_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE:-${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE:-0}}")"
-MONTH_MAX_RUNS_PER_HOUR_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR:-${UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR:-0}}")"
+DEFAULT_LOG_DIR="$(build_default_log_dir)"
+LOG_DIR="$(trim "${UK_AQ_BACKFILL_LOCAL_LOG_DIR:-${DEFAULT_LOG_DIR}}")"
+STOP_ON_ERROR_RAW="$(trim "${UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR:-true}")"
+RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS:-${UK_AQ_BACKFILL_PAUSE_SECONDS:-0}}")"
+MAX_RUNS_PER_MINUTE_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE:-0}")"
+MAX_RUNS_PER_HOUR_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR:-0}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
@@ -276,23 +292,23 @@ if ! STOP_ON_ERROR="$(parse_bool "${STOP_ON_ERROR_RAW}")"; then
   exit 2
 fi
 
-if ! [[ "${MONTH_RUN_INTERVAL_SECONDS_RAW}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS: ${MONTH_RUN_INTERVAL_SECONDS_RAW}" >&2
+if ! [[ "${RUN_INTERVAL_SECONDS_RAW}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS: ${RUN_INTERVAL_SECONDS_RAW}" >&2
   exit 2
 fi
-MONTH_RUN_INTERVAL_SECONDS="${MONTH_RUN_INTERVAL_SECONDS_RAW}"
+RUN_INTERVAL_SECONDS="${RUN_INTERVAL_SECONDS_RAW}"
 
-if ! [[ "${MONTH_MAX_RUNS_PER_MINUTE_RAW}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_MINUTE: ${MONTH_MAX_RUNS_PER_MINUTE_RAW}" >&2
+if ! [[ "${MAX_RUNS_PER_MINUTE_RAW}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE: ${MAX_RUNS_PER_MINUTE_RAW}" >&2
   exit 2
 fi
-MONTH_MAX_RUNS_PER_MINUTE="${MONTH_MAX_RUNS_PER_MINUTE_RAW}"
+MAX_RUNS_PER_MINUTE="${MAX_RUNS_PER_MINUTE_RAW}"
 
-if ! [[ "${MONTH_MAX_RUNS_PER_HOUR_RAW}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid UK_AQ_BACKFILL_MONTH_MAX_RUNS_PER_HOUR: ${MONTH_MAX_RUNS_PER_HOUR_RAW}" >&2
+if ! [[ "${MAX_RUNS_PER_HOUR_RAW}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR: ${MAX_RUNS_PER_HOUR_RAW}" >&2
   exit 2
 fi
-MONTH_MAX_RUNS_PER_HOUR="${MONTH_MAX_RUNS_PER_HOUR_RAW}"
+MAX_RUNS_PER_HOUR="${MAX_RUNS_PER_HOUR_RAW}"
 
 if ! validate_day_utc "${FROM_DAY_UTC}"; then
   echo "Invalid UK_AQ_BACKFILL_FROM_DAY_UTC: ${FROM_DAY_UTC}" >&2
@@ -378,8 +394,8 @@ while IFS=' ' read -r month_from month_to; do
   export UK_AQ_BACKFILL_FROM_DAY_UTC="${month_from}"
   export UK_AQ_BACKFILL_TO_DAY_UTC="${month_to}"
 
-  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_MINUTE}" 60 "local-backfill per-minute"
-  enforce_run_rate_limit "${MONTH_MAX_RUNS_PER_HOUR}" 3600 "local-backfill per-hour"
+  enforce_run_rate_limit "${MAX_RUNS_PER_MINUTE}" 60 "local-backfill per-minute"
+  enforce_run_rate_limit "${MAX_RUNS_PER_HOUR}" 3600 "local-backfill per-hour"
   RUN_START_EPOCHS+=("$(date +%s)")
 
   if deno run --allow-env --allow-net --allow-read --allow-write --allow-run \
@@ -393,8 +409,8 @@ while IFS=' ' read -r month_from month_to; do
     fi
   fi
 
-  if [[ "${MONTH_RUN_INTERVAL_SECONDS}" -gt 0 ]]; then
-    sleep "${MONTH_RUN_INTERVAL_SECONDS}"
+  if [[ "${RUN_INTERVAL_SECONDS}" -gt 0 ]]; then
+    sleep "${RUN_INTERVAL_SECONDS}"
   fi
 done <<< "${month_ranges}"
 

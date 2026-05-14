@@ -17,3 +17,4 @@ nohup_MBAir.out
 /logs2
 .vscode/settings.json
 system_docs_ops.zip
+*.pyc

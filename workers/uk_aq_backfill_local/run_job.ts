@@ -5136,6 +5136,52 @@ async function resolveConnectorIdByCode(
     return cached;
   }
 
+  if (R2_HISTORY_DROPBOX_ROOT || hasRequiredR2Config(OBS_R2_CONFIG)) {
+    try {
+      const snapshotInfo = await findLatestCoreSnapshotManifestInfo();
+      if (snapshotInfo) {
+        const manifestObject = await loadHistoryObjectBytesByR2Key(
+          snapshotInfo.manifest_key,
+        );
+        const manifest = parseCoreSnapshotManifest(
+          new TextDecoder().decode(manifestObject.body),
+          snapshotInfo.manifest_key,
+        );
+        const connectorsTableKey = findCoreTableKey(manifest, "connectors");
+        if (connectorsTableKey) {
+          const connectorsObject = await loadHistoryObjectBytesByR2Key(
+            connectorsTableKey,
+          );
+          const ndjsonText = decodeCoreTableText(
+            connectorsObject.body,
+            connectorsTableKey,
+          );
+          for (const line of ndjsonText.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const row = JSON.parse(trimmed) as Record<string, unknown>;
+              const rowCode = String(row.connector_code || "").trim()
+                .toLowerCase();
+              const rowId = Number(row.id);
+              if (
+                rowCode === connectorCode && Number.isInteger(rowId) &&
+                rowId > 0
+              ) {
+                connectorCodeCache.set(connectorCode, Math.trunc(rowId));
+                return Math.trunc(rowId);
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall through to Supabase fallback below.
+    }
+  }
+
   if (INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY) {
     const query = new URLSearchParams();
     query.set("select", "id");
@@ -5161,51 +5207,6 @@ async function resolveConnectorIdByCode(
     }
   }
 
-  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
-    return null;
-  }
-  try {
-    const snapshotInfo = await findLatestCoreSnapshotManifestInfo();
-    if (!snapshotInfo) {
-      return null;
-    }
-    const manifestObject = await loadHistoryObjectBytesByR2Key(
-      snapshotInfo.manifest_key,
-    );
-    const manifest = parseCoreSnapshotManifest(
-      new TextDecoder().decode(manifestObject.body),
-      snapshotInfo.manifest_key,
-    );
-    const connectorsTableKey = findCoreTableKey(manifest, "connectors");
-    if (!connectorsTableKey) {
-      return null;
-    }
-    const connectorsObject = await loadHistoryObjectBytesByR2Key(
-      connectorsTableKey,
-    );
-    const ndjsonText = decodeCoreTableText(
-      connectorsObject.body,
-      connectorsTableKey,
-    );
-    for (const line of ndjsonText.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const row = JSON.parse(trimmed) as Record<string, unknown>;
-        const rowCode = String(row.connector_code || "").trim().toLowerCase();
-        const rowId = Number(row.id);
-        if (rowCode === connectorCode && Number.isInteger(rowId) && rowId > 0) {
-          connectorCodeCache.set(connectorCode, Math.trunc(rowId));
-          return Math.trunc(rowId);
-        }
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    return null;
-  }
-
   return null;
 }
 
@@ -5215,6 +5216,50 @@ async function resolveConnectorServiceUrl(
   const cached = connectorServiceUrlCache.get(connectorId);
   if (cached !== undefined) {
     return cached;
+  }
+
+  if (R2_HISTORY_DROPBOX_ROOT || hasRequiredR2Config(OBS_R2_CONFIG)) {
+    try {
+      const snapshotInfo = await findLatestCoreSnapshotManifestInfo();
+      if (snapshotInfo) {
+        const manifestObject = await loadHistoryObjectBytesByR2Key(
+          snapshotInfo.manifest_key,
+        );
+        const manifest = parseCoreSnapshotManifest(
+          new TextDecoder().decode(manifestObject.body),
+          snapshotInfo.manifest_key,
+        );
+        const connectorsTableKey = findCoreTableKey(manifest, "connectors");
+        if (connectorsTableKey) {
+          const connectorsObject = await loadHistoryObjectBytesByR2Key(
+            connectorsTableKey,
+          );
+          const ndjsonText = decodeCoreTableText(
+            connectorsObject.body,
+            connectorsTableKey,
+          );
+          for (const line of ndjsonText.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed) {
+              continue;
+            }
+            try {
+              const row = JSON.parse(trimmed) as Record<string, unknown>;
+              const rowId = Number(row.id);
+              if (Number.isInteger(rowId) && rowId === connectorId) {
+                const serviceUrl = String(row.service_url || "").trim() || null;
+                connectorServiceUrlCache.set(connectorId, serviceUrl);
+                return serviceUrl;
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall through to Supabase fallback below.
+    }
   }
 
   if (INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY) {
@@ -5239,58 +5284,6 @@ async function resolveConnectorServiceUrl(
         return serviceUrl;
       }
     }
-  }
-
-  if (!R2_HISTORY_DROPBOX_ROOT && !hasRequiredR2Config(OBS_R2_CONFIG)) {
-    connectorServiceUrlCache.set(connectorId, null);
-    return null;
-  }
-
-  try {
-    const snapshotInfo = await findLatestCoreSnapshotManifestInfo();
-    if (!snapshotInfo) {
-      connectorServiceUrlCache.set(connectorId, null);
-      return null;
-    }
-    const manifestObject = await loadHistoryObjectBytesByR2Key(
-      snapshotInfo.manifest_key,
-    );
-    const manifest = parseCoreSnapshotManifest(
-      new TextDecoder().decode(manifestObject.body),
-      snapshotInfo.manifest_key,
-    );
-    const connectorsTableKey = findCoreTableKey(manifest, "connectors");
-    if (!connectorsTableKey) {
-      connectorServiceUrlCache.set(connectorId, null);
-      return null;
-    }
-    const connectorsObject = await loadHistoryObjectBytesByR2Key(
-      connectorsTableKey,
-    );
-    const ndjsonText = decodeCoreTableText(
-      connectorsObject.body,
-      connectorsTableKey,
-    );
-    for (const line of ndjsonText.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
-      }
-      try {
-        const row = JSON.parse(trimmed) as Record<string, unknown>;
-        const rowId = Number(row.id);
-        if (Number.isInteger(rowId) && rowId === connectorId) {
-          const serviceUrl = String(row.service_url || "").trim() || null;
-          connectorServiceUrlCache.set(connectorId, serviceUrl);
-          return serviceUrl;
-        }
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    connectorServiceUrlCache.set(connectorId, null);
-    return null;
   }
 
   connectorServiceUrlCache.set(connectorId, null);
@@ -6331,27 +6324,39 @@ function buildOpenaqArchiveObjectKey(
   return `records/csv.gz/locationid=${locationId}/year=${year}/month=${month}/location-${locationId}-${yyyymmdd}.csv.gz`;
 }
 
-function openaqMirrorFilePath(
+function openaqMirrorFilePaths(
   dayUtc: string,
   locationId: number,
-): string | null {
+): string[] {
   if (!IS_LOCAL_RUN || !OPENAQ_RAW_MIRROR_ROOT) {
-    return null;
+    return [];
   }
   const normalizedDay = parseIsoDayUtc(dayUtc);
   if (!normalizedDay) {
-    return null;
+    return [];
   }
+  const year = normalizedDay.slice(0, 4);
+  const month = normalizedDay.slice(5, 7);
   const yyyymmdd = normalizedDay.replaceAll("-", "");
   const root = OPENAQ_RAW_MIRROR_ROOT.trim();
   if (!root) {
-    return null;
+    return [];
   }
-  return path.join(
-    root,
-    `day_utc=${normalizedDay}`,
-    `location-${locationId}-${yyyymmdd}.csv.gz`,
-  );
+  const paths = [
+    path.join(
+      root,
+      `day_utc=${normalizedDay}`,
+      `location-${locationId}-${yyyymmdd}.csv.gz`,
+    ),
+    path.join(
+      root,
+      `locationid=${locationId}`,
+      `year=${year}`,
+      `month=${month}`,
+      `location-${locationId}-${yyyymmdd}.csv.gz`,
+    ),
+  ];
+  return Array.from(new Set(paths));
 }
 
 type OpenaqArchiveFetchResult = {
@@ -6367,10 +6372,13 @@ async function fetchOpenaqArchiveCsvGz(
   locationId: number,
 ): Promise<OpenaqArchiveFetchResult> {
   const archiveKey = buildOpenaqArchiveObjectKey(dayUtc, locationId);
-  const mirrorPath = openaqMirrorFilePath(dayUtc, locationId);
+  const mirrorPaths = openaqMirrorFilePaths(dayUtc, locationId);
+  const existingMirrorPath = mirrorPaths.find((mirrorPath) =>
+    fs.existsSync(mirrorPath)
+  ) || null;
 
-  if (mirrorPath && fs.existsSync(mirrorPath)) {
-    const mirroredBytes = fs.readFileSync(mirrorPath);
+  if (existingMirrorPath) {
+    const mirroredBytes = fs.readFileSync(existingMirrorPath);
     const mirroredText = new TextDecoder().decode(
       zlib.gunzipSync(mirroredBytes),
     );
@@ -6401,9 +6409,10 @@ async function fetchOpenaqArchiveCsvGz(
     };
   }
 
-  if (mirrorPath) {
-    fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
-    fs.writeFileSync(mirrorPath, downloadedBytes);
+  const mirrorWritePath = existingMirrorPath || mirrorPaths[0] || null;
+  if (mirrorWritePath) {
+    fs.mkdirSync(path.dirname(mirrorWritePath), { recursive: true });
+    fs.writeFileSync(mirrorWritePath, downloadedBytes);
   }
 
   let csvText: string;
@@ -6421,7 +6430,7 @@ async function fetchOpenaqArchiveCsvGz(
     archive_key: archiveKey,
     csv_text: csvText,
     mirror_reused: false,
-    mirror_written: Boolean(mirrorPath),
+    mirror_written: Boolean(mirrorWritePath),
   };
 }
 
@@ -10338,7 +10347,7 @@ async function runSourceToAll(
               locationIdSet.add(locationId);
             }
           }
-          const candidateLocationIds = Array.from(locationIdSet).sort((
+          let candidateLocationIds = Array.from(locationIdSet).sort((
             left,
             right,
           ) => left - right);
@@ -10369,6 +10378,80 @@ async function runSourceToAll(
             connectorId,
             candidateStationRefs,
           );
+          if (REQUESTED_TIMESERIES_IDS && REQUESTED_TIMESERIES_IDS.length > 0) {
+            const requestedSet = new Set(REQUESTED_TIMESERIES_IDS);
+            const targetedTimeseriesIds = sortedUniquePositiveInts(
+              Array.from(requestedSet).filter((timeseriesId) =>
+                lookup.binding_by_timeseries_id.has(timeseriesId)
+              ),
+            );
+            if (targetedTimeseriesIds.length === 0) {
+              connectorDaySkipped += 1;
+              await ledgerInsertRunDay(ledgerEnabled, {
+                run_id: runId,
+                run_mode: RUN_MODE,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_kind: "download",
+                status: "skipped",
+                rows_read: 0,
+                rows_written_aqilevels: 0,
+                objects_written_r2: 0,
+                checkpoint_json: {
+                  source_adapter: sourceAdapter,
+                  skip_reason: "no_matching_requested_timeseries_ids",
+                  requested_timeseries_ids: REQUESTED_TIMESERIES_IDS,
+                },
+                started_at: startedAt,
+                finished_at: nowIso(),
+              });
+              continue;
+            }
+            const targetedStationRefs = new Set<string>();
+            for (const timeseriesId of targetedTimeseriesIds) {
+              const binding = lookup.binding_by_timeseries_id.get(timeseriesId);
+              if (binding?.station_ref) {
+                targetedStationRefs.add(binding.station_ref);
+              }
+            }
+            const filteredLocationIds = candidateLocationIds.filter((locationId) =>
+              targetedStationRefs.has(String(locationId))
+            );
+            sourceCheckpointJson.requested_timeseries_ids =
+              targetedTimeseriesIds;
+            sourceCheckpointJson.requested_timeseries_station_ref_count =
+              targetedStationRefs.size;
+            sourceCheckpointJson.candidate_location_count_unfiltered =
+              candidateLocationIds.length;
+            sourceCheckpointJson.candidate_location_count_filtered =
+              filteredLocationIds.length;
+            candidateLocationIds = filteredLocationIds;
+            if (candidateLocationIds.length === 0) {
+              connectorDaySkipped += 1;
+              await ledgerInsertRunDay(ledgerEnabled, {
+                run_id: runId,
+                run_mode: RUN_MODE,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_kind: "download",
+                status: "skipped",
+                rows_read: 0,
+                rows_written_aqilevels: 0,
+                objects_written_r2: 0,
+                checkpoint_json: {
+                  source_adapter: sourceAdapter,
+                  skip_reason:
+                    "no_matching_location_ids_after_timeseries_filter",
+                  requested_timeseries_ids: targetedTimeseriesIds,
+                  requested_timeseries_station_ref_count:
+                    targetedStationRefs.size,
+                },
+                started_at: startedAt,
+                finished_at: nowIso(),
+              });
+              continue;
+            }
+          }
           let locationFilesFound = 0;
           let locationFilesMissing = 0;
           let locationFilesMirrorReused = 0;
