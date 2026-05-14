@@ -18,6 +18,10 @@ export interface Env {
   UK_AQ_CHART_METRICS_RPC_SCHEMA: unknown;
   UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE: unknown;
   UK_AQ_CHART_METRICS_MAX_BODY_BYTES: unknown;
+  UK_AQ_TIMESERIES_V2_ENABLED: unknown;
+  UK_AQ_TIMESERIES_PROXY_FIRST: unknown;
+  UK_AQ_TIMESERIES_R2_FIRST: unknown;
+  UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE: unknown;
 }
 
 
@@ -209,6 +213,44 @@ const CHART_METRICS_MAX_TRACKED_KEYS = 5_000;
 const CHART_METRICS_RATE_WINDOW_MS = 60 * 1000;
 const DEFAULT_CHART_METRICS_RPC = "uk_aq_rpc_chart_load_metrics_insert";
 const DEFAULT_CHART_METRICS_RPC_SCHEMA = "uk_aq_public";
+const TIMESERIES_UPSTREAM_FUNCTION = "uk_aq_timeseries";
+const TIMESERIES_V2_VERSION = "2";
+const TIMESERIES_V2_CACHE_KEY_VERSION = "ts-v2";
+const TIMESERIES_V2_ALLOWED_WINDOWS = new Set(["12h", "24h", "7d", "31d", "90d"]);
+const TIMESERIES_V2_CACHE_BUSTER_KEYS = new Set(["_t", "timestamp", "cache_bust", "random"]);
+const TIMESERIES_V2_PRIMARY_QUERY_KEYS = [
+  "timeseries_id",
+  "window",
+  "since",
+  "start_utc",
+  "end_utc",
+  "format",
+  "v",
+] as const;
+
+type TimeseriesV2Flags = {
+  enabled: boolean;
+  proxyFirst: boolean;
+  r2First: boolean;
+  allowIngestOverwrite: boolean;
+};
+
+type TimeseriesV2CanonicalizeResult = {
+  url: URL;
+  strippedCacheBusters: string[];
+};
+
+type TimeseriesV2EnvelopeMeta = {
+  source_mode: string;
+  r2_coverage_end: string | null;
+  ingest_tail_start: string | null;
+  has_gap: boolean | null;
+  row_count: number | null;
+  r2_row_count: number | null;
+  ingest_row_count: number | null;
+  deduped_row_count: number | null;
+  cache_status: "MISS" | "HIT" | "BYPASS";
+};
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -793,6 +835,175 @@ function getFirstSearchParam(url: URL, keys: readonly string[]): string | null {
     }
   }
   return null;
+}
+
+function parsePositiveIntegerStringOrNull(
+  value: string | null,
+  min = 1,
+  max = 2_147_483_647,
+): string | null {
+  const text = String(value ?? "").trim();
+  if (!text || !/^\d+$/.test(text)) {
+    return null;
+  }
+  const numeric = Number(text);
+  if (!Number.isFinite(numeric) || numeric < min || numeric > max) {
+    return null;
+  }
+  return String(Math.floor(numeric));
+}
+
+function normalizeIsoOrNull(value: string | null): string | null {
+  const ms = parseIsoMsOrNull(value);
+  if (ms === null || !Number.isFinite(ms)) {
+    return null;
+  }
+  return new Date(ms).toISOString();
+}
+
+function resolveTimeseriesV2FlagsFromEnv(envValues: {
+  v2EnabledRaw: string;
+  proxyFirstRaw: string;
+  r2FirstRaw: string;
+  allowIngestOverwriteRaw: string;
+}): TimeseriesV2Flags {
+  return {
+    enabled: parseBooleanFlag(envValues.v2EnabledRaw),
+    proxyFirst: parseBooleanFlag(envValues.proxyFirstRaw),
+    r2First: parseBooleanFlag(envValues.r2FirstRaw),
+    allowIngestOverwrite: parseBooleanFlag(envValues.allowIngestOverwriteRaw),
+  };
+}
+
+function isTimeseriesV2Request(url: URL, upstreamFunction: string, flags: TimeseriesV2Flags): boolean {
+  if (upstreamFunction !== TIMESERIES_UPSTREAM_FUNCTION) {
+    return false;
+  }
+  if (!flags.enabled || !flags.proxyFirst) {
+    return false;
+  }
+  return String(url.searchParams.get("v") ?? "").trim() === TIMESERIES_V2_VERSION;
+}
+
+function canonicalizeTimeseriesV2RequestUrl(url: URL, allowCacheBypassParams: boolean): TimeseriesV2CanonicalizeResult {
+  const original = new URL(url.toString());
+  const strippedCacheBusters: string[] = [];
+  if (!allowCacheBypassParams) {
+    for (const key of TIMESERIES_V2_CACHE_BUSTER_KEYS) {
+      if (original.searchParams.has(key)) {
+        strippedCacheBusters.push(key);
+        original.searchParams.delete(key);
+      }
+    }
+  }
+
+  const timeseriesId = parsePositiveIntegerStringOrNull(original.searchParams.get("timeseries_id"));
+  const rawWindow = String(original.searchParams.get("window") ?? "").trim().toLowerCase();
+  const normalizedWindow = rawWindow && TIMESERIES_V2_ALLOWED_WINDOWS.has(rawWindow) ? rawWindow : null;
+  const normalizedSince = normalizeIsoOrNull(original.searchParams.get("since"))
+    ?? (String(original.searchParams.get("since") ?? "").trim() || null);
+  const normalizedStartUtc = normalizeIsoOrNull(
+    getFirstSearchParam(original, ["start_utc", "start"]),
+  );
+  const normalizedEndUtc = normalizeIsoOrNull(
+    getFirstSearchParam(original, ["end_utc", "end"]),
+  );
+  const hasValidRange = Boolean(
+    normalizedStartUtc &&
+      normalizedEndUtc &&
+      Date.parse(normalizedEndUtc) > Date.parse(normalizedStartUtc),
+  );
+
+  const normalized = new URL(original.origin + original.pathname);
+  if (timeseriesId) {
+    normalized.searchParams.set("timeseries_id", timeseriesId);
+  }
+  if (normalizedWindow && !hasValidRange) {
+    normalized.searchParams.set("window", normalizedWindow);
+  }
+  if (normalizedSince) {
+    normalized.searchParams.set("since", normalizedSince);
+  }
+  if (hasValidRange && normalizedStartUtc && normalizedEndUtc) {
+    normalized.searchParams.set("start_utc", normalizedStartUtc);
+    normalized.searchParams.set("end_utc", normalizedEndUtc);
+  }
+  normalized.searchParams.set("format", "json");
+  normalized.searchParams.set("v", TIMESERIES_V2_VERSION);
+
+  if (allowCacheBypassParams) {
+    for (const [key, value] of original.searchParams.entries()) {
+      if ((TIMESERIES_V2_PRIMARY_QUERY_KEYS as readonly string[]).includes(key)) {
+        continue;
+      }
+      normalized.searchParams.append(key, value);
+    }
+  }
+
+  return { url: normalized, strippedCacheBusters };
+}
+
+async function buildTimeseriesV2EnvelopeResponse(
+  upstreamResponse: Response,
+  requestUrl: URL,
+  cacheStatus: "MISS" | "HIT" | "BYPASS",
+): Promise<{ bodyText: string; meta: TimeseriesV2EnvelopeMeta } | null> {
+  if (upstreamResponse.status !== 200) {
+    return null;
+  }
+
+  const contentType = String(upstreamResponse.headers.get("Content-Type") ?? "").toLowerCase();
+  if (!contentType.includes("application/json")) {
+    return null;
+  }
+
+  let payload: unknown;
+  try {
+    payload = await upstreamResponse.clone().json();
+  } catch (_err) {
+    return null;
+  }
+
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const payloadRecord = payload as Record<string, unknown>;
+  const data = Array.isArray(payloadRecord.data) ? payloadRecord.data : [];
+  const requestStartUtc = String(requestUrl.searchParams.get("start_utc") ?? "").trim() || null;
+  const requestEndUtc = String(requestUrl.searchParams.get("end_utc") ?? "").trim() || null;
+  const requestWindow = String(requestUrl.searchParams.get("window") ?? "").trim() || null;
+  const requestSince = String(requestUrl.searchParams.get("since") ?? "").trim() || null;
+  const meta: TimeseriesV2EnvelopeMeta = {
+    source_mode: "origin_only_v2_wrapper",
+    r2_coverage_end: null,
+    ingest_tail_start: null,
+    has_gap: null,
+    row_count: data.length,
+    r2_row_count: null,
+    ingest_row_count: data.length,
+    deduped_row_count: 0,
+    cache_status: cacheStatus,
+  };
+
+  const envelope = {
+    schema_version: 2,
+    timeseries_id: Number(requestUrl.searchParams.get("timeseries_id") ?? 0) || null,
+    request: {
+      window: requestWindow,
+      start_utc: requestStartUtc,
+      end_utc: requestEndUtc,
+      since: requestSince,
+    },
+    data,
+    meta,
+    // Preserve compatibility with existing frontend parsing during migration.
+    data_format: payloadRecord.data_format ?? "objects",
+    columns: Array.isArray(payloadRecord.columns) ? payloadRecord.columns : ["observed_at", "value"],
+    next_since: payloadRecord.next_since ?? null,
+    guideline: payloadRecord.guideline ?? null,
+  };
+  return { bodyText: JSON.stringify(envelope), meta };
 }
 
 function canonicalizeAqiHistoryRequestUrl(url: URL, upstreamFunction: string): URL {
@@ -1406,7 +1617,19 @@ export default {
       }
     }
 
-    const normalizedRequestUrl = canonicalizeAqiHistoryRequestUrl(url, upstreamFunction);
+    const timeseriesV2Flags = resolveTimeseriesV2FlagsFromEnv({
+      v2EnabledRaw: await readSecret(env.UK_AQ_TIMESERIES_V2_ENABLED),
+      proxyFirstRaw: await readSecret(env.UK_AQ_TIMESERIES_PROXY_FIRST),
+      r2FirstRaw: await readSecret(env.UK_AQ_TIMESERIES_R2_FIRST),
+      allowIngestOverwriteRaw: await readSecret(env.UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE),
+    });
+    const useTimeseriesV2Skeleton = isTimeseriesV2Request(url, upstreamFunction, timeseriesV2Flags);
+    const timeseriesV2Canonicalized = useTimeseriesV2Skeleton
+      ? canonicalizeTimeseriesV2RequestUrl(url, bypassRequested)
+      : null;
+    const normalizedRequestUrl = useTimeseriesV2Skeleton
+      ? timeseriesV2Canonicalized!.url
+      : canonicalizeAqiHistoryRequestUrl(url, upstreamFunction);
     const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
@@ -1480,6 +1703,17 @@ export default {
           }
           notModifiedHeaders.set("X-UK-AQ-Cache", "HIT");
           notModifiedHeaders.set("X-UK-AQ-Cache-Profile", profileName);
+          if (useTimeseriesV2Skeleton) {
+            notModifiedHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
+            const sourceMode = cachedResponse.headers.get("X-UK-AQ-Timeseries-Source-Mode");
+            const hasGap = cachedResponse.headers.get("X-UK-AQ-Has-Gap");
+            if (sourceMode) {
+              notModifiedHeaders.set("X-UK-AQ-Timeseries-Source-Mode", sourceMode);
+            }
+            if (hasGap) {
+              notModifiedHeaders.set("X-UK-AQ-Has-Gap", hasGap);
+            }
+          }
           addCorsHeaders(notModifiedHeaders, requestOrigin, allowedOrigins);
           return new Response(null, { status: 304, headers: notModifiedHeaders });
         }
@@ -1487,6 +1721,9 @@ export default {
         const hitHeaders = new Headers(cachedResponse.headers);
         hitHeaders.set("X-UK-AQ-Cache", "HIT");
         hitHeaders.set("X-UK-AQ-Cache-Profile", profileName);
+        if (useTimeseriesV2Skeleton) {
+          hitHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
+        }
         addCorsHeaders(hitHeaders, requestOrigin, allowedOrigins);
         return new Response(cachedResponse.body, {
           status: cachedResponse.status,
@@ -1527,7 +1764,15 @@ export default {
         allowedOrigins,
       );
     }
-    upstreamUrl.search = normalizedRequestUrl.search;
+    const normalizedUpstreamRequestUrl = new URL(normalizedRequestUrl.toString());
+    if (
+      useTimeseriesV2Skeleton &&
+      normalizedUpstreamRequestUrl.searchParams.get("format") === "json"
+    ) {
+      // Current uk_aq_timeseries origin supports objects/compact only.
+      normalizedUpstreamRequestUrl.searchParams.set("format", "objects");
+    }
+    upstreamUrl.search = normalizedUpstreamRequestUrl.search;
 
     const upstreamHeaders = new Headers();
     if (!usingExternalUpstream) {
@@ -1579,9 +1824,10 @@ export default {
       return makeErrorResponse(502, "upstream_fetch_failed", requestOrigin, allowedOrigins);
     }
 
+    const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.delete("Set-Cookie");
-    responseHeaders.set("X-UK-AQ-Cache", shouldUseCache ? "MISS" : "BYPASS");
+    responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
     responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
     if (upstreamRetried && upstreamRetryReason) {
       responseHeaders.set("X-UK-AQ-Upstream-Retry", upstreamRetryReason);
@@ -1590,9 +1836,33 @@ export default {
     if (upstreamResponse.status === 200) {
       responseHeaders.set("Cache-Control", buildCacheControl(profile));
     }
+    let responseBody: BodyInit | null = upstreamResponse.body;
+    if (useTimeseriesV2Skeleton) {
+      responseHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
+      if (timeseriesV2Canonicalized && timeseriesV2Canonicalized.strippedCacheBusters.length) {
+        responseHeaders.set(
+          "X-UK-AQ-Timeseries-Stripped-Params",
+          timeseriesV2Canonicalized.strippedCacheBusters.join(","),
+        );
+      }
+      const wrapped = await buildTimeseriesV2EnvelopeResponse(
+        upstreamResponse,
+        normalizedRequestUrl,
+        cacheStatusLabel,
+      );
+      if (wrapped) {
+        responseBody = wrapped.bodyText;
+        responseHeaders.set("Content-Type", "application/json; charset=utf-8");
+        responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", wrapped.meta.source_mode);
+        responseHeaders.set("X-UK-AQ-Has-Gap", String(wrapped.meta.has_gap));
+      } else {
+        responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", "origin_only_v2_wrapper");
+        responseHeaders.set("X-UK-AQ-Has-Gap", "null");
+      }
+    }
     addCorsHeaders(responseHeaders, requestOrigin, allowedOrigins);
 
-    const response = new Response(upstreamResponse.body, {
+    const response = new Response(responseBody, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
       headers: responseHeaders,

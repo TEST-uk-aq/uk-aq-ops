@@ -1311,7 +1311,696 @@ Requirements:
      both passes land.
 ```
 
-### Phase 6 — Monitoring, limits, and reports polish
+
+---
+
+## Additional Phase — Integrity-specific backfill wrapper and worker output scopes
+
+### Goal
+
+Add an integrity-specific backfill wrapper so the history-integrity system can safely orchestrate observation repairs and AQI rebuilds without changing the normal/manual backfill workflow.
+
+The key design rule is:
+
+```text
+source_to_r2 repairs observations.
+r2_history_obs_to_aqilevels rebuilds AQI levels.
+```
+
+The existing general/manual launcher should remain available:
+
+```text
+scripts/uk_aq_backfill_local.sh
+```
+
+A new integrity-specific launcher should be added under the history-integrity script area:
+
+```text
+scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh
+```
+
+This wrapper should call the same worker implementation as `uk_aq_backfill_local.sh`, but it should use safer integrity defaults and explicit output scopes.
+
+---
+
+### Why this phase is needed
+
+The current `source_to_r2` worker path can rebuild/write AQI levels as part of an observations backfill. That causes two problems for the integrity workflow:
+
+1. Observation repair can be blocked if AQI rows are empty.
+2. AQI may be rebuilt multiple times for the same connector/day if several targeted observation backfills happen in one integrity run.
+
+The new integrity workflow separates these concerns:
+
+```text
+Phase 6.6:
+  repair observations only
+  record affected connector-days in an AQI rebuild queue
+
+Phase 6.7:
+  inspect AQI-only health issues
+  add extra connector-days to the same AQI rebuild queue
+
+Phase 6.8:
+  rebuild AQI once per queued connector/day
+```
+
+To make that safe, the worker needs an explicit way to run `source_to_r2` as observations-only.
+
+---
+
+### Required worker-level change
+
+Add worker-level support for an output scope setting, for example:
+
+```bash
+UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only
+UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only
+UK_AQ_BACKFILL_OUTPUT_SCOPE=default
+```
+
+Recommended behaviour:
+
+```text
+default:
+  Existing/manual behaviour, for backwards compatibility.
+
+observations_only:
+  source_to_r2 writes observations only.
+  It must not build, merge, export, or manifest-write AQI levels.
+  The skip guard must only depend on obsHistoryRows.length.
+
+aqilevels_only:
+  Only valid with r2_history_obs_to_aqilevels.
+  Rebuilds AQI levels from existing R2 observations.
+```
+
+For Phase 6.6, the integrity wrapper should call:
+
+```bash
+UK_AQ_BACKFILL_RUN_MODE=source_to_r2
+UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only
+UK_AQ_BACKFILL_FORCE_REPLACE=true
+UK_AQ_BACKFILL_TIMESERIES_IDS=<affected-timeseries-ids>
+UK_AQ_BACKFILL_FROM_DAY_UTC=<day>
+UK_AQ_BACKFILL_TO_DAY_UTC=<day>
+```
+
+For Phase 6.8, the integrity wrapper should call:
+
+```bash
+UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels
+UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only
+UK_AQ_BACKFILL_FORCE_REPLACE=true
+UK_AQ_BACKFILL_CONNECTOR_IDS=<connector-id>
+UK_AQ_BACKFILL_FROM_DAY_UTC=<day>
+UK_AQ_BACKFILL_TO_DAY_UTC=<day>
+```
+
+---
+
+### Required integrity wrapper behaviour
+
+Create:
+
+```text
+scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh
+```
+
+The script should be a near-copy of `scripts/uk_aq_backfill_local.sh`, but with integrity-specific safety defaults.
+
+It should support two explicit operations:
+
+```bash
+uk_aq_integrity_backfill.sh observs-only
+uk_aq_integrity_backfill.sh aqi-only
+```
+
+or equivalent flags:
+
+```bash
+uk_aq_integrity_backfill.sh --observs-only
+uk_aq_integrity_backfill.sh --aqi-only
+```
+
+Recommended interface:
+
+```bash
+uk_aq_integrity_backfill.sh \
+  --env CIC-Test \
+  --observs-only \
+  --connector-id 6 \
+  --timeseries-ids 3742,3811 \
+  --from-day 2026-05-08 \
+  --to-day 2026-05-08
+```
+
+```bash
+uk_aq_integrity_backfill.sh \
+  --env CIC-Test \
+  --aqi-only \
+  --connector-id 6 \
+  --from-day 2026-05-08 \
+  --to-day 2026-05-08
+```
+
+The wrapper should:
+
+1. Load the correct environment/backfill env file.
+2. Enforce CIC-Test/LIVE path guardrails.
+3. Refuse to run if both `--observs-only` and `--aqi-only` are passed.
+4. Refuse `--observs-only` without `--timeseries-ids`.
+5. Refuse `--aqi-only` without `--connector-id`.
+6. Pass `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only` for observs-only mode.
+7. Pass `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only` for AQI-only mode.
+8. Preserve clear logs and exit codes so history-integrity can record success/failure.
+
+---
+
+### Why keep `uk_aq_backfill_local.sh`?
+
+Keep the existing script for manual/operator runs.
+
+Manual runs may still want broad connector/day behaviour, diagnostics, or existing compatibility. The new wrapper is for the stricter integrity workflow only.
+
+This avoids making the general backfill entrypoint more confusing while giving history-integrity a safer, narrower contract.
+
+---
+
+### Phase relationship
+
+This phase should be implemented before or as part of Phase 6.6.
+
+Recommended placement in the plan:
+
+```text
+Phase 6.5 — R2 cross-check
+Additional Phase — Integrity-specific backfill wrapper and worker output scopes
+Phase 6.6 — Observation repair queue and execution
+Phase 6.7 — AQI-only health check and queueing
+Phase 6.8 — Deduplicated AQI rebuild execution
+Phase 7 — Monitoring, limits, and reports polish
+```
+
+---
+
+### Codex prompt
+
+```text
+Repo: uk-aq-ops.
+
+Please implement an additional setup phase for the UK-AQ History Integrity backfill orchestration.
+
+Context:
+- The history-integrity workflow now separates observation repair from AQI rebuild.
+- `source_to_r2` should be able to run as observations-only for integrity repairs.
+- `r2_history_obs_to_aqilevels` should remain the owner of AQI rebuilds.
+- The existing manual/general script `scripts/uk_aq_backfill_local.sh` should remain available for manual runs.
+- Add an integrity-specific wrapper under:
+  `scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh`
+
+Requirements:
+
+1. Worker output-scope support
+   - Add support for an env var such as:
+       `UK_AQ_BACKFILL_OUTPUT_SCOPE`
+   - Supported values:
+       `default`
+       `observations_only`
+       `aqilevels_only`
+   - Default should preserve the current/manual behaviour unless explicitly overridden.
+
+2. source_to_r2 observations-only mode
+   - When:
+       `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`
+       and `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only`
+     the worker must write observations only.
+   - It must not build, preserve, merge, export, or manifest-write AQI levels.
+   - The skip guard must only skip when `obsHistoryRows.length === 0`.
+   - Empty AQI rows must never block observation repair in observations-only mode.
+   - Structured logs should clearly include:
+       `output_scope: "observations_only"`
+       rows written
+       affected connector/day
+       requested timeseries IDs
+
+3. r2_history_obs_to_aqilevels AQI-only mode
+   - When:
+       `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`
+       and `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`
+     the worker should rebuild AQI from R2 observations using the existing logic.
+   - This should be compatible with connector/day rebuilds.
+   - Structured logs should include:
+       `output_scope: "aqilevels_only"`
+       connector/day
+       rows read/written
+       manifest status
+
+4. Invalid combinations
+   - Refuse invalid combinations clearly:
+       `observations_only` with `r2_history_obs_to_aqilevels` unless deliberately supported later.
+       `aqilevels_only` with `source_to_r2`.
+       unknown output scope values.
+   - Error messages should be explicit and should fail before mutating R2.
+
+5. Add integrity wrapper
+   - Add:
+       `scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh`
+   - It should be a thin launcher around the existing local backfill worker, not a fork of the worker logic.
+   - It should support:
+       `--env CIC-Test|LIVE`
+       `--observs-only`
+       `--aqi-only`
+       `--connector-id N`
+       `--timeseries-ids A,B,C`
+       `--from-day YYYY-MM-DD`
+       `--to-day YYYY-MM-DD`
+       `--dry-run` where supported
+   - It should load the correct environment/backfill env file and enforce CIC-Test/LIVE guardrails.
+   - It should refuse:
+       both `--observs-only` and `--aqi-only`
+       neither `--observs-only` nor `--aqi-only`
+       `--observs-only` without `--timeseries-ids`
+       `--aqi-only` without `--connector-id`
+   - For observs-only mode it should export:
+       `UK_AQ_BACKFILL_RUN_MODE=source_to_r2`
+       `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only`
+       `UK_AQ_BACKFILL_FORCE_REPLACE=true`
+       `UK_AQ_BACKFILL_TIMESERIES_IDS=<ids>`
+       `UK_AQ_BACKFILL_FROM_DAY_UTC=<from>`
+       `UK_AQ_BACKFILL_TO_DAY_UTC=<to>`
+   - For AQI-only mode it should export:
+       `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`
+       `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`
+       `UK_AQ_BACKFILL_FORCE_REPLACE=true`
+       `UK_AQ_BACKFILL_CONNECTOR_IDS=<connector>`
+       `UK_AQ_BACKFILL_FROM_DAY_UTC=<from>`
+       `UK_AQ_BACKFILL_TO_DAY_UTC=<to>`
+
+6. Tests / verification
+   - Add a dry-run or test path showing that observs-only mode does not call AQI export/manifest writing.
+   - Add a dry-run or test path showing that AQI-only mode calls `r2_history_obs_to_aqilevels` and does not run source acquisition.
+   - Run the relevant type checks.
+   - Update docs or operational notes so Phase 6.6/6.8 know to call the new integrity wrapper.
+
+Important:
+- Do not duplicate the worker implementation.
+- Keep one worker implementation and two shell entrypoints:
+    manual/general: `scripts/uk_aq_backfill_local.sh`
+    integrity-specific: `scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh`
+- Keep the new wrapper conservative and fail-safe.
+```
+
+
+---
+
+### Phase 6.6 — Observation repair queue and execution
+
+Goal:
+
+Repair observation history discrepancies found by Phase 6.5, but do **not** rebuild AQI immediately after each individual backfill. Instead, record the affected connector/day pairs into a deduplicated AQI rebuild queue for Phase 6.8.
+
+Motivation:
+
+Phase 6.5 detects observation mismatches by comparing source-side per-timeseries row counts with the R2 observations history index manifest from the local Dropbox R2 history backup. When a source file has changed, or when the cross-check finds `mismatch` / `source_only` / `r2_manifest_missing`, the correct repair is a targeted `source_to_r2` observation backfill.
+
+However, AQI should not be rebuilt inline after each individual targeted backfill. A single connector/day may have several affected timeseries batches in the same integrity run. Rebuilding AQI after each batch could rebuild the same connector/day multiple times.
+
+Design:
+
+1. Run the existing observation repair logic from Phase 6.5 outputs.
+2. For each affected source/day/timeseries set, call the existing backfill wrapper with:
+
+```bash
+UK_AQ_BACKFILL_RUN_MODE=source_to_r2
+UK_AQ_BACKFILL_FORCE_REPLACE=true
+UK_AQ_BACKFILL_TIMESERIES_IDS=<comma-separated affected timeseries IDs>
+UK_AQ_BACKFILL_FROM_DAY_UTC=<day>
+UK_AQ_BACKFILL_TO_DAY_UTC=<day>
+```
+
+3. `source_to_r2` should be treated as the observation repair path. It should not block observation writes just because AQI rows are empty.
+4. After each successful observation repair, add the affected `(connector_id, day_utc)` to an AQI rebuild queue.
+5. Deduplicate the queue by `(connector_id, day_utc)`.
+6. For Phase 6.6 queued jobs, set:
+
+```text
+reason = obs_repaired
+source_mode = live_r2
+```
+
+7. Use `live_r2` because these observations have just been repaired and the Dropbox R2 history backup may not have caught up yet.
+8. Record observation backfill status separately from AQI rebuild status. An observation repair can succeed even if the later AQI rebuild fails.
+9. Persist the AQI rebuild queue to SQLite before Phase 6.8 runs, so a later run can recover pending AQI rebuilds if the process stops after observation repair.
+
+Suggested SQLite table:
+
+```sql
+CREATE TABLE IF NOT EXISTS aqi_rebuild_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  env_name TEXT NOT NULL,
+  connector_id INTEGER NOT NULL,
+  day_utc TEXT NOT NULL,
+
+  reason TEXT NOT NULL,
+  source_mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+
+  requested_timeseries_ids TEXT,
+  notes TEXT,
+
+  created_at_utc TEXT NOT NULL,
+  started_at_utc TEXT,
+  finished_at_utc TEXT,
+
+  UNIQUE(run_id, connector_id, day_utc)
+);
+```
+
+Initial status values:
+
+```text
+queued
+running
+complete
+failed
+skipped
+```
+
+If the same `(run_id, connector_id, day_utc)` is queued more than once, keep one row and append/merge the affected timeseries IDs and notes. Even though Phase 6.7 should skip Phase 6.6 queued connector-days, keep this deduplication as a safety check.
+
+Prompt:
+
+```text
+Repo: uk-aq-ops.
+
+Please implement Phase 6.6 of the UK-AQ History Integrity system: observation repair queue and execution.
+
+Use:
+docs/uk-aq-history-integrity-system-doc-v2.md
+
+Build on Phase 6.5 Pass B.
+
+Context:
+Phase 6.5 now detects observation discrepancies by comparing source-side per-timeseries row counts with the R2 observations history index manifest from the local Dropbox R2 history backup. Observation discrepancies are statuses such as mismatch, source_only, and r2_manifest_missing.
+
+Requirements:
+
+1. Observation repair execution
+   - For observation discrepancies that require repair, run the existing local backfill wrapper in targeted observation mode:
+       UK_AQ_BACKFILL_RUN_MODE=source_to_r2
+       UK_AQ_BACKFILL_FORCE_REPLACE=true
+       UK_AQ_BACKFILL_TIMESERIES_IDS=<comma-separated affected timeseries IDs>
+       UK_AQ_BACKFILL_FROM_DAY_UTC=<day>
+       UK_AQ_BACKFILL_TO_DAY_UTC=<day>
+   - Group compatible repairs where safe, but do not broaden to whole connector/day observation replacement unless explicitly configured.
+   - Preserve dry-run behaviour: print planned commands but do not execute.
+
+2. AQI rebuild queue
+   - Add a SQLite table aqi_rebuild_queue if it does not already exist:
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       run_id INTEGER NOT NULL,
+       env_name TEXT NOT NULL,
+       connector_id INTEGER NOT NULL,
+       day_utc TEXT NOT NULL,
+       reason TEXT NOT NULL,
+       source_mode TEXT NOT NULL,
+       status TEXT NOT NULL,
+       requested_timeseries_ids TEXT,
+       notes TEXT,
+       created_at_utc TEXT NOT NULL,
+       started_at_utc TEXT,
+       finished_at_utc TEXT,
+       UNIQUE(run_id, connector_id, day_utc)
+   - After a successful source_to_r2 observation repair, queue the affected connector/day for AQI rebuild.
+   - For these rows use:
+       reason = obs_repaired
+       source_mode = live_r2
+       status = queued
+   - Deduplicate by (run_id, connector_id, day_utc). If a duplicate is queued, merge affected timeseries IDs and append a note rather than inserting a second row.
+   - Persist the queue before Phase 6.8 runs so pending AQI rebuilds survive a later failure.
+
+3. Status separation
+   - Record observation backfill status separately from AQI rebuild status.
+   - Do not mark an observation repair as failed just because the later AQI rebuild fails.
+   - Reports should distinguish:
+       observation_backfills_attempted
+       observation_backfills_ok
+       observation_backfills_failed
+       aqi_rebuilds_queued_from_obs_repair
+
+4. Backfill-side expectation
+   - source_to_r2 is the observation repair path.
+   - It must not skip writing observations simply because generated AQI rows are empty.
+   - If needed, update the backfill worker so source_to_r2 targeted repair writes observations only, and leaves AQI rebuild responsibility to r2_history_obs_to_aqilevels.
+
+5. Tests / verification
+   - Synthetic cross-check rows for two timeseries on the same connector/day should produce targeted source_to_r2 repairs but only one aqi_rebuild_queue row.
+   - Dry-run should show planned source_to_r2 commands and planned AQI queue entries without mutating remote outputs.
+   - A failed source_to_r2 repair must not queue an AQI rebuild for that connector/day.
+
+6. Docs
+   - Update the system doc to describe Phase 6.6.
+   - Explain that AQI rebuilds are queued and deduplicated, not run immediately after every observation backfill.
+```
+
+---
+
+### Phase 6.7 — AQI-only health check and queueing
+
+Goal:
+
+Find AQI history problems that are **not** caused by observation mismatches already repaired in Phase 6.6, and add those connector/day pairs to the same AQI rebuild queue.
+
+Motivation:
+
+Some days may have correct observations but stale, missing, incomplete, or failed AQI output. These should not trigger `source_to_r2`, because the observations do not need source repair. Instead, they should trigger `r2_history_obs_to_aqilevels`.
+
+This pass should avoid duplicating work already queued by Phase 6.6.
+
+Design:
+
+1. Build a set of connector/days already queued by Phase 6.6 in the current run.
+2. Inspect AQI history health for connector/days in the checked window.
+3. Skip connector/days already queued from Phase 6.6.
+4. Detect AQI-only rebuild candidates, for example:
+
+```text
+AQI manifest missing
+AQI manifest stale writer/schema/algorithm version
+AQI manifest empty when observations exist
+previous AQI rebuild failed or pending
+```
+
+5. Do **not** compare observation row counts directly to AQI row counts as if they should be equal. They are different datasets.
+6. Record AQI-only candidates into `aqi_rebuild_queue` with:
+
+```text
+reason = aqi_health_check
+source_mode = live_r2
+status = queued
+```
+
+7. For the first implementation, use `live_r2` for all queued AQI rebuilds. Dropbox-backed AQI rebuilds can be added later as an optimisation.
+8. Keep a defensive duplicate check: if a connector/day is already in the queue, do not insert another row. Merge the reason/note if needed.
+
+Possible later optimisation:
+
+A future Phase 6.8 v2 may allow AQI-only jobs to use the Dropbox R2 history backup as the observation source when it is safe. For PM rolling 24-hour AQI, this is only safe when neither the target connector/day nor the previous connector/day was observation-repaired in the same run.
+
+Prompt:
+
+```text
+Repo: uk-aq-ops.
+
+Please implement Phase 6.7 of the UK-AQ History Integrity system: AQI-only health check and queueing.
+
+Use:
+docs/uk-aq-history-integrity-system-doc-v2.md
+
+Build on Phase 6.6.
+
+Context:
+Phase 6.6 repairs observation discrepancies with targeted source_to_r2 backfills and queues affected connector/days for AQI rebuild. Phase 6.7 should find AQI-only problems for connector/days that were not already queued by Phase 6.6.
+
+Requirements:
+
+1. Skip Phase 6.6 connector/days
+   - At the start of Phase 6.7, load the current run's queued connector/days from aqi_rebuild_queue where reason includes obs_repaired.
+   - Do not inspect or queue those connector/days again in the AQI-only pass.
+   - Keep a defensive duplicate check anyway: if a connector/day is already queued, do not insert a duplicate row; merge notes/reasons if needed.
+
+2. AQI health checks
+   - Inspect AQI history manifests from the configured local Dropbox R2 history backup where available.
+   - Identify AQI-only rebuild candidates such as:
+       AQI manifest missing
+       AQI manifest stale writer/schema/algorithm version
+       AQI manifest empty when observations exist
+       previous AQI rebuild failed or remains pending
+   - Do not treat observation row count and AQI row count as equivalent. Do not require them to match.
+   - The AQI health check should be connector/day oriented for rebuild purposes, even if diagnostics identify individual affected timeseries.
+
+3. Queue AQI-only rebuilds
+   - Insert AQI-only candidates into aqi_rebuild_queue with:
+       reason = aqi_health_check
+       source_mode = live_r2
+       status = queued
+   - For the first implementation, use live_r2 for all AQI rebuilds. Do not implement Dropbox-backed AQI rebuild input yet.
+   - Deduplicate by (run_id, connector_id, day_utc).
+
+4. Reporting
+   - Add report counters:
+       aqi_health_connector_days_checked
+       aqi_health_rebuilds_queued
+       aqi_health_skipped_already_obs_repaired
+       aqi_health_manifest_missing
+       aqi_health_manifest_stale
+       aqi_health_manifest_empty
+       aqi_health_previous_rebuild_failed
+   - Include a deterministic list of queued AQI-only connector/days in the Markdown and JSON reports.
+
+5. Tests / verification
+   - A connector/day already queued by Phase 6.6 must be skipped by Phase 6.7.
+   - A missing AQI manifest for a connector/day not queued by Phase 6.6 should queue one AQI rebuild row.
+   - Duplicate queue attempts must not create duplicate rows.
+   - Dry-run should report candidates without mutating remote outputs.
+
+6. Docs
+   - Update the system doc to describe Phase 6.7.
+   - Explain that AQI-only issues trigger r2_history_obs_to_aqilevels, not source_to_r2.
+```
+
+---
+
+### Phase 6.8 — Deduplicated AQI rebuild execution
+
+Goal:
+
+Execute AQI rebuilds once per queued connector/day using `r2_history_obs_to_aqilevels`, after Phase 6.6 and Phase 6.7 have finished queueing all required work.
+
+Motivation:
+
+AQI rebuilds should be deduplicated across all reasons in the run. If several timeseries were observation-repaired for the same connector/day, or if both observation repair and AQI health checks identify the same connector/day, the system should run one AQI rebuild for that connector/day.
+
+For the first implementation, all AQI rebuilds should read observations from live R2. This avoids stale Dropbox reads immediately after observation repair.
+
+Design:
+
+1. Load queued rows from `aqi_rebuild_queue` for the current run where `status = queued`.
+2. Deduplicate by `(connector_id, day_utc)`.
+3. For each queued connector/day, run the existing backfill wrapper with:
+
+```bash
+UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels
+UK_AQ_BACKFILL_FORCE_REPLACE=true
+UK_AQ_BACKFILL_CONNECTOR_IDS=<connector_id>
+UK_AQ_BACKFILL_FROM_DAY_UTC=<day>
+UK_AQ_BACKFILL_TO_DAY_UTC=<day>
+```
+
+4. Use live R2 as the observation input source for all Phase 6.8 v1 rebuilds.
+5. Update queue row status:
+
+```text
+queued -> running -> complete
+queued -> running -> failed
+```
+
+6. Record start/end timestamps and failure notes.
+7. Do not fail or reverse the observation repair status if AQI rebuild fails. AQI failure should be visible as a separate repair debt.
+8. Include AQI rebuild results in the run report.
+
+Future Phase 6.8 v2:
+
+Later, AQI-only jobs may be allowed to read observations from the Dropbox R2 history backup when safe. Safety rule for PM rolling 24-hour AQI:
+
+```text
+For AQI rebuild of connector/day D, Dropbox input is safe only if:
+  connector/day D was not observation-repaired in this run
+  and connector/day D-1 was not observation-repaired in this run
+```
+
+If either day was observation-repaired in the same run, use live R2 because Dropbox may not have caught up.
+
+No implementation prompt is required for Phase 6.8 v2 yet.
+
+Prompt:
+
+```text
+Repo: uk-aq-ops.
+
+Please implement Phase 6.8 of the UK-AQ History Integrity system: deduplicated AQI rebuild execution.
+
+Use:
+docs/uk-aq-history-integrity-system-doc-v2.md
+
+Build on Phases 6.6 and 6.7.
+
+Context:
+Phase 6.6 queues AQI rebuilds after successful observation repairs. Phase 6.7 queues AQI-only rebuilds after AQI health checks. Phase 6.8 should execute the queued rebuilds once per connector/day using the existing r2_history_obs_to_aqilevels mode.
+
+Requirements:
+
+1. Queue loading and deduplication
+   - Load aqi_rebuild_queue rows for the current run where status = queued.
+   - Deduplicate by (connector_id, day_utc).
+   - If duplicate rows somehow exist, execute only one rebuild and mark/merge the duplicates safely.
+
+2. AQI rebuild execution
+   - For each queued connector/day, call the existing local backfill wrapper with:
+       UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels
+       UK_AQ_BACKFILL_FORCE_REPLACE=true
+       UK_AQ_BACKFILL_CONNECTOR_IDS=<connector_id>
+       UK_AQ_BACKFILL_FROM_DAY_UTC=<day>
+       UK_AQ_BACKFILL_TO_DAY_UTC=<day>
+   - For the first implementation, all AQI rebuilds should use live R2 as the observation input source.
+   - Do not implement Dropbox-backed AQI rebuild input yet.
+
+3. Queue status updates
+   - Before running a rebuild, update the row to:
+       status = running
+       started_at_utc = now
+   - On success:
+       status = complete
+       finished_at_utc = now
+   - On failure:
+       status = failed
+       finished_at_utc = now
+       notes = error summary
+   - A failed AQI rebuild should not rewrite the observation backfill status. Observation repair and AQI rebuild statuses must remain separate.
+
+4. Dry-run behaviour
+   - In dry-run mode, print planned r2_history_obs_to_aqilevels commands.
+   - Do not mutate R2 or AQI output.
+   - Either do not insert queue status changes, or clearly mark dry-run queue/report entries as planned only.
+
+5. Reporting
+   - Add counters:
+       aqi_rebuilds_queued_total
+       aqi_rebuilds_attempted
+       aqi_rebuilds_complete
+       aqi_rebuilds_failed
+       aqi_rebuilds_skipped
+   - Include one deterministic report row per connector/day rebuild.
+   - Include the reasons that caused the rebuild, such as obs_repaired and/or aqi_health_check.
+
+6. Recovery behaviour
+   - If a previous run left failed or pending AQI rebuilds, make it possible for a later run to report them and optionally retry them.
+   - Do not automatically retry old failed rebuilds unless an explicit option is added or the current run re-queues the same connector/day.
+
+7. Tests / verification
+   - Multiple queued reasons for the same connector/day should result in one r2_history_obs_to_aqilevels command.
+   - A failed AQI rebuild should leave observation repair status unchanged.
+   - Dry-run should print planned rebuilds without remote mutation.
+
+8. Docs
+   - Update the system doc to describe Phase 6.8.
+   - Add a note for future Phase 6.8 v2: AQI-only jobs may later read from Dropbox R2 history backup when safe, but v1 always uses live R2.
+```
+
+
+### Phase 7 — Monitoring, limits, and reports polish
 
 Goal:
 
@@ -1322,7 +2011,7 @@ Prompt:
 ```text
 Repo: uk-aq-ops.
 
-Please implement Phase 6 of the UK-AQ History Integrity system: monitoring and limits.
+Please implement Phase 7 of the UK-AQ History Integrity system: monitoring and limits.
 
 Use:
 docs/uk-aq-history-integrity-system-doc-v2.md
@@ -1348,7 +2037,7 @@ Requirements:
 - Include recommendations in the report when limits are repeatedly hit.
 ```
 
-### Phase 7 — API-based source adapters
+### Phase 8 — API-based source adapters
 
 Goal:
 
@@ -1359,7 +2048,7 @@ Prompt:
 ```text
 Repo: uk-aq-ops.
 
-Please design and implement Phase 7 of the UK-AQ History Integrity system for API-based sources.
+Please design and implement Phase 8 of the UK-AQ History Integrity system for API-based sources.
 
 Use:
 docs/uk-aq-history-integrity-system-doc-v2.md

@@ -53,6 +53,24 @@ Environment:
 USAGE
 }
 
+preflight_error() {
+  echo "ERROR preflight: $*" >&2
+}
+
+ensure_parent_writable() {
+  local target="$1"
+  local parent
+  parent="$(dirname "${target}")"
+  mkdir -p "${parent}" 2>/dev/null || {
+    preflight_error "cannot create parent directory for ${target}: ${parent}"
+    exit 3
+  }
+  if [[ ! -w "${parent}" ]]; then
+    preflight_error "parent directory is not writable for ${target}: ${parent}"
+    exit 3
+  fi
+}
+
 ENV_NAME=""
 REMAINING_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -115,17 +133,18 @@ REQUIRED_VARS=(
   UK_AQ_HISTORY_INTEGRITY_LOG_DIR
   UK_AQ_HISTORY_INTEGRITY_REPORT_DIR
   UK_AQ_HISTORY_INTEGRITY_LOCK_DIR
+  UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT
 )
 for v in "${REQUIRED_VARS[@]}"; do
   if [[ -z "${!v:-}" ]]; then
-    echo "ERROR: required env var ${v} is not set in ${ENV_FILE}" >&2
+    preflight_error "required env var ${v} is not set in ${ENV_FILE}"
     exit 3
   fi
 done
 
 # Guardrail 1: env file's declared env name must match --env.
 if [[ "${UK_AQ_ENV_NAME}" != "${ENV_NAME}" ]]; then
-  echo "ERROR: --env=${ENV_NAME} but UK_AQ_ENV_NAME=${UK_AQ_ENV_NAME} in ${ENV_FILE}. Refusing to run." >&2
+  preflight_error "--env=${ENV_NAME} but UK_AQ_ENV_NAME=${UK_AQ_ENV_NAME} in ${ENV_FILE}. Refusing to run."
   exit 4
 fi
 
@@ -136,6 +155,7 @@ else
   OTHER_ENV="LIVE"
 fi
 PATH_VARS=(
+  UK_AQ_HISTORY_INTEGRITY_ROOT
   UK_AQ_HISTORY_INTEGRITY_STATE_DIR
   UK_AQ_HISTORY_INTEGRITY_DB_PATH
   UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR
@@ -146,13 +166,15 @@ PATH_VARS=(
   UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH
   UK_AQ_R2_HISTORY_DROPBOX_ROOT
   UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT
+  UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER
+  UK_AQ_INTEGRITY_BACKFILL_WRAPPER
   UK_AQ_BACKFILL_WRAPPER
   UK_AQ_BACKFILL_ENV_FILE
 )
 for v in "${PATH_VARS[@]}"; do
   val="${!v:-}"
   if [[ -n "${val}" && "${val}" == *"/${OTHER_ENV}/"* ]]; then
-    echo "ERROR: --env=${ENV_NAME} but ${v}=${val} contains '/${OTHER_ENV}/'. Refusing to run." >&2
+    preflight_error "--env=${ENV_NAME} but ${v}=${val} contains '/${OTHER_ENV}/'. Refusing to run."
     exit 4
   fi
 done
@@ -160,7 +182,7 @@ done
 # Guardrail 3: DB path must live inside the env state dir.
 STATE_DIR_TRIMMED="${UK_AQ_HISTORY_INTEGRITY_STATE_DIR%/}"
 if [[ "${UK_AQ_HISTORY_INTEGRITY_DB_PATH}" != "${STATE_DIR_TRIMMED}/"* ]]; then
-  echo "ERROR: UK_AQ_HISTORY_INTEGRITY_DB_PATH=${UK_AQ_HISTORY_INTEGRITY_DB_PATH} is not inside UK_AQ_HISTORY_INTEGRITY_STATE_DIR=${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}. Refusing to run." >&2
+  preflight_error "UK_AQ_HISTORY_INTEGRITY_DB_PATH=${UK_AQ_HISTORY_INTEGRITY_DB_PATH} is not inside UK_AQ_HISTORY_INTEGRITY_STATE_DIR=${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}. Refusing to run."
   exit 4
 fi
 
@@ -172,6 +194,74 @@ mkdir -p \
   "${UK_AQ_HISTORY_INTEGRITY_LOG_DIR}" \
   "${UK_AQ_HISTORY_INTEGRITY_REPORT_DIR}" \
   "${UK_AQ_HISTORY_INTEGRITY_LOCK_DIR}"
+
+for dir in \
+  "${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}" \
+  "${UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR}" \
+  "${UK_AQ_HISTORY_INTEGRITY_TMP_DIR}" \
+  "${UK_AQ_HISTORY_INTEGRITY_LOG_DIR}" \
+  "${UK_AQ_HISTORY_INTEGRITY_REPORT_DIR}" \
+  "${UK_AQ_HISTORY_INTEGRITY_LOCK_DIR}"; do
+  if [[ ! -d "${dir}" ]]; then
+    preflight_error "required directory is missing after mkdir: ${dir}"
+    exit 3
+  fi
+  if [[ ! -w "${dir}" ]]; then
+    preflight_error "required directory is not writable: ${dir}"
+    exit 3
+  fi
+done
+
+if [[ "${UK_AQ_HISTORY_INTEGRITY_DB_PATH}" == *"/Dropbox/"* ]]; then
+  preflight_error "UK_AQ_HISTORY_INTEGRITY_DB_PATH must be local (non-Dropbox), got ${UK_AQ_HISTORY_INTEGRITY_DB_PATH}"
+  exit 4
+fi
+
+ensure_parent_writable "${UK_AQ_HISTORY_INTEGRITY_DB_PATH}"
+
+if [[ -n "${UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH:-}" ]]; then
+  ensure_parent_writable "${UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH}"
+  if [[ "${UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH}" == "${UK_AQ_HISTORY_INTEGRITY_DB_PATH}" ]]; then
+    preflight_error "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH must differ from UK_AQ_HISTORY_INTEGRITY_DB_PATH"
+    exit 4
+  fi
+fi
+
+RUN_BACKFILL=false
+for arg in "${REMAINING_ARGS[@]}"; do
+  if [[ "${arg}" == "--run-backfill" ]]; then
+    RUN_BACKFILL=true
+    break
+  fi
+done
+
+if [[ "${RUN_BACKFILL}" == "true" ]]; then
+  INTEGRITY_BACKFILL_WRAPPER="${UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER:-${UK_AQ_INTEGRITY_BACKFILL_WRAPPER:-}}"
+  if [[ -z "${INTEGRITY_BACKFILL_WRAPPER}" ]]; then
+    preflight_error "Backfill wrapper is required when --run-backfill is used, but neither UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER nor UK_AQ_INTEGRITY_BACKFILL_WRAPPER is set."
+    exit 3
+  fi
+  if [[ ! -f "${INTEGRITY_BACKFILL_WRAPPER}" ]]; then
+    preflight_error "integrity backfill wrapper does not exist: ${INTEGRITY_BACKFILL_WRAPPER}"
+    exit 3
+  fi
+  if [[ ! -x "${INTEGRITY_BACKFILL_WRAPPER}" ]]; then
+    preflight_error "integrity backfill wrapper is not executable: ${INTEGRITY_BACKFILL_WRAPPER}"
+    exit 3
+  fi
+  if [[ -z "${UK_AQ_BACKFILL_ENV_FILE:-}" ]]; then
+    preflight_error "UK_AQ_BACKFILL_ENV_FILE is required when --run-backfill is used, but it is not set."
+    exit 3
+  fi
+  if [[ ! -f "${UK_AQ_BACKFILL_ENV_FILE}" ]]; then
+    preflight_error "UK_AQ_BACKFILL_ENV_FILE does not exist: ${UK_AQ_BACKFILL_ENV_FILE}"
+    exit 3
+  fi
+  if [[ ! -r "${UK_AQ_BACKFILL_ENV_FILE}" ]]; then
+    preflight_error "UK_AQ_BACKFILL_ENV_FILE is not readable: ${UK_AQ_BACKFILL_ENV_FILE}"
+    exit 3
+  fi
+fi
 
 # Per-environment PID lock.
 LOCK_FILE="${UK_AQ_HISTORY_INTEGRITY_LOCK_DIR%/}/uk-aq-history-integrity.lock"
