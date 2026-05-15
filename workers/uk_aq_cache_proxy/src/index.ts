@@ -36,8 +36,6 @@ export interface Env {
   UK_AQ_TIMESERIES_R2_FIRST: unknown;
   UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE: unknown;
   UK_AQ_OBSERVS_HISTORY_R2_API_URL: unknown;
-  UK_AQ_TIMESERIES_R2_MANIFEST_URL: unknown;
-  UK_AQ_TIMESERIES_R2_INDEX_URL: unknown;
   UK_AQ_TIMESERIES_MAX_WINDOW_DAYS: unknown;
   UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST: unknown;
   UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS: unknown;
@@ -307,8 +305,6 @@ type TimeseriesV2RuntimeConfig = {
   historicalBrowserTtlSeconds: number;
   historicalSwrSeconds: number;
   staleIfErrorSeconds: number;
-  r2ManifestUrl: string;
-  r2IndexUrl: string;
 };
 
 type TimeseriesV2RequestWindow = {
@@ -1092,8 +1088,6 @@ function buildTimeseriesV2RuntimeConfig(env: Env): TimeseriesV2RuntimeConfig {
     ),
     historicalSwrSeconds: parseIntInRange(String(env.UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS ?? ""), 86400, 0, 604800),
     staleIfErrorSeconds: parseIntInRange(String(env.UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS ?? ""), 300, 0, 604800),
-    r2ManifestUrl: String(env.UK_AQ_TIMESERIES_R2_MANIFEST_URL ?? "").trim(),
-    r2IndexUrl: String(env.UK_AQ_TIMESERIES_R2_INDEX_URL ?? "").trim(),
   };
 }
 
@@ -1263,7 +1257,7 @@ function toIsoSafe(valueMs: number): string {
 
 function applySinceOverlap(sinceIso: string | null, overlapMinutes: number, lowerBoundMs: number): string | null {
   const sinceMs = parseIsoMsOrNull(sinceIso);
-  if (!Number.isFinite(sinceMs)) {
+  if (sinceMs === null || !Number.isFinite(sinceMs)) {
     return null;
   }
   const overlapMs = Math.max(0, overlapMinutes) * 60 * 1000;
