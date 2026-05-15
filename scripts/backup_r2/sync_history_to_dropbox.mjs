@@ -404,7 +404,7 @@ function checkpointDayHash(state, domain, dayUtc) {
   return String(state?.domains?.[domain]?.days?.[dayUtc]?.manifest_hash || "").trim();
 }
 
-function planDays(inventory, state, args) {
+export function planDays(inventory, state, args) {
   const plan = {};
   for (const domain of args.domains) {
     const inventoryDays = inventory?.domains?.[domain]?.days || {};
@@ -437,7 +437,7 @@ function planDays(inventory, state, args) {
   return plan;
 }
 
-function planIndexFiles(inventory, state) {
+export function planIndexFiles(inventory, state) {
   const candidates = [];
   for (const indexKey of INDEX_FILE_KEYS) {
     const invEntry = inventory?.index_files?.[indexKey];
@@ -449,7 +449,7 @@ function planIndexFiles(inventory, state) {
   return candidates;
 }
 
-function planIndexTreeUnits(inventory, state) {
+export function planIndexTreeUnits(inventory, state) {
   const candidates = [];
   for (const treeKey of INDEX_TREE_KEYS) {
     const invUnits = inventory?.index_tree_units?.[treeKey]?.units || {};

@@ -1,0 +1,143 @@
+name: UK AQ R2 Initial Build Inventory
+
+# Manual one-off (or recovery) workflow that *only* builds the R2 history backup
+# inventory at history/_index/backup_inventory_v1.json. The regular daily backup
+# workflow (uk_aq_r2_history_dropbox_backup.yml) does the same build step
+# inline before its sync step — this workflow exists for the LIVE bootstrap
+# (where the first build can take 1-2 hours) and as an emergency rebuild tool
+# if the inventory ever goes missing/invalid.
+#
+# Re-runs are near-instant: the builder loads the existing inventory and
+# etag-skips unchanged manifests. Only changed/new manifests get re-read.
+#
+# No cron, no automatic triggers. Manual workflow_dispatch only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "Ignore previous inventory; re-read every manifest from R2"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Share the same concurrency group as the daily backup so we don't race against
+# the regular sync. Both write/read the same inventory file in R2.
+concurrency:
+  group: uk-aq-r2-history-dropbox-backup
+  cancel-in-progress: false
+
+jobs:
+  build-r2-history-inventory:
+    runs-on: ubuntu-latest
+    # Generous timeout for the LIVE first build, which can take ~2h on GH
+    # runners due to per-cat latency. Steady-state re-runs finish in minutes.
+    timeout-minutes: 240
+    env:
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
+      UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
+      UK_AQ_R2_HISTORY_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_PREFIX || 'history/_index' }}
+      UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || 'history/_index/backup_inventory_v1.json' }}
+
+      INPUT_FULL_REBUILD: ${{ github.event.inputs.full_rebuild || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          required_vars=(
+            CFLARE_R2_ENDPOINT
+            CFLARE_R2_BUCKET
+            CFLARE_R2_ACCESS_KEY_ID
+            CFLARE_R2_SECRET_ACCESS_KEY
+          )
+
+          missing=0
+          for key in "${required_vars[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required value: ${key}" >&2
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Configure rclone remote
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
+        run: |
+          set -euo pipefail
+
+          endpoint="${CFLARE_R2_ENDPOINT%/}"
+
+          mkdir -p "$(dirname "${RCLONE_CONFIG}")"
+          {
+            echo "[uk_aq_r2]"
+            echo "type = s3"
+            echo "provider = Cloudflare"
+            echo "env_auth = false"
+            echo "access_key_id = ${CFLARE_R2_ACCESS_KEY_ID}"
+            echo "secret_access_key = ${CFLARE_R2_SECRET_ACCESS_KEY}"
+            echo "endpoint = ${endpoint}"
+            echo "region = ${CFLARE_R2_REGION}"
+            echo "acl = private"
+            echo "no_check_bucket = true"
+          } > "${RCLONE_CONFIG}"
+
+          chmod 600 "${RCLONE_CONFIG}"
+
+          # shellcheck disable=SC2016
+          echo "RCLONE_CONFIG=${RCLONE_CONFIG}" >> "$GITHUB_ENV"
+
+      - name: Build R2 history backup inventory
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+
+          cmd=(
+            node scripts/backup_r2/build_backup_inventory.mjs
+            --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
+            --inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}"
+            --index-prefix "${UK_AQ_R2_HISTORY_INDEX_PREFIX}"
+            --report-out "tmp/r2_backup_inventory_report.json"
+          )
+
+          if [ "${INPUT_FULL_REBUILD}" = "true" ]; then
+            cmd+=(--full-rebuild)
+          fi
+
+          echo "Running: ${cmd[*]}"
+          "${cmd[@]}"
+
+      - name: Upload inventory report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-r2-initial-build-inventory-report
+          path: tmp/r2_backup_inventory_report.json
+          if-no-files-found: ignore

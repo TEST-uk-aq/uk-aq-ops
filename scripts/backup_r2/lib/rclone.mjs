@@ -97,12 +97,17 @@ export function rcloneCat(rcloneBin, targetPath) {
 
 // Recursive lsjson for files under a remote path. Returns [] if the path does
 // not exist; throws on any other rclone error.
-export function rcloneLsjsonRecursive(rcloneBin, targetPath) {
-  const result = runRclone(
-    rcloneBin,
-    ["lsjson", targetPath, "--recursive", "--files-only"],
-    { allow_failure: true },
-  );
+//
+// `--hash --hash-type MD5` is included by default. For Cloudflare R2 (and other
+// S3-compatible backends), rclone only populates `Hashes.md5` in the lsjson
+// output when these flags are set — without them the etag is hidden, and any
+// caller relying on it for change detection silently falls back to ModTime.
+// Pass `{ hash: false }` to opt out (rare; useful only when the caller doesn't
+// need the hash and wants a marginally cheaper LIST).
+export function rcloneLsjsonRecursive(rcloneBin, targetPath, { hash = true } = {}) {
+  const args = ["lsjson", targetPath, "--recursive", "--files-only"];
+  if (hash) args.push("--hash", "--hash-type", "MD5");
+  const result = runRclone(rcloneBin, args, { allow_failure: true });
   if (result.status !== 0) {
     const combined = `${result.stderr}\n${result.stdout}`;
     if (isRcloneNotFoundMessage(combined)) {
@@ -126,12 +131,13 @@ export function rcloneLsjsonRecursive(rcloneBin, targetPath) {
 
 // Non-recursive lsjson for a single file (or its parent directory). Returns
 // the matching entry by file name, or null if the file is not present.
-export function rcloneLsjsonFile(rcloneBin, parentPath, fileName) {
-  const result = runRclone(
-    rcloneBin,
-    ["lsjson", parentPath, "--files-only", "--max-depth", "1"],
-    { allow_failure: true },
-  );
+//
+// `--hash --hash-type MD5` is included by default for the same reason as
+// `rcloneLsjsonRecursive` — see that function's comment.
+export function rcloneLsjsonFile(rcloneBin, parentPath, fileName, { hash = true } = {}) {
+  const args = ["lsjson", parentPath, "--files-only", "--max-depth", "1"];
+  if (hash) args.push("--hash", "--hash-type", "MD5");
+  const result = runRclone(rcloneBin, args, { allow_failure: true });
   if (result.status !== 0) {
     const combined = `${result.stderr}\n${result.stdout}`;
     if (isRcloneNotFoundMessage(combined)) {

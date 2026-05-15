@@ -23,7 +23,9 @@ export const INDEX_TREE_KEYS = Object.freeze([
 
 export const DEFAULT_INVENTORY_REL_PATH = "history/_index/backup_inventory_v1.json";
 
-// Load an inventory from R2.
+// Pure validator for an `rcloneCatMaybe`-shaped result. Extracted from
+// loadInventory so unit tests can exercise the validation rules without
+// shelling out to rclone.
 //
 // Modes:
 //   { strict: true }
@@ -31,25 +33,20 @@ export const DEFAULT_INVENTORY_REL_PATH = "history/_index/backup_inventory_v1.js
 //     malformed, or schema-mismatched. Used by sync — a bad inventory must
 //     fail loudly so the operator re-runs the builder.
 //
-//   { strict: false } (default)
+//   { strict: false }
 //     Return null on any unreadable state. Used by the builder when reading
 //     the *previous* inventory — the builder is replacing it anyway, so a bad
 //     existing file just means "do a full first build."
 //
-// The helpful errors include the resolved target path and an instruction to
+// The error messages include the resolved target path and an instruction to
 // re-run the builder script.
-export function loadInventory(
-  rcloneBin,
-  sourceRoot,
-  inventoryRelPath,
-  { strict = false } = {},
+export function validateInventoryPayload(
+  catResult,
+  { strict = false, targetPath = "<unknown>" } = {},
 ) {
-  const targetPath = joinTargetPath(sourceRoot, inventoryRelPath);
-  const result = rcloneCatMaybe(rcloneBin, targetPath);
-
   const buildHint = `re-run scripts/backup_r2/build_backup_inventory.mjs --source-root <root> to regenerate it`;
 
-  if (!result.found) {
+  if (!catResult || !catResult.found) {
     if (strict) {
       throw new Error(
         `Inventory not found at ${targetPath}. ${buildHint}`,
@@ -58,7 +55,7 @@ export function loadInventory(
     return null;
   }
 
-  const text = String(result.text || "").trim();
+  const text = String(catResult.text || "").trim();
   if (!text) {
     if (strict) {
       throw new Error(
@@ -108,4 +105,16 @@ export function loadInventory(
   }
 
   return parsed;
+}
+
+// Load an inventory from R2 via rclone cat, then validate it.
+export function loadInventory(
+  rcloneBin,
+  sourceRoot,
+  inventoryRelPath,
+  { strict = false } = {},
+) {
+  const targetPath = joinTargetPath(sourceRoot, inventoryRelPath);
+  const result = rcloneCatMaybe(rcloneBin, targetPath);
+  return validateInventoryPayload(result, { strict, targetPath });
 }

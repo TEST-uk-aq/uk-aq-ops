@@ -175,56 +175,56 @@ function writeReport(reportOutPath, payload) {
 // ---- Etag-skip helpers ----
 
 // Extract the bits of rclone lsjson metadata we use for skip-key building +
-// telemetry. R2 normally exposes a real MD5 in Hashes.MD5 for single-part
-// uploads (all our manifests are small). If MD5 is missing — rclone backend
-// quirks or multipart-style etags — we fall back to ModTime, which is a
-// weaker signal. The "weaker" case is reported so an operator can investigate
-// rather than silently relying on it.
+// telemetry.
+//
+// Cloudflare R2 (and other S3-compatible backends) only populates `Hashes.md5`
+// in lsjson output when called with `--hash --hash-type MD5`. Our lsjson
+// wrappers in lib/rclone.mjs do this by default. If the MD5 is still missing
+// after that, rclone's backend version or this specific object isn't exposing
+// it (e.g. multipart upload composite etag) — we fall back to Size + ModTime
+// for the skip decision, which is weaker but still detects rewrites.
 function extractLsjsonMetadata(entry) {
   if (!entry || typeof entry !== "object") {
-    return { size: null, md5: null, modtime: null, source: "missing" };
+    return { size: null, md5: null, modtime: null, has_md5: false };
   }
   const rawSize = Number(entry.Size);
   const size = Number.isFinite(rawSize) ? rawSize : null;
   const hashes = entry.Hashes || {};
-  const md5 = (hashes.MD5 || hashes.md5 || "").trim() || null;
+  const md5 = (hashes.md5 || hashes.MD5 || "").trim() || null;
   const modtime = (entry.ModTime || "").trim() || null;
-  let source;
-  if (md5 && size !== null) source = "etag_md5";
-  else if (modtime && size !== null) source = "modtime_fallback";
-  else if (size !== null) source = "size_only";
-  else source = "missing";
-  return { size, md5, modtime, source };
+  return { size, md5, modtime, has_md5: Boolean(md5) };
 }
 
-function lsjsonEtagKey(meta) {
-  if (!meta) return null;
-  const sizePart = meta.size !== null && meta.size !== undefined ? String(meta.size) : "";
-  const sigPart = meta.md5 || meta.modtime || "";
-  if (!sizePart && !sigPart) return null;
-  return `${sizePart}/${sigPart}`;
-}
-
-function previousDayEtagKey(prev) {
-  if (!prev) return null;
-  const size = Number(prev.manifest_size);
-  const md5 = (prev.r2_etag || "").trim() || null;
+// Read previous-inventory metadata for skip comparison. `r2_md5` is the only
+// MD5 source — legacy `r2_etag` fields (from inventories written before the
+// --hash fix) are intentionally ignored, since they were always null in
+// practice and there's nothing to gain by trying to bridge them.
+function previousMetadata(prev, sizeField) {
+  if (!prev) return { size: null, md5: null, modtime: null };
+  const rawSize = Number(prev[sizeField]);
+  const size = Number.isFinite(rawSize) ? rawSize : null;
+  const md5 = (prev.r2_md5 || "").trim() || null;
   const modtime = (prev.r2_modtime || "").trim() || null;
-  const sizePart = Number.isFinite(size) ? String(size) : "";
-  const sigPart = md5 || modtime || "";
-  if (!sizePart && !sigPart) return null;
-  return `${sizePart}/${sigPart}`;
+  return { size, md5, modtime };
 }
 
-function previousFileEtagKey(prev) {
-  if (!prev) return null;
-  const size = Number(prev.size);
-  const md5 = (prev.r2_etag || "").trim() || null;
-  const modtime = (prev.r2_modtime || "").trim() || null;
-  const sizePart = Number.isFinite(size) ? String(size) : "";
-  const sigPart = md5 || modtime || "";
-  if (!sizePart && !sigPart) return null;
-  return `${sizePart}/${sigPart}`;
+// Decide whether the previous inventory entry can be reused for a current
+// lsjson entry, and if so by which signal. Returns one of:
+//   "md5"      — both sides have an MD5 and they match (with size match)
+//   "modtime"  — MD5 missing on either side, but size + modtime match
+//   null       — different, or insufficient signal; current must be re-read
+function classifyReuse(currentMeta, prevMeta) {
+  if (!currentMeta || !prevMeta) return null;
+  if (currentMeta.size === null || prevMeta.size === null) return null;
+  if (currentMeta.size !== prevMeta.size) return null;
+  if (currentMeta.md5 && prevMeta.md5) {
+    return currentMeta.md5 === prevMeta.md5 ? "md5" : null;
+  }
+  if (currentMeta.modtime && prevMeta.modtime
+      && currentMeta.modtime === prevMeta.modtime) {
+    return "modtime";
+  }
+  return null;
 }
 
 // ---- Entry builders ----
@@ -247,15 +247,15 @@ function buildDayInventoryEntry({
   } catch {
     parsed = null;
   }
-  const hashes = lsjsonEntry?.Hashes || {};
+  const meta = extractLsjsonMetadata(lsjsonEntry);
   return {
     unit_type: "day_folder",
     relative_path: dayRelativePath,
     manifest_relative_path: manifestRelativePath,
     manifest_hash: sha256Hex(manifestText),
     manifest_size: Buffer.byteLength(manifestText, "utf8"),
-    r2_etag: hashes.MD5 || hashes.md5 || null,
-    r2_modtime: lsjsonEntry?.ModTime || null,
+    r2_md5: meta.md5,
+    r2_modtime: meta.modtime,
     file_count: safeIntOrNull(parsed?.file_count),
     total_bytes: safeIntOrNull(parsed?.total_bytes),
     source_row_count: safeIntOrNull(parsed?.source_row_count),
@@ -263,22 +263,26 @@ function buildDayInventoryEntry({
 }
 
 function buildFileInventoryEntry({ relativePath, fileText, lsjsonEntry }) {
-  const hashes = lsjsonEntry?.Hashes || {};
+  const meta = extractLsjsonMetadata(lsjsonEntry);
   return {
     unit_type: "file",
     relative_path: relativePath,
     hash: sha256Hex(fileText),
     size: Buffer.byteLength(fileText, "utf8"),
-    r2_etag: hashes.MD5 || hashes.md5 || null,
-    r2_modtime: lsjsonEntry?.ModTime || null,
+    r2_md5: meta.md5,
+    r2_modtime: meta.modtime,
   };
 }
 
-function recordMetadataSource(stats, source) {
-  if (source === "etag_md5") stats.metadata.etag_md5 += 1;
-  else if (source === "modtime_fallback") stats.metadata.modtime_fallback += 1;
-  else if (source === "size_only") stats.metadata.size_only += 1;
-  else stats.metadata.missing += 1;
+
+function recordMd5Availability(stats, hasMd5) {
+  if (hasMd5) stats.md5_available_count += 1;
+  else stats.md5_missing_count += 1;
+}
+
+function recordReuseOutcome(stats, classification) {
+  if (classification === "md5") stats.reuse_by_md5_size += 1;
+  else if (classification === "modtime") stats.reuse_by_size_modtime += 1;
 }
 
 // ---- Phase: per-domain day folders ----
@@ -305,21 +309,18 @@ function scanDayDomain({
     const dayUtc = match[1];
     stats.manifests_listed += 1;
 
-    const meta = extractLsjsonMetadata(entry);
-    recordMetadataSource(stats, meta.source);
+    const currentMeta = extractLsjsonMetadata(entry);
+    recordMd5Availability(stats, currentMeta.has_md5);
     const previousEntry = previousDays?.[dayUtc] || null;
-    const lsEtag = lsjsonEtagKey(meta);
-    const prevEtag = previousDayEtagKey(previousEntry);
+    const prevMeta = previousMetadata(previousEntry, "manifest_size");
+    const reuseClass = previousEntry && previousEntry.manifest_hash
+      ? classifyReuse(currentMeta, prevMeta)
+      : null;
 
-    if (
-      previousEntry
-      && lsEtag
-      && prevEtag
-      && lsEtag === prevEtag
-      && previousEntry.manifest_hash
-    ) {
+    if (reuseClass) {
       days[dayUtc] = { ...previousEntry };
       stats.etag_skip_hits += 1;
+      recordReuseOutcome(stats, reuseClass);
       continue;
     }
 
@@ -361,19 +362,16 @@ function scanIndexFile({
   }
   stats.index_files_listed += 1;
 
-  const meta = extractLsjsonMetadata(lsjsonEntry);
-  recordMetadataSource(stats, meta.source);
-  const lsEtag = lsjsonEtagKey(meta);
-  const prevEtag = previousFileEtagKey(previousEntry);
+  const currentMeta = extractLsjsonMetadata(lsjsonEntry);
+  recordMd5Availability(stats, currentMeta.has_md5);
+  const prevMeta = previousMetadata(previousEntry, "size");
+  const reuseClass = previousEntry && previousEntry.hash
+    ? classifyReuse(currentMeta, prevMeta)
+    : null;
 
-  if (
-    previousEntry
-    && lsEtag
-    && prevEtag
-    && lsEtag === prevEtag
-    && previousEntry.hash
-  ) {
+  if (reuseClass) {
     stats.index_files_skipped += 1;
+    recordReuseOutcome(stats, reuseClass);
     return { ...previousEntry };
   }
 
@@ -406,21 +404,18 @@ function scanIndexTree({
     if (excludeRelativePaths.has(unitRelativePath)) continue;
     stats.index_tree_units_listed += 1;
 
-    const meta = extractLsjsonMetadata(entry);
-    recordMetadataSource(stats, meta.source);
+    const currentMeta = extractLsjsonMetadata(entry);
+    recordMd5Availability(stats, currentMeta.has_md5);
     const previousEntry = previousUnits?.[relPath] || null;
-    const lsEtag = lsjsonEtagKey(meta);
-    const prevEtag = previousFileEtagKey(previousEntry);
+    const prevMeta = previousMetadata(previousEntry, "size");
+    const reuseClass = previousEntry && previousEntry.hash
+      ? classifyReuse(currentMeta, prevMeta)
+      : null;
 
-    if (
-      previousEntry
-      && lsEtag
-      && prevEtag
-      && lsEtag === prevEtag
-      && previousEntry.hash
-    ) {
+    if (reuseClass) {
       units[relPath] = { ...previousEntry };
       stats.index_tree_units_skipped += 1;
+      recordReuseOutcome(stats, reuseClass);
       continue;
     }
 
@@ -526,16 +521,18 @@ async function main() {
     index_tree_units_listed: 0,
     index_tree_units_reread: 0,
     index_tree_units_skipped: 0,
-    // R2 LIST metadata source breakdown across every entry the etag-skip
-    // decision was made for. If modtime_fallback / size_only / missing are
-    // non-zero, the rclone backend or R2 isn't exposing a usable MD5 for
-    // some objects and skip decisions degrade to a weaker signal.
-    metadata: {
-      etag_md5: 0,
-      modtime_fallback: 0,
-      size_only: 0,
-      missing: 0,
-    },
+    // MD5 availability per lsjson entry. md5_missing_count > 0 means rclone
+    // didn't return a Hashes.md5 for some objects (despite --hash --hash-type
+    // MD5) — could be multipart-style etags or a backend version quirk.
+    md5_available_count: 0,
+    md5_missing_count: 0,
+    // Reuse outcomes split by the signal used to decide reuse. The first is
+    // the strong path (Size + MD5); the second is the weaker fallback that
+    // kicks in only when MD5 is missing on either side. A high
+    // reuse_by_size_modtime suggests either rclone isn't being called with
+    // --hash or R2 isn't exposing MD5 for those objects.
+    reuse_by_md5_size: 0,
+    reuse_by_size_modtime: 0,
     elapsed_ms: {},
   };
 
@@ -628,26 +625,15 @@ async function main() {
   const totalReread = stats.manifests_reread;
   const etagSkipRate = totalLs > 0 ? (totalLs - totalReread) / totalLs : null;
 
-  const meta = stats.metadata;
-  const totalMetaEntries =
-    meta.etag_md5 + meta.modtime_fallback + meta.size_only + meta.missing;
-  const etagMetadataAvailable =
-    totalMetaEntries > 0 && meta.modtime_fallback === 0
-      && meta.size_only === 0 && meta.missing === 0;
+  const md5Available = stats.md5_available_count > 0
+    && stats.md5_missing_count === 0;
   const metadataWarnings = [];
-  if (meta.modtime_fallback > 0) {
+  if (stats.md5_missing_count > 0) {
     metadataWarnings.push(
-      `${meta.modtime_fallback} entries had no MD5 etag — fell back to ModTime+Size (weaker change signal)`,
-    );
-  }
-  if (meta.size_only > 0) {
-    metadataWarnings.push(
-      `${meta.size_only} entries had only Size — etag-skip degraded`,
-    );
-  }
-  if (meta.missing > 0) {
-    metadataWarnings.push(
-      `${meta.missing} entries had no usable LIST metadata — always re-read`,
+      `${stats.md5_missing_count} entries had no Hashes.md5 from rclone lsjson — `
+      + `skip decisions for those entries fall back to Size + ModTime (weaker). `
+      + `Confirm rclone is being called with --hash --hash-type MD5 and that R2 is `
+      + `exposing the etag for these objects.`,
     );
   }
 
@@ -672,8 +658,11 @@ async function main() {
     index_tree_units_listed: stats.index_tree_units_listed,
     index_tree_units_reread: stats.index_tree_units_reread,
     index_tree_units_skipped: stats.index_tree_units_skipped,
-    etag_metadata_available: etagMetadataAvailable,
-    metadata_source_counts: meta,
+    md5_available_count: stats.md5_available_count,
+    md5_missing_count: stats.md5_missing_count,
+    reuse_by_md5_size: stats.reuse_by_md5_size,
+    reuse_by_size_modtime: stats.reuse_by_size_modtime,
+    md5_metadata_available: md5Available,
     metadata_warnings: metadataWarnings,
     elapsed_ms: stats.elapsed_ms,
     summary: inventory.summary,

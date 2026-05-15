@@ -1,0 +1,300 @@
+// Minimal tests for the R2 history Dropbox backup inventory plumbing.
+//
+// Scope (per the plan):
+// - planDays: unchanged day not queued
+// - planDays: changed old day queued
+// - planDays: new day queued
+// - validateInventoryPayload: missing inventory fails loudly in strict mode
+
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  planDays,
+  planIndexFiles,
+  planIndexTreeUnits,
+} from "../scripts/backup_r2/sync_history_to_dropbox.mjs";
+import {
+  INVENTORY_KIND,
+  INVENTORY_SCHEMA_VERSION,
+  validateInventoryPayload,
+} from "../scripts/backup_r2/lib/inventory.mjs";
+
+function makeInventory({ days = {}, indexFiles = {}, indexTreeUnits = {} } = {}) {
+  const tree = {
+    observations_timeseries: { units: {} },
+    aqilevels_timeseries: { units: {} },
+  };
+  for (const [key, units] of Object.entries(indexTreeUnits)) {
+    tree[key] = { units };
+  }
+  return {
+    version: INVENTORY_SCHEMA_VERSION,
+    kind: INVENTORY_KIND,
+    generated_at: "2026-05-15T00:00:00.000Z",
+    source: { index_prefix: "history/_index", domain_prefixes: {} },
+    domains: {
+      observations: { days: days.observations || {} },
+      aqilevels: { days: days.aqilevels || {} },
+      core: { days: days.core || {} },
+    },
+    index_files: indexFiles,
+    index_tree_units: tree,
+    summary: {},
+  };
+}
+
+function makeCheckpoint({ days = {}, indexFiles = {}, indexTreeUnits = {} } = {}) {
+  const buildDomain = (dayMap) => ({
+    days: dayMap,
+    last_successful_day_utc: null,
+    last_successful_copy_at: null,
+  });
+  const tree = {
+    observations_timeseries: { units: {} },
+    aqilevels_timeseries: { units: {} },
+  };
+  for (const [key, units] of Object.entries(indexTreeUnits)) {
+    tree[key] = { units };
+  }
+  return {
+    version: 1,
+    created_at: "2026-05-15T00:00:00.000Z",
+    updated_at: "2026-05-15T00:00:00.000Z",
+    domains: {
+      observations: buildDomain(days.observations || {}),
+      aqilevels: buildDomain(days.aqilevels || {}),
+      core: buildDomain(days.core || {}),
+    },
+    index_files: indexFiles,
+    index_tree_units: tree,
+  };
+}
+
+function obsDayInventoryEntry(dayUtc, hash) {
+  return {
+    unit_type: "day_folder",
+    relative_path: `history/v1/observations/day_utc=${dayUtc}`,
+    manifest_relative_path: `history/v1/observations/day_utc=${dayUtc}/manifest.json`,
+    manifest_hash: hash,
+    manifest_size: 1234,
+  };
+}
+
+function obsDayCheckpointEntry(dayUtc, hash) {
+  return {
+    manifest_key: `history/v1/observations/day_utc=${dayUtc}/manifest.json`,
+    copied_at: "2026-05-14T00:00:00.000Z",
+    manifest_hash: hash,
+  };
+}
+
+const SYNC_ARGS = {
+  domains: ["observations", "aqilevels", "core"],
+  max_days_per_run: 0,
+};
+
+// ----- planDays -----
+
+test("planDays: unchanged day is skipped, not queued", () => {
+  const inventory = makeInventory({
+    days: { observations: { "2026-05-10": obsDayInventoryEntry("2026-05-10", "hashA") } },
+  });
+  const state = makeCheckpoint({
+    days: { observations: { "2026-05-10": obsDayCheckpointEntry("2026-05-10", "hashA") } },
+  });
+
+  const plan = planDays(inventory, state, SYNC_ARGS);
+
+  assert.equal(plan.observations.listed_days, 1);
+  assert.equal(plan.observations.candidate_days, 0);
+  assert.equal(plan.observations.skipped_unchanged, 1);
+  assert.deepEqual(plan.observations.candidates, []);
+});
+
+test("planDays: changed old day is queued", () => {
+  const inventory = makeInventory({
+    days: { observations: { "2026-05-10": obsDayInventoryEntry("2026-05-10", "newHash") } },
+  });
+  const state = makeCheckpoint({
+    days: { observations: { "2026-05-10": obsDayCheckpointEntry("2026-05-10", "oldHash") } },
+  });
+
+  const plan = planDays(inventory, state, SYNC_ARGS);
+
+  assert.equal(plan.observations.candidate_days, 1);
+  assert.equal(plan.observations.skipped_unchanged, 0);
+  assert.equal(plan.observations.candidates[0].day_utc, "2026-05-10");
+  assert.equal(plan.observations.candidates[0].inventory_entry.manifest_hash, "newHash");
+});
+
+test("planDays: new day (not in checkpoint) is queued", () => {
+  const inventory = makeInventory({
+    days: { observations: { "2026-05-11": obsDayInventoryEntry("2026-05-11", "freshHash") } },
+  });
+  const state = makeCheckpoint({}); // empty checkpoint — first run
+
+  const plan = planDays(inventory, state, SYNC_ARGS);
+
+  assert.equal(plan.observations.candidate_days, 1);
+  assert.equal(plan.observations.skipped_unchanged, 0);
+  assert.equal(plan.observations.candidates[0].day_utc, "2026-05-11");
+  assert.equal(plan.observations.candidates[0].inventory_entry.manifest_hash, "freshHash");
+});
+
+test("planDays: max_days_per_run throttles candidates per domain", () => {
+  const inventory = makeInventory({
+    days: {
+      observations: {
+        "2026-05-10": obsDayInventoryEntry("2026-05-10", "h1"),
+        "2026-05-11": obsDayInventoryEntry("2026-05-11", "h2"),
+        "2026-05-12": obsDayInventoryEntry("2026-05-12", "h3"),
+      },
+    },
+  });
+  const state = makeCheckpoint({}); // all three days new
+
+  const plan = planDays(inventory, state, { ...SYNC_ARGS, max_days_per_run: 2 });
+
+  assert.equal(plan.observations.candidate_days, 2);
+  assert.equal(plan.observations.skipped_by_limit, 1);
+});
+
+// ----- planIndexFiles / planIndexTreeUnits -----
+
+test("planIndexFiles: unchanged file skipped, changed file queued", () => {
+  const inventory = makeInventory({
+    indexFiles: {
+      observations_latest: {
+        unit_type: "file",
+        relative_path: "history/_index/observations_latest.json",
+        hash: "hashA",
+        size: 100,
+      },
+      aqilevels_latest: {
+        unit_type: "file",
+        relative_path: "history/_index/aqilevels_latest.json",
+        hash: "hashB-new",
+        size: 100,
+      },
+    },
+  });
+  const state = makeCheckpoint({
+    indexFiles: {
+      observations_latest: { hash: "hashA", relative_path: "history/_index/observations_latest.json", size: 100, copied_at: "" },
+      aqilevels_latest: { hash: "hashB-old", relative_path: "history/_index/aqilevels_latest.json", size: 100, copied_at: "" },
+    },
+  });
+
+  const candidates = planIndexFiles(inventory, state);
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].index_key, "aqilevels_latest");
+});
+
+test("planIndexTreeUnits: unchanged unit skipped, changed unit queued", () => {
+  const inventory = makeInventory({
+    indexTreeUnits: {
+      observations_timeseries: {
+        "day_utc=2026-05-10/connector_id=6/manifest.json": {
+          unit_type: "file",
+          relative_path: "history/_index/observations_timeseries/day_utc=2026-05-10/connector_id=6/manifest.json",
+          hash: "treeHashSame",
+          size: 50,
+        },
+        "day_utc=2026-05-10/connector_id=7/manifest.json": {
+          unit_type: "file",
+          relative_path: "history/_index/observations_timeseries/day_utc=2026-05-10/connector_id=7/manifest.json",
+          hash: "treeHashChanged-new",
+          size: 50,
+        },
+      },
+    },
+  });
+  const state = makeCheckpoint({
+    indexTreeUnits: {
+      observations_timeseries: {
+        "day_utc=2026-05-10/connector_id=6/manifest.json": { hash: "treeHashSame", relative_path: "...", size: 50, copied_at: "" },
+        "day_utc=2026-05-10/connector_id=7/manifest.json": { hash: "treeHashChanged-old", relative_path: "...", size: 50, copied_at: "" },
+      },
+    },
+  });
+
+  const candidates = planIndexTreeUnits(inventory, state);
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].tree_key, "observations_timeseries");
+  assert.equal(candidates[0].unit_key, "day_utc=2026-05-10/connector_id=7/manifest.json");
+});
+
+// ----- validateInventoryPayload -----
+
+test("validateInventoryPayload: missing inventory throws actionable error in strict mode", () => {
+  assert.throws(
+    () =>
+      validateInventoryPayload(
+        { found: false, text: "" },
+        { strict: true, targetPath: "uk_aq_r2:bucket/history/_index/backup_inventory_v1.json" },
+      ),
+    (err) => {
+      assert.match(err.message, /Inventory not found at uk_aq_r2:bucket\/history\/_index\/backup_inventory_v1\.json/);
+      assert.match(err.message, /re-run scripts\/backup_r2\/build_backup_inventory\.mjs/);
+      return true;
+    },
+  );
+});
+
+test("validateInventoryPayload: missing inventory returns null in permissive mode", () => {
+  const result = validateInventoryPayload(
+    { found: false, text: "" },
+    { strict: false, targetPath: "..." },
+  );
+  assert.equal(result, null);
+});
+
+test("validateInventoryPayload: empty inventory throws zero-bytes error in strict mode", () => {
+  assert.throws(
+    () =>
+      validateInventoryPayload(
+        { found: true, text: "" },
+        { strict: true, targetPath: "remote:path" },
+      ),
+    /empty \(zero bytes\)/,
+  );
+});
+
+test("validateInventoryPayload: wrong kind throws actionable error in strict mode", () => {
+  assert.throws(
+    () =>
+      validateInventoryPayload(
+        { found: true, text: JSON.stringify({ kind: "something-else", version: 1 }) },
+        { strict: true, targetPath: "remote:path" },
+      ),
+    /unexpected kind/,
+  );
+});
+
+test("validateInventoryPayload: wrong version throws actionable error in strict mode", () => {
+  assert.throws(
+    () =>
+      validateInventoryPayload(
+        { found: true, text: JSON.stringify({ kind: INVENTORY_KIND, version: 99 }) },
+        { strict: true, targetPath: "remote:path" },
+      ),
+    /version=99/,
+  );
+});
+
+test("validateInventoryPayload: returns parsed object for a valid inventory", () => {
+  const payload = {
+    kind: INVENTORY_KIND,
+    version: INVENTORY_SCHEMA_VERSION,
+    domains: { observations: { days: {} } },
+  };
+  const result = validateInventoryPayload(
+    { found: true, text: JSON.stringify(payload) },
+    { strict: true, targetPath: "remote:path" },
+  );
+  assert.equal(result.kind, INVENTORY_KIND);
+  assert.equal(result.version, INVENTORY_SCHEMA_VERSION);
+});
