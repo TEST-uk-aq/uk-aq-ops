@@ -273,6 +273,10 @@ type ObsHistoryFileEntry = {
   max_observed_at?: string | null;
   min_timestamp_hour_utc?: string | null;
   max_timestamp_hour_utc?: string | null;
+  // Internal-only: per-part counts used to compute the connector-level
+  // top-level `timeseries_row_counts` aggregate. Stripped from the
+  // serialized manifest by stripTimeseriesCountsFromFileEntries.
+  timeseries_row_counts?: Record<string, number> | null;
 };
 
 type ObsConnectorManifest = {
@@ -2049,6 +2053,31 @@ function averageNumber(total: number, count: number): number | null {
   return total / count;
 }
 
+function aggregateTimeseriesRowCounts(
+  entries: Array<{ timeseries_row_counts?: Record<string, number> | null | undefined }>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const entry of entries) {
+    const counts = entry?.timeseries_row_counts;
+    if (!counts || typeof counts !== "object") continue;
+    for (const [key, value] of Object.entries(counts)) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric) || numeric < 0) continue;
+      out[key] = (out[key] || 0) + Math.trunc(numeric);
+    }
+  }
+  return out;
+}
+
+function stripTimeseriesCountsFromFileEntries(
+  entries: ObsHistoryFileEntry[],
+): ObsHistoryFileEntry[] {
+  return entries.map((entry) => {
+    const { timeseries_row_counts: _ignored, ...rest } = entry;
+    return rest;
+  });
+}
+
 function statsFromFileEntries(
   fileEntries: ObsHistoryFileEntry[],
   totalRows: number,
@@ -2087,11 +2116,13 @@ function summarizeObservationPartRows(
   max_timeseries_id: number | null;
   min_observed_at: string | null;
   max_observed_at: string | null;
+  timeseries_row_counts: Record<string, number>;
 } {
   let minTimeseriesId: number | null = null;
   let maxTimeseriesId: number | null = null;
   let minObservedAt: string | null = null;
   let maxObservedAt: string | null = null;
+  const timeseriesRowCounts: Record<string, number> = {};
 
   for (const row of rows) {
     const timeseriesId = Number(row.timeseries_id);
@@ -2103,6 +2134,8 @@ function summarizeObservationPartRows(
       if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
         maxTimeseriesId = normalizedTimeseriesId;
       }
+      const key = String(normalizedTimeseriesId);
+      timeseriesRowCounts[key] = (timeseriesRowCounts[key] || 0) + 1;
     }
 
     const observedAt = typeof row.observed_at === "string" ? row.observed_at : null;
@@ -2121,6 +2154,7 @@ function summarizeObservationPartRows(
     max_timeseries_id: maxTimeseriesId,
     min_observed_at: minObservedAt,
     max_observed_at: maxObservedAt,
+    timeseries_row_counts: timeseriesRowCounts,
   };
 }
 
@@ -2199,12 +2233,14 @@ function createObsConnectorManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }): ObsConnectorManifest & { [key: string]: unknown } {
-  const parquetObjectKeys = args.fileEntries.map((entry) => entry.key);
-  const totalBytes = args.fileEntries.reduce(
+  const manifestFileEntries = stripTimeseriesCountsFromFileEntries(args.fileEntries);
+  const parquetObjectKeys = manifestFileEntries.map((entry) => entry.key);
+  const totalBytes = manifestFileEntries.reduce(
     (sum, entry) => sum + Number(entry.bytes || 0),
     0,
   );
-  const stats = statsFromFileEntries(args.fileEntries, args.sourceRowCount);
+  const stats = statsFromFileEntries(manifestFileEntries, args.sourceRowCount);
+  const timeseriesRowCounts = aggregateTimeseriesRowCounts(args.fileEntries);
 
   return withManifestHash({
     day_utc: args.dayUtc,
@@ -2215,15 +2251,16 @@ function createObsConnectorManifest(args: {
     min_observed_at: args.minObservedAt,
     max_observed_at: args.maxObservedAt,
     parquet_object_keys: parquetObjectKeys,
-    file_count: args.fileEntries.length,
+    file_count: manifestFileEntries.length,
     total_bytes: totalBytes,
-    files: args.fileEntries,
+    files: manifestFileEntries,
     history_schema_name: HISTORY_OBSERVATIONS_SCHEMA_NAME,
     history_schema_version: HISTORY_OBSERVATIONS_SCHEMA_VERSION,
     columns: HISTORY_OBSERVATIONS_COLUMNS,
     writer_version: HISTORY_OBSERVATIONS_WRITER_VERSION,
     writer_git_sha: args.writerGitSha,
     ...stats,
+    timeseries_row_counts: timeseriesRowCounts,
     backed_up_at_utc: args.backedUpAtUtc,
   });
 }
@@ -2292,6 +2329,10 @@ function createObsDayManifest(args: {
     totalRows,
   );
 
+  const timeseriesRowCounts = aggregateTimeseriesRowCounts(
+    args.connectorManifests as Array<{ timeseries_row_counts?: Record<string, number> | null }>,
+  );
+
   return withManifestHash({
     day_utc: args.dayUtc,
     connector_id: null,
@@ -2304,6 +2345,7 @@ function createObsDayManifest(args: {
     file_count: files.length,
     total_bytes: totalBytes,
     files,
+    timeseries_row_counts: timeseriesRowCounts,
     connector_manifests: args.connectorManifests.map((manifest) => ({
       connector_id: manifest.connector_id,
       manifest_key: manifest.manifest_key,
@@ -2833,6 +2875,7 @@ async function exportObsConnectorDayToR2(args: {
       max_timeseries_id: partSummary.max_timeseries_id,
       min_observed_at: partSummary.min_observed_at,
       max_observed_at: partSummary.max_observed_at,
+      timeseries_row_counts: partSummary.timeseries_row_counts,
     });
     partIndex += 1;
   };
