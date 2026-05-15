@@ -1854,6 +1854,83 @@ def _planned_backfill_command(
 BACKFILL_DEFAULT_TIMEOUT_SECONDS = 1800
 BACKFILL_OUTPUT_TAIL_BYTES = 4096
 
+# Optional cap on timeseries IDs sent to the backfill wrapper in one subprocess
+# call. 0 (or unset) = no chunking, send the full union in a single call (legacy
+# behaviour). When set to N>0, large lists are sliced into chunks of <=N and each
+# chunk gets its own subprocess + 30-min budget. Useful for large daily batches
+# (e.g. weekly/monthly runs with many mismatches) that would otherwise hit the
+# per-call timeout.
+_CHUNK_ENV_VAR = "UK_AQ_HISTORY_INTEGRITY_MAX_TIMESERIES_IDS_PER_BACKFILL"
+
+# Status precedence for combining per-chunk results into one per-event row.
+# Worst status wins so a single failed chunk surfaces as a failed backfill on
+# every event that contained any of its timeseries IDs.
+_BACKFILL_STATUS_RANK = {
+    "ok": 0,
+    "no_timeseries_ids": 1,
+    "error": 2,
+    "timeout": 3,
+    "spawn_error": 4,
+    "no_wrapper": 5,
+    "no_env_file": 5,
+}
+
+
+def _chunk_timeseries_ids(ids: list[int]) -> list[list[int]]:
+    """Slice timeseries IDs into chunks of at most _CHUNK_ENV_VAR each.
+
+    Returns [list(ids)] (a single chunk) when the env var is unset, '0', or
+    invalid — preserving the legacy single-call behaviour. Otherwise splits in
+    order so callers can map each chunk back to its source events by intersecting
+    timeseries-ID sets.
+    """
+    raw = (os.environ.get(_CHUNK_ENV_VAR) or "").strip()
+    try:
+        max_per = int(raw)
+    except (TypeError, ValueError):
+        max_per = 0
+    if max_per <= 0 or len(ids) <= max_per:
+        return [list(ids)]
+    return [list(ids[i:i + max_per]) for i in range(0, len(ids), max_per)]
+
+
+def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reduce per-chunk backfill results to a single dict suitable for
+    `_record_backfill_on_event`.
+
+    - status: worst across chunks (per _BACKFILL_STATUS_RANK)
+    - exit_code: from the worst-ranked chunk (deterministic) or last if all ok
+    - duration_seconds: sum across chunks
+    - log_path / error: '; '-joined non-empty values
+    - stdout_tail / stderr_tail: from the worst-ranked chunk (most useful for diagnosis)
+    """
+    if not results:
+        return {"status": "no_timeseries_ids", "exit_code": None, "duration_seconds": 0.0,
+                "wrapper_path": None, "env_file_path": None, "stdout_tail": "",
+                "stderr_tail": "", "log_path": None, "error": None}
+    if len(results) == 1:
+        return results[0]
+    ranked = sorted(
+        results,
+        key=lambda r: _BACKFILL_STATUS_RANK.get(r.get("status") or "", 99),
+        reverse=True,
+    )
+    worst = ranked[0]
+    log_paths = [str(r["log_path"]) for r in results if r.get("log_path")]
+    errors = [str(r["error"]) for r in results if r.get("error")]
+    return {
+        "status": worst.get("status"),
+        "exit_code": worst.get("exit_code") if worst.get("status") != "ok"
+                     else results[-1].get("exit_code"),
+        "duration_seconds": sum(float(r.get("duration_seconds") or 0) for r in results),
+        "wrapper_path": results[-1].get("wrapper_path"),
+        "env_file_path": results[-1].get("env_file_path"),
+        "stdout_tail": worst.get("stdout_tail", "") or "",
+        "stderr_tail": worst.get("stderr_tail", "") or "",
+        "log_path": "; ".join(log_paths) if log_paths else None,
+        "error": "; ".join(errors) if errors else None,
+    }
+
 
 def _load_env_file(path: Path) -> dict[str, str]:
     """Parse a bash-style KEY=VALUE env file. Strips matching surrounding
@@ -2206,12 +2283,18 @@ def check_openaq(
         "days": 0,
         "head_checked": 0,
         "downloaded": 0,
+        "first_seen": 0,
         "changed": 0,
         "unchanged_after_download": 0,
         "missing": 0,
         "errors": 0,
         "downloaded_bytes": 0,
-        "changed_files": [],   # list of {location_id, day, event_id, timeseries_ids}
+        # first_seen_files: baselined this run (new to integrity DB). Not backfilled
+        # directly — cross-check phase will repair if R2 actually disagrees.
+        "first_seen_files": [],
+        # changed_files: metadata diverged from prior baseline (changed or reappeared).
+        # These are the source-driven backfill candidates.
+        "changed_files": [],
         "planned_backfills": [],
         "backfills_attempted": 0,
         "backfills_ok": 0,
@@ -2327,7 +2410,20 @@ def check_openaq(
             if outcome == "unchanged_content":
                 metrics["downloaded"] += 1
                 metrics["unchanged_after_download"] += 1
-            if outcome in {"changed", "first_seen", "reappeared"}:
+            if outcome == "first_seen":
+                # Baseline: record metadata/hash/counts but do not drive backfill.
+                # Cross-check phase remains the single source of truth for whether
+                # R2 actually needs repair for these files.
+                metrics["downloaded"] += 1
+                metrics["first_seen"] += 1
+                metrics["first_seen_files"].append({
+                    "location_id": result["location_id"],
+                    "day": result["day"],
+                    "event_id": result["event_id"],
+                    "event_type": result["event_type"],
+                    "timeseries_ids": result["timeseries_ids"],
+                })
+            elif outcome in {"changed", "reappeared"}:
                 metrics["downloaded"] += 1
                 metrics["changed"] += 1
                 metrics["changed_files"].append({
@@ -2366,6 +2462,7 @@ def check_openaq(
     progress.finish()
 
     # Sort for deterministic reports (completion order is non-deterministic).
+    metrics["first_seen_files"].sort(key=lambda e: (e["day"], e["location_id"]))
     metrics["changed_files"].sort(key=lambda e: (e["day"], e["location_id"]))
     metrics["planned_backfills"].sort()
 
@@ -2400,36 +2497,56 @@ def check_openaq(
                 break
             group = by_day[day_iso]
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
+            chunks = _chunk_timeseries_ids(union_ids)
             log.info(
-                "backfill batch day=%s files=%s total_timeseries_ids=%s",
-                day_iso, len(group), len(union_ids),
+                "backfill batch day=%s files=%s total_timeseries_ids=%s chunks=%s",
+                day_iso, len(group), len(union_ids), len(chunks),
             )
-            bf = run_narrow_backfill(
-                wrapper_path=resolve_integrity_backfill_wrapper(),
-                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                env_name=env_name,
-                timeseries_ids=union_ids,
-                day=dt.date.fromisoformat(day_iso),
-                log=log,
-                log_dir=backfill_log_dir,
-                log_label=f"day_{day_iso}",
-            )
+            event_chunk_results: dict[int, list[dict[str, Any]]] = {}
+            for chunk_index, chunk_ids in enumerate(chunks, start=1):
+                chunk_label = (
+                    f"day_{day_iso}" if len(chunks) == 1
+                    else f"day_{day_iso}_chunk_{chunk_index}_of_{len(chunks)}"
+                )
+                chunk_id_set = set(chunk_ids)
+                bf = run_narrow_backfill(
+                    wrapper_path=resolve_integrity_backfill_wrapper(),
+                    env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                    env_name=env_name,
+                    timeseries_ids=chunk_ids,
+                    day=dt.date.fromisoformat(day_iso),
+                    log=log,
+                    log_dir=backfill_log_dir,
+                    log_label=chunk_label,
+                )
+                metrics["backfills_attempted"] += 1
+                if bf["status"] == "ok":
+                    metrics["backfills_ok"] += 1
+                else:
+                    metrics["backfills_failed"] += 1
+                for entry in group:
+                    eid = entry.get("event_id")
+                    if not eid:
+                        continue
+                    if any(t in chunk_id_set for t in entry["timeseries_ids"]):
+                        event_chunk_results.setdefault(int(eid), []).append(bf)
             for entry in group:
-                if entry.get("event_id"):
-                    _record_backfill_on_event(
-                        conn, int(entry["event_id"]),
-                        entry["timeseries_ids"], bf,
-                        batch_info={
-                            "files": len(group),
-                            "total_timeseries_ids": len(union_ids),
-                        },
-                    )
+                eid = entry.get("event_id")
+                if not eid:
+                    continue
+                chunk_bfs = event_chunk_results.get(int(eid), [])
+                if not chunk_bfs:
+                    continue
+                _record_backfill_on_event(
+                    conn, int(eid),
+                    entry["timeseries_ids"],
+                    _combine_backfill_results(chunk_bfs),
+                    batch_info={
+                        "files": len(group),
+                        "total_timeseries_ids": len(union_ids),
+                    },
+                )
             conn.commit()
-            metrics["backfills_attempted"] += 1
-            if bf["status"] == "ok":
-                metrics["backfills_ok"] += 1
-            else:
-                metrics["backfills_failed"] += 1
             done_backfill_days += 1
             backfill_progress.update(
                 (
@@ -2450,7 +2567,7 @@ def check_openaq(
         )
         backfill_progress.finish()
 
-    log.info("openaq: done %s", {k: v for k, v in metrics.items() if k not in ("changed_files", "planned_backfills", "sample_urls")})
+    log.info("openaq: done %s", {k: v for k, v in metrics.items() if k not in ("first_seen_files", "changed_files", "planned_backfills", "sample_urls")})
     return metrics
 
 
@@ -2873,11 +2990,15 @@ def check_sensor_community(
         "index_fetched": 0,
         "head_checked": 0,
         "downloaded": 0,
+        "first_seen": 0,
         "changed": 0,
         "unchanged_after_download": 0,
         "missing": 0,
         "errors": 0,
         "downloaded_bytes": 0,
+        # first_seen_files: baselined this run; not backfilled directly.
+        "first_seen_files": [],
+        # changed_files: metadata diverged from baseline (changed or reappeared).
         "changed_files": [],
         "planned_backfills": [],
         "backfills_attempted": 0,
@@ -3006,7 +3127,18 @@ def check_sensor_community(
             if outcome == "unchanged_content":
                 metrics["downloaded"] += 1
                 metrics["unchanged_after_download"] += 1
-            if outcome in {"changed", "first_seen", "reappeared"}:
+            if outcome == "first_seen":
+                # Baseline: record metadata/hash/counts but do not drive backfill.
+                metrics["downloaded"] += 1
+                metrics["first_seen"] += 1
+                metrics["first_seen_files"].append({
+                    "sensor_id": result["sensor_id"],
+                    "day": result["day"],
+                    "event_id": result["event_id"],
+                    "event_type": result["event_type"],
+                    "timeseries_ids": result["timeseries_ids"],
+                })
+            elif outcome in {"changed", "reappeared"}:
                 metrics["downloaded"] += 1
                 metrics["changed"] += 1
                 metrics["changed_files"].append({
@@ -3044,6 +3176,7 @@ def check_sensor_community(
     )
     progress.finish()
 
+    metrics["first_seen_files"].sort(key=lambda e: (e["day"], e["sensor_id"]))
     metrics["changed_files"].sort(key=lambda e: (e["day"], e["sensor_id"]))
     metrics["planned_backfills"].sort()
 
@@ -3079,36 +3212,56 @@ def check_sensor_community(
                 break
             group = by_day[day_iso]
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
+            chunks = _chunk_timeseries_ids(union_ids)
             log.info(
-                "sensorcommunity backfill batch day=%s files=%s total_timeseries_ids=%s",
-                day_iso, len(group), len(union_ids),
+                "sensorcommunity backfill batch day=%s files=%s total_timeseries_ids=%s chunks=%s",
+                day_iso, len(group), len(union_ids), len(chunks),
             )
-            bf = run_narrow_backfill(
-                wrapper_path=resolve_integrity_backfill_wrapper(),
-                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                env_name=env_name,
-                timeseries_ids=union_ids,
-                day=dt.date.fromisoformat(day_iso),
-                log=log,
-                log_dir=backfill_log_dir,
-                log_label=f"sc_day_{day_iso}",
-            )
+            event_chunk_results: dict[int, list[dict[str, Any]]] = {}
+            for chunk_index, chunk_ids in enumerate(chunks, start=1):
+                chunk_label = (
+                    f"sc_day_{day_iso}" if len(chunks) == 1
+                    else f"sc_day_{day_iso}_chunk_{chunk_index}_of_{len(chunks)}"
+                )
+                chunk_id_set = set(chunk_ids)
+                bf = run_narrow_backfill(
+                    wrapper_path=resolve_integrity_backfill_wrapper(),
+                    env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                    env_name=env_name,
+                    timeseries_ids=chunk_ids,
+                    day=dt.date.fromisoformat(day_iso),
+                    log=log,
+                    log_dir=backfill_log_dir,
+                    log_label=chunk_label,
+                )
+                metrics["backfills_attempted"] += 1
+                if bf["status"] == "ok":
+                    metrics["backfills_ok"] += 1
+                else:
+                    metrics["backfills_failed"] += 1
+                for entry in group:
+                    eid = entry.get("event_id")
+                    if not eid:
+                        continue
+                    if any(t in chunk_id_set for t in entry["timeseries_ids"]):
+                        event_chunk_results.setdefault(int(eid), []).append(bf)
             for entry in group:
-                if entry.get("event_id"):
-                    _record_backfill_on_event(
-                        conn, int(entry["event_id"]),
-                        entry["timeseries_ids"], bf,
-                        batch_info={
-                            "files": len(group),
-                            "total_timeseries_ids": len(union_ids),
-                        },
-                    )
+                eid = entry.get("event_id")
+                if not eid:
+                    continue
+                chunk_bfs = event_chunk_results.get(int(eid), [])
+                if not chunk_bfs:
+                    continue
+                _record_backfill_on_event(
+                    conn, int(eid),
+                    entry["timeseries_ids"],
+                    _combine_backfill_results(chunk_bfs),
+                    batch_info={
+                        "files": len(group),
+                        "total_timeseries_ids": len(union_ids),
+                    },
+                )
             conn.commit()
-            metrics["backfills_attempted"] += 1
-            if bf["status"] == "ok":
-                metrics["backfills_ok"] += 1
-            else:
-                metrics["backfills_failed"] += 1
             done_backfill_days += 1
             backfill_progress.update(
                 (
@@ -3131,7 +3284,7 @@ def check_sensor_community(
 
     log.info(
         "sensorcommunity: done %s",
-        {k: v for k, v in metrics.items() if k not in ("changed_files", "planned_backfills", "sample_urls")},
+        {k: v for k, v in metrics.items() if k not in ("first_seen_files", "changed_files", "planned_backfills", "sample_urls")},
     )
     return metrics
 
@@ -3730,23 +3883,41 @@ def run_cross_check_backfills(
                 limits.stopped_for,
             )
             break
-        bf = run_narrow_backfill(
-            wrapper_path=resolve_integrity_backfill_wrapper(),
-            env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-            env_name=env_name,
-            timeseries_ids=ts_ids,
-            connector_ids=[connector_id],
-            day=day_obj,
-            log=log,
-            log_dir=backfill_log_dir,
-            log_label=f"cc_day_{day_iso}_connector_{connector_id}",
-            output_scope="observations_only",
-        )
-        metrics["observation_backfills_attempted"] += 1
-        metrics["backfills_attempted"] += 1
-        if bf["status"] == "ok":
-            metrics["observation_backfills_ok"] += 1
-            metrics["backfills_ok"] += 1
+        chunks = _chunk_timeseries_ids(ts_ids)
+        if len(chunks) > 1:
+            log.info(
+                "cross-check observation repair: chunking day=%s connector=%s "
+                "total_timeseries_ids=%s chunks=%s",
+                day_iso, connector_id, len(ts_ids), len(chunks),
+            )
+        all_chunks_ok = True
+        for chunk_index, chunk_ids in enumerate(chunks, start=1):
+            chunk_label = (
+                f"cc_day_{day_iso}_connector_{connector_id}" if len(chunks) == 1
+                else f"cc_day_{day_iso}_connector_{connector_id}_chunk_{chunk_index}_of_{len(chunks)}"
+            )
+            bf = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=chunk_ids,
+                connector_ids=[connector_id],
+                day=day_obj,
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=chunk_label,
+                output_scope="observations_only",
+            )
+            metrics["observation_backfills_attempted"] += 1
+            metrics["backfills_attempted"] += 1
+            if bf["status"] == "ok":
+                metrics["observation_backfills_ok"] += 1
+                metrics["backfills_ok"] += 1
+            else:
+                metrics["observation_backfills_failed"] += 1
+                metrics["backfills_failed"] += 1
+                all_chunks_ok = False
+        if all_chunks_ok:
             queued = _queue_aqi_rebuild_from_obs_repair(
                 conn=conn,
                 run_id=run_id,
@@ -3762,9 +3933,6 @@ def run_cross_check_backfills(
             if queued in {"inserted", "merged"}:
                 if queued == "inserted":
                     queued_aqi_rebuild_keys.add((day_iso, connector_id))
-        else:
-            metrics["observation_backfills_failed"] += 1
-            metrics["backfills_failed"] += 1
 
     metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued_aqi_rebuild_keys)
 
@@ -5273,6 +5441,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Index fetches:  {sc.get('index_fetched', 0)}",
             f"- HEAD checked:   {sc.get('head_checked', 0)}",
             f"- Downloaded:     {sc.get('downloaded', 0)}",
+            f"- First seen:     {sc.get('first_seen', 0)}",
             f"- Changed:        {sc.get('changed', 0)}",
             f"- Unchanged DL:   {sc.get('unchanged_after_download', 0)}",
             f"- Missing:        {sc.get('missing', 0)}",
@@ -5283,6 +5452,18 @@ def format_summary_md(s: dict[str, Any]) -> str:
         ])
         if sc.get("skipped_reason"):
             lines.append(f"- Skipped reason: {sc['skipped_reason']}")
+        sc_first_seen = sc.get("first_seen_files") or []
+        if sc_first_seen:
+            lines.extend(["", "### First-seen files (sensorcommunity, baselined — not backfilled)", ""])
+            for entry in sc_first_seen[:50]:
+                lines.append(
+                    f"- {entry['sensor_id']} / {entry['day']} "
+                    f"(event_id={entry.get('event_id')}, "
+                    f"type={entry.get('event_type')}, "
+                    f"timeseries={entry.get('timeseries_ids')})"
+                )
+            if len(sc_first_seen) > 50:
+                lines.append(f"- ... {len(sc_first_seen) - 50} more")
         sc_changed = sc.get("changed_files") or []
         if sc_changed:
             lines.extend(["", "### Changed files (sensorcommunity)", ""])
@@ -5307,6 +5488,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Days:           {oq.get('days', 0)}",
             f"- HEAD checked:   {oq.get('head_checked', 0)}",
             f"- Downloaded:     {oq.get('downloaded', 0)}",
+            f"- First seen:     {oq.get('first_seen', 0)}",
             f"- Changed:        {oq.get('changed', 0)}",
             f"- Unchanged DL:   {oq.get('unchanged_after_download', 0)}",
             f"- Missing (404):  {oq.get('missing', 0)}",
@@ -5317,6 +5499,18 @@ def format_summary_md(s: dict[str, Any]) -> str:
         ])
         if oq.get("skipped_reason"):
             lines.append(f"- Skipped reason: {oq['skipped_reason']}")
+        first_seen_oq = oq.get("first_seen_files") or []
+        if first_seen_oq:
+            lines.extend(["", "### First-seen files (baselined — not backfilled)", ""])
+            for entry in first_seen_oq[:50]:
+                lines.append(
+                    f"- {entry['location_id']} / {entry['day']} "
+                    f"(event_id={entry.get('event_id')}, "
+                    f"type={entry.get('event_type')}, "
+                    f"timeseries={entry.get('timeseries_ids')})"
+                )
+            if len(first_seen_oq) > 50:
+                lines.append(f"- ... {len(first_seen_oq) - 50} more")
         changed = oq.get("changed_files") or []
         if changed:
             lines.extend(["", "### Changed files", ""])
@@ -5749,6 +5943,7 @@ def main(argv: list[str]) -> int:
             if adapter_metrics.get("ran"):
                 notes_parts.append(
                     f"{adapter_name} head_checked={adapter_metrics.get('head_checked', 0)} "
+                    f"first_seen={adapter_metrics.get('first_seen', 0)} "
                     f"changed={adapter_metrics.get('changed', 0)} missing={adapter_metrics.get('missing', 0)} "
                     f"downloaded_bytes={adapter_metrics.get('downloaded_bytes', 0)} "
                     f"errors={adapter_metrics.get('errors', 0)} "

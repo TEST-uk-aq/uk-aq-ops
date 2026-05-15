@@ -1,0 +1,44 @@
+{
+  "ok": true,
+  "first_build": true,
+  "dry_run": true,
+  "full_rebuild": false,
+  "inventory_rel_path": "history/_index/backup_inventory_v1.json",
+  "inventory_size": 2198184,
+  "inventory_hash": "2c2fd27b2e1284ed186709c81e7bfb7f7c0d39396dbe83a4dd2b24f48687a28e",
+  "generated_at": "2026-05-15T14:24:10.343Z",
+  "domains": [
+    "observations",
+    "aqilevels",
+    "core"
+  ],
+  "manifests_listed": 1056,
+  "manifests_reread": 1056,
+  "etag_skip_hits": 0,
+  "etag_skip_rate": 0,
+  "index_files_listed": 4,
+  "index_files_reread": 4,
+  "index_files_skipped": 0,
+  "index_files_missing": 0,
+  "index_tree_units_listed": 3922,
+  "index_tree_units_reread": 3922,
+  "index_tree_units_skipped": 0,
+  "elapsed_ms": {
+    "days": 922526,
+    "index_files": 4409,
+    "index_trees": 1527288,
+    "total": 2454581
+  },
+  "summary": {
+    "domain_day_count": {
+      "observations": 495,
+      "aqilevels": 495,
+      "core": 66
+    },
+    "index_file_count": 4,
+    "index_tree_unit_count": {
+      "observations_timeseries": 1960,
+      "aqilevels_timeseries": 1962
+    }
+  }
+}

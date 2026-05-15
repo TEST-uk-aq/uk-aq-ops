@@ -1,0 +1,55 @@
+FixedTimeUTC,Frequency,Repo,Platform,Service/Workflow,ScheduleSource,CronUTC,Purpose,EnabledByDefault
+00:55,Daily @ 00:55 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-supabase-db-dump-backup-trigger,deploy workflow default,55 0 * * *,DB dump backup to Dropbox,yes
+02:00,Daily @ 02:00 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-prune-daily,deploy workflow default,0 2 * * *,Prune old observations,yes
+03:00,Daily @ 03:00 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_stations_daily.yml,CF workflow-scheduler (ops),0 3 * * *,Stations daily sync,yes
+03:00,Daily @ 03:00 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 3 * * *,Trigger uk_aq_stations_daily,yes
+03:00,Daily @ 03:00 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-observs-partition-maintenance-daily,deploy workflow default,0 3 * * *,Partition maintenance on obs_aqidb,yes
+03:15,Daily @ 03:15 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-aqilevels-retention-daily,deploy workflow default,15 3 * * *,AQI levels retention cleanup,yes
+03:17,Weekly Mon @ 03:17 UTC,CIC-test-uk-aq-ops,GitHub Actions,codeql-noarchive.yml,workflow schedule,17 3 * * 1,CodeQL analysis,yes
+04:15,Monthly 1st @ 04:15 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_air_sos_site_register_monthly.yml,workflow schedule,15 4 1 * *,SOS site register download,yes
+04:15,Daily @ 04:15 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,15 4 * * *,Trigger uk_aq_r2_core_snapshot,yes
+04:15,Daily @ 04:15 UTC,CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_core_snapshot.yml,CF workflow-scheduler,15 4 * * *,Core snapshot to R2,yes
+04:35,Daily @ 04:35 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,35 4 * * *,Trigger uk_aq_r2_history_dropbox_backup,yes
+04:35,Daily @ 04:35 UTC,CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_history_dropbox_backup.yml,CF workflow-scheduler,35 4 * * *,Backup R2 history to Dropbox,yes
+05:35,Monthly 1st @ 05:35 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_monthly_index_maintenance.yml,workflow schedule,35 5 1 * *,Index maintenance,yes
+05:49,Daily @ 05:49 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,49 5 * * *,Trigger uk_aq_dropbox_prune_raw,yes
+05:49,Daily @ 05:49 UTC,CIC-test-uk-aq-ops,GitHub Actions,uk_aq_dropbox_prune_raw.yml,CF workflow-scheduler,49 5 * * *,Prune raw data in Dropbox,yes
+06:00,Daily @ 06:00 UTC,CIC-test-uk-aq-ingest,GitHub Actions,supabase-keepalive.yml,workflow schedule,0 6 * * *,Supabase keepalive ping,yes
+06:00,Weekly Mon @ 06:00 UTC,CIC-Test-uk-population-ingest,GitHub Actions,nomis_ingest.yml,workflow schedule,0 6 * * 1,Nomis population data ingestion,yes
+06:00,Monthly 3rd @ 06:00 UTC,CIC-Test-uk-population-ingest,GitHub Actions,nomis_monthly_check.yml,workflow schedule,0 6 3 * *,Monthly check edge function,yes
+N/A,None,CIC-test-uk-aq,None,None,None,None,No cron schedules,N/A
+N/A (disabled),N/A,CIC-test-uk-aq-ingest,Cloudflare Worker,uk_aq_dispatcher,wrangler.toml,disabled (crons=[]),Poll dispatcher (currently disabled),no
+N/A (every 5 min),Every 5 minutes,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_egress_monitor.yml,workflow schedule,*/5 * * * *,Egress monitor for core DB,yes
+N/A (every 5 min),Every 5 minutes,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_observs_egress_monitor.yml,workflow schedule,*/5 * * * *,Egress monitor for obs_aqidb,yes
+N/A (every 6h),Every 6h at :50 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-timeseries-aqi-reconcile-deep-trigger,deploy workflow default,50 */6 * * *,AQI reconcile deep,no
+N/A (every min),Every minute,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-latest-snapshot-every-minute,deploy workflow default,* * * * *,Build latest snapshots to R2,yes
+N/A (hourly),Hourly at :20 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-timeseries-aqi-hourly-trigger,deploy workflow default,20 * * * *,AQI hourly compute (sync),yes
+N/A (hourly),Hourly at :35 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-timeseries-aqi-reconcile-short-trigger,deploy workflow default,35 * * * *,AQI reconcile short,no
+N/A (hourly),Hourly,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-db-size-logger-hourly,deploy workflow default,0 * * * *,DB size logging,no
+,Every 5 minutes,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_egress_monitor.yml,workflow schedule,*/5 * * * *,Egress monitor for core DB,yes
+,Every 5 minutes,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_observs_egress_monitor.yml,workflow schedule,*/5 * * * *,Egress monitor for obs_aqidb,yes
+,Daily @ 06:00 UTC,CIC-test-uk-aq-ingest,GitHub Actions,supabase-keepalive.yml,workflow schedule,0 6 * * *,Supabase keepalive ping,yes
+,Monthly 1st @ 04:15 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_air_sos_site_register_monthly.yml,workflow schedule,15 4 1 * *,SOS site register download,yes
+,Monthly 1st @ 05:35 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_monthly_index_maintenance.yml,workflow schedule,35 5 1 * *,Index maintenance,yes
+,Daily @ 03:00 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_stations_daily.yml,CF workflow-scheduler (ops),0 3 * * *,Stations daily sync,yes
+,N/A,CIC-test-uk-aq-ingest,Cloudflare Worker,uk_aq_dispatcher,wrangler.toml,disabled (crons=[]),Poll dispatcher (currently disabled),no
+,Daily @ 03:00 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 3 * * *,Trigger uk_aq_stations_daily,yes
+,Daily @ 04:15 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,15 4 * * *,Trigger uk_aq_r2_core_snapshot,yes
+,Daily @ 04:35 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,35 4 * * *,Trigger uk_aq_r2_history_dropbox_backup,yes
+,Daily @ 05:49 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,49 5 * * *,Trigger uk_aq_dropbox_prune_raw,yes
+,Daily @ 04:15 UTC,CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_core_snapshot.yml,CF workflow-scheduler,15 4 * * *,Core snapshot to R2,yes
+,Daily @ 04:35 UTC,CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_history_dropbox_backup.yml,CF workflow-scheduler,35 4 * * *,Backup R2 history to Dropbox,yes
+,Daily @ 05:49 UTC,CIC-test-uk-aq-ops,GitHub Actions,uk_aq_dropbox_prune_raw.yml,CF workflow-scheduler,49 5 * * *,Prune raw data in Dropbox,yes
+,Weekly Mon @ 03:17 UTC,CIC-test-uk-aq-ops,GitHub Actions,codeql-noarchive.yml,workflow schedule,17 3 * * 1,CodeQL analysis,yes
+,Daily @ 02:00 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-prune-daily,deploy workflow default,0 2 * * *,Prune old observations,yes
+,Every minute,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-latest-snapshot-every-minute,deploy workflow default,* * * * *,Build latest snapshots to R2,yes
+,Daily @ 03:00 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-observs-partition-maintenance-daily,deploy workflow default,0 3 * * *,Partition maintenance on obs_aqidb,yes
+,Hourly at :20 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-timeseries-aqi-hourly-trigger,deploy workflow default,20 * * * *,AQI hourly compute (sync),yes
+,Hourly at :35 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-timeseries-aqi-reconcile-short-trigger,deploy workflow default,35 * * * *,AQI reconcile short,no
+,Every 6h at :50 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-timeseries-aqi-reconcile-deep-trigger,deploy workflow default,50 */6 * * *,AQI reconcile deep,no
+,Daily @ 00:55 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-supabase-db-dump-backup-trigger,deploy workflow default,55 0 * * *,DB dump backup to Dropbox,yes
+,Daily @ 03:15 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-aqilevels-retention-daily,deploy workflow default,15 3 * * *,AQI levels retention cleanup,yes
+,Hourly,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-db-size-logger-hourly,deploy workflow default,0 * * * *,DB size logging,no
+,None,CIC-test-uk-aq,None,None,None,None,No cron schedules,N/A
+,Weekly Mon @ 06:00 UTC,CIC-Test-uk-population-ingest,GitHub Actions,nomis_ingest.yml,workflow schedule,0 6 * * 1,Nomis population data ingestion,yes
+,Monthly 3rd @ 06:00 UTC,CIC-Test-uk-population-ingest,GitHub Actions,nomis_monthly_check.yml,workflow schedule,0 6 3 * *,Monthly check edge function,yes

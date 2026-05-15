@@ -61,6 +61,20 @@
 See [`uk-aq-history-integrity.md`](uk-aq-history-integrity.md) for the full
 system doc.
 
+## R2 history backup scripts
+
+- `scripts/backup_r2/build_backup_inventory.mjs`
+  - Walks R2, etag-skips unchanged manifests, writes `history/_index/backup_inventory_v1.json`.
+  - The slow scan only fires once (first build) and for changed entries thereafter.
+- `scripts/backup_r2/sync_history_to_dropbox.mjs`
+  - Reads the inventory, compares hashes to the Dropbox checkpoint, copies only changed/missing units.
+  - Fails loudly if the inventory is missing/invalid; no fallback to direct scan.
+- `scripts/backup_r2/lib/`
+  - `rclone.mjs` shared rclone wrappers + sha256 + path helpers.
+  - `inventory.mjs` schema constants + `loadInventory(...,{strict})` used by both scripts.
+
+See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) for the full system doc.
+
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh`
   - Thin shell launcher; loads `<ENV>.env`, runs guardrails, creates state
     dirs, takes a per-environment PID lock, then calls the python entrypoint.

@@ -48,6 +48,7 @@ jobs:
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
       UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v1.json' }}
+      UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || 'history/_index/backup_inventory_v1.json' }}
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
@@ -148,7 +149,27 @@ jobs:
           # shellcheck disable=SC2016
           echo "RCLONE_CONFIG=${RCLONE_CONFIG}" >> "$GITHUB_ENV"
 
-      - name: Run manifest-aware incremental backup
+      - name: Build R2 history backup inventory
+        # Always runs (no --dry-run) even when the workflow's dry_run input is
+        # true. The inventory is a single small control file in R2, not user
+        # data — and the sync step needs a fresh inventory to produce an
+        # accurate dry-run plan. Writing the inventory is idempotent.
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+
+          cmd=(
+            node scripts/backup_r2/build_backup_inventory.mjs
+            --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
+            --inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}"
+            --index-prefix "${UK_AQ_R2_HISTORY_INDEX_PREFIX}"
+            --report-out "tmp/r2_backup_inventory_report.json"
+          )
+
+          echo "Running: ${cmd[*]}"
+          "${cmd[@]}"
+
+      - name: Run inventory-driven Dropbox sync
         run: |
           set -euo pipefail
           mkdir -p tmp
@@ -180,6 +201,7 @@ jobs:
             node scripts/backup_r2/sync_history_to_dropbox.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
+            --inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}"
             --state-rel-path "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}"
             --max-days-per-run "${max_days}"
             --report-out "tmp/r2_history_dropbox_backup_report.json"
@@ -192,12 +214,14 @@ jobs:
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
 
-      - name: Upload backup report artifact
+      - name: Upload backup report artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: uk-aq-r2-history-dropbox-backup-report
-          path: tmp/r2_history_dropbox_backup_report.json
+          path: |
+            tmp/r2_backup_inventory_report.json
+            tmp/r2_history_dropbox_backup_report.json
           if-no-files-found: ignore
 
       - name: Report daily task health
