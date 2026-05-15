@@ -35,8 +35,6 @@ enabled = true
 # - UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES (optional; default 180)
 # - UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR (optional; default true)
 # - UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR (optional; default false)
-# - UK_AQ_TIMESERIES_R2_MANIFEST_URL (optional; diagnostics only in v2 meta)
-# - UK_AQ_TIMESERIES_R2_INDEX_URL (optional; diagnostics only in v2 meta)
 # - UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS (optional; default 60)
 # - UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS (optional; default 60)
 # - UK_AQ_TIMESERIES_RECENT_SWR_SECONDS (optional; default 60)

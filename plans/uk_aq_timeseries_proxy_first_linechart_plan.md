@@ -375,6 +375,7 @@ Success criteria:
 - Repeated chart opens hit Cloudflare cache instead of repeatedly hitting Supabase.
 - Existing `sensors_chart.html` still works.
 
+
 ### Phase 6 — expand
 
 Promote in this order:
@@ -713,6 +714,19 @@ Please report:
 
 If safe, implement only the minimal schema/RPC change needed for the proxy to fetch a bounded tail range. Do not change ingest workers.
 ```
+The required RPC already exists. /workspaces/uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_ops_rpcs.sql:161-222:
+
+
+uk_aq_public.uk_aq_rpc_observs_timeseries_window(
+  p_connector_id, p_timeseries_id,
+  p_start_utc timestamptz, p_end_utc timestamptz,
+  p_since_ts timestamptz default null,
+  p_limit integer default null
+) returns table (observed_at timestamptz, value double precision)
+This satisfies all five requirements from Prompt 5: arbitrary start_utc/end_utc, supports tail-only, no hard-coded recent-hours window, and since for incremental. The existing edge function uk_aq_timeseries (index.ts:65, OBS_AQIDB_TIMESERIES_WINDOW_RPC = "uk_aq_rpc_observs_timeseries_window") already calls it with p_start_utc/p_end_utc/p_since_ts. The proxy v2 stitcher hits this edge function via fetchTimeseriesOriginPayload (index.ts:1175). End-to-end already wired.
+
+Nothing to migrate. 
+
 
 # Codex prompt 6 — canary and validation script
 
