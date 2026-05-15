@@ -297,7 +297,11 @@ function scanDayDomain({
   stats,
 }) {
   const domainSourcePath = joinTargetPath(sourceRoot, domainPrefix);
-  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, domainSourcePath);
+  // Day manifests are at <domain>/day_utc=*/manifest.json — depth 2.
+  // Capping the depth avoids enumerating per-connector parquet parts inside
+  // each day folder (thousands of extra LIST entries that would all be
+  // filtered out by DAY_MANIFEST_PATTERN anyway).
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, domainSourcePath, { maxDepth: 2 });
 
   const days = {};
   for (const entry of lsjsonEntries) {
@@ -393,7 +397,9 @@ function scanIndexTree({
 }) {
   const treePrefix = indexPrefix ? `${indexPrefix}/${treeKey}` : treeKey;
   const treeSourcePath = joinTargetPath(sourceRoot, treePrefix);
-  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, treeSourcePath);
+  // Tree unit manifests live at <tree>/day_utc=*/connector_id=*/manifest.json
+  // — depth 3.
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, treeSourcePath, { maxDepth: 3 });
 
   const units = {};
   for (const entry of lsjsonEntries) {

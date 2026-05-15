@@ -104,9 +104,20 @@ export function rcloneCat(rcloneBin, targetPath) {
 // caller relying on it for change detection silently falls back to ModTime.
 // Pass `{ hash: false }` to opt out (rare; useful only when the caller doesn't
 // need the hash and wants a marginally cheaper LIST).
-export function rcloneLsjsonRecursive(rcloneBin, targetPath, { hash = true } = {}) {
+//
+// `maxDepth` (optional positive integer) caps the recursion depth so we don't
+// enumerate sibling objects we'll filter out anyway. Day manifests live at
+// depth 2 (`day_utc=*/manifest.json`); timeseries-tree per-unit manifests
+// live at depth 3 (`day_utc=*/connector_id=*/manifest.json`). Without this,
+// recursing into `history/v1/observations/` walks every parquet part inside
+// each connector folder — thousands of extra LIST entries that cost minutes
+// of GH-runner time per scan.
+export function rcloneLsjsonRecursive(rcloneBin, targetPath, { hash = true, maxDepth = 0 } = {}) {
   const args = ["lsjson", targetPath, "--recursive", "--files-only"];
   if (hash) args.push("--hash", "--hash-type", "MD5");
+  if (Number.isFinite(maxDepth) && maxDepth > 0) {
+    args.push("--max-depth", String(Math.trunc(maxDepth)));
+  }
   const result = runRclone(rcloneBin, args, { allow_failure: true });
   if (result.status !== 0) {
     const combined = `${result.stderr}\n${result.stdout}`;
