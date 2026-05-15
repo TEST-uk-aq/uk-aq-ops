@@ -276,12 +276,12 @@ function buildFileInventoryEntry({ relativePath, fileText, lsjsonEntry }) {
 
 
 function recordMd5Availability(stats, hasMd5) {
-  if (hasMd5) stats.md5_available_count += 1;
-  else stats.md5_missing_count += 1;
+  if (hasMd5) stats.r2_md5_available_count += 1;
+  else stats.r2_md5_missing_count += 1;
 }
 
 function recordReuseOutcome(stats, classification) {
-  if (classification === "md5") stats.reuse_by_md5_size += 1;
+  if (classification === "md5") stats.reuse_by_r2_md5_size += 1;
   else if (classification === "modtime") stats.reuse_by_size_modtime += 1;
 }
 
@@ -319,7 +319,6 @@ function scanDayDomain({
 
     if (reuseClass) {
       days[dayUtc] = { ...previousEntry };
-      stats.etag_skip_hits += 1;
       recordReuseOutcome(stats, reuseClass);
       continue;
     }
@@ -513,7 +512,6 @@ async function main() {
   const stats = {
     manifests_listed: 0,
     manifests_reread: 0,
-    etag_skip_hits: 0,
     index_files_listed: 0,
     index_files_reread: 0,
     index_files_skipped: 0,
@@ -521,17 +519,18 @@ async function main() {
     index_tree_units_listed: 0,
     index_tree_units_reread: 0,
     index_tree_units_skipped: 0,
-    // MD5 availability per lsjson entry. md5_missing_count > 0 means rclone
-    // didn't return a Hashes.md5 for some objects (despite --hash --hash-type
-    // MD5) — could be multipart-style etags or a backend version quirk.
-    md5_available_count: 0,
-    md5_missing_count: 0,
+    // MD5 availability per lsjson entry across all three categories.
+    // r2_md5_missing_count > 0 means rclone didn't return Hashes.md5 for
+    // some objects (despite --hash --hash-type MD5) — could be multipart-style
+    // etags or a backend version quirk.
+    r2_md5_available_count: 0,
+    r2_md5_missing_count: 0,
     // Reuse outcomes split by the signal used to decide reuse. The first is
     // the strong path (Size + MD5); the second is the weaker fallback that
     // kicks in only when MD5 is missing on either side. A high
     // reuse_by_size_modtime suggests either rclone isn't being called with
     // --hash or R2 isn't exposing MD5 for those objects.
-    reuse_by_md5_size: 0,
+    reuse_by_r2_md5_size: 0,
     reuse_by_size_modtime: 0,
     elapsed_ms: {},
   };
@@ -623,14 +622,22 @@ async function main() {
 
   const totalLs = stats.manifests_listed;
   const totalReread = stats.manifests_reread;
-  const etagSkipRate = totalLs > 0 ? (totalLs - totalReread) / totalLs : null;
+  const manifestReuseRate = totalLs > 0 ? (totalLs - totalReread) / totalLs : null;
 
-  const md5Available = stats.md5_available_count > 0
-    && stats.md5_missing_count === 0;
+  // Split the day-manifest re-reads by reason: full-rebuild forced them all,
+  // otherwise they're either net-new days or days whose signals didn't match.
+  // (Index files / tree units have their own per-category counters above.)
+  const totalRereadAllCategories =
+    stats.manifests_reread + stats.index_files_reread + stats.index_tree_units_reread;
+  const rereadFullRebuild = args.full_rebuild ? totalRereadAllCategories : 0;
+  const rereadNewOrChanged = args.full_rebuild ? 0 : totalRereadAllCategories;
+
+  const r2Md5Available = stats.r2_md5_available_count > 0
+    && stats.r2_md5_missing_count === 0;
   const metadataWarnings = [];
-  if (stats.md5_missing_count > 0) {
+  if (stats.r2_md5_missing_count > 0) {
     metadataWarnings.push(
-      `${stats.md5_missing_count} entries had no Hashes.md5 from rclone lsjson — `
+      `${stats.r2_md5_missing_count} entries had no Hashes.md5 from rclone lsjson — `
       + `skip decisions for those entries fall back to Size + ModTime (weaker). `
       + `Confirm rclone is being called with --hash --hash-type MD5 and that R2 is `
       + `exposing the etag for these objects.`,
@@ -649,8 +656,9 @@ async function main() {
     domains: args.domains,
     manifests_listed: totalLs,
     manifests_reread: totalReread,
-    etag_skip_hits: stats.etag_skip_hits,
-    etag_skip_rate: etagSkipRate,
+    manifest_reuse_rate: manifestReuseRate,
+    reread_new_or_changed: rereadNewOrChanged,
+    reread_full_rebuild: rereadFullRebuild,
     index_files_listed: stats.index_files_listed,
     index_files_reread: stats.index_files_reread,
     index_files_skipped: stats.index_files_skipped,
@@ -658,11 +666,11 @@ async function main() {
     index_tree_units_listed: stats.index_tree_units_listed,
     index_tree_units_reread: stats.index_tree_units_reread,
     index_tree_units_skipped: stats.index_tree_units_skipped,
-    md5_available_count: stats.md5_available_count,
-    md5_missing_count: stats.md5_missing_count,
-    reuse_by_md5_size: stats.reuse_by_md5_size,
+    r2_md5_available_count: stats.r2_md5_available_count,
+    r2_md5_missing_count: stats.r2_md5_missing_count,
+    reuse_by_r2_md5_size: stats.reuse_by_r2_md5_size,
     reuse_by_size_modtime: stats.reuse_by_size_modtime,
-    md5_metadata_available: md5Available,
+    r2_md5_metadata_available: r2Md5Available,
     metadata_warnings: metadataWarnings,
     elapsed_ms: stats.elapsed_ms,
     summary: inventory.summary,
