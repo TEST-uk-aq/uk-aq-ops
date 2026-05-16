@@ -203,3 +203,36 @@ For deployment and scheduler wiring, use:
 - `README.md`
 - `.github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml`
 - Scheduler attempt deadline variable: `GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_ATTEMPT_DEADLINE` (fallback aliases accepted), default `15m`.
+
+Are you sure that the builder runs in uk_aq_prune_daily?
+
+Good push — let me actually verify rather than asserting.
+
+Yes — confirmed with three pieces of evidence:
+
+The caller exists. workers/uk_aq_prune_daily/server.mjs:1922 invokes rebuildR2HistoryIndexes after Phase B completes successfully.
+
+prune-daily runs daily at 02:00 UTC. system_docs/uk_aq_cron_schedules.csv:17:
+
+
+CIC-test-uk-aq-ops, GCP Cloud Scheduler, uk-aq-prune-daily, 0 2 * * *, Daily @ 02:00 UTC, Prune old observations
+That's 2.5 hours before your 04:35 UTC backup workflow — fits the symptom exactly.
+
+The rebuild is unconditional. workers/shared/uk_aq_r2_history_index.mjs:1151-1157 does an unconditional r2PutObject for every day × connector — no "skip if content matches existing" check. With generated_at: new Date().toISOString() baked into the payload at line 616, every PUT writes a different MD5 even when underlying data is identical.
+
+So every daily prune-daily run rewrites every tree-unit manifest (1059 days × ~4 connectors × 2 domains ≈ ~3930 R2 PUTs) regardless of whether anything actually changed.
+
+One nuance I should have stated up front
+There's no separate "index rebuild" scheduled job — it's a side effect of uk_aq_prune_daily's Phase B success path. The rebuild fires:
+
+✅ Daily, when Phase B runs and completes (the common case)
+❌ NOT if Phase B is disabled or errors out
+❌ NOT in dry-run mode
+So if Phase B were ever to be disabled or skipped, the daily churn would stop and the inventory builder would suddenly become fast. The user could test this hypothesis by temporarily disabling Phase B for one prune-daily run — the next day's backup would have full reuse on tree units (proving the churn is the index rebuild, not something else).
+
+But I'd recommend the fix (Option A.3: stop including generated_at in the hashable payload, or use a data-driven timestamp) rather than that test, since the test breaks the index for one day.
+
+Was there something specific about the prune-daily connection that didn't feel right? I want to make sure I'm answering the actual concern.
+
+I was just checking that it actually did. I suppose there is a good reason to also rebuild it there, because the R2 data has changed, so it keeps the inventory fresh. 
+

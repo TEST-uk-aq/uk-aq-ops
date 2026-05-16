@@ -377,3 +377,16 @@ Want me to draft the patch?
 Ah if B also saves writes costs, that's worth doing. 
 Can you implement A.3 + B please.
 
+so if lots of days change then the inventory sync goes up, but the dbox sync will be minutes?
+Roughly yes, but they scale differently:
+
+Inventory build — goes up only a little. Today's 15.6min was almost entirely the per-day lsjson --hash walk against R2 (elapsed_ms.days = 3.5min, elapsed_ms.index_trees = 12min), which runs every time regardless of changes. The extra cost from changes is just the reread_new_or_changed GETs to re-fetch manifest JSON when MD5s differ — that's a small JSON read per changed day/unit, so even 100 changed days adds maybe seconds, not minutes.
+
+Dropbox sync — scales linearly with candidates. Each changed day triggers an rclone copy of that day's manifest + child files. Rough envelope:
+
+Changed days	Sync time
+1–5 (typical incremental)	<30s
+~20–50 (a backfill window)	1–3 min
+200+ (mass rewrite)	10+ min
+So yes — if you do something that touches lots of days (big backfill, schema migration), sync goes from 2.5s into the minutes-range, and could even rival the inventory step. For normal day-to-day operation it'll stay well under a minute.
+
