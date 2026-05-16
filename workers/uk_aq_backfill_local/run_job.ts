@@ -10122,6 +10122,7 @@ async function runSourceToAll(
         const sourceCheckpointJson: Record<string, unknown> = {
           source_adapter: sourceAdapter,
         };
+        let openaqFetchErrorCount = 0;
         let candidateSourceUnits = 0;
 
         if (sourceAdapter === "breathelondon") {
@@ -10486,6 +10487,7 @@ async function runSourceToAll(
                 checkpoint_json: {
                   source_adapter: sourceAdapter,
                   skip_reason: "no_matching_requested_timeseries_ids",
+                  no_data_classification: "metadata_mismatch",
                   requested_timeseries_ids: REQUESTED_TIMESERIES_IDS,
                 },
                 started_at: startedAt,
@@ -10528,6 +10530,7 @@ async function runSourceToAll(
                   source_adapter: sourceAdapter,
                   skip_reason:
                     "no_matching_location_ids_after_timeseries_filter",
+                  no_data_classification: "metadata_mismatch",
                   requested_timeseries_ids: targetedTimeseriesIds,
                   requested_timeseries_station_ref_count:
                     targetedStationRefs.size,
@@ -10548,6 +10551,9 @@ async function runSourceToAll(
           let totalSkippedUnknownParameter = 0;
           let totalSkippedOutsideDay = 0;
           let totalSkippedInvalidValueOrTimestamp = 0;
+          // fetchOpenaqArchiveCsvGz currently returns found:true/false or throws.
+          // It does not currently return structured non-throwing error results.
+          let locationFetchErrorCount = 0;
 
           for (const locationId of candidateLocationIds) {
             const sourceFile = await fetchOpenaqArchiveCsvGz(
@@ -10617,26 +10623,57 @@ async function runSourceToAll(
           }
 
           if (locationFilesFound === 0) {
-            connectorDaySkipped += 1;
-            await ledgerInsertRunDay(ledgerEnabled, {
+            const noDataClassification = locationFetchErrorCount === 0
+              ? "authoritative_no_data"
+              : "transport_error";
+            sourceCheckpointJson.no_data_classification = noDataClassification;
+            sourceCheckpointJson.fetch_outcomes = {
+              found: locationFilesFound,
+              missing: locationFilesMissing,
+              error: locationFetchErrorCount,
+            };
+            logStructured("info", "source_to_r2_openaq_no_data_classification", {
               run_id: runId,
-              run_mode: RUN_MODE,
               day_utc: dayUtc,
               connector_id: connectorId,
-              source_kind: "download",
-              status: "skipped",
-              rows_read: 0,
-              rows_written_aqilevels: 0,
-              objects_written_r2: 0,
-              checkpoint_json: {
-                source_adapter: sourceAdapter,
-                skip_reason: "no_location_day_source_files",
-                candidate_location_count: candidateLocationIds.length,
-              },
-              started_at: startedAt,
-              finished_at: nowIso(),
+              source_adapter: sourceAdapter,
+              class: noDataClassification,
+              fetch_outcomes: sourceCheckpointJson.fetch_outcomes,
+              reason: "no_location_day_source_files",
             });
-            continue;
+            if (locationFetchErrorCount > 0) {
+              connectorDaySkipped += 1;
+              await ledgerInsertRunDay(ledgerEnabled, {
+                run_id: runId,
+                run_mode: RUN_MODE,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_kind: "download",
+                status: "skipped",
+                rows_read: 0,
+                rows_written_aqilevels: 0,
+                objects_written_r2: 0,
+                checkpoint_json: {
+                  source_adapter: sourceAdapter,
+                  skip_reason: "no_location_day_source_files",
+                  candidate_location_count: candidateLocationIds.length,
+                  ...sourceCheckpointJson,
+                },
+                started_at: startedAt,
+                finished_at: nowIso(),
+              });
+              continue;
+            }
+            sourceCheckpointJson.empty_manifest_written = true;
+            sourceCheckpointJson.empty_manifest_reason =
+              "no_location_day_source_files";
+            logStructured("info", "source_to_r2_openaq_empty_manifest_written", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: sourceAdapter,
+              reason: "no_location_day_source_files",
+            });
           }
 
           candidateSourceUnits = locationFilesFound;
@@ -10658,6 +10695,7 @@ async function runSourceToAll(
             totalSkippedOutsideDay;
           sourceCheckpointJson.total_skipped_invalid_value_or_timestamp =
             totalSkippedInvalidValueOrTimestamp;
+          openaqFetchErrorCount = locationFetchErrorCount;
         } else if (sourceAdapter === "uk_air_sos") {
           const stationRefsLookup = await fetchStationRefsForConnector(
             connectorId,
@@ -11052,8 +11090,37 @@ async function runSourceToAll(
           const skipReason = noObservations
             ? "no_observation_rows"
             : "no_observations_or_aqilevel_rows";
-          connectorDaySkipped += 1;
-          logStructured("info", "source_to_r2_connector_day_skipped", {
+          const shouldWriteOpenaqEmptyManifest = sourceAdapter === "openaq" &&
+            noObservations &&
+            sourceCheckpointJson.no_data_classification !== "transport_error";
+          if (shouldWriteOpenaqEmptyManifest) {
+            sourceCheckpointJson.no_data_classification = "authoritative_no_data";
+            sourceCheckpointJson.fetch_outcomes = sourceCheckpointJson.fetch_outcomes || {
+              found: toSafeInt(sourceCheckpointJson.location_files_found),
+              missing: toSafeInt(sourceCheckpointJson.location_files_missing),
+              error: openaqFetchErrorCount,
+            };
+            sourceCheckpointJson.empty_manifest_written = true;
+            sourceCheckpointJson.empty_manifest_reason = skipReason;
+            logStructured("info", "source_to_r2_openaq_no_data_classification", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: sourceAdapter,
+              class: "authoritative_no_data",
+              fetch_outcomes: sourceCheckpointJson.fetch_outcomes,
+              reason: skipReason,
+            });
+            logStructured("info", "source_to_r2_openaq_empty_manifest_written", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: sourceAdapter,
+              reason: skipReason,
+            });
+          } else {
+            connectorDaySkipped += 1;
+            logStructured("info", "source_to_r2_connector_day_skipped", {
             run_id: runId,
             day_utc: dayUtc,
             connector_id: connectorId,
@@ -11076,28 +11143,29 @@ async function runSourceToAll(
             targeted_preserved_aqi_rows:
               sourceCheckpointJson.targeted_preserved_aqi_rows ?? null,
           });
-          await ledgerInsertRunDay(ledgerEnabled, {
-            run_id: runId,
-            run_mode: RUN_MODE,
-            day_utc: dayUtc,
-            connector_id: connectorId,
-            source_kind: "download",
-            status: "skipped",
-            rows_read: obsHistoryRows.length,
-            rows_written_aqilevels: aqilevelRows.length,
-            objects_written_r2: 0,
-            checkpoint_json: {
-              source_adapter: sourceAdapter,
-              skip_reason: skipReason,
-              candidate_source_units: candidateSourceUnits,
-              rows_observations: obsHistoryRows.length,
-              rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
-              ...sourceCheckpointJson,
-            },
-            started_at: startedAt,
-            finished_at: nowIso(),
-          });
-          continue;
+            await ledgerInsertRunDay(ledgerEnabled, {
+              run_id: runId,
+              run_mode: RUN_MODE,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_kind: "download",
+              status: "skipped",
+              rows_read: obsHistoryRows.length,
+              rows_written_aqilevels: aqilevelRows.length,
+              objects_written_r2: 0,
+              checkpoint_json: {
+                source_adapter: sourceAdapter,
+                skip_reason: skipReason,
+                candidate_source_units: candidateSourceUnits,
+                rows_observations: obsHistoryRows.length,
+                rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
+                ...sourceCheckpointJson,
+              },
+              started_at: startedAt,
+              finished_at: nowIso(),
+            });
+            continue;
+          }
         }
 
         if (DRY_RUN) {
