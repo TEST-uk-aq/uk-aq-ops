@@ -10641,29 +10641,6 @@ async function runSourceToAll(
               fetch_outcomes: sourceCheckpointJson.fetch_outcomes,
               reason: "no_location_day_source_files",
             });
-            if (locationFetchErrorCount > 0) {
-              connectorDaySkipped += 1;
-              await ledgerInsertRunDay(ledgerEnabled, {
-                run_id: runId,
-                run_mode: RUN_MODE,
-                day_utc: dayUtc,
-                connector_id: connectorId,
-                source_kind: "download",
-                status: "skipped",
-                rows_read: 0,
-                rows_written_aqilevels: 0,
-                objects_written_r2: 0,
-                checkpoint_json: {
-                  source_adapter: sourceAdapter,
-                  skip_reason: "no_location_day_source_files",
-                  candidate_location_count: candidateLocationIds.length,
-                  ...sourceCheckpointJson,
-                },
-                started_at: startedAt,
-                finished_at: nowIso(),
-              });
-              continue;
-            }
             sourceCheckpointJson.empty_manifest_written = true;
             sourceCheckpointJson.empty_manifest_reason =
               "no_location_day_source_files";
