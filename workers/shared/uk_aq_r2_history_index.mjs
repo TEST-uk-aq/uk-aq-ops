@@ -1,11 +1,56 @@
+import { createHash } from "node:crypto";
 import {
   hasRequiredR2Config,
   normalizePrefix,
   r2GetObject,
+  r2HeadObject,
   r2ListAllCommonPrefixes,
   r2PutObject,
   sha256Hex,
 } from "./r2_sigv4.mjs";
+
+// MD5 hex of the body bytes — matches the etag R2 returns for single-part
+// PUTs (all our manifests are small enough that R2 never splits them).
+function md5HexOfBody(body) {
+  const buf = typeof body === "string" ? Buffer.from(body, "utf-8") : body;
+  return createHash("md5").update(buf).digest("hex");
+}
+
+function stripEtagQuotes(etag) {
+  if (!etag) return null;
+  const cleaned = String(etag).trim().replace(/^["W\/]+|"+$/g, "").toLowerCase();
+  return cleaned || null;
+}
+
+// Idempotent PUT: HEAD the existing object, compare its etag with the MD5 of
+// the new body, skip the PUT if they match. Avoids re-writing R2 objects
+// every rebuild when the payload content is byte-identical (a common case
+// once `generated_at` is data-driven). Saves R2 PUT operations *and* keeps
+// downstream consumers — like the Dropbox backup builder — fast by not
+// churning their etag-skip baseline.
+async function r2PutObjectIfChanged({ r2, key, body, content_type }) {
+  const newMd5 = md5HexOfBody(body);
+  const bodyBytes = typeof body === "string"
+    ? Buffer.byteLength(body, "utf-8")
+    : body.length;
+
+  let existingEtag = null;
+  try {
+    const head = await r2HeadObject({ r2, key });
+    if (head?.exists) {
+      existingEtag = stripEtagQuotes(head.etag);
+    }
+  } catch (_err) {
+    // HEAD failure is non-fatal — treat as "unknown" and proceed to PUT.
+  }
+
+  if (existingEtag && existingEtag === newMd5) {
+    return { key, etag: existingEtag, bytes: bodyBytes, skipped: true };
+  }
+
+  const result = await r2PutObject({ r2, key, body, content_type });
+  return { ...result, skipped: false };
+}
 
 // Phase 6.5 Pass A backfill (Path 2): parquet-wasm + arrow read paths.
 // Imported lazily on first use so the module's cold-start cost stays low
@@ -553,7 +598,7 @@ async function maybePatchConnectorManifestWithCounts({
   };
   const newHash = sha256Hex(JSON.stringify(patchedWithoutHash));
   const patched = { ...patchedWithoutHash, manifest_hash: newHash };
-  await r2PutObject({
+  await r2PutObjectIfChanged({
     r2,
     key: manifestKey,
     body: `${JSON.stringify(patched, null, 2)}\n`,
@@ -613,7 +658,14 @@ function buildObservationTimeseriesConnectorIndexPayload({
 
   return {
     schema_version: OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: prefer the source connector manifest's backed_up_at_utc so
+    // this index payload is byte-identical run-to-run when source data didn't
+    // change. Falls back to caller-supplied generatedAt (which may still be
+    // wall-clock from a default-arg) only when the source has no timestamp.
+    generated_at:
+      toIsoOrNull(connectorManifest?.backed_up_at_utc)
+      || toIsoOrNull(generatedAt)
+      || null,
     source: "r2_connector_manifest",
     domain: "observations",
     index_kind: "timeseries_file_ranges",
@@ -717,7 +769,11 @@ function buildAqilevelTimeseriesConnectorIndexPayload({
 
   return {
     schema_version: AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: see buildObservationTimeseriesConnectorIndexPayload note.
+    generated_at:
+      toIsoOrNull(connectorManifest?.backed_up_at_utc)
+      || toIsoOrNull(generatedAt)
+      || null,
     source: "r2_connector_manifest",
     domain: "aqilevels",
     index_kind: "timeseries_file_ranges",
@@ -1048,7 +1104,7 @@ export async function rebuildR2HistoryIndexForDomain({
   });
   const indexKey = buildR2HistoryIndexKey(indexPrefix, normalizedDomain);
   const body = `${JSON.stringify(payload, null, 2)}\n`;
-  const putResult = await r2PutObject({
+  const putResult = await r2PutObjectIfChanged({
     r2,
     key: indexKey,
     body,
@@ -1059,6 +1115,7 @@ export async function rebuildR2HistoryIndexForDomain({
     domain: normalizedDomain,
     index_key: indexKey,
     index_bytes: putResult.bytes,
+    index_put_skipped: Boolean(putResult.skipped),
     day_prefix_count: dayList.length,
     indexed_day_count: payload.day_count,
     total_rows: payload.total_rows,
@@ -1149,7 +1206,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
               target.connector_id,
             );
             const body = `${JSON.stringify(payload, null, 2)}\n`;
-            await r2PutObject({
+            const putResult = await r2PutObjectIfChanged({
               r2,
               key: connectorIndexKey,
               body,
@@ -1160,6 +1217,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
               index_key: connectorIndexKey,
               file_count: payload.file_count,
               indexed_file_count: payload.indexed_file_count,
+              put_skipped: Boolean(putResult.skipped),
             };
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1232,7 +1290,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
 
   const latestKey = buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix);
   const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
-  const latestPut = await r2PutObject({
+  const latestPut = await r2PutObjectIfChanged({
     r2,
     key: latestKey,
     body: latestBody,
@@ -1244,6 +1302,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
     index_kind: "timeseries_file_ranges",
     latest_index_key: latestKey,
     latest_index_bytes: latestPut.bytes,
+    latest_index_put_skipped: Boolean(latestPut.skipped),
     observations_timeseries_index_prefix: normalizedTimeseriesPrefix,
     indexed_day_count: latestPayload.day_count,
     connector_index_count: connectorIndexCount,
@@ -1325,7 +1384,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
               target.connector_id,
             );
             const body = `${JSON.stringify(payload, null, 2)}\n`;
-            await r2PutObject({
+            const putResult = await r2PutObjectIfChanged({
               r2,
               key: connectorIndexKey,
               body,
@@ -1336,6 +1395,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
               index_key: connectorIndexKey,
               file_count: payload.file_count,
               indexed_file_count: payload.indexed_file_count,
+              put_skipped: Boolean(putResult.skipped),
             };
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1408,7 +1468,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
 
   const latestKey = buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix);
   const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
-  const latestPut = await r2PutObject({
+  const latestPut = await r2PutObjectIfChanged({
     r2,
     key: latestKey,
     body: latestBody,
@@ -1420,6 +1480,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
     index_kind: "timeseries_file_ranges",
     latest_index_key: latestKey,
     latest_index_bytes: latestPut.bytes,
+    latest_index_put_skipped: Boolean(latestPut.skipped),
     aqilevels_timeseries_index_prefix: normalizedTimeseriesPrefix,
     indexed_day_count: latestPayload.day_count,
     connector_index_count: connectorIndexCount,

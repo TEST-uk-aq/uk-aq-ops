@@ -303,3 +303,25 @@ One or two runs to converge. Even worst case, by the day after tomorrow it'll be
 The report_daily_task_health step has if: always() so it'll still record this run's status (cancelled = failed) before the runner exits. So you'll see a "failed" entry in daily_task_runs for today — that's just a side effect of the migration cost; tomorrow's run should record ok.
 
 Sleep well — the chart-gap diagnostic is the only thing left in queue, and that's a 30-second DevTools check whenever you get back to it.
+
+
+Day scan went from 22 min → 2.4 min (9× speedup as expected). Index trees barely budged (8.2 min vs 8.4 min) because they don't have sibling noise — only the manifests we want — so --max-depth had nothing to filter out there.
+
+Breakdown:
+
+Phase	Before	After	Note
+Day scan	22.5 min	2.4 min	--max-depth 2 stripped parquet enumeration ✓
+Index files	4.4 sec	4.2 sec	Unchanged (was already cheap)
+Tree scan	8.4 min	8.2 min	Not max-depth-limited; ~2000 connector subprefixes × LIST round-trips dominates
+Total	31 min	10.7 min	
+Tree scan being the new bottleneck is inherent to S3-style listing across thousands of subprefixes — each connector folder is its own LIST call. Could potentially be optimized further by using a single non-recursive lsjson + parsing keys ourselves, but it's small enough to not bother right now.
+
+Sync prediction
+Yesterday's sync ran for ~60 min before being killed. At ~1 sec per rclone copyto, that's roughly 3600 units. You had 4 + 3922 = 3926 units to copy, so it likely got almost all of them done. Today's sync should:
+
+Skip the ~3600 units already in the checkpoint → instant
+Re-attempt the remaining ~300-ish that didn't finish → ~5 min
+New: nothing (no R2 changes overnight, just steady-state daily delta)
+So I'd expect 5-15 minutes for sync today. Tomorrow it'll be seconds.
+
+Total today: builder 10 min + sync ~10 min = ~20 min. Well inside the 120-min budget.
