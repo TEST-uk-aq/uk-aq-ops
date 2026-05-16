@@ -29,6 +29,7 @@ import {
   joinTargetPath,
   rcloneCatMaybe,
   runRclone,
+  runRcloneWithRetry,
   sha256Hex,
   uploadFromTempFile,
 } from "./lib/rclone.mjs";
@@ -61,6 +62,41 @@ const DEFAULT_REPORT_OUT = String(process.env.UK_AQ_R2_HISTORY_BACKUP_REPORT_OUT
 const DEFAULT_INVENTORY_REL_PATH_ENV =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim()
   || DEFAULT_INVENTORY_REL_PATH;
+const DROPBOX_WRITE_RETRY_MAX_ATTEMPTS = 7;
+const DROPBOX_WRITE_RETRY_INITIAL_DELAY_MS = 5_000;
+const DROPBOX_WRITE_RETRY_MAX_DELAY_MS = 60_000;
+const DROPBOX_WRITE_RETRY_BACKOFF_MULTIPLIER = 2;
+
+function isDropboxTooManyWriteOperationsError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /too_many_write_operations/i.test(message);
+}
+
+function onDropboxWriteRetry(event) {
+  const errMessage = event.error instanceof Error ? event.error.message : String(event.error);
+  const compactMessage = errMessage.split("\n")[0] || "unknown error";
+  const retryAfterSec = Math.ceil(Number(event.delay_ms || 0) / 1000);
+  console.warn(
+    `[uk_aq_r2_history_dropbox_backup] Dropbox write throttled `
+    + `(attempt ${event.attempt}/${event.max_attempts}); `
+    + `retrying in ${retryAfterSec}s. ${compactMessage}`,
+  );
+}
+
+function dropboxWriteRetryOptions() {
+  return {
+    max_attempts: DROPBOX_WRITE_RETRY_MAX_ATTEMPTS,
+    initial_delay_ms: DROPBOX_WRITE_RETRY_INITIAL_DELAY_MS,
+    max_delay_ms: DROPBOX_WRITE_RETRY_MAX_DELAY_MS,
+    backoff_multiplier: DROPBOX_WRITE_RETRY_BACKOFF_MULTIPLIER,
+    should_retry: isDropboxTooManyWriteOperationsError,
+    on_retry: onDropboxWriteRetry,
+  };
+}
+
+function runDropboxWriteAwareRclone(rcloneBin, rcloneArgs) {
+  runRcloneWithRetry(rcloneBin, rcloneArgs, dropboxWriteRetryOptions());
+}
 
 function usage() {
   console.log(
@@ -322,6 +358,7 @@ function writeCheckpointState(rcloneBin, checkpointPath, state) {
     checkpointPath,
     `${JSON.stringify(state, null, 2)}\n`,
     "uk_aq_r2_history_backup_state_",
+    dropboxWriteRetryOptions(),
   );
 }
 
@@ -383,13 +420,21 @@ function copyDayFolder(rcloneBin, sourceDayPath, destDayPath, dryRun) {
     "--fast-list",
   ];
   if (dryRun) args.push("--dry-run");
-  runRclone(rcloneBin, args);
+  if (dryRun) {
+    runRclone(rcloneBin, args);
+    return;
+  }
+  runDropboxWriteAwareRclone(rcloneBin, args);
 }
 
 function copyFilePath(rcloneBin, sourcePath, destPath, dryRun) {
   const args = ["copyto", sourcePath, destPath, "--check-first"];
   if (dryRun) args.push("--dry-run");
-  runRclone(rcloneBin, args);
+  if (dryRun) {
+    runRclone(rcloneBin, args);
+    return;
+  }
+  runDropboxWriteAwareRclone(rcloneBin, args);
 }
 
 // ---- Planning (inventory-driven) ----

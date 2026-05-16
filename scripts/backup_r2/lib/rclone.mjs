@@ -59,6 +59,71 @@ export function runRclone(rcloneBin, rcloneArgs, options = {}) {
   return { status, stdout, stderr };
 }
 
+function sleepMs(delayMs) {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+  const bounded = Math.trunc(delayMs);
+  const int32Max = 2_147_483_647;
+  const duration = Math.min(bounded, int32Max);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, duration);
+}
+
+function defaultRetryMatcher(error) {
+  return false;
+}
+
+export function runRcloneWithRetry(rcloneBin, rcloneArgs, options = {}) {
+  const maxAttempts = Number.isFinite(Number(options.max_attempts))
+    ? Math.max(1, Math.trunc(Number(options.max_attempts)))
+    : 1;
+  const initialDelayMs = Number.isFinite(Number(options.initial_delay_ms))
+    ? Math.max(0, Math.trunc(Number(options.initial_delay_ms)))
+    : 0;
+  const maxDelayMs = Number.isFinite(Number(options.max_delay_ms))
+    ? Math.max(0, Math.trunc(Number(options.max_delay_ms)))
+    : initialDelayMs;
+  const backoffMultiplier = Number.isFinite(Number(options.backoff_multiplier))
+    ? Math.max(1, Number(options.backoff_multiplier))
+    : 2;
+  const shouldRetry = typeof options.should_retry === "function"
+    ? options.should_retry
+    : defaultRetryMatcher;
+  const onRetry = typeof options.on_retry === "function"
+    ? options.on_retry
+    : null;
+
+  let attempt = 1;
+  let delayMs = initialDelayMs;
+  while (attempt <= maxAttempts) {
+    try {
+      return runRclone(rcloneBin, rcloneArgs, options);
+    } catch (error) {
+      const retryable = attempt < maxAttempts && shouldRetry(error);
+      if (!retryable) {
+        throw error;
+      }
+
+      if (onRetry) {
+        try {
+          onRetry({
+            attempt,
+            max_attempts: maxAttempts,
+            delay_ms: delayMs,
+            args: [...rcloneArgs],
+            error,
+          });
+        } catch {
+          // Never fail the retry path because a logger callback throws.
+        }
+      }
+
+      sleepMs(delayMs);
+      delayMs = Math.min(maxDelayMs, Math.max(delayMs + 1, Math.trunc(delayMs * backoffMultiplier)));
+      attempt += 1;
+    }
+  }
+  throw new Error("unreachable");
+}
+
 export function isRcloneNotFoundMessage(text) {
   const normalized = String(text || "").toLowerCase();
   return (
@@ -179,12 +244,22 @@ export function rcloneLsjsonFile(rcloneBin, parentPath, fileName, { hash = true 
 
 // Write `content` to a temp file, then `rclone copyto` it to `remoteTargetPath`.
 // Used for both inventory and checkpoint uploads.
-export function uploadFromTempFile(rcloneBin, remoteTargetPath, content, tempPrefix = "uk_aq_r2_upload_") {
+export function uploadFromTempFile(
+  rcloneBin,
+  remoteTargetPath,
+  content,
+  tempPrefix = "uk_aq_r2_upload_",
+  retryOptions = null,
+) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), tempPrefix));
   const tempFile = path.join(tempDir, "upload.tmp");
   try {
     fs.writeFileSync(tempFile, content, "utf8");
-    runRclone(rcloneBin, ["copyto", tempFile, remoteTargetPath]);
+    if (retryOptions) {
+      runRcloneWithRetry(rcloneBin, ["copyto", tempFile, remoteTargetPath], retryOptions);
+    } else {
+      runRclone(rcloneBin, ["copyto", tempFile, remoteTargetPath]);
+    }
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
