@@ -181,6 +181,20 @@ function toIsoOrNull(value) {
   return new Date(ms).toISOString();
 }
 
+// Pick the latest ISO timestamp from an array of strings. Used to derive
+// data-driven `generated_at` values for aggregate index files so they stay
+// byte-stable run-to-run when underlying sources haven't changed.
+function pickMaxIsoTimestamp(values) {
+  let maxMs = -Infinity;
+  for (const value of (Array.isArray(values) ? values : [])) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms)) continue;
+    if (ms > maxMs) maxMs = ms;
+  }
+  return maxMs === -Infinity ? null : new Date(maxMs).toISOString();
+}
+
 function buildDayCutoff(maxLookbackDays, todayDay = new Date().toISOString().slice(0, 10)) {
   if (!Number.isFinite(maxLookbackDays) || maxLookbackDays <= 0) {
     return null;
@@ -922,7 +936,14 @@ export function buildDomainIndexPayload({
   );
   return {
     schema_version: INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: derive from the latest source day-manifest's backed_up_at_utc
+    // so this payload is byte-identical run-to-run when underlying day manifests
+    // didn't change. Falls back to caller-supplied generatedAt only when no
+    // source has a timestamp.
+    generated_at:
+      pickMaxIsoTimestamp(sortedSummaries.map((entry) => entry?.backed_up_at_utc))
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
     source: "r2_day_manifests",
     domain: normalizedDomain,
     bucket: String(bucket || "").trim() || null,
@@ -1218,6 +1239,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
               file_count: payload.file_count,
               indexed_file_count: payload.indexed_file_count,
               put_skipped: Boolean(putResult.skipped),
+              backed_up_at_utc: payload.backed_up_at_utc,
             };
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1262,7 +1284,16 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
 
   const latestPayload = {
     schema_version: OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: see buildDomainIndexPayload note. Derived from the latest
+    // backed_up_at_utc across all per-(day, connector) index payloads.
+    generated_at:
+      pickMaxIsoTimestamp(
+        daySummaries.flatMap((entry) =>
+          (entry.connector_indexes || []).map((c) => c.backed_up_at_utc),
+        ),
+      )
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
     source: "r2_connector_manifests",
     domain: "observations",
     index_kind: "timeseries_file_ranges",
@@ -1396,6 +1427,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
               file_count: payload.file_count,
               indexed_file_count: payload.indexed_file_count,
               put_skipped: Boolean(putResult.skipped),
+              backed_up_at_utc: payload.backed_up_at_utc,
             };
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1440,7 +1472,15 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
 
   const latestPayload = {
     schema_version: AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    // Data-driven: see buildDomainIndexPayload note.
+    generated_at:
+      pickMaxIsoTimestamp(
+        daySummaries.flatMap((entry) =>
+          (entry.connector_indexes || []).map((c) => c.backed_up_at_utc),
+        ),
+      )
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
     source: "r2_connector_manifests",
     domain: "aqilevels",
     index_kind: "timeseries_file_ranges",
