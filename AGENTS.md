@@ -28,3 +28,11 @@
 - Prefer stable request URLs/params for normal traffic so Cloudflare cache can return warm-cache hits.
 - Use cache-buster/version params only for diagnostics, forced-refresh actions, or explicit bypass-cache testing.
 - When evaluating performance/cost changes, check cache-hit behavior (`CF-Cache-Status`) and distinguish cache-hit traffic from origin-fetch traffic.
+
+## R2 History Index Byte-Stability Policy
+
+- Payloads written by `workers/shared/uk_aq_r2_history_index.mjs` (the R2 history index manifests under `history/_index/...`) must be byte-identical run-to-run when the underlying source data has not changed.
+- Every field — `generated_at`, key ordering, number formatting, optional fields — must be derived from the source manifests, never from wall-clock time, run IDs, or other run-scoped state.
+- Why: any byte change rotates the R2 etag, which invalidates the etag-skip baseline in `scripts/backup_r2/build_backup_inventory.mjs`. A blanket churn forces the next inventory build to re-read every changed manifest (hours of `rclone cat` round-trips) and the Dropbox sync to re-upload every one (hours more, plus Dropbox write-rate throttling). Commit `2aa79d5` (2026-05-17) is the reference incident — moving `generated_at` to data-driven fixed it but produced a one-time multi-hour transition cost.
+- When editing the index builder: treat byte-stability as load-bearing. If you add a new field, source it from the manifests; if you need a timestamp, derive it from `max(source.backed_up_at_utc)` or similar.
+- If you have to make a non-data-driven change, expect and call out the one-time inventory + Dropbox sync cost in the PR description.
