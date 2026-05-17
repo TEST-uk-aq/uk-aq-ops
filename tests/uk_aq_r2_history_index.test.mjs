@@ -121,6 +121,64 @@ test("resolveR2HistoryIndexConfig uses deploy bucket mapping when explicit bucke
   );
 });
 
+test("buildDomainIndexPayload derives generated_at from latest day-summary backed_up_at_utc", () => {
+  const payload = buildDomainIndexPayload({
+    domain: "observations",
+    prefix: "history/v1/observations",
+    bucket: "uk-aq-history-dev",
+    generatedAt: "2026-05-17T12:00:00.000Z",
+    daySummaries: [
+      {
+        day_utc: "2026-03-10",
+        total_rows: 20,
+        backed_up_at_utc: "2026-03-10T08:00:00.000Z",
+      },
+      {
+        day_utc: "2026-03-12",
+        total_rows: 30,
+        backed_up_at_utc: "2026-03-13T04:50:02.685Z",
+      },
+      {
+        day_utc: "2026-01-15",
+        total_rows: 10,
+        backed_up_at_utc: "2026-01-15T22:00:00.000Z",
+      },
+    ],
+  });
+
+  assert.equal(payload.generated_at, "2026-03-13T04:50:02.685Z");
+});
+
+test("buildDomainIndexPayload falls back to generatedAt when no source backed_up_at_utc available", () => {
+  const payload = buildDomainIndexPayload({
+    domain: "observations",
+    prefix: "history/v1/observations",
+    bucket: "uk-aq-history-dev",
+    generatedAt: "2026-05-17T12:00:00.000Z",
+    daySummaries: [
+      { day_utc: "2026-03-10", total_rows: 20 },
+      { day_utc: "2026-03-12", total_rows: 30, backed_up_at_utc: null },
+    ],
+  });
+
+  assert.equal(payload.generated_at, "2026-05-17T12:00:00.000Z");
+});
+
+test("buildDomainIndexPayload is byte-stable across repeated calls with same source data", () => {
+  const args = {
+    domain: "aqilevels",
+    prefix: "history/v1/aqilevels",
+    bucket: "uk-aq-history-dev",
+    daySummaries: [
+      { day_utc: "2026-03-12", total_rows: 5, backed_up_at_utc: "2026-03-12T01:00:00.000Z" },
+    ],
+  };
+  const first = JSON.stringify(buildDomainIndexPayload({ ...args, generatedAt: "2026-05-17T10:00:00.000Z" }));
+  const second = JSON.stringify(buildDomainIndexPayload({ ...args, generatedAt: "2026-05-17T15:30:00.000Z" }));
+
+  assert.equal(first, second);
+});
+
 test("observations timeseries index keys follow expected history/_index layout", () => {
   const latestKey = buildR2HistoryObservationsTimeseriesLatestKey("history/_index");
   const connectorKey = buildR2HistoryObservationsTimeseriesConnectorIndexKey(
