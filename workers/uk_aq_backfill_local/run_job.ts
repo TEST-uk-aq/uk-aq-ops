@@ -10977,21 +10977,40 @@ async function runSourceToAll(
           );
           if (targetedTimeseriesIds.length > 0) {
             const targetedSet = new Set(targetedTimeseriesIds);
-            const localObsRows = await loadObsRowsForConnectorDayFromLocalHistory(
+            const rawLocalObsRows = await loadObsRowsForConnectorDayFromLocalHistory(
               dayUtc,
               connectorId,
             );
-            const localAqiRows = sourceObservationsOnly
+            const rawLocalAqiRows = sourceObservationsOnly
               ? null
               : await loadAqiRowsForConnectorDayFromLocalHistory(
                 dayUtc,
                 connectorId,
               );
-            if (!localObsRows || (!sourceObservationsOnly && !localAqiRows)) {
-              throw new Error(
-                `source_to_r2 targeted merge requires local Dropbox history manifests for day=${dayUtc} connector=${connectorId}`,
+            // When no local history exists for this (day, connector), there is
+            // nothing to preserve — treat preservation as empty and write the
+            // replacement rows as a fresh manifest. Covers integrity backfills
+            // for days the original ingest missed (upstream outage, fresh
+            // historical backfill, etc.).
+            const localHistoryMissing = !rawLocalObsRows ||
+              (!sourceObservationsOnly && !rawLocalAqiRows);
+            if (localHistoryMissing) {
+              logStructured(
+                "info",
+                "source_to_r2_targeted_merge_no_local_history",
+                {
+                  run_id: runId,
+                  day_utc: dayUtc,
+                  connector_id: connectorId,
+                  source_adapter: sourceAdapter,
+                  obs_local_missing: !rawLocalObsRows,
+                  aqi_local_missing: !sourceObservationsOnly && !rawLocalAqiRows,
+                  targeted_timeseries_id_count: targetedTimeseriesIds.length,
+                },
               );
             }
+            const localObsRows = rawLocalObsRows ?? [];
+            const localAqiRows = rawLocalAqiRows;
 
             const replacementObsRows = obsHistoryRows.filter((row) =>
               targetedSet.has(row.timeseries_id)
@@ -11010,7 +11029,10 @@ async function runSourceToAll(
               replacementObsRows.length;
             sourceCheckpointJson.targeted_preserved_obs_rows =
               preservedObsRows.length;
-            if (!sourceObservationsOnly && localAqiRows) {
+            sourceCheckpointJson.targeted_local_history_missing =
+              localHistoryMissing;
+            if (!sourceObservationsOnly) {
+              const effectiveLocalAqiRows = localAqiRows ?? [];
               const mergedSourceRows = mapR2ObservationRowsToSourceObservations({
                 rows: obsHistoryRows.map((row) => ({
                   timeseries_id: row.timeseries_id,
@@ -11029,7 +11051,7 @@ async function runSourceToAll(
                   dayUtc,
                 ),
               );
-              const preservedAqiRows = localAqiRows.filter((row) =>
+              const preservedAqiRows = effectiveLocalAqiRows.filter((row) =>
                 !targetedSet.has(row.timeseries_id)
               );
               aqilevelRows = dedupeAqiHistoryRows([
