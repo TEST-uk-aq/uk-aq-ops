@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_db_size_logger_cloud_run/**"
+      - "workers/shared/r2_sigv4.mjs"
       - "scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
       - ".github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml"
   workflow_dispatch:

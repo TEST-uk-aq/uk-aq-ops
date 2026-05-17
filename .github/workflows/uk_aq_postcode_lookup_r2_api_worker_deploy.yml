@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_postcode_lookup_r2_api_worker/**"
+      - "workers/shared/postcode_lookup.mjs"
       - ".github/workflows/uk_aq_postcode_lookup_r2_api_worker_deploy.yml"
   workflow_dispatch:
 

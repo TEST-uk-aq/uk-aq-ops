@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_supabase_db_dump_backup_service/**"
+      - "workers/shared/daily_task_health.mjs"
       - "scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
       - ".github/workflows/uk_aq_supabase_db_dump_backup_service_deploy.yml"
   workflow_dispatch:

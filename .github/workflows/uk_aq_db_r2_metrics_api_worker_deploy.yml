@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - "workers/uk_aq_db_size_metrics_api_worker/**"
+      - "workers/shared/r2_sigv4.mjs"
+      - "workers/shared/uk_aq_r2_history_index.mjs"
       - ".github/workflows/uk_aq_db_r2_metrics_api_worker_deploy.yml"
   workflow_dispatch:
 

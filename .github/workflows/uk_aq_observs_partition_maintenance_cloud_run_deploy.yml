@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_observs_partition_maintenance_service/server.mjs"
+      - "workers/shared/daily_task_health.mjs"
       - "Dockerfile"
       - "package.json"
       - "package-lock.json"
