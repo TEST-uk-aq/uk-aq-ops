@@ -1,3 +1,21 @@
+// INVARIANT: index payloads written by this module must be byte-identical
+// run-to-run when the underlying source data hasn't changed. Every field
+// (including `generated_at`, key ordering, number formatting, optional
+// fields, etc.) needs to be derived from the source data — never from
+// wall-clock time, run IDs, or other run-scoped state.
+//
+// Why this matters: any byte change rotates the R2 etag, which invalidates
+// the etag-skip baseline used by scripts/backup_r2/build_backup_inventory.mjs.
+// A blanket churn forces the next inventory build to re-read every changed
+// manifest (hours of `rclone cat` round-trips) AND the Dropbox sync to
+// re-upload every one of them (hours more, plus Dropbox write-rate
+// throttling). The 2026-05-17 transition to a data-driven `generated_at`
+// produced exactly this cascade — see commit 2aa79d5.
+//
+// When editing this file, treat byte-stability as a load-bearing property.
+// If you add a new field, source it from the manifests; if you need a
+// timestamp, derive it from `max(source.backed_up_at_utc)` or similar.
+
 import { createHash } from "node:crypto";
 import {
   hasRequiredR2Config,
