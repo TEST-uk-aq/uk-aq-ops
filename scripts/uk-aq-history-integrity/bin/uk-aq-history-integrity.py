@@ -19,6 +19,7 @@ import concurrent.futures
 import datetime as dt
 import gzip
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -1135,6 +1136,10 @@ def _http_get_to_file(
 
 
 def _is_retryable_url_error(exc: BaseException) -> bool:
+    if isinstance(exc, http.client.IncompleteRead):
+        return True
+    if isinstance(exc, http.client.RemoteDisconnected):
+        return True
     if isinstance(exc, urllib.error.HTTPError):
         return int(exc.code) in RETRYABLE_HTTP_STATUS_CODES
     if isinstance(exc, urllib.error.URLError):
@@ -2650,10 +2655,26 @@ def _sc_fetch_day_index(
     """
     url = _sc_day_url(base_url, day)
     req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"GET {url} returned {resp.status}")
-        body = resp.read()
+    body: bytes | None = None
+    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"GET {url} returned {resp.status}")
+                body = resp.read()
+            break
+        except urllib.error.HTTPError as e:
+            if _is_retryable_url_error(e) and attempt < HTTP_RETRY_ATTEMPTS:
+                _sleep_http_retry("GET", url, attempt, e)
+                continue
+            raise
+        except Exception as e:
+            if _is_retryable_url_error(e) and attempt < HTTP_RETRY_ATTEMPTS:
+                _sleep_http_retry("GET", url, attempt, e)
+                continue
+            raise
+    if body is None:
+        raise RuntimeError(f"GET {url} failed after retries")
     text = body.decode("utf-8", errors="replace")
     out: dict[str, str] = {}
     for match in SC_INDEX_FILENAME_RE.finditer(text):

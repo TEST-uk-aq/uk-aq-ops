@@ -26,7 +26,7 @@ Optional env vars:
   UK_AQ_BACKFILL_TIMESERIES_IDS             optional CSV timeseries filter
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
   UK_AQ_BACKFILL_OUTPUT_SCOPE               default|observations_only|aqilevels_only (default: default)
-  UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_DROPBOX_ROOT/uk-aq-backfill-local-logs
+  UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_ENV_NAME/uk-aq-backfill-local-logs
   UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true
   UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS       default: 0
   UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE        default: 0 (disabled)
@@ -52,15 +52,19 @@ trim() {
 
 build_default_log_dir() {
   local env_root
-  env_root="$(trim "${UK_AQ_DROPBOX_ROOT:-}")"
+  env_root="$(trim "${UK_AQ_ENV_NAME:-}")"
+  if [[ -z "${env_root}" ]]; then
+    env_root="$(trim "${UK_AQ_DROPBOX_ROOT:-}")"
+  fi
   while [[ "${env_root}" == /* ]]; do
     env_root="${env_root#/}"
   done
   while [[ "${env_root}" == */ ]]; do
     env_root="${env_root%/}"
   done
+
   if [[ -z "${env_root}" ]]; then
-    env_root="CIC-Test"
+    env_root="local"
   fi
   printf '/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/%s/uk-aq-backfill-local-logs' "${env_root}"
 }

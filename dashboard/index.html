@@ -73,10 +73,35 @@
         letter-spacing: -0.02em;
       }
 
-      header p {
-        margin: 0;
-        color: var(--ink-soft);
-        max-width: 740px;
+      .mode-switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .mode-switch-btn {
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--ink);
+        border-radius: 999px;
+        padding: 8px 14px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+
+      .mode-switch-btn.is-active {
+        background: var(--ink);
+        color: #fff;
+        border-color: var(--ink);
+        cursor: default;
+      }
+
+      .mode-switch-btn:not(.is-active):hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 16px rgba(34, 24, 12, 0.18);
       }
 
       .meta {
@@ -116,6 +141,38 @@
         flex-wrap: wrap;
         gap: 10px 16px;
         align-items: center;
+      }
+
+      .refresh-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .refresh-left {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      .refresh-right {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .dropbox-mtime-value {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 14px;
+        color: var(--ink);
+        word-break: break-word;
+      }
+
+      .dropbox-mtime-note {
+        margin-top: 8px;
       }
 
       .refresh-controls span {
@@ -177,6 +234,15 @@
       .grid {
         display: grid;
         gap: 22px;
+      }
+
+      .mode-view {
+        display: grid;
+        gap: 22px;
+      }
+
+      .mode-view[hidden] {
+        display: none;
       }
 
       .panel {
@@ -1228,43 +1294,28 @@
     <div class="shell">
       <header>
         <h1 id="dashboard-title">UK AQ Dashboard</h1>
-        <p id="dashboard-subtitle">
-          Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates
-          from your local API.
-        </p>
-        <div class="meta">
-          <div class="meta-left">
-            <span class="meta-status" id="status">Waiting for data...</span>
-            <span class="meta-note" id="data-meta">Project n/a</span>
-          </div>
-          <div class="refresh-controls">
-            <span>Refresh</span>
-            <div class="refresh-group" id="refresh-group">
-              <span class="refresh-pill">
-                <input type="radio" name="refresh" id="refresh-1" value="60" />
-                <label for="refresh-1">1 min</label>
-              </span>
-              <span class="refresh-pill">
-                <input type="radio" name="refresh" id="refresh-5" value="300" checked />
-                <label for="refresh-5">5 min</label>
-              </span>
-              <span class="refresh-pill">
-                <input type="radio" name="refresh" id="refresh-10" value="600" />
-                <label for="refresh-10">10 min</label>
-              </span>
-              <span class="refresh-pill">
-                <input type="radio" name="refresh" id="refresh-30" value="1800" />
-                <label for="refresh-30">30 min</label>
-              </span>
-              <span class="refresh-pill">
-                <input type="radio" name="refresh" id="refresh-60" value="3600" />
-                <label for="refresh-60">60 min</label>
-              </span>
-            </div>
-            <button class="refresh-button" id="refresh-now">Refresh now</button>
-          </div>
+        <div class="mode-switch" role="tablist" aria-label="Dashboard mode">
+          <button
+            id="mode-ingest"
+            class="mode-switch-btn is-active"
+            type="button"
+            data-mode="ingest"
+            role="tab"
+            aria-selected="true"
+          >
+            Ingest
+          </button>
+          <button
+            id="mode-operations"
+            class="mode-switch-btn"
+            type="button"
+            data-mode="operations"
+            role="tab"
+            aria-selected="false"
+          >
+            Operations
+          </button>
         </div>
-        <div class="error" id="error"></div>
       </header>
 
       <div class="grid" id="dashboard"></div>
@@ -1276,8 +1327,6 @@
         envName: "local",
         apiBaseUrl: "/api",
         dashboardTitle: "UK AQ Dashboard",
-        dashboardSubtitle:
-          "Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates from your local API.",
         defaultRefreshSeconds: 300,
       };
       const runtimeConfig =
@@ -1338,23 +1387,50 @@
 
       const dashboardEl = document.getElementById("dashboard");
       const dashboardTitleEl = document.getElementById("dashboard-title");
-      const dashboardSubtitleEl = document.getElementById("dashboard-subtitle");
-      const statusEl = document.getElementById("status");
-      const dataMetaEl = document.getElementById("data-meta");
-      const errorEl = document.getElementById("error");
-      const refreshGroup = document.getElementById("refresh-group");
-      const refreshNowBtn = document.getElementById("refresh-now");
+      const modeIngestBtn = document.getElementById("mode-ingest");
+      const modeOperationsBtn = document.getElementById("mode-operations");
+      const DASHBOARD_MODE_STORAGE_KEY = "uk_aq_dashboard_mode";
+      const DASHBOARD_REFRESH_INGEST_STORAGE_KEY = "uk_aq_dashboard_refresh_ingest_seconds";
+      const DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY = "uk_aq_dashboard_refresh_operations_seconds";
+      const OPERATIONS_DAY_STORAGE_KEY = "uk_aq_dashboard_operations_day";
+      const DASHBOARD_MODES = new Set(["ingest", "operations"]);
+      let activeMode = "ingest";
+      let statusEl = null;
+      let dataMetaEl = null;
+      let errorEl = null;
+      let refreshGroup = null;
+      let refreshNowBtn = null;
       let refreshTimer = null;
-      let refreshSeconds = Number(runtimeConfig.defaultRefreshSeconds) || 300;
+      let operationsDropboxPollTimer = null;
+      let operationsDayValue = null;
+      const modeContainers = {
+        ingest: null,
+        operations: null,
+      };
+      const modeIsLoading = {
+        ingest: false,
+        operations: false,
+      };
+      const modeLastLoadedAtMs = {
+        ingest: 0,
+        operations: 0,
+      };
+      const refreshSecondsByMode = {
+        ingest: Number(runtimeConfig.defaultRefreshSeconds) || 300,
+        operations: 1800,
+      };
+      let modeStatusText = "Waiting for data...";
+      let modeDataMetaText = "Project n/a";
+      let modeErrorText = "";
       let wasInactive = document.hidden || !document.hasFocus();
-      if (!Number.isFinite(refreshSeconds) || refreshSeconds <= 0) {
-        refreshSeconds = 300;
+      if (!Number.isFinite(refreshSecondsByMode.ingest) || refreshSecondsByMode.ingest <= 0) {
+        refreshSecondsByMode.ingest = 300;
+      }
+      if (!Number.isFinite(refreshSecondsByMode.operations) || refreshSecondsByMode.operations <= 0) {
+        refreshSecondsByMode.operations = 1800;
       }
       if (dashboardTitleEl) {
         dashboardTitleEl.textContent = runtimeConfig.dashboardTitle || DEFAULT_CONFIG.dashboardTitle;
-      }
-      if (dashboardSubtitleEl) {
-        dashboardSubtitleEl.textContent = runtimeConfig.dashboardSubtitle || DEFAULT_CONFIG.dashboardSubtitle;
       }
       if (document && document.title) {
         document.title = runtimeConfig.dashboardTitle || DEFAULT_CONFIG.dashboardTitle;
@@ -1414,6 +1490,7 @@
         "Sunday",
       ];
       const COVERAGE_WEEKDAY_ABBREVIATIONS = ["M", "T", "W", "T", "F", "S", "S"];
+      const REFRESH_OPTIONS_SECONDS = [60, 300, 600, 1800, 3600];
       let dispatchConnectorFilter = "all";
       let dispatchLookbackMinutes = 30;
       let dispatchCursor = null;
@@ -1426,6 +1503,7 @@
       let dashboardLoadSequence = 0;
       let storageCoverageLoadSequence = 0;
       let r2ConnectorCountsLoadSequence = 0;
+      let operationsLoadSequence = 0;
       const R2_CONNECTOR_CHARTS = [
         {
           connectorId: 1,
@@ -1454,6 +1532,22 @@
       ];
 
       try {
+        const storedMode = localStorage.getItem(DASHBOARD_MODE_STORAGE_KEY);
+        if (storedMode && DASHBOARD_MODES.has(storedMode)) {
+          activeMode = storedMode;
+        }
+        const storedIngestRefresh = Number(localStorage.getItem(DASHBOARD_REFRESH_INGEST_STORAGE_KEY));
+        if (REFRESH_OPTIONS_SECONDS.includes(storedIngestRefresh)) {
+          refreshSecondsByMode.ingest = storedIngestRefresh;
+        }
+        const storedOperationsRefresh = Number(localStorage.getItem(DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY));
+        if (REFRESH_OPTIONS_SECONDS.includes(storedOperationsRefresh)) {
+          refreshSecondsByMode.operations = storedOperationsRefresh;
+        }
+        const storedOperationsDay = localStorage.getItem(OPERATIONS_DAY_STORAGE_KEY);
+        if (storedOperationsDay && /^\d{4}-\d{2}-\d{2}$/.test(storedOperationsDay)) {
+          operationsDayValue = storedOperationsDay;
+        }
         const storedConnector = localStorage.getItem(DISPATCH_CONNECTOR_STORAGE_KEY);
         if (storedConnector && DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === storedConnector)) {
           dispatchConnectorFilter = storedConnector;
@@ -1494,6 +1588,9 @@
         }
       } catch (_err) {
         // Ignore storage read issues and use defaults.
+      }
+      if (!operationsDayValue) {
+        operationsDayValue = toUtcDateKey(startOfUtcDay(new Date()));
       }
       if (!storageCoverageMonthCursor) {
         storageCoverageMonthCursor = startOfUtcMonth(new Date());
@@ -2104,16 +2201,25 @@
       }
 
       function setStatus(text) {
-        statusEl.textContent = text;
+        modeStatusText = text || "";
+        if (statusEl) {
+          statusEl.textContent = modeStatusText;
+        }
       }
 
       function setDataMeta(payload) {
         const projectRef = payload && payload.project_ref ? payload.project_ref : "n/a";
-        dataMetaEl.textContent = `Project ${projectRef}`;
+        modeDataMetaText = `Project ${projectRef}`;
+        if (dataMetaEl) {
+          dataMetaEl.textContent = modeDataMetaText;
+        }
       }
 
       function setError(text) {
-        errorEl.textContent = text || "";
+        modeErrorText = text || "";
+        if (errorEl) {
+          errorEl.textContent = modeErrorText;
+        }
       }
 
       function buildResponseErrorMessage(resp, payload, text) {
@@ -2159,35 +2265,195 @@
         return !document.hidden && document.hasFocus();
       }
 
+      function ensureModeContainer(mode) {
+        if (!DASHBOARD_MODES.has(mode)) {
+          return null;
+        }
+        if (modeContainers[mode]) {
+          return modeContainers[mode];
+        }
+        const container = document.createElement("div");
+        container.className = "mode-view";
+        container.dataset.mode = mode;
+        container.hidden = mode !== activeMode;
+        dashboardEl.appendChild(container);
+        modeContainers[mode] = container;
+        return container;
+      }
+
+      function getModeContainer(mode = activeMode) {
+        return ensureModeContainer(mode);
+      }
+
+      function syncModeControlRefsFromVisibleContainer() {
+        const container = getModeContainer(activeMode);
+        if (!container) {
+          statusEl = null;
+          dataMetaEl = null;
+          errorEl = null;
+          return;
+        }
+        statusEl = container.querySelector('[data-panel="mode-controls"] #status');
+        dataMetaEl = container.querySelector('[data-panel="mode-controls"] #data-meta');
+        errorEl = container.querySelector('[data-panel="mode-controls"] #error');
+      }
+
+      function showModeContainer(mode) {
+        DASHBOARD_MODES.forEach((candidate) => {
+          const container = ensureModeContainer(candidate);
+          if (container) {
+            container.hidden = candidate !== mode;
+          }
+        });
+        syncModeControlRefsFromVisibleContainer();
+      }
+
+      function getActiveRefreshSeconds() {
+        const value = Number(refreshSecondsByMode[activeMode]);
+        if (!Number.isFinite(value) || value <= 0) {
+          return activeMode === "operations" ? 1800 : 300;
+        }
+        return value;
+      }
+
+      function persistActiveModeRefreshSeconds() {
+        const key = activeMode === "operations"
+          ? DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY
+          : DASHBOARD_REFRESH_INGEST_STORAGE_KEY;
+        try {
+          localStorage.setItem(key, String(getActiveRefreshSeconds()));
+        } catch (_err) {
+          // Ignore storage write failures.
+        }
+      }
+
+      function isModeStale(mode) {
+        const refreshSeconds = Number(refreshSecondsByMode[mode]);
+        if (!Number.isFinite(refreshSeconds) || refreshSeconds <= 0) {
+          return true;
+        }
+        const lastLoadedAt = Number(modeLastLoadedAtMs[mode] || 0);
+        if (!Number.isFinite(lastLoadedAt) || lastLoadedAt <= 0) {
+          return true;
+        }
+        return (Date.now() - lastLoadedAt) >= (refreshSeconds * 1000);
+      }
+
       function startRefreshTimer() {
         clearRefreshTimer();
         if (!isPageActive()) {
           return;
         }
+        const refreshSeconds = getActiveRefreshSeconds();
         refreshTimer = setInterval(() => {
           if (!isPageActive()) {
             return;
           }
-          loadDashboard();
+          if (activeMode === "operations" && modeIsLoading.operations) {
+            return;
+          }
+          if (activeMode === "ingest" && modeIsLoading.ingest) {
+            return;
+          }
+          void loadCurrentMode();
         }, refreshSeconds * 1000);
       }
 
-      function setRefreshInterval(seconds) {
-        refreshSeconds = seconds;
+      function setRefreshIntervalForActiveMode(seconds) {
+        if (!Number.isFinite(seconds) || seconds <= 0) {
+          return;
+        }
+        refreshSecondsByMode[activeMode] = seconds;
+        persistActiveModeRefreshSeconds();
         startRefreshTimer();
       }
 
       function handleActivityChange() {
         if (!isPageActive()) {
           clearRefreshTimer();
+          clearOperationsDropboxPollTimer();
           wasInactive = true;
           return;
         }
         startRefreshTimer();
+        if (activeMode === "operations") {
+          startOperationsDropboxPolling();
+        }
         if (wasInactive) {
-          loadDashboard();
+          void loadCurrentMode({ refreshOnResume: true });
           wasInactive = false;
         }
+      }
+
+      function renderRefreshPills(mode) {
+        const refreshName = `refresh-${mode}`;
+        const selectedValue = getActiveRefreshSeconds();
+        const options = [
+          { value: 60, label: "1 min" },
+          { value: 300, label: "5 min" },
+          { value: 600, label: "10 min" },
+          { value: 1800, label: "30 min" },
+          { value: 3600, label: "60 min" },
+        ];
+        return options
+          .map((option) => {
+            const inputId = `${refreshName}-${option.value}`;
+            const checked = option.value === selectedValue ? "checked" : "";
+            return `
+              <span class="refresh-pill">
+                <input type="radio" name="${refreshName}" id="${inputId}" value="${option.value}" ${checked} />
+                <label for="${inputId}">${option.label}</label>
+              </span>
+            `;
+          })
+          .join("");
+      }
+
+      function renderModeControlPanel(mode) {
+        const title = mode === "operations" ? "Operations" : "Ingest";
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.dataset.panel = "mode-controls";
+        panel.innerHTML = `
+          <h2>${title}</h2>
+          <div class="refresh-row">
+            <div class="refresh-left">
+              <span class="meta-status" id="status">${escapeHtml(modeStatusText || "Waiting for data...")}</span>
+              <span class="meta-note" id="data-meta">${escapeHtml(modeDataMetaText || "Project n/a")}</span>
+            </div>
+            <div class="refresh-right">
+              <div class="refresh-controls">
+                <span>Refresh</span>
+                <div class="refresh-group" id="refresh-group">${renderRefreshPills(mode)}</div>
+              </div>
+              <button class="refresh-button" id="refresh-now" type="button">Refresh now</button>
+            </div>
+          </div>
+          <div class="error" id="error">${escapeHtml(modeErrorText || "")}</div>
+        `;
+        statusEl = panel.querySelector("#status");
+        dataMetaEl = panel.querySelector("#data-meta");
+        errorEl = panel.querySelector("#error");
+        refreshGroup = panel.querySelector("#refresh-group");
+        refreshNowBtn = panel.querySelector("#refresh-now");
+        if (refreshGroup) {
+          refreshGroup.addEventListener("change", (event) => {
+            if (event.target && event.target.type === "radio") {
+              const value = Number(event.target.value);
+              setRefreshIntervalForActiveMode(value);
+            }
+          });
+        }
+        if (refreshNowBtn) {
+          refreshNowBtn.addEventListener("click", () => {
+            if (activeMode === "operations") {
+              loadOperationsDashboard({ forceRefresh: true });
+            } else {
+              loadDashboard({ forceRefresh: true });
+            }
+          });
+        }
+        return panel;
       }
 
       function renderPanel(pollutant) {
@@ -2690,6 +2956,9 @@
       }
 
       async function refreshR2MetricsOnly() {
+        if (activeMode !== "ingest") {
+          return;
+        }
         if (!latestDashboardData) {
           return;
         }
@@ -2727,11 +2996,14 @@
             latestDashboardData.r2_backup_window,
             latestDashboardData.r2_backup_window_error,
           );
-          const currentPanel = dashboardEl.querySelector('[data-panel="db-size"]');
+          const ingestContainer = getModeContainer("ingest");
+          const currentPanel = ingestContainer
+            ? ingestContainer.querySelector('[data-panel="db-size"]')
+            : null;
           if (currentPanel) {
             currentPanel.replaceWith(nextPanel);
-          } else {
-            dashboardEl.appendChild(nextPanel);
+          } else if (ingestContainer) {
+            ingestContainer.appendChild(nextPanel);
           }
           const generatedAt = (payload && payload.generated_at) || new Date().toISOString();
           setStatus(`R2 metrics refreshed ${formatDateTimeLocalWithTimezone(generatedAt)}`);
@@ -4421,12 +4693,16 @@
       }
 
       function upsertStorageCoveragePanel(nextPanel) {
-        const currentPanel = dashboardEl.querySelector('[data-panel="storage-coverage"]');
+        const ingestContainer = getModeContainer("ingest");
+        if (!ingestContainer) {
+          return;
+        }
+        const currentPanel = ingestContainer.querySelector('[data-panel="storage-coverage"]');
         if (currentPanel) {
           currentPanel.replaceWith(nextPanel);
           return;
         }
-        dashboardEl.appendChild(nextPanel);
+        ingestContainer.appendChild(nextPanel);
       }
 
       function renderStorageCoverageLoadingPanel(message = "Refreshing calendar...") {
@@ -4463,6 +4739,9 @@
       }
 
       async function loadStorageCoverage(options = {}) {
+        if (activeMode !== "ingest") {
+          return;
+        }
         const forceRefresh = Boolean(options.forceRefresh);
         const parentLoadId = Number(options.parentLoadId) || 0;
         const requestId = ++storageCoverageLoadSequence;
@@ -4530,9 +4809,205 @@
         }
       }
 
+      function formatDurationSince(value) {
+        const time = new Date(value || "").getTime();
+        if (Number.isNaN(time)) {
+          return "n/a";
+        }
+        const deltaSeconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+        const hours = Math.floor(deltaSeconds / 3600);
+        const minutes = Math.floor((deltaSeconds % 3600) / 60);
+        const seconds = deltaSeconds % 60;
+        return `${hours}h ${minutes}m ${seconds}s ago`;
+      }
+
+      function renderOperationsDropboxPanel() {
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.dataset.panel = "operations-dropbox";
+        panel.innerHTML = `
+          <h2>Dropbox</h2>
+          <div class="dropbox-mtime-value" id="dropbox-mtime-value">Loading...</div>
+          <div class="footnote dropbox-mtime-note" id="dropbox-mtime-note">Checking most recent mtime in R2_history_backup.</div>
+        `;
+        return panel;
+      }
+
+      function renderOperationsDailyTaskPlaceholderPanel() {
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.dataset.panel = "operations-daily-task";
+        const dayValue = operationsDayValue || toUtcDateKey(startOfUtcDay(new Date()));
+        panel.innerHTML = `
+          <h2>daily_task_latest_runs (placeholder)</h2>
+          <div class="dispatch-filters">
+            <label class="dispatch-filter" for="operations-day-selector">
+              Day
+              <input class="settings-input" id="operations-day-selector" type="date" value="${escapeHtml(dayValue)}" />
+            </label>
+          </div>
+          <div class="footnote">Placeholder card for ObsAQI DB daily task view. Refresh interval: 30 minutes.</div>
+        `;
+        const daySelector = panel.querySelector("#operations-day-selector");
+        if (daySelector) {
+          daySelector.addEventListener("change", (event) => {
+            const nextValue = String(event.target.value || "");
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(nextValue)) {
+              return;
+            }
+            operationsDayValue = nextValue;
+            try {
+              localStorage.setItem(OPERATIONS_DAY_STORAGE_KEY, operationsDayValue);
+            } catch (_err) {
+              // Ignore storage write failures.
+            }
+          });
+        }
+        return panel;
+      }
+
+      async function refreshOperationsDropboxPanel() {
+        if (activeMode !== "operations") {
+          return;
+        }
+        const operationsContainer = getModeContainer("operations");
+        const valueEl = operationsContainer ? operationsContainer.querySelector("#dropbox-mtime-value") : null;
+        const noteEl = operationsContainer ? operationsContainer.querySelector("#dropbox-mtime-note") : null;
+        if (!valueEl || !noteEl) {
+          return;
+        }
+        try {
+          const params = new URLSearchParams();
+          params.set("t", String(Date.now()));
+          const resp = await fetch(buildApiUrl("operations_dropbox_mtime", params));
+          const text = await resp.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(text);
+          } catch (_err) {
+            payload = null;
+          }
+          if (!resp.ok) {
+            throw new Error(buildResponseErrorMessage(resp, payload, text));
+          }
+          const absolute = payload && payload.latest_mtime_utc
+            ? formatDateTimeLocalWithTimezone(payload.latest_mtime_utc)
+            : "n/a";
+          const ago = payload && payload.latest_mtime_utc
+            ? formatDurationSince(payload.latest_mtime_utc)
+            : "n/a";
+          valueEl.textContent = `${absolute} (${ago})`;
+          const resolvedPath = String((payload && payload.resolved_history_path) || "n/a");
+          const apiError = payload && payload.error ? String(payload.error) : "";
+          const updatesLine = "Updates every 30 secs";
+          noteEl.innerHTML = apiError
+            ? `${escapeHtml(`Path: ${resolvedPath}`)}<br>${escapeHtml(updatesLine)}<br>${escapeHtml(apiError)}`
+            : `${escapeHtml(`Path: ${resolvedPath}`)}<br>${escapeHtml(updatesLine)}`;
+        } catch (err) {
+          valueEl.textContent = "Unavailable";
+          noteEl.textContent = err && err.message ? String(err.message) : "Failed to load Dropbox mtime";
+        }
+      }
+
+      function clearOperationsDropboxPollTimer() {
+        if (operationsDropboxPollTimer) {
+          clearInterval(operationsDropboxPollTimer);
+          operationsDropboxPollTimer = null;
+        }
+      }
+
+      function startOperationsDropboxPolling() {
+        clearOperationsDropboxPollTimer();
+        if (activeMode !== "operations" || !isPageActive()) {
+          return;
+        }
+        operationsDropboxPollTimer = setInterval(() => {
+          if (activeMode !== "operations" || !isPageActive()) {
+            return;
+          }
+          void refreshOperationsDropboxPanel();
+        }, 30000);
+      }
+
+      function applyModeSwitchUi() {
+        if (modeIngestBtn) {
+          const isActive = activeMode === "ingest";
+          modeIngestBtn.classList.toggle("is-active", isActive);
+          modeIngestBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
+        if (modeOperationsBtn) {
+          const isActive = activeMode === "operations";
+          modeOperationsBtn.classList.toggle("is-active", isActive);
+          modeOperationsBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
+      }
+
+      async function loadOperationsDashboard(options = {}) {
+        const forceRefresh = Boolean(options.forceRefresh);
+        const loadId = ++operationsLoadSequence;
+        const operationsContainer = getModeContainer("operations");
+        if (!operationsContainer) {
+          return;
+        }
+        if (operationsContainer.children.length === 0) {
+          operationsContainer.appendChild(renderModeControlPanel("operations"));
+          operationsContainer.appendChild(renderOperationsDropboxPanel());
+          operationsContainer.appendChild(renderOperationsDailyTaskPlaceholderPanel());
+        } else {
+          syncModeControlRefsFromVisibleContainer();
+        }
+        modeIsLoading.operations = true;
+        setError("");
+        setStatus(forceRefresh ? "Force refreshing..." : "Loading...");
+        await refreshOperationsDropboxPanel();
+        if (loadId !== operationsLoadSequence || activeMode !== "operations") {
+          modeIsLoading.operations = false;
+          return;
+        }
+        modeLastLoadedAtMs.operations = Date.now();
+        modeIsLoading.operations = false;
+        setStatus(`Updated ${formatDateTimeLocalWithTimezone(new Date().toISOString())}`);
+        setDataMeta({ project_ref: runtimeConfig.envName || "n/a" });
+        startOperationsDropboxPolling();
+      }
+
+      async function loadCurrentMode(options = {}) {
+        const forceRefresh = Boolean(options.forceRefresh);
+        const refreshOnResume = Boolean(options.refreshOnResume);
+        applyModeSwitchUi();
+        showModeContainer(activeMode);
+        clearOperationsDropboxPollTimer();
+        if (activeMode === "operations") {
+          const shouldLoad = forceRefresh || refreshOnResume || isModeStale("operations");
+          if (shouldLoad && !modeIsLoading.operations) {
+            await loadOperationsDashboard({ forceRefresh });
+          } else {
+            startOperationsDropboxPolling();
+          }
+          return;
+        }
+        const shouldLoad = forceRefresh || refreshOnResume || isModeStale("ingest");
+        if (shouldLoad && !modeIsLoading.ingest) {
+          await loadDashboard({ forceRefresh });
+        }
+      }
+
       async function loadDashboard(options = {}) {
+        if (activeMode !== "ingest") {
+          return;
+        }
         const forceRefresh = Boolean(options.forceRefresh);
         const loadId = ++dashboardLoadSequence;
+        const ingestContainer = getModeContainer("ingest");
+        if (!ingestContainer) {
+          return;
+        }
+        if (ingestContainer.children.length === 0) {
+          ingestContainer.appendChild(renderModeControlPanel("ingest"));
+        } else {
+          syncModeControlRefsFromVisibleContainer();
+        }
+        modeIsLoading.ingest = true;
         setError("");
         setStatus(forceRefresh ? "Force refreshing..." : "Loading...");
         try {
@@ -4559,6 +5034,11 @@
             throw new Error(message);
           }
           if (loadId !== dashboardLoadSequence) {
+            modeIsLoading.ingest = false;
+            return;
+          }
+          if (activeMode !== "ingest") {
+            modeIsLoading.ingest = false;
             return;
           }
           const data = payload || {};
@@ -4571,23 +5051,24 @@
               // Ignore storage write issues.
             }
           }
-          dashboardEl.innerHTML = "";
+          const nextPanels = [];
+          nextPanels.push(renderModeControlPanel("ingest"));
           if (Array.isArray(data.connectors_settings)) {
-            dashboardEl.appendChild(renderConnectorSettingsPanel(data.connectors_settings));
+            nextPanels.push(renderConnectorSettingsPanel(data.connectors_settings));
           }
           if (
             data.dispatcher_settings &&
             shouldShowDispatcherSettings(data.connectors_settings)
           ) {
-            dashboardEl.appendChild(renderDispatcherSettingsPanel(data.dispatcher_settings));
+            nextPanels.push(renderDispatcherSettingsPanel(data.dispatcher_settings));
           }
           if (Array.isArray(data.dispatch_runs)) {
-            dashboardEl.appendChild(renderDispatchPanel(data.dispatch_runs));
+            nextPanels.push(renderDispatchPanel(data.dispatch_runs));
           }
           (Array.isArray(data.pollutants) ? data.pollutants : []).forEach((pollutant) => {
-            dashboardEl.appendChild(renderPanel(pollutant));
+            nextPanels.push(renderPanel(pollutant));
           });
-          dashboardEl.appendChild(
+          nextPanels.push(
             renderDbSizePanel(
               data.db_size_metrics,
               data.db_size_metrics_error,
@@ -4601,14 +5082,23 @@
               data.r2_backup_window_error,
             ),
           );
+          ingestContainer.replaceChildren(...nextPanels);
           upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel("Refreshing calendar..."));
+          modeLastLoadedAtMs.ingest = Date.now();
+          modeIsLoading.ingest = false;
           setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}`);
           setDataMeta(data);
           void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
         } catch (err) {
           if (loadId !== dashboardLoadSequence) {
+            modeIsLoading.ingest = false;
             return;
           }
+          if (activeMode !== "ingest") {
+            modeIsLoading.ingest = false;
+            return;
+          }
+          modeIsLoading.ingest = false;
           if (maybeRedirectToAccessLogin(err, buildApiUrl("dashboard"))) {
             setStatus("Cloudflare Access login required. Redirecting...");
             setError("Cloudflare Access login required. Redirecting...");
@@ -4619,33 +5109,44 @@
         }
       }
 
-      refreshGroup.addEventListener("change", (event) => {
-        if (event.target && event.target.name === "refresh") {
-          const value = Number(event.target.value);
-          if (Number.isFinite(value) && value > 0) {
-            setRefreshInterval(value);
-          }
-        }
-      });
-
-      refreshNowBtn.addEventListener("click", () => {
-        loadDashboard();
-      });
-
       document.addEventListener("visibilitychange", handleActivityChange);
       window.addEventListener("focus", handleActivityChange);
       window.addEventListener("blur", handleActivityChange);
-
-      const refreshChoice = refreshGroup.querySelector(
-        `input[name="refresh"][value="${String(refreshSeconds)}"]`,
-      );
-      if (refreshChoice) {
-        refreshChoice.checked = true;
+      if (modeIngestBtn) {
+        modeIngestBtn.addEventListener("click", () => {
+          if (activeMode === "ingest") {
+            return;
+          }
+          activeMode = "ingest";
+          try {
+            localStorage.setItem(DASHBOARD_MODE_STORAGE_KEY, activeMode);
+          } catch (_err) {
+            // Ignore storage write failures.
+          }
+          startRefreshTimer();
+          void loadCurrentMode({ forceRefresh: false });
+        });
+      }
+      if (modeOperationsBtn) {
+        modeOperationsBtn.addEventListener("click", () => {
+          if (activeMode === "operations") {
+            return;
+          }
+          activeMode = "operations";
+          try {
+            localStorage.setItem(DASHBOARD_MODE_STORAGE_KEY, activeMode);
+          } catch (_err) {
+            // Ignore storage write failures.
+          }
+          startRefreshTimer();
+          void loadCurrentMode({ forceRefresh: false });
+        });
       }
 
-      setRefreshInterval(refreshSeconds);
+      applyModeSwitchUi();
+      startRefreshTimer();
       if (isPageActive()) {
-        loadDashboard();
+        void loadCurrentMode({ forceRefresh: false });
       }
     </script>
   </body>

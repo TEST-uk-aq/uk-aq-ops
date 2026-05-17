@@ -133,6 +133,11 @@ R2_HISTORY_DAYS_CACHE_STATE: Dict[str, Any] = {
     "generated_at": None,
 }
 STORAGE_COVERAGE_CACHE_STATE: Dict[str, Any] = {"rows": None, "next_refresh_at": None}
+DROPBOX_HISTORY_MTIME_CACHE_STATE: Dict[str, Any] = {
+    "payload": None,
+    "error": None,
+    "generated_at": None,
+}
 DISPATCH_RUNS_STATE: Dict[str, Any] = {
     "rows": [],
     "latest_created_at": None,
@@ -141,6 +146,10 @@ CACHE_TTL_SECONDS = 20
 R2_CACHE_TTL_SECONDS = 60 * 60
 R2_HISTORY_DAYS_CACHE_TTL_SECONDS = 5 * 60
 STORAGE_COVERAGE_CACHE_TTL_SECONDS = 6 * 60 * 60
+DROPBOX_HISTORY_MTIME_CACHE_TTL_SECONDS = max(
+    5,
+    int(os.getenv("UK_AQ_DROPBOX_MTIME_CACHE_TTL_SECONDS", "20")),
+)
 UTC_DATETIME_MIN = datetime.min.replace(tzinfo=timezone.utc)
 R2_BYTES_PER_GB = 1024 ** 3
 R2_CLASS_A_ACTION_TYPES = {
@@ -1678,6 +1687,163 @@ def _candidate_dropbox_state_paths() -> List[Path]:
             add_from_base(app_dir)
 
     return candidates
+
+
+def _candidate_dropbox_history_dirs() -> List[Path]:
+    candidates: List[Path] = []
+    seen: Set[str] = set()
+
+    def add_candidate(raw_path: Optional[Path]) -> None:
+        if raw_path is None:
+            return
+        expanded = raw_path.expanduser()
+        key = str(expanded)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(expanded)
+
+    for state_path in _candidate_dropbox_state_paths():
+        rel_parts = [
+            part for part in str(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH or "").strip().strip("/").split("/")
+            if part
+        ]
+        history_path = state_path
+        for _ in rel_parts:
+            history_path = history_path.parent
+        if not rel_parts:
+            history_path = state_path.parent
+        add_candidate(history_path)
+
+    local_roots: List[Path] = []
+    if UK_AQ_DROPBOX_LOCAL_ROOT:
+        local_roots.append(Path(UK_AQ_DROPBOX_LOCAL_ROOT))
+    default_local_root = Path.home() / "Dropbox"
+    if default_local_root.exists():
+        local_roots.append(default_local_root)
+
+    remote_root = UK_AQ_DROPBOX_ROOT.strip().strip("/")
+    history_dir = UK_AQ_R2_HISTORY_DROPBOX_DIR.strip().strip("/")
+
+    def add_from_base(base_root: Path) -> None:
+        path_parts: List[str] = [str(base_root)]
+        if remote_root:
+            path_parts.append(remote_root)
+        if history_dir:
+            path_parts.append(history_dir)
+        add_candidate(Path(*path_parts))
+
+    for local_root in local_roots:
+        add_from_base(local_root)
+        apps_root = local_root / "Apps"
+        if UK_AQ_DROPBOX_APP_FOLDER:
+            add_from_base(apps_root / UK_AQ_DROPBOX_APP_FOLDER)
+            continue
+        if not apps_root.is_dir():
+            continue
+        preferred_app_path = apps_root / "github-uk-air-quality-networks"
+        if preferred_app_path.is_dir():
+            add_from_base(preferred_app_path)
+        try:
+            app_dirs = sorted(
+                child
+                for child in apps_root.iterdir()
+                if child.is_dir() and child != preferred_app_path
+            )
+        except OSError:
+            app_dirs = []
+        for app_dir in app_dirs:
+            add_from_base(app_dir)
+
+    return candidates
+
+
+def _scan_dropbox_history_latest_mtime() -> Tuple[Dict[str, Any], Optional[str]]:
+    now_utc = datetime.now(timezone.utc)
+    newest_mtime: Optional[float] = None
+    newest_path: Optional[Path] = None
+    newest_root: Optional[Path] = None
+    existing_roots: List[Path] = []
+    candidate_roots = _candidate_dropbox_history_dirs()
+
+    for root in candidate_roots:
+        if not root.is_dir():
+            continue
+        existing_roots.append(root)
+        try:
+            root_mtime = root.stat().st_mtime
+        except OSError:
+            root_mtime = None
+        if root_mtime is not None and (newest_mtime is None or root_mtime > newest_mtime):
+            newest_mtime = root_mtime
+            newest_path = root
+            newest_root = root
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            for dirname in dirnames:
+                dir_candidate = Path(dirpath) / dirname
+                try:
+                    mtime = dir_candidate.stat().st_mtime
+                except OSError:
+                    continue
+                if newest_mtime is None or mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest_path = dir_candidate
+                    newest_root = root
+            for filename in filenames:
+                file_candidate = Path(dirpath) / filename
+                try:
+                    mtime = file_candidate.stat().st_mtime
+                except OSError:
+                    continue
+                if newest_mtime is None or mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest_path = file_candidate
+                    newest_root = root
+
+    if newest_mtime is None:
+        payload = {
+            "generated_at": now_utc.isoformat().replace("+00:00", "Z"),
+            "resolved_history_path": str(existing_roots[0]) if existing_roots else None,
+            "candidate_history_paths": [str(path) for path in candidate_roots[:12]],
+            "latest_mtime_utc": None,
+            "latest_entry_path": None,
+        }
+        return payload, "No readable files/directories found under candidate R2_history_backup paths"
+
+    latest_mtime = datetime.fromtimestamp(newest_mtime, tz=timezone.utc)
+    payload = {
+        "generated_at": now_utc.isoformat().replace("+00:00", "Z"),
+        "resolved_history_path": str(newest_root) if newest_root else None,
+        "candidate_history_paths": [str(path) for path in candidate_roots[:12]],
+        "latest_mtime_utc": latest_mtime.isoformat().replace("+00:00", "Z"),
+        "latest_entry_path": str(newest_path) if newest_path else None,
+    }
+    return payload, None
+
+
+def _get_dropbox_history_latest_mtime_cached(
+    force_refresh: bool = False,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    now_utc = datetime.now(timezone.utc)
+    with CACHE_LOCK:
+        cached_payload = DROPBOX_HISTORY_MTIME_CACHE_STATE.get("payload")
+        cached_error = DROPBOX_HISTORY_MTIME_CACHE_STATE.get("error")
+        cached_generated_at = DROPBOX_HISTORY_MTIME_CACHE_STATE.get("generated_at")
+        if (
+            not force_refresh
+            and isinstance(cached_payload, dict)
+            and isinstance(cached_generated_at, datetime)
+            and (now_utc - cached_generated_at).total_seconds() < DROPBOX_HISTORY_MTIME_CACHE_TTL_SECONDS
+        ):
+            return cached_payload, str(cached_error) if cached_error else None
+
+    payload, error = _scan_dropbox_history_latest_mtime()
+    with CACHE_LOCK:
+        DROPBOX_HISTORY_MTIME_CACHE_STATE["payload"] = payload
+        DROPBOX_HISTORY_MTIME_CACHE_STATE["error"] = error
+        DROPBOX_HISTORY_MTIME_CACHE_STATE["generated_at"] = now_utc
+    return payload, error
 
 
 def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str]]:
@@ -3916,6 +4082,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/r2_connector_counts":
                 self._serve_r2_connector_counts(parsed)
                 return
+            if parsed.path == "/api/operations_dropbox_mtime":
+                self._serve_operations_dropbox_mtime(parsed)
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as exc:
             if self._is_client_disconnect_error(exc):
@@ -4257,6 +4426,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload.encode("utf-8"))
             return
 
+        payload = json.dumps(payload_data, indent=2)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
+
+    def _serve_operations_dropbox_mtime(self, parsed) -> None:
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        force_refresh_raw = ((query.get("force") or [""])[0] or "").strip().lower()
+        force_refresh = force_refresh_raw in {"1", "true", "yes", "y", "on"}
+        payload_obj, payload_error = _get_dropbox_history_latest_mtime_cached(
+            force_refresh=force_refresh,
+        )
+        payload_data = dict(payload_obj or {})
+        payload_data["error"] = payload_error
+        payload_data["generated_at"] = payload_data.get(
+            "generated_at",
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
         payload = json.dumps(payload_data, indent=2)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
