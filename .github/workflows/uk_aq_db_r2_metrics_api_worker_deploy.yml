@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UK_AQ_DB_R2_METRICS_API_WORKER_NAME: ${{ vars.UK_AQ_DB_R2_METRICS_API_WORKER_NAME || 'uk-aq-db-r2-metrics-api' }}
-      UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_DB_R2_METRICS_TARGET_ENV: ${{ vars.UK_AQ_DB_R2_METRICS_TARGET_ENV || '' }}
     steps:
@@ -38,7 +38,7 @@ jobs:
             exit 1
           fi
           if [ -z "${UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID}" ]; then
-            echo "Missing variable CLOUDFLARE_ACCOUNT_ID (or fallback UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID)."
+            echo "Missing secret CLOUDFLARE_ACCOUNT_ID (or fallback UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID)."
             exit 1
           fi
 
