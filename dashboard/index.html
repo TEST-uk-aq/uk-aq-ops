@@ -5161,6 +5161,26 @@
         return parsedMs;
       }
 
+      function parseDailyTaskSummaryObject(summaryValue) {
+        if (!summaryValue) {
+          return null;
+        }
+        if (typeof summaryValue === "object" && !Array.isArray(summaryValue)) {
+          return summaryValue;
+        }
+        if (typeof summaryValue === "string") {
+          try {
+            const parsed = JSON.parse(summaryValue);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              return parsed;
+            }
+          } catch (_err) {
+            return null;
+          }
+        }
+        return null;
+      }
+
       function buildDailyTaskRunsRowMeta(row, nowMs) {
         const rawStatus = String((row && (row.raw_status || row.status)) || "").trim().toLowerCase();
         const scheduledAtMs = parseTimestampMs(row && (row.scheduled_at_utc || row.scheduled_or_started_at));
@@ -5172,6 +5192,13 @@
         const hasSuccessStatus = ["finished", "success", "ok", "completed"].includes(rawStatus);
         const hasFailedStatus = ["failed", "error"].includes(rawStatus);
         const isOverdue = startedAtMs === null && scheduledAtMs !== null && (scheduledAtMs + 120000) < nowMs;
+        const summary = parseDailyTaskSummaryObject(row && row.summary);
+        const integrityBackfillsFailed = Number(summary && summary.backfills_failed);
+        const integrityAqiRebuildsFailed = Number(summary && summary.aqi_rebuilds_failed);
+        const isIntegrityFinishedWithErrors =
+          String((row && row.task_key) || "") === "ops.history_integrity" &&
+          ((Number.isFinite(integrityBackfillsFailed) && integrityBackfillsFailed > 0) ||
+            (Number.isFinite(integrityAqiRebuildsFailed) && integrityAqiRebuildsFailed > 0));
 
         let statusLabel = "Unknown";
         let statusClass = "unknown";
@@ -5179,8 +5206,13 @@
           statusLabel = "Failed";
           statusClass = "failed";
         } else if (finishedAtMs !== null || hasSuccessStatus) {
-          statusLabel = "Finished";
-          statusClass = "succeeded";
+          if (isIntegrityFinishedWithErrors) {
+            statusLabel = "Finished with Errors";
+            statusClass = "warning";
+          } else {
+            statusLabel = "Finished";
+            statusClass = "succeeded";
+          }
         } else if (startedAtMs !== null) {
           statusLabel = "Started";
           statusClass = "running";
@@ -5195,16 +5227,20 @@
           statusClass = "warning";
         }
 
+        const isActiveRun = startedAtMs !== null && finishedAtMs === null && failedAtMs === null;
         let durationSeconds = Number.isFinite(Number(row && row.duration_seconds))
           ? Math.max(0, Math.round(Number(row.duration_seconds)))
           : null;
-        if (durationSeconds === null && startedAtMs !== null) {
+        const durationStartMs = startedAtMs !== null ? startedAtMs : scheduledAtMs;
+        if (isActiveRun && durationStartMs !== null) {
+          durationSeconds = Math.max(0, Math.floor((nowMs - durationStartMs) / 1000));
+        } else if (durationSeconds === null && durationStartMs !== null && (startedAtMs !== null || rawStatus === "started")) {
           if (failedAtMs !== null) {
-            durationSeconds = Math.max(0, Math.floor((failedAtMs - startedAtMs) / 1000));
+            durationSeconds = Math.max(0, Math.floor((failedAtMs - durationStartMs) / 1000));
           } else if (finishedAtMs !== null) {
-            durationSeconds = Math.max(0, Math.floor((finishedAtMs - startedAtMs) / 1000));
+            durationSeconds = Math.max(0, Math.floor((finishedAtMs - durationStartMs) / 1000));
           } else {
-            durationSeconds = Math.max(0, Math.floor((nowMs - startedAtMs) / 1000));
+            durationSeconds = Math.max(0, Math.floor((nowMs - durationStartMs) / 1000));
           }
         }
 

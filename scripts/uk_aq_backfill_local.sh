@@ -32,6 +32,8 @@ Optional env vars:
   UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE        default: 0 (disabled)
   UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR          default: 0 (disabled)
   UK_AQ_BACKFILL_PAUSE_SECONDS              legacy alias for run interval
+  UK_AQ_BACKFILL_DENO_BIN                   optional full path override for deno binary
+  UK_AQ_BACKFILL_NODE_BIN                   optional full path override for node binary
 
 Notes:
   - This script is local/manual-only and always sets UK_AQ_BACKFILL_TRIGGER_MODE=manual.
@@ -182,6 +184,76 @@ resolve_run_job_path() {
   fi
   printf '%s' "${active_runner}"
   return 0
+}
+
+resolve_deno_bin() {
+  local override_raw
+  override_raw="$(trim "${UK_AQ_BACKFILL_DENO_BIN:-}")"
+  if [[ -n "${override_raw}" ]]; then
+    if [[ ! -x "${override_raw}" ]]; then
+      echo "Invalid UK_AQ_BACKFILL_DENO_BIN (not executable): ${override_raw}" >&2
+      return 1
+    fi
+    printf '%s' "${override_raw}"
+    return 0
+  fi
+
+  local candidate=""
+  candidate="$(command -v deno 2>/dev/null || true)"
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+    printf '%s' "${candidate}"
+    return 0
+  fi
+
+  for candidate in \
+    "/usr/local/bin/deno" \
+    "/opt/homebrew/bin/deno" \
+    "/usr/bin/deno" \
+    "/bin/deno"
+  do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "deno executable not found. Install deno or set UK_AQ_BACKFILL_DENO_BIN to a full executable path." >&2
+  return 1
+}
+
+resolve_node_bin() {
+  local override_raw
+  override_raw="$(trim "${UK_AQ_BACKFILL_NODE_BIN:-}")"
+  if [[ -n "${override_raw}" ]]; then
+    if [[ ! -x "${override_raw}" ]]; then
+      echo "Invalid UK_AQ_BACKFILL_NODE_BIN (not executable): ${override_raw}" >&2
+      return 1
+    fi
+    printf '%s' "${override_raw}"
+    return 0
+  fi
+
+  local candidate=""
+  candidate="$(command -v node 2>/dev/null || true)"
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+    printf '%s' "${candidate}"
+    return 0
+  fi
+
+  for candidate in \
+    "/usr/local/bin/node" \
+    "/opt/homebrew/bin/node" \
+    "/usr/bin/node" \
+    "/bin/node"
+  do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "node executable not found. Install node or set UK_AQ_BACKFILL_NODE_BIN to a full executable path." >&2
+  return 1
 }
 
 prune_recent_run_starts() {
@@ -358,6 +430,8 @@ if [[ -n "${REQUESTED_TRIGGER_MODE}" && "${REQUESTED_TRIGGER_MODE}" != "manual" 
 fi
 TRIGGER_MODE="manual"
 RUN_JOB_PATH="$(resolve_run_job_path "${REPO_ROOT}")"
+DENO_BIN="$(resolve_deno_bin)"
+NODE_BIN="$(resolve_node_bin)"
 
 mkdir -p "${LOG_DIR}"
 
@@ -411,6 +485,8 @@ while IFS=' ' read -r month_from month_to; do
   echo "Force replace: ${FORCE_REPLACE}"
   echo "Output scope: ${OUTPUT_SCOPE}"
   echo "Runner: ${RUN_JOB_PATH}"
+  echo "Deno bin: ${DENO_BIN}"
+  echo "Node bin: ${NODE_BIN}"
 
   export UK_AQ_BACKFILL_TRIGGER_MODE="${TRIGGER_MODE}"
   export UK_AQ_BACKFILL_RUN_MODE="${RUN_MODE}"
@@ -425,7 +501,7 @@ while IFS=' ' read -r month_from month_to; do
   enforce_run_rate_limit "${MAX_RUNS_PER_HOUR}" 3600 "local-backfill per-hour"
   RUN_START_EPOCHS+=("$(date +%s)")
 
-  if deno run --allow-env --allow-net --allow-read --allow-write --allow-run \
+  if "${DENO_BIN}" run --allow-env --allow-net --allow-read --allow-write --allow-run \
     "${RUN_JOB_PATH}" | tee "${log_file}"; then
     echo "Window ${month_from} -> ${month_to}: ok"
   else
@@ -461,7 +537,7 @@ if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MOD
   index_rebuild_ok="false"
   for ((index_rebuild_attempt=1; index_rebuild_attempt<=index_rebuild_max_attempts; index_rebuild_attempt++)); do
     echo "R2 history index rebuild attempt ${index_rebuild_attempt}/${index_rebuild_max_attempts}" | tee -a "${index_log_file}"
-    if node scripts/backup_r2/uk_aq_build_r2_history_index.mjs 2>&1 | tee -a "${index_log_file}"; then
+    if "${NODE_BIN}" scripts/backup_r2/uk_aq_build_r2_history_index.mjs 2>&1 | tee -a "${index_log_file}"; then
       index_rebuild_ok="true"
       break
     fi
