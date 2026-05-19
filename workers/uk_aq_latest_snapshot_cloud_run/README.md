@@ -7,7 +7,7 @@ Builds latest map snapshots from `uk_aq_public.uk_aq_latest_rpc` and publishes d
 - Build snapshot matrix every 60 seconds (via Cloud Scheduler).
 - Snapshot matrix (Phase A):
   - `pollutant`: `pm25`, `pm10`, `no2`
-  - `window`: `3h`, `6h`, `1d`
+  - `window`: `3h`, `6h`, `1d`, `7d`, `all`
   - `network_group`: `all`
 - Write per-key snapshot JSON objects with stable keys.
 - Write per-family manifest with hashes, row counts, observed-at bounds, and build metadata.
@@ -30,7 +30,7 @@ Builds latest map snapshots from `uk_aq_public.uk_aq_latest_rpc` and publishes d
 - `UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC` (default `uk_aq_latest_rpc`)
 - `UK_AQ_LATEST_SNAPSHOT_LIMIT` (default `10000`)
 - `UK_AQ_LATEST_SNAPSHOT_POLLUTANTS` (default `pm25,pm10,no2`)
-- `UK_AQ_LATEST_SNAPSHOT_WINDOWS` (default `3h,6h,1d`)
+- `UK_AQ_LATEST_SNAPSHOT_WINDOWS` (default `3h,6h,1d,7d,all`)
 - `UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP` (default `all`)
 - `UK_AQ_LATEST_SNAPSHOT_R2_PREFIX` (default `latest_snapshots/v1`)
 - `UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY` (default `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/manifest.json`)

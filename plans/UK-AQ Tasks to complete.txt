@@ -29,6 +29,11 @@ Legal messages from the connectors
 
 
 Later
+
+
+Prune all large tables in sbase. Ingest_runs being one. 
+
+
 Implement realtime updates in the same plan
 uk-aq-ops/plans/uk-aq-r2-snapshots-realtime-updates-plan-DRAFT.md
 

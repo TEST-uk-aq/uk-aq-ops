@@ -4,7 +4,7 @@ const DEFAULT_CACHE_SECONDS = 60;
 const MAX_CACHE_SECONDS = 604800;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 
-const VALID_WINDOWS = new Set(["3h", "6h", "1d"]);
+const VALID_WINDOWS = new Set(["3h", "6h", "1d", "7d", "all"]);
 const VALID_NETWORK_GROUPS = new Set(["all"]);
 
 function corsHeaders() {
