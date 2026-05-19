@@ -40,8 +40,10 @@ jobs:
       SCHEDULER_TIMEZONE: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_TIMEZONE || vars.DB_SIZE_LOGGER_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.DB_SIZE_LOGGER_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
       SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_DB_SIZE_LOGGER_SCHEDULER_SERVICE_ACCOUNT || vars.DB_SIZE_LOGGER_SCHEDULER_SERVICE_ACCOUNT || '' }}
-      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
-      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      SUPABASE_URL: ${{ vars.DB_SIZE_LOGGER_SUPABASE_URL || vars.SUPABASE_URL }}
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.DB_SIZE_LOGGER_OBS_AQIDB_SUPABASE_URL || vars.OBS_AQIDB_SUPABASE_URL }}
+      EXPECTED_SUPABASE_PROJECT_REF: ${{ vars.DB_SIZE_LOGGER_EXPECTED_SUPABASE_PROJECT_REF || vars.SUPABASE_PROJECT_REF || '' }}
+      EXPECTED_OBS_AQIDB_SUPABASE_PROJECT_REF: ${{ vars.DB_SIZE_LOGGER_EXPECTED_OBS_AQIDB_PROJECT_REF || vars.OBS_AQIDB_SUPABASE_PROJECT_REF || '' }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
       UK_AQ_DB_SIZE_RPC: ${{ vars.UK_AQ_DB_SIZE_RPC || 'uk_aq_rpc_database_size_bytes' }}
       UK_AQ_DB_SIZE_UPSERT_RPC: ${{ vars.UK_AQ_DB_SIZE_UPSERT_RPC || 'uk_aq_rpc_db_size_metric_upsert' }}
@@ -65,12 +67,12 @@ jobs:
       UK_AQ_DB_SIZE_RPC_RETRIES: ${{ vars.UK_AQ_DB_SIZE_RPC_RETRIES || '3' }}
       UK_AQ_INGEST_DB_LABEL: ${{ vars.UK_AQ_INGEST_DB_LABEL || 'ingestdb' }}
       UK_AQ_OBS_AQIDB_DB_LABEL: ${{ vars.UK_AQ_OBS_AQIDB_DB_LABEL || 'obs_aqidb' }}
-      SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
-      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      SB_SECRET_KEY: ${{ secrets.DB_SIZE_LOGGER_SB_SECRET_KEY || secrets.SB_SECRET_KEY }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.DB_SIZE_LOGGER_OBS_AQIDB_SECRET_KEY || secrets.OBS_AQIDB_SECRET_KEY }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
-      SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
-      OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
+      SB_SECRET_KEY_SECRET_NAME: ${{ vars.DB_SIZE_LOGGER_SB_SECRET_KEY_SECRET_NAME || vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
+      OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.DB_SIZE_LOGGER_OBS_AQIDB_SECRET_KEY_SECRET_NAME || vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
       CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME || 'CFLARE_R2_ACCESS_KEY_ID' }}
       CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME || 'CFLARE_R2_SECRET_ACCESS_KEY' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
@@ -103,6 +105,27 @@ jobs:
             echo "Missing required variable: OBS_AQIDB_SUPABASE_URL"
             exit 1
           fi
+
+          ingest_ref_from_url="$(printf '%s' "${SUPABASE_URL}" | sed -E 's#https?://([^.]+).*#\1#')"
+          obs_ref_from_url="$(printf '%s' "${OBS_AQIDB_SUPABASE_URL}" | sed -E 's#https?://([^.]+).*#\1#')"
+
+          if [ -n "${EXPECTED_SUPABASE_PROJECT_REF:-}" ] && [ "${ingest_ref_from_url}" != "${EXPECTED_SUPABASE_PROJECT_REF}" ]; then
+            echo "SUPABASE_URL project ref mismatch: expected ${EXPECTED_SUPABASE_PROJECT_REF}, got ${ingest_ref_from_url}."
+            exit 1
+          fi
+          if [ -n "${EXPECTED_OBS_AQIDB_SUPABASE_PROJECT_REF:-}" ] && [ "${obs_ref_from_url}" != "${EXPECTED_OBS_AQIDB_SUPABASE_PROJECT_REF}" ]; then
+            echo "OBS_AQIDB_SUPABASE_URL project ref mismatch: expected ${EXPECTED_OBS_AQIDB_SUPABASE_PROJECT_REF}, got ${obs_ref_from_url}."
+            exit 1
+          fi
+
+          echo "DB size logger deploy target summary:"
+          echo "  project_id=${PROJECT_ID}"
+          echo "  region=${REGION}"
+          echo "  service_name=${SERVICE_NAME}"
+          echo "  ingest_project_ref=${ingest_ref_from_url}"
+          echo "  obs_aqidb_project_ref=${obs_ref_from_url}"
+          echo "  db_size_cloud_run_enabled=${UK_AQ_DB_SIZE_CLOUD_RUN_ENABLED}"
+          echo "  schema_size_cloud_run_enabled=${UK_AQ_SCHEMA_SIZE_CLOUD_RUN_ENABLED}"
 
       - name: Validate Google auth config
         run: |

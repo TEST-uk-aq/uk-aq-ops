@@ -37,6 +37,14 @@ and continues; it only fails when both DB sources fail in the same run.
 
 ## Optional env vars
 
+- `DB_SIZE_LOGGER_SUPABASE_URL` (deploy-time override; falls back to `SUPABASE_URL`)
+- `DB_SIZE_LOGGER_OBS_AQIDB_SUPABASE_URL` (deploy-time override; falls back to `OBS_AQIDB_SUPABASE_URL`)
+- `DB_SIZE_LOGGER_EXPECTED_SUPABASE_PROJECT_REF` (deploy preflight; fails if URL project ref mismatches)
+- `DB_SIZE_LOGGER_EXPECTED_OBS_AQIDB_PROJECT_REF` (deploy preflight; fails if URL project ref mismatches)
+- `DB_SIZE_LOGGER_SB_SECRET_KEY` (deploy-time override; falls back to `SB_SECRET_KEY`)
+- `DB_SIZE_LOGGER_OBS_AQIDB_SECRET_KEY` (deploy-time override; falls back to `OBS_AQIDB_SECRET_KEY`)
+- `DB_SIZE_LOGGER_SB_SECRET_KEY_SECRET_NAME` (deploy-time Secret Manager name override)
+- `DB_SIZE_LOGGER_OBS_AQIDB_SECRET_KEY_SECRET_NAME` (deploy-time Secret Manager name override)
 - `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`)
 - `UK_AQ_DB_SIZE_RPC` (default `uk_aq_rpc_database_size_bytes`)
 - `UK_AQ_DB_SIZE_UPSERT_RPC` (default `uk_aq_rpc_db_size_metric_upsert`)

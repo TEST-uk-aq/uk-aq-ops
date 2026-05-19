@@ -19,8 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UK_AQ_DB_R2_METRICS_API_WORKER_NAME: ${{ vars.UK_AQ_DB_R2_METRICS_API_WORKER_NAME || 'uk-aq-db-r2-metrics-api' }}
-      UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
-      UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_DB_R2_METRICS_TARGET_ENV: ${{ vars.UK_AQ_DB_R2_METRICS_TARGET_ENV || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,28 +29,53 @@ jobs:
       - name: Validate Cloudflare credentials
         run: |
           set -euo pipefail
-          if [ -z "${UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN}" ]; then
-            echo "Missing secret UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN."
+          if [ -z "${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}" ]; then
+            echo "Missing variable UK_AQ_DB_R2_METRICS_API_WORKER_NAME."
             exit 1
           fi
-          if [ -z "${UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID}" ]; then
-            echo "Missing variable UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID."
+          if [ -z "${UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN}" ]; then
+            echo "Missing secret CLOUDFLARE_API_TOKEN (or fallback UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN)."
             exit 1
           fi
+          if [ -z "${UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Missing variable CLOUDFLARE_ACCOUNT_ID (or fallback UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID)."
+            exit 1
+          fi
+
+          target_env="$(printf '%s' "${UK_AQ_DB_R2_METRICS_TARGET_ENV}" | tr '[:upper:]' '[:lower:]')"
+          worker_name_lc="$(printf '%s' "${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}" | tr '[:upper:]' '[:lower:]')"
+          if [ "${target_env}" = "test" ] || [ "${target_env}" = "cic-test" ]; then
+            if [[ "${worker_name_lc}" != *"test"* ]] && [[ "${worker_name_lc}" != *"cic-test"* ]]; then
+              echo "Refusing deploy: target env '${target_env}' requires worker name containing 'test' (current: ${UK_AQ_DB_R2_METRICS_API_WORKER_NAME})."
+              exit 1
+            fi
+          fi
+          if [ "${target_env}" = "live" ] || [ "${target_env}" = "prod" ] || [ "${target_env}" = "production" ]; then
+            if [[ "${worker_name_lc}" == *"test"* ]] || [[ "${worker_name_lc}" == *"cic-test"* ]]; then
+              echo "Refusing deploy: target env '${target_env}' cannot deploy a test worker name (${UK_AQ_DB_R2_METRICS_API_WORKER_NAME})."
+              exit 1
+            fi
+          fi
+
+          masked_account_id="${UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID:0:4}...${UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID: -4}"
+          echo "Deploy target summary:"
+          echo "  target_env=${target_env:-unset}"
+          echo "  worker_name=${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}"
+          echo "  account_id=${masked_account_id}"
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
-          apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_db_size_metrics_api_worker
           command: deploy --name ${{ env.UK_AQ_DB_R2_METRICS_API_WORKER_NAME }}
 
       - name: Set Worker secrets
         working-directory: workers/uk_aq_db_size_metrics_api_worker
         env:
-          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           secrets_json="$(jq -n \
@@ -85,7 +111,7 @@ jobs:
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
-          apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_db_size_metrics_api_worker
           command: deploy --name ${{ env.UK_AQ_DB_R2_METRICS_API_WORKER_NAME }}
