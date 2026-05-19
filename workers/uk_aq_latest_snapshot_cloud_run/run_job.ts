@@ -139,7 +139,7 @@ const UK_AQ_LATEST_SNAPSHOT_POLLUTANTS = parseCsvList(
 
 const UK_AQ_LATEST_SNAPSHOT_WINDOWS = parseCsvList(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_WINDOWS"),
-  ["3h", "6h", "1d"],
+  ["3h", "6h", "1d", "7d", "all"],
 ).map((value) => normalizeWindow(value)).filter((value): value is string => Boolean(value));
 
 const UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP =

@@ -5,6 +5,7 @@ Serves latest snapshot JSON objects from R2 using stable URL/query keys for cach
 ## Endpoints
 
 - `GET /v1/latest-snapshot?pollutant=pm25&window=6h&network_group=all`
+- Supported windows: `3h`, `6h`, `1d`, `7d`, `all`
 - `GET /v1/manifest`
 - `GET /v1/health`
 
