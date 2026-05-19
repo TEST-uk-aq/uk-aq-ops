@@ -18,3 +18,4 @@ nohup_MBAir.out
 .vscode/settings.json
 system_docs_ops.zip
 *.pyc
+*.env

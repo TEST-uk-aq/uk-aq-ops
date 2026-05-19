@@ -25,6 +25,8 @@ Play timelapse of hex-map over the last week?
 
 Change Live pill to a small status bar to show when refresh is going to happen. 1 min countdown
 
+Legal messages from the connectors
+
 
 Later
 Implement realtime updates in the same plan
@@ -46,3 +48,6 @@ Sensor list in map mode, could have select circles, so that you can change avera
 
 
 Consolidate 2 sbase DBs into one. Will probably have to have 2 or 3 days data only??
+
+
+Create a mirror site using Cloudflare. In case Github goes down. Can have 2 versions. One connected to repo, and one that uses Direct Upload, from the local cloned repo. 

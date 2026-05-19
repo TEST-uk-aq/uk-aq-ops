@@ -452,10 +452,28 @@ fi
 
 if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MODE}" == "obs_aqi_to_r2" || "${RUN_MODE}" == "r2_history_obs_to_aqilevels" ) ]]; then
   index_log_file="${LOG_DIR}/r2_history_index_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
+  index_rebuild_max_attempts=3
+  index_rebuild_retry_sleep_seconds=5
   echo ""
   echo "=== Rebuild R2 History Index ==="
   echo "Log: ${index_log_file}"
-  if node scripts/backup_r2/uk_aq_build_r2_history_index.mjs | tee "${index_log_file}"; then
+  : > "${index_log_file}"
+  index_rebuild_ok="false"
+  for ((index_rebuild_attempt=1; index_rebuild_attempt<=index_rebuild_max_attempts; index_rebuild_attempt++)); do
+    echo "R2 history index rebuild attempt ${index_rebuild_attempt}/${index_rebuild_max_attempts}" | tee -a "${index_log_file}"
+    if node scripts/backup_r2/uk_aq_build_r2_history_index.mjs 2>&1 | tee -a "${index_log_file}"; then
+      index_rebuild_ok="true"
+      break
+    fi
+    index_rebuild_exit_code=$?
+    echo "R2 history index rebuild attempt ${index_rebuild_attempt}/${index_rebuild_max_attempts} failed (exit=${index_rebuild_exit_code})." | tee -a "${index_log_file}" >&2
+    if (( index_rebuild_attempt < index_rebuild_max_attempts )); then
+      echo "Retrying R2 history index rebuild in ${index_rebuild_retry_sleep_seconds}s..." | tee -a "${index_log_file}"
+      sleep "${index_rebuild_retry_sleep_seconds}"
+    fi
+  done
+
+  if [[ "${index_rebuild_ok}" == "true" ]]; then
     echo "R2 history index rebuild: ok"
   else
     echo "R2 history index rebuild: failed" >&2

@@ -45,7 +45,7 @@
           radial-gradient(circle at 80% 0%, rgba(31, 122, 122, 0.18), transparent 45%),
           linear-gradient(135deg, var(--bg-base), var(--bg-accent));
         min-height: 100vh;
-        padding: 32px 20px 40px;
+        padding: 32px 20px calc(112px + env(safe-area-inset-bottom));
       }
 
       .shell {
@@ -102,6 +102,48 @@
       .mode-switch-btn:not(.is-active):hover {
         transform: translateY(-1px);
         box-shadow: 0 8px 16px rgba(34, 24, 12, 0.18);
+      }
+
+      .dashboard-page-switcher {
+        position: fixed;
+        left: 50%;
+        bottom: calc(12px + env(safe-area-inset-bottom));
+        transform: translateX(-50%);
+        z-index: 1000;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: rgba(255, 250, 241, 0.94);
+        box-shadow: 0 8px 28px rgba(34, 24, 12, 0.16);
+        backdrop-filter: blur(10px);
+      }
+
+      .dashboard-page-switcher__button {
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--ink);
+        padding: 8px 14px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+      }
+
+      .dashboard-page-switcher__button.is-active {
+        background: var(--ink);
+        border-color: var(--ink);
+        color: #fff;
+        cursor: default;
+      }
+
+      .dashboard-page-switcher__button:not(.is-active):hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
       }
 
       .meta {
@@ -1079,6 +1121,18 @@
         color: var(--accent-2);
       }
 
+      .status-pill.scheduled,
+      .status-pill.unknown {
+        background: rgba(168, 178, 193, 0.2);
+        color: #4b4f56;
+      }
+
+      .status-pill.overdue,
+      .status-pill.warning {
+        background: rgba(245, 193, 74, 0.2);
+        color: #a56800;
+      }
+
       .status-pill.partial {
         background: rgba(47, 143, 91, 0.15);
         color: #2f8f5b;
@@ -1113,6 +1167,176 @@
       .runtime-pill.overdue {
         background: rgba(211, 74, 63, 0.16);
         color: #b0322a;
+      }
+
+      .daily-task-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+
+      .daily-task-toolbar-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .daily-task-mode-switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .daily-task-mode-button {
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--ink);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+
+      .daily-task-mode-button.is-active {
+        background: var(--ink);
+        color: #fff;
+        border-color: var(--ink);
+        cursor: default;
+      }
+
+      .daily-task-mode-button:disabled {
+        opacity: 0.65;
+        cursor: not-allowed;
+      }
+
+      .daily-task-table {
+        table-layout: fixed;
+      }
+
+      .daily-task-table th,
+      .daily-task-table td {
+        padding: 10px 6px;
+      }
+
+      .daily-task-table th:first-child,
+      .daily-task-table td:first-child {
+        padding-left: 14px;
+      }
+
+      .daily-task-table th:last-child,
+      .daily-task-table td:last-child {
+        padding-right: 6px;
+      }
+
+      .daily-task-sort-btn {
+        border: none;
+        background: transparent;
+        padding: 0;
+        margin: 0;
+        font: inherit;
+        font-size: inherit;
+        letter-spacing: inherit;
+        text-transform: inherit;
+        color: inherit;
+        cursor: pointer;
+      }
+
+      .daily-task-sort-btn:hover {
+        text-decoration: underline;
+      }
+
+      .daily-task-task-cell {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .daily-task-expand {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: #fff;
+        width: 24px;
+        height: 24px;
+        line-height: 0;
+        padding: 0;
+        cursor: pointer;
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: transparent;
+        font-size: 0;
+      }
+
+      .daily-task-expand::before {
+        content: "";
+        width: 0;
+        height: 0;
+        border-top: 6px solid transparent;
+        border-bottom: 6px solid transparent;
+        border-left: 7px solid #5f584f;
+        transition: transform 0.12s ease;
+      }
+
+      .daily-task-expand[aria-expanded="true"] {
+        background: rgba(31, 122, 122, 0.12);
+      }
+
+      .daily-task-expand[aria-expanded="true"]::before {
+        transform: rotate(90deg);
+      }
+
+      .daily-task-name {
+        font-weight: 600;
+        overflow: visible;
+        text-overflow: clip;
+        white-space: normal;
+        line-height: 1.25;
+      }
+
+      .daily-task-platform {
+        text-transform: none;
+        letter-spacing: normal;
+      }
+
+      .daily-task-summary-row.is-hidden {
+        display: none;
+      }
+
+      .daily-task-summary-cell {
+        background: rgba(255, 255, 255, 0.8);
+      }
+
+      .daily-task-summary-json {
+        margin: 0;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #fff;
+        max-height: 220px;
+        overflow: auto;
+        font-size: 11px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .daily-task-state {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 12px;
+        color: var(--ink-soft);
+        padding: 8px 2px;
+      }
+
+      .daily-task-state.is-error {
+        color: #9b2c2c;
       }
 
       .metric-note {
@@ -1156,6 +1380,13 @@
       .settings-button:hover {
         transform: translateY(-1px);
         box-shadow: 0 8px 16px rgba(31, 122, 122, 0.25);
+      }
+
+      .settings-button:disabled {
+        opacity: 0.65;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
       }
 
       .settings-input,
@@ -1320,6 +1551,26 @@
 
       <div class="grid" id="dashboard"></div>
     </div>
+    <nav class="dashboard-page-switcher" aria-label="Dashboard pages">
+      <button
+        id="mode-ingest-bottom"
+        type="button"
+        class="dashboard-page-switcher__button is-active"
+        data-mode="ingest"
+        aria-selected="true"
+      >
+        Ingest
+      </button>
+      <button
+        id="mode-operations-bottom"
+        type="button"
+        class="dashboard-page-switcher__button"
+        data-mode="operations"
+        aria-selected="false"
+      >
+        Operations
+      </button>
+    </nav>
 
     <script src="assets/config.js"></script>
     <script>
@@ -1389,10 +1640,21 @@
       const dashboardTitleEl = document.getElementById("dashboard-title");
       const modeIngestBtn = document.getElementById("mode-ingest");
       const modeOperationsBtn = document.getElementById("mode-operations");
+      const modeIngestBottomBtn = document.getElementById("mode-ingest-bottom");
+      const modeOperationsBottomBtn = document.getElementById("mode-operations-bottom");
       const DASHBOARD_MODE_STORAGE_KEY = "uk_aq_dashboard_mode";
       const DASHBOARD_REFRESH_INGEST_STORAGE_KEY = "uk_aq_dashboard_refresh_ingest_seconds";
       const DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY = "uk_aq_dashboard_refresh_operations_seconds";
-      const OPERATIONS_DAY_STORAGE_KEY = "uk_aq_dashboard_operations_day";
+      const DAILY_TASK_RUNS_SELECTED_DAY_STORAGE_KEY = "ukAqDashboard.operations.dailyTaskRuns.selectedDay";
+      const DAILY_TASK_RUNS_MODE_STORAGE_KEY = "ukAqDashboard.operations.dailyTaskRuns.mode";
+      const DAILY_TASK_RUNS_MODE_VALUES = new Set(["latest", "all"]);
+      const DAILY_TASK_RUNS_SORT_KEYS = new Set([
+        "updated",
+        "task",
+        "scheduled_started",
+        "finished_failed",
+        "duration",
+      ]);
       const DASHBOARD_MODES = new Set(["ingest", "operations"]);
       let activeMode = "ingest";
       let statusEl = null;
@@ -1402,7 +1664,16 @@
       let refreshNowBtn = null;
       let refreshTimer = null;
       let operationsDropboxPollTimer = null;
-      let operationsDayValue = null;
+      let dailyTaskRunsDayValue = null;
+      let dailyTaskRunsModeValue = "latest";
+      let dailyTaskRunsRows = [];
+      let dailyTaskRunsLoading = false;
+      let dailyTaskRunsLoadSequence = 0;
+      let dailyTaskRunsLastUpdatedText = "n/a";
+      let dailyTaskRunsSort = {
+        key: "updated",
+        direction: "desc",
+      };
       const modeContainers = {
         ingest: null,
         operations: null,
@@ -1415,9 +1686,10 @@
         ingest: 0,
         operations: 0,
       };
+      const MIN_OPERATIONS_AUTO_REFRESH_SECONDS = 3600;
       const refreshSecondsByMode = {
         ingest: Number(runtimeConfig.defaultRefreshSeconds) || 300,
-        operations: 1800,
+        operations: MIN_OPERATIONS_AUTO_REFRESH_SECONDS,
       };
       let modeStatusText = "Waiting for data...";
       let modeDataMetaText = "Project n/a";
@@ -1427,7 +1699,7 @@
         refreshSecondsByMode.ingest = 300;
       }
       if (!Number.isFinite(refreshSecondsByMode.operations) || refreshSecondsByMode.operations <= 0) {
-        refreshSecondsByMode.operations = 1800;
+        refreshSecondsByMode.operations = MIN_OPERATIONS_AUTO_REFRESH_SECONDS;
       }
       if (dashboardTitleEl) {
         dashboardTitleEl.textContent = runtimeConfig.dashboardTitle || DEFAULT_CONFIG.dashboardTitle;
@@ -1542,11 +1814,18 @@
         }
         const storedOperationsRefresh = Number(localStorage.getItem(DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY));
         if (REFRESH_OPTIONS_SECONDS.includes(storedOperationsRefresh)) {
-          refreshSecondsByMode.operations = storedOperationsRefresh;
+          refreshSecondsByMode.operations = Math.max(
+            MIN_OPERATIONS_AUTO_REFRESH_SECONDS,
+            storedOperationsRefresh
+          );
         }
-        const storedOperationsDay = localStorage.getItem(OPERATIONS_DAY_STORAGE_KEY);
-        if (storedOperationsDay && /^\d{4}-\d{2}-\d{2}$/.test(storedOperationsDay)) {
-          operationsDayValue = storedOperationsDay;
+        const storedDailyTaskRunsDay = sessionStorage.getItem(DAILY_TASK_RUNS_SELECTED_DAY_STORAGE_KEY);
+        if (storedDailyTaskRunsDay && /^\d{4}-\d{2}-\d{2}$/.test(storedDailyTaskRunsDay)) {
+          dailyTaskRunsDayValue = storedDailyTaskRunsDay;
+        }
+        const storedDailyTaskRunsMode = sessionStorage.getItem(DAILY_TASK_RUNS_MODE_STORAGE_KEY);
+        if (storedDailyTaskRunsMode && DAILY_TASK_RUNS_MODE_VALUES.has(storedDailyTaskRunsMode)) {
+          dailyTaskRunsModeValue = storedDailyTaskRunsMode;
         }
         const storedConnector = localStorage.getItem(DISPATCH_CONNECTOR_STORAGE_KEY);
         if (storedConnector && DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === storedConnector)) {
@@ -1589,8 +1868,11 @@
       } catch (_err) {
         // Ignore storage read issues and use defaults.
       }
-      if (!operationsDayValue) {
-        operationsDayValue = toUtcDateKey(startOfUtcDay(new Date()));
+      if (!dailyTaskRunsDayValue) {
+        dailyTaskRunsDayValue = toUtcDateKey(startOfUtcDay(new Date()));
+      }
+      if (!DAILY_TASK_RUNS_MODE_VALUES.has(dailyTaskRunsModeValue)) {
+        dailyTaskRunsModeValue = "latest";
       }
       if (!storageCoverageMonthCursor) {
         storageCoverageMonthCursor = startOfUtcMonth(new Date());
@@ -2179,9 +2461,16 @@
           return null;
         }
         const rounded = Math.max(0, Math.round(Number(totalSeconds)));
-        const minutes = Math.floor(rounded / 60);
+        const hours = Math.floor(rounded / 3600);
+        const minutes = Math.floor((rounded % 3600) / 60);
         const seconds = rounded % 60;
-        return `${minutes}m ${seconds}s`;
+        if (hours > 0) {
+          return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+        }
+        if (minutes > 0) {
+          return `${minutes}m ${seconds}s`;
+        }
+        return `${seconds}s`;
       }
 
       function calcDurationMinutes(run) {
@@ -2208,7 +2497,17 @@
       }
 
       function setDataMeta(payload) {
-        const projectRef = payload && payload.project_ref ? payload.project_ref : "n/a";
+        const projectRef =
+          activeMode === "operations"
+            ? (
+                (payload && payload.obs_aqidb_project_ref)
+                || (payload && payload.project_ref)
+                || "n/a"
+              )
+            : (
+                (payload && payload.project_ref)
+                || "n/a"
+              );
         modeDataMetaText = `Project ${projectRef}`;
         if (dataMetaEl) {
           dataMetaEl.textContent = modeDataMetaText;
@@ -2311,7 +2610,10 @@
       function getActiveRefreshSeconds() {
         const value = Number(refreshSecondsByMode[activeMode]);
         if (!Number.isFinite(value) || value <= 0) {
-          return activeMode === "operations" ? 1800 : 300;
+          return activeMode === "operations" ? MIN_OPERATIONS_AUTO_REFRESH_SECONDS : 300;
+        }
+        if (activeMode === "operations") {
+          return Math.max(MIN_OPERATIONS_AUTO_REFRESH_SECONDS, value);
         }
         return value;
       }
@@ -2363,6 +2665,9 @@
         if (!Number.isFinite(seconds) || seconds <= 0) {
           return;
         }
+        if (activeMode === "operations") {
+          seconds = Math.max(MIN_OPERATIONS_AUTO_REFRESH_SECONDS, seconds);
+        }
         refreshSecondsByMode[activeMode] = seconds;
         persistActiveModeRefreshSeconds();
         startRefreshTimer();
@@ -2380,21 +2685,25 @@
           startOperationsDropboxPolling();
         }
         if (wasInactive) {
-          void loadCurrentMode({ refreshOnResume: true });
+          if (activeMode === "ingest") {
+            void loadCurrentMode({ refreshOnResume: true });
+          }
           wasInactive = false;
         }
       }
 
       function renderRefreshPills(mode) {
         const refreshName = `refresh-${mode}`;
-        const selectedValue = getActiveRefreshSeconds();
-        const options = [
-          { value: 60, label: "1 min" },
-          { value: 300, label: "5 min" },
-          { value: 600, label: "10 min" },
-          { value: 1800, label: "30 min" },
-          { value: 3600, label: "60 min" },
-        ];
+        const selectedValue = Number(refreshSecondsByMode[mode] || (mode === "operations" ? MIN_OPERATIONS_AUTO_REFRESH_SECONDS : 300));
+        const options = mode === "operations"
+          ? [{ value: MIN_OPERATIONS_AUTO_REFRESH_SECONDS, label: "60 min" }]
+          : [
+            { value: 60, label: "1 min" },
+            { value: 300, label: "5 min" },
+            { value: 600, label: "10 min" },
+            { value: 1800, label: "30 min" },
+            { value: 3600, label: "60 min" },
+          ];
         return options
           .map((option) => {
             const inputId = `${refreshName}-${option.value}`;
@@ -2956,7 +3265,7 @@
       }
 
       async function refreshR2MetricsOnly() {
-        if (activeMode !== "ingest") {
+        if (activeMode !== "operations") {
           return;
         }
         if (!latestDashboardData) {
@@ -2996,14 +3305,14 @@
             latestDashboardData.r2_backup_window,
             latestDashboardData.r2_backup_window_error,
           );
-          const ingestContainer = getModeContainer("ingest");
-          const currentPanel = ingestContainer
-            ? ingestContainer.querySelector('[data-panel="db-size"]')
+          const operationsContainer = getModeContainer("operations");
+          const currentPanel = operationsContainer
+            ? operationsContainer.querySelector('[data-panel="db-size"]')
             : null;
           if (currentPanel) {
             currentPanel.replaceWith(nextPanel);
-          } else if (ingestContainer) {
-            ingestContainer.appendChild(nextPanel);
+          } else if (operationsContainer) {
+            operationsContainer.appendChild(nextPanel);
           }
           const generatedAt = (payload && payload.generated_at) || new Date().toISOString();
           setStatus(`R2 metrics refreshed ${formatDateTimeLocalWithTimezone(generatedAt)}`);
@@ -3546,7 +3855,7 @@
             } catch (_err) {
               // Ignore storage write issues.
             }
-            loadDashboard();
+            loadOperationsDashboard();
           });
         }
 
@@ -4693,16 +5002,16 @@
       }
 
       function upsertStorageCoveragePanel(nextPanel) {
-        const ingestContainer = getModeContainer("ingest");
-        if (!ingestContainer) {
+        const operationsContainer = getModeContainer("operations");
+        if (!operationsContainer) {
           return;
         }
-        const currentPanel = ingestContainer.querySelector('[data-panel="storage-coverage"]');
+        const currentPanel = operationsContainer.querySelector('[data-panel="storage-coverage"]');
         if (currentPanel) {
           currentPanel.replaceWith(nextPanel);
           return;
         }
-        ingestContainer.appendChild(nextPanel);
+        operationsContainer.appendChild(nextPanel);
       }
 
       function renderStorageCoverageLoadingPanel(message = "Refreshing calendar...") {
@@ -4718,7 +5027,7 @@
 
       function renderStorageCoverageErrorPanel(message, options = {}) {
         const forceRefresh = Boolean(options.forceRefresh);
-        const parentLoadId = Number(options.parentLoadId) || dashboardLoadSequence;
+        const parentLoadId = Number(options.parentLoadId) || operationsLoadSequence;
         const panel = document.createElement("section");
         panel.className = "panel coverage-calendar-panel";
         panel.dataset.panel = "storage-coverage";
@@ -4739,7 +5048,7 @@
       }
 
       async function loadStorageCoverage(options = {}) {
-        if (activeMode !== "ingest") {
+        if (activeMode !== "operations") {
           return;
         }
         const forceRefresh = Boolean(options.forceRefresh);
@@ -4769,7 +5078,7 @@
           if (requestId !== storageCoverageLoadSequence) {
             return;
           }
-          if (parentLoadId && parentLoadId !== dashboardLoadSequence) {
+          if (parentLoadId && parentLoadId !== operationsLoadSequence) {
             return;
           }
           const data = payload || {};
@@ -4793,7 +5102,7 @@
           if (requestId !== storageCoverageLoadSequence) {
             return;
           }
-          if (parentLoadId && parentLoadId !== dashboardLoadSequence) {
+          if (parentLoadId && parentLoadId !== operationsLoadSequence) {
             return;
           }
           if (maybeRedirectToAccessLogin(err, buildApiUrl("storage_coverage"))) {
@@ -4833,35 +5142,488 @@
         return panel;
       }
 
-      function renderOperationsDailyTaskPlaceholderPanel() {
+      function getOperationsDailyTaskPanel() {
+        const operationsContainer = getModeContainer("operations");
+        if (!operationsContainer) {
+          return null;
+        }
+        return operationsContainer.querySelector('[data-panel="operations-daily-task"]');
+      }
+
+      function parseTimestampMs(value) {
+        if (!value) {
+          return null;
+        }
+        const parsedMs = new Date(value).getTime();
+        if (Number.isNaN(parsedMs)) {
+          return null;
+        }
+        return parsedMs;
+      }
+
+      function buildDailyTaskRunsRowMeta(row, nowMs) {
+        const rawStatus = String((row && (row.raw_status || row.status)) || "").trim().toLowerCase();
+        const scheduledAtMs = parseTimestampMs(row && (row.scheduled_at_utc || row.scheduled_or_started_at));
+        const startedAtMs = parseTimestampMs(row && row.started_at);
+        const finishedAtMs = parseTimestampMs(row && row.finished_at);
+        const failedAtMs = parseTimestampMs(row && row.failed_at);
+        const updatedAtMs = parseTimestampMs(row && row.updated_at);
+        const hasWarningStatus = ["warning", "partial", "stopped_limit"].includes(rawStatus);
+        const hasSuccessStatus = ["finished", "success", "ok", "completed"].includes(rawStatus);
+        const hasFailedStatus = ["failed", "error"].includes(rawStatus);
+        const isOverdue = startedAtMs === null && scheduledAtMs !== null && (scheduledAtMs + 120000) < nowMs;
+
+        let statusLabel = "Unknown";
+        let statusClass = "unknown";
+        if (failedAtMs !== null || hasFailedStatus) {
+          statusLabel = "Failed";
+          statusClass = "failed";
+        } else if (finishedAtMs !== null || hasSuccessStatus) {
+          statusLabel = "Finished";
+          statusClass = "succeeded";
+        } else if (startedAtMs !== null) {
+          statusLabel = "Started";
+          statusClass = "running";
+        } else if (isOverdue) {
+          statusLabel = "Overdue";
+          statusClass = "overdue";
+        } else if (scheduledAtMs !== null) {
+          statusLabel = "Scheduled";
+          statusClass = "scheduled";
+        } else if (hasWarningStatus) {
+          statusLabel = "Warning";
+          statusClass = "warning";
+        }
+
+        let durationSeconds = Number.isFinite(Number(row && row.duration_seconds))
+          ? Math.max(0, Math.round(Number(row.duration_seconds)))
+          : null;
+        if (durationSeconds === null && startedAtMs !== null) {
+          if (failedAtMs !== null) {
+            durationSeconds = Math.max(0, Math.floor((failedAtMs - startedAtMs) / 1000));
+          } else if (finishedAtMs !== null) {
+            durationSeconds = Math.max(0, Math.floor((finishedAtMs - startedAtMs) / 1000));
+          } else {
+            durationSeconds = Math.max(0, Math.floor((nowMs - startedAtMs) / 1000));
+          }
+        }
+
+        return {
+          statusLabel,
+          statusClass,
+          scheduledAtMs,
+          startedAtMs,
+          finishedAtMs,
+          failedAtMs,
+          updatedAtMs,
+          scheduledOrStartedMs: startedAtMs !== null ? startedAtMs : scheduledAtMs,
+          finishedOrFailedMs: failedAtMs !== null ? failedAtMs : finishedAtMs,
+          durationSeconds,
+        };
+      }
+
+      function formatDailyTaskSummary(summaryValue) {
+        if (summaryValue === null || summaryValue === undefined) {
+          return "No summary";
+        }
+        if (typeof summaryValue === "string") {
+          const trimmed = summaryValue.trim();
+          return trimmed ? trimmed : "No summary";
+        }
+        if (typeof summaryValue === "object") {
+          if (Array.isArray(summaryValue) && summaryValue.length === 0) {
+            return "No summary";
+          }
+          if (!Array.isArray(summaryValue) && Object.keys(summaryValue).length === 0) {
+            return "No summary";
+          }
+          try {
+            return JSON.stringify(summaryValue, null, 2);
+          } catch (_err) {
+            return "No summary";
+          }
+        }
+        return String(summaryValue);
+      }
+
+      function sortDailyTaskRunsRows(rows, mode, nowMs) {
+        const direction = dailyTaskRunsSort.direction === "asc" ? "asc" : "desc";
+        const entries = (Array.isArray(rows) ? rows : []).map((row, index) => ({
+          row,
+          meta: buildDailyTaskRunsRowMeta(row, nowMs),
+          index,
+        }));
+
+        if (dailyTaskRunsSort.key === "task" && mode === "all") {
+          const grouped = new Map();
+          entries.forEach((entry) => {
+            const groupKey = String((entry.row && (entry.row.task_name || entry.row.task_key)) || "Unknown");
+            if (!grouped.has(groupKey)) {
+              grouped.set(groupKey, []);
+            }
+            grouped.get(groupKey).push(entry);
+          });
+          const groups = Array.from(grouped.entries()).map(([groupKey, groupEntries]) => {
+            const sortedEntries = [...groupEntries].sort((left, right) => {
+              const leftUpdated = left.meta.updatedAtMs === null ? -1 : left.meta.updatedAtMs;
+              const rightUpdated = right.meta.updatedAtMs === null ? -1 : right.meta.updatedAtMs;
+              return rightUpdated - leftUpdated || left.index - right.index;
+            });
+            const latestUpdated = sortedEntries.length ? (sortedEntries[0].meta.updatedAtMs || -1) : -1;
+            return { groupKey, latestUpdated, entries: sortedEntries };
+          });
+          groups.sort((left, right) => {
+            if (left.latestUpdated !== right.latestUpdated) {
+              return right.latestUpdated - left.latestUpdated;
+            }
+            return left.groupKey.localeCompare(right.groupKey, undefined, { sensitivity: "base" });
+          });
+          return groups.flatMap((group) => group.entries);
+        }
+
+        const compareNullableNumber = (left, right) => {
+          if (left === right) return 0;
+          if (left === null) return 1;
+          if (right === null) return -1;
+          return direction === "asc" ? left - right : right - left;
+        };
+
+        const compareText = (left, right) => {
+          const result = String(left || "").localeCompare(String(right || ""), undefined, {
+            sensitivity: "base",
+            numeric: true,
+          });
+          return direction === "asc" ? result : -result;
+        };
+
+        const sortedEntries = [...entries];
+        sortedEntries.sort((left, right) => {
+          let result = 0;
+          if (dailyTaskRunsSort.key === "task") {
+            result = compareText(
+              left.row && (left.row.task_name || left.row.task_key || "Unknown"),
+              right.row && (right.row.task_name || right.row.task_key || "Unknown"),
+            );
+          } else if (dailyTaskRunsSort.key === "scheduled_started") {
+            result = compareNullableNumber(left.meta.scheduledOrStartedMs, right.meta.scheduledOrStartedMs);
+          } else if (dailyTaskRunsSort.key === "finished_failed") {
+            result = compareNullableNumber(left.meta.finishedOrFailedMs, right.meta.finishedOrFailedMs);
+          } else if (dailyTaskRunsSort.key === "duration") {
+            result = compareNullableNumber(left.meta.durationSeconds, right.meta.durationSeconds);
+          } else {
+            result = compareNullableNumber(left.meta.updatedAtMs, right.meta.updatedAtMs);
+          }
+          if (result !== 0) {
+            return result;
+          }
+          return left.index - right.index;
+        });
+
+        return sortedEntries;
+      }
+
+      function renderDailyTaskRunsCardContent(panel, rows, options = {}) {
+        if (!panel) {
+          return;
+        }
+        const contentEl = panel.querySelector("#daily-task-runs-content");
+        if (!contentEl) {
+          return;
+        }
+        if (options.loading) {
+          contentEl.innerHTML = `<div class="daily-task-state">${escapeHtml(options.loadingMessage || "Loading...")}</div>`;
+          return;
+        }
+        if (options.errorMessage) {
+          contentEl.innerHTML = `<div class="daily-task-state is-error">${escapeHtml(options.errorMessage)}</div>`;
+          return;
+        }
+        if (!Array.isArray(rows) || rows.length === 0) {
+          contentEl.innerHTML = `<div class="daily-task-state">No daily task runs found for this day.</div>`;
+          return;
+        }
+
+        const mode = dailyTaskRunsModeValue === "all" ? "all" : "latest";
+        const nowMs = Date.now();
+        const sortedEntries = sortDailyTaskRunsRows(rows, mode, nowMs);
+        const sortArrow = (sortKey) => {
+          if (dailyTaskRunsSort.key !== sortKey) {
+            return "";
+          }
+          return dailyTaskRunsSort.direction === "asc" ? " ▲" : " ▼";
+        };
+
+        const rowsMarkup = sortedEntries
+          .map((entry, index) => {
+            const row = entry.row || {};
+            const meta = entry.meta;
+            const rowKey = String(row.run_id || `${row.task_key || "task"}-${index}`);
+            const summaryRowId = `daily-task-summary-${escapeHtml(rowKey).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+            const taskLabel = String(row.task_name || row.task_key || "Unknown");
+            const platformLabel = String(row.platform || "n/a");
+            const scheduledValue = meta.startedAtMs !== null
+              ? formatTime(row.started_at)
+              : (meta.scheduledAtMs !== null ? formatTime(row.scheduled_at_utc || row.scheduled_or_started_at) : "n/a");
+            const finishedValue = meta.failedAtMs !== null
+              ? formatTime(row.failed_at)
+              : (meta.finishedAtMs !== null ? formatTime(row.finished_at) : "—");
+            const durationValue = meta.durationSeconds === null ? "n/a" : (formatDurationSeconds(meta.durationSeconds) || "n/a");
+            const summaryText = formatDailyTaskSummary(row.summary);
+
+            return `
+              <tr class="daily-task-row">
+                <td>
+                  <div class="daily-task-task-cell">
+                    <button class="daily-task-expand" type="button" aria-label="Toggle summary" aria-expanded="false" aria-controls="${summaryRowId}" data-summary-row-id="${summaryRowId}"></button>
+                    <span class="daily-task-name">${escapeHtml(taskLabel)}</span>
+                  </div>
+                </td>
+                <td class="daily-task-platform">${escapeHtml(platformLabel)}</td>
+                <td><span class="status-pill ${escapeHtml(meta.statusClass)}">${escapeHtml(meta.statusLabel)}</span></td>
+                <td>${escapeHtml(scheduledValue)}</td>
+                <td>${escapeHtml(finishedValue)}</td>
+                <td>${escapeHtml(durationValue)}</td>
+              </tr>
+              <tr id="${summaryRowId}" class="daily-task-summary-row is-hidden">
+                <td colspan="6" class="daily-task-summary-cell">
+                  <pre class="daily-task-summary-json">${escapeHtml(summaryText)}</pre>
+                </td>
+              </tr>
+            `;
+          })
+          .join("");
+
+        contentEl.innerHTML = `
+          <table class="daily-task-table">
+            <colgroup>
+              <col style="width:40%" />
+              <col style="width:9%" />
+              <col style="width:10%" />
+              <col style="width:17%" />
+              <col style="width:17%" />
+              <col style="width:7%" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="task">Task${sortArrow("task")}</button></th>
+                <th>Platform</th>
+                <th>Status</th>
+                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="scheduled_started">Scheduled<br>/ Started${sortArrow("scheduled_started")}</button></th>
+                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="finished_failed">Finished<br>/ Failed${sortArrow("finished_failed")}</button></th>
+                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="duration">Duration${sortArrow("duration")}</button></th>
+              </tr>
+            </thead>
+            <tbody>${rowsMarkup}</tbody>
+          </table>
+        `;
+
+        const sortButtons = contentEl.querySelectorAll("[data-daily-task-sort]");
+        sortButtons.forEach((buttonEl) => {
+          buttonEl.addEventListener("click", () => {
+            const nextKey = String(buttonEl.getAttribute("data-daily-task-sort") || "");
+            if (!DAILY_TASK_RUNS_SORT_KEYS.has(nextKey)) {
+              return;
+            }
+            if (dailyTaskRunsSort.key === nextKey) {
+              dailyTaskRunsSort.direction = dailyTaskRunsSort.direction === "asc" ? "desc" : "asc";
+            } else {
+              dailyTaskRunsSort.key = nextKey;
+              dailyTaskRunsSort.direction = nextKey === "task" ? "asc" : "desc";
+            }
+            renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows);
+          });
+        });
+
+        const expandButtons = contentEl.querySelectorAll(".daily-task-expand");
+        expandButtons.forEach((buttonEl) => {
+          buttonEl.addEventListener("click", () => {
+            const summaryRowId = String(buttonEl.getAttribute("data-summary-row-id") || "");
+            if (!summaryRowId) {
+              return;
+            }
+            const summaryRowEl = document.getElementById(summaryRowId);
+            if (!summaryRowEl) {
+              return;
+            }
+            const currentlyExpanded = buttonEl.getAttribute("aria-expanded") === "true";
+            buttonEl.setAttribute("aria-expanded", currentlyExpanded ? "false" : "true");
+            summaryRowEl.classList.toggle("is-hidden", currentlyExpanded);
+          });
+        });
+      }
+
+      function updateDailyTaskRunsModeButtons(panel) {
+        const buttons = panel ? panel.querySelectorAll("[data-daily-task-mode]") : [];
+        buttons.forEach((buttonEl) => {
+          const modeValue = String(buttonEl.getAttribute("data-daily-task-mode") || "latest");
+          const isActive = modeValue === dailyTaskRunsModeValue;
+          buttonEl.classList.toggle("is-active", isActive);
+          buttonEl.setAttribute("aria-pressed", isActive ? "true" : "false");
+          buttonEl.disabled = isActive || dailyTaskRunsLoading;
+        });
+      }
+
+      async function loadDailyTaskRunsCard(options = {}) {
+        const panel = getOperationsDailyTaskPanel();
+        if (!panel) {
+          return;
+        }
+        const force = Boolean(options.force);
+        const parentLoadId = Number(options.parentLoadId) || 0;
+        const requestId = ++dailyTaskRunsLoadSequence;
+        dailyTaskRunsLoading = true;
+
+        const dayInput = panel.querySelector("#daily-task-runs-day-selector");
+        const refreshButton = panel.querySelector("#daily-task-runs-refresh");
+        const updatedEl = panel.querySelector("#daily-task-runs-updated");
+        if (dayInput) {
+          dayInput.disabled = true;
+        }
+        if (refreshButton) {
+          refreshButton.disabled = true;
+          refreshButton.textContent = "Refreshing...";
+        }
+        updateDailyTaskRunsModeButtons(panel);
+        if (!dailyTaskRunsRows.length) {
+          renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows, { loading: true, loadingMessage: "Loading daily task runs..." });
+        }
+
+        try {
+          const params = new URLSearchParams();
+          params.set("day", dailyTaskRunsDayValue || toUtcDateKey(startOfUtcDay(new Date())));
+          params.set("mode", dailyTaskRunsModeValue || "latest");
+          if (force) {
+            params.set("t", String(Date.now()));
+          }
+          const requestUrl = buildApiUrl("daily_task_runs", params);
+          const resp = await fetch(requestUrl);
+          const text = await resp.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(text);
+          } catch (_err) {
+            payload = null;
+          }
+          if (!resp.ok) {
+            const message = buildResponseErrorMessage(resp, payload, text);
+            throw new Error(message);
+          }
+          if (requestId !== dailyTaskRunsLoadSequence) {
+            return;
+          }
+          if (parentLoadId && parentLoadId !== operationsLoadSequence) {
+            return;
+          }
+          const rows = Array.isArray(payload && payload.rows) ? payload.rows : [];
+          dailyTaskRunsRows = rows;
+          dailyTaskRunsLastUpdatedText = payload && payload.generated_at
+            ? formatDateTimeLocalWithTimezone(payload.generated_at)
+            : "n/a";
+          if (updatedEl) {
+            updatedEl.textContent = `Updated: ${dailyTaskRunsLastUpdatedText}`;
+          }
+          renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows);
+        } catch (err) {
+          if (requestId !== dailyTaskRunsLoadSequence) {
+            return;
+          }
+          if (parentLoadId && parentLoadId !== operationsLoadSequence) {
+            return;
+          }
+          const message = err && err.message ? String(err.message) : "Failed to load daily task runs";
+          renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows, {
+            errorMessage: message,
+          });
+        } finally {
+          if (requestId === dailyTaskRunsLoadSequence) {
+            dailyTaskRunsLoading = false;
+            if (dayInput) {
+              dayInput.disabled = false;
+            }
+            if (refreshButton) {
+              refreshButton.disabled = false;
+              refreshButton.textContent = "Refresh";
+            }
+            updateDailyTaskRunsModeButtons(panel);
+          }
+        }
+      }
+
+      function renderOperationsDailyTaskPanel() {
         const panel = document.createElement("section");
         panel.className = "panel";
         panel.dataset.panel = "operations-daily-task";
-        const dayValue = operationsDayValue || toUtcDateKey(startOfUtcDay(new Date()));
+        const dayValue = dailyTaskRunsDayValue || toUtcDateKey(startOfUtcDay(new Date()));
         panel.innerHTML = `
-          <h2>daily_task_latest_runs (placeholder)</h2>
-          <div class="dispatch-filters">
-            <label class="dispatch-filter" for="operations-day-selector">
-              Day
-              <input class="settings-input" id="operations-day-selector" type="date" value="${escapeHtml(dayValue)}" />
-            </label>
+          <h2>Daily Tasks Latest Runs</h2>
+          <div class="daily-task-toolbar">
+            <div class="dispatch-filters">
+              <label class="dispatch-filter" for="daily-task-runs-day-selector">
+                Day
+                <input class="settings-input" id="daily-task-runs-day-selector" type="date" value="${escapeHtml(dayValue)}" />
+              </label>
+              <div class="daily-task-mode-switch" role="group" aria-label="Daily task run mode">
+                <button type="button" class="daily-task-mode-button${dailyTaskRunsModeValue === "latest" ? " is-active" : ""}" data-daily-task-mode="latest" aria-pressed="${dailyTaskRunsModeValue === "latest" ? "true" : "false"}">Latest</button>
+                <button type="button" class="daily-task-mode-button${dailyTaskRunsModeValue === "all" ? " is-active" : ""}" data-daily-task-mode="all" aria-pressed="${dailyTaskRunsModeValue === "all" ? "true" : "false"}">All runs</button>
+              </div>
+            </div>
+            <div class="daily-task-toolbar-right">
+              <span class="meta-note" id="daily-task-runs-updated">Updated: ${escapeHtml(dailyTaskRunsLastUpdatedText)}</span>
+              <button class="settings-button" id="daily-task-runs-refresh" type="button">Refresh</button>
+            </div>
           </div>
-          <div class="footnote">Placeholder card for ObsAQI DB daily task view. Refresh interval: 30 minutes.</div>
+          <div id="daily-task-runs-content">
+            <div class="daily-task-state">Loading daily task runs...</div>
+          </div>
+          <div class="footnote">Times in UTC.</div>
         `;
-        const daySelector = panel.querySelector("#operations-day-selector");
+        const daySelector = panel.querySelector("#daily-task-runs-day-selector");
         if (daySelector) {
           daySelector.addEventListener("change", (event) => {
             const nextValue = String(event.target.value || "");
             if (!/^\d{4}-\d{2}-\d{2}$/.test(nextValue)) {
               return;
             }
-            operationsDayValue = nextValue;
+            dailyTaskRunsDayValue = nextValue;
             try {
-              localStorage.setItem(OPERATIONS_DAY_STORAGE_KEY, operationsDayValue);
+              sessionStorage.setItem(DAILY_TASK_RUNS_SELECTED_DAY_STORAGE_KEY, dailyTaskRunsDayValue);
             } catch (_err) {
               // Ignore storage write failures.
             }
+            loadDailyTaskRunsCard({ force: true });
           });
+        }
+
+        const modeButtons = panel.querySelectorAll("[data-daily-task-mode]");
+        modeButtons.forEach((buttonEl) => {
+          buttonEl.addEventListener("click", () => {
+            const nextMode = String(buttonEl.getAttribute("data-daily-task-mode") || "").trim().toLowerCase();
+            if (!DAILY_TASK_RUNS_MODE_VALUES.has(nextMode) || nextMode === dailyTaskRunsModeValue) {
+              return;
+            }
+            dailyTaskRunsModeValue = nextMode;
+            try {
+              sessionStorage.setItem(DAILY_TASK_RUNS_MODE_STORAGE_KEY, dailyTaskRunsModeValue);
+            } catch (_err) {
+              // Ignore storage write failures.
+            }
+            if (!DAILY_TASK_RUNS_SORT_KEYS.has(dailyTaskRunsSort.key)) {
+              dailyTaskRunsSort = { key: "updated", direction: "desc" };
+            }
+            updateDailyTaskRunsModeButtons(panel);
+            loadDailyTaskRunsCard({ force: true });
+          });
+        });
+
+        const refreshButton = panel.querySelector("#daily-task-runs-refresh");
+        if (refreshButton) {
+          refreshButton.addEventListener("click", () => {
+            loadDailyTaskRunsCard({ force: true });
+          });
+        }
+        updateDailyTaskRunsModeButtons(panel);
+        if (Array.isArray(dailyTaskRunsRows) && dailyTaskRunsRows.length) {
+          renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows);
         }
         return panel;
       }
@@ -4940,6 +5702,16 @@
           modeOperationsBtn.classList.toggle("is-active", isActive);
           modeOperationsBtn.setAttribute("aria-selected", isActive ? "true" : "false");
         }
+        if (modeIngestBottomBtn) {
+          const isActive = activeMode === "ingest";
+          modeIngestBottomBtn.classList.toggle("is-active", isActive);
+          modeIngestBottomBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
+        if (modeOperationsBottomBtn) {
+          const isActive = activeMode === "operations";
+          modeOperationsBottomBtn.classList.toggle("is-active", isActive);
+          modeOperationsBottomBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
       }
 
       async function loadOperationsDashboard(options = {}) {
@@ -4949,26 +5721,81 @@
         if (!operationsContainer) {
           return;
         }
-        if (operationsContainer.children.length === 0) {
-          operationsContainer.appendChild(renderModeControlPanel("operations"));
-          operationsContainer.appendChild(renderOperationsDropboxPanel());
-          operationsContainer.appendChild(renderOperationsDailyTaskPlaceholderPanel());
-        } else {
-          syncModeControlRefsFromVisibleContainer();
-        }
         modeIsLoading.operations = true;
         setError("");
         setStatus(forceRefresh ? "Force refreshing..." : "Loading...");
-        await refreshOperationsDropboxPanel();
-        if (loadId !== operationsLoadSequence || activeMode !== "operations") {
+        try {
+          const params = new URLSearchParams();
+          params.set("t", String(Date.now()));
+          params.set("include_storage_coverage", "0");
+          if (forceRefresh) {
+            params.set("force", "1");
+          }
+          const dashboardUrl = buildApiUrl("dashboard", params);
+          const resp = await fetch(dashboardUrl);
+          const text = await resp.text();
+          let payload = null;
+          try {
+            payload = JSON.parse(text);
+          } catch (_err) {
+            payload = null;
+          }
+          if (!resp.ok) {
+            const message = buildResponseErrorMessage(resp, payload, text);
+            throw new Error(message);
+          }
+          if (loadId !== operationsLoadSequence || activeMode !== "operations") {
+            modeIsLoading.operations = false;
+            return;
+          }
+          const data = payload || {};
+          latestDashboardData = data;
+          const existingDailyTaskPanel = operationsContainer.querySelector('[data-panel="operations-daily-task"]');
+          const nextPanels = [
+            renderModeControlPanel("operations"),
+            renderOperationsDropboxPanel(),
+            existingDailyTaskPanel || renderOperationsDailyTaskPanel(),
+            renderDbSizePanel(
+              data.db_size_metrics,
+              data.db_size_metrics_error,
+              data.schema_size_metrics,
+              data.schema_size_metrics_error,
+              data.r2_domain_size_metrics,
+              data.r2_domain_size_metrics_error,
+              data.r2_usage,
+              data.r2_usage_error,
+              data.r2_backup_window,
+              data.r2_backup_window_error,
+            ),
+            renderStorageCoverageLoadingPanel("Refreshing calendar..."),
+          ];
+          operationsContainer.replaceChildren(...nextPanels);
+          await refreshOperationsDropboxPanel();
+          await loadDailyTaskRunsCard({ force: forceRefresh, parentLoadId: loadId });
+          if (loadId !== operationsLoadSequence || activeMode !== "operations") {
+            modeIsLoading.operations = false;
+            return;
+          }
+          modeLastLoadedAtMs.operations = Date.now();
           modeIsLoading.operations = false;
-          return;
+          setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}`);
+          setDataMeta(data);
+          startOperationsDropboxPolling();
+          void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
+        } catch (err) {
+          if (loadId !== operationsLoadSequence || activeMode !== "operations") {
+            modeIsLoading.operations = false;
+            return;
+          }
+          modeIsLoading.operations = false;
+          if (maybeRedirectToAccessLogin(err, buildApiUrl("dashboard"))) {
+            setStatus("Cloudflare Access login required. Redirecting...");
+            setError("Cloudflare Access login required. Redirecting...");
+            return;
+          }
+          setError(err.message || String(err));
+          setStatus("Error");
         }
-        modeLastLoadedAtMs.operations = Date.now();
-        modeIsLoading.operations = false;
-        setStatus(`Updated ${formatDateTimeLocalWithTimezone(new Date().toISOString())}`);
-        setDataMeta({ project_ref: runtimeConfig.envName || "n/a" });
-        startOperationsDropboxPolling();
       }
 
       async function loadCurrentMode(options = {}) {
@@ -5068,27 +5895,11 @@
           (Array.isArray(data.pollutants) ? data.pollutants : []).forEach((pollutant) => {
             nextPanels.push(renderPanel(pollutant));
           });
-          nextPanels.push(
-            renderDbSizePanel(
-              data.db_size_metrics,
-              data.db_size_metrics_error,
-              data.schema_size_metrics,
-              data.schema_size_metrics_error,
-              data.r2_domain_size_metrics,
-              data.r2_domain_size_metrics_error,
-              data.r2_usage,
-              data.r2_usage_error,
-              data.r2_backup_window,
-              data.r2_backup_window_error,
-            ),
-          );
           ingestContainer.replaceChildren(...nextPanels);
-          upsertStorageCoveragePanel(renderStorageCoverageLoadingPanel("Refreshing calendar..."));
           modeLastLoadedAtMs.ingest = Date.now();
           modeIsLoading.ingest = false;
           setStatus(`Updated ${formatDateTimeLocalWithTimezone(data.generated_at)}`);
           setDataMeta(data);
-          void loadStorageCoverage({ forceRefresh, parentLoadId: loadId });
         } catch (err) {
           if (loadId !== dashboardLoadSequence) {
             modeIsLoading.ingest = false;
@@ -5112,35 +5923,31 @@
       document.addEventListener("visibilitychange", handleActivityChange);
       window.addEventListener("focus", handleActivityChange);
       window.addEventListener("blur", handleActivityChange);
+      function activateMode(mode) {
+        if (!DASHBOARD_MODES.has(mode) || activeMode === mode) {
+          return;
+        }
+        activeMode = mode;
+        try {
+          localStorage.setItem(DASHBOARD_MODE_STORAGE_KEY, activeMode);
+        } catch (_err) {
+          // Ignore storage write failures.
+        }
+        startRefreshTimer();
+        void loadCurrentMode({ forceRefresh: false });
+      }
+
       if (modeIngestBtn) {
-        modeIngestBtn.addEventListener("click", () => {
-          if (activeMode === "ingest") {
-            return;
-          }
-          activeMode = "ingest";
-          try {
-            localStorage.setItem(DASHBOARD_MODE_STORAGE_KEY, activeMode);
-          } catch (_err) {
-            // Ignore storage write failures.
-          }
-          startRefreshTimer();
-          void loadCurrentMode({ forceRefresh: false });
-        });
+        modeIngestBtn.addEventListener("click", () => activateMode("ingest"));
       }
       if (modeOperationsBtn) {
-        modeOperationsBtn.addEventListener("click", () => {
-          if (activeMode === "operations") {
-            return;
-          }
-          activeMode = "operations";
-          try {
-            localStorage.setItem(DASHBOARD_MODE_STORAGE_KEY, activeMode);
-          } catch (_err) {
-            // Ignore storage write failures.
-          }
-          startRefreshTimer();
-          void loadCurrentMode({ forceRefresh: false });
-        });
+        modeOperationsBtn.addEventListener("click", () => activateMode("operations"));
+      }
+      if (modeIngestBottomBtn) {
+        modeIngestBottomBtn.addEventListener("click", () => activateMode("ingest"));
+      }
+      if (modeOperationsBottomBtn) {
+        modeOperationsBottomBtn.addEventListener("click", () => activateMode("operations"));
       }
 
       applyModeSwitchUi();

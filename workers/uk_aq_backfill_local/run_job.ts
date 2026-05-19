@@ -167,6 +167,7 @@ type UkAirSosTimeseriesProcessResult = {
   mapped_point_count: number;
   mirror_reused: boolean;
   mirror_written: boolean;
+  integrity_snapshot_reused: boolean;
   no_data_manifest_reused: boolean;
   empty_payload_confirmed: boolean;
   skipped_outside_day: number;
@@ -184,6 +185,7 @@ type UkAirSosTimeseriesFetchResult = {
   payload: unknown;
   mirror_reused: boolean;
   mirror_written: boolean;
+  integrity_snapshot_reused: boolean;
   no_data_manifest_reused: boolean;
 };
 
@@ -905,6 +907,9 @@ const UK_AIR_SOS_TIMESERIES_RETRY_CONCURRENCY = Math.max(
 const UK_AIR_SOS_RAW_MIRROR_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT",
 );
+const UK_AIR_SOS_INTEGRITY_SNAPSHOT_ROOT = optionalEnv(
+  "UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT",
+);
 const OPENAQ_SOURCE_ENABLED = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_OPENAQ_SOURCE_ENABLED"),
   true,
@@ -944,6 +949,21 @@ const OPENAQ_ARCHIVE_RETRY_BASE_MS = parsePositiveInt(
 );
 const OPENAQ_RAW_MIRROR_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT",
+);
+const SOURCE_TO_R2_TARGETED_STAGE_ENABLED = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED"),
+  false,
+);
+const SOURCE_TO_R2_TARGETED_STAGE_ROOT = optionalEnv(
+  "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT",
+);
+const SOURCE_TO_R2_TARGETED_STAGE_FINALIZE = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE"),
+  false,
+);
+const SOURCE_TO_R2_TARGETED_STAGE_CLEANUP = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP"),
+  true,
 );
 const IS_LOCAL_RUN = !optionalEnv("K_SERVICE") && !optionalEnv("K_REVISION");
 
@@ -1574,6 +1594,154 @@ function buildAqiPartKey(
   return `${buildAqiConnectorPrefix(dayUtc, connectorId)}/part-${
     String(partIndex).padStart(5, "0")
   }.parquet`;
+}
+
+function resolveTargetedStageDir(
+  dayUtc: string,
+  connectorId: number,
+): string | null {
+  if (!SOURCE_TO_R2_TARGETED_STAGE_ENABLED) {
+    return null;
+  }
+  const root = (SOURCE_TO_R2_TARGETED_STAGE_ROOT || "").trim();
+  if (!root) {
+    return null;
+  }
+  const normalizedDay = parseIsoDayUtc(dayUtc);
+  if (!normalizedDay) {
+    return null;
+  }
+  return path.join(
+    root,
+    `day_utc=${normalizedDay}`,
+    `connector_id=${connectorId}`,
+  );
+}
+
+function resolveTargetedStageFilePath(
+  dayUtc: string,
+  connectorId: number,
+  kind: "obs" | "aqi",
+): string | null {
+  const stageDir = resolveTargetedStageDir(dayUtc, connectorId);
+  if (!stageDir) {
+    return null;
+  }
+  const fileName = kind === "obs"
+    ? "obs_history_rows.json"
+    : "aqilevel_rows.json";
+  return path.join(stageDir, fileName);
+}
+
+function writeTargetedStageJson(
+  filePath: string,
+  rows: ReadonlyArray<unknown>,
+): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp-${Date.now()}-${Math.random()
+    .toString(16).slice(2)}`;
+  fs.writeFileSync(tempPath, JSON.stringify(rows), "utf8");
+  fs.renameSync(tempPath, filePath);
+}
+
+function readObsRowsForConnectorDayFromTargetedStage(
+  dayUtc: string,
+  connectorId: number,
+): ObsHistoryRow[] | null {
+  const filePath = resolveTargetedStageFilePath(dayUtc, connectorId, "obs");
+  if (!filePath || !fs.existsSync(filePath)) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    throw new Error(`Invalid targeted-stage observation JSON: ${filePath}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Invalid targeted-stage observation rows: ${filePath}`);
+  }
+  const rows: ObsHistoryRow[] = [];
+  for (const rowRaw of parsed) {
+    if (!rowRaw || typeof rowRaw !== "object" || Array.isArray(rowRaw)) {
+      continue;
+    }
+    const row = rowRaw as Record<string, unknown>;
+    const timeseriesId = toSafeInt(row.timeseries_id);
+    const observedAt = String(row.observed_at || "").trim();
+    const value = toFiniteNumber(row.value);
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0 || !observedAt) {
+      continue;
+    }
+    rows.push({
+      timeseries_id: timeseriesId,
+      observed_at: observedAt,
+      value,
+    });
+  }
+  return rows;
+}
+
+function readAqiRowsForConnectorDayFromTargetedStage(
+  dayUtc: string,
+  connectorId: number,
+): AqilevelsHistoryRow[] | null {
+  const filePath = resolveTargetedStageFilePath(dayUtc, connectorId, "aqi");
+  if (!filePath || !fs.existsSync(filePath)) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    throw new Error(`Invalid targeted-stage AQI JSON: ${filePath}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Invalid targeted-stage AQI rows: ${filePath}`);
+  }
+  const rows: AqilevelsHistoryRow[] = [];
+  for (const rowRaw of parsed) {
+    if (!rowRaw || typeof rowRaw !== "object" || Array.isArray(rowRaw)) {
+      continue;
+    }
+    const row = rowRaw as Record<string, unknown>;
+    const timeseriesId = toSafeInt(row.timeseries_id);
+    const connectorIdValue = toSafeInt(row.connector_id);
+    const pollutantCodeRaw = String(row.pollutant_code || "").trim().toLowerCase();
+    const timestampHourUtc = String(row.timestamp_hour_utc || "").trim();
+    const stationId = toSafeInt(row.station_id);
+    if (
+      !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
+      !Number.isInteger(connectorIdValue) || connectorIdValue <= 0 ||
+      !timestampHourUtc ||
+      (pollutantCodeRaw !== "no2" &&
+        pollutantCodeRaw !== "pm25" &&
+        pollutantCodeRaw !== "pm10")
+    ) {
+      continue;
+    }
+    rows.push({
+      timeseries_id: timeseriesId,
+      station_id: Number.isInteger(stationId) && stationId > 0 ? stationId : null,
+      connector_id: connectorIdValue,
+      pollutant_code: pollutantCodeRaw as "no2" | "pm25" | "pm10",
+      timestamp_hour_utc: timestampHourUtc,
+      hourly_mean_ugm3: toFiniteNumber(row.hourly_mean_ugm3),
+      rolling24h_mean_ugm3: toFiniteNumber(row.rolling24h_mean_ugm3),
+      hourly_sample_count: toFiniteNumber(row.hourly_sample_count),
+      daqi_index_level: toFiniteNumber(row.daqi_index_level),
+      eaqi_index_level: toFiniteNumber(row.eaqi_index_level),
+    });
+  }
+  return rows;
+}
+
+function clearTargetedStageForConnectorDay(dayUtc: string, connectorId: number): void {
+  const stageDir = resolveTargetedStageDir(dayUtc, connectorId);
+  if (!stageDir || !fs.existsSync(stageDir)) {
+    return;
+  }
+  fs.rmSync(stageDir, { recursive: true, force: true });
 }
 
 function resolveLocalHistoryPathForR2Key(key: string): string | null {
@@ -5561,6 +5729,94 @@ function ukAirSosMirrorFilePath(
   );
 }
 
+const ukAirSosIntegritySnapshotCache = new Map<
+  string,
+  Map<string, Array<Record<string, unknown>>> | null
+>();
+
+function ukAirSosIntegritySnapshotFilePath(
+  dayUtc: string,
+  stationRef: string,
+): string | null {
+  if (!IS_LOCAL_RUN) {
+    return null;
+  }
+  const normalizedDay = parseIsoDayUtc(dayUtc);
+  if (!normalizedDay) {
+    return null;
+  }
+  const root = (UK_AIR_SOS_INTEGRITY_SNAPSHOT_ROOT || "").trim();
+  if (!root) {
+    return null;
+  }
+  const stationToken = encodeURIComponent(stationRef);
+  return path.join(
+    root,
+    `station_ref=${stationToken}`,
+    `day_utc=${normalizedDay}`,
+    "snapshot.ndjson",
+  );
+}
+
+function readUkAirSosIntegritySnapshotTimeseriesPayload(args: {
+  day_utc: string;
+  station_ref: string;
+  timeseries_ref: string;
+}): unknown | null {
+  const snapshotPath = ukAirSosIntegritySnapshotFilePath(
+    args.day_utc,
+    args.station_ref,
+  );
+  if (!snapshotPath) {
+    return null;
+  }
+  if (!ukAirSosIntegritySnapshotCache.has(snapshotPath)) {
+    if (!fs.existsSync(snapshotPath)) {
+      ukAirSosIntegritySnapshotCache.set(snapshotPath, null);
+    } else {
+      const byTimeseriesRef = new Map<string, Array<Record<string, unknown>>>();
+      const text = fs.readFileSync(snapshotPath, "utf8");
+      const lines = text.split(/\r?\n/);
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) {
+          continue;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Failed to parse UK-AIR SOS integrity snapshot ${snapshotPath}: ${message}`,
+          );
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          continue;
+        }
+        const row = parsed as Record<string, unknown>;
+        const timeseriesRef = String(row.timeseries_ref || "").trim();
+        const observedAt = String(row.observed_at_utc || "").trim();
+        const value = toFiniteNumber(row.value);
+        if (!timeseriesRef || !observedAt || value === null) {
+          continue;
+        }
+        const values = byTimeseriesRef.get(timeseriesRef) || [];
+        values.push({ time: observedAt, value });
+        byTimeseriesRef.set(timeseriesRef, values);
+      }
+      ukAirSosIntegritySnapshotCache.set(snapshotPath, byTimeseriesRef);
+    }
+  }
+
+  const byTimeseriesRef = ukAirSosIntegritySnapshotCache.get(snapshotPath) || null;
+  if (!byTimeseriesRef) {
+    return null;
+  }
+  const values = byTimeseriesRef.get(args.timeseries_ref) || [];
+  return { values };
+}
+
 function ukAirSosNoDataManifestFilePath(dayUtc: string): string | null {
   if (!IS_LOCAL_RUN || !UK_AIR_SOS_RAW_MIRROR_ROOT) {
     return null;
@@ -5659,6 +5915,7 @@ function writeUkAirSosNoDataManifest(args: {
 async function fetchUkAirSosTimeseriesData(args: {
   base_url: string;
   day_utc: string;
+  station_ref: string;
   timeseries_ref: string;
   timespan: string;
   known_empty_timeseries_refs?: ReadonlySet<string>;
@@ -5673,6 +5930,7 @@ async function fetchUkAirSosTimeseriesData(args: {
         payload: JSON.parse(fs.readFileSync(mirrorPath, "utf8")) as unknown,
         mirror_reused: true,
         mirror_written: false,
+        integrity_snapshot_reused: false,
         no_data_manifest_reused: false,
       };
     } catch (error) {
@@ -5683,11 +5941,27 @@ async function fetchUkAirSosTimeseriesData(args: {
     }
   }
 
+  const integritySnapshotPayload = readUkAirSosIntegritySnapshotTimeseriesPayload({
+    day_utc: args.day_utc,
+    station_ref: args.station_ref,
+    timeseries_ref: args.timeseries_ref,
+  });
+  if (integritySnapshotPayload) {
+    return {
+      payload: integritySnapshotPayload,
+      mirror_reused: false,
+      mirror_written: false,
+      integrity_snapshot_reused: true,
+      no_data_manifest_reused: false,
+    };
+  }
+
   if (args.known_empty_timeseries_refs?.has(args.timeseries_ref)) {
     return {
       payload: { values: [] },
       mirror_reused: false,
       mirror_written: false,
+      integrity_snapshot_reused: false,
       no_data_manifest_reused: true,
     };
   }
@@ -5714,6 +5988,7 @@ async function fetchUkAirSosTimeseriesData(args: {
     payload,
     mirror_reused: false,
     mirror_written: Boolean(shouldWriteMirror),
+    integrity_snapshot_reused: false,
     no_data_manifest_reused: false,
   };
 }
@@ -5824,6 +6099,7 @@ async function processUkAirSosTimeseriesBatch(args: {
         const payload = await fetchUkAirSosTimeseriesData({
           base_url: args.base_url,
           day_utc: args.day_utc,
+          station_ref: binding.station_ref,
           timeseries_ref: binding.timeseries_ref,
           timespan: args.timespan,
           known_empty_timeseries_refs: args.known_empty_timeseries_refs,
@@ -5871,6 +6147,7 @@ async function processUkAirSosTimeseriesBatch(args: {
             mapped_point_count: rows.length,
             mirror_reused: payload.mirror_reused,
             mirror_written: payload.mirror_written,
+            integrity_snapshot_reused: payload.integrity_snapshot_reused,
             no_data_manifest_reused: payload.no_data_manifest_reused,
             empty_payload_confirmed: emptyPayloadConfirmed,
             skipped_outside_day: skippedOutsideDay,
@@ -5888,6 +6165,7 @@ async function processUkAirSosTimeseriesBatch(args: {
           mapped_point_count: rows.length,
           mirror_reused: payload.mirror_reused,
           mirror_written: payload.mirror_written,
+          integrity_snapshot_reused: payload.integrity_snapshot_reused,
           no_data_manifest_reused: payload.no_data_manifest_reused,
           empty_payload_confirmed: emptyPayloadConfirmed,
           skipped_outside_day: skippedOutsideDay,
@@ -5921,6 +6199,7 @@ async function processUkAirSosTimeseriesBatch(args: {
           mapped_point_count: 0,
           mirror_reused: false,
           mirror_written: false,
+          integrity_snapshot_reused: false,
           no_data_manifest_reused: false,
           empty_payload_confirmed: false,
           skipped_outside_day: 0,
@@ -10817,7 +11096,7 @@ async function runSourceToAll(
             connectorId,
             candidateStationRefs,
           );
-          const candidateBindings = Array.from(
+          const candidateBindingsUnfiltered = Array.from(
             lookup.binding_by_timeseries_ref.values(),
           )
             .filter((binding) => candidateStationRefs.has(binding.station_ref))
@@ -10842,6 +11121,71 @@ async function runSourceToAll(
               }
               return left.timeseries_id - right.timeseries_id;
             });
+          let candidateBindings = candidateBindingsUnfiltered;
+          if (REQUESTED_TIMESERIES_IDS && REQUESTED_TIMESERIES_IDS.length > 0) {
+            const requestedSet = new Set(REQUESTED_TIMESERIES_IDS);
+            const targetedTimeseriesIds = sortedUniquePositiveInts(
+              Array.from(requestedSet).filter((timeseriesId) =>
+                lookup.binding_by_timeseries_id.has(timeseriesId)
+              ),
+            );
+            if (targetedTimeseriesIds.length === 0) {
+              connectorDaySkipped += 1;
+              await ledgerInsertRunDay(ledgerEnabled, {
+                run_id: runId,
+                run_mode: RUN_MODE,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_kind: "download",
+                status: "skipped",
+                rows_read: 0,
+                rows_written_aqilevels: 0,
+                objects_written_r2: 0,
+                checkpoint_json: {
+                  source_adapter: sourceAdapter,
+                  skip_reason: "no_matching_requested_timeseries_ids",
+                  no_data_classification: "metadata_mismatch",
+                  requested_timeseries_ids: REQUESTED_TIMESERIES_IDS,
+                },
+                started_at: startedAt,
+                finished_at: nowIso(),
+              });
+              continue;
+            }
+            const targetedSet = new Set(targetedTimeseriesIds);
+            candidateBindings = candidateBindingsUnfiltered.filter((binding) =>
+              targetedSet.has(binding.timeseries_id)
+            );
+            sourceCheckpointJson.requested_timeseries_ids = targetedTimeseriesIds;
+            sourceCheckpointJson.candidate_timeseries_count_unfiltered =
+              candidateBindingsUnfiltered.length;
+            sourceCheckpointJson.candidate_timeseries_count_filtered =
+              candidateBindings.length;
+            if (candidateBindings.length === 0) {
+              connectorDaySkipped += 1;
+              await ledgerInsertRunDay(ledgerEnabled, {
+                run_id: runId,
+                run_mode: RUN_MODE,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_kind: "download",
+                status: "skipped",
+                rows_read: 0,
+                rows_written_aqilevels: 0,
+                objects_written_r2: 0,
+                checkpoint_json: {
+                  source_adapter: sourceAdapter,
+                  skip_reason:
+                    "no_matching_timeseries_bindings_after_timeseries_filter",
+                  no_data_classification: "metadata_mismatch",
+                  requested_timeseries_ids: targetedTimeseriesIds,
+                },
+                started_at: startedAt,
+                finished_at: nowIso(),
+              });
+              continue;
+            }
+          }
 
           if (candidateBindings.length === 0) {
             connectorDaySkipped += 1;
@@ -10969,6 +11313,7 @@ async function runSourceToAll(
           let totalMappedPoints = 0;
           let totalMirrorReused = 0;
           let totalMirrorWritten = 0;
+          let totalIntegritySnapshotReused = 0;
           let totalNoDataManifestReused = 0;
           let totalSkippedOutsideDay = 0;
           let totalSkippedNullValue = 0;
@@ -10979,6 +11324,9 @@ async function runSourceToAll(
             totalMappedPoints += result.mapped_point_count;
             totalMirrorReused += result.mirror_reused ? 1 : 0;
             totalMirrorWritten += result.mirror_written ? 1 : 0;
+            totalIntegritySnapshotReused += result.integrity_snapshot_reused
+              ? 1
+              : 0;
             totalNoDataManifestReused += result.no_data_manifest_reused ? 1 : 0;
             totalSkippedOutsideDay += result.skipped_outside_day;
             totalSkippedNullValue += result.skipped_null_value;
@@ -11039,6 +11387,8 @@ async function runSourceToAll(
             candidateBindings.length;
           sourceCheckpointJson.mirror_reused_count = totalMirrorReused;
           sourceCheckpointJson.mirror_written_count = totalMirrorWritten;
+          sourceCheckpointJson.integrity_snapshot_reused_count =
+            totalIntegritySnapshotReused;
           sourceCheckpointJson.no_data_manifest_reused_count =
             totalNoDataManifestReused;
           sourceCheckpointJson.no_data_manifest_written_count =
@@ -11063,6 +11413,7 @@ async function runSourceToAll(
           dedupedObservationRows,
         );
         let aqilevelRows: AqilevelsHistoryRow[] = [];
+        let targetedStageActiveForConnectorDay = false;
 
         if (
           SOURCE_TO_R2_TARGETED_MERGE &&
@@ -11078,13 +11429,22 @@ async function runSourceToAll(
           );
           if (targetedTimeseriesIds.length > 0) {
             const targetedSet = new Set(targetedTimeseriesIds);
-            const rawLocalObsRows = await loadObsRowsForConnectorDayFromLocalHistory(
-              dayUtc,
-              connectorId,
-            );
+            const useTargetedStage = SOURCE_TO_R2_TARGETED_STAGE_ENABLED &&
+              !DRY_RUN;
+            const rawStageObsRows = useTargetedStage
+              ? readObsRowsForConnectorDayFromTargetedStage(dayUtc, connectorId)
+              : null;
+            const rawLocalObsRows = rawStageObsRows ??
+              await loadObsRowsForConnectorDayFromLocalHistory(
+                dayUtc,
+                connectorId,
+              );
+            const rawStageAqiRows = sourceObservationsOnly || !useTargetedStage
+              ? null
+              : readAqiRowsForConnectorDayFromTargetedStage(dayUtc, connectorId);
             const rawLocalAqiRows = sourceObservationsOnly
               ? null
-              : await loadAqiRowsForConnectorDayFromLocalHistory(
+              : rawStageAqiRows ?? await loadAqiRowsForConnectorDayFromLocalHistory(
                 dayUtc,
                 connectorId,
               );
@@ -11095,7 +11455,9 @@ async function runSourceToAll(
             // historical backfill, etc.).
             const localHistoryMissing = !rawLocalObsRows ||
               (!sourceObservationsOnly && !rawLocalAqiRows);
-            if (localHistoryMissing) {
+            const usingStagedBaseline = rawStageObsRows !== null ||
+              (!sourceObservationsOnly && rawStageAqiRows !== null);
+            if (localHistoryMissing && !usingStagedBaseline) {
               logStructured(
                 "info",
                 "source_to_r2_targeted_merge_no_local_history",
@@ -11109,6 +11471,9 @@ async function runSourceToAll(
                   targeted_timeseries_id_count: targetedTimeseriesIds.length,
                 },
               );
+            }
+            if (useTargetedStage) {
+              targetedStageActiveForConnectorDay = true;
             }
             const localObsRows = rawLocalObsRows ?? [];
             const localAqiRows = rawLocalAqiRows;
@@ -11132,6 +11497,12 @@ async function runSourceToAll(
               preservedObsRows.length;
             sourceCheckpointJson.targeted_local_history_missing =
               localHistoryMissing;
+            sourceCheckpointJson.targeted_stage_enabled = useTargetedStage;
+            sourceCheckpointJson.targeted_stage_finalize = useTargetedStage &&
+              SOURCE_TO_R2_TARGETED_STAGE_FINALIZE;
+            sourceCheckpointJson.targeted_stage_baseline = usingStagedBaseline
+              ? "stage"
+              : "local_history";
             if (!sourceObservationsOnly) {
               const effectiveLocalAqiRows = localAqiRows ?? [];
               const mergedSourceRows = mapR2ObservationRowsToSourceObservations({
@@ -11166,6 +11537,26 @@ async function runSourceToAll(
                 replacementAqiRows.length;
               sourceCheckpointJson.targeted_preserved_aqi_rows =
                 preservedAqiRows.length;
+            }
+            if (useTargetedStage) {
+              const obsStagePath = resolveTargetedStageFilePath(
+                dayUtc,
+                connectorId,
+                "obs",
+              );
+              if (obsStagePath) {
+                writeTargetedStageJson(obsStagePath, obsHistoryRows);
+              }
+              if (!sourceObservationsOnly) {
+                const aqiStagePath = resolveTargetedStageFilePath(
+                  dayUtc,
+                  connectorId,
+                  "aqi",
+                );
+                if (aqiStagePath) {
+                  writeTargetedStageJson(aqiStagePath, aqilevelRows);
+                }
+              }
             }
           } else {
             if (!sourceObservationsOnly) {
@@ -11325,6 +11716,61 @@ async function runSourceToAll(
           continue;
         }
 
+        if (
+          targetedStageActiveForConnectorDay &&
+          !SOURCE_TO_R2_TARGETED_STAGE_FINALIZE
+        ) {
+          connectorDayComplete += 1;
+          sourceProcessedDaySet.add(dayUtc);
+          logStructured("info", "source_to_r2_targeted_stage_deferred_commit", {
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_adapter: sourceAdapter,
+            rows_observations: obsHistoryRows.length,
+            rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
+          });
+          await ledgerInsertRunDay(ledgerEnabled, {
+            run_id: runId,
+            run_mode: RUN_MODE,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_kind: "download",
+            status: "complete",
+            rows_read: obsHistoryRows.length,
+            rows_written_aqilevels: sourceObservationsOnly ? 0 : aqilevelRows.length,
+            objects_written_r2: 0,
+            checkpoint_json: {
+              source_adapter: sourceAdapter,
+              targeted_stage_deferred_commit: true,
+              candidate_source_units: candidateSourceUnits,
+              ...sourceCheckpointJson,
+            },
+            started_at: startedAt,
+            finished_at: nowIso(),
+          });
+          await ledgerUpsertCheckpoint(ledgerEnabled, {
+            run_mode: RUN_MODE,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_kind: "download",
+            status: "complete",
+            rows_read: obsHistoryRows.length,
+            rows_written_aqilevels: sourceObservationsOnly ? 0 : aqilevelRows.length,
+            objects_written_r2: 0,
+            checkpoint_json: {
+              source_adapter: sourceAdapter,
+              targeted_stage_deferred_commit: true,
+              updated_by_run_id: runId,
+              completed_at: nowIso(),
+              candidate_source_units: candidateSourceUnits,
+              ...sourceCheckpointJson,
+            },
+            updated_at: nowIso(),
+          });
+          continue;
+        }
+
         const obsExport = await exportObsConnectorRowsToR2({
           run_id: runId,
           day_utc: dayUtc,
@@ -11389,6 +11835,13 @@ async function runSourceToAll(
           content_type: "application/json",
         });
         objectsWrittenR2 += 1;
+        if (
+          targetedStageActiveForConnectorDay &&
+          SOURCE_TO_R2_TARGETED_STAGE_FINALIZE &&
+          SOURCE_TO_R2_TARGETED_STAGE_CLEANUP
+        ) {
+          clearTargetedStageForConnectorDay(dayUtc, connectorId);
+        }
         connectorDayComplete += 1;
         sourceProcessedDaySet.add(dayUtc);
         logStructured("info", "source_to_r2_connector_day_complete", {

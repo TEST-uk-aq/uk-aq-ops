@@ -32,7 +32,8 @@ Required:
 
 Forwarded options:
   --profile daily|weekly|monthly|manual   Run profile (default: manual).
-  --source openaq|sensor-community|all    Source adapter (Phase 1: not yet used).
+  --source openaq|sensorcommunity|uk_air_sos|all
+                                           Source filter (includes uk_air_sos station/day source checks).
   --from-day YYYY-MM-DD                   Manual lower bound.
   --to-day YYYY-MM-DD                     Manual upper bound.
   --dry-run                               Plan only; no remote calls.

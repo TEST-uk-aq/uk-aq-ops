@@ -41,7 +41,7 @@ Scheduled calls always run both databases in order:
 Secrets:
 
 - `UK_AQ_INGESTDB_DB_URL`
-- `UK_AQ_OBS_AQIDB_DB_URL`
+- `OBS_AQIDB_SUPABASE_DB_URL`
 - `DROPBOX_APP_KEY`
 - `DROPBOX_APP_SECRET`
 - `DROPBOX_REFRESH_TOKEN`
@@ -54,9 +54,26 @@ Optional plain env:
 
 - `UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR` default `Supabase_Backup_db_dump`
 - `UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS` default `7`
+- `UK_AQ_DB_DUMP_SPLIT_LARGE_INSERTS` default `true`
+- `UK_AQ_DB_DUMP_INSERT_SPLIT_THRESHOLD_ROWS` default `10000`
+- `UK_AQ_DB_DUMP_INSERT_CHUNK_ROWS` default `5000` (clamped to `100..100000`)
 - `SUPABASE_BIN` default `supabase`
 - `GZIP_BIN` default `gzip`
 - `BASH_BIN` default `bash`
+
+## Data dump post-processing
+
+`data.sql` is post-processed before gzip/upload to reduce restore stalls through Supabase/session pooler paths:
+
+- only `data` dumps are rewritten (`roles`/`schema` are untouched)
+- large multi-row `INSERT INTO ... VALUES` statements are split into smaller INSERT statements
+- per-row values are preserved; only trailing row delimiters are adjusted when chunking
+
+Output filenames and Dropbox paths are unchanged:
+
+- `roles.sql.gz`
+- `schema.sql.gz`
+- `data.sql.gz`
 
 ## Important implementation note
 

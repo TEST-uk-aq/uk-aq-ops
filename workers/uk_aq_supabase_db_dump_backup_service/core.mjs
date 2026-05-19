@@ -1,9 +1,10 @@
 import fs from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import readline from "node:readline";
 
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_API_BASE_URL = "https://api.dropboxapi.com/2";
@@ -15,6 +16,12 @@ export const DEFAULT_DUMP_KINDS = Object.freeze(["roles", "schema", "data"]);
 export const DEFAULT_RETENTION_DAYS = 7;
 export const DEFAULT_BACKUP_DIR = "Supabase_Backup_db_dump";
 const MAX_LOG_MESSAGE_LENGTH = 1200;
+const DEFAULT_SPLIT_LARGE_INSERTS = true;
+const DEFAULT_INSERT_SPLIT_THRESHOLD_ROWS = 10_000;
+const DEFAULT_INSERT_CHUNK_ROWS = 5_000;
+const MIN_INSERT_CHUNK_ROWS = 100;
+const MAX_INSERT_CHUNK_ROWS = 100_000;
+const MAX_TABLES_SPLIT_LOG_ENTRIES = 50;
 
 function nowIso() {
   return new Date().toISOString();
@@ -53,6 +60,23 @@ export function parsePositiveInt(rawValue, fallback, min = 1, max = 10_000) {
     return max;
   }
   return intValue;
+}
+
+export function parseBooleanEnv(rawValue, fallback) {
+  if (rawValue === null || rawValue === undefined) {
+    return fallback;
+  }
+  const normalized = String(rawValue).trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "n", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
 }
 
 function requiredEnv(name) {
@@ -216,6 +240,30 @@ function sanitizeErrorMessage(error) {
   return `${redacted.slice(0, MAX_LOG_MESSAGE_LENGTH - 3)}...`;
 }
 
+export function resolveInsertSplitConfig(env = process.env) {
+  const enabled = parseBooleanEnv(
+    env.UK_AQ_DB_DUMP_SPLIT_LARGE_INSERTS,
+    DEFAULT_SPLIT_LARGE_INSERTS,
+  );
+  const thresholdRows = parsePositiveInt(
+    env.UK_AQ_DB_DUMP_INSERT_SPLIT_THRESHOLD_ROWS,
+    DEFAULT_INSERT_SPLIT_THRESHOLD_ROWS,
+    1,
+    1_000_000,
+  );
+  const chunkRows = parsePositiveInt(
+    env.UK_AQ_DB_DUMP_INSERT_CHUNK_ROWS,
+    DEFAULT_INSERT_CHUNK_ROWS,
+    MIN_INSERT_CHUNK_ROWS,
+    MAX_INSERT_CHUNK_ROWS,
+  );
+  return {
+    enabled,
+    threshold_rows: thresholdRows,
+    chunk_rows: chunkRows,
+  };
+}
+
 async function readResponseText(response, limit = MAX_LOG_MESSAGE_LENGTH) {
   const raw = await response.text();
   return raw.length <= limit ? raw : `${raw.slice(0, limit - 3)}...`;
@@ -302,6 +350,227 @@ async function gzipFile(gzipBin, filePath) {
     );
   }
   return `${filePath}.gz`;
+}
+
+function formatTableNameFromInsertHeader(line) {
+  const match = line.match(/^INSERT INTO\s+"([^"]+)"\."([^"]+)"\s+/i);
+  if (!match) {
+    return null;
+  }
+  return `"${match[1]}"."${match[2]}"`;
+}
+
+function isExpectedMultiLineInsertHeader(line) {
+  return /^INSERT INTO\s+"[^"]+"\."[^"]+"\s+.*\sVALUES\s*$/i.test(line);
+}
+
+export function normalizeInsertRowDelimiter(rowLine, delimiter) {
+  const match = String(rowLine).match(/^(.*?)([;,])(\s*)$/);
+  if (!match) {
+    return null;
+  }
+  return `${match[1]}${delimiter}${match[3]}`;
+}
+
+function canRewriteInsertRows(rowLines) {
+  if (!Array.isArray(rowLines) || rowLines.length === 0) {
+    return false;
+  }
+  return rowLines.every((rowLine) => /[;,]\s*$/.test(String(rowLine)));
+}
+
+function summarizeTablesSplit(tableMap) {
+  const rows = Array.from(tableMap.values());
+  rows.sort((left, right) => {
+    if (right.input_rows !== left.input_rows) {
+      return right.input_rows - left.input_rows;
+    }
+    return left.table.localeCompare(right.table);
+  });
+  const tableEntries = rows.slice(0, MAX_TABLES_SPLIT_LOG_ENTRIES);
+  const truncatedCount = Math.max(0, rows.length - tableEntries.length);
+  return { tableEntries, truncatedCount };
+}
+
+export async function splitLargeDataInsertsInFile({
+  filePath,
+  thresholdRows,
+  chunkRows,
+  runId,
+  databaseName,
+  enabled,
+}) {
+  const beforeStats = await fs.stat(filePath);
+  const summary = {
+    enabled: Boolean(enabled),
+    threshold_rows: thresholdRows,
+    chunk_rows: chunkRows,
+    insert_statements_seen: 0,
+    insert_statements_split: 0,
+    input_rows_total: 0,
+    output_insert_statements: 0,
+    max_input_rows_per_insert: 0,
+    tables_split: [],
+    tables_split_truncated_count: 0,
+    before_bytes: beforeStats.size,
+    after_bytes: beforeStats.size,
+  };
+
+  logStructured("INFO", "supabase_db_dump_data_insert_split_started", {
+    run_id: runId,
+    database: databaseName,
+    raw_file_name: path.basename(filePath),
+    enabled: summary.enabled,
+    threshold_rows: summary.threshold_rows,
+    chunk_rows: summary.chunk_rows,
+  });
+
+  if (!summary.enabled) {
+    logStructured("INFO", "supabase_db_dump_data_insert_split_finished", {
+      run_id: runId,
+      database: databaseName,
+      raw_file_name: path.basename(filePath),
+      ...summary,
+    });
+    return summary;
+  }
+
+  const tempFilePath = `${filePath}.split.tmp`;
+  const readStream = createReadStream(filePath, { encoding: "utf8" });
+  const writeStream = createWriteStream(tempFilePath, { encoding: "utf8", mode: 0o600 });
+  const lineReader = readline.createInterface({
+    input: readStream,
+    crlfDelay: Infinity,
+  });
+  const tablesSplitMap = new Map();
+
+  const writeLine = (line) => {
+    writeStream.write(`${line}\n`);
+  };
+
+  let currentInsert = null;
+
+  const flushCurrentInsert = () => {
+    if (!currentInsert) {
+      return;
+    }
+    const {
+      headerLine,
+      rowLines,
+      originalLines,
+      expectedFormat,
+      tableName,
+    } = currentInsert;
+    const inputRowCount = rowLines.length;
+    summary.input_rows_total += inputRowCount;
+    summary.max_input_rows_per_insert = Math.max(summary.max_input_rows_per_insert, inputRowCount);
+
+    const shouldSplit =
+      expectedFormat
+      && inputRowCount > summary.threshold_rows
+      && canRewriteInsertRows(rowLines);
+
+    if (!shouldSplit) {
+      summary.output_insert_statements += 1;
+      for (const originalLine of originalLines) {
+        writeLine(originalLine);
+      }
+      currentInsert = null;
+      return;
+    }
+
+    const outputStatements = Math.ceil(inputRowCount / summary.chunk_rows);
+    summary.insert_statements_split += 1;
+    summary.output_insert_statements += outputStatements;
+    const existingTableStats = tablesSplitMap.get(tableName) || {
+      table: tableName,
+      input_rows: 0,
+      output_insert_statements: 0,
+    };
+    existingTableStats.input_rows += inputRowCount;
+    existingTableStats.output_insert_statements += outputStatements;
+    tablesSplitMap.set(tableName, existingTableStats);
+
+    for (let start = 0; start < rowLines.length; start += summary.chunk_rows) {
+      const chunk = rowLines.slice(start, start + summary.chunk_rows);
+      writeLine(headerLine);
+      for (let index = 0; index < chunk.length; index += 1) {
+        const rowLine = chunk[index];
+        const delimiter = index === chunk.length - 1 ? ";" : ",";
+        const normalized = normalizeInsertRowDelimiter(rowLine, delimiter);
+        writeLine(normalized ?? rowLine);
+      }
+      writeLine("");
+    }
+
+    currentInsert = null;
+  };
+
+  try {
+    for await (const line of lineReader) {
+      if (!currentInsert) {
+        if (/^INSERT INTO\s+/i.test(line)) {
+          summary.insert_statements_seen += 1;
+          if (/;\s*$/.test(line)) {
+            summary.output_insert_statements += 1;
+            writeLine(line);
+            continue;
+          }
+          currentInsert = {
+            headerLine: line,
+            expectedFormat: isExpectedMultiLineInsertHeader(line),
+            tableName: formatTableNameFromInsertHeader(line) || "unknown",
+            rowLines: [],
+            originalLines: [line],
+          };
+          continue;
+        }
+        writeLine(line);
+        continue;
+      }
+
+      currentInsert.originalLines.push(line);
+      currentInsert.rowLines.push(line);
+
+      if (/;\s*$/.test(line)) {
+        flushCurrentInsert();
+      }
+    }
+
+    flushCurrentInsert();
+    await new Promise((resolve, reject) => {
+      writeStream.end((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+    await fs.rename(tempFilePath, filePath);
+  } catch (error) {
+    writeStream.destroy();
+    await fs.rm(tempFilePath, { force: true });
+    throw error;
+  } finally {
+    lineReader.close();
+  }
+
+  const { tableEntries, truncatedCount } = summarizeTablesSplit(tablesSplitMap);
+  summary.tables_split = tableEntries;
+  summary.tables_split_truncated_count = truncatedCount;
+
+  const afterStats = await fs.stat(filePath);
+  summary.after_bytes = afterStats.size;
+
+  logStructured("INFO", "supabase_db_dump_data_insert_split_finished", {
+    run_id: runId,
+    database: databaseName,
+    raw_file_name: path.basename(filePath),
+    ...summary,
+  });
+
+  return summary;
 }
 
 class DropboxClient {
@@ -452,6 +721,7 @@ function resolveConfig() {
     gzipBin: String(process.env.GZIP_BIN || "gzip").trim() || "gzip",
     supabaseBin: String(process.env.SUPABASE_BIN || "supabase").trim() || "supabase",
     retentionDays,
+    insertSplit: resolveInsertSplitConfig(process.env),
     dropboxRoot,
     backupDir,
     dropboxBackupRoot: buildBackupRoot(dropboxRoot, backupDir),
@@ -517,6 +787,18 @@ async function runSingleDump({
     outputFile: rawFilePath,
   });
 
+  let insertSplit = null;
+  if (dumpKind === "data") {
+    insertSplit = await splitLargeDataInsertsInFile({
+      filePath: rawFilePath,
+      thresholdRows: config.insertSplit.threshold_rows,
+      chunkRows: config.insertSplit.chunk_rows,
+      runId,
+      databaseName,
+      enabled: config.insertSplit.enabled,
+    });
+  }
+
   const rawStats = await fs.stat(rawFilePath);
   const gzFilePath = await gzipFile(config.gzipBin, rawFilePath);
   const gzStats = await fs.stat(gzFilePath);
@@ -545,6 +827,7 @@ async function runSingleDump({
     raw_bytes: rawStats.size,
     gzip_bytes: gzStats.size,
     dropbox_path: dropboxPath,
+    insert_split: insertSplit,
   };
 }
 

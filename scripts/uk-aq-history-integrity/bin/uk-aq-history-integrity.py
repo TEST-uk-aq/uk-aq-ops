@@ -22,6 +22,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -30,11 +31,13 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 REQUIRED_ENV_VARS = (
@@ -77,6 +80,12 @@ PROFILE_START_WINDOWS_DAYS = {
 
 DEFAULT_INGESTDB_RETENTION_DAYS = 5
 
+DAILY_TASK_HEALTH_TASK_KEY = "ops.history_integrity"
+DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
+DAILY_TASK_HEALTH_SOURCE_WORKER = "uk-aq-history-integrity"
+DAILY_TASK_HEALTH_RPC_SCHEMA = "uk_aq_public"
+DAILY_TASK_HEALTH_ERROR_LIMIT = 1200
+
 
 def resolve_integrity_backfill_wrapper() -> str:
     for name in (
@@ -97,7 +106,23 @@ def resolve_integrity_backfill_wrapper() -> str:
 # (and by source_file_state / source_file_events).
 SOURCE_KEY_BY_CONNECTOR_CODE = {
     "openaq": "openaq",
-    "sensorcommunity": "sensor-community",
+    "sensorcommunity": "sensorcommunity",
+    "uk_air_sos": "uk_air_sos",
+}
+
+# `--source all` includes all currently implemented source adapters.
+CROSS_CHECK_SOURCE_KEYS_BY_FILTER: dict[str, tuple[str, ...]] = {
+    "openaq": ("openaq",),
+    "sensorcommunity": ("sensorcommunity",),
+    "uk_air_sos": ("uk_air_sos",),
+    "all": ("openaq", "sensorcommunity", "uk_air_sos"),
+}
+CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
+    "openaq": ("openaq",),
+    "sensorcommunity": ("sensorcommunity",),
+    # Phase 7.4: include uk_air_sos in observation-repair candidates.
+    "uk_air_sos": ("uk_air_sos",),
+    "all": ("openaq", "sensorcommunity", "uk_air_sos"),
 }
 
 # Subset of core tables that the integrity DB needs. Other tables in the
@@ -727,6 +752,38 @@ def _build_lookup(conn: sqlite3.Connection, log: logging.Logger) -> int:
     return total
 
 
+def collect_lookup_active_counts_by_source(
+    conn: sqlite3.Connection,
+    source_keys: Iterable[str] = ("openaq", "sensorcommunity", "uk_air_sos"),
+) -> dict[str, dict[str, int]]:
+    keys = tuple(dict.fromkeys(str(k) for k in source_keys if str(k)))
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT
+          source_key,
+          COUNT(DISTINCT CASE WHEN is_active = 1 THEN station_id END) AS active_stations,
+          COUNT(DISTINCT CASE WHEN is_active = 1 THEN timeseries_id END) AS active_timeseries
+        FROM source_station_timeseries_lookup
+        WHERE source_key IN ({placeholders})
+        GROUP BY source_key
+        """,
+        keys,
+    ).fetchall()
+    counts: dict[str, dict[str, int]] = {
+        key: {"active_stations": 0, "active_timeseries": 0}
+        for key in keys
+    }
+    for source_key, active_stations, active_timeseries in rows:
+        counts[str(source_key)] = {
+            "active_stations": int(active_stations or 0),
+            "active_timeseries": int(active_timeseries or 0),
+        }
+    return counts
+
+
 def import_core_snapshot(
     conn: sqlite3.Connection,
     env_name: str,
@@ -1206,6 +1263,443 @@ SC_COLUMN_TO_REF_SUFFIX = {
     "pressure": ":pressure",
 }
 
+UK_AIR_SOS_SOURCE_KEY = "uk_air_sos"
+UK_AIR_SOS_DEFAULT_BASE_URL = "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
+UK_AIR_SOS_DEFAULT_TIMEOUT_SECONDS = 30
+UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ENV = "UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS"
+UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ALLOWED = {"none", "changed", "all"}
+UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_DEFAULT = "changed"
+UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_ENV = (
+    "UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES"
+)
+UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT = 0
+
+UK_AIR_SOS_STATUS_OK = "ok"
+UK_AIR_SOS_STATUS_NO_DATA = "no_data"
+UK_AIR_SOS_STATUS_NOT_FOUND = "not_found"
+UK_AIR_SOS_STATUS_TEMP_ERROR = "temporary_error"
+UK_AIR_SOS_STATUS_PERM_ERROR = "permanent_error"
+
+UkAirSosFetcher = Callable[
+    [str, str, str, str, int],
+    dict[str, Any],
+]
+
+
+def _iso_utc_seconds(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ",
+    )
+
+
+def _uk_air_sos_day_bounds(day_utc: str) -> tuple[str, str]:
+    day = dt.date.fromisoformat(day_utc)
+    start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+    end = start + dt.timedelta(days=1)
+    return _iso_utc_seconds(start), _iso_utc_seconds(end)
+
+
+def _uk_air_sos_parse_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        numeric = float(value)
+        ts = numeric * 1000 if abs(numeric) < 1e12 else numeric
+        parsed = dt.datetime.fromtimestamp(ts / 1000.0, tz=dt.timezone.utc)
+        return _iso_utc_seconds(parsed)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            numeric = float(raw)
+        except ValueError:
+            numeric = None
+        if numeric is not None and math.isfinite(numeric):
+            ts = numeric * 1000 if abs(numeric) < 1e12 else numeric
+            parsed = dt.datetime.fromtimestamp(ts / 1000.0, tz=dt.timezone.utc)
+            return _iso_utc_seconds(parsed)
+        candidate = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+        try:
+            parsed_dt = dt.datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=dt.timezone.utc)
+        return _iso_utc_seconds(parsed_dt)
+    return None
+
+
+def _uk_air_sos_to_finite_number(value: Any) -> int | float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    normalized = float(f"{numeric:.15g}")
+    if normalized == 0.0:
+        normalized = 0.0
+    return int(normalized) if normalized.is_integer() else normalized
+
+
+def _uk_air_sos_extract_datapoints(payload: Any) -> list[dict[str, Any]]:
+    values = payload
+    if not isinstance(values, list) and isinstance(values, dict):
+        nested = values.get("values") or values.get("data")
+        if isinstance(nested, list):
+            values = nested
+    if not isinstance(values, list):
+        return []
+
+    datapoints: list[dict[str, Any]] = []
+    for row in values:
+        observed_at: str | None = None
+        number_value: int | float | None = None
+        if isinstance(row, list):
+            if len(row) < 2:
+                continue
+            observed_at = _uk_air_sos_parse_timestamp(row[0])
+            number_value = _uk_air_sos_to_finite_number(row[1])
+        elif isinstance(row, dict):
+            observed_at = _uk_air_sos_parse_timestamp(
+                row.get("time")
+                or row.get("timestamp")
+                or row.get("t")
+                or row.get("dateTime")
+                or row.get("phenomenonTime")
+                or row.get("observed_at"),
+            )
+            number_value = _uk_air_sos_to_finite_number(
+                row.get("value")
+                or row.get("v")
+                or row.get("result"),
+            )
+        if not observed_at:
+            continue
+        datapoints.append({
+            "observed_at_utc": observed_at,
+            "value": number_value,
+        })
+    return datapoints
+
+
+def _uk_air_sos_fetch_timeseries_payload(
+    base_url: str,
+    day_utc: str,
+    timeseries_ref: str,
+    timespan: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    url = (
+        f"{base_url.rstrip('/')}/timeseries/"
+        f"{urllib.parse.quote(timeseries_ref, safe='')}/getData"
+        f"?timespan={urllib.parse.quote(timespan, safe=':/')}&format=tvp"
+    )
+    req = urllib.request.Request(url, method="GET")
+
+    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                body = resp.read()
+                payload = json.loads(body.decode("utf-8"))
+                return {
+                    "status": UK_AIR_SOS_STATUS_OK,
+                    "payload": payload,
+                    "error": None,
+                    "http_status": int(resp.status),
+                }
+        except urllib.error.HTTPError as exc:
+            if int(exc.code) == 404:
+                return {
+                    "status": UK_AIR_SOS_STATUS_NOT_FOUND,
+                    "payload": None,
+                    "error": f"HTTP 404 for timeseries_ref={timeseries_ref}",
+                    "http_status": int(exc.code),
+                }
+            if _is_retryable_url_error(exc):
+                if attempt < HTTP_RETRY_ATTEMPTS:
+                    _sleep_http_retry("GET", url, attempt, exc)
+                    continue
+                return {
+                    "status": UK_AIR_SOS_STATUS_TEMP_ERROR,
+                    "payload": None,
+                    "error": f"HTTP {exc.code} for timeseries_ref={timeseries_ref}",
+                    "http_status": int(exc.code),
+                }
+            return {
+                "status": UK_AIR_SOS_STATUS_PERM_ERROR,
+                "payload": None,
+                "error": f"HTTP {exc.code} for timeseries_ref={timeseries_ref}",
+                "http_status": int(exc.code),
+            }
+        except json.JSONDecodeError as exc:
+            return {
+                "status": UK_AIR_SOS_STATUS_PERM_ERROR,
+                "payload": None,
+                "error": f"invalid JSON for timeseries_ref={timeseries_ref}: {exc}",
+                "http_status": None,
+            }
+        except Exception as exc:
+            if _is_retryable_url_error(exc):
+                if attempt < HTTP_RETRY_ATTEMPTS:
+                    _sleep_http_retry("GET", url, attempt, exc)
+                    continue
+                return {
+                    "status": UK_AIR_SOS_STATUS_TEMP_ERROR,
+                    "payload": None,
+                    "error": f"temporary fetch failure for timeseries_ref={timeseries_ref}: {exc}",
+                    "http_status": None,
+                }
+            return {
+                "status": UK_AIR_SOS_STATUS_PERM_ERROR,
+                "payload": None,
+                "error": f"non-retryable fetch failure for timeseries_ref={timeseries_ref}: {exc}",
+                "http_status": None,
+            }
+
+    return {
+        "status": UK_AIR_SOS_STATUS_TEMP_ERROR,
+        "payload": None,
+        "error": f"timeseries_ref={timeseries_ref}: exhausted retries",
+        "http_status": None,
+    }
+
+
+def build_uk_air_sos_canonical_snapshot(
+    *,
+    station_ref: str,
+    day_utc: str,
+    timeseries_bindings: Iterable[dict[str, Any]],
+    base_url: str | None = None,
+    timeout_seconds: int = UK_AIR_SOS_DEFAULT_TIMEOUT_SECONDS,
+    fetcher: UkAirSosFetcher | None = None,
+) -> dict[str, Any]:
+    """Build canonical SOS snapshot rows for one station/day.
+
+    Output rows are sorted by (timeseries_id, observed_at_utc) and encoded as
+    stable NDJSON bytes with the minimal canonical row shape.
+    """
+    source_base_url = (
+        (base_url or os.environ.get("UK_AQ_BACKFILL_UK_AIR_SOS_BASE_URL") or "")
+        .strip()
+        or UK_AIR_SOS_DEFAULT_BASE_URL
+    )
+    fetch_fn = fetcher or _uk_air_sos_fetch_timeseries_payload
+    day_start_iso, day_end_iso = _uk_air_sos_day_bounds(day_utc)
+    timespan = f"{day_start_iso}/{day_end_iso}"
+
+    binding_rows = []
+    for raw in timeseries_bindings:
+        ts_id = _row_get_int(raw, "timeseries_id")
+        ts_ref = _row_get_str(raw, "timeseries_ref")
+        if ts_id is None or ts_id <= 0 or not ts_ref:
+            continue
+        binding_rows.append({"timeseries_id": ts_id, "timeseries_ref": ts_ref})
+    binding_rows.sort(key=lambda row: (int(row["timeseries_id"]), str(row["timeseries_ref"])))
+
+    rows: list[dict[str, Any]] = []
+    timeseries_results: list[dict[str, Any]] = []
+    for binding in binding_rows:
+        ts_id = int(binding["timeseries_id"])
+        ts_ref = str(binding["timeseries_ref"])
+        fetched = fetch_fn(
+            source_base_url,
+            day_utc,
+            ts_ref,
+            timespan,
+            int(timeout_seconds),
+        )
+        status = str(fetched.get("status") or UK_AIR_SOS_STATUS_PERM_ERROR)
+        result_row: dict[str, Any] = {
+            "timeseries_id": ts_id,
+            "timeseries_ref": ts_ref,
+            "status": status,
+            "row_count": 0,
+            "error": fetched.get("error"),
+        }
+        if status != UK_AIR_SOS_STATUS_OK:
+            timeseries_results.append(result_row)
+            continue
+
+        datapoints = _uk_air_sos_extract_datapoints(fetched.get("payload"))
+        for point in datapoints:
+            observed_at = str(point.get("observed_at_utc") or "")
+            value = point.get("value")
+            if not observed_at:
+                continue
+            if observed_at < day_start_iso or observed_at >= day_end_iso:
+                continue
+            if value is None:
+                continue
+            rows.append({
+                "station_ref": station_ref,
+                "timeseries_id": ts_id,
+                "timeseries_ref": ts_ref,
+                "observed_at_utc": observed_at,
+                "value": value,
+            })
+            result_row["row_count"] = int(result_row["row_count"]) + 1
+        if int(result_row["row_count"]) == 0:
+            result_row["status"] = UK_AIR_SOS_STATUS_NO_DATA
+        timeseries_results.append(result_row)
+
+    status_list = [str(item.get("status") or "") for item in timeseries_results]
+    if any(status == UK_AIR_SOS_STATUS_TEMP_ERROR for status in status_list):
+        final_status = UK_AIR_SOS_STATUS_TEMP_ERROR
+    elif any(status == UK_AIR_SOS_STATUS_PERM_ERROR for status in status_list):
+        final_status = UK_AIR_SOS_STATUS_PERM_ERROR
+    elif status_list and all(status == UK_AIR_SOS_STATUS_NOT_FOUND for status in status_list):
+        final_status = UK_AIR_SOS_STATUS_NOT_FOUND
+    elif rows:
+        final_status = UK_AIR_SOS_STATUS_OK
+    else:
+        final_status = UK_AIR_SOS_STATUS_NO_DATA
+
+    if final_status in (UK_AIR_SOS_STATUS_TEMP_ERROR, UK_AIR_SOS_STATUS_PERM_ERROR):
+        return {
+            "status": final_status,
+            "station_ref": station_ref,
+            "day_utc": day_utc,
+            "base_url": source_base_url,
+            "timespan": timespan,
+            "rows": [],
+            "row_count": 0,
+            "ndjson_bytes": b"",
+            "sha256": None,
+            "timeseries_results": timeseries_results,
+            "error": "; ".join(
+                str(item.get("error"))
+                for item in timeseries_results
+                if item.get("error")
+            ) or None,
+        }
+
+    rows.sort(key=lambda row: (int(row["timeseries_id"]), str(row["observed_at_utc"])))
+    ndjson_text = "".join(
+        json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n"
+        for row in rows
+    )
+    ndjson_bytes = ndjson_text.encode("utf-8")
+    return {
+        "status": final_status,
+        "station_ref": station_ref,
+        "day_utc": day_utc,
+        "base_url": source_base_url,
+        "timespan": timespan,
+        "rows": rows,
+        "row_count": len(rows),
+        "ndjson_bytes": ndjson_bytes,
+        "sha256": hashlib.sha256(ndjson_bytes).hexdigest(),
+        "timeseries_results": timeseries_results,
+        "error": None,
+    }
+
+
+def _resolve_keep_api_snapshots_policy() -> str:
+    raw = str(
+        os.environ.get(
+            UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ENV,
+            UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_DEFAULT,
+        ),
+    ).strip().lower()
+    if raw in UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ALLOWED:
+        return raw
+    return UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_DEFAULT
+
+
+def _resolve_uk_air_sos_not_found_cooldown_seconds() -> int:
+    raw = str(
+        os.environ.get(
+            UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_ENV,
+            UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT,
+        ),
+    ).strip()
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        minutes = UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT
+    if minutes <= 0:
+        return 0
+    return minutes * 60
+
+
+def _parse_iso_utc(value: str | None) -> dt.datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = dt.datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _uk_air_sos_source_file_key(station_ref: str, day: dt.date) -> str:
+    return f"uk_air_sos:station_ref={station_ref}:day_utc={day.isoformat()}"
+
+
+def _uk_air_sos_cache_path(cache_root: Path, station_ref: str, day: dt.date) -> Path:
+    station_token = urllib.parse.quote(station_ref, safe="._-")
+    return (
+        cache_root
+        / f"station_ref={station_token}"
+        / f"day_utc={day.isoformat()}"
+        / "snapshot.ndjson"
+    )
+
+
+def _uk_air_sos_remote_key(base_url: str, station_ref: str, day: dt.date) -> str:
+    station_token = urllib.parse.quote(station_ref, safe="")
+    return (
+        f"{base_url.rstrip('/')}/station_ref={station_token}/day_utc={day.isoformat()}"
+    )
+
+
+def _uk_air_sos_station_bindings(
+    conn: sqlite3.Connection,
+) -> dict[str, list[dict[str, Any]]]:
+    rows = conn.execute(
+        """
+        SELECT
+          l.source_location_id,
+          l.station_ref,
+          l.station_id,
+          l.connector_id,
+          l.timeseries_id,
+          t.timeseries_ref
+        FROM source_station_timeseries_lookup l
+        JOIN core_timeseries_snapshot t ON t.id = l.timeseries_id
+        WHERE l.source_key = ?
+          AND l.is_active = 1
+          AND l.station_ref IS NOT NULL
+          AND l.station_ref != ''
+          AND t.timeseries_ref IS NOT NULL
+          AND t.timeseries_ref != ''
+        ORDER BY l.station_ref, l.timeseries_id
+        """,
+        (UK_AIR_SOS_SOURCE_KEY,),
+    ).fetchall()
+    out: dict[str, list[dict[str, Any]]] = {}
+    for source_location_id, station_ref, station_id, connector_id, timeseries_id, timeseries_ref in rows:
+        station = str(station_ref or "").strip()
+        if not station:
+            continue
+        out.setdefault(station, []).append({
+            "source_location_id": str(source_location_id or station),
+            "station_ref": station,
+            "station_id": int(station_id),
+            "connector_id": int(connector_id),
+            "timeseries_id": int(timeseries_id),
+            "timeseries_ref": str(timeseries_ref),
+        })
+    return out
+
 
 def _openaq_parse_per_timeseries_counts(
     csv_gz_path: Path,
@@ -1465,6 +1959,105 @@ def _upsert_state(
     )
 
 
+def _upsert_source_state(
+    conn: sqlite3.Connection,
+    *,
+    source_key: str,
+    remote_scheme: str,
+    source_file_key: str,
+    env_name: str,
+    remote_url_or_key: str,
+    station_ref: str | None,
+    source_location_id: str | None,
+    day: dt.date,
+    exists_remote: bool,
+    content_length: int | None,
+    etag: str | None,
+    last_modified_utc: str | None,
+    sha256_downloaded: str | None,
+    sha256_uncompressed: str | None,
+    local_cached_path: str | None,
+    now_iso: str,
+    last_changed_at: str | None,
+    last_status: str,
+    notes: str | None = None,
+) -> None:
+    """Generic source_file_state upsert for non-OpenAQ sources."""
+    cur = conn.execute(
+        "SELECT first_seen_at_utc, last_changed_at_utc FROM source_file_state WHERE source_file_key = ?",
+        (source_file_key,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        first_seen = now_iso
+        carried_changed = last_changed_at
+    else:
+        first_seen = row[0] or now_iso
+        carried_changed = last_changed_at if last_changed_at is not None else row[1]
+
+    conn.execute(
+        """
+        INSERT INTO source_file_state (
+          source_file_key, env_name, source_key, remote_scheme,
+          remote_url_or_key, station_ref, source_location_id, day_utc,
+          date_range_start_utc, date_range_end_utc,
+          exists_remote, content_length, etag, last_modified_utc,
+          sha256_downloaded, sha256_uncompressed,
+          local_cached_path,
+          first_seen_at_utc, last_checked_at_utc, last_changed_at_utc,
+          last_status, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_file_key) DO UPDATE SET
+          env_name = excluded.env_name,
+          source_key = excluded.source_key,
+          remote_scheme = excluded.remote_scheme,
+          remote_url_or_key = excluded.remote_url_or_key,
+          station_ref = excluded.station_ref,
+          source_location_id = excluded.source_location_id,
+          day_utc = excluded.day_utc,
+          exists_remote = excluded.exists_remote,
+          content_length = excluded.content_length,
+          etag = excluded.etag,
+          last_modified_utc = excluded.last_modified_utc,
+          sha256_downloaded = COALESCE(excluded.sha256_downloaded, source_file_state.sha256_downloaded),
+          sha256_uncompressed = COALESCE(excluded.sha256_uncompressed, source_file_state.sha256_uncompressed),
+          local_cached_path = excluded.local_cached_path,
+          last_checked_at_utc = excluded.last_checked_at_utc,
+          last_changed_at_utc = excluded.last_changed_at_utc,
+          last_status = excluded.last_status,
+          notes = excluded.notes
+        """,
+        (
+            source_file_key, env_name, source_key, remote_scheme,
+            remote_url_or_key, station_ref, source_location_id, day.isoformat(),
+            None, None,
+            1 if exists_remote else 0, content_length, etag, last_modified_utc,
+            sha256_downloaded, sha256_uncompressed,
+            local_cached_path,
+            first_seen, now_iso, carried_changed,
+            last_status, notes,
+        ),
+    )
+
+
+def _mark_source_state_fetch_error(
+    conn: sqlite3.Connection,
+    *,
+    source_file_key: str,
+    status: str,
+    now_iso: str,
+) -> None:
+    """Record a fetch error without overwriting baseline hashes/content."""
+    conn.execute(
+        """
+        UPDATE source_file_state
+        SET last_checked_at_utc = ?, last_status = ?
+        WHERE source_file_key = ?
+        """,
+        (now_iso, status, source_file_key),
+    )
+
+
 def _insert_event(
     conn: sqlite3.Connection,
     *,
@@ -1516,13 +2109,69 @@ def _insert_event(
     return int(cur.lastrowid)
 
 
+def _insert_source_event(
+    conn: sqlite3.Connection,
+    *,
+    source_key: str,
+    event_type: str,
+    env_name: str,
+    source_file_key: str,
+    remote_url_or_key: str,
+    station_ref: str | None,
+    source_location_id: str | None,
+    day: dt.date,
+    prior: dict[str, Any] | None,
+    new_content_length: int | None,
+    new_etag: str | None,
+    new_last_modified_utc: str | None,
+    new_sha256_downloaded: str | None,
+    new_sha256_uncompressed: str | None,
+    downloaded_bytes: int,
+    hash_runtime_ms: int,
+    now_iso: str,
+    notes: str | None = None,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO source_file_events (
+          event_at_utc, env_name, source_key, event_type,
+          source_file_key, remote_url_or_key,
+          station_ref, source_location_id, day_utc,
+          old_content_length, new_content_length,
+          old_etag, new_etag,
+          old_last_modified_utc, new_last_modified_utc,
+          old_sha256_downloaded, new_sha256_downloaded,
+          old_sha256_uncompressed, new_sha256_uncompressed,
+          downloaded_bytes, hash_runtime_ms,
+          backfill_triggered, backfill_timeseries_ids, backfill_status,
+          notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            now_iso, env_name, source_key, event_type,
+            source_file_key, remote_url_or_key,
+            station_ref, source_location_id, day.isoformat(),
+            (prior or {}).get("content_length"), new_content_length,
+            (prior or {}).get("etag"), new_etag,
+            (prior or {}).get("last_modified_utc"), new_last_modified_utc,
+            (prior or {}).get("sha256_downloaded"), new_sha256_downloaded,
+            (prior or {}).get("sha256_uncompressed"), new_sha256_uncompressed,
+            downloaded_bytes, hash_runtime_ms,
+            0, None, None,
+            notes,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
 def _fetch_prior_state(
     conn: sqlite3.Connection, source_file_key: str
 ) -> dict[str, Any] | None:
     row = conn.execute(
         """
         SELECT exists_remote, content_length, etag, last_modified_utc,
-               sha256_downloaded, sha256_uncompressed, last_status
+               sha256_downloaded, sha256_uncompressed, last_status, local_cached_path,
+               last_checked_at_utc
         FROM source_file_state
         WHERE source_file_key = ?
         """,
@@ -1538,6 +2187,8 @@ def _fetch_prior_state(
         "sha256_downloaded": row[4],
         "sha256_uncompressed": row[5],
         "last_status": row[6],
+        "local_cached_path": row[7],
+        "last_checked_at_utc": row[8],
     }
 
 
@@ -1866,6 +2517,7 @@ BACKFILL_OUTPUT_TAIL_BYTES = 4096
 # (e.g. weekly/monthly runs with many mismatches) that would otherwise hit the
 # per-call timeout.
 _CHUNK_ENV_VAR = "UK_AQ_HISTORY_INTEGRITY_MAX_TIMESERIES_IDS_PER_BACKFILL"
+_TRY_UNCHUNKED_FIRST_ENV_VAR = "UK_AQ_HISTORY_INTEGRITY_BACKFILL_TRY_UNCHUNKED_FIRST"
 
 # Status precedence for combining per-chunk results into one per-event row.
 # Worst status wins so a single failed chunk surfaces as a failed backfill on
@@ -2037,6 +2689,7 @@ def run_narrow_backfill(
     log_dir: Path | None = None,
     log_label: str | None = None,
     output_scope: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one (timeseries-ids, day).
 
@@ -2102,15 +2755,27 @@ def run_narrow_backfill(
     connector_csv = ",".join(str(c) for c in (connector_ids or []) if int(c) > 0)
     if connector_csv:
         sub_env["UK_AQ_BACKFILL_CONNECTOR_IDS"] = connector_csv
+    if extra_env:
+        for key, value in extra_env.items():
+            if key and value is not None:
+                sub_env[str(key)] = str(value)
     # Reuse integrity OpenAQ local source-cache as the backfill mirror root
     # unless backfill-specific mirror root is already explicitly set.
-    if not (sub_env.get("UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT") or "").strip():
-        integrity_cache_root = (
-            sub_env.get("UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR") or ""
-        ).strip()
-        if integrity_cache_root:
+    integrity_cache_root = (
+        sub_env.get("UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR") or ""
+    ).strip()
+    if integrity_cache_root:
+        if not (sub_env.get("UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT") or "").strip():
             sub_env["UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT"] = str(
                 Path(integrity_cache_root) / "openaq"
+            )
+        # Option 1 (same-run handoff): let source_to_r2(uk_air_sos) reuse
+        # canonical station/day snapshots that integrity just fetched in this run.
+        if not (
+            sub_env.get("UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT") or ""
+        ).strip():
+            sub_env["UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT"] = str(
+                Path(integrity_cache_root) / "uk_air_sos"
             )
 
     started = time.monotonic()
@@ -2189,6 +2854,8 @@ def run_narrow_backfill(
                 fh.write(f"# connector_ids: {sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n")
                 fh.write(f"# timeseries_ids: {sub_env['UK_AQ_BACKFILL_TIMESERIES_IDS']}\n")
                 fh.write(f"# output_scope: {sub_env.get('UK_AQ_BACKFILL_OUTPUT_SCOPE', 'default')}\n")
+                if extra_env:
+                    fh.write(f"# extra_env: {json.dumps(extra_env, sort_keys=True)}\n")
                 fh.write(f"# command: {' '.join(cmd)}\n")
                 fh.write(f"# exit_code: {result['exit_code']}\n")
                 fh.write(f"# status: {result['status']}\n")
@@ -2592,7 +3259,7 @@ def check_openaq(
 #   issuing a per-file HEAD.
 # - Index parse uses a simple regex over the standard nginx-style listing.
 
-SC_SOURCE_KEY = "sensor-community"
+SC_SOURCE_KEY = "sensorcommunity"
 SC_DEFAULT_BASE_URL = "https://archive.sensor.community"
 SC_REMOTE_SCHEME = "https"
 SC_INDEX_FILENAME_RE = re.compile(
@@ -3310,6 +3977,708 @@ def check_sensor_community(
     return metrics
 
 
+UK_AIR_SOS_REMOTE_SCHEME = "api"
+
+
+def _should_suppress_uk_air_sos_not_found_retry(
+    prior: dict[str, Any] | None,
+    *,
+    now_iso: str,
+    cooldown_seconds: int,
+) -> bool:
+    if cooldown_seconds <= 0 or prior is None:
+        return False
+    if int(prior.get("exists_remote") or 0) != 0:
+        return False
+    last_checked = _parse_iso_utc(prior.get("last_checked_at_utc"))
+    now_dt = _parse_iso_utc(now_iso)
+    if last_checked is None or now_dt is None:
+        return False
+    elapsed = (now_dt - last_checked).total_seconds()
+    if elapsed < 0:
+        return False
+    return elapsed < float(cooldown_seconds)
+
+
+def _check_one_uk_air_sos_station_day_threadsafe(
+    db_path: str,
+    env_name: str,
+    base_url: str,
+    station_ref: str,
+    bindings: list[dict[str, Any]],
+    day: dt.date,
+    cache_root: Path,
+    keep_policy: str,
+    not_found_cooldown_seconds: int,
+    log: logging.Logger,
+    limits: LimitTracker | None = None,
+) -> dict[str, Any]:
+    if limits is not None and limits.should_stop():
+        return {
+            "outcome": "stopped",
+            "station_ref": station_ref,
+            "day": day.isoformat(),
+            "downloaded_bytes": 0,
+            "row_count": 0,
+            "event_id": None,
+            "event_type": None,
+            "timeseries_ids": [],
+        }
+    conn = _worker_db_conn(db_path)
+    try:
+        result = _check_one_uk_air_sos_station_day(
+            conn=conn,
+            env_name=env_name,
+            base_url=base_url,
+            station_ref=station_ref,
+            bindings=bindings,
+            day=day,
+            cache_root=cache_root,
+            keep_policy=keep_policy,
+            not_found_cooldown_seconds=not_found_cooldown_seconds,
+            log=log,
+        )
+    finally:
+        try:
+            conn.commit()
+        except sqlite3.Error:
+            pass
+    result["station_ref"] = station_ref
+    result["day"] = day.isoformat()
+    return result
+
+
+def _check_one_uk_air_sos_station_day(
+    conn: sqlite3.Connection,
+    env_name: str,
+    base_url: str,
+    station_ref: str,
+    bindings: list[dict[str, Any]],
+    day: dt.date,
+    cache_root: Path,
+    keep_policy: str,
+    not_found_cooldown_seconds: int,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    sfk = _uk_air_sos_source_file_key(station_ref, day)
+    now_iso = fmt_iso(utc_now())
+    prior = _fetch_prior_state(conn, sfk)
+    source_location_id = station_ref
+    timeseries_ids = sorted({
+        int(binding["timeseries_id"])
+        for binding in bindings
+        if int(binding["timeseries_id"]) > 0
+    })
+    remote_key = _uk_air_sos_remote_key(base_url, station_ref, day)
+
+    if _should_suppress_uk_air_sos_not_found_retry(
+        prior,
+        now_iso=now_iso,
+        cooldown_seconds=not_found_cooldown_seconds,
+    ):
+        _upsert_source_state(
+            conn=conn,
+            source_key=UK_AIR_SOS_SOURCE_KEY,
+            remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+            source_file_key=sfk,
+            env_name=env_name,
+            remote_url_or_key=remote_key,
+            station_ref=station_ref,
+            source_location_id=source_location_id,
+            day=day,
+            exists_remote=False,
+            content_length=None,
+            etag=None,
+            last_modified_utc=None,
+            sha256_downloaded=None,
+            sha256_uncompressed=None,
+            local_cached_path=str(prior.get("local_cached_path") or "") or None,
+            now_iso=now_iso,
+            last_changed_at=None,
+            last_status="not_found_suppressed",
+            notes=(
+                "uk_air_sos not_found suppressed by cooldown "
+                f"({not_found_cooldown_seconds}s)"
+            ),
+        )
+        return {
+            "outcome": "not_found_suppressed",
+            "snapshot_status": UK_AIR_SOS_STATUS_NOT_FOUND,
+            "downloaded_bytes": 0,
+            "row_count": 0,
+            "event_id": None,
+            "event_type": None,
+            "timeseries_ids": timeseries_ids,
+        }
+
+    snapshot = build_uk_air_sos_canonical_snapshot(
+        station_ref=station_ref,
+        day_utc=day.isoformat(),
+        timeseries_bindings=bindings,
+        base_url=base_url,
+    )
+    snapshot_status = str(snapshot.get("status") or "")
+    row_count = int(snapshot.get("row_count") or 0)
+    ndjson_bytes = snapshot.get("ndjson_bytes") or b""
+    sha = snapshot.get("sha256")
+
+    # Temporary/permanent fetch errors: do not overwrite baseline hashes/counts.
+    if snapshot_status in {UK_AIR_SOS_STATUS_TEMP_ERROR, UK_AIR_SOS_STATUS_PERM_ERROR}:
+        if prior is not None:
+            _mark_source_state_fetch_error(
+                conn,
+                source_file_key=sfk,
+                status=snapshot_status,
+                now_iso=now_iso,
+            )
+        event_type = "temporary_error" if snapshot_status == UK_AIR_SOS_STATUS_TEMP_ERROR else "permanent_error"
+        event_id = _insert_source_event(
+            conn=conn,
+            source_key=UK_AIR_SOS_SOURCE_KEY,
+            event_type=event_type,
+            env_name=env_name,
+            source_file_key=sfk,
+            remote_url_or_key=remote_key,
+            station_ref=station_ref,
+            source_location_id=source_location_id,
+            day=day,
+            prior=prior,
+            new_content_length=None,
+            new_etag=None,
+            new_last_modified_utc=None,
+            new_sha256_downloaded=None,
+            new_sha256_uncompressed=None,
+            downloaded_bytes=0,
+            hash_runtime_ms=0,
+            now_iso=now_iso,
+            notes=str(snapshot.get("error") or "source fetch error"),
+        )
+        return {
+            "outcome": event_type,
+            "snapshot_status": snapshot_status,
+            "downloaded_bytes": 0,
+            "row_count": 0,
+            "event_id": event_id,
+            "event_type": event_type,
+            "timeseries_ids": timeseries_ids,
+        }
+
+    # not_found from SOS is a missing source unit (station/day).
+    if snapshot_status == UK_AIR_SOS_STATUS_NOT_FOUND:
+        if prior is None:
+            _upsert_source_state(
+                conn=conn,
+                source_key=UK_AIR_SOS_SOURCE_KEY,
+                remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+                source_file_key=sfk,
+                env_name=env_name,
+                remote_url_or_key=remote_key,
+                station_ref=station_ref,
+                source_location_id=source_location_id,
+                day=day,
+                exists_remote=False,
+                content_length=None,
+                etag=None,
+                last_modified_utc=None,
+                sha256_downloaded=None,
+                sha256_uncompressed=None,
+                local_cached_path=None,
+                now_iso=now_iso,
+                last_changed_at=None,
+                last_status="missing",
+                notes="uk_air_sos snapshot not_found",
+            )
+            event_id = _insert_source_event(
+                conn=conn,
+                source_key=UK_AIR_SOS_SOURCE_KEY,
+                event_type="missing_first_seen",
+                env_name=env_name,
+                source_file_key=sfk,
+                remote_url_or_key=remote_key,
+                station_ref=station_ref,
+                source_location_id=source_location_id,
+                day=day,
+                prior=None,
+                new_content_length=None,
+                new_etag=None,
+                new_last_modified_utc=None,
+                new_sha256_downloaded=None,
+                new_sha256_uncompressed=None,
+                downloaded_bytes=0,
+                hash_runtime_ms=0,
+                now_iso=now_iso,
+                notes="uk_air_sos snapshot not_found",
+            )
+            return {
+                "outcome": "not_found_first_seen",
+                "snapshot_status": snapshot_status,
+                "downloaded_bytes": 0,
+                "row_count": 0,
+                "event_id": event_id,
+                "event_type": "missing_first_seen",
+                "timeseries_ids": timeseries_ids,
+            }
+
+        if int(prior.get("exists_remote") or 0) == 1:
+            _upsert_source_state(
+                conn=conn,
+                source_key=UK_AIR_SOS_SOURCE_KEY,
+                remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+                source_file_key=sfk,
+                env_name=env_name,
+                remote_url_or_key=remote_key,
+                station_ref=station_ref,
+                source_location_id=source_location_id,
+                day=day,
+                exists_remote=False,
+                content_length=None,
+                etag=None,
+                last_modified_utc=None,
+                sha256_downloaded=None,
+                sha256_uncompressed=None,
+                local_cached_path=None,
+                now_iso=now_iso,
+                last_changed_at=now_iso,
+                last_status="missing",
+                notes="uk_air_sos snapshot not_found",
+            )
+            event_id = _insert_source_event(
+                conn=conn,
+                source_key=UK_AIR_SOS_SOURCE_KEY,
+                event_type="missing_after_seen",
+                env_name=env_name,
+                source_file_key=sfk,
+                remote_url_or_key=remote_key,
+                station_ref=station_ref,
+                source_location_id=source_location_id,
+                day=day,
+                prior=prior,
+                new_content_length=None,
+                new_etag=None,
+                new_last_modified_utc=None,
+                new_sha256_downloaded=None,
+                new_sha256_uncompressed=None,
+                downloaded_bytes=0,
+                hash_runtime_ms=0,
+                now_iso=now_iso,
+                notes="uk_air_sos snapshot not_found after prior success",
+            )
+            return {
+                "outcome": "not_found_after_seen",
+                "snapshot_status": snapshot_status,
+                "downloaded_bytes": 0,
+                "row_count": 0,
+                "event_id": event_id,
+                "event_type": "missing_after_seen",
+                "timeseries_ids": timeseries_ids,
+            }
+
+        _upsert_source_state(
+            conn=conn,
+            source_key=UK_AIR_SOS_SOURCE_KEY,
+            remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+            source_file_key=sfk,
+            env_name=env_name,
+            remote_url_or_key=remote_key,
+            station_ref=station_ref,
+            source_location_id=source_location_id,
+            day=day,
+            exists_remote=False,
+            content_length=None,
+            etag=None,
+            last_modified_utc=None,
+            sha256_downloaded=None,
+            sha256_uncompressed=None,
+            local_cached_path=None,
+            now_iso=now_iso,
+            last_changed_at=None,
+            last_status="missing",
+            notes="uk_air_sos snapshot still missing",
+        )
+        return {
+            "outcome": "not_found_still",
+            "snapshot_status": snapshot_status,
+            "downloaded_bytes": 0,
+            "row_count": 0,
+            "event_id": None,
+            "event_type": None,
+            "timeseries_ids": timeseries_ids,
+        }
+
+    # Successful snapshot (`ok` or `no_data`) path.
+    counts_by_ts_id: dict[int, int] = {}
+    for row in snapshot.get("rows", []):
+        ts_id = int(row.get("timeseries_id") or 0)
+        if ts_id <= 0:
+            continue
+        counts_by_ts_id[ts_id] = counts_by_ts_id.get(ts_id, 0) + 1
+    _record_source_file_timeseries_counts(conn, sfk, counts_by_ts_id, now_iso)
+
+    is_first_seen = prior is None
+    was_missing = prior is not None and int(prior.get("exists_remote") or 0) == 0
+    prior_sha = str(prior.get("sha256_uncompressed") or "") if prior else ""
+    content_changed = is_first_seen or (not prior_sha) or prior_sha != str(sha or "")
+    state_changed = is_first_seen or was_missing or content_changed
+
+    if not state_changed:
+        outcome = "unchanged"
+        event_type = None
+        last_changed_at = None
+    else:
+        if is_first_seen:
+            outcome = "first_seen"
+            event_type = "first_seen"
+        elif was_missing:
+            outcome = "reappeared"
+            event_type = "reappeared"
+        else:
+            outcome = "changed"
+            event_type = "changed"
+        last_changed_at = now_iso
+
+    keep_snapshot = (
+        keep_policy == "all"
+        or (keep_policy == "changed" and outcome in {"changed", "reappeared"})
+    )
+    cache_path = _uk_air_sos_cache_path(cache_root, station_ref, day)
+    local_cached_path: str | None = None
+    if keep_snapshot:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(ndjson_bytes)
+        local_cached_path = str(cache_path)
+    else:
+        if cache_path.exists():
+            cache_path.unlink(missing_ok=True)
+
+    _upsert_source_state(
+        conn=conn,
+        source_key=UK_AIR_SOS_SOURCE_KEY,
+        remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+        source_file_key=sfk,
+        env_name=env_name,
+        remote_url_or_key=remote_key,
+        station_ref=station_ref,
+        source_location_id=source_location_id,
+        day=day,
+        exists_remote=True,
+        content_length=len(ndjson_bytes),
+        etag=None,
+        last_modified_utc=None,
+        sha256_downloaded=str(sha or ""),
+        sha256_uncompressed=str(sha or ""),
+        local_cached_path=local_cached_path,
+        now_iso=now_iso,
+        last_changed_at=last_changed_at,
+        last_status=outcome,
+        notes=(
+            f"uk_air_sos snapshot_status={snapshot_status} row_count={row_count} "
+            f"keep_policy={keep_policy}"
+        ),
+    )
+
+    event_id: int | None = None
+    if event_type:
+        event_id = _insert_source_event(
+            conn=conn,
+            source_key=UK_AIR_SOS_SOURCE_KEY,
+            event_type=event_type,
+            env_name=env_name,
+            source_file_key=sfk,
+            remote_url_or_key=remote_key,
+            station_ref=station_ref,
+            source_location_id=source_location_id,
+            day=day,
+            prior=prior,
+            new_content_length=len(ndjson_bytes),
+            new_etag=None,
+            new_last_modified_utc=None,
+            new_sha256_downloaded=str(sha or ""),
+            new_sha256_uncompressed=str(sha or ""),
+            downloaded_bytes=len(ndjson_bytes),
+            hash_runtime_ms=0,
+            now_iso=now_iso,
+            notes=(
+                f"uk_air_sos snapshot_status={snapshot_status} row_count={row_count} "
+                f"keep_policy={keep_policy}"
+            ),
+        )
+
+    return {
+        "outcome": outcome,
+        "snapshot_status": snapshot_status,
+        "downloaded_bytes": len(ndjson_bytes),
+        "row_count": row_count,
+        "event_id": event_id,
+        "event_type": event_type,
+        "timeseries_ids": timeseries_ids,
+    }
+
+
+def check_uk_air_sos(
+    conn: sqlite3.Connection,
+    env_name: str,
+    env: dict[str, str],
+    from_day: str | None,
+    to_day: str | None,
+    *,
+    dry_run: bool,
+    run_backfill: bool,
+    limits: LimitTracker,
+    log: logging.Logger,
+    concurrency: int = DEFAULT_CONCURRENCY,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "ran": False,
+        "stopped_for": None,
+        "stations": 0,
+        "stations_checked": 0,
+        "station_days_checked": 0,
+        "days": 0,
+        "head_checked": 0,
+        "downloaded": 0,
+        "first_seen": 0,
+        "changed": 0,
+        "reappeared": 0,
+        "unchanged_after_download": 0,
+        "snapshots_successful": 0,
+        "snapshots_no_data": 0,
+        "missing": 0,
+        "not_found": 0,
+        "not_found_suppressed": 0,
+        "temporary_errors": 0,
+        "permanent_errors": 0,
+        "errors": 0,
+        "rows_counted": 0,
+        "downloaded_bytes": 0,
+        "first_seen_files": [],
+        "changed_files": [],
+        "planned_backfills": [],
+        "backfills_attempted": 0,
+        "backfills_ok": 0,
+        "backfills_failed": 0,
+        "keep_api_snapshots_policy": _resolve_keep_api_snapshots_policy(),
+        "not_found_cooldown_seconds": _resolve_uk_air_sos_not_found_cooldown_seconds(),
+        "skipped_reason": None,
+    }
+    base_url = os.environ.get(
+        "UK_AQ_BACKFILL_UK_AIR_SOS_BASE_URL",
+        UK_AIR_SOS_DEFAULT_BASE_URL,
+    )
+
+    if not from_day or not to_day:
+        metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
+        log.warning("uk_air_sos: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
+    station_bindings = _uk_air_sos_station_bindings(conn)
+    stations = sorted(station_bindings.keys())
+    if not stations:
+        metrics["skipped_reason"] = "no uk_air_sos active station/timeseries bindings in source_station_timeseries_lookup"
+        log.warning("uk_air_sos: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
+    days = _date_range_inclusive(from_day, to_day)
+    if not days:
+        metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
+        log.warning("uk_air_sos: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
+    metrics["stations"] = len(stations)
+    metrics["days"] = len(days)
+    metrics["stations_checked"] = len(stations)
+    metrics["ran"] = True
+
+    log.info(
+        "uk_air_sos: starting stations=%s days=%s base_url=%s keep_api_snapshots=%s not_found_cooldown_seconds=%s%s",
+        len(stations),
+        len(days),
+        base_url,
+        metrics["keep_api_snapshots_policy"],
+        metrics["not_found_cooldown_seconds"],
+        " (dry-run)" if dry_run else "",
+    )
+    if run_backfill:
+        log.info("uk_air_sos: direct backfill is disabled in Phase 7.3 (cross-check-driven repair only)")
+
+    if dry_run:
+        sample = []
+        for station in stations[:3]:
+            for day in days[:2]:
+                sample.append(_uk_air_sos_remote_key(base_url, station, day))
+        metrics["sample_urls"] = sample
+        log.info(
+            "uk_air_sos dry-run: would check %s station/day units; sample=%s",
+            len(stations) * len(days),
+            sample[:6],
+        )
+        return metrics
+
+    cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / UK_AIR_SOS_SOURCE_KEY
+    cache_root.mkdir(parents=True, exist_ok=True)
+    db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures: list[concurrent.futures.Future] = []
+        for station_ref in stations:
+            if limits.should_stop():
+                break
+            bindings = station_bindings.get(station_ref) or []
+            if not bindings:
+                continue
+            for day in days:
+                if limits.should_stop():
+                    break
+                futures.append(ex.submit(
+                    _check_one_uk_air_sos_station_day_threadsafe,
+                    db_path,
+                    env_name,
+                    base_url,
+                    station_ref,
+                    bindings,
+                    day,
+                    cache_root,
+                    metrics["keep_api_snapshots_policy"],
+                    int(metrics["not_found_cooldown_seconds"] or 0),
+                    log,
+                    limits,
+                ))
+        total_tasks = len(futures)
+        completed_tasks = 0
+        progress = SingleLineProgress("uk_air_sos progress")
+        progress.update(
+            (
+                f"0/{total_tasks} checked=0 changed=0 downloaded=0 "
+                f"missing=0 errors=0 planned_backfills=0"
+            ),
+            force=True,
+        )
+
+        for fut in concurrent.futures.as_completed(futures):
+            completed_tasks += 1
+            try:
+                result = fut.result()
+            except Exception as exc:
+                metrics["errors"] += 1
+                log.warning("uk_air_sos worker raised: %s", exc)
+                progress.update(
+                    (
+                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills=0"
+                    ),
+                )
+                continue
+
+            outcome = result.get("outcome")
+            if outcome == "stopped":
+                progress.update(
+                    (
+                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                        f"missing={metrics['missing']} errors={metrics['errors']} "
+                        f"planned_backfills=0 stopped_for={limits.stopped_for or 'n/a'}"
+                    ),
+                )
+                continue
+
+            metrics["head_checked"] += 1
+            metrics["station_days_checked"] += 1
+            metrics["rows_counted"] += int(result.get("row_count") or 0)
+            metrics["downloaded_bytes"] += int(result.get("downloaded_bytes") or 0)
+            snapshot_status = str(result.get("snapshot_status") or "")
+            if snapshot_status in {UK_AIR_SOS_STATUS_OK, UK_AIR_SOS_STATUS_NO_DATA}:
+                metrics["snapshots_successful"] += 1
+                if snapshot_status == UK_AIR_SOS_STATUS_NO_DATA:
+                    metrics["snapshots_no_data"] += 1
+            elif snapshot_status == UK_AIR_SOS_STATUS_NOT_FOUND:
+                metrics["not_found"] += 1
+
+            if outcome == "first_seen":
+                metrics["downloaded"] += 1
+                metrics["first_seen"] += 1
+                metrics["first_seen_files"].append({
+                    "station_ref": result["station_ref"],
+                    "day": result["day"],
+                    "event_id": result["event_id"],
+                    "event_type": result["event_type"],
+                    "timeseries_ids": result["timeseries_ids"],
+                })
+            elif outcome == "reappeared":
+                metrics["downloaded"] += 1
+                metrics["changed"] += 1
+                metrics["reappeared"] += 1
+                metrics["changed_files"].append({
+                    "station_ref": result["station_ref"],
+                    "day": result["day"],
+                    "event_id": result["event_id"],
+                    "event_type": result["event_type"],
+                    "timeseries_ids": result["timeseries_ids"],
+                })
+            elif outcome == "changed":
+                metrics["downloaded"] += 1
+                metrics["changed"] += 1
+                metrics["changed_files"].append({
+                    "station_ref": result["station_ref"],
+                    "day": result["day"],
+                    "event_id": result["event_id"],
+                    "event_type": result["event_type"],
+                    "timeseries_ids": result["timeseries_ids"],
+                })
+            elif outcome == "unchanged":
+                metrics["downloaded"] += 1
+                metrics["unchanged_after_download"] += 1
+            elif outcome in {"not_found_first_seen", "not_found_after_seen", "not_found_still"}:
+                metrics["missing"] += 1
+            elif outcome == "not_found_suppressed":
+                metrics["missing"] += 1
+                metrics["not_found_suppressed"] += 1
+            elif outcome == "temporary_error":
+                metrics["temporary_errors"] += 1
+                metrics["errors"] += 1
+            elif outcome == "permanent_error":
+                metrics["permanent_errors"] += 1
+                metrics["errors"] += 1
+            else:
+                metrics["errors"] += 1
+
+            progress.update(
+                (
+                    f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                    f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+                    f"missing={metrics['missing']} errors={metrics['errors']} "
+                    f"planned_backfills=0"
+                ),
+            )
+
+    progress.update(
+        (
+            f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+            f"changed={metrics['changed']} downloaded={metrics['downloaded']} "
+            f"missing={metrics['missing']} errors={metrics['errors']} planned_backfills=0"
+        ),
+        force=True,
+    )
+    progress.finish()
+
+    metrics["first_seen_files"].sort(key=lambda e: (e["day"], e["station_ref"]))
+    metrics["changed_files"].sort(key=lambda e: (e["day"], e["station_ref"]))
+
+    if limits.should_stop():
+        metrics["stopped_for"] = limits.stopped_for
+        log.warning("uk_air_sos: stopped early due to limit=%s", limits.stopped_for)
+
+    log.info(
+        "uk_air_sos: done %s",
+        {
+            k: v
+            for k, v in metrics.items()
+            if k not in ("first_seen_files", "changed_files", "sample_urls")
+        },
+    )
+    return metrics
+
+
 R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
 R2_AQILEVELS_PREFIX = "history/v1/aqilevels"
 AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME = "aqilevels"
@@ -3391,13 +4760,10 @@ def run_r2_cross_checks(
     if not manifest_prefix:
         raise RuntimeError("R2 observations_timeseries manifest prefix is empty")
 
-    source_keys_by_filter = {
-        "openaq": ("openaq",),
-        "sensorcommunity": ("sensor-community",),
-        "sensor-community": ("sensor-community",),
-        "all": ("openaq", "sensor-community"),
-    }
-    source_keys = source_keys_by_filter.get(source_filter, ("openaq", "sensor-community"))
+    source_keys = CROSS_CHECK_SOURCE_KEYS_BY_FILTER.get(
+        source_filter,
+        CROSS_CHECK_SOURCE_KEYS_BY_FILTER["all"],
+    )
 
     where = [
         "s.env_name = ?",
@@ -3595,16 +4961,12 @@ def _collect_cross_check_backfill_targets(
 ) -> dict[tuple[str, int], list[int]]:
     if not statuses:
         return {}
-    source_codes_by_filter = {
-        "openaq": ("openaq",),
-        "sensorcommunity": ("sensorcommunity", "sensor-community"),
-        "sensor-community": ("sensorcommunity", "sensor-community"),
-        "all": ("openaq", "sensorcommunity", "sensor-community"),
-    }
-    connector_codes = source_codes_by_filter.get(
+    connector_codes = CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER.get(
         source_filter,
-        ("openaq", "sensorcommunity", "sensor-community"),
+        CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER["all"],
     )
+    if not connector_codes:
+        return {}
     placeholders = ",".join("?" for _ in statuses)
     connector_placeholders = ",".join("?" for _ in connector_codes)
     rows = conn.execute(
@@ -3641,6 +5003,127 @@ def _collect_cross_check_backfill_targets(
         key: sorted(values)
         for key, values in sorted(grouped.items(), key=lambda item: item[0])
     }
+
+
+def _collect_uk_air_sos_source_change_targets(
+    conn: sqlite3.Connection,
+    *,
+    source_filter: str,
+    uk_air_sos_metrics: Mapping[str, Any] | None,
+) -> dict[tuple[str, int], list[int]]:
+    """Build connector/day -> timeseries IDs from SOS changed/reappeared rows.
+
+    Phase 7.4 uses these as additional observation-repair candidates so
+    source content changes can be repaired even when row-count parity happens
+    to match R2.
+    """
+    if source_filter not in {"uk_air_sos", "all"}:
+        return {}
+    changed_files = (uk_air_sos_metrics or {}).get("changed_files") or []
+    if not isinstance(changed_files, list) or not changed_files:
+        return {}
+
+    candidate_pairs: list[tuple[str, int]] = []
+    timeseries_ids_set: set[int] = set()
+    for entry in changed_files:
+        if not isinstance(entry, dict):
+            continue
+        day_utc = str(entry.get("day") or "").strip()
+        if not day_utc:
+            continue
+        try:
+            dt.date.fromisoformat(day_utc)
+        except ValueError:
+            continue
+        raw_ids = entry.get("timeseries_ids")
+        if not isinstance(raw_ids, list):
+            continue
+        for raw_id in raw_ids:
+            try:
+                ts_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if ts_id <= 0:
+                continue
+            candidate_pairs.append((day_utc, ts_id))
+            timeseries_ids_set.add(ts_id)
+
+    if not candidate_pairs:
+        return {}
+
+    placeholders = ",".join("?" for _ in timeseries_ids_set)
+    rows = conn.execute(
+        f"""
+        SELECT t.id, t.connector_id
+        FROM core_timeseries_snapshot t
+        JOIN core_connectors_snapshot c ON c.id = t.connector_id
+        WHERE t.id IN ({placeholders})
+          AND c.connector_code = ?
+        """,
+        (*sorted(timeseries_ids_set), UK_AIR_SOS_SOURCE_KEY),
+    ).fetchall()
+    ts_to_connector: dict[int, int] = {}
+    for ts_id, connector_id in rows:
+        try:
+            parsed_ts = int(ts_id)
+            parsed_connector = int(connector_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_ts > 0 and parsed_connector > 0:
+            ts_to_connector[parsed_ts] = parsed_connector
+
+    grouped: dict[tuple[str, int], set[int]] = {}
+    for day_utc, ts_id in candidate_pairs:
+        connector_id = ts_to_connector.get(ts_id)
+        if connector_id is None:
+            continue
+        grouped.setdefault((day_utc, connector_id), set()).add(ts_id)
+    return {
+        key: sorted(values)
+        for key, values in sorted(grouped.items(), key=lambda item: item[0])
+    }
+
+
+def _merge_observation_repair_targets(
+    cross_check_targets: Mapping[tuple[str, int], list[int]] | None,
+    source_change_targets: Mapping[tuple[str, int], list[int]] | None,
+) -> tuple[dict[tuple[str, int], list[int]], dict[tuple[str, int], list[str]]]:
+    """Deduplicate repair targets by (day_utc, connector_id, timeseries_id)."""
+    merged: dict[tuple[str, int], set[int]] = {}
+    origins: dict[tuple[str, int], set[str]] = {}
+
+    for key, ids in (cross_check_targets or {}).items():
+        bucket = merged.setdefault(key, set())
+        for raw_ts in ids:
+            try:
+                ts_id = int(raw_ts)
+            except (TypeError, ValueError):
+                continue
+            if ts_id > 0:
+                bucket.add(ts_id)
+        origins.setdefault(key, set()).add("cross_check")
+    for key, ids in (source_change_targets or {}).items():
+        bucket = merged.setdefault(key, set())
+        for raw_ts in ids:
+            try:
+                ts_id = int(raw_ts)
+            except (TypeError, ValueError):
+                continue
+            if ts_id > 0:
+                bucket.add(ts_id)
+        origins.setdefault(key, set()).add("source_change")
+
+    merged_sorted = {
+        key: sorted(values)
+        for key, values in sorted(merged.items(), key=lambda item: item[0])
+        if values
+    }
+    origins_sorted = {
+        key: sorted(values)
+        for key, values in sorted(origins.items(), key=lambda item: item[0])
+        if key in merged_sorted
+    }
+    return merged_sorted, origins_sorted
 
 
 def _parse_csv_ints(value: str | None) -> set[int]:
@@ -3821,6 +5304,7 @@ def run_cross_check_backfills(
     run_compact: str,
     env: dict[str, str],
     source_filter: str,
+    uk_air_sos_metrics: Mapping[str, Any] | None,
     dry_run: bool,
     run_backfill: bool,
     limits: LimitTracker,
@@ -3833,6 +5317,8 @@ def run_cross_check_backfills(
         "observation_backfills_ok": 0,
         "observation_backfills_failed": 0,
         "aqi_rebuilds_queued_from_obs_repair": 0,
+        "source_change_candidate_days": 0,
+        "source_change_candidate_timeseries_ids": 0,
         "planned_observation_backfills": [],
         "planned_aqi_rebuilds": [],
         "planned_aqi_rebuild_connector_days": [],
@@ -3847,10 +5333,25 @@ def run_cross_check_backfills(
     if not run_backfill:
         return metrics
 
-    targets_by_day_connector = _collect_cross_check_backfill_targets(
+    cross_check_targets = _collect_cross_check_backfill_targets(
         conn,
         run_id=run_id,
         source_filter=source_filter,
+    )
+    source_change_targets = _collect_uk_air_sos_source_change_targets(
+        conn,
+        source_filter=source_filter,
+        uk_air_sos_metrics=uk_air_sos_metrics,
+    )
+    metrics["source_change_candidate_days"] = len(
+        {day_iso for day_iso, _ in source_change_targets.keys()}
+    )
+    metrics["source_change_candidate_timeseries_ids"] = sum(
+        len(ids) for ids in source_change_targets.values()
+    )
+    targets_by_day_connector, origins_by_day_connector = _merge_observation_repair_targets(
+        cross_check_targets,
+        source_change_targets,
     )
     metrics["observation_backfill_candidate_days"] = len(
         {day_iso for day_iso, _ in targets_by_day_connector.keys()}
@@ -3862,7 +5363,7 @@ def run_cross_check_backfills(
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     if not targets_by_day_connector:
         log.info(
-            "cross-check observation repair: no mismatch/source_only/r2_manifest_missing candidates for run_id=%s source=%s",
+            "cross-check observation repair: no candidates (cross-check or source-change) for run_id=%s source=%s",
             run_id,
             source_filter,
         )
@@ -3873,6 +5374,7 @@ def run_cross_check_backfills(
     )
     queued_aqi_rebuild_keys: set[tuple[str, int]] = set()
     for (day_iso, connector_id), ts_ids in sorted(targets_by_day_connector.items()):
+        origins = origins_by_day_connector.get((day_iso, connector_id), ["cross_check"])
         day_obj = dt.date.fromisoformat(day_iso)
         cmd = _planned_backfill_command(
             env,
@@ -3886,7 +5388,8 @@ def run_cross_check_backfills(
         log.info("cross-check planned observation repair: %s", cmd)
         queue_entry = (
             f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired "
-            f"source_mode=live_r2 timeseries_ids={','.join(str(ts_id) for ts_id in ts_ids)}"
+            f"source_mode=live_r2 origins={','.join(origins)} "
+            f"timeseries_ids={','.join(str(ts_id) for ts_id in ts_ids)}"
         )
         metrics["planned_aqi_rebuilds"].append(queue_entry)
         metrics["planned_aqi_rebuild_connector_days"].append({
@@ -3905,18 +5408,91 @@ def run_cross_check_backfills(
             )
             break
         chunks = _chunk_timeseries_ids(ts_ids)
+        try_unchunked_first = _is_truthy(
+            os.environ.get(_TRY_UNCHUNKED_FIRST_ENV_VAR, "1"),
+        )
+        if len(chunks) > 1 and try_unchunked_first:
+            log.info(
+                "cross-check observation repair: trying unchunked first day=%s connector=%s total_timeseries_ids=%s",
+                day_iso,
+                connector_id,
+                len(ts_ids),
+            )
+            unchunked_label = f"cc_day_{day_iso}_connector_{connector_id}_unchunked_first"
+            bf = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=ts_ids,
+                connector_ids=[connector_id],
+                day=day_obj,
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=unchunked_label,
+                output_scope="observations_only",
+            )
+            metrics["observation_backfills_attempted"] += 1
+            metrics["backfills_attempted"] += 1
+            if bf["status"] == "ok":
+                metrics["observation_backfills_ok"] += 1
+                metrics["backfills_ok"] += 1
+                queued = _queue_aqi_rebuild_from_obs_repair(
+                    conn=conn,
+                    run_id=run_id,
+                    env_name=env_name,
+                    connector_id=connector_id,
+                    day_utc=day_iso,
+                    requested_timeseries_ids=ts_ids,
+                    queue_note=(
+                        f"queued_from_cross_check day={day_iso} connector_id={connector_id} origins={','.join(origins)}"
+                    ),
+                    log=log,
+                )
+                if queued in {"inserted", "merged"}:
+                    if queued == "inserted":
+                        queued_aqi_rebuild_keys.add((day_iso, connector_id))
+                continue
+            metrics["observation_backfills_failed"] += 1
+            metrics["backfills_failed"] += 1
+            log.warning(
+                "cross-check observation repair: unchunked attempt failed; falling back to chunked mode day=%s connector=%s status=%s",
+                day_iso,
+                connector_id,
+                bf.get("status"),
+            )
         if len(chunks) > 1:
             log.info(
                 "cross-check observation repair: chunking day=%s connector=%s "
                 "total_timeseries_ids=%s chunks=%s",
                 day_iso, connector_id, len(ts_ids), len(chunks),
             )
+        stage_root = (
+            backfill_log_dir
+            / "_targeted_stage"
+            / f"run_{run_id}"
+            / f"day_{day_iso}"
+            / f"connector_{connector_id}"
+        )
+        if len(chunks) > 1:
+            shutil.rmtree(stage_root, ignore_errors=True)
         all_chunks_ok = True
         for chunk_index, chunk_ids in enumerate(chunks, start=1):
             chunk_label = (
                 f"cc_day_{day_iso}_connector_{connector_id}" if len(chunks) == 1
                 else f"cc_day_{day_iso}_connector_{connector_id}_chunk_{chunk_index}_of_{len(chunks)}"
             )
+            extra_env: dict[str, str] | None = None
+            if len(chunks) > 1:
+                extra_env = {
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
+                        "true" if chunk_index == len(chunks) else "false"
+                    ),
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": (
+                        "true" if chunk_index == len(chunks) else "false"
+                    ),
+                }
             bf = run_narrow_backfill(
                 wrapper_path=resolve_integrity_backfill_wrapper(),
                 env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
@@ -3928,6 +5504,7 @@ def run_cross_check_backfills(
                 log_dir=backfill_log_dir,
                 log_label=chunk_label,
                 output_scope="observations_only",
+                extra_env=extra_env,
             )
             metrics["observation_backfills_attempted"] += 1
             metrics["backfills_attempted"] += 1
@@ -3947,7 +5524,7 @@ def run_cross_check_backfills(
                 day_utc=day_iso,
                 requested_timeseries_ids=ts_ids,
                 queue_note=(
-                    f"queued_from_cross_check day={day_iso} connector_id={connector_id}"
+                    f"queued_from_cross_check day={day_iso} connector_id={connector_id} origins={','.join(origins)}"
                 ),
                 log=log,
             )
@@ -3958,9 +5535,11 @@ def run_cross_check_backfills(
     metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued_aqi_rebuild_keys)
 
     log.info(
-        "cross-check observation-repair: candidate_days=%s candidate_timeseries_ids=%s attempted=%s ok=%s failed=%s queued_aqi_rebuilds=%s",
+        "cross-check observation-repair: candidate_days=%s candidate_timeseries_ids=%s source_change_days=%s source_change_timeseries_ids=%s attempted=%s ok=%s failed=%s queued_aqi_rebuilds=%s",
         metrics["observation_backfill_candidate_days"],
         metrics["observation_backfill_candidate_timeseries_ids"],
+        metrics["source_change_candidate_days"],
+        metrics["source_change_candidate_timeseries_ids"],
         metrics["observation_backfills_attempted"],
         metrics["observation_backfills_ok"],
         metrics["observation_backfills_failed"],
@@ -4702,7 +6281,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--source",
         default="all",
-        choices=["openaq", "sensor-community", "sensorcommunity", "all"],
+        choices=["openaq", "sensorcommunity", "uk_air_sos", "all"],
         help="Source adapter filter (also scopes cross-check source rows).",
     )
     p.add_argument("--from-day", dest="from_day", default=None,
@@ -4884,6 +6463,273 @@ def _is_truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _parse_bool(value: str | None, default: bool) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _daily_task_health_enabled() -> bool:
+    return _parse_bool(
+        os.environ.get("UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_ENABLED"),
+        True,
+    )
+
+
+def _daily_task_health_strict() -> bool:
+    return _parse_bool(
+        os.environ.get("UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_STRICT"),
+        False,
+    )
+
+
+def _truncate_text(value: Any, limit: int = DAILY_TASK_HEALTH_ERROR_LIMIT) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)]}..."
+
+
+def _daily_task_health_error_payload(exc: Exception) -> dict[str, Any]:
+    stack = ""
+    if hasattr(exc, "__traceback__"):
+        stack = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return {
+        "name": type(exc).__name__,
+        "message": _truncate_text(str(exc)),
+        "stack_preview": _truncate_text(stack, 1800) if stack else None,
+    }
+
+
+def _http_post_json(
+    *,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any] | list[dict[str, Any]],
+    timeout_seconds: int = 30,
+) -> Any:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    for key, value in headers.items():
+        req.add_header(key, value)
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        payload = resp.read().decode("utf-8", errors="replace")
+        if not payload.strip():
+            return None
+        return json.loads(payload)
+
+
+def _resolve_daily_task_health_config(
+    *,
+    env_name: str,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "enabled": _daily_task_health_enabled(),
+        "strict": _daily_task_health_strict(),
+        "task_key": DAILY_TASK_HEALTH_TASK_KEY,
+        "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
+        "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
+        "env_name": env_name,
+        "backfill_env_file": str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")).strip(),
+        "supabase_url": "",
+        "supabase_key": "",
+        "supabase_db_url": "",
+    }
+    if not config["enabled"]:
+        return config
+
+    loaded: dict[str, str] = {}
+    env_file = str(config["backfill_env_file"]).strip()
+    if env_file:
+        try:
+            loaded = _load_env_file(Path(env_file))
+        except OSError:
+            loaded = {}
+    config["supabase_url"] = str(
+        loaded.get("OBS_AQIDB_SUPABASE_URL")
+        or os.environ.get("OBS_AQIDB_SUPABASE_URL")
+        or "",
+    ).strip().rstrip("/")
+    config["supabase_key"] = str(
+        loaded.get("OBS_AQIDB_SECRET_KEY")
+        or os.environ.get("OBS_AQIDB_SECRET_KEY")
+        or "",
+    ).strip()
+    config["supabase_db_url"] = str(
+        loaded.get("OBS_AQIDB_SUPABASE_DB_URL")
+        or os.environ.get("OBS_AQIDB_SUPABASE_DB_URL")
+        or "",
+    ).strip()
+    return config
+
+
+def _daily_task_health_headers(supabase_key: str, schema: str) -> dict[str, str]:
+    return {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Accept-Profile": schema,
+        "Content-Profile": schema,
+    }
+
+
+def _daily_task_health_call_rpc(
+    config: Mapping[str, Any],
+    *,
+    rpc_name: str,
+    body: dict[str, Any],
+) -> Any:
+    supabase_url = str(config.get("supabase_url") or "").strip().rstrip("/")
+    supabase_key = str(config.get("supabase_key") or "").strip()
+    if not supabase_url or not supabase_key:
+        raise RuntimeError("daily task health missing Supabase URL/service key")
+    url = f"{supabase_url}/rest/v1/rpc/{rpc_name}"
+    headers = _daily_task_health_headers(
+        supabase_key,
+        DAILY_TASK_HEALTH_RPC_SCHEMA,
+    )
+    return _http_post_json(url=url, headers=headers, body=body)
+
+
+def _daily_task_health_start(
+    config: Mapping[str, Any],
+    *,
+    scheduled_for_date: str,
+    started_at_utc: str,
+    summary: dict[str, Any],
+    platform_run_id: str | None,
+    log_url: str | None,
+) -> str | None:
+    result = _daily_task_health_call_rpc(
+        config,
+        rpc_name="uk_aq_rpc_daily_task_started",
+        body={
+            "p": {
+                "task_key": DAILY_TASK_HEALTH_TASK_KEY,
+                "scheduled_for_date": scheduled_for_date,
+                "started_at": started_at_utc,
+                "summary": summary,
+                "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
+                "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
+                "platform_run_id": platform_run_id,
+                "log_url": log_url,
+            },
+        },
+    )
+    if isinstance(result, str):
+        return result
+    return None
+
+
+def _daily_task_health_finish(
+    config: Mapping[str, Any],
+    *,
+    run_id: str | None,
+    scheduled_for_date: str,
+    finished_at_utc: str,
+    summary: dict[str, Any],
+    platform_run_id: str | None,
+    log_url: str | None,
+) -> None:
+    payload = {
+        "summary": summary,
+        "finished_at": finished_at_utc,
+        "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
+        "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
+        "platform_run_id": platform_run_id,
+        "log_url": log_url,
+    }
+    if run_id:
+        _daily_task_health_call_rpc(
+            config,
+            rpc_name="uk_aq_rpc_daily_task_finished",
+            body={"p_run_id": run_id, "p": payload},
+        )
+    else:
+        _daily_task_health_call_rpc(
+            config,
+            rpc_name="uk_aq_rpc_daily_task_report_final",
+            body={
+                "p": {
+                    "task_key": DAILY_TASK_HEALTH_TASK_KEY,
+                    "status": "Finished",
+                    "scheduled_for_date": scheduled_for_date,
+                    "finished_at": finished_at_utc,
+                    "summary": summary,
+                    "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
+                    "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
+                    "platform_run_id": platform_run_id,
+                    "log_url": log_url,
+                },
+            },
+        )
+    _daily_task_health_call_rpc(
+        config,
+        rpc_name="uk_aq_rpc_recompute_daily_task_status",
+        body={"p_date": scheduled_for_date},
+    )
+
+
+def _daily_task_health_fail(
+    config: Mapping[str, Any],
+    *,
+    run_id: str | None,
+    scheduled_for_date: str,
+    failed_at_utc: str,
+    summary: dict[str, Any],
+    error_message: str,
+    error_payload: dict[str, Any],
+    platform_run_id: str | None,
+    log_url: str | None,
+) -> None:
+    payload = {
+        "summary": summary,
+        "failed_at": failed_at_utc,
+        "error_message": _truncate_text(error_message),
+        "error": error_payload,
+        "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
+        "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
+        "platform_run_id": platform_run_id,
+        "log_url": log_url,
+    }
+    if run_id:
+        _daily_task_health_call_rpc(
+            config,
+            rpc_name="uk_aq_rpc_daily_task_failed",
+            body={"p_run_id": run_id, "p": payload},
+        )
+    else:
+        _daily_task_health_call_rpc(
+            config,
+            rpc_name="uk_aq_rpc_daily_task_report_final",
+            body={
+                "p": {
+                    "task_key": DAILY_TASK_HEALTH_TASK_KEY,
+                    "status": "Failed",
+                    "scheduled_for_date": scheduled_for_date,
+                    "failed_at": failed_at_utc,
+                    "summary": summary,
+                    "error_message": _truncate_text(error_message),
+                    "error": error_payload,
+                    "source_repo": DAILY_TASK_HEALTH_SOURCE_REPO,
+                    "source_worker": DAILY_TASK_HEALTH_SOURCE_WORKER,
+                    "platform_run_id": platform_run_id,
+                    "log_url": log_url,
+                },
+            },
+        )
+    _daily_task_health_call_rpc(
+        config,
+        rpc_name="uk_aq_rpc_recompute_daily_task_status",
+        body={"p_date": scheduled_for_date},
+    )
+
+
 def _collect_guardrail_errors(cli_env: str, env: dict[str, str]) -> list[str]:
     errors: list[str] = []
     if env["UK_AQ_ENV_NAME"] != cli_env:
@@ -5055,12 +6901,53 @@ def collect_preflight_errors(
                 )
 
     # Source adapter dependency checks (local import only; no network in preflight).
-    if args.source in {"openaq", "all", "sensor-community", "sensorcommunity"}:
+    if args.source in {"openaq", "all", "sensorcommunity", "uk_air_sos"}:
         for module_name in ("gzip", "hashlib", "urllib.request", "sqlite3"):
             try:
                 __import__(module_name)
             except Exception as exc:  # pragma: no cover - defensive
                 errors.append(f"required Python module '{module_name}' failed to import ({exc}).")
+
+    daily_task_health_enabled = _daily_task_health_enabled()
+    if daily_task_health_enabled:
+        env_file_raw = str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")).strip()
+        loaded_daily_env: dict[str, str] = {}
+        if not env_file_raw:
+            errors.append(
+                "UK_AQ_BACKFILL_ENV_FILE is required when daily task health reporting is enabled.",
+            )
+        else:
+            env_file_path = Path(env_file_raw)
+            if not env_file_path.exists():
+                errors.append(f"UK_AQ_BACKFILL_ENV_FILE does not exist: {env_file_path}")
+            elif not env_file_path.is_file():
+                errors.append(f"UK_AQ_BACKFILL_ENV_FILE is not a regular file: {env_file_path}")
+            elif not os.access(env_file_path, os.R_OK):
+                errors.append(f"UK_AQ_BACKFILL_ENV_FILE is not readable: {env_file_path}")
+            else:
+                loaded_daily_env = _load_env_file(env_file_path)
+
+        if env_file_raw:
+            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
+            if f"/{other_env}/" in env_file_raw:
+                errors.append(
+                    f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
+                )
+
+        obs_supabase_url = str(
+            loaded_daily_env.get("OBS_AQIDB_SUPABASE_URL", ""),
+        ).strip()
+        obs_supabase_key = str(
+            loaded_daily_env.get("OBS_AQIDB_SECRET_KEY", ""),
+        ).strip()
+        if not obs_supabase_url:
+            errors.append(
+                "OBS_AQIDB_SUPABASE_URL is required in UK_AQ_BACKFILL_ENV_FILE when daily task health reporting is enabled.",
+            )
+        if not obs_supabase_key:
+            errors.append(
+                "OBS_AQIDB_SECRET_KEY is required in UK_AQ_BACKFILL_ENV_FILE when daily task health reporting is enabled.",
+            )
 
     if args.run_backfill:
         wrapper_raw = resolve_integrity_backfill_wrapper()
@@ -5194,6 +7081,8 @@ def collect_preflight_errors(
         "check_only": bool(args.check_only),
         "dry_run": bool(args.dry_run),
         "run_backfill": bool(args.run_backfill),
+        "daily_task_health_enabled": daily_task_health_enabled,
+        "daily_task_health_strict": _daily_task_health_strict(),
         "cross_check_enabled": not args.skip_cross_check,
         "paths": {
             "root": env["UK_AQ_HISTORY_INTEGRITY_ROOT"],
@@ -5380,6 +7269,61 @@ def open_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def normalize_source_key_sensorcommunity(
+    conn: sqlite3.Connection,
+    log: logging.Logger,
+) -> None:
+    """Canonicalize legacy Sensor.Community source_key variants in-place."""
+    normalized_expr = "lower(replace(replace(source_key, '-', ''), '_', ''))"
+    target_key = SC_SOURCE_KEY
+    changed_total = 0
+
+    # Lookup table has a PK on (source_key, source_location_id, timeseries_id).
+    # Delete legacy rows that would collide with an existing canonical row first.
+    changed_total += conn.execute(
+        f"""
+        DELETE FROM source_station_timeseries_lookup AS legacy
+        WHERE {normalized_expr} = 'sensorcommunity'
+          AND source_key <> ?
+          AND EXISTS (
+            SELECT 1
+            FROM source_station_timeseries_lookup AS canonical
+            WHERE canonical.source_key = ?
+              AND canonical.source_location_id = legacy.source_location_id
+              AND canonical.timeseries_id = legacy.timeseries_id
+          )
+        """,
+        (target_key, target_key),
+    ).rowcount or 0
+    changed_total += conn.execute(
+        f"""
+        UPDATE source_station_timeseries_lookup
+        SET source_key = ?
+        WHERE {normalized_expr} = 'sensorcommunity'
+          AND source_key <> ?
+        """,
+        (target_key, target_key),
+    ).rowcount or 0
+
+    for table_name in ("source_file_state", "source_file_events"):
+        changed_total += conn.execute(
+            f"""
+            UPDATE {table_name}
+            SET source_key = ?
+            WHERE {normalized_expr} = 'sensorcommunity'
+              AND source_key <> ?
+            """,
+            (target_key, target_key),
+        ).rowcount or 0
+
+    if changed_total > 0:
+        conn.commit()
+        log.info(
+            "source_key normalization: canonicalized Sensor.Community rows=%s",
+            changed_total,
+        )
+
+
 def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     log_path = Path(log_dir) / f"run-{run_compact}.log"
@@ -5450,6 +7394,19 @@ def format_summary_md(s: dict[str, Any]) -> str:
         if snap.get("error"):
             lines.append(f"- Error:         {snap['error']}")
         lines.append("")
+    lookup_counts = s.get("lookup_source_counts") or {}
+    if lookup_counts:
+        lines.extend([
+            "## Active lookup counts",
+            "",
+        ])
+        for source_key in ("openaq", "sensorcommunity", "uk_air_sos"):
+            entry = lookup_counts.get(source_key) or {}
+            lines.append(
+                f"- {source_key}: stations={int(entry.get('active_stations', 0))} "
+                f"timeseries={int(entry.get('active_timeseries', 0))}"
+            )
+        lines.append("")
 
     sc = s.get("sensor_community") or {}
     if sc.get("ran") or sc.get("skipped_reason"):
@@ -5497,6 +7454,65 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 )
             if len(sc_changed) > 50:
                 lines.append(f"- ... {len(sc_changed) - 50} more")
+        lines.append("")
+
+    cc_for_sos = s.get("cross_check") or {}
+    sos = s.get("uk_air_sos") or {}
+    if sos.get("ran") or sos.get("skipped_reason"):
+        lines.extend([
+            "## UK-AIR SOS",
+            "",
+            f"- Ran:            {bool(sos.get('ran'))}",
+            f"- Stations:       {sos.get('stations', 0)}",
+            f"- Days:           {sos.get('days', 0)}",
+            f"- Station-days checked: {sos.get('station_days_checked', sos.get('head_checked', 0))}",
+            f"- Successful snapshots: {sos.get('snapshots_successful', 0)}",
+            f"- No-data snapshots: {sos.get('snapshots_no_data', 0)}",
+            f"- Not-found (404): {sos.get('not_found', 0)}",
+            f"- Not-found suppressed: {sos.get('not_found_suppressed', 0)}",
+            f"- First seen:     {sos.get('first_seen', 0)}",
+            f"- Changed:        {sos.get('changed', 0)}",
+            f"- Reappeared:     {sos.get('reappeared', 0)}",
+            f"- Unchanged:      {sos.get('unchanged_after_download', 0)}",
+            f"- Missing:        {sos.get('missing', 0)}",
+            f"- Temporary errors:{sos.get('temporary_errors', 0)}",
+            f"- Permanent errors:{sos.get('permanent_errors', 0)}",
+            f"- Rows counted:   {sos.get('rows_counted', 0)}",
+            f"- Downloaded MB:  {round(sos.get('downloaded_bytes', 0) / (1024 * 1024), 4)}",
+            f"- Cache keep policy: {sos.get('keep_api_snapshots_policy') or '(default)'}",
+            f"- Not-found cooldown secs: {sos.get('not_found_cooldown_seconds', 0)}",
+            f"- Cross-check discrepancies: {cc_for_sos.get('discrepancy_total', 0)}",
+            f"- Observation repairs: attempted={cc_for_sos.get('observation_backfills_attempted', cc_for_sos.get('backfills_attempted', 0))} ok={cc_for_sos.get('observation_backfills_ok', cc_for_sos.get('backfills_ok', 0))} failed={cc_for_sos.get('observation_backfills_failed', cc_for_sos.get('backfills_failed', 0))}",
+            f"- AQI rebuilds: queued={cc_for_sos.get('aqi_rebuilds_queued_total', 0)} complete={cc_for_sos.get('aqi_rebuilds_complete', 0)} failed={cc_for_sos.get('aqi_rebuilds_failed', 0)}",
+            f"- Stopped for:    {sos.get('stopped_for') or '(none)'}",
+            f"- Backfills:      attempted={sos.get('backfills_attempted', 0)} ok={sos.get('backfills_ok', 0)} failed={sos.get('backfills_failed', 0)}",
+        ])
+        if sos.get("skipped_reason"):
+            lines.append(f"- Skipped reason: {sos['skipped_reason']}")
+        sos_first_seen = sos.get("first_seen_files") or []
+        if sos_first_seen:
+            lines.extend(["", "### First-seen station/day snapshots (uk_air_sos, baselined — not backfilled)", ""])
+            for entry in sos_first_seen[:50]:
+                lines.append(
+                    f"- {entry['station_ref']} / {entry['day']} "
+                    f"(event_id={entry.get('event_id')}, "
+                    f"type={entry.get('event_type')}, "
+                    f"timeseries={entry.get('timeseries_ids')})"
+                )
+            if len(sos_first_seen) > 50:
+                lines.append(f"- ... {len(sos_first_seen) - 50} more")
+        sos_changed = sos.get("changed_files") or []
+        if sos_changed:
+            lines.extend(["", "### Changed station/day snapshots (uk_air_sos)", ""])
+            for entry in sos_changed[:50]:
+                lines.append(
+                    f"- {entry['station_ref']} / {entry['day']} "
+                    f"(event_id={entry.get('event_id')}, "
+                    f"type={entry.get('event_type')}, "
+                    f"timeseries={entry.get('timeseries_ids')})"
+                )
+            if len(sos_changed) > 50:
+                lines.append(f"- ... {len(sos_changed) - 50} more")
         lines.append("")
 
     oq = s.get("openaq") or {}
@@ -5569,6 +7585,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- cross_checks_r2_only:     {cc.get('cross_checks_r2_only', 0)}",
             f"- cross_checks_r2_manifest_missing: {cc.get('cross_checks_r2_manifest_missing', 0)}",
             f"- Observation repair candidates: days={cc.get('observation_backfill_candidate_days', cc.get('backfill_candidate_days', 0))} timeseries_ids={cc.get('observation_backfill_candidate_timeseries_ids', cc.get('backfill_candidate_timeseries_ids', 0))}",
+            f"- Source-change candidates:     days={cc.get('source_change_candidate_days', 0)} timeseries_ids={cc.get('source_change_candidate_timeseries_ids', 0)}",
             f"- Observation repairs:       attempted={cc.get('observation_backfills_attempted', cc.get('backfills_attempted', 0))} ok={cc.get('observation_backfills_ok', cc.get('backfills_ok', 0))} failed={cc.get('observation_backfills_failed', cc.get('backfills_failed', 0))}",
             f"- AQI rebuilds queued:       {cc.get('aqi_rebuilds_queued_from_obs_repair', 0)}",
             f"- AQI health checked connector-days: {cc.get('aqi_health_connector_days_checked', 0)}",
@@ -5671,6 +7688,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "observation_backfills_ok",
         "observation_backfills_failed",
         "aqi_rebuilds_queued_from_obs_repair",
+        "source_change_candidate_days",
+        "source_change_candidate_timeseries_ids",
         "aqi_health_connector_days_checked",
         "aqi_health_rebuilds_queued",
         "aqi_health_skipped_already_obs_repaired",
@@ -5683,6 +7702,10 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "aqi_rebuilds_complete",
         "aqi_rebuilds_failed",
         "aqi_rebuilds_skipped",
+        "uk_air_sos_snapshots_successful",
+        "uk_air_sos_snapshots_no_data",
+        "uk_air_sos_not_found",
+        "uk_air_sos_not_found_suppressed",
         "warnings_count",
         "errors_count",
     ):
@@ -5709,9 +7732,6 @@ def write_reports(
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    if args.source == "sensor-community":
-        # Accept either token; normalize internally for existing branch logic.
-        args.source = "sensorcommunity"
     env = load_env_or_die()
     preflight_summary = run_preflight_or_die(args, env)
 
@@ -5734,6 +7754,41 @@ def main(argv: list[str]) -> int:
     log.info("log_file=%s", log_path)
     log.info("preflight summary=%s", preflight_summary)
 
+    daily_task_health_config = _resolve_daily_task_health_config(env_name=args.env)
+    daily_task_health_enabled = bool(daily_task_health_config.get("enabled"))
+    daily_task_health_strict = bool(daily_task_health_config.get("strict"))
+    daily_task_health_run_id: str | None = None
+    daily_task_scheduled_for_date = started_at.date().isoformat()
+    daily_task_platform_run_id = f"{args.env}:{run_compact}"
+    if daily_task_health_enabled:
+        start_summary = {
+            "env": args.env,
+            "profile": args.profile,
+            "source": args.source,
+            "from_day": args.from_day,
+            "to_day": args.to_day,
+            "check_only": bool(args.check_only),
+            "dry_run": bool(args.dry_run),
+            "run_backfill": bool(args.run_backfill),
+            "skip_cross_check": bool(args.skip_cross_check),
+            "status": "started",
+            "log_path": str(log_path),
+        }
+        try:
+            daily_task_health_run_id = _daily_task_health_start(
+                daily_task_health_config,
+                scheduled_for_date=daily_task_scheduled_for_date,
+                started_at_utc=started_iso,
+                summary=start_summary,
+                platform_run_id=daily_task_platform_run_id,
+                log_url=str(log_path),
+            )
+        except Exception as exc:
+            log.warning("daily task health start failed: %s", exc)
+            if daily_task_health_strict:
+                log.error("daily task health strict mode enabled; aborting run")
+                return 1
+
     end_back_days = resolve_integrity_end_back_days(os.environ)
     from_day, to_day = compute_window(
         args.profile, args.from_day, args.to_day, os.environ
@@ -5751,6 +7806,7 @@ def main(argv: list[str]) -> int:
         )
 
     conn = open_db(env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
+    normalize_source_key_sensorcommunity(conn, log)
     run_id: int | None = None
     try:
         cur = conn.execute(
@@ -5812,7 +7868,21 @@ def main(argv: list[str]) -> int:
         empty_metrics = {"ran": False, "skipped_reason": None}
         openaq_metrics: dict[str, Any] = dict(empty_metrics)
         sc_metrics: dict[str, Any] = dict(empty_metrics)
+        sos_metrics: dict[str, Any] = dict(empty_metrics)
         cross_check_metrics: dict[str, Any] = dict(empty_metrics)
+        lookup_source_counts: dict[str, dict[str, int]] = (
+            collect_lookup_active_counts_by_source(conn)
+        )
+        sos_counts = lookup_source_counts.get("uk_air_sos", {})
+        log.info(
+            "lookup active counts: openaq stations=%s timeseries=%s; sensorcommunity stations=%s timeseries=%s; uk_air_sos stations=%s timeseries=%s",
+            (lookup_source_counts.get("openaq") or {}).get("active_stations", 0),
+            (lookup_source_counts.get("openaq") or {}).get("active_timeseries", 0),
+            (lookup_source_counts.get("sensorcommunity") or {}).get("active_stations", 0),
+            (lookup_source_counts.get("sensorcommunity") or {}).get("active_timeseries", 0),
+            sos_counts.get("active_stations", 0),
+            sos_counts.get("active_timeseries", 0),
+        )
 
         run_openaq = args.source in {"openaq", "all"} and snapshot_ok
         if args.source in {"openaq", "all"} and not run_openaq:
@@ -5841,6 +7911,21 @@ def main(argv: list[str]) -> int:
                 from_day=from_day, to_day=to_day,
                 dry_run=args.dry_run, run_backfill=args.run_backfill,
                 limits=limits, log=log, run_compact=run_compact,
+                concurrency=max(1, int(args.concurrency)),
+            )
+
+        run_sos = args.source in {"uk_air_sos", "all"} and snapshot_ok
+        if args.source in {"uk_air_sos", "all"} and not run_sos:
+            log.warning(
+                "uk_air_sos: skipped because core snapshot status=%s (need imported/reused)",
+                snapshot_result["status"],
+            )
+        if run_sos:
+            sos_metrics = check_uk_air_sos(
+                conn=conn, env_name=args.env, env=env,
+                from_day=from_day, to_day=to_day,
+                dry_run=args.dry_run, run_backfill=args.run_backfill,
+                limits=limits, log=log,
                 concurrency=max(1, int(args.concurrency)),
             )
 
@@ -5882,6 +7967,7 @@ def main(argv: list[str]) -> int:
                 run_compact=run_compact,
                 env=env,
                 source_filter=args.source,
+                uk_air_sos_metrics=sos_metrics,
                 dry_run=args.dry_run,
                 run_backfill=args.run_backfill,
                 limits=limits,
@@ -5916,8 +8002,16 @@ def main(argv: list[str]) -> int:
             )
             cross_check_metrics.update(aqi_rebuild_metrics)
 
-        any_adapter_ran = openaq_metrics.get("ran") or sc_metrics.get("ran")
-        any_stopped = openaq_metrics.get("stopped_for") or sc_metrics.get("stopped_for")
+        any_adapter_ran = (
+            openaq_metrics.get("ran")
+            or sc_metrics.get("ran")
+            or sos_metrics.get("ran")
+        )
+        any_stopped = (
+            openaq_metrics.get("stopped_for")
+            or sc_metrics.get("stopped_for")
+            or sos_metrics.get("stopped_for")
+        )
 
         # Decide top-level run status.
         if any_stopped:
@@ -5959,8 +8053,11 @@ def main(argv: list[str]) -> int:
                 f"snapshot {snapshot_result['status']}: {snapshot_result.get('error')}"
             )
 
-        for adapter_name, adapter_metrics in (("openaq", openaq_metrics),
-                                              ("sensorcommunity", sc_metrics)):
+        for adapter_name, adapter_metrics in (
+            ("openaq", openaq_metrics),
+            ("sensorcommunity", sc_metrics),
+            ("uk_air_sos", sos_metrics),
+        ):
             if adapter_metrics.get("ran"):
                 notes_parts.append(
                     f"{adapter_name} head_checked={adapter_metrics.get('head_checked', 0)} "
@@ -5991,6 +8088,8 @@ def main(argv: list[str]) -> int:
                     "cross-check-observation-repair "
                     f"candidates_days={cross_check_metrics.get('observation_backfill_candidate_days', cross_check_metrics.get('backfill_candidate_days', 0))} "
                     f"candidates_timeseries_ids={cross_check_metrics.get('observation_backfill_candidate_timeseries_ids', cross_check_metrics.get('backfill_candidate_timeseries_ids', 0))} "
+                    f"source_change_days={cross_check_metrics.get('source_change_candidate_days', 0)} "
+                    f"source_change_timeseries_ids={cross_check_metrics.get('source_change_candidate_timeseries_ids', 0)} "
                     f"attempted={cross_check_metrics.get('observation_backfills_attempted', cross_check_metrics.get('backfills_attempted', 0))} "
                     f"ok={cross_check_metrics.get('observation_backfills_ok', cross_check_metrics.get('backfills_ok', 0))} "
                     f"failed={cross_check_metrics.get('observation_backfills_failed', cross_check_metrics.get('backfills_failed', 0))} "
@@ -6030,7 +8129,11 @@ def main(argv: list[str]) -> int:
         notes = "; ".join(notes_parts) + "."
 
         def _sum(key: str) -> int:
-            return int(openaq_metrics.get(key, 0)) + int(sc_metrics.get(key, 0))
+            return (
+                int(openaq_metrics.get(key, 0))
+                + int(sc_metrics.get(key, 0))
+                + int(sos_metrics.get(key, 0))
+            )
 
         cross_check_backfills_attempted = int(
             cross_check_metrics.get(
@@ -6102,11 +8205,15 @@ def main(argv: list[str]) -> int:
             warnings_count_total += 1
         if sc_metrics.get("skipped_reason"):
             warnings_count_total += 1
+        if sos_metrics.get("skipped_reason"):
+            warnings_count_total += 1
         if cross_check_metrics.get("skipped_reason"):
             warnings_count_total += 1
         if openaq_metrics.get("stopped_for"):
             warnings_count_total += 1
         if sc_metrics.get("stopped_for"):
+            warnings_count_total += 1
+        if sos_metrics.get("stopped_for"):
             warnings_count_total += 1
 
         metrics: dict[str, Any] = {
@@ -6160,6 +8267,19 @@ def main(argv: list[str]) -> int:
             "sensor_community_sensors": sc_metrics.get("sensors", 0),
             "sensor_community_days": sc_metrics.get("days", 0),
             "sensor_community_index_fetched": sc_metrics.get("index_fetched", 0),
+            "uk_air_sos_stopped_for": sos_metrics.get("stopped_for"),
+            "uk_air_sos_stations": sos_metrics.get("stations", 0),
+            "uk_air_sos_days": sos_metrics.get("days", 0),
+            "uk_air_sos_station_days_checked": sos_metrics.get("station_days_checked", 0),
+            "uk_air_sos_rows_counted": sos_metrics.get("rows_counted", 0),
+            "uk_air_sos_snapshots_successful": sos_metrics.get("snapshots_successful", 0),
+            "uk_air_sos_snapshots_no_data": sos_metrics.get("snapshots_no_data", 0),
+            "uk_air_sos_not_found": sos_metrics.get("not_found", 0),
+            "uk_air_sos_not_found_suppressed": sos_metrics.get("not_found_suppressed", 0),
+            "uk_air_sos_temporary_errors": sos_metrics.get("temporary_errors", 0),
+            "uk_air_sos_permanent_errors": sos_metrics.get("permanent_errors", 0),
+            "uk_air_sos_lookup_active_stations": int(sos_counts.get("active_stations", 0)),
+            "uk_air_sos_lookup_active_timeseries": int(sos_counts.get("active_timeseries", 0)),
         }
 
         finished_at = utc_now()
@@ -6273,8 +8393,10 @@ def main(argv: list[str]) -> int:
             "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
             "log_path": str(log_path),
             "snapshot": snapshot_result,
+            "lookup_source_counts": lookup_source_counts,
             "openaq": openaq_metrics,
             "sensor_community": sc_metrics,
+            "uk_air_sos": sos_metrics,
             "cross_check": cross_check_metrics,
             "metrics": metrics,
             "notes": notes,
@@ -6299,6 +8421,53 @@ def main(argv: list[str]) -> int:
         log.info("report_json=%s", json_path)
         log.info("report_md=%s", md_path)
         log.info("done status=%s runtime_seconds=%s", status, runtime_seconds)
+        if daily_task_health_enabled:
+            finish_summary = {
+                "env": args.env,
+                "profile": args.profile,
+                "source": args.source,
+                "from_day": from_day,
+                "to_day": to_day,
+                "check_only": bool(args.check_only),
+                "dry_run": bool(args.dry_run),
+                "run_backfill": bool(args.run_backfill),
+                "skip_cross_check": bool(args.skip_cross_check),
+                "integrity_run_id": run_id,
+                "status": status,
+                "files_head_checked": metrics.get("files_head_checked", 0),
+                "files_downloaded": metrics.get("files_downloaded", 0),
+                "files_changed": metrics.get("files_changed", 0),
+                "files_first_seen": int(openaq_metrics.get("first_seen", 0)) + int(sc_metrics.get("first_seen", 0)) + int(sos_metrics.get("first_seen", 0)),
+                "cross_checks_total": metrics.get("cross_checks_total", 0),
+                "cross_checks_ok": metrics.get("cross_checks_ok", 0),
+                "cross_checks_mismatch": metrics.get("cross_checks_mismatch", 0),
+                "cross_checks_source_only": metrics.get("cross_checks_source_only", 0),
+                "cross_checks_r2_manifest_missing": metrics.get("cross_checks_r2_manifest_missing", 0),
+                "backfills_triggered": metrics.get("backfills_triggered", 0),
+                "backfills_ok": metrics.get("backfills_ok", 0),
+                "backfills_failed": metrics.get("backfills_failed", 0),
+                "aqi_rebuilds_queued": metrics.get("aqi_rebuilds_queued_total", 0),
+                "aqi_rebuilds_ok": metrics.get("aqi_rebuilds_complete", 0),
+                "aqi_rebuilds_failed": metrics.get("aqi_rebuilds_failed", 0),
+                "runtime_seconds": runtime_seconds,
+                "report_json_path": str(json_path),
+                "report_md_path": str(md_path),
+                "log_path": str(log_path),
+            }
+            try:
+                _daily_task_health_finish(
+                    daily_task_health_config,
+                    run_id=daily_task_health_run_id,
+                    scheduled_for_date=daily_task_scheduled_for_date,
+                    finished_at_utc=finished_iso,
+                    summary=finish_summary,
+                    platform_run_id=daily_task_platform_run_id,
+                    log_url=str(log_path),
+                )
+            except Exception as exc:
+                log.warning("daily task health finish failed: %s", exc)
+                if daily_task_health_strict:
+                    raise
         return 0
     except Exception as exc:
         log.exception("run failed: %s", exc)
@@ -6318,6 +8487,39 @@ def main(argv: list[str]) -> int:
                 conn.commit()
             except Exception:
                 pass
+        if daily_task_health_enabled:
+            failed_iso = fmt_iso(utc_now())
+            fail_summary = {
+                "env": args.env,
+                "profile": args.profile,
+                "source": args.source,
+                "from_day": from_day if "from_day" in locals() else args.from_day,
+                "to_day": to_day if "to_day" in locals() else args.to_day,
+                "check_only": bool(args.check_only),
+                "dry_run": bool(args.dry_run),
+                "run_backfill": bool(args.run_backfill),
+                "skip_cross_check": bool(args.skip_cross_check),
+                "integrity_run_id": run_id,
+                "status": "error",
+                "runtime_seconds": round(time.monotonic() - started_mono, 3),
+                "log_path": str(log_path),
+            }
+            try:
+                _daily_task_health_fail(
+                    daily_task_health_config,
+                    run_id=daily_task_health_run_id,
+                    scheduled_for_date=daily_task_scheduled_for_date,
+                    failed_at_utc=failed_iso,
+                    summary=fail_summary,
+                    error_message=str(exc),
+                    error_payload=_daily_task_health_error_payload(exc),
+                    platform_run_id=daily_task_platform_run_id,
+                    log_url=str(log_path),
+                )
+            except Exception as health_exc:
+                log.warning("daily task health fail-report failed: %s", health_exc)
+                if daily_task_health_strict:
+                    raise
         return 1
     finally:
         conn.close()

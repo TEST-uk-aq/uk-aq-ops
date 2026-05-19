@@ -84,6 +84,7 @@ R2_HISTORY_DAYS_API_MAX_DAYS = max(1, min(3660, _raw_r2_history_days_max))
 OBS_AQIDB_SUPABASE_URL = str(os.getenv("OBS_AQIDB_SUPABASE_URL") or "").strip()
 OBS_AQIDB_SECRET_KEY = str(os.getenv("OBS_AQIDB_SECRET_KEY") or "").strip()
 PUBLIC_SCHEMA = os.getenv("UK_AQ_PUBLIC_SCHEMA", "uk_aq_public")
+OPS_SCHEMA = os.getenv("UK_AQ_OPS_SCHEMA", "uk_aq_ops")
 R2_BACKUP_WINDOW_RPC = os.getenv("UK_AQ_R2_HISTORY_WINDOW_RPC", "uk_aq_rpc_r2_history_window")
 UK_AQ_DROPBOX_ROOT = str(os.getenv("UK_AQ_DROPBOX_ROOT") or "CIC-Test").strip()
 UK_AQ_DROPBOX_LOCAL_ROOT = str(os.getenv("UK_AQ_DROPBOX_LOCAL_ROOT") or "").strip()
@@ -149,6 +150,10 @@ STORAGE_COVERAGE_CACHE_TTL_SECONDS = 6 * 60 * 60
 DROPBOX_HISTORY_MTIME_CACHE_TTL_SECONDS = max(
     5,
     int(os.getenv("UK_AQ_DROPBOX_MTIME_CACHE_TTL_SECONDS", "20")),
+)
+DAILY_TASK_RUNS_DASHBOARD_MAX_ROWS = max(
+    50,
+    int(os.getenv("UK_AQ_DAILY_TASK_RUNS_DASHBOARD_MAX_ROWS", "500")),
 )
 UTC_DATETIME_MIN = datetime.min.replace(tzinfo=timezone.utc)
 R2_BYTES_PER_GB = 1024 ** 3
@@ -1494,6 +1499,77 @@ def _parse_iso_day(value: Any) -> Optional[date]:
         return datetime.fromisoformat(normalized).date()
     except ValueError:
         return None
+
+
+def _fetch_daily_task_runs_dashboard_rows(
+    *,
+    scheduled_day: date,
+    mode: str,
+) -> List[Dict[str, Any]]:
+    if mode not in {"latest", "all"}:
+        raise ValueError("mode must be latest or all")
+    if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
+        raise RuntimeError(
+            "ObsAQIDB is not configured (set OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY)."
+        )
+
+    base_url = _ensure_allowed_base_url(
+        f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
+    )
+    headers = _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=OPS_SCHEMA)
+    params: Dict[str, str] = {
+        "select": (
+            "run_id,task_key,task_name,platform,source,scheduled_for_date,scheduled_time_utc,"
+            "scheduled_at_utc,attempt,raw_status,started_at,finished_at,failed_at,updated_at,"
+            "duration_seconds,summary,error_message,log_url,effective_status,scheduled_or_started_at,"
+            "finished_or_failed_at,is_failed,is_overdue,is_not_started,task_day_rank"
+        ),
+        "scheduled_for_date": f"eq.{scheduled_day.isoformat()}",
+        "order": "updated_at.desc.nullslast,run_id.desc",
+        "limit": str(DAILY_TASK_RUNS_DASHBOARD_MAX_ROWS),
+    }
+    if mode == "latest":
+        params["task_day_rank"] = "eq.1"
+
+    rows = _fetch_json(
+        f"{base_url}/daily_task_runs_dashboard",
+        headers,
+        params,
+    )
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized_rows.append(
+            {
+                "run_id": row.get("run_id"),
+                "task_key": row.get("task_key"),
+                "task_name": row.get("task_name"),
+                "platform": row.get("platform"),
+                "source": row.get("source"),
+                "scheduled_for_date": row.get("scheduled_for_date"),
+                "scheduled_time_utc": row.get("scheduled_time_utc"),
+                "scheduled_at_utc": row.get("scheduled_at_utc"),
+                "attempt": row.get("attempt"),
+                "raw_status": row.get("raw_status"),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "failed_at": row.get("failed_at"),
+                "updated_at": row.get("updated_at"),
+                "duration_seconds": row.get("duration_seconds"),
+                "summary": row.get("summary"),
+                "error_message": row.get("error_message"),
+                "log_url": row.get("log_url"),
+                "effective_status": row.get("effective_status"),
+                "scheduled_or_started_at": row.get("scheduled_or_started_at"),
+                "finished_or_failed_at": row.get("finished_or_failed_at"),
+                "is_failed": row.get("is_failed"),
+                "is_overdue": row.get("is_overdue"),
+                "is_not_started": row.get("is_not_started"),
+                "task_day_rank": row.get("task_day_rank"),
+            }
+        )
+    return normalized_rows
 
 
 def _empty_dropbox_backup_days() -> Dict[str, Set[date]]:
@@ -3640,6 +3716,7 @@ def _build_dashboard(
 ) -> Dict[str, Any]:
     headers = _postgrest_headers(service_role_key)
     project_ref = _project_ref_from_base_url(base_url)
+    obs_aqidb_project_ref = _project_ref_from_base_url(OBS_AQIDB_SUPABASE_URL)
 
     connectors = _fetch_all(
         base_url,
@@ -3927,6 +4004,7 @@ def _build_dashboard(
 
     return {
         "project_ref": project_ref,
+        "obs_aqidb_project_ref": obs_aqidb_project_ref,
         "generated_at": now.isoformat().replace("+00:00", "Z"),
         "dispatch_cursor": next_dispatch_cursor,
         "buckets": list(BUCKETS),
@@ -4084,6 +4162,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/operations_dropbox_mtime":
                 self._serve_operations_dropbox_mtime(parsed)
+                return
+            if parsed.path == "/api/daily_task_runs":
+                self._serve_daily_task_runs(parsed)
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as exc:
@@ -4448,6 +4529,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
             datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         )
         payload = json.dumps(payload_data, indent=2)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload.encode("utf-8"))
+
+    def _serve_daily_task_runs(self, parsed) -> None:
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        mode = ((query.get("mode") or ["latest"])[0] or "latest").strip().lower()
+        day_text = ((query.get("day") or [""])[0] or "").strip()
+        selected_day = _parse_iso_day(day_text) if day_text else None
+        if selected_day is None:
+            selected_day = datetime.now(timezone.utc).date()
+
+        if mode not in {"latest", "all"}:
+            payload = json.dumps({"error": "mode must be latest or all"}, indent=2)
+            self.send_response(HTTPStatus.BAD_REQUEST)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        try:
+            rows = _fetch_daily_task_runs_dashboard_rows(
+                scheduled_day=selected_day,
+                mode=mode,
+            )
+        except Exception as exc:
+            payload = json.dumps({"error": str(exc)}, indent=2)
+            self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        payload = json.dumps(
+            {
+                "day": selected_day.isoformat(),
+                "mode": mode,
+                "rows": rows,
+                "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+            indent=2,
+        )
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")

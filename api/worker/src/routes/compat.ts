@@ -8,6 +8,8 @@ const GET_ROUTES = new Set([
   "/api/storage_coverage",
   "/api/r2_metrics",
   "/api/r2_connector_counts",
+  "/api/daily_task_runs",
+  "/api/operations_dropbox_mtime",
 ]);
 
 const POST_ROUTES = new Set([
@@ -22,6 +24,8 @@ const GET_ROUTE_CACHE_SECONDS: Record<string, number> = {
   "/api/storage_coverage": 300,
   "/api/r2_metrics": 300,
   "/api/r2_connector_counts": 300,
+  "/api/daily_task_runs": 120,
+  "/api/operations_dropbox_mtime": 30,
 };
 
 function shouldBypassCache(request: Request): boolean {
