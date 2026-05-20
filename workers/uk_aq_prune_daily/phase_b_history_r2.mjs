@@ -1038,7 +1038,7 @@ export function buildConnectorManifestForTest(args) {
 }
 
 function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, backedUpAtUtc }) {
-  const sourceFiles = connectorManifests.flatMap((manifest) =>
+  const files = connectorManifests.flatMap((manifest) =>
     (Array.isArray(manifest.files) ? manifest.files : []).map((entry) => ({
       connector_id: manifest.connector_id,
       key: entry.key,
@@ -1049,18 +1049,13 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
       max_timeseries_id: entry.max_timeseries_id ?? null,
       min_observed_at: entry.min_observed_at ?? null,
       max_observed_at: entry.max_observed_at ?? null,
-      timeseries_row_counts: entry.timeseries_row_counts || null,
     }))
   );
-  const files = stripTimeseriesCountsFromFileEntries(sourceFiles);
 
   const parquetObjectKeys = uniqueSorted(files.map((entry) => entry.key));
   const totalRows = connectorManifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
   const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
   const connectorIds = connectorManifests.map((manifest) => Number(manifest.connector_id));
-  const timeseriesRowCounts =
-    aggregateTimeseriesRowCounts(connectorManifests)
-    ?? aggregateTimeseriesRowCounts(sourceFiles);
 
   const minObservedAt = connectorManifests.reduce(
     (current, manifest) => minIso(current, manifest.min_observed_at || null),
@@ -1085,7 +1080,6 @@ function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, ba
     file_count: files.length,
     total_bytes: totalBytes,
     files,
-    timeseries_row_counts: timeseriesRowCounts,
     connector_manifests: connectorManifests.map((manifest) => ({
       connector_id: manifest.connector_id,
       manifest_key: manifest.manifest_key,

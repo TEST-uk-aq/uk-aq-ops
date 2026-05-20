@@ -20,6 +20,9 @@ export const INDEX_TREE_KEYS = Object.freeze([
   "observations_timeseries",
   "aqilevels_timeseries",
 ]);
+export const COMMITTED_CONNECTOR_UNIT_KEYS = Object.freeze([
+  "observations",
+]);
 
 export const DEFAULT_INVENTORY_REL_PATH = "history/_index/backup_inventory_v1.json";
 

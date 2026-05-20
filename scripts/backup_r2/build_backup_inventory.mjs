@@ -4,7 +4,8 @@
 // The inventory lives at <source-root>/<inventory-rel-path> (default
 // history/_index/backup_inventory_v1.json) and records one entry per backup
 // unit: per-domain day manifests, the four *_latest.json index files, and the
-// per-(day, connector) manifests under the timeseries index trees.
+// per-(day, connector) manifests under the timeseries index trees, plus
+// committed observations connector manifests.
 //
 // On subsequent runs, `rclone lsjson` is used to compare each remote file's
 // size + MD5 etag against the previous inventory; matching entries are reused
@@ -28,6 +29,7 @@ import {
   uploadFromTempFile,
 } from "./lib/rclone.mjs";
 import {
+  COMMITTED_CONNECTOR_UNIT_KEYS,
   DOMAIN_NAMES,
   INDEX_FILE_KEYS,
   INDEX_TREE_KEYS,
@@ -60,6 +62,8 @@ const DEFAULT_REPORT_OUT =
 
 const DAY_MANIFEST_PATTERN = /^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/;
 const INDEX_TREE_UNIT_PATTERN =
+  /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
+const COMMITTED_CONNECTOR_MANIFEST_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
 
 function usage() {
@@ -437,6 +441,55 @@ function scanIndexTree({
   return { treeKey, units };
 }
 
+// ---- Phase: committed per-(day, connector) observation manifests ----
+
+function scanCommittedConnectorManifests({
+  rcloneBin,
+  sourceRoot,
+  domainPrefix,
+  previousUnits,
+  excludeRelativePaths,
+  stats,
+}) {
+  const sourcePath = joinTargetPath(sourceRoot, domainPrefix);
+  // Connector manifests live at
+  // <domain>/day_utc=*/connector_id=*/manifest.json — depth 3.
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, sourcePath, { maxDepth: 3 });
+  const units = {};
+  for (const entry of lsjsonEntries) {
+    const relPath = String(entry?.Path || "");
+    if (!COMMITTED_CONNECTOR_MANIFEST_PATTERN.test(relPath)) continue;
+    const unitRelativePath = `${domainPrefix}/${relPath}`;
+    if (excludeRelativePaths.has(unitRelativePath)) continue;
+    stats.committed_connector_units_listed += 1;
+
+    const currentMeta = extractLsjsonMetadata(entry);
+    recordMd5Availability(stats, currentMeta.has_md5);
+    const previousEntry = previousUnits?.[relPath] || null;
+    const prevMeta = previousMetadata(previousEntry, "size");
+    const reuseClass = previousEntry && previousEntry.hash
+      ? classifyReuse(currentMeta, prevMeta)
+      : null;
+
+    if (reuseClass) {
+      units[relPath] = { ...previousEntry };
+      stats.committed_connector_units_skipped += 1;
+      recordReuseOutcome(stats, reuseClass);
+      continue;
+    }
+
+    const unitSourcePath = joinTargetPath(sourceRoot, unitRelativePath);
+    const fileText = rcloneCat(rcloneBin, unitSourcePath);
+    stats.committed_connector_units_reread += 1;
+    units[relPath] = buildFileInventoryEntry({
+      relativePath: unitRelativePath,
+      fileText,
+      lsjsonEntry: entry,
+    });
+  }
+  return units;
+}
+
 // ---- Inventory composition ----
 
 // Deterministic key ordering: sort object keys alphabetically at every level.
@@ -472,10 +525,17 @@ function computeSummary(inventory) {
       inventory.index_tree_units?.[treeKey]?.units || {},
     ).length;
   }
+  const committedConnectorUnitCount = {};
+  for (const key of COMMITTED_CONNECTOR_UNIT_KEYS) {
+    committedConnectorUnitCount[key] = Object.keys(
+      inventory.committed_connector_units?.[key]?.units || {},
+    ).length;
+  }
   return {
     domain_day_count: domainDayCount,
     index_file_count: indexFileCount,
     index_tree_unit_count: indexTreeUnitCount,
+    committed_connector_unit_count: committedConnectorUnitCount,
   };
 }
 
@@ -512,6 +572,9 @@ async function main() {
       observations_timeseries: { units: {} },
       aqilevels_timeseries: { units: {} },
     },
+    committed_connector_units: {
+      observations: { units: {} },
+    },
     summary: {},
   };
 
@@ -525,6 +588,9 @@ async function main() {
     index_tree_units_listed: 0,
     index_tree_units_reread: 0,
     index_tree_units_skipped: 0,
+    committed_connector_units_listed: 0,
+    committed_connector_units_reread: 0,
+    committed_connector_units_skipped: 0,
     // MD5 availability per lsjson entry across all three categories.
     // r2_md5_missing_count > 0 means rclone didn't return Hashes.md5 for
     // some objects (despite --hash --hash-type MD5) — could be multipart-style
@@ -606,6 +672,23 @@ async function main() {
   }
   stats.elapsed_ms.index_trees = Date.now() - tTrees;
 
+  // Phase: committed observations connector manifests
+  const tConnectorManifests = Date.now();
+  if (args.domains.includes("observations")) {
+    const previousUnits =
+      previousInventory?.committed_connector_units?.observations?.units || {};
+    const units = scanCommittedConnectorManifests({
+      rcloneBin: args.rclone_bin,
+      sourceRoot: args.source_root,
+      domainPrefix: DEFAULT_DOMAIN_PREFIXES.observations,
+      previousUnits,
+      excludeRelativePaths,
+      stats,
+    });
+    inventory.committed_connector_units.observations = { units };
+  }
+  stats.elapsed_ms.committed_connector_units = Date.now() - tConnectorManifests;
+
   inventory.summary = computeSummary(inventory);
 
   const inventoryJson = buildDeterministicJson(inventory);
@@ -634,7 +717,10 @@ async function main() {
   // otherwise they're either net-new days or days whose signals didn't match.
   // (Index files / tree units have their own per-category counters above.)
   const totalRereadAllCategories =
-    stats.manifests_reread + stats.index_files_reread + stats.index_tree_units_reread;
+    stats.manifests_reread
+    + stats.index_files_reread
+    + stats.index_tree_units_reread
+    + stats.committed_connector_units_reread;
   const rereadFullRebuild = args.full_rebuild ? totalRereadAllCategories : 0;
   const rereadNewOrChanged = args.full_rebuild ? 0 : totalRereadAllCategories;
 
@@ -672,6 +758,9 @@ async function main() {
     index_tree_units_listed: stats.index_tree_units_listed,
     index_tree_units_reread: stats.index_tree_units_reread,
     index_tree_units_skipped: stats.index_tree_units_skipped,
+    committed_connector_units_listed: stats.committed_connector_units_listed,
+    committed_connector_units_reread: stats.committed_connector_units_reread,
+    committed_connector_units_skipped: stats.committed_connector_units_skipped,
     r2_md5_available_count: stats.r2_md5_available_count,
     r2_md5_missing_count: stats.r2_md5_missing_count,
     reuse_by_r2_md5_size: stats.reuse_by_r2_md5_size,

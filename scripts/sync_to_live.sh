@@ -38,6 +38,7 @@ EXCLUDES=(
 
   # Secrets and environment config
   --exclude='.env'
+  --exclude='*.env'
   --exclude='.env.*'
   --exclude='supabase/config.toml'
   --exclude='supabase/.temp/'

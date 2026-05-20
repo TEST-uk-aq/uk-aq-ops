@@ -4713,7 +4713,7 @@ def _read_r2_timeseries_manifest_counts(
     manifest_prefix: str,
     day_utc: str,
     connector_id: int,
-) -> tuple[dict[int, int] | None, str | None]:
+) -> tuple[dict[int, int] | None, str | None, str | None]:
     manifest_path = (
         r2_history_root
         / manifest_prefix
@@ -4722,13 +4722,22 @@ def _read_r2_timeseries_manifest_counts(
         / "manifest.json"
     )
     if not manifest_path.is_file():
-        return None, f"manifest_missing:{manifest_path}"
+        return None, f"manifest_missing:{manifest_path}", None
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return None, f"manifest_invalid_json:{manifest_path}:{exc}"
-    counts = _normalize_timeseries_row_counts(payload.get("timeseries_row_counts"))
-    return counts, None
+        return None, f"manifest_invalid_json:{manifest_path}:{exc}", None
+    if "timeseries_row_counts" not in payload:
+        return {}, None, "timeseries_row_counts_missing"
+    raw_counts = payload.get("timeseries_row_counts")
+    if not isinstance(raw_counts, dict):
+        return {}, None, "timeseries_row_counts_invalid_type"
+    counts = _normalize_timeseries_row_counts(raw_counts)
+    if not raw_counts:
+        return counts, None, "timeseries_row_counts_empty_object"
+    if not counts:
+        return counts, None, "timeseries_row_counts_unusable_entries"
+    return counts, None, None
 
 
 def run_r2_cross_checks(
@@ -4815,15 +4824,17 @@ def run_r2_cross_checks(
         "source_only": 0,
         "r2_only": 0,
         "r2_manifest_missing": 0,
+        "r2_timeseries_counts_missing": 0,
     }
     discrepancy_total = 0
     discrepancies: list[dict[str, Any]] = []
     insert_rows: list[tuple[Any, ...]] = []
     manifest_missing_days = 0
+    counts_missing_days = 0
 
     for day_utc, connector_id in sorted(grouped.keys()):
         source_counts = grouped[(day_utc, connector_id)]
-        r2_counts, manifest_error = _read_r2_timeseries_manifest_counts(
+        r2_counts, manifest_error, counts_missing_reason = _read_r2_timeseries_manifest_counts(
             root, manifest_prefix, day_utc, connector_id,
         )
         if r2_counts is None:
@@ -4848,6 +4859,34 @@ def run_r2_cross_checks(
                     run_id, env_name, connector_id, day_utc, timeseries_id,
                     source_row_count, None, None, status, checked_at_utc,
                     manifest_error,
+                ))
+            continue
+        if counts_missing_reason:
+            counts_missing_days += 1
+            for timeseries_id, source_row_count in sorted(source_counts.items()):
+                status = "r2_timeseries_counts_missing"
+                status_counts[status] += 1
+                discrepancy_total += 1
+                notes = (
+                    "timeseries_row_counts missing/invalid in R2 manifest "
+                    f"({counts_missing_reason}); metadata enrichment required before cross-check repair"
+                )
+                entry = {
+                    "status": status,
+                    "connector_id": connector_id,
+                    "day_utc": day_utc,
+                    "timeseries_id": timeseries_id,
+                    "source_row_count": source_row_count,
+                    "r2_row_count": None,
+                    "delta": None,
+                    "notes": notes,
+                }
+                if len(discrepancies) < CROSS_CHECK_MAX_REPORT_DISCREPANCIES:
+                    discrepancies.append(entry)
+                insert_rows.append((
+                    run_id, env_name, connector_id, day_utc, timeseries_id,
+                    source_row_count, None, None, status, checked_at_utc,
+                    notes,
                 ))
             continue
 
@@ -4926,12 +4965,14 @@ def run_r2_cross_checks(
         "source_rows": len(rows),
         "connector_days": len(grouped),
         "manifests_missing_days": manifest_missing_days,
+        "timeseries_counts_missing_days": counts_missing_days,
         "cross_checks_total": sum(status_counts.values()),
         "cross_checks_ok": status_counts["ok"],
         "cross_checks_mismatch": status_counts["mismatch"],
         "cross_checks_source_only": status_counts["source_only"],
         "cross_checks_r2_only": status_counts["r2_only"],
         "cross_checks_r2_manifest_missing": status_counts["r2_manifest_missing"],
+        "cross_checks_r2_timeseries_counts_missing": status_counts["r2_timeseries_counts_missing"],
         "discrepancy_total": discrepancy_total,
         "discrepancies_truncated_to": CROSS_CHECK_MAX_REPORT_DISCREPANCIES,
         "discrepancies": discrepancies,
@@ -4939,13 +4980,14 @@ def run_r2_cross_checks(
         "manifest_prefix": manifest_prefix,
     }
     log.info(
-        "cross-check done total=%s ok=%s mismatch=%s source_only=%s r2_only=%s manifest_missing=%s connector_days=%s source_rows=%s",
+        "cross-check done total=%s ok=%s mismatch=%s source_only=%s r2_only=%s manifest_missing=%s counts_missing=%s connector_days=%s source_rows=%s",
         metrics["cross_checks_total"],
         metrics["cross_checks_ok"],
         metrics["cross_checks_mismatch"],
         metrics["cross_checks_source_only"],
         metrics["cross_checks_r2_only"],
         metrics["cross_checks_r2_manifest_missing"],
+        metrics["cross_checks_r2_timeseries_counts_missing"],
         metrics["connector_days"],
         metrics["source_rows"],
     )
@@ -7578,12 +7620,14 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Source rows:              {cc.get('source_rows', 0)}",
             f"- Connector-days:           {cc.get('connector_days', 0)}",
             f"- Missing manifests:        {cc.get('manifests_missing_days', 0)}",
+            f"- Missing timeseries counts days: {cc.get('timeseries_counts_missing_days', 0)}",
             f"- cross_checks_total:       {cc.get('cross_checks_total', 0)}",
             f"- cross_checks_ok:          {cc.get('cross_checks_ok', 0)}",
             f"- cross_checks_mismatch:    {cc.get('cross_checks_mismatch', 0)}",
             f"- cross_checks_source_only: {cc.get('cross_checks_source_only', 0)}",
             f"- cross_checks_r2_only:     {cc.get('cross_checks_r2_only', 0)}",
             f"- cross_checks_r2_manifest_missing: {cc.get('cross_checks_r2_manifest_missing', 0)}",
+            f"- cross_checks_r2_timeseries_counts_missing: {cc.get('cross_checks_r2_timeseries_counts_missing', 0)}",
             f"- Observation repair candidates: days={cc.get('observation_backfill_candidate_days', cc.get('backfill_candidate_days', 0))} timeseries_ids={cc.get('observation_backfill_candidate_timeseries_ids', cc.get('backfill_candidate_timeseries_ids', 0))}",
             f"- Source-change candidates:     days={cc.get('source_change_candidate_days', 0)} timeseries_ids={cc.get('source_change_candidate_timeseries_ids', 0)}",
             f"- Observation repairs:       attempted={cc.get('observation_backfills_attempted', cc.get('backfills_attempted', 0))} ok={cc.get('observation_backfills_ok', cc.get('backfills_ok', 0))} failed={cc.get('observation_backfills_failed', cc.get('backfills_failed', 0))}",
@@ -8081,7 +8125,8 @@ def main(argv: list[str]) -> int:
                 f"mismatch={cross_check_metrics.get('cross_checks_mismatch', 0)} "
                 f"source_only={cross_check_metrics.get('cross_checks_source_only', 0)} "
                 f"r2_only={cross_check_metrics.get('cross_checks_r2_only', 0)} "
-                f"manifest_missing={cross_check_metrics.get('cross_checks_r2_manifest_missing', 0)}"
+                f"manifest_missing={cross_check_metrics.get('cross_checks_r2_manifest_missing', 0)} "
+                f"r2_timeseries_counts_missing={cross_check_metrics.get('cross_checks_r2_timeseries_counts_missing', 0)}"
             )
             if args.run_backfill:
                 notes_parts.append(
@@ -8235,6 +8280,9 @@ def main(argv: list[str]) -> int:
             "cross_checks_r2_only": int(cross_check_metrics.get("cross_checks_r2_only", 0) or 0),
             "cross_checks_r2_manifest_missing": int(
                 cross_check_metrics.get("cross_checks_r2_manifest_missing", 0) or 0
+            ),
+            "cross_checks_r2_timeseries_counts_missing": int(
+                cross_check_metrics.get("cross_checks_r2_timeseries_counts_missing", 0) or 0
             ),
             "observation_backfills_attempted": cross_check_backfills_attempted,
             "observation_backfills_ok": cross_check_backfills_ok,
@@ -8443,6 +8491,7 @@ def main(argv: list[str]) -> int:
                 "cross_checks_mismatch": metrics.get("cross_checks_mismatch", 0),
                 "cross_checks_source_only": metrics.get("cross_checks_source_only", 0),
                 "cross_checks_r2_manifest_missing": metrics.get("cross_checks_r2_manifest_missing", 0),
+                "cross_checks_r2_timeseries_counts_missing": metrics.get("cross_checks_r2_timeseries_counts_missing", 0),
                 "backfills_triggered": metrics.get("backfills_triggered", 0),
                 "backfills_ok": metrics.get("backfills_ok", 0),
                 "backfills_failed": metrics.get("backfills_failed", 0),

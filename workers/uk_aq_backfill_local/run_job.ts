@@ -2497,10 +2497,6 @@ function createObsDayManifest(args: {
     totalRows,
   );
 
-  const timeseriesRowCounts = aggregateTimeseriesRowCounts(
-    args.connectorManifests as Array<{ timeseries_row_counts?: Record<string, number> | null }>,
-  );
-
   return withManifestHash({
     day_utc: args.dayUtc,
     connector_id: null,
@@ -2513,7 +2509,6 @@ function createObsDayManifest(args: {
     file_count: files.length,
     total_bytes: totalBytes,
     files,
-    timeseries_row_counts: timeseriesRowCounts,
     connector_manifests: args.connectorManifests.map((manifest) => ({
       connector_id: manifest.connector_id,
       manifest_key: manifest.manifest_key,

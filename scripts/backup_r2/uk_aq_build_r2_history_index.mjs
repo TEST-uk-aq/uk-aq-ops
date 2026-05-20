@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import { rebuildR2HistoryIndexes } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 
 function usage() {
@@ -14,6 +15,10 @@ function usage() {
     "                                          timeseries_row_counts, read each parquet,",
     "                                          compute per-timeseries counts, patch the",
     "                                          manifest (new manifest_hash), and re-upload.",
+    "  --target <YYYY-MM-DD:connector_id>      Target one observations day+connector pair.",
+    "                                          Repeat flag to target multiple pairs.",
+    "  --targets-csv <path>                    CSV of targets with day_utc + connector_id",
+    "                                          columns (additional columns are ignored).",
     "  -h, --help                              Show this help",
     "",
     "Required env:",
@@ -50,6 +55,7 @@ function parseArgs(argv) {
     fetchConcurrency: undefined,
     maxKeys: undefined,
     computeMissingTimeseriesCounts: false,
+    observationsTargets: [],
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -81,6 +87,24 @@ function parseArgs(argv) {
       args.computeMissingTimeseriesCounts = true;
       continue;
     }
+    if (arg === "--target") {
+      const rawValue = String(argv[i + 1] || "").trim();
+      if (!rawValue) {
+        throw new Error("--target requires YYYY-MM-DD:connector_id");
+      }
+      args.observationsTargets.push(parseTargetArg(rawValue));
+      i += 1;
+      continue;
+    }
+    if (arg === "--targets-csv") {
+      const csvPath = String(argv[i + 1] || "").trim();
+      if (!csvPath) {
+        throw new Error("--targets-csv requires a file path");
+      }
+      args.observationsTargets.push(...loadTargetsFromCsv(csvPath));
+      i += 1;
+      continue;
+    }
     if (arg === "-h" || arg === "--help") {
       usage();
       process.exit(0);
@@ -88,7 +112,110 @@ function parseArgs(argv) {
     throw new Error(`Unknown arg: ${arg}`);
   }
 
+  if (args.observationsTargets.length > 0) {
+    if (!args.domains.includes("observations")) {
+      throw new Error("--target/--targets-csv may only be used when observations domain is selected");
+    }
+    const deduped = new Map();
+    for (const entry of args.observationsTargets) {
+      deduped.set(`${entry.day_utc}|${entry.connector_id}`, entry);
+    }
+    args.observationsTargets = Array.from(deduped.values()).sort((a, b) => {
+      if (a.day_utc !== b.day_utc) {
+        return a.day_utc.localeCompare(b.day_utc);
+      }
+      return a.connector_id - b.connector_id;
+    });
+  }
+
   return args;
+}
+
+function parseIsoDay(value) {
+  const day = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    return "";
+  }
+  const ms = Date.parse(`${day}T00:00:00.000Z`);
+  if (Number.isNaN(ms)) {
+    return "";
+  }
+  return day;
+}
+
+function parseConnectorId(value, flagName = "connector_id") {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    throw new Error(`Invalid ${flagName}: ${String(value || "")}`);
+  }
+  return Math.trunc(raw);
+}
+
+function parseTargetArg(rawValue) {
+  const [dayRaw, connectorRaw] = String(rawValue || "").split(":");
+  const dayUtc = parseIsoDay(dayRaw);
+  if (!dayUtc) {
+    throw new Error(`Invalid --target day_utc: ${String(dayRaw || "")}`);
+  }
+  const connectorId = parseConnectorId(connectorRaw, "connector_id in --target");
+  return { day_utc: dayUtc, connector_id: connectorId };
+}
+
+function parseCsvLine(line) {
+  const out = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === "\"") {
+      if (inQuotes && line[i + 1] === "\"") {
+        current += "\"";
+        i += 1;
+        continue;
+      }
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (ch === "," && !inQuotes) {
+      out.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  out.push(current.trim());
+  return out;
+}
+
+function loadTargetsFromCsv(csvPath) {
+  if (!fs.existsSync(csvPath)) {
+    throw new Error(`--targets-csv file does not exist: ${csvPath}`);
+  }
+  const csvText = fs.readFileSync(csvPath, "utf8");
+  const lines = csvText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  if (lines.length === 0) {
+    return [];
+  }
+  const header = parseCsvLine(lines[0]).map((value) => value.toLowerCase());
+  const dayIndex = header.indexOf("day_utc");
+  const connectorIndex = header.indexOf("connector_id");
+  if (dayIndex === -1 || connectorIndex === -1) {
+    throw new Error("--targets-csv must include day_utc and connector_id columns");
+  }
+  const out = [];
+  for (let i = 1; i < lines.length; i += 1) {
+    const row = parseCsvLine(lines[i]);
+    const dayUtc = parseIsoDay(row[dayIndex]);
+    if (!dayUtc) {
+      continue;
+    }
+    const connectorId = parseConnectorId(row[connectorIndex], "connector_id in --targets-csv");
+    out.push({ day_utc: dayUtc, connector_id: connectorId });
+  }
+  return out;
 }
 
 async function main() {
@@ -99,6 +226,7 @@ async function main() {
     fetchConcurrency: args.fetchConcurrency,
     maxKeys: args.maxKeys,
     computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
+    observationsTargets: args.observationsTargets.length ? args.observationsTargets : null,
   });
   process.stdout.write(`${JSON.stringify({ ok: true, ...summary }, null, 2)}\n`);
 }

@@ -386,6 +386,44 @@ function parseDayFromPrefix(prefixValue, domainPrefix) {
   return parseIsoDay(match[1]);
 }
 
+function normalizeObservationTargets(observationTargets) {
+  if (!Array.isArray(observationTargets) || observationTargets.length === 0) {
+    return null;
+  }
+  const byDay = new Map();
+  for (const entry of observationTargets) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const dayUtc = parseIsoDay(entry.day_utc);
+    const connectorId = parsePositiveId(entry.connector_id);
+    if (!dayUtc || !connectorId) continue;
+    let connectorSet = byDay.get(dayUtc);
+    if (!connectorSet) {
+      connectorSet = new Set();
+      byDay.set(dayUtc, connectorSet);
+    }
+    connectorSet.add(connectorId);
+  }
+  return byDay.size ? byDay : null;
+}
+
+function flattenObservationTargetPairs(targetMap) {
+  if (!targetMap || targetMap.size === 0) {
+    return [];
+  }
+  const out = [];
+  for (const [dayUtc, connectorIds] of targetMap.entries()) {
+    for (const connectorId of connectorIds) {
+      out.push({ day_utc: dayUtc, connector_id: connectorId });
+    }
+  }
+  out.sort((a, b) => {
+    const dayCompare = a.day_utc.localeCompare(b.day_utc);
+    if (dayCompare !== 0) return dayCompare;
+    return a.connector_id - b.connector_id;
+  });
+  return out;
+}
+
 function buildObservationConnectorManifestKey(observationsPrefix, dayUtc, connectorId) {
   return `${normalizePrefix(observationsPrefix)}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
 }
@@ -1173,6 +1211,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   maxKeys = DEFAULT_MAX_KEYS,
   computeMissingTimeseriesCounts = false,
+  observationTargets = null,
 }) {
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for R2 observations timeseries index rebuild");
@@ -1190,10 +1229,19 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
     .map((prefix) => parseDayFromPrefix(prefix, normalizedObservationsPrefix))
     .filter(Boolean)
     .sort((a, b) => a.localeCompare(b));
+  const targetMap = normalizeObservationTargets(observationTargets);
+  const requestedTargets = flattenObservationTargetPairs(targetMap);
+  const requestedTargetSet = new Set(
+    requestedTargets.map((entry) => `${entry.day_utc}|${entry.connector_id}`),
+  );
+  const matchedTargetSet = new Set();
+  const selectedDayList = targetMap
+    ? dayList.filter((dayUtc) => targetMap.has(dayUtc))
+    : dayList;
 
   const warnings = [];
   const daySummaries = (await mapWithConcurrency(
-    dayList,
+    selectedDayList,
     fetchConcurrency,
     async (dayUtc) => {
       const dayManifestKey = `${normalizedObservationsPrefix}/day_utc=${dayUtc}/manifest.json`;
@@ -1214,8 +1262,15 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
         dayUtc,
         normalizedObservationsPrefix,
       );
+      const dayTargetSet = targetMap?.get(dayUtc) || null;
+      const filteredTargets = dayTargetSet
+        ? targets.filter((target) => dayTargetSet.has(target.connector_id))
+        : targets;
+      for (const target of filteredTargets) {
+        matchedTargetSet.add(`${dayUtc}|${target.connector_id}`);
+      }
       const connectorResults = (await mapWithConcurrency(
-        targets,
+        filteredTargets,
         fetchConcurrency,
         async (target) => {
           try {
@@ -1279,6 +1334,17 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
       };
     },
   )).filter(Boolean);
+
+  if (targetMap) {
+    const unmatched = requestedTargets.filter(
+      (entry) => !matchedTargetSet.has(`${entry.day_utc}|${entry.connector_id}`),
+    );
+    for (const entry of unmatched) {
+      warnings.push(
+        `Target not found in observations manifests day=${entry.day_utc} connector=${entry.connector_id}`,
+      );
+    }
+  }
 
   const days = daySummaries.map((entry) => entry.day_utc);
   const connectorIndexCount = daySummaries.reduce(
@@ -1357,6 +1423,10 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
     connector_index_count: connectorIndexCount,
     file_count: fileCount,
     indexed_file_count: indexedFileCount,
+    target_mode: Boolean(targetMap),
+    target_requested_count: requestedTargetSet.size,
+    target_matched_count: matchedTargetSet.size,
+    target_unmatched_count: targetMap ? requestedTargetSet.size - matchedTargetSet.size : 0,
     warning_count: warnings.length,
     warnings,
   };
@@ -1556,6 +1626,7 @@ export async function rebuildR2HistoryIndexes({
   fetchConcurrency,
   maxKeys,
   computeMissingTimeseriesCounts = false,
+  observationsTargets = null,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
@@ -1601,6 +1672,7 @@ export async function rebuildR2HistoryIndexes({
         fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
         maxKeys: maxKeys || config.max_keys,
         computeMissingTimeseriesCounts,
+        observationTargets: observationsTargets,
       });
     }
     if (domain === "aqilevels") {

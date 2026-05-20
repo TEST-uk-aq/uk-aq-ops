@@ -16,7 +16,8 @@
 //     version, created_at, updated_at,
 //     domains: { observations: {days: {...}, ...}, aqilevels: {...}, core: {...} },
 //     index_files: { observations_latest: {relative_path, copied_at, hash, size}, ... },
-//     index_tree_units: { observations_timeseries: { units: { "day_utc=.../connector_id=.../manifest.json": {...} } }, ... }
+//     index_tree_units: { observations_timeseries: { units: { "day_utc=.../connector_id=.../manifest.json": {...} } }, ... },
+//     committed_connector_units: { observations: { units: { "day_utc=.../connector_id=.../manifest.json": {...} } } }
 //   }
 // Old checkpoint files lacking the new sections are accepted; the new sections
 // are populated on first inventory-driven run.
@@ -34,6 +35,7 @@ import {
   uploadFromTempFile,
 } from "./lib/rclone.mjs";
 import {
+  COMMITTED_CONNECTOR_UNIT_KEYS,
   DEFAULT_INVENTORY_REL_PATH,
   DOMAIN_NAMES,
   INDEX_FILE_KEYS,
@@ -234,6 +236,14 @@ function emptyIndexTreeUnitsState() {
   return out;
 }
 
+function emptyCommittedConnectorUnitsState() {
+  const out = {};
+  for (const key of COMMITTED_CONNECTOR_UNIT_KEYS) {
+    out[key] = { units: {} };
+  }
+  return out;
+}
+
 function emptyCheckpointState(nowIso) {
   const domains = {};
   for (const domain of DOMAIN_NAMES) {
@@ -246,6 +256,7 @@ function emptyCheckpointState(nowIso) {
     domains,
     index_files: {},
     index_tree_units: emptyIndexTreeUnitsState(),
+    committed_connector_units: emptyCommittedConnectorUnitsState(),
   };
 }
 
@@ -326,6 +337,31 @@ function sanitizeCheckpointState(rawState) {
     indexTreeUnits[treeKey] = { units: cleanedUnits };
   }
 
+  // Committed connector-manifest units (new section). Old checkpoints lack this.
+  const committedConnectorUnits = emptyCommittedConnectorUnitsState();
+  const rawCommittedUnits = state.committed_connector_units
+    && typeof state.committed_connector_units === "object"
+    && !Array.isArray(state.committed_connector_units)
+    ? state.committed_connector_units
+    : {};
+  for (const domainKey of COMMITTED_CONNECTOR_UNIT_KEYS) {
+    const rawDomain = rawCommittedUnits[domainKey];
+    const rawUnits = rawDomain && typeof rawDomain === "object" && rawDomain.units && typeof rawDomain.units === "object"
+      ? rawDomain.units
+      : {};
+    const cleanedUnits = {};
+    for (const [unitKey, entry] of Object.entries(rawUnits)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      cleanedUnits[String(unitKey)] = {
+        relative_path: String(entry.relative_path || "").trim(),
+        copied_at: String(entry.copied_at || "").trim(),
+        hash: String(entry.hash || "").trim(),
+        size: Number.isFinite(Number(entry.size)) ? Math.trunc(Number(entry.size)) : null,
+      };
+    }
+    committedConnectorUnits[domainKey] = { units: cleanedUnits };
+  }
+
   return {
     version: Number.isFinite(Number(state.version)) ? Number(state.version) : 1,
     created_at: typeof state.created_at === "string" && state.created_at ? state.created_at : nowIso,
@@ -333,6 +369,7 @@ function sanitizeCheckpointState(rawState) {
     domains,
     index_files: indexFiles,
     index_tree_units: indexTreeUnits,
+    committed_connector_units: committedConnectorUnits,
   };
 }
 
@@ -399,6 +436,20 @@ function markIndexTreeUnitCopied(state, treeKey, unitKey, details) {
     state.index_tree_units[treeKey] = { units: {} };
   }
   state.index_tree_units[treeKey].units[unitKey] = {
+    relative_path: details.relative_path,
+    copied_at: details.copied_at,
+    hash: details.hash,
+    size: details.size,
+  };
+  state.updated_at = details.copied_at;
+}
+
+function markCommittedConnectorUnitCopied(state, domainKey, unitKey, details) {
+  if (!state.committed_connector_units[domainKey]
+      || typeof state.committed_connector_units[domainKey] !== "object") {
+    state.committed_connector_units[domainKey] = { units: {} };
+  }
+  state.committed_connector_units[domainKey].units[unitKey] = {
     relative_path: details.relative_path,
     copied_at: details.copied_at,
     hash: details.hash,
@@ -514,6 +565,27 @@ export function planIndexTreeUnits(inventory, state) {
   return candidates;
 }
 
+export function planCommittedConnectorUnits(inventory, state, args) {
+  const candidates = [];
+  for (const domainKey of COMMITTED_CONNECTOR_UNIT_KEYS) {
+    if (!args.domains.includes(domainKey)) continue;
+    const invUnits = inventory?.committed_connector_units?.[domainKey]?.units || {};
+    const cpUnits = state?.committed_connector_units?.[domainKey]?.units || {};
+    for (const unitKey of Object.keys(invUnits).sort()) {
+      const invEntry = invUnits[unitKey];
+      if (!invEntry || !invEntry.hash || !invEntry.relative_path) continue;
+      const cpHash = String(cpUnits[unitKey]?.hash || "").trim();
+      if (cpHash && cpHash === String(invEntry.hash).trim()) continue;
+      candidates.push({
+        domain_key: domainKey,
+        unit_key: unitKey,
+        inventory_entry: invEntry,
+      });
+    }
+  }
+  return candidates;
+}
+
 // ---- Main ----
 
 async function main(args) {
@@ -546,6 +618,7 @@ async function main(args) {
     domains: {},
     index_files: {},
     index_tree_units: {},
+    committed_connector_units: {},
     totals: {
       listed_days: 0,
       candidate_days: 0,
@@ -556,6 +629,8 @@ async function main(args) {
       index_files_copied: 0,
       index_tree_units_candidates: 0,
       index_tree_units_copied: 0,
+      committed_connector_units_candidates: 0,
+      committed_connector_units_copied: 0,
     },
   };
 
@@ -674,6 +749,39 @@ async function main(args) {
       report.index_tree_units[candidate.tree_key] = { copied_units: [] };
     }
     report.index_tree_units[candidate.tree_key].copied_units.push(candidate.unit_key);
+  }
+
+  // ---- Plan + copy committed observations connector manifests ----
+  const committedConnectorCandidates = planCommittedConnectorUnits(inventory, state, args);
+  report.totals.committed_connector_units_candidates = committedConnectorCandidates.length;
+  for (const candidate of committedConnectorCandidates) {
+    const invEntry = candidate.inventory_entry;
+    const relativePath = String(invEntry.relative_path || "").trim();
+    const hash = String(invEntry.hash || "").trim();
+    if (!relativePath || !hash) {
+      throw new Error(
+        `Inventory committed_connector_units entry for ${candidate.domain_key}/${candidate.unit_key} is missing required fields`,
+      );
+    }
+    const sourcePath = joinTargetPath(args.source_root, relativePath);
+    const destPath = joinTargetPath(args.dest_root, relativePath);
+    copyFilePath(args.rclone_bin, sourcePath, destPath, args.dry_run);
+
+    if (!args.dry_run) {
+      const copiedAt = new Date().toISOString();
+      markCommittedConnectorUnitCopied(state, candidate.domain_key, candidate.unit_key, {
+        relative_path: relativePath,
+        copied_at: copiedAt,
+        hash,
+        size: Number.isFinite(Number(invEntry.size)) ? Math.trunc(Number(invEntry.size)) : null,
+      });
+      writeCheckpointState(args.rclone_bin, checkpointPath, state);
+      report.totals.committed_connector_units_copied += 1;
+    }
+    if (!report.committed_connector_units[candidate.domain_key]) {
+      report.committed_connector_units[candidate.domain_key] = { copied_units: [] };
+    }
+    report.committed_connector_units[candidate.domain_key].copied_units.push(candidate.unit_key);
   }
 
   report.completed_at = new Date().toISOString();
