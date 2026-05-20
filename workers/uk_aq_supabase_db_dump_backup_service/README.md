@@ -68,12 +68,18 @@ Optional plain env:
 - only `data` dumps are rewritten (`roles`/`schema` are untouched)
 - large multi-row `INSERT INTO ... VALUES` statements are split into smaller INSERT statements
 - per-row values are preserved; only trailing row delimiters are adjusted when chunking
+- Supabase dry-run scripts are normalized so `cron` is not excluded from dump scope (preserves `cron.job` rows)
+- `schema.sql` is prefixed with `create extension if not exists pg_cron;` when missing
 
 Output filenames and Dropbox paths are unchanged:
 
 - `roles.sql.gz`
 - `schema.sql.gz`
 - `data.sql.gz`
+
+## Restore note for cron jobs
+
+To restore scheduled jobs from `data.sql.gz` into a new database, ensure the `pg_cron` extension is enabled on the target first so `cron.job` exists before running the data restore.
 
 ## Important implementation note
 

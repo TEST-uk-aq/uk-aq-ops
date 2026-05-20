@@ -15,6 +15,7 @@ export const DEFAULT_DATABASE_ORDER = Object.freeze(["ingestdb", "obs_aqidb"]);
 export const DEFAULT_DUMP_KINDS = Object.freeze(["roles", "schema", "data"]);
 export const DEFAULT_RETENTION_DAYS = 7;
 export const DEFAULT_BACKUP_DIR = "Supabase_Backup_db_dump";
+const PG_CRON_ENABLE_SQL = "create extension if not exists pg_cron;";
 const MAX_LOG_MESSAGE_LENGTH = 1200;
 const DEFAULT_SPLIT_LARGE_INSERTS = true;
 const DEFAULT_INSERT_SPLIT_THRESHOLD_ROWS = 10_000;
@@ -220,6 +221,39 @@ export function extractDryRunScript(outputText) {
     throw new Error("Unable to find the Supabase dry-run bash script.");
   }
   return String(outputText).slice(markerIndex).trim();
+}
+
+function removeExcludeSchemaTokenListEntry(tokenList, tokenToRemove) {
+  return String(tokenList || "")
+    .split("|")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .filter((entry) => entry !== tokenToRemove)
+    .join("|");
+}
+
+export function includeCronJobsInDryRunScript(scriptText) {
+  let updated = String(scriptText || "");
+
+  // Supabase CLI can classify cron as an internal schema. Remove that exclusion
+  // so cron.job rows are preserved in data dumps for restore into new databases.
+  updated = updated.replace(/(--exclude-schema\s+")([^"]+)(")/g, (_match, start, tokenList, end) => {
+    const normalized = removeExcludeSchemaTokenListEntry(tokenList, "cron");
+    return `${start}${normalized}${end}`;
+  });
+
+  return updated;
+}
+
+export async function ensurePgCronExtensionAtTopOfSchemaFile(filePath) {
+  const existing = await fs.readFile(filePath, "utf8");
+  if (/(^|\n)\s*create extension if not exists "?pg_cron"?\s*;/i.test(existing)) {
+    return false;
+  }
+
+  const prefix = `${PG_CRON_ENABLE_SQL}\n\n`;
+  await fs.writeFile(filePath, `${prefix}${existing}`, "utf8");
+  return true;
 }
 
 function redactSensitiveText(rawValue) {
@@ -779,13 +813,25 @@ async function runSingleDump({
     );
   }
 
-  const scriptText = extractDryRunScript(dryRunResult.stdout);
+  const scriptText = includeCronJobsInDryRunScript(extractDryRunScript(dryRunResult.stdout));
   await executeDumpScriptToFile({
     bashBin: config.bashBin,
     scriptText,
     scriptPath,
     outputFile: rawFilePath,
   });
+
+  if (dumpKind === "schema") {
+    const addedPgCronEnable = await ensurePgCronExtensionAtTopOfSchemaFile(rawFilePath);
+    if (addedPgCronEnable) {
+      logStructured("INFO", "supabase_db_dump_schema_pg_cron_enable_prepended", {
+        run_id: runId,
+        database: databaseName,
+        dump_kind: dumpKind,
+        statement: PG_CRON_ENABLE_SQL,
+      });
+    }
+  }
 
   let insertSplit = null;
   if (dumpKind === "data") {

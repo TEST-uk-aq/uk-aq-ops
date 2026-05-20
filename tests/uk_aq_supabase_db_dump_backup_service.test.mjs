@@ -8,7 +8,9 @@ import {
   buildBackupRoot,
   buildDatabaseBackupFolder,
   buildDumpArgs,
+  ensurePgCronExtensionAtTopOfSchemaFile,
   extractDryRunScript,
+  includeCronJobsInDryRunScript,
   normalizeDropboxPath,
   parseBooleanEnv,
   planRetentionDeletes,
@@ -99,6 +101,31 @@ test("extractDryRunScript strips the banner and keeps the bash script", () => {
   );
 });
 
+test("includeCronJobsInDryRunScript removes cron from exclude-schema filters", () => {
+  const updated = includeCronJobsInDryRunScript([
+    "#!/usr/bin/env bash",
+    "pg_dump \\",
+    "  --data-only \\",
+    "  --exclude-schema \"information_schema|pg_*|cron|extensions\" \\",
+    "  --schema \"*\"",
+  ].join("\n"));
+
+  assert.match(updated, /--exclude-schema "information_schema\|pg_\*\|extensions"/);
+  assert.doesNotMatch(updated, /\|cron\|/);
+  assert.doesNotMatch(updated, /\|cron"/);
+});
+
+test("includeCronJobsInDryRunScript is a no-op when cron is not excluded", () => {
+  const script = [
+    "#!/usr/bin/env bash",
+    "pg_dump \\",
+    "  --data-only \\",
+    "  --exclude-schema \"information_schema|pg_*|extensions\" \\",
+    "  --schema \"*\"",
+  ].join("\n");
+  assert.equal(includeCronJobsInDryRunScript(script), script);
+});
+
 test("resolveOldestKeptDate keeps the latest seven UTC folders inclusive", () => {
   assert.equal(resolveOldestKeptDate("2026-03-16", 7), "2026-03-10");
 });
@@ -174,6 +201,38 @@ async function withTempSqlFile(content, fn) {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 }
+
+test("ensurePgCronExtensionAtTopOfSchemaFile prepends pg_cron enable SQL", async () => {
+  const sql = [
+    "create schema if not exists uk_aq_core;",
+    "set search_path = uk_aq_core, public;",
+    "",
+  ].join("\n");
+
+  await withTempSqlFile(sql, async (filePath) => {
+    const updated = await ensurePgCronExtensionAtTopOfSchemaFile(filePath);
+    const content = await fs.readFile(filePath, "utf8");
+    assert.equal(updated, true);
+    assert.match(content, /^create extension if not exists pg_cron;\n\ncreate schema if not exists uk_aq_core;/);
+  });
+});
+
+test("ensurePgCronExtensionAtTopOfSchemaFile does not duplicate existing statement", async () => {
+  const sql = [
+    "create extension if not exists pg_cron;",
+    "",
+    "create schema if not exists uk_aq_core;",
+    "",
+  ].join("\n");
+
+  await withTempSqlFile(sql, async (filePath) => {
+    const before = await fs.readFile(filePath, "utf8");
+    const updated = await ensurePgCronExtensionAtTopOfSchemaFile(filePath);
+    const after = await fs.readFile(filePath, "utf8");
+    assert.equal(updated, false);
+    assert.equal(after, before);
+  });
+});
 
 test("splitLargeDataInsertsInFile rewrites 25,001-row INSERT into 6 statements", async () => {
   const sql = [
