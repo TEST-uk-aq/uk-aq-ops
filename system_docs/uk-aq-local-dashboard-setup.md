@@ -105,6 +105,7 @@ Both dashboards read from their own repo's `.env`. The dashboard-specific vars n
 | `UK_AQ_DB_SIZE_API_TOKEN` | token from `.env` | live token |
 | `UK_AQ_R2_HISTORY_DAYS_API_URL` | `https://uk-aq-db-r2-metrics-api.cic-test.workers.dev/v1/r2-history-days` | live worker URL |
 | `UK_AQ_R2_HISTORY_COUNTS_API_URL` | `https://uk-aq-db-r2-metrics-api.cic-test.workers.dev/v1/r2-history-counts` | live worker URL |
+| `UK_AQ_SERVICE_EGRESS_LOOKBACK_DAYS` | `7` | `7` |
 | `UK_AQ_DROPBOX_LOCAL_ROOT` | `/Users/mikehinford/Dropbox` | `/Users/mikehinford/Dropbox` |
 | `UKAQ_DASHBOARD_TITLE` | Browser title/header text | Browser title/header text |
 | `UKAQ_DASHBOARD_SUBTITLE` | Browser subtitle text | Browser subtitle text |
@@ -179,6 +180,7 @@ This section describes where each panel on `dashboard/index.html` gets its data 
 | Dispatcher Feed table | `/api/dashboard` | `uk_aq_core.uk_aq_ingest_runs` view/table (`/uk_aq_ingest_runs`) plus synthetic in-flight rows derived from `connectors.last_run_start/last_run_end` |
 | PM2.5 / PM10 / NO2 freshness tables | `/api/dashboard` | `uk_aq_core.timeseries` (`last_value`, `last_value_at`, station/connector IDs) plus `phenomena`; connector metadata from `connectors`; station metadata from `stations` + `station_metadata` |
 | DB Size Trend (line + stacked charts) | `/api/dashboard` | Primary: external DB-size metrics API (`UK_AQ_DB_SIZE_API_URL`) returning `db_size_metrics`, `schema_size_metrics`, `r2_domain_size_metrics`; fallback/top-up: Supabase views `uk_aq_db_size_metrics_hourly`, `uk_aq_schema_size_metrics_hourly`, `uk_aq_r2_domain_size_metrics_hourly` |
+| Latest Snapshot Service Egress (24h) | `/api/dashboard` | ObsAQI DB view `uk_aq_service_egress_metrics_minute` (service rollup rows written by latest snapshot Cloud Run builder) |
 | R2 usage bars + free-tier percentages | `/api/dashboard`, `/api/r2_metrics` | Cloudflare account metrics API calls in backend (`_fetch_r2_account_metrics`) using R2/Cloudflare account token env vars |
 | R2 history window label | `/api/dashboard`, `/api/r2_metrics` | Preferred: external history-days API (`UK_AQ_R2_HISTORY_DAYS_API_URL`); fallback: Supabase RPC `uk_aq_rpc_r2_history_days_by_domain`; additional fallback range RPC `uk_aq_rpc_r2_history_window` |
 | Daily Tasks Latest Runs (Operations) | `/api/daily_task_runs` | ObsAQI DB view `uk_aq_ops.daily_task_runs_dashboard` (joins `uk_aq_ops.daily_task_runs` + `uk_aq_ops.daily_task_definitions`), filtered by `scheduled_for_date` and mode (`latest` or `all`) |
