@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  buildCronJobsRestoreSql,
   buildBackupRoot,
   buildDatabaseBackupFolder,
   buildDumpArgs,
@@ -112,7 +113,7 @@ test("includeCronJobsInDryRunScript removes cron from exclude-schema filters", (
 
   assert.match(updated, /--exclude-schema "information_schema\|pg_\*\|extensions"/);
   assert.doesNotMatch(updated, /\|cron\|/);
-  assert.doesNotMatch(updated, /\|cron"/);
+  assert.doesNotMatch(updated, /--exclude-schema "[^"]*\|cron[^"]*"/);
   assert.match(updated, /--schema "public\|uk_aq_core\|uk_aq_raw\|cron"/);
 });
 
@@ -136,6 +137,57 @@ test("includeCronJobsInDryRunScript appends cron to explicit include-schema list
   ].join("\n"));
 
   assert.match(updated, /--schema "public\|auth\|storage\|cron"/);
+});
+
+test("buildCronJobsRestoreSql emits deterministic restore SQL for cron.job rows", () => {
+  const sql = buildCronJobsRestoreSql({
+    databaseName: "obs_aqidb",
+    generatedAt: "2026-05-21T16:00:00.000Z",
+    rows: [
+      {
+        jobid: 7,
+        schedule: "10 6 * * *",
+        command: "select * from uk_aq_ops.fn('a');",
+        nodename: "localhost",
+        nodeport: 5432,
+        database: "postgres",
+        username: "postgres",
+        active: true,
+        jobname: "job_a",
+      },
+      {
+        jobid: 3,
+        schedule: "55 * * * *",
+        command: "select 1;",
+        nodename: "localhost",
+        nodeport: 5432,
+        database: "postgres",
+        username: "postgres",
+        active: false,
+        jobname: "job_b",
+      },
+    ],
+  });
+
+  assert.match(sql, /create extension if not exists pg_cron;/);
+  assert.match(sql, /delete from cron\.job;/);
+  assert.match(sql, /insert into cron\.job \("jobid", "schedule", "command", "nodename", "nodeport", "database", "username", "active", "jobname"\) values/);
+  assert.match(sql, /\(3, '55 \* \* \* \*', 'select 1;'/);
+  assert.match(sql, /\(7, '10 6 \* \* \*', 'select \* from uk_aq_ops\.fn\(''a''\);'/);
+  assert.match(sql, /select pg_catalog\.setval\('cron\.jobid_seq', coalesce\(\(select max\(jobid\) from cron\.job\), 1\), true\);/);
+  assert.match(sql, /commit;/);
+});
+
+test("buildCronJobsRestoreSql emits empty restore scaffold when no rows are present", () => {
+  const sql = buildCronJobsRestoreSql({
+    databaseName: "ingestdb",
+    generatedAt: "2026-05-21T16:00:00.000Z",
+    rows: [],
+  });
+
+  assert.match(sql, /-- No rows found in source cron\.job\./);
+  assert.match(sql, /select pg_catalog\.setval\('cron\.jobid_seq', 1, false\);/);
+  assert.doesNotMatch(sql, /insert into cron\.job/i);
 });
 
 test("resolveOldestKeptDate keeps the latest seven UTC folders inclusive", () => {

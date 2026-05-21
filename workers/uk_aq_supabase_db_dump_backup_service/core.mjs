@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import { Client as PgClient } from "pg";
 
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_API_BASE_URL = "https://api.dropboxapi.com/2";
@@ -13,6 +14,7 @@ const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 export const SERVICE_NAME = "uk_aq_supabase_db_dump_backup_service";
 export const DEFAULT_DATABASE_ORDER = Object.freeze(["ingestdb", "obs_aqidb"]);
 export const DEFAULT_DUMP_KINDS = Object.freeze(["roles", "schema", "data"]);
+export const CRON_JOBS_DUMP_KIND = "cron_jobs";
 export const DEFAULT_RETENTION_DAYS = 7;
 export const DEFAULT_BACKUP_DIR = "Supabase_Backup_db_dump";
 const PG_CRON_ENABLE_SQL = "create extension if not exists pg_cron;";
@@ -330,6 +332,125 @@ function sanitizeErrorMessage(error) {
     return redacted;
   }
   return `${redacted.slice(0, MAX_LOG_MESSAGE_LENGTH - 3)}...`;
+}
+
+function sqlTextLiteral(value) {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function sqlIntegerLiteral(value) {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return "null";
+  }
+  return String(Math.trunc(parsed));
+}
+
+function sqlBooleanLiteral(value) {
+  return value ? "true" : "false";
+}
+
+export function buildCronJobsRestoreSql({
+  databaseName,
+  rows,
+  generatedAt = nowIso(),
+}) {
+  const lines = [
+    "-- uk_aq pg_cron jobs backup",
+    `-- source_database: ${databaseName}`,
+    `-- generated_at_utc: ${generatedAt}`,
+    "begin;",
+    "create extension if not exists pg_cron;",
+    "",
+    "-- Replace existing cron jobs with the source snapshot.",
+    "delete from cron.job;",
+  ];
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    lines.push("");
+    lines.push("-- No rows found in source cron.job.");
+    lines.push("select pg_catalog.setval('cron.jobid_seq', 1, false);");
+    lines.push("commit;");
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  const normalizedRows = [...rows].sort((left, right) => {
+    const leftId = Number(left?.jobid ?? 0);
+    const rightId = Number(right?.jobid ?? 0);
+    return leftId - rightId;
+  });
+
+  lines.push("");
+  lines.push(
+    'insert into cron.job ("jobid", "schedule", "command", "nodename", "nodeport", "database", "username", "active", "jobname") values',
+  );
+  lines.push(
+    normalizedRows
+      .map((row) => {
+        return [
+          "  (",
+          sqlIntegerLiteral(row.jobid),
+          ", ",
+          sqlTextLiteral(row.schedule),
+          ", ",
+          sqlTextLiteral(row.command),
+          ", ",
+          sqlTextLiteral(row.nodename),
+          ", ",
+          sqlIntegerLiteral(row.nodeport),
+          ", ",
+          sqlTextLiteral(row.database),
+          ", ",
+          sqlTextLiteral(row.username),
+          ", ",
+          sqlBooleanLiteral(Boolean(row.active)),
+          ", ",
+          sqlTextLiteral(row.jobname),
+          ")",
+        ].join("");
+      })
+      .join(",\n"),
+  );
+  lines.push(";");
+  lines.push(
+    "select pg_catalog.setval('cron.jobid_seq', coalesce((select max(jobid) from cron.job), 1), true);",
+  );
+  lines.push("commit;");
+  lines.push("");
+  return lines.join("\n");
+}
+
+async function fetchCronJobsRows(dbUrl) {
+  const client = new PgClient({ connectionString: dbUrl });
+  await client.connect();
+  try {
+    const result = await client.query(
+      [
+        "select",
+        "  jobid,",
+        "  schedule,",
+        "  command,",
+        "  nodename,",
+        "  nodeport,",
+        "  database,",
+        "  username,",
+        "  active,",
+        "  jobname",
+        "from cron.job",
+        "order by jobid",
+      ].join("\n"),
+    );
+    return result.rows || [];
+  } finally {
+    await client.end();
+  }
 }
 
 export function resolveInsertSplitConfig(env = process.env) {
@@ -947,6 +1068,65 @@ async function runSingleDump({
   };
 }
 
+async function runCronJobsDump({
+  config,
+  runId,
+  databaseName,
+  workingDir,
+  dbUrl,
+  dropboxClient,
+  runDate,
+}) {
+  const rawFilePath = path.join(workingDir, `${CRON_JOBS_DUMP_KIND}.sql`);
+  const dropboxFolder = buildDatabaseBackupFolder(
+    config.dropboxRoot,
+    config.backupDir,
+    databaseName,
+    runDate,
+  );
+  const dropboxPath = `${dropboxFolder}/${CRON_JOBS_DUMP_KIND}.sql.gz`;
+
+  logStructured("INFO", "supabase_db_dump_cron_jobs_step_started", {
+    run_id: runId,
+    database: databaseName,
+    dump_kind: CRON_JOBS_DUMP_KIND,
+  });
+
+  const cronRows = await fetchCronJobsRows(dbUrl);
+  const sqlText = buildCronJobsRestoreSql({
+    databaseName,
+    rows: cronRows,
+    generatedAt: nowIso(),
+  });
+  await fs.writeFile(rawFilePath, sqlText, "utf8");
+
+  const rawStats = await fs.stat(rawFilePath);
+  const gzFilePath = await gzipFile(config.gzipBin, rawFilePath);
+  const gzStats = await fs.stat(gzFilePath);
+
+  await dropboxClient.uploadFile(gzFilePath, dropboxPath);
+
+  logStructured("INFO", "supabase_db_dump_cron_jobs_step_finished", {
+    run_id: runId,
+    database: databaseName,
+    dump_kind: CRON_JOBS_DUMP_KIND,
+    source_row_count: cronRows.length,
+    raw_bytes: rawStats.size,
+    gzip_bytes: gzStats.size,
+    dropbox_path: dropboxPath,
+  });
+
+  return {
+    dump_kind: CRON_JOBS_DUMP_KIND,
+    file_name: `${CRON_JOBS_DUMP_KIND}.sql.gz`,
+    raw_bytes: rawStats.size,
+    gzip_bytes: gzStats.size,
+    dropbox_path: dropboxPath,
+    source_row_count: cronRows.length,
+    source_table: "cron.job",
+  };
+}
+
 async function applyDropboxRetention({ config, dropboxClient, databaseName, runDate, runId }) {
   const databaseRoot = joinDropboxPath(config.dropboxBackupRoot, databaseName);
   const oldestKeptDate = resolveOldestKeptDate(runDate, config.retentionDays);
@@ -1023,6 +1203,16 @@ async function runDatabaseBackup({
       });
       result.dumps.push(dumpResult);
     }
+    const cronJobsDumpResult = await runCronJobsDump({
+      config,
+      runId,
+      databaseName,
+      workingDir,
+      dbUrl: databaseConfig.dbUrl,
+      dropboxClient,
+      runDate,
+    });
+    result.dumps.push(cronJobsDumpResult);
 
     result.retention = await applyDropboxRetention({
       config,

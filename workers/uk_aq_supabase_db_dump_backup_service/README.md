@@ -10,6 +10,7 @@ Each run creates:
 - `roles.sql.gz`
 - `schema.sql.gz`
 - `data.sql.gz`
+- `cron_jobs.sql.gz`
 
 for each database, uploads them to Dropbox, and prunes dated Dropbox folders older than the configured retention window.
 
@@ -74,16 +75,23 @@ Optional plain env:
 - `obs_aqidb` `schema.sql` is also prefixed with a guarded statement to set
   `authenticator` PostgREST schemas globally:
   `public,graphql_public,uk_aq_public,uk_aq_ops`
+- `cron_jobs.sql` is generated directly from `cron.job` and uploaded separately so cron restore is not dependent on Supabase CLI extension-schema filtering
 
 Output filenames and Dropbox paths are unchanged:
 
 - `roles.sql.gz`
 - `schema.sql.gz`
 - `data.sql.gz`
+- `cron_jobs.sql.gz`
 
 ## Restore note for cron jobs
 
-To restore scheduled jobs from `data.sql.gz` into a new database, ensure the `pg_cron` extension is enabled on the target first so `cron.job` exists before running the data restore.
+Restore order for cron jobs:
+
+1. restore `roles.sql.gz`
+2. restore `schema.sql.gz`
+3. restore `data.sql.gz`
+4. restore `cron_jobs.sql.gz` (this file creates `pg_cron` if missing, clears `cron.job`, and reinserts the source rows)
 
 ## Important implementation note
 
