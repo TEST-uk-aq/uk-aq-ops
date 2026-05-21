@@ -60,6 +60,10 @@ DB_SIZE_LOOKBACK_DAYS = max(
     1,
     int(os.getenv("UK_AQ_DB_SIZE_LOOKBACK_DAYS", "28")),
 )
+SERVICE_EGRESS_LOOKBACK_DAYS = max(
+    1,
+    int(os.getenv("UK_AQ_SERVICE_EGRESS_LOOKBACK_DAYS", "7")),
+)
 METRICS_VIEW_PAGE_SIZE = 1000
 EXTERNAL_METRICS_MAX_LAG = timedelta(hours=6)
 EXTERNAL_SCHEMA_MISSING_WARNING = "External DB size API payload missing usable schema_size_metrics rows"
@@ -979,6 +983,55 @@ def _normalize_r2_domain_size_metrics_rows(rows: List[Dict[str, Any]]) -> List[D
     return normalized
 
 
+def _normalize_service_egress_metrics_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for row in rows:
+        bucket_minute = _parse_timestamp(row.get("bucket_minute"))
+        if bucket_minute is None:
+            continue
+        source_type = str(row.get("source_type") or "").strip().lower() or "other"
+        if source_type not in {"supabase", "r2", "cloudflare_cache", "gcp", "other"}:
+            source_type = "other"
+
+        def _to_non_negative_int(value: Any) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return 0
+            return max(0, parsed)
+
+        normalized.append(
+            {
+                "bucket_minute": bucket_minute.isoformat().replace("+00:00", "Z"),
+                "env_name": str(row.get("env_name") or "").strip().lower() or "unknown",
+                "project_ref": str(row.get("project_ref") or "").strip(),
+                "service_name": str(row.get("service_name") or "").strip(),
+                "source_type": source_type,
+                "source_name": str(row.get("source_name") or "").strip(),
+                "route_name": str(row.get("route_name") or "").strip(),
+                "query_name": str(row.get("query_name") or "").strip(),
+                "window_label": str(row.get("window_label") or "").strip(),
+                "status": str(row.get("status") or "").strip().lower() or "ok",
+                "request_count": _to_non_negative_int(row.get("request_count")),
+                "response_rows": _to_non_negative_int(row.get("response_rows")),
+                "response_bytes_est": _to_non_negative_int(row.get("response_bytes_est")),
+                "upstream_bytes_est": _to_non_negative_int(row.get("upstream_bytes_est")),
+                "cache_hit_count": _to_non_negative_int(row.get("cache_hit_count")),
+                "cache_miss_count": _to_non_negative_int(row.get("cache_miss_count")),
+                "objects_written_count": _to_non_negative_int(row.get("objects_written_count")),
+                "objects_written_bytes": _to_non_negative_int(row.get("objects_written_bytes")),
+                "duration_ms": _to_non_negative_int(row.get("duration_ms")),
+                "error_count": _to_non_negative_int(row.get("error_count")),
+                "notes": row.get("notes") if isinstance(row.get("notes"), dict) else None,
+            }
+        )
+
+    normalized.sort(
+        key=lambda item: _parse_timestamp(item.get("bucket_minute")) or UTC_DATETIME_MIN
+    )
+    return normalized
+
+
 def _filter_r2_domain_metrics_to_committed_days(
     rows: List[Dict[str, Any]],
     r2_history_days: Optional[Dict[str, Set[date]]],
@@ -1473,6 +1526,36 @@ def _fetch_size_metrics(
         external_r2_error,
     )
     return db_rows, schema_rows, r2_rows, db_warning, schema_warning, r2_warning
+
+
+def _fetch_service_egress_metrics(
+    now: datetime,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
+        return [], "obs_aqidb: missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY"
+
+    obs_base_url = f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
+    since = now - timedelta(days=SERVICE_EGRESS_LOOKBACK_DAYS)
+    try:
+        rows = _fetch_all(
+            obs_base_url,
+            _postgrest_headers(OBS_AQIDB_SECRET_KEY),
+            "uk_aq_service_egress_metrics_minute",
+            {
+                "select": (
+                    "bucket_minute,env_name,project_ref,service_name,source_type,"
+                    "source_name,route_name,query_name,window_label,status,request_count,"
+                    "response_rows,response_bytes_est,upstream_bytes_est,cache_hit_count,"
+                    "cache_miss_count,objects_written_count,objects_written_bytes,duration_ms,error_count,notes"
+                ),
+                "bucket_minute": f"gte.{_to_postgrest_ts(since)}",
+                "order": "bucket_minute.asc",
+            },
+            limit=METRICS_VIEW_PAGE_SIZE,
+        )
+    except Exception as exc:
+        return [], str(exc)
+    return _normalize_service_egress_metrics_rows(rows), None
 
 
 def _normalize_iso_date(value: Any) -> Optional[str]:
@@ -3798,6 +3881,7 @@ def _build_dashboard(
     dropbox_state_path = coverage_context["dropbox_state_path"]
     dropbox_state_error = coverage_context["dropbox_state_error"]
     r2_usage, r2_usage_error = _get_r2_usage_cached(force_refresh=False)
+    service_egress_metrics, service_egress_metrics_error = _fetch_service_egress_metrics(now)
     ingest_runs = _get_ingest_runs_cached(
         base_url,
         headers,
@@ -4016,6 +4100,8 @@ def _build_dashboard(
         "r2_domain_size_metrics_error": r2_domain_size_metrics_error,
         "r2_usage": r2_usage,
         "r2_usage_error": r2_usage_error,
+        "service_egress_metrics": service_egress_metrics,
+        "service_egress_metrics_error": service_egress_metrics_error,
         "r2_backup_window": r2_backup_window,
         "r2_backup_window_error": r2_backup_window_error,
         "r2_history_days_bucket": r2_history_days_bucket,

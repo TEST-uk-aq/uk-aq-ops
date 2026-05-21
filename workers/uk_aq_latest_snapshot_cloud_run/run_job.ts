@@ -7,7 +7,38 @@ import {
 } from "../shared/r2_sigv4.mjs";
 
 type RpcError = { message: string };
-type RpcResult<T> = { data: T | null; error: RpcError | null };
+type RpcCallMeta = {
+  attempt_count: number;
+  retry_count: number;
+  http_status: number | null;
+  duration_ms: number;
+  response_bytes: number;
+};
+type RpcResult<T> = { data: T | null; error: RpcError | null; meta: RpcCallMeta };
+
+type ServiceEgressMetricRow = {
+  bucket_minute?: string;
+  env_name: string;
+  project_ref?: string;
+  service_name: string;
+  source_type: "supabase" | "r2" | "cloudflare_cache" | "gcp" | "other";
+  source_name?: string;
+  route_name: string;
+  query_name?: string;
+  window_label?: string;
+  status: "ok" | "error" | "partial" | "skipped";
+  request_count?: number;
+  response_rows?: number;
+  response_bytes_est?: number;
+  upstream_bytes_est?: number;
+  cache_hit_count?: number;
+  cache_miss_count?: number;
+  objects_written_count?: number;
+  objects_written_bytes?: number;
+  duration_ms?: number;
+  error_count?: number;
+  notes?: Record<string, unknown> | null;
+};
 
 type RawLatestRow = {
   id: number | null;
@@ -165,6 +196,28 @@ const UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS = parsePositiveInt(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS"),
   20000,
 );
+const UK_AQ_SERVICE_EGRESS_METRICS_ENABLED = parseBoolean(
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_ENABLED"),
+  false,
+);
+const UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL = (
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL") || ""
+).trim();
+const UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY = (
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY") || SB_SECRET_KEY
+).trim();
+const UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA = (
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA") || "uk_aq_public"
+).trim();
+const UK_AQ_SERVICE_EGRESS_METRICS_RPC = (
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_RPC") || "uk_aq_rpc_service_egress_metrics_batch_upsert"
+).trim();
+const UK_AQ_SERVICE_EGRESS_ENV = (
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_ENV") || Deno.env.get("UK_AQ_ENV") || "unknown"
+).trim().toLowerCase() || "unknown";
+const UK_AQ_SERVICE_EGRESS_PROJECT_REF = (
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_PROJECT_REF") || ""
+).trim();
 
 const R2_CONFIG = {
   endpoint: optionalEnvAny(["CFLARE_R2_ENDPOINT", "R2_ENDPOINT"]) || "",
@@ -173,6 +226,7 @@ const R2_CONFIG = {
   access_key_id: optionalEnvAny(["CFLARE_R2_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"]) || "",
   secret_access_key: optionalEnvAny(["CFLARE_R2_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"]) || "",
 };
+const TEXT_ENCODER = new TextEncoder();
 
 function requiredEnv(name: string): string {
   const value = (Deno.env.get(name) || "").trim();
@@ -221,6 +275,32 @@ function parseCsvList(raw: string | undefined | null, fallback: string[]): strin
   }
   const values = source.split(",").map((value) => value.trim()).filter(Boolean);
   return values.length ? values : [...fallback];
+}
+
+function measureUtf8Bytes(value: string): number {
+  if (!value) {
+    return 0;
+  }
+  return TEXT_ENCODER.encode(value).byteLength;
+}
+
+function deriveProjectRef(supabaseUrl: string): string {
+  const trimmed = String(supabaseUrl || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    const host = new URL(trimmed).hostname.toLowerCase();
+    if (host.endsWith(".supabase.co")) {
+      return host.slice(0, -".supabase.co".length);
+    }
+    if (host.endsWith(".supabase.in")) {
+      return host.slice(0, -".supabase.in".length);
+    }
+  } catch {
+    return "";
+  }
+  return "";
 }
 
 function normalizeMatrixPollutant(value: string | null): string | null {
@@ -626,9 +706,14 @@ async function postgrestRpc<T>(
   args: Record<string, unknown>,
 ): Promise<RpcResult<T>> {
   const endpoint = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/rpc/${rpcName}`;
+  const startedMs = Date.now();
   let lastError: string | null = null;
+  let lastStatus: number | null = null;
+  let totalResponseBytes = 0;
+  let attemptCount = 0;
 
   for (let attempt = 1; attempt <= UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES; attempt += 1) {
+    attemptCount = attempt;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS);
     try {
@@ -646,16 +731,29 @@ async function postgrestRpc<T>(
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
+      lastStatus = response.status;
+      const responseText = await response.text();
+      totalResponseBytes += measureUtf8Bytes(responseText);
 
       let payload: unknown = null;
       try {
-        payload = await response.json();
+        payload = responseText ? JSON.parse(responseText) : null;
       } catch {
         payload = null;
       }
 
       if (response.ok) {
-        return { data: payload as T, error: null };
+        return {
+          data: payload as T,
+          error: null,
+          meta: {
+            attempt_count: attemptCount,
+            retry_count: Math.max(0, attemptCount - 1),
+            http_status: lastStatus,
+            duration_ms: Date.now() - startedMs,
+            response_bytes: totalResponseBytes,
+          },
+        };
       }
 
       const message = extractErrorMessage(payload, response.status);
@@ -664,7 +762,17 @@ async function postgrestRpc<T>(
         await sleep(attempt * 350);
         continue;
       }
-      return { data: null, error: { message } };
+      return {
+        data: null,
+        error: { message },
+        meta: {
+          attempt_count: attemptCount,
+          retry_count: Math.max(0, attemptCount - 1),
+          http_status: lastStatus,
+          duration_ms: Date.now() - startedMs,
+          response_bytes: totalResponseBytes,
+        },
+      };
     } catch (error) {
       clearTimeout(timeoutId);
       const message = error instanceof Error ? error.message : String(error);
@@ -673,11 +781,31 @@ async function postgrestRpc<T>(
         await sleep(attempt * 350);
         continue;
       }
-      return { data: null, error: { message } };
+      return {
+        data: null,
+        error: { message },
+        meta: {
+          attempt_count: attemptCount,
+          retry_count: Math.max(0, attemptCount - 1),
+          http_status: lastStatus,
+          duration_ms: Date.now() - startedMs,
+          response_bytes: totalResponseBytes,
+        },
+      };
     }
   }
 
-  return { data: null, error: { message: lastError || "RPC request failed" } };
+  return {
+    data: null,
+    error: { message: lastError || "RPC request failed" },
+    meta: {
+      attempt_count: attemptCount,
+      retry_count: Math.max(0, attemptCount - 1),
+      http_status: lastStatus,
+      duration_ms: Date.now() - startedMs,
+      response_bytes: totalResponseBytes,
+    },
+  };
 }
 
 function extractErrorMessage(payload: unknown, status: number): string {
@@ -699,10 +827,20 @@ function looksLikeCursorSignatureMismatch(message: string): boolean {
     normalized.includes("uk_aq_latest_rpc");
 }
 
+function mergeRpcMeta(a: RpcCallMeta, b: RpcCallMeta): RpcCallMeta {
+  return {
+    attempt_count: a.attempt_count + b.attempt_count,
+    retry_count: a.retry_count + b.retry_count,
+    http_status: b.http_status ?? a.http_status,
+    duration_ms: a.duration_ms + b.duration_ms,
+    response_bytes: a.response_bytes + b.response_bytes,
+  };
+}
+
 async function callLatestRpc(
   pollutant: string,
   windowLabel: string,
-): Promise<RpcResult<RawLatestRow[]>> {
+): Promise<RpcResult<RawLatestRow[]> & { signature: string }> {
   const cursorBody = {
     region: null,
     pcon_code: null,
@@ -717,12 +855,12 @@ async function callLatestRpc(
 
   const firstAttempt = await postgrestRpc<RawLatestRow[]>(UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC, cursorBody);
   if (!firstAttempt.error) {
-    return firstAttempt;
+    return { ...firstAttempt, signature: "since_updated_at" };
   }
   if (!looksLikeCursorSignatureMismatch(firstAttempt.error.message)) {
-    return firstAttempt;
+    return { ...firstAttempt, signature: "since_updated_at" };
   }
-  return await postgrestRpc<RawLatestRow[]>(UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC, {
+  const fallbackAttempt = await postgrestRpc<RawLatestRow[]>(UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC, {
     region: null,
     pcon_code: null,
     station_like: null,
@@ -732,6 +870,11 @@ async function callLatestRpc(
     limit_rows: UK_AQ_LATEST_SNAPSHOT_LIMIT,
     since_ts: null,
   });
+  return {
+    ...fallbackAttempt,
+    meta: mergeRpcMeta(firstAttempt.meta, fallbackAttempt.meta),
+    signature: "since_ts",
+  };
 }
 
 function toStableJson(value: unknown): string {
@@ -802,6 +945,134 @@ function isRetryableStatus(status: number): boolean {
     status === 503 || status === 504;
 }
 
+function normalizeMetricKeyPart(value: string | undefined): string {
+  const text = String(value || "").trim();
+  return text || "";
+}
+
+function metricBucketMinute(iso: string): string {
+  const timestamp = normalizeTimestamp(iso) || utcNowIso();
+  return timestamp.slice(0, 16) + ":00.000Z";
+}
+
+function aggregateServiceEgressMetrics(rows: ServiceEgressMetricRow[]): ServiceEgressMetricRow[] {
+  const byKey = new Map<string, ServiceEgressMetricRow>();
+  for (const row of rows) {
+    const key = [
+      normalizeMetricKeyPart(row.bucket_minute),
+      normalizeMetricKeyPart(row.env_name),
+      normalizeMetricKeyPart(row.project_ref),
+      normalizeMetricKeyPart(row.service_name),
+      normalizeMetricKeyPart(row.source_type),
+      normalizeMetricKeyPart(row.source_name),
+      normalizeMetricKeyPart(row.route_name),
+      normalizeMetricKeyPart(row.query_name),
+      normalizeMetricKeyPart(row.window_label),
+      normalizeMetricKeyPart(row.status),
+    ].join("|");
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, {
+        ...row,
+        request_count: Math.max(0, row.request_count ?? 0),
+        response_rows: Math.max(0, row.response_rows ?? 0),
+        response_bytes_est: Math.max(0, row.response_bytes_est ?? 0),
+        upstream_bytes_est: Math.max(0, row.upstream_bytes_est ?? 0),
+        cache_hit_count: Math.max(0, row.cache_hit_count ?? 0),
+        cache_miss_count: Math.max(0, row.cache_miss_count ?? 0),
+        objects_written_count: Math.max(0, row.objects_written_count ?? 0),
+        objects_written_bytes: Math.max(0, row.objects_written_bytes ?? 0),
+        duration_ms: Math.max(0, row.duration_ms ?? 0),
+        error_count: Math.max(0, row.error_count ?? 0),
+      });
+      continue;
+    }
+    existing.request_count = (existing.request_count ?? 0) + Math.max(0, row.request_count ?? 0);
+    existing.response_rows = (existing.response_rows ?? 0) + Math.max(0, row.response_rows ?? 0);
+    existing.response_bytes_est = (existing.response_bytes_est ?? 0) +
+      Math.max(0, row.response_bytes_est ?? 0);
+    existing.upstream_bytes_est = (existing.upstream_bytes_est ?? 0) +
+      Math.max(0, row.upstream_bytes_est ?? 0);
+    existing.cache_hit_count = (existing.cache_hit_count ?? 0) + Math.max(0, row.cache_hit_count ?? 0);
+    existing.cache_miss_count = (existing.cache_miss_count ?? 0) + Math.max(0, row.cache_miss_count ?? 0);
+    existing.objects_written_count = (existing.objects_written_count ?? 0) +
+      Math.max(0, row.objects_written_count ?? 0);
+    existing.objects_written_bytes = (existing.objects_written_bytes ?? 0) +
+      Math.max(0, row.objects_written_bytes ?? 0);
+    existing.duration_ms = (existing.duration_ms ?? 0) + Math.max(0, row.duration_ms ?? 0);
+    existing.error_count = (existing.error_count ?? 0) + Math.max(0, row.error_count ?? 0);
+    if (row.notes && typeof row.notes === "object") {
+      existing.notes = { ...(existing.notes || {}), ...row.notes };
+    }
+  }
+  return [...byKey.values()];
+}
+
+async function postgrestRpcToUrl(
+  baseUrl: string,
+  apiKey: string,
+  schema: string,
+  rpcName: string,
+  body: Record<string, unknown>,
+): Promise<{ ok: boolean; status: number; message: string; payload: unknown }> {
+  const endpoint = `${baseUrl.replace(/\/$/, "")}/rest/v1/rpc/${rpcName}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: apiKey,
+      Authorization: `Bearer ${apiKey}`,
+      "Accept-Profile": schema,
+      "Content-Profile": schema,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = text || null;
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: response.status,
+      message: extractErrorMessage(payload, response.status),
+      payload,
+    };
+  }
+  return { ok: true, status: response.status, message: "ok", payload };
+}
+
+async function publishServiceEgressMetrics(rows: ServiceEgressMetricRow[]): Promise<void> {
+  if (!UK_AQ_SERVICE_EGRESS_METRICS_ENABLED) {
+    return;
+  }
+  const sinkUrl = UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL;
+  const sinkKey = UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY;
+  if (!sinkUrl || !sinkKey || !UK_AQ_SERVICE_EGRESS_METRICS_RPC || !UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA) {
+    return;
+  }
+  if (!rows.length) {
+    return;
+  }
+  const response = await postgrestRpcToUrl(
+    sinkUrl,
+    sinkKey,
+    UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA,
+    UK_AQ_SERVICE_EGRESS_METRICS_RPC,
+    { p_rows: rows },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `Metrics RPC failed HTTP ${response.status}: ${response.message}`,
+    );
+  }
+}
+
 async function loadExistingManifest(): Promise<SnapshotManifest | null> {
   try {
     const existing = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY });
@@ -819,10 +1090,13 @@ async function loadExistingManifest(): Promise<SnapshotManifest | null> {
 async function buildSnapshotFor(
   pollutant: string,
   windowLabel: string,
-): Promise<{ payload: SnapshotPayload; rows: LatestItem[] }> {
+): Promise<{ payload: SnapshotPayload; rows: LatestItem[]; rpc_meta: RpcCallMeta; rpc_signature: string; raw_row_count: number }> {
   const rpcResult = await callLatestRpc(toRpcPollutant(pollutant), windowLabel);
   if (rpcResult.error) {
-    throw new Error(rpcResult.error.message);
+    const error = new Error(rpcResult.error.message);
+    (error as Error & { rpc_meta?: RpcCallMeta; rpc_signature?: string }).rpc_meta = rpcResult.meta;
+    (error as Error & { rpc_meta?: RpcCallMeta; rpc_signature?: string }).rpc_signature = rpcResult.signature;
+    throw error;
   }
   const rawRows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
   const nextCursor = deriveNextCursor(rawRows, null, null);
@@ -853,7 +1127,13 @@ async function buildSnapshotFor(
     data: rows,
   };
 
-  return { payload, rows };
+  return {
+    payload,
+    rows,
+    rpc_meta: rpcResult.meta,
+    rpc_signature: rpcResult.signature,
+    raw_row_count: rawRows.length,
+  };
 }
 
 async function main(): Promise<void> {
@@ -877,6 +1157,10 @@ async function main(): Promise<void> {
   const startedAt = utcNowIso();
   const startedMs = Date.now();
   const warnings: string[] = [];
+  const serviceEgressMetricRows: ServiceEgressMetricRow[] = [];
+  const serviceProjectRef = UK_AQ_SERVICE_EGRESS_PROJECT_REF ||
+    deriveProjectRef(UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL) ||
+    deriveProjectRef(SUPABASE_URL);
 
   const previousManifest = await loadExistingManifest();
   const previousById = new Map<string, SnapshotManifestEntry>();
@@ -900,12 +1184,13 @@ async function main(): Promise<void> {
       const previous = previousById.get(id) || null;
 
       try {
-        const { payload, rows } = await buildSnapshotFor(pollutant, windowLabel);
+        const { payload, rows, rpc_meta, rpc_signature, raw_row_count } = await buildSnapshotFor(pollutant, windowLabel);
         const body = `${toStableJson(payload)}\n`;
-        const bodyBytes = new TextEncoder().encode(body);
+        const bodyBytes = TEXT_ENCODER.encode(body);
         const hash = sha256Hex(bodyBytes);
         const etag = `"sha256-${hash}"`;
         const changed = previous?.sha256 !== hash || previous?.object_key !== key;
+        const itemDurationMs = Date.now() - itemStarted;
 
         if (changed) {
           await r2PutObject({
@@ -918,6 +1203,59 @@ async function main(): Promise<void> {
         } else {
           skippedUnchangedCount += 1;
         }
+
+        serviceEgressMetricRows.push({
+          bucket_minute: metricBucketMinute(startedAt),
+          env_name: UK_AQ_SERVICE_EGRESS_ENV,
+          project_ref: serviceProjectRef,
+          service_name: "uk_aq_latest_snapshot_builder",
+          source_type: "supabase",
+          source_name: deriveProjectRef(SUPABASE_URL) || "source_supabase",
+          route_name: "snapshot_matrix_build",
+          query_name: UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC,
+          window_label: windowLabel,
+          status: "ok",
+          request_count: 1,
+          response_rows: raw_row_count,
+          response_bytes_est: rpc_meta.response_bytes,
+          upstream_bytes_est: rpc_meta.response_bytes,
+          duration_ms: rpc_meta.duration_ms,
+          error_count: 0,
+          notes: {
+            trigger_mode: triggerMode,
+            pollutant,
+            rpc_signature,
+            rpc_attempt_count: rpc_meta.attempt_count,
+            rpc_retry_count: rpc_meta.retry_count,
+            rpc_http_status: rpc_meta.http_status,
+          },
+        });
+
+        serviceEgressMetricRows.push({
+          bucket_minute: metricBucketMinute(startedAt),
+          env_name: UK_AQ_SERVICE_EGRESS_ENV,
+          project_ref: serviceProjectRef,
+          service_name: "uk_aq_latest_snapshot_builder",
+          source_type: "r2",
+          source_name: R2_CONFIG.bucket || "",
+          route_name: "snapshot_object_write",
+          query_name: "r2PutObject",
+          window_label: windowLabel,
+          status: changed ? "ok" : "skipped",
+          request_count: changed ? 1 : 0,
+          response_rows: 0,
+          response_bytes_est: 0,
+          upstream_bytes_est: changed ? bodyBytes.byteLength : 0,
+          objects_written_count: changed ? 1 : 0,
+          objects_written_bytes: changed ? bodyBytes.byteLength : 0,
+          duration_ms: itemDurationMs,
+          error_count: 0,
+          notes: {
+            trigger_mode: triggerMode,
+            pollutant,
+            changed,
+          },
+        });
 
         const observed = minMaxObservedAt(rows);
         entries.push({
@@ -935,7 +1273,7 @@ async function main(): Promise<void> {
           min_observed_at: observed.min,
           max_observed_at: observed.max,
           generated_at: utcNowIso(),
-          build_duration_ms: Date.now() - itemStarted,
+          build_duration_ms: itemDurationMs,
           previous_sha256: previous?.sha256 ?? null,
           changed,
           error: null,
@@ -943,8 +1281,37 @@ async function main(): Promise<void> {
         successCount += 1;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const rpcMeta = (error as Error & { rpc_meta?: RpcCallMeta }).rpc_meta;
+        const rpcSignature = (error as Error & { rpc_signature?: string }).rpc_signature;
         failureCount += 1;
         warnings.push(`${id}: ${message}`);
+        serviceEgressMetricRows.push({
+          bucket_minute: metricBucketMinute(startedAt),
+          env_name: UK_AQ_SERVICE_EGRESS_ENV,
+          project_ref: serviceProjectRef,
+          service_name: "uk_aq_latest_snapshot_builder",
+          source_type: "supabase",
+          source_name: deriveProjectRef(SUPABASE_URL) || "source_supabase",
+          route_name: "snapshot_matrix_build",
+          query_name: UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC,
+          window_label: windowLabel,
+          status: "error",
+          request_count: 1,
+          response_rows: 0,
+          response_bytes_est: rpcMeta?.response_bytes ?? 0,
+          upstream_bytes_est: rpcMeta?.response_bytes ?? 0,
+          duration_ms: rpcMeta?.duration_ms ?? (Date.now() - itemStarted),
+          error_count: 1,
+          notes: {
+            trigger_mode: triggerMode,
+            pollutant,
+            rpc_signature: rpcSignature || null,
+            rpc_attempt_count: rpcMeta?.attempt_count ?? null,
+            rpc_retry_count: rpcMeta?.retry_count ?? null,
+            rpc_http_status: rpcMeta?.http_status ?? null,
+            error: message,
+          },
+        });
 
         if (previous) {
           entries.push({
@@ -1040,9 +1407,17 @@ async function main(): Promise<void> {
     await r2PutObject({
       r2: R2_CONFIG,
       key: reportKey,
-      body: new TextEncoder().encode(`${toStableJson(report)}\n`),
+      body: TEXT_ENCODER.encode(`${toStableJson(report)}\n`),
       content_type: "application/json; charset=utf-8",
     });
+  }
+
+  const aggregatedEgressMetrics = aggregateServiceEgressMetrics(serviceEgressMetricRows);
+  try {
+    await publishServiceEgressMetrics(aggregatedEgressMetrics);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    warnings.push(`service_egress_metrics_flush_failed: ${message}`);
   }
 
   const report: BuildReport = {

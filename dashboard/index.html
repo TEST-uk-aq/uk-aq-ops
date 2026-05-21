@@ -4617,6 +4617,135 @@
         }
       }
 
+      function renderServiceEgressPanel(rows, sourceError) {
+        const panel = document.createElement("section");
+        panel.className = "panel";
+        panel.dataset.panel = "service-egress";
+
+        const normalizedRows = Array.isArray(rows) ? rows : [];
+        const cutoffMs = Date.now() - (24 * 60 * 60 * 1000);
+        const latestSnapshotRows = normalizedRows.filter((row) => {
+          if (!row || row.service_name !== "uk_aq_latest_snapshot_builder") {
+            return false;
+          }
+          const bucketMs = new Date(row.bucket_minute || "").getTime();
+          return Number.isFinite(bucketMs) && bucketMs >= cutoffMs;
+        });
+
+        const grouped = new Map();
+        latestSnapshotRows.forEach((row) => {
+          const key = [
+            String(row.source_type || "other"),
+            String(row.route_name || ""),
+            String(row.query_name || ""),
+            String(row.window_label || ""),
+          ].join("|");
+          const current = grouped.get(key) || {
+            source_type: String(row.source_type || "other"),
+            route_name: String(row.route_name || ""),
+            query_name: String(row.query_name || ""),
+            window_label: String(row.window_label || ""),
+            request_count: 0,
+            response_rows: 0,
+            response_bytes_est: 0,
+            upstream_bytes_est: 0,
+            objects_written_count: 0,
+            objects_written_bytes: 0,
+            duration_ms: 0,
+            error_count: 0,
+          };
+          current.request_count += Number(row.request_count || 0);
+          current.response_rows += Number(row.response_rows || 0);
+          current.response_bytes_est += Number(row.response_bytes_est || 0);
+          current.upstream_bytes_est += Number(row.upstream_bytes_est || 0);
+          current.objects_written_count += Number(row.objects_written_count || 0);
+          current.objects_written_bytes += Number(row.objects_written_bytes || 0);
+          current.duration_ms += Number(row.duration_ms || 0);
+          current.error_count += Number(row.error_count || 0);
+          grouped.set(key, current);
+        });
+
+        const tableRows = Array.from(grouped.values()).sort((a, b) => {
+          const aBytes = Number(a.response_bytes_est || 0) + Number(a.upstream_bytes_est || 0);
+          const bBytes = Number(b.response_bytes_est || 0) + Number(b.upstream_bytes_est || 0);
+          return bBytes - aBytes;
+        });
+
+        const totals = tableRows.reduce((acc, row) => {
+          acc.request_count += Number(row.request_count || 0);
+          acc.response_rows += Number(row.response_rows || 0);
+          acc.response_bytes_est += Number(row.response_bytes_est || 0);
+          acc.upstream_bytes_est += Number(row.upstream_bytes_est || 0);
+          acc.objects_written_count += Number(row.objects_written_count || 0);
+          acc.objects_written_bytes += Number(row.objects_written_bytes || 0);
+          acc.duration_ms += Number(row.duration_ms || 0);
+          acc.error_count += Number(row.error_count || 0);
+          return acc;
+        }, {
+          request_count: 0,
+          response_rows: 0,
+          response_bytes_est: 0,
+          upstream_bytes_est: 0,
+          objects_written_count: 0,
+          objects_written_bytes: 0,
+          duration_ms: 0,
+          error_count: 0,
+        });
+
+        const rowsMarkup = tableRows.length
+          ? tableRows.map((row) => `
+              <tr>
+                <td>${escapeHtml(String(row.source_type || ""))}</td>
+                <td>${escapeHtml(String(row.window_label || "all"))}</td>
+                <td>${escapeHtml(String(row.route_name || ""))}</td>
+                <td>${escapeHtml(String(row.query_name || ""))}</td>
+                <td>${formatCount(row.request_count)}</td>
+                <td>${formatCompactCount(row.response_rows)}</td>
+                <td>${formatBytesBestFit(row.response_bytes_est)}</td>
+                <td>${formatBytesBestFit(row.upstream_bytes_est)}</td>
+                <td>${formatCount(row.objects_written_count)}</td>
+                <td>${formatBytesBestFit(row.objects_written_bytes)}</td>
+                <td>${formatCompactCount(row.duration_ms)}</td>
+                <td>${formatCount(row.error_count)}</td>
+              </tr>
+            `).join("")
+          : `<tr><td colspan="12">No latest-snapshot service egress rows in the last 24h.</td></tr>`;
+
+        const warningLine = sourceError
+          ? `<div class="footnote">Metrics source warning: ${escapeHtml(String(sourceError))}</div>`
+          : "";
+
+        panel.innerHTML = `
+          <h2>Latest Snapshot Service Egress (24h) <span class="chip">beta</span></h2>
+          <div class="meta-note">
+            Requests ${formatCount(totals.request_count)} · Supabase response ${formatBytesBestFit(totals.response_bytes_est)} · Upstream ${formatBytesBestFit(totals.upstream_bytes_est)} · R2 write ${formatBytesBestFit(totals.objects_written_bytes)} · Errors ${formatCount(totals.error_count)}
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Window</th>
+                <th>Route</th>
+                <th>Query</th>
+                <th>Req</th>
+                <th>Rows</th>
+                <th>Resp bytes</th>
+                <th>Upstream bytes</th>
+                <th>R2 writes</th>
+                <th>R2 bytes</th>
+                <th>Duration ms</th>
+                <th>Errors</th>
+              </tr>
+            </thead>
+            <tbody>${rowsMarkup}</tbody>
+          </table>
+          <div class="footnote">Rollup source: uk_aq_public.uk_aq_service_egress_metrics_minute. Values are estimates, not Supabase billing authority.</div>
+          ${warningLine}
+        `;
+
+        return panel;
+      }
+
       function renderStorageCoverageCalendarPanel(serverCoverageRows, options = {}) {
         const forceConnectorCountsRefresh = Boolean(options.forceConnectorCountsRefresh);
         const monthStartUtc = storageCoverageMonthCursor || startOfUtcMonth(new Date());
@@ -5802,6 +5931,10 @@
               data.r2_usage_error,
               data.r2_backup_window,
               data.r2_backup_window_error,
+            ),
+            renderServiceEgressPanel(
+              data.service_egress_metrics,
+              data.service_egress_metrics_error,
             ),
             renderStorageCoverageLoadingPanel("Refreshing calendar..."),
           ];

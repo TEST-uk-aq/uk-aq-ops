@@ -38,6 +38,13 @@ Builds latest map snapshots from `uk_aq_public.uk_aq_latest_rpc` and publishes d
 - `UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED` (default `true`)
 - `UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES` (default `3`)
 - `UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS` (default `20000`)
+- `UK_AQ_SERVICE_EGRESS_METRICS_ENABLED` (default `false`)
+- `UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL` (optional metrics sink URL; default disabled if empty)
+- `UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY` (optional metrics sink service key)
+- `UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA` (default `uk_aq_public`)
+- `UK_AQ_SERVICE_EGRESS_METRICS_RPC` (default `uk_aq_rpc_service_egress_metrics_batch_upsert`)
+- `UK_AQ_SERVICE_EGRESS_ENV` (default `UK_AQ_ENV` or `unknown`)
+- `UK_AQ_SERVICE_EGRESS_PROJECT_REF` (optional project ref override for attribution rows)
 
 ## Trigger mode
 
