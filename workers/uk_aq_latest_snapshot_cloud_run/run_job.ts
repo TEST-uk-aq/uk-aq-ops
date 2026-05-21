@@ -1,20 +1,12 @@
+import zlib from "node:zlib";
 import {
   hasRequiredR2Config,
   normalizePrefix,
   r2GetObject,
+  r2HeadObject,
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
-
-type RpcError = { message: string };
-type RpcCallMeta = {
-  attempt_count: number;
-  retry_count: number;
-  http_status: number | null;
-  duration_ms: number;
-  response_bytes: number;
-};
-type RpcResult<T> = { data: T | null; error: RpcError | null; meta: RpcCallMeta };
 
 type ServiceEgressMetricRow = {
   bucket_minute?: string;
@@ -38,20 +30,6 @@ type ServiceEgressMetricRow = {
   duration_ms?: number;
   error_count?: number;
   notes?: Record<string, unknown> | null;
-};
-
-type RawLatestRow = {
-  id: number | null;
-  updated_at: string | null;
-  timeseries_ref: string | null;
-  label: string | null;
-  uom: string | null;
-  last_value: number | null;
-  last_value_at: string | null;
-  connector_id: number | null;
-  connector: Record<string, unknown> | null;
-  station: Record<string, unknown> | null;
-  phenomenon: Record<string, unknown> | null;
 };
 
 type LatestItem = {
@@ -117,10 +95,11 @@ type SnapshotManifest = {
   generated_at: string;
   trigger_mode: string;
   source: {
-    type: "postgrest_rpc";
-    supabase_url: string;
-    rpc: string;
-    schema: string;
+    type: "pubsub_observation_state";
+    pubsub_subscription: string;
+    state_key: string;
+    core_metadata_prefix: string;
+    core_metadata_day_utc: string | null;
   };
   matrix: {
     network_group: string;
@@ -152,15 +131,182 @@ type BuildReport = {
   warnings: string[];
 };
 
-const SUPABASE_URL = requiredEnv("SUPABASE_URL");
-const SB_SECRET_KEY = requiredEnv("SB_SECRET_KEY");
-const UK_AQ_PUBLIC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
-const UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC = (
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC") || "uk_aq_latest_rpc"
+type PubsubPullMessage = {
+  ackId?: unknown;
+  message?: {
+    data?: unknown;
+  };
+};
+
+type PubsubPullResponse = {
+  receivedMessages?: unknown;
+};
+
+type ObservationMessageRow = {
+  connector_id: number;
+  timeseries_id: number;
+  observed_at: string;
+  value: number | null;
+  value_float8_hex: string | null;
+  status: string | null;
+};
+
+type DecodedMessage = {
+  ackId: string | null;
+  row: ObservationMessageRow | null;
+  payloadBytes: number;
+};
+
+type PullSummary = {
+  pull_requests: number;
+  pulled_messages: number;
+  decoded_rows: number;
+  malformed_messages: number;
+  acked_messages: number;
+  payload_bytes: number;
+  duration_ms: number;
+};
+
+type LatestStateEntry = {
+  connector_id: number;
+  timeseries_id: number;
+  observed_at: string;
+  value: number | null;
+  value_float8_hex: string | null;
+  status: string | null;
+  ingested_at: string | null;
+};
+
+type LatestStateFile = {
+  schema_version: 1;
+  updated_at: string;
+  entries: LatestStateEntry[];
+};
+
+type LoadedState = {
+  stateMap: Map<string, LatestStateEntry>;
+  existingHash: string | null;
+  existingBytes: number;
+};
+
+type StateApplySummary = {
+  applied_new: number;
+  applied_newer: number;
+  skipped_older: number;
+  skipped_duplicate: number;
+};
+
+type CoreSnapshotManifest = {
+  day_utc: string | null;
+  tables: Array<{ table: string; key: string }>;
+};
+
+type MetadataConnector = {
+  id: number;
+  connector_code: string | null;
+  label: string | null;
+  display_name: string | null;
+  station_display_name_template: string | null;
+};
+
+type MetadataStation = {
+  id: number;
+  connector_id: number | null;
+  station_ref: string | null;
+  label: string | null;
+  station_name: string | null;
+  pcon_code: string | null;
+  la_code: string | null;
+};
+
+type MetadataMembership = {
+  station_id: number;
+  network_code: string;
+  network_label: string | null;
+  is_primary: boolean;
+};
+
+type MetadataTimeseries = {
+  id: number;
+  connector_id: number | null;
+  station_id: number | null;
+  phenomenon_id: number | null;
+  label: string | null;
+  uom: string | null;
+};
+
+type MetadataPhenomenon = {
+  id: number;
+  observed_property_id: number | null;
+  label: string | null;
+  notation: string | null;
+  pollutant_label: string | null;
+  source_label: string | null;
+};
+
+type MetadataObservedProperty = {
+  id: number;
+  code: string | null;
+  display_name: string | null;
+};
+
+type CoreMetadataCacheFile = {
+  schema_version: 1;
+  generated_at: string;
+  source_day_utc: string | null;
+  connectors: MetadataConnector[];
+  stations: MetadataStation[];
+  memberships: MetadataMembership[];
+  timeseries: MetadataTimeseries[];
+  phenomena: MetadataPhenomenon[];
+  observed_properties: MetadataObservedProperty[];
+};
+
+type MetadataIndex = {
+  source_day_utc: string | null;
+  connectorsById: Map<number, MetadataConnector>;
+  stationsById: Map<number, MetadataStation>;
+  membershipsByStationId: Map<number, MetadataMembership[]>;
+  timeseriesById: Map<number, MetadataTimeseries>;
+  phenomenaById: Map<number, MetadataPhenomenon>;
+  observedPropertyById: Map<number, MetadataObservedProperty>;
+};
+
+type MetadataRefreshStats = {
+  refreshed: boolean;
+  source_day_utc: string | null;
+  objects_read: number;
+  bytes_read: number;
+  cache_bytes_written: number;
+  duration_ms: number;
+};
+
+type SnapshotSourceRow = {
+  pollutant: string;
+  item: LatestItem;
+};
+
+const PUBSUB_PROJECT_ID = (
+  Deno.env.get("GCP_PROJECT_ID") ||
+  Deno.env.get("GOOGLE_CLOUD_PROJECT") ||
+  ""
 ).trim();
-const UK_AQ_LATEST_SNAPSHOT_LIMIT = Math.min(
-  10000,
-  Math.max(1, parsePositiveInt(Deno.env.get("UK_AQ_LATEST_SNAPSHOT_LIMIT"), 10000)),
+
+const PUBSUB_SUBSCRIPTION = (
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION") ||
+  "uk-aq-latest-snapshot-sub"
+).trim();
+
+const OBSERVS_BASE_SUBSCRIPTION = (
+  Deno.env.get("OBSERVS_PUBSUB_SUBSCRIPTION") ||
+  ""
+).trim();
+
+const PUBSUB_PULL_MAX_MESSAGES = 1000;
+const PUBSUB_MAX_BATCHES_PER_RUN = 8;
+const PUBSUB_PULL_RETRIES = parsePositiveInt(
+  Deno.env.get("OBSERVS_PUBSUB_WRITER_PUBSUB_RETRIES"),
+  3,
 );
 
 const UK_AQ_LATEST_SNAPSHOT_POLLUTANTS = parseCsvList(
@@ -188,14 +334,22 @@ const UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED = parseBoolean(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED"),
   true,
 );
-const UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES = parsePositiveInt(
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES"),
-  3,
+const UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX = normalizePrefix(
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX") || "latest_snapshots_state/v1",
 );
-const UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS = parsePositiveInt(
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS"),
-  20000,
+const UK_AQ_LATEST_SNAPSHOT_STATE_KEY = `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/latest_state.json`;
+const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX = normalizePrefix(
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX") || "history/v1/core",
 );
+const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY =
+  `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/core_metadata_cache.json`;
+const UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS = parsePositiveInt(
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS"),
+  86400,
+);
+const UK_AQ_LATEST_SNAPSHOT_CORE_LOOKBACK_DAYS = 14;
+const UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES = 500_000;
+
 const UK_AQ_SERVICE_EGRESS_METRICS_ENABLED = parseBoolean(
   Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_ENABLED"),
   false,
@@ -204,7 +358,7 @@ const UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL = (
   Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL") || ""
 ).trim();
 const UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY = (
-  Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY") || SB_SECRET_KEY
+  Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY") || ""
 ).trim();
 const UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA = (
   Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA") || "uk_aq_public"
@@ -226,15 +380,8 @@ const R2_CONFIG = {
   access_key_id: optionalEnvAny(["CFLARE_R2_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"]) || "",
   secret_access_key: optionalEnvAny(["CFLARE_R2_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"]) || "",
 };
-const TEXT_ENCODER = new TextEncoder();
 
-function requiredEnv(name: string): string {
-  const value = (Deno.env.get(name) || "").trim();
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
+const TEXT_ENCODER = new TextEncoder();
 
 function optionalEnvAny(names: string[]): string | null {
   for (const name of names) {
@@ -256,156 +403,97 @@ function parsePositiveInt(raw: string | undefined | null, fallback: number): num
 
 function parseBoolean(raw: string | undefined | null, fallback: boolean): boolean {
   const value = String(raw || "").trim().toLowerCase();
-  if (!value) {
-    return fallback;
-  }
-  if (["1", "true", "yes", "y", "on"].includes(value)) {
-    return true;
-  }
-  if (["0", "false", "no", "n", "off"].includes(value)) {
-    return false;
-  }
+  if (!value) return fallback;
+  if (["1", "true", "yes", "y", "on"].includes(value)) return true;
+  if (["0", "false", "no", "n", "off"].includes(value)) return false;
   return fallback;
 }
 
 function parseCsvList(raw: string | undefined | null, fallback: string[]): string[] {
   const source = String(raw || "").trim();
-  if (!source) {
-    return [...fallback];
-  }
+  if (!source) return [...fallback];
   const values = source.split(",").map((value) => value.trim()).filter(Boolean);
   return values.length ? values : [...fallback];
 }
 
-function measureUtf8Bytes(value: string): number {
-  if (!value) {
-    return 0;
-  }
-  return TEXT_ENCODER.encode(value).byteLength;
-}
-
-function deriveProjectRef(supabaseUrl: string): string {
-  const trimmed = String(supabaseUrl || "").trim();
-  if (!trimmed) {
-    return "";
-  }
-  try {
-    const host = new URL(trimmed).hostname.toLowerCase();
-    if (host.endsWith(".supabase.co")) {
-      return host.slice(0, -".supabase.co".length);
-    }
-    if (host.endsWith(".supabase.in")) {
-      return host.slice(0, -".supabase.in".length);
-    }
-  } catch {
-    return "";
-  }
-  return "";
-}
-
-function normalizeMatrixPollutant(value: string | null): string | null {
-  const normalized = normalizeText(value);
-  if (!normalized) {
-    return null;
-  }
-  const compact = normalized.toLowerCase().replace(/[\s_.-]/g, "");
-  if (compact === "pm25") {
-    return "pm25";
-  }
-  if (compact === "pm10") {
-    return "pm10";
-  }
-  if (compact === "no2") {
-    return "no2";
-  }
-  return null;
-}
-
-function toRpcPollutant(matrixPollutant: string): string {
-  const normalized = normalizeMatrixPollutant(matrixPollutant);
-  if (normalized === "pm25") {
-    return "pm2.5";
-  }
-  return normalized || matrixPollutant;
-}
-
-function normalizePollutant(value: string | null): string | null {
-  const normalized = normalizeText(value);
-  if (!normalized) {
-    return null;
-  }
-  const compact = normalized.toLowerCase().replace(/[\s_]/g, "");
-  if (compact === "pm25" || compact === "pm2.5") {
-    return "pm2.5";
-  }
-  if (compact === "pm10") {
-    return "pm10";
-  }
-  if (compact === "no2") {
-    return "no2";
-  }
-  return normalized.toLowerCase();
-}
-
-function normalizeWindow(value: string | null): string | null {
-  const normalized = normalizeText(value)?.toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  return ["3h", "6h", "1d", "7d", "all"].includes(normalized)
-    ? normalized
-    : null;
-}
-
 function normalizeText(value: string | null): string | null {
-  if (!value) {
-    return null;
-  }
+  if (!value) return null;
   const trimmed = value.trim();
   return trimmed || null;
 }
 
 function normalizeTimestamp(value: unknown): string | null {
   const text = typeof value === "string" ? value.trim() : "";
-  if (!text) {
-    return null;
-  }
+  if (!text) return null;
   const ms = Date.parse(text);
-  if (!Number.isFinite(ms)) {
-    return null;
-  }
+  if (!Number.isFinite(ms)) return null;
   return new Date(ms).toISOString();
 }
 
-function normalizeCursorId(value: unknown): number | null {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return null;
-  }
-  return Math.trunc(parsed);
-}
-
 function normalizeNonEmptyText(value: string | null | undefined): string | null {
-  if (value === null || value === undefined) {
-    return null;
-  }
+  if (value === null || value === undefined) return null;
   const trimmed = String(value).trim();
-  return trimmed ? trimmed : null;
+  return trimmed || null;
 }
 
-function formatUnit(unit: string | null): string | null {
-  if (!unit) {
-    return null;
+function normalizeMatrixPollutant(value: string | null): string | null {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  const compact = normalized.toLowerCase().replace(/[\s_.-]/g, "");
+  if (compact === "pm25") return "pm25";
+  if (compact === "pm10") return "pm10";
+  if (compact === "no2") return "no2";
+  return null;
+}
+
+function normalizePollutant(value: string | null): string | null {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  const compact = normalized.toLowerCase().replace(/[\s_]/g, "");
+  if (compact === "pm25" || compact === "pm2.5") return "pm2.5";
+  if (compact === "pm10") return "pm10";
+  if (compact === "no2") return "no2";
+  return normalized.toLowerCase();
+}
+
+function normalizeWindow(value: string | null): string | null {
+  const normalized = normalizeText(value)?.toLowerCase();
+  if (!normalized) return null;
+  return ["3h", "6h", "1d", "7d", "all"].includes(normalized) ? normalized : null;
+}
+
+function measureUtf8Bytes(value: string): number {
+  if (!value) return 0;
+  return TEXT_ENCODER.encode(value).byteLength;
+}
+
+function deriveProjectRef(supabaseUrl: string): string {
+  const trimmed = String(supabaseUrl || "").trim();
+  if (!trimmed) return "";
+  try {
+    const host = new URL(trimmed).hostname.toLowerCase();
+    if (host.endsWith(".supabase.co")) return host.slice(0, -".supabase.co".length);
+    if (host.endsWith(".supabase.in")) return host.slice(0, -".supabase.in".length);
+  } catch {
+    return "";
   }
-  const trimmed = unit.trim();
-  if (!trimmed) {
-    return null;
-  }
-  const normalized = trimmed.toLowerCase().replace(/µ/g, "u");
-  if (normalized.includes("ug") && /m\s*[-^]?\s*3/.test(normalized)) {
-    return "µg/m³";
-  }
-  return trimmed;
+  return "";
+}
+
+function utcNowIso(): string {
+  return new Date().toISOString();
+}
+
+function compactTimestamp(iso: string): string {
+  return iso.replace(/[:-]|\.\d{3}/g, "");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 function looksLikeUrl(value: string): boolean {
@@ -417,20 +505,14 @@ function looksLikePollutantUri(value: string): boolean {
 }
 
 function deriveStationLabel(label: string | null): string | null {
-  if (!label) {
-    return null;
-  }
+  if (!label) return null;
   const separator = label.includes(" - ") ? " - " : "-";
   const parts = label.split(separator).map((part) => part.trim()).filter(Boolean);
-  if (!parts.length) {
-    return label;
-  }
+  if (!parts.length) return label;
   if (parts.length > 1 && (looksLikePollutantUri(parts[0]) || looksLikeUrl(parts[0]))) {
     return parts[parts.length - 1];
   }
-  if (parts.length === 1 && looksLikeUrl(parts[0])) {
-    return null;
-  }
+  if (parts.length === 1 && looksLikeUrl(parts[0])) return null;
   return parts[0];
 }
 
@@ -440,13 +522,9 @@ function resolveStationLabel(
   seriesLabel: string | null,
 ): string | null {
   const normalizedStationLabel = normalizeNonEmptyText(stationLabel);
-  if (normalizedStationLabel) {
-    return normalizedStationLabel;
-  }
+  if (normalizedStationLabel) return normalizedStationLabel;
   const derived = normalizeNonEmptyText(deriveStationLabel(seriesLabel));
-  if (derived) {
-    return derived;
-  }
+  if (derived) return derived;
   return normalizeNonEmptyText(stationRef);
 }
 
@@ -521,9 +599,7 @@ function formatFallbackDisplayName(
   }
   if (!normalizedName) return base;
   const normalizedBase = base.toLowerCase();
-  if (normalizedRef && normalizedBase.includes(normalizedRef.toLowerCase())) {
-    return base;
-  }
+  if (normalizedRef && normalizedBase.includes(normalizedRef.toLowerCase())) return base;
   return normalizedRef ? `${base} - ${normalizedRef}` : base;
 }
 
@@ -531,393 +607,42 @@ function formatDisplayName(
   template: string | null | undefined,
   stationName: string | null | undefined,
   stationLabel: string | null | undefined,
-  stationRef: string | number,
+  stationRef: string | number | null,
   stationId: string | number | null | undefined,
 ): string | null {
   const refText = normalizeNonEmptyText(stationRef !== null && stationRef !== undefined ? String(stationRef) : null);
   const fallback = formatFallbackDisplayName(stationName, stationLabel, refText, stationId);
   const effectiveTemplate = template?.trim();
-  if (!effectiveTemplate) {
-    return fallback;
-  }
+  if (!effectiveTemplate) return fallback;
   const rendered = renderDisplayTemplate(effectiveTemplate, {
     station_name: stationName ?? "",
     station_label: stationLabel ?? "",
     station_ref: refText ?? "",
   });
-  if (rendered) {
-    return rendered;
-  }
+  if (rendered) return rendered;
   return fallback;
 }
 
-function hasAssignedGeoCode(row: RawLatestRow): boolean {
-  const station = (row.station ?? null) as Record<string, unknown> | null;
-  const pconCode = typeof station?.pcon_code === "string"
-    ? station.pcon_code.trim()
-    : "";
-  const laCode = typeof station?.la_code === "string"
-    ? station.la_code.trim()
-    : "";
-  return Boolean(pconCode || laCode);
+function formatUnit(unit: string | null): string | null {
+  if (!unit) return null;
+  const trimmed = unit.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.toLowerCase().replace(/µ/g, "u");
+  if (normalized.includes("ug") && /m\s*[-^]?\s*3/.test(normalized)) return "µg/m³";
+  return trimmed;
 }
 
-function passesOutlierThreshold(row: RawLatestRow): boolean {
-  const rawValue = row?.last_value;
-  const value = Number(rawValue);
-  if (!Number.isFinite(value)) {
-    return false;
-  }
-  const phenomenon = (row.phenomenon ?? null) as Record<string, unknown> | null;
-  const pollutant = normalizePollutant(
-    (phenomenon?.observed_property_code as string | null)
-      ?? (phenomenon?.notation as string | null)
-      ?? (phenomenon?.pollutant_label as string | null)
-      ?? (phenomenon?.label as string | null)
-      ?? null,
-  );
-  if (!pollutant) {
-    return true;
-  }
+function passesOutlierThreshold(pollutant: string | null, value: number | null): boolean {
+  if (value === null || !Number.isFinite(value)) return false;
+  if (!pollutant) return true;
   const thresholds: Record<string, { min: number; max: number }> = {
     "pm2.5": { min: 0, max: 500 },
     "pm25": { min: 0, max: 500 },
     "pm10": { min: 0, max: 600 },
   };
   const bounds = thresholds[pollutant];
-  if (!bounds) {
-    return true;
-  }
+  if (!bounds) return true;
   return value >= bounds.min && value <= bounds.max;
-}
-
-function deriveNextCursor(
-  rows: RawLatestRow[],
-  fallbackSince: string | null,
-  fallbackSinceId: number | null,
-): { since: string | null; sinceId: number | null } {
-  let bestSince = fallbackSince ? normalizeTimestamp(fallbackSince) : null;
-  let bestId = bestSince ? (fallbackSinceId ?? 0) : null;
-  let bestMs = bestSince ? Date.parse(bestSince) : Number.NEGATIVE_INFINITY;
-  for (const row of rows) {
-    const rowSince = normalizeTimestamp(row?.updated_at ?? row?.last_value_at ?? "");
-    if (!rowSince) {
-      continue;
-    }
-    const rowMs = Date.parse(rowSince);
-    const rowId = normalizeCursorId(row?.id) ?? 0;
-    if (rowMs > bestMs) {
-      bestMs = rowMs;
-      bestSince = rowSince;
-      bestId = rowId;
-      continue;
-    }
-    if (rowMs === bestMs) {
-      const currentId = bestId ?? 0;
-      if (rowId > currentId) {
-        bestId = rowId;
-      }
-    }
-  }
-  if (!bestSince) {
-    return { since: null, sinceId: null };
-  }
-  return { since: bestSince, sinceId: bestId ?? 0 };
-}
-
-function buildLatestItem(row: RawLatestRow): LatestItem {
-  const station = (row.station ?? null) as Record<string, unknown> | null;
-  const connector = (row.connector ?? null) as Record<string, unknown> | null;
-  const phenomenon = (row.phenomenon ?? null) as Record<string, unknown> | null;
-
-  const stationLabel = resolveStationLabel(
-    station?.label as string | null | undefined,
-    station?.station_ref as string | null | undefined,
-    row.label,
-  );
-
-  const pollutantLabel = resolvePhenomenonLabel(
-    phenomenon?.observed_property_display_name as string | null | undefined,
-    phenomenon?.pollutant_label as string | null | undefined,
-    phenomenon?.label as string | null | undefined,
-    phenomenon?.notation as string | null | undefined,
-    (phenomenon?.source_label as string | null | undefined)
-      ?? (phenomenon?.eionet_uri as string | null | undefined),
-  );
-
-  const observedPropertyCode = normalizePollutant(
-    (phenomenon?.observed_property_code as string | null)
-      ?? (phenomenon?.notation as string | null)
-      ?? (phenomenon?.pollutant_label as string | null)
-      ?? (phenomenon?.label as string | null)
-      ?? null,
-  );
-
-  const rawMemberships = Array.isArray(station?.station_network_memberships)
-    ? station.station_network_memberships
-    : [];
-  const stationNetworkMemberships = rawMemberships
-    .map((entry: Record<string, unknown>) => {
-      const networkCode = (entry?.network_code as string | null)
-        ?? (entry?.connector_code as string | null)
-        ?? null;
-      if (!networkCode) {
-        return null;
-      }
-      return {
-        network_code: networkCode,
-        network_label: (entry?.network_label as string | null)
-          ?? (entry?.label as string | null)
-          ?? null,
-        is_primary: Boolean(entry?.is_primary),
-      };
-    })
-    .filter((entry): entry is { network_code: string; network_label: string | null; is_primary: boolean } => Boolean(entry));
-
-  return {
-    id: row.id ?? null,
-    last_value: row.last_value ?? null,
-    last_value_at: row.last_value_at ?? null,
-    connector_code: (connector?.connector_code as string | null) ?? null,
-    connector_label: (connector?.display_name as string | null)
-      ?? (connector?.label as string | null)
-      ?? null,
-    station_id: (station?.id as number | null) ?? null,
-    station_label: stationLabel,
-    display_name: formatDisplayName(
-      connector?.station_display_name_template as string | null | undefined,
-      station?.station_name as string | null | undefined,
-      stationLabel,
-      station?.station_ref as string | number,
-      station?.id as string | number | null | undefined,
-    ),
-    pcon_code: (station?.pcon_code as string | null) ?? null,
-    la_code: (station?.la_code as string | null) ?? null,
-    station_network_memberships: stationNetworkMemberships,
-    phenomenon_label: pollutantLabel,
-    pollutant_label: pollutantLabel,
-    observed_property_code: observedPropertyCode,
-    uom_display: formatUnit(row.uom),
-  };
-}
-
-async function postgrestRpc<T>(
-  rpcName: string,
-  args: Record<string, unknown>,
-): Promise<RpcResult<T>> {
-  const endpoint = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/rpc/${rpcName}`;
-  const startedMs = Date.now();
-  let lastError: string | null = null;
-  let lastStatus: number | null = null;
-  let totalResponseBytes = 0;
-  let attemptCount = 0;
-
-  for (let attempt = 1; attempt <= UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES; attempt += 1) {
-    attemptCount = attempt;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS);
-    try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SB_SECRET_KEY,
-          Authorization: `Bearer ${SB_SECRET_KEY}`,
-          "Accept-Profile": UK_AQ_PUBLIC_SCHEMA,
-          "Content-Profile": UK_AQ_PUBLIC_SCHEMA,
-          "x-ukaq-egress-caller": "uk_aq_latest_snapshot_builder",
-        },
-        body: JSON.stringify(args),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      lastStatus = response.status;
-      const responseText = await response.text();
-      totalResponseBytes += measureUtf8Bytes(responseText);
-
-      let payload: unknown = null;
-      try {
-        payload = responseText ? JSON.parse(responseText) : null;
-      } catch {
-        payload = null;
-      }
-
-      if (response.ok) {
-        return {
-          data: payload as T,
-          error: null,
-          meta: {
-            attempt_count: attemptCount,
-            retry_count: Math.max(0, attemptCount - 1),
-            http_status: lastStatus,
-            duration_ms: Date.now() - startedMs,
-            response_bytes: totalResponseBytes,
-          },
-        };
-      }
-
-      const message = extractErrorMessage(payload, response.status);
-      lastError = message;
-      if (attempt < UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES && isRetryableStatus(response.status)) {
-        await sleep(attempt * 350);
-        continue;
-      }
-      return {
-        data: null,
-        error: { message },
-        meta: {
-          attempt_count: attemptCount,
-          retry_count: Math.max(0, attemptCount - 1),
-          http_status: lastStatus,
-          duration_ms: Date.now() - startedMs,
-          response_bytes: totalResponseBytes,
-        },
-      };
-    } catch (error) {
-      clearTimeout(timeoutId);
-      const message = error instanceof Error ? error.message : String(error);
-      lastError = message;
-      if (attempt < UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES) {
-        await sleep(attempt * 350);
-        continue;
-      }
-      return {
-        data: null,
-        error: { message },
-        meta: {
-          attempt_count: attemptCount,
-          retry_count: Math.max(0, attemptCount - 1),
-          http_status: lastStatus,
-          duration_ms: Date.now() - startedMs,
-          response_bytes: totalResponseBytes,
-        },
-      };
-    }
-  }
-
-  return {
-    data: null,
-    error: { message: lastError || "RPC request failed" },
-    meta: {
-      attempt_count: attemptCount,
-      retry_count: Math.max(0, attemptCount - 1),
-      http_status: lastStatus,
-      duration_ms: Date.now() - startedMs,
-      response_bytes: totalResponseBytes,
-    },
-  };
-}
-
-function extractErrorMessage(payload: unknown, status: number): string {
-  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-    const obj = payload as Record<string, unknown>;
-    for (const key of ["message", "error_description", "error"]) {
-      const value = obj[key];
-      if (typeof value === "string" && value.trim()) {
-        return value.trim();
-      }
-    }
-  }
-  return `RPC HTTP ${status}`;
-}
-
-function looksLikeCursorSignatureMismatch(message: string): boolean {
-  const normalized = String(message || "").toLowerCase();
-  return normalized.includes("could not find the function") &&
-    normalized.includes("uk_aq_latest_rpc");
-}
-
-function mergeRpcMeta(a: RpcCallMeta, b: RpcCallMeta): RpcCallMeta {
-  return {
-    attempt_count: a.attempt_count + b.attempt_count,
-    retry_count: a.retry_count + b.retry_count,
-    http_status: b.http_status ?? a.http_status,
-    duration_ms: a.duration_ms + b.duration_ms,
-    response_bytes: a.response_bytes + b.response_bytes,
-  };
-}
-
-async function callLatestRpc(
-  pollutant: string,
-  windowLabel: string,
-): Promise<RpcResult<RawLatestRow[]> & { signature: string }> {
-  const cursorBody = {
-    region: null,
-    pcon_code: null,
-    station_like: null,
-    connector_id: null,
-    pollutant,
-    window_label: windowLabel,
-    limit_rows: UK_AQ_LATEST_SNAPSHOT_LIMIT,
-    since_updated_at: null,
-    since_updated_id: null,
-  };
-
-  const firstAttempt = await postgrestRpc<RawLatestRow[]>(UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC, cursorBody);
-  if (!firstAttempt.error) {
-    return { ...firstAttempt, signature: "since_updated_at" };
-  }
-  if (!looksLikeCursorSignatureMismatch(firstAttempt.error.message)) {
-    return { ...firstAttempt, signature: "since_updated_at" };
-  }
-  const fallbackAttempt = await postgrestRpc<RawLatestRow[]>(UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC, {
-    region: null,
-    pcon_code: null,
-    station_like: null,
-    connector_id: null,
-    pollutant,
-    window_label: windowLabel,
-    limit_rows: UK_AQ_LATEST_SNAPSHOT_LIMIT,
-    since_ts: null,
-  });
-  return {
-    ...fallbackAttempt,
-    meta: mergeRpcMeta(firstAttempt.meta, fallbackAttempt.meta),
-    signature: "since_ts",
-  };
-}
-
-function toStableJson(value: unknown): string {
-  return JSON.stringify(stableSort(value));
-}
-
-function stableSort(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => stableSort(item));
-  }
-  if (value && typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    const sortedKeys = Object.keys(obj).sort((a, b) => a.localeCompare(b));
-    const output: Record<string, unknown> = {};
-    for (const key of sortedKeys) {
-      output[key] = stableSort(obj[key]);
-    }
-    return output;
-  }
-  return value;
-}
-
-function minMaxObservedAt(rows: LatestItem[]): { min: string | null; max: string | null } {
-  let minMs = Number.POSITIVE_INFINITY;
-  let maxMs = Number.NEGATIVE_INFINITY;
-  let min: string | null = null;
-  let max: string | null = null;
-  for (const row of rows) {
-    const value = normalizeTimestamp(row.last_value_at);
-    if (!value) {
-      continue;
-    }
-    const ms = Date.parse(value);
-    if (ms < minMs) {
-      minMs = ms;
-      min = value;
-    }
-    if (ms > maxMs) {
-      maxMs = ms;
-      max = value;
-    }
-  }
-  return { min, max };
 }
 
 function matrixId(networkGroup: string, pollutant: string, windowLabel: string): string {
@@ -928,21 +653,20 @@ function snapshotKey(networkGroup: string, pollutant: string, windowLabel: strin
   return `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/network_group=${networkGroup}/pollutant=${pollutant}/window=${windowLabel}.json`;
 }
 
-function utcNowIso(): string {
-  return new Date().toISOString();
+function toStableJson(value: unknown): string {
+  return JSON.stringify(stableSort(value));
 }
 
-function compactTimestamp(iso: string): string {
-  return iso.replace(/[:-]|\.\d{3}/g, "");
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isRetryableStatus(status: number): boolean {
-  return status === 408 || status === 429 || status === 500 || status === 502 ||
-    status === 503 || status === 504;
+function stableSort(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => stableSort(item));
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const sortedKeys = Object.keys(obj).sort((a, b) => a.localeCompare(b));
+    const output: Record<string, unknown> = {};
+    for (const key of sortedKeys) output[key] = stableSort(obj[key]);
+    return output;
+  }
+  return value;
 }
 
 function normalizeMetricKeyPart(value: string | undefined): string {
@@ -989,16 +713,12 @@ function aggregateServiceEgressMetrics(rows: ServiceEgressMetricRow[]): ServiceE
     }
     existing.request_count = (existing.request_count ?? 0) + Math.max(0, row.request_count ?? 0);
     existing.response_rows = (existing.response_rows ?? 0) + Math.max(0, row.response_rows ?? 0);
-    existing.response_bytes_est = (existing.response_bytes_est ?? 0) +
-      Math.max(0, row.response_bytes_est ?? 0);
-    existing.upstream_bytes_est = (existing.upstream_bytes_est ?? 0) +
-      Math.max(0, row.upstream_bytes_est ?? 0);
+    existing.response_bytes_est = (existing.response_bytes_est ?? 0) + Math.max(0, row.response_bytes_est ?? 0);
+    existing.upstream_bytes_est = (existing.upstream_bytes_est ?? 0) + Math.max(0, row.upstream_bytes_est ?? 0);
     existing.cache_hit_count = (existing.cache_hit_count ?? 0) + Math.max(0, row.cache_hit_count ?? 0);
     existing.cache_miss_count = (existing.cache_miss_count ?? 0) + Math.max(0, row.cache_miss_count ?? 0);
-    existing.objects_written_count = (existing.objects_written_count ?? 0) +
-      Math.max(0, row.objects_written_count ?? 0);
-    existing.objects_written_bytes = (existing.objects_written_bytes ?? 0) +
-      Math.max(0, row.objects_written_bytes ?? 0);
+    existing.objects_written_count = (existing.objects_written_count ?? 0) + Math.max(0, row.objects_written_count ?? 0);
+    existing.objects_written_bytes = (existing.objects_written_bytes ?? 0) + Math.max(0, row.objects_written_bytes ?? 0);
     existing.duration_ms = (existing.duration_ms ?? 0) + Math.max(0, row.duration_ms ?? 0);
     existing.error_count = (existing.error_count ?? 0) + Math.max(0, row.error_count ?? 0);
     if (row.notes && typeof row.notes === "object") {
@@ -1014,7 +734,7 @@ async function postgrestRpcToUrl(
   schema: string,
   rpcName: string,
   body: Record<string, unknown>,
-): Promise<{ ok: boolean; status: number; message: string; payload: unknown }> {
+): Promise<{ ok: boolean; status: number; message: string }> {
   const endpoint = `${baseUrl.replace(/\/$/, "")}/rest/v1/rpc/${rpcName}`;
   const response = await fetch(endpoint, {
     method: "POST",
@@ -1027,50 +747,812 @@ async function postgrestRpcToUrl(
     },
     body: JSON.stringify(body),
   });
-
-  const text = await response.text();
+  const text = await response.text().catch(() => "");
   let payload: unknown = null;
   try {
     payload = text ? JSON.parse(text) : null;
   } catch {
     payload = text || null;
   }
-
   if (!response.ok) {
-    return {
-      ok: false,
-      status: response.status,
-      message: extractErrorMessage(payload, response.status),
-      payload,
-    };
+    const message = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? String((payload as Record<string, unknown>).message || `HTTP ${response.status}`)
+      : `HTTP ${response.status}`;
+    return { ok: false, status: response.status, message };
   }
-  return { ok: true, status: response.status, message: "ok", payload };
+  return { ok: true, status: response.status, message: "ok" };
 }
 
 async function publishServiceEgressMetrics(rows: ServiceEgressMetricRow[]): Promise<void> {
-  if (!UK_AQ_SERVICE_EGRESS_METRICS_ENABLED) {
-    return;
-  }
-  const sinkUrl = UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL;
-  const sinkKey = UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY;
-  if (!sinkUrl || !sinkKey || !UK_AQ_SERVICE_EGRESS_METRICS_RPC || !UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA) {
-    return;
-  }
-  if (!rows.length) {
-    return;
-  }
+  if (!UK_AQ_SERVICE_EGRESS_METRICS_ENABLED) return;
+  if (!UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL || !UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY) return;
+  if (!UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA || !UK_AQ_SERVICE_EGRESS_METRICS_RPC) return;
+  if (!rows.length) return;
   const response = await postgrestRpcToUrl(
-    sinkUrl,
-    sinkKey,
+    UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL,
+    UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY,
     UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA,
     UK_AQ_SERVICE_EGRESS_METRICS_RPC,
     { p_rows: rows },
   );
   if (!response.ok) {
-    throw new Error(
-      `Metrics RPC failed HTTP ${response.status}: ${response.message}`,
-    );
+    throw new Error(`Metrics RPC failed HTTP ${response.status}: ${response.message}`);
   }
+}
+
+function subscriptionPath(): string {
+  if (PUBSUB_SUBSCRIPTION.startsWith("projects/")) return PUBSUB_SUBSCRIPTION;
+  return `projects/${PUBSUB_PROJECT_ID}/subscriptions/${PUBSUB_SUBSCRIPTION}`;
+}
+
+async function fetchGoogleAccessToken(): Promise<string> {
+  const response = await fetch(
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+    { headers: { "Metadata-Flavor": "Google" } },
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Metadata token request failed (${response.status}): ${text}`);
+  }
+  const payload = await response.json().catch(() => null);
+  const token = typeof payload?.access_token === "string" ? payload.access_token.trim() : "";
+  if (!token) throw new Error("Metadata token response missing access_token");
+  return token;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+async function pubsubPost(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  let lastError = "";
+  for (let attempt = 1; attempt <= PUBSUB_PULL_RETRIES; attempt += 1) {
+    try {
+      const token = await fetchGoogleAccessToken();
+      const response = await fetch(`https://pubsub.googleapis.com/v1/${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok) return asRecord(payload) || {};
+
+      const message = asRecord(payload)?.error
+        ? JSON.stringify(asRecord(payload)?.error)
+        : `HTTP ${response.status}`;
+      lastError = message;
+      if (attempt < PUBSUB_PULL_RETRIES && isRetryableStatus(response.status)) {
+        await sleep(Math.min(5000, attempt * 1000));
+        continue;
+      }
+      throw new Error(message);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (attempt < PUBSUB_PULL_RETRIES) {
+        await sleep(Math.min(5000, attempt * 1000));
+        continue;
+      }
+      throw new Error(`Pub/Sub request failed: ${lastError}`);
+    }
+  }
+  throw new Error(`Pub/Sub request failed: ${lastError || "unknown"}`);
+}
+
+async function pullPubsubMessages(maxMessages: number): Promise<PubsubPullMessage[]> {
+  const payload = await pubsubPost(`${subscriptionPath()}:pull`, {
+    maxMessages,
+    returnImmediately: true,
+  }) as PubsubPullResponse;
+  if (!Array.isArray(payload?.receivedMessages)) return [];
+  return payload.receivedMessages as PubsubPullMessage[];
+}
+
+async function ackPubsubMessages(ackIds: string[]): Promise<void> {
+  if (!ackIds.length) return;
+  await pubsubPost(`${subscriptionPath()}:acknowledge`, { ackIds });
+}
+
+function decodeMessageRow(message: PubsubPullMessage): DecodedMessage {
+  const ackId = typeof message.ackId === "string" && message.ackId.trim() ? message.ackId : null;
+  const data = message.message?.data;
+  if (!ackId || typeof data !== "string" || !data.trim()) {
+    return { ackId, row: null, payloadBytes: 0 };
+  }
+  try {
+    const decoded = atob(data);
+    const payloadBytes = measureUtf8Bytes(decoded);
+    const parsed = JSON.parse(decoded);
+    const record = asRecord(parsed);
+    if (!record) return { ackId, row: null, payloadBytes };
+
+    const connectorId = Number(record.connector_id);
+    const timeseriesId = Number(record.timeseries_id);
+    const observedAt = normalizeTimestamp(record.observed_at);
+    if (!Number.isInteger(connectorId) || connectorId <= 0) return { ackId, row: null, payloadBytes };
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) return { ackId, row: null, payloadBytes };
+    if (!observedAt) return { ackId, row: null, payloadBytes };
+
+    const valueRaw = record.value;
+    const value = valueRaw === null || valueRaw === undefined ? null : Number(valueRaw);
+    if (value !== null && !Number.isFinite(value)) return { ackId, row: null, payloadBytes };
+
+    return {
+      ackId,
+      payloadBytes,
+      row: {
+        connector_id: Math.trunc(connectorId),
+        timeseries_id: Math.trunc(timeseriesId),
+        observed_at: observedAt,
+        value,
+        value_float8_hex: record.value_float8_hex === null || record.value_float8_hex === undefined
+          ? null
+          : String(record.value_float8_hex),
+        status: record.status === null || record.status === undefined ? null : String(record.status),
+      },
+    };
+  } catch {
+    return { ackId, row: null, payloadBytes: 0 };
+  }
+}
+
+function stateKey(connectorId: number, timeseriesId: number): string {
+  return `${connectorId}:${timeseriesId}`;
+}
+
+function compareStateRows(a: LatestStateEntry, b: LatestStateEntry): number {
+  const aMs = Date.parse(a.observed_at);
+  const bMs = Date.parse(b.observed_at);
+  if (aMs !== bMs) return aMs - bMs;
+  const aIngested = a.ingested_at ? Date.parse(a.ingested_at) : 0;
+  const bIngested = b.ingested_at ? Date.parse(b.ingested_at) : 0;
+  if (aIngested !== bIngested) return aIngested - bIngested;
+  return 0;
+}
+
+function applyRowsToState(
+  stateMap: Map<string, LatestStateEntry>,
+  rows: ObservationMessageRow[],
+  ingestedAt: string,
+): StateApplySummary {
+  const summary: StateApplySummary = {
+    applied_new: 0,
+    applied_newer: 0,
+    skipped_older: 0,
+    skipped_duplicate: 0,
+  };
+
+  for (const row of rows) {
+    const key = stateKey(row.connector_id, row.timeseries_id);
+    const next: LatestStateEntry = {
+      connector_id: row.connector_id,
+      timeseries_id: row.timeseries_id,
+      observed_at: row.observed_at,
+      value: row.value,
+      value_float8_hex: row.value_float8_hex,
+      status: row.status,
+      ingested_at: ingestedAt,
+    };
+    const current = stateMap.get(key);
+    if (!current) {
+      stateMap.set(key, next);
+      summary.applied_new += 1;
+      continue;
+    }
+    const cmp = compareStateRows(current, next);
+    if (cmp < 0) {
+      stateMap.set(key, next);
+      summary.applied_newer += 1;
+    } else if (cmp === 0) {
+      summary.skipped_duplicate += 1;
+    } else {
+      summary.skipped_older += 1;
+    }
+  }
+
+  return summary;
+}
+
+function serializeState(stateMap: Map<string, LatestStateEntry>, updatedAt: string): Uint8Array {
+  const entries = [...stateMap.values()]
+    .sort((a, b) => {
+      if (a.connector_id !== b.connector_id) return a.connector_id - b.connector_id;
+      return a.timeseries_id - b.timeseries_id;
+    });
+
+  const payload: LatestStateFile = {
+    schema_version: 1,
+    updated_at: updatedAt,
+    entries,
+  };
+  return TEXT_ENCODER.encode(`${toStableJson(payload)}\n`);
+}
+
+async function loadState(): Promise<LoadedState> {
+  try {
+    const existing = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY });
+    const text = new TextDecoder().decode(existing.body);
+    const bytes = existing.body.byteLength;
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+    const stateMap = new Map<string, LatestStateEntry>();
+    const rows = Array.isArray((parsed as Record<string, unknown> | null)?.entries)
+      ? ((parsed as Record<string, unknown>).entries as unknown[])
+      : [];
+    for (const row of rows) {
+      const record = asRecord(row);
+      if (!record) continue;
+      const connectorId = Number(record.connector_id);
+      const timeseriesId = Number(record.timeseries_id);
+      const observedAt = normalizeTimestamp(record.observed_at);
+      if (!Number.isInteger(connectorId) || connectorId <= 0) continue;
+      if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) continue;
+      if (!observedAt) continue;
+      stateMap.set(
+        stateKey(Math.trunc(connectorId), Math.trunc(timeseriesId)),
+        {
+          connector_id: Math.trunc(connectorId),
+          timeseries_id: Math.trunc(timeseriesId),
+          observed_at: observedAt,
+          value: record.value === null || record.value === undefined ? null : Number(record.value),
+          value_float8_hex: record.value_float8_hex === null || record.value_float8_hex === undefined
+            ? null
+            : String(record.value_float8_hex),
+          status: record.status === null || record.status === undefined ? null : String(record.status),
+          ingested_at: normalizeTimestamp(record.ingested_at),
+        },
+      );
+    }
+    return {
+      stateMap,
+      existingHash: sha256Hex(existing.body),
+      existingBytes: bytes,
+    };
+  } catch {
+    return {
+      stateMap: new Map<string, LatestStateEntry>(),
+      existingHash: null,
+      existingBytes: 0,
+    };
+  }
+}
+
+function decodeCoreTableText(body: Uint8Array, tableKey: string): string {
+  const decoder = new TextDecoder();
+  if (tableKey.endsWith(".gz")) {
+    const uncompressed = zlib.gunzipSync(body);
+    return decoder.decode(uncompressed);
+  }
+  return decoder.decode(body);
+}
+
+function parseNdjsonRows(text: string): Array<Record<string, unknown>> {
+  const rows: Array<Record<string, unknown>> = [];
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed);
+      if (row && typeof row === "object" && !Array.isArray(row)) {
+        rows.push(row as Record<string, unknown>);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return rows;
+}
+
+function parseCoreManifest(text: string): CoreSnapshotManifest {
+  const parsed = JSON.parse(text);
+  const root = asRecord(parsed) || {};
+  const tablesRaw = Array.isArray(root.tables) ? root.tables : [];
+  const tables: Array<{ table: string; key: string }> = [];
+  for (const item of tablesRaw) {
+    const record = asRecord(item);
+    if (!record) continue;
+    const table = String(record.table || "").trim();
+    const key = String(record.key || "").trim();
+    if (!table || !key) continue;
+    tables.push({ table, key });
+  }
+  return {
+    day_utc: normalizeDay(root.day_utc),
+    tables,
+  };
+}
+
+function normalizeDay(value: unknown): string | null {
+  const text = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  return text;
+}
+
+function shiftIsoDay(isoDay: string, dayOffset: number): string {
+  const base = new Date(`${isoDay}T00:00:00.000Z`);
+  if (Number.isNaN(base.getTime())) return isoDay;
+  base.setUTCDate(base.getUTCDate() + dayOffset);
+  return base.toISOString().slice(0, 10);
+}
+
+function tableKeyFromManifest(manifest: CoreSnapshotManifest, tableName: string): string | null {
+  const needle = tableName.trim().toLowerCase();
+  for (const entry of manifest.tables) {
+    if (entry.table.trim().toLowerCase() === needle) return entry.key;
+  }
+  return null;
+}
+
+function buildMetadataIndex(cache: CoreMetadataCacheFile): MetadataIndex {
+  const connectorsById = new Map<number, MetadataConnector>();
+  const stationsById = new Map<number, MetadataStation>();
+  const membershipsByStationId = new Map<number, MetadataMembership[]>();
+  const timeseriesById = new Map<number, MetadataTimeseries>();
+  const phenomenaById = new Map<number, MetadataPhenomenon>();
+  const observedPropertyById = new Map<number, MetadataObservedProperty>();
+
+  for (const row of cache.connectors) connectorsById.set(row.id, row);
+  for (const row of cache.stations) stationsById.set(row.id, row);
+  for (const row of cache.timeseries) timeseriesById.set(row.id, row);
+  for (const row of cache.phenomena) phenomenaById.set(row.id, row);
+  for (const row of cache.observed_properties) observedPropertyById.set(row.id, row);
+  for (const row of cache.memberships) {
+    const existing = membershipsByStationId.get(row.station_id) || [];
+    existing.push(row);
+    membershipsByStationId.set(row.station_id, existing);
+  }
+  for (const rows of membershipsByStationId.values()) {
+    rows.sort((a, b) => {
+      if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
+      return a.network_code.localeCompare(b.network_code);
+    });
+  }
+
+  return {
+    source_day_utc: cache.source_day_utc,
+    connectorsById,
+    stationsById,
+    membershipsByStationId,
+    timeseriesById,
+    phenomenaById,
+    observedPropertyById,
+  };
+}
+
+function isMetadataCacheFresh(cache: CoreMetadataCacheFile): boolean {
+  const generatedAt = normalizeTimestamp(cache.generated_at);
+  if (!generatedAt) return false;
+  const ageMs = Date.now() - Date.parse(generatedAt);
+  return ageMs <= UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS * 1000;
+}
+
+async function findLatestCoreManifestKey(): Promise<{ day_utc: string; key: string } | null> {
+  const todayUtc = utcNowIso().slice(0, 10);
+  for (let offset = 0; offset <= UK_AQ_LATEST_SNAPSHOT_CORE_LOOKBACK_DAYS; offset += 1) {
+    const dayUtc = shiftIsoDay(todayUtc, -offset);
+    const key = `${UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX}/day_utc=${dayUtc}/manifest.json`;
+    const head = await r2HeadObject({ r2: R2_CONFIG, key });
+    if (head.exists) return { day_utc: dayUtc, key };
+  }
+  return null;
+}
+
+function mapConnectorRows(rows: Array<Record<string, unknown>>): MetadataConnector[] {
+  const output: MetadataConnector[] = [];
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    output.push({
+      id: Math.trunc(id),
+      connector_code: normalizeNonEmptyText(String(row.connector_code ?? "")),
+      label: normalizeNonEmptyText(String(row.label ?? "")),
+      display_name: normalizeNonEmptyText(String(row.display_name ?? "")),
+      station_display_name_template: normalizeNonEmptyText(String(row.station_display_name_template ?? "")),
+    });
+  }
+  return output;
+}
+
+function mapStationRows(rows: Array<Record<string, unknown>>): MetadataStation[] {
+  const output: MetadataStation[] = [];
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const connectorId = Number(row.connector_id);
+    output.push({
+      id: Math.trunc(id),
+      connector_id: Number.isInteger(connectorId) && connectorId > 0 ? Math.trunc(connectorId) : null,
+      station_ref: normalizeNonEmptyText(String(row.station_ref ?? "")),
+      label: normalizeNonEmptyText(String(row.label ?? "")),
+      station_name: normalizeNonEmptyText(String(row.station_name ?? "")),
+      pcon_code: normalizeNonEmptyText(String(row.pcon_code ?? "")),
+      la_code: normalizeNonEmptyText(String(row.la_code ?? "")),
+    });
+  }
+  return output;
+}
+
+function mapMembershipRows(rows: Array<Record<string, unknown>>): MetadataMembership[] {
+  const output: MetadataMembership[] = [];
+  for (const row of rows) {
+    const stationId = Number(row.station_id);
+    const networkCode = normalizeNonEmptyText(String(row.network_code ?? ""));
+    if (!Number.isInteger(stationId) || stationId <= 0 || !networkCode) continue;
+    output.push({
+      station_id: Math.trunc(stationId),
+      network_code: networkCode,
+      network_label: normalizeNonEmptyText(String(row.network_label ?? "")),
+      is_primary: Boolean(row.is_primary),
+    });
+  }
+  return output;
+}
+
+function mapTimeseriesRows(rows: Array<Record<string, unknown>>): MetadataTimeseries[] {
+  const output: MetadataTimeseries[] = [];
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const connectorId = Number(row.connector_id);
+    const stationId = Number(row.station_id);
+    const phenomenonId = Number(row.phenomenon_id);
+    output.push({
+      id: Math.trunc(id),
+      connector_id: Number.isInteger(connectorId) && connectorId > 0 ? Math.trunc(connectorId) : null,
+      station_id: Number.isInteger(stationId) && stationId > 0 ? Math.trunc(stationId) : null,
+      phenomenon_id: Number.isInteger(phenomenonId) && phenomenonId > 0 ? Math.trunc(phenomenonId) : null,
+      label: normalizeNonEmptyText(String(row.label ?? "")),
+      uom: normalizeNonEmptyText(String(row.uom ?? "")),
+    });
+  }
+  return output;
+}
+
+function mapPhenomenonRows(rows: Array<Record<string, unknown>>): MetadataPhenomenon[] {
+  const output: MetadataPhenomenon[] = [];
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const observedPropertyId = Number(row.observed_property_id);
+    output.push({
+      id: Math.trunc(id),
+      observed_property_id: Number.isInteger(observedPropertyId) && observedPropertyId > 0
+        ? Math.trunc(observedPropertyId)
+        : null,
+      label: normalizeNonEmptyText(String(row.label ?? "")),
+      notation: normalizeNonEmptyText(String(row.notation ?? "")),
+      pollutant_label: normalizeNonEmptyText(String(row.pollutant_label ?? "")),
+      source_label: normalizeNonEmptyText(String(row.source_label ?? row.eionet_uri ?? "")),
+    });
+  }
+  return output;
+}
+
+function mapObservedPropertyRows(rows: Array<Record<string, unknown>>): MetadataObservedProperty[] {
+  const output: MetadataObservedProperty[] = [];
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    output.push({
+      id: Math.trunc(id),
+      code: normalizeNonEmptyText(String(row.code ?? "")),
+      display_name: normalizeNonEmptyText(String(row.display_name ?? "")),
+    });
+  }
+  return output;
+}
+
+async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: MetadataRefreshStats }> {
+  const startedMs = Date.now();
+  let objectsRead = 0;
+  let bytesRead = 0;
+
+  try {
+    const cacheObject = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY });
+    objectsRead += 1;
+    bytesRead += cacheObject.body.byteLength;
+    const text = new TextDecoder().decode(cacheObject.body);
+    const parsed = JSON.parse(text) as CoreMetadataCacheFile;
+    if (parsed && parsed.schema_version === 1 && isMetadataCacheFresh(parsed)) {
+      return {
+        metadata: buildMetadataIndex(parsed),
+        stats: {
+          refreshed: false,
+          source_day_utc: parsed.source_day_utc || null,
+          objects_read: objectsRead,
+          bytes_read: bytesRead,
+          cache_bytes_written: 0,
+          duration_ms: Date.now() - startedMs,
+        },
+      };
+    }
+  } catch {
+    // fall through to refresh
+  }
+
+  const latestManifestInfo = await findLatestCoreManifestKey();
+  if (!latestManifestInfo) {
+    throw new Error("No core snapshot manifest found in R2 lookback window.");
+  }
+
+  const manifestObject = await r2GetObject({ r2: R2_CONFIG, key: latestManifestInfo.key });
+  objectsRead += 1;
+  bytesRead += manifestObject.body.byteLength;
+  const manifestText = new TextDecoder().decode(manifestObject.body);
+  const manifest = parseCoreManifest(manifestText);
+
+  const requiredTables = [
+    "connectors",
+    "stations",
+    "timeseries",
+    "phenomena",
+    "observed_properties",
+  ];
+
+  const tableRows = new Map<string, Array<Record<string, unknown>>>();
+  for (const tableName of requiredTables) {
+    const key = tableKeyFromManifest(manifest, tableName);
+    if (!key) {
+      throw new Error(`Core snapshot manifest missing table ${tableName}`);
+    }
+    const object = await r2GetObject({ r2: R2_CONFIG, key });
+    objectsRead += 1;
+    bytesRead += object.body.byteLength;
+    const ndjsonText = decodeCoreTableText(object.body, key);
+    tableRows.set(tableName, parseNdjsonRows(ndjsonText));
+  }
+
+  const membershipsKey = tableKeyFromManifest(manifest, "station_network_memberships");
+  if (membershipsKey) {
+    const object = await r2GetObject({ r2: R2_CONFIG, key: membershipsKey });
+    objectsRead += 1;
+    bytesRead += object.body.byteLength;
+    const ndjsonText = decodeCoreTableText(object.body, membershipsKey);
+    tableRows.set("station_network_memberships", parseNdjsonRows(ndjsonText));
+  } else {
+    tableRows.set("station_network_memberships", []);
+  }
+
+  const cachePayload: CoreMetadataCacheFile = {
+    schema_version: 1,
+    generated_at: utcNowIso(),
+    source_day_utc: manifest.day_utc || latestManifestInfo.day_utc,
+    connectors: mapConnectorRows(tableRows.get("connectors") || []),
+    stations: mapStationRows(tableRows.get("stations") || []),
+    memberships: mapMembershipRows(tableRows.get("station_network_memberships") || []),
+    timeseries: mapTimeseriesRows(tableRows.get("timeseries") || []),
+    phenomena: mapPhenomenonRows(tableRows.get("phenomena") || []),
+    observed_properties: mapObservedPropertyRows(tableRows.get("observed_properties") || []),
+  };
+  const cacheBytes = TEXT_ENCODER.encode(`${toStableJson(cachePayload)}\n`);
+  await r2PutObject({
+    r2: R2_CONFIG,
+    key: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY,
+    body: cacheBytes,
+    content_type: "application/json; charset=utf-8",
+  });
+
+  return {
+    metadata: buildMetadataIndex(cachePayload),
+    stats: {
+      refreshed: true,
+      source_day_utc: cachePayload.source_day_utc,
+      objects_read: objectsRead,
+      bytes_read: bytesRead,
+      cache_bytes_written: cacheBytes.byteLength,
+      duration_ms: Date.now() - startedMs,
+    },
+  };
+}
+
+function deriveNextCursor(rows: LatestItem[]): { since: string | null; sinceId: number | null } {
+  let bestSince: string | null = null;
+  let bestId: number | null = null;
+  let bestMs = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    const since = normalizeTimestamp(row.last_value_at);
+    if (!since) continue;
+    const rowMs = Date.parse(since);
+    const rowId = Number.isInteger(row.id) && (row.id as number) >= 0 ? (row.id as number) : 0;
+    if (rowMs > bestMs) {
+      bestMs = rowMs;
+      bestSince = since;
+      bestId = rowId;
+      continue;
+    }
+    if (rowMs === bestMs) {
+      const currentId = bestId ?? 0;
+      if (rowId > currentId) bestId = rowId;
+    }
+  }
+  return { since: bestSince, sinceId: bestSince ? (bestId ?? 0) : null };
+}
+
+function minMaxObservedAt(rows: LatestItem[]): { min: string | null; max: string | null } {
+  let minMs = Number.POSITIVE_INFINITY;
+  let maxMs = Number.NEGATIVE_INFINITY;
+  let min: string | null = null;
+  let max: string | null = null;
+  for (const row of rows) {
+    const value = normalizeTimestamp(row.last_value_at);
+    if (!value) continue;
+    const ms = Date.parse(value);
+    if (ms < minMs) {
+      minMs = ms;
+      min = value;
+    }
+    if (ms > maxMs) {
+      maxMs = ms;
+      max = value;
+    }
+  }
+  return { min, max };
+}
+
+function computeWindowCutoffMs(windowLabel: string, nowMs: number): number | null {
+  if (windowLabel === "all") return null;
+  if (windowLabel === "3h") return nowMs - 3 * 60 * 60 * 1000;
+  if (windowLabel === "6h") return nowMs - 6 * 60 * 60 * 1000;
+  if (windowLabel === "1d") return nowMs - 24 * 60 * 60 * 1000;
+  if (windowLabel === "7d") return nowMs - 7 * 24 * 60 * 60 * 1000;
+  return null;
+}
+
+function buildSourceRows(
+  stateMap: Map<string, LatestStateEntry>,
+  metadata: MetadataIndex,
+): { rows: SnapshotSourceRow[]; missingMetadata: number } {
+  const rows: SnapshotSourceRow[] = [];
+  let missingMetadata = 0;
+
+  for (const state of stateMap.values()) {
+    const series = metadata.timeseriesById.get(state.timeseries_id);
+    if (!series) {
+      missingMetadata += 1;
+      continue;
+    }
+    const station = series.station_id ? metadata.stationsById.get(series.station_id) || null : null;
+    const connectorId = series.connector_id || state.connector_id;
+    const connector = connectorId ? metadata.connectorsById.get(connectorId) || null : null;
+    const phenomenon = series.phenomenon_id ? metadata.phenomenaById.get(series.phenomenon_id) || null : null;
+    const observedProperty = phenomenon?.observed_property_id
+      ? metadata.observedPropertyById.get(phenomenon.observed_property_id) || null
+      : null;
+
+    const pollutantNormalized = normalizePollutant(
+      observedProperty?.code ??
+        phenomenon?.notation ??
+        phenomenon?.pollutant_label ??
+        phenomenon?.label ??
+        null,
+    );
+    const matrixPollutant = normalizeMatrixPollutant(pollutantNormalized);
+    if (!matrixPollutant) continue;
+
+    if (!passesOutlierThreshold(pollutantNormalized, state.value)) continue;
+    if (!(station?.pcon_code || station?.la_code)) continue;
+
+    const stationLabel = resolveStationLabel(station?.label, station?.station_ref, series.label ?? null);
+    const stationMemberships = station
+      ? (metadata.membershipsByStationId.get(station.id) || []).map((item) => ({
+        network_code: item.network_code,
+        network_label: item.network_label,
+        is_primary: item.is_primary,
+      }))
+      : [];
+
+    const phenomenonLabel = resolvePhenomenonLabel(
+      observedProperty?.display_name,
+      phenomenon?.pollutant_label,
+      phenomenon?.label,
+      phenomenon?.notation,
+      phenomenon?.source_label,
+    );
+
+    const item: LatestItem = {
+      id: series.id,
+      last_value: state.value,
+      last_value_at: state.observed_at,
+      connector_code: connector?.connector_code || null,
+      connector_label: connector?.display_name || connector?.label || null,
+      station_id: station?.id ?? null,
+      station_label: stationLabel,
+      display_name: formatDisplayName(
+        connector?.station_display_name_template,
+        station?.station_name,
+        stationLabel,
+        station?.station_ref || null,
+        station?.id ?? null,
+      ),
+      pcon_code: station?.pcon_code ?? null,
+      la_code: station?.la_code ?? null,
+      station_network_memberships: stationMemberships,
+      phenomenon_label: phenomenonLabel,
+      pollutant_label: phenomenonLabel,
+      observed_property_code: pollutantNormalized,
+      uom_display: formatUnit(series.uom),
+    };
+
+    rows.push({
+      pollutant: matrixPollutant,
+      item,
+    });
+  }
+
+  return { rows, missingMetadata };
+}
+
+function sortSnapshotRows(rows: LatestItem[]): LatestItem[] {
+  return rows.sort((a, b) => {
+    const aPollutant = a.phenomenon_label ?? a.pollutant_label ?? "";
+    const bPollutant = b.phenomenon_label ?? b.pollutant_label ?? "";
+    const pollutantCompare = aPollutant.localeCompare(bPollutant);
+    if (pollutantCompare !== 0) return pollutantCompare;
+    const aStation = a.station_label ?? "";
+    const bStation = b.station_label ?? "";
+    return aStation.localeCompare(bStation);
+  });
+}
+
+async function flushPubsubRows(): Promise<{ rows: ObservationMessageRow[]; validAckIds: string[]; summary: PullSummary }> {
+  const startedMs = Date.now();
+  const outputRows: ObservationMessageRow[] = [];
+  const validAckIds: string[] = [];
+  const summary: PullSummary = {
+    pull_requests: 0,
+    pulled_messages: 0,
+    decoded_rows: 0,
+    malformed_messages: 0,
+    acked_messages: 0,
+    payload_bytes: 0,
+    duration_ms: 0,
+  };
+
+  for (let batch = 0; batch < PUBSUB_MAX_BATCHES_PER_RUN; batch += 1) {
+    summary.pull_requests += 1;
+    const pulled = await pullPubsubMessages(PUBSUB_PULL_MAX_MESSAGES);
+    if (!pulled.length) break;
+    summary.pulled_messages += pulled.length;
+
+    const malformedAckIds: string[] = [];
+    const batchValidAckIds: string[] = [];
+    const batchRows: ObservationMessageRow[] = [];
+
+    for (const message of pulled) {
+      const decoded = decodeMessageRow(message);
+      summary.payload_bytes += decoded.payloadBytes;
+      if (!decoded.ackId) {
+        summary.malformed_messages += 1;
+        continue;
+      }
+      if (!decoded.row) {
+        malformedAckIds.push(decoded.ackId);
+        summary.malformed_messages += 1;
+        continue;
+      }
+      batchValidAckIds.push(decoded.ackId);
+      batchRows.push(decoded.row);
+    }
+
+    if (malformedAckIds.length) {
+      await ackPubsubMessages(malformedAckIds);
+      summary.acked_messages += malformedAckIds.length;
+    }
+    summary.decoded_rows += batchRows.length;
+    validAckIds.push(...batchValidAckIds);
+    outputRows.push(...batchRows);
+  }
+
+  summary.duration_ms = Date.now() - startedMs;
+  return { rows: outputRows, validAckIds, summary };
 }
 
 async function loadExistingManifest(): Promise<SnapshotManifest | null> {
@@ -1078,62 +1560,11 @@ async function loadExistingManifest(): Promise<SnapshotManifest | null> {
     const existing = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY });
     const text = new TextDecoder().decode(existing.body);
     const parsed = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object") {
-      return null;
-    }
+    if (!parsed || typeof parsed !== "object") return null;
     return parsed as SnapshotManifest;
   } catch {
     return null;
   }
-}
-
-async function buildSnapshotFor(
-  pollutant: string,
-  windowLabel: string,
-): Promise<{ payload: SnapshotPayload; rows: LatestItem[]; rpc_meta: RpcCallMeta; rpc_signature: string; raw_row_count: number }> {
-  const rpcResult = await callLatestRpc(toRpcPollutant(pollutant), windowLabel);
-  if (rpcResult.error) {
-    const error = new Error(rpcResult.error.message);
-    (error as Error & { rpc_meta?: RpcCallMeta; rpc_signature?: string }).rpc_meta = rpcResult.meta;
-    (error as Error & { rpc_meta?: RpcCallMeta; rpc_signature?: string }).rpc_signature = rpcResult.signature;
-    throw error;
-  }
-  const rawRows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
-  const nextCursor = deriveNextCursor(rawRows, null, null);
-  const rows = rawRows
-    .filter((row) => passesOutlierThreshold(row))
-    .filter((row) => hasAssignedGeoCode(row))
-    .map((row) => buildLatestItem(row))
-    .sort((a, b) => {
-      const aPollutant = a.phenomenon_label ?? a.pollutant_label ?? "";
-      const bPollutant = b.phenomenon_label ?? b.pollutant_label ?? "";
-      const pollutantCompare = aPollutant.localeCompare(bPollutant);
-      if (pollutantCompare !== 0) return pollutantCompare;
-      const aStation = a.station_label ?? "";
-      const bStation = b.station_label ?? "";
-      return aStation.localeCompare(bStation);
-    });
-
-  const payload: SnapshotPayload = {
-    region: null,
-    pcon_code: null,
-    pollutant,
-    window: windowLabel,
-    since: null,
-    since_id: null,
-    next_since: nextCursor.since,
-    next_since_id: nextCursor.sinceId,
-    count: rows.length,
-    data: rows,
-  };
-
-  return {
-    payload,
-    rows,
-    rpc_meta: rpcResult.meta,
-    rpc_signature: rpcResult.signature,
-    raw_row_count: rawRows.length,
-  };
 }
 
 async function main(): Promise<void> {
@@ -1145,6 +1576,15 @@ async function main(): Promise<void> {
   }
   if (!UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY) {
     throw new Error("UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY resolved empty.");
+  }
+  if (!PUBSUB_PROJECT_ID) {
+    throw new Error("Missing GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT).");
+  }
+  if (!PUBSUB_SUBSCRIPTION) {
+    throw new Error("UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION resolved empty.");
+  }
+  if (OBSERVS_BASE_SUBSCRIPTION && OBSERVS_BASE_SUBSCRIPTION === PUBSUB_SUBSCRIPTION) {
+    throw new Error("Snapshot Pub/Sub subscription must be dedicated (must not equal OBSERVS_PUBSUB_SUBSCRIPTION).");
   }
   if (UK_AQ_LATEST_SNAPSHOT_POLLUTANTS.length === 0) {
     throw new Error("UK_AQ_LATEST_SNAPSHOT_POLLUTANTS resolved empty.");
@@ -1159,17 +1599,148 @@ async function main(): Promise<void> {
   const warnings: string[] = [];
   const serviceEgressMetricRows: ServiceEgressMetricRow[] = [];
   const serviceProjectRef = UK_AQ_SERVICE_EGRESS_PROJECT_REF ||
-    deriveProjectRef(UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL) ||
-    deriveProjectRef(SUPABASE_URL);
+    deriveProjectRef(UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL);
 
   const previousManifest = await loadExistingManifest();
   const previousById = new Map<string, SnapshotManifestEntry>();
   for (const entry of previousManifest?.snapshots || []) {
-    if (entry && typeof entry.id === "string") {
-      previousById.set(entry.id, entry as SnapshotManifestEntry);
-    }
+    if (entry && typeof entry.id === "string") previousById.set(entry.id, entry as SnapshotManifestEntry);
   }
 
+  const stateLoaded = await loadState();
+
+  serviceEgressMetricRows.push({
+    bucket_minute: metricBucketMinute(startedAt),
+    env_name: UK_AQ_SERVICE_EGRESS_ENV,
+    project_ref: serviceProjectRef,
+    service_name: "uk_aq_latest_snapshot_builder",
+    source_type: "r2",
+    source_name: R2_CONFIG.bucket || "",
+    route_name: "latest_state_read",
+    query_name: "r2GetObject",
+    status: stateLoaded.existingHash ? "ok" : "skipped",
+    request_count: stateLoaded.existingHash ? 1 : 0,
+    response_rows: stateLoaded.stateMap.size,
+    response_bytes_est: stateLoaded.existingBytes,
+    upstream_bytes_est: stateLoaded.existingBytes,
+    duration_ms: 0,
+    error_count: 0,
+    notes: {
+      state_key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
+      state_found: Boolean(stateLoaded.existingHash),
+    },
+  });
+
+  const pulled = await flushPubsubRows();
+  const ingestedAt = utcNowIso();
+  const stateApply = applyRowsToState(stateLoaded.stateMap, pulled.rows, ingestedAt);
+  if (stateLoaded.stateMap.size > UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES) {
+    throw new Error(
+      `Latest snapshot state exceeded max entries (${stateLoaded.stateMap.size} > ${UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES}).`,
+    );
+  }
+
+  const stateBytes = serializeState(stateLoaded.stateMap, ingestedAt);
+  const nextStateHash = sha256Hex(stateBytes);
+  const stateChanged = nextStateHash !== stateLoaded.existingHash;
+  if (stateChanged) {
+    await r2PutObject({
+      r2: R2_CONFIG,
+      key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
+      body: stateBytes,
+      content_type: "application/json; charset=utf-8",
+    });
+  }
+
+  serviceEgressMetricRows.push({
+    bucket_minute: metricBucketMinute(startedAt),
+    env_name: UK_AQ_SERVICE_EGRESS_ENV,
+    project_ref: serviceProjectRef,
+    service_name: "uk_aq_latest_snapshot_builder",
+    source_type: "r2",
+    source_name: R2_CONFIG.bucket || "",
+    route_name: "latest_state_write",
+    query_name: "r2PutObject",
+    status: stateChanged ? "ok" : "skipped",
+    request_count: stateChanged ? 1 : 0,
+    response_rows: stateLoaded.stateMap.size,
+    response_bytes_est: 0,
+    upstream_bytes_est: stateChanged ? stateBytes.byteLength : 0,
+    objects_written_count: stateChanged ? 1 : 0,
+    objects_written_bytes: stateChanged ? stateBytes.byteLength : 0,
+    duration_ms: 0,
+    error_count: 0,
+    notes: {
+      state_key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
+      applied_new: stateApply.applied_new,
+      applied_newer: stateApply.applied_newer,
+      skipped_older: stateApply.skipped_older,
+      skipped_duplicate: stateApply.skipped_duplicate,
+    },
+  });
+
+  if (pulled.validAckIds.length) {
+    await ackPubsubMessages(pulled.validAckIds);
+    pulled.summary.acked_messages += pulled.validAckIds.length;
+  }
+
+  serviceEgressMetricRows.push({
+    bucket_minute: metricBucketMinute(startedAt),
+    env_name: UK_AQ_SERVICE_EGRESS_ENV,
+    project_ref: serviceProjectRef,
+    service_name: "uk_aq_latest_snapshot_builder",
+    source_type: "gcp",
+    source_name: PUBSUB_PROJECT_ID,
+    route_name: "pubsub_observation_pull",
+    query_name: PUBSUB_SUBSCRIPTION,
+    status: "ok",
+    request_count: pulled.summary.pull_requests,
+    response_rows: pulled.summary.decoded_rows,
+    response_bytes_est: pulled.summary.payload_bytes,
+    upstream_bytes_est: pulled.summary.payload_bytes,
+    duration_ms: pulled.summary.duration_ms,
+    error_count: 0,
+    notes: {
+      pulled_messages: pulled.summary.pulled_messages,
+      malformed_messages: pulled.summary.malformed_messages,
+      acked_messages: pulled.summary.acked_messages,
+      max_batches: PUBSUB_MAX_BATCHES_PER_RUN,
+      max_messages: PUBSUB_PULL_MAX_MESSAGES,
+    },
+  });
+
+  const metadataResult = await loadMetadataIndex();
+  serviceEgressMetricRows.push({
+    bucket_minute: metricBucketMinute(startedAt),
+    env_name: UK_AQ_SERVICE_EGRESS_ENV,
+    project_ref: serviceProjectRef,
+    service_name: "uk_aq_latest_snapshot_builder",
+    source_type: "r2",
+    source_name: R2_CONFIG.bucket || "",
+    route_name: "core_metadata_refresh",
+    query_name: "r2GetObject",
+    status: "ok",
+    request_count: metadataResult.stats.objects_read,
+    response_rows: metadataResult.metadata.timeseriesById.size,
+    response_bytes_est: metadataResult.stats.bytes_read,
+    upstream_bytes_est: metadataResult.stats.bytes_read,
+    objects_written_count: metadataResult.stats.refreshed ? 1 : 0,
+    objects_written_bytes: metadataResult.stats.cache_bytes_written,
+    duration_ms: metadataResult.stats.duration_ms,
+    error_count: 0,
+    notes: {
+      refreshed: metadataResult.stats.refreshed,
+      metadata_day_utc: metadataResult.stats.source_day_utc,
+      cache_key: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY,
+    },
+  });
+
+  const sourceRows = buildSourceRows(stateLoaded.stateMap, metadataResult.metadata);
+  if (sourceRows.missingMetadata > 0) {
+    warnings.push(`missing_metadata_rows=${sourceRows.missingMetadata}`);
+  }
+
+  const nowMs = Date.now();
   const entries: SnapshotManifestEntry[] = [];
   let successCount = 0;
   let failureCount = 0;
@@ -1182,9 +1753,33 @@ async function main(): Promise<void> {
       const id = matrixId(UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP, pollutant, windowLabel);
       const key = snapshotKey(UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP, pollutant, windowLabel);
       const previous = previousById.get(id) || null;
-
       try {
-        const { payload, rows, rpc_meta, rpc_signature, raw_row_count } = await buildSnapshotFor(pollutant, windowLabel);
+        const cutoffMs = computeWindowCutoffMs(windowLabel, nowMs);
+        const rows = sourceRows.rows
+          .filter((row) => row.pollutant === pollutant)
+          .map((row) => row.item)
+          .filter((item) => {
+            if (cutoffMs === null) return true;
+            const observedAt = normalizeTimestamp(item.last_value_at);
+            if (!observedAt) return false;
+            return Date.parse(observedAt) >= cutoffMs;
+          });
+
+        sortSnapshotRows(rows);
+        const nextCursor = deriveNextCursor(rows);
+        const payload: SnapshotPayload = {
+          region: null,
+          pcon_code: null,
+          pollutant,
+          window: windowLabel,
+          since: null,
+          since_id: null,
+          next_since: nextCursor.since,
+          next_since_id: nextCursor.sinceId,
+          count: rows.length,
+          data: rows,
+        };
+
         const body = `${toStableJson(payload)}\n`;
         const bodyBytes = TEXT_ENCODER.encode(body);
         const hash = sha256Hex(bodyBytes);
@@ -1209,33 +1804,6 @@ async function main(): Promise<void> {
           env_name: UK_AQ_SERVICE_EGRESS_ENV,
           project_ref: serviceProjectRef,
           service_name: "uk_aq_latest_snapshot_builder",
-          source_type: "supabase",
-          source_name: deriveProjectRef(SUPABASE_URL) || "source_supabase",
-          route_name: "snapshot_matrix_build",
-          query_name: UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC,
-          window_label: windowLabel,
-          status: "ok",
-          request_count: 1,
-          response_rows: raw_row_count,
-          response_bytes_est: rpc_meta.response_bytes,
-          upstream_bytes_est: rpc_meta.response_bytes,
-          duration_ms: rpc_meta.duration_ms,
-          error_count: 0,
-          notes: {
-            trigger_mode: triggerMode,
-            pollutant,
-            rpc_signature,
-            rpc_attempt_count: rpc_meta.attempt_count,
-            rpc_retry_count: rpc_meta.retry_count,
-            rpc_http_status: rpc_meta.http_status,
-          },
-        });
-
-        serviceEgressMetricRows.push({
-          bucket_minute: metricBucketMinute(startedAt),
-          env_name: UK_AQ_SERVICE_EGRESS_ENV,
-          project_ref: serviceProjectRef,
-          service_name: "uk_aq_latest_snapshot_builder",
           source_type: "r2",
           source_name: R2_CONFIG.bucket || "",
           route_name: "snapshot_object_write",
@@ -1243,7 +1811,7 @@ async function main(): Promise<void> {
           window_label: windowLabel,
           status: changed ? "ok" : "skipped",
           request_count: changed ? 1 : 0,
-          response_rows: 0,
+          response_rows: rows.length,
           response_bytes_est: 0,
           upstream_bytes_est: changed ? bodyBytes.byteLength : 0,
           objects_written_count: changed ? 1 : 0,
@@ -1281,38 +1849,8 @@ async function main(): Promise<void> {
         successCount += 1;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const rpcMeta = (error as Error & { rpc_meta?: RpcCallMeta }).rpc_meta;
-        const rpcSignature = (error as Error & { rpc_signature?: string }).rpc_signature;
         failureCount += 1;
         warnings.push(`${id}: ${message}`);
-        serviceEgressMetricRows.push({
-          bucket_minute: metricBucketMinute(startedAt),
-          env_name: UK_AQ_SERVICE_EGRESS_ENV,
-          project_ref: serviceProjectRef,
-          service_name: "uk_aq_latest_snapshot_builder",
-          source_type: "supabase",
-          source_name: deriveProjectRef(SUPABASE_URL) || "source_supabase",
-          route_name: "snapshot_matrix_build",
-          query_name: UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC,
-          window_label: windowLabel,
-          status: "error",
-          request_count: 1,
-          response_rows: 0,
-          response_bytes_est: rpcMeta?.response_bytes ?? 0,
-          upstream_bytes_est: rpcMeta?.response_bytes ?? 0,
-          duration_ms: rpcMeta?.duration_ms ?? (Date.now() - itemStarted),
-          error_count: 1,
-          notes: {
-            trigger_mode: triggerMode,
-            pollutant,
-            rpc_signature: rpcSignature || null,
-            rpc_attempt_count: rpcMeta?.attempt_count ?? null,
-            rpc_retry_count: rpcMeta?.retry_count ?? null,
-            rpc_http_status: rpcMeta?.http_status ?? null,
-            error: message,
-          },
-        });
-
         if (previous) {
           entries.push({
             ...previous,
@@ -1359,10 +1897,11 @@ async function main(): Promise<void> {
     generated_at: finishedAt,
     trigger_mode: triggerMode,
     source: {
-      type: "postgrest_rpc",
-      supabase_url: SUPABASE_URL,
-      rpc: UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC,
-      schema: UK_AQ_PUBLIC_SCHEMA,
+      type: "pubsub_observation_state",
+      pubsub_subscription: subscriptionPath(),
+      state_key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
+      core_metadata_prefix: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX,
+      core_metadata_day_utc: metadataResult.metadata.source_day_utc,
     },
     matrix: {
       network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
@@ -1381,7 +1920,7 @@ async function main(): Promise<void> {
     snapshots: entries,
   };
 
-  const manifestBody = new TextEncoder().encode(`${toStableJson(manifest)}\n`);
+  const manifestBody = TEXT_ENCODER.encode(`${toStableJson(manifest)}\n`);
   await r2PutObject({
     r2: R2_CONFIG,
     key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
@@ -1432,7 +1971,6 @@ async function main(): Promise<void> {
     skipped_unchanged_count: skippedUnchangedCount,
     warnings,
   };
-
   console.log(JSON.stringify(report));
 
   if (failureCount > 0) {

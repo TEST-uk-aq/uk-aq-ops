@@ -18,9 +18,7 @@ Build frequency is every minute via Cloud Scheduler.
 - Path: `workers/uk_aq_latest_snapshot_cloud_run/`
 - Runtime script: `run_job.ts`
 - Deploy workflow: `.github/workflows/uk_aq_latest_snapshot_cloud_run_deploy.yml`
-- Pulls observation messages from a dedicated Pub/Sub subscription.
-- Maintains latest-per-timeseries state in R2 (`latest_snapshots_state/v1` by default).
-- Refreshes metadata from daily R2 core snapshot (`history/v1/core` by default; daily refresh cadence).
+- Reads latest values from `uk_aq_public.uk_aq_latest_rpc`.
 - Writes snapshot objects + family manifest to R2.
 
 2. Latest snapshot R2 API Worker
@@ -36,23 +34,20 @@ Build frequency is every minute via Cloud Scheduler.
 - Path: `workers/uk_aq_cache_proxy/src/index.ts`
 - External route: `/api/aq/latest-snapshot`
 - Upstream target configured by: `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`.
-- Returns `upstream_fetch_failed` when upstream is unreachable/failing.
+- Returns `upstream_fetch_failed` when the upstream URL is bad/unreachable or upstream returns a fetch failure path.
 
 ## Request Flow
 
 1. Cloud Scheduler triggers Cloud Run service every minute.
-2. Cloud Run service pulls Pub/Sub observations from the latest-snapshot subscription.
-3. Service updates R2 latest-state object.
-4. Service loads cached core metadata (refreshes from latest `history/v1/core/day_utc=...` snapshot once stale).
-5. Service builds the matrix payloads and writes changed snapshot objects to R2.
-6. Service writes/updates latest family manifest.
-7. Browser calls cache proxy route: `/api/aq/latest-snapshot?...`.
-8. Cache proxy forwards to latest snapshot R2 API worker URL from `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`.
-9. R2 API Worker validates upstream auth and serves object from R2.
+2. Cloud Run service builds snapshot payloads for each matrix key.
+3. Service writes changed snapshot objects to R2 and always writes/updates the latest family manifest.
+4. Browser calls cache proxy route: `/api/aq/latest-snapshot?...`.
+5. Cache proxy forwards to latest snapshot R2 API worker URL from `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`.
+6. R2 API Worker validates upstream auth and serves object from R2.
 
 ## R2 Key Layout
 
-Default snapshot prefix: `latest_snapshots/v1`
+Default prefix: `latest_snapshots/v1`
 
 Snapshot object keys:
 
@@ -67,11 +62,6 @@ Manifest key:
 Optional run report keys:
 
 - `latest_snapshots/v1/_runs/<UTC timestamp>.json`
-
-Default state/metadata cache keys:
-
-- `latest_snapshots_state/v1/latest_state.json`
-- `latest_snapshots_state/v1/core_metadata_cache.json`
 
 ## Query Contract
 
@@ -88,6 +78,10 @@ Valid values:
 - `pollutant`: `pm25`, `pm10`, `no2`
 - `window`: `3h`, `6h`, `1d`, `7d`, `all`
 - `network_group`: `all`
+
+Note:
+
+- `limit` is relevant to builder-side RPC fetch limits, not to R2 API response selection.
 
 ## Environment Variables
 
@@ -110,7 +104,8 @@ Cloud Run builder controls:
 
 Builder data/object controls:
 
-- `UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION` (default `uk-aq-latest-snapshot-sub`; must not match `OBSERVS_PUBSUB_SUBSCRIPTION`)
+- `UK_AQ_LATEST_SNAPSHOT_SOURCE_RPC` (default `uk_aq_latest_rpc`)
+- `UK_AQ_LATEST_SNAPSHOT_LIMIT` (default `10000`; hard-capped in code at `10000`)
 - `UK_AQ_LATEST_SNAPSHOT_POLLUTANTS` (default `pm25,pm10,no2`)
 - `UK_AQ_LATEST_SNAPSHOT_WINDOWS` (default `3h,6h,1d,7d,all`)
 - `UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP` (default `all`)
@@ -118,10 +113,9 @@ Builder data/object controls:
 - `UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY` (default `${prefix}/manifest.json`)
 - `UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX` (default `${prefix}/_runs`)
 - `UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED` (default `true`)
-- `UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX` (default `latest_snapshots_state/v1`)
-- `UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX` (default `history/v1/core`)
-- `UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS` (default `86400`)
-- `UK_AQ_SERVICE_EGRESS_METRICS_ENABLED` (default `false`)
+- `UK_AQ_LATEST_SNAPSHOT_RPC_RETRIES` (default `3`)
+- `UK_AQ_LATEST_SNAPSHOT_RPC_TIMEOUT_MS` (default `20000`)
+- `UK_AQ_SERVICE_EGRESS_METRICS_ENABLED` (default `true`)
 - `UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL` (optional metrics sink Supabase URL)
 - `UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY` (optional metrics sink service key)
 - `UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA` (default `uk_aq_public`)
@@ -167,14 +161,8 @@ When `UK_AQ_LATEST_SNAPSHOT_R2_API_URL` changes, redeploy cache proxy so Worker 
 2. Check manifest at `latest_snapshots/v1/manifest.json`.
 3. Check expected snapshot object key exists for requested `(pollutant, window, network_group)`.
 
-Cloud Run builder fails with subscription safety error:
-
-1. Check `UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION` is configured to a dedicated subscription.
-2. Ensure it is not equal to `OBSERVS_PUBSUB_SUBSCRIPTION`.
-
 ## Related Docs
 
 - `system_docs/uk-aq-cache-proxy.md`
 - `workers/uk_aq_latest_snapshot_cloud_run/README.md`
 - `workers/uk_aq_latest_snapshot_r2_api_worker/README.md`
-- `system_docs/uk-aq-r2-core-snapshot.md`

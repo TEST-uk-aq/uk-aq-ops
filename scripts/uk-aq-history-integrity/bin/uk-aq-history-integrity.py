@@ -5859,7 +5859,7 @@ def run_aqi_health_checks(
 
 def _planned_aqi_rebuild_command(
     env: dict[str, str],
-    connector_id: int,
+    connector_id: int | None,
     day: dt.date,
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
@@ -5870,12 +5870,15 @@ def _planned_aqi_rebuild_command(
     ).strip()
     wrapper = wrapper_raw or "<integrity backfill wrapper unset>"
     iso = day.isoformat()
+    connector_scope = ""
+    if connector_id is not None and int(connector_id) > 0:
+        connector_scope = f"UK_AQ_BACKFILL_CONNECTOR_IDS={int(connector_id)} "
     return (
         f"UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
         f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
         f"UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only "
-        f"UK_AQ_BACKFILL_CONNECTOR_IDS={int(connector_id)} "
+        f"{connector_scope}"
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_ENV_FILE={env_file} "
@@ -5888,7 +5891,7 @@ def run_aqi_rebuild_backfill(
     wrapper_path: str | None,
     env_file_path: str | None,
     env_name: str,
-    connector_id: int,
+    connector_id: int | None,
     day: dt.date,
     log: logging.Logger,
     timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
@@ -5937,11 +5940,14 @@ def run_aqi_rebuild_backfill(
         "UK_AQ_BACKFILL_DRY_RUN": "false",
         "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
         "UK_AQ_BACKFILL_OUTPUT_SCOPE": "aqilevels_only",
-        "UK_AQ_BACKFILL_CONNECTOR_IDS": str(int(connector_id)),
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
     })
+    if connector_id is not None and int(connector_id) > 0:
+        sub_env["UK_AQ_BACKFILL_CONNECTOR_IDS"] = str(int(connector_id))
+    else:
+        sub_env.pop("UK_AQ_BACKFILL_CONNECTOR_IDS", None)
     sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
     sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_ID", None)
 
@@ -5954,20 +5960,21 @@ def run_aqi_rebuild_backfill(
             "--env",
             env_name,
             "--aqi-only",
-            "--connector-id",
-            str(int(connector_id)),
             "--from-day",
             iso,
             "--to-day",
             iso,
         ]
+        if connector_id is not None and int(connector_id) > 0:
+            cmd.extend(["--connector-id", str(int(connector_id))])
 
     started = time.monotonic()
+    connector_scope = str(int(connector_id)) if connector_id is not None and int(connector_id) > 0 else "all"
     log.info(
-        "aqi rebuild invoke wrapper=%s day=%s connector_id=%s",
+        "aqi rebuild invoke wrapper=%s day=%s connector_scope=%s",
         wrapper_path,
         iso,
-        connector_id,
+        connector_scope,
     )
 
     stdout_text = ""
@@ -6007,14 +6014,14 @@ def run_aqi_rebuild_backfill(
 
     if log_dir is not None and (stdout_text or stderr_text or result["status"]):
         log_dir.mkdir(parents=True, exist_ok=True)
-        label = log_label or f"aqi_day_{iso}_connector_{int(connector_id)}"
+        label = log_label or f"aqi_day_{iso}_connector_{connector_scope}"
         log_path = log_dir / f"{label}.log"
         try:
             with log_path.open("w", encoding="utf-8") as fh:
                 fh.write(f"# wrapper: {wrapper_path}\n")
                 fh.write(f"# env_file: {env_file_path}\n")
                 fh.write(f"# day: {iso}\n")
-                fh.write(f"# connector_id: {int(connector_id)}\n")
+                fh.write(f"# connector_scope: {connector_scope}\n")
                 fh.write("# run_mode: r2_history_obs_to_aqilevels\n")
                 fh.write("# output_scope: aqilevels_only\n")
                 fh.write(f"# command: {' '.join(cmd)}\n")
@@ -6076,9 +6083,13 @@ def run_aqi_rebuild_queue_execution(
         (run_id,),
     ).fetchall()
 
-    by_key: dict[tuple[str, int], list[tuple[Any, ...]]] = {}
+    by_day: dict[str, list[tuple[Any, ...]]] = {}
     for row in queue_rows:
         row_id, connector_id, day_utc, *_ = row
+        day_iso = str(day_utc or "").strip()
+        if not day_iso:
+            metrics["aqi_rebuilds_skipped"] += 1
+            continue
         try:
             parsed_connector_id = int(connector_id)
         except (TypeError, ValueError):
@@ -6088,12 +6099,11 @@ def run_aqi_rebuild_queue_execution(
         if parsed_connector_id <= 0:
             metrics["aqi_rebuilds_skipped"] += 1
             continue
-        key = (str(day_utc), parsed_connector_id)
-        by_key.setdefault(key, []).append(row)
+        by_day.setdefault(day_iso, []).append(row)
 
-    metrics["aqi_rebuilds_queued_total"] = len(by_key)
+    metrics["aqi_rebuilds_queued_total"] = len(by_day)
     if dry_run and metrics["aqi_rebuilds_queued_total"] == 0 and dry_run_planned_rows:
-        seed_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        seed_by_day: dict[str, dict[str, Any]] = {}
         for row in dry_run_planned_rows:
             day_iso = str(row.get("day_utc") or "").strip()
             if not day_iso:
@@ -6104,32 +6114,35 @@ def run_aqi_rebuild_queue_execution(
                 continue
             if connector_id <= 0:
                 continue
-            key = (day_iso, connector_id)
-            current = seed_by_key.get(key)
+            current = seed_by_day.get(day_iso)
             row_reasons = _parse_reason_tokens(",".join(str(v) for v in (row.get("reasons") or [])))
             if not row_reasons and row.get("reason"):
                 row_reasons = _parse_reason_tokens(str(row.get("reason")))
             if current is None:
-                seed_by_key[key] = {
+                seed_by_day[day_iso] = {
                     "day_utc": day_iso,
-                    "connector_id": connector_id,
+                    "connector_ids": [connector_id],
                     "reasons": sorted(row_reasons),
                 }
                 continue
             merged = _parse_reason_tokens(",".join(current.get("reasons") or []))
             merged.update(row_reasons)
             current["reasons"] = sorted(merged)
+            if connector_id not in current["connector_ids"]:
+                current["connector_ids"].append(connector_id)
 
-        for (day_iso, connector_id), seed in sorted(seed_by_key.items(), key=lambda item: item[0]):
+        for day_iso, seed in sorted(seed_by_day.items(), key=lambda item: item[0]):
+            connector_ids = sorted(int(v) for v in seed.get("connector_ids") or [])
             planned_cmd = _planned_aqi_rebuild_command(
                 env,
-                connector_id,
+                None,
                 dt.date.fromisoformat(day_iso),
             )
             metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
             metrics["aqi_rebuild_results"].append({
                 "queue_row_ids": [],
-                "connector_id": connector_id,
+                "connector_id": None,
+                "connector_ids": connector_ids,
                 "day_utc": day_iso,
                 "reasons": seed.get("reasons") or [],
                 "status": "planned",
@@ -6137,28 +6150,36 @@ def run_aqi_rebuild_queue_execution(
                 "error": None,
                 "log_path": None,
             })
-        metrics["aqi_rebuilds_queued_total"] = len(seed_by_key)
+        metrics["aqi_rebuilds_queued_total"] = len(seed_by_day)
         metrics["aqi_rebuild_ran"] = True
         return metrics
 
-    if not by_key:
+    if not by_day:
         metrics["aqi_rebuild_ran"] = True
         return metrics
 
     backfill_log_dir = (
         Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     )
-    for (day_iso, connector_id), rows_for_key in sorted(by_key.items(), key=lambda item: item[0]):
+    for day_iso, rows_for_key in sorted(by_day.items(), key=lambda item: item[0]):
         day_obj = dt.date.fromisoformat(day_iso)
         merged_reasons: set[str] = set()
+        connector_ids: set[int] = set()
         for row in rows_for_key:
             merged_reasons.update(_parse_reason_tokens(row[3]))
+            try:
+                parsed_connector_id = int(row[1])
+            except (TypeError, ValueError):
+                continue
+            if parsed_connector_id > 0:
+                connector_ids.add(parsed_connector_id)
         reasons_sorted = sorted(merged_reasons)
+        connector_ids_sorted = sorted(connector_ids)
         primary_row = rows_for_key[0]
         duplicate_rows = rows_for_key[1:]
         row_ids = [int(row[0]) for row in rows_for_key if row[0] is not None]
 
-        planned_cmd = _planned_aqi_rebuild_command(env, connector_id, day_obj)
+        planned_cmd = _planned_aqi_rebuild_command(env, None, day_obj)
         metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
 
         if duplicate_rows:
@@ -6169,7 +6190,7 @@ def run_aqi_rebuild_queue_execution(
                     dup_id = int(dup[0])
                     merged_note = _merge_notes(
                         dup[6],
-                        f"skipped duplicate queue key; executed by queue_row_id={int(primary_row[0])}",
+                        f"skipped duplicate queue day; executed by queue_row_id={int(primary_row[0])}",
                     )
                     conn.execute(
                         """
@@ -6186,7 +6207,8 @@ def run_aqi_rebuild_queue_execution(
         if dry_run:
             metrics["aqi_rebuild_results"].append({
                 "queue_row_ids": row_ids,
-                "connector_id": connector_id,
+                "connector_id": None,
+                "connector_ids": connector_ids_sorted,
                 "day_utc": day_iso,
                 "reasons": reasons_sorted,
                 "status": "planned",
@@ -6200,7 +6222,8 @@ def run_aqi_rebuild_queue_execution(
             metrics["aqi_rebuilds_skipped"] += 1
             metrics["aqi_rebuild_results"].append({
                 "queue_row_ids": row_ids,
-                "connector_id": connector_id,
+                "connector_id": None,
+                "connector_ids": connector_ids_sorted,
                 "day_utc": day_iso,
                 "reasons": reasons_sorted,
                 "status": "skipped_limit",
@@ -6232,11 +6255,11 @@ def run_aqi_rebuild_queue_execution(
             wrapper_path=resolve_integrity_backfill_wrapper(),
             env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
             env_name=env_name,
-            connector_id=connector_id,
+            connector_id=None,
             day=day_obj,
             log=log,
             log_dir=backfill_log_dir,
-            log_label=f"aqi_day_{day_iso}_connector_{connector_id}",
+            log_label=f"aqi_day_{day_iso}_all_connectors",
         )
         metrics["aqi_rebuilds_attempted"] += 1
 
@@ -6281,7 +6304,8 @@ def run_aqi_rebuild_queue_execution(
 
         metrics["aqi_rebuild_results"].append({
             "queue_row_ids": row_ids,
-            "connector_id": connector_id,
+            "connector_id": None,
+            "connector_ids": connector_ids_sorted,
             "day_utc": day_iso,
             "reasons": reasons_sorted,
             "status": final_status,
@@ -6295,7 +6319,7 @@ def run_aqi_rebuild_queue_execution(
         metrics["aqi_rebuild_results"],
         key=lambda row: (
             str(row.get("day_utc") or ""),
-            int(row.get("connector_id") or 0),
+            int(((row.get("connector_ids") or [0])[0]) or 0),
         ),
     )
     return metrics
