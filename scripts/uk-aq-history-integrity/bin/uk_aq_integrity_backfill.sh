@@ -21,7 +21,7 @@ Mode-specific requirements:
     --timeseries-ids CSV  Comma-separated positive integer timeseries IDs.
     --connector-id N      Optional connector filter for tighter scope.
   --aqi-only:
-    --connector-id N      Required connector ID.
+    --connector-id N      Optional connector filter for partial-day scope.
 
 Optional:
   --dry-run               Set UK_AQ_BACKFILL_DRY_RUN=true (default false).
@@ -341,11 +341,6 @@ if (( OBSERVS_ONLY == 1 )) && [[ -z "${TIMESERIES_IDS}" ]]; then
   echo "ERROR: --observs-only requires --timeseries-ids." >&2
   exit 2
 fi
-if (( AQI_ONLY == 1 )) && [[ -z "${CONNECTOR_ID}" ]]; then
-  echo "ERROR: --aqi-only requires --connector-id." >&2
-  exit 2
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT="${UK_AQ_HISTORY_INTEGRITY_ROOT:-${DEFAULT_ROOT}}"

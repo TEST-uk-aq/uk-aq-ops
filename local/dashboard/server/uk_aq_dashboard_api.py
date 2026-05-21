@@ -1539,8 +1539,8 @@ def _fetch_service_egress_metrics(
     try:
         rows = _fetch_all(
             obs_base_url,
-            _postgrest_headers(OBS_AQIDB_SECRET_KEY),
-            "uk_aq_service_egress_metrics_minute",
+            _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema="uk_aq_ops"),
+            "service_egress_metrics_minute",
             {
                 "select": (
                     "bucket_minute,env_name,project_ref,service_name,source_type,"
