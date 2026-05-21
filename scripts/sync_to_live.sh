@@ -72,7 +72,9 @@ EXCLUDES=(
 
   # Ops management docs (test-env specific)
   --exclude='env-vars-master.csv'
-  --exclude='env-vars-master*.numbers'
+  --exclude='R2 History structure.csv'
+  --exclude='R2 Manifest-Index-Inventory cheat sheet.csv'
+  --exclude='*.numbers'
 
   # Local machine setup (contain hardcoded test paths)
   --exclude='local/launchd/'

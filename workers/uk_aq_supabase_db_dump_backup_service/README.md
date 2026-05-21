@@ -69,7 +69,11 @@ Optional plain env:
 - large multi-row `INSERT INTO ... VALUES` statements are split into smaller INSERT statements
 - per-row values are preserved; only trailing row delimiters are adjusted when chunking
 - Supabase dry-run scripts are normalized so `cron` is not excluded from dump scope (preserves `cron.job` rows)
+- Supabase dry-run scripts are also normalized so explicit `--schema` include lists contain `cron` when not using wildcard schema selection
 - `schema.sql` is prefixed with `create extension if not exists pg_cron;` when missing
+- `obs_aqidb` `schema.sql` is also prefixed with a guarded statement to set
+  `authenticator` PostgREST schemas globally:
+  `public,graphql_public,uk_aq_public,uk_aq_ops`
 
 Output filenames and Dropbox paths are unchanged:
 

@@ -107,12 +107,13 @@ test("includeCronJobsInDryRunScript removes cron from exclude-schema filters", (
     "pg_dump \\",
     "  --data-only \\",
     "  --exclude-schema \"information_schema|pg_*|cron|extensions\" \\",
-    "  --schema \"*\"",
+    "  --schema \"public|uk_aq_core|uk_aq_raw\"",
   ].join("\n"));
 
   assert.match(updated, /--exclude-schema "information_schema\|pg_\*\|extensions"/);
   assert.doesNotMatch(updated, /\|cron\|/);
   assert.doesNotMatch(updated, /\|cron"/);
+  assert.match(updated, /--schema "public\|uk_aq_core\|uk_aq_raw\|cron"/);
 });
 
 test("includeCronJobsInDryRunScript is a no-op when cron is not excluded", () => {
@@ -124,6 +125,17 @@ test("includeCronJobsInDryRunScript is a no-op when cron is not excluded", () =>
     "  --schema \"*\"",
   ].join("\n");
   assert.equal(includeCronJobsInDryRunScript(script), script);
+});
+
+test("includeCronJobsInDryRunScript appends cron to explicit include-schema lists", () => {
+  const updated = includeCronJobsInDryRunScript([
+    "#!/usr/bin/env bash",
+    "pg_dump \\",
+    "  --data-only \\",
+    "  --schema \"public|auth|storage\"",
+  ].join("\n"));
+
+  assert.match(updated, /--schema "public\|auth\|storage\|cron"/);
 });
 
 test("resolveOldestKeptDate keeps the latest seven UTC folders inclusive", () => {

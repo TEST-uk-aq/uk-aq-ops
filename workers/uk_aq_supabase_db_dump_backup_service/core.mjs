@@ -16,6 +16,22 @@ export const DEFAULT_DUMP_KINDS = Object.freeze(["roles", "schema", "data"]);
 export const DEFAULT_RETENTION_DAYS = 7;
 export const DEFAULT_BACKUP_DIR = "Supabase_Backup_db_dump";
 const PG_CRON_ENABLE_SQL = "create extension if not exists pg_cron;";
+const OBS_AQIDB_AUTHENTICATOR_PGRST_SCHEMAS = [
+  "public",
+  "graphql_public",
+  "uk_aq_public",
+  "uk_aq_ops",
+];
+const OBS_AQIDB_AUTHENTICATOR_PGRST_SQL = [
+  "do $$",
+  "begin",
+  "  execute 'alter role authenticator set pgrst.db_schemas = ''public,graphql_public,uk_aq_public,uk_aq_ops''';",
+  "exception",
+  "  when insufficient_privilege or undefined_object then",
+  "    raise notice 'Skipped ALTER ROLE authenticator SET pgrst.db_schemas (insufficient privilege or missing role).';",
+  "end",
+  "$$;",
+].join("\n");
 const MAX_LOG_MESSAGE_LENGTH = 1200;
 const DEFAULT_SPLIT_LARGE_INSERTS = true;
 const DEFAULT_INSERT_SPLIT_THRESHOLD_ROWS = 10_000;
@@ -224,12 +240,29 @@ export function extractDryRunScript(outputText) {
 }
 
 function removeExcludeSchemaTokenListEntry(tokenList, tokenToRemove) {
+  const separator = String(tokenList || "").includes("|") ? "|" : ",";
   return String(tokenList || "")
-    .split("|")
+    .split(/[|,]/)
     .map((entry) => entry.trim())
     .filter(Boolean)
     .filter((entry) => entry !== tokenToRemove)
-    .join("|");
+    .join(separator);
+}
+
+function ensureSchemaTokenListEntry(tokenList, tokenToAdd) {
+  const raw = String(tokenList || "");
+  const separator = raw.includes("|") ? "|" : ",";
+  const normalized = raw
+    .split(/[|,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (normalized.includes("*")) {
+    return raw;
+  }
+  if (!normalized.includes(tokenToAdd)) {
+    normalized.push(tokenToAdd);
+  }
+  return normalized.join(separator);
 }
 
 export function includeCronJobsInDryRunScript(scriptText) {
@@ -239,6 +272,13 @@ export function includeCronJobsInDryRunScript(scriptText) {
   // so cron.job rows are preserved in data dumps for restore into new databases.
   updated = updated.replace(/(--exclude-schema\s+")([^"]+)(")/g, (_match, start, tokenList, end) => {
     const normalized = removeExcludeSchemaTokenListEntry(tokenList, "cron");
+    return `${start}${normalized}${end}`;
+  });
+
+  // Some Supabase dry-run scripts also use explicit include-schema lists.
+  // Ensure cron is present there too, otherwise cron.job rows are still omitted.
+  updated = updated.replace(/(--schema\s+")([^"]+)(")/g, (_match, start, tokenList, end) => {
+    const normalized = ensureSchemaTokenListEntry(tokenList, "cron");
     return `${start}${normalized}${end}`;
   });
 
@@ -252,6 +292,24 @@ export async function ensurePgCronExtensionAtTopOfSchemaFile(filePath) {
   }
 
   const prefix = `${PG_CRON_ENABLE_SQL}\n\n`;
+  await fs.writeFile(filePath, `${prefix}${existing}`, "utf8");
+  return true;
+}
+
+export async function ensureObsAqidbAuthenticatorSchemasAtTopOfSchemaFile(filePath) {
+  const existing = await fs.readFile(filePath, "utf8");
+  const schemaListPattern = OBS_AQIDB_AUTHENTICATOR_PGRST_SCHEMAS.map((schema) =>
+    schema.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  ).join("\\s*,\\s*");
+  const alreadyPresent = new RegExp(
+    `alter\\s+role\\s+authenticator\\s+set\\s+pgrst\\.db_schemas\\s*=\\s*'?${schemaListPattern}'?\\s*;`,
+    "i",
+  ).test(existing);
+  if (alreadyPresent) {
+    return false;
+  }
+
+  const prefix = `${OBS_AQIDB_AUTHENTICATOR_PGRST_SQL}\n\n`;
   await fs.writeFile(filePath, `${prefix}${existing}`, "utf8");
   return true;
 }
@@ -830,6 +888,18 @@ async function runSingleDump({
         dump_kind: dumpKind,
         statement: PG_CRON_ENABLE_SQL,
       });
+    }
+    if (databaseName === "obs_aqidb") {
+      const addedAuthenticatorSchemas =
+        await ensureObsAqidbAuthenticatorSchemasAtTopOfSchemaFile(rawFilePath);
+      if (addedAuthenticatorSchemas) {
+        logStructured("INFO", "supabase_db_dump_schema_authenticator_pgrst_schemas_prepended", {
+          run_id: runId,
+          database: databaseName,
+          dump_kind: dumpKind,
+          schemas: OBS_AQIDB_AUTHENTICATOR_PGRST_SCHEMAS,
+        });
+      }
     }
   }
 
