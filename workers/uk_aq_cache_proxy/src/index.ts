@@ -256,7 +256,8 @@ const TIMESERIES_V2_PRIMARY_QUERY_KEYS = [
 ] as const;
 const TIMESERIES_V2_DEFAULT_MAX_WINDOW_DAYS = 90;
 const TIMESERIES_V2_MAX_WINDOW_DAYS_LIMIT = 365;
-const TIMESERIES_V2_DEFAULT_MAX_R2_OBJECTS_PER_REQUEST = 120;
+const TIMESERIES_V2_DEFAULT_MAX_R2_OBJECTS_PER_REQUEST = 1000;
+const TIMESERIES_V2_MAX_R2_PAGES_PER_REQUEST = 200;
 const TIMESERIES_V2_DEFAULT_MAX_SUPABASE_TAIL_HOURS = 168;
 const TIMESERIES_V2_DEFAULT_INCREMENTAL_OVERLAP_MINUTES = 180;
 const TIMESERIES_V2_MAX_INCREMENTAL_OVERLAP_MINUTES = 720;
@@ -320,6 +321,13 @@ type TimeseriesV2StitchResult = {
   meta: TimeseriesV2EnvelopeMeta;
   sourceMode: string;
   cacheControl: string;
+};
+
+type R2PagedObservationsResult = {
+  rows: Array<Record<string, unknown>>;
+  coverage: Record<string, unknown> | null;
+  pagesFetched: number;
+  hitPageLimit: boolean;
 };
 
 const textEncoder = new TextEncoder();
@@ -1251,6 +1259,125 @@ async function fetchR2ObservationsPayload(
   return payload as Record<string, unknown>;
 }
 
+function asArrayOfStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+}
+
+function mergeCoverageDiagnostics(
+  target: Record<string, unknown>,
+  sourceCoverage: Record<string, unknown>,
+): void {
+  const fieldsToUnion = [
+    "missing_day_manifest_keys",
+    "missing_connector_manifest_keys",
+    "missing_parquet_keys",
+  ];
+  for (const field of fieldsToUnion) {
+    const merged = new Set<string>([
+      ...asArrayOfStrings(target[field]),
+      ...asArrayOfStrings(sourceCoverage[field]),
+    ]);
+    target[field] = Array.from(merged);
+  }
+}
+
+async function fetchR2ObservationsPaged(
+  r2ApiUrl: string,
+  upstreamAuthSecret: string,
+  params: {
+    timeseriesId: number;
+    connectorId: number;
+    startUtc: string;
+    endUtc: string;
+    sinceUtc: string | null;
+    pageLimitRows: number;
+    maxPages: number;
+  },
+): Promise<R2PagedObservationsResult> {
+  const rowsByObservedAt = new Map<string, Record<string, unknown>>();
+  const pageLimitRows = Math.max(1, params.pageLimitRows);
+  const maxPages = Math.max(1, params.maxPages);
+  let pageSinceUtc = params.sinceUtc;
+  let pagesFetched = 0;
+  let hitPageLimit = false;
+  let exhaustedWindow = false;
+  let mergedCoverage: Record<string, unknown> | null = null;
+
+  while (pagesFetched < maxPages) {
+    const payload = await fetchR2ObservationsPayload(
+      r2ApiUrl,
+      upstreamAuthSecret,
+      {
+        timeseriesId: params.timeseriesId,
+        connectorId: params.connectorId,
+        startUtc: params.startUtc,
+        endUtc: params.endUtc,
+        sinceUtc: pageSinceUtc,
+        limitRows: pageLimitRows,
+      },
+    );
+    pagesFetched += 1;
+
+    const payloadCoverage = payload.coverage && typeof payload.coverage === "object"
+      ? payload.coverage as Record<string, unknown>
+      : null;
+    if (!mergedCoverage && payloadCoverage) {
+      mergedCoverage = { ...payloadCoverage };
+    } else if (mergedCoverage && payloadCoverage) {
+      mergeCoverageDiagnostics(mergedCoverage, payloadCoverage);
+    }
+
+    const pageRows = parseTimeseriesRowsFromPayload(payload, "r2");
+    if (pageRows.length === 0) {
+      exhaustedWindow = true;
+      break;
+    }
+
+    let lastObservedAt: string | null = null;
+    for (const row of pageRows) {
+      const observedAt = String(row?.observed_at ?? "").trim();
+      if (!observedAt) {
+        continue;
+      }
+      rowsByObservedAt.set(observedAt, row);
+      lastObservedAt = observedAt;
+    }
+
+    const responseRowCount = Number(payload.row_count);
+    const reachedPageLimit = Number.isFinite(responseRowCount)
+      ? responseRowCount >= pageLimitRows
+      : pageRows.length >= pageLimitRows;
+    if (!reachedPageLimit) {
+      exhaustedWindow = true;
+      break;
+    }
+    if (!lastObservedAt) {
+      exhaustedWindow = true;
+      break;
+    }
+
+    pageSinceUtc = lastObservedAt;
+  }
+
+  if (!exhaustedWindow && pagesFetched >= maxPages) {
+    hitPageLimit = true;
+  }
+
+  return {
+    rows: Array.from(rowsByObservedAt.values()).sort((left, right) => {
+      const leftMs = parseIsoMsOrNull(left?.observed_at ?? null) ?? 0;
+      const rightMs = parseIsoMsOrNull(right?.observed_at ?? null) ?? 0;
+      return leftMs - rightMs;
+    }),
+    coverage: mergedCoverage,
+    pagesFetched,
+    hitPageLimit,
+  };
+}
+
 function toIsoSafe(valueMs: number): string {
   return new Date(valueMs).toISOString();
 }
@@ -1418,19 +1545,24 @@ async function stitchTimeseriesV2FromR2AndIngest(
   let r2Payload: Record<string, unknown> | null = null;
   let r2Rows: Array<Record<string, unknown>> = [];
   try {
-    r2Payload = await fetchR2ObservationsPayload(
+    const pagedR2 = await fetchR2ObservationsPaged(
       deps.r2HistoryApiUrl,
       deps.upstreamAuthSecret,
       {
         timeseriesId: requestWindow.timeseriesId,
         connectorId,
-          startUtc: requestStartUtc,
-          endUtc: requestEndUtc,
-          sinceUtc: overlapSince,
-          limitRows: runtime.maxR2ObjectsPerRequest,
-        },
-      );
-    r2Rows = parseTimeseriesRowsFromPayload(r2Payload, "r2");
+        startUtc: requestStartUtc,
+        endUtc: requestEndUtc,
+        sinceUtc: overlapSince,
+        pageLimitRows: runtime.maxR2ObjectsPerRequest,
+        maxPages: TIMESERIES_V2_MAX_R2_PAGES_PER_REQUEST,
+      },
+    );
+    r2Payload = pagedR2.coverage ? { coverage: pagedR2.coverage } : null;
+    r2Rows = pagedR2.rows;
+    if (pagedR2.hitPageLimit) {
+      r2Errors.push(`r2_page_limit_reached_${pagedR2.pagesFetched}`);
+    }
   } catch (error) {
     r2Errors.push(error instanceof Error ? error.message : String(error));
     if (!runtime.partialOnR2Error) {
