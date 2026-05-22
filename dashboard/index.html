@@ -5891,10 +5891,11 @@
         setStatus(forceRefresh ? "Force refreshing..." : "Loading...");
         try {
           const params = new URLSearchParams();
-          params.set("t", String(Date.now()));
           params.set("include_storage_coverage", "0");
+          params.set("include_metric_context", "1");
           if (forceRefresh) {
             params.set("force", "1");
+            params.set("t", String(Date.now()));
           }
           const dashboardUrl = buildApiUrl("dashboard", params);
           const resp = await fetch(dashboardUrl);
@@ -6008,12 +6009,13 @@
         setStatus(forceRefresh ? "Force refreshing..." : "Loading...");
         try {
           const params = new URLSearchParams();
-          params.set("t", String(Date.now()));
           params.set("include_storage_coverage", "0");
+          params.set("include_metric_context", "0");
           if (forceRefresh) {
             params.set("force", "1");
+            params.set("t", String(Date.now()));
           }
-          if (dispatchCursor) {
+          if (!forceRefresh && dispatchCursor) {
             params.set("dispatch_cursor", dispatchCursor);
           }
           const dashboardUrl = buildApiUrl("dashboard", params);

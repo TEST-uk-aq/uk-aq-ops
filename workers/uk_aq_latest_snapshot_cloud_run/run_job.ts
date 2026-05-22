@@ -159,6 +159,7 @@ type DecodedMessage = {
 
 type PullSummary = {
   pull_requests: number;
+  ack_requests: number;
   pulled_messages: number;
   decoded_rows: number;
   malformed_messages: number;
@@ -304,6 +305,8 @@ const OBSERVS_BASE_SUBSCRIPTION = (
 
 const PUBSUB_PULL_MAX_MESSAGES = 1000;
 const PUBSUB_MAX_BATCHES_PER_RUN = 8;
+const PUBSUB_ACK_MAX_IDS_PER_REQUEST = 1000;
+const PUBSUB_ACK_MAX_REQUEST_BYTES = 450_000;
 const PUBSUB_PULL_RETRIES = parsePositiveInt(
   Deno.env.get("OBSERVS_PUBSUB_WRITER_PUBSUB_RETRIES"),
   3,
@@ -852,9 +855,35 @@ async function pullPubsubMessages(maxMessages: number): Promise<PubsubPullMessag
   return payload.receivedMessages as PubsubPullMessage[];
 }
 
-async function ackPubsubMessages(ackIds: string[]): Promise<void> {
-  if (!ackIds.length) return;
-  await pubsubPost(`${subscriptionPath()}:acknowledge`, { ackIds });
+function chunkPubsubAckIds(ackIds: string[]): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+
+  for (const ackId of ackIds) {
+    const candidate = [...current, ackId];
+    const candidateBytes = measureUtf8Bytes(JSON.stringify({ ackIds: candidate }));
+    if (
+      current.length > 0 &&
+      (candidate.length > PUBSUB_ACK_MAX_IDS_PER_REQUEST || candidateBytes > PUBSUB_ACK_MAX_REQUEST_BYTES)
+    ) {
+      chunks.push(current);
+      current = [ackId];
+      continue;
+    }
+    current = candidate;
+  }
+
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+async function ackPubsubMessages(ackIds: string[]): Promise<number> {
+  if (!ackIds.length) return 0;
+  const chunks = chunkPubsubAckIds(ackIds);
+  for (const chunk of chunks) {
+    await pubsubPost(`${subscriptionPath()}:acknowledge`, { ackIds: chunk });
+  }
+  return chunks.length;
 }
 
 function decodeMessageRow(message: PubsubPullMessage): DecodedMessage {
@@ -1508,6 +1537,7 @@ async function flushPubsubRows(): Promise<{ rows: ObservationMessageRow[]; valid
   const validAckIds: string[] = [];
   const summary: PullSummary = {
     pull_requests: 0,
+    ack_requests: 0,
     pulled_messages: 0,
     decoded_rows: 0,
     malformed_messages: 0,
@@ -1543,7 +1573,7 @@ async function flushPubsubRows(): Promise<{ rows: ObservationMessageRow[]; valid
     }
 
     if (malformedAckIds.length) {
-      await ackPubsubMessages(malformedAckIds);
+      summary.ack_requests += await ackPubsubMessages(malformedAckIds);
       summary.acked_messages += malformedAckIds.length;
     }
     summary.decoded_rows += batchRows.length;
@@ -1680,7 +1710,7 @@ async function main(): Promise<void> {
   });
 
   if (pulled.validAckIds.length) {
-    await ackPubsubMessages(pulled.validAckIds);
+    pulled.summary.ack_requests += await ackPubsubMessages(pulled.validAckIds);
     pulled.summary.acked_messages += pulled.validAckIds.length;
   }
 
@@ -1694,7 +1724,7 @@ async function main(): Promise<void> {
     route_name: "pubsub_observation_pull",
     query_name: PUBSUB_SUBSCRIPTION,
     status: "ok",
-    request_count: pulled.summary.pull_requests,
+    request_count: pulled.summary.pull_requests + pulled.summary.ack_requests,
     response_rows: pulled.summary.decoded_rows,
     response_bytes_est: pulled.summary.payload_bytes,
     upstream_bytes_est: pulled.summary.payload_bytes,
@@ -1704,6 +1734,8 @@ async function main(): Promise<void> {
       pulled_messages: pulled.summary.pulled_messages,
       malformed_messages: pulled.summary.malformed_messages,
       acked_messages: pulled.summary.acked_messages,
+      ack_requests: pulled.summary.ack_requests,
+      pull_requests: pulled.summary.pull_requests,
       max_batches: PUBSUB_MAX_BATCHES_PER_RUN,
       max_messages: PUBSUB_PULL_MAX_MESSAGES,
     },

@@ -10,6 +10,7 @@ export type ProxyCacheOptions = {
   cacheTtlSeconds?: number;
   staleWhileRevalidateSeconds?: number;
   bypassCache?: boolean;
+  ignoredCacheSearchParams?: string[];
 };
 
 export class UpstreamError extends Error {
@@ -87,7 +88,11 @@ export async function proxyToUpstream(
   const cacheControl = useEdgeCache && !bypassCache
     ? `public, max-age=${cacheTtlSeconds}, s-maxage=${cacheTtlSeconds}, stale-while-revalidate=${staleWhileRevalidateSeconds}`
     : "no-store";
-  const cacheKey = new Request(incomingUrl.toString(), { method: "GET" });
+  const cacheKeyUrl = new URL(incomingUrl.toString());
+  for (const key of cacheOptions?.ignoredCacheSearchParams || []) {
+    cacheKeyUrl.searchParams.delete(key);
+  }
+  const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
 
   if (useEdgeCache && !bypassCache) {
     const cached = await defaultEdgeCache().match(cacheKey);

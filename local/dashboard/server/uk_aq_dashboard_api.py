@@ -258,8 +258,13 @@ except ValueError:
 STATION_SNAPSHOT_MAX_ROWS = max(1000, _raw_station_snapshot_max_rows)
 
 
-def _dashboard_cache_bucket(include_storage_coverage: bool) -> str:
-    return "with_coverage" if include_storage_coverage else "without_coverage"
+def _dashboard_cache_bucket(
+    include_storage_coverage: bool,
+    include_metric_context: bool,
+) -> str:
+    if include_storage_coverage:
+        return "with_coverage"
+    return "without_coverage_with_metrics" if include_metric_context else "without_coverage"
 
 
 def _invalidate_dashboard_cache(clear_storage_coverage: bool = False) -> None:
@@ -3791,11 +3796,31 @@ def _fetch_storage_coverage_context(
     }
 
 
+def _empty_storage_coverage_context() -> Dict[str, Any]:
+    return {
+        "db_size_metrics": [],
+        "schema_size_metrics": [],
+        "r2_domain_size_metrics": [],
+        "db_size_metrics_error": None,
+        "schema_size_metrics_error": None,
+        "r2_domain_size_metrics_error": None,
+        "r2_history_days": None,
+        "r2_backup_window": None,
+        "r2_backup_window_error": None,
+        "r2_history_days_bucket": None,
+        "r2_history_days_error": None,
+        "dropbox_backup_days": _empty_dropbox_backup_days(),
+        "dropbox_state_path": None,
+        "dropbox_state_error": None,
+    }
+
+
 def _build_dashboard(
     base_url: str,
     service_role_key: str,
     dispatch_cursor: Optional[datetime] = None,
     include_storage_coverage: bool = True,
+    include_metric_context: bool = True,
 ) -> Dict[str, Any]:
     headers = _postgrest_headers(service_role_key)
     project_ref = _project_ref_from_base_url(base_url)
@@ -3861,10 +3886,14 @@ def _build_dashboard(
             active_station_keys[(connector_id, station_id)] = True
 
     now = datetime.now(timezone.utc)
-    coverage_context = _fetch_storage_coverage_context(
-        base_url,
-        headers,
-        now,
+    coverage_context = (
+        _fetch_storage_coverage_context(
+            base_url,
+            headers,
+            now,
+        )
+        if include_metric_context
+        else _empty_storage_coverage_context()
     )
     db_size_metrics = coverage_context["db_size_metrics"]
     schema_size_metrics = coverage_context["schema_size_metrics"]
@@ -3880,8 +3909,12 @@ def _build_dashboard(
     dropbox_backup_days = coverage_context["dropbox_backup_days"]
     dropbox_state_path = coverage_context["dropbox_state_path"]
     dropbox_state_error = coverage_context["dropbox_state_error"]
-    r2_usage, r2_usage_error = _get_r2_usage_cached(force_refresh=False)
-    service_egress_metrics, service_egress_metrics_error = _fetch_service_egress_metrics(now)
+    if include_metric_context:
+        r2_usage, r2_usage_error = _get_r2_usage_cached(force_refresh=False)
+        service_egress_metrics, service_egress_metrics_error = _fetch_service_egress_metrics(now)
+    else:
+        r2_usage, r2_usage_error = None, None
+        service_egress_metrics, service_egress_metrics_error = [], None
     ingest_runs = _get_ingest_runs_cached(
         base_url,
         headers,
@@ -4137,17 +4170,9 @@ def _get_dashboard(
     service_role_key: str,
     dispatch_cursor: Optional[datetime] = None,
     include_storage_coverage: bool = True,
+    include_metric_context: bool = True,
 ) -> Dict[str, Any]:
-    # Cursor-based requests are incremental and should not be served from the shared cache.
-    if dispatch_cursor is not None:
-        return _build_dashboard(
-            base_url,
-            service_role_key,
-            dispatch_cursor=dispatch_cursor,
-            include_storage_coverage=include_storage_coverage,
-        )
-
-    cache_bucket = _dashboard_cache_bucket(include_storage_coverage)
+    cache_bucket = _dashboard_cache_bucket(include_storage_coverage, include_metric_context)
     with CACHE_LOCK:
         bucket_state = CACHE_STATE.get(cache_bucket) or {}
         cached = bucket_state.get("data")
@@ -4161,6 +4186,7 @@ def _get_dashboard(
         service_role_key,
         dispatch_cursor=dispatch_cursor,
         include_storage_coverage=include_storage_coverage,
+        include_metric_context=include_metric_context,
     )
     with CACHE_LOCK:
         bucket_state = CACHE_STATE.setdefault(cache_bucket, {})
@@ -4351,6 +4377,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         force_refresh = force_refresh_raw in {"1", "true", "yes", "y", "on"}
         include_storage_coverage_raw = ((query.get("include_storage_coverage") or ["1"])[0] or "").strip().lower()
         include_storage_coverage = include_storage_coverage_raw not in {"0", "false", "no", "n", "off"}
+        include_metric_context_raw = ((query.get("include_metric_context") or ["1"])[0] or "").strip().lower()
+        include_metric_context = include_metric_context_raw not in {"0", "false", "no", "n", "off"}
+        if include_storage_coverage:
+            include_metric_context = True
         cursor_values = query.get("dispatch_cursor") or []
         if cursor_values:
             parsed_cursor = _parse_timestamp(cursor_values[0])
@@ -4367,6 +4397,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.server.service_role_key,
                 dispatch_cursor=dispatch_cursor,
                 include_storage_coverage=include_storage_coverage,
+                include_metric_context=include_metric_context,
             )
         except Exception as exc:
             payload = json.dumps({"error": str(exc)}, indent=2)

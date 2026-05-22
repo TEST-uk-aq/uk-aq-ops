@@ -28,10 +28,12 @@ const GET_ROUTE_CACHE_SECONDS: Record<string, number> = {
   "/api/operations_dropbox_mtime": 30,
 };
 
-function shouldBypassCache(request: Request): boolean {
+function shouldBypassCache(request: Request, pathname: string): boolean {
   const search = new URL(request.url).searchParams;
-  const bypassKeys = ["force", "refresh", "nocache", "cache_bust", "cacheBust", "t", "ts"];
-  for (const key of bypassKeys) {
+  const bypassKeys = ["force", "refresh", "nocache", "cache_bust", "cacheBust"];
+  const cacheBustKeys = pathname === "/api/dashboard" ? [] : ["t", "ts"];
+  const keys = [...bypassKeys, ...cacheBustKeys];
+  for (const key of keys) {
     const value = String(search.get(key) || "").trim().toLowerCase();
     if (!value) {
       continue;
@@ -61,7 +63,10 @@ export async function handleCompatRoute(
     return proxyToUpstream(request, env, pathname, {
       cacheTtlSeconds: GET_ROUTE_CACHE_SECONDS[pathname] ?? 0,
       staleWhileRevalidateSeconds: 60,
-      bypassCache: shouldBypassCache(request),
+      bypassCache: shouldBypassCache(request, pathname),
+      ignoredCacheSearchParams: pathname === "/api/dashboard"
+        ? ["t", "ts", "dispatch_cursor"]
+        : undefined,
     });
   }
 
