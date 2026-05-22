@@ -1640,17 +1640,26 @@ async function stitchTimeseriesV2FromR2AndIngest(
     requestWindow.requestEndMs,
     requestWindow.normalizedWindowLabel ?? "24h",
   ) as { hasGap: boolean; gapRanges: Array<{ start_utc: string; end_utc: string }> };
+  if (merged.merged.length === 0) {
+    gapInfo.hasGap = true;
+    gapInfo.gapRanges = [{
+      start_utc: requestStartUtc,
+      end_utc: requestEndUtc,
+    }];
+  }
   const nextSince = computeNextSince(merged.merged, requestWindow.requestSinceIso);
 
   let sourceMode = "r2_plus_ingest_tail";
-  if (r2Rows.length > 0 && ingestRows.length === 0) {
+  if (r2Rows.length === 0 && ingestRows.length === 0) {
+    sourceMode = "no_data_in_window";
+  } else if (r2Rows.length > 0 && ingestRows.length === 0) {
     sourceMode = "r2_only";
   } else if (r2Rows.length === 0 && ingestRows.length > 0) {
     sourceMode = "ingest_only_fallback";
   } else if (ingestSlices.some((slice) => slice.reason !== "tail_after_r2")) {
     sourceMode = "r2_plus_ingest_tail_and_repairs";
   }
-  if (r2Errors.length > 0 && ingestRows.length > 0) {
+  if (r2Errors.length > 0 && ingestRows.length > 0 && sourceMode !== "no_data_in_window") {
     sourceMode = "ingest_only_on_r2_error";
   }
 
