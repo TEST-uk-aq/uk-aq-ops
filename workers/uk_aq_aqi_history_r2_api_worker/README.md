@@ -2,8 +2,8 @@
 
 Cloudflare Worker for AQI history reads with stitched sources:
 
-- recent data from `obs_aqidb` (`uk_aq_public.uk_aq_timeseries_aqi_hourly`)
-- older data from R2 History
+- primary source: R2 History
+- fallback/repair source for recent gaps: `obs_aqidb` (`uk_aq_public.uk_aq_timeseries_aqi_hourly`)
 
 Routes:
 
@@ -48,12 +48,13 @@ R2 paths expected:
 
 Serving rule:
 
-- Recent period uses ObsAQIDB (default last 7 days).
-- If the ObsAQIDB read fails, the same recent window falls back to R2 history on a best-effort basis.
-- Older period uses committed R2 day manifests:
+- R2 history is always read first across the full requested window.
+- Recent fallback window is controlled by `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default last 7 days).
+- ObsAQIDB is queried only when recent R2 coverage appears missing/incomplete.
+- ObsAQIDB rows are used as fallback/repairs; overlapping timestamps keep R2 values.
+- R2 uses committed day manifests:
   - a UTC day is served only when the day manifest exists.
   - no `_SUCCESS` marker or loose parquet scan fallback is used.
-- Overlapping timestamps are de-duplicated with ObsAQIDB as source-of-truth.
 - Cache policy is dynamic by requested end time:
   - windows ending within the last 24 hours use the short live TTL
   - windows ending more than 24 hours ago use the long immutable-history TTL
@@ -77,8 +78,8 @@ Response:
 
 - returns hourly points sorted by `period_start_utc` ascending:
   - `{ period_start_utc, daqi_index_level, eaqi_index_level, timeseries_id, station_id }`
-- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, plus `obs_aqidb_status` / `r2_recent_fallback_*` when live recent reads fail).
-- includes `response_complete` plus scan-completeness diagnostics (`coverage.history_scan_complete` / `coverage.r2_recent_fallback_scan_complete`) so clients can detect partial history scans.
+- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when recent fallback is used).
+- includes `response_complete` plus scan-completeness diagnostics (`coverage.history_scan_complete` and `coverage.history_scan_stopped_reason`) so clients can detect partial history scans.
 - includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.
 
