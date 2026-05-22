@@ -5,6 +5,7 @@ Builds latest map snapshots from a dedicated Pub/Sub observation subscription an
 ## Purpose
 
 - Pull latest observation messages every 60 seconds (via Cloud Scheduler + dedicated Pub/Sub subscription).
+- Acknowledge pulled Pub/Sub messages in bounded chunks so backlog bursts do not exceed the Pub/Sub acknowledge request size limit.
 - Maintain latest-per-timeseries state in R2.
 - Refresh metadata from daily R2 core snapshot (default once per day).
 - Snapshot matrix (Phase A):

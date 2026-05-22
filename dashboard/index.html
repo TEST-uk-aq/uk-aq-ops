@@ -5271,6 +5271,24 @@
         return panel;
       }
 
+      function renderOperationsInitialLoadingShell(forceRefresh = false) {
+        const operationsContainer = getModeContainer("operations");
+        if (!operationsContainer) {
+          return;
+        }
+        if (operationsContainer.children.length > 0 && !forceRefresh) {
+          syncModeControlRefsFromVisibleContainer();
+          return;
+        }
+        operationsContainer.replaceChildren(
+          renderModeControlPanel("operations"),
+          renderOperationsDropboxPanel(),
+          renderOperationsDailyTaskPanel(),
+          renderStorageCoverageLoadingPanel("Loading operations metrics..."),
+        );
+        syncModeControlRefsFromVisibleContainer();
+      }
+
       function getOperationsDailyTaskPanel() {
         const operationsContainer = getModeContainer("operations");
         if (!operationsContainer) {
@@ -5889,10 +5907,12 @@
         modeIsLoading.operations = true;
         setError("");
         setStatus(forceRefresh ? "Force refreshing..." : "Loading...");
+        renderOperationsInitialLoadingShell(forceRefresh);
         try {
           const params = new URLSearchParams();
           params.set("include_storage_coverage", "0");
           params.set("include_metric_context", "1");
+          params.set("include_ingest_context", "0");
           if (forceRefresh) {
             params.set("force", "1");
             params.set("t", String(Date.now()));

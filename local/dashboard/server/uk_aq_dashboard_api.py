@@ -261,10 +261,13 @@ STATION_SNAPSHOT_MAX_ROWS = max(1000, _raw_station_snapshot_max_rows)
 def _dashboard_cache_bucket(
     include_storage_coverage: bool,
     include_metric_context: bool,
+    include_ingest_context: bool = True,
 ) -> str:
+    ingest_suffix = "with_ingest" if include_ingest_context else "ops_only"
     if include_storage_coverage:
-        return "with_coverage"
-    return "without_coverage_with_metrics" if include_metric_context else "without_coverage"
+        return f"with_coverage_{ingest_suffix}"
+    metric_suffix = "with_metrics" if include_metric_context else "without_metrics"
+    return f"without_coverage_{metric_suffix}_{ingest_suffix}"
 
 
 def _invalidate_dashboard_cache(clear_storage_coverage: bool = False) -> None:
@@ -3821,80 +3824,94 @@ def _build_dashboard(
     dispatch_cursor: Optional[datetime] = None,
     include_storage_coverage: bool = True,
     include_metric_context: bool = True,
+    include_ingest_context: bool = True,
 ) -> Dict[str, Any]:
     headers = _postgrest_headers(service_role_key)
     project_ref = _project_ref_from_base_url(base_url)
     obs_aqidb_project_ref = _project_ref_from_base_url(OBS_AQIDB_SUPABASE_URL)
 
-    connectors = _fetch_all(
-        base_url,
-        headers,
-        "connectors",
-        {
-            "select": "id,connector_code,label,display_name,last_run_start,last_run_end,poll_enabled,poll_interval_minutes,poll_window_hours,poll_timeseries_batch_size,scheduler_backend",
-            "order": "connector_code.asc",
-        },
-    )
-    connector_map = {
-        row["id"]: {
-            "connector_code": row.get("connector_code"),
-            "label": row.get("label"),
-        }
-        for row in connectors
-        if row.get("id") is not None
-    }
-
-    stations = _fetch_all(
-        base_url,
-        headers,
-        "stations",
-        {
-            "select": "id,connector_id,service_ref,removed_at",
-        },
-    )
-    station_metadata = _fetch_all(
-        base_url,
-        headers,
-        "station_metadata",
-        {
-            "select": "station_id,attributes",
-        },
-    )
-    metadata_by_station = {
-        row.get("station_id"): row.get("attributes") or {}
-        for row in station_metadata
-        if row.get("station_id") is not None
-    }
+    connectors: List[Dict[str, Any]] = []
+    connector_map: Dict[int, Dict[str, Any]] = {}
     active_station_keys: Dict[Tuple[int, int], bool] = {}
-    for row in stations:
-        station_id = row.get("id")
-        connector_id = row.get("connector_id")
-        if station_id is None or connector_id is None:
-            continue
-        if row.get("removed_at") is not None:
-            active_station_keys[(connector_id, station_id)] = False
-            continue
-        connector_meta = connector_map.get(connector_id, {})
-        connector_code = connector_meta.get("connector_code") or ""
-        service_ref = row.get("service_ref") or ""
-        if connector_code == "breathelondon" and service_ref == "breathelondon":
-            attributes = metadata_by_station.get(station_id, {})
-            enabled_ok = _is_truthy_flag(attributes.get("enabled"))
-            active_ok = _is_truthy_flag(attributes.get("site_active"))
-            active_station_keys[(connector_id, station_id)] = enabled_ok or active_ok
-        else:
-            active_station_keys[(connector_id, station_id)] = True
-
-    now = datetime.now(timezone.utc)
-    coverage_context = (
-        _fetch_storage_coverage_context(
+    if include_ingest_context:
+        connectors = _fetch_all(
             base_url,
             headers,
-            now,
+            "connectors",
+            {
+                "select": "id,connector_code,label,display_name,last_run_start,last_run_end,poll_enabled,poll_interval_minutes,poll_window_hours,poll_timeseries_batch_size,scheduler_backend",
+                "order": "connector_code.asc",
+            },
         )
-        if include_metric_context
-        else _empty_storage_coverage_context()
-    )
+        connector_map = {
+            row["id"]: {
+                "connector_code": row.get("connector_code"),
+                "label": row.get("label"),
+            }
+            for row in connectors
+            if row.get("id") is not None
+        }
+
+        stations = _fetch_all(
+            base_url,
+            headers,
+            "stations",
+            {
+                "select": "id,connector_id,service_ref,removed_at",
+            },
+        )
+        station_metadata = _fetch_all(
+            base_url,
+            headers,
+            "station_metadata",
+            {
+                "select": "station_id,attributes",
+            },
+        )
+        metadata_by_station = {
+            row.get("station_id"): row.get("attributes") or {}
+            for row in station_metadata
+            if row.get("station_id") is not None
+        }
+        for row in stations:
+            station_id = row.get("id")
+            connector_id = row.get("connector_id")
+            if station_id is None or connector_id is None:
+                continue
+            if row.get("removed_at") is not None:
+                active_station_keys[(connector_id, station_id)] = False
+                continue
+            connector_meta = connector_map.get(connector_id, {})
+            connector_code = connector_meta.get("connector_code") or ""
+            service_ref = row.get("service_ref") or ""
+            if connector_code == "breathelondon" and service_ref == "breathelondon":
+                attributes = metadata_by_station.get(station_id, {})
+                enabled_ok = _is_truthy_flag(attributes.get("enabled"))
+                active_ok = _is_truthy_flag(attributes.get("site_active"))
+                active_station_keys[(connector_id, station_id)] = enabled_ok or active_ok
+            else:
+                active_station_keys[(connector_id, station_id)] = True
+
+    now = datetime.now(timezone.utc)
+    r2_usage: Optional[Dict[str, Any]] = None
+    r2_usage_error: Optional[str] = None
+    service_egress_metrics: List[Dict[str, Any]] = []
+    service_egress_metrics_error: Optional[str] = None
+    if include_metric_context:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            coverage_future = executor.submit(
+                _fetch_storage_coverage_context,
+                base_url,
+                headers,
+                now,
+            )
+            r2_usage_future = executor.submit(_get_r2_usage_cached, force_refresh=False)
+            service_egress_future = executor.submit(_fetch_service_egress_metrics, now)
+            coverage_context = coverage_future.result()
+            r2_usage, r2_usage_error = r2_usage_future.result()
+            service_egress_metrics, service_egress_metrics_error = service_egress_future.result()
+    else:
+        coverage_context = _empty_storage_coverage_context()
     db_size_metrics = coverage_context["db_size_metrics"]
     schema_size_metrics = coverage_context["schema_size_metrics"]
     r2_domain_size_metrics = coverage_context["r2_domain_size_metrics"]
@@ -3909,19 +3926,21 @@ def _build_dashboard(
     dropbox_backup_days = coverage_context["dropbox_backup_days"]
     dropbox_state_path = coverage_context["dropbox_state_path"]
     dropbox_state_error = coverage_context["dropbox_state_error"]
-    if include_metric_context:
-        r2_usage, r2_usage_error = _get_r2_usage_cached(force_refresh=False)
-        service_egress_metrics, service_egress_metrics_error = _fetch_service_egress_metrics(now)
-    else:
-        r2_usage, r2_usage_error = None, None
-        service_egress_metrics, service_egress_metrics_error = [], None
-    ingest_runs = _get_ingest_runs_cached(
-        base_url,
-        headers,
-        now,
-        dispatch_cursor=dispatch_cursor,
+    ingest_runs = (
+        _get_ingest_runs_cached(
+            base_url,
+            headers,
+            now,
+            dispatch_cursor=dispatch_cursor,
+        )
+        if include_ingest_context
+        else []
     )
-    dispatcher_settings = _fetch_dispatcher_settings(base_url, headers)
+    dispatcher_settings = (
+        _fetch_dispatcher_settings(base_url, headers)
+        if include_ingest_context
+        else {}
+    )
     in_flight_rows: List[Dict[str, Any]] = []
     latest_run_by_connector: Dict[int, Dict[str, Any]] = {}
     for row in ingest_runs:
@@ -4012,15 +4031,19 @@ def _build_dashboard(
         reverse=True,
     )
 
-    timeseries_rows = _fetch_all(
-        base_url,
-        headers,
-        "timeseries",
-        {
-            "select": "station_id,connector_id,last_value,last_value_at,label,phenomenon:phenomena(label,notation,pollutant_label)",
-            "last_value_at": "not.is.null",
-            "last_value": "not.is.null",
-        },
+    timeseries_rows = (
+        _fetch_all(
+            base_url,
+            headers,
+            "timeseries",
+            {
+                "select": "station_id,connector_id,last_value,last_value_at,label,phenomenon:phenomena(label,notation,pollutant_label)",
+                "last_value_at": "not.is.null",
+                "last_value": "not.is.null",
+            },
+        )
+        if include_ingest_context
+        else []
     )
 
     latest_by_pollutant: Dict[str, Dict[Tuple[int, int], datetime]] = {
@@ -4171,8 +4194,13 @@ def _get_dashboard(
     dispatch_cursor: Optional[datetime] = None,
     include_storage_coverage: bool = True,
     include_metric_context: bool = True,
+    include_ingest_context: bool = True,
 ) -> Dict[str, Any]:
-    cache_bucket = _dashboard_cache_bucket(include_storage_coverage, include_metric_context)
+    cache_bucket = _dashboard_cache_bucket(
+        include_storage_coverage,
+        include_metric_context,
+        include_ingest_context,
+    )
     with CACHE_LOCK:
         bucket_state = CACHE_STATE.get(cache_bucket) or {}
         cached = bucket_state.get("data")
@@ -4187,6 +4215,7 @@ def _get_dashboard(
         dispatch_cursor=dispatch_cursor,
         include_storage_coverage=include_storage_coverage,
         include_metric_context=include_metric_context,
+        include_ingest_context=include_ingest_context,
     )
     with CACHE_LOCK:
         bucket_state = CACHE_STATE.setdefault(cache_bucket, {})
@@ -4379,6 +4408,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         include_storage_coverage = include_storage_coverage_raw not in {"0", "false", "no", "n", "off"}
         include_metric_context_raw = ((query.get("include_metric_context") or ["1"])[0] or "").strip().lower()
         include_metric_context = include_metric_context_raw not in {"0", "false", "no", "n", "off"}
+        include_ingest_context_raw = ((query.get("include_ingest_context") or ["1"])[0] or "").strip().lower()
+        include_ingest_context = include_ingest_context_raw not in {"0", "false", "no", "n", "off"}
         if include_storage_coverage:
             include_metric_context = True
         cursor_values = query.get("dispatch_cursor") or []
@@ -4398,6 +4429,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 dispatch_cursor=dispatch_cursor,
                 include_storage_coverage=include_storage_coverage,
                 include_metric_context=include_metric_context,
+                include_ingest_context=include_ingest_context,
             )
         except Exception as exc:
             payload = json.dumps({"error": str(exc)}, indent=2)
