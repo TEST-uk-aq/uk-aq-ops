@@ -91,6 +91,14 @@ test("gap detection catches middle hole", () => {
   assert.equal(result.gapRanges.length >= 1, true);
 });
 
+test("gap detection with no rows is represented as full-window gap by caller policy", () => {
+  const startMs = Date.parse("2026-05-18T13:40:07.157Z");
+  const endMs = Date.parse("2026-05-19T13:40:07.157Z");
+  const result = detectGapRanges([], startMs, endMs, "7d");
+  assert.equal(result.hasGap, false);
+  assert.equal(result.gapRanges.length, 0);
+});
+
 test("next_since is monotonic vs requested since", () => {
   const rows = [
     { observed_at: "2026-05-10T01:00:00.000Z", value: 1 },
