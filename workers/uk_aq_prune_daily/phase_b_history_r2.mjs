@@ -1648,11 +1648,15 @@ async function dropboxRefreshAccessToken(dropboxConfig) {
 }
 
 async function uploadBytesToDropbox({ accessToken, path, body, contentType = "application/octet-stream" }) {
+  // Dropbox /2/files/upload rejects application/json; force JSON payloads to octet-stream.
+  const normalizedContentType = /^application\/json\b/i.test(String(contentType || ""))
+    ? "application/octet-stream"
+    : contentType;
   const response = await fetch(DROPBOX_UPLOAD_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": contentType,
+      "Content-Type": normalizedContentType,
       "Dropbox-API-Arg": JSON.stringify({
         path,
         mode: "overwrite",
