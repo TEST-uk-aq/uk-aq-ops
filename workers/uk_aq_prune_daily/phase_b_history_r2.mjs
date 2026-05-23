@@ -1779,10 +1779,24 @@ function createPruneComparisonManifest({
   });
 }
 
+function formatRunFolderPrefix(nowUtcIso) {
+  const dt = new Date(nowUtcIso);
+  if (Number.isNaN(dt.getTime())) {
+    return "unknown_0000_";
+  }
+  const yyyy = String(dt.getUTCFullYear());
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  const hh = String(dt.getUTCHours()).padStart(2, "0");
+  const min = String(dt.getUTCMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}_${hh}${min}_`;
+}
+
 function buildPruneComparisonBasePath({ runtime, dayUtc, connectorId }) {
   const configuredDir = String(runtime.prune_check_dropbox?.dir || DEFAULT_PRUNE_CHECK_DROPBOX_DIR).trim();
   const cleanDir = configuredDir.replace(/^\/+/, "").replace(/\/+$/, "") || DEFAULT_PRUNE_CHECK_DROPBOX_DIR;
-  const suffix = `/${cleanDir}/run_id=${runtime.run_id}/observations/day_utc=${dayUtc}/connector_id=${connectorId}`;
+  const runFolderPrefix = formatRunFolderPrefix(runtime.now_utc);
+  const suffix = `/${cleanDir}/${runFolderPrefix}run_id=${runtime.run_id}/observations/day_utc=${dayUtc}/connector_id=${connectorId}`;
   return joinDropboxPath(runtime.dropbox?.root || "", suffix);
 }
 
@@ -2956,6 +2970,7 @@ export async function runPhaseBBackup({
   const runtime = {
     ...phaseB,
     run_id: runId,
+    now_utc: nowUtc,
     staging_prefix: `${phaseB.staging_prefix_base}/run_id=${runId}`,
   };
 
