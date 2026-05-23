@@ -33,6 +33,9 @@ const DEFAULT_COMMITTED_PREFIX = "history/v1/observations";
 const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels";
 const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
+const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
+const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
+const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
 const HISTORY_SCHEMA_NAME = "observations";
 const HISTORY_SCHEMA_VERSION = 2;
@@ -113,6 +116,20 @@ function parsePositiveInt(raw, fallback, min = 1, max = 1_000_000) {
   return intValue;
 }
 
+function parseBoolean(raw, fallback) {
+  if (raw === undefined || raw === null || raw === "") {
+    return fallback;
+  }
+  const value = String(raw).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(value)) {
+    return true;
+  }
+  if (["0", "false", "no", "n", "off"].includes(value)) {
+    return false;
+  }
+  return fallback;
+}
+
 function parseBigInt(value, fieldName) {
   if (value === null || value === undefined || value === "") {
     return 0n;
@@ -131,8 +148,37 @@ function readResponseTextLimit(text, limit = 1000) {
   return text.length <= limit ? text : `${text.slice(0, limit)}...`;
 }
 
+async function readResponseText(response, limit = 1000) {
+  const raw = await response.text();
+  return raw.length <= limit ? raw : raw.slice(0, limit);
+}
+
 function normalizeBaseUrl(raw) {
   return String(raw || "").trim().replace(/\/+$/, "");
+}
+
+function normalizeDropboxPath(raw) {
+  const value = (raw || "").trim();
+  if (!value) {
+    return "";
+  }
+  const withSlash = value.startsWith("/") ? value : `/${value}`;
+  return withSlash.replace(/\/+$/, "");
+}
+
+function joinDropboxPath(root, suffix) {
+  const rootPath = normalizeDropboxPath(root);
+  const suffixPath = normalizeDropboxPath(suffix);
+  if (!rootPath) {
+    return suffixPath || "/";
+  }
+  if (!suffixPath) {
+    return rootPath;
+  }
+  if (suffixPath === rootPath || suffixPath.startsWith(`${rootPath}/`)) {
+    return suffixPath;
+  }
+  return `${rootPath}${suffixPath}`;
 }
 
 function normalizeDayUtc(value) {
@@ -1569,6 +1615,449 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
   };
 }
 
+async function dropboxRefreshAccessToken(dropboxConfig) {
+  const appKey = String(dropboxConfig?.app_key || "").trim();
+  const appSecret = String(dropboxConfig?.app_secret || "").trim();
+  const refreshToken = String(dropboxConfig?.refresh_token || "").trim();
+  if (!(appKey && appSecret && refreshToken)) {
+    throw new Error("Dropbox credentials missing (DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN).");
+  }
+
+  const tokenBody = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: appKey,
+    client_secret: appSecret,
+  });
+
+  const tokenResp = await fetch(DROPBOX_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: tokenBody.toString(),
+  });
+  if (!tokenResp.ok) {
+    const text = await readResponseText(tokenResp);
+    throw new Error(`Dropbox token request failed (${tokenResp.status}): ${text}`);
+  }
+  const tokenJson = await tokenResp.json();
+  const token = String(tokenJson?.access_token || "").trim();
+  if (!token) {
+    throw new Error("Dropbox token response missing access_token.");
+  }
+  return token;
+}
+
+async function uploadBytesToDropbox({ accessToken, path, body, contentType = "application/octet-stream" }) {
+  const response = await fetch(DROPBOX_UPLOAD_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": contentType,
+      "Dropbox-API-Arg": JSON.stringify({
+        path,
+        mode: "overwrite",
+        autorename: false,
+        mute: true,
+      }),
+    },
+    body,
+  });
+  if (!response.ok) {
+    const text = await readResponseText(response);
+    throw new Error(`Dropbox upload failed (${response.status}) path=${path}: ${text}`);
+  }
+}
+
+function normalizeManifestParquetKeys(manifest) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    return [];
+  }
+  const fromParquetObjectKeys = Array.isArray(manifest.parquet_object_keys)
+    ? manifest.parquet_object_keys
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+    : [];
+  if (fromParquetObjectKeys.length > 0) {
+    return fromParquetObjectKeys;
+  }
+  if (!Array.isArray(manifest.files)) {
+    return [];
+  }
+  return manifest.files
+    .map((entry) => (entry && typeof entry === "object") ? String(entry.key || "").trim() : "")
+    .filter(Boolean);
+}
+
+function parseManifestBigInt(value, fieldName) {
+  if (value === null || value === undefined || value === "") {
+    throw new Error(`Missing required manifest field: ${fieldName}`);
+  }
+  try {
+    const parsed = BigInt(String(value));
+    if (parsed < 0n) {
+      throw new Error(`Negative value not allowed for ${fieldName}`);
+    }
+    return parsed;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid manifest bigint ${fieldName}: ${message}`);
+  }
+}
+
+function parseManifestPositiveInt(value, fieldName, allowZero = false) {
+  if (value === null || value === undefined || value === "") {
+    throw new Error(`Missing required manifest field: ${fieldName}`);
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    throw new Error(`Invalid manifest integer ${fieldName}`);
+  }
+  if (allowZero ? parsed < 0 : parsed <= 0) {
+    throw new Error(`Invalid manifest integer ${fieldName}=${parsed}`);
+  }
+  return parsed;
+}
+
+function validateAdoptedManifest({
+  manifest,
+  dayUtc,
+  connectorId,
+  manifestKey,
+}) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error(`Invalid manifest JSON object for ${manifestKey}`);
+  }
+  const manifestDay = normalizeDayUtc(manifest.day_utc);
+  if (!manifestDay || manifestDay !== dayUtc) {
+    throw new Error(`Manifest day mismatch for ${manifestKey}: expected=${dayUtc} actual=${manifestDay || "missing"}`);
+  }
+  const manifestConnector = Number(manifest.connector_id);
+  if (!Number.isInteger(manifestConnector) || manifestConnector !== connectorId) {
+    throw new Error(
+      `Manifest connector mismatch for ${manifestKey}: expected=${connectorId} actual=${String(manifest.connector_id ?? "missing")}`,
+    );
+  }
+
+  const manifestRowCount = parseManifestBigInt(manifest.source_row_count, "source_row_count");
+  const manifestFileCount = parseManifestPositiveInt(manifest.file_count, "file_count", false);
+  const manifestTotalBytes = parseManifestBigInt(manifest.total_bytes, "total_bytes");
+  const parquetKeys = normalizeManifestParquetKeys(manifest);
+  if (parquetKeys.length === 0) {
+    throw new Error(`Manifest has no parquet object keys: ${manifestKey}`);
+  }
+  if (parquetKeys.length < manifestFileCount) {
+    throw new Error(
+      `Manifest file_count exceeds available parquet keys for ${manifestKey}: file_count=${manifestFileCount} keys=${parquetKeys.length}`,
+    );
+  }
+
+  return {
+    manifest,
+    manifest_row_count: manifestRowCount,
+    manifest_file_count: manifestFileCount,
+    manifest_total_bytes: manifestTotalBytes,
+    parquet_keys: parquetKeys,
+  };
+}
+
+function createPruneComparisonManifest({
+  baseManifest,
+  canonicalManifestKey,
+}) {
+  const { manifest_hash: _discard, ...withoutHash } = baseManifest;
+  return withManifestHash({
+    ...withoutHash,
+    comparison_only: true,
+    safe_to_promote: false,
+    source_owner: "phase_b_prune_check",
+    storage_target: "dropbox",
+    canonical_r2_manifest_key: canonicalManifestKey,
+  });
+}
+
+function buildPruneComparisonBasePath({ runtime, dayUtc, connectorId }) {
+  const configuredDir = String(runtime.prune_check_dropbox?.dir || DEFAULT_PRUNE_CHECK_DROPBOX_DIR).trim();
+  const cleanDir = configuredDir.replace(/^\/+/, "").replace(/\/+$/, "") || DEFAULT_PRUNE_CHECK_DROPBOX_DIR;
+  const suffix = `/${cleanDir}/run_id=${runtime.run_id}/observations/day_utc=${dayUtc}/connector_id=${connectorId}`;
+  return joinDropboxPath(runtime.dropbox?.root || "", suffix);
+}
+
+async function exportPruneComparisonToDropbox({
+  candidate,
+  runtime,
+  adoptedManifestKey,
+  adoptedManifest,
+  logStructured,
+}) {
+  const dayUtc = candidate.day_utc;
+  const connectorId = candidate.connector_id;
+  const dayStart = `${dayUtc}T00:00:00.000Z`;
+  const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
+  const comparisonRoot = buildPruneComparisonBasePath({ runtime, dayUtc, connectorId });
+
+  const accessToken = await dropboxRefreshAccessToken(runtime.dropbox);
+  const committedParts = [];
+  let observedRows = 0n;
+  let totalBytes = 0n;
+  let partIndex = 0;
+
+  await withPgClient(runtime.supabase_db_url, async (streamClient) => {
+    const sql = `
+select
+  connector_id,
+  timeseries_id,
+  observed_at,
+  value
+from uk_aq_ops.uk_aq_phase_b_history_rows(
+  $1::integer,
+  $2::timestamptz,
+  $3::timestamptz,
+  $4::integer,
+  $5::timestamptz
+)
+`;
+
+    const cursor = streamClient.query(
+      new Cursor(sql, [connectorId, dayStart, dayEnd, null, null]),
+    );
+    let pendingRows = [];
+
+    const flushPart = async () => {
+      if (!pendingRows.length) {
+        return;
+      }
+      const rows = pendingRows;
+      pendingRows = [];
+      const parquetBuffer = rowsToParquetBuffer(
+        rows,
+        parquetWriterProperties(runtime.observations_row_group_size),
+      );
+      const fileName = `part-${String(partIndex).padStart(5, "0")}.parquet`;
+      const dropboxPath = `${comparisonRoot}/${fileName}`;
+      await uploadBytesToDropbox({
+        accessToken,
+        path: dropboxPath,
+        body: parquetBuffer,
+      });
+
+      const partSummary = summarizeObservationPartRows(rows);
+      const bytes = Buffer.byteLength(parquetBuffer);
+      committedParts.push({
+        key: dropboxPath,
+        row_count: rows.length,
+        bytes,
+        etag_or_hash: sha256Hex(parquetBuffer),
+        min_timeseries_id: partSummary.min_timeseries_id,
+        max_timeseries_id: partSummary.max_timeseries_id,
+        min_observed_at: partSummary.min_observed_at,
+        max_observed_at: partSummary.max_observed_at,
+        timeseries_row_counts: partSummary.timeseries_row_counts,
+      });
+      observedRows += BigInt(rows.length);
+      totalBytes += BigInt(bytes);
+      partIndex += 1;
+    };
+
+    try {
+      for (;;) {
+        const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
+        if (!rows.length) {
+          break;
+        }
+        for (const row of rows) {
+          pendingRows.push({
+            connector_id: Number(row.connector_id),
+            timeseries_id: Number(row.timeseries_id),
+            observed_at: row.observed_at,
+            value: row.value,
+          });
+          if (pendingRows.length >= runtime.observations_part_max_rows) {
+            await flushPart();
+          }
+        }
+      }
+      if (pendingRows.length > 0) {
+        await flushPart();
+      }
+    } finally {
+      await closeCursor(cursor);
+    }
+  });
+
+  const comparisonManifestBase = createConnectorManifest({
+    dayUtc,
+    connectorId,
+    runId: runtime.run_id,
+    sourceRowCount: Number(observedRows),
+    minObservedAt: candidate.min_observed_at,
+    maxObservedAt: candidate.max_observed_at,
+    fileEntries: committedParts,
+    writerGitSha: runtime.writer_git_sha,
+    backedUpAtUtc: nowIso(),
+  });
+  const pruneManifest = createPruneComparisonManifest({
+    baseManifest: comparisonManifestBase,
+    canonicalManifestKey: adoptedManifestKey,
+  });
+  const adoptedRows = parseManifestBigInt(adoptedManifest?.source_row_count, "source_row_count");
+  const adoptedFiles = parseManifestPositiveInt(adoptedManifest?.file_count, "file_count", false);
+  const adoptedBytes = parseManifestBigInt(adoptedManifest?.total_bytes, "total_bytes");
+  const rowCountDelta = observedRows - adoptedRows;
+
+  const comparisonContext = {
+    run_id: runtime.run_id,
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    adopted_r2_manifest_key: adoptedManifestKey,
+    adopted_r2_manifest_hash: String(adoptedManifest?.manifest_hash || "").trim() || null,
+    prune_manifest_hash: String(pruneManifest?.manifest_hash || "").trim() || null,
+    adopted_r2_source_row_count: adoptedRows.toString(),
+    prune_source_row_count: observedRows.toString(),
+    row_count_delta: rowCountDelta.toString(),
+    adopted_r2_file_count: adoptedFiles,
+    prune_file_count: committedParts.length,
+    adopted_r2_total_bytes: adoptedBytes.toString(),
+    prune_total_bytes: totalBytes.toString(),
+    comparison_output_root: comparisonRoot,
+    notes: "comparison only; committed R2 was not overwritten",
+  };
+
+  await uploadBytesToDropbox({
+    accessToken,
+    path: `${comparisonRoot}/prune_manifest.json`,
+    body: Buffer.from(JSON.stringify(pruneManifest, null, 2), "utf8"),
+    contentType: "application/json",
+  });
+  await uploadBytesToDropbox({
+    accessToken,
+    path: `${comparisonRoot}/adopted_r2_manifest.json`,
+    body: Buffer.from(JSON.stringify(adoptedManifest, null, 2), "utf8"),
+    contentType: "application/json",
+  });
+  await uploadBytesToDropbox({
+    accessToken,
+    path: `${comparisonRoot}/comparison_context.json`,
+    body: Buffer.from(JSON.stringify(comparisonContext, null, 2), "utf8"),
+    contentType: "application/json",
+  });
+
+  logStructured("INFO", "phase_b_history_prune_check_dropbox_export_complete", {
+    run_id: runtime.run_id,
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    comparison_output_root: comparisonRoot,
+    prune_source_row_count: observedRows.toString(),
+    adopted_source_row_count: adoptedRows.toString(),
+    row_count_delta: rowCountDelta.toString(),
+  });
+
+  return {
+    comparison_output_root: comparisonRoot,
+    prune_source_row_count: observedRows,
+    adopted_source_row_count: adoptedRows,
+    row_count_delta: rowCountDelta,
+  };
+}
+
+async function maybeAdoptExistingConnectorManifest({
+  candidate,
+  runtime,
+  logStructured,
+}) {
+  if (!runtime.adopt_existing_manifest_enabled) {
+    return { adopted: false, reason: "adoption_guard_disabled" };
+  }
+
+  const dayUtc = candidate.day_utc;
+  const connectorId = candidate.connector_id;
+  const connectorManifestKey = buildConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
+  const manifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
+  if (!manifestHead.exists) {
+    return { adopted: false, reason: "manifest_missing" };
+  }
+
+  logStructured("INFO", "phase_b_history_existing_manifest_found", {
+    run_id: runtime.run_id,
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    manifest_key: connectorManifestKey,
+  });
+
+  try {
+    const object = await r2GetObject({ r2: runtime.r2, key: connectorManifestKey });
+    let parsedManifest;
+    try {
+      parsedManifest = JSON.parse(object.body.toString("utf8"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Manifest JSON parse failed for ${connectorManifestKey}: ${message}`);
+    }
+    const validated = validateAdoptedManifest({
+      manifest: parsedManifest,
+      dayUtc,
+      connectorId,
+      manifestKey: connectorManifestKey,
+    });
+
+    const probeKey = validated.parquet_keys[0];
+    const probeHead = await r2HeadObject({ r2: runtime.r2, key: probeKey });
+    if (!probeHead.exists) {
+      throw new Error(`Adopted manifest references missing parquet object: ${probeKey}`);
+    }
+
+    let comparison = null;
+    if (runtime.prune_check_dropbox?.enabled) {
+      logStructured("INFO", "phase_b_history_prune_check_dropbox_export_start", {
+        run_id: runtime.run_id,
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        manifest_key: connectorManifestKey,
+      });
+      try {
+        comparison = await exportPruneComparisonToDropbox({
+          candidate,
+          runtime,
+          adoptedManifestKey: connectorManifestKey,
+          adoptedManifest: validated.manifest,
+          logStructured,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logStructured("ERROR", "phase_b_history_prune_check_dropbox_export_failed", {
+          run_id: runtime.run_id,
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          manifest_key: connectorManifestKey,
+          error: message,
+          required: runtime.prune_check_dropbox?.required === true,
+        });
+        if (runtime.prune_check_dropbox?.required) {
+          throw error;
+        }
+      }
+    }
+
+    return {
+      adopted: true,
+      manifest_key: connectorManifestKey,
+      history_row_count: validated.manifest_row_count,
+      history_file_count: validated.manifest_file_count,
+      history_total_bytes: validated.manifest_total_bytes,
+      comparison,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logStructured("ERROR", "phase_b_history_existing_manifest_adoption_failed", {
+      run_id: runtime.run_id,
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      manifest_key: connectorManifestKey,
+      error: message,
+    });
+    throw error;
+  }
+}
+
 function toAqilevelConnectorCountRow(row) {
   const expectedRowCountValue = row.expected_row_count === undefined
     ? row.row_count
@@ -2425,6 +2914,21 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     committed_prefix: committedPrefix,
     aqilevels_prefix: aqilevelsPrefix,
     runs_prefix: runsPrefix,
+    adopt_existing_manifest_enabled: parseBoolean(
+      env.UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED,
+      true,
+    ),
+    prune_check_dropbox: {
+      enabled: parseBoolean(env.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED, false),
+      required: parseBoolean(env.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED, false),
+      dir: String(env.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR || DEFAULT_PRUNE_CHECK_DROPBOX_DIR).trim(),
+    },
+    dropbox: {
+      root: String(env.UK_AQ_DROPBOX_ROOT || "").trim(),
+      app_key: String(env.DROPBOX_APP_KEY || "").trim(),
+      app_secret: String(env.DROPBOX_APP_SECRET || "").trim(),
+      refresh_token: String(env.DROPBOX_REFRESH_TOKEN || "").trim(),
+    },
     aqilevels_source: {
       base_url: String(env.OBS_AQIDB_SUPABASE_URL || "").trim(),
       privileged_key: String(env.OBS_AQIDB_SECRET_KEY || "").trim(),
@@ -2480,6 +2984,7 @@ export async function runPhaseBBackup({
     pending_candidates: 0,
     processed_candidates: 0,
     completed_candidates: 0,
+    adopted_candidates: 0,
     failed_candidates: 0,
     total_written_rows: "0",
     total_written_bytes: "0",
@@ -2488,6 +2993,9 @@ export async function runPhaseBBackup({
     failures: [],
     completed_preview: [],
     blocked_preview: [],
+    adoption_failures: [],
+    prune_check_dropbox_exports: 0,
+    prune_check_dropbox_failures: 0,
     aqilevels: null,
   };
 
@@ -2498,6 +3006,10 @@ export async function runPhaseBBackup({
     ingest_retention_days: window.ingest_retention_days,
     phase_b_eligible_age_days: window.phase_b_eligible_age_days,
     latest_eligible_day_utc: window.latest_eligible_day_utc,
+    adopt_existing_manifest_enabled: runtime.adopt_existing_manifest_enabled,
+    prune_check_dropbox_enabled: runtime.prune_check_dropbox?.enabled === true,
+    prune_check_dropbox_required: runtime.prune_check_dropbox?.required === true,
+    prune_check_dropbox_dir: runtime.prune_check_dropbox?.dir || DEFAULT_PRUNE_CHECK_DROPBOX_DIR,
     max_candidates_per_run: runtime.max_candidates_per_run,
     part_max_rows: runtime.part_max_rows,
     observations_part_max_rows: runtime.observations_part_max_rows,
@@ -2561,10 +3073,28 @@ export async function runPhaseBBackup({
 
       const startedAtMs = Date.now();
       try {
-        const exportResult = await exportCandidateToR2({
+        const adoptResult = await maybeAdoptExistingConnectorManifest({
           candidate,
           runtime,
+          logStructured,
         });
+
+        let exportResult;
+        if (adoptResult.adopted) {
+          exportResult = {
+            manifest_key: adoptResult.manifest_key,
+            written_row_count: adoptResult.history_row_count,
+            file_count: adoptResult.history_file_count,
+            total_bytes: adoptResult.history_total_bytes,
+            adopted: true,
+          };
+        } else {
+          exportResult = await exportCandidateToR2({
+            candidate,
+            runtime,
+          });
+          exportResult.adopted = false;
+        }
 
         await markCandidateComplete(controlClient, {
           dayUtc: candidate.day_utc,
@@ -2576,9 +3106,27 @@ export async function runPhaseBBackup({
           historyTotalBytes: exportResult.total_bytes,
         });
 
-        totalWrittenRows += exportResult.written_row_count;
-        totalWrittenBytes += exportResult.total_bytes;
         summary.completed_candidates += 1;
+        if (exportResult.adopted) {
+          summary.adopted_candidates += 1;
+          logStructured("INFO", "phase_b_history_existing_manifest_adopted", {
+            run_id: runId,
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            manifest_key: exportResult.manifest_key,
+            history_row_count: exportResult.written_row_count.toString(),
+            history_file_count: exportResult.file_count,
+            history_total_bytes: exportResult.total_bytes.toString(),
+          });
+        } else {
+          totalWrittenRows += exportResult.written_row_count;
+          totalWrittenBytes += exportResult.total_bytes;
+        }
+        if (adoptResult.adopted && adoptResult.comparison) {
+          summary.prune_check_dropbox_exports += 1;
+        } else if (adoptResult.adopted && runtime.prune_check_dropbox?.enabled) {
+          summary.prune_check_dropbox_failures += 1;
+        }
 
         const dayState = await finalizeDayGateIfReady({
           client: controlClient,
@@ -2599,6 +3147,8 @@ export async function runPhaseBBackup({
           file_count: exportResult.file_count,
           total_bytes: exportResult.total_bytes.toString(),
           manifest_key: exportResult.manifest_key,
+          source_owner: exportResult.adopted ? "adopted_existing_r2_manifest" : "phase_b_export",
+          comparison_output_root: adoptResult.comparison?.comparison_output_root || null,
           duration_ms: durationMs,
         });
       } catch (error) {
@@ -2616,6 +3166,12 @@ export async function runPhaseBBackup({
         });
         dayResults.set(candidate.day_utc, dayState);
         summary.failed_candidates += 1;
+        summary.adoption_failures.push({
+          day_utc: candidate.day_utc,
+          connector_id: candidate.connector_id,
+          run_id: runId,
+          error: message,
+        });
         summary.failures.push({
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
@@ -2657,12 +3213,24 @@ export async function runPhaseBBackup({
   summary.blocked_days = dayStates.filter((state) => state.history_done !== true).length;
   summary.completed_preview = dayStates.slice(0, 25);
   summary.blocked_preview = dayStates.filter((state) => state.history_done !== true).slice(0, 25);
+  summary.adoption_failures = summary.adoption_failures.slice(0, 25);
+  summary.failures = summary.failures.slice(0, 25);
 
   const cleanupSummary = await cleanupStaging({ runtime, logStructured });
   summary.staging_cleanup = cleanupSummary;
 
   const runManifestKey = await writeRunManifest({ runtime, runSummary: summary });
   summary.run_manifest_key = runManifestKey;
+
+  if (runtime.prune_check_dropbox?.enabled) {
+    logStructured("INFO", "phase_b_history_prune_check_summary", {
+      run_id: runId,
+      adopted_candidates: summary.adopted_candidates,
+      dropbox_exports: summary.prune_check_dropbox_exports,
+      dropbox_failures: summary.prune_check_dropbox_failures,
+      required: runtime.prune_check_dropbox?.required === true,
+    });
+  }
 
   logStructured("INFO", "phase_b_history_run_summary", summary);
   return summary;
