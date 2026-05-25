@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/local/scripts/run_cloudflared.sh</string>
+        <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/local/scripts/run_cloudflared.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -20,9 +20,9 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/logs/cloudflared.log</string>
+    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/logs/cloudflared.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/logs/cloudflared.log</string>
+    <string>/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/logs/cloudflared.log</string>
 </dict>
 </plist>

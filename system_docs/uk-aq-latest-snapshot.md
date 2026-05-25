@@ -122,13 +122,6 @@ Builder data/object controls:
 - `UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX` (default `latest_snapshots_state/v1`)
 - `UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX` (default `history/v1/core`)
 - `UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS` (default `86400`)
-- `UK_AQ_SERVICE_EGRESS_METRICS_ENABLED` (default `false`)
-- `UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL` (optional metrics sink Supabase URL)
-- `UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY` (optional metrics sink service key)
-- `UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA` (default `uk_aq_public`)
-- `UK_AQ_SERVICE_EGRESS_METRICS_RPC` (default `uk_aq_rpc_service_egress_metrics_batch_upsert`)
-- `UK_AQ_SERVICE_EGRESS_ENV` (environment label persisted with metric rows)
-- `UK_AQ_SERVICE_EGRESS_PROJECT_REF` (optional project-ref label persisted with metric rows)
 
 R2 API Worker controls:
 
