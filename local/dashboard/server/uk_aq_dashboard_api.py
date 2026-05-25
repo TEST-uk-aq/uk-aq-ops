@@ -60,11 +60,8 @@ DB_SIZE_LOOKBACK_DAYS = max(
     1,
     int(os.getenv("UK_AQ_DB_SIZE_LOOKBACK_DAYS", "28")),
 )
-SERVICE_EGRESS_LOOKBACK_DAYS = max(
-    1,
-    int(os.getenv("UK_AQ_SERVICE_EGRESS_LOOKBACK_DAYS", "7")),
-)
 METRICS_VIEW_PAGE_SIZE = 1000
+SERVICE_EGRESS_DASHBOARD_VIEW = "uk_aq_endpoint_egress_metrics_24h_dashboard"
 EXTERNAL_METRICS_MAX_LAG = timedelta(hours=6)
 EXTERNAL_SCHEMA_MISSING_WARNING = "External DB size API payload missing usable schema_size_metrics rows"
 EXTERNAL_SCHEMA_LAG_WARNING = "External DB size API returned lagging schema_size_metrics window"
@@ -997,40 +994,43 @@ def _normalize_service_egress_metrics_rows(rows: List[Dict[str, Any]]) -> List[D
         bucket_minute = _parse_timestamp(row.get("bucket_minute"))
         if bucket_minute is None:
             continue
-        source_type = str(row.get("source_type") or "").strip().lower() or "other"
-        if source_type not in {"supabase", "r2", "cloudflare_cache", "gcp", "other"}:
-            source_type = "other"
 
         def _to_non_negative_int(value: Any) -> int:
             try:
-                parsed = int(value)
+                parsed = int(float(value))
             except (TypeError, ValueError):
                 return 0
             return max(0, parsed)
 
+        status_class = str(row.get("status_class") or "").strip().lower()
+        if status_class not in {"2xx", "3xx", "4xx", "5xx", "other"}:
+            status_class = "other"
+        observed_requests = _to_non_negative_int(row.get("observed_requests"))
+        error_count = observed_requests if status_class in {"4xx", "5xx"} else 0
+
         normalized.append(
             {
                 "bucket_minute": bucket_minute.isoformat().replace("+00:00", "Z"),
-                "env_name": str(row.get("env_name") or "").strip().lower() or "unknown",
-                "project_ref": str(row.get("project_ref") or "").strip(),
-                "service_name": str(row.get("service_name") or "").strip(),
-                "source_type": source_type,
-                "source_name": str(row.get("source_name") or "").strip(),
-                "route_name": str(row.get("route_name") or "").strip(),
-                "query_name": str(row.get("query_name") or "").strip(),
-                "window_label": str(row.get("window_label") or "").strip(),
-                "status": str(row.get("status") or "").strip().lower() or "ok",
-                "request_count": _to_non_negative_int(row.get("request_count")),
-                "response_rows": _to_non_negative_int(row.get("response_rows")),
-                "response_bytes_est": _to_non_negative_int(row.get("response_bytes_est")),
-                "upstream_bytes_est": _to_non_negative_int(row.get("upstream_bytes_est")),
-                "cache_hit_count": _to_non_negative_int(row.get("cache_hit_count")),
-                "cache_miss_count": _to_non_negative_int(row.get("cache_miss_count")),
-                "objects_written_count": _to_non_negative_int(row.get("objects_written_count")),
-                "objects_written_bytes": _to_non_negative_int(row.get("objects_written_bytes")),
-                "duration_ms": _to_non_negative_int(row.get("duration_ms")),
-                "error_count": _to_non_negative_int(row.get("error_count")),
-                "notes": row.get("notes") if isinstance(row.get("notes"), dict) else None,
+                "env_name": "unknown",
+                "project_ref": "",
+                "service_name": "supabase_endpoint",
+                "source_type": "supabase",
+                "source_name": "",
+                "route_name": str(row.get("endpoint") or "").strip(),
+                "query_name": str(row.get("method") or "").strip().upper(),
+                "window_label": status_class,
+                "status": "ok" if status_class in {"2xx", "3xx"} else "error",
+                "request_count": observed_requests,
+                "response_rows": _to_non_negative_int(row.get("estimated_requests")),
+                "response_bytes_est": _to_non_negative_int(row.get("response_bytes_sum")),
+                "upstream_bytes_est": _to_non_negative_int(row.get("response_bytes_sum")),
+                "cache_hit_count": 0,
+                "cache_miss_count": 0,
+                "objects_written_count": 0,
+                "objects_written_bytes": 0,
+                "duration_ms": _to_non_negative_int(row.get("duration_ms_sum")),
+                "error_count": error_count,
+                "notes": None,
             }
         )
 
@@ -1537,26 +1537,22 @@ def _fetch_size_metrics(
 
 
 def _fetch_service_egress_metrics(
-    now: datetime,
+    base_url: str,
+    service_role_key: str,
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
-        return [], "obs_aqidb: missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY"
+    if not base_url or not service_role_key:
+        return [], "ingestdb: missing base URL or service key"
 
-    obs_base_url = f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
-    since = now - timedelta(days=SERVICE_EGRESS_LOOKBACK_DAYS)
     try:
         rows = _fetch_all(
-            obs_base_url,
-            _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema="uk_aq_ops"),
-            "service_egress_metrics_minute",
+            base_url,
+            _postgrest_headers(service_role_key, schema=PUBLIC_SCHEMA),
+            SERVICE_EGRESS_DASHBOARD_VIEW,
             {
                 "select": (
-                    "bucket_minute,env_name,project_ref,service_name,source_type,"
-                    "source_name,route_name,query_name,window_label,status,request_count,"
-                    "response_rows,response_bytes_est,upstream_bytes_est,cache_hit_count,"
-                    "cache_miss_count,objects_written_count,objects_written_bytes,duration_ms,error_count,notes"
+                    "bucket_minute,endpoint,method,status_class,observed_requests,"
+                    "estimated_requests,response_bytes_sum,duration_ms_sum"
                 ),
-                "bucket_minute": f"gte.{_to_postgrest_ts(since)}",
                 "order": "bucket_minute.asc",
             },
             limit=METRICS_VIEW_PAGE_SIZE,
@@ -3906,7 +3902,11 @@ def _build_dashboard(
                 now,
             )
             r2_usage_future = executor.submit(_get_r2_usage_cached, force_refresh=False)
-            service_egress_future = executor.submit(_fetch_service_egress_metrics, now)
+            service_egress_future = executor.submit(
+                _fetch_service_egress_metrics,
+                base_url,
+                service_role_key,
+            )
             coverage_context = coverage_future.result()
             r2_usage, r2_usage_error = r2_usage_future.result()
             service_egress_metrics, service_egress_metrics_error = service_egress_future.result()

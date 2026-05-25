@@ -39,13 +39,6 @@ Builds latest map snapshots from a dedicated Pub/Sub observation subscription an
 - `UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX` (default `history/v1/core`)
 - `UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS` (default `86400`)
 - `UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION` (default `uk-aq-latest-snapshot-sub`; must be dedicated and not equal to `OBSERVS_PUBSUB_SUBSCRIPTION`)
-- `UK_AQ_SERVICE_EGRESS_METRICS_ENABLED` (default `false`)
-- `UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL` (optional metrics sink URL; default disabled if empty)
-- `UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY` (optional metrics sink service key)
-- `UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA` (default `uk_aq_public`)
-- `UK_AQ_SERVICE_EGRESS_METRICS_RPC` (default `uk_aq_rpc_service_egress_metrics_batch_upsert`)
-- `UK_AQ_SERVICE_EGRESS_ENV` (default `UK_AQ_ENV` or `unknown`)
-- `UK_AQ_SERVICE_EGRESS_PROJECT_REF` (optional project ref override for attribution rows)
 
 ## Trigger mode
 

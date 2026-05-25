@@ -45,11 +45,12 @@
           radial-gradient(circle at 80% 0%, rgba(31, 122, 122, 0.18), transparent 45%),
           linear-gradient(135deg, var(--bg-base), var(--bg-accent));
         min-height: 100vh;
-        padding: 32px 20px calc(112px + env(safe-area-inset-bottom));
+        padding: 32px 10px calc(112px + env(safe-area-inset-bottom));
       }
 
       .shell {
-        max-width: 1100px;
+        max-width: 100%;
+        width: 90vw;
         margin: 0 auto;
         display: grid;
         gap: 24px;
@@ -410,17 +411,17 @@
 
       .db-size-chart-wrap {
         width: 100%;
-        height: 290px;
         border: 1px solid var(--border);
         border-radius: 14px;
         background: rgba(255, 255, 255, 0.68);
         overflow: hidden;
         position: relative;
+        min-height: 220px;
       }
 
       .db-size-chart {
         width: 100%;
-        height: 100%;
+        height: auto;
         display: block;
       }
 
@@ -968,12 +969,12 @@
       }
 
       .coverage-connector-chart-wrap {
-        min-height: 210px;
+        min-height: 170px;
       }
 
       .coverage-connector-chart-svg {
         width: 100%;
-        height: 210px;
+        height: auto;
         display: block;
       }
 
@@ -1406,11 +1407,84 @@
         font-size: 14px;
       }
 
+      .table-scroll {
+        width: 100%;
+        overflow-x: auto;
+        overflow-y: hidden;
+        -webkit-overflow-scrolling: touch;
+      }
+
       th,
       td {
         text-align: left;
         padding: 10px 8px;
         border-bottom: 1px solid var(--border);
+      }
+
+      .egress-wrap {
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      .egress-table {
+        table-layout: fixed;
+      }
+
+      .egress-col-source {
+        width: 8ch;
+      }
+
+      .egress-col-window {
+        width: 7ch;
+      }
+
+      .egress-col-route {
+        width: auto;
+      }
+
+      .egress-col-query {
+        width: 7ch;
+      }
+
+      .egress-col-req {
+        width: 6ch;
+      }
+
+      .egress-col-rows {
+        width: 6ch;
+      }
+
+      .egress-col-resp {
+        width: 10ch;
+      }
+
+      .egress-col-upstream {
+        width: 11ch;
+      }
+
+      .egress-col-duration {
+        width: 8ch;
+      }
+
+      .egress-col-errors {
+        width: 7ch;
+      }
+
+      .egress-query {
+        white-space: nowrap;
+        overflow-wrap: normal;
+        word-break: normal;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .egress-query-head {
+        white-space: nowrap;
+      }
+
+      .egress-table th {
+        white-space: nowrap;
       }
 
       th {
@@ -1436,6 +1510,14 @@
         overflow: hidden;
         background: #efe4cf;
         min-width: 140px;
+      }
+
+      .freshness-mobile-trend-row {
+        display: none;
+      }
+
+      .freshness-mobile-trend-cell {
+        padding: 8px 10px 12px;
       }
 
       .seg {
@@ -1502,9 +1584,25 @@
       }
 
       @media (max-width: 900px) {
-        th:nth-child(n + 5),
-        td:nth-child(n + 5) {
+        .table-scroll-egress .egress-table {
+          min-width: 980px;
+        }
+
+        .table-scroll-daily-task .daily-task-table {
+          min-width: 900px;
+        }
+
+        .table-scroll-freshness .freshness-table {
+          min-width: 900px;
+        }
+
+        .freshness-table th:nth-child(9),
+        .freshness-table td:nth-child(9) {
           display: none;
+        }
+
+        .freshness-table .freshness-mobile-trend-row {
+          display: table-row;
         }
 
         .db-size-chart-wrap {
@@ -2754,11 +2852,24 @@
           });
         }
         if (refreshNowBtn) {
-          refreshNowBtn.addEventListener("click", () => {
-            if (activeMode === "operations") {
-              loadOperationsDashboard({ forceRefresh: true });
-            } else {
-              loadDashboard({ forceRefresh: true });
+          refreshNowBtn.addEventListener("click", async () => {
+            if (refreshNowBtn.disabled) {
+              return;
+            }
+            refreshNowBtn.disabled = true;
+            const originalLabel = refreshNowBtn.textContent;
+            refreshNowBtn.textContent = "Refreshing...";
+            try {
+              if (activeMode === "operations") {
+                await loadOperationsDashboard({ forceRefresh: false });
+              } else {
+                await loadDashboard({ forceRefresh: false });
+              }
+            } finally {
+              if (document.body.contains(refreshNowBtn)) {
+                refreshNowBtn.disabled = false;
+                refreshNowBtn.textContent = originalLabel || "Refresh now";
+              }
             }
           });
         }
@@ -2770,50 +2881,57 @@
         panel.className = "panel";
         panel.innerHTML = `
           <h2>${pollutant.label} <span class="chip">${pollutant.key}</span></h2>
-          <table>
-            <thead>
-              <tr>
-                <th>Connector</th>
-                <th>Stations</th>
-                <th>Active</th>
-                <th>0-3</th>
-                <th>3-6</th>
-                <th>6-24</th>
-                <th>1-7</th>
-                <th>7+</th>
-                <th>Trend</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${pollutant.connectors
-                .map((row) => {
-                  const total = row.stations_with_pollutant || 0;
-                  const active = row.active_stations_with_pollutant || 0;
-                  const bucketCounts = bucketOrder.map((bucket) => row.buckets[bucket] || 0);
-                  const segments = bucketCounts
-                    .map((count, idx) => {
-                      const pct = total ? (count / total) * 100 : 0;
-                      const label = `${bucketOrder[idx]}: ${count}`;
-                      return `<span class="seg seg-${idx}" style="width:${pct}%" title="${label}"></span>`;
-                    })
-                    .join("");
-                  return `
-                    <tr>
-                      <td class="connector-name">${row.label}</td>
-                      <td>${total}</td>
-                      <td>${active}</td>
-                      <td>${bucketCounts[0]}</td>
-                      <td>${bucketCounts[1]}</td>
-                      <td>${bucketCounts[2]}</td>
-                      <td>${bucketCounts[3]}</td>
-                      <td>${bucketCounts[4]}</td>
-                      <td><div class="bucket-bar">${segments}</div></td>
-                    </tr>
-                  `;
-                })
-                .join("")}
-            </tbody>
-          </table>
+          <div class="table-scroll table-scroll-freshness">
+            <table class="freshness-table">
+              <thead>
+                <tr>
+                  <th>Connector</th>
+                  <th>Stations</th>
+                  <th>Active</th>
+                  <th>0-3</th>
+                  <th>3-6</th>
+                  <th>6-24</th>
+                  <th>1-7</th>
+                  <th>7+</th>
+                  <th>Trend</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${pollutant.connectors
+                  .map((row) => {
+                    const total = row.stations_with_pollutant || 0;
+                    const active = row.active_stations_with_pollutant || 0;
+                    const bucketCounts = bucketOrder.map((bucket) => row.buckets[bucket] || 0);
+                    const segments = bucketCounts
+                      .map((count, idx) => {
+                        const pct = total ? (count / total) * 100 : 0;
+                        const label = `${bucketOrder[idx]}: ${count}`;
+                        return `<span class="seg seg-${idx}" style="width:${pct}%" title="${label}"></span>`;
+                      })
+                      .join("");
+                    return `
+                      <tr>
+                        <td class="connector-name">${row.label}</td>
+                        <td>${total}</td>
+                        <td>${active}</td>
+                        <td>${bucketCounts[0]}</td>
+                        <td>${bucketCounts[1]}</td>
+                        <td>${bucketCounts[2]}</td>
+                        <td>${bucketCounts[3]}</td>
+                        <td>${bucketCounts[4]}</td>
+                        <td><div class="bucket-bar">${segments}</div></td>
+                      </tr>
+                      <tr class="freshness-mobile-trend-row">
+                        <td colspan="9" class="freshness-mobile-trend-cell">
+                          <div class="bucket-bar">${segments}</div>
+                        </td>
+                      </tr>
+                    `;
+                  })
+                  .join("")}
+              </tbody>
+            </table>
+          </div>
           <div class="footnote">Buckets are based on timeseries last_value_at timestamps.</div>
         `;
         return panel;
@@ -3459,7 +3577,7 @@
           );
 
           chartMarkup = `
-            <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Ingest and Observs/AQI DB size trend">
+            <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet" role="img" aria-label="Ingest and Observs/AQI DB size trend">
               ${yTicks
                 .map((tick) => {
                   const y = yFor(tick);
@@ -3579,7 +3697,7 @@
             <div class="db-size-subchart">
               <h3>${escapeHtml(title)}</h3>
               <div class="db-size-chart-wrap">
-                <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(ariaLabel)}">
+                <svg class="db-size-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet" role="img" aria-label="${escapeHtml(ariaLabel)}">
                   ${yTicks
                     .map((tick) => {
                       const y = yFor(tick);
@@ -4446,7 +4564,7 @@
         }).join("");
 
         return `
-          <svg class="coverage-connector-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(connectorConfig.title)} R2 connector row counts">
+          <svg class="coverage-connector-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMin meet" role="img" aria-label="${escapeHtml(connectorConfig.title)} R2 connector row counts">
             ${yTicks.map((tick) => {
               const y = yFor(tick);
               return `
@@ -4625,9 +4743,7 @@
         const normalizedRows = Array.isArray(rows) ? rows : [];
         const cutoffMs = Date.now() - (24 * 60 * 60 * 1000);
         const latestSnapshotRows = normalizedRows.filter((row) => {
-          if (!row || row.service_name !== "uk_aq_latest_snapshot_builder") {
-            return false;
-          }
+          if (!row) return false;
           const bucketMs = new Date(row.bucket_minute || "").getTime();
           return Number.isFinite(bucketMs) && bucketMs >= cutoffMs;
         });
@@ -4649,8 +4765,6 @@
             response_rows: 0,
             response_bytes_est: 0,
             upstream_bytes_est: 0,
-            objects_written_count: 0,
-            objects_written_bytes: 0,
             duration_ms: 0,
             error_count: 0,
           };
@@ -4658,8 +4772,6 @@
           current.response_rows += Number(row.response_rows || 0);
           current.response_bytes_est += Number(row.response_bytes_est || 0);
           current.upstream_bytes_est += Number(row.upstream_bytes_est || 0);
-          current.objects_written_count += Number(row.objects_written_count || 0);
-          current.objects_written_bytes += Number(row.objects_written_bytes || 0);
           current.duration_ms += Number(row.duration_ms || 0);
           current.error_count += Number(row.error_count || 0);
           grouped.set(key, current);
@@ -4676,8 +4788,6 @@
           acc.response_rows += Number(row.response_rows || 0);
           acc.response_bytes_est += Number(row.response_bytes_est || 0);
           acc.upstream_bytes_est += Number(row.upstream_bytes_est || 0);
-          acc.objects_written_count += Number(row.objects_written_count || 0);
-          acc.objects_written_bytes += Number(row.objects_written_bytes || 0);
           acc.duration_ms += Number(row.duration_ms || 0);
           acc.error_count += Number(row.error_count || 0);
           return acc;
@@ -4686,8 +4796,6 @@
           response_rows: 0,
           response_bytes_est: 0,
           upstream_bytes_est: 0,
-          objects_written_count: 0,
-          objects_written_bytes: 0,
           duration_ms: 0,
           error_count: 0,
         });
@@ -4697,49 +4805,59 @@
               <tr>
                 <td>${escapeHtml(String(row.source_type || ""))}</td>
                 <td>${escapeHtml(String(row.window_label || "all"))}</td>
-                <td>${escapeHtml(String(row.route_name || ""))}</td>
-                <td>${escapeHtml(String(row.query_name || ""))}</td>
+                <td class="egress-wrap">${escapeHtml(String(row.route_name || ""))}</td>
+                <td class="egress-query">${escapeHtml(String(row.query_name || ""))}</td>
                 <td>${formatCount(row.request_count)}</td>
                 <td>${formatCompactCount(row.response_rows)}</td>
                 <td>${formatBytesBestFit(row.response_bytes_est)}</td>
                 <td>${formatBytesBestFit(row.upstream_bytes_est)}</td>
-                <td>${formatCount(row.objects_written_count)}</td>
-                <td>${formatBytesBestFit(row.objects_written_bytes)}</td>
                 <td>${formatCompactCount(row.duration_ms)}</td>
                 <td>${formatCount(row.error_count)}</td>
               </tr>
             `).join("")
-          : `<tr><td colspan="12">No latest-snapshot service egress rows in the last 24h.</td></tr>`;
+          : `<tr><td colspan="10">No Supabase endpoint egress rows in the last 24h.</td></tr>`;
 
         const warningLine = sourceError
           ? `<div class="footnote">Metrics source warning: ${escapeHtml(String(sourceError))}</div>`
           : "";
 
         panel.innerHTML = `
-          <h2>Latest Snapshot Service Egress (24h) <span class="chip">beta</span></h2>
+          <h2>Supabase Endpoint Egress (24h) <span class="chip">beta</span></h2>
           <div class="meta-note">
-            Requests ${formatCount(totals.request_count)} · Supabase response ${formatBytesBestFit(totals.response_bytes_est)} · Upstream ${formatBytesBestFit(totals.upstream_bytes_est)} · R2 write ${formatBytesBestFit(totals.objects_written_bytes)} · Errors ${formatCount(totals.error_count)}
+            Requests ${formatCount(totals.request_count)} · Supabase response ${formatBytesBestFit(totals.response_bytes_est)} · Upstream ${formatBytesBestFit(totals.upstream_bytes_est)} · Errors ${formatCount(totals.error_count)}
           </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Source</th>
-                <th>Window</th>
-                <th>Route</th>
-                <th>Query</th>
-                <th>Req</th>
-                <th>Rows</th>
-                <th>Resp bytes</th>
-                <th>Upstream bytes</th>
-                <th>R2 writes</th>
-                <th>R2 bytes</th>
-                <th>Duration ms</th>
-                <th>Errors</th>
-              </tr>
-            </thead>
-            <tbody>${rowsMarkup}</tbody>
-          </table>
-          <div class="footnote">Rollup source: uk_aq_public.uk_aq_service_egress_metrics_minute. Values are estimates, not Supabase billing authority.</div>
+          <div class="table-scroll table-scroll-egress">
+            <table class="egress-table">
+              <colgroup>
+                <col class="egress-col-source">
+                <col class="egress-col-window">
+                <col class="egress-col-route">
+                <col class="egress-col-query">
+                <col class="egress-col-req">
+                <col class="egress-col-rows">
+                <col class="egress-col-resp">
+                <col class="egress-col-upstream">
+                <col class="egress-col-duration">
+                <col class="egress-col-errors">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>Window</th>
+                  <th class="egress-wrap">Route</th>
+                  <th class="egress-query-head">Query</th>
+                  <th>Req</th>
+                  <th>Rows</th>
+                  <th>Resp bytes</th>
+                  <th>Upstream bytes</th>
+                  <th>Duration ms</th>
+                  <th>Errors</th>
+                </tr>
+              </thead>
+              <tbody>${rowsMarkup}</tbody>
+            </table>
+          </div>
+          <div class="footnote">Rollup source: uk_aq_public.uk_aq_endpoint_egress_metrics_24h_dashboard. Values are estimates, not Supabase billing authority.</div>
           ${warningLine}
         `;
 
@@ -4873,7 +4991,11 @@
             forceRefreshButton.disabled = true;
             forceRefreshButton.textContent = "Force Refreshing...";
             try {
-              await loadDashboard({ forceRefresh: true });
+              if (activeMode === "operations") {
+                await loadOperationsDashboard({ forceRefresh: true });
+              } else {
+                await loadDashboard({ forceRefresh: true });
+              }
             } finally {
               if (document.body.contains(forceRefreshButton)) {
                 forceRefreshButton.disabled = false;
@@ -5577,27 +5699,29 @@
           .join("");
 
         contentEl.innerHTML = `
-          <table class="daily-task-table">
-            <colgroup>
-              <col style="width:40%" />
-              <col style="width:9%" />
-              <col style="width:10%" />
-              <col style="width:17%" />
-              <col style="width:17%" />
-              <col style="width:7%" />
-            </colgroup>
-            <thead>
-              <tr>
-                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="task">Task${sortArrow("task")}</button></th>
-                <th>Platform</th>
-                <th>Status</th>
-                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="scheduled_started">Scheduled<br>/ Started${sortArrow("scheduled_started")}</button></th>
-                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="finished_failed">Finished<br>/ Failed${sortArrow("finished_failed")}</button></th>
-                <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="duration">Duration${sortArrow("duration")}</button></th>
-              </tr>
-            </thead>
-            <tbody>${rowsMarkup}</tbody>
-          </table>
+          <div class="table-scroll table-scroll-daily-task">
+            <table class="daily-task-table">
+              <colgroup>
+                <col style="width:40%" />
+                <col style="width:9%" />
+                <col style="width:10%" />
+                <col style="width:17%" />
+                <col style="width:17%" />
+                <col style="width:7%" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="task">Task${sortArrow("task")}</button></th>
+                  <th>Platform</th>
+                  <th>Status</th>
+                  <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="scheduled_started">Scheduled<br>/ Started${sortArrow("scheduled_started")}</button></th>
+                  <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="finished_failed">Finished<br>/ Failed${sortArrow("finished_failed")}</button></th>
+                  <th><button type="button" class="daily-task-sort-btn" data-daily-task-sort="duration">Duration${sortArrow("duration")}</button></th>
+                </tr>
+              </thead>
+              <tbody>${rowsMarkup}</tbody>
+            </table>
+          </div>
         `;
 
         const sortButtons = contentEl.querySelectorAll("[data-daily-task-sort]");
@@ -5991,11 +6115,15 @@
       async function loadCurrentMode(options = {}) {
         const forceRefresh = Boolean(options.forceRefresh);
         const refreshOnResume = Boolean(options.refreshOnResume);
+        const modeSwitch = Boolean(options.modeSwitch);
         applyModeSwitchUi();
         showModeContainer(activeMode);
         clearOperationsDropboxPollTimer();
         if (activeMode === "operations") {
-          const shouldLoad = forceRefresh || refreshOnResume || isModeStale("operations");
+          const hasLoaded = Number(modeLastLoadedAtMs.operations || 0) > 0;
+          const shouldLoad = modeSwitch
+            ? (!hasLoaded || forceRefresh)
+            : (forceRefresh || refreshOnResume || isModeStale("operations"));
           if (shouldLoad && !modeIsLoading.operations) {
             await loadOperationsDashboard({ forceRefresh });
           } else {
@@ -6003,7 +6131,10 @@
           }
           return;
         }
-        const shouldLoad = forceRefresh || refreshOnResume || isModeStale("ingest");
+        const hasLoaded = Number(modeLastLoadedAtMs.ingest || 0) > 0;
+        const shouldLoad = modeSwitch
+          ? (!hasLoaded || forceRefresh)
+          : (forceRefresh || refreshOnResume || isModeStale("ingest"));
         if (shouldLoad && !modeIsLoading.ingest) {
           await loadDashboard({ forceRefresh });
         }
@@ -6125,7 +6256,7 @@
           // Ignore storage write failures.
         }
         startRefreshTimer();
-        void loadCurrentMode({ forceRefresh: false });
+        void loadCurrentMode({ forceRefresh: false, modeSwitch: true });
       }
 
       if (modeIngestBtn) {

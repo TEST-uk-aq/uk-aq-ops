@@ -9,10 +9,10 @@ AQ_BASE="/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Network
 LIVE_BASE="${AQ_BASE}/LIVE UK AQ Networks"
 
 TEST_INGEST="${AQ_BASE}/CIC-test-uk-aq-ingest"
-TEST_OPS="${AQ_BASE}/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops"
+TEST_OPS="${AQ_BASE}/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
 TEST_SCHEMA="${AQ_BASE}/CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema"
-TEST_WEBPAGE="${AQ_BASE}/CIC UK-AQ Webpage/CIC-test-uk-aq"
-TEST_POP_INGEST="${AQ_BASE}/CIC UK Population Ingest/CIC-Test-uk-population-ingest"
+TEST_WEBPAGE="${AQ_BASE}/CIC-UK-AQ Webpage/CIC-test-uk-aq-webpage"
+TEST_POP_INGEST="${AQ_BASE}/CIC-Test-uk-aq-Population-Ingest/CIC-Test-uk-population-ingest"
 
 LIVE_INGEST="${LIVE_BASE}/LIVE-uk-aq-ingest"
 LIVE_OPS="${LIVE_BASE}/LIVE-uk-aq-ops"
@@ -61,14 +61,9 @@ EXCLUDES=(
   # Scripts that reference test-specific paths
   --exclude='scripts/sync_to_live.sh'
 
-  # Test-only OpenAQ LIVE->TEST mirror code (must never sync to LIVE)
-  --exclude='supabase/functions/uk_aq_sync_openaq_from_live/'
-  --exclude='system_docs/table_info/uk_aq_openaq_live_sync_state.md'
   --exclude='.github/workflows/supabase_edge_deploy.yml'
   --exclude='system_docs/uk_aq_edge_functions.md'
   --exclude='system_docs/uk_aq_github_actions.md'
-  --exclude='config/uk_aq_github_env_targets.csv'
-  --exclude='schemas/ingest_db/uk_aq_openaq_live_sync_test.sql'
 
   # Ops management docs (test-env specific)
   --exclude='env-vars-master.csv'

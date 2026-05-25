@@ -22,6 +22,17 @@
   - `schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql` (main Obs AQI schema), and
   - a schema-repo SQL file under `schemas/obs_aqi_db/` when a targeted apply file is needed.
 
+## Environment Sync
+
+- This repo has an env sync script: `scripts/uk_aq_sync_github_secrets.sh`.
+- The script syncs `.env` keys to GitHub and packages `.env.supabase` into GitHub secret `SUPABASE_SECRETS_ENV`; ingest Supabase edge deploy workflows apply that payload via `supabase secrets set`.
+
+## Implementation Reporting
+
+- When changing code, schema, workflows, or config, always include clear implementation steps in the response.
+- Implementation steps must state what changed, which files were changed, and any required apply/deploy/run commands.
+- If no code changes were made, state that explicitly.
+
 ## R2/Cloudflare Cache Cost Policy
 
 - For AQI history served via R2 + Cloudflare, assume cost is primarily driven by R2 operation counts (especially Class B reads) and Worker request volume, not R2 bandwidth egress.
@@ -36,3 +47,6 @@
 - Why: any byte change rotates the R2 etag, which invalidates the etag-skip baseline in `scripts/backup_r2/build_backup_inventory.mjs`. A blanket churn forces the next inventory build to re-read every changed manifest (hours of `rclone cat` round-trips) and the Dropbox sync to re-upload every one (hours more, plus Dropbox write-rate throttling). Commit `2aa79d5` (2026-05-17) is the reference incident — moving `generated_at` to data-driven fixed it but produced a one-time multi-hour transition cost.
 - When editing the index builder: treat byte-stability as load-bearing. If you add a new field, source it from the manifests; if you need a timestamp, derive it from `max(source.backed_up_at_utc)` or similar.
 - If you have to make a non-data-driven change, expect and call out the one-time inventory + Dropbox sync cost in the PR description.
+
+## Search Tool Preference
+- Prefer `grep` for text search and file discovery; do not use `rg` unless explicitly requested.

@@ -21,7 +21,7 @@ The registry records the current trusted object for each history domain, day, an
 
 ## 2. Problem
 
-Phase B observations backup currently discovers work from ingest DB state through `uk_aq_ops.history_candidates`.
+Phase B observations backup currently discovers work from ingest DB state through `uk_aq_ops.history_candidates` (in ingestdb / main UK AQ DB).
 
 That means valid R2 history can already exist for a `(day_utc, connector_id)`, but prune Phase B can later see the same day/connector as pending and write to the same committed R2 keys.
 
@@ -287,7 +287,7 @@ Examples of conflict:
 - registry says current object exists, but R2 manifest is missing;
 - R2 manifest exists, but registry has a different current manifest;
 - manifest path and manifest body disagree;
-- candidate source row count is incompatible with trusted R2 state;
+- candidate source row count (from ingestdb) is incompatible with trusted R2 state;
 - day manifest references connector manifests that are not current/trusted.
 
 Conflict behaviour:
@@ -297,6 +297,47 @@ Conflict behaviour:
 - record `trust_status='conflict'` where applicable;
 - log structured error;
 - require manual repair/adoption/rebuild.
+
+### 14.1 Adopted parity delta guard (future)
+
+In addition to ownership/manifest checks, add a lightweight row-count parity guard for adopted observations connector candidates.
+
+Guard inputs for each `(day_utc, connector_id)` candidate:
+
+- `prune_ingestdb_source_row_count` (rows selected from ingestdb source during Phase B export path);
+- `r2_history_row_count` from adopted current R2 connector manifest/registry row.
+
+Source-of-truth note for this guard:
+
+- Primary parity source DB: ingestdb (main UK AQ DB; `uk_aq_core.observations` via Phase B source path).
+- Not part of the parity guard calculation: obsaqidb (`uk_aq_observs.observations`).
+- Optional diagnostics only: compare ingestdb vs obsaqidb counts/fingerprints when investigating conflicts.
+
+Guard policy:
+
+1. Compute:
+   - `row_count_delta = prune_ingestdb_source_row_count - r2_history_row_count`
+   - `abs_row_count_delta = abs(row_count_delta)`
+   - `delta_ratio = abs_row_count_delta / greatest(prune_ingestdb_source_row_count, 1)`
+2. If `abs_row_count_delta` or `delta_ratio` exceeds configured thresholds:
+   - mark candidate and/or registry trust as `conflict`;
+   - block prune delete for that day/connector;
+   - emit structured conflict log with both counts and delta values.
+3. If delta is within thresholds:
+   - allow adopt/skip behaviour to continue.
+
+Recommended initial thresholds (tune later):
+
+- `abs_row_count_delta > 1000` OR
+- `delta_ratio > 0.10` (10%)
+
+This is intentionally a metadata-level safety check, not full row-by-row parity. It is intended to catch large drift cheaply, using ingestdb as the parity source for prune safety decisions.
+
+Operational impact:
+
+- Supabase egress impact: none (internal DB-to-worker queries only).
+- DB size impact: minimal (small extra metrics fields in logs and optional registry notes).
+- Runtime impact: low (simple integer math per adopted candidate).
 
 ---
 
@@ -419,6 +460,7 @@ If a forced rebuild needs rollback:
 - Trusted current registry row causes skip/adopt, not overwrite.
 - Missing registry but existing R2 manifest causes adopt-or-block, not overwrite.
 - Registry/R2 mismatch blocks prune.
+- Adopted parity delta guard blocks prune delete when row-count drift exceeds thresholds.
 - `prune_day_gates.history_done=true` only when all observations connector objects for the day are trusted/current.
 - Force rebuild requires explicit scoped controls.
 - Forced rebuild preserves superseded registry records.
@@ -433,6 +475,8 @@ If a forced rebuild needs rollback:
 - registry lookup current trusted row;
 - registry missing + R2 manifest exists;
 - registry/R2 conflict;
+- adopted row-count delta within threshold (adopt allowed);
+- adopted row-count delta above threshold (conflict + prune delete blocked);
 - candidate complete from registry adoption;
 - day gate complete from trusted connector registry rows;
 - day gate blocked by one conflict;
@@ -454,6 +498,7 @@ Repeat with:
 - registry says current but R2 missing;
 - R2 manifest exists but body/path mismatch;
 - mixed adopted/new connector day;
+- adopted connector day with large `prune_ingestdb_source_row_count` vs `r2_history_row_count` drift;
 - AQI day manifest exists;
 - explicit force rebuild enabled/disabled.
 
