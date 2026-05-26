@@ -193,7 +193,7 @@ UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/gi
 UK_AQ_R2_HISTORY_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/r2-history"
 UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/r2-history/history/v1/core"
 
-UK_AQ_BACKFILL_WRAPPER="Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/scripts/uk_aq_backfill_local.sh"
+UK_AQ_BACKFILL_WRAPPER="/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/scripts/uk_aq_backfill_local.sh"
 UK_AQ_BACKFILL_ENV_FILE="/PATH/TO/CIC-Test/backfill.env"
 ```
 

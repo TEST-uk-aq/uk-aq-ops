@@ -221,7 +221,7 @@ EXCL='--exclude=.git --exclude=.env* --exclude=.venv --exclude=node_modules --ex
 rsync -av $EXCL "$BASE/CIC-test-uk-aq-ingest/" "$BASE/LIVE UK AQ Networks/LIVE-uk-aq-ingest/"
 
 # Ops
-rsync -av $EXCL "$BASE/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/" "$BASE/LIVE UK AQ Networks/LIVE-uk-aq-ops/"
+rsync -av $EXCL "$BASE/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/" "$BASE/LIVE UK AQ Networks/LIVE-uk-aq-ops/"
 
 # Schema
 rsync -av $EXCL "$BASE/CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema/" "$BASE/LIVE UK AQ Networks/LIVE-uk-aq-schema/"

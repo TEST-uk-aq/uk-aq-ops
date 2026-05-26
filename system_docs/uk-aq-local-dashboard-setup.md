@@ -50,7 +50,7 @@ Run the same steps in each repo root.
 
 **Test:**
 ```bash
-cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops"
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
 python3 -m venv .venv
 .venv/bin/pip install -r local/dashboard/server/requirements.txt
 .venv/bin/python3 -c "import requests; print('ok')"
@@ -222,7 +222,7 @@ Freshness buckets (`0-3`, `3-6`, `6-24`, `1-7`, `7+`) are based on `timeseries.l
 ### Test (dashboard + cloudflared tunnel)
 
 ```bash
-cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops"
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
 ./local/launchd/install_launchd.sh
 ```
 
@@ -246,7 +246,7 @@ Installs and starts:
 
 ```bash
 # Test dashboard
-cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops"
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
 ./local/scripts/run_dashboard.sh
 # → http://127.0.0.1:8000
 
@@ -269,9 +269,9 @@ launchctl unload ~/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.dashboard
 launchctl load  ~/Library/LaunchAgents/co.uk.chronicillnesschannel.aq.dashboard.test.plist
 
 # View logs
-tail -f "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/logs/dashboard_test.log"
+tail -f "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/logs/dashboard_test.log"
 tail -f "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/LIVE UK AQ Networks/LIVE-uk-aq-ops/logs/dashboard_live.log"
-tail -f "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq Operations/CIC-test-uk-aq-ops/logs/cloudflared.log"
+tail -f "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/logs/cloudflared.log"
 ```
 
 ---

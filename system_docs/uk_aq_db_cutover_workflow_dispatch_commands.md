@@ -20,7 +20,7 @@ From ingest repo:
 From ops repo:
 
 ```bash
-cd "../CIC-test-uk-aq Operations/CIC-test-uk-aq-ops"
+cd "../CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
 ./scripts/uk_aq_sync_github_secrets.sh \
   \
   --env-file .env \
