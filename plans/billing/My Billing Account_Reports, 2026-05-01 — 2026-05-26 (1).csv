@@ -1,0 +1,9 @@
+Service description,Service ID,Cost (£),Savings programs (£),Other savings (£),Unrounded subtotal (£),Subtotal (£),Percent change in subtotal compared to previous period
+Cloud Run,152E-C115-5142,5.90,0.00,-3.67,2.226666,2.23,New
+Cloud Scheduler,1F14-4801-0E16,0.58,0.00,0.00,0.583470,0.58,New
+Secret Manager,EE82-7A5E-871C,0.40,0.00,0.00,0.404197,0.40,New
+Artifact Registry,149C-F9EC-3994,0.03,0.00,0.00,0.027948,0.03,New
+Cloud Pub/Sub,A1E8-BE35-7EBC,0.00,0.00,0.00,0.000001,0.00,0%
+,,,,Subtotal,3.242282,3.24
+,,,,Tax,0.000000,0.00
+,,,,Filtered total,3.242282,3.24

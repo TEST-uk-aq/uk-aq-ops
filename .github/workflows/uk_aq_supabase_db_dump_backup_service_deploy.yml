@@ -217,8 +217,10 @@ jobs:
 
             printf '%s' "${secret_value}" | "${UPSERT_SCRIPT}" \
               --project "${PROJECT_ID}" \
+              --region "${REGION}" \
               --secret "${secret_name}" \
-              --required "${required}"
+              --required "${required}" \
+              --apply
           }
 
           upsert_secret "${UK_AQ_INGESTDB_DB_URL_SECRET_NAME}" "${UK_AQ_INGESTDB_DB_URL}" 1

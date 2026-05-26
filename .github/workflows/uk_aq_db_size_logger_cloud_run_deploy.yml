@@ -211,8 +211,10 @@ jobs:
 
             printf '%s' "${secret_value}" | "${UPSERT_SCRIPT}" \
               --project "${PROJECT_ID}" \
+              --region "${REGION}" \
               --secret "${secret_name}" \
-              --required "${required}"
+              --required "${required}" \
+              --apply
           }
 
           upsert_secret "${SB_SECRET_KEY_SECRET_NAME}" "${SB_SECRET_KEY}" 1

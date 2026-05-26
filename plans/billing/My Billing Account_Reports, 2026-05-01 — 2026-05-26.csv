@@ -1,0 +1,17 @@
+Label,Cost (£),Savings programs (£),Other savings (£),Unrounded subtotal (£),Subtotal (£),Percent change in subtotal compared to previous period
+job_name:uk-aq-latest-snapshot-service,1.57,0.00,-0.38,1.195271,1.20,New
+,1.02,0.00,0.00,1.015585,1.02,New
+job_name:uk-aq-openaq-ingest-service,1.02,0.00,-0.72,0.300699,0.30,New
+job_name:uk-aq-supabase-db-dump-backup-service,0.86,0.00,-0.62,0.234663,0.23,New
+job_name:uk-aq-breathelondon-ingest-service,0.95,0.00,-0.79,0.156344,0.16,New
+job_name:uk-aq-timeseries-aqi-hourly-service,0.59,0.00,-0.46,0.128378,0.13,New
+job_name:uk-aq-scomm-ingest-service,0.42,0.00,-0.32,0.097013,0.10,New
+job_name:uk-aq-sos-ingest-service,0.25,0.00,-0.19,0.059670,0.06,New
+job_name:uk-aq-observs-pubsub-writer-service,0.14,0.00,-0.11,0.030382,0.03,New
+job_name:uk-aq-prune-daily,0.05,0.00,-0.03,0.016811,0.02,New
+job_name:uk-aq-db-size-logger-service,0.04,0.00,-0.04,0.003311,0.00,0%
+job_name:uk-aq-observs-partition-maintenance-service,0.00,0.00,-0.00,0.000344,0.00,0%
+job_name:uk-aq-aqilevels-retention-service,0.00,0.00,-0.00,0.000339,0.00,0%
+,,,Subtotal,3.238810,3.24
+,,,Tax,0.000000,0.00
+,,,Filtered total,3.238810,3.24
