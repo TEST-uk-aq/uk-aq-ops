@@ -2,6 +2,8 @@
 
 - `codeql-noarchive` in this repo currently scans `actions` and `javascript-typescript` only.
 - If Python source files are added outside `archive/`, update `.github/workflows/codeql-noarchive.yml` to include `python` in the language matrix.
+- When working on mirrored CIC-Test scripts, change the file in the current CIC-Test repo once and keep the sibling CIC-Test repo copy in sync.
+- Do not inspect or modify any `LIVE` repo unless the user explicitly asks.
 
 ## Backup Policy
 

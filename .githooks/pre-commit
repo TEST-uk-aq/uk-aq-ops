@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+OTHER_REPO_ROOT=""
+for candidate in \
+  "${ROOT_DIR}/../CIC-test-uk-aq-ingest" \
+  "${ROOT_DIR}/../../CIC-test-uk-aq-ingest" \
+  "${ROOT_DIR}/../CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+do
+  if [[ -d "${candidate}" && "${candidate}" != "${ROOT_DIR}" ]]; then
+    OTHER_REPO_ROOT="${candidate}"
+    break
+  fi
+done
+
+if [[ -z "${OTHER_REPO_ROOT}" ]]; then
+  echo "Skipping mirrored script sync: sibling repo not found from ${ROOT_DIR}" >&2
+  exit 0
+fi
+
+MIRRORED_FILES=(
+  "scripts/gcp/uk_aq_cleanup_secret_versions.sh"
+  "scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+)
+
+for relpath in "${MIRRORED_FILES[@]}"; do
+  source_file="${ROOT_DIR}/${relpath}"
+  target_file="${OTHER_REPO_ROOT}/${relpath}"
+
+  if [[ ! -f "${source_file}" ]]; then
+    continue
+  fi
+
+  if cmp -s "${source_file}" "${target_file}" 2>/dev/null; then
+    continue
+  fi
+
+  mkdir -p "$(dirname "${target_file}")"
+  cp -p "${source_file}" "${target_file}"
+  echo "Synced ${relpath} to sibling repo copy."
+done

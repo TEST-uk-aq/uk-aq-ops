@@ -28,7 +28,6 @@ const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const DEFAULT_REPAIR_FETCH_PAGE_SIZE = 1_000;
 const MAX_REPAIR_FETCH_PAGES = 500;
 const PREVIEW_LIMIT = 25;
-const LATE_ARRIVAL_MIN_LOOKBACK_HOURS = 24;
 const LATE_ARRIVAL_DISCOVERY_PAGE_SIZE = 1000;
 const MAX_LATE_ARRIVAL_DISCOVERY_PAGES = 100;
 const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
@@ -426,10 +425,6 @@ function buildRecentUtcDayWindow(recentDays) {
     window_start: new Date(windowStartMs).toISOString(),
     window_end: new Date(utcTomorrowMidnightMs).toISOString(),
   };
-}
-
-function computeLateArrivalLookbackHours(maxHoursPerRun) {
-  return Math.max(LATE_ARRIVAL_MIN_LOOKBACK_HOURS, maxHoursPerRun);
 }
 
 function buildUtcDayWindow(dayUtc) {
@@ -1932,10 +1927,6 @@ async function runChartLoadMetricsMaintenance(config) {
 }
 
 async function discoverLateArrivalDays(config, overallWindow) {
-  const now = new Date();
-  const lookbackHours = computeLateArrivalLookbackHours(config.maxHoursPerRun);
-  const lookbackStartIso = new Date(now.getTime() - (lookbackHours * HOUR_MS)).toISOString();
-  const lookupEndIso = now.toISOString();
   const cutoffWindowStart = toIso(overallWindow.window_start, "late_arrival.window_start");
   const distinctDaySet = new Set();
   let scannedRowCount = 0;
@@ -1953,11 +1944,9 @@ async function discoverLateArrivalDays(config, overallWindow) {
     const { data, error } = await ingestClient
       .schema(RPC_SCHEMA)
       .from("observations")
-      .select("observed_at,created_at")
-      .gte("created_at", lookbackStartIso)
-      .lt("created_at", lookupEndIso)
+      .select("observed_at")
       .lt("observed_at", cutoffWindowStart)
-      .order("created_at", { ascending: true })
+      .order("observed_at", { ascending: true })
       .range(start, end);
 
     if (error) {
@@ -1983,9 +1972,6 @@ async function discoverLateArrivalDays(config, overallWindow) {
   const discoveredDays = Array.from(distinctDaySet).sort();
   const targetDays = discoveredDays.slice(0, MAX_LATE_ARRIVAL_WINDOWS_PER_RUN);
   return {
-    lookback_hours: lookbackHours,
-    lookback_start: lookbackStartIso,
-    lookup_end: lookupEndIso,
     cutoff_window_start: cutoffWindowStart,
     discovered_day_count: discoveredDays.length,
     target_day_count: targetDays.length,

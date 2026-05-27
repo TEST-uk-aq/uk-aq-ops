@@ -292,14 +292,22 @@ if [[ -z "${current_payload_b64}" ]]; then
   exit 1
 fi
 
-CURRENT_HASH="$(printf '%s' "${current_payload_b64}" | python3 - <<'PY'
-import base64, hashlib, sys
-b64 = sys.stdin.read().strip()
+CURRENT_HASH="$(python3 - "${current_payload_b64}" <<'PY'
+import base64
+import hashlib
+import sys
+
+b64 = sys.argv[1].strip()
 pad = '=' * (-len(b64) % 4)
 raw = base64.urlsafe_b64decode((b64 + pad).encode('ascii'))
 print(hashlib.sha256(raw).hexdigest())
 PY
 )"
+
+if [[ -z "${CURRENT_HASH}" ]]; then
+  echo "${SECRET_NAME}: unable to compute current secret hash." >&2
+  exit 1
+fi
 
 changed="yes"
 if [[ "${CURRENT_HASH}" == "${NEW_HASH}" ]]; then
