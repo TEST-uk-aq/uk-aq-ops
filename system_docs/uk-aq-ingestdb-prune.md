@@ -71,6 +71,7 @@ Comparison scope rule:
 - The late-arrival target list is split by the obs_aqidb retention cutover:
   - days older than `OBS_AQIDB_OBSERVS_RETENTION_DAYS` (default `14`, overrideable via `obsAqidbObservsRetentionDays`) are deleted directly from ingest by hour bucket, without compare/repair
   - younger days still run the normal targeted 24-hour compare/repair/delete flow and the same history gate checks
+  - the `14`-day cap now applies only to the repair-eligible subset, not to the direct-delete subset
 - This catches backfilled historical observations that arrived recently without widening the normal daily prune window.
 
 ## Dry-run behavior

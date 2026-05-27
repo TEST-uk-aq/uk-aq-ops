@@ -1990,15 +1990,11 @@ async function discoverLateArrivalDays(ingestClient, overallWindow) {
   }
 
   const discoveredDays = Array.from(distinctDaySet).sort();
-  const targetDays = discoveredDays.slice(0, MAX_LATE_ARRIVAL_WINDOWS_PER_RUN);
   return {
     cutoff_window_start: cutoffWindowStart,
     discovered_day_count: discoveredDays.length,
-    target_day_count: targetDays.length,
-    dropped_day_count: Math.max(0, discoveredDays.length - targetDays.length),
     discovered_day_preview: sampleRows(discoveredDays),
-    target_day_preview: sampleRows(targetDays),
-    target_days: targetDays,
+    discovered_days: discoveredDays,
     scanned_row_count: scannedRowCount,
     scanned_page_count: scannedPageCount,
     truncated_by_page_limit: truncatedByPageLimit,
@@ -2124,31 +2120,40 @@ async function runLateArrivalCleanup(config, overallWindow) {
     db: { schema: RPC_SCHEMA },
   });
   const discovery = await discoverLateArrivalDays(ingestClient, overallWindow);
+  const { discovered_days: discoveredDays, ...discoverySummary } = discovery;
   const obsAqidbCutoffDayUtc = buildRetentionCutoffDayUtc(config.obsAqidbObservsRetentionDays);
   const directDeleteDayWindows = [];
-  const repairDayWindows = [];
-  for (const dayUtc of discovery.target_days) {
+  const repairEligibleDayWindows = [];
+  for (const dayUtc of discoveredDays) {
     const dayWindow = buildUtcDayWindow(dayUtc);
     if (dayWindow.day_utc < obsAqidbCutoffDayUtc) {
       directDeleteDayWindows.push(dayWindow);
       continue;
     }
-    repairDayWindows.push(dayWindow);
+    repairEligibleDayWindows.push(dayWindow);
   }
+  const repairDayWindows = repairEligibleDayWindows.slice(0, MAX_LATE_ARRIVAL_WINDOWS_PER_RUN);
+  const droppedDayCount = Math.max(0, repairEligibleDayWindows.length - repairDayWindows.length);
   const dayWindows = [...directDeleteDayWindows, ...repairDayWindows];
   logStructured("INFO", "ingestdb_late_arrival_discovery_summary", {
     run_id: runId,
     mode: config.dryRun ? "dry-run" : "delete",
-    ...discovery,
+    ...discoverySummary,
   });
 
-  if (discovery.target_days.length === 0) {
+  if (discoveredDays.length === 0) {
     return {
       enabled: true,
       skipped: true,
       reason: "no_late_arrival_days_detected",
       run_id: runId,
-      ...discovery,
+      ...discoverySummary,
+      obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
+      obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
+      target_day_count: 0,
+      direct_delete_day_count: 0,
+      repair_day_count: 0,
+      dropped_day_count: 0,
       processed_day_count: 0,
       delete_error_count: 0,
       mismatch_after_repair_count: 0,
@@ -2169,6 +2174,7 @@ async function runLateArrivalCleanup(config, overallWindow) {
     obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
     direct_delete_day_count: directDeleteDayWindows.length,
     repair_day_count: repairDayWindows.length,
+    dropped_day_count: droppedDayCount,
     target_day_preview: sampleRows(dayWindows.map((entry) => entry.day_utc)),
     direct_delete_day_preview: sampleRows(directDeleteDayWindows.map((entry) => entry.day_utc)),
     repair_day_preview: sampleRows(repairDayWindows.map((entry) => entry.day_utc)),
@@ -2239,12 +2245,14 @@ async function runLateArrivalCleanup(config, overallWindow) {
     enabled: true,
     skipped: false,
     run_id: runId,
-    ...discovery,
+    ...discoverySummary,
     obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
     obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
+    target_day_count: dayWindows.length,
     direct_delete_day_count: directDeleteDayWindows.length,
     repair_day_count: repairDayWindows.length,
     processed_day_count: dayWindows.length,
+    dropped_day_count: droppedDayCount,
     delete_error_count:
       sumIntField(batchSummaries, "delete_error_count") +
       sumIntField(batchSummaries, "delete_after_repair_error_count"),
