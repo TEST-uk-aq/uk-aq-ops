@@ -28,6 +28,10 @@ const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const DEFAULT_REPAIR_FETCH_PAGE_SIZE = 1_000;
 const MAX_REPAIR_FETCH_PAGES = 500;
 const PREVIEW_LIMIT = 25;
+const LATE_ARRIVAL_MIN_LOOKBACK_HOURS = 24;
+const LATE_ARRIVAL_DISCOVERY_PAGE_SIZE = 1000;
+const MAX_LATE_ARRIVAL_DISCOVERY_PAGES = 100;
+const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
 const RPC_SCHEMA = "uk_aq_public";
 const DEFAULT_CHART_METRICS_RETENTION_DAYS = 90;
 const DEFAULT_CHART_METRICS_DAILY_REFRESH_DAYS = 7;
@@ -158,6 +162,16 @@ function compactPruneHealthSummary(summary = {}) {
         raw_rows_deleted: summary.chart_load_metrics.raw_rows_deleted,
         daily_rows_upserted: summary.chart_load_metrics.daily_rows_upserted,
         error: summary.chart_load_metrics.error,
+      }
+      : undefined,
+    late_arrival: summary.late_arrival
+      ? {
+        enabled: summary.late_arrival.enabled,
+        skipped: summary.late_arrival.skipped,
+        discovered_day_count: summary.late_arrival.discovered_day_count,
+        target_day_count: summary.late_arrival.target_day_count,
+        processed_day_count: summary.late_arrival.processed_day_count,
+        error_count: summary.late_arrival.error_count,
       }
       : undefined,
     warnings: [
@@ -411,6 +425,22 @@ function buildRecentUtcDayWindow(recentDays) {
   return {
     window_start: new Date(windowStartMs).toISOString(),
     window_end: new Date(utcTomorrowMidnightMs).toISOString(),
+  };
+}
+
+function computeLateArrivalLookbackHours(maxHoursPerRun) {
+  return Math.max(LATE_ARRIVAL_MIN_LOOKBACK_HOURS, maxHoursPerRun);
+}
+
+function buildUtcDayWindow(dayUtc) {
+  const startDate = new Date(`${String(dayUtc).slice(0, 10)}T00:00:00.000Z`);
+  if (Number.isNaN(startDate.getTime())) {
+    throw new Error(`Invalid day_utc for day window: ${String(dayUtc)}`);
+  }
+  return {
+    day_utc: startDate.toISOString().slice(0, 10),
+    window_start: startDate.toISOString(),
+    window_end: new Date(startDate.getTime() + DAY_MS).toISOString(),
   };
 }
 
@@ -1901,6 +1931,165 @@ async function runChartLoadMetricsMaintenance(config) {
   return summary;
 }
 
+async function discoverLateArrivalDays(config, overallWindow) {
+  const now = new Date();
+  const lookbackHours = computeLateArrivalLookbackHours(config.maxHoursPerRun);
+  const lookbackStartIso = new Date(now.getTime() - (lookbackHours * HOUR_MS)).toISOString();
+  const lookupEndIso = now.toISOString();
+  const cutoffWindowStart = toIso(overallWindow.window_start, "late_arrival.window_start");
+  const distinctDaySet = new Set();
+  let scannedRowCount = 0;
+  let scannedPageCount = 0;
+  let truncatedByPageLimit = false;
+
+  const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    db: { schema: RPC_SCHEMA },
+  });
+
+  for (let page = 0; page < MAX_LATE_ARRIVAL_DISCOVERY_PAGES; page += 1) {
+    const start = page * LATE_ARRIVAL_DISCOVERY_PAGE_SIZE;
+    const end = start + LATE_ARRIVAL_DISCOVERY_PAGE_SIZE - 1;
+    const { data, error } = await ingestClient
+      .schema(RPC_SCHEMA)
+      .from("observations")
+      .select("observed_at,created_at")
+      .gte("created_at", lookbackStartIso)
+      .lt("created_at", lookupEndIso)
+      .lt("observed_at", cutoffWindowStart)
+      .order("created_at", { ascending: true })
+      .range(start, end);
+
+    if (error) {
+      throw new Error(`late-arrival discovery query failed: ${error.message}`);
+    }
+
+    const rows = Array.isArray(data) ? data : [];
+    scannedPageCount += 1;
+    scannedRowCount += rows.length;
+    for (const row of rows) {
+      const observedAtIso = toIso(row.observed_at, "late_arrival.observed_at");
+      distinctDaySet.add(toObservedDay(observedAtIso));
+    }
+
+    if (rows.length < LATE_ARRIVAL_DISCOVERY_PAGE_SIZE) {
+      break;
+    }
+    if (page + 1 === MAX_LATE_ARRIVAL_DISCOVERY_PAGES) {
+      truncatedByPageLimit = true;
+    }
+  }
+
+  const discoveredDays = Array.from(distinctDaySet).sort();
+  const targetDays = discoveredDays.slice(0, MAX_LATE_ARRIVAL_WINDOWS_PER_RUN);
+  return {
+    lookback_hours: lookbackHours,
+    lookback_start: lookbackStartIso,
+    lookup_end: lookupEndIso,
+    cutoff_window_start: cutoffWindowStart,
+    discovered_day_count: discoveredDays.length,
+    target_day_count: targetDays.length,
+    dropped_day_count: Math.max(0, discoveredDays.length - targetDays.length),
+    discovered_day_preview: sampleRows(discoveredDays),
+    target_day_preview: sampleRows(targetDays),
+    target_days: targetDays,
+    scanned_row_count: scannedRowCount,
+    scanned_page_count: scannedPageCount,
+    truncated_by_page_limit: truncatedByPageLimit,
+  };
+}
+
+async function runLateArrivalCleanup(config, overallWindow) {
+  const runId = randomUUID();
+  const discovery = await discoverLateArrivalDays(config, overallWindow);
+  logStructured("INFO", "ingestdb_late_arrival_discovery_summary", {
+    run_id: runId,
+    mode: config.dryRun ? "dry-run" : "delete",
+    ...discovery,
+  });
+
+  if (discovery.target_days.length === 0) {
+    return {
+      enabled: true,
+      skipped: true,
+      reason: "no_late_arrival_days_detected",
+      run_id: runId,
+      ...discovery,
+      processed_day_count: 0,
+      delete_error_count: 0,
+      mismatch_after_repair_count: 0,
+      history_gate_blocked_bucket_count: 0,
+      history_gate_blocked_after_repair_bucket_count: 0,
+      total_deleted_rows: "0",
+      total_deleted_after_repair_rows: "0",
+      alert_condition_count: 0,
+      batch_summaries_preview: [],
+    };
+  }
+
+  const dayWindows = discovery.target_days.map((dayUtc) => buildUtcDayWindow(dayUtc));
+  logStructured("INFO", "ingestdb_late_arrival_cleanup_plan", {
+    run_id: runId,
+    mode: config.dryRun ? "dry-run" : "delete",
+    target_day_count: dayWindows.length,
+    target_day_preview: sampleRows(dayWindows.map((entry) => entry.day_utc)),
+  });
+
+  const batchSummaries = [];
+  for (const dayWindow of dayWindows) {
+    try {
+      const summary = await runPruneSingleWindow(config, dayWindow, {
+        parent_run_id: runId,
+        batch_index: batchSummaries.length + 1,
+        batch_count: dayWindows.length,
+      });
+      batchSummaries.push(summary);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logStructured("ERROR", "ingestdb_late_arrival_cleanup_day_error", {
+        run_id: runId,
+        day_utc: dayWindow.day_utc,
+        error: message,
+      });
+      batchSummaries.push({
+        day_utc: dayWindow.day_utc,
+        run_id: null,
+        mode: config.dryRun ? "dry-run" : "delete",
+        window_start: dayWindow.window_start,
+        window_end: dayWindow.window_end,
+        delete_error_count: 1,
+        alert_condition_count: 1,
+        error: message,
+      });
+    }
+  }
+
+  const summary = {
+    enabled: true,
+    skipped: false,
+    run_id: runId,
+    ...discovery,
+    processed_day_count: dayWindows.length,
+    delete_error_count:
+      sumIntField(batchSummaries, "delete_error_count") +
+      sumIntField(batchSummaries, "delete_after_repair_error_count"),
+    mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
+    history_gate_blocked_bucket_count:
+      sumIntField(batchSummaries, "history_gate_blocked_bucket_count") +
+      sumIntField(batchSummaries, "history_gate_blocked_after_repair_bucket_count"),
+    history_gate_blocked_after_repair_bucket_count: sumIntField(
+      batchSummaries,
+      "history_gate_blocked_after_repair_bucket_count",
+    ),
+    total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
+    total_deleted_after_repair_rows: sumBigIntField(batchSummaries, "total_deleted_after_repair_rows").toString(),
+    alert_condition_count: sumIntField(batchSummaries, "alert_condition_count"),
+    batch_summaries_preview: sampleRows(batchSummaries),
+  };
+  logStructured("INFO", "ingestdb_late_arrival_cleanup_summary", summary);
+  return summary;
+}
+
 async function runPrune(config) {
   const phaseARecentSummary = await runPhaseARecent(config);
 
@@ -1976,61 +2165,78 @@ async function runPrune(config) {
     DEFAULT_MAX_HOURS_PER_BATCH,
   );
 
+  let pruneWindowSummary;
   if (batches.length <= 1) {
-    const singleSummary = await runPruneSingleWindow(config, batches[0] ?? overallWindow);
-    return {
-      ...singleSummary,
-      phase_a_recent: phaseARecentSummary,
-      phase_b_history: phaseBHistorySummary,
-      phase_b_history_index: phaseBHistoryIndexSummary,
-      chart_load_metrics: chartLoadMetricsSummary,
-    };
-  }
-
-  const parentRunId = randomUUID();
-  logStructured("INFO", "ingestdb_prune_batch_plan", {
-    run_id: parentRunId,
-    mode: config.dryRun ? "dry-run" : "delete",
-    phase_b_history_enabled: Boolean(config.phaseB?.enabled),
-    phase_b_history_run_id: phaseBHistorySummary?.run_id || null,
-    window_start: overallWindow.window_start,
-    window_end: overallWindow.window_end,
-    ingestdb_retention_days: config.ingestDbRetentionDays,
-    max_hours_per_run: config.maxHoursPerRun,
-    batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
-    batch_count: batches.length,
-    batches_preview: sampleRows(batches),
-  });
-
-  const batchSummaries = [];
-  for (const batch of batches) {
-    const summary = await runPruneSingleWindow(config, batch, {
-      parent_run_id: parentRunId,
-      batch_index: batch.batch_index,
+    pruneWindowSummary = await runPruneSingleWindow(config, batches[0] ?? overallWindow);
+  } else {
+    const parentRunId = randomUUID();
+    logStructured("INFO", "ingestdb_prune_batch_plan", {
+      run_id: parentRunId,
+      mode: config.dryRun ? "dry-run" : "delete",
+      phase_b_history_enabled: Boolean(config.phaseB?.enabled),
+      phase_b_history_run_id: phaseBHistorySummary?.run_id || null,
+      window_start: overallWindow.window_start,
+      window_end: overallWindow.window_end,
+      ingestdb_retention_days: config.ingestDbRetentionDays,
+      max_hours_per_run: config.maxHoursPerRun,
+      batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
       batch_count: batches.length,
+      batches_preview: sampleRows(batches),
     });
-    batchSummaries.push(summary);
+
+    const batchSummaries = [];
+    for (const batch of batches) {
+      const summary = await runPruneSingleWindow(config, batch, {
+        parent_run_id: parentRunId,
+        batch_index: batch.batch_index,
+        batch_count: batches.length,
+      });
+      batchSummaries.push(summary);
+    }
+
+    pruneWindowSummary = aggregateBatchSummary(
+      config,
+      overallWindow,
+      batches,
+      batchSummaries,
+      parentRunId,
+    );
   }
 
-  const aggregateSummary = aggregateBatchSummary(
-    config,
-    overallWindow,
-    batches,
-    batchSummaries,
-    parentRunId,
-  );
+  let lateArrivalSummary = {
+    enabled: false,
+    skipped: true,
+    reason: "not_started",
+  };
+  try {
+    lateArrivalSummary = await runLateArrivalCleanup(config, overallWindow);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    lateArrivalSummary = {
+      enabled: true,
+      skipped: false,
+      error: message,
+    };
+    logStructured("WARNING", "ingestdb_late_arrival_cleanup_failed", {
+      error: message,
+    });
+  }
+
   const combinedSummary = {
-    ...aggregateSummary,
+    ...pruneWindowSummary,
     phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
     phase_b_history_index: phaseBHistoryIndexSummary,
     chart_load_metrics: chartLoadMetricsSummary,
+    late_arrival: lateArrivalSummary,
   };
-  logStructured(
-    "INFO",
-    config.dryRun ? "ingestdb_prune_dry_run_batched_summary" : "ingestdb_prune_delete_batched_summary",
-    combinedSummary,
-  );
+  if (batches.length > 1) {
+    logStructured(
+      "INFO",
+      config.dryRun ? "ingestdb_prune_dry_run_batched_summary" : "ingestdb_prune_delete_batched_summary",
+      combinedSummary,
+    );
+  }
   return combinedSummary;
 }
 
