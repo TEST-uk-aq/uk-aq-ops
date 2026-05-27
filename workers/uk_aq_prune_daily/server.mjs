@@ -21,6 +21,7 @@ const DEFAULT_DELETE_BATCH_SIZE = 50_000;
 const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
 const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
 const DEFAULT_MAX_HOURS_PER_BATCH = 24;
+const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
 const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
 const DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS = 1_000;
 const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
@@ -169,7 +170,10 @@ function compactPruneHealthSummary(summary = {}) {
         skipped: summary.late_arrival.skipped,
         discovered_day_count: summary.late_arrival.discovered_day_count,
         target_day_count: summary.late_arrival.target_day_count,
+        direct_delete_day_count: summary.late_arrival.direct_delete_day_count,
+        repair_day_count: summary.late_arrival.repair_day_count,
         processed_day_count: summary.late_arrival.processed_day_count,
+        obs_aqidb_cutoff_day_utc: summary.late_arrival.obs_aqidb_cutoff_day_utc,
         error_count: summary.late_arrival.error_count,
       }
       : undefined,
@@ -437,6 +441,20 @@ function buildUtcDayWindow(dayUtc) {
     window_start: startDate.toISOString(),
     window_end: new Date(startDate.getTime() + DAY_MS).toISOString(),
   };
+}
+
+function buildRetentionCutoffDayUtc(retentionDays) {
+  const now = new Date();
+  const utcMidnightMs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    0,
+    0,
+    0,
+    0,
+  );
+  return new Date(utcMidnightMs - (retentionDays * DAY_MS)).toISOString().slice(0, 10);
 }
 
 function splitWindowIntoBatches(windowStartIso, windowEndIso, maxHoursPerBatch = DEFAULT_MAX_HOURS_PER_BATCH) {
@@ -1230,6 +1248,12 @@ function buildRunConfig(url) {
     1,
     14,
   );
+  const obsAqidbObservsRetentionDays = parsePositiveInt(
+    params.get("obsAqidbObservsRetentionDays") ?? process.env.OBS_AQIDB_OBSERVS_RETENTION_DAYS,
+    DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS,
+    1,
+    3650,
+  );
 
   const phaseB = resolvePhaseBRuntimeConfig(process.env);
   phaseB.enabled = parseBoolean(
@@ -1290,6 +1314,7 @@ function buildRunConfig(url) {
     deleteBatchSize,
     maxDeleteBatchesPerHour,
     repairOneMismatchBucket,
+    obsAqidbObservsRetentionDays,
     phaseAEnabled,
     phaseARecentDays,
     phaseB,
@@ -1926,17 +1951,12 @@ async function runChartLoadMetricsMaintenance(config) {
   return summary;
 }
 
-async function discoverLateArrivalDays(config, overallWindow) {
+async function discoverLateArrivalDays(ingestClient, overallWindow) {
   const cutoffWindowStart = toIso(overallWindow.window_start, "late_arrival.window_start");
   const distinctDaySet = new Set();
   let scannedRowCount = 0;
   let scannedPageCount = 0;
   let truncatedByPageLimit = false;
-
-  const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    db: { schema: RPC_SCHEMA },
-  });
 
   for (let page = 0; page < MAX_LATE_ARRIVAL_DISCOVERY_PAGES; page += 1) {
     const start = page * LATE_ARRIVAL_DISCOVERY_PAGE_SIZE;
@@ -1985,9 +2005,137 @@ async function discoverLateArrivalDays(config, overallWindow) {
   };
 }
 
+async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, runId, batchIndex, batchCount) {
+  const ingestBuckets = await fetchHourlyFingerprints(ingestClient, dayWindow.window_start, dayWindow.window_end, "ingest");
+  const batchSummaryMeta = batchCount > 1
+    ? {
+      parent_run_id: runId,
+      batch_index: batchIndex,
+      batch_count: batchCount,
+      batch_window_hours: 24,
+    }
+    : {};
+
+  if (ingestBuckets.length === 0) {
+    const skippedSummary = {
+      run_id: randomUUID(),
+      ...batchSummaryMeta,
+      mode: config.dryRun ? "dry-run" : "delete",
+      phase: "late_arrival_direct_delete",
+      day_utc: dayWindow.day_utc,
+      window_start: dayWindow.window_start,
+      window_end: dayWindow.window_end,
+      ingest_bucket_count: 0,
+      deleted_bucket_count: 0,
+      total_deleted_rows: "0",
+      delete_error_count: 0,
+      alert_condition_count: 0,
+      skipped: true,
+      reason: "no_ingest_buckets_detected",
+      deleted_buckets_preview: [],
+      delete_errors_preview: [],
+    };
+    logStructured("INFO", "ingestdb_late_arrival_direct_delete_summary", skippedSummary);
+    return skippedSummary;
+  }
+
+  logStructured("INFO", "ingestdb_late_arrival_direct_delete_plan", {
+    run_id: runId,
+    day_utc: dayWindow.day_utc,
+    mode: config.dryRun ? "dry-run" : "delete",
+    ingest_bucket_count: ingestBuckets.length,
+    window_start: dayWindow.window_start,
+    window_end: dayWindow.window_end,
+    ingest_bucket_preview: sampleRows(ingestBuckets.map(toBucketOutput)),
+  });
+
+  const deletedBucketResults = [];
+  const deleteErrors = [];
+  let totalDeletedRows = 0n;
+
+  if (!config.dryRun) {
+    for (const bucket of ingestBuckets) {
+      try {
+        const result = await deleteHourBucket(
+          ingestClient,
+          bucket,
+          config.deleteBatchSize,
+          config.maxDeleteBatchesPerHour,
+        );
+        totalDeletedRows += result.deleted_rows;
+
+        const bucketResult = {
+          connector_id: result.connector_id,
+          hour_start: result.hour_start,
+          deleted_rows: result.deleted_rows.toString(),
+          batches_run: result.batches_run,
+          drained: result.drained,
+        };
+        deletedBucketResults.push(bucketResult);
+        logStructured("INFO", "hour_bucket_late_arrival_direct_delete_result", {
+          run_id: runId,
+          day_utc: dayWindow.day_utc,
+          ...bucketResult,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const errorPayload = {
+          connector_id: bucket.connector_id,
+          hour_start: bucket.hour_start,
+          reason: "direct_delete_error",
+          message,
+        };
+        deleteErrors.push(errorPayload);
+        logStructured("ERROR", "hour_bucket_late_arrival_direct_delete_error", {
+          run_id: runId,
+          day_utc: dayWindow.day_utc,
+          ...errorPayload,
+        });
+      }
+    }
+  }
+
+  const summary = {
+    run_id: randomUUID(),
+    ...batchSummaryMeta,
+    mode: config.dryRun ? "dry-run" : "delete",
+    phase: "late_arrival_direct_delete",
+    day_utc: dayWindow.day_utc,
+    window_start: dayWindow.window_start,
+    window_end: dayWindow.window_end,
+    ingest_bucket_count: ingestBuckets.length,
+    deleted_bucket_count: deletedBucketResults.length,
+    total_deleted_rows: totalDeletedRows.toString(),
+    delete_error_count: deleteErrors.length,
+    alert_condition_count: deleteErrors.length,
+    skipped: false,
+    reason: "older_than_obs_aqidb_retention_cutoff",
+    deleted_buckets_preview: sampleRows(deletedBucketResults),
+    delete_errors_preview: sampleRows(deleteErrors),
+  };
+  logStructured("INFO", "ingestdb_late_arrival_direct_delete_summary", summary);
+  return summary;
+}
+
 async function runLateArrivalCleanup(config, overallWindow) {
   const runId = randomUUID();
-  const discovery = await discoverLateArrivalDays(config, overallWindow);
+  const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    db: { schema: RPC_SCHEMA },
+  });
+  const discovery = await discoverLateArrivalDays(ingestClient, overallWindow);
+  const obsAqidbCutoffDayUtc = buildRetentionCutoffDayUtc(config.obsAqidbObservsRetentionDays);
+  const directDeleteDayWindows = [];
+  const repairDayWindows = [];
+  for (const dayUtc of discovery.target_days) {
+    const dayWindow = buildUtcDayWindow(dayUtc);
+    if (dayWindow.day_utc < obsAqidbCutoffDayUtc) {
+      directDeleteDayWindows.push(dayWindow);
+      continue;
+    }
+    repairDayWindows.push(dayWindow);
+  }
+  const dayWindows = [...directDeleteDayWindows, ...repairDayWindows];
   logStructured("INFO", "ingestdb_late_arrival_discovery_summary", {
     run_id: runId,
     mode: config.dryRun ? "dry-run" : "delete",
@@ -2013,16 +2161,53 @@ async function runLateArrivalCleanup(config, overallWindow) {
     };
   }
 
-  const dayWindows = discovery.target_days.map((dayUtc) => buildUtcDayWindow(dayUtc));
   logStructured("INFO", "ingestdb_late_arrival_cleanup_plan", {
     run_id: runId,
     mode: config.dryRun ? "dry-run" : "delete",
     target_day_count: dayWindows.length,
+    obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
+    obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
+    direct_delete_day_count: directDeleteDayWindows.length,
+    repair_day_count: repairDayWindows.length,
     target_day_preview: sampleRows(dayWindows.map((entry) => entry.day_utc)),
+    direct_delete_day_preview: sampleRows(directDeleteDayWindows.map((entry) => entry.day_utc)),
+    repair_day_preview: sampleRows(repairDayWindows.map((entry) => entry.day_utc)),
   });
 
   const batchSummaries = [];
-  for (const dayWindow of dayWindows) {
+  for (const dayWindow of directDeleteDayWindows) {
+    try {
+      const summary = await runLateArrivalDirectDeleteDay(
+        config,
+        ingestClient,
+        dayWindow,
+        runId,
+        batchSummaries.length + 1,
+        dayWindows.length,
+      );
+      batchSummaries.push(summary);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logStructured("ERROR", "ingestdb_late_arrival_direct_delete_day_error", {
+        run_id: runId,
+        day_utc: dayWindow.day_utc,
+        error: message,
+      });
+      batchSummaries.push({
+        day_utc: dayWindow.day_utc,
+        run_id: null,
+        mode: config.dryRun ? "dry-run" : "delete",
+        phase: "late_arrival_direct_delete",
+        window_start: dayWindow.window_start,
+        window_end: dayWindow.window_end,
+        delete_error_count: 1,
+        alert_condition_count: 1,
+        error: message,
+      });
+    }
+  }
+
+  for (const dayWindow of repairDayWindows) {
     try {
       const summary = await runPruneSingleWindow(config, dayWindow, {
         parent_run_id: runId,
@@ -2055,6 +2240,10 @@ async function runLateArrivalCleanup(config, overallWindow) {
     skipped: false,
     run_id: runId,
     ...discovery,
+    obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
+    obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
+    direct_delete_day_count: directDeleteDayWindows.length,
+    repair_day_count: repairDayWindows.length,
     processed_day_count: dayWindows.length,
     delete_error_count:
       sumIntField(batchSummaries, "delete_error_count") +
@@ -2327,5 +2516,6 @@ server.listen(port, () => {
     default_dry_run: DEFAULT_DRY_RUN,
     default_ingestdb_retention_days: DEFAULT_INGESTDB_RETENTION_DAYS,
     default_max_hours_per_run: DEFAULT_MAX_HOURS_PER_RUN,
+    default_obs_aqidb_observs_retention_days: DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS,
   });
 });
