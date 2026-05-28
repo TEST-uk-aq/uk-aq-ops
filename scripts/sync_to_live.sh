@@ -104,6 +104,8 @@ EXCLUDES=(
   --exclude='*.zip'
   
   --exclude='dev-blog/'
+  --exclude='uk_aq_inject_project_ref.mjs'
+  --exclude='index.html''
 )
 
 # ── Sync function ─────────────────────────────────────────────────────────────
