@@ -105,7 +105,8 @@ EXCLUDES=(
   
   --exclude='dev-blog/'
   --exclude='uk_aq_inject_project_ref.mjs'
-  --exclude='index.html''
+  --exclude='index.html'
+  --exclude='*sidebar.js'
 )
 
 # ── Sync function ─────────────────────────────────────────────────────────────
