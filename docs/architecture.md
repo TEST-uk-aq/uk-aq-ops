@@ -7,9 +7,9 @@ This implementation keeps the existing UK AQ local dashboard UI and behaviour, a
 Main components:
 
 - `dashboard/` static single-page front end (Cloudflare Pages)
-- `api/worker/` Cloudflare Worker API/proxy (`/api/*`)
+- `workers/uk_aq_dashboard_online_api_worker/` Cloudflare Worker dashboard API (`/api/*`)
 - `local/dashboard/server/uk_aq_dashboard_api.py` migrated backend API (source-compatible with existing local dashboard contract)
-  - hosted target: Cloud Run service deployed by `.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml`
+  - hosted target: any reachable upstream API endpoint set in `DASHBOARD_UPSTREAM_BASE_URL*`
 - `station_snapshot/` local station snapshot front end
 - `local/station_snapshot/server/uk_aq_station_snapshot_local.py` migrated local station snapshot backend API
 
@@ -28,14 +28,13 @@ Expected request routing:
 1. Browser requests `/` and static assets from Cloudflare Pages.
 2. Browser requests `/api/*` on the same subdomain.
 3. Cloudflare routes `/api/*` to the Worker.
-4. Worker proxies compatibility routes to the migrated dashboard backend API.
+4. Worker serves the compatibility routes directly (or proxies upstream when configured).
 
 ## Trust boundaries
 
 - Browser is untrusted.
 - Cloudflare Zero Trust protects access to the admin subdomain.
-- Worker boundary holds server-side config and optional upstream bearer token.
-- Upstream dashboard backend holds Supabase service-role and other sensitive data source credentials.
+- Worker boundary holds server-side config, Supabase/Cloudflare credentials, and optional upstream bearer token.
 - Browser receives only browser-safe config from `dashboard/assets/config.js`.
 
 ## Data flow

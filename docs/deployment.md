@@ -52,10 +52,10 @@ Workflow:
 
 What it does:
 
-1. Installs and type-checks `api/worker`.
+1. Installs and type-checks `workers/uk_aq_dashboard_online_api_worker`.
 2. Builds an environment-specific Wrangler config with hostname + zone substitution.
 3. Deploys Worker code with Wrangler.
-4. Pushes worker secrets for upstream URL/token.
+4. Pushes worker secrets for direct mode (Supabase + API deps) and optional upstream URL/token.
 5. Deploys Worker again with updated secret state.
 
 Default route vars:
@@ -66,38 +66,27 @@ Default route vars:
 - test worker name: `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST` (default `uk-aq-ops-dashboard-api-test`)
 - live worker name: `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE` (default `uk-aq-ops-dashboard-api-live`)
 
-## Dashboard backend Cloud Run deployment
+## Dashboard worker mode
 
-Workflow:
+The dashboard API worker can run in two modes:
 
-- `.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml`
+- direct mode (default online path): worker reads data directly using worker secrets
+- upstream mode (optional): worker proxies to `DASHBOARD_UPSTREAM_BASE_URL*`
 
-What it does:
+If you use upstream mode, set:
 
-1. Builds `local/dashboard/server/Dockerfile`.
-2. Pushes the image to Artifact Registry.
-3. Deploys `local/dashboard/server/uk_aq_dashboard_api.py` to Cloud Run.
-4. Prints the Cloud Run service URL in logs.
+- `DASHBOARD_UPSTREAM_BASE_URL_TEST`
+- `DASHBOARD_UPSTREAM_BASE_URL_LIVE`
 
-Current default Cloud Run sizing (overridable by repo vars):
+Important upstream safety:
 
-- `SERVICE_CPU=0.25`
-- `SERVICE_MEMORY=512Mi`
-- `SERVICE_CONCURRENCY=10`
-- `SERVICE_MAX_INSTANCES=1`
-- `SERVICE_MIN_INSTANCES=0`
+- Do not point upstream at the same admin hostname route (`/api/*`) or it will loop.
+- The worker has a host-loop guard and will fall back to direct mode when upstream host equals request host.
 
-R2 metrics auth inputs for backend:
+Legacy note:
 
-- account id: `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` (fallback `CLOUDFLARE_ACCOUNT_ID`)
-- token: `UK_AQ_R2_CLOUDFLARE_API_TOKEN` (fallback `CFLARE_API_READ_TOKEN`)
-
-After deploy:
-
-1. Copy the service URL from workflow logs.
-2. Set/update repo variable `DASHBOARD_UPSTREAM_BASE_URL_TEST` and/or `DASHBOARD_UPSTREAM_BASE_URL_LIVE`.
-3. Optional: set `DASHBOARD_UPSTREAM_BEARER_TOKEN_TEST` and/or `DASHBOARD_UPSTREAM_BEARER_TOKEN_LIVE`.
-4. Re-run `.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`.
+- `.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml` is retired and archived at:
+  - `archive/2026-04-21_dashboard-backend-cloud-run-retired/uk_aq_dashboard_backend_cloud_run_deploy.yml`
 
 ## Cloudflare account model
 
@@ -162,7 +151,6 @@ End-to-end smoke test:
 - Cloudflare Pages custom domain bindings for the test/live projects.
 - Cloudflare Zero Trust policy assignment for admin subdomain.
 - Worker secret values (`DASHBOARD_UPSTREAM_BASE_URL_TEST`/`_LIVE`, optional bearer token variants).
-- Cloud Run dashboard backend deploy (workflow above) before setting dashboard upstream URLs.
 - GitHub vars/secrets for Worker deploy credentials:
   - `UK_AQ_CF_ACCOUNT_ID_UKAQ` / `UK_AQ_CF_API_TOKEN_UKAQ`
 - GitHub repo variables for dashboard config generation.

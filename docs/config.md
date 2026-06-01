@@ -38,7 +38,7 @@ Worker runtime:
 
 Store worker secrets in Cloudflare Worker secrets.
 
-Dashboard backend Cloud Run runtime:
+Dashboard upstream backend runtime (wherever hosted):
 
 - required:
   - `SUPABASE_URL`

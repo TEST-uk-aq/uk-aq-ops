@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "api/worker/**"
+      - "workers/uk_aq_dashboard_online_api_worker/**"
       - ".github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml"
   workflow_dispatch:
     inputs:
@@ -34,6 +34,33 @@ jobs:
       UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST || vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api-test' }}
       DASHBOARD_UPSTREAM_BASE_URL: ${{ vars.DASHBOARD_UPSTREAM_BASE_URL_TEST || vars.DASHBOARD_UPSTREAM_BASE_URL || '' }}
       DASHBOARD_UPSTREAM_BEARER_TOKEN: ${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN_TEST || secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN || '' }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
+      SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY || '' }}
+      UK_AQ_CORE_SCHEMA: ${{ vars.UK_AQ_CORE_SCHEMA || 'uk_aq_core' }}
+      UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
+      UK_AQ_OPS_SCHEMA: ${{ vars.UK_AQ_OPS_SCHEMA || 'uk_aq_ops' }}
+      UK_AQ_DB_SIZE_API_URL: ${{ vars.UK_AQ_DB_SIZE_API_URL || '' }}
+      UK_AQ_DB_SIZE_API_TOKEN: ${{ secrets.UK_AQ_DB_SIZE_API_TOKEN || '' }}
+      UK_AQ_DB_SIZE_LOOKBACK_DAYS: ${{ vars.UK_AQ_DB_SIZE_LOOKBACK_DAYS || '28' }}
+      UK_AQ_R2_HISTORY_DAYS_API_URL: ${{ vars.UK_AQ_R2_HISTORY_DAYS_API_URL || '' }}
+      UK_AQ_R2_HISTORY_DAYS_API_TOKEN: ${{ secrets.UK_AQ_R2_HISTORY_DAYS_API_TOKEN || '' }}
+      UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS: ${{ vars.UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS || '3660' }}
+      UK_AQ_R2_HISTORY_COUNTS_API_URL: ${{ vars.UK_AQ_R2_HISTORY_COUNTS_API_URL || '' }}
+      UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: ${{ secrets.UK_AQ_R2_HISTORY_COUNTS_API_TOKEN || '' }}
+      UK_AQ_R2_HISTORY_WINDOW_RPC: ${{ vars.UK_AQ_R2_HISTORY_WINDOW_RPC || 'uk_aq_rpc_r2_history_window' }}
+      UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_R2_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
+      CFLARE_API_READ_TOKEN: ${{ secrets.CFLARE_API_READ_TOKEN || '' }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY || '' }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET || '' }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN || '' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
+      UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
+      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v1.json' }}
+      CLEANAIRSURB_ST_ID: ${{ vars.CLEANAIRSURB_ST_ID || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,11 +71,11 @@ jobs:
           node-version: 20
 
       - name: Install worker dependencies
-        working-directory: api/worker
+        working-directory: workers/uk_aq_dashboard_online_api_worker
         run: npm ci
 
       - name: Type check worker
-        working-directory: api/worker
+        working-directory: workers/uk_aq_dashboard_online_api_worker
         run: npm run check
 
       - name: Validate deployment settings
@@ -75,8 +102,8 @@ jobs:
             echo "Missing worker name variable for test dashboard API worker."
             exit 1
           fi
-          if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ]; then
-            echo "Missing variable DASHBOARD_UPSTREAM_BASE_URL_TEST (or fallback DASHBOARD_UPSTREAM_BASE_URL)."
+          if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ] && { [ -z "${SUPABASE_URL}" ] || [ -z "${SB_SECRET_KEY}" ]; }; then
+            echo "Direct mode requires SUPABASE_URL + SB_SECRET_KEY when DASHBOARD_UPSTREAM_BASE_URL is not set."
             exit 1
           fi
 
@@ -100,20 +127,20 @@ jobs:
           }
           hostname_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_HOSTNAME}")"
           zone_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_ZONE_NAME}")"
-          cp api/worker/wrangler.toml api/worker/wrangler.deploy.toml
-          sed -i "s/__UK_AQ_OPS_ADMIN_HOSTNAME__/${hostname_escaped}/g" api/worker/wrangler.deploy.toml
-          sed -i "s/__UK_AQ_OPS_ADMIN_ZONE_NAME__/${zone_escaped}/g" api/worker/wrangler.deploy.toml
+          cp workers/uk_aq_dashboard_online_api_worker/wrangler.toml workers/uk_aq_dashboard_online_api_worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_HOSTNAME__/${hostname_escaped}/g" workers/uk_aq_dashboard_online_api_worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_ZONE_NAME__/${zone_escaped}/g" workers/uk_aq_dashboard_online_api_worker/wrangler.deploy.toml
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
           apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-          workingDirectory: api/worker
+          workingDirectory: workers/uk_aq_dashboard_online_api_worker
           command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}
 
       - name: Set Worker secrets
-        working-directory: api/worker
+        working-directory: workers/uk_aq_dashboard_online_api_worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
@@ -122,7 +149,34 @@ jobs:
           secrets_json="$(jq -n \
             --arg DASHBOARD_UPSTREAM_BASE_URL "${DASHBOARD_UPSTREAM_BASE_URL}" \
             --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${DASHBOARD_UPSTREAM_BEARER_TOKEN}" \
-            '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN} | with_entries(select(.value != ""))')"
+            --arg SUPABASE_URL "${SUPABASE_URL}" \
+            --arg SB_SECRET_KEY "${SB_SECRET_KEY}" \
+            --arg OBS_AQIDB_SUPABASE_URL "${OBS_AQIDB_SUPABASE_URL}" \
+            --arg OBS_AQIDB_SECRET_KEY "${OBS_AQIDB_SECRET_KEY}" \
+            --arg UK_AQ_CORE_SCHEMA "${UK_AQ_CORE_SCHEMA}" \
+            --arg UK_AQ_PUBLIC_SCHEMA "${UK_AQ_PUBLIC_SCHEMA}" \
+            --arg UK_AQ_OPS_SCHEMA "${UK_AQ_OPS_SCHEMA}" \
+            --arg UK_AQ_DB_SIZE_API_URL "${UK_AQ_DB_SIZE_API_URL}" \
+            --arg UK_AQ_DB_SIZE_API_TOKEN "${UK_AQ_DB_SIZE_API_TOKEN}" \
+            --arg UK_AQ_DB_SIZE_LOOKBACK_DAYS "${UK_AQ_DB_SIZE_LOOKBACK_DAYS}" \
+            --arg UK_AQ_R2_HISTORY_DAYS_API_URL "${UK_AQ_R2_HISTORY_DAYS_API_URL}" \
+            --arg UK_AQ_R2_HISTORY_DAYS_API_TOKEN "${UK_AQ_R2_HISTORY_DAYS_API_TOKEN}" \
+            --arg UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS "${UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS}" \
+            --arg UK_AQ_R2_HISTORY_COUNTS_API_URL "${UK_AQ_R2_HISTORY_COUNTS_API_URL}" \
+            --arg UK_AQ_R2_HISTORY_COUNTS_API_TOKEN "${UK_AQ_R2_HISTORY_COUNTS_API_TOKEN}" \
+            --arg UK_AQ_R2_HISTORY_WINDOW_RPC "${UK_AQ_R2_HISTORY_WINDOW_RPC}" \
+            --arg UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID "${UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID}" \
+            --arg UK_AQ_R2_CLOUDFLARE_API_TOKEN "${UK_AQ_R2_CLOUDFLARE_API_TOKEN}" \
+            --arg CLOUDFLARE_ACCOUNT_ID "${CLOUDFLARE_ACCOUNT_ID}" \
+            --arg CFLARE_API_READ_TOKEN "${CFLARE_API_READ_TOKEN}" \
+            --arg DROPBOX_APP_KEY "${DROPBOX_APP_KEY}" \
+            --arg DROPBOX_APP_SECRET "${DROPBOX_APP_SECRET}" \
+            --arg DROPBOX_REFRESH_TOKEN "${DROPBOX_REFRESH_TOKEN}" \
+            --arg UK_AQ_DROPBOX_ROOT "${UK_AQ_DROPBOX_ROOT}" \
+            --arg UK_AQ_R2_HISTORY_DROPBOX_DIR "${UK_AQ_R2_HISTORY_DROPBOX_DIR}" \
+            --arg UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}" \
+            --arg CLEANAIRSURB_ST_ID "${CLEANAIRSURB_ST_ID}" \
+            '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN, SUPABASE_URL: $SUPABASE_URL, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, UK_AQ_CORE_SCHEMA: $UK_AQ_CORE_SCHEMA, UK_AQ_PUBLIC_SCHEMA: $UK_AQ_PUBLIC_SCHEMA, UK_AQ_OPS_SCHEMA: $UK_AQ_OPS_SCHEMA, UK_AQ_DB_SIZE_API_URL: $UK_AQ_DB_SIZE_API_URL, UK_AQ_DB_SIZE_API_TOKEN: $UK_AQ_DB_SIZE_API_TOKEN, UK_AQ_DB_SIZE_LOOKBACK_DAYS: $UK_AQ_DB_SIZE_LOOKBACK_DAYS, UK_AQ_R2_HISTORY_DAYS_API_URL: $UK_AQ_R2_HISTORY_DAYS_API_URL, UK_AQ_R2_HISTORY_DAYS_API_TOKEN: $UK_AQ_R2_HISTORY_DAYS_API_TOKEN, UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS: $UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS, UK_AQ_R2_HISTORY_COUNTS_API_URL: $UK_AQ_R2_HISTORY_COUNTS_API_URL, UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: $UK_AQ_R2_HISTORY_COUNTS_API_TOKEN, UK_AQ_R2_HISTORY_WINDOW_RPC: $UK_AQ_R2_HISTORY_WINDOW_RPC, UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: $UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID, UK_AQ_R2_CLOUDFLARE_API_TOKEN: $UK_AQ_R2_CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: $CLOUDFLARE_ACCOUNT_ID, CFLARE_API_READ_TOKEN: $CFLARE_API_READ_TOKEN, DROPBOX_APP_KEY: $DROPBOX_APP_KEY, DROPBOX_APP_SECRET: $DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN: $DROPBOX_REFRESH_TOKEN, UK_AQ_DROPBOX_ROOT: $UK_AQ_DROPBOX_ROOT, UK_AQ_R2_HISTORY_DROPBOX_DIR: $UK_AQ_R2_HISTORY_DROPBOX_DIR, UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: $UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH, CLEANAIRSURB_ST_ID: $CLEANAIRSURB_ST_ID} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
             if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"; then
               exit 0
@@ -139,7 +193,7 @@ jobs:
         with:
           apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-          workingDirectory: api/worker
+          workingDirectory: workers/uk_aq_dashboard_online_api_worker
           command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}
 
   deploy-live:
@@ -153,6 +207,33 @@ jobs:
       UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE || vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api-live' }}
       DASHBOARD_UPSTREAM_BASE_URL: ${{ vars.DASHBOARD_UPSTREAM_BASE_URL_LIVE || vars.DASHBOARD_UPSTREAM_BASE_URL || '' }}
       DASHBOARD_UPSTREAM_BEARER_TOKEN: ${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN_LIVE || secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN || '' }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
+      SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY || '' }}
+      UK_AQ_CORE_SCHEMA: ${{ vars.UK_AQ_CORE_SCHEMA || 'uk_aq_core' }}
+      UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
+      UK_AQ_OPS_SCHEMA: ${{ vars.UK_AQ_OPS_SCHEMA || 'uk_aq_ops' }}
+      UK_AQ_DB_SIZE_API_URL: ${{ vars.UK_AQ_DB_SIZE_API_URL || '' }}
+      UK_AQ_DB_SIZE_API_TOKEN: ${{ secrets.UK_AQ_DB_SIZE_API_TOKEN || '' }}
+      UK_AQ_DB_SIZE_LOOKBACK_DAYS: ${{ vars.UK_AQ_DB_SIZE_LOOKBACK_DAYS || '28' }}
+      UK_AQ_R2_HISTORY_DAYS_API_URL: ${{ vars.UK_AQ_R2_HISTORY_DAYS_API_URL || '' }}
+      UK_AQ_R2_HISTORY_DAYS_API_TOKEN: ${{ secrets.UK_AQ_R2_HISTORY_DAYS_API_TOKEN || '' }}
+      UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS: ${{ vars.UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS || '3660' }}
+      UK_AQ_R2_HISTORY_COUNTS_API_URL: ${{ vars.UK_AQ_R2_HISTORY_COUNTS_API_URL || '' }}
+      UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: ${{ secrets.UK_AQ_R2_HISTORY_COUNTS_API_TOKEN || '' }}
+      UK_AQ_R2_HISTORY_WINDOW_RPC: ${{ vars.UK_AQ_R2_HISTORY_WINDOW_RPC || 'uk_aq_rpc_r2_history_window' }}
+      UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_R2_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
+      CFLARE_API_READ_TOKEN: ${{ secrets.CFLARE_API_READ_TOKEN || '' }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY || '' }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET || '' }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN || '' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
+      UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
+      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v1.json' }}
+      CLEANAIRSURB_ST_ID: ${{ vars.CLEANAIRSURB_ST_ID || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -163,11 +244,11 @@ jobs:
           node-version: 20
 
       - name: Install worker dependencies
-        working-directory: api/worker
+        working-directory: workers/uk_aq_dashboard_online_api_worker
         run: npm ci
 
       - name: Type check worker
-        working-directory: api/worker
+        working-directory: workers/uk_aq_dashboard_online_api_worker
         run: npm run check
 
       - name: Validate deployment settings
@@ -194,8 +275,8 @@ jobs:
             echo "Missing worker name variable for live dashboard API worker."
             exit 1
           fi
-          if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ]; then
-            echo "Missing variable DASHBOARD_UPSTREAM_BASE_URL_LIVE (or fallback DASHBOARD_UPSTREAM_BASE_URL)."
+          if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ] && { [ -z "${SUPABASE_URL}" ] || [ -z "${SB_SECRET_KEY}" ]; }; then
+            echo "Direct mode requires SUPABASE_URL + SB_SECRET_KEY when DASHBOARD_UPSTREAM_BASE_URL is not set."
             exit 1
           fi
 
@@ -219,20 +300,20 @@ jobs:
           }
           hostname_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_HOSTNAME}")"
           zone_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_ZONE_NAME}")"
-          cp api/worker/wrangler.toml api/worker/wrangler.deploy.toml
-          sed -i "s/__UK_AQ_OPS_ADMIN_HOSTNAME__/${hostname_escaped}/g" api/worker/wrangler.deploy.toml
-          sed -i "s/__UK_AQ_OPS_ADMIN_ZONE_NAME__/${zone_escaped}/g" api/worker/wrangler.deploy.toml
+          cp workers/uk_aq_dashboard_online_api_worker/wrangler.toml workers/uk_aq_dashboard_online_api_worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_HOSTNAME__/${hostname_escaped}/g" workers/uk_aq_dashboard_online_api_worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_ZONE_NAME__/${zone_escaped}/g" workers/uk_aq_dashboard_online_api_worker/wrangler.deploy.toml
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
           apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-          workingDirectory: api/worker
+          workingDirectory: workers/uk_aq_dashboard_online_api_worker
           command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}
 
       - name: Set Worker secrets
-        working-directory: api/worker
+        working-directory: workers/uk_aq_dashboard_online_api_worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
@@ -241,7 +322,34 @@ jobs:
           secrets_json="$(jq -n \
             --arg DASHBOARD_UPSTREAM_BASE_URL "${DASHBOARD_UPSTREAM_BASE_URL}" \
             --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${DASHBOARD_UPSTREAM_BEARER_TOKEN}" \
-            '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN} | with_entries(select(.value != ""))')"
+            --arg SUPABASE_URL "${SUPABASE_URL}" \
+            --arg SB_SECRET_KEY "${SB_SECRET_KEY}" \
+            --arg OBS_AQIDB_SUPABASE_URL "${OBS_AQIDB_SUPABASE_URL}" \
+            --arg OBS_AQIDB_SECRET_KEY "${OBS_AQIDB_SECRET_KEY}" \
+            --arg UK_AQ_CORE_SCHEMA "${UK_AQ_CORE_SCHEMA}" \
+            --arg UK_AQ_PUBLIC_SCHEMA "${UK_AQ_PUBLIC_SCHEMA}" \
+            --arg UK_AQ_OPS_SCHEMA "${UK_AQ_OPS_SCHEMA}" \
+            --arg UK_AQ_DB_SIZE_API_URL "${UK_AQ_DB_SIZE_API_URL}" \
+            --arg UK_AQ_DB_SIZE_API_TOKEN "${UK_AQ_DB_SIZE_API_TOKEN}" \
+            --arg UK_AQ_DB_SIZE_LOOKBACK_DAYS "${UK_AQ_DB_SIZE_LOOKBACK_DAYS}" \
+            --arg UK_AQ_R2_HISTORY_DAYS_API_URL "${UK_AQ_R2_HISTORY_DAYS_API_URL}" \
+            --arg UK_AQ_R2_HISTORY_DAYS_API_TOKEN "${UK_AQ_R2_HISTORY_DAYS_API_TOKEN}" \
+            --arg UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS "${UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS}" \
+            --arg UK_AQ_R2_HISTORY_COUNTS_API_URL "${UK_AQ_R2_HISTORY_COUNTS_API_URL}" \
+            --arg UK_AQ_R2_HISTORY_COUNTS_API_TOKEN "${UK_AQ_R2_HISTORY_COUNTS_API_TOKEN}" \
+            --arg UK_AQ_R2_HISTORY_WINDOW_RPC "${UK_AQ_R2_HISTORY_WINDOW_RPC}" \
+            --arg UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID "${UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID}" \
+            --arg UK_AQ_R2_CLOUDFLARE_API_TOKEN "${UK_AQ_R2_CLOUDFLARE_API_TOKEN}" \
+            --arg CLOUDFLARE_ACCOUNT_ID "${CLOUDFLARE_ACCOUNT_ID}" \
+            --arg CFLARE_API_READ_TOKEN "${CFLARE_API_READ_TOKEN}" \
+            --arg DROPBOX_APP_KEY "${DROPBOX_APP_KEY}" \
+            --arg DROPBOX_APP_SECRET "${DROPBOX_APP_SECRET}" \
+            --arg DROPBOX_REFRESH_TOKEN "${DROPBOX_REFRESH_TOKEN}" \
+            --arg UK_AQ_DROPBOX_ROOT "${UK_AQ_DROPBOX_ROOT}" \
+            --arg UK_AQ_R2_HISTORY_DROPBOX_DIR "${UK_AQ_R2_HISTORY_DROPBOX_DIR}" \
+            --arg UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}" \
+            --arg CLEANAIRSURB_ST_ID "${CLEANAIRSURB_ST_ID}" \
+            '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN, SUPABASE_URL: $SUPABASE_URL, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, UK_AQ_CORE_SCHEMA: $UK_AQ_CORE_SCHEMA, UK_AQ_PUBLIC_SCHEMA: $UK_AQ_PUBLIC_SCHEMA, UK_AQ_OPS_SCHEMA: $UK_AQ_OPS_SCHEMA, UK_AQ_DB_SIZE_API_URL: $UK_AQ_DB_SIZE_API_URL, UK_AQ_DB_SIZE_API_TOKEN: $UK_AQ_DB_SIZE_API_TOKEN, UK_AQ_DB_SIZE_LOOKBACK_DAYS: $UK_AQ_DB_SIZE_LOOKBACK_DAYS, UK_AQ_R2_HISTORY_DAYS_API_URL: $UK_AQ_R2_HISTORY_DAYS_API_URL, UK_AQ_R2_HISTORY_DAYS_API_TOKEN: $UK_AQ_R2_HISTORY_DAYS_API_TOKEN, UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS: $UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS, UK_AQ_R2_HISTORY_COUNTS_API_URL: $UK_AQ_R2_HISTORY_COUNTS_API_URL, UK_AQ_R2_HISTORY_COUNTS_API_TOKEN: $UK_AQ_R2_HISTORY_COUNTS_API_TOKEN, UK_AQ_R2_HISTORY_WINDOW_RPC: $UK_AQ_R2_HISTORY_WINDOW_RPC, UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: $UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID, UK_AQ_R2_CLOUDFLARE_API_TOKEN: $UK_AQ_R2_CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: $CLOUDFLARE_ACCOUNT_ID, CFLARE_API_READ_TOKEN: $CFLARE_API_READ_TOKEN, DROPBOX_APP_KEY: $DROPBOX_APP_KEY, DROPBOX_APP_SECRET: $DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN: $DROPBOX_REFRESH_TOKEN, UK_AQ_DROPBOX_ROOT: $UK_AQ_DROPBOX_ROOT, UK_AQ_R2_HISTORY_DROPBOX_DIR: $UK_AQ_R2_HISTORY_DROPBOX_DIR, UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: $UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH, CLEANAIRSURB_ST_ID: $CLEANAIRSURB_ST_ID} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
             if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"; then
               exit 0
@@ -258,5 +366,5 @@ jobs:
         with:
           apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-          workingDirectory: api/worker
+          workingDirectory: workers/uk_aq_dashboard_online_api_worker
           command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}

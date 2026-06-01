@@ -1,5 +1,8 @@
 # UK AQ Ops Dashboard API Worker
 
+> Legacy path notice: active worker code now lives at `workers/uk_aq_dashboard_online_api_worker/`.
+> Keep this directory for historical reference only.
+
 Cloudflare Worker API/proxy for the hosted UK AQ ops dashboard.
 
 ## Purpose
@@ -21,7 +24,7 @@ Compatibility routes (for existing dashboard parity):
 - `POST /api/connectors`
 - `POST /api/dispatcher_settings`
 
-Edge caching is enabled for compatibility `GET` routes to reduce Cloud Run hits:
+Edge caching is enabled for compatibility `GET` routes to reduce upstream backend hits:
 
 - `/api/config`: 10 minutes
 - `/api/snapshot`: 30 seconds
@@ -78,7 +81,7 @@ Failure shape:
 ## Local check
 
 ```bash
-cd api/worker
+cd workers/uk_aq_dashboard_online_api_worker
 npm install
 npm run check
 ```
@@ -86,6 +89,6 @@ npm run check
 ## Deploy
 
 ```bash
-cd api/worker
+cd workers/uk_aq_dashboard_online_api_worker
 npx wrangler deploy
 ```

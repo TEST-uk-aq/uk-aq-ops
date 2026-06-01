@@ -66,7 +66,7 @@ Dashboard paths:
 - Station snapshot front end: `station_snapshot/`
 - Station snapshot backend API: `local/station_snapshot/server/uk_aq_station_snapshot_local.py`
 - Station snapshot launcher: `local/scripts/run_station_snapshot_local.sh`
-- Hosted proxy worker: `api/worker/`
+- Hosted dashboard API worker: `workers/uk_aq_dashboard_online_api_worker/`
 - Combined local start/stop wrappers: `./dev_dashboards.sh` and `./dev_dashboards_stop.sh`
 
 Local dashboard run:
@@ -241,20 +241,20 @@ Primary controls:
 - Upstream auth header:
   - injects `X-UK-AQ-Upstream-Auth` using `UK_AQ_EDGE_UPSTREAM_SECRET`.
 
-### 11) Dashboard Backend Cloud Run (`local/dashboard/server/uk_aq_dashboard_api.py`)
+### 11) Dashboard Backend API Source (`local/dashboard/server/uk_aq_dashboard_api.py`)
 
-- deploys the migrated Python dashboard backend as a Cloud Run service
-- serves compatibility API routes used by the hosted dashboard worker:
+- source implementation for the dashboard upstream API used by the hosted dashboard worker
+- serves compatibility API routes:
   - `/api/dashboard`
   - `/api/storage_coverage`
   - `/api/r2_metrics`
   - `/api/r2_connector_counts`
   - `/api/connectors`
   - `/api/dispatcher_settings`
-- service is deployed as public (`allow-unauthenticated`) so Cloudflare Worker can call it
-- optional bearer auth on `/api/*` is enforced when `DASHBOARD_UPSTREAM_BEARER_TOKEN` is configured
-- deployed URL is printed in workflow logs and should be set as repo variable:
+- hosted dashboard API worker target is configured by:
   - `DASHBOARD_UPSTREAM_BASE_URL`
+- legacy dashboard Cloud Run workflow is retired and archived at:
+  - `archive/2026-04-21_dashboard-backend-cloud-run-retired/uk_aq_dashboard_backend_cloud_run_deploy.yml`
 
 ## Local run
 
@@ -337,7 +337,6 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_aqilevels_retention_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
-- `/.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_ops_dashboard_pages_deploy.yml`
 - `/.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`
 - `/.github/workflows/uk_aq_timeseries_aqi_hourly_cloud_run_deploy.yml`
