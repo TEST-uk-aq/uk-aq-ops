@@ -9,4 +9,4 @@ UKAQ_PROXY_ROUTE_PREFIX = "/api"
 
 [[routes]]
 pattern = "__UK_AQ_OPS_ADMIN_HOSTNAME__/api/*"
-zone_name = "chronicillnesschannel.co.uk"
+zone_name = "__UK_AQ_OPS_ADMIN_ZONE_NAME__"

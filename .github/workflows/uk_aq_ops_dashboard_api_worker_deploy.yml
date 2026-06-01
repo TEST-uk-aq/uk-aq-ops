@@ -1,0 +1,262 @@
+name: Deploy UK AQ Ops Dashboard API Workers
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "api/worker/**"
+      - ".github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml"
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Deploy target"
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - test
+          - live
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-test:
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target_env == 'both' || inputs.target_env == 'test')) || (github.event_name != 'workflow_dispatch' && (vars.UK_AQ_DEPLOY_ENV == '' || vars.UK_AQ_DEPLOY_ENV == 'test' || vars.UK_AQ_DEPLOY_ENV == 'cic-test')) }}
+    runs-on: ubuntu-latest
+    env:
+      UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_OPS_ADMIN_ZONE_NAME: ${{ vars.UK_AQ_OPS_ADMIN_ZONE_NAME || 'ukaq.co.uk' }}
+      UK_AQ_OPS_ADMIN_HOSTNAME: ${{ vars.UK_AQ_OPS_ADMIN_TEST_HOSTNAME || 'cic-test-uk-aq-admin.ukaq.co.uk' }}
+      UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST || vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api-test' }}
+      DASHBOARD_UPSTREAM_BASE_URL: ${{ vars.DASHBOARD_UPSTREAM_BASE_URL_TEST || vars.DASHBOARD_UPSTREAM_BASE_URL || '' }}
+      DASHBOARD_UPSTREAM_BEARER_TOKEN: ${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN_TEST || secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install worker dependencies
+        working-directory: api/worker
+        run: npm ci
+
+      - name: Type check worker
+        working-directory: api/worker
+        run: npm run check
+
+      - name: Validate deployment settings
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UK_AQ_CF_API_TOKEN_UKAQ}" ]; then
+            echo "Missing secret UK_AQ_CF_API_TOKEN_UKAQ (or fallback UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_CF_ACCOUNT_ID_UKAQ}" ]; then
+            echo "Missing variable UK_AQ_CF_ACCOUNT_ID_UKAQ (or fallback UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_OPS_ADMIN_ZONE_NAME}" ]; then
+            echo "Missing variable UK_AQ_OPS_ADMIN_ZONE_NAME."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_OPS_ADMIN_HOSTNAME}" ]; then
+            echo "Missing variable UK_AQ_OPS_ADMIN_TEST_HOSTNAME (or fallback)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}" ]; then
+            echo "Missing worker name variable for test dashboard API worker."
+            exit 1
+          fi
+          if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ]; then
+            echo "Missing variable DASHBOARD_UPSTREAM_BASE_URL_TEST (or fallback DASHBOARD_UPSTREAM_BASE_URL)."
+            exit 1
+          fi
+
+          if [[ "${UK_AQ_OPS_ADMIN_HOSTNAME}" != *.${UK_AQ_OPS_ADMIN_ZONE_NAME} ]]; then
+            echo "Host ${UK_AQ_OPS_ADMIN_HOSTNAME} is not within zone ${UK_AQ_OPS_ADMIN_ZONE_NAME}."
+            exit 1
+          fi
+
+          masked_account_id="${UK_AQ_CF_ACCOUNT_ID_UKAQ:0:4}...${UK_AQ_CF_ACCOUNT_ID_UKAQ: -4}"
+          echo "Deploying test dashboard API worker:"
+          echo "  worker=${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"
+          echo "  hostname=${UK_AQ_OPS_ADMIN_HOSTNAME}"
+          echo "  zone=${UK_AQ_OPS_ADMIN_ZONE_NAME}"
+          echo "  account=${masked_account_id}"
+
+      - name: Prepare wrangler config
+        run: |
+          set -euo pipefail
+          escape_for_sed() {
+            printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
+          }
+          hostname_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_HOSTNAME}")"
+          zone_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_ZONE_NAME}")"
+          cp api/worker/wrangler.toml api/worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_HOSTNAME__/${hostname_escaped}/g" api/worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_ZONE_NAME__/${zone_escaped}/g" api/worker/wrangler.deploy.toml
+
+      - name: Deploy Worker (base)
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
+          accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
+          workingDirectory: api/worker
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}
+
+      - name: Set Worker secrets
+        working-directory: api/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg DASHBOARD_UPSTREAM_BASE_URL "${DASHBOARD_UPSTREAM_BASE_URL}" \
+            --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${DASHBOARD_UPSTREAM_BEARER_TOKEN}" \
+            '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN} | with_entries(select(.value != ""))')"
+          for attempt in 1 2 3; do
+            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to apply Worker secrets after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
+          accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
+          workingDirectory: api/worker
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}
+
+  deploy-live:
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target_env == 'both' || inputs.target_env == 'live')) || (github.event_name != 'workflow_dispatch' && (vars.UK_AQ_DEPLOY_ENV == 'live' || vars.UK_AQ_DEPLOY_ENV == 'prod' || vars.UK_AQ_DEPLOY_ENV == 'production')) }}
+    runs-on: ubuntu-latest
+    env:
+      UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_OPS_ADMIN_ZONE_NAME: ${{ vars.UK_AQ_OPS_ADMIN_ZONE_NAME || 'ukaq.co.uk' }}
+      UK_AQ_OPS_ADMIN_HOSTNAME: ${{ vars.UK_AQ_OPS_ADMIN_LIVE_HOSTNAME || 'uk-aq-admin.ukaq.co.uk' }}
+      UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE || vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api-live' }}
+      DASHBOARD_UPSTREAM_BASE_URL: ${{ vars.DASHBOARD_UPSTREAM_BASE_URL_LIVE || vars.DASHBOARD_UPSTREAM_BASE_URL || '' }}
+      DASHBOARD_UPSTREAM_BEARER_TOKEN: ${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN_LIVE || secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install worker dependencies
+        working-directory: api/worker
+        run: npm ci
+
+      - name: Type check worker
+        working-directory: api/worker
+        run: npm run check
+
+      - name: Validate deployment settings
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UK_AQ_CF_API_TOKEN_UKAQ}" ]; then
+            echo "Missing secret UK_AQ_CF_API_TOKEN_UKAQ (or fallback UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_CF_ACCOUNT_ID_UKAQ}" ]; then
+            echo "Missing variable UK_AQ_CF_ACCOUNT_ID_UKAQ (or fallback UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_OPS_ADMIN_ZONE_NAME}" ]; then
+            echo "Missing variable UK_AQ_OPS_ADMIN_ZONE_NAME."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_OPS_ADMIN_HOSTNAME}" ]; then
+            echo "Missing variable UK_AQ_OPS_ADMIN_LIVE_HOSTNAME (or fallback)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}" ]; then
+            echo "Missing worker name variable for live dashboard API worker."
+            exit 1
+          fi
+          if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ]; then
+            echo "Missing variable DASHBOARD_UPSTREAM_BASE_URL_LIVE (or fallback DASHBOARD_UPSTREAM_BASE_URL)."
+            exit 1
+          fi
+
+          if [[ "${UK_AQ_OPS_ADMIN_HOSTNAME}" != *.${UK_AQ_OPS_ADMIN_ZONE_NAME} ]]; then
+            echo "Host ${UK_AQ_OPS_ADMIN_HOSTNAME} is not within zone ${UK_AQ_OPS_ADMIN_ZONE_NAME}."
+            exit 1
+          fi
+
+          masked_account_id="${UK_AQ_CF_ACCOUNT_ID_UKAQ:0:4}...${UK_AQ_CF_ACCOUNT_ID_UKAQ: -4}"
+          echo "Deploying live dashboard API worker:"
+          echo "  worker=${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"
+          echo "  hostname=${UK_AQ_OPS_ADMIN_HOSTNAME}"
+          echo "  zone=${UK_AQ_OPS_ADMIN_ZONE_NAME}"
+          echo "  account=${masked_account_id}"
+
+      - name: Prepare wrangler config
+        run: |
+          set -euo pipefail
+          escape_for_sed() {
+            printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
+          }
+          hostname_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_HOSTNAME}")"
+          zone_escaped="$(escape_for_sed "${UK_AQ_OPS_ADMIN_ZONE_NAME}")"
+          cp api/worker/wrangler.toml api/worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_HOSTNAME__/${hostname_escaped}/g" api/worker/wrangler.deploy.toml
+          sed -i "s/__UK_AQ_OPS_ADMIN_ZONE_NAME__/${zone_escaped}/g" api/worker/wrangler.deploy.toml
+
+      - name: Deploy Worker (base)
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
+          accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
+          workingDirectory: api/worker
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}
+
+      - name: Set Worker secrets
+        working-directory: api/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg DASHBOARD_UPSTREAM_BASE_URL "${DASHBOARD_UPSTREAM_BASE_URL}" \
+            --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${DASHBOARD_UPSTREAM_BEARER_TOKEN}" \
+            '{DASHBOARD_UPSTREAM_BASE_URL: $DASHBOARD_UPSTREAM_BASE_URL, DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN} | with_entries(select(.value != ""))')"
+          for attempt in 1 2 3; do
+            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to apply Worker secrets after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
+          accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
+          workingDirectory: api/worker
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME }}

@@ -26,7 +26,7 @@ Expected source env vars:
 
 Default local output directory:
 
-- `tmp/geo_lookup_v1`
+- `~/tmp/geo_lookup_v1`
 
 Directory/object structure:
 
@@ -36,11 +36,11 @@ v1/
   pcon/
     detailed/
       grid_0.05/
-        <lat_min>_<lon_min>.json
+        iy1030_ix-3.json
   la/
     detailed/
       grid_0.05/
-        <lat_min>_<lon_min>.json
+        iy1030_ix-3.json
   adjacency/
     pcon_<version>.json
     la_<version>.json
@@ -49,66 +49,71 @@ v1/
 Notes:
 
 - A feature is included in every tile whose bbox overlaps the feature bbox.
+- Tile keys use integer indices (`iy`, `ix`) as canonical identifiers to avoid float rounding drift.
+- MultiPolygon assignment uses per-part bbox tiling with tile-key dedupe (reduces shard explosion for disjoint geometries).
+- Shard and adjacency JSON are written minified to reduce local tmp usage and R2 object size.
 - Adjacency output is approximate (`bbox_overlap_approx`) in the first implementation.
 
 ## Build flow
 
-1) Resolve PCON file from Dropbox:
+### Offline local files (preferred)
+
+Use local GeoJSON files directly (no Dropbox download step).
+
+```bash
+node scripts/geography/build_pcon_la_lookup_shards.mjs \
+  --pcon-geojson "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/Geo-Resources/admin/PCON/UK/July_2024/BFC/Data/Westminster_Parliamentary_Constituencies_July_2024_Boundaries_UK_BFC_5018004800687358456.geojson" \
+  --la-geojson "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/Geo-Resources/admin/LAD/UK/May_2025/BGC/Data/LAD_MAY_2025_UK_BGC_V2_6173306121795233386.geojson" \
+  --output-dir "${UK_AQ_GEO_SHARD_OUTPUT_DIR:-$HOME/tmp/geo_lookup_v1}" \
+  --prefix "${UK_AQ_GEO_R2_PREFIX:-v1}" \
+  --grid-size "${UK_AQ_GEO_GRID_SIZE_DEGREES:-0.05}" \
+  --boundary-detail "${UK_AQ_GEO_BOUNDARY_DETAIL:-detailed}" \
+  --pcon-version "${UK_AQ_GEO_PCON_VERSION:-2024}" \
+  --la-version "${UK_AQ_GEO_LA_VERSION:-2025}"
+```
+
+### Dropbox resolve (optional)
+
+Only use this when you explicitly want to resolve/download source files from Dropbox:
 
 ```bash
 python3 scripts/geography/resolve_dropbox_geojson.py \
   --dropbox-base "$PCON_GEOJSON_DROPBOX_BASE" \
   --dropbox-path "$PCON_GEOJSON_DROPBOX_PATH" \
   --version "${UK_AQ_GEO_PCON_VERSION:-2024}" \
-  --output "tmp/pcon.geojson"
-```
+  --output "$HOME/tmp/pcon.geojson"
 
-2) Resolve LA file from Dropbox:
-
-```bash
 python3 scripts/geography/resolve_dropbox_geojson.py \
   --dropbox-base "$LA_GEOJSON_DROPBOX_BASE" \
   --dropbox-path "$LA_GEOJSON_DROPBOX_PATH" \
   --version "${UK_AQ_GEO_LA_VERSION:-latest-configured}" \
-  --output "tmp/la.geojson"
+  --output "$HOME/tmp/la.geojson"
 ```
 
-3) Build shard files:
+Then run the same build command with those local paths.
 
-```bash
-node scripts/geography/build_pcon_la_lookup_shards.mjs \
-  --pcon-geojson "tmp/pcon.geojson" \
-  --la-geojson "tmp/la.geojson" \
-  --output-dir "${UK_AQ_GEO_SHARD_OUTPUT_DIR:-tmp/geo_lookup_v1}" \
-  --prefix "${UK_AQ_GEO_R2_PREFIX:-v1}" \
-  --grid-size "${UK_AQ_GEO_GRID_SIZE_DEGREES:-0.05}" \
-  --boundary-detail "${UK_AQ_GEO_BOUNDARY_DETAIL:-detailed}" \
-  --pcon-version "${UK_AQ_GEO_PCON_VERSION:-2024}" \
-  --la-version "${UK_AQ_GEO_LA_VERSION:-latest-configured}"
-```
-
-4) Upload to R2:
+### Upload to R2
 
 ```bash
 node scripts/geography/upload_pcon_la_lookup_shards_to_r2.mjs \
-  --input-dir "${UK_AQ_GEO_SHARD_OUTPUT_DIR:-tmp/geo_lookup_v1}" \
+  --input-dir "${UK_AQ_GEO_SHARD_OUTPUT_DIR:-$HOME/tmp/geo_lookup_v1}" \
   --prefix "${UK_AQ_GEO_R2_PREFIX:-v1}"
 ```
 
-5) Compare Aiven vs R2 lookup (Layer 1D gate):
+5) Validate against existing station PCON/LA values (Layer 1D placeholder):
 
 ```bash
-python3 scripts/geography/compare_r2_geo_lookup_with_aiven.py \
-  --limit "${UK_AQ_GEO_COMPARE_LIMIT:-100}" \
-  --output "${UK_AQ_GEO_COMPARE_OUTPUT:-logs/geo_compare/latest.json}"
+python3 scripts/geography/validate_r2_geo_lookup_against_stations.py \
+  --limit "${UK_AQ_GEO_VALIDATE_LIMIT:-100}" \
+  --output "${UK_AQ_GEO_VALIDATE_OUTPUT:-logs/geo_validate/latest.json}"
 ```
 
 Optional explicit station list:
 
 ```bash
-python3 scripts/geography/compare_r2_geo_lookup_with_aiven.py \
+python3 scripts/geography/validate_r2_geo_lookup_against_stations.py \
   --station-ids "123,456,789" \
-  --output "${UK_AQ_GEO_COMPARE_OUTPUT:-logs/geo_compare/latest.json}"
+  --output "${UK_AQ_GEO_VALIDATE_OUTPUT:-logs/geo_validate/latest.json}"
 ```
 
 ## Required env vars
@@ -133,14 +138,15 @@ Upload-time:
   - `UK_AQ_GEO_R2_ENDPOINT`
   - `UK_AQ_GEO_R2_CLOUDFLARE_ACCOUNT_ID`
 
-Layer 1D compare gate:
+Layer 1D validation gate placeholder:
 
-- `PCON_AIVEN_PG_DSN`
-- `UK_AQ_GEO_COMPARE_LIMIT` (default `100`)
-- `UK_AQ_GEO_COMPARE_STATION_IDS` (optional CSV)
-- `UK_AQ_GEO_COMPARE_INCLUDE_ALREADY_ENRICHED` (default `false`)
-- `UK_AQ_GEO_COMPARE_OUTPUT` (default `logs/geo_compare/latest.json`)
-- plus R2 read credentials used by upload script fallback:
+- `SUPABASE_URL`
+- `SB_SECRET_KEY`
+- `UK_AQ_GEO_VALIDATE_LIMIT` (default `100`)
+- `UK_AQ_GEO_VALIDATE_STATION_IDS` (optional CSV)
+- `UK_AQ_GEO_VALIDATE_RANDOM_SEED` (optional)
+- `UK_AQ_GEO_VALIDATE_OUTPUT` (default `logs/geo_validate/latest.json`)
+- plus R2 read credentials:
   - `CLOUDFLARE_R2_ACCESS_KEY_ID` / `CFLARE_R2_ACCESS_KEY_ID`
   - `CLOUDFLARE_R2_SECRET_ACCESS_KEY` / `CFLARE_R2_SECRET_ACCESS_KEY`
 
@@ -153,12 +159,12 @@ Dropbox resolve step:
 ## Edge cases and limitations
 
 - Boundary-edge points can require neighbouring tile fallback during ingest lookup.
-- If source versions differ from Aiven boundary vintages, comparison mismatches may be valid.
 - Adjacency output is approximate in Layer 1 and intended as future support data.
+- Aiven is not part of the active design for this feature.
 
-Layer 1D mismatch interpretation:
+Layer 1D mismatch interpretation (validation placeholder):
 
-- `*_code_mismatch`: different boundary code selected between Aiven and R2; review boundary version and edge geometry.
-- `*_missing_in_aiven` / `*_missing_in_r2`: one side found a polygon and the other did not; check tile fallback and source coverage.
+- `*_code_mismatch`: different boundary code selected between stored station value and R2 lookup; review boundary version and edge geometry.
+- `*_missing_stored` / `*_missing_r2`: one side has a code and the other does not; check tile fallback and source coverage.
 - `*_name_mismatch`: code matched but label differs; usually naming dataset drift rather than spatial mismatch.
 - `both_missing`: neither lookup found a polygon for the station coordinate.

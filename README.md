@@ -30,14 +30,25 @@ Cloudflare edge workers in this repo:
 
 Cloudflare deploy model (Option A):
 
-- domain workers deploy with:
+- dashboard Pages + dashboard API worker deploy with:
+  - var `UK_AQ_CF_ACCOUNT_ID_UKAQ`
+  - secret `UK_AQ_CF_API_TOKEN_UKAQ`
+  - zone/host vars:
+    - `UK_AQ_OPS_ADMIN_ZONE_NAME`
+    - `UK_AQ_OPS_ADMIN_TEST_HOSTNAME`
+    - `UK_AQ_OPS_ADMIN_LIVE_HOSTNAME`
+  - worker/project vars:
+    - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST`
+    - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE`
+    - `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_TEST`
+    - `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_LIVE`
+- other domain workers deploy with:
   - var `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
   - secret `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
 - R2 workers deploy with:
   - var `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`
   - secret `UK_AQ_R2_CLOUDFLARE_API_TOKEN`
 - set worker-name vars to keep test/live side-by-side in one account:
-  - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
   - `UK_AQ_CACHE_WORKER_NAME`
   - `UK_AQ_DB_R2_METRICS_API_WORKER_NAME`
   - `UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME`
@@ -327,6 +338,8 @@ Apply in Supabase SQL editor:
 - `/.github/workflows/uk_aq_aqilevels_retention_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_db_size_logger_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml`
+- `/.github/workflows/uk_aq_ops_dashboard_pages_deploy.yml`
+- `/.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`
 - `/.github/workflows/uk_aq_timeseries_aqi_hourly_cloud_run_deploy.yml`
 - `/.github/workflows/uk_aq_r2_history_dropbox_backup.yml`
 - `/.github/workflows/uk_aq_cache_proxy_deploy.yml`

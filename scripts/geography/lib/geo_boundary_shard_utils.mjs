@@ -48,8 +48,8 @@ export function formatGridToken(gridSize) {
   return Number(gridSize).toFixed(precision);
 }
 
-export function buildTileKey(latMin, lonMin, precision) {
-  return `${formatCoordToken(latMin, precision)}_${formatCoordToken(lonMin, precision)}`;
+export function buildTileKey(ix, iy) {
+  return `iy${iy}_ix${ix}`;
 }
 
 function buildTileIndexRange(minValue, maxValue, gridSize) {
@@ -72,12 +72,16 @@ function buildTileIndexRange(minValue, maxValue, gridSize) {
 
 export function tileForPoint(lat, lon, gridSize) {
   const precision = gridPrecision(gridSize);
-  const latMin = roundCoord(Math.floor(lat / gridSize) * gridSize, precision);
-  const lonMin = roundCoord(Math.floor(lon / gridSize) * gridSize, precision);
+  const iy = Math.floor(lat / gridSize);
+  const ix = Math.floor(lon / gridSize);
+  const latMin = roundCoord(iy * gridSize, precision);
+  const lonMin = roundCoord(ix * gridSize, precision);
   const latMax = roundCoord(latMin + gridSize, precision);
   const lonMax = roundCoord(lonMin + gridSize, precision);
   return {
-    key: buildTileKey(latMin, lonMin, precision),
+    key: buildTileKey(ix, iy),
+    ix,
+    iy,
     lat_min: latMin,
     lat_max: latMax,
     lon_min: lonMin,
@@ -115,7 +119,9 @@ export function tilesForBbox(bbox, gridSize) {
       const lonMin = roundCoord(lonIdx * gridSize, precision);
       const lonMax = roundCoord(lonMin + gridSize, precision);
       tiles.push({
-        key: buildTileKey(latMin, lonMin, precision),
+        key: buildTileKey(lonIdx, latIdx),
+        ix: lonIdx,
+        iy: latIdx,
         lat_min: latMin,
         lat_max: latMax,
         lon_min: lonMin,
@@ -125,13 +131,104 @@ export function tilesForBbox(bbox, gridSize) {
   }
 
   tiles.sort((left, right) => {
-    if (left.lat_min !== right.lat_min) {
-      return left.lat_min - right.lat_min;
+    if (left.iy !== right.iy) {
+      return left.iy - right.iy;
     }
-    return left.lon_min - right.lon_min;
+    return left.ix - right.ix;
   });
 
   return tiles;
+}
+
+function bboxFromRingCoordinates(rings) {
+  if (!Array.isArray(rings)) {
+    return null;
+  }
+  let minLon = Number.POSITIVE_INFINITY;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+
+  for (const ring of rings) {
+    if (!Array.isArray(ring)) {
+      continue;
+    }
+    for (const point of ring) {
+      if (!Array.isArray(point) || point.length < 2) {
+        continue;
+      }
+      const lon = Number(point[0]);
+      const lat = Number(point[1]);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+        continue;
+      }
+      minLon = Math.min(minLon, lon);
+      minLat = Math.min(minLat, lat);
+      maxLon = Math.max(maxLon, lon);
+      maxLat = Math.max(maxLat, lat);
+    }
+  }
+
+  if (!Number.isFinite(minLon) || !Number.isFinite(minLat) || !Number.isFinite(maxLon) || !Number.isFinite(maxLat)) {
+    return null;
+  }
+
+  return [
+    roundCoord(minLon, 6),
+    roundCoord(minLat, 6),
+    roundCoord(maxLon, 6),
+    roundCoord(maxLat, 6),
+  ];
+}
+
+export function extractPolygonBboxes(geometry) {
+  if (!geometry || typeof geometry !== "object") {
+    return [];
+  }
+  const geometryType = String(geometry.type || "");
+  const coordinates = geometry.coordinates;
+
+  if (geometryType === "Polygon") {
+    const bbox = bboxFromRingCoordinates(coordinates);
+    return bbox ? [bbox] : [];
+  }
+
+  if (geometryType === "MultiPolygon" && Array.isArray(coordinates)) {
+    const bboxes = [];
+    for (const polygonRings of coordinates) {
+      const bbox = bboxFromRingCoordinates(polygonRings);
+      if (bbox) {
+        bboxes.push(bbox);
+      }
+    }
+    return bboxes;
+  }
+
+  return [];
+}
+
+export function tilesForGeometry(geometry, gridSize) {
+  const polygonBboxes = extractPolygonBboxes(geometry);
+  if (polygonBboxes.length === 0) {
+    return [];
+  }
+
+  const byKey = new Map();
+  for (const polygonBbox of polygonBboxes) {
+    const tiles = tilesForBbox(polygonBbox, gridSize);
+    for (const tile of tiles) {
+      if (!byKey.has(tile.key)) {
+        byKey.set(tile.key, tile);
+      }
+    }
+  }
+
+  return Array.from(byKey.values()).sort((left, right) => {
+    if (left.iy !== right.iy) {
+      return left.iy - right.iy;
+    }
+    return left.ix - right.ix;
+  });
 }
 
 export function bboxesOverlap(leftBbox, rightBbox) {

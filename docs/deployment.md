@@ -22,7 +22,7 @@ Or run both with wrappers:
 ./dev_dashboards_stop.sh
 ```
 
-## GitHub Pages deployment
+## Cloudflare Pages deployment
 
 Workflow:
 
@@ -31,8 +31,18 @@ Workflow:
 What it does:
 
 1. Generates `dashboard/assets/config.js` from GitHub variables.
-2. Uploads `dashboard/` as the GitHub Pages artifact.
-3. Deploys to GitHub Pages.
+2. Assembles `_pages/` with `dashboard/` and `station_snapshot/`.
+3. Deploys static assets to Cloudflare Pages.
+
+Default project vars:
+
+- test: `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_TEST` (default `uk-aq-ops-dashboard-test`)
+- live: `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_LIVE` (default `uk-aq-ops-dashboard-live`)
+
+Deploy credentials:
+
+- var: `UK_AQ_CF_ACCOUNT_ID_UKAQ`
+- secret: `UK_AQ_CF_API_TOKEN_UKAQ`
 
 ## Worker deployment
 
@@ -43,9 +53,18 @@ Workflow:
 What it does:
 
 1. Installs and type-checks `api/worker`.
-2. Deploys Worker code with Wrangler.
-3. Pushes worker secrets for upstream URL/token.
-4. Deploys Worker again with updated secret state.
+2. Builds an environment-specific Wrangler config with hostname + zone substitution.
+3. Deploys Worker code with Wrangler.
+4. Pushes worker secrets for upstream URL/token.
+5. Deploys Worker again with updated secret state.
+
+Default route vars:
+
+- zone: `UK_AQ_OPS_ADMIN_ZONE_NAME` (default `ukaq.co.uk`)
+- test host: `UK_AQ_OPS_ADMIN_TEST_HOSTNAME` (default `cic-test-uk-aq-admin.ukaq.co.uk`)
+- live host: `UK_AQ_OPS_ADMIN_LIVE_HOSTNAME` (default `uk-aq-admin.ukaq.co.uk`)
+- test worker name: `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST` (default `uk-aq-ops-dashboard-api-test`)
+- live worker name: `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE` (default `uk-aq-ops-dashboard-api-live`)
 
 ## Dashboard backend Cloud Run deployment
 
@@ -76,19 +95,18 @@ R2 metrics auth inputs for backend:
 After deploy:
 
 1. Copy the service URL from workflow logs.
-2. Set/update repo variable `DASHBOARD_UPSTREAM_BASE_URL` to that URL.
-3. Re-run `.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`.
+2. Set/update repo variable `DASHBOARD_UPSTREAM_BASE_URL_TEST` and/or `DASHBOARD_UPSTREAM_BASE_URL_LIVE`.
+3. Optional: set `DASHBOARD_UPSTREAM_BEARER_TOKEN_TEST` and/or `DASHBOARD_UPSTREAM_BEARER_TOKEN_LIVE`.
+4. Re-run `.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`.
 
-## Cloudflare account split (Option A)
+## Cloudflare account model
 
-Use two account credential sets in GitHub:
+Dashboard workflows (Pages + API worker) use:
 
-- Domain workers (route-bound on `*.chronicillnesschannel.co.uk`):
-  - var: `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
-  - secret: `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
-- R2 workers (workers with `[[r2_buckets]]` bindings):
-  - var: `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`
-  - secret: `UK_AQ_R2_CLOUDFLARE_API_TOKEN`
+- var: `UK_AQ_CF_ACCOUNT_ID_UKAQ`
+- secret: `UK_AQ_CF_API_TOKEN_UKAQ`
+
+Other workers in this repo still use their existing credential families (`UK_AQ_DOMAIN_CLOUDFLARE_*`, `UK_AQ_R2_CLOUDFLARE_*`, etc.) unless migrated separately.
 
 Domain-class workflows:
 
@@ -101,20 +119,12 @@ R2-class workflows:
 - `.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml`
 - `.github/workflows/uk_aq_aqi_history_r2_api_worker_deploy.yml`
 
-Optional worker-name vars (recommended for test/live side-by-side in one account):
-
-- `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
-- `UK_AQ_CACHE_WORKER_NAME`
-- `UK_AQ_DB_R2_METRICS_API_WORKER_NAME`
-- `UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME`
-- `UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME`
-
 ## Cloudflare routing notes for /api/*
 
 Configure Cloudflare route so that:
 
-- `https://<admin-subdomain>/api/*` -> worker name from `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
-  (default: `uk-aq-ops-dashboard-api`)
+- `https://cic-test-uk-aq-admin.ukaq.co.uk/api/*` -> test worker
+- `https://uk-aq-admin.ukaq.co.uk/api/*` -> live worker
 
 Keep dashboard pages and assets served from the root path (`/`).
 
@@ -149,11 +159,10 @@ End-to-end smoke test:
 
 ## Manual setup required outside repo
 
-- Cloudflare route binding for `/api/*`.
+- Cloudflare Pages custom domain bindings for the test/live projects.
 - Cloudflare Zero Trust policy assignment for admin subdomain.
-- Worker secret values (`DASHBOARD_UPSTREAM_BASE_URL`, optional bearer token).
-- Cloud Run dashboard backend deploy (workflow above) before setting `DASHBOARD_UPSTREAM_BASE_URL`.
+- Worker secret values (`DASHBOARD_UPSTREAM_BASE_URL_TEST`/`_LIVE`, optional bearer token variants).
+- Cloud Run dashboard backend deploy (workflow above) before setting dashboard upstream URLs.
 - GitHub vars/secrets for Worker deploy credentials:
-  - `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID` / `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
-  - `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` / `UK_AQ_R2_CLOUDFLARE_API_TOKEN`
+  - `UK_AQ_CF_ACCOUNT_ID_UKAQ` / `UK_AQ_CF_API_TOKEN_UKAQ`
 - GitHub repo variables for dashboard config generation.

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import { createHash } from "node:crypto";
 
 import {
   bboxesOverlap,
@@ -9,6 +11,7 @@ import {
   normalizeFeatureRecord,
   normalizePrefix,
   parseGridSize,
+  tilesForGeometry,
   tilesForBbox,
 } from "./lib/geo_boundary_shard_utils.mjs";
 
@@ -23,7 +26,10 @@ const DEFAULTS = {
       || process.env.UK_AQ_GEO_LA_GEOJSON
       || "",
   ).trim(),
-  output_dir: String(process.env.UK_AQ_GEO_SHARD_OUTPUT_DIR || "tmp/geo_lookup_v1").trim(),
+  output_dir: String(
+    process.env.UK_AQ_GEO_SHARD_OUTPUT_DIR
+      || path.join(os.homedir(), "tmp", "geo_lookup_v1"),
+  ).trim(),
   prefix: normalizePrefix(process.env.UK_AQ_GEO_R2_PREFIX || "v1"),
   grid_size_degrees: parseGridSize(process.env.UK_AQ_GEO_GRID_SIZE_DEGREES || "0.05", 0.05),
   boundary_detail: String(process.env.UK_AQ_GEO_BOUNDARY_DETAIL || "detailed").trim() || "detailed",
@@ -88,7 +94,7 @@ function usage() {
       "  --la-geojson <path>",
       "",
       "Options:",
-      "  --output-dir <path>           Output directory (default: tmp/geo_lookup_v1)",
+      "  --output-dir <path>           Output directory (default: ~/tmp/geo_lookup_v1)",
       "  --prefix <value>              R2 object key prefix in manifest (default: v1)",
       "  --grid-size <number>          Grid size in degrees (default: 0.05)",
       "  --boundary-detail <value>     Boundary detail label (default: detailed)",
@@ -271,9 +277,21 @@ function valueOrFallback(value, fallback) {
   return normalized || fallback;
 }
 
+async function sha256FileHex(filePath) {
+  const hash = createHash("sha256");
+  const stream = fs.createReadStream(filePath);
+  await new Promise((resolve, reject) => {
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", resolve);
+  });
+  return hash.digest("hex");
+}
+
 async function loadGeoJsonFile(filePath) {
   const absolutePath = path.resolve(filePath);
-  const rawText = await fs.promises.readFile(absolutePath, "utf8");
+  const rawBuffer = await fs.promises.readFile(absolutePath);
+  const rawText = rawBuffer.toString("utf8");
   let parsed;
   try {
     parsed = JSON.parse(rawText);
@@ -293,7 +311,71 @@ async function loadGeoJsonFile(filePath) {
 
   return {
     absolutePath,
+    fileName: path.basename(absolutePath),
+    fileBytes: rawBuffer.byteLength,
     featureCollection: parsed,
+  };
+}
+
+function bboxCoverageFromFeatures(features) {
+  if (!Array.isArray(features) || features.length === 0) {
+    return null;
+  }
+  let minLon = Number.POSITIVE_INFINITY;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+
+  for (const feature of features) {
+    const bbox = feature?.bbox;
+    if (!Array.isArray(bbox) || bbox.length !== 4) {
+      continue;
+    }
+    const [leftMinLon, leftMinLat, leftMaxLon, leftMaxLat] = bbox.map((value) => Number(value));
+    if (!Number.isFinite(leftMinLon) || !Number.isFinite(leftMinLat) || !Number.isFinite(leftMaxLon) || !Number.isFinite(leftMaxLat)) {
+      continue;
+    }
+    minLon = Math.min(minLon, leftMinLon);
+    minLat = Math.min(minLat, leftMinLat);
+    maxLon = Math.max(maxLon, leftMaxLon);
+    maxLat = Math.max(maxLat, leftMaxLat);
+  }
+
+  if (!Number.isFinite(minLon) || !Number.isFinite(minLat) || !Number.isFinite(maxLon) || !Number.isFinite(maxLat)) {
+    return null;
+  }
+
+  return {
+    min_lon: Number(minLon.toFixed(6)),
+    min_lat: Number(minLat.toFixed(6)),
+    max_lon: Number(maxLon.toFixed(6)),
+    max_lat: Number(maxLat.toFixed(6)),
+  };
+}
+
+function mergeCoverageBboxes(values) {
+  const normalized = values.filter((value) => value && typeof value === "object");
+  if (normalized.length === 0) {
+    return null;
+  }
+  let minLon = Number.POSITIVE_INFINITY;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+  for (const value of normalized) {
+    minLon = Math.min(minLon, Number(value.min_lon));
+    minLat = Math.min(minLat, Number(value.min_lat));
+    maxLon = Math.max(maxLon, Number(value.max_lon));
+    maxLat = Math.max(maxLat, Number(value.max_lat));
+  }
+  if (!Number.isFinite(minLon) || !Number.isFinite(minLat) || !Number.isFinite(maxLon) || !Number.isFinite(maxLat)) {
+    return null;
+  }
+  return {
+    min_lon: Number(minLon.toFixed(6)),
+    min_lat: Number(minLat.toFixed(6)),
+    max_lon: Number(maxLon.toFixed(6)),
+    max_lat: Number(maxLat.toFixed(6)),
   };
 }
 
@@ -346,8 +428,10 @@ function buildAdjacency(features) {
   return outputFeatures;
 }
 
-async function writeJsonFile(filePath, payload) {
-  const jsonText = `${JSON.stringify(payload, null, 2)}\n`;
+async function writeJsonFile(filePath, payload, { minified = false } = {}) {
+  const jsonText = minified
+    ? `${JSON.stringify(payload)}\n`
+    : `${JSON.stringify(payload, null, 2)}\n`;
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
   await fs.promises.writeFile(filePath, jsonText, "utf8");
   return Buffer.byteLength(jsonText, "utf8");
@@ -403,6 +487,8 @@ async function buildLayerArtifacts({
   outputDir,
   prefix,
   source,
+  sourceFileSha256,
+  sourceFileBytes,
   codeCandidates,
   nameCandidates,
   skipAdjacency,
@@ -430,8 +516,9 @@ async function buildLayerArtifacts({
     }
 
     validFeatures.push(prepared);
-    const tiles = tilesForBbox(prepared.bbox, gridSize);
-    for (const tile of tiles) {
+    const tiles = tilesForGeometry(prepared.geometry, gridSize);
+    const effectiveTiles = tiles.length > 0 ? tiles : tilesForBbox(prepared.bbox, gridSize);
+    for (const tile of effectiveTiles) {
       if (!tileMap.has(tile.key)) {
         tileMap.set(tile.key, {
           tile,
@@ -443,10 +530,15 @@ async function buildLayerArtifacts({
   }
 
   const objectEntries = [];
-  const sortedTileKeys = Array.from(tileMap.keys()).sort((left, right) => left.localeCompare(right));
+  const sortedTiles = Array.from(tileMap.values()).sort((left, right) => {
+    if (left.tile.iy !== right.tile.iy) {
+      return left.tile.iy - right.tile.iy;
+    }
+    return left.tile.ix - right.tile.ix;
+  });
 
-  for (const tileKey of sortedTileKeys) {
-    const bucket = tileMap.get(tileKey);
+  for (const bucket of sortedTiles) {
+    const tileKey = bucket.tile.key;
     const layerPath = path.join(layer, boundaryDetail, `grid_${gridToken}`);
     const relativePath = path.join(layerPath, `${tileKey}.json`).replace(/\\/g, "/");
     const outputPath = path.join(outputDir, relativePath);
@@ -458,6 +550,9 @@ async function buildLayerArtifacts({
       boundary_detail: boundaryDetail,
       grid_size_degrees: gridSize,
       tile: {
+        ix: bucket.tile.ix,
+        iy: bucket.tile.iy,
+        key: bucket.tile.key,
         lat_min: bucket.tile.lat_min,
         lat_max: bucket.tile.lat_max,
         lon_min: bucket.tile.lon_min,
@@ -474,7 +569,7 @@ async function buildLayerArtifacts({
         })),
     };
 
-    const bytes = await writeJsonFile(outputPath, shardPayload);
+    const bytes = await writeJsonFile(outputPath, shardPayload, { minified: true });
     objectEntries.push({
       layer,
       kind: "grid_shard",
@@ -496,7 +591,7 @@ async function buildLayerArtifacts({
     };
     const relativePath = path.join("adjacency", `${layer}_${boundaryVersion}.json`).replace(/\\/g, "/");
     const outputPath = path.join(outputDir, relativePath);
-    const bytes = await writeJsonFile(outputPath, adjacency);
+    const bytes = await writeJsonFile(outputPath, adjacency, { minified: true });
 
     objectEntries.push({
       layer,
@@ -513,14 +608,18 @@ async function buildLayerArtifacts({
     layer,
     source,
     input_path: loaded.absolutePath,
+    source_file_name: loaded.fileName,
+    source_file_bytes: sourceFileBytes,
+    source_file_sha256: sourceFileSha256,
     code_property: codeKey,
     name_property: nameKey,
     boundary_version: boundaryVersion,
     feature_count: validFeatures.length,
     raw_feature_count: features.length,
-    shard_count: sortedTileKeys.length,
+    shard_count: sortedTiles.length,
     skipped_invalid_count: skippedInvalid,
     skipped_unsupported_geometry_count: skippedUnsupportedGeometry,
+    bbox_coverage: bboxCoverageFromFeatures(validFeatures),
     object_entries: objectEntries,
     adjacency_enabled: !skipAdjacency,
     adjacency_method: skipAdjacency ? null : "bbox_overlap_approx",
@@ -537,6 +636,7 @@ async function main() {
   const loadedFiles = await Promise.all(
     layerConfigs.map(async (layerConfig) => ({
       ...layerConfig,
+      source_file_sha256: await sha256FileHex(path.resolve(layerConfig.input_path)),
       loaded: await loadGeoJsonFile(layerConfig.input_path),
     })),
   );
@@ -553,6 +653,8 @@ async function main() {
       outputDir,
       prefix: args.prefix,
       source: layerConfig.source,
+      sourceFileSha256: layerConfig.source_file_sha256,
+      sourceFileBytes: layerConfig.loaded.fileBytes,
       codeCandidates: layerConfig.code_candidates,
       nameCandidates: layerConfig.name_candidates,
       skipAdjacency: args.skip_adjacency,
@@ -571,6 +673,9 @@ async function main() {
       boundary_version: result.boundary_version,
       source: result.source,
       input_path: result.input_path,
+      source_file_name: result.source_file_name,
+      source_file_bytes: result.source_file_bytes,
+      source_file_sha256: result.source_file_sha256,
       code_property: result.code_property,
       name_property: result.name_property,
       raw_feature_count: result.raw_feature_count,
@@ -578,6 +683,7 @@ async function main() {
       shard_count: result.shard_count,
       skipped_invalid_count: result.skipped_invalid_count,
       skipped_unsupported_geometry_count: result.skipped_unsupported_geometry_count,
+      bbox_coverage: result.bbox_coverage,
       adjacency_enabled: result.adjacency_enabled,
       adjacency_method: result.adjacency_method,
     };
@@ -601,6 +707,7 @@ async function main() {
     boundary_detail: args.boundary_detail,
     grid_size_degrees: args.grid_size_degrees,
     grid_token: gridToken,
+    bbox_coverage: mergeCoverageBboxes(layerResults.map((result) => result.bbox_coverage)),
     layers: layersManifest,
     shard_count: totalShardCount,
     feature_count: totalFeatureCount,

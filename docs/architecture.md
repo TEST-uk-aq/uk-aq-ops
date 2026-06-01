@@ -6,7 +6,7 @@ This implementation keeps the existing UK AQ local dashboard UI and behaviour, a
 
 Main components:
 
-- `dashboard/` static single-page front end (GitHub Pages)
+- `dashboard/` static single-page front end (Cloudflare Pages)
 - `api/worker/` Cloudflare Worker API/proxy (`/api/*`)
 - `local/dashboard/server/uk_aq_dashboard_api.py` migrated backend API (source-compatible with existing local dashboard contract)
   - hosted target: Cloud Run service deployed by `.github/workflows/uk_aq_dashboard_backend_cloud_run_deploy.yml`
@@ -17,15 +17,15 @@ Main components:
 
 Test target URL:
 
-- `https://cic-test-uk-aq-admin.chronicillnesschannel.co.uk/`
+- `https://cic-test-uk-aq-admin.ukaq.co.uk/`
 
 Live target URL:
 
-- `https://uk-aq-admin.chronicillnesschannel.co.uk/`
+- `https://uk-aq-admin.ukaq.co.uk/`
 
 Expected request routing:
 
-1. Browser requests `/` and static assets from GitHub Pages.
+1. Browser requests `/` and static assets from Cloudflare Pages.
 2. Browser requests `/api/*` on the same subdomain.
 3. Cloudflare routes `/api/*` to the Worker.
 4. Worker proxies compatibility routes to the migrated dashboard backend API.

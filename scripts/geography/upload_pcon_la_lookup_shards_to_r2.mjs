@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 
 import {
   hasRequiredR2Config,
@@ -8,7 +9,10 @@ import {
   r2PutObject,
 } from "../../workers/shared/r2_sigv4.mjs";
 
-const DEFAULT_INPUT_DIR = String(process.env.UK_AQ_GEO_SHARD_OUTPUT_DIR || "tmp/geo_lookup_v1").trim();
+const DEFAULT_INPUT_DIR = String(
+  process.env.UK_AQ_GEO_SHARD_OUTPUT_DIR
+    || path.join(os.homedir(), "tmp", "geo_lookup_v1"),
+).trim();
 const DEFAULT_PREFIX = normalizePrefix(process.env.UK_AQ_GEO_R2_PREFIX || "v1");
 
 function usage() {
@@ -18,7 +22,7 @@ function usage() {
       "  node scripts/geography/upload_pcon_la_lookup_shards_to_r2.mjs [options]",
       "",
       "Options:",
-      "  --input-dir <path>            Directory containing manifest.json and shard files",
+      "  --input-dir <path>            Directory containing manifest.json and shard files (default: ~/tmp/geo_lookup_v1)",
       "  --prefix <value>              R2 key prefix (default: v1)",
       "  --bucket <value>              Override bucket",
       "  --endpoint <value>            Override endpoint",
