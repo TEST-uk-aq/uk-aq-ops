@@ -34,10 +34,9 @@ What it does:
 2. Assembles `_pages/` with `dashboard/` and `station_snapshot/`.
 3. Deploys static assets to Cloudflare Pages.
 
-Default project vars:
+Default project var:
 
-- test: `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_TEST` (default `uk-aq-ops-dashboard-test`)
-- live: `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_LIVE` (default `uk-aq-ops-dashboard-live`)
+- `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT` (test repo default: `uk-aq-ops-dashboard-test`; live repo default: `uk-aq-ops-dashboard-live`)
 
 Deploy credentials:
 
@@ -61,22 +60,19 @@ What it does:
 Default route vars:
 
 - zone: `UK_AQ_OPS_ADMIN_ZONE_NAME` (default `ukaq.co.uk`)
-- test host: `UK_AQ_OPS_ADMIN_TEST_HOSTNAME` (default `cic-test-uk-aq-admin.ukaq.co.uk`)
-- live host: `UK_AQ_OPS_ADMIN_LIVE_HOSTNAME` (default `uk-aq-admin.ukaq.co.uk`)
-- test worker name: `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST` (default `uk-aq-ops-dashboard-api-test`)
-- live worker name: `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE` (default `uk-aq-ops-dashboard-api-live`)
+- host: `UK_AQ_OPS_ADMIN_HOSTNAME` (test repo default: `cic-test-uk-aq-admin.ukaq.co.uk`; live repo default: `uk-aq-admin.ukaq.co.uk`)
+- worker name: `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME` (test repo default: `uk-aq-ops-dashboard-api-test`; live repo default: `uk-aq-ops-dashboard-api-live`)
 
 ## Dashboard worker mode
 
 The dashboard API worker can run in two modes:
 
 - direct mode (default online path): worker reads data directly using worker secrets
-- upstream mode (optional): worker proxies to `DASHBOARD_UPSTREAM_BASE_URL*`
+- upstream mode (optional): worker proxies to `DASHBOARD_UPSTREAM_BASE_URL`
 
 If you use upstream mode, set:
 
-- `DASHBOARD_UPSTREAM_BASE_URL_TEST`
-- `DASHBOARD_UPSTREAM_BASE_URL_LIVE`
+- `DASHBOARD_UPSTREAM_BASE_URL`
 
 Important upstream safety:
 
@@ -150,7 +146,7 @@ End-to-end smoke test:
 
 - Cloudflare Pages custom domain bindings for the test/live projects.
 - Cloudflare Zero Trust policy assignment for admin subdomain.
-- Worker secret values (`DASHBOARD_UPSTREAM_BASE_URL_TEST`/`_LIVE`, optional bearer token variants).
+- Worker secret values (`DASHBOARD_UPSTREAM_BASE_URL`, optional `DASHBOARD_UPSTREAM_BEARER_TOKEN`) if using upstream mode.
 - GitHub vars/secrets for Worker deploy credentials:
   - `UK_AQ_CF_ACCOUNT_ID_UKAQ` / `UK_AQ_CF_API_TOKEN_UKAQ`
 - GitHub repo variables for dashboard config generation.

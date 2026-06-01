@@ -35,13 +35,10 @@ Cloudflare deploy model (Option A):
   - secret `UK_AQ_CF_API_TOKEN_UKAQ`
   - zone/host vars:
     - `UK_AQ_OPS_ADMIN_ZONE_NAME`
-    - `UK_AQ_OPS_ADMIN_TEST_HOSTNAME`
-    - `UK_AQ_OPS_ADMIN_LIVE_HOSTNAME`
+    - `UK_AQ_OPS_ADMIN_HOSTNAME`
   - worker/project vars:
-    - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST`
-    - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE`
-    - `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_TEST`
-    - `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_LIVE`
+    - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
+    - `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT`
 - other domain workers deploy with:
   - var `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
   - secret `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
@@ -252,6 +249,9 @@ Primary controls:
   - `/api/connectors`
   - `/api/dispatcher_settings`
 - hosted dashboard API worker target is configured by:
+  - `UK_AQ_OPS_ADMIN_HOSTNAME`
+  - `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
+- optional upstream proxy mode can be enabled with:
   - `DASHBOARD_UPSTREAM_BASE_URL`
 - legacy dashboard Cloud Run workflow is retired and archived at:
   - `archive/2026-04-21_dashboard-backend-cloud-run-retired/uk_aq_dashboard_backend_cloud_run_deploy.yml`

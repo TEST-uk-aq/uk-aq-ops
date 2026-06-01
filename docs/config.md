@@ -17,12 +17,6 @@ Browser-safe variables:
 - `UKAQ_DASHBOARD_TITLE`
 - `UKAQ_DASHBOARD_SUBTITLE`
 - `UKAQ_DEFAULT_REFRESH_SECONDS`
-- optional test/live overrides used by deploy workflow:
-  - `UKAQ_ENV_NAME_TEST`, `UKAQ_ENV_NAME_LIVE`
-  - `UKAQ_API_BASE_URL_TEST`, `UKAQ_API_BASE_URL_LIVE`
-  - `UKAQ_DASHBOARD_TITLE_TEST`, `UKAQ_DASHBOARD_TITLE_LIVE`
-  - `UKAQ_DASHBOARD_SUBTITLE_TEST`, `UKAQ_DASHBOARD_SUBTITLE_LIVE`
-  - `UKAQ_DEFAULT_REFRESH_SECONDS_TEST`, `UKAQ_DEFAULT_REFRESH_SECONDS_LIVE`
 
 These values are safe to expose in shipped client assets.
 
@@ -30,11 +24,8 @@ These values are safe to expose in shipped client assets.
 
 Worker runtime:
 
-- `DASHBOARD_UPSTREAM_BASE_URL` (required)
+- `DASHBOARD_UPSTREAM_BASE_URL` (optional; only for upstream proxy mode)
 - `DASHBOARD_UPSTREAM_BEARER_TOKEN` (optional)
-- optional test/live overrides used by deploy workflow:
-  - `DASHBOARD_UPSTREAM_BASE_URL_TEST`, `DASHBOARD_UPSTREAM_BASE_URL_LIVE`
-  - `DASHBOARD_UPSTREAM_BEARER_TOKEN_TEST`, `DASHBOARD_UPSTREAM_BEARER_TOKEN_LIVE`
 
 Store worker secrets in Cloudflare Worker secrets.
 
@@ -70,12 +61,9 @@ Dashboard Pages + dashboard API worker workflows use:
 Dashboard routing/project vars:
 
 - `UK_AQ_OPS_ADMIN_ZONE_NAME`
-- `UK_AQ_OPS_ADMIN_TEST_HOSTNAME`
-- `UK_AQ_OPS_ADMIN_LIVE_HOSTNAME`
-- `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_TEST`
-- `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME_LIVE`
-- `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_TEST`
-- `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_LIVE`
+- `UK_AQ_OPS_ADMIN_HOSTNAME`
+- `UK_AQ_OPS_DASHBOARD_API_WORKER_NAME`
+- `UK_AQ_OPS_DASHBOARD_PAGES_PROJECT`
 
 Other repo workers still use their existing credential families (`UK_AQ_DOMAIN_CLOUDFLARE_*`, `UK_AQ_R2_CLOUDFLARE_*`, etc.).
 
@@ -103,12 +91,7 @@ Local:
 - Typical `apiBaseUrl` is `/api`.
 - Run local backend with `local/scripts/run_dashboard_local.sh`.
 
-Test:
+Test/Live:
 
-- Generate config in GitHub Actions using test vars/overrides.
-- Point test worker to `DASHBOARD_UPSTREAM_BASE_URL_TEST` (or fallback base var).
-
-Live:
-
-- Generate config in GitHub Actions using live vars/overrides.
-- Point live worker to `DASHBOARD_UPSTREAM_BASE_URL_LIVE` (or fallback base var).
+- Generate config in each repo using that repo's `UKAQ_*` values.
+- Keep `DASHBOARD_UPSTREAM_BASE_URL` empty for direct online mode unless you explicitly want upstream proxy mode.

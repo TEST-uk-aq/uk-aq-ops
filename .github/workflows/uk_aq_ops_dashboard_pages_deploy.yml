@@ -1,4 +1,4 @@
-name: Deploy UK AQ Ops Dashboards to Cloudflare Pages
+name: Deploy UK AQ Ops Dashboard to Cloudflare Pages
 
 on:
   push:
@@ -10,33 +10,22 @@ on:
       - "scripts/dashboard/**"
       - ".github/workflows/uk_aq_ops_dashboard_pages_deploy.yml"
   workflow_dispatch:
-    inputs:
-      target_env:
-        description: "Deploy target"
-        required: true
-        default: both
-        type: choice
-        options:
-          - both
-          - test
-          - live
 
 permissions:
   contents: read
 
 jobs:
-  deploy-test:
-    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target_env == 'both' || inputs.target_env == 'test')) || (github.event_name != 'workflow_dispatch' && (vars.UK_AQ_DEPLOY_ENV == '' || vars.UK_AQ_DEPLOY_ENV == 'test' || vars.UK_AQ_DEPLOY_ENV == 'cic-test')) }}
+  deploy:
     runs-on: ubuntu-latest
     env:
       UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
-      UK_AQ_OPS_DASHBOARD_PAGES_PROJECT: ${{ vars.UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_TEST || 'uk-aq-ops-dashboard-test' }}
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME_TEST || vars.UKAQ_ENV_NAME || 'test' }}
-      UKAQ_API_BASE_URL: ${{ vars.UKAQ_API_BASE_URL_TEST || vars.UKAQ_API_BASE_URL || '/api' }}
-      UKAQ_DASHBOARD_TITLE: ${{ vars.UKAQ_DASHBOARD_TITLE_TEST || vars.UKAQ_DASHBOARD_TITLE || 'UK AQ Dashboard (Test)' }}
-      UKAQ_DASHBOARD_SUBTITLE: ${{ vars.UKAQ_DASHBOARD_SUBTITLE_TEST || vars.UKAQ_DASHBOARD_SUBTITLE || 'Test dashboard on ukaq.co.uk' }}
-      UKAQ_DEFAULT_REFRESH_SECONDS: ${{ vars.UKAQ_DEFAULT_REFRESH_SECONDS_TEST || vars.UKAQ_DEFAULT_REFRESH_SECONDS || '300' }}
+      UK_AQ_OPS_DASHBOARD_PAGES_PROJECT: ${{ vars.UK_AQ_OPS_DASHBOARD_PAGES_PROJECT || 'uk-aq-ops-dashboard-test' }}
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'test' }}
+      UKAQ_API_BASE_URL: ${{ vars.UKAQ_API_BASE_URL || '/api' }}
+      UKAQ_DASHBOARD_TITLE: ${{ vars.UKAQ_DASHBOARD_TITLE || 'UK AQ Dashboard (Test)' }}
+      UKAQ_DASHBOARD_SUBTITLE: ${{ vars.UKAQ_DASHBOARD_SUBTITLE || 'Test dashboard on ukaq.co.uk' }}
+      UKAQ_DEFAULT_REFRESH_SECONDS: ${{ vars.UKAQ_DEFAULT_REFRESH_SECONDS || '300' }}
       UKAQ_CONFIG_OUT_PATH: dashboard/assets/config.js
     steps:
       - name: Checkout
@@ -59,7 +48,7 @@ jobs:
             exit 1
           fi
           if [ -z "${UK_AQ_OPS_DASHBOARD_PAGES_PROJECT}" ]; then
-            echo "Missing variable UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_TEST."
+            echo "Missing variable UK_AQ_OPS_DASHBOARD_PAGES_PROJECT."
             exit 1
           fi
 
@@ -76,65 +65,7 @@ jobs:
           cp -R dashboard/. _pages/
           cp -R station_snapshot/. _pages/station_snapshot/
 
-      - name: Deploy to Cloudflare Pages (test)
-        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
-        with:
-          apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
-          accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-          command: pages deploy _pages --project-name ${{ env.UK_AQ_OPS_DASHBOARD_PAGES_PROJECT }} --branch main
-
-  deploy-live:
-    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target_env == 'both' || inputs.target_env == 'live')) || (github.event_name != 'workflow_dispatch' && (vars.UK_AQ_DEPLOY_ENV == 'live' || vars.UK_AQ_DEPLOY_ENV == 'prod' || vars.UK_AQ_DEPLOY_ENV == 'production')) }}
-    runs-on: ubuntu-latest
-    env:
-      UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
-      UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
-      UK_AQ_OPS_DASHBOARD_PAGES_PROJECT: ${{ vars.UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_LIVE || 'uk-aq-ops-dashboard-live' }}
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME_LIVE || vars.UKAQ_ENV_NAME || 'live' }}
-      UKAQ_API_BASE_URL: ${{ vars.UKAQ_API_BASE_URL_LIVE || vars.UKAQ_API_BASE_URL || '/api' }}
-      UKAQ_DASHBOARD_TITLE: ${{ vars.UKAQ_DASHBOARD_TITLE_LIVE || vars.UKAQ_DASHBOARD_TITLE || 'UK AQ Dashboard' }}
-      UKAQ_DASHBOARD_SUBTITLE: ${{ vars.UKAQ_DASHBOARD_SUBTITLE_LIVE || vars.UKAQ_DASHBOARD_SUBTITLE || 'Live dashboard on ukaq.co.uk' }}
-      UKAQ_DEFAULT_REFRESH_SECONDS: ${{ vars.UKAQ_DEFAULT_REFRESH_SECONDS_LIVE || vars.UKAQ_DEFAULT_REFRESH_SECONDS || '300' }}
-      UKAQ_CONFIG_OUT_PATH: dashboard/assets/config.js
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Validate Cloudflare settings
-        run: |
-          set -euo pipefail
-          if [ -z "${UK_AQ_CF_API_TOKEN_UKAQ}" ]; then
-            echo "Missing secret UK_AQ_CF_API_TOKEN_UKAQ (or fallback UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN)."
-            exit 1
-          fi
-          if [ -z "${UK_AQ_CF_ACCOUNT_ID_UKAQ}" ]; then
-            echo "Missing variable UK_AQ_CF_ACCOUNT_ID_UKAQ (or fallback UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID)."
-            exit 1
-          fi
-          if [ -z "${UK_AQ_OPS_DASHBOARD_PAGES_PROJECT}" ]; then
-            echo "Missing variable UK_AQ_OPS_DASHBOARD_PAGES_PROJECT_LIVE."
-            exit 1
-          fi
-
-      - name: Generate browser-safe dashboard config
-        run: |
-          set -euo pipefail
-          node scripts/dashboard/generate_dashboard_config.mjs
-
-      - name: Assemble Pages artifact
-        run: |
-          set -euo pipefail
-          rm -rf _pages
-          mkdir -p _pages/station_snapshot
-          cp -R dashboard/. _pages/
-          cp -R station_snapshot/. _pages/station_snapshot/
-
-      - name: Deploy to Cloudflare Pages (live)
+      - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
           apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
