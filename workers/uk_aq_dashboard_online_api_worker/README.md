@@ -92,6 +92,13 @@ Optional direct-mode data sources:
 - `UK_AQ_R2_CLOUDFLARE_API_TOKEN` or `CFLARE_API_READ_TOKEN`
 - Dropbox optional fields (`DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN`) for `/api/operations_dropbox_mtime`
 
+R2 history API fallback behavior:
+
+- If `UK_AQ_R2_HISTORY_DAYS_API_URL` is unset, the worker derives it from `UK_AQ_DB_SIZE_API_URL` origin as `/v1/r2-history-days`.
+- If `UK_AQ_R2_HISTORY_COUNTS_API_URL` is unset, the worker derives it from `UK_AQ_R2_HISTORY_DAYS_API_URL` (or `UK_AQ_DB_SIZE_API_URL`) origin as `/v1/r2-history-counts`.
+- `UK_AQ_R2_HISTORY_DAYS_API_TOKEN` falls back to `UK_AQ_DB_SIZE_API_TOKEN`.
+- `UK_AQ_R2_HISTORY_COUNTS_API_TOKEN` falls back to `UK_AQ_R2_HISTORY_DAYS_API_TOKEN`, then `UK_AQ_DB_SIZE_API_TOKEN`.
+
 Optional upstream proxy mode:
 
 - `DASHBOARD_UPSTREAM_BASE_URL`

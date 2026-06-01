@@ -287,6 +287,72 @@ function buildUrl(base: string, path: string, params?: Record<string, string | u
   return url.toString();
 }
 
+function resolveUrlOrigin(urlValue: string): string {
+  try {
+    const parsed = new URL(urlValue);
+    if (!parsed.protocol || !parsed.host) {
+      return "";
+    }
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch (_err) {
+    return "";
+  }
+}
+
+function resolveR2HistoryDaysApiUrl(env: WorkerEnv): string {
+  const explicit = String(env.UK_AQ_R2_HISTORY_DAYS_API_URL || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const dbSizeApi = String(env.UK_AQ_DB_SIZE_API_URL || "").trim();
+  if (!dbSizeApi) {
+    return "";
+  }
+  const origin = resolveUrlOrigin(dbSizeApi);
+  if (!origin) {
+    return "";
+  }
+  return `${origin}/v1/r2-history-days`;
+}
+
+function resolveR2HistoryCountsApiUrl(env: WorkerEnv): string {
+  const explicit = String(env.UK_AQ_R2_HISTORY_COUNTS_API_URL || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  const daysApi = String(env.UK_AQ_R2_HISTORY_DAYS_API_URL || "").trim();
+  if (daysApi) {
+    const origin = resolveUrlOrigin(daysApi);
+    if (origin) {
+      return `${origin}/v1/r2-history-counts`;
+    }
+  }
+
+  const dbSizeApi = String(env.UK_AQ_DB_SIZE_API_URL || "").trim();
+  if (!dbSizeApi) {
+    return "";
+  }
+  const origin = resolveUrlOrigin(dbSizeApi);
+  if (!origin) {
+    return "";
+  }
+  return `${origin}/v1/r2-history-counts`;
+}
+
+function resolveR2HistoryDaysApiToken(env: WorkerEnv): string {
+  return String(env.UK_AQ_R2_HISTORY_DAYS_API_TOKEN || env.UK_AQ_DB_SIZE_API_TOKEN || "").trim();
+}
+
+function resolveR2HistoryCountsApiToken(env: WorkerEnv): string {
+  return String(
+    env.UK_AQ_R2_HISTORY_COUNTS_API_TOKEN ||
+      env.UK_AQ_R2_HISTORY_DAYS_API_TOKEN ||
+      env.UK_AQ_DB_SIZE_API_TOKEN ||
+      "",
+  ).trim();
+}
+
 async function fetchAllRows(
   restBase: string,
   tableOrView: string,
@@ -417,7 +483,7 @@ async function fetchR2HistoryDays(
     }
   }
 
-  const apiUrl = String(env.UK_AQ_R2_HISTORY_DAYS_API_URL || "").trim();
+  const apiUrl = resolveR2HistoryDaysApiUrl(env);
   if (!apiUrl) {
     const fallback = {
       daySets: null,
@@ -431,7 +497,7 @@ async function fetchR2HistoryDays(
 
   const headers = new Headers();
   headers.set("Accept", "application/json");
-  const token = String(env.UK_AQ_R2_HISTORY_DAYS_API_TOKEN || "").trim();
+  const token = resolveR2HistoryDaysApiToken(env);
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
@@ -1499,13 +1565,13 @@ export async function getDirectR2ConnectorCountsPayload(
   env: WorkerEnv,
   search: URLSearchParams,
 ): Promise<JsonObject> {
-  const apiUrl = String(env.UK_AQ_R2_HISTORY_COUNTS_API_URL || "").trim();
+  const apiUrl = resolveR2HistoryCountsApiUrl(env);
   if (!apiUrl) {
     throw new Error("R2 history-counts API not configured.");
   }
   const headers = new Headers();
   headers.set("Accept", "application/json");
-  const token = String(env.UK_AQ_R2_HISTORY_COUNTS_API_TOKEN || "").trim();
+  const token = resolveR2HistoryCountsApiToken(env);
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
