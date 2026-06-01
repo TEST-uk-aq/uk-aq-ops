@@ -997,7 +997,6 @@ function buildStorageCoverageRows(
 
   const today = new Date();
   const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-  const yesterdayUtc = addUtcDays(todayUtc, -1);
   const defaultStart = addUtcDays(todayUtc, -90);
   const minStart = dateCandidates.length
     ? new Date(Math.min(...dateCandidates.map((item) => item.getTime())))
@@ -1008,7 +1007,7 @@ function buildStorageCoverageRows(
   const obsStart = parseIsoDay(obsOldest);
   const aqiStart = parseIsoDay(aqiOldest);
   const rows: unknown[] = [];
-  for (let cursor = new Date(start.getTime()); cursor.getTime() <= yesterdayUtc.getTime(); cursor = addUtcDays(cursor, 1)) {
+  for (let cursor = new Date(start.getTime()); cursor.getTime() <= todayUtc.getTime(); cursor = addUtcDays(cursor, 1)) {
     const day = toIsoDay(cursor);
     const r2Observs = Boolean(r2Days?.observations.has(day));
     rows.push({
@@ -1020,7 +1019,7 @@ function buildStorageCoverageRows(
       r2_aqilevels: Boolean(r2Days?.aqilevels.has(day)),
       dropbox_observs: dropboxDays.observations.has(day),
       dropbox_aqilevels: dropboxDays.aqilevels.has(day),
-      isToday: false,
+      isToday: cursor.getTime() === todayUtc.getTime(),
     });
   }
   return rows;
