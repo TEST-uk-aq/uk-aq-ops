@@ -287,6 +287,18 @@ function buildUrl(base: string, path: string, params?: Record<string, string | u
   return url.toString();
 }
 
+function appendQueryParams(urlValue: string, params?: Record<string, string | undefined>): string {
+  const url = new URL(urlValue);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === "string" && value.length > 0) {
+        url.searchParams.set(key, value);
+      }
+    }
+  }
+  return url.toString();
+}
+
 function resolveUrlOrigin(urlValue: string): string {
   try {
     const parsed = new URL(urlValue);
@@ -504,7 +516,7 @@ async function fetchR2HistoryDays(
   const maxDays = Math.max(1, Math.min(3660, Math.trunc(readNumber(env.UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS, 3660))));
   try {
     const payload = await fetchJsonObject(
-      buildUrl(apiUrl, "", { max_days: String(maxDays) }),
+      appendQueryParams(apiUrl, { max_days: String(maxDays) }),
       { method: "GET", headers },
       "R2 history-days API",
     );
@@ -1582,7 +1594,7 @@ export async function getDirectR2ConnectorCountsPayload(
       params[key] = value;
     }
   }
-  return fetchJsonObject(buildUrl(apiUrl, "", params), { method: "GET", headers }, "R2 history-counts API");
+  return fetchJsonObject(appendQueryParams(apiUrl, params), { method: "GET", headers }, "R2 history-counts API");
 }
 
 export async function getDirectDailyTaskRunsPayload(
