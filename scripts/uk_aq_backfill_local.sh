@@ -26,6 +26,7 @@ Optional env vars:
   UK_AQ_BACKFILL_TIMESERIES_IDS             optional CSV timeseries filter
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
   UK_AQ_BACKFILL_OUTPUT_SCOPE               default|observations_only|aqilevels_only (default: default)
+  UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX   default: true (set false to skip the final full R2 history index rebuild)
   UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_ENV_NAME/uk-aq-backfill-local-logs
   UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true
   UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS       default: 0
@@ -355,6 +356,7 @@ RUN_INTERVAL_SECONDS_RAW="$(trim "${UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS:-${UK_AQ
 MAX_RUNS_PER_MINUTE_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE:-0}")"
 MAX_RUNS_PER_HOUR_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR:-0}")"
 OUTPUT_SCOPE_RAW="$(trim "${UK_AQ_BACKFILL_OUTPUT_SCOPE:-default}")"
+REBUILD_R2_HISTORY_INDEX_RAW="$(trim "${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX:-true}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
@@ -404,6 +406,11 @@ MAX_RUNS_PER_HOUR="${MAX_RUNS_PER_HOUR_RAW}"
 
 if ! OUTPUT_SCOPE="$(normalize_output_scope "${OUTPUT_SCOPE_RAW}")"; then
   echo "Invalid UK_AQ_BACKFILL_OUTPUT_SCOPE: ${OUTPUT_SCOPE_RAW}" >&2
+  exit 2
+fi
+
+if ! REBUILD_R2_HISTORY_INDEX="$(parse_bool "${REBUILD_R2_HISTORY_INDEX_RAW}")"; then
+  echo "Invalid UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX: ${REBUILD_R2_HISTORY_INDEX_RAW}" >&2
   exit 2
 fi
 
@@ -484,6 +491,7 @@ while IFS=' ' read -r month_from month_to; do
   echo "Connector filter: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
   echo "Force replace: ${FORCE_REPLACE}"
   echo "Output scope: ${OUTPUT_SCOPE}"
+  echo "Full R2 history index rebuild after success: ${REBUILD_R2_HISTORY_INDEX}"
   echo "Runner: ${RUN_JOB_PATH}"
   echo "Deno bin: ${DENO_BIN}"
   echo "Node bin: ${NODE_BIN}"
@@ -527,6 +535,11 @@ if [[ "${#failures[@]}" -gt 0 ]]; then
 fi
 
 if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MODE}" == "obs_aqi_to_r2" || "${RUN_MODE}" == "r2_history_obs_to_aqilevels" ) ]]; then
+  if [[ "${REBUILD_R2_HISTORY_INDEX}" != "true" ]]; then
+    echo "Skipping final full R2 history index rebuild (UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX=${REBUILD_R2_HISTORY_INDEX})."
+    echo "All windows completed successfully."
+    exit 0
+  fi
   index_log_file="${LOG_DIR}/r2_history_index_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
   index_rebuild_max_attempts=3
   index_rebuild_retry_sleep_seconds=5

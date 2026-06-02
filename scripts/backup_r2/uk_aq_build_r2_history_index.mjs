@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import fs from "node:fs";
-import { rebuildR2HistoryIndexes } from "../../workers/shared/uk_aq_r2_history_index.mjs";
+import {
+  rebuildR2HistoryIndexes,
+  updateR2HistoryIndexesTargeted,
+} from "../../workers/shared/uk_aq_r2_history_index.mjs";
 
 function usage() {
   console.log([
@@ -9,12 +12,18 @@ function usage() {
     "",
     "Options:",
     "  --domain observations|aqilevels|both   Domain filter (default: both)",
+    "  --kind observations|aqilevels|both     Alias for --domain (used by targeted mode)",
     "  --fetch-concurrency <n>                 Override manifest fetch concurrency",
     "  --max-keys <n>                          Override R2 list page size",
     "  --compute-missing-timeseries-counts     For days whose connector manifest lacks",
     "                                          timeseries_row_counts, read each parquet,",
     "                                          compute per-timeseries counts, patch the",
     "                                          manifest (new manifest_hash), and re-upload.",
+    "  --targeted                              Run a narrow latest-index update for a known",
+    "                                          day range instead of a full history rebuild.",
+    "  --from-day YYYY-MM-DD                   Required with --targeted.",
+    "  --to-day YYYY-MM-DD                     Required with --targeted.",
+    "  --connector-id <n>                      Optional connector filter for --targeted.",
     "  --target <YYYY-MM-DD:connector_id>      Target one observations day+connector pair.",
     "                                          Repeat flag to target multiple pairs.",
     "  --targets-csv <path>                    CSV of targets with day_utc + connector_id",
@@ -55,6 +64,10 @@ function parseArgs(argv) {
     fetchConcurrency: undefined,
     maxKeys: undefined,
     computeMissingTimeseriesCounts: false,
+    targeted: false,
+    fromDayUtc: undefined,
+    toDayUtc: undefined,
+    connectorId: undefined,
     observationsTargets: [],
   };
 
@@ -63,14 +76,38 @@ function parseArgs(argv) {
     if (arg === "--domain") {
       const value = String(argv[i + 1] || "").trim().toLowerCase();
       i += 1;
-      if (value === "both" || !value) {
-        args.domains = ["observations", "aqilevels"];
-        continue;
+      applyDomainArg(args, value, "--domain");
+      continue;
+    }
+    if (arg === "--kind") {
+      const value = String(argv[i + 1] || "").trim().toLowerCase();
+      i += 1;
+      applyDomainArg(args, value, "--kind");
+      continue;
+    }
+    if (arg === "--targeted") {
+      args.targeted = true;
+      continue;
+    }
+    if (arg === "--from-day") {
+      args.fromDayUtc = parseIsoDay(argv[i + 1]);
+      if (!args.fromDayUtc) {
+        throw new Error("--from-day requires a valid YYYY-MM-DD value");
       }
-      if (value !== "observations" && value !== "aqilevels") {
-        throw new Error("--domain must be observations, aqilevels, or both");
+      i += 1;
+      continue;
+    }
+    if (arg === "--to-day") {
+      args.toDayUtc = parseIsoDay(argv[i + 1]);
+      if (!args.toDayUtc) {
+        throw new Error("--to-day requires a valid YYYY-MM-DD value");
       }
-      args.domains = [value];
+      i += 1;
+      continue;
+    }
+    if (arg === "--connector-id") {
+      args.connectorId = parseConnectorId(argv[i + 1], "--connector-id");
+      i += 1;
       continue;
     }
     if (arg === "--fetch-concurrency") {
@@ -85,6 +122,28 @@ function parseArgs(argv) {
     }
     if (arg === "--compute-missing-timeseries-counts") {
       args.computeMissingTimeseriesCounts = true;
+      continue;
+    }
+    if (arg.startsWith("--kind=")) {
+      applyDomainArg(args, String(arg.slice("--kind=".length) || "").trim().toLowerCase(), "--kind");
+      continue;
+    }
+    if (arg.startsWith("--from-day=")) {
+      args.fromDayUtc = parseIsoDay(arg.slice("--from-day=".length));
+      if (!args.fromDayUtc) {
+        throw new Error("--from-day requires a valid YYYY-MM-DD value");
+      }
+      continue;
+    }
+    if (arg.startsWith("--to-day=")) {
+      args.toDayUtc = parseIsoDay(arg.slice("--to-day=".length));
+      if (!args.toDayUtc) {
+        throw new Error("--to-day requires a valid YYYY-MM-DD value");
+      }
+      continue;
+    }
+    if (arg.startsWith("--connector-id=")) {
+      args.connectorId = parseConnectorId(arg.slice("--connector-id=".length), "--connector-id");
       continue;
     }
     if (arg === "--target") {
@@ -112,6 +171,20 @@ function parseArgs(argv) {
     throw new Error(`Unknown arg: ${arg}`);
   }
 
+  if (args.targeted) {
+    if (!args.fromDayUtc || !args.toDayUtc) {
+      throw new Error("--targeted requires --from-day and --to-day");
+    }
+    if (args.toDayUtc < args.fromDayUtc) {
+      throw new Error("--to-day must be >= --from-day");
+    }
+    if (args.observationsTargets.length > 0) {
+      throw new Error("--target/--targets-csv may not be used with --targeted");
+    }
+  } else if (args.fromDayUtc || args.toDayUtc || args.connectorId) {
+    throw new Error("--from-day/--to-day/--connector-id require --targeted");
+  }
+
   if (args.observationsTargets.length > 0) {
     if (!args.domains.includes("observations")) {
       throw new Error("--target/--targets-csv may only be used when observations domain is selected");
@@ -129,6 +202,17 @@ function parseArgs(argv) {
   }
 
   return args;
+}
+
+function applyDomainArg(args, value, flagName) {
+  if (value === "both" || !value) {
+    args.domains = ["observations", "aqilevels"];
+    return;
+  }
+  if (value !== "observations" && value !== "aqilevels") {
+    throw new Error(`${flagName} must be observations, aqilevels, or both`);
+  }
+  args.domains = [value];
 }
 
 function parseIsoDay(value) {
@@ -220,14 +304,24 @@ function loadTargetsFromCsv(csvPath) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const summary = await rebuildR2HistoryIndexes({
-    env: process.env,
-    domains: args.domains,
-    fetchConcurrency: args.fetchConcurrency,
-    maxKeys: args.maxKeys,
-    computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
-    observationsTargets: args.observationsTargets.length ? args.observationsTargets : null,
-  });
+  const summary = args.targeted
+    ? await updateR2HistoryIndexesTargeted({
+        env: process.env,
+        domains: args.domains,
+        fromDayUtc: args.fromDayUtc,
+        toDayUtc: args.toDayUtc,
+        connectorId: args.connectorId,
+        fetchConcurrency: args.fetchConcurrency,
+        computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
+      })
+    : await rebuildR2HistoryIndexes({
+        env: process.env,
+        domains: args.domains,
+        fetchConcurrency: args.fetchConcurrency,
+        maxKeys: args.maxKeys,
+        computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
+        observationsTargets: args.observationsTargets.length ? args.observationsTargets : null,
+      });
   process.stdout.write(`${JSON.stringify({ ok: true, ...summary }, null, 2)}\n`);
 }
 

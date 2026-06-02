@@ -1013,6 +1013,202 @@ export function buildDomainIndexPayload({
   };
 }
 
+function enumerateIsoDaysInclusive(fromDayUtc, toDayUtc) {
+  const startDay = parseIsoDay(fromDayUtc);
+  const endDay = parseIsoDay(toDayUtc);
+  if (!startDay || !endDay) {
+    throw new Error("Targeted R2 history index update requires valid from/to day values");
+  }
+  if (endDay < startDay) {
+    throw new Error("Targeted R2 history index update requires to_day_utc >= from_day_utc");
+  }
+
+  const out = [];
+  const startMs = Date.parse(`${startDay}T00:00:00.000Z`);
+  const endMs = Date.parse(`${endDay}T00:00:00.000Z`);
+  for (let cursorMs = startMs; cursorMs <= endMs; cursorMs += 24 * 60 * 60 * 1000) {
+    out.push(new Date(cursorMs).toISOString().slice(0, 10));
+  }
+  return out;
+}
+
+function normalizeTimeseriesLatestDaySummary(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+  const dayUtc = parseIsoDay(entry.day_utc);
+  if (!dayUtc) {
+    return null;
+  }
+  const connectorIds = Array.from(new Set(
+    (Array.isArray(entry.connector_ids) ? entry.connector_ids : [])
+      .map((value) => parsePositiveId(value))
+      .filter(Boolean),
+  )).sort((a, b) => a - b);
+  const connectorCount = parseNonNegativeInt(entry.connector_count);
+  return {
+    day_utc: dayUtc,
+    connector_count: connectorIds.length || connectorCount || 0,
+    connector_ids: connectorIds,
+    file_count: parseNonNegativeInt(entry.file_count) || 0,
+    indexed_file_count: parseNonNegativeInt(entry.indexed_file_count) || 0,
+    backed_up_at_utc: toIsoOrNull(entry.backed_up_at_utc),
+  };
+}
+
+function buildTimeseriesLatestDaySummary({
+  dayUtc,
+  connectorPayloads,
+  dayBackedUpAtUtc = null,
+}) {
+  const sortedConnectorPayloads = Array.from(Array.isArray(connectorPayloads) ? connectorPayloads : [])
+    .filter((entry) => entry && typeof entry === "object")
+    .sort((a, b) => (parsePositiveId(a.connector_id) || 0) - (parsePositiveId(b.connector_id) || 0));
+  const connectorIds = sortedConnectorPayloads
+    .map((entry) => parsePositiveId(entry.connector_id))
+    .filter(Boolean);
+  return {
+    day_utc: dayUtc,
+    connector_count: connectorIds.length,
+    connector_ids: connectorIds,
+    file_count: sortedConnectorPayloads.reduce(
+      (sum, entry) => sum + (parseNonNegativeInt(entry.file_count) || 0),
+      0,
+    ),
+    indexed_file_count: sortedConnectorPayloads.reduce(
+      (sum, entry) => sum + (parseNonNegativeInt(entry.indexed_file_count) || 0),
+      0,
+    ),
+    backed_up_at_utc:
+      toIsoOrNull(dayBackedUpAtUtc)
+      || pickMaxIsoTimestamp(sortedConnectorPayloads.map((entry) => entry.backed_up_at_utc)),
+  };
+}
+
+function buildObservationsTimeseriesLatestPayload({
+  bucket,
+  generatedAt,
+  existingGeneratedAt = null,
+  indexPrefix = DEFAULT_R2_HISTORY_INDEX_PREFIX,
+  observationsPrefix,
+  observationsTimeseriesIndexPrefix = DEFAULT_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
+  daySummaries,
+}) {
+  const sortedSummaries = Array.from(Array.isArray(daySummaries) ? daySummaries : [])
+    .map((entry) => normalizeTimeseriesLatestDaySummary(entry))
+    .filter(Boolean)
+    .sort((a, b) => a.day_utc.localeCompare(b.day_utc));
+  const days = sortedSummaries.map((entry) => entry.day_utc);
+  const connectorIndexCount = sortedSummaries.reduce(
+    (sum, entry) => sum + (parseNonNegativeInt(entry.connector_count) || 0),
+    0,
+  );
+  const fileCount = sortedSummaries.reduce(
+    (sum, entry) => sum + (parseNonNegativeInt(entry.file_count) || 0),
+    0,
+  );
+  const indexedFileCount = sortedSummaries.reduce(
+    (sum, entry) => sum + (parseNonNegativeInt(entry.indexed_file_count) || 0),
+    0,
+  );
+
+  return {
+    schema_version: OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION,
+    generated_at:
+      pickMaxIsoTimestamp([
+        ...sortedSummaries.map((entry) => entry.backed_up_at_utc),
+        existingGeneratedAt,
+      ])
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
+    source: "r2_connector_manifests",
+    domain: "observations",
+    index_kind: "timeseries_file_ranges",
+    bucket: String(bucket || "").trim() || null,
+    observations_prefix: normalizePrefix(observationsPrefix || ""),
+    index_prefix: normalizePrefix(
+      observationsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
+    ),
+    min_day_utc: days.length ? days[0] : null,
+    max_day_utc: days.length ? days[days.length - 1] : null,
+    day_count: days.length,
+    connector_index_count: connectorIndexCount,
+    file_count: fileCount,
+    indexed_file_count: indexedFileCount,
+    days,
+    key_layout: {
+      connector_index_manifest_key_template:
+        `${normalizePrefix(
+          observationsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
+        )}/day_utc={day_utc}/connector_id={connector_id}/manifest.json`,
+      latest_key: buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix),
+    },
+    day_summaries: sortedSummaries,
+  };
+}
+
+function buildAqilevelsTimeseriesLatestPayload({
+  bucket,
+  generatedAt,
+  existingGeneratedAt = null,
+  indexPrefix = DEFAULT_R2_HISTORY_INDEX_PREFIX,
+  aqilevelsPrefix,
+  aqilevelsTimeseriesIndexPrefix = DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX,
+  daySummaries,
+}) {
+  const sortedSummaries = Array.from(Array.isArray(daySummaries) ? daySummaries : [])
+    .map((entry) => normalizeTimeseriesLatestDaySummary(entry))
+    .filter(Boolean)
+    .sort((a, b) => a.day_utc.localeCompare(b.day_utc));
+  const days = sortedSummaries.map((entry) => entry.day_utc);
+  const connectorIndexCount = sortedSummaries.reduce(
+    (sum, entry) => sum + (parseNonNegativeInt(entry.connector_count) || 0),
+    0,
+  );
+  const fileCount = sortedSummaries.reduce(
+    (sum, entry) => sum + (parseNonNegativeInt(entry.file_count) || 0),
+    0,
+  );
+  const indexedFileCount = sortedSummaries.reduce(
+    (sum, entry) => sum + (parseNonNegativeInt(entry.indexed_file_count) || 0),
+    0,
+  );
+
+  return {
+    schema_version: AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION,
+    generated_at:
+      pickMaxIsoTimestamp([
+        ...sortedSummaries.map((entry) => entry.backed_up_at_utc),
+        existingGeneratedAt,
+      ])
+      || toIsoOrNull(generatedAt)
+      || new Date().toISOString(),
+    source: "r2_connector_manifests",
+    domain: "aqilevels",
+    index_kind: "timeseries_file_ranges",
+    bucket: String(bucket || "").trim() || null,
+    aqilevels_prefix: normalizePrefix(aqilevelsPrefix || ""),
+    index_prefix: normalizePrefix(
+      aqilevelsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX,
+    ),
+    min_day_utc: days.length ? days[0] : null,
+    max_day_utc: days.length ? days[days.length - 1] : null,
+    day_count: days.length,
+    connector_index_count: connectorIndexCount,
+    file_count: fileCount,
+    indexed_file_count: indexedFileCount,
+    days,
+    key_layout: {
+      connector_index_manifest_key_template:
+        `${normalizePrefix(
+          aqilevelsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX,
+        )}/day_utc={day_utc}/connector_id={connector_id}/manifest.json`,
+      latest_key: buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix),
+    },
+    day_summaries: sortedSummaries,
+  };
+}
+
 export function normalizeR2HistoryIndexDomain(
   payload,
   { expectedDomain, maxLookbackDays = 0, todayDay } = {},
@@ -1115,6 +1311,21 @@ async function fetchJsonObjectFromR2(r2, key) {
     throw new Error(`R2 object ${key} must be a JSON object`);
   }
   return parsed;
+}
+
+async function fetchJsonObjectFromR2IfExists(r2, key) {
+  try {
+    return {
+      exists: true,
+      payload: await fetchJsonObjectFromR2(r2, key),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("(404)")) {
+      return { exists: false, payload: null };
+    }
+    throw error;
+  }
 }
 
 export async function rebuildR2HistoryIndexForDomain({
@@ -1330,6 +1541,14 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
         day_utc: dayUtc,
         connector_count: connectorResults.length,
         connector_ids: connectorResults.map((entry) => entry.connector_id),
+        file_count: connectorResults.reduce((sum, entry) => sum + entry.file_count, 0),
+        indexed_file_count: connectorResults.reduce(
+          (sum, entry) => sum + entry.indexed_file_count,
+          0,
+        ),
+        backed_up_at_utc:
+          toIsoOrNull(dayManifestObject?.backed_up_at_utc)
+          || pickMaxIsoTimestamp(connectorResults.map((entry) => entry.backed_up_at_utc)),
         connector_indexes: connectorResults,
       };
     },
@@ -1366,42 +1585,21 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
     0,
   );
 
-  const latestPayload = {
-    schema_version: OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    // Data-driven: see buildDomainIndexPayload note. Derived from the latest
-    // backed_up_at_utc across all per-(day, connector) index payloads.
-    generated_at:
-      pickMaxIsoTimestamp(
-        daySummaries.flatMap((entry) =>
-          (entry.connector_indexes || []).map((c) => c.backed_up_at_utc),
-        ),
-      )
-      || toIsoOrNull(generatedAt)
-      || new Date().toISOString(),
-    source: "r2_connector_manifests",
-    domain: "observations",
-    index_kind: "timeseries_file_ranges",
-    bucket: String(bucketName || r2.bucket || "").trim() || null,
-    observations_prefix: normalizedObservationsPrefix,
-    index_prefix: normalizedTimeseriesPrefix,
-    min_day_utc: days.length ? days[0] : null,
-    max_day_utc: days.length ? days[days.length - 1] : null,
-    day_count: days.length,
-    connector_index_count: connectorIndexCount,
-    file_count: fileCount,
-    indexed_file_count: indexedFileCount,
-    days,
-    key_layout: {
-      connector_index_manifest_key_template:
-        `${normalizedTimeseriesPrefix}/day_utc={day_utc}/connector_id={connector_id}/manifest.json`,
-      latest_key: buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix),
-    },
-    day_summaries: daySummaries.map((entry) => ({
+  const latestPayload = buildObservationsTimeseriesLatestPayload({
+    bucket: bucketName || r2.bucket,
+    generatedAt,
+    indexPrefix,
+    observationsPrefix: normalizedObservationsPrefix,
+    observationsTimeseriesIndexPrefix: normalizedTimeseriesPrefix,
+    daySummaries: daySummaries.map((entry) => ({
       day_utc: entry.day_utc,
       connector_count: entry.connector_count,
       connector_ids: entry.connector_ids,
+      file_count: entry.file_count,
+      indexed_file_count: entry.indexed_file_count,
+      backed_up_at_utc: entry.backed_up_at_utc,
     })),
-  };
+  });
 
   const latestKey = buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix);
   const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
@@ -1533,6 +1731,14 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
         day_utc: dayUtc,
         connector_count: connectorResults.length,
         connector_ids: connectorResults.map((entry) => entry.connector_id),
+        file_count: connectorResults.reduce((sum, entry) => sum + entry.file_count, 0),
+        indexed_file_count: connectorResults.reduce(
+          (sum, entry) => sum + entry.indexed_file_count,
+          0,
+        ),
+        backed_up_at_utc:
+          toIsoOrNull(dayManifestObject?.backed_up_at_utc)
+          || pickMaxIsoTimestamp(connectorResults.map((entry) => entry.backed_up_at_utc)),
         connector_indexes: connectorResults,
       };
     },
@@ -1558,41 +1764,21 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
     0,
   );
 
-  const latestPayload = {
-    schema_version: AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION,
-    // Data-driven: see buildDomainIndexPayload note.
-    generated_at:
-      pickMaxIsoTimestamp(
-        daySummaries.flatMap((entry) =>
-          (entry.connector_indexes || []).map((c) => c.backed_up_at_utc),
-        ),
-      )
-      || toIsoOrNull(generatedAt)
-      || new Date().toISOString(),
-    source: "r2_connector_manifests",
-    domain: "aqilevels",
-    index_kind: "timeseries_file_ranges",
-    bucket: String(bucketName || r2.bucket || "").trim() || null,
-    aqilevels_prefix: normalizedAqilevelsPrefix,
-    index_prefix: normalizedTimeseriesPrefix,
-    min_day_utc: days.length ? days[0] : null,
-    max_day_utc: days.length ? days[days.length - 1] : null,
-    day_count: days.length,
-    connector_index_count: connectorIndexCount,
-    file_count: fileCount,
-    indexed_file_count: indexedFileCount,
-    days,
-    key_layout: {
-      connector_index_manifest_key_template:
-        `${normalizedTimeseriesPrefix}/day_utc={day_utc}/connector_id={connector_id}/manifest.json`,
-      latest_key: buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix),
-    },
-    day_summaries: daySummaries.map((entry) => ({
+  const latestPayload = buildAqilevelsTimeseriesLatestPayload({
+    bucket: bucketName || r2.bucket,
+    generatedAt,
+    indexPrefix,
+    aqilevelsPrefix: normalizedAqilevelsPrefix,
+    aqilevelsTimeseriesIndexPrefix: normalizedTimeseriesPrefix,
+    daySummaries: daySummaries.map((entry) => ({
       day_utc: entry.day_utc,
       connector_count: entry.connector_count,
       connector_ids: entry.connector_ids,
+      file_count: entry.file_count,
+      indexed_file_count: entry.indexed_file_count,
+      backed_up_at_utc: entry.backed_up_at_utc,
     })),
-  };
+  });
 
   const latestKey = buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix);
   const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
@@ -1616,6 +1802,522 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
     indexed_file_count: indexedFileCount,
     warning_count: warnings.length,
     warnings,
+  };
+}
+
+async function updateR2HistoryIndexForDomainTargeted({
+  r2,
+  bucketName,
+  domain,
+  domainPrefix,
+  indexPrefix = DEFAULT_R2_HISTORY_INDEX_PREFIX,
+  generatedAt = new Date().toISOString(),
+  fromDayUtc,
+  toDayUtc,
+}) {
+  const normalizedDomain = String(domain || "").trim().toLowerCase();
+  if (!SUPPORTED_DOMAINS.has(normalizedDomain)) {
+    throw new Error(`Unsupported R2 history index domain: ${String(domain || "")}`);
+  }
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing R2 config for targeted R2 history index update");
+  }
+
+  const normalizedPrefix = normalizePrefix(domainPrefix);
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const warnings = [];
+  const indexKey = buildR2HistoryIndexKey(indexPrefix, normalizedDomain);
+  const existingIndex = await fetchJsonObjectFromR2IfExists(r2, indexKey);
+  const existingPayload = existingIndex.exists
+    ? normalizeR2HistoryIndexDomain(existingIndex.payload, { expectedDomain: normalizedDomain })
+    : null;
+  const summaryMap = new Map(
+    Array.from(existingPayload?.day_summaries || []).map((entry) => [entry.day_utc, entry]),
+  );
+
+  for (const dayUtc of dayList) {
+    const manifestKey = `${normalizedPrefix}/day_utc=${dayUtc}/manifest.json`;
+    const manifestResult = await fetchJsonObjectFromR2IfExists(r2, manifestKey);
+    if (!manifestResult.exists) {
+      summaryMap.delete(dayUtc);
+      warnings.push(`Removed missing ${normalizedDomain} day summary for ${dayUtc}`);
+      continue;
+    }
+    const summary = buildDaySummaryFromManifest({
+      domain: normalizedDomain,
+      dayUtc,
+      manifest: manifestResult.payload,
+    });
+    if (!summary) {
+      summaryMap.delete(dayUtc);
+      warnings.push(`Skipped invalid ${normalizedDomain} day manifest for ${dayUtc}`);
+      continue;
+    }
+    summaryMap.set(dayUtc, summary);
+  }
+
+  const payload = buildDomainIndexPayload({
+    domain: normalizedDomain,
+    prefix: normalizedPrefix,
+    bucket: bucketName || r2.bucket,
+    generatedAt,
+    daySummaries: Array.from(summaryMap.values()),
+  });
+  const body = `${JSON.stringify(payload, null, 2)}\n`;
+  const putResult = await r2PutObjectIfChanged({
+    r2,
+    key: indexKey,
+    body,
+    content_type: "application/json; charset=utf-8",
+  });
+
+  return {
+    domain: normalizedDomain,
+    mode: "targeted",
+    from_day_utc: dayList.length ? dayList[0] : null,
+    to_day_utc: dayList.length ? dayList[dayList.length - 1] : null,
+    targeted_day_count: dayList.length,
+    index_key: indexKey,
+    index_bytes: putResult.bytes,
+    index_put_skipped: Boolean(putResult.skipped),
+    indexed_day_count: payload.day_count,
+    total_rows: payload.total_rows,
+    warning_count: warnings.length,
+    warnings,
+  };
+}
+
+async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
+  r2,
+  bucketName,
+  observationsPrefix,
+  indexPrefix = DEFAULT_R2_HISTORY_INDEX_PREFIX,
+  observationsTimeseriesIndexPrefix = DEFAULT_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
+  generatedAt = new Date().toISOString(),
+  fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
+  computeMissingTimeseriesCounts = false,
+  fromDayUtc,
+  toDayUtc,
+  connectorId = null,
+}) {
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing R2 config for targeted observations timeseries index update");
+  }
+
+  const normalizedObservationsPrefix = normalizePrefix(observationsPrefix);
+  const normalizedTimeseriesPrefix = normalizePrefix(observationsTimeseriesIndexPrefix);
+  const normalizedConnectorId = connectorId == null ? null : parsePositiveId(connectorId);
+  if (connectorId != null && !normalizedConnectorId) {
+    throw new Error(`Invalid targeted observations connector_id: ${String(connectorId || "")}`);
+  }
+
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const warnings = [];
+  const latestKey = buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix);
+  const existingLatest = await fetchJsonObjectFromR2IfExists(r2, latestKey);
+  const existingLatestPayload = existingLatest.exists ? existingLatest.payload : null;
+  const daySummaryMap = new Map();
+  for (const entry of Array.isArray(existingLatestPayload?.day_summaries)
+    ? existingLatestPayload.day_summaries
+    : []) {
+    const normalizedEntry = normalizeTimeseriesLatestDaySummary(entry);
+    if (normalizedEntry) {
+      daySummaryMap.set(normalizedEntry.day_utc, normalizedEntry);
+    }
+  }
+
+  let rewrittenConnectorIndexCount = 0;
+  let rewrittenPutSkippedCount = 0;
+  for (const dayUtc of dayList) {
+    const dayManifestKey = `${normalizedObservationsPrefix}/day_utc=${dayUtc}/manifest.json`;
+    const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
+    if (!dayManifestResult.exists) {
+      daySummaryMap.delete(dayUtc);
+      warnings.push(`Removed missing observations timeseries day summary for ${dayUtc}`);
+      continue;
+    }
+    const dayManifestObject = dayManifestResult.payload;
+    const targets = resolveObservationConnectorManifestTargets(
+      dayManifestObject,
+      dayUtc,
+      normalizedObservationsPrefix,
+    );
+    const writeTargets = normalizedConnectorId
+      ? targets.filter((target) => target.connector_id === normalizedConnectorId)
+      : targets;
+    if (normalizedConnectorId && writeTargets.length === 0) {
+      warnings.push(
+        `Target connector not found in observations manifests day=${dayUtc} connector=${normalizedConnectorId}`,
+      );
+    }
+
+    const connectorResults = (await mapWithConcurrency(
+      targets,
+      fetchConcurrency,
+      async (target) => {
+        try {
+          let connectorManifestObject = await fetchJsonObjectFromR2(r2, target.manifest_key);
+          if (computeMissingTimeseriesCounts) {
+            connectorManifestObject = await maybePatchConnectorManifestWithCounts({
+              r2,
+              manifestKey: target.manifest_key,
+              connectorManifest: connectorManifestObject,
+              warningsSink: warnings,
+              dayUtc,
+              connectorId: target.connector_id,
+            });
+          }
+          const payload = buildObservationTimeseriesConnectorIndexPayload({
+            dayUtc,
+            connectorId: target.connector_id,
+            generatedAt,
+            bucket: bucketName || r2.bucket,
+            observationsPrefix: normalizedObservationsPrefix,
+            connectorManifestKey: target.manifest_key,
+            connectorManifest: connectorManifestObject,
+          });
+          const shouldWrite = !normalizedConnectorId || target.connector_id === normalizedConnectorId;
+          let putSkipped = null;
+          if (shouldWrite) {
+            const connectorIndexKey = buildR2HistoryObservationsTimeseriesConnectorIndexKey(
+              normalizedTimeseriesPrefix,
+              dayUtc,
+              target.connector_id,
+            );
+            const body = `${JSON.stringify(payload, null, 2)}\n`;
+            const putResult = await r2PutObjectIfChanged({
+              r2,
+              key: connectorIndexKey,
+              body,
+              content_type: "application/json; charset=utf-8",
+            });
+            putSkipped = Boolean(putResult.skipped);
+          }
+          return {
+            connector_id: target.connector_id,
+            file_count: payload.file_count,
+            indexed_file_count: payload.indexed_file_count,
+            backed_up_at_utc: payload.backed_up_at_utc,
+            wrote_index: shouldWrite,
+            put_skipped: putSkipped,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          warnings.push(
+            `Skipped targeted observations timeseries connector index for day=${dayUtc} connector=${target.connector_id}: ${message}`,
+          );
+          return null;
+        }
+      },
+    ))
+      .filter(Boolean)
+      .sort((a, b) => a.connector_id - b.connector_id);
+
+    rewrittenConnectorIndexCount += connectorResults.filter((entry) => entry.wrote_index).length;
+    rewrittenPutSkippedCount += connectorResults.filter(
+      (entry) => entry.wrote_index && entry.put_skipped,
+    ).length;
+    daySummaryMap.set(dayUtc, buildTimeseriesLatestDaySummary({
+      dayUtc,
+      connectorPayloads: connectorResults,
+      dayBackedUpAtUtc: dayManifestObject?.backed_up_at_utc,
+    }));
+  }
+
+  const latestPayload = buildObservationsTimeseriesLatestPayload({
+    bucket: bucketName || r2.bucket,
+    generatedAt,
+    existingGeneratedAt: existingLatestPayload?.generated_at,
+    indexPrefix,
+    observationsPrefix: normalizedObservationsPrefix,
+    observationsTimeseriesIndexPrefix: normalizedTimeseriesPrefix,
+    daySummaries: Array.from(daySummaryMap.values()),
+  });
+  const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
+  const latestPut = await r2PutObjectIfChanged({
+    r2,
+    key: latestKey,
+    body: latestBody,
+    content_type: "application/json; charset=utf-8",
+  });
+
+  return {
+    domain: "observations",
+    index_kind: "timeseries_file_ranges",
+    mode: "targeted",
+    from_day_utc: dayList.length ? dayList[0] : null,
+    to_day_utc: dayList.length ? dayList[dayList.length - 1] : null,
+    targeted_day_count: dayList.length,
+    targeted_connector_id: normalizedConnectorId,
+    rewritten_connector_index_count: rewrittenConnectorIndexCount,
+    rewritten_put_skipped_count: rewrittenPutSkippedCount,
+    latest_index_key: latestKey,
+    latest_index_bytes: latestPut.bytes,
+    latest_index_put_skipped: Boolean(latestPut.skipped),
+    observations_timeseries_index_prefix: normalizedTimeseriesPrefix,
+    indexed_day_count: latestPayload.day_count,
+    connector_index_count: latestPayload.connector_index_count,
+    file_count: latestPayload.file_count,
+    indexed_file_count: latestPayload.indexed_file_count,
+    warning_count: warnings.length,
+    warnings,
+  };
+}
+
+async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
+  r2,
+  bucketName,
+  aqilevelsPrefix,
+  indexPrefix = DEFAULT_R2_HISTORY_INDEX_PREFIX,
+  aqilevelsTimeseriesIndexPrefix = DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX,
+  generatedAt = new Date().toISOString(),
+  fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
+  fromDayUtc,
+  toDayUtc,
+  connectorId = null,
+}) {
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing R2 config for targeted aqilevels timeseries index update");
+  }
+
+  const normalizedAqilevelsPrefix = normalizePrefix(aqilevelsPrefix);
+  const normalizedTimeseriesPrefix = normalizePrefix(aqilevelsTimeseriesIndexPrefix);
+  const normalizedConnectorId = connectorId == null ? null : parsePositiveId(connectorId);
+  if (connectorId != null && !normalizedConnectorId) {
+    throw new Error(`Invalid targeted aqilevels connector_id: ${String(connectorId || "")}`);
+  }
+
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const warnings = [];
+  const latestKey = buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix);
+  const existingLatest = await fetchJsonObjectFromR2IfExists(r2, latestKey);
+  const existingLatestPayload = existingLatest.exists ? existingLatest.payload : null;
+  const daySummaryMap = new Map();
+  for (const entry of Array.isArray(existingLatestPayload?.day_summaries)
+    ? existingLatestPayload.day_summaries
+    : []) {
+    const normalizedEntry = normalizeTimeseriesLatestDaySummary(entry);
+    if (normalizedEntry) {
+      daySummaryMap.set(normalizedEntry.day_utc, normalizedEntry);
+    }
+  }
+
+  let rewrittenConnectorIndexCount = 0;
+  let rewrittenPutSkippedCount = 0;
+  for (const dayUtc of dayList) {
+    const dayManifestKey = `${normalizedAqilevelsPrefix}/day_utc=${dayUtc}/manifest.json`;
+    const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
+    if (!dayManifestResult.exists) {
+      daySummaryMap.delete(dayUtc);
+      warnings.push(`Removed missing aqilevels timeseries day summary for ${dayUtc}`);
+      continue;
+    }
+    const dayManifestObject = dayManifestResult.payload;
+    const targets = resolveAqilevelsConnectorManifestTargets(
+      dayManifestObject,
+      dayUtc,
+      normalizedAqilevelsPrefix,
+    );
+    const writeTargets = normalizedConnectorId
+      ? targets.filter((target) => target.connector_id === normalizedConnectorId)
+      : targets;
+    if (normalizedConnectorId && writeTargets.length === 0) {
+      warnings.push(
+        `Target connector not found in aqilevels manifests day=${dayUtc} connector=${normalizedConnectorId}`,
+      );
+    }
+
+    const connectorResults = (await mapWithConcurrency(
+      targets,
+      fetchConcurrency,
+      async (target) => {
+        try {
+          const connectorManifestObject = await fetchJsonObjectFromR2(r2, target.manifest_key);
+          const payload = buildAqilevelTimeseriesConnectorIndexPayload({
+            dayUtc,
+            connectorId: target.connector_id,
+            generatedAt,
+            bucket: bucketName || r2.bucket,
+            aqilevelsPrefix: normalizedAqilevelsPrefix,
+            connectorManifestKey: target.manifest_key,
+            connectorManifest: connectorManifestObject,
+          });
+          const shouldWrite = !normalizedConnectorId || target.connector_id === normalizedConnectorId;
+          let putSkipped = null;
+          if (shouldWrite) {
+            const connectorIndexKey = buildR2HistoryAqilevelsTimeseriesConnectorIndexKey(
+              normalizedTimeseriesPrefix,
+              dayUtc,
+              target.connector_id,
+            );
+            const body = `${JSON.stringify(payload, null, 2)}\n`;
+            const putResult = await r2PutObjectIfChanged({
+              r2,
+              key: connectorIndexKey,
+              body,
+              content_type: "application/json; charset=utf-8",
+            });
+            putSkipped = Boolean(putResult.skipped);
+          }
+          return {
+            connector_id: target.connector_id,
+            file_count: payload.file_count,
+            indexed_file_count: payload.indexed_file_count,
+            backed_up_at_utc: payload.backed_up_at_utc,
+            wrote_index: shouldWrite,
+            put_skipped: putSkipped,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          warnings.push(
+            `Skipped targeted aqilevels timeseries connector index for day=${dayUtc} connector=${target.connector_id}: ${message}`,
+          );
+          return null;
+        }
+      },
+    ))
+      .filter(Boolean)
+      .sort((a, b) => a.connector_id - b.connector_id);
+
+    rewrittenConnectorIndexCount += connectorResults.filter((entry) => entry.wrote_index).length;
+    rewrittenPutSkippedCount += connectorResults.filter(
+      (entry) => entry.wrote_index && entry.put_skipped,
+    ).length;
+    daySummaryMap.set(dayUtc, buildTimeseriesLatestDaySummary({
+      dayUtc,
+      connectorPayloads: connectorResults,
+      dayBackedUpAtUtc: dayManifestObject?.backed_up_at_utc,
+    }));
+  }
+
+  const latestPayload = buildAqilevelsTimeseriesLatestPayload({
+    bucket: bucketName || r2.bucket,
+    generatedAt,
+    existingGeneratedAt: existingLatestPayload?.generated_at,
+    indexPrefix,
+    aqilevelsPrefix: normalizedAqilevelsPrefix,
+    aqilevelsTimeseriesIndexPrefix: normalizedTimeseriesPrefix,
+    daySummaries: Array.from(daySummaryMap.values()),
+  });
+  const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
+  const latestPut = await r2PutObjectIfChanged({
+    r2,
+    key: latestKey,
+    body: latestBody,
+    content_type: "application/json; charset=utf-8",
+  });
+
+  return {
+    domain: "aqilevels",
+    index_kind: "timeseries_file_ranges",
+    mode: "targeted",
+    from_day_utc: dayList.length ? dayList[0] : null,
+    to_day_utc: dayList.length ? dayList[dayList.length - 1] : null,
+    targeted_day_count: dayList.length,
+    targeted_connector_id: normalizedConnectorId,
+    rewritten_connector_index_count: rewrittenConnectorIndexCount,
+    rewritten_put_skipped_count: rewrittenPutSkippedCount,
+    latest_index_key: latestKey,
+    latest_index_bytes: latestPut.bytes,
+    latest_index_put_skipped: Boolean(latestPut.skipped),
+    aqilevels_timeseries_index_prefix: normalizedTimeseriesPrefix,
+    indexed_day_count: latestPayload.day_count,
+    connector_index_count: latestPayload.connector_index_count,
+    file_count: latestPayload.file_count,
+    indexed_file_count: latestPayload.indexed_file_count,
+    warning_count: warnings.length,
+    warnings,
+  };
+}
+
+export async function updateR2HistoryIndexesTargeted({
+  env = defaultEnv(),
+  domains = ["observations"],
+  fromDayUtc,
+  toDayUtc,
+  connectorId = null,
+  generatedAt = new Date().toISOString(),
+  fetchConcurrency,
+  computeMissingTimeseriesCounts = false,
+} = {}) {
+  const config = resolveR2HistoryIndexConfig(env);
+  if (!hasRequiredR2Config(config.r2)) {
+    throw new Error("Missing R2 config for targeted R2 history index update");
+  }
+
+  const normalizedDomains = Array.from(new Set(
+    (Array.isArray(domains) ? domains : []).map((domain) =>
+      String(domain || "").trim().toLowerCase()
+    ),
+  )).filter((domain) => SUPPORTED_DOMAINS.has(domain));
+  if (!normalizedDomains.length) {
+    throw new Error("No supported domains requested for targeted R2 history index update");
+  }
+
+  const results = [];
+  let observationsTimeseries = null;
+  let aqilevelsTimeseries = null;
+  for (const domain of normalizedDomains) {
+    const domainPrefix = domain === "observations"
+      ? config.observations_prefix
+      : config.aqilevels_prefix;
+    results.push(await updateR2HistoryIndexForDomainTargeted({
+      r2: config.r2,
+      bucketName: config.r2.bucket,
+      domain,
+      domainPrefix,
+      indexPrefix: config.index_prefix,
+      generatedAt,
+      fromDayUtc,
+      toDayUtc,
+    }));
+
+    if (domain === "observations") {
+      observationsTimeseries = await updateR2HistoryObservationsTimeseriesIndexesTargeted({
+        r2: config.r2,
+        bucketName: config.r2.bucket,
+        observationsPrefix: config.observations_prefix,
+        indexPrefix: config.index_prefix,
+        observationsTimeseriesIndexPrefix: config.observations_timeseries_index_prefix,
+        generatedAt,
+        fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
+        computeMissingTimeseriesCounts,
+        fromDayUtc,
+        toDayUtc,
+        connectorId,
+      });
+    }
+    if (domain === "aqilevels") {
+      aqilevelsTimeseries = await updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
+        r2: config.r2,
+        bucketName: config.r2.bucket,
+        aqilevelsPrefix: config.aqilevels_prefix,
+        indexPrefix: config.index_prefix,
+        aqilevelsTimeseriesIndexPrefix: config.aqilevels_timeseries_index_prefix,
+        generatedAt,
+        fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
+        fromDayUtc,
+        toDayUtc,
+        connectorId,
+      });
+    }
+  }
+
+  return {
+    mode: "targeted",
+    generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
+    bucket: config.r2.bucket,
+    index_prefix: config.index_prefix,
+    observations_timeseries_index_prefix: config.observations_timeseries_index_prefix,
+    aqilevels_timeseries_index_prefix: config.aqilevels_timeseries_index_prefix,
+    observations_prefix: config.observations_prefix,
+    aqilevels_prefix: config.aqilevels_prefix,
+    from_day_utc: parseIsoDay(fromDayUtc),
+    to_day_utc: parseIsoDay(toDayUtc),
+    connector_id: connectorId == null ? null : parsePositiveId(connectorId),
+    results,
+    observations_timeseries: observationsTimeseries,
+    aqilevels_timeseries: aqilevelsTimeseries,
   };
 }
 

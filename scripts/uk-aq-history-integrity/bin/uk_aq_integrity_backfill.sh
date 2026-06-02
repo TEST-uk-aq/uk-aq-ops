@@ -31,6 +31,8 @@ Notes:
   - Loads <ROOT>/env/<ENV>.env from UK_AQ_HISTORY_INTEGRITY_ROOT or script parent.
   - Sources UK_AQ_BACKFILL_ENV_FILE from the integrity env file.
   - Calls UK_AQ_BACKFILL_WRAPPER with strict integrity defaults.
+  - Disables the wrapper's final full R2 history index rebuild and then runs one
+    targeted index update for the repaired day range after a successful non-dry-run.
 USAGE
 }
 
@@ -199,6 +201,41 @@ if not value:
 else:
     print(str(Path(value).resolve(strict=False)))
 PY
+}
+
+resolve_node_bin() {
+  local override_raw
+  override_raw="$(trim "${UK_AQ_BACKFILL_NODE_BIN:-}")"
+  if [[ -n "${override_raw}" ]]; then
+    if [[ ! -x "${override_raw}" ]]; then
+      echo "Invalid UK_AQ_BACKFILL_NODE_BIN (not executable): ${override_raw}" >&2
+      return 1
+    fi
+    printf '%s' "${override_raw}"
+    return 0
+  fi
+
+  local candidate=""
+  candidate="$(command -v node 2>/dev/null || true)"
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+    printf '%s' "${candidate}"
+    return 0
+  fi
+
+  for candidate in \
+    "/usr/local/bin/node" \
+    "/opt/homebrew/bin/node" \
+    "/usr/bin/node" \
+    "/bin/node"
+  do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "node executable not found. Install node or set UK_AQ_BACKFILL_NODE_BIN to a full executable path." >&2
+  return 1
 }
 
 resolve_integrity_wrapper_var() {
@@ -421,17 +458,26 @@ if [[ ! -f "${BACKFILL_WRAPPER}" ]]; then
   exit 4
 fi
 
+if ! NODE_BIN="$(resolve_node_bin)"; then
+  echo "ERROR: unable to resolve node binary for integrity backfill." >&2
+  exit 4
+fi
+export UK_AQ_BACKFILL_NODE_BIN="${NODE_BIN}"
+
 if (( OBSERVS_ONLY == 1 )); then
   export UK_AQ_BACKFILL_RUN_MODE="source_to_r2"
   export UK_AQ_BACKFILL_OUTPUT_SCOPE="observations_only"
+  TARGET_KIND="observations"
 else
   export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
   export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
+  TARGET_KIND="aqilevels"
 fi
 
 export UK_AQ_BACKFILL_TRIGGER_MODE="manual"
 export UK_AQ_BACKFILL_DRY_RUN="${DRY_RUN}"
 export UK_AQ_BACKFILL_FORCE_REPLACE="true"
+export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX="false"
 export UK_AQ_BACKFILL_FROM_DAY_UTC="${FROM_DAY_UTC}"
 export UK_AQ_BACKFILL_TO_DAY_UTC="${TO_DAY_UTC}"
 
@@ -454,6 +500,7 @@ echo "mode: ${UK_AQ_BACKFILL_RUN_MODE}"
 echo "output_scope: ${UK_AQ_BACKFILL_OUTPUT_SCOPE}"
 echo "dry_run: ${UK_AQ_BACKFILL_DRY_RUN}"
 echo "force_replace: ${UK_AQ_BACKFILL_FORCE_REPLACE}"
+echo "full_r2_history_index_rebuild: ${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX}"
 echo "from_day_utc: ${UK_AQ_BACKFILL_FROM_DAY_UTC}"
 echo "to_day_utc: ${UK_AQ_BACKFILL_TO_DAY_UTC}"
 echo "connector_ids: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
@@ -466,4 +513,45 @@ set +e
 bash "${BACKFILL_WRAPPER}"
 status=$?
 set -e
-exit "${status}"
+if [[ "${status}" -ne 0 ]]; then
+  exit "${status}"
+fi
+
+if [[ "${DRY_RUN}" == "true" ]]; then
+  echo "Skipping targeted R2 history index update because --dry-run was set."
+  exit 0
+fi
+
+BACKFILL_REPO_ROOT="$(cd "$(dirname "${BACKFILL_WRAPPER_PATH}")/.." && pwd)"
+TARGETED_INDEX_CMD=(
+  "${NODE_BIN}"
+  "${BACKFILL_REPO_ROOT}/scripts/backup_r2/uk_aq_build_r2_history_index.mjs"
+  --targeted
+  --kind "${TARGET_KIND}"
+  --from-day "${FROM_DAY_UTC}"
+  --to-day "${TO_DAY_UTC}"
+)
+if [[ -n "${CONNECTOR_ID}" ]]; then
+  TARGETED_INDEX_CMD+=(--connector-id "${CONNECTOR_ID}")
+fi
+
+echo ""
+echo "=== Targeted R2 History Index Update ==="
+echo "kind: ${TARGET_KIND}"
+echo "from_day_utc: ${FROM_DAY_UTC}"
+echo "to_day_utc: ${TO_DAY_UTC}"
+echo "connector_id: ${CONNECTOR_ID:-all}"
+echo "node_bin: ${NODE_BIN}"
+echo "repo_root: ${BACKFILL_REPO_ROOT}"
+
+set +e
+"${TARGETED_INDEX_CMD[@]}"
+targeted_status=$?
+set -e
+
+if [[ "${targeted_status}" -ne 0 ]]; then
+  echo "ERROR: targeted R2 history index update failed." >&2
+  exit "${targeted_status}"
+fi
+
+exit 0
