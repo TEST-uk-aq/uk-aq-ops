@@ -59,6 +59,62 @@ const DROPBOX_MTIME_TTL_MS = 20_000;
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download";
 const DROPBOX_GET_METADATA_URL = "https://api.dropboxapi.com/2/files/get_metadata";
+const R2_BYTES_PER_GB = 1024 ** 3;
+const R2_CLASS_A_ACTION_TYPES = new Set([
+  "ListBuckets",
+  "PutBucket",
+  "ListObjects",
+  "PutObject",
+  "CopyObject",
+  "CompleteMultipartUpload",
+  "CreateMultipartUpload",
+  "LifecycleStorageTierTransition",
+  "ListMultipartUploads",
+  "UploadPart",
+  "UploadPartCopy",
+  "ListParts",
+  "PutBucketEncryption",
+  "PutBucketCors",
+  "PutBucketLifecycleConfiguration",
+]);
+const R2_CLASS_B_ACTION_TYPES = new Set([
+  "HeadBucket",
+  "HeadObject",
+  "GetObject",
+  "UsageSummary",
+  "GetBucketEncryption",
+  "GetBucketLocation",
+  "GetBucketCors",
+  "GetBucketLifecycleConfiguration",
+]);
+const R2_FREE_ACTION_TYPES = new Set([
+  "DeleteObject",
+  "DeleteObjects",
+  "DeleteBucket",
+  "AbortMultipartUpload",
+]);
+const R2_OPS_GQL_QUERY = `
+query R2OpsMonth($accountTag: string!, $startDate: Time!, $endDate: Time!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      r2OperationsAdaptiveGroups(
+        limit: 10000
+        filter: {
+          datetime_geq: $startDate
+          datetime_leq: $endDate
+        }
+      ) {
+        sum {
+          requests
+        }
+        dimensions {
+          actionType
+        }
+      }
+    }
+  }
+}
+`;
 
 type CacheEntry<T> = {
   expiresAt: number;
@@ -297,6 +353,36 @@ function appendQueryParams(urlValue: string, params?: Record<string, string | un
     }
   }
   return url.toString();
+}
+
+function summarizeCloudflareGraphqlErrors(payload: JsonObject): string | null {
+  const rawErrors = payload.errors;
+  if (!Array.isArray(rawErrors) || !rawErrors.length) {
+    return null;
+  }
+  const messages: string[] = [];
+  const seen = new Set<string>();
+  for (const item of rawErrors) {
+    let message = "";
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      message = String((item as JsonObject).message || "").trim();
+      const path = (item as JsonObject).path;
+      if (message && Array.isArray(path) && path.length) {
+        message = `${message} (${path.map((part) => String(part)).join(".")})`;
+      }
+    } else {
+      message = String(item || "").trim();
+    }
+    if (!message || seen.has(message)) {
+      continue;
+    }
+    seen.add(message);
+    messages.push(message);
+    if (messages.length >= 3) {
+      break;
+    }
+  }
+  return messages.length ? messages.join("; ") : null;
 }
 
 function resolveUrlOrigin(urlValue: string): string {
@@ -604,6 +690,114 @@ function extractR2UsagePoint(value: unknown): { used_bytes: number; object_count
   return { used_bytes: bytes, object_count: objects };
 }
 
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(200, value));
+}
+
+async function fetchR2OperationsMetrics(
+  accountId: string,
+  apiToken: string,
+  now: Date,
+): Promise<{ metrics: JsonObject | null; error: string | null }> {
+  const windowEnd = new Date(now.getTime());
+  const windowStart = new Date(Date.UTC(windowEnd.getUTCFullYear(), windowEnd.getUTCMonth(), 1, 0, 0, 0, 0));
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${apiToken}`);
+  headers.set("Content-Type", "application/json");
+
+  let payload: JsonObject;
+  try {
+    payload = await fetchJsonObject(
+      "https://api.cloudflare.com/client/v4/graphql",
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          query: R2_OPS_GQL_QUERY,
+          variables: {
+            accountTag: accountId,
+            startDate: windowStart.toISOString(),
+            endDate: windowEnd.toISOString(),
+          },
+        }),
+      },
+      "Cloudflare R2 ops",
+    );
+  } catch (err) {
+    return { metrics: null, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  const gqlError = summarizeCloudflareGraphqlErrors(payload);
+  if (gqlError) {
+    return { metrics: null, error: `R2 ops GraphQL returned errors: ${gqlError}` };
+  }
+
+  const data = payload.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { metrics: null, error: "R2 ops missing data object" };
+  }
+  const viewer = (data as JsonObject).viewer;
+  if (!viewer || typeof viewer !== "object" || Array.isArray(viewer)) {
+    return { metrics: null, error: "R2 ops missing viewer object" };
+  }
+  const accounts = (viewer as JsonObject).accounts;
+  if (!Array.isArray(accounts) || !accounts.length || !accounts[0] || typeof accounts[0] !== "object" || Array.isArray(accounts[0])) {
+    return { metrics: null, error: "R2 ops missing account data" };
+  }
+  const groups = (accounts[0] as JsonObject).r2OperationsAdaptiveGroups;
+  if (!Array.isArray(groups)) {
+    return { metrics: null, error: "R2 ops missing operations groups" };
+  }
+
+  let classARequests = 0;
+  let classBRequests = 0;
+  let unclassifiedRequests = 0;
+  const unclassifiedActionTypes: string[] = [];
+  const unclassifiedSeen = new Set<string>();
+
+  for (const group of groups) {
+    if (!group || typeof group !== "object" || Array.isArray(group)) {
+      continue;
+    }
+    const dimensions = (group as JsonObject).dimensions;
+    const totals = (group as JsonObject).sum;
+    if (!dimensions || typeof dimensions !== "object" || Array.isArray(dimensions) || !totals || typeof totals !== "object" || Array.isArray(totals)) {
+      continue;
+    }
+    const actionType = String((dimensions as JsonObject).actionType || "").trim();
+    if (!actionType) {
+      continue;
+    }
+    const requestsCount = readNumber((totals as JsonObject).requests, Number.NaN);
+    if (!Number.isFinite(requestsCount) || requestsCount < 0) {
+      continue;
+    }
+    if (R2_CLASS_A_ACTION_TYPES.has(actionType)) {
+      classARequests += Math.round(requestsCount);
+    } else if (R2_CLASS_B_ACTION_TYPES.has(actionType)) {
+      classBRequests += Math.round(requestsCount);
+    } else if (!R2_FREE_ACTION_TYPES.has(actionType) && !actionType.toLowerCase().startsWith("delete")) {
+      unclassifiedRequests += Math.round(requestsCount);
+      if (!unclassifiedSeen.has(actionType)) {
+        unclassifiedSeen.add(actionType);
+        unclassifiedActionTypes.push(actionType);
+      }
+    }
+  }
+
+  return {
+    metrics: {
+      class_a_requests: classARequests,
+      class_b_requests: classBRequests,
+      unclassified_requests: unclassifiedRequests,
+      unclassified_action_types: unclassifiedActionTypes.sort(),
+      window_start_utc: windowStart.toISOString(),
+      window_end_utc: windowEnd.toISOString(),
+    },
+    error: null,
+  };
+}
+
 async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usage: JsonObject | null; error: string | null }> {
   if (!forceRefresh) {
     const cached = cacheGet(r2UsageCache);
@@ -650,16 +844,18 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
     if (!selected) {
       throw new Error("Cloudflare R2 metrics missing standard usage values");
     }
+    const now = new Date();
     const freeTierGb = 10;
-    const freeBytes = freeTierGb * 1024 * 1024 * 1024;
+    const freeBytes = freeTierGb * R2_BYTES_PER_GB;
     const classAFree = 1_000_000;
     const classBFree = 10_000_000;
+    const opsMetrics = await fetchR2OperationsMetrics(accountId, apiToken, now);
     const usage: JsonObject = {
       standard_used_bytes: Math.max(0, Math.round(selected.used_bytes)),
-      standard_used_gb: Math.max(0, selected.used_bytes) / (1024 ** 3),
+      standard_used_gb: Math.max(0, selected.used_bytes) / R2_BYTES_PER_GB,
       standard_objects: Math.max(0, Math.round(selected.object_count)),
       free_tier_gb: freeTierGb,
-      percent_of_free_tier: Math.min(100, Math.max(0, (selected.used_bytes / freeBytes) * 100)),
+      percent_of_free_tier: clampPercent((selected.used_bytes / freeBytes) * 100),
       class_a_used_requests: null,
       class_b_used_requests: null,
       class_a_free_tier_requests: classAFree,
@@ -670,11 +866,25 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
       class_ops_unclassified_action_types: [],
       class_ops_window_start_utc: null,
       class_ops_window_end_utc: null,
-      class_ops_error: "R2 class A/B operation analytics are not configured in direct mode.",
+      class_ops_error: opsMetrics.error,
       storage_source: "cloudflare_r2_account_metrics",
       source: "cloudflare_r2_account_metrics",
-      as_of_utc: nowIso(),
+      as_of_utc: now.toISOString(),
     };
+    if (opsMetrics.metrics) {
+      const classAUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_a_requests, 0)));
+      const classBUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_b_requests, 0)));
+      usage.class_a_used_requests = classAUsed;
+      usage.class_b_used_requests = classBUsed;
+      usage.class_a_percent_of_free_tier = clampPercent((classAUsed / classAFree) * 100);
+      usage.class_b_percent_of_free_tier = clampPercent((classBUsed / classBFree) * 100);
+      usage.class_ops_unclassified_requests = Math.max(0, Math.round(readNumber(opsMetrics.metrics.unclassified_requests, 0)));
+      usage.class_ops_unclassified_action_types = Array.isArray(opsMetrics.metrics.unclassified_action_types)
+        ? opsMetrics.metrics.unclassified_action_types
+        : [];
+      usage.class_ops_window_start_utc = String(opsMetrics.metrics.window_start_utc || "") || null;
+      usage.class_ops_window_end_utc = String(opsMetrics.metrics.window_end_utc || "") || null;
+    }
     const value = { usage, error: null };
     r2UsageCache = { value, expiresAt: Date.now() + R2_USAGE_TTL_MS };
     return value;
