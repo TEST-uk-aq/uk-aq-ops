@@ -563,7 +563,9 @@ class GeoShardLookup:
         )
         self.layers = self._normalize_layers(self.manifest.get("layers"))
         self._shard_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._geometry_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._missing_shards: set[str] = set()
+        self._missing_geometry: set[str] = set()
 
     def _normalize_layers(self, raw_layers: Any) -> Dict[str, Dict[str, Any]]:
         if not isinstance(raw_layers, dict):
@@ -576,9 +578,9 @@ class GeoShardLookup:
         return normalized
 
     def tile_key(self, lon: float, lat: float) -> str:
-        lat_min = round_coord(math.floor(lat / self.grid_size) * self.grid_size, self.grid_precision)
-        lon_min = round_coord(math.floor(lon / self.grid_size) * self.grid_size, self.grid_precision)
-        return f"{format_coord(lat_min, self.grid_precision)}_{format_coord(lon_min, self.grid_precision)}"
+        iy = math.floor(lat / self.grid_size)
+        ix = math.floor(lon / self.grid_size)
+        return f"iy{iy}_ix{ix}"
 
     def tile_neighbors(self, lon: float, lat: float, include_neighbors: bool) -> List[str]:
         lat_index = math.floor(lat / self.grid_size)
@@ -586,9 +588,7 @@ class GeoShardLookup:
         deltas = NEIGHBOR_TILE_DELTAS if include_neighbors else [(0, 0)]
         keys: List[str] = []
         for d_lat, d_lon in deltas:
-            tile_lat = round_coord((lat_index + d_lat) * self.grid_size, self.grid_precision)
-            tile_lon = round_coord((lon_index + d_lon) * self.grid_size, self.grid_precision)
-            key = f"{format_coord(tile_lat, self.grid_precision)}_{format_coord(tile_lon, self.grid_precision)}"
+            key = f"iy{lat_index + d_lat}_ix{lon_index + d_lon}"
             if key not in keys:
                 keys.append(key)
         return keys
@@ -616,6 +616,38 @@ class GeoShardLookup:
             self._shard_cache.popitem(last=False)
         return data
 
+    def geometry_key(self, relative_path: str) -> str:
+        rel = str(relative_path or "").strip().lstrip("/")
+        return f"{self.prefix}/{rel}" if self.prefix else rel
+
+    def get_geometry(self, feature: Dict[str, Any]) -> Any:
+        geometry = feature.get("geometry")
+        if geometry is not None:
+            return geometry
+        relative_path = stringify_or_none(
+            feature.get("geometry_ref")
+            or feature.get("geometry_relative_path")
+        )
+        if not relative_path:
+            return None
+        object_key = self.geometry_key(relative_path)
+        if object_key in self._missing_geometry:
+            return None
+        cached = self._geometry_cache.get(object_key)
+        if cached is not None:
+            self._geometry_cache.move_to_end(object_key)
+            return cached.get("geometry")
+        try:
+            data = self.r2.get_json_object(object_key)
+        except FileNotFoundError:
+            self._missing_geometry.add(object_key)
+            return None
+        self._geometry_cache[object_key] = data
+        self._geometry_cache.move_to_end(object_key)
+        while len(self._geometry_cache) > self.shard_cache_limit:
+            self._geometry_cache.popitem(last=False)
+        return data.get("geometry")
+
     def lookup(self, layer: str, lon: float, lat: float, include_neighbors: bool) -> Dict[str, Any]:
         tile_keys = self.tile_neighbors(lon, lat, include_neighbors)
         diagnostics: Dict[str, Any] = {
@@ -623,6 +655,7 @@ class GeoShardLookup:
             "matched_tile_key": None,
             "candidate_feature_count": 0,
             "checked_feature_count": 0,
+            "geometry_object_keys_checked": [],
             "boundary_detail": self.boundary_detail,
             "grid_size_degrees": self.grid_size,
             "grid_token": self.grid_token,
@@ -639,7 +672,13 @@ class GeoShardLookup:
                 if not point_in_bbox(lon, lat, bbox):
                     continue
                 diagnostics["candidate_feature_count"] += 1
-                geometry = feature.get("geometry")
+                geometry_ref = stringify_or_none(
+                    feature.get("geometry_ref")
+                    or feature.get("geometry_relative_path")
+                )
+                if geometry_ref:
+                    diagnostics["geometry_object_keys_checked"].append(self.geometry_key(geometry_ref))
+                geometry = self.get_geometry(feature)
                 diagnostics["checked_feature_count"] += 1
                 if point_in_geometry(lon, lat, geometry):
                     diagnostics["matched_tile_key"] = tile_key

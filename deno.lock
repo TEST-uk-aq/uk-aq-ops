@@ -298,7 +298,8 @@
         "npm:hyparquet@^1.25.1",
         "npm:parquet-wasm@~0.7.1",
         "npm:pg-cursor@^2.18.0",
-        "npm:pg@^8.19.0"
+        "npm:pg@^8.19.0",
+        "npm:proj4@^2.20.8"
       ]
     }
   }

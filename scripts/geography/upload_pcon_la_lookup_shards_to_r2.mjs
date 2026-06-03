@@ -9,6 +9,12 @@ import {
   r2PutObject,
 } from "../../workers/shared/r2_sigv4.mjs";
 
+const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
+const API_RETRYABLE_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
+const API_REQUEST_MAX_ATTEMPTS = 5;
+const API_REQUEST_RETRY_BASE_MS = 750;
+const API_REQUEST_RETRY_MAX_MS = 8000;
+
 const DEFAULT_INPUT_DIR = String(
   process.env.UK_AQ_GEO_SHARD_OUTPUT_DIR
     || path.join(os.homedir(), "tmp", "geo_lookup_v1"),
@@ -35,7 +41,8 @@ function usage() {
       "  UK_AQ_GEO_R2_ENDPOINT",
       "  UK_AQ_GEO_R2_REGION",
       "  UK_AQ_GEO_R2_CLOUDFLARE_ACCOUNT_ID",
-      "  UK_AQ_POSTCODE_R2_CLOUDFLARE_ACCOUNT_ID / UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID / UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_ACCOUNT_ID",
+      "  UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID / UK_AQ_POSTCODE_R2_CLOUDFLARE_ACCOUNT_ID / UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_ACCOUNT_ID",
+      "  UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN / CLOUDFLARE_API_TOKEN (preferred for geo upload)",
       "  CLOUDFLARE_R2_ACCESS_KEY_ID / CFLARE_R2_ACCESS_KEY_ID / R2_ACCESS_KEY_ID",
       "  CLOUDFLARE_R2_SECRET_ACCESS_KEY / CFLARE_R2_SECRET_ACCESS_KEY / R2_SECRET_ACCESS_KEY",
     ].join("\n"),
@@ -97,9 +104,9 @@ function parseArgs(argv) {
 function resolveAccountId() {
   return String(
     process.env.UK_AQ_GEO_R2_CLOUDFLARE_ACCOUNT_ID
+      || process.env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID
       || process.env.UK_AQ_POSTCODE_R2_CLOUDFLARE_ACCOUNT_ID
       || process.env.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID
-      || process.env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID
       || process.env.CLOUDFLARE_ACCOUNT_ID
       || "",
   ).trim();
@@ -128,13 +135,11 @@ function buildR2Config(args) {
   const endpoint = resolveEndpoint(args, accountId);
 
   return {
+    account_id: accountId,
     endpoint,
     bucket: String(
       args.bucket_override
         || process.env.UK_AQ_GEO_R2_BUCKET
-        || process.env.UK_AQ_POSTCODE_R2_BUCKET
-        || process.env.CFLARE_R2_BUCKET
-        || process.env.R2_BUCKET
         || "uk-aq-pcon-la-lookup",
     ).trim(),
     region: String(
@@ -157,6 +162,121 @@ function buildR2Config(args) {
         || "",
     ).trim(),
   };
+}
+
+function resolveApiToken() {
+  return String(
+    process.env.UK_AQ_GEO_R2_CLOUDFLARE_API_TOKEN
+      || process.env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN
+      || process.env.CLOUDFLARE_API_TOKEN
+      || "",
+  ).trim();
+}
+
+function hasRequiredCloudflareApiConfig(config) {
+  return Boolean(config && config.account_id && config.bucket && config.api_token);
+}
+
+function isRetryableApiRequestError(error) {
+  const message = String(error instanceof Error ? error.message : error || "").toLowerCase();
+  if (!message) {
+    return false;
+  }
+  return [
+    "connection reset",
+    "connection closed",
+    "broken pipe",
+    "socket hang up",
+    "econnreset",
+    "econnrefused",
+    "ehostunreach",
+    "etimedout",
+    "timed out",
+    "timeout",
+    "networkerror",
+    "network error",
+    "temporarily unavailable",
+    "tls",
+    "eof",
+  ].some((token) => message.includes(token));
+}
+
+function computeApiRetryDelayMs(attempt) {
+  return Math.min(
+    API_REQUEST_RETRY_MAX_MS,
+    API_REQUEST_RETRY_BASE_MS * (2 ** Math.max(0, attempt - 1)),
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function encodeObjectKeyForCloudflareApi(objectKey) {
+  return String(objectKey || "")
+    .split("/")
+    .filter((part) => part.length > 0)
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+async function cloudflareApiPutObject({
+  accountId,
+  apiToken,
+  bucket,
+  key,
+  body,
+  contentType = "application/octet-stream",
+}) {
+  const encodedKey = encodeObjectKeyForCloudflareApi(key);
+  const url = `${CLOUDFLARE_API_BASE}/accounts/${accountId}/r2/buckets/${bucket}/objects/${encodedKey}`;
+  for (let attempt = 1; attempt <= API_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${apiToken}`,
+          "content-type": contentType,
+          "content-length": String(body.byteLength),
+        },
+        body,
+      });
+    } catch (error) {
+      if (!isRetryableApiRequestError(error) || attempt === API_REQUEST_MAX_ATTEMPTS) {
+        throw error;
+      }
+      await sleep(computeApiRetryDelayMs(attempt));
+      continue;
+    }
+
+    const raw = await response.text();
+    let payload = null;
+    try {
+      payload = raw ? JSON.parse(raw) : null;
+    } catch {}
+
+    if (response.ok && payload?.success) {
+      return {
+        bytes: body.byteLength,
+        result: payload?.result || null,
+      };
+    }
+
+    const retryable = API_RETRYABLE_STATUS_CODES.has(response.status);
+    if (retryable && attempt < API_REQUEST_MAX_ATTEMPTS) {
+      await sleep(computeApiRetryDelayMs(attempt));
+      continue;
+    }
+
+    const errorText = payload
+      ? JSON.stringify(payload)
+      : raw;
+    throw new Error(
+      `Cloudflare API upload failed for ${key}: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ""}`,
+    );
+  }
+  throw new Error(`Cloudflare API upload retry loop exhausted for ${key}.`);
 }
 
 function toObjectKey(prefix, relativePath) {
@@ -212,9 +332,16 @@ async function main() {
   const prefix = normalizePrefix(args.prefix || manifest.prefix || DEFAULT_PREFIX);
 
   const r2 = buildR2Config(args);
-  if (!hasRequiredR2Config(r2)) {
+  const apiToken = resolveApiToken();
+  const useCloudflareApi = hasRequiredCloudflareApiConfig({
+    account_id: r2.account_id,
+    bucket: r2.bucket,
+    api_token: apiToken,
+  });
+
+  if (!useCloudflareApi && !hasRequiredR2Config(r2)) {
     throw new Error(
-      "Missing R2 config. Ensure bucket, endpoint/account id, access key id, and secret access key are set.",
+      "Missing R2 config. Provide either Cloudflare account id + API token, or S3-compatible endpoint/account id + access key id + secret access key.",
     );
   }
 
@@ -227,12 +354,21 @@ async function main() {
     const fileBuffer = await readFileBuffer(filePath);
 
     if (!args.dry_run) {
-      const uploadResult = await r2PutObject({
-        r2,
-        key: objectKey,
-        body: fileBuffer,
-        content_type: "application/json; charset=utf-8",
-      });
+      const uploadResult = useCloudflareApi
+        ? await cloudflareApiPutObject({
+          accountId: r2.account_id,
+          apiToken,
+          bucket: r2.bucket,
+          key: objectKey,
+          body: fileBuffer,
+          contentType: "application/json; charset=utf-8",
+        })
+        : await r2PutObject({
+          r2,
+          key: objectKey,
+          body: fileBuffer,
+          content_type: "application/json; charset=utf-8",
+        });
       totalUploadedBytes += uploadResult.bytes;
     } else {
       totalUploadedBytes += fileBuffer.byteLength;
@@ -256,12 +392,21 @@ async function main() {
   const manifestObjectKey = toObjectKey(prefix, "manifest.json");
 
   if (!args.dry_run) {
-    const manifestUploadResult = await r2PutObject({
-      r2,
-      key: manifestObjectKey,
-      body: uploadManifestBuffer,
-      content_type: "application/json; charset=utf-8",
-    });
+    const manifestUploadResult = useCloudflareApi
+      ? await cloudflareApiPutObject({
+        accountId: r2.account_id,
+        apiToken,
+        bucket: r2.bucket,
+        key: manifestObjectKey,
+        body: uploadManifestBuffer,
+        contentType: "application/json; charset=utf-8",
+      })
+      : await r2PutObject({
+        r2,
+        key: manifestObjectKey,
+        body: uploadManifestBuffer,
+        content_type: "application/json; charset=utf-8",
+      });
     totalUploadedBytes += manifestUploadResult.bytes;
   } else {
     totalUploadedBytes += uploadManifestBuffer.byteLength;
@@ -273,6 +418,8 @@ async function main() {
         ok: true,
         dry_run: args.dry_run,
         bucket: r2.bucket,
+        account_id: r2.account_id || null,
+        upload_mode: useCloudflareApi ? "cloudflare_api_token" : "s3_sigv4",
         prefix,
         shard_count: Number(manifest.shard_count || 0),
         feature_count: Number(manifest.feature_count || 0),

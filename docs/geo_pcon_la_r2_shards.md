@@ -33,6 +33,13 @@ Directory/object structure:
 ```text
 v1/
   manifest.json
+  by_code/
+    pcon/
+      2024/
+        S14000065.json
+    la/
+      2025/
+        E06000054.json
   pcon/
     detailed/
       grid_0.05/
@@ -48,10 +55,12 @@ v1/
 
 Notes:
 
-- A feature is included in every tile whose bbox overlaps the feature bbox.
+- A feature ref is included in every tile whose bbox overlaps the feature bbox.
+- Full geometry is stored once under `by_code/`; tile shards contain `code`, `name`, `bbox`, and `geometry_ref`.
 - Tile keys use integer indices (`iy`, `ix`) as canonical identifiers to avoid float rounding drift.
 - MultiPolygon assignment uses per-part bbox tiling with tile-key dedupe (reduces shard explosion for disjoint geometries).
-- Shard and adjacency JSON are written minified to reduce local tmp usage and R2 object size.
+- Shard, by-code geometry, and adjacency JSON are written minified to reduce local tmp usage and R2 object size.
+- The builder accepts mixed boundary CRS inputs and normalizes output to `EPSG:4326`; `EPSG:27700` GeoJSON is reprojected in-process during build.
 - Adjacency output is approximate (`bbox_overlap_approx`) in the first implementation.
 
 ## Build flow
@@ -59,6 +68,13 @@ Notes:
 ### Offline local files (preferred)
 
 Use local GeoJSON files directly (no Dropbox download step).
+
+The current UK files are mixed:
+
+- PCON input is already `EPSG:4326`
+- LA input is `EPSG:27700`
+
+The builder handles that automatically and still writes WGS84 shard geometry/bboxes.
 
 ```bash
 node scripts/geography/build_pcon_la_lookup_shards.mjs \
@@ -100,21 +116,46 @@ node scripts/geography/upload_pcon_la_lookup_shards_to_r2.mjs \
   --prefix "${UK_AQ_GEO_R2_PREFIX:-v1}"
 ```
 
-5) Validate against existing station PCON/LA values (Layer 1D placeholder):
+Upload notes:
+
+- The uploader defaults to the geo bucket `uk-aq-pcon-la-lookup`.
+- Preferred auth mode is Cloudflare account API token using:
+  - `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
+  - `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
+- S3-compatible R2 access keys are used only when API-token mode is not available.
+
+5) Validate against existing station PCON/LA values:
 
 ```bash
-python3 scripts/geography/validate_r2_geo_lookup_against_stations.py \
-  --limit "${UK_AQ_GEO_VALIDATE_LIMIT:-100}" \
-  --output "${UK_AQ_GEO_VALIDATE_OUTPUT:-logs/geo_validate/latest.json}"
+UK_AQ_GEO_VALIDATE_LIMIT=100 \
+UK_AQ_GEO_VALIDATE_OUTPUT=logs/geo_validate/latest.json \
+npm run geo:validate-stations
+```
+
+Seeded random sample:
+
+```bash
+UK_AQ_GEO_VALIDATE_LIMIT=100 \
+UK_AQ_GEO_VALIDATE_RANDOM_SEED=42 \
+UK_AQ_GEO_VALIDATE_OUTPUT=logs/geo_validate/latest.json \
+npm run geo:validate-stations
 ```
 
 Optional explicit station list:
 
 ```bash
-python3 scripts/geography/validate_r2_geo_lookup_against_stations.py \
-  --station-ids "123,456,789" \
-  --output "${UK_AQ_GEO_VALIDATE_OUTPUT:-logs/geo_validate/latest.json}"
+UK_AQ_GEO_VALIDATE_STATION_IDS="123,456,789" \
+UK_AQ_GEO_VALIDATE_OUTPUT=logs/geo_validate/station_ids.json \
+npm run geo:validate-stations
 ```
+
+Validation notes:
+
+- Normal validation samples only stations that already have both stored `pcon_code` and `la_code` values.
+- Explicit `--station-ids` / `UK_AQ_GEO_VALIDATE_STATION_IDS` takes priority over random sampling.
+- This is a confidence gate, not a perfect oracle: stored station `pcon_code` / `la_code` values may come from a different boundary vintage than the newly built R2 shards.
+- Treat code mismatches as the primary signal.
+- Treat name mismatches as secondary diagnostics only; they often indicate version drift or naming-style differences rather than a bad shard.
 
 ## Required env vars
 
@@ -138,17 +179,20 @@ Upload-time:
   - `UK_AQ_GEO_R2_ENDPOINT`
   - `UK_AQ_GEO_R2_CLOUDFLARE_ACCOUNT_ID`
 
-Layer 1D validation gate placeholder:
+Validation:
 
 - `SUPABASE_URL`
 - `SB_SECRET_KEY`
+- `UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID`
+- `UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN`
+- `UK_AQ_GEO_R2_BUCKET` (default `uk-aq-pcon-la-lookup`)
+- `UK_AQ_GEO_R2_PREFIX` (default `v1`)
+- `UK_AQ_GEO_GRID_SIZE_DEGREES` (default `0.05`)
+- `UK_AQ_GEO_BOUNDARY_DETAIL` (default `detailed`)
 - `UK_AQ_GEO_VALIDATE_LIMIT` (default `100`)
-- `UK_AQ_GEO_VALIDATE_STATION_IDS` (optional CSV)
 - `UK_AQ_GEO_VALIDATE_RANDOM_SEED` (optional)
+- `UK_AQ_GEO_VALIDATE_STATION_IDS` (optional CSV)
 - `UK_AQ_GEO_VALIDATE_OUTPUT` (default `logs/geo_validate/latest.json`)
-- plus R2 read credentials:
-  - `CLOUDFLARE_R2_ACCESS_KEY_ID` / `CFLARE_R2_ACCESS_KEY_ID`
-  - `CLOUDFLARE_R2_SECRET_ACCESS_KEY` / `CFLARE_R2_SECRET_ACCESS_KEY`
 
 Dropbox resolve step:
 
@@ -162,9 +206,11 @@ Dropbox resolve step:
 - Adjacency output is approximate in Layer 1 and intended as future support data.
 - Aiven is not part of the active design for this feature.
 
-Layer 1D mismatch interpretation (validation placeholder):
+Validation mismatch interpretation:
 
-- `*_code_mismatch`: different boundary code selected between stored station value and R2 lookup; review boundary version and edge geometry.
-- `*_missing_stored` / `*_missing_r2`: one side has a code and the other does not; check tile fallback and source coverage.
-- `*_name_mismatch`: code matched but label differs; usually naming dataset drift rather than spatial mismatch.
-- `both_missing`: neither lookup found a polygon for the station coordinate.
+- `pcon_code_mismatch` / `la_code_mismatch`: the R2 shard selected a different code from the stored station value; review boundary version and edge geometry first.
+- `pcon_no_r2_match` / `la_no_r2_match`: the lookup could not find a polygon for that layer; check tile coverage, shard completeness, and boundary-edge handling.
+- `invalid_coordinates`: the stored station geometry could not be decoded or was outside lon/lat bounds.
+- `lookup_error`: the validator could not read the shard or geometry object from R2.
+- `possible_boundary_edge`: the match came from a neighbouring tile; this can be correct for points near the edge of a polygon.
+- `possible_boundary_version_difference`: code values differ but the stored and R2 names match after normalization; this usually means a boundary-vintage or naming-dataset difference rather than a broken lookup.
