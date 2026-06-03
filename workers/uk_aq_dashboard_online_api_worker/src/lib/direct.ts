@@ -1710,8 +1710,7 @@ function dashboardCacheKey(search: URLSearchParams): string {
   const includeStorage = asBoolFlag(search.get("include_storage_coverage"), true) ? "1" : "0";
   const includeMetric = asBoolFlag(search.get("include_metric_context"), true) ? "1" : "0";
   const includeIngest = asBoolFlag(search.get("include_ingest_context"), true) ? "1" : "0";
-  const cursor = String(search.get("dispatch_cursor") || "").trim();
-  return `storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|cursor=${cursor}`;
+  return `storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}`;
 }
 
 export async function getDirectDashboardPayload(
@@ -1727,13 +1726,11 @@ export async function getDirectDashboardPayload(
     }
   }
 
-  const dispatchCursorRaw = String(search.get("dispatch_cursor") || "").trim();
-  const dispatchCursor = parseTimestamp(dispatchCursorRaw);
   const payload = await fetchDashboardBaseData(env, {
     includeStorageCoverage: asBoolFlag(search.get("include_storage_coverage"), true),
     includeMetricContext: asBoolFlag(search.get("include_metric_context"), true),
     includeIngestContext: asBoolFlag(search.get("include_ingest_context"), true),
-    dispatchCursor,
+    dispatchCursor: null,
     forceRefresh,
   });
   dashboardCache.set(cacheKey, { value: payload, expiresAt: Date.now() + DASHBOARD_TTL_MS });

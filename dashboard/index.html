@@ -1823,7 +1823,6 @@
       ];
       const DISPATCH_CONNECTOR_STORAGE_KEY = "uk_aq_dispatch_connector";
       const DISPATCH_LOOKBACK_STORAGE_KEY = "uk_aq_dispatch_lookback_mins";
-      const DISPATCH_CURSOR_STORAGE_KEY = "uk_aq_dispatch_cursor";
       const DB_SIZE_PERIOD_OPTIONS = [
         { value: 6, label: "6 hours" },
         { value: 12, label: "12 hours" },
@@ -1863,7 +1862,6 @@
       const REFRESH_OPTIONS_SECONDS = [60, 300, 600, 1800, 3600];
       let dispatchConnectorFilter = "all";
       let dispatchLookbackMinutes = 30;
-      let dispatchCursor = null;
       let dbSizePeriodHours = 24;
       let storageCoverageMonthCursor = null;
       let storageCoverageMode = "month";
@@ -1935,10 +1933,6 @@
           DISPATCH_LOOKBACK_OPTIONS.some((opt) => opt.value === storedLookback)
         ) {
           dispatchLookbackMinutes = storedLookback;
-        }
-        const storedCursor = localStorage.getItem(DISPATCH_CURSOR_STORAGE_KEY);
-        if (storedCursor) {
-          dispatchCursor = storedCursor;
         }
         const storedDbSizePeriod = Number(localStorage.getItem(DB_SIZE_PERIOD_STORAGE_KEY));
         if (
@@ -2861,9 +2855,9 @@
             refreshNowBtn.textContent = "Refreshing...";
             try {
               if (activeMode === "operations") {
-                await loadOperationsDashboard({ forceRefresh: false });
+                await loadOperationsDashboard({ forceRefresh: true });
               } else {
-                await loadDashboard({ forceRefresh: false });
+                await loadDashboard({ forceRefresh: true });
               }
             } finally {
               if (document.body.contains(refreshNowBtn)) {
@@ -6166,9 +6160,6 @@
             params.set("force", "1");
             params.set("t", String(Date.now()));
           }
-          if (!forceRefresh && dispatchCursor) {
-            params.set("dispatch_cursor", dispatchCursor);
-          }
           const dashboardUrl = buildApiUrl("dashboard", params);
           const resp = await fetch(dashboardUrl);
           const text = await resp.text();
@@ -6192,14 +6183,6 @@
           }
           const data = payload || {};
           latestDashboardData = data;
-          if (typeof data.dispatch_cursor === "string" && data.dispatch_cursor) {
-            dispatchCursor = data.dispatch_cursor;
-            try {
-              localStorage.setItem(DISPATCH_CURSOR_STORAGE_KEY, dispatchCursor);
-            } catch (_err) {
-              // Ignore storage write issues.
-            }
-          }
           const nextPanels = [];
           nextPanels.push(renderModeControlPanel("ingest"));
           if (Array.isArray(data.connectors_settings)) {
