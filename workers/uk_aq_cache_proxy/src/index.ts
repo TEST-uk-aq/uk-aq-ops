@@ -1712,6 +1712,15 @@ function canonicalizeAqiHistoryRequestUrl(url: URL, upstreamFunction: string): U
     return normalized;
   }
 
+  const requestedFormat = String(normalized.searchParams.get("format") || "").trim().toLowerCase();
+  if (requestedFormat === "tsv") {
+    normalized.searchParams.set("format", "tsv");
+  } else if (requestedFormat === "objects") {
+    normalized.searchParams.set("format", "objects");
+  } else {
+    normalized.searchParams.set("format", "compact");
+  }
+
   const startMs = parseIsoMsOrNull(getFirstSearchParam(normalized, AQI_HISTORY_START_KEYS));
   const endMs = parseIsoMsOrNull(getFirstSearchParam(normalized, AQI_HISTORY_END_KEYS));
   if (startMs === null || endMs === null || endMs <= startMs) {

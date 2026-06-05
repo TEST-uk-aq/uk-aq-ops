@@ -36,8 +36,8 @@ REQUIRED_ENV_VARS = (
     "UK_AQ_HISTORY_INTEGRITY_DB_PATH",
     "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR",
     "UK_AQ_HISTORY_INTEGRITY_TMP_DIR",
-    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR",
-    "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR",
+    "UK_AQ_AQI_GAP_LOG_DIR",
+    "UK_AQ_AQI_GAP_REPORT_DIR",
     "UK_AQ_HISTORY_INTEGRITY_LOCK_DIR",
     "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT",
 )
@@ -48,8 +48,8 @@ PATH_VARS_FOR_GUARDRAILS = (
     "UK_AQ_HISTORY_INTEGRITY_DB_PATH",
     "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR",
     "UK_AQ_HISTORY_INTEGRITY_TMP_DIR",
-    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR",
-    "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR",
+    "UK_AQ_AQI_GAP_LOG_DIR",
+    "UK_AQ_AQI_GAP_REPORT_DIR",
     "UK_AQ_HISTORY_INTEGRITY_LOCK_DIR",
     "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH",
     "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
@@ -422,8 +422,8 @@ def ensure_dirs(env: Mapping[str, str]) -> None:
         "UK_AQ_HISTORY_INTEGRITY_STATE_DIR",
         "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR",
         "UK_AQ_HISTORY_INTEGRITY_TMP_DIR",
-        "UK_AQ_HISTORY_INTEGRITY_LOG_DIR",
-        "UK_AQ_HISTORY_INTEGRITY_REPORT_DIR",
+        "UK_AQ_AQI_GAP_LOG_DIR",
+        "UK_AQ_AQI_GAP_REPORT_DIR",
         "UK_AQ_HISTORY_INTEGRITY_LOCK_DIR",
     ):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
@@ -1430,6 +1430,12 @@ def write_reports(output_dir: Path, base_name: str, report: Mapping[str, Any]) -
     return json_path, md_path
 
 
+def resolve_output_dir(env: Mapping[str, str], args: argparse.Namespace) -> Path:
+    if args.output_dir:
+        return Path(args.output_dir).expanduser()
+    return Path(env["UK_AQ_AQI_GAP_REPORT_DIR"])
+
+
 def record_run_summaries(
     conn: sqlite3.Connection,
     run_id: int,
@@ -1579,7 +1585,7 @@ def main(argv: Sequence[str]) -> int:
     lock_path = Path(env["UK_AQ_HISTORY_INTEGRITY_LOCK_DIR"]) / f"aqi-gap-check-{args.env}.lock"
 
     with RunLock(lock_path):
-        log_path = setup_logging(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"], run_compact, args.verbose)
+        log_path = setup_logging(env["UK_AQ_AQI_GAP_LOG_DIR"], run_compact, args.verbose)
         log = logging.getLogger("uk-aq-aqi-gap-check")
         log.info("start env=%s profile=%s source=%s", args.env, args.profile or "manual", args.source or "(default)")
         log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
@@ -1700,7 +1706,7 @@ def main(argv: Sequence[str]) -> int:
             actual_row_count, missing_rows = compare_expected_vs_actual(expected_rows, actual_rows)
             summary_counts = build_missing_summaries(missing_rows, expected_rows, actual_row_count)
 
-            output_dir = Path(args.output_dir).expanduser() if args.output_dir else Path(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"]) / "aqi_gap_check"
+            output_dir = resolve_output_dir(env, args)
             report_base = (
                 f"aqi_gap_check_{source_mode}_{(args.profile or 'manual').replace('_', '-')}_"
                 f"{(computed_from_day or 'none')}_{(computed_to_day or 'none')}_{run_compact}"

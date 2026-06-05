@@ -2,6 +2,7 @@ import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/aqilevels";
+const DEFAULT_HISTORY_BANDS_PREFIX = "history/v1/aqilevels/bands/v1";
 const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_timeseries";
 const DEFAULT_CACHE_SECONDS = 300;
@@ -43,6 +44,23 @@ const AQI_PARQUET_COLUMNS = [
   "eaqi_pm25_index_level",
   "eaqi_pm10_index_level",
 ];
+const AQI_BAND_CACHE_COLUMNS = [
+  "period_start_utc",
+  "timestamp_hour_utc",
+  "timeseries_id",
+  "station_id",
+  "connector_id",
+  "pollutant_code",
+  "daqi_index_level",
+  "eaqi_index_level",
+  "daqi_no2_index_level",
+  "daqi_pm25_rolling24h_index_level",
+  "daqi_pm10_rolling24h_index_level",
+  "eaqi_no2_index_level",
+  "eaqi_pm25_index_level",
+  "eaqi_pm10_index_level",
+];
+const AQI_RESPONSE_FORMATS = new Set(["json", "objects", "compact", "tsv"]);
 const timeseriesWindowContextCache = new Map();
 
 function corsHeaders() {
@@ -189,6 +207,32 @@ function jsonResponse(payload, {
   });
 }
 
+function buildTsvResponseBody(columns, rows) {
+  const safeColumns = Array.isArray(columns) ? columns : [];
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const serialize = (value) => {
+    if (value === null || value === undefined) {
+      return "";
+    }
+    if (value instanceof Date) {
+      return Number.isFinite(value.getTime()) ? value.toISOString() : "";
+    }
+    const text = String(value);
+    return text.replace(/\t/g, " ").replace(/\r?\n/g, " ");
+  };
+  const lines = [safeColumns.join("\t")];
+  for (const row of safeRows) {
+    if (Array.isArray(row)) {
+      lines.push(row.map((value) => serialize(value)).join("\t"));
+      continue;
+    }
+    if (row && typeof row === "object") {
+      lines.push(safeColumns.map((column) => serialize(row[column])).join("\t"));
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 function withCacheMarker(response, marker) {
   const headers = new Headers(response.headers);
   headers.set("x-ukaq-cache", marker);
@@ -224,6 +268,21 @@ function authorized(request, env) {
 
 function toUtcDayFromMs(ms) {
   return new Date(ms).toISOString().slice(0, 10);
+}
+
+function parseIsoDay(raw) {
+  const text = String(raw || "").trim();
+  if (!text) {
+    return null;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    return text;
+  }
+  const ms = Date.parse(text);
+  if (!Number.isFinite(ms)) {
+    return null;
+  }
+  return toUtcDayFromMs(ms);
 }
 
 function utcMidnightMs(isoDay) {
@@ -294,6 +353,129 @@ async function fetchJsonObjectFromR2(env, key) {
     throw new Error(`Invalid JSON object at ${key}`);
   }
   return { exists: true, value: parsed };
+}
+
+function normalizeAqiResponseFormat(rawFormat) {
+  const compact = String(rawFormat || "").trim().toLowerCase();
+  if (compact === "tsv") {
+    return "tsv";
+  }
+  if (compact === "objects") {
+    return "objects";
+  }
+  if (compact === "compact" || compact === "json" || compact === "") {
+    return "compact";
+  }
+  return "compact";
+}
+
+function buildAqiBandCacheKey({
+  bandsPrefix,
+  dayUtc,
+  connectorId,
+  timeseriesIds,
+  pollutantKey,
+}) {
+  const normalizedPrefix = normalizePrefix(bandsPrefix || DEFAULT_HISTORY_BANDS_PREFIX);
+  const normalizedDay = parseIsoDay(dayUtc);
+  const normalizedConnectorId = parseRequiredPositiveInt(connectorId);
+  const normalizedTimeseriesIds = Array.isArray(timeseriesIds)
+    ? timeseriesIds
+      .map((value) => parseRequiredPositiveInt(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+  const normalizedTimeseriesPart = normalizedTimeseriesIds.length > 0
+    ? Array.from(new Set(normalizedTimeseriesIds)).sort((left, right) => left - right).join("_")
+    : null;
+  const normalizedPollutant = normalizeAqiPollutant(pollutantKey) || "all";
+  if (!normalizedPrefix || !normalizedDay || !normalizedConnectorId || !normalizedTimeseriesPart) {
+    return null;
+  }
+  return `${normalizedPrefix}/day_utc=${normalizedDay}/connector_id=${normalizedConnectorId}/timeseries_ids=${normalizedTimeseriesPart}/pollutant=${normalizedPollutant}.json`;
+}
+
+function getAqiBandCacheColumns() {
+  return AQI_BAND_CACHE_COLUMNS.slice();
+}
+
+function rowToAqiBandCompactRow(row) {
+  return AQI_BAND_CACHE_COLUMNS.map((columnName) => {
+    if (columnName === "timestamp_hour_utc") {
+      return row?.timestamp_hour_utc || row?.period_start_utc || null;
+    }
+    return row?.[columnName] ?? null;
+  });
+}
+
+function expandAqiBandCompactPayload(payload) {
+  const columns = Array.isArray(payload?.columns) ? payload.columns : [];
+  const rawPoints = Array.isArray(payload?.points) ? payload.points : [];
+  if (!columns.length || !rawPoints.length) {
+    return [];
+  }
+  return rawPoints.map((row) => {
+    const out = {};
+    for (let index = 0; index < columns.length; index += 1) {
+      out[columns[index]] = Array.isArray(row) ? row[index] ?? null : null;
+    }
+    if (!out.timestamp_hour_utc) {
+      out.timestamp_hour_utc = out.period_start_utc || null;
+    }
+    return out;
+  });
+}
+
+function buildAqiBandCachePayload({
+  dayUtc,
+  historyPrefix,
+  connectorId,
+  stationId,
+  timeseriesIds,
+  pollutantKey,
+  rowsByPeriodStart,
+  source,
+  responseComplete,
+  cacheScope,
+}) {
+  const normalizedTimeseriesIds = Array.isArray(timeseriesIds)
+    ? Array.from(
+      new Set(
+        timeseriesIds
+          .map((value) => parseRequiredPositiveInt(value))
+          .filter((value) => Number.isFinite(value) && value > 0),
+      ),
+    ).sort((left, right) => left - right)
+    : [];
+  const rows = Array.from(rowsByPeriodStart.values()).sort((left, right) => {
+    const leftMs = Date.parse(String(left.period_start_utc || "")) || 0;
+    const rightMs = Date.parse(String(right.period_start_utc || "")) || 0;
+    return leftMs - rightMs;
+  });
+  const points = rows.map((row) => rowToAqiBandCompactRow(row));
+  const dayStartMs = Date.parse(`${dayUtc}T00:00:00.000Z`);
+  const generatedAtUtc = rows.length > 0
+    ? String(rows[rows.length - 1]?.period_start_utc || "").trim() || (Number.isFinite(dayStartMs) ? new Date(dayStartMs + DAY_MS).toISOString() : new Date().toISOString())
+    : (Number.isFinite(dayStartMs) ? new Date(dayStartMs + DAY_MS).toISOString() : new Date().toISOString());
+  return {
+    ok: true,
+    schema_version: 1,
+    wire_format: "json",
+    data_format: "compact",
+    columns: getAqiBandCacheColumns(),
+    points,
+    source: source || "r2_band_cache",
+    cache_scope: cacheScope || "immutable",
+    response_complete: responseComplete === true,
+    generated_at_utc: generatedAtUtc,
+    history_prefix: normalizePrefix(historyPrefix || DEFAULT_HISTORY_PREFIX),
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    station_id: stationId,
+    timeseries_id: normalizedTimeseriesIds.length === 1 ? normalizedTimeseriesIds[0] : null,
+    timeseries_ids: normalizedTimeseriesIds,
+    pollutant: pollutantKey || null,
+    row_count: points.length,
+  };
 }
 
 async function fetchFilteredParquetRowsFromR2(
@@ -563,6 +745,15 @@ function buildEmptyHistoryRead() {
       warnings: [],
       target_timeseries_id_count: 0,
       scan_stopped_reason: null,
+    },
+    aqi_band_cache: {
+      enabled: true,
+      prefix: DEFAULT_HISTORY_BANDS_PREFIX,
+      eligible_day_count: 0,
+      hit_count: 0,
+      miss_count: 0,
+      write_count: 0,
+      skipped_day_count: 0,
     },
   };
 }
@@ -976,17 +1167,20 @@ async function readHistoryRows({
   env,
   historyPrefix,
   connectorId,
+  stationId = null,
   targetTimeseriesIds,
   startIso,
   endIso,
   sinceIso,
   pollutantKey,
   limit,
+  bandCacheWrites = null,
 }) {
   const scanStartedAtMs = Date.now();
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
   const sinceMs = sinceIso ? Date.parse(sinceIso) : Number.NaN;
+  const bandCacheWriteQueue = Array.isArray(bandCacheWrites) ? bandCacheWrites : null;
   const parquetRowChunkSize = parsePositiveInt(
     env.UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE,
     DEFAULT_PARQUET_ROW_CHUNK_SIZE,
@@ -1025,6 +1219,12 @@ async function readHistoryRows({
   const targetTimeseriesIdCount = Array.isArray(targetTimeseriesIds)
     ? targetTimeseriesIds.length
     : 0;
+  const bandCachePrefix = DEFAULT_HISTORY_BANDS_PREFIX;
+  let bandCacheHitCount = 0;
+  let bandCacheMissCount = 0;
+  let bandCacheWriteCount = 0;
+  let bandCacheEligibleDayCount = 0;
+  let bandCacheSkippedDayCount = 0;
 
   const days = listUtcDays(startIso, endIso);
   const daysToScan = days.slice().reverse();
@@ -1113,10 +1313,62 @@ async function readHistoryRows({
     if (isScanBudgetExceeded()) {
       break;
     }
+    const dayStartMs = utcMidnightMs(dayUtc);
+    const dayEndMs = dayStartMs + DAY_MS;
+    const requestCoversFullDay = startMs <= dayStartMs && endMs >= dayEndMs;
+    const sinceKeepsFullDay = !Number.isFinite(sinceMs) || sinceMs <= dayStartMs;
+    const dayBandCacheEligible = requestCoversFullDay && sinceKeepsFullDay;
+    const dayRowsByPeriodStart = new Map();
+    let dayCacheComplete = true;
+    let dayCacheKey = null;
+
+    if (dayBandCacheEligible) {
+      dayCacheKey = buildAqiBandCacheKey({
+        bandsPrefix: bandCachePrefix,
+        dayUtc,
+        connectorId,
+        timeseriesIds: targetTimeseriesIds,
+        pollutantKey,
+      });
+      if (dayCacheKey) {
+        bandCacheEligibleDayCount += 1;
+        try {
+          const cachedBandObject = await fetchJsonObjectFromR2(env, dayCacheKey);
+          if (
+            cachedBandObject.exists
+            && cachedBandObject.value
+            && cachedBandObject.value.response_complete === true
+            && String(cachedBandObject.value.data_format || "").toLowerCase() === "compact"
+          ) {
+            const cachedBandRows = expandAqiBandCompactPayload(cachedBandObject.value);
+            for (const row of cachedBandRows) {
+              const periodStart = String(row?.period_start_utc || "").trim();
+              if (periodStart) {
+                dayRowsByPeriodStart.set(periodStart, row);
+              }
+            }
+            bandCacheHitCount += 1;
+            for (const [periodStart, row] of dayRowsByPeriodStart.entries()) {
+              rowsByPeriodStart.set(periodStart, row);
+            }
+            continue;
+          }
+          bandCacheMissCount += 1;
+        } catch (_error) {
+          bandCacheMissCount += 1;
+        }
+      } else {
+        bandCacheSkippedDayCount += 1;
+      }
+    } else {
+      bandCacheSkippedDayCount += 1;
+    }
+
     const dayManifestKey = buildDayManifestKey(historyPrefix, dayUtc);
     const dayManifestObject = await fetchJsonObjectFromR2(env, dayManifestKey);
     if (!dayManifestObject.exists) {
       missingDayManifestKeys.push(dayManifestKey);
+      dayCacheComplete = false;
       continue;
     }
 
@@ -1182,11 +1434,14 @@ async function readHistoryRows({
             timeseriesIndexIndexedFileCount += extraction.indexed_file_count;
             timeseriesIndexUnknownRangeFileCount += extraction.unknown_range_file_count;
             timeseriesIndexSkippedByPollutantFiles += extraction.skipped_by_pollutant_file_count;
-            parquetKeys = extraction.keys;
             if (extraction.all_files_range_bounded && extraction.keys.length === 0) {
               timeseriesIndexSkippedByRangeDays += 1;
               continue;
             }
+            if (!extraction.all_files_range_bounded) {
+              dayCacheComplete = false;
+            }
+            parquetKeys = extraction.keys;
           } else {
             timeseriesIndexMissCount += 1;
             timeseriesIndexMissingKeys.push(connectorIndexKey);
@@ -1194,6 +1449,7 @@ async function readHistoryRows({
               timeseriesIndexWarnings.push(
                 `Skipped fallback manifest scan for ${connectorIndexKey}: timeseries index is required.`,
               );
+              dayCacheComplete = false;
               continue;
             }
           }
@@ -1204,6 +1460,7 @@ async function readHistoryRows({
             `Optional timeseries index read failed for ${connectorIndexKey}: ${message}`,
           );
           if (requireTimeseriesIndex && targetTimeseriesIdCount > 0) {
+            dayCacheComplete = false;
             continue;
           }
         }
@@ -1214,6 +1471,7 @@ async function readHistoryRows({
         const connectorManifestObject = await fetchJsonObjectFromR2(env, connectorManifestKey);
         if (!connectorManifestObject.exists) {
           missingConnectorManifestKeys.add(connectorManifestKey);
+          dayCacheComplete = false;
           continue;
         }
 
@@ -1244,6 +1502,7 @@ async function readHistoryRows({
         );
         if (!parquet.exists) {
           missingParquetKeys.add(parquetKey);
+          dayCacheComplete = false;
           continue;
         }
         appendFilteredRows(parquet.rows, {
@@ -1252,12 +1511,46 @@ async function readHistoryRows({
           endMs,
           sinceMs,
           pollutantKey,
-          outByPeriodStart: rowsByPeriodStart,
+          outByPeriodStart: dayRowsByPeriodStart,
         });
       }
     }
+    for (const [periodStart, row] of dayRowsByPeriodStart.entries()) {
+      rowsByPeriodStart.set(periodStart, row);
+    }
+
     if (scanStoppedReason) {
+      dayCacheComplete = false;
       break;
+    }
+
+    if (dayBandCacheEligible && dayCacheKey && dayCacheComplete) {
+      const dayCachePayload = buildAqiBandCachePayload({
+        dayUtc,
+        historyPrefix,
+        connectorId,
+        stationId,
+        timeseriesIds: targetTimeseriesIds,
+        pollutantKey,
+        rowsByPeriodStart: dayRowsByPeriodStart,
+        source: "r2_day_scan",
+        responseComplete: true,
+        cacheScope: "immutable",
+      });
+      if (bandCacheWriteQueue) {
+        bandCacheWriteCount += 1;
+        bandCacheWriteQueue.push(
+          env.UK_AQ_HISTORY_BUCKET.put(
+            dayCacheKey,
+            JSON.stringify(dayCachePayload),
+            {
+              httpMetadata: {
+                contentType: "application/json; charset=utf-8",
+              },
+            },
+          ),
+        );
+      }
     }
   }
 
@@ -1291,6 +1584,15 @@ async function readHistoryRows({
       max_parquet_files_per_request: maxParquetFilesPerRequest,
       max_scan_elapsed_ms: maxScanElapsedMs,
       scan_stopped_reason: scanStoppedReason,
+    },
+    aqi_band_cache: {
+      enabled: true,
+      prefix: bandCachePrefix,
+      eligible_day_count: bandCacheEligibleDayCount,
+      hit_count: bandCacheHitCount,
+      miss_count: bandCacheMissCount,
+      write_count: bandCacheWriteCount,
+      skipped_day_count: bandCacheSkippedDayCount,
     },
   };
 }
@@ -1448,7 +1750,7 @@ function resolveTimeRange(url) {
   return { ok: true, startIso: start.toISOString(), endIso: end.toISOString() };
 }
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   if (!VALID_PATHS.has(url.pathname)) {
     return jsonResponse({ ok: false, error: "Not found." }, { status: 404, cacheSeconds: 30 });
@@ -1526,6 +1828,15 @@ async function handleRequest(request, env) {
     }, { status: 400, cacheSeconds: 30 });
   }
 
+  const responseFormatRaw = String(url.searchParams.get("format") || "").trim().toLowerCase();
+  if (url.searchParams.has("format") && !AQI_RESPONSE_FORMATS.has(responseFormatRaw)) {
+    return jsonResponse({
+      ok: false,
+      error: "format must be one of json, compact, objects, or tsv.",
+    }, { status: 400, cacheSeconds: 30 });
+  }
+  const responseFormat = normalizeAqiResponseFormat(responseFormatRaw);
+
   const historyPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_HISTORY_PREFIX,
   ) || DEFAULT_HISTORY_PREFIX;
@@ -1557,6 +1868,7 @@ async function handleRequest(request, env) {
   let targetConnectorId = null;
   let targetStationId = null;
   let targetTimeseriesIds = [timeseriesId];
+  const bandCacheWriteTasks = [];
 
   const resolveTimeseriesWindowContext = async () => {
     if (windowContextLookupAttempted) {
@@ -1617,14 +1929,19 @@ async function handleRequest(request, env) {
       env,
       historyPrefix,
       connectorId: historyConnectorId,
+      stationId: parseRequiredPositiveInt(historyContext.station_id),
       targetTimeseriesIds: historyTargetTimeseriesIds,
       startIso: new Date(historyStartMs).toISOString(),
       endIso: new Date(historyEndMs).toISOString(),
       sinceIso,
       pollutantKey: requestedPollutant,
       limit: null,
+      bandCacheWrites: bandCacheWriteTasks,
     })
     : buildEmptyHistoryRead();
+  if (bandCacheWriteTasks.length > 0 && ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(Promise.allSettled(bandCacheWriteTasks));
+  }
 
   let recentFallbackRead = buildEmptyRecentRead();
   const historyScanStoppedReason = r2Read?.timeseries_index?.scan_stopped_reason || null;
@@ -1688,7 +2005,10 @@ async function handleRequest(request, env) {
   const responseComplete = historyScanComplete
     && recentFallbackRead.status !== "fallback_error";
 
-  return jsonResponse({
+  const responseRows = points;
+  const responseColumns = getAqiBandCacheColumns();
+  const compactPoints = responseRows.map((row) => rowToAqiBandCompactRow(row));
+  const responsePayload = {
     ok: true,
     generated_at_utc: new Date().toISOString(),
     history_prefix: historyPrefix,
@@ -1708,7 +2028,10 @@ async function handleRequest(request, env) {
     since_utc: sinceIso,
     row_count: points.length,
     response_complete: responseComplete,
-    points,
+    wire_format: responseFormat === "tsv" ? "tsv" : "json",
+    data_format: responseFormat === "objects" ? "objects" : "compact",
+    columns: responseColumns,
+    points: responseFormat === "objects" ? responseRows : compactPoints,
     coverage: {
       days_scanned: r2Read.days_scanned,
       scanned_connector_manifests: r2Read.scanned_connector_manifests,
@@ -1746,10 +2069,26 @@ async function handleRequest(request, env) {
         ? recentFallbackRead.error
         : null,
     },
-  }, {
-    status: 200,
-    cacheSeconds,
-  });
+  };
+
+  let response;
+  if (responseFormat === "tsv") {
+    response = new Response(buildTsvResponseBody(responseColumns, responseRows), {
+      status: 200,
+      headers: {
+        "Content-Type": "text/tab-separated-values; charset=utf-8",
+        "Cache-Control": cacheControlHeader(cacheSeconds),
+        ...corsHeaders(),
+      },
+    });
+  } else {
+    response = jsonResponse(responsePayload, {
+      status: 200,
+      cacheSeconds,
+    });
+  }
+
+  return response;
 }
 
 export default {
@@ -1784,7 +2123,7 @@ export default {
 
     let response;
     try {
-      response = await handleRequest(request, env);
+      response = await handleRequest(request, env, ctx);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       response = jsonResponse({ ok: false, error: message }, {
