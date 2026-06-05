@@ -154,8 +154,13 @@ The checker reuses the same history-integrity local state model:
 
 - local SQLite DB = `UK_AQ_HISTORY_INTEGRITY_DB_PATH`
 - local writable state dirs outside Dropbox
-- logs/reports via the history-integrity env paths
+- logs via `UK_AQ_AQI_GAP_LOG_DIR` and reports via `UK_AQ_AQI_GAP_REPORT_DIR`
 - post-run SQLite copy sync via `UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH`
+
+By convention the Dropbox-backed log and report directories live under:
+
+- `.../uk-aq-history-integrity/aqi_gap_check/logs`
+- `.../uk-aq-history-integrity/aqi_gap_check/reports`
 
 Like the main integrity runner, the checker writes to the local working SQLite DB first and then copies the final DB file to the repo/Dropbox copy after the run.
 
@@ -182,7 +187,7 @@ It also reuses the existing core snapshot tables, especially:
 
 Full JSON reports are written under:
 
-- `$UK_AQ_HISTORY_INTEGRITY_REPORT_DIR/aqi_gap_check/`
+- `$UK_AQ_AQI_GAP_REPORT_DIR/`
 
 A markdown summary file is also written alongside the JSON report.
 

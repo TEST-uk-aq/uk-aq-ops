@@ -19,6 +19,12 @@ Optional query params:
 
 - `scope` (must be `timeseries`; default `timeseries`)
 - `grain` (must be `hourly`; default `hourly`)
+- `format`
+  - default `compact` JSON with `columns` + compact `points` arrays
+  - aliases:
+    - `json` -> compact JSON
+    - `objects` -> row-object JSON
+    - `tsv` -> legacy tab-separated text
 - time range (one of):
   - `from_utc` + `to_utc` (ISO timestamps)
   - aliases: `start_utc`/`end_utc`, `from`/`to`, `start`/`end`
@@ -39,6 +45,8 @@ R2 paths expected:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/manifest.json`
 - connector manifest:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
+- compact immutable-day band cache:
+  - `history/v1/aqilevels/bands/v1/day_utc=YYYY-MM-DD/connector_id=NN/timeseries_ids=.../pollutant=all|pm25|pm10|no2.json`
 - the worker resolves timeseries window context from `uk_aq_public.uk_aq_timeseries_aqi_hourly` (including `connector_id`, `station_id`, and window `timeseries_ids`) and narrows scans accordingly
 - optional AQI timeseries index (fast-path):
   - `${UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
@@ -76,9 +84,9 @@ Useful runtime vars:
 
 Response:
 
-- returns hourly points sorted by `period_start_utc` ascending:
-  - `{ period_start_utc, daqi_index_level, eaqi_index_level, timeseries_id, station_id }`
-- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when recent fallback is used).
+- default JSON response uses `wire_format=json`, `data_format=compact`, `columns`, and compact `points` arrays.
+- `format=objects` returns row-object JSON; `format=tsv` returns a legacy tab-separated payload.
+- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, `coverage.aqi_band_cache`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when recent fallback is used).
 - includes `response_complete` plus scan-completeness diagnostics (`coverage.history_scan_complete` and `coverage.history_scan_stopped_reason`) so clients can detect partial history scans.
 - includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.

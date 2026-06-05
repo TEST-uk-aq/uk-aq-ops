@@ -29,6 +29,11 @@ Optional:
 
 - `scope` (must be `timeseries`; default `timeseries`)
 - `grain` (must be `hourly`; default `hourly`)
+- `format`
+  - default `compact` JSON with `columns` + compact `points` arrays
+  - `json` is accepted as an alias for compact JSON
+  - `objects` returns row-object JSON
+  - `tsv` returns the legacy tab-separated payload
 - time range:
   - `from_utc` + `to_utc` (ISO timestamps)
   - aliases: `start_utc`/`end_utc`, `from`/`to`, `start`/`end`
@@ -71,6 +76,10 @@ Window split behavior:
   - missing/invalid index entries fall back to connector manifest scanning.
 - AQI parquet reads use `timeseries_id` row-group stats plus chunked column reads so the worker does not materialize whole parquet files for single-timeseries requests.
 - Day-level R2 scans are processed newest-first so when scan budgets are hit, recent overlap near the live split is prioritized over older history.
+- Immutable day AQI band objects are cached in R2 under:
+  - `history/v1/aqilevels/bands/v1/day_utc=YYYY-MM-DD/connector_id=NN/timeseries_ids=.../pollutant=all|pm25|pm10|no2.json`
+  - cache reads are only used for full-day immutable windows
+  - writes are queued with `ctx.waitUntil()` after a clean scan of a full-day immutable window completes
 
 ## Required GitHub env/secret targets
 
@@ -124,16 +133,21 @@ Coverage metadata includes fallback status for the recent window:
 - `coverage.target_timeseries_id_count`: number of timeseries ids used for AQI index filtering
 - `coverage.history_scan_complete` / `coverage.history_scan_stopped_reason`: whether the main R2 history scan completed without budget cut-off
 - `coverage.timeseries_index`: AQI index diagnostics for the main history segment (`enabled`, `prefix`, `hit_count`, `miss_count`, `skipped_days_by_file_range`, `skipped_files_by_pollutant`, and warnings)
+- `coverage.aqi_band_cache`: band-cache diagnostics (`enabled`, `prefix`, `eligible_day_count`, `hit_count`, `miss_count`, `write_count`, `skipped_day_count`)
 - `coverage.obs_aqidb_fallback_used`: whether ObsAQIDB fallback rows were merged
 - `coverage.obs_aqidb_fallback_reason`: currently `r2_recent_missing_or_incomplete` when fallback path runs
 - `coverage.obs_aqidb_fallback_recent_r2_point_count`: R2 hourly point count in the recent fallback window
 - `coverage.obs_aqidb_fallback_error`: fallback error when ObsAQIDB fallback fails but R2 data was still returned
 - top-level `response_complete`: `true` when required R2 scans were not cut short by scan budgets
 - top-level `cache_scope`: `recent` or `immutable`
+- top-level `wire_format`: `json` for JSON responses, `tsv` for legacy text
+- top-level `data_format`: `compact` or `objects` when JSON is returned
 
 ## Point payload
 
-Each `points[]` row includes:
+Default `format=compact` JSON returns `columns` plus compact `points[]` arrays. `format=objects` returns row objects.
+
+Each row object includes:
 
 - `period_start_utc`
 - `timeseries_id`
@@ -146,8 +160,8 @@ Each `points[]` row includes:
   - `daqi_pm25_rolling24h_index_level`
   - `daqi_pm10_rolling24h_index_level`
   - `eaqi_no2_index_level`
-  - `eaqi_pm25_index_level`
-  - `eaqi_pm10_index_level`
+- `eaqi_pm25_index_level`
+- `eaqi_pm10_index_level`
 
 When `pollutant` is omitted, the generic pair remains the max-across-supported-pollutants summary for backward compatibility. New chart clients should read the pollutant-specific fields directly.
 

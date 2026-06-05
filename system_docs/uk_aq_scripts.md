@@ -142,7 +142,7 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
   - Local-only AQI gap checker for missing hourly AQI rows.
   - Compares expected AQI row presence from local observations against actual local AQI hourly history.
   - Supports `r2-dropbox` and `db-dump` source modes plus `daily`, `weekly`, `monthly`, and `obsaqidb` profiles.
-  - Writes JSON + markdown reports under `UK_AQ_HISTORY_INTEGRITY_REPORT_DIR/aqi_gap_check/` and stores run summaries in the shared history-integrity SQLite DB.
+  - Writes JSON + markdown reports under `UK_AQ_AQI_GAP_REPORT_DIR/` and stores run summaries in the shared history-integrity SQLite DB. In the deployed env examples, this resolves to `.../uk-aq-history-integrity/aqi_gap_check/reports/`, with logs under the sibling `.../aqi_gap_check/logs/` directory.
 
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py`
   - Python entrypoint. Phase 1: env/path guardrails, SQLite schema
