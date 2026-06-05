@@ -10,8 +10,9 @@ const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
 const MAX_LIMIT = 20000;
 const MAX_RANGE_DAYS = 366;
-const DEFAULT_OBSAQIDB_SOURCE_OF_TRUTH_HOURS = 24 * 7;
-const MAX_OBSAQIDB_SOURCE_OF_TRUTH_HOURS = MAX_RANGE_DAYS * 24;
+const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
+const MAX_INGESTDB_RETENTION_DAYS = 3650;
+const DEFAULT_OBSAQIDB_RECENT_OVERLAP_DAYS = 1;
 const DEFAULT_OBSAQIDB_TIMEOUT_MS = 10000;
 const MIN_OBSAQIDB_TIMEOUT_MS = 2000;
 const MAX_OBSAQIDB_TIMEOUT_MS = 30000;
@@ -1829,22 +1830,26 @@ async function handleRequest(request, env, ctx) {
   ) || DEFAULT_HISTORY_PREFIX;
   const cachePolicy = resolveCachePolicy(env, endIso);
   const { cacheSeconds, cacheScope } = cachePolicy;
-  const obsAqiDbSourceOfTruthHours = parsePositiveInt(
-    env.UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS,
-    DEFAULT_OBSAQIDB_SOURCE_OF_TRUTH_HOURS,
+  const ingestRetentionDays = parsePositiveInt(
+    env.INGESTDB_RETENTION_DAYS,
+    DEFAULT_INGESTDB_RETENTION_DAYS,
     1,
-    MAX_OBSAQIDB_SOURCE_OF_TRUTH_HOURS,
+    MAX_INGESTDB_RETENTION_DAYS,
   );
 
   const nowMs = Date.now();
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
-  const splitBoundaryMs = nowMs - obsAqiDbSourceOfTruthHours * HOUR_MS;
+  const splitBoundaryDayUtc = addUtcDays(toUtcDayFromMs(nowMs), -ingestRetentionDays);
+  const splitBoundaryMs = utcMidnightMs(splitBoundaryDayUtc);
   const splitBoundaryIso = new Date(splitBoundaryMs).toISOString();
+  const recentOverlapMs = DEFAULT_OBSAQIDB_RECENT_OVERLAP_DAYS * DAY_MS;
 
   const historyStartMs = startMs;
   const historyEndMs = endMs;
-  const recentStartMs = startMs > splitBoundaryMs ? startMs : splitBoundaryMs;
+  const recentStartMs = startMs > (splitBoundaryMs - recentOverlapMs)
+    ? startMs
+    : splitBoundaryMs - recentOverlapMs;
   const recentEndMs = endMs;
   const hasHistoryWindow = historyEndMs > historyStartMs;
   const hasRecentWindow = recentEndMs > recentStartMs;
@@ -1940,16 +1945,7 @@ async function handleRequest(request, env, ctx) {
   const recentR2PointCount = hasRecentWindow
     ? countPointsInWindow(r2Read.points, recentStartMs, recentEndMs)
     : 0;
-  const hasRecentWindowMissingKeys = hasRecentWindow && (
-    hasMissingKeyInWindow(r2Read.missing_day_manifest_keys, recentStartMs, recentEndMs)
-    || hasMissingKeyInWindow(r2Read.missing_connector_manifest_keys, recentStartMs, recentEndMs)
-    || hasMissingKeyInWindow(r2Read.missing_parquet_keys, recentStartMs, recentEndMs)
-  );
-  const hasRecentR2CoverageSignals =
-    recentR2PointCount > 0
-    && historyScanComplete
-    && !hasRecentWindowMissingKeys;
-  const shouldFetchRecentFallback = hasRecentWindow && !hasRecentR2CoverageSignals;
+  const shouldFetchRecentFallback = hasRecentWindow;
 
   if (shouldFetchRecentFallback) {
     try {
@@ -1977,7 +1973,7 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // R2 is source-of-truth. ObsAQIDB only fills missing/non-overlapping recent periods.
+  // R2 is source-of-truth. ObsAQIDB only fills the recent ingest overlap.
   const points = mergePointsPreferPrimary(
     r2Read.points,
     recentFallbackRead.points,
@@ -2005,7 +2001,8 @@ async function handleRequest(request, env, ctx) {
     history_prefix: historyPrefix,
     source,
     source_split_boundary_utc: splitBoundaryIso,
-    source_of_truth_hours: obsAqiDbSourceOfTruthHours,
+    source_of_truth_days: ingestRetentionDays,
+    source_of_truth_hours: ingestRetentionDays * 24,
     cache_scope: cacheScope,
     scope,
     grain,
@@ -2041,6 +2038,7 @@ async function handleRequest(request, env, ctx) {
       target_timeseries_id_count: Array.isArray(targetTimeseriesIds)
         ? targetTimeseriesIds.length
         : 0,
+      ingest_retention_days: ingestRetentionDays,
       history_scan_complete: historyScanComplete,
       history_scan_stopped_reason: historyScanStoppedReason,
       timeseries_index: r2Read.timeseries_index,
@@ -2054,7 +2052,7 @@ async function handleRequest(request, env, ctx) {
       obs_aqidb_window_to_utc: hasRecentWindow ? new Date(recentEndMs).toISOString() : null,
       obs_aqidb_fallback_used: recentFallbackRead.status === "fallback_live",
       obs_aqidb_fallback_reason: shouldFetchRecentFallback
-        ? "r2_recent_missing_or_incomplete"
+        ? "recent_window_overlap"
         : null,
       obs_aqidb_fallback_recent_r2_point_count: recentR2PointCount,
       obs_aqidb_fallback_error: recentFallbackRead.status === "fallback_error"

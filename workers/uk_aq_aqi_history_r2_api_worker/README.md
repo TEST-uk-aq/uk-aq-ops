@@ -58,9 +58,9 @@ R2 paths expected:
 Serving rule:
 
 - R2 history is always read first across the full requested window.
-- Recent fallback window is controlled by `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default last 7 days).
-- ObsAQIDB is queried only when recent R2 coverage appears missing/incomplete.
-- ObsAQIDB rows are used as fallback/repairs; overlapping timestamps keep R2 values.
+- Recent ObsAQIDB fallback is controlled by `INGESTDB_RETENTION_DAYS` (default 5 in the shared env map; 4 in the current test `.env`) with a one-day overlap at the cutover.
+- ObsAQIDB is queried whenever the requested window overlaps that ingest retention window.
+- ObsAQIDB rows are used as fallback/repairs; overlapping timestamps keep R2 values, so R2 always wins on shared timestamps.
 - R2 uses committed day manifests:
   - a UTC day is served only when the day manifest exists.
   - no `_SUCCESS` marker or loose parquet scan fallback is used.
@@ -75,7 +75,7 @@ Required runtime secrets for stitched mode:
 
 Useful runtime vars:
 
-- `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default `168`)
+- `INGESTDB_RETENTION_DAYS` (default `5`)
 - `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS` (default `10000`)
 - `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE` (default `5000`)
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)

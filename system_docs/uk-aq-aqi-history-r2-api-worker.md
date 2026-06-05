@@ -49,8 +49,8 @@ Optional:
 Window split behavior:
 
 - worker reads R2 first across the full requested range.
-- `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS` (default `168`) defines the recent fallback window eligible for ObsAQIDB repairs.
-- worker calls ObsAQIDB only when recent R2 coverage appears missing or incomplete.
+- `INGESTDB_RETENTION_DAYS` (default `5`) defines the recent ObsAQIDB merge window, with a one-day overlap at the cutover.
+- worker calls ObsAQIDB whenever the requested range overlaps that ingest retention window.
 - overlapping timestamps are de-duplicated by hour, with R2 rows winning.
 - if ObsAQIDB fallback fails, R2 results are still returned when available.
 - cache TTL is also dynamic by the requested end time:
@@ -107,7 +107,7 @@ Variables:
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED=true`
 - `UK_AQ_AQI_HISTORY_R2_CACHE_MAX_AGE_SECONDS=300`
 - `UK_AQ_AQI_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS=86400`
-- `UK_AQ_AQI_HISTORY_SOURCE_OF_TRUTH_HOURS=168` (default)
+- `INGESTDB_RETENTION_DAYS=5` (default)
 - `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS=10000` (default)
 - `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE=5000` (default)
 - `UK_AQ_PUBLIC_SCHEMA=uk_aq_public`
@@ -126,6 +126,7 @@ Coverage metadata includes fallback status for the recent window:
 
 - `coverage.obs_aqidb_status`: `not_requested`, `fallback_live`, or `fallback_error`
 - `coverage.obs_aqidb_error`: fallback read error message when present
+- `coverage.ingest_retention_days`: retention days used for the recent merge window
 - `coverage.target_connector_id`: resolved connector id for the requested timeseries window context when lookup succeeds
 - `coverage.target_station_id`: resolved station id for the requested timeseries window context (metadata only; parquet filtering is timeseries-based)
 - `coverage.timeseries_window_context_lookup_source_path`: PostgREST source used for timeseries window context lookup
@@ -137,9 +138,10 @@ Coverage metadata includes fallback status for the recent window:
 - `coverage.aqi_band_cache`: band-cache diagnostics (`enabled`, `prefix`, `eligible_day_count`, `hit_count`, `miss_count`, `write_count`, `skipped_day_count`)
 - `coverage.resolved_connector_id`: connector id discovered from R2 when ObsAQIDB context lookup misses
 - `coverage.obs_aqidb_fallback_used`: whether ObsAQIDB fallback rows were merged
-- `coverage.obs_aqidb_fallback_reason`: currently `r2_recent_missing_or_incomplete` when fallback path runs
+- `coverage.obs_aqidb_fallback_reason`: `recent_window_overlap` when the deterministic ObsAQIDB merge window is queried
 - `coverage.obs_aqidb_fallback_recent_r2_point_count`: R2 hourly point count in the recent fallback window
 - `coverage.obs_aqidb_fallback_error`: fallback error when ObsAQIDB fallback fails but R2 data was still returned
+- top-level `source_of_truth_days` / `source_of_truth_hours`: derived from `INGESTDB_RETENTION_DAYS`
 - top-level `response_complete`: `true` when required R2 scans were not cut short by scan budgets
 - top-level `cache_scope`: `recent` or `immutable`
 - top-level `wire_format`: `json` for JSON responses, `tsv` for legacy text
