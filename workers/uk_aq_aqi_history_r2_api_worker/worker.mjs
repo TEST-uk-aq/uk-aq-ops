@@ -1256,34 +1256,6 @@ async function readHistoryRows({
     };
   }
 
-  if (!Number.isFinite(Number(connectorId)) || Number(connectorId) <= 0) {
-    return {
-      points: [],
-      days_scanned: days.length,
-      scanned_connector_manifests: 0,
-      scanned_parquet_files: 0,
-      missing_day_manifest_keys: [],
-      missing_connector_manifest_keys: [],
-      missing_parquet_keys: [],
-      timeseries_index: {
-        enabled: timeseriesIndexEnabled,
-        prefix: timeseriesIndexPrefix,
-        scanned_connector_index_keys: 0,
-        hit_count: 0,
-        miss_count: 0,
-        skipped_days_by_file_range: 0,
-        skipped_files_by_pollutant: 0,
-        indexed_file_count_seen: 0,
-        unknown_range_file_count_seen: 0,
-        missing_connector_index_keys: [],
-        warnings: [
-          "No connector context available for target timeseries; skipped R2 history scan.",
-        ],
-        target_timeseries_id_count: targetTimeseriesIdCount,
-      },
-    };
-  }
-
   const rowsByPeriodStart = new Map();
   const missingDayManifestKeys = [];
   const missingConnectorManifestKeys = new Set();
@@ -1293,6 +1265,7 @@ async function readHistoryRows({
   const timeseriesIndexMissingKeys = [];
   const timeseriesIndexWarnings = [];
   let scannedConnectorManifests = 0;
+  let resolvedConnectorId = parseRequiredPositiveInt(connectorId) || null;
   let timeseriesIndexHitCount = 0;
   let timeseriesIndexMissCount = 0;
   let timeseriesIndexSkippedByRangeDays = 0;
@@ -1320,20 +1293,20 @@ async function readHistoryRows({
     const dayBandCacheEligible = requestCoversFullDay && sinceKeepsFullDay;
     const dayRowsByPeriodStart = new Map();
     let dayCacheComplete = true;
-    let dayCacheKey = null;
+    let dayCacheLookupKey = null;
 
-    if (dayBandCacheEligible) {
-      dayCacheKey = buildAqiBandCacheKey({
+    if (dayBandCacheEligible && resolvedConnectorId) {
+      dayCacheLookupKey = buildAqiBandCacheKey({
         bandsPrefix: bandCachePrefix,
         dayUtc,
-        connectorId,
+        connectorId: resolvedConnectorId,
         timeseriesIds: targetTimeseriesIds,
         pollutantKey,
       });
-      if (dayCacheKey) {
+      if (dayCacheLookupKey) {
         bandCacheEligibleDayCount += 1;
         try {
-          const cachedBandObject = await fetchJsonObjectFromR2(env, dayCacheKey);
+          const cachedBandObject = await fetchJsonObjectFromR2(env, dayCacheLookupKey);
           if (
             cachedBandObject.exists
             && cachedBandObject.value
@@ -1505,6 +1478,9 @@ async function readHistoryRows({
           dayCacheComplete = false;
           continue;
         }
+        if (!resolvedConnectorId) {
+          resolvedConnectorId = targetConnectorId;
+        }
         appendFilteredRows(parquet.rows, {
           targetTimeseriesIds,
           startMs,
@@ -1524,11 +1500,21 @@ async function readHistoryRows({
       break;
     }
 
-    if (dayBandCacheEligible && dayCacheKey && dayCacheComplete) {
+    if (dayBandCacheEligible && dayCacheComplete && resolvedConnectorId) {
+      const dayCacheWriteKey = buildAqiBandCacheKey({
+        bandsPrefix: bandCachePrefix,
+        dayUtc,
+        connectorId: resolvedConnectorId,
+        timeseriesIds: targetTimeseriesIds,
+        pollutantKey,
+      });
+      if (!dayCacheWriteKey) {
+        continue;
+      }
       const dayCachePayload = buildAqiBandCachePayload({
         dayUtc,
         historyPrefix,
-        connectorId,
+        connectorId: resolvedConnectorId,
         stationId,
         timeseriesIds: targetTimeseriesIds,
         pollutantKey,
@@ -1541,7 +1527,7 @@ async function readHistoryRows({
         bandCacheWriteCount += 1;
         bandCacheWriteQueue.push(
           env.UK_AQ_HISTORY_BUCKET.put(
-            dayCacheKey,
+            dayCacheWriteKey,
             JSON.stringify(dayCachePayload),
             {
               httpMetadata: {
@@ -1563,10 +1549,11 @@ async function readHistoryRows({
     points,
     days_scanned: days.length,
     scanned_connector_manifests: scannedConnectorManifests,
-    scanned_parquet_files: scannedParquetKeys.size,
-    missing_day_manifest_keys: missingDayManifestKeys,
-    missing_connector_manifest_keys: Array.from(missingConnectorManifestKeys.values()),
-    missing_parquet_keys: Array.from(missingParquetKeys.values()),
+      scanned_parquet_files: scannedParquetKeys.size,
+      resolved_connector_id: resolvedConnectorId,
+      missing_day_manifest_keys: missingDayManifestKeys,
+      missing_connector_manifest_keys: Array.from(missingConnectorManifestKeys.values()),
+      missing_parquet_keys: Array.from(missingParquetKeys.values()),
     timeseries_index: {
       enabled: timeseriesIndexEnabled,
       prefix: timeseriesIndexPrefix,
@@ -1939,6 +1926,10 @@ async function handleRequest(request, env, ctx) {
       bandCacheWrites: bandCacheWriteTasks,
     })
     : buildEmptyHistoryRead();
+  const resolvedR2ConnectorId = parseRequiredPositiveInt(r2Read.resolved_connector_id);
+  if (!targetConnectorId && resolvedR2ConnectorId) {
+    targetConnectorId = resolvedR2ConnectorId;
+  }
   if (bandCacheWriteTasks.length > 0 && ctx && typeof ctx.waitUntil === "function") {
     ctx.waitUntil(Promise.allSettled(bandCacheWriteTasks));
   }
@@ -2041,6 +2032,7 @@ async function handleRequest(request, env, ctx) {
       missing_parquet_keys: r2Read.missing_parquet_keys,
       target_connector_id: targetConnectorId,
       target_station_id: targetStationId,
+      resolved_connector_id: resolvedR2ConnectorId,
       timeseries_window_context_lookup_source_path: windowContextSourcePath,
       timeseries_window_context_lookup_error: windowContextLookupError,
       timeseries_window_context_lookup_cache_hit: windowContextLookupAttempted
