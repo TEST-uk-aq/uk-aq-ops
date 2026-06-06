@@ -40,7 +40,7 @@ Serving rule:
 - when the optional timeseries index exists, file selection is narrowed by:
   - `min_timeseries_id/max_timeseries_id`
   - and, when present in index file metadata, `min_observed_at/max_observed_at` overlap with the requested time window (`start_utc`/`end_utc`/`since_utc`)
-- if the optional timeseries index is missing/invalid for a day+connector, the worker falls back to connector manifest file scanning.
+- if the optional timeseries index is missing/invalid for a day+connector, including an empty or otherwise unusable index manifest, the worker falls back to connector manifest file scanning.
 
 Response:
 

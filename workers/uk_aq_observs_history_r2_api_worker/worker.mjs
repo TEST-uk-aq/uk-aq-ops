@@ -698,11 +698,15 @@ async function readHistoryRows({
           timeseriesIndexSkippedByTimeRangeFiles +=
             extraction.skipped_by_time_range_file_count;
           parquetKeys = extraction.keys;
-          if (
-            extraction.all_files_range_bounded && extraction.keys.length === 0
-          ) {
-            timeseriesIndexSkippedByRangeDays += 1;
-            continue;
+          if (extraction.keys.length === 0) {
+            if (extraction.all_files_range_bounded) {
+              timeseriesIndexSkippedByRangeDays += 1;
+              continue;
+            }
+            parquetKeys = null;
+            timeseriesIndexWarnings.push(
+              `Optional timeseries index had no usable file entries for ${connectorIndexKey}; falling back to connector manifest scanning.`,
+            );
           }
         } else {
           timeseriesIndexMissCount += 1;
