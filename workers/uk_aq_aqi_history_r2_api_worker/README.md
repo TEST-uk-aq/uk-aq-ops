@@ -57,10 +57,10 @@ R2 paths expected:
 
 Serving rule:
 
-- R2 history is always read first across the full requested window.
-- Recent ObsAQIDB fallback is controlled by `INGESTDB_RETENTION_DAYS` (default 5 in the shared env map; 4 in the current test `.env`) with a one-day overlap at the cutover.
-- ObsAQIDB is queried whenever the requested window overlaps that ingest retention window.
-- ObsAQIDB rows are used as fallback/repairs; overlapping timestamps keep R2 values, so R2 always wins on shared timestamps.
+- R2 history is read only for the portion of the requested window older than the ingest retention cutover.
+- Recent ObsAQIDB coverage is controlled by `INGESTDB_RETENTION_DAYS` (default 5 in the shared env map; 4 in the current test `.env`) with a one-day overlap at the cutover.
+- ObsAQIDB is queried for the recent slice whenever the requested window overlaps that ingest retention window.
+- ObsAQIDB rows are used as fallback/repairs for the recent slice; overlapping timestamps keep R2 values, so R2 wins on the one-day overlap before the cutover.
 - R2 uses committed day manifests:
   - a UTC day is served only when the day manifest exists.
   - no `_SUCCESS` marker or loose parquet scan fallback is used.

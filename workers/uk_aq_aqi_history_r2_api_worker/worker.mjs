@@ -1846,7 +1846,9 @@ async function handleRequest(request, env, ctx) {
   const recentOverlapMs = DEFAULT_OBSAQIDB_RECENT_OVERLAP_DAYS * DAY_MS;
 
   const historyStartMs = startMs;
-  const historyEndMs = endMs;
+  // R2 only covers history older than the ingest retention window.
+  // Keep a one-day overlap so any boundary-day rows still prefer R2 when both sources exist.
+  const historyEndMs = Math.min(endMs, splitBoundaryMs);
   const recentStartMs = startMs > (splitBoundaryMs - recentOverlapMs)
     ? startMs
     : splitBoundaryMs - recentOverlapMs;
