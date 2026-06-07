@@ -15,11 +15,11 @@ TIMESERIES_ID="354"
 STATION_ID="1575"
 POLLUTANT_CODE="pm25"
 
-FROM_UTC="2026-03-28 00:00:00"
-TO_UTC_EXCLUSIVE="2026-04-12 00:00:00"
+FROM_UTC="2026-04-25 00:00:00"
+TO_UTC_EXCLUSIVE="2026-05-10 00:00:00"
 
-FROM_DAY_UTC="2026-03-28"
-TO_DAY_UTC="2026-04-11"
+FROM_DAY_UTC="2026-04-25"
+TO_DAY_UTC="2026-05-10"
 
 OUT_DIR="./r2_aqi_gap_check_${TIMESERIES_ID}_${POLLUTANT_CODE}_$(date +%Y%m%d_%H%M%S)"
 
@@ -80,7 +80,7 @@ select
   filename
 from read_parquet(
   [
-    '${BASE_DIR}/v1/observations/day_utc=2026-03-*/connector_id=*/*.parquet',
+    '${BASE_DIR}/v1/observations/day_utc=2026-05-*/connector_id=*/*.parquet',
     '${BASE_DIR}/v1/observations/day_utc=2026-04-*/connector_id=*/*.parquet'
   ],
   hive_partitioning = true,
@@ -113,7 +113,7 @@ select
   filename
 from read_parquet(
   [
-    '${BASE_DIR}/v1/aqilevels/day_utc=2026-03-*/connector_id=*/*.parquet',
+    '${BASE_DIR}/v1/aqilevels/day_utc=2026-05-*/connector_id=*/*.parquet',
     '${BASE_DIR}/v1/aqilevels/day_utc=2026-04-*/connector_id=*/*.parquet'
   ],
   hive_partitioning = true,
@@ -213,7 +213,7 @@ create or replace temp view obs_index_manifests as
 select *
 from read_json_auto(
   [
-    '${BASE_DIR}/_index/observations_timeseries/day_utc=2026-03-*/connector_id=*/*.json',
+    '${BASE_DIR}/_index/observations_timeseries/day_utc=2026-05-*/connector_id=*/*.json',
     '${BASE_DIR}/_index/observations_timeseries/day_utc=2026-04-*/connector_id=*/*.json'
   ],
   filename = true,
@@ -224,7 +224,7 @@ create or replace temp view aqi_index_manifests as
 select *
 from read_json_auto(
   [
-    '${BASE_DIR}/_index/aqilevels_timeseries/day_utc=2026-03-*/connector_id=*/*.json',
+    '${BASE_DIR}/_index/aqilevels_timeseries/day_utc=2026-05-*/connector_id=*/*.json',
     '${BASE_DIR}/_index/aqilevels_timeseries/day_utc=2026-04-*/connector_id=*/*.json'
   ],
   filename = true,
