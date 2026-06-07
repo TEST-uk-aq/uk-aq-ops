@@ -7,7 +7,6 @@ import {
   mergeSlices,
   normalizeObservedRow,
   resolveTimeseriesWindowBounds,
-  subtractCoveredTailInterval,
 } from "./timeseries_v2_stitch.mjs";
 
 export interface Env {
@@ -228,6 +227,7 @@ const AQI_HISTORY_UPSTREAM_MAX_ATTEMPTS = 6;
 const AQI_HISTORY_UPSTREAM_RETRY_DELAY_MS = 700;
 const UPSTREAM_RETRY_STATUSES = new Set([502, 503, 504]);
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 const AQI_HISTORY_CANONICALIZE_MIN_WINDOW_MS = 3 * 24 * HOUR_MS;
 const AQI_HISTORY_START_KEYS = ["from_utc", "start_utc", "from", "start"] as const;
 const AQI_HISTORY_END_KEYS = ["to_utc", "end_utc", "to", "end"] as const;
@@ -1368,8 +1368,8 @@ async function fetchR2ObservationsPaged(
 
   return {
     rows: Array.from(rowsByObservedAt.values()).sort((left, right) => {
-      const leftMs = parseIsoMsOrNull(left?.observed_at ?? null) ?? 0;
-      const rightMs = parseIsoMsOrNull(right?.observed_at ?? null) ?? 0;
+      const leftMs = parseIsoMsOrNull(String(left?.observed_at ?? "")) ?? 0;
+      const rightMs = parseIsoMsOrNull(String(right?.observed_at ?? "")) ?? 0;
       return leftMs - rightMs;
     }),
     coverage: mergedCoverage,
@@ -1515,6 +1515,29 @@ async function stitchTimeseriesV2FromR2AndIngest(
     return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
   }
 
+  const maxTailSpanMs = runtime.maxSupabaseTailHours * HOUR_MS;
+  const ingestTailStartMs = Math.max(
+    requestWindow.requestStartMs,
+    requestWindow.requestEndMs - maxTailSpanMs + DAY_MS,
+  );
+  const ingestOverlapStartMs = Math.max(
+    requestWindow.requestStartMs,
+    ingestTailStartMs - DAY_MS,
+  );
+  const r2HistoryEndMs = Math.max(requestWindow.requestStartMs, ingestTailStartMs);
+  const shouldFetchR2History = r2HistoryEndMs > requestWindow.requestStartMs;
+
+  if (!shouldFetchR2History) {
+    return buildTimeseriesV2FallbackEnvelope(
+      requestUrl,
+      originPayload,
+      cacheStatus,
+      "origin_only_v2_wrapper_recent_window",
+      [],
+      [],
+    );
+  }
+
   if (!deps.r2HistoryApiUrl) {
     return buildTimeseriesV2FallbackEnvelope(
       requestUrl,
@@ -1531,7 +1554,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
     deps.sbSecretKey,
     requestWindow.timeseriesId,
   );
-  if (connectorId === null || !deps.r2HistoryApiUrl) {
+  if (connectorId === null) {
     return buildTimeseriesV2FallbackEnvelope(
       requestUrl,
       originPayload,
@@ -1552,7 +1575,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
         timeseriesId: requestWindow.timeseriesId,
         connectorId,
         startUtc: requestStartUtc,
-        endUtc: requestEndUtc,
+        endUtc: toIsoSafe(r2HistoryEndMs),
         sinceUtc: overlapSince,
         pageLimitRows: runtime.maxR2ObjectsPerRequest,
         maxPages: TIMESERIES_V2_MAX_R2_PAGES_PER_REQUEST,
@@ -1571,12 +1594,10 @@ async function stitchTimeseriesV2FromR2AndIngest(
   }
 
   const coverage = computeCoverageFromRows(r2Rows) as { coverageStart: string | null; coverageEnd: string | null };
-  const tail = subtractCoveredTailInterval(
-    requestWindow.requestStartMs,
-    requestWindow.requestEndMs,
-    coverage.coverageEnd,
-  ) as { tailStartMs: number; tailEndMs: number };
-  const maxTailSpanMs = runtime.maxSupabaseTailHours * HOUR_MS;
+  const tail = {
+    tailStartMs: ingestOverlapStartMs,
+    tailEndMs: requestWindow.requestEndMs,
+  };
 
   const missingKeys = [
     ...(
