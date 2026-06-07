@@ -1516,16 +1516,20 @@ async function stitchTimeseriesV2FromR2AndIngest(
   }
 
   const maxTailSpanMs = runtime.maxSupabaseTailHours * HOUR_MS;
-  const ingestTailStartMs = Math.max(
-    requestWindow.requestStartMs,
-    requestWindow.requestEndMs - maxTailSpanMs + DAY_MS,
-  );
-  const ingestOverlapStartMs = Math.max(
-    requestWindow.requestStartMs,
-    ingestTailStartMs - DAY_MS,
-  );
-  const r2HistoryEndMs = Math.max(requestWindow.requestStartMs, ingestTailStartMs);
-  const shouldFetchR2History = r2HistoryEndMs > requestWindow.requestStartMs;
+  const recentCutoffMs = Date.now() - maxTailSpanMs;
+  const hasHistoricalCoverage = requestWindow.requestStartMs < recentCutoffMs;
+  const hasRecentCoverage = requestWindow.requestEndMs > recentCutoffMs;
+  const ingestTailStartMs = hasRecentCoverage
+    ? Math.max(requestWindow.requestStartMs, recentCutoffMs - DAY_MS)
+    : requestWindow.requestEndMs;
+  const ingestOverlapStartMs = hasRecentCoverage
+    ? Math.max(requestWindow.requestStartMs, ingestTailStartMs - DAY_MS)
+    : requestWindow.requestEndMs;
+  const r2HistoryEndMs = hasHistoricalCoverage
+    ? Math.min(requestWindow.requestEndMs, recentCutoffMs)
+    : requestWindow.requestStartMs;
+  const shouldFetchR2History = hasHistoricalCoverage &&
+    r2HistoryEndMs > requestWindow.requestStartMs;
 
   if (!shouldFetchR2History) {
     return buildTimeseriesV2FallbackEnvelope(
@@ -1611,13 +1615,17 @@ async function stitchTimeseriesV2FromR2AndIngest(
     ),
   ].map((item) => String(item ?? "")).filter(Boolean);
 
-  const missingSlices = buildMissingDaySlices(
-    missingKeys,
-    requestWindow.requestStartMs,
-    requestWindow.requestEndMs,
-  ) as Array<{ startMs: number; endMs: number; reason: string }>;
+  const missingSlices = hasRecentCoverage
+    ? buildMissingDaySlices(
+      missingKeys,
+      requestWindow.requestStartMs,
+      requestWindow.requestEndMs,
+    ) as Array<{ startMs: number; endMs: number; reason: string }>
+    : [];
   const ingestSlices = mergeSlices([
-    ...(tail.tailEndMs > tail.tailStartMs ? [{ startMs: tail.tailStartMs, endMs: tail.tailEndMs, reason: "tail_after_r2" }] : []),
+    ...(tail.tailEndMs > tail.tailStartMs
+      ? [{ startMs: tail.tailStartMs, endMs: tail.tailEndMs, reason: "tail_after_r2" }]
+      : []),
     ...missingSlices,
   ]) as Array<{ startMs: number; endMs: number; reason: string }>;
 
