@@ -5831,6 +5831,11 @@
           if (parentLoadId && parentLoadId !== operationsLoadSequence) {
             return;
           }
+          if (maybeRedirectToAccessLogin(err, buildApiUrl("daily_task_runs"))) {
+            setStatus("Cloudflare Access login required. Redirecting...");
+            setError("Cloudflare Access login required. Redirecting...");
+            return;
+          }
           const message = err && err.message ? String(err.message) : "Failed to load daily task runs";
           renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows, {
             errorMessage: message,
