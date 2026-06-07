@@ -19,3 +19,4 @@ nohup_MBAir.out
 system_docs_ops.zip
 *.pyc
 *.env
+/scripts/aqi_gaps/r2_aqi_gap_check*
