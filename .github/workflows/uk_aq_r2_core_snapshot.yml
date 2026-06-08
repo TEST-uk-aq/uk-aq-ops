@@ -58,6 +58,15 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Report daily task health (started)
+        id: daily_task_health_started
+        env:
+          SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+          DAILY_TASK_KEY: ops.r2_core_snapshot
+          DAILY_TASK_HEALTH_REPORT_STAGE: started
+        run: node scripts/report_daily_task_health.mjs
+
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
@@ -130,3 +139,14 @@ jobs:
           name: uk-aq-r2-core-snapshot-report
           path: tmp/uk_aq_core_snapshot_to_r2_report.json
           if-no-files-found: ignore
+
+      - name: Report daily task health
+        if: always()
+        env:
+          SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+          DAILY_TASK_KEY: ops.r2_core_snapshot
+          DAILY_TASK_HEALTH_REPORT_STAGE: final
+          DAILY_TASK_HEALTH_RUN_ID: ${{ steps.daily_task_health_started.outputs.health_run_id }}
+          JOB_STATUS: ${{ job.status }}
+        run: node scripts/report_daily_task_health.mjs

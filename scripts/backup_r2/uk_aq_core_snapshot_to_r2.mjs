@@ -22,6 +22,30 @@ const DEFAULT_CORE_PREFIX = normalizePrefix(
 const DEFAULT_SOURCE_SCHEMA = (process.env.UK_AQ_CORE_SNAPSHOT_SCHEMA || "uk_aq_core").trim();
 const DEFAULT_CURSOR_BATCH_ROWS = parsePositiveInt(process.env.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS, 5000);
 const DEFAULT_REPORT_OUT = String(process.env.UK_AQ_R2_CORE_SNAPSHOT_REPORT_OUT || "").trim();
+const CORE_SNAPSHOT_DB_RETRY_MAX_ATTEMPTS = 4;
+const CORE_SNAPSHOT_DB_RETRY_INITIAL_DELAY_MS = 1_000;
+const CORE_SNAPSHOT_DB_RETRY_MAX_DELAY_MS = 10_000;
+const CORE_SNAPSHOT_DB_RETRY_BACKOFF_MULTIPLIER = 2;
+const CORE_SNAPSHOT_DB_RETRYABLE_ERROR_CODES = new Set([
+  "08001",
+  "08003",
+  "08004",
+  "08006",
+  "08007",
+  "53300",
+  "57P01",
+  "57P02",
+  "57P03",
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EPIPE",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ETIMEDOUT",
+]);
 
 const TABLE_EXPORT_CONFIG = Object.freeze({
   connectors: Object.freeze({ order_by: "id" }),
@@ -113,6 +137,109 @@ function assertSimpleSqlIdent(value, label) {
     throw new Error(`Invalid ${label}: ${ident}`);
   }
   return ident;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function describeError(error) {
+  if (error && typeof error === "object") {
+    const parts = [];
+    if ("code" in error && error.code) {
+      parts.push(`code=${String(error.code)}`);
+    }
+    if ("errno" in error && error.errno && error.errno !== error.code) {
+      parts.push(`errno=${String(error.errno)}`);
+    }
+    if ("message" in error && error.message) {
+      parts.push(String(error.message));
+    }
+    if ("detail" in error && error.detail && error.detail !== error.message) {
+      parts.push(String(error.detail));
+    }
+    if (parts.length) {
+      return parts.join(" | ");
+    }
+  }
+  return String(error || "");
+}
+
+function isRetryableCoreSnapshotDbError(error) {
+  const code = String(error?.code || error?.errno || "").trim().toUpperCase();
+  if (CORE_SNAPSHOT_DB_RETRYABLE_ERROR_CODES.has(code)) {
+    return true;
+  }
+
+  const message = describeError(error).toLowerCase();
+  if (!message) {
+    return false;
+  }
+
+  return [
+    "broken pipe",
+    "connection reset",
+    "connection reset by peer",
+    "connection terminated",
+    "could not connect to server",
+    "econnrefused",
+    "econnreset",
+    "ehostunreach",
+    "enetunreach",
+    "eof",
+    "network error",
+    "networkerror",
+    "remaining connection slots are reserved",
+    "server closed the connection unexpectedly",
+    "socket hang up",
+    "temporarily unavailable",
+    "terminating connection",
+    "timed out",
+    "timeout",
+    "too many clients",
+  ].some((token) => message.includes(token));
+}
+
+async function retryTransient(operation, options = {}) {
+  const label = String(options.label || "operation").trim() || "operation";
+  const maxAttempts = Number.isFinite(Number(options.maxAttempts))
+    ? Math.max(1, Math.trunc(Number(options.maxAttempts)))
+    : 1;
+  const initialDelayMs = Number.isFinite(Number(options.initialDelayMs))
+    ? Math.max(0, Math.trunc(Number(options.initialDelayMs)))
+    : 0;
+  const maxDelayMs = Number.isFinite(Number(options.maxDelayMs))
+    ? Math.max(0, Math.trunc(Number(options.maxDelayMs)))
+    : initialDelayMs;
+  const backoffMultiplier = Number.isFinite(Number(options.backoffMultiplier))
+    ? Math.max(1, Number(options.backoffMultiplier))
+    : 2;
+  const shouldRetry = typeof options.shouldRetry === "function"
+    ? options.shouldRetry
+    : () => false;
+
+  let attempt = 1;
+  let delayMs = initialDelayMs;
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      const retryable = attempt < maxAttempts && shouldRetry(error);
+      if (!retryable) {
+        throw error;
+      }
+
+      console.warn(
+        `${label} attempt ${attempt}/${maxAttempts} failed: ${describeError(error) || "<no error message>"}; retrying in ${delayMs}ms`,
+      );
+      await sleep(delayMs);
+      delayMs = Math.min(
+        maxDelayMs,
+        Math.max(delayMs + 1, Math.trunc(delayMs * backoffMultiplier)),
+      );
+      attempt += 1;
+    }
+  }
 }
 
 function writeReport(reportOutPath, payload) {
@@ -222,12 +349,12 @@ async function withPgClient(connectionString, fn) {
     query_timeout: 0,
     application_name: "uk_aq_core_snapshot_to_r2",
   });
-  await client.connect();
   try {
+    await client.connect();
     await client.query("set timezone = 'UTC'");
     return await fn(client);
   } finally {
-    await client.end();
+    await client.end().catch(() => {});
   }
 }
 
@@ -389,32 +516,42 @@ async function main(args) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "uk_aq_core_snapshot_"));
 
   try {
-    const tableArtifacts = await withPgClient(ingestDbUrl, async (client) => {
-      const artifacts = [];
-      for (const table of args.tables) {
-        const config = TABLE_EXPORT_CONFIG[table];
-        const relativePath = `table=${table}/rows.ndjson.gz`;
-        const tempFile = path.join(tmpDir, `${table}.rows.ndjson.gz`);
-        const result = await exportTableToGzip({
-          client,
-          schema: sourceSchema,
-          table,
-          orderBy: config.order_by,
-          outputFile: tempFile,
-          cursorBatchRows: args.cursor_batch_rows,
-        });
+    const tableArtifacts = await retryTransient(
+      () => withPgClient(ingestDbUrl, async (client) => {
+        const artifacts = [];
+        for (const table of args.tables) {
+          const config = TABLE_EXPORT_CONFIG[table];
+          const relativePath = `table=${table}/rows.ndjson.gz`;
+          const tempFile = path.join(tmpDir, `${table}.rows.ndjson.gz`);
+          const result = await exportTableToGzip({
+            client,
+            schema: sourceSchema,
+            table,
+            orderBy: config.order_by,
+            outputFile: tempFile,
+            cursorBatchRows: args.cursor_batch_rows,
+          });
 
-        artifacts.push({
-          table,
-          order_by: config.order_by,
-          relative_path: relativePath,
-          key: `${dayPrefix}/${relativePath}`,
-          temp_file: tempFile,
-          ...result,
-        });
-      }
-      return artifacts;
-    });
+          artifacts.push({
+            table,
+            order_by: config.order_by,
+            relative_path: relativePath,
+            key: `${dayPrefix}/${relativePath}`,
+            temp_file: tempFile,
+            ...result,
+          });
+        }
+        return artifacts;
+      }),
+      {
+        label: "core snapshot DB export",
+        maxAttempts: CORE_SNAPSHOT_DB_RETRY_MAX_ATTEMPTS,
+        initialDelayMs: CORE_SNAPSHOT_DB_RETRY_INITIAL_DELAY_MS,
+        maxDelayMs: CORE_SNAPSHOT_DB_RETRY_MAX_DELAY_MS,
+        backoffMultiplier: CORE_SNAPSHOT_DB_RETRY_BACKOFF_MULTIPLIER,
+        shouldRetry: isRetryableCoreSnapshotDbError,
+      },
+    );
 
     const checksumsLines = tableArtifacts
       .map((entry) => `${entry.sha256}  ${entry.relative_path}`)
