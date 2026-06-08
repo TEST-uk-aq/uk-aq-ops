@@ -1919,13 +1919,7 @@ async function handleRequest(request, env, ctx) {
     };
   };
 
-  const historyContext = hasHistoryWindow
-    ? await resolveTimeseriesWindowContext()
-    : {
-      connector_id: null,
-      station_id: null,
-      timeseries_ids: [timeseriesId],
-    };
+  const historyContext = await resolveTimeseriesWindowContext();
   const historyConnectorId = parseRequiredPositiveInt(historyContext.connector_id);
   const historyTargetTimeseriesIds = Array.isArray(historyContext.timeseries_ids)
     ? historyContext.timeseries_ids
