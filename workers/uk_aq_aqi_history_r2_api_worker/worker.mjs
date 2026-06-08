@@ -1671,6 +1671,19 @@ function mergePointsPreferPrimary(primaryPoints, secondaryPoints, limit) {
   return rows;
 }
 
+function countAqiBandValues(points) {
+  const rows = Array.isArray(points) ? points : [];
+  return {
+    parsed_point_count: rows.length,
+    daqi_count: rows.filter((row) =>
+      row?.daqi_index_level !== null && row?.daqi_index_level !== undefined
+    ).length,
+    eaqi_count: rows.filter((row) =>
+      row?.eaqi_index_level !== null && row?.eaqi_index_level !== undefined
+    ).length,
+  };
+}
+
 function countPointsInWindow(points, startMs, endMs) {
   if (!Array.isArray(points) || points.length === 0) {
     return 0;
@@ -1997,6 +2010,7 @@ async function handleRequest(request, env, ctx) {
   const responseRows = points;
   const responseColumns = getAqiBandCacheColumns();
   const compactPoints = responseRows.map((row) => rowToAqiBandCompactRow(row));
+  const aqiCounts = countAqiBandValues(responseRows);
   const responsePayload = {
     ok: true,
     generated_at_utc: new Date().toISOString(),
@@ -2022,6 +2036,36 @@ async function handleRequest(request, env, ctx) {
     data_format: responseFormat === "objects" ? "objects" : "compact",
     columns: responseColumns,
     points: responseFormat === "objects" ? responseRows : compactPoints,
+    meta: {
+      source,
+      response_complete: responseComplete,
+      row_count: points.length,
+      raw_row_count: points.length,
+      parsed_point_count: aqiCounts.parsed_point_count,
+      daqi_count: aqiCounts.daqi_count,
+      eaqi_count: aqiCounts.eaqi_count,
+      data_format: responseFormat === "objects" ? "objects" : "compact",
+      wire_format: responseFormat === "tsv" ? "tsv" : "json",
+      timeseries_id: timeseriesId,
+      station_id: targetStationId,
+      connector_id: targetConnectorId,
+      pollutant: requestedPollutant,
+      query_from_utc: startIso,
+      query_to_utc: endIso,
+      source_split_boundary_utc: splitBoundaryIso,
+      source_of_truth_days: ingestRetentionDays,
+      source_of_truth_hours: ingestRetentionDays * 24,
+      coverage: {
+        ingest_retention_days: ingestRetentionDays,
+        history_window_from_utc: hasHistoryWindow ? new Date(historyStartMs).toISOString() : null,
+        history_window_to_utc: hasHistoryWindow ? new Date(historyEndMs).toISOString() : null,
+        obs_aqidb_window_from_utc: hasRecentWindow ? new Date(recentStartMs).toISOString() : null,
+        obs_aqidb_window_to_utc: hasRecentWindow ? new Date(recentEndMs).toISOString() : null,
+        history_scan_complete: historyScanComplete,
+        history_scan_stopped_reason: historyScanStoppedReason,
+        obs_aqidb_status: recentFallbackRead.status,
+      },
+    },
     coverage: {
       days_scanned: r2Read.days_scanned,
       scanned_connector_manifests: r2Read.scanned_connector_manifests,

@@ -107,6 +107,8 @@ EXCLUDES=(
   --exclude='uk_aq_inject_project_ref.mjs'
   --exclude='index.html'
   --exclude='*sidebar.js'
+  
+  --exclude='r2_aqi_gap_check*'
 )
 
 # ── Sync function ─────────────────────────────────────────────────────────────
