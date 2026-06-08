@@ -204,7 +204,7 @@ Key optional controls:
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`; default `dev`)
 
 Website observation API note:
-- `uk_aq_timeseries` now uses ingestdb for the freshest `24` hours (`UK_AQ_TIMESERIES_INGEST_SOURCE_OF_TRUTH_HOURS`), `obs_aqidb` for the next `6` days in the local `7`-day window (`UK_AQ_TIMESERIES_OBSAQIDB_SOURCE_OF_TRUTH_HOURS`, default `168`), and R2 for older history.
+- `uk_aq_timeseries` now uses `INGESTDB_RETENTION_DAYS` as the single split control. The freshest retention window comes from ingestdb, and older observation history comes from R2 history. ObsAQIDB is not used for observation line chart data.
 
 Phase B required env/secrets:
 
