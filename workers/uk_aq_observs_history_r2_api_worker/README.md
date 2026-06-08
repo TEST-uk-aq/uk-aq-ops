@@ -46,8 +46,10 @@ Response:
 
 - returns `{ observed_at, value }` rows sorted by `observed_at` ascending.
 - includes `cache_scope` (`recent` or `immutable`) for cache policy visibility.
+- includes top-level `response_complete`, `has_gap`, `coverage_state`, and `partial_reasons`.
 - includes coverage diagnostics (`missing_day_manifest_keys`, etc.).
 - includes `coverage.timeseries_index` diagnostics for index hit/miss/fallback visibility, including `skipped_files_by_time_range`.
+- marks responses partial when required day manifests, connector manifests, parquet objects, row-limit capacity, or uncertain timeseries-index skips/warnings prevent the worker from proving full coverage.
 - sets `x-ukaq-cache: HIT|MISS`.
 
 Cache behavior:

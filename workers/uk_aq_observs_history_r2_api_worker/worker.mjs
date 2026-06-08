@@ -596,9 +596,47 @@ function normalizeAndSortRows(rowsByObservedAt, limit) {
     return leftMs - rightMs;
   });
   if (limit !== null && rows.length > limit) {
-    return rows.slice(0, limit);
+    return {
+      rows: rows.slice(0, limit),
+      limited_by_limit: true,
+      total_rows_before_limit: rows.length,
+    };
   }
-  return rows;
+  return {
+    rows,
+    limited_by_limit: false,
+    total_rows_before_limit: rows.length,
+  };
+}
+
+function summarizeCoverageCompleteness(historyRead) {
+  const partialReasons = [];
+  if (historyRead.missing_day_manifest_keys.length > 0) {
+    partialReasons.push("missing_day_manifest");
+  }
+  if (historyRead.missing_connector_manifest_keys.length > 0) {
+    partialReasons.push("missing_connector_manifest");
+  }
+  if (historyRead.missing_parquet_keys.length > 0) {
+    partialReasons.push("missing_parquet");
+  }
+  if (historyRead.limited_by_limit) {
+    partialReasons.push("limited_by_limit");
+  }
+  const index = historyRead.timeseries_index || {};
+  if (Number(index.skipped_days_by_file_range) > 0) {
+    partialReasons.push("timeseries_index_skipped_day");
+  }
+  if (Array.isArray(index.warnings) && index.warnings.length > 0) {
+    partialReasons.push("timeseries_index_warning");
+  }
+  const uniqueReasons = Array.from(new Set(partialReasons));
+  return {
+    response_complete: uniqueReasons.length === 0,
+    has_gap: uniqueReasons.length > 0,
+    coverage_state: uniqueReasons.length === 0 ? "complete" : "partial",
+    partial_reasons: uniqueReasons,
+  };
 }
 
 async function readHistoryRows({
@@ -760,9 +798,11 @@ async function readHistoryRows({
     }
   }
 
-  const rows = normalizeAndSortRows(rowsByObservedAt, limit);
+  const normalizedRows = normalizeAndSortRows(rowsByObservedAt, limit);
   return {
-    rows,
+    rows: normalizedRows.rows,
+    limited_by_limit: normalizedRows.limited_by_limit,
+    total_rows_before_limit: normalizedRows.total_rows_before_limit,
     days_scanned: days.length,
     scanned_parquet_files: scannedParquetKeys.length,
     missing_day_manifest_keys: missingDayManifestKeys,
@@ -809,6 +849,7 @@ async function handleRequest(requestParams, env) {
     sinceIso,
     limit,
   });
+  const completeness = summarizeCoverageCompleteness(historyRead);
 
   return jsonResponse({
     ok: true,
@@ -821,10 +862,20 @@ async function handleRequest(requestParams, env) {
     since_utc: sinceIso,
     cache_scope: cacheScope,
     row_count: historyRead.rows.length,
+    response_complete: completeness.response_complete,
+    has_gap: completeness.has_gap,
+    coverage_state: completeness.coverage_state,
+    partial_reasons: completeness.partial_reasons,
     rows: historyRead.rows,
     coverage: {
       days_scanned: historyRead.days_scanned,
       scanned_parquet_files: historyRead.scanned_parquet_files,
+      limited_by_limit: historyRead.limited_by_limit,
+      total_rows_before_limit: historyRead.total_rows_before_limit,
+      response_complete: completeness.response_complete,
+      has_gap: completeness.has_gap,
+      coverage_state: completeness.coverage_state,
+      partial_reasons: completeness.partial_reasons,
       missing_day_manifest_keys: historyRead.missing_day_manifest_keys,
       missing_connector_manifest_keys:
         historyRead.missing_connector_manifest_keys,
