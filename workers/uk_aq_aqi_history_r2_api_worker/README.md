@@ -57,10 +57,13 @@ R2 paths expected:
 
 Serving rule:
 
-- R2 history is read only for the portion of the requested window older than the ingest retention cutover.
-- Recent ObsAQIDB coverage is controlled by `INGESTDB_RETENTION_DAYS` (default 5 in the shared env map; 4 in the current test `.env`) with a one-day overlap at the cutover.
-- ObsAQIDB is queried for the recent slice whenever the requested window overlaps that ingest retention window.
-- ObsAQIDB rows are used as fallback/repairs for the recent slice; overlapping timestamps keep R2 values, so R2 wins on the one-day overlap before the cutover.
+- The request range is split with `INGESTDB_RETENTION_DAYS` into three rolling source zones:
+  - retention range (`now - INGESTDB_RETENTION_DAYS` to now): ObsAQIDB only
+  - one-day overlap (the day before retention): R2 preferred, ObsAQIDB fills only hours missing from R2
+  - historical range (older than the overlap): R2 only
+- R2 history is requested only up to the rolling retention start, never for the retention source window.
+- ObsAQIDB is queried only when the requested window overlaps the one-day overlap or retention range.
+- Overlapping timestamps keep R2 values, so R2 wins in the one-day overlap.
 - R2 uses committed day manifests:
   - a UTC day is served only when the day manifest exists.
   - no `_SUCCESS` marker or loose parquet scan fallback is used.
@@ -87,8 +90,8 @@ Response:
 
 - default JSON response uses `wire_format=json`, `data_format=compact`, `columns`, and compact `points` arrays.
 - `format=objects` returns row-object JSON; `format=tsv` returns a legacy tab-separated payload.
-- includes source and coverage diagnostics (history + obs_aqidb windows/counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, `coverage.aqi_band_cache`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when recent fallback is used).
-- includes `response_complete` plus scan-completeness diagnostics (`coverage.history_scan_complete` and `coverage.history_scan_stopped_reason`) so clients can detect partial history scans.
+- includes source and coverage diagnostics (historical/overlap/retention windows, source coverage intervals, history + obs_aqidb counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, `coverage.aqi_band_cache`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when live fallback is used).
+- includes `response_complete`, `has_gap`, `coverage_state`, and `partial_reasons` plus scan-completeness diagnostics (`coverage.history_scan_complete` and `coverage.history_scan_stopped_reason`) so clients can detect partial history scans.
 - includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.
 

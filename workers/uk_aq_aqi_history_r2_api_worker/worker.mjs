@@ -294,6 +294,30 @@ function addUtcDays(isoDay, deltaDays) {
   return toUtcDayFromMs(utcMidnightMs(isoDay) + deltaDays * DAY_MS);
 }
 
+function makeWindow(startMs, endMs) {
+  if (
+    !Number.isFinite(startMs)
+    || !Number.isFinite(endMs)
+    || endMs <= startMs
+  ) {
+    return null;
+  }
+  return {
+    startMs,
+    endMs,
+    startIso: new Date(startMs).toISOString(),
+    endIso: new Date(endMs).toISOString(),
+  };
+}
+
+function windowStartIso(window) {
+  return window ? window.startIso : null;
+}
+
+function windowEndIso(window) {
+  return window ? window.endIso : null;
+}
+
 function listUtcDays(startIso, endIso) {
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
@@ -1701,6 +1725,40 @@ function countPointsInWindow(points, startMs, endMs) {
   return count;
 }
 
+function filterPointsToWindow(points, startMs, endMs) {
+  if (!Array.isArray(points) || points.length === 0) {
+    return [];
+  }
+  return points.filter((point) => {
+    const periodStartMs = Date.parse(String(point?.period_start_utc || ""));
+    return Number.isFinite(periodStartMs)
+      && periodStartMs >= startMs
+      && periodStartMs < endMs;
+  });
+}
+
+function pointHourKey(point) {
+  const periodStartMs = Date.parse(String(point?.period_start_utc || ""));
+  if (!Number.isFinite(periodStartMs)) {
+    return null;
+  }
+  return new Date(Math.floor(periodStartMs / HOUR_MS) * HOUR_MS).toISOString();
+}
+
+function filterPointsToMissingHours(candidatePoints, preferredPoints, startMs, endMs) {
+  const preferredHourKeys = new Set();
+  for (const point of filterPointsToWindow(preferredPoints, startMs, endMs)) {
+    const key = pointHourKey(point);
+    if (key) {
+      preferredHourKeys.add(key);
+    }
+  }
+  return filterPointsToWindow(candidatePoints, startMs, endMs).filter((point) => {
+    const key = pointHourKey(point);
+    return key !== null && !preferredHourKeys.has(key);
+  });
+}
+
 function hasMissingKeyInWindow(keys, startMs, endMs) {
   if (!Array.isArray(keys) || keys.length === 0) {
     return false;
@@ -1722,6 +1780,33 @@ function hasMissingKeyInWindow(keys, startMs, endMs) {
     }
   }
   return false;
+}
+
+function collectR2PartialReasonsForWindow(r2Read, window) {
+  if (!window) {
+    return [];
+  }
+  const reasons = [];
+  const scanStoppedReason = r2Read?.timeseries_index?.scan_stopped_reason || null;
+  if (scanStoppedReason) {
+    reasons.push(`r2_scan_stopped:${scanStoppedReason}`);
+  }
+  if (hasMissingKeyInWindow(r2Read?.missing_day_manifest_keys, window.startMs, window.endMs)) {
+    reasons.push("missing_day_manifest");
+  }
+  if (
+    hasMissingKeyInWindow(
+      r2Read?.missing_connector_manifest_keys,
+      window.startMs,
+      window.endMs,
+    )
+  ) {
+    reasons.push("missing_connector_manifest");
+  }
+  if (hasMissingKeyInWindow(r2Read?.missing_parquet_keys, window.startMs, window.endMs)) {
+    reasons.push("missing_parquet");
+  }
+  return Array.from(new Set(reasons));
 }
 
 function resolveTimeRange(url) {
@@ -1853,21 +1938,41 @@ async function handleRequest(request, env, ctx) {
   const nowMs = Date.now();
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
-  const splitBoundaryDayUtc = addUtcDays(toUtcDayFromMs(nowMs), -ingestRetentionDays);
-  const splitBoundaryMs = utcMidnightMs(splitBoundaryDayUtc);
-  const splitBoundaryIso = new Date(splitBoundaryMs).toISOString();
-  const recentOverlapMs = DEFAULT_OBSAQIDB_RECENT_OVERLAP_DAYS * DAY_MS;
+  const effectiveEndMs = Math.min(endMs, nowMs);
+  const retentionStartMs = nowMs - ingestRetentionDays * DAY_MS;
+  const overlapStartMs = retentionStartMs -
+    DEFAULT_OBSAQIDB_RECENT_OVERLAP_DAYS * DAY_MS;
+  const splitBoundaryIso = new Date(retentionStartMs).toISOString();
+  const overlapStartIso = new Date(overlapStartMs).toISOString();
 
-  const historyStartMs = startMs;
-  // R2 only covers history older than the ingest retention window.
-  // Keep a one-day overlap so any boundary-day rows still prefer R2 when both sources exist.
-  const historyEndMs = Math.min(endMs, splitBoundaryMs);
-  const recentStartMs = startMs > (splitBoundaryMs - recentOverlapMs)
-    ? startMs
-    : splitBoundaryMs - recentOverlapMs;
-  const recentEndMs = endMs;
-  const hasHistoryWindow = historyEndMs > historyStartMs;
-  const hasRecentWindow = recentEndMs > recentStartMs;
+  const historicalWindow = makeWindow(
+    startMs,
+    Math.min(effectiveEndMs, overlapStartMs),
+  );
+  const overlapWindow = makeWindow(
+    Math.max(startMs, overlapStartMs),
+    Math.min(effectiveEndMs, retentionStartMs),
+  );
+  const retentionWindow = makeWindow(
+    Math.max(startMs, retentionStartMs),
+    effectiveEndMs,
+  );
+  const r2Window = makeWindow(
+    startMs,
+    Math.min(effectiveEndMs, retentionStartMs),
+  );
+  const obsAqiDbWindow = makeWindow(
+    Math.min(
+      overlapWindow ? overlapWindow.startMs : Number.POSITIVE_INFINITY,
+      retentionWindow ? retentionWindow.startMs : Number.POSITIVE_INFINITY,
+    ),
+    Math.max(
+      overlapWindow ? overlapWindow.endMs : Number.NEGATIVE_INFINITY,
+      retentionWindow ? retentionWindow.endMs : Number.NEGATIVE_INFINITY,
+    ),
+  );
+  const hasHistoryWindow = Boolean(r2Window);
+  const hasObsAqiDbWindow = Boolean(obsAqiDbWindow);
   let windowContextSourcePath = null;
   let windowContextLookupError = null;
   let windowContextLookupCacheHit = false;
@@ -1932,8 +2037,8 @@ async function handleRequest(request, env, ctx) {
       connectorId: historyConnectorId,
       stationId: parseRequiredPositiveInt(historyContext.station_id),
       targetTimeseriesIds: historyTargetTimeseriesIds,
-      startIso: new Date(historyStartMs).toISOString(),
-      endIso: new Date(historyEndMs).toISOString(),
+      startIso: r2Window.startIso,
+      endIso: r2Window.endIso,
       sinceIso,
       pollutantKey: requestedPollutant,
       limit: null,
@@ -1951,18 +2056,21 @@ async function handleRequest(request, env, ctx) {
   let recentFallbackRead = buildEmptyRecentRead();
   const historyScanStoppedReason = r2Read?.timeseries_index?.scan_stopped_reason || null;
   const historyScanComplete = historyScanStoppedReason === null;
-  const recentR2PointCount = hasRecentWindow
-    ? countPointsInWindow(r2Read.points, recentStartMs, recentEndMs)
+  const overlapR2Points = overlapWindow
+    ? filterPointsToWindow(r2Read.points, overlapWindow.startMs, overlapWindow.endMs)
+    : [];
+  const recentR2PointCount = overlapWindow
+    ? overlapR2Points.length
     : 0;
-  const shouldFetchRecentFallback = hasRecentWindow;
+  const shouldFetchRecentFallback = hasObsAqiDbWindow;
 
   if (shouldFetchRecentFallback) {
     try {
       const obsAqiRecentRead = await readRecentRowsFromObsAqiDb({
         env,
         timeseriesId,
-        startIso: new Date(recentStartMs).toISOString(),
-        endIso: new Date(recentEndMs).toISOString(),
+        startIso: obsAqiDbWindow.startIso,
+        endIso: obsAqiDbWindow.endIso,
         sinceIso,
         pollutantKey: requestedPollutant,
       });
@@ -1982,24 +2090,121 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // R2 is source-of-truth. ObsAQIDB only fills the recent ingest overlap.
+  const overlapObsAqiDbCandidatePoints = overlapWindow
+    ? filterPointsToWindow(
+      recentFallbackRead.points,
+      overlapWindow.startMs,
+      overlapWindow.endMs,
+    )
+    : [];
+  const overlapObsAqiDbFillPoints = overlapWindow
+    ? filterPointsToMissingHours(
+      overlapObsAqiDbCandidatePoints,
+      overlapR2Points,
+      overlapWindow.startMs,
+      overlapWindow.endMs,
+    )
+    : [];
+  const retentionObsAqiDbPoints = retentionWindow
+    ? filterPointsToWindow(
+      recentFallbackRead.points,
+      retentionWindow.startMs,
+      retentionWindow.endMs,
+    )
+    : [];
+  const obsAqiDbMergePoints = [
+    ...overlapObsAqiDbFillPoints,
+    ...retentionObsAqiDbPoints,
+  ];
+
+  // R2 is source-of-truth for historical/overlap AQI. ObsAQIDB fills only
+  // missing overlap hours and the retention range.
   const points = mergePointsPreferPrimary(
     r2Read.points,
-    recentFallbackRead.points,
+    obsAqiDbMergePoints,
     limit,
   );
   let source = "r2_only";
   if (points.length === 0) {
     source = "no_data_in_window";
-  } else if (r2Read.points.length === 0 && recentFallbackRead.points.length > 0) {
-    source = "obs_aqidb_only_fallback";
-  } else if (recentFallbackRead.points.length > 0) {
-    source = recentR2PointCount > 0
-      ? "r2_plus_obs_aqidb_tail_and_repairs"
-      : "r2_plus_obs_aqidb_tail";
+  } else if (r2Read.points.length === 0 && obsAqiDbMergePoints.length > 0) {
+    source = "obs_aqidb_retention_only";
+  } else if (r2Read.points.length > 0 && obsAqiDbMergePoints.length > 0) {
+    source = overlapObsAqiDbFillPoints.length > 0 && retentionObsAqiDbPoints.length > 0
+      ? "r2_plus_obs_aqidb_overlap_fill_and_retention"
+      : overlapObsAqiDbFillPoints.length > 0
+      ? "r2_plus_obs_aqidb_overlap_fill"
+      : "r2_plus_obs_aqidb_retention";
   }
-  const responseComplete = historyScanComplete
-    && recentFallbackRead.status !== "fallback_error";
+  const historicalR2PartialReasons = collectR2PartialReasonsForWindow(
+    r2Read,
+    historicalWindow,
+  );
+  const overlapR2PartialReasons = collectR2PartialReasonsForWindow(
+    r2Read,
+    overlapWindow,
+  );
+  const partialReasons = new Set([
+    ...historicalR2PartialReasons.map((reason) => `historical:${reason}`),
+  ]);
+  if (hasObsAqiDbWindow && recentFallbackRead.status === "fallback_error") {
+    partialReasons.add(`obs_aqidb:${recentFallbackRead.error || "fallback_error"}`);
+  }
+  const responseComplete = partialReasons.size === 0;
+  const hasGap = !responseComplete;
+  const coverageState = responseComplete ? "complete" : "partial";
+  const partialReasonList = Array.from(partialReasons);
+  const historicalR2PointCount = historicalWindow
+    ? countPointsInWindow(r2Read.points, historicalWindow.startMs, historicalWindow.endMs)
+    : 0;
+  const retentionObsAqiStatus = retentionWindow
+    ? recentFallbackRead.status === "fallback_live"
+      ? "obs_aqidb_live"
+      : recentFallbackRead.status
+    : "not_requested";
+  const overlapObsAqiStatus = overlapWindow
+    ? recentFallbackRead.status === "fallback_live"
+      ? "obs_aqidb_live"
+      : recentFallbackRead.status
+    : "not_requested";
+  const sourceCoverage = [
+    historicalWindow
+      ? {
+        zone: "historical",
+        source: "r2",
+        from_utc: historicalWindow.startIso,
+        to_utc: historicalWindow.endIso,
+        status: historicalR2PartialReasons.length === 0 ? "complete" : "partial",
+        row_count: historicalR2PointCount,
+        partial_reasons: historicalR2PartialReasons,
+      }
+      : null,
+    overlapWindow
+      ? {
+        zone: "overlap",
+        source: "r2_preferred_obs_aqidb_missing_hour_fill",
+        from_utc: overlapWindow.startIso,
+        to_utc: overlapWindow.endIso,
+        status: recentFallbackRead.status === "fallback_error" ? "partial" : "complete",
+        r2_row_count: overlapR2Points.length,
+        obs_aqidb_candidate_row_count: overlapObsAqiDbCandidatePoints.length,
+        obs_aqidb_fill_row_count: overlapObsAqiDbFillPoints.length,
+        r2_partial_reasons: overlapR2PartialReasons,
+        obs_aqidb_status: overlapObsAqiStatus,
+      }
+      : null,
+    retentionWindow
+      ? {
+        zone: "retention",
+        source: "obs_aqidb",
+        from_utc: retentionWindow.startIso,
+        to_utc: retentionWindow.endIso,
+        status: recentFallbackRead.status === "fallback_live" ? "complete" : "partial",
+        row_count: retentionObsAqiDbPoints.length,
+        obs_aqidb_status: retentionObsAqiStatus,
+      }
+      : null,
+  ].filter(Boolean);
 
   const responseRows = points;
   const responseColumns = getAqiBandCacheColumns();
@@ -2011,6 +2216,8 @@ async function handleRequest(request, env, ctx) {
     history_prefix: historyPrefix,
     source,
     source_split_boundary_utc: splitBoundaryIso,
+    overlap_start_utc: overlapStartIso,
+    retention_start_utc: splitBoundaryIso,
     source_of_truth_days: ingestRetentionDays,
     source_of_truth_hours: ingestRetentionDays * 24,
     cache_scope: cacheScope,
@@ -2026,6 +2233,9 @@ async function handleRequest(request, env, ctx) {
     since_utc: sinceIso,
     row_count: points.length,
     response_complete: responseComplete,
+    has_gap: hasGap,
+    coverage_state: coverageState,
+    partial_reasons: partialReasonList,
     wire_format: responseFormat === "tsv" ? "tsv" : "json",
     data_format: responseFormat === "objects" ? "objects" : "compact",
     columns: responseColumns,
@@ -2047,14 +2257,28 @@ async function handleRequest(request, env, ctx) {
       query_from_utc: startIso,
       query_to_utc: endIso,
       source_split_boundary_utc: splitBoundaryIso,
+      overlap_start_utc: overlapStartIso,
+      retention_start_utc: splitBoundaryIso,
       source_of_truth_days: ingestRetentionDays,
       source_of_truth_hours: ingestRetentionDays * 24,
+      has_gap: hasGap,
+      coverage_state: coverageState,
+      partial_reasons: partialReasonList,
       coverage: {
         ingest_retention_days: ingestRetentionDays,
-        history_window_from_utc: hasHistoryWindow ? new Date(historyStartMs).toISOString() : null,
-        history_window_to_utc: hasHistoryWindow ? new Date(historyEndMs).toISOString() : null,
-        obs_aqidb_window_from_utc: hasRecentWindow ? new Date(recentStartMs).toISOString() : null,
-        obs_aqidb_window_to_utc: hasRecentWindow ? new Date(recentEndMs).toISOString() : null,
+        overlap_start_utc: overlapStartIso,
+        retention_start_utc: splitBoundaryIso,
+        historical_window_from_utc: windowStartIso(historicalWindow),
+        historical_window_to_utc: windowEndIso(historicalWindow),
+        overlap_window_from_utc: windowStartIso(overlapWindow),
+        overlap_window_to_utc: windowEndIso(overlapWindow),
+        retention_window_from_utc: windowStartIso(retentionWindow),
+        retention_window_to_utc: windowEndIso(retentionWindow),
+        r2_window_from_utc: windowStartIso(r2Window),
+        r2_window_to_utc: windowEndIso(r2Window),
+        obs_aqidb_window_from_utc: windowStartIso(obsAqiDbWindow),
+        obs_aqidb_window_to_utc: windowEndIso(obsAqiDbWindow),
+        source_coverage: sourceCoverage,
         history_scan_complete: historyScanComplete,
         history_scan_stopped_reason: historyScanStoppedReason,
         obs_aqidb_status: recentFallbackRead.status,
@@ -2079,22 +2303,41 @@ async function handleRequest(request, env, ctx) {
         ? targetTimeseriesIds.length
         : 0,
       ingest_retention_days: ingestRetentionDays,
+      overlap_start_utc: overlapStartIso,
+      retention_start_utc: splitBoundaryIso,
+      response_complete: responseComplete,
+      has_gap: hasGap,
+      coverage_state: coverageState,
+      partial_reasons: partialReasonList,
+      source_coverage: sourceCoverage,
       history_scan_complete: historyScanComplete,
       history_scan_stopped_reason: historyScanStoppedReason,
       timeseries_index: r2Read.timeseries_index,
       obs_aqidb_source_path: recentFallbackRead.source_path,
-      obs_aqidb_row_count: recentFallbackRead.points.length,
+      obs_aqidb_row_count: obsAqiDbMergePoints.length,
+      obs_aqidb_raw_row_count: recentFallbackRead.points.length,
       obs_aqidb_status: recentFallbackRead.status,
       obs_aqidb_error: recentFallbackRead.error,
-      history_window_from_utc: hasHistoryWindow ? new Date(historyStartMs).toISOString() : null,
-      history_window_to_utc: hasHistoryWindow ? new Date(historyEndMs).toISOString() : null,
-      obs_aqidb_window_from_utc: hasRecentWindow ? new Date(recentStartMs).toISOString() : null,
-      obs_aqidb_window_to_utc: hasRecentWindow ? new Date(recentEndMs).toISOString() : null,
+      historical_window_from_utc: windowStartIso(historicalWindow),
+      historical_window_to_utc: windowEndIso(historicalWindow),
+      overlap_window_from_utc: windowStartIso(overlapWindow),
+      overlap_window_to_utc: windowEndIso(overlapWindow),
+      retention_window_from_utc: windowStartIso(retentionWindow),
+      retention_window_to_utc: windowEndIso(retentionWindow),
+      r2_window_from_utc: windowStartIso(r2Window),
+      r2_window_to_utc: windowEndIso(r2Window),
+      obs_aqidb_window_from_utc: windowStartIso(obsAqiDbWindow),
+      obs_aqidb_window_to_utc: windowEndIso(obsAqiDbWindow),
       obs_aqidb_fallback_used: recentFallbackRead.status === "fallback_live",
       obs_aqidb_fallback_reason: shouldFetchRecentFallback
-        ? "recent_window_overlap"
+        ? "overlap_missing_hour_fill_and_retention"
         : null,
       obs_aqidb_fallback_recent_r2_point_count: recentR2PointCount,
+      historical_r2_point_count: historicalR2PointCount,
+      overlap_r2_point_count: overlapR2Points.length,
+      overlap_obs_aqidb_candidate_row_count: overlapObsAqiDbCandidatePoints.length,
+      overlap_obs_aqidb_fill_row_count: overlapObsAqiDbFillPoints.length,
+      retention_obs_aqidb_row_count: retentionObsAqiDbPoints.length,
       obs_aqidb_fallback_error: recentFallbackRead.status === "fallback_error"
         ? recentFallbackRead.error
         : null,
