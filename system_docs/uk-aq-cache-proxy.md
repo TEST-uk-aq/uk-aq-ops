@@ -27,6 +27,8 @@ Read endpoints:
   - `v=2` path (gated by `UK_AQ_TIMESERIES_V2_ENABLED` + `UK_AQ_TIMESERIES_PROXY_FIRST`) now forwards the stitched origin payload from `uk_aq_timeseries` without re-stitching observations in the cache proxy
   - the origin edge function owns the observation source split: ingestdb for the retention range, R2-preferred plus ingestdb missing-hour fill for the one-day overlap, and R2-only for historical ranges
   - the proxy does not use ObsAQIDB for observation line data
+  - incomplete `v=2` responses are returned with `Cache-Control: no-store` and are not written to the Worker cache when origin metadata reports `response_complete=false`, `has_gap=true`, or upstream R2/ingest errors
+  - response headers include `X-UK-AQ-Timeseries-Cacheable` and, when present in origin metadata, `X-UK-AQ-Response-Complete`
   - response headers still include the cache key version and the usual cache headers for the returned payload
 - `/api/aq/stations-chart` -> `uk_aq_stations_chart`
 - `/api/aq/stations` -> `uk_aq_stations`

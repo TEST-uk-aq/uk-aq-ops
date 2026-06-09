@@ -777,7 +777,7 @@ async function readHistoryRows({
       ).filter(Boolean);
     }
 
-    for (const parquetKey of parquetKeys) {
+    for (const parquetKey of Array.from(new Set(parquetKeys))) {
       scannedParquetKeys.push(parquetKey);
       const parquet = await fetchFilteredParquetRowsFromR2(
         env,

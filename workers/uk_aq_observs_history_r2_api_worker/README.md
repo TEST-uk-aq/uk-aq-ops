@@ -41,6 +41,7 @@ Serving rule:
   - `min_timeseries_id/max_timeseries_id`
   - and, when present in index file metadata, `min_observed_at/max_observed_at` overlap with the requested time window (`start_utc`/`end_utc`/`since_utc`)
 - if the optional timeseries index is missing/invalid for a day+connector, including an empty or otherwise unusable index manifest, the worker falls back to connector manifest file scanning.
+- parquet object keys are de-duplicated before scanning so index and connector-manifest paths do not decode the same object more than once.
 
 Response:
 
