@@ -1,0 +1,145 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import {
+  buildConnectorManifestKey,
+  buildDayManifestKey,
+  resolvePhaseBRuntimeConfig,
+} from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import {
+  hasRequiredR2Config,
+  r2GetObject,
+} from "../../workers/shared/r2_sigv4.mjs";
+
+function usage() {
+  console.log(
+    "Usage: node scripts/backup_r2/download_day.mjs --day YYYY-MM-DD [--connector N] --out <dir>",
+  );
+}
+
+function parseArgs(argv) {
+  const args = {
+    day: "",
+    connector: null,
+    out: "",
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--day") {
+      args.day = String(argv[i + 1] || "").trim();
+      i += 1;
+      continue;
+    }
+    if (arg === "--connector") {
+      const raw = String(argv[i + 1] || "").trim();
+      args.connector = raw ? Number(raw) : null;
+      i += 1;
+      continue;
+    }
+    if (arg === "--out") {
+      args.out = String(argv[i + 1] || "").trim();
+      i += 1;
+      continue;
+    }
+    if (arg === "-h" || arg === "--help") {
+      usage();
+      process.exit(0);
+    }
+    throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(args.day)) {
+    throw new Error("--day must be YYYY-MM-DD");
+  }
+  if (!args.out) {
+    throw new Error("--out is required");
+  }
+  if (args.connector !== null && (!Number.isFinite(args.connector) || args.connector < 1)) {
+    throw new Error("--connector must be a positive integer");
+  }
+
+  return args;
+}
+
+function sanitizeOutputDirName(rawOutDir) {
+  const trimmed = String(rawOutDir || "").trim();
+  const baseName = path.basename(trimmed);
+  if (!/^[A-Za-z0-9._-]{1,120}$/.test(baseName)) {
+    throw new Error("--out must be a simple directory name (letters, numbers, . _ -)");
+  }
+  return baseName;
+}
+
+async function downloadObject(r2, objectKey, targetPath) {
+  const object = await r2GetObject({ r2, key: objectKey });
+  if (!Buffer.isBuffer(object.body)) {
+    throw new Error(`R2 object body is not binary data: ${objectKey}`);
+  }
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  // lgtm[js/http-to-file-access] R2 backup downloader intentionally persists validated remote backup objects.
+  fs.writeFileSync(targetPath, object.body);
+  return {
+    key: objectKey,
+    bytes: object.bytes,
+    path: targetPath,
+  };
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const config = resolvePhaseBRuntimeConfig(process.env);
+
+  if (!hasRequiredR2Config(config.r2)) {
+    throw new Error("Missing R2 config. Set endpoint, bucket, region, access key id, and secret.");
+  }
+
+  const outDir = path.join(process.cwd(), sanitizeOutputDirName(args.out));
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const manifestKey = args.connector === null
+    ? buildDayManifestKey(config.committed_prefix, args.day)
+    : buildConnectorManifestKey(config.committed_prefix, args.day, args.connector);
+
+  const manifestObject = await r2GetObject({ r2: config.r2, key: manifestKey });
+  const manifest = JSON.parse(manifestObject.body.toString("utf8"));
+
+  const manifestTarget = path.join(outDir, "manifest.json");
+  fs.mkdirSync(path.dirname(manifestTarget), { recursive: true });
+  // Write normalized JSON rather than the raw payload blob from transport.
+  // lgtm[js/http-to-file-access] Downloader intentionally stores fetched manifest metadata locally.
+  fs.writeFileSync(manifestTarget, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const parquetKeys = Array.isArray(manifest.parquet_object_keys)
+    ? manifest.parquet_object_keys.map((key) => String(key))
+    : [];
+
+  if (parquetKeys.length === 0) {
+    throw new Error(`Manifest has no parquet_object_keys: ${manifestKey}`);
+  }
+
+  let totalBytes = 0;
+  for (let idx = 0; idx < parquetKeys.length; idx += 1) {
+    const objectKey = parquetKeys[idx];
+    const localName = `part-${String(idx).padStart(5, "0")}.parquet`;
+    const targetPath = path.join(outDir, "data", localName);
+    const result = await downloadObject(config.r2, objectKey, targetPath);
+    totalBytes += result.bytes;
+  }
+
+  console.log(JSON.stringify({
+    ok: true,
+    day_utc: args.day,
+    connector_id: args.connector,
+    manifest_key: manifestKey,
+    downloaded_files: parquetKeys.length,
+    downloaded_bytes: totalBytes,
+    output_dir: outDir,
+  }, null, 2));
+}
+
+main().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(JSON.stringify({ ok: false, error: message }));
+  process.exit(1);
+});
