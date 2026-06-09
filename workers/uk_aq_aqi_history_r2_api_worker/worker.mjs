@@ -1,8 +1,8 @@
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 
-const DEFAULT_HISTORY_PREFIX = "history/v1/aqilevels";
-const DEFAULT_HISTORY_BANDS_PREFIX = "history/v1/aqilevels/bands/v1";
+const DEFAULT_HISTORY_PREFIX = "history/v1/aqilevels/hourly";
+const DEFAULT_HISTORY_BANDS_PREFIX = "history/v1/aqilevels/hourly/bands/v1";
 const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_timeseries";
 const DEFAULT_CACHE_SECONDS = 300;

@@ -41,7 +41,7 @@ Notes:
   - This script calls the active local backfill run_job.ts in day windows (internally chunked for pacing).
   - Archive paths are retired and are never valid runner paths for active runs.
   - With UK_AQ_BACKFILL_FORCE_REPLACE=false, already-backed-up connector/day outputs are skipped.
-  - r2_history_obs_to_aqilevels reads committed history/v1/observations manifests/parquet only and rewrites history/v1/aqilevels outputs.
+  - r2_history_obs_to_aqilevels reads committed history/v1/observations manifests/parquet only and rewrites history/v1/aqilevels/hourly outputs.
   - Leave UK_AQ_BACKFILL_CONNECTOR_IDS unset to include all currently supported source adapters.
 USAGE
 }

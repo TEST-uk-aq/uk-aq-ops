@@ -4680,7 +4680,7 @@ def check_uk_air_sos(
 
 
 R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
-R2_AQILEVELS_PREFIX = "history/v1/aqilevels"
+R2_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly"
 AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME = "aqilevels"
 AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION = 2
 AQILEVELS_EXPECTED_WRITER_VERSION = "parquet-wasm-zstd-v2"

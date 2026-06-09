@@ -568,7 +568,7 @@ async function fetchR2HistoryDays(env, url) {
     env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations",
   );
   const aqilevelsPrefix = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels",
+    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly",
   );
   const indexConfig = resolveR2HistoryIndexConfig(env);
   const todayDay = new Date().toISOString().slice(0, 10);

@@ -545,8 +545,8 @@ const OBS_R2_HISTORY_PREFIX = normalizePrefix(
     "history/v1/observations",
 ) || "history/v1/observations";
 const AQI_R2_HISTORY_PREFIX = normalizePrefix(
-  Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") || "history/v1/aqilevels",
-) || "history/v1/aqilevels";
+  Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") || "history/v1/aqilevels/hourly",
+) || "history/v1/aqilevels/hourly";
 const CORE_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
 ) || "history/v1/core";

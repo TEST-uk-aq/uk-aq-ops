@@ -21,20 +21,47 @@ const HISTORY_OBSERVATIONS_COLUMNS = Object.freeze([
   "value",
 ]);
 
-const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels";
-const HISTORY_AQILEVELS_SCHEMA_VERSION = 2;
-const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v2";
+const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
+const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
+const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v1";
+const HISTORY_AQILEVELS_GRAIN = "hourly";
 const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "connector_id",
-  "timeseries_id",
   "station_id",
+  "timeseries_id",
   "pollutant_code",
   "timestamp_hour_utc",
+  "daqi_input_value_ugm3",
+  "daqi_input_averaging_code",
+  "daqi_index_level",
+  "daqi_source_observation_count",
+  "daqi_required_observation_count",
+  "daqi_calculation_status",
+  "daqi_missing_reason",
+  "eaqi_input_value_ugm3",
+  "eaqi_input_averaging_code",
+  "eaqi_index_level",
+  "eaqi_source_observation_count",
+  "eaqi_required_observation_count",
+  "eaqi_calculation_status",
+  "eaqi_missing_reason",
+  "hourly_sample_count",
+  "algorithm_version",
+  "computed_at_utc",
   "hourly_mean_ugm3",
   "rolling24h_mean_ugm3",
-  "hourly_sample_count",
-  "daqi_index_level",
-  "eaqi_index_level",
+  "no2_hourly_mean_ugm3",
+  "pm25_hourly_mean_ugm3",
+  "pm10_hourly_mean_ugm3",
+  "pm25_rolling24h_mean_ugm3",
+  "pm10_rolling24h_mean_ugm3",
+  "daqi_no2_index_level",
+  "daqi_pm25_rolling24h_index_level",
+  "daqi_pm10_rolling24h_index_level",
+  "eaqi_no2_index_level",
+  "eaqi_pm25_index_level",
+  "eaqi_pm10_index_level",
+  "updated_at",
 ]);
 
 function usage() {
@@ -73,7 +100,7 @@ function usage() {
     "",
     "Optional env:",
     "  UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX   default: history/v1/observations",
-    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX      default: history/v1/aqilevels",
+    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX      default: history/v1/aqilevels/hourly",
   ].join("\n"));
 }
 
@@ -295,6 +322,9 @@ export function buildObservationDayManifestFromConnectorManifests({
     0,
   );
   const totalBytes = files.reduce((sum, file) => sum + toSafeInt(file.bytes), 0);
+  const availablePollutants = Array.from(new Set(
+    files.flatMap((file) => Array.isArray(file.pollutant_codes) ? file.pollutant_codes : []),
+  )).sort((a, b) => a.localeCompare(b));
   const connectorIds = sortedManifests
     .map((manifest) => Number(manifest.connector_id))
     .filter((value) => Number.isInteger(value))
@@ -428,6 +458,13 @@ export function buildAqilevelsDayManifestFromConnectorManifests({
     })),
     totalRows,
   );
+  const availablePollutants = Array.from(new Set(
+    sortedManifests.flatMap((manifest) =>
+      Array.isArray(manifest.available_pollutants)
+        ? manifest.available_pollutants.map((pollutantCode) => String(pollutantCode || "").trim().toLowerCase()).filter(Boolean)
+        : []
+    ),
+  )).sort();
 
   return withManifestHash({
     day_utc: dayUtc,
@@ -451,12 +488,15 @@ export function buildAqilevelsDayManifestFromConnectorManifests({
       max_timeseries_id: manifest.max_timeseries_id ?? null,
       file_count: manifest.file_count,
       total_bytes: manifest.total_bytes,
+      available_pollutants: Array.isArray(manifest.available_pollutants) ? manifest.available_pollutants : [],
     })),
+    grain: HISTORY_AQILEVELS_GRAIN,
     history_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
     history_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
     columns: HISTORY_AQILEVELS_COLUMNS,
     writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
     writer_git_sha: pickWriterGitSha(sortedManifests, existingDayManifest),
+    available_pollutants: availablePollutants,
     ...stats,
     backed_up_at_utc: pickBackedUpAtUtc(sortedManifests, existingDayManifest),
   });

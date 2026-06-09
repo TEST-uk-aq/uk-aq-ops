@@ -39,7 +39,7 @@ function usage() {
     "",
     "Optional env:",
     "  UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX   default: history/v1/observations",
-    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX      default: history/v1/aqilevels",
+    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX      default: history/v1/aqilevels/hourly",
     "  UK_AQ_R2_HISTORY_INDEX_PREFIX          default: history/_index",
     "  UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX",
     "                                         default: history/_index/observations_timeseries",

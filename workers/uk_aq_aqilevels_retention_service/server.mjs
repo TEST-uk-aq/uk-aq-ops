@@ -151,7 +151,7 @@ function buildConfig(url) {
       region: (process.env.CFLARE_R2_REGION || process.env.R2_REGION || "auto").trim() || "auto",
       aqilevels_prefix: (
         process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX
-        || "history/v1/aqilevels"
+        || "history/v1/aqilevels/hourly"
       ).trim().replace(/^\/+|\/+$/g, ""),
     },
   };

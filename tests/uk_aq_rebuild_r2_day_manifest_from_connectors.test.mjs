@@ -123,7 +123,7 @@ test("buildDayManifestFromConnectorManifests keeps aqilevels connector summary f
         day_utc: "2026-04-30",
         connector_id: 3,
         run_id: "shared-run",
-        manifest_key: "history/v1/aqilevels/day_utc=2026-04-30/connector_id=3/manifest.json",
+        manifest_key: "history/v1/aqilevels/hourly/day_utc=2026-04-30/connector_id=3/manifest.json",
         source_row_count: 24,
         min_timeseries_id: 301,
         max_timeseries_id: 350,
@@ -131,9 +131,10 @@ test("buildDayManifestFromConnectorManifests keeps aqilevels connector summary f
         max_timestamp_hour_utc: "2026-04-30T23:00:00.000Z",
         file_count: 1,
         total_bytes: 1200,
+        available_pollutants: ["no2", "pm10"],
         files: [
           {
-            key: "history/v1/aqilevels/day_utc=2026-04-30/connector_id=3/part-00000.parquet",
+            key: "history/v1/aqilevels/hourly/day_utc=2026-04-30/connector_id=3/part-00000.parquet",
             bytes: 1200,
             row_count: 24,
             etag_or_hash: "etag-aqi-3",
@@ -159,16 +160,19 @@ test("buildDayManifestFromConnectorManifests keeps aqilevels connector summary f
   assert.deepEqual(rebuilt.connector_manifests, [
     {
       connector_id: 3,
-      manifest_key: "history/v1/aqilevels/day_utc=2026-04-30/connector_id=3/manifest.json",
+      manifest_key: "history/v1/aqilevels/hourly/day_utc=2026-04-30/connector_id=3/manifest.json",
       source_row_count: 24,
       min_timeseries_id: 301,
       max_timeseries_id: 350,
       file_count: 1,
       total_bytes: 1200,
+      available_pollutants: ["no2", "pm10"],
     },
   ]);
-  assert.equal(rebuilt.history_schema_name, "aqilevels");
-  assert.equal(rebuilt.history_schema_version, 2);
-  assert.equal(rebuilt.writer_version, "parquet-wasm-zstd-v2");
+  assert.equal(rebuilt.grain, "hourly");
+  assert.equal(rebuilt.history_schema_name, "aqilevels_hourly");
+  assert.equal(rebuilt.history_schema_version, 1);
+  assert.equal(rebuilt.writer_version, "parquet-wasm-zstd-v1");
+  assert.deepEqual(rebuilt.available_pollutants, ["no2", "pm10"]);
   assert.equal(rebuilt.manifest_hash, hashWithoutManifestHash(rebuilt));
 });

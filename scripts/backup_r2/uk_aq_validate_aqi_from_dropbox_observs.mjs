@@ -17,7 +17,7 @@ import {
 } from "../../workers/uk_aq_backfill_local/backfill_core.mjs";
 
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v1/observations";
-const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels";
+const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
 const DEFAULT_CORE_PREFIX = "history/v1/core";
 const DEFAULT_MAX_SAMPLES = 50;
 const DEFAULT_FLOAT_TOLERANCE = 1e-9;
@@ -71,7 +71,7 @@ function usage() {
     "  UK_AQ_R2_HISTORY_DROPBOX_ROOT",
     "  UK_AQ_R2_HISTORY_DROPBOX_LOCAL_ROOT",
     "  UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX (default history/v1/observations)",
-    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX (default history/v1/aqilevels)",
+    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX (default history/v1/aqilevels/hourly)",
     "  UK_AQ_R2_HISTORY_CORE_PREFIX (default history/v1/core)",
   ].join("\n"));
 }

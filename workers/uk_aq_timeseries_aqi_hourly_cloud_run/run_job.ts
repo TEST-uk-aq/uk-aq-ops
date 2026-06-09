@@ -14,11 +14,20 @@ type HelperRow = {
   pollutant_code: "no2" | "pm25" | "pm10";
   timestamp_hour_utc: string;
 
-  no2_hourly_mean_ugm3: number | null;
-  pm25_hourly_mean_ugm3: number | null;
-  pm10_hourly_mean_ugm3: number | null;
-  pm25_rolling24h_mean_ugm3: number | null;
-  pm10_rolling24h_mean_ugm3: number | null;
+  daqi_input_value_ugm3: number | null;
+  daqi_input_averaging_code: string | null;
+  daqi_index_level: number | null;
+  daqi_source_observation_count: number | null;
+  daqi_required_observation_count: number | null;
+  daqi_calculation_status: string | null;
+  daqi_missing_reason: string | null;
+  eaqi_input_value_ugm3: number | null;
+  eaqi_input_averaging_code: string | null;
+  eaqi_index_level: number | null;
+  eaqi_source_observation_count: number | null;
+  eaqi_required_observation_count: number | null;
+  eaqi_calculation_status: string | null;
+  eaqi_missing_reason: string | null;
 
   hourly_sample_count: number | null;
 };
@@ -381,11 +390,32 @@ function parseHelperRows(payload: unknown): HelperRow[] {
       connector_id: Math.trunc(connectorId),
       pollutant_code: pollutantCode as "no2" | "pm25" | "pm10",
       timestamp_hour_utc: hourIso(new Date(Date.parse(timestampRaw))),
-      no2_hourly_mean_ugm3: toNullableNumber(row.no2_hourly_mean_ugm3),
-      pm25_hourly_mean_ugm3: toNullableNumber(row.pm25_hourly_mean_ugm3),
-      pm10_hourly_mean_ugm3: toNullableNumber(row.pm10_hourly_mean_ugm3),
-      pm25_rolling24h_mean_ugm3: toNullableNumber(row.pm25_rolling24h_mean_ugm3),
-      pm10_rolling24h_mean_ugm3: toNullableNumber(row.pm10_rolling24h_mean_ugm3),
+      daqi_input_value_ugm3: toNullableNumber(row.daqi_input_value_ugm3),
+      daqi_input_averaging_code: typeof row.daqi_input_averaging_code === "string"
+        ? row.daqi_input_averaging_code
+        : null,
+      daqi_index_level: toNullableInt(row.daqi_index_level),
+      daqi_source_observation_count: toNullableInt(row.daqi_source_observation_count),
+      daqi_required_observation_count: toNullableInt(row.daqi_required_observation_count),
+      daqi_calculation_status: typeof row.daqi_calculation_status === "string"
+        ? row.daqi_calculation_status
+        : null,
+      daqi_missing_reason: typeof row.daqi_missing_reason === "string"
+        ? row.daqi_missing_reason
+        : null,
+      eaqi_input_value_ugm3: toNullableNumber(row.eaqi_input_value_ugm3),
+      eaqi_input_averaging_code: typeof row.eaqi_input_averaging_code === "string"
+        ? row.eaqi_input_averaging_code
+        : null,
+      eaqi_index_level: toNullableInt(row.eaqi_index_level),
+      eaqi_source_observation_count: toNullableInt(row.eaqi_source_observation_count),
+      eaqi_required_observation_count: toNullableInt(row.eaqi_required_observation_count),
+      eaqi_calculation_status: typeof row.eaqi_calculation_status === "string"
+        ? row.eaqi_calculation_status
+        : null,
+      eaqi_missing_reason: typeof row.eaqi_missing_reason === "string"
+        ? row.eaqi_missing_reason
+        : null,
       hourly_sample_count: toNullableInt(row.hourly_sample_count),
     });
   }

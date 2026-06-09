@@ -122,7 +122,7 @@ async function ensureParquetTooling() {
 
 export const DEFAULT_R2_HISTORY_INDEX_PREFIX = "history/_index";
 export const DEFAULT_R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations";
-export const DEFAULT_R2_HISTORY_AQILEVELS_PREFIX = "history/v1/aqilevels";
+export const DEFAULT_R2_HISTORY_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
 export const DEFAULT_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX =
   "history/_index/observations_timeseries";
 export const DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX =
@@ -820,9 +820,13 @@ function buildAqilevelTimeseriesConnectorIndexPayload({
   let minTimeseriesId = null;
   let maxTimeseriesId = null;
   let indexedFileCount = 0;
+  const availablePollutants = new Set();
   for (const file of files) {
     const fileMin = parsePositiveId(file.min_timeseries_id);
     const fileMax = parsePositiveId(file.max_timeseries_id);
+    for (const pollutantCode of (Array.isArray(file.pollutant_codes) ? file.pollutant_codes : [])) {
+      availablePollutants.add(pollutantCode);
+    }
     if (fileMin && fileMax) {
       indexedFileCount += 1;
       if (!minTimeseriesId || fileMin < minTimeseriesId) {
@@ -860,6 +864,7 @@ function buildAqilevelTimeseriesConnectorIndexPayload({
     file_count: files.length,
     indexed_file_count: indexedFileCount,
     index_coverage: indexedFileCount === files.length ? "complete" : "partial",
+    available_pollutants: Array.from(availablePollutants).sort((a, b) => a.localeCompare(b)),
     min_timeseries_id: minTimeseriesId,
     max_timeseries_id: maxTimeseriesId,
     files,

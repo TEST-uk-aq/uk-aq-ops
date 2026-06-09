@@ -43,7 +43,7 @@ const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
     process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations",
   ),
   aqilevels: normalizePrefix(
-    process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels",
+    process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly",
   ),
   core: normalizePrefix(
     process.env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core",

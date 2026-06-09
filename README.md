@@ -128,7 +128,7 @@ Primary controls:
 - `UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS` (default `7`)
 - `UK_AQ_R2_HISTORY_STAGING_PREFIX` (default `history/v1/_ops/observations/staging`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
-- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels/hourly`)
 - `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
 - Scheduler attempt deadline is managed by deploy workflow variable `GCP_UK_AQ_PRUNE_DAILY_SCHEDULER_ATTEMPT_DEADLINE` (with ingestdb alias fallbacks), default `15m`.
@@ -162,7 +162,7 @@ Primary controls:
 - computes retention cutoff using Europe/London local-day policy
 - lists AQI day candidates older than cutoff from `uk_aq_aqilevels`
 - checks committed R2 History manifest per day:
-  - `history/v1/aqilevels/day_utc=YYYY-MM-DD/manifest.json`
+  - `history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/manifest.json`
 - deletes only days with confirmed committed manifest
 
 ### 6) DB + R2 Metrics API Worker (`workers/uk_aq_db_size_metrics_api_worker/worker.mjs`)
@@ -204,7 +204,7 @@ Primary controls:
   - `local_to_aqilevels` (Phase 1 implemented)
   - `obs_aqi_to_r2` (implemented: dry-run planning + non-dry R2 export for both `observations` and `aqilevels` domains)
   - `source_to_r2` (Phase 1 stubbed)
-  - `r2_history_obs_to_aqilevels` (implemented: reads committed `history/v1/observations` parquet/manifests and rewrites committed `history/v1/aqilevels` without obs_aqidb reads)
+  - `r2_history_obs_to_aqilevels` (implemented: reads committed `history/v1/observations` parquet/manifests and rewrites committed `history/v1/aqilevels/hourly` without obs_aqidb reads)
 - `local_to_aqilevels` behavior:
   - UTC-day backfill with newest day first
   - optional connector filter
@@ -217,7 +217,7 @@ Primary controls:
 - `r2_history_obs_to_aqilevels` behavior:
   - uses committed observations day manifests as the source of truth for which day+connector partitions exist
   - reads only `history/v1/observations/...` parquet parts plus the prior-hour lookback needed for rolling 24-hour AQI values
-  - writes compatible `history/v1/aqilevels/...` connector/day manifests back to the committed AQI tree
+  - writes compatible `history/v1/aqilevels/hourly/...` connector/day manifests back to the committed AQI tree
   - `force_replace=true` removes old AQI connector objects for the targeted day+connector and rebuilds the AQI day manifest from the refreshed connector manifests
 - minimal run/day/checkpoint ledger wiring in `uk_aq_ops` (if schema is applied)
 
@@ -291,7 +291,7 @@ node scripts/backup_r2/sync_history_to_dropbox.mjs \
 Notes:
 - Dropbox layout mirrors R2 History layout exactly:
   - `history/v1/observations/day_utc=YYYY-MM-DD/...`
-  - `history/v1/aqilevels/day_utc=YYYY-MM-DD/...`
+  - `history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/...`
 - No `YYYY/YYYY-MM` reshaping is applied.
 - Already-checkpointed days are re-copied if the source day `manifest.json` hash changes.
 - Checkpoint file default:

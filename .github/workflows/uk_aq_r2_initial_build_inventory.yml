@@ -44,7 +44,7 @@ jobs:
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
 
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
-      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels' }}
+      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels/hourly' }}
       UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
       UK_AQ_R2_HISTORY_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_PREFIX || 'history/_index' }}
       UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || 'history/_index/backup_inventory_v1.json' }}

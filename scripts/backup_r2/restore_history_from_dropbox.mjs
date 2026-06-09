@@ -12,7 +12,7 @@ function normalizePrefix(rawPrefix) {
 
 const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
   observations: normalizePrefix(process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations"),
-  aqilevels: normalizePrefix(process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels"),
+  aqilevels: normalizePrefix(process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly"),
   core: normalizePrefix(process.env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core"),
 });
 

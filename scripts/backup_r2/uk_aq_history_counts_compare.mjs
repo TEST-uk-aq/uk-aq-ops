@@ -19,7 +19,7 @@ const DEFAULT_OBSERVS_RETENTION_DAYS = 21;
 const DEFAULT_AQI_RETENTION_DAYS = 14;
 const DEFAULT_MAX_DAYS = 400;
 const DEFAULT_OBSERVATIONS_PREFIX = "history/v1/observations";
-const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels";
+const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
 const DEFAULT_DROPBOX_LOCAL_BACKUP_ROOT =
   "/Users/mikehinford/Library/CloudStorage/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup";
 

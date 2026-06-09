@@ -65,7 +65,7 @@ test("buildDaySummaryFromManifest keeps connector row counts from observations d
 test("normalizeR2HistoryIndexDomain filters to lookback window while preserving totals", () => {
   const payload = buildDomainIndexPayload({
     domain: "aqilevels",
-    prefix: "history/v1/aqilevels",
+    prefix: "history/v1/aqilevels/hourly",
     bucket: "uk-aq-history-dev",
     generatedAt: "2026-03-13T12:00:00.000Z",
     daySummaries: [
@@ -167,7 +167,7 @@ test("buildDomainIndexPayload falls back to generatedAt when no source backed_up
 test("buildDomainIndexPayload is byte-stable across repeated calls with same source data", () => {
   const args = {
     domain: "aqilevels",
-    prefix: "history/v1/aqilevels",
+    prefix: "history/v1/aqilevels/hourly",
     bucket: "uk-aq-history-dev",
     daySummaries: [
       { day_utc: "2026-03-12", total_rows: 5, backed_up_at_utc: "2026-03-12T01:00:00.000Z" },

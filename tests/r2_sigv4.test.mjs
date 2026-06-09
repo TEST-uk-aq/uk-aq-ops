@@ -75,7 +75,7 @@ test("r2PutObject retries retryable HTTP failures and then succeeds", async () =
   try {
     const result = await r2PutObject({
       r2: TEST_R2_CONFIG,
-      key: "history/v1/aqilevels/day_utc=2025-07-27/connector_id=3/part-00000.parquet",
+      key: "history/v1/aqilevels/hourly/day_utc=2025-07-27/connector_id=3/part-00000.parquet",
       body: "payload",
     });
 
@@ -102,7 +102,7 @@ test("r2PutObject does not retry non-retryable client failures", async () => {
       () =>
         r2PutObject({
           r2: TEST_R2_CONFIG,
-          key: "history/v1/aqilevels/day_utc=2025-07-27/connector_id=3/part-00000.parquet",
+          key: "history/v1/aqilevels/hourly/day_utc=2025-07-27/connector_id=3/part-00000.parquet",
           body: "payload",
         }),
       /R2 PUT failed \(400\)/,

@@ -115,7 +115,7 @@ const R2_HISTORY_OBSERVATIONS_PREFIX = parseHistoryPrefix(
 );
 const R2_HISTORY_AQILEVELS_PREFIX = parseHistoryPrefix(
   optionalEnv("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") ||
-    "history/v1/aqilevels",
+    "history/v1/aqilevels/hourly",
 );
 
 const RPC_RETRIES = parsePositiveInt(
