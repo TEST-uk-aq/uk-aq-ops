@@ -280,6 +280,7 @@ type TimeseriesV2EnvelopeMeta = {
   r2_coverage_end: string | null;
   ingest_tail_start: string | null;
   ingest_tail_end?: string | null;
+  response_complete?: boolean | null;
   has_gap: boolean | null;
   gap_ranges?: Array<{ start_utc: string; end_utc: string }>;
   row_count: number | null;
@@ -1406,6 +1407,16 @@ function buildTimeseriesV2CacheControl(sourceMode: string, runtime: TimeseriesV2
   ].join(", ");
 }
 
+function isTimeseriesV2ResponseCacheable(stitched: TimeseriesV2StitchResult): boolean {
+  const meta = stitched.meta || {};
+  const r2Errors = Array.isArray(meta.r2_errors) ? meta.r2_errors : [];
+  const ingestErrors = Array.isArray(meta.ingest_errors) ? meta.ingest_errors : [];
+  return meta.response_complete !== false &&
+    meta.has_gap !== true &&
+    r2Errors.length === 0 &&
+    ingestErrors.length === 0;
+}
+
 async function buildTimeseriesV2Etag(bodyText: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(bodyText));
   const bytes = new Uint8Array(digest);
@@ -1423,26 +1434,48 @@ function buildTimeseriesV2FallbackEnvelope(
   ingestErrors: string[] = [],
 ): TimeseriesV2StitchResult {
   const data = Array.isArray(payloadRecord.data) ? payloadRecord.data : [];
+  const payloadMeta = payloadRecord.meta && typeof payloadRecord.meta === "object"
+    ? payloadRecord.meta as Record<string, unknown>
+    : {};
   const requestStartUtc = String(requestUrl.searchParams.get("start_utc") ?? "").trim() || null;
   const requestEndUtc = String(requestUrl.searchParams.get("end_utc") ?? "").trim() || null;
   const requestWindow = String(requestUrl.searchParams.get("window") ?? "").trim() || null;
   const requestSince = String(requestUrl.searchParams.get("since") ?? "").trim() || null;
+  const responseComplete = typeof payloadRecord.response_complete === "boolean"
+    ? payloadRecord.response_complete
+    : typeof payloadMeta.response_complete === "boolean"
+    ? payloadMeta.response_complete
+    : null;
+  const hasGap = typeof payloadRecord.has_gap === "boolean"
+    ? payloadRecord.has_gap
+    : typeof payloadMeta.has_gap === "boolean"
+    ? payloadMeta.has_gap
+    : responseComplete === false
+    ? true
+    : null;
+  const rowCount = Number(payloadMeta.row_count ?? payloadRecord.count ?? data.length);
+  const r2RowCount = Number(payloadMeta.r2_row_count);
+  const ingestRowCount = Number(payloadMeta.ingest_row_count);
+  const dedupedRowCount = Number(payloadMeta.deduped_row_count);
+  const payloadR2Errors = Array.isArray(payloadMeta.r2_errors) ? payloadMeta.r2_errors.map(String) : r2Errors;
+  const payloadIngestErrors = Array.isArray(payloadMeta.ingest_errors) ? payloadMeta.ingest_errors.map(String) : ingestErrors;
   const meta: TimeseriesV2EnvelopeMeta = {
-    source_mode: sourceMode,
-    r2_coverage_start: null,
-    r2_coverage_end: null,
-    ingest_tail_start: null,
-    ingest_tail_end: null,
-    has_gap: null,
+    source_mode: String(payloadMeta.source_mode || payloadRecord.source || sourceMode),
+    r2_coverage_start: typeof payloadMeta.r2_coverage_start === "string" ? payloadMeta.r2_coverage_start : null,
+    r2_coverage_end: typeof payloadMeta.r2_coverage_end === "string" ? payloadMeta.r2_coverage_end : null,
+    ingest_tail_start: typeof payloadMeta.ingest_tail_start === "string" ? payloadMeta.ingest_tail_start : null,
+    ingest_tail_end: typeof payloadMeta.ingest_tail_end === "string" ? payloadMeta.ingest_tail_end : null,
+    response_complete: responseComplete,
+    has_gap: hasGap,
     gap_ranges: [],
-    row_count: data.length,
-    r2_row_count: null,
-    ingest_row_count: data.length,
-    deduped_row_count: 0,
+    row_count: Number.isFinite(rowCount) ? rowCount : data.length,
+    r2_row_count: Number.isFinite(r2RowCount) ? r2RowCount : null,
+    ingest_row_count: Number.isFinite(ingestRowCount) ? ingestRowCount : null,
+    deduped_row_count: Number.isFinite(dedupedRowCount) ? dedupedRowCount : null,
     next_since: payloadRecord.next_since ? String(payloadRecord.next_since) : null,
     cache_status: cacheStatus,
-    r2_errors: r2Errors,
-    ingest_errors: ingestErrors,
+    r2_errors: payloadR2Errors,
+    ingest_errors: payloadIngestErrors,
   };
   const envelope = {
     schema_version: 2,
@@ -1454,7 +1487,10 @@ function buildTimeseriesV2FallbackEnvelope(
       since: requestSince,
     },
     data,
-    meta,
+    meta: {
+      ...payloadMeta,
+      ...meta,
+    },
     data_format: payloadRecord.data_format ?? "objects",
     columns: Array.isArray(payloadRecord.columns) ? payloadRecord.columns : ["observed_at", "value"],
     next_since: payloadRecord.next_since ?? null,
@@ -2270,14 +2306,19 @@ export default {
 
       const bodyText = JSON.stringify(stitched.envelope);
       const etag = await buildTimeseriesV2Etag(bodyText);
+      const timeseriesResponseCacheable = isTimeseriesV2ResponseCacheable(stitched);
       const responseHeaders = new Headers();
       responseHeaders.set("Content-Type", "application/json; charset=utf-8");
-      responseHeaders.set("Cache-Control", stitched.cacheControl);
+      responseHeaders.set("Cache-Control", timeseriesResponseCacheable ? stitched.cacheControl : "no-store");
       responseHeaders.set("ETag", etag);
       responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
       responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
       responseHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
+      responseHeaders.set("X-UK-AQ-Timeseries-Cacheable", String(timeseriesResponseCacheable));
       responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", stitched.meta.source_mode);
+      if (stitched.meta.response_complete !== undefined && stitched.meta.response_complete !== null) {
+        responseHeaders.set("X-UK-AQ-Response-Complete", String(stitched.meta.response_complete));
+      }
       responseHeaders.set("X-UK-AQ-Has-Gap", String(stitched.meta.has_gap));
       if (stitched.meta.r2_coverage_end) {
         responseHeaders.set("X-UK-AQ-R2-Coverage-End", stitched.meta.r2_coverage_end);
@@ -2308,7 +2349,7 @@ export default {
         status: 200,
         headers: responseHeaders,
       });
-      if (shouldUseCache && request.method === "GET") {
+      if (timeseriesResponseCacheable && shouldUseCache && request.method === "GET") {
         ctx.waitUntil(cache.put(cacheKey, stitchedResponse.clone()));
       }
       return stitchedResponse;
