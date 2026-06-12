@@ -1,0 +1,66 @@
+uk-aq-timeseries-aqi-hourly
+
+
+
+select *
+from uk_aq_public.uk_aq_rpc_timeseries_aqi_hourly_helper_upsert(
+  p_hour_end_start_exclusive => '2026-06-12T00:00:00Z'::timestamptz,
+  p_hour_end_end_inclusive => '2026-06-12T16:00:00Z'::timestamptz,
+  p_timeseries_ids => null::integer[],
+  p_reference_hour_end_utc => '2026-06-12T16:00:00Z'::timestamptz
+);
+
+
+
+SERVICE_URL="$(gcloud run services describe "$GCP_TIMESERIES_AQI_HOURLY_SERVICE_NAME" \
+--region "$GCP_REGION" \
+--project "$GCP_PROJECT_ID" \
+--format='value(status.url)')"
+
+
+
+
+TOKEN="$(gcloud auth print-identity-token)"
+
+curl -sS -X POST "$SERVICE_URL" \
+-H "Authorization: Bearer ${TOKEN}" \
+-H "Content-Type: application/json" \
+-d '{
+"trigger_mode": "manual",
+"run_mode": "backfill",
+"from_hour_utc": "2026-06-08T00:00:00Z",
+"to_hour_utc": "2026-06-12T12:00:00Z"
+}'
+
+
+
+SERVICE_URL="$(gcloud run services describe "$GCP_TIMESERIES_AQI_HOURLY_SERVICE_NAME" \
+--region "$GCP_REGION" \
+--project "$GCP_PROJECT_ID" \
+--format='value(status.url)')"
+
+TOKEN="$(gcloud auth print-identity-token)"
+
+curl -sS -X POST "$SERVICE_URL" \
+-H "Authorization: Bearer ${TOKEN}" \
+-H "Content-Type: application/json" \
+-d '{
+"trigger_mode": "manual",
+"run_mode": "backfill",
+"from_hour_utc": "2026-06-08T00:00:00Z",
+"to_hour_utc": "2026-06-11T00:00:00Z"
+}'
+
+
+
+DRY_RUN=true 'scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh' \
+  2026-06-08T00:00:00Z \
+  2026-06-12T15:00:00Z
+  
+  
+'scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh' \
+2026-06-08T00:00:00Z \
+2026-06-12T15:00:00Z
+  
+  
+  

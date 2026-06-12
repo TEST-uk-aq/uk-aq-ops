@@ -558,6 +558,44 @@ observation object count unchanged
 
 Known script gotcha: if an index delete script lists folder-style entries such as `aqilevels_timeseries/`, skip entries ending in `/` or use `rclone lsf --files-only`. `rclone deletefile` can only delete files.
 
+Use the guarded TEST deletion wrapper for this step:
+
+```text
+scripts/AQI-levels-refactor-June-2026/delete_test_aqilevels_r2_objects.sh
+```
+
+The script is TEST-only by design. It refuses non-TEST remotes and buckets and defaults to dry-run.
+
+Example dry-run:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+LOG_DIR="scripts/AQI-levels-refactor-June-2026/logs" \
+./scripts/AQI-levels-refactor-June-2026/delete_test_aqilevels_r2_objects.sh --dry-run
+```
+
+Review the candidate list in:
+
+```text
+scripts/AQI-levels-refactor-June-2026/logs/aqilevels_all_r2_delete_candidates_TEST_<timestamp>.txt
+```
+
+Example execute:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+LOG_DIR="scripts/AQI-levels-refactor-June-2026/logs" \
+./scripts/AQI-levels-refactor-June-2026/delete_test_aqilevels_r2_objects.sh --execute
+```
+
+When prompted, type exactly:
+
+```text
+DELETE TEST AQI
+```
+
 ## 14. Rebuild historical AQI levels
 
 Update the robust AQI rebuild/backfill script to write the new layout.
@@ -588,7 +626,7 @@ scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_TEST_202
 The wrapper runs `r2_history_obs_to_aqilevels` from the local Dropbox observation history and rewrites AQI-only outputs in TEST R2. For this rebuild, use the full range:
 
 ```text
-2025-01-01 to 2026-06-06
+2025-01-01 to 2026-06-07
 ```
 
 Required environment values inside the wrapper or shell:
@@ -605,7 +643,7 @@ export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
 export UK_AQ_BACKFILL_FORCE_REPLACE="true"
 export UK_AQ_BACKFILL_DRY_RUN="false"
 export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
-export UK_AQ_BACKFILL_TO_DAY_UTC="2026-06-06"
+export UK_AQ_BACKFILL_TO_DAY_UTC="2026-06-07"
 export UK_AQ_R2_HISTORY_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup"
 export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX="false"
 ```
@@ -621,6 +659,25 @@ cd "$REPO_ROOT"
 ```
 
 If `.env` contains quoted values, make sure the `.env` loader strips wrapping quotes. A known failure is `UK_AQ_BACKFILL_RUN_JOB_PATH` being read with literal quote characters. `uk_aq_backfill_local.sh` should strip wrapping quotes before checking the file path.
+
+Example run:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+export CFLARE_R2_ENDPOINT="https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com"
+export CFLARE_R2_REGION="auto"
+export CFLARE_R2_ACCESS_KEY_ID="<TEST_R2_ACCESS_KEY_ID>"
+export CFLARE_R2_SECRET_ACCESS_KEY="<TEST_R2_SECRET_ACCESS_KEY>"
+
+./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_TEST_2025_2026.sh
+```
+
+When prompted, type exactly:
+
+```text
+REBUILD TEST AQI
+```
 
 Rebuild Indexes
 
@@ -791,6 +848,44 @@ Suggested manual payload:
   "from_hour_utc": "<pause_start_hour_utc>",
   "to_hour_utc": "<restart_hour_utc>"
 }
+```
+
+For multi-day downtime/recent windows, use the daily Cloud Run backfill wrapper instead of one large manual request:
+
+```text
+scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh
+```
+
+The script resolves the Cloud Run service URL with `gcloud`, sends `run_mode: "backfill"` one UTC day at a time, and never triggers Cloud Run helper refresh.
+
+Required environment:
+
+```bash
+export GCP_TIMESERIES_AQI_HOURLY_SERVICE_NAME="uk-aq-timeseries-aqi-hourly"
+export GCP_REGION="europe-west2"
+export GCP_PROJECT_ID="<TEST_GCP_PROJECT_ID>"
+```
+
+Dry-run example:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+DRY_RUN=true \
+./scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh \
+  "2026-06-08T00:00:00Z" \
+  "2026-06-12T15:00:00Z"
+```
+
+Execute example:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+PAUSE_SECONDS=5 \
+./scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh \
+  "<pause_start_hour_utc>" \
+  "<restart_hour_utc>"
 ```
 
 Expected Cloud Run log:

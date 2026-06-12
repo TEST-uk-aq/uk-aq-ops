@@ -114,6 +114,125 @@ history/v1/aqilevels/day_utc=YYYY-MM-DD/...
 history/v1/aqilevels/bands/v1/...
 ```
 
+### 4.1 Script placement and LIVE adaptation
+
+Use the June refactor scripts from:
+
+```text
+scripts/AQI-levels-refactor-June-2026/
+```
+
+Relevant scripts:
+
+```text
+delete_test_aqilevels_r2_objects.sh
+rebuild_aqilevels_from_r2_dropbox_TEST_2025_2026.sh
+run_obsaqidb_aqi_backfill_daily.sh
+```
+
+The first two wrappers are hard-guarded for TEST and must not be run unchanged for LIVE. For LIVE, use them as implementation templates only:
+
+```text
+delete_test_aqilevels_r2_objects.sh -> LIVE AQI R2 delete template
+rebuild_aqilevels_from_r2_dropbox_TEST_2025_2026.sh -> LIVE historical AQI rebuild template
+run_obsaqidb_aqi_backfill_daily.sh -> usable for LIVE Cloud Run backfill with LIVE GCP env
+```
+
+### 4.2 LIVE AQI R2 delete example
+
+Before deletion, generate and review the candidate lists. This mirrors the guarded TEST delete script but points at LIVE.
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+REMOTE="uk_aq_r2_live"
+BUCKET="<LIVE_R2_BUCKET>"
+BASE="${REMOTE}:${BUCKET}"
+RUN_DATE="$(date -u +%F_%H%M%S)"
+LOG_DIR="scripts/AQI-levels-refactor-June-2026/logs"
+
+mkdir -p "$LOG_DIR"
+
+AQI_LIST="${LOG_DIR}/aqilevels_r2_delete_candidates_LIVE_${RUN_DATE}.txt"
+INDEX_LIST="${LOG_DIR}/aqilevels_index_r2_delete_candidates_LIVE_${RUN_DATE}.txt"
+ALL_LIST="${LOG_DIR}/aqilevels_all_r2_delete_candidates_LIVE_${RUN_DATE}.txt"
+
+rclone lsf "${BASE}/history/v1/aqilevels/" --recursive > "$AQI_LIST" || true
+rclone lsf "${BASE}/history/_index/" --recursive --files-only | grep 'aqilevels' > "$INDEX_LIST" || true
+
+{
+  sed 's#^#history/v1/aqilevels/#' "$AQI_LIST"
+  sed 's#^#history/_index/#' "$INDEX_LIST"
+} > "$ALL_LIST"
+
+wc -l "$AQI_LIST" "$INDEX_LIST" "$ALL_LIST"
+head -30 "$ALL_LIST"
+```
+
+After the mandatory operator pause and only after confirming the candidate list is AQI-only:
+
+```bash
+rclone purge "${BASE}/history/v1/aqilevels/"
+
+while IFS= read -r rel_key; do
+  [[ -z "$rel_key" ]] && continue
+  rclone deletefile "${BASE}/history/_index/${rel_key}"
+done < "$INDEX_LIST"
+```
+
+Post-delete check:
+
+```bash
+rclone lsf "${BASE}/history/v1/aqilevels/" --recursive || true
+rclone lsf "${BASE}/history/_index/" --recursive | grep 'aqilevels' || true
+```
+
+### 4.3 LIVE historical AQI rebuild example
+
+Use `rebuild_aqilevels_from_r2_dropbox_TEST_2025_2026.sh` as the template for the LIVE rebuild wrapper. The LIVE equivalent belongs beside it in:
+
+```text
+scripts/AQI-levels-refactor-June-2026/
+```
+
+Example command shape for the LIVE rebuild:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+export CFLARE_R2_ENDPOINT="<LIVE_R2_ENDPOINT>"
+export CFLARE_R2_REGION="auto"
+export CFLARE_R2_BUCKET="<LIVE_R2_BUCKET>"
+export CFLARE_R2_ACCESS_KEY_ID="<LIVE_R2_ACCESS_KEY_ID>"
+export CFLARE_R2_SECRET_ACCESS_KEY="<LIVE_R2_SECRET_ACCESS_KEY>"
+
+export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
+export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
+export UK_AQ_BACKFILL_FORCE_REPLACE="true"
+export UK_AQ_BACKFILL_DRY_RUN="false"
+export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
+export UK_AQ_BACKFILL_TO_DAY_UTC="<last_complete_historical_day_utc>"
+export UK_AQ_R2_HISTORY_DROPBOX_ROOT="<LIVE_R2_HISTORY_DROPBOX_ROOT>"
+export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX="false"
+unset UK_AQ_BACKFILL_CONNECTOR_IDS || true
+
+./scripts/uk_aq_backfill_local.sh
+```
+
+Then rebuild AQI indexes and inventory for LIVE:
+
+```bash
+node scripts/backup_r2/uk_aq_build_r2_history_index.mjs \
+  --domain aqilevels
+
+node scripts/backup_r2/build_backup_inventory.mjs \
+  --source-root "uk_aq_r2_live:<LIVE_R2_BUCKET>" \
+  --domain aqilevels \
+  --index-prefix "history/_index" \
+  --full-rebuild \
+  --report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild_LIVE.json"
+```
+
 ## 5. Manually refresh recent helper rows
 
 After the historical rebuild and before Cloud Run backfill, manually refresh helper rows in the LIVE ingest database for the downtime/recent window.
@@ -182,6 +301,44 @@ Then run the full downtime/recent LIVE backfill:
   "from_hour_utc": "<pause_start_hour_utc>",
   "to_hour_utc": "<restart_hour_utc>"
 }
+```
+
+For multi-day LIVE windows, use:
+
+```text
+scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh
+```
+
+This script chunks the same `run_mode: "backfill"` payload one UTC day at a time. It does not use `reconcile_short` or `reconcile_deep`, so it does not refresh helper rows from Cloud Run.
+
+Dry-run example:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+export GCP_TIMESERIES_AQI_HOURLY_SERVICE_NAME="<LIVE_AQI_HOURLY_CLOUD_RUN_SERVICE>"
+export GCP_REGION="<LIVE_GCP_REGION>"
+export GCP_PROJECT_ID="<LIVE_GCP_PROJECT_ID>"
+
+DRY_RUN=true \
+./scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh \
+  "<pause_start_hour_utc>" \
+  "<restart_hour_utc>"
+```
+
+Execute example:
+
+```bash
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+export GCP_TIMESERIES_AQI_HOURLY_SERVICE_NAME="<LIVE_AQI_HOURLY_CLOUD_RUN_SERVICE>"
+export GCP_REGION="<LIVE_GCP_REGION>"
+export GCP_PROJECT_ID="<LIVE_GCP_PROJECT_ID>"
+
+PAUSE_SECONDS=5 \
+./scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh \
+  "<pause_start_hour_utc>" \
+  "<restart_hour_utc>"
 ```
 
 Record:
