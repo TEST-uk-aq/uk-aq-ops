@@ -120,6 +120,9 @@ GCP project:
 GCP region:
 R2 bucket:
 R2 backup Dropbox root: `CIC-Test/R2_history_backup` (offline copy preferred)
+R2 backup AQI prefix: `history/v1/aqilevels/hourly`
+R2 backup inventory path: `history/_index/backup_inventory_v1.json`
+R2 backup state path: `_ops/checkpoints/r2_history_backup_state_v1.json`
 OBS_AQIDB_SUPABASE_URL:
 SUPABASE_URL:
 INGESTDB_RETENTION_DAYS:
@@ -133,7 +136,8 @@ Website beta URL:
 ### 4.3 Inventory current AQI R2 objects
 
 Create an inventory before deletion.
-Use the offline Dropbox copy at `CIC-Test/R2_history_backup` for all validation queries, inventories, and rebuild inputs in TEST.
+
+For pre-delete evidence, inventory the TEST R2 bucket directly and save the output. The offline Dropbox copy at `CIC-Test/R2_history_backup` is used as the rebuild input and validation copy, but Step 13 deletion is against TEST R2 only. Do not delete from the Dropbox backup during Step 13.
 
 Inventory scope:
 
@@ -161,6 +165,9 @@ old_parquet_count
 old_manifest_count
 old_band_cache_count
 old_index_count
+new_hourly_parquet_count
+new_hourly_manifest_count
+new_hourly_index_count
 min_day_utc
 max_day_utc
 ```
@@ -507,7 +514,9 @@ eaqi_index_level
 
 ## 13. Delete TEST AQI R2 objects
 
-After code changes are ready but before rebuild, delete only old AQI objects.
+After code changes are ready but before rebuild, delete only old AQI objects from the TEST R2 bucket.
+
+Do not delete the local Dropbox backup. It remains the rebuild input and pre-rebuild evidence source.
 
 Delete:
 
@@ -545,6 +554,8 @@ old AQI index count = 0
 observation object count unchanged
 ```
 
+Known script gotcha: if an index delete script lists folder-style entries such as `aqilevels_timeseries/`, skip entries ending in `/` or use `rclone lsf --files-only`. `rclone deletefile` can only delete files.
+
 ## 14. Rebuild historical AQI levels
 
 Update the robust AQI rebuild/backfill script to write the new layout.
@@ -564,24 +575,128 @@ history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/connector_id=<id>/part-00000.parq
 6. Rebuild AQI latest descriptors and timeseries index objects for the new path.
 7. Avoid writing old band cache objects unless the cache format is also rebuilt.
 
-Suggested rebuild command:
+Suggested rebuild wrapper:
 
-This wrapper already runs `r2_history_obs_to_aqilevels` from Dropbox observation history and rewrites AQI-only outputs in place.
+Use a wrapper script in:
+
+```text
+scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_TEST_2025_2026.sh
+```
+
+The wrapper runs `r2_history_obs_to_aqilevels` from the local Dropbox observation history and rewrites AQI-only outputs in TEST R2. For this rebuild, use the full range:
+
+```text
+2025-01-01 to 2026-06-06
+```
+
+Required environment values inside the wrapper or shell:
 
 ```bash
+export CFLARE_R2_ENDPOINT="https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com"
+export CFLARE_R2_REGION="auto"
+export CFLARE_R2_BUCKET="uk-aq-history-cic-test"
+export CFLARE_R2_ACCESS_KEY_ID="<TEST_R2_ACCESS_KEY_ID>"
+export CFLARE_R2_SECRET_ACCESS_KEY="<TEST_R2_SECRET_ACCESS_KEY>"
+
 export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
 export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
 export UK_AQ_BACKFILL_FORCE_REPLACE="true"
 export UK_AQ_BACKFILL_DRY_RUN="false"
-export UK_AQ_BACKFILL_FROM_DAY_UTC="2026-03-28"
-export UK_AQ_BACKFILL_TO_DAY_UTC="2026-04-10"
-export UK_AQ_BACKFILL_CONNECTOR_IDS="1"
+export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
+export UK_AQ_BACKFILL_TO_DAY_UTC="2026-06-06"
 export UK_AQ_R2_HISTORY_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup"
 export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX="false"
-./scripts/uk_aq_backfill_local.sh
 ```
 
-## 15. Rebuild recent missing AQI levels after restart
+Do not set `UK_AQ_BACKFILL_CONNECTOR_IDS` for the full rebuild unless intentionally restricting to one connector.
+
+Because this wrapper lives one folder below `scripts`, resolve `REPO_ROOT` with:
+
+```bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "$REPO_ROOT"
+```
+
+If `.env` contains quoted values, make sure the `.env` loader strips wrapping quotes. A known failure is `UK_AQ_BACKFILL_RUN_JOB_PATH` being read with literal quote characters. `uk_aq_backfill_local.sh` should strip wrapping quotes before checking the file path.
+
+Rebuild Indexes
+
+node scripts/backup_r2/uk_aq_build_r2_history_index.mjs \
+--domain aqilevels
+
+Rebuild Inventory
+
+node scripts/backup_r2/build_backup_inventory.mjs \
+--source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
+--domain aqilevels \
+--index-prefix "history/_index" \
+--full-rebuild \
+--report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild_TEST.json"
+
+## 15. Refresh the R2 Dropbox backup after the historical rebuild
+
+After the rebuilt AQI files exist in TEST R2, refresh the Dropbox backup so validation queries read the new hourly layout.
+
+The current backup inventory defaults AQI levels to:
+
+```text
+history/v1/aqilevels/hourly
+```
+
+Confirm no environment override has reverted this to the old AQI prefix.
+
+Important: the Dropbox sync copies changed or missing inventory units, but it does not remove stale old-layout files from Dropbox. Therefore archive the old active Dropbox AQI folder before the first post-rebuild AQI backup sync.
+
+```bash
+DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup"
+STAMP="$(date -u +%F_%H%M%S)"
+
+mkdir -p "${DROPBOX_ROOT}/_archive/pre-aqilevels-v1-hard-rebuild"
+
+mv \
+  "${DROPBOX_ROOT}/history/v1/aqilevels" \
+  "${DROPBOX_ROOT}/_archive/pre-aqilevels-v1-hard-rebuild/aqilevels_old_layout_${STAMP}"
+```
+
+Then rebuild the R2 backup inventory from TEST R2 for AQI levels:
+
+```bash
+node scripts/backup_r2/build_backup_inventory.mjs \
+  --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
+  --domain aqilevels \
+  --index-prefix "history/_index" \
+  --full-rebuild \
+  --report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild.json"
+```
+
+Then run the inventory-driven Dropbox sync for AQI levels only:
+
+```bash
+node scripts/backup_r2/sync_history_to_dropbox.mjs \
+  --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
+  --dest-root "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup" \
+  --domain aqilevels \
+  --inventory-rel-path "history/_index/backup_inventory_v1.json" \
+  --state-rel-path "_ops/checkpoints/r2_history_backup_state_v1.json" \
+  --max-days-per-run 0 \
+  --report-out "tmp/r2_history_dropbox_backup_aqilevels_after_rebuild.json"
+```
+
+Post-sync checks:
+
+```bash
+find "${DROPBOX_ROOT}/history/v1/aqilevels/hourly" -type f | head -50
+
+find "${DROPBOX_ROOT}/history/v1/aqilevels" \
+  -type f \
+  | grep -v "/hourly/" \
+  | head -50
+```
+
+The second command should return no old-layout AQI files.
+
+## 16. Rebuild recent missing AQI levels after restart
 
 After the historical rebuild:
 
@@ -611,9 +726,9 @@ Also run targeted test:
 }
 ```
 
-## 16. Validation queries
+## 17. Validation queries
 
-### 16.1 DuckDB schema check
+### 17.1 DuckDB schema check
 
 ```sql
 DESCRIBE SELECT *
@@ -625,7 +740,7 @@ FROM read_parquet(
 
 Expected: no old wide columns.
 
-### 16.2 Timeseries 354 PM2.5 check
+### 17.2 Timeseries 354 PM2.5 check
 
 ```sql
 SELECT
@@ -661,7 +776,7 @@ WHERE station_id = 1575
 ORDER BY timestamp_hour_utc;
 ```
 
-### 16.3 PM2.5 input-basis check
+### 17.3 PM2.5 input-basis check
 
 ```sql
 SELECT
@@ -686,7 +801,7 @@ pm10 | rolling_24h_mean | hourly_mean
 no2  | hourly_mean      | hourly_mean
 ```
 
-### 16.4 Gap check
+### 17.4 Gap check
 
 ```sql
 WITH src AS (
@@ -764,7 +879,7 @@ WHERE timestamp_hour_utc IS NULL
 ORDER BY hour_utc;
 ```
 
-## 17. Browser validation
+## 18. Browser validation
 
 Use TEST website with:
 
@@ -785,7 +900,7 @@ Check:
 9. Switch pollutant.
 10. Confirm debug logs explain gaps.
 
-## 18. Restart AQI schedules
+## 19. Restart AQI schedules
 
 After validation:
 
@@ -805,7 +920,7 @@ operator:
 first successful run id:
 ```
 
-## 19. TEST monitoring
+## 20. TEST monitoring
 
 Monitor for at least one full rebuild plus several scheduled AQI cycles.
 
@@ -815,6 +930,7 @@ Checks:
 new AQI rows appearing in ObsAQIDB
 new hourly R2 AQI parquet appearing under aqilevels/hourly
 no old AQI parquet paths reappearing
+Dropbox backup contains only new hourly AQI files in active `history/v1/aqilevels`
 AQI history endpoint response_complete true where expected
 website AQI bands stable
 no parser-created gaps
@@ -822,7 +938,7 @@ no unexpected Cloud Run errors
 no unexpected R2 read/write spike
 ```
 
-## 20. Update this runbook after TEST
+## 21. Update this runbook after TEST
 
 Before LIVE:
 
@@ -833,7 +949,7 @@ Before LIVE:
 5. Add rollback notes.
 6. Add a mandatory LIVE pause point before deletion.
 
-## 21. LIVE repeat notes
+## 22. LIVE repeat notes
 
 LIVE should follow the same steps, but with extra safeguards:
 

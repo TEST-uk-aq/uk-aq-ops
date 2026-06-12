@@ -53,6 +53,17 @@ trim() {
   printf '%s' "${value}"
 }
 
+strip_wrapping_quotes() {
+  local value="${1:-}"
+  value="$(trim "${value}")"
+  if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "${value}"
+}
+
 build_default_log_dir() {
   local env_root
   env_root="$(trim "${UK_AQ_ENV_NAME:-}")"
@@ -160,7 +171,7 @@ PY
 resolve_run_job_path() {
   local repo_root="${1}"
   local override_raw
-  override_raw="$(trim "${UK_AQ_BACKFILL_RUN_JOB_PATH:-}")"
+  override_raw="$(strip_wrapping_quotes "${UK_AQ_BACKFILL_RUN_JOB_PATH:-}")"
   if [[ -n "${override_raw}" ]]; then
     local override_path="${override_raw}"
     if [[ "${override_path}" != /* ]]; then
