@@ -378,7 +378,7 @@ Required changes:
 Validation:
 
 ```json
-{"trigger_mode":"manual","run_mode":"reconcile_short","timeseries_ids":[354]}
+{"trigger_mode":"manual","run_mode":"backfill","timeseries_ids":[354],"from_hour_utc":"<start_hour_utc>","to_hour_utc":"<end_hour_utc>"}
 ```
 
 Expected:
@@ -388,6 +388,8 @@ rows_changed > 0 or clean no-op
 no old wide AQI fields used
 new ObsAQIDB rows inserted/updated
 ```
+
+Important: `reconcile_short` and `reconcile_deep` refresh helper rows from Cloud Run. Use `backfill` for smoke tests unless the operator explicitly wants Cloud Run to refresh the helper table.
 
 ## 10. Implement R2 writer changes
 
@@ -702,8 +704,83 @@ After the historical rebuild:
 
 1. Deploy new AQI hourly compute.
 2. Restart AQI compute.
-3. Run targeted reconcile/backfill for the downtime window.
-4. Confirm the compute fills missing recent hours.
+3. Manually refresh the ingest helper rows for the downtime/recent window.
+4. Run targeted Cloud Run `backfill` for the same window.
+5. Confirm the compute fills missing recent hours.
+
+Do not use `reconcile_short` or `reconcile_deep` for this step unless the operator explicitly wants the Cloud Run service to refresh helper rows. In the current worker, helper refresh is only triggered for `reconcile_short` and `reconcile_deep`; `backfill` reads existing helper rows and writes ObsAQIDB rows.
+
+### 16.1 Manual helper refresh
+
+Run this against the ingest database first:
+
+```sql
+select *
+from uk_aq_public.uk_aq_rpc_timeseries_aqi_hourly_helper_upsert(
+  p_hour_end_start_exclusive => '<pause_start_hour_utc>'::timestamptz,
+  p_hour_end_end_inclusive => '<restart_hour_utc>'::timestamptz,
+  p_timeseries_ids => null,
+  p_reference_hour_end_utc => '<restart_hour_utc>'::timestamptz
+);
+```
+
+Expected:
+
+```text
+source_rows > 0
+rows_upserted > 0 or clean no-op if already refreshed
+timeseries_hours_changed equals rows_upserted
+```
+
+TEST discovery:
+
+```json
+[
+  {
+    "source_rows": 105446,
+    "rows_upserted": 106182,
+    "timeseries_hours_changed": 106182,
+    "max_changed_lag_hours": "110.0000000000000000"
+  }
+]
+```
+
+If helper refresh fails with a missing variable or missing index-level column, apply the latest ingest helper RPC from the schema repo before retrying.
+
+### 16.2 ObsAQIDB focused SQL patch
+
+Before rerunning the Cloud Run backfill, confirm the ObsAQIDB table and hourly upsert RPC include the latest focused fixes:
+
+```text
+schemas/obs_aqi_db/uk_aq_obs_aqi_db_aqi_station_link_hardening.sql
+```
+
+The focused file must include:
+
+```text
+add column if not exists no2_hourly_mean_ugm3
+add column if not exists pm25_hourly_mean_ugm3
+add column if not exists pm10_hourly_mean_ugm3
+add column if not exists pm25_rolling24h_mean_ugm3
+add column if not exists pm10_rolling24h_mean_ugm3
+add column if not exists daqi_no2_index_level
+add column if not exists daqi_pm25_rolling24h_index_level
+add column if not exists daqi_pm10_rolling24h_index_level
+add column if not exists eaqi_no2_index_level
+add column if not exists eaqi_pm25_index_level
+add column if not exists eaqi_pm10_index_level
+```
+
+The hourly upsert RPC must carry these fields through `incoming_base`:
+
+```text
+r.daqi_index_level
+r.eaqi_index_level
+```
+
+If the focused file was not already applied, apply it to ObsAQIDB before the Cloud Run backfill.
+
+### 16.3 Cloud Run backfill
 
 Suggested manual payload:
 
@@ -716,13 +793,39 @@ Suggested manual payload:
 }
 ```
 
-Also run targeted test:
+Expected Cloud Run log:
+
+```text
+ok: true
+error: null
+source_rows > 0
+rows_upserted > 0
+rows_changed > 0
+timeseries_hours_changed > 0
+station_link_null_rows = 0
+station_link_mismatched_rows = 0
+helper_refresh_source_rows = null
+helper_refresh_rows_upserted = null
+```
+
+TEST smoke result after the fixes:
 
 ```json
 {
-  "trigger_mode": "manual",
-  "run_mode": "reconcile_short",
-  "timeseries_ids": [354]
+  "run_mode": "backfill",
+  "ok": true,
+  "error": null,
+  "source_rows": 3655,
+  "rows_upserted": 3655,
+  "rows_changed": 3655,
+  "timeseries_hours_changed": 3655,
+  "daily_rows_upserted": 1906,
+  "monthly_rows_upserted": 1916,
+  "station_link_null_rows": 0,
+  "station_link_mismatched_rows": 0,
+  "helper_pages_fetched": 4,
+  "helper_refresh_source_rows": null,
+  "helper_refresh_rows_upserted": null
 }
 ```
 
