@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_timeseries_aqi_hourly_cloud_run/**"
+      - "lib/aqi/**"
       - "scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
       - ".github/workflows/uk_aq_timeseries_aqi_hourly_cloud_run_deploy.yml"
   workflow_dispatch:
