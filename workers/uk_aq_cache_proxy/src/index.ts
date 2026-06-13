@@ -252,7 +252,7 @@ const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 const WEBSITE_DEBUG_LOG_MIN_BODY_BYTES = 4 * 1024;
 const WEBSITE_DEBUG_LOG_DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const WEBSITE_DEBUG_LOG_MAX_BODY_BYTES = 1024 * 1024;
-const WEBSITE_DEBUG_LOG_DEFAULT_FOLDER = "/error_logs";
+const WEBSITE_DEBUG_LOG_DEFAULT_FOLDER = "/error_log";
 const WEBSITE_DEBUG_LOG_FILENAME_PREFIX = "uk_aq_error_hex_map_html_";
 const TIMESERIES_UPSTREAM_FUNCTION = "uk_aq_timeseries";
 const TIMESERIES_V2_VERSION = "2";
@@ -564,13 +564,13 @@ function websiteDebugLogDropboxFolder(dropboxRoot: string, configuredFolder: str
   if (!folder) {
     return WEBSITE_DEBUG_LOG_DEFAULT_FOLDER;
   }
-  if (folder.endsWith("/error_logs")) {
+  if (folder.endsWith("/error_log")) {
     return folder;
   }
-  if (folder.endsWith("/error_log")) {
-    return `${folder}s`;
+  if (folder.endsWith("/error_logs")) {
+    return folder.slice(0, -1);
   }
-  return joinDropboxPath(folder, "error_logs");
+  return joinDropboxPath(folder, "error_log");
 }
 
 function compactUtcTimestampForFilename(timestamp: string): string {
@@ -687,7 +687,7 @@ function normalizeWebsiteDebugLogPayload(payload: unknown): Record<string, unkno
 async function handleWebsiteDebugLogIngest(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  _ctx: ExecutionContext,
   requestOrigin: string | null,
   allowedOrigins: Set<string>,
 ): Promise<Response> {
@@ -712,25 +712,37 @@ async function handleWebsiteDebugLogIngest(
     return makeErrorResponse(400, "invalid_payload", requestOrigin, allowedOrigins);
   }
 
-  ctx.waitUntil((async () => {
-    try {
-      const result = await uploadWebsiteDebugLogToDropbox(env, payload);
-      if (!result.uploaded) {
-        console.warn("website_debug_log_dropbox_skipped", { reason: result.reason || "unknown" });
-      }
-    } catch (error) {
-      console.error("website_debug_log_dropbox_upload_failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  })());
-
   const headers = new Headers({
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
   });
   addCorsHeaders(headers, requestOrigin, allowedOrigins);
-  return new Response(JSON.stringify({ ok: true }), { status: 202, headers });
+
+  try {
+    const result = await uploadWebsiteDebugLogToDropbox(env, payload);
+    if (!result.uploaded) {
+      console.warn("website_debug_log_dropbox_skipped", { reason: result.reason || "unknown" });
+      return new Response(JSON.stringify({
+        ok: false,
+        uploaded: false,
+        reason: result.reason || "unknown",
+      }), { status: 503, headers });
+    }
+    return new Response(JSON.stringify({
+      ok: true,
+      uploaded: true,
+      dropbox_path: result.dropbox_path || null,
+    }), { status: 201, headers });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("website_debug_log_dropbox_upload_failed", { error: message });
+    return new Response(JSON.stringify({
+      ok: false,
+      uploaded: false,
+      error: "dropbox_upload_failed",
+      message,
+    }), { status: 502, headers });
+  }
 }
 
 function trimTextOrNull(value: unknown, maxLength: number): string | null {
