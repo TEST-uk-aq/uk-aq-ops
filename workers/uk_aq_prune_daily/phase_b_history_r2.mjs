@@ -1412,13 +1412,13 @@ function rowsToAqilevelParquetBuffer(rows, writerProperties) {
   const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
   const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
   const table = arrow.tableFromArrays({
-    connector_id: Int32Array.from(rows.map((row) => Number(row.connector_id))),
+    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
     station_id: int32Vector(rows.map((row) => (
       row.station_id === null || row.station_id === undefined
         ? null
         : Number(row.station_id)
     ))),
-    timeseries_id: Int32Array.from(rows.map((row) => Number(row.timeseries_id))),
+    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
     pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
     timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
     daqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.daqi_input_value_ugm3))),
