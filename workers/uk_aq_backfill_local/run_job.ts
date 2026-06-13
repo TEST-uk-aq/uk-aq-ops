@@ -2983,9 +2983,9 @@ function rowsToAqiParquetBuffer(
     tableFromArrays: (data: Record<string, unknown>) => unknown;
     tableToIPC: (table: unknown, mode: "stream") => Uint8Array;
   }).tableFromArrays({
-    connector_id: rows.map((row) => row.connector_id),
+    connector_id: int32Vector(rows.map((row) => row.connector_id)),
     station_id: int32Vector(rows.map((row) => row.station_id)),
-    timeseries_id: rows.map((row) => row.timeseries_id),
+    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
     pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
     timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
     daqi_input_value_ugm3: float64Vector(rows.map((row) => row.daqi_input_value_ugm3)),

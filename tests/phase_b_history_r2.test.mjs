@@ -349,6 +349,9 @@ test("AQI parquet writer preserves nullable text and timestamp column types", ()
   const table = arrow.tableFromIPC(wasmTable.intoIPCStream());
   const fields = new Map(table.schema.fields.map((field) => [field.name, String(field.type)]));
 
+  assert.equal(fields.get("connector_id"), "Int32");
+  assert.equal(fields.get("station_id"), "Int32");
+  assert.equal(fields.get("timeseries_id"), "Int32");
   assert.equal(fields.get("daqi_input_averaging_code"), "Utf8");
   assert.equal(fields.get("daqi_calculation_status"), "Utf8");
   assert.equal(fields.get("eaqi_input_averaging_code"), "Utf8");
