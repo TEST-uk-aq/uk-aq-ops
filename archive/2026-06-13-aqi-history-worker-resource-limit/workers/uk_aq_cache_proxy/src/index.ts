@@ -230,7 +230,7 @@ const MIN_SESSION_MAX_AGE_SECONDS = 60;
 const MAX_SESSION_MAX_AGE_SECONDS = 86400;
 const DEFAULT_UPSTREAM_MAX_ATTEMPTS = 2;
 const UPSTREAM_RETRY_DELAY_MS = 300;
-const AQI_HISTORY_UPSTREAM_MAX_ATTEMPTS = 2;
+const AQI_HISTORY_UPSTREAM_MAX_ATTEMPTS = 6;
 const AQI_HISTORY_UPSTREAM_RETRY_DELAY_MS = 700;
 const UPSTREAM_RETRY_STATUSES = new Set([502, 503, 504]);
 const HOUR_MS = 60 * 60 * 1000;
@@ -1895,9 +1895,6 @@ function isCacheableUpstreamResponse(response: Response): boolean {
   if (response.status !== 200) {
     return false;
   }
-  if ((response.headers.get("X-UK-AQ-Response-Complete") ?? "").toLowerCase() === "false") {
-    return false;
-  }
   const cacheControl = (response.headers.get("Cache-Control") ?? "").toLowerCase();
   return !(cacheControl.includes("no-store") || cacheControl.includes("private"));
 }
@@ -1909,28 +1906,6 @@ function isSafeRequestMethod(method: string): boolean {
 
 function shouldRetryUpstreamStatus(status: number): boolean {
   return UPSTREAM_RETRY_STATUSES.has(status);
-}
-
-async function shouldRetryAqiHistoryUpstreamResponse(response: Response): Promise<boolean> {
-  if (!shouldRetryUpstreamStatus(response.status)) {
-    return false;
-  }
-  if (response.status !== 503) {
-    return true;
-  }
-  const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
-  if (!contentType.includes("text/html")) {
-    return true;
-  }
-  try {
-    const text = await response.clone().text();
-    if (/Error\s+1102|Worker exceeded resource limits/i.test(text)) {
-      return false;
-    }
-  } catch (_error) {
-    return false;
-  }
-  return true;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1956,7 +1931,6 @@ async function fetchUpstreamWithRetry(
   method: string,
   maxAttempts = DEFAULT_UPSTREAM_MAX_ATTEMPTS,
   retryDelayMs = UPSTREAM_RETRY_DELAY_MS,
-  shouldRetryResponse: (response: Response) => Promise<boolean> | boolean = (response) => shouldRetryUpstreamStatus(response.status),
 ): Promise<UpstreamFetchResult> {
   const canRetry = isSafeRequestMethod(method);
   const normalizedAttempts = canRetry ? Math.max(1, Math.floor(maxAttempts)) : 1;
@@ -1966,8 +1940,7 @@ async function fetchUpstreamWithRetry(
   for (let attempt = 1; attempt <= normalizedAttempts; attempt += 1) {
     try {
       const response = await fetch(url, init);
-      const retryableResponse = canRetry ? await shouldRetryResponse(response) : false;
-      const shouldRetry = retryableResponse && attempt < normalizedAttempts;
+      const shouldRetry = canRetry && shouldRetryUpstreamStatus(response.status) && attempt < normalizedAttempts;
       if (!shouldRetry) {
         if (attempt === 1) {
           return { response, retried: false, attempts: 1 };
@@ -2723,9 +2696,6 @@ export default {
         request.method,
         upstreamMaxAttempts,
         upstreamRetryDelayMs,
-        usingExternalAqiHistoryUpstream
-          ? shouldRetryAqiHistoryUpstreamResponse
-          : undefined,
       );
       upstreamResponse = fetchResult.response;
       upstreamRetried = fetchResult.retried;
@@ -2746,11 +2716,8 @@ export default {
       responseHeaders.set("X-UK-AQ-Upstream-Retry", upstreamRetryReason);
     }
     responseHeaders.set("X-UK-AQ-Upstream-Attempts", String(upstreamAttemptCount));
-    const upstreamResponseComplete = (upstreamResponse.headers.get("X-UK-AQ-Response-Complete") ?? "").toLowerCase();
-    if (upstreamResponse.status === 200 && upstreamResponseComplete !== "false") {
+    if (upstreamResponse.status === 200) {
       responseHeaders.set("Cache-Control", buildCacheControl(profile));
-    } else if (upstreamResponseComplete === "false") {
-      responseHeaders.set("Cache-Control", "no-store");
     }
     const responseBody: BodyInit | null = upstreamResponse.body;
     addCorsHeaders(responseHeaders, requestOrigin, allowedOrigins);

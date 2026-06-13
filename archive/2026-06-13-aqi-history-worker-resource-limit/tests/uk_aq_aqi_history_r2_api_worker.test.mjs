@@ -154,59 +154,10 @@ test("worker source uses the normalized hourly AQI response contract", () => {
   assert.match(workerSource, /const AQI_RESPONSE_COLUMNS = \[/);
   assert.match(workerSource, /__ukaq_aqi_history_response_v/);
   assert.match(workerSource, /aqi_band_cache:\s*\{\s*enabled: false/);
-  assert.match(workerSource, /UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST/);
-  assert.match(workerSource, /max_parquet_chunks_budget_exceeded/);
-  assert.match(workerSource, /aqi_history_request/);
   assert.doesNotMatch(
     workerSource,
     /daqi_no2_index_level|daqi_pm25_rolling24h_index_level|daqi_pm10_rolling24h_index_level|eaqi_no2_index_level|eaqi_pm25_index_level|eaqi_pm10_index_level/,
   );
-});
-
-test("worker returns structured partial JSON instead of broad scanning when required index lacks connector context", async () => {
-  const harness = installAqiHistoryMocks([]);
-
-  try {
-    const response = await aqiHistoryWorker.fetch(
-      new Request("https://example.test/v1/aqi-history?scope=timeseries&grain=hourly&timeseries_id=396&entity=396&pollutant=pm25&row_limit=20000&from_utc=2026-04-03T14:52:10.978Z&to_utc=2026-04-10T14:52:10.978Z", {
-        headers: {
-          "x-uk-aq-upstream-auth": "test-upstream-secret",
-        },
-      }),
-      {
-        UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret",
-        INGESTDB_RETENTION_DAYS: "5",
-        UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED: "true",
-        UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX: "true",
-      },
-      harness.ctx,
-    );
-
-    assert.equal(response.status, 200);
-    assert.match(response.headers.get("x-uk-aq-request-id"), /^[0-9a-f-]+$/i);
-    assert.equal(response.headers.get("x-uk-aq-response-complete"), "false");
-    assert.equal(response.headers.get("cache-control"), "no-store");
-
-    const payload = await response.json();
-    assert.equal(payload.ok, true);
-    assert.equal(payload.response_complete, false);
-    assert.equal(payload.has_gap, true);
-    assert.equal(payload.coverage.timeseries_index.enabled, true);
-    assert.equal(payload.coverage.timeseries_index.require_timeseries_index, true);
-    assert.equal(
-      payload.coverage.history_scan_stopped_reason,
-      "missing_connector_context_for_required_timeseries_index",
-    );
-    assert.deepEqual(payload.coverage.scan_metrics.r2_object_reads, 0);
-    assert.equal(payload.coverage.scan_metrics.stopped_early, true);
-    assert.equal(payload.coverage.scanned_connector_manifests, 0);
-    assert.equal(payload.coverage.scanned_parquet_files, 0);
-    assert.ok(payload.partial_reasons.some((reason) => (
-      reason.includes("missing_connector_context_for_required_timeseries_index")
-    )));
-  } finally {
-    await harness.restore();
-  }
 });
 
 test("worker returns normalized compact AQI rows with row-summary metadata", async () => {

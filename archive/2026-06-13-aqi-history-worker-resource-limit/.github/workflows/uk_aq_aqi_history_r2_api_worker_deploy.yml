@@ -21,14 +21,6 @@ jobs:
       UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
       INGESTDB_RETENTION_DAYS: ${{ vars.INGESTDB_RETENTION_DAYS || '5' }}
-      UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX || 'history/_index/aqilevels_timeseries' }}
-      UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED: ${{ vars.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED || 'true' }}
-      UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX: ${{ vars.UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX || 'true' }}
-      UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST: ${{ vars.UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST || '120' }}
-      UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST: ${{ vars.UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST || '80' }}
-      UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST: ${{ vars.UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST || '300' }}
-      UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST: ${{ vars.UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST || '600' }}
-      UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS: ${{ vars.UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS || '12000' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,35 +60,6 @@ jobs:
           set -euo pipefail
           sed -i "s|__CFLARE_R2_BUCKET__|${CFLARE_R2_BUCKET}|g" workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml
           sed -i "s|__INGESTDB_RETENTION_DAYS__|${INGESTDB_RETENTION_DAYS}|g" workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          config_path = Path("workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml")
-          text = config_path.read_text(encoding="utf-8")
-          replacements = {
-              "UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX": os.environ["UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX"],
-              "UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED": os.environ["UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED"],
-              "UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX": os.environ["UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX"],
-              "UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST"],
-              "UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST"],
-              "UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST"],
-              "UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST"],
-              "UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS"],
-          }
-          for key, value in replacements.items():
-              escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-              text, count = re.subn(
-                  rf'^{re.escape(key)}\s*=\s*"[^"]*"',
-                  f'{key} = "{escaped}"',
-                  text,
-                  flags=re.MULTILINE,
-              )
-              if count != 1:
-                  raise SystemExit(f"Expected exactly one {key} entry in {config_path}, found {count}.")
-          config_path.write_text(text, encoding="utf-8")
-          PY
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65

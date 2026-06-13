@@ -49,12 +49,13 @@ R2 paths expected:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
 - the worker resolves timeseries window context from `uk_aq_public.uk_aq_timeseries_aqi_hourly` (including `connector_id`, `station_id`, and window `timeseries_ids`) and narrows scans accordingly
 - the ObsAQIDB fallback query reads the normalized hourly AQI contract directly (`daqi_input_*`, `eaqi_input_*`, `*_calculation_status`, `*_missing_reason`, and source counts) and the worker returns those normalized rows directly
-- if the ObsAQIDB context lookup misses for an R2-only timeseries, the worker still scans R2 directly by timeseries id across day connector manifests instead of returning an empty response
+- if the ObsAQIDB context lookup misses while `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX=true`, the worker returns structured partial JSON instead of scanning every connector manifest for every day
 - optional AQI timeseries index (fast-path):
   - `${UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
   - the worker resolves window timeseries ids from `uk_aq_public.uk_aq_timeseries_aqi_hourly` and narrows parquet file scans using each file's `min_timeseries_id/max_timeseries_id`
-  - if the optional index is missing/invalid for a day+connector, it falls back to connector manifest file scanning
+  - if the optional index is missing/invalid for a day+connector and `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX=true`, connector manifest fallback is skipped and the response is marked partial
 - AQI parquet reads use `timeseries_id` row-group stats and chunked column reads instead of materializing whole parquet files
+- safety budgets cap R2 object reads, parquet files, row groups, parquet chunks, and elapsed scan time; budget stops return partial JSON with diagnostics instead of running until Cloudflare terminates the Worker
 - legacy hourly band-cache reads/writes are disabled in this worker; normalized responses are served from fresh R2/ObsAQIDB reads plus the HTTP cache layer
 
 Serving rule:
@@ -86,6 +87,12 @@ Useful runtime vars:
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX` (default `history/_index/aqilevels_timeseries`)
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED` (default `true`)
+- `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX` (default `true`)
+- `UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST` (default `120`)
+- `UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST` (default `80`)
+- `UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST` (default `300`)
+- `UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST` (default `600`)
+- `UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS` (default `12000`)
 - `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`)
 
 Response:
@@ -93,7 +100,7 @@ Response:
 - default JSON response uses `wire_format=json`, `data_format=compact`, `columns`, and compact `points` arrays.
 - `format=objects` returns row-object JSON; `format=tsv` returns a legacy tab-separated payload.
 - each row is a normalized hourly AQI row with `period_start_utc`, `connector_id`, `station_id`, `timeseries_id`, `pollutant_code`, `daqi_index_level`, `eaqi_index_level`, `daqi_input_value_ugm3`, `daqi_input_averaging_code`, `eaqi_input_value_ugm3`, `eaqi_input_averaging_code`, `daqi_calculation_status`, `eaqi_calculation_status`, `source`, and `source_coverage`
-- includes source and coverage diagnostics (historical/overlap/retention windows, source coverage intervals, history + obs_aqidb counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, `coverage.row_summary`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when live fallback is used)
+- includes source and coverage diagnostics (historical/overlap/retention windows, source coverage intervals, history + obs_aqidb counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, `coverage.scan_metrics`, `coverage.row_summary`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when live fallback is used)
 - `coverage.row_summary` includes returned-row counts plus missing/null diagnostics (`parsed_point_count`, `null_daqi_count`, `null_eaqi_count`, `source_counts`, `source_coverage_counts`, `pollutant_counts`, and calculation-status / missing-reason counts)
 - includes `response_complete`, `has_gap`, `coverage_state`, and `partial_reasons` plus scan-completeness diagnostics (`coverage.history_scan_complete` and `coverage.history_scan_stopped_reason`) so clients can detect partial history scans.
 - includes `cache_scope` of `recent` or `immutable`

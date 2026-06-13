@@ -52,9 +52,8 @@ Read endpoints:
     - this reduces cache-key churn from second-level timestamp differences on hourly AQI charts
   - upstream retry policy:
     - general read routes: up to 2 attempts
-    - AQI history route: up to 2 attempts with linear backoff
+    - AQI history route: up to 6 attempts with linear backoff
     - retry statuses: `502`, `503`, `504`
-    - AQI history `503` responses with Cloudflare Error 1102 / "Worker exceeded resource limits" HTML are not retried, because retrying repeats the same CPU/R2-heavy upstream work inside the same browser request path
 - `/api/aq/postcode_lookup` -> external postcode lookup R2 API URL (`UK_AQ_POSTCODE_LOOKUP_R2_API_URL`)
   - uses the long-lived postcode cache profile (`max-age=86400`)
 - `/api/aq/postcode_suggest` -> external postcode suggest R2 API URL (`UK_AQ_POSTCODE_SUGGEST_R2_API_URL`)

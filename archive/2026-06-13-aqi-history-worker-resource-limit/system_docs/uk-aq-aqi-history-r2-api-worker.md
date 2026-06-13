@@ -76,17 +76,9 @@ Window split behavior:
   - index key shape: `day_utc=YYYY-MM-DD/connector_id=<id>/manifest.json`
   - worker resolves window timeseries ids from `uk_aq_public.uk_aq_timeseries_aqi_hourly` and narrows parquet scans by `min_timeseries_id/max_timeseries_id`.
   - if the resolved window timeseries id list is explicitly empty for the requested window, the worker fast-returns an empty history segment and skips R2 parquet scans to avoid CPU-limit failures.
-  - missing/invalid index entries do not fall back to connector manifest scanning when `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX=true`.
-  - if the connector context cannot be resolved while the index is required, the worker returns structured partial JSON with `response_complete=false` and `partial_reasons` instead of scanning every connector manifest for every day.
+  - missing/invalid index entries fall back to connector manifest scanning.
 - AQI parquet reads use `timeseries_id` row-group stats plus chunked column reads so the worker does not materialize whole parquet files for single-timeseries requests.
 - Day-level R2 scans are processed newest-first so when scan budgets are hit, recent overlap near the live split is prioritized over older history.
-- The normal indexed path reads the per-day connector index directly when `connector_id` is known; it does not read the day manifest first.
-- Safety budgets stop a request before Cloudflare kills the Worker. Budget stops return HTTP 200 partial JSON with diagnostics rather than Cloudflare HTML:
-  - max parquet files
-  - max R2 object reads
-  - max parquet row groups
-  - max parquet chunks
-  - max scan elapsed milliseconds
 - Legacy hourly AQI band-cache objects under `history/v1/aqilevels/hourly/bands/v1/...` are no longer read or written by this worker; the live API serves normalized rows directly from R2 plus the ObsAQIDB retention fallback.
 
 ## Required GitHub env/secret targets
@@ -112,17 +104,11 @@ Variables:
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX=history/_index`
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX=history/_index/aqilevels_timeseries`
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED=true`
-- `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX=true`
 - `UK_AQ_AQI_HISTORY_R2_CACHE_MAX_AGE_SECONDS=300`
 - `UK_AQ_AQI_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS=86400`
 - `INGESTDB_RETENTION_DAYS=5` (default)
 - `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS=10000` (default)
 - `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE=5000` (default)
-- `UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST=120`
-- `UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST=80`
-- `UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST=300`
-- `UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST=600`
-- `UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS=12000`
 - `UK_AQ_PUBLIC_SCHEMA=uk_aq_public`
 
 ## Cache proxy integration
@@ -154,7 +140,6 @@ Coverage metadata includes fallback status for the recent window:
 - `coverage.target_timeseries_id_count`: number of timeseries ids used for AQI index filtering
 - `coverage.history_scan_complete` / `coverage.history_scan_stopped_reason`: whether the main R2 history scan completed without budget cut-off
 - `coverage.timeseries_index`: AQI index diagnostics for the main history segment (`enabled`, `prefix`, `hit_count`, `miss_count`, `skipped_days_by_file_range`, `skipped_files_by_pollutant`, and warnings)
-- `coverage.scan_metrics`: request safety counters and limits (`r2_object_reads`, `r2_list_operations`, `parquet_row_groups_scanned`, `parquet_chunks_scanned`, decoded row counts, and `stopped_reason`)
 - `coverage.row_summary`: returned-row diagnostics (`parsed_point_count`, `null_daqi_count`, `null_eaqi_count`, `source_counts`, `source_coverage_counts`, `pollutant_counts`, and calculation-status / missing-reason counts)
 - `coverage.resolved_connector_id`: connector id discovered from R2 when ObsAQIDB context lookup misses
 - `coverage.obs_aqidb_fallback_used`: whether ObsAQIDB fallback rows were merged
@@ -167,7 +152,6 @@ Coverage metadata includes fallback status for the recent window:
 - top-level `cache_scope`: `recent` or `immutable`
 - top-level `wire_format`: `json` for JSON responses, `tsv` for legacy text
 - top-level `data_format`: `compact` or `objects` when JSON is returned
-- partial responses set `X-UK-AQ-Response-Complete: false` and `Cache-Control: no-store`, and are not written to the Worker cache
 
 ## Point payload
 

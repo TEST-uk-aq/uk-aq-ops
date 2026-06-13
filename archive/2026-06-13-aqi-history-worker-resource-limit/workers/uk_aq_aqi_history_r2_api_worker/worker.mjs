@@ -22,15 +22,6 @@ const MAX_PARQUET_ROW_CHUNK_SIZE = 50000;
 const DEFAULT_MAX_PARQUET_FILES_PER_REQUEST = 200;
 const MIN_MAX_PARQUET_FILES_PER_REQUEST = 10;
 const MAX_MAX_PARQUET_FILES_PER_REQUEST = 5000;
-const DEFAULT_MAX_R2_OBJECT_READS_PER_REQUEST = 80;
-const MIN_MAX_R2_OBJECT_READS_PER_REQUEST = 10;
-const MAX_MAX_R2_OBJECT_READS_PER_REQUEST = 5000;
-const DEFAULT_MAX_PARQUET_ROW_GROUPS_PER_REQUEST = 300;
-const MIN_MAX_PARQUET_ROW_GROUPS_PER_REQUEST = 10;
-const MAX_MAX_PARQUET_ROW_GROUPS_PER_REQUEST = 10000;
-const DEFAULT_MAX_PARQUET_CHUNKS_PER_REQUEST = 600;
-const MIN_MAX_PARQUET_CHUNKS_PER_REQUEST = 10;
-const MAX_MAX_PARQUET_CHUNKS_PER_REQUEST = 50000;
 const DEFAULT_MAX_SCAN_ELAPSED_MS = 18000;
 const MIN_MAX_SCAN_ELAPSED_MS = 1000;
 const MAX_MAX_SCAN_ELAPSED_MS = 120000;
@@ -143,88 +134,6 @@ function parseOptionalBoolean(raw, fallback) {
     return false;
   }
   return fallback;
-}
-
-function createScanMetrics({
-  requestId = null,
-  maxR2ObjectReads,
-  maxParquetRowGroups,
-  maxParquetChunks,
-} = {}) {
-  return {
-    request_id: requestId,
-    r2_object_reads: 0,
-    r2_list_operations: 0,
-    r2_object_read_keys_by_kind: {
-      day_manifest: 0,
-      timeseries_index: 0,
-      connector_manifest: 0,
-      parquet_file: 0,
-      other: 0,
-    },
-    parquet_row_groups_scanned: 0,
-    parquet_chunks_scanned: 0,
-    parquet_filter_rows_decoded: 0,
-    parquet_payload_rows_decoded: 0,
-    parquet_matched_rows: 0,
-    max_r2_object_reads: maxR2ObjectReads,
-    max_r2_list_operations: 0,
-    max_parquet_row_groups: maxParquetRowGroups,
-    max_parquet_chunks: maxParquetChunks,
-    stopped_early: false,
-    stopped_reason: null,
-  };
-}
-
-function stopScan(metrics, reason) {
-  if (metrics && !metrics.stopped_reason) {
-    metrics.stopped_early = true;
-    metrics.stopped_reason = reason;
-  }
-  return reason;
-}
-
-function canReadR2Object(metrics, kind = "other") {
-  if (!metrics) {
-    return true;
-  }
-  if (metrics.r2_object_reads >= metrics.max_r2_object_reads) {
-    stopScan(metrics, `max_r2_object_reads_budget_exceeded:${metrics.max_r2_object_reads}`);
-    return false;
-  }
-  metrics.r2_object_reads += 1;
-  const normalizedKind = Object.prototype.hasOwnProperty.call(
-    metrics.r2_object_read_keys_by_kind,
-    kind,
-  )
-    ? kind
-    : "other";
-  metrics.r2_object_read_keys_by_kind[normalizedKind] += 1;
-  return true;
-}
-
-function canScanParquetRowGroup(metrics) {
-  if (!metrics) {
-    return true;
-  }
-  if (metrics.parquet_row_groups_scanned >= metrics.max_parquet_row_groups) {
-    stopScan(metrics, `max_parquet_row_groups_budget_exceeded:${metrics.max_parquet_row_groups}`);
-    return false;
-  }
-  metrics.parquet_row_groups_scanned += 1;
-  return true;
-}
-
-function canScanParquetChunk(metrics) {
-  if (!metrics) {
-    return true;
-  }
-  if (metrics.parquet_chunks_scanned >= metrics.max_parquet_chunks) {
-    stopScan(metrics, `max_parquet_chunks_budget_exceeded:${metrics.max_parquet_chunks}`);
-    return false;
-  }
-  metrics.parquet_chunks_scanned += 1;
-  return true;
 }
 
 function parseRequiredPositiveInt(raw) {
@@ -490,10 +399,7 @@ function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
   return fallbackKey;
 }
 
-async function fetchJsonObjectFromR2(env, key, metrics = null, kind = "other") {
-  if (!canReadR2Object(metrics, kind)) {
-    return { exists: false, value: null, budget_exceeded: true };
-  }
+async function fetchJsonObjectFromR2(env, key) {
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
     return { exists: false, value: null };
@@ -620,11 +526,7 @@ async function fetchFilteredParquetRowsFromR2(
   rowChunkSize,
   targetTimeseriesIds = null,
   payloadColumns = AQI_PARQUET_COLUMNS,
-  metrics = null,
 ) {
-  if (!canReadR2Object(metrics, "parquet_file")) {
-    return { exists: false, rows: [], budget_exceeded: true };
-  }
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
     return { exists: false, rows: [] };
@@ -677,9 +579,6 @@ async function fetchFilteredParquetRowsFromR2(
   const outRows = [];
   let rowGroupStart = 0;
   for (const rowGroup of metadata.row_groups ?? []) {
-    if (!canScanParquetRowGroup(metrics)) {
-      break;
-    }
     const rowGroupRows = Number(rowGroup?.num_rows ?? 0);
     const rowGroupEnd = rowGroupStart + rowGroupRows;
     if (!Number.isFinite(rowGroupRows) || rowGroupRows <= 0) {
@@ -711,9 +610,6 @@ async function fetchFilteredParquetRowsFromR2(
       chunkStart < rowGroupEnd;
       chunkStart += rowChunkSize
     ) {
-      if (!canScanParquetChunk(metrics)) {
-        break;
-      }
       const chunkEnd = Math.min(rowGroupEnd, chunkStart + rowChunkSize);
       const matchedIndexes = [];
       if (filterColumns.length > 0) {
@@ -726,9 +622,6 @@ async function fetchFilteredParquetRowsFromR2(
         );
         if (filterRows.length === 0) {
           continue;
-        }
-        if (metrics) {
-          metrics.parquet_filter_rows_decoded += filterRows.length;
         }
         for (let idx = 0; idx < filterRows.length; idx += 1) {
           const rowEntry = filterRows[idx];
@@ -758,9 +651,6 @@ async function fetchFilteredParquetRowsFromR2(
       if (payloadRows.length === 0) {
         continue;
       }
-      if (metrics) {
-        metrics.parquet_payload_rows_decoded += payloadRows.length;
-      }
 
       for (const idx of matchedIndexes) {
         const rowEntry = idx < payloadRows.length ? payloadRows[idx] : null;
@@ -773,15 +663,9 @@ async function fetchFilteredParquetRowsFromR2(
         }
         outRows.push(row);
       }
-      if (metrics) {
-        metrics.parquet_matched_rows += matchedIndexes.length;
-      }
     }
 
     rowGroupStart = rowGroupEnd;
-    if (metrics?.stopped_reason) {
-      break;
-    }
   }
 
   return { exists: true, rows: outRows };
@@ -859,7 +743,6 @@ function normalizeFiniteIndex(value, maxValue) {
 function buildEmptyHistoryRead() {
   return {
     points: [],
-    days_requested: 0,
     days_scanned: 0,
     scanned_connector_manifests: 0,
     scanned_parquet_files: 0,
@@ -881,11 +764,6 @@ function buildEmptyHistoryRead() {
       target_timeseries_id_count: 0,
       scan_stopped_reason: null,
     },
-    scan_metrics: createScanMetrics({
-      maxR2ObjectReads: 0,
-      maxParquetRowGroups: 0,
-      maxParquetChunks: 0,
-    }),
     aqi_band_cache: {
       enabled: false,
       prefix: DEFAULT_HISTORY_BANDS_PREFIX,
@@ -1341,24 +1219,6 @@ async function readHistoryRows({
     MIN_MAX_PARQUET_FILES_PER_REQUEST,
     MAX_MAX_PARQUET_FILES_PER_REQUEST,
   );
-  const maxR2ObjectReadsPerRequest = parsePositiveInt(
-    env.UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST,
-    DEFAULT_MAX_R2_OBJECT_READS_PER_REQUEST,
-    MIN_MAX_R2_OBJECT_READS_PER_REQUEST,
-    MAX_MAX_R2_OBJECT_READS_PER_REQUEST,
-  );
-  const maxParquetRowGroupsPerRequest = parsePositiveInt(
-    env.UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST,
-    DEFAULT_MAX_PARQUET_ROW_GROUPS_PER_REQUEST,
-    MIN_MAX_PARQUET_ROW_GROUPS_PER_REQUEST,
-    MAX_MAX_PARQUET_ROW_GROUPS_PER_REQUEST,
-  );
-  const maxParquetChunksPerRequest = parsePositiveInt(
-    env.UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST,
-    DEFAULT_MAX_PARQUET_CHUNKS_PER_REQUEST,
-    MIN_MAX_PARQUET_CHUNKS_PER_REQUEST,
-    MAX_MAX_PARQUET_CHUNKS_PER_REQUEST,
-  );
   const maxScanElapsedMs = parsePositiveInt(
     env.UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS,
     DEFAULT_MAX_SCAN_ELAPSED_MS,
@@ -1375,11 +1235,6 @@ async function readHistoryRows({
   const bandCacheWriteCount = 0;
   const bandCacheEligibleDayCount = 0;
   const bandCacheSkippedDayCount = 0;
-  const scanMetrics = createScanMetrics({
-    maxR2ObjectReads: maxR2ObjectReadsPerRequest,
-    maxParquetRowGroups: maxParquetRowGroupsPerRequest,
-    maxParquetChunks: maxParquetChunksPerRequest,
-  });
 
   const days = listUtcDays(startIso, endIso);
   const daysToScan = days.slice().reverse();
@@ -1400,7 +1255,6 @@ async function readHistoryRows({
   const timeseriesIndexMissingKeys = [];
   const timeseriesIndexWarnings = [];
   let scannedConnectorManifests = 0;
-  let scannedDays = 0;
   let resolvedConnectorId = parseRequiredPositiveInt(connectorId) || null;
   let timeseriesIndexHitCount = 0;
   let timeseriesIndexMissCount = 0;
@@ -1409,34 +1263,10 @@ async function readHistoryRows({
   let timeseriesIndexIndexedFileCount = 0;
   let timeseriesIndexUnknownRangeFileCount = 0;
   let scanStoppedReason = null;
-  if (!timeseriesIndexEnabled && requireTimeseriesIndex && targetTimeseriesIdCount > 0) {
-    scanStoppedReason = "timeseries_index_required_but_disabled";
-    stopScan(scanMetrics, scanStoppedReason);
-    timeseriesIndexWarnings.push(
-      "Skipped broad history scan: timeseries index is required but disabled by Worker configuration.",
-    );
-  }
-  if (
-    timeseriesIndexEnabled
-    && requireTimeseriesIndex
-    && targetTimeseriesIdCount > 0
-    && !resolvedConnectorId
-  ) {
-    scanStoppedReason = "missing_connector_context_for_required_timeseries_index";
-    stopScan(scanMetrics, scanStoppedReason);
-    timeseriesIndexWarnings.push(
-      "Skipped broad connector manifest scan: timeseries index is required but connector_id could not be resolved.",
-    );
-  }
 
   const isScanBudgetExceeded = () => {
-    if (scanMetrics.stopped_reason) {
-      scanStoppedReason = scanMetrics.stopped_reason;
-      return true;
-    }
     if (Date.now() - scanStartedAtMs > maxScanElapsedMs) {
       scanStoppedReason = `scan_elapsed_ms_budget_exceeded:${maxScanElapsedMs}`;
-      stopScan(scanMetrics, scanStoppedReason);
       return true;
     }
     return false;
@@ -1449,30 +1279,30 @@ async function readHistoryRows({
     const dayStartMs = utcMidnightMs(dayUtc);
     const dayEndMs = dayStartMs + DAY_MS;
     const dayRowsByPeriodStart = new Map();
-    scannedDays += 1;
+
+    const dayManifestKey = buildDayManifestKey(historyPrefix, dayUtc);
+    const dayManifestObject = await fetchJsonObjectFromR2(env, dayManifestKey);
+    if (!dayManifestObject.exists) {
+      missingDayManifestKeys.push(dayManifestKey);
+      continue;
+    }
 
     const connectorManifestTargets = [];
-    if (Number.isFinite(resolvedConnectorId) && resolvedConnectorId > 0) {
+    if (Number.isFinite(connectorId) && connectorId > 0) {
       const connectorManifestFallbackKey = buildConnectorManifestKey(
         historyPrefix,
         dayUtc,
-        resolvedConnectorId,
+        connectorId,
       );
       connectorManifestTargets.push({
-        connector_id: resolvedConnectorId,
-        manifest_key: connectorManifestFallbackKey,
+        connector_id: connectorId,
+        manifest_key: findConnectorManifestKey(
+          dayManifestObject.value,
+          connectorId,
+          connectorManifestFallbackKey,
+        ),
       });
     } else {
-      const dayManifestKey = buildDayManifestKey(historyPrefix, dayUtc);
-      const dayManifestObject = await fetchJsonObjectFromR2(env, dayManifestKey, scanMetrics, "day_manifest");
-      if (dayManifestObject.budget_exceeded) {
-        scanStoppedReason = scanMetrics.stopped_reason;
-        break;
-      }
-      if (!dayManifestObject.exists) {
-        missingDayManifestKeys.push(dayManifestKey);
-        continue;
-      }
       const connectorManifestEntries = Array.isArray(dayManifestObject.value?.connector_manifests)
         ? dayManifestObject.value.connector_manifests
         : [];
@@ -1508,11 +1338,7 @@ async function readHistoryRows({
         );
         timeseriesIndexScannedKeys.push(connectorIndexKey);
         try {
-          const connectorIndexObject = await fetchJsonObjectFromR2(env, connectorIndexKey, scanMetrics, "timeseries_index");
-          if (connectorIndexObject.budget_exceeded) {
-            scanStoppedReason = scanMetrics.stopped_reason;
-            break;
-          }
+          const connectorIndexObject = await fetchJsonObjectFromR2(env, connectorIndexKey);
           if (connectorIndexObject.exists) {
             timeseriesIndexHitCount += 1;
             const extraction = extractParquetKeysFromTimeseriesIndex(
@@ -1552,11 +1378,7 @@ async function readHistoryRows({
 
       if (parquetKeys === null) {
         scannedConnectorManifests += 1;
-        const connectorManifestObject = await fetchJsonObjectFromR2(env, connectorManifestKey, scanMetrics, "connector_manifest");
-        if (connectorManifestObject.budget_exceeded) {
-          scanStoppedReason = scanMetrics.stopped_reason;
-          break;
-        }
+        const connectorManifestObject = await fetchJsonObjectFromR2(env, connectorManifestKey);
         if (!connectorManifestObject.exists) {
           missingConnectorManifestKeys.add(connectorManifestKey);
           continue;
@@ -1586,15 +1408,7 @@ async function readHistoryRows({
           parquetRowChunkSize,
           targetTimeseriesIds,
           parquetPayloadColumns,
-          scanMetrics,
         );
-        if (parquet.budget_exceeded) {
-          scanStoppedReason = scanMetrics.stopped_reason;
-          break;
-        }
-        if (scanMetrics.stopped_reason && !scanStoppedReason) {
-          scanStoppedReason = scanMetrics.stopped_reason;
-        }
         if (!parquet.exists) {
           missingParquetKeys.add(parquetKey);
           continue;
@@ -1611,9 +1425,6 @@ async function readHistoryRows({
           outByPeriodStart: dayRowsByPeriodStart,
           source: "r2",
         });
-        if (scanStoppedReason) {
-          break;
-        }
       }
     }
     for (const [periodStart, row] of dayRowsByPeriodStart.entries()) {
@@ -1632,8 +1443,7 @@ async function readHistoryRows({
   const points = normalizeAndSortRows(rowsByPeriodStart, limit);
   return {
     points,
-    days_requested: days.length,
-    days_scanned: scannedDays,
+    days_scanned: days.length,
     scanned_connector_manifests: scannedConnectorManifests,
     scanned_parquet_files: scannedParquetKeys.size,
     resolved_connector_id: resolvedConnectorId,
@@ -1657,10 +1467,6 @@ async function readHistoryRows({
       max_parquet_files_per_request: maxParquetFilesPerRequest,
       max_scan_elapsed_ms: maxScanElapsedMs,
       scan_stopped_reason: scanStoppedReason,
-    },
-    scan_metrics: {
-      ...scanMetrics,
-      duration_ms: Date.now() - scanStartedAtMs,
     },
     aqi_band_cache: {
       enabled: false,
@@ -1862,21 +1668,8 @@ function collectR2PartialReasonsForWindow(r2Read, window) {
   }
   const reasons = [];
   const scanStoppedReason = r2Read?.timeseries_index?.scan_stopped_reason || null;
-  const timeseriesIndex = r2Read?.timeseries_index || {};
   if (scanStoppedReason) {
     reasons.push(`r2_scan_stopped:${scanStoppedReason}`);
-  }
-  if (timeseriesIndex.require_timeseries_index && timeseriesIndex.enabled === false) {
-    reasons.push("timeseries_index_required_but_disabled");
-  }
-  if (
-    timeseriesIndex.require_timeseries_index
-    && Number(timeseriesIndex.miss_count || 0) > 0
-  ) {
-    reasons.push("required_timeseries_index_miss");
-  }
-  if (Array.isArray(timeseriesIndex.warnings) && timeseriesIndex.warnings.length > 0) {
-    reasons.push("timeseries_index_warning");
   }
   if (hasMissingKeyInWindow(r2Read?.missing_day_manifest_keys, window.startMs, window.endMs)) {
     reasons.push("missing_day_manifest");
@@ -1924,8 +1717,6 @@ function resolveTimeRange(url) {
 }
 
 async function handleRequest(request, env, ctx) {
-  const requestId = crypto.randomUUID();
-  const requestStartedAtMs = Date.now();
   const url = new URL(request.url);
   if (!VALID_PATHS.has(url.pathname)) {
     return jsonResponse({ ok: false, error: "Not found." }, { status: 404, cacheSeconds: 30 });
@@ -2308,7 +2099,6 @@ async function handleRequest(request, env, ctx) {
   const compactPoints = buildAqiHistoryCompactRows(responseRows);
   const responsePayload = {
     ok: true,
-    request_id: requestId,
     generated_at_utc: new Date().toISOString(),
     history_prefix: historyPrefix,
     source,
@@ -2371,7 +2161,6 @@ async function handleRequest(request, env, ctx) {
       coverage_state: coverageState,
       partial_reasons: partialReasonList,
       row_summary: rowSummary,
-      scan_metrics: r2Read.scan_metrics,
       coverage: {
         ingest_retention_days: ingestRetentionDays,
         overlap_start_utc: overlapStartIso,
@@ -2394,18 +2183,9 @@ async function handleRequest(request, env, ctx) {
       },
     },
     coverage: {
-      days_requested: r2Read.days_requested ?? r2Read.days_scanned,
       days_scanned: r2Read.days_scanned,
       scanned_connector_manifests: r2Read.scanned_connector_manifests,
       scanned_parquet_files: r2Read.scanned_parquet_files,
-      r2_object_reads: r2Read.scan_metrics?.r2_object_reads ?? null,
-      r2_list_operations: r2Read.scan_metrics?.r2_list_operations ?? 0,
-      parquet_row_groups_scanned: r2Read.scan_metrics?.parquet_row_groups_scanned ?? null,
-      parquet_chunks_scanned: r2Read.scan_metrics?.parquet_chunks_scanned ?? null,
-      parquet_filter_rows_decoded: r2Read.scan_metrics?.parquet_filter_rows_decoded ?? null,
-      parquet_payload_rows_decoded: r2Read.scan_metrics?.parquet_payload_rows_decoded ?? null,
-      parquet_matched_rows: r2Read.scan_metrics?.parquet_matched_rows ?? null,
-      scan_metrics: r2Read.scan_metrics,
       missing_day_manifest_keys: r2Read.missing_day_manifest_keys,
       missing_connector_manifest_keys: r2Read.missing_connector_manifest_keys,
       missing_parquet_keys: r2Read.missing_parquet_keys,
@@ -2462,47 +2242,14 @@ async function handleRequest(request, env, ctx) {
         : null,
     },
   };
-  const durationMs = Date.now() - requestStartedAtMs;
-  console.log(JSON.stringify({
-    event: "aqi_history_request",
-    request_id: requestId,
-    timeseries_id: timeseriesId,
-    station_id: targetStationId,
-    connector_id: targetConnectorId,
-    pollutant: requestedPollutant,
-    from_utc: startIso,
-    to_utc: endIso,
-    days_requested: r2Read.days_requested ?? r2Read.days_scanned,
-    days_scanned: r2Read.days_scanned,
-    manifests_scanned: r2Read.scanned_connector_manifests,
-    parquet_files_scanned: r2Read.scanned_parquet_files,
-    index_hit_count: r2Read.timeseries_index?.hit_count ?? 0,
-    index_miss_count: r2Read.timeseries_index?.miss_count ?? 0,
-    r2_object_reads: r2Read.scan_metrics?.r2_object_reads ?? null,
-    r2_list_operations: r2Read.scan_metrics?.r2_list_operations ?? 0,
-    row_count: points.length,
-    duration_ms: durationMs,
-    response_complete: responseComplete,
-    stopped_early: Boolean(r2Read.scan_metrics?.stopped_early),
-    stopped_reason: historyScanStoppedReason,
-    timeseries_index_enabled: r2Read.timeseries_index?.enabled ?? null,
-    timeseries_index_prefix: r2Read.timeseries_index?.prefix ?? null,
-  }));
 
   let response;
-  const responseExtraHeaders = {
-    "X-UK-AQ-Request-ID": requestId,
-    "X-UK-AQ-Response-Complete": responseComplete ? "true" : "false",
-    ...(responseComplete ? {} : { "Cache-Control": "no-store" }),
-  };
   if (responseFormat === "tsv") {
     response = new Response(buildTsvResponseBody(responseColumns, responseRows), {
       status: 200,
       headers: {
         "Content-Type": "text/tab-separated-values; charset=utf-8",
-        "Cache-Control": responseComplete ? cacheControlHeader(cacheSeconds) : "no-store",
-        "X-UK-AQ-Request-ID": requestId,
-        "X-UK-AQ-Response-Complete": responseComplete ? "true" : "false",
+        "Cache-Control": cacheControlHeader(cacheSeconds),
         ...corsHeaders(),
       },
     });
@@ -2510,7 +2257,6 @@ async function handleRequest(request, env, ctx) {
     response = jsonResponse(responsePayload, {
       status: 200,
       cacheSeconds,
-      extraHeaders: responseExtraHeaders,
     });
   }
 
@@ -2558,12 +2304,7 @@ export default {
       });
     }
 
-    if (
-      response.ok
-      && response.headers.get("X-UK-AQ-Response-Complete") !== "false"
-      && ctx
-      && typeof ctx.waitUntil === "function"
-    ) {
+    if (response.ok && ctx && typeof ctx.waitUntil === "function") {
       ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
     }
     return withCacheMarker(response, "MISS");
