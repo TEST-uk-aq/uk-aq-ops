@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as arrow from "apache-arrow";
+import * as parquetWasm from "parquet-wasm/esm";
 import {
   HISTORY_AQILEVELS_COLUMNS,
   HISTORY_OBSERVATIONS_COLUMNS_V2,
@@ -10,6 +12,7 @@ import {
   dayWindowFromNow,
   normalizeAqilevelHistoryRowForTest,
   resolvePhaseBRuntimeConfig,
+  rowsToAqilevelParquetBufferForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 test("connector manifest includes expected Phase B fields", () => {
@@ -298,4 +301,59 @@ test("AQI history row parser preserves the normalized hourly shape", () => {
   assert.equal(parsed.daqi_input_averaging_code, "rolling_24h_mean");
   assert.equal(parsed.eaqi_index_level, 3);
   assert.equal(parsed.updated_at, "2026-04-30T10:06:00.000Z");
+});
+
+test("AQI parquet writer preserves nullable text and timestamp column types", () => {
+  const parquetBuffer = rowsToAqilevelParquetBufferForTest([
+    {
+      connector_id: 1,
+      station_id: 101,
+      timeseries_id: 1001,
+      pollutant_code: "pm25",
+      timestamp_hour_utc: "2025-01-01T00:00:00.000Z",
+      daqi_input_value_ugm3: 12.5,
+      daqi_input_averaging_code: "rolling_24h_mean",
+      daqi_index_level: 2,
+      daqi_source_observation_count: 24,
+      daqi_required_observation_count: 24,
+      daqi_calculation_status: "ok",
+      daqi_missing_reason: null,
+      eaqi_input_value_ugm3: 10.5,
+      eaqi_input_averaging_code: "hourly_mean",
+      eaqi_index_level: 1,
+      eaqi_source_observation_count: 1,
+      eaqi_required_observation_count: 1,
+      eaqi_calculation_status: "ok",
+      eaqi_missing_reason: null,
+      hourly_sample_count: 1,
+      algorithm_version: "aqilevels_hourly_v1",
+      computed_at_utc: null,
+      hourly_mean_ugm3: 10.5,
+      rolling24h_mean_ugm3: 12.5,
+      no2_hourly_mean_ugm3: null,
+      pm25_hourly_mean_ugm3: 10.5,
+      pm10_hourly_mean_ugm3: null,
+      pm25_rolling24h_mean_ugm3: 12.5,
+      pm10_rolling24h_mean_ugm3: null,
+      daqi_no2_index_level: null,
+      daqi_pm25_rolling24h_index_level: 2,
+      daqi_pm10_rolling24h_index_level: null,
+      eaqi_no2_index_level: null,
+      eaqi_pm25_index_level: 1,
+      eaqi_pm10_index_level: null,
+      updated_at: null,
+    },
+  ]);
+
+  const wasmTable = parquetWasm.readParquet(new Uint8Array(parquetBuffer));
+  const table = arrow.tableFromIPC(wasmTable.intoIPCStream());
+  const fields = new Map(table.schema.fields.map((field) => [field.name, String(field.type)]));
+
+  assert.equal(fields.get("daqi_input_averaging_code"), "Utf8");
+  assert.equal(fields.get("daqi_calculation_status"), "Utf8");
+  assert.equal(fields.get("eaqi_input_averaging_code"), "Utf8");
+  assert.equal(fields.get("eaqi_calculation_status"), "Utf8");
+  assert.equal(fields.get("algorithm_version"), "Utf8");
+  assert.match(fields.get("computed_at_utc"), /^Timestamp/);
+  assert.match(fields.get("updated_at"), /^Timestamp/);
 });

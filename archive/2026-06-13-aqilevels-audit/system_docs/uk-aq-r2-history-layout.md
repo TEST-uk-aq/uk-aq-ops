@@ -11,8 +11,15 @@ This file is a practical R2 schema/reference file for local DuckDB checks and Co
 
 The canonical R2 layout document says the actual object tree, manifest shapes, and derived index payloads are defined by the ops writers and readers in `uk-aq-ops`.
 
-For parquet columns, this file follows the current writer code in
-`phase_b_history_r2.mjs` and `workers/uk_aq_backfill_local/run_job.ts`.
+For parquet columns, this file follows the current writer code in `phase_b_history_r2.mjs`.
+
+The AQI section of `system_docs/uk-aq-r2-history-layout.md` appears older for AQI parquet columns because it lists generic `hourly_mean_ugm3` and `rolling24h_mean_ugm3`. The current writer code writes pollutant-expanded mean columns instead:
+
+- `no2_hourly_mean_ugm3`
+- `pm25_hourly_mean_ugm3`
+- `pm10_hourly_mean_ugm3`
+- `pm25_rolling24h_mean_ugm3`
+- `pm10_rolling24h_mean_ugm3`
 
 ## Bucket selection
 
@@ -69,14 +76,13 @@ history/
           part-00001.parquet
           ...
     aqilevels/
-      hourly/
-        day_utc=YYYY-MM-DD/
+      day_utc=YYYY-MM-DD/
+        manifest.json
+        connector_id=<id>/
           manifest.json
-          connector_id=<id>/
-            manifest.json
-            part-00000.parquet
-            part-00001.parquet
-            ...
+          part-00000.parquet
+          part-00001.parquet
+          ...
     core/
       day_utc=YYYY-MM-DD/
         manifest.json
@@ -249,10 +255,9 @@ history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/manifest.json
 Metadata:
 
 ```text
-history_schema_name: aqilevels_hourly
-history_schema_version: 1
-grain: hourly
-writer_version: parquet-wasm-zstd-v1
+history_schema_name: aqilevels
+history_schema_version: 2
+writer_version: parquet-wasm-zstd-v2
 writer_columns_constant: HISTORY_AQILEVELS_COLUMNS
 ```
 
@@ -261,41 +266,24 @@ Columns, in current writer order:
 | Ordinal | Column | DuckDB-friendly type | Notes |
 |---:|---|---|---|
 | 1 | `connector_id` | INTEGER | Connector id |
-| 2 | `station_id` | INTEGER | Nullable |
-| 3 | `timeseries_id` | INTEGER | Timeseries id |
+| 2 | `timeseries_id` | INTEGER | Timeseries id |
+| 3 | `station_id` | INTEGER | Nullable |
 | 4 | `pollutant_code` | VARCHAR | Expected examples: `pm25`, `pm10`, `no2` |
 | 5 | `timestamp_hour_utc` | TIMESTAMP | AQI hour |
-| 6 | `daqi_input_value_ugm3` | DOUBLE | Nullable DAQI input value |
-| 7 | `daqi_input_averaging_code` | VARCHAR | `hourly_mean` or `rolling_24h_mean` |
-| 8 | `daqi_index_level` | INTEGER | Row DAQI level |
-| 9 | `daqi_source_observation_count` | INTEGER | Nullable source count |
-| 10 | `daqi_required_observation_count` | INTEGER | Required count for the DAQI input |
-| 11 | `daqi_calculation_status` | VARCHAR | `ok`, `missing_input`, `insufficient_samples`, or `unsupported_pollutant` |
-| 12 | `daqi_missing_reason` | VARCHAR | Nullable reason when DAQI is null |
-| 13 | `eaqi_input_value_ugm3` | DOUBLE | Nullable EAQI input value |
-| 14 | `eaqi_input_averaging_code` | VARCHAR | Initially `hourly_mean` |
-| 15 | `eaqi_index_level` | INTEGER | Row EAQI level |
-| 16 | `eaqi_source_observation_count` | INTEGER | Nullable source count |
-| 17 | `eaqi_required_observation_count` | INTEGER | Required count for the EAQI input |
-| 18 | `eaqi_calculation_status` | VARCHAR | `ok`, `missing_input`, `insufficient_samples`, or `unsupported_pollutant` |
-| 19 | `eaqi_missing_reason` | VARCHAR | Nullable reason when EAQI is null |
-| 20 | `hourly_sample_count` | INTEGER | Nullable hourly source sample count |
-| 21 | `algorithm_version` | VARCHAR | Current value `aqilevels_hourly_v1` |
-| 22 | `computed_at_utc` | TIMESTAMP | Nullable compute timestamp |
-| 23 | `hourly_mean_ugm3` | DOUBLE | Compatibility hourly mean |
-| 24 | `rolling24h_mean_ugm3` | DOUBLE | Compatibility rolling 24h mean for PM rows |
-| 25 | `no2_hourly_mean_ugm3` | DOUBLE | Compatibility NO2 hourly mean |
-| 26 | `pm25_hourly_mean_ugm3` | DOUBLE | Compatibility PM2.5 hourly mean |
-| 27 | `pm10_hourly_mean_ugm3` | DOUBLE | Compatibility PM10 hourly mean |
-| 28 | `pm25_rolling24h_mean_ugm3` | DOUBLE | Compatibility PM2.5 rolling 24h mean |
-| 29 | `pm10_rolling24h_mean_ugm3` | DOUBLE | Compatibility PM10 rolling 24h mean |
-| 30 | `daqi_no2_index_level` | INTEGER | Compatibility NO2 DAQI |
-| 31 | `daqi_pm25_rolling24h_index_level` | INTEGER | Compatibility PM2.5 DAQI using 24h rolling mean |
-| 32 | `daqi_pm10_rolling24h_index_level` | INTEGER | Compatibility PM10 DAQI using 24h rolling mean |
-| 33 | `eaqi_no2_index_level` | INTEGER | Compatibility NO2 EAQI |
-| 34 | `eaqi_pm25_index_level` | INTEGER | Compatibility PM2.5 EAQI |
-| 35 | `eaqi_pm10_index_level` | INTEGER | Compatibility PM10 EAQI |
-| 36 | `updated_at` | TIMESTAMP | Nullable source row timestamp |
+| 6 | `no2_hourly_mean_ugm3` | DOUBLE | Nullable |
+| 7 | `pm25_hourly_mean_ugm3` | DOUBLE | Nullable |
+| 8 | `pm10_hourly_mean_ugm3` | DOUBLE | Nullable |
+| 9 | `pm25_rolling24h_mean_ugm3` | DOUBLE | Nullable |
+| 10 | `pm10_rolling24h_mean_ugm3` | DOUBLE | Nullable |
+| 11 | `hourly_sample_count` | INTEGER | Nullable |
+| 12 | `daqi_index_level` | INTEGER | Generic DAQI for the row/pollutant context |
+| 13 | `eaqi_index_level` | INTEGER | Generic EAQI for the row/pollutant context |
+| 14 | `daqi_no2_index_level` | INTEGER | NO2-specific DAQI |
+| 15 | `daqi_pm25_rolling24h_index_level` | INTEGER | PM2.5-specific DAQI using 24h rolling mean |
+| 16 | `daqi_pm10_rolling24h_index_level` | INTEGER | PM10-specific DAQI using 24h rolling mean |
+| 17 | `eaqi_no2_index_level` | INTEGER | NO2-specific EAQI |
+| 18 | `eaqi_pm25_index_level` | INTEGER | PM2.5-specific EAQI |
+| 19 | `eaqi_pm10_index_level` | INTEGER | PM10-specific EAQI |
 
 Important PM2.5 fieldnames:
 
@@ -329,13 +317,11 @@ Top-level fields:
 | `file_count` | integer | Number of parquet parts |
 | `total_bytes` | integer | Total parquet bytes |
 | `files` | object[] | Per-file entries |
-| `grain` | string | `hourly` |
-| `history_schema_name` | string | `aqilevels_hourly` |
-| `history_schema_version` | integer | `1` |
+| `history_schema_name` | string | `aqilevels` |
+| `history_schema_version` | integer | `2` |
 | `columns` | string[] | AQI parquet columns |
-| `writer_version` | string | `parquet-wasm-zstd-v1` |
+| `writer_version` | string | `parquet-wasm-zstd-v2` |
 | `writer_git_sha` | string/null | Writer git SHA if available |
-| `available_pollutants` | string[] | Pollutants represented in this connector/day |
 | `bytes_per_row_estimate` | number/null | Derived file-size stat |
 | `avg_file_bytes` | number/null | Derived file-size stat |
 | `min_file_bytes` | integer/null | Derived file-size stat |
@@ -355,7 +341,6 @@ Top-level fields:
 | `max_timeseries_id` | integer/null | File range |
 | `min_timestamp_hour_utc` | timestamp string/null | File coverage |
 | `max_timestamp_hour_utc` | timestamp string/null | File coverage |
-| `pollutant_codes` | string[] | Pollutants represented in this parquet file |
 
 ## AQI day manifest
 
@@ -383,13 +368,11 @@ Top-level fields:
 | `total_bytes` | integer | Total bytes |
 | `files` | object[] | Flattened file entries |
 | `connector_manifests` | object[] | Connector manifest summaries |
-| `grain` | string | `hourly` |
-| `history_schema_name` | string | `aqilevels_hourly` |
-| `history_schema_version` | integer | `1` |
+| `history_schema_name` | string | `aqilevels` |
+| `history_schema_version` | integer | `2` |
 | `columns` | string[] | AQI parquet columns |
-| `writer_version` | string | `parquet-wasm-zstd-v1` |
+| `writer_version` | string | `parquet-wasm-zstd-v2` |
 | `writer_git_sha` | string/null | Writer git SHA if available |
-| `available_pollutants` | string[] | Pollutants represented in this day |
 | `bytes_per_row_estimate` | number/null | Derived file-size stat |
 | `avg_file_bytes` | number/null | Derived file-size stat |
 | `min_file_bytes` | integer/null | Derived file-size stat |
@@ -448,20 +431,16 @@ Each object-format row includes:
 | Column |
 |---|
 | `period_start_utc` |
-| `connector_id` |
 | `timeseries_id` |
 | `station_id` |
-| `pollutant_code` |
 | `daqi_index_level` |
 | `eaqi_index_level` |
-| `daqi_input_value_ugm3` |
-| `daqi_input_averaging_code` |
-| `eaqi_input_value_ugm3` |
-| `eaqi_input_averaging_code` |
-| `daqi_calculation_status` |
-| `eaqi_calculation_status` |
-| `source` |
-| `source_coverage` |
+| `daqi_no2_index_level` |
+| `daqi_pm25_rolling24h_index_level` |
+| `daqi_pm10_rolling24h_index_level` |
+| `eaqi_no2_index_level` |
+| `eaqi_pm25_index_level` |
+| `eaqi_pm10_index_level` |
 
 The R2 parquet physical time field is `timestamp_hour_utc`. The API response field is `period_start_utc`.
 

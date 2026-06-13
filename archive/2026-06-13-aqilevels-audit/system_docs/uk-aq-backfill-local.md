@@ -164,12 +164,6 @@ skip-on-no-data behaviour; extend per-adapter as needed.
     per-timeseries counts for cross-check parity.
 - `aqilevels_only` (valid only with `r2_history_obs_to_aqilevels`)
   - Rebuilds AQI history outputs only from committed R2 observation history.
-  - Writes normalized hourly AQI parquet under `history/v1/aqilevels/hourly/...`
-    using `history_schema_name=aqilevels_hourly`,
-    `history_schema_version=1`, `grain=hourly`, and
-    `writer_version=parquet-wasm-zstd-v1`.
-  - AQI rows include the normalized `daqi_input_*` and `eaqi_input_*`
-    fields plus compatibility mean/index fields used by older diagnostics.
 
 Invalid run-mode/output-scope combinations fail before any R2 mutation.
 

@@ -20,7 +20,7 @@ export UK_AQ_BACKFILL_FORCE_REPLACE="true"
 export UK_AQ_BACKFILL_DRY_RUN="false"
 
 export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
-export UK_AQ_BACKFILL_TO_DAY_UTC="2026-06-07"
+export UK_AQ_BACKFILL_TO_DAY_UTC="2026-06-08"
 
 # Leave blank to rebuild all connectors.
 # Set this only if you want to restrict the rebuild, for example:
