@@ -356,14 +356,23 @@ async function observationPartPathsForConnectorDay(sourceRoot, dayUtc, connector
 async function loadSourceObservationsForTargetDay({ sourceRoot, dayUtc, connectorId, lookup }) {
   const daysToRead = [shiftDay(dayUtc, -1), dayUtc];
   const rows = [];
+
   for (const sourceDay of daysToRead) {
     const partPaths = await observationPartPathsForConnectorDay(sourceRoot, sourceDay, connectorId);
+
     for (const partPath of partPaths) {
-      if (fs.existsSync(partPath)) {
-        rows.push(...await readObservationParquet(partPath, connectorId, lookup));
+      if (!fs.existsSync(partPath)) {
+        continue;
+      }
+
+      const partRows = await readObservationParquet(partPath, connectorId, lookup);
+
+      for (const row of partRows) {
+        rows.push(row);
       }
     }
   }
+
   return rows;
 }
 
@@ -731,7 +740,7 @@ if (fileURLToPath(import.meta.url) === path.resolve(process.argv[1] || "")) {
     const config = parseArgs();
     await runLocalAqilevelsRebuild(config);
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(error instanceof Error ? (error.stack || error.message) : String(error));
     process.exitCode = 1;
   }
 }

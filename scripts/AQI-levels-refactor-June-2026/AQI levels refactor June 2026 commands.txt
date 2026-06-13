@@ -75,5 +75,12 @@ PAUSE_SECONDS=10 \
 scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_hourly.sh \
 2026-06-11T10:00:00Z \
 2026-06-11T10:00:00Z
+
+
+UK_AQ_LOCAL_AQI_CONFIRMATION="REBUILD TEST AQI LOCAL" \
+./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh \
+  --from-day 2025-01-01 \
+  --to-day 2026-06-08 \
+  --upload
   
   
