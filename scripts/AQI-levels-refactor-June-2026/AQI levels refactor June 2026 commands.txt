@@ -29,7 +29,7 @@ curl -sS -X POST "$SERVICE_URL" \
 "trigger_mode": "manual",
 "run_mode": "backfill",
 "from_hour_utc": "2026-06-08T00:00:00Z",
-"to_hour_utc": "2026-06-12T12:00:00Z"
+"to_hour_utc": "2026-06-11T12:00:00Z"
 }'
 
 
@@ -55,12 +55,25 @@ curl -sS -X POST "$SERVICE_URL" \
 
 DRY_RUN=true 'scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh' \
   2026-06-08T00:00:00Z \
-  2026-06-12T15:00:00Z
+  2026-06-11T00:00:00Z
   
   
 'scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_daily.sh' \
+  2026-06-08T00:00:00Z \
+  2026-06-11T00:00:00Z
+  
+  
+PAUSE_SECONDS=10 \
+scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_hourly.sh \
 2026-06-08T00:00:00Z \
 2026-06-12T15:00:00Z
   
+  
+  
+  
+PAUSE_SECONDS=10 \
+scripts/AQI-levels-refactor-June-2026/run_obsaqidb_aqi_backfill_hourly.sh \
+2026-06-11T10:00:00Z \
+2026-06-11T10:00:00Z
   
   

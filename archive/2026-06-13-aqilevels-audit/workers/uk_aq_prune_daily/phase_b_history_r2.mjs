@@ -1407,63 +1407,52 @@ function rowsToParquetBuffer(rows, writerProperties) {
 
 function rowsToAqilevelParquetBuffer(rows, writerProperties) {
   ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const float64Vector = (values) => arrow.vectorFromArray(values, new arrow.Float64());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
   const table = arrow.tableFromArrays({
     connector_id: Int32Array.from(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
+    station_id: rows.map((row) => (
       row.station_id === null || row.station_id === undefined
         ? null
         : Number(row.station_id)
-    ))),
+    )),
     timeseries_id: Int32Array.from(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.daqi_input_value_ugm3))),
-    daqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.daqi_input_averaging_code))),
-    daqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_index_level))),
-    daqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_source_observation_count))),
-    daqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_required_observation_count))),
-    daqi_calculation_status: textVector(rows.map((row) => toNullableText(row.daqi_calculation_status))),
-    daqi_missing_reason: textVector(rows.map((row) => toNullableText(row.daqi_missing_reason))),
-    eaqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.eaqi_input_value_ugm3))),
-    eaqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.eaqi_input_averaging_code))),
-    eaqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_index_level))),
-    eaqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_source_observation_count))),
-    eaqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_required_observation_count))),
-    eaqi_calculation_status: textVector(rows.map((row) => toNullableText(row.eaqi_calculation_status))),
-    eaqi_missing_reason: textVector(rows.map((row) => toNullableText(row.eaqi_missing_reason))),
-    hourly_sample_count: int32Vector(rows.map((row) => toNullableInteger(row.hourly_sample_count))),
-    algorithm_version: textVector(rows.map((row) => toNullableText(row.algorithm_version))),
-    computed_at_utc: timestampVector(rows.map((row) => (row.computed_at_utc ? new Date(row.computed_at_utc) : null))),
-    hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.hourly_mean_ugm3))),
-    rolling24h_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.rolling24h_mean_ugm3))),
-    no2_hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.no2_hourly_mean_ugm3))),
-    pm25_hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm25_hourly_mean_ugm3))),
-    pm10_hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm10_hourly_mean_ugm3))),
-    pm25_rolling24h_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm25_rolling24h_mean_ugm3))),
-    pm10_rolling24h_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm10_rolling24h_mean_ugm3))),
-    daqi_no2_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_no2_index_level))),
-    daqi_pm25_rolling24h_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_pm25_rolling24h_index_level))),
-    daqi_pm10_rolling24h_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_pm10_rolling24h_index_level))),
-    eaqi_no2_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_no2_index_level))),
-    eaqi_pm25_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_pm25_index_level))),
-    eaqi_pm10_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_pm10_index_level))),
-    updated_at: timestampVector(rows.map((row) => (row.updated_at ? new Date(row.updated_at) : null))),
+    pollutant_code: rows.map((row) => String(row.pollutant_code || "")),
+    timestamp_hour_utc: rows.map((row) => new Date(row.timestamp_hour_utc)),
+    daqi_input_value_ugm3: rows.map((row) => toNullableNumber(row.daqi_input_value_ugm3)),
+    daqi_input_averaging_code: rows.map((row) => toNullableText(row.daqi_input_averaging_code)),
+    daqi_index_level: rows.map((row) => toNullableInteger(row.daqi_index_level)),
+    daqi_source_observation_count: rows.map((row) => toNullableInteger(row.daqi_source_observation_count)),
+    daqi_required_observation_count: rows.map((row) => toNullableInteger(row.daqi_required_observation_count)),
+    daqi_calculation_status: rows.map((row) => toNullableText(row.daqi_calculation_status)),
+    daqi_missing_reason: rows.map((row) => toNullableText(row.daqi_missing_reason)),
+    eaqi_input_value_ugm3: rows.map((row) => toNullableNumber(row.eaqi_input_value_ugm3)),
+    eaqi_input_averaging_code: rows.map((row) => toNullableText(row.eaqi_input_averaging_code)),
+    eaqi_index_level: rows.map((row) => toNullableInteger(row.eaqi_index_level)),
+    eaqi_source_observation_count: rows.map((row) => toNullableInteger(row.eaqi_source_observation_count)),
+    eaqi_required_observation_count: rows.map((row) => toNullableInteger(row.eaqi_required_observation_count)),
+    eaqi_calculation_status: rows.map((row) => toNullableText(row.eaqi_calculation_status)),
+    eaqi_missing_reason: rows.map((row) => toNullableText(row.eaqi_missing_reason)),
+    hourly_sample_count: rows.map((row) => toNullableInteger(row.hourly_sample_count)),
+    algorithm_version: rows.map((row) => toNullableText(row.algorithm_version)),
+    computed_at_utc: rows.map((row) => (row.computed_at_utc ? new Date(row.computed_at_utc) : null)),
+    hourly_mean_ugm3: rows.map((row) => toNullableNumber(row.hourly_mean_ugm3)),
+    rolling24h_mean_ugm3: rows.map((row) => toNullableNumber(row.rolling24h_mean_ugm3)),
+    no2_hourly_mean_ugm3: rows.map((row) => toNullableNumber(row.no2_hourly_mean_ugm3)),
+    pm25_hourly_mean_ugm3: rows.map((row) => toNullableNumber(row.pm25_hourly_mean_ugm3)),
+    pm10_hourly_mean_ugm3: rows.map((row) => toNullableNumber(row.pm10_hourly_mean_ugm3)),
+    pm25_rolling24h_mean_ugm3: rows.map((row) => toNullableNumber(row.pm25_rolling24h_mean_ugm3)),
+    pm10_rolling24h_mean_ugm3: rows.map((row) => toNullableNumber(row.pm10_rolling24h_mean_ugm3)),
+    daqi_no2_index_level: rows.map((row) => toNullableInteger(row.daqi_no2_index_level)),
+    daqi_pm25_rolling24h_index_level: rows.map((row) => toNullableInteger(row.daqi_pm25_rolling24h_index_level)),
+    daqi_pm10_rolling24h_index_level: rows.map((row) => toNullableInteger(row.daqi_pm10_rolling24h_index_level)),
+    eaqi_no2_index_level: rows.map((row) => toNullableInteger(row.eaqi_no2_index_level)),
+    eaqi_pm25_index_level: rows.map((row) => toNullableInteger(row.eaqi_pm25_index_level)),
+    eaqi_pm10_index_level: rows.map((row) => toNullableInteger(row.eaqi_pm10_index_level)),
+    updated_at: rows.map((row) => (row.updated_at ? new Date(row.updated_at) : null)),
   });
 
   const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
   const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
   return Buffer.from(parquetBytes);
-}
-
-export function rowsToAqilevelParquetBufferForTest(rows) {
-  return rowsToAqilevelParquetBuffer(
-    rows,
-    parquetWriterProperties(DEFAULT_AQILEVELS_ROW_GROUP_SIZE, HISTORY_AQILEVELS_WRITER_VERSION),
-  );
 }
 
 async function closeCursor(cursor) {

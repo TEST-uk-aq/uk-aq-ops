@@ -5,13 +5,6 @@ This file is deploy-order first. It mirrors the TEST sequence after the Step 16 
 Use it after TEST has been validated and the TEST rollout notes are final.
 Do not use this file as the full validation, rollback, or investigation runbook.
 
-Audit status on 2026-06-13: safe to use for LIVE only after the code revision
-containing the normalized `workers/uk_aq_backfill_local/run_job.ts` AQI R2
-writer is deployed/available locally. That writer must emit
-`history_schema_name=aqilevels_hourly`, `history_schema_version=1`,
-`grain=hourly`, and the normalized `daqi_input_*` / `eaqi_input_*` parquet
-columns under `history/v1/aqilevels/hourly`.
-
 ## 1. Required pause
 
 Before touching LIVE data or schedules:
@@ -26,56 +19,6 @@ Before touching LIVE data or schedules:
 LIVE pause time UTC:
 paused jobs/services:
 operator:
-```
-
-## 1.1 Required LIVE configuration preflight
-
-Confirm these LIVE repo variables/secrets before deletion or rebuild. Do not
-reuse CIC-Test values.
-
-Required repo variables:
-
-```text
-CFLARE_R2_ENDPOINT=<LIVE endpoint>
-CFLARE_R2_BUCKET=<LIVE R2 bucket, e.g. uk-aq-history-live>
-CFLARE_R2_REGION=auto
-UK_AQ_R2_HISTORY_AQILEVELS_PREFIX=history/v1/aqilevels/hourly
-UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX=history/v1/observations
-UK_AQ_R2_HISTORY_CORE_PREFIX=history/v1/core
-UK_AQ_R2_HISTORY_INDEX_PREFIX=history/_index
-UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH=history/_index/backup_inventory_v1.json
-UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH=_ops/checkpoints/r2_history_backup_state_v1.json
-UK_AQ_DROPBOX_ROOT=LIVE
-UK_AQ_R2_HISTORY_DROPBOX_DIR=R2_history_backup
-OBS_AQIDB_SUPABASE_URL=<LIVE ObsAQIDB URL>
-OBS_AQIDB_RPC_SCHEMA=uk_aq_public
-SUPABASE_URL=<LIVE ingest DB URL>
-GCP_PROJECT_ID=<LIVE GCP project>
-GCP_REGION=<LIVE GCP region>
-GCP_TIMESERIES_AQI_HOURLY_SERVICE_NAME=<LIVE AQI hourly service>
-```
-
-Required secrets:
-
-```text
-CFLARE_R2_ACCESS_KEY_ID=<LIVE R2 key>
-CFLARE_R2_SECRET_ACCESS_KEY=<LIVE R2 secret>
-DROPBOX_APP_KEY
-DROPBOX_APP_SECRET
-DROPBOX_REFRESH_TOKEN
-OBS_AQIDB_SECRET_KEY=<LIVE ObsAQIDB service role key>
-SB_SECRET_KEY=<LIVE ingest DB service role key>
-```
-
-Relevant workflows to confirm/use:
-
-```text
-.github/workflows/uk_aq_timeseries_aqi_hourly_cloud_run_deploy.yml
-.github/workflows/uk_aq_aqi_history_r2_api_worker_deploy.yml
-.github/workflows/uk_aq_aqilevels_retention_cloud_run_deploy.yml
-.github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml
-.github/workflows/uk_aq_r2_history_dropbox_backup.yml
-.github/workflows/uk_aq_r2_history_restore_from_dropbox.yml
 ```
 
 ## 2. SQL to paste into Supabase UI
@@ -147,8 +90,7 @@ Deploy workers after the SQL changes are in place.
 1. Open the repo in GitHub Desktop.
 2. Publish/deploy the AQI hourly Cloud Run worker changes for `workers/uk_aq_timeseries_aqi_hourly_cloud_run/run_job.ts`.
 3. Publish/deploy the AQI history R2 worker changes for `workers/uk_aq_aqi_history_r2_api_worker/worker.mjs`.
-4. Confirm the local rebuild worker file `workers/uk_aq_backfill_local/run_job.ts` is the normalized AQI writer revision before running the historical rebuild. This is a local/manual script path, not a Cloud Run deployment.
-5. Confirm the deployed Cloud Run revision is the expected revision.
+4. Confirm the deployed Cloud Run revision is the expected revision.
 
 ## 4. LIVE R2 deletion and historical rebuild order
 
@@ -168,9 +110,7 @@ history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/connector_id=<id>/part-00000.parq
 7. Confirm no old files remain under:
 
 ```text
-history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/...
 history/v1/aqilevels/day_utc=YYYY-MM-DD/...
-history/v1/aqilevels/hourly/bands/v1/...
 history/v1/aqilevels/bands/v1/...
 ```
 
@@ -292,25 +232,6 @@ node scripts/backup_r2/build_backup_inventory.mjs \
   --full-rebuild \
   --report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild_LIVE.json"
 ```
-
-Validation checkpoint before continuing:
-
-```bash
-duckdb -c "
-DESCRIBE SELECT *
-FROM read_parquet(
-  '<LIVE_R2_HISTORY_DROPBOX_ROOT>/history/v1/aqilevels/hourly/day_utc=*/connector_id=*/*.parquet',
-  union_by_name = true
-);
-"
-```
-
-Expected AQI columns include `daqi_input_value_ugm3`,
-`daqi_input_averaging_code`, `eaqi_input_value_ugm3`,
-`eaqi_input_averaging_code`, `daqi_calculation_status`,
-`eaqi_calculation_status`, `algorithm_version`, and `computed_at_utc`.
-Expected manifest metadata is `history_schema_name=aqilevels_hourly`,
-`history_schema_version=1`, and `grain=hourly`.
 
 ## 5. Manually refresh recent helper rows
 
@@ -453,14 +374,6 @@ Before the first post-rebuild LIVE AQI Dropbox sync:
 4. Confirm the active Dropbox backup contains files under `history/v1/aqilevels/hourly`.
 5. Confirm the active Dropbox backup has no old AQI files outside `/hourly/`.
 
-Audit note: `COMMITTED_CONNECTOR_UNIT_KEYS` is intentionally
-observations-only. AQI connector manifests and parquet files are copied as part
-of the `aqilevels` day folder unit under
-`history/v1/aqilevels/hourly/day_utc=.../connector_id=.../`; AQI timeseries
-index connector manifests are copied separately through
-`index_tree_units.aqilevels_timeseries`. There is no additional committed AQI
-data outside those copied units.
-
 ```bash
 UK_AQ_R2_HISTORY_AQILEVELS_PREFIX="history/v1/aqilevels/hourly" \
 node scripts/backup_r2/build_backup_inventory.mjs \
@@ -470,26 +383,6 @@ node scripts/backup_r2/build_backup_inventory.mjs \
   --full-rebuild \
   --report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild_LIVE.json"
 ```
-
-```bash
-node scripts/backup_r2/sync_history_to_dropbox.mjs \
-  --source-root "uk_aq_r2_live:uk-aq-history-live" \
-  --dest-root "<LIVE_DROPBOX_RCLONE_ROOT>/R2_history_backup" \
-  --domain aqilevels \
-  --inventory-rel-path "history/_index/backup_inventory_v1.json" \
-  --state-rel-path "_ops/checkpoints/r2_history_backup_state_v1.json" \
-  --max-days-per-run 0 \
-  --report-out "tmp/r2_history_dropbox_backup_aqilevels_after_rebuild_LIVE.json"
-```
-
-Post-sync checks:
-
-```bash
-find "<LIVE_R2_HISTORY_DROPBOX_ROOT>/history/v1/aqilevels/hourly" -type f | head -50
-find "<LIVE_R2_HISTORY_DROPBOX_ROOT>/history/v1/aqilevels" -type f | grep -v "/hourly/" | head -50
-```
-
-The second command should return no active old-layout AQI files.
 
 ## 8. Restart LIVE AQI schedules
 

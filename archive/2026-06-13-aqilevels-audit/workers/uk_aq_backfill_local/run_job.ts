@@ -243,37 +243,11 @@ type AqilevelsHistoryRow = {
   connector_id: number;
   pollutant_code: "no2" | "pm25" | "pm10";
   timestamp_hour_utc: string;
-  daqi_input_value_ugm3: number | null;
-  daqi_input_averaging_code: string | null;
-  daqi_source_observation_count: number | null;
-  daqi_required_observation_count: number | null;
-  daqi_calculation_status: string | null;
-  daqi_missing_reason: string | null;
-  eaqi_input_value_ugm3: number | null;
-  eaqi_input_averaging_code: string | null;
-  eaqi_source_observation_count: number | null;
-  eaqi_required_observation_count: number | null;
-  eaqi_calculation_status: string | null;
-  eaqi_missing_reason: string | null;
   hourly_mean_ugm3: number | null;
   rolling24h_mean_ugm3: number | null;
   hourly_sample_count: number | null;
   daqi_index_level: number | null;
   eaqi_index_level: number | null;
-  no2_hourly_mean_ugm3: number | null;
-  pm25_hourly_mean_ugm3: number | null;
-  pm10_hourly_mean_ugm3: number | null;
-  pm25_rolling24h_mean_ugm3: number | null;
-  pm10_rolling24h_mean_ugm3: number | null;
-  daqi_no2_index_level: number | null;
-  daqi_pm25_rolling24h_index_level: number | null;
-  daqi_pm10_rolling24h_index_level: number | null;
-  eaqi_no2_index_level: number | null;
-  eaqi_pm25_index_level: number | null;
-  eaqi_pm10_index_level: number | null;
-  algorithm_version: string | null;
-  computed_at_utc: string | null;
-  updated_at: string | null;
 };
 
 type AqilevelsHistoryParquetRow = {
@@ -282,37 +256,11 @@ type AqilevelsHistoryParquetRow = {
   station_id: number | null;
   pollutant_code: "no2" | "pm25" | "pm10";
   timestamp_hour_utc: string;
-  daqi_input_value_ugm3: number | null;
-  daqi_input_averaging_code: string | null;
-  daqi_index_level: number | null;
-  daqi_source_observation_count: number | null;
-  daqi_required_observation_count: number | null;
-  daqi_calculation_status: string | null;
-  daqi_missing_reason: string | null;
-  eaqi_input_value_ugm3: number | null;
-  eaqi_input_averaging_code: string | null;
-  eaqi_index_level: number | null;
-  eaqi_source_observation_count: number | null;
-  eaqi_required_observation_count: number | null;
-  eaqi_calculation_status: string | null;
-  eaqi_missing_reason: string | null;
-  hourly_sample_count: number | null;
-  algorithm_version: string | null;
-  computed_at_utc: string | null;
   hourly_mean_ugm3: number | null;
   rolling24h_mean_ugm3: number | null;
-  no2_hourly_mean_ugm3: number | null;
-  pm25_hourly_mean_ugm3: number | null;
-  pm10_hourly_mean_ugm3: number | null;
-  pm25_rolling24h_mean_ugm3: number | null;
-  pm10_rolling24h_mean_ugm3: number | null;
-  daqi_no2_index_level: number | null;
-  daqi_pm25_rolling24h_index_level: number | null;
-  daqi_pm10_rolling24h_index_level: number | null;
-  eaqi_no2_index_level: number | null;
-  eaqi_pm25_index_level: number | null;
-  eaqi_pm10_index_level: number | null;
-  updated_at: string | null;
+  hourly_sample_count: number | null;
+  daqi_index_level: number | null;
+  eaqi_index_level: number | null;
 };
 
 type ObsHistoryFileEntry = {
@@ -572,46 +520,20 @@ const HISTORY_OBSERVATIONS_COLUMNS = Object.freeze([
   "observed_at",
   "value",
 ]);
-const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
-const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
-const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v1";
+const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels";
+const HISTORY_AQILEVELS_SCHEMA_VERSION = 2;
+const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v2";
 const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "connector_id",
-  "station_id",
   "timeseries_id",
+  "station_id",
   "pollutant_code",
   "timestamp_hour_utc",
-  "daqi_input_value_ugm3",
-  "daqi_input_averaging_code",
-  "daqi_index_level",
-  "daqi_source_observation_count",
-  "daqi_required_observation_count",
-  "daqi_calculation_status",
-  "daqi_missing_reason",
-  "eaqi_input_value_ugm3",
-  "eaqi_input_averaging_code",
-  "eaqi_index_level",
-  "eaqi_source_observation_count",
-  "eaqi_required_observation_count",
-  "eaqi_calculation_status",
-  "eaqi_missing_reason",
-  "hourly_sample_count",
-  "algorithm_version",
-  "computed_at_utc",
   "hourly_mean_ugm3",
   "rolling24h_mean_ugm3",
-  "no2_hourly_mean_ugm3",
-  "pm25_hourly_mean_ugm3",
-  "pm10_hourly_mean_ugm3",
-  "pm25_rolling24h_mean_ugm3",
-  "pm10_rolling24h_mean_ugm3",
-  "daqi_no2_index_level",
-  "daqi_pm25_rolling24h_index_level",
-  "daqi_pm10_rolling24h_index_level",
-  "eaqi_no2_index_level",
-  "eaqi_pm25_index_level",
-  "eaqi_pm10_index_level",
-  "updated_at",
+  "hourly_sample_count",
+  "daqi_index_level",
+  "eaqi_index_level",
 ]);
 
 const OBS_R2_DEPLOY_ENV =
@@ -1798,62 +1720,17 @@ function readAqiRowsForConnectorDayFromTargetedStage(
     ) {
       continue;
     }
-    const pollutantCode = pollutantCodeRaw as "no2" | "pm25" | "pm10";
-    const hourlyMean = toFiniteNumber(row.hourly_mean_ugm3);
-    const rolling24hMean = toFiniteNumber(row.rolling24h_mean_ugm3);
-    const daqiInputValue = toSafeNumber(row.daqi_input_value_ugm3) ??
-      (pollutantCode === "no2" ? hourlyMean : rolling24hMean);
-    const daqiInputAveragingCode = optionalText(row.daqi_input_averaging_code) ??
-      daqiAveragingCodeForPollutant(pollutantCode);
-    const daqiStatus = optionalText(row.daqi_calculation_status) ??
-      (daqiInputValue === null ? "missing_input" : "ok");
-    const eaqiInputValue = toSafeNumber(row.eaqi_input_value_ugm3) ?? hourlyMean;
-    const eaqiStatus = optionalText(row.eaqi_calculation_status) ??
-      (eaqiInputValue === null ? "missing_input" : "ok");
-    const daqiIndexLevel = toFiniteNumber(row.daqi_index_level);
-    const eaqiIndexLevel = toFiniteNumber(row.eaqi_index_level);
     rows.push({
       timeseries_id: timeseriesId,
       station_id: Number.isInteger(stationId) && stationId > 0 ? stationId : null,
       connector_id: connectorIdValue,
-      pollutant_code: pollutantCode,
+      pollutant_code: pollutantCodeRaw as "no2" | "pm25" | "pm10",
       timestamp_hour_utc: timestampHourUtc,
-      daqi_input_value_ugm3: daqiInputValue,
-      daqi_input_averaging_code: daqiInputAveragingCode,
-      daqi_source_observation_count: toSafeWholeNumber(row.daqi_source_observation_count) ??
-        (daqiInputValue === null ? null : daqiInputAveragingCode === "rolling_24h_mean" ? 24 : toSafeWholeNumber(row.hourly_sample_count)),
-      daqi_required_observation_count: toSafeWholeNumber(row.daqi_required_observation_count) ??
-        (daqiInputAveragingCode === "rolling_24h_mean" ? 24 : 1),
-      daqi_calculation_status: daqiStatus,
-      daqi_missing_reason: optionalText(row.daqi_missing_reason) ??
-        (daqiStatus === "ok" ? null : daqiStatus),
-      eaqi_input_value_ugm3: eaqiInputValue,
-      eaqi_input_averaging_code: optionalText(row.eaqi_input_averaging_code) ?? "hourly_mean",
-      eaqi_source_observation_count: toSafeWholeNumber(row.eaqi_source_observation_count) ??
-        (eaqiInputValue === null ? null : toSafeWholeNumber(row.hourly_sample_count)),
-      eaqi_required_observation_count: toSafeWholeNumber(row.eaqi_required_observation_count) ?? 1,
-      eaqi_calculation_status: eaqiStatus,
-      eaqi_missing_reason: optionalText(row.eaqi_missing_reason) ??
-        (eaqiStatus === "ok" ? null : eaqiStatus),
-      hourly_mean_ugm3: hourlyMean,
-      rolling24h_mean_ugm3: rolling24hMean,
+      hourly_mean_ugm3: toFiniteNumber(row.hourly_mean_ugm3),
+      rolling24h_mean_ugm3: toFiniteNumber(row.rolling24h_mean_ugm3),
       hourly_sample_count: toFiniteNumber(row.hourly_sample_count),
-      daqi_index_level: daqiIndexLevel,
-      eaqi_index_level: eaqiIndexLevel,
-      no2_hourly_mean_ugm3: pollutantCode === "no2" ? hourlyMean : null,
-      pm25_hourly_mean_ugm3: pollutantCode === "pm25" ? hourlyMean : null,
-      pm10_hourly_mean_ugm3: pollutantCode === "pm10" ? hourlyMean : null,
-      pm25_rolling24h_mean_ugm3: pollutantCode === "pm25" ? rolling24hMean : null,
-      pm10_rolling24h_mean_ugm3: pollutantCode === "pm10" ? rolling24hMean : null,
-      daqi_no2_index_level: pollutantCode === "no2" ? daqiIndexLevel : null,
-      daqi_pm25_rolling24h_index_level: pollutantCode === "pm25" ? daqiIndexLevel : null,
-      daqi_pm10_rolling24h_index_level: pollutantCode === "pm10" ? daqiIndexLevel : null,
-      eaqi_no2_index_level: pollutantCode === "no2" ? eaqiIndexLevel : null,
-      eaqi_pm25_index_level: pollutantCode === "pm25" ? eaqiIndexLevel : null,
-      eaqi_pm10_index_level: pollutantCode === "pm10" ? eaqiIndexLevel : null,
-      algorithm_version: optionalText(row.algorithm_version) ?? "aqilevels_hourly_v1",
-      computed_at_utc: optionalIsoTimestamp(row.computed_at_utc),
-      updated_at: optionalIsoTimestamp(row.updated_at),
+      daqi_index_level: toFiniteNumber(row.daqi_index_level),
+      eaqi_index_level: toFiniteNumber(row.eaqi_index_level),
     });
   }
   return rows;
@@ -2186,41 +2063,6 @@ function normalizeAqilevelsHistoryRows(
         (pollutantCode === "pm25"
           ? toSafeNumber(record.pm25_rolling24h_mean_ugm3)
           : toSafeNumber(record.pm10_rolling24h_mean_ugm3));
-    const daqiInputValue = toSafeNumber(record.daqi_input_value_ugm3) ??
-      (pollutantCode === "no2" ? hourlyMean : rolling24hMean);
-    const daqiInputAveragingCode = optionalText(record.daqi_input_averaging_code) ??
-      daqiAveragingCodeForPollutant(pollutantCode);
-    const daqiSourceCount = toSafeWholeNumber(record.daqi_source_observation_count) ??
-      (daqiInputValue === null ? null : daqiInputAveragingCode === "rolling_24h_mean" ? 24 : toSafeWholeNumber(record.hourly_sample_count));
-    const daqiRequiredCount = toSafeWholeNumber(record.daqi_required_observation_count) ??
-      (daqiInputAveragingCode === "rolling_24h_mean" ? 24 : 1);
-    const daqiStatus = optionalText(record.daqi_calculation_status) ??
-      (daqiInputValue === null ? "missing_input" : "ok");
-    const eaqiInputValue = toSafeNumber(record.eaqi_input_value_ugm3) ?? hourlyMean;
-    const eaqiInputAveragingCode = optionalText(record.eaqi_input_averaging_code) ?? "hourly_mean";
-    const eaqiSourceCount = toSafeWholeNumber(record.eaqi_source_observation_count) ??
-      (eaqiInputValue === null ? null : toSafeWholeNumber(record.hourly_sample_count));
-    const eaqiRequiredCount = toSafeWholeNumber(record.eaqi_required_observation_count) ?? 1;
-    const eaqiStatus = optionalText(record.eaqi_calculation_status) ??
-      (eaqiInputValue === null ? "missing_input" : "ok");
-    const daqiIndexLevel = toSafeNumber(record.daqi_index_level) ??
-      lookupAqiIndexLevel(
-        daqiInputValue,
-        pollutantCode === "no2"
-          ? DAQI_NO2_BREAKPOINTS
-          : pollutantCode === "pm25"
-          ? DAQI_PM25_ROLLING24H_BREAKPOINTS
-          : DAQI_PM10_ROLLING24H_BREAKPOINTS,
-      );
-    const eaqiIndexLevel = toSafeNumber(record.eaqi_index_level) ??
-      lookupAqiIndexLevel(
-        eaqiInputValue,
-        pollutantCode === "no2"
-          ? EAQI_NO2_BREAKPOINTS
-          : pollutantCode === "pm25"
-          ? EAQI_PM25_BREAKPOINTS
-          : EAQI_PM10_BREAKPOINTS,
-      );
 
     rows.push({
       timeseries_id: Math.trunc(timeseriesId),
@@ -2228,39 +2070,11 @@ function normalizeAqilevelsHistoryRows(
       connector_id: connectorId,
       pollutant_code: pollutantCode,
       timestamp_hour_utc: timestamp.toISOString(),
-      daqi_input_value_ugm3: daqiInputValue,
-      daqi_input_averaging_code: daqiInputAveragingCode,
-      daqi_source_observation_count: daqiSourceCount,
-      daqi_required_observation_count: daqiRequiredCount,
-      daqi_calculation_status: daqiStatus,
-      daqi_missing_reason: optionalText(record.daqi_missing_reason) ??
-        (daqiStatus === "ok" ? null : daqiStatus),
-      eaqi_input_value_ugm3: eaqiInputValue,
-      eaqi_input_averaging_code: eaqiInputAveragingCode,
-      eaqi_source_observation_count: eaqiSourceCount,
-      eaqi_required_observation_count: eaqiRequiredCount,
-      eaqi_calculation_status: eaqiStatus,
-      eaqi_missing_reason: optionalText(record.eaqi_missing_reason) ??
-        (eaqiStatus === "ok" ? null : eaqiStatus),
       hourly_mean_ugm3: hourlyMean,
       rolling24h_mean_ugm3: rolling24hMean,
       hourly_sample_count: toSafeNumber(record.hourly_sample_count),
-      daqi_index_level: daqiIndexLevel,
-      eaqi_index_level: eaqiIndexLevel,
-      no2_hourly_mean_ugm3: pollutantCode === "no2" ? hourlyMean : null,
-      pm25_hourly_mean_ugm3: pollutantCode === "pm25" ? hourlyMean : null,
-      pm10_hourly_mean_ugm3: pollutantCode === "pm10" ? hourlyMean : null,
-      pm25_rolling24h_mean_ugm3: pollutantCode === "pm25" ? rolling24hMean : null,
-      pm10_rolling24h_mean_ugm3: pollutantCode === "pm10" ? rolling24hMean : null,
-      daqi_no2_index_level: pollutantCode === "no2" ? daqiIndexLevel : null,
-      daqi_pm25_rolling24h_index_level: pollutantCode === "pm25" ? daqiIndexLevel : null,
-      daqi_pm10_rolling24h_index_level: pollutantCode === "pm10" ? daqiIndexLevel : null,
-      eaqi_no2_index_level: pollutantCode === "no2" ? eaqiIndexLevel : null,
-      eaqi_pm25_index_level: pollutantCode === "pm25" ? eaqiIndexLevel : null,
-      eaqi_pm10_index_level: pollutantCode === "pm10" ? eaqiIndexLevel : null,
-      algorithm_version: optionalText(record.algorithm_version) ?? "aqilevels_hourly_v1",
-      computed_at_utc: optionalIsoTimestamp(record.computed_at_utc),
-      updated_at: optionalIsoTimestamp(record.updated_at),
+      daqi_index_level: toSafeNumber(record.daqi_index_level),
+      eaqi_index_level: toSafeNumber(record.eaqi_index_level),
     });
   }
 
@@ -2971,58 +2785,20 @@ function rowsToAqiParquetBuffer(
   rows: AqilevelsHistoryParquetRow[],
 ): Uint8Array {
   ensureParquetWasmInitialized();
-  const int32Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Int32());
-  const float64Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Float64());
-  const textVector = (values: Array<string | null>) =>
-    arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values: Array<Date | null>) =>
-    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
   const table = (arrow as unknown as {
     tableFromArrays: (data: Record<string, unknown>) => unknown;
     tableToIPC: (table: unknown, mode: "stream") => Uint8Array;
   }).tableFromArrays({
     connector_id: rows.map((row) => row.connector_id),
-    station_id: int32Vector(rows.map((row) => row.station_id)),
     timeseries_id: rows.map((row) => row.timeseries_id),
-    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_input_value_ugm3: float64Vector(rows.map((row) => row.daqi_input_value_ugm3)),
-    daqi_input_averaging_code: textVector(rows.map((row) => row.daqi_input_averaging_code)),
-    daqi_index_level: int32Vector(rows.map((row) => row.daqi_index_level)),
-    daqi_source_observation_count: int32Vector(rows.map((row) => row.daqi_source_observation_count)),
-    daqi_required_observation_count: int32Vector(rows.map((row) => row.daqi_required_observation_count)),
-    daqi_calculation_status: textVector(rows.map((row) => row.daqi_calculation_status)),
-    daqi_missing_reason: textVector(rows.map((row) => row.daqi_missing_reason)),
-    eaqi_input_value_ugm3: float64Vector(rows.map((row) => row.eaqi_input_value_ugm3)),
-    eaqi_input_averaging_code: textVector(rows.map((row) => row.eaqi_input_averaging_code)),
-    eaqi_index_level: int32Vector(rows.map((row) => row.eaqi_index_level)),
-    eaqi_source_observation_count: int32Vector(rows.map((row) => row.eaqi_source_observation_count)),
-    eaqi_required_observation_count: int32Vector(rows.map((row) => row.eaqi_required_observation_count)),
-    eaqi_calculation_status: textVector(rows.map((row) => row.eaqi_calculation_status)),
-    eaqi_missing_reason: textVector(rows.map((row) => row.eaqi_missing_reason)),
-    hourly_sample_count: int32Vector(rows.map((row) => row.hourly_sample_count)),
-    algorithm_version: textVector(rows.map((row) => row.algorithm_version)),
-    computed_at_utc: timestampVector(rows.map((row) =>
-      row.computed_at_utc ? new Date(row.computed_at_utc) : null
-    )),
-    hourly_mean_ugm3: float64Vector(rows.map((row) => row.hourly_mean_ugm3)),
-    rolling24h_mean_ugm3: float64Vector(rows.map((row) => row.rolling24h_mean_ugm3)),
-    no2_hourly_mean_ugm3: float64Vector(rows.map((row) => row.no2_hourly_mean_ugm3)),
-    pm25_hourly_mean_ugm3: float64Vector(rows.map((row) => row.pm25_hourly_mean_ugm3)),
-    pm10_hourly_mean_ugm3: float64Vector(rows.map((row) => row.pm10_hourly_mean_ugm3)),
-    pm25_rolling24h_mean_ugm3: float64Vector(rows.map((row) => row.pm25_rolling24h_mean_ugm3)),
-    pm10_rolling24h_mean_ugm3: float64Vector(rows.map((row) => row.pm10_rolling24h_mean_ugm3)),
-    daqi_no2_index_level: int32Vector(rows.map((row) => row.daqi_no2_index_level)),
-    daqi_pm25_rolling24h_index_level: int32Vector(rows.map((row) => row.daqi_pm25_rolling24h_index_level)),
-    daqi_pm10_rolling24h_index_level: int32Vector(rows.map((row) => row.daqi_pm10_rolling24h_index_level)),
-    eaqi_no2_index_level: int32Vector(rows.map((row) => row.eaqi_no2_index_level)),
-    eaqi_pm25_index_level: int32Vector(rows.map((row) => row.eaqi_pm25_index_level)),
-    eaqi_pm10_index_level: int32Vector(rows.map((row) => row.eaqi_pm10_index_level)),
-    updated_at: timestampVector(rows.map((row) =>
-      row.updated_at ? new Date(row.updated_at) : null
-    )),
+    station_id: rows.map((row) => row.station_id),
+    pollutant_code: rows.map((row) => row.pollutant_code),
+    timestamp_hour_utc: rows.map((row) => new Date(row.timestamp_hour_utc)),
+    hourly_mean_ugm3: rows.map((row) => row.hourly_mean_ugm3),
+    rolling24h_mean_ugm3: rows.map((row) => row.rolling24h_mean_ugm3),
+    hourly_sample_count: rows.map((row) => row.hourly_sample_count),
+    daqi_index_level: rows.map((row) => row.daqi_index_level),
+    eaqi_index_level: rows.map((row) => row.eaqi_index_level),
   });
   const wasmTable = (parquetWasm as unknown as {
     Table: { fromIPCStream: (bytes: Uint8Array) => unknown };
@@ -3543,37 +3319,11 @@ async function exportAqiConnectorDayToR2(args: {
         station_id: row.station_id,
         pollutant_code: row.pollutant_code,
         timestamp_hour_utc: row.timestamp_hour_utc,
-        daqi_input_value_ugm3: row.daqi_input_value_ugm3,
-        daqi_input_averaging_code: row.daqi_input_averaging_code,
-        daqi_index_level: row.daqi_index_level,
-        daqi_source_observation_count: row.daqi_source_observation_count,
-        daqi_required_observation_count: row.daqi_required_observation_count,
-        daqi_calculation_status: row.daqi_calculation_status,
-        daqi_missing_reason: row.daqi_missing_reason,
-        eaqi_input_value_ugm3: row.eaqi_input_value_ugm3,
-        eaqi_input_averaging_code: row.eaqi_input_averaging_code,
-        eaqi_index_level: row.eaqi_index_level,
-        eaqi_source_observation_count: row.eaqi_source_observation_count,
-        eaqi_required_observation_count: row.eaqi_required_observation_count,
-        eaqi_calculation_status: row.eaqi_calculation_status,
-        eaqi_missing_reason: row.eaqi_missing_reason,
-        hourly_sample_count: row.hourly_sample_count,
-        algorithm_version: row.algorithm_version,
-        computed_at_utc: row.computed_at_utc,
         hourly_mean_ugm3: row.hourly_mean_ugm3,
         rolling24h_mean_ugm3: row.rolling24h_mean_ugm3,
-        no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3,
-        pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3,
-        pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3,
-        pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3,
-        pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3,
-        daqi_no2_index_level: row.daqi_no2_index_level,
-        daqi_pm25_rolling24h_index_level: row.daqi_pm25_rolling24h_index_level,
-        daqi_pm10_rolling24h_index_level: row.daqi_pm10_rolling24h_index_level,
-        eaqi_no2_index_level: row.eaqi_no2_index_level,
-        eaqi_pm25_index_level: row.eaqi_pm25_index_level,
-        eaqi_pm10_index_level: row.eaqi_pm10_index_level,
-        updated_at: row.updated_at,
+        hourly_sample_count: row.hourly_sample_count,
+        daqi_index_level: row.daqi_index_level,
+        eaqi_index_level: row.eaqi_index_level,
       });
       if (parquetRowsBuffer.length >= AQI_R2_PART_MAX_ROWS) {
         await flushPart();
@@ -3801,37 +3551,11 @@ async function exportAqiConnectorRowsToR2(args: {
       station_id: row.station_id,
       pollutant_code: row.pollutant_code,
       timestamp_hour_utc: row.timestamp_hour_utc,
-      daqi_input_value_ugm3: row.daqi_input_value_ugm3,
-      daqi_input_averaging_code: row.daqi_input_averaging_code,
-      daqi_index_level: row.daqi_index_level,
-      daqi_source_observation_count: row.daqi_source_observation_count,
-      daqi_required_observation_count: row.daqi_required_observation_count,
-      daqi_calculation_status: row.daqi_calculation_status,
-      daqi_missing_reason: row.daqi_missing_reason,
-      eaqi_input_value_ugm3: row.eaqi_input_value_ugm3,
-      eaqi_input_averaging_code: row.eaqi_input_averaging_code,
-      eaqi_index_level: row.eaqi_index_level,
-      eaqi_source_observation_count: row.eaqi_source_observation_count,
-      eaqi_required_observation_count: row.eaqi_required_observation_count,
-      eaqi_calculation_status: row.eaqi_calculation_status,
-      eaqi_missing_reason: row.eaqi_missing_reason,
-      hourly_sample_count: row.hourly_sample_count,
-      algorithm_version: row.algorithm_version,
-      computed_at_utc: row.computed_at_utc,
       hourly_mean_ugm3: row.hourly_mean_ugm3,
       rolling24h_mean_ugm3: row.rolling24h_mean_ugm3,
-      no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3,
-      pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3,
-      pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3,
-      pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3,
-      pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3,
-      daqi_no2_index_level: row.daqi_no2_index_level,
-      daqi_pm25_rolling24h_index_level: row.daqi_pm25_rolling24h_index_level,
-      daqi_pm10_rolling24h_index_level: row.daqi_pm10_rolling24h_index_level,
-      eaqi_no2_index_level: row.eaqi_no2_index_level,
-      eaqi_pm25_index_level: row.eaqi_pm25_index_level,
-      eaqi_pm10_index_level: row.eaqi_pm10_index_level,
-      updated_at: row.updated_at,
+      hourly_sample_count: row.hourly_sample_count,
+      daqi_index_level: row.daqi_index_level,
+      eaqi_index_level: row.eaqi_index_level,
     }));
     const partSummary = summarizeAqilevelsPartRows(parquetRows);
     const partKey = buildAqiPartKey(args.day_utc, args.connector_id, partIndex);
@@ -3982,37 +3706,6 @@ function toSafeNumber(value: unknown): number | null {
     return null;
   }
   return parsed;
-}
-
-function toSafeWholeNumber(value: unknown): number | null {
-  const parsed = toSafeNumber(value);
-  if (parsed === null) {
-    return null;
-  }
-  return Math.max(0, Math.trunc(parsed));
-}
-
-function optionalText(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const text = value.trim();
-  return text ? text : null;
-}
-
-function optionalIsoTimestamp(value: unknown): string | null {
-  const text = typeof value === "string" ? value.trim() : "";
-  if (!text) {
-    return null;
-  }
-  const timestampMs = Date.parse(text);
-  return Number.isFinite(timestampMs) ? new Date(timestampMs).toISOString() : null;
-}
-
-function daqiAveragingCodeForPollutant(
-  pollutantCode: "no2" | "pm25" | "pm10",
-): "hourly_mean" | "rolling_24h_mean" {
-  return pollutantCode === "no2" ? "hourly_mean" : "rolling_24h_mean";
 }
 
 function parseIsoHour(value: unknown): string | null {
@@ -7397,20 +7090,6 @@ function helperRowsToAqilevelHistoryRows(
         (pollutantCode === "pm25"
           ? toSafeNumber(row.pm25_rolling24h_mean_ugm3)
           : toSafeNumber(row.pm10_rolling24h_mean_ugm3));
-    const daqiInputValue = pollutantCode === "no2" ? hourlyMean : rolling24hMean;
-    const daqiInputAveragingCode = daqiAveragingCodeForPollutant(pollutantCode);
-    const daqiSourceCount = daqiInputValue === null
-      ? null
-      : daqiInputAveragingCode === "rolling_24h_mean"
-      ? 24
-      : toSafeWholeNumber(row.hourly_sample_count);
-    const daqiRequiredCount = daqiInputAveragingCode === "rolling_24h_mean" ? 24 : 1;
-    const daqiStatus = daqiInputValue === null ? "missing_input" : "ok";
-    const eaqiInputValue = hourlyMean;
-    const eaqiSourceCount = eaqiInputValue === null ? null : toSafeWholeNumber(row.hourly_sample_count);
-    const eaqiStatus = eaqiInputValue === null ? "missing_input" : "ok";
-    const daqiIndexLevel = toSafeNumber(row.daqi_index_level);
-    const eaqiIndexLevel = toSafeNumber(row.eaqi_index_level);
 
     normalizedRows.push({
       timeseries_id: Number(row.timeseries_id),
@@ -7420,37 +7099,11 @@ function helperRowsToAqilevelHistoryRows(
       connector_id: Number(row.connector_id),
       pollutant_code: pollutantCode,
       timestamp_hour_utc: String(row.timestamp_hour_utc || ""),
-      daqi_input_value_ugm3: daqiInputValue,
-      daqi_input_averaging_code: daqiInputAveragingCode,
-      daqi_source_observation_count: daqiSourceCount,
-      daqi_required_observation_count: daqiRequiredCount,
-      daqi_calculation_status: daqiStatus,
-      daqi_missing_reason: daqiStatus === "ok" ? null : daqiStatus,
-      eaqi_input_value_ugm3: eaqiInputValue,
-      eaqi_input_averaging_code: "hourly_mean",
-      eaqi_source_observation_count: eaqiSourceCount,
-      eaqi_required_observation_count: 1,
-      eaqi_calculation_status: eaqiStatus,
-      eaqi_missing_reason: eaqiStatus === "ok" ? null : eaqiStatus,
       hourly_mean_ugm3: hourlyMean,
       rolling24h_mean_ugm3: rolling24hMean,
       hourly_sample_count: toSafeNumber(row.hourly_sample_count),
-      daqi_index_level: daqiIndexLevel,
-      eaqi_index_level: eaqiIndexLevel,
-      no2_hourly_mean_ugm3: pollutantCode === "no2" ? hourlyMean : null,
-      pm25_hourly_mean_ugm3: pollutantCode === "pm25" ? hourlyMean : null,
-      pm10_hourly_mean_ugm3: pollutantCode === "pm10" ? hourlyMean : null,
-      pm25_rolling24h_mean_ugm3: pollutantCode === "pm25" ? rolling24hMean : null,
-      pm10_rolling24h_mean_ugm3: pollutantCode === "pm10" ? rolling24hMean : null,
-      daqi_no2_index_level: pollutantCode === "no2" ? daqiIndexLevel : null,
-      daqi_pm25_rolling24h_index_level: pollutantCode === "pm25" ? daqiIndexLevel : null,
-      daqi_pm10_rolling24h_index_level: pollutantCode === "pm10" ? daqiIndexLevel : null,
-      eaqi_no2_index_level: pollutantCode === "no2" ? eaqiIndexLevel : null,
-      eaqi_pm25_index_level: pollutantCode === "pm25" ? eaqiIndexLevel : null,
-      eaqi_pm10_index_level: pollutantCode === "pm10" ? eaqiIndexLevel : null,
-      algorithm_version: "aqilevels_hourly_v1",
-      computed_at_utc: null,
-      updated_at: null,
+      daqi_index_level: toSafeNumber(row.daqi_index_level),
+      eaqi_index_level: toSafeNumber(row.eaqi_index_level),
     });
   }
 
@@ -7917,16 +7570,6 @@ async function readAqiHistoryRowsFromParquetBytes(
       continue;
     }
     const stationIdRaw = Number(stationValues[index]);
-    const hourlyMean = toSafeNumber(hourlyValues[index]);
-    const rolling24hMean = toSafeNumber(rollingValues[index]);
-    const daqiInputAveragingCode = daqiAveragingCodeForPollutant(pollutant);
-    const daqiInputValue = pollutant === "no2" ? hourlyMean : rolling24hMean;
-    const daqiStatus = daqiInputValue === null ? "missing_input" : "ok";
-    const eaqiInputValue = hourlyMean;
-    const eaqiStatus = eaqiInputValue === null ? "missing_input" : "ok";
-    const daqiIndexLevel = toSafeNumber(daqiValues[index]);
-    const eaqiIndexLevel = toSafeNumber(eaqiValues[index]);
-    const hourlySampleCount = toSafeNumber(sampleValues[index]);
     rows.push({
       timeseries_id: Math.trunc(timeseriesId),
       station_id: Number.isInteger(stationIdRaw) && stationIdRaw > 0
@@ -7935,43 +7578,11 @@ async function readAqiHistoryRowsFromParquetBytes(
       connector_id: 0,
       pollutant_code: pollutant,
       timestamp_hour_utc: timestampHourUtc,
-      daqi_input_value_ugm3: daqiInputValue,
-      daqi_input_averaging_code: daqiInputAveragingCode,
-      daqi_source_observation_count: daqiInputValue === null
-        ? null
-        : daqiInputAveragingCode === "rolling_24h_mean"
-        ? 24
-        : toSafeWholeNumber(hourlySampleCount),
-      daqi_required_observation_count: daqiInputAveragingCode === "rolling_24h_mean" ? 24 : 1,
-      daqi_calculation_status: daqiStatus,
-      daqi_missing_reason: daqiStatus === "ok" ? null : daqiStatus,
-      eaqi_input_value_ugm3: eaqiInputValue,
-      eaqi_input_averaging_code: "hourly_mean",
-      eaqi_source_observation_count: eaqiInputValue === null
-        ? null
-        : toSafeWholeNumber(hourlySampleCount),
-      eaqi_required_observation_count: 1,
-      eaqi_calculation_status: eaqiStatus,
-      eaqi_missing_reason: eaqiStatus === "ok" ? null : eaqiStatus,
-      hourly_mean_ugm3: hourlyMean,
-      rolling24h_mean_ugm3: rolling24hMean,
-      hourly_sample_count: hourlySampleCount,
-      daqi_index_level: daqiIndexLevel,
-      eaqi_index_level: eaqiIndexLevel,
-      no2_hourly_mean_ugm3: pollutant === "no2" ? hourlyMean : null,
-      pm25_hourly_mean_ugm3: pollutant === "pm25" ? hourlyMean : null,
-      pm10_hourly_mean_ugm3: pollutant === "pm10" ? hourlyMean : null,
-      pm25_rolling24h_mean_ugm3: pollutant === "pm25" ? rolling24hMean : null,
-      pm10_rolling24h_mean_ugm3: pollutant === "pm10" ? rolling24hMean : null,
-      daqi_no2_index_level: pollutant === "no2" ? daqiIndexLevel : null,
-      daqi_pm25_rolling24h_index_level: pollutant === "pm25" ? daqiIndexLevel : null,
-      daqi_pm10_rolling24h_index_level: pollutant === "pm10" ? daqiIndexLevel : null,
-      eaqi_no2_index_level: pollutant === "no2" ? eaqiIndexLevel : null,
-      eaqi_pm25_index_level: pollutant === "pm25" ? eaqiIndexLevel : null,
-      eaqi_pm10_index_level: pollutant === "pm10" ? eaqiIndexLevel : null,
-      algorithm_version: "aqilevels_hourly_v1",
-      computed_at_utc: null,
-      updated_at: null,
+      hourly_mean_ugm3: toSafeNumber(hourlyValues[index]),
+      rolling24h_mean_ugm3: toSafeNumber(rollingValues[index]),
+      hourly_sample_count: toSafeNumber(sampleValues[index]),
+      daqi_index_level: toSafeNumber(daqiValues[index]),
+      eaqi_index_level: toSafeNumber(eaqiValues[index]),
     });
   }
   return rows;

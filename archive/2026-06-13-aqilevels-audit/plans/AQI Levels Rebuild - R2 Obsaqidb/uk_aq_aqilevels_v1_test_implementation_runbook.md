@@ -523,10 +523,6 @@ Do not delete the local Dropbox backup. It remains the rebuild input and pre-reb
 Delete:
 
 ```text
-history/v1/aqilevels/hourly/day_utc=*/manifest.json
-history/v1/aqilevels/hourly/day_utc=*/connector_id=*/manifest.json
-history/v1/aqilevels/hourly/day_utc=*/connector_id=*/*.parquet
-history/v1/aqilevels/hourly/bands/v1/**
 history/v1/aqilevels/day_utc=*/manifest.json
 history/v1/aqilevels/day_utc=*/connector_id=*/manifest.json
 history/v1/aqilevels/day_utc=*/connector_id=*/*.parquet
@@ -685,20 +681,17 @@ REBUILD TEST AQI
 
 Rebuild Indexes
 
-```text
-node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --domain aqilevels
-```
+node scripts/backup_r2/uk_aq_build_r2_history_index.mjs \
+--domain aqilevels
 
 Rebuild Inventory
 
-```text
 node scripts/backup_r2/build_backup_inventory.mjs \
 --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
 --domain aqilevels \
 --index-prefix "history/_index" \
 --full-rebuild \
 --report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild_TEST.json"
-```
 
 ## 15. Refresh the R2 Dropbox backup after the historical rebuild
 
