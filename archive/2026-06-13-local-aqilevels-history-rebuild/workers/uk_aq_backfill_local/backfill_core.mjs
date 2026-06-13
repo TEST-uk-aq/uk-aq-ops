@@ -1,33 +1,5 @@
-import {
-  buildAqilevelHistoryRowsForDayFromSourceObservations as buildNormalizedAqilevelHistoryRowsForDayFromSourceObservations,
-  buildAqilevelHistoryRowsByDayFromSourceObservations as buildNormalizedAqilevelHistoryRowsByDayFromSourceObservations,
-  dedupeSourceObservationRows as aqiDedupeSourceObservationRows,
-  helperRowsToNormalizedAqiV1Rows,
-  narrowRowsToDayRange as aqiNarrowRowsToDayRange,
-  pivotNarrowRowsToHelperRows as aqiPivotNarrowRowsToHelperRows,
-  sourceObservationsToNarrowRows as aqiSourceObservationsToNarrowRows,
-} from "../../lib/aqi/aqi_levels.mjs";
-
-export {
-  AQI_ALGORITHM_VERSION,
-  AQI_AVERAGING_CODES,
-  AQI_CALCULATION_STATUSES,
-  AQI_SUPPORTED_POLLUTANTS,
-  AQI_V1_NORMALIZED_COLUMNS,
-  DAQI_NO2_BREAKPOINTS,
-  DAQI_PM10_ROLLING24H_BREAKPOINTS,
-  DAQI_PM25_ROLLING24H_BREAKPOINTS,
-  EAQI_NO2_BREAKPOINTS,
-  EAQI_PM10_BREAKPOINTS,
-  EAQI_PM25_BREAKPOINTS,
-  daqiAveragingCodeForPollutant,
-  lookupAqiIndexLevel,
-  normalizeAqiAveragingCode,
-  normalizeAqiCalculationStatus,
-  normalizePollutantCode,
-} from "../../lib/aqi/aqi_levels.mjs";
-
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
 export const ALLOWED_TRIGGER_MODES = Object.freeze(["scheduler", "manual"]);
 export const ALLOWED_RUN_MODES = Object.freeze([
@@ -88,6 +60,93 @@ const RETRYABLE_AQILEVELS_WRITE_ERROR_SNIPPETS = [
   "http 504",
   "gateway timeout",
 ];
+
+export const DAQI_NO2_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 67, level: 1 },
+  { low: 67, high: 134, level: 2 },
+  { low: 134, high: 200, level: 3 },
+  { low: 200, high: 267, level: 4 },
+  { low: 267, high: 334, level: 5 },
+  { low: 334, high: 400, level: 6 },
+  { low: 400, high: 467, level: 7 },
+  { low: 467, high: 534, level: 8 },
+  { low: 534, high: 600, level: 9 },
+  { low: 600, high: null, level: 10 },
+]);
+
+export const DAQI_PM25_ROLLING24H_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 11, level: 1 },
+  { low: 11, high: 23, level: 2 },
+  { low: 23, high: 35, level: 3 },
+  { low: 35, high: 41, level: 4 },
+  { low: 41, high: 47, level: 5 },
+  { low: 47, high: 53, level: 6 },
+  { low: 53, high: 58, level: 7 },
+  { low: 58, high: 64, level: 8 },
+  { low: 64, high: 70, level: 9 },
+  { low: 70, high: null, level: 10 },
+]);
+
+export const DAQI_PM10_ROLLING24H_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 16, level: 1 },
+  { low: 16, high: 33, level: 2 },
+  { low: 33, high: 50, level: 3 },
+  { low: 50, high: 58, level: 4 },
+  { low: 58, high: 66, level: 5 },
+  { low: 66, high: 75, level: 6 },
+  { low: 75, high: 83, level: 7 },
+  { low: 83, high: 91, level: 8 },
+  { low: 91, high: 100, level: 9 },
+  { low: 100, high: null, level: 10 },
+]);
+
+export const EAQI_NO2_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 10, level: 1 },
+  { low: 10, high: 25, level: 2 },
+  { low: 25, high: 60, level: 3 },
+  { low: 60, high: 100, level: 4 },
+  { low: 100, high: 150, level: 5 },
+  { low: 150, high: null, level: 6 },
+]);
+
+export const EAQI_PM25_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 5, level: 1 },
+  { low: 5, high: 15, level: 2 },
+  { low: 15, high: 50, level: 3 },
+  { low: 50, high: 90, level: 4 },
+  { low: 90, high: 140, level: 5 },
+  { low: 140, high: null, level: 6 },
+]);
+
+export const EAQI_PM10_BREAKPOINTS = Object.freeze([
+  { low: 0, high: 15, level: 1 },
+  { low: 15, high: 45, level: 2 },
+  { low: 45, high: 120, level: 3 },
+  { low: 120, high: 195, level: 4 },
+  { low: 195, high: 270, level: 5 },
+  { low: 270, high: null, level: 6 },
+]);
+
+export function lookupAqiIndexLevel(value, breakpoints) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
+  }
+  if (!Array.isArray(breakpoints) || breakpoints.length === 0) {
+    return null;
+  }
+  const firstLow = Number(breakpoints[0]?.low);
+  if (!Number.isFinite(firstLow) || value < firstLow) {
+    return null;
+  }
+  // Breakpoints are matched by ordered inclusive upper bound so decimal values
+  // between published integer legend thresholds still resolve without gaps.
+  for (const breakpoint of breakpoints) {
+    if (breakpoint.high === null || value <= breakpoint.high) {
+      return breakpoint.level;
+    }
+  }
+  return null;
+}
 
 export function parseRunMode(raw, fallback = "local_to_aqilevels") {
   const value = String(raw || "").trim().toLowerCase();
@@ -397,35 +456,381 @@ export function mapR2ObservationRowsToSourceObservations({
   return observations;
 }
 
+function parseIsoHour(raw) {
+  const normalized = normalizeIsoTimestamp(raw);
+  if (!normalized) {
+    return null;
+  }
+  const date = new Date(normalized);
+  date.setUTCMinutes(0, 0, 0);
+  return date.toISOString();
+}
+
+function average(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return null;
+  }
+  const total = values.reduce((sum, value) => sum + value, 0);
+  return total / values.length;
+}
+
+function sortHelperRows(rows) {
+  rows.sort((left, right) => {
+    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
+    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
+    return Number(left.timeseries_id) - Number(right.timeseries_id);
+  });
+  return rows;
+}
+
+function sortAqilevelHistoryRows(rows) {
+  rows.sort((left, right) => {
+    if (Number(left.timeseries_id) !== Number(right.timeseries_id)) {
+      return Number(left.timeseries_id) - Number(right.timeseries_id);
+    }
+    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
+    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
+    return 0;
+  });
+  return rows;
+}
+
 export function dedupeSourceObservationRows(rows) {
-  return aqiDedupeSourceObservationRows(rows);
+  const byKey = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    const timeseriesId = Number(row.timeseries_id);
+    const observedAt = normalizeIsoTimestamp(row.observed_at);
+    const value = Number(row.value);
+    const stationId = Number(row.station_id);
+    const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0 || !observedAt) {
+      continue;
+    }
+    if (!Number.isInteger(stationId) || stationId <= 0) {
+      continue;
+    }
+    if (
+      !(
+        pollutantCode === "no2" || pollutantCode === "pm25" ||
+        pollutantCode === "pm10"
+      )
+    ) {
+      continue;
+    }
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    const key = `${Math.trunc(timeseriesId)}|${observedAt}`;
+    byKey.set(key, {
+      timeseries_id: Math.trunc(timeseriesId),
+      station_id: Math.trunc(stationId),
+      pollutant_code: pollutantCode,
+      observed_at: observedAt,
+      value,
+    });
+  }
+
+  const deduped = Array.from(byKey.values());
+  deduped.sort((left, right) => {
+    if (left.timeseries_id !== right.timeseries_id) {
+      return left.timeseries_id - right.timeseries_id;
+    }
+    if (left.observed_at < right.observed_at) return -1;
+    if (left.observed_at > right.observed_at) return 1;
+    return 0;
+  });
+  return deduped;
 }
 
 export function sourceObservationsToNarrowRows(rows) {
-  return aqiSourceObservationsToNarrowRows(rows);
+  const grouped = new Map();
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    if (
+      !(
+        row.pollutant_code === "pm10" || row.pollutant_code === "pm25" ||
+        row.pollutant_code === "no2"
+      )
+    ) {
+      continue;
+    }
+    const timeseriesId = Number(row.timeseries_id);
+    const stationId = Number(row.station_id);
+    const value = Number(row.value);
+    const hourIso = parseIsoHour(row.observed_at);
+    if (
+      !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
+      !Number.isInteger(stationId) || stationId <= 0 || !hourIso
+    ) {
+      continue;
+    }
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    const key = `${Math.trunc(timeseriesId)}|${hourIso}`;
+    const current = grouped.get(key) || {
+      timeseries_id: Math.trunc(timeseriesId),
+      station_id: Math.trunc(stationId),
+      connector_id: Number.isInteger(Number(row.connector_id)) && Number(row.connector_id) > 0
+        ? Math.trunc(Number(row.connector_id))
+        : null,
+      timestamp_hour_utc: hourIso,
+      pollutant_code: row.pollutant_code,
+      sum: 0,
+      count: 0,
+    };
+    current.sum += value;
+    current.count += 1;
+    grouped.set(key, current);
+  }
+
+  const narrowRows = Array.from(grouped.values()).map((groupedRow) => ({
+    timeseries_id: groupedRow.timeseries_id,
+    station_id: groupedRow.station_id,
+    connector_id: groupedRow.connector_id,
+    timestamp_hour_utc: groupedRow.timestamp_hour_utc,
+    pollutant_code: groupedRow.pollutant_code,
+    hourly_mean_ugm3: groupedRow.count > 0
+      ? groupedRow.sum / groupedRow.count
+      : null,
+    sample_count: groupedRow.count > 0 ? groupedRow.count : null,
+  }));
+
+  narrowRows.sort((left, right) => {
+    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
+    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
+    if (left.timeseries_id !== right.timeseries_id) {
+      return left.timeseries_id - right.timeseries_id;
+    }
+    return left.pollutant_code.localeCompare(right.pollutant_code);
+  });
+  return narrowRows;
+}
+
+function computeRolling24h(helperRows) {
+  const byTimeseries = new Map();
+  for (const row of helperRows) {
+    const timeseriesId = Number(row.timeseries_id);
+    const list = byTimeseries.get(timeseriesId) || [];
+    list.push(row);
+    byTimeseries.set(timeseriesId, list);
+  }
+
+  for (const rows of byTimeseries.values()) {
+    sortHelperRows(rows);
+    for (let currentIndex = 0; currentIndex < rows.length; currentIndex += 1) {
+      const currentTs = Date.parse(rows[currentIndex].timestamp_hour_utc);
+      const pm25Values = [];
+      const pm10Values = [];
+
+      for (let previousIndex = currentIndex; previousIndex >= 0; previousIndex -= 1) {
+        const previousTs = Date.parse(rows[previousIndex].timestamp_hour_utc);
+        const diffHours = Math.trunc((currentTs - previousTs) / HOUR_MS);
+        if (diffHours > 23) {
+          break;
+        }
+        const pm25 = rows[previousIndex].pm25_hourly_mean_ugm3;
+        const pm10 = rows[previousIndex].pm10_hourly_mean_ugm3;
+        if (typeof pm25 === "number") {
+          pm25Values.push(pm25);
+        }
+        if (typeof pm10 === "number") {
+          pm10Values.push(pm10);
+        }
+      }
+
+      rows[currentIndex].pm25_rolling24h_mean_ugm3 = average(pm25Values);
+      rows[currentIndex].pm10_rolling24h_mean_ugm3 = average(pm10Values);
+    }
+  }
 }
 
 export function pivotNarrowRowsToHelperRows(narrowRows) {
-  return aqiPivotNarrowRowsToHelperRows(narrowRows);
+  const byKey = new Map();
+  for (const row of Array.isArray(narrowRows) ? narrowRows : []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    const timeseriesId = Number(row.timeseries_id);
+    const stationId = Number(row.station_id);
+    const connectorId = Number(row.connector_id);
+    const timestampHourUtc = normalizeIsoTimestamp(row.timestamp_hour_utc);
+    const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
+    if (
+      !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
+      !Number.isInteger(stationId) || stationId <= 0 ||
+      !timestampHourUtc ||
+      !(pollutantCode === "no2" || pollutantCode === "pm25" || pollutantCode === "pm10")
+    ) {
+      continue;
+    }
+    const key = `${Math.trunc(timeseriesId)}|${timestampHourUtc}`;
+    const existing = byKey.get(key) || {
+      timeseries_id: Math.trunc(timeseriesId),
+      station_id: Math.trunc(stationId),
+      connector_id: Number.isInteger(connectorId) && connectorId > 0
+        ? Math.trunc(connectorId)
+        : null,
+      pollutant_code: pollutantCode,
+      timestamp_hour_utc: timestampHourUtc,
+      no2_hourly_mean_ugm3: null,
+      pm25_hourly_mean_ugm3: null,
+      pm10_hourly_mean_ugm3: null,
+      pm25_rolling24h_mean_ugm3: null,
+      pm10_rolling24h_mean_ugm3: null,
+      hourly_sample_count: null,
+    };
+
+    const sampleCount = row.sample_count === null || row.sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.sample_count));
+
+    if (pollutantCode === "no2") {
+      existing.no2_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
+          row.hourly_mean_ugm3 === undefined
+        ? null
+        : Number(row.hourly_mean_ugm3);
+      existing.hourly_sample_count = sampleCount;
+    } else if (pollutantCode === "pm25") {
+      existing.pm25_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
+          row.hourly_mean_ugm3 === undefined
+        ? null
+        : Number(row.hourly_mean_ugm3);
+      existing.hourly_sample_count = sampleCount;
+    } else if (pollutantCode === "pm10") {
+      existing.pm10_hourly_mean_ugm3 = row.hourly_mean_ugm3 === null ||
+          row.hourly_mean_ugm3 === undefined
+        ? null
+        : Number(row.hourly_mean_ugm3);
+      existing.hourly_sample_count = sampleCount;
+    } else {
+      continue;
+    }
+
+    byKey.set(key, existing);
+  }
+
+  const helperRows = sortHelperRows(Array.from(byKey.values()));
+  computeRolling24h(helperRows);
+  return helperRows;
 }
 
 export function narrowRowsToDayRange(helperRows, dayUtc) {
-  return aqiNarrowRowsToDayRange(helperRows, dayUtc);
-}
-
-export function sourceObservationRowsToHelperRowsForDay(rows, dayUtc) {
-  return aqiNarrowRowsToDayRange(
-    aqiPivotNarrowRowsToHelperRows(aqiSourceObservationsToNarrowRows(rows)),
-    dayUtc,
+  const dayStartIso = utcDayStartIso(dayUtc);
+  const dayEndIso = utcDayEndIso(dayUtc);
+  return sortHelperRows(
+    (Array.isArray(helperRows) ? helperRows : []).filter((row) =>
+      row.timestamp_hour_utc >= dayStartIso &&
+      row.timestamp_hour_utc < dayEndIso
+    ),
   );
 }
 
+export function sourceObservationRowsToHelperRowsForDay(rows, dayUtc) {
+  const helperRows = pivotNarrowRowsToHelperRows(
+    sourceObservationsToNarrowRows(dedupeSourceObservationRows(rows)),
+  );
+  return narrowRowsToDayRange(helperRows, dayUtc);
+}
+
 export function helperRowsToAqilevelHistoryRows(helperRows) {
-  return helperRowsToNormalizedAqiV1Rows(helperRows);
+  const rows = (Array.isArray(helperRows) ? helperRows : []).map((row) => ({
+    timeseries_id: Number(row.timeseries_id),
+    station_id: Number(row.station_id),
+    connector_id: row.connector_id === null || row.connector_id === undefined
+      ? null
+      : Number(row.connector_id),
+    pollutant_code: String(row.pollutant_code || "").trim().toLowerCase(),
+    timestamp_hour_utc: normalizeIsoTimestamp(row.timestamp_hour_utc),
+    no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3 === null ||
+        row.no2_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.no2_hourly_mean_ugm3),
+    pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3 === null ||
+        row.pm25_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm25_hourly_mean_ugm3),
+    pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3 === null ||
+        row.pm10_hourly_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm10_hourly_mean_ugm3),
+    pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3 === null ||
+        row.pm25_rolling24h_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm25_rolling24h_mean_ugm3),
+    pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3 === null ||
+        row.pm10_rolling24h_mean_ugm3 === undefined
+      ? null
+      : Number(row.pm10_rolling24h_mean_ugm3),
+    hourly_sample_count: row.hourly_sample_count === null ||
+        row.hourly_sample_count === undefined
+      ? null
+      : Math.trunc(Number(row.hourly_sample_count)),
+    daqi_index_level: null,
+    eaqi_index_level: null,
+    daqi_no2_index_level: lookupAqiIndexLevel(
+      row.no2_hourly_mean_ugm3,
+      DAQI_NO2_BREAKPOINTS,
+    ),
+    daqi_pm25_rolling24h_index_level: lookupAqiIndexLevel(
+      row.pm25_rolling24h_mean_ugm3,
+      DAQI_PM25_ROLLING24H_BREAKPOINTS,
+    ),
+    daqi_pm10_rolling24h_index_level: lookupAqiIndexLevel(
+      row.pm10_rolling24h_mean_ugm3,
+      DAQI_PM10_ROLLING24H_BREAKPOINTS,
+    ),
+    eaqi_no2_index_level: lookupAqiIndexLevel(
+      row.no2_hourly_mean_ugm3,
+      EAQI_NO2_BREAKPOINTS,
+    ),
+    eaqi_pm25_index_level: lookupAqiIndexLevel(
+      row.pm25_hourly_mean_ugm3,
+      EAQI_PM25_BREAKPOINTS,
+    ),
+    eaqi_pm10_index_level: lookupAqiIndexLevel(
+      row.pm10_hourly_mean_ugm3,
+      EAQI_PM10_BREAKPOINTS,
+    ),
+  })).filter((row) =>
+    Number.isInteger(row.timeseries_id) && row.timeseries_id > 0 &&
+    Number.isInteger(row.station_id) && row.station_id > 0 &&
+    (row.pollutant_code === "no2" || row.pollutant_code === "pm25" || row.pollutant_code === "pm10") &&
+    typeof row.timestamp_hour_utc === "string"
+  );
+
+  for (const row of rows) {
+    const daqiCandidates = [
+      row.daqi_no2_index_level,
+      row.daqi_pm25_rolling24h_index_level,
+      row.daqi_pm10_rolling24h_index_level,
+    ].filter((value) => Number.isFinite(value));
+    row.daqi_index_level = daqiCandidates.length > 0
+      ? Math.max(...daqiCandidates)
+      : null;
+    const eaqiCandidates = [
+      row.eaqi_no2_index_level,
+      row.eaqi_pm25_index_level,
+      row.eaqi_pm10_index_level,
+    ].filter((value) => Number.isFinite(value));
+    row.eaqi_index_level = eaqiCandidates.length > 0
+      ? Math.max(...eaqiCandidates)
+      : null;
+  }
+
+  return sortAqilevelHistoryRows(rows);
 }
 
 export function buildAqilevelHistoryRowsForDayFromSourceObservations(rows, dayUtc) {
-  return buildNormalizedAqilevelHistoryRowsForDayFromSourceObservations(rows, dayUtc);
+  return helperRowsToAqilevelHistoryRows(
+    sourceObservationRowsToHelperRowsForDay(rows, dayUtc),
+  );
 }
 
 export function buildAqilevelHistoryRowsByDayFromSourceObservations({
@@ -433,11 +838,30 @@ export function buildAqilevelHistoryRowsByDayFromSourceObservations({
   fromDayUtc,
   toDayUtc,
 }) {
-  return buildNormalizedAqilevelHistoryRowsByDayFromSourceObservations({
-    rows,
-    fromDayUtc,
-    toDayUtc,
-  });
+  const fromDay = parseIsoDayUtc(fromDayUtc);
+  const toDay = parseIsoDayUtc(toDayUtc);
+  if (!(fromDay && toDay)) {
+    throw new Error("Invalid day range for AQI history build");
+  }
+  if (compareIsoDay(toDay, fromDay) < 0) {
+    throw new Error("to_day_utc must be >= from_day_utc");
+  }
+
+  const helperRows = pivotNarrowRowsToHelperRows(
+    sourceObservationsToNarrowRows(dedupeSourceObservationRows(rows)),
+  );
+  const output = [];
+  let cursor = fromDay;
+  while (compareIsoDay(cursor, toDay) <= 0) {
+    output.push({
+      day_utc: cursor,
+      rows: helperRowsToAqilevelHistoryRows(
+        narrowRowsToDayRange(helperRows, cursor),
+      ),
+    });
+    cursor = shiftIsoDay(cursor, 1);
+  }
+  return output;
 }
 
 export function buildAqilevelHistoryRowsByDayFromR2ObservationRows({

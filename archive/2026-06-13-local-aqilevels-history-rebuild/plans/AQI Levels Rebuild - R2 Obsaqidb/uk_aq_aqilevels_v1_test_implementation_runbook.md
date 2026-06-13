@@ -602,175 +602,107 @@ DELETE TEST AQI
 
 ## 14. Rebuild historical AQI levels
 
-Use the local Dropbox-source AQI rebuild job for the historical pass. This avoids
-historical reads from Supabase/ObsAQIDB and keeps generated AQI parquet out of
-the Dropbox backup until the operator explicitly runs the separate backup sync.
+Update the robust AQI rebuild/backfill script to write the new layout.
 
 The rebuild must:
 
-1. Read source observations from the local Dropbox R2 history backup.
-2. Read both D-1 and D observations for every target day so DAQI PM rolling
-   24-hour inputs have the required previous-day context.
-3. Compute hourly AQI rows using separate DAQI/EAQI inputs.
-4. Write generated files only under a non-Dropbox work directory. Default:
-
-```text
-~/uk-aq-work/aqilevels-rebuild
-```
-
-5. Upload generated AQI history to TEST R2 only:
-
-```text
-uk_aq_r2_test:uk-aq-history-cic-test
-```
-
-6. Verify a sampled TEST R2 output object after upload.
-7. Leave R2 index rebuild, backup inventory rebuild, and Dropbox backup sync as
-   explicit manual next steps.
-
-The rebuild must not:
-
-1. Write generated AQI files into the Dropbox backup.
-2. Run the Dropbox backup sync.
-3. Rebuild R2 indexes automatically.
-4. Rebuild backup inventory automatically.
-5. Run Supabase historical backfill.
-6. Run ObsAQIDB rollups.
-7. Touch LIVE resources.
-
-AQI parquet must be written to:
+1. Read source observations from R2 Dropbox history or the chosen local source.
+2. Compute hourly AQI rows using separate DAQI/EAQI inputs.
+3. Write hourly parquet to:
 
 ```text
 history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/connector_id=<id>/part-00000.parquet
 ```
 
-Connector and day manifests must be written alongside the parquet:
+4. Write connector manifests.
+5. Write day manifests.
+6. Rebuild AQI latest descriptors and timeseries index objects for the new path.
+7. Avoid writing old band cache objects unless the cache format is also rebuilt.
+
+Suggested rebuild wrapper:
+
+Use a wrapper script in:
 
 ```text
-history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/connector_id=<id>/manifest.json
-history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/manifest.json
+scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_TEST_2025_2026.sh
 ```
 
-The local rebuild script is:
+The wrapper runs `r2_history_obs_to_aqilevels` from the local Dropbox observation history and rewrites AQI-only outputs in TEST R2. For this rebuild, use the full range:
 
 ```text
-scripts/AQI-levels-refactor-June-2026/local_aqilevels_rebuild_from_dropbox.mjs
+2025-01-01 to 2026-06-07
 ```
 
-The wrapper is:
+Required environment values inside the wrapper or shell:
 
-```text
-scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh
+```bash
+export CFLARE_R2_ENDPOINT="https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com"
+export CFLARE_R2_REGION="auto"
+export CFLARE_R2_BUCKET="uk-aq-history-cic-test"
+export CFLARE_R2_ACCESS_KEY_ID="<TEST_R2_ACCESS_KEY_ID>"
+export CFLARE_R2_SECRET_ACCESS_KEY="<TEST_R2_SECRET_ACCESS_KEY>"
+
+export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
+export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
+export UK_AQ_BACKFILL_FORCE_REPLACE="true"
+export UK_AQ_BACKFILL_DRY_RUN="false"
+export UK_AQ_BACKFILL_FROM_DAY_UTC="2025-01-01"
+export UK_AQ_BACKFILL_TO_DAY_UTC="2026-06-07"
+export UK_AQ_R2_HISTORY_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup"
+export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX="false"
 ```
 
-Dry-run command:
+Do not set `UK_AQ_BACKFILL_CONNECTOR_IDS` for the full rebuild unless intentionally restricting to one connector.
+
+Because this wrapper lives one folder below `scripts`, resolve `REPO_ROOT` with:
+
+```bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "$REPO_ROOT"
+```
+
+If `.env` contains quoted values, make sure the `.env` loader strips wrapping quotes. A known failure is `UK_AQ_BACKFILL_RUN_JOB_PATH` being read with literal quote characters. `uk_aq_backfill_local.sh` should strip wrapping quotes before checking the file path.
+
+Example run:
 
 ```bash
 cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
 
-./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh \
-  --from-day 2025-01-01 \
-  --to-day 2026-06-07 \
-  --dry-run
+export CFLARE_R2_ENDPOINT="https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com"
+export CFLARE_R2_REGION="auto"
+export CFLARE_R2_ACCESS_KEY_ID="<TEST_R2_ACCESS_KEY_ID>"
+export CFLARE_R2_SECRET_ACCESS_KEY="<TEST_R2_SECRET_ACCESS_KEY>"
+
+./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_TEST_2025_2026.sh
 ```
 
-Single-day local-only smoke command:
-
-```bash
-./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh \
-  --from-day 2025-01-30 \
-  --to-day 2025-01-30 \
-  --connector-ids 3 \
-  --local-only
-```
-
-Full TEST upload command:
-
-```bash
-UK_AQ_LOCAL_AQI_CONFIRMATION="REBUILD TEST AQI LOCAL" \
-./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh \
-  --from-day 2025-01-01 \
-  --to-day 2026-06-07 \
-  --upload
-```
-
-Use `--replace` only when the existing TEST AQI objects for the same day range
-should be purged before upload.
-
-Default behavior keeps local generated work and reports. To remove the generated
-local AQI work only after upload and verification succeed:
-
-```bash
-KEEP_LOCAL_AQI_WORK=false \
-UK_AQ_LOCAL_AQI_CONFIRMATION="REBUILD TEST AQI LOCAL" \
-./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh \
-  --from-day 2025-01-01 \
-  --to-day 2026-06-07 \
-  --upload
-```
-
-Reports are written under:
+When prompted, type exactly:
 
 ```text
-~/uk-aq-work/aqilevels-rebuild/reports/local_aqilevels_rebuild_TEST_<timestamp>.json
+REBUILD TEST AQI
 ```
 
-Manual verification command examples:
-
-```bash
-rclone lsjson \
-  "uk_aq_r2_test:uk-aq-history-cic-test/history/v1/aqilevels/hourly/day_utc=2025-01-30/connector_id=3/part-00000.parquet"
-
-rclone copyto \
-  "uk_aq_r2_test:uk-aq-history-cic-test/history/v1/aqilevels/hourly/day_utc=2025-01-30/connector_id=3/part-00000.parquet" \
-  "/tmp/uk_aq_aqilevels_sample.parquet"
-
-duckdb -c "describe select * from read_parquet('/tmp/uk_aq_aqilevels_sample.parquet') limit 0;"
-```
-
-Expected schema markers:
+Rebuild Indexes
 
 ```text
-history_schema_name = aqilevels_hourly
-history_schema_version = 1
-grain = hourly
-daqi_input_value_ugm3
-daqi_input_averaging_code
-daqi_index_level
-daqi_calculation_status
-eaqi_input_value_ugm3
-eaqi_input_averaging_code
-eaqi_index_level
-eaqi_calculation_status
+node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --domain aqilevels
 ```
 
-After upload and verification, rebuild indexes manually:
+Rebuild Inventory
 
-```bash
-UK_AQ_R2_HISTORY_AQILEVELS_PREFIX="history/v1/aqilevels/hourly" \
-UK_AQ_R2_HISTORY_INDEX_PREFIX="history/_index" \
-node scripts/backup_r2/uk_aq_build_r2_history_index.mjs \
-  --domain aqilevels
-```
-
-Then rebuild the TEST backup inventory manually:
-
-```bash
-UK_AQ_R2_HISTORY_AQILEVELS_PREFIX="history/v1/aqilevels/hourly" \
+```text
 node scripts/backup_r2/build_backup_inventory.mjs \
-  --source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
-  --domain aqilevels \
-  --index-prefix "history/_index" \
-  --full-rebuild \
-  --report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild_TEST.json"
+--source-root "uk_aq_r2_test:uk-aq-history-cic-test" \
+--domain aqilevels \
+--index-prefix "history/_index" \
+--full-rebuild \
+--report-out "tmp/r2_backup_inventory_aqilevels_after_rebuild_TEST.json"
 ```
 
 ## 15. Refresh the R2 Dropbox backup after the historical rebuild
 
-After the rebuilt AQI files exist in TEST R2, and only after the operator has
-accepted the TEST R2 output, refresh the Dropbox backup so validation queries
-read the new hourly layout. This is a manual follow-up. The local AQI rebuild
-script intentionally does not run this sync.
+After the rebuilt AQI files exist in TEST R2, refresh the Dropbox backup so validation queries read the new hourly layout.
 
 The current backup inventory defaults AQI levels to:
 
