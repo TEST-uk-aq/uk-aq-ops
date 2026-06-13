@@ -42,10 +42,6 @@ enabled = true
 # - UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS (optional; default 86400)
 # - UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS (optional; default 86400)
 # - UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS (optional; default 300)
-# - DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN (optional; required for /api/aq/debug-log uploads)
-# - UK_AQ_DROPBOX_ROOT (optional; root folder for /api/aq/debug-log Dropbox uploads)
-# - UK_AIR_ERROR_DROPBOX_FOLDER (optional; default /error_logs for /api/aq/debug-log)
-# - UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES (optional; default 262144)
 #
 # Route binding is configured in Cloudflare dashboard or via wrangler CLI.
 # Recommended hostnames:

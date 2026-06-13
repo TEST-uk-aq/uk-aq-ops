@@ -48,12 +48,6 @@ export interface Env {
   UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS: unknown;
   UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS: unknown;
   UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS: unknown;
-  DROPBOX_APP_KEY: unknown;
-  DROPBOX_APP_SECRET: unknown;
-  DROPBOX_REFRESH_TOKEN: unknown;
-  UK_AQ_DROPBOX_ROOT: unknown;
-  UK_AIR_ERROR_DROPBOX_FOLDER: unknown;
-  UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES: unknown;
 }
 
 
@@ -211,7 +205,6 @@ const API_PREFIX = "/api/aq/";
 const SESSION_START_PATH = "/api/aq/session/start";
 const SESSION_END_PATH = "/api/aq/session/end";
 const CHART_METRICS_PATH = "/api/aq/chart-metrics";
-const WEBSITE_DEBUG_LOG_PATH = "/api/aq/debug-log";
 const SESSION_COOKIE_NAME = "uk_aq_edge_session";
 const SESSION_INIT_HEADER = "X-UK-AQ-Session-Init";
 const CACHE_BYPASS_QUERY = "cache";
@@ -247,13 +240,6 @@ const CHART_METRICS_MAX_TRACKED_KEYS = 5_000;
 const CHART_METRICS_RATE_WINDOW_MS = 60 * 1000;
 const DEFAULT_CHART_METRICS_RPC = "uk_aq_rpc_chart_load_metrics_insert";
 const DEFAULT_CHART_METRICS_RPC_SCHEMA = "uk_aq_public";
-const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
-const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
-const WEBSITE_DEBUG_LOG_MIN_BODY_BYTES = 4 * 1024;
-const WEBSITE_DEBUG_LOG_DEFAULT_MAX_BODY_BYTES = 256 * 1024;
-const WEBSITE_DEBUG_LOG_MAX_BODY_BYTES = 1024 * 1024;
-const WEBSITE_DEBUG_LOG_DEFAULT_FOLDER = "/error_logs";
-const WEBSITE_DEBUG_LOG_FILENAME_PREFIX = "uk_aq_error_hex_map_html_";
 const TIMESERIES_UPSTREAM_FUNCTION = "uk_aq_timeseries";
 const TIMESERIES_V2_VERSION = "2";
 const TIMESERIES_V2_CACHE_KEY_VERSION = "ts-v2";
@@ -352,10 +338,6 @@ const chartMetricsRateState = new Map<string, { windowStartMs: number; count: nu
 
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/$/, "");
-}
-
-function nowIso(): string {
-  return new Date().toISOString();
 }
 
 async function readSecret(value: unknown): Promise<string> {
@@ -520,217 +502,6 @@ function compactChartMetricPayload(metric: ChartMetricsPayload): Record<string, 
       }
     });
   return payload;
-}
-
-function normalizeDropboxPath(rawValue: string): string {
-  const value = String(rawValue || "").trim();
-  if (!value) {
-    return "";
-  }
-  const withSlash = value.startsWith("/") ? value : `/${value}`;
-  return withSlash.replace(/\/+$/, "");
-}
-
-function joinDropboxPath(...parts: string[]): string {
-  const joined = parts
-    .map((part, index) => {
-      const normalized = normalizeDropboxPath(part);
-      if (!normalized) return "";
-      return index === 0 ? normalized : normalized.replace(/^\/+/, "");
-    })
-    .filter(Boolean)
-    .join("/");
-  return normalizeDropboxPath(joined);
-}
-
-function dropboxPathWithRoot(dropboxRoot: string, pathValue: string): string {
-  const root = normalizeDropboxPath(dropboxRoot);
-  const cleaned = normalizeDropboxPath(pathValue);
-  if (!root) {
-    return cleaned;
-  }
-  if (!cleaned) {
-    return root;
-  }
-  if (cleaned === root || cleaned.startsWith(`${root}/`)) {
-    return cleaned;
-  }
-  return joinDropboxPath(root, cleaned);
-}
-
-function websiteDebugLogDropboxFolder(dropboxRoot: string, configuredFolder: string): string {
-  const configured = normalizeDropboxPath(configuredFolder || WEBSITE_DEBUG_LOG_DEFAULT_FOLDER);
-  const folder = dropboxPathWithRoot(dropboxRoot, configured || WEBSITE_DEBUG_LOG_DEFAULT_FOLDER);
-  if (!folder) {
-    return WEBSITE_DEBUG_LOG_DEFAULT_FOLDER;
-  }
-  if (folder.endsWith("/error_logs")) {
-    return folder;
-  }
-  if (folder.endsWith("/error_log")) {
-    return `${folder}s`;
-  }
-  return joinDropboxPath(folder, "error_logs");
-}
-
-function compactUtcTimestampForFilename(timestamp: string): string {
-  return timestamp.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
-}
-
-function randomHex(bytes = 4): string {
-  const buffer = new Uint8Array(bytes);
-  crypto.getRandomValues(buffer);
-  return Array.from(buffer, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function readResponseTextWithLimit(response: Response, limit = 1000): Promise<string> {
-  const text = await response.text();
-  return text.length <= limit ? text : text.slice(0, limit);
-}
-
-async function readDropboxAccessToken(env: Env): Promise<string | null> {
-  const appKey = (await readSecret(env.DROPBOX_APP_KEY)).trim();
-  const appSecret = (await readSecret(env.DROPBOX_APP_SECRET)).trim();
-  const refreshToken = (await readSecret(env.DROPBOX_REFRESH_TOKEN)).trim();
-  if (!(appKey && appSecret && refreshToken)) {
-    return null;
-  }
-
-  const tokenBody = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: refreshToken,
-    client_id: appKey,
-    client_secret: appSecret,
-  });
-  const tokenResponse = await fetch(DROPBOX_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: tokenBody.toString(),
-  });
-  if (!tokenResponse.ok) {
-    const text = await readResponseTextWithLimit(tokenResponse);
-    throw new Error(`dropbox_token_failed_${tokenResponse.status}:${text}`);
-  }
-  const tokenJson = await tokenResponse.json() as { access_token?: unknown };
-  const accessToken = String(tokenJson?.access_token || "").trim();
-  if (!accessToken) {
-    throw new Error("dropbox_token_missing_access_token");
-  }
-  return accessToken;
-}
-
-async function uploadWebsiteDebugLogToDropbox(env: Env, payload: Record<string, unknown>): Promise<{
-  uploaded: boolean;
-  dropbox_path?: string;
-  reason?: string;
-}> {
-  const accessToken = await readDropboxAccessToken(env);
-  if (!accessToken) {
-    return { uploaded: false, reason: "missing_dropbox_credentials" };
-  }
-
-  const createdAt = typeof payload.created_at_utc === "string" && payload.created_at_utc
-    ? payload.created_at_utc
-    : nowIso();
-  const dateFolder = createdAt.slice(0, 10);
-  const folder = websiteDebugLogDropboxFolder(
-    await readSecret(env.UK_AQ_DROPBOX_ROOT),
-    await readSecret(env.UK_AIR_ERROR_DROPBOX_FOLDER),
-  );
-  const fileName = `${WEBSITE_DEBUG_LOG_FILENAME_PREFIX}${compactUtcTimestampForFilename(createdAt)}_${randomHex(4)}.json`;
-  const dropboxPath = joinDropboxPath(folder, dateFolder, fileName);
-  const bodyText = `${JSON.stringify(payload, null, 2)}\n`;
-  const uploadResponse = await fetch(DROPBOX_UPLOAD_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Dropbox-API-Arg": JSON.stringify({
-        path: dropboxPath,
-        mode: "add",
-        autorename: true,
-        mute: false,
-      }),
-      "Content-Type": "application/octet-stream",
-    },
-    body: bodyText,
-  });
-  if (!uploadResponse.ok) {
-    const text = await readResponseTextWithLimit(uploadResponse);
-    throw new Error(`dropbox_upload_failed_${uploadResponse.status}:${text}`);
-  }
-  return { uploaded: true, dropbox_path: dropboxPath };
-}
-
-function normalizeWebsiteDebugLogPayload(payload: unknown): Record<string, unknown> {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new RequestValidationError(400, "invalid_payload");
-  }
-  const source = String((payload as Record<string, unknown>).source || "").trim();
-  if (source !== "hex_map.html") {
-    throw new RequestValidationError(400, "source_invalid");
-  }
-  const createdAt = String((payload as Record<string, unknown>).created_at_utc || nowIso()).trim();
-  const createdMs = Date.parse(createdAt);
-  if (!Number.isFinite(createdMs)) {
-    throw new RequestValidationError(400, "created_at_utc_invalid");
-  }
-  return {
-    ...(payload as Record<string, unknown>),
-    schema_version: 1,
-    source,
-    debug_enabled: true,
-    created_at_utc: new Date(createdMs).toISOString(),
-    received_at_utc: nowIso(),
-  };
-}
-
-async function handleWebsiteDebugLogIngest(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-  requestOrigin: string | null,
-  allowedOrigins: Set<string>,
-): Promise<Response> {
-  if (request.method !== "POST") {
-    return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
-  }
-
-  const maxBodyBytes = parseIntInRange(
-    await readSecret(env.UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES),
-    WEBSITE_DEBUG_LOG_DEFAULT_MAX_BODY_BYTES,
-    WEBSITE_DEBUG_LOG_MIN_BODY_BYTES,
-    WEBSITE_DEBUG_LOG_MAX_BODY_BYTES,
-  );
-
-  let payload: Record<string, unknown>;
-  try {
-    payload = normalizeWebsiteDebugLogPayload(await readJsonBodyWithLimit(request, maxBodyBytes));
-  } catch (error) {
-    if (error instanceof RequestValidationError) {
-      return makeErrorResponse(error.status, error.code, requestOrigin, allowedOrigins);
-    }
-    return makeErrorResponse(400, "invalid_payload", requestOrigin, allowedOrigins);
-  }
-
-  ctx.waitUntil((async () => {
-    try {
-      const result = await uploadWebsiteDebugLogToDropbox(env, payload);
-      if (!result.uploaded) {
-        console.warn("website_debug_log_dropbox_skipped", { reason: result.reason || "unknown" });
-      }
-    } catch (error) {
-      console.error("website_debug_log_dropbox_upload_failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  })());
-
-  const headers = new Headers({
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
-  });
-  addCorsHeaders(headers, requestOrigin, allowedOrigins);
-  return new Response(JSON.stringify({ ok: true }), { status: 202, headers });
 }
 
 function trimTextOrNull(value: unknown, maxLength: number): string | null {
@@ -2285,26 +2056,6 @@ export default {
     const tokenSecret = await readSecret(env.UK_AQ_EDGE_ACCESS_TOKEN_SECRET);
     if (!tokenSecret) {
       return makeErrorResponse(500, "missing_edge_access_secret", requestOrigin, allowedOrigins);
-    }
-
-    if (url.pathname === WEBSITE_DEBUG_LOG_PATH) {
-      if (requestOrigin === null) {
-        return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
-      }
-      if (!isOriginAllowed(requestOrigin, allowedOrigins)) {
-        return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
-      }
-      if (!isLocalDevRequest) {
-        const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
-        if (!sessionToken) {
-          return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
-        }
-        const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
-        if (!authCheck.ok) {
-          return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
-        }
-      }
-      return handleWebsiteDebugLogIngest(request, env, ctx, requestOrigin, allowedOrigins);
     }
 
     if (isSessionRoute(url.pathname)) {
