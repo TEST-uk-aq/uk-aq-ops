@@ -62,24 +62,6 @@
   - Full behavior and merge-mode details are documented in:
     - [`uk-aq-backfill-local.md`](uk-aq-backfill-local.md)
 
-- `scripts/AQI-levels-refactor-June-2026/local_aqilevels_rebuild_from_dropbox.mjs`
-  - Rebuilds normalized hourly AQI history from local Dropbox R2 observation
-    backup files into a non-Dropbox local work directory.
-  - Reads D-1 and D observations for each target day so DAQI PM rolling 24-hour
-    inputs have previous-day context.
-  - Can upload generated AQI parquet/manifests to TEST R2 only under
-    `history/v1/aqilevels/hourly`.
-  - Requires typed confirmation `REBUILD TEST AQI LOCAL` for upload mode.
-  - Intentionally does not run R2 index rebuild, backup inventory rebuild,
-    Dropbox sync, Supabase historical backfill, or ObsAQIDB rollups.
-
-- `scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh`
-  - Shell wrapper for the local AQI historical rebuild script.
-  - Defaults to the local Dropbox TEST backup as source and
-    `~/uk-aq-work/aqilevels-rebuild` as generated output work root.
-  - Supports `--dry-run`, `--local-only`, and `--upload`; upload mode targets
-    `uk_aq_r2_test:uk-aq-history-cic-test`.
-
 ## History integrity scripts
 
 See [`uk-aq-r2-history-integrity.md`](uk-aq-r2-history-integrity.md) for the full

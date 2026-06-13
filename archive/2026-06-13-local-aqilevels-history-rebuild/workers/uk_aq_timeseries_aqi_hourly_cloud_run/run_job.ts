@@ -1,8 +1,3 @@
-import {
-  normalizeAqiAveragingCode,
-  normalizeAqiCalculationStatus,
-} from "../../lib/aqi/aqi_levels.mjs";
-
 type RpcError = { message: string };
 
 type RpcResult<T> = {
@@ -396,20 +391,28 @@ function parseHelperRows(payload: unknown): HelperRow[] {
       pollutant_code: pollutantCode as "no2" | "pm25" | "pm10",
       timestamp_hour_utc: hourIso(new Date(Date.parse(timestampRaw))),
       daqi_input_value_ugm3: toNullableNumber(row.daqi_input_value_ugm3),
-      daqi_input_averaging_code: normalizeAqiAveragingCode(row.daqi_input_averaging_code),
+      daqi_input_averaging_code: typeof row.daqi_input_averaging_code === "string"
+        ? row.daqi_input_averaging_code
+        : null,
       daqi_index_level: toNullableInt(row.daqi_index_level),
       daqi_source_observation_count: toNullableInt(row.daqi_source_observation_count),
       daqi_required_observation_count: toNullableInt(row.daqi_required_observation_count),
-      daqi_calculation_status: normalizeAqiCalculationStatus(row.daqi_calculation_status),
+      daqi_calculation_status: typeof row.daqi_calculation_status === "string"
+        ? row.daqi_calculation_status
+        : null,
       daqi_missing_reason: typeof row.daqi_missing_reason === "string"
         ? row.daqi_missing_reason
         : null,
       eaqi_input_value_ugm3: toNullableNumber(row.eaqi_input_value_ugm3),
-      eaqi_input_averaging_code: normalizeAqiAveragingCode(row.eaqi_input_averaging_code),
+      eaqi_input_averaging_code: typeof row.eaqi_input_averaging_code === "string"
+        ? row.eaqi_input_averaging_code
+        : null,
       eaqi_index_level: toNullableInt(row.eaqi_index_level),
       eaqi_source_observation_count: toNullableInt(row.eaqi_source_observation_count),
       eaqi_required_observation_count: toNullableInt(row.eaqi_required_observation_count),
-      eaqi_calculation_status: normalizeAqiCalculationStatus(row.eaqi_calculation_status),
+      eaqi_calculation_status: typeof row.eaqi_calculation_status === "string"
+        ? row.eaqi_calculation_status
+        : null,
       eaqi_missing_reason: typeof row.eaqi_missing_reason === "string"
         ? row.eaqi_missing_reason
         : null,

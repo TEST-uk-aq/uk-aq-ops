@@ -173,64 +173,6 @@ skip-on-no-data behaviour; extend per-adapter as needed.
 
 Invalid run-mode/output-scope combinations fail before any R2 mutation.
 
-## Local AQI historical rebuild from Dropbox backup
-
-For the AQI Levels v1 historical hard rebuild, use the dedicated local rebuild
-script instead of the general `uk_aq_backfill_local.sh` wrapper:
-
-```text
-scripts/AQI-levels-refactor-June-2026/local_aqilevels_rebuild_from_dropbox.mjs
-scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh
-```
-
-This path reads committed observation parquet from the local Dropbox R2 backup,
-computes normalized hourly AQI rows locally, writes generated AQI parquet and
-manifests under a non-Dropbox work directory, and can upload those generated
-files to TEST R2 only.
-
-Default paths:
-
-- source root: `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup`
-- work root: `~/uk-aq-work/aqilevels-rebuild`
-- TEST R2 target: `uk_aq_r2_test:uk-aq-history-cic-test`
-- AQI prefix: `history/v1/aqilevels/hourly`
-
-The local rebuild reads both D-1 and D observations for each target day so PM2.5
-and PM10 DAQI rolling 24-hour inputs can be computed without reading
-Supabase/ObsAQIDB historical rows.
-
-Safety rules:
-
-- generated AQI work is refused if the work root is inside Dropbox
-- generated AQI work is refused if it would be written inside the source backup
-- upload mode requires typed confirmation: `REBUILD TEST AQI LOCAL`
-- upload mode refuses R2 targets whose name includes `live`
-- index rebuild, backup inventory rebuild, and Dropbox sync are skipped
-  intentionally and must be run manually after TEST R2 verification
-- no Supabase historical backfill or ObsAQIDB rollup is run by this path
-
-Command examples:
-
-```bash
-./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh \
-  --from-day 2025-01-30 \
-  --to-day 2025-01-30 \
-  --connector-ids 3 \
-  --local-only
-
-UK_AQ_LOCAL_AQI_CONFIRMATION="REBUILD TEST AQI LOCAL" \
-./scripts/AQI-levels-refactor-June-2026/rebuild_aqilevels_from_r2_dropbox_local_TEST.sh \
-  --from-day 2025-01-01 \
-  --to-day 2026-06-07 \
-  --upload
-```
-
-Reports are written under:
-
-```text
-~/uk-aq-work/aqilevels-rebuild/reports/local_aqilevels_rebuild_TEST_<timestamp>.json
-```
-
 ## Manual index-count repair flag
 
 The R2 history index rebuilder keeps an explicit manual recovery switch for

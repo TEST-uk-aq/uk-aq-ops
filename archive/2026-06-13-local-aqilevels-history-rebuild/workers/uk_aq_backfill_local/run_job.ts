@@ -10203,7 +10203,7 @@ async function runR2HistoryObsToAqilevels(
         const aqilevelRows = buildAqilevelHistoryRowsForDayFromSourceObservations(
           sourceFetch.rows,
           dayUtc,
-        ) as AqilevelsHistoryRow[];
+        );
         connectorRowsWritten = aqilevelRows.length;
         const writePlan = planAqilevelHistoryConnectorWrite({
           forceReplace: FORCE_REPLACE,
