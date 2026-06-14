@@ -44,18 +44,11 @@ jobs:
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels/hourly' }}
       UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
-      UK_AQ_R2_HISTORY_WRITE_VERSION: ${{ vars.UK_AQ_R2_HISTORY_WRITE_VERSION || 'v1' }}
-      UK_AQ_R2_HISTORY_BACKUP_VERSION: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_VERSION || '' }}
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
-      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
-      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || 'history/v2/aqilevels/hourly/debug' }}
-      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
       UK_AQ_R2_HISTORY_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_PREFIX || 'history/_index' }}
-      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
-      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '' }}
-      UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || '' }}
+      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v1.json' }}
+      UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || 'history/_index/backup_inventory_v1.json' }}
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
@@ -168,13 +161,10 @@ jobs:
           cmd=(
             node scripts/backup_r2/build_backup_inventory.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
+            --inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}"
             --index-prefix "${UK_AQ_R2_HISTORY_INDEX_PREFIX}"
-            --index-v2-prefix "${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}"
             --report-out "tmp/r2_backup_inventory_report.json"
           )
-          if [ -n "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}" ]; then
-            cmd+=(--inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}")
-          fi
 
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
@@ -211,15 +201,11 @@ jobs:
             node scripts/backup_r2/sync_history_to_dropbox.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
+            --inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}"
+            --state-rel-path "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}"
             --max-days-per-run "${max_days}"
             --report-out "tmp/r2_history_dropbox_backup_report.json"
           )
-          if [ -n "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}" ]; then
-            cmd+=(--inventory-rel-path "${UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH}")
-          fi
-          if [ -n "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}" ]; then
-            cmd+=(--state-rel-path "${UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH}")
-          fi
 
           if [ "${INPUT_DRY_RUN}" = "true" ]; then
             cmd+=(--dry-run)

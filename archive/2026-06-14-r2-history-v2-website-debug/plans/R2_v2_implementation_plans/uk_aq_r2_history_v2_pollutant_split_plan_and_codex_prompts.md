@@ -470,48 +470,29 @@ When `v1`, it should continue current behaviour unchanged.
 
 1. Implement v2 writer support.
 2. Build historical v2 in CIC-Test alongside v1.
-3. Build CIC-Test core v2 with the existing core snapshot writer:
-
-   ```bash
-   UK_AQ_R2_HISTORY_CORE_PREFIX=history/v2/core \
-   node scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs \
-     --report-out ./tmp/uk_aq_core_snapshot_to_r2_v2_report.json
-   ```
-
-4. Build index v2.
-5. Build CIC-Test v2 Dropbox inventory and sync v2 to Dropbox.
-6. Add AQI history Worker support for read switch.
-7. Add observations Worker/history support for read switch if needed.
-8. Keep website response contract unchanged.
-9. Set CIC-Test Worker read version to v2.
-10. Test 24h, 7d, 31d and 90d chart loads.
-11. Compare v1 and v2 responses for selected sensors.
-12. Soak test.
-13. Switch prune daily to write v2.
-14. Keep v1 data available for rollback.
-15. Delete v1 only after explicit decision.
+3. Build index v2.
+4. Add AQI history Worker support for read switch.
+5. Add observations Worker/history support for read switch if needed.
+6. Keep website response contract unchanged.
+7. Set CIC-Test Worker read version to v2.
+8. Test 24h, 7d, 31d and 90d chart loads.
+9. Compare v1 and v2 responses for selected sensors.
+10. Soak test.
+11. Switch prune daily to write v2.
+12. Keep v1 data available for rollback.
+13. Delete v1 only after explicit decision.
 
 ### 10.2 LIVE later
 
 1. Build LIVE v2 alongside LIVE v1.
-2. Build LIVE core v2 with the existing core snapshot writer, against the LIVE
-   environment only when LIVE rollout is explicitly approved:
-
-   ```bash
-   UK_AQ_R2_HISTORY_CORE_PREFIX=history/v2/core \
-   node scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs \
-     --report-out ./tmp/uk_aq_core_snapshot_to_r2_live_v2_report.json
-   ```
-
-3. Build LIVE index v2.
-4. Build LIVE v2 Dropbox inventory and sync v2 to Dropbox.
-5. Deploy Worker code that supports read switch but leave LIVE reading v1.
-6. Validate v2 via manual endpoint/tests.
-7. Switch LIVE read version to v2.
-8. Soak test.
-9. Switch LIVE write version to v2.
-10. Keep v1 for rollback.
-11. Remove v1 later after successful soak period.
+2. Build LIVE index v2.
+3. Deploy Worker code that supports read switch but leave LIVE reading v1.
+4. Validate v2 via manual endpoint/tests.
+5. Switch LIVE read version to v2.
+6. Soak test.
+7. Switch LIVE write version to v2.
+8. Keep v1 for rollback.
+9. Remove v1 later after successful soak period.
 
 Deployment warning:
 
@@ -1460,24 +1441,22 @@ Before changing anything:
 The runbook must include:
 1. Preflight checks.
 2. Required env vars.
-3. Build/refresh core v2 using the existing core snapshot writer with
-   `UK_AQ_R2_HISTORY_CORE_PREFIX=history/v2/core`.
-4. Build historical v2 observations.
-5. Build historical v2 AQI hourly data/debug.
-6. Build `_index_v2`.
-7. Build/refresh backup inventory.
-8. Sync v2 to Dropbox.
-9. Validate parquet schemas with DuckDB.
-10. Validate manifests.
-11. Validate indexes.
-12. Compare v1 vs v2 for selected sensors.
-13. Enable Worker v2 read mode in CIC-Test.
-14. Test 24h, 7d, 31d and 90d chart ranges.
-15. Confirm no Cloudflare 1102.
-16. Switch prune daily write mode to v2 only after v2 read testing passes.
-17. Rollback steps.
-18. Soak period checks.
-19. Criteria for deleting v1 later.
+3. Build historical v2 observations.
+4. Build historical v2 AQI hourly data/debug.
+5. Build `_index_v2`.
+6. Build/refresh backup inventory.
+7. Sync v2 to Dropbox.
+8. Validate parquet schemas with DuckDB.
+9. Validate manifests.
+10. Validate indexes.
+11. Compare v1 vs v2 for selected sensors.
+12. Enable Worker v2 read mode in CIC-Test.
+13. Test 24h, 7d, 31d and 90d chart ranges.
+14. Confirm no Cloudflare 1102.
+15. Switch prune daily write mode to v2 only after v2 read testing passes.
+16. Rollback steps.
+17. Soak period checks.
+18. Criteria for deleting v1 later.
 
 Known test cases:
 - timeseries_id=354, station_id=1575, pollutant=pm25
@@ -1508,27 +1487,25 @@ The LIVE plan must be conservative.
 
 Requirements:
 1. Build LIVE v2 alongside LIVE v1.
-2. Build/refresh LIVE core v2 using the existing core snapshot writer with
-   `UK_AQ_R2_HISTORY_CORE_PREFIX=history/v2/core`.
-3. Do not delete LIVE v1 during initial rollout.
-4. Confirm LIVE v2 object inventory before switching.
-5. Confirm LIVE `_index_v2`.
-6. Deploy Worker code that supports v1/v2 read switch but keep LIVE on v1 initially.
-7. Validate LIVE v2 with manual/API tests.
-8. Switch LIVE read version to v2.
-9. Soak test.
-10. Switch LIVE write version to v2.
-11. Keep rollback instructions:
+2. Do not delete LIVE v1 during initial rollout.
+3. Confirm LIVE v2 object inventory before switching.
+4. Confirm LIVE `_index_v2`.
+5. Deploy Worker code that supports v1/v2 read switch but keep LIVE on v1 initially.
+6. Validate LIVE v2 with manual/API tests.
+7. Switch LIVE read version to v2.
+8. Soak test.
+9. Switch LIVE write version to v2.
+10. Keep rollback instructions:
     - set `UK_AQ_R2_HISTORY_READ_VERSION=v1`
     - optionally set `UK_AQ_R2_HISTORY_WRITE_VERSION=v1`
-12. Include monitoring:
+11. Include monitoring:
     - Cloudflare 1102/503
     - R2 Class A/B
     - storage size
     - chart debug logs
     - AQI band gaps
-13. Include criteria for deleting v1 later.
-14. Include criteria for removing legacy v1 code later.
+12. Include criteria for deleting v1 later.
+13. Include criteria for removing legacy v1 code later.
 
 Do not implement anything. Documentation only.
 ```

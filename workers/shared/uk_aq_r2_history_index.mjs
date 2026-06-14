@@ -279,26 +279,15 @@ export function filterIsoDaysByLookback(
   return out;
 }
 
-function resolveDeployEnv(env) {
-  return String(env.UK_AQ_DEPLOY_ENV || env.DEPLOY_ENV || "dev").trim().toLowerCase() || "dev";
-}
-
-export function resolveR2Bucket(env = defaultEnv(), deployEnv = resolveDeployEnv(env)) {
+export function resolveR2Bucket(env = defaultEnv()) {
   const explicitBucket = String(env.R2_BUCKET || env.CFLARE_R2_BUCKET || "").trim();
   if (explicitBucket) {
     return explicitBucket;
   }
-  if (deployEnv === "prod" || deployEnv === "production") {
-    return String(env.R2_BUCKET_PROD || "").trim();
-  }
-  if (deployEnv === "stage" || deployEnv === "staging") {
-    return String(env.R2_BUCKET_STAGE || "").trim();
-  }
-  return String(env.R2_BUCKET_DEV || "").trim();
+  return "";
 }
 
 export function resolveR2HistoryIndexConfig(env = defaultEnv()) {
-  const deployEnv = resolveDeployEnv(env);
   const indexPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_INDEX_PREFIX || DEFAULT_R2_HISTORY_INDEX_PREFIX,
   );
@@ -306,10 +295,9 @@ export function resolveR2HistoryIndexConfig(env = defaultEnv()) {
     env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX,
   );
   return {
-    deploy_env: deployEnv,
     r2: {
       endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
-      bucket: resolveR2Bucket(env, deployEnv),
+      bucket: resolveR2Bucket(env),
       region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
       access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
       secret_access_key: String(

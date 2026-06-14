@@ -9,82 +9,26 @@ import { joinTargetPath, rcloneCatMaybe } from "./rclone.mjs";
 export const INVENTORY_SCHEMA_VERSION = 1;
 export const INVENTORY_KIND = "uk_aq_r2_history_backup_inventory";
 
-export const BACKUP_VERSION_VALUES = Object.freeze(["v1", "v2"]);
-export const V1_DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "core"]);
-export const V2_DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "aqilevels_debug", "core"]);
-export const DOMAIN_NAMES = Object.freeze([...new Set([...V1_DOMAIN_NAMES, ...V2_DOMAIN_NAMES])]);
-export const V1_INDEX_FILE_KEYS = Object.freeze([
+export const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "core"]);
+export const INDEX_FILE_KEYS = Object.freeze([
   "observations_latest",
   "aqilevels_latest",
   "observations_timeseries_latest",
   "aqilevels_timeseries_latest",
-]);
-export const V2_INDEX_FILE_KEYS = Object.freeze([
   "observations_timeseries_v2_latest",
   "aqilevels_hourly_data_timeseries_v2_latest",
 ]);
-export const INDEX_FILE_KEYS = Object.freeze([...V1_INDEX_FILE_KEYS, ...V2_INDEX_FILE_KEYS]);
-export const V1_INDEX_TREE_KEYS = Object.freeze([
+export const INDEX_TREE_KEYS = Object.freeze([
   "observations_timeseries",
   "aqilevels_timeseries",
-]);
-export const V2_INDEX_TREE_KEYS = Object.freeze([
   "observations_timeseries_v2",
   "aqilevels_hourly_data_timeseries_v2",
 ]);
-export const INDEX_TREE_KEYS = Object.freeze([...V1_INDEX_TREE_KEYS, ...V2_INDEX_TREE_KEYS]);
 export const COMMITTED_CONNECTOR_UNIT_KEYS = Object.freeze([
   "observations",
 ]);
 
-export const DEFAULT_V1_INVENTORY_REL_PATH = "history/_index/backup_inventory_v1.json";
-export const DEFAULT_V2_INVENTORY_REL_PATH = "history/_index_v2/backup_inventory_v2.json";
-export const DEFAULT_INVENTORY_REL_PATH = DEFAULT_V1_INVENTORY_REL_PATH;
-export const DEFAULT_V1_STATE_REL_PATH = "_ops/checkpoints/r2_history_backup_state_v1.json";
-export const DEFAULT_V2_STATE_REL_PATH = "_ops/checkpoints/r2_history_backup_state_v2.json";
-
-export function parseBackupVersion(raw, fallback = "v1") {
-  const value = String(raw || "").trim().toLowerCase();
-  if (BACKUP_VERSION_VALUES.includes(value)) return value;
-  const fallbackValue = String(fallback || "").trim().toLowerCase();
-  return BACKUP_VERSION_VALUES.includes(fallbackValue) ? fallbackValue : "v1";
-}
-
-export function resolveBackupVersion(env = process.env) {
-  const explicitBackupVersion = String(env.UK_AQ_R2_HISTORY_BACKUP_VERSION || "").trim();
-  if (explicitBackupVersion) return parseBackupVersion(explicitBackupVersion, "v1");
-  return parseBackupVersion(env.UK_AQ_R2_HISTORY_WRITE_VERSION, "v1");
-}
-
-export function defaultInventoryRelPathForBackupVersion(backupVersion) {
-  return parseBackupVersion(backupVersion) === "v2"
-    ? DEFAULT_V2_INVENTORY_REL_PATH
-    : DEFAULT_V1_INVENTORY_REL_PATH;
-}
-
-export function defaultStateRelPathForBackupVersion(backupVersion) {
-  return parseBackupVersion(backupVersion) === "v2"
-    ? DEFAULT_V2_STATE_REL_PATH
-    : DEFAULT_V1_STATE_REL_PATH;
-}
-
-export function domainNamesForBackupVersion(backupVersion) {
-  return parseBackupVersion(backupVersion) === "v2"
-    ? [...V2_DOMAIN_NAMES]
-    : [...V1_DOMAIN_NAMES];
-}
-
-export function indexFileKeysForBackupVersion(backupVersion) {
-  return parseBackupVersion(backupVersion) === "v2"
-    ? [...V2_INDEX_FILE_KEYS]
-    : [...V1_INDEX_FILE_KEYS];
-}
-
-export function indexTreeKeysForBackupVersion(backupVersion) {
-  return parseBackupVersion(backupVersion) === "v2"
-    ? [...V2_INDEX_TREE_KEYS]
-    : [...V1_INDEX_TREE_KEYS];
-}
+export const DEFAULT_INVENTORY_REL_PATH = "history/_index/backup_inventory_v1.json";
 
 // Pure validator for an `rcloneCatMaybe`-shaped result. Extracted from
 // loadInventory so unit tests can exercise the validation rules without

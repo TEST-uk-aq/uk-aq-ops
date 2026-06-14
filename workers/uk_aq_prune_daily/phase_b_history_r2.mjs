@@ -3373,24 +3373,15 @@ export function dayWindowFromNow(
   };
 }
 
-function resolveR2Bucket(env, deployEnv) {
+function resolveR2Bucket(env) {
   const explicitBucket = (env.R2_BUCKET || env.CFLARE_R2_BUCKET || "").trim();
   if (explicitBucket) {
     return explicitBucket;
   }
-
-  const normalized = String(deployEnv || "dev").trim().toLowerCase();
-  if (normalized === "prod" || normalized === "production") {
-    return (env.R2_BUCKET_PROD || "").trim();
-  }
-  if (normalized === "stage" || normalized === "staging") {
-    return (env.R2_BUCKET_STAGE || "").trim();
-  }
-  return (env.R2_BUCKET_DEV || "").trim();
+  return "";
 }
 
 export function resolvePhaseBRuntimeConfig(env = process.env) {
-  const deployEnv = String(env.UK_AQ_DEPLOY_ENV || env.DEPLOY_ENV || "dev").trim().toLowerCase() || "dev";
   const stagingBasePrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_STAGING_PREFIX || DEFAULT_STAGING_PREFIX,
   );
@@ -3427,12 +3418,11 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   );
 
   return {
-    deploy_env: deployEnv,
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
     supabase_db_url: String(env.SUPABASE_DB_URL || env.DATABASE_URL || "").trim(),
     r2: {
       endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
-      bucket: resolveR2Bucket(env, deployEnv),
+      bucket: resolveR2Bucket(env),
       region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
       access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
       secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
@@ -3600,7 +3590,6 @@ export async function runPhaseBBackup({
     row_group_size: runtime.row_group_size,
     observations_row_group_size: runtime.observations_row_group_size,
     aqilevels_row_group_size: runtime.aqilevels_row_group_size,
-    deploy_env: runtime.deploy_env,
     r2_bucket: runtime.r2.bucket,
     observations_prefix: runtime.committed_prefix,
     aqilevels_prefix: runtime.aqilevels_prefix,

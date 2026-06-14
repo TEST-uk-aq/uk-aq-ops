@@ -59,7 +59,7 @@ EXCLUDES=(
   --exclude='workers/worker_error_logs/'
 
   # Scripts that reference test-specific paths
-  --exclude='scripts/sync_to_live.sh'
+  --exclude='sync_to_live.sh'
 
   --exclude='.github/workflows/supabase_edge_deploy.yml'
   --exclude='system_docs/uk_aq_edge_functions.md'

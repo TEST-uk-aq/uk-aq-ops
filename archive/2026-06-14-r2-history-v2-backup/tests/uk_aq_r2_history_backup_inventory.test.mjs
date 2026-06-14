@@ -15,23 +15,15 @@ import {
   planIndexTreeUnits,
 } from "../scripts/backup_r2/sync_history_to_dropbox.mjs";
 import {
-  defaultInventoryRelPathForBackupVersion,
-  defaultStateRelPathForBackupVersion,
-  domainNamesForBackupVersion,
   INVENTORY_KIND,
   INVENTORY_SCHEMA_VERSION,
-  indexFileKeysForBackupVersion,
-  indexTreeKeysForBackupVersion,
-  resolveBackupVersion,
   validateInventoryPayload,
 } from "../scripts/backup_r2/lib/inventory.mjs";
 
-function makeInventory({ backupVersion = "v1", days = {}, indexFiles = {}, indexTreeUnits = {} } = {}) {
+function makeInventory({ days = {}, indexFiles = {}, indexTreeUnits = {} } = {}) {
   const tree = {
     observations_timeseries: { units: {} },
     aqilevels_timeseries: { units: {} },
-    observations_timeseries_v2: { units: {} },
-    aqilevels_hourly_data_timeseries_v2: { units: {} },
   };
   for (const [key, units] of Object.entries(indexTreeUnits)) {
     tree[key] = { units };
@@ -39,7 +31,6 @@ function makeInventory({ backupVersion = "v1", days = {}, indexFiles = {}, index
   return {
     version: INVENTORY_SCHEMA_VERSION,
     kind: INVENTORY_KIND,
-    backup_version: backupVersion,
     generated_at: "2026-05-15T00:00:00.000Z",
     source: { index_prefix: "history/_index", domain_prefixes: {} },
     domains: {
@@ -62,8 +53,6 @@ function makeCheckpoint({ days = {}, indexFiles = {}, indexTreeUnits = {} } = {}
   const tree = {
     observations_timeseries: { units: {} },
     aqilevels_timeseries: { units: {} },
-    observations_timeseries_v2: { units: {} },
-    aqilevels_hourly_data_timeseries_v2: { units: {} },
   };
   for (const [key, units] of Object.entries(indexTreeUnits)) {
     tree[key] = { units };
@@ -240,7 +229,6 @@ test("planIndexTreeUnits: unchanged unit skipped, changed unit queued", () => {
 
 test("planIndexFiles and planIndexTreeUnits include v2 pollutant index keys", () => {
   const inventory = makeInventory({
-    backupVersion: "v2",
     indexFiles: {
       observations_timeseries_v2_latest: {
         unit_type: "file",
@@ -263,12 +251,8 @@ test("planIndexFiles and planIndexTreeUnits include v2 pollutant index keys", ()
   });
   const state = makeCheckpoint({});
 
-  const fileCandidates = planIndexFiles(inventory, state, {
-    indexFileKeys: indexFileKeysForBackupVersion("v2"),
-  });
-  const treeCandidates = planIndexTreeUnits(inventory, state, {
-    indexTreeKeys: indexTreeKeysForBackupVersion("v2"),
-  });
+  const fileCandidates = planIndexFiles(inventory, state);
+  const treeCandidates = planIndexTreeUnits(inventory, state);
 
   assert.equal(fileCandidates.length, 1);
   assert.equal(fileCandidates[0].index_key, "observations_timeseries_v2_latest");
@@ -277,61 +261,6 @@ test("planIndexFiles and planIndexTreeUnits include v2 pollutant index keys", ()
   assert.equal(
     treeCandidates[0].unit_key,
     "day_utc=2026-05-10/connector_id=6/pollutant_code=pm25/manifest.json",
-  );
-});
-
-// ----- backup version selection -----
-
-test("backup version defaults to v1 paths when write and backup vars are unset", () => {
-  assert.equal(resolveBackupVersion({}), "v1");
-  assert.equal(
-    defaultInventoryRelPathForBackupVersion("v1"),
-    "history/_index/backup_inventory_v1.json",
-  );
-  assert.equal(
-    defaultStateRelPathForBackupVersion("v1"),
-    "_ops/checkpoints/r2_history_backup_state_v1.json",
-  );
-  assert.deepEqual(domainNamesForBackupVersion("v1"), ["observations", "aqilevels", "core"]);
-});
-
-test("backup version follows write version when backup override is unset", () => {
-  const env = { UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" };
-  assert.equal(resolveBackupVersion(env), "v2");
-  assert.equal(
-    defaultInventoryRelPathForBackupVersion(resolveBackupVersion(env)),
-    "history/_index_v2/backup_inventory_v2.json",
-  );
-  assert.equal(
-    defaultStateRelPathForBackupVersion(resolveBackupVersion(env)),
-    "_ops/checkpoints/r2_history_backup_state_v2.json",
-  );
-  assert.deepEqual(
-    domainNamesForBackupVersion("v2"),
-    ["observations", "aqilevels", "aqilevels_debug", "core"],
-  );
-});
-
-test("backup version override can pin v1 while write version is v2", () => {
-  const env = {
-    UK_AQ_R2_HISTORY_WRITE_VERSION: "v2",
-    UK_AQ_R2_HISTORY_BACKUP_VERSION: "v1",
-  };
-  assert.equal(resolveBackupVersion(env), "v1");
-  assert.equal(
-    defaultInventoryRelPathForBackupVersion(resolveBackupVersion(env)),
-    "history/_index/backup_inventory_v1.json",
-  );
-  assert.equal(
-    defaultStateRelPathForBackupVersion(resolveBackupVersion(env)),
-    "_ops/checkpoints/r2_history_backup_state_v1.json",
-  );
-});
-
-test("v1 and v2 backup checkpoint paths are separate", () => {
-  assert.notEqual(
-    defaultStateRelPathForBackupVersion("v1"),
-    defaultStateRelPathForBackupVersion("v2"),
   );
 });
 

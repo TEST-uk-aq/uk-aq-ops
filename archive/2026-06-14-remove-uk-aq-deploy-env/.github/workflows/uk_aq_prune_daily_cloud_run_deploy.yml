@@ -57,6 +57,7 @@ jobs:
       REPAIR_BUCKET_OUTBOX_CHUNK_SIZE: ${{ vars.INGESTDB_PRUNE_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE || '1000' }}
       FLUSH_CLAIM_BATCH_LIMIT: ${{ vars.INGESTDB_PRUNE_FLUSH_CLAIM_BATCH_LIMIT || '20' }}
       MAX_FLUSH_BATCHES: ${{ vars.INGESTDB_PRUNE_MAX_FLUSH_BATCHES || '30' }}
+      UK_AQ_DEPLOY_ENV: ${{ vars.UK_AQ_DEPLOY_ENV || 'dev' }}
       UK_AQ_R2_HISTORY_PHASE_B_ENABLED: ${{ vars.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || 'true' }}
       UK_AQ_R2_HISTORY_PART_MAX_ROWS: ${{ vars.UK_AQ_R2_HISTORY_PART_MAX_ROWS || '1000000' }}
       UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS: ${{ vars.UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS || '20000' }}
@@ -72,6 +73,9 @@ jobs:
       UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR || 'prune_r2_check' }}
       UK_AQ_CHART_METRICS_RETENTION_DAYS: ${{ vars.UK_AQ_CHART_METRICS_RETENTION_DAYS || '90' }}
       UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS: ${{ vars.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS || '7' }}
+      R2_BUCKET_PROD: ${{ vars.R2_BUCKET_PROD || '' }}
+      R2_BUCKET_STAGE: ${{ vars.R2_BUCKET_STAGE || '' }}
+      R2_BUCKET_DEV: ${{ vars.R2_BUCKET_DEV || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
@@ -122,8 +126,8 @@ jobs:
               echo "Missing required repo variable: CFLARE_R2_ENDPOINT (Phase B backup enabled)."
               exit 1
             fi
-            if [ -z "${CFLARE_R2_BUCKET:-}" ]; then
-              echo "Missing required repo variable: CFLARE_R2_BUCKET (Phase B backup enabled)."
+            if [ -z "${R2_BUCKET_PROD:-}" ] && [ -z "${R2_BUCKET_STAGE:-}" ] && [ -z "${R2_BUCKET_DEV:-}" ] && [ -z "${CFLARE_R2_BUCKET:-}" ]; then
+              echo "Missing R2 bucket mapping (set R2_BUCKET_PROD/STAGE/DEV or CFLARE_R2_BUCKET)."
               exit 1
             fi
           fi
@@ -310,6 +314,7 @@ jobs:
           env_updates+=("REPAIR_BUCKET_OUTBOX_CHUNK_SIZE=${REPAIR_BUCKET_OUTBOX_CHUNK_SIZE}")
           env_updates+=("FLUSH_CLAIM_BATCH_LIMIT=${FLUSH_CLAIM_BATCH_LIMIT}")
           env_updates+=("MAX_FLUSH_BATCHES=${MAX_FLUSH_BATCHES}")
+          env_updates+=("UK_AQ_DEPLOY_ENV=${UK_AQ_DEPLOY_ENV}")
           env_updates+=("UK_AQ_R2_HISTORY_PHASE_B_ENABLED=${UK_AQ_R2_HISTORY_PHASE_B_ENABLED}")
           env_updates+=("UK_AQ_R2_HISTORY_PART_MAX_ROWS=${UK_AQ_R2_HISTORY_PART_MAX_ROWS}")
           env_updates+=("UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS=${UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS}")
@@ -327,7 +332,18 @@ jobs:
           env_updates+=("UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS=${UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS}")
           env_updates+=("CFLARE_R2_ENDPOINT=${CFLARE_R2_ENDPOINT}")
           env_updates+=("CFLARE_R2_REGION=${CFLARE_R2_REGION}")
-          env_updates+=("CFLARE_R2_BUCKET=${CFLARE_R2_BUCKET}")
+          if [ -n "${R2_BUCKET_PROD:-}" ]; then
+            env_updates+=("R2_BUCKET_PROD=${R2_BUCKET_PROD}")
+          fi
+          if [ -n "${R2_BUCKET_STAGE:-}" ]; then
+            env_updates+=("R2_BUCKET_STAGE=${R2_BUCKET_STAGE}")
+          fi
+          if [ -n "${R2_BUCKET_DEV:-}" ]; then
+            env_updates+=("R2_BUCKET_DEV=${R2_BUCKET_DEV}")
+          fi
+          if [ -n "${CFLARE_R2_BUCKET:-}" ]; then
+            env_updates+=("CFLARE_R2_BUCKET=${CFLARE_R2_BUCKET}")
+          fi
           if [ -n "${UK_AQ_DROPBOX_ROOT:-}" ]; then
             env_updates+=("UK_AQ_DROPBOX_ROOT=${UK_AQ_DROPBOX_ROOT}")
           fi

@@ -108,17 +108,15 @@ test("normalizeR2HistoryIndexDomain filters to lookback window while preserving 
   assert.equal(normalized.total_rows, 50);
 });
 
-test("resolveR2HistoryIndexConfig uses deploy bucket mapping when explicit bucket is absent", () => {
+test("resolveR2HistoryIndexConfig uses the explicit R2 bucket", () => {
   const config = resolveR2HistoryIndexConfig({
-    UK_AQ_DEPLOY_ENV: "stage",
-    R2_BUCKET_STAGE: "uk-aq-history-stage",
+    CFLARE_R2_BUCKET: "uk-aq-history-cic-test",
     CFLARE_R2_ENDPOINT: "https://example.invalid",
     CFLARE_R2_ACCESS_KEY_ID: "key",
     CFLARE_R2_SECRET_ACCESS_KEY: "secret",
   });
 
-  assert.equal(config.deploy_env, "stage");
-  assert.equal(config.r2.bucket, "uk-aq-history-stage");
+  assert.equal(config.r2.bucket, "uk-aq-history-cic-test");
   assert.equal(config.index_prefix, "history/_index");
   assert.equal(
     config.observations_timeseries_index_prefix,
@@ -201,8 +199,7 @@ test("observations timeseries index keys follow expected history/_index layout",
 
 test("resolveR2HistoryIndexConfig exposes v2 data and _index_v2 defaults separately from v1", () => {
   const config = resolveR2HistoryIndexConfig({
-    UK_AQ_DEPLOY_ENV: "dev",
-    R2_BUCKET_DEV: "uk-aq-history-dev",
+    CFLARE_R2_BUCKET: "uk-aq-history-cic-test",
     CFLARE_R2_ENDPOINT: "https://example.invalid",
     CFLARE_R2_ACCESS_KEY_ID: "key",
     CFLARE_R2_SECRET_ACCESS_KEY: "secret",

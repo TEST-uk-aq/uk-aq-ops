@@ -36,7 +36,7 @@ function usage() {
     "  CFLARE_R2_REGION / R2_REGION",
     "  CFLARE_R2_ACCESS_KEY_ID / R2_ACCESS_KEY_ID",
     "  CFLARE_R2_SECRET_ACCESS_KEY / R2_SECRET_ACCESS_KEY",
-    "  R2 bucket via CFLARE_R2_BUCKET / R2_BUCKET",
+    "  R2 bucket mapping via CFLARE_R2_BUCKET / R2_BUCKET or R2_BUCKET_DEV/STAGE/PROD",
     "",
     "Optional env:",
     "  UK_AQ_R2_HISTORY_INDEX_VERSION         default: v1",

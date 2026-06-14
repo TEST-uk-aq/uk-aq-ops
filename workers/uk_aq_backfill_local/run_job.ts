@@ -674,10 +674,6 @@ function parseHistoryWriteVersion(raw: string | undefined): "v1" | "v2" {
   throw new Error(`Invalid UK_AQ_R2_HISTORY_WRITE_VERSION=${String(raw)}; expected v1 or v2`);
 }
 
-const OBS_R2_DEPLOY_ENV =
-  (Deno.env.get("UK_AQ_DEPLOY_ENV") || Deno.env.get("DEPLOY_ENV") || "dev")
-    .trim()
-    .toLowerCase();
 const OBS_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX") ||
     "history/v1/observations",
@@ -712,7 +708,7 @@ const OBS_R2_CONFIG = {
   endpoint:
     (Deno.env.get("CFLARE_R2_ENDPOINT") || Deno.env.get("R2_ENDPOINT") || "")
       .trim(),
-  bucket: resolveR2BucketByDeployEnv(),
+  bucket: resolveR2Bucket(),
   region:
     (Deno.env.get("CFLARE_R2_REGION") || Deno.env.get("R2_REGION") || "auto")
       .trim() || "auto",
@@ -1209,19 +1205,12 @@ function optionalEnvAny(names: string[]): string | null {
   return null;
 }
 
-function resolveR2BucketByDeployEnv(): string {
+function resolveR2Bucket(): string {
   const explicit = optionalEnvAny(["CFLARE_R2_BUCKET", "R2_BUCKET"]);
   if (explicit) {
     return explicit;
   }
-
-  if (OBS_R2_DEPLOY_ENV === "prod" || OBS_R2_DEPLOY_ENV === "production") {
-    return optionalEnv("R2_BUCKET_PROD") || "";
-  }
-  if (OBS_R2_DEPLOY_ENV === "stage" || OBS_R2_DEPLOY_ENV === "staging") {
-    return optionalEnv("R2_BUCKET_STAGE") || "";
-  }
-  return optionalEnv("R2_BUCKET_DEV") || "";
+  return "";
 }
 
 function normalizeRestUrl(baseUrl: string): string {
