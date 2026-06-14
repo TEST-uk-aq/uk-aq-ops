@@ -678,7 +678,12 @@ async function runBuild(args) {
   const bindings = loadCoreTimeseriesBindings({
     dropboxRoot,
     corePrefix: args.corePrefix,
-    maxDayUtc: args.toDay || "",
+    // Use the newest available core snapshot. Core timeseries metadata is used
+    // as lookup/reference data for v2 observation partitioning, and CIC-Test only
+    // has local core snapshots back to 2026-03-13. Restricting this to args.toDay
+    // makes older observation rebuilds fail even though the latest core snapshot
+    // has the required timeseries bindings.
+    maxDayUtc: "",
   });
   const targets = findObservationTargets({
     dropboxRoot,
