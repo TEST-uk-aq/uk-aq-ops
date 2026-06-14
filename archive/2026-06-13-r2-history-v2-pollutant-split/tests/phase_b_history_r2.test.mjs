@@ -4,26 +4,15 @@ import * as arrow from "apache-arrow";
 import * as parquetWasm from "parquet-wasm/esm";
 import {
   HISTORY_AQILEVELS_COLUMNS,
-  HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2,
-  HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2,
-  HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
   HISTORY_OBSERVATIONS_COLUMNS_V2,
-  buildHistoryV2ConnectorManifestForTest,
-  buildHistoryV2DayManifestForTest,
-  buildHistoryV2PartKey,
-  buildHistoryV2PollutantManifestForTest,
   buildAqilevelConnectorManifestForTest,
   buildAqilevelDayManifestForTest,
   buildConnectorManifestForTest,
   computeDayGateState,
-  defaultHistoryV2PrefixesForTest,
   dayWindowFromNow,
   normalizeAqilevelHistoryRowForTest,
-  rowsToAqilevelDataV2ParquetBufferForTest,
-  rowsToAqilevelDebugV2ParquetBufferForTest,
   resolvePhaseBRuntimeConfig,
   rowsToAqilevelParquetBufferForTest,
-  rowsToObservationV2ParquetBufferForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 test("connector manifest includes expected Phase B fields", () => {
@@ -92,44 +81,10 @@ test("runtime config includes AQI levels prefix defaults", () => {
   const config = resolvePhaseBRuntimeConfig({});
   assert.equal(config.committed_prefix, "history/v1/observations");
   assert.equal(config.aqilevels_prefix, "history/v1/aqilevels/hourly");
-  assert.equal(config.history_write_version, "v1");
-  assert.equal(config.committed_prefix_v2, "history/v2/observations");
-  assert.equal(config.aqilevels_hourly_data_prefix_v2, "history/v2/aqilevels/hourly/data");
-  assert.equal(config.aqilevels_hourly_debug_prefix_v2, "history/v2/aqilevels/hourly/debug");
   assert.equal(config.observations_part_max_rows, 500000);
   assert.equal(config.observations_row_group_size, 50000);
   assert.equal(config.aqilevels_part_max_rows, 1000000);
   assert.equal(config.aqilevels_row_group_size, 100000);
-});
-
-test("runtime config accepts explicit R2 history v2 write prefixes", () => {
-  const config = resolvePhaseBRuntimeConfig({
-    UK_AQ_R2_HISTORY_WRITE_VERSION: "v2",
-    UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: "custom/v2/observations",
-    UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: "custom/v2/aqi/data",
-    UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX: "custom/v2/aqi/debug",
-  });
-  assert.equal(config.history_write_version, "v2");
-  assert.equal(config.committed_prefix_v2, "custom/v2/observations");
-  assert.equal(config.aqilevels_hourly_data_prefix_v2, "custom/v2/aqi/data");
-  assert.equal(config.aqilevels_hourly_debug_prefix_v2, "custom/v2/aqi/debug");
-});
-
-test("R2 history v2 path builders use pollutant partitions", () => {
-  const prefixes = defaultHistoryV2PrefixesForTest();
-  assert.deepEqual(prefixes, {
-    observations: "history/v2/observations",
-    aqilevels_hourly_data: "history/v2/aqilevels/hourly/data",
-    aqilevels_hourly_debug: "history/v2/aqilevels/hourly/debug",
-  });
-  assert.equal(
-    buildHistoryV2PartKey(prefixes.observations, "2026-04-30", 9, "pm25", 0),
-    "history/v2/observations/day_utc=2026-04-30/connector_id=9/pollutant_code=pm25/part-00000.parquet",
-  );
-  assert.equal(
-    buildHistoryV2PartKey(prefixes.aqilevels_hourly_data, "2026-04-30", 9, "PM25", 12),
-    "history/v2/aqilevels/hourly/data/day_utc=2026-04-30/connector_id=9/pollutant_code=pm25/part-00012.parquet",
-  );
 });
 
 test("runtime config supports domain-specific parquet geometry overrides", () => {
@@ -297,76 +252,6 @@ test("AQI day manifest aggregates hourly connector manifests", () => {
   assert.deepEqual(manifest.files[1].pollutant_codes, ["no2", "pm10"]);
 });
 
-test("R2 history v2 manifests expose day connector and pollutant hierarchy", () => {
-  const pollutantManifest = buildHistoryV2PollutantManifestForTest({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: "data",
-    dayUtc: "2026-04-30",
-    connectorId: 9,
-    pollutantCode: "pm25",
-    runId: "v2-run-123",
-    manifestKey: "history/v2/aqilevels/hourly/data/day_utc=2026-04-30/connector_id=9/pollutant_code=pm25/manifest.json",
-    sourceRowCount: 2,
-    fileEntries: [
-      {
-        key: "history/v2/aqilevels/hourly/data/day_utc=2026-04-30/connector_id=9/pollutant_code=pm25/part-00000.parquet",
-        bytes: 321,
-        row_count: 2,
-        etag_or_hash: "etag-v2",
-        min_timeseries_id: 354,
-        max_timeseries_id: 396,
-        min_timestamp_hour_utc: "2026-04-30T00:00:00.000Z",
-        max_timestamp_hour_utc: "2026-04-30T01:00:00.000Z",
-        timeseries_row_counts: { "354": 1, "396": 1 },
-      },
-    ],
-    writerGitSha: "abc123",
-    backedUpAtUtc: "2026-05-01T00:00:00.000Z",
-  });
-
-  assert.equal(pollutantManifest.history_version, "v2");
-  assert.equal(pollutantManifest.manifest_kind, "pollutant");
-  assert.equal(pollutantManifest.domain, "aqilevels");
-  assert.equal(pollutantManifest.grain, "hourly");
-  assert.equal(pollutantManifest.profile, "data");
-  assert.equal(pollutantManifest.pollutant_code, "pm25");
-  assert.deepEqual(pollutantManifest.columns, HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2);
-  assert.deepEqual(pollutantManifest.timeseries_row_counts, { "354": 1, "396": 1 });
-
-  const connectorManifest = buildHistoryV2ConnectorManifestForTest({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: "data",
-    dayUtc: "2026-04-30",
-    connectorId: 9,
-    runId: "v2-run-123",
-    manifestKey: "history/v2/aqilevels/hourly/data/day_utc=2026-04-30/connector_id=9/manifest.json",
-    pollutantManifests: [pollutantManifest],
-    writerGitSha: "abc123",
-    backedUpAtUtc: "2026-05-01T00:00:00.000Z",
-  });
-  assert.equal(connectorManifest.manifest_kind, "connector");
-  assert.deepEqual(connectorManifest.pollutant_codes, ["pm25"]);
-  assert.equal(connectorManifest.child_manifests[0].manifest_key, pollutantManifest.manifest_key);
-
-  const dayManifest = buildHistoryV2DayManifestForTest({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: "data",
-    dayUtc: "2026-04-30",
-    runId: "v2-run-123",
-    manifestKey: "history/v2/aqilevels/hourly/data/day_utc=2026-04-30/manifest.json",
-    connectorManifests: [connectorManifest],
-    writerGitSha: "abc123",
-    backedUpAtUtc: "2026-05-01T00:00:00.000Z",
-  });
-  assert.equal(dayManifest.manifest_kind, "day");
-  assert.deepEqual(dayManifest.connector_ids, [9]);
-  assert.equal(dayManifest.connector_manifests[0].manifest_key, connectorManifest.manifest_key);
-  assert.equal(typeof dayManifest.manifest_hash, "string");
-});
-
 test("AQI history row parser preserves the normalized hourly shape", () => {
   const parsed = normalizeAqilevelHistoryRowForTest({
     connector_id: "9",
@@ -474,66 +359,4 @@ test("AQI parquet writer preserves nullable text and timestamp column types", ()
   assert.equal(fields.get("algorithm_version"), "Utf8");
   assert.match(fields.get("computed_at_utc"), /^Timestamp/);
   assert.match(fields.get("updated_at"), /^Timestamp/);
-});
-
-test("R2 history v2 parquet writers emit compact observation and AQI schemas", () => {
-  const observationBuffer = rowsToObservationV2ParquetBufferForTest([
-    {
-      connector_id: 9,
-      station_id: 1575,
-      timeseries_id: 354,
-      pollutant_code: "pm25",
-      observed_at_utc: "2026-04-30T00:00:00.000Z",
-      value: 12.3,
-    },
-  ]);
-  const observationTable = arrow.tableFromIPC(
-    parquetWasm.readParquet(new Uint8Array(observationBuffer)).intoIPCStream(),
-  );
-  assert.deepEqual(
-    observationTable.schema.fields.map((field) => field.name),
-    HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
-  );
-
-  const aqiRow = {
-    connector_id: 9,
-    station_id: 1575,
-    timeseries_id: 354,
-    pollutant_code: "pm25",
-    timestamp_hour_utc: "2026-04-30T10:00:00.000Z",
-    daqi_input_value_ugm3: 12.3,
-    daqi_input_averaging_code: "rolling_24h_mean",
-    daqi_index_level: 4,
-    daqi_source_observation_count: 24,
-    daqi_required_observation_count: 24,
-    daqi_calculation_status: "ok",
-    daqi_missing_reason: null,
-    eaqi_input_value_ugm3: 11.2,
-    eaqi_input_averaging_code: "hourly_mean",
-    eaqi_index_level: 3,
-    eaqi_source_observation_count: 1,
-    eaqi_required_observation_count: 1,
-    eaqi_calculation_status: "ok",
-    eaqi_missing_reason: null,
-    hourly_sample_count: 24,
-    algorithm_version: "aqilevels_hourly_v1",
-    computed_at_utc: "2026-04-30T10:05:00.000Z",
-  };
-
-  const dataTable = arrow.tableFromIPC(
-    parquetWasm.readParquet(new Uint8Array(rowsToAqilevelDataV2ParquetBufferForTest([aqiRow]))).intoIPCStream(),
-  );
-  assert.deepEqual(
-    dataTable.schema.fields.map((field) => field.name),
-    HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2,
-  );
-
-  const debugTable = arrow.tableFromIPC(
-    parquetWasm.readParquet(new Uint8Array(rowsToAqilevelDebugV2ParquetBufferForTest([aqiRow]))).intoIPCStream(),
-  );
-  const debugFields = debugTable.schema.fields.map((field) => field.name);
-  assert.deepEqual(debugFields, HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2);
-  assert.equal(debugFields.includes("hourly_mean_ugm3"), false);
-  assert.equal(debugFields.includes("pm25_rolling24h_mean_ugm3"), false);
-  assert.equal(debugFields.includes("updated_at"), false);
 });

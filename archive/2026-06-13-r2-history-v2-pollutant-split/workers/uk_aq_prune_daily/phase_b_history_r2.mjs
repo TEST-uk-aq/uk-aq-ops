@@ -63,14 +63,6 @@ export const HISTORY_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
   "value",
 ]);
 const HISTORY_OBSERVATIONS_COLUMNS = HISTORY_OBSERVATIONS_COLUMNS_V2;
-export const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "observed_at_utc",
-  "value",
-]);
 export const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "connector_id",
   "station_id",
@@ -109,48 +101,6 @@ export const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "eaqi_pm10_index_level",
   "updated_at",
 ]);
-export const HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "timestamp_hour_utc",
-  "daqi_index_level",
-  "eaqi_index_level",
-  "daqi_calculation_status",
-  "daqi_missing_reason",
-  "eaqi_calculation_status",
-  "eaqi_missing_reason",
-]);
-export const HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "timestamp_hour_utc",
-  "daqi_input_value_ugm3",
-  "daqi_input_averaging_code",
-  "daqi_index_level",
-  "daqi_source_observation_count",
-  "daqi_required_observation_count",
-  "daqi_calculation_status",
-  "daqi_missing_reason",
-  "eaqi_input_value_ugm3",
-  "eaqi_input_averaging_code",
-  "eaqi_index_level",
-  "eaqi_source_observation_count",
-  "eaqi_required_observation_count",
-  "eaqi_calculation_status",
-  "eaqi_missing_reason",
-  "hourly_sample_count",
-  "algorithm_version",
-  "computed_at_utc",
-]);
-const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
-const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
-const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
-const HISTORY_R2_V2_SCHEMA_VERSION = 2;
-const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
 
 let parquetWasmInitialized = false;
 
@@ -196,14 +146,6 @@ function parseBoolean(raw, fallback) {
     return false;
   }
   return fallback;
-}
-
-function parseHistoryWriteVersion(raw) {
-  const value = String(raw || "v1").trim().toLowerCase();
-  if (value === "v1" || value === "v2") {
-    return value;
-  }
-  throw new Error(`Invalid UK_AQ_R2_HISTORY_WRITE_VERSION=${String(raw)}; expected v1 or v2`);
 }
 
 function parseBigInt(value, fieldName) {
@@ -515,42 +457,6 @@ function buildRunManifestKey(runsPrefix, runId) {
 
 function buildPartKey(prefix, dayUtc, connectorId, partIndex) {
   return `${connectorPrefix(prefix, dayUtc, connectorId)}/part-${String(partIndex).padStart(5, "0")}.parquet`;
-}
-
-function normalizePollutantCodeForPath(pollutantCode) {
-  const value = String(pollutantCode || "").trim().toLowerCase();
-  if (!/^[a-z0-9_]+$/.test(value)) {
-    throw new Error(`Invalid pollutant_code for R2 path: ${String(pollutantCode || "")}`);
-  }
-  return value;
-}
-
-function pollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode) {
-  return `${connectorPrefix(basePrefix, dayUtc, connectorId)}/pollutant_code=${normalizePollutantCodeForPath(pollutantCode)}`;
-}
-
-export function buildHistoryV2PollutantManifestKey(basePrefix, dayUtc, connectorId, pollutantCode) {
-  return `${pollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/manifest.json`;
-}
-
-export function buildHistoryV2PartKey(basePrefix, dayUtc, connectorId, pollutantCode, partIndex) {
-  return `${pollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/part-${String(partIndex).padStart(5, "0")}.parquet`;
-}
-
-export function buildHistoryV2ConnectorManifestKey(basePrefix, dayUtc, connectorId) {
-  return buildConnectorManifestKey(basePrefix, dayUtc, connectorId);
-}
-
-export function buildHistoryV2DayManifestKey(basePrefix, dayUtc) {
-  return buildDayManifestKey(basePrefix, dayUtc);
-}
-
-export function defaultHistoryV2PrefixesForTest() {
-  return {
-    observations: HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-    aqilevels_hourly_data: HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
-    aqilevels_hourly_debug: HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
-  };
 }
 
 function toPgConnectionConfig(connectionString) {
@@ -1465,261 +1371,6 @@ export function buildAqilevelDayManifestForTest(args) {
   return createAqilevelDayManifest(args);
 }
 
-function historyV2ColumnsFor(domain, profile = null) {
-  if (domain === "observations") {
-    return HISTORY_OBSERVATIONS_COLUMNS_R2_V2;
-  }
-  if (domain === "aqilevels" && profile === "data") {
-    return HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2;
-  }
-  if (domain === "aqilevels" && profile === "debug") {
-    return HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2;
-  }
-  throw new Error(`Unsupported R2 history v2 schema: domain=${domain} profile=${profile || "null"}`);
-}
-
-function minEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => minIso(current, entry?.[fieldName] || null), null);
-}
-
-function maxEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => maxIso(current, entry?.[fieldName] || null), null);
-}
-
-function minNumericEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => {
-    const value = Number(entry?.[fieldName]);
-    if (!Number.isFinite(value) || value <= 0) return current;
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.min(current, normalized);
-  }, null);
-}
-
-function maxNumericEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => {
-    const value = Number(entry?.[fieldName]);
-    if (!Number.isFinite(value) || value <= 0) return current;
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.max(current, normalized);
-  }, null);
-}
-
-function createHistoryV2PollutantManifest({
-  domain,
-  grain = null,
-  profile = null,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-  runId = null,
-  manifestKey,
-  sourceRowCount,
-  fileEntries,
-  writerGitSha,
-  backedUpAtUtc,
-}) {
-  const normalizedPollutantCode = normalizePollutantCodeForPath(pollutantCode);
-  const files = (Array.isArray(fileEntries) ? fileEntries : []).map((entry) => ({
-    ...entry,
-    pollutant_code: normalizedPollutantCode,
-  }));
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const minObservedAtUtc = minEntryValue(files, "min_observed_at_utc") || minEntryValue(files, "min_observed_at");
-  const maxObservedAtUtc = maxEntryValue(files, "max_observed_at_utc") || maxEntryValue(files, "max_observed_at");
-  const minTimestampHourUtc = minEntryValue(files, "min_timestamp_hour_utc");
-  const maxTimestampHourUtc = maxEntryValue(files, "max_timestamp_hour_utc");
-  const payload = {
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "pollutant",
-    domain,
-    grain,
-    profile,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_code: normalizedPollutantCode,
-    pollutant_codes: [normalizedPollutantCode],
-    run_id: runId,
-    manifest_key: manifestKey,
-    source_row_count: Number(sourceRowCount),
-    row_count: Number(sourceRowCount),
-    min_timeseries_id: minNumericEntryValue(files, "min_timeseries_id"),
-    max_timeseries_id: maxNumericEntryValue(files, "max_timeseries_id"),
-    min_observed_at_utc: minObservedAtUtc,
-    max_observed_at_utc: maxObservedAtUtc,
-    min_timestamp_hour_utc: minTimestampHourUtc,
-    max_timestamp_hour_utc: maxTimestampHourUtc,
-    parquet_object_keys: uniqueSorted(files.map((entry) => entry.key)),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: [],
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    timeseries_row_counts: aggregateTimeseriesRowCounts(files),
-    ...statsFromFileEntries(files, Number(sourceRowCount)),
-    backed_up_at_utc: backedUpAtUtc,
-  };
-  return withManifestHash(payload);
-}
-
-function createHistoryV2ConnectorManifest({
-  domain,
-  grain = null,
-  profile = null,
-  dayUtc,
-  connectorId,
-  runId = null,
-  manifestKey,
-  pollutantManifests,
-  writerGitSha,
-  backedUpAtUtc,
-}) {
-  const manifests = Array.isArray(pollutantManifests) ? pollutantManifests : [];
-  const childManifests = manifests
-    .map((manifest) => ({
-      pollutant_code: manifest.pollutant_code,
-      manifest_key: manifest.manifest_key,
-      manifest_hash: manifest.manifest_hash,
-      source_row_count: manifest.source_row_count,
-      row_count: manifest.row_count,
-      file_count: manifest.file_count,
-      total_bytes: manifest.total_bytes,
-      min_timeseries_id: manifest.min_timeseries_id ?? null,
-      max_timeseries_id: manifest.max_timeseries_id ?? null,
-      min_observed_at_utc: manifest.min_observed_at_utc ?? null,
-      max_observed_at_utc: manifest.max_observed_at_utc ?? null,
-      min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-      max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-    }));
-  const files = manifests.flatMap((manifest) => Array.isArray(manifest.files) ? manifest.files : []);
-  const totalRows = manifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
-  const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
-  const pollutantCodes = uniqueSorted(manifests.map((manifest) => manifest.pollutant_code).filter(Boolean));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "connector",
-    domain,
-    grain,
-    profile,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: runId,
-    manifest_key: manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minNumericEntryValue(manifests, "min_timeseries_id"),
-    max_timeseries_id: maxNumericEntryValue(manifests, "max_timeseries_id"),
-    min_observed_at_utc: minEntryValue(manifests, "min_observed_at_utc"),
-    max_observed_at_utc: maxEntryValue(manifests, "max_observed_at_utc"),
-    min_timestamp_hour_utc: minEntryValue(manifests, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxEntryValue(manifests, "max_timestamp_hour_utc"),
-    parquet_object_keys: uniqueSorted(files.map((entry) => entry.key)),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    pollutant_manifests: childManifests,
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    timeseries_row_counts: aggregateTimeseriesRowCounts(manifests),
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: backedUpAtUtc,
-  });
-}
-
-function createHistoryV2DayManifest({
-  domain,
-  grain = null,
-  profile = null,
-  dayUtc,
-  runId = null,
-  manifestKey,
-  connectorManifests,
-  writerGitSha,
-  backedUpAtUtc,
-}) {
-  const manifests = Array.isArray(connectorManifests) ? connectorManifests : [];
-  const childManifests = manifests
-    .map((manifest) => ({
-      connector_id: manifest.connector_id,
-      manifest_key: manifest.manifest_key,
-      manifest_hash: manifest.manifest_hash,
-      source_row_count: manifest.source_row_count,
-      row_count: manifest.row_count,
-      file_count: manifest.file_count,
-      total_bytes: manifest.total_bytes,
-      pollutant_codes: Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : [],
-      min_timeseries_id: manifest.min_timeseries_id ?? null,
-      max_timeseries_id: manifest.max_timeseries_id ?? null,
-      min_observed_at_utc: manifest.min_observed_at_utc ?? null,
-      max_observed_at_utc: manifest.max_observed_at_utc ?? null,
-      min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-      max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-    }));
-  const files = manifests.flatMap((manifest) => Array.isArray(manifest.files) ? manifest.files : []);
-  const totalRows = manifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
-  const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
-  const connectorIds = manifests.map((manifest) => Number(manifest.connector_id)).filter((value) => Number.isInteger(value));
-  const pollutantCodes = uniqueSorted(manifests.flatMap((manifest) => (
-    Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : []
-  )));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "day",
-    domain,
-    grain,
-    profile,
-    day_utc: dayUtc,
-    connector_id: null,
-    connector_ids: connectorIds,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: runId,
-    manifest_key: manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minNumericEntryValue(manifests, "min_timeseries_id"),
-    max_timeseries_id: maxNumericEntryValue(manifests, "max_timeseries_id"),
-    min_observed_at_utc: minEntryValue(manifests, "min_observed_at_utc"),
-    max_observed_at_utc: maxEntryValue(manifests, "max_observed_at_utc"),
-    min_timestamp_hour_utc: minEntryValue(manifests, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxEntryValue(manifests, "max_timestamp_hour_utc"),
-    parquet_object_keys: uniqueSorted(files.map((entry) => entry.key)),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    connector_manifests: childManifests,
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: backedUpAtUtc,
-  });
-}
-
-export function buildHistoryV2PollutantManifestForTest(args) {
-  return createHistoryV2PollutantManifest(args);
-}
-
-export function buildHistoryV2ConnectorManifestForTest(args) {
-  return createHistoryV2ConnectorManifest(args);
-}
-
-export function buildHistoryV2DayManifestForTest(args) {
-  return createHistoryV2DayManifest(args);
-}
-
 const PARQUET_WRITER_PROPERTIES_CACHE = new Map();
 
 function parquetWriterProperties(rowGroupSize, createdBy = WRITER_VERSION) {
@@ -1812,118 +1463,6 @@ export function rowsToAqilevelParquetBufferForTest(rows) {
   return rowsToAqilevelParquetBuffer(
     rows,
     parquetWriterProperties(DEFAULT_AQILEVELS_ROW_GROUP_SIZE, HISTORY_AQILEVELS_WRITER_VERSION),
-  );
-}
-
-function rowsToObservationV2ParquetBuffer(rows, writerProperties) {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
-      row.station_id === null || row.station_id === undefined
-        ? null
-        : Number(row.station_id)
-    ))),
-    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at_utc || row.observed_at))),
-    value: rows.map((row) => (row.value === null || row.value === undefined ? null : Number(row.value))),
-  });
-
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
-  return Buffer.from(parquetBytes);
-}
-
-function rowsToAqilevelDataV2ParquetBuffer(rows, writerProperties) {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
-      row.station_id === null || row.station_id === undefined
-        ? null
-        : Number(row.station_id)
-    ))),
-    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_index_level))),
-    eaqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_index_level))),
-    daqi_calculation_status: textVector(rows.map((row) => toNullableText(row.daqi_calculation_status))),
-    daqi_missing_reason: textVector(rows.map((row) => toNullableText(row.daqi_missing_reason))),
-    eaqi_calculation_status: textVector(rows.map((row) => toNullableText(row.eaqi_calculation_status))),
-    eaqi_missing_reason: textVector(rows.map((row) => toNullableText(row.eaqi_missing_reason))),
-  });
-
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
-  return Buffer.from(parquetBytes);
-}
-
-function rowsToAqilevelDebugV2ParquetBuffer(rows, writerProperties) {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const float64Vector = (values) => arrow.vectorFromArray(values, new arrow.Float64());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
-      row.station_id === null || row.station_id === undefined
-        ? null
-        : Number(row.station_id)
-    ))),
-    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.daqi_input_value_ugm3))),
-    daqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.daqi_input_averaging_code))),
-    daqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_index_level))),
-    daqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_source_observation_count))),
-    daqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_required_observation_count))),
-    daqi_calculation_status: textVector(rows.map((row) => toNullableText(row.daqi_calculation_status))),
-    daqi_missing_reason: textVector(rows.map((row) => toNullableText(row.daqi_missing_reason))),
-    eaqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.eaqi_input_value_ugm3))),
-    eaqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.eaqi_input_averaging_code))),
-    eaqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_index_level))),
-    eaqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_source_observation_count))),
-    eaqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_required_observation_count))),
-    eaqi_calculation_status: textVector(rows.map((row) => toNullableText(row.eaqi_calculation_status))),
-    eaqi_missing_reason: textVector(rows.map((row) => toNullableText(row.eaqi_missing_reason))),
-    hourly_sample_count: int32Vector(rows.map((row) => toNullableInteger(row.hourly_sample_count))),
-    algorithm_version: textVector(rows.map((row) => toNullableText(row.algorithm_version))),
-    computed_at_utc: timestampVector(rows.map((row) => (row.computed_at_utc ? new Date(row.computed_at_utc) : null))),
-  });
-
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
-  return Buffer.from(parquetBytes);
-}
-
-export function rowsToObservationV2ParquetBufferForTest(rows) {
-  return rowsToObservationV2ParquetBuffer(
-    rows,
-    parquetWriterProperties(DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
-}
-
-export function rowsToAqilevelDataV2ParquetBufferForTest(rows) {
-  return rowsToAqilevelDataV2ParquetBuffer(
-    rows,
-    parquetWriterProperties(DEFAULT_AQILEVELS_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
-}
-
-export function rowsToAqilevelDebugV2ParquetBufferForTest(rows) {
-  return rowsToAqilevelDebugV2ParquetBuffer(
-    rows,
-    parquetWriterProperties(DEFAULT_AQILEVELS_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
   );
 }
 
@@ -3400,16 +2939,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   const aqilevelsPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_AQILEVELS_PREFIX,
   );
-  const historyWriteVersion = parseHistoryWriteVersion(env.UK_AQ_R2_HISTORY_WRITE_VERSION);
-  const committedPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-  );
-  const aqilevelsDataPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
-  );
-  const aqilevelsDebugPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
-  );
   const runsPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
   );
@@ -3490,10 +3019,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     staging_prefix_base: stagingBasePrefix,
     committed_prefix: committedPrefix,
     aqilevels_prefix: aqilevelsPrefix,
-    history_write_version: historyWriteVersion,
-    committed_prefix_v2: committedPrefixV2,
-    aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
-    aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
     runs_prefix: runsPrefix,
     adopt_existing_manifest_enabled: parseBoolean(
       env.UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED,

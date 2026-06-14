@@ -11,7 +11,6 @@ function usage() {
     "  node scripts/backup_r2/uk_aq_build_r2_history_index.mjs [options]",
     "",
     "Options:",
-    "  --history-version v1|v2              History index layout to build (default: v1)",
     "  --domain observations|aqilevels|both   Domain filter (default: both)",
     "  --kind observations|aqilevels|both     Alias for --domain (used by targeted mode)",
     "  --fetch-concurrency <n>                 Override manifest fetch concurrency",
@@ -39,7 +38,6 @@ function usage() {
     "  R2 bucket mapping via CFLARE_R2_BUCKET / R2_BUCKET or R2_BUCKET_DEV/STAGE/PROD",
     "",
     "Optional env:",
-    "  UK_AQ_R2_HISTORY_INDEX_VERSION         default: v1",
     "  UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX   default: history/v1/observations",
     "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX      default: history/v1/aqilevels/hourly",
     "  UK_AQ_R2_HISTORY_INDEX_PREFIX          default: history/_index",
@@ -47,15 +45,6 @@ function usage() {
     "                                         default: history/_index/observations_timeseries",
     "  UK_AQ_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX",
     "                                         default: history/_index/aqilevels_timeseries",
-    "  UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX",
-    "                                         default: history/v2/observations",
-    "  UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX",
-    "                                         default: history/v2/aqilevels/hourly/data",
-    "  UK_AQ_R2_HISTORY_INDEX_V2_PREFIX       default: history/_index_v2",
-    "  UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX",
-    "                                         default: history/_index_v2/observations_timeseries",
-    "  UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX",
-    "                                         default: history/_index_v2/aqilevels_hourly_data_timeseries",
     "  UK_AQ_R2_HISTORY_INDEX_FETCH_CONCURRENCY",
     "  UK_AQ_R2_HISTORY_INDEX_MAX_KEYS",
   ].join("\n"));
@@ -70,11 +59,7 @@ function parsePositiveInt(raw, flagName) {
 }
 
 function parseArgs(argv) {
-  const envHistoryVersion = String(process.env.UK_AQ_R2_HISTORY_INDEX_VERSION || "v1")
-    .trim()
-    .toLowerCase();
   const args = {
-    historyVersion: envHistoryVersion || "v1",
     domains: ["observations", "aqilevels"],
     fetchConcurrency: undefined,
     maxKeys: undefined,
@@ -88,15 +73,6 @@ function parseArgs(argv) {
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--history-version") {
-      args.historyVersion = parseHistoryVersion(argv[i + 1]);
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith("--history-version=")) {
-      args.historyVersion = parseHistoryVersion(arg.slice("--history-version=".length));
-      continue;
-    }
     if (arg === "--domain") {
       const value = String(argv[i + 1] || "").trim().toLowerCase();
       i += 1;
@@ -196,9 +172,6 @@ function parseArgs(argv) {
   }
 
   if (args.targeted) {
-    if (args.historyVersion !== "v1") {
-      throw new Error("--targeted is only supported for v1 indexes; run v2 as a non-targeted rebuild");
-    }
     if (!args.fromDayUtc || !args.toDayUtc) {
       throw new Error("--targeted requires --from-day and --to-day");
     }
@@ -228,17 +201,7 @@ function parseArgs(argv) {
     });
   }
 
-  args.historyVersion = parseHistoryVersion(args.historyVersion);
-
   return args;
-}
-
-function parseHistoryVersion(raw) {
-  const value = String(raw || "").trim().toLowerCase();
-  if (value !== "v1" && value !== "v2") {
-    throw new Error("--history-version must be v1 or v2");
-  }
-  return value;
 }
 
 function applyDomainArg(args, value, flagName) {
@@ -354,7 +317,6 @@ async function main() {
     : await rebuildR2HistoryIndexes({
         env: process.env,
         domains: args.domains,
-        historyVersion: args.historyVersion,
         fetchConcurrency: args.fetchConcurrency,
         maxKeys: args.maxKeys,
         computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,

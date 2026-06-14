@@ -227,43 +227,6 @@ test("planIndexTreeUnits: unchanged unit skipped, changed unit queued", () => {
   assert.equal(candidates[0].unit_key, "day_utc=2026-05-10/connector_id=7/manifest.json");
 });
 
-test("planIndexFiles and planIndexTreeUnits include v2 pollutant index keys", () => {
-  const inventory = makeInventory({
-    indexFiles: {
-      observations_timeseries_v2_latest: {
-        unit_type: "file",
-        relative_path: "history/_index_v2/observations_timeseries_latest.json",
-        hash: "v2LatestHash",
-        size: 100,
-      },
-    },
-    indexTreeUnits: {
-      observations_timeseries_v2: {
-        "day_utc=2026-05-10/connector_id=6/pollutant_code=pm25/manifest.json": {
-          unit_type: "file",
-          relative_path:
-            "history/_index_v2/observations_timeseries/day_utc=2026-05-10/connector_id=6/pollutant_code=pm25/manifest.json",
-          hash: "v2TreeHash",
-          size: 50,
-        },
-      },
-    },
-  });
-  const state = makeCheckpoint({});
-
-  const fileCandidates = planIndexFiles(inventory, state);
-  const treeCandidates = planIndexTreeUnits(inventory, state);
-
-  assert.equal(fileCandidates.length, 1);
-  assert.equal(fileCandidates[0].index_key, "observations_timeseries_v2_latest");
-  assert.equal(treeCandidates.length, 1);
-  assert.equal(treeCandidates[0].tree_key, "observations_timeseries_v2");
-  assert.equal(
-    treeCandidates[0].unit_key,
-    "day_utc=2026-05-10/connector_id=6/pollutant_code=pm25/manifest.json",
-  );
-});
-
 // ----- validateInventoryPayload -----
 
 test("validateInventoryPayload: missing inventory throws actionable error in strict mode", () => {

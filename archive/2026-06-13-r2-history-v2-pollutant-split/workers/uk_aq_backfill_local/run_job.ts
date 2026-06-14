@@ -226,8 +226,6 @@ type HelperRow = {
 
 type ObsHistoryRow = {
   timeseries_id: number;
-  station_id?: number | null;
-  pollutant_code?: SourcePollutantCode | null;
   observed_at: string;
   value: number | null;
 };
@@ -574,14 +572,6 @@ const HISTORY_OBSERVATIONS_COLUMNS = Object.freeze([
   "observed_at",
   "value",
 ]);
-const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "observed_at_utc",
-  "value",
-]);
 const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
 const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
 const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v1";
@@ -623,56 +613,6 @@ const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
   "eaqi_pm10_index_level",
   "updated_at",
 ]);
-const HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "timestamp_hour_utc",
-  "daqi_index_level",
-  "eaqi_index_level",
-  "daqi_calculation_status",
-  "daqi_missing_reason",
-  "eaqi_calculation_status",
-  "eaqi_missing_reason",
-]);
-const HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "timestamp_hour_utc",
-  "daqi_input_value_ugm3",
-  "daqi_input_averaging_code",
-  "daqi_index_level",
-  "daqi_source_observation_count",
-  "daqi_required_observation_count",
-  "daqi_calculation_status",
-  "daqi_missing_reason",
-  "eaqi_input_value_ugm3",
-  "eaqi_input_averaging_code",
-  "eaqi_index_level",
-  "eaqi_source_observation_count",
-  "eaqi_required_observation_count",
-  "eaqi_calculation_status",
-  "eaqi_missing_reason",
-  "hourly_sample_count",
-  "algorithm_version",
-  "computed_at_utc",
-]);
-const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
-const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
-const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
-const HISTORY_R2_V2_SCHEMA_VERSION = 2;
-const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
-
-function parseHistoryWriteVersion(raw: string | undefined): "v1" | "v2" {
-  const value = String(raw || "v1").trim().toLowerCase();
-  if (value === "v1" || value === "v2") {
-    return value;
-  }
-  throw new Error(`Invalid UK_AQ_R2_HISTORY_WRITE_VERSION=${String(raw)}; expected v1 or v2`);
-}
 
 const OBS_R2_DEPLOY_ENV =
   (Deno.env.get("UK_AQ_DEPLOY_ENV") || Deno.env.get("DEPLOY_ENV") || "dev")
@@ -685,21 +625,6 @@ const OBS_R2_HISTORY_PREFIX = normalizePrefix(
 const AQI_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") || "history/v1/aqilevels/hourly",
 ) || "history/v1/aqilevels/hourly";
-const HISTORY_R2_WRITE_VERSION = parseHistoryWriteVersion(
-  Deno.env.get("UK_AQ_R2_HISTORY_WRITE_VERSION") || undefined,
-);
-const OBS_R2_HISTORY_PREFIX_V2 = normalizePrefix(
-  Deno.env.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX") ||
-    HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-) || HISTORY_R2_V2_OBSERVATIONS_PREFIX;
-const AQI_R2_HISTORY_DATA_PREFIX_V2 = normalizePrefix(
-  Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX") ||
-    HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
-) || HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX;
-const AQI_R2_HISTORY_DEBUG_PREFIX_V2 = normalizePrefix(
-  Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX") ||
-    HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
-) || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX;
 const CORE_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
 ) || "history/v1/core";
@@ -1749,66 +1674,6 @@ function buildAqiPartKey(
   }.parquet`;
 }
 
-function normalizePollutantCodeForR2Path(pollutantCode: string): string {
-  const value = String(pollutantCode || "").trim().toLowerCase();
-  if (!/^[a-z0-9_]+$/.test(value)) {
-    throw new Error(`Invalid pollutant_code for R2 path: ${pollutantCode}`);
-  }
-  return value;
-}
-
-function buildHistoryV2ConnectorPrefix(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-): string {
-  return `${basePrefix}/day_utc=${dayUtc}/connector_id=${connectorId}`;
-}
-
-function buildHistoryV2PollutantPrefix(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-  pollutantCode: string,
-): string {
-  return `${buildHistoryV2ConnectorPrefix(basePrefix, dayUtc, connectorId)}/pollutant_code=${
-    normalizePollutantCodeForR2Path(pollutantCode)
-  }`;
-}
-
-function buildHistoryV2DayManifestKey(basePrefix: string, dayUtc: string): string {
-  return `${basePrefix}/day_utc=${dayUtc}/manifest.json`;
-}
-
-function buildHistoryV2ConnectorManifestKey(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-): string {
-  return `${buildHistoryV2ConnectorPrefix(basePrefix, dayUtc, connectorId)}/manifest.json`;
-}
-
-function buildHistoryV2PollutantManifestKey(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-  pollutantCode: string,
-): string {
-  return `${buildHistoryV2PollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/manifest.json`;
-}
-
-function buildHistoryV2PartKey(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-  pollutantCode: string,
-  partIndex: number,
-): string {
-  return `${buildHistoryV2PollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/part-${
-    String(partIndex).padStart(5, "0")
-  }.parquet`;
-}
-
 function resolveTargetedStageDir(
   dayUtc: string,
   connectorId: number,
@@ -1888,8 +1753,6 @@ function readObsRowsForConnectorDayFromTargetedStage(
     }
     rows.push({
       timeseries_id: timeseriesId,
-      station_id: toSafeInt(row.station_id) || null,
-      pollutant_code: parsePollutantCode(row.pollutant_code),
       observed_at: observedAt,
       value,
     });
@@ -3179,118 +3042,6 @@ function rowsToAqiParquetBuffer(
       AQI_R2_ROW_GROUP_SIZE,
       HISTORY_AQILEVELS_WRITER_VERSION,
     ),
-  );
-}
-
-function writeArrowTableToParquet(table: unknown, writerProperties: unknown): Uint8Array {
-  const wasmTable = (parquetWasm as unknown as {
-    Table: { fromIPCStream: (bytes: Uint8Array) => unknown };
-  }).Table.fromIPCStream(
-    (arrow as unknown as {
-      tableToIPC: (table: unknown, mode: "stream") => Uint8Array;
-    }).tableToIPC(table, "stream"),
-  );
-  return (parquetWasm as unknown as {
-    writeParquet: (table: unknown, writerProperties: unknown) => Uint8Array;
-  }).writeParquet(wasmTable, writerProperties);
-}
-
-function rowsToObservationV2ParquetBuffer(rows: Array<ObsHistoryRow & {
-  connector_id: number;
-  station_id: number | null;
-  pollutant_code: string;
-}>): Uint8Array {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values: Array<string | null>) =>
-    arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values: Array<Date | null>) =>
-    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = (arrow as unknown as {
-    tableFromArrays: (data: Record<string, unknown>) => unknown;
-  }).tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => row.connector_id)),
-    station_id: int32Vector(rows.map((row) => row.station_id)),
-    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
-    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
-    observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at))),
-    value: rows.map((row) => row.value === null || row.value === undefined ? null : Number(row.value)),
-  });
-  return writeArrowTableToParquet(
-    table,
-    parquetWriterProperties(OBS_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
-}
-
-function rowsToAqiDataV2ParquetBuffer(rows: AqilevelsHistoryParquetRow[]): Uint8Array {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values: Array<string | null>) =>
-    arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values: Array<Date | null>) =>
-    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = (arrow as unknown as {
-    tableFromArrays: (data: Record<string, unknown>) => unknown;
-  }).tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => row.connector_id)),
-    station_id: int32Vector(rows.map((row) => row.station_id)),
-    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
-    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_index_level: int32Vector(rows.map((row) => row.daqi_index_level)),
-    eaqi_index_level: int32Vector(rows.map((row) => row.eaqi_index_level)),
-    daqi_calculation_status: textVector(rows.map((row) => row.daqi_calculation_status)),
-    daqi_missing_reason: textVector(rows.map((row) => row.daqi_missing_reason)),
-    eaqi_calculation_status: textVector(rows.map((row) => row.eaqi_calculation_status)),
-    eaqi_missing_reason: textVector(rows.map((row) => row.eaqi_missing_reason)),
-  });
-  return writeArrowTableToParquet(
-    table,
-    parquetWriterProperties(AQI_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
-}
-
-function rowsToAqiDebugV2ParquetBuffer(rows: AqilevelsHistoryParquetRow[]): Uint8Array {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Int32());
-  const float64Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Float64());
-  const textVector = (values: Array<string | null>) =>
-    arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values: Array<Date | null>) =>
-    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = (arrow as unknown as {
-    tableFromArrays: (data: Record<string, unknown>) => unknown;
-  }).tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => row.connector_id)),
-    station_id: int32Vector(rows.map((row) => row.station_id)),
-    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
-    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_input_value_ugm3: float64Vector(rows.map((row) => row.daqi_input_value_ugm3)),
-    daqi_input_averaging_code: textVector(rows.map((row) => row.daqi_input_averaging_code)),
-    daqi_index_level: int32Vector(rows.map((row) => row.daqi_index_level)),
-    daqi_source_observation_count: int32Vector(rows.map((row) => row.daqi_source_observation_count)),
-    daqi_required_observation_count: int32Vector(rows.map((row) => row.daqi_required_observation_count)),
-    daqi_calculation_status: textVector(rows.map((row) => row.daqi_calculation_status)),
-    daqi_missing_reason: textVector(rows.map((row) => row.daqi_missing_reason)),
-    eaqi_input_value_ugm3: float64Vector(rows.map((row) => row.eaqi_input_value_ugm3)),
-    eaqi_input_averaging_code: textVector(rows.map((row) => row.eaqi_input_averaging_code)),
-    eaqi_index_level: int32Vector(rows.map((row) => row.eaqi_index_level)),
-    eaqi_source_observation_count: int32Vector(rows.map((row) => row.eaqi_source_observation_count)),
-    eaqi_required_observation_count: int32Vector(rows.map((row) => row.eaqi_required_observation_count)),
-    eaqi_calculation_status: textVector(rows.map((row) => row.eaqi_calculation_status)),
-    eaqi_missing_reason: textVector(rows.map((row) => row.eaqi_missing_reason)),
-    hourly_sample_count: int32Vector(rows.map((row) => row.hourly_sample_count)),
-    algorithm_version: textVector(rows.map((row) => row.algorithm_version)),
-    computed_at_utc: timestampVector(rows.map((row) => row.computed_at_utc ? new Date(row.computed_at_utc) : null)),
-  });
-  return writeArrowTableToParquet(
-    table,
-    parquetWriterProperties(AQI_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
   );
 }
 
@@ -7605,8 +7356,6 @@ function sourceObservationsToObsHistoryRows(
 ): ObsHistoryRow[] {
   return rows.map((row) => ({
     timeseries_id: row.timeseries_id,
-    station_id: row.station_id,
-    pollutant_code: row.pollutant_code,
     observed_at: row.observed_at,
     value: row.value,
   }));

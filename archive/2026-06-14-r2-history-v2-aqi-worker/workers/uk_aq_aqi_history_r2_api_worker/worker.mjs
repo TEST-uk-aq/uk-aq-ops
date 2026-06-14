@@ -2,12 +2,9 @@ import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/aqilevels/hourly";
-const DEFAULT_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 const DEFAULT_HISTORY_BANDS_PREFIX = "history/v1/aqilevels/hourly/bands/v1";
 const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
-const DEFAULT_HISTORY_V2_INDEX_PREFIX = "history/_index_v2";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_timeseries";
-const DEFAULT_V2_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_hourly_data_timeseries";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
@@ -148,11 +145,6 @@ function parseOptionalBoolean(raw, fallback) {
   return fallback;
 }
 
-function parseReadVersion(raw) {
-  const value = String(raw || "").trim().toLowerCase();
-  return value === "v2" ? "v2" : "v1";
-}
-
 function createScanMetrics({
   requestId = null,
   maxR2ObjectReads,
@@ -175,7 +167,6 @@ function createScanMetrics({
     parquet_filter_rows_decoded: 0,
     parquet_payload_rows_decoded: 0,
     parquet_matched_rows: 0,
-    parquet_bytes_read: 0,
     max_r2_object_reads: maxR2ObjectReads,
     max_r2_list_operations: 0,
     max_parquet_row_groups: maxParquetRowGroups,
@@ -362,13 +353,9 @@ function buildTsvResponseBody(columns, rows) {
   return `${lines.join("\n")}\n`;
 }
 
-function buildAqiHistoryResponseCacheKey(request, env = {}) {
+function buildAqiHistoryResponseCacheKey(request) {
   const url = new URL(request.url);
   url.searchParams.set("__ukaq_aqi_history_response_v", AQI_HISTORY_RESPONSE_CACHE_VERSION);
-  url.searchParams.set(
-    "__ukaq_aqi_history_read_v",
-    parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION),
-  );
   return new Request(url.toString(), { method: "GET" });
 }
 
@@ -481,14 +468,6 @@ function buildConnectorManifestKey(prefix, dayUtc, connectorId) {
 
 function buildTimeseriesConnectorIndexKey(indexPrefix, dayUtc, connectorId) {
   return `${indexPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
-}
-
-function buildTimeseriesPollutantIndexKey(indexPrefix, dayUtc, connectorId, pollutantKey) {
-  const normalizedPollutant = normalizeAqiPollutant(pollutantKey);
-  if (!normalizedPollutant) {
-    return null;
-  }
-  return `${indexPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${normalizedPollutant}/manifest.json`;
 }
 
 function findConnectorManifestKey(dayManifest, connectorId, fallbackKey) {
@@ -666,9 +645,6 @@ async function fetchFilteredParquetRowsFromR2(
   }
 
   const arrayBuffer = await object.arrayBuffer();
-  if (metrics) {
-    metrics.parquet_bytes_read += arrayBuffer.byteLength;
-  }
   const metadata = await parquetMetadataAsync(arrayBuffer, { compressors });
   const schemaColumns = parquetSchema(metadata).children.map((column) =>
     column.element.name
@@ -1272,12 +1248,11 @@ function extractParquetKeysFromTimeseriesIndex(
     if (!key) {
       continue;
     }
-    const filePollutants = Array.from(new Set([
-      ...(Array.isArray(entry?.pollutant_codes) ? entry.pollutant_codes : []),
-      entry?.pollutant_code,
-    ]
-      .map((value) => normalizeAqiPollutant(value))
-      .filter(Boolean)));
+    const filePollutants = Array.isArray(entry?.pollutant_codes)
+      ? entry.pollutant_codes
+        .map((value) => normalizeAqiPollutant(value))
+        .filter(Boolean)
+      : [];
     if (pollutantKey && filePollutants.length > 0 && !filePollutants.includes(pollutantKey)) {
       filesSkippedByPollutant += 1;
       continue;
@@ -1324,10 +1299,7 @@ function extractParquetKeysFromTimeseriesIndex(
 
 async function readHistoryRows({
   env,
-  readVersion = "v1",
   historyPrefix,
-  historyIndexPrefix,
-  timeseriesIndexPrefix,
   connectorId,
   stationId = null,
   targetTimeseriesIds,
@@ -1347,17 +1319,14 @@ async function readHistoryRows({
     MIN_PARQUET_ROW_CHUNK_SIZE,
     MAX_PARQUET_ROW_CHUNK_SIZE,
   );
-  const normalizedReadVersion = parseReadVersion(readVersion);
-  const normalizedHistoryIndexPrefix = normalizePrefix(historyIndexPrefix || (
-    normalizedReadVersion === "v2"
-      ? DEFAULT_HISTORY_V2_INDEX_PREFIX
-      : DEFAULT_HISTORY_INDEX_PREFIX
-  ));
-  const normalizedTimeseriesIndexPrefix = normalizePrefix(timeseriesIndexPrefix || (
-    normalizedReadVersion === "v2"
-      ? `${normalizedHistoryIndexPrefix}/${DEFAULT_V2_TIMESERIES_INDEX_SUBPREFIX}`
-      : `${normalizedHistoryIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`
-  ));
+  const historyIndexPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_INDEX_PREFIX || DEFAULT_HISTORY_INDEX_PREFIX,
+  ) || DEFAULT_HISTORY_INDEX_PREFIX;
+  const timeseriesIndexPrefix = normalizePrefix(
+    env.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX
+      || env.UK_AQ_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX
+      || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`,
+  ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`;
   const timeseriesIndexEnabled = parseOptionalBoolean(
     env.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED,
     true,
@@ -1440,13 +1409,6 @@ async function readHistoryRows({
   let timeseriesIndexIndexedFileCount = 0;
   let timeseriesIndexUnknownRangeFileCount = 0;
   let scanStoppedReason = null;
-  if (normalizedReadVersion === "v2" && !pollutantKey) {
-    scanStoppedReason = "v2_requires_pollutant_partition";
-    stopScan(scanMetrics, scanStoppedReason);
-    timeseriesIndexWarnings.push(
-      "Skipped v2 R2 scan: pollutant is required to read pollutant-partitioned AQI history.",
-    );
-  }
   if (!timeseriesIndexEnabled && requireTimeseriesIndex && targetTimeseriesIdCount > 0) {
     scanStoppedReason = "timeseries_index_required_but_disabled";
     stopScan(scanMetrics, scanStoppedReason);
@@ -1539,26 +1501,11 @@ async function readHistoryRows({
       const targetConnectorId = Number(connectorManifestTarget.connector_id);
 
       if (timeseriesIndexEnabled && Number.isFinite(targetConnectorId) && targetConnectorId > 0) {
-        const connectorIndexKey = normalizedReadVersion === "v2"
-          ? buildTimeseriesPollutantIndexKey(
-            normalizedTimeseriesIndexPrefix,
-            dayUtc,
-            targetConnectorId,
-            pollutantKey,
-          )
-          : buildTimeseriesConnectorIndexKey(
-            normalizedTimeseriesIndexPrefix,
-            dayUtc,
-            targetConnectorId,
-          );
-        if (!connectorIndexKey) {
-          scanStoppedReason = "v2_requires_pollutant_partition";
-          stopScan(scanMetrics, scanStoppedReason);
-          timeseriesIndexWarnings.push(
-            "Skipped v2 R2 scan: pollutant is required to build the v2 timeseries index key.",
-          );
-          break;
-        }
+        const connectorIndexKey = buildTimeseriesConnectorIndexKey(
+          timeseriesIndexPrefix,
+          dayUtc,
+          targetConnectorId,
+        );
         timeseriesIndexScannedKeys.push(connectorIndexKey);
         try {
           const connectorIndexObject = await fetchJsonObjectFromR2(env, connectorIndexKey, scanMetrics, "timeseries_index");
@@ -1604,12 +1551,6 @@ async function readHistoryRows({
       }
 
       if (parquetKeys === null) {
-        if (normalizedReadVersion === "v2" && requireTimeseriesIndex && targetTimeseriesIdCount > 0) {
-          timeseriesIndexWarnings.push(
-            `Skipped fallback manifest scan for ${connectorManifestKey}: v2 read mode requires the pollutant timeseries index.`,
-          );
-          continue;
-        }
         scannedConnectorManifests += 1;
         const connectorManifestObject = await fetchJsonObjectFromR2(env, connectorManifestKey, scanMetrics, "connector_manifest");
         if (connectorManifestObject.budget_exceeded) {
@@ -1701,11 +1642,7 @@ async function readHistoryRows({
     missing_parquet_keys: Array.from(missingParquetKeys.values()),
     timeseries_index: {
       enabled: timeseriesIndexEnabled,
-      prefix: normalizedTimeseriesIndexPrefix,
-      read_version: normalizedReadVersion,
-      index_version: normalizedReadVersion,
-      data_profile: normalizedReadVersion === "v2" ? "hourly_data" : "v1",
-      pollutant_partition: normalizedReadVersion === "v2" ? (pollutantKey || null) : null,
+      prefix: timeseriesIndexPrefix,
       scanned_connector_index_keys: timeseriesIndexScannedKeys.length,
       hit_count: timeseriesIndexHitCount,
       miss_count: timeseriesIndexMissCount,
@@ -2075,42 +2012,9 @@ async function handleRequest(request, env, ctx) {
   }
   const responseFormat = normalizeAqiResponseFormat(responseFormatRaw);
 
-  const readVersion = parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION);
-  const historyPrefix = readVersion === "v2"
-    ? (
-      normalizePrefix(
-        env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX
-          || DEFAULT_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX,
-      ) || DEFAULT_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX
-    )
-    : (
-      normalizePrefix(env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_HISTORY_PREFIX)
-      || DEFAULT_HISTORY_PREFIX
-    );
-  const historyIndexPrefix = readVersion === "v2"
-    ? (
-      normalizePrefix(env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || DEFAULT_HISTORY_V2_INDEX_PREFIX)
-      || DEFAULT_HISTORY_V2_INDEX_PREFIX
-    )
-    : (
-      normalizePrefix(env.UK_AQ_R2_HISTORY_INDEX_PREFIX || DEFAULT_HISTORY_INDEX_PREFIX)
-      || DEFAULT_HISTORY_INDEX_PREFIX
-    );
-  const timeseriesIndexPrefix = readVersion === "v2"
-    ? (
-      normalizePrefix(
-        env.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_V2_PREFIX
-          || env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
-          || `${historyIndexPrefix}/${DEFAULT_V2_TIMESERIES_INDEX_SUBPREFIX}`,
-      ) || `${historyIndexPrefix}/${DEFAULT_V2_TIMESERIES_INDEX_SUBPREFIX}`
-    )
-    : (
-      normalizePrefix(
-        env.UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX
-          || env.UK_AQ_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX
-          || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`,
-      ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`
-    );
+  const historyPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_HISTORY_PREFIX,
+  ) || DEFAULT_HISTORY_PREFIX;
   const cachePolicy = resolveCachePolicy(env, endIso);
   const { cacheSeconds, cacheScope } = cachePolicy;
   const ingestRetentionDays = parsePositiveInt(
@@ -2217,10 +2121,7 @@ async function handleRequest(request, env, ctx) {
   const r2Read = hasHistoryWindow
     ? await readHistoryRows({
       env,
-      readVersion,
       historyPrefix,
-      historyIndexPrefix,
-      timeseriesIndexPrefix,
       connectorId: historyConnectorId,
       stationId: parseRequiredPositiveInt(historyContext.station_id),
       targetTimeseriesIds: historyTargetTimeseriesIds,
@@ -2409,12 +2310,7 @@ async function handleRequest(request, env, ctx) {
     ok: true,
     request_id: requestId,
     generated_at_utc: new Date().toISOString(),
-    read_version: readVersion,
-    index_version: readVersion,
-    data_profile: readVersion === "v2" ? "hourly_data" : "v1",
     history_prefix: historyPrefix,
-    history_index_prefix: historyIndexPrefix,
-    timeseries_index_prefix: timeseriesIndexPrefix,
     source,
     source_split_boundary_utc: splitBoundaryIso,
     overlap_start_utc: overlapStartIso,
@@ -2460,12 +2356,6 @@ async function handleRequest(request, env, ctx) {
       eaqi_missing_reason_counts: rowSummary.eaqi_missing_reason_counts,
       data_format: responseFormat === "objects" ? "objects" : "compact",
       wire_format: responseFormat === "tsv" ? "tsv" : "json",
-      read_version: readVersion,
-      index_version: readVersion,
-      data_profile: readVersion === "v2" ? "hourly_data" : "v1",
-      history_prefix: historyPrefix,
-      history_index_prefix: historyIndexPrefix,
-      timeseries_index_prefix: timeseriesIndexPrefix,
       timeseries_id: timeseriesId,
       station_id: targetStationId,
       connector_id: targetConnectorId,
@@ -2504,13 +2394,6 @@ async function handleRequest(request, env, ctx) {
       },
     },
     coverage: {
-      read_version: readVersion,
-      index_version: r2Read.timeseries_index?.index_version || readVersion,
-      data_profile: r2Read.timeseries_index?.data_profile || (readVersion === "v2" ? "hourly_data" : "v1"),
-      history_prefix: historyPrefix,
-      history_index_prefix: historyIndexPrefix,
-      timeseries_index_prefix: timeseriesIndexPrefix,
-      pollutant_partition: r2Read.timeseries_index?.pollutant_partition || null,
       days_requested: r2Read.days_requested ?? r2Read.days_scanned,
       days_scanned: r2Read.days_scanned,
       scanned_connector_manifests: r2Read.scanned_connector_manifests,
@@ -2522,7 +2405,6 @@ async function handleRequest(request, env, ctx) {
       parquet_filter_rows_decoded: r2Read.scan_metrics?.parquet_filter_rows_decoded ?? null,
       parquet_payload_rows_decoded: r2Read.scan_metrics?.parquet_payload_rows_decoded ?? null,
       parquet_matched_rows: r2Read.scan_metrics?.parquet_matched_rows ?? null,
-      parquet_bytes_read: r2Read.scan_metrics?.parquet_bytes_read ?? null,
       scan_metrics: r2Read.scan_metrics,
       missing_day_manifest_keys: r2Read.missing_day_manifest_keys,
       missing_connector_manifest_keys: r2Read.missing_connector_manifest_keys,
@@ -2584,9 +2466,6 @@ async function handleRequest(request, env, ctx) {
   console.log(JSON.stringify({
     event: "aqi_history_request",
     request_id: requestId,
-    read_version: readVersion,
-    index_version: r2Read.timeseries_index?.index_version || readVersion,
-    data_profile: r2Read.timeseries_index?.data_profile || (readVersion === "v2" ? "hourly_data" : "v1"),
     timeseries_id: timeseriesId,
     station_id: targetStationId,
     connector_id: targetConnectorId,
@@ -2601,7 +2480,6 @@ async function handleRequest(request, env, ctx) {
     index_miss_count: r2Read.timeseries_index?.miss_count ?? 0,
     r2_object_reads: r2Read.scan_metrics?.r2_object_reads ?? null,
     r2_list_operations: r2Read.scan_metrics?.r2_list_operations ?? 0,
-    parquet_bytes_read: r2Read.scan_metrics?.parquet_bytes_read ?? null,
     row_count: points.length,
     duration_ms: durationMs,
     response_complete: responseComplete,
@@ -2609,7 +2487,6 @@ async function handleRequest(request, env, ctx) {
     stopped_reason: historyScanStoppedReason,
     timeseries_index_enabled: r2Read.timeseries_index?.enabled ?? null,
     timeseries_index_prefix: r2Read.timeseries_index?.prefix ?? null,
-    pollutant_partition: r2Read.timeseries_index?.pollutant_partition ?? null,
   }));
 
   let response;
@@ -2664,7 +2541,7 @@ export default {
       });
     }
 
-    const cacheKey = buildAqiHistoryResponseCacheKey(request, env);
+    const cacheKey = buildAqiHistoryResponseCacheKey(request);
     const cached = await caches.default.match(cacheKey);
     if (cached) {
       return withCacheMarker(cached, "HIT");

@@ -15,14 +15,10 @@ export const INDEX_FILE_KEYS = Object.freeze([
   "aqilevels_latest",
   "observations_timeseries_latest",
   "aqilevels_timeseries_latest",
-  "observations_timeseries_v2_latest",
-  "aqilevels_hourly_data_timeseries_v2_latest",
 ]);
 export const INDEX_TREE_KEYS = Object.freeze([
   "observations_timeseries",
   "aqilevels_timeseries",
-  "observations_timeseries_v2",
-  "aqilevels_hourly_data_timeseries_v2",
 ]);
 export const COMMITTED_CONNECTOR_UNIT_KEYS = Object.freeze([
   "observations",

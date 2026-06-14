@@ -52,9 +52,6 @@ const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
 const DEFAULT_INDEX_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_INDEX_PREFIX || "history/_index",
 );
-const DEFAULT_INDEX_V2_PREFIX = normalizePrefix(
-  process.env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || "history/_index_v2",
-);
 const DEFAULT_INVENTORY_REL_PATH =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim()
   || `${DEFAULT_INDEX_PREFIX || "history/_index"}/backup_inventory_v1.json`;
@@ -66,8 +63,6 @@ const DEFAULT_REPORT_OUT =
 const DAY_MANIFEST_PATTERN = /^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/;
 const INDEX_TREE_UNIT_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
-const INDEX_TREE_UNIT_V2_PATTERN =
-  /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/pollutant_code=(pm25|pm10|no2)\/manifest\.json$/;
 const COMMITTED_CONNECTOR_MANIFEST_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
 
@@ -85,7 +80,6 @@ function usage() {
       `  --inventory-rel-path <p>   Default: ${DEFAULT_INVENTORY_REL_PATH}`,
       "  --domain <name>            observations | aqilevels | core (repeatable)",
       `  --index-prefix <prefix>    Default: ${DEFAULT_INDEX_PREFIX || "history/_index"}`,
-      `  --index-v2-prefix <prefix> Default: ${DEFAULT_INDEX_V2_PREFIX || "history/_index_v2"}`,
       `  --rclone-bin <name>        Default: ${DEFAULT_RCLONE_BIN}`,
       "  --report-out <file>        Write JSON report to file",
       "  --dry-run                  Build/validate only; do not upload inventory",
@@ -101,7 +95,6 @@ function parseArgs(argv) {
     inventory_rel_path: DEFAULT_INVENTORY_REL_PATH,
     domains: [],
     index_prefix: DEFAULT_INDEX_PREFIX,
-    index_v2_prefix: DEFAULT_INDEX_V2_PREFIX,
     rclone_bin: DEFAULT_RCLONE_BIN,
     report_out: DEFAULT_REPORT_OUT,
     dry_run: false,
@@ -133,12 +126,6 @@ function parseArgs(argv) {
     if (arg === "--index-prefix") {
       args.index_prefix =
         normalizePrefix(argv[i + 1] || "") || DEFAULT_INDEX_PREFIX;
-      i += 1;
-      continue;
-    }
-    if (arg === "--index-v2-prefix") {
-      args.index_v2_prefix =
-        normalizePrefix(argv[i + 1] || "") || DEFAULT_INDEX_V2_PREFIX;
       i += 1;
       continue;
     }
@@ -366,16 +353,15 @@ function scanIndexFile({
   sourceRoot,
   indexKey,
   indexPrefix,
-  fileName,
   previousEntry,
   excludeRelativePaths,
   stats,
 }) {
-  const normalizedFileName = String(fileName || `${indexKey}.json`).trim();
-  const relativePath = indexPrefix ? `${indexPrefix}/${normalizedFileName}` : normalizedFileName;
+  const fileName = `${indexKey}.json`;
+  const relativePath = indexPrefix ? `${indexPrefix}/${fileName}` : fileName;
   if (excludeRelativePaths.has(relativePath)) return null;
   const parentPath = joinTargetPath(sourceRoot, indexPrefix || "");
-  const lsjsonEntry = rcloneLsjsonFile(rcloneBin, parentPath, normalizedFileName);
+  const lsjsonEntry = rcloneLsjsonFile(rcloneBin, parentPath, fileName);
 
   if (!lsjsonEntry) {
     stats.index_files_missing += 1;
@@ -409,23 +395,20 @@ function scanIndexTree({
   sourceRoot,
   treeKey,
   indexPrefix,
-  treePath,
-  unitPattern,
-  maxDepth = 3,
   previousUnits,
   excludeRelativePaths,
   stats,
 }) {
-  const normalizedTreePath = String(treePath || treeKey).trim();
-  const normalizedUnitPattern = unitPattern || INDEX_TREE_UNIT_PATTERN;
-  const treePrefix = indexPrefix ? `${indexPrefix}/${normalizedTreePath}` : normalizedTreePath;
+  const treePrefix = indexPrefix ? `${indexPrefix}/${treeKey}` : treeKey;
   const treeSourcePath = joinTargetPath(sourceRoot, treePrefix);
-  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, treeSourcePath, { maxDepth });
+  // Tree unit manifests live at <tree>/day_utc=*/connector_id=*/manifest.json
+  // — depth 3.
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, treeSourcePath, { maxDepth: 3 });
 
   const units = {};
   for (const entry of lsjsonEntries) {
     const relPath = String(entry?.Path || "");
-    if (!normalizedUnitPattern.test(relPath)) continue;
+    if (!INDEX_TREE_UNIT_PATTERN.test(relPath)) continue;
     const unitRelativePath = `${treePrefix}/${relPath}`;
     if (excludeRelativePaths.has(unitRelativePath)) continue;
     stats.index_tree_units_listed += 1;
@@ -456,50 +439,6 @@ function scanIndexTree({
   }
 
   return { treeKey, units };
-}
-
-function indexFileScanConfig(indexKey, args) {
-  if (indexKey === "observations_timeseries_v2_latest") {
-    return {
-      indexPrefix: args.index_v2_prefix,
-      fileName: "observations_timeseries_latest.json",
-    };
-  }
-  if (indexKey === "aqilevels_hourly_data_timeseries_v2_latest") {
-    return {
-      indexPrefix: args.index_v2_prefix,
-      fileName: "aqilevels_hourly_data_timeseries_latest.json",
-    };
-  }
-  return {
-    indexPrefix: args.index_prefix,
-    fileName: `${indexKey}.json`,
-  };
-}
-
-function indexTreeScanConfig(treeKey, args) {
-  if (treeKey === "observations_timeseries_v2") {
-    return {
-      indexPrefix: args.index_v2_prefix,
-      treePath: "observations_timeseries",
-      unitPattern: INDEX_TREE_UNIT_V2_PATTERN,
-      maxDepth: 4,
-    };
-  }
-  if (treeKey === "aqilevels_hourly_data_timeseries_v2") {
-    return {
-      indexPrefix: args.index_v2_prefix,
-      treePath: "aqilevels_hourly_data_timeseries",
-      unitPattern: INDEX_TREE_UNIT_V2_PATTERN,
-      maxDepth: 4,
-    };
-  }
-  return {
-    indexPrefix: args.index_prefix,
-    treePath: treeKey,
-    unitPattern: INDEX_TREE_UNIT_PATTERN,
-    maxDepth: 3,
-  };
 }
 
 // ---- Phase: committed per-(day, connector) observation manifests ----
@@ -617,7 +556,6 @@ async function main() {
     generated_at: new Date().toISOString(),
     source: {
       index_prefix: args.index_prefix,
-      index_v2_prefix: args.index_v2_prefix,
       domain_prefixes: {
         observations: DEFAULT_DOMAIN_PREFIXES.observations,
         aqilevels: DEFAULT_DOMAIN_PREFIXES.aqilevels,
@@ -630,9 +568,10 @@ async function main() {
       core: { days: {} },
     },
     index_files: {},
-    index_tree_units: Object.fromEntries(
-      INDEX_TREE_KEYS.map((treeKey) => [treeKey, { units: {} }]),
-    ),
+    index_tree_units: {
+      observations_timeseries: { units: {} },
+      aqilevels_timeseries: { units: {} },
+    },
     committed_connector_units: {
       observations: { units: {} },
     },
@@ -700,13 +639,11 @@ async function main() {
   const tIndexFiles = Date.now();
   for (const indexKey of INDEX_FILE_KEYS) {
     const previousEntry = previousInventory?.index_files?.[indexKey] || null;
-    const scanConfig = indexFileScanConfig(indexKey, args);
     const entry = scanIndexFile({
       rcloneBin: args.rclone_bin,
       sourceRoot: args.source_root,
       indexKey,
-      indexPrefix: scanConfig.indexPrefix,
-      fileName: scanConfig.fileName,
+      indexPrefix: args.index_prefix,
       previousEntry,
       excludeRelativePaths,
       stats,
@@ -722,15 +659,11 @@ async function main() {
   for (const treeKey of INDEX_TREE_KEYS) {
     const previousUnits =
       previousInventory?.index_tree_units?.[treeKey]?.units || {};
-    const scanConfig = indexTreeScanConfig(treeKey, args);
     const { units } = scanIndexTree({
       rcloneBin: args.rclone_bin,
       sourceRoot: args.source_root,
       treeKey,
-      indexPrefix: scanConfig.indexPrefix,
-      treePath: scanConfig.treePath,
-      unitPattern: scanConfig.unitPattern,
-      maxDepth: scanConfig.maxDepth,
+      indexPrefix: args.index_prefix,
       previousUnits,
       excludeRelativePaths,
       stats,

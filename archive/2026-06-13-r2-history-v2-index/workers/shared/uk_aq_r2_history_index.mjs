@@ -123,24 +123,16 @@ async function ensureParquetTooling() {
 export const DEFAULT_R2_HISTORY_INDEX_PREFIX = "history/_index";
 export const DEFAULT_R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations";
 export const DEFAULT_R2_HISTORY_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
-export const DEFAULT_R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v2";
-export const DEFAULT_R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
-export const DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 export const DEFAULT_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX =
   "history/_index/observations_timeseries";
 export const DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX =
   "history/_index/aqilevels_timeseries";
-export const DEFAULT_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX =
-  "history/_index_v2/observations_timeseries";
-export const DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX =
-  "history/_index_v2/aqilevels_hourly_data_timeseries";
 
 const DEFAULT_FETCH_CONCURRENCY = 16;
 const DEFAULT_MAX_KEYS = 1000;
 const INDEX_SCHEMA_VERSION = 1;
 const OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
 const AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
-const HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION = 2;
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
 
 function defaultEnv() {
@@ -181,14 +173,6 @@ function parsePositiveId(raw) {
   return Math.trunc(value);
 }
 
-function parsePollutantCode(raw) {
-  const value = String(raw || "").trim().toLowerCase();
-  if (value === "pm25" || value === "pm10" || value === "no2") {
-    return value;
-  }
-  return null;
-}
-
 function parseIsoDay(value) {
   if (typeof value !== "string") {
     return null;
@@ -213,18 +197,6 @@ function toIsoOrNull(value) {
     return null;
   }
   return new Date(ms).toISOString();
-}
-
-function minIso(left, right) {
-  if (!left) return right || null;
-  if (!right) return left;
-  return left <= right ? left : right;
-}
-
-function maxIso(left, right) {
-  if (!left) return right || null;
-  if (!right) return left;
-  return left >= right ? left : right;
 }
 
 // Pick the latest ISO timestamp from an array of strings. Used to derive
@@ -302,9 +274,6 @@ export function resolveR2HistoryIndexConfig(env = defaultEnv()) {
   const indexPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_INDEX_PREFIX || DEFAULT_R2_HISTORY_INDEX_PREFIX,
   );
-  const indexPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX,
-  );
   return {
     deploy_env: deployEnv,
     r2: {
@@ -322,15 +291,7 @@ export function resolveR2HistoryIndexConfig(env = defaultEnv()) {
     aqilevels_prefix: normalizePrefix(
       env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_R2_HISTORY_AQILEVELS_PREFIX,
     ),
-    observations_prefix_v2: normalizePrefix(
-      env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || DEFAULT_R2_HISTORY_V2_OBSERVATIONS_PREFIX,
-    ),
-    aqilevels_hourly_data_prefix_v2: normalizePrefix(
-      env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX
-        || DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX,
-    ),
     index_prefix: indexPrefix,
-    index_prefix_v2: indexPrefixV2,
     observations_timeseries_index_prefix: normalizePrefix(
       env.UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX
         || `${indexPrefix}/${"observations_timeseries"}`,
@@ -338,14 +299,6 @@ export function resolveR2HistoryIndexConfig(env = defaultEnv()) {
     aqilevels_timeseries_index_prefix: normalizePrefix(
       env.UK_AQ_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX
         || `${indexPrefix}/${"aqilevels_timeseries"}`,
-    ),
-    observations_timeseries_index_prefix_v2: normalizePrefix(
-      env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX
-        || `${indexPrefixV2}/${"observations_timeseries"}`,
-    ),
-    aqilevels_hourly_data_timeseries_index_prefix_v2: normalizePrefix(
-      env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
-        || `${indexPrefixV2}/${"aqilevels_hourly_data_timeseries"}`,
     ),
     fetch_concurrency: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_INDEX_FETCH_CONCURRENCY,
@@ -379,16 +332,6 @@ export function buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix) {
 export function buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix) {
   const prefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_INDEX_PREFIX);
   return `${prefix}/aqilevels_timeseries_latest.json`;
-}
-
-export function buildR2HistoryV2ObservationsTimeseriesLatestKey(indexPrefix) {
-  const prefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
-  return `${prefix}/observations_timeseries_latest.json`;
-}
-
-export function buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(indexPrefix) {
-  const prefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
-  return `${prefix}/aqilevels_hourly_data_timeseries_latest.json`;
 }
 
 export function buildR2HistoryObservationsTimeseriesConnectorIndexKey(
@@ -431,62 +374,6 @@ export function buildR2HistoryAqilevelsTimeseriesConnectorIndexKey(
     );
   }
   return `${normalizedPrefix}/day_utc=${normalizedDay}/connector_id=${normalizedConnectorId}/manifest.json`;
-}
-
-export function buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
-  observationsTimeseriesIndexPrefix,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-) {
-  const normalizedPrefix = normalizePrefix(
-    observationsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
-  );
-  const normalizedDay = parseIsoDay(dayUtc);
-  const normalizedConnectorId = parsePositiveId(connectorId);
-  const normalizedPollutantCode = parsePollutantCode(pollutantCode);
-  if (!normalizedDay) {
-    throw new Error(`Invalid day_utc for observations v2 timeseries index key: ${String(dayUtc || "")}`);
-  }
-  if (!normalizedConnectorId) {
-    throw new Error(
-      `Invalid connector_id for observations v2 timeseries index key: ${String(connectorId || "")}`,
-    );
-  }
-  if (!normalizedPollutantCode) {
-    throw new Error(
-      `Invalid pollutant_code for observations v2 timeseries index key: ${String(pollutantCode || "")}`,
-    );
-  }
-  return `${normalizedPrefix}/day_utc=${normalizedDay}/connector_id=${normalizedConnectorId}/pollutant_code=${normalizedPollutantCode}/manifest.json`;
-}
-
-export function buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
-  aqilevelsTimeseriesIndexPrefix,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-) {
-  const normalizedPrefix = normalizePrefix(
-    aqilevelsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX,
-  );
-  const normalizedDay = parseIsoDay(dayUtc);
-  const normalizedConnectorId = parsePositiveId(connectorId);
-  const normalizedPollutantCode = parsePollutantCode(pollutantCode);
-  if (!normalizedDay) {
-    throw new Error(`Invalid day_utc for aqilevels v2 timeseries index key: ${String(dayUtc || "")}`);
-  }
-  if (!normalizedConnectorId) {
-    throw new Error(
-      `Invalid connector_id for aqilevels v2 timeseries index key: ${String(connectorId || "")}`,
-    );
-  }
-  if (!normalizedPollutantCode) {
-    throw new Error(
-      `Invalid pollutant_code for aqilevels v2 timeseries index key: ${String(pollutantCode || "")}`,
-    );
-  }
-  return `${normalizedPrefix}/day_utc=${normalizedDay}/connector_id=${normalizedConnectorId}/pollutant_code=${normalizedPollutantCode}/manifest.json`;
 }
 
 function parseDayFromPrefix(prefixValue, domainPrefix) {
@@ -543,14 +430,6 @@ function buildObservationConnectorManifestKey(observationsPrefix, dayUtc, connec
 
 function buildAqilevelsConnectorManifestKey(aqilevelsPrefix, dayUtc, connectorId) {
   return `${normalizePrefix(aqilevelsPrefix)}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
-}
-
-function buildHistoryV2ConnectorManifestKey(dataPrefix, dayUtc, connectorId) {
-  return `${normalizePrefix(dataPrefix)}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
-}
-
-function buildHistoryV2PollutantManifestKey(dataPrefix, dayUtc, connectorId, pollutantCode) {
-  return `${normalizePrefix(dataPrefix)}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
 }
 
 function resolveObservationConnectorManifestTargets(dayManifest, dayUtc, observationsPrefix) {
@@ -631,94 +510,6 @@ function resolveAqilevelsConnectorManifestTargets(dayManifest, dayUtc, aqilevels
     });
   }
   return Array.from(byConnectorId.values()).sort((a, b) => a.connector_id - b.connector_id);
-}
-
-function resolveHistoryV2ConnectorManifestTargets(dayManifest, dayUtc, dataPrefix) {
-  const byConnectorId = new Map();
-  const connectorEntries = Array.isArray(dayManifest?.connector_manifests)
-    ? dayManifest.connector_manifests
-    : Array.isArray(dayManifest?.child_manifests)
-      ? dayManifest.child_manifests
-      : [];
-
-  for (const entry of connectorEntries) {
-    const connectorId = parsePositiveId(entry?.connector_id);
-    if (!connectorId) {
-      continue;
-    }
-    const manifestKey = typeof entry?.manifest_key === "string" && entry.manifest_key.trim()
-      ? entry.manifest_key.trim()
-      : buildHistoryV2ConnectorManifestKey(dataPrefix, dayUtc, connectorId);
-    byConnectorId.set(String(connectorId), {
-      connector_id: connectorId,
-      manifest_key: manifestKey,
-    });
-  }
-
-  if (byConnectorId.size > 0) {
-    return Array.from(byConnectorId.values()).sort((a, b) => a.connector_id - b.connector_id);
-  }
-
-  const connectorIds = Array.isArray(dayManifest?.connector_ids)
-    ? dayManifest.connector_ids
-    : [];
-  for (const rawConnectorId of connectorIds) {
-    const connectorId = parsePositiveId(rawConnectorId);
-    if (!connectorId) {
-      continue;
-    }
-    byConnectorId.set(String(connectorId), {
-      connector_id: connectorId,
-      manifest_key: buildHistoryV2ConnectorManifestKey(dataPrefix, dayUtc, connectorId),
-    });
-  }
-  return Array.from(byConnectorId.values()).sort((a, b) => a.connector_id - b.connector_id);
-}
-
-function resolveHistoryV2PollutantManifestTargets(connectorManifest, dayUtc, connectorId, dataPrefix) {
-  const byPollutant = new Map();
-  const pollutantEntries = Array.isArray(connectorManifest?.pollutant_manifests)
-    ? connectorManifest.pollutant_manifests
-    : Array.isArray(connectorManifest?.child_manifests)
-      ? connectorManifest.child_manifests
-      : [];
-
-  for (const entry of pollutantEntries) {
-    const pollutantCode = parsePollutantCode(entry?.pollutant_code);
-    if (!pollutantCode) {
-      continue;
-    }
-    const manifestKey = typeof entry?.manifest_key === "string" && entry.manifest_key.trim()
-      ? entry.manifest_key.trim()
-      : buildHistoryV2PollutantManifestKey(dataPrefix, dayUtc, connectorId, pollutantCode);
-    byPollutant.set(pollutantCode, {
-      pollutant_code: pollutantCode,
-      manifest_key: manifestKey,
-    });
-  }
-
-  if (byPollutant.size > 0) {
-    return Array.from(byPollutant.values()).sort((a, b) =>
-      a.pollutant_code.localeCompare(b.pollutant_code)
-    );
-  }
-
-  const pollutantCodes = Array.isArray(connectorManifest?.pollutant_codes)
-    ? connectorManifest.pollutant_codes
-    : [];
-  for (const rawPollutantCode of pollutantCodes) {
-    const pollutantCode = parsePollutantCode(rawPollutantCode);
-    if (!pollutantCode) {
-      continue;
-    }
-    byPollutant.set(pollutantCode, {
-      pollutant_code: pollutantCode,
-      manifest_key: buildHistoryV2PollutantManifestKey(dataPrefix, dayUtc, connectorId, pollutantCode),
-    });
-  }
-  return Array.from(byPollutant.values()).sort((a, b) =>
-    a.pollutant_code.localeCompare(b.pollutant_code)
-  );
 }
 
 function normalizeObservationTimeseriesIndexFileEntry(entry) {
@@ -1081,152 +872,6 @@ function buildAqilevelTimeseriesConnectorIndexPayload({
   };
 }
 
-function normalizeHistoryV2TimeseriesIndexFileEntry(entry, pollutantCode, domain) {
-  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-    return null;
-  }
-  const key = typeof entry.key === "string" ? entry.key.trim() : "";
-  if (!key) {
-    return null;
-  }
-  const normalizedPollutantCode = parsePollutantCode(entry.pollutant_code) || pollutantCode;
-  if (!normalizedPollutantCode) {
-    return null;
-  }
-  const minTimeseriesId = parsePositiveId(entry.min_timeseries_id);
-  const maxTimeseriesId = parsePositiveId(entry.max_timeseries_id);
-  const invalidRange = minTimeseriesId && maxTimeseriesId && minTimeseriesId > maxTimeseriesId;
-  const minObservedAtUtc =
-    toIsoOrNull(entry.min_observed_at_utc)
-    || toIsoOrNull(entry.min_observed_at);
-  const maxObservedAtUtc =
-    toIsoOrNull(entry.max_observed_at_utc)
-    || toIsoOrNull(entry.max_observed_at);
-  return {
-    key,
-    row_count: parseNonNegativeInt(entry.row_count) || 0,
-    bytes: parseNonNegativeInt(entry.bytes) || 0,
-    etag_or_hash: typeof entry.etag_or_hash === "string" && entry.etag_or_hash.trim()
-      ? entry.etag_or_hash.trim()
-      : null,
-    pollutant_code: normalizedPollutantCode,
-    min_timeseries_id: invalidRange ? null : minTimeseriesId,
-    max_timeseries_id: invalidRange ? null : maxTimeseriesId,
-    min_observed_at_utc: domain === "observations" ? minObservedAtUtc : null,
-    max_observed_at_utc: domain === "observations" ? maxObservedAtUtc : null,
-    min_timestamp_hour_utc: domain === "aqilevels" ? toIsoOrNull(entry.min_timestamp_hour_utc) : null,
-    max_timestamp_hour_utc: domain === "aqilevels" ? toIsoOrNull(entry.max_timestamp_hour_utc) : null,
-  };
-}
-
-export function buildHistoryV2TimeseriesPollutantIndexPayload({
-  domain,
-  grain = null,
-  profile = null,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-  generatedAt,
-  bucket,
-  dataPrefix,
-  pollutantManifestKey,
-  pollutantManifest,
-}) {
-  const normalizedDomain = String(domain || "").trim().toLowerCase();
-  if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
-    throw new Error(`Unsupported R2 history v2 index domain: ${String(domain || "")}`);
-  }
-  const normalizedPollutantCode = parsePollutantCode(pollutantCode || pollutantManifest?.pollutant_code);
-  if (!normalizedPollutantCode) {
-    throw new Error(`Invalid pollutant_code for R2 history v2 index: ${String(pollutantCode || "")}`);
-  }
-  const files = Array.from(
-    (Array.isArray(pollutantManifest?.files) ? pollutantManifest.files : []).map(
-      (entry) => normalizeHistoryV2TimeseriesIndexFileEntry(entry, normalizedPollutantCode, normalizedDomain),
-    ),
-  ).filter(Boolean);
-  files.sort((a, b) => a.key.localeCompare(b.key));
-
-  let minTimeseriesId = null;
-  let maxTimeseriesId = null;
-  let indexedFileCount = 0;
-  for (const file of files) {
-    const fileMin = parsePositiveId(file.min_timeseries_id);
-    const fileMax = parsePositiveId(file.max_timeseries_id);
-    if (fileMin && fileMax) {
-      indexedFileCount += 1;
-      if (!minTimeseriesId || fileMin < minTimeseriesId) {
-        minTimeseriesId = fileMin;
-      }
-      if (!maxTimeseriesId || fileMax > maxTimeseriesId) {
-        maxTimeseriesId = fileMax;
-      }
-    }
-  }
-
-  const sourceRowCount = parseNonNegativeInt(pollutantManifest?.source_row_count)
-    ?? parseNonNegativeInt(pollutantManifest?.row_count)
-    ?? files.reduce((sum, file) => sum + file.row_count, 0);
-  const timeseriesRowCounts =
-    normalizeTimeseriesRowCounts(pollutantManifest?.timeseries_row_counts)
-    ?? aggregateTimeseriesRowCountsFromFiles(
-      Array.isArray(pollutantManifest?.files) ? pollutantManifest.files : [],
-    );
-  const minObservedAtUtc =
-    toIsoOrNull(pollutantManifest?.min_observed_at_utc)
-    || toIsoOrNull(pollutantManifest?.min_observed_at)
-    || files.reduce((current, file) => minIso(current, file.min_observed_at_utc), null);
-  const maxObservedAtUtc =
-    toIsoOrNull(pollutantManifest?.max_observed_at_utc)
-    || toIsoOrNull(pollutantManifest?.max_observed_at)
-    || files.reduce((current, file) => maxIso(current, file.max_observed_at_utc), null);
-  const minTimestampHourUtc =
-    toIsoOrNull(pollutantManifest?.min_timestamp_hour_utc)
-    || files.reduce((current, file) => minIso(current, file.min_timestamp_hour_utc), null);
-  const maxTimestampHourUtc =
-    toIsoOrNull(pollutantManifest?.max_timestamp_hour_utc)
-    || files.reduce((current, file) => maxIso(current, file.max_timestamp_hour_utc), null);
-  const manifestHash =
-    typeof pollutantManifest?.manifest_hash === "string" && pollutantManifest.manifest_hash.trim()
-      ? pollutantManifest.manifest_hash.trim()
-      : null;
-
-  return {
-    schema_version: HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at:
-      toIsoOrNull(pollutantManifest?.backed_up_at_utc)
-      || toIsoOrNull(generatedAt)
-      || null,
-    source: "r2_pollutant_manifest",
-    history_version: "v2",
-    domain: normalizedDomain,
-    grain,
-    profile,
-    index_kind: "timeseries_file_ranges",
-    bucket: String(bucket || "").trim() || null,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_code: normalizedPollutantCode,
-    data_prefix: normalizePrefix(dataPrefix || ""),
-    pollutant_manifest_key: pollutantManifestKey,
-    connector_pollutant_manifest_key: pollutantManifestKey,
-    pollutant_manifest_hash: manifestHash,
-    source_row_count: sourceRowCount,
-    timeseries_row_counts: timeseriesRowCounts,
-    file_count: files.length,
-    indexed_file_count: indexedFileCount,
-    index_coverage: indexedFileCount === files.length ? "complete" : "partial",
-    min_timeseries_id: minTimeseriesId,
-    max_timeseries_id: maxTimeseriesId,
-    min_observed_at_utc: normalizedDomain === "observations" ? minObservedAtUtc : null,
-    max_observed_at_utc: normalizedDomain === "observations" ? maxObservedAtUtc : null,
-    min_timestamp_hour_utc: normalizedDomain === "aqilevels" ? minTimestampHourUtc : null,
-    max_timestamp_hour_utc: normalizedDomain === "aqilevels" ? maxTimestampHourUtc : null,
-    files,
-    backed_up_at_utc: toIsoOrNull(pollutantManifest?.backed_up_at_utc),
-  };
-}
-
 function aggregateConnectorsFromFiles(files) {
   const connectorMap = new Map();
   for (const entry of Array.isArray(files) ? files : []) {
@@ -1564,120 +1209,6 @@ function buildAqilevelsTimeseriesLatestPayload({
           aqilevelsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX,
         )}/day_utc={day_utc}/connector_id={connector_id}/manifest.json`,
       latest_key: buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix),
-    },
-    day_summaries: sortedSummaries,
-  };
-}
-
-function normalizeHistoryV2TimeseriesLatestDaySummary(entry) {
-  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-    return null;
-  }
-  const dayUtc = parseIsoDay(entry.day_utc);
-  if (!dayUtc) {
-    return null;
-  }
-  const connectorIds = Array.from(new Set(
-    (Array.isArray(entry.connector_ids) ? entry.connector_ids : [])
-      .map((value) => parsePositiveId(value))
-      .filter(Boolean),
-  )).sort((a, b) => a - b);
-  const pollutantCodes = Array.from(new Set(
-    (Array.isArray(entry.pollutant_codes) ? entry.pollutant_codes : [])
-      .map((value) => parsePollutantCode(value))
-      .filter(Boolean),
-  )).sort((a, b) => a.localeCompare(b));
-  const connectorCount = parseNonNegativeInt(entry.connector_count);
-  const pollutantIndexCount = parseNonNegativeInt(entry.pollutant_index_count);
-  return {
-    day_utc: dayUtc,
-    connector_count: connectorIds.length || connectorCount || 0,
-    connector_ids: connectorIds,
-    pollutant_codes: pollutantCodes,
-    pollutant_index_count: pollutantIndexCount || 0,
-    file_count: parseNonNegativeInt(entry.file_count) || 0,
-    indexed_file_count: parseNonNegativeInt(entry.indexed_file_count) || 0,
-    backed_up_at_utc: toIsoOrNull(entry.backed_up_at_utc),
-  };
-}
-
-function buildHistoryV2TimeseriesLatestPayload({
-  domain,
-  grain = null,
-  profile = null,
-  bucket,
-  generatedAt,
-  existingGeneratedAt = null,
-  indexPrefix = DEFAULT_R2_HISTORY_V2_INDEX_PREFIX,
-  dataPrefix,
-  timeseriesIndexPrefix,
-  daySummaries,
-}) {
-  const normalizedDomain = String(domain || "").trim().toLowerCase();
-  if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
-    throw new Error(`Unsupported R2 history v2 latest index domain: ${String(domain || "")}`);
-  }
-  const normalizedIndexPrefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
-  const normalizedTimeseriesPrefix = normalizePrefix(timeseriesIndexPrefix || (
-    normalizedDomain === "observations"
-      ? DEFAULT_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX
-      : DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
-  ));
-  const latestKey = normalizedDomain === "observations"
-    ? buildR2HistoryV2ObservationsTimeseriesLatestKey(normalizedIndexPrefix)
-    : buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(normalizedIndexPrefix);
-  const sortedSummaries = Array.from(Array.isArray(daySummaries) ? daySummaries : [])
-    .map((entry) => normalizeHistoryV2TimeseriesLatestDaySummary(entry))
-    .filter(Boolean)
-    .sort((a, b) => a.day_utc.localeCompare(b.day_utc));
-  const days = sortedSummaries.map((entry) => entry.day_utc);
-  const connectorIndexCount = sortedSummaries.reduce(
-    (sum, entry) => sum + (parseNonNegativeInt(entry.connector_count) || 0),
-    0,
-  );
-  const pollutantIndexCount = sortedSummaries.reduce(
-    (sum, entry) => sum + (parseNonNegativeInt(entry.pollutant_index_count) || 0),
-    0,
-  );
-  const fileCount = sortedSummaries.reduce(
-    (sum, entry) => sum + (parseNonNegativeInt(entry.file_count) || 0),
-    0,
-  );
-  const indexedFileCount = sortedSummaries.reduce(
-    (sum, entry) => sum + (parseNonNegativeInt(entry.indexed_file_count) || 0),
-    0,
-  );
-
-  return {
-    schema_version: HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION,
-    generated_at:
-      pickMaxIsoTimestamp([
-        ...sortedSummaries.map((entry) => entry.backed_up_at_utc),
-        existingGeneratedAt,
-      ])
-      || toIsoOrNull(generatedAt)
-      || new Date().toISOString(),
-    source: "r2_pollutant_manifests",
-    history_version: "v2",
-    domain: normalizedDomain,
-    grain,
-    profile,
-    index_kind: "timeseries_file_ranges",
-    bucket: String(bucket || "").trim() || null,
-    data_prefix: normalizePrefix(dataPrefix || ""),
-    index_prefix: normalizedTimeseriesPrefix,
-    min_day_utc: days.length ? days[0] : null,
-    max_day_utc: days.length ? days[days.length - 1] : null,
-    day_count: days.length,
-    connector_index_count: connectorIndexCount,
-    pollutant_index_count: pollutantIndexCount,
-    file_count: fileCount,
-    indexed_file_count: indexedFileCount,
-    days,
-    key_layout: {
-      pollutant_index_manifest_key_template:
-        `${normalizedTimeseriesPrefix}/day_utc={day_utc}/connector_id={connector_id}/pollutant_code={pollutant_code}/manifest.json`,
-      latest_key: latestKey,
     },
     day_summaries: sortedSummaries,
   };
@@ -2279,229 +1810,6 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
   };
 }
 
-async function rebuildR2HistoryV2TimeseriesIndexes({
-  r2,
-  bucketName,
-  domain,
-  dataPrefix,
-  indexPrefix = DEFAULT_R2_HISTORY_V2_INDEX_PREFIX,
-  timeseriesIndexPrefix,
-  generatedAt = new Date().toISOString(),
-  fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
-  maxKeys = DEFAULT_MAX_KEYS,
-}) {
-  const normalizedDomain = String(domain || "").trim().toLowerCase();
-  if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
-    throw new Error(`Unsupported R2 history v2 timeseries index domain: ${String(domain || "")}`);
-  }
-  if (!hasRequiredR2Config(r2)) {
-    throw new Error("Missing R2 config for R2 history v2 timeseries index rebuild");
-  }
-
-  const normalizedDataPrefix = normalizePrefix(dataPrefix);
-  const normalizedIndexPrefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
-  const normalizedTimeseriesPrefix = normalizePrefix(timeseriesIndexPrefix || (
-    normalizedDomain === "observations"
-      ? DEFAULT_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX
-      : DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
-  ));
-  const dayPrefixes = await r2ListAllCommonPrefixes({
-    r2,
-    prefix: `${normalizedDataPrefix}/`,
-    delimiter: "/",
-    max_keys: maxKeys,
-  });
-  const dayList = dayPrefixes
-    .map((prefix) => parseDayFromPrefix(prefix, normalizedDataPrefix))
-    .filter(Boolean)
-    .sort((a, b) => a.localeCompare(b));
-
-  const warnings = [];
-  const daySummaries = (await mapWithConcurrency(
-    dayList,
-    fetchConcurrency,
-    async (dayUtc) => {
-      const dayManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/manifest.json`;
-      let dayManifestObject;
-      try {
-        dayManifestObject = await fetchJsonObjectFromR2(r2, dayManifestKey);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (message.includes("(404)")) {
-          warnings.push(`Skipped missing ${normalizedDomain} v2 day manifest for ${dayUtc}`);
-          return null;
-        }
-        throw new Error(`Failed to read ${normalizedDomain} v2 day manifest ${dayManifestKey}: ${message}`);
-      }
-
-      const connectorTargets = resolveHistoryV2ConnectorManifestTargets(
-        dayManifestObject,
-        dayUtc,
-        normalizedDataPrefix,
-      );
-      const connectorResults = (await mapWithConcurrency(
-        connectorTargets,
-        fetchConcurrency,
-        async (connectorTarget) => {
-          let connectorManifestObject;
-          try {
-            connectorManifestObject = await fetchJsonObjectFromR2(r2, connectorTarget.manifest_key);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            warnings.push(
-              `Skipped ${normalizedDomain} v2 connector manifest day=${dayUtc} connector=${connectorTarget.connector_id}: ${message}`,
-            );
-            return null;
-          }
-
-          const pollutantTargets = resolveHistoryV2PollutantManifestTargets(
-            connectorManifestObject,
-            dayUtc,
-            connectorTarget.connector_id,
-            normalizedDataPrefix,
-          );
-          const pollutantResults = (await mapWithConcurrency(
-            pollutantTargets,
-            fetchConcurrency,
-            async (pollutantTarget) => {
-              try {
-                const pollutantManifestObject = await fetchJsonObjectFromR2(
-                  r2,
-                  pollutantTarget.manifest_key,
-                );
-                const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
-                  domain: normalizedDomain,
-                  grain: normalizedDomain === "aqilevels" ? "hourly" : null,
-                  profile: normalizedDomain === "aqilevels" ? "data" : null,
-                  dayUtc,
-                  connectorId: connectorTarget.connector_id,
-                  pollutantCode: pollutantTarget.pollutant_code,
-                  generatedAt,
-                  bucket: bucketName || r2.bucket,
-                  dataPrefix: normalizedDataPrefix,
-                  pollutantManifestKey: pollutantTarget.manifest_key,
-                  pollutantManifest: pollutantManifestObject,
-                });
-                const pollutantIndexKey = normalizedDomain === "observations"
-                  ? buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
-                    normalizedTimeseriesPrefix,
-                    dayUtc,
-                    connectorTarget.connector_id,
-                    pollutantTarget.pollutant_code,
-                  )
-                  : buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
-                    normalizedTimeseriesPrefix,
-                    dayUtc,
-                    connectorTarget.connector_id,
-                    pollutantTarget.pollutant_code,
-                  );
-                const body = `${JSON.stringify(payload, null, 2)}\n`;
-                const putResult = await r2PutObjectIfChanged({
-                  r2,
-                  key: pollutantIndexKey,
-                  body,
-                  content_type: "application/json; charset=utf-8",
-                });
-                return {
-                  connector_id: connectorTarget.connector_id,
-                  pollutant_code: pollutantTarget.pollutant_code,
-                  index_key: pollutantIndexKey,
-                  file_count: payload.file_count,
-                  indexed_file_count: payload.indexed_file_count,
-                  put_skipped: Boolean(putResult.skipped),
-                  backed_up_at_utc: payload.backed_up_at_utc,
-                };
-              } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                warnings.push(
-                  `Skipped ${normalizedDomain} v2 pollutant timeseries index day=${dayUtc} connector=${connectorTarget.connector_id} pollutant=${pollutantTarget.pollutant_code}: ${message}`,
-                );
-                return null;
-              }
-            },
-          )).filter(Boolean);
-
-          return {
-            connector_id: connectorTarget.connector_id,
-            pollutant_indexes: pollutantResults.sort((a, b) =>
-              a.pollutant_code.localeCompare(b.pollutant_code)
-            ),
-            backed_up_at_utc:
-              toIsoOrNull(connectorManifestObject?.backed_up_at_utc)
-              || pickMaxIsoTimestamp(pollutantResults.map((entry) => entry.backed_up_at_utc)),
-          };
-        },
-      ))
-        .filter(Boolean)
-        .sort((a, b) => a.connector_id - b.connector_id);
-
-      const pollutantIndexes = connectorResults.flatMap((entry) => entry.pollutant_indexes);
-      const pollutantCodes = Array.from(new Set(
-        pollutantIndexes.map((entry) => entry.pollutant_code).filter(Boolean),
-      )).sort((a, b) => a.localeCompare(b));
-      return {
-        day_utc: dayUtc,
-        connector_count: connectorResults.length,
-        connector_ids: connectorResults.map((entry) => entry.connector_id),
-        pollutant_codes: pollutantCodes,
-        pollutant_index_count: pollutantIndexes.length,
-        file_count: pollutantIndexes.reduce((sum, entry) => sum + entry.file_count, 0),
-        indexed_file_count: pollutantIndexes.reduce(
-          (sum, entry) => sum + entry.indexed_file_count,
-          0,
-        ),
-        backed_up_at_utc:
-          toIsoOrNull(dayManifestObject?.backed_up_at_utc)
-          || pickMaxIsoTimestamp(connectorResults.map((entry) => entry.backed_up_at_utc)),
-        connector_indexes: connectorResults,
-      };
-    },
-  )).filter(Boolean);
-
-  const latestPayload = buildHistoryV2TimeseriesLatestPayload({
-    domain: normalizedDomain,
-    grain: normalizedDomain === "aqilevels" ? "hourly" : null,
-    profile: normalizedDomain === "aqilevels" ? "data" : null,
-    bucket: bucketName || r2.bucket,
-    generatedAt,
-    indexPrefix: normalizedIndexPrefix,
-    dataPrefix: normalizedDataPrefix,
-    timeseriesIndexPrefix: normalizedTimeseriesPrefix,
-    daySummaries,
-  });
-  const latestKey = normalizedDomain === "observations"
-    ? buildR2HistoryV2ObservationsTimeseriesLatestKey(normalizedIndexPrefix)
-    : buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(normalizedIndexPrefix);
-  const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
-  const latestPut = await r2PutObjectIfChanged({
-    r2,
-    key: latestKey,
-    body: latestBody,
-    content_type: "application/json; charset=utf-8",
-  });
-
-  return {
-    history_version: "v2",
-    domain: normalizedDomain,
-    grain: normalizedDomain === "aqilevels" ? "hourly" : null,
-    profile: normalizedDomain === "aqilevels" ? "data" : null,
-    index_kind: "timeseries_file_ranges",
-    latest_index_key: latestKey,
-    latest_index_bytes: latestPut.bytes,
-    latest_index_put_skipped: Boolean(latestPut.skipped),
-    data_prefix: normalizedDataPrefix,
-    timeseries_index_prefix: normalizedTimeseriesPrefix,
-    day_prefix_count: dayList.length,
-    indexed_day_count: latestPayload.day_count,
-    connector_index_count: latestPayload.connector_index_count,
-    pollutant_index_count: latestPayload.pollutant_index_count,
-    file_count: latestPayload.file_count,
-    indexed_file_count: latestPayload.indexed_file_count,
-    warning_count: warnings.length,
-    warnings,
-  };
-}
-
 async function updateR2HistoryIndexForDomainTargeted({
   r2,
   bucketName,
@@ -3021,7 +2329,6 @@ export async function updateR2HistoryIndexesTargeted({
 export async function rebuildR2HistoryIndexes({
   env = defaultEnv(),
   domains = ["observations", "aqilevels"],
-  historyVersion = "v1",
   generatedAt = new Date().toISOString(),
   fetchConcurrency,
   maxKeys,
@@ -3041,62 +2348,6 @@ export async function rebuildR2HistoryIndexes({
 
   if (!normalizedDomains.length) {
     throw new Error("No supported domains requested for R2 history index rebuild");
-  }
-
-  const normalizedHistoryVersion = String(historyVersion || "v1").trim().toLowerCase();
-  if (normalizedHistoryVersion !== "v1" && normalizedHistoryVersion !== "v2") {
-    throw new Error(`Unsupported R2 history index version: ${String(historyVersion || "")}`);
-  }
-
-  if (normalizedHistoryVersion === "v2") {
-    const results = [];
-    let observationsTimeseries = null;
-    let aqilevelsTimeseries = null;
-    for (const domain of normalizedDomains) {
-      if (domain === "observations") {
-        observationsTimeseries = await rebuildR2HistoryV2TimeseriesIndexes({
-          r2: config.r2,
-          bucketName: config.r2.bucket,
-          domain: "observations",
-          dataPrefix: config.observations_prefix_v2,
-          indexPrefix: config.index_prefix_v2,
-          timeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
-          generatedAt,
-          fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
-          maxKeys: maxKeys || config.max_keys,
-        });
-        results.push(observationsTimeseries);
-      }
-      if (domain === "aqilevels") {
-        aqilevelsTimeseries = await rebuildR2HistoryV2TimeseriesIndexes({
-          r2: config.r2,
-          bucketName: config.r2.bucket,
-          domain: "aqilevels",
-          dataPrefix: config.aqilevels_hourly_data_prefix_v2,
-          indexPrefix: config.index_prefix_v2,
-          timeseriesIndexPrefix: config.aqilevels_hourly_data_timeseries_index_prefix_v2,
-          generatedAt,
-          fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
-          maxKeys: maxKeys || config.max_keys,
-        });
-        results.push(aqilevelsTimeseries);
-      }
-    }
-
-    return {
-      history_version: "v2",
-      generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
-      bucket: config.r2.bucket,
-      index_prefix: config.index_prefix_v2,
-      observations_timeseries_index_prefix: config.observations_timeseries_index_prefix_v2,
-      aqilevels_hourly_data_timeseries_index_prefix:
-        config.aqilevels_hourly_data_timeseries_index_prefix_v2,
-      observations_prefix: config.observations_prefix_v2,
-      aqilevels_hourly_data_prefix: config.aqilevels_hourly_data_prefix_v2,
-      results,
-      observations_timeseries: observationsTimeseries,
-      aqilevels_timeseries: aqilevelsTimeseries,
-    };
   }
 
   const results = [];
