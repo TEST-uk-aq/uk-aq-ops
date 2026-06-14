@@ -1677,15 +1677,11 @@ function parseOptionalDay(value: unknown): string | null {
 }
 
 function buildObsDayManifestKey(dayUtc: string): string {
-  return `${activeObsHistoryPrefix()}/day_utc=${dayUtc}/manifest.json`;
+  return `${OBS_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/manifest.json`;
 }
 
 function buildAqiDayManifestKey(dayUtc: string): string {
-  return `${activeAqiHistoryDataPrefix()}/day_utc=${dayUtc}/manifest.json`;
-}
-
-function buildAqiDebugDayManifestKey(dayUtc: string): string {
-  return `${activeAqiHistoryDebugPrefix()}/day_utc=${dayUtc}/manifest.json`;
+  return `${AQI_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/manifest.json`;
 }
 
 function buildCoreDayManifestKey(dayUtc: string): string {
@@ -1693,23 +1689,19 @@ function buildCoreDayManifestKey(dayUtc: string): string {
 }
 
 function buildObsDayPrefix(dayUtc: string): string {
-  return `${activeObsHistoryPrefix()}/day_utc=${dayUtc}`;
+  return `${OBS_R2_HISTORY_PREFIX}/day_utc=${dayUtc}`;
 }
 
 function buildAqiDayPrefix(dayUtc: string): string {
-  return `${activeAqiHistoryDataPrefix()}/day_utc=${dayUtc}`;
+  return `${AQI_R2_HISTORY_PREFIX}/day_utc=${dayUtc}`;
 }
 
 function buildObsConnectorPrefix(dayUtc: string, connectorId: number): string {
-  return `${activeObsHistoryPrefix()}/day_utc=${dayUtc}/connector_id=${connectorId}`;
+  return `${OBS_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/connector_id=${connectorId}`;
 }
 
 function buildAqiConnectorPrefix(dayUtc: string, connectorId: number): string {
-  return `${activeAqiHistoryDataPrefix()}/day_utc=${dayUtc}/connector_id=${connectorId}`;
-}
-
-function buildAqiDebugConnectorPrefix(dayUtc: string, connectorId: number): string {
-  return `${activeAqiHistoryDebugPrefix()}/day_utc=${dayUtc}/connector_id=${connectorId}`;
+  return `${AQI_R2_HISTORY_PREFIX}/day_utc=${dayUtc}/connector_id=${connectorId}`;
 }
 
 function buildObsConnectorManifestKey(
@@ -1744,24 +1736,6 @@ function buildAqiPartKey(
   return `${buildAqiConnectorPrefix(dayUtc, connectorId)}/part-${
     String(partIndex).padStart(5, "0")
   }.parquet`;
-}
-
-function activeObsHistoryPrefix(): string {
-  return HISTORY_R2_WRITE_VERSION === "v2"
-    ? OBS_R2_HISTORY_PREFIX_V2
-    : OBS_R2_HISTORY_PREFIX;
-}
-
-function activeAqiHistoryDataPrefix(): string {
-  return HISTORY_R2_WRITE_VERSION === "v2"
-    ? AQI_R2_HISTORY_DATA_PREFIX_V2
-    : AQI_R2_HISTORY_PREFIX;
-}
-
-function activeAqiHistoryDebugPrefix(): string {
-  return HISTORY_R2_WRITE_VERSION === "v2"
-    ? AQI_R2_HISTORY_DEBUG_PREFIX_V2
-    : AQI_R2_HISTORY_PREFIX;
 }
 
 function normalizePollutantCodeForR2Path(pollutantCode: string): string {
@@ -3043,260 +3017,6 @@ function createAqiDayManifest(args: {
   });
 }
 
-function minFileEntryString(
-  entries: ObsHistoryFileEntry[],
-  fieldName: keyof ObsHistoryFileEntry,
-): string | null {
-  let out: string | null = null;
-  for (const entry of entries) {
-    const value = typeof entry[fieldName] === "string"
-      ? String(entry[fieldName])
-      : null;
-    if (value && (!out || value < out)) out = value;
-  }
-  return out;
-}
-
-function maxFileEntryString(
-  entries: ObsHistoryFileEntry[],
-  fieldName: keyof ObsHistoryFileEntry,
-): string | null {
-  let out: string | null = null;
-  for (const entry of entries) {
-    const value = typeof entry[fieldName] === "string"
-      ? String(entry[fieldName])
-      : null;
-    if (value && (!out || value > out)) out = value;
-  }
-  return out;
-}
-
-function minFileEntryNumber(
-  entries: ObsHistoryFileEntry[],
-  fieldName: keyof ObsHistoryFileEntry,
-): number | null {
-  let out: number | null = null;
-  for (const entry of entries) {
-    const value = Number(entry[fieldName]);
-    if (!Number.isFinite(value) || value <= 0) continue;
-    const normalized = Math.trunc(value);
-    out = out === null ? normalized : Math.min(out, normalized);
-  }
-  return out;
-}
-
-function maxFileEntryNumber(
-  entries: ObsHistoryFileEntry[],
-  fieldName: keyof ObsHistoryFileEntry,
-): number | null {
-  let out: number | null = null;
-  for (const entry of entries) {
-    const value = Number(entry[fieldName]);
-    if (!Number.isFinite(value) || value <= 0) continue;
-    const normalized = Math.trunc(value);
-    out = out === null ? normalized : Math.max(out, normalized);
-  }
-  return out;
-}
-
-function historyV2AqiColumns(profile: "data" | "debug"): readonly string[] {
-  return profile === "data"
-    ? HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2
-    : HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2;
-}
-
-function createAqiV2PollutantManifest(args: {
-  profile: "data" | "debug";
-  dayUtc: string;
-  connectorId: number;
-  pollutantCode: "no2" | "pm25" | "pm10";
-  runId: string;
-  manifestKey: string;
-  sourceRowCount: number;
-  fileEntries: ObsHistoryFileEntry[];
-  writerGitSha: string | null;
-  backedUpAtUtc: string;
-}) {
-  const files = args.fileEntries.map((entry) => ({
-    ...entry,
-    pollutant_code: args.pollutantCode,
-  }));
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "pollutant",
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: args.profile,
-    day_utc: args.dayUtc,
-    connector_id: args.connectorId,
-    pollutant_code: args.pollutantCode,
-    pollutant_codes: [args.pollutantCode],
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: args.sourceRowCount,
-    row_count: args.sourceRowCount,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: [],
-    columns: historyV2AqiColumns(args.profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, args.sourceRowCount),
-    backed_up_at_utc: args.backedUpAtUtc,
-  });
-}
-
-function createAqiV2ConnectorManifest(args: {
-  profile: "data" | "debug";
-  dayUtc: string;
-  connectorId: number;
-  runId: string;
-  manifestKey: string;
-  pollutantManifests: Array<Record<string, unknown>>;
-  writerGitSha: string | null;
-  backedUpAtUtc: string;
-}) {
-  const files = args.pollutantManifests.flatMap((manifest) =>
-    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
-  );
-  const pollutantCodes = Array.from(new Set(args.pollutantManifests
-    .map((manifest) => String(manifest.pollutant_code || "").trim())
-    .filter(Boolean))).sort();
-  const totalRows = args.pollutantManifests.reduce(
-    (sum, manifest) => sum + toSafeInt(manifest.source_row_count),
-    0,
-  );
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const childManifests = args.pollutantManifests.map((manifest) => ({
-    pollutant_code: manifest.pollutant_code,
-    manifest_key: manifest.manifest_key,
-    manifest_hash: manifest.manifest_hash,
-    source_row_count: manifest.source_row_count,
-    row_count: manifest.row_count,
-    file_count: manifest.file_count,
-    total_bytes: manifest.total_bytes,
-    min_timeseries_id: manifest.min_timeseries_id ?? null,
-    max_timeseries_id: manifest.max_timeseries_id ?? null,
-    min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-    max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-  }));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "connector",
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: args.profile,
-    day_utc: args.dayUtc,
-    connector_id: args.connectorId,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    pollutant_manifests: childManifests,
-    columns: historyV2AqiColumns(args.profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: args.backedUpAtUtc,
-  });
-}
-
-function createAqiV2DayManifest(args: {
-  profile: "data" | "debug";
-  dayUtc: string;
-  runId: string;
-  manifestKey: string;
-  connectorManifests: Array<Record<string, unknown>>;
-  writerGitSha: string | null;
-  backedUpAtUtc: string;
-}) {
-  const files = args.connectorManifests.flatMap((manifest) =>
-    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
-  );
-  const connectorIds = args.connectorManifests
-    .map((manifest) => Number(manifest.connector_id))
-    .filter((value) => Number.isInteger(value))
-    .sort((left, right) => left - right);
-  const pollutantCodes = Array.from(new Set(args.connectorManifests
-    .flatMap((manifest) => Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : [])
-    .map((value) => String(value || "").trim())
-    .filter(Boolean))).sort();
-  const totalRows = args.connectorManifests.reduce(
-    (sum, manifest) => sum + toSafeInt(manifest.source_row_count),
-    0,
-  );
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const childManifests = args.connectorManifests.map((manifest) => ({
-    connector_id: manifest.connector_id,
-    manifest_key: manifest.manifest_key,
-    manifest_hash: manifest.manifest_hash,
-    source_row_count: manifest.source_row_count,
-    row_count: manifest.row_count,
-    file_count: manifest.file_count,
-    total_bytes: manifest.total_bytes,
-    pollutant_codes: manifest.pollutant_codes,
-    min_timeseries_id: manifest.min_timeseries_id ?? null,
-    max_timeseries_id: manifest.max_timeseries_id ?? null,
-    min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-    max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-  }));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "day",
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: args.profile,
-    day_utc: args.dayUtc,
-    connector_id: null,
-    connector_ids: connectorIds,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    connector_manifests: childManifests,
-    columns: historyV2AqiColumns(args.profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: args.backedUpAtUtc,
-  });
-}
-
 function ensureParquetWasmInitialized(): void {
   if (parquetWasmInitialized) {
     return;
@@ -3655,13 +3375,9 @@ async function loadExistingConnectorManifest(
           : null,
         min_observed_at: typeof item.min_observed_at === "string"
           ? item.min_observed_at
-          : typeof item.min_observed_at_utc === "string"
-          ? item.min_observed_at_utc
           : null,
         max_observed_at: typeof item.max_observed_at === "string"
           ? item.max_observed_at
-          : typeof item.max_observed_at_utc === "string"
-          ? item.max_observed_at_utc
           : null,
       };
     })
@@ -3675,13 +3391,9 @@ async function loadExistingConnectorManifest(
     source_row_count: toSafeInt(record.source_row_count),
     min_observed_at: typeof record.min_observed_at === "string"
       ? record.min_observed_at
-      : typeof record.min_observed_at_utc === "string"
-      ? record.min_observed_at_utc
       : null,
     max_observed_at: typeof record.max_observed_at === "string"
       ? record.max_observed_at
-      : typeof record.max_observed_at_utc === "string"
-      ? record.max_observed_at_utc
       : null,
     parquet_object_keys: Array.isArray(record.parquet_object_keys)
       ? record.parquet_object_keys.map((value) => String(value || "").trim())
@@ -3892,14 +3604,6 @@ async function loadExistingAqiConnectorManifest(
   connectorId: number,
 ): Promise<AqilevelsConnectorManifest | null> {
   const key = buildAqiConnectorManifestKey(dayUtc, connectorId);
-  return await loadAqiConnectorManifestByKey(dayUtc, connectorId, key);
-}
-
-async function loadAqiConnectorManifestByKey(
-  dayUtc: string,
-  connectorId: number,
-  key: string,
-): Promise<AqilevelsConnectorManifest | null> {
   const head = await r2HeadObject({ r2: OBS_R2_CONFIG, key });
   if (!head.exists) {
     return null;
@@ -4280,236 +3984,6 @@ async function exportObsConnectorRowsToR2(args: {
   };
 }
 
-function aqilevelRowsToParquetRows(
-  rows: AqilevelsHistoryRow[],
-  connectorId: number,
-): AqilevelsHistoryParquetRow[] {
-  return rows.map((row) => ({
-    connector_id: connectorId,
-    timeseries_id: row.timeseries_id,
-    station_id: row.station_id,
-    pollutant_code: row.pollutant_code,
-    timestamp_hour_utc: row.timestamp_hour_utc,
-    daqi_input_value_ugm3: row.daqi_input_value_ugm3,
-    daqi_input_averaging_code: row.daqi_input_averaging_code,
-    daqi_index_level: row.daqi_index_level,
-    daqi_source_observation_count: row.daqi_source_observation_count,
-    daqi_required_observation_count: row.daqi_required_observation_count,
-    daqi_calculation_status: row.daqi_calculation_status,
-    daqi_missing_reason: row.daqi_missing_reason,
-    eaqi_input_value_ugm3: row.eaqi_input_value_ugm3,
-    eaqi_input_averaging_code: row.eaqi_input_averaging_code,
-    eaqi_index_level: row.eaqi_index_level,
-    eaqi_source_observation_count: row.eaqi_source_observation_count,
-    eaqi_required_observation_count: row.eaqi_required_observation_count,
-    eaqi_calculation_status: row.eaqi_calculation_status,
-    eaqi_missing_reason: row.eaqi_missing_reason,
-    hourly_sample_count: row.hourly_sample_count,
-    algorithm_version: row.algorithm_version,
-    computed_at_utc: row.computed_at_utc,
-    hourly_mean_ugm3: row.hourly_mean_ugm3,
-    rolling24h_mean_ugm3: row.rolling24h_mean_ugm3,
-    no2_hourly_mean_ugm3: row.no2_hourly_mean_ugm3,
-    pm25_hourly_mean_ugm3: row.pm25_hourly_mean_ugm3,
-    pm10_hourly_mean_ugm3: row.pm10_hourly_mean_ugm3,
-    pm25_rolling24h_mean_ugm3: row.pm25_rolling24h_mean_ugm3,
-    pm10_rolling24h_mean_ugm3: row.pm10_rolling24h_mean_ugm3,
-    daqi_no2_index_level: row.daqi_no2_index_level,
-    daqi_pm25_rolling24h_index_level: row.daqi_pm25_rolling24h_index_level,
-    daqi_pm10_rolling24h_index_level: row.daqi_pm10_rolling24h_index_level,
-    eaqi_no2_index_level: row.eaqi_no2_index_level,
-    eaqi_pm25_index_level: row.eaqi_pm25_index_level,
-    eaqi_pm10_index_level: row.eaqi_pm10_index_level,
-    updated_at: row.updated_at,
-  }));
-}
-
-function groupAqilevelRowsByPollutant(
-  rows: AqilevelsHistoryRow[],
-): Map<"no2" | "pm25" | "pm10", AqilevelsHistoryRow[]> {
-  const grouped = new Map<"no2" | "pm25" | "pm10", AqilevelsHistoryRow[]>();
-  for (const row of rows) {
-    if (!grouped.has(row.pollutant_code)) grouped.set(row.pollutant_code, []);
-    grouped.get(row.pollutant_code)?.push(row);
-  }
-  return grouped;
-}
-
-async function exportAqiConnectorRowsToR2V2(args: {
-  run_id: string;
-  day_utc: string;
-  connector_id: number;
-  rows: AqilevelsHistoryRow[];
-  force_replace?: boolean;
-}): Promise<{
-  rows_read: number;
-  objects_written_r2: number;
-  parquet_files_written: number;
-  manifest_key: string;
-  connector_manifest: AqilevelsConnectorManifest & Record<string, unknown>;
-}> {
-  if (args.force_replace ?? FORCE_REPLACE) {
-    await deleteR2Prefix(
-      buildHistoryV2ConnectorPrefix(
-        AQI_R2_HISTORY_DATA_PREFIX_V2,
-        args.day_utc,
-        args.connector_id,
-      ),
-    );
-    await deleteR2Prefix(
-      buildHistoryV2ConnectorPrefix(
-        AQI_R2_HISTORY_DEBUG_PREFIX_V2,
-        args.day_utc,
-        args.connector_id,
-      ),
-    );
-  }
-
-  const sortedRows = [...args.rows].sort((left, right) => {
-    if (left.pollutant_code !== right.pollutant_code) {
-      return left.pollutant_code.localeCompare(right.pollutant_code);
-    }
-    if (left.timeseries_id !== right.timeseries_id) {
-      return left.timeseries_id - right.timeseries_id;
-    }
-    if (left.timestamp_hour_utc < right.timestamp_hour_utc) return -1;
-    if (left.timestamp_hour_utc > right.timestamp_hour_utc) return 1;
-    return 0;
-  });
-  const pollutantGroups = groupAqilevelRowsByPollutant(sortedRows);
-  const dataPollutantManifests: Array<Record<string, unknown>> = [];
-  const debugPollutantManifests: Array<Record<string, unknown>> = [];
-  let objectsWritten = 0;
-  let parquetFilesWritten = 0;
-
-  for (const [pollutantCode, pollutantRows] of pollutantGroups.entries()) {
-    for (const profile of ["data", "debug"] as const) {
-      const basePrefix = profile === "data"
-        ? AQI_R2_HISTORY_DATA_PREFIX_V2
-        : AQI_R2_HISTORY_DEBUG_PREFIX_V2;
-      const fileEntries: ObsHistoryFileEntry[] = [];
-      const rowChunks = chunkRows(pollutantRows, AQI_R2_PART_MAX_ROWS);
-      for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
-        const chunk = rowChunks[partIndex];
-        if (!chunk.length) continue;
-        const parquetRows = aqilevelRowsToParquetRows(chunk, args.connector_id);
-        const partSummary = summarizeAqilevelsPartRows(parquetRows);
-        const partKey = buildHistoryV2PartKey(
-          basePrefix,
-          args.day_utc,
-          args.connector_id,
-          pollutantCode,
-          partIndex,
-        );
-        const parquetBuffer = profile === "data"
-          ? rowsToAqiDataV2ParquetBuffer(parquetRows)
-          : rowsToAqiDebugV2ParquetBuffer(parquetRows);
-        const putResult = await r2PutObject({
-          r2: OBS_R2_CONFIG,
-          key: partKey,
-          body: parquetBuffer,
-          content_type: "application/vnd.apache.parquet",
-        });
-        fileEntries.push({
-          key: partKey,
-          row_count: chunk.length,
-          bytes: Math.trunc(putResult.bytes),
-          etag_or_hash: putResult.etag || sha256Hex(parquetBuffer),
-          min_timeseries_id: partSummary.min_timeseries_id,
-          max_timeseries_id: partSummary.max_timeseries_id,
-          pollutant_codes: [pollutantCode],
-          min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
-          max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
-        });
-        objectsWritten += 1;
-        parquetFilesWritten += 1;
-      }
-      const manifestKey = buildHistoryV2PollutantManifestKey(
-        basePrefix,
-        args.day_utc,
-        args.connector_id,
-        pollutantCode,
-      );
-      const pollutantManifest = createAqiV2PollutantManifest({
-        profile,
-        dayUtc: args.day_utc,
-        connectorId: args.connector_id,
-        pollutantCode,
-        runId: args.run_id,
-        manifestKey,
-        sourceRowCount: pollutantRows.length,
-        fileEntries,
-        writerGitSha: OBS_R2_WRITER_GIT_SHA,
-        backedUpAtUtc: nowIso(),
-      });
-      await r2PutObject({
-        r2: OBS_R2_CONFIG,
-        key: manifestKey,
-        body: encodeJsonBody(pollutantManifest),
-        content_type: "application/json",
-      });
-      objectsWritten += 1;
-      if (profile === "data") {
-        dataPollutantManifests.push(pollutantManifest);
-      } else {
-        debugPollutantManifests.push(pollutantManifest);
-      }
-    }
-  }
-
-  const dataConnectorManifestKey = buildHistoryV2ConnectorManifestKey(
-    AQI_R2_HISTORY_DATA_PREFIX_V2,
-    args.day_utc,
-    args.connector_id,
-  );
-  const debugConnectorManifestKey = buildHistoryV2ConnectorManifestKey(
-    AQI_R2_HISTORY_DEBUG_PREFIX_V2,
-    args.day_utc,
-    args.connector_id,
-  );
-  const dataConnectorManifest = createAqiV2ConnectorManifest({
-    profile: "data",
-    dayUtc: args.day_utc,
-    connectorId: args.connector_id,
-    runId: args.run_id,
-    manifestKey: dataConnectorManifestKey,
-    pollutantManifests: dataPollutantManifests,
-    writerGitSha: OBS_R2_WRITER_GIT_SHA,
-    backedUpAtUtc: nowIso(),
-  });
-  const debugConnectorManifest = createAqiV2ConnectorManifest({
-    profile: "debug",
-    dayUtc: args.day_utc,
-    connectorId: args.connector_id,
-    runId: args.run_id,
-    manifestKey: debugConnectorManifestKey,
-    pollutantManifests: debugPollutantManifests,
-    writerGitSha: OBS_R2_WRITER_GIT_SHA,
-    backedUpAtUtc: nowIso(),
-  });
-  await r2PutObject({
-    r2: OBS_R2_CONFIG,
-    key: dataConnectorManifestKey,
-    body: encodeJsonBody(dataConnectorManifest),
-    content_type: "application/json",
-  });
-  await r2PutObject({
-    r2: OBS_R2_CONFIG,
-    key: debugConnectorManifestKey,
-    body: encodeJsonBody(debugConnectorManifest),
-    content_type: "application/json",
-  });
-  objectsWritten += 2;
-
-  return {
-    rows_read: sortedRows.length,
-    objects_written_r2: objectsWritten,
-    parquet_files_written: parquetFilesWritten,
-    manifest_key: dataConnectorManifestKey,
-    connector_manifest: dataConnectorManifest as AqilevelsConnectorManifest & Record<string, unknown>,
-  };
-}
-
 async function exportAqiConnectorRowsToR2(args: {
   run_id: string;
   day_utc: string;
@@ -4523,10 +3997,6 @@ async function exportAqiConnectorRowsToR2(args: {
   manifest_key: string;
   connector_manifest: AqilevelsConnectorManifest & Record<string, unknown>;
 }> {
-  if (HISTORY_R2_WRITE_VERSION === "v2") {
-    return await exportAqiConnectorRowsToR2V2(args);
-  }
-
   if (args.force_replace ?? FORCE_REPLACE) {
     await deleteR2Prefix(
       buildAqiConnectorPrefix(args.day_utc, args.connector_id),
@@ -4699,17 +4169,7 @@ async function loadAllObsConnectorManifestsForDay(
 async function loadAllAqiConnectorManifestsForDay(
   dayUtc: string,
 ): Promise<Array<AqilevelsConnectorManifest & Record<string, unknown>>> {
-  return await loadAllAqiConnectorManifestsForDayPrefix(
-    dayUtc,
-    activeAqiHistoryDataPrefix(),
-  );
-}
-
-async function loadAllAqiConnectorManifestsForDayPrefix(
-  dayUtc: string,
-  basePrefix: string,
-): Promise<Array<AqilevelsConnectorManifest & Record<string, unknown>>> {
-  const prefix = `${basePrefix}/day_utc=${dayUtc}/connector_id=`;
+  const prefix = `${buildAqiDayPrefix(dayUtc)}/connector_id=`;
   const objects = await r2ListAllObjects({
     r2: OBS_R2_CONFIG,
     prefix,
@@ -4727,10 +4187,9 @@ async function loadAllAqiConnectorManifestsForDayPrefix(
     if (!Number.isInteger(connectorId) || connectorId <= 0) {
       continue;
     }
-    const manifest = await loadAqiConnectorManifestByKey(
+    const manifest = await loadExistingAqiConnectorManifest(
       dayUtc,
       Math.trunc(connectorId),
-      `${basePrefix}/day_utc=${dayUtc}/connector_id=${Math.trunc(connectorId)}/manifest.json`,
     );
     if (manifest) {
       manifests.push(
@@ -8986,11 +8445,8 @@ async function fetchSourceObservationRowsForConnectorFromR2ObservationHistory(
         column.element.name
       );
       const timeseriesStatsIndex = schemaColumns.indexOf("timeseries_id");
-      const observedAtColumn = schemaColumns.includes("observed_at_utc")
-        ? "observed_at_utc"
-        : "observed_at";
       if (
-        timeseriesStatsIndex < 0 || !schemaColumns.includes(observedAtColumn) ||
+        timeseriesStatsIndex < 0 || !schemaColumns.includes("observed_at") ||
         !schemaColumns.includes("value")
       ) {
         logStructured("warning", "local_to_aqilevels_r2_parquet_schema_invalid", {
@@ -9049,7 +8505,7 @@ async function fetchSourceObservationRowsForConnectorFromR2ObservationHistory(
               readParquetColumnValues(
                 file,
                 metadata,
-                observedAtColumn,
+                "observed_at",
                 chunkStart,
                 chunkEnd,
               ),
@@ -10863,7 +10319,6 @@ async function runR2HistoryObsToAqilevels(
 
     processedDays.add(dayUtc);
     const dayManifestKey = buildAqiDayManifestKey(dayUtc);
-    const debugDayManifestKey = buildAqiDebugDayManifestKey(dayUtc);
     const dayManifestHead = await r2HeadObject({
       r2: OBS_R2_CONFIG,
       key: dayManifestKey,
@@ -11060,20 +10515,10 @@ async function runR2HistoryObsToAqilevels(
             dayManifestRemovedCount = await deleteR2ObjectIfExists(
               dayManifestKey,
             );
-            if (HISTORY_R2_WRITE_VERSION === "v2") {
-              dayManifestRemovedCount += await deleteR2ObjectIfExists(
-                debugDayManifestKey,
-              );
-            }
           }
           connectorObjectsDeleted = await deleteR2Prefix(
             buildAqiConnectorPrefix(dayUtc, connectorId),
           );
-          if (HISTORY_R2_WRITE_VERSION === "v2") {
-            connectorObjectsDeleted += await deleteR2Prefix(
-              buildAqiDebugConnectorPrefix(dayUtc, connectorId),
-            );
-          }
           summary.objects_deleted_r2 += connectorObjectsDeleted;
           touchedConnectorIds.add(connectorId);
           dayNeedsManifestRefresh = true;
@@ -11249,14 +10694,9 @@ async function runR2HistoryObsToAqilevels(
       summary.failed_days.push(dayUtc);
       for (const connectorId of touchedConnectorIds) {
         try {
-          let deleted = await deleteR2Prefix(
+          const deleted = await deleteR2Prefix(
             buildAqiConnectorPrefix(dayUtc, connectorId),
           );
-          if (HISTORY_R2_WRITE_VERSION === "v2") {
-            deleted += await deleteR2Prefix(
-              buildAqiDebugConnectorPrefix(dayUtc, connectorId),
-            );
-          }
           if (deleted > 0) {
             summary.objects_deleted_r2 += deleted;
           }
@@ -11330,58 +10770,19 @@ async function runR2HistoryObsToAqilevels(
       continue;
     }
 
-    if (HISTORY_R2_WRITE_VERSION === "v2") {
-      const dataDayManifest = createAqiV2DayManifest({
-        profile: "data",
-        dayUtc,
-        runId,
-        manifestKey: dayManifestKey,
-        connectorManifests,
-        writerGitSha: OBS_R2_WRITER_GIT_SHA,
-        backedUpAtUtc: nowIso(),
-      });
-      const debugConnectorManifests = await loadAllAqiConnectorManifestsForDayPrefix(
-        dayUtc,
-        AQI_R2_HISTORY_DEBUG_PREFIX_V2,
-      );
-      const debugDayManifest = createAqiV2DayManifest({
-        profile: "debug",
-        dayUtc,
-        runId,
-        manifestKey: debugDayManifestKey,
-        connectorManifests: debugConnectorManifests,
-        writerGitSha: OBS_R2_WRITER_GIT_SHA,
-        backedUpAtUtc: nowIso(),
-      });
-      await r2PutObject({
-        r2: OBS_R2_CONFIG,
-        key: dayManifestKey,
-        body: encodeJsonBody(dataDayManifest),
-        content_type: "application/json",
-      });
-      await r2PutObject({
-        r2: OBS_R2_CONFIG,
-        key: debugDayManifestKey,
-        body: encodeJsonBody(debugDayManifest),
-        content_type: "application/json",
-      });
-      summary.objects_written_r2 += 2;
-    } else {
-      const dayManifest = createAqiDayManifest({
-        dayUtc,
-        runId,
-        connectorManifests,
-        writerGitSha: OBS_R2_WRITER_GIT_SHA,
-        backedUpAtUtc: nowIso(),
-      });
-      await r2PutObject({
-        r2: OBS_R2_CONFIG,
-        key: dayManifestKey,
-        body: encodeJsonBody(dayManifest),
-        content_type: "application/json",
-      });
-      summary.objects_written_r2 += 1;
-    }
+    const dayManifest = createAqiDayManifest({
+      dayUtc,
+      runId,
+      connectorManifests,
+      writerGitSha: OBS_R2_WRITER_GIT_SHA,
+      backedUpAtUtc: nowIso(),
+    });
+    await r2PutObject({
+      r2: OBS_R2_CONFIG,
+      key: dayManifestKey,
+      body: encodeJsonBody(dayManifest),
+      content_type: "application/json",
+    });
     const manifestHead = await r2HeadObject({
       r2: OBS_R2_CONFIG,
       key: dayManifestKey,
@@ -11391,6 +10792,7 @@ async function runR2HistoryObsToAqilevels(
         `Missing AQI day manifest after upload: ${dayManifestKey}`,
       );
     }
+    summary.objects_written_r2 += 1;
     summary.exported_days.push(dayUtc);
     logStructured("info", "r2_history_obs_to_aqilevels_day_complete", {
       run_id: runId,

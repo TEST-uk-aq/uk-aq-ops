@@ -120,7 +120,7 @@ Confirm the repo is the CIC-Test ops repo:
 
 ```bash
 pwd
-gh repo view --json url --jq .url
+git status --short
 ```
 
 Confirm syntax and tests before build:
@@ -150,46 +150,39 @@ Expected CIC-Test bucket/root values must point at CIC-Test, not LIVE.
 
 ## Build historical v2 observations
 
-Use the local Dropbox v1 observation mirror as the source and write v2
-observations directly to R2. This path does not create generated parquet files
-inside the Dropbox mirror.
-
-Start with a dry-run, then a small target window and known test connector before
-a full range.
-
-Dry-run smoke window:
-
-```bash
-node scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs \
-  --from-day 2026-04-03 \
-  --to-day 2026-04-10 \
-  --connector-id 1 \
-  --connector-id 3 \
-  --connector-id 6 \
-  --connector-id 7 \
-  --dry-run
-```
+Use `source_to_r2` with `observations_only` first. Start with a small target
+window and known test connector before a full range.
 
 Small smoke window:
 
 ```bash
-node scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs \
-  --from-day 2026-04-03 \
-  --to-day 2026-04-10 \
-  --connector-id 1 \
-  --connector-id 3 \
-  --connector-id 6 \
-  --connector-id 7 \
-  --write-r2
+export UK_AQ_R2_HISTORY_WRITE_VERSION=v2
+export UK_AQ_BACKFILL_RUN_MODE=source_to_r2
+export UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only
+export UK_AQ_BACKFILL_DRY_RUN=false
+export UK_AQ_BACKFILL_FORCE_REPLACE=false
+export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX=false
+export UK_AQ_BACKFILL_FROM_DAY_UTC=2026-04-03
+export UK_AQ_BACKFILL_TO_DAY_UTC=2026-04-10
+export UK_AQ_BACKFILL_CONNECTOR_IDS=1,3,7
+
+./scripts/uk_aq_backfill_local.sh
 ```
 
 Full historical build template:
 
 ```bash
-node scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs \
-  --from-day YYYY-MM-DD \
-  --to-day YYYY-MM-DD \
-  --write-r2
+export UK_AQ_R2_HISTORY_WRITE_VERSION=v2
+export UK_AQ_BACKFILL_RUN_MODE=source_to_r2
+export UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only
+export UK_AQ_BACKFILL_DRY_RUN=false
+export UK_AQ_BACKFILL_FORCE_REPLACE=false
+export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX=false
+export UK_AQ_BACKFILL_FROM_DAY_UTC=YYYY-MM-DD
+export UK_AQ_BACKFILL_TO_DAY_UTC=YYYY-MM-DD
+unset UK_AQ_BACKFILL_CONNECTOR_IDS
+
+./scripts/uk_aq_backfill_local.sh
 ```
 
 Expected R2 objects:
@@ -199,21 +192,9 @@ history/v2/observations/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pol
 history/v2/observations/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/part-00000.parquet
 ```
 
-Notes:
-
-- `--replace` is required to overwrite existing pollutant manifests or an
-  existing day manifest.
-- Without `--replace`, existing day manifests are left intact. This avoids
-  shrinking a full day manifest during connector-filtered smoke tests.
-- If a connector-filtered first build creates a partial day manifest, rerun the
-  full day with `--replace` before treating that day as complete.
-
 ## Build historical v2 AQI hourly data/debug
 
 Use committed R2 observations as the source and write AQI v2 data/debug.
-The active AQI Dropbox comparison helper can target either v1 or v2; for v2,
-use `--history-version v2` so write mode passes
-`UK_AQ_R2_HISTORY_WRITE_VERSION=v2` to the backfill runner.
 
 Small smoke window:
 
@@ -226,24 +207,9 @@ export UK_AQ_BACKFILL_FORCE_REPLACE=false
 export UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX=false
 export UK_AQ_BACKFILL_FROM_DAY_UTC=2026-04-03
 export UK_AQ_BACKFILL_TO_DAY_UTC=2026-04-10
-export UK_AQ_BACKFILL_CONNECTOR_IDS=1,3,6,7
+export UK_AQ_BACKFILL_CONNECTOR_IDS=1,3,7
 
 ./scripts/uk_aq_backfill_local.sh
-```
-
-Optional local Dropbox comparison before/after a targeted rebuild:
-
-```bash
-node scripts/backup_r2/uk_aq_validate_aqi_from_dropbox_observs.mjs \
-  --history-version v2 \
-  --from-day 2026-04-03 \
-  --to-day 2026-04-10 \
-  --connector-id 1 \
-  --connector-id 3 \
-  --connector-id 6 \
-  --connector-id 7 \
-  --dry-run \
-  --format json
 ```
 
 Full historical build template:

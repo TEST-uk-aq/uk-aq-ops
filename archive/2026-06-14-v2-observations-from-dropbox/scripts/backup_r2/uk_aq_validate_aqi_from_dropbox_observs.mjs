@@ -16,12 +16,9 @@ import {
   utcDayStartIso,
 } from "../../workers/uk_aq_backfill_local/backfill_core.mjs";
 
-const DEFAULT_OBSERVATIONS_PREFIX_V1 = "history/v1/observations";
-const DEFAULT_AQILEVELS_PREFIX_V1 = "history/v1/aqilevels/hourly";
-const DEFAULT_CORE_PREFIX_V1 = "history/v1/core";
-const DEFAULT_OBSERVATIONS_PREFIX_V2 = "history/v2/observations";
-const DEFAULT_AQILEVELS_DATA_PREFIX_V2 = "history/v2/aqilevels/hourly/data";
-const DEFAULT_CORE_PREFIX_V2 = "history/v2/core";
+const DEFAULT_OBSERVATIONS_PREFIX = "history/v1/observations";
+const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
+const DEFAULT_CORE_PREFIX = "history/v1/core";
 const DEFAULT_MAX_SAMPLES = 50;
 const DEFAULT_FLOAT_TOLERANCE = 1e-9;
 const DEFAULT_BACKFILL_SCRIPT_REL = "scripts/uk_aq_backfill_local.sh";
@@ -47,7 +44,6 @@ function usage() {
     "",
     "Options:",
     "  --root <path>                 Local R2 Dropbox backup root (default: auto detect)",
-    "  --history-version v1|v2       History layout/version to read and rebuild (default from env or v1)",
     "  --from-day <YYYY-MM-DD>       Optional inclusive day lower bound",
     "  --to-day <YYYY-MM-DD>         Optional inclusive day upper bound",
     "  --connector-id <id>           Optional connector filter (repeatable)",
@@ -74,20 +70,15 @@ function usage() {
     "  UK_AQ_DROPBOX_ROOT",
     "  UK_AQ_R2_HISTORY_DROPBOX_ROOT",
     "  UK_AQ_R2_HISTORY_DROPBOX_LOCAL_ROOT",
-    "  UK_AQ_R2_HISTORY_WRITE_VERSION (v1|v2)",
-    "  UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX (v1 default history/v1/observations)",
-    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX (v1 default history/v1/aqilevels/hourly)",
-    "  UK_AQ_R2_HISTORY_CORE_PREFIX (v1 default history/v1/core)",
-    "  UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX (v2 default history/v2/observations)",
-    "  UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX (v2 default history/v2/aqilevels/hourly/data)",
-    "  UK_AQ_R2_HISTORY_V2_CORE_PREFIX (v2 default history/v2/core)",
+    "  UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX (default history/v1/observations)",
+    "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX (default history/v1/aqilevels/hourly)",
+    "  UK_AQ_R2_HISTORY_CORE_PREFIX (default history/v1/core)",
   ].join("\n"));
 }
 
 function parseArgs(argv) {
   const args = {
     root: "",
-    historyVersion: parseHistoryVersion(process.env.UK_AQ_R2_HISTORY_WRITE_VERSION || "v1"),
     fromDay: "",
     toDay: "",
     connectorIds: new Set(),
@@ -108,11 +99,6 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--root") {
       args.root = String(argv[i + 1] || "").trim();
-      i += 1;
-      continue;
-    }
-    if (arg === "--history-version") {
-      args.historyVersion = parseHistoryVersion(argv[i + 1]);
       i += 1;
       continue;
     }
@@ -202,12 +188,6 @@ function parseArgs(argv) {
     throw new Error("Use either --dry-run or --write-r2, not both");
   }
   return args;
-}
-
-function parseHistoryVersion(rawValue) {
-  const value = String(rawValue || "v1").trim().toLowerCase();
-  if (value === "v1" || value === "v2") return value;
-  throw new Error("history version must be v1 or v2");
 }
 
 function parsePositiveInt(rawValue, flagName) {
@@ -474,8 +454,7 @@ async function readObsHistoryRowsFromParquetBytes(bytes) {
   if (!rowCount) return [];
   const [timeseriesValues, observedAtValues, valueValues] = await Promise.all([
     readParquetColumnValues(file, metadata, "timeseries_id", 0, rowCount),
-    readParquetColumnValues(file, metadata, "observed_at_utc", 0, rowCount)
-      .catch(() => readParquetColumnValues(file, metadata, "observed_at", 0, rowCount)),
+    readParquetColumnValues(file, metadata, "observed_at", 0, rowCount),
     readParquetColumnValues(file, metadata, "value", 0, rowCount),
   ]);
   const rows = [];
@@ -765,50 +744,9 @@ function toCsv(rows, columns) {
   return `${lines.join("\n")}\n`;
 }
 
-function resolveHistoryPrefixes(historyVersion) {
-  if (historyVersion === "v2") {
-    return {
-      observationsPrefix: normalizePrefix(
-        process.env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX,
-        DEFAULT_OBSERVATIONS_PREFIX_V2,
-      ),
-      aqilevelsPrefix: normalizePrefix(
-        process.env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX,
-        DEFAULT_AQILEVELS_DATA_PREFIX_V2,
-      ),
-      corePrefix: resolveCorePrefixForVersion(historyVersion),
-    };
-  }
-  return {
-    observationsPrefix: normalizePrefix(
-      process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX,
-      DEFAULT_OBSERVATIONS_PREFIX_V1,
-    ),
-    aqilevelsPrefix: normalizePrefix(
-      process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX,
-      DEFAULT_AQILEVELS_PREFIX_V1,
-    ),
-    corePrefix: resolveCorePrefixForVersion(historyVersion),
-  };
-}
-
-function resolveCorePrefixForVersion(historyVersion) {
-  if (historyVersion === "v2") {
-    return normalizePrefix(
-      process.env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX,
-      DEFAULT_CORE_PREFIX_V2,
-    );
-  }
-  return normalizePrefix(
-    process.env.UK_AQ_R2_HISTORY_CORE_PREFIX,
-    DEFAULT_CORE_PREFIX_V1,
-  );
-}
-
-function formatWriteCommand({ dayUtc, connectorIds, backfillScript, historyVersion }) {
+function formatWriteCommand({ dayUtc, connectorIds, backfillScript }) {
   const connectorCsv = connectorIds.join(",");
   return [
-    `UK_AQ_R2_HISTORY_WRITE_VERSION=${historyVersion}`,
     `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`,
     `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`,
     `UK_AQ_BACKFILL_DRY_RUN=false`,
@@ -820,13 +758,12 @@ function formatWriteCommand({ dayUtc, connectorIds, backfillScript, historyVersi
   ].join(" ");
 }
 
-function executeWriteCommands({ groupedByDay, backfillScript, repoRoot, historyVersion }) {
+function executeWriteCommands({ groupedByDay, backfillScript, repoRoot }) {
   const runs = [];
   for (const [dayUtc, connectorSet] of groupedByDay.entries()) {
     const connectorIds = Array.from(connectorSet).sort((left, right) => left - right);
     const env = {
       ...process.env,
-      UK_AQ_R2_HISTORY_WRITE_VERSION: historyVersion,
       UK_AQ_BACKFILL_RUN_MODE: "r2_history_obs_to_aqilevels",
       UK_AQ_BACKFILL_OUTPUT_SCOPE: "aqilevels_only",
       UK_AQ_BACKFILL_DRY_RUN: "false",
@@ -868,7 +805,18 @@ async function main() {
     throw new Error("No Dropbox root found. Set --root or UK_AQ_R2_HISTORY_DROPBOX_ROOT.");
   }
 
-  const { observationsPrefix, aqilevelsPrefix, corePrefix } = resolveHistoryPrefixes(args.historyVersion);
+  const observationsPrefix = normalizePrefix(
+    process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX,
+    DEFAULT_OBSERVATIONS_PREFIX,
+  );
+  const aqilevelsPrefix = normalizePrefix(
+    process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX,
+    DEFAULT_AQILEVELS_PREFIX,
+  );
+  const corePrefix = normalizePrefix(
+    process.env.UK_AQ_R2_HISTORY_CORE_PREFIX,
+    DEFAULT_CORE_PREFIX,
+  );
 
   const bindings = loadCoreTimeseriesBindings({ dropboxRoot, corePrefix });
   const targets = findObservationTargets({
@@ -997,7 +945,6 @@ async function main() {
       dayUtc,
       connectorIds: Array.from(connectorSet).sort((left, right) => left - right),
       backfillScript: backfillScriptPath,
-      historyVersion: args.historyVersion,
     }));
 
   let writeRuns = [];
@@ -1009,7 +956,6 @@ async function main() {
       groupedByDay,
       backfillScript: backfillScriptPath,
       repoRoot,
-      historyVersion: args.historyVersion,
     });
   }
 
@@ -1018,7 +964,6 @@ async function main() {
     const payload = {
       ok: true,
       mode: args.mode,
-      history_version: args.historyVersion,
       dry_run: !writeR2,
       write_r2: writeR2,
       dropbox_root: dropboxRoot,
