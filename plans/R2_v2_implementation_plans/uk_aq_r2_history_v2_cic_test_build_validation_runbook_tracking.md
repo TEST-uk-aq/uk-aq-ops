@@ -106,3 +106,111 @@ Revised runbook order:
 
 Next action:
 Retry the observations v2 dry-run after confirming local Dropbox has history/v2/core.
+
+
+
+
+
+Docs/runbook update note: only one v2 core snapshot is required
+
+Update the v2 R2 history docs and runbooks to say that the v2 observations builder should use the latest available v2 core snapshot, not a date-matched core snapshot.
+
+Only one current v2 core snapshot is required under:
+
+history/v2/core/day_utc=YYYY-MM-DD/
+
+Reason:
+The v2 observations builder only needs core as reference metadata for mapping timeseries IDs to station IDs, connector IDs and pollutant codes. It does not need a separate historical core snapshot for every observation day.
+
+The runbook should not imply that history/v2/core must exist for every historical day being rebuilt. Build one current v2 core snapshot, then use that latest snapshot for v2 observation rebuilding.
+
+Also note that the observations builder was updated to use the newest available core snapshot rather than filtering core snapshots to day_utc <= --to-day.
+
+
+
+
+## v2 observations build: partial R2 write after fetch failed
+
+The full v2 observations write command returned:
+
+{
+  "ok": false,
+  "error": "fetch failed"
+}
+
+However, Cloudflare R2 shows v2 observation day folders under:
+
+history/v2/observations/
+
+Conclusion:
+The script partly wrote v2 observations to R2 before failing. Treat the build as incomplete until manifests and reports are verified.
+
+Action:
+Rerun the same observations build without `--replace`, with `--report-out`. Existing pollutant manifests should be skipped, and missing objects/manifests should be filled where possible.
+
+If the retry fails again, split the build into monthly chunks to reduce the impact of network/R2 fetch failures.
+
+Runbook update:
+For large v2 observations builds, prefer chunked date ranges, for example monthly, and always use `--report-out`. If a large run ends with `fetch failed`, do not assume failure means no data was written. Check R2 for partial output, then rerun without `--replace` or retry the affected date range.
+
+
+
+Runbook update note: move v2 observations inventory after v1-to-v2 observations build
+
+The v2 observations backup inventory must be built after the v1-to-v2 observations build has completed.
+
+Move the observations-only inventory step so it comes immediately after:
+
+Build historical v2 observations
+
+and before:
+
+Sync v2 observations to Dropbox
+
+Reason:
+The inventory builder reads the committed v2 observation manifests and object metadata from R2. If it runs before the v1-to-v2 observations build, the inventory will be missing the newly created v2 observation files or will represent an incomplete state.
+
+Updated order:
+
+1. Build core v2
+2. Build historical v2 observations from v1 observations
+3. Build v2 observations inventory
+4. Sync v2 observations to Dropbox
+5. Validate local v2 observations files
+6. Build historical v2 AQI hourly data/debug from local v2 observations
+7. Build v2 AQI inventory/sync later
+8. Build _index_v2 after the v2 data needed by the index exists
+
+For observations only, use:
+
+UK_AQ_R2_HISTORY_WRITE_VERSION=v2 \
+node scripts/backup_r2/build_backup_inventory.mjs \
+  --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
+  --backup-version v2 \
+  --domain observations \
+  --index-v2-prefix history/_index_v2 \
+  --full-rebuild \
+  --report-out tmp/r2_backup_inventory_v2_observations_report.json
+  
+  
+  
+  
+  ## V2 observations inventory completed
+
+  The observations-only v2 backup inventory completed successfully.
+
+  Important result:
+  - Inventory path: history/_index_v2/backup_inventory_v2.json
+  - Domain: observations only
+  - Observation days: 525
+  - Committed connector units: 2,080
+  - Observation objects: 4,217
+  - Observation bytes: 947,517,190
+  - Metadata warnings: 0
+  - Backup warnings: 0
+  - Missing domain prefixes: 0
+
+  The report shows index files missing, but that is expected at this stage because _index_v2 has not been built yet. This inventory is being used now only to sync v2 observations to Dropbox so the AQI levels rebuild can use local v2 observations.
+
+  Next step:
+  Run observations-only v2 Dropbox sync.  

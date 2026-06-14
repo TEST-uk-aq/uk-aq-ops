@@ -212,13 +212,45 @@ function normalizePrefix(rawValue, fallbackValue) {
 function normalizePollutantCode(rawValue) {
   const value = String(rawValue || "").trim().toLowerCase();
   if (!value) return null;
+  const compact = value.replace(/[\s._-]+/g, "");
+  if (compact === "no2" || value.includes("nitrogen dioxide")) return "no2";
+  if (compact === "pm25" || compact === "pm2.5".replace(".", "")) return "pm25";
+  if (compact === "pm10") return "pm10";
+  if (compact === "o3" || value.includes("ozone")) return "o3";
   if (value === "no2" || value.includes("nitrogen")) return "no2";
   if (value === "pm25" || value === "pm2.5" || value === "pm_25") return "pm25";
   if (value === "pm10" || value === "pm_10") return "pm10";
   if (value.includes("pm2.5") || value.includes("pm25") || value.includes("2_5")) return "pm25";
   if (value.includes("pm10")) return "pm10";
   if (value.includes("no2")) return "no2";
+  if (/\/pollutant\/6001(?:\D|$)/.test(value)) return "pm25";
+  if (/\/pollutant\/5(?:\D|$)/.test(value)) return "pm10";
   return null;
+}
+
+function normalizePollutantCodeFromMetadataRow(row) {
+  const fields = [
+    "pollutant_code",
+    "pollutant_label",
+    "code",
+    "phenomenon_code",
+    "observed_property_code",
+    "notation",
+    "source_label",
+    "label",
+    "display_name",
+    "name",
+  ];
+  for (const field of fields) {
+    const pollutantCode = normalizePollutantCode(row?.[field]);
+    if (pollutantCode) return pollutantCode;
+  }
+  return null;
+}
+
+function positiveIntegerOrNull(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? Math.trunc(parsed) : null;
 }
 
 function findDropboxRoot(cliValue) {
@@ -271,18 +303,17 @@ function loadCoreTimeseriesBindings({ dropboxRoot, corePrefix, maxDayUtc = "" })
     const timeseriesPath = path.join(snapshotRoot, "table=timeseries", "rows.ndjson.gz");
     if (!fs.existsSync(timeseriesPath) || fs.statSync(timeseriesPath).size <= 0) continue;
 
-    const lookupRows = [
-      ...readNdjsonGz(path.join(snapshotRoot, "table=phenomena", "rows.ndjson.gz")),
-      ...readNdjsonGz(path.join(snapshotRoot, "table=observed_properties", "rows.ndjson.gz")),
-    ];
-    const pollutantById = new Map();
-    for (const row of lookupRows) {
-      const id = Number(row?.id);
-      if (!Number.isInteger(id) || id <= 0) continue;
-      const pollutant = normalizePollutantCode(
-        row?.code || row?.pollutant_code || row?.phenomenon_code || row?.label || row?.display_name || row?.name,
-      );
-      if (pollutant) pollutantById.set(Math.trunc(id), pollutant);
+    const phenomenaById = new Map();
+    for (const row of readNdjsonGz(path.join(snapshotRoot, "table=phenomena", "rows.ndjson.gz"))) {
+      const id = positiveIntegerOrNull(row?.id);
+      if (id === null) continue;
+      phenomenaById.set(id, row);
+    }
+    const observedPropertiesById = new Map();
+    for (const row of readNdjsonGz(path.join(snapshotRoot, "table=observed_properties", "rows.ndjson.gz"))) {
+      const id = positiveIntegerOrNull(row?.id);
+      if (id === null) continue;
+      observedPropertiesById.set(id, row);
     }
 
     const bindings = new Map();
@@ -292,17 +323,21 @@ function loadCoreTimeseriesBindings({ dropboxRoot, corePrefix, maxDayUtc = "" })
       if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) continue;
       if (!Number.isInteger(stationId) || stationId <= 0) continue;
       const connectorId = Number(row?.connector_id);
-      const lookupId = Number(row?.phenomenon_id ?? row?.observed_property_id);
-      const pollutant = normalizePollutantCode(
-        row?.pollutant_code ||
-          row?.phenomenon_code ||
-          row?.observed_property_code ||
-          row?.pollutant ||
-          (Number.isInteger(lookupId) ? pollutantById.get(Math.trunc(lookupId)) : null) ||
-          row?.timeseries_ref ||
-          row?.label ||
-          row?.display_name,
-      );
+      const phenomenonId = positiveIntegerOrNull(row?.phenomenon_id);
+      const observedPropertyId = positiveIntegerOrNull(row?.observed_property_id);
+      const phenomenon = phenomenonId === null ? null : phenomenaById.get(phenomenonId);
+      const phenomenonObservedPropertyId = positiveIntegerOrNull(phenomenon?.observed_property_id);
+      const observedPropertyFromPhenomenon = phenomenonObservedPropertyId === null
+        ? null
+        : observedPropertiesById.get(phenomenonObservedPropertyId);
+      const observedPropertyFromTimeseries = observedPropertyId === null
+        ? null
+        : observedPropertiesById.get(observedPropertyId);
+      const pollutant = normalizePollutantCodeFromMetadataRow(row) ||
+        normalizePollutantCodeFromMetadataRow(phenomenon) ||
+        normalizePollutantCodeFromMetadataRow(observedPropertyFromPhenomenon) ||
+        normalizePollutantCodeFromMetadataRow(observedPropertyFromTimeseries) ||
+        normalizePollutantCode(row?.timeseries_ref);
       if (!pollutant) continue;
       bindings.set(Math.trunc(timeseriesId), {
         timeseries_id: Math.trunc(timeseriesId),
@@ -575,6 +610,16 @@ async function buildConnectorDayPlan({ targetPrefix, dayUtc, connectorId, rows, 
   };
 }
 
+function pollutantRowCountsFromPlans(pollutantPlans) {
+  const out = {};
+  for (const plan of pollutantPlans || []) {
+    const pollutantCode = normalizePollutantCode(plan?.pollutant_code);
+    if (!pollutantCode) continue;
+    out[pollutantCode] = Number(plan?.manifest?.row_count || plan?.manifest?.source_row_count || 0);
+  }
+  return Object.fromEntries(Object.entries(out).sort(([left], [right]) => left.localeCompare(right)));
+}
+
 async function writeConnectorDayPlanToR2({ r2, plan, replace }) {
   const skipped = [];
   let objectsWritten = 0;
@@ -766,6 +811,7 @@ async function runBuild(args) {
       rows_converted: converted.rows.length,
       missing_metadata_rows: converted.missing_metadata_rows,
       pollutant_codes: plan.pollutant_plans.map((item) => item.pollutant_code),
+      pollutant_row_counts: pollutantRowCountsFromPlans(plan.pollutant_plans),
       parquet_files: plan.pollutant_plans.reduce((sum, item) => sum + item.parts.length, 0),
       connector_manifest_key: plan.connector_manifest_key,
       objects_written_r2: writeResult.objects_written_r2,

@@ -425,41 +425,6 @@ function summarizeObservationPartRows(rows) {
   };
 }
 
-function observedAtForHistoryRow(row) {
-  return row?.observed_at_utc || row?.observed_at || null;
-}
-
-function summarizeObservationV2PartRows(rows) {
-  const summary = summarizeObservationPartRows(
-    rows.map((row) => ({
-      ...row,
-      observed_at: observedAtForHistoryRow(row),
-    })),
-  );
-  return {
-    min_timeseries_id: summary.min_timeseries_id,
-    max_timeseries_id: summary.max_timeseries_id,
-    min_observed_at_utc: summary.min_observed_at,
-    max_observed_at_utc: summary.max_observed_at,
-    timeseries_row_counts: summary.timeseries_row_counts,
-  };
-}
-
-function groupObservationV2RowsByPollutant(rows) {
-  const grouped = new Map();
-  for (const row of rows) {
-    const pollutantCode = normalizePollutantCodeForPath(row.pollutant_code);
-    if (!grouped.has(pollutantCode)) {
-      grouped.set(pollutantCode, []);
-    }
-    grouped.get(pollutantCode).push({
-      ...row,
-      pollutant_code: pollutantCode,
-    });
-  }
-  return Array.from(grouped.entries()).sort(([left], [right]) => left.localeCompare(right));
-}
-
 function normalizeTimeseriesRowCountsMap(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return null;
@@ -1997,20 +1962,6 @@ async function writeCommittedPartAndCheckpoint({
   observedRows,
   totalBytes,
 }) {
-  if (runtime.history_write_version === "v2") {
-    return await writeCommittedV2PartAndCheckpoint({
-      streamClient,
-      runtime,
-      dayUtc,
-      connectorId,
-      partIndex,
-      rows,
-      committedParts,
-      observedRows,
-      totalBytes,
-    });
-  }
-
   const parquetBuffer = rowsToParquetBuffer(
     rows,
     parquetWriterProperties(runtime.observations_row_group_size),
@@ -2068,164 +2019,6 @@ async function writeCommittedPartAndCheckpoint({
   };
 }
 
-async function writeCommittedV2PartAndCheckpoint({
-  streamClient,
-  runtime,
-  dayUtc,
-  connectorId,
-  partIndex,
-  rows,
-  committedParts,
-  observedRows,
-  totalBytes,
-}) {
-  const groupedRows = groupObservationV2RowsByPollutant(rows);
-  const nextParts = [...committedParts];
-  let bytesAdded = 0n;
-
-  for (const [pollutantCode, pollutantRows] of groupedRows) {
-    const parquetBuffer = rowsToObservationV2ParquetBuffer(
-      pollutantRows,
-      parquetWriterProperties(runtime.observations_row_group_size, HISTORY_R2_V2_WRITER_VERSION),
-    );
-    const committedKey = buildHistoryV2PartKey(
-      runtime.committed_prefix,
-      dayUtc,
-      connectorId,
-      pollutantCode,
-      partIndex,
-    );
-    const putResult = await r2PutObject({
-      r2: runtime.r2,
-      key: committedKey,
-      body: parquetBuffer,
-      content_type: "application/octet-stream",
-    });
-    const head = await r2HeadObject({ r2: runtime.r2, key: committedKey });
-    if (!head.exists) {
-      throw new Error(`Missing committed object after write: ${committedKey}`);
-    }
-
-    const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
-      ? Math.trunc(head.bytes)
-      : Math.trunc(putResult.bytes);
-    const etagOrHash = head.etag || putResult.etag || null;
-    const partSummary = summarizeObservationV2PartRows(pollutantRows);
-    nextParts.push({
-      key: committedKey,
-      row_count: pollutantRows.length,
-      bytes,
-      etag_or_hash: etagOrHash,
-      pollutant_code: pollutantCode,
-      min_timeseries_id: partSummary.min_timeseries_id,
-      max_timeseries_id: partSummary.max_timeseries_id,
-      min_observed_at_utc: partSummary.min_observed_at_utc,
-      max_observed_at_utc: partSummary.max_observed_at_utc,
-      timeseries_row_counts: partSummary.timeseries_row_counts,
-    });
-    bytesAdded += BigInt(bytes);
-  }
-
-  const nextObservedRows = observedRows + BigInt(rows.length);
-  const nextTotalBytes = totalBytes + bytesAdded;
-  const nextPartIndex = partIndex + 1;
-  const lastRow = rows[rows.length - 1];
-  const lastObservedAt = observedAtForHistoryRow(lastRow);
-
-  await updateCandidateResumeCheckpoint(streamClient, {
-    dayUtc,
-    connectorId,
-    runId: runtime.run_id,
-    lastTimeseriesId: Number(lastRow.timeseries_id),
-    lastObservedAt: new Date(lastObservedAt).toISOString(),
-    partIndex: nextPartIndex,
-    exportedRowCount: nextObservedRows,
-    parts: nextParts,
-  });
-
-  return {
-    partIndex: nextPartIndex,
-    committedParts: nextParts,
-    observedRows: nextObservedRows,
-    totalBytes: nextTotalBytes,
-  };
-}
-
-async function writeObservationV2ConnectorManifest({
-  runtime,
-  dayUtc,
-  connectorId,
-  committedParts,
-  backedUpAtUtc,
-}) {
-  const partsByPollutant = new Map();
-  for (const part of committedParts) {
-    const pollutantCode = normalizePollutantCodeForPath(part.pollutant_code);
-    if (!partsByPollutant.has(pollutantCode)) {
-      partsByPollutant.set(pollutantCode, []);
-    }
-    partsByPollutant.get(pollutantCode).push(part);
-  }
-
-  const pollutantManifests = [];
-  for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-    const pollutantManifestKey = buildHistoryV2PollutantManifestKey(
-      runtime.committed_prefix,
-      dayUtc,
-      connectorId,
-      pollutantCode,
-    );
-    const sourceRowCount = pollutantParts.reduce((sum, part) => sum + Number(part.row_count || 0), 0);
-    const pollutantManifest = createHistoryV2PollutantManifest({
-      domain: "observations",
-      dayUtc,
-      connectorId,
-      pollutantCode,
-      runId: runtime.run_id,
-      manifestKey: pollutantManifestKey,
-      sourceRowCount,
-      fileEntries: pollutantParts,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-    await r2PutObject({
-      r2: runtime.r2,
-      key: pollutantManifestKey,
-      body: Buffer.from(JSON.stringify(pollutantManifest, null, 2), "utf8"),
-      content_type: "application/json",
-    });
-    const pollutantManifestHead = await r2HeadObject({ r2: runtime.r2, key: pollutantManifestKey });
-    if (!pollutantManifestHead.exists) {
-      throw new Error(`V2 pollutant manifest missing after upload: ${pollutantManifestKey}`);
-    }
-    pollutantManifests.push(pollutantManifest);
-  }
-
-  const connectorManifestKey = buildHistoryV2ConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
-  const connectorManifest = createHistoryV2ConnectorManifest({
-    domain: "observations",
-    dayUtc,
-    connectorId,
-    runId: runtime.run_id,
-    manifestKey: connectorManifestKey,
-    pollutantManifests,
-    writerGitSha: runtime.writer_git_sha,
-    backedUpAtUtc,
-  });
-  await r2PutObject({
-    r2: runtime.r2,
-    key: connectorManifestKey,
-    body: Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"),
-    content_type: "application/json",
-  });
-
-  const connectorManifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
-  if (!connectorManifestHead.exists) {
-    throw new Error(`V2 connector manifest missing after upload: ${connectorManifestKey}`);
-  }
-  return { connectorManifest, connectorManifestKey };
-}
-
 async function exportCandidateToR2({ candidate, runtime }) {
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
@@ -2250,12 +2043,7 @@ async function exportCandidateToR2({ candidate, runtime }) {
   const resumeTimeseriesId = candidate.resume_last_timeseries_id;
   const resumeObservedAt = candidate.resume_last_observed_at;
 
-  if (runtime.history_write_version === "v2" && partIndex > committedParts.length) {
-    throw new Error(
-      `Resume checkpoint mismatch for day=${dayUtc} connector=${connectorId}: v2 part_index=${partIndex} parts=${committedParts.length}`,
-    );
-  }
-  if (runtime.history_write_version !== "v2" && partIndex !== committedParts.length) {
+  if (partIndex !== committedParts.length) {
     throw new Error(
       `Resume checkpoint mismatch for day=${dayUtc} connector=${connectorId}: part_index=${partIndex} parts=${committedParts.length}`,
     );
@@ -2279,22 +2067,7 @@ async function exportCandidateToR2({ candidate, runtime }) {
   totalBytes = committedParts.reduce((sum, part) => sum + BigInt(part.bytes), 0n);
 
   await withPgClient(runtime.supabase_db_url, async (streamClient) => {
-    const sql = runtime.history_write_version === "v2" ? `
-select
-  connector_id,
-  station_id,
-  timeseries_id,
-  pollutant_code,
-  observed_at_utc,
-  value
-from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
-  $1::integer,
-  $2::timestamptz,
-  $3::timestamptz,
-  $4::integer,
-  $5::timestamptz
-)
-` : `
+    const sql = `
 select
   connector_id,
   timeseries_id,
@@ -2322,25 +2095,12 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
         }
 
         for (const row of rows) {
-          if (runtime.history_write_version === "v2") {
-            pendingRows.push({
-              connector_id: Number(row.connector_id),
-              station_id: row.station_id === null || row.station_id === undefined
-                ? null
-                : Number(row.station_id),
-              timeseries_id: Number(row.timeseries_id),
-              pollutant_code: normalizePollutantCodeForPath(row.pollutant_code),
-              observed_at_utc: row.observed_at_utc,
-              value: row.value,
-            });
-          } else {
-            pendingRows.push({
-              connector_id: Number(row.connector_id),
-              timeseries_id: Number(row.timeseries_id),
-              observed_at: row.observed_at,
-              value: row.value,
-            });
-          }
+          pendingRows.push({
+            connector_id: Number(row.connector_id),
+            timeseries_id: Number(row.timeseries_id),
+            observed_at: row.observed_at,
+            value: row.value,
+          });
 
           if (pendingRows.length >= runtime.observations_part_max_rows) {
             const flushed = await writeCommittedPartAndCheckpoint({
@@ -2392,28 +2152,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
   }
 
   const backedUpAtUtc = nowIso();
-  if (runtime.history_write_version === "v2") {
-    const { connectorManifest, connectorManifestKey } = await writeObservationV2ConnectorManifest({
-      runtime,
-      dayUtc,
-      connectorId,
-      committedParts,
-      backedUpAtUtc,
-    });
-
-    return {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      manifest_key: connectorManifestKey,
-      source_row_count: expectedRowCount,
-      written_row_count: observedRows,
-      file_count: committedParts.length,
-      total_bytes: totalBytes,
-      parquet_object_keys: connectorManifest.parquet_object_keys,
-      files: committedParts,
-    };
-  }
-
   const connectorManifest = createConnectorManifest({
     dayUtc,
     connectorId,
@@ -3470,26 +3208,14 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
   }
 
   const backedUpAtUtc = nowIso();
-  const dayManifestKey = runtime.history_write_version === "v2"
-    ? buildHistoryV2DayManifestKey(runtime.committed_prefix, dayUtc)
-    : buildDayManifestKey(runtime.committed_prefix, dayUtc);
-  const dayManifest = runtime.history_write_version === "v2"
-    ? createHistoryV2DayManifest({
-      domain: "observations",
-      dayUtc,
-      runId: runtime.run_id,
-      manifestKey: dayManifestKey,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    })
-    : createDayManifest({
-      dayUtc,
-      runId: runtime.run_id,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
+  const dayManifest = createDayManifest({
+    dayUtc,
+    runId: runtime.run_id,
+    connectorManifests,
+    writerGitSha: runtime.writer_git_sha,
+    backedUpAtUtc,
+  });
+  const dayManifestKey = buildDayManifestKey(runtime.committed_prefix, dayUtc);
 
   await r2PutObject({
     r2: runtime.r2,
@@ -3675,9 +3401,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   const aqilevelsDebugPrefixV2 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
   );
-  const activeCommittedPrefix = historyWriteVersion === "v2"
-    ? committedPrefixV2
-    : committedPrefix;
   const runsPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
   );
@@ -3755,8 +3478,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       90,
     ),
     staging_prefix_base: stagingBasePrefix,
-    committed_prefix: activeCommittedPrefix,
-    committed_prefix_v1: committedPrefix,
+    committed_prefix: committedPrefix,
     aqilevels_prefix: aqilevelsPrefix,
     history_write_version: historyWriteVersion,
     committed_prefix_v2: committedPrefixV2,

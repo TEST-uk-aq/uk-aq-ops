@@ -110,6 +110,8 @@ test("runtime config accepts explicit R2 history v2 write prefixes", () => {
     UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX: "custom/v2/aqi/debug",
   });
   assert.equal(config.history_write_version, "v2");
+  assert.equal(config.committed_prefix, "custom/v2/observations");
+  assert.equal(config.committed_prefix_v1, "history/v1/observations");
   assert.equal(config.committed_prefix_v2, "custom/v2/observations");
   assert.equal(config.aqilevels_hourly_data_prefix_v2, "custom/v2/aqi/data");
   assert.equal(config.aqilevels_hourly_debug_prefix_v2, "custom/v2/aqi/debug");
