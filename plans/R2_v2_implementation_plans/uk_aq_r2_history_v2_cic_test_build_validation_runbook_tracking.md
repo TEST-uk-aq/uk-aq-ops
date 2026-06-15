@@ -247,3 +247,46 @@ node scripts/backup_r2/build_backup_inventory.mjs \
   - Manifests now show `history_version: v2`, `domain: aqilevels`, and correct `profile: data/debug`.
 
   Note: these two scripts are currently untracked in git, so `git diff` does not show a normal patch for them.
+  
+  
+  
+  Implemented the TEST-side fix. No LIVE files touched.
+
+  Root cause:
+  - AQI bars use `/api/aq/aqi-history`, which is already reading R2 v2 aqilevels.
+  - PM2.5 line uses `/api/aq/timeseries?v=2`, routed through `uk_aq_cache_proxy`.
+  - That proxy path was still returning the origin-only v2 wrapper instead of calling the observations R2 worker.
+  - Also, v2 observations are pollutant-partitioned, but the line chart request did not include `pollutant=pm25`. Direct R2 worker test returned `0` rows without pollutant, and `24` rows with `pollutant=pm25` for `timeseries_id=354`, `connector_id=1`, `2026-04-11`.
+
+  Changed:
+  - [index.ts](</Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/workers/uk_aq_cache_proxy/src/index.ts>)
+    - Preserves `pollutant` in the v2 timeseries cache key.
+    - Sends `pollutant` to the observations R2 API.
+    - Replaces the origin-only early return with R2-first stitching, capped Supabase tail/repair fetches, merge/dedupe, coverage, gap, and partial metadata.
+  - [timeseries-client.js](</Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-UK-AQ Webpage/CIC-test-uk-aq-webpage/timeseries-client.js>)
+    - Adds optional pollutant support to canonical timeseries URLs.
+  - [hex_map.html](</Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-UK-AQ Webpage/CIC-test-uk-aq-webpage/hex_map.html>)
+    - Sends active pollutant on line-chart requests.
+  - [sensors_chart.html](</Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-UK-AQ Webpage/CIC-test-uk-aq-webpage/sensors_chart.html>)
+    - Same pollutant propagation for the shared v2 path.
+
+  Confirmed:
+  - Observations worker is deployed/configured as v2 in TEST: direct response includes `read_version: "v2"`, `history_prefix: "history/v2/observations"`, `timeseries_index_prefix: "history/_index_v2/observations_timeseries"`.
+  - V2 observations index exists for the sample: `timeseries_id=354`, `connector_id=1`, `pollutant=pm25`, day `2026-04-11`, row count `24`.
+
+  Validation run:
+  - `node --check workers/uk_aq_cache_proxy/src/index.ts`
+  - `node --check workers/uk_aq_observs_history_r2_api_worker/worker.mjs`
+  - `node --check workers/uk_aq_aqi_history_r2_api_worker/worker.mjs`
+  - `node --check .../CIC-test-uk-aq-webpage/timeseries-client.js`
+  - `npm run check`
+  - `npm run test:timeseries-v2-stitch`
+
+  Deploy next:
+  - Ops: run `.github/workflows/uk_aq_cache_proxy_deploy.yml`.
+  - Webpage: run `pages.yml` in the TEST webpage repo.
+  - Ensure TEST vars stay set: `UK_AQ_TIMESERIES_V2_ENABLED=true`, `UK_AQ_TIMESERIES_PROXY_FIRST=true`, `UK_AQ_TIMESERIES_R2_FIRST=true`, `UK_AQ_OBSERVS_HISTORY_R2_API_URL=https://uk-aq-observs-history-r2-api.cic-test.workers.dev/v1/observations`.
+
+  Rollback:
+  - Fast config rollback: set `UK_AQ_TIMESERIES_R2_FIRST=false` to keep v2 wrapper but stop R2 stitching.
+  - Fuller rollback: set `UK_AQ_TIMESERIES_PROXY_FIRST=false` or `UK_AQ_TIMESERIES_V2_ENABLED=false` to use the old timeseries path.
