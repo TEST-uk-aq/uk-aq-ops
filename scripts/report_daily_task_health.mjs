@@ -101,8 +101,44 @@ function mapReportStage(rawStage) {
   throw new Error(`Invalid DAILY_TASK_HEALTH_REPORT_STAGE: ${rawStage}`);
 }
 
+function buildBackupVersionDetails() {
+  const writeVersion = optionalEnv("UK_AQ_R2_HISTORY_WRITE_VERSION");
+  const backupVersion = optionalEnv("UK_AQ_R2_HISTORY_BACKUP_VERSION");
+
+  // Only add backup version fields when at least one of the backup workflow
+  // env vars is present. Other workflows (prune, partition, etc.) that call
+  // this script do not set these vars and will not get these fields.
+  if (!writeVersion && !backupVersion) {
+    return null;
+  }
+
+  function normalizeHistoryVersion(value, fallback = "v1") {
+    const normalised = String(value || "").trim().toLowerCase();
+    return ["v1", "v2"].includes(normalised) ? normalised : fallback;
+  }
+
+  const resolvedWrite = normalizeHistoryVersion(writeVersion, "v1");
+  const resolvedBackup = backupVersion
+    ? normalizeHistoryVersion(backupVersion, resolvedWrite)
+    : resolvedWrite;
+
+  const inventoryRelPaths = {
+    v1: "history/_index/backup_inventory_v1.json",
+    v2: "history/_index_v2/backup_inventory_v2.json",
+  };
+
+  const details = {
+    backup_version: resolvedBackup,
+    history_write_version: resolvedWrite,
+    history_backup_version: backupVersion || "",
+    inventory_rel_path: inventoryRelPaths[resolvedBackup] || null,
+  };
+
+  return details;
+}
+
 function buildSummary(jobStatus) {
-  return {
+  const summary = {
     github_repository: optionalEnv("GITHUB_REPOSITORY") || null,
     github_workflow: optionalEnv("GITHUB_WORKFLOW") || null,
     github_run_id: optionalEnv("GITHUB_RUN_ID") || null,
@@ -115,6 +151,13 @@ function buildSummary(jobStatus) {
     job_status: jobStatus || null,
     trigger: "github_actions",
   };
+
+  const backupDetails = buildBackupVersionDetails();
+  if (backupDetails) {
+    Object.assign(summary, backupDetails);
+  }
+
+  return summary;
 }
 
 function stripUndefined(input) {

@@ -50,11 +50,13 @@ function usage() {
     "  --from-day <YYYY-MM-DD>       Inclusive source day lower bound",
     "  --to-day <YYYY-MM-DD>         Inclusive source day upper bound",
     "  --connector-id <id>           Optional connector filter (repeatable)",
+    "  --connector-ids <ids>         Optional comma-separated connector filter",
     "  --max-connector-days <n>      Cap connector-day builds (0=all, default 0)",
     "  --source-prefix <prefix>      Source observations prefix (default history/v1/observations)",
     "  --core-prefix <prefix>        Source core prefix (default UK_AQ_R2_HISTORY_V2_CORE_PREFIX, then v1 core)",
     "  --target-prefix <prefix>      Target v2 observations prefix (default history/v2/observations)",
     "  --part-max-rows <n>           Max rows per v2 parquet part (default 500000)",
+    "  --rebuild-day-manifests       Manifest-only mode for v2 observations connector/day manifests",
     "  --dry-run                     Explicit no-write mode (default)",
     "  --write-r2                    Upload v2 observations parquet/manifests to R2",
     "  --replace                     Replace existing target pollutant manifests",
@@ -88,6 +90,7 @@ function parseArgs(argv) {
     sawDryRun: false,
     sawWriteR2: false,
     replace: false,
+    rebuildDayManifests: false,
     reportOut: "",
   };
 
@@ -105,6 +108,11 @@ function parseArgs(argv) {
     } else if (arg === "--connector-id") {
       args.connectorIds.add(parsePositiveInt(argv[i + 1], "--connector-id"));
       i += 1;
+    } else if (arg === "--connector-ids") {
+      for (const connectorId of parseConnectorIdList(argv[i + 1], "--connector-ids")) {
+        args.connectorIds.add(connectorId);
+      }
+      i += 1;
     } else if (arg === "--max-connector-days") {
       args.maxConnectorDays = parseNonNegativeInt(argv[i + 1], "--max-connector-days");
       i += 1;
@@ -120,6 +128,8 @@ function parseArgs(argv) {
     } else if (arg === "--part-max-rows") {
       args.partMaxRows = parsePositiveInt(argv[i + 1], "--part-max-rows");
       i += 1;
+    } else if (arg === "--rebuild-day-manifests") {
+      args.rebuildDayManifests = true;
     } else if (arg === "--dry-run") {
       args.mode = "dry-run";
       args.sawDryRun = true;
@@ -172,6 +182,18 @@ function parseNonNegativeInt(rawValue, flagName) {
     throw new Error(`${flagName} must be >= 0`);
   }
   return Math.trunc(value);
+}
+
+function parseConnectorIdList(rawValue, flagName) {
+  const text = String(rawValue || "").trim();
+  if (!text) return [];
+  const ids = [];
+  for (const part of text.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    ids.push(parsePositiveInt(trimmed, flagName));
+  }
+  return ids;
 }
 
 function parseIsoDayUtc(value) {
@@ -274,6 +296,13 @@ function buildR2Config() {
     access_key_id: String(process.env.CFLARE_R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || "").trim(),
     secret_access_key: String(process.env.CFLARE_R2_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || "").trim(),
   };
+}
+
+function assertTestR2WriteTarget(r2) {
+  const bucket = String(r2?.bucket || "").trim();
+  if (bucket !== "uk-aq-history-cic-test") {
+    throw new Error(`Refusing --write-r2 for non-TEST bucket: ${bucket || "(empty)"}`);
+  }
 }
 
 function readNdjsonGz(filePath) {
@@ -620,9 +649,438 @@ function pollutantRowCountsFromPlans(pollutantPlans) {
   return Object.fromEntries(Object.entries(out).sort(([left], [right]) => left.localeCompare(right)));
 }
 
+function isoDayRange(fromDay, toDay) {
+  const start = parseIsoDayUtc(fromDay);
+  const end = parseIsoDayUtc(toDay);
+  if (!start || !end || start > end) return [];
+  const days = [];
+  const cursor = new Date(`${start}T00:00:00.000Z`);
+  const endDate = new Date(`${end}T00:00:00.000Z`);
+  while (cursor <= endDate) {
+    days.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return days;
+}
+
+function readJsonIfExists(filePath) {
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).size <= 0) return null;
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function readLocalManifestByKey({ dropboxRoot, key }) {
+  const normalizedKey = String(key || "").trim().replace(/^\/+/, "");
+  if (!normalizedKey) return null;
+  return readJsonIfExists(path.join(dropboxRoot, normalizedKey));
+}
+
+function discoverTargetDays({ dropboxRoot, targetPrefix, fromDay, toDay }) {
+  if (fromDay || toDay) {
+    return isoDayRange(fromDay || toDay, toDay || fromDay);
+  }
+  const root = path.join(dropboxRoot, targetPrefix);
+  if (!fs.existsSync(root)) return [];
+  return fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^day_utc=\d{4}-\d{2}-\d{2}$/.test(entry.name))
+    .map((entry) => entry.name.slice("day_utc=".length))
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function discoverConnectorPartitionsForDay({ dropboxRoot, targetPrefix, dayUtc }) {
+  const dayRoot = path.join(dropboxRoot, targetPrefix, `day_utc=${dayUtc}`);
+  if (!fs.existsSync(dayRoot)) return [];
+  return fs.readdirSync(dayRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^connector_id=\d+$/.test(entry.name))
+    .map((entry) => Number(entry.name.slice("connector_id=".length)))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((left, right) => left - right);
+}
+
+function discoverPollutantPartitionsForConnector({ dropboxRoot, targetPrefix, dayUtc, connectorId }) {
+  const connectorRoot = path.join(dropboxRoot, targetPrefix, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
+  if (!fs.existsSync(connectorRoot)) return [];
+  return fs.readdirSync(connectorRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^pollutant_code=[a-z0-9_]+$/i.test(entry.name))
+    .map((entry) => entry.name.slice("pollutant_code=".length).trim().toLowerCase())
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function listParquetFilesForPollutant({ dropboxRoot, targetPrefix, dayUtc, connectorId, pollutantCode }) {
+  const pollutantRoot = path.join(
+    dropboxRoot,
+    targetPrefix,
+    `day_utc=${dayUtc}`,
+    `connector_id=${connectorId}`,
+    `pollutant_code=${pollutantCode}`,
+  );
+  if (!fs.existsSync(pollutantRoot)) return [];
+  return fs.readdirSync(pollutantRoot, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".parquet"))
+    .map((entry) =>
+      `${targetPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/${entry.name}`
+    )
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function numericManifestValue(manifest, fieldName) {
+  const value = Number(manifest?.[fieldName]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function rowCountFromManifest(manifest) {
+  return numericManifestValue(manifest, "row_count")
+    ?? numericManifestValue(manifest, "source_row_count")
+    ?? 0;
+}
+
+function fileCountFromManifest(manifest) {
+  return numericManifestValue(manifest, "file_count")
+    ?? (Array.isArray(manifest?.parquet_object_keys) ? manifest.parquet_object_keys.length : 0);
+}
+
+function parquetObjectKeysFromManifest(manifest) {
+  return Array.from(new Set([
+    ...(Array.isArray(manifest?.parquet_object_keys) ? manifest.parquet_object_keys : []),
+    ...(Array.isArray(manifest?.files)
+      ? manifest.files.map((entry) => entry?.key).filter((key) => String(key || "").endsWith(".parquet"))
+      : []),
+  ].map((key) => String(key || "").trim()).filter(Boolean))).sort((left, right) => left.localeCompare(right));
+}
+
+function connectorIdsFromManifest(manifest) {
+  return (Array.isArray(manifest?.connector_ids) ? manifest.connector_ids : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .map((value) => Math.trunc(value))
+    .sort((left, right) => left - right);
+}
+
+function pollutantCodesFromManifest(manifest) {
+  const raw = Array.isArray(manifest?.pollutant_codes)
+    ? manifest.pollutant_codes
+    : Array.isArray(manifest?.available_pollutants)
+      ? manifest.available_pollutants
+      : [];
+  return Array.from(new Set(raw.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)))
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function sameArray(left, right) {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+function manifestSummaryChanged(beforeManifest, afterManifest, beforeCodes, afterCodes) {
+  if (!beforeManifest) return true;
+  return !sameArray(beforeCodes, afterCodes)
+    || rowCountFromManifest(beforeManifest) !== rowCountFromManifest(afterManifest)
+    || fileCountFromManifest(beforeManifest) !== fileCountFromManifest(afterManifest)
+    || !sameArray(parquetObjectKeysFromManifest(beforeManifest), parquetObjectKeysFromManifest(afterManifest));
+}
+
+function pollutantOverlayKey(dayUtc, connectorId, pollutantCode) {
+  return `${dayUtc}|${connectorId}|${String(pollutantCode || "").trim().toLowerCase()}`;
+}
+
+function addPlanPollutantManifestsToOverlay(overlay, plan, pollutantCodes = null) {
+  const allowed = pollutantCodes ? new Set(pollutantCodes) : null;
+  for (const pollutantPlan of plan?.pollutant_plans || []) {
+    const pollutantCode = String(pollutantPlan.pollutant_code || "").trim().toLowerCase();
+    if (!pollutantCode || (allowed && !allowed.has(pollutantCode))) continue;
+    overlay.set(
+      pollutantOverlayKey(plan.day_utc, plan.connector_id, pollutantCode),
+      pollutantPlan.manifest,
+    );
+  }
+}
+
+async function rebuildConnectorManifestFromExistingPollutantPartitions({
+  dropboxRoot,
+  targetPrefix,
+  dayUtc,
+  connectorId,
+  overlayPollutantManifests,
+  manifestIntegrityWarnings,
+  manifestIntegrityErrors,
+}) {
+  const connectorManifestKey = buildHistoryV2ConnectorManifestKey(targetPrefix, dayUtc, connectorId);
+  const existingConnectorManifest = readLocalManifestByKey({ dropboxRoot, key: connectorManifestKey });
+  const folderPollutantCodes = discoverPollutantPartitionsForConnector({ dropboxRoot, targetPrefix, dayUtc, connectorId });
+  const overlayCodes = Array.from(overlayPollutantManifests.keys())
+    .map((key) => key.split("|"))
+    .filter(([keyDay, keyConnector]) => keyDay === dayUtc && Number(keyConnector) === Number(connectorId))
+    .map((parts) => parts[2])
+    .filter(Boolean);
+  const pollutantCodes = Array.from(new Set([...folderPollutantCodes, ...overlayCodes]))
+    .sort((left, right) => left.localeCompare(right));
+  const pollutantManifests = [];
+
+  for (const pollutantCode of pollutantCodes) {
+    const overlayManifest = overlayPollutantManifests.get(pollutantOverlayKey(dayUtc, connectorId, pollutantCode));
+    if (overlayManifest) {
+      pollutantManifests.push(overlayManifest);
+      continue;
+    }
+
+    const pollutantManifestKey = buildHistoryV2PollutantManifestKey(targetPrefix, dayUtc, connectorId, pollutantCode);
+    const pollutantManifest = readLocalManifestByKey({ dropboxRoot, key: pollutantManifestKey });
+    if (pollutantManifest) {
+      pollutantManifests.push(pollutantManifest);
+      continue;
+    }
+
+    const parquetKeys = listParquetFilesForPollutant({ dropboxRoot, targetPrefix, dayUtc, connectorId, pollutantCode });
+    if (parquetKeys.length > 0) {
+      manifestIntegrityWarnings.push({
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        pollutant_code: pollutantCode,
+        warning: "missing_pollutant_manifest_with_existing_parquet",
+        parquet_object_keys: parquetKeys,
+      });
+    } else {
+      manifestIntegrityWarnings.push({
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        pollutant_code: pollutantCode,
+        warning: "missing_pollutant_manifest",
+      });
+    }
+  }
+
+  if (pollutantCodes.length > 0 && pollutantManifests.length === 0) {
+    manifestIntegrityErrors.push({
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        error: "connector_has_pollutant_folders_but_no_usable_pollutant_manifests",
+        folder_pollutant_codes: folderPollutantCodes,
+        overlay_pollutant_codes: overlayCodes,
+      });
+    return {
+      manifest: null,
+      result: {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        manifest_key: connectorManifestKey,
+        connector_manifest_pollutant_codes_before: pollutantCodesFromManifest(existingConnectorManifest),
+        folder_pollutant_codes: folderPollutantCodes,
+        overlay_pollutant_codes: overlayCodes,
+        connector_manifest_pollutant_codes_after: [],
+        row_count_before: existingConnectorManifest ? rowCountFromManifest(existingConnectorManifest) : null,
+        row_count_after: null,
+        file_count_before: existingConnectorManifest ? fileCountFromManifest(existingConnectorManifest) : null,
+        file_count_after: null,
+        changed: false,
+        error: "no_usable_pollutant_manifests",
+      },
+    };
+  }
+
+  const connectorManifest = buildHistoryV2ConnectorManifestForTest({
+    domain: "observations",
+    dayUtc,
+    connectorId,
+    manifestKey: connectorManifestKey,
+    pollutantManifests,
+    writerGitSha: process.env.GITHUB_SHA || null,
+    backedUpAtUtc: new Date().toISOString(),
+  });
+  const beforeCodes = pollutantCodesFromManifest(existingConnectorManifest);
+  const afterCodes = pollutantCodesFromManifest(connectorManifest);
+  const changed = manifestSummaryChanged(existingConnectorManifest, connectorManifest, beforeCodes, afterCodes);
+
+  return {
+    manifest: connectorManifest,
+    result: {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      manifest_key: connectorManifestKey,
+      connector_manifest_pollutant_codes_before: beforeCodes,
+      folder_pollutant_codes: folderPollutantCodes,
+      overlay_pollutant_codes: overlayCodes,
+      connector_manifest_pollutant_codes_after: afterCodes,
+      row_count_before: existingConnectorManifest ? rowCountFromManifest(existingConnectorManifest) : null,
+      row_count_after: rowCountFromManifest(connectorManifest),
+      file_count_before: existingConnectorManifest ? fileCountFromManifest(existingConnectorManifest) : null,
+      file_count_after: fileCountFromManifest(connectorManifest),
+      changed,
+    },
+  };
+}
+
+async function rebuildDayManifestFromExistingConnectorPartitions({
+  dropboxRoot,
+  targetPrefix,
+  dayUtc,
+  connectorWriteFilter,
+  overlayPollutantManifests,
+  writeR2,
+  r2,
+  manifestIntegrityWarnings,
+  manifestIntegrityErrors,
+}) {
+  const dayManifestKey = buildHistoryV2DayManifestKey(targetPrefix, dayUtc);
+  const existingDayManifest = readLocalManifestByKey({ dropboxRoot, key: dayManifestKey });
+  const folderConnectorIds = discoverConnectorPartitionsForDay({ dropboxRoot, targetPrefix, dayUtc });
+  const overlayConnectorIds = Array.from(overlayPollutantManifests.keys())
+    .map((key) => key.split("|"))
+    .filter(([keyDay]) => keyDay === dayUtc)
+    .map((parts) => Number(parts[1]))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  const connectorIds = Array.from(new Set([...folderConnectorIds, ...overlayConnectorIds]))
+    .sort((left, right) => left - right);
+  const connectorManifests = [];
+  const connectorResults = [];
+  const filesThatWouldBeWritten = [];
+  const pendingWrites = [];
+
+  for (const connectorId of connectorIds) {
+    const { manifest, result } = await rebuildConnectorManifestFromExistingPollutantPartitions({
+      dropboxRoot,
+      targetPrefix,
+      dayUtc,
+      connectorId,
+      overlayPollutantManifests,
+      manifestIntegrityWarnings,
+      manifestIntegrityErrors,
+    });
+    connectorResults.push(result);
+    if (!manifest) continue;
+    connectorManifests.push(manifest);
+
+    const shouldWriteConnector = result.changed
+      && (!connectorWriteFilter || connectorWriteFilter.has(connectorId));
+    if (shouldWriteConnector) {
+      filesThatWouldBeWritten.push(result.manifest_key);
+      if (writeR2) {
+        pendingWrites.push({
+          key: result.manifest_key,
+          body: `${JSON.stringify(manifest, null, 2)}\n`,
+          content_type: "application/json",
+        });
+      }
+    }
+  }
+
+  const dayManifest = buildHistoryV2DayManifestForTest({
+    domain: "observations",
+    dayUtc,
+    manifestKey: dayManifestKey,
+    connectorManifests,
+    writerGitSha: process.env.GITHUB_SHA || null,
+    backedUpAtUtc: new Date().toISOString(),
+  });
+  const beforeConnectorIds = connectorIdsFromManifest(existingDayManifest);
+  const afterConnectorIds = connectorIdsFromManifest(dayManifest);
+  const missingFromManifest = folderConnectorIds.filter((connectorId) => !afterConnectorIds.includes(connectorId));
+  if (missingFromManifest.length > 0) {
+    manifestIntegrityErrors.push({
+      day_utc: dayUtc,
+      error: "refusing_incomplete_day_manifest",
+      folder_connector_ids: folderConnectorIds,
+      day_manifest_connector_ids_after: afterConnectorIds,
+      missing_connector_ids: missingFromManifest,
+    });
+  }
+  const changed = manifestSummaryChanged(existingDayManifest, dayManifest, beforeConnectorIds, afterConnectorIds);
+  if (changed) {
+    filesThatWouldBeWritten.push(dayManifestKey);
+    if (writeR2 && missingFromManifest.length === 0) {
+      pendingWrites.push({
+        key: dayManifestKey,
+        body: `${JSON.stringify(dayManifest, null, 2)}\n`,
+        content_type: "application/json",
+      });
+    }
+  }
+
+  return {
+    dayResult: {
+      day_utc: dayUtc,
+      manifest_key: dayManifestKey,
+      day_manifest_connector_ids_before: beforeConnectorIds,
+      folder_connector_ids: folderConnectorIds,
+      day_manifest_connector_ids_after: afterConnectorIds,
+      row_count_before: existingDayManifest ? rowCountFromManifest(existingDayManifest) : null,
+      row_count_after: rowCountFromManifest(dayManifest),
+      file_count_before: existingDayManifest ? fileCountFromManifest(existingDayManifest) : null,
+      file_count_after: fileCountFromManifest(dayManifest),
+      parquet_object_key_count_before: existingDayManifest ? parquetObjectKeysFromManifest(existingDayManifest).length : null,
+      parquet_object_key_count_after: parquetObjectKeysFromManifest(dayManifest).length,
+      changed,
+      written: writeR2 && changed && missingFromManifest.length === 0,
+    },
+    connectorResults,
+    filesThatWouldBeWritten,
+    pendingWrites,
+  };
+}
+
+async function refreshV2ObservationManifests({
+  dropboxRoot,
+  targetPrefix,
+  days,
+  connectorWriteFilter,
+  overlayPollutantManifests,
+  writeR2,
+  r2,
+}) {
+  const dayManifestResults = [];
+  const connectorManifestResults = [];
+  const manifestIntegrityWarnings = [];
+  const manifestIntegrityErrors = [];
+  const filesThatWouldBeWritten = [];
+  const filesWritten = [];
+  const pendingWrites = [];
+
+  for (const dayUtc of days) {
+    const result = await rebuildDayManifestFromExistingConnectorPartitions({
+      dropboxRoot,
+      targetPrefix,
+      dayUtc,
+      connectorWriteFilter,
+      overlayPollutantManifests,
+      writeR2,
+      r2,
+      manifestIntegrityWarnings,
+      manifestIntegrityErrors,
+    });
+    dayManifestResults.push(result.dayResult);
+    connectorManifestResults.push(...result.connectorResults);
+    filesThatWouldBeWritten.push(...result.filesThatWouldBeWritten);
+    pendingWrites.push(...result.pendingWrites);
+  }
+
+  if (writeR2 && manifestIntegrityErrors.length > 0) {
+    throw new Error(`Manifest integrity errors blocked write: ${JSON.stringify(manifestIntegrityErrors)}`);
+  }
+  if (writeR2) {
+    for (const item of pendingWrites) {
+      await r2PutObject({ r2, key: item.key, body: item.body, content_type: item.content_type });
+      filesWritten.push(item.key);
+    }
+  }
+
+  return {
+    days_scanned: dayManifestResults.length,
+    days_changed: dayManifestResults.filter((result) => result.changed).length,
+    days_unchanged: dayManifestResults.filter((result) => !result.changed).length,
+    days_refreshed: dayManifestResults.filter((result) => result.written).length,
+    connector_manifests_refreshed: connectorManifestResults.filter((result) => result.changed).length,
+    day_manifest_results: dayManifestResults,
+    connector_manifest_results: connectorManifestResults,
+    manifest_integrity_warnings: manifestIntegrityWarnings,
+    manifest_integrity_errors: manifestIntegrityErrors,
+    files_that_would_be_written: Array.from(new Set(filesThatWouldBeWritten)).sort(),
+    files_written: Array.from(new Set(filesWritten)).sort(),
+  };
+}
+
 async function writeConnectorDayPlanToR2({ r2, plan, replace }) {
   const skipped = [];
   let objectsWritten = 0;
+  const writtenPollutantCodes = [];
   const writablePollutantPlans = [];
   for (const pollutantPlan of plan.pollutant_plans) {
     if (!replace) {
@@ -655,17 +1113,9 @@ async function writeConnectorDayPlanToR2({ r2, plan, replace }) {
       content_type: "application/json",
     });
     objectsWritten += 1;
+    writtenPollutantCodes.push(pollutantPlan.pollutant_code);
   }
-  if (writablePollutantPlans.length > 0 || replace) {
-    await r2PutObject({
-      r2,
-      key: plan.connector_manifest_key,
-      body: `${JSON.stringify(plan.connector_manifest, null, 2)}\n`,
-      content_type: "application/json",
-    });
-    objectsWritten += 1;
-  }
-  return { objects_written_r2: objectsWritten, skipped_pollutants: skipped };
+  return { objects_written_r2: objectsWritten, skipped_pollutants: skipped, written_pollutant_codes: writtenPollutantCodes };
 }
 
 async function refreshDayManifests({ r2, targetPrefix, dayPlansByDay, writeR2, replace }) {
@@ -710,15 +1160,56 @@ async function refreshDayManifests({ r2, targetPrefix, dayPlansByDay, writeR2, r
   return dayReports;
 }
 
+async function runManifestOnlyRebuild({ args, dropboxRoot, r2, writeR2 }) {
+  const days = discoverTargetDays({
+    dropboxRoot,
+    targetPrefix: args.targetPrefix,
+    fromDay: args.fromDay,
+    toDay: args.toDay,
+  });
+  const connectorWriteFilter = args.connectorIds.size > 0 ? new Set(args.connectorIds) : null;
+  const manifestRefresh = await refreshV2ObservationManifests({
+    dropboxRoot,
+    targetPrefix: args.targetPrefix,
+    days,
+    connectorWriteFilter,
+    overlayPollutantManifests: new Map(),
+    writeR2,
+    r2,
+  });
+
+  return {
+    ok: true,
+    mode: args.mode,
+    dry_run: !writeR2,
+    write_r2: writeR2,
+    replace: args.replace,
+    rebuild_day_manifests: true,
+    manifest_only_mode: true,
+    message: "Running manifest-only rebuild mode for v2 observations day manifests.",
+    dropbox_root: dropboxRoot,
+    target_observations_prefix: args.targetPrefix,
+    connector_filter: args.connectorIds.size > 0 ? Array.from(args.connectorIds).sort((left, right) => left - right) : null,
+    objects_written_r2: manifestRefresh.files_written.length,
+    ...manifestRefresh,
+  };
+}
+
 async function runBuild(args) {
   const writeR2 = args.mode === "write-r2";
   const r2 = buildR2Config();
   if (writeR2 && !hasRequiredR2Config(r2)) {
     throw new Error("R2 credentials are required for --write-r2.");
   }
+  if (writeR2) {
+    assertTestR2WriteTarget(r2);
+  }
   const dropboxRoot = findDropboxRoot(args.root);
   if (!dropboxRoot) {
     throw new Error("No Dropbox root found. Set --root or UK_AQ_R2_HISTORY_DROPBOX_ROOT.");
+  }
+  if (args.rebuildDayManifests) {
+    return await runManifestOnlyRebuild({ args, dropboxRoot, r2, writeR2 });
   }
   const bindings = loadCoreTimeseriesBindings({
     dropboxRoot,
@@ -740,6 +1231,8 @@ async function runBuild(args) {
   });
 
   const dayPlansByDay = new Map();
+  const overlayPollutantManifests = new Map();
+  const processedConnectorIdsByDay = new Map();
   const connectorReports = [];
   let rowsRead = 0;
   let rowsConverted = 0;
@@ -802,8 +1295,15 @@ async function runBuild(args) {
       writeResult = await writeConnectorDayPlanToR2({ r2, plan, replace: args.replace });
       objectsWritten += writeResult.objects_written_r2;
     }
+    addPlanPollutantManifestsToOverlay(
+      overlayPollutantManifests,
+      plan,
+      writeR2 ? writeResult.written_pollutant_codes : null,
+    );
     if (!dayPlansByDay.has(target.day_utc)) dayPlansByDay.set(target.day_utc, []);
     dayPlansByDay.get(target.day_utc).push(plan);
+    if (!processedConnectorIdsByDay.has(target.day_utc)) processedConnectorIdsByDay.set(target.day_utc, new Set());
+    processedConnectorIdsByDay.get(target.day_utc).add(target.connector_id);
     connectorReports.push({
       ...target,
       status: writeR2 ? "complete" : "dry_run",
@@ -819,14 +1319,21 @@ async function runBuild(args) {
     });
   }
 
-  const dayReports = await refreshDayManifests({
-    r2,
+  const daysToRefresh = Array.from(dayPlansByDay.keys()).sort((left, right) => left.localeCompare(right));
+  const processedConnectorIds = new Set();
+  for (const dayConnectorIds of processedConnectorIdsByDay.values()) {
+    for (const connectorId of dayConnectorIds) processedConnectorIds.add(connectorId);
+  }
+  const manifestRefresh = await refreshV2ObservationManifests({
+    dropboxRoot,
     targetPrefix: args.targetPrefix,
-    dayPlansByDay,
+    days: daysToRefresh,
+    connectorWriteFilter: processedConnectorIds,
+    overlayPollutantManifests,
     writeR2,
-    replace: args.replace,
+    r2,
   });
-  if (writeR2) objectsWritten += dayReports.filter((report) => report.written).length;
+  if (writeR2) objectsWritten += manifestRefresh.files_written.length;
 
   return {
     ok: true,
@@ -834,6 +1341,8 @@ async function runBuild(args) {
     dry_run: !writeR2,
     write_r2: writeR2,
     replace: args.replace,
+    rebuild_day_manifests: false,
+    manifest_only_mode: false,
     dropbox_root: dropboxRoot,
     source_observations_prefix: args.sourcePrefix,
     source_core_prefix: args.corePrefix,
@@ -847,7 +1356,18 @@ async function runBuild(args) {
     parquet_files_planned: parquetFilesPlanned,
     parquet_bytes_planned: parquetBytesPlanned,
     objects_written_r2: objectsWritten,
-    day_manifests: dayReports,
+    days_scanned: manifestRefresh.days_scanned,
+    days_changed: manifestRefresh.days_changed,
+    days_unchanged: manifestRefresh.days_unchanged,
+    days_refreshed: manifestRefresh.days_refreshed,
+    day_manifests: manifestRefresh.day_manifest_results,
+    day_manifest_results: manifestRefresh.day_manifest_results,
+    connector_manifests_refreshed: manifestRefresh.connector_manifests_refreshed,
+    connector_manifest_results: manifestRefresh.connector_manifest_results,
+    manifest_integrity_warnings: manifestRefresh.manifest_integrity_warnings,
+    manifest_integrity_errors: manifestRefresh.manifest_integrity_errors,
+    files_that_would_be_written: manifestRefresh.files_that_would_be_written,
+    files_written: manifestRefresh.files_written,
     connector_days: connectorReports,
   };
 }
