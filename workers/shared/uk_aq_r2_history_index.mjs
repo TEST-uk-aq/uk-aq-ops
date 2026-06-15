@@ -750,7 +750,7 @@ function normalizeObservationTimeseriesIndexFileEntry(entry) {
 function normalizeTimeseriesRowCounts(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const out = {};
-  for (const [key, value] of Object.entries(raw)) {
+  for (const [key, value] of Object.entries(raw).sort((a, b) => Number(a[0]) - Number(b[0]))) {
     const id = parsePositiveId(key);
     const n = parseNonNegativeInt(value);
     if (id && n !== null && n > 0) {
@@ -760,6 +760,15 @@ function normalizeTimeseriesRowCounts(raw) {
   return Object.keys(out).length ? out : null;
 }
 
+function sortTimeseriesRowCounts(raw) {
+  const normalized = normalizeTimeseriesRowCounts(raw);
+  if (!normalized) return null;
+  const out = {};
+  for (const key of Object.keys(normalized).sort((a, b) => Number(a) - Number(b))) {
+    out[key] = normalized[key];
+  }
+  return out;
+}
 
 function aggregateTimeseriesRowCountsFromFiles(files) {
   const out = {};
@@ -774,7 +783,7 @@ function aggregateTimeseriesRowCountsFromFiles(files) {
       out[key] = (out[key] || 0) + Math.trunc(n);
     }
   }
-  return sawAny ? out : null;
+  return sawAny ? sortTimeseriesRowCounts(out) : null;
 }
 
 
@@ -799,7 +808,7 @@ async function readParquetTimeseriesRowCounts({ r2, key }) {
     const key = String(Math.trunc(id));
     counts[key] = (counts[key] || 0) + 1;
   }
-  return counts;
+  return sortTimeseriesRowCounts(counts) || {};
 }
 
 
@@ -832,6 +841,77 @@ async function computeConnectorManifestTimeseriesCounts({
     }
   }
   return out;
+}
+
+async function computePollutantManifestTimeseriesCounts({
+  r2,
+  pollutantManifest,
+  warningsSink,
+  dayUtc,
+  connectorId,
+  pollutantCode,
+}) {
+  const files = Array.isArray(pollutantManifest?.files) ? pollutantManifest.files : [];
+  if (!files.length) return {};
+  const out = {};
+  for (const entry of files) {
+    const key = typeof entry?.key === "string" ? entry.key : null;
+    if (!key) continue;
+    try {
+      const fileCounts = await readParquetTimeseriesRowCounts({ r2, key });
+      for (const [tsId, n] of Object.entries(fileCounts)) {
+        out[tsId] = (out[tsId] || 0) + n;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warningsSink?.push?.(
+        `Skipped parquet row-count read day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} key=${key}: ${message}`,
+      );
+    }
+  }
+  return sortTimeseriesRowCounts(out) || {};
+}
+
+async function maybePatchHistoryV2PollutantManifestWithCounts({
+  r2,
+  manifestKey,
+  pollutantManifest,
+  warningsSink,
+  dayUtc,
+  connectorId,
+  pollutantCode,
+}) {
+  if (normalizeTimeseriesRowCounts(pollutantManifest?.timeseries_row_counts)) {
+    return pollutantManifest;
+  }
+  if (!pollutantManifest || typeof pollutantManifest !== "object") {
+    return pollutantManifest;
+  }
+  const counts = await computePollutantManifestTimeseriesCounts({
+    r2,
+    pollutantManifest,
+    warningsSink,
+    dayUtc,
+    connectorId,
+    pollutantCode,
+  });
+  if (!counts || Object.keys(counts).length === 0) {
+    return pollutantManifest;
+  }
+  const { manifest_hash: _oldHash, ...payloadWithoutHash } = pollutantManifest;
+  const patchedWithoutHash = {
+    ...payloadWithoutHash,
+    timeseries_row_counts: counts,
+  };
+  const newHash = sha256Hex(JSON.stringify(patchedWithoutHash));
+  const patched = { ...patchedWithoutHash, manifest_hash: newHash };
+  await r2PutObjectIfChanged({
+    r2,
+    key: manifestKey,
+    body: `${JSON.stringify(patched, null, 2)}\n`,
+    content_type: "application/json; charset=utf-8",
+  });
+  return patched;
 }
 
 
@@ -2277,6 +2357,7 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
   generatedAt = new Date().toISOString(),
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   maxKeys = DEFAULT_MAX_KEYS,
+  computeMissingTimeseriesCounts = false,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
   if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
@@ -2353,10 +2434,21 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
             fetchConcurrency,
             async (pollutantTarget) => {
               try {
-                const pollutantManifestObject = await fetchJsonObjectFromR2(
+                let pollutantManifestObject = await fetchJsonObjectFromR2(
                   r2,
                   pollutantTarget.manifest_key,
                 );
+                if (computeMissingTimeseriesCounts) {
+                  pollutantManifestObject = await maybePatchHistoryV2PollutantManifestWithCounts({
+                    r2,
+                    manifestKey: pollutantTarget.manifest_key,
+                    pollutantManifest: pollutantManifestObject,
+                    warningsSink: warnings,
+                    dayUtc,
+                    connectorId: connectorTarget.connector_id,
+                    pollutantCode: pollutantTarget.pollutant_code,
+                  });
+                }
                 const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
                   domain: normalizedDomain,
                   grain: normalizedDomain === "aqilevels" ? "hourly" : null,
@@ -3052,6 +3144,7 @@ export async function rebuildR2HistoryIndexes({
           generatedAt,
           fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
           maxKeys: maxKeys || config.max_keys,
+          computeMissingTimeseriesCounts,
         });
         results.push(observationsTimeseries);
       }
@@ -3066,6 +3159,7 @@ export async function rebuildR2HistoryIndexes({
           generatedAt,
           fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
           maxKeys: maxKeys || config.max_keys,
+          computeMissingTimeseriesCounts,
         });
         results.push(aqilevelsTimeseries);
       }

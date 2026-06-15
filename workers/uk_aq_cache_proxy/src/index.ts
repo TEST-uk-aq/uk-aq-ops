@@ -7,6 +7,7 @@ import {
   mergeSlices,
   normalizeObservedRow,
   resolveTimeseriesWindowBounds,
+  subtractCoveredTailInterval,
 } from "./timeseries_v2_stitch.mjs";
 
 export interface Env {
@@ -261,6 +262,7 @@ const TIMESERIES_V2_ALLOWED_WINDOWS = new Set(["12h", "24h", "7d", "31d", "90d"]
 const TIMESERIES_V2_CACHE_BUSTER_KEYS = new Set(["_t", "timestamp", "cache_bust", "random"]);
 const TIMESERIES_V2_PRIMARY_QUERY_KEYS = [
   "timeseries_id",
+  "pollutant",
   "window",
   "since",
   "start_utc",
@@ -325,6 +327,7 @@ type TimeseriesV2RuntimeConfig = {
 
 type TimeseriesV2RequestWindow = {
   timeseriesId: number;
+  pollutantKey: string | null;
   requestStartMs: number;
   requestEndMs: number;
   requestSinceIso: string | null;
@@ -1184,6 +1187,14 @@ function normalizeIsoOrNull(value: string | null): string | null {
   return new Date(ms).toISOString();
 }
 
+function normalizeTimeseriesPollutantKey(value: string | null): string | null {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s._-]+/g, "");
+  if (normalized === "pm25" || normalized === "pm10" || normalized === "no2") {
+    return normalized;
+  }
+  return null;
+}
+
 function resolveTimeseriesV2FlagsFromEnv(envValues: {
   v2EnabledRaw: string;
   proxyFirstRaw: string;
@@ -1240,6 +1251,10 @@ function canonicalizeTimeseriesV2RequestUrl(url: URL, allowCacheBypassParams: bo
   const normalized = new URL(original.origin + original.pathname);
   if (timeseriesId) {
     normalized.searchParams.set("timeseries_id", timeseriesId);
+  }
+  const pollutantKey = normalizeTimeseriesPollutantKey(original.searchParams.get("pollutant"));
+  if (pollutantKey) {
+    normalized.searchParams.set("pollutant", pollutantKey);
   }
   if (normalizedWindow && !hasValidRange) {
     normalized.searchParams.set("window", normalizedWindow);
@@ -1346,6 +1361,7 @@ function buildTimeseriesV2RequestWindow(requestUrl: URL, runtime: TimeseriesV2Ru
   if (!timeseriesIdText) {
     throw new RequestValidationError(400, "timeseries_id_required");
   }
+  const pollutantKey = normalizeTimeseriesPollutantKey(requestUrl.searchParams.get("pollutant"));
   const rawWindow = String(requestUrl.searchParams.get("window") ?? "").trim().toLowerCase();
   const startUtc = getFirstSearchParam(requestUrl, ["start_utc", "start"]);
   const endUtc = getFirstSearchParam(requestUrl, ["end_utc", "end"]);
@@ -1366,6 +1382,7 @@ function buildTimeseriesV2RequestWindow(requestUrl: URL, runtime: TimeseriesV2Ru
 
   return {
     timeseriesId: Number(timeseriesIdText),
+    pollutantKey,
     requestStartMs: bounds.startMs,
     requestEndMs: bounds.endMs,
     requestSinceIso: since,
@@ -1463,6 +1480,7 @@ async function fetchR2ObservationsPayload(
   params: {
     timeseriesId: number;
     connectorId: number;
+    pollutantKey: string | null;
     startUtc: string;
     endUtc: string;
     sinceUtc: string | null;
@@ -1475,6 +1493,9 @@ async function fetchR2ObservationsPayload(
   }
   endpoint.searchParams.set("timeseries_id", String(params.timeseriesId));
   endpoint.searchParams.set("connector_id", String(params.connectorId));
+  if (params.pollutantKey) {
+    endpoint.searchParams.set("pollutant", params.pollutantKey);
+  }
   endpoint.searchParams.set("start_utc", params.startUtc);
   endpoint.searchParams.set("end_utc", params.endUtc);
   if (params.sinceUtc) {
@@ -1532,6 +1553,7 @@ async function fetchR2ObservationsPaged(
   params: {
     timeseriesId: number;
     connectorId: number;
+    pollutantKey: string | null;
     startUtc: string;
     endUtc: string;
     sinceUtc: string | null;
@@ -1555,6 +1577,7 @@ async function fetchR2ObservationsPaged(
       {
         timeseriesId: params.timeseriesId,
         connectorId: params.connectorId,
+        pollutantKey: params.pollutantKey,
         startUtc: params.startUtc,
         endUtc: params.endUtc,
         sinceUtc: pageSinceUtc,
@@ -1768,19 +1791,269 @@ async function stitchTimeseriesV2FromR2AndIngest(
   const requestWindow = buildTimeseriesV2RequestWindow(requestUrl, runtime);
   const requestStartUtc = toIsoSafe(requestWindow.requestStartMs);
   const requestEndUtc = toIsoSafe(requestWindow.requestEndMs);
-  const originPayload = await fetchTimeseriesOriginPayload(
-    deps.supabaseUrl,
-    deps.supabasePublishableKey,
-    deps.upstreamAuthSecret,
-    {
-      timeseriesId: requestWindow.timeseriesId,
-      startUtc: requestStartUtc,
-      endUtc: requestEndUtc,
-      sinceUtc: requestWindow.requestSinceIso,
-    },
-  );
+  const windowLabelForGapDetection = requestWindow.normalizedWindowLabel
+    || String(requestUrl.searchParams.get("window") || "explicit");
 
-  return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
+  if (!flags.r2First || !deps.r2HistoryApiUrl) {
+    const originPayload = await fetchTimeseriesOriginPayload(
+      deps.supabaseUrl,
+      deps.supabasePublishableKey,
+      deps.upstreamAuthSecret,
+      {
+        timeseriesId: requestWindow.timeseriesId,
+        startUtc: requestStartUtc,
+        endUtc: requestEndUtc,
+        sinceUtc: requestWindow.requestSinceIso,
+      },
+    );
+    return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
+  }
+
+  const r2Errors: string[] = [];
+  const ingestErrors: string[] = [];
+  const partialReasons = new Set<string>();
+  let connectorId: number | null = null;
+  let r2Rows: Array<Record<string, unknown>> = [];
+  let r2Coverage: Record<string, unknown> | null = null;
+  let r2PagesFetched = 0;
+  let r2HitPageLimit = false;
+
+  if (!requestWindow.pollutantKey) {
+    r2Errors.push("pollutant_required_for_v2_r2");
+    partialReasons.add("pollutant_required_for_v2_r2");
+  } else {
+    connectorId = await loadTimeseriesConnectorId(
+      deps.supabaseUrl,
+      deps.sbSecretKey,
+      requestWindow.timeseriesId,
+    );
+    if (!connectorId) {
+      r2Errors.push("connector_id_lookup_failed");
+      partialReasons.add("connector_id_lookup_failed");
+    } else {
+      try {
+        const r2SinceUtc = applySinceOverlap(
+          requestWindow.requestSinceIso,
+          runtime.incrementalOverlapMinutes,
+          requestWindow.requestStartMs,
+        );
+        const r2Result = await fetchR2ObservationsPaged(
+          deps.r2HistoryApiUrl,
+          deps.upstreamAuthSecret,
+          {
+            timeseriesId: requestWindow.timeseriesId,
+            connectorId,
+            pollutantKey: requestWindow.pollutantKey,
+            startUtc: requestStartUtc,
+            endUtc: requestEndUtc,
+            sinceUtc: r2SinceUtc,
+            pageLimitRows: runtime.maxR2ObjectsPerRequest,
+            maxPages: TIMESERIES_V2_MAX_R2_PAGES_PER_REQUEST,
+          },
+        );
+        r2Rows = r2Result.rows;
+        r2Coverage = r2Result.coverage;
+        r2PagesFetched = r2Result.pagesFetched;
+        r2HitPageLimit = r2Result.hitPageLimit;
+        if (r2HitPageLimit) {
+          partialReasons.add("r2_page_limit_reached");
+        }
+        const coverageComplete = r2Coverage?.response_complete;
+        if (coverageComplete === false) {
+          partialReasons.add("r2_coverage_partial");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        r2Errors.push(message);
+        partialReasons.add("r2_fetch_failed");
+        if (!runtime.partialOnR2Error) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  const r2RowCoverage = computeCoverageFromRows(r2Rows);
+  const r2CoverageStart = r2RowCoverage.coverageStart;
+  const r2CoverageEnd = r2RowCoverage.coverageEnd;
+  const maxIngestSpanMs = runtime.maxSupabaseTailHours * HOUR_MS;
+  const ingestSlices: Array<{ startMs: number; endMs: number; reason: string }> = [];
+  const skippedIngestSlices: Array<{ start_utc: string; end_utc: string; reason: string }> = [];
+
+  function addIngestSlice(startMs: number, endMs: number, reason: string): void {
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+      return;
+    }
+    const cappedStartMs = Math.max(startMs, endMs - maxIngestSpanMs);
+    if (cappedStartMs > startMs) {
+      skippedIngestSlices.push({
+        start_utc: new Date(startMs).toISOString(),
+        end_utc: new Date(cappedStartMs).toISOString(),
+        reason: `${reason}_outside_supabase_tail_cap`,
+      });
+      partialReasons.add("supabase_tail_cap");
+    }
+    if (endMs > cappedStartMs) {
+      ingestSlices.push({ startMs: cappedStartMs, endMs, reason });
+    }
+  }
+
+  if (r2Rows.length > 0) {
+    const tail = subtractCoveredTailInterval(
+      requestWindow.requestStartMs,
+      requestWindow.requestEndMs,
+      r2CoverageEnd,
+    );
+    addIngestSlice(tail.tailStartMs, tail.tailEndMs, "r2_tail_gap");
+
+    const missingKeys = [
+      ...asArrayOfStrings(r2Coverage?.missing_day_manifest_keys),
+      ...asArrayOfStrings(r2Coverage?.missing_connector_manifest_keys),
+      ...asArrayOfStrings(r2Coverage?.missing_parquet_keys),
+    ];
+    for (const slice of buildMissingDaySlices(
+      missingKeys,
+      requestWindow.requestStartMs,
+      requestWindow.requestEndMs,
+    )) {
+      addIngestSlice(slice.startMs, slice.endMs, slice.reason || "r2_missing_slice");
+    }
+  } else {
+    addIngestSlice(
+      requestWindow.requestStartMs,
+      requestWindow.requestEndMs,
+      r2Errors.length ? "r2_unavailable" : "r2_empty",
+    );
+  }
+
+  const mergedIngestSlices = mergeSlices(ingestSlices);
+  const ingestRowsByObservedAt = new Map<string, Record<string, unknown>>();
+  let guideline: unknown = null;
+  for (const slice of mergedIngestSlices) {
+    const sliceStartUtc = new Date(slice.startMs).toISOString();
+    const sliceEndUtc = new Date(slice.endMs).toISOString();
+    try {
+      const originPayload = await fetchTimeseriesOriginPayload(
+        deps.supabaseUrl,
+        deps.supabasePublishableKey,
+        deps.upstreamAuthSecret,
+        {
+          timeseriesId: requestWindow.timeseriesId,
+          startUtc: sliceStartUtc,
+          endUtc: sliceEndUtc,
+          sinceUtc: requestWindow.requestSinceIso,
+        },
+      );
+      if (guideline === null && Object.prototype.hasOwnProperty.call(originPayload, "guideline")) {
+        guideline = originPayload.guideline;
+      }
+      for (const row of parseTimeseriesRowsFromPayload(originPayload, "ingest")) {
+        const observedAt = String(row?.observed_at ?? "").trim();
+        if (observedAt) {
+          ingestRowsByObservedAt.set(observedAt, row);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ingestErrors.push(message);
+      partialReasons.add("ingest_fetch_failed");
+      if (!runtime.partialOnIngestError) {
+        throw error;
+      }
+    }
+  }
+
+  for (const skipped of skippedIngestSlices) {
+    partialReasons.add(skipped.reason);
+  }
+
+  const ingestRows = Array.from(ingestRowsByObservedAt.values()).sort((left, right) => {
+    const leftMs = parseIsoMsOrNull(String(left?.observed_at ?? "")) ?? 0;
+    const rightMs = parseIsoMsOrNull(String(right?.observed_at ?? "")) ?? 0;
+    return leftMs - rightMs;
+  });
+  const merged = mergeAndDedupeRows(r2Rows, ingestRows, flags.allowIngestOverwrite);
+  const gapInfo = detectGapRanges(
+    merged.merged,
+    requestWindow.requestStartMs,
+    requestWindow.requestEndMs,
+    windowLabelForGapDetection,
+  ) as { hasGap: boolean; gapRanges: Array<{ start_utc: string; end_utc: string }> };
+  if (gapInfo.hasGap) {
+    partialReasons.add("detected_gap");
+  }
+
+  let sourceMode = "ingest_only_fallback";
+  if (r2Rows.length > 0 && ingestRows.length === 0) {
+    sourceMode = "r2_only";
+  } else if (r2Rows.length > 0 && ingestRows.length > 0) {
+    const hasRepairs = mergedIngestSlices.some((slice) => slice.reason !== "r2_tail_gap");
+    sourceMode = hasRepairs ? "r2_plus_ingest_tail_and_repairs" : "r2_plus_ingest_tail";
+  } else if (r2Rows.length === 0 && r2Errors.length > 0) {
+    sourceMode = "ingest_only_on_r2_error";
+  }
+
+  const responseComplete = partialReasons.size === 0 && !r2HitPageLimit && ingestErrors.length === 0;
+  const nextSince = computeNextSince(merged.merged, requestWindow.requestSinceIso) as string | null;
+  const meta: TimeseriesV2EnvelopeMeta = {
+    source_mode: sourceMode,
+    r2_coverage_start: r2CoverageStart,
+    r2_coverage_end: r2CoverageEnd,
+    ingest_tail_start: mergedIngestSlices.length ? new Date(mergedIngestSlices[0].startMs).toISOString() : null,
+    ingest_tail_end: mergedIngestSlices.length
+      ? new Date(mergedIngestSlices[mergedIngestSlices.length - 1].endMs).toISOString()
+      : null,
+    response_complete: responseComplete,
+    has_gap: gapInfo.hasGap || partialReasons.size > 0,
+    gap_ranges: gapInfo.gapRanges,
+    row_count: merged.merged.length,
+    r2_row_count: r2Rows.length,
+    ingest_row_count: ingestRows.length,
+    deduped_row_count: merged.deduped,
+    next_since: nextSince,
+    r2_errors: r2Errors,
+    ingest_errors: ingestErrors,
+    cache_status: cacheStatus,
+  };
+
+  const envelope = {
+    schema_version: 2,
+    timeseries_id: requestWindow.timeseriesId,
+    request: {
+      window: requestWindow.normalizedWindowLabel,
+      start_utc: requestStartUtc,
+      end_utc: requestEndUtc,
+      since: requestWindow.requestSinceIso,
+      pollutant: requestWindow.pollutantKey,
+    },
+    data: merged.merged,
+    meta: {
+      ...meta,
+      coverage: r2Coverage,
+      connector_id: connectorId,
+      pollutant: requestWindow.pollutantKey,
+      partial_reasons: Array.from(partialReasons),
+      r2_pages_fetched: r2PagesFetched,
+      r2_hit_page_limit: r2HitPageLimit,
+      ingest_slices: mergedIngestSlices.map((slice) => ({
+        start_utc: new Date(slice.startMs).toISOString(),
+        end_utc: new Date(slice.endMs).toISOString(),
+        reason: slice.reason,
+      })),
+      skipped_ingest_slices: skippedIngestSlices,
+    },
+    data_format: "objects",
+    columns: ["observed_at", "value"],
+    next_since: nextSince,
+    guideline,
+  };
+
+  return {
+    envelope,
+    meta,
+    sourceMode,
+    cacheControl: buildTimeseriesV2CacheControl(sourceMode, runtime),
+  };
 }
 
 function canonicalizeAqiHistoryRequestUrl(url: URL, upstreamFunction: string): URL {

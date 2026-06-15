@@ -242,7 +242,7 @@ async function loadSourceObservationsForTargetDay({ sourceRoot, dayUtc, connecto
     for (const partPath of partPaths) {
       if (!fs.existsSync(partPath)) continue;
       const partRows = await readV2ObservationParquet(partPath, connectorId, counters);
-      rows.push(...partRows);
+      for (const row of partRows) rows.push(row);
     }
   }
   return rows;
@@ -348,23 +348,6 @@ async function writeConnectorOutputForPrefix({ workRoot, prefix, dayUtc, connect
   return connectorManifest;
 }
 
-async function writeDayManifestForPrefix({ workRoot, prefix, dayUtc, runId, connectorManifests, computedAtUtc, objectType }) {
-  const manifestRelKey = `${prefix}/day_utc=${dayUtc}/manifest.json`;
-  const dayManifest = buildHistoryV2DayManifestForTest({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: objectType,
-    dayUtc,
-    runId,
-    manifestKey: manifestRelKey,
-    connectorManifests,
-    writerGitSha: null,
-    backedUpAtUtc: computedAtUtc,
-  });
-  await writeJson(path.join(workRoot, manifestRelKey), dayManifest);
-  return dayManifest;
-}
-
 function manifestTreeObjectKeys(manifest) {
   const keys = new Set();
   if (manifest?.manifest_key) keys.add(manifest.manifest_key);
@@ -373,6 +356,251 @@ function manifestTreeObjectKeys(manifest) {
     if (child?.manifest_key) keys.add(child.manifest_key);
   }
   return Array.from(keys).sort();
+}
+
+async function readJsonIfExists(filePath) {
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).size <= 0) return null;
+  return readJson(filePath);
+}
+
+async function readManifestFromRoots({ roots, key }) {
+  for (const root of roots) {
+    const manifest = await readJsonIfExists(path.join(root, key));
+    if (manifest) return manifest;
+  }
+  return null;
+}
+
+async function discoverConnectorIdsForAqiDay({ roots, prefix, dayUtc }) {
+  const ids = new Set();
+  for (const root of roots) {
+    const dayRoot = path.join(root, prefix, `day_utc=${dayUtc}`);
+    if (!fs.existsSync(dayRoot)) continue;
+    const entries = await fsp.readdir(dayRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^connector_id=\d+$/.test(entry.name)) continue;
+      const connectorId = Number(entry.name.slice("connector_id=".length));
+      if (Number.isInteger(connectorId) && connectorId > 0) ids.add(connectorId);
+    }
+  }
+  return Array.from(ids).sort((a, b) => a - b);
+}
+
+async function discoverPollutantCodesForAqiConnector({ roots, prefix, dayUtc, connectorId }) {
+  const codes = new Set();
+  for (const root of roots) {
+    const connectorRoot = path.join(root, prefix, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
+    if (!fs.existsSync(connectorRoot)) continue;
+    const entries = await fsp.readdir(connectorRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^pollutant_code=[a-z0-9_]+$/i.test(entry.name)) continue;
+      const pollutantCode = entry.name.slice("pollutant_code=".length).trim().toLowerCase();
+      if (pollutantCode) codes.add(pollutantCode);
+    }
+  }
+  return Array.from(codes).sort((left, right) => left.localeCompare(right));
+}
+
+function connectorIdsFromManifest(manifest) {
+  return (Array.isArray(manifest?.connector_ids) ? manifest.connector_ids : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((a, b) => a - b);
+}
+
+function pollutantCodesFromManifest(manifest) {
+  const raw = Array.isArray(manifest?.pollutant_codes)
+    ? manifest.pollutant_codes
+    : Array.isArray(manifest?.available_pollutants)
+      ? manifest.available_pollutants
+      : [];
+  return Array.from(new Set(raw.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)))
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function parquetKeysFromManifest(manifest) {
+  return Array.from(new Set([
+    ...(Array.isArray(manifest?.parquet_object_keys) ? manifest.parquet_object_keys : []),
+    ...(Array.isArray(manifest?.files)
+      ? manifest.files.map((file) => file?.key).filter((key) => String(key || "").endsWith(".parquet"))
+      : []),
+  ].map((key) => String(key || "").trim()).filter(Boolean))).sort((left, right) => left.localeCompare(right));
+}
+
+function rowCountFromManifest(manifest) {
+  const rowCount = Number(manifest?.row_count ?? manifest?.source_row_count);
+  return Number.isFinite(rowCount) ? rowCount : 0;
+}
+
+function fileCountFromManifest(manifest) {
+  const fileCount = Number(manifest?.file_count);
+  return Number.isFinite(fileCount) ? fileCount : parquetKeysFromManifest(manifest).length;
+}
+
+function arraysEqual(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sortedUniqueConnectorIds(ids) {
+  return Array.from(new Set(ids.map(Number).filter((id) => Number.isInteger(id) && id > 0))).sort((a, b) => a - b);
+}
+
+async function rebuildAqiConnectorManifestFromFolders({
+  roots,
+  workRoot,
+  prefix,
+  dayUtc,
+  connectorId,
+  runId,
+  computedAtUtc,
+  objectType,
+  writeLocal,
+  warnings,
+}) {
+  const manifestKey = `${prefix}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`;
+  const before = await readManifestFromRoots({ roots, key: manifestKey });
+  const folderPollutants = await discoverPollutantCodesForAqiConnector({ roots, prefix, dayUtc, connectorId });
+  const pollutantManifests = [];
+  for (const pollutantCode of folderPollutants) {
+    const pollutantManifestKey = `${prefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+    const pollutantManifest = await readManifestFromRoots({ roots, key: pollutantManifestKey });
+    if (pollutantManifest) {
+      pollutantManifests.push(pollutantManifest);
+    } else {
+      warnings.push({
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        pollutant_code: pollutantCode,
+        profile: objectType,
+        warning: "missing_pollutant_manifest",
+      });
+    }
+  }
+
+  const manifest = buildHistoryV2ConnectorManifestForTest({
+    domain: "aqilevels",
+    grain: "hourly",
+    profile: objectType,
+    dayUtc,
+    connectorId,
+    runId,
+    manifestKey,
+    pollutantManifests,
+    writerGitSha: null,
+    backedUpAtUtc: computedAtUtc,
+  });
+  const beforePollutants = pollutantCodesFromManifest(before);
+  const afterPollutants = pollutantCodesFromManifest(manifest);
+  const changed = !before
+    || !arraysEqual(beforePollutants, afterPollutants)
+    || rowCountFromManifest(before) !== rowCountFromManifest(manifest)
+    || fileCountFromManifest(before) !== fileCountFromManifest(manifest)
+    || !arraysEqual(parquetKeysFromManifest(before), parquetKeysFromManifest(manifest));
+  if (writeLocal && changed) await writeJson(path.join(workRoot, manifestKey), manifest);
+  return {
+    manifest,
+    result: {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      profile: objectType,
+      manifest_key: manifestKey,
+      connector_manifest_pollutant_codes_before: beforePollutants,
+      folder_pollutant_codes: folderPollutants,
+      connector_manifest_pollutant_codes_after: afterPollutants,
+      row_count_before: before ? rowCountFromManifest(before) : null,
+      row_count_after: rowCountFromManifest(manifest),
+      file_count_before: before ? fileCountFromManifest(before) : null,
+      file_count_after: fileCountFromManifest(manifest),
+      changed,
+      written_local: Boolean(writeLocal && changed),
+    },
+  };
+}
+
+async function rebuildAqiDayManifestFromFolders({
+  sourceRoot,
+  workRoot,
+  prefix,
+  dayUtc,
+  runId,
+  computedAtUtc,
+  objectType,
+  writeLocal,
+  warnings,
+  errors,
+}) {
+  const roots = [workRoot, sourceRoot];
+  const manifestKey = `${prefix}/day_utc=${dayUtc}/manifest.json`;
+  const before = await readManifestFromRoots({ roots: [sourceRoot], key: manifestKey });
+  const folderConnectorIds = await discoverConnectorIdsForAqiDay({ roots, prefix, dayUtc });
+  const connectorManifests = [];
+  const connectorResults = [];
+  for (const connectorId of folderConnectorIds) {
+    const { manifest, result } = await rebuildAqiConnectorManifestFromFolders({
+      roots,
+      workRoot,
+      prefix,
+      dayUtc,
+      connectorId,
+      runId,
+      computedAtUtc,
+      objectType,
+      writeLocal,
+      warnings,
+    });
+    connectorManifests.push(manifest);
+    connectorResults.push(result);
+  }
+  const manifest = buildHistoryV2DayManifestForTest({
+    domain: "aqilevels",
+    grain: "hourly",
+    profile: objectType,
+    dayUtc,
+    runId,
+    manifestKey,
+    connectorManifests,
+    writerGitSha: null,
+    backedUpAtUtc: computedAtUtc,
+  });
+  const beforeConnectorIds = connectorIdsFromManifest(before);
+  const afterConnectorIds = connectorIdsFromManifest(manifest);
+  const missingConnectorIds = folderConnectorIds.filter((connectorId) => !afterConnectorIds.includes(connectorId));
+  if (missingConnectorIds.length) {
+    errors.push({
+      day_utc: dayUtc,
+      profile: objectType,
+      error: "refusing_incomplete_day_manifest",
+      folder_connector_ids: folderConnectorIds,
+      day_manifest_connector_ids_after: afterConnectorIds,
+      missing_connector_ids: missingConnectorIds,
+    });
+  }
+  const changed = !before
+    || !arraysEqual(beforeConnectorIds, afterConnectorIds)
+    || rowCountFromManifest(before) !== rowCountFromManifest(manifest)
+    || fileCountFromManifest(before) !== fileCountFromManifest(manifest)
+    || !arraysEqual(parquetKeysFromManifest(before), parquetKeysFromManifest(manifest));
+  if (writeLocal && changed && !missingConnectorIds.length) await writeJson(path.join(workRoot, manifestKey), manifest);
+  return {
+    manifest,
+    connectorResults,
+    result: {
+      day_utc: dayUtc,
+      profile: objectType,
+      manifest_key: manifestKey,
+      day_manifest_connector_ids_before: beforeConnectorIds,
+      folder_connector_ids: folderConnectorIds,
+      day_manifest_connector_ids_after: afterConnectorIds,
+      row_count_before: before ? rowCountFromManifest(before) : null,
+      row_count_after: rowCountFromManifest(manifest),
+      file_count_before: before ? fileCountFromManifest(before) : null,
+      file_count_after: fileCountFromManifest(manifest),
+      parquet_object_key_count_before: before ? parquetKeysFromManifest(before).length : null,
+      parquet_object_key_count_after: parquetKeysFromManifest(manifest).length,
+      changed,
+      written_local: Boolean(writeLocal && changed && !missingConnectorIds.length),
+    },
+  };
 }
 
 async function describeParquetSchema(filePath) {
@@ -393,15 +621,20 @@ function runRclone(args) {
 
 async function uploadToTestR2(config, report) {
   for (const prefix of [AQI_DATA_PREFIX, AQI_DEBUG_PREFIX]) {
-    const source = path.join(config.workRoot, prefix);
-    const target = `${config.r2Target}/${prefix}`;
-    if (!fs.existsSync(source)) continue;
-    if (config.replace) {
-      for (const day of report.days_processed) {
-        runRclone(["purge", `${target}/day_utc=${day}`]);
+    for (const day of report.days_processed) {
+      const source = path.join(config.workRoot, prefix, `day_utc=${day}`);
+      const target = `${config.r2Target}/${prefix}/day_utc=${day}`;
+      if (!fs.existsSync(source)) continue;
+      if (config.replace && !report.rebuild_day_manifests) {
+        const connectorIds = Array.isArray(report.connector_ids_processed)
+          ? report.connector_ids_processed
+          : [];
+        for (const connectorId of connectorIds) {
+          runRclone(["purge", `${target}/connector_id=${connectorId}`]);
+        }
       }
+      runRclone(["copy", source, target]);
     }
-    runRclone(["copy", source, target]);
   }
   report.files_uploaded = report.files_written;
 }
@@ -434,6 +667,7 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     r2Target: env.UK_AQ_LOCAL_AQI_V2_R2_TARGET || env.UK_AQ_LOCAL_AQI_R2_TARGET || DEFAULT_R2_TARGET,
     mode: "dry-run",
     replace: false,
+    rebuildDayManifests: false,
     keepLocalWork: parseBoolean(env.KEEP_LOCAL_AQI_WORK, true),
     confirmation: env.UK_AQ_LOCAL_AQI_V2_CONFIRMATION || env.UK_AQ_LOCAL_AQI_CONFIRMATION || "",
   };
@@ -455,6 +689,7 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     else if (arg === "--local-only") config.mode = "local-only";
     else if (arg === "--upload") config.mode = "upload";
     else if (arg === "--replace") config.replace = true;
+    else if (arg === "--rebuild-day-manifests") config.rebuildDayManifests = true;
     else if (arg === "--keep-local-work") config.keepLocalWork = true;
     else if (arg === "--delete-local-work-after-success") config.keepLocalWork = false;
     else if (arg === "--confirm") config.confirmation = next();
@@ -484,7 +719,7 @@ export function validateConfig(config) {
 function printUsage() {
   console.log(`Usage:
   node scripts/R2_v2_implementation/aqi_v2_dropbox_builder_TEST.mjs \\
-    --from-day YYYY-MM-DD --to-day YYYY-MM-DD [--connector-ids 1,3,6,7] [--dry-run|--local-only|--upload] [--replace]
+    --from-day YYYY-MM-DD --to-day YYYY-MM-DD [--connector-ids 1,3,6,7] [--dry-run|--local-only|--upload] [--replace] [--rebuild-day-manifests]
 
 Source: local Dropbox ${OBS_PREFIX}
 Output: TEST R2 ${AQI_DATA_PREFIX} and ${AQI_DEBUG_PREFIX}
@@ -509,10 +744,14 @@ export async function runLocalAqilevelsV2Rebuild(config) {
     target_debug_prefix: AQI_DEBUG_PREFIX,
     mode: config.mode,
     replace: config.replace,
+    rebuild_day_manifests: config.rebuildDayManifests,
     days_processed: [],
     connector_ids_processed: [],
     connector_day_complete: 0,
     connector_day_error: 0,
+    dry_run_manifest_note: config.mode === "dry-run"
+      ? "Dry-run does not write AQI output folders. Day manifest scan fields reflect existing local/Dropbox output only; expected-after-write fields are projections when AQI rows were calculable."
+      : null,
     rows_read_observations: 0,
     rows_used_for_aqi: 0,
     rows_skipped_unsupported_pollutant: 0,
@@ -524,6 +763,10 @@ export async function runLocalAqilevelsV2Rebuild(config) {
     files_written: [],
     files_uploaded: [],
     pollutant_row_counts: {},
+    day_manifest_results: [],
+    connector_manifest_results: [],
+    manifest_integrity_warnings: [],
+    manifest_integrity_errors: [],
     sampled_schema_verification_result: null,
     errors: [],
     index_rebuild_skipped_intentionally: true,
@@ -533,70 +776,134 @@ export async function runLocalAqilevelsV2Rebuild(config) {
   const reportPath = path.join(config.workRoot, "reports", `local_aqilevels_v2_rebuild_TEST_${stamp}.json`);
 
   try {
-    if (config.mode === "dry-run") report.message = "Dry run only; observations were read but no local AQI parquet was written and no R2 upload was attempted.";
+    if (config.rebuildDayManifests) {
+      report.message = "Running manifest-only rebuild mode for v2 aqilevels day manifests.";
+    } else if (config.mode === "dry-run") {
+      report.message = "Dry run only; observations were read but no local AQI parquet was written and no R2 upload was attempted.";
+    }
     for (const dayUtc of dayRange(config.fromDayUtc, config.toDayUtc)) {
-      const dayConnectorIds = await connectorIdsForDay(config.sourceRoot, dayUtc);
+      let dayConnectorIds = [];
+      if (config.rebuildDayManifests) {
+        const [dataConnectorIds, debugConnectorIds] = await Promise.all([
+          discoverConnectorIdsForAqiDay({ roots: [config.workRoot, config.sourceRoot], prefix: AQI_DATA_PREFIX, dayUtc }),
+          discoverConnectorIdsForAqiDay({ roots: [config.workRoot, config.sourceRoot], prefix: AQI_DEBUG_PREFIX, dayUtc }),
+        ]);
+        dayConnectorIds = Array.from(new Set([...dataConnectorIds, ...debugConnectorIds])).sort((a, b) => a - b);
+      } else {
+        dayConnectorIds = await connectorIdsForDay(config.sourceRoot, dayUtc);
+      }
       const targetConnectorIds = (config.connectorIds || dayConnectorIds).filter((id) => dayConnectorIds.includes(id));
-      const dataConnectorManifests = [];
-      const debugConnectorManifests = [];
+      const connectorsWithAqiRows = [];
 
-      for (const connectorId of targetConnectorIds) {
-        const beforeRowsRead = report.rows_read_observations;
-        const sourceRows = await loadSourceObservationsForTargetDay({
-          sourceRoot: config.sourceRoot,
-          dayUtc,
-          connectorId,
-          counters: report,
-        });
-        report.rows_used_for_aqi += sourceRows.length;
-        const aqiRows = buildAqilevelHistoryRowsForDayFromSourceObservations(sourceRows, dayUtc, { computedAtUtc: runStartedAt });
-        if (!aqiRows.length) continue;
-        if (config.mode !== "dry-run") {
-          const dataManifest = await writeConnectorOutputForPrefix({
-            workRoot: config.workRoot,
-            prefix: AQI_DATA_PREFIX,
+      if (!config.rebuildDayManifests) {
+        for (const connectorId of targetConnectorIds) {
+          const beforeRowsRead = report.rows_read_observations;
+          const sourceRows = await loadSourceObservationsForTargetDay({
+            sourceRoot: config.sourceRoot,
             dayUtc,
             connectorId,
-            runId,
-            rows: aqiRows,
-            computedAtUtc: runStartedAt,
-            objectType: "data",
+            counters: report,
           });
-          const debugManifest = await writeConnectorOutputForPrefix({
-            workRoot: config.workRoot,
-            prefix: AQI_DEBUG_PREFIX,
-            dayUtc,
-            connectorId,
-            runId,
-            rows: aqiRows,
-            computedAtUtc: runStartedAt,
-            objectType: "debug",
-          });
-          dataConnectorManifests.push(dataManifest);
-          debugConnectorManifests.push(debugManifest);
-          report.files_written.push(
-            ...manifestTreeObjectKeys(dataManifest),
-            ...manifestTreeObjectKeys(debugManifest),
-          );
-          report.rows_written_aqilevels_data += aqiRows.length;
-          report.rows_written_aqilevels_debug += aqiRows.length;
-          report.parquet_files_written += (dataManifest.parquet_object_keys || []).length + (debugManifest.parquet_object_keys || []).length;
+          report.rows_used_for_aqi += sourceRows.length;
+          const aqiRows = buildAqilevelHistoryRowsForDayFromSourceObservations(sourceRows, dayUtc, { computedAtUtc: runStartedAt });
+          if (!aqiRows.length) continue;
+          connectorsWithAqiRows.push(connectorId);
+          if (config.mode !== "dry-run") {
+            const dataManifest = await writeConnectorOutputForPrefix({
+              workRoot: config.workRoot,
+              prefix: AQI_DATA_PREFIX,
+              dayUtc,
+              connectorId,
+              runId,
+              rows: aqiRows,
+              computedAtUtc: runStartedAt,
+              objectType: "data",
+            });
+            const debugManifest = await writeConnectorOutputForPrefix({
+              workRoot: config.workRoot,
+              prefix: AQI_DEBUG_PREFIX,
+              dayUtc,
+              connectorId,
+              runId,
+              rows: aqiRows,
+              computedAtUtc: runStartedAt,
+              objectType: "debug",
+            });
+            report.files_written.push(
+              ...manifestTreeObjectKeys(dataManifest),
+              ...manifestTreeObjectKeys(debugManifest),
+            );
+            report.rows_written_aqilevels_data += aqiRows.length;
+            report.rows_written_aqilevels_debug += aqiRows.length;
+            report.parquet_files_written += (dataManifest.parquet_object_keys || []).length + (debugManifest.parquet_object_keys || []).length;
+          }
+          report.connector_day_complete += 1;
+          report.connector_ids_processed.push(connectorId);
+          if (report.rows_read_observations === beforeRowsRead) report.connector_day_error += 1;
         }
-        report.connector_day_complete += 1;
-        report.connector_ids_processed.push(connectorId);
-        if (report.rows_read_observations === beforeRowsRead) report.connector_day_error += 1;
+      } else {
+        report.connector_day_complete += targetConnectorIds.length;
+        for (const connectorId of targetConnectorIds) {
+          report.connector_ids_processed.push(connectorId);
+        }
       }
 
-      if (config.mode !== "dry-run" && dataConnectorManifests.length) {
-        const dataDayManifest = await writeDayManifestForPrefix({ workRoot: config.workRoot, prefix: AQI_DATA_PREFIX, dayUtc, runId, connectorManifests: dataConnectorManifests, computedAtUtc: runStartedAt, objectType: "data" });
-        const debugDayManifest = await writeDayManifestForPrefix({ workRoot: config.workRoot, prefix: AQI_DEBUG_PREFIX, dayUtc, runId, connectorManifests: debugConnectorManifests, computedAtUtc: runStartedAt, objectType: "debug" });
-        report.files_written.push(dataDayManifest.manifest_key, debugDayManifest.manifest_key);
+      if (targetConnectorIds.length) {
         report.days_processed.push(dayUtc);
-      } else if (config.mode === "dry-run" && targetConnectorIds.length) {
-        report.days_processed.push(dayUtc);
+      }
+
+      for (const [prefix, objectType] of [[AQI_DATA_PREFIX, "data"], [AQI_DEBUG_PREFIX, "debug"]]) {
+        const { result, connectorResults } = await rebuildAqiDayManifestFromFolders({
+          sourceRoot: config.sourceRoot,
+          workRoot: config.workRoot,
+          prefix,
+          dayUtc,
+          runId,
+          computedAtUtc: runStartedAt,
+          objectType,
+          writeLocal: config.mode !== "dry-run",
+          warnings: report.manifest_integrity_warnings,
+          errors: report.manifest_integrity_errors,
+        });
+        result.manifest_result_basis = config.mode === "dry-run"
+          ? "existing_output_scan_only"
+          : "after_local_output_write";
+        result.manifest_scan_existing_folder_connector_ids = result.folder_connector_ids;
+        result.manifest_target_connector_ids = targetConnectorIds;
+        result.manifest_expected_connector_ids_after_write = config.mode === "dry-run" && !config.rebuildDayManifests
+          ? sortedUniqueConnectorIds([...result.folder_connector_ids, ...connectorsWithAqiRows])
+          : result.day_manifest_connector_ids_after;
+        result.manifest_actual_connector_ids_after_write = config.mode === "dry-run"
+          ? null
+          : result.day_manifest_connector_ids_after;
+        report.day_manifest_results.push(result);
+        for (const result of connectorResults) {
+          report.connector_manifest_results.push(result);
+        }
+        if (result.written_local) report.files_written.push(result.manifest_key);
+        for (const connectorResult of connectorResults) {
+          if (connectorResult.written_local) report.files_written.push(connectorResult.manifest_key);
+        }
       }
     }
     report.connector_ids_processed = Array.from(new Set(report.connector_ids_processed)).sort((a, b) => a - b);
+
+    for (const dayResult of report.day_manifest_results) {
+      const missing = dayResult.folder_connector_ids.filter((connectorId) => !dayResult.day_manifest_connector_ids_after.includes(connectorId));
+      if (missing.length) {
+        report.manifest_integrity_errors.push({
+          day_utc: dayResult.day_utc,
+          profile: dayResult.profile,
+          error: "day_manifest_would_drop_discovered_connectors",
+          folder_connector_ids: dayResult.folder_connector_ids,
+          day_manifest_connector_ids_after: dayResult.day_manifest_connector_ids_after,
+          missing_connector_ids: missing,
+        });
+      }
+    }
+    if (report.manifest_integrity_errors.length) {
+      throw new Error(`Manifest integrity errors: ${JSON.stringify(report.manifest_integrity_errors)}`);
+    }
 
     const sampleFile = report.files_written.find((file) => file.endsWith(".parquet"));
     if (sampleFile) {
