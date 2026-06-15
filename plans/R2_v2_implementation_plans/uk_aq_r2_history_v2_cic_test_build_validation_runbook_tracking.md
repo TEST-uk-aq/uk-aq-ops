@@ -214,3 +214,36 @@ node scripts/backup_r2/build_backup_inventory.mjs \
 
   Next step:
   Run observations-only v2 Dropbox sync.  
+  
+  
+  
+  
+  Checked and fixed the two v2 scripts.
+
+  Files changed:
+  - `scripts/R2_v2_implementation/aqi_v2_dropbox_builder_TEST.mjs`
+  - `scripts/R2_v2_implementation/rebuild_aqilevels_v2_from_r2_dropbox_local_TEST.sh`
+
+  What I fixed:
+  - The shell wrapper was calling a non-existent script path. It now calls `scripts/R2_v2_implementation/aqi_v2_dropbox_builder_TEST.mjs`.
+  - The v2 builder was writing the old wide AQI schema to both `data` and `debug`. It now reuses the existing worker v2 parquet helpers:
+    - `data`: compact v2 AQI columns
+    - `debug`: richer v2 AQI debug columns
+  - The builder was hand-rolling manifests without the full v2 manifest shape. It now uses the existing v2 manifest builders for pollutant, connector, and day manifests.
+  - The local report now includes pollutant manifest paths as well as connector manifests and parquet files.
+
+  Checks run:
+  - `node --check scripts/R2_v2_implementation/aqi_v2_dropbox_builder_TEST.mjs`
+  - `bash -n scripts/R2_v2_implementation/rebuild_aqilevels_v2_from_r2_dropbox_local_TEST.sh`
+  - `npm run check`
+  - Wrapper `--help`
+  - Local-only smoke run for `2026-04-10`, connector `1`, writing only to `/tmp/uk-aq-aqi-v2-smoke`
+
+  Smoke result:
+  - No R2 upload.
+  - Wrote v2 data/debug local outputs.
+  - Data schema is compact v2 columns.
+  - Debug schema is richer v2 debug columns.
+  - Manifests now show `history_version: v2`, `domain: aqilevels`, and correct `profile: data/debug`.
+
+  Note: these two scripts are currently untracked in git, so `git diff` does not show a normal patch for them.
