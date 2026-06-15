@@ -304,10 +304,19 @@ type TimeseriesV2EnvelopeMeta = {
   ingest_row_count: number | null;
   deduped_row_count: number | null;
   next_since?: string | null;
-  r2_errors?: string[];
-  ingest_errors?: string[];
+  r2_errors?: Array<string | Record<string, unknown>>;
+  ingest_errors?: Array<string | Record<string, unknown>>;
   cache_status: "MISS" | "HIT" | "BYPASS";
 };
+
+export class R2HistoryFetchError extends Error {
+  details: Record<string, unknown>;
+  constructor(message: string, details: Record<string, unknown>) {
+    super(message);
+    this.name = "R2HistoryFetchError";
+    this.details = details;
+  }
+}
 
 type TimeseriesV2RuntimeConfig = {
   maxWindowDays: number;
@@ -1463,13 +1472,26 @@ async function fetchTimeseriesOriginPayload(
   });
   const text = await response.text();
   let payload: unknown = null;
+  let parsedJson = false;
   try {
-    payload = text ? JSON.parse(text) : null;
+    if (text) {
+      payload = JSON.parse(text);
+      parsedJson = true;
+    }
   } catch (_err) {
     payload = null;
   }
-  if (!response.ok || !payload || typeof payload !== "object") {
-    throw new Error(`timeseries_origin_failed_${response.status}`);
+  if (!response.ok || !parsedJson || typeof payload !== "object") {
+    const errorDetails = {
+      kind: "timeseries_origin_failed",
+      status: response.status,
+      statusText: response.statusText,
+      contentType: response.headers.get("content-type"),
+      bodyPreview: text ? text.substring(0, 1000) : "",
+      upstreamUrlPath: endpoint.pathname + endpoint.search,
+      worker: "observations"
+    };
+    throw new R2HistoryFetchError(`timeseries_origin_failed_${response.status}`, errorDetails);
   }
   return payload as Record<string, unknown>;
 }
@@ -1511,13 +1533,26 @@ async function fetchR2ObservationsPayload(
   });
   const text = await response.text();
   let payload: unknown = null;
+  let parsedJson = false;
   try {
-    payload = text ? JSON.parse(text) : null;
+    if (text) {
+      payload = JSON.parse(text);
+      parsedJson = true;
+    }
   } catch (_err) {
     payload = null;
   }
-  if (!response.ok || !payload || typeof payload !== "object") {
-    throw new Error(`r2_history_failed_${response.status}`);
+  if (!response.ok || !parsedJson || typeof payload !== "object") {
+    const errorDetails = {
+      kind: "r2_history_failed",
+      status: response.status,
+      statusText: response.statusText,
+      contentType: response.headers.get("content-type"),
+      bodyPreview: text ? text.substring(0, 1000) : "",
+      upstreamUrlPath: endpoint.pathname + endpoint.search,
+      worker: "observations"
+    };
+    throw new R2HistoryFetchError(`r2_history_failed_${response.status}`, errorDetails);
   }
   return payload as Record<string, unknown>;
 }
@@ -1694,8 +1729,8 @@ function buildTimeseriesV2FallbackEnvelope(
   payloadRecord: Record<string, unknown>,
   cacheStatus: "MISS" | "HIT" | "BYPASS",
   sourceMode = "origin_only_v2_wrapper",
-  r2Errors: string[] = [],
-  ingestErrors: string[] = [],
+  r2Errors: Array<string | Record<string, unknown>> = [],
+  ingestErrors: Array<string | Record<string, unknown>> = [],
 ): TimeseriesV2StitchResult {
   const data = Array.isArray(payloadRecord.data) ? payloadRecord.data : [];
   const payloadMeta = payloadRecord.meta && typeof payloadRecord.meta === "object"
@@ -1721,8 +1756,12 @@ function buildTimeseriesV2FallbackEnvelope(
   const r2RowCount = Number(payloadMeta.r2_row_count);
   const ingestRowCount = Number(payloadMeta.ingest_row_count);
   const dedupedRowCount = Number(payloadMeta.deduped_row_count);
-  const payloadR2Errors = Array.isArray(payloadMeta.r2_errors) ? payloadMeta.r2_errors.map(String) : r2Errors;
-  const payloadIngestErrors = Array.isArray(payloadMeta.ingest_errors) ? payloadMeta.ingest_errors.map(String) : ingestErrors;
+  const payloadR2Errors: Array<string | Record<string, unknown>> = Array.isArray(payloadMeta.r2_errors)
+    ? (payloadMeta.r2_errors as unknown[]).map((e) => (e && typeof e === "object" && !Array.isArray(e) ? e as Record<string, unknown> : String(e)))
+    : r2Errors;
+  const payloadIngestErrors: Array<string | Record<string, unknown>> = Array.isArray(payloadMeta.ingest_errors)
+    ? (payloadMeta.ingest_errors as unknown[]).map((e) => (e && typeof e === "object" && !Array.isArray(e) ? e as Record<string, unknown> : String(e)))
+    : ingestErrors;
   const meta: TimeseriesV2EnvelopeMeta = {
     source_mode: String(payloadMeta.source_mode || payloadRecord.source || sourceMode),
     r2_coverage_start: typeof payloadMeta.r2_coverage_start === "string" ? payloadMeta.r2_coverage_start : null,
@@ -1809,8 +1848,8 @@ async function stitchTimeseriesV2FromR2AndIngest(
     return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
   }
 
-  const r2Errors: string[] = [];
-  const ingestErrors: string[] = [];
+  const r2Errors: Array<string | Record<string, unknown>> = [];
+  const ingestErrors: Array<string | Record<string, unknown>> = [];
   const partialReasons = new Set<string>();
   let connectorId: number | null = null;
   let r2Rows: Array<Record<string, unknown>> = [];
@@ -1863,8 +1902,12 @@ async function stitchTimeseriesV2FromR2AndIngest(
           partialReasons.add("r2_coverage_partial");
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        r2Errors.push(message);
+        if (error instanceof R2HistoryFetchError) {
+          r2Errors.push(error.details);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          r2Errors.push(message);
+        }
         partialReasons.add("r2_fetch_failed");
         if (!runtime.partialOnR2Error) {
           throw error;
@@ -1954,8 +1997,12 @@ async function stitchTimeseriesV2FromR2AndIngest(
         }
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ingestErrors.push(message);
+      if (error instanceof R2HistoryFetchError) {
+        ingestErrors.push(error.details);
+      } else {
+        const message = error instanceof Error ? error.message : String(error);
+        ingestErrors.push(message);
+      }
       partialReasons.add("ingest_fetch_failed");
       if (!runtime.partialOnIngestError) {
         throw error;
