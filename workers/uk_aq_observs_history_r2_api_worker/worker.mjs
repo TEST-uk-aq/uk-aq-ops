@@ -822,6 +822,7 @@ async function readHistoryRows({
     env.UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_ENABLED,
     true,
   );
+  const normalizedPollutantKey = normalizePollutant(pollutantKey);
 
   const days = listUtcDays(startIso, endIso);
   // --- DIAG: index_plan ---
@@ -852,7 +853,6 @@ async function readHistoryRows({
   let timeseriesIndexSkippedByTimeRangeFiles = 0;
   let timeseriesIndexIndexedFileCount = 0;
   let timeseriesIndexUnknownRangeFileCount = 0;
-  const normalizedPollutantKey = normalizePollutant(pollutantKey);
 
   if (normalizedReadVersion === "v2" && !timeseriesIndexEnabled) {
     timeseriesIndexWarnings.push(
