@@ -656,6 +656,65 @@ function extractParquetKeysFromTimeseriesIndex(
   }
 
   const dedupedKeys = Array.from(new Set(allKeys));
+
+  // --- DIAG: file bounds filtering result ---
+  const candidateCount = files.length - filesSkippedByTimeRange;
+  const selectedCount = dedupedKeys.length;
+  const skippedByBounds = candidateCount - selectedCount;
+  // Build per-file selected_file diag logs (cap at 20)
+  const MAX_FILE_DIAG = 20;
+  const selectedFileEntries = [];
+  for (const entry of files) {
+    const key = String(entry?.key || "").trim();
+    if (!key || !dedupedKeys.includes(key)) continue;
+    selectedFileEntries.push({
+      key,
+      bytes: Number(entry?.bytes ?? entry?.file_bytes ?? null) || null,
+      min_timeseries_id: Number(entry?.min_timeseries_id) || null,
+      max_timeseries_id: Number(entry?.max_timeseries_id) || null,
+      contains_timeseries_id:
+        Number.isFinite(Number(entry?.min_timeseries_id)) &&
+        Number.isFinite(Number(entry?.max_timeseries_id))
+          ? timeseriesId >= Number(entry.min_timeseries_id) &&
+            timeseriesId <= Number(entry.max_timeseries_id)
+          : null,
+    });
+  }
+  const selectedTotalBytes = selectedFileEntries.reduce(
+    (sum, f) => sum + (f.bytes || 0),
+    0,
+  );
+  console.log("UK_AQ_OBSERVS_DIAG", JSON.stringify({
+    stage: "file_bounds_filter",
+    timeseries_id: timeseriesId,
+    candidate_file_count_before_bounds: candidateCount,
+    selected_file_count_after_bounds: selectedCount,
+    selected_file_total_bytes: selectedTotalBytes,
+    skipped_by_bounds_count: skippedByBounds,
+    skipped_by_time_range_count: filesSkippedByTimeRange,
+    unknown_range_file_count: filesWithUnknownRange,
+  }));
+  const loggedFiles = selectedFileEntries.slice(0, MAX_FILE_DIAG);
+  for (const f of loggedFiles) {
+    console.log("UK_AQ_OBSERVS_DIAG", JSON.stringify({
+      stage: "selected_file",
+      timeseries_id: timeseriesId,
+      key: f.key,
+      bytes: f.bytes,
+      min_timeseries_id: f.min_timeseries_id,
+      max_timeseries_id: f.max_timeseries_id,
+      contains_timeseries_id: f.contains_timeseries_id,
+    }));
+  }
+  if (selectedFileEntries.length > MAX_FILE_DIAG) {
+    console.log("UK_AQ_OBSERVS_DIAG", JSON.stringify({
+      stage: "selected_file_truncated",
+      selected_file_count_after_bounds: selectedCount,
+      logged_file_count: MAX_FILE_DIAG,
+    }));
+  }
+  // --- END DIAG ---
+
   return {
     keys: dedupedKeys,
     file_count: files.length,
@@ -765,6 +824,19 @@ async function readHistoryRows({
   );
 
   const days = listUtcDays(startIso, endIso);
+  // --- DIAG: index_plan ---
+  console.log("UK_AQ_OBSERVS_DIAG", JSON.stringify({
+    stage: "index_plan",
+    read_version: normalizedReadVersion,
+    day_count: days.length,
+    first_day: days[0] ?? null,
+    last_day: days[days.length - 1] ?? null,
+    timeseries_index_enabled: timeseriesIndexEnabled,
+    timeseries_index_prefix: normalizedTimeseriesIndexPrefix,
+    history_prefix: historyPrefix,
+    pollutant: normalizedPollutantKey,
+  }));
+  // --- END DIAG ---
   const metrics = createReadMetrics();
   const rowsByObservedAt = new Map();
   const missingDayManifestKeys = [];
@@ -938,6 +1010,12 @@ async function readHistoryRows({
 
     for (const parquetKey of Array.from(new Set(parquetKeys))) {
       scannedParquetKeys.push(parquetKey);
+      // --- DIAG: parquet_fetch_start ---
+      console.log("UK_AQ_OBSERVS_DIAG", JSON.stringify({
+        stage: "parquet_fetch_start",
+        key: parquetKey,
+      }));
+      // --- END DIAG ---
       const parquet = await fetchFilteredParquetRowsFromR2(
         env,
         parquetKey,
@@ -1034,6 +1112,24 @@ async function handleRequest(requestParams, env) {
   const cachePolicy = resolveCachePolicy(env, endIso);
   const { cacheSeconds, cacheScope } = cachePolicy;
 
+  // --- DIAG: request_start ---
+  const _diagRequestStart = Date.now();
+  console.log("UK_AQ_OBSERVS_DIAG", JSON.stringify({
+    stage: "request_start",
+    read_version: readVersion,
+    timeseries_id: timeseriesId,
+    connector_id: connectorId,
+    pollutant: pollutantKey,
+    start_utc: startIso,
+    end_utc: endIso,
+    since_utc: sinceIso ?? null,
+    limit: limit ?? null,
+    observations_prefix: historyPrefix,
+    history_index_prefix: historyIndexPrefix,
+    timeseries_index_prefix: timeseriesIndexPrefix,
+  }));
+  // --- END DIAG ---
+
   const historyRead = await readHistoryRows({
     env,
     readVersion,
@@ -1048,6 +1144,28 @@ async function handleRequest(requestParams, env) {
     sinceIso,
     limit,
   });
+  // --- DIAG: request_complete ---
+  console.log("UK_AQ_OBSERVS_DIAG", JSON.stringify({
+    stage: "request_complete",
+    read_version: readVersion,
+    timeseries_id: timeseriesId,
+    connector_id: connectorId,
+    pollutant: pollutantKey,
+    start_utc: startIso,
+    end_utc: endIso,
+    r2_object_reads: historyRead.metrics?.r2_object_reads ?? null,
+    parquet_bytes_read: historyRead.metrics?.parquet_bytes_read ?? null,
+    parquet_row_groups_scanned: historyRead.metrics?.parquet_row_groups_scanned ?? null,
+    matched_rows: historyRead.metrics?.parquet_matched_rows ?? null,
+    scanned_parquet_files: historyRead.scanned_parquet_files,
+    days_scanned: historyRead.days_scanned,
+    ts_index_hits: historyRead.timeseries_index?.hit_count ?? null,
+    ts_index_misses: historyRead.timeseries_index?.miss_count ?? null,
+    ts_index_missing_keys_count: historyRead.timeseries_index?.missing_connector_index_keys?.length ?? null,
+    row_count: historyRead.rows.length,
+    duration_ms: Date.now() - _diagRequestStart,
+  }));
+  // --- END DIAG ---
   const completeness = summarizeCoverageCompleteness(historyRead);
 
   return jsonResponse({
@@ -1143,11 +1261,29 @@ export default {
       return withCacheMarker(cached, "HIT");
     }
 
+    const _fetchStart = Date.now();
     let response;
     try {
       response = await handleRequest(requestParams, env);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const errorName = error instanceof Error ? error.name : "UnknownError";
+      const readVersion = parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION);
+      // --- DIAG: error ---
+      console.warn("UK_AQ_OBSERVS_ERROR", JSON.stringify({
+        stage: "error",
+        read_version: readVersion,
+        route_path: requestUrl.pathname,
+        timeseries_id: requestParams.timeseriesId,
+        connector_id: requestParams.connectorId,
+        pollutant: requestParams.pollutantKey,
+        start_utc: requestParams.startIso,
+        end_utc: requestParams.endIso,
+        error_name: errorName,
+        error_message: message,
+        duration_ms: Date.now() - _fetchStart,
+      }));
+      // --- END DIAG ---
       response = jsonResponse({ ok: false, error: message }, {
         status: 500,
         cacheSeconds: 30,
