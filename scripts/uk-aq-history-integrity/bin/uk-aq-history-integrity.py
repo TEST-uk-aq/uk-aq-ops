@@ -26,6 +26,7 @@ import math
 import os
 import re
 import shutil
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -242,6 +243,7 @@ CREATE TABLE IF NOT EXISTS cross_checks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id INTEGER NOT NULL,
   env_name TEXT NOT NULL,
+  history_version TEXT NOT NULL DEFAULT 'v1',
   connector_id INTEGER NOT NULL,
   day_utc TEXT NOT NULL,
   timeseries_id INTEGER NOT NULL,
@@ -262,6 +264,11 @@ CREATE TABLE IF NOT EXISTS aqi_rebuild_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id INTEGER NOT NULL,
   env_name TEXT NOT NULL,
+  history_version TEXT NOT NULL DEFAULT 'v1',
+  domain TEXT,
+  profile TEXT,
+  pollutant_code TEXT,
+  source_observations_version TEXT,
   connector_id INTEGER NOT NULL,
   day_utc TEXT NOT NULL,
 
@@ -4681,10 +4688,207 @@ def check_uk_air_sos(
 
 R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
 R2_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly"
+R2_HISTORY_INDEX_PREFIX = "history/_index"
+R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
+R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v2"
+R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v2/observations"
+R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data"
+R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug"
+R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = (
+    "history/_index_v2/observations_timeseries"
+)
+R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX = (
+    "history/_index_v2/aqilevels_hourly_data_timeseries"
+)
 AQILEVELS_EXPECTED_HISTORY_SCHEMA_NAME = "aqilevels"
 AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION = 2
 AQILEVELS_EXPECTED_WRITER_VERSION = "parquet-wasm-zstd-v2"
 CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
+
+HISTORY_INTEGRITY_SCHEMA_VERSION = 2
+HISTORY_VERSION_CHOICES = ("v1", "v2", "both")
+LAST_BACKFILL_ENV_LOAD_RESULT: dict[str, Any] = {}
+
+
+class HistoryPathConfig:
+    def __init__(
+        self,
+        *,
+        history_version: str,
+        observations_data_prefix: str,
+        aqilevels_hourly_data_prefix: str,
+        aqilevels_hourly_debug_prefix: str | None,
+        observations_timeseries_index_prefix: str,
+        aqilevels_timeseries_index_prefix: str,
+        observations_latest_index_key: str,
+        aqilevels_latest_index_key: str,
+        observations_partition_levels: tuple[str, ...],
+        aqilevels_partition_levels: tuple[str, ...],
+        checks_implemented: bool,
+    ) -> None:
+        self.history_version = history_version
+        self.observations_data_prefix = observations_data_prefix
+        self.aqilevels_hourly_data_prefix = aqilevels_hourly_data_prefix
+        self.aqilevels_hourly_debug_prefix = aqilevels_hourly_debug_prefix
+        self.observations_timeseries_index_prefix = observations_timeseries_index_prefix
+        self.aqilevels_timeseries_index_prefix = aqilevels_timeseries_index_prefix
+        self.observations_latest_index_key = observations_latest_index_key
+        self.aqilevels_latest_index_key = aqilevels_latest_index_key
+        self.observations_partition_levels = observations_partition_levels
+        self.aqilevels_partition_levels = aqilevels_partition_levels
+        self.checks_implemented = checks_implemented
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "history_version": self.history_version,
+            "observations_data_prefix": self.observations_data_prefix,
+            "aqilevels_hourly_data_prefix": self.aqilevels_hourly_data_prefix,
+            "aqilevels_hourly_debug_prefix": self.aqilevels_hourly_debug_prefix,
+            "observations_timeseries_index_prefix": self.observations_timeseries_index_prefix,
+            "aqilevels_timeseries_index_prefix": self.aqilevels_timeseries_index_prefix,
+            "observations_latest_index_key": self.observations_latest_index_key,
+            "aqilevels_latest_index_key": self.aqilevels_latest_index_key,
+            "observations_partition_levels": list(self.observations_partition_levels),
+            "aqilevels_partition_levels": list(self.aqilevels_partition_levels),
+            "checks_implemented": self.checks_implemented,
+        }
+
+
+def _normalize_history_prefix(value: str | None, default: str) -> str:
+    raw = str(value if value is not None else default).strip().strip("/")
+    return raw or default.strip("/")
+
+
+def _append_json_name(prefix: str, name: str) -> str:
+    return f"{prefix.strip('/')}/{name}"
+
+
+def resolve_history_version_mode(args: argparse.Namespace | None = None) -> str:
+    raw = ""
+    if args is not None:
+        raw = str(getattr(args, "history_version", "") or "").strip().lower()
+    if not raw:
+        raw = str(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_VERSION", "v1")).strip().lower()
+    if raw not in HISTORY_VERSION_CHOICES:
+        raise ValueError(
+            "history version must be one of "
+            f"{', '.join(HISTORY_VERSION_CHOICES)} (got {raw!r})"
+        )
+    return raw
+
+
+def expand_history_versions(history_version_mode: str) -> list[str]:
+    if history_version_mode == "both":
+        return ["v1", "v2"]
+    if history_version_mode in {"v1", "v2"}:
+        return [history_version_mode]
+    raise ValueError(
+        "history version must be one of "
+        f"{', '.join(HISTORY_VERSION_CHOICES)} (got {history_version_mode!r})"
+    )
+
+
+def resolve_history_path_config(
+    history_version: str,
+    env: Mapping[str, str] | None = None,
+) -> HistoryPathConfig:
+    values = os.environ if env is None else env
+    if history_version == "v1":
+        index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_INDEX_PREFIX"),
+            R2_HISTORY_INDEX_PREFIX,
+        )
+        observations_index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX"),
+            f"{index_prefix}/observations_timeseries",
+        )
+        aqilevels_index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX"),
+            f"{index_prefix}/aqilevels_timeseries",
+        )
+        return HistoryPathConfig(
+            history_version="v1",
+            observations_data_prefix=_normalize_history_prefix(
+                values.get("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX"),
+                R2_HISTORY_OBSERVATIONS_PREFIX,
+            ),
+            aqilevels_hourly_data_prefix=_normalize_history_prefix(
+                values.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX"),
+                R2_AQILEVELS_PREFIX,
+            ),
+            aqilevels_hourly_debug_prefix=None,
+            observations_timeseries_index_prefix=observations_index_prefix,
+            aqilevels_timeseries_index_prefix=aqilevels_index_prefix,
+            observations_latest_index_key=_append_json_name(
+                index_prefix,
+                "observations_timeseries_latest.json",
+            ),
+            aqilevels_latest_index_key=_append_json_name(
+                index_prefix,
+                "aqilevels_timeseries_latest.json",
+            ),
+            observations_partition_levels=("day_utc", "connector_id"),
+            aqilevels_partition_levels=("day_utc", "connector_id"),
+            checks_implemented=True,
+        )
+    if history_version == "v2":
+        index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_INDEX_V2_PREFIX"),
+            R2_HISTORY_V2_INDEX_PREFIX,
+        )
+        observations_index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX"),
+            f"{index_prefix}/observations_timeseries",
+        )
+        aqilevels_index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"),
+            f"{index_prefix}/aqilevels_hourly_data_timeseries",
+        )
+        return HistoryPathConfig(
+            history_version="v2",
+            observations_data_prefix=_normalize_history_prefix(
+                values.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX"),
+                R2_HISTORY_V2_OBSERVATIONS_PREFIX,
+            ),
+            aqilevels_hourly_data_prefix=_normalize_history_prefix(
+                values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX"),
+                R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX,
+            ),
+            aqilevels_hourly_debug_prefix=_normalize_history_prefix(
+                values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX"),
+                R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
+            ),
+            observations_timeseries_index_prefix=observations_index_prefix,
+            aqilevels_timeseries_index_prefix=aqilevels_index_prefix,
+            observations_latest_index_key=_append_json_name(
+                index_prefix,
+                "observations_timeseries_latest.json",
+            ),
+            aqilevels_latest_index_key=_append_json_name(
+                index_prefix,
+                "aqilevels_hourly_data_timeseries_latest.json",
+            ),
+            observations_partition_levels=("day_utc", "connector_id", "pollutant_code"),
+            aqilevels_partition_levels=("day_utc", "connector_id", "pollutant_code"),
+            checks_implemented=False,
+        )
+    raise ValueError(f"unsupported history version: {history_version!r}")
+
+
+def resolve_history_path_configs(
+    history_version_mode: str,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, HistoryPathConfig]:
+    return {
+        version: resolve_history_path_config(version, env)
+        for version in expand_history_versions(history_version_mode)
+    }
+
+
+def serialize_history_path_configs(
+    configs: Mapping[str, HistoryPathConfig],
+) -> dict[str, dict[str, Any]]:
+    return {version: config.to_dict() for version, config in sorted(configs.items())}
 
 
 def _normalize_timeseries_row_counts(raw: Any) -> dict[int, int]:
@@ -4856,7 +5060,7 @@ def run_r2_cross_checks(
                 if len(discrepancies) < CROSS_CHECK_MAX_REPORT_DISCREPANCIES:
                     discrepancies.append(entry)
                 insert_rows.append((
-                    run_id, env_name, connector_id, day_utc, timeseries_id,
+                    run_id, env_name, "v1", connector_id, day_utc, timeseries_id,
                     source_row_count, None, None, status, checked_at_utc,
                     manifest_error,
                 ))
@@ -4884,7 +5088,7 @@ def run_r2_cross_checks(
                 if len(discrepancies) < CROSS_CHECK_MAX_REPORT_DISCREPANCIES:
                     discrepancies.append(entry)
                 insert_rows.append((
-                    run_id, env_name, connector_id, day_utc, timeseries_id,
+                    run_id, env_name, "v1", connector_id, day_utc, timeseries_id,
                     source_row_count, None, None, status, checked_at_utc,
                     notes,
                 ))
@@ -4913,6 +5117,7 @@ def run_r2_cross_checks(
             insert_rows.append((
                 run_id,
                 env_name,
+                "v1",
                 connector_id,
                 day_utc,
                 timeseries_id,
@@ -4942,9 +5147,9 @@ def run_r2_cross_checks(
         conn.executemany(
             """
             INSERT INTO cross_checks (
-              run_id, env_name, connector_id, day_utc, timeseries_id,
+              run_id, env_name, history_version, connector_id, day_utc, timeseries_id,
               source_row_count, r2_row_count, delta, status, checked_at_utc, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             insert_rows,
         )
@@ -5256,15 +5461,22 @@ def _queue_aqi_rebuild(
         conn.execute(
             """
             INSERT INTO aqi_rebuild_queue (
-              run_id, env_name, connector_id, day_utc,
+              run_id, env_name, history_version, domain, profile,
+              pollutant_code, source_observations_version,
+              connector_id, day_utc,
               reason, source_mode, status,
               requested_timeseries_ids, notes,
               created_at_utc, started_at_utc, finished_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
             """,
             (
                 run_id,
                 env_name,
+                "v1",
+                "aqilevels",
+                "hourly",
+                None,
+                "v1",
                 connector_id,
                 day_utc,
                 reason,
@@ -6389,10 +6601,94 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip Phase 6.5 Pass B source-vs-R2 count cross-check (debug/recovery).",
     )
+    default_history_version = os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_VERSION", "v1")
+    p.add_argument(
+        "--history-version",
+        default=default_history_version,
+        choices=list(HISTORY_VERSION_CHOICES),
+        help=(
+            "R2 history layout version to check "
+            f"(default {default_history_version!r}; env UK_AQ_R2_HISTORY_INTEGRITY_VERSION)."
+        ),
+    )
     return p.parse_args(argv)
 
 
+def _parse_env_assignment_line(raw_line: str) -> tuple[str, str] | None:
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[len("export "):].lstrip()
+    if "=" not in line:
+        return None
+    key, raw_value = line.split("=", 1)
+    key = key.strip()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+        return None
+    value_part = raw_value.strip()
+    if not value_part:
+        return key, ""
+    try:
+        pieces = shlex.split(value_part, comments=True, posix=True)
+    except ValueError:
+        pieces = [value_part.strip().strip("'\"")]
+    if not pieces:
+        return key, ""
+    return key, pieces[0]
+
+
+def load_env_file_assignments(path: str | Path) -> dict[str, str]:
+    env_path = Path(path).expanduser()
+    values: dict[str, str] = {}
+    with env_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            parsed = _parse_env_assignment_line(raw_line)
+            if parsed is None:
+                continue
+            key, value = parsed
+            values[key] = value
+    return values
+
+
+def load_backfill_env_file_if_set(*, override_existing: bool = False) -> dict[str, Any]:
+    raw_path = str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")).strip()
+    result: dict[str, Any] = {
+        "path": raw_path,
+        "loaded": False,
+        "loaded_keys": [],
+        "shared_history_keys": [],
+        "skipped_existing_keys": [],
+        "error": None,
+    }
+    if not raw_path:
+        return result
+    env_path = Path(raw_path).expanduser()
+    if not env_path.is_file():
+        result["error"] = f"UK_AQ_BACKFILL_ENV_FILE not found: {env_path}"
+        return result
+    loaded = load_env_file_assignments(env_path)
+    loaded_keys: list[str] = []
+    skipped_existing: list[str] = []
+    for key, value in loaded.items():
+        if not override_existing and key in os.environ:
+            skipped_existing.append(key)
+            continue
+        os.environ[key] = value
+        loaded_keys.append(key)
+    result["path"] = str(env_path)
+    result["loaded"] = True
+    result["loaded_keys"] = sorted(loaded_keys)
+    result["skipped_existing_keys"] = sorted(skipped_existing)
+    result["shared_history_keys"] = sorted(
+        key for key in loaded
+        if key.startswith("UK_AQ_R2_HISTORY_")
+    )
+    return result
+
+
 def load_env_or_die() -> dict[str, str]:
+    global LAST_BACKFILL_ENV_LOAD_RESULT
     missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
     if missing:
         sys.stderr.write(
@@ -6401,6 +6697,7 @@ def load_env_or_die() -> dict[str, str]:
             f"       Missing: {', '.join(missing)}\n"
         )
         sys.exit(3)
+    LAST_BACKFILL_ENV_LOAD_RESULT = load_backfill_env_file_if_set()
     return {v: os.environ[v] for v in REQUIRED_ENV_VARS}
 
 
@@ -7305,6 +7602,16 @@ def open_db(db_path: str) -> sqlite3.Connection:
         "snapshot_day_utc": "TEXT",
         "bytes_read": "INTEGER DEFAULT 0",
     })
+    ensure_columns(conn, "cross_checks", {
+        "history_version": "TEXT NOT NULL DEFAULT 'v1'",
+    })
+    ensure_columns(conn, "aqi_rebuild_queue", {
+        "history_version": "TEXT NOT NULL DEFAULT 'v1'",
+        "domain": "TEXT",
+        "profile": "TEXT",
+        "pollutant_code": "TEXT",
+        "source_observations_version": "TEXT",
+    })
     ensure_columns(conn, "integrity_runs", {
         "backfills_ok": "INTEGER DEFAULT 0",
         "backfills_failed": "INTEGER DEFAULT 0",
@@ -7437,6 +7744,43 @@ def format_summary_md(s: dict[str, Any]) -> str:
         f"- Log:       {s['log_path']}",
         "",
     ]
+
+    history_configs = s.get("history_path_configs") or {}
+    if history_configs:
+        lines.extend([
+            "## History version configuration",
+            "",
+            f"- Integrity schema version: {s.get('history_integrity_schema_version')}",
+            f"- Version mode: {s.get('history_version_mode')}",
+            f"- Checked versions: {', '.join(s.get('checked_versions') or [])}",
+            f"- Site read version: {s.get('site_read_version') or '(unset)'}",
+        ])
+        backfill_env = s.get("backfill_env_file") or {}
+        if backfill_env.get("path") or backfill_env.get("loaded"):
+            lines.extend([
+                f"- Backfill env file: {backfill_env.get('path') or '(unset)'}",
+                f"- Backfill env loaded: {bool(backfill_env.get('loaded'))}",
+                "- Shared history keys loaded: "
+                + ", ".join(backfill_env.get("shared_history_keys") or []),
+            ])
+            if backfill_env.get("error"):
+                lines.append(f"- Backfill env error: {backfill_env.get('error')}")
+        for version in sorted(history_configs):
+            config = history_configs.get(version) or {}
+            lines.extend([
+                "",
+                f"### history_version={version}",
+                "",
+                f"- Checks implemented: {bool(config.get('checks_implemented'))}",
+                f"- Observations data prefix: {config.get('observations_data_prefix')}",
+                f"- AQI hourly data prefix: {config.get('aqilevels_hourly_data_prefix')}",
+                f"- AQI hourly debug prefix: {config.get('aqilevels_hourly_debug_prefix') or '(none)'}",
+                f"- Observations index prefix: {config.get('observations_timeseries_index_prefix')}",
+                f"- AQI index prefix: {config.get('aqilevels_timeseries_index_prefix')}",
+                f"- Observations latest index: {config.get('observations_latest_index_key')}",
+                f"- AQI latest index: {config.get('aqilevels_latest_index_key')}",
+            ])
+        lines.append("")
 
     snap = s.get("snapshot") or {}
     if snap:
@@ -7801,6 +8145,11 @@ def write_reports(
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     env = load_env_or_die()
+    history_version_mode = resolve_history_version_mode(args)
+    checked_history_versions = expand_history_versions(history_version_mode)
+    history_path_configs = resolve_history_path_configs(history_version_mode)
+    serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
+    site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_READ_VERSION", "")).strip() or None
     preflight_summary = run_preflight_or_die(args, env)
 
     started_mono = time.monotonic()
@@ -8012,7 +8361,18 @@ def main(argv: list[str]) -> int:
                 ),
             }
             log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
+        elif history_version_mode == "v2":
+            cross_check_metrics = {
+                "ran": False,
+                "history_version": "v2",
+                "skipped_reason": (
+                    "v2 deep R2 cross-checks are not implemented in phase 1; "
+                    "path config/reporting only"
+                ),
+            }
+            log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
         else:
+            v1_config = history_path_configs["v1"]
             cross_check_metrics = run_r2_cross_checks(
                 conn=conn,
                 run_id=int(run_id),
@@ -8021,12 +8381,23 @@ def main(argv: list[str]) -> int:
                 from_day=from_day,
                 to_day=to_day,
                 r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
-                r2_manifest_prefix=os.environ.get(
-                    "UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX"
-                ),
+                r2_manifest_prefix=v1_config.observations_timeseries_index_prefix,
                 checked_at_utc=fmt_iso(utc_now()),
                 log=log,
             )
+            cross_check_metrics["history_version"] = "v1"
+            if history_version_mode == "both":
+                cross_check_metrics["additional_history_versions"] = {
+                    "v2": {
+                        "ran": False,
+                        "checks_implemented": False,
+                        "status": "not_implemented_phase1",
+                        "skipped_reason": (
+                            "v2 deep R2 cross-checks are not implemented in phase 1; "
+                            "path config/reporting only"
+                        ),
+                    }
+                }
         if cross_check_metrics.get("ran"):
             cc_backfill_metrics = run_cross_check_backfills(
                 conn=conn,
@@ -8047,7 +8418,7 @@ def main(argv: list[str]) -> int:
                 run_id=int(run_id),
                 env_name=args.env,
                 r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
-                r2_aqilevels_prefix=os.environ.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX"),
+                r2_aqilevels_prefix=history_path_configs["v1"].aqilevels_hourly_data_prefix,
                 dry_run=args.dry_run,
                 run_backfill=args.run_backfill,
                 log=log,
@@ -8444,10 +8815,42 @@ def main(argv: list[str]) -> int:
         )
         conn.commit()
 
+        history_version_results = {
+            version: {
+                "history_version": version,
+                "checks_implemented": bool(config.checks_implemented),
+                "status": (
+                    "checked"
+                    if version == "v1" and cross_check_metrics.get("ran")
+                    else "not_implemented_phase1"
+                    if version == "v2"
+                    else "skipped"
+                ),
+                "skipped_reason": (
+                    None
+                    if version == "v1" and cross_check_metrics.get("ran")
+                    else (
+                        "v2 deep R2 checks are not implemented in phase 1; "
+                        "path config/reporting only"
+                    )
+                    if version == "v2"
+                    else cross_check_metrics.get("skipped_reason")
+                ),
+            }
+            for version, config in history_path_configs.items()
+        }
+
         summary: dict[str, Any] = {
             "env": args.env,
             "profile": args.profile,
             "source": args.source,
+            "history_integrity_schema_version": HISTORY_INTEGRITY_SCHEMA_VERSION,
+            "history_version_mode": history_version_mode,
+            "checked_versions": checked_history_versions,
+            "history_path_configs": serialized_history_path_configs,
+            "history_version_results": history_version_results,
+            "site_read_version": site_read_version,
+            "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,
             "from_day": from_day,
             "to_day": to_day,
             "dry_run": args.dry_run,
