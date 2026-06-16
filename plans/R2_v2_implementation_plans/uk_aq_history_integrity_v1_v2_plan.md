@@ -304,6 +304,9 @@ The manifest should include fields like:
 Integrity should rely on `row_count`, `source_row_count` when present, `file_count`, `timeseries_row_counts`, and `files[]` with parquet object references. Do not rely on `total_rows` unless the emitting code is confirmed to use it. Parquet files without a pollutant manifest are orphan/incomplete data, and a pollutant partition is not healthy unless `manifest.json` exists and all files referenced by it exist.
 
 For each selected `day_utc`, connector, and pollutant, check:
+### v2 observations check paths
+
+For each selected `day_utc`, connector, and pollutant:
 
 ```text
 history/v2/observations/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json
@@ -326,6 +329,9 @@ For each selected `day_utc`, connector, and pollutant, check both the source par
 
 ```text
 history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json
+For each selected `day_utc`, connector, and pollutant:
+
+```text
 history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/part-00000.parquet
 history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json
 history/_index_v2/aqilevels_hourly_data_timeseries_latest.json
@@ -339,6 +345,10 @@ Debug partitions, when generated, are expected to look like:
 history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/
   manifest.json
   part-00000.parquet
+Debug should be optional and reported separately:
+
+```text
+history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/part-00000.parquet
 ```
 
 Recommended policy:
@@ -350,6 +360,11 @@ Recommended policy:
 - Do not fail overall v2 AQI integrity solely because debug is missing unless the writer explicitly guarantees it and strict mode is enabled.
 - Add explicit strictness env: `UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true`.
 - Report debug coverage as `optional_debug_missing` unless strict mode is enabled.
+- Default: do not fail overall v2 AQI integrity solely because debug is missing.
+- Add explicit flag/env:
+  - `--include-aqi-debug`
+  - `UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG=true|false`
+- Report debug coverage as `optional_debug_missing` unless explicitly required.
 
 ## 6. Recommended version-selection model
 
@@ -518,6 +533,24 @@ Use these existing shared env names first:
 ```text
 UK_AQ_R2_HISTORY_READ_VERSION
 UK_AQ_R2_HISTORY_WRITE_VERSION
+### 7.3 Prefix overrides
+
+Support version-specific env overrides:
+
+```text
+UK_AQ_R2_HISTORY_INTEGRITY_V1_OBSERVATIONS_PREFIX
+UK_AQ_R2_HISTORY_INTEGRITY_V1_AQILEVELS_HOURLY_PREFIX
+UK_AQ_R2_HISTORY_INTEGRITY_V1_INDEX_PREFIX
+
+UK_AQ_R2_HISTORY_INTEGRITY_V2_OBSERVATIONS_PREFIX
+UK_AQ_R2_HISTORY_INTEGRITY_V2_AQILEVELS_HOURLY_DATA_PREFIX
+UK_AQ_R2_HISTORY_INTEGRITY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX
+UK_AQ_R2_HISTORY_INTEGRITY_V2_INDEX_PREFIX
+```
+
+But prefer reusing existing shared env names where possible:
+
+```text
 UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
 UK_AQ_R2_HISTORY_AQILEVELS_PREFIX
 UK_AQ_R2_HISTORY_INDEX_PREFIX
@@ -536,6 +569,9 @@ UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true|false
 ```
 
 The index builder already uses the shared v2 path names.
+```
+
+The index builder already uses these names.
 
 ## 8. Recommended report schema changes
 
@@ -748,6 +784,11 @@ Repair decision matrix:
 | v2 observations present, v2 AQI missing | Run AQI rebuild from v2 observations, then rebuild v2 AQI index |
 | R2 v2 exists but Dropbox v2 is missing | Report backup lag/incomplete local mirror rather than a source data gap |
 | neither v1 nor v2 exists | Treat as source/prune/Supabase issue requiring source investigation |
+| v1 data present, v2 data missing, v2 index missing | Generate v2 from v1/source, then rebuild `_index_v2` observations |
+| v2 data present, v2 index missing | Rebuild `_index_v2` only |
+| source data present, v1 and v2 missing | Run source-to-history backfill for target version(s), then rebuild index |
+| v2 observations present, v2 AQI missing | Run AQI rebuild from v2 observations, then rebuild v2 AQI index |
+| source only in R2 v1/Dropbox backup | Plan v1-to-v2 conversion/backfill and note Dropbox backup dependency |
 
 ### Phase 5: Optional comparison mode
 
@@ -1129,6 +1170,18 @@ For phases 2-5:
 3. Should phase 1 add nullable `history_version` columns immediately, or should persistent schema migration wait until phase 2/4 when v2 findings and queues are actively written?
 4. What is the source of truth for verifying local Dropbox backup inventory completeness for v2: inventory JSON, rclone listing, or path existence plus manifest validation?
 5. Are v2 AQI debug indexes generated today, or should the plan only check debug source partitions until index behavior is confirmed?
+## 13. Open questions before implementation
+
+1. What exact schema do v2 observation pollutant manifests use? Do they include `timeseries_row_counts`, `source_row_count`, `total_rows`, and parquet object references?
+2. Do v2 observations always write a `manifest.json` per `pollutant_code`, or can data exist with only parquet files?
+3. Do v2 AQI hourly data partitions have manifests, or only parquet files plus `_index_v2` manifests?
+4. Is `history/v2/aqilevels/hourly/debug` expected for every data partition, or only for diagnostics/failures?
+5. Which runtime env var reflects the test site’s active read version: `UK_AQ_R2_HISTORY_READ_VERSION`, dashboard worker env, or another config?
+6. Is there already a v1-to-v2 observations converter/backfill command, or should Phase 4 only suggest “run prune daily/backfill with v2 write vars”?
+7. Should the main integrity runner’s default switch from `v1` to site read version after v2 stabilizes?
+8. Does the integrity SQLite schema need persistent `history_version` columns on `cross_checks` and AQI queue tables, or is report-only enough in phase 1?
+9. Should AQI rebuild queue rows include `history_version` to avoid queuing v1 repairs from a v2 integrity run?
+10. Are there existing Dropbox backup layouts for v2 that mirror R2 exactly, or is local backup currently v1-only/incomplete?
 
 ## 14. Suggested Codex implementation prompt for phase 1
 
