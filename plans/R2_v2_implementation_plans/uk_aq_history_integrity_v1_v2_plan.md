@@ -10,6 +10,8 @@ The active UK-AQ integrity tooling is partly history-integrity tooling and partl
 
 The index builder already has substantial v2 awareness in `workers/shared/uk_aq_r2_history_index.mjs`: v2 data/index prefix constants exist, v2 env vars are read, and a v2 rebuild path can rebuild observations and AQI hourly data timeseries indexes.
 
+The implementation must load `UK_AQ_BACKFILL_ENV_FILE` if it is set, then use the existing shared `UK_AQ_R2_HISTORY_*` variables from that file. Do not invent separate v2 integrity path variables except as optional overrides.
+
 The integrity tooling itself is not version-aware yet. It can therefore report a v1-oriented “healthy” result while v2 is missing, especially for the 2026-06-11 case where data exists in v1 observations but the site reads v2. To fix this safely, add a central history-version path resolver and make every R2/local-Dropbox integrity check explicitly run against `v1`, `v2`, or `both`, with report output that always includes the checked history version.
 
 ## 2. Current integrity architecture
@@ -169,7 +171,7 @@ The AQI gap checker has no CLI/env history version selection and hard-codes `his
 
 ## 5. Required v1/v2 path mapping
 
-The integrity tooling must load the env file from UK_AQ_BACKFILL_ENV_FILE if set, then use the existing shared UK_AQ_R2_HISTORY_* vars from that .env.
+The resolver must first load the normal integrity env, then, if `UK_AQ_BACKFILL_ENV_FILE` is set, load that file as an additional shared runtime env source for existing `UK_AQ_R2_HISTORY_*` variables such as `UK_AQ_R2_HISTORY_READ_VERSION`, `UK_AQ_R2_HISTORY_WRITE_VERSION`, `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX`, `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX`, `UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX`, `UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX`, and `UK_AQ_R2_HISTORY_INDEX_V2_PREFIX`. Integrity-specific env vars should be limited to selector/strictness behavior, not duplicate path definitions unless an override is explicitly needed.
 
 Add a central path config model. Proposed shape:
 
@@ -212,6 +214,96 @@ class HistoryPathConfig:
 | AQI hourly data timeseries index | `history/_index_v2/aqilevels_hourly_data_timeseries` |
 | AQI hourly data latest index | `history/_index_v2/aqilevels_hourly_data_timeseries_latest.json` |
 
+### Local Dropbox backup expectations
+
+The intended local Dropbox backup mirrors R2 under:
+
+```text
+/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup
+```
+
+Therefore v2 should appear locally as:
+
+```text
+R2_history_backup/history/v2/observations/...
+R2_history_backup/history/v2/aqilevels/hourly/data/...
+R2_history_backup/history/v2/aqilevels/hourly/debug/...
+R2_history_backup/history/_index_v2/...
+```
+
+Integrity must not assume the local Dropbox mirror is complete. It should distinguish:
+
+- R2 v2 exists, Dropbox v2 missing = backup lag/incomplete mirror.
+- R2 v1 exists, R2 v2 missing = v2 backfill needed.
+- Dropbox v1 exists, R2 v2 missing = local v1-to-v2 builder can be used.
+- Neither v1 nor v2 exists = source/prune/Supabase issue.
+
+### v2 observations check paths and manifest schema
+
+A v2 observation pollutant manifest is authoritative for its day/connector/pollutant partition and should live at:
+
+```text
+history/v2/observations/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json
+```
+
+Expected partition shape:
+
+```text
+history/v2/observations/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/
+  manifest.json
+  part-00000.parquet
+  part-00001.parquet
+```
+
+The manifest should include fields like:
+
+```json
+{
+  "schema_version": 2,
+  "generated_at": "2026-06-16T08:34:06.613Z",
+  "source": "...",
+  "history_version": "v2",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "bucket": "uk-aq-history-cic-test",
+  "day_utc": "2026-03-19",
+  "connector_id": 7,
+  "pollutant_code": "pm25",
+  "row_count": 47288,
+  "source_row_count": 47288,
+  "file_count": 2,
+  "min_timeseries_id": 7429,
+  "max_timeseries_id": 7308573,
+  "min_observed_at_utc": "2026-03-19T00:00:16.000Z",
+  "max_observed_at_utc": "2026-03-19T23:59:47.000Z",
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "timeseries_row_counts": {
+    "7507": 234,
+    "8214": 235
+  },
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-03-19/connector_id=7/pollutant_code=pm25/part-00000.parquet",
+      "row_count": 25000,
+      "bytes": 247039,
+      "etag_or_hash": "...",
+      "pollutant_code": "pm25",
+      "min_timeseries_id": 7429,
+      "max_timeseries_id": 7900,
+      "min_observed_at_utc": "2026-03-19T00:00:20.000Z",
+      "max_observed_at_utc": "2026-03-19T23:59:47.000Z",
+      "min_timestamp_hour_utc": null,
+      "max_timestamp_hour_utc": null
+    }
+  ]
+}
+```
+
+Integrity should rely on `row_count`, `source_row_count` when present, `file_count`, `timeseries_row_counts`, and `files[]` with parquet object references. Do not rely on `total_rows` unless the emitting code is confirmed to use it. Parquet files without a pollutant manifest are orphan/incomplete data, and a pollutant partition is not healthy unless `manifest.json` exists and all files referenced by it exist.
+
+For each selected `day_utc`, connector, and pollutant, check:
 ### v2 observations check paths
 
 For each selected `day_utc`, connector, and pollutant:
@@ -225,6 +317,18 @@ history/_index_v2/observations_timeseries_latest.json
 
 ### v2 AQI hourly data check paths
 
+V2 AQI hourly data partitions should have their own source partition manifests; `_index_v2` manifests are additional index products and do not replace the source partition manifests. The required data partition shape is:
+
+```text
+history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/
+  manifest.json
+  part-00000.parquet
+```
+
+For each selected `day_utc`, connector, and pollutant, check both the source partition manifest/files and the index manifest:
+
+```text
+history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json
 For each selected `day_utc`, connector, and pollutant:
 
 ```text
@@ -235,6 +339,12 @@ history/_index_v2/aqilevels_hourly_data_timeseries_latest.json
 
 ### v2 AQI debug check paths
 
+Debug partitions, when generated, are expected to look like:
+
+```text
+history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/
+  manifest.json
+  part-00000.parquet
 Debug should be optional and reported separately:
 
 ```text
@@ -243,6 +353,13 @@ history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant
 
 Recommended policy:
 
+- Missing AQI hourly data = error.
+- Missing AQI hourly data index = error.
+- Missing AQI hourly debug = warning by default.
+- Missing AQI hourly debug index = warning by default.
+- Do not fail overall v2 AQI integrity solely because debug is missing unless the writer explicitly guarantees it and strict mode is enabled.
+- Add explicit strictness env: `UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true`.
+- Report debug coverage as `optional_debug_missing` unless strict mode is enabled.
 - Default: do not fail overall v2 AQI integrity solely because debug is missing.
 - Add explicit flag/env:
   - `--include-aqi-debug`
@@ -286,6 +403,8 @@ or, for both mode:
 This preserves existing behavior while preventing ambiguity.
 
 ### 6.3 Avoid false health when v2 is missing
+
+The active site/API read version is `UK_AQ_R2_HISTORY_READ_VERSION`, used by the observations and AQI history R2 API workers. Integrity should include this as report context, for example `site_read_version`, but it must not use the site read version as the default check selector. The default should remain v1 for compatibility until scheduled jobs are explicitly changed to v2 or both.
 
 Rules:
 
@@ -405,6 +524,15 @@ scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py \
   --history-version v2
 ```
 
+### 7.3 Env loading and prefix source
+
+The integrity tooling must load `UK_AQ_BACKFILL_ENV_FILE` when it is set and then use the existing shared `UK_AQ_R2_HISTORY_*` variables from that file. This keeps integrity aligned with the same path/version contract used by backfill, prune, and API tooling.
+
+Use these existing shared env names first:
+
+```text
+UK_AQ_R2_HISTORY_READ_VERSION
+UK_AQ_R2_HISTORY_WRITE_VERSION
 ### 7.3 Prefix overrides
 
 Support version-specific env overrides:
@@ -429,6 +557,18 @@ UK_AQ_R2_HISTORY_INDEX_PREFIX
 UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX
 UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX
 UK_AQ_R2_HISTORY_INDEX_V2_PREFIX
+UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX
+UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
+```
+
+Do not invent separate v2 integrity path variables unless they are optional explicit overrides. Integrity-specific env should be limited to behavior such as:
+
+```text
+UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v1|v2|both
+UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true|false
+```
+
+The index builder already uses the shared v2 path names.
 ```
 
 The index builder already uses these names.
@@ -436,6 +576,8 @@ The index builder already uses these names.
 ## 8. Recommended report schema changes
 
 ### 8.1 Main summary report
+
+Add fields and include the worker read version as context only. `site_read_version` should come from `UK_AQ_R2_HISTORY_READ_VERSION` when available, but the checked version must still come from `--history-version` or `UK_AQ_R2_HISTORY_INTEGRITY_VERSION`.
 
 Add fields:
 
@@ -563,6 +705,7 @@ For `both` mode:
 
 Scope:
 
+- Add env-loading support that reads `UK_AQ_BACKFILL_ENV_FILE` if set and uses the shared `UK_AQ_R2_HISTORY_*` vars from that file.
 - Add central `HistoryPathConfig` / resolver.
 - Add `--history-version v1|v2|both` to main integrity runner.
 - Add env fallback `UK_AQ_R2_HISTORY_INTEGRITY_VERSION`.
@@ -615,11 +758,32 @@ Scope:
 - Generate repair plans only; keep execution separate/opt-in.
 - Add suggested repair kind and commands.
 - Do not execute repair commands unless an explicit future flag is added.
+- Prefer the existing v1-to-v2 observations builder when v1 Dropbox source exists: `scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs`.
+
+Example v1-to-v2 observations repair command for 2026-06-11:
+
+```bash
+node scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs \
+  --from-day 2026-06-11 \
+  --to-day 2026-06-11 \
+  --connector-ids 1,3,6,7 \
+  --part-max-rows 5000 \
+  --write-r2 \
+  --replace \
+  --report-out tmp/v2_observations_2026-06-11_from_v1_dropbox.json
+```
 
 Repair decision matrix:
 
 | Condition | Suggested repair |
 | --- | --- |
+| v1 exists in R2 but not local Dropbox | Run/refresh Dropbox backup in v1 mode for the target day first |
+| v1 exists in local Dropbox and v2 observations are missing | Run `scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs` for the target day/connectors, then rebuild `_index_v2` observations |
+| v2 data exists but v2 index is missing | Rebuild `_index_v2` only |
+| data still exists in Supabase and targeted prune/backfill supports v2 | Run prune daily/backfill with explicit `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, then rebuild `_index_v2` |
+| v2 observations present, v2 AQI missing | Run AQI rebuild from v2 observations, then rebuild v2 AQI index |
+| R2 v2 exists but Dropbox v2 is missing | Report backup lag/incomplete local mirror rather than a source data gap |
+| neither v1 nor v2 exists | Treat as source/prune/Supabase issue requiring source investigation |
 | v1 data present, v2 data missing, v2 index missing | Generate v2 from v1/source, then rebuild `_index_v2` observations |
 | v2 data present, v2 index missing | Rebuild `_index_v2` only |
 | source data present, v1 and v2 missing | Run source-to-history backfill for target version(s), then rebuild index |
@@ -687,6 +851,13 @@ summary["history_version_mode"] = history_version_mode
 summary["checked_versions"] = checked_versions
 summary["history_path_configs"] = { ... }
 ```
+
+Add persistent schema planning before any v2 findings or repair queues are written:
+
+- Add `history_version` to `cross_checks` or create versioned successor tables before v2 cross-check rows are persisted.
+- Add `history_version` and domain/profile fields to `aqi_rebuild_queue` before v2 AQI rebuild rows are queued.
+- Ensure any future gap/finding/repair tables include `history_version`, `domain`, `profile`, `day_utc`, `connector_id`, and `pollutant_code` where applicable.
+- Keep phase 1 report-only if schema migration is intentionally deferred, but do not enable v2 queueing without persistent version fields.
 
 #### Phase 2 changes
 
@@ -977,6 +1148,28 @@ For phases 2-5:
 - Keep default `v1` until v2 integrity is proven.
 - Keep any repair planning non-executing by default.
 
+## 13. Resolved design answers and remaining open questions
+
+### 13.1 Resolved answers
+
+1. V2 observation pollutant manifests are authoritative per `day_utc`/`connector_id`/`pollutant_code` partition and should include `history_version`, `domain`, `row_count`, `source_row_count` where available, `file_count`, `timeseries_row_counts`, observed-at bounds, and `files[]` entries with parquet object references and file-level stats.
+2. V2 observations should always write `manifest.json` per pollutant partition. Parquet without manifest is orphan/incomplete data and should not be considered healthy.
+3. V2 AQI hourly data and debug partitions should have source partition manifests as well as parquet files. `_index_v2` manifests are additional index products, not substitutes for source manifests.
+4. V2 AQI debug should be warning-only by default and fatal only when `UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true`.
+5. `UK_AQ_R2_HISTORY_READ_VERSION` reflects the API workers' active R2 history storage read version. Integrity should report it as `site_read_version` context but not default to it.
+6. The existing v1-to-v2 observations builder is `scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs`, and it should be the preferred repair suggestion when v1 Dropbox source exists.
+7. The main integrity runner should keep default v1 for compatibility in phase 1. Later scheduled integrity can explicitly run `--history-version both` or separate v1/v2 jobs.
+8. Persistent `history_version` columns are needed before persisted v2 findings/queues/repairs are enabled.
+9. AQI rebuild queue rows should include `history_version` plus enough domain/profile/pollutant context to distinguish v1 AQI from v2 AQI hourly data.
+10. The intended Dropbox backup mirrors R2 under `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup`, including `history/v2/...` and `history/_index_v2/...`, but local Dropbox completeness must be verified and not assumed.
+
+### 13.2 Remaining open questions
+
+1. Which existing backfill/prune commands definitively support targeted v2 writes with `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, and what exact env/flag combination should be suggested when Supabase is the source?
+2. Which process should rebuild `_index_v2` after repair in the safest targeted way, and what exact command should integrity include in repair plans?
+3. Should phase 1 add nullable `history_version` columns immediately, or should persistent schema migration wait until phase 2/4 when v2 findings and queues are actively written?
+4. What is the source of truth for verifying local Dropbox backup inventory completeness for v2: inventory JSON, rclone listing, or path existence plus manifest validation?
+5. Are v2 AQI debug indexes generated today, or should the plan only check debug source partitions until index behavior is confirmed?
 ## 13. Open questions before implementation
 
 1. What exact schema do v2 observation pollutant manifests use? Do they include `timeseries_row_counts`, `source_row_count`, `total_rows`, and parquet object references?
@@ -1013,6 +1206,7 @@ Make the integrity tooling explicitly history-version-aware at the configuration
 
 Required changes:
 1. In scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py:
+   - Load `UK_AQ_BACKFILL_ENV_FILE` if set and use existing shared `UK_AQ_R2_HISTORY_*` vars from that file for path/version config.
    - Add a central history version path resolver for v1 and v2.
    - Support --history-version v1|v2|both.
    - Support env fallback UK_AQ_R2_HISTORY_INTEGRITY_VERSION.
@@ -1025,6 +1219,8 @@ Required changes:
    - Include history version/path details in the Markdown report.
    - Ensure existing v1 cross-check calls still use the same v1 prefixes.
    - For v2/both, it is acceptable in phase 1 to report v2 path config and mark deep v2 checks as not yet implemented, but do not silently report v2 healthy.
+   - Use `UK_AQ_R2_HISTORY_READ_VERSION` only as report context (`site_read_version`), not as the default integrity selector.
+   - Do not introduce separate v2 integrity path env vars except optional overrides; prefer the shared env names already used by the index/backfill tooling.
 
 2. In scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh:
    - Document --history-version in usage.
@@ -1037,6 +1233,7 @@ Required changes:
    - env fallback.
    - invalid history version rejects.
    - report metadata includes checked version(s).
+   - env loading merges `UK_AQ_BACKFILL_ENV_FILE` shared `UK_AQ_R2_HISTORY_*` variables.
 
 Validation:
 - Run:
