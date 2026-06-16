@@ -18,3 +18,11 @@ UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS = "86400"
 binding = "UK_AQ_HISTORY_BUCKET"
 bucket_name = "__CFLARE_R2_BUCKET__"
 preview_bucket_name = "__CFLARE_R2_BUCKET__"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = true
