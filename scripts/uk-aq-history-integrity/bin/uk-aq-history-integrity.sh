@@ -36,6 +36,8 @@ Forwarded options:
                                            Source filter (includes uk_air_sos station/day source checks).
   --from-day YYYY-MM-DD                   Manual lower bound.
   --to-day YYYY-MM-DD                     Manual upper bound.
+  --history-version v1|v2|both            R2 history layout version to check
+                                           (default: v1 unless env override).
   --dry-run                               Plan only; no remote calls.
   --check-only                            Detect changes; do not backfill.
   --run-backfill                          Trigger backfill on confirmed changes.
@@ -51,6 +53,13 @@ Environment:
 
   UK_AQ_HISTORY_INTEGRITY_PYTHON
     Optional python interpreter override (default: python3).
+
+  UK_AQ_R2_HISTORY_INTEGRITY_VERSION
+    Optional default for --history-version: v1, v2, or both.
+
+  UK_AQ_BACKFILL_ENV_FILE
+    If set in the integrity env, the Python runner loads this .env file and
+    uses existing shared UK_AQ_R2_HISTORY_* vars from it for path/version config.
 USAGE
 }
 
