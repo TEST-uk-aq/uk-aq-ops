@@ -290,3 +290,12 @@ node scripts/backup_r2/build_backup_inventory.mjs \
   Rollback:
   - Fast config rollback: set `UK_AQ_TIMESERIES_R2_FIRST=false` to keep v2 wrapper but stop R2 stitching.
   - Fuller rollback: set `UK_AQ_TIMESERIES_PROXY_FIRST=false` or `UK_AQ_TIMESERIES_V2_ENABLED=false` to use the old timeseries path.
+  
+  
+Use --part-max-rows 25000 when build v2 observs
+  
+node scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs \
+--from-day 2026-03-18 --to-day 2026-05-10 \
+--connector-id 7 \
+--part-max-rows 25000 \
+--write-r2 --replace  

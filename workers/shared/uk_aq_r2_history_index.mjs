@@ -2582,6 +2582,279 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
   };
 }
 
+async function updateR2HistoryV2TimeseriesIndexesTargeted({
+  r2,
+  bucketName,
+  domain,
+  dataPrefix,
+  indexPrefix = DEFAULT_R2_HISTORY_V2_INDEX_PREFIX,
+  timeseriesIndexPrefix,
+  generatedAt = new Date().toISOString(),
+  fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
+  computeMissingTimeseriesCounts = false,
+  fromDayUtc,
+  toDayUtc,
+  connectorId = null,
+}) {
+  const normalizedDomain = String(domain || "").trim().toLowerCase();
+  if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
+    throw new Error(`Unsupported R2 history v2 timeseries index domain: ${String(domain || "")}`);
+  }
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing R2 config for targeted R2 history v2 timeseries index update");
+  }
+
+  const normalizedDataPrefix = normalizePrefix(dataPrefix);
+  const normalizedIndexPrefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
+  const normalizedTimeseriesPrefix = normalizePrefix(timeseriesIndexPrefix || (
+    normalizedDomain === "observations"
+      ? DEFAULT_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX
+      : DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
+  ));
+  const normalizedConnectorId = connectorId == null ? null : parsePositiveId(connectorId);
+  if (connectorId != null && !normalizedConnectorId) {
+    throw new Error(`Invalid targeted v2 timeseries connector_id: ${String(connectorId || "")}`);
+  }
+
+  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const warnings = [];
+
+  const latestKey = normalizedDomain === "observations"
+    ? buildR2HistoryV2ObservationsTimeseriesLatestKey(normalizedIndexPrefix)
+    : buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(normalizedIndexPrefix);
+
+  const existingLatest = await fetchJsonObjectFromR2IfExists(r2, latestKey);
+  const existingLatestPayload = existingLatest.exists ? existingLatest.payload : null;
+  const daySummaryMap = new Map();
+  for (const entry of Array.isArray(existingLatestPayload?.day_summaries)
+    ? existingLatestPayload.day_summaries
+    : []) {
+    const normalizedEntry = normalizeHistoryV2TimeseriesLatestDaySummary(entry);
+    if (normalizedEntry) {
+      daySummaryMap.set(normalizedEntry.day_utc, normalizedEntry);
+    }
+  }
+
+  let rewrittenConnectorIndexCount = 0;
+  let rewrittenPollutantIndexCount = 0;
+  let rewrittenPutSkippedCount = 0;
+
+  for (const dayUtc of dayList) {
+    const dayManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/manifest.json`;
+    const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
+    if (!dayManifestResult.exists) {
+      daySummaryMap.delete(dayUtc);
+      warnings.push(`Removed missing ${normalizedDomain} v2 day summary for ${dayUtc}`);
+      continue;
+    }
+    const dayManifestObject = dayManifestResult.payload;
+
+    const connectorTargets = resolveHistoryV2ConnectorManifestTargets(
+      dayManifestObject,
+      dayUtc,
+      normalizedDataPrefix,
+    );
+
+    if (normalizedConnectorId && !connectorTargets.some(t => t.connector_id === normalizedConnectorId)) {
+      warnings.push(
+        `Target connector not found in ${normalizedDomain} v2 manifests day=${dayUtc} connector=${normalizedConnectorId}`,
+      );
+    }
+
+    const connectorResults = (await mapWithConcurrency(
+      connectorTargets,
+      fetchConcurrency,
+      async (connectorTarget) => {
+        let connectorManifestObject;
+        try {
+          connectorManifestObject = await fetchJsonObjectFromR2(r2, connectorTarget.manifest_key);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          warnings.push(
+            `Skipped ${normalizedDomain} v2 connector manifest day=${dayUtc} connector=${connectorTarget.connector_id}: ${message}`,
+          );
+          return null;
+        }
+
+        const pollutantTargets = resolveHistoryV2PollutantManifestTargets(
+          connectorManifestObject,
+          dayUtc,
+          connectorTarget.connector_id,
+          normalizedDataPrefix,
+        );
+        const pollutantResults = (await mapWithConcurrency(
+          pollutantTargets,
+          fetchConcurrency,
+          async (pollutantTarget) => {
+            try {
+              let pollutantManifestObject = await fetchJsonObjectFromR2(
+                r2,
+                pollutantTarget.manifest_key,
+              );
+              if (computeMissingTimeseriesCounts) {
+                pollutantManifestObject = await maybePatchHistoryV2PollutantManifestWithCounts({
+                  r2,
+                  manifestKey: pollutantTarget.manifest_key,
+                  pollutantManifest: pollutantManifestObject,
+                  warningsSink: warnings,
+                  dayUtc,
+                  connectorId: connectorTarget.connector_id,
+                  pollutantCode: pollutantTarget.pollutant_code,
+                });
+              }
+              const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
+                domain: normalizedDomain,
+                grain: normalizedDomain === "aqilevels" ? "hourly" : null,
+                profile: normalizedDomain === "aqilevels" ? "data" : null,
+                dayUtc,
+                connectorId: connectorTarget.connector_id,
+                pollutantCode: pollutantTarget.pollutant_code,
+                generatedAt,
+                bucket: bucketName || r2.bucket,
+                dataPrefix: normalizedDataPrefix,
+                pollutantManifestKey: pollutantTarget.manifest_key,
+                pollutantManifest: pollutantManifestObject,
+              });
+
+              const shouldWrite = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
+              let putSkipped = null;
+
+              if (shouldWrite) {
+                const pollutantIndexKey = normalizedDomain === "observations"
+                  ? buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
+                    normalizedTimeseriesPrefix,
+                    dayUtc,
+                    connectorTarget.connector_id,
+                    pollutantTarget.pollutant_code,
+                  )
+                  : buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
+                    normalizedTimeseriesPrefix,
+                    dayUtc,
+                    connectorTarget.connector_id,
+                    pollutantTarget.pollutant_code,
+                  );
+                const body = `${JSON.stringify(payload, null, 2)}\n`;
+                const putResult = await r2PutObjectIfChanged({
+                  r2,
+                  key: pollutantIndexKey,
+                  body,
+                  content_type: "application/json; charset=utf-8",
+                });
+                putSkipped = Boolean(putResult.skipped);
+              }
+
+              return {
+                connector_id: connectorTarget.connector_id,
+                pollutant_code: pollutantTarget.pollutant_code,
+                file_count: payload.file_count,
+                indexed_file_count: payload.indexed_file_count,
+                backed_up_at_utc: payload.backed_up_at_utc,
+                wrote_index: shouldWrite,
+                put_skipped: putSkipped,
+              };
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              warnings.push(
+                `Skipped ${normalizedDomain} v2 pollutant timeseries index day=${dayUtc} connector=${connectorTarget.connector_id} pollutant=${pollutantTarget.pollutant_code}: ${message}`,
+              );
+              return null;
+            }
+          },
+        )).filter(Boolean);
+
+        return {
+          connector_id: connectorTarget.connector_id,
+          pollutant_indexes: pollutantResults.sort((a, b) =>
+            a.pollutant_code.localeCompare(b.pollutant_code)
+          ),
+          backed_up_at_utc:
+            toIsoOrNull(connectorManifestObject?.backed_up_at_utc)
+            || pickMaxIsoTimestamp(pollutantResults.map((entry) => entry.backed_up_at_utc)),
+          wrote_index: pollutantResults.some(p => p.wrote_index),
+          put_skipped_count: pollutantResults.filter(p => p.put_skipped).length,
+        };
+      },
+    ))
+      .filter(Boolean)
+      .sort((a, b) => a.connector_id - b.connector_id);
+
+    rewrittenConnectorIndexCount += connectorResults.filter((entry) => entry.wrote_index).length;
+    rewrittenPollutantIndexCount += connectorResults.reduce((sum, entry) => sum + entry.pollutant_indexes.filter(p => p.wrote_index).length, 0);
+    rewrittenPutSkippedCount += connectorResults.reduce((sum, entry) => sum + entry.put_skipped_count, 0);
+
+    const pollutantIndexes = connectorResults.flatMap((entry) => entry.pollutant_indexes);
+    const pollutantCodes = Array.from(new Set(
+      pollutantIndexes.map((entry) => entry.pollutant_code).filter(Boolean),
+    )).sort((a, b) => a.localeCompare(b));
+
+    const daySummary = {
+      day_utc: dayUtc,
+      connector_count: connectorResults.length,
+      connector_ids: connectorResults.map((entry) => entry.connector_id),
+      pollutant_codes: pollutantCodes,
+      pollutant_index_count: pollutantIndexes.length,
+      file_count: pollutantIndexes.reduce((sum, entry) => sum + entry.file_count, 0),
+      indexed_file_count: pollutantIndexes.reduce(
+        (sum, entry) => sum + entry.indexed_file_count,
+        0,
+      ),
+      backed_up_at_utc:
+        toIsoOrNull(dayManifestObject?.backed_up_at_utc)
+        || pickMaxIsoTimestamp(connectorResults.map((entry) => entry.backed_up_at_utc)),
+    };
+    daySummaryMap.set(dayUtc, normalizeHistoryV2TimeseriesLatestDaySummary(daySummary));
+  }
+
+  const latestPayload = buildHistoryV2TimeseriesLatestPayload({
+    domain: normalizedDomain,
+    grain: normalizedDomain === "aqilevels" ? "hourly" : null,
+    profile: normalizedDomain === "aqilevels" ? "data" : null,
+    bucket: bucketName || r2.bucket,
+    generatedAt,
+    existingGeneratedAt: existingLatestPayload?.generated_at,
+    indexPrefix: normalizedIndexPrefix,
+    dataPrefix: normalizedDataPrefix,
+    timeseriesIndexPrefix: normalizedTimeseriesPrefix,
+    daySummaries: Array.from(daySummaryMap.values()),
+  });
+
+  const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
+  const latestPut = await r2PutObjectIfChanged({
+    r2,
+    key: latestKey,
+    body: latestBody,
+    content_type: "application/json; charset=utf-8",
+  });
+
+  return {
+    history_version: "v2",
+    domain: normalizedDomain,
+    grain: normalizedDomain === "aqilevels" ? "hourly" : null,
+    profile: normalizedDomain === "aqilevels" ? "data" : null,
+    index_kind: "timeseries_file_ranges",
+    mode: "targeted",
+    from_day_utc: dayList.length ? dayList[0] : null,
+    to_day_utc: dayList.length ? dayList[dayList.length - 1] : null,
+    targeted_day_count: dayList.length,
+    targeted_connector_id: normalizedConnectorId,
+    rewritten_connector_index_count: rewrittenConnectorIndexCount,
+    rewritten_pollutant_index_count: rewrittenPollutantIndexCount,
+    rewritten_put_skipped_count: rewrittenPutSkippedCount,
+    latest_index_key: latestKey,
+    latest_index_bytes: latestPut.bytes,
+    latest_index_put_skipped: Boolean(latestPut.skipped),
+    data_prefix: normalizedDataPrefix,
+    timeseries_index_prefix: normalizedTimeseriesPrefix,
+    indexed_day_count: latestPayload.day_count,
+    connector_index_count: latestPayload.connector_index_count,
+    pollutant_index_count: latestPayload.pollutant_index_count,
+    file_count: latestPayload.file_count,
+    indexed_file_count: latestPayload.indexed_file_count,
+    warning_count: warnings.length,
+    warnings,
+  };
+}
+
 async function updateR2HistoryIndexForDomainTargeted({
   r2,
   bucketName,
@@ -3009,6 +3282,7 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
 
 export async function updateR2HistoryIndexesTargeted({
   env = defaultEnv(),
+  historyVersion = "v1",
   domains = ["observations"],
   fromDayUtc,
   toDayUtc,
@@ -3035,27 +3309,21 @@ export async function updateR2HistoryIndexesTargeted({
   let observationsTimeseries = null;
   let aqilevelsTimeseries = null;
   for (const domain of normalizedDomains) {
-    const domainPrefix = domain === "observations"
-      ? config.observations_prefix
-      : config.aqilevels_prefix;
-    results.push(await updateR2HistoryIndexForDomainTargeted({
-      r2: config.r2,
-      bucketName: config.r2.bucket,
-      domain,
-      domainPrefix,
-      indexPrefix: config.index_prefix,
-      generatedAt,
-      fromDayUtc,
-      toDayUtc,
-    }));
-
-    if (domain === "observations") {
-      observationsTimeseries = await updateR2HistoryObservationsTimeseriesIndexesTargeted({
+    if (historyVersion === "v2") {
+      const dataPrefix = domain === "observations"
+        ? config.observations_prefix_v2
+        : config.aqilevels_hourly_data_prefix_v2;
+      const timeseriesIndexPrefix = domain === "observations"
+        ? config.observations_timeseries_index_prefix_v2
+        : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
+        
+      const result = await updateR2HistoryV2TimeseriesIndexesTargeted({
         r2: config.r2,
         bucketName: config.r2.bucket,
-        observationsPrefix: config.observations_prefix,
-        indexPrefix: config.index_prefix,
-        observationsTimeseriesIndexPrefix: config.observations_timeseries_index_prefix,
+        domain,
+        dataPrefix,
+        indexPrefix: config.index_prefix_v2,
+        timeseriesIndexPrefix,
         generatedAt,
         fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
         computeMissingTimeseriesCounts,
@@ -3063,20 +3331,56 @@ export async function updateR2HistoryIndexesTargeted({
         toDayUtc,
         connectorId,
       });
-    }
-    if (domain === "aqilevels") {
-      aqilevelsTimeseries = await updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
+      results.push(result);
+      if (domain === "observations") {
+        observationsTimeseries = result;
+      } else if (domain === "aqilevels") {
+        aqilevelsTimeseries = result;
+      }
+    } else {
+      const domainPrefix = domain === "observations"
+        ? config.observations_prefix
+        : config.aqilevels_prefix;
+      results.push(await updateR2HistoryIndexForDomainTargeted({
         r2: config.r2,
         bucketName: config.r2.bucket,
-        aqilevelsPrefix: config.aqilevels_prefix,
+        domain,
+        domainPrefix,
         indexPrefix: config.index_prefix,
-        aqilevelsTimeseriesIndexPrefix: config.aqilevels_timeseries_index_prefix,
         generatedAt,
-        fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
         fromDayUtc,
         toDayUtc,
-        connectorId,
-      });
+      }));
+
+      if (domain === "observations") {
+        observationsTimeseries = await updateR2HistoryObservationsTimeseriesIndexesTargeted({
+          r2: config.r2,
+          bucketName: config.r2.bucket,
+          observationsPrefix: config.observations_prefix,
+          indexPrefix: config.index_prefix,
+          observationsTimeseriesIndexPrefix: config.observations_timeseries_index_prefix,
+          generatedAt,
+          fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
+          computeMissingTimeseriesCounts,
+          fromDayUtc,
+          toDayUtc,
+          connectorId,
+        });
+      }
+      if (domain === "aqilevels") {
+        aqilevelsTimeseries = await updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
+          r2: config.r2,
+          bucketName: config.r2.bucket,
+          aqilevelsPrefix: config.aqilevels_prefix,
+          indexPrefix: config.index_prefix,
+          aqilevelsTimeseriesIndexPrefix: config.aqilevels_timeseries_index_prefix,
+          generatedAt,
+          fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
+          fromDayUtc,
+          toDayUtc,
+          connectorId,
+        });
+      }
     }
   }
 

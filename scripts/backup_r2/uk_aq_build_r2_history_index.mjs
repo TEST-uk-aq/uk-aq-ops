@@ -197,8 +197,8 @@ function parseArgs(argv) {
   }
 
   if (args.targeted) {
-    if (args.historyVersion !== "v1") {
-      throw new Error("--targeted is only supported for v1 indexes; run v2 as a non-targeted rebuild");
+    if (args.historyVersion !== "v1" && args.historyVersion !== "v2") {
+      throw new Error("--targeted is only supported for v1 and v2 indexes");
     }
     if (!args.fromDayUtc || !args.toDayUtc) {
       throw new Error("--targeted requires --from-day and --to-day");
@@ -345,6 +345,7 @@ async function main() {
   const summary = args.targeted
     ? await updateR2HistoryIndexesTargeted({
         env: process.env,
+        historyVersion: args.historyVersion,
         domains: args.domains,
         fromDayUtc: args.fromDayUtc,
         toDayUtc: args.toDayUtc,
