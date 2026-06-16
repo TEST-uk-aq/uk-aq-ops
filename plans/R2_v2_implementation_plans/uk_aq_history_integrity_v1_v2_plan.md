@@ -169,6 +169,8 @@ The AQI gap checker has no CLI/env history version selection and hard-codes `his
 
 ## 5. Required v1/v2 path mapping
 
+The integrity tooling must load the env file from UK_AQ_BACKFILL_ENV_FILE if set, then use the existing shared UK_AQ_R2_HISTORY_* vars from that .env.
+
 Add a central path config model. Proposed shape:
 
 ```python
