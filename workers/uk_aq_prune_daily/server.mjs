@@ -2293,6 +2293,7 @@ async function runPrune(config) {
     try {
       const indexSummary = await rebuildR2HistoryIndexes({
         env: process.env,
+        historyVersion: config.phaseB.history_write_version,
       });
       phaseBHistoryIndexSummary = {
         enabled: true,
@@ -2302,6 +2303,7 @@ async function runPrune(config) {
       logStructured("INFO", "phase_b_history_index_rebuild_complete", {
         run_id: phaseBRunId,
         bucket: indexSummary.bucket,
+        history_version: indexSummary.history_version,
         index_prefix: indexSummary.index_prefix,
         results: indexSummary.results,
       });
