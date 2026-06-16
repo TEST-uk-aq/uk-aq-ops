@@ -33,3 +33,8 @@ The observations worker may return response_complete=false because one page hit 
 The cache proxy then correctly pages again and gets the rest of the data.
 But it still keeps the earlier page-level “partial” metadata.
 So the final combined response can be marked r2_coverage_partial even though the paged read actually succeeded.
+
+
+## Prune Daily v2 still using a v1 path
+
+history/v1/_ops/observations/runs/run_id=.../run_manifest.json
