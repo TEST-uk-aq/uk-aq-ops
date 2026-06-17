@@ -25,7 +25,6 @@ import {
   resolvePhaseBRuntimeConfig,
   rowsToAqilevelParquetBufferForTest,
   rowsToObservationV2ParquetBufferForTest,
-  writeCommittedV2PartAndCheckpointForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 test("connector manifest includes expected Phase B fields", () => {
@@ -557,86 +556,4 @@ test("R2 history v2 parquet writers emit compact observation and AQI schemas", (
   assert.equal(debugFields.includes("hourly_mean_ugm3"), false);
   assert.equal(debugFields.includes("pm25_rolling24h_mean_ugm3"), false);
   assert.equal(debugFields.includes("updated_at"), false);
-});
-
-test("v2 part writer advances past first pollutant and checkpoints off cursor client", async () => {
-  const events = [];
-  const previousFetch = globalThis.fetch;
-  const putKeys = [];
-  globalThis.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET").toUpperCase();
-    const key = decodeURIComponent(new URL(url).pathname.split("/").slice(2).join("/"));
-    if (method === "PUT") {
-      putKeys.push(key);
-      return new Response("", { status: 200, headers: { etag: `etag-${putKeys.length}` } });
-    }
-    if (method === "HEAD") {
-      assert.ok(putKeys.includes(key), `unexpected HEAD before PUT for ${key}`);
-      return new Response("", { status: 200, headers: { "content-length": "123", etag: `head-${key}` } });
-    }
-    throw new Error(`unexpected ${method} ${url}`);
-  };
-
-  const streamClient = {
-    async query() {
-      throw new Error("resume checkpoint must not run on the active cursor client");
-    },
-  };
-  const checkpointQueries = [];
-  const checkpointClient = {
-    async query(sql, params) {
-      checkpointQueries.push({ sql, params });
-      return { rows: [] };
-    },
-  };
-  const runtime = {
-    run_id: "run-post-pollutant-test",
-    history_write_version: "v2",
-    r2: {
-      endpoint: "https://example.invalid",
-      region: "auto",
-      access_key_id: "test-access-key",
-      secret_access_key: "test-secret-key",
-      bucket: "test-bucket",
-    },
-    committed_prefix: "history/v2/observations",
-    observations_row_group_size: 1000,
-    run_budget: createPhaseBRunBudgetForTest({ maxSeconds: 60, stopBeforeTimeoutSeconds: 1 }),
-    checkpoint_client_for_test: checkpointClient,
-    logStructured(severity, event, fields) {
-      events.push({ severity, event, fields });
-    },
-  };
-
-  try {
-    const result = await writeCommittedV2PartAndCheckpointForTest({
-      streamClient,
-      runtime,
-      dayUtc: "2026-06-12",
-      connectorId: 1,
-      partIndex: 0,
-      rows: [
-        { connector_id: 1, station_id: 10, timeseries_id: 100, pollutant_code: "pm10", observed_at_utc: "2026-06-12T00:00:00.000Z", value: 12.3 },
-        { connector_id: 1, station_id: 11, timeseries_id: 101, pollutant_code: "pm25", observed_at_utc: "2026-06-12T00:00:00.000Z", value: 7.8 },
-      ],
-      committedParts: [],
-      observedRows: 0n,
-      totalBytes: 0n,
-    });
-
-    const eventNames = events.map((entry) => entry.event);
-    const pm10CompleteIndex = eventNames.findIndex((event, index) => event === "phase_b_history_pollutant_complete" && events[index].fields.pollutant_code === "pm10");
-    const pm25StartIndex = eventNames.findIndex((event, index) => event === "phase_b_history_pollutant_start" && events[index].fields.pollutant_code === "pm25");
-    assert.notEqual(pm10CompleteIndex, -1);
-    assert.notEqual(pm25StartIndex, -1);
-    assert.ok(pm25StartIndex > pm10CompleteIndex, "pm25 starts after pm10 completes");
-    assert.ok(eventNames.includes("phase_b_history_pollutant_loop_after_complete"));
-    assert.equal(result.committedParts.length, 2);
-    assert.equal(result.partIndex, 1);
-    assert.equal(result.observedRows, 2n);
-    assert.equal(checkpointQueries.length, 1);
-    assert.deepEqual(result.committedParts.map((part) => part.pollutant_code), ["pm10", "pm25"]);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
 });

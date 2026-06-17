@@ -2165,18 +2165,10 @@ async function writeCommittedV2PartAndCheckpoint({
   totalBytes,
 }) {
   const groupedRows = groupObservationV2RowsByPollutant(rows);
-  logPhaseB(runtime, "INFO", "phase_b_history_connector_pollutant_plan", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_codes: groupedRows.map(([pollutantCode]) => pollutantCode),
-    pollutant_count: groupedRows.length,
-    row_count: rows.length,
-  });
   const nextParts = [...committedParts];
   let bytesAdded = 0n;
 
-  for (let pollutantIndex = 0; pollutantIndex < groupedRows.length; pollutantIndex += 1) {
-    const [pollutantCode, pollutantRows] = groupedRows[pollutantIndex];
+  for (const [pollutantCode, pollutantRows] of groupedRows) {
     assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 15_000);
     const pollutantStartedAtMs = Date.now();
     logPhaseB(runtime, "INFO", "phase_b_history_pollutant_start", {
@@ -2265,21 +2257,6 @@ async function writeCommittedV2PartAndCheckpoint({
       part_count: 1,
       duration_ms: Math.max(0, Date.now() - pollutantStartedAtMs),
     });
-    logPhaseB(runtime, "INFO", "phase_b_history_pollutant_loop_after_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      pollutant_index: pollutantIndex,
-      pollutant_count: groupedRows.length,
-      next_pollutant_code: groupedRows[pollutantIndex + 1]?.[0] || null,
-      written_pollutant_count: pollutantIndex + 1,
-    });
-    assertBudget(runtime, "after_pollutant_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      next_pollutant_code: groupedRows[pollutantIndex + 1]?.[0] || null,
-    }, 15_000);
   }
 
   const nextObservedRows = observedRows + BigInt(rows.length);
@@ -2288,7 +2265,7 @@ async function writeCommittedV2PartAndCheckpoint({
   const lastRow = rows[rows.length - 1];
   const lastObservedAt = observedAtForHistoryRow(lastRow);
 
-  const checkpointPayload = {
+  await updateCandidateResumeCheckpoint(streamClient, {
     dayUtc,
     connectorId,
     runId: runtime.run_id,
@@ -2297,45 +2274,6 @@ async function writeCommittedV2PartAndCheckpoint({
     partIndex: nextPartIndex,
     exportedRowCount: nextObservedRows,
     parts: nextParts,
-  };
-
-  logPhaseB(runtime, "INFO", "phase_b_history_checkpoint_write_start", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    part_index: nextPartIndex,
-    rows_written: nextObservedRows.toString(),
-    part_count: nextParts.length,
-  });
-  const checkpointStartedAtMs = Date.now();
-  try {
-    if (runtime.checkpoint_client_for_test) {
-      await updateCandidateResumeCheckpoint(runtime.checkpoint_client_for_test, checkpointPayload);
-    } else if (runtime.supabase_db_url) {
-      await withPgClient(runtime.supabase_db_url, async (checkpointClient) => {
-        await updateCandidateResumeCheckpoint(checkpointClient, checkpointPayload);
-      });
-    } else {
-      await updateCandidateResumeCheckpoint(streamClient, checkpointPayload);
-    }
-  } catch (error) {
-    logPhaseB(runtime, "ERROR", "phase_b_history_checkpoint_write_failed", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      part_index: nextPartIndex,
-      rows_written: nextObservedRows.toString(),
-      part_count: nextParts.length,
-      duration_ms: Math.max(0, Date.now() - checkpointStartedAtMs),
-      ...errorLogFields(error),
-    });
-    throw error;
-  }
-  logPhaseB(runtime, "INFO", "phase_b_history_checkpoint_write_complete", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    part_index: nextPartIndex,
-    rows_written: nextObservedRows.toString(),
-    part_count: nextParts.length,
-    duration_ms: Math.max(0, Date.now() - checkpointStartedAtMs),
   });
 
   return {
@@ -2346,10 +2284,6 @@ async function writeCommittedV2PartAndCheckpoint({
   };
 }
 
-export async function writeCommittedV2PartAndCheckpointForTest(args) {
-  return await writeCommittedV2PartAndCheckpoint(args);
-}
-
 async function writeObservationV2ConnectorManifest({
   runtime,
   dayUtc,
@@ -2357,13 +2291,6 @@ async function writeObservationV2ConnectorManifest({
   committedParts,
   backedUpAtUtc,
 }) {
-  assertBudget(runtime, "connector_manifest_prepare", { day_utc: dayUtc, connector_id: connectorId }, 15_000);
-  const prepareStartedAtMs = Date.now();
-  logPhaseB(runtime, "INFO", "phase_b_history_connector_manifest_prepare_start", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    part_count: committedParts.length,
-  });
   const partsByPollutant = new Map();
   for (const part of committedParts) {
     const pollutantCode = normalizePollutantCodeForPath(part.pollutant_code);
@@ -2374,14 +2301,6 @@ async function writeObservationV2ConnectorManifest({
   }
 
   const pollutantManifests = [];
-  logPhaseB(runtime, "INFO", "phase_b_history_connector_manifest_prepare_complete", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_codes: Array.from(partsByPollutant.keys()).sort(),
-    pollutant_count: partsByPollutant.size,
-    part_count: committedParts.length,
-    duration_ms: Math.max(0, Date.now() - prepareStartedAtMs),
-  });
   for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
     assertBudget(runtime, "manifest_write", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 10_000);
     const pollutantManifestKey = buildHistoryV2PollutantManifestKey(
