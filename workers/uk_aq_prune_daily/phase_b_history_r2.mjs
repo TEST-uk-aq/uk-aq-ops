@@ -2165,18 +2165,27 @@ async function writeCommittedV2PartAndCheckpoint({
   totalBytes,
 }) {
   const groupedRows = groupObservationV2RowsByPollutant(rows);
+  const sourcePollutantCodes = groupedRows.map(([pollutantCode]) => pollutantCode);
+  const writeGroups = groupedRows.filter(([pollutantCode]) => runtime.observations_pollutant_codes.includes(pollutantCode));
+  const writePollutantCodes = writeGroups.map(([pollutantCode]) => pollutantCode);
+  const excludedPollutantCodes = sourcePollutantCodes.filter((c) => !writePollutantCodes.includes(c));
+
   logPhaseB(runtime, "INFO", "phase_b_history_connector_pollutant_plan", {
     day_utc: dayUtc,
     connector_id: connectorId,
-    pollutant_codes: groupedRows.map(([pollutantCode]) => pollutantCode),
-    pollutant_count: groupedRows.length,
+    source_pollutant_codes: sourcePollutantCodes,
+    write_pollutant_codes: writePollutantCodes,
+    excluded_pollutant_codes: excludedPollutantCodes,
+    pollutant_filter_mode: "allow_list",
+    pollutant_count: sourcePollutantCodes.length,
+    write_pollutant_count: writePollutantCodes.length,
     row_count: rows.length,
   });
   const nextParts = [...committedParts];
   let bytesAdded = 0n;
 
-  for (let pollutantIndex = 0; pollutantIndex < groupedRows.length; pollutantIndex += 1) {
-    const [pollutantCode, pollutantRows] = groupedRows[pollutantIndex];
+  for (let pollutantIndex = 0; pollutantIndex < writeGroups.length; pollutantIndex += 1) {
+    const [pollutantCode, pollutantRows] = writeGroups[pollutantIndex];
     assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 15_000);
     const pollutantStartedAtMs = Date.now();
     logPhaseB(runtime, "INFO", "phase_b_history_pollutant_start", {
@@ -4028,6 +4037,9 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     2_000_000,
   );
 
+  const rawPollutantCodes = String(env.UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES || "pm25,pm10,no2").trim();
+  const allowedPollutantCodes = rawPollutantCodes.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
+
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
     supabase_db_url: String(env.SUPABASE_DB_URL || env.DATABASE_URL || "").trim(),
@@ -4058,6 +4070,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       10_000,
       2_000_000,
     ),
+    observations_pollutant_codes: allowedPollutantCodes,
     aqilevels_part_max_rows: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_AQILEVELS_PART_MAX_ROWS || env.UK_AQ_R2_HISTORY_PART_MAX_ROWS,
       DEFAULT_AQILEVELS_PART_MAX_ROWS,

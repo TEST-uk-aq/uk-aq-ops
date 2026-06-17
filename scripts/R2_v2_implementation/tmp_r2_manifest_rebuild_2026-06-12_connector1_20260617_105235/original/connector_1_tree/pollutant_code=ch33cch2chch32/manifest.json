@@ -1,0 +1,70 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "ch33cch2chch32",
+  "pollutant_codes": [
+    "ch33cch2chch32"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=ch33cch2chch32/manifest.json",
+  "source_row_count": 70,
+  "row_count": 70,
+  "min_timeseries_id": 18586198,
+  "max_timeseries_id": 18586200,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=ch33cch2chch32/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2547,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=ch33cch2chch32/part-00003.parquet",
+      "row_count": 70,
+      "bytes": 2547,
+      "etag_or_hash": "\"1015ff2713cab502d8cb4e50a83ec7d2\"",
+      "pollutant_code": "ch33cch2chch32",
+      "min_timeseries_id": 18586198,
+      "max_timeseries_id": 18586200,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586198": 22,
+        "18586199": 24,
+        "18586200": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586198": 22,
+    "18586199": 24,
+    "18586200": 24
+  },
+  "bytes_per_row_estimate": 36.385714285714286,
+  "avg_file_bytes": 2547,
+  "min_file_bytes": 2547,
+  "max_file_bytes": 2547,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "53719c846a2d3ade357559e10df186cb4431d711b8aad9996a32dc484f63debb"
+}

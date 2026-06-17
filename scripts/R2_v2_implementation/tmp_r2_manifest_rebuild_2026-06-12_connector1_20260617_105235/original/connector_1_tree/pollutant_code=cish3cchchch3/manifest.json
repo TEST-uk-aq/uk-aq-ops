@@ -1,0 +1,66 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "cish3cchchch3",
+  "pollutant_codes": [
+    "cish3cchchch3"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=cish3cchchch3/manifest.json",
+  "source_row_count": 24,
+  "row_count": 24,
+  "min_timeseries_id": 18586540,
+  "max_timeseries_id": 18586540,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=cish3cchchch3/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2237,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=cish3cchchch3/part-00003.parquet",
+      "row_count": 24,
+      "bytes": 2237,
+      "etag_or_hash": "\"4dc814fa8b024fb287809ed45c2d6ceb\"",
+      "pollutant_code": "cish3cchchch3",
+      "min_timeseries_id": 18586540,
+      "max_timeseries_id": 18586540,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586540": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586540": 24
+  },
+  "bytes_per_row_estimate": 93.20833333333333,
+  "avg_file_bytes": 2237,
+  "min_file_bytes": 2237,
+  "max_file_bytes": 2237,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "c952da5e282558fe787dbf94c17e8820647c42bb4b8a7955404ec1228b557bd4"
+}

@@ -1,0 +1,70 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "h3cch2chch32",
+  "pollutant_codes": [
+    "h3cch2chch32"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h3cch2chch32/manifest.json",
+  "source_row_count": 70,
+  "row_count": 70,
+  "min_timeseries_id": 18586201,
+  "max_timeseries_id": 18586203,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h3cch2chch32/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2696,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h3cch2chch32/part-00003.parquet",
+      "row_count": 70,
+      "bytes": 2696,
+      "etag_or_hash": "\"e6c86857105867b9b9f0ecacee626af1\"",
+      "pollutant_code": "h3cch2chch32",
+      "min_timeseries_id": 18586201,
+      "max_timeseries_id": 18586203,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586201": 22,
+        "18586202": 24,
+        "18586203": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586201": 22,
+    "18586202": 24,
+    "18586203": 24
+  },
+  "bytes_per_row_estimate": 38.51428571428571,
+  "avg_file_bytes": 2696,
+  "min_file_bytes": 2696,
+  "max_file_bytes": 2696,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "32f2f1cccc79461e39805f95ac722983963c8a565028da6e1ab890898c9f9f54"
+}

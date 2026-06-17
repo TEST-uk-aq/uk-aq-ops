@@ -601,6 +601,7 @@ test("v2 part writer advances past first pollutant and checkpoints off cursor cl
     },
     committed_prefix: "history/v2/observations",
     observations_row_group_size: 1000,
+    observations_pollutant_codes: ["pm25", "pm10", "no2"],
     run_budget: createPhaseBRunBudgetForTest({ maxSeconds: 60, stopBeforeTimeoutSeconds: 1 }),
     checkpoint_client_for_test: checkpointClient,
     logStructured(severity, event, fields) {
@@ -636,6 +637,77 @@ test("v2 part writer advances past first pollutant and checkpoints off cursor cl
     assert.equal(result.observedRows, 2n);
     assert.equal(checkpointQueries.length, 1);
     assert.deepEqual(result.committedParts.map((part) => part.pollutant_code), ["pm10", "pm25"]);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("v2 part writer filters pollutants according to observations_pollutant_codes allowlist", async () => {
+  const events = [];
+  const previousFetch = globalThis.fetch;
+  const putKeys = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const method = String(options.method || "GET").toUpperCase();
+    const key = decodeURIComponent(new URL(url).pathname.split("/").slice(2).join("/"));
+    if (method === "PUT") {
+      putKeys.push(key);
+      return new Response("", { status: 200, headers: { etag: `etag-${putKeys.length}` } });
+    }
+    if (method === "HEAD") {
+      return new Response("", { status: 200, headers: { "content-length": "123", etag: `head-${key}` } });
+    }
+    throw new Error(`unexpected ${method} ${url}`);
+  };
+
+  const streamClient = { async query() { throw new Error("not used"); } };
+  const checkpointClient = { async query() { return { rows: [] }; } };
+
+  const runtime = {
+    run_id: "run-filter-test",
+    history_write_version: "v2",
+    r2: {
+      endpoint: "https://example.invalid",
+      region: "auto",
+      access_key_id: "test",
+      secret_access_key: "test",
+      bucket: "test",
+    },
+    committed_prefix: "history/v2/observations",
+    observations_row_group_size: 1000,
+    observations_pollutant_codes: ["pm25", "no2"], // pm10 is omitted!
+    run_budget: createPhaseBRunBudgetForTest({ maxSeconds: 60, stopBeforeTimeoutSeconds: 1 }),
+    checkpoint_client_for_test: checkpointClient,
+    logStructured(severity, event, fields) {
+      events.push({ severity, event, fields });
+    },
+  };
+
+  try {
+    const result = await writeCommittedV2PartAndCheckpointForTest({
+      streamClient,
+      runtime,
+      dayUtc: "2026-06-12",
+      connectorId: 1,
+      partIndex: 0,
+      rows: [
+        { connector_id: 1, station_id: 10, timeseries_id: 100, pollutant_code: "pm10", observed_at_utc: "2026-06-12T00:00:00.000Z", value: 12.3 },
+        { connector_id: 1, station_id: 11, timeseries_id: 101, pollutant_code: "pm25", observed_at_utc: "2026-06-12T00:00:00.000Z", value: 7.8 },
+        { connector_id: 1, station_id: 12, timeseries_id: 102, pollutant_code: "o3", observed_at_utc: "2026-06-12T00:00:00.000Z", value: 4.5 },
+      ],
+      committedParts: [],
+      observedRows: 0n,
+      totalBytes: 0n,
+    });
+
+    const planEvent = events.find((e) => e.event === "phase_b_history_connector_pollutant_plan");
+    assert.ok(planEvent);
+    assert.deepEqual(planEvent.fields.source_pollutant_codes, ["o3", "pm10", "pm25"]);
+    assert.deepEqual(planEvent.fields.write_pollutant_codes, ["pm25"]);
+    assert.deepEqual(planEvent.fields.excluded_pollutant_codes, ["o3", "pm10"]);
+
+    assert.equal(result.committedParts.length, 1, "Only pm25 should be written");
+    assert.deepEqual(result.committedParts.map((part) => part.pollutant_code), ["pm25"]);
+    assert.equal(result.observedRows, 3n, "All rows must be counted towards checkpointed source rows");
   } finally {
     globalThis.fetch = previousFetch;
   }

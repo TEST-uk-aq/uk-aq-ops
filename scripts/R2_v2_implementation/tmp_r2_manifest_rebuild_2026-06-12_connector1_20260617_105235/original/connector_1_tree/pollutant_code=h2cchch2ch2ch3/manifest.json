@@ -1,0 +1,66 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "h2cchch2ch2ch3",
+  "pollutant_codes": [
+    "h2cchch2ch2ch3"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h2cchch2ch2ch3/manifest.json",
+  "source_row_count": 24,
+  "row_count": 24,
+  "min_timeseries_id": 18586541,
+  "max_timeseries_id": 18586541,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h2cchch2ch2ch3/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2317,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h2cchch2ch2ch3/part-00003.parquet",
+      "row_count": 24,
+      "bytes": 2317,
+      "etag_or_hash": "\"34d843db46dd4db2563a2b4c53e7205e\"",
+      "pollutant_code": "h2cchch2ch2ch3",
+      "min_timeseries_id": 18586541,
+      "max_timeseries_id": 18586541,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586541": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586541": 24
+  },
+  "bytes_per_row_estimate": 96.54166666666667,
+  "avg_file_bytes": 2317,
+  "min_file_bytes": 2317,
+  "max_file_bytes": 2317,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "1c9985d54b8090c9837a4bc82aa75fc6b9268901bf470a7ff8a2538797f7c243"
+}

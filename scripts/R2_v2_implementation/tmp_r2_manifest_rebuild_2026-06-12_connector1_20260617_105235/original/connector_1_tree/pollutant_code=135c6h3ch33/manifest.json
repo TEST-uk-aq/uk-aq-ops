@@ -1,0 +1,66 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "135c6h3ch33",
+  "pollutant_codes": [
+    "135c6h3ch33"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=135c6h3ch33/manifest.json",
+  "source_row_count": 24,
+  "row_count": 24,
+  "min_timeseries_id": 18586544,
+  "max_timeseries_id": 18586544,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=135c6h3ch33/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2377,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=135c6h3ch33/part-00003.parquet",
+      "row_count": 24,
+      "bytes": 2377,
+      "etag_or_hash": "\"fff9e04e962e86ddc7330b4890a5d371\"",
+      "pollutant_code": "135c6h3ch33",
+      "min_timeseries_id": 18586544,
+      "max_timeseries_id": 18586544,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586544": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586544": 24
+  },
+  "bytes_per_row_estimate": 99.04166666666667,
+  "avg_file_bytes": 2377,
+  "min_file_bytes": 2377,
+  "max_file_bytes": 2377,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "3eaef7ffb0bba02032fd64321efafee5d2fccb29fe3d0e4e4b773e77d96fdc89"
+}

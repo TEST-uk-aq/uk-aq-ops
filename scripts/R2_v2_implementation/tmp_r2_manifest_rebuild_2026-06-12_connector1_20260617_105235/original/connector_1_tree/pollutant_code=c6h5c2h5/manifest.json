@@ -1,0 +1,70 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "c6h5c2h5",
+  "pollutant_codes": [
+    "c6h5c2h5"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=c6h5c2h5/manifest.json",
+  "source_row_count": 70,
+  "row_count": 70,
+  "min_timeseries_id": 18586183,
+  "max_timeseries_id": 18586185,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=c6h5c2h5/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2557,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=c6h5c2h5/part-00003.parquet",
+      "row_count": 70,
+      "bytes": 2557,
+      "etag_or_hash": "\"b41a09c2b4b2d45394f0e0393595fa05\"",
+      "pollutant_code": "c6h5c2h5",
+      "min_timeseries_id": 18586183,
+      "max_timeseries_id": 18586185,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586183": 22,
+        "18586184": 24,
+        "18586185": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586183": 22,
+    "18586184": 24,
+    "18586185": 24
+  },
+  "bytes_per_row_estimate": 36.52857142857143,
+  "avg_file_bytes": 2557,
+  "min_file_bytes": 2557,
+  "max_file_bytes": 2557,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "52974cda9f1a8991267cd4fb9aa94cce786b93fd27ee65eeb386646b80953978"
+}

@@ -1,0 +1,70 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "h2cch2",
+  "pollutant_codes": [
+    "h2cch2"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h2cch2/manifest.json",
+  "source_row_count": 70,
+  "row_count": 70,
+  "min_timeseries_id": 18586180,
+  "max_timeseries_id": 18586182,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h2cch2/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2682,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=h2cch2/part-00003.parquet",
+      "row_count": 70,
+      "bytes": 2682,
+      "etag_or_hash": "\"fb67a288cc45a7f764e0de3e420498d5\"",
+      "pollutant_code": "h2cch2",
+      "min_timeseries_id": 18586180,
+      "max_timeseries_id": 18586182,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586180": 22,
+        "18586181": 24,
+        "18586182": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586180": 22,
+    "18586181": 24,
+    "18586182": 24
+  },
+  "bytes_per_row_estimate": 38.31428571428572,
+  "avg_file_bytes": 2682,
+  "min_file_bytes": 2682,
+  "max_file_bytes": 2682,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "5e5f8ff6d7cc5363c1bea9693028c3f1273d376dadbeaab98c4271800f811623"
+}

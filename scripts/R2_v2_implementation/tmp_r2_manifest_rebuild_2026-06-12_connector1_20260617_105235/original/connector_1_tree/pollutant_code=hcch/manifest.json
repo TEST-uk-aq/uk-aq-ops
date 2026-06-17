@@ -1,0 +1,70 @@
+{
+  "manifest_schema_version": 2,
+  "history_schema_version": 2,
+  "history_version": "v2",
+  "manifest_kind": "pollutant",
+  "domain": "observations",
+  "grain": null,
+  "profile": null,
+  "day_utc": "2026-06-12",
+  "connector_id": 1,
+  "pollutant_code": "hcch",
+  "pollutant_codes": [
+    "hcch"
+  ],
+  "run_id": "39cbf26e-8c87-4066-b45d-948d7b1d04d2",
+  "manifest_key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=hcch/manifest.json",
+  "source_row_count": 70,
+  "row_count": 70,
+  "min_timeseries_id": 18586186,
+  "max_timeseries_id": 18586188,
+  "min_observed_at_utc": null,
+  "max_observed_at_utc": null,
+  "min_timestamp_hour_utc": null,
+  "max_timestamp_hour_utc": null,
+  "parquet_object_keys": [
+    "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=hcch/part-00003.parquet"
+  ],
+  "file_count": 1,
+  "total_bytes": 2545,
+  "files": [
+    {
+      "key": "history/v2/observations/day_utc=2026-06-12/connector_id=1/pollutant_code=hcch/part-00003.parquet",
+      "row_count": 70,
+      "bytes": 2545,
+      "etag_or_hash": "\"555e26beb0fc20f9fd6c4ddcf8bdf3a3\"",
+      "pollutant_code": "hcch",
+      "min_timeseries_id": 18586186,
+      "max_timeseries_id": 18586188,
+      "min_observed_at_utc": null,
+      "max_observed_at_utc": null,
+      "timeseries_row_counts": {
+        "18586186": 22,
+        "18586187": 24,
+        "18586188": 24
+      }
+    }
+  ],
+  "child_manifests": [],
+  "columns": [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value"
+  ],
+  "writer_version": "parquet-wasm-zstd-v2",
+  "writer_git_sha": null,
+  "timeseries_row_counts": {
+    "18586186": 22,
+    "18586187": 24,
+    "18586188": 24
+  },
+  "bytes_per_row_estimate": 36.357142857142854,
+  "avg_file_bytes": 2545,
+  "min_file_bytes": 2545,
+  "max_file_bytes": 2545,
+  "backed_up_at_utc": "2026-06-17T09:20:20.323Z",
+  "manifest_hash": "f00d94d731239de6b7828cbbe288dc3d96c1b9976585e87f9bda5fc5222798dc"
+}
