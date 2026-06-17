@@ -27,13 +27,31 @@ function renderHeader(){
 }
 renderHeader();
 function fmtDate(v){if(!v)return '';const d=new Date(v);return isNaN(d)?String(v):new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}).format(d).replace(',','');}
-function fmt(v){if(v===null||v===undefined||v==='')return '';if(typeof v==='number')return Number.isInteger(v)?String(v):String(Math.round(v*1000)/1000);return String(v)}
+function isNullish(v){return v===null||v===undefined||v==='';}
+function fmt(v){if(typeof v==='number')return Number.isInteger(v)?String(v):String(Math.round(v*1000)/1000);return String(v)}
+function fmtNullable(v){return isNullish(v)?'NULL':fmt(v)}
+function fieldPresenceFlag(k){
+  if(k==='ingestdb_observs_value')return 'has_ingestdb_observs_row';
+  if(k==='obsaqidb_observs_value')return 'has_obsaqidb_observs_row';
+  if(k==='r2_observs_value')return 'has_r2_observs_row';
+  if(['aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','daqi_index_level','eaqi_index_level','daqi_colour','eaqi_colour'].includes(k))return 'has_aqi_row';
+  return null;
+}
+function displayCell(row,k){
+  const flag=fieldPresenceFlag(k);
+  if(flag&&!row[flag])return 'No Data';
+  return fmtNullable(row[k]);
+}
+function colourCell(row,k){
+  if(!row.has_aqi_row)return 'No Data';
+  if(isNullish(row[k]))return 'NULL';
+  return `<span class="swatch" style="background:${fmt(row[k])}"></span>`;
+}
 function pollutantLabel(code){if(code==='pm25')return 'PM2.5';if(code==='pm10')return 'PM10';if(code==='no2')return 'NO2';return code;}
 function stationLabel(s){return `${s.station_name || s.label || '(unnamed station)'} · station_id ${s.station_id} · connector ${s.connector_id ?? ''} · ref ${s.station_ref ?? ''}`;}
 function stationLastValueLabel(s){
-  if(s.last_value===null||s.last_value===undefined||s.last_value==='')return '';
-  const time=s.last_value_at ? ` at ${fmtDate(s.last_value_at)}` : '';
-  return ` · last ${pollutantLabel(pollutant)}: ${fmt(s.last_value)}${time}`;
+  const time=isNullish(s.last_value_at)?'NULL':fmtDate(s.last_value_at);
+  return ` · last ${pollutantLabel(pollutant)}: ${fmtNullable(s.last_value)} at ${time}`;
 }
 function sortedRows(){
   return [...currentRows].sort((a,b)=>{
@@ -46,7 +64,7 @@ function sortedRows(){
   });
 }
 function renderRows(){
-  body.innerHTML=sortedRows().map(row=>`<tr>${keys.map(k=>{if(k==='observed_at')return `<td>${fmtDate(row[k])}</td>`; if(k.endsWith('colour'))return `<td><span class="swatch" style="background:${row[k]||'#fff'}"></span></td>`; return `<td class="${typeof row[k]==='number'?'num':''}">${fmt(row[k])}</td>`}).join('')}</tr>`).join('');
+  body.innerHTML=sortedRows().map(row=>`<tr>${keys.map(k=>{if(k==='observed_at')return `<td>${fmtDate(row[k])}</td>`; if(k.endsWith('colour'))return `<td>${colourCell(row,k)}</td>`; return `<td class="${typeof row[k]==='number'?'num':''}">${displayCell(row,k)}</td>`}).join('')}</tr>`).join('');
 }
 async function search(){
   const q=document.getElementById('q').value.trim();
@@ -76,6 +94,6 @@ async function search(){
     loadRows();
   });
 }
-async function loadRows(){if(!station)return; status.textContent='Loading rows…'; warning.hidden=true; const ts=document.getElementById('ts').value; const qs=new URLSearchParams({station_id:station.station_id,pollutant,range}); if(ts)qs.set('timeseries_id',ts); const r=await fetch(`/api/station-snapshot-v2/rows?${qs}`); const j=await r.json(); if(!r.ok){status.className='status error';status.textContent=j.message||j.error||'Request failed';return} status.className='status'; status.textContent=`${j.rows.length} rows · selected timeseries ${j.selected_timeseries_id||''}`; if(j.overlap_detected){warning.hidden=false;warning.textContent='Overlap detected: both R2 and ingestdb have rows for the same observed_at. R2 is being used for AQI source values.'} const list=j.timeseries||[]; tsBox.hidden=list.length<=1; ts.innerHTML=list.map(t=>`<option value="${t.timeseries_id}" ${t.timeseries_id===j.selected_timeseries_id?'selected':''}>${t.timeseries_id} · connector ${t.connector_id} · ${t.label||''} · ${t.uom||''}</option>`).join(''); currentRows=j.rows||[];renderRows();}
+async function loadRows(){if(!station)return; status.textContent='Loading rows…'; warning.hidden=true; const ts=document.getElementById('ts').value; const qs=new URLSearchParams({station_id:station.station_id,pollutant,range}); if(ts)qs.set('timeseries_id',ts); const r=await fetch(`/api/station-snapshot-v2/rows?${qs}`); const j=await r.json(); if(!r.ok){status.className='status error';status.textContent=j.message||j.error||'Request failed';return} status.className='status'; status.textContent=`${j.rows.length} rows · selected timeseries ${j.selected_timeseries_id||''}`; if(j.overlap_detected){warning.hidden=false;warning.textContent='Overlap detected: both R2 and ObsAQIDB have AQI rows for the same observed_at. R2 is being used for AQI source values.'} const list=j.timeseries||[]; tsBox.hidden=list.length<=1; ts.innerHTML=list.map(t=>`<option value="${t.timeseries_id}" ${t.timeseries_id===j.selected_timeseries_id?'selected':''}>${t.timeseries_id} · connector ${t.connector_id} · ${t.label||''} · ${t.uom||''}</option>`).join(''); currentRows=j.rows||[];renderRows();}
 q.oninput=()=>{clearTimeout(timer);timer=setTimeout(search,250)}; document.querySelectorAll('[data-pollutant]').forEach(b=>b.onclick=()=>{pollutant=b.dataset.pollutant;document.querySelectorAll('[data-pollutant]').forEach(x=>x.classList.toggle('active',x===b));if(document.getElementById('q').value.trim().length>=2)search();loadRows()}); document.querySelectorAll('[data-range]').forEach(b=>b.onclick=()=>{range=b.dataset.range;document.querySelectorAll('[data-range]').forEach(x=>x.classList.toggle('active',x===b));loadRows()}); ts.onchange=loadRows;
 </script></body></html>
