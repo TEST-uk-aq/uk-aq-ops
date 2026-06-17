@@ -4,7 +4,7 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>UK AQ station_snapshot_v2</title>
 <style>
-:root{--bg:#f3f6fb;--panel:#fff;--text:#10243b;--muted:#5e6f82;--line:#d8e0ea;--accent:#145da0;--warn:#8b1e3f}*{box-sizing:border-box}body{margin:0;font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:linear-gradient(160deg,#eef4ff,#f7fbff 50%,#edf7f2);color:var(--text)}main{padding:18px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}h1{font-size:1.35rem;margin:0 0 4px}.muted{color:var(--muted)}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}input,select,button{border:1px solid #c4d1df;border-radius:8px;padding:8px 9px;font:inherit}input{min-width:320px}button{background:#eef4ff;color:#123;border-color:#bdd1e8;cursor:pointer;font-weight:650}button.active{background:var(--accent);color:#fff}.results{display:grid;gap:6px;margin-top:8px;max-width:780px}.result{width:100%;text-align:left;background:#fff}.status{padding:8px 10px;border-radius:8px;background:#ecf2fb;border:1px solid #d4e1f3}.warn{background:#fff5df;border-color:#f0c36a;color:#5a3b00}.error{background:#fff2f5;border-color:#efc0cf;color:var(--warn)}.table-wrap{overflow:auto}table{border-collapse:collapse;width:max-content;min-width:100%;font-size:.84rem}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap}th{position:sticky;top:0;background:#f7fbff}.num{text-align:right;font-variant-numeric:tabular-nums}.swatch{display:inline-block;width:22px;height:22px;border:1px solid #c4d1df;border-radius:4px;vertical-align:middle;background:#fff}
+:root{--bg:#f3f6fb;--panel:#fff;--text:#10243b;--muted:#5e6f82;--line:#d8e0ea;--accent:#145da0;--warn:#8b1e3f}*{box-sizing:border-box}body{margin:0;font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:linear-gradient(160deg,#eef4ff,#f7fbff 50%,#edf7f2);color:var(--text)}main{padding:18px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}h1{font-size:1.35rem;margin:0 0 4px}.muted{color:var(--muted)}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}input,select,button{border:1px solid #c4d1df;border-radius:8px;padding:8px 9px;font:inherit}input{min-width:320px}button{background:#eef4ff;color:#123;border-color:#bdd1e8;cursor:pointer;font-weight:650}button.active{background:var(--accent);color:#fff}.results{display:grid;gap:6px;margin-top:8px;max-width:780px}.result{width:100%;text-align:left;background:#fff}.status{padding:8px 10px;border-radius:8px;background:#ecf2fb;border:1px solid #d4e1f3}.warn{background:#fff5df;border-color:#f0c36a;color:#5a3b00}.error{background:#fff2f5;border-color:#efc0cf;color:var(--warn)}.table-wrap{overflow:auto}table{border-collapse:collapse;width:max-content;min-width:100%;font-size:.84rem}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap}th{position:sticky;top:0;background:#f7fbff}.num{text-align:right;font-variant-numeric:tabular-nums}.swatch{display:inline-block;width:22px;height:22px;border:1px solid #c4d1df;border-radius:4px;vertical-align:middle;background:#fff}.sort-header{border:0;background:transparent;padding:0;color:inherit;font:inherit;font-weight:700;cursor:pointer}
 </style>
 </head>
 <body><main>
@@ -15,9 +15,39 @@
 </main><script>
 const cols=['observed_at','ingestdb.observs.value','obsaqidb.observs.value','r2.observs.value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','DAQI colour','daqi_index_level','EAQI colour','eaqi_index_level'];
 const keys=['observed_at','ingestdb_observs_value','obsaqidb_observs_value','r2_observs_value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','daqi_colour','daqi_index_level','eaqi_colour','eaqi_index_level'];
-let station=null,pollutant='pm25',range='24h',timer=null;head.innerHTML=cols.map(c=>`<th>${c}</th>`).join('');
+let station=null,pollutant='pm25',range='24h',timer=null,currentRows=[],sortAsc=true;
+function renderHeader(){
+  head.innerHTML=cols.map((c,i)=>{
+    if(keys[i]==='observed_at'){
+      return `<th><button id="sortObserved" class="sort-header" type="button">observed_at ${sortAsc ? '▲' : '▼'}</button></th>`;
+    }
+    return `<th>${c}</th>`;
+  }).join('');
+  document.getElementById('sortObserved').onclick=()=>{sortAsc=!sortAsc;renderHeader();renderRows()};
+}
+renderHeader();
 function fmtDate(v){if(!v)return '';const d=new Date(v);return isNaN(d)?String(v):new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}).format(d).replace(',','');}
 function fmt(v){if(v===null||v===undefined||v==='')return '';if(typeof v==='number')return Number.isInteger(v)?String(v):String(Math.round(v*1000)/1000);return String(v)}
+function pollutantLabel(code){if(code==='pm25')return 'PM2.5';if(code==='pm10')return 'PM10';if(code==='no2')return 'NO2';return code;}
+function stationLabel(s){return `${s.station_name || s.label || '(unnamed station)'} · station_id ${s.station_id} · connector ${s.connector_id ?? ''} · ref ${s.station_ref ?? ''}`;}
+function stationLastValueLabel(s){
+  if(s.last_value===null||s.last_value===undefined||s.last_value==='')return '';
+  const time=s.last_value_at ? ` at ${fmtDate(s.last_value_at)}` : '';
+  return ` · last ${pollutantLabel(pollutant)}: ${fmt(s.last_value)}${time}`;
+}
+function sortedRows(){
+  return [...currentRows].sort((a,b)=>{
+    const av=Date.parse(a.observed_at||'');
+    const bv=Date.parse(b.observed_at||'');
+    if(Number.isNaN(av)&&Number.isNaN(bv))return 0;
+    if(Number.isNaN(av))return 1;
+    if(Number.isNaN(bv))return -1;
+    return sortAsc ? av-bv : bv-av;
+  });
+}
+function renderRows(){
+  body.innerHTML=sortedRows().map(row=>`<tr>${keys.map(k=>{if(k==='observed_at')return `<td>${fmtDate(row[k])}</td>`; if(k.endsWith('colour'))return `<td><span class="swatch" style="background:${row[k]||'#fff'}"></span></td>`; return `<td class="${typeof row[k]==='number'?'num':''}">${fmt(row[k])}</td>`}).join('')}</tr>`).join('');
+}
 async function search(){
   const q=document.getElementById('q').value.trim();
   if(q.length<2){
@@ -25,13 +55,14 @@ async function search(){
     return;
   }
 
-  const r=await fetch(`/api/station-snapshot-v2/search-stations?q=${encodeURIComponent(q)}`);
+  const qs = new URLSearchParams({ q, pollutant });
+  const r=await fetch(`/api/station-snapshot-v2/search-stations?${qs}`);
   const j=await r.json();
   const stations = j.stations || j.results || [];
 
   results.innerHTML = stations.map((s,i)=>`
     <button class="result" data-i="${i}">
-      ${s.station_name || s.label || '(unnamed station)'} · station_id ${s.station_id} · connector ${s.connector_id ?? ''} · ref ${s.station_ref ?? ''}
+      ${stationLabel(s)}${stationLastValueLabel(s)}
     </button>
   `).join('') || '<div class="muted">No matches.</div>';
 
@@ -39,12 +70,12 @@ async function search(){
     station = stations[i];
     results.innerHTML = `
       <div class="status">
-        Selected: ${station.station_name || station.label || '(unnamed station)'} · station_id ${station.station_id} · connector ${station.connector_id ?? ''} · ref ${station.station_ref ?? ''}
+        Selected: ${stationLabel(station)}${stationLastValueLabel(station)}
       </div>
     `;
     loadRows();
   });
 }
-async function loadRows(){if(!station)return; status.textContent='Loading rows…'; warning.hidden=true; const ts=document.getElementById('ts').value; const qs=new URLSearchParams({station_id:station.station_id,pollutant,range}); if(ts)qs.set('timeseries_id',ts); const r=await fetch(`/api/station-snapshot-v2/rows?${qs}`); const j=await r.json(); if(!r.ok){status.className='status error';status.textContent=j.message||j.error||'Request failed';return} status.className='status'; status.textContent=`${j.rows.length} rows · selected timeseries ${j.selected_timeseries_id||''}`; if(j.overlap_detected){warning.hidden=false;warning.textContent='Overlap detected: both R2 and ingestdb have rows for the same observed_at. R2 is being used for AQI source values.'} const list=j.timeseries||[]; tsBox.hidden=list.length<=1; ts.innerHTML=list.map(t=>`<option value="${t.timeseries_id}" ${t.timeseries_id===j.selected_timeseries_id?'selected':''}>${t.timeseries_id} · connector ${t.connector_id} · ${t.label||''} · ${t.uom||''}</option>`).join(''); body.innerHTML=(j.rows||[]).map(row=>`<tr>${keys.map(k=>{if(k==='observed_at')return `<td>${fmtDate(row[k])}</td>`; if(k.endsWith('colour'))return `<td><span class="swatch" style="background:${row[k]||'#fff'}"></span></td>`; return `<td class="${typeof row[k]==='number'?'num':''}">${fmt(row[k])}</td>`}).join('')}</tr>`).join('');}
-q.oninput=()=>{clearTimeout(timer);timer=setTimeout(search,250)}; document.querySelectorAll('[data-pollutant]').forEach(b=>b.onclick=()=>{pollutant=b.dataset.pollutant;document.querySelectorAll('[data-pollutant]').forEach(x=>x.classList.toggle('active',x===b));loadRows()}); document.querySelectorAll('[data-range]').forEach(b=>b.onclick=()=>{range=b.dataset.range;document.querySelectorAll('[data-range]').forEach(x=>x.classList.toggle('active',x===b));loadRows()}); ts.onchange=loadRows;
+async function loadRows(){if(!station)return; status.textContent='Loading rows…'; warning.hidden=true; const ts=document.getElementById('ts').value; const qs=new URLSearchParams({station_id:station.station_id,pollutant,range}); if(ts)qs.set('timeseries_id',ts); const r=await fetch(`/api/station-snapshot-v2/rows?${qs}`); const j=await r.json(); if(!r.ok){status.className='status error';status.textContent=j.message||j.error||'Request failed';return} status.className='status'; status.textContent=`${j.rows.length} rows · selected timeseries ${j.selected_timeseries_id||''}`; if(j.overlap_detected){warning.hidden=false;warning.textContent='Overlap detected: both R2 and ingestdb have rows for the same observed_at. R2 is being used for AQI source values.'} const list=j.timeseries||[]; tsBox.hidden=list.length<=1; ts.innerHTML=list.map(t=>`<option value="${t.timeseries_id}" ${t.timeseries_id===j.selected_timeseries_id?'selected':''}>${t.timeseries_id} · connector ${t.connector_id} · ${t.label||''} · ${t.uom||''}</option>`).join(''); currentRows=j.rows||[];renderRows();}
+q.oninput=()=>{clearTimeout(timer);timer=setTimeout(search,250)}; document.querySelectorAll('[data-pollutant]').forEach(b=>b.onclick=()=>{pollutant=b.dataset.pollutant;document.querySelectorAll('[data-pollutant]').forEach(x=>x.classList.toggle('active',x===b));if(document.getElementById('q').value.trim().length>=2)search();loadRows()}); document.querySelectorAll('[data-range]').forEach(b=>b.onclick=()=>{range=b.dataset.range;document.querySelectorAll('[data-range]').forEach(x=>x.classList.toggle('active',x===b));loadRows()}); ts.onchange=loadRows;
 </script></body></html>
