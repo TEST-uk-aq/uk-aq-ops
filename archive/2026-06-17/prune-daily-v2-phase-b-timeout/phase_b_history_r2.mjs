@@ -26,8 +26,6 @@ const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE = 50_000;
 const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
-const DEFAULT_MAX_SECONDS_PER_RUN = 840;
-const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
 const DEFAULT_AQILEVELS_SOURCE_MAX_PAGES = 50_000;
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
 const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
@@ -198,89 +196,6 @@ function parseBoolean(raw, fallback) {
     return false;
   }
   return fallback;
-}
-
-function errorLogFields(error) {
-  if (!(error instanceof Error)) {
-    return { error_message: String(error) };
-  }
-  return {
-    error_name: error.name,
-    error_message: error.message,
-    error_cause_code: error.cause?.code || error.code || null,
-  };
-}
-
-export function createPhaseBRunBudgetForTest({
-  startedAtMs = Date.now(),
-  maxSecondsPerRun = DEFAULT_MAX_SECONDS_PER_RUN,
-  stopBeforeTimeoutSeconds = DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS,
-} = {}) {
-  const maxMs = Math.max(1, Math.trunc(Number(maxSecondsPerRun) || DEFAULT_MAX_SECONDS_PER_RUN)) * 1000;
-  const stopBeforeMs = Math.max(0, Math.trunc(Number(stopBeforeTimeoutSeconds) || 0)) * 1000;
-  const usableMs = Math.max(1, maxMs - stopBeforeMs);
-  return {
-    started_at_ms: startedAtMs,
-    max_ms: maxMs,
-    stop_before_timeout_ms: stopBeforeMs,
-    deadline_ms: startedAtMs + usableMs,
-  };
-}
-
-function budgetSnapshot(runtime) {
-  const budget = runtime?.run_budget;
-  if (!budget) {
-    return {
-      elapsed_run_ms: null,
-      remaining_budget_ms: null,
-    };
-  }
-  const now = Date.now();
-  return {
-    elapsed_run_ms: Math.max(0, now - budget.started_at_ms),
-    remaining_budget_ms: Math.max(0, budget.deadline_ms - now),
-  };
-}
-
-function hasBudgetFor(runtime, minMs = 0) {
-  const budget = runtime?.run_budget;
-  if (!budget) {
-    return true;
-  }
-  return Date.now() + Math.max(0, minMs) < budget.deadline_ms;
-}
-
-function logPhaseB(runtime, severity, event, fields = {}) {
-  const logStructured = runtime?.logStructured;
-  if (typeof logStructured !== "function") {
-    return;
-  }
-  logStructured(severity, event, {
-    run_id: runtime.run_id,
-    history_write_version: runtime.history_write_version,
-    r2_bucket: runtime.r2?.bucket || null,
-    ...budgetSnapshot(runtime),
-    ...fields,
-  });
-}
-
-class PhaseBHistoryBudgetExhaustedError extends Error {
-  constructor(message = "Phase B history run budget exhausted") {
-    super(message);
-    this.name = "PhaseBHistoryBudgetExhaustedError";
-    this.code = "PHASE_B_HISTORY_BUDGET_EXHAUSTED";
-  }
-}
-
-function assertBudget(runtime, operation, fields = {}, minMs = 0) {
-  if (hasBudgetFor(runtime, minMs)) {
-    return;
-  }
-  logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
-    operation,
-    ...fields,
-  });
-  throw new PhaseBHistoryBudgetExhaustedError();
 }
 
 function parseHistoryWriteVersion(raw) {
@@ -2169,34 +2084,10 @@ async function writeCommittedV2PartAndCheckpoint({
   let bytesAdded = 0n;
 
   for (const [pollutantCode, pollutantRows] of groupedRows) {
-    assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 15_000);
-    const pollutantStartedAtMs = Date.now();
-    logPhaseB(runtime, "INFO", "phase_b_history_pollutant_start", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      rows_selected: pollutantRows.length,
-      part_count: 1,
-      prefix: pollutantPrefix(runtime.committed_prefix, dayUtc, connectorId, pollutantCode),
-    });
-    logPhaseB(runtime, "INFO", "phase_b_history_parquet_build_start", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      rows_selected: pollutantRows.length,
-    });
-    const parquetStartedAtMs = Date.now();
     const parquetBuffer = rowsToObservationV2ParquetBuffer(
       pollutantRows,
       parquetWriterProperties(runtime.observations_row_group_size, HISTORY_R2_V2_WRITER_VERSION),
     );
-    logPhaseB(runtime, "INFO", "phase_b_history_parquet_build_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      rows_written: pollutantRows.length,
-      duration_ms: Math.max(0, Date.now() - parquetStartedAtMs),
-    });
     const committedKey = buildHistoryV2PartKey(
       runtime.committed_prefix,
       dayUtc,
@@ -2204,15 +2095,6 @@ async function writeCommittedV2PartAndCheckpoint({
       pollutantCode,
       partIndex,
     );
-    assertBudget(runtime, "r2_put", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode, prefix: committedKey }, 15_000);
-    logPhaseB(runtime, "INFO", "phase_b_history_r2_put_start", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      prefix: committedKey,
-      rows_written: pollutantRows.length,
-    });
-    const putStartedAtMs = Date.now();
     const putResult = await r2PutObject({
       r2: runtime.r2,
       key: committedKey,
@@ -2223,13 +2105,6 @@ async function writeCommittedV2PartAndCheckpoint({
     if (!head.exists) {
       throw new Error(`Missing committed object after write: ${committedKey}`);
     }
-    logPhaseB(runtime, "INFO", "phase_b_history_r2_put_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      prefix: committedKey,
-      duration_ms: Math.max(0, Date.now() - putStartedAtMs),
-    });
 
     const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
       ? Math.trunc(head.bytes)
@@ -2249,14 +2124,6 @@ async function writeCommittedV2PartAndCheckpoint({
       timeseries_row_counts: partSummary.timeseries_row_counts,
     });
     bytesAdded += BigInt(bytes);
-    logPhaseB(runtime, "INFO", "phase_b_history_pollutant_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      rows_written: pollutantRows.length,
-      part_count: 1,
-      duration_ms: Math.max(0, Date.now() - pollutantStartedAtMs),
-    });
   }
 
   const nextObservedRows = observedRows + BigInt(rows.length);
@@ -2302,7 +2169,6 @@ async function writeObservationV2ConnectorManifest({
 
   const pollutantManifests = [];
   for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-    assertBudget(runtime, "manifest_write", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 10_000);
     const pollutantManifestKey = buildHistoryV2PollutantManifestKey(
       runtime.committed_prefix,
       dayUtc,
@@ -2322,14 +2188,6 @@ async function writeObservationV2ConnectorManifest({
       writerGitSha: runtime.writer_git_sha,
       backedUpAtUtc,
     });
-    logPhaseB(runtime, "INFO", "phase_b_history_manifest_write_start", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      manifest_path: pollutantManifestKey,
-      part_count: pollutantParts.length,
-    });
-    const manifestStartedAtMs = Date.now();
     await r2PutObject({
       r2: runtime.r2,
       key: pollutantManifestKey,
@@ -2340,14 +2198,6 @@ async function writeObservationV2ConnectorManifest({
     if (!pollutantManifestHead.exists) {
       throw new Error(`V2 pollutant manifest missing after upload: ${pollutantManifestKey}`);
     }
-    logPhaseB(runtime, "INFO", "phase_b_history_manifest_write_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      manifest_path: pollutantManifestKey,
-      part_count: pollutantParts.length,
-      duration_ms: Math.max(0, Date.now() - manifestStartedAtMs),
-    });
     pollutantManifests.push(pollutantManifest);
   }
 
@@ -2362,13 +2212,6 @@ async function writeObservationV2ConnectorManifest({
     writerGitSha: runtime.writer_git_sha,
     backedUpAtUtc,
   });
-  logPhaseB(runtime, "INFO", "phase_b_history_manifest_write_start", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    manifest_path: connectorManifestKey,
-    part_count: committedParts.length,
-  });
-  const connectorManifestStartedAtMs = Date.now();
   await r2PutObject({
     r2: runtime.r2,
     key: connectorManifestKey,
@@ -2380,41 +2223,7 @@ async function writeObservationV2ConnectorManifest({
   if (!connectorManifestHead.exists) {
     throw new Error(`V2 connector manifest missing after upload: ${connectorManifestKey}`);
   }
-  logPhaseB(runtime, "INFO", "phase_b_history_manifest_write_complete", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    manifest_path: connectorManifestKey,
-    part_count: committedParts.length,
-    duration_ms: Math.max(0, Date.now() - connectorManifestStartedAtMs),
-  });
   return { connectorManifest, connectorManifestKey };
-}
-
-async function cleanupCandidatePartialOutput({ runtime, dayUtc, connectorId }) {
-  const prefix = connectorPrefix(runtime.committed_prefix, dayUtc, connectorId);
-  logPhaseB(runtime, "WARNING", "phase_b_history_partial_cleanup_start", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    prefix,
-  });
-  const entries = await r2ListAllObjects({ r2: runtime.r2, prefix: `${prefix}/`, max_keys: 1000 });
-  const keys = entries.map((entry) => entry.key);
-  let deletedCount = 0;
-  let errorCount = 0;
-  for (let i = 0; i < keys.length; i += 1000) {
-    const result = await r2DeleteObjects({ r2: runtime.r2, keys: keys.slice(i, i + 1000) });
-    deletedCount += result.deleted_count;
-    errorCount += result.errors.length;
-  }
-  logPhaseB(runtime, "WARNING", "phase_b_history_partial_cleanup_complete", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    prefix,
-    scanned_count: entries.length,
-    deleted_count: deletedCount,
-    error_count: errorCount,
-  });
-  return { scanned_count: entries.length, deleted_count: deletedCount, error_count: errorCount };
 }
 
 async function exportCandidateToR2({ candidate, runtime }) {
@@ -2438,15 +2247,8 @@ async function exportCandidateToR2({ candidate, runtime }) {
     0n,
   );
   let partIndex = Number(candidate.resume_part_index || 0);
-  let resumeTimeseriesId = candidate.resume_last_timeseries_id;
-  let resumeObservedAt = candidate.resume_last_observed_at;
-  logPhaseB(runtime, "INFO", "phase_b_history_connector_start", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    rows_selected: expectedRowCount.toString(),
-    prefix: connectorPrefix(runtime.committed_prefix, dayUtc, connectorId),
-    manifest_path: buildConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId),
-  });
+  const resumeTimeseriesId = candidate.resume_last_timeseries_id;
+  const resumeObservedAt = candidate.resume_last_observed_at;
 
   if (runtime.history_write_version === "v2" && partIndex > committedParts.length) {
     throw new Error(
@@ -2462,33 +2264,6 @@ async function exportCandidateToR2({ candidate, runtime }) {
     throw new Error(
       `Resume checkpoint missing key tuple for day=${dayUtc} connector=${connectorId} with part_index=${partIndex}`,
     );
-  }
-
-  if (runtime.history_write_version === "v2") {
-    const connectorManifestKey = buildHistoryV2ConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
-    const connectorManifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
-    if (!connectorManifestHead.exists) {
-      const existingEntries = await r2ListAllObjects({
-        r2: runtime.r2,
-        prefix: `${connectorPrefix(runtime.committed_prefix, dayUtc, connectorId)}/`,
-        max_keys: 1000,
-      });
-      if (existingEntries.length > 0) {
-        logPhaseB(runtime, "WARNING", "phase_b_history_candidate_skipped", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          prefix: connectorPrefix(runtime.committed_prefix, dayUtc, connectorId),
-          reason: "manifestless_partial_final_prefix_cleanup_before_retry",
-        });
-        await cleanupCandidatePartialOutput({ runtime, dayUtc, connectorId });
-        committedParts = [];
-        observedRows = 0n;
-        totalBytes = 0n;
-        partIndex = 0;
-        resumeTimeseriesId = null;
-        resumeObservedAt = null;
-      }
-    }
   }
 
   for (const part of committedParts) {
@@ -2541,20 +2316,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
 
     try {
       for (;;) {
-        assertBudget(runtime, "row_fetch", { day_utc: dayUtc, connector_id: connectorId }, 30_000);
-        logPhaseB(runtime, "INFO", "phase_b_history_row_fetch_start", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          rows_selected: observedRows.toString(),
-        });
-        const fetchStartedAtMs = Date.now();
         const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
-        logPhaseB(runtime, "INFO", "phase_b_history_row_fetch_complete", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          rows_selected: rows.length,
-          duration_ms: Math.max(0, Date.now() - fetchStartedAtMs),
-        });
         if (!rows.length) {
           break;
         }
@@ -2639,14 +2401,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
       backedUpAtUtc,
     });
 
-    logPhaseB(runtime, "INFO", "phase_b_history_connector_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      rows_written: observedRows.toString(),
-      part_count: committedParts.length,
-      manifest_path: connectorManifestKey,
-      prefix: connectorPrefix(runtime.committed_prefix, dayUtc, connectorId),
-    });
     return {
       day_utc: dayUtc,
       connector_id: connectorId,
@@ -3108,7 +2862,8 @@ async function maybeAdoptExistingConnectorManifest({
 
     let comparison = null;
     if (runtime.prune_check_dropbox?.enabled) {
-      logPhaseB(runtime, "INFO", "phase_b_history_dropbox_check_start", {
+      logStructured("INFO", "phase_b_history_prune_check_dropbox_export_start", {
+        run_id: runtime.run_id,
         day_utc: dayUtc,
         connector_id: connectorId,
         manifest_key: connectorManifestKey,
@@ -3123,25 +2878,17 @@ async function maybeAdoptExistingConnectorManifest({
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        logPhaseB(runtime, "ERROR", "phase_b_history_dropbox_check_failed", {
+        logStructured("ERROR", "phase_b_history_prune_check_dropbox_export_failed", {
+          run_id: runtime.run_id,
           day_utc: dayUtc,
           connector_id: connectorId,
           manifest_key: connectorManifestKey,
           error: message,
-          ...errorLogFields(error),
           required: runtime.prune_check_dropbox?.required === true,
         });
         if (runtime.prune_check_dropbox?.required) {
           throw error;
         }
-      }
-      if (comparison) {
-        logPhaseB(runtime, "INFO", "phase_b_history_dropbox_check_complete", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          manifest_key: connectorManifestKey,
-          comparison_output_root: comparison.comparison_output_root,
-        });
       }
     }
 
@@ -4001,18 +3748,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       1,
       50_000,
     ),
-    max_seconds_per_run: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN,
-      DEFAULT_MAX_SECONDS_PER_RUN,
-      30,
-      86_400,
-    ),
-    stop_before_timeout_seconds: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS,
-      DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS,
-      0,
-      3_600,
-    ),
     staging_retention_days: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS,
       DEFAULT_STAGING_RETENTION_DAYS,
@@ -4068,11 +3803,6 @@ export async function runPhaseBBackup({
     run_id: runId,
     now_utc: nowUtc,
     staging_prefix: `${phaseB.staging_prefix_base}/run_id=${runId}`,
-    logStructured,
-    run_budget: createPhaseBRunBudgetForTest({
-      maxSecondsPerRun: phaseB.max_seconds_per_run,
-      stopBeforeTimeoutSeconds: phaseB.stop_before_timeout_seconds,
-    }),
   };
 
   if (!runtime.enabled) {
@@ -4131,8 +3861,6 @@ export async function runPhaseBBackup({
     prune_check_dropbox_required: runtime.prune_check_dropbox?.required === true,
     prune_check_dropbox_dir: runtime.prune_check_dropbox?.dir || DEFAULT_PRUNE_CHECK_DROPBOX_DIR,
     max_candidates_per_run: runtime.max_candidates_per_run,
-    max_seconds_per_run: runtime.max_seconds_per_run,
-    stop_before_timeout_seconds: runtime.stop_before_timeout_seconds,
     part_max_rows: runtime.part_max_rows,
     observations_part_max_rows: runtime.observations_part_max_rows,
     aqilevels_part_max_rows: runtime.aqilevels_part_max_rows,
@@ -4187,43 +3915,16 @@ export async function runPhaseBBackup({
       return;
     }
 
-    for (let candidateIndex = 0; candidateIndex < pendingCandidates.length; candidateIndex += 1) {
-      const candidate = pendingCandidates[candidateIndex];
-      if (!hasBudgetFor(runtime, 60_000)) {
-        logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
-          operation: "candidate_start",
-          day_utc: candidate.day_utc,
-          connector_id: candidate.connector_id,
-          candidate_index: candidateIndex,
-          candidate_count: pendingCandidates.length,
-        });
-        break;
-      }
+    for (const candidate of pendingCandidates) {
       summary.processed_candidates += 1;
 
       const claimed = await markCandidateInProgress(controlClient, candidate.day_utc, candidate.connector_id, runId);
       if (!claimed) {
-        logPhaseB(runtime, "INFO", "phase_b_history_candidate_skipped", {
-          day_utc: candidate.day_utc,
-          connector_id: candidate.connector_id,
-          candidate_index: candidateIndex,
-          candidate_count: pendingCandidates.length,
-          reason: "not_claimed",
-        });
         continue;
       }
 
       const startedAtMs = Date.now();
       try {
-        logPhaseB(runtime, "INFO", "phase_b_history_candidate_start", {
-          day_utc: candidate.day_utc,
-          connector_id: candidate.connector_id,
-          candidate_index: candidateIndex,
-          candidate_count: pendingCandidates.length,
-          rows_selected: candidate.expected_row_count.toString(),
-          prefix: connectorPrefix(runtime.committed_prefix, candidate.day_utc, candidate.connector_id),
-          manifest_path: buildConnectorManifestKey(runtime.committed_prefix, candidate.day_utc, candidate.connector_id),
-        });
         const adoptResult = await maybeAdoptExistingConnectorManifest({
           candidate,
           runtime,
@@ -4242,8 +3943,8 @@ export async function runPhaseBBackup({
         } else {
           exportResult = await exportCandidateToR2({
             candidate,
-          runtime,
-        });
+            runtime,
+          });
           exportResult.adopted = false;
         }
 
@@ -4304,21 +4005,6 @@ export async function runPhaseBBackup({
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        try {
-          if (runtime.history_write_version === "v2") {
-            await cleanupCandidatePartialOutput({
-              runtime,
-              dayUtc: candidate.day_utc,
-              connectorId: candidate.connector_id,
-            });
-          }
-        } catch (cleanupError) {
-          logPhaseB(runtime, "ERROR", "phase_b_history_partial_cleanup_failed", {
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            ...errorLogFields(cleanupError),
-          });
-        }
         await markCandidateFailed(controlClient, {
           dayUtc: candidate.day_utc,
           connectorId: candidate.connector_id,
@@ -4347,39 +4033,24 @@ export async function runPhaseBBackup({
         });
         logStructured("ERROR", "phase_b_history_candidate_failed", {
           run_id: runId,
-          history_write_version: runtime.history_write_version,
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
-          candidate_index: candidateIndex,
-          candidate_count: pendingCandidates.length,
           resumed_from_part_index: Number(candidate.resume_part_index || 0),
           resumed_from_row_count: candidate.resume_exported_row_count.toString(),
           error: message,
-          ...errorLogFields(error),
-          ...budgetSnapshot(runtime),
           next_action: "retry_safe",
           prune_blocked_for_day: true,
         });
-        if (error instanceof PhaseBHistoryBudgetExhaustedError) {
-          break;
-        }
       }
     }
   });
 
-  if (hasBudgetFor(runtime, 120_000)) {
-    summary.aqilevels = await runAqilevelsBackup({
-      runtime,
-      latestEligibleDayUtc: window.latest_eligible_day_utc,
-      dryRun,
-      logStructured,
-    });
-  } else {
-    logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
-      operation: "aqilevels_backup_start",
-    });
-    summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
-  }
+  summary.aqilevels = await runAqilevelsBackup({
+    runtime,
+    latestEligibleDayUtc: window.latest_eligible_day_utc,
+    dryRun,
+    logStructured,
+  });
 
   if (dryRun) {
     logStructured("INFO", "phase_b_history_run_summary", summary);

@@ -11,7 +11,6 @@ import {
   buildHistoryV2ConnectorManifestForTest,
   buildHistoryV2DayManifestForTest,
   buildHistoryV2PartKey,
-  createPhaseBRunBudgetForTest,
   buildHistoryV2PollutantManifestForTest,
   buildAqilevelConnectorManifestForTest,
   buildAqilevelDayManifestForTest,
@@ -101,23 +100,6 @@ test("runtime config includes AQI levels prefix defaults", () => {
   assert.equal(config.observations_row_group_size, 50000);
   assert.equal(config.aqilevels_part_max_rows, 1000000);
   assert.equal(config.aqilevels_row_group_size, 100000);
-  assert.equal(config.max_seconds_per_run, 840);
-  assert.equal(config.stop_before_timeout_seconds, 60);
-});
-
-test("runtime config supports Phase B run budget overrides", () => {
-  const config = resolvePhaseBRuntimeConfig({
-    UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN: "120",
-    UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS: "15",
-  });
-  assert.equal(config.max_seconds_per_run, 120);
-  assert.equal(config.stop_before_timeout_seconds, 15);
-  const budget = createPhaseBRunBudgetForTest({
-    startedAtMs: 1000,
-    maxSecondsPerRun: config.max_seconds_per_run,
-    stopBeforeTimeoutSeconds: config.stop_before_timeout_seconds,
-  });
-  assert.equal(budget.deadline_ms, 106000);
 });
 
 test("runtime config accepts explicit R2 history v2 write prefixes", () => {
