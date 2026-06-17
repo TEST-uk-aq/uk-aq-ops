@@ -10,7 +10,6 @@ import {
   handleStatusSummaryRoute,
 } from "./routes/status";
 import type { WorkerEnv } from "./lib/upstream";
-import { handleStationSnapshotV2Rows, handleStationSnapshotV2Search } from "./lib/station_snapshot_v2";
 
 function getPathname(request: Request): string {
   return new URL(request.url).pathname;
@@ -54,12 +53,6 @@ export default {
     }
     if (pathname === "/api/history/runs") {
       return handleHistoryRunsRoute(env, search);
-    }
-    if (pathname === "/api/station-snapshot-v2/search-stations") {
-      return handleStationSnapshotV2Search(env, search);
-    }
-    if (pathname === "/api/station-snapshot-v2/rows") {
-      return handleStationSnapshotV2Rows(env, search);
     }
 
     if (isCompatRoute(pathname)) {
