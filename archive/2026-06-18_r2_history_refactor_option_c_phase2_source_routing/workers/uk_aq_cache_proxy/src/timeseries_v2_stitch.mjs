@@ -59,67 +59,6 @@ export function resolveTimeseriesWindowBounds({
   };
 }
 
-export function classifyTimeseriesV2SourceRoute({
-  requestStartMs,
-  requestEndMs,
-  recentBoundaryMs,
-}) {
-  if (
-    !Number.isFinite(requestStartMs)
-    || !Number.isFinite(requestEndMs)
-    || requestEndMs <= requestStartMs
-    || !Number.isFinite(recentBoundaryMs)
-  ) {
-    return {
-      sourceMode: "recent_history_stitched",
-      usedR2: true,
-      usedSupabase: true,
-      r2StartMs: requestStartMs,
-      r2EndMs: requestEndMs,
-      ingestStartMs: requestStartMs,
-      ingestEndMs: requestEndMs,
-      recentBoundaryMs,
-    };
-  }
-
-  if (requestEndMs <= recentBoundaryMs) {
-    return {
-      sourceMode: "history_only",
-      usedR2: true,
-      usedSupabase: false,
-      r2StartMs: requestStartMs,
-      r2EndMs: requestEndMs,
-      ingestStartMs: null,
-      ingestEndMs: null,
-      recentBoundaryMs,
-    };
-  }
-
-  if (requestStartMs >= recentBoundaryMs) {
-    return {
-      sourceMode: "recent_only",
-      usedR2: false,
-      usedSupabase: true,
-      r2StartMs: null,
-      r2EndMs: null,
-      ingestStartMs: requestStartMs,
-      ingestEndMs: requestEndMs,
-      recentBoundaryMs,
-    };
-  }
-
-  return {
-    sourceMode: "recent_history_stitched",
-    usedR2: true,
-    usedSupabase: true,
-    r2StartMs: requestStartMs,
-    r2EndMs: recentBoundaryMs,
-    ingestStartMs: recentBoundaryMs,
-    ingestEndMs: requestEndMs,
-    recentBoundaryMs,
-  };
-}
-
 export function normalizeObservedRow(input, sourceLabel) {
   if (!input || typeof input !== "object") return null;
   const observedAt = String(input.observed_at ?? "").trim();

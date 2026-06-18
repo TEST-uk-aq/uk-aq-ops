@@ -92,7 +92,7 @@ function sortedRows(){
 function compactDebug(debug){
   if(!debug)return null;
   const ordered={};
-  ['selected_timeseries_id','selected_timeseries_ref','selected_station_ref','selected_connector_id','selected_service_ref','selected_phenomenon_id','range_start_utc','range_end_utc','source_mode','used_r2','used_supabase','source_routing_decision','chart_history_route_used','chart_history_params_equivalent','r2_row_count','r2_object_rows_read','r2_rows_after_time_filter','r2_candidate_key_count','r2_candidate_keys_checked','r2_candidate_manifest_match_count','r2_candidate_manifest_matches','r2_first_matching_key','r2_first_matching_key_reason','ingestdb_row_count','obsaqidb_row_count','aqi_row_count','merged_row_count','selected_timeseries_latest_at_utc','selected_timeseries_latest_in_range'].forEach(k=>{if(debug[k]!==undefined)ordered[k]=debug[k];});
+  ['selected_timeseries_id','selected_timeseries_ref','selected_station_ref','selected_connector_id','selected_service_ref','selected_phenomenon_id','range_start_utc','range_end_utc','chart_history_route_used','chart_history_params_equivalent','r2_row_count','r2_object_rows_read','r2_rows_after_time_filter','r2_candidate_key_count','r2_candidate_keys_checked','r2_candidate_manifest_match_count','r2_candidate_manifest_matches','r2_first_matching_key','r2_first_matching_key_reason','ingestdb_row_count','obsaqidb_row_count','aqi_row_count','merged_row_count','selected_timeseries_latest_at_utc','selected_timeseries_latest_in_range'].forEach(k=>{if(debug[k]!==undefined)ordered[k]=debug[k];});
   Object.keys(debug).forEach(k=>{if(ordered[k]===undefined)ordered[k]=debug[k];});
   return ordered;
 }

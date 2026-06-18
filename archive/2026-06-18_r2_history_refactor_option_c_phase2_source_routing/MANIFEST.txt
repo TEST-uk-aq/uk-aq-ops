@@ -1,0 +1,6 @@
+Archive snapshot before Phase 2 source-routing implementation.
+Created: 2026-06-18
+Files:
+workers/uk_aq_cache_proxy/src/index.ts
+workers/uk_aq_cache_proxy/src/timeseries_v2_stitch.mjs
+tests/uk_aq_cache_proxy.timeseries_v2_stitch.test.mjs

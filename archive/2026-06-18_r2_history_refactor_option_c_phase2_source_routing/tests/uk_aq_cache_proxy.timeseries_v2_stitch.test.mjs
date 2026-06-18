@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 
 import {
   buildMissingDaySlices,
-  classifyTimeseriesV2SourceRoute,
   computeCoverageFromRows,
   computeNextSince,
   detectGapRanges,
@@ -130,42 +129,4 @@ test("coverage from rows reports start/end", () => {
   ]);
   assert.equal(coverage.coverageStart, "2026-05-10T01:00:00.000Z");
   assert.equal(coverage.coverageEnd, "2026-05-10T03:00:00.000Z");
-});
-
-test("source routing classifies historical-only requests as R2-only", () => {
-  const route = classifyTimeseriesV2SourceRoute({
-    requestStartMs: Date.parse("2026-05-18T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-01T00:00:00.000Z"),
-    recentBoundaryMs: Date.parse("2026-06-11T00:00:00.000Z"),
-  });
-  assert.equal(route.sourceMode, "history_only");
-  assert.equal(route.usedR2, true);
-  assert.equal(route.usedSupabase, false);
-  assert.equal(route.ingestStartMs, null);
-});
-
-test("source routing classifies recent-only requests as Supabase-only", () => {
-  const route = classifyTimeseriesV2SourceRoute({
-    requestStartMs: Date.parse("2026-06-12T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-18T00:00:00.000Z"),
-    recentBoundaryMs: Date.parse("2026-06-11T00:00:00.000Z"),
-  });
-  assert.equal(route.sourceMode, "recent_only");
-  assert.equal(route.usedR2, false);
-  assert.equal(route.usedSupabase, true);
-  assert.equal(route.r2StartMs, null);
-});
-
-test("source routing classifies boundary-crossing requests as stitched", () => {
-  const boundaryMs = Date.parse("2026-06-11T00:00:00.000Z");
-  const route = classifyTimeseriesV2SourceRoute({
-    requestStartMs: Date.parse("2026-06-01T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-18T00:00:00.000Z"),
-    recentBoundaryMs: boundaryMs,
-  });
-  assert.equal(route.sourceMode, "recent_history_stitched");
-  assert.equal(route.usedR2, true);
-  assert.equal(route.usedSupabase, true);
-  assert.equal(route.r2EndMs, boundaryMs);
-  assert.equal(route.ingestStartMs, boundaryMs);
 });

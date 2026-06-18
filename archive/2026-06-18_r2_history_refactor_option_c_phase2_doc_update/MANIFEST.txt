@@ -1,0 +1,4 @@
+Archive snapshot before Phase 2 cache proxy doc update.
+Created: 2026-06-18
+Files:
+system_docs/uk-aq-cache-proxy.md

@@ -1,0 +1,5 @@
+Archive snapshot before Phase 2 Station Snapshot chart-probe metadata sync.
+Created: 2026-06-18
+Files:
+/Users/mikehinford/Dropbox/Projects/CIC Website/ChronicChannel-Test Root Repo/ChronicChannel-test.github.io/serve.py
+station_snapshot_v2/index.html

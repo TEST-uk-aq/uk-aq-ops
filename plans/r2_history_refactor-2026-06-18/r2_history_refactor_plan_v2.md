@@ -969,6 +969,14 @@ Acceptance:
 
 Purpose: Make `/api/aq/timeseries` or the central cache proxy route classify the source mode before fetching.
 
+Implementation note, 2026-06-18:
+
+- Added a unit-tested source-routing helper for `history_only`, `recent_only`, and `recent_history_stitched`.
+- Updated the cache proxy v2 stitch path so `history_only` requests use R2 only and do not create Supabase/IngestDB fallback slices.
+- Updated `recent_only` requests to return through the existing Supabase/IngestDB origin path without R2 fetches.
+- Added summary metadata and headers for `source_mode`, `used_r2`, and `used_supabase`; verbose `source_routing_decision` is only included when `debug=1`.
+- Updated Station Snapshot v2 debug propagation so chart probes can display `source_mode`, `used_r2`, and `used_supabase` from `/api/aq/timeseries`.
+
 Tasks:
 
 1. Add a source-routing function with clear inputs and outputs.

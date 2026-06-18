@@ -1,5 +1,5 @@
 import {
-  classifyTimeseriesV2SourceRoute,
+  buildMissingDaySlices,
   computeCoverageFromRows,
   computeNextSince,
   detectGapRanges,
@@ -7,6 +7,7 @@ import {
   mergeSlices,
   normalizeObservedRow,
   resolveTimeseriesWindowBounds,
+  subtractCoveredTailInterval,
 } from "./timeseries_v2_stitch.mjs";
 
 export interface Env {
@@ -292,9 +293,6 @@ type TimeseriesV2CanonicalizeResult = {
 
 type TimeseriesV2EnvelopeMeta = {
   source_mode: string;
-  used_r2?: boolean;
-  used_supabase?: boolean;
-  source_routing_decision?: Record<string, unknown>;
   r2_coverage_start?: string | null;
   r2_coverage_end: string | null;
   ingest_tail_start: string | null;
@@ -1703,7 +1701,7 @@ function applySinceOverlap(sinceIso: string | null, overlapMinutes: number, lowe
 }
 
 function buildTimeseriesV2CacheControl(sourceMode: string, runtime: TimeseriesV2RuntimeConfig): string {
-  const isHistorical = sourceMode === "r2_only" || sourceMode === "history_only";
+  const isHistorical = sourceMode === "r2_only";
   const browserTtl = isHistorical ? runtime.historicalBrowserTtlSeconds : runtime.recentBrowserTtlSeconds;
   const edgeTtl = isHistorical ? runtime.historicalEdgeTtlSeconds : runtime.recentEdgeTtlSeconds;
   const swr = isHistorical ? runtime.historicalSwrSeconds : runtime.recentSwrSeconds;
@@ -1842,31 +1840,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
   const requestEndUtc = toIsoSafe(requestWindow.requestEndMs);
   const windowLabelForGapDetection = requestWindow.normalizedWindowLabel
     || String(requestUrl.searchParams.get("window") || "explicit");
-  const sourceRoute = classifyTimeseriesV2SourceRoute({
-    requestStartMs: requestWindow.requestStartMs,
-    requestEndMs: requestWindow.requestEndMs,
-    recentBoundaryMs: Date.now() - runtime.maxSupabaseTailHours * HOUR_MS,
-  }) as {
-    sourceMode: "history_only" | "recent_only" | "recent_history_stitched";
-    usedR2: boolean;
-    usedSupabase: boolean;
-    r2StartMs: number | null;
-    r2EndMs: number | null;
-    ingestStartMs: number | null;
-    ingestEndMs: number | null;
-    recentBoundaryMs: number;
-  };
-  const debugRouting = parseBooleanFlag(String(requestUrl.searchParams.get("debug") ?? "false"));
-  const sourceRoutingDecision = {
-    source_mode: sourceRoute.sourceMode,
-    used_r2: sourceRoute.usedR2,
-    used_supabase: sourceRoute.usedSupabase,
-    recent_boundary_utc: new Date(sourceRoute.recentBoundaryMs).toISOString(),
-    r2_start_utc: sourceRoute.r2StartMs === null ? null : new Date(sourceRoute.r2StartMs).toISOString(),
-    r2_end_utc: sourceRoute.r2EndMs === null ? null : new Date(sourceRoute.r2EndMs).toISOString(),
-    ingest_start_utc: sourceRoute.ingestStartMs === null ? null : new Date(sourceRoute.ingestStartMs).toISOString(),
-    ingest_end_utc: sourceRoute.ingestEndMs === null ? null : new Date(sourceRoute.ingestEndMs).toISOString(),
-  };
 
   if (!flags.r2First || !deps.r2HistoryApiUrl) {
     const originPayload = await fetchTimeseriesOriginPayload(
@@ -1883,42 +1856,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
     return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
   }
 
-  if (sourceRoute.sourceMode === "recent_only") {
-    const originPayload = await fetchTimeseriesOriginPayload(
-      deps.supabaseUrl,
-      deps.supabasePublishableKey,
-      deps.upstreamAuthSecret,
-      {
-        timeseriesId: requestWindow.timeseriesId,
-        startUtc: requestStartUtc,
-        endUtc: requestEndUtc,
-        sinceUtc: requestWindow.requestSinceIso,
-      },
-    );
-    const fallback = buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus, "recent_only");
-    fallback.meta.source_mode = "recent_only";
-    fallback.meta.used_r2 = false;
-    fallback.meta.used_supabase = true;
-    fallback.meta.r2_row_count = 0;
-    if (debugRouting) {
-      fallback.meta.source_routing_decision = sourceRoutingDecision;
-    }
-    const envelopeMeta = (fallback.envelope.meta && typeof fallback.envelope.meta === "object"
-      ? fallback.envelope.meta as Record<string, unknown>
-      : {});
-    envelopeMeta.source_mode = "recent_only";
-    envelopeMeta.used_r2 = false;
-    envelopeMeta.used_supabase = true;
-    envelopeMeta.r2_row_count = 0;
-    if (debugRouting) {
-      envelopeMeta.source_routing_decision = sourceRoutingDecision;
-    }
-    fallback.envelope.meta = envelopeMeta;
-    fallback.sourceMode = "recent_only";
-    fallback.cacheControl = buildTimeseriesV2CacheControl("recent_only", runtime);
-    return fallback;
-  }
-
   const r2Errors: Array<string | Record<string, unknown>> = [];
   const ingestErrors: Array<string | Record<string, unknown>> = [];
   const partialReasons = new Set<string>();
@@ -1929,9 +1866,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
   let r2PagesFetched = 0;
   let r2HitPageLimit = false;
 
-  if (!sourceRoute.usedR2) {
-    // This branch is currently handled by the recent_only early return.
-  } else if (!requestWindow.pollutantKey) {
+  if (!requestWindow.pollutantKey) {
     r2Errors.push("pollutant_required_for_v2_r2");
     partialReasons.add("pollutant_required_for_v2_r2");
   } else {
@@ -1953,7 +1888,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
         const r2SinceUtc = applySinceOverlap(
           requestWindow.requestSinceIso,
           runtime.incrementalOverlapMinutes,
-          sourceRoute.r2StartMs ?? requestWindow.requestStartMs,
+          requestWindow.requestStartMs,
         );
         const r2Result = await fetchR2ObservationsPaged(
           deps.r2HistoryApiUrl,
@@ -1962,8 +1897,8 @@ async function stitchTimeseriesV2FromR2AndIngest(
             timeseriesId: requestWindow.timeseriesId,
             connectorId,
             pollutantKey: requestWindow.pollutantKey,
-            startUtc: toIsoSafe(sourceRoute.r2StartMs ?? requestWindow.requestStartMs),
-            endUtc: toIsoSafe(sourceRoute.r2EndMs ?? requestWindow.requestEndMs),
+            startUtc: requestStartUtc,
+            endUtc: requestEndUtc,
             sinceUtc: r2SinceUtc,
             pageLimitRows: runtime.maxR2ObjectsPerRequest,
             maxPages: TIMESERIES_V2_MAX_R2_PAGES_PER_REQUEST,
@@ -2020,16 +1955,32 @@ async function stitchTimeseriesV2FromR2AndIngest(
     }
   }
 
-  if (sourceRoute.usedSupabase && sourceRoute.ingestStartMs !== null && sourceRoute.ingestEndMs !== null) {
-    addIngestSlice(
-      sourceRoute.ingestStartMs,
-      sourceRoute.ingestEndMs,
-      sourceRoute.sourceMode === "recent_history_stitched" ? "source_route_recent_tail" : "source_route_recent_window",
+  if (r2Rows.length > 0) {
+    const tail = subtractCoveredTailInterval(
+      requestWindow.requestStartMs,
+      requestWindow.requestEndMs,
+      r2CoverageEnd,
     );
-  }
+    addIngestSlice(tail.tailStartMs, tail.tailEndMs, "r2_tail_gap");
 
-  if (!sourceRoute.usedSupabase && r2Rows.length === 0) {
-    partialReasons.add(r2Errors.length ? "r2_unavailable_history_only" : "r2_empty_history_only");
+    const missingKeys = [
+      ...asArrayOfStrings(r2Coverage?.missing_day_manifest_keys),
+      ...asArrayOfStrings(r2Coverage?.missing_connector_manifest_keys),
+      ...asArrayOfStrings(r2Coverage?.missing_parquet_keys),
+    ];
+    for (const slice of buildMissingDaySlices(
+      missingKeys,
+      requestWindow.requestStartMs,
+      requestWindow.requestEndMs,
+    )) {
+      addIngestSlice(slice.startMs, slice.endMs, slice.reason || "r2_missing_slice");
+    }
+  } else {
+    addIngestSlice(
+      requestWindow.requestStartMs,
+      requestWindow.requestEndMs,
+      r2Errors.length ? "r2_unavailable" : "r2_empty",
+    );
   }
 
   const mergedIngestSlices = mergeSlices(ingestSlices);
@@ -2093,17 +2044,20 @@ async function stitchTimeseriesV2FromR2AndIngest(
     partialReasons.add("detected_gap");
   }
 
-  const sourceMode = sourceRoute.sourceMode;
+  let sourceMode = "ingest_only_fallback";
+  if (r2Rows.length > 0 && ingestRows.length === 0) {
+    sourceMode = "r2_only";
+  } else if (r2Rows.length > 0 && ingestRows.length > 0) {
+    const hasRepairs = mergedIngestSlices.some((slice) => slice.reason !== "r2_tail_gap");
+    sourceMode = hasRepairs ? "r2_plus_ingest_tail_and_repairs" : "r2_plus_ingest_tail";
+  } else if (r2Rows.length === 0 && r2Errors.length > 0) {
+    sourceMode = "ingest_only_on_r2_error";
+  }
 
   const responseComplete = partialReasons.size === 0 && !r2HitPageLimit && ingestErrors.length === 0;
   const nextSince = computeNextSince(merged.merged, requestWindow.requestSinceIso) as string | null;
-  const usedSupabase = mergedIngestSlices.length > 0
-    || sourceRoute.usedSupabase
-    || connectorIdSource === "supabase_lookup";
   const meta: TimeseriesV2EnvelopeMeta = {
     source_mode: sourceMode,
-    used_r2: sourceRoute.usedR2,
-    used_supabase: usedSupabase,
     r2_coverage_start: r2CoverageStart,
     r2_coverage_end: r2CoverageEnd,
     ingest_tail_start: mergedIngestSlices.length ? new Date(mergedIngestSlices[0].startMs).toISOString() : null,
@@ -2122,9 +2076,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
     ingest_errors: ingestErrors,
     cache_status: cacheStatus,
   };
-  if (debugRouting) {
-    meta.source_routing_decision = sourceRoutingDecision;
-  }
 
   const envelope = {
     schema_version: 2,
@@ -2144,8 +2095,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
       connector_id: connectorId,
       connector_id_source: connectorIdSource,
       used_supabase_connector_lookup: connectorIdSource === "supabase_lookup",
-      used_r2: sourceRoute.usedR2,
-      used_supabase: usedSupabase,
       pollutant: requestWindow.pollutantKey,
       partial_reasons: Array.from(partialReasons),
       r2_pages_fetched: r2PagesFetched,
@@ -2156,7 +2105,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
         reason: slice.reason,
       })),
       skipped_ingest_slices: skippedIngestSlices,
-      ...(debugRouting ? { source_routing_decision: sourceRoutingDecision } : {}),
     },
     data_format: "objects",
     columns: ["observed_at", "value"],
@@ -2993,12 +2941,6 @@ export default {
       responseHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
       responseHeaders.set("X-UK-AQ-Timeseries-Cacheable", String(timeseriesResponseCacheable));
       responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", stitched.meta.source_mode);
-      if (stitched.meta.used_r2 !== undefined) {
-        responseHeaders.set("X-UK-AQ-Used-R2", String(stitched.meta.used_r2));
-      }
-      if (stitched.meta.used_supabase !== undefined) {
-        responseHeaders.set("X-UK-AQ-Used-Supabase", String(stitched.meta.used_supabase));
-      }
       if (stitched.meta.response_complete !== undefined && stitched.meta.response_complete !== null) {
         responseHeaders.set("X-UK-AQ-Response-Complete", String(stitched.meta.response_complete));
       }
