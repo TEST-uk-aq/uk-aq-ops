@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
 
 import {
   buildMissingDaySlices,
@@ -169,17 +168,4 @@ test("source routing classifies boundary-crossing requests as stitched", () => {
   assert.equal(route.usedSupabase, true);
   assert.equal(route.r2EndMs, boundaryMs);
   assert.equal(route.ingestStartMs, boundaryMs);
-});
-
-test("cache proxy tries R2 timeseries metadata before Supabase connector lookup", () => {
-  const source = fs.readFileSync("workers/uk_aq_cache_proxy/src/index.ts", "utf8");
-  const r2LookupPos = source.indexOf("loadTimeseriesMetadataFromR2(");
-  const supabaseLookupPos = source.indexOf("loadTimeseriesConnectorId(");
-  const r2CallPos = source.indexOf("r2TimeseriesMetadata = await loadTimeseriesMetadataFromR2(");
-  const supabaseCallPos = source.indexOf("connectorId = await loadTimeseriesConnectorId(");
-  assert.ok(r2LookupPos > 0);
-  assert.ok(supabaseLookupPos > 0);
-  assert.ok(r2CallPos > 0);
-  assert.ok(supabaseCallPos > 0);
-  assert.ok(r2CallPos < supabaseCallPos);
 });

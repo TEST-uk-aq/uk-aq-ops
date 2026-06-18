@@ -1,11 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildHistoryV2TimeseriesMetadataIndexPayload,
   buildHistoryV2TimeseriesPollutantIndexPayload,
   buildR2HistoryObservationsTimeseriesConnectorIndexKey,
   buildR2HistoryObservationsTimeseriesLatestKey,
-  buildR2HistoryV2TimeseriesMetadataIndexKey,
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey,
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
   buildR2HistoryV2ObservationsTimeseriesLatestKey,
@@ -250,10 +248,6 @@ test("v2 timeseries index keys include day, connector, and pollutant without alt
     ),
     "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-04-03/connector_id=396/pollutant_code=pm25/manifest.json",
   );
-  assert.equal(
-    buildR2HistoryV2TimeseriesMetadataIndexKey("history/_index_v2/timeseries", 3742),
-    "history/_index_v2/timeseries/timeseries_id=3742.json",
-  );
 });
 
 test("buildHistoryV2TimeseriesPollutantIndexPayload builds observation pollutant index metadata", () => {
@@ -382,73 +376,5 @@ test("v2 pollutant index payload is byte-stable when source backed_up_at_utc is 
     generatedAt: "2026-06-02T00:00:00.000Z",
   }));
 
-  assert.equal(first, second);
-});
-
-test("buildHistoryV2TimeseriesMetadataIndexPayload merges observations and AQI coverage", () => {
-  const payload = buildHistoryV2TimeseriesMetadataIndexPayload({
-    timeseriesId: 3742,
-    generatedAt: "2026-06-18T10:00:00.000Z",
-    entries: [
-      {
-        domain: "observations",
-        day_utc: "2026-06-05",
-        connector_id: 6,
-        pollutant_code: "pm25",
-        row_count: 24,
-        min_observed_at_utc: "2026-06-05T00:00:00.000Z",
-        max_observed_at_utc: "2026-06-05T23:00:00.000Z",
-        source_index_key: "history/_index_v2/observations_timeseries/day_utc=2026-06-05/connector_id=6/pollutant_code=pm25/manifest.json",
-        source_manifest_hash: "obs-hash",
-        backed_up_at_utc: "2026-06-15T11:26:10.267Z",
-      },
-      {
-        domain: "aqilevels",
-        day_utc: "2026-06-05",
-        connector_id: 6,
-        pollutant_code: "pm25",
-        row_count: 24,
-        min_timestamp_hour_utc: "2026-06-05T00:00:00.000Z",
-        max_timestamp_hour_utc: "2026-06-05T23:00:00.000Z",
-        source_index_key: "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-05/connector_id=6/pollutant_code=pm25/manifest.json",
-        source_manifest_hash: "aqi-hash",
-        backed_up_at_utc: "2026-06-15T11:26:11.267Z",
-      },
-    ],
-  });
-
-  assert.equal(payload.index_kind, "timeseries_metadata");
-  assert.equal(payload.generated_at, "2026-06-15T11:26:11.267Z");
-  assert.equal(payload.connector_id, 6);
-  assert.deepEqual(payload.connector_ids, [6]);
-  assert.deepEqual(payload.pollutant_codes, ["pm25"]);
-  assert.equal(payload.observations_coverage.row_count, 24);
-  assert.equal(payload.observations_coverage.first_observed_at_utc, "2026-06-05T00:00:00.000Z");
-  assert.equal(payload.aqi_coverage.row_count, 24);
-  assert.equal(payload.aqi_coverage.first_timestamp_hour_utc, "2026-06-05T00:00:00.000Z");
-});
-
-test("v2 timeseries metadata payload is byte-stable when source timestamps are unchanged", () => {
-  const args = {
-    timeseriesId: 3742,
-    entries: [
-      {
-        domain: "observations",
-        day_utc: "2026-06-05",
-        connector_id: 6,
-        pollutant_code: "pm25",
-        row_count: 24,
-        backed_up_at_utc: "2026-06-15T11:26:10.267Z",
-      },
-    ],
-  };
-  const first = JSON.stringify(buildHistoryV2TimeseriesMetadataIndexPayload({
-    ...args,
-    generatedAt: "2026-06-18T10:00:00.000Z",
-  }));
-  const second = JSON.stringify(buildHistoryV2TimeseriesMetadataIndexPayload({
-    ...args,
-    generatedAt: "2026-06-18T11:00:00.000Z",
-  }));
   assert.equal(first, second);
 });

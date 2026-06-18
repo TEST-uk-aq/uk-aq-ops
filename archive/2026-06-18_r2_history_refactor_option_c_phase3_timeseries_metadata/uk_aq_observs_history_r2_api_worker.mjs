@@ -6,7 +6,6 @@ const DEFAULT_HISTORY_V2_PREFIX = "history/v2/observations";
 const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
 const DEFAULT_HISTORY_V2_INDEX_PREFIX = "history/_index_v2";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "observations_timeseries";
-const DEFAULT_TIMESERIES_METADATA_INDEX_SUBPREFIX = "timeseries";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
@@ -15,7 +14,7 @@ const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const OBS_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
-const VALID_PATHS = new Set(["/", "/v1/observations", "/v1/timeseries-metadata"]);
+const VALID_PATHS = new Set(["/", "/v1/observations"]);
 
 function corsHeaders() {
   return {
@@ -568,35 +567,6 @@ function parseObservationsRequest(url) {
   };
 }
 
-function parseTimeseriesMetadataRequest(url) {
-  if (url.pathname !== "/v1/timeseries-metadata") {
-    return { ok: false, status: 404, error: "Not found." };
-  }
-  const timeseriesId = parseRequiredPositiveInt(url.searchParams.get("timeseries_id"));
-  if (!timeseriesId) {
-    return {
-      ok: false,
-      status: 400,
-      error: "timeseries_id must be a positive integer.",
-    };
-  }
-  return { ok: true, timeseriesId };
-}
-
-function resolveTimeseriesMetadataIndexPrefix(env) {
-  const historyIndexPrefix = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || DEFAULT_HISTORY_V2_INDEX_PREFIX,
-  ) || DEFAULT_HISTORY_V2_INDEX_PREFIX;
-  return normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX
-      || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_METADATA_INDEX_SUBPREFIX}`,
-  ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_METADATA_INDEX_SUBPREFIX}`;
-}
-
-function buildTimeseriesMetadataIndexKey(prefix, timeseriesId) {
-  return `${normalizePrefix(prefix)}/timeseries_id=${timeseriesId}.json`;
-}
-
 function buildCanonicalCacheKey(requestUrl, {
   timeseriesId,
   connectorId,
@@ -624,16 +594,6 @@ function buildCanonicalCacheKey(requestUrl, {
   if (limit !== null) {
     cacheUrl.searchParams.set("limit", String(limit));
   }
-  return new Request(cacheUrl.toString(), { method: "GET" });
-}
-
-function buildTimeseriesMetadataCacheKey(requestUrl, requestParams) {
-  const cacheUrl = new URL(requestUrl);
-  cacheUrl.pathname = "/v1/timeseries-metadata";
-  cacheUrl.search = "";
-  cacheUrl.hash = "";
-  cacheUrl.searchParams.set("timeseries_id", String(requestParams.timeseriesId));
-  cacheUrl.searchParams.set("__ukaq_observs_history_read_v", "v2");
   return new Request(cacheUrl.toString(), { method: "GET" });
 }
 
@@ -1261,37 +1221,6 @@ async function handleRequest(requestParams, env) {
   });
 }
 
-async function handleTimeseriesMetadataRequest(requestParams, env) {
-  const metadataIndexPrefix = resolveTimeseriesMetadataIndexPrefix(env);
-  const metadataKey = buildTimeseriesMetadataIndexKey(
-    metadataIndexPrefix,
-    requestParams.timeseriesId,
-  );
-  const object = await fetchJsonObjectFromR2(env, metadataKey);
-  if (!object.exists) {
-    return jsonResponse({
-      ok: false,
-      error: "timeseries_metadata_not_found",
-      timeseries_id: requestParams.timeseriesId,
-      metadata_index_prefix: metadataIndexPrefix,
-      metadata_key: metadataKey,
-    }, {
-      status: 404,
-      cacheSeconds: 60,
-    });
-  }
-  return jsonResponse({
-    ok: true,
-    timeseries_id: requestParams.timeseriesId,
-    metadata_index_prefix: metadataIndexPrefix,
-    metadata_key: metadataKey,
-    metadata: object.value,
-  }, {
-    status: 200,
-    cacheSeconds: DEFAULT_IMMUTABLE_CACHE_SECONDS,
-  });
-}
-
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
@@ -1317,26 +1246,6 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
-    if (requestUrl.pathname === "/v1/timeseries-metadata") {
-      const requestParams = parseTimeseriesMetadataRequest(requestUrl);
-      if (!requestParams.ok) {
-        return jsonResponse({ ok: false, error: requestParams.error }, {
-          status: requestParams.status,
-          cacheSeconds: 30,
-        });
-      }
-      const cacheKey = buildTimeseriesMetadataCacheKey(request.url, requestParams);
-      const cached = await caches.default.match(cacheKey);
-      if (cached) {
-        return withCacheMarker(cached, "HIT");
-      }
-      const response = await handleTimeseriesMetadataRequest(requestParams, env);
-      if (response.ok) {
-        ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
-      }
-      return withCacheMarker(response, "MISS");
-    }
-
     const requestParams = parseObservationsRequest(requestUrl);
     if (!requestParams.ok) {
       return jsonResponse({ ok: false, error: requestParams.error }, {

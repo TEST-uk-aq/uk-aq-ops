@@ -1452,66 +1452,6 @@ async function loadTimeseriesConnectorId(
   return Math.trunc(connectorId);
 }
 
-async function loadTimeseriesMetadataFromR2(
-  r2ApiUrl: string,
-  upstreamAuthSecret: string,
-  timeseriesId: number,
-): Promise<Record<string, unknown> | null> {
-  if (!r2ApiUrl || !upstreamAuthSecret) {
-    return null;
-  }
-  const endpoint = new URL(r2ApiUrl);
-  endpoint.pathname = "/v1/timeseries-metadata";
-  endpoint.search = "";
-  endpoint.searchParams.set("timeseries_id", String(timeseriesId));
-  let response: Response;
-  try {
-    response = await fetch(endpoint.toString(), {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        [UPSTREAM_AUTH_HEADER]: upstreamAuthSecret,
-      },
-    });
-  } catch (_err) {
-    return null;
-  }
-  if (response.status === 404) {
-    return null;
-  }
-  if (!response.ok) {
-    return null;
-  }
-  let payload: unknown;
-  try {
-    payload = await response.json();
-  } catch (_err) {
-    return null;
-  }
-  const record = payload && typeof payload === "object" && !Array.isArray(payload)
-    ? payload as Record<string, unknown>
-    : null;
-  const metadata = record?.metadata;
-  return metadata && typeof metadata === "object" && !Array.isArray(metadata)
-    ? metadata as Record<string, unknown>
-    : null;
-}
-
-function connectorIdFromTimeseriesMetadata(metadata: Record<string, unknown> | null): number | null {
-  const connectorId = Number(metadata?.connector_id);
-  if (Number.isFinite(connectorId) && connectorId > 0) {
-    return Math.trunc(connectorId);
-  }
-  const connectorIds = Array.isArray(metadata?.connector_ids) ? metadata.connector_ids : [];
-  if (connectorIds.length === 1) {
-    const onlyConnectorId = Number(connectorIds[0]);
-    if (Number.isFinite(onlyConnectorId) && onlyConnectorId > 0) {
-      return Math.trunc(onlyConnectorId);
-    }
-  }
-  return null;
-}
-
 async function fetchTimeseriesOriginPayload(
   supabaseUrl: string,
   supabasePublishableKey: string,
@@ -1983,8 +1923,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
   const ingestErrors: Array<string | Record<string, unknown>> = [];
   const partialReasons = new Set<string>();
   let connectorId: number | null = requestWindow.connectorId;
-  let connectorIdSource: "request" | "r2_metadata" | "supabase_lookup" | null = connectorId ? "request" : null;
-  let r2TimeseriesMetadata: Record<string, unknown> | null = null;
+  let connectorIdSource: "request" | "supabase_lookup" | null = connectorId ? "request" : null;
   let r2Rows: Array<Record<string, unknown>> = [];
   let r2Coverage: Record<string, unknown> | null = null;
   let r2PagesFetched = 0;
@@ -1996,17 +1935,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
     r2Errors.push("pollutant_required_for_v2_r2");
     partialReasons.add("pollutant_required_for_v2_r2");
   } else {
-    if (!connectorId) {
-      r2TimeseriesMetadata = await loadTimeseriesMetadataFromR2(
-        deps.r2HistoryApiUrl,
-        deps.upstreamAuthSecret,
-        requestWindow.timeseriesId,
-      );
-      connectorId = connectorIdFromTimeseriesMetadata(r2TimeseriesMetadata);
-      if (connectorId) {
-        connectorIdSource = "r2_metadata";
-      }
-    }
     if (!connectorId) {
       connectorId = await loadTimeseriesConnectorId(
         deps.supabaseUrl,
@@ -2215,8 +2143,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
       coverage: r2Coverage,
       connector_id: connectorId,
       connector_id_source: connectorIdSource,
-      used_r2_timeseries_metadata_lookup: connectorIdSource === "r2_metadata",
-      r2_timeseries_metadata: debugRouting ? r2TimeseriesMetadata : null,
       used_supabase_connector_lookup: connectorIdSource === "supabase_lookup",
       used_r2: sourceRoute.usedR2,
       used_supabase: usedSupabase,

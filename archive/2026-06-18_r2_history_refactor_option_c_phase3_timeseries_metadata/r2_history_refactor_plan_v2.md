@@ -1077,15 +1077,6 @@ Acceptance:
 5. No v1-style root files added to `_index_v2`.
 6. Re-running the metadata index builder without source-data changes produces byte-identical metadata payloads.
 
-Implementation notes:
-
-- Existing `_index_v2` manifests were found to contain per-timeseries row counts, but only under day/connector/pollutant paths. They are not a direct `timeseries_id -> connector_id` lookup, so using them at request time would require broad manifest scans.
-- The refactor therefore adds direct metadata objects at `history/_index_v2/timeseries/timeseries_id=<id>.json`.
-- The metadata objects are generated from existing v2 observations and AQI timeseries index manifests, not from raw data and not from wall-clock timestamps.
-- Caller-supplied `connector_id` remains the first path. The R2 metadata resolver only runs when older callers omit `connector_id`.
-- The observations history R2 API exposes a protected `/v1/timeseries-metadata?timeseries_id=<id>` route using the same upstream secret as `/v1/observations`.
-- The cache proxy tries R2 metadata before the Supabase compatibility lookup and reports `connector_id_source` as `request`, `r2_metadata`, or `supabase_lookup`.
-
 ### VS Code Codex prompt for Phase 3
 
 ```text

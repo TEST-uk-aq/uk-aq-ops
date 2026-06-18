@@ -8,6 +8,12 @@
 
 - Route-shape follow-up (Option 3 after Option 2 baseline): split cache profiles into `/api/aq/meta/*` (long TTL) and `/api/aq/realtime/*` (short TTL). Use `realtime` naming (not `live`) to avoid confusion with test/live environments.
 
+## Network Data Feed Down Message
+
+- Badge: Network feed offline
+
+- Tooltip / small helper text: We are not receiving data from this network at the moment. The map will update when the feed is restored.
+
 ## Networks to add
 
 - Add SaddleSense London cycling network.

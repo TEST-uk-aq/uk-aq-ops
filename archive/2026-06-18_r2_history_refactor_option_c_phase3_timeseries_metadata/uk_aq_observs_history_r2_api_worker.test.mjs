@@ -76,17 +76,6 @@ function observationRequest(extraParams = "") {
   );
 }
 
-function metadataRequest(timeseriesId = 3742) {
-  return new Request(
-    `https://example.test/v1/timeseries-metadata?timeseries_id=${timeseriesId}`,
-    {
-      headers: {
-        "x-uk-aq-upstream-auth": "test-upstream-secret",
-      },
-    },
-  );
-}
-
 test("observations Worker v1 default uses configured v1 prefix and v1 index", async () => {
   const harness = installHarness({});
   try {
@@ -200,40 +189,6 @@ test("observations Worker v2 reads pollutant index path and reports missing parq
     assert.equal(payload.coverage.parquet_matched_rows, 0);
     assert.deepEqual(harness.getKeys, [indexKey, parquetKey]);
     assert.equal(harness.getKeys.some((key) => key.includes("history/v1/observations")), false);
-  } finally {
-    await harness.restore();
-  }
-});
-
-test("observations Worker serves protected v2 timeseries metadata index", async () => {
-  const metadataKey = "history/_index_v2/timeseries/timeseries_id=3742.json";
-  const harness = installHarness({
-    [metadataKey]: makeJsonR2Object({
-      schema_version: 1,
-      index_kind: "timeseries_metadata",
-      history_version: "v2",
-      timeseries_id: 3742,
-      connector_id: 6,
-      connector_ids: [6],
-      pollutant_codes: ["pm25"],
-      observations_coverage: { row_count: 10 },
-      aqi_coverage: { row_count: 8 },
-    }),
-  });
-
-  try {
-    const response = await observsHistoryWorker.fetch(
-      metadataRequest(),
-      harness.env,
-      harness.ctx,
-    );
-
-    assert.equal(response.status, 200);
-    const payload = await response.json();
-    assert.equal(payload.ok, true);
-    assert.equal(payload.metadata_key, metadataKey);
-    assert.equal(payload.metadata.connector_id, 6);
-    assert.deepEqual(harness.getKeys, [metadataKey]);
   } finally {
     await harness.restore();
   }
