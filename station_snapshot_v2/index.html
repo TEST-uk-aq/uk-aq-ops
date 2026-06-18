@@ -22,6 +22,12 @@ function selectedTimeseriesMeta(){
   const list=station&&Array.isArray(station.timeseries)?station.timeseries:[];
   return list.find(t=>String(t.timeseries_id)===String(tsValue))||station?.selected_timeseries||null;
 }
+function rangeBoundsUtc(){
+  const hours={24h:24,7d:7*24,31d:31*24,90d:90*24}[range]||24;
+  const end=new Date();
+  const start=new Date(end.getTime()-hours*60*60*1000);
+  return {start_utc:start.toISOString(),end_utc:end.toISOString()};
+}
 function renderHeader(){
   head.innerHTML=cols.map((c,i)=>{
     if(keys[i]==='observed_at'){
@@ -169,7 +175,8 @@ async function loadRows(){
   try{
     const ts=document.getElementById('ts').value;
     const tsMeta=selectedTimeseriesMeta();
-    const qs=new URLSearchParams({station_id:station.station_id,pollutant,range,debug:'1'});
+    const bounds=rangeBoundsUtc();
+    const qs=new URLSearchParams({station_id:station.station_id,pollutant,range,start_utc:bounds.start_utc,end_utc:bounds.end_utc,debug:'1'});
     if(ts)qs.set('timeseries_id',ts);
     const connectorId=tsMeta?.connector_id??station.selected_timeseries_connector_id??station.connector_id;
     const stationRef=tsMeta?.station_ref??station.station_ref;

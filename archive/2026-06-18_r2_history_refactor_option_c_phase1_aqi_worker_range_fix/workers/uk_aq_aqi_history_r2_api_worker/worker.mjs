@@ -2022,22 +2022,6 @@ async function handleRequest(request, env, ctx) {
     }, { status: 400, cacheSeconds: 30 });
   }
 
-  const requestedConnectorId = parseRequiredPositiveInt(url.searchParams.get("connector_id"));
-  if (url.searchParams.has("connector_id") && !requestedConnectorId) {
-    return jsonResponse({
-      ok: false,
-      error: "connector_id must be a positive integer when provided.",
-    }, { status: 400, cacheSeconds: 30 });
-  }
-
-  const requestedStationId = parseRequiredPositiveInt(url.searchParams.get("station_id"));
-  if (url.searchParams.has("station_id") && !requestedStationId) {
-    return jsonResponse({
-      ok: false,
-      error: "station_id must be a positive integer when provided.",
-    }, { status: 400, cacheSeconds: 30 });
-  }
-
   const requestedPollutant = url.searchParams.has("pollutant")
     ? normalizeAqiPollutant(url.searchParams.get("pollutant"))
     : null;
@@ -2178,8 +2162,8 @@ async function handleRequest(request, env, ctx) {
   let windowContextLookupError = null;
   let windowContextLookupCacheHit = false;
   let windowContextLookupAttempted = false;
-  let targetConnectorId = requestedConnectorId || null;
-  let targetStationId = requestedStationId || null;
+  let targetConnectorId = null;
+  let targetStationId = null;
   let targetTimeseriesIds = [timeseriesId];
 
   const resolveTimeseriesWindowContext = async () => {
@@ -2200,8 +2184,8 @@ async function handleRequest(request, env, ctx) {
       });
       windowContextSourcePath = lookup.source_path;
       windowContextLookupCacheHit = lookup.cache_hit;
-      targetConnectorId = parseRequiredPositiveInt(lookup.connector_id) || targetConnectorId;
-      targetStationId = parseRequiredPositiveInt(lookup.station_id) || targetStationId;
+      targetConnectorId = parseRequiredPositiveInt(lookup.connector_id);
+      targetStationId = parseRequiredPositiveInt(lookup.station_id);
       const windowTimeseriesIds = Array.isArray(lookup.timeseries_ids)
         ? lookup.timeseries_ids
           .map((value) => parseRequiredPositiveInt(value))
@@ -2212,8 +2196,8 @@ async function handleRequest(request, env, ctx) {
         : [timeseriesId];
     } catch (error) {
       windowContextLookupError = error instanceof Error ? error.message : String(error);
-      targetConnectorId = requestedConnectorId || null;
-      targetStationId = requestedStationId || null;
+      targetConnectorId = null;
+      targetStationId = null;
       targetTimeseriesIds = [timeseriesId];
     }
 

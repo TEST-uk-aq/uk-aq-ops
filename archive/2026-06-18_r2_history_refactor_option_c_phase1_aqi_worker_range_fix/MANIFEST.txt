@@ -1,0 +1,5 @@
+Archive snapshot before AQI R2 Worker connector_id fix and Snapshot v2 range fix.
+Created: 2026-06-18
+Files:
+workers/uk_aq_aqi_history_r2_api_worker/worker.mjs
+/Users/mikehinford/Dropbox/Projects/CIC Website/ChronicChannel-Test Root Repo/ChronicChannel-test.github.io/serve.py

@@ -157,6 +157,8 @@ test("worker source uses the normalized hourly AQI response contract", () => {
   assert.match(workerSource, /UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST/);
   assert.match(workerSource, /max_parquet_chunks_budget_exceeded/);
   assert.match(workerSource, /aqi_history_request/);
+  assert.match(workerSource, /const requestedConnectorId = parseRequiredPositiveInt\(url\.searchParams\.get\("connector_id"\)\)/);
+  assert.match(workerSource, /targetConnectorId = requestedConnectorId \|\| null/);
   assert.doesNotMatch(
     workerSource,
     /daqi_no2_index_level|daqi_pm25_rolling24h_index_level|daqi_pm10_rolling24h_index_level|eaqi_no2_index_level|eaqi_pm25_index_level|eaqi_pm10_index_level/,
