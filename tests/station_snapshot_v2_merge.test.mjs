@@ -23,7 +23,7 @@ test('station_snapshot_v2 merge logic covers source values, overlap, -99, and AQ
       { observed_at: '2026-06-17T08:00:00Z', hourly_mean_ugm3: 11, rolling24h_mean_ugm3: 10, hourly_sample_count: 3, daqi_index_level: 2, eaqi_index_level: 1 },
       { observed_at: '2026-06-17T07:00:00Z', hourly_sample_count: 1 },
     ],
-    r2Aqi: [{ observed_at: '2026-06-17T08:00:00Z', hourly_mean_ugm3: 12, rolling24h_mean_ugm3: 9, hourly_sample_count: 4, daqi_index_level: 3, eaqi_index_level: 2 }],
+    r2Aqi: [{ observed_at: '2026-06-17T08:00:00Z', source: 'r2', hourly_mean_ugm3: 12, rolling24h_mean_ugm3: 9, hourly_sample_count: 4, daqi_index_level: 3, eaqi_index_level: 2 }],
   });
   assert.equal(result.overlap_detected, true);
   const exact = result.rows.find((row) => row.observed_at === '2026-06-17T08:15:00.000Z');
@@ -38,7 +38,7 @@ test('station_snapshot_v2 merge logic covers source values, overlap, -99, and AQ
   assert.equal(obsExact.aqi_source, 'R2 History');
   const minus = result.rows.find((row) => row.observed_at === '2026-06-17T07:00:00.000Z');
   assert.equal(minus.ingestdb_observs_value, -99);
-  assert.equal(minus.aqi_source, 'obsaqidb');
+  assert.equal(minus.aqi_source, 'ObsAQIDB');
   assert.equal(minus.daqi_colour, null);
   const r2Only = result.rows.find((row) => row.observed_at === '2026-06-17T06:00:00.000Z');
   assert.equal(r2Only.r2_observs_value, 14);
