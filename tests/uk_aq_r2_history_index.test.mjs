@@ -13,6 +13,7 @@ import {
   buildDaySummaryFromManifest,
   buildDomainIndexPayload,
   normalizeR2HistoryIndexDomain,
+  rebuildR2HistoryV2TimeseriesMetadataIndexes,
   resolveR2HistoryIndexConfig,
 } from "../workers/shared/uk_aq_r2_history_index.mjs";
 
@@ -451,4 +452,184 @@ test("v2 timeseries metadata payload is byte-stable when source timestamps are u
     generatedAt: "2026-06-18T11:00:00.000Z",
   }));
   assert.equal(first, second);
+});
+
+function installFakeR2Fetch(objectsByKey) {
+  const originalFetch = globalThis.fetch;
+  const puts = new Map();
+  function keyFromUrl(url) {
+    const parsed = new URL(url);
+    const path = decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
+    const prefix = "test-bucket/";
+    return path.startsWith(prefix) ? path.slice(prefix.length) : path;
+  }
+  globalThis.fetch = async (url, init = {}) => {
+    const method = String(init.method || "GET").toUpperCase();
+    const key = keyFromUrl(String(url));
+    if (method === "GET") {
+      if (!Object.prototype.hasOwnProperty.call(objectsByKey, key)) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(`${JSON.stringify(objectsByKey[key])}\n`, {
+        status: 200,
+        headers: { etag: `"${key.length.toString(16)}"` },
+      });
+    }
+    if (method === "HEAD") {
+      return new Response(null, { status: 404 });
+    }
+    if (method === "PUT") {
+      puts.set(key, String(init.body || ""));
+      return new Response("", { status: 200, headers: { etag: `"put-${puts.size}"` } });
+    }
+    return new Response("unsupported", { status: 405 });
+  };
+  return {
+    puts,
+    restore() {
+      globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+test("v2 timeseries metadata rebuild skips absent connector pollutant partitions without warnings", async () => {
+  const objects = {
+    "history/_index_v2/observations_timeseries_latest.json": {
+      day_summaries: [
+        {
+          day_utc: "2026-03-18",
+          connector_ids: [3],
+          pollutant_codes: ["no2", "pm10", "pm25"],
+        },
+      ],
+    },
+    "history/v2/observations/day_utc=2026-03-18/manifest.json": {
+      connector_manifests: [
+        {
+          connector_id: 3,
+          manifest_key: "history/v2/observations/day_utc=2026-03-18/connector_id=3/manifest.json",
+        },
+      ],
+    },
+    "history/v2/observations/day_utc=2026-03-18/connector_id=3/manifest.json": {
+      pollutant_manifests: [
+        {
+          pollutant_code: "no2",
+          manifest_key: "history/v2/observations/day_utc=2026-03-18/connector_id=3/pollutant_code=no2/manifest.json",
+        },
+        {
+          pollutant_code: "pm25",
+          manifest_key: "history/v2/observations/day_utc=2026-03-18/connector_id=3/pollutant_code=pm25/manifest.json",
+        },
+      ],
+    },
+    "history/v2/observations/day_utc=2026-03-18/connector_id=3/pollutant_code=no2/manifest.json": {
+      manifest_hash: "obs-no2",
+      backed_up_at_utc: "2026-03-19T00:00:00.000Z",
+    },
+    "history/v2/observations/day_utc=2026-03-18/connector_id=3/pollutant_code=pm25/manifest.json": {
+      manifest_hash: "obs-pm25",
+      backed_up_at_utc: "2026-03-19T00:00:00.000Z",
+    },
+    "history/_index_v2/observations_timeseries/day_utc=2026-03-18/connector_id=3/pollutant_code=no2/manifest.json": {
+      domain: "observations",
+      day_utc: "2026-03-18",
+      connector_id: 3,
+      pollutant_code: "no2",
+      timeseries_row_counts: { "3001": 24 },
+      backed_up_at_utc: "2026-03-19T00:00:00.000Z",
+    },
+    "history/_index_v2/observations_timeseries/day_utc=2026-03-18/connector_id=3/pollutant_code=pm25/manifest.json": {
+      domain: "observations",
+      day_utc: "2026-03-18",
+      connector_id: 3,
+      pollutant_code: "pm25",
+      timeseries_row_counts: { "3742": 24 },
+      backed_up_at_utc: "2026-03-19T00:00:00.000Z",
+    },
+    "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": {
+      day_summaries: [
+        {
+          day_utc: "2026-06-12",
+          connector_ids: [7],
+          pollutant_codes: ["no2", "pm10", "pm25"],
+        },
+      ],
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/manifest.json": {
+      connector_manifests: [
+        {
+          connector_id: 7,
+          manifest_key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/connector_id=7/manifest.json",
+        },
+      ],
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/connector_id=7/manifest.json": {
+      pollutant_manifests: [
+        {
+          pollutant_code: "pm10",
+          manifest_key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/connector_id=7/pollutant_code=pm10/manifest.json",
+        },
+        {
+          pollutant_code: "pm25",
+          manifest_key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/connector_id=7/pollutant_code=pm25/manifest.json",
+        },
+      ],
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/connector_id=7/pollutant_code=pm10/manifest.json": {
+      manifest_hash: "aqi-pm10",
+      backed_up_at_utc: "2026-06-13T00:00:00.000Z",
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/connector_id=7/pollutant_code=pm25/manifest.json": {
+      manifest_hash: "aqi-pm25",
+      backed_up_at_utc: "2026-06-13T00:00:00.000Z",
+    },
+    "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-12/connector_id=7/pollutant_code=pm10/manifest.json": {
+      domain: "aqilevels",
+      day_utc: "2026-06-12",
+      connector_id: 7,
+      pollutant_code: "pm10",
+      timeseries_row_counts: { "7001": 24 },
+      backed_up_at_utc: "2026-06-13T00:00:00.000Z",
+    },
+    "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-12/connector_id=7/pollutant_code=pm25/manifest.json": {
+      domain: "aqilevels",
+      day_utc: "2026-06-12",
+      connector_id: 7,
+      pollutant_code: "pm25",
+      timeseries_row_counts: { "7002": 24 },
+      backed_up_at_utc: "2026-06-13T00:00:00.000Z",
+    },
+  };
+  const fakeFetch = installFakeR2Fetch(objects);
+  try {
+    const summary = await rebuildR2HistoryV2TimeseriesMetadataIndexes({
+      r2: {
+        endpoint: "https://r2.example.test",
+        bucket: "test-bucket",
+        region: "auto",
+        access_key_id: "test-key",
+        secret_access_key: "test-secret",
+      },
+      bucketName: "test-bucket",
+      fetchConcurrency: 4,
+    });
+
+    assert.equal(summary.warning_count, 0);
+    assert.equal(summary.actual_index_manifest_count, 4);
+    assert.equal(summary.metadata_object_count, 4);
+    assert.equal(summary.skipped_absent_data_partition_count, 2);
+    assert.equal(summary.missing_index_for_existing_data_partition_count, 0);
+    assert.equal(summary.observations.actual_index_manifest_count, 2);
+    assert.equal(summary.observations.skipped_absent_data_partition_count, 1);
+    assert.equal(summary.aqilevels.actual_index_manifest_count, 2);
+    assert.equal(summary.aqilevels.skipped_absent_data_partition_count, 1);
+    assert.equal(
+      summary.warnings.some((warning) => warning.includes("pollutant_code=pm10")),
+      false,
+    );
+    assert.ok(fakeFetch.puts.has("history/_index_v2/timeseries/timeseries_id=3742.json"));
+  } finally {
+    fakeFetch.restore();
+  }
 });

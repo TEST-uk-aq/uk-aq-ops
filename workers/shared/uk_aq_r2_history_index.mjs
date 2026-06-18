@@ -2007,10 +2007,28 @@ function resolveHistoryV2LatestPollutantIndexTargets({
   return targets;
 }
 
+function buildHistoryV2TimeseriesIndexKeyForDomain(domain, timeseriesIndexPrefix, target) {
+  return domain === "observations"
+    ? buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
+      timeseriesIndexPrefix,
+      target.day_utc,
+      target.connector_id,
+      target.pollutant_code,
+    )
+    : buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
+      timeseriesIndexPrefix,
+      target.day_utc,
+      target.connector_id,
+      target.pollutant_code,
+    );
+}
+
 export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
   r2,
   bucketName,
   indexPrefix = DEFAULT_R2_HISTORY_V2_INDEX_PREFIX,
+  observationsDataPrefix = DEFAULT_R2_HISTORY_V2_OBSERVATIONS_PREFIX,
+  aqilevelsHourlyDataPrefix = DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX,
   observationsTimeseriesIndexPrefix = DEFAULT_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
   aqilevelsHourlyDataTimeseriesIndexPrefix =
     DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX,
@@ -2022,6 +2040,12 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
     throw new Error("Missing R2 config for R2 history v2 timeseries metadata index rebuild");
   }
   const normalizedIndexPrefix = normalizePrefix(indexPrefix || DEFAULT_R2_HISTORY_V2_INDEX_PREFIX);
+  const normalizedObservationsDataPrefix = normalizePrefix(
+    observationsDataPrefix || DEFAULT_R2_HISTORY_V2_OBSERVATIONS_PREFIX,
+  );
+  const normalizedAqiDataPrefix = normalizePrefix(
+    aqilevelsHourlyDataPrefix || DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX,
+  );
   const normalizedObservationsPrefix = normalizePrefix(
     observationsTimeseriesIndexPrefix || DEFAULT_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
   );
@@ -2035,25 +2059,108 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
   const warnings = [];
   const entriesByTimeseriesId = new Map();
 
-  async function collectDomain(domain, latestKey, timeseriesIndexPrefix) {
+  async function collectDomain(domain, latestKey, timeseriesIndexPrefix, dataPrefix) {
     const latestResult = await fetchJsonObjectFromR2IfExists(r2, latestKey);
     if (!latestResult.exists) {
       warnings.push(`Skipped missing ${domain} v2 timeseries latest index: ${latestKey}`);
-      return { domain, latest_key: latestKey, target_count: 0, index_count: 0 };
+      return {
+        domain,
+        latest_key: latestKey,
+        potential_grid_target_count: 0,
+        actual_data_partition_count: 0,
+        actual_index_manifest_count: 0,
+        skipped_absent_data_partition_count: 0,
+        missing_index_for_existing_data_partition_count: 0,
+      };
     }
-    const targets = resolveHistoryV2LatestPollutantIndexTargets({
+    const potentialTargets = resolveHistoryV2LatestPollutantIndexTargets({
       latestPayload: latestResult.payload,
       domain,
       timeseriesIndexPrefix,
     });
-    let indexCount = 0;
-    await mapWithConcurrency(targets, fetchConcurrency, async (target) => {
-      const result = await fetchJsonObjectFromR2IfExists(r2, target.key);
-      if (!result.exists) {
-        warnings.push(`Skipped missing ${domain} v2 timeseries index: ${target.key}`);
+    const potentialTargetKeys = new Set(potentialTargets.map((target) =>
+      `${target.day_utc}|${target.connector_id}|${target.pollutant_code}`
+    ));
+    const actualTargetsByKey = new Map();
+    const daySummaries = Array.isArray(latestResult.payload?.day_summaries)
+      ? latestResult.payload.day_summaries
+      : [];
+
+    await mapWithConcurrency(daySummaries, fetchConcurrency, async (summary) => {
+      const dayUtc = parseIsoDay(summary?.day_utc);
+      if (!dayUtc) return null;
+      const dayManifestKey = `${dataPrefix}/day_utc=${dayUtc}/manifest.json`;
+      const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
+      if (!dayManifestResult.exists) {
+        warnings.push(`Skipped missing ${domain} v2 data day manifest: ${dayManifestKey}`);
         return null;
       }
-      indexCount += 1;
+      const connectorTargets = resolveHistoryV2ConnectorManifestTargets(
+        dayManifestResult.payload,
+        dayUtc,
+        dataPrefix,
+      );
+      await mapWithConcurrency(connectorTargets, fetchConcurrency, async (connectorTarget) => {
+        const connectorManifestResult = await fetchJsonObjectFromR2IfExists(
+          r2,
+          connectorTarget.manifest_key,
+        );
+        if (!connectorManifestResult.exists) {
+          warnings.push(
+            `Skipped missing ${domain} v2 data connector manifest: ${connectorTarget.manifest_key}`,
+          );
+          return null;
+        }
+        const pollutantTargets = resolveHistoryV2PollutantManifestTargets(
+          connectorManifestResult.payload,
+          dayUtc,
+          connectorTarget.connector_id,
+          dataPrefix,
+        );
+        await mapWithConcurrency(pollutantTargets, fetchConcurrency, async (pollutantTarget) => {
+          const dataPartitionResult = await fetchJsonObjectFromR2IfExists(
+            r2,
+            pollutantTarget.manifest_key,
+          );
+          if (!dataPartitionResult.exists) {
+            return null;
+          }
+          const key = `${dayUtc}|${connectorTarget.connector_id}|${pollutantTarget.pollutant_code}`;
+          actualTargetsByKey.set(key, {
+            day_utc: dayUtc,
+            connector_id: connectorTarget.connector_id,
+            pollutant_code: pollutantTarget.pollutant_code,
+            data_manifest_key: pollutantTarget.manifest_key,
+            index_key: buildHistoryV2TimeseriesIndexKeyForDomain(domain, timeseriesIndexPrefix, {
+              day_utc: dayUtc,
+              connector_id: connectorTarget.connector_id,
+              pollutant_code: pollutantTarget.pollutant_code,
+            }),
+          });
+          return null;
+        });
+        return null;
+      });
+      return null;
+    });
+
+    const targets = Array.from(actualTargetsByKey.values()).sort((a, b) => {
+      if (a.day_utc !== b.day_utc) return a.day_utc.localeCompare(b.day_utc);
+      if (a.connector_id !== b.connector_id) return a.connector_id - b.connector_id;
+      return a.pollutant_code.localeCompare(b.pollutant_code);
+    });
+    let actualIndexManifestCount = 0;
+    let missingIndexForExistingDataPartitionCount = 0;
+    await mapWithConcurrency(targets, fetchConcurrency, async (target) => {
+      const result = await fetchJsonObjectFromR2IfExists(r2, target.index_key);
+      if (!result.exists) {
+        missingIndexForExistingDataPartitionCount += 1;
+        warnings.push(
+          `Skipped missing ${domain} v2 timeseries index for existing data partition: ${target.index_key}`,
+        );
+        return null;
+      }
+      actualIndexManifestCount += 1;
       const counts = normalizeTimeseriesRowCounts(result.payload?.timeseries_row_counts);
       if (!counts) {
         return null;
@@ -2061,7 +2168,7 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
       for (const timeseriesId of Object.keys(counts)) {
         const entry = extractHistoryV2TimeseriesMetadataEntry(result.payload, timeseriesId);
         if (!entry) continue;
-        entry.source_index_key = target.key;
+        entry.source_index_key = target.index_key;
         const key = String(parsePositiveId(timeseriesId));
         const current = entriesByTimeseriesId.get(key) || [];
         current.push(entry);
@@ -2069,18 +2176,36 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
       }
       return null;
     });
-    return { domain, latest_key: latestKey, target_count: targets.length, index_count: indexCount };
+    const actualTargetKeys = new Set(actualTargetsByKey.keys());
+    let skippedAbsentDataPartitionCount = 0;
+    for (const key of potentialTargetKeys) {
+      if (!actualTargetKeys.has(key)) {
+        skippedAbsentDataPartitionCount += 1;
+      }
+    }
+    return {
+      domain,
+      latest_key: latestKey,
+      potential_grid_target_count: potentialTargetKeys.size,
+      actual_data_partition_count: targets.length,
+      actual_index_manifest_count: actualIndexManifestCount,
+      metadata_source_index_manifest_count: actualIndexManifestCount,
+      skipped_absent_data_partition_count: skippedAbsentDataPartitionCount,
+      missing_index_for_existing_data_partition_count: missingIndexForExistingDataPartitionCount,
+    };
   }
 
   const observationsResult = await collectDomain(
     "observations",
     buildR2HistoryV2ObservationsTimeseriesLatestKey(normalizedIndexPrefix),
     normalizedObservationsPrefix,
+    normalizedObservationsDataPrefix,
   );
   const aqiResult = await collectDomain(
     "aqilevels",
     buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(normalizedIndexPrefix),
     normalizedAqiPrefix,
+    normalizedAqiDataPrefix,
   );
 
   let putSkippedCount = 0;
@@ -2120,6 +2245,14 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
     timeseries_count: timeseriesIds.length,
     metadata_object_count: writtenCount,
     metadata_put_skipped_count: putSkippedCount,
+    actual_index_manifest_count:
+      observationsResult.actual_index_manifest_count + aqiResult.actual_index_manifest_count,
+    skipped_absent_data_partition_count:
+      observationsResult.skipped_absent_data_partition_count
+      + aqiResult.skipped_absent_data_partition_count,
+    missing_index_for_existing_data_partition_count:
+      observationsResult.missing_index_for_existing_data_partition_count
+      + aqiResult.missing_index_for_existing_data_partition_count,
     observations: observationsResult,
     aqilevels: aqiResult,
     warning_count: warnings.length,
@@ -3848,6 +3981,8 @@ export async function rebuildR2HistoryIndexes({
       r2: config.r2,
       bucketName: config.r2.bucket,
       indexPrefix: config.index_prefix_v2,
+      observationsDataPrefix: config.observations_prefix_v2,
+      aqilevelsHourlyDataPrefix: config.aqilevels_hourly_data_prefix_v2,
       observationsTimeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
       aqilevelsHourlyDataTimeseriesIndexPrefix:
         config.aqilevels_hourly_data_timeseries_index_prefix_v2,
