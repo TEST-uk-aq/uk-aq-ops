@@ -4,18 +4,19 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>UK AQ station_snapshot_v2</title>
 <style>
-:root{--bg:#f3f6fb;--panel:#fff;--text:#10243b;--muted:#5e6f82;--line:#d8e0ea;--accent:#145da0;--warn:#8b1e3f}*{box-sizing:border-box}body{margin:0;font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:linear-gradient(160deg,#eef4ff,#f7fbff 50%,#edf7f2);color:var(--text)}main{padding:18px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}h1{font-size:1.35rem;margin:0 0 4px}.muted{color:var(--muted)}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}input,select,button{border:1px solid #c4d1df;border-radius:8px;padding:8px 9px;font:inherit}input{min-width:320px}button{background:#eef4ff;color:#123;border-color:#bdd1e8;cursor:pointer;font-weight:650}button.active{background:var(--accent);color:#fff}.results{display:grid;gap:6px;margin-top:8px;max-width:780px}.result{width:100%;text-align:left;background:#fff}.status{padding:8px 10px;border-radius:8px;background:#ecf2fb;border:1px solid #d4e1f3}.warn{background:#fff5df;border-color:#f0c36a;color:#5a3b00}.error{background:#fff2f5;border-color:#efc0cf;color:var(--warn)}.table-wrap{overflow:auto}table{border-collapse:collapse;width:max-content;min-width:100%;font-size:.84rem}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap}th{position:sticky;top:0;background:#f7fbff}.num{text-align:right;font-variant-numeric:tabular-nums}.swatch{display:inline-block;width:22px;height:22px;border:1px solid #c4d1df;border-radius:4px;vertical-align:middle;background:#fff}.sort-header{border:0;background:transparent;padding:0;color:inherit;font:inherit;font-weight:700;cursor:pointer}
+:root{--bg:#f3f6fb;--panel:#fff;--text:#10243b;--muted:#5e6f82;--line:#d8e0ea;--accent:#145da0;--warn:#8b1e3f}*{box-sizing:border-box}body{margin:0;font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:linear-gradient(160deg,#eef4ff,#f7fbff 50%,#edf7f2);color:var(--text)}main{padding:18px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}h1{font-size:1.35rem;margin:0 0 4px}.muted{color:var(--muted)}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}input,select,button{border:1px solid #c4d1df;border-radius:8px;padding:8px 9px;font:inherit}input{min-width:320px}button{background:#eef4ff;color:#123;border-color:#bdd1e8;cursor:pointer;font-weight:650}button.active{background:var(--accent);color:#fff}.results{display:grid;gap:6px;margin-top:8px;max-width:780px}.result{width:100%;text-align:left;background:#fff}.status{padding:8px 10px;border-radius:8px;background:#ecf2fb;border:1px solid #d4e1f3}.warn{background:#fff5df;border-color:#f0c36a;color:#5a3b00}.debug-panel{font-size:.78rem}.debug-panel summary{cursor:pointer;font-weight:700}.debug-panel pre{white-space:pre-wrap;overflow:auto;background:#f7fbff;border:1px solid var(--line);border-radius:8px;padding:10px}.error{background:#fff2f5;border-color:#efc0cf;color:var(--warn)}.table-wrap{overflow:auto}table{border-collapse:collapse;width:max-content;min-width:100%;font-size:.84rem}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap}th{position:sticky;top:0;background:#f7fbff}.num{text-align:right;font-variant-numeric:tabular-nums}.swatch{display:inline-block;width:22px;height:22px;border:1px solid #c4d1df;border-radius:4px;vertical-align:middle;background:#fff}.sort-header{border:0;background:transparent;padding:0;color:inherit;font:inherit;font-weight:700;cursor:pointer}.loading-scope{position:relative}.loading-overlay{position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.62);opacity:0;pointer-events:none;transition:opacity .5s ease}.loading-overlay.is-visible{opacity:1}.loading-overlay[hidden]{display:none}.uk-aq-loader{width:74px;height:74px;display:block;transform-origin:50% 50%;animation:ukAqSpin 1s linear infinite;will-change:transform}@keyframes ukAqSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.loading-overlay{transition:none}.uk-aq-loader{animation:none}}
 </style>
 </head>
 <body><main>
 <div class="card"><h1>station_snapshot_v2</h1><div class="muted">Lightweight diagnostic for ingestdb, ObsAQIDB, R2 history, and AQI/hourly rows. v1 remains available separately.</div></div>
-<div class="card"><div class="controls"><div><label for="q">Station search</label><input id="q" placeholder="Marylebone, station_id, station_ref, connector"></div><div><label>Pollutant</label><button data-pollutant="pm25" class="active">PM2.5</button> <button data-pollutant="pm10">PM10</button> <button data-pollutant="no2">NO2</button></div><div><label>Range</label><button data-range="24h" class="active">24hrs</button> <button data-range="7d">7 days</button> <button data-range="31d">31 days</button> <button data-range="90d">90 days</button></div><div id="tsBox" hidden><label for="ts">Timeseries</label><select id="ts"></select></div></div><div id="results" class="results"></div></div>
-<div id="warning" class="status warn" hidden></div><div id="status" class="status">Search for a station to begin.</div>
+<div id="snapshotCard" class="card loading-scope"><div id="loadingOverlay" class="loading-overlay" hidden aria-live="polite" aria-label="Loading"><img class="uk-aq-loader" src="/images/UKAQ-Loading.svg" alt="UK AQ loading"></div><div class="controls"><div><label for="q">Station search</label><input id="q" placeholder="Marylebone, station_id, station_ref, connector"></div><div><label>Pollutant</label><button data-pollutant="pm25" class="active">PM2.5</button> <button data-pollutant="pm10">PM10</button> <button data-pollutant="no2">NO2</button></div><div><label>Range</label><button data-range="24h" class="active">24hrs</button> <button data-range="7d">7 days</button> <button data-range="31d">31 days</button> <button data-range="90d">90 days</button></div><div id="tsBox" hidden><label for="ts">Timeseries</label><select id="ts"></select></div></div><div id="results" class="results"></div></div>
+<div id="warning" class="status warn" hidden></div><div id="status" class="status">Search for a station to begin.</div><details id="debugPanel" class="card debug-panel" hidden><summary>Rows debug</summary><pre id="debugPre"></pre></details>
 <div class="card table-wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 </main><script>
 const cols=['observed_at','ingestdb.observs.value','obsaqidb.observs.value','r2.observs.value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','DAQI colour','daqi_index_level','EAQI colour','eaqi_index_level'];
 const keys=['observed_at','ingestdb_observs_value','obsaqidb_observs_value','r2_observs_value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','daqi_colour','daqi_index_level','eaqi_colour','eaqi_index_level'];
 let station=null,pollutant='pm25',range='24h',timer=null,currentRows=[],sortAsc=true;
+let searchController=null,rowsController=null,searchToken=0,rowsToken=0,activeLoads=0,hideLoaderTimer=null;
 function renderHeader(){
   head.innerHTML=cols.map((c,i)=>{
     if(keys[i]==='observed_at'){
@@ -42,17 +43,30 @@ function displayCell(row,k){
   if(flag&&!row[flag])return 'No Data';
   return fmtNullable(row[k]);
 }
+const DAQI_COLOURS={1:'#1DB100',2:'#61D836',3:'#34FF00',4:'#FFFB00',5:'#FFCE04',6:'#FF9300',7:'#FF6464',8:'#FF2600',9:'#A50026',10:'#672C7F'};
+const EAQI_COLOURS={1:'#34FF00',2:'#FFFB00',3:'#FF9300',4:'#FF2600',5:'#A50026',6:'#672C7F',good:'#34FF00',fair:'#FFFB00',moderate:'#FF9300',poor:'#FF2600','very poor':'#A50026','extremely poor':'#672C7F'};
+function derivedAqiColour(row,k){
+  if(k==='daqi_colour'&&isNullish(row[k]))return DAQI_COLOURS[Number(row.daqi_index_level)]||null;
+  if(k==='eaqi_colour'&&isNullish(row[k])){const raw=row.eaqi_index_level;return EAQI_COLOURS[String(raw).trim().toLowerCase()]||EAQI_COLOURS[Number(raw)]||null;}
+  return row[k];
+}
 function colourCell(row,k){
   if(!row.has_aqi_row)return 'No Data';
-  if(isNullish(row[k]))return 'NULL';
-  return `<span class="swatch" style="background:${fmt(row[k])}"></span>`;
+  const colour=derivedAqiColour(row,k);
+  if(isNullish(colour))return 'NULL';
+  return `<span class="swatch" style="background:${fmt(colour)}"></span>`;
 }
 function pollutantLabel(code){if(code==='pm25')return 'PM2.5';if(code==='pm10')return 'PM10';if(code==='no2')return 'NO2';return code;}
 function stationLabel(s){return `${s.station_name || s.label || '(unnamed station)'} · station_id ${s.station_id} · connector ${s.connector_id ?? ''} · ref ${s.station_ref ?? ''}`;}
 function stationLastValueLabel(s){
   const time=isNullish(s.last_value_at)?'NULL':fmtDate(s.last_value_at);
-  return ` · last ${pollutantLabel(pollutant)}: ${fmtNullable(s.last_value)} at ${time}`;
+  const ts=s.selected_timeseries_id||s.last_value_timeseries_id;
+  return ` · last ${pollutantLabel(pollutant)}: ${fmtNullable(s.last_value)} at ${time}${ts?' · ts '+ts:''}`;
 }
+function showLoader(){activeLoads++;clearTimeout(hideLoaderTimer);loadingOverlay.hidden=false;requestAnimationFrame(()=>loadingOverlay.classList.add('is-visible'));}
+function hideLoader(){activeLoads=Math.max(0,activeLoads-1);if(activeLoads)return;loadingOverlay.classList.remove('is-visible');hideLoaderTimer=setTimeout(()=>{if(!activeLoads)loadingOverlay.hidden=true;},500);}
+function clearError(){status.className='status';warning.hidden=true;renderDebug(null);}
+function isAbort(err){return err&&err.name==='AbortError';}
 function sortedRows(){
   return [...currentRows].sort((a,b)=>{
     const av=Date.parse(a.observed_at||'');
@@ -62,6 +76,35 @@ function sortedRows(){
     if(Number.isNaN(bv))return -1;
     return sortAsc ? av-bv : bv-av;
   });
+}
+
+function compactDebug(debug){
+  if(!debug)return null;
+  const ordered={};
+  ['selected_timeseries_id','selected_timeseries_ref','selected_station_ref','selected_connector_id','selected_service_ref','selected_phenomenon_id','range_start_utc','range_end_utc','chart_history_route_used','chart_history_params_equivalent','r2_row_count','r2_object_rows_read','r2_rows_after_time_filter','r2_candidate_key_count','r2_candidate_keys_checked','r2_candidate_manifest_match_count','r2_candidate_manifest_matches','r2_first_matching_key','r2_first_matching_key_reason','ingestdb_row_count','obsaqidb_row_count','aqi_row_count','merged_row_count','selected_timeseries_latest_at_utc','selected_timeseries_latest_in_range'].forEach(k=>{if(debug[k]!==undefined)ordered[k]=debug[k];});
+  Object.keys(debug).forEach(k=>{if(ordered[k]===undefined)ordered[k]=debug[k];});
+  return ordered;
+}
+function rowsDebugWarnings(debug){
+  const warnings=[];
+  if(!debug)return warnings;
+  if(debug.chart_history_auth_hint)warnings.push(debug.chart_history_auth_hint);
+  if(debug.r2_observs_config_error)warnings.push(debug.r2_observs_config_error);
+  if(debug.r2_aqi_config_error)warnings.push(debug.r2_aqi_config_error);
+  const cfg=debug.config||{};
+  if(debug.chart_history_error&&String(debug.chart_history_error).includes('403')&&!debug.chart_history_auth_hint){
+    warnings.push('Protected chart history route returned 403. Check Cloudflare Access service token and upstream secret config.');
+  }
+  if((cfg.cloudflare_access_client_id_present===false||cfg.cloudflare_access_client_secret_present===false)&&debug.chart_history_error){
+    warnings.push('Cloudflare Access service token config is missing or incomplete for server-side history diagnostics.');
+  }
+  return [...new Set(warnings)];
+}
+function renderDebug(debug){
+  const compact=compactDebug(debug);
+  if(!compact){debugPanel.hidden=true;debugPre.textContent='';return;}
+  debugPanel.hidden=false;
+  debugPre.textContent=JSON.stringify(compact,null,2);
 }
 function renderRows(){
   body.innerHTML=sortedRows().map(row=>`<tr>${keys.map(k=>{if(k==='observed_at')return `<td>${fmtDate(row[k])}</td>`; if(k.endsWith('colour'))return `<td>${colourCell(row,k)}</td>`; return `<td class="${typeof row[k]==='number'?'num':''}">${displayCell(row,k)}</td>`}).join('')}</tr>`).join('');
@@ -73,27 +116,77 @@ async function search(){
     return;
   }
 
-  const qs = new URLSearchParams({ q, pollutant });
-  const r=await fetch(`/api/station-snapshot-v2/search-stations?${qs}`);
-  const j=await r.json();
-  const stations = j.stations || j.results || [];
+  const token=++searchToken;
+  if(searchController)searchController.abort();
+  searchController=new AbortController();
+  clearError();
+  status.textContent=`Searching ${pollutantLabel(pollutant)} stations…`;
+  showLoader();
+  try{
+    const qs = new URLSearchParams({ q, pollutant });
+    const r=await fetch(`/api/station-snapshot-v2/search-stations?${qs}`,{signal:searchController.signal});
+    const j=await r.json();
+    if(token!==searchToken)return;
+    const stations = j.stations || j.results || [];
+    if(!r.ok||j.error){status.className='status error';status.textContent=j.message||j.error||'Search failed';return;}
 
-  results.innerHTML = stations.map((s,i)=>`
-    <button class="result" data-i="${i}">
-      ${stationLabel(s)}${stationLastValueLabel(s)}
-    </button>
-  `).join('') || '<div class="muted">No matches.</div>';
+    results.innerHTML = stations.map((s,i)=>`
+      <button class="result" data-i="${i}" title="${(s.selected_timeseries_label||'').replaceAll('"','&quot;')}">
+        ${stationLabel(s)}${stationLastValueLabel(s)}
+      </button>
+    `).join('') || `<div class="muted">No ${pollutantLabel(pollutant)} matches.</div>`;
+    status.className='status';
+    status.textContent=`${stations.length} ${pollutantLabel(pollutant)} station match${stations.length===1?'':'es'}.`;
 
-  [...results.querySelectorAll('button')].forEach((b,i)=>b.onclick=()=>{
-    station = stations[i];
-    results.innerHTML = `
-      <div class="status">
-        Selected: ${stationLabel(station)}${stationLastValueLabel(station)}
-      </div>
-    `;
-    loadRows();
-  });
+    [...results.querySelectorAll('button')].forEach((b,i)=>b.onclick=()=>{
+      station = stations[i];
+      results.innerHTML = `
+        <div class="status">
+          Selected: ${stationLabel(station)}${stationLastValueLabel(station)}
+        </div>
+      `;
+      loadRows();
+    });
+  }catch(err){
+    if(!isAbort(err)){status.className='status error';status.textContent=err.message||'Search failed';}
+  }finally{
+    if(token===searchToken)hideLoader(); else activeLoads=Math.max(0,activeLoads-1);
+  }
 }
-async function loadRows(){if(!station)return; status.textContent='Loading rows…'; warning.hidden=true; const ts=document.getElementById('ts').value; const qs=new URLSearchParams({station_id:station.station_id,pollutant,range}); if(ts)qs.set('timeseries_id',ts); const r=await fetch(`/api/station-snapshot-v2/rows?${qs}`); const j=await r.json(); if(!r.ok){status.className='status error';status.textContent=j.message||j.error||'Request failed';return} status.className='status'; status.textContent=`${j.rows.length} rows · selected timeseries ${j.selected_timeseries_id||''}`; if(j.overlap_detected){warning.hidden=false;warning.textContent='Overlap detected: both R2 and ObsAQIDB have AQI rows for the same observed_at. R2 is being used for AQI source values.'} const list=j.timeseries||[]; tsBox.hidden=list.length<=1; ts.innerHTML=list.map(t=>`<option value="${t.timeseries_id}" ${t.timeseries_id===j.selected_timeseries_id?'selected':''}>${t.timeseries_id} · connector ${t.connector_id} · ${t.label||''} · ${t.uom||''}</option>`).join(''); currentRows=j.rows||[];renderRows();}
+async function loadRows(){
+  if(!station)return;
+  const token=++rowsToken;
+  if(rowsController)rowsController.abort();
+  rowsController=new AbortController();
+  clearError();
+  status.textContent=`Loading ${pollutantLabel(pollutant)} rows…`;
+  showLoader();
+  try{
+    const ts=document.getElementById('ts').value;
+    const qs=new URLSearchParams({station_id:station.station_id,pollutant,range});
+    if(ts)qs.set('timeseries_id',ts);
+    const r=await fetch(`/api/station-snapshot-v2/rows?${qs}`,{signal:rowsController.signal});
+    const j=await r.json();
+    if(token!==rowsToken)return;
+    if(!r.ok||j.error){status.className='status error';status.textContent=j.message||j.error||'Request failed';return}
+    status.className='status';
+    status.textContent=j.message||`${j.rows.length} rows · selected ${pollutantLabel(pollutant)} timeseries ${j.selected_timeseries_id||'none'}`;
+    if(j.debug)console.log('station_snapshot_v2 rows debug',j.debug);
+    renderDebug(j.debug);
+    const warnings=[];
+    if(j.warning)warnings.push(j.warning);
+    warnings.push(...rowsDebugWarnings(j.debug));
+    if(j.overlap_detected)warnings.push('Overlap detected: both R2 and ObsAQIDB have AQI rows for the same observed_at. R2 is being used for AQI source values.');
+    if(warnings.length){warning.hidden=false;warning.textContent=warnings.join(' ');}
+    const list=j.timeseries||[];
+    tsBox.hidden=list.length<=1;
+    ts.innerHTML=list.map(t=>`<option value="${t.timeseries_id}" ${String(t.timeseries_id)===String(j.selected_timeseries_id)?'selected':''}>${t.timeseries_id} · connector ${t.connector_id} · phenomenon ${t.phenomenon_id??''} · ${t.timeseries_ref||''} · ${t.label||''} · ${t.uom||''}</option>`).join('');
+    currentRows=j.rows||[];renderRows();
+  }catch(err){
+    if(!isAbort(err)){status.className='status error';status.textContent=err.message||'Rows request failed';}
+  }finally{
+    if(token===rowsToken)hideLoader(); else activeLoads=Math.max(0,activeLoads-1);
+  }
+}
 q.oninput=()=>{clearTimeout(timer);timer=setTimeout(search,250)}; document.querySelectorAll('[data-pollutant]').forEach(b=>b.onclick=()=>{pollutant=b.dataset.pollutant;document.querySelectorAll('[data-pollutant]').forEach(x=>x.classList.toggle('active',x===b));if(document.getElementById('q').value.trim().length>=2)search();loadRows()}); document.querySelectorAll('[data-range]').forEach(b=>b.onclick=()=>{range=b.dataset.range;document.querySelectorAll('[data-range]').forEach(x=>x.classList.toggle('active',x===b));loadRows()}); ts.onchange=loadRows;
 </script></body></html>
