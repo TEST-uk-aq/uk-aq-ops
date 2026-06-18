@@ -1,0 +1,28 @@
+name = "uk-aq-observs-history-r2-api"
+main = "worker.mjs"
+compatibility_date = "2026-03-09"
+
+[vars]
+UK_AQ_R2_HISTORY_READ_VERSION = "__UK_AQ_R2_HISTORY_READ_VERSION__"
+UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
+UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX = "__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX__"
+UK_AQ_R2_HISTORY_INDEX_PREFIX = "history/_index"
+UK_AQ_R2_HISTORY_INDEX_V2_PREFIX = "__UK_AQ_R2_HISTORY_INDEX_V2_PREFIX__"
+UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
+UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX__"
+UK_AQ_OBSERVS_HISTORY_R2_TIMESERIES_INDEX_ENABLED = "true"
+UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS = "300"
+UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS = "86400"
+
+[[r2_buckets]]
+binding = "UK_AQ_HISTORY_BUCKET"
+bucket_name = "__CFLARE_R2_BUCKET__"
+preview_bucket_name = "__CFLARE_R2_BUCKET__"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = true

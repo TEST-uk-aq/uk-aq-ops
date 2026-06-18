@@ -1,5 +1,9 @@
 # TODO
 
+## Integrity for R2_v2
+
+## R2 History Worker Refactor
+
 ## Egress Reduction
 
 - Route-shape follow-up (Option 3 after Option 2 baseline): split cache profiles into `/api/aq/meta/*` (long TTL) and `/api/aq/realtime/*` (short TTL). Use `realtime` naming (not `live`) to avoid confusion with test/live environments.

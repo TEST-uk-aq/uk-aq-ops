@@ -262,7 +262,6 @@ const TIMESERIES_V2_ALLOWED_WINDOWS = new Set(["12h", "24h", "7d", "31d", "90d"]
 const TIMESERIES_V2_CACHE_BUSTER_KEYS = new Set(["_t", "timestamp", "cache_bust", "random"]);
 const TIMESERIES_V2_PRIMARY_QUERY_KEYS = [
   "timeseries_id",
-  "connector_id",
   "pollutant",
   "window",
   "since",
@@ -337,7 +336,6 @@ type TimeseriesV2RuntimeConfig = {
 
 type TimeseriesV2RequestWindow = {
   timeseriesId: number;
-  connectorId: number | null;
   pollutantKey: string | null;
   requestStartMs: number;
   requestEndMs: number;
@@ -1243,7 +1241,6 @@ function canonicalizeTimeseriesV2RequestUrl(url: URL, allowCacheBypassParams: bo
   }
 
   const timeseriesId = parsePositiveIntegerStringOrNull(original.searchParams.get("timeseries_id"));
-  const connectorId = parsePositiveIntegerStringOrNull(original.searchParams.get("connector_id"));
   const rawWindow = String(original.searchParams.get("window") ?? "").trim().toLowerCase();
   const normalizedWindow = rawWindow && TIMESERIES_V2_ALLOWED_WINDOWS.has(rawWindow) ? rawWindow : null;
   const normalizedSince = normalizeIsoOrNull(original.searchParams.get("since"))
@@ -1263,9 +1260,6 @@ function canonicalizeTimeseriesV2RequestUrl(url: URL, allowCacheBypassParams: bo
   const normalized = new URL(original.origin + original.pathname);
   if (timeseriesId) {
     normalized.searchParams.set("timeseries_id", timeseriesId);
-  }
-  if (connectorId) {
-    normalized.searchParams.set("connector_id", connectorId);
   }
   const pollutantKey = normalizeTimeseriesPollutantKey(original.searchParams.get("pollutant"));
   if (pollutantKey) {
@@ -1376,7 +1370,6 @@ function buildTimeseriesV2RequestWindow(requestUrl: URL, runtime: TimeseriesV2Ru
   if (!timeseriesIdText) {
     throw new RequestValidationError(400, "timeseries_id_required");
   }
-  const connectorIdText = parsePositiveIntegerStringOrNull(requestUrl.searchParams.get("connector_id"));
   const pollutantKey = normalizeTimeseriesPollutantKey(requestUrl.searchParams.get("pollutant"));
   const rawWindow = String(requestUrl.searchParams.get("window") ?? "").trim().toLowerCase();
   const startUtc = getFirstSearchParam(requestUrl, ["start_utc", "start"]);
@@ -1398,7 +1391,6 @@ function buildTimeseriesV2RequestWindow(requestUrl: URL, runtime: TimeseriesV2Ru
 
   return {
     timeseriesId: Number(timeseriesIdText),
-    connectorId: connectorIdText ? Number(connectorIdText) : null,
     pollutantKey,
     requestStartMs: bounds.startMs,
     requestEndMs: bounds.endMs,
@@ -1859,8 +1851,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
   const r2Errors: Array<string | Record<string, unknown>> = [];
   const ingestErrors: Array<string | Record<string, unknown>> = [];
   const partialReasons = new Set<string>();
-  let connectorId: number | null = requestWindow.connectorId;
-  let connectorIdSource: "request" | "supabase_lookup" | null = connectorId ? "request" : null;
+  let connectorId: number | null = null;
   let r2Rows: Array<Record<string, unknown>> = [];
   let r2Coverage: Record<string, unknown> | null = null;
   let r2PagesFetched = 0;
@@ -1870,16 +1861,11 @@ async function stitchTimeseriesV2FromR2AndIngest(
     r2Errors.push("pollutant_required_for_v2_r2");
     partialReasons.add("pollutant_required_for_v2_r2");
   } else {
-    if (!connectorId) {
-      connectorId = await loadTimeseriesConnectorId(
-        deps.supabaseUrl,
-        deps.sbSecretKey,
-        requestWindow.timeseriesId,
-      );
-      if (connectorId) {
-        connectorIdSource = "supabase_lookup";
-      }
-    }
+    connectorId = await loadTimeseriesConnectorId(
+      deps.supabaseUrl,
+      deps.sbSecretKey,
+      requestWindow.timeseriesId,
+    );
     if (!connectorId) {
       r2Errors.push("connector_id_lookup_failed");
       partialReasons.add("connector_id_lookup_failed");
@@ -2085,7 +2071,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
       start_utc: requestStartUtc,
       end_utc: requestEndUtc,
       since: requestWindow.requestSinceIso,
-      connector_id: connectorId,
       pollutant: requestWindow.pollutantKey,
     },
     data: merged.merged,
@@ -2093,8 +2078,6 @@ async function stitchTimeseriesV2FromR2AndIngest(
       ...meta,
       coverage: r2Coverage,
       connector_id: connectorId,
-      connector_id_source: connectorIdSource,
-      used_supabase_connector_lookup: connectorIdSource === "supabase_lookup",
       pollutant: requestWindow.pollutantKey,
       partial_reasons: Array.from(partialReasons),
       r2_pages_fetched: r2PagesFetched,

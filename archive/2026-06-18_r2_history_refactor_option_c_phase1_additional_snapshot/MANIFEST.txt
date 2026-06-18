@@ -1,0 +1,4 @@
+Archive snapshot for additional Phase 1 local server sync.
+Created: 2026-06-18
+Archived current root repo serve.py before adding outbound local-dev User-Agent.
+Source: /Users/mikehinford/Dropbox/Projects/CIC Website/ChronicChannel-Test Root Repo/ChronicChannel-test.github.io/serve.py

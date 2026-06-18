@@ -40,11 +40,6 @@ function parsePositiveIntegerStringOrNull(value, min = 1, max = 2_147_483_647) {
   return String(Math.floor(numeric));
 }
 
-function normalizeTimeseriesPollutantKey(value) {
-  const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s._-]+/g, "");
-  return ["pm25", "pm10", "no2"].includes(normalized) ? normalized : null;
-}
-
 function canonicalizeTimeseriesV2RequestUrl(url, allowCacheBypassParams) {
   const original = new URL(url.toString());
   if (!allowCacheBypassParams) {
@@ -55,8 +50,6 @@ function canonicalizeTimeseriesV2RequestUrl(url, allowCacheBypassParams) {
 
   const normalized = new URL(original.origin + original.pathname);
   const timeseriesId = parsePositiveIntegerStringOrNull(original.searchParams.get("timeseries_id"));
-  const connectorId = parsePositiveIntegerStringOrNull(original.searchParams.get("connector_id"));
-  const pollutantKey = normalizeTimeseriesPollutantKey(original.searchParams.get("pollutant"));
   const startUtc = normalizeIsoOrNull(original.searchParams.get("start_utc") || original.searchParams.get("start"));
   const endUtc = normalizeIsoOrNull(original.searchParams.get("end_utc") || original.searchParams.get("end"));
   const since = normalizeIsoOrNull(original.searchParams.get("since"));
@@ -64,8 +57,6 @@ function canonicalizeTimeseriesV2RequestUrl(url, allowCacheBypassParams) {
   const hasValidRange = Boolean(startUtc && endUtc && Date.parse(endUtc) > Date.parse(startUtc));
 
   if (timeseriesId) normalized.searchParams.set("timeseries_id", timeseriesId);
-  if (connectorId) normalized.searchParams.set("connector_id", connectorId);
-  if (pollutantKey) normalized.searchParams.set("pollutant", pollutantKey);
   if (windowValue && ALLOWED_WINDOWS.has(windowValue) && !hasValidRange) {
     normalized.searchParams.set("window", windowValue);
   }
@@ -78,7 +69,7 @@ function canonicalizeTimeseriesV2RequestUrl(url, allowCacheBypassParams) {
   normalized.searchParams.set("v", "2");
   if (allowCacheBypassParams) {
     for (const [key, value] of original.searchParams.entries()) {
-      if (["timeseries_id", "connector_id", "pollutant", "window", "since", "start_utc", "end_utc", "format", "v"].includes(key)) {
+      if (["timeseries_id", "window", "since", "start_utc", "end_utc", "format", "v"].includes(key)) {
         continue;
       }
       normalized.searchParams.append(key, value);
@@ -104,8 +95,6 @@ function runChecks() {
   const v2Url = new URL(
     "https://example.test/api/aq/timeseries"
     + "?timeseries_id=3742"
-    + "&connector_id=6"
-    + "&pollutant=PM2.5"
     + "&window=24H"
     + "&start=2026-05-14T10:00:00Z"
     + "&end=2026-05-14T16:00:00Z"
@@ -121,8 +110,6 @@ function runChecks() {
   const normalized = canonicalizeTimeseriesV2RequestUrl(v2Url, false);
   assert.equal(normalized.searchParams.has("cache_bust"), false);
   assert.equal(normalized.searchParams.get("timeseries_id"), "3742");
-  assert.equal(normalized.searchParams.get("connector_id"), "6");
-  assert.equal(normalized.searchParams.get("pollutant"), "pm25");
   assert.equal(normalized.searchParams.get("window"), null, "range request should not include window");
   assert.equal(normalized.searchParams.get("start_utc"), "2026-05-14T10:00:00.000Z");
   assert.equal(normalized.searchParams.get("end_utc"), "2026-05-14T16:00:00.000Z");

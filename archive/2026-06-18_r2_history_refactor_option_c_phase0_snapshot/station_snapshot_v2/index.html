@@ -17,11 +17,6 @@ const cols=['observed_at','ingestdb.observs.value','obsaqidb.observs.value','r2.
 const keys=['observed_at','ingestdb_observs_value','obsaqidb_observs_value','r2_observs_value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','daqi_colour','daqi_index_level','eaqi_colour','eaqi_index_level'];
 let station=null,pollutant='pm25',range='24h',timer=null,currentRows=[],sortAsc=true;
 let searchController=null,rowsController=null,searchToken=0,rowsToken=0,activeLoads=0,hideLoaderTimer=null;
-function selectedTimeseriesMeta(){
-  const tsValue=document.getElementById('ts').value;
-  const list=station&&Array.isArray(station.timeseries)?station.timeseries:[];
-  return list.find(t=>String(t.timeseries_id)===String(tsValue))||station?.selected_timeseries||null;
-}
 function renderHeader(){
   head.innerHTML=cols.map((c,i)=>{
     if(keys[i]==='observed_at'){
@@ -168,15 +163,8 @@ async function loadRows(){
   showLoader();
   try{
     const ts=document.getElementById('ts').value;
-    const tsMeta=selectedTimeseriesMeta();
-    const qs=new URLSearchParams({station_id:station.station_id,pollutant,range,debug:'1'});
+    const qs=new URLSearchParams({station_id:station.station_id,pollutant,range});
     if(ts)qs.set('timeseries_id',ts);
-    const connectorId=tsMeta?.connector_id??station.selected_timeseries_connector_id??station.connector_id;
-    const stationRef=tsMeta?.station_ref??station.station_ref;
-    const serviceRef=tsMeta?.service_ref??station.service_ref;
-    if(connectorId!==undefined&&connectorId!==null&&connectorId!=='')qs.set('connector_id',connectorId);
-    if(stationRef!==undefined&&stationRef!==null&&stationRef!=='')qs.set('station_ref',stationRef);
-    if(serviceRef!==undefined&&serviceRef!==null&&serviceRef!=='')qs.set('service_ref',serviceRef);
     const r=await fetch(`/api/station-snapshot-v2/rows?${qs}`,{signal:rowsController.signal});
     const j=await r.json();
     if(token!==rowsToken)return;
@@ -191,8 +179,6 @@ async function loadRows(){
     if(j.overlap_detected)warnings.push('Overlap detected: both R2 and ObsAQIDB have AQI rows for the same observed_at. R2 is being used for AQI source values.');
     if(warnings.length){warning.hidden=false;warning.textContent=warnings.join(' ');}
     const list=j.timeseries||[];
-    if(station)station.timeseries=list;
-    if(station)station.selected_timeseries=list.find(t=>String(t.timeseries_id)===String(j.selected_timeseries_id))||station.selected_timeseries||null;
     tsBox.hidden=list.length<=1;
     ts.innerHTML=list.map(t=>`<option value="${t.timeseries_id}" ${String(t.timeseries_id)===String(j.selected_timeseries_id)?'selected':''}>${t.timeseries_id} · connector ${t.connector_id} · phenomenon ${t.phenomenon_id??''} · ${t.timeseries_ref||''} · ${t.label||''} · ${t.uom||''}</option>`).join('');
     currentRows=j.rows||[];renderRows();
