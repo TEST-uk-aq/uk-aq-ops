@@ -38,7 +38,32 @@ function renderHeader(){
   document.getElementById('sortObserved').onclick=()=>{sortAsc=!sortAsc;renderHeader();renderRows()};
 }
 renderHeader();
-function fmtDate(v,mode='exact'){if(!v)return '';const d=new Date(v);if(isNaN(d))return String(v);const withSeconds=mode==='exact'&&(d.getSeconds()!==0||d.getMilliseconds()!==0);return new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:withSeconds?'2-digit':undefined,hour12:false}).format(d).replace(',','');}
+function parseUtcDate(value){
+  if(!value)return null;
+  let text=String(value).trim();
+  if(!text)return null;
+  if(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\+00(?::?00)?|Z)$/i.test(text)){
+    text=text.replace(' ','T').replace(/\+00(?::?00)?$/i,'Z');
+  }else if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?\+00$/i.test(text)){
+    text=text.replace(/\+00$/i,'Z');
+  }
+  const d=new Date(text);
+  return Number.isNaN(d.getTime())?null:d;
+}
+function pad2(n){return String(n).padStart(2,'0')}
+function formatUtcDateTime(value,{exact=false,bucket=false}={}){
+  const d=parseUtcDate(value);
+  if(!d)return isNullish(value)?'No Data':String(value);
+  const day=pad2(d.getUTCDate());
+  const month=pad2(d.getUTCMonth()+1);
+  const year=d.getUTCFullYear();
+  const hour=pad2(d.getUTCHours());
+  const minute=bucket?'00':pad2(d.getUTCMinutes());
+  const includeSeconds=exact&&(d.getUTCSeconds()!==0||d.getUTCMilliseconds()!==0);
+  const second=includeSeconds?`:${pad2(d.getUTCSeconds())}`:'';
+  return `${day}/${month}/${year} ${hour}:${minute}${second}Z`;
+}
+function fmtDate(v,mode='exact'){return formatUtcDateTime(v,{exact:mode==='exact',bucket:mode==='bucket'});}
 function isNullish(v){return v===null||v===undefined||v==='';}
 function fmt(v){if(typeof v==='number')return Number.isInteger(v)?String(v):String(Math.round(v*1000)/1000);return String(v)}
 function fmtNullable(v){return isNullish(v)?'NULL':fmt(v)}
