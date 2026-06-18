@@ -8,7 +8,6 @@ const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
 const DEFAULT_HISTORY_V2_INDEX_PREFIX = "history/_index_v2";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_timeseries";
 const DEFAULT_V2_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_hourly_data_timeseries";
-const DEFAULT_V2_TIMESERIES_METADATA_INDEX_SUBPREFIX = "timeseries";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
@@ -1086,69 +1085,6 @@ async function readTimeseriesWindowContextFromObsAqiDb({
   return {
     ...context,
     cache_hit: false,
-  };
-}
-
-function buildTimeseriesMetadataIndexKey(historyIndexPrefix, timeseriesId) {
-  const normalizedPrefix = normalizePrefix(
-    `${historyIndexPrefix || DEFAULT_HISTORY_V2_INDEX_PREFIX}/${DEFAULT_V2_TIMESERIES_METADATA_INDEX_SUBPREFIX}`,
-  );
-  const normalizedTimeseriesId = parseRequiredPositiveInt(timeseriesId);
-  if (!normalizedPrefix || !normalizedTimeseriesId) {
-    return null;
-  }
-  return `${normalizedPrefix}/timeseries_id=${normalizedTimeseriesId}.json`;
-}
-
-async function readTimeseriesWindowContextFromR2Metadata({
-  env,
-  historyIndexPrefix,
-  timeseriesId,
-}) {
-  const metadataKey = buildTimeseriesMetadataIndexKey(historyIndexPrefix, timeseriesId);
-  if (
-    !metadataKey
-    || !env.UK_AQ_HISTORY_BUCKET
-    || typeof env.UK_AQ_HISTORY_BUCKET.get !== "function"
-  ) {
-    return {
-      found: false,
-      source_path: metadataKey,
-      connector_id: null,
-      station_id: null,
-      timeseries_ids: [timeseriesId],
-      metadata: null,
-    };
-  }
-
-  const object = await fetchJsonObjectFromR2(env, metadataKey, null, "timeseries_metadata");
-  if (!object.exists) {
-    return {
-      found: false,
-      source_path: metadataKey,
-      connector_id: null,
-      station_id: null,
-      timeseries_ids: [timeseriesId],
-      metadata: null,
-    };
-  }
-
-  const metadata = object.value && typeof object.value === "object" && !Array.isArray(object.value)
-    ? object.value
-    : {};
-  const connectorIds = Array.isArray(metadata.connector_ids)
-    ? metadata.connector_ids.map((value) => parseRequiredPositiveInt(value)).filter(Boolean)
-    : [];
-  const connectorId =
-    parseRequiredPositiveInt(metadata.connector_id)
-    || (connectorIds.length === 1 ? connectorIds[0] : null);
-  return {
-    found: Boolean(connectorId),
-    source_path: metadataKey,
-    connector_id: connectorId,
-    station_id: null,
-    timeseries_ids: [timeseriesId],
-    metadata,
   };
 }
 
@@ -2238,17 +2174,10 @@ async function handleRequest(request, env, ctx) {
   );
   const hasHistoryWindow = Boolean(r2Window);
   const hasObsAqiDbWindow = Boolean(obsAqiDbWindow);
-  const isHistoricalOnlyWindow = hasHistoryWindow && !hasObsAqiDbWindow;
   let windowContextSourcePath = null;
   let windowContextLookupError = null;
   let windowContextLookupCacheHit = false;
   let windowContextLookupAttempted = false;
-  let windowContextLookupSource = null;
-  let r2TimeseriesMetadataLookupAttempted = false;
-  let r2TimeseriesMetadataLookupFound = false;
-  let r2TimeseriesMetadataIndexKey = null;
-  let r2TimeseriesMetadata = null;
-  let obsAqiDbContextLookupAttempted = false;
   let targetConnectorId = requestedConnectorId || null;
   let targetStationId = requestedStationId || null;
   let targetTimeseriesIds = [timeseriesId];
@@ -2262,57 +2191,13 @@ async function handleRequest(request, env, ctx) {
       };
     }
     windowContextLookupAttempted = true;
-
-    if (targetConnectorId && isHistoricalOnlyWindow) {
-      windowContextLookupSource = "request";
-      return {
-        connector_id: targetConnectorId,
-        station_id: targetStationId,
-        timeseries_ids: targetTimeseriesIds,
-      };
-    }
-
-    if (!targetConnectorId && readVersion === "v2" && hasHistoryWindow) {
-      r2TimeseriesMetadataLookupAttempted = true;
-      try {
-        const metadataLookup = await readTimeseriesWindowContextFromR2Metadata({
-          env,
-          historyIndexPrefix,
-          timeseriesId,
-        });
-        r2TimeseriesMetadataIndexKey = metadataLookup.source_path;
-        r2TimeseriesMetadataLookupFound = Boolean(metadataLookup.found);
-        r2TimeseriesMetadata = metadataLookup.metadata || null;
-        if (metadataLookup.found) {
-          windowContextLookupSource = "r2_metadata";
-          targetConnectorId = parseRequiredPositiveInt(metadataLookup.connector_id) || targetConnectorId;
-          targetStationId = parseRequiredPositiveInt(metadataLookup.station_id) || targetStationId;
-          targetTimeseriesIds = Array.isArray(metadataLookup.timeseries_ids)
-            && metadataLookup.timeseries_ids.length > 0
-            ? metadataLookup.timeseries_ids
-            : [timeseriesId];
-          if (isHistoricalOnlyWindow) {
-            return {
-              connector_id: targetConnectorId,
-              station_id: targetStationId,
-              timeseries_ids: targetTimeseriesIds,
-            };
-          }
-        }
-      } catch (error) {
-        windowContextLookupError = error instanceof Error ? error.message : String(error);
-      }
-    }
-
     try {
-      obsAqiDbContextLookupAttempted = true;
       const lookup = await readTimeseriesWindowContextFromObsAqiDb({
         env,
         timeseriesId,
         startIso,
         endIso,
       });
-      windowContextLookupSource = "obs_aqidb";
       windowContextSourcePath = lookup.source_path;
       windowContextLookupCacheHit = lookup.cache_hit;
       targetConnectorId = parseRequiredPositiveInt(lookup.connector_id) || targetConnectorId;
@@ -2597,11 +2482,6 @@ async function handleRequest(request, env, ctx) {
       history_prefix: historyPrefix,
       history_index_prefix: historyIndexPrefix,
       timeseries_index_prefix: timeseriesIndexPrefix,
-      used_r2: r2MergePoints.length > 0 || hasHistoryWindow,
-      used_supabase: obsAqiDbContextLookupAttempted || recentFallbackRead.status === "fallback_live",
-      connector_id_source: windowContextLookupSource,
-      used_r2_timeseries_metadata_lookup: r2TimeseriesMetadataLookupFound,
-      used_supabase_connector_lookup: obsAqiDbContextLookupAttempted,
       timeseries_id: timeseriesId,
       station_id: targetStationId,
       connector_id: targetConnectorId,
@@ -2666,15 +2546,7 @@ async function handleRequest(request, env, ctx) {
       target_connector_id: targetConnectorId,
       target_station_id: targetStationId,
       resolved_connector_id: resolvedR2ConnectorId,
-      connector_id_source: windowContextLookupSource,
-      timeseries_metadata_index_key: r2TimeseriesMetadataIndexKey,
-      r2_timeseries_metadata_lookup_attempted: r2TimeseriesMetadataLookupAttempted,
-      r2_timeseries_metadata_lookup_found: r2TimeseriesMetadataLookupFound,
-      used_r2_timeseries_metadata_lookup: r2TimeseriesMetadataLookupFound,
-      used_supabase_connector_lookup: obsAqiDbContextLookupAttempted,
-      r2_timeseries_metadata: r2TimeseriesMetadata,
       timeseries_window_context_lookup_source_path: windowContextSourcePath,
-      timeseries_window_context_lookup_source: windowContextLookupSource,
       timeseries_window_context_lookup_error: windowContextLookupError,
       timeseries_window_context_lookup_cache_hit: windowContextLookupAttempted
         ? windowContextLookupCacheHit
@@ -2734,9 +2606,6 @@ async function handleRequest(request, env, ctx) {
     timeseries_id: timeseriesId,
     station_id: targetStationId,
     connector_id: targetConnectorId,
-    connector_id_source: windowContextLookupSource,
-    used_r2_timeseries_metadata_lookup: r2TimeseriesMetadataLookupFound,
-    used_supabase_connector_lookup: obsAqiDbContextLookupAttempted,
     pollutant: requestedPollutant,
     from_utc: startIso,
     to_utc: endIso,

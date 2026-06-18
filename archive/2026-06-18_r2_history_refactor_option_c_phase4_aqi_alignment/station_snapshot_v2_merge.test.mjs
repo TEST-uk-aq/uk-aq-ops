@@ -34,7 +34,6 @@ test('station_snapshot_v2 merge logic covers source values, overlap, -99, and AQ
   assert.equal(result.rows[0].eaqi_colour, '#50CCAA');
   const minus = result.rows.find((row) => row.observed_at === '2026-06-17T07:00:00.000Z');
   assert.equal(minus.ingestdb_observs_value, -99);
-  assert.equal(minus.aqi_source, 'obsaqidb');
   assert.equal(minus.daqi_colour, null);
   const r2Only = result.rows.find((row) => row.observed_at === '2026-06-17T06:00:00.000Z');
   assert.equal(r2Only.r2_observs_value, 14);

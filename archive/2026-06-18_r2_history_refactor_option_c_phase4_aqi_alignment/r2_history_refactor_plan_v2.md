@@ -1164,14 +1164,6 @@ Acceptance:
 5. Station Snapshot v2 can still display detailed AQI diagnostics with `debug=1`.
 6. Station Snapshot v2 AQI R2 probe does not silently omit `connector_id` when the selected timeseries metadata has it.
 
-Implementation notes:
-
-- AQI history v2 now follows the same connector-resolution order as observations for historical-only reads: caller `connector_id`, then R2 timeseries metadata, then ObsAQIDB compatibility lookup only if needed.
-- Historical-only AQI requests with caller `connector_id` do not perform an ObsAQIDB context lookup.
-- AQI v2 keeps using the canonical `history/_index_v2/aqilevels_hourly_data_timeseries_latest.json` descriptor and pollutant-partitioned `history/_index_v2/aqilevels_hourly_data_timeseries/.../pollutant_code=<code>/manifest.json` paths.
-- Normal AQI responses already use compact rows by default and do not include repeated colour hex fields; Station Snapshot v2 keeps deriving display colours locally.
-- Station Snapshot v2 now reports R2 AQI and ObsAQIDB AQI row counts separately in debug.
-
 ### VS Code Codex prompt for Phase 4
 
 ```text
