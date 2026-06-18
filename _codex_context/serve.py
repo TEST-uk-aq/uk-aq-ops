@@ -939,9 +939,9 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
             debug['chart_history_first_matching_key_reason'] = 'exact selected_timeseries_id match through chart history route'
         return rows, debug
 
-    def _v2_fetch_r2_rows(self, base_url, token, params):
+    def _v2_fetch_r2_rows(self, base_url, token, params, include_payload=False):
         if not base_url or not token:
-            return []
+            return ([], None) if include_payload else []
 
         headers = {
             'Accept': 'application/json',
@@ -973,17 +973,18 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
             payload = self._fetch_json(url, headers)
         except Exception as exc:
             print(f'  [snapshot-v2] optional R2 API failed: {exc}')
-            return []
+            return ([], None) if include_payload else []
 
+        rows = []
         if isinstance(payload, list):
-            return payload
-
-        if isinstance(payload, dict):
+            rows = payload
+        elif isinstance(payload, dict):
             for key in ('rows', 'observations', 'data', 'points'):
                 if isinstance(payload.get(key), list):
-                    return payload[key]
+                    rows = payload[key]
+                    break
 
-        return []
+        return (rows, payload) if include_payload else rows
 
     def _serve_station_snapshot_v2(self):
         parsed = urlparse(self.path)
@@ -1240,10 +1241,8 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
             row.setdefault('source', 'direct_r2_observs')
         r2_aqi_params = dict(r2_params)
         r2_aqi_params['format'] = 'objects'
-        r2_aqi = self._v2_fetch_r2_rows(UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_AQI_HISTORY_R2_API_TOKEN, r2_aqi_params)
-        for row in r2_aqi:
-            row['source'] = 'r2_history'
-        result.setdefault('debug', {}).update({'direct_r2_observs_row_count': len(r2_obs), 'r2_row_count': len(r2_obs), 'r2_observs_source_used': 'direct_observations_r2_api' if r2_obs else 'direct_observations_r2_api_empty', 'chart_history_row_count': len(chart_rows), 'r2_aqi_row_count': len(r2_aqi), 'r2_aqi_source_used': 'uk_aq_aqi_history_r2_api_worker' if r2_aqi else 'uk_aq_aqi_history_r2_api_worker_empty', 'obsaqidb_aqi_row_count': len(obs_aqi), 'aqi_row_count': len(r2_aqi) + len(obs_aqi), 'aqi_overlap_detected': bool(r2_aqi and obs_aqi), 'r2_aqi_lookup_key_or_filter': r2_aqi_params})
+        r2_aqi, r2_aqi_payload = self._v2_fetch_r2_rows(UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_AQI_HISTORY_R2_API_TOKEN, r2_aqi_params, include_payload=True)
+        self._v2_update_aqi_history_debug(result.setdefault('debug', {}), r2_aqi, r2_aqi_payload, obs_aqi, r2_aqi_params, len(r2_obs), chart_rows)
         self._v2_merge_rows(result, ingest_obs, obs_obs, r2_obs, r2_aqi + obs_aqi)
 
     def _v2_rows_via_sql(self, result, station_id, pollutant, window, requested_ts, start, end):
@@ -1276,13 +1275,43 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
             row.setdefault('source', 'direct_r2_observs')
         r2_aqi_params = dict(r2_params)
         r2_aqi_params['format'] = 'objects'
-        r2_aqi = self._v2_fetch_r2_rows(UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_AQI_HISTORY_R2_API_TOKEN, r2_aqi_params)
-        for row in r2_aqi:
-            row['source'] = 'r2_history'
+        r2_aqi, r2_aqi_payload = self._v2_fetch_r2_rows(UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_AQI_HISTORY_R2_API_TOKEN, r2_aqi_params, include_payload=True)
         for row in local_aqi:
             row.setdefault('source', 'obsaqidb')
-        result.setdefault('debug', {}).update({'direct_r2_observs_row_count': len(r2_obs), 'r2_row_count': len(r2_obs), 'r2_observs_source_used': 'direct_observations_r2_api' if r2_obs else 'direct_observations_r2_api_empty', 'chart_history_row_count': len(chart_rows), 'r2_aqi_row_count': len(r2_aqi), 'r2_aqi_source_used': 'uk_aq_aqi_history_r2_api_worker' if r2_aqi else 'uk_aq_aqi_history_r2_api_worker_empty', 'obsaqidb_aqi_row_count': len(local_aqi), 'aqi_row_count': len(r2_aqi) + len(local_aqi), 'aqi_overlap_detected': bool(r2_aqi and local_aqi), 'r2_aqi_lookup_key_or_filter': r2_aqi_params})
+        self._v2_update_aqi_history_debug(result.setdefault('debug', {}), r2_aqi, r2_aqi_payload, local_aqi, r2_aqi_params, len(r2_obs), chart_rows)
         self._v2_merge_rows(result, ingest_obs, obs_obs, r2_obs, r2_aqi + local_aqi)
+
+    def _v2_count_by_key(self, rows, key):
+        counts = {}
+        for row in rows or []:
+            value = row.get(key) if isinstance(row, dict) else None
+            label = str(value).strip() if value is not None and str(value).strip() else 'missing'
+            counts[label] = counts.get(label, 0) + 1
+        return counts
+
+    def _v2_update_aqi_history_debug(self, debug, api_rows, api_payload, local_aqi_rows, api_params, r2_obs_count, chart_rows):
+        meta = api_payload.get('meta') if isinstance(api_payload, dict) and isinstance(api_payload.get('meta'), dict) else {}
+        row_source_counts = self._v2_count_by_key(api_rows, 'source')
+        row_coverage_counts = self._v2_count_by_key(api_rows, 'source_coverage')
+        debug.update({
+            'direct_r2_observs_row_count': r2_obs_count,
+            'r2_row_count': r2_obs_count,
+            'r2_observs_source_used': 'direct_observations_r2_api' if r2_obs_count else 'direct_observations_r2_api_empty',
+            'chart_history_row_count': len(chart_rows),
+            'aqi_history_api_row_count': len(api_rows),
+            'aqi_history_api_source_counts': row_source_counts,
+            'aqi_history_api_source_coverage_counts': row_coverage_counts,
+            'aqi_history_api_meta_source_counts': meta.get('source_counts'),
+            'aqi_history_api_meta_source_coverage_counts': meta.get('source_coverage_counts'),
+            'direct_r2_aqi_row_count': row_source_counts.get('r2', 0),
+            'obsaqidb_retention_aqi_row_count': row_coverage_counts.get('retention', 0),
+            'r2_aqi_row_count': len(api_rows),
+            'r2_aqi_source_used': 'uk_aq_aqi_history_r2_api_worker' if api_rows else 'uk_aq_aqi_history_r2_api_worker_empty',
+            'obsaqidb_aqi_row_count': len(local_aqi_rows),
+            'aqi_row_count': len(api_rows) + len(local_aqi_rows),
+            'aqi_overlap_detected': bool(api_rows and local_aqi_rows),
+            'r2_aqi_lookup_key_or_filter': api_params,
+        })
 
     def _v2_merge_rows(self, result, ingest_obs, obs_obs, r2_obs, aqi_rows):
         merged = {}
@@ -1314,9 +1343,16 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
                 row[source] = pick(r, 'value', 'observed_value', 'observs_value', 'mean_value')
                 row[flag] = True
 
-        def is_r2_aqi(row):
-            raw = str(row.get('source') or '').strip().lower().replace('_', ' ')
-            return raw in ('r2', 'r2 history', 'r2 history api')
+        def normalized_aqi_source(row):
+            raw_source = str(row.get('source') or '').strip().lower().replace('_', ' ')
+            raw_coverage = str(row.get('source_coverage') or '').strip().lower().replace('_', ' ')
+            if raw_source == 'r2':
+                return 'R2 History', True
+            if raw_source in ('obs aqidb', 'obsaqidb', 'obs aqi db'):
+                return 'ObsAQIDB retention' if raw_coverage == 'retention' else 'ObsAQIDB', False
+            if raw_coverage == 'retention':
+                return 'ObsAQIDB retention', False
+            return 'AQI history API', False
 
         def apply_aqi(row, r, source, is_r2_source):
             row['has_aqi_row'] = True
@@ -1335,8 +1371,7 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
         for r in aqi_rows:
             key = self._hour_key(r.get('timestamp_hour_utc') or r.get('observed_at') or r.get('period_start_utc'))
             if not key: continue
-            is_r2_source = is_r2_aqi(r)
-            source = 'R2 History' if is_r2_source else (r.get('source') or 'obsaqidb')
+            source, is_r2_source = normalized_aqi_source(r)
             existing = aqi_by_hour.get(key)
             if existing and existing.get('source') != source:
                 result['overlap_detected'] = True
@@ -1370,6 +1405,7 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
         for row in exact_observation_rows:
             hour_group_sizes[row.get('hour_bucket')] = hour_group_sizes.get(row.get('hour_bucket'), 0) + 1
         non_hourly_count = sum(1 for row in exact_observation_rows if row.get('observed_at') != row.get('hour_bucket'))
+        labelled_r2_count = sum(1 for row in merged.values() if row.get('aqi_source') == 'R2 History')
         debug.update({
             'observation_key_mode': 'exact_observed_at',
             'aqi_key_mode': 'hour_bucket',
@@ -1381,6 +1417,9 @@ class MultiRootHandler(http.server.SimpleHTTPRequestHandler):
             'non_hourly_observation_count': non_hourly_count,
             'standalone_aqi_only_row_count': standalone_aqi_only_count,
             'chart_history_rows_used_for_r2_column': False,
+            'aqi_rows_labelled_r2_history_count': labelled_r2_count,
+            'aqi_rows_after_r2_coverage_labelled_r2_count': 0,
+            'aqi_rows_after_r2_coverage_labelled_r2_count_note': 'computed from row-level source only; non-r2 rows are never labelled R2 History',
         })
         result['rows'] = sorted(merged.values(), key=lambda r: r['observed_at'], reverse=True)[:STATION_SNAPSHOT_MAX_ROWS]
         debug['merged_row_count'] = len(result['rows'])

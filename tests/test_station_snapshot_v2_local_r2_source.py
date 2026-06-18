@@ -3,14 +3,9 @@ import pathlib
 import unittest
 
 
-ROOT_SERVE = pathlib.Path(
-    "/Users/mikehinford/Dropbox/Projects/CIC Website/ChronicChannel-Test Root Repo/"
-    "ChronicChannel-test.github.io/serve.py"
-)
-OPS_ROOT = pathlib.Path(
-    "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/"
-    "CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
-)
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT_SERVE = REPO_ROOT / "_codex_context" / "serve.py"
+OPS_ROOT = REPO_ROOT
 
 
 def load_serve_module():
@@ -60,7 +55,7 @@ class StationSnapshotV2LocalR2SourceTest(unittest.TestCase):
         aqi_rows = [
             {
                 "timestamp_hour_utc": "2026-06-18T12:00:00Z",
-                "source": "r2_history",
+                "source": "r2",
                 "daqi_index_level": 1,
                 "eaqi_index_level": 1,
             }
@@ -94,13 +89,39 @@ class StationSnapshotV2LocalR2SourceTest(unittest.TestCase):
         self.assertEqual(debug["standalone_aqi_only_row_count"], 0)
         self.assertFalse(debug["chart_history_rows_used_for_r2_column"])
 
+
+    def test_aqi_history_api_retention_rows_display_as_obsaqidb(self):
+        serve = load_serve_module()
+        handler = object.__new__(serve.MultiRootHandler)
+        result = {"debug": {}}
+
+        handler._v2_merge_rows(
+            result,
+            [{"observed_at": "2026-06-18T10:05:00Z", "value": 5.1}],
+            [],
+            [],
+            [
+                {
+                    "timestamp_hour_utc": "2026-06-18T10:00:00Z",
+                    "source": "obs_aqidb",
+                    "source_coverage": "retention",
+                    "hourly_mean_ugm3": 5.0,
+                }
+            ],
+        )
+
+        row = result["rows"][0]
+        self.assertEqual(row["aqi_source"], "ObsAQIDB retention")
+        self.assertIsNone(row["r2_observs_value"])
+        self.assertEqual(result["debug"]["aqi_rows_after_r2_coverage_labelled_r2_count"], 0)
+
     def test_chart_history_rows_do_not_feed_r2_observs_source(self):
         source = ROOT_SERVE.read_text(encoding="utf-8")
 
         self.assertNotIn("r2_obs, chart_debug = self._v2_fetch_chart_history_rows", source)
         self.assertNotIn("if not r2_obs:\n            r2_obs = self._v2_fetch_r2_rows", source)
         self.assertIn("chart_rows, chart_debug = self._v2_fetch_chart_history_rows", source)
-        self.assertIn("'direct_r2_observs_row_count': len(r2_obs)", source)
+        self.assertIn("'direct_r2_observs_row_count': r2_obs_count", source)
         self.assertIn("'r2_observs_source_used': 'direct_observations_r2_api'", source)
 
     def test_r2_aqi_points_merge_as_r2_history(self):
@@ -116,7 +137,7 @@ class StationSnapshotV2LocalR2SourceTest(unittest.TestCase):
             [
                 {
                     "period_start_utc": "2026-06-04T12:00:00.000Z",
-                    "source": "r2_history",
+                    "source": "r2",
                     "daqi_index_level": 1,
                     "eaqi_index_level": 1,
                     "eaqi_input_value_ugm3": 3.969,
