@@ -4,7 +4,7 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>UK AQ station_snapshot_v2</title>
 <style>
-:root{--bg:#f3f6fb;--panel:#fff;--text:#10243b;--muted:#5e6f82;--line:#d8e0ea;--soft-line:#edf2f7;--accent:#145da0;--warn:#8b1e3f}*{box-sizing:border-box}body{margin:0;font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:linear-gradient(160deg,#eef4ff,#f7fbff 50%,#edf7f2);color:var(--text)}main{padding:18px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}h1{font-size:1.35rem;margin:0 0 4px}.muted{color:var(--muted)}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}input,select,button{border:1px solid #c4d1df;border-radius:8px;padding:8px 9px;font:inherit}input{min-width:320px}button{background:#eef4ff;color:#123;border-color:#bdd1e8;cursor:pointer;font-weight:650}button.active{background:var(--accent);color:#fff}.results{display:grid;gap:6px;margin-top:8px;max-width:780px}.result{width:100%;text-align:left;background:#fff}.status{padding:8px 10px;border-radius:8px;background:#ecf2fb;border:1px solid #d4e1f3}.warn{background:#fff5df;border-color:#f0c36a;color:#5a3b00}.debug-panel{font-size:.78rem}.debug-panel summary{cursor:pointer;font-weight:700}.debug-panel pre{white-space:pre-wrap;overflow:auto;background:#f7fbff;border:1px solid var(--line);border-radius:8px;padding:10px}.error{background:#fff2f5;border-color:#efc0cf;color:var(--warn)}.table-wrap{overflow:auto;max-height:72vh;padding:0}.table-wrap table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:.84rem}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap;background:#fff}tr.same-hour-row td{border-bottom-color:var(--soft-line)}tr.new-hour-row td{border-top:1px solid var(--line)}th{position:sticky;top:0;z-index:2;background:#f7fbff;box-shadow:0 1px 0 var(--line)}.bucket-repeat{color:transparent}.num{text-align:right;font-variant-numeric:tabular-nums}.swatch{display:inline-block;width:22px;height:22px;border:1px solid #c4d1df;border-radius:4px;vertical-align:middle;background:#fff}.aqi-colour-cell{text-align:right}.aqi-level-cell{text-align:left}.sort-header{border:0;background:transparent;padding:0;color:inherit;font:inherit;font-weight:700;cursor:pointer}.loading-scope{position:relative}.loading-overlay{position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.62);opacity:0;pointer-events:none;transition:opacity .5s ease}.loading-overlay.is-visible{opacity:1}.loading-overlay[hidden]{display:none}.uk-aq-loader{width:74px;height:74px;display:block;transform-origin:50% 50%;animation:ukAqSpin 1s linear infinite;will-change:transform}@keyframes ukAqSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.loading-overlay{transition:none}.uk-aq-loader{animation:none}}
+:root{--bg:#f3f6fb;--panel:#fff;--text:#10243b;--muted:#5e6f82;--line:#d8e0ea;--accent:#145da0;--warn:#8b1e3f}*{box-sizing:border-box}body{margin:0;font-family:"IBM Plex Sans","Segoe UI",sans-serif;background:linear-gradient(160deg,#eef4ff,#f7fbff 50%,#edf7f2);color:var(--text)}main{padding:18px;display:grid;gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}h1{font-size:1.35rem;margin:0 0 4px}.muted{color:var(--muted)}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}input,select,button{border:1px solid #c4d1df;border-radius:8px;padding:8px 9px;font:inherit}input{min-width:320px}button{background:#eef4ff;color:#123;border-color:#bdd1e8;cursor:pointer;font-weight:650}button.active{background:var(--accent);color:#fff}.results{display:grid;gap:6px;margin-top:8px;max-width:780px}.result{width:100%;text-align:left;background:#fff}.status{padding:8px 10px;border-radius:8px;background:#ecf2fb;border:1px solid #d4e1f3}.warn{background:#fff5df;border-color:#f0c36a;color:#5a3b00}.debug-panel{font-size:.78rem}.debug-panel summary{cursor:pointer;font-weight:700}.debug-panel pre{white-space:pre-wrap;overflow:auto;background:#f7fbff;border:1px solid var(--line);border-radius:8px;padding:10px}.error{background:#fff2f5;border-color:#efc0cf;color:var(--warn)}.table-wrap{overflow:auto}table{border-collapse:collapse;width:max-content;min-width:100%;font-size:.84rem}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap}th{position:sticky;top:0;background:#f7fbff}.num{text-align:right;font-variant-numeric:tabular-nums}.swatch{display:inline-block;width:22px;height:22px;border:1px solid #c4d1df;border-radius:4px;vertical-align:middle;background:#fff}.sort-header{border:0;background:transparent;padding:0;color:inherit;font:inherit;font-weight:700;cursor:pointer}.loading-scope{position:relative}.loading-overlay{position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.62);opacity:0;pointer-events:none;transition:opacity .5s ease}.loading-overlay.is-visible{opacity:1}.loading-overlay[hidden]{display:none}.uk-aq-loader{width:74px;height:74px;display:block;transform-origin:50% 50%;animation:ukAqSpin 1s linear infinite;will-change:transform}@keyframes ukAqSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.loading-overlay{transition:none}.uk-aq-loader{animation:none}}
 </style>
 </head>
 <body><main>
@@ -13,8 +13,8 @@
 <div id="warning" class="status warn" hidden></div><div id="status" class="status">Search for a station to begin.</div><details id="debugPanel" class="card debug-panel" hidden><summary>Rows debug</summary><pre id="debugPre"></pre></details>
 <div class="card table-wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 </main><script>
-const cols=['hour bucket','observed_at','ingestdb.observs.value','obsaqidb.observs.value','r2.observs.value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','DAQI colour','daqi_index_level','EAQI colour','eaqi_index_level'];
-const keys=['hour_bucket','observed_at','ingestdb_observs_value','obsaqidb_observs_value','r2_observs_value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','daqi_colour','daqi_index_level','eaqi_colour','eaqi_index_level'];
+const cols=['observed_at','ingestdb.observs.value','obsaqidb.observs.value','r2.observs.value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','DAQI colour','daqi_index_level','EAQI colour','eaqi_index_level'];
+const keys=['observed_at','ingestdb_observs_value','obsaqidb_observs_value','r2_observs_value','aqi_source','hourly_mean_ugm3','rolling24h_mean_ugm3','hourly_sample_count','daqi_colour','daqi_index_level','eaqi_colour','eaqi_index_level'];
 let station=null,pollutant='pm25',range='24h',timer=null,currentRows=[],sortAsc=true;
 let searchController=null,rowsController=null,searchToken=0,rowsToken=0,activeLoads=0,hideLoaderTimer=null;
 function selectedTimeseriesMeta(){
@@ -31,14 +31,14 @@ function rangeBoundsUtc(){
 function renderHeader(){
   head.innerHTML=cols.map((c,i)=>{
     if(keys[i]==='observed_at'){
-      return `<th><button id="sortObserved" class="sort-header" type="button">observed_at exact ${sortAsc ? '▲' : '▼'}</button></th>`;
+      return `<th><button id="sortObserved" class="sort-header" type="button">observed_at ${sortAsc ? '▲' : '▼'}</button></th>`;
     }
     return `<th>${c}</th>`;
   }).join('');
   document.getElementById('sortObserved').onclick=()=>{sortAsc=!sortAsc;renderHeader();renderRows()};
 }
 renderHeader();
-function fmtDate(v,mode='exact'){if(!v)return '';const d=new Date(v);if(isNaN(d))return String(v);const withSeconds=mode==='exact'&&(d.getSeconds()!==0||d.getMilliseconds()!==0);return new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:withSeconds?'2-digit':undefined,hour12:false}).format(d).replace(',','');}
+function fmtDate(v){if(!v)return '';const d=new Date(v);return isNaN(d)?String(v):new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}).format(d).replace(',','');}
 function isNullish(v){return v===null||v===undefined||v==='';}
 function fmt(v){if(typeof v==='number')return Number.isInteger(v)?String(v):String(Math.round(v*1000)/1000);return String(v)}
 function fmtNullable(v){return isNullish(v)?'NULL':fmt(v)}
@@ -50,7 +50,6 @@ function fieldPresenceFlag(k){
   return null;
 }
 function displayCell(row,k){
-  if(k==='hour_bucket')return fmtDate(row[k],'bucket');
   const flag=fieldPresenceFlag(k);
   if(flag&&!row[flag])return 'No Data';
   return fmtNullable(row[k]);
@@ -93,7 +92,7 @@ function sortedRows(){
 function compactDebug(debug){
   if(!debug)return null;
   const ordered={};
-  ['selected_timeseries_id','selected_timeseries_ref','selected_station_ref','selected_connector_id','selected_service_ref','selected_phenomenon_id','range_start_utc','range_end_utc','observation_key_mode','aqi_key_mode','exact_observation_row_count','same_hour_observation_group_count','max_observations_in_hour_bucket','collapsed_hour_collision_count','pre_fix_hour_collision_source_bucket_count','non_hourly_observation_count','standalone_aqi_only_row_count','direct_r2_observs_row_count','r2_observs_source_used','r2_lookup_key_or_filter','chart_history_row_count','chart_history_rows_used_for_r2_column','chart_history_source_mode','chart_history_r2_row_count','chart_history_ingest_row_count','chart_history_r2_coverage_end','chart_history_used_r2','chart_history_used_supabase','chart_history_source_routing_decision','chart_history_route_used','chart_history_params_equivalent','chart_history_object_rows_read','chart_history_candidate_key_count','chart_history_candidate_keys_checked','chart_history_candidate_manifest_match_count','chart_history_candidate_manifest_matches','chart_history_first_matching_key','chart_history_first_matching_key_reason','r2_aqi_row_count','r2_aqi_source_used','obsaqidb_aqi_row_count','aqi_row_count','aqi_overlap_detected','r2_aqi_lookup_key_or_filter','ingestdb_row_count','obsaqidb_row_count','merged_row_count','selected_timeseries_latest_at_utc','selected_timeseries_latest_in_range'].forEach(k=>{if(debug[k]!==undefined)ordered[k]=debug[k];});
+  ['selected_timeseries_id','selected_timeseries_ref','selected_station_ref','selected_connector_id','selected_service_ref','selected_phenomenon_id','range_start_utc','range_end_utc','source_mode','used_r2','used_supabase','source_routing_decision','chart_history_route_used','chart_history_params_equivalent','r2_row_count','r2_aqi_row_count','obsaqidb_aqi_row_count','aqi_row_count','aqi_overlap_detected','r2_object_rows_read','r2_rows_after_time_filter','r2_candidate_key_count','r2_candidate_keys_checked','r2_candidate_manifest_match_count','r2_candidate_manifest_matches','r2_first_matching_key','r2_first_matching_key_reason','r2_aqi_lookup_key_or_filter','ingestdb_row_count','obsaqidb_row_count','merged_row_count','selected_timeseries_latest_at_utc','selected_timeseries_latest_in_range'].forEach(k=>{if(debug[k]!==undefined)ordered[k]=debug[k];});
   Object.keys(debug).forEach(k=>{if(ordered[k]===undefined)ordered[k]=debug[k];});
   return ordered;
 }
@@ -119,19 +118,7 @@ function renderDebug(debug){
   debugPre.textContent=JSON.stringify(compact,null,2);
 }
 function renderRows(){
-  let prevBucket=null;
-  body.innerHTML=sortedRows().map(row=>{
-    const sameHour=row.hour_bucket&&row.hour_bucket===prevBucket;
-    const rowClass=sameHour?'same-hour-row':'new-hour-row';
-    const cells=keys.map(k=>{
-      if(k==='hour_bucket'){const text=sameHour?'':fmtDate(row[k],'bucket');prevBucket=row.hour_bucket||prevBucket;return `<td class="${sameHour?'bucket-repeat':''}">${text}</td>`;}
-      if(k==='observed_at')return `<td>${fmtDate(row[k],'exact')}</td>`;
-      if(k==='daqi_colour'||k==='eaqi_colour')return `<td class="aqi-colour-cell">${colourCell(row,k)}</td>`;
-      if(k==='daqi_index_level'||k==='eaqi_index_level')return `<td class="aqi-level-cell">${displayCell(row,k)}</td>`;
-      return `<td class="${typeof row[k]==='number'?'num':''}">${displayCell(row,k)}</td>`;
-    }).join('');
-    return `<tr class="${rowClass}">${cells}</tr>`;
-  }).join('');
+  body.innerHTML=sortedRows().map(row=>`<tr>${keys.map(k=>{if(k==='observed_at')return `<td>${fmtDate(row[k])}</td>`; if(k.endsWith('colour'))return `<td>${colourCell(row,k)}</td>`; return `<td class="${typeof row[k]==='number'?'num':''}">${displayCell(row,k)}</td>`}).join('')}</tr>`).join('');
 }
 async function search(){
   const q=document.getElementById('q').value.trim();
