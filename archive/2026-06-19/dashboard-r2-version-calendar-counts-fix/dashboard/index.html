@@ -879,13 +879,19 @@
       }
 
       .coverage-bar-dropbox-only-observs {
-        background: var(--color-r2-observs);
-        border: 0;
+        background: #ffffff;
+        border: 1px solid var(--color-r2-observs);
       }
 
       .coverage-bar-dropbox-only-aqilevels {
-        background: var(--color-r2-aqilevels);
-        border: 0;
+        background: #ffffff;
+        border: 1px solid var(--color-r2-aqilevels);
+      }
+
+      .coverage-bar-dropbox-only-observs .coverage-bar-label,
+      .coverage-bar-dropbox-only-aqilevels .coverage-bar-label {
+        color: #000000;
+        text-shadow: none;
       }
 
       .coverage-bar-aqilevels-striped {
@@ -928,11 +934,6 @@
         margin-bottom: 14px;
         color: #5f574c;
         font-size: 13px;
-      }
-
-      .coverage-connector-counts-note.is-warning {
-        color: #7b4a00;
-        font-weight: 700;
       }
 
       .coverage-connector-chart-grid {
@@ -1075,15 +1076,16 @@
 
       .coverage-square-dropbox-only-observs,
       .coverage-square-dropbox-only-aqilevels {
+        background-color: #ffffff;
         box-sizing: border-box;
       }
 
       .coverage-square-dropbox-only-observs {
-        background-color: var(--color-r2-observs);
+        border: 1px solid var(--color-r2-observs);
       }
 
       .coverage-square-dropbox-only-aqilevels {
-        background-color: var(--color-r2-aqilevels);
+        border: 1px solid var(--color-r2-aqilevels);
       }
 
       .coverage-square.has-backup-icon {
@@ -4638,22 +4640,6 @@
         const subtitle = isYearMode
           ? "Year view shows monthly average rows per day. Stacked mode places AQI on the bottom and Observs on the top."
           : "Month view shows daily row totals. Stacked mode places AQI on the bottom and Observs on the top.";
-        const payloadWarningParts = [];
-        if (payload && payload.read_version_label) {
-          payloadWarningParts.push(`active version ${payload.read_version_label}`);
-        }
-        if (payload && payload.error) {
-          const attemptedKeys = payload.index_keys && typeof payload.index_keys === "object"
-            ? Object.values(payload.index_keys).filter(Boolean).join(", ")
-            : "unknown index key";
-          payloadWarningParts.push(`index warning: ${payload.error}; attempted ${attemptedKeys}`);
-        }
-        if (payload && payload.read_version_warning) {
-          payloadWarningParts.push(payload.read_version_warning);
-        }
-        const payloadWarningMarkup = payloadWarningParts.length
-          ? `<div class="coverage-connector-counts-note is-warning">${escapeHtml(payloadWarningParts.join(" • "))}</div>`
-          : "";
 
         container.innerHTML = `
           <div class="coverage-connector-counts-head">
@@ -4666,7 +4652,6 @@
             </div>
           </div>
           <div class="coverage-connector-counts-note">${escapeHtml(subtitle)}</div>
-          ${payloadWarningMarkup}
           ${bodyMarkup}
         `;
 
@@ -4916,7 +4901,7 @@
         if (isYearMode) {
           const yearStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
           bodyMarkup = renderCoverageYearGrid(yearStartUtc, resolved.rows);
-          footnoteText = "Squares only and complete days only (today excluded). With ingest: red top-left and blue/green on the bottom row. Without ingest: blue/green on top row and R2 orange/yellow on bottom row. Backup-only days use the same filled orange/yellow storage colours with a blue Dropbox icon.";
+          footnoteText = "Squares only and complete days only (today excluded). With ingest: red top-left and blue/green on the bottom row. Without ingest: blue/green on top row and R2 orange/yellow on bottom row. Dropbox-only backup days render as white squares with orange/yellow borders and a blue Dropbox icon.";
         } else {
           const calendarCells = buildCoverageCalendarCells(monthStartUtc, resolved.rows, true);
           const cellsMarkup = calendarCells
@@ -4962,7 +4947,7 @@
             })
             .join("");
           bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
-          footnoteText = "Top: Ingest DB (red), R2 History - Obs (orange), or Backup - Obs (orange filled). Middle: ObsAQI DB - Obs (blue). Bottom: AQI (yellow/green, striped when both R2 + ObsAQI are present) or Backup - AQI (yellow filled). R2 bars with Dropbox copy show a second line (blue Dropbox icon + Backup). Today shows half-width bars.";
+          footnoteText = "Top: Ingest DB (red), R2 History - Obs (orange), or Dropbox-only Backup - Obs (white with orange border). Middle: ObsAQI DB - Obs (blue). Bottom: AQI (yellow/green, striped when both R2 + ObsAQI are present) or Dropbox-only Backup - AQI (white with yellow border). R2 bars with Dropbox copy show a second line (blue Dropbox icon + Backup). Today shows half-width bars.";
         }
 
         panel.innerHTML = `
