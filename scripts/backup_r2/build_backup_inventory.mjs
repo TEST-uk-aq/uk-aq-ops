@@ -19,6 +19,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   joinTargetPath,
@@ -41,6 +42,8 @@ import {
   loadInventory,
   parseBackupVersion,
   resolveBackupVersion,
+  RUN_MANIFEST_UNIT_KEYS,
+  runManifestPrefixForBackupVersion,
 } from "./lib/inventory.mjs";
 
 const DEFAULT_BACKUP_VERSION = resolveBackupVersion(process.env);
@@ -66,6 +69,11 @@ const INDEX_TREE_UNIT_V2_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/pollutant_code=(pm25|pm10|no2)\/manifest\.json$/;
 const COMMITTED_CONNECTOR_MANIFEST_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
+const RUN_MANIFEST_UNIT_PATTERN = /^run_id=[^/]+\/run_manifest\.json$/;
+
+export function isRunManifestUnitPath(relativePath) {
+  return RUN_MANIFEST_UNIT_PATTERN.test(String(relativePath || ""));
+}
 
 function resolveDomainPrefixes(backupVersion, env = process.env) {
   const version = parseBackupVersion(backupVersion);
@@ -114,6 +122,7 @@ function usage() {
       "  --domain <name>            observations | aqilevels | aqilevels_debug | core (repeatable)",
       `  --index-prefix <prefix>    Default: ${DEFAULT_INDEX_PREFIX || "history/_index"}`,
       `  --index-v2-prefix <prefix> Default: ${DEFAULT_INDEX_V2_PREFIX || "history/_index_v2"}`,
+      "  --runs-prefix <prefix>     Override selected-version run manifest prefix",
       `  --rclone-bin <name>        Default: ${DEFAULT_RCLONE_BIN}`,
       "  --report-out <file>        Write JSON report to file",
       "  --dry-run                  Build/validate only; do not upload inventory",
@@ -132,6 +141,7 @@ function parseArgs(argv) {
     domains: [],
     index_prefix: DEFAULT_INDEX_PREFIX,
     index_v2_prefix: DEFAULT_INDEX_V2_PREFIX,
+    runs_prefix: "",
     rclone_bin: DEFAULT_RCLONE_BIN,
     report_out: DEFAULT_REPORT_OUT,
     dry_run: false,
@@ -175,6 +185,11 @@ function parseArgs(argv) {
     if (arg === "--index-v2-prefix") {
       args.index_v2_prefix =
         normalizePrefix(argv[i + 1] || "") || DEFAULT_INDEX_V2_PREFIX;
+      i += 1;
+      continue;
+    }
+    if (arg === "--runs-prefix") {
+      args.runs_prefix = normalizePrefix(argv[i + 1] || "");
       i += 1;
       continue;
     }
@@ -552,6 +567,51 @@ function indexTreeScanConfig(treeKey, args) {
 
 // ---- Phase: committed per-(day, connector) observation manifests ----
 
+function scanRunManifests({
+  rcloneBin,
+  sourceRoot,
+  runsPrefix,
+  previousUnits,
+  excludeRelativePaths,
+  stats,
+}) {
+  const sourcePath = joinTargetPath(sourceRoot, runsPrefix);
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, sourcePath, { maxDepth: 2 });
+  const units = {};
+  for (const entry of lsjsonEntries) {
+    const relPath = String(entry?.Path || "");
+    if (!isRunManifestUnitPath(relPath)) continue;
+    const unitRelativePath = `${runsPrefix}/${relPath}`;
+    if (excludeRelativePaths.has(unitRelativePath)) continue;
+    stats.run_manifest_units_listed += 1;
+
+    const currentMeta = extractLsjsonMetadata(entry);
+    recordMd5Availability(stats, currentMeta.has_md5);
+    const previousEntry = previousUnits?.[relPath] || null;
+    const prevMeta = previousMetadata(previousEntry, "size");
+    const reuseClass = previousEntry && previousEntry.hash
+      ? classifyReuse(currentMeta, prevMeta)
+      : null;
+
+    if (reuseClass) {
+      units[relPath] = { ...previousEntry };
+      stats.run_manifest_units_skipped += 1;
+      recordReuseOutcome(stats, reuseClass);
+      continue;
+    }
+
+    const unitSourcePath = joinTargetPath(sourceRoot, unitRelativePath);
+    const fileText = rcloneCat(rcloneBin, unitSourcePath);
+    stats.run_manifest_units_reread += 1;
+    units[relPath] = buildFileInventoryEntry({
+      relativePath: unitRelativePath,
+      fileText,
+      lsjsonEntry: entry,
+    });
+  }
+  return units;
+}
+
 function scanCommittedConnectorManifests({
   rcloneBin,
   sourceRoot,
@@ -659,6 +719,16 @@ function computeSummary(inventory, { domainNames, indexTreeKeys }) {
       inventory.committed_connector_units?.[key]?.units || {},
     ).length;
   }
+  const runManifestUnitCount = {};
+  const runManifestUnitBytes = {};
+  for (const key of RUN_MANIFEST_UNIT_KEYS) {
+    const units = inventory.run_manifest_units?.[key]?.units || {};
+    runManifestUnitCount[key] = Object.keys(units).length;
+    runManifestUnitBytes[key] = Object.values(units).reduce(
+      (sum, entry) => sum + (safeIntOrNull(entry?.size) ?? 0),
+      0,
+    );
+  }
   return {
     domain_day_count: domainDayCount,
     domain_object_count: domainObjectCount,
@@ -668,6 +738,8 @@ function computeSummary(inventory, { domainNames, indexTreeKeys }) {
     index_tree_unit_count: indexTreeUnitCount,
     index_tree_unit_bytes: indexTreeUnitBytes,
     committed_connector_unit_count: committedConnectorUnitCount,
+    run_manifest_unit_count: runManifestUnitCount,
+    run_manifest_unit_bytes: runManifestUnitBytes,
   };
 }
 
@@ -680,6 +752,7 @@ async function main() {
   const defaultDomains = domainNamesForBackupVersion(args.backup_version);
   const indexFileKeys = indexFileKeysForBackupVersion(args.backup_version);
   const indexTreeKeys = indexTreeKeysForBackupVersion(args.backup_version);
+  const runsPrefix = args.runs_prefix || runManifestPrefixForBackupVersion(args.backup_version);
 
   if (args.show_version) {
     const selected = {
@@ -691,6 +764,7 @@ async function main() {
       domain_prefixes: domainPrefixes,
       index_prefix: args.index_prefix,
       index_v2_prefix: args.index_v2_prefix,
+      runs_prefix: runsPrefix,
       index_file_keys: indexFileKeys,
       index_tree_keys: indexTreeKeys,
     };
@@ -712,6 +786,7 @@ async function main() {
       backup_version: args.backup_version,
       index_prefix: args.index_prefix,
       index_v2_prefix: args.index_v2_prefix,
+      runs_prefix: runsPrefix,
       domain_prefixes: Object.fromEntries(
         args.domains.map((domain) => [domain, domainPrefixes[domain] || null]),
       ),
@@ -722,6 +797,9 @@ async function main() {
       indexTreeKeys.map((treeKey) => [treeKey, { units: {} }]),
     ),
     committed_connector_units: {
+      observations: { units: {} },
+    },
+    run_manifest_units: {
       observations: { units: {} },
     },
     summary: {},
@@ -740,6 +818,9 @@ async function main() {
     committed_connector_units_listed: 0,
     committed_connector_units_reread: 0,
     committed_connector_units_skipped: 0,
+    run_manifest_units_listed: 0,
+    run_manifest_units_reread: 0,
+    run_manifest_units_skipped: 0,
     // MD5 availability per lsjson entry across all three categories.
     // r2_md5_missing_count > 0 means rclone didn't return Hashes.md5 for
     // some objects (despite --hash --hash-type MD5) — could be multipart-style
@@ -844,6 +925,22 @@ async function main() {
   }
   stats.elapsed_ms.committed_connector_units = Date.now() - tConnectorManifests;
 
+  const tRunManifests = Date.now();
+  if (args.domains.includes("observations")) {
+    const previousUnits =
+      previousInventory?.run_manifest_units?.observations?.units || {};
+    const units = scanRunManifests({
+      rcloneBin: args.rclone_bin,
+      sourceRoot: args.source_root,
+      runsPrefix,
+      previousUnits,
+      excludeRelativePaths,
+      stats,
+    });
+    inventory.run_manifest_units.observations = { units };
+  }
+  stats.elapsed_ms.run_manifest_units = Date.now() - tRunManifests;
+
   inventory.summary = computeSummary(inventory, {
     domainNames: args.domains,
     indexTreeKeys,
@@ -878,7 +975,8 @@ async function main() {
     stats.manifests_reread
     + stats.index_files_reread
     + stats.index_tree_units_reread
-    + stats.committed_connector_units_reread;
+    + stats.committed_connector_units_reread
+    + stats.run_manifest_units_reread;
   const rereadFullRebuild = args.full_rebuild ? totalRereadAllCategories : 0;
   const rereadNewOrChanged = args.full_rebuild ? 0 : totalRereadAllCategories;
 
@@ -920,6 +1018,7 @@ async function main() {
     ),
     index_prefix: args.index_prefix,
     index_v2_prefix: args.index_v2_prefix,
+    runs_prefix: runsPrefix,
     inventory_size: Buffer.byteLength(inventoryJson, "utf8"),
     inventory_hash: inventoryHash,
     generated_at: inventory.generated_at,
@@ -939,6 +1038,9 @@ async function main() {
     committed_connector_units_listed: stats.committed_connector_units_listed,
     committed_connector_units_reread: stats.committed_connector_units_reread,
     committed_connector_units_skipped: stats.committed_connector_units_skipped,
+    run_manifest_units_listed: stats.run_manifest_units_listed,
+    run_manifest_units_reread: stats.run_manifest_units_reread,
+    run_manifest_units_skipped: stats.run_manifest_units_skipped,
     r2_md5_available_count: stats.r2_md5_available_count,
     r2_md5_missing_count: stats.r2_md5_missing_count,
     reuse_by_r2_md5_size: stats.reuse_by_r2_md5_size,
@@ -955,10 +1057,17 @@ async function main() {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(
-    `${JSON.stringify({ ok: false, error: message }, null, 2)}\n`,
-  );
-  process.exit(1);
-});
+function isMainModule(moduleUrl) {
+  if (!process.argv[1]) return false;
+  return path.resolve(process.argv[1]) === fileURLToPath(moduleUrl);
+}
+
+if (isMainModule(import.meta.url)) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `${JSON.stringify({ ok: false, error: message }, null, 2)}\n`,
+    );
+    process.exit(1);
+  });
+}

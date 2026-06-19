@@ -13,7 +13,10 @@ import {
   planDays,
   planIndexFiles,
   planIndexTreeUnits,
+  planRunManifestUnits,
+  sanitizeCheckpointState,
 } from "../scripts/backup_r2/sync_history_to_dropbox.mjs";
+import { isRunManifestUnitPath } from "../scripts/backup_r2/build_backup_inventory.mjs";
 import {
   defaultInventoryRelPathForBackupVersion,
   defaultStateRelPathForBackupVersion,
@@ -23,10 +26,11 @@ import {
   indexFileKeysForBackupVersion,
   indexTreeKeysForBackupVersion,
   resolveBackupVersion,
+  runManifestPrefixForBackupVersion,
   validateInventoryPayload,
 } from "../scripts/backup_r2/lib/inventory.mjs";
 
-function makeInventory({ backupVersion = "v1", days = {}, indexFiles = {}, indexTreeUnits = {} } = {}) {
+function makeInventory({ backupVersion = "v1", days = {}, indexFiles = {}, indexTreeUnits = {}, runManifestUnits = {} } = {}) {
   const tree = {
     observations_timeseries: { units: {} },
     aqilevels_timeseries: { units: {} },
@@ -49,11 +53,12 @@ function makeInventory({ backupVersion = "v1", days = {}, indexFiles = {}, index
     },
     index_files: indexFiles,
     index_tree_units: tree,
+    run_manifest_units: { observations: { units: runManifestUnits.observations || {} } },
     summary: {},
   };
 }
 
-function makeCheckpoint({ days = {}, indexFiles = {}, indexTreeUnits = {} } = {}) {
+function makeCheckpoint({ days = {}, indexFiles = {}, indexTreeUnits = {}, runManifestUnits = {} } = {}) {
   const buildDomain = (dayMap) => ({
     days: dayMap,
     last_successful_day_utc: null,
@@ -79,6 +84,7 @@ function makeCheckpoint({ days = {}, indexFiles = {}, indexTreeUnits = {} } = {}
     },
     index_files: indexFiles,
     index_tree_units: tree,
+    run_manifest_units: { observations: { units: runManifestUnits.observations || {} } },
   };
 }
 
@@ -278,6 +284,110 @@ test("planIndexFiles and planIndexTreeUnits include v2 pollutant index keys", ()
     treeCandidates[0].unit_key,
     "day_utc=2026-05-10/connector_id=6/pollutant_code=pm25/manifest.json",
   );
+});
+
+
+// ----- run manifest inventory/sync units -----
+
+test("backup version selection resolves selected run manifest prefixes", () => {
+  assert.equal(
+    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_BACKUP_VERSION: "v2" })),
+    "history/v2/_ops/observations/runs",
+  );
+  assert.equal(
+    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" })),
+    "history/v2/_ops/observations/runs",
+  );
+  assert.equal(
+    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_BACKUP_VERSION: "v1", UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" })),
+    "history/v1/_ops/observations/runs",
+  );
+});
+
+test("run manifest inventory path filter accepts only run_id manifest files", () => {
+  assert.equal(isRunManifestUnitPath("run_id=abc-123/run_manifest.json"), true);
+  assert.equal(isRunManifestUnitPath("run_id=abc-123/other.json"), false);
+  assert.equal(isRunManifestUnitPath("not_run_id=abc-123/run_manifest.json"), false);
+  assert.equal(isRunManifestUnitPath("run_id=abc-123/nested/run_manifest.json"), false);
+});
+
+test("planRunManifestUnits: changed hash queued and same checkpoint hash skipped", () => {
+  const unitKeySame = "run_id=same/run_manifest.json";
+  const unitKeyChanged = "run_id=changed/run_manifest.json";
+  const inventory = makeInventory({
+    backupVersion: "v2",
+    runManifestUnits: { observations: {
+      [unitKeySame]: { unit_type: "file", relative_path: `history/v2/_ops/observations/runs/${unitKeySame}`, hash: "hash-same", size: 12 },
+      [unitKeyChanged]: { unit_type: "file", relative_path: `history/v2/_ops/observations/runs/${unitKeyChanged}`, hash: "hash-new", size: 34 },
+    } },
+  });
+  const state = makeCheckpoint({
+    runManifestUnits: { observations: {
+      [unitKeySame]: { relative_path: `history/v2/_ops/observations/runs/${unitKeySame}`, copied_at: "2026-06-01T00:00:00.000Z", hash: "hash-same", size: 12 },
+      [unitKeyChanged]: { relative_path: `history/v2/_ops/observations/runs/${unitKeyChanged}`, copied_at: "2026-06-01T00:00:00.000Z", hash: "hash-old", size: 34 },
+    } },
+  });
+
+  const candidates = planRunManifestUnits(inventory, state, { domains: ["observations"] });
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].unit_key, unitKeyChanged);
+});
+
+test("selected v2 run manifests do not include v1 units", () => {
+  const inventory = makeInventory({
+    backupVersion: "v2",
+    runManifestUnits: { observations: {
+      "run_id=v2/run_manifest.json": { unit_type: "file", relative_path: "history/v2/_ops/observations/runs/run_id=v2/run_manifest.json", hash: "v2", size: 1 },
+    } },
+  });
+  const candidates = planRunManifestUnits(inventory, makeCheckpoint({}), { domains: ["observations"] });
+  assert.equal(candidates.length, 1);
+  assert.match(candidates[0].inventory_entry.relative_path, /^history\/v2\//);
+});
+
+
+test("old checkpoints without run_manifest_units are upgraded in memory", () => {
+  const state = sanitizeCheckpointState({
+    version: 1,
+    created_at: "2026-06-01T00:00:00.000Z",
+    updated_at: "2026-06-01T00:00:00.000Z",
+    domains: { observations: { days: {} } },
+  }, { backupVersion: "v2" });
+
+  assert.deepEqual(state.run_manifest_units, { observations: { units: {} } });
+});
+
+test("run manifest checkpoint entries retain relative path, copied_at, hash, and size", () => {
+  const state = sanitizeCheckpointState({
+    run_manifest_units: { observations: { units: {
+      "run_id=copied/run_manifest.json": {
+        relative_path: "history/v2/_ops/observations/runs/run_id=copied/run_manifest.json",
+        copied_at: "2026-06-02T00:00:00.000Z",
+        hash: "abc123",
+        size: 321,
+      },
+    } } },
+  }, { backupVersion: "v2" });
+
+  assert.deepEqual(state.run_manifest_units.observations.units["run_id=copied/run_manifest.json"], {
+    relative_path: "history/v2/_ops/observations/runs/run_id=copied/run_manifest.json",
+    copied_at: "2026-06-02T00:00:00.000Z",
+    hash: "abc123",
+    size: 321,
+  });
+});
+
+test("selected v1 run manifests are supported as straightforward legacy file units", () => {
+  const inventory = makeInventory({
+    backupVersion: "v1",
+    runManifestUnits: { observations: {
+      "run_id=v1/run_manifest.json": { unit_type: "file", relative_path: "history/v1/_ops/observations/runs/run_id=v1/run_manifest.json", hash: "v1", size: 1 },
+    } },
+  });
+  const candidates = planRunManifestUnits(inventory, makeCheckpoint({}), { domains: ["observations"] });
+  assert.equal(candidates.length, 1);
+  assert.match(candidates[0].inventory_entry.relative_path, /^history\/v1\//);
 });
 
 // ----- backup version selection -----

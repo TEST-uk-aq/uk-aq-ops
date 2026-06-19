@@ -6,7 +6,7 @@ For the canonical R2 object tree and manifest/index payload shapes, see `system_
 
 ## Purpose
 
-- Mirror committed R2 History day folders (and the derived index files used by the history fast paths) into Dropbox.
+- Mirror committed R2 History day folders, derived index files used by the history fast paths, and selected-version Phase B run manifests into Dropbox.
 - Detect any old R2 day whose manifest has been rewritten and re-copy it — the system never assumes old days are immutable.
 - Avoid reading every old day's manifest on every backup run. Steady-state runs are near-instant.
 
@@ -69,6 +69,7 @@ Shape (abbreviated):
   "source": {
     "index_prefix": "history/_index",
     "index_v2_prefix": "history/_index_v2",
+    "runs_prefix": "history/v2/_ops/observations/runs",
     "domain_prefixes": {...}
   },
   "domains": {
@@ -114,10 +115,26 @@ Shape (abbreviated):
     },
     "aqilevels_hourly_data_timeseries_v2": { "units": {...} }
   },
+  "run_manifest_units": {
+    "observations": {
+      "units": {
+        "run_id=<run_id>/run_manifest.json": {
+          "unit_type": "file",
+          "relative_path": "history/v2/_ops/observations/runs/run_id=<run_id>/run_manifest.json",
+          "hash": "<sha256>",
+          "size": 123,
+          "r2_md5": "<R2 object MD5 etag>",
+          "r2_modtime": "..."
+        }
+      }
+    }
+  },
   "summary": {
     "domain_day_count": {...},
     "domain_object_count": {...},
     "domain_total_bytes": {...},
+    "run_manifest_unit_count": { "observations": 1 },
+    "run_manifest_unit_bytes": { "observations": 123 },
     "index_file_count": 4,
     "index_file_bytes": 12345,
     "index_tree_unit_count": {...},
@@ -196,7 +213,7 @@ Mirrored v2 domain paths:
 - `history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/...`
 - `history/v2/core/day_utc=YYYY-MM-DD/...`
 
-Operational Phase B run manifests are written outside the Dropbox backup domains. With `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, prune Phase B writes run manifests under `history/v2/_ops/observations/runs/run_id=<run_id>/run_manifest.json`. Dropbox run-manifest backup is intentionally not included here and is a separate follow-up.
+Operational Phase B run manifests are written outside the day-folder domains and are copied as file units, not as domain day folders. In v2 backup mode, Dropbox backups include run manifests from `history/v2/_ops/observations/runs/run_id=<run_id>/run_manifest.json`. In v1 backup mode, the same inventory/sync path supports legacy run manifests from `history/v1/_ops/observations/runs/run_id=<run_id>/run_manifest.json`. The selected backup mode does not copy the other version's run manifests.
 
 Mirrored v1 derived index files:
 
@@ -207,12 +224,13 @@ Mirrored v1 derived index files:
 - `history/_index/observations_timeseries/day_utc=YYYY-MM-DD/connector_id=<id>/manifest.json`
 - `history/_index/aqilevels_timeseries/day_utc=YYYY-MM-DD/connector_id=<id>/manifest.json`
 
-Mirrored v2 derived index files:
+Mirrored v2 derived index files and run manifests:
 
 - `history/_index_v2/observations_timeseries_latest.json`
 - `history/_index_v2/aqilevels_hourly_data_timeseries_latest.json`
 - `history/_index_v2/observations_timeseries/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json`
 - `history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json`
+- `history/v2/_ops/observations/runs/run_id=<run_id>/run_manifest.json`
 
 Checkpoint paths:
 
@@ -254,6 +272,13 @@ The checkpoint records, per backup unit, what was last successfully copied to Dr
       }
     },
     "aqilevels_timeseries": { "units": {...} }
+  },
+  "run_manifest_units": {
+    "observations": {
+      "units": {
+        "run_id=<run_id>/run_manifest.json": { "relative_path": "...", "copied_at": "...", "hash": "...", "size": N }
+      }
+    }
   }
 }
 ```
@@ -278,6 +303,7 @@ CLI:
 --domain <name>                      observations | aqilevels | aqilevels_debug | core
 --index-prefix <prefix>              default history/_index
 --index-v2-prefix <prefix>           default history/_index_v2
+--runs-prefix <prefix>              optional selected-version run manifest prefix override
 --rclone-bin <name>                  default rclone
 --report-out <file>                  write JSON report to file
 --dry-run                            build/validate only; do not upload
@@ -291,9 +317,10 @@ Behaviour:
 2. For each selected domain, `rclone lsjson --recursive` enumerates every `day_utc=*/manifest.json`. For each: if etag+size matches the previous inventory entry, reuse verbatim; otherwise `rclone cat` it, SHA-256 the bytes, extract `file_count`/`total_bytes`/`source_row_count`.
 3. In v1 mode, scans v1 `*_latest.json` index files and v1 per-`(day, connector)` index manifests only.
 4. In v2 mode, scans `_index_v2/*_latest.json` files and v2 per-`(day, connector, pollutant)` index manifests only.
-5. Writes deterministic JSON, uploads via `rclone copyto` from a temp file unless `--dry-run`.
-6. Defensive guard: the inventory's own path is excluded from all scans so it can never include itself.
-7. In v2 mode, reports any selected v2 domain with zero day manifests under `backup_warnings` and `missing_domain_prefixes`; it does not silently fall back to v1 core.
+5. Scans only the selected backup version's Phase B run-manifest prefix (`history/v2/_ops/observations/runs` for v2, `history/v1/_ops/observations/runs` for v1) and includes only `run_id=<id>/run_manifest.json` file units. Malformed siblings and nested paths are ignored.
+6. Writes deterministic JSON, uploads via `rclone copyto` from a temp file unless `--dry-run`.
+7. Defensive guard: the inventory's own path is excluded from all scans so it can never include itself.
+8. In v2 mode, reports any selected v2 domain with zero day manifests under `backup_warnings` and `missing_domain_prefixes`; it does not silently fall back to v1 core.
 
 ### Sync — `scripts/backup_r2/sync_history_to_dropbox.mjs`
 
@@ -322,8 +349,9 @@ Behaviour:
 3. **Plan days** per domain: for each day in inventory, compare `manifest_hash` against checkpoint's stored hash. Mismatch → queue. Apply `--max-days-per-run` per domain.
 4. **Plan index files**: same hash compare for the selected version's index latest files.
 5. **Plan index tree units**: same hash compare for the selected version's index tree manifests.
-6. **Copy** queued units (`rclone copy` for day folders, `rclone copyto` for single files). Dropbox `too_many_write_operations` responses are retried with exponential backoff before the unit is treated as failed. On each successful copy, update the checkpoint section and rewrite the checkpoint.
-7. **No deletion propagation**: units in the checkpoint but absent from the inventory are ignored; nothing is removed from Dropbox.
+6. **Plan run manifest units**: same hash compare for the selected version's Phase B run manifests. These are copied with `rclone copyto` and keep the same relative path in Dropbox.
+7. **Copy** queued units (`rclone copy` for day folders, `rclone copyto` for single files). Dropbox `too_many_write_operations` responses are retried with exponential backoff before the unit is treated as failed. On each successful copy, update the checkpoint section and rewrite the checkpoint.
+8. **No deletion propagation**: units in the checkpoint but absent from the inventory are ignored; nothing is removed from Dropbox.
 
 ### Shared library — `scripts/backup_r2/lib/`
 
