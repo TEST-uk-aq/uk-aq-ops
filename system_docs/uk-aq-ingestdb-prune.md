@@ -38,6 +38,7 @@ Bucket key is:
   - failures are logged as `phase_b_history_index_rebuild_failed`
   - prune compare/delete work continues, so core prune safety is not blocked by index refresh drift
 - `uk_aq_ops.prune_day_gates.history_done` continues to gate prune deletes using observation backup completion.
+- The prune history gate also requires a non-empty day-level manifest key and `history_completed_at`. Accepted day manifest paths are legacy v1 observation/AQI hourly manifests and v2 observation manifests, including `history/v2/observations/day_utc=YYYY-MM-DD/manifest.json`. Connector-level or pollutant-level manifests under a day do not satisfy the day gate.
 - Legacy staging objects are still cleaned up by retention policy (`history/v1/_ops/observations/staging/...`) to drain old runs.
 - Prune deletion for an hour bucket is allowed only when that bucket day has `history_done=true`.
 
