@@ -36,6 +36,9 @@ export const INDEX_TREE_KEYS = Object.freeze([...V1_INDEX_TREE_KEYS, ...V2_INDEX
 export const COMMITTED_CONNECTOR_UNIT_KEYS = Object.freeze([
   "observations",
 ]);
+export const RUN_MANIFEST_UNIT_KEYS = Object.freeze([
+  "observations",
+]);
 
 export const DEFAULT_V1_INVENTORY_REL_PATH = "history/_index/backup_inventory_v1.json";
 export const DEFAULT_V2_INVENTORY_REL_PATH = "history/_index_v2/backup_inventory_v2.json";
@@ -84,6 +87,12 @@ export function indexTreeKeysForBackupVersion(backupVersion) {
   return parseBackupVersion(backupVersion) === "v2"
     ? [...V2_INDEX_TREE_KEYS]
     : [...V1_INDEX_TREE_KEYS];
+}
+
+export function runManifestPrefixForBackupVersion(backupVersion, env = process.env) {
+  return parseBackupVersion(backupVersion) === "v2"
+    ? String(env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || "history/v2/_ops/observations/runs").replace(/^\/+|\/+$/g, "")
+    : String(env.UK_AQ_R2_HISTORY_RUNS_PREFIX || "history/v1/_ops/observations/runs").replace(/^\/+|\/+$/g, "");
 }
 
 // Pure validator for an `rcloneCatMaybe`-shaped result. Extracted from
