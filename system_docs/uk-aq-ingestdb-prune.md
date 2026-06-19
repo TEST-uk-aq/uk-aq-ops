@@ -23,8 +23,8 @@ Bucket key is:
 - Example: on `2026-03-17`, with `INGESTDB_RETENTION_DAYS=7`, latest eligible day is `2026-03-09`; with `INGESTDB_RETENTION_DAYS=5`, latest eligible day is `2026-03-11`.
 - Observations source rows are streamed through server-side projection function `uk_aq_ops.uk_aq_phase_b_history_rows` by `(day_utc, connector_id)` and written to R2 Parquet with ZSTD compression.
 - Observations part rollover defaults to `1,000,000` rows per file.
-- Observations write each part directly to committed prefix (`history/v1/observations/...`) and persist resume checkpoint state after each part so retries continue from the last committed tuple instead of re-reading full-day rows.
-- AQI levels are exported in the same run for completed observation days that are missing AQI day manifests; AQI rows are streamed from `uk_aq_aqilevels.timeseries_aqi_hourly` grouped by connector and written to `history/v1/aqilevels/hourly/...`.
+- Observations write each part directly to the version-selected committed prefix (`history/v1/observations/...` or, with `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, `history/v2/observations/...`) and persist resume checkpoint state after each part so retries continue from the last committed tuple instead of re-reading full-day rows.
+- AQI levels are exported in the same run for completed observation days that are missing AQI day manifests; AQI rows are streamed from `uk_aq_aqilevels.timeseries_aqi_hourly` grouped by connector and written to the version-selected AQI prefix (`history/v1/aqilevels/hourly/...` or, with `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, `history/v2/aqilevels/hourly/data/...`). The configured v2 debug prefix is `history/v2/aqilevels/hourly/debug/...` for debug AQI-level outputs.
 - AQI export preserves rows where `station_id` is null (instead of dropping them), so connector/day row-count validation stays aligned with source RPC totals.
 - Phase B writes manifests, verifies object existence, and updates:
   - `uk_aq_ops.history_candidates`
@@ -199,11 +199,12 @@ Key optional controls:
 - `UK_AQ_R2_HISTORY_STAGING_PREFIX` (default `history/v1/_ops/observations/staging`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels/hourly`)
-- `UK_AQ_R2_HISTORY_WRITE_VERSION` (default `v1`; allowed `v1|v2`; v2 support is explicit and scheduled writes remain v1 unless this is set)
+- `UK_AQ_R2_HISTORY_WRITE_VERSION` (default `v1`; allowed `v1|v2`; controls Phase B observation, AQI-level, and run-manifest write paths)
 - `UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX` (default `history/v2/observations`)
 - `UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX` (default `history/v2/aqilevels/hourly/data`)
 - `UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX` (default `history/v2/aqilevels/hourly/debug`)
-- `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
+- `UK_AQ_R2_HISTORY_RUNS_PREFIX` (v1 run-manifest prefix; default `history/v1/_ops/observations/runs`)
+- `UK_AQ_R2_HISTORY_V2_RUNS_PREFIX` (v2 run-manifest prefix; default `history/v2/_ops/observations/runs`)
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX` (default `history/_index/observations_timeseries`)
 
