@@ -13,8 +13,6 @@ import {
 const DEFAULT_LOOKBACK_DAYS = 28;
 const MAX_LOOKBACK_DAYS = 120;
 const R2_HISTORY_DAYS_MAX_LOOKBACK_DAYS = 3660;
-const R2_HISTORY_READ_VERSION_DEFAULT = "v1";
-const R2_HISTORY_READ_VERSION_VALUES = new Set(["v1", "v2"]);
 const R2_HISTORY_DAYS_DEFAULT_MAX_LOOKBACK_DAYS = 120;
 const R2_HISTORY_COUNTS_DEFAULT_RANGE_DAYS = 31;
 const R2_HISTORY_COUNTS_MAX_RANGE_DAYS = 3660;
@@ -543,43 +541,6 @@ async function listCommittedDaysForDomain({
   };
 }
 
-function resolveR2HistoryReadVersion(env, url) {
-  const raw = String(url.searchParams.get("read_version") || env.UK_AQ_R2_HISTORY_READ_VERSION || "").trim();
-  const normalized = raw.toLowerCase();
-  if (!normalized) {
-    return {
-      version: R2_HISTORY_READ_VERSION_DEFAULT,
-      label: `R2_${R2_HISTORY_READ_VERSION_DEFAULT}`,
-      source: "default_missing_env",
-      warning: `UK_AQ_R2_HISTORY_READ_VERSION/read_version is not set; defaulting to ${R2_HISTORY_READ_VERSION_DEFAULT}.`,
-      valid: true,
-      raw,
-    };
-  }
-  if (R2_HISTORY_READ_VERSION_VALUES.has(normalized)) {
-    return { version: normalized, label: `R2_${normalized}`, source: url.searchParams.get("read_version") ? "query" : "env", warning: null, valid: true, raw };
-  }
-  throw new Error(`Invalid R2 history read version ${JSON.stringify(raw)}; expected v1 or v2`);
-}
-
-function resolveR2HistoryLayoutConfig(env, url) {
-  const readVersion = resolveR2HistoryReadVersion(env, url);
-  if (readVersion.version === "v2") {
-    return {
-      readVersion,
-      observationsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || "history/v2/observations"),
-      aqilevelsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || "history/v2/aqilevels/hourly_data"),
-      indexPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || "history/_index_v2"),
-    };
-  }
-  return {
-    readVersion,
-    observationsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations"),
-    aqilevelsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly"),
-    indexPrefix: resolveR2HistoryIndexConfig(env).index_prefix,
-  };
-}
-
 async function fetchR2HistoryDays(env, url) {
   const maxKeys = Math.max(
     100,
@@ -603,10 +564,13 @@ async function fetchR2HistoryDays(env, url) {
     throw new Error("Missing R2 config for history days API (endpoint/bucket/region/access credentials)");
   }
 
-  const layoutConfig = resolveR2HistoryLayoutConfig(env, url);
-  const observationsPrefix = layoutConfig.observationsPrefix;
-  const aqilevelsPrefix = layoutConfig.aqilevelsPrefix;
-  const indexPrefix = layoutConfig.indexPrefix;
+  const observationsPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations",
+  );
+  const aqilevelsPrefix = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly",
+  );
+  const indexConfig = resolveR2HistoryIndexConfig(env);
   const todayDay = new Date().toISOString().slice(0, 10);
   const domainSources = {};
   const warnings = [];
@@ -616,7 +580,7 @@ async function fetchR2HistoryDays(env, url) {
   try {
     observations = compactHistoryIndexDomain(await readR2HistoryIndex({
       r2,
-      indexKey: buildR2HistoryIndexKey(indexPrefix, "observations"),
+      indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
       domain: "observations",
       maxLookbackDays,
       todayDay,
@@ -638,7 +602,7 @@ async function fetchR2HistoryDays(env, url) {
   try {
     aqilevels = compactHistoryIndexDomain(await readR2HistoryIndex({
       r2,
-      indexKey: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
+      indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
       domain: "aqilevels",
       maxLookbackDays,
       todayDay,
@@ -675,14 +639,10 @@ async function fetchR2HistoryDays(env, url) {
     },
     source,
     sources: domainSources,
-    read_version: layoutConfig.readVersion.version,
-    read_version_label: layoutConfig.readVersion.label,
-    read_version_source: layoutConfig.readVersion.source,
-    read_version_warning: layoutConfig.readVersion.warning,
-    index_prefix: indexPrefix,
+    index_prefix: indexConfig.index_prefix,
     index_keys: {
-      observations: buildR2HistoryIndexKey(indexPrefix, "observations"),
-      aqilevels: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
+      observations: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
+      aqilevels: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
     },
     warnings,
     strict_manifests: strictManifests,
@@ -717,18 +677,17 @@ async function fetchR2HistoryCounts(env, url) {
     throw new Error("Missing R2 config for history counts API (endpoint/bucket/region/access credentials)");
   }
 
-  const layoutConfig = resolveR2HistoryLayoutConfig(env, url);
-  const indexPrefix = layoutConfig.indexPrefix;
+  const indexConfig = resolveR2HistoryIndexConfig(env);
   const observations = compactHistoryIndexDomain(await readR2HistoryIndex({
     r2,
-    indexKey: buildR2HistoryIndexKey(indexPrefix, "observations"),
+    indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
     domain: "observations",
     maxLookbackDays: 0,
     todayDay,
   }));
   const aqilevels = compactHistoryIndexDomain(await readR2HistoryIndex({
     r2,
-    indexKey: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
+    indexKey: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
     domain: "aqilevels",
     maxLookbackDays: 0,
     todayDay,
@@ -750,14 +709,10 @@ async function fetchR2HistoryCounts(env, url) {
     grain,
     connector_ids_requested: connectorIds,
     source: "cloudflare_r2_history_index",
-    read_version: layoutConfig.readVersion.version,
-    read_version_label: layoutConfig.readVersion.label,
-    read_version_source: layoutConfig.readVersion.source,
-    read_version_warning: layoutConfig.readVersion.warning,
-    index_prefix: indexPrefix,
+    index_prefix: indexConfig.index_prefix,
     index_keys: {
-      observations: buildR2HistoryIndexKey(indexPrefix, "observations"),
-      aqilevels: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
+      observations: buildR2HistoryIndexKey(indexConfig.index_prefix, "observations"),
+      aqilevels: buildR2HistoryIndexKey(indexConfig.index_prefix, "aqilevels"),
     },
     domains: {
       observations: {

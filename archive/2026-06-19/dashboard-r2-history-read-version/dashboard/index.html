@@ -600,23 +600,6 @@
         letter-spacing: -0.02em;
       }
 
-      .coverage-calendar-version {
-        display: inline-flex;
-        align-items: center;
-        border: 1px solid #d9cbb7;
-        border-radius: 999px;
-        padding: 0.18rem 0.48rem;
-        color: #6b6255;
-        background: #fffaf2;
-        font: 700 0.72rem/1 IBM Plex Mono, ui-monospace, monospace;
-      }
-
-      .coverage-calendar-version.is-warning {
-        border-color: #d9822b;
-        color: #8a4b12;
-        background: #fff3df;
-      }
-
       .coverage-calendar-nav {
         display: inline-flex;
         align-items: center;
@@ -1885,7 +1868,6 @@
       let r2ConnectorCountsMode = "stacked";
       let latestDashboardData = null;
       let latestR2ConnectorCounts = null;
-      let latestR2HistoryReadVersion = { label: "R2_?", warning: "R2 history read version has not been reported by the dashboard API yet.", valid: false };
       let dashboardLoadSequence = 0;
       let storageCoverageLoadSequence = 0;
       let r2ConnectorCountsLoadSequence = 0;
@@ -4890,11 +4872,6 @@
           : formatCoverageMonthTitle(monthStartUtc);
         const previousLabel = isYearMode ? "&lt; Previous Year" : "&lt; Previous";
         const nextLabel = isYearMode ? "Next Year &gt;" : "Next &gt;";
-        const r2Version = options.r2HistoryReadVersion || latestR2HistoryReadVersion || {};
-        const r2VersionLabel = String(r2Version.label || (r2Version.version ? `R2_${r2Version.version}` : "R2_?"));
-        const r2VersionWarning = String(r2Version.warning || "");
-        const r2VersionClass = r2VersionWarning || r2Version.valid === false ? " is-warning" : "";
-        const r2VersionTitle = r2VersionWarning || `${r2VersionLabel} selected by UK_AQ_R2_HISTORY_READ_VERSION`;
 
         let bodyMarkup = "";
         let footnoteText = "";
@@ -4953,7 +4930,6 @@
         panel.innerHTML = `
           <div class="coverage-calendar-head">
             <h2 class="coverage-calendar-title">${escapeHtml(titleText)}</h2>
-            <span class="coverage-calendar-version${r2VersionClass}" title="${escapeHtml(r2VersionTitle)}">${escapeHtml(r2VersionLabel)}</span>
             <div class="coverage-calendar-nav">
               <span class="coverage-calendar-view">
                 <span class="coverage-calendar-view-label">View</span>
@@ -4982,7 +4958,6 @@
           </div>
           ${bodyMarkup}
           <div class="footnote">${escapeHtml(footnoteText)}</div>
-          ${r2VersionWarning ? `<div class="footnote">${escapeHtml(r2VersionWarning)}</div>` : ""}
           <div class="coverage-connector-counts-section" data-role="r2-connector-counts"></div>
         `;
 
@@ -5359,14 +5334,10 @@
             latestDashboardData.storage_coverage_days = coverageRows;
             latestDashboardData.storage_coverage_source =
               data.storage_coverage_source || "live_per_day_presence";
-            latestDashboardData.r2_history_read_version =
-              data.r2_history_read_version || latestDashboardData.r2_history_read_version;
           }
-          latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
           upsertStorageCoveragePanel(
             renderStorageCoverageCalendarPanel(coverageRows, {
               forceConnectorCountsRefresh: forceRefresh,
-              r2HistoryReadVersion: latestR2HistoryReadVersion,
             }),
           );
           if (String(errorEl.textContent || "").startsWith(STORAGE_COVERAGE_ERROR_PREFIX)) {
@@ -6088,7 +6059,6 @@
           }
           const data = payload || {};
           latestDashboardData = data;
-          latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
           const existingDailyTaskPanel = operationsContainer.querySelector('[data-panel="operations-daily-task"]');
           const nextPanels = [
             renderModeControlPanel("operations"),

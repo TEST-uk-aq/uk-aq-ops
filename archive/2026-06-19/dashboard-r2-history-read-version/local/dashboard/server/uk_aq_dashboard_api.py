@@ -77,9 +77,6 @@ R2_HISTORY_COUNTS_API_URL = str(os.getenv("UK_AQ_R2_HISTORY_COUNTS_API_URL") or 
 R2_HISTORY_COUNTS_API_TOKEN = str(
     os.getenv("UK_AQ_R2_HISTORY_COUNTS_API_TOKEN") or R2_HISTORY_DAYS_API_TOKEN
 ).strip()
-R2_HISTORY_READ_VERSION_ENV = "UK_AQ_R2_HISTORY_READ_VERSION"
-R2_HISTORY_READ_VERSION_DEFAULT = "v1"
-R2_HISTORY_READ_VERSION_ACCEPTED = {"v1", "v2"}
 try:
     _raw_r2_history_days_max = int(str(os.getenv("UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS", "3660")).strip())
 except ValueError:
@@ -367,45 +364,6 @@ def _project_ref_from_base_url(base_url: str) -> Optional[str]:
 def _request_path(url: str) -> str:
     parsed = urlparse(url)
     return parsed.path or url
-
-
-def _resolve_r2_history_read_version() -> Dict[str, Any]:
-    raw = str(os.getenv(R2_HISTORY_READ_VERSION_ENV) or "").strip()
-    normalized = raw.lower()
-    if not normalized:
-        return {
-            "version": R2_HISTORY_READ_VERSION_DEFAULT,
-            "label": f"R2_{R2_HISTORY_READ_VERSION_DEFAULT}",
-            "source": "default_missing_env",
-            "warning": f"{R2_HISTORY_READ_VERSION_ENV} is not set; defaulting to {R2_HISTORY_READ_VERSION_DEFAULT} to preserve existing dashboard behaviour.",
-            "valid": True,
-            "raw": raw,
-        }
-    if normalized in R2_HISTORY_READ_VERSION_ACCEPTED:
-        return {
-            "version": normalized,
-            "label": f"R2_{normalized}",
-            "source": "env",
-            "warning": None,
-            "valid": True,
-            "raw": raw,
-        }
-    return {
-        "version": None,
-        "label": "R2 invalid",
-        "source": "invalid_env",
-        "warning": f"Invalid {R2_HISTORY_READ_VERSION_ENV}={raw!r}; expected v1 or v2. R2 history checks are disabled until this is fixed.",
-        "valid": False,
-        "raw": raw,
-    }
-
-
-def _append_r2_history_read_version(params: Dict[str, str]) -> Dict[str, str]:
-    resolved = _resolve_r2_history_read_version()
-    if not resolved.get("valid"):
-        raise ValueError(str(resolved.get("warning") or "Invalid R2 history read version"))
-    params["read_version"] = str(resolved["version"])
-    return params
 
 
 def _resolve_r2_history_days_api_url() -> str:
@@ -2676,12 +2634,9 @@ def _fetch_r2_history_days_from_external_api(
     if not api_url:
         return None, None, None, "R2 history-days API not configured"
 
-    try:
-        params: Dict[str, str] = _append_r2_history_read_version({
-            "max_days": str(R2_HISTORY_DAYS_API_MAX_DAYS),
-        })
-    except ValueError as exc:
-        return None, None, None, str(exc)
+    params: Dict[str, str] = {
+        "max_days": str(R2_HISTORY_DAYS_API_MAX_DAYS),
+    }
 
     headers: Dict[str, str] = {
         "Accept": "application/json",
@@ -2754,13 +2709,6 @@ def _fetch_r2_history_days_from_external_api(
     r2_window["observations_day_count"] = len(observations_days)
     r2_window["aqilevels_day_count"] = len(aqilevels_days)
     r2_window["count_basis"] = "explicit_overlap_both_domains"
-
-    resolved_version = _resolve_r2_history_read_version()
-    r2_window["read_version"] = resolved_version["version"]
-    r2_window["read_version_label"] = resolved_version["label"]
-    r2_window["read_version_source"] = resolved_version["source"]
-    if resolved_version.get("warning"):
-        r2_window["read_version_warning"] = resolved_version["warning"]
 
     bucket_value = str(payload.get("bucket") or "").strip() or None
     return day_sets, r2_window, bucket_value, None
@@ -2895,14 +2843,11 @@ def _fetch_r2_history_counts_from_external_api(
     if not api_url:
         return None, "R2 history-counts API not configured"
 
-    try:
-        params: Dict[str, str] = _append_r2_history_read_version({
-            "from_day": from_day,
-            "to_day": to_day,
-            "grain": grain,
-        })
-    except ValueError as exc:
-        return None, str(exc)
+    params: Dict[str, str] = {
+        "from_day": from_day,
+        "to_day": to_day,
+        "grain": grain,
+    }
     if connector_ids:
         params["connector_ids"] = connector_ids
 
@@ -4221,7 +4166,6 @@ def _build_dashboard(
         "dropbox_backup_state_error": dropbox_state_error,
         "storage_coverage_source": "live_per_day_presence",
         "storage_coverage_days": storage_coverage_days,
-        "r2_history_read_version": _resolve_r2_history_read_version(),
         "pollutants": pollutants_payload,
         "dispatch_runs": dispatch_runs,
         "dispatcher_settings": dispatcher_settings,
@@ -4309,7 +4253,6 @@ def _build_storage_coverage_payload(
         "generated_at": now.isoformat().replace("+00:00", "Z"),
         "storage_coverage_source": "live_per_day_presence",
         "storage_coverage_days": storage_coverage_days,
-        "r2_history_read_version": _resolve_r2_history_read_version(),
     }
 
 
@@ -4986,10 +4929,6 @@ def main() -> None:
     server.html_path = html_path
     server.upstream_bearer_token = str(os.getenv("DASHBOARD_UPSTREAM_BEARER_TOKEN") or "").strip()
 
-    r2_version = _resolve_r2_history_read_version()
-    print(f"UK AQ dashboard R2 history read version: {r2_version['label']} ({r2_version['source']})")
-    if r2_version.get("warning"):
-        print(f"UK AQ dashboard R2 history read version warning: {r2_version['warning']}")
     print(f"UK AQ dashboard running at http://{args.host}:{args.port}")
     server.serve_forever()
 
