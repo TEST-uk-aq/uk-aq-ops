@@ -153,6 +153,8 @@ const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
+export const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE = "^history/(v1/(observations|aqilevels/hourly)|v2/observations)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$";
+const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX = new RegExp(PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE);
 
 let parquetWasmInitialized = false;
 
@@ -281,6 +283,14 @@ function assertBudget(runtime, operation, fields = {}, minMs = 0) {
     ...fields,
   });
   throw new PhaseBHistoryBudgetExhaustedError();
+}
+
+export function isAcceptedPruneHistoryDayManifestKey(value) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  const key = String(value).trim();
+  return key !== "" && PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX.test(key);
 }
 
 function parseHistoryWriteVersion(raw) {
@@ -4529,7 +4539,7 @@ from uk_aq_ops.prune_day_gates g
 where g.day_utc in (${literalList})
   and g.history_done is true
   and nullif(btrim(g.history_manifest_key), '') is not null
-  and g.history_manifest_key ~ '^history/v1/(observations|aqilevels/hourly)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$'
+  and g.history_manifest_key ~ '${PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE}'
   and g.history_completed_at is not null
 `;
     const result = await client.query(sql);
