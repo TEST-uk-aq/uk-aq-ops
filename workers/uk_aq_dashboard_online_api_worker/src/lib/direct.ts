@@ -136,9 +136,11 @@ type CacheEntry<T> = {
 };
 
 const dashboardCache = new Map<string, CacheEntry<DashboardPayload>>();
-let storageCoverageCache: CacheEntry<{ generated_at: string; storage_coverage_source: string; storage_coverage_days: unknown[] }> | null = null;
+let storageCoverageCache: CacheEntry<{ generated_at: string; storage_coverage_source: string; storage_coverage_days: unknown[]; r2_history_read_version: R2HistoryReadVersionResolution }> | null = null;
 let r2UsageCache: CacheEntry<{ usage: JsonObject | null; error: string | null }> | null = null;
 let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> | null = null;
+let r2HistoryDaysCacheVersionKey: string | null = null;
+let storageCoverageCacheVersionKey: string | null = null;
 let dropboxMtimeCache: CacheEntry<{ payload: JsonObject; error: string | null }> | null = null;
 
 function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolution {
@@ -165,6 +167,11 @@ function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolu
     valid: false,
     raw,
   };
+}
+
+function r2HistoryReadVersionCacheKey(env: WorkerEnv): string {
+  const resolved = resolveR2HistoryReadVersion(env);
+  return `${resolved.valid ? resolved.version : "invalid"}:${resolved.raw}`;
 }
 
 function addR2HistoryReadVersionParam(params: Record<string, string>, env: WorkerEnv): Record<string, string> {
@@ -622,7 +629,8 @@ async function fetchR2HistoryDays(
   env: WorkerEnv,
   forceRefresh = false,
 ): Promise<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> {
-  if (!forceRefresh) {
+  const versionCacheKey = r2HistoryReadVersionCacheKey(env);
+  if (!forceRefresh && r2HistoryDaysCacheVersionKey === versionCacheKey) {
     const cached = cacheGet(r2HistoryDaysCache);
     if (cached) {
       return cached;
@@ -638,6 +646,7 @@ async function fetchR2HistoryDays(
       error: "R2 history-days API not configured",
       readVersion: resolveR2HistoryReadVersion(env),
     };
+    r2HistoryDaysCacheVersionKey = versionCacheKey;
     r2HistoryDaysCache = { value: fallback, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
     return fallback;
   }
@@ -663,6 +672,7 @@ async function fetchR2HistoryDays(
       error: null,
       readVersion: resolveR2HistoryReadVersion(env),
     };
+    r2HistoryDaysCacheVersionKey = versionCacheKey;
     r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
     return value;
   } catch (err) {
@@ -673,6 +683,7 @@ async function fetchR2HistoryDays(
       error: err instanceof Error ? err.message : String(err),
       readVersion: resolveR2HistoryReadVersion(env),
     };
+    r2HistoryDaysCacheVersionKey = versionCacheKey;
     r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
     return value;
   }
@@ -1792,9 +1803,10 @@ export async function getDirectDashboardPayload(
 export async function getDirectStorageCoveragePayload(
   env: WorkerEnv,
   search: URLSearchParams,
-): Promise<{ generated_at: string; storage_coverage_source: string; storage_coverage_days: unknown[] }> {
+): Promise<{ generated_at: string; storage_coverage_source: string; storage_coverage_days: unknown[]; r2_history_read_version: R2HistoryReadVersionResolution }> {
   const forceRefresh = asTruthy(search.get("force"));
-  if (!forceRefresh) {
+  const versionCacheKey = r2HistoryReadVersionCacheKey(env);
+  if (!forceRefresh && storageCoverageCacheVersionKey === versionCacheKey) {
     const cached = cacheGet(storageCoverageCache);
     if (cached) {
       return cached;
@@ -1813,6 +1825,7 @@ export async function getDirectStorageCoveragePayload(
     storage_coverage_days: Array.isArray(payload.storage_coverage_days) ? payload.storage_coverage_days : [],
     r2_history_read_version: payload.r2_history_read_version || resolveR2HistoryReadVersion(env),
   };
+  storageCoverageCacheVersionKey = versionCacheKey;
   storageCoverageCache = { value: response, expiresAt: Date.now() + STORAGE_COVERAGE_TTL_MS };
   return response;
 }

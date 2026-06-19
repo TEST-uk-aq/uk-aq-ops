@@ -140,3 +140,66 @@ test("aggregateR2HistoryConnectorCounts preserves per-connector daily rows and m
     },
   ]);
 });
+
+import {
+  buildR2HistoryReadIndexKey,
+  compactHistoryIndexDomain,
+  resolveR2HistoryLayoutConfig,
+} from "../workers/uk_aq_db_size_metrics_api_worker/worker.mjs";
+
+function testUrl(search = "") {
+  return new URL(`https://example.test/v1/r2-history-days${search}`);
+}
+
+test("R2 history calendar resolver maps v1 to v1 indexes and prefixes", () => {
+  const layout = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: "v1" }, testUrl());
+  assert.equal(layout.readVersion.label, "R2_v1");
+  assert.equal(layout.observationsPrefix, "history/v1/observations");
+  assert.equal(layout.aqilevelsPrefix, "history/v1/aqilevels/hourly");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "observations"), "history/_index/observations_latest.json");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "aqilevels"), "history/_index/aqilevels_latest.json");
+});
+
+test("R2 history calendar resolver maps v2 to v2 timeseries indexes and day prefixes", () => {
+  const layout = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: "v2" }, testUrl());
+  assert.equal(layout.readVersion.label, "R2_v2");
+  assert.equal(layout.observationsPrefix, "history/v2/observations");
+  assert.equal(layout.aqilevelsPrefix, "history/v2/aqilevels/hourly/data");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "observations"), "history/_index_v2/observations_timeseries_latest.json");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "aqilevels"), "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
+  assert.equal(`${layout.observationsPrefix}/day_utc=2026-06-12/`, "history/v2/observations/day_utc=2026-06-12/");
+  assert.equal(`${layout.aqilevelsPrefix}/day_utc=2026-06-12/`, "history/v2/aqilevels/hourly/data/day_utc=2026-06-12/");
+});
+
+test("R2 history calendar resolver honours explicit v2 env defaults and query labels", () => {
+  const layout = resolveR2HistoryLayoutConfig({
+    UK_AQ_R2_HISTORY_READ_VERSION: "v1",
+    UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: "custom/v2/obs/",
+    UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: "custom/v2/aqi/",
+    UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: "custom/_index_v2/",
+  }, testUrl("?read_version=v2"));
+  assert.equal(layout.readVersion.source, "query");
+  assert.equal(layout.readVersion.label, "R2_v2");
+  assert.equal(layout.observationsPrefix, "custom/v2/obs");
+  assert.equal(layout.aqilevelsPrefix, "custom/v2/aqi");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "observations"), "custom/_index_v2/observations_timeseries_latest.json");
+  assert.equal(buildR2HistoryReadIndexKey(layout, "aqilevels"), "custom/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
+});
+
+test("invalid R2 history read version gives a clear warning/error", () => {
+  assert.throws(
+    () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: "v3" }, testUrl()),
+    /Invalid R2 history read version "v3"; expected v1 or v2/,
+  );
+});
+
+test("calendar day compaction detects v2-only days from day_summaries even without a days array", () => {
+  const compacted = compactHistoryIndexDomain({
+    day_summaries: [
+      { day_utc: "2026-06-14", connectors: [{ connector_id: 1, row_count: 1 }] },
+      { day_utc: "2026-06-12", connectors: [{ connector_id: 1, row_count: 1 }] },
+      { day_utc: "2026-06-13", connectors: [{ connector_id: 6, row_count: 1 }] },
+    ],
+  });
+  assert.deepEqual(compacted.days, ["2026-06-12", "2026-06-13", "2026-06-14"]);
+});

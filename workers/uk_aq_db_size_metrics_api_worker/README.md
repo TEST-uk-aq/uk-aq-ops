@@ -106,13 +106,22 @@ Behavior:
 - Reads R2-domain size rows from ingestdb public view:
   - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
 - PostgREST reads are paginated (`limit`/`offset`, 1000 rows per page) so larger lookback windows still include newest buckets when the project row cap is 1000.
-- For `/v1/r2-history-days`, first tries derived R2 history index files:
+- For `/v1/r2-history-days`, a central R2 history layout resolver uses `UK_AQ_R2_HISTORY_READ_VERSION` (or the `read_version` query parameter) to select the active calendar layout.
+- For `v1`, the calendar day checks use:
   - `history/_index/observations_latest.json`
   - `history/_index/aqilevels_latest.json`
-  - index prefix is configurable via `UK_AQ_R2_HISTORY_INDEX_PREFIX`
-- For `/v1/r2-history-counts`, reads the same derived R2 history index files and aggregates
+  - `history/v1/observations/day_utc=YYYY-MM-DD/`
+  - `history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/`
+  - v1 index prefix is configurable via `UK_AQ_R2_HISTORY_INDEX_PREFIX`.
+- For `v2`, the calendar day checks use:
+  - `history/_index_v2/observations_timeseries_latest.json`
+  - `history/_index_v2/aqilevels_hourly_data_timeseries_latest.json`
+  - `history/v2/observations/day_utc=YYYY-MM-DD/`
+  - `history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/`
+  - v2 paths are configurable via `UK_AQ_R2_HISTORY_INDEX_V2_PREFIX`, `UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX`, and `UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX`.
+- For `/v1/r2-history-counts`, reads the same version-selected derived R2 history index files and aggregates
   connector row counts by day or month entirely in-memory.
-- If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that domain only:
+- If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that same active-version domain only (no v1 fallback when v2 is selected):
   - lists `day_utc=YYYY-MM-DD/` common prefixes under the domain;
   - filters by `max_days` and excludes future dates.
 - Optional strict mode (`strict_manifests=true`):
@@ -135,9 +144,13 @@ Optional:
 - `CFLARE_R2_REGION` (default `auto`)
 - `CFLARE_R2_ACCESS_KEY_ID` (required for `/v1/r2-history-days`)
 - `CFLARE_R2_SECRET_ACCESS_KEY` (required for `/v1/r2-history-days`)
-- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
-- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels/hourly`)
-- `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
+- `UK_AQ_R2_HISTORY_READ_VERSION` (`v1` or `v2`; default `v1`)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (v1 default `history/v1/observations`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (v1 default `history/v1/aqilevels/hourly`)
+- `UK_AQ_R2_HISTORY_INDEX_PREFIX` (v1 default `history/_index`)
+- `UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX` (v2 default `history/v2/observations`)
+- `UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX` (v2 default `history/v2/aqilevels/hourly/data`)
+- `UK_AQ_R2_HISTORY_INDEX_V2_PREFIX` (v2 default `history/_index_v2`)
 
 ## Deploy (manual)
 
