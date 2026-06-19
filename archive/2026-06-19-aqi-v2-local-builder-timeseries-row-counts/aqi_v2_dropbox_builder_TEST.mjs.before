@@ -263,19 +263,14 @@ async function rowsToAqiParquetBuffer(rows, objectType) {
 
 function summarizeRows(rows) {
   const pollutants = new Set();
-  const timeseriesRowCounts = new Map();
   let minTimeseriesId = null;
   let maxTimeseriesId = null;
   let minTimestampHourUtc = null;
   let maxTimestampHourUtc = null;
   for (const row of rows) {
     pollutants.add(row.pollutant_code);
-    const timeseriesId = Number(row.timeseries_id);
-    if (Number.isInteger(timeseriesId) && timeseriesId > 0) {
-      minTimeseriesId = minTimeseriesId === null ? timeseriesId : Math.min(minTimeseriesId, timeseriesId);
-      maxTimeseriesId = maxTimeseriesId === null ? timeseriesId : Math.max(maxTimeseriesId, timeseriesId);
-      timeseriesRowCounts.set(timeseriesId, (timeseriesRowCounts.get(timeseriesId) || 0) + 1);
-    }
+    minTimeseriesId = minTimeseriesId === null ? row.timeseries_id : Math.min(minTimeseriesId, row.timeseries_id);
+    maxTimeseriesId = maxTimeseriesId === null ? row.timeseries_id : Math.max(maxTimeseriesId, row.timeseries_id);
     minTimestampHourUtc = minTimestampHourUtc === null || row.timestamp_hour_utc < minTimestampHourUtc ? row.timestamp_hour_utc : minTimestampHourUtc;
     maxTimestampHourUtc = maxTimestampHourUtc === null || row.timestamp_hour_utc > maxTimestampHourUtc ? row.timestamp_hour_utc : maxTimestampHourUtc;
   }
@@ -285,11 +280,6 @@ function summarizeRows(rows) {
     pollutant_codes: Array.from(pollutants).sort(),
     min_timestamp_hour_utc: minTimestampHourUtc,
     max_timestamp_hour_utc: maxTimestampHourUtc,
-    timeseries_row_counts: Object.fromEntries(
-      Array.from(timeseriesRowCounts.entries())
-        .sort(([left], [right]) => left - right)
-        .map(([timeseriesId, count]) => [String(timeseriesId), count]),
-    ),
   };
 }
 
