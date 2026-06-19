@@ -48,7 +48,7 @@ jobs:
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN || '' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
-      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '' }}
+      UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '_ops/checkpoints/r2_history_backup_state_v1.json' }}
       CLEANAIRSURB_ST_ID: ${{ vars.CLEANAIRSURB_ST_ID || '' }}
     steps:
       - name: Checkout
