@@ -34,6 +34,7 @@ const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
 const DEFAULT_COMMITTED_PREFIX = "history/v1/observations";
 const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
 const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
+const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
@@ -299,6 +300,45 @@ function parseHistoryWriteVersion(raw) {
     return value;
   }
   throw new Error(`Invalid UK_AQ_R2_HISTORY_WRITE_VERSION=${String(raw)}; expected v1 or v2`);
+}
+
+export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
+  const historyWriteVersion = parseHistoryWriteVersion(env.UK_AQ_R2_HISTORY_WRITE_VERSION);
+  const observationsPrefixV1 = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || DEFAULT_COMMITTED_PREFIX,
+  );
+  const observationsPrefixV2 = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || HISTORY_R2_V2_OBSERVATIONS_PREFIX,
+  );
+  const aqilevelsPrefixV1 = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_AQILEVELS_PREFIX,
+  );
+  const aqilevelsDataPrefixV2 = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
+  );
+  const aqilevelsDebugPrefixV2 = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
+  );
+  const runsPrefixV1 = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
+  );
+  const runsPrefixV2 = normalizePrefix(
+    env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || DEFAULT_RUNS_PREFIX_V2,
+  );
+
+  return Object.freeze({
+    history_write_version: historyWriteVersion,
+    observations_prefix: historyWriteVersion === "v2" ? observationsPrefixV2 : observationsPrefixV1,
+    observations_prefix_v1: observationsPrefixV1,
+    observations_prefix_v2: observationsPrefixV2,
+    aqilevels_prefix: historyWriteVersion === "v2" ? aqilevelsDataPrefixV2 : aqilevelsPrefixV1,
+    aqilevels_prefix_v1: aqilevelsPrefixV1,
+    aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
+    aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
+    runs_prefix: historyWriteVersion === "v2" ? runsPrefixV2 : runsPrefixV1,
+    runs_prefix_v1: runsPrefixV1,
+    runs_prefix_v2: runsPrefixV2,
+  });
 }
 
 function parseBigInt(value, fieldName) {
@@ -4012,28 +4052,15 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   const stagingBasePrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_STAGING_PREFIX || DEFAULT_STAGING_PREFIX,
   );
-  const committedPrefix = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || DEFAULT_COMMITTED_PREFIX,
-  );
-  const aqilevelsPrefix = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_AQILEVELS_PREFIX,
-  );
-  const historyWriteVersion = parseHistoryWriteVersion(env.UK_AQ_R2_HISTORY_WRITE_VERSION);
-  const committedPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-  );
-  const aqilevelsDataPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
-  );
-  const aqilevelsDebugPrefixV2 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
-  );
-  const activeCommittedPrefix = historyWriteVersion === "v2"
-    ? committedPrefixV2
-    : committedPrefix;
-  const runsPrefix = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
-  );
+  const writePrefixes = resolvePhaseBHistoryWritePrefixes(env);
+  const committedPrefix = writePrefixes.observations_prefix_v1;
+  const committedPrefixV2 = writePrefixes.observations_prefix_v2;
+  const activeCommittedPrefix = writePrefixes.observations_prefix;
+  const aqilevelsPrefix = writePrefixes.aqilevels_prefix;
+  const aqilevelsDataPrefixV2 = writePrefixes.aqilevels_hourly_data_prefix_v2;
+  const aqilevelsDebugPrefixV2 = writePrefixes.aqilevels_hourly_debug_prefix_v2;
+  const runsPrefix = writePrefixes.runs_prefix;
+  const historyWriteVersion = writePrefixes.history_write_version;
   const sharedPartMaxRows = parsePositiveInt(
     env.UK_AQ_R2_HISTORY_PART_MAX_ROWS,
     DEFAULT_PART_MAX_ROWS,
@@ -4127,11 +4154,14 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     committed_prefix: activeCommittedPrefix,
     committed_prefix_v1: committedPrefix,
     aqilevels_prefix: aqilevelsPrefix,
+    aqilevels_prefix_v1: writePrefixes.aqilevels_prefix_v1,
     history_write_version: historyWriteVersion,
     committed_prefix_v2: committedPrefixV2,
     aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
     aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
     runs_prefix: runsPrefix,
+    runs_prefix_v1: writePrefixes.runs_prefix_v1,
+    runs_prefix_v2: writePrefixes.runs_prefix_v2,
     adopt_existing_manifest_enabled: parseBoolean(
       env.UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED,
       true,
@@ -4250,6 +4280,12 @@ export async function runPhaseBBackup({
     r2_bucket: runtime.r2.bucket,
     observations_prefix: runtime.committed_prefix,
     aqilevels_prefix: runtime.aqilevels_prefix,
+    aqilevels_prefix_v1: runtime.aqilevels_prefix_v1,
+    aqilevels_hourly_data_prefix_v2: runtime.aqilevels_hourly_data_prefix_v2,
+    aqilevels_hourly_debug_prefix_v2: runtime.aqilevels_hourly_debug_prefix_v2,
+    runs_prefix: runtime.runs_prefix,
+    runs_prefix_v1: runtime.runs_prefix_v1,
+    runs_prefix_v2: runtime.runs_prefix_v2,
   });
 
   const dayResults = new Map();

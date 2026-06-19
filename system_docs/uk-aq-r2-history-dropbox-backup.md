@@ -196,6 +196,8 @@ Mirrored v2 domain paths:
 - `history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/...`
 - `history/v2/core/day_utc=YYYY-MM-DD/...`
 
+Operational Phase B run manifests are written outside the Dropbox backup domains. With `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, prune Phase B writes run manifests under `history/v2/_ops/observations/runs/run_id=<run_id>/run_manifest.json`. Dropbox run-manifest backup is intentionally not included here and is a separate follow-up.
+
 Mirrored v1 derived index files:
 
 - `history/_index/observations_latest.json`
