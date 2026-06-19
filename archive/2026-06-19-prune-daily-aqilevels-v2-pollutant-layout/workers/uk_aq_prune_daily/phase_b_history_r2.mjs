@@ -580,7 +580,7 @@ function summarizeObservationV2PartRows(rows) {
   };
 }
 
-function groupRowsByPollutant(rows) {
+function groupObservationV2RowsByPollutant(rows) {
   const grouped = new Map();
   for (const row of rows) {
     const pollutantCode = normalizePollutantCodeForPath(row.pollutant_code);
@@ -617,7 +617,6 @@ function summarizeAqilevelPartRows(rows) {
   let minTimestampHourUtc = null;
   let maxTimestampHourUtc = null;
   const pollutantCodes = [];
-  const timeseriesRowCounts = new Map();
 
   for (const row of rows) {
     const timeseriesId = Number(row.timeseries_id);
@@ -629,10 +628,6 @@ function summarizeAqilevelPartRows(rows) {
       if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
         maxTimeseriesId = normalizedTimeseriesId;
       }
-      timeseriesRowCounts.set(
-        normalizedTimeseriesId,
-        (timeseriesRowCounts.get(normalizedTimeseriesId) || 0) + 1,
-      );
     }
     const timestampHourUtc = typeof row.timestamp_hour_utc === "string"
       ? row.timestamp_hour_utc
@@ -653,11 +648,6 @@ function summarizeAqilevelPartRows(rows) {
     min_timestamp_hour_utc: minTimestampHourUtc,
     max_timestamp_hour_utc: maxTimestampHourUtc,
     pollutant_codes: uniqueSorted(pollutantCodes),
-    timeseries_row_counts: Object.fromEntries(
-      Array.from(timeseriesRowCounts.entries())
-        .sort(([left], [right]) => left - right)
-        .map(([timeseriesId, count]) => [String(timeseriesId), count]),
-    ),
   };
 }
 
@@ -2224,7 +2214,7 @@ async function writeCommittedV2PartAndCheckpoint({
   observedRows,
   totalBytes,
 }) {
-  const groupedRows = groupRowsByPollutant(rows);
+  const groupedRows = groupObservationV2RowsByPollutant(rows);
   const sourcePollutantCodes = groupedRows.map(([pollutantCode]) => pollutantCode);
   const writeGroups = groupedRows.filter(([pollutantCode]) => runtime.observations_pollutant_codes.includes(pollutantCode));
   const writePollutantCodes = writeGroups.map(([pollutantCode]) => pollutantCode);
@@ -3513,62 +3503,8 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     }
     const partRows = pendingRows;
     pendingRows = [];
-
-    if (runtime.history_write_version === "v2") {
-      const groupedRows = groupRowsByPollutant(partRows);
-      logPhaseB(runtime, "INFO", "phase_b_aqilevels_v2_pollutant_plan", {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        pollutant_codes: groupedRows.map(([pollutantCode]) => pollutantCode),
-        pollutant_count: groupedRows.length,
-        row_count: partRows.length,
-      });
-
-      for (const [pollutantCode, pollutantRows] of groupedRows) {
-        const partSummary = summarizeAqilevelPartRows(pollutantRows);
-        const partKey = buildHistoryV2PartKey(runtime.aqilevels_prefix, dayUtc, connectorId, pollutantCode, partIndex);
-        const parquetBuffer = rowsToAqilevelDataV2ParquetBuffer(
-          pollutantRows,
-          parquetWriterProperties(
-            runtime.aqilevels_row_group_size,
-            HISTORY_R2_V2_WRITER_VERSION,
-          ),
-        );
-        const putResult = await r2PutObject({
-          r2: runtime.r2,
-          key: partKey,
-          body: parquetBuffer,
-          content_type: "application/octet-stream",
-        });
-        const head = await r2HeadObject({ r2: runtime.r2, key: partKey });
-        if (!head.exists) {
-          throw new Error(`Missing AQI v2 committed object after write: ${partKey}`);
-        }
-        const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
-          ? Math.trunc(head.bytes)
-          : Math.trunc(putResult.bytes);
-        const etagOrHash = head.etag || putResult.etag || null;
-
-        fileEntries.push({
-          key: partKey,
-          row_count: pollutantRows.length,
-          bytes,
-          etag_or_hash: etagOrHash,
-          pollutant_code: pollutantCode,
-          min_timeseries_id: partSummary.min_timeseries_id,
-          max_timeseries_id: partSummary.max_timeseries_id,
-          min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
-          max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
-          timeseries_row_counts: partSummary.timeseries_row_counts,
-        });
-        totalBytes += BigInt(bytes);
-      }
-      partIndex += 1;
-      observedRows += BigInt(partRows.length);
-      return;
-    }
-
     const partSummary = summarizeAqilevelPartRows(partRows);
+
     const partKey = buildPartKey(runtime.aqilevels_prefix, dayUtc, connectorId, partIndex);
     const parquetBuffer = rowsToAqilevelParquetBuffer(
       partRows,
@@ -3669,74 +3605,20 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     );
   }
 
-  const backedUpAtUtc = nowIso();
-  let connectorManifestKey = buildConnectorManifestKey(runtime.aqilevels_prefix, dayUtc, connectorId);
-  let connectorManifest;
-  if (runtime.history_write_version === "v2") {
-    const pollutantManifests = [];
-    const partsByPollutant = new Map();
-    for (const fileEntry of fileEntries) {
-      const pollutantCode = normalizePollutantCodeForPath(fileEntry.pollutant_code);
-      if (!partsByPollutant.has(pollutantCode)) {
-        partsByPollutant.set(pollutantCode, []);
-      }
-      partsByPollutant.get(pollutantCode).push(fileEntry);
-    }
-    for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-      const pollutantManifestKey = buildHistoryV2PollutantManifestKey(runtime.aqilevels_prefix, dayUtc, connectorId, pollutantCode);
-      const pollutantManifest = createHistoryV2PollutantManifest({
-        domain: "aqilevels",
-        grain: HISTORY_AQILEVELS_GRAIN,
-        profile: "data",
-        dayUtc,
-        connectorId,
-        pollutantCode,
-        runId: runtime.run_id,
-        manifestKey: pollutantManifestKey,
-        sourceRowCount: pollutantParts.reduce((sum, part) => sum + Number(part.row_count || 0), 0),
-        fileEntries: pollutantParts,
-        writerGitSha: runtime.writer_git_sha,
-        backedUpAtUtc,
-      });
-      await r2PutObject({
-        r2: runtime.r2,
-        key: pollutantManifestKey,
-        body: Buffer.from(JSON.stringify(pollutantManifest, null, 2), "utf8"),
-        content_type: "application/json",
-      });
-      const pollutantManifestHead = await r2HeadObject({ r2: runtime.r2, key: pollutantManifestKey });
-      if (!pollutantManifestHead.exists) {
-        throw new Error(`AQI v2 pollutant manifest missing after upload: ${pollutantManifestKey}`);
-      }
-      pollutantManifests.push(pollutantManifest);
-    }
-    connectorManifest = createHistoryV2ConnectorManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile: "data",
-      dayUtc,
-      connectorId,
-      runId: runtime.run_id,
-      manifestKey: connectorManifestKey,
-      pollutantManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-  } else {
-    connectorManifest = createAqilevelConnectorManifest({
-      dayUtc,
-      connectorId,
-      runId: runtime.run_id,
-      sourceRowCount: Number(observedRows),
-      minTimeseriesId: connector.min_timeseries_id ?? null,
-      maxTimeseriesId: connector.max_timeseries_id ?? null,
-      minTimestampHourUtc: minTimestampHourUtc || connector.min_timestamp_hour_utc || null,
-      maxTimestampHourUtc: maxTimestampHourUtc || connector.max_timestamp_hour_utc || null,
-      fileEntries,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-  }
+  const connectorManifestKey = buildConnectorManifestKey(runtime.aqilevels_prefix, dayUtc, connectorId);
+  const connectorManifest = createAqilevelConnectorManifest({
+    dayUtc,
+    connectorId,
+    runId: runtime.run_id,
+    sourceRowCount: Number(observedRows),
+    minTimeseriesId: connector.min_timeseries_id ?? null,
+    maxTimeseriesId: connector.max_timeseries_id ?? null,
+    minTimestampHourUtc: minTimestampHourUtc || connector.min_timestamp_hour_utc || null,
+    maxTimestampHourUtc: maxTimestampHourUtc || connector.max_timestamp_hour_utc || null,
+    fileEntries,
+    writerGitSha: runtime.writer_git_sha,
+    backedUpAtUtc: nowIso(),
+  });
   await r2PutObject({
     r2: runtime.r2,
     key: connectorManifestKey,
@@ -3793,27 +3675,14 @@ async function exportAqilevelDayToR2({ runtime, dayUtc }) {
     connectorManifests.push(result.connector_manifest);
   }
 
-  const backedUpAtUtc = nowIso();
   const dayManifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
-  const dayManifest = runtime.history_write_version === "v2"
-    ? createHistoryV2DayManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile: "data",
-      dayUtc,
-      runId: runtime.run_id,
-      manifestKey: dayManifestKey,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    })
-    : createAqilevelDayManifest({
-      dayUtc,
-      runId: runtime.run_id,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
+  const dayManifest = createAqilevelDayManifest({
+    dayUtc,
+    runId: runtime.run_id,
+    connectorManifests,
+    writerGitSha: runtime.writer_git_sha,
+    backedUpAtUtc: nowIso(),
+  });
   await r2PutObject({
     r2: runtime.r2,
     key: dayManifestKey,
