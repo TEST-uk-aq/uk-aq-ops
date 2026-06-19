@@ -6,8 +6,6 @@ import {
 } from "../shared/r2_sigv4.mjs";
 import {
   buildR2HistoryIndexKey,
-  buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey,
-  buildR2HistoryV2ObservationsTimeseriesLatestKey,
   readR2HistoryIndex,
   resolveR2HistoryIndexConfig,
 } from "../shared/uk_aq_r2_history_index.mjs";
@@ -564,13 +562,13 @@ function resolveR2HistoryReadVersion(env, url) {
   throw new Error(`Invalid R2 history read version ${JSON.stringify(raw)}; expected v1 or v2`);
 }
 
-export function resolveR2HistoryLayoutConfig(env, url) {
+function resolveR2HistoryLayoutConfig(env, url) {
   const readVersion = resolveR2HistoryReadVersion(env, url);
   if (readVersion.version === "v2") {
     return {
       readVersion,
       observationsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || "history/v2/observations"),
-      aqilevelsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || "history/v2/aqilevels/hourly/data"),
+      aqilevelsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || "history/v2/aqilevels/hourly_data"),
       indexPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || "history/_index_v2"),
     };
   }
@@ -580,22 +578,6 @@ export function resolveR2HistoryLayoutConfig(env, url) {
     aqilevelsPrefix: normalizePrefix(env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly"),
     indexPrefix: resolveR2HistoryIndexConfig(env).index_prefix,
   };
-}
-
-export function buildR2HistoryReadIndexKey(layoutConfig, domain) {
-  const normalizedDomain = String(domain || "").trim().toLowerCase();
-  if (layoutConfig?.readVersion?.version === "v2") {
-    if (normalizedDomain === "observations") {
-      return buildR2HistoryV2ObservationsTimeseriesLatestKey(layoutConfig.indexPrefix);
-    }
-    if (normalizedDomain === "aqilevels") {
-      return buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(layoutConfig.indexPrefix);
-    }
-  }
-  if (layoutConfig?.readVersion?.version === "v1") {
-    return buildR2HistoryIndexKey(layoutConfig.indexPrefix, normalizedDomain);
-  }
-  throw new Error(`Invalid R2 history read version for index key: ${String(layoutConfig?.readVersion?.version || "")}`);
 }
 
 async function fetchR2HistoryDays(env, url) {
@@ -625,10 +607,6 @@ async function fetchR2HistoryDays(env, url) {
   const observationsPrefix = layoutConfig.observationsPrefix;
   const aqilevelsPrefix = layoutConfig.aqilevelsPrefix;
   const indexPrefix = layoutConfig.indexPrefix;
-  const indexKeys = {
-    observations: buildR2HistoryReadIndexKey(layoutConfig, "observations"),
-    aqilevels: buildR2HistoryReadIndexKey(layoutConfig, "aqilevels"),
-  };
   const todayDay = new Date().toISOString().slice(0, 10);
   const domainSources = {};
   const warnings = [];
@@ -638,7 +616,7 @@ async function fetchR2HistoryDays(env, url) {
   try {
     observations = compactHistoryIndexDomain(await readR2HistoryIndex({
       r2,
-      indexKey: indexKeys.observations,
+      indexKey: buildR2HistoryIndexKey(indexPrefix, "observations"),
       domain: "observations",
       maxLookbackDays,
       todayDay,
@@ -660,7 +638,7 @@ async function fetchR2HistoryDays(env, url) {
   try {
     aqilevels = compactHistoryIndexDomain(await readR2HistoryIndex({
       r2,
-      indexKey: indexKeys.aqilevels,
+      indexKey: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
       domain: "aqilevels",
       maxLookbackDays,
       todayDay,
@@ -702,7 +680,10 @@ async function fetchR2HistoryDays(env, url) {
     read_version_source: layoutConfig.readVersion.source,
     read_version_warning: layoutConfig.readVersion.warning,
     index_prefix: indexPrefix,
-    index_keys: indexKeys,
+    index_keys: {
+      observations: buildR2HistoryIndexKey(indexPrefix, "observations"),
+      aqilevels: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
+    },
     warnings,
     strict_manifests: strictManifests,
   };
@@ -738,40 +719,20 @@ async function fetchR2HistoryCounts(env, url) {
 
   const layoutConfig = resolveR2HistoryLayoutConfig(env, url);
   const indexPrefix = layoutConfig.indexPrefix;
-  const indexKeys = {
-    observations: buildR2HistoryReadIndexKey(layoutConfig, "observations"),
-    aqilevels: buildR2HistoryReadIndexKey(layoutConfig, "aqilevels"),
-  };
-  const warnings = [];
-  let observations = compactHistoryIndexDomain(null);
-  let aqilevels = compactHistoryIndexDomain(null);
-  let indexError = null;
-  try {
-    observations = compactHistoryIndexDomain(await readR2HistoryIndex({
-      r2,
-      indexKey: indexKeys.observations,
-      domain: "observations",
-      maxLookbackDays: 0,
-      todayDay,
-    }));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    indexError = indexError || message;
-    warnings.push(`observations index unavailable for ${layoutConfig.readVersion.label}: ${message}`);
-  }
-  try {
-    aqilevels = compactHistoryIndexDomain(await readR2HistoryIndex({
-      r2,
-      indexKey: indexKeys.aqilevels,
-      domain: "aqilevels",
-      maxLookbackDays: 0,
-      todayDay,
-    }));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    indexError = indexError || message;
-    warnings.push(`aqilevels index unavailable for ${layoutConfig.readVersion.label}: ${message}`);
-  }
+  const observations = compactHistoryIndexDomain(await readR2HistoryIndex({
+    r2,
+    indexKey: buildR2HistoryIndexKey(indexPrefix, "observations"),
+    domain: "observations",
+    maxLookbackDays: 0,
+    todayDay,
+  }));
+  const aqilevels = compactHistoryIndexDomain(await readR2HistoryIndex({
+    r2,
+    indexKey: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
+    domain: "aqilevels",
+    maxLookbackDays: 0,
+    todayDay,
+  }));
 
   const aggregated = aggregateR2HistoryConnectorCounts({
     observationsDomain: observations,
@@ -788,15 +749,16 @@ async function fetchR2HistoryCounts(env, url) {
     to_day_utc: toDay,
     grain,
     connector_ids_requested: connectorIds,
-    source: indexError ? "cloudflare_r2_history_index_unavailable" : "cloudflare_r2_history_index",
-    error: indexError,
-    warnings,
+    source: "cloudflare_r2_history_index",
     read_version: layoutConfig.readVersion.version,
     read_version_label: layoutConfig.readVersion.label,
     read_version_source: layoutConfig.readVersion.source,
     read_version_warning: layoutConfig.readVersion.warning,
     index_prefix: indexPrefix,
-    index_keys: indexKeys,
+    index_keys: {
+      observations: buildR2HistoryIndexKey(indexPrefix, "observations"),
+      aqilevels: buildR2HistoryIndexKey(indexPrefix, "aqilevels"),
+    },
     domains: {
       observations: {
         generated_at: observations.generated_at,
