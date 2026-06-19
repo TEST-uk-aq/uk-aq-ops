@@ -261,9 +261,14 @@ function buildDayCutoff(maxLookbackDays) {
     .slice(0, 10);
 }
 
-function compactHistoryIndexDomain(domainPayload) {
+export function compactHistoryIndexDomain(domainPayload) {
+  const explicitDays = Array.isArray(domainPayload?.days) ? domainPayload.days : [];
+  const summaryDays = Array.isArray(domainPayload?.day_summaries)
+    ? domainPayload.day_summaries.map((entry) => parseIsoDay(entry?.day_utc)).filter(Boolean)
+    : [];
+  const days = Array.from(new Set([...explicitDays, ...summaryDays])).sort();
   return {
-    days: Array.isArray(domainPayload?.days) ? domainPayload.days : [],
+    days,
     day_summaries: Array.isArray(domainPayload?.day_summaries) ? domainPayload.day_summaries : [],
     min_day_utc: domainPayload?.min_day_utc || null,
     max_day_utc: domainPayload?.max_day_utc || null,
@@ -646,7 +651,7 @@ async function fetchR2HistoryDays(env, url) {
     domainSources.observations = "cloudflare_r2_history_index";
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    warnings.push(`observations index fallback: ${message}`);
+    warnings.push(`observations index unavailable for ${layoutConfig.readVersion.label}: attempted ${indexKeys.observations}; ${message}; scanning ${observationsPrefix} only (no v1 fallback).`);
     observations = await listCommittedDaysForDomain({
       r2,
       domainPrefix: observationsPrefix,
@@ -668,7 +673,7 @@ async function fetchR2HistoryDays(env, url) {
     domainSources.aqilevels = "cloudflare_r2_history_index";
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    warnings.push(`aqilevels index fallback: ${message}`);
+    warnings.push(`aqilevels index unavailable for ${layoutConfig.readVersion.label}: attempted ${indexKeys.aqilevels}; ${message}; scanning ${aqilevelsPrefix} only (no v1 fallback).`);
     aqilevels = await listCommittedDaysForDomain({
       r2,
       domainPrefix: aqilevelsPrefix,
