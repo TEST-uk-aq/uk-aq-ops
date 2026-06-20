@@ -75,14 +75,6 @@ R2 history-counts response shape:
 - `index_prefix`
 - `index_keys.observations`
 - `index_keys.aqilevels`
-- `domains.observations` / `domains.aqilevels`
-  - `generated_at`
-  - `min_day_utc`
-  - `max_day_utc`
-  - `day_count`
-  - `total_rows`
-  - `first_day_summary_fields`
-  - `connector_row_counts_found`
 - `connectors[]`
   - `connector_id`
   - `observations_total_rows`
@@ -129,11 +121,6 @@ Behavior:
   - v2 paths are configurable via `UK_AQ_R2_HISTORY_INDEX_V2_PREFIX`, `UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX`, and `UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX`.
 - For `/v1/r2-history-counts`, reads the same version-selected derived R2 history index files and aggregates
   connector row counts by day or month entirely in-memory.
-- In `read_version=v2`, connector counts come from
-  `history/_index_v2/*_latest.json` `day_summaries[].connectors[].row_count`.
-  If a v2 latest index is still on the old shape without `connectors`, the
-  response includes a warning that the v2 latest index must be rebuilt instead
-  of silently treating missing connector summaries as genuine zero rows.
 - If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that same active-version domain only (no v1 fallback when v2 is selected):
   - lists `day_utc=YYYY-MM-DD/` common prefixes under the domain;
   - filters by `max_days` and excludes future dates.

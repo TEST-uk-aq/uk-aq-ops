@@ -96,12 +96,14 @@ UK_AQ_DROPBOX_APP_FOLDER = str(os.getenv("UK_AQ_DROPBOX_APP_FOLDER") or "").stri
 UK_AQ_R2_HISTORY_DROPBOX_DIR = str(
     os.getenv("UK_AQ_R2_HISTORY_DROPBOX_DIR") or "R2_history_backup"
 ).strip()
-UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV = "UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH"
+UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV = str(os.getenv("UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH") or "").strip()
 R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS = {
     "v1": "_ops/checkpoints/r2_history_backup_state_v1.json",
     "v2": "_ops/checkpoints/r2_history_backup_state_v2.json",
 }
-UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV = "UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE"
+UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE = str(
+    os.getenv("UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE") or ""
+).strip()
 DROPBOX_APP_KEY = str(os.getenv("DROPBOX_APP_KEY") or "").strip()
 DROPBOX_APP_SECRET = str(os.getenv("DROPBOX_APP_SECRET") or "").strip()
 DROPBOX_REFRESH_TOKEN = str(os.getenv("DROPBOX_REFRESH_TOKEN") or "").strip()
@@ -413,76 +415,37 @@ def _looks_like_v1_dropbox_state_path(value: str) -> bool:
 
 def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
     read_version_info = _resolve_r2_history_read_version()
-    if not read_version_info.get("valid"):
-        warning = str(
-            read_version_info.get("warning")
-            or "Invalid R2 history read version; Dropbox checkpoint selection disabled."
-        )
-        return {
-            "path": None,
-            "source": "disabled_invalid_read_version",
-            "cache_key": f"invalid:{read_version_info.get('raw') or ''}:dropbox_disabled",
-            "warning": warning,
-            "error": warning,
-            "fallback_attempted": False,
-            "read_version": read_version_info,
-            "attempted_paths": [],
-            "state_file_override": None,
-            "ignored_state_file_override": None,
-        }
-
-    version = str(read_version_info.get("version") or R2_HISTORY_READ_VERSION_DEFAULT)
-    raw_env = str(os.getenv(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV) or "").strip()
-    state_file_override = str(os.getenv(UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV) or "").strip()
-
+    version = read_version_info.get("version") or R2_HISTORY_READ_VERSION_DEFAULT
+    raw_env = UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV
+    
     fallback_attempted = False
-    warnings: List[str] = []
+    warning = None
     source = "default"
     attempted_paths: List[str] = []
-    ignored_state_file_override: Optional[str] = None
-
+    
     if raw_env:
         source = "env"
         attempted_paths.append(raw_env)
         if version == "v2" and _looks_like_v1_dropbox_state_path(raw_env):
             path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS["v2"]
-            source = "default:v2_ignored_v1_env_override"
-            warnings.append(
-                f"{R2_HISTORY_READ_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV} looks like a v1 path ({raw_env}). Using v2 default instead."
-            )
+            source = "default_override_v1"
+            warning = f"UK_AQ_R2_HISTORY_READ_VERSION is v2 but UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH looks like a v1 path ({raw_env}). Using v2 default instead."
+            fallback_attempted = True
             attempted_paths.append(path)
         else:
             path = raw_env
     else:
-        path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS[version]
+        path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS.get(version, R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS["v1"])
         attempted_paths.append(path)
-
-    if state_file_override:
-        attempted_paths.append(state_file_override)
-        if version == "v2" and _looks_like_v1_dropbox_state_path(state_file_override):
-            ignored_state_file_override = state_file_override
-            state_file_override = ""
-            if source == "default:v2_ignored_v1_env_override":
-                source = "default:v2_ignored_v1_env_and_state_file_overrides"
-            elif source == "default":
-                source = "default:v2_ignored_v1_state_file_override"
-            warnings.append(
-                f"{R2_HISTORY_READ_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV} looks like a v1 checkpoint ({ignored_state_file_override}). Ignoring that override and using the resolved v2 checkpoint path."
-            )
-
-    cache_key = f"{version}:{path}:state_file={state_file_override or ''}"
-
+    
     return {
         "path": path,
         "source": source,
-        "cache_key": cache_key,
-        "warning": " ".join(warnings) if warnings else None,
-        "error": None,
+        "cache_key": f"{version}:{path}",
+        "warning": warning,
         "fallback_attempted": fallback_attempted,
         "read_version": read_version_info,
         "attempted_paths": attempted_paths,
-        "state_file_override": state_file_override or None,
-        "ignored_state_file_override": ignored_state_file_override,
     }
 
 
@@ -1913,15 +1876,9 @@ def _load_dropbox_backup_days_remote(state_rel_path: str) -> Tuple[Dict[str, Set
     return parsed_days, path_ref, parse_error
 
 
-def _candidate_dropbox_state_paths(
-    resolved_state_rel_path: Optional[str],
-    state_info: Optional[Dict[str, Any]] = None,
-) -> List[Path]:
+def _candidate_dropbox_state_paths(resolved_state_rel_path: str) -> List[Path]:
     candidates: List[Path] = []
     seen: Set[str] = set()
-
-    if not resolved_state_rel_path:
-        return candidates
 
     def add_candidate(raw_path: Optional[Path]) -> None:
         if raw_path is None:
@@ -1933,10 +1890,8 @@ def _candidate_dropbox_state_paths(
         seen.add(key)
         candidates.append(expanded)
 
-    info = state_info or _resolve_dropbox_state_path_info()
-    state_file_override = str(info.get("state_file_override") or "").strip()
-    if state_file_override:
-        add_candidate(Path(state_file_override))
+    if UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE:
+        add_candidate(Path(UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE))
 
     local_roots: List[Path] = []
     if UK_AQ_DROPBOX_LOCAL_ROOT:
@@ -2003,11 +1958,9 @@ def _candidate_dropbox_history_dirs() -> List[Path]:
         candidates.append(expanded)
 
     state_info = _resolve_dropbox_state_path_info()
-    resolved_state_rel_path = state_info.get("path")
-    if not resolved_state_rel_path:
-        return candidates
+    resolved_state_rel_path = state_info["path"]
 
-    for state_path in _candidate_dropbox_state_paths(resolved_state_rel_path, state_info=state_info):
+    for state_path in _candidate_dropbox_state_paths(resolved_state_rel_path):
         rel_parts = [
             part for part in str(resolved_state_rel_path or "").strip().strip("/").split("/")
             if part
@@ -2152,13 +2105,10 @@ def _get_dropbox_history_latest_mtime_cached(
 
 def _load_dropbox_backup_days() -> Tuple[Dict[str, Set[date]], Optional[str], Optional[str], Dict[str, Any]]:
     state_info = _resolve_dropbox_state_path_info()
-    resolved_path = state_info.get("path")
+    resolved_path = state_info["path"]
 
     domain_days = _empty_dropbox_backup_days()
-    if not resolved_path:
-        return domain_days, None, state_info.get("error"), state_info
-
-    for candidate in _candidate_dropbox_state_paths(resolved_path, state_info=state_info):
+    for candidate in _candidate_dropbox_state_paths(resolved_path):
         if not candidate.is_file():
             continue
         try:

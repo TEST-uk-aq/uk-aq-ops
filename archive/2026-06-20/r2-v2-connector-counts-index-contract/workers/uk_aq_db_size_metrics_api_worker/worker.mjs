@@ -278,58 +278,6 @@ export function compactHistoryIndexDomain(domainPayload) {
   };
 }
 
-function firstDaySummaryFieldNames(domainPayload, fromDay, toDay) {
-  const daySummaries = Array.isArray(domainPayload?.day_summaries)
-    ? domainPayload.day_summaries
-    : [];
-  const first = daySummaries.find((entry) => {
-    const dayUtc = parseIsoDay(entry?.day_utc);
-    return dayUtc && dayUtc >= fromDay && dayUtc <= toDay;
-  }) || daySummaries[0] || null;
-  if (!first || typeof first !== "object" || Array.isArray(first)) {
-    return [];
-  }
-  return Object.keys(first).sort((a, b) => a.localeCompare(b));
-}
-
-function connectorRowCountDiagnostics(domainPayload, fromDay, toDay) {
-  const daySummaries = Array.isArray(domainPayload?.day_summaries)
-    ? domainPayload.day_summaries
-    : [];
-  let daySummaryCount = 0;
-  let connectorArrayDayCount = 0;
-  let connectorRowCountDayCount = 0;
-  let connectorRowCountEntryCount = 0;
-
-  for (const summary of daySummaries) {
-    const dayUtc = parseIsoDay(summary?.day_utc);
-    if (!dayUtc || dayUtc < fromDay || dayUtc > toDay) {
-      continue;
-    }
-    daySummaryCount += 1;
-    if (Array.isArray(summary?.connectors)) {
-      connectorArrayDayCount += 1;
-      if (summary.connectors.some((entry) => parseNonNegativeInt(entry?.row_count, null) !== null)) {
-        connectorRowCountDayCount += 1;
-      }
-      connectorRowCountEntryCount += summary.connectors.filter(
-        (entry) =>
-          parseNonNegativeInt(entry?.connector_id, null)
-          && parseNonNegativeInt(entry?.row_count, null) !== null,
-      ).length;
-    }
-  }
-
-  return {
-    day_summary_count_in_range: daySummaryCount,
-    connector_array_day_count: connectorArrayDayCount,
-    connector_row_count_day_count: connectorRowCountDayCount,
-    connector_row_count_entry_count: connectorRowCountEntryCount,
-    connector_row_counts_found: connectorRowCountEntryCount > 0,
-    connector_row_count_fields_found: connectorRowCountDayCount > 0,
-  };
-}
-
 function parseConnectorIds(rawValue) {
   if (typeof rawValue !== "string" || !rawValue.trim()) {
     return [];
@@ -528,7 +476,6 @@ export function aggregateR2HistoryConnectorCounts({
   return {
     bucket_count: orderedBucketKeys.length,
     range_day_count: countInclusiveDays(normalizedFrom, normalizedTo),
-    connector_count: connectors.length,
     connectors,
   };
 }
@@ -831,34 +778,6 @@ async function fetchR2HistoryCounts(env, url) {
     warnings.push(`aqilevels index unavailable for ${layoutConfig.readVersion.label}: ${message}`);
   }
 
-  const observationsDiagnostics = {
-    first_day_summary_fields: firstDaySummaryFieldNames(observations, fromDay, toDay),
-    ...connectorRowCountDiagnostics(observations, fromDay, toDay),
-  };
-  const aqilevelsDiagnostics = {
-    first_day_summary_fields: firstDaySummaryFieldNames(aqilevels, fromDay, toDay),
-    ...connectorRowCountDiagnostics(aqilevels, fromDay, toDay),
-  };
-
-  if (layoutConfig.readVersion.version === "v2") {
-    if (
-      observationsDiagnostics.day_summary_count_in_range > 0
-      && observationsDiagnostics.connector_array_day_count === 0
-    ) {
-      warnings.push(
-        `observations ${layoutConfig.readVersion.label} latest index ${indexKeys.observations} does not include day_summaries[].connectors row-count summaries; rebuild the v2 latest index before using connector row-count charts.`,
-      );
-    }
-    if (
-      aqilevelsDiagnostics.day_summary_count_in_range > 0
-      && aqilevelsDiagnostics.connector_array_day_count === 0
-    ) {
-      warnings.push(
-        `aqilevels ${layoutConfig.readVersion.label} latest index ${indexKeys.aqilevels} does not include day_summaries[].connectors row-count summaries; rebuild the v2 latest index before using connector row-count charts.`,
-      );
-    }
-  }
-
   const aggregated = aggregateR2HistoryConnectorCounts({
     observationsDomain: observations,
     aqilevelsDomain: aqilevels,
@@ -890,7 +809,6 @@ async function fetchR2HistoryCounts(env, url) {
         max_day_utc: observations.max_day_utc,
         day_count: observations.day_count,
         total_rows: observations.total_rows,
-        ...observationsDiagnostics,
       },
       aqilevels: {
         generated_at: aqilevels.generated_at,
@@ -898,7 +816,6 @@ async function fetchR2HistoryCounts(env, url) {
         max_day_utc: aqilevels.max_day_utc,
         day_count: aqilevels.day_count,
         total_rows: aqilevels.total_rows,
-        ...aqilevelsDiagnostics,
       },
     },
     ...aggregated,

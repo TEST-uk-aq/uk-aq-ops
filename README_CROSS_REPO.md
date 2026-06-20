@@ -1,7 +1,7 @@
 # Cross-repo map: CIC-test-uk-aq-ops
 
 ## Main repo
-- `CIC-test-uk-aq-ingest` is the main repo for this project and the default starting point for cross-repo tasks.
+- `CIC-test-uk-aq-ops` is the main repo for this project and the default starting point for cross-repo tasks.
 
 ## Purpose
 This repo runs UK AQ operational Cloud Run services (prune, outbox, partition maintenance, DB size logging, and backfill) and related deployment/setup documentation.

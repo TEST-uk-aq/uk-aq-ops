@@ -142,7 +142,7 @@ const DEFAULT_MAX_KEYS = 1000;
 const INDEX_SCHEMA_VERSION = 1;
 const OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
 const AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
-const HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION = 3;
+const HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION = 2;
 const HISTORY_V2_TIMESERIES_METADATA_SCHEMA_VERSION = 1;
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
 
@@ -1852,27 +1852,11 @@ function normalizeHistoryV2TimeseriesLatestDaySummary(entry) {
   if (!dayUtc) {
     return null;
   }
-  const connectorRowCounts = new Map();
-  for (const connector of Array.isArray(entry.connectors) ? entry.connectors : []) {
-    const connectorId = parsePositiveId(connector?.connector_id);
-    const rowCount = parseNonNegativeInt(connector?.row_count);
-    if (!connectorId || rowCount === null) {
-      continue;
-    }
-    connectorRowCounts.set(connectorId, (connectorRowCounts.get(connectorId) || 0) + rowCount);
-  }
-  const connectorIds = Array.from(new Set([
-    ...(Array.isArray(entry.connector_ids) ? entry.connector_ids : [])
+  const connectorIds = Array.from(new Set(
+    (Array.isArray(entry.connector_ids) ? entry.connector_ids : [])
       .map((value) => parsePositiveId(value))
       .filter(Boolean),
-    ...connectorRowCounts.keys(),
-  ])).sort((a, b) => a - b);
-  const connectors = Array.from(connectorRowCounts.entries())
-    .map(([connectorId, rowCount]) => ({
-      connector_id: connectorId,
-      row_count: rowCount,
-    }))
-    .sort((a, b) => a.connector_id - b.connector_id);
+  )).sort((a, b) => a - b);
   const pollutantCodes = Array.from(new Set(
     (Array.isArray(entry.pollutant_codes) ? entry.pollutant_codes : [])
       .map((value) => parsePollutantCode(value))
@@ -1880,13 +1864,10 @@ function normalizeHistoryV2TimeseriesLatestDaySummary(entry) {
   )).sort((a, b) => a.localeCompare(b));
   const connectorCount = parseNonNegativeInt(entry.connector_count);
   const pollutantIndexCount = parseNonNegativeInt(entry.pollutant_index_count);
-  const connectorRowTotal = connectors.reduce((sum, connector) => sum + connector.row_count, 0);
   return {
     day_utc: dayUtc,
     connector_count: connectorIds.length || connectorCount || 0,
     connector_ids: connectorIds,
-    connectors,
-    total_rows: parseNonNegativeInt(entry.total_rows) ?? connectorRowTotal,
     pollutant_codes: pollutantCodes,
     pollutant_index_count: pollutantIndexCount || 0,
     file_count: parseNonNegativeInt(entry.file_count) || 0,
@@ -1895,7 +1876,7 @@ function normalizeHistoryV2TimeseriesLatestDaySummary(entry) {
   };
 }
 
-export function buildHistoryV2TimeseriesLatestPayload({
+function buildHistoryV2TimeseriesLatestPayload({
   domain,
   grain = null,
   profile = null,
@@ -1933,10 +1914,6 @@ export function buildHistoryV2TimeseriesLatestPayload({
     (sum, entry) => sum + (parseNonNegativeInt(entry.pollutant_index_count) || 0),
     0,
   );
-  const totalRows = sortedSummaries.reduce(
-    (sum, entry) => sum + (parseNonNegativeInt(entry.total_rows) || 0),
-    0,
-  );
   const fileCount = sortedSummaries.reduce(
     (sum, entry) => sum + (parseNonNegativeInt(entry.file_count) || 0),
     0,
@@ -1967,7 +1944,6 @@ export function buildHistoryV2TimeseriesLatestPayload({
     min_day_utc: days.length ? days[0] : null,
     max_day_utc: days.length ? days[days.length - 1] : null,
     day_count: days.length,
-    total_rows: totalRows,
     connector_index_count: connectorIndexCount,
     pollutant_index_count: pollutantIndexCount,
     file_count: fileCount,
@@ -3019,7 +2995,6 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
                   connector_id: connectorTarget.connector_id,
                   pollutant_code: pollutantTarget.pollutant_code,
                   index_key: pollutantIndexKey,
-                  row_count: payload.source_row_count,
                   file_count: payload.file_count,
                   indexed_file_count: payload.indexed_file_count,
                   put_skipped: Boolean(putResult.skipped),
@@ -3040,10 +3015,6 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
             pollutant_indexes: pollutantResults.sort((a, b) =>
               a.pollutant_code.localeCompare(b.pollutant_code)
             ),
-            row_count: pollutantResults.reduce(
-              (sum, entry) => sum + (parseNonNegativeInt(entry.row_count) || 0),
-              0,
-            ),
             backed_up_at_utc:
               toIsoOrNull(connectorManifestObject?.backed_up_at_utc)
               || pickMaxIsoTimestamp(pollutantResults.map((entry) => entry.backed_up_at_utc)),
@@ -3061,11 +3032,6 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
         day_utc: dayUtc,
         connector_count: connectorResults.length,
         connector_ids: connectorResults.map((entry) => entry.connector_id),
-        connectors: connectorResults.map((entry) => ({
-          connector_id: entry.connector_id,
-          row_count: entry.row_count,
-        })),
-        total_rows: connectorResults.reduce((sum, entry) => sum + entry.row_count, 0),
         pollutant_codes: pollutantCodes,
         pollutant_index_count: pollutantIndexes.length,
         file_count: pollutantIndexes.reduce((sum, entry) => sum + entry.file_count, 0),
@@ -3289,7 +3255,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
               return {
                 connector_id: connectorTarget.connector_id,
                 pollutant_code: pollutantTarget.pollutant_code,
-                row_count: payload.source_row_count,
                 file_count: payload.file_count,
                 indexed_file_count: payload.indexed_file_count,
                 backed_up_at_utc: payload.backed_up_at_utc,
@@ -3310,10 +3275,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
           connector_id: connectorTarget.connector_id,
           pollutant_indexes: pollutantResults.sort((a, b) =>
             a.pollutant_code.localeCompare(b.pollutant_code)
-          ),
-          row_count: pollutantResults.reduce(
-            (sum, entry) => sum + (parseNonNegativeInt(entry.row_count) || 0),
-            0,
           ),
           backed_up_at_utc:
             toIsoOrNull(connectorManifestObject?.backed_up_at_utc)
@@ -3339,11 +3300,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
       day_utc: dayUtc,
       connector_count: connectorResults.length,
       connector_ids: connectorResults.map((entry) => entry.connector_id),
-      connectors: connectorResults.map((entry) => ({
-        connector_id: entry.connector_id,
-        row_count: entry.row_count,
-      })),
-      total_rows: connectorResults.reduce((sum, entry) => sum + entry.row_count, 0),
       pollutant_codes: pollutantCodes,
       pollutant_index_count: pollutantIndexes.length,
       file_count: pollutantIndexes.reduce((sum, entry) => sum + entry.file_count, 0),

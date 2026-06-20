@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildHistoryV2TimeseriesLatestPayload,
   buildHistoryV2TimeseriesMetadataIndexPayload,
   buildHistoryV2TimeseriesPollutantIndexPayload,
   buildR2HistoryObservationsTimeseriesConnectorIndexKey,
@@ -290,7 +289,7 @@ test("buildHistoryV2TimeseriesPollutantIndexPayload builds observation pollutant
     },
   });
 
-  assert.equal(payload.schema_version, 3);
+  assert.equal(payload.schema_version, 2);
   assert.equal(payload.generated_at, "2026-04-04T01:02:03.000Z");
   assert.equal(payload.history_version, "v2");
   assert.equal(payload.domain, "observations");
@@ -382,115 +381,6 @@ test("v2 pollutant index payload is byte-stable when source backed_up_at_utc is 
   const second = JSON.stringify(buildHistoryV2TimeseriesPollutantIndexPayload({
     ...args,
     generatedAt: "2026-06-02T00:00:00.000Z",
-  }));
-
-  assert.equal(first, second);
-});
-
-test("v2 observations latest day summaries include sorted connector row counts", () => {
-  const payload = buildHistoryV2TimeseriesLatestPayload({
-    domain: "observations",
-    bucket: "uk-aq-history-dev",
-    generatedAt: "2026-06-20T00:00:00.000Z",
-    dataPrefix: "history/v2/observations",
-    timeseriesIndexPrefix: "history/_index_v2/observations_timeseries",
-    daySummaries: [
-      {
-        day_utc: "2026-06-12",
-        connector_count: 3,
-        connector_ids: [7, 3, 1],
-        connectors: [
-          { connector_id: 7, row_count: 23456 },
-          { connector_id: 1, row_count: 12345 },
-          { connector_id: 3, row_count: 67890 },
-        ],
-        pollutant_codes: ["pm25", "no2"],
-        pollutant_index_count: 4,
-        file_count: 87,
-        indexed_file_count: 87,
-        backed_up_at_utc: "2026-06-17T09:52:53.000Z",
-      },
-    ],
-  });
-
-  assert.equal(payload.schema_version, 3);
-  assert.equal(payload.domain, "observations");
-  assert.equal(payload.total_rows, 103691);
-  assert.equal(payload.day_summaries[0].total_rows, 103691);
-  assert.deepEqual(payload.day_summaries[0].connector_ids, [1, 3, 7]);
-  assert.deepEqual(payload.day_summaries[0].connectors, [
-    { connector_id: 1, row_count: 12345 },
-    { connector_id: 3, row_count: 67890 },
-    { connector_id: 7, row_count: 23456 },
-  ]);
-  assert.deepEqual(payload.day_summaries[0].pollutant_codes, ["no2", "pm25"]);
-  assert.equal(payload.day_summaries[0].file_count, 87);
-  assert.equal(payload.day_summaries[0].indexed_file_count, 87);
-  assert.equal(payload.day_summaries[0].backed_up_at_utc, "2026-06-17T09:52:53.000Z");
-});
-
-test("v2 AQI latest day summaries include connector row counts without using file counts", () => {
-  const payload = buildHistoryV2TimeseriesLatestPayload({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: "data",
-    bucket: "uk-aq-history-dev",
-    generatedAt: "2026-06-20T00:00:00.000Z",
-    dataPrefix: "history/v2/aqilevels/hourly/data",
-    timeseriesIndexPrefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
-    daySummaries: [
-      {
-        day_utc: "2026-06-12",
-        connector_ids: [3],
-        connectors: [{ connector_id: 3, row_count: 2468 }],
-        pollutant_codes: ["no2"],
-        pollutant_index_count: 1,
-        file_count: 1,
-        indexed_file_count: 1,
-        backed_up_at_utc: "2026-06-17T09:52:53.000Z",
-      },
-    ],
-  });
-
-  assert.equal(payload.schema_version, 3);
-  assert.equal(payload.domain, "aqilevels");
-  assert.equal(payload.grain, "hourly");
-  assert.equal(payload.profile, "data");
-  assert.equal(payload.total_rows, 2468);
-  assert.equal(payload.day_summaries[0].total_rows, 2468);
-  assert.equal(payload.day_summaries[0].file_count, 1);
-  assert.deepEqual(payload.day_summaries[0].connectors, [
-    { connector_id: 3, row_count: 2468 },
-  ]);
-});
-
-test("v2 latest payload is byte-stable with unchanged source summaries", () => {
-  const args = {
-    domain: "observations",
-    bucket: "uk-aq-history-dev",
-    dataPrefix: "history/v2/observations",
-    timeseriesIndexPrefix: "history/_index_v2/observations_timeseries",
-    daySummaries: [
-      {
-        day_utc: "2026-06-12",
-        connector_ids: [3, 1],
-        connectors: [
-          { connector_id: 3, row_count: 30 },
-          { connector_id: 1, row_count: 10 },
-        ],
-        pollutant_codes: ["pm25"],
-        pollutant_index_count: 2,
-        backed_up_at_utc: "2026-06-17T09:52:53.000Z",
-      },
-    ],
-  };
-  const first = JSON.stringify(buildHistoryV2TimeseriesLatestPayload({
-    ...args,
-    generatedAt: "2026-06-20T00:00:00.000Z",
-  }));
-  const second = JSON.stringify(buildHistoryV2TimeseriesLatestPayload({
-    ...args,
-    generatedAt: "2026-06-21T00:00:00.000Z",
   }));
 
   assert.equal(first, second);
