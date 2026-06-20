@@ -4911,16 +4911,165 @@ def _v2_obs_gap(
             "db_dump_present": None,
         },
         "suggested_repair": {
-            "kind": "v1_to_v2_observations_backfill",
-            "requires_index_rebuild": True,
+            "kind": "repair_plan_unclassified",
+            "requires_index_rebuild": False,
             "commands": [],
-            "notes": (
-                "Future repair may use scripts/backup_r2/"
-                "uk_aq_build_v2_observations_from_dropbox_v1.mjs when local v1 "
-                "Dropbox source exists; _index_v2 rebuild command requires confirmation."
-            ),
+            "notes": "Repair planning did not classify this v2 observations finding.",
         },
     }
+
+
+def _repair_day_connector_args(day_utc: str | None, connector_id: int | str | None) -> list[str]:
+    args: list[str] = []
+    if day_utc:
+        args.extend(["--from-day", day_utc, "--to-day", day_utc])
+    if connector_id is not None:
+        args.extend(["--connector-ids", str(connector_id)])
+    return args
+
+
+def _confirmed_v1_to_v2_observations_command(
+    *,
+    day_utc: str | None,
+    connector_id: int | str | None,
+) -> list[str]:
+    args = _repair_day_connector_args(day_utc, connector_id)
+    return [
+        "node",
+        "scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs",
+        *args,
+        "--part-max-rows",
+        "5000",
+        "--write-r2",
+        "--replace",
+        "--report-out",
+        f"tmp/v2_observations_{day_utc or 'selected_range'}_from_v1_dropbox.json",
+    ]
+
+
+def _local_v1_observations_evidence(
+    root: Path,
+    *,
+    day_utc: str | None,
+    connector_id: int | str | None,
+) -> tuple[bool | None, list[str]]:
+    if not day_utc:
+        return None, []
+    base = root / "history/v1/observations" / f"day_utc={day_utc}"
+    if connector_id is not None:
+        base = base / f"connector_id={connector_id}"
+    if not base.exists():
+        return False, [str(base.relative_to(root))]
+    return True, [str(base.relative_to(root))]
+
+
+def _local_v2_observations_evidence(
+    root: Path,
+    config: HistoryPathConfig,
+    *,
+    day_utc: str | None,
+    connector_id: int | str | None,
+    pollutant_code: str | None,
+) -> tuple[bool | None, list[str]]:
+    if not day_utc:
+        return None, []
+    base = root / config.observations_data_prefix.strip("/") / f"day_utc={day_utc}"
+    if connector_id is not None:
+        base = base / f"connector_id={connector_id}"
+    if pollutant_code:
+        base = base / f"pollutant_code={pollutant_code}"
+    if not base.exists():
+        return False, [str(base.relative_to(root))]
+    return True, [str(base.relative_to(root))]
+
+
+def _enrich_v2_observations_repair_plans(
+    *,
+    root: Path,
+    gaps: list[dict[str, Any]],
+) -> None:
+    index_gap_types = {
+        "index_day_dir_missing",
+        "index_connector_dir_missing",
+        "index_pollutant_dir_missing",
+        "index_manifest_missing",
+        "index_manifest_invalid_json",
+        "index_manifest_missing_timeseries_counts",
+        "index_manifest_empty_timeseries_counts",
+        "latest_index_missing",
+        "latest_index_invalid_json",
+        "latest_index_stale_or_incomplete",
+    }
+    data_gap_types = {
+        "day_dir_missing",
+        "connector_dir_missing",
+        "pollutant_dir_missing",
+        "data_manifest_missing",
+        "data_manifest_invalid_json",
+        "data_manifest_schema_mismatch",
+        "data_manifest_empty",
+        "parquet_missing",
+        "parquet_empty_or_placeholder",
+        "parquet_unreadable",
+        "row_count_mismatch",
+        "pollutant_missing",
+        "orphan_parquet_without_manifest",
+    }
+    for gap in gaps:
+        gap_type = str(gap.get("gap_type") or "")
+        day_utc = gap.get("day_utc")
+        connector_id = gap.get("connector_id")
+        v1_present, v1_paths = _local_v1_observations_evidence(
+            root,
+            day_utc=str(day_utc) if day_utc else None,
+            connector_id=connector_id,
+        )
+        evidence = gap.setdefault("source_evidence", {})
+        evidence["v1_local_dropbox_present"] = v1_present
+        if v1_paths:
+            evidence["v1_local_dropbox_paths"] = v1_paths
+
+        if gap_type in index_gap_types:
+            gap["suggested_repair"] = {
+                "kind": "rebuild_v2_observations_index_only",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    "Confirm the v2 observations data partition exists for the finding.",
+                    "Rebuild only the v2 observations _index_v2 timeseries manifest for the affected day/connector/pollutant.",
+                ],
+                "notes": (
+                    "No exact _index_v2 rebuild command is emitted because the index rebuild "
+                    "command contract remains unresolved."
+                ),
+            }
+        elif gap_type in data_gap_types and v1_present is True:
+            gap["suggested_repair"] = {
+                "kind": "v1_dropbox_to_v2_observations_backfill_plan",
+                "requires_index_rebuild": True,
+                "commands": [_confirmed_v1_to_v2_observations_command(day_utc=day_utc, connector_id=connector_id)],
+                "steps": [
+                    "Use the confirmed local Dropbox v1-to-v2 observations builder for the affected day/connector scope.",
+                    "After v2 observations are written by an operator, rebuild the affected v2 observations _index_v2 manifests.",
+                ],
+                "notes": (
+                    "This is a non-executing plan. The listed builder command is a suggestion only; "
+                    "the checker does not run it. The follow-up _index_v2 rebuild command is not listed "
+                    "because its command contract has not been confirmed."
+                ),
+            }
+        elif gap_type in data_gap_types and v1_present is False:
+            gap["suggested_repair"] = {
+                "kind": "source_or_v1_backup_investigation_required",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    "Confirm whether v1 exists in R2 but is missing from the local Dropbox mirror.",
+                    "If v1 exists only in R2, refresh the Dropbox backup for the target scope before planning v1-to-v2 generation.",
+                    "If neither v1 nor v2 exists, investigate source/prune/Supabase availability before selecting a repair command.",
+                ],
+                "notes": "No Supabase/prune/backfill command is emitted because the exact v2 write contract has not been confirmed.",
+            }
 
 
 def _manifest_files(payload: Any) -> list[dict[str, Any]]:
@@ -5052,6 +5201,7 @@ def run_v2_observations_integrity_checks(
                     except Exception:
                         gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
 
+    _enrich_v2_observations_repair_plans(root=root, gaps=gaps)
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
     result = {"status": status, "checked_partitions": checked, "gap_count": len(gaps), "gaps": gaps}
     if log:
@@ -5096,12 +5246,110 @@ def _v2_aqi_gap(
             "db_dump_present": None,
         },
         "suggested_repair": {
-            "kind": "v2_aqi_hourly_rebuild_from_v2_observations",
+            "kind": "repair_plan_unclassified",
             "requires_index_rebuild": True,
             "commands": [],
-            "notes": "AQI rebuild and _index_v2 rebuild commands require confirmation; no repair is executed by this checker.",
+            "notes": "Repair planning did not classify this v2 AQI finding.",
         },
     }
+
+
+def _enrich_v2_aqi_repair_plans(
+    *,
+    root: Path,
+    config: HistoryPathConfig,
+    gaps: list[dict[str, Any]],
+) -> None:
+    index_gap_types = {
+        "index_day_dir_missing",
+        "index_connector_dir_missing",
+        "index_pollutant_dir_missing",
+        "index_manifest_missing",
+        "index_manifest_invalid_json",
+        "index_manifest_missing_timeseries_counts",
+        "index_manifest_empty_timeseries_counts",
+        "latest_index_missing",
+        "latest_index_invalid_json",
+        "latest_index_stale_or_incomplete",
+    }
+    data_gap_types = {
+        "day_dir_missing",
+        "connector_dir_missing",
+        "pollutant_dir_missing",
+        "data_manifest_missing",
+        "data_manifest_invalid_json",
+        "data_manifest_schema_mismatch",
+        "data_manifest_empty",
+        "parquet_missing",
+        "parquet_empty_or_placeholder",
+        "parquet_unreadable",
+        "row_count_mismatch",
+        "pollutant_missing",
+        "orphan_parquet_without_manifest",
+    }
+    debug_gap_prefixes = ("debug_",)
+    for gap in gaps:
+        gap_type = str(gap.get("gap_type") or "")
+        day_utc = gap.get("day_utc")
+        connector_id = gap.get("connector_id")
+        pollutant_code = gap.get("pollutant_code")
+        v2_obs_present, v2_obs_paths = _local_v2_observations_evidence(
+            root,
+            config,
+            day_utc=str(day_utc) if day_utc else None,
+            connector_id=connector_id,
+            pollutant_code=str(pollutant_code) if pollutant_code else None,
+        )
+        evidence = gap.setdefault("source_evidence", {})
+        evidence["v2_observations_present"] = v2_obs_present
+        if v2_obs_paths:
+            evidence["v2_observations_paths"] = v2_obs_paths
+
+        if gap_type in index_gap_types:
+            gap["suggested_repair"] = {
+                "kind": "rebuild_v2_aqi_index_only",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    "Confirm the v2 AQI hourly data partition exists for the finding.",
+                    "Rebuild only the v2 AQI hourly data _index_v2 timeseries manifest for the affected day/connector/pollutant.",
+                ],
+                "notes": "No exact _index_v2 rebuild command is emitted because the command contract remains unresolved.",
+            }
+        elif gap_type.startswith(debug_gap_prefixes):
+            gap["suggested_repair"] = {
+                "kind": "v2_aqi_debug_optional_rebuild_plan",
+                "requires_index_rebuild": False,
+                "commands": [],
+                "steps": [
+                    "Decide whether debug AQI coverage is required for this run.",
+                    "If required, rebuild v2 AQI debug outputs from v2 observations using the confirmed operational rebuild path.",
+                ],
+                "notes": "Debug coverage is optional unless the checker was run with debug required; no exact rebuild command is confirmed here.",
+            }
+        elif gap_type in data_gap_types and v2_obs_present is True:
+            gap["suggested_repair"] = {
+                "kind": "v2_aqi_hourly_rebuild_from_v2_observations_plan",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    "Run the confirmed AQI hourly rebuild process from v2 observations for the affected day/connector/pollutant scope.",
+                    "After v2 AQI hourly data is written by an operator, rebuild the affected v2 AQI hourly data _index_v2 manifests.",
+                ],
+                "notes": "AQI rebuild and _index_v2 rebuild commands require confirmation; no repair is executed by this checker.",
+            }
+        elif gap_type in data_gap_types:
+            gap["suggested_repair"] = {
+                "kind": "repair_v2_observations_before_v2_aqi",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    "Repair or generate the missing v2 observations partition first.",
+                    "Then rebuild v2 AQI hourly data from v2 observations.",
+                    "Finally rebuild the affected v2 AQI hourly data _index_v2 manifests.",
+                ],
+                "notes": "No Supabase/prune/backfill command is emitted because the exact v2 write contract has not been confirmed.",
+            }
 
 
 def _is_positive_int(value: Any) -> bool:
@@ -5294,6 +5542,7 @@ def run_v2_aqilevels_integrity_checks(
             debug_status = "ok"
 
     all_gaps = data_gaps + debug_gaps
+    _enrich_v2_aqi_repair_plans(root=root, config=config, gaps=all_gaps)
     status = "fail" if any(g.get("severity") == "error" for g in all_gaps) else "ok"
     result = {
         "status": status,
