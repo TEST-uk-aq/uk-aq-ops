@@ -8704,8 +8704,33 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
                         f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
+                    if gaps:
+                        lines.extend([
+                            "",
+                            "### V2 observation gaps",
+                            "",
+                            "| Severity | Gap type | Day | Connector | Pollutant | Expected path | Repair plan | Index rebuild |",
+                            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                        ])
+                        for gap in gaps[:25]:
+                            repair = gap.get("suggested_repair") or {}
+                            lines.append(
+                                "| "
+                                f"{gap.get('severity') or ''} | "
+                                f"{gap.get('gap_type') or ''} | "
+                                f"{gap.get('day_utc') or ''} | "
+                                f"{gap.get('connector_id') or ''} | "
+                                f"{gap.get('pollutant_code') or ''} | "
+                                f"{gap.get('expected_path') or ''} | "
+                                f"{repair.get('kind') or ''} | "
+                                f"{bool(repair.get('requires_index_rebuild'))} |"
+                            )
+                        if len(gaps) > 25:
+                            lines.append(f"| info | truncated |  |  |  | {len(gaps) - 25} more gaps |  |  |")
                     if aqi_gaps:
                         lines.extend([
+                            "",
+                            "### V2 AQI gaps",
                             "",
                             "| Severity | Profile | Gap type | Day | Connector | Pollutant | Expected path |",
                             "| --- | --- | --- | --- | --- | --- | --- |",
@@ -9142,7 +9167,9 @@ def main(argv: list[str]) -> int:
                 "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
             }
         else:
-            v1_config = history_path_configs["v1"]
+            v1_config = history_path_configs.get("v1")
+            if v1_config is None:
+                raise RuntimeError("v1 history path config is required for v1 cross-check mode")
             cross_check_metrics = run_r2_cross_checks(
                 conn=conn,
                 run_id=int(run_id),
@@ -9197,16 +9224,31 @@ def main(argv: list[str]) -> int:
                 log=log,
             )
             cross_check_metrics.update(cc_backfill_metrics)
-            aqi_health_metrics = run_aqi_health_checks(
-                conn=conn,
-                run_id=int(run_id),
-                env_name=args.env,
-                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
-                r2_aqilevels_prefix=history_path_configs["v1"].aqilevels_hourly_data_prefix,
-                dry_run=args.dry_run,
-                run_backfill=args.run_backfill,
-                log=log,
-            )
+            v1_config_for_legacy_aqi = history_path_configs.get("v1")
+            if v1_config_for_legacy_aqi is None:
+                aqi_health_metrics = {
+                    "aqi_health_ran": False,
+                    "aqi_health_skipped_reason": "skipped because v1 was not selected for this run",
+                    "aqi_health_connector_days_checked": 0,
+                    "aqi_health_rebuilds_queued": 0,
+                    "aqi_health_skipped_already_obs_repaired": 0,
+                    "aqi_health_manifest_missing": 0,
+                    "aqi_health_manifest_stale": 0,
+                    "aqi_health_manifest_empty": 0,
+                    "aqi_health_previous_rebuild_failed": 0,
+                    "queued_aqi_only_connector_days": [],
+                }
+            else:
+                aqi_health_metrics = run_aqi_health_checks(
+                    conn=conn,
+                    run_id=int(run_id),
+                    env_name=args.env,
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                    r2_aqilevels_prefix=v1_config_for_legacy_aqi.aqilevels_hourly_data_prefix,
+                    dry_run=args.dry_run,
+                    run_backfill=args.run_backfill,
+                    log=log,
+                )
             cross_check_metrics.update(aqi_health_metrics)
             aqi_rebuild_metrics = run_aqi_rebuild_queue_execution(
                 conn=conn,
