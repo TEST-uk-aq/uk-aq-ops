@@ -8768,23 +8768,25 @@ def collect_preflight_errors(
     if parsed_from and parsed_to and parsed_from > parsed_to:
         errors.append("--from-day must be less than or equal to --to-day.")
 
-    snapshot_root = Path(env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"])
+    core_history_version = resolve_core_history_version_for_mode(resolve_history_version_mode(args))
+    resolved_snapshot_root = resolve_core_snapshot_root(core_history_version, os.environ)
+    snapshot_root = Path(resolved_snapshot_root)
     if not snapshot_root.exists():
         errors.append(
-            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT does not exist: {snapshot_root}. "
+            f"resolved core snapshot root for history_version={core_history_version} does not exist: {snapshot_root}. "
             "Has Dropbox finished syncing the core snapshot backup?",
         )
     elif not snapshot_root.is_dir():
         errors.append(
-            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT is not a directory: {snapshot_root}",
+            f"resolved core snapshot root for history_version={core_history_version} is not a directory: {snapshot_root}",
         )
     elif not os.access(snapshot_root, os.R_OK):
         errors.append(
-            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT is not readable: {snapshot_root}",
+            f"resolved core snapshot root for history_version={core_history_version} is not readable: {snapshot_root}",
         )
     elif not _looks_like_snapshot_root(snapshot_root):
         errors.append(
-            f"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT does not look like a snapshot history root: {snapshot_root}. "
+            f"resolved core snapshot root for history_version={core_history_version} does not look like a snapshot history root: {snapshot_root}. "
             "Has Dropbox finished syncing the core snapshot backup?",
         )
 
@@ -8986,8 +8988,6 @@ def collect_preflight_errors(
     window_from, window_to = compute_window(
         args.profile, args.from_day, args.to_day, os.environ,
     )
-
-    core_history_version = resolve_core_history_version_for_mode(resolve_history_version_mode(args))
 
     summary = {
         "env": args.env,
