@@ -13,7 +13,7 @@ const CRON_BY_JOB_KEY = Object.freeze({
   /* DEPLOY_CRON_MAP_END */
 });
 
-const JOBS = [
+export const JOBS = [
   // job_key: uk_aq_stations_daily
   {
     job_key: "uk_aq_stations_daily",
@@ -22,21 +22,41 @@ const JOBS = [
     workflow_file: "uk_aq_stations_daily.yml",
     ref: "main",
   },
-  // job_key: uk_aq_r2_core_snapshot
+  // job_key: uk_aq_r2_core_snapshot_v1
   {
-    job_key: "uk_aq_r2_core_snapshot",
+    job_key: "uk_aq_r2_core_snapshot_v1",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_r2_core_snapshot.yml",
     ref: "main",
+    inputs: { history_version: "v1" },
   },
-  // job_key: uk_aq_r2_history_dropbox_backup
+  // job_key: uk_aq_r2_core_snapshot_v2
   {
-    job_key: "uk_aq_r2_history_dropbox_backup",
+    job_key: "uk_aq_r2_core_snapshot_v2",
+    owner: "YOUR_GITHUB_OWNER",
+    repo: "uk-aq-ops",
+    workflow_file: "uk_aq_r2_core_snapshot.yml",
+    ref: "main",
+    inputs: { history_version: "v2" },
+  },
+  // job_key: uk_aq_r2_history_dropbox_backup_v1
+  {
+    job_key: "uk_aq_r2_history_dropbox_backup_v1",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
     ref: "main",
+    inputs: { backup_version: "v1" },
+  },
+  // job_key: uk_aq_r2_history_dropbox_backup_v2
+  {
+    job_key: "uk_aq_r2_history_dropbox_backup_v2",
+    owner: "YOUR_GITHUB_OWNER",
+    repo: "uk-aq-ops",
+    workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
+    ref: "main",
+    inputs: { backup_version: "v2" },
   },
   // job_key: uk_aq_dropbox_prune_raw
   {
@@ -48,14 +68,14 @@ const JOBS = [
   },
 ];
 
-function workflowDispatchUrl(job) {
+export function workflowDispatchUrl(job) {
   const owner = encodeURIComponent(job.owner);
   const repo = encodeURIComponent(job.repo);
   const workflow = encodeURIComponent(job.workflow_file);
   return `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`;
 }
 
-function jobsForCron(cronExpression) {
+export function jobsForCron(cronExpression) {
   const matchingKeys = new Set(
     Object.entries(CRON_BY_JOB_KEY)
       .filter(([, cron]) => cron === cronExpression)
@@ -69,7 +89,7 @@ function jobsForCron(cronExpression) {
   return JOBS.filter((job) => matchingKeys.has(job.job_key));
 }
 
-async function dispatchWorkflow(job, token) {
+export async function dispatchWorkflow(job, token) {
   const url = workflowDispatchUrl(job);
   const label = `${job.owner}/${job.repo}:${job.workflow_file}@${job.ref}`;
 
@@ -86,7 +106,10 @@ async function dispatchWorkflow(job, token) {
       "Content-Type": "application/json",
       "User-Agent": "uk-aq-cloudflare-workflow-scheduler",
     },
-    body: JSON.stringify({ ref: job.ref }),
+    body: JSON.stringify({
+      ref: job.ref,
+      ...(job.inputs ? { inputs: job.inputs } : {}),
+    }),
   });
 
   console.log(
@@ -104,7 +127,7 @@ async function dispatchWorkflow(job, token) {
   }
 }
 
-async function runCron(cronExpression, env) {
+export async function runCron(cronExpression, env) {
   console.log(`[workflow-scheduler] received cron=${cronExpression}`);
 
   const token = env.GITHUB_WORKFLOW_DISPATCH_TOKEN;
