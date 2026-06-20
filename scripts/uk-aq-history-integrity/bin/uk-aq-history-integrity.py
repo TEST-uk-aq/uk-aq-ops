@@ -4854,7 +4854,7 @@ def resolve_history_path_config(
             ),
             observations_partition_levels=("day_utc", "connector_id", "pollutant_code"),
             aqilevels_partition_levels=("day_utc", "connector_id", "pollutant_code"),
-            checks_implemented=False,
+            checks_implemented=True,
         )
     raise ValueError(f"unsupported history version: {history_version!r}")
 
@@ -4873,6 +4873,177 @@ def serialize_history_path_configs(
     configs: Mapping[str, HistoryPathConfig],
 ) -> dict[str, dict[str, Any]]:
     return {version: config.to_dict() for version, config in sorted(configs.items())}
+
+
+
+
+def _v2_obs_gap(
+    gap_type: str,
+    *,
+    day_utc: str | None = None,
+    connector_id: int | str | None = None,
+    pollutant_code: str | None = None,
+    expected_path: str | None = None,
+    related_paths: list[str] | None = None,
+    severity: str = "error",
+) -> dict[str, Any]:
+    cid: int | str | None = connector_id
+    if cid is not None:
+        try:
+            cid = int(str(cid))
+        except ValueError:
+            pass
+    return {
+        "history_version": "v2",
+        "domain": "observations",
+        "severity": severity,
+        "gap_type": gap_type,
+        "day_utc": day_utc,
+        "connector_id": cid,
+        "pollutant_code": pollutant_code,
+        "expected_path": expected_path,
+        "related_paths": list(related_paths or []),
+        "source_evidence": {
+            "v1_present": None,
+            "source_counts_present": None,
+            "db_dump_present": None,
+        },
+        "suggested_repair": {
+            "kind": "v1_to_v2_observations_backfill",
+            "requires_index_rebuild": True,
+            "commands": [],
+            "notes": (
+                "Future repair may use scripts/backup_r2/"
+                "uk_aq_build_v2_observations_from_dropbox_v1.mjs when local v1 "
+                "Dropbox source exists; _index_v2 rebuild command requires confirmation."
+            ),
+        },
+    }
+
+
+def _manifest_files(payload: Any) -> list[dict[str, Any]]:
+    files = payload.get("files") if isinstance(payload, dict) else None
+    return files if isinstance(files, list) else []
+
+
+def _rel_key_to_path(root: Path, key: str) -> Path:
+    return root / str(key).strip().lstrip("/")
+
+
+def run_v2_observations_integrity_checks(
+    *,
+    r2_history_root: str | Path | None,
+    config: HistoryPathConfig,
+    from_day: str | None,
+    to_day: str | None,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
+    if not r2_history_root:
+        raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
+    root = Path(r2_history_root)
+    if not root.is_dir():
+        raise RuntimeError(f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {root}")
+    if not from_day or not to_day:
+        raise RuntimeError("v2 observations integrity requires a selected from/to day range")
+
+    gaps: list[dict[str, Any]] = []
+    checked = 0
+    data_prefix = config.observations_data_prefix.strip("/")
+    index_prefix = config.observations_timeseries_index_prefix.strip("/")
+    latest_key = config.observations_latest_index_key.strip("/")
+
+    latest_path = root / latest_key
+    if not latest_path.is_file():
+        gaps.append(_v2_obs_gap("latest_index_missing", expected_path=latest_key))
+    else:
+        try:
+            json.loads(latest_path.read_text(encoding="utf-8"))
+        except Exception:
+            gaps.append(_v2_obs_gap("latest_index_invalid_json", expected_path=latest_key))
+
+    for day in _date_range_inclusive(from_day, to_day):
+        day_utc = day.isoformat()
+        day_rel = f"{data_prefix}/day_utc={day_utc}"
+        day_dir = root / day_rel
+        if not day_dir.is_dir():
+            gaps.append(_v2_obs_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
+            continue
+        connector_dirs = sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir())
+        if not connector_dirs:
+            gaps.append(_v2_obs_gap("connector_dir_missing", day_utc=day_utc, expected_path=f"{day_rel}/connector_id=*"))
+            continue
+        for connector_dir in connector_dirs:
+            connector_raw = connector_dir.name.split("=", 1)[1]
+            pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
+            if not pollutant_dirs:
+                gaps.append(_v2_obs_gap("pollutant_dir_missing", day_utc=day_utc, connector_id=connector_raw, expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*"))
+                continue
+            for pollutant_dir in pollutant_dirs:
+                pollutant = pollutant_dir.name.split("=", 1)[1]
+                checked += 1
+                part_rel = f"{day_rel}/{connector_dir.name}/{pollutant_dir.name}"
+                manifest_rel = f"{part_rel}/manifest.json"
+                manifest_path = root / manifest_rel
+                local_parquets = list(pollutant_dir.glob("*.parquet"))
+                payload: Any = None
+                if not manifest_path.is_file():
+                    gaps.append(_v2_obs_gap("data_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
+                    if local_parquets:
+                        gaps.append(_v2_obs_gap("orphan_parquet_without_manifest", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
+                else:
+                    try:
+                        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        gaps.append(_v2_obs_gap("data_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                    if isinstance(payload, dict):
+                        schema_bad = []
+                        if payload.get("history_version", "v2") != "v2": schema_bad.append("history_version")
+                        if payload.get("domain", "observations") != "observations": schema_bad.append("domain")
+                        if "day_utc" in payload and str(payload.get("day_utc")) != day_utc: schema_bad.append("day_utc")
+                        if "connector_id" in payload and str(payload.get("connector_id")) != str(connector_raw): schema_bad.append("connector_id")
+                        if "pollutant_code" in payload and str(payload.get("pollutant_code")) != pollutant: schema_bad.append("pollutant_code")
+                        if schema_bad:
+                            gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=schema_bad))
+                        files = _manifest_files(payload)
+                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(files):
+                            gaps.append(_v2_obs_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
+                        if "row_count" in payload and (not isinstance(payload.get("row_count"), int) or int(payload.get("row_count") or 0) <= 0):
+                            gaps.append(_v2_obs_gap("data_manifest_empty", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                        if "source_row_count" in payload and (not isinstance(payload.get("source_row_count"), int) or int(payload.get("source_row_count") or 0) <= 0):
+                            gaps.append(_v2_obs_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
+                        if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
+                            gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                        for entry in files:
+                            key = entry.get("key") if isinstance(entry, dict) else None
+                            if not key:
+                                gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
+                                continue
+                            file_path = _rel_key_to_path(root, str(key))
+                            if not file_path.is_file():
+                                gaps.append(_v2_obs_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                            elif file_path.stat().st_size <= 0:
+                                gaps.append(_v2_obs_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                    elif payload is not None:
+                        gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
+                idx_path = root / idx_rel
+                if not idx_path.is_file():
+                    gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                else:
+                    try:
+                        idx_payload = json.loads(idx_path.read_text(encoding="utf-8"))
+                        if "timeseries_row_counts" not in idx_payload:
+                            gaps.append(_v2_obs_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                        elif not idx_payload.get("timeseries_row_counts"):
+                            gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    except Exception:
+                        gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+
+    status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
+    result = {"status": status, "checked_partitions": checked, "gap_count": len(gaps), "gaps": gaps}
+    if log:
+        log.info("v2 observations integrity done status=%s checked_partitions=%s gaps=%s", status, checked, len(gaps))
+    return result
 
 
 def _normalize_timeseries_row_counts(raw: Any) -> dict[int, int]:
@@ -7981,14 +8152,42 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     f"- Observations prefix: {config.get('observations_data_prefix')}",
                     f"- Observations index prefix: {config.get('observations_timeseries_index_prefix')}",
                 ])
-                if version == "v2" and not config.get("checks_implemented", True):
+                hvr = (s.get("history_version_results") or {}).get(version) or {}
+                if version == "v2":
+                    obs = hvr.get("observations") or (cc.get("v2_observations") or {}) or ((cc.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {})
+                    gaps = list(obs.get("gaps") or [])
+                    lines.extend([
+                        "- V2 observations checks: implemented",
+                        "- V2 AQI hourly checks: not implemented until Phase 3",
+                        f"- Checked observation partitions: {obs.get('checked_partitions', 0)}",
+                        f"- Observation gaps: {obs.get('gap_count', len(gaps))}",
+                    ])
+                    if gaps:
+                        lines.extend([
+                            "",
+                            "| Severity | Gap type | Day | Connector | Pollutant | Expected path |",
+                            "| --- | --- | --- | --- | --- | --- |",
+                        ])
+                        for gap in gaps[:25]:
+                            lines.append(
+                                "| "
+                                f"{gap.get('severity') or ''} | "
+                                f"{gap.get('gap_type') or ''} | "
+                                f"{gap.get('day_utc') or ''} | "
+                                f"{gap.get('connector_id') or ''} | "
+                                f"{gap.get('pollutant_code') or ''} | "
+                                f"{gap.get('expected_path') or ''} |"
+                            )
+                        if len(gaps) > 25:
+                            lines.append(f"| info | truncated |  |  |  | {len(gaps) - 25} more gaps |")
+                elif version == "v2" and not config.get("checks_implemented", True):
                     lines.append("- Deep v2 checks: not implemented in Phase 1")
                 lines.append("")
             if s.get("history_version_mode") == "both":
                 lines.extend([
                     "## v1/v2 comparison",
                     "",
-                    "- Full comparison: not implemented in Phase 1",
+                    "- Full comparison: not implemented until Phase 5",
                     "",
                 ])
         lines.extend([
@@ -8372,15 +8571,23 @@ def main(argv: list[str]) -> int:
             }
             log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
         elif history_version_mode == "v2":
+            v2_obs = run_v2_observations_integrity_checks(
+                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                config=history_path_configs["v2"],
+                from_day=from_day,
+                to_day=to_day,
+                log=log,
+            )
             cross_check_metrics = {
-                "ran": False,
+                "ran": True,
                 "history_version": "v2",
-                "skipped_reason": (
-                    "v2 deep R2 cross-checks are not implemented in phase 1; "
-                    "path config/reporting only"
-                ),
+                "skipped_reason": None,
+                "v2_observations": v2_obs,
+                "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0),
+                "cross_checks_ok": int(v2_obs.get("checked_partitions", 0) or 0) if v2_obs.get("status") == "ok" else 0,
+                "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0),
+                "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0),
             }
-            log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
         else:
             v1_config = history_path_configs["v1"]
             cross_check_metrics = run_r2_cross_checks(
@@ -8397,15 +8604,23 @@ def main(argv: list[str]) -> int:
             )
             cross_check_metrics["history_version"] = "v1"
             if history_version_mode == "both":
+                v2_obs = run_v2_observations_integrity_checks(
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                    config=history_path_configs["v2"],
+                    from_day=from_day,
+                    to_day=to_day,
+                    log=log,
+                )
                 cross_check_metrics["additional_history_versions"] = {
                     "v2": {
-                        "ran": False,
-                        "checks_implemented": False,
-                        "status": "not_implemented_phase1",
-                        "skipped_reason": (
-                            "v2 deep R2 cross-checks are not implemented in phase 1; "
-                            "path config/reporting only"
-                        ),
+                        "ran": True,
+                        "checks_implemented": True,
+                        "status": v2_obs.get("status"),
+                        "observations": v2_obs,
+                        "aqilevels": {
+                            "status": "not_implemented",
+                            "reason": "v2 AQI hourly data checks are Phase 3",
+                        },
                     }
                 }
         if cross_check_metrics.get("ran"):
@@ -8477,6 +8692,12 @@ def main(argv: list[str]) -> int:
             status = "noop"
         else:
             status = "noop"
+        v2_gap_count_for_status = (
+            int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
+            + int(((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {}).get("gap_count", 0) or 0)
+        )
+        if v2_gap_count_for_status > 0:
+            status = "fail"
 
         # Build the notes from snapshot + openaq outcomes.
         notes_parts: list[str] = []
@@ -8649,6 +8870,8 @@ def main(argv: list[str]) -> int:
             + _sum("backfills_failed")
             + cross_check_backfills_failed
             + aqi_rebuilds_failed
+            + int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
+            + int(((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {}).get("gap_count", 0) or 0)
         )
         warnings_count_total = warnings_delta
         if openaq_metrics.get("skipped_reason"):
@@ -8825,30 +9048,31 @@ def main(argv: list[str]) -> int:
         )
         conn.commit()
 
-        history_version_results = {
-            version: {
-                "history_version": version,
-                "checks_implemented": bool(config.checks_implemented),
-                "status": (
-                    "checked"
-                    if version == "v1" and cross_check_metrics.get("ran")
-                    else "not_implemented_phase1"
-                    if version == "v2"
-                    else "skipped"
-                ),
-                "skipped_reason": (
-                    None
-                    if version == "v1" and cross_check_metrics.get("ran")
-                    else (
-                        "v2 deep R2 checks are not implemented in phase 1; "
-                        "path config/reporting only"
-                    )
-                    if version == "v2"
-                    else cross_check_metrics.get("skipped_reason")
-                ),
-            }
-            for version, config in history_path_configs.items()
-        }
+        history_version_results: dict[str, Any] = {}
+        for version, config in history_path_configs.items():
+            if version == "v1":
+                history_version_results[version] = {
+                    "history_version": "v1",
+                    "checks_implemented": True,
+                    "status": "checked" if cross_check_metrics.get("ran") else "skipped",
+                    "skipped_reason": None if cross_check_metrics.get("ran") else cross_check_metrics.get("skipped_reason"),
+                }
+            else:
+                v2_obs = (
+                    cross_check_metrics.get("v2_observations")
+                    or (cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations")
+                    or {"status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": []}
+                )
+                history_version_results[version] = {
+                    "history_version": "v2",
+                    "checks_implemented": True,
+                    "status": v2_obs.get("status", "fail"),
+                    "observations": v2_obs,
+                    "aqilevels": {
+                        "status": "not_implemented",
+                        "reason": "v2 AQI hourly data checks are Phase 3",
+                    },
+                }
 
         summary: dict[str, Any] = {
             "env": args.env,

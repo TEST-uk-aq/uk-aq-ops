@@ -49,7 +49,7 @@ class HistoryVersionPathTests(unittest.TestCase):
         self.assertEqual(config.aqilevels_hourly_debug_prefix, "history/v2/aqilevels/hourly/debug")
         self.assertEqual(config.observations_timeseries_index_prefix, "history/_index_v2/observations_timeseries")
         self.assertEqual(config.aqilevels_timeseries_index_prefix, "history/_index_v2/aqilevels_hourly_data_timeseries")
-        self.assertFalse(config.checks_implemented)
+        self.assertTrue(config.checks_implemented)
 
     def test_v2_uses_shared_env_overrides(self) -> None:
         env = {
@@ -149,9 +149,9 @@ class HistoryVersionPathTests(unittest.TestCase):
         markdown = MODULE.format_summary_md(summary)
         self.assertIn("## R2 Cross-check — v1", markdown)
         self.assertIn("## R2 Cross-check — v2", markdown)
-        self.assertIn("Deep v2 checks: not implemented in Phase 1", markdown)
+        self.assertIn("V2 observations checks: implemented", markdown)
         self.assertIn("## v1/v2 comparison", markdown)
-        self.assertIn("Full comparison: not implemented in Phase 1", markdown)
+        self.assertIn("Full comparison: not implemented until Phase 5", markdown)
 
     def test_existing_v1_path_env_behavior_is_preserved(self) -> None:
         env = {
