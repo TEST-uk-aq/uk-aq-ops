@@ -758,6 +758,79 @@ def _build_lookup(conn: sqlite3.Connection, log: logging.Logger) -> int:
     return total
 
 
+
+
+def resolve_core_history_version_for_mode(history_version_mode: str) -> str:
+    mode = str(history_version_mode or "v1").strip().lower()
+    if mode in {"v1", "v2"}:
+        return mode
+    # A combined run preserves the existing v1 core snapshot behaviour; v2-only
+    # runs use v2 and never fall back to v1.
+    if mode == "both":
+        return "v1"
+    raise ValueError(f"unsupported history version mode: {history_version_mode!r}")
+
+def resolve_core_snapshot_prefix(history_version: str, env: Mapping[str, str] | None = None) -> str:
+    values = os.environ if env is None else env
+    version = str(history_version or "v1").strip().lower()
+    if version == "v2":
+        return _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX"),
+            "history/v2/core",
+        )
+    if version == "v1":
+        return _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_CORE_PREFIX"),
+            "history/v1/core",
+        )
+    raise ValueError(f"unsupported history version: {history_version!r}")
+
+
+def resolve_core_snapshot_root(
+    history_version: str,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    values = os.environ if env is None else env
+    version = str(history_version or "v1").strip().lower()
+    core_prefix = resolve_core_snapshot_prefix(version, values)
+    backup_root = str(values.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "") or "").strip()
+    if backup_root:
+        return str(Path(backup_root) / core_prefix)
+
+    explicit_root = str(values.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT", "") or "").strip()
+    if not explicit_root:
+        return explicit_root
+    # Preserve legacy v1 behaviour, but prevent v2-only runs from reusing a
+    # configured v1 Dropbox core root silently.
+    if version == "v2":
+        normalized = explicit_root.replace("\\", "/")
+        if normalized.endswith("/history/v1/core") or normalized == "history/v1/core":
+            return explicit_root[: -len("history/v1/core")] + core_prefix
+    return explicit_root
+
+
+def classify_core_snapshot_status(
+    snapshot_result: Mapping[str, Any],
+    *,
+    history_version: str,
+    expected_day: str | None,
+) -> str:
+    version = str(history_version or "v1").strip().lower()
+    status = str(snapshot_result.get("status") or "")
+    if version == "v2" and status in {"missing_root", "no_snapshot"}:
+        return "v2_core_snapshot_missing"
+    day = str(snapshot_result.get("snapshot_day_utc") or "").strip()
+    if version == "v2" and status in {"imported", "reused", "dry_run"} and expected_day and day and day < expected_day:
+        return "v2_core_snapshot_stale"
+    if status in {"imported", "reused", "dry_run"}:
+        return "ok"
+    if status in {"missing_root", "no_snapshot"}:
+        return "missing"
+    if status == "skipped":
+        return "warning"
+    return status or "warning"
+
+
 def collect_lookup_active_counts_by_source(
     conn: sqlite3.Connection,
     source_keys: Iterable[str] = ("openaq", "sensorcommunity", "uk_air_sos"),
@@ -8310,6 +8383,8 @@ def collect_preflight_errors(
         args.profile, args.from_day, args.to_day, os.environ,
     )
 
+    core_history_version = resolve_core_history_version_for_mode(resolve_history_version_mode(args))
+
     summary = {
         "env": args.env,
         "profile": args.profile,
@@ -8326,7 +8401,9 @@ def collect_preflight_errors(
             "root": env["UK_AQ_HISTORY_INTEGRITY_ROOT"],
             "state_dir": env["UK_AQ_HISTORY_INTEGRITY_STATE_DIR"],
             "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-            "snapshot_root": env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"],
+            "snapshot_root": resolve_core_snapshot_root(core_history_version, os.environ),
+            "core_history_version": core_history_version,
+            "core_prefix": resolve_core_snapshot_prefix(core_history_version, os.environ),
             "r2_history_root": str(os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "")),
             "backfill_wrapper": resolve_integrity_backfill_wrapper(),
             "backfill_env_file": str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")),
@@ -8350,7 +8427,8 @@ def run_preflight_or_die(
     print(
         "preflight paths: "
         f"state={summary['paths']['state_dir']} db={summary['paths']['db_path']} "
-        f"snapshot={summary['paths']['snapshot_root']} r2={summary['paths']['r2_history_root'] or '<unset>'} "
+        f"snapshot={summary['paths']['snapshot_root']} core_version={summary['paths']['core_history_version']} "
+        f"core_prefix={summary['paths']['core_prefix']} r2={summary['paths']['r2_history_root'] or '<unset>'} "
         f"wrapper={summary['paths']['backfill_wrapper'] or '<unset>'}"
     )
     for warning in warnings:
@@ -8663,6 +8741,10 @@ def format_summary_md(s: dict[str, Any]) -> str:
             "## Core snapshot",
             "",
             f"- Status:        {snap.get('status')}",
+            f"- Core history version: {snap.get('core_history_version') or '(unset)'}",
+            f"- Core prefix:   {snap.get('core_prefix') or '(unset)'}",
+            f"- Snapshot root: {snap.get('snapshot_root') or '(unset)'}",
+            f"- Core snapshot status: {snap.get('core_snapshot_status') or '(unset)'}",
             f"- Snapshot day:  {snap.get('snapshot_day_utc') or '(none)'}",
             f"- Manifest hash: {snap.get('manifest_hash') or '(none)'}",
             f"- Previous hash: {snap.get('previous_manifest_hash') or '(none)'}",
@@ -9221,7 +9303,9 @@ def main(argv: list[str]) -> int:
             snapshot_result = {
                 "status": "skipped",
                 "error": "skipped by --skip-snapshot-import",
-                "snapshot_root": os.environ.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"),
+                "snapshot_root": resolve_core_snapshot_root(resolve_core_history_version_for_mode(history_version_mode), os.environ),
+                "core_history_version": resolve_core_history_version_for_mode(history_version_mode),
+                "core_prefix": resolve_core_snapshot_prefix(resolve_core_history_version_for_mode(history_version_mode), os.environ),
                 "snapshot_day_dir": None,
                 "snapshot_day_utc": None,
                 "manifest_hash": None,
@@ -9235,12 +9319,19 @@ def main(argv: list[str]) -> int:
             snapshot_result = import_core_snapshot(
                 conn=conn,
                 env_name=args.env,
-                snapshot_root_str=os.environ.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"),
+                snapshot_root_str=resolve_core_snapshot_root(resolve_core_history_version_for_mode(history_version_mode), os.environ),
                 force=args.force_snapshot_import,
                 dry_run=args.dry_run,
                 log=log,
             )
-            if snapshot_result["status"] in {"missing_root", "no_snapshot"}:
+            snapshot_result["core_history_version"] = resolve_core_history_version_for_mode(history_version_mode)
+            snapshot_result["core_prefix"] = resolve_core_snapshot_prefix(snapshot_result["core_history_version"], os.environ)
+            snapshot_result["core_snapshot_status"] = classify_core_snapshot_status(
+                snapshot_result,
+                history_version=snapshot_result["core_history_version"],
+                expected_day=to_day,
+            )
+            if snapshot_result["status"] in {"missing_root", "no_snapshot"} or snapshot_result["core_snapshot_status"].endswith("_missing") or snapshot_result["core_snapshot_status"].endswith("_stale"):
                 warnings_delta += 1
 
         # Phase 3 / Phase 5: source adapters share a single LimitTracker
@@ -9250,7 +9341,11 @@ def main(argv: list[str]) -> int:
             max_runtime_minutes=args.max_runtime_minutes,
             started_mono=started_mono,
         )
-        snapshot_ok = snapshot_result["status"] in {"imported", "reused"}
+        if "core_history_version" not in snapshot_result:
+            snapshot_result["core_history_version"] = resolve_core_history_version_for_mode(history_version_mode)
+            snapshot_result["core_prefix"] = resolve_core_snapshot_prefix(snapshot_result["core_history_version"], os.environ)
+            snapshot_result["core_snapshot_status"] = classify_core_snapshot_status(snapshot_result, history_version=snapshot_result["core_history_version"], expected_day=to_day)
+        snapshot_ok = snapshot_result["status"] in {"imported", "reused"} and snapshot_result.get("core_snapshot_status") == "ok"
 
         empty_metrics = {"ran": False, "skipped_reason": None}
         openaq_metrics: dict[str, Any] = dict(empty_metrics)
