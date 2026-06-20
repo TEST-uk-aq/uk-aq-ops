@@ -4928,8 +4928,17 @@ def _manifest_files(payload: Any) -> list[dict[str, Any]]:
     return files if isinstance(files, list) else []
 
 
-def _rel_key_to_path(root: Path, key: str) -> Path:
-    return root / str(key).strip().lstrip("/")
+def _rel_key_to_path(root: Path, key: str) -> Path | None:
+    raw = str(key).strip().lstrip("/")
+    if not raw:
+        return None
+    root_resolved = root.resolve()
+    candidate = (root_resolved / raw).resolve()
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError:
+        return None
+    return candidate
 
 
 def run_v2_observations_integrity_checks(
@@ -5021,7 +5030,9 @@ def run_v2_observations_integrity_checks(
                                 gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
                                 continue
                             file_path = _rel_key_to_path(root, str(key))
-                            if not file_path.is_file():
+                            if file_path is None:
+                                gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
+                            elif not file_path.is_file():
                                 gaps.append(_v2_obs_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                             elif file_path.stat().st_size <= 0:
                                 gaps.append(_v2_obs_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
@@ -5222,7 +5233,9 @@ def run_v2_aqilevels_integrity_checks(
                                 data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
                                 continue
                             file_path = _rel_key_to_path(root, str(key))
-                            if not file_path.is_file():
+                            if file_path is None:
+                                data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
+                            elif not file_path.is_file():
                                 data_gaps.append(_v2_aqi_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                             elif file_path.stat().st_size <= 0:
                                 data_gaps.append(_v2_aqi_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
@@ -5267,8 +5280,12 @@ def run_v2_aqilevels_integrity_checks(
                 debug_gaps.append(_v2_aqi_gap("debug_manifest_schema_mismatch", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
             for entry in _manifest_files(payload):
                 key = entry.get("key") if isinstance(entry, dict) else None
-                if key and not _rel_key_to_path(root, str(key)).is_file():
-                    debug_gaps.append(_v2_aqi_gap("debug_parquet_missing", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                if key:
+                    file_path = _rel_key_to_path(root, str(key))
+                    if file_path is None:
+                        debug_gaps.append(_v2_aqi_gap("debug_manifest_schema_mismatch", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
+                    elif not file_path.is_file():
+                        debug_gaps.append(_v2_aqi_gap("debug_parquet_missing", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
         if any(g.get("severity") == "error" for g in debug_gaps):
             debug_status = "fail"
         elif debug_gaps:
