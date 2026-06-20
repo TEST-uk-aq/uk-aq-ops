@@ -533,6 +533,71 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=6", metrics["planned_v2_observation_repairs"][0])
         self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
 
+    def test_v2_post_repair_recheck_reports_fixed_observations_and_failed_aqi(self) -> None:
+        config = MODULE.resolve_history_path_config("v2", {})
+        with mock.patch.object(MODULE, "run_v2_observations_integrity_checks", return_value={
+            "status": "ok",
+            "checked_partitions": 1,
+            "gap_count": 0,
+            "gaps": [],
+        }) as obs_check, mock.patch.object(MODULE, "run_v2_aqilevels_integrity_checks", return_value={
+            "status": "fail",
+            "checked_partitions": 0,
+            "gap_count": 1,
+            "gaps": [{"gap_type": "connector_dir_missing", "day_utc": "2026-06-08", "connector_id": 6}],
+            "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
+        }) as aqi_check:
+            result = MODULE.run_v2_post_repair_integrity_rechecks(
+                r2_history_root=self.root,
+                config=config,
+                from_day="2026-06-08",
+                to_day="2026-06-08",
+                allowed_connector_ids={6},
+                source_scope={"source": "openaq", "connector_ids": [6], "scope": "source"},
+                check_aqi_debug=False,
+                require_aqi_debug=False,
+                log=self.log,
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["message"], "v2 observations fixed; v2 AQI still failing")
+        obs_check.assert_called_once()
+        aqi_check.assert_called_once()
+        self.assertEqual(obs_check.call_args.kwargs["allowed_connector_ids"], {6})
+        self.assertEqual(aqi_check.call_args.kwargs["allowed_connector_ids"], {6})
+
+    def test_v2_post_repair_recheck_final_status_ok_only_when_observations_and_aqi_pass(self) -> None:
+        config = MODULE.resolve_history_path_config("v2", {})
+        for obs_status, aqi_status, expected in (
+            ("ok", "ok", "ok"),
+            ("ok", "fail", "fail"),
+            ("fail", "ok", "fail"),
+            ("fail", "fail", "fail"),
+        ):
+            with self.subTest(obs_status=obs_status, aqi_status=aqi_status), \
+                 mock.patch.object(MODULE, "run_v2_observations_integrity_checks", return_value={
+                     "status": obs_status, "checked_partitions": 1, "gap_count": 0 if obs_status == "ok" else 1, "gaps": [],
+                 }), \
+                 mock.patch.object(MODULE, "run_v2_aqilevels_integrity_checks", return_value={
+                     "status": aqi_status,
+                     "checked_partitions": 1,
+                     "gap_count": 0 if aqi_status == "ok" else 1,
+                     "gaps": [],
+                     "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
+                 }):
+                result = MODULE.run_v2_post_repair_integrity_rechecks(
+                    r2_history_root=self.root,
+                    config=config,
+                    from_day="2026-06-08",
+                    to_day="2026-06-08",
+                    allowed_connector_ids={6},
+                    source_scope={"source": "openaq", "connector_ids": [6], "scope": "source"},
+                    check_aqi_debug=False,
+                    require_aqi_debug=False,
+                    log=self.log,
+                )
+            self.assertEqual(result["status"], expected)
+
     def test_adapter_backfill_history_version_is_v2_only_for_v2_mode(self) -> None:
         self.assertEqual(MODULE.adapter_backfill_history_version("v2"), "v2")
         self.assertEqual(MODULE.adapter_backfill_history_version("v1"), "v1")

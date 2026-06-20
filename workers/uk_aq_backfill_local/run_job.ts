@@ -453,6 +453,8 @@ type R2HistoryObsToAqilevelsDayConnectorResult = {
   objects_written_r2: number;
   objects_deleted_r2: number;
   manifest_key: string | null;
+  diagnostic_reason?: string | null;
+  diagnostic_counters?: Record<string, number>;
   error: string | null;
 };
 
@@ -481,6 +483,51 @@ type R2HistoryObsToAqilevelsSummary = {
   day_connector_results: R2HistoryObsToAqilevelsDayConnectorResult[];
   message: string;
 };
+
+function buildAqiGenerationDiagnostics(
+  rows: SourceObservationRow[],
+  dayUtc: string,
+  rowsWrittenAqilevels: number,
+): { counters: Record<string, number>; reason: string | null } {
+  const supportedRows = rows.filter((row) =>
+    row.pollutant_code === "no2" ||
+    row.pollutant_code === "pm25" ||
+    row.pollutant_code === "pm10"
+  );
+  const validValueRows = supportedRows.filter((row) =>
+    typeof row.value === "number" && Number.isFinite(row.value) && row.value >= 0
+  );
+  const narrowRows = sourceObservationsToNarrowRowsCore(validValueRows);
+  const helperRows = sourceObservationRowsToHelperRowsForDayCore(validValueRows, dayUtc);
+  const thresholdMatchedRows = helperRowsToAqilevelHistoryRowsCore(helperRows)
+    .filter((row: Record<string, unknown>) =>
+      row.daqi_index_level !== null || row.eaqi_index_level !== null
+    );
+  const counters = {
+    rows_read: rows.length,
+    rows_after_pollutant_mapping: supportedRows.length,
+    rows_after_valid_value_filter: validValueRows.length,
+    rows_after_hourly_grouping: narrowRows.length,
+    rows_after_day_filter: helperRows.length,
+    rows_after_threshold_join: thresholdMatchedRows.length,
+    rows_written_aqilevels: rowsWrittenAqilevels,
+  };
+  let reason: string | null = null;
+  if (rows.length > 0 && supportedRows.length === 0) {
+    reason = "no_supported_aqi_pollutants_after_pollutant_mapping";
+  } else if (supportedRows.length > 0 && validValueRows.length === 0) {
+    reason = "no_valid_non_negative_numeric_values";
+  } else if (validValueRows.length > 0 && narrowRows.length === 0) {
+    reason = "no_rows_after_hourly_grouping";
+  } else if (narrowRows.length > 0 && helperRows.length === 0) {
+    reason = "no_rows_in_requested_day_after_day_filter";
+  } else if (helperRows.length > 0 && rowsWrittenAqilevels === 0) {
+    reason = thresholdMatchedRows.length === 0
+      ? "no_rows_matched_aqi_thresholds"
+      : "aqi_rows_filtered_before_write";
+  }
+  return { counters, reason };
+}
 
 type SourceToAllSummary = {
   mode: "source_to_r2";
@@ -10994,6 +11041,35 @@ async function runR2HistoryObsToAqilevels(
           dayUtc,
         ) as AqilevelsHistoryRow[];
         connectorRowsWritten = aqilevelRows.length;
+        const generationDiagnostics = buildAqiGenerationDiagnostics(
+          sourceFetch.rows,
+          dayUtc,
+          connectorRowsWritten,
+        );
+        logStructured(
+          generationDiagnostics.reason ? "warning" : "info",
+          "r2_history_obs_to_aqilevels_connector_diagnostics",
+          {
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_filter: sourceFetch.source_filter,
+            diagnostic_reason: generationDiagnostics.reason,
+            ...generationDiagnostics.counters,
+          },
+        );
+        if (
+          !DRY_RUN &&
+          hasConnectorFilter &&
+          connectorRowsRead > 0 &&
+          connectorRowsWritten === 0
+        ) {
+          throw new Error(
+            `explicit connector/day AQI rebuild produced no rows: ${
+              generationDiagnostics.reason || "unknown_aqi_generation_zero_rows"
+            }`,
+          );
+        }
         const writePlan = planAqilevelHistoryConnectorWrite({
           forceReplace: FORCE_REPLACE,
           hasExistingManifest: Boolean(existingManifest),
@@ -11022,6 +11098,8 @@ async function runR2HistoryObsToAqilevels(
             objects_written_r2: 0,
             objects_deleted_r2: 0,
             manifest_key: existingManifest?.manifest_key || null,
+            diagnostic_reason: generationDiagnostics.reason,
+            diagnostic_counters: generationDiagnostics.counters,
             error: null,
           });
           logStructured("info", "r2_history_obs_to_aqilevels_connector_dry_run_plan", {
@@ -11109,11 +11187,13 @@ async function runR2HistoryObsToAqilevels(
           skip_reason: writePlan.skip_reason,
           rows_read: connectorRowsRead,
           rows_written_aqilevels: connectorRowsWritten,
-          objects_written_r2: connectorObjectsWritten,
-          objects_deleted_r2: connectorObjectsDeleted,
-          manifest_key: connectorManifestKey,
-          error: null,
-        });
+            objects_written_r2: connectorObjectsWritten,
+            objects_deleted_r2: connectorObjectsDeleted,
+            manifest_key: connectorManifestKey,
+            diagnostic_reason: generationDiagnostics.reason,
+            diagnostic_counters: generationDiagnostics.counters,
+            error: null,
+          });
 
         await ledgerInsertRunDay(ledgerEnabled, {
           run_id: runId,
@@ -11183,6 +11263,8 @@ async function runR2HistoryObsToAqilevels(
           objects_written_r2: connectorObjectsWritten,
           objects_deleted_r2: connectorObjectsDeleted,
           manifest_key: connectorManifestKey,
+          diagnostic_reason: null,
+          diagnostic_counters: {},
           error: message,
         });
 

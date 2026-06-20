@@ -51,6 +51,18 @@ class HistoryVersionPathTests(unittest.TestCase):
         self.assertEqual(config.aqilevels_timeseries_index_prefix, "history/_index_v2/aqilevels_hourly_data_timeseries")
         self.assertTrue(config.checks_implemented)
 
+    def test_executed_script_resolves_v2_core_preflight_path(self) -> None:
+        env = {
+            "UK_AQ_R2_HISTORY_DROPBOX_ROOT": "/tmp/R2_history_backup",
+            "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT": "/tmp/R2_history_backup/history/v1/core",
+        }
+        self.assertEqual(MODULE.resolve_core_history_version_for_mode("v2"), "v2")
+        self.assertEqual(MODULE.resolve_core_snapshot_prefix("v2", env), "history/v2/core")
+        self.assertEqual(
+            MODULE.resolve_core_snapshot_root("v2", env),
+            "/tmp/R2_history_backup/history/v2/core",
+        )
+
     def test_v2_uses_shared_env_overrides(self) -> None:
         env = {
             "UK_AQ_R2_HISTORY_INDEX_V2_PREFIX": "custom/_index_v2",
