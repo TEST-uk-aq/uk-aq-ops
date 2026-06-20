@@ -41,6 +41,7 @@ def make_args(**overrides: object) -> Namespace:
         "force_snapshot_import": False,
         "skip_snapshot_import": False,
         "skip_cross_check": False,
+        "history_version": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -89,7 +90,9 @@ class PreflightTests(unittest.TestCase):
             encoding="utf-8",
         )
         r2_root = root / "r2"
-        (r2_root / "history" / "v1").mkdir(parents=True, exist_ok=True)
+        r2_v1_core = r2_root / "history" / "v1" / "core"
+        r2_v1_core.mkdir(parents=True, exist_ok=True)
+        (r2_v1_core / "manifest.json").write_text("{}", encoding="utf-8")
 
         env = {
             "UK_AQ_ENV_NAME": "CIC-Test",
@@ -243,6 +246,48 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(summary["source"], "uk_air_sos")
             self.assertTrue(summary["daily_task_health_enabled"])
             self.assertTrue(summary["daily_task_health_strict"])
+
+    def test_v2_preflight_validates_and_reports_resolved_core_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, os_env = self._base_env(root)
+            backup_root = root / "R2_history_backup"
+            v2_core_root = backup_root / "history" / "v2" / "core"
+            v2_core_root.mkdir(parents=True, exist_ok=True)
+            (v2_core_root / "manifest.json").write_text("{}", encoding="utf-8")
+            os_env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"] = str(backup_root)
+            os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(
+                backup_root / "history" / "v1" / "core",
+            )
+            args = make_args(history_version="v2", skip_cross_check=True)
+            with patched_env(os_env):
+                errors, _, summary = MODULE.collect_preflight_errors(args, env)
+            self.assertEqual(errors, [])
+            self.assertEqual(summary["paths"]["core_history_version"], "v2")
+            self.assertEqual(summary["paths"]["core_prefix"], "history/v2/core")
+            self.assertEqual(summary["paths"]["snapshot_root"], str(v2_core_root))
+
+    def test_v2_preflight_missing_resolved_core_root_reports_v2_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, os_env = self._base_env(root)
+            backup_root = root / "R2_history_backup"
+            (backup_root / "history" / "v1" / "core").mkdir(parents=True, exist_ok=True)
+            (backup_root / "history" / "v1" / "core" / "manifest.json").write_text("{}", encoding="utf-8")
+            os_env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"] = str(backup_root)
+            os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(
+                backup_root / "history" / "v1" / "core",
+            )
+            args = make_args(history_version="v2", skip_cross_check=True)
+            with patched_env(os_env):
+                errors, _, summary = MODULE.collect_preflight_errors(args, env)
+            self.assertEqual(summary["paths"]["snapshot_root"], str(backup_root / "history" / "v2" / "core"))
+            self.assertTrue(
+                any(
+                    "history_version=v2" in err and "history/v2/core" in err
+                    for err in errors
+                ),
+            )
 
     def test_resolve_daily_task_health_config_loads_obs_creds_from_backfill_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
