@@ -5971,6 +5971,60 @@ def run_v2_aqilevels_integrity_checks(
         log.info("v2 AQI integrity done status=%s checked_partitions=%s gaps=%s debug_gaps=%s", status, checked, len(data_gaps), len(debug_gaps))
     return result
 
+
+def run_v2_post_repair_integrity_rechecks(
+    *,
+    r2_history_root: str | Path | None,
+    config: HistoryPathConfig,
+    from_day: str | None,
+    to_day: str | None,
+    allowed_connector_ids: set[int] | None,
+    source_scope: dict[str, Any] | None,
+    check_aqi_debug: bool,
+    require_aqi_debug: bool,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Re-run v2 integrity checks after repairs so final status reflects reality."""
+    post_obs = run_v2_observations_integrity_checks(
+        r2_history_root=r2_history_root,
+        config=config,
+        from_day=from_day,
+        to_day=to_day,
+        allowed_connector_ids=allowed_connector_ids,
+        source_scope=source_scope,
+        log=log,
+    )
+    post_aqi = run_v2_aqilevels_integrity_checks(
+        r2_history_root=r2_history_root,
+        config=config,
+        from_day=from_day,
+        to_day=to_day,
+        allowed_connector_ids=allowed_connector_ids,
+        source_scope=source_scope,
+        check_aqi_debug=check_aqi_debug,
+        require_aqi_debug=require_aqi_debug,
+        log=log,
+    )
+    obs_status = str(post_obs.get("status") or "fail")
+    aqi_status = str(post_aqi.get("status") or "fail")
+    if obs_status == "ok" and aqi_status == "ok":
+        message = "v2 observations fixed and AQI fixed"
+    elif obs_status == "ok":
+        message = "v2 observations fixed; v2 AQI still failing"
+    elif aqi_status == "ok":
+        message = "v2 AQI fixed; v2 observations still failing"
+    else:
+        message = "v2 observations and v2 AQI still failing"
+    status = "ok" if obs_status == "ok" and aqi_status == "ok" else "fail"
+    return {
+        "ran": True,
+        "status": status,
+        "message": message,
+        "observations": post_obs,
+        "aqilevels": post_aqi,
+    }
+
+
 def _normalize_timeseries_row_counts(raw: Any) -> dict[int, int]:
     if not isinstance(raw, dict):
         return {}
@@ -10231,6 +10285,42 @@ def main(argv: list[str]) -> int:
                 history_version="v2" if history_version_mode == "v2" else "v1",
             )
             cross_check_metrics.update(aqi_rebuild_metrics)
+            if history_version_mode == "v2" and (
+                int(cross_check_metrics.get("v2_observation_repairs_ok", 0) or 0) > 0
+                or int(cross_check_metrics.get("aqi_rebuilds_complete", 0) or 0) > 0
+                or int(cross_check_metrics.get("aqi_rebuilds_failed", 0) or 0) > 0
+            ):
+                pre_obs = cross_check_metrics.get("v2_observations") or {}
+                pre_aqi = cross_check_metrics.get("v2_aqilevels") or {}
+                post_repair = run_v2_post_repair_integrity_rechecks(
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                    config=history_path_configs["v2"],
+                    from_day=from_day,
+                    to_day=to_day,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
+                    check_aqi_debug=bool(args.check_aqi_debug),
+                    require_aqi_debug=bool(args.require_aqi_debug),
+                    log=log,
+                )
+                cross_check_metrics["v2_pre_repair_observations"] = pre_obs
+                cross_check_metrics["v2_pre_repair_aqilevels"] = pre_aqi
+                cross_check_metrics["v2_post_repair"] = post_repair
+                cross_check_metrics["v2_observations"] = post_repair["observations"]
+                cross_check_metrics["v2_aqilevels"] = post_repair["aqilevels"]
+                cross_check_metrics["v2_repair_status_message"] = post_repair["message"]
+                post_obs = post_repair["observations"]
+                post_aqi = post_repair["aqilevels"]
+                post_total = int(post_obs.get("checked_partitions", 0) or 0) + int(post_aqi.get("checked_partitions", 0) or 0)
+                post_gaps = (
+                    int(post_obs.get("gap_count", 0) or 0)
+                    + int(post_aqi.get("gap_count", 0) or 0)
+                    + int((post_aqi.get("debug") or {}).get("gap_count", 0) or 0)
+                )
+                cross_check_metrics["cross_checks_total"] = post_total
+                cross_check_metrics["cross_checks_ok"] = post_total if post_repair["status"] == "ok" else 0
+                cross_check_metrics["cross_checks_mismatch"] = post_gaps
+                cross_check_metrics["discrepancy_total"] = post_gaps
 
         any_adapter_ran = (
             openaq_metrics.get("ran")
@@ -10325,6 +10415,12 @@ def main(argv: list[str]) -> int:
                 f"r2_timeseries_counts_missing={cross_check_metrics.get('cross_checks_r2_timeseries_counts_missing', 0)}"
             )
             if args.run_backfill:
+                if cross_check_metrics.get("v2_repair_status_message"):
+                    notes_parts.append(
+                        "v2-post-repair-check "
+                        f"status={(cross_check_metrics.get('v2_post_repair') or {}).get('status')} "
+                        f"message={cross_check_metrics.get('v2_repair_status_message')}"
+                    )
                 notes_parts.append(
                     "cross-check-observation-repair "
                     f"candidates_days={cross_check_metrics.get('observation_backfill_candidate_days', cross_check_metrics.get('backfill_candidate_days', 0))} "
