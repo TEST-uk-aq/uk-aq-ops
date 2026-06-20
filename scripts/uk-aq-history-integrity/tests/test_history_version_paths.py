@@ -164,6 +164,109 @@ class HistoryVersionPathTests(unittest.TestCase):
         self.assertEqual(config.aqilevels_hourly_data_prefix, "custom/v1/aqilevels/hourly")
         self.assertEqual(config.observations_timeseries_index_prefix, "custom/_index/observations_timeseries")
 
+    def test_v2_only_failed_report_writes_without_v1_config(self) -> None:
+        v2_gap = {
+            "history_version": "v2",
+            "domain": "observations",
+            "severity": "error",
+            "gap_type": "missing_partition",
+            "day_utc": "2026-06-08",
+            "connector_id": 123,
+            "pollutant_code": "pm25",
+            "expected_path": "history/v2/observations/day_utc=2026-06-08/connector_id=123/pollutant_code=pm25/data.parquet",
+            "suggested_repair": {
+                "kind": "repair_observations_partition",
+                "requires_index_rebuild": True,
+            },
+        }
+        history_path_configs = MODULE.serialize_history_path_configs(
+            MODULE.resolve_history_path_configs("v2", {})
+        )
+        summary = {
+            "env": "CIC-Test",
+            "profile": "manual",
+            "started_at_utc": "2026-06-20T00:00:00Z",
+            "finished_at_utc": "2026-06-20T00:01:00Z",
+            "status": "fail",
+            "source": "openaq",
+            "from_day": "2026-06-08",
+            "to_day": "2026-06-08",
+            "dry_run": False,
+            "check_only": True,
+            "run_backfill": False,
+            "db_path": ":memory:",
+            "log_path": "test.log",
+            "history_integrity_schema_version": 2,
+            "history_version_mode": "v2",
+            "checked_versions": ["v2"],
+            "site_read_version": None,
+            "history_path_configs": history_path_configs,
+            "history_version_results": {
+                "v2": {
+                    "history_version": "v2",
+                    "checks_implemented": True,
+                    "status": "fail",
+                    "observations": {
+                        "status": "fail",
+                        "checked_partitions": 8,
+                        "gap_count": 1,
+                        "gaps": [v2_gap],
+                    },
+                    "aqilevels": {
+                        "status": "ok",
+                        "checked_partitions": 7,
+                        "gap_count": 0,
+                        "gaps": [],
+                        "debug": {
+                            "checked": False,
+                            "required": False,
+                            "status": "skipped",
+                            "gap_count": 0,
+                            "gaps": [],
+                        },
+                    },
+                }
+            },
+            "cross_check": {
+                "ran": True,
+                "history_version": "v2",
+                "v2_observations": {
+                    "status": "fail",
+                    "checked_partitions": 8,
+                    "gap_count": 1,
+                    "gaps": [v2_gap],
+                },
+                "v2_aqilevels": {
+                    "status": "ok",
+                    "checked_partitions": 7,
+                    "gap_count": 0,
+                    "gaps": [],
+                    "debug": {"checked": False, "required": False, "gap_count": 0, "gaps": []},
+                },
+                "cross_checks_total": 15,
+                "cross_checks_ok": 0,
+                "cross_checks_mismatch": 1,
+            },
+            "metrics": {},
+        }
+
+        self.assertEqual(summary["checked_versions"], ["v2"])
+        self.assertEqual(list(summary["history_path_configs"].keys()), ["v2"])
+        self.assertEqual(summary["status"], "fail")
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path, md_path = MODULE.write_reports(tmp, "20260620T000000Z", summary)
+            self.assertTrue(json_path.is_file())
+            markdown = md_path.read_text(encoding="utf-8")
+        self.assertIn("## R2 Cross-check — history_version=v2", markdown)
+        self.assertIn("### V2 observation gaps", markdown)
+        self.assertIn("repair_observations_partition", markdown)
+        self.assertIn("history/v2/observations/day_utc=2026-06-08", markdown)
+        self.assertNotIn("history_version=v1", markdown)
+
+    def test_no_direct_v1_history_config_lookup_remains(self) -> None:
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('history_path_configs["v1"]', source)
+
 
 if __name__ == "__main__":
     unittest.main()
