@@ -24,6 +24,7 @@ Mode-specific requirements:
     --connector-id N      Optional connector filter for partial-day scope.
 
 Optional:
+  --history-version v1|v2 Select R2 history write/index target (default v1).
   --dry-run               Set UK_AQ_BACKFILL_DRY_RUN=true (default false).
   -h, --help              Show this help.
 
@@ -261,6 +262,7 @@ TIMESERIES_IDS_RAW=""
 FROM_DAY_UTC=""
 TO_DAY_UTC=""
 DRY_RUN=false
+HISTORY_VERSION="v1"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -312,6 +314,14 @@ while [[ $# -gt 0 ]]; do
       TO_DAY_UTC="${1#--to-day=}"
       shift
       ;;
+    --history-version)
+      HISTORY_VERSION="${2:-}"
+      shift 2
+      ;;
+    --history-version=*)
+      HISTORY_VERSION="${1#--history-version=}"
+      shift
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -336,6 +346,14 @@ case "${ENV_NAME}" in
   CIC-Test|LIVE) ;;
   *)
     echo "ERROR: --env must be CIC-Test or LIVE (got '${ENV_NAME}')." >&2
+    exit 2
+    ;;
+esac
+
+case "${HISTORY_VERSION}" in
+  v1|v2) ;;
+  *)
+    echo "ERROR: --history-version must be v1 or v2 (got '${HISTORY_VERSION}')." >&2
     exit 2
     ;;
 esac
@@ -474,6 +492,9 @@ else
   TARGET_KIND="aqilevels"
 fi
 
+export UK_AQ_R2_HISTORY_WRITE_VERSION="${HISTORY_VERSION}"
+export UK_AQ_R2_HISTORY_BACKUP_VERSION="${HISTORY_VERSION}"
+export UK_AQ_R2_HISTORY_INDEX_VERSION="${HISTORY_VERSION}"
 export UK_AQ_BACKFILL_TRIGGER_MODE="manual"
 export UK_AQ_BACKFILL_DRY_RUN="${DRY_RUN}"
 export UK_AQ_BACKFILL_FORCE_REPLACE="true"
@@ -498,6 +519,8 @@ echo "=== UK AQ Integrity Backfill ==="
 echo "env: ${ENV_NAME}"
 echo "mode: ${UK_AQ_BACKFILL_RUN_MODE}"
 echo "output_scope: ${UK_AQ_BACKFILL_OUTPUT_SCOPE}"
+echo "history_version: ${HISTORY_VERSION}"
+echo "write_version: ${UK_AQ_R2_HISTORY_WRITE_VERSION}"
 echo "dry_run: ${UK_AQ_BACKFILL_DRY_RUN}"
 echo "force_replace: ${UK_AQ_BACKFILL_FORCE_REPLACE}"
 echo "full_r2_history_index_rebuild: ${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX}"
@@ -527,6 +550,7 @@ TARGETED_INDEX_CMD=(
   "${NODE_BIN}"
   "${BACKFILL_REPO_ROOT}/scripts/backup_r2/uk_aq_build_r2_history_index.mjs"
   --targeted
+  --history-version "${HISTORY_VERSION}"
   --kind "${TARGET_KIND}"
   --from-day "${FROM_DAY_UTC}"
   --to-day "${TO_DAY_UTC}"
@@ -538,6 +562,7 @@ fi
 echo ""
 echo "=== Targeted R2 History Index Update ==="
 echo "kind: ${TARGET_KIND}"
+echo "history_version: ${HISTORY_VERSION}"
 echo "from_day_utc: ${FROM_DAY_UTC}"
 echo "to_day_utc: ${TO_DAY_UTC}"
 echo "connector_id: ${CONNECTOR_ID:-all}"
