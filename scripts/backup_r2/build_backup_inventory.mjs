@@ -75,7 +75,7 @@ export function isRunManifestUnitPath(relativePath) {
   return RUN_MANIFEST_UNIT_PATTERN.test(String(relativePath || ""));
 }
 
-function resolveDomainPrefixes(backupVersion, env = process.env) {
+export function resolveDomainPrefixes(backupVersion, env = process.env) {
   const version = parseBackupVersion(backupVersion);
   if (version === "v2") {
     return Object.freeze({

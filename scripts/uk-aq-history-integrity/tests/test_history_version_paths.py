@@ -268,5 +268,86 @@ class HistoryVersionPathTests(unittest.TestCase):
         self.assertNotIn('history_path_configs["v1"]', source)
 
 
+class CoreSnapshotVersionPathTests(unittest.TestCase):
+    def test_v1_integrity_resolves_core_snapshot_root_to_v1_core(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "R2_history_backup"
+            env = {"UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(root)}
+            self.assertEqual(
+                MODULE.resolve_core_snapshot_root("v1", env),
+                str(root / "history/v1/core"),
+            )
+            self.assertEqual(MODULE.resolve_core_snapshot_prefix("v1", env), "history/v1/core")
+
+    def test_v2_integrity_resolves_core_snapshot_root_to_v2_core(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "R2_history_backup"
+            env = {"UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(root)}
+            self.assertEqual(
+                MODULE.resolve_core_snapshot_root("v2", env),
+                str(root / "history/v2/core"),
+            )
+            self.assertEqual(MODULE.resolve_core_snapshot_prefix("v2", env), "history/v2/core")
+
+    def test_v2_integrity_does_not_silently_fall_back_to_v1_core(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit_v1 = Path(tmp) / "R2_history_backup" / "history/v1/core"
+            env = {"UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT": str(explicit_v1)}
+            resolved = MODULE.resolve_core_snapshot_root("v2", env)
+            self.assertTrue(resolved.endswith("R2_history_backup/history/v2/core"))
+            self.assertNotIn("history/v1/core", resolved)
+
+    def test_v2_missing_core_snapshot_reports_clear_missing_status(self) -> None:
+        status = MODULE.classify_core_snapshot_status(
+            {"status": "no_snapshot", "snapshot_day_utc": None},
+            history_version="v2",
+            expected_day="2026-06-20",
+        )
+        self.assertEqual(status, "v2_core_snapshot_missing")
+
+    def test_v2_stale_core_snapshot_reports_clear_stale_status(self) -> None:
+        status = MODULE.classify_core_snapshot_status(
+            {"status": "reused", "snapshot_day_utc": "2026-06-16"},
+            history_version="v2",
+            expected_day="2026-06-20",
+        )
+        self.assertEqual(status, "v2_core_snapshot_stale")
+
+    def test_report_includes_core_version_prefix_root_and_status(self) -> None:
+        markdown = MODULE.format_summary_md({
+            "env": "CIC-Test",
+            "profile": "manual",
+            "started_at_utc": "2026-06-20T00:00:00Z",
+            "finished_at_utc": "2026-06-20T00:01:00Z",
+            "status": "warning",
+            "source": "openaq",
+            "from_day": "2026-06-20",
+            "to_day": "2026-06-20",
+            "dry_run": True,
+            "check_only": True,
+            "run_backfill": False,
+            "db_path": "/tmp/db.sqlite",
+            "log_path": "/tmp/run.log",
+            "snapshot": {
+                "status": "no_snapshot",
+                "core_history_version": "v2",
+                "core_prefix": "history/v2/core",
+                "snapshot_root": "/tmp/R2_history_backup/history/v2/core",
+                "core_snapshot_status": "v2_core_snapshot_missing",
+                "snapshot_day_utc": None,
+                "manifest_hash": None,
+                "previous_manifest_hash": None,
+                "snapshot_day_dir": None,
+                "bytes_read": 0,
+                "rows_lookup": 0,
+                "tables": {},
+            },
+        })
+        self.assertIn("Core history version: v2", markdown)
+        self.assertIn("Core prefix:   history/v2/core", markdown)
+        self.assertIn("Snapshot root: /tmp/R2_history_backup/history/v2/core", markdown)
+        self.assertIn("Core snapshot status: v2_core_snapshot_missing", markdown)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -696,9 +696,13 @@ const AQI_R2_HISTORY_DEBUG_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX") ||
     HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
 ) || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX;
-const CORE_R2_HISTORY_PREFIX = normalizePrefix(
-  Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
-) || "history/v1/core";
+const CORE_R2_HISTORY_PREFIX = HISTORY_R2_WRITE_VERSION === "v2"
+  ? (normalizePrefix(
+    Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") || "history/v2/core",
+  ) || "history/v2/core")
+  : (normalizePrefix(
+    Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
+  ) || "history/v1/core");
 const R2_HISTORY_DROPBOX_ROOT = optionalEnvAny([
   "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
   "UK_AQ_BACKFILL_R2_HISTORY_DROPBOX_ROOT",

@@ -23,6 +23,14 @@ on:
         required: false
         default: ""
         type: string
+      history_version:
+        description: "Core snapshot history version (v1 or v2). Blank = v1."
+        required: false
+        default: "v1"
+        type: choice
+        options:
+          - v1
+          - v2
 
 permissions:
   contents: read
@@ -42,7 +50,9 @@ jobs:
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      UK_AQ_R2_HISTORY_WRITE_VERSION: ${{ github.event.inputs.history_version || vars.UK_AQ_R2_HISTORY_WRITE_VERSION || 'v1' }}
       UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
+      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
       UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS: ${{ vars.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS || '5000' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
@@ -79,7 +89,9 @@ jobs:
             CFLARE_R2_BUCKET
             CFLARE_R2_ACCESS_KEY_ID
             CFLARE_R2_SECRET_ACCESS_KEY
+            UK_AQ_R2_HISTORY_WRITE_VERSION
             UK_AQ_R2_HISTORY_CORE_PREFIX
+            UK_AQ_R2_HISTORY_V2_CORE_PREFIX
           )
 
           missing=0
@@ -93,6 +105,14 @@ jobs:
           if [ "$missing" -ne 0 ]; then
             exit 1
           fi
+
+          case "${UK_AQ_R2_HISTORY_WRITE_VERSION}" in
+            v1|v2) ;;
+            *)
+              echo "UK_AQ_R2_HISTORY_WRITE_VERSION must be v1 or v2." >&2
+              exit 1
+              ;;
+          esac
 
           day_utc="$(printf "%s" "${INPUT_DAY_UTC}" | tr -d '\r\n' | xargs)"
           case "${day_utc}" in
