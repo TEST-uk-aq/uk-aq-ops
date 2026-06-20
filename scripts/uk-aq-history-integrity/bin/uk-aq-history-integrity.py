@@ -5048,14 +5048,19 @@ def _enrich_v2_observations_repair_plans(
                 "kind": "v1_dropbox_to_v2_observations_backfill_plan",
                 "requires_index_rebuild": True,
                 "commands": [_confirmed_v1_to_v2_observations_command(day_utc=day_utc, connector_id=connector_id)],
+                "executes": False,
+                "operator_action_required": True,
+                "write_risk": "writes_to_r2_if_operator_runs_command",
                 "steps": [
                     "Use the confirmed local Dropbox v1-to-v2 observations builder for the affected day/connector scope.",
+                    "Review the suggested command before running it manually because it includes --write-r2 and --replace.",
                     "After v2 observations are written by an operator, rebuild the affected v2 observations _index_v2 manifests.",
                 ],
                 "notes": (
-                    "This is a non-executing plan. The listed builder command is a suggestion only; "
-                    "the checker does not run it. The follow-up _index_v2 rebuild command is not listed "
-                    "because its command contract has not been confirmed."
+                    "This is a non-executing plan. The listed builder command is operator guidance only; "
+                    "the checker does not run it. It contains --write-r2 and --replace, so it must only "
+                    "be copied and run manually after operator review. The follow-up _index_v2 rebuild "
+                    "command is not listed because its command contract has not been confirmed."
                 ),
             }
         elif gap_type in data_gap_types and v1_present is False:

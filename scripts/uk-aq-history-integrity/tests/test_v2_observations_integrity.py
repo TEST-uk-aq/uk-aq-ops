@@ -121,6 +121,25 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertEqual(results["v1"]["status"], "checked")
         self.assertEqual(results["v2"]["status"], "fail")
 
+
+    def test_v1_to_v2_repair_command_is_marked_non_executing_write_risk(self) -> None:
+        day = "2026-06-11"
+        v1_dir = self.root / f"history/v1/observations/day_utc={day}/connector_id=7"
+        v1_dir.mkdir(parents=True)
+
+        result = self._run(day, day)
+
+        gap = next(g for g in result["gaps"] if g["gap_type"] == "day_dir_missing")
+        repair = gap["suggested_repair"]
+        self.assertEqual(repair["kind"], "v1_dropbox_to_v2_observations_backfill_plan")
+        self.assertEqual(repair["executes"], False)
+        self.assertEqual(repair["operator_action_required"], True)
+        self.assertEqual(repair["write_risk"], "writes_to_r2_if_operator_runs_command")
+        command = repair["commands"][0]
+        self.assertIn("--write-r2", command)
+        self.assertIn("--replace", command)
+        self.assertIn("operator review", repair["notes"])
+
     def test_targeted_day_range_does_not_scan_outside_days(self) -> None:
         self._write_healthy(day="2026-06-11")
         self._write_healthy(day="2026-06-12", manifest=False)
