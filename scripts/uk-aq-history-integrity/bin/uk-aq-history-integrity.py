@@ -4891,8 +4891,10 @@ def _v2_obs_gap(
     if cid is not None:
         try:
             cid = int(str(cid))
-        except ValueError:
-            pass
+        except (TypeError, ValueError):
+            # Some gap records may use non-numeric connector identifiers; keep the
+            # original value so the report still identifies the partition.
+            cid = connector_id
     return {
         "history_version": "v2",
         "domain": "observations",
