@@ -2482,6 +2482,7 @@ def _planned_backfill_command(
     day: dt.date,
     connector_ids: list[int] | None = None,
     output_scope: str | None = None,
+    history_version: str = "v1",
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
@@ -2497,6 +2498,9 @@ def _planned_backfill_command(
         f"UK_AQ_BACKFILL_RUN_MODE=source_to_r2 "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
         f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
+        f"UK_AQ_R2_HISTORY_WRITE_VERSION={history_version} "
+        f"UK_AQ_R2_HISTORY_BACKUP_VERSION={history_version} "
+        f"UK_AQ_R2_HISTORY_INDEX_VERSION={history_version} "
         f"{f'UK_AQ_BACKFILL_OUTPUT_SCOPE={output_scope} ' if output_scope else ''}"
         f"{f'UK_AQ_BACKFILL_CONNECTOR_IDS={connector_csv} ' if connector_csv else ''}"
         f"UK_AQ_BACKFILL_TIMESERIES_IDS={ids_csv} "
@@ -2696,6 +2700,7 @@ def run_narrow_backfill(
     log_label: str | None = None,
     output_scope: str | None = None,
     extra_env: dict[str, str] | None = None,
+    history_version: str = "v1",
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one (timeseries-ids, day).
 
@@ -2752,6 +2757,9 @@ def run_narrow_backfill(
         "UK_AQ_BACKFILL_DRY_RUN": "false",
         "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
         "UK_AQ_BACKFILL_OUTPUT_SCOPE": output_scope or "default",
+        "UK_AQ_R2_HISTORY_WRITE_VERSION": history_version,
+        "UK_AQ_R2_HISTORY_BACKUP_VERSION": history_version,
+        "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TIMESERIES_IDS": ",".join(str(t) for t in timeseries_ids),
@@ -2802,6 +2810,8 @@ def run_narrow_backfill(
             "--env",
             env_name,
             "--observs-only",
+            "--history-version",
+            history_version,
             "--from-day",
             iso,
             "--to-day",
@@ -6803,6 +6813,7 @@ def _planned_aqi_rebuild_command(
     env: dict[str, str],
     connector_id: int | None,
     day: dt.date,
+    history_version: str = "v1",
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
@@ -6819,6 +6830,9 @@ def _planned_aqi_rebuild_command(
         f"UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
         f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
+        f"UK_AQ_R2_HISTORY_WRITE_VERSION={history_version} "
+        f"UK_AQ_R2_HISTORY_BACKUP_VERSION={history_version} "
+        f"UK_AQ_R2_HISTORY_INDEX_VERSION={history_version} "
         f"UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only "
         f"{connector_scope}"
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
@@ -6839,6 +6853,7 @@ def run_aqi_rebuild_backfill(
     timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
     log_dir: Path | None = None,
     log_label: str | None = None,
+    history_version: str = "v1",
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": None,
@@ -6882,6 +6897,9 @@ def run_aqi_rebuild_backfill(
         "UK_AQ_BACKFILL_DRY_RUN": "false",
         "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
         "UK_AQ_BACKFILL_OUTPUT_SCOPE": "aqilevels_only",
+        "UK_AQ_R2_HISTORY_WRITE_VERSION": history_version,
+        "UK_AQ_R2_HISTORY_BACKUP_VERSION": history_version,
+        "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
@@ -6902,6 +6920,8 @@ def run_aqi_rebuild_backfill(
             "--env",
             env_name,
             "--aqi-only",
+            "--history-version",
+            history_version,
             "--from-day",
             iso,
             "--to-day",
@@ -6985,6 +7005,116 @@ def run_aqi_rebuild_backfill(
     return result
 
 
+
+
+def _timeseries_ids_for_connector(conn: sqlite3.Connection, connector_id: int) -> list[int]:
+    rows = conn.execute(
+        """
+        SELECT id
+        FROM core_timeseries_snapshot
+        WHERE connector_id = ?
+          AND (ended_at IS NULL OR TRIM(ended_at) = '')
+        ORDER BY id
+        """,
+        (int(connector_id),),
+    ).fetchall()
+    return [int(row[0]) for row in rows if row and int(row[0]) > 0]
+
+
+def run_v2_gap_backfills(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    run_compact: str,
+    env: dict[str, str],
+    v2_observations: Mapping[str, Any],
+    dry_run: bool,
+    run_backfill: bool,
+    limits: LimitTracker,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Execute direct source -> v2 observation repairs for missing v2 gaps.
+
+    The lower-level supported contract is UK_AQ_R2_HISTORY_WRITE_VERSION=v2,
+    UK_AQ_R2_HISTORY_BACKUP_VERSION=v2, and UK_AQ_R2_HISTORY_INDEX_VERSION=v2;
+    the integrity shell wrapper forwards these and calls the v2-aware targeted
+    index builder with --history-version v2. This intentionally does not use
+    any v1-to-v2 Dropbox conversion plan.
+    """
+    metrics: dict[str, Any] = {
+        "v2_observation_repairs_attempted": 0,
+        "v2_observation_repairs_ok": 0,
+        "v2_observation_repairs_failed": 0,
+        "v2_observation_index_rebuilds_attempted": 0,
+        "v2_observation_index_rebuilds_ok": 0,
+        "v2_observation_index_rebuilds_failed": 0,
+        "planned_v2_observation_repairs": [],
+        "planned_v2_observation_index_rebuilds": [],
+        "aqi_rebuilds_queued_from_obs_repair": 0,
+        "planned_aqi_rebuilds": [],
+        "planned_aqi_rebuild_connector_days": [],
+        "unsupported_v2_backfill": False,
+    }
+    if not run_backfill:
+        return metrics
+    gaps = list(v2_observations.get("gaps") or [])
+    if not gaps:
+        return metrics
+    by_key: dict[tuple[str, int], list[int]] = {}
+    for gap in gaps:
+        day_iso = str(gap.get("day_utc") or "").strip()
+        try:
+            connector_id = int(gap.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        if not day_iso or connector_id <= 0:
+            continue
+        ts_ids = _timeseries_ids_for_connector(conn, connector_id)
+        if ts_ids:
+            by_key[(day_iso, connector_id)] = ts_ids
+    backfill_log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
+    queued: set[tuple[str, int]] = set()
+    for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
+        day_obj = dt.date.fromisoformat(day_iso)
+        cmd = _planned_backfill_command(env, ts_ids, day_obj, connector_ids=[connector_id], output_scope="observations_only", history_version="v2")
+        metrics["planned_v2_observation_repairs"].append(cmd)
+        idx_cmd = f"node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --history-version v2 --targeted --kind observations --from-day {day_iso} --to-day {day_iso} --connector-id {connector_id}"
+        metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
+        metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
+        metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
+        if dry_run:
+            queued.add((day_iso, connector_id))
+            continue
+        if limits.should_stop():
+            break
+        bf = run_narrow_backfill(
+            wrapper_path=resolve_integrity_backfill_wrapper(),
+            env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+            env_name=env_name,
+            timeseries_ids=ts_ids,
+            connector_ids=[connector_id],
+            day=day_obj,
+            log=log,
+            log_dir=backfill_log_dir,
+            log_label=f"v2_obs_day_{day_iso}_connector_{connector_id}",
+            output_scope="observations_only",
+            history_version="v2",
+        )
+        metrics["v2_observation_repairs_attempted"] += 1
+        metrics["v2_observation_index_rebuilds_attempted"] += 1
+        if bf.get("status") == "ok":
+            metrics["v2_observation_repairs_ok"] += 1
+            metrics["v2_observation_index_rebuilds_ok"] += 1
+            action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=ts_ids, queue_note="queued_from_v2_observation_repair", log=log)
+            if action in {"inserted", "merged"}:
+                queued.add((day_iso, connector_id))
+        else:
+            metrics["v2_observation_repairs_failed"] += 1
+            metrics["v2_observation_index_rebuilds_failed"] += 1
+    metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued)
+    return metrics
+
 def run_aqi_rebuild_queue_execution(
     conn: sqlite3.Connection,
     *,
@@ -6997,6 +7127,7 @@ def run_aqi_rebuild_queue_execution(
     limits: LimitTracker,
     log: logging.Logger,
     dry_run_planned_rows: list[dict[str, Any]] | None = None,
+    history_version: str = "v1",
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "aqi_rebuild_ran": False,
@@ -7079,6 +7210,7 @@ def run_aqi_rebuild_queue_execution(
                 env,
                 None,
                 dt.date.fromisoformat(day_iso),
+                history_version=history_version,
             )
             metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
             metrics["aqi_rebuild_results"].append({
@@ -7121,7 +7253,7 @@ def run_aqi_rebuild_queue_execution(
         duplicate_rows = rows_for_key[1:]
         row_ids = [int(row[0]) for row in rows_for_key if row[0] is not None]
 
-        planned_cmd = _planned_aqi_rebuild_command(env, None, day_obj)
+        planned_cmd = _planned_aqi_rebuild_command(env, None, day_obj, history_version=history_version)
         metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
 
         if duplicate_rows:
@@ -7202,6 +7334,7 @@ def run_aqi_rebuild_queue_execution(
             log=log,
             log_dir=backfill_log_dir,
             log_label=f"aqi_day_{day_iso}_all_connectors",
+            history_version=history_version,
         )
         metrics["aqi_rebuilds_attempted"] += 1
 
@@ -9299,6 +9432,20 @@ def main(argv: list[str]) -> int:
                 log=log,
             )
             cross_check_metrics.update(cc_backfill_metrics)
+            if history_version_mode == "v2":
+                v2_backfill_metrics = run_v2_gap_backfills(
+                    conn=conn,
+                    run_id=int(run_id),
+                    env_name=args.env,
+                    run_compact=run_compact,
+                    env=env,
+                    v2_observations=cross_check_metrics.get("v2_observations") or {},
+                    dry_run=args.dry_run,
+                    run_backfill=args.run_backfill,
+                    limits=limits,
+                    log=log,
+                )
+                cross_check_metrics.update(v2_backfill_metrics)
             v1_config_for_legacy_aqi = history_path_configs.get("v1")
             if v1_config_for_legacy_aqi is None:
                 aqi_health_metrics = {
@@ -9339,6 +9486,7 @@ def main(argv: list[str]) -> int:
                     *(cross_check_metrics.get("planned_aqi_rebuild_connector_days") or []),
                     *(cross_check_metrics.get("queued_aqi_only_connector_days") or []),
                 ],
+                history_version="v2" if history_version_mode == "v2" else "v1",
             )
             cross_check_metrics.update(aqi_rebuild_metrics)
 
