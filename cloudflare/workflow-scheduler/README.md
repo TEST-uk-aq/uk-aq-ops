@@ -13,9 +13,11 @@ Each cron line must include `job_key` comment:
 [triggers]
 crons = [
   "0 3 * * *",   # job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
-  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "22 9 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
+  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot_v1 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "20 4 * * *",  # job_key: uk_aq_r2_core_snapshot_v2 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup_v1 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "45 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup_v2 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "49 5 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]
 ```
 
@@ -26,6 +28,7 @@ crons = [
 1. Cloudflare fires `scheduled()` and passes only the cron string (no job name).
 2. Deploy workflow builds `job_key -> cron` map from `wrangler.toml` comments.
 3. Worker matches received cron string to job keys, then dispatches matching workflows.
+4. Version-specific R2 jobs pass explicit `workflow_dispatch` inputs instead of relying on workflow defaults: core snapshot uses `history_version`, and Dropbox backup uses `backup_version`.
 
 ## Required Secret
 
@@ -58,6 +61,12 @@ Optional:
 - Secret: `UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY`
 
 ## Logging
+
+Configured R2 history jobs:
+- `uk_aq_r2_core_snapshot_v1` at 04:15 UTC dispatches `uk_aq_r2_core_snapshot.yml` with `history_version=v1`.
+- `uk_aq_r2_core_snapshot_v2` at 04:20 UTC dispatches `uk_aq_r2_core_snapshot.yml` with `history_version=v2`.
+- `uk_aq_r2_history_dropbox_backup_v1` at 04:35 UTC dispatches `uk_aq_r2_history_dropbox_backup.yml` with `backup_version=v1`.
+- `uk_aq_r2_history_dropbox_backup_v2` at 04:45 UTC dispatches `uk_aq_r2_history_dropbox_backup.yml` with `backup_version=v2`.
 
 Worker logs include:
 - received cron expression
