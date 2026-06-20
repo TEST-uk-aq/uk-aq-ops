@@ -4877,6 +4877,42 @@ def serialize_history_path_configs(
 
 
 
+def _connector_dir_allowed(dirname: str, allowed_connector_ids: set[int]) -> bool:
+    if not dirname.startswith("connector_id="):
+        return False
+    raw = dirname.split("=", 1)[1]
+    try:
+        return int(raw) in allowed_connector_ids
+    except (TypeError, ValueError):
+        return False
+
+
+def resolve_v2_source_scope(
+    conn: sqlite3.Connection,
+    source_filter: str,
+) -> tuple[set[int] | None, dict[str, Any]]:
+    source = str(source_filter or "all").strip() or "all"
+    if source == "all":
+        return None, {"source": "all", "connector_ids": None, "scope": "all"}
+    rows = conn.execute(
+        """
+        SELECT DISTINCT connector_id
+        FROM source_station_timeseries_lookup
+        WHERE source_key = ?
+          AND connector_id IS NOT NULL
+        ORDER BY connector_id
+        """,
+        (source,),
+    ).fetchall()
+    connector_ids = sorted({int(row[0]) for row in rows if row[0] is not None})
+    if not connector_ids:
+        raise RuntimeError(
+            "v2 source-specific integrity checks could not resolve any connector_id "
+            f"for source={source!r} from the imported core snapshot lookup"
+        )
+    return set(connector_ids), {"source": source, "connector_ids": connector_ids, "scope": "source"}
+
+
 def _v2_obs_gap(
     gap_type: str,
     *,
@@ -5101,6 +5137,8 @@ def run_v2_observations_integrity_checks(
     config: HistoryPathConfig,
     from_day: str | None,
     to_day: str | None,
+    allowed_connector_ids: set[int] | None = None,
+    source_scope: dict[str, Any] | None = None,
     log: logging.Logger | None = None,
 ) -> dict[str, Any]:
     if not r2_history_root:
@@ -5134,6 +5172,11 @@ def run_v2_observations_integrity_checks(
             gaps.append(_v2_obs_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
             continue
         connector_dirs = sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir())
+        if allowed_connector_ids is not None:
+            connector_dirs = [
+                p for p in connector_dirs
+                if _connector_dir_allowed(p.name, allowed_connector_ids)
+            ]
         if not connector_dirs:
             gaps.append(_v2_obs_gap("connector_dir_missing", day_utc=day_utc, expected_path=f"{day_rel}/connector_id=*"))
             continue
@@ -5209,6 +5252,8 @@ def run_v2_observations_integrity_checks(
     _enrich_v2_observations_repair_plans(root=root, gaps=gaps)
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
     result = {"status": status, "checked_partitions": checked, "gap_count": len(gaps), "gaps": gaps}
+    if source_scope is not None:
+        result["source_scope"] = source_scope
     if log:
         log.info("v2 observations integrity done status=%s checked_partitions=%s gaps=%s", status, checked, len(gaps))
     return result
@@ -5402,6 +5447,8 @@ def run_v2_aqilevels_integrity_checks(
     config: HistoryPathConfig,
     from_day: str | None,
     to_day: str | None,
+    allowed_connector_ids: set[int] | None = None,
+    source_scope: dict[str, Any] | None = None,
     check_aqi_debug: bool = False,
     require_aqi_debug: bool = False,
     log: logging.Logger | None = None,
@@ -5442,6 +5489,11 @@ def run_v2_aqilevels_integrity_checks(
             data_gaps.append(_v2_aqi_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
             continue
         connector_dirs = sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir())
+        if allowed_connector_ids is not None:
+            connector_dirs = [
+                p for p in connector_dirs
+                if _connector_dir_allowed(p.name, allowed_connector_ids)
+            ]
         if not connector_dirs:
             data_gaps.append(_v2_aqi_gap("connector_dir_missing", day_utc=day_utc, expected_path=f"{day_rel}/connector_id=*"))
             continue
@@ -5563,6 +5615,8 @@ def run_v2_aqilevels_integrity_checks(
             "gaps": debug_gaps,
         },
     }
+    if source_scope is not None:
+        result["source_scope"] = source_scope
     if log:
         log.info("v2 AQI integrity done status=%s checked_partitions=%s gaps=%s debug_gaps=%s", status, checked, len(data_gaps), len(debug_gaps))
     return result
@@ -8693,7 +8747,13 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     aqi_gaps = list(aqi.get("gaps") or []) + list((aqi.get("debug") or {}).get("gaps") or [])
                     debug = aqi.get("debug") or {}
                     debug_mode = "skipped" if not debug.get("checked") else ("required" if debug.get("required") else "warning-only")
+                    source_scope = obs.get("source_scope") or aqi.get("source_scope") or {}
+                    source_scope_line = "all connectors"
+                    if source_scope.get("scope") == "source":
+                        connector_ids = source_scope.get("connector_ids") or []
+                        source_scope_line = f"{source_scope.get('source')} connector_id={','.join(str(c) for c in connector_ids)}"
                     lines.extend([
+                        f"- Source scope: {source_scope_line}",
                         f"- AQI hourly data prefix: {config.get('aqilevels_hourly_data_prefix')}",
                         f"- AQI hourly data index prefix: {config.get('aqilevels_timeseries_index_prefix')}",
                         "- V2 observations checks: implemented",
@@ -9067,6 +9127,11 @@ def main(argv: list[str]) -> int:
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
         )
+        v2_allowed_connector_ids: set[int] | None = None
+        v2_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
+        if "v2" in checked_history_versions and snapshot_ok:
+            v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
+            log.info("v2 source scope: %s", v2_source_scope)
         sos_counts = lookup_source_counts.get("uk_air_sos", {})
         log.info(
             "lookup active counts: openaq stations=%s timeseries=%s; sensorcommunity stations=%s timeseries=%s; uk_air_sos stations=%s timeseries=%s",
@@ -9144,6 +9209,8 @@ def main(argv: list[str]) -> int:
                 config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                source_scope=v2_source_scope,
                 log=log,
             )
             v2_aqi = run_v2_aqilevels_integrity_checks(
@@ -9151,6 +9218,8 @@ def main(argv: list[str]) -> int:
                 config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                source_scope=v2_source_scope,
                 check_aqi_debug=bool(args.check_aqi_debug),
                 require_aqi_debug=bool(args.require_aqi_debug),
                 log=log,
@@ -9159,6 +9228,7 @@ def main(argv: list[str]) -> int:
                 "ran": True,
                 "history_version": "v2",
                 "skipped_reason": None,
+                "source_scope": v2_source_scope,
                 "v2_observations": v2_obs,
                 "v2_aqilevels": v2_aqi,
                 "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0),
@@ -9189,6 +9259,8 @@ def main(argv: list[str]) -> int:
                     config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
                     log=log,
                 )
                 v2_aqi = run_v2_aqilevels_integrity_checks(
@@ -9196,6 +9268,8 @@ def main(argv: list[str]) -> int:
                     config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
                     check_aqi_debug=bool(args.check_aqi_debug),
                     require_aqi_debug=bool(args.require_aqi_debug),
                     log=log,
@@ -9205,6 +9279,7 @@ def main(argv: list[str]) -> int:
                         "ran": True,
                         "checks_implemented": True,
                         "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
+                        "source_scope": v2_source_scope,
                         "observations": v2_obs,
                         "aqilevels": v2_aqi,
                     }
@@ -9689,6 +9764,7 @@ def main(argv: list[str]) -> int:
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
             "history_version_results": history_version_results,
+            "source_scope": v2_source_scope if "v2" in checked_history_versions else None,
             "site_read_version": site_read_version,
             "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,
             "from_day": from_day,

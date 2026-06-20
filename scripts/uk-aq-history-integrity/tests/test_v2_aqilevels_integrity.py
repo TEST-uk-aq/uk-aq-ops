@@ -156,6 +156,41 @@ class V2AqiIntegrityTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["checked_partitions"], 1)
 
+    def test_source_scoped_aqi_and_debug_ignore_connector_1(self) -> None:
+        day = "2026-06-07"
+        self._write_healthy(day=day)
+        part6 = self._partition(day=day, connector=6, pollutant="pm25")
+        part6.mkdir(parents=True, exist_ok=True)
+        key6 = f"history/v2/aqilevels/hourly/data/day_utc={day}/connector_id=6/pollutant_code=pm25/part-00000.parquet"
+        (self.root / key6).write_bytes(b"PAR1")
+        (part6 / "manifest.json").write_text(json.dumps({"files": [{"key": key6}], "row_count": 1, "timeseries_row_counts": {"301": 1}}), encoding="utf-8")
+        idx6 = self._index(day=day, connector=6, pollutant="pm25")
+        idx6.mkdir(parents=True, exist_ok=True)
+        (idx6 / "manifest.json").write_text(json.dumps({"timeseries_row_counts": {"301": 1}}), encoding="utf-8")
+        debug6 = self._partition(day=day, connector=6, pollutant="pm25", profile="debug")
+        debug6.mkdir(parents=True, exist_ok=True)
+        (debug6 / "manifest.json").write_text(json.dumps({
+            "history_version": "v2", "domain": "aqilevels", "grain": "hourly", "profile": "debug",
+            "day_utc": day, "connector_id": 6, "pollutant_code": "pm25", "files": []
+        }), encoding="utf-8")
+        part1 = self._partition(day=day, connector=1, pollutant="o3")
+        part1.mkdir(parents=True, exist_ok=True)
+        key1 = f"history/v2/aqilevels/hourly/data/day_utc={day}/connector_id=1/pollutant_code=o3/part-00000.parquet"
+        (self.root / key1).write_bytes(b"PAR1")
+        (part1 / "manifest.json").write_text(json.dumps({"files": [{"key": key1}], "row_count": 1, "timeseries_row_counts": {"201": 1}}), encoding="utf-8")
+
+        result = MODULE.run_v2_aqilevels_integrity_checks(
+            r2_history_root=self.root, config=self.config, from_day=day, to_day=day,
+            allowed_connector_ids={6},
+            source_scope={"source": "openaq", "connector_ids": [6], "scope": "source"},
+            check_aqi_debug=True, require_aqi_debug=True,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(any(g.get("connector_id") == 1 for g in result["gaps"]))
+        self.assertFalse(any(g.get("connector_id") == 1 for g in result["debug"]["gaps"]))
+        self.assertEqual(result["source_scope"]["connector_ids"], [6])
+
 
 if __name__ == "__main__":
     unittest.main()

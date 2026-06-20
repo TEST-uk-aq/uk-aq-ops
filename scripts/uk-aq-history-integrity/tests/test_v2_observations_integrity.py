@@ -147,6 +147,73 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["checked_partitions"], 1)
 
+    def test_source_scoped_openaq_ignores_connector_1_missing_index(self) -> None:
+        day = "2026-06-07"
+        self._write_healthy(day=day)
+        part6 = self._partition(day=day, connector=6, pollutant="pm25")
+        part6.mkdir(parents=True, exist_ok=True)
+        key6 = f"history/v2/observations/day_utc={day}/connector_id=6/pollutant_code=pm25/part-00000.parquet"
+        (self.root / key6).write_bytes(b"PAR1")
+        (part6 / "manifest.json").write_text(json.dumps({"files": [{"key": key6}], "row_count": 1, "timeseries_row_counts": {"301": 1}}), encoding="utf-8")
+        idx6 = self._index(day=day, connector=6, pollutant="pm25")
+        idx6.mkdir(parents=True, exist_ok=True)
+        (idx6 / "manifest.json").write_text(json.dumps({"timeseries_row_counts": {"301": 1}}), encoding="utf-8")
+        part1 = self._partition(day=day, connector=1, pollutant="o3")
+        part1.mkdir(parents=True, exist_ok=True)
+        key1 = f"history/v2/observations/day_utc={day}/connector_id=1/pollutant_code=o3/part-00000.parquet"
+        (self.root / key1).write_bytes(b"PAR1")
+        (part1 / "manifest.json").write_text(json.dumps({
+            "history_version": "v2", "domain": "observations", "day_utc": day,
+            "connector_id": 1, "pollutant_code": "o3", "row_count": 1,
+            "source_row_count": 1, "file_count": 1,
+            "timeseries_row_counts": {"201": 1}, "files": [{"key": key1}],
+        }), encoding="utf-8")
+
+        result = MODULE.run_v2_observations_integrity_checks(
+            r2_history_root=self.root, config=self.config, from_day=day, to_day=day,
+            allowed_connector_ids={6},
+            source_scope={"source": "openaq", "connector_ids": [6], "scope": "source"},
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["checked_partitions"], 1)
+        self.assertFalse(any(g.get("connector_id") == 1 for g in result["gaps"]))
+        self.assertEqual(result["source_scope"]["connector_ids"], [6])
+
+    def test_source_scoped_uk_air_sos_reports_connector_1_missing_index(self) -> None:
+        day = "2026-06-07"
+        self._write_healthy(day=day)
+        part1 = self._partition(day=day, connector=1, pollutant="o3")
+        part1.mkdir(parents=True, exist_ok=True)
+        key1 = f"history/v2/observations/day_utc={day}/connector_id=1/pollutant_code=o3/part-00000.parquet"
+        (self.root / key1).write_bytes(b"PAR1")
+        (part1 / "manifest.json").write_text(json.dumps({"files": [{"key": key1}], "row_count": 1, "timeseries_row_counts": {"201": 1}}), encoding="utf-8")
+
+        result = MODULE.run_v2_observations_integrity_checks(
+            r2_history_root=self.root, config=self.config, from_day=day, to_day=day,
+            allowed_connector_ids={1},
+        )
+
+        self.assertIn("index_manifest_missing", self._gap_types(result))
+        self.assertTrue(any(g.get("connector_id") == 1 for g in result["gaps"]))
+
+    def test_all_scope_reports_connector_1_missing_index(self) -> None:
+        day = "2026-06-07"
+        self._write_healthy(day=day)
+        part1 = self._partition(day=day, connector=1, pollutant="o3")
+        part1.mkdir(parents=True, exist_ok=True)
+        key1 = f"history/v2/observations/day_utc={day}/connector_id=1/pollutant_code=o3/part-00000.parquet"
+        (self.root / key1).write_bytes(b"PAR1")
+        (part1 / "manifest.json").write_text(json.dumps({"files": [{"key": key1}], "row_count": 1, "timeseries_row_counts": {"201": 1}}), encoding="utf-8")
+
+        result = MODULE.run_v2_observations_integrity_checks(
+            r2_history_root=self.root, config=self.config, from_day=day, to_day=day,
+            source_scope={"source": "all", "connector_ids": None, "scope": "all"},
+        )
+
+        self.assertIn("index_manifest_missing", self._gap_types(result))
+        self.assertIsNone(result["source_scope"]["connector_ids"])
+
 
 if __name__ == "__main__":
     unittest.main()
