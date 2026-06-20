@@ -27,7 +27,8 @@ export {
   normalizePollutantCode,
 } from "../../lib/aqi/aqi_levels.mjs";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 export const ALLOWED_TRIGGER_MODES = Object.freeze(["scheduler", "manual"]);
 export const ALLOWED_RUN_MODES = Object.freeze([

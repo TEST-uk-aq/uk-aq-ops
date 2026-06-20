@@ -2206,13 +2206,6 @@ def _metadata_changed(prior: dict[str, Any], head: dict[str, Any]) -> bool:
     )
 
 
-def _prior_local_cache_exists(prior: dict[str, Any] | None) -> bool:
-    if not prior:
-        return False
-    local_cached_path = str(prior.get("local_cached_path") or "").strip()
-    return bool(local_cached_path and Path(local_cached_path).is_file())
-
-
 def _check_one_openaq_file_threadsafe(
     db_path: str,
     env_name: str,
@@ -2223,7 +2216,6 @@ def _check_one_openaq_file_threadsafe(
     cache_root: Path,
     log: logging.Logger,
     limits: LimitTracker | None = None,
-    force_download_when_cache_missing: bool = False,
 ) -> dict[str, Any]:
     """Worker entrypoint: opens a thread-local connection, calls the inner
     function, commits, and enriches the result with location_id + day so the
@@ -2242,7 +2234,6 @@ def _check_one_openaq_file_threadsafe(
     try:
         result = _check_one_openaq_file(
             conn, env_name, base_url, location_id, day, tmp_dir, cache_root, log,
-            force_download_when_cache_missing=force_download_when_cache_missing,
         )
     finally:
         try:
@@ -2263,7 +2254,6 @@ def _check_one_openaq_file(
     tmp_dir: Path,
     cache_root: Path,
     log: logging.Logger,
-    force_download_when_cache_missing: bool = False,
 ) -> dict[str, Any]:
     """Run HEAD + (optional) download + hash for a single OpenAQ file."""
     url = _openaq_url(base_url, location_id, day)
@@ -2348,17 +2338,10 @@ def _check_one_openaq_file(
     # ---- 200 path: decide whether to download
     is_first_seen = prior is None
     was_missing = prior is not None and prior["exists_remote"] == 0
-    needs_cache_refresh = (
-        bool(force_download_when_cache_missing)
-        and prior is not None
-        and int(prior.get("exists_remote") or 0) == 1
-        and not _prior_local_cache_exists(prior)
-    )
     needs_download = (
         is_first_seen
         or was_missing
         or _metadata_changed(prior, head)
-        or needs_cache_refresh
     )
 
     if not needs_download:
@@ -2369,7 +2352,7 @@ def _check_one_openaq_file(
             head=head, exists_remote=True,
             sha256_downloaded=prior["sha256_downloaded"],
             sha256_uncompressed=prior["sha256_uncompressed"],
-            local_cached_path=prior.get("local_cached_path"),
+            local_cached_path=None,
             now_iso=now_iso, last_changed_at=None,
             last_status="unchanged",
         )
@@ -2380,31 +2363,10 @@ def _check_one_openaq_file(
         }
 
     # Download + hash
-    tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / f"openaq-{location_id}-{day.strftime('%Y%m%d')}.csv.gz"
     if tmp_path.exists():
         tmp_path.unlink()
-    try:
-        bytes_downloaded = _http_get_to_file(url, tmp_path)
-    except Exception as exc:
-        tmp_path.unlink(missing_ok=True)
-        _upsert_state(
-            conn, source_file_key=sfk, env_name=env_name, remote_url=url,
-            location_id=location_id, day=day,
-            head=head, exists_remote=True,
-            sha256_downloaded=(prior or {}).get("sha256_downloaded"),
-            sha256_uncompressed=(prior or {}).get("sha256_uncompressed"),
-            local_cached_path=(prior or {}).get("local_cached_path"),
-            now_iso=now_iso, last_changed_at=None,
-            last_status="download_failed",
-        )
-        log.warning("openaq download failed loc=%s day=%s: %s", location_id, day.isoformat(), exc)
-        return {
-            "outcome": "download_failed", "downloaded_bytes": 0,
-            "event_id": None, "event_type": None,
-            "timeseries_ids": timeseries_ids,
-            "error": str(exc),
-        }
+    bytes_downloaded = _http_get_to_file(url, tmp_path)
     sha_compressed, _ = sha256_of_file(tmp_path)
     hash_start = time.monotonic()
     sha_uncompressed = _sha256_uncompressed_gzip(tmp_path)
@@ -2420,7 +2382,7 @@ def _check_one_openaq_file(
     # what we had before it disappeared.
     state_changed = is_first_seen or was_missing or content_changed
 
-    if not state_changed and not needs_cache_refresh:
+    if not state_changed:
         # Downloaded only because metadata differed; content hash matches
         # prior. Discard temp; no event.
         tmp_path.unlink(missing_ok=True)
@@ -2430,7 +2392,7 @@ def _check_one_openaq_file(
             head=head, exists_remote=True,
             sha256_downloaded=sha_compressed,
             sha256_uncompressed=sha_uncompressed,
-            local_cached_path=prior.get("local_cached_path"),
+            local_cached_path=None,
             now_iso=now_iso, last_changed_at=None,
             last_status="unchanged",
         )
@@ -2440,11 +2402,13 @@ def _check_one_openaq_file(
             "timeseries_ids": timeseries_ids,
         }
 
+    # State changed: first_seen, reappeared, or content changed (or all).
+    # Cache the file regardless; reappeared-with-same-content still counts
+    # as a state transition that may need a backfill.
     event_type = (
         "first_seen" if is_first_seen
         else "reappeared" if was_missing
-        else "changed" if state_changed
-        else "unchanged"
+        else "changed"
     )
     cache_path = _openaq_cache_path(cache_root, location_id, day)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2485,29 +2449,27 @@ def _check_one_openaq_file(
         sha256_downloaded=sha_compressed,
         sha256_uncompressed=sha_uncompressed,
         local_cached_path=str(cache_path),
-        now_iso=now_iso, last_changed_at=now_iso if state_changed else None,
+        now_iso=now_iso, last_changed_at=now_iso,
         last_status=event_type,
     )
-    event_id = None
-    if state_changed:
-        event_id = _insert_event(
-            conn, event_type=event_type, env_name=env_name,
-            source_file_key=sfk, remote_url=url,
-            location_id=location_id, day=day,
-            prior=prior, head=head,
-            new_sha_downloaded=sha_compressed, new_sha_uncompressed=sha_uncompressed,
-            downloaded_bytes=bytes_downloaded, hash_runtime_ms=hash_runtime_ms,
-            now_iso=now_iso,
-            notes=("content unchanged from prior version (state-only transition)"
-                   if not content_changed else None),
-        )
+    event_id = _insert_event(
+        conn, event_type=event_type, env_name=env_name,
+        source_file_key=sfk, remote_url=url,
+        location_id=location_id, day=day,
+        prior=prior, head=head,
+        new_sha_downloaded=sha_compressed, new_sha_uncompressed=sha_uncompressed,
+        downloaded_bytes=bytes_downloaded, hash_runtime_ms=hash_runtime_ms,
+        now_iso=now_iso,
+        notes=("content unchanged from prior version (state-only transition)"
+               if not content_changed else None),
+    )
     log.info(
         "openaq %s loc=%s day=%s sha=%s..%s bytes=%s",
         event_type, location_id, day.isoformat(),
         sha_uncompressed[:8], sha_uncompressed[-4:], bytes_downloaded,
     )
     return {
-        "outcome": event_type if state_changed else "unchanged_content",
+        "outcome": event_type,
         "downloaded_bytes": bytes_downloaded,
         "event_id": event_id, "event_type": event_type,
         "timeseries_ids": timeseries_ids,
@@ -2521,7 +2483,6 @@ def _planned_backfill_command(
     connector_ids: list[int] | None = None,
     output_scope: str | None = None,
     history_version: str = "v1",
-    env_name: str | None = None,
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
@@ -2533,26 +2494,6 @@ def _planned_backfill_command(
     connector_csv = ",".join(str(c) for c in (connector_ids or []) if int(c) > 0)
     ids_csv = ",".join(str(t) for t in timeseries_ids)
     iso = day.isoformat()
-    wrapper_command = wrapper
-    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
-        mode_arg = "--aqi-only" if output_scope == "aqilevels_only" else "--observs-only"
-        cli_parts = [
-            shlex.quote(wrapper),
-            "--env",
-            shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
-            mode_arg,
-            "--history-version",
-            shlex.quote(str(history_version)),
-            "--from-day",
-            iso,
-            "--to-day",
-            iso,
-            "--timeseries-ids",
-            shlex.quote(ids_csv),
-        ]
-        if connector_csv:
-            cli_parts.extend(["--connector-id", shlex.quote(connector_csv.split(",", 1)[0])])
-        wrapper_command = " ".join(cli_parts)
     return (
         f"UK_AQ_BACKFILL_RUN_MODE=source_to_r2 "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
@@ -2566,17 +2507,8 @@ def _planned_backfill_command(
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_ENV_FILE={env_file} "
-        f"{wrapper_command}"
+        f"{wrapper}"
     )
-
-
-def adapter_backfill_history_version(history_version_mode: str) -> str:
-    """History version used by source-adapter triggered backfills.
-
-    `both` mode remains conservative: source-change backfills keep the legacy
-    v1 target while the v2 checker reports v2 gaps separately.
-    """
-    return "v2" if history_version_mode == "v2" else "v1"
 
 
 # ---------------------------------------------------------------------------
@@ -2596,8 +2528,6 @@ BACKFILL_OUTPUT_TAIL_BYTES = 4096
 # per-call timeout.
 _CHUNK_ENV_VAR = "UK_AQ_HISTORY_INTEGRITY_MAX_TIMESERIES_IDS_PER_BACKFILL"
 _TRY_UNCHUNKED_FIRST_ENV_VAR = "UK_AQ_HISTORY_INTEGRITY_BACKFILL_TRY_UNCHUNKED_FIRST"
-_V2_OBSERVATION_REPAIR_CHUNK_ENV_VAR = "UK_AQ_HISTORY_INTEGRITY_V2_OBSERVATION_REPAIR_MAX_TIMESERIES_IDS"
-_V2_OBSERVATION_REPAIR_DEFAULT_CHUNK_SIZE = 500
 
 # Status precedence for combining per-chunk results into one per-event row.
 # Worst status wins so a single failed chunk surfaces as a failed backfill on
@@ -2629,43 +2559,6 @@ def _chunk_timeseries_ids(ids: list[int]) -> list[list[int]]:
     if max_per <= 0 or len(ids) <= max_per:
         return [list(ids)]
     return [list(ids[i:i + max_per]) for i in range(0, len(ids), max_per)]
-
-
-def _v2_observation_repair_chunk_size() -> int:
-    raw = (os.environ.get(_V2_OBSERVATION_REPAIR_CHUNK_ENV_VAR) or "").strip()
-    try:
-        max_per = int(raw) if raw else _V2_OBSERVATION_REPAIR_DEFAULT_CHUNK_SIZE
-    except (TypeError, ValueError):
-        max_per = _V2_OBSERVATION_REPAIR_DEFAULT_CHUNK_SIZE
-    if max_per <= 0:
-        max_per = _V2_OBSERVATION_REPAIR_DEFAULT_CHUNK_SIZE
-    return max_per
-
-
-def _chunk_v2_observation_repair_timeseries_ids(ids: list[int]) -> list[list[int]]:
-    """Chunk v2 source-scoped observation repairs before invoking the wrapper.
-
-    v1 keeps the legacy opt-in chunking behavior above. v2 repairs can be
-    connector-wide and source scoped, so a single OpenAQ connector/day can carry
-    thousands of timeseries IDs through an env var and shell argument. Keep
-    those wrapper calls bounded by default while preserving deterministic ID
-    order.
-    """
-    max_per = _v2_observation_repair_chunk_size()
-    if not ids:
-        return []
-    if len(ids) <= max_per:
-        return [list(ids)]
-    return [list(ids[i:i + max_per]) for i in range(0, len(ids), max_per)]
-
-
-def _tail_lines(text: str, limit: int = 80) -> str:
-    if not text:
-        return ""
-    lines = text.splitlines()
-    if len(lines) <= limit:
-        return text
-    return "\n".join(["...[truncated]...", *lines[-limit:]])
 
 
 def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2995,11 +2888,6 @@ def run_narrow_backfill(
         "backfill done status=%s exit_code=%s duration=%.3fs",
         result["status"], result["exit_code"], result["duration_seconds"],
     )
-    if result.get("status") != "ok":
-        if result.get("stdout_tail"):
-            log.warning("backfill stdout tail:\n%s", result["stdout_tail"])
-        if result.get("stderr_tail"):
-            log.warning("backfill stderr tail:\n%s", result["stderr_tail"])
     return result
 
 
@@ -3071,7 +2959,6 @@ def check_openaq(
     log: logging.Logger,
     run_compact: str,
     concurrency: int = DEFAULT_CONCURRENCY,
-    history_version: str = "v1",
 ) -> dict[str, Any]:
     """Iterate distinct OpenAQ locations × days; run per-file workflow.
 
@@ -3090,7 +2977,6 @@ def check_openaq(
         "missing": 0,
         "errors": 0,
         "downloaded_bytes": 0,
-        "download_failed": 0,
         # first_seen_files: baselined this run (new to integrity DB). Not backfilled
         # directly — cross-check phase will repair if R2 actually disagrees.
         "first_seen_files": [],
@@ -3168,7 +3054,6 @@ def check_openaq(
                     _check_one_openaq_file_threadsafe,
                     db_path, env_name, base_url, loc, day,
                     tmp_dir, cache_root, log, limits,
-                    force_download_when_cache_missing=(history_version == "v2"),
                 ))
         total_tasks = len(futures)
         progress.update(
@@ -3210,9 +3095,6 @@ def check_openaq(
             metrics["head_checked"] += 1
             if outcome in {"missing_first_seen", "missing_disappeared", "still_missing"}:
                 metrics["missing"] += 1
-            if outcome == "download_failed":
-                metrics["download_failed"] += 1
-                metrics["errors"] += 1
             if outcome == "unchanged_content":
                 metrics["downloaded"] += 1
                 metrics["unchanged_after_download"] += 1
@@ -3241,19 +3123,7 @@ def check_openaq(
                 })
                 if run_backfill:
                     day_obj = dt.date.fromisoformat(result["day"])
-                    connector_ids = (
-                        _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == "v2"
-                        else None
-                    )
-                    cmd = _planned_backfill_command(
-                        env,
-                        result["timeseries_ids"],
-                        day_obj,
-                        connector_ids=connector_ids,
-                        history_version=history_version,
-                        env_name=env_name,
-                    )
+                    cmd = _planned_backfill_command(env, result["timeseries_ids"], day_obj)
                     metrics["planned_backfills"].append(cmd)
                     log.info("openaq planned backfill: %s", cmd)
             bytes_added = int(result.get("downloaded_bytes") or 0)
@@ -3315,11 +3185,6 @@ def check_openaq(
                 break
             group = by_day[day_iso]
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
-            connector_ids = (
-                _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == "v2"
-                else None
-            )
             chunks = _chunk_timeseries_ids(union_ids)
             log.info(
                 "backfill batch day=%s files=%s total_timeseries_ids=%s chunks=%s",
@@ -3337,12 +3202,10 @@ def check_openaq(
                     env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
                     env_name=env_name,
                     timeseries_ids=chunk_ids,
-                    connector_ids=connector_ids,
                     day=dt.date.fromisoformat(day_iso),
                     log=log,
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
-                    history_version=history_version,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -3520,7 +3383,6 @@ def _check_one_sc_file_threadsafe(
     cache_root: Path,
     log: logging.Logger,
     limits: LimitTracker | None = None,
-    force_download_when_cache_missing: bool = False,
 ) -> dict[str, Any]:
     """Worker entrypoint mirroring `_check_one_openaq_file_threadsafe`."""
     if limits is not None and limits.should_stop():
@@ -3538,7 +3400,6 @@ def _check_one_sc_file_threadsafe(
         result = _check_one_sc_file(
             conn, env_name, base_url, sensor_id, day, filename_in_index,
             tmp_dir, cache_root, log,
-            force_download_when_cache_missing=force_download_when_cache_missing,
         )
     finally:
         try:
@@ -3560,7 +3421,6 @@ def _check_one_sc_file(
     tmp_dir: Path,
     cache_root: Path,
     log: logging.Logger,
-    force_download_when_cache_missing: bool = False,
 ) -> dict[str, Any]:
     """Per-sensor/day workflow. Mirrors `_check_one_openaq_file` but:
     - skips HEAD entirely when not in index (avoids issuing per-file 404s),
@@ -3672,13 +3532,7 @@ def _check_one_sc_file(
 
     is_first_seen = prior is None
     was_missing = prior is not None and prior["exists_remote"] == 0
-    needs_cache_refresh = (
-        bool(force_download_when_cache_missing)
-        and prior is not None
-        and int(prior.get("exists_remote") or 0) == 1
-        and not _prior_local_cache_exists(prior)
-    )
-    needs_download = is_first_seen or was_missing or _metadata_changed(prior, head) or needs_cache_refresh
+    needs_download = is_first_seen or was_missing or _metadata_changed(prior, head)
 
     if not needs_download:
         _upsert_state(
@@ -3687,7 +3541,7 @@ def _check_one_sc_file(
             head=head, exists_remote=True,
             sha256_downloaded=prior["sha256_downloaded"],
             sha256_uncompressed=prior["sha256_uncompressed"],
-            local_cached_path=prior.get("local_cached_path"),
+            local_cached_path=None,
             now_iso=now_iso, last_changed_at=None,
             last_status="unchanged",
         )
@@ -3701,35 +3555,10 @@ def _check_one_sc_file(
             "timeseries_ids": timeseries_ids,
         }
 
-    tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / f"sc-{sensor_id}-{day.strftime('%Y%m%d')}.csv"
     if tmp_path.exists():
         tmp_path.unlink()
-    try:
-        bytes_downloaded = _http_get_to_file(url, tmp_path)
-    except Exception as exc:
-        tmp_path.unlink(missing_ok=True)
-        _upsert_state(
-            conn, source_file_key=sfk, env_name=env_name, remote_url=url,
-            location_id=sensor_id, day=day,
-            head=head, exists_remote=True,
-            sha256_downloaded=(prior or {}).get("sha256_downloaded"),
-            sha256_uncompressed=(prior or {}).get("sha256_uncompressed"),
-            local_cached_path=(prior or {}).get("local_cached_path"),
-            now_iso=now_iso, last_changed_at=None,
-            last_status="download_failed",
-        )
-        conn.execute(
-            "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
-            (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
-        )
-        log.warning("sensorcommunity download failed sensor=%s day=%s: %s", sensor_id, day.isoformat(), exc)
-        return {
-            "outcome": "download_failed", "downloaded_bytes": 0,
-            "event_id": None, "event_type": None,
-            "timeseries_ids": timeseries_ids,
-            "error": str(exc),
-        }
+    bytes_downloaded = _http_get_to_file(url, tmp_path)
     hash_start = time.monotonic()
     sha_csv = _sha256_of_csv(tmp_path)
     hash_runtime_ms = int((time.monotonic() - hash_start) * 1000)
@@ -3741,7 +3570,7 @@ def _check_one_sc_file(
     )
     state_changed = is_first_seen or was_missing or content_changed
 
-    if not state_changed and not needs_cache_refresh:
+    if not state_changed:
         tmp_path.unlink(missing_ok=True)
         _upsert_state(
             conn, source_file_key=sfk, env_name=env_name, remote_url=url,
@@ -3749,7 +3578,7 @@ def _check_one_sc_file(
             head=head, exists_remote=True,
             sha256_downloaded=sha_csv,
             sha256_uncompressed=sha_csv,
-            local_cached_path=prior.get("local_cached_path"),
+            local_cached_path=None,
             now_iso=now_iso, last_changed_at=None,
             last_status="unchanged",
         )
@@ -3766,8 +3595,7 @@ def _check_one_sc_file(
     event_type = (
         "first_seen" if is_first_seen
         else "reappeared" if was_missing
-        else "changed" if state_changed
-        else "unchanged"
+        else "changed"
     )
     cache_path = _sc_cache_path(cache_root, day, filename_in_index)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3808,37 +3636,35 @@ def _check_one_sc_file(
         sha256_downloaded=sha_csv,
         sha256_uncompressed=sha_csv,
         local_cached_path=str(cache_path),
-        now_iso=now_iso, last_changed_at=now_iso if state_changed else None,
+        now_iso=now_iso, last_changed_at=now_iso,
         last_status=event_type,
     )
     conn.execute(
         "UPDATE source_file_state SET source_key=?, remote_scheme=? WHERE source_file_key=?",
         (SC_SOURCE_KEY, SC_REMOTE_SCHEME, sfk),
     )
-    event_id = None
-    if state_changed:
-        event_id = _insert_event(
-            conn, event_type=event_type, env_name=env_name,
-            source_file_key=sfk, remote_url=url,
-            location_id=sensor_id, day=day,
-            prior=prior, head=head,
-            new_sha_downloaded=sha_csv, new_sha_uncompressed=sha_csv,
-            downloaded_bytes=bytes_downloaded, hash_runtime_ms=hash_runtime_ms,
-            now_iso=now_iso,
-            notes=("content unchanged from prior version (state-only transition)"
-                   if not content_changed else None),
-        )
-        conn.execute(
-            "UPDATE source_file_events SET source_key=? WHERE id=?",
-            (SC_SOURCE_KEY, event_id),
-        )
+    event_id = _insert_event(
+        conn, event_type=event_type, env_name=env_name,
+        source_file_key=sfk, remote_url=url,
+        location_id=sensor_id, day=day,
+        prior=prior, head=head,
+        new_sha_downloaded=sha_csv, new_sha_uncompressed=sha_csv,
+        downloaded_bytes=bytes_downloaded, hash_runtime_ms=hash_runtime_ms,
+        now_iso=now_iso,
+        notes=("content unchanged from prior version (state-only transition)"
+               if not content_changed else None),
+    )
+    conn.execute(
+        "UPDATE source_file_events SET source_key=? WHERE id=?",
+        (SC_SOURCE_KEY, event_id),
+    )
     log.info(
         "sensorcommunity %s sensor=%s day=%s sha=%s..%s bytes=%s",
         event_type, sensor_id, day.isoformat(),
         sha_csv[:8], sha_csv[-4:], bytes_downloaded,
     )
     return {
-        "outcome": event_type if state_changed else "unchanged_content",
+        "outcome": event_type,
         "downloaded_bytes": bytes_downloaded,
         "event_id": event_id, "event_type": event_type,
         "timeseries_ids": timeseries_ids,
@@ -3858,7 +3684,6 @@ def check_sensor_community(
     log: logging.Logger,
     run_compact: str,
     concurrency: int = DEFAULT_CONCURRENCY,
-    history_version: str = "v1",
 ) -> dict[str, Any]:
     """Iterate days × distinct SC sensor IDs from the lookup; one index fetch per day."""
     metrics: dict[str, Any] = {
@@ -3875,7 +3700,6 @@ def check_sensor_community(
         "missing": 0,
         "errors": 0,
         "downloaded_bytes": 0,
-        "download_failed": 0,
         # first_seen_files: baselined this run; not backfilled directly.
         "first_seen_files": [],
         # changed_files: metadata diverged from baseline (changed or reappeared).
@@ -3961,7 +3785,6 @@ def check_sensor_community(
                 _check_one_sc_file_threadsafe,
                 db_path, env_name, base_url, sensor_id, day, filename,
                 tmp_dir, cache_root, log, limits,
-                force_download_when_cache_missing=(history_version == "v2"),
             ))
         total_tasks = len(futures)
         completed_tasks = 0
@@ -4005,9 +3828,6 @@ def check_sensor_community(
             metrics["head_checked"] += 1
             if outcome in {"missing_first_seen", "missing_disappeared", "still_missing"}:
                 metrics["missing"] += 1
-            if outcome == "download_failed":
-                metrics["download_failed"] += 1
-                metrics["errors"] += 1
             if outcome == "unchanged_content":
                 metrics["downloaded"] += 1
                 metrics["unchanged_after_download"] += 1
@@ -4034,19 +3854,7 @@ def check_sensor_community(
                 })
                 if run_backfill:
                     day_obj = dt.date.fromisoformat(result["day"])
-                    connector_ids = (
-                        _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == "v2"
-                        else None
-                    )
-                    cmd = _planned_backfill_command(
-                        env,
-                        result["timeseries_ids"],
-                        day_obj,
-                        connector_ids=connector_ids,
-                        history_version=history_version,
-                        env_name=env_name,
-                    )
+                    cmd = _planned_backfill_command(env, result["timeseries_ids"], day_obj)
                     metrics["planned_backfills"].append(cmd)
                     log.info("sensorcommunity planned backfill: %s", cmd)
             bytes_added = int(result.get("downloaded_bytes") or 0)
@@ -4108,11 +3916,6 @@ def check_sensor_community(
                 break
             group = by_day[day_iso]
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
-            connector_ids = (
-                _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == "v2"
-                else None
-            )
             chunks = _chunk_timeseries_ids(union_ids)
             log.info(
                 "sensorcommunity backfill batch day=%s files=%s total_timeseries_ids=%s chunks=%s",
@@ -4130,12 +3933,10 @@ def check_sensor_community(
                     env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
                     env_name=env_name,
                     timeseries_ids=chunk_ids,
-                    connector_ids=connector_ids,
                     day=dt.date.fromisoformat(day_iso),
                     log=log,
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
-                    history_version=history_version,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -4641,7 +4442,6 @@ def check_uk_air_sos(
     limits: LimitTracker,
     log: logging.Logger,
     concurrency: int = DEFAULT_CONCURRENCY,
-    history_version: str = "v1",
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "ran": False,
@@ -5097,23 +4897,6 @@ def _connector_dir_allowed(dirname: str, allowed_connector_ids: set[int]) -> boo
         return False
 
 
-def _expected_connector_ids(allowed_connector_ids: set[int] | None) -> list[int]:
-    if allowed_connector_ids is None:
-        return []
-    return sorted({int(cid) for cid in allowed_connector_ids if int(cid) > 0})
-
-
-def _connector_id_from_dirname(dirname: str) -> int | None:
-    if not dirname.startswith("connector_id="):
-        return None
-    raw = dirname.split("=", 1)[1]
-    try:
-        cid = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return cid if cid > 0 else None
-
-
 def resolve_v2_source_scope(
     conn: sqlite3.Connection,
     source_filter: str,
@@ -5396,40 +5179,15 @@ def run_v2_observations_integrity_checks(
         day_rel = f"{data_prefix}/day_utc={day_utc}"
         day_dir = root / day_rel
         if not day_dir.is_dir():
-            if allowed_connector_ids is None:
-                gaps.append(_v2_obs_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
-            else:
-                for connector_id in _expected_connector_ids(allowed_connector_ids):
-                    gaps.append(_v2_obs_gap(
-                        "day_dir_missing",
-                        day_utc=day_utc,
-                        connector_id=connector_id,
-                        expected_path=f"{day_rel}/connector_id={connector_id}",
-                    ))
+            gaps.append(_v2_obs_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
             continue
         connector_dirs = sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir())
         if allowed_connector_ids is not None:
-            existing_allowed_ids = {
-                cid
-                for p in connector_dirs
-                for cid in [_connector_id_from_dirname(p.name)]
-                if cid is not None and cid in allowed_connector_ids
-            }
-            for connector_id in _expected_connector_ids(allowed_connector_ids):
-                if connector_id not in existing_allowed_ids:
-                    gaps.append(_v2_obs_gap(
-                        "connector_dir_missing",
-                        day_utc=day_utc,
-                        connector_id=connector_id,
-                        expected_path=f"{day_rel}/connector_id={connector_id}",
-                    ))
             connector_dirs = [
                 p for p in connector_dirs
                 if _connector_dir_allowed(p.name, allowed_connector_ids)
             ]
         if not connector_dirs:
-            if allowed_connector_ids is not None:
-                continue
             gaps.append(_v2_obs_gap("connector_dir_missing", day_utc=day_utc, expected_path=f"{day_rel}/connector_id=*"))
             continue
         for connector_dir in connector_dirs:
@@ -5738,40 +5496,15 @@ def run_v2_aqilevels_integrity_checks(
         day_rel = f"{data_prefix}/day_utc={day_utc}"
         day_dir = root / day_rel
         if not day_dir.is_dir():
-            if allowed_connector_ids is None:
-                data_gaps.append(_v2_aqi_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
-            else:
-                for connector_id in _expected_connector_ids(allowed_connector_ids):
-                    data_gaps.append(_v2_aqi_gap(
-                        "day_dir_missing",
-                        day_utc=day_utc,
-                        connector_id=connector_id,
-                        expected_path=f"{day_rel}/connector_id={connector_id}",
-                    ))
+            data_gaps.append(_v2_aqi_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
             continue
         connector_dirs = sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir())
         if allowed_connector_ids is not None:
-            existing_allowed_ids = {
-                cid
-                for p in connector_dirs
-                for cid in [_connector_id_from_dirname(p.name)]
-                if cid is not None and cid in allowed_connector_ids
-            }
-            for connector_id in _expected_connector_ids(allowed_connector_ids):
-                if connector_id not in existing_allowed_ids:
-                    data_gaps.append(_v2_aqi_gap(
-                        "connector_dir_missing",
-                        day_utc=day_utc,
-                        connector_id=connector_id,
-                        expected_path=f"{day_rel}/connector_id={connector_id}",
-                    ))
             connector_dirs = [
                 p for p in connector_dirs
                 if _connector_dir_allowed(p.name, allowed_connector_ids)
             ]
         if not connector_dirs:
-            if allowed_connector_ids is not None:
-                continue
             data_gaps.append(_v2_aqi_gap("connector_dir_missing", day_utc=day_utc, expected_path=f"{day_rel}/connector_id=*"))
             continue
         for connector_dir in connector_dirs:
@@ -6451,7 +6184,6 @@ def _queue_aqi_rebuild(
     requested_timeseries_ids: list[int],
     queue_note: str | None,
     log: logging.Logger,
-    history_version: str = "v1",
 ) -> str:
     now_iso = fmt_iso(utc_now())
     merged_ids_csv = _merge_csv_ids(None, requested_timeseries_ids)
@@ -6480,11 +6212,11 @@ def _queue_aqi_rebuild(
             (
                 run_id,
                 env_name,
-                history_version,
+                "v1",
                 "aqilevels",
                 "hourly",
                 None,
-                history_version,
+                "v1",
                 connector_id,
                 day_utc,
                 reason,
@@ -6543,7 +6275,6 @@ def _queue_aqi_rebuild_from_obs_repair(
     requested_timeseries_ids: list[int],
     queue_note: str | None,
     log: logging.Logger,
-    history_version: str = "v1",
 ) -> str:
     return _queue_aqi_rebuild(
         conn=conn,
@@ -6556,7 +6287,6 @@ def _queue_aqi_rebuild_from_obs_repair(
         requested_timeseries_ids=requested_timeseries_ids,
         queue_note=queue_note,
         log=log,
-        history_version=history_version,
     )
 
 
@@ -6646,7 +6376,6 @@ def run_cross_check_backfills(
             day_obj,
             connector_ids=[connector_id],
             output_scope="observations_only",
-            env_name=env_name,
         )
         metrics["planned_observation_backfills"].append(cmd)
         metrics["planned_backfills"].append(cmd)
@@ -7085,7 +6814,6 @@ def _planned_aqi_rebuild_command(
     connector_id: int | None,
     day: dt.date,
     history_version: str = "v1",
-    env_name: str | None = None,
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
@@ -7098,23 +6826,6 @@ def _planned_aqi_rebuild_command(
     connector_scope = ""
     if connector_id is not None and int(connector_id) > 0:
         connector_scope = f"UK_AQ_BACKFILL_CONNECTOR_IDS={int(connector_id)} "
-    wrapper_command = wrapper
-    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
-        cli_parts = [
-            shlex.quote(wrapper),
-            "--env",
-            shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
-            "--aqi-only",
-            "--history-version",
-            shlex.quote(str(history_version)),
-            "--from-day",
-            iso,
-            "--to-day",
-            iso,
-        ]
-        if connector_id is not None and int(connector_id) > 0:
-            cli_parts.extend(["--connector-id", str(int(connector_id))])
-        wrapper_command = " ".join(cli_parts)
     return (
         f"UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
@@ -7127,7 +6838,7 @@ def _planned_aqi_rebuild_command(
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_ENV_FILE={env_file} "
-        f"{wrapper_command}"
+        f"{wrapper}"
     )
 
 
@@ -7310,194 +7021,6 @@ def _timeseries_ids_for_connector(conn: sqlite3.Connection, connector_id: int) -
     return [int(row[0]) for row in rows if row and int(row[0]) > 0]
 
 
-def _connector_ids_for_timeseries(
-    conn: sqlite3.Connection,
-    timeseries_ids: Iterable[int],
-) -> list[int]:
-    ids = sorted({int(ts_id) for ts_id in timeseries_ids if int(ts_id) > 0})
-    if not ids:
-        return []
-    placeholders = ",".join("?" for _ in ids)
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT DISTINCT connector_id
-            FROM core_timeseries_snapshot
-            WHERE id IN ({placeholders})
-              AND connector_id IS NOT NULL
-              AND (ended_at IS NULL OR TRIM(ended_at) = '')
-            ORDER BY connector_id
-            """,
-            ids,
-        ).fetchall()
-    except sqlite3.Error:
-        return []
-    return [int(row[0]) for row in rows if row and int(row[0]) > 0]
-
-
-def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
-
-
-def _source_file_key_for_lookup_row(source_key: str, source_location_id: str, day: dt.date) -> str | None:
-    if source_key == OPENAQ_SOURCE_KEY:
-        return _openaq_source_file_key(source_location_id, day)
-    if source_key == SC_SOURCE_KEY:
-        return _sc_source_file_key(source_location_id, day)
-    if source_key == UK_AIR_SOS_SOURCE_KEY:
-        return _uk_air_sos_source_file_key(source_location_id, day)
-    return None
-
-
-def _source_cache_status_for_connector_day(
-    conn: sqlite3.Connection,
-    *,
-    connector_id: int,
-    day: dt.date,
-) -> dict[str, Any]:
-    if not _table_exists(conn, "source_station_timeseries_lookup") or not _table_exists(conn, "source_file_state"):
-        return {"status": "not_checked", "reason": "source state tables unavailable"}
-
-    lookup_rows = conn.execute(
-        """
-        SELECT DISTINCT source_key, source_location_id
-        FROM source_station_timeseries_lookup
-        WHERE connector_id = ?
-          AND is_active = 1
-          AND source_location_id IS NOT NULL
-        ORDER BY source_key, source_location_id
-        """,
-        (int(connector_id),),
-    ).fetchall()
-    source_keys = [
-        _source_file_key_for_lookup_row(str(row[0]), str(row[1]), day)
-        for row in lookup_rows
-    ]
-    source_keys = [key for key in source_keys if key]
-    if not source_keys:
-        return {"status": "unavailable", "reason": "no active source files resolved for connector/day"}
-
-    remote_exists = 0
-    cached = 0
-    download_failed = 0
-    missing = 0
-    absent_state = 0
-    for source_file_key in source_keys:
-        row = conn.execute(
-            """
-            SELECT exists_remote, local_cached_path, last_status
-            FROM source_file_state
-            WHERE source_file_key = ?
-            """,
-            (source_file_key,),
-        ).fetchone()
-        if row is None:
-            absent_state += 1
-            continue
-        exists_remote = int(row[0] or 0)
-        last_status = str(row[2] or "")
-        if exists_remote == 1:
-            remote_exists += 1
-            local_cached_path = str(row[1] or "").strip()
-            if local_cached_path and Path(local_cached_path).is_file():
-                cached += 1
-            if last_status == "download_failed":
-                download_failed += 1
-        else:
-            missing += 1
-
-    if remote_exists <= 0:
-        return {
-            "status": "unavailable",
-            "reason": "no remote source files exist for connector/day",
-            "source_file_count": len(source_keys),
-            "missing": missing,
-            "absent_state": absent_state,
-        }
-    if cached < remote_exists:
-        return {
-            "status": "download_failed" if download_failed else "cache_missing",
-            "reason": "remote source files exist but local cache is incomplete",
-            "source_file_count": len(source_keys),
-            "remote_exists": remote_exists,
-            "cached": cached,
-            "download_failed": download_failed,
-            "missing": missing,
-            "absent_state": absent_state,
-        }
-    return {
-        "status": "ok",
-        "source_file_count": len(source_keys),
-        "remote_exists": remote_exists,
-        "cached": cached,
-        "download_failed": download_failed,
-        "missing": missing,
-        "absent_state": absent_state,
-    }
-
-
-def _set_v2_source_repair_plan(
-    gap: dict[str, Any],
-    *,
-    status: str,
-    command: str | None,
-    source_cache_status: Mapping[str, Any] | None,
-) -> None:
-    evidence = gap.setdefault("source_evidence", {})
-    if source_cache_status is not None:
-        evidence["source_cache_status"] = dict(source_cache_status)
-    if status == "ready":
-        gap["suggested_repair"] = {
-            "kind": "source_to_v2_observations_backfill",
-            "requires_index_rebuild": True,
-            "commands": [command] if command else [],
-            "executes": True,
-            "operator_action_required": False,
-            "write_risk": "writes_to_r2_when_run_backfill_is_enabled",
-            "steps": [
-                "Use the normal source-to-R2 backfill wrapper with --history-version v2.",
-                "Rebuild the affected v2 observations timeseries index after observations are written.",
-                "Queue connector-scoped v2 AQI rebuild only after the observation repair succeeds.",
-            ],
-            "notes": "Source cache for the connector/day is available; no v1 Dropbox evidence is required.",
-        }
-    elif status == "planned_after_obs_repair":
-        gap["suggested_repair"] = {
-            "kind": "source_to_v2_observations_backfill_planned",
-            "requires_index_rebuild": True,
-            "commands": [command] if command else [],
-            "executes": False,
-            "operator_action_required": False,
-            "write_risk": "dry_run_only",
-            "steps": [
-                "Dry-run plan: source-to-v2 observation repair would run with --history-version v2.",
-                "AQI rebuild would be queued only after a successful observation repair.",
-            ],
-            "notes": "Dry-run planning does not claim obs_repaired.",
-        }
-    else:
-        reason = ""
-        if source_cache_status is not None:
-            reason = str(source_cache_status.get("reason") or source_cache_status.get("status") or "")
-        gap["suggested_repair"] = {
-            "kind": "source_cache_required_for_v2_observations_backfill",
-            "requires_index_rebuild": True,
-            "commands": [],
-            "executes": False,
-            "operator_action_required": True,
-            "write_risk": "none",
-            "steps": [
-                "Refresh/check the upstream source cache for the affected connector/day.",
-                "Retry the v2 source-to-R2 observation repair after source cache is available.",
-            ],
-            "notes": reason or "Source cache is not available for this connector/day.",
-        }
-
-
 def run_v2_gap_backfills(
     *,
     conn: sqlite3.Connection,
@@ -7523,19 +7046,11 @@ def run_v2_gap_backfills(
         "v2_observation_repairs_attempted": 0,
         "v2_observation_repairs_ok": 0,
         "v2_observation_repairs_failed": 0,
-        "observation_backfills_attempted": 0,
-        "observation_backfills_ok": 0,
-        "observation_backfills_failed": 0,
         "v2_observation_index_rebuilds_attempted": 0,
         "v2_observation_index_rebuilds_ok": 0,
         "v2_observation_index_rebuilds_failed": 0,
-        "v2_observation_repairs_source_unavailable": 0,
-        "v2_observation_repairs_source_download_failed": 0,
-        "v2_observation_repair_chunk_size": _v2_observation_repair_chunk_size(),
         "planned_v2_observation_repairs": [],
         "planned_v2_observation_index_rebuilds": [],
-        "skipped_v2_observation_repairs": [],
-        "v2_observation_repair_results": [],
         "aqi_rebuilds_queued_from_obs_repair": 0,
         "planned_aqi_rebuilds": [],
         "planned_aqi_rebuild_connector_days": [],
@@ -7547,7 +7062,6 @@ def run_v2_gap_backfills(
     if not gaps:
         return metrics
     by_key: dict[tuple[str, int], list[int]] = {}
-    gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for gap in gaps:
         day_iso = str(gap.get("day_utc") or "").strip()
         try:
@@ -7559,148 +7073,45 @@ def run_v2_gap_backfills(
         ts_ids = _timeseries_ids_for_connector(conn, connector_id)
         if ts_ids:
             by_key[(day_iso, connector_id)] = ts_ids
-            gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
-    metrics["observation_backfill_candidate_days"] = len(by_key)
-    metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
-    metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
-    metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     backfill_log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     queued: set[tuple[str, int]] = set()
     for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
         day_obj = dt.date.fromisoformat(day_iso)
-        chunks = _chunk_v2_observation_repair_timeseries_ids(ts_ids)
-        planned_cmds = [
-            _planned_backfill_command(env, chunk_ids, day_obj, connector_ids=[connector_id], output_scope="observations_only", history_version="v2", env_name=env_name)
-            for chunk_ids in chunks
-        ]
-        first_cmd = planned_cmds[0] if planned_cmds else None
+        cmd = _planned_backfill_command(env, ts_ids, day_obj, connector_ids=[connector_id], output_scope="observations_only", history_version="v2")
+        metrics["planned_v2_observation_repairs"].append(cmd)
         idx_cmd = f"node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --history-version v2 --targeted --kind observations --from-day {day_iso} --to-day {day_iso} --connector-id {connector_id}"
+        metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
+        metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
+        metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
         if dry_run:
-            metrics["planned_v2_observation_repairs"].extend(planned_cmds)
-            metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
-            metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=planned_after_obs_repair history_version=v2")
-            metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["planned_after_obs_repair"], "history_version": "v2"})
-            for gap in gaps_by_key.get((day_iso, connector_id), []):
-                _set_v2_source_repair_plan(gap, status="planned_after_obs_repair", command=first_cmd, source_cache_status=None)
             queued.add((day_iso, connector_id))
             continue
         if limits.should_stop():
             break
-        source_cache_status = _source_cache_status_for_connector_day(
-            conn,
-            connector_id=connector_id,
+        bf = run_narrow_backfill(
+            wrapper_path=resolve_integrity_backfill_wrapper(),
+            env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+            env_name=env_name,
+            timeseries_ids=ts_ids,
+            connector_ids=[connector_id],
             day=day_obj,
+            log=log,
+            log_dir=backfill_log_dir,
+            log_label=f"v2_obs_day_{day_iso}_connector_{connector_id}",
+            output_scope="observations_only",
+            history_version="v2",
         )
-        if source_cache_status.get("status") not in {"ok", "not_checked"}:
-            for gap in gaps_by_key.get((day_iso, connector_id), []):
-                _set_v2_source_repair_plan(gap, status="skipped", command=None, source_cache_status=source_cache_status)
-            skip_entry = {
-                "day_utc": day_iso,
-                "connector_id": connector_id,
-                "status": source_cache_status.get("status"),
-                "reason": source_cache_status.get("reason"),
-                "source_cache": source_cache_status,
-            }
-            metrics["skipped_v2_observation_repairs"].append(skip_entry)
-            if source_cache_status.get("status") == "unavailable":
-                metrics["v2_observation_repairs_source_unavailable"] += 1
-            else:
-                metrics["v2_observation_repairs_source_download_failed"] += 1
-            log.warning(
-                "v2 observation repair skipped day=%s connector_id=%s source_status=%s reason=%s",
-                day_iso,
-                connector_id,
-                source_cache_status.get("status"),
-                source_cache_status.get("reason"),
-            )
-            continue
-        metrics["planned_v2_observation_repairs"].extend(planned_cmds)
-        metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
-        for gap in gaps_by_key.get((day_iso, connector_id), []):
-            _set_v2_source_repair_plan(gap, status="ready", command=first_cmd, source_cache_status=source_cache_status)
-        chunk_results: list[dict[str, Any]] = []
-        for chunk_index, chunk_ids in enumerate(chunks, start=1):
-            if limits.should_stop():
-                break
-            chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
-            if len(chunks) > 1:
-                chunk_label = f"{chunk_label}_chunk_{chunk_index:03d}_of_{len(chunks):03d}"
-            bf = run_narrow_backfill(
-                wrapper_path=resolve_integrity_backfill_wrapper(),
-                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                env_name=env_name,
-                timeseries_ids=chunk_ids,
-                connector_ids=[connector_id],
-                day=day_obj,
-                log=log,
-                log_dir=backfill_log_dir,
-                log_label=chunk_label,
-                output_scope="observations_only",
-                history_version="v2",
-            )
-            chunk_results.append(bf)
-            metrics["v2_observation_repairs_attempted"] += 1
-            metrics["observation_backfills_attempted"] += 1
-            metrics["v2_observation_index_rebuilds_attempted"] += 1
-            if bf.get("status") == "ok":
-                metrics["v2_observation_index_rebuilds_ok"] += 1
-            else:
-                metrics["v2_observation_repairs_failed"] += 1
-                metrics["observation_backfills_failed"] += 1
-                metrics["v2_observation_index_rebuilds_failed"] += 1
-                break
-        combined = _combine_backfill_results(chunk_results)
-        repair_ok = bool(chunk_results) and all((r.get("status") == "ok") for r in chunk_results)
-        repair_entry = {
-            "day_utc": day_iso,
-            "connector_id": connector_id,
-            "history_version": "v2",
-            "status": "ok" if repair_ok else "failed",
-            "wrapper_status": combined.get("status"),
-            "exit_code": combined.get("exit_code"),
-            "error": combined.get("error"),
-            "stdout_tail": combined.get("stdout_tail") or "",
-            "stderr_tail": combined.get("stderr_tail") or "",
-            "log_path": combined.get("log_path"),
-            "timeseries_id_count": len(ts_ids),
-            "chunk_count": len(chunks),
-            "attempted_chunks": len(chunk_results),
-            "ok_chunks": sum(1 for r in chunk_results if r.get("status") == "ok"),
-            "failed_chunks": sum(1 for r in chunk_results if r.get("status") != "ok"),
-            "source_cache": source_cache_status,
-            "chunks": [
-                {
-                    "chunk_index": i,
-                    "timeseries_id_count": len(chunks[i - 1]) if i - 1 < len(chunks) else None,
-                    "status": result.get("status"),
-                    "exit_code": result.get("exit_code"),
-                    "error": result.get("error"),
-                    "stdout_tail": result.get("stdout_tail") or "",
-                    "stderr_tail": result.get("stderr_tail") or "",
-                    "log_path": result.get("log_path"),
-                }
-                for i, result in enumerate(chunk_results, start=1)
-            ],
-        }
-        metrics["v2_observation_repair_results"].append(repair_entry)
-        if repair_ok:
+        metrics["v2_observation_repairs_attempted"] += 1
+        metrics["v2_observation_index_rebuilds_attempted"] += 1
+        if bf.get("status") == "ok":
             metrics["v2_observation_repairs_ok"] += 1
-            metrics["observation_backfills_ok"] += 1
-            action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=ts_ids, queue_note="queued_from_v2_observation_repair", log=log, history_version="v2")
+            metrics["v2_observation_index_rebuilds_ok"] += 1
+            action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=ts_ids, queue_note="queued_from_v2_observation_repair", log=log)
             if action in {"inserted", "merged"}:
                 queued.add((day_iso, connector_id))
-            metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
-            metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
         else:
-            log.warning(
-                "v2 observation repair failed day=%s connector_id=%s attempted_chunks=%s failed_chunks=%s exit_code=%s error=%s",
-                day_iso,
-                connector_id,
-                repair_entry["attempted_chunks"],
-                repair_entry["failed_chunks"],
-                repair_entry["exit_code"],
-                repair_entry["error"],
-            )
+            metrics["v2_observation_repairs_failed"] += 1
+            metrics["v2_observation_index_rebuilds_failed"] += 1
     metrics["aqi_rebuilds_queued_from_obs_repair"] = len(queued)
     return metrics
 
@@ -7745,7 +7156,7 @@ def run_aqi_rebuild_queue_execution(
         (run_id,),
     ).fetchall()
 
-    by_key: dict[tuple[str, int | None], list[tuple[Any, ...]]] = {}
+    by_day: dict[str, list[tuple[Any, ...]]] = {}
     for row in queue_rows:
         row_id, connector_id, day_utc, *_ = row
         day_iso = str(day_utc or "").strip()
@@ -7761,12 +7172,11 @@ def run_aqi_rebuild_queue_execution(
         if parsed_connector_id <= 0:
             metrics["aqi_rebuilds_skipped"] += 1
             continue
-        connector_scope = parsed_connector_id if history_version == "v2" else None
-        by_key.setdefault((day_iso, connector_scope), []).append(row)
+        by_day.setdefault(day_iso, []).append(row)
 
-    metrics["aqi_rebuilds_queued_total"] = len(by_key)
+    metrics["aqi_rebuilds_queued_total"] = len(by_day)
     if dry_run and metrics["aqi_rebuilds_queued_total"] == 0 and dry_run_planned_rows:
-        seed_by_key: dict[tuple[str, int | None], dict[str, Any]] = {}
+        seed_by_day: dict[str, dict[str, Any]] = {}
         for row in dry_run_planned_rows:
             day_iso = str(row.get("day_utc") or "").strip()
             if not day_iso:
@@ -7777,17 +7187,14 @@ def run_aqi_rebuild_queue_execution(
                 continue
             if connector_id <= 0:
                 continue
-            connector_scope = connector_id if history_version == "v2" else None
-            seed_key = (day_iso, connector_scope)
-            current = seed_by_key.get(seed_key)
+            current = seed_by_day.get(day_iso)
             row_reasons = _parse_reason_tokens(",".join(str(v) for v in (row.get("reasons") or [])))
             if not row_reasons and row.get("reason"):
                 row_reasons = _parse_reason_tokens(str(row.get("reason")))
             if current is None:
-                seed_by_key[seed_key] = {
+                seed_by_day[day_iso] = {
                     "day_utc": day_iso,
                     "connector_ids": [connector_id],
-                    "connector_scope": connector_scope,
                     "reasons": sorted(row_reasons),
                 }
                 continue
@@ -7797,19 +7204,18 @@ def run_aqi_rebuild_queue_execution(
             if connector_id not in current["connector_ids"]:
                 current["connector_ids"].append(connector_id)
 
-        for (day_iso, connector_scope), seed in sorted(seed_by_key.items(), key=lambda item: (item[0][0], int(item[0][1] or 0))):
+        for day_iso, seed in sorted(seed_by_day.items(), key=lambda item: item[0]):
             connector_ids = sorted(int(v) for v in seed.get("connector_ids") or [])
             planned_cmd = _planned_aqi_rebuild_command(
                 env,
-                connector_scope,
+                None,
                 dt.date.fromisoformat(day_iso),
                 history_version=history_version,
-                env_name=env_name,
             )
             metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
             metrics["aqi_rebuild_results"].append({
                 "queue_row_ids": [],
-                "connector_id": connector_scope,
+                "connector_id": None,
                 "connector_ids": connector_ids,
                 "day_utc": day_iso,
                 "reasons": seed.get("reasons") or [],
@@ -7818,18 +7224,18 @@ def run_aqi_rebuild_queue_execution(
                 "error": None,
                 "log_path": None,
             })
-        metrics["aqi_rebuilds_queued_total"] = len(seed_by_key)
+        metrics["aqi_rebuilds_queued_total"] = len(seed_by_day)
         metrics["aqi_rebuild_ran"] = True
         return metrics
 
-    if not by_key:
+    if not by_day:
         metrics["aqi_rebuild_ran"] = True
         return metrics
 
     backfill_log_dir = (
         Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     )
-    for (day_iso, connector_scope), rows_for_key in sorted(by_key.items(), key=lambda item: (item[0][0], int(item[0][1] or 0))):
+    for day_iso, rows_for_key in sorted(by_day.items(), key=lambda item: item[0]):
         day_obj = dt.date.fromisoformat(day_iso)
         merged_reasons: set[str] = set()
         connector_ids: set[int] = set()
@@ -7847,13 +7253,7 @@ def run_aqi_rebuild_queue_execution(
         duplicate_rows = rows_for_key[1:]
         row_ids = [int(row[0]) for row in rows_for_key if row[0] is not None]
 
-        planned_cmd = _planned_aqi_rebuild_command(
-            env,
-            connector_scope,
-            day_obj,
-            history_version=history_version,
-            env_name=env_name,
-        )
+        planned_cmd = _planned_aqi_rebuild_command(env, None, day_obj, history_version=history_version)
         metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
 
         if duplicate_rows:
@@ -7881,7 +7281,7 @@ def run_aqi_rebuild_queue_execution(
         if dry_run:
             metrics["aqi_rebuild_results"].append({
                 "queue_row_ids": row_ids,
-                "connector_id": connector_scope,
+                "connector_id": None,
                 "connector_ids": connector_ids_sorted,
                 "day_utc": day_iso,
                 "reasons": reasons_sorted,
@@ -7896,7 +7296,7 @@ def run_aqi_rebuild_queue_execution(
             metrics["aqi_rebuilds_skipped"] += 1
             metrics["aqi_rebuild_results"].append({
                 "queue_row_ids": row_ids,
-                "connector_id": connector_scope,
+                "connector_id": None,
                 "connector_ids": connector_ids_sorted,
                 "day_utc": day_iso,
                 "reasons": reasons_sorted,
@@ -7929,15 +7329,11 @@ def run_aqi_rebuild_queue_execution(
             wrapper_path=resolve_integrity_backfill_wrapper(),
             env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
             env_name=env_name,
-            connector_id=connector_scope,
+            connector_id=None,
             day=day_obj,
             log=log,
             log_dir=backfill_log_dir,
-            log_label=(
-                f"aqi_day_{day_iso}_connector_{connector_scope}"
-                if connector_scope is not None
-                else f"aqi_day_{day_iso}_all_connectors"
-            ),
+            log_label=f"aqi_day_{day_iso}_all_connectors",
             history_version=history_version,
         )
         metrics["aqi_rebuilds_attempted"] += 1
@@ -7983,7 +7379,7 @@ def run_aqi_rebuild_queue_execution(
 
         metrics["aqi_rebuild_results"].append({
             "queue_row_ids": row_ids,
-            "connector_id": connector_scope,
+            "connector_id": None,
             "connector_ids": connector_ids_sorted,
             "day_utc": day_iso,
             "reasons": reasons_sorted,
@@ -9602,45 +8998,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.extend(["```bash", cmd, "```"])
             if len(cc_planned) > 20:
                 lines.append(f"... {len(cc_planned) - 20} more")
-        skipped_v2_repairs = cc.get("skipped_v2_observation_repairs") or []
-        if skipped_v2_repairs:
-            lines.extend(["", "### Skipped v2 observation repairs", ""])
-            for entry in skipped_v2_repairs[:50]:
-                lines.append(
-                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
-                    f"status={entry.get('status')} reason={entry.get('reason')}"
-                )
-            if len(skipped_v2_repairs) > 50:
-                lines.append(f"- ... {len(skipped_v2_repairs) - 50} more")
-        v2_repair_results = cc.get("v2_observation_repair_results") or []
-        if v2_repair_results:
-            lines.extend(["", "### V2 observation repair results", ""])
-            for entry in v2_repair_results[:25]:
-                source_cache = entry.get("source_cache") or {}
-                lines.append(
-                    f"- connector={entry.get('connector_id')} day={entry.get('day_utc')} "
-                    f"status={entry.get('status')} wrapper_status={entry.get('wrapper_status')} "
-                    f"source_cache={source_cache.get('status') or '(unknown)'} "
-                    f"chunks={entry.get('attempted_chunks')}/{entry.get('chunk_count')} "
-                    f"failed_chunks={entry.get('failed_chunks')} exit_code={entry.get('exit_code')} "
-                    f"log={entry.get('log_path') or '(none)'}"
-                )
-                if entry.get("error"):
-                    lines.append(f"  - error: {entry.get('error')}")
-                if entry.get("status") != "ok":
-                    lines.append("  - AQI rebuild was not queued because the observation repair did not complete successfully.")
-                stdout_tail = _tail_lines(str(entry.get("stdout_tail") or ""), 80)
-                if stdout_tail:
-                    lines.extend(["", "  stdout tail:", "  ```text"])
-                    lines.extend(f"  {line}" for line in stdout_tail.splitlines())
-                    lines.append("  ```")
-                stderr_tail = _tail_lines(str(entry.get("stderr_tail") or ""), 80)
-                if stderr_tail:
-                    lines.extend(["", "  stderr tail:", "  ```text"])
-                    lines.extend(f"  {line}" for line in stderr_tail.splitlines())
-                    lines.append("  ```")
-            if len(v2_repair_results) > 25:
-                lines.append(f"- ... {len(v2_repair_results) - 25} more")
         planned_aqi = cc.get("planned_aqi_rebuilds") or []
         if planned_aqi:
             lines.extend(["", "### Planned AQI rebuild queue entries from cross-check", ""])
@@ -9909,7 +9266,6 @@ def main(argv: list[str]) -> int:
             v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
             log.info("v2 source scope: %s", v2_source_scope)
         sos_counts = lookup_source_counts.get("uk_air_sos", {})
-        source_adapter_history_version = adapter_backfill_history_version(history_version_mode)
         log.info(
             "lookup active counts: openaq stations=%s timeseries=%s; sensorcommunity stations=%s timeseries=%s; uk_air_sos stations=%s timeseries=%s",
             (lookup_source_counts.get("openaq") or {}).get("active_stations", 0),
@@ -9933,7 +9289,6 @@ def main(argv: list[str]) -> int:
                 dry_run=args.dry_run, run_backfill=args.run_backfill,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
-                history_version=source_adapter_history_version,
             )
 
         run_sc = args.source in {"sensorcommunity", "all"} and snapshot_ok
@@ -9949,7 +9304,6 @@ def main(argv: list[str]) -> int:
                 dry_run=args.dry_run, run_backfill=args.run_backfill,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
-                history_version=source_adapter_history_version,
             )
 
         run_sos = args.source in {"uk_air_sos", "all"} and snapshot_ok
@@ -9965,7 +9319,6 @@ def main(argv: list[str]) -> int:
                 dry_run=args.dry_run, run_backfill=args.run_backfill,
                 limits=limits, log=log,
                 concurrency=max(1, int(args.concurrency)),
-                history_version=source_adapter_history_version,
             )
 
         if args.skip_cross_check:

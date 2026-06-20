@@ -191,41 +191,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
         self.assertFalse(any(g.get("connector_id") == 1 for g in result["debug"]["gaps"]))
         self.assertEqual(result["source_scope"]["connector_ids"], [6])
 
-    def test_source_scoped_missing_aqi_day_dir_emits_connector_specific_gap(self) -> None:
-        day = "2026-06-08"
-        latest_path = self.root / "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
-        latest_path.write_text(json.dumps({"latest": day}), encoding="utf-8")
-
-        result = MODULE.run_v2_aqilevels_integrity_checks(
-            r2_history_root=self.root, config=self.config, from_day=day, to_day=day,
-            allowed_connector_ids={6},
-            source_scope={"source": "openaq", "connector_ids": [6], "scope": "source"},
-        )
-
-        gaps = [g for g in result["gaps"] if g["gap_type"] == "day_dir_missing"]
-        self.assertEqual(len(gaps), 1)
-        self.assertEqual(gaps[0]["connector_id"], 6)
-        self.assertTrue(gaps[0]["expected_path"].endswith(f"day_utc={day}/connector_id=6"))
-
-    def test_source_scoped_missing_aqi_connector_dir_emits_connector_specific_gap(self) -> None:
-        day = "2026-06-08"
-        latest_path = self.root / "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
-        latest_path.write_text(json.dumps({"latest": day}), encoding="utf-8")
-        (self.root / f"history/v2/aqilevels/hourly/data/day_utc={day}").mkdir(parents=True, exist_ok=True)
-
-        result = MODULE.run_v2_aqilevels_integrity_checks(
-            r2_history_root=self.root, config=self.config, from_day=day, to_day=day,
-            allowed_connector_ids={6},
-            source_scope={"source": "openaq", "connector_ids": [6], "scope": "source"},
-        )
-
-        gaps = [g for g in result["gaps"] if g["gap_type"] == "connector_dir_missing"]
-        self.assertEqual(len(gaps), 1)
-        self.assertEqual(gaps[0]["connector_id"], 6)
-        self.assertTrue(gaps[0]["expected_path"].endswith(f"day_utc={day}/connector_id=6"))
-
 
 if __name__ == "__main__":
     unittest.main()
