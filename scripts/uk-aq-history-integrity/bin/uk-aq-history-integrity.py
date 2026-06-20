@@ -12,11 +12,10 @@ Sensor.Community adapter, real backfill invocation, and API adapters land
 in Phases 5/4/7.
 """
 
-from __future__ import annotations
-
 import argparse
 import concurrent.futures
 import datetime as dt
+from dataclasses import dataclass
 import gzip
 import hashlib
 import http.client
@@ -38,7 +37,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Literal
 
 
 REQUIRED_ENV_VARS = (
@@ -243,7 +242,7 @@ CREATE TABLE IF NOT EXISTS cross_checks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id INTEGER NOT NULL,
   env_name TEXT NOT NULL,
-  history_version TEXT NOT NULL DEFAULT 'v1',
+  history_version TEXT,
   connector_id INTEGER NOT NULL,
   day_utc TEXT NOT NULL,
   timeseries_id INTEGER NOT NULL,
@@ -264,7 +263,7 @@ CREATE TABLE IF NOT EXISTS aqi_rebuild_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id INTEGER NOT NULL,
   env_name TEXT NOT NULL,
-  history_version TEXT NOT NULL DEFAULT 'v1',
+  history_version TEXT,
   domain TEXT,
   profile TEXT,
   pollutant_code TEXT,
@@ -4710,33 +4709,19 @@ HISTORY_VERSION_CHOICES = ("v1", "v2", "both")
 LAST_BACKFILL_ENV_LOAD_RESULT: dict[str, Any] = {}
 
 
+@dataclass(frozen=True)
 class HistoryPathConfig:
-    def __init__(
-        self,
-        *,
-        history_version: str,
-        observations_data_prefix: str,
-        aqilevels_hourly_data_prefix: str,
-        aqilevels_hourly_debug_prefix: str | None,
-        observations_timeseries_index_prefix: str,
-        aqilevels_timeseries_index_prefix: str,
-        observations_latest_index_key: str,
-        aqilevels_latest_index_key: str,
-        observations_partition_levels: tuple[str, ...],
-        aqilevels_partition_levels: tuple[str, ...],
-        checks_implemented: bool,
-    ) -> None:
-        self.history_version = history_version
-        self.observations_data_prefix = observations_data_prefix
-        self.aqilevels_hourly_data_prefix = aqilevels_hourly_data_prefix
-        self.aqilevels_hourly_debug_prefix = aqilevels_hourly_debug_prefix
-        self.observations_timeseries_index_prefix = observations_timeseries_index_prefix
-        self.aqilevels_timeseries_index_prefix = aqilevels_timeseries_index_prefix
-        self.observations_latest_index_key = observations_latest_index_key
-        self.aqilevels_latest_index_key = aqilevels_latest_index_key
-        self.observations_partition_levels = observations_partition_levels
-        self.aqilevels_partition_levels = aqilevels_partition_levels
-        self.checks_implemented = checks_implemented
+    history_version: Literal["v1", "v2"]
+    observations_data_prefix: str
+    aqilevels_hourly_data_prefix: str
+    aqilevels_hourly_debug_prefix: str | None
+    observations_timeseries_index_prefix: str
+    aqilevels_timeseries_index_prefix: str
+    observations_latest_index_key: str
+    aqilevels_latest_index_key: str
+    observations_partition_levels: tuple[str, ...]
+    aqilevels_partition_levels: tuple[str, ...]
+    checks_implemented: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -4752,7 +4737,6 @@ class HistoryPathConfig:
             "aqilevels_partition_levels": list(self.aqilevels_partition_levels),
             "checks_implemented": self.checks_implemented,
         }
-
 
 def _normalize_history_prefix(value: str | None, default: str) -> str:
     raw = str(value if value is not None else default).strip().strip("/")
@@ -7603,10 +7587,10 @@ def open_db(db_path: str) -> sqlite3.Connection:
         "bytes_read": "INTEGER DEFAULT 0",
     })
     ensure_columns(conn, "cross_checks", {
-        "history_version": "TEXT NOT NULL DEFAULT 'v1'",
+        "history_version": "TEXT",
     })
     ensure_columns(conn, "aqi_rebuild_queue", {
-        "history_version": "TEXT NOT NULL DEFAULT 'v1'",
+        "history_version": "TEXT",
         "domain": "TEXT",
         "profile": "TEXT",
         "pollutant_code": "TEXT",
@@ -7981,8 +7965,34 @@ def format_summary_md(s: dict[str, Any]) -> str:
 
     cc = s.get("cross_check") or {}
     if cc.get("ran") or cc.get("skipped_reason"):
+        checked_versions = list(s.get("checked_versions") or [])
+        if checked_versions:
+            for version in checked_versions:
+                config = (s.get("history_path_configs") or {}).get(version) or {}
+                heading = (
+                    f"## R2 Cross-check — history_version={version}"
+                    if len(checked_versions) == 1
+                    else f"## R2 Cross-check — {version}"
+                )
+                lines.extend([
+                    heading,
+                    "",
+                    f"- History version: {version}",
+                    f"- Observations prefix: {config.get('observations_data_prefix')}",
+                    f"- Observations index prefix: {config.get('observations_timeseries_index_prefix')}",
+                ])
+                if version == "v2" and not config.get("checks_implemented", True):
+                    lines.append("- Deep v2 checks: not implemented in Phase 1")
+                lines.append("")
+            if s.get("history_version_mode") == "both":
+                lines.extend([
+                    "## v1/v2 comparison",
+                    "",
+                    "- Full comparison: not implemented in Phase 1",
+                    "",
+                ])
         lines.extend([
-            "## R2 Cross-check",
+            "## R2 Cross-check metrics",
             "",
             f"- Ran:                      {bool(cc.get('ran'))}",
             f"- Source rows:              {cc.get('source_rows', 0)}",

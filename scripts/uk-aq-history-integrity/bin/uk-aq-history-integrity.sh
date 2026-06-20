@@ -36,8 +36,8 @@ Forwarded options:
                                            Source filter (includes uk_air_sos station/day source checks).
   --from-day YYYY-MM-DD                   Manual lower bound.
   --to-day YYYY-MM-DD                     Manual upper bound.
-  --history-version v1|v2|both            R2 history layout version to check
-                                           (default: v1 unless env override).
+  --history-version v1|v2|both            R2 history layout version to check.
+                                           Forwarded to Python; default is v1 unless env override.
   --dry-run                               Plan only; no remote calls.
   --check-only                            Detect changes; do not backfill.
   --run-backfill                          Trigger backfill on confirmed changes.

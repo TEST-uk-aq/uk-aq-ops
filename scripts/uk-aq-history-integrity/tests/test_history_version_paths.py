@@ -110,6 +110,60 @@ class HistoryVersionPathTests(unittest.TestCase):
             self.assertIn("pollutant_code", queue_columns)
             self.assertIn("source_observations_version", queue_columns)
 
+    def test_invalid_history_version_rejects(self) -> None:
+        with self.assertRaises(ValueError):
+            MODULE.expand_history_versions("v3")
+        with self.assertRaises(ValueError):
+            MODULE.resolve_history_version_mode(Namespace(history_version="latest"))
+
+    def test_report_metadata_includes_checked_versions_and_v2_not_healthy(self) -> None:
+        summary = {
+            "env": "CIC-Test",
+            "profile": "manual",
+            "started_at_utc": "2026-06-20T00:00:00Z",
+            "finished_at_utc": "2026-06-20T00:01:00Z",
+            "status": "ok",
+            "source": "all",
+            "from_day": "2026-06-11",
+            "to_day": "2026-06-11",
+            "dry_run": False,
+            "check_only": True,
+            "run_backfill": False,
+            "db_path": ":memory:",
+            "log_path": "test.log",
+            "history_integrity_schema_version": 2,
+            "history_version_mode": "both",
+            "checked_versions": ["v1", "v2"],
+            "site_read_version": "v2",
+            "history_path_configs": MODULE.serialize_history_path_configs(
+                MODULE.resolve_history_path_configs("both", {})
+            ),
+            "cross_check": {
+                "ran": True,
+                "cross_checks_total": 0,
+                "additional_history_versions": {
+                    "v2": {"status": "not_implemented_phase1"},
+                },
+            },
+        }
+        markdown = MODULE.format_summary_md(summary)
+        self.assertIn("## R2 Cross-check — v1", markdown)
+        self.assertIn("## R2 Cross-check — v2", markdown)
+        self.assertIn("Deep v2 checks: not implemented in Phase 1", markdown)
+        self.assertIn("## v1/v2 comparison", markdown)
+        self.assertIn("Full comparison: not implemented in Phase 1", markdown)
+
+    def test_existing_v1_path_env_behavior_is_preserved(self) -> None:
+        env = {
+            "UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX": "custom/v1/observations",
+            "UK_AQ_R2_HISTORY_AQILEVELS_PREFIX": "custom/v1/aqilevels/hourly",
+            "UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX": "custom/_index/observations_timeseries",
+        }
+        config = MODULE.resolve_history_path_config("v1", env)
+        self.assertEqual(config.observations_data_prefix, "custom/v1/observations")
+        self.assertEqual(config.aqilevels_hourly_data_prefix, "custom/v1/aqilevels/hourly")
+        self.assertEqual(config.observations_timeseries_index_prefix, "custom/_index/observations_timeseries")
+
 
 if __name__ == "__main__":
     unittest.main()

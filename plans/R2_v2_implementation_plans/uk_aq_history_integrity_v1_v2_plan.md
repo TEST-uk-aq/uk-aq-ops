@@ -329,9 +329,6 @@ For each selected `day_utc`, connector, and pollutant, check both the source par
 
 ```text
 history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json
-For each selected `day_utc`, connector, and pollutant:
-
-```text
 history/v2/aqilevels/hourly/data/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/part-00000.parquet
 history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/manifest.json
 history/_index_v2/aqilevels_hourly_data_timeseries_latest.json
@@ -339,32 +336,33 @@ history/_index_v2/aqilevels_hourly_data_timeseries_latest.json
 
 ### v2 AQI debug check paths
 
-Debug partitions, when generated, are expected to look like:
+Debug partitions are optional in Phase 1. If future debug generation is confirmed and debug checks are explicitly enabled, expected debug source paths are:
 
 ```text
 history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/
   manifest.json
   part-00000.parquet
-Debug should be optional and reported separately:
-
-```text
-history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/part-00000.parquet
 ```
+
+Do not check debug indexes until debug index generation is confirmed.
 
 Recommended policy:
 
 - Missing AQI hourly data = error.
 - Missing AQI hourly data index = error.
-- Missing AQI hourly debug = warning by default.
-- Missing AQI hourly debug index = warning by default.
-- Do not fail overall v2 AQI integrity solely because debug is missing unless the writer explicitly guarantees it and strict mode is enabled.
-- Add explicit strictness env: `UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true`.
-- Report debug coverage as `optional_debug_missing` unless strict mode is enabled.
-- Default: do not fail overall v2 AQI integrity solely because debug is missing.
-- Add explicit flag/env:
-  - `--include-aqi-debug`
+- Debug checks are off by default in Phase 1.
+- Future flags:
+  - `--check-aqi-debug`
+  - `--require-aqi-debug`
+- Future envs:
   - `UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG=true|false`
-- Report debug coverage as `optional_debug_missing` unless explicitly required.
+  - `UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true|false`
+- Defaults:
+  - check debug: `false`
+  - require debug: `false`
+- Missing debug must not fail integrity unless explicitly required.
+- Do not check debug indexes until debug index generation is confirmed.
+- Report debug coverage as `optional_debug_missing` only when debug checks are explicitly enabled.
 
 ## 6. Recommended version-selection model
 
@@ -528,27 +526,20 @@ scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py \
 
 The integrity tooling must load `UK_AQ_BACKFILL_ENV_FILE` when it is set and then use the existing shared `UK_AQ_R2_HISTORY_*` variables from that file. This keeps integrity aligned with the same path/version contract used by backfill, prune, and API tooling.
 
-Use these existing shared env names first:
+Use these existing shared env names first for version context:
 
 ```text
 UK_AQ_R2_HISTORY_READ_VERSION
 UK_AQ_R2_HISTORY_WRITE_VERSION
-### 7.3 Prefix overrides
-
-Support version-specific env overrides:
-
-```text
-UK_AQ_R2_HISTORY_INTEGRITY_V1_OBSERVATIONS_PREFIX
-UK_AQ_R2_HISTORY_INTEGRITY_V1_AQILEVELS_HOURLY_PREFIX
-UK_AQ_R2_HISTORY_INTEGRITY_V1_INDEX_PREFIX
-
-UK_AQ_R2_HISTORY_INTEGRITY_V2_OBSERVATIONS_PREFIX
-UK_AQ_R2_HISTORY_INTEGRITY_V2_AQILEVELS_HOURLY_DATA_PREFIX
-UK_AQ_R2_HISTORY_INTEGRITY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX
-UK_AQ_R2_HISTORY_INTEGRITY_V2_INDEX_PREFIX
 ```
 
-But prefer reusing existing shared env names where possible:
+`UK_AQ_R2_HISTORY_READ_VERSION` is report context only (`site_read_version`) and must not silently become the integrity default selector.
+
+### 7.4 Prefix overrides
+
+Integrity should normally use the shared `UK_AQ_R2_HISTORY_*` variables loaded from the normal environment and from `UK_AQ_BACKFILL_ENV_FILE` when it is set. Do not introduce separate integrity-specific v2 path variables for normal use.
+
+Use these existing shared env names first:
 
 ```text
 UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX
@@ -561,17 +552,15 @@ UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX
 UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
 ```
 
-Do not invent separate v2 integrity path variables unless they are optional explicit overrides. Integrity-specific env should be limited to behavior such as:
+Integrity-specific env should be limited to selector/strictness behavior such as:
 
 ```text
 UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v1|v2|both
+UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG=true|false
 UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG=true|false
 ```
 
-The index builder already uses the shared v2 path names.
-```
-
-The index builder already uses these names.
+If future integrity-specific prefix overrides are retained, they must be documented as diagnostic/emergency overrides only, not normal configuration.
 
 ## 8. Recommended report schema changes
 
@@ -757,8 +746,11 @@ Scope:
 
 - Generate repair plans only; keep execution separate/opt-in.
 - Add suggested repair kind and commands.
+- Phase 1 must not execute repairs.
 - Do not execute repair commands unless an explicit future flag is added.
+- Do not invent Supabase-to-v2 repair commands; when Supabase is the source, say the exact command requires confirmation.
 - Prefer the existing v1-to-v2 observations builder when v1 Dropbox source exists: `scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs`.
+- The exact `_index_v2` rebuild command remains unresolved and must not be invented.
 
 Example v1-to-v2 observations repair command for 2026-06-11:
 
@@ -852,12 +844,12 @@ summary["checked_versions"] = checked_versions
 summary["history_path_configs"] = { ... }
 ```
 
-Add persistent schema planning before any v2 findings or repair queues are written:
+Add nullable persistent schema fields in Phase 1 even though v2 checks remain report-only:
 
-- Add `history_version` to `cross_checks` or create versioned successor tables before v2 cross-check rows are persisted.
-- Add `history_version` and domain/profile fields to `aqi_rebuild_queue` before v2 AQI rebuild rows are queued.
+- Add nullable `history_version` to `cross_checks` or create versioned successor tables before v2 cross-check rows are persisted.
+- Add nullable `history_version`, `domain`, `profile`, and `pollutant_code` fields to `aqi_rebuild_queue` before v2 AQI rebuild rows are queued.
 - Ensure any future gap/finding/repair tables include `history_version`, `domain`, `profile`, `day_utc`, `connector_id`, and `pollutant_code` where applicable.
-- Keep phase 1 report-only if schema migration is intentionally deferred, but do not enable v2 queueing without persistent version fields.
+- Add nullable fields or versioned successor-table support before any v2 findings, queues, or repairs are enabled.
 
 #### Phase 2 changes
 
@@ -1167,21 +1159,8 @@ For phases 2-5:
 
 1. Which existing backfill/prune commands definitively support targeted v2 writes with `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, and what exact env/flag combination should be suggested when Supabase is the source?
 2. Which process should rebuild `_index_v2` after repair in the safest targeted way, and what exact command should integrity include in repair plans?
-3. Should phase 1 add nullable `history_version` columns immediately, or should persistent schema migration wait until phase 2/4 when v2 findings and queues are actively written?
-4. What is the source of truth for verifying local Dropbox backup inventory completeness for v2: inventory JSON, rclone listing, or path existence plus manifest validation?
-5. Are v2 AQI debug indexes generated today, or should the plan only check debug source partitions until index behavior is confirmed?
-## 13. Open questions before implementation
-
-1. What exact schema do v2 observation pollutant manifests use? Do they include `timeseries_row_counts`, `source_row_count`, `total_rows`, and parquet object references?
-2. Do v2 observations always write a `manifest.json` per `pollutant_code`, or can data exist with only parquet files?
-3. Do v2 AQI hourly data partitions have manifests, or only parquet files plus `_index_v2` manifests?
-4. Is `history/v2/aqilevels/hourly/debug` expected for every data partition, or only for diagnostics/failures?
-5. Which runtime env var reflects the test site’s active read version: `UK_AQ_R2_HISTORY_READ_VERSION`, dashboard worker env, or another config?
-6. Is there already a v1-to-v2 observations converter/backfill command, or should Phase 4 only suggest “run prune daily/backfill with v2 write vars”?
-7. Should the main integrity runner’s default switch from `v1` to site read version after v2 stabilizes?
-8. Does the integrity SQLite schema need persistent `history_version` columns on `cross_checks` and AQI queue tables, or is report-only enough in phase 1?
-9. Should AQI rebuild queue rows include `history_version` to avoid queuing v1 repairs from a v2 integrity run?
-10. Are there existing Dropbox backup layouts for v2 that mirror R2 exactly, or is local backup currently v1-only/incomplete?
+3. What is the source of truth for verifying local Dropbox backup inventory completeness for v2: inventory JSON, rclone listing, or path existence plus manifest validation?
+4. Are v2 AQI debug indexes generated today, or should the plan only check debug source partitions until index behavior is confirmed?
 
 ## 14. Suggested Codex implementation prompt for phase 1
 
