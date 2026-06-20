@@ -5048,6 +5048,254 @@ def run_v2_observations_integrity_checks(
     return result
 
 
+
+def _v2_aqi_gap(
+    gap_type: str,
+    *,
+    profile: str = "data",
+    day_utc: str | None = None,
+    connector_id: int | str | None = None,
+    pollutant_code: str | None = None,
+    expected_path: str | None = None,
+    related_paths: list[str] | None = None,
+    severity: str = "error",
+) -> dict[str, Any]:
+    cid: int | str | None = connector_id
+    if cid is not None:
+        try:
+            cid = int(str(cid))
+        except (TypeError, ValueError):
+            cid = connector_id
+    return {
+        "history_version": "v2",
+        "domain": "aqilevels",
+        "grain": "hourly",
+        "profile": profile,
+        "severity": severity,
+        "gap_type": gap_type,
+        "day_utc": day_utc,
+        "connector_id": cid,
+        "pollutant_code": pollutant_code,
+        "expected_path": expected_path,
+        "related_paths": list(related_paths or []),
+        "source_evidence": {
+            "v2_observations_present": None,
+            "v1_aqi_present": None,
+            "source_counts_present": None,
+            "db_dump_present": None,
+        },
+        "suggested_repair": {
+            "kind": "v2_aqi_hourly_rebuild_from_v2_observations",
+            "requires_index_rebuild": True,
+            "commands": [],
+            "notes": "AQI rebuild and _index_v2 rebuild commands require confirmation; no repair is executed by this checker.",
+        },
+    }
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _load_json_file(path: Path) -> tuple[Any | None, str | None]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    except OSError:
+        return None, "unreadable"
+
+
+def _validate_v2_aqi_manifest(
+    *,
+    payload: Any,
+    profile: str,
+    day_utc: str,
+    connector_id: str,
+    pollutant_code: str,
+) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["manifest_not_object"]
+    bad: list[str] = []
+    expected = {
+        "history_version": "v2",
+        "domain": "aqilevels",
+        "grain": "hourly",
+        "profile": profile,
+        "day_utc": day_utc,
+        "connector_id": str(connector_id),
+        "pollutant_code": pollutant_code,
+    }
+    for key, want in expected.items():
+        if key in payload and str(payload.get(key)) != want:
+            bad.append(key)
+    return bad
+
+
+def run_v2_aqilevels_integrity_checks(
+    *,
+    r2_history_root: str | Path | None,
+    config: HistoryPathConfig,
+    from_day: str | None,
+    to_day: str | None,
+    check_aqi_debug: bool = False,
+    require_aqi_debug: bool = False,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
+    if not r2_history_root:
+        raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
+    root = Path(r2_history_root)
+    if not root.is_dir():
+        raise RuntimeError(f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {root}")
+    if not from_day or not to_day:
+        raise RuntimeError("v2 AQI integrity requires a selected from/to day range")
+
+    data_gaps: list[dict[str, Any]] = []
+    debug_gaps: list[dict[str, Any]] = []
+    checked = 0
+    debug_checked = 0
+    data_prefix = config.aqilevels_hourly_data_prefix.strip("/")
+    debug_prefix = (config.aqilevels_hourly_debug_prefix or "").strip("/")
+    index_prefix = config.aqilevels_timeseries_index_prefix.strip("/")
+    latest_key = config.aqilevels_latest_index_key.strip("/")
+
+    latest_path = root / latest_key
+    if not latest_path.is_file():
+        data_gaps.append(_v2_aqi_gap("latest_index_missing", expected_path=latest_key))
+    else:
+        payload, err = _load_json_file(latest_path)
+        if err:
+            data_gaps.append(_v2_aqi_gap("latest_index_invalid_json", expected_path=latest_key))
+        elif not isinstance(payload, dict):
+            data_gaps.append(_v2_aqi_gap("latest_index_stale_or_incomplete", expected_path=latest_key, related_paths=["latest index is not an object"]))
+
+    expected_parts: list[tuple[str, str, str]] = []
+    for day in _date_range_inclusive(from_day, to_day):
+        day_utc = day.isoformat()
+        day_rel = f"{data_prefix}/day_utc={day_utc}"
+        day_dir = root / day_rel
+        if not day_dir.is_dir():
+            data_gaps.append(_v2_aqi_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
+            continue
+        connector_dirs = sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir())
+        if not connector_dirs:
+            data_gaps.append(_v2_aqi_gap("connector_dir_missing", day_utc=day_utc, expected_path=f"{day_rel}/connector_id=*"))
+            continue
+        for connector_dir in connector_dirs:
+            connector_raw = connector_dir.name.split("=", 1)[1]
+            pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
+            if not pollutant_dirs:
+                data_gaps.append(_v2_aqi_gap("pollutant_dir_missing", day_utc=day_utc, connector_id=connector_raw, expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*"))
+                continue
+            for pollutant_dir in pollutant_dirs:
+                pollutant = pollutant_dir.name.split("=", 1)[1]
+                expected_parts.append((day_utc, connector_raw, pollutant))
+                checked += 1
+                part_rel = f"{day_rel}/{connector_dir.name}/{pollutant_dir.name}"
+                manifest_rel = f"{part_rel}/manifest.json"
+                manifest_path = root / manifest_rel
+                local_parquets = list(pollutant_dir.glob("*.parquet"))
+                if not manifest_path.is_file():
+                    data_gaps.append(_v2_aqi_gap("data_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
+                    if local_parquets:
+                        data_gaps.append(_v2_aqi_gap("orphan_parquet_without_manifest", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
+                else:
+                    payload, err = _load_json_file(manifest_path)
+                    if err:
+                        data_gaps.append(_v2_aqi_gap("data_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                    elif isinstance(payload, dict):
+                        bad = _validate_v2_aqi_manifest(payload=payload, profile="data", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant)
+                        if bad:
+                            data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
+                        files = _manifest_files(payload)
+                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and not isinstance(payload.get("file_count"), bool) and payload.get("file_count") != len(files):
+                            data_gaps.append(_v2_aqi_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
+                        if "row_count" in payload and not _is_positive_int(payload.get("row_count")):
+                            data_gaps.append(_v2_aqi_gap("data_manifest_empty", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                        if "source_row_count" in payload and not _is_positive_int(payload.get("source_row_count")):
+                            data_gaps.append(_v2_aqi_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
+                        if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
+                            data_gaps.append(_v2_aqi_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                        for entry in files:
+                            key = entry.get("key") if isinstance(entry, dict) else None
+                            if not key:
+                                data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
+                                continue
+                            file_path = _rel_key_to_path(root, str(key))
+                            if not file_path.is_file():
+                                data_gaps.append(_v2_aqi_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                            elif file_path.stat().st_size <= 0:
+                                data_gaps.append(_v2_aqi_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                    else:
+                        data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
+                idx_path = root / idx_rel
+                if not (root / f"{index_prefix}/day_utc={day_utc}").is_dir():
+                    data_gaps.append(_v2_aqi_gap("index_day_dir_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=f"{index_prefix}/day_utc={day_utc}"))
+                elif not (root / f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}").is_dir():
+                    data_gaps.append(_v2_aqi_gap("index_connector_dir_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}"))
+                elif not (root / f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}").is_dir():
+                    data_gaps.append(_v2_aqi_gap("index_pollutant_dir_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}"))
+                elif not idx_path.is_file():
+                    data_gaps.append(_v2_aqi_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                else:
+                    idx_payload, idx_err = _load_json_file(idx_path)
+                    if idx_err:
+                        data_gaps.append(_v2_aqi_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    elif not isinstance(idx_payload, dict) or "timeseries_row_counts" not in idx_payload:
+                        data_gaps.append(_v2_aqi_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    elif not idx_payload.get("timeseries_row_counts"):
+                        data_gaps.append(_v2_aqi_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+
+    debug_status = "skipped"
+    if check_aqi_debug:
+        severity = "error" if require_aqi_debug else "warning"
+        for day_utc, connector_raw, pollutant in expected_parts:
+            debug_checked += 1
+            debug_rel = f"{debug_prefix}/day_utc={day_utc}/connector_id={connector_raw}/pollutant_code={pollutant}"
+            manifest_rel = f"{debug_rel}/manifest.json"
+            manifest_path = root / manifest_rel
+            if not manifest_path.is_file():
+                debug_gaps.append(_v2_aqi_gap("debug_manifest_missing", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                continue
+            payload, err = _load_json_file(manifest_path)
+            if err:
+                debug_gaps.append(_v2_aqi_gap("debug_manifest_invalid_json", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                continue
+            bad = _validate_v2_aqi_manifest(payload=payload, profile="debug", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant)
+            if bad:
+                debug_gaps.append(_v2_aqi_gap("debug_manifest_schema_mismatch", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
+            for entry in _manifest_files(payload):
+                key = entry.get("key") if isinstance(entry, dict) else None
+                if key and not _rel_key_to_path(root, str(key)).is_file():
+                    debug_gaps.append(_v2_aqi_gap("debug_parquet_missing", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+        if any(g.get("severity") == "error" for g in debug_gaps):
+            debug_status = "fail"
+        elif debug_gaps:
+            debug_status = "warning"
+        else:
+            debug_status = "ok"
+
+    all_gaps = data_gaps + debug_gaps
+    status = "fail" if any(g.get("severity") == "error" for g in all_gaps) else "ok"
+    result = {
+        "status": status,
+        "checked_partitions": checked,
+        "gap_count": len(data_gaps),
+        "gaps": data_gaps,
+        "debug": {
+            "checked": bool(check_aqi_debug),
+            "required": bool(require_aqi_debug),
+            "status": debug_status,
+            "checked_partitions": debug_checked,
+            "gap_count": len(debug_gaps),
+            "gaps": debug_gaps,
+        },
+    }
+    if log:
+        log.info("v2 AQI integrity done status=%s checked_partitions=%s gaps=%s debug_gaps=%s", status, checked, len(data_gaps), len(debug_gaps))
+    return result
+
 def _normalize_timeseries_row_counts(raw: Any) -> dict[int, int]:
     if not isinstance(raw, dict):
         return {}
@@ -6768,6 +7016,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             f"(default {default_history_version!r}; env UK_AQ_R2_HISTORY_INTEGRITY_VERSION)."
         ),
     )
+    p.add_argument(
+        "--check-aqi-debug",
+        action="store_true",
+        default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG"), False),
+        help="Check optional v2 AQI hourly debug partitions (default false; env UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG).",
+    )
+    p.add_argument(
+        "--require-aqi-debug",
+        action="store_true",
+        default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG"), False),
+        help="Treat missing/invalid v2 AQI hourly debug partitions as errors (default false; env UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG).",
+    )
     return p.parse_args(argv)
 
 
@@ -8157,31 +8417,41 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 hvr = (s.get("history_version_results") or {}).get(version) or {}
                 if version == "v2":
                     obs = hvr.get("observations") or (cc.get("v2_observations") or {}) or ((cc.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {})
+                    aqi = hvr.get("aqilevels") or (cc.get("v2_aqilevels") or {}) or ((cc.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {})
                     gaps = list(obs.get("gaps") or [])
+                    aqi_gaps = list(aqi.get("gaps") or []) + list((aqi.get("debug") or {}).get("gaps") or [])
+                    debug = aqi.get("debug") or {}
+                    debug_mode = "skipped" if not debug.get("checked") else ("required" if debug.get("required") else "warning-only")
                     lines.extend([
+                        f"- AQI hourly data prefix: {config.get('aqilevels_hourly_data_prefix')}",
+                        f"- AQI hourly data index prefix: {config.get('aqilevels_timeseries_index_prefix')}",
                         "- V2 observations checks: implemented",
-                        "- V2 AQI hourly checks: not implemented until Phase 3",
+                        "- V2 AQI hourly data checks: implemented",
+                        f"- AQI debug checks: {debug_mode}",
                         f"- Checked observation partitions: {obs.get('checked_partitions', 0)}",
                         f"- Observation gaps: {obs.get('gap_count', len(gaps))}",
+                        f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
+                        f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
-                    if gaps:
+                    if aqi_gaps:
                         lines.extend([
                             "",
-                            "| Severity | Gap type | Day | Connector | Pollutant | Expected path |",
-                            "| --- | --- | --- | --- | --- | --- |",
+                            "| Severity | Profile | Gap type | Day | Connector | Pollutant | Expected path |",
+                            "| --- | --- | --- | --- | --- | --- | --- |",
                         ])
-                        for gap in gaps[:25]:
+                        for gap in aqi_gaps[:25]:
                             lines.append(
                                 "| "
                                 f"{gap.get('severity') or ''} | "
+                                f"{gap.get('profile') or ''} | "
                                 f"{gap.get('gap_type') or ''} | "
                                 f"{gap.get('day_utc') or ''} | "
                                 f"{gap.get('connector_id') or ''} | "
                                 f"{gap.get('pollutant_code') or ''} | "
                                 f"{gap.get('expected_path') or ''} |"
                             )
-                        if len(gaps) > 25:
-                            lines.append(f"| info | truncated |  |  |  | {len(gaps) - 25} more gaps |")
+                        if len(aqi_gaps) > 25:
+                            lines.append(f"| info |  | truncated |  |  |  | {len(aqi_gaps) - 25} more gaps |")
                 elif version == "v2" and not config.get("checks_implemented", True):
                     lines.append("- Deep v2 checks: not implemented in Phase 1")
                 lines.append("")
@@ -8580,15 +8850,25 @@ def main(argv: list[str]) -> int:
                 to_day=to_day,
                 log=log,
             )
+            v2_aqi = run_v2_aqilevels_integrity_checks(
+                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                config=history_path_configs["v2"],
+                from_day=from_day,
+                to_day=to_day,
+                check_aqi_debug=bool(args.check_aqi_debug),
+                require_aqi_debug=bool(args.require_aqi_debug),
+                log=log,
+            )
             cross_check_metrics = {
                 "ran": True,
                 "history_version": "v2",
                 "skipped_reason": None,
                 "v2_observations": v2_obs,
-                "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0),
-                "cross_checks_ok": int(v2_obs.get("checked_partitions", 0) or 0) if v2_obs.get("status") == "ok" else 0,
-                "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0),
-                "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0),
+                "v2_aqilevels": v2_aqi,
+                "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0),
+                "cross_checks_ok": (int(v2_obs.get("checked_partitions", 0) or 0) + int(v2_aqi.get("checked_partitions", 0) or 0)) if v2_obs.get("status") == "ok" and v2_aqi.get("status") == "ok" else 0,
+                "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
+                "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
             }
         else:
             v1_config = history_path_configs["v1"]
@@ -8613,16 +8893,22 @@ def main(argv: list[str]) -> int:
                     to_day=to_day,
                     log=log,
                 )
+                v2_aqi = run_v2_aqilevels_integrity_checks(
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
+                    config=history_path_configs["v2"],
+                    from_day=from_day,
+                    to_day=to_day,
+                    check_aqi_debug=bool(args.check_aqi_debug),
+                    require_aqi_debug=bool(args.require_aqi_debug),
+                    log=log,
+                )
                 cross_check_metrics["additional_history_versions"] = {
                     "v2": {
                         "ran": True,
                         "checks_implemented": True,
-                        "status": v2_obs.get("status"),
+                        "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
                         "observations": v2_obs,
-                        "aqilevels": {
-                            "status": "not_implemented",
-                            "reason": "v2 AQI hourly data checks are Phase 3",
-                        },
+                        "aqilevels": v2_aqi,
                     }
                 }
         if cross_check_metrics.get("ran"):
@@ -8696,7 +8982,11 @@ def main(argv: list[str]) -> int:
             status = "noop"
         v2_gap_count_for_status = (
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
+            + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
+            + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
             + int(((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {}).get("gap_count", 0) or 0)
+            + int(((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {}).get("gap_count", 0) or 0)
+            + int(((((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0) if ((((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {}).get("debug") or {}).get("required")) else 0)
         )
         if v2_gap_count_for_status > 0:
             status = "fail"
@@ -8872,8 +9162,7 @@ def main(argv: list[str]) -> int:
             + _sum("backfills_failed")
             + cross_check_backfills_failed
             + aqi_rebuilds_failed
-            + int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
-            + int(((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {}).get("gap_count", 0) or 0)
+            + v2_gap_count_for_status
         )
         warnings_count_total = warnings_delta
         if openaq_metrics.get("skipped_reason"):
@@ -9065,15 +9354,17 @@ def main(argv: list[str]) -> int:
                     or (cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations")
                     or {"status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": []}
                 )
+                v2_aqi = (
+                    cross_check_metrics.get("v2_aqilevels")
+                    or (cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels")
+                    or {"status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": [], "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []}}
+                )
                 history_version_results[version] = {
                     "history_version": "v2",
                     "checks_implemented": True,
-                    "status": v2_obs.get("status", "fail"),
+                    "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
                     "observations": v2_obs,
-                    "aqilevels": {
-                        "status": "not_implemented",
-                        "reason": "v2 AQI hourly data checks are Phase 3",
-                    },
+                    "aqilevels": v2_aqi,
                 }
 
         summary: dict[str, Any] = {
