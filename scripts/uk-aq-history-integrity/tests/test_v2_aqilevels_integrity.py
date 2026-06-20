@@ -91,6 +91,20 @@ class V2AqiIntegrityTests(unittest.TestCase):
         self._write_healthy(parquet=False)
         self.assertIn("parquet_missing", self._gap_types(self._run()))
 
+    def test_aqi_manifest_rejects_parquet_key_outside_root(self) -> None:
+        self._write_healthy()
+        manifest_path = self._partition() / "manifest.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["files"] = [{"key": "../../outside.parquet"}]
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("data_manifest_schema_mismatch", self._gap_types(result))
+        gap = next(g for g in result["gaps"] if g["gap_type"] == "data_manifest_schema_mismatch")
+        self.assertTrue(any("escapes mirror root" in p for p in gap["related_paths"]))
+
     def test_orphan_aqi_parquet_without_manifest(self) -> None:
         self._write_healthy(manifest=False)
         self.assertIn("orphan_parquet_without_manifest", self._gap_types(self._run()))
