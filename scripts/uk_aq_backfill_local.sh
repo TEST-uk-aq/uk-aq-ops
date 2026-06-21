@@ -41,7 +41,7 @@ Notes:
   - This script calls the active local backfill run_job.ts in day windows (internally chunked for pacing).
   - Archive paths are retired and are never valid runner paths for active runs.
   - With UK_AQ_BACKFILL_FORCE_REPLACE=false, already-backed-up connector/day outputs are skipped.
-  - r2_history_obs_to_aqilevels reads committed R2 observations and rewrites AQI history for the selected UK_AQ_R2_HISTORY_WRITE_VERSION (v1 or v2).
+  - r2_history_obs_to_aqilevels reads committed R2 observations and rewrites AQI history for the selected UK_AQ_R2_HISTORY_VERSION (v1 or v2).
   - v1 uses UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX / UK_AQ_R2_HISTORY_AQILEVELS_PREFIX exactly as configured.
   - v2 uses UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX and the v2 AQI data/debug prefixes.
   - Leave UK_AQ_BACKFILL_CONNECTOR_IDS unset to include all currently supported source adapters.

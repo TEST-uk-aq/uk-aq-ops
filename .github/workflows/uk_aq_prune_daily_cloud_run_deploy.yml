@@ -65,7 +65,7 @@ jobs:
       UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500' }}
       UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS: ${{ vars.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS || '7' }}
       UK_AQ_R2_HISTORY_STAGING_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_STAGING_PREFIX || 'history/v1/_ops/observations/staging' }}
-      UK_AQ_R2_HISTORY_WRITE_VERSION: ${{ vars.UK_AQ_R2_HISTORY_WRITE_VERSION || 'v1' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
       UK_AQ_R2_HISTORY_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_RUNS_PREFIX || 'history/v1/_ops/observations/runs' }}
@@ -126,10 +126,14 @@ jobs:
             echo "Missing required repo variable: OBS_AQIDB_SUPABASE_URL"
             exit 1
           fi
-          case "${UK_AQ_R2_HISTORY_WRITE_VERSION}" in
+          case "${UK_AQ_R2_HISTORY_VERSION}" in
             v1|v2) ;;
+            "")
+              echo "Missing GitHub variable UK_AQ_R2_HISTORY_VERSION."
+              exit 1
+              ;;
             *)
-              echo "Invalid UK_AQ_R2_HISTORY_WRITE_VERSION=${UK_AQ_R2_HISTORY_WRITE_VERSION}; expected v1 or v2."
+              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v1 or v2."
               exit 1
               ;;
           esac
@@ -334,7 +338,7 @@ jobs:
           env_updates+=("UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN=${UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN}")
           env_updates+=("UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS=${UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS}")
           env_updates+=("UK_AQ_R2_HISTORY_STAGING_PREFIX=${UK_AQ_R2_HISTORY_STAGING_PREFIX}")
-          env_updates+=("UK_AQ_R2_HISTORY_WRITE_VERSION=${UK_AQ_R2_HISTORY_WRITE_VERSION}")
+          env_updates+=("UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}")
           env_updates+=("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX=${UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX}")
           env_updates+=("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX=${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}")
           env_updates+=("UK_AQ_R2_HISTORY_RUNS_PREFIX=${UK_AQ_R2_HISTORY_RUNS_PREFIX}")

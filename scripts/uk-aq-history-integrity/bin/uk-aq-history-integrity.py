@@ -2931,12 +2931,7 @@ def run_narrow_backfill(
         sub_env.update(loaded)
 
     iso = day.isoformat()
-    for deprecated_key in (
-        "UK_AQ_R2_HISTORY_READ_VERSION",
-        "UK_AQ_R2_HISTORY_WRITE_VERSION",
-        "UK_AQ_R2_HISTORY_BACKUP_VERSION",
-    ):
-        sub_env.pop(deprecated_key, None)
+
     sub_env.update({
         "UK_AQ_BACKFILL_RUN_MODE": "source_to_r2",
         "UK_AQ_BACKFILL_DRY_RUN": "false",
@@ -7320,12 +7315,7 @@ def run_aqi_rebuild_backfill(
         sub_env.update(loaded)
 
     iso = day.isoformat()
-    for deprecated_key in (
-        "UK_AQ_R2_HISTORY_READ_VERSION",
-        "UK_AQ_R2_HISTORY_WRITE_VERSION",
-        "UK_AQ_R2_HISTORY_BACKUP_VERSION",
-    ):
-        sub_env.pop(deprecated_key, None)
+
     sub_env.update({
         "UK_AQ_BACKFILL_RUN_MODE": "r2_history_obs_to_aqilevels",
         "UK_AQ_BACKFILL_DRY_RUN": "false",
