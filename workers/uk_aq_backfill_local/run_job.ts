@@ -2915,6 +2915,115 @@ function createObsDayManifest(args: {
   });
 }
 
+function createObservationV2PollutantManifest(args: {
+  dayUtc: string;
+  connectorId: number;
+  pollutantCode: string;
+  runId: string;
+  manifestKey: string;
+  sourceRowCount: number;
+  fileEntries: ObsHistoryFileEntry[];
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+}) {
+  const files = args.fileEntries.map((entry) => ({
+    ...entry,
+    pollutant_code: args.pollutantCode,
+  }));
+  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  return withManifestHash({
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_version: "v2",
+    manifest_kind: "pollutant",
+    domain: "observations",
+    day_utc: args.dayUtc,
+    connector_id: args.connectorId,
+    pollutant_code: args.pollutantCode,
+    pollutant_codes: [args.pollutantCode],
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: args.sourceRowCount,
+    row_count: args.sourceRowCount,
+    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
+    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
+    min_observed_at_utc: minFileEntryString(files, "min_observed_at"),
+    max_observed_at_utc: maxFileEntryString(files, "max_observed_at"),
+    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    child_manifests: [],
+    columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...statsFromFileEntries(files, args.sourceRowCount),
+    backed_up_at_utc: args.backedUpAtUtc,
+  });
+}
+
+function createObservationV2ConnectorManifest(args: {
+  dayUtc: string;
+  connectorId: number;
+  runId: string;
+  manifestKey: string;
+  pollutantManifests: Array<Record<string, unknown>>;
+  writerGitSha: string | null;
+  backedUpAtUtc: string;
+}) {
+  const files = args.pollutantManifests.flatMap((manifest) =>
+    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
+  );
+  const pollutantCodes = Array.from(new Set(args.pollutantManifests
+    .map((manifest) => String(manifest.pollutant_code || "").trim())
+    .filter(Boolean))).sort();
+  const totalRows = args.pollutantManifests.reduce((sum, manifest) => sum + toSafeInt(manifest.source_row_count), 0);
+  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
+  const childManifests = args.pollutantManifests.map((manifest) => ({
+    pollutant_code: manifest.pollutant_code,
+    manifest_key: manifest.manifest_key,
+    manifest_hash: manifest.manifest_hash,
+    source_row_count: manifest.source_row_count,
+    row_count: manifest.row_count,
+    file_count: manifest.file_count,
+    total_bytes: manifest.total_bytes,
+    min_timeseries_id: manifest.min_timeseries_id ?? null,
+    max_timeseries_id: manifest.max_timeseries_id ?? null,
+    min_observed_at_utc: manifest.min_observed_at_utc ?? null,
+    max_observed_at_utc: manifest.max_observed_at_utc ?? null,
+  }));
+  return withManifestHash({
+    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
+    history_version: "v2",
+    manifest_kind: "connector",
+    domain: "observations",
+    day_utc: args.dayUtc,
+    connector_id: args.connectorId,
+    pollutant_code: null,
+    pollutant_codes: pollutantCodes,
+    run_id: args.runId,
+    manifest_key: args.manifestKey,
+    source_row_count: totalRows,
+    row_count: totalRows,
+    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
+    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
+    min_observed_at_utc: minFileEntryString(files, "min_observed_at"),
+    max_observed_at_utc: maxFileEntryString(files, "max_observed_at"),
+    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
+    file_count: files.length,
+    total_bytes: totalBytes,
+    files,
+    child_manifests: childManifests,
+    pollutant_manifests: childManifests,
+    columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
+    writer_version: HISTORY_R2_V2_WRITER_VERSION,
+    writer_git_sha: args.writerGitSha,
+    ...statsFromFileEntries(files, totalRows),
+    backed_up_at_utc: args.backedUpAtUtc,
+  });
+}
+
 function createAqiConnectorManifest(args: {
   dayUtc: string;
   connectorId: number;
@@ -4235,6 +4344,10 @@ async function exportObsConnectorRowsToR2(args: {
   manifest_key: string;
   connector_manifest: ObsConnectorManifest & Record<string, unknown>;
 }> {
+  if (HISTORY_R2_WRITE_VERSION === "v2") {
+    return await exportObsConnectorRowsToR2V2(args);
+  }
+
   if (FORCE_REPLACE) {
     await deleteR2Prefix(
       buildObsConnectorPrefix(args.day_utc, args.connector_id),
@@ -4328,6 +4441,158 @@ async function exportObsConnectorRowsToR2(args: {
     objects_written_r2: fileEntries.length + 1,
     manifest_key: manifestKey,
     connector_manifest: connectorManifest,
+  };
+}
+
+function groupObservationRowsByPollutant(
+  rows: ObsHistoryRow[],
+): Map<string, ObsHistoryRow[]> {
+  const grouped = new Map<string, ObsHistoryRow[]>();
+  for (const row of rows) {
+    const pollutantCode = normalizePollutantCodeForR2Path(String(row.pollutant_code || ""));
+    if (!grouped.has(pollutantCode)) grouped.set(pollutantCode, []);
+    grouped.get(pollutantCode)?.push(row);
+  }
+  return grouped;
+}
+
+async function exportObsConnectorRowsToR2V2(args: {
+  run_id: string;
+  day_utc: string;
+  connector_id: number;
+  rows: ObsHistoryRow[];
+}): Promise<{
+  rows_read: number;
+  objects_written_r2: number;
+  manifest_key: string;
+  connector_manifest: ObsConnectorManifest & Record<string, unknown>;
+}> {
+  if (FORCE_REPLACE) {
+    await deleteR2Prefix(
+      buildHistoryV2ConnectorPrefix(
+        OBS_R2_HISTORY_PREFIX_V2,
+        args.day_utc,
+        args.connector_id,
+      ),
+    );
+  }
+
+  const sortedRows = [...args.rows].sort((left, right) => {
+    const leftPollutant = String(left.pollutant_code || "");
+    const rightPollutant = String(right.pollutant_code || "");
+    if (leftPollutant !== rightPollutant) return leftPollutant.localeCompare(rightPollutant);
+    if (left.timeseries_id !== right.timeseries_id) return left.timeseries_id - right.timeseries_id;
+    if (left.observed_at < right.observed_at) return -1;
+    if (left.observed_at > right.observed_at) return 1;
+    return 0;
+  });
+  const pollutantGroups = groupObservationRowsByPollutant(sortedRows);
+  const pollutantManifests: Array<Record<string, unknown>> = [];
+  let objectsWritten = 0;
+
+  for (const [pollutantCode, pollutantRows] of Array.from(pollutantGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+    const fileEntries: ObsHistoryFileEntry[] = [];
+    const rowChunks = chunkRows(pollutantRows, OBS_R2_PART_MAX_ROWS);
+    for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
+      const chunk = rowChunks[partIndex];
+      if (!chunk.length) continue;
+      const parquetRows = chunk.map((row) => ({
+        connector_id: args.connector_id,
+        station_id: row.station_id ?? null,
+        timeseries_id: row.timeseries_id,
+        pollutant_code: pollutantCode,
+        observed_at: row.observed_at,
+        value: row.value,
+      }));
+      const partSummary = summarizeObservationPartRows(parquetRows);
+      const partKey = buildHistoryV2PartKey(
+        OBS_R2_HISTORY_PREFIX_V2,
+        args.day_utc,
+        args.connector_id,
+        pollutantCode,
+        partIndex,
+      );
+      const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
+      const putResult = await r2PutObject({
+        r2: OBS_R2_CONFIG,
+        key: partKey,
+        body: parquetBuffer,
+        content_type: "application/octet-stream",
+      });
+      const head = await r2HeadObject({ r2: OBS_R2_CONFIG, key: partKey });
+      if (!head.exists) {
+        throw new Error(`Missing v2 observation parquet part after upload: ${partKey}`);
+      }
+      fileEntries.push({
+        key: partKey,
+        row_count: chunk.length,
+        bytes: typeof head.bytes === "number" && Number.isFinite(head.bytes)
+          ? Math.trunc(head.bytes)
+          : Math.trunc(putResult.bytes),
+        etag_or_hash: head.etag || putResult.etag || null,
+        pollutant_codes: [pollutantCode],
+        min_timeseries_id: partSummary.min_timeseries_id,
+        max_timeseries_id: partSummary.max_timeseries_id,
+        min_observed_at: partSummary.min_observed_at,
+        max_observed_at: partSummary.max_observed_at,
+        timeseries_row_counts: partSummary.timeseries_row_counts,
+      });
+      objectsWritten += 1;
+    }
+    const manifestKey = buildHistoryV2PollutantManifestKey(
+      OBS_R2_HISTORY_PREFIX_V2,
+      args.day_utc,
+      args.connector_id,
+      pollutantCode,
+    );
+    const pollutantManifest = createObservationV2PollutantManifest({
+      dayUtc: args.day_utc,
+      connectorId: args.connector_id,
+      pollutantCode,
+      runId: args.run_id,
+      manifestKey,
+      sourceRowCount: pollutantRows.length,
+      fileEntries,
+      writerGitSha: OBS_R2_WRITER_GIT_SHA,
+      backedUpAtUtc: nowIso(),
+    });
+    await r2PutObject({
+      r2: OBS_R2_CONFIG,
+      key: manifestKey,
+      body: encodeJsonBody(pollutantManifest),
+      content_type: "application/json",
+    });
+    objectsWritten += 1;
+    pollutantManifests.push(pollutantManifest);
+  }
+
+  const manifestKey = buildHistoryV2ConnectorManifestKey(
+    OBS_R2_HISTORY_PREFIX_V2,
+    args.day_utc,
+    args.connector_id,
+  );
+  const connectorManifest = createObservationV2ConnectorManifest({
+    dayUtc: args.day_utc,
+    connectorId: args.connector_id,
+    runId: args.run_id,
+    manifestKey,
+    pollutantManifests,
+    writerGitSha: OBS_R2_WRITER_GIT_SHA,
+    backedUpAtUtc: nowIso(),
+  });
+  await r2PutObject({
+    r2: OBS_R2_CONFIG,
+    key: manifestKey,
+    body: encodeJsonBody(connectorManifest),
+    content_type: "application/json",
+  });
+  objectsWritten += 1;
+
+  return {
+    rows_read: sortedRows.length,
+    objects_written_r2: objectsWritten,
+    manifest_key: manifestKey,
+    connector_manifest: connectorManifest as ObsConnectorManifest & Record<string, unknown>,
   };
 }
 

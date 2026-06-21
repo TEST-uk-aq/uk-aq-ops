@@ -250,5 +250,32 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertTrue(gaps[0]["expected_path"].endswith(f"day_utc={day}/connector_id=6"))
 
 
+class V2ObservationMalformedLayoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config = MODULE.resolve_history_path_config("v2", {})
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_connector_level_part_file_without_pollutant_partitions_fails(self) -> None:
+        connector = self.root / "history/v2/observations/day_utc=2026-06-08/connector_id=6"
+        connector.mkdir(parents=True, exist_ok=True)
+        (connector / "manifest.json").write_text(json.dumps({"connector_id": 6}), encoding="utf-8")
+        (connector / "part-00000.parquet").write_bytes(b"PAR1")
+
+        result = MODULE.run_v2_observations_integrity_checks(
+            r2_history_root=self.root,
+            config=self.config,
+            from_day="2026-06-08",
+            to_day="2026-06-08",
+        )
+        gap_types = {g["gap_type"] for g in result["gaps"]}
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("unexpected_connector_level_part_file", gap_types)
+        self.assertIn("missing_pollutant_partitions", gap_types)
+
+
 if __name__ == "__main__":
     unittest.main()
