@@ -22,26 +22,27 @@ assert.doesNotMatch(html, /coverage-bar-dropbox-only-observs\s*\{\s*background:\
 assert.doesNotMatch(html, /coverage-bar-dropbox-only-aqilevels\s*\{\s*background:\s*#ffffff[\s\S]*?border:\s*1px solid var\(--color-r2-aqilevels\)/, 'AQI backup bars must not use white yellow-bordered style');
 assert.match(html, /payloadWarningParts/, 'connector-count warnings should render without failing the calendar');
 
-const v1 = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: 'v1' }, fakeUrl());
+const v1 = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: 'v1' }, fakeUrl());
 assert.equal(v1.readVersion.label, 'R2_v1');
 assert.equal(buildR2HistoryReadIndexKey(v1, 'observations'), 'history/_index/observations_latest.json');
 assert.equal(buildR2HistoryReadIndexKey(v1, 'aqilevels'), 'history/_index/aqilevels_latest.json');
 
-const v2 = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: 'v2' }, fakeUrl());
+const v2 = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: 'v2' }, fakeUrl());
 assert.equal(v2.readVersion.label, 'R2_v2');
 assert.equal(buildR2HistoryReadIndexKey(v2, 'observations'), 'history/_index_v2/observations_timeseries_latest.json');
 assert.equal(buildR2HistoryReadIndexKey(v2, 'aqilevels'), 'history/_index_v2/aqilevels_hourly_data_timeseries_latest.json');
 
 assert.throws(
-  () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: 'v3' }, fakeUrl()),
-  /Invalid R2 history read version.*expected v1 or v2/,
+  () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: 'v3' }, fakeUrl()),
+  /Invalid UK_AQ_R2_HISTORY_VERSION.*expected v1 or v2/,
 );
 
-const missing = resolveR2HistoryLayoutConfig({}, fakeUrl());
-assert.equal(missing.readVersion.label, 'R2_v1');
-assert.match(missing.readVersion.warning, /defaulting to v1/);
+assert.throws(
+  () => resolveR2HistoryLayoutConfig({}, fakeUrl()),
+  /Missing UK_AQ_R2_HISTORY_VERSION/,
+);
 
-const queryOverride = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: 'v1' }, fakeUrl('v2'));
+const queryOverride = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: 'v1' }, fakeUrl('v2'));
 assert.equal(queryOverride.readVersion.label, 'R2_v2');
 assert.equal(queryOverride.readVersion.source, 'query');
 

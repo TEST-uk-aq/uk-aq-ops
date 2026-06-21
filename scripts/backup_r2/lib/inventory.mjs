@@ -5,6 +5,10 @@
 //   and exits non-zero with an actionable message if not present)
 
 import { joinTargetPath, rcloneCatMaybe } from "./rclone.mjs";
+import {
+  parseR2HistoryVersion,
+  resolveR2HistoryVersion,
+} from "../../../workers/shared/uk_aq_r2_history_version.mjs";
 
 export const INVENTORY_SCHEMA_VERSION = 1;
 export const INVENTORY_KIND = "uk_aq_r2_history_backup_inventory";
@@ -46,17 +50,12 @@ export const DEFAULT_INVENTORY_REL_PATH = DEFAULT_V1_INVENTORY_REL_PATH;
 export const DEFAULT_V1_STATE_REL_PATH = "_ops/checkpoints/r2_history_backup_state_v1.json";
 export const DEFAULT_V2_STATE_REL_PATH = "_ops/checkpoints/r2_history_backup_state_v2.json";
 
-export function parseBackupVersion(raw, fallback = "v1") {
-  const value = String(raw || "").trim().toLowerCase();
-  if (BACKUP_VERSION_VALUES.includes(value)) return value;
-  const fallbackValue = String(fallback || "").trim().toLowerCase();
-  return BACKUP_VERSION_VALUES.includes(fallbackValue) ? fallbackValue : "v1";
+export function parseBackupVersion(raw) {
+  return parseR2HistoryVersion(raw, { varName: "--backup-version" });
 }
 
 export function resolveBackupVersion(env = process.env) {
-  const explicitBackupVersion = String(env.UK_AQ_R2_HISTORY_BACKUP_VERSION || "").trim();
-  if (explicitBackupVersion) return parseBackupVersion(explicitBackupVersion, "v1");
-  return parseBackupVersion(env.UK_AQ_R2_HISTORY_WRITE_VERSION, "v1");
+  return resolveR2HistoryVersion(env, { context: "R2 history backup" });
 }
 
 export function defaultInventoryRelPathForBackupVersion(backupVersion) {

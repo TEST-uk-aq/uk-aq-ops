@@ -1,5 +1,9 @@
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
+import {
+  parseR2HistoryVersion,
+  resolveR2HistoryVersion,
+} from "../shared/uk_aq_r2_history_version.mjs";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/aqilevels/hourly";
 const DEFAULT_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
@@ -150,8 +154,7 @@ function parseOptionalBoolean(raw, fallback) {
 }
 
 function parseReadVersion(raw) {
-  const value = String(raw || "").trim().toLowerCase();
-  return value === "v2" ? "v2" : "v1";
+  return parseR2HistoryVersion(raw, { varName: "readVersion" });
 }
 
 function createScanMetrics({
@@ -368,7 +371,7 @@ function buildAqiHistoryResponseCacheKey(request, env = {}) {
   url.searchParams.set("__ukaq_aqi_history_response_v", AQI_HISTORY_RESPONSE_CACHE_VERSION);
   url.searchParams.set(
     "__ukaq_aqi_history_read_v",
-    parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION),
+    resolveR2HistoryVersion(env, { context: "R2 AQI history API reads" }),
   );
   return new Request(url.toString(), { method: "GET" });
 }
@@ -2155,7 +2158,7 @@ async function handleRequest(request, env, ctx) {
   }
   const responseFormat = normalizeAqiResponseFormat(responseFormatRaw);
 
-  const readVersion = parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION);
+  const readVersion = resolveR2HistoryVersion(env, { context: "R2 AQI history API reads" });
   const historyPrefix = readVersion === "v2"
     ? (
       normalizePrefix(

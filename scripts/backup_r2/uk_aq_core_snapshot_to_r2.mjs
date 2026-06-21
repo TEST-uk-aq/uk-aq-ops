@@ -15,25 +15,16 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
-
-const HISTORY_VERSION_VALUES = new Set(["v1", "v2"]);
-
-export function parseHistoryWriteVersion(raw, fallback = "v1") {
-  const value = String(raw || "").trim().toLowerCase();
-  if (HISTORY_VERSION_VALUES.has(value)) return value;
-  const fallbackValue = String(fallback || "").trim().toLowerCase();
-  return HISTORY_VERSION_VALUES.has(fallbackValue) ? fallbackValue : "v1";
-}
+import { resolveR2HistoryVersion } from "../../workers/shared/uk_aq_r2_history_version.mjs";
 
 export function resolveCoreSnapshotPrefix(env = process.env) {
-  const version = parseHistoryWriteVersion(env.UK_AQ_R2_HISTORY_WRITE_VERSION, "v1");
+  const version = resolveR2HistoryVersion(env, { context: "R2 core snapshot" });
   if (version === "v2") {
     return normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core");
   }
   return normalizePrefix(env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core");
 }
 
-const DEFAULT_CORE_PREFIX = resolveCoreSnapshotPrefix(process.env);
 const DEFAULT_SOURCE_SCHEMA = (process.env.UK_AQ_CORE_SNAPSHOT_SCHEMA || "uk_aq_core").trim();
 const DEFAULT_CURSOR_BATCH_ROWS = parsePositiveInt(process.env.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS, 5000);
 const DEFAULT_REPORT_OUT = String(process.env.UK_AQ_R2_CORE_SNAPSHOT_REPORT_OUT || "").trim();
@@ -112,7 +103,7 @@ function usage() {
       "",
       "Optional:",
       "  --day-utc <YYYY-MM-DD>       Default: today UTC",
-      "  --prefix <r2-prefix>         Default: selected by UK_AQ_R2_HISTORY_WRITE_VERSION (v1 history/v1/core; v2 history/v2/core)",
+      "  --prefix <r2-prefix>         Default: selected by UK_AQ_R2_HISTORY_VERSION (v1 history/v1/core; v2 history/v2/core)",
       "  --table <name>               Repeatable table filter",
       "  --tables <a,b,c>             Comma-separated table filter",
       "  --cursor-batch-rows <N>      Default: 5000",
@@ -269,7 +260,7 @@ function writeReport(reportOutPath, payload) {
 function parseArgs(argv) {
   const args = {
     day_utc: todayUtcDay(),
-    prefix: DEFAULT_CORE_PREFIX,
+    prefix: "",
     tables: [],
     cursor_batch_rows: DEFAULT_CURSOR_BATCH_ROWS,
     dry_run: false,
@@ -325,6 +316,10 @@ function parseArgs(argv) {
       process.exit(0);
     }
     throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (!args.prefix) {
+    args.prefix = resolveCoreSnapshotPrefix(process.env);
   }
 
   if (!args.prefix) {

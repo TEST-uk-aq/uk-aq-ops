@@ -2630,8 +2630,7 @@ def _planned_backfill_command(
         f"UK_AQ_BACKFILL_RUN_MODE=source_to_r2 "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
         f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
-        f"UK_AQ_R2_HISTORY_WRITE_VERSION={history_version} "
-        f"UK_AQ_R2_HISTORY_BACKUP_VERSION={history_version} "
+        f"UK_AQ_R2_HISTORY_VERSION={history_version} "
         f"UK_AQ_R2_HISTORY_INDEX_VERSION={history_version} "
         f"{f'UK_AQ_BACKFILL_OUTPUT_SCOPE={output_scope} ' if output_scope else ''}"
         f"{f'UK_AQ_BACKFILL_CONNECTOR_IDS={connector_csv} ' if connector_csv else ''}"
@@ -2932,13 +2931,18 @@ def run_narrow_backfill(
         sub_env.update(loaded)
 
     iso = day.isoformat()
+    for deprecated_key in (
+        "UK_AQ_R2_HISTORY_READ_VERSION",
+        "UK_AQ_R2_HISTORY_WRITE_VERSION",
+        "UK_AQ_R2_HISTORY_BACKUP_VERSION",
+    ):
+        sub_env.pop(deprecated_key, None)
     sub_env.update({
         "UK_AQ_BACKFILL_RUN_MODE": "source_to_r2",
         "UK_AQ_BACKFILL_DRY_RUN": "false",
         "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
         "UK_AQ_BACKFILL_OUTPUT_SCOPE": output_scope or "default",
-        "UK_AQ_R2_HISTORY_WRITE_VERSION": history_version,
-        "UK_AQ_R2_HISTORY_BACKUP_VERSION": history_version,
+        "UK_AQ_R2_HISTORY_VERSION": history_version,
         "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
@@ -7255,8 +7259,7 @@ def _planned_aqi_rebuild_command(
         f"UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
         f"UK_AQ_BACKFILL_FORCE_REPLACE=true "
-        f"UK_AQ_R2_HISTORY_WRITE_VERSION={history_version} "
-        f"UK_AQ_R2_HISTORY_BACKUP_VERSION={history_version} "
+        f"UK_AQ_R2_HISTORY_VERSION={history_version} "
         f"UK_AQ_R2_HISTORY_INDEX_VERSION={history_version} "
         f"UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only "
         f"{connector_scope}"
@@ -7317,13 +7320,18 @@ def run_aqi_rebuild_backfill(
         sub_env.update(loaded)
 
     iso = day.isoformat()
+    for deprecated_key in (
+        "UK_AQ_R2_HISTORY_READ_VERSION",
+        "UK_AQ_R2_HISTORY_WRITE_VERSION",
+        "UK_AQ_R2_HISTORY_BACKUP_VERSION",
+    ):
+        sub_env.pop(deprecated_key, None)
     sub_env.update({
         "UK_AQ_BACKFILL_RUN_MODE": "r2_history_obs_to_aqilevels",
         "UK_AQ_BACKFILL_DRY_RUN": "false",
         "UK_AQ_BACKFILL_FORCE_REPLACE": "true",
         "UK_AQ_BACKFILL_OUTPUT_SCOPE": "aqilevels_only",
-        "UK_AQ_R2_HISTORY_WRITE_VERSION": history_version,
-        "UK_AQ_R2_HISTORY_BACKUP_VERSION": history_version,
+        "UK_AQ_R2_HISTORY_VERSION": history_version,
         "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
@@ -7649,8 +7657,8 @@ def run_v2_gap_backfills(
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
-    The lower-level supported contract is UK_AQ_R2_HISTORY_WRITE_VERSION=v2,
-    UK_AQ_R2_HISTORY_BACKUP_VERSION=v2, and UK_AQ_R2_HISTORY_INDEX_VERSION=v2;
+    The lower-level supported contract is UK_AQ_R2_HISTORY_VERSION=v2
+    and UK_AQ_R2_HISTORY_INDEX_VERSION=v2;
     the integrity shell wrapper forwards these and calls the v2-aware targeted
     index builder with --history-version v2. This intentionally does not use
     any v1-to-v2 Dropbox conversion plan.
@@ -9907,7 +9915,7 @@ def main(argv: list[str]) -> int:
     checked_history_versions = expand_history_versions(history_version_mode)
     history_path_configs = resolve_history_path_configs(history_version_mode)
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
-    site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_READ_VERSION", "")).strip() or None
+    site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
     preflight_summary = run_preflight_or_die(args, env)
 
     started_mono = time.monotonic()

@@ -291,15 +291,11 @@ test("planIndexFiles and planIndexTreeUnits include v2 pollutant index keys", ()
 
 test("backup version selection resolves selected run manifest prefixes", () => {
   assert.equal(
-    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_BACKUP_VERSION: "v2" })),
+    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_VERSION: "v2" })),
     "history/v2/_ops/observations/runs",
   );
   assert.equal(
-    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" })),
-    "history/v2/_ops/observations/runs",
-  );
-  assert.equal(
-    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_BACKUP_VERSION: "v1", UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" })),
+    runManifestPrefixForBackupVersion(resolveBackupVersion({ UK_AQ_R2_HISTORY_VERSION: "v1" })),
     "history/v1/_ops/observations/runs",
   );
 });
@@ -392,8 +388,15 @@ test("selected v1 run manifests are supported as straightforward legacy file uni
 
 // ----- backup version selection -----
 
-test("backup version defaults to v1 paths when write and backup vars are unset", () => {
-  assert.equal(resolveBackupVersion({}), "v1");
+test("backup version rejects missing canonical history version", () => {
+  assert.throws(
+    () => resolveBackupVersion({}),
+    /Missing UK_AQ_R2_HISTORY_VERSION/,
+  );
+});
+
+test("backup version selects v1 paths from canonical v1 history version", () => {
+  assert.equal(resolveBackupVersion({ UK_AQ_R2_HISTORY_VERSION: "v1" }), "v1");
   assert.equal(
     defaultInventoryRelPathForBackupVersion("v1"),
     "history/_index/backup_inventory_v1.json",
@@ -405,8 +408,8 @@ test("backup version defaults to v1 paths when write and backup vars are unset",
   assert.deepEqual(domainNamesForBackupVersion("v1"), ["observations", "aqilevels", "core"]);
 });
 
-test("backup version follows write version when backup override is unset", () => {
-  const env = { UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" };
+test("backup version follows canonical history version for v2 paths", () => {
+  const env = { UK_AQ_R2_HISTORY_VERSION: "v2" };
   assert.equal(resolveBackupVersion(env), "v2");
   assert.equal(
     defaultInventoryRelPathForBackupVersion(resolveBackupVersion(env)),
@@ -422,19 +425,20 @@ test("backup version follows write version when backup override is unset", () =>
   );
 });
 
-test("backup version override can pin v1 while write version is v2", () => {
-  const env = {
-    UK_AQ_R2_HISTORY_WRITE_VERSION: "v2",
-    UK_AQ_R2_HISTORY_BACKUP_VERSION: "v1",
-  };
-  assert.equal(resolveBackupVersion(env), "v1");
-  assert.equal(
-    defaultInventoryRelPathForBackupVersion(resolveBackupVersion(env)),
-    "history/_index/backup_inventory_v1.json",
+test("backup version rejects deprecated split backup and write vars", () => {
+  assert.throws(
+    () => resolveBackupVersion({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_R2_HISTORY_WRITE_VERSION: "v2",
+    }),
+    /UK_AQ_R2_HISTORY_WRITE_VERSION/,
   );
-  assert.equal(
-    defaultStateRelPathForBackupVersion(resolveBackupVersion(env)),
-    "_ops/checkpoints/r2_history_backup_state_v1.json",
+  assert.throws(
+    () => resolveBackupVersion({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_R2_HISTORY_BACKUP_VERSION: "v1",
+    }),
+    /UK_AQ_R2_HISTORY_BACKUP_VERSION/,
   );
 });
 

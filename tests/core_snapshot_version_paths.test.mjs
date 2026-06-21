@@ -4,12 +4,26 @@ import assert from 'node:assert/strict';
 import { resolveCoreSnapshotPrefix } from '../scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs';
 import { resolveDomainPrefixes } from '../scripts/backup_r2/build_backup_inventory.mjs';
 
-test('core snapshot generation chooses v1 prefix for v1 write version', () => {
-  assert.equal(resolveCoreSnapshotPrefix({ UK_AQ_R2_HISTORY_WRITE_VERSION: 'v1' }), 'history/v1/core');
+test('core snapshot generation chooses v1 prefix for canonical v1 history version', () => {
+  assert.equal(resolveCoreSnapshotPrefix({ UK_AQ_R2_HISTORY_VERSION: 'v1' }), 'history/v1/core');
 });
 
-test('core snapshot generation chooses v2 prefix for v2 write version', () => {
-  assert.equal(resolveCoreSnapshotPrefix({ UK_AQ_R2_HISTORY_WRITE_VERSION: 'v2' }), 'history/v2/core');
+test('core snapshot generation chooses v2 prefix for canonical v2 history version', () => {
+  assert.equal(resolveCoreSnapshotPrefix({ UK_AQ_R2_HISTORY_VERSION: 'v2' }), 'history/v2/core');
+});
+
+test('core snapshot rejects deprecated split write version', () => {
+  assert.throws(
+    () => resolveCoreSnapshotPrefix({ UK_AQ_R2_HISTORY_WRITE_VERSION: 'v2', UK_AQ_R2_HISTORY_VERSION: 'v2' }),
+    /UK_AQ_R2_HISTORY_WRITE_VERSION/,
+  );
+});
+
+test('core snapshot requires canonical history version when prefix is not supplied', () => {
+  assert.throws(
+    () => resolveCoreSnapshotPrefix({}),
+    /Missing UK_AQ_R2_HISTORY_VERSION/,
+  );
 });
 
 test('backup inventory selects v2 core prefix for v2 backup version', () => {

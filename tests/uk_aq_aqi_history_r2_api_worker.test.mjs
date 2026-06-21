@@ -191,7 +191,7 @@ function installHistoricalR2Harness(objectsByKey = {}) {
     cachePutCalls,
     env: {
       UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret",
-      UK_AQ_R2_HISTORY_READ_VERSION: "v2",
+      UK_AQ_R2_HISTORY_VERSION: "v2",
       INGESTDB_RETENTION_DAYS: "5",
       UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED: "true",
       UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX: "true",
@@ -317,6 +317,7 @@ test("worker returns structured partial JSON instead of broad scanning when requ
       }),
       {
         UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret",
+        UK_AQ_R2_HISTORY_VERSION: "v1",
         INGESTDB_RETENTION_DAYS: "5",
         UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED: "true",
         UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX: "true",
@@ -365,6 +366,7 @@ test("worker returns normalized compact AQI rows with row-summary metadata", asy
       }),
       {
         UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret",
+        UK_AQ_R2_HISTORY_VERSION: "v1",
         OBS_AQIDB_SUPABASE_URL: "https://supabase.test",
         OBS_AQIDB_SECRET_KEY: "test-obsaqidb-secret",
         UK_AQ_PUBLIC_SCHEMA: "uk_aq_public",
@@ -431,6 +433,7 @@ test("worker returns row objects without legacy timestamp fields when format=obj
       }),
       {
         UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret",
+        UK_AQ_R2_HISTORY_VERSION: "v1",
         OBS_AQIDB_SUPABASE_URL: "https://supabase.test",
         OBS_AQIDB_SECRET_KEY: "test-obsaqidb-secret",
         UK_AQ_PUBLIC_SCHEMA: "uk_aq_public",

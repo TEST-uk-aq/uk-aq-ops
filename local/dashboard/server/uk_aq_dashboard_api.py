@@ -77,9 +77,13 @@ R2_HISTORY_COUNTS_API_URL = str(os.getenv("UK_AQ_R2_HISTORY_COUNTS_API_URL") or 
 R2_HISTORY_COUNTS_API_TOKEN = str(
     os.getenv("UK_AQ_R2_HISTORY_COUNTS_API_TOKEN") or R2_HISTORY_DAYS_API_TOKEN
 ).strip()
-R2_HISTORY_READ_VERSION_ENV = "UK_AQ_R2_HISTORY_READ_VERSION"
-R2_HISTORY_READ_VERSION_DEFAULT = "v1"
+R2_HISTORY_VERSION_ENV = "UK_AQ_R2_HISTORY_VERSION"
 R2_HISTORY_READ_VERSION_ACCEPTED = {"v1", "v2"}
+DEPRECATED_R2_HISTORY_VERSION_ENVS = (
+    "UK_AQ_R2_HISTORY_READ_VERSION",
+    "UK_AQ_R2_HISTORY_WRITE_VERSION",
+    "UK_AQ_R2_HISTORY_BACKUP_VERSION",
+)
 try:
     _raw_r2_history_days_max = int(str(os.getenv("UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS", "3660")).strip())
 except ValueError:
@@ -376,15 +380,29 @@ def _request_path(url: str) -> str:
 
 
 def _resolve_r2_history_read_version() -> Dict[str, Any]:
-    raw = str(os.getenv(R2_HISTORY_READ_VERSION_ENV) or "").strip()
+    present_deprecated = [name for name in DEPRECATED_R2_HISTORY_VERSION_ENVS if name in os.environ]
+    if present_deprecated:
+        return {
+            "version": None,
+            "label": "R2 invalid",
+            "source": "invalid_env",
+            "warning": (
+                "Deprecated R2 history version env var(s) "
+                f"{', '.join(present_deprecated)} are no longer supported. "
+                f"Use {R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split vars."
+            ),
+            "valid": False,
+            "raw": "",
+        }
+    raw = str(os.getenv(R2_HISTORY_VERSION_ENV) or "").strip()
     normalized = raw.lower()
     if not normalized:
         return {
-            "version": R2_HISTORY_READ_VERSION_DEFAULT,
-            "label": f"R2_{R2_HISTORY_READ_VERSION_DEFAULT}",
-            "source": "default_missing_env",
-            "warning": f"{R2_HISTORY_READ_VERSION_ENV} is not set; defaulting to {R2_HISTORY_READ_VERSION_DEFAULT} to preserve existing dashboard behaviour.",
-            "valid": True,
+            "version": None,
+            "label": "R2 invalid",
+            "source": "missing_env",
+            "warning": f"Missing {R2_HISTORY_VERSION_ENV}; set {R2_HISTORY_VERSION_ENV}=v1 or {R2_HISTORY_VERSION_ENV}=v2.",
+            "valid": False,
             "raw": raw,
         }
     if normalized in R2_HISTORY_READ_VERSION_ACCEPTED:
@@ -400,7 +418,7 @@ def _resolve_r2_history_read_version() -> Dict[str, Any]:
         "version": None,
         "label": "R2 invalid",
         "source": "invalid_env",
-        "warning": f"Invalid {R2_HISTORY_READ_VERSION_ENV}={raw!r}; expected v1 or v2. R2 history checks are disabled until this is fixed.",
+        "warning": f"Invalid {R2_HISTORY_VERSION_ENV}={raw!r}; expected v1 or v2. R2 history checks are disabled until this is fixed.",
         "valid": False,
         "raw": raw,
     }
@@ -431,7 +449,7 @@ def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
             "ignored_state_file_override": None,
         }
 
-    version = str(read_version_info.get("version") or R2_HISTORY_READ_VERSION_DEFAULT)
+    version = str(read_version_info.get("version"))
     raw_env = str(os.getenv(UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV) or "").strip()
     state_file_override = str(os.getenv(UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV) or "").strip()
 
@@ -448,7 +466,7 @@ def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
             path = R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS["v2"]
             source = "default:v2_ignored_v1_env_override"
             warnings.append(
-                f"{R2_HISTORY_READ_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV} looks like a v1 path ({raw_env}). Using v2 default instead."
+                f"{R2_HISTORY_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH_ENV} looks like a v1 path ({raw_env}). Using v2 default instead."
             )
             attempted_paths.append(path)
         else:
@@ -467,7 +485,7 @@ def _resolve_dropbox_state_path_info() -> Dict[str, Any]:
             elif source == "default":
                 source = "default:v2_ignored_v1_state_file_override"
             warnings.append(
-                f"{R2_HISTORY_READ_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV} looks like a v1 checkpoint ({ignored_state_file_override}). Ignoring that override and using the resolved v2 checkpoint path."
+                f"{R2_HISTORY_VERSION_ENV} is v2 but {UK_AQ_R2_HISTORY_DROPBOX_STATE_FILE_ENV} looks like a v1 checkpoint ({ignored_state_file_override}). Ignoring that override and using the resolved v2 checkpoint path."
             )
 
     cache_key = f"{version}:{path}:state_file={state_file_override or ''}"

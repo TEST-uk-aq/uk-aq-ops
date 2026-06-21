@@ -49,7 +49,7 @@ type R2DaySets = {
 type R2HistoryReadVersionResolution = {
   version: "v1" | "v2" | null;
   label: string;
-  source: "env" | "default_missing_env" | "invalid_env";
+  source: "env" | "missing_env" | "invalid_env";
   warning: string | null;
   valid: boolean;
   raw: string;
@@ -118,9 +118,13 @@ const R2_FREE_ACTION_TYPES = new Set([
   "DeleteBucket",
   "AbortMultipartUpload",
 ]);
-const R2_HISTORY_READ_VERSION_ENV = "UK_AQ_R2_HISTORY_READ_VERSION";
-const R2_HISTORY_READ_VERSION_DEFAULT: "v1" = "v1";
+const R2_HISTORY_VERSION_ENV = "UK_AQ_R2_HISTORY_VERSION";
 const R2_HISTORY_READ_VERSION_ACCEPTED = new Set(["v1", "v2"]);
+const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
+  "UK_AQ_R2_HISTORY_READ_VERSION",
+  "UK_AQ_R2_HISTORY_WRITE_VERSION",
+  "UK_AQ_R2_HISTORY_BACKUP_VERSION",
+];
 const R2_HISTORY_BACKUP_STATE_REL_PATH_DEFAULTS = {
   v1: "_ops/checkpoints/r2_history_backup_state_v1.json",
   v2: "_ops/checkpoints/r2_history_backup_state_v2.json",
@@ -175,15 +179,28 @@ let storageCoverageCacheVersionKey: string | null = null;
 let dropboxMtimeCache: CacheEntry<{ payload: JsonObject; error: string | null }> | null = null;
 
 function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolution {
-  const raw = String(env.UK_AQ_R2_HISTORY_READ_VERSION || "").trim();
+  const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) =>
+    Object.prototype.hasOwnProperty.call(env, name)
+  );
+  if (presentDeprecated.length > 0) {
+    return {
+      version: null,
+      label: "R2 invalid",
+      source: "invalid_env",
+      warning: `Deprecated R2 history version env var(s) ${presentDeprecated.join(", ")} are no longer supported. Use ${R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split vars.`,
+      valid: false,
+      raw: "",
+    };
+  }
+  const raw = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
   const normalized = raw.toLowerCase();
   if (!normalized) {
     return {
-      version: R2_HISTORY_READ_VERSION_DEFAULT,
-      label: `R2_${R2_HISTORY_READ_VERSION_DEFAULT}`,
-      source: "default_missing_env",
-      warning: `${R2_HISTORY_READ_VERSION_ENV} is not set; defaulting to ${R2_HISTORY_READ_VERSION_DEFAULT} to preserve existing dashboard behaviour.`,
-      valid: true,
+      version: null,
+      label: "R2 invalid",
+      source: "missing_env",
+      warning: `Missing ${R2_HISTORY_VERSION_ENV}; set ${R2_HISTORY_VERSION_ENV}=v1 or ${R2_HISTORY_VERSION_ENV}=v2.`,
+      valid: false,
       raw,
     };
   }
@@ -194,7 +211,7 @@ function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolu
     version: null,
     label: "R2 invalid",
     source: "invalid_env",
-    warning: `Invalid ${R2_HISTORY_READ_VERSION_ENV}=${JSON.stringify(raw)}; expected v1 or v2. R2 history checks are disabled until this is fixed.`,
+    warning: `Invalid ${R2_HISTORY_VERSION_ENV}=${JSON.stringify(raw)}; expected v1 or v2. R2 history checks are disabled until this is fixed.`,
     valid: false,
     raw,
   };

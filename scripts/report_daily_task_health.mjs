@@ -1,3 +1,8 @@
+import {
+  deprecatedR2HistoryVersionVarsPresent,
+  parseR2HistoryVersion,
+} from "../workers/shared/uk_aq_r2_history_version.mjs";
+
 const RPC_SCHEMA = "uk_aq_public";
 
 function parseBoolean(raw, fallback = false) {
@@ -102,25 +107,20 @@ function mapReportStage(rawStage) {
 }
 
 function buildBackupVersionDetails() {
-  const writeVersion = optionalEnv("UK_AQ_R2_HISTORY_WRITE_VERSION");
-  const backupVersion = optionalEnv("UK_AQ_R2_HISTORY_BACKUP_VERSION");
+  const deprecated = deprecatedR2HistoryVersionVarsPresent(process.env);
+  if (deprecated.length > 0) {
+    throw new Error(
+      `Daily task health no longer supports ${deprecated.join(", ")}. `
+      + "Use UK_AQ_R2_HISTORY_VERSION=v1|v2 and delete the old split read/write/backup vars.",
+    );
+  }
 
-  // Only add backup version fields when at least one of the backup workflow
-  // env vars is present. Other workflows (prune, partition, etc.) that call
-  // this script do not set these vars and will not get these fields.
-  if (!writeVersion && !backupVersion) {
+  const rawHistoryVersion = optionalEnv("UK_AQ_R2_HISTORY_VERSION");
+  if (!rawHistoryVersion) {
     return null;
   }
 
-  function normalizeHistoryVersion(value, fallback = "v1") {
-    const normalised = String(value || "").trim().toLowerCase();
-    return ["v1", "v2"].includes(normalised) ? normalised : fallback;
-  }
-
-  const resolvedWrite = normalizeHistoryVersion(writeVersion, "v1");
-  const resolvedBackup = backupVersion
-    ? normalizeHistoryVersion(backupVersion, resolvedWrite)
-    : resolvedWrite;
+  const historyVersion = parseR2HistoryVersion(rawHistoryVersion);
 
   const inventoryRelPaths = {
     v1: "history/_index/backup_inventory_v1.json",
@@ -128,10 +128,9 @@ function buildBackupVersionDetails() {
   };
 
   const details = {
-    backup_version: resolvedBackup,
-    history_write_version: resolvedWrite,
-    history_backup_version: backupVersion || "",
-    inventory_rel_path: inventoryRelPaths[resolvedBackup] || null,
+    history_version: historyVersion,
+    backup_version: historyVersion,
+    inventory_rel_path: inventoryRelPaths[historyVersion] || null,
   };
 
   return details;

@@ -1,5 +1,9 @@
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
+import {
+  parseR2HistoryVersion,
+  resolveR2HistoryVersion,
+} from "../shared/uk_aq_r2_history_version.mjs";
 
 const DEFAULT_HISTORY_PREFIX = "history/v1/observations";
 const DEFAULT_HISTORY_V2_PREFIX = "history/v2/observations";
@@ -73,8 +77,7 @@ function parseOptionalBoolean(raw, fallback) {
 }
 
 function parseReadVersion(raw) {
-  const value = String(raw || "").trim().toLowerCase();
-  return value === "v2" ? "v2" : "v1";
+  return parseR2HistoryVersion(raw, { varName: "readVersion" });
 }
 
 function parseRequiredPositiveInt(raw) {
@@ -1116,7 +1119,7 @@ async function handleRequest(requestParams, env) {
     sinceIso,
     limit,
   } = requestParams;
-  const readVersion = parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION);
+  const readVersion = resolveR2HistoryVersion(env, { context: "R2 observations history API reads" });
   const historyPrefix = readVersion === "v2"
     ? (
       normalizePrefix(env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || DEFAULT_HISTORY_V2_PREFIX)
@@ -1345,7 +1348,7 @@ export default {
       });
     }
 
-    const readVersion = parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION);
+    const readVersion = resolveR2HistoryVersion(env, { context: "R2 observations history API reads" });
     const cacheKey = buildCanonicalCacheKey(request.url, requestParams, readVersion);
     const cached = await caches.default.match(cacheKey);
     if (cached) {
@@ -1359,7 +1362,7 @@ export default {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const errorName = error instanceof Error ? error.name : "UnknownError";
-      const readVersion = parseReadVersion(env.UK_AQ_R2_HISTORY_READ_VERSION);
+      const readVersion = resolveR2HistoryVersion(env, { context: "R2 observations history API reads" });
       // --- DIAG: error ---
       console.warn("UK_AQ_OBSERVS_ERROR", JSON.stringify({
         stage: "error",

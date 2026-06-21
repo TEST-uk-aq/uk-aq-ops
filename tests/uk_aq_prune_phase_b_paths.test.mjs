@@ -19,7 +19,7 @@ function runManifestKey(prefix, runId = RUN_ID) {
 }
 
 test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () => {
-  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" });
+  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v2" });
 
   assert.equal(resolved.history_write_version, "v2");
   assert.equal(resolved.aqilevels_prefix, "history/v2/aqilevels/hourly/data");
@@ -34,9 +34,19 @@ test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () =
   );
 });
 
+test("Phase B rejects deprecated split write version", () => {
+  assert.throws(
+    () => resolvePhaseBHistoryWritePrefixes({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_R2_HISTORY_WRITE_VERSION: "v2",
+    }),
+    /UK_AQ_R2_HISTORY_WRITE_VERSION/,
+  );
+});
+
 test("Phase B v2 resolves run manifests to the v2 ops prefix even when legacy runs prefix is present", () => {
   const resolved = resolvePhaseBHistoryWritePrefixes({
-    UK_AQ_R2_HISTORY_WRITE_VERSION: "v2",
+    UK_AQ_R2_HISTORY_VERSION: "v2",
     UK_AQ_R2_HISTORY_RUNS_PREFIX: "history/v1/_ops/observations/runs",
   });
 
@@ -48,7 +58,7 @@ test("Phase B v2 resolves run manifests to the v2 ops prefix even when legacy ru
 });
 
 test("Phase B v1 keeps existing v1 AQI levels and run manifest prefixes", () => {
-  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_WRITE_VERSION: "v1" });
+  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v1" });
 
   assert.equal(resolved.history_write_version, "v1");
   assert.equal(resolved.aqilevels_prefix, "history/v1/aqilevels/hourly");
@@ -64,7 +74,7 @@ test("Phase B v1 keeps existing v1 AQI levels and run manifest prefixes", () => 
 });
 
 test("Phase B v2 write targets do not resolve AQI or run manifests under legacy v1 prefixes", () => {
-  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" });
+  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v2" });
   const dayManifestKey = buildDayManifestKey(resolved.aqilevels_prefix, DAY);
   const connectorManifestKey = buildConnectorManifestKey(resolved.aqilevels_prefix, DAY, 7);
   const runKey = runManifestKey(resolved.runs_prefix);
@@ -76,7 +86,7 @@ test("Phase B v2 write targets do not resolve AQI or run manifests under legacy 
 
 
 test("Phase B v2 AQI data paths are pollutant-partitioned and not connector-level parquet", () => {
-  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" });
+  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v2" });
   const pollutantManifestKey = buildHistoryV2PollutantManifestKey(resolved.aqilevels_prefix, "2026-06-13", 3, "pm25");
   const pollutantPartKey = buildHistoryV2PartKey(resolved.aqilevels_prefix, "2026-06-13", 3, "pm25", 0);
   const oldBadConnectorPartKey = `${resolved.aqilevels_prefix}/day_utc=2026-06-13/connector_id=3/part-00000.parquet`;
@@ -157,7 +167,7 @@ test("Phase B v2 AQI manifests point day and connector parents at child pollutan
 });
 
 test("Phase B v2 AQI debug paths use the same pollutant partition shape", () => {
-  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_WRITE_VERSION: "v2" });
+  const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v2" });
   assert.equal(
     buildHistoryV2PollutantManifestKey(resolved.aqilevels_hourly_debug_prefix_v2, DAY, 7, "pm10"),
     "history/v2/aqilevels/hourly/debug/day_utc=2026-06-14/connector_id=7/pollutant_code=pm10/manifest.json",

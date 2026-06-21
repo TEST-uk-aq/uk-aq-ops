@@ -79,7 +79,7 @@ class HistoryVersionPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / "backfill.env"
             env_path.write_text(
-                "UK_AQ_R2_HISTORY_READ_VERSION=v2\n"
+                "UK_AQ_R2_HISTORY_VERSION=v2\n"
                 "UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX=from-file/v2/observations\n"
                 "UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX=from-file/v2/aqi/data\n",
                 encoding="utf-8",
@@ -88,19 +88,19 @@ class HistoryVersionPathTests(unittest.TestCase):
                 os.environ,
                 {
                     "UK_AQ_BACKFILL_ENV_FILE": str(env_path),
-                    "UK_AQ_R2_HISTORY_READ_VERSION": "v1",
+                    "UK_AQ_R2_HISTORY_VERSION": "v1",
                 },
                 clear=True,
             ):
                 result = MODULE.load_backfill_env_file_if_set()
                 self.assertTrue(result["loaded"])
-                self.assertEqual(os.environ["UK_AQ_R2_HISTORY_READ_VERSION"], "v1")
+                self.assertEqual(os.environ["UK_AQ_R2_HISTORY_VERSION"], "v1")
                 self.assertEqual(
                     os.environ["UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX"],
                     "from-file/v2/observations",
                 )
-                self.assertIn("UK_AQ_R2_HISTORY_READ_VERSION", result["shared_history_keys"])
-                self.assertIn("UK_AQ_R2_HISTORY_READ_VERSION", result["skipped_existing_keys"])
+                self.assertIn("UK_AQ_R2_HISTORY_VERSION", result["shared_history_keys"])
+                self.assertIn("UK_AQ_R2_HISTORY_VERSION", result["skipped_existing_keys"])
 
     def test_open_db_adds_history_version_columns_for_persistent_history_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

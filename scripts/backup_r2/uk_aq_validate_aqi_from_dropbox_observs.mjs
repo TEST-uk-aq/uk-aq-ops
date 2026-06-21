@@ -15,6 +15,7 @@ import {
   utcDayEndIso,
   utcDayStartIso,
 } from "../../workers/uk_aq_backfill_local/backfill_core.mjs";
+import { resolveR2HistoryVersion } from "../../workers/shared/uk_aq_r2_history_version.mjs";
 
 const DEFAULT_OBSERVATIONS_PREFIX_V1 = "history/v1/observations";
 const DEFAULT_AQILEVELS_PREFIX_V1 = "history/v1/aqilevels/hourly";
@@ -74,7 +75,7 @@ function usage() {
     "  UK_AQ_DROPBOX_ROOT",
     "  UK_AQ_R2_HISTORY_DROPBOX_ROOT",
     "  UK_AQ_R2_HISTORY_DROPBOX_LOCAL_ROOT",
-    "  UK_AQ_R2_HISTORY_WRITE_VERSION (v1|v2)",
+    "  UK_AQ_R2_HISTORY_VERSION (v1|v2)",
     "  UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX (v1 default history/v1/observations)",
     "  UK_AQ_R2_HISTORY_AQILEVELS_PREFIX (v1 default history/v1/aqilevels/hourly)",
     "  UK_AQ_R2_HISTORY_CORE_PREFIX (v1 default history/v1/core)",
@@ -87,7 +88,7 @@ function usage() {
 function parseArgs(argv) {
   const args = {
     root: "",
-    historyVersion: parseHistoryVersion(process.env.UK_AQ_R2_HISTORY_WRITE_VERSION || "v1"),
+    historyVersion: "",
     fromDay: "",
     toDay: "",
     connectorIds: new Set(),
@@ -201,11 +202,14 @@ function parseArgs(argv) {
   if (args.sawDryRun && args.sawWriteR2) {
     throw new Error("Use either --dry-run or --write-r2, not both");
   }
+  if (!args.historyVersion) {
+    args.historyVersion = resolveR2HistoryVersion(process.env, { context: "R2 AQI Dropbox validation writes" });
+  }
   return args;
 }
 
 function parseHistoryVersion(rawValue) {
-  const value = String(rawValue || "v1").trim().toLowerCase();
+  const value = String(rawValue || "").trim().toLowerCase();
   if (value === "v1" || value === "v2") return value;
   throw new Error("history version must be v1 or v2");
 }
@@ -808,7 +812,7 @@ function resolveCorePrefixForVersion(historyVersion) {
 function formatWriteCommand({ dayUtc, connectorIds, backfillScript, historyVersion }) {
   const connectorCsv = connectorIds.join(",");
   return [
-    `UK_AQ_R2_HISTORY_WRITE_VERSION=${historyVersion}`,
+    `UK_AQ_R2_HISTORY_VERSION=${historyVersion}`,
     `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`,
     `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`,
     `UK_AQ_BACKFILL_DRY_RUN=false`,
@@ -826,7 +830,7 @@ function executeWriteCommands({ groupedByDay, backfillScript, repoRoot, historyV
     const connectorIds = Array.from(connectorSet).sort((left, right) => left - right);
     const env = {
       ...process.env,
-      UK_AQ_R2_HISTORY_WRITE_VERSION: historyVersion,
+      UK_AQ_R2_HISTORY_VERSION: historyVersion,
       UK_AQ_BACKFILL_RUN_MODE: "r2_history_obs_to_aqilevels",
       UK_AQ_BACKFILL_OUTPUT_SCOPE: "aqilevels_only",
       UK_AQ_BACKFILL_DRY_RUN: "false",
@@ -835,6 +839,9 @@ function executeWriteCommands({ groupedByDay, backfillScript, repoRoot, historyV
       UK_AQ_BACKFILL_TO_DAY_UTC: dayUtc,
       UK_AQ_BACKFILL_CONNECTOR_IDS: connectorIds.join(","),
     };
+    delete env.UK_AQ_R2_HISTORY_READ_VERSION;
+    delete env.UK_AQ_R2_HISTORY_WRITE_VERSION;
+    delete env.UK_AQ_R2_HISTORY_BACKUP_VERSION;
     const result = spawnSync(backfillScript, [], {
       cwd: repoRoot,
       env,

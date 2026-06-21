@@ -33,26 +33,26 @@ const helpers = vm.runInNewContext(js, {
 });
 
 test('storage coverage Dropbox checkpoint defaults follow the active R2 history read version', () => {
-  const v1 = helpers.resolveDropboxStatePath({ UK_AQ_R2_HISTORY_READ_VERSION: 'v1' });
+  const v1 = helpers.resolveDropboxStatePath({ UK_AQ_R2_HISTORY_VERSION: 'v1' });
   assert.equal(v1.path, '/CIC-Test/R2_history_backup/_ops/checkpoints/r2_history_backup_state_v1.json');
   assert.equal(v1.source, 'default:v1');
   assert.equal(v1.fallbackAttempted, false);
-  assert.match(helpers.storageCoverageCacheKey({ UK_AQ_R2_HISTORY_READ_VERSION: 'v1' }), /v1:/);
+  assert.match(helpers.storageCoverageCacheKey({ UK_AQ_R2_HISTORY_VERSION: 'v1' }), /v1:/);
 
-  const v2 = helpers.resolveDropboxStatePath({ UK_AQ_R2_HISTORY_READ_VERSION: 'v2' });
+  const v2 = helpers.resolveDropboxStatePath({ UK_AQ_R2_HISTORY_VERSION: 'v2' });
   assert.equal(v2.path, '/CIC-Test/R2_history_backup/_ops/checkpoints/r2_history_backup_state_v2.json');
   assert.equal(v2.source, 'default:v2');
   assert.equal(v2.fallbackAttempted, false);
-  assert.match(helpers.storageCoverageCacheKey({ UK_AQ_R2_HISTORY_READ_VERSION: 'v2' }), /v2:/);
+  assert.match(helpers.storageCoverageCacheKey({ UK_AQ_R2_HISTORY_VERSION: 'v2' }), /v2:/);
   assert.match(
-    helpers.dashboardCacheKey(new URLSearchParams('include_storage_coverage=1'), { UK_AQ_R2_HISTORY_READ_VERSION: 'v2' }),
+    helpers.dashboardCacheKey(new URLSearchParams('include_storage_coverage=1'), { UK_AQ_R2_HISTORY_VERSION: 'v2' }),
     /r2_history_backup_state_v2\.json/,
   );
 });
 
 test('v2 mode does not silently fall back to a configured v1 Dropbox checkpoint', () => {
   const resolved = helpers.resolveDropboxStatePath({
-    UK_AQ_R2_HISTORY_READ_VERSION: 'v2',
+    UK_AQ_R2_HISTORY_VERSION: 'v2',
     UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: '_ops/checkpoints/r2_history_backup_state_v1.json',
   });
   assert.equal(resolved.path, '/CIC-Test/R2_history_backup/_ops/checkpoints/r2_history_backup_state_v2.json');
@@ -60,7 +60,7 @@ test('v2 mode does not silently fall back to a configured v1 Dropbox checkpoint'
   assert.equal(resolved.fallbackAttempted, false);
   assert.match(resolved.warning, /ignored/i);
   assert.match(helpers.storageCoverageCacheKey({
-    UK_AQ_R2_HISTORY_READ_VERSION: 'v2',
+    UK_AQ_R2_HISTORY_VERSION: 'v2',
     UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: '_ops/checkpoints/r2_history_backup_state_v1.json',
   }), /r2_history_backup_state_v2\.json/);
 });

@@ -215,9 +215,10 @@ class V2RepairExecutionTests(unittest.TestCase):
             log=self.log,
         )
         repair = metrics["planned_v2_observation_repairs"][0]
-        self.assertIn("UK_AQ_R2_HISTORY_WRITE_VERSION=v2", repair)
-        self.assertIn("UK_AQ_R2_HISTORY_BACKUP_VERSION=v2", repair)
+        self.assertIn("UK_AQ_R2_HISTORY_VERSION=v2", repair)
         self.assertIn("UK_AQ_R2_HISTORY_INDEX_VERSION=v2", repair)
+        self.assertNotIn("UK_AQ_R2_HISTORY_WRITE_VERSION", repair)
+        self.assertNotIn("UK_AQ_R2_HISTORY_BACKUP_VERSION", repair)
         self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=6", repair)
         self.assertIn("UK_AQ_BACKFILL_TIMESERIES_IDS=101,102", repair)
         self.assertNotIn("v1_dropbox_to_v2_observations_backfill_plan", repair)
@@ -702,7 +703,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             )
 
         self.assertEqual(metrics["backfills_attempted"], 1)
-        self.assertIn("UK_AQ_R2_HISTORY_WRITE_VERSION=v2", metrics["planned_backfills"][0])
+        self.assertIn("UK_AQ_R2_HISTORY_VERSION=v2", metrics["planned_backfills"][0])
         self.assertIn("--history-version v2", metrics["planned_backfills"][0])
         self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=6", metrics["planned_backfills"][0])
         self.assertEqual(check_file.call_args.kwargs["force_download_when_cache_missing"], True)
@@ -742,7 +743,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             )
 
         self.assertEqual(metrics["backfills_attempted"], 1)
-        self.assertIn("UK_AQ_R2_HISTORY_WRITE_VERSION=v2", metrics["planned_backfills"][0])
+        self.assertIn("UK_AQ_R2_HISTORY_VERSION=v2", metrics["planned_backfills"][0])
         self.assertIn("--history-version v2", metrics["planned_backfills"][0])
         self.assertEqual(check_file.call_args.kwargs["force_download_when_cache_missing"], True)
         self.assertEqual(run_bf.call_args.kwargs["history_version"], "v2")
@@ -777,7 +778,7 @@ class V2RepairExecutionTests(unittest.TestCase):
                 concurrency=1,
             )
 
-        self.assertIn("UK_AQ_R2_HISTORY_WRITE_VERSION=v1", metrics["planned_backfills"][0])
+        self.assertIn("UK_AQ_R2_HISTORY_VERSION=v1", metrics["planned_backfills"][0])
         self.assertIn("--history-version v1", metrics["planned_backfills"][0])
         self.assertEqual(run_bf.call_args.kwargs["history_version"], "v1")
 

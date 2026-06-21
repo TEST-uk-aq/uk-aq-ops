@@ -5,6 +5,11 @@ import {
   r2HeadObject,
 } from "../shared/r2_sigv4.mjs";
 import {
+  assertNoDeprecatedR2HistoryVersionVars,
+  parseR2HistoryVersion,
+  resolveR2HistoryVersion,
+} from "../shared/uk_aq_r2_history_version.mjs";
+import {
   buildR2HistoryIndexKey,
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey,
   buildR2HistoryV2ObservationsTimeseriesLatestKey,
@@ -15,8 +20,6 @@ import {
 const DEFAULT_LOOKBACK_DAYS = 28;
 const MAX_LOOKBACK_DAYS = 120;
 const R2_HISTORY_DAYS_MAX_LOOKBACK_DAYS = 3660;
-const R2_HISTORY_READ_VERSION_DEFAULT = "v1";
-const R2_HISTORY_READ_VERSION_VALUES = new Set(["v1", "v2"]);
 const R2_HISTORY_DAYS_DEFAULT_MAX_LOOKBACK_DAYS = 120;
 const R2_HISTORY_COUNTS_DEFAULT_RANGE_DAYS = 31;
 const R2_HISTORY_COUNTS_MAX_RANGE_DAYS = 3660;
@@ -604,22 +607,17 @@ async function listCommittedDaysForDomain({
 }
 
 function resolveR2HistoryReadVersion(env, url) {
-  const raw = String(url.searchParams.get("read_version") || env.UK_AQ_R2_HISTORY_READ_VERSION || "").trim();
-  const normalized = raw.toLowerCase();
-  if (!normalized) {
-    return {
-      version: R2_HISTORY_READ_VERSION_DEFAULT,
-      label: `R2_${R2_HISTORY_READ_VERSION_DEFAULT}`,
-      source: "default_missing_env",
-      warning: `UK_AQ_R2_HISTORY_READ_VERSION/read_version is not set; defaulting to ${R2_HISTORY_READ_VERSION_DEFAULT}.`,
-      valid: true,
-      raw,
-    };
+  assertNoDeprecatedR2HistoryVersionVars(env, { context: "R2 DB size metrics history reads" });
+  const queryValue = url.searchParams.get("read_version");
+  if (queryValue !== null && String(queryValue).trim() !== "") {
+    const version = parseR2HistoryVersion(queryValue, { varName: "read_version" });
+    return { version, label: `R2_${version}`, source: "query", warning: null, valid: true, raw: String(queryValue).trim() };
   }
-  if (R2_HISTORY_READ_VERSION_VALUES.has(normalized)) {
-    return { version: normalized, label: `R2_${normalized}`, source: url.searchParams.get("read_version") ? "query" : "env", warning: null, valid: true, raw };
-  }
-  throw new Error(`Invalid R2 history read version ${JSON.stringify(raw)}; expected v1 or v2`);
+  const version = resolveR2HistoryVersion(env, {
+    context: "R2 DB size metrics history reads",
+    guardDeprecated: false,
+  });
+  return { version, label: `R2_${version}`, source: "env", warning: null, valid: true, raw: String(env.UK_AQ_R2_HISTORY_VERSION || "").trim() };
 }
 
 export function resolveR2HistoryLayoutConfig(env, url) {

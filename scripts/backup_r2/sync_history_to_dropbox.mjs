@@ -56,11 +56,8 @@ function parseNonNegativeInt(rawValue, fallback) {
   return intValue;
 }
 
-const DEFAULT_BACKUP_VERSION = resolveBackupVersion(process.env);
 const ENV_STATE_REL_PATH =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || "").trim();
-const DEFAULT_STATE_REL_PATH = ENV_STATE_REL_PATH
-  || defaultStateRelPathForBackupVersion(DEFAULT_BACKUP_VERSION);
 const DEFAULT_MAX_DAYS_PER_RUN = parseNonNegativeInt(
   process.env.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN,
   0,
@@ -70,8 +67,6 @@ const DEFAULT_RCLONE_BIN =
 const DEFAULT_REPORT_OUT = String(process.env.UK_AQ_R2_HISTORY_BACKUP_REPORT_OUT || "").trim();
 const ENV_INVENTORY_REL_PATH =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim();
-const DEFAULT_INVENTORY_REL_PATH_ENV = ENV_INVENTORY_REL_PATH
-  || defaultInventoryRelPathForBackupVersion(DEFAULT_BACKUP_VERSION);
 const DROPBOX_WRITE_RETRY_MAX_ATTEMPTS = 7;
 const DROPBOX_WRITE_RETRY_INITIAL_DELAY_MS = 5_000;
 const DROPBOX_WRITE_RETRY_MAX_DELAY_MS = 60_000;
@@ -121,9 +116,9 @@ function usage() {
       "  --dest-root     Example: uk_aq_dropbox:/CIC-Test/R2_history_backup",
       "",
       "Optional:",
-      `  --backup-version <v>         v1 | v2. Default: ${DEFAULT_BACKUP_VERSION}`,
-      `  --inventory-rel-path <p>     Default: ${DEFAULT_INVENTORY_REL_PATH_ENV}`,
-      `  --state-rel-path <path>      Default: ${DEFAULT_STATE_REL_PATH}`,
+      "  --backup-version <v>         v1 | v2. Default: UK_AQ_R2_HISTORY_VERSION",
+      "  --inventory-rel-path <p>     Default: selected-version inventory path",
+      "  --state-rel-path <path>      Default: selected-version checkpoint path",
       "  --domain <name>              observations | aqilevels | aqilevels_debug | core (repeatable)",
       "  --max-days-per-run <N>       Safety throttle on day copies; 0 = unlimited",
       `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
@@ -140,7 +135,7 @@ function usage() {
 
 function parseArgs(argv) {
   const args = {
-    backup_version: DEFAULT_BACKUP_VERSION,
+    backup_version: "",
     source_root: "",
     dest_root: "",
     inventory_rel_path: ENV_INVENTORY_REL_PATH,
@@ -156,7 +151,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--backup-version") {
-      args.backup_version = parseBackupVersion(argv[i + 1], DEFAULT_BACKUP_VERSION);
+      args.backup_version = parseBackupVersion(argv[i + 1]);
       i += 1;
       continue;
     }
@@ -172,12 +167,12 @@ function parseArgs(argv) {
     }
     if (arg === "--inventory-rel-path") {
       args.inventory_rel_path =
-        String(argv[i + 1] || "").trim() || DEFAULT_INVENTORY_REL_PATH_ENV;
+        String(argv[i + 1] || "").trim();
       i += 1;
       continue;
     }
     if (arg === "--state-rel-path") {
-      args.state_rel_path = String(argv[i + 1] || "").trim() || DEFAULT_STATE_REL_PATH;
+      args.state_rel_path = String(argv[i + 1] || "").trim();
       i += 1;
       continue;
     }
@@ -223,6 +218,10 @@ function parseArgs(argv) {
       process.exit(0);
     }
     throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (!args.backup_version) {
+    args.backup_version = resolveBackupVersion(process.env);
   }
 
   if (!args.inventory_rel_path) {

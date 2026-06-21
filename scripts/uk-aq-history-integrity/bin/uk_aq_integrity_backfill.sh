@@ -492,8 +492,10 @@ else
   TARGET_KIND="aqilevels"
 fi
 
-export UK_AQ_R2_HISTORY_WRITE_VERSION="${HISTORY_VERSION}"
-export UK_AQ_R2_HISTORY_BACKUP_VERSION="${HISTORY_VERSION}"
+unset UK_AQ_R2_HISTORY_READ_VERSION || true
+unset UK_AQ_R2_HISTORY_WRITE_VERSION || true
+unset UK_AQ_R2_HISTORY_BACKUP_VERSION || true
+export UK_AQ_R2_HISTORY_VERSION="${HISTORY_VERSION}"
 export UK_AQ_R2_HISTORY_INDEX_VERSION="${HISTORY_VERSION}"
 export UK_AQ_BACKFILL_TRIGGER_MODE="manual"
 export UK_AQ_BACKFILL_DRY_RUN="${DRY_RUN}"
@@ -520,7 +522,7 @@ echo "env: ${ENV_NAME}"
 echo "mode: ${UK_AQ_BACKFILL_RUN_MODE}"
 echo "output_scope: ${UK_AQ_BACKFILL_OUTPUT_SCOPE}"
 echo "history_version: ${HISTORY_VERSION}"
-echo "write_version: ${UK_AQ_R2_HISTORY_WRITE_VERSION}"
+echo "r2_history_version: ${UK_AQ_R2_HISTORY_VERSION}"
 echo "dry_run: ${UK_AQ_BACKFILL_DRY_RUN}"
 echo "force_replace: ${UK_AQ_BACKFILL_FORCE_REPLACE}"
 echo "full_r2_history_index_rebuild: ${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX}"

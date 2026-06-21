@@ -37,6 +37,7 @@ function installHarness(objectsByKey = {}) {
     cachePutCalls,
     env: {
       UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret",
+      UK_AQ_R2_HISTORY_VERSION: "v1",
       UK_AQ_HISTORY_BUCKET: {
         async get(key) {
           getKeys.push(key);
@@ -132,7 +133,7 @@ test("observations Worker v2 requires pollutant partition and does not broad sca
       observationRequest(),
       {
         ...harness.env,
-        UK_AQ_R2_HISTORY_READ_VERSION: "v2",
+        UK_AQ_R2_HISTORY_VERSION: "v2",
       },
       harness.ctx,
     );
@@ -178,7 +179,7 @@ test("observations Worker v2 reads pollutant index path and reports missing parq
       observationRequest("pollutant=pm25"),
       {
         ...harness.env,
-        UK_AQ_R2_HISTORY_READ_VERSION: "v2",
+        UK_AQ_R2_HISTORY_VERSION: "v2",
         UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: "history/v2/observations",
         UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: "history/_index_v2",
         UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX:

@@ -46,7 +46,6 @@ import {
   runManifestPrefixForBackupVersion,
 } from "./lib/inventory.mjs";
 
-const DEFAULT_BACKUP_VERSION = resolveBackupVersion(process.env);
 const DEFAULT_INDEX_PREFIX = normalizePrefix(
   process.env.UK_AQ_R2_HISTORY_INDEX_PREFIX || "history/_index",
 );
@@ -55,8 +54,6 @@ const DEFAULT_INDEX_V2_PREFIX = normalizePrefix(
 );
 const ENV_INVENTORY_REL_PATH =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_INVENTORY_REL_PATH || "").trim();
-const DEFAULT_INVENTORY_REL_PATH = ENV_INVENTORY_REL_PATH
-  || defaultInventoryRelPathForBackupVersion(DEFAULT_BACKUP_VERSION);
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
 const DEFAULT_REPORT_OUT =
@@ -117,8 +114,8 @@ function usage() {
       "  --source-root              Example: uk_aq_r2:uk-aq-history-cic-test",
       "",
       "Optional:",
-      `  --backup-version <v>       v1 | v2. Default: ${DEFAULT_BACKUP_VERSION}`,
-      `  --inventory-rel-path <p>   Default: ${DEFAULT_INVENTORY_REL_PATH}`,
+      "  --backup-version <v>       v1 | v2. Default: UK_AQ_R2_HISTORY_VERSION",
+      "  --inventory-rel-path <p>   Default: selected-version inventory path",
       "  --domain <name>            observations | aqilevels | aqilevels_debug | core (repeatable)",
       `  --index-prefix <prefix>    Default: ${DEFAULT_INDEX_PREFIX || "history/_index"}`,
       `  --index-v2-prefix <prefix> Default: ${DEFAULT_INDEX_V2_PREFIX || "history/_index_v2"}`,
@@ -136,7 +133,7 @@ function usage() {
 function parseArgs(argv) {
   const args = {
     source_root: "",
-    backup_version: DEFAULT_BACKUP_VERSION,
+    backup_version: "",
     inventory_rel_path: ENV_INVENTORY_REL_PATH,
     domains: [],
     index_prefix: DEFAULT_INDEX_PREFIX,
@@ -152,7 +149,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--backup-version") {
-      args.backup_version = parseBackupVersion(argv[i + 1], DEFAULT_BACKUP_VERSION);
+      args.backup_version = parseBackupVersion(argv[i + 1]);
       i += 1;
       continue;
     }
@@ -163,7 +160,7 @@ function parseArgs(argv) {
     }
     if (arg === "--inventory-rel-path") {
       args.inventory_rel_path =
-        String(argv[i + 1] || "").trim() || DEFAULT_INVENTORY_REL_PATH;
+        String(argv[i + 1] || "").trim();
       i += 1;
       continue;
     }
@@ -220,6 +217,10 @@ function parseArgs(argv) {
       process.exit(0);
     }
     throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (!args.backup_version) {
+    args.backup_version = resolveBackupVersion(process.env);
   }
 
   if (!args.inventory_rel_path) {

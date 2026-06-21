@@ -16,6 +16,7 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
+import { resolveR2HistoryVersion } from "../shared/uk_aq_r2_history_version.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PART_MAX_ROWS = 1_000_000;
@@ -294,16 +295,8 @@ export function isAcceptedPruneHistoryDayManifestKey(value) {
   return key !== "" && PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX.test(key);
 }
 
-function parseHistoryWriteVersion(raw) {
-  const value = String(raw || "v1").trim().toLowerCase();
-  if (value === "v1" || value === "v2") {
-    return value;
-  }
-  throw new Error(`Invalid UK_AQ_R2_HISTORY_WRITE_VERSION=${String(raw)}; expected v1 or v2`);
-}
-
 export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
-  const historyWriteVersion = parseHistoryWriteVersion(env.UK_AQ_R2_HISTORY_WRITE_VERSION);
+  const historyWriteVersion = resolveR2HistoryVersion(env, { context: "R2 prune Phase B history writes" });
   const observationsPrefixV1 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || DEFAULT_COMMITTED_PREFIX,
   );

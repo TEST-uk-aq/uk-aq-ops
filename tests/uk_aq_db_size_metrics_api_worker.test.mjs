@@ -153,7 +153,7 @@ function testUrl(search = "") {
 }
 
 test("R2 history calendar resolver maps v1 to v1 indexes and prefixes", () => {
-  const layout = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: "v1" }, testUrl());
+  const layout = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: "v1" }, testUrl());
   assert.equal(layout.readVersion.label, "R2_v1");
   assert.equal(layout.observationsPrefix, "history/v1/observations");
   assert.equal(layout.aqilevelsPrefix, "history/v1/aqilevels/hourly");
@@ -162,7 +162,7 @@ test("R2 history calendar resolver maps v1 to v1 indexes and prefixes", () => {
 });
 
 test("R2 history calendar resolver maps v2 to v2 timeseries indexes and day prefixes", () => {
-  const layout = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: "v2" }, testUrl());
+  const layout = resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" }, testUrl());
   assert.equal(layout.readVersion.label, "R2_v2");
   assert.equal(layout.observationsPrefix, "history/v2/observations");
   assert.equal(layout.aqilevelsPrefix, "history/v2/aqilevels/hourly/data");
@@ -174,7 +174,7 @@ test("R2 history calendar resolver maps v2 to v2 timeseries indexes and day pref
 
 test("R2 history calendar resolver honours explicit v2 env defaults and query labels", () => {
   const layout = resolveR2HistoryLayoutConfig({
-    UK_AQ_R2_HISTORY_READ_VERSION: "v1",
+    UK_AQ_R2_HISTORY_VERSION: "v1",
     UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: "custom/v2/obs/",
     UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: "custom/v2/aqi/",
     UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: "custom/_index_v2/",
@@ -189,8 +189,25 @@ test("R2 history calendar resolver honours explicit v2 env defaults and query la
 
 test("invalid R2 history read version gives a clear warning/error", () => {
   assert.throws(
-    () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_READ_VERSION: "v3" }, testUrl()),
-    /Invalid R2 history read version "v3"; expected v1 or v2/,
+    () => resolveR2HistoryLayoutConfig({ UK_AQ_R2_HISTORY_VERSION: "v3" }, testUrl()),
+    /Invalid UK_AQ_R2_HISTORY_VERSION="v3"; expected v1 or v2/,
+  );
+});
+
+test("missing R2 history version gives a clear warning/error", () => {
+  assert.throws(
+    () => resolveR2HistoryLayoutConfig({}, testUrl()),
+    /Missing UK_AQ_R2_HISTORY_VERSION/,
+  );
+});
+
+test("deprecated split read version is rejected even with canonical env set", () => {
+  assert.throws(
+    () => resolveR2HistoryLayoutConfig({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_R2_HISTORY_READ_VERSION: "v2",
+    }, testUrl()),
+    /UK_AQ_R2_HISTORY_READ_VERSION/,
   );
 });
 
@@ -365,7 +382,7 @@ test("v2 counts API aggregates connector rows from v2 latest index connector sum
   const { status, payload } = await fetchCountsJson(
     "?read_version=v2&from_day=2026-06-12&to_day=2026-06-14&grain=day",
     objects,
-    { UK_AQ_R2_HISTORY_READ_VERSION: "v1" },
+    { UK_AQ_R2_HISTORY_VERSION: "v1" },
   );
 
   assert.equal(status, 200);

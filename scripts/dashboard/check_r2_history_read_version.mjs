@@ -1,39 +1,44 @@
 #!/usr/bin/env node
 
-const ACCEPTED = new Set(["v1", "v2"]);
-const DEFAULT_VERSION = "v1";
+import {
+  deprecatedR2HistoryVersionVarsPresent,
+  parseR2HistoryVersion,
+} from "../../workers/shared/uk_aq_r2_history_version.mjs";
 
 function resolveR2HistoryReadVersion(env = process.env) {
-  const raw = String(env.UK_AQ_R2_HISTORY_READ_VERSION || "").trim();
-  const normalized = raw.toLowerCase();
-  if (!normalized) {
+  const deprecated = deprecatedR2HistoryVersionVarsPresent(env);
+  if (deprecated.length > 0) {
     return {
-      version: DEFAULT_VERSION,
-      label: `R2_${DEFAULT_VERSION}`,
-      source: "default_missing_env",
-      warning: `UK_AQ_R2_HISTORY_READ_VERSION is not set; defaulting to ${DEFAULT_VERSION} to preserve existing dashboard behaviour.`,
-      valid: true,
+      version: null,
+      label: "R2 invalid",
+      source: "invalid_env",
+      warning: `Deprecated R2 history version env var(s) ${deprecated.join(", ")} are no longer supported. Use UK_AQ_R2_HISTORY_VERSION=v1|v2.`,
+      valid: false,
+      raw: "",
+    };
+  }
+  const raw = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
+  try {
+    const version = parseR2HistoryVersion(raw);
+    return { version, label: `R2_${version}`, source: "env", warning: null, valid: true, raw };
+  } catch (error) {
+    return {
+      version: null,
+      label: "R2 invalid",
+      source: raw ? "invalid_env" : "missing_env",
+      warning: error instanceof Error ? error.message : String(error),
+      valid: false,
       raw,
     };
   }
-  if (ACCEPTED.has(normalized)) {
-    return { version: normalized, label: `R2_${normalized}`, source: "env", warning: null, valid: true, raw };
-  }
-  return {
-    version: null,
-    label: "R2 invalid",
-    source: "invalid_env",
-    warning: `Invalid UK_AQ_R2_HISTORY_READ_VERSION=${JSON.stringify(raw)}; expected v1 or v2.`,
-    valid: false,
-    raw,
-  };
 }
 
 const cases = [
-  ["v1", { UK_AQ_R2_HISTORY_READ_VERSION: "v1" }, { version: "v1", label: "R2_v1", valid: true, source: "env" }],
-  ["v2", { UK_AQ_R2_HISTORY_READ_VERSION: "v2" }, { version: "v2", label: "R2_v2", valid: true, source: "env" }],
-  ["missing", {}, { version: "v1", label: "R2_v1", valid: true, source: "default_missing_env" }],
-  ["invalid", { UK_AQ_R2_HISTORY_READ_VERSION: "v3" }, { version: null, label: "R2 invalid", valid: false, source: "invalid_env" }],
+  ["v1", { UK_AQ_R2_HISTORY_VERSION: "v1" }, { version: "v1", label: "R2_v1", valid: true, source: "env" }],
+  ["v2", { UK_AQ_R2_HISTORY_VERSION: "v2" }, { version: "v2", label: "R2_v2", valid: true, source: "env" }],
+  ["missing", {}, { version: null, label: "R2 invalid", valid: false, source: "missing_env" }],
+  ["invalid", { UK_AQ_R2_HISTORY_VERSION: "v3" }, { version: null, label: "R2 invalid", valid: false, source: "invalid_env" }],
+  ["deprecated", { UK_AQ_R2_HISTORY_READ_VERSION: "v2", UK_AQ_R2_HISTORY_VERSION: "v2" }, { version: null, label: "R2 invalid", valid: false, source: "invalid_env" }],
 ];
 
 for (const [name, env, expected] of cases) {

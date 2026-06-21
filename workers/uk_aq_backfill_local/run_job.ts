@@ -714,12 +714,30 @@ const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
 
-function parseHistoryWriteVersion(raw: string | undefined): "v1" | "v2" {
-  const value = String(raw || "v1").trim().toLowerCase();
+const CANONICAL_R2_HISTORY_VERSION_ENV = "UK_AQ_R2_HISTORY_VERSION";
+const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
+  "UK_AQ_R2_HISTORY_READ_VERSION",
+  "UK_AQ_R2_HISTORY_WRITE_VERSION",
+  "UK_AQ_R2_HISTORY_BACKUP_VERSION",
+];
+
+function resolveHistoryWriteVersionFromEnv(): "v1" | "v2" {
+  const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) => Deno.env.get(name) !== undefined);
+  if (presentDeprecated.length > 0) {
+    throw new Error(
+      `R2 local backfill no longer supports ${presentDeprecated.join(", ")}. `
+        + `Use ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split read/write/backup vars.`,
+    );
+  }
+  const raw = Deno.env.get(CANONICAL_R2_HISTORY_VERSION_ENV);
+  const value = String(raw || "").trim().toLowerCase();
   if (value === "v1" || value === "v2") {
     return value;
   }
-  throw new Error(`Invalid UK_AQ_R2_HISTORY_WRITE_VERSION=${String(raw)}; expected v1 or v2`);
+  if (!value) {
+    throw new Error(`Missing ${CANONICAL_R2_HISTORY_VERSION_ENV}; set ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1 or ${CANONICAL_R2_HISTORY_VERSION_ENV}=v2.`);
+  }
+  throw new Error(`Invalid ${CANONICAL_R2_HISTORY_VERSION_ENV}=${JSON.stringify(String(raw))}; expected v1 or v2`);
 }
 
 const OBS_R2_HISTORY_PREFIX = normalizePrefix(
@@ -729,9 +747,7 @@ const OBS_R2_HISTORY_PREFIX = normalizePrefix(
 const AQI_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") || "history/v1/aqilevels/hourly",
 ) || "history/v1/aqilevels/hourly";
-const HISTORY_R2_WRITE_VERSION = parseHistoryWriteVersion(
-  Deno.env.get("UK_AQ_R2_HISTORY_WRITE_VERSION") || undefined,
-);
+const HISTORY_R2_WRITE_VERSION = resolveHistoryWriteVersionFromEnv();
 const OBS_R2_HISTORY_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX") ||
     HISTORY_R2_V2_OBSERVATIONS_PREFIX,
