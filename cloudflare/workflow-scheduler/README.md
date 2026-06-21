@@ -7,27 +7,25 @@ This Worker replaces selected GitHub cron schedules by calling GitHub `workflow_
 Change schedule times only in:
 - `cloudflare/workflow-scheduler/wrangler.toml`
 
-Each cron line must include `job_key` comment:
+Each cron line must include a `job_keys` comment with one or more comma-separated logical job keys:
 
 ```toml
 [triggers]
 crons = [
-  "0 3 * * *",   # job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
-  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot_v1 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "20 4 * * *",  # job_key: uk_aq_r2_core_snapshot_v2 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup_v1 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "45 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup_v2 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "49 5 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
+  "0 3 * * *",   # job_keys: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
+  "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot_v1, uk_aq_r2_core_snapshot_v2 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup_v1, uk_aq_r2_history_dropbox_backup_v2 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "49 5 * * *",  # job_keys: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]
 ```
 
-`worker.js` does not store literal cron values in source. Deploy injects the cron map from `wrangler.toml` by `job_key`.
+`worker.js` does not store literal cron values in source. Deploy injects the cron-to-logical-job map from `wrangler.toml` by `job_keys`.
 
 ## How Routing Works
 
 1. Cloudflare fires `scheduled()` and passes only the cron string (no job name).
-2. Deploy workflow builds `job_key -> cron` map from `wrangler.toml` comments.
-3. Worker matches received cron string to job keys, then dispatches matching workflows.
+2. Deploy workflow builds a `cron -> [job_key, ...]` map from `wrangler.toml` comments.
+3. Worker matches the received cron string to one or more logical job keys, then dispatches matching workflows.
 4. Version-specific R2 jobs pass explicit `workflow_dispatch` inputs instead of relying on workflow defaults: core snapshot uses `history_version`, and Dropbox backup uses `backup_version`.
 
 ## Required Secret
@@ -63,15 +61,14 @@ Optional:
 ## Logging
 
 Configured R2 history jobs:
-- `uk_aq_r2_core_snapshot_v1` at 04:15 UTC dispatches `uk_aq_r2_core_snapshot.yml` with `history_version=v1`.
-- `uk_aq_r2_core_snapshot_v2` at 04:20 UTC dispatches `uk_aq_r2_core_snapshot.yml` with `history_version=v2`.
-- `uk_aq_r2_history_dropbox_backup_v1` at 04:35 UTC dispatches `uk_aq_r2_history_dropbox_backup.yml` with `backup_version=v1`.
-- `uk_aq_r2_history_dropbox_backup_v2` at 04:45 UTC dispatches `uk_aq_r2_history_dropbox_backup.yml` with `backup_version=v2`.
+- `15 4 * * *` dispatches both `uk_aq_r2_core_snapshot_v1` and `uk_aq_r2_core_snapshot_v2` to `uk_aq_r2_core_snapshot.yml` with explicit `history_version=v1` and `history_version=v2` inputs.
+- `35 4 * * *` dispatches both `uk_aq_r2_history_dropbox_backup_v1` and `uk_aq_r2_history_dropbox_backup_v2` to `uk_aq_r2_history_dropbox_backup.yml` with explicit `backup_version=v1` and `backup_version=v2` inputs.
 
 Worker logs include:
 - received cron expression
-- `job_key` and workflow being dispatched
+- cron expression, `job_key`, workflow, and non-secret workflow inputs being dispatched
 - GitHub API response status
+- grouped summary for cron events that dispatch multiple logical jobs
 - GitHub error response body (if any)
 
 ## Ops Notes

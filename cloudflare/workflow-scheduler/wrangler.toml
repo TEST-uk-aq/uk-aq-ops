@@ -8,10 +8,8 @@ compatibility_date = "2026-05-13"
 # Schedule is in UTC
 [triggers]
 crons = [
-  "0 3 * * *",   # job_key: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
-  "15 4 * * *",  # job_key: uk_aq_r2_core_snapshot_v1 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "20 4 * * *",  # job_key: uk_aq_r2_core_snapshot_v2 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "35 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup_v1 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "45 4 * * *",  # job_key: uk_aq_r2_history_dropbox_backup_v2 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "49 5 * * *",  # job_key: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
+  "0 3 * * *",   # job_keys: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
+  "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot_v1, uk_aq_r2_core_snapshot_v2 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup_v1, uk_aq_r2_history_dropbox_backup_v2 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "49 5 * * *",  # job_keys: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]
