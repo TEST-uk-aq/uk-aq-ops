@@ -2,9 +2,6 @@ name = "uk-aq-workflow-scheduler"
 main = "worker.js"
 compatibility_date = "2026-05-13"
 
-[vars]
-UK_AQ_R2_HISTORY_VERSION = "v2"
-
 # Single schedule source of truth.
 # Edit only these cron lines when changing run times.
 # Format: "<cron>", # job_key: <job_key> | <repo>/<workflow_file>
@@ -12,7 +9,7 @@ UK_AQ_R2_HISTORY_VERSION = "v2"
 [triggers]
 crons = [
   "0 3 * * *",   # job_keys: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
-  "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "30 9 * * *",  # job_keys: uk_aq_r2_core_snapshot_v1, uk_aq_r2_core_snapshot_v2 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "25 9 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup_v1, uk_aq_r2_history_dropbox_backup_v2 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
   "49 5 * * *",  # job_keys: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]

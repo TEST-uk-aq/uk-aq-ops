@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { dispatchWorkflow, inputsForJob, JOBS } from "../cloudflare/workflow-scheduler/worker.js";
+import { dispatchWorkflow, JOBS } from "../cloudflare/workflow-scheduler/worker.js";
 
 const wranglerText = readFileSync("cloudflare/workflow-scheduler/wrangler.toml", "utf8");
 const workerText = readFileSync("cloudflare/workflow-scheduler/worker.js", "utf8");
@@ -49,23 +49,27 @@ test("every wrangler cron maps to existing worker jobs", () => {
   }
 });
 
-test("core snapshot cron slot dispatches one active history-version job", () => {
+test("core snapshot cron slot dispatches v1 and v2 with explicit inputs", () => {
   const cronJobMap = parseCronJobMap();
-  assert.deepEqual(cronJobMap.get("15 4 * * *"), ["uk_aq_r2_core_snapshot"]);
-  const job = jobByKey("uk_aq_r2_core_snapshot");
-  assert.equal(job.history_version_input, true);
-  assert.deepEqual(inputsForJob(job, { UK_AQ_R2_HISTORY_VERSION: "v2" }), { history_version: "v2" });
+  assert.deepEqual(cronJobMap.get("15 4 * * *"), [
+    "uk_aq_r2_core_snapshot_v1",
+    "uk_aq_r2_core_snapshot_v2",
+  ]);
+  assert.deepEqual(jobByKey("uk_aq_r2_core_snapshot_v1").inputs, { history_version: "v1" });
+  assert.deepEqual(jobByKey("uk_aq_r2_core_snapshot_v2").inputs, { history_version: "v2" });
 });
 
-test("Dropbox backup cron slot dispatches one active history-version job", () => {
+test("Dropbox backup cron slot dispatches v1 and v2 with explicit inputs", () => {
   const cronJobMap = parseCronJobMap();
-  assert.deepEqual(cronJobMap.get("35 4 * * *"), ["uk_aq_r2_history_dropbox_backup"]);
-  const job = jobByKey("uk_aq_r2_history_dropbox_backup");
-  assert.equal(job.history_version_input, true);
-  assert.deepEqual(inputsForJob(job, { UK_AQ_R2_HISTORY_VERSION: "v2" }), { history_version: "v2" });
+  assert.deepEqual(cronJobMap.get("35 4 * * *"), [
+    "uk_aq_r2_history_dropbox_backup_v1",
+    "uk_aq_r2_history_dropbox_backup_v2",
+  ]);
+  assert.deepEqual(jobByKey("uk_aq_r2_history_dropbox_backup_v1").inputs, { backup_version: "v1" });
+  assert.deepEqual(jobByKey("uk_aq_r2_history_dropbox_backup_v2").inputs, { backup_version: "v2" });
 });
 
-test("dispatchWorkflow includes active history_version in GitHub API body", async () => {
+test("dispatchWorkflow includes inputs in GitHub API body when present", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (url, init) => {
@@ -74,11 +78,7 @@ test("dispatchWorkflow includes active history_version in GitHub API body", asyn
   };
 
   try {
-    await dispatchWorkflow(
-      jobByKey("uk_aq_r2_history_dropbox_backup"),
-      "test-token",
-      { UK_AQ_R2_HISTORY_VERSION: "v2" },
-    );
+    await dispatchWorkflow(jobByKey("uk_aq_r2_history_dropbox_backup_v2"), "test-token");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -86,15 +86,8 @@ test("dispatchWorkflow includes active history_version in GitHub API body", asyn
   assert.equal(calls.length, 1);
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     ref: "main",
-    inputs: { history_version: "v2" },
+    inputs: { backup_version: "v2" },
   });
-});
-
-test("history-version jobs reject missing active Worker config", () => {
-  assert.throws(
-    () => inputsForJob(jobByKey("uk_aq_r2_core_snapshot"), {}),
-    /Missing required Worker var: UK_AQ_R2_HISTORY_VERSION/,
-  );
 });
 
 test("dispatchWorkflow preserves single-job cron behaviour by omitting inputs when absent", async () => {
@@ -118,6 +111,4 @@ test("dispatchWorkflow preserves single-job cron behaviour by omitting inputs wh
 test("worker source uses cron-to-array map for grouped logical jobs", () => {
   assert.match(workerText, /export const CRON_JOB_MAP/);
   assert.match(workerText, /const jobKeys = CRON_JOB_MAP\[cronExpression\] \|\| \[\]/);
-  assert.doesNotMatch(workerText, /uk_aq_r2_core_snapshot_v[12]/);
-  assert.doesNotMatch(workerText, /uk_aq_r2_history_dropbox_backup_v[12]/);
 });

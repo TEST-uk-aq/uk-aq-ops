@@ -15,11 +15,6 @@ name: UK AQ R2 Initial Build Inventory
 on:
   workflow_dispatch:
     inputs:
-      history_version:
-        description: "R2 history inventory version (v1 or v2). Blank = repo variable UK_AQ_R2_HISTORY_VERSION."
-        required: false
-        default: ""
-        type: string
       full_rebuild:
         description: "Ignore previous inventory; re-read every manifest from R2"
         required: false
@@ -51,7 +46,8 @@ jobs:
       UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
       UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels/hourly' }}
       UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
-      UK_AQ_R2_HISTORY_VERSION: ${{ github.event.inputs.history_version || vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_R2_HISTORY_WRITE_VERSION: ${{ vars.UK_AQ_R2_HISTORY_WRITE_VERSION || 'v1' }}
+      UK_AQ_R2_HISTORY_BACKUP_VERSION: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_VERSION || '' }}
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || 'history/v2/aqilevels/hourly/debug' }}
@@ -84,7 +80,6 @@ jobs:
             CFLARE_R2_BUCKET
             CFLARE_R2_ACCESS_KEY_ID
             CFLARE_R2_SECRET_ACCESS_KEY
-            UK_AQ_R2_HISTORY_VERSION
           )
 
           missing=0
@@ -98,14 +93,6 @@ jobs:
           if [ "$missing" -ne 0 ]; then
             exit 1
           fi
-
-          case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2) ;;
-            *)
-              echo "UK_AQ_R2_HISTORY_VERSION must be v1 or v2." >&2
-              exit 1
-              ;;
-          esac
 
       - name: Configure rclone remote
         env:

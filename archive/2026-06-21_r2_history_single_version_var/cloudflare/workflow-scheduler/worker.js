@@ -13,19 +13,6 @@ export const CRON_JOB_MAP = Object.freeze({
   /* DEPLOY_CRON_MAP_END */
 });
 
-const HISTORY_VERSION_VALUES = new Set(["v1", "v2"]);
-
-function resolveHistoryVersion(env) {
-  const value = String(env?.UK_AQ_R2_HISTORY_VERSION || "").trim().toLowerCase();
-  if (HISTORY_VERSION_VALUES.has(value)) {
-    return value;
-  }
-  if (!value) {
-    throw new Error("Missing required Worker var: UK_AQ_R2_HISTORY_VERSION");
-  }
-  throw new Error(`Invalid Worker var UK_AQ_R2_HISTORY_VERSION=${JSON.stringify(value)}; expected v1 or v2`);
-}
-
 export const JOBS = [
   // job_key: uk_aq_stations_daily
   {
@@ -35,23 +22,41 @@ export const JOBS = [
     workflow_file: "uk_aq_stations_daily.yml",
     ref: "main",
   },
-  // job_key: uk_aq_r2_core_snapshot
+  // job_key: uk_aq_r2_core_snapshot_v1
   {
-    job_key: "uk_aq_r2_core_snapshot",
+    job_key: "uk_aq_r2_core_snapshot_v1",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_r2_core_snapshot.yml",
     ref: "main",
-    history_version_input: true,
+    inputs: { history_version: "v1" },
   },
-  // job_key: uk_aq_r2_history_dropbox_backup
+  // job_key: uk_aq_r2_core_snapshot_v2
   {
-    job_key: "uk_aq_r2_history_dropbox_backup",
+    job_key: "uk_aq_r2_core_snapshot_v2",
+    owner: "YOUR_GITHUB_OWNER",
+    repo: "uk-aq-ops",
+    workflow_file: "uk_aq_r2_core_snapshot.yml",
+    ref: "main",
+    inputs: { history_version: "v2" },
+  },
+  // job_key: uk_aq_r2_history_dropbox_backup_v1
+  {
+    job_key: "uk_aq_r2_history_dropbox_backup_v1",
     owner: "YOUR_GITHUB_OWNER",
     repo: "uk-aq-ops",
     workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
     ref: "main",
-    history_version_input: true,
+    inputs: { backup_version: "v1" },
+  },
+  // job_key: uk_aq_r2_history_dropbox_backup_v2
+  {
+    job_key: "uk_aq_r2_history_dropbox_backup_v2",
+    owner: "YOUR_GITHUB_OWNER",
+    repo: "uk-aq-ops",
+    workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
+    ref: "main",
+    inputs: { backup_version: "v2" },
   },
   // job_key: uk_aq_dropbox_prune_raw
   {
@@ -80,24 +85,16 @@ export function jobsForCron(cronExpression) {
   return jobKeys.map((jobKey) => jobsByKey.get(jobKey)).filter(Boolean);
 }
 
-export function inputsForJob(job, env = {}) {
-  if (job.history_version_input) {
-    return { history_version: resolveHistoryVersion(env) };
-  }
-  return job.inputs || null;
-}
-
-export async function dispatchWorkflow(job, token, env = {}) {
+export async function dispatchWorkflow(job, token) {
   const url = workflowDispatchUrl(job);
   const label = `${job.owner}/${job.repo}:${job.workflow_file}@${job.ref}`;
-  const inputs = inputsForJob(job, env);
   const body = {
     ref: job.ref,
-    ...(inputs ? { inputs } : {}),
+    ...(job.inputs ? { inputs: job.inputs } : {}),
   };
 
   console.log(
-    `[workflow-scheduler] dispatching job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(inputs || {})}`,
+    `[workflow-scheduler] dispatching job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(job.inputs || {})}`,
   );
 
   const response = await fetch(url, {
@@ -113,13 +110,13 @@ export async function dispatchWorkflow(job, token, env = {}) {
   });
 
   console.log(
-    `[workflow-scheduler] github response job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(inputs || {})} status=${response.status}`,
+    `[workflow-scheduler] github response job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(job.inputs || {})} status=${response.status}`,
   );
 
   if (!response.ok) {
     const errorBody = (await response.text()).slice(0, 4000);
     console.log(
-      `[workflow-scheduler] github error job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(inputs || {})} body=${errorBody}`,
+      `[workflow-scheduler] github error job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(job.inputs || {})} body=${errorBody}`,
     );
     throw new Error(
       `GitHub dispatch failed for job_key=${job.job_key} workflow=${label} (status ${response.status})`,
@@ -150,7 +147,7 @@ export async function runCron(cronExpression, env) {
   const results = [];
   for (const job of jobs) {
     try {
-      await dispatchWorkflow(job, token, env);
+      await dispatchWorkflow(job, token);
       results.push({ job_key: job.job_key, workflow_file: job.workflow_file, status: "ok" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

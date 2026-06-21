@@ -13,8 +13,8 @@ Each cron line must include a `job_keys` comment with one or more comma-separate
 [triggers]
 crons = [
   "0 3 * * *",   # job_keys: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
-  "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
-  "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
+  "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot_v1, uk_aq_r2_core_snapshot_v2 | uk-aq-ops/uk_aq_r2_core_snapshot.yml
+  "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup_v1, uk_aq_r2_history_dropbox_backup_v2 | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
   "49 5 * * *",  # job_keys: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]
 ```
@@ -26,7 +26,7 @@ crons = [
 1. Cloudflare fires `scheduled()` and passes only the cron string (no job name).
 2. Deploy workflow builds a `cron -> [job_key, ...]` map from `wrangler.toml` comments.
 3. Worker matches the received cron string to one or more logical job keys, then dispatches matching workflows.
-4. R2 jobs pass one explicit `history_version` input derived from the Worker `UK_AQ_R2_HISTORY_VERSION` config. The Worker does not dispatch separate v1/v2 job variants.
+4. Version-specific R2 jobs pass explicit `workflow_dispatch` inputs instead of relying on workflow defaults: core snapshot uses `history_version`, and Dropbox backup uses `backup_version`.
 
 ## Required Secret
 
@@ -37,9 +37,6 @@ Use a PAT or GitHub App token with repo access and Actions write permission for 
 
 Optional Worker secret:
 - `MANUAL_TRIGGER_KEY` (enables `GET /run?cron=...&key=...`)
-
-Required Worker variable:
-- `UK_AQ_R2_HISTORY_VERSION` (`v1` or `v2`)
 
 ## Deploy Workflow (Ops Repo)
 
@@ -64,8 +61,8 @@ Optional:
 ## Logging
 
 Configured R2 history jobs:
-- `15 4 * * *` dispatches `uk_aq_r2_core_snapshot` once to `uk_aq_r2_core_snapshot.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION`.
-- `35 4 * * *` dispatches `uk_aq_r2_history_dropbox_backup` once to `uk_aq_r2_history_dropbox_backup.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION`.
+- `15 4 * * *` dispatches both `uk_aq_r2_core_snapshot_v1` and `uk_aq_r2_core_snapshot_v2` to `uk_aq_r2_core_snapshot.yml` with explicit `history_version=v1` and `history_version=v2` inputs.
+- `35 4 * * *` dispatches both `uk_aq_r2_history_dropbox_backup_v1` and `uk_aq_r2_history_dropbox_backup_v2` to `uk_aq_r2_history_dropbox_backup.yml` with explicit `backup_version=v1` and `backup_version=v2` inputs.
 
 Worker logs include:
 - received cron expression
