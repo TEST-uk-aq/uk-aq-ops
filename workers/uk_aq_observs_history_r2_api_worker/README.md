@@ -19,7 +19,7 @@ Optional query params:
 - `since_utc` (ISO timestamp, exclusive lower bound)
 - `limit` (`1..20000`)
 - `pollutant` (`pm25`, `pm10`, or `no2`; required only when
-  `UK_AQ_R2_HISTORY_READ_VERSION=v2`)
+  `UK_AQ_R2_HISTORY_VERSION=v2`)
 
 Auth:
 
@@ -47,7 +47,7 @@ Serving rule:
 
 V2 serving rule:
 
-- enabled only when `UK_AQ_R2_HISTORY_READ_VERSION=v2`.
+- enabled only when `UK_AQ_R2_HISTORY_VERSION=v2`.
 - requires the request `pollutant` query parameter so the Worker can read the
   pollutant-split partition directly.
 - reads the per-pollutant timeseries index at
@@ -83,7 +83,7 @@ Cache behavior:
 
 Optional env:
 
-- `UK_AQ_R2_HISTORY_READ_VERSION` (`v1|v2`, default `v1`)
+- `UK_AQ_R2_HISTORY_VERSION` (required `v1|v2`, canonical active selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
 - `UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS` (default `300`, clamp `30..604800`)
 - `UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS` (default `86400`, clamp `30..604800`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)

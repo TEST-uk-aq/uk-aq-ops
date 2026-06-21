@@ -114,7 +114,7 @@ Behavior:
 - Reads R2-domain size rows from ingestdb public view:
   - `uk_aq_public.uk_aq_r2_domain_size_metrics_hourly`
 - PostgREST reads are paginated (`limit`/`offset`, 1000 rows per page) so larger lookback windows still include newest buckets when the project row cap is 1000.
-- For `/v1/r2-history-days`, a central R2 history layout resolver uses `UK_AQ_R2_HISTORY_READ_VERSION` (or the `read_version` query parameter) to select the active calendar layout.
+- For `/v1/r2-history-days`, a central R2 history layout resolver uses `UK_AQ_R2_HISTORY_VERSION` (or the `read_version` request query parameter override) to select the active calendar layout.
 - For `v1`, the calendar day checks use:
   - `history/_index/observations_latest.json`
   - `history/_index/aqilevels_latest.json`
@@ -157,7 +157,7 @@ Optional:
 - `CFLARE_R2_REGION` (default `auto`)
 - `CFLARE_R2_ACCESS_KEY_ID` (required for `/v1/r2-history-days`)
 - `CFLARE_R2_SECRET_ACCESS_KEY` (required for `/v1/r2-history-days`)
-- `UK_AQ_R2_HISTORY_READ_VERSION` (`v1` or `v2`; default `v1`)
+- `UK_AQ_R2_HISTORY_VERSION` (required `v1` or `v2`, canonical active selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (v1 default `history/v1/observations`)
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (v1 default `history/v1/aqilevels/hourly`)
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (v1 default `history/_index`)

@@ -839,9 +839,7 @@ function executeWriteCommands({ groupedByDay, backfillScript, repoRoot, historyV
       UK_AQ_BACKFILL_TO_DAY_UTC: dayUtc,
       UK_AQ_BACKFILL_CONNECTOR_IDS: connectorIds.join(","),
     };
-    delete env.UK_AQ_R2_HISTORY_READ_VERSION;
-    delete env.UK_AQ_R2_HISTORY_WRITE_VERSION;
-    delete env.UK_AQ_R2_HISTORY_BACKUP_VERSION;
+
     const result = spawnSync(backfillScript, [], {
       cwd: repoRoot,
       env,

@@ -4909,7 +4909,7 @@
         const r2VersionLabel = String(r2Version.label || (r2Version.version ? `R2_${r2Version.version}` : "R2_?"));
         const r2VersionWarning = String(r2Version.warning || "");
         const r2VersionClass = r2VersionWarning || r2Version.valid === false ? " is-warning" : "";
-        const r2VersionTitle = r2VersionWarning || `${r2VersionLabel} selected by UK_AQ_R2_HISTORY_READ_VERSION`;
+        const r2VersionTitle = r2VersionWarning || `${r2VersionLabel} selected by UK_AQ_R2_HISTORY_VERSION`;
 
         let bodyMarkup = "";
         let footnoteText = "";

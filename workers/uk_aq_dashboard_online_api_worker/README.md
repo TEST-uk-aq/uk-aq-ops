@@ -88,7 +88,7 @@ Optional direct-mode data sources:
 - `UK_AQ_R2_HISTORY_DAYS_API_TOKEN`
 - `UK_AQ_R2_HISTORY_COUNTS_API_URL`
 - `UK_AQ_R2_HISTORY_COUNTS_API_TOKEN`
-- `UK_AQ_R2_HISTORY_READ_VERSION` (`v1` or `v2`; deployed as a Worker secret by `.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`; TEST defaults to `v2`)
+- `UK_AQ_R2_HISTORY_VERSION` (required `v1` or `v2`; canonical active selector deployed as a Worker secret by `.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml`; TEST uses `v2`. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
 - `UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH` (optional; defaults by read version to `_ops/checkpoints/r2_history_backup_state_v1.json` or `_ops/checkpoints/r2_history_backup_state_v2.json`)
 - `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_ACCOUNT_ID`
 - `UK_AQ_R2_CLOUDFLARE_API_TOKEN` or `CFLARE_API_READ_TOKEN`

@@ -22,7 +22,7 @@ jobs:
       UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_R2_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
-      UK_AQ_R2_HISTORY_READ_VERSION: ${{ vars.UK_AQ_R2_HISTORY_READ_VERSION || 'v1' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX || 'history/_index_v2/observations_timeseries' }}
@@ -54,12 +54,23 @@ jobs:
             echo "Missing variable CFLARE_R2_BUCKET."
             exit 1
           fi
+          case "${UK_AQ_R2_HISTORY_VERSION}" in
+            v1|v2) ;;
+            "")
+              echo "Missing GitHub variable UK_AQ_R2_HISTORY_VERSION."
+              exit 1
+              ;;
+            *)
+              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v1 or v2."
+              exit 1
+              ;;
+          esac
 
       - name: Substitute wrangler.toml placeholders
         run: |
           set -euo pipefail
           sed -i "s|__CFLARE_R2_BUCKET__|${CFLARE_R2_BUCKET}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
-          sed -i "s|__UK_AQ_R2_HISTORY_READ_VERSION__|${UK_AQ_R2_HISTORY_READ_VERSION}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
+          sed -i "s|__UK_AQ_R2_HISTORY_VERSION__|${UK_AQ_R2_HISTORY_VERSION}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX__|${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_INDEX_V2_PREFIX__|${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX__|${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
