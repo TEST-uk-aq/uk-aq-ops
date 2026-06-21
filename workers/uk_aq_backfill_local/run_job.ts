@@ -150,6 +150,7 @@ type SourceObservationRow = {
   pollutant_code: SourcePollutantCode;
   observed_at: string;
   value: number;
+  source_parameter?: string | null;
 };
 
 type UkAirSosDatapoint = {
@@ -1815,7 +1816,7 @@ function activeAqiHistoryDebugPrefix(): string {
     : AQI_R2_HISTORY_PREFIX;
 }
 
-function normalizePollutantCodeForR2Path(pollutantCode: string): string {
+export function normalizePollutantCodeForR2Path(pollutantCode: string): string {
   const value = String(pollutantCode || "").trim().toLowerCase();
   if (!/^[a-z0-9_]+$/.test(value)) {
     throw new Error(`Invalid pollutant_code for R2 path: ${pollutantCode}`);
@@ -4343,6 +4344,10 @@ async function exportObsConnectorRowsToR2(args: {
   objects_written_r2: number;
   manifest_key: string;
   connector_manifest: ObsConnectorManifest & Record<string, unknown>;
+  rows_with_missing_pollutant_code?: number;
+  rows_skipped_missing_pollutant_code?: number;
+  example_missing_pollutant_rows?: MissingPollutantExampleRow[];
+  pollutant_codes_written?: string[];
 }> {
   if (HISTORY_R2_WRITE_VERSION === "v2") {
     return await exportObsConnectorRowsToR2V2(args);
@@ -4444,6 +4449,61 @@ async function exportObsConnectorRowsToR2(args: {
   };
 }
 
+type MissingPollutantExampleRow = {
+  timeseries_id: number | null;
+  station_id: number | null;
+  observed_at: string | null;
+  source_parameter: string | null;
+};
+
+type ObservationPollutantClassification = {
+  valid_rows: ObsHistoryRow[];
+  missing_pollutant_rows: ObsHistoryRow[];
+  rows_with_missing_pollutant_code: number;
+  rows_skipped_missing_pollutant_code: number;
+  example_missing_pollutant_rows: MissingPollutantExampleRow[];
+  pollutant_codes_written: string[];
+};
+
+function safeMissingPollutantExample(row: ObsHistoryRow): MissingPollutantExampleRow {
+  const sourceParameter = typeof (row as Record<string, unknown>).source_parameter === "string"
+    ? String((row as Record<string, unknown>).source_parameter).trim() || null
+    : null;
+  return {
+    timeseries_id: Number.isInteger(Number(row.timeseries_id)) ? Math.trunc(Number(row.timeseries_id)) : null,
+    station_id: Number.isInteger(Number(row.station_id)) ? Math.trunc(Number(row.station_id)) : null,
+    observed_at: typeof row.observed_at === "string" && row.observed_at ? row.observed_at : null,
+    source_parameter: sourceParameter,
+  };
+}
+
+export function classifyObservationRowsForV2PollutantPartitions(
+  rows: ObsHistoryRow[],
+): ObservationPollutantClassification {
+  const validRows: ObsHistoryRow[] = [];
+  const missingPollutantRows: ObsHistoryRow[] = [];
+  const pollutantCodes = new Set<string>();
+
+  for (const row of rows) {
+    try {
+      const pollutantCode = normalizePollutantCodeForR2Path(String(row.pollutant_code || ""));
+      validRows.push({ ...row, pollutant_code: pollutantCode as SourcePollutantCode });
+      pollutantCodes.add(pollutantCode);
+    } catch (_error) {
+      missingPollutantRows.push(row);
+    }
+  }
+
+  return {
+    valid_rows: validRows,
+    missing_pollutant_rows: missingPollutantRows,
+    rows_with_missing_pollutant_code: missingPollutantRows.length,
+    rows_skipped_missing_pollutant_code: missingPollutantRows.length,
+    example_missing_pollutant_rows: missingPollutantRows.slice(0, 5).map(safeMissingPollutantExample),
+    pollutant_codes_written: Array.from(pollutantCodes).sort((a, b) => a.localeCompare(b)),
+  };
+}
+
 function groupObservationRowsByPollutant(
   rows: ObsHistoryRow[],
 ): Map<string, ObsHistoryRow[]> {
@@ -4466,6 +4526,10 @@ async function exportObsConnectorRowsToR2V2(args: {
   objects_written_r2: number;
   manifest_key: string;
   connector_manifest: ObsConnectorManifest & Record<string, unknown>;
+  rows_with_missing_pollutant_code: number;
+  rows_skipped_missing_pollutant_code: number;
+  example_missing_pollutant_rows: MissingPollutantExampleRow[];
+  pollutant_codes_written: string[];
 }> {
   if (FORCE_REPLACE) {
     await deleteR2Prefix(
@@ -4477,7 +4541,25 @@ async function exportObsConnectorRowsToR2V2(args: {
     );
   }
 
-  const sortedRows = [...args.rows].sort((left, right) => {
+  const classification = classifyObservationRowsForV2PollutantPartitions(args.rows);
+  if (classification.rows_skipped_missing_pollutant_code > 0) {
+    logStructured("warning", "source_to_r2_v2_observations_missing_pollutant_code_rows_skipped", {
+      run_id: args.run_id,
+      day_utc: args.day_utc,
+      connector_id: args.connector_id,
+      rows_read: args.rows.length,
+      rows_with_missing_pollutant_code: classification.rows_with_missing_pollutant_code,
+      rows_skipped_missing_pollutant_code: classification.rows_skipped_missing_pollutant_code,
+      example_missing_pollutant_rows: classification.example_missing_pollutant_rows,
+    });
+  }
+  if (args.rows.length > 0 && classification.valid_rows.length === 0) {
+    throw new Error(
+      `No valid pollutant_code rows for v2 observation R2 write: day_utc=${args.day_utc} connector_id=${args.connector_id} rows_read=${args.rows.length} rows_skipped_missing_pollutant_code=${classification.rows_skipped_missing_pollutant_code}`,
+    );
+  }
+
+  const sortedRows = [...classification.valid_rows].sort((left, right) => {
     const leftPollutant = String(left.pollutant_code || "");
     const rightPollutant = String(right.pollutant_code || "");
     if (leftPollutant !== rightPollutant) return leftPollutant.localeCompare(rightPollutant);
@@ -4579,7 +4661,11 @@ async function exportObsConnectorRowsToR2V2(args: {
     pollutantManifests,
     writerGitSha: OBS_R2_WRITER_GIT_SHA,
     backedUpAtUtc: nowIso(),
-  });
+  }) as ObsConnectorManifest & Record<string, unknown>;
+  connectorManifest.rows_with_missing_pollutant_code = classification.rows_with_missing_pollutant_code;
+  connectorManifest.rows_skipped_missing_pollutant_code = classification.rows_skipped_missing_pollutant_code;
+  connectorManifest.example_missing_pollutant_rows = classification.example_missing_pollutant_rows;
+  connectorManifest.pollutant_codes_written = classification.pollutant_codes_written;
   await r2PutObject({
     r2: OBS_R2_CONFIG,
     key: manifestKey,
@@ -4589,10 +4675,14 @@ async function exportObsConnectorRowsToR2V2(args: {
   objectsWritten += 1;
 
   return {
-    rows_read: sortedRows.length,
+    rows_read: args.rows.length,
     objects_written_r2: objectsWritten,
     manifest_key: manifestKey,
     connector_manifest: connectorManifest as ObsConnectorManifest & Record<string, unknown>,
+    rows_with_missing_pollutant_code: classification.rows_with_missing_pollutant_code,
+    rows_skipped_missing_pollutant_code: classification.rows_skipped_missing_pollutant_code,
+    example_missing_pollutant_rows: classification.example_missing_pollutant_rows,
+    pollutant_codes_written: classification.pollutant_codes_written,
   };
 }
 
@@ -8285,7 +8375,7 @@ type OpenaqCsvParseResult = {
   skipped_invalid_value_or_timestamp: number;
 };
 
-function parseOpenaqCsvObservations(args: {
+export function parseOpenaqCsvObservations(args: {
   dayUtc: string;
   csvText: string;
   lookup: SourceConnectorLookup;
@@ -8423,10 +8513,11 @@ function parseOpenaqCsvObservations(args: {
     rows.push({
       timeseries_id: binding.timeseries_id,
       station_id: binding.station_id,
-      pollutant_code: binding.pollutant_code,
+      pollutant_code: parseSourcePollutantCode(String(binding.pollutant_code || "")) || pollutantCode,
       observed_at: observedAtIso,
       value,
-    });
+      source_parameter: parameterRaw,
+    } as SourceObservationRow);
   }
 
   return {
@@ -13424,6 +13515,10 @@ async function runSourceToAll(
           source_adapter: sourceAdapter,
           candidate_source_units: candidateSourceUnits,
           rows_observations: obsHistoryRows.length,
+          rows_with_missing_pollutant_code: obsExport.rows_with_missing_pollutant_code ?? 0,
+          rows_skipped_missing_pollutant_code: obsExport.rows_skipped_missing_pollutant_code ?? 0,
+          example_missing_pollutant_rows: obsExport.example_missing_pollutant_rows ?? [],
+          pollutant_codes_written: obsExport.pollutant_codes_written ?? [],
           rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
           objects_written_r2: sourceObservationsOnly
             ? obsExport.objects_written_r2 + 1
@@ -13447,6 +13542,10 @@ async function runSourceToAll(
           checkpoint_json: {
             source_adapter: sourceAdapter,
             observation_manifest_key: obsExport.manifest_key,
+            rows_with_missing_pollutant_code: obsExport.rows_with_missing_pollutant_code ?? 0,
+            rows_skipped_missing_pollutant_code: obsExport.rows_skipped_missing_pollutant_code ?? 0,
+            example_missing_pollutant_rows: obsExport.example_missing_pollutant_rows ?? [],
+            pollutant_codes_written: obsExport.pollutant_codes_written ?? [],
             aqilevels_manifest_key: aqiExport?.manifest_key || null,
             day_observation_manifest_key: buildObsDayManifestKey(dayUtc),
             day_aqilevels_manifest_key: sourceObservationsOnly
@@ -13473,6 +13572,10 @@ async function runSourceToAll(
           checkpoint_json: {
             source_adapter: sourceAdapter,
             observation_manifest_key: obsExport.manifest_key,
+            rows_with_missing_pollutant_code: obsExport.rows_with_missing_pollutant_code ?? 0,
+            rows_skipped_missing_pollutant_code: obsExport.rows_skipped_missing_pollutant_code ?? 0,
+            example_missing_pollutant_rows: obsExport.example_missing_pollutant_rows ?? [],
+            pollutant_codes_written: obsExport.pollutant_codes_written ?? [],
             aqilevels_manifest_key: aqiExport?.manifest_key || null,
             updated_by_run_id: runId,
             completed_at: nowIso(),
