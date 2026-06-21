@@ -5,6 +5,7 @@ import test from "node:test";
 import { dispatchWorkflow, inputsForJob, JOBS } from "../cloudflare/workflow-scheduler/worker.js";
 
 const wranglerText = readFileSync("cloudflare/workflow-scheduler/wrangler.toml", "utf8");
+const schedulerDeployWorkflowText = readFileSync(".github/workflows/uk_aq_workflow_scheduler_deploy.yml", "utf8");
 const workerText = readFileSync("cloudflare/workflow-scheduler/worker.js", "utf8");
 
 function parseCronJobMap() {
@@ -120,4 +121,16 @@ test("worker source uses cron-to-array map for grouped logical jobs", () => {
   assert.match(workerText, /const jobKeys = CRON_JOB_MAP\[cronExpression\] \|\| \[\]/);
   assert.doesNotMatch(workerText, /uk_aq_r2_core_snapshot_v[12]/);
   assert.doesNotMatch(workerText, /uk_aq_r2_history_dropbox_backup_v[12]/);
+});
+
+test("tracked scheduler wrangler config does not hard-code active history version", () => {
+  assert.doesNotMatch(wranglerText, /UK_AQ_R2_HISTORY_VERSION\s*=/);
+});
+
+test("scheduler deploy workflow injects active history version from repo vars", () => {
+  assert.doesNotMatch(schedulerDeployWorkflowText, /target_environment/);
+  assert.doesNotMatch(schedulerDeployWorkflowText, /environment:\s*\$\{\{/);
+  assert.match(schedulerDeployWorkflowText, /UK_AQ_R2_HISTORY_VERSION:\s*\$\{\{\s*vars\.UK_AQ_R2_HISTORY_VERSION \|\| ''\s*\}\}/);
+  assert.match(schedulerDeployWorkflowText, /Missing GitHub variable UK_AQ_R2_HISTORY_VERSION/);
+  assert.match(schedulerDeployWorkflowText, /UK_AQ_R2_HISTORY_VERSION = "\{history_version\}"/);
 });

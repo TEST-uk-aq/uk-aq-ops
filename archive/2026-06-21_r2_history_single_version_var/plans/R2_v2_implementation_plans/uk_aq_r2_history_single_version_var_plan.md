@@ -106,8 +106,6 @@ Final scheduler job keys must be:
 
 The Worker must not keep baked-in v1/v2 job variants. The active version should come from `UK_AQ_R2_HISTORY_VERSION` at workflow/runtime configuration time, not from the scheduler job name.
 
-Do not hard-code `UK_AQ_R2_HISTORY_VERSION` in tracked scheduler config such as `cloudflare/workflow-scheduler/wrangler.toml`. The scheduler Worker must receive `UK_AQ_R2_HISTORY_VERSION` from deploy configuration. TEST and LIVE are separate repos, not selectable target environments inside one workflow, so the deploy workflow must not add a `target_environment` input or bind jobs to named GitHub Environments such as `CIC-Test` or `LIVE`. It should read the current repo's GitHub variable `UK_AQ_R2_HISTORY_VERSION`, validate it is present and is `v1` or `v2`, then inject it into the generated Worker config used for `wrangler deploy`. The TEST repo variable should be `v2`; the LIVE repo variable should remain `v1` until explicitly switched.
-
 ## Archive Policy For This Implementation
 
 Before changing any active file for this implementation plan, create a one-time archive snapshot of that file under an implementation-specific archive directory, for example:
@@ -504,8 +502,6 @@ Changes:
   - Replace `uk_aq_r2_history_dropbox_backup_v1` and `_v2` with one `uk_aq_r2_history_dropbox_backup`.
   - Remove baked-in v1/v2 scheduler job variants from the Worker source.
   - For normal scheduled core snapshot and Dropbox backup dispatches, pass one `history_version` value derived from the active deploy/config value `UK_AQ_R2_HISTORY_VERSION`. Do not create v1/v2 job variants.
-  - Do not hard-code `UK_AQ_R2_HISTORY_VERSION=v2` in tracked `cloudflare/workflow-scheduler/wrangler.toml`; inject the current repo's GitHub variable into the generated deploy config instead.
-  - In `.github/workflows/uk_aq_workflow_scheduler_deploy.yml`, validate `UK_AQ_R2_HISTORY_VERSION` is present and is `v1` or `v2` before deploy. Do not add a `target_environment` input and do not bind the job to named GitHub Environments such as `CIC-Test` or `LIVE`; TEST and LIVE are separate repos. TEST repo var should be `v2`; LIVE repo var should remain `v1` until explicitly switched.
   - Set standard crons to `04:15` and `04:35` UTC.
 - Update `tests/workflow_scheduler.test.mjs`.
 - Update `cloudflare/workflow-scheduler/README.md`.

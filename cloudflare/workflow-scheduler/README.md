@@ -28,6 +28,11 @@ crons = [
 3. Worker matches the received cron string to one or more logical job keys, then dispatches matching workflows.
 4. R2 jobs pass one explicit `history_version` input derived from the Worker `UK_AQ_R2_HISTORY_VERSION` config. The Worker does not dispatch separate v1/v2 job variants.
 
+The tracked `wrangler.toml` must not hard-code `UK_AQ_R2_HISTORY_VERSION`.
+The deploy workflow reads `UK_AQ_R2_HISTORY_VERSION` from the current repo's
+GitHub variable, validates it is `v1` or `v2`, and injects it into the
+generated Worker config used for `wrangler deploy`.
+
 ## Required Secret
 
 Worker secret:
@@ -38,7 +43,7 @@ Use a PAT or GitHub App token with repo access and Actions write permission for 
 Optional Worker secret:
 - `MANUAL_TRIGGER_KEY` (enables `GET /run?cron=...&key=...`)
 
-Required Worker variable:
+Required Worker variable injected at deploy:
 - `UK_AQ_R2_HISTORY_VERSION` (`v1` or `v2`)
 
 ## Deploy Workflow (Ops Repo)
@@ -49,8 +54,12 @@ Workflow:
 Behavior:
 - Runs on push to `main` for `cloudflare/workflow-scheduler/**` changes, or manual dispatch.
 - Replaces `YOUR_GITHUB_OWNER` with `github.repository_owner` during deploy.
+- Validates `UK_AQ_R2_HISTORY_VERSION` from repo variables and injects it into the generated Worker config.
 - Injects cron map into `worker.js` from `wrangler.toml`.
 - Validates `job_key` coverage and map alignment before deploy.
+
+Required GitHub repo variable:
+- `UK_AQ_R2_HISTORY_VERSION` (`v1` or `v2`; TEST repo should be `v2`, LIVE repo should remain `v1` until explicitly switched)
 
 Required GitHub repo secrets:
 - `CLOUDFLARE_ACCOUNT_ID`

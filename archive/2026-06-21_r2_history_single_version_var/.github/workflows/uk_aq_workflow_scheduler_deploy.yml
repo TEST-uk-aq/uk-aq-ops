@@ -21,7 +21,6 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN: ${{ secrets.UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN || '' }}
       UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY: ${{ secrets.UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY || '' }}
-      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,17 +40,6 @@ jobs:
             echo "Missing secret UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN."
             exit 1
           fi
-          case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2) ;;
-            "")
-              echo "Missing GitHub variable UK_AQ_R2_HISTORY_VERSION."
-              exit 1
-              ;;
-            *)
-              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v1 or v2."
-              exit 1
-              ;;
-          esac
 
       - name: Prepare scheduler config
         run: |
@@ -71,7 +59,6 @@ jobs:
 
           python3 - <<'PY'
           import re
-          import os
           from pathlib import Path
 
           wrangler_path = Path("cloudflare/workflow-scheduler/wrangler.toml")
@@ -79,9 +66,6 @@ jobs:
 
           wrangler_text = wrangler_path.read_text(encoding="utf-8")
           worker_text = worker_path.read_text(encoding="utf-8")
-          history_version = os.environ.get("UK_AQ_R2_HISTORY_VERSION", "").strip()
-          if history_version not in {"v1", "v2"}:
-              raise SystemExit("UK_AQ_R2_HISTORY_VERSION must be present and v1 or v2 before deploy config generation")
 
           match = re.search(r'crons\s*=\s*\[(.*?)\]', wrangler_text, re.S)
           if not match:
@@ -148,30 +132,7 @@ jobs:
               )
 
           worker_path.write_text(updated_worker, encoding="utf-8")
-          vars_match = re.search(r'(?ms)^\[vars\]\n(?P<body>.*?)(?=^\[|\Z)', wrangler_text)
-          history_line = f'UK_AQ_R2_HISTORY_VERSION = "{history_version}"'
-          if vars_match:
-              body = vars_match.group("body")
-              if re.search(r'^UK_AQ_R2_HISTORY_VERSION\s*=', body, re.M):
-                  body = re.sub(
-                      r'^UK_AQ_R2_HISTORY_VERSION\s*=.*$',
-                      history_line,
-                      body,
-                      flags=re.M,
-                  )
-              else:
-                  body = f"{body.rstrip()}\n{history_line}\n"
-              wrangler_text = f"{wrangler_text[:vars_match.start('body')]}{body}{wrangler_text[vars_match.end('body'):]}"
-          else:
-              insert_after = re.search(r'^compatibility_date\s*=\s*"[^"]+"\s*$', wrangler_text, re.M)
-              if not insert_after:
-                  raise SystemExit("Missing compatibility_date in wrangler.toml")
-              insert_at = insert_after.end()
-              vars_block = f'\n\n[vars]\n{history_line}\n'
-              wrangler_text = f"{wrangler_text[:insert_at]}{vars_block}{wrangler_text[insert_at:]}"
-          wrangler_path.write_text(wrangler_text, encoding="utf-8")
           print(f"Prepared deploy cron map: {cron_job_map}")
-          print(f"Injected UK_AQ_R2_HISTORY_VERSION={history_version} into generated Worker deploy config")
           PY
 
       - name: Validate scheduler cron alignment
