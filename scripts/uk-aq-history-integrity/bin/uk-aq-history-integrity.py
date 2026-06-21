@@ -5508,8 +5508,17 @@ def run_v2_observations_integrity_checks(
         for connector_dir in connector_dirs:
             connector_raw = connector_dir.name.split("=", 1)[1]
             pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
+            connector_level_parts = sorted(p for p in connector_dir.glob("part-*.parquet") if p.is_file())
+            if connector_level_parts:
+                gaps.append(_v2_obs_gap(
+                    "unexpected_connector_level_part_file",
+                    day_utc=day_utc,
+                    connector_id=connector_raw,
+                    expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*/part-*.parquet",
+                    related_paths=[str(p.relative_to(root)) for p in connector_level_parts],
+                ))
             if not pollutant_dirs:
-                gaps.append(_v2_obs_gap("pollutant_dir_missing", day_utc=day_utc, connector_id=connector_raw, expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*"))
+                gaps.append(_v2_obs_gap("missing_pollutant_partitions", day_utc=day_utc, connector_id=connector_raw, expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*"))
                 continue
             for pollutant_dir in pollutant_dirs:
                 pollutant = pollutant_dir.name.split("=", 1)[1]
