@@ -8,7 +8,7 @@
  * - Cron values are generated into this file at deploy time from wrangler.toml.
  * - YOUR_GITHUB_OWNER is replaced at deploy with github.repository_owner.
  */
-const CRON_BY_JOB_KEY = Object.freeze({
+export const CRON_JOB_MAP = Object.freeze({
   /* DEPLOY_CRON_MAP_START */
   /* DEPLOY_CRON_MAP_END */
 });
@@ -76,25 +76,25 @@ export function workflowDispatchUrl(job) {
 }
 
 export function jobsForCron(cronExpression) {
-  const matchingKeys = new Set(
-    Object.entries(CRON_BY_JOB_KEY)
-      .filter(([, cron]) => cron === cronExpression)
-      .map(([jobKey]) => jobKey),
-  );
-
-  if (matchingKeys.size === 0) {
+  const jobKeys = CRON_JOB_MAP[cronExpression] || [];
+  if (jobKeys.length === 0) {
     return [];
   }
 
-  return JOBS.filter((job) => matchingKeys.has(job.job_key));
+  const jobsByKey = new Map(JOBS.map((job) => [job.job_key, job]));
+  return jobKeys.map((jobKey) => jobsByKey.get(jobKey)).filter(Boolean);
 }
 
 export async function dispatchWorkflow(job, token) {
   const url = workflowDispatchUrl(job);
   const label = `${job.owner}/${job.repo}:${job.workflow_file}@${job.ref}`;
+  const body = {
+    ref: job.ref,
+    ...(job.inputs ? { inputs: job.inputs } : {}),
+  };
 
   console.log(
-    `[workflow-scheduler] dispatching job_key=${job.job_key} workflow=${label}`,
+    `[workflow-scheduler] dispatching job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(job.inputs || {})}`,
   );
 
   const response = await fetch(url, {
@@ -106,20 +106,17 @@ export async function dispatchWorkflow(job, token) {
       "Content-Type": "application/json",
       "User-Agent": "uk-aq-cloudflare-workflow-scheduler",
     },
-    body: JSON.stringify({
-      ref: job.ref,
-      ...(job.inputs ? { inputs: job.inputs } : {}),
-    }),
+    body: JSON.stringify(body),
   });
 
   console.log(
-    `[workflow-scheduler] github response job_key=${job.job_key} workflow=${label} status=${response.status}`,
+    `[workflow-scheduler] github response job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(job.inputs || {})} status=${response.status}`,
   );
 
   if (!response.ok) {
     const errorBody = (await response.text()).slice(0, 4000);
     console.log(
-      `[workflow-scheduler] github error job_key=${job.job_key} workflow=${label} body=${errorBody}`,
+      `[workflow-scheduler] github error job_key=${job.job_key} workflow=${label} inputs=${JSON.stringify(job.inputs || {})} body=${errorBody}`,
     );
     throw new Error(
       `GitHub dispatch failed for job_key=${job.job_key} workflow=${label} (status ${response.status})`,
@@ -138,13 +135,43 @@ export async function runCron(cronExpression, env) {
   const jobs = jobsForCron(cronExpression);
   if (jobs.length === 0) {
     console.log(
-      `[workflow-scheduler] no configured jobs matched cron=${cronExpression}; cron map keys=${Object.keys(CRON_BY_JOB_KEY).join(",")}`,
+      `[workflow-scheduler] no configured jobs matched cron=${cronExpression}; configured crons=${Object.keys(CRON_JOB_MAP).join(",")}`,
     );
     return;
   }
 
+  console.log(
+    `[workflow-scheduler] cron=${cronExpression} dispatching ${jobs.length} logical job(s): ${jobs.map((job) => job.job_key).join(",")}`,
+  );
+
+  const results = [];
   for (const job of jobs) {
-    await dispatchWorkflow(job, token);
+    try {
+      await dispatchWorkflow(job, token);
+      results.push({ job_key: job.job_key, workflow_file: job.workflow_file, status: "ok" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      results.push({
+        job_key: job.job_key,
+        workflow_file: job.workflow_file,
+        status: "failed",
+        error: message,
+      });
+      console.log(
+        `[workflow-scheduler] dispatch failed cron=${cronExpression} job_key=${job.job_key} workflow=${job.workflow_file} error=${message}`,
+      );
+    }
+  }
+
+  const failed = results.filter((result) => result.status === "failed");
+  console.log(
+    `[workflow-scheduler] grouped summary cron=${cronExpression} results=${JSON.stringify(results)}`,
+  );
+
+  if (failed.length > 0) {
+    throw new Error(
+      `Workflow scheduler partially failed for cron=${cronExpression}: ${failed.map((result) => `${result.job_key}: ${result.error}`).join("; ")}`,
+    );
   }
 }
 
