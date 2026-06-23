@@ -3473,10 +3473,17 @@ async function discoverPendingAqilevelDays({ client, runtime, latestEligibleDayU
   const pending = [];
 
   for (const dayUtc of candidates) {
-    const manifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
-    const head = await r2HeadObject({ r2: runtime.r2, key: manifestKey });
-    if (!head.exists) {
-      pending.push(dayUtc);
+    const manifestKeys = [buildDayManifestKey(runtime.aqilevels_prefix, dayUtc)];
+    if (runtime.history_write_version === "v2") {
+      manifestKeys.push(buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc));
+    }
+
+    for (const manifestKey of manifestKeys) {
+      const head = await r2HeadObject({ r2: runtime.r2, key: manifestKey });
+      if (!head.exists) {
+        pending.push(dayUtc);
+        break;
+      }
     }
     if (pending.length >= runtime.max_candidates_per_run) {
       break;
@@ -3490,10 +3497,12 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
   const connectorId = Number(connector.connector_id);
   const expectedRowCount = connector.expected_row_count;
   const fileEntries = [];
+  const debugFileEntries = [];
   let partIndex = 0;
   let pendingRows = [];
   let observedRows = 0n;
   let totalBytes = 0n;
+  let debugTotalBytes = 0n;
   let minTimestampHourUtc = null;
   let maxTimestampHourUtc = null;
   let cursorAfterTimeseriesId = null;
@@ -3519,42 +3528,47 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
 
       for (const [pollutantCode, pollutantRows] of groupedRows) {
         const partSummary = summarizeAqilevelPartRows(pollutantRows);
-        const partKey = buildHistoryV2PartKey(runtime.aqilevels_prefix, dayUtc, connectorId, pollutantCode, partIndex);
-        const parquetBuffer = rowsToAqilevelDataV2ParquetBuffer(
-          pollutantRows,
-          parquetWriterProperties(
-            runtime.aqilevels_row_group_size,
-            HISTORY_R2_V2_WRITER_VERSION,
-          ),
-        );
-        const putResult = await r2PutObject({
-          r2: runtime.r2,
-          key: partKey,
-          body: parquetBuffer,
-          content_type: "application/octet-stream",
-        });
-        const head = await r2HeadObject({ r2: runtime.r2, key: partKey });
-        if (!head.exists) {
-          throw new Error(`Missing AQI v2 committed object after write: ${partKey}`);
-        }
-        const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
-          ? Math.trunc(head.bytes)
-          : Math.trunc(putResult.bytes);
-        const etagOrHash = head.etag || putResult.etag || null;
-
-        fileEntries.push({
-          key: partKey,
-          row_count: pollutantRows.length,
-          bytes,
-          etag_or_hash: etagOrHash,
-          pollutant_code: pollutantCode,
-          min_timeseries_id: partSummary.min_timeseries_id,
-          max_timeseries_id: partSummary.max_timeseries_id,
-          min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
-          max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
-          timeseries_row_counts: partSummary.timeseries_row_counts,
-        });
-        totalBytes += BigInt(bytes);
+        const writeProfilePart = async ({ prefix, profile, toParquetBuffer, targetFileEntries }) => {
+          const partKey = buildHistoryV2PartKey(prefix, dayUtc, connectorId, pollutantCode, partIndex);
+          const parquetBuffer = toParquetBuffer(
+            pollutantRows,
+            parquetWriterProperties(
+              runtime.aqilevels_row_group_size,
+              HISTORY_R2_V2_WRITER_VERSION,
+            ),
+          );
+          const putResult = await r2PutObject({
+            r2: runtime.r2,
+            key: partKey,
+            body: parquetBuffer,
+            content_type: "application/octet-stream",
+          });
+          const head = await r2HeadObject({ r2: runtime.r2, key: partKey });
+          if (!head.exists) {
+            throw new Error(`Missing AQI v2 ${profile} committed object after write: ${partKey}`);
+          }
+          const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
+            ? Math.trunc(head.bytes)
+            : Math.trunc(putResult.bytes);
+          const etagOrHash = head.etag || putResult.etag || null;
+          targetFileEntries.push({
+            key: partKey,
+            row_count: pollutantRows.length,
+            bytes,
+            etag_or_hash: etagOrHash,
+            pollutant_code: pollutantCode,
+            min_timeseries_id: partSummary.min_timeseries_id,
+            max_timeseries_id: partSummary.max_timeseries_id,
+            min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
+            max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
+            timeseries_row_counts: partSummary.timeseries_row_counts,
+          });
+          return bytes;
+        };
+        const dataBytes = await writeProfilePart({ prefix: runtime.aqilevels_prefix, profile: "data", toParquetBuffer: rowsToAqilevelDataV2ParquetBuffer, targetFileEntries: fileEntries });
+        const debugBytes = await writeProfilePart({ prefix: runtime.aqilevels_hourly_debug_prefix_v2, profile: "debug", toParquetBuffer: rowsToAqilevelDebugV2ParquetBuffer, targetFileEntries: debugFileEntries });
+        totalBytes += BigInt(dataBytes);
+        debugTotalBytes += BigInt(debugBytes);
       }
       partIndex += 1;
       observedRows += BigInt(partRows.length);
@@ -3665,56 +3679,43 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
   const backedUpAtUtc = nowIso();
   let connectorManifestKey = buildConnectorManifestKey(runtime.aqilevels_prefix, dayUtc, connectorId);
   let connectorManifest;
+  let debugConnectorManifestKey = null;
+  let debugConnectorManifest = null;
   if (runtime.history_write_version === "v2") {
-    const pollutantManifests = [];
-    const partsByPollutant = new Map();
-    for (const fileEntry of fileEntries) {
-      const pollutantCode = normalizePollutantCodeForPath(fileEntry.pollutant_code);
-      if (!partsByPollutant.has(pollutantCode)) {
-        partsByPollutant.set(pollutantCode, []);
+    const createAndUploadProfileConnectorManifest = async ({ prefix, profile, profileFileEntries }) => {
+      const pollutantManifests = [];
+      const partsByPollutant = new Map();
+      for (const fileEntry of profileFileEntries) {
+        const pollutantCode = normalizePollutantCodeForPath(fileEntry.pollutant_code);
+        if (!partsByPollutant.has(pollutantCode)) partsByPollutant.set(pollutantCode, []);
+        partsByPollutant.get(pollutantCode).push(fileEntry);
       }
-      partsByPollutant.get(pollutantCode).push(fileEntry);
-    }
-    for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-      const pollutantManifestKey = buildHistoryV2PollutantManifestKey(runtime.aqilevels_prefix, dayUtc, connectorId, pollutantCode);
-      const pollutantManifest = createHistoryV2PollutantManifest({
-        domain: "aqilevels",
-        grain: HISTORY_AQILEVELS_GRAIN,
-        profile: "data",
-        dayUtc,
-        connectorId,
-        pollutantCode,
-        runId: runtime.run_id,
-        manifestKey: pollutantManifestKey,
-        sourceRowCount: pollutantParts.reduce((sum, part) => sum + Number(part.row_count || 0), 0),
-        fileEntries: pollutantParts,
-        writerGitSha: runtime.writer_git_sha,
-        backedUpAtUtc,
-      });
-      await r2PutObject({
-        r2: runtime.r2,
-        key: pollutantManifestKey,
-        body: Buffer.from(JSON.stringify(pollutantManifest, null, 2), "utf8"),
-        content_type: "application/json",
-      });
-      const pollutantManifestHead = await r2HeadObject({ r2: runtime.r2, key: pollutantManifestKey });
-      if (!pollutantManifestHead.exists) {
-        throw new Error(`AQI v2 pollutant manifest missing after upload: ${pollutantManifestKey}`);
+      for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+        const pollutantManifestKey = buildHistoryV2PollutantManifestKey(prefix, dayUtc, connectorId, pollutantCode);
+        const pollutantManifest = createHistoryV2PollutantManifest({
+          domain: "aqilevels", grain: HISTORY_AQILEVELS_GRAIN, profile, dayUtc, connectorId, pollutantCode,
+          runId: runtime.run_id, manifestKey: pollutantManifestKey,
+          sourceRowCount: pollutantParts.reduce((sum, part) => sum + Number(part.row_count || 0), 0),
+          fileEntries: pollutantParts, writerGitSha: runtime.writer_git_sha, backedUpAtUtc,
+        });
+        await r2PutObject({ r2: runtime.r2, key: pollutantManifestKey, body: Buffer.from(JSON.stringify(pollutantManifest, null, 2), "utf8"), content_type: "application/json" });
+        const pollutantManifestHead = await r2HeadObject({ r2: runtime.r2, key: pollutantManifestKey });
+        if (!pollutantManifestHead.exists) throw new Error(`AQI v2 ${profile} pollutant manifest missing after upload: ${pollutantManifestKey}`);
+        pollutantManifests.push(pollutantManifest);
       }
-      pollutantManifests.push(pollutantManifest);
-    }
-    connectorManifest = createHistoryV2ConnectorManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile: "data",
-      dayUtc,
-      connectorId,
-      runId: runtime.run_id,
-      manifestKey: connectorManifestKey,
-      pollutantManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
+      const profileConnectorManifestKey = buildConnectorManifestKey(prefix, dayUtc, connectorId);
+      return { key: profileConnectorManifestKey, manifest: createHistoryV2ConnectorManifest({
+        domain: "aqilevels", grain: HISTORY_AQILEVELS_GRAIN, profile, dayUtc, connectorId,
+        runId: runtime.run_id, manifestKey: profileConnectorManifestKey, pollutantManifests,
+        writerGitSha: runtime.writer_git_sha, backedUpAtUtc,
+      }) };
+    };
+    const dataProfile = await createAndUploadProfileConnectorManifest({ prefix: runtime.aqilevels_prefix, profile: "data", profileFileEntries: fileEntries });
+    connectorManifestKey = dataProfile.key;
+    connectorManifest = dataProfile.manifest;
+    const debugProfile = await createAndUploadProfileConnectorManifest({ prefix: runtime.aqilevels_hourly_debug_prefix_v2, profile: "debug", profileFileEntries: debugFileEntries });
+    debugConnectorManifestKey = debugProfile.key;
+    debugConnectorManifest = debugProfile.manifest;
   } else {
     connectorManifest = createAqilevelConnectorManifest({
       dayUtc,
@@ -3742,6 +3743,14 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
     throw new Error(`AQI connector manifest missing after upload: ${connectorManifestKey}`);
   }
 
+  if (runtime.history_write_version === "v2") {
+    await r2PutObject({ r2: runtime.r2, key: debugConnectorManifestKey, body: Buffer.from(JSON.stringify(debugConnectorManifest, null, 2), "utf8"), content_type: "application/json" });
+    const debugManifestHead = await r2HeadObject({ r2: runtime.r2, key: debugConnectorManifestKey });
+    if (!debugManifestHead.exists) {
+      throw new Error(`AQI debug connector manifest missing after upload: ${debugConnectorManifestKey}`);
+    }
+  }
+
   return {
     connector_id: connectorId,
     manifest_key: connectorManifestKey,
@@ -3752,7 +3761,21 @@ async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
       ...connectorManifest,
       manifest_key: connectorManifestKey,
     },
+    debug_file_count: debugFileEntries.length,
+    debug_total_bytes: debugTotalBytes,
+    debug_connector_manifest: debugConnectorManifest ? {
+      ...debugConnectorManifest,
+      manifest_key: debugConnectorManifestKey,
+    } : null,
   };
+}
+
+export async function discoverPendingAqilevelDaysForTest(args) {
+  return await discoverPendingAqilevelDays(args);
+}
+
+export async function exportAqilevelDayToR2ForTest(args) {
+  return await exportAqilevelDayToR2(args);
 }
 
 async function exportAqilevelDayToR2({ runtime, dayUtc }) {
@@ -3770,9 +3793,12 @@ async function exportAqilevelDayToR2({ runtime, dayUtc }) {
   }
 
   const connectorManifests = [];
+  const debugConnectorManifests = [];
   let totalRows = 0n;
   let totalBytes = 0n;
   let totalFiles = 0;
+  let debugTotalBytes = 0n;
+  let debugTotalFiles = 0;
 
   for (const connector of connectorCounts) {
     const result = await exportAqilevelConnectorDayToR2({
@@ -3783,7 +3809,12 @@ async function exportAqilevelDayToR2({ runtime, dayUtc }) {
     totalRows += result.source_row_count;
     totalBytes += result.total_bytes;
     totalFiles += result.file_count;
+    debugTotalBytes += result.debug_total_bytes || 0n;
+    debugTotalFiles += result.debug_file_count || 0;
     connectorManifests.push(result.connector_manifest);
+    if (result.debug_connector_manifest) {
+      debugConnectorManifests.push(result.debug_connector_manifest);
+    }
   }
 
   const backedUpAtUtc = nowIso();
@@ -3814,9 +3845,37 @@ async function exportAqilevelDayToR2({ runtime, dayUtc }) {
     content_type: "application/json",
   });
 
+  let debugDayManifestKey = null;
+  if (runtime.history_write_version === "v2") {
+    debugDayManifestKey = buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc);
+    const debugDayManifest = createHistoryV2DayManifest({
+      domain: "aqilevels",
+      grain: HISTORY_AQILEVELS_GRAIN,
+      profile: "debug",
+      dayUtc,
+      runId: runtime.run_id,
+      manifestKey: debugDayManifestKey,
+      connectorManifests: debugConnectorManifests,
+      writerGitSha: runtime.writer_git_sha,
+      backedUpAtUtc,
+    });
+    await r2PutObject({
+      r2: runtime.r2,
+      key: debugDayManifestKey,
+      body: Buffer.from(JSON.stringify(debugDayManifest, null, 2), "utf8"),
+      content_type: "application/json",
+    });
+  }
+
   const dayHead = await r2HeadObject({ r2: runtime.r2, key: dayManifestKey });
   if (!dayHead.exists) {
     throw new Error(`AQI day manifest missing after upload: ${dayManifestKey}`);
+  }
+  if (runtime.history_write_version === "v2") {
+    const debugDayHead = await r2HeadObject({ r2: runtime.r2, key: debugDayManifestKey });
+    if (!debugDayHead.exists) {
+      throw new Error(`AQI debug day manifest missing after upload: ${debugDayManifestKey}`);
+    }
   }
 
   return {
@@ -3827,6 +3886,9 @@ async function exportAqilevelDayToR2({ runtime, dayUtc }) {
     file_count: totalFiles,
     total_bytes: totalBytes,
     day_manifest_key: dayManifestKey,
+    debug_file_count: debugTotalFiles,
+    debug_total_bytes: debugTotalBytes,
+    debug_day_manifest_key: debugDayManifestKey,
   };
 }
 
