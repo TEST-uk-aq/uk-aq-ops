@@ -111,6 +111,7 @@ EXCLUDES=(
   --exclude='r2_aqi_gap_check*'
   --exclude='scripts/R2_v2_implementation/tmp_r2_manifest_rebuild*'
   --exclude='logs4GH/'
+  --exclude='_codex_context/'
 )
 
 # ── Sync function ─────────────────────────────────────────────────────────────
