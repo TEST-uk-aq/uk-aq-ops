@@ -545,6 +545,13 @@ if [[ "${DRY_RUN}" == "true" ]]; then
   exit 0
 fi
 
+if (( OBSERVS_ONLY == 1 )) \
+  && [[ "${UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED:-}" == "true" ]] \
+  && [[ "${UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE:-}" != "true" ]]; then
+  echo "Skipping targeted R2 history index update because this staged observation chunk did not finalise."
+  exit 0
+fi
+
 BACKFILL_REPO_ROOT="$(cd "$(dirname "${BACKFILL_WRAPPER_PATH}")/.." && pwd)"
 TARGETED_INDEX_CMD=(
   "${NODE_BIN}"

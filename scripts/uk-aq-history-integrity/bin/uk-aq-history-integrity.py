@@ -2753,7 +2753,16 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     if not results:
         return {"status": "no_timeseries_ids", "exit_code": None, "duration_seconds": 0.0,
                 "wrapper_path": None, "env_file_path": None, "stdout_tail": "",
-                "stderr_tail": "", "log_path": None, "error": None}
+                "stderr_tail": "", "log_path": None, "error": None,
+                "rows_observations": 0, "source_connector_day_complete_events": 0,
+                "source_connector_day_skipped_events": 0,
+                "source_connector_day_pending_events": 0,
+                "source_connector_day_failed_events": 0,
+                "source_to_r2_targeted_stage_deferred_commit_events": 0,
+                "targeted_stage_deferred_rows_observations": 0,
+                "max_targeted_stage_deferred_rows_observations": 0,
+                "backfill_run_status": None,
+                "source_acquisition_pending_days": []}
     if len(results) == 1:
         return results[0]
     ranked = sorted(
@@ -2775,6 +2784,23 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "stderr_tail": worst.get("stderr_tail", "") or "",
         "log_path": "; ".join(log_paths) if log_paths else None,
         "error": "; ".join(errors) if errors else None,
+        "rows_observations": sum(int(r.get("rows_observations") or 0) for r in results),
+        "source_connector_day_complete_events": sum(int(r.get("source_connector_day_complete_events") or 0) for r in results),
+        "source_connector_day_skipped_events": sum(int(r.get("source_connector_day_skipped_events") or 0) for r in results),
+        "source_connector_day_pending_events": sum(int(r.get("source_connector_day_pending_events") or 0) for r in results),
+        "source_connector_day_failed_events": sum(int(r.get("source_connector_day_failed_events") or 0) for r in results),
+        "source_to_r2_targeted_stage_deferred_commit_events": sum(int(r.get("source_to_r2_targeted_stage_deferred_commit_events") or 0) for r in results),
+        "targeted_stage_deferred_rows_observations": sum(int(r.get("targeted_stage_deferred_rows_observations") or 0) for r in results),
+        "max_targeted_stage_deferred_rows_observations": max(
+            [int(r.get("max_targeted_stage_deferred_rows_observations") or 0) for r in results] or [0]
+        ),
+        "backfill_run_status": next((str(r.get("backfill_run_status")) for r in results if r.get("backfill_run_status")), None),
+        "source_acquisition_pending_days": sorted({
+            str(day)
+            for r in results
+            for day in (r.get("source_acquisition_pending_days") or [])
+            if str(day or "").strip()
+        }),
     }
 
 
@@ -2863,6 +2889,76 @@ def _tail_bytes(text: str, limit: int = BACKFILL_OUTPUT_TAIL_BYTES) -> str:
     if len(encoded) <= limit:
         return text
     return "...[truncated]...\n" + encoded[-limit:].decode("utf-8", errors="replace")
+
+
+def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "rows_observations": 0,
+        "source_connector_day_complete_events": 0,
+        "source_connector_day_skipped_events": 0,
+        "source_connector_day_pending_events": 0,
+        "source_connector_day_failed_events": 0,
+        "source_to_r2_targeted_stage_deferred_commit_events": 0,
+        "targeted_stage_deferred_rows_observations": 0,
+        "max_targeted_stage_deferred_rows_observations": 0,
+        "backfill_run_status": None,
+        "source_acquisition_pending_days": [],
+    }
+    for line in stdout_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_name = event.get("event")
+        if event_name == "source_to_r2_connector_day_complete":
+            status["source_connector_day_complete_events"] += 1
+            try:
+                status["rows_observations"] += int(event.get("rows_observations") or 0)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if event_name == "source_to_r2_connector_day_skipped":
+            status["source_connector_day_skipped_events"] += 1
+            try:
+                status["rows_observations"] += int(event.get("rows_observations") or 0)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if event_name == "source_to_r2_connector_day_pending":
+            status["source_connector_day_pending_events"] += 1
+            continue
+        if event_name == "source_to_r2_connector_day_failed":
+            status["source_connector_day_failed_events"] += 1
+            continue
+        if event_name == "source_to_r2_targeted_stage_deferred_commit":
+            status["source_to_r2_targeted_stage_deferred_commit_events"] += 1
+            try:
+                rows_observations = int(event.get("rows_observations") or 0)
+            except (TypeError, ValueError):
+                rows_observations = 0
+            status["targeted_stage_deferred_rows_observations"] += rows_observations
+            status["max_targeted_stage_deferred_rows_observations"] = max(
+                int(status["max_targeted_stage_deferred_rows_observations"] or 0),
+                rows_observations,
+            )
+            continue
+        if event_name == "backfill_run_complete":
+            run_status = event.get("status")
+            if run_status is not None:
+                status["backfill_run_status"] = str(run_status)
+            summary = event.get("summary")
+            if isinstance(summary, dict):
+                pending_days = summary.get("source_acquisition_pending_days")
+                if isinstance(pending_days, list):
+                    status["source_acquisition_pending_days"] = [
+                        str(day) for day in pending_days if str(day or "").strip()
+                    ]
+    return status
 
 
 def run_narrow_backfill(
@@ -3036,6 +3132,7 @@ def run_narrow_backfill(
 
     result["stdout_tail"] = _tail_bytes(stdout_text)
     result["stderr_tail"] = _tail_bytes(stderr_text)
+    result.update(_extract_source_to_r2_observation_status(stdout_text))
 
     if log_dir is not None and (stdout_text or stderr_text or result["status"]):
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -6695,6 +6792,55 @@ def _queue_aqi_rebuild_from_obs_repair(
     )
 
 
+def _validate_chunked_v2_observation_repair_for_aqi(
+    *,
+    chunk_count: int,
+    chunk_results: list[dict[str, Any]],
+    repaired_observation_rows: int,
+) -> tuple[bool, str | None]:
+    if chunk_count <= 1:
+        return True, None
+    if len(chunk_results) != chunk_count:
+        return False, f"attempted_chunks={len(chunk_results)} expected_chunks={chunk_count}"
+
+    deferred_events = sum(
+        int(result.get("source_to_r2_targeted_stage_deferred_commit_events") or 0)
+        for result in chunk_results
+    )
+    complete_events = sum(
+        int(result.get("source_connector_day_complete_events") or 0)
+        for result in chunk_results
+    )
+    expected_deferred_events = chunk_count - 1
+    if deferred_events != expected_deferred_events:
+        return False, (
+            f"targeted_stage_deferred_events={deferred_events} "
+            f"expected={expected_deferred_events}"
+        )
+    if complete_events != 1:
+        return False, f"connector_day_complete_events={complete_events} expected=1"
+
+    for index, result in enumerate(chunk_results[:-1], start=1):
+        if int(result.get("source_connector_day_complete_events") or 0) > 0:
+            return False, f"chunk_{index}_published_before_finalise"
+    final_result = chunk_results[-1]
+    if int(final_result.get("source_connector_day_complete_events") or 0) != 1:
+        return False, "final_chunk_did_not_publish_connector_day"
+
+    max_deferred_rows = max(
+        [
+            int(result.get("max_targeted_stage_deferred_rows_observations") or 0)
+            for result in chunk_results[:-1]
+        ] or [0]
+    )
+    if max_deferred_rows > 0 and repaired_observation_rows < max_deferred_rows:
+        return False, (
+            f"final_rows={repaired_observation_rows} "
+            f"less_than_staged_rows={max_deferred_rows}"
+        )
+    return True, None
+
+
 def run_cross_check_backfills(
     *,
     conn: sqlite3.Connection,
@@ -7657,6 +7803,8 @@ def run_v2_gap_backfills(
         "v2_observation_repairs_attempted": 0,
         "v2_observation_repairs_ok": 0,
         "v2_observation_repairs_failed": 0,
+        "v2_observation_repairs_no_rows": 0,
+        "v2_observation_repairs_guard_failed": 0,
         "observation_backfills_attempted": 0,
         "observation_backfills_ok": 0,
         "observation_backfills_failed": 0,
@@ -7726,39 +7874,45 @@ def run_v2_gap_backfills(
             day=day_obj,
         )
         if source_cache_status.get("status") not in {"ok", "not_checked"}:
-            for gap in gaps_by_key.get((day_iso, connector_id), []):
-                _set_v2_source_repair_plan(gap, status="skipped", command=None, source_cache_status=source_cache_status)
-            skip_entry = {
-                "day_utc": day_iso,
-                "connector_id": connector_id,
-                "status": source_cache_status.get("status"),
-                "reason": source_cache_status.get("reason"),
-                "source_cache": source_cache_status,
-            }
-            metrics["skipped_v2_observation_repairs"].append(skip_entry)
-            if source_cache_status.get("status") == "unavailable":
-                metrics["v2_observation_repairs_source_unavailable"] += 1
-            else:
-                metrics["v2_observation_repairs_source_download_failed"] += 1
             log.warning(
-                "v2 observation repair skipped day=%s connector_id=%s source_status=%s reason=%s",
+                "v2 observation repair will run despite source cache status day=%s connector_id=%s source_status=%s reason=%s",
                 day_iso,
                 connector_id,
                 source_cache_status.get("status"),
                 source_cache_status.get("reason"),
             )
-            continue
         metrics["planned_v2_observation_repairs"].extend(planned_cmds)
         metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
         for gap in gaps_by_key.get((day_iso, connector_id), []):
             _set_v2_source_repair_plan(gap, status="ready", command=first_cmd, source_cache_status=source_cache_status)
         chunk_results: list[dict[str, Any]] = []
+        stage_root = (
+            backfill_log_dir
+            / "_targeted_stage"
+            / f"v2_run_{run_id}"
+            / f"day_{day_iso}"
+            / f"connector_{connector_id}"
+        )
+        if len(chunks) > 1:
+            shutil.rmtree(stage_root, ignore_errors=True)
         for chunk_index, chunk_ids in enumerate(chunks, start=1):
             if limits.should_stop():
                 break
             chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
             if len(chunks) > 1:
                 chunk_label = f"{chunk_label}_chunk_{chunk_index:03d}_of_{len(chunks):03d}"
+            extra_env: dict[str, str] | None = None
+            if len(chunks) > 1:
+                extra_env = {
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
+                        "true" if chunk_index == len(chunks) else "false"
+                    ),
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": (
+                        "true" if chunk_index == len(chunks) else "false"
+                    ),
+                }
             bf = run_narrow_backfill(
                 wrapper_path=resolve_integrity_backfill_wrapper(),
                 env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
@@ -7771,6 +7925,7 @@ def run_v2_gap_backfills(
                 log_label=chunk_label,
                 output_scope="observations_only",
                 history_version="v2",
+                extra_env=extra_env,
             )
             chunk_results.append(bf)
             metrics["v2_observation_repairs_attempted"] += 1
@@ -7784,18 +7939,71 @@ def run_v2_gap_backfills(
                 metrics["v2_observation_index_rebuilds_failed"] += 1
                 break
         combined = _combine_backfill_results(chunk_results)
-        repair_ok = bool(chunk_results) and all((r.get("status") == "ok") for r in chunk_results)
+        wrapper_ok = bool(chunk_results) and all((r.get("status") == "ok") for r in chunk_results)
+        repaired_observation_rows = int(combined.get("rows_observations") or 0)
+        complete_events = int(combined.get("source_connector_day_complete_events") or 0)
+        skipped_events = int(combined.get("source_connector_day_skipped_events") or 0)
+        pending_events = int(combined.get("source_connector_day_pending_events") or 0)
+        failed_events = int(combined.get("source_connector_day_failed_events") or 0)
+        backfill_run_status = combined.get("backfill_run_status")
+        pending_days = list(combined.get("source_acquisition_pending_days") or [])
+        guard_ok, guard_reason = _validate_chunked_v2_observation_repair_for_aqi(
+            chunk_count=len(chunks),
+            chunk_results=chunk_results,
+            repaired_observation_rows=repaired_observation_rows,
+        )
+        source_pending = wrapper_ok and (
+            pending_events > 0
+            or str(backfill_run_status or "").strip() == "stubbed"
+            or len(pending_days) > 0
+        )
+        no_observation_rows = (
+            wrapper_ok
+            and not source_pending
+            and failed_events <= 0
+            and repaired_observation_rows <= 0
+            and (complete_events > 0 or skipped_events > 0)
+        )
+        repair_ok = (
+            wrapper_ok
+            and not source_pending
+            and failed_events <= 0
+            and repaired_observation_rows > 0
+            and guard_ok
+        )
+        if source_pending:
+            repair_status = "source_pending"
+        elif repair_ok:
+            repair_status = "ok"
+        elif no_observation_rows:
+            repair_status = "no_observations"
+        elif wrapper_ok and repaired_observation_rows > 0 and not guard_ok:
+            repair_status = "guard_failed"
+        else:
+            repair_status = "failed"
         repair_entry = {
             "day_utc": day_iso,
             "connector_id": connector_id,
             "history_version": "v2",
-            "status": "ok" if repair_ok else "failed",
+            "status": repair_status,
             "wrapper_status": combined.get("status"),
             "exit_code": combined.get("exit_code"),
             "error": combined.get("error"),
             "stdout_tail": combined.get("stdout_tail") or "",
             "stderr_tail": combined.get("stderr_tail") or "",
             "log_path": combined.get("log_path"),
+            "rows_observations": repaired_observation_rows,
+            "source_connector_day_complete_events": complete_events,
+            "source_connector_day_skipped_events": skipped_events,
+            "source_connector_day_pending_events": pending_events,
+            "source_connector_day_failed_events": failed_events,
+            "source_to_r2_targeted_stage_deferred_commit_events": int(combined.get("source_to_r2_targeted_stage_deferred_commit_events") or 0),
+            "targeted_stage_deferred_rows_observations": int(combined.get("targeted_stage_deferred_rows_observations") or 0),
+            "max_targeted_stage_deferred_rows_observations": int(combined.get("max_targeted_stage_deferred_rows_observations") or 0),
+            "aqi_rebuild_guard_ok": guard_ok,
+            "aqi_rebuild_guard_reason": guard_reason,
+            "backfill_run_status": backfill_run_status,
+            "source_acquisition_pending_days": pending_days,
             "timeseries_id_count": len(ts_ids),
             "chunk_count": len(chunks),
             "attempted_chunks": len(chunk_results),
@@ -7812,6 +8020,16 @@ def run_v2_gap_backfills(
                     "stdout_tail": result.get("stdout_tail") or "",
                     "stderr_tail": result.get("stderr_tail") or "",
                     "log_path": result.get("log_path"),
+                    "rows_observations": int(result.get("rows_observations") or 0),
+                    "source_connector_day_complete_events": int(result.get("source_connector_day_complete_events") or 0),
+                    "source_connector_day_skipped_events": int(result.get("source_connector_day_skipped_events") or 0),
+                    "source_connector_day_pending_events": int(result.get("source_connector_day_pending_events") or 0),
+                    "source_connector_day_failed_events": int(result.get("source_connector_day_failed_events") or 0),
+                    "source_to_r2_targeted_stage_deferred_commit_events": int(result.get("source_to_r2_targeted_stage_deferred_commit_events") or 0),
+                    "targeted_stage_deferred_rows_observations": int(result.get("targeted_stage_deferred_rows_observations") or 0),
+                    "max_targeted_stage_deferred_rows_observations": int(result.get("max_targeted_stage_deferred_rows_observations") or 0),
+                    "backfill_run_status": result.get("backfill_run_status"),
+                    "source_acquisition_pending_days": list(result.get("source_acquisition_pending_days") or []),
                 }
                 for i, result in enumerate(chunk_results, start=1)
             ],
@@ -7825,7 +8043,40 @@ def run_v2_gap_backfills(
                 queued.add((day_iso, connector_id))
             metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
             metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
+        elif no_observation_rows:
+            metrics["v2_observation_repairs_no_rows"] += 1
+            log.warning(
+                "v2 observation repair wrote no rows day=%s connector_id=%s attempted_chunks=%s complete_events=%s; AQI rebuild not queued",
+                day_iso,
+                connector_id,
+                repair_entry["attempted_chunks"],
+                complete_events,
+            )
+        elif source_pending:
+            metrics["v2_observation_repairs_source_unavailable"] += 1
+            log.warning(
+                "v2 observation repair pending source acquisition day=%s connector_id=%s attempted_chunks=%s pending_events=%s pending_days=%s; AQI rebuild not queued",
+                day_iso,
+                connector_id,
+                repair_entry["attempted_chunks"],
+                pending_events,
+                pending_days,
+            )
+        elif repair_status == "guard_failed":
+            metrics["v2_observation_repairs_guard_failed"] += 1
+            metrics["v2_observation_repairs_failed"] += 1
+            metrics["observation_backfills_failed"] += 1
+            log.warning(
+                "v2 observation repair blocked AQI rebuild by guard day=%s connector_id=%s attempted_chunks=%s reason=%s; AQI rebuild not queued",
+                day_iso,
+                connector_id,
+                repair_entry["attempted_chunks"],
+                guard_reason,
+            )
         else:
+            if wrapper_ok:
+                metrics["v2_observation_repairs_failed"] += 1
+                metrics["observation_backfills_failed"] += 1
             log.warning(
                 "v2 observation repair failed day=%s connector_id=%s attempted_chunks=%s failed_chunks=%s exit_code=%s error=%s",
                 day_iso,

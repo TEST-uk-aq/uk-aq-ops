@@ -9503,6 +9503,7 @@ async function fetchSourceObservationRowsForConnectorFromR2ObservationHistory(
             bindingByTimeseriesId: lookup.binding_by_timeseries_id,
             windowStartIso: lookbackStartIso,
             windowEndIso: dayEndIso,
+            connectorId,
           });
           if (mappedRows.length > 0) {
             const filteredRows = requestedStationIdSet
@@ -13194,6 +13195,7 @@ async function runSourceToAll(
                 bindingByTimeseriesId: connectorLookup.binding_by_timeseries_id,
                 windowStartIso: utcDayStartIso(dayUtc),
                 windowEndIso: utcDayStartIso(shiftIsoDay(dayUtc, 1)),
+                connectorId,
               });
               const replacementAqiRows = helperRowsToAqilevelHistoryRows(
                 sourceObservationRowsToHelperRowsForDay(

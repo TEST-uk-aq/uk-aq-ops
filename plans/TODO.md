@@ -48,3 +48,11 @@ So the final combined response can be marked r2_coverage_partial even though the
 ## Prune Daily v2 still using a v1 path
 
 history/v1/_ops/observations/runs/run_id=.../run_manifest.json
+
+## Fix AQILevels Debug writer_git_sha 
+
+Ensure the Cloud Run prune daily deployment passes the current Git commit SHA into the Phase B writer so future AQILevels data/debug manifests populate writer_git_sha instead of null.
+
+## Network selector card
+
+Netrwork counts don't update when switching between UK and C&R

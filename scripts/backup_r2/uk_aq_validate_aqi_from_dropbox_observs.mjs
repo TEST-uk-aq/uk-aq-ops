@@ -931,6 +931,7 @@ async function main() {
       windowStartIso: addUtcHours(utcDayStartIso(dayUtc), -23),
       windowEndIso: utcDayEndIso(dayUtc),
       stationIdFilter: null,
+      connectorId,
     });
     const expectedRows = buildAqilevelHistoryRowsForDayFromSourceObservations(
       mappedSourceRows,

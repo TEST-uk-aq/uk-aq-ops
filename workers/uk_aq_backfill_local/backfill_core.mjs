@@ -304,6 +304,7 @@ export function mapR2ObservationRowsToSourceObservations({
   windowStartIso,
   windowEndIso,
   stationIdFilter = null,
+  connectorId = /** @type {number | null} */ (null),
 }) {
   if (!(bindingByTimeseriesId instanceof Map)) {
     throw new Error("bindingByTimeseriesId must be a Map");
@@ -378,9 +379,13 @@ export function mapR2ObservationRowsToSourceObservations({
       continue;
     }
 
+    const connectorIdValue = Number(connectorId ?? row.connector_id);
     observations.push({
       timeseries_id: Math.trunc(timeseriesId),
       station_id: Math.trunc(Number(binding.station_id)),
+      connector_id: Number.isInteger(connectorIdValue) && connectorIdValue > 0
+        ? Math.trunc(connectorIdValue)
+        : null,
       pollutant_code: binding.pollutant_code,
       observed_at: observedAtIso,
       value,
@@ -447,6 +452,7 @@ export function buildAqilevelHistoryRowsByDayFromR2ObservationRows({
   fromDayUtc,
   toDayUtc,
   stationIdFilter = null,
+  connectorId = /** @type {number | null} */ (null),
 }) {
   const fromDay = parseIsoDayUtc(fromDayUtc);
   const toDay = parseIsoDayUtc(toDayUtc);
@@ -459,6 +465,7 @@ export function buildAqilevelHistoryRowsByDayFromR2ObservationRows({
     windowStartIso: addUtcHours(utcDayStartIso(fromDay), -23),
     windowEndIso: utcDayEndIso(toDay),
     stationIdFilter,
+    connectorId,
   });
   return buildAqilevelHistoryRowsByDayFromSourceObservations({
     rows: sourceRows,
