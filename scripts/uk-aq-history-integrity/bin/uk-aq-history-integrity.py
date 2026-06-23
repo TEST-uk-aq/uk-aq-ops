@@ -2761,6 +2761,9 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "source_to_r2_targeted_stage_deferred_commit_events": 0,
                 "targeted_stage_deferred_rows_observations": 0,
                 "max_targeted_stage_deferred_rows_observations": 0,
+                "source_timeseries_row_counts": {},
+                "source_pollutant_codes": [],
+                "source_mapped_rows": 0,
                 "backfill_run_status": None,
                 "source_acquisition_pending_days": []}
     if len(results) == 1:
@@ -2794,6 +2797,16 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "max_targeted_stage_deferred_rows_observations": max(
             [int(r.get("max_targeted_stage_deferred_rows_observations") or 0) for r in results] or [0]
         ),
+        "source_timeseries_row_counts": _merge_timeseries_row_counts([
+            r.get("source_timeseries_row_counts") for r in results
+        ]),
+        "source_pollutant_codes": sorted({
+            str(code).strip()
+            for r in results
+            for code in (r.get("source_pollutant_codes") or [])
+            if str(code or "").strip()
+        }),
+        "source_mapped_rows": sum(int(r.get("source_mapped_rows") or 0) for r in results),
         "backfill_run_status": next((str(r.get("backfill_run_status")) for r in results if r.get("backfill_run_status")), None),
         "source_acquisition_pending_days": sorted({
             str(day)
@@ -2891,6 +2904,17 @@ def _tail_bytes(text: str, limit: int = BACKFILL_OUTPUT_TAIL_BYTES) -> str:
     return "...[truncated]...\n" + encoded[-limit:].decode("utf-8", errors="replace")
 
 
+def _merge_timeseries_row_counts(
+    raw_maps: Iterable[Any],
+) -> dict[int, int]:
+    merged: dict[int, int] = {}
+    for raw_map in raw_maps:
+        counts = _normalize_timeseries_row_counts(raw_map)
+        for timeseries_id, count in counts.items():
+            merged[timeseries_id] = merged.get(timeseries_id, 0) + count
+    return merged
+
+
 def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]:
     status: dict[str, Any] = {
         "rows_observations": 0,
@@ -2901,9 +2925,14 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         "source_to_r2_targeted_stage_deferred_commit_events": 0,
         "targeted_stage_deferred_rows_observations": 0,
         "max_targeted_stage_deferred_rows_observations": 0,
+        "source_timeseries_row_counts": {},
+        "source_pollutant_codes": [],
+        "source_mapped_rows": 0,
         "backfill_run_status": None,
         "source_acquisition_pending_days": [],
     }
+    source_timeseries_row_counts: dict[int, int] = {}
+    source_pollutant_codes: set[str] = set()
     for line in stdout_text.splitlines():
         stripped = line.strip()
         if not stripped.startswith("{"):
@@ -2915,12 +2944,36 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         if not isinstance(event, dict):
             continue
         event_name = event.get("event")
+        try:
+            timeseries_id = int(event.get("timeseries_id"))
+        except (TypeError, ValueError):
+            timeseries_id = None
+        mapped_count = None
+        for mapped_key in ("mapped_point_count", "mapped_records"):
+            try:
+                mapped_count = int(event.get(mapped_key))
+            except (TypeError, ValueError):
+                continue
+            break
+        if mapped_count is not None and mapped_count > 0:
+            status["source_mapped_rows"] += mapped_count
+            if timeseries_id is not None and timeseries_id > 0:
+                source_timeseries_row_counts[timeseries_id] = (
+                    source_timeseries_row_counts.get(timeseries_id, 0) + mapped_count
+                )
+        pollutant_code = str(event.get("pollutant_code") or "").strip()
+        if pollutant_code and mapped_count is not None and mapped_count > 0:
+            source_pollutant_codes.add(pollutant_code)
         if event_name == "source_to_r2_connector_day_complete":
             status["source_connector_day_complete_events"] += 1
             try:
                 status["rows_observations"] += int(event.get("rows_observations") or 0)
             except (TypeError, ValueError):
                 pass
+            for code in event.get("pollutant_codes_written") or []:
+                code_str = str(code or "").strip()
+                if code_str:
+                    source_pollutant_codes.add(code_str)
             continue
         if event_name == "source_to_r2_connector_day_skipped":
             status["source_connector_day_skipped_events"] += 1
@@ -2958,6 +3011,8 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
                     status["source_acquisition_pending_days"] = [
                         str(day) for day in pending_days if str(day or "").strip()
                     ]
+    status["source_timeseries_row_counts"] = source_timeseries_row_counts
+    status["source_pollutant_codes"] = sorted(source_pollutant_codes)
     return status
 
 
@@ -6841,6 +6896,262 @@ def _validate_chunked_v2_observation_repair_for_aqi(
     return True, None
 
 
+def _repo_root_for_integrity_script() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _v2_observation_connector_manifest_key(
+    *,
+    day_utc: str,
+    connector_id: int,
+    env: Mapping[str, str],
+) -> str:
+    merged_env = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
+    config = resolve_history_path_config("v2", merged_env)
+    return (
+        f"{config.observations_data_prefix.strip('/')}"
+        f"/day_utc={day_utc}/connector_id={int(connector_id)}/manifest.json"
+    )
+
+
+def _has_direct_r2_read_config(env: Mapping[str, str]) -> bool:
+    return all(
+        str(env.get(key) or "").strip()
+        for key in (
+            "CFLARE_R2_ENDPOINT",
+            "CFLARE_R2_BUCKET",
+            "CFLARE_R2_ACCESS_KEY_ID",
+            "CFLARE_R2_SECRET_ACCESS_KEY",
+        )
+    ) or all(
+        str(env.get(key) or "").strip()
+        for key in (
+            "R2_ENDPOINT",
+            "R2_BUCKET",
+            "R2_ACCESS_KEY_ID",
+            "R2_SECRET_ACCESS_KEY",
+        )
+    )
+
+
+def _read_json_manifest_from_r2(
+    *,
+    manifest_key: str,
+    env: Mapping[str, str],
+    timeout_seconds: int = 30,
+) -> tuple[Any | None, str | None]:
+    merged_env = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
+    if not _has_direct_r2_read_config(merged_env):
+        return None, "r2_config_missing"
+    node_bin = (
+        merged_env.get("UK_AQ_BACKFILL_NODE_BIN")
+        or merged_env.get("NODE_BIN")
+        or shutil.which("node")
+        or "node"
+    )
+    read_env = {
+        **merged_env,
+        "UK_AQ_MANIFEST_GUARD_KEY": manifest_key,
+    }
+    code = r"""
+import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
+
+const env = process.env;
+const key = String(env.UK_AQ_MANIFEST_GUARD_KEY || "").trim();
+const r2 = {
+  endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
+  bucket: String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim(),
+  region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
+  access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
+  secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
+};
+const object = await r2GetObject({ r2, key });
+process.stdout.write(object.body.toString("utf8"));
+"""
+    try:
+        proc = subprocess.run(
+            [node_bin, "--input-type=module", "-e", code],
+            cwd=_repo_root_for_integrity_script(),
+            env=read_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"r2_read_failed:{type(exc).__name__}"
+    if proc.returncode != 0:
+        return None, f"r2_read_failed:exit_code={proc.returncode}"
+    try:
+        return json.loads(proc.stdout or ""), None
+    except json.JSONDecodeError:
+        return None, "r2_manifest_invalid_json"
+
+
+def _read_json_manifest_for_guard(
+    *,
+    manifest_key: str,
+    env: Mapping[str, str],
+) -> tuple[Any | None, str | None, str | None]:
+    payload, err = _read_json_manifest_from_r2(manifest_key=manifest_key, env=env)
+    if err is None:
+        return payload, "r2", None
+
+    merged_env = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
+    root_raw = str(merged_env.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT") or "").strip()
+    if root_raw:
+        manifest_path = Path(root_raw) / manifest_key
+        if manifest_path.is_file():
+            local_payload, local_err = _load_json_file(manifest_path)
+            if local_err is None:
+                return local_payload, "local_mirror", None
+            return None, "local_mirror", f"local_manifest_{local_err}"
+        return None, "local_mirror", f"local_manifest_missing:{manifest_key}"
+    return None, None, err
+
+
+def _manifest_row_count(payload: Mapping[str, Any]) -> int:
+    for key in ("row_count", "source_row_count"):
+        try:
+            value = int(payload.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    total = 0
+    for entry in _manifest_files(payload):
+        try:
+            total += int(entry.get("row_count") or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _manifest_timeseries_row_counts(payload: Mapping[str, Any]) -> dict[int, int]:
+    counts = _normalize_timeseries_row_counts(payload.get("timeseries_row_counts"))
+    if counts:
+        return counts
+    return _merge_timeseries_row_counts(
+        entry.get("timeseries_row_counts") for entry in _manifest_files(payload)
+    )
+
+
+def _manifest_pollutant_codes(payload: Mapping[str, Any]) -> set[str]:
+    codes: set[str] = {
+        str(code).strip()
+        for code in (payload.get("pollutant_codes") or [])
+        if str(code or "").strip()
+    }
+    for key in ("pollutant_manifests", "child_manifests"):
+        raw_children = payload.get(key)
+        if isinstance(raw_children, list):
+            for child in raw_children:
+                if isinstance(child, dict):
+                    code = str(child.get("pollutant_code") or "").strip()
+                    if code:
+                        codes.add(code)
+    for entry in _manifest_files(payload):
+        code = str(entry.get("pollutant_code") or "").strip()
+        if code:
+            codes.add(code)
+        for entry_code in entry.get("pollutant_codes") or []:
+            code_str = str(entry_code or "").strip()
+            if code_str:
+                codes.add(code_str)
+    return codes
+
+
+def _verify_v2_observation_manifest_content_for_aqi(
+    *,
+    day_utc: str,
+    connector_id: int,
+    env: Mapping[str, str],
+    expected_timeseries_row_counts: Mapping[int, int],
+    expected_pollutant_codes: Iterable[str],
+    expected_min_rows: int,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    manifest_key = _v2_observation_connector_manifest_key(
+        day_utc=day_utc,
+        connector_id=connector_id,
+        env=env,
+    )
+    payload, source, err = _read_json_manifest_for_guard(
+        manifest_key=manifest_key,
+        env=env,
+    )
+    details: dict[str, Any] = {
+        "manifest_key": manifest_key,
+        "manifest_source": source,
+        "expected_min_rows": int(expected_min_rows or 0),
+        "expected_timeseries_count": len(expected_timeseries_row_counts),
+        "expected_pollutant_codes": sorted({
+            str(code).strip()
+            for code in expected_pollutant_codes
+            if str(code or "").strip()
+        }),
+    }
+    if err is not None:
+        details["error"] = err
+        return False, f"manifest_read_failed:{err}", details
+    if not isinstance(payload, dict):
+        return False, "manifest_not_object", details
+    if str(payload.get("history_version") or "v2") != "v2":
+        return False, "manifest_history_version_mismatch", details
+    if str(payload.get("domain") or "observations") != "observations":
+        return False, "manifest_domain_mismatch", details
+    if "day_utc" in payload and str(payload.get("day_utc")) != day_utc:
+        return False, "manifest_day_mismatch", details
+    if "connector_id" in payload:
+        try:
+            manifest_connector_id = int(payload.get("connector_id") or 0)
+        except (TypeError, ValueError):
+            manifest_connector_id = 0
+        if manifest_connector_id != int(connector_id):
+            return False, "manifest_connector_mismatch", details
+
+    manifest_rows = _manifest_row_count(payload)
+    manifest_counts = _manifest_timeseries_row_counts(payload)
+    manifest_pollutants = _manifest_pollutant_codes(payload)
+    details.update({
+        "manifest_rows": manifest_rows,
+        "manifest_timeseries_count": len(manifest_counts),
+        "manifest_pollutant_codes": sorted(manifest_pollutants),
+    })
+    if expected_min_rows > 0 and manifest_rows < expected_min_rows:
+        return False, f"manifest_rows_below_expected:{manifest_rows}<{expected_min_rows}", details
+
+    missing_timeseries: list[int] = []
+    low_count_timeseries: list[str] = []
+    for raw_timeseries_id, raw_expected_count in expected_timeseries_row_counts.items():
+        try:
+            timeseries_id = int(raw_timeseries_id)
+            expected_count = int(raw_expected_count)
+        except (TypeError, ValueError):
+            continue
+        if expected_count <= 0:
+            continue
+        observed_count = int(manifest_counts.get(timeseries_id, 0) or 0)
+        if observed_count <= 0:
+            missing_timeseries.append(timeseries_id)
+        elif observed_count < expected_count:
+            low_count_timeseries.append(f"{timeseries_id}:{observed_count}<{expected_count}")
+    if missing_timeseries:
+        details["missing_timeseries_ids"] = missing_timeseries[:25]
+        details["missing_timeseries_count"] = len(missing_timeseries)
+        return False, f"manifest_missing_timeseries:{len(missing_timeseries)}", details
+    if low_count_timeseries:
+        details["low_count_timeseries"] = low_count_timeseries[:25]
+        details["low_count_timeseries_count"] = len(low_count_timeseries)
+        return False, f"manifest_timeseries_counts_low:{len(low_count_timeseries)}", details
+
+    expected_pollutants = set(details["expected_pollutant_codes"])
+    missing_pollutants = sorted(expected_pollutants - manifest_pollutants)
+    if missing_pollutants:
+        details["missing_pollutant_codes"] = missing_pollutants
+        return False, f"manifest_missing_pollutants:{','.join(missing_pollutants)}", details
+    return True, None, details
+
+
 def run_cross_check_backfills(
     *,
     conn: sqlite3.Connection,
@@ -7947,10 +8258,20 @@ def run_v2_gap_backfills(
         failed_events = int(combined.get("source_connector_day_failed_events") or 0)
         backfill_run_status = combined.get("backfill_run_status")
         pending_days = list(combined.get("source_acquisition_pending_days") or [])
-        guard_ok, guard_reason = _validate_chunked_v2_observation_repair_for_aqi(
+        process_guard_ok, process_guard_reason = _validate_chunked_v2_observation_repair_for_aqi(
             chunk_count=len(chunks),
             chunk_results=chunk_results,
             repaired_observation_rows=repaired_observation_rows,
+        )
+        source_timeseries_row_counts = _normalize_timeseries_row_counts(
+            combined.get("source_timeseries_row_counts")
+        )
+        source_pollutant_codes = list(combined.get("source_pollutant_codes") or [])
+        source_rows_from_counts = sum(source_timeseries_row_counts.values())
+        expected_min_manifest_rows = (
+            max(repaired_observation_rows, source_rows_from_counts)
+            if source_rows_from_counts > 0
+            else repaired_observation_rows
         )
         source_pending = wrapper_ok and (
             pending_events > 0
@@ -7964,12 +8285,34 @@ def run_v2_gap_backfills(
             and repaired_observation_rows <= 0
             and (complete_events > 0 or skipped_events > 0)
         )
+        manifest_guard_ok = True
+        manifest_guard_reason: str | None = None
+        manifest_guard_details: dict[str, Any] = {}
+        should_verify_manifest = (
+            wrapper_ok
+            and not source_pending
+            and failed_events <= 0
+            and repaired_observation_rows > 0
+            and process_guard_ok
+        )
+        if should_verify_manifest:
+            manifest_guard_ok, manifest_guard_reason, manifest_guard_details = (
+                _verify_v2_observation_manifest_content_for_aqi(
+                    day_utc=day_iso,
+                    connector_id=connector_id,
+                    env=env,
+                    expected_timeseries_row_counts=source_timeseries_row_counts,
+                    expected_pollutant_codes=source_pollutant_codes,
+                    expected_min_rows=expected_min_manifest_rows,
+                )
+            )
         repair_ok = (
             wrapper_ok
             and not source_pending
             and failed_events <= 0
             and repaired_observation_rows > 0
-            and guard_ok
+            and process_guard_ok
+            and manifest_guard_ok
         )
         if source_pending:
             repair_status = "source_pending"
@@ -7977,7 +8320,7 @@ def run_v2_gap_backfills(
             repair_status = "ok"
         elif no_observation_rows:
             repair_status = "no_observations"
-        elif wrapper_ok and repaired_observation_rows > 0 and not guard_ok:
+        elif wrapper_ok and repaired_observation_rows > 0 and (not process_guard_ok or not manifest_guard_ok):
             repair_status = "guard_failed"
         else:
             repair_status = "failed"
@@ -8000,8 +8343,19 @@ def run_v2_gap_backfills(
             "source_to_r2_targeted_stage_deferred_commit_events": int(combined.get("source_to_r2_targeted_stage_deferred_commit_events") or 0),
             "targeted_stage_deferred_rows_observations": int(combined.get("targeted_stage_deferred_rows_observations") or 0),
             "max_targeted_stage_deferred_rows_observations": int(combined.get("max_targeted_stage_deferred_rows_observations") or 0),
-            "aqi_rebuild_guard_ok": guard_ok,
-            "aqi_rebuild_guard_reason": guard_reason,
+            "source_timeseries_row_counts": {
+                str(timeseries_id): count
+                for timeseries_id, count in sorted(source_timeseries_row_counts.items())
+            },
+            "source_pollutant_codes": sorted({str(code) for code in source_pollutant_codes}),
+            "source_mapped_rows": int(combined.get("source_mapped_rows") or 0),
+            "aqi_rebuild_guard_ok": process_guard_ok and manifest_guard_ok,
+            "aqi_rebuild_guard_reason": process_guard_reason or manifest_guard_reason,
+            "aqi_rebuild_process_guard_ok": process_guard_ok,
+            "aqi_rebuild_process_guard_reason": process_guard_reason,
+            "aqi_rebuild_manifest_guard_ok": manifest_guard_ok,
+            "aqi_rebuild_manifest_guard_reason": manifest_guard_reason,
+            "aqi_rebuild_manifest_guard": manifest_guard_details,
             "backfill_run_status": backfill_run_status,
             "source_acquisition_pending_days": pending_days,
             "timeseries_id_count": len(ts_ids),
@@ -8028,6 +8382,14 @@ def run_v2_gap_backfills(
                     "source_to_r2_targeted_stage_deferred_commit_events": int(result.get("source_to_r2_targeted_stage_deferred_commit_events") or 0),
                     "targeted_stage_deferred_rows_observations": int(result.get("targeted_stage_deferred_rows_observations") or 0),
                     "max_targeted_stage_deferred_rows_observations": int(result.get("max_targeted_stage_deferred_rows_observations") or 0),
+                    "source_timeseries_row_counts": {
+                        str(timeseries_id): count
+                        for timeseries_id, count in sorted(
+                            _normalize_timeseries_row_counts(result.get("source_timeseries_row_counts")).items()
+                        )
+                    },
+                    "source_pollutant_codes": list(result.get("source_pollutant_codes") or []),
+                    "source_mapped_rows": int(result.get("source_mapped_rows") or 0),
                     "backfill_run_status": result.get("backfill_run_status"),
                     "source_acquisition_pending_days": list(result.get("source_acquisition_pending_days") or []),
                 }
@@ -8071,7 +8433,7 @@ def run_v2_gap_backfills(
                 day_iso,
                 connector_id,
                 repair_entry["attempted_chunks"],
-                guard_reason,
+                repair_entry["aqi_rebuild_guard_reason"],
             )
         else:
             if wrapper_ok:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gzip
 import importlib.util
+import json
 import logging
 import os
 import sqlite3
@@ -70,6 +71,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             "UK_AQ_HISTORY_INTEGRITY_TMP_DIR": str(self.root / "tmp"),
             "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR": str(self.root / "source-cache"),
             "UK_AQ_BACKFILL_ENV_FILE": str(self.root / "backfill.env"),
+            "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(self.root / "r2-history"),
         }
         self.log = logging.getLogger("v2-repair-test")
 
@@ -183,7 +185,59 @@ class V2RepairExecutionTests(unittest.TestCase):
         path.write_bytes(payload)
         return len(payload)
 
-    def _ok_obs_repair_result(self, rows: int = 1) -> dict[str, object]:
+    def _write_v2_observation_connector_manifest(
+        self,
+        *,
+        day_utc: str = "2026-06-08",
+        connector_id: int = 6,
+        timeseries_row_counts: dict[int, int] | None = None,
+        pollutant_codes: list[str] | None = None,
+        declared_row_count: int | None = None,
+    ) -> None:
+        counts = timeseries_row_counts or {101: 1}
+        pollutants = pollutant_codes or ["pm25"]
+        row_count = int(declared_row_count) if declared_row_count is not None else sum(int(value) for value in counts.values())
+        manifest_path = (
+            Path(self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"])
+            / "history/v2/observations"
+            / f"day_utc={day_utc}"
+            / f"connector_id={connector_id}"
+            / "manifest.json"
+        )
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps({
+                "history_version": "v2",
+                "domain": "observations",
+                "manifest_kind": "connector",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_codes": pollutants,
+                "row_count": row_count,
+                "source_row_count": row_count,
+                "timeseries_row_counts": {str(key): value for key, value in counts.items()},
+                "files": [{
+                    "key": (
+                        f"history/v2/observations/day_utc={day_utc}/connector_id={connector_id}/"
+                        f"pollutant_code={pollutants[0]}/part-00000.parquet"
+                    ),
+                    "row_count": row_count,
+                    "pollutant_codes": pollutants,
+                    "timeseries_row_counts": {str(key): value for key, value in counts.items()},
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+    def _ok_obs_repair_result(
+        self,
+        rows: int = 1,
+        *,
+        source_counts: dict[int, int] | None = None,
+        pollutant_codes: list[str] | None = None,
+    ) -> dict[str, object]:
+        source_counts = source_counts or {}
+        pollutant_codes = pollutant_codes or []
         return {
             "status": "ok",
             "exit_code": 0,
@@ -195,12 +249,23 @@ class V2RepairExecutionTests(unittest.TestCase):
             "source_to_r2_targeted_stage_deferred_commit_events": 0,
             "targeted_stage_deferred_rows_observations": 0,
             "max_targeted_stage_deferred_rows_observations": 0,
+            "source_timeseries_row_counts": {str(key): value for key, value in source_counts.items()},
+            "source_pollutant_codes": pollutant_codes,
+            "source_mapped_rows": sum(source_counts.values()),
             "stdout_tail": "",
             "stderr_tail": "",
             "log_path": None,
         }
 
-    def _staged_obs_repair_result(self, rows: int = 1) -> dict[str, object]:
+    def _staged_obs_repair_result(
+        self,
+        rows: int = 1,
+        *,
+        source_counts: dict[int, int] | None = None,
+        pollutant_codes: list[str] | None = None,
+    ) -> dict[str, object]:
+        source_counts = source_counts or {}
+        pollutant_codes = pollutant_codes or []
         return {
             "status": "ok",
             "exit_code": 0,
@@ -212,6 +277,9 @@ class V2RepairExecutionTests(unittest.TestCase):
             "source_to_r2_targeted_stage_deferred_commit_events": 1,
             "targeted_stage_deferred_rows_observations": rows,
             "max_targeted_stage_deferred_rows_observations": rows,
+            "source_timeseries_row_counts": {str(key): value for key, value in source_counts.items()},
+            "source_pollutant_codes": pollutant_codes,
+            "source_mapped_rows": sum(source_counts.values()),
             "stdout_tail": "",
             "stderr_tail": "",
             "log_path": None,
@@ -283,6 +351,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             conn.close()
 
     def test_v2_execution_invokes_wrapper_with_history_version_v2(self) -> None:
+        self._write_v2_observation_connector_manifest(timeseries_row_counts={101: 1})
         with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "wrapper.sh")), \
              mock.patch.object(MODULE, "run_narrow_backfill", return_value=self._ok_obs_repair_result()) as run_bf:
             (self.root / "wrapper.sh").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -353,6 +422,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         try:
             self._insert_openaq_prior_state(conn, local_cached_path=str(cached))
             gap = {"day_utc": "2026-06-08", "connector_id": 6}
+            self._write_v2_observation_connector_manifest(timeseries_row_counts={101: 2})
             with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "wrapper.sh")), \
                  mock.patch.object(MODULE, "run_narrow_backfill", return_value=self._ok_obs_repair_result(rows=2)) as run_bf:
                 metrics = MODULE.run_v2_gap_backfills(
@@ -391,6 +461,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         cached.write_bytes(gzip.compress(b"ok\n"))
         try:
             self._insert_openaq_prior_state(conn, local_cached_path=str(cached))
+            self._write_v2_observation_connector_manifest(timeseries_row_counts={101: 3})
             with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")), \
                  mock.patch.object(MODULE, "run_narrow_backfill", return_value=self._ok_obs_repair_result(rows=3)) as run_obs, \
                  mock.patch.object(MODULE, "run_aqi_rebuild_backfill", return_value={"status": "ok", "log_path": None}) as run_aqi:
@@ -560,10 +631,14 @@ class V2RepairExecutionTests(unittest.TestCase):
         cached.write_bytes(gzip.compress(b"ok\n"))
         try:
             self._insert_openaq_prior_state(conn, local_cached_path=str(cached))
+            self._write_v2_observation_connector_manifest(
+                timeseries_row_counts={101: 1, 102: 1, 103: 1, 104: 1, 105: 1},
+                pollutant_codes=["pm25"],
+            )
             ok_results = [
-                self._staged_obs_repair_result(rows=2),
-                self._staged_obs_repair_result(rows=4),
-                self._ok_obs_repair_result(rows=5),
+                self._staged_obs_repair_result(rows=2, source_counts={101: 1, 102: 1}, pollutant_codes=["pm25"]),
+                self._staged_obs_repair_result(rows=4, source_counts={103: 1, 104: 1}, pollutant_codes=["pm25"]),
+                self._ok_obs_repair_result(rows=5, source_counts={105: 1}, pollutant_codes=["pm25"]),
             ]
             with mock.patch.dict(os.environ, {MODULE._V2_OBSERVATION_REPAIR_CHUNK_ENV_VAR: "2"}), \
                  mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "wrapper.sh")), \
@@ -635,6 +710,53 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(result["status"], "guard_failed")
             self.assertFalse(result["aqi_rebuild_guard_ok"])
             self.assertIn("targeted_stage_deferred_events=0", result["aqi_rebuild_guard_reason"])
+            queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
+            self.assertEqual(int(queued), 0)
+        finally:
+            conn.close()
+
+    def test_v2_observation_repair_guard_blocks_aqi_when_final_manifest_misses_source_timeseries(self) -> None:
+        conn = self._new_source_db(timeseries_ids=(101, 102))
+        cached = self.root / "cached-openaq-manifest-missing-timeseries.csv.gz"
+        cached.write_bytes(gzip.compress(b"ok\n"))
+        try:
+            self._insert_openaq_prior_state(conn, local_cached_path=str(cached))
+            self._write_v2_observation_connector_manifest(
+                timeseries_row_counts={101: 1},
+                pollutant_codes=["pm25"],
+                declared_row_count=2,
+            )
+            with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "wrapper.sh")), \
+                 mock.patch.object(
+                     MODULE,
+                     "run_narrow_backfill",
+                     return_value=self._ok_obs_repair_result(
+                         rows=2,
+                         source_counts={101: 1, 102: 1},
+                         pollutant_codes=["pm25"],
+                     ),
+                 ):
+                metrics = MODULE.run_v2_gap_backfills(
+                    conn=conn,
+                    run_id=134,
+                    env_name="CIC-Test",
+                    run_compact="run",
+                    env=self.env,
+                    v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
+                    dry_run=False,
+                    run_backfill=True,
+                    limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+                    log=self.log,
+                )
+
+            self.assertEqual(metrics["v2_observation_repairs_ok"], 0)
+            self.assertEqual(metrics["v2_observation_repairs_guard_failed"], 1)
+            self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 0)
+            result = metrics["v2_observation_repair_results"][0]
+            self.assertEqual(result["status"], "guard_failed")
+            self.assertFalse(result["aqi_rebuild_manifest_guard_ok"])
+            self.assertIn("manifest_missing_timeseries:1", result["aqi_rebuild_manifest_guard_reason"])
+            self.assertEqual(result["aqi_rebuild_manifest_guard"]["missing_timeseries_ids"], [102])
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
             self.assertEqual(int(queued), 0)
         finally:
