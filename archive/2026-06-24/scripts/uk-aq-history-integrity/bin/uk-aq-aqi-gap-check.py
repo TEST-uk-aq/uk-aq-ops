@@ -22,7 +22,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -447,6 +446,7 @@ def resolve_integrity_end_back_days(env: Mapping[str, str] | None = None) -> int
             if parsed > 0:
                 retention_days = parsed
         except ValueError:
+            # Ignore malformed INGESTDB_RETENTION_DAYS and retain the default retention.
             pass
     return retention_days + 1
 
@@ -560,8 +560,8 @@ def copy_db_to_dropbox(env: Mapping[str, str], conn: sqlite3.Connection, log: lo
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
-        except OSError:
-            pass
+        except OSError as cleanup_exc:
+            logging.debug("Ignoring non-fatal temporary DB cleanup failure: %s", cleanup_exc)
     return result
 
 
