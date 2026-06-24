@@ -229,6 +229,151 @@ class V2RepairExecutionTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_v2_observation_partition(
+        self,
+        *,
+        day_utc: str = "2026-06-18",
+        connector_id: int = 1,
+        pollutant_code: str = "pm25",
+        timeseries_row_counts: dict[int, int] | None = None,
+    ) -> None:
+        counts = timeseries_row_counts or {218: 13}
+        row_count = sum(int(value) for value in counts.values())
+        root = Path(self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"])
+        key = (
+            f"history/v2/observations/day_utc={day_utc}/connector_id={connector_id}/"
+            f"pollutant_code={pollutant_code}/part-00000.parquet"
+        )
+        part = root / f"history/v2/observations/day_utc={day_utc}/connector_id={connector_id}/pollutant_code={pollutant_code}"
+        part.mkdir(parents=True, exist_ok=True)
+        (root / key).write_bytes(b"PAR1")
+        payload = {
+            "history_version": "v2",
+            "domain": "observations",
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+            "row_count": row_count,
+            "source_row_count": row_count,
+            "file_count": 1,
+            "timeseries_row_counts": {str(key): value for key, value in counts.items()},
+            "files": [{
+                "key": key,
+                "row_count": row_count,
+                "pollutant_code": pollutant_code,
+                "timeseries_row_counts": {str(key): value for key, value in counts.items()},
+            }],
+        }
+        (part / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+        idx = root / f"history/_index_v2/observations_timeseries/day_utc={day_utc}/connector_id={connector_id}/pollutant_code={pollutant_code}"
+        idx.mkdir(parents=True, exist_ok=True)
+        (idx / "manifest.json").write_text(
+            json.dumps({"timeseries_row_counts": {str(key): value for key, value in counts.items()}}),
+            encoding="utf-8",
+        )
+        latest = root / "history/_index_v2/observations_timeseries_latest.json"
+        latest.parent.mkdir(parents=True, exist_ok=True)
+        latest.write_text(json.dumps({"latest": day_utc}), encoding="utf-8")
+
+    def _new_current_source_db(
+        self,
+        *,
+        day_utc: str = "2026-06-18",
+        connector_id: int = 1,
+        source_key: str = MODULE.UK_AIR_SOS_SOURCE_KEY,
+        source_location_id: str = "station-1",
+        timeseries_pollutants: dict[int, str] | None = None,
+        source_counts: dict[int, int] | None = None,
+    ) -> sqlite3.Connection:
+        timeseries_pollutants = timeseries_pollutants or {218: "pm25"}
+        source_counts = source_counts or {218: 24}
+        conn = MODULE.open_db(str(self.root / f"current-source-{connector_id}-{day_utc}.sqlite"))
+        phenomenon_ids: dict[str, int] = {}
+        for pollutant in sorted(set(timeseries_pollutants.values())):
+            phenomenon_id = len(phenomenon_ids) + 1
+            phenomenon_ids[pollutant] = phenomenon_id
+            conn.execute(
+                """
+                INSERT INTO core_phenomena_snapshot (
+                  id, label, source_label, pollutant_label, observed_property_id, connector_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (phenomenon_id, pollutant, pollutant, pollutant, phenomenon_id, connector_id),
+            )
+        for ts_id, pollutant in sorted(timeseries_pollutants.items()):
+            conn.execute(
+                """
+                INSERT INTO core_timeseries_snapshot (
+                  id, station_id, connector_id, timeseries_ref, label, phenomenon_id, ended_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ts_id, 1, connector_id, f"source:{source_location_id}:{pollutant}:{ts_id}", pollutant, phenomenon_ids[pollutant], None),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_station_timeseries_lookup (
+                  source_key, source_location_id, station_ref, station_id,
+                  connector_id, timeseries_id, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (source_key, source_location_id, source_location_id, 1, connector_id, ts_id, 1),
+            )
+        source_file_key = f"{source_key}:{source_location_id}:{day_utc}"
+        conn.execute(
+            """
+            INSERT INTO source_file_state (
+              source_file_key, env_name, source_key, remote_scheme,
+              remote_url_or_key, station_ref, source_location_id, day_utc,
+              exists_remote, first_seen_at_utc, last_checked_at_utc, last_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_file_key,
+                "CIC-Test",
+                source_key,
+                "mock",
+                "mock://source",
+                source_location_id,
+                source_location_id,
+                day_utc,
+                1,
+                "2026-06-24T00:00:00Z",
+                "2026-06-24T00:00:00Z",
+                "changed",
+            ),
+        )
+        for ts_id, count in sorted(source_counts.items()):
+            conn.execute(
+                """
+                INSERT INTO source_file_timeseries_counts (
+                  source_file_key, timeseries_id, row_count, counted_at_utc
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (source_file_key, ts_id, count, "2026-06-24T00:00:00Z"),
+            )
+        conn.commit()
+        return conn
+
+    def _run_v2_observations_integrity_with_source(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        day_utc: str = "2026-06-18",
+        source: str = "uk_air_sos",
+        connector_ids: list[int] | None = None,
+    ) -> dict[str, object]:
+        return MODULE.run_v2_observations_integrity_checks(
+            r2_history_root=self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"],
+            config=MODULE.resolve_history_path_config("v2", {}),
+            from_day=day_utc,
+            to_day=day_utc,
+            conn=conn,
+            env_name="CIC-Test",
+            allowed_connector_ids=set(connector_ids) if connector_ids else None,
+            source_scope={"source": source, "connector_ids": connector_ids, "scope": "source" if connector_ids else "all"},
+            log=self.log,
+        )
+
     def _ok_obs_repair_result(
         self,
         rows: int = 1,
@@ -347,6 +492,159 @@ class V2RepairExecutionTests(unittest.TestCase):
 
             self.assertEqual(allowed, {1})
             self.assertEqual(scope, {"source": "uk_air_sos", "connector_ids": [1], "scope": "source"})
+        finally:
+            conn.close()
+
+    def test_v2_source_r2_mismatch_detects_stale_internal_manifest_and_plans_repair(self) -> None:
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 13},
+        )
+        conn = self._new_current_source_db(
+            day_utc="2026-06-18",
+            connector_id=1,
+            timeseries_pollutants={218: "pm25"},
+            source_counts={218: 24},
+        )
+        try:
+            result = self._run_v2_observations_integrity_with_source(
+                conn,
+                day_utc="2026-06-18",
+                connector_ids=[1],
+            )
+
+            gaps = [gap for gap in result["gaps"] if gap["gap_type"] == "source_r2_timeseries_row_mismatch"]
+            self.assertEqual(len(gaps), 1)
+            self.assertEqual(gaps[0]["connector_id"], 1)
+            self.assertEqual(gaps[0]["pollutant_code"], "pm25")
+            self.assertEqual(gaps[0]["source_rows"], 24)
+            self.assertEqual(gaps[0]["r2_rows"], 13)
+            self.assertEqual(gaps[0]["missing_timeseries_count"], 1)
+            self.assertIn(218, gaps[0]["sample_missing_timeseries_ids"])
+
+            repair_metrics = MODULE.run_v2_gap_backfills(
+                conn=conn,
+                run_id=218,
+                env_name="CIC-Test",
+                run_compact="run",
+                env=self.env,
+                v2_observations=result,
+                dry_run=True,
+                run_backfill=True,
+                limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+                log=self.log,
+            )
+            self.assertEqual(repair_metrics["observation_backfill_candidate_days"], 1)
+            self.assertEqual(len(repair_metrics["planned_v2_observation_repairs"]), 1)
+            self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=1", repair_metrics["planned_v2_observation_repairs"][0])
+            self.assertIn("--history-version v2 --targeted --kind observations", repair_metrics["planned_v2_observation_index_rebuilds"][0])
+        finally:
+            conn.close()
+
+    def test_v2_source_r2_matching_counts_do_not_create_repair_candidate(self) -> None:
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 24},
+        )
+        conn = self._new_current_source_db(
+            day_utc="2026-06-18",
+            connector_id=1,
+            timeseries_pollutants={218: "pm25"},
+            source_counts={218: 24},
+        )
+        try:
+            result = self._run_v2_observations_integrity_with_source(
+                conn,
+                day_utc="2026-06-18",
+                connector_ids=[1],
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse(any(gap["gap_type"] == "source_r2_timeseries_row_mismatch" for gap in result["gaps"]))
+        finally:
+            conn.close()
+
+    def test_v2_source_r2_mismatch_is_pollutant_specific(self) -> None:
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 13},
+        )
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="no2",
+            timeseries_row_counts={319: 24},
+        )
+        conn = self._new_current_source_db(
+            day_utc="2026-06-18",
+            connector_id=1,
+            timeseries_pollutants={218: "pm25", 319: "no2"},
+            source_counts={218: 24, 319: 24},
+        )
+        try:
+            result = self._run_v2_observations_integrity_with_source(
+                conn,
+                day_utc="2026-06-18",
+                connector_ids=[1],
+            )
+            mismatch_gaps = [gap for gap in result["gaps"] if gap["gap_type"] == "source_r2_timeseries_row_mismatch"]
+            self.assertEqual(len(mismatch_gaps), 1)
+            self.assertEqual(mismatch_gaps[0]["pollutant_code"], "pm25")
+            self.assertEqual(mismatch_gaps[0]["sample_missing_timeseries_ids"], [218])
+        finally:
+            conn.close()
+
+    def test_v2_source_r2_mismatch_diagnostics_include_multiple_timeseries_sample(self) -> None:
+        r2_counts = {210: 13, 211: 13, 218: 13}
+        source_counts = {210: 24, 211: 23, 218: 24}
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts=r2_counts,
+        )
+        conn = self._new_current_source_db(
+            day_utc="2026-06-18",
+            connector_id=1,
+            timeseries_pollutants={210: "pm25", 211: "pm25", 218: "pm25"},
+            source_counts=source_counts,
+        )
+        try:
+            result = self._run_v2_observations_integrity_with_source(
+                conn,
+                day_utc="2026-06-18",
+                connector_ids=[1],
+            )
+            gap = next(gap for gap in result["gaps"] if gap["gap_type"] == "source_r2_timeseries_row_mismatch")
+            self.assertEqual(gap["missing_timeseries_count"], 3)
+            self.assertEqual(gap["sample_missing_timeseries_ids"], [210, 211, 218])
+            self.assertEqual(gap["source_rows"], sum(source_counts.values()))
+            self.assertEqual(gap["r2_rows"], sum(r2_counts.values()))
+            self.assertTrue(any("timeseries_id=218" in item for item in gap["related_paths"]))
+        finally:
+            conn.close()
+
+    def test_v2_source_r2_missing_current_source_data_does_not_create_repair_candidate(self) -> None:
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 13},
+        )
+        conn = MODULE.open_db(str(self.root / "empty-current-source.sqlite"))
+        try:
+            result = self._run_v2_observations_integrity_with_source(
+                conn,
+                day_utc="2026-06-18",
+                connector_ids=[1],
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse(any(gap["gap_type"] == "source_r2_timeseries_row_mismatch" for gap in result["gaps"]))
         finally:
             conn.close()
 

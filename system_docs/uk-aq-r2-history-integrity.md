@@ -1352,6 +1352,18 @@ Delivered:
 	  does not gate the source-to-R2 repair attempt.
 	  AQI rebuilds from v2 R2 observations pass the known connector ID through the
 	  source-row mapper so normalized AQI rows retain connector scope.
+- V2 observation integrity also compares current source-cache coverage against
+  each checked R2 v2 observation partition at `(connector_id, day_utc,
+  pollutant_code, timeseries_id)` granularity. This is required because an R2
+  partition manifest can be internally consistent but stale: `row_count`,
+  `source_row_count`, and `timeseries_row_counts` may all describe only what was
+  exported when a partial partition was written. When current source rows exceed
+  local R2 partition rows for any timeseries, integrity emits
+  `source_r2_timeseries_row_mismatch` with source/R2 row totals, mismatch count,
+  and sample timeseries ids, then the existing v2 source-to-R2 observation
+  repair path handles the connector/day. If current source counts are absent or
+  pollutant metadata is unavailable, no stale-partition repair candidate is
+  emitted.
 - Phase 7.5 adds SOS error-handling/reporting polish:
   explicit `no_data` vs `not_found` vs `temporary_error` vs `permanent_error`
   counters, optional not-found retry suppression via
@@ -1625,6 +1637,11 @@ upstream archive contains.
   `source_file_timeseries_counts`, reads local Dropbox-backed
   `history/_index/observations_timeseries/.../manifest.json`, and compares
   `timeseries_row_counts`.
+- For v2 observations, the same source-side counts are also used by the v2
+  structural integrity pass to compare current source coverage with the local R2
+  pollutant partition coverage. This source comparison does not trust
+  `source_row_count` as a freshness signal; that field may be stale and only
+  prove internal consistency for an old partial export.
 - Outcomes recorded in a new `cross_checks` table with status
   `ok | source_only | r2_only | mismatch | r2_manifest_missing | r2_timeseries_counts_missing`.
 - Run row and report grow `cross_checks_total / ok / mismatch /
