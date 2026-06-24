@@ -6896,14 +6896,30 @@ def _validate_chunked_v2_observation_repair_for_aqi(
     return True, None
 
 
-def _repo_root_for_integrity_script(env: Mapping[str, str] | None = None) -> Path:
+def _resolve_repo_root_with_diagnostics(env: Mapping[str, str] | None = None) -> tuple[Path, str]:
     values = os.environ if env is None else env
     explicit_root = str(values.get("UK_AQ_OPS_REPO_ROOT", "") or "").strip()
+    inferred = Path(__file__).resolve().parents[3]
+
     if explicit_root:
         path = Path(explicit_root)
         if path.is_dir() and (path / "workers/shared/r2_sigv4.mjs").is_file():
-            return path
-    return Path(__file__).resolve().parents[3]
+            return path, "ops_repo_root_explicit_valid"
+        if path.is_dir():
+            diag = "r2_sigv4_missing"
+        else:
+            diag = "ops_repo_root_invalid"
+    else:
+        diag = "ops_repo_root_missing"
+
+    if not (inferred / "workers/shared/r2_sigv4.mjs").is_file():
+        return inferred, "r2_sigv4_missing"
+    return inferred, diag if diag != "ops_repo_root_missing" else "ops_repo_root_inferred"
+
+
+def _repo_root_for_integrity_script(env: Mapping[str, str] | None = None) -> Path:
+    path, _ = _resolve_repo_root_with_diagnostics(env)
+    return path
 
 
 def _v2_observation_connector_manifest_key(
@@ -6949,6 +6965,11 @@ def _read_json_manifest_from_r2(
     merged_env = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
     if not _has_direct_r2_read_config(merged_env):
         return None, "r2_config_missing"
+
+    cwd_path, diag_reason = _resolve_repo_root_with_diagnostics(merged_env)
+    if diag_reason == "r2_sigv4_missing":
+        return None, f"r2_read_failed:{diag_reason}"
+
     node_bin = (
         merged_env.get("UK_AQ_BACKFILL_NODE_BIN")
         or merged_env.get("NODE_BIN")
@@ -6977,7 +6998,7 @@ process.stdout.write(object.body.toString("utf8"));
     try:
         proc = subprocess.run(
             [node_bin, "--input-type=module", "-e", code],
-            cwd=_repo_root_for_integrity_script(env=merged_env),
+            cwd=cwd_path,
             env=read_env,
             capture_output=True,
             text=True,
@@ -6985,13 +7006,13 @@ process.stdout.write(object.body.toString("utf8"));
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return None, f"r2_read_failed:{type(exc).__name__}"
+        return None, f"r2_read_failed:{type(exc).__name__}:[diag={diag_reason}]"
     if proc.returncode != 0:
-        return None, f"r2_read_failed:exit_code={proc.returncode}"
+        return None, f"r2_read_failed:exit_code={proc.returncode}:[diag={diag_reason}]"
     try:
         return json.loads(proc.stdout or ""), None
     except json.JSONDecodeError:
-        return None, "r2_manifest_invalid_json"
+        return None, f"r2_manifest_invalid_json:[diag={diag_reason}]"
 
 
 def _read_json_manifest_for_guard(

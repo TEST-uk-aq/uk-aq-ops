@@ -1229,17 +1229,25 @@ class RepoRootTests(unittest.TestCase):
     def test_repo_root_resolves_from_explicit_env_var_when_valid(self) -> None:
         (self.root / "workers" / "shared").mkdir(parents=True, exist_ok=True)
         (self.root / "workers" / "shared" / "r2_sigv4.mjs").touch()
-        resolved = MODULE._repo_root_for_integrity_script(env={"UK_AQ_OPS_REPO_ROOT": str(self.root)})
-        self.assertEqual(resolved, self.root)
+        path, diag = MODULE._resolve_repo_root_with_diagnostics(env={"UK_AQ_OPS_REPO_ROOT": str(self.root)})
+        self.assertEqual(path, self.root)
+        self.assertEqual(diag, "ops_repo_root_explicit_valid")
 
     def test_repo_root_falls_back_when_explicit_dir_invalid(self) -> None:
+        path, diag = MODULE._resolve_repo_root_with_diagnostics(env={"UK_AQ_OPS_REPO_ROOT": "/does/not/exist/ever"})
+        self.assertEqual(path, Path(MODULE.__file__).resolve().parents[3])
+        self.assertEqual(diag, "ops_repo_root_invalid")
+
+    def test_repo_root_falls_back_when_explicit_dir_lacks_r2_sigv4(self) -> None:
         self.root.mkdir(exist_ok=True)
-        resolved = MODULE._repo_root_for_integrity_script(env={"UK_AQ_OPS_REPO_ROOT": str(self.root)})
-        self.assertEqual(resolved, Path(MODULE.__file__).resolve().parents[3])
+        path, diag = MODULE._resolve_repo_root_with_diagnostics(env={"UK_AQ_OPS_REPO_ROOT": str(self.root)})
+        self.assertEqual(path, Path(MODULE.__file__).resolve().parents[3])
+        self.assertEqual(diag, "r2_sigv4_missing")
 
     def test_repo_root_falls_back_when_explicit_env_var_missing(self) -> None:
-        resolved = MODULE._repo_root_for_integrity_script(env={})
-        self.assertEqual(resolved, Path(MODULE.__file__).resolve().parents[3])
+        path, diag = MODULE._resolve_repo_root_with_diagnostics(env={})
+        self.assertEqual(path, Path(MODULE.__file__).resolve().parents[3])
+        self.assertEqual(diag, "ops_repo_root_inferred")
 
 
 if __name__ == "__main__":
