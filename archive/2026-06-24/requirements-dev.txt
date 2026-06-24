@@ -6,4 +6,3 @@ python-dotenv
 psycopg2-binary
 shapely
 pyproj
-duckdb
