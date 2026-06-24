@@ -30,9 +30,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
     def _index(self, day: str = "2026-06-11", connector: int = 7, pollutant: str = "pm25") -> Path:
         return self.root / f"history/_index_v2/aqilevels_hourly_data_timeseries/day_utc={day}/connector_id={connector}/pollutant_code={pollutant}"
 
-    def _obs_partition(self, day: str = "2026-06-11", connector: int = 7, pollutant: str = "pm25") -> Path:
-        return self.root / f"history/v2/observations/day_utc={day}/connector_id={connector}/pollutant_code={pollutant}"
-
     def _write_healthy(self, *, latest: bool = True, index: bool = True, manifest: bool = True, parquet: bool = True, day: str = "2026-06-11") -> None:
         part = self._partition(day=day)
         part.mkdir(parents=True, exist_ok=True)
@@ -54,28 +51,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
             latest_path = self.root / "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"
             latest_path.parent.mkdir(parents=True, exist_ok=True)
             latest_path.write_text(json.dumps({"latest": day}), encoding="utf-8")
-
-    def _write_observations(
-        self,
-        *,
-        day: str = "2026-06-11",
-        connector: int = 7,
-        pollutant: str = "pm25",
-        timeseries_row_counts: dict[int, int] | None = None,
-    ) -> None:
-        counts = timeseries_row_counts or {101: 3}
-        row_count = sum(int(value) for value in counts.values())
-        part = self._obs_partition(day=day, connector=connector, pollutant=pollutant)
-        part.mkdir(parents=True, exist_ok=True)
-        key = f"history/v2/observations/day_utc={day}/connector_id={connector}/pollutant_code={pollutant}/part-00000.parquet"
-        (self.root / key).write_bytes(b"PAR1")
-        (part / "manifest.json").write_text(json.dumps({
-            "history_version": "v2", "domain": "observations", "day_utc": day,
-            "connector_id": connector, "pollutant_code": pollutant, "row_count": row_count,
-            "source_row_count": row_count, "file_count": 1,
-            "timeseries_row_counts": {str(key): value for key, value in counts.items()},
-            "files": [{"key": key, "timeseries_row_counts": {str(key): value for key, value in counts.items()}}],
-        }), encoding="utf-8")
 
     def _run(self, **kwargs) -> dict:
         return MODULE.run_v2_aqilevels_integrity_checks(
@@ -141,34 +116,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
     def test_missing_latest_v2_aqi_data_index(self) -> None:
         self._write_healthy(latest=False)
         self.assertIn("latest_index_missing", self._gap_types(self._run()))
-
-    def test_v2_aqi_integrity_reports_missing_aqi_against_existing_observations(self) -> None:
-        self._write_observations()
-        latest_path = self.root / "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
-        latest_path.write_text(json.dumps({"latest": "2026-06-11"}), encoding="utf-8")
-
-        result = self._run()
-
-        self.assertEqual(result["status"], "fail")
-        self.assertEqual(result["observation_coverage_checked"], 1)
-        self.assertIn("aqi_manifest_missing_after_obs_repair", self._gap_types(result))
-
-    def test_v2_aqi_integrity_reports_aqi_rows_below_observations(self) -> None:
-        self._write_observations(timeseries_row_counts={101: 3})
-        self._write_healthy()
-        manifest_path = self._partition() / "manifest.json"
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        payload["row_count"] = 2
-        payload["source_row_count"] = 2
-        payload["timeseries_row_counts"] = {"101": 2}
-        payload["files"][0]["timeseries_row_counts"] = {"101": 2}
-        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
-
-        result = self._run()
-
-        self.assertEqual(result["status"], "fail")
-        self.assertIn("aqi_rows_below_observation_rows", self._gap_types(result))
 
     def test_debug_skipped_by_default(self) -> None:
         self._write_healthy()
