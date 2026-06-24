@@ -183,30 +183,39 @@ def read_manifest(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def manifest_row_count(manifest: dict[str, Any] | None, timeseries_id: str | None = None) -> int | None:
+def manifest_partition_row_count(manifest: dict[str, Any] | None) -> int | None:
+    """Return a whole-partition row count when the manifest exposes one."""
     if not manifest:
         return None
-    if timeseries_id is not None:
-        for key in ("timeseries", "timeseries_counts", "timeseries_row_counts", "rows_by_timeseries_id"):
-            value = manifest.get(key)
-            if isinstance(value, dict):
-                item = value.get(str(timeseries_id)) or value.get(int(timeseries_id) if str(timeseries_id).isdigit() else timeseries_id)
-                if isinstance(item, dict):
-                    for count_key in ("row_count", "rows", "count"):
-                        if isinstance(item.get(count_key), int):
-                            return int(item[count_key])
-                elif isinstance(item, int):
-                    return int(item)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and str(item.get("timeseries_id")) == str(timeseries_id):
-                        for count_key in ("row_count", "rows", "count"):
-                            if isinstance(item.get(count_key), int):
-                                return int(item[count_key])
     for key in ("row_count", "rows", "count", "record_count"):
         value = manifest.get(key)
         if isinstance(value, int):
             return int(value)
+    return None
+
+
+def manifest_timeseries_row_count(manifest: dict[str, Any] | None, timeseries_id: str) -> int | None:
+    """Return an explicit per-timeseries row count, never a partition count."""
+    if not manifest:
+        return None
+    for key in ("timeseries", "timeseries_counts", "timeseries_row_counts", "rows_by_timeseries_id"):
+        value = manifest.get(key)
+        if isinstance(value, dict):
+            item = value.get(str(timeseries_id))
+            if item is None and str(timeseries_id).isdigit():
+                item = value.get(int(timeseries_id))
+            if isinstance(item, dict):
+                for count_key in ("row_count", "rows", "count"):
+                    if isinstance(item.get(count_key), int):
+                        return int(item[count_key])
+            elif isinstance(item, int):
+                return int(item)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and str(item.get("timeseries_id")) == str(timeseries_id):
+                    for count_key in ("row_count", "rows", "count"):
+                        if isinstance(item.get(count_key), int):
+                            return int(item[count_key])
     return None
 
 
@@ -239,8 +248,8 @@ def build_summary_rows(root: Path, days: list[str], connector_id: str | None, po
             for tsid in tsids:
                 obs_rows = obs_counts.get(tsid, 0)
                 aqi_rows = aqi_counts.get(tsid, 0)
-                obs_idx_rows = manifest_row_count(obs_manifest, tsid)
-                aqi_idx_rows = manifest_row_count(aqi_manifest, tsid)
+                obs_idx_rows = manifest_timeseries_row_count(obs_manifest, tsid)
+                aqi_idx_rows = manifest_timeseries_row_count(aqi_manifest, tsid)
                 rows.append({
                     "day_utc": day,
                     "connector_id": cid,

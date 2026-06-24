@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 import subprocess
 import sys
@@ -76,10 +77,11 @@ def write_aqi(root, pollutant="pm25", timeseries_counts=None, connector_id="1"):
     con.close()
 
 
-def write_index(root, kind, pollutant="pm25", row_count=1, connector_id="1"):
+def write_index(root, kind, pollutant="pm25", row_count=1, connector_id="1", manifest=None):
     part = root / "history/_index_v2" / kind / f"day_utc={DAY}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant}"
     part.mkdir(parents=True, exist_ok=True)
-    (part / "manifest.json").write_text(f'{{"row_count": {row_count}}}\n', encoding="utf-8")
+    payload = {"row_count": row_count} if manifest is None else manifest
+    (part / "manifest.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
 def read_summary(out):
@@ -176,3 +178,52 @@ def test_optional_timeseries_filter(tmp_path):
     proc, out = run_checker(tmp_path / "all", root, ["--connector-id", "1", "--pollutant", "pm25"])
     assert proc.returncode == 0, proc.stderr
     assert {row["timeseries_id"] for row in read_summary(out)} == {"218", "219"}
+
+
+def test_partition_manifest_count_is_not_used_as_per_timeseries_count(tmp_path):
+    root = tmp_path / "r2"
+    write_obs(root, timeseries_counts={"218": 24})
+    write_aqi(root, timeseries_counts={"218": 24})
+    write_index(root, "observations_timeseries", manifest={"row_count": 1908})
+    write_index(root, "aqilevels_hourly_data_timeseries", manifest={"row_count": 1908})
+    proc, out = run_checker(tmp_path, root, ["--connector-id", "1", "--pollutant", "pm25", "--timeseries-id", "218"])
+    assert proc.returncode == 0, proc.stderr
+    row = read_summary(out)[0]
+    assert row["obs_idx"] == "yes"
+    assert row["aqi_idx"] == "yes"
+    assert row["obs_idx_rows"] == ""
+    assert row["aqi_idx_rows"] == ""
+    assert "stale_or_partial_aqi_index" not in row["status"]
+
+
+def test_per_timeseries_manifest_count_is_used_when_present(tmp_path):
+    root = tmp_path / "r2"
+    write_aqi(root, timeseries_counts={"218": 13})
+    write_index(root, "aqilevels_hourly_data_timeseries", manifest={"timeseries_row_counts": {"218": 13}})
+    proc, out = run_checker(tmp_path, root, ["--connector-id", "1", "--pollutant", "pm25", "--timeseries-id", "218"])
+    assert proc.returncode == 0, proc.stderr
+    row = read_summary(out)[0]
+    assert row["aqi_idx_rows"] == "13"
+
+
+def test_stale_or_partial_aqi_index_uses_genuine_per_timeseries_count(tmp_path):
+    root = tmp_path / "r2"
+    write_aqi(root, timeseries_counts={"218": 24})
+    write_index(root, "aqilevels_hourly_data_timeseries", manifest={"timeseries_row_counts": {"218": 13}})
+    proc, out = run_checker(tmp_path, root, ["--connector-id", "1", "--pollutant", "pm25", "--timeseries-id", "218"])
+    assert proc.returncode == 0, proc.stderr
+    row = read_summary(out)[0]
+    assert row["aqi_idx_rows"] == "13"
+    assert "stale_or_partial_aqi_index" in row["status"]
+
+
+def test_partition_manifest_count_lower_than_aqi_rows_does_not_trigger_stale_index(tmp_path):
+    root = tmp_path / "r2"
+    write_aqi(root, timeseries_counts={"218": 24})
+    write_index(root, "aqilevels_hourly_data_timeseries", manifest={"row_count": 13})
+    proc, out = run_checker(tmp_path, root, ["--connector-id", "1", "--pollutant", "pm25", "--timeseries-id", "218"])
+    assert proc.returncode == 0, proc.stderr
+    row = read_summary(out)[0]
+    assert row["aqi_idx"] == "yes"
+    assert row["aqi_idx_rows"] == ""
+    assert "stale_or_partial_aqi_index" not in row["status"]
