@@ -1,6 +1,9 @@
 # TODO
 
-## Integrity for R2_v2
+## Integrity extra hardening step
+
+* Add an exact observed-hour comparison for v2 observation integrity, so it can detect cases where R2 and current source have the same row count for a timeseries but the actual `observed_at_utc` hours differ.
+
 
 ## R2 History Worker Refactor
 
