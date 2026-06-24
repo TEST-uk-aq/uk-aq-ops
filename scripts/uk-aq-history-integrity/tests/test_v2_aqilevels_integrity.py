@@ -169,6 +169,10 @@ class V2AqiIntegrityTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "fail")
         self.assertIn("aqi_rows_below_observation_rows", self._gap_types(result))
+        gap = next(g for g in result["gaps"] if g["gap_type"] == "aqi_rows_below_observation_rows")
+        self.assertIs(gap["source_evidence"]["v2_observations_present"], True)
+        self.assertEqual(gap["suggested_repair"]["kind"], "v2_aqi_hourly_rebuild_from_v2_observations")
+        self.assertNotEqual(gap["suggested_repair"]["kind"], "repair_plan_unclassified")
 
     def test_debug_skipped_by_default(self) -> None:
         self._write_healthy()

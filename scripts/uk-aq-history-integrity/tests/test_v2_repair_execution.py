@@ -1717,6 +1717,219 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(metrics["aqi_post_rebuild_validation_failed"], 0)
         self.assertEqual(metrics["aqi_rebuild_results"][0]["post_rebuild_validation_gaps"], [])
 
+    def test_v2_aqi_integrity_gap_dry_run_plans_aqi_only_rebuild(self) -> None:
+        v2_aqi = {
+            "gaps": [{
+                "gap_type": "aqi_rows_below_observation_rows",
+                "day_utc": "2026-06-18",
+                "connector_id": 1,
+                "pollutant_code": "pm25",
+                "source_evidence": {"v2_observations_present": True},
+            }]
+        }
+        with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")):
+            metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
+                conn=self.conn,
+                run_id=28,
+                env_name="CIC-Test",
+                env=self.env,
+                v2_aqilevels=v2_aqi,
+                dry_run=True,
+                run_backfill=True,
+                log=self.log,
+            )
+
+        self.assertEqual(metrics["v2_aqi_rebuilds_queued_from_integrity"], 1)
+        self.assertEqual(metrics["planned_aqi_rebuild_connector_days"][0]["connector_id"], 1)
+        self.assertEqual(metrics["planned_aqi_rebuild_connector_days"][0]["reasons"], [MODULE.AQI_INTEGRITY_OBS_COVERAGE_REASON])
+        planned = metrics["planned_v2_aqi_rebuilds_from_integrity"][0]
+        self.assertIn("--aqi-only", planned)
+        self.assertIn("--history-version v2", planned)
+        self.assertIn("--connector-id 1", planned)
+        self.assertIn("UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels", planned)
+        queued = self.conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
+        self.assertEqual(int(queued), 0)
+
+    def test_v2_aqi_integrity_gap_queues_and_executes_aqi_only_rebuild(self) -> None:
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 24},
+        )
+        self._write_v2_aqi_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 24},
+        )
+        v2_aqi = {
+            "gaps": [{
+                "gap_type": "aqi_rows_below_observation_rows",
+                "day_utc": "2026-06-18",
+                "connector_id": 1,
+                "pollutant_code": "pm25",
+                "source_evidence": {"v2_observations_present": True},
+            }]
+        }
+        with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")), \
+             mock.patch.object(MODULE, "run_aqi_rebuild_backfill", return_value={"status": "ok", "log_path": None}) as run_aqi:
+            queue_metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
+                conn=self.conn,
+                run_id=29,
+                env_name="CIC-Test",
+                env=self.env,
+                v2_aqilevels=v2_aqi,
+                dry_run=False,
+                run_backfill=True,
+                log=self.log,
+            )
+            exec_metrics = MODULE.run_aqi_rebuild_queue_execution(
+                self.conn,
+                run_id=29,
+                env_name="CIC-Test",
+                run_compact="run",
+                env=self.env,
+                dry_run=False,
+                run_backfill=True,
+                limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+                log=self.log,
+                history_version="v2",
+            )
+
+        self.assertEqual(queue_metrics["v2_aqi_rebuilds_queued_from_integrity"], 1)
+        self.assertEqual(exec_metrics["aqi_rebuilds_complete"], 1)
+        self.assertEqual(run_aqi.call_args.kwargs["history_version"], "v2")
+        self.assertEqual(run_aqi.call_args.kwargs["connector_id"], 1)
+        queued = self.conn.execute("SELECT status, reason, history_version FROM aqi_rebuild_queue WHERE run_id = 29").fetchone()
+        self.assertEqual(queued, ("complete", MODULE.AQI_INTEGRITY_OBS_COVERAGE_REASON, "v2"))
+
+    def test_v2_aqi_integrity_reason_gets_post_rebuild_validation(self) -> None:
+        self._insert_aqi_queue_row(run_id=30, connector_id=6, reason=MODULE.AQI_INTEGRITY_OBS_COVERAGE_REASON)
+        self._write_v2_observation_partition(
+            day_utc="2026-06-08",
+            connector_id=6,
+            pollutant_code="pm25",
+            timeseries_row_counts={101: 3},
+        )
+        with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")), \
+             mock.patch.object(MODULE, "run_aqi_rebuild_backfill", return_value={"status": "ok", "log_path": None}):
+            metrics = MODULE.run_aqi_rebuild_queue_execution(
+                self.conn,
+                run_id=30,
+                env_name="CIC-Test",
+                run_compact="run",
+                env=self.env,
+                dry_run=False,
+                run_backfill=True,
+                limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+                log=self.log,
+                history_version="v2",
+            )
+
+        self.assertEqual(metrics["aqi_rebuilds_failed"], 1)
+        self.assertEqual(metrics["aqi_post_rebuild_validation_failed"], 1)
+        self.assertEqual(metrics["aqi_rebuild_results"][0]["post_rebuild_validation_gaps"][0]["gap_type"], "aqi_manifest_missing_after_obs_repair")
+
+    def test_v2_aqi_integrity_duplicate_gaps_queue_one_rebuild_with_all_pollutants(self) -> None:
+        v2_aqi = {
+            "gaps": [
+                {
+                    "gap_type": "aqi_rows_below_observation_rows",
+                    "day_utc": "2026-06-18",
+                    "connector_id": 1,
+                    "pollutant_code": "pm25",
+                    "source_evidence": {"v2_observations_present": True},
+                },
+                {
+                    "gap_type": "aqi_manifest_missing_after_obs_repair",
+                    "day_utc": "2026-06-18",
+                    "connector_id": 1,
+                    "pollutant_code": "no2",
+                    "source_evidence": {"v2_observations_present": True},
+                },
+            ]
+        }
+        with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")):
+            metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
+                conn=self.conn,
+                run_id=31,
+                env_name="CIC-Test",
+                env=self.env,
+                v2_aqilevels=v2_aqi,
+                dry_run=False,
+                run_backfill=True,
+                log=self.log,
+            )
+
+        self.assertEqual(metrics["v2_aqi_rebuilds_queued_from_integrity"], 1)
+        row = self.conn.execute("SELECT notes FROM aqi_rebuild_queue WHERE run_id = 31").fetchone()
+        self.assertIn("aqi_manifest_missing_after_obs_repair,aqi_rows_below_observation_rows", row[0])
+        self.assertIn("pollutants=no2,pm25", row[0])
+
+    def test_v2_aqi_integrity_gap_without_observation_evidence_does_not_queue(self) -> None:
+        v2_aqi = {
+            "gaps": [{
+                "gap_type": "aqi_rows_below_observation_rows",
+                "day_utc": "2026-06-18",
+                "connector_id": 1,
+                "pollutant_code": "pm25",
+                "source_evidence": {"v2_observations_present": False},
+            }]
+        }
+        metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
+            conn=self.conn,
+            run_id=32,
+            env_name="CIC-Test",
+            env=self.env,
+            v2_aqilevels=v2_aqi,
+            dry_run=False,
+            run_backfill=True,
+            log=self.log,
+        )
+
+        self.assertEqual(metrics["v2_aqi_rebuilds_queued_from_integrity"], 0)
+        self.assertEqual(metrics["v2_aqi_rebuilds_skipped_missing_observation_evidence"], 1)
+        self.assertEqual(metrics["skipped_v2_aqi_rebuilds_from_integrity"][0]["reason"], "missing_v2_observation_evidence")
+        queued = self.conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue WHERE run_id = 32").fetchone()[0]
+        self.assertEqual(int(queued), 0)
+
+    def test_v2_aqi_integrity_source_scope_limits_queued_connectors(self) -> None:
+        v2_aqi = {
+            "gaps": [
+                {
+                    "gap_type": "aqi_rows_below_observation_rows",
+                    "day_utc": "2026-06-18",
+                    "connector_id": 1,
+                    "pollutant_code": "pm25",
+                    "source_evidence": {"v2_observations_present": True},
+                },
+                {
+                    "gap_type": "aqi_rows_below_observation_rows",
+                    "day_utc": "2026-06-18",
+                    "connector_id": 6,
+                    "pollutant_code": "pm25",
+                    "source_evidence": {"v2_observations_present": True},
+                },
+            ]
+        }
+        with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")):
+            metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
+                conn=self.conn,
+                run_id=33,
+                env_name="CIC-Test",
+                env=self.env,
+                v2_aqilevels=v2_aqi,
+                dry_run=True,
+                run_backfill=True,
+                log=self.log,
+                allowed_connector_ids={1},
+            )
+
+        self.assertEqual(metrics["v2_aqi_rebuilds_queued_from_integrity"], 1)
+        self.assertEqual(metrics["planned_aqi_rebuild_connector_days"][0]["connector_id"], 1)
+        self.assertEqual(metrics["skipped_v2_aqi_rebuilds_from_integrity"][0]["reason"], "outside_source_scope")
+
     def test_v2_aqi_rebuild_planned_command_includes_connector_scope(self) -> None:
         self._insert_aqi_queue_row(run_id=21, connector_id=6)
         with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")):

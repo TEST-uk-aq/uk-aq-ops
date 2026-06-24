@@ -5149,6 +5149,18 @@ CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
 HISTORY_INTEGRITY_SCHEMA_VERSION = 2
 HISTORY_VERSION_CHOICES = ("v1", "v2", "both")
 LAST_BACKFILL_ENV_LOAD_RESULT: dict[str, Any] = {}
+AQI_INTEGRITY_OBS_COVERAGE_REASON = "aqi_integrity_obs_coverage_gap"
+V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES = {
+    "aqi_manifest_missing_after_obs_repair",
+    "aqi_manifest_missing_for_observations",
+    "aqi_rows_below_observation_rows",
+    "data_manifest_missing",
+    "data_manifest_empty",
+    "parquet_missing",
+    "parquet_empty_or_placeholder",
+    "row_count_mismatch",
+    "pollutant_dir_missing",
+}
 
 
 @dataclass(frozen=True)
@@ -6115,16 +6127,32 @@ def _enrich_v2_aqi_repair_plans(
                 ],
                 "notes": "Debug coverage is optional unless the checker was run with debug required; no exact rebuild command is confirmed here.",
             }
-        elif gap_type in data_gap_types and v2_obs_present is True:
+        elif (
+            (gap_type in data_gap_types or gap_type in V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES)
+            and v2_obs_present is True
+        ):
+            if day_utc and connector_id:
+                try:
+                    command = _planned_aqi_rebuild_command(
+                        {},
+                        int(connector_id),
+                        dt.date.fromisoformat(str(day_utc)),
+                        history_version="v2",
+                    )
+                except (TypeError, ValueError):
+                    command = None
+            else:
+                command = None
             gap["suggested_repair"] = {
-                "kind": "v2_aqi_hourly_rebuild_from_v2_observations_plan",
+                "kind": "v2_aqi_hourly_rebuild_from_v2_observations",
                 "requires_index_rebuild": True,
-                "commands": [],
+                "commands": [command] if command else [],
                 "steps": [
-                    "Run the confirmed AQI hourly rebuild process from v2 observations for the affected day/connector/pollutant scope.",
-                    "After v2 AQI hourly data is written by an operator, rebuild the affected v2 AQI hourly data _index_v2 manifests.",
+                    "Queue the existing AQI-only v2 rebuild from v2 observations for the affected connector/day.",
+                    "Run the queued AQI-only rebuild through the integrity backfill wrapper.",
+                    "Post-validate v2 AQI hourly data manifests against v2 observation manifests.",
                 ],
-                "notes": "AQI rebuild and _index_v2 rebuild commands require confirmation; no repair is executed by this checker.",
+                "notes": "Observation-backed v2 AQI data coverage gaps are executable by the integrity runner.",
             }
         elif gap_type in data_gap_types:
             gap["suggested_repair"] = {
@@ -7093,6 +7121,153 @@ def _queue_aqi_rebuild(
         merged_reason,
     )
     return "merged"
+
+
+def queue_v2_aqi_rebuilds_from_integrity_gaps(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    env: dict[str, str],
+    v2_aqilevels: Mapping[str, Any],
+    dry_run: bool,
+    run_backfill: bool,
+    log: logging.Logger,
+    allowed_connector_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "v2_aqi_integrity_rebuild_bridge_ran": False,
+        "v2_aqi_rebuilds_queued_from_integrity": 0,
+        "v2_aqi_rebuilds_skipped_missing_observation_evidence": 0,
+        "v2_aqi_rebuilds_skipped_non_executable_gap": 0,
+        "planned_v2_aqi_rebuilds_from_integrity": [],
+        "planned_aqi_rebuild_connector_days": [],
+        "queued_aqi_only_connector_days": [],
+        "skipped_v2_aqi_rebuilds_from_integrity": [],
+    }
+    if not run_backfill:
+        return metrics
+
+    grouped: dict[tuple[str, int], dict[str, Any]] = {}
+    for gap in list(v2_aqilevels.get("gaps") or []):
+        gap_type = str(gap.get("gap_type") or "").strip()
+        day_utc = str(gap.get("day_utc") or "").strip()
+        try:
+            connector_id = int(gap.get("connector_id"))
+        except (TypeError, ValueError):
+            connector_id = 0
+        pollutant_code = str(gap.get("pollutant_code") or "").strip()
+        evidence = gap.get("source_evidence") if isinstance(gap.get("source_evidence"), dict) else {}
+        observations_present = evidence.get("v2_observations_present") is True
+
+        skip_reason: str | None = None
+        if gap_type not in V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES:
+            skip_reason = "non_executable_gap_type"
+            metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
+        elif not day_utc or connector_id <= 0:
+            skip_reason = "missing_connector_day"
+            metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
+        elif allowed_connector_ids is not None and connector_id not in allowed_connector_ids:
+            skip_reason = "outside_source_scope"
+            metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
+        elif not observations_present:
+            skip_reason = "missing_v2_observation_evidence"
+            metrics["v2_aqi_rebuilds_skipped_missing_observation_evidence"] += 1
+
+        if skip_reason is not None:
+            metrics["skipped_v2_aqi_rebuilds_from_integrity"].append({
+                "day_utc": day_utc or None,
+                "connector_id": connector_id if connector_id > 0 else None,
+                "pollutant_code": pollutant_code or None,
+                "gap_type": gap_type or None,
+                "reason": skip_reason,
+            })
+            continue
+
+        key = (day_utc, connector_id)
+        entry = grouped.setdefault(key, {
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "gap_types": set(),
+            "pollutants": set(),
+        })
+        entry["gap_types"].add(gap_type)
+        if pollutant_code:
+            entry["pollutants"].add(pollutant_code)
+
+    queued_keys: set[tuple[str, int]] = set()
+    planned_rows: list[dict[str, Any]] = []
+    for (day_utc, connector_id), entry in sorted(grouped.items()):
+        gap_types = sorted(entry["gap_types"])
+        pollutants = sorted(entry["pollutants"])
+        try:
+            day_obj = dt.date.fromisoformat(day_utc)
+        except ValueError:
+            metrics["skipped_v2_aqi_rebuilds_from_integrity"].append({
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "gap_types": gap_types,
+                "reason": "invalid_day",
+            })
+            continue
+        command = _planned_aqi_rebuild_command(
+            env,
+            connector_id,
+            day_obj,
+            history_version="v2",
+            env_name=env_name,
+        )
+        queue_note = (
+            "source=v2_aqi_integrity "
+            f"gap_types={','.join(gap_types)} "
+            f"pollutants={','.join(pollutants) if pollutants else '<unknown>'} "
+            "history_version=v2"
+        )
+        row = {
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "reasons": [AQI_INTEGRITY_OBS_COVERAGE_REASON],
+            "gap_types": gap_types,
+            "pollutants": pollutants,
+            "notes": queue_note,
+            "history_version": "v2",
+            "source_mode": "live_r2",
+            "planned_command": command,
+        }
+        planned_rows.append(row)
+        metrics["planned_v2_aqi_rebuilds_from_integrity"].append(command)
+        if dry_run:
+            queued_keys.add((day_utc, connector_id))
+            continue
+
+        action = _queue_aqi_rebuild(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=connector_id,
+            day_utc=day_utc,
+            reason=AQI_INTEGRITY_OBS_COVERAGE_REASON,
+            source_mode="live_r2",
+            requested_timeseries_ids=[],
+            queue_note=queue_note,
+            log=log,
+            history_version="v2",
+        )
+        if action in {"inserted", "merged"}:
+            queued_keys.add((day_utc, connector_id))
+
+    metrics["v2_aqi_integrity_rebuild_bridge_ran"] = True
+    metrics["v2_aqi_rebuilds_queued_from_integrity"] = len(queued_keys)
+    metrics["planned_aqi_rebuild_connector_days"] = planned_rows
+    metrics["queued_aqi_only_connector_days"] = planned_rows
+    log.info(
+        "v2 AQI integrity rebuild bridge done planned=%s queued=%s skipped_missing_obs=%s skipped_non_executable=%s",
+        len(planned_rows),
+        metrics["v2_aqi_rebuilds_queued_from_integrity"],
+        metrics["v2_aqi_rebuilds_skipped_missing_observation_evidence"],
+        metrics["v2_aqi_rebuilds_skipped_non_executable_gap"],
+    )
+    return metrics
 
 
 def _queue_aqi_rebuild_from_obs_repair(
@@ -9221,7 +9396,10 @@ def run_aqi_rebuild_queue_execution(
             bf.get("status") == "ok"
             and history_version == "v2"
             and connector_scope is not None
-            and "obs_repaired" in merged_reasons
+            and (
+                "obs_repaired" in merged_reasons
+                or AQI_INTEGRITY_OBS_COVERAGE_REASON in merged_reasons
+            )
         ):
             root_raw = str(env.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT") or "").strip()
             if root_raw:
@@ -10887,6 +11065,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Source-change candidates:     days={cc.get('source_change_candidate_days', 0)} timeseries_ids={cc.get('source_change_candidate_timeseries_ids', 0)}",
             f"- Observation repairs:       attempted={cc.get('observation_backfills_attempted', cc.get('backfills_attempted', 0))} ok={cc.get('observation_backfills_ok', cc.get('backfills_ok', 0))} failed={cc.get('observation_backfills_failed', cc.get('backfills_failed', 0))}",
             f"- AQI rebuilds queued:       {cc.get('aqi_rebuilds_queued_from_obs_repair', 0)}",
+            f"- V2 AQI integrity rebuilds queued: {cc.get('v2_aqi_rebuilds_queued_from_integrity', 0)}",
+            f"- V2 AQI integrity bridge ran:      {bool(cc.get('v2_aqi_integrity_rebuild_bridge_ran'))}",
             f"- AQI health checked connector-days: {cc.get('aqi_health_connector_days_checked', 0)}",
             f"- AQI health rebuilds queued:        {cc.get('aqi_health_rebuilds_queued', 0)}",
             f"- AQI health skipped obs-repaired:   {cc.get('aqi_health_skipped_already_obs_repaired', 0)}",
@@ -11449,6 +11629,29 @@ def main(argv: list[str]) -> int:
                     log=log,
                 )
             cross_check_metrics.update(aqi_health_metrics)
+            if history_version_mode == "v2":
+                existing_planned_aqi_rows = list(cross_check_metrics.get("planned_aqi_rebuild_connector_days") or [])
+                existing_aqi_only_rows = list(cross_check_metrics.get("queued_aqi_only_connector_days") or [])
+                v2_aqi_integrity_queue_metrics = queue_v2_aqi_rebuilds_from_integrity_gaps(
+                    conn=conn,
+                    run_id=int(run_id),
+                    env_name=args.env,
+                    env=env,
+                    v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
+                    dry_run=args.dry_run,
+                    run_backfill=args.run_backfill,
+                    log=log,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                )
+                cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
+                cross_check_metrics["planned_aqi_rebuild_connector_days"] = [
+                    *existing_planned_aqi_rows,
+                    *(v2_aqi_integrity_queue_metrics.get("planned_aqi_rebuild_connector_days") or []),
+                ]
+                cross_check_metrics["queued_aqi_only_connector_days"] = [
+                    *existing_aqi_only_rows,
+                    *(v2_aqi_integrity_queue_metrics.get("queued_aqi_only_connector_days") or []),
+                ]
             aqi_rebuild_metrics = run_aqi_rebuild_queue_execution(
                 conn=conn,
                 run_id=int(run_id),
