@@ -71,13 +71,13 @@ export function classifyTimeseriesV2SourceRoute({
     || !Number.isFinite(recentBoundaryMs)
   ) {
     return {
-      sourceMode: "r2_first_full_range",
+      sourceMode: "recent_history_stitched",
       usedR2: true,
-      usedSupabase: false,
+      usedSupabase: true,
       r2StartMs: requestStartMs,
       r2EndMs: requestEndMs,
-      ingestStartMs: null,
-      ingestEndMs: null,
+      ingestStartMs: requestStartMs,
+      ingestEndMs: requestEndMs,
       recentBoundaryMs,
     };
   }
@@ -97,25 +97,25 @@ export function classifyTimeseriesV2SourceRoute({
 
   if (requestStartMs >= recentBoundaryMs) {
     return {
-      sourceMode: "r2_first_full_range",
-      usedR2: true,
-      usedSupabase: false,
-      r2StartMs: requestStartMs,
-      r2EndMs: requestEndMs,
-      ingestStartMs: null,
-      ingestEndMs: null,
+      sourceMode: "recent_only",
+      usedR2: false,
+      usedSupabase: true,
+      r2StartMs: null,
+      r2EndMs: null,
+      ingestStartMs: requestStartMs,
+      ingestEndMs: requestEndMs,
       recentBoundaryMs,
     };
   }
 
   return {
-    sourceMode: "r2_first_full_range",
+    sourceMode: "recent_history_stitched",
     usedR2: true,
-    usedSupabase: false,
+    usedSupabase: true,
     r2StartMs: requestStartMs,
-    r2EndMs: requestEndMs,
-    ingestStartMs: null,
-    ingestEndMs: null,
+    r2EndMs: recentBoundaryMs,
+    ingestStartMs: recentBoundaryMs,
+    ingestEndMs: requestEndMs,
     recentBoundaryMs,
   };
 }
@@ -195,13 +195,6 @@ export function buildMissingDaySlices(keys, requestStartMs, requestEndMs) {
 
   slices.sort((a, b) => a.startMs - b.startMs);
   return slices;
-}
-
-export function buildDiagnosticDaySlices(keys, requestStartMs, requestEndMs, reason) {
-  return buildMissingDaySlices(keys, requestStartMs, requestEndMs).map((slice) => ({
-    ...slice,
-    reason,
-  }));
 }
 
 export function mergeSlices(slices) {
@@ -315,87 +308,5 @@ export function subtractCoveredTailInterval(requestStartMs, requestEndMs, r2Cove
   return {
     tailStartMs,
     tailEndMs: requestEndMs,
-  };
-}
-
-export function buildTimeseriesV2SupabaseFillPlan({
-  requestStartMs,
-  requestEndMs,
-  r2Rows,
-  r2Coverage,
-  maxSupabaseTailHours,
-}) {
-  const sourceRows = Array.isArray(r2Rows) ? r2Rows : [];
-  const maxSupabaseSpanMs = Math.max(0, Number(maxSupabaseTailHours) || 0) * HOUR_MS;
-  const candidateSlices = [];
-  const skippedIngestSlices = [];
-
-  function addSlice(startMs, endMs, reason) {
-    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
-      return;
-    }
-    if (!Number.isFinite(maxSupabaseSpanMs) || maxSupabaseSpanMs <= 0) {
-      skippedIngestSlices.push({
-        start_utc: new Date(startMs).toISOString(),
-        end_utc: new Date(endMs).toISOString(),
-        reason: `${reason}_outside_supabase_tail_cap`,
-      });
-      return;
-    }
-    const allowedSupabaseStartMs = requestEndMs - maxSupabaseSpanMs;
-    const cappedStartMs = Math.max(startMs, allowedSupabaseStartMs);
-    if (cappedStartMs > startMs) {
-      skippedIngestSlices.push({
-        start_utc: new Date(startMs).toISOString(),
-        end_utc: new Date(Math.min(endMs, cappedStartMs)).toISOString(),
-        reason: `${reason}_outside_supabase_tail_cap`,
-      });
-    }
-    if (endMs > cappedStartMs) {
-      candidateSlices.push({ startMs: cappedStartMs, endMs, reason });
-    }
-  }
-
-  const r2RowCoverage = computeCoverageFromRows(sourceRows);
-  const r2CoverageStart = r2RowCoverage.coverageStart;
-  const r2CoverageEnd = r2RowCoverage.coverageEnd;
-
-  if (sourceRows.length === 0) {
-    addSlice(requestStartMs, requestEndMs, "r2_empty_window");
-  } else {
-    const coverageStartMs = parseIsoMsOrNull(r2CoverageStart);
-    if (Number.isFinite(coverageStartMs) && coverageStartMs > requestStartMs) {
-      addSlice(requestStartMs, coverageStartMs, "r2_uncovered_head");
-    }
-
-    const { tailStartMs, tailEndMs } = subtractCoveredTailInterval(
-      requestStartMs,
-      requestEndMs,
-      r2CoverageEnd,
-    );
-    addSlice(tailStartMs, tailEndMs, "r2_uncovered_tail");
-  }
-
-  const coverageRecord = r2Coverage && typeof r2Coverage === "object" ? r2Coverage : {};
-  for (const [field, reason] of [
-    ["missing_day_manifest_keys", "missing_day_manifest"],
-    ["missing_connector_manifest_keys", "missing_connector_manifest"],
-    ["missing_parquet_keys", "missing_parquet"],
-  ]) {
-    for (const slice of buildDiagnosticDaySlices(
-      Array.isArray(coverageRecord[field]) ? coverageRecord[field] : [],
-      requestStartMs,
-      requestEndMs,
-      reason,
-    )) {
-      addSlice(slice.startMs, slice.endMs, slice.reason);
-    }
-  }
-
-  return {
-    ingestSlices: mergeSlices(candidateSlices),
-    skippedIngestSlices,
-    r2CoverageStart,
-    r2CoverageEnd,
   };
 }

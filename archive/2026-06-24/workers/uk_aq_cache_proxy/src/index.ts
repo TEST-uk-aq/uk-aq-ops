@@ -1,9 +1,10 @@
 import {
-  buildTimeseriesV2SupabaseFillPlan,
   classifyTimeseriesV2SourceRoute,
+  computeCoverageFromRows,
   computeNextSince,
   detectGapRanges,
   mergeAndDedupeRows,
+  mergeSlices,
   normalizeObservedRow,
   resolveTimeseriesWindowBounds,
 } from "./timeseries_v2_stitch.mjs";
@@ -1906,7 +1907,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
     requestEndMs: requestWindow.requestEndMs,
     recentBoundaryMs: Date.now() - runtime.maxSupabaseTailHours * HOUR_MS,
   }) as {
-    sourceMode: "history_only" | "r2_first_full_range";
+    sourceMode: "history_only" | "recent_only" | "recent_history_stitched";
     usedR2: boolean;
     usedSupabase: boolean;
     r2StartMs: number | null;
@@ -1942,6 +1943,42 @@ async function stitchTimeseriesV2FromR2AndIngest(
     return buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus);
   }
 
+  if (sourceRoute.sourceMode === "recent_only") {
+    const originPayload = await fetchTimeseriesOriginPayload(
+      deps.supabaseUrl,
+      deps.supabasePublishableKey,
+      deps.upstreamAuthSecret,
+      {
+        timeseriesId: requestWindow.timeseriesId,
+        startUtc: requestStartUtc,
+        endUtc: requestEndUtc,
+        sinceUtc: requestWindow.requestSinceIso,
+      },
+    );
+    const fallback = buildTimeseriesV2FallbackEnvelope(requestUrl, originPayload, cacheStatus, "recent_only");
+    fallback.meta.source_mode = "recent_only";
+    fallback.meta.used_r2 = false;
+    fallback.meta.used_supabase = true;
+    fallback.meta.r2_row_count = 0;
+    if (debugRouting) {
+      fallback.meta.source_routing_decision = sourceRoutingDecision;
+    }
+    const envelopeMeta = (fallback.envelope.meta && typeof fallback.envelope.meta === "object"
+      ? fallback.envelope.meta as Record<string, unknown>
+      : {});
+    envelopeMeta.source_mode = "recent_only";
+    envelopeMeta.used_r2 = false;
+    envelopeMeta.used_supabase = true;
+    envelopeMeta.r2_row_count = 0;
+    if (debugRouting) {
+      envelopeMeta.source_routing_decision = sourceRoutingDecision;
+    }
+    fallback.envelope.meta = envelopeMeta;
+    fallback.sourceMode = "recent_only";
+    fallback.cacheControl = buildTimeseriesV2CacheControl("recent_only", runtime);
+    return fallback;
+  }
+
   const r2Errors: Array<string | Record<string, unknown>> = [];
   const ingestErrors: Array<string | Record<string, unknown>> = [];
   const partialReasons = new Set<string>();
@@ -1953,7 +1990,9 @@ async function stitchTimeseriesV2FromR2AndIngest(
   let r2PagesFetched = 0;
   let r2HitPageLimit = false;
 
-  if (!requestWindow.pollutantKey) {
+  if (!sourceRoute.usedR2) {
+    // This branch is currently handled by the recent_only early return.
+  } else if (!requestWindow.pollutantKey) {
     r2Errors.push("pollutant_required_for_v2_r2");
     partialReasons.add("pollutant_required_for_v2_r2");
   } else {
@@ -2028,22 +2067,44 @@ async function stitchTimeseriesV2FromR2AndIngest(
     }
   }
 
-  const fillPlan = buildTimeseriesV2SupabaseFillPlan({
-    requestStartMs: requestWindow.requestStartMs,
-    requestEndMs: requestWindow.requestEndMs,
-    r2Rows,
-    r2Coverage,
-    maxSupabaseTailHours: runtime.maxSupabaseTailHours,
-  }) as {
-    ingestSlices: Array<{ startMs: number; endMs: number; reason: string }>;
-    skippedIngestSlices: Array<{ start_utc: string; end_utc: string; reason: string }>;
-    r2CoverageStart: string | null;
-    r2CoverageEnd: string | null;
-  };
-  const r2CoverageStart = fillPlan.r2CoverageStart;
-  const r2CoverageEnd = fillPlan.r2CoverageEnd;
-  const mergedIngestSlices = fillPlan.ingestSlices;
-  const skippedIngestSlices = fillPlan.skippedIngestSlices;
+  const r2RowCoverage = computeCoverageFromRows(r2Rows);
+  const r2CoverageStart = r2RowCoverage.coverageStart;
+  const r2CoverageEnd = r2RowCoverage.coverageEnd;
+  const maxIngestSpanMs = runtime.maxSupabaseTailHours * HOUR_MS;
+  const ingestSlices: Array<{ startMs: number; endMs: number; reason: string }> = [];
+  const skippedIngestSlices: Array<{ start_utc: string; end_utc: string; reason: string }> = [];
+
+  function addIngestSlice(startMs: number, endMs: number, reason: string): void {
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+      return;
+    }
+    const cappedStartMs = Math.max(startMs, endMs - maxIngestSpanMs);
+    if (cappedStartMs > startMs) {
+      skippedIngestSlices.push({
+        start_utc: new Date(startMs).toISOString(),
+        end_utc: new Date(cappedStartMs).toISOString(),
+        reason: `${reason}_outside_supabase_tail_cap`,
+      });
+      partialReasons.add("supabase_tail_cap");
+    }
+    if (endMs > cappedStartMs) {
+      ingestSlices.push({ startMs: cappedStartMs, endMs, reason });
+    }
+  }
+
+  if (sourceRoute.usedSupabase && sourceRoute.ingestStartMs !== null && sourceRoute.ingestEndMs !== null) {
+    addIngestSlice(
+      sourceRoute.ingestStartMs,
+      sourceRoute.ingestEndMs,
+      sourceRoute.sourceMode === "recent_history_stitched" ? "source_route_recent_tail" : "source_route_recent_window",
+    );
+  }
+
+  if (!sourceRoute.usedSupabase && r2Rows.length === 0) {
+    partialReasons.add(r2Errors.length ? "r2_unavailable_history_only" : "r2_empty_history_only");
+  }
+
+  const mergedIngestSlices = mergeSlices(ingestSlices);
   const ingestRowsByObservedAt = new Map<string, Record<string, unknown>>();
   let guideline: unknown = null;
   for (const slice of mergedIngestSlices) {
@@ -2104,30 +2165,16 @@ async function stitchTimeseriesV2FromR2AndIngest(
     partialReasons.add("detected_gap");
   }
 
-  const usedR2 = r2PagesFetched > 0 || r2Rows.length > 0 || r2Coverage !== null;
-  const usedSupabase = mergedIngestSlices.length > 0
-    || sourceRoute.usedSupabase
-    || connectorIdSource === "supabase_lookup";
-  let sourceMode: string;
-  if (r2Rows.length === 0 && mergedIngestSlices.length > 0) {
-    sourceMode = r2Errors.length > 0 ? "ingest_only_on_r2_error" : "ingest_only_fallback";
-  } else if (mergedIngestSlices.length > 0) {
-    const hasRepairSlice = mergedIngestSlices.some((slice) => (
-      slice.reason === "missing_day_manifest"
-      || slice.reason === "missing_connector_manifest"
-      || slice.reason === "missing_parquet"
-      || slice.reason === "r2_uncovered_head"
-    ));
-    sourceMode = hasRepairSlice ? "r2_plus_ingest_repairs" : "r2_plus_ingest_tail";
-  } else {
-    sourceMode = sourceRoute.sourceMode === "history_only" ? "r2_only" : "r2_first_full_range";
-  }
+  const sourceMode = sourceRoute.sourceMode;
 
   const responseComplete = partialReasons.size === 0 && !r2HitPageLimit && ingestErrors.length === 0;
   const nextSince = computeNextSince(merged.merged, requestWindow.requestSinceIso) as string | null;
+  const usedSupabase = mergedIngestSlices.length > 0
+    || sourceRoute.usedSupabase
+    || connectorIdSource === "supabase_lookup";
   const meta: TimeseriesV2EnvelopeMeta = {
     source_mode: sourceMode,
-    used_r2: usedR2,
+    used_r2: sourceRoute.usedR2,
     used_supabase: usedSupabase,
     r2_coverage_start: r2CoverageStart,
     r2_coverage_end: r2CoverageEnd,
@@ -2171,7 +2218,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
       used_r2_timeseries_metadata_lookup: connectorIdSource === "r2_metadata",
       r2_timeseries_metadata: debugRouting ? r2TimeseriesMetadata : null,
       used_supabase_connector_lookup: connectorIdSource === "supabase_lookup",
-      used_r2: usedR2,
+      used_r2: sourceRoute.usedR2,
       used_supabase: usedSupabase,
       pollutant: requestWindow.pollutantKey,
       partial_reasons: Array.from(partialReasons),

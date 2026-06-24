@@ -4,7 +4,6 @@ import fs from "node:fs";
 
 import {
   buildMissingDaySlices,
-  buildTimeseriesV2SupabaseFillPlan,
   classifyTimeseriesV2SourceRoute,
   computeCoverageFromRows,
   computeNextSince,
@@ -146,127 +145,30 @@ test("source routing classifies historical-only requests as R2-only", () => {
   assert.equal(route.ingestStartMs, null);
 });
 
-test("source routing keeps recent requests R2-first across the full range", () => {
+test("source routing classifies recent-only requests as Supabase-only", () => {
   const route = classifyTimeseriesV2SourceRoute({
     requestStartMs: Date.parse("2026-06-12T00:00:00.000Z"),
     requestEndMs: Date.parse("2026-06-18T00:00:00.000Z"),
     recentBoundaryMs: Date.parse("2026-06-11T00:00:00.000Z"),
   });
-  assert.equal(route.sourceMode, "r2_first_full_range");
-  assert.equal(route.usedR2, true);
-  assert.equal(route.usedSupabase, false);
-  assert.equal(route.r2StartMs, Date.parse("2026-06-12T00:00:00.000Z"));
-  assert.equal(route.r2EndMs, Date.parse("2026-06-18T00:00:00.000Z"));
-  assert.equal(route.ingestStartMs, null);
+  assert.equal(route.sourceMode, "recent_only");
+  assert.equal(route.usedR2, false);
+  assert.equal(route.usedSupabase, true);
+  assert.equal(route.r2StartMs, null);
 });
 
-test("source routing keeps boundary-crossing requests R2-first across the full range", () => {
+test("source routing classifies boundary-crossing requests as stitched", () => {
   const boundaryMs = Date.parse("2026-06-11T00:00:00.000Z");
   const route = classifyTimeseriesV2SourceRoute({
     requestStartMs: Date.parse("2026-06-01T00:00:00.000Z"),
     requestEndMs: Date.parse("2026-06-18T00:00:00.000Z"),
     recentBoundaryMs: boundaryMs,
   });
-  assert.equal(route.sourceMode, "r2_first_full_range");
+  assert.equal(route.sourceMode, "recent_history_stitched");
   assert.equal(route.usedR2, true);
-  assert.equal(route.usedSupabase, false);
-  assert.equal(route.r2StartMs, Date.parse("2026-06-01T00:00:00.000Z"));
-  assert.equal(route.r2EndMs, Date.parse("2026-06-18T00:00:00.000Z"));
-  assert.equal(route.ingestStartMs, null);
-});
-
-test("recent range with R2 rows does not create a Supabase fill slice", () => {
-  const plan = buildTimeseriesV2SupabaseFillPlan({
-    requestStartMs: Date.parse("2026-06-22T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-23T00:00:00.000Z"),
-    r2Rows: [
-      { observed_at: "2026-06-22T00:00:00.000Z", value: 8 },
-      { observed_at: "2026-06-22T23:59:59.999Z", value: 9 },
-    ],
-    r2Coverage: { response_complete: true },
-    maxSupabaseTailHours: 168,
-  });
-  assert.equal(plan.ingestSlices.length, 0);
-  assert.equal(plan.skippedIngestSlices.length, 0);
-  assert.equal(plan.r2CoverageStart, "2026-06-22T00:00:00.000Z");
-  assert.equal(plan.r2CoverageEnd, "2026-06-22T23:59:59.999Z");
-});
-
-test("recent range with no R2 rows falls back to Supabase for the request range", () => {
-  const plan = buildTimeseriesV2SupabaseFillPlan({
-    requestStartMs: Date.parse("2026-06-22T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-23T00:00:00.000Z"),
-    r2Rows: [],
-    r2Coverage: { response_complete: true },
-    maxSupabaseTailHours: 168,
-  });
-  assert.equal(plan.ingestSlices.length, 1);
-  assert.equal(new Date(plan.ingestSlices[0].startMs).toISOString(), "2026-06-22T00:00:00.000Z");
-  assert.equal(new Date(plan.ingestSlices[0].endMs).toISOString(), "2026-06-23T00:00:00.000Z");
-  assert.equal(plan.ingestSlices[0].reason, "r2_empty_window");
-});
-
-test("mixed range asks Supabase only for uncovered tail after R2 coverage", () => {
-  const plan = buildTimeseriesV2SupabaseFillPlan({
-    requestStartMs: Date.parse("2026-06-01T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-10T00:00:00.000Z"),
-    r2Rows: [
-      { observed_at: "2026-06-01T00:00:00.000Z", value: 1 },
-      { observed_at: "2026-06-07T12:00:00.000Z", value: 2 },
-    ],
-    r2Coverage: { response_complete: true },
-    maxSupabaseTailHours: 168,
-  });
-  assert.equal(plan.ingestSlices.length, 1);
-  assert.equal(new Date(plan.ingestSlices[0].startMs).toISOString(), "2026-06-07T12:00:00.001Z");
-  assert.equal(new Date(plan.ingestSlices[0].endMs).toISOString(), "2026-06-10T00:00:00.000Z");
-  assert.equal(plan.ingestSlices[0].reason, "r2_uncovered_tail");
-});
-
-test("R2 missing diagnostics create Supabase repair slices inside the tail cap", () => {
-  const plan = buildTimeseriesV2SupabaseFillPlan({
-    requestStartMs: Date.parse("2026-06-20T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-24T00:00:00.000Z"),
-    r2Rows: [
-      { observed_at: "2026-06-20T00:00:00.000Z", value: 1 },
-      { observed_at: "2026-06-23T23:59:59.999Z", value: 2 },
-    ],
-    r2Coverage: {
-      missing_day_manifest_keys: [
-        "history/v2/observations/day_utc=2026-06-22/manifest.json",
-      ],
-    },
-    maxSupabaseTailHours: 168,
-  });
-  assert.equal(plan.ingestSlices.length, 1);
-  assert.equal(new Date(plan.ingestSlices[0].startMs).toISOString(), "2026-06-22T00:00:00.000Z");
-  assert.equal(new Date(plan.ingestSlices[0].endMs).toISOString(), "2026-06-23T00:00:00.000Z");
-  assert.equal(plan.ingestSlices[0].reason, "missing_day_manifest");
-});
-
-test("missing diagnostic ranges outside the Supabase tail cap are reported as skipped", () => {
-  const plan = buildTimeseriesV2SupabaseFillPlan({
-    requestStartMs: Date.parse("2026-06-01T00:00:00.000Z"),
-    requestEndMs: Date.parse("2026-06-24T00:00:00.000Z"),
-    r2Rows: [
-      { observed_at: "2026-06-01T00:00:00.000Z", value: 1 },
-      { observed_at: "2026-06-23T23:59:59.999Z", value: 2 },
-    ],
-    r2Coverage: {
-      missing_day_manifest_keys: [
-        "history/v2/observations/day_utc=2026-06-05/manifest.json",
-      ],
-    },
-    maxSupabaseTailHours: 24,
-  });
-  assert.equal(plan.ingestSlices.length, 0);
-  assert.equal(plan.skippedIngestSlices.length, 1);
-  assert.equal(plan.skippedIngestSlices[0].start_utc, "2026-06-05T00:00:00.000Z");
-  assert.equal(plan.skippedIngestSlices[0].end_utc, "2026-06-06T00:00:00.000Z");
-  assert.equal(
-    plan.skippedIngestSlices[0].reason,
-    "missing_day_manifest_outside_supabase_tail_cap",
-  );
+  assert.equal(route.usedSupabase, true);
+  assert.equal(route.r2EndMs, boundaryMs);
+  assert.equal(route.ingestStartMs, boundaryMs);
 });
 
 test("cache proxy tries R2 timeseries metadata before Supabase connector lookup", () => {
@@ -280,17 +182,4 @@ test("cache proxy tries R2 timeseries metadata before Supabase connector lookup"
   assert.ok(r2CallPos > 0);
   assert.ok(supabaseCallPos > 0);
   assert.ok(r2CallPos < supabaseCallPos);
-});
-
-test("cache proxy keeps origin-only wrapper before R2 stitch when R2-first is disabled or unconfigured", () => {
-  const source = fs.readFileSync("workers/uk_aq_cache_proxy/src/index.ts", "utf8");
-  const guardPos = source.indexOf("if (!flags.r2First || !deps.r2HistoryApiUrl)");
-  const originFetchPos = source.indexOf(
-    "const originPayload = await fetchTimeseriesOriginPayload(",
-    guardPos,
-  );
-  const r2FetchPos = source.indexOf("const r2Result = await fetchR2ObservationsPaged(");
-  assert.ok(guardPos > 0);
-  assert.ok(originFetchPos > guardPos);
-  assert.ok(r2FetchPos > originFetchPos);
 });
