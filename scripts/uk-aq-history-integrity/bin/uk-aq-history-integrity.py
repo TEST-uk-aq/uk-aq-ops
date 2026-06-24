@@ -5499,6 +5499,7 @@ def _enrich_v2_observations_repair_plans(
         "parquet_empty_or_placeholder",
         "parquet_unreadable",
         "row_count_mismatch",
+        "source_r2_timeseries_row_mismatch",
         "pollutant_missing",
         "orphan_parquet_without_manifest",
     }
@@ -5582,12 +5583,230 @@ def _rel_key_to_path(root: Path, key: str) -> Path | None:
     return candidate
 
 
+def _normalize_history_pollutant_code(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    compact = re.sub(r"[^a-z0-9]+", "", text.replace("µ", "u").replace("μ", "u"))
+    if not compact:
+        return None
+    if "pm25" in compact or "pm2p5" in compact or "particulatematter25" in compact:
+        return "pm25"
+    if "pm10" in compact or "particulatematter10" in compact:
+        return "pm10"
+    if "no2" in compact or "nitrogendioxide" in compact:
+        return "no2"
+    if compact == "o3" or "ozone" in compact:
+        return "o3"
+    if "so2" in compact or "sulphurdioxide" in compact or "sulfurdioxide" in compact:
+        return "so2"
+    if compact == "co" or "carbonmonoxide" in compact:
+        return "co"
+    return None
+
+
+def _source_keys_for_scope(source_scope: Mapping[str, Any] | None) -> tuple[str, ...]:
+    source_filter = "all"
+    if isinstance(source_scope, Mapping):
+        source_filter = str(source_scope.get("source") or "all").strip() or "all"
+    return CROSS_CHECK_SOURCE_KEYS_BY_FILTER.get(
+        source_filter,
+        CROSS_CHECK_SOURCE_KEYS_BY_FILTER["all"],
+    )
+
+
+def _current_source_counts_for_v2_partition(
+    conn: sqlite3.Connection | None,
+    *,
+    env_name: str | None,
+    source_scope: Mapping[str, Any] | None,
+    day_utc: str,
+    connector_id: int,
+    pollutant_code: str,
+) -> tuple[dict[int, int], str | None]:
+    if conn is None:
+        return {}, "source_connection_unavailable"
+
+    source_keys = _source_keys_for_scope(source_scope)
+    if not source_keys:
+        return {}, "source_scope_has_no_source_keys"
+
+    where = [
+        "s.day_utc = ?",
+        "c.row_count > 0",
+        "l.connector_id = ?",
+        f"s.source_key IN ({','.join('?' for _ in source_keys)})",
+    ]
+    params: list[Any] = [day_utc, connector_id, *source_keys]
+    if env_name:
+        where.append("s.env_name = ?")
+        params.append(env_name)
+    where_sql = " AND ".join(where)
+
+    rows = conn.execute(
+        f"""
+        SELECT
+          c.timeseries_id,
+          SUM(c.row_count) AS source_row_count,
+          t.timeseries_ref,
+          t.label AS timeseries_label,
+          p.label AS phenomenon_label,
+          p.source_label AS phenomenon_source_label,
+          p.pollutant_label AS phenomenon_pollutant_label
+        FROM source_file_timeseries_counts c
+        JOIN source_file_state s
+          ON s.source_file_key = c.source_file_key
+        JOIN source_station_timeseries_lookup l
+          ON l.source_key = s.source_key
+         AND l.source_location_id = s.source_location_id
+         AND l.timeseries_id = c.timeseries_id
+        LEFT JOIN core_timeseries_snapshot t
+          ON t.id = c.timeseries_id
+        LEFT JOIN core_phenomena_snapshot p
+          ON p.id = t.phenomenon_id
+        WHERE {where_sql}
+        GROUP BY
+          c.timeseries_id,
+          t.timeseries_ref,
+          t.label,
+          p.label,
+          p.source_label,
+          p.pollutant_label
+        ORDER BY c.timeseries_id
+        """,
+        tuple(params),
+    ).fetchall()
+
+    counts: dict[int, int] = {}
+    saw_source_rows = False
+    saw_pollutant_metadata = False
+    wanted_pollutant = _normalize_history_pollutant_code(pollutant_code)
+    for (
+        timeseries_id,
+        source_row_count,
+        timeseries_ref,
+        timeseries_label,
+        phenomenon_label,
+        phenomenon_source_label,
+        phenomenon_pollutant_label,
+    ) in rows:
+        saw_source_rows = True
+        candidates = [
+            phenomenon_pollutant_label,
+            phenomenon_source_label,
+            phenomenon_label,
+            timeseries_label,
+            timeseries_ref,
+        ]
+        normalized_candidates = {
+            code for code in (_normalize_history_pollutant_code(value) for value in candidates) if code
+        }
+        if normalized_candidates:
+            saw_pollutant_metadata = True
+        if wanted_pollutant and wanted_pollutant not in normalized_candidates:
+            continue
+        try:
+            ts_id = int(timeseries_id)
+            count = int(source_row_count or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts_id > 0 and count > 0:
+            counts[ts_id] = counts.get(ts_id, 0) + count
+
+    if counts:
+        return counts, None
+    if saw_source_rows and not saw_pollutant_metadata:
+        return {}, "source_pollutant_metadata_unavailable"
+    if saw_source_rows:
+        return {}, "source_pollutant_not_present"
+    return {}, "source_counts_unavailable"
+
+
+def _build_v2_source_r2_mismatch_gap(
+    *,
+    day_utc: str,
+    connector_id: int | str,
+    pollutant_code: str,
+    expected_path: str,
+    source_counts: Mapping[int, int],
+    r2_counts: Mapping[int, int],
+    source_skip_reason: str | None = None,
+) -> dict[str, Any] | None:
+    if not source_counts:
+        return None
+
+    mismatches: list[dict[str, Any]] = []
+    for timeseries_id in sorted(source_counts):
+        source_rows = int(source_counts.get(timeseries_id) or 0)
+        r2_rows = int(r2_counts.get(timeseries_id) or 0)
+        if source_rows > r2_rows:
+            mismatches.append({
+                "timeseries_id": int(timeseries_id),
+                "source_rows": source_rows,
+                "r2_rows": r2_rows,
+                "missing_rows": source_rows - r2_rows,
+            })
+    if not mismatches:
+        return None
+
+    source_total = sum(int(v or 0) for v in source_counts.values())
+    r2_total_for_source = sum(int(r2_counts.get(ts_id, 0) or 0) for ts_id in source_counts)
+    sample = mismatches[:25]
+    gap = _v2_obs_gap(
+        "source_r2_timeseries_row_mismatch",
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=expected_path,
+        related_paths=[
+            (
+                f"timeseries_id={entry['timeseries_id']} "
+                f"source_rows={entry['source_rows']} "
+                f"r2_rows={entry['r2_rows']} "
+                f"missing_rows={entry['missing_rows']}"
+            )
+            for entry in sample
+        ],
+    )
+    gap["source_rows"] = source_total
+    gap["r2_rows"] = r2_total_for_source
+    gap["missing_timeseries_count"] = len(mismatches)
+    gap["sample_missing_timeseries_ids"] = [entry["timeseries_id"] for entry in sample]
+    gap["source_r2_mismatches"] = sample
+    if source_skip_reason:
+        gap["source_skip_reason"] = source_skip_reason
+    evidence = gap.setdefault("source_evidence", {})
+    evidence["source_counts_present"] = True
+    evidence["source_rows"] = source_total
+    evidence["r2_rows_for_source_timeseries"] = r2_total_for_source
+    evidence["missing_timeseries_count"] = len(mismatches)
+    evidence["sample_missing_timeseries_ids"] = [entry["timeseries_id"] for entry in sample]
+    return gap
+
+
+def _r2_partition_timeseries_counts_from_manifest(payload: Any) -> dict[int, int]:
+    if not isinstance(payload, dict):
+        return {}
+    counts = _normalize_timeseries_row_counts(payload.get("timeseries_row_counts"))
+    if counts:
+        return counts
+    merged: dict[int, int] = {}
+    for entry in _manifest_files(payload):
+        if not isinstance(entry, dict):
+            continue
+        for ts_id, count in _normalize_timeseries_row_counts(entry.get("timeseries_row_counts")).items():
+            merged[ts_id] = merged.get(ts_id, 0) + count
+    return merged
+
+
 def run_v2_observations_integrity_checks(
     *,
     r2_history_root: str | Path | None,
     config: HistoryPathConfig,
     from_day: str | None,
     to_day: str | None,
+    conn: sqlite3.Connection | None = None,
+    env_name: str | None = None,
     allowed_connector_ids: set[int] | None = None,
     source_scope: dict[str, Any] | None = None,
     log: logging.Logger | None = None,
@@ -5733,6 +5952,32 @@ def run_v2_observations_integrity_checks(
                             gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                     except Exception:
                         gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+
+                if isinstance(payload, dict):
+                    try:
+                        connector_id_for_source = int(str(connector_raw))
+                    except (TypeError, ValueError):
+                        connector_id_for_source = None
+                    if connector_id_for_source is not None:
+                        source_counts, source_skip_reason = _current_source_counts_for_v2_partition(
+                            conn,
+                            env_name=env_name,
+                            source_scope=source_scope,
+                            day_utc=day_utc,
+                            connector_id=connector_id_for_source,
+                            pollutant_code=pollutant,
+                        )
+                        stale_gap = _build_v2_source_r2_mismatch_gap(
+                            day_utc=day_utc,
+                            connector_id=connector_raw,
+                            pollutant_code=pollutant,
+                            expected_path=manifest_rel,
+                            source_counts=source_counts,
+                            r2_counts=_r2_partition_timeseries_counts_from_manifest(payload),
+                            source_skip_reason=source_skip_reason,
+                        )
+                        if stale_gap is not None:
+                            gaps.append(stale_gap)
 
     _enrich_v2_observations_repair_plans(root=root, gaps=gaps)
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
@@ -6134,6 +6379,8 @@ def run_v2_aqilevels_integrity_checks(
 
 def run_v2_post_repair_integrity_rechecks(
     *,
+    conn: sqlite3.Connection | None = None,
+    env_name: str | None = None,
     r2_history_root: str | Path | None,
     config: HistoryPathConfig,
     from_day: str | None,
@@ -6150,6 +6397,8 @@ def run_v2_post_repair_integrity_rechecks(
         config=config,
         from_day=from_day,
         to_day=to_day,
+        conn=conn,
+        env_name=env_name,
         allowed_connector_ids=allowed_connector_ids,
         source_scope=source_scope,
         log=log,
@@ -10785,6 +11034,8 @@ def main(argv: list[str]) -> int:
                 config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
+                conn=conn,
+                env_name=args.env,
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
                 log=log,
@@ -10835,6 +11086,8 @@ def main(argv: list[str]) -> int:
                     config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
+                    conn=conn,
+                    env_name=args.env,
                     allowed_connector_ids=v2_allowed_connector_ids,
                     source_scope=v2_source_scope,
                     log=log,
@@ -10940,6 +11193,8 @@ def main(argv: list[str]) -> int:
                 pre_obs = cross_check_metrics.get("v2_observations") or {}
                 pre_aqi = cross_check_metrics.get("v2_aqilevels") or {}
                 post_repair = run_v2_post_repair_integrity_rechecks(
+                    conn=conn,
+                    env_name=args.env,
                     r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                     config=history_path_configs["v2"],
                     from_day=from_day,
