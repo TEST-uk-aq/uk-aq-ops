@@ -1,0 +1,19 @@
+scripts/r2_query/query_r2_v2_aqilevels.sh --connector-id 1 --from-day 2026-06-18 --to-day 2026-06-23 --pollutant pm25 --timeseries-id 218
+  
+scripts/r2_query/query_r2_v2_aqilevels.sh --connector-id 1 --from-day 2026-06-18 --to-day 2026-06-23 --pollutant pm25 --timeseries-id 218 | tee tmp/r2_aqi_conn1_2026-06-18_to_2026-06-23_$(date +%Y%m%d-%H%M%S).txt  
+  
+scripts/r2_query/query_r2_v2_aqilevels.sh --connector-id 1 --from-day 2026-06-18 --to-day 2026-06-23 --pollutant pm25 --timeseries-id 218 | tee tmp/r2_aqi_conn1_2026-06-18_to_2026-06-23_$(date +%Y%m%d-%H%M%S).txt  
+
+
+
+
+scripts/r2_query/query_r2_v2_observs_aqilevels.sh --connector-id 1 --from-day 2026-06-18 --to-day 2026-06-23 --pollutant pm25 --timeseries-id 218 | tee tmp/r2_observs_aqi_conn1_2026-06-18_to_2026-06-23_$(date +%Y%m%d-%H%M%S).txt
+
+
+
+scripts/r2_query/query_r2_v2_observs_aqilevels.sh --connector-id 1 --from-day 2026-06-18 --to-day 2026-06-23 --pollutant pm25 --timeseries-id 218 | tee tmp/r2_observs_aqi_conn1_2026-06-18_to_2026-06-23_$(date +%Y%m%d-%H%M%S).txt
+
+
+
+
+scripts/r2_query/query_r2_v2_observs_aqilevels_indexes.sh --connector-id 1 --from-day 2026-06-18 --to-day 2026-06-23 --pollutant pm25 --timeseries-id 218 | tee tmp/r2_indexes_conn1_2026-06-18_to_2026-06-23_$(date +%Y%m%d-%H%M%S).txt

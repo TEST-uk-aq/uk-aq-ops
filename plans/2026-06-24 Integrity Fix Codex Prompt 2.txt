@@ -1,0 +1,327 @@
+We need to fix a v2 AQI timeseries-index bug in the UK AQ ops repo.
+
+Repository:
+
+```text
+ChronicChannel-test/uk-aq-ops
+```
+
+Context:
+
+The v2 AQI day-partition data can be rebuilt successfully, but the website line chart still does not show the updated AQI levels/bands. Cloudflare cache purge and browser cache clearing do not fix it.
+
+The problem appears to be that the website `/api/aq/aqi-history` route reads via the v2 AQI timeseries index, not directly from the day partitions.
+
+Relevant R2 paths:
+
+```text
+history/v2/aqilevels/hourly/data/
+history/_index_v2/aqilevels_hourly_data_timeseries/
+```
+
+Observed behaviour:
+
+A direct R2 day-partition query sees updated/rebuilt AQI rows for the affected connector/day/timeseries.
+
+But the website debug/API log still shows the AQI history endpoint using the AQI timeseries index and returning incomplete data:
+
+```text
+aqi-history route
+point_count=13
+response_complete=false
+partial_reasons=[
+  historical:required_timeseries_index_miss,
+  historical:timeseries_index_warning
+]
+timeseries_index_prefix=history/_index_v2/aqilevels_hourly_data_timeseries
+```
+
+At the same time, the normal observation timeseries endpoint is reading observations correctly:
+
+```text
+timeseries route
+point_count=24
+response_complete=true
+source_prefix=history/v2/observations
+timeseries_index_prefix=history/_index_v2/observations_timeseries
+```
+
+So the likely root cause is:
+
+```text
+v2 AQI-only repair rebuilds history/v2/aqilevels/hourly/data, but does not reliably rebuild/update history/_index_v2/aqilevels_hourly_data_timeseries for the affected connector/day/pollutant/timeseries.
+```
+
+This is separate from the connector-filter guard bug. This prompt is only for the AQI index update problem.
+
+Before changing any active file:
+
+Archive each active file you will change under:
+
+```text
+archive/YYYY-MM-DD/
+```
+
+Use the date of the day you run this prompt. Preserve the original relative path. Only archive each file once for that date. If already archived that day, do not archive it again.
+
+Likely files to inspect:
+
+```text
+workers/uk_aq_backfill_local/run_job.ts
+workers/shared/
+scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py
+scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py
+system_docs/uk-aq-r2-history-integrity.md
+```
+
+Also search the repo for:
+
+```text
+aqilevels_hourly_data_timeseries
+aqi-history
+required_timeseries_index_miss
+timeseries_index_warning
+history/_index_v2
+observations_timeseries
+rebuild timeseries index
+timeseries index
+aqilevels hourly data timeseries
+```
+
+Do not change frontend chart code.
+Do not change cache proxy logic unless you prove the index is correct and the API route is wrong.
+Do not deploy.
+Do not run real backfills.
+Do not write to R2, Supabase, Dropbox, or source systems during investigation/tests.
+
+Goal:
+
+When a v2 AQI-only repair rebuilds day-partition AQI data under:
+
+```text
+history/v2/aqilevels/hourly/data/day_utc=<day>/connector_id=<connector>/pollutant_code=<pollutant>/
+```
+
+the matching v2 AQI timeseries index under:
+
+```text
+history/_index_v2/aqilevels_hourly_data_timeseries/
+```
+
+must be updated or rebuilt for the affected connector/day/pollutant/timeseries, so `/api/aq/aqi-history` returns the repaired rows.
+
+Required semantics:
+
+1. Connector/day/pollutant AQI data rebuilt
+
+If AQI rows are written or replaced for a connector/day/pollutant, the corresponding AQI timeseries index entries must be refreshed.
+
+2. Connector-scoped AQI repair
+
+If the run is connector-scoped, only the affected connector’s AQI index entries should be rebuilt or updated. Do not require full-day all-connector rebuilds just to update the index.
+
+3. Timeseries index completeness
+
+For an affected timeseries, after repair, the index must point to all relevant AQI rows for the requested range. The website must not continue to report:
+
+```text
+required_timeseries_index_miss
+timeseries_index_warning
+response_complete=false
+```
+
+when the underlying v2 AQI day data exists.
+
+4. Preserve other data
+
+Index rebuild/update must not delete unrelated connector/day/pollutant/timeseries entries. If the index is sharded, update only the affected shard(s), or rebuild the shard(s) from authoritative R2 day data.
+
+5. Idempotence
+
+Running the same AQI repair twice should leave the AQI data and timeseries index consistent, without duplicate rows or stale pointers.
+
+6. Post-rebuild validation
+
+The integrity runner should validate not only that the v2 AQI day partition exists, but also that the AQI timeseries index used by `/api/aq/aqi-history` can serve the rebuilt data. If current validation only checks day manifests/data, extend it so AQI index freshness is also checked after an AQI rebuild.
+
+The validation should catch this case:
+
+```text
+day-partition AQI data exists and is correct
+AQI timeseries index is missing/stale
+/api/aq/aqi-history would still be incomplete
+```
+
+Expected fix location:
+
+Find the code path used by:
+
+```text
+RUN_MODE=r2_history_obs_to_aqilevels
+output_scope=aqilevels_only
+history_version=v2
+```
+
+and identify where AQI hourly parquet/manifests are written. Add the AQI timeseries index update/rebuild there, or call the existing index-rebuild function if one exists.
+
+If there is already an index writer used for observations or normal backfill, reuse that pattern rather than creating a parallel implementation.
+
+Tests to add or update:
+
+A. AQI-only v2 repair updates AQI timeseries index
+
+Fixture:
+
+```text
+v2 observations exist for connector 1, pollutant pm25, timeseries_id 218, day 2026-06-19
+v2 AQI hourly day data is rebuilt for connector 1
+AQI timeseries index initially missing or stale
+```
+
+Expected:
+
+```text
+AQI day parquet/manifests are written
+history/_index_v2/aqilevels_hourly_data_timeseries is written/updated
+index contains timeseries_id=218 rows for the repaired day
+```
+
+B. API-facing index completeness
+
+If there is a test helper for the API route or index reader, simulate `/api/aq/aqi-history` reading through the AQI timeseries index.
+
+Expected:
+
+```text
+point_count matches the rebuilt AQI rows
+response_complete=true
+no required_timeseries_index_miss
+no timeseries_index_warning
+```
+
+C. Stale index detection
+
+Fixture:
+
+```text
+AQI day partition has 24 rows
+AQI timeseries index has only 13 rows
+```
+
+Expected:
+
+```text
+integrity validation flags the stale/missing index
+repair plan indicates AQI timeseries index rebuild/update is required
+```
+
+D. Connector-scoped index update preserves unrelated connectors
+
+Fixture:
+
+```text
+existing AQI index has connector 3 rows
+repair only connector 1
+```
+
+Expected:
+
+```text
+connector 1 index rows are refreshed
+connector 3 index rows remain present and unchanged
+```
+
+E. Idempotent rerun
+
+Run the AQI index update twice in test.
+
+Expected:
+
+```text
+no duplicate index entries
+same row counts after second run
+```
+
+F. Existing day data without index
+
+Fixture:
+
+```text
+history/v2/aqilevels/hourly/data exists
+history/_index_v2/aqilevels_hourly_data_timeseries missing
+```
+
+Expected:
+
+```text
+repair/index rebuild creates the missing timeseries index
+```
+
+Validation commands:
+
+Run from repo root:
+
+```bash
+python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py
+git diff --check workers/uk_aq_backfill_local/run_job.ts scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py system_docs/uk-aq-r2-history-integrity.md
+```
+
+Also run any TypeScript/worker tests that cover:
+
+```text
+workers/uk_aq_backfill_local/run_job.ts
+v2 R2 history index writer
+aqi-history route or AQI history reader
+```
+
+Manual command not to execute during the fix, but to keep in mind as target behaviour:
+
+```bash
+UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels \
+UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only \
+UK_AQ_R2_HISTORY_VERSION=v2 \
+UK_AQ_R2_HISTORY_INDEX_VERSION=v2 \
+UK_AQ_BACKFILL_CONNECTOR_IDS=1 \
+UK_AQ_BACKFILL_FROM_DAY_UTC=2026-06-19 \
+UK_AQ_BACKFILL_TO_DAY_UTC=2026-06-19 \
+scripts/uk_aq_integrity_backfill.sh --env CIC-Test --aqi-only --history-version v2 --from-day 2026-06-19 --to-day 2026-06-19 --connector-id 1
+```
+
+Expected behaviour after fix:
+
+```text
+AQI day data for connector 1 is rebuilt
+AQI timeseries index for affected timeseries is rebuilt/refreshed
+/api/aq/aqi-history can read the updated AQI rows through history/_index_v2/aqilevels_hourly_data_timeseries
+chart AQI bands update without relying on Cloudflare/browser cache purge
+```
+
+Update docs:
+
+```text
+system_docs/uk-aq-r2-history-integrity.md
+```
+
+Document:
+
+```text
+v2 AQI day data and v2 AQI timeseries index are separate artefacts
+website AQI history reads through history/_index_v2/aqilevels_hourly_data_timeseries
+AQI-only repairs must update both the day data and the AQI timeseries index
+post-rebuild validation must check API-facing index completeness, not just day-partition files
+```
+
+Final report should include:
+
+1. Confirmed root cause.
+2. Exact files/functions changed.
+3. How AQI timeseries index is now updated after AQI-only repair.
+4. How unrelated connectors/timeseries are preserved.
+5. Tests added/updated.
+6. Validation commands and results.
+7. Any remaining risks or manual verification needed.
+
+The key instruction is: do not stop at rebuilding history/v2/aqilevels/hourly/data; the repair must also refresh the API-facing v2 AQI timeseries index.

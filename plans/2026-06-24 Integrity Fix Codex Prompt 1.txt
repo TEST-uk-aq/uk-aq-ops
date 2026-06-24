@@ -1,0 +1,310 @@
+We need to fix a long-term connector-scoped v2 AQI rebuild bug in the UK AQ ops repo.
+
+Repository:
+
+```text id="70fi91"
+ChronicChannel-test/uk-aq-ops
+```
+
+Context:
+
+The integrity runner now correctly detects v2 AQI gaps where v2 observations exist but v2 AQI hourly rows are missing/stale. It also queues AQI-only v2 rebuilds via:
+
+```text id="fakkzl"
+aqi_integrity_obs_coverage_gap
+```
+
+and uses connector-scoped v2 AQI rebuilds.
+
+However, the AQI-only v2 rebuild worker itself now fails on one day because its connector-filter guard treats unrequested connectors as missing.
+
+Real failure:
+
+```text id="zv9ff6"
+env=CIC-Test
+run_mode=r2_history_obs_to_aqilevels
+output_scope=aqilevels_only
+history_version=v2
+day_utc=2026-06-19
+connector_filter=[1]
+observed connectors for the day=[1,3,7]
+```
+
+Failure log:
+
+```text id="3k2dpe"
+r2_history_obs_to_aqilevels_window_discovered
+discovered_connector_ids=[1,3,7]
+connector_filter=[1]
+
+r2_history_obs_to_aqilevels_day_skipped_connector_filter_incomplete
+target_connectors=[1]
+missing_connectors=[3,7]
+```
+
+This is wrong for a connector-scoped AQI repair. If the requested connector is present, the worker should rebuild that connector. It should not fail because other observed connectors also exist on that day.
+
+Important contrast:
+
+For 2026-06-18, the same kind of day had connectors `[1,3,7]`, target connector `[1]`, and the rebuild completed for connector 1. The likely reason is that 18/06 already had enough existing AQI output/manifest state to merge or preserve other connectors, while 19/06 had no usable connector 1 AQI output yet. The worker must not depend on that accidental difference.
+
+Before changing any active file:
+
+Archive each active file you will change under:
+
+```text id="54e0z8"
+archive/YYYY-MM-DD/
+```
+
+Use the date of the day you run this prompt. Preserve the original relative path. Only archive each file once for that date. If already archived that day, do not archive it again.
+
+Likely files to inspect:
+
+```text id="nri1bk"
+workers/uk_aq_backfill_local/run_job.ts
+scripts/uk_aq_integrity_backfill.sh
+scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py
+system_docs/uk-aq-r2-history-integrity.md
+```
+
+Also search the repo for these strings:
+
+```text id="h6nggy"
+r2_history_obs_to_aqilevels_day_skipped_connector_filter_incomplete
+connector_filter_incomplete
+runR2HistoryObsToAqilevels
+r2_history_obs_to_aqilevels_window_discovered
+```
+
+Do not change frontend files.
+Do not change cache proxy files.
+Do not deploy.
+Do not run real backfills.
+Do not write to R2, Supabase, Dropbox, or source systems.
+
+Goal:
+
+Fix the v2 AQI-only rebuild worker so connector-scoped rebuilds are valid long-term.
+
+Required semantics:
+
+1. Full-day v2 AQI rebuild, no connector filter
+
+When no connector filter is supplied, the worker should rebuild all observed connectors for the selected day/window, as it does today.
+
+2. Connector-scoped v2 AQI rebuild, connector filter supplied
+
+When a connector filter is supplied, for example:
+
+```text id="czzgda"
+UK_AQ_BACKFILL_CONNECTOR_IDS=1
+```
+
+the worker should:
+
+* Check whether connector 1 has v2 observations for the day.
+* If connector 1 exists, rebuild connector 1.
+* Ignore other observed connectors such as 3 and 7 for the purpose of deciding whether connector 1 is allowed to run.
+* Not fail with `missing_connectors=[3,7]`.
+* Not accidentally rebuild connectors 3 and 7.
+* Not delete or overwrite other connectors’ existing AQI data.
+* Preserve or merge existing day/connector/pollutant manifests/indexes correctly if the code maintains aggregate manifests.
+
+3. Requested connector missing
+
+If a connector filter is supplied and the requested connector has no v2 observations for the day, then the worker should skip/fail that requested connector with a clear diagnostic, for example:
+
+```text id="dsg2w1"
+target_connector_observations_missing
+```
+
+or similar.
+
+It should not report unrequested connectors as missing.
+
+4. Manifest/index behaviour
+
+Investigate how v2 AQI data manifests are structured. Current R2 layout includes connector-scoped pollutant directories:
+
+```text id="tkg4cn"
+history/v2/aqilevels/hourly/data/day_utc=<day>/connector_id=<connector>/pollutant_code=<pollutant>/
+```
+
+The fix should respect that connector/day/pollutant scope.
+
+If there is an aggregate day manifest or connector manifest that is rebuilt, then for connector-scoped repair the code must either:
+
+* rebuild only the affected connector manifest/index, or
+* merge/preserve existing entries for other connectors, or
+* regenerate the aggregate manifest from the actual R2/local tree without requiring unrequested connectors to be rebuilt in the same run.
+
+Do not make connector-scoped repair dependent on existing AQI rows for other connectors.
+
+What not to do:
+
+Do not remove the guard entirely. Replace it with the correct guard:
+
+```text id="jfi7o3"
+For connector-filtered rebuilds, verify requested connectors are present in observations.
+Do not require every observed connector on the day to be included in the connector filter.
+```
+
+Do not make the integrity runner queue full-day AQI rebuilds just to avoid this. Connector-scoped repair is required.
+
+Tests to add or update:
+
+A. Connector-filtered v2 AQI rebuild allows other observed connectors
+
+Fixture:
+
+```text id="5zqwx3"
+observed connectors for day: [1,3,7]
+connector filter: [1]
+```
+
+Expected:
+
+```text id="yj9br8"
+connector 1 is processed
+connectors 3 and 7 are not processed
+no connector_filter_incomplete failure
+summary status ok, assuming connector 1 writes successfully
+```
+
+B. Connector-filtered v2 AQI rebuild with missing requested connector fails clearly
+
+Fixture:
+
+```text id="y9i3bn"
+observed connectors for day: [3,7]
+connector filter: [1]
+```
+
+Expected:
+
+```text id="ukb5qe"
+connector 1 is skipped/failed with target connector missing from observations
+no claim that connectors 3 or 7 are missing
+```
+
+C. Full-day rebuild still processes all observed connectors
+
+Fixture:
+
+```text id="dgy6vk"
+observed connectors for day: [1,3,7]
+no connector filter
+```
+
+Expected:
+
+```text id="otnpyk"
+connectors 1, 3 and 7 are processed
+existing full-day behaviour preserved
+```
+
+D. Connector-filtered rebuild should work even when no existing AQI output exists for other connectors
+
+Fixture:
+
+```text id="s0n2qc"
+observed connectors for day: [1,3,7]
+connector filter: [1]
+existing AQI output for connector 1 missing/stale
+existing AQI output for connectors 3 and 7 missing
+```
+
+Expected:
+
+```text id="4bkj7a"
+connector 1 is rebuilt
+run does not fail just because 3 and 7 are absent from AQI output
+```
+
+E. Connector-filtered rebuild must not delete existing other-connector output
+
+Fixture:
+
+```text id="tgxyg7"
+existing AQI output for connector 3 exists
+connector filter: [1]
+```
+
+Expected:
+
+```text id="sjcaak"
+connector 3 output remains untouched
+connector 1 output is rebuilt
+```
+
+F. Integrity end-to-end test, if practical
+
+Given v2 AQI integrity gap for connector 1/day, queue reason `aqi_integrity_obs_coverage_gap`, and observations for connectors `[1,3,7]`:
+
+Expected:
+
+```text id="q9v70l"
+AQI-only rebuild for connector 1 succeeds
+post-rebuild validation runs
+run is not failed by connector_filter_incomplete
+```
+
+Validation commands:
+
+Run from repo root:
+
+```bash id="72muol"
+python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py
+git diff --check workers/uk_aq_backfill_local/run_job.ts scripts/uk_aq_integrity_backfill.sh scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/tests/test_v2_repair_execution.py system_docs/uk-aq-r2-history-integrity.md
+```
+
+Also run any existing TypeScript or worker tests that cover `workers/uk_aq_backfill_local/run_job.ts`.
+
+If there is no existing focused TypeScript test harness for the local worker, add tests where the repo already keeps similar backfill-worker tests. If no suitable harness exists, add a small unit-testable helper function for the connector-filter decision and test that helper.
+
+Manual command not to execute, but to keep in mind as the target behaviour:
+
+```bash id="0o2hxc"
+UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels \
+UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only \
+UK_AQ_R2_HISTORY_VERSION=v2 \
+UK_AQ_R2_HISTORY_INDEX_VERSION=v2 \
+UK_AQ_BACKFILL_CONNECTOR_IDS=1 \
+UK_AQ_BACKFILL_FROM_DAY_UTC=2026-06-19 \
+UK_AQ_BACKFILL_TO_DAY_UTC=2026-06-19 \
+scripts/uk_aq_integrity_backfill.sh --env CIC-Test --aqi-only --history-version v2 --from-day 2026-06-19 --to-day 2026-06-19 --connector-id 1
+```
+
+Expected behaviour after the fix:
+
+```text id="lz0ugq"
+2026-06-19 connector 1 AQI-only rebuild runs
+connectors 3 and 7 do not block it
+timeseries_id=218 gets AQI rows for the day if observations exist
+post-rebuild validation passes if AQI rows cover observations
+```
+
+Update docs:
+
+```text id="fvpmh7"
+system_docs/uk-aq-r2-history-integrity.md
+```
+
+Document:
+
+* v2 AQI repairs can be connector/day scoped.
+* Connector-scoped AQI repair only requires requested connectors to have observations.
+* Other observed connectors on the same day must not block the requested connector.
+* Full-day rebuilds and connector-scoped rebuilds have different completeness rules.
+* Post-rebuild validation still checks AQI coverage against observations for the rebuilt connector/day.
+
+Final report should include:
+
+1. Confirmed root cause.
+2. Exact file and function where the bad connector filter guard was fixed.
+3. New guard semantics.
+4. Tests added/updated.
+5. Validation commands and results.
+6. Remaining risks or follow-up.
