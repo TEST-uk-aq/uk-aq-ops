@@ -1218,29 +1218,5 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertTrue(all("--connector-id" in cmd for cmd in metrics["planned_aqi_rebuild_commands"]))
 
 
-class RepoRootTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_repo_root_resolves_from_explicit_env_var_when_valid(self) -> None:
-        (self.root / "workers" / "shared").mkdir(parents=True, exist_ok=True)
-        (self.root / "workers" / "shared" / "r2_sigv4.mjs").touch()
-        resolved = MODULE._repo_root_for_integrity_script(env={"UK_AQ_OPS_REPO_ROOT": str(self.root)})
-        self.assertEqual(resolved, self.root)
-
-    def test_repo_root_falls_back_when_explicit_dir_invalid(self) -> None:
-        self.root.mkdir(exist_ok=True)
-        resolved = MODULE._repo_root_for_integrity_script(env={"UK_AQ_OPS_REPO_ROOT": str(self.root)})
-        self.assertEqual(resolved, Path(MODULE.__file__).resolve().parents[3])
-
-    def test_repo_root_falls_back_when_explicit_env_var_missing(self) -> None:
-        resolved = MODULE._repo_root_for_integrity_script(env={})
-        self.assertEqual(resolved, Path(MODULE.__file__).resolve().parents[3])
-
-
 if __name__ == "__main__":
     unittest.main()

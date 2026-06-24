@@ -6896,13 +6896,7 @@ def _validate_chunked_v2_observation_repair_for_aqi(
     return True, None
 
 
-def _repo_root_for_integrity_script(env: Mapping[str, str] | None = None) -> Path:
-    values = os.environ if env is None else env
-    explicit_root = str(values.get("UK_AQ_OPS_REPO_ROOT", "") or "").strip()
-    if explicit_root:
-        path = Path(explicit_root)
-        if path.is_dir() and (path / "workers/shared/r2_sigv4.mjs").is_file():
-            return path
+def _repo_root_for_integrity_script() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
@@ -6977,7 +6971,7 @@ process.stdout.write(object.body.toString("utf8"));
     try:
         proc = subprocess.run(
             [node_bin, "--input-type=module", "-e", code],
-            cwd=_repo_root_for_integrity_script(env=merged_env),
+            cwd=_repo_root_for_integrity_script(),
             env=read_env,
             capture_output=True,
             text=True,

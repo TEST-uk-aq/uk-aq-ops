@@ -23,6 +23,17 @@
 - Active scripts, workers, services, and runner-path defaults must only target non-archive paths.
 - Do not add archive fallbacks for active runtime code paths.
 
+### Pre-change Archive Requirement
+
+* Before making a substantial or high-risk code change, archive the current version of every file that is expected to be changed.
+* Archive copies must be placed under a dated directory inside `archive/`, using today’s date in `YYYY-MM-DD` format.
+* Preserve the original relative path of each archived file inside that dated archive directory where practical, so the archived copy can be traced back to its source location.
+* If additional files are discovered during the work and need to be changed, archive those files before changing them.
+* A file only needs to be archived once per calendar day. If the same file has already been archived in today’s archive directory, do not create another duplicate archive copy for that file.
+* Archive copies are for reference and rollback only. Do not wire archive paths into active runtime code, tests, scripts, workers, services, or default runner paths.
+* Do not modify archived copies after they have been created, except to correct an accidental archive-path mistake before the main code change proceeds.
+
+
 ## Schema Placement Policy
 
 - Canonical SQL DDL belongs in the schema repo (`.../CIC-test-uk-aq-schema/schemas/...`), not only in ops worker directories.
