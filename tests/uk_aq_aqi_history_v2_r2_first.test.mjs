@@ -1,0 +1,122 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  buildExpectedAqiHourBuckets,
+  summarizeExpectedAqiHourCoverage,
+  mergePointsPreferPrimary,
+  filterPointsToMissingRows,
+  extractParquetKeysFromTimeseriesIndex,
+} from "../workers/uk_aq_aqi_history_r2_api_worker/worker.mjs";
+
+function row(hour, source = "r2", daqi = 2, eaqi = 3) {
+  return {
+    period_start_utc: `2026-06-21T${String(hour).padStart(2, "0")}:00:00.000Z`,
+    connector_id: 1,
+    station_id: 10,
+    timeseries_id: 218,
+    pollutant_code: "pm25",
+    daqi_index_level: daqi,
+    eaqi_index_level: eaqi,
+    source,
+  };
+}
+
+test("v2 expected hourly coverage treats complete R2 rows as complete even when ObsAQIDB has fewer rows", () => {
+  const r2Rows = Array.from({ length: 24 }, (_, hour) => row(hour, "r2"));
+  const sparseObsRows = [row(0, "obs_aqidb"), row(1, "obs_aqidb"), row(2, "obs_aqidb")];
+  const obsFillRows = filterPointsToMissingRows(
+    sparseObsRows,
+    r2Rows,
+    Date.parse("2026-06-21T00:00:00Z"),
+    Date.parse("2026-06-22T00:00:00Z"),
+  );
+  const merged = mergePointsPreferPrimary(r2Rows, obsFillRows, null);
+  const coverage = summarizeExpectedAqiHourCoverage(merged, {
+    startIso: "2026-06-21T00:00:00Z",
+    endIso: "2026-06-22T00:00:00Z",
+    timeseriesId: 218,
+    pollutantKey: "pm25",
+  });
+
+  assert.equal(obsFillRows.length, 0);
+  assert.equal(merged.length, 24);
+  assert.equal(coverage.complete, true);
+  assert.equal(coverage.missing_hour_count, 0);
+});
+
+test("v2 R2 gaps can be completed by ObsAQIDB fill rows while preserving R2 precedence", () => {
+  const r2Rows = Array.from({ length: 24 }, (_, hour) => row(hour, "r2"))
+    .filter((point) => ![5, 6].includes(Number(point.period_start_utc.slice(11, 13))));
+  const obsRows = [row(5, "obs_aqidb", 4, 4), row(6, "obs_aqidb", 5, 5), row(7, "obs_aqidb", 9, 9)];
+  const obsFillRows = filterPointsToMissingRows(
+    obsRows,
+    r2Rows,
+    Date.parse("2026-06-21T00:00:00Z"),
+    Date.parse("2026-06-22T00:00:00Z"),
+  );
+  const merged = mergePointsPreferPrimary(r2Rows, obsFillRows, null);
+  const coverage = summarizeExpectedAqiHourCoverage(merged, {
+    startIso: "2026-06-21T00:00:00Z",
+    endIso: "2026-06-22T00:00:00Z",
+    timeseriesId: 218,
+    pollutantKey: "pm25",
+  });
+
+  assert.deepEqual(obsFillRows.map((point) => point.period_start_utc.slice(11, 13)), ["05", "06"]);
+  assert.equal(merged.find((point) => point.period_start_utc.includes("T07:"))?.source, "r2");
+  assert.equal(coverage.complete, true);
+});
+
+test("v2 expected-hour coverage reports incomplete responses when both R2 and ObsAQIDB miss hours", () => {
+  const merged = Array.from({ length: 24 }, (_, hour) => row(hour, "r2"))
+    .filter((point) => ![5, 6].includes(Number(point.period_start_utc.slice(11, 13))));
+  const coverage = summarizeExpectedAqiHourCoverage(merged, {
+    startIso: "2026-06-21T00:00:00Z",
+    endIso: "2026-06-22T00:00:00Z",
+    timeseriesId: 218,
+    pollutantKey: "pm25",
+  });
+
+  assert.equal(coverage.complete, false);
+  assert.equal(coverage.missing_hour_count, 2);
+  assert.deepEqual(coverage.missing_hours, [
+    "2026-06-21T05:00:00.000Z",
+    "2026-06-21T06:00:00.000Z",
+  ]);
+});
+
+test("v2 pollutant-partitioned timeseries index uses manifest files[].key parquet targets", () => {
+  const extraction = extractParquetKeysFromTimeseriesIndex({
+    files: [
+      {
+        key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-21/connector_id=1/pollutant_code=pm25/part-000.parquet",
+        min_timeseries_id: 200,
+        max_timeseries_id: 250,
+        pollutant_code: "pm25",
+      },
+      {
+        key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-21/connector_id=1/pollutant_code=pm10/part-000.parquet",
+        min_timeseries_id: 200,
+        max_timeseries_id: 250,
+        pollutant_code: "pm10",
+      },
+    ],
+  }, [218], "pm25");
+
+  assert.deepEqual(extraction.keys, [
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-21/connector_id=1/pollutant_code=pm25/part-000.parquet",
+  ]);
+  assert.equal(extraction.file_count, 2);
+  assert.equal(extraction.skipped_by_pollutant_file_count, 1);
+});
+
+test("since removes intentionally skipped incremental hours from expected-hour coverage", () => {
+  assert.deepEqual(buildExpectedAqiHourBuckets(
+    "2026-06-21T00:00:00Z",
+    "2026-06-21T03:00:00Z",
+    "2026-06-21T00:00:00Z",
+  ), [
+    "2026-06-21T01:00:00.000Z",
+    "2026-06-21T02:00:00.000Z",
+  ]);
+});

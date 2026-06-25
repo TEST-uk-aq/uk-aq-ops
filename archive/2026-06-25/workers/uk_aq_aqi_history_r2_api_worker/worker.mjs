@@ -1963,63 +1963,6 @@ function filterPointsToMissingRows(candidatePoints, preferredPoints, startMs, en
   });
 }
 
-function buildExpectedAqiHourBuckets(startIso, endIso, sinceIso = null) {
-  const startMs = Date.parse(startIso);
-  const endMs = Date.parse(endIso);
-  const sinceMs = sinceIso ? Date.parse(sinceIso) : Number.NaN;
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
-    return [];
-  }
-  const buckets = [];
-  let hourMs = Math.ceil(startMs / HOUR_MS) * HOUR_MS;
-  while (hourMs < endMs) {
-    if (!Number.isFinite(sinceMs) || hourMs > sinceMs) {
-      buckets.push(new Date(hourMs).toISOString());
-    }
-    hourMs += HOUR_MS;
-  }
-  return buckets;
-}
-
-function summarizeExpectedAqiHourCoverage(points, {
-  startIso,
-  endIso,
-  sinceIso = null,
-  timeseriesId,
-  pollutantKey,
-} = {}) {
-  const expectedHours = buildExpectedAqiHourBuckets(startIso, endIso, sinceIso);
-  const requestedTimeseriesId = parseRequiredPositiveInt(timeseriesId);
-  const requestedPollutant = normalizeAqiPollutant(pollutantKey);
-  const expectedHourSet = new Set(expectedHours);
-  const presentHours = new Set();
-  for (const point of Array.isArray(points) ? points : []) {
-    const pointTimeseriesId = parseRequiredPositiveInt(point?.timeseries_id);
-    if (requestedTimeseriesId && pointTimeseriesId !== requestedTimeseriesId) {
-      continue;
-    }
-    if (requestedPollutant && normalizeAqiPollutant(point?.pollutant_code) !== requestedPollutant) {
-      continue;
-    }
-    const periodStartMs = Date.parse(String(point?.period_start_utc || ""));
-    if (!Number.isFinite(periodStartMs)) {
-      continue;
-    }
-    const periodStartIso = new Date(periodStartMs).toISOString();
-    if (expectedHourSet.has(periodStartIso)) {
-      presentHours.add(periodStartIso);
-    }
-  }
-  const missingHours = expectedHours.filter((hourIso) => !presentHours.has(hourIso));
-  return {
-    expected_hour_count: expectedHours.length,
-    present_hour_count: presentHours.size,
-    missing_hour_count: missingHours.length,
-    missing_hours: missingHours,
-    complete: missingHours.length === 0,
-  };
-}
-
 function hasMissingKeyInWindow(keys, startMs, endMs) {
   if (!Array.isArray(keys) || keys.length === 0) {
     return false;
@@ -2282,25 +2225,19 @@ async function handleRequest(request, env, ctx) {
     Math.max(startMs, retentionStartMs),
     effectiveEndMs,
   );
-  const r2Window = readVersion === "v2"
-    ? makeWindow(startMs, effectiveEndMs)
-    : makeWindow(
-      startMs,
-      Math.min(effectiveEndMs, retentionStartMs),
-    );
+  const r2Window = makeWindow(
+    startMs,
+    Math.min(effectiveEndMs, retentionStartMs),
+  );
   const obsAqiDbWindow = makeWindow(
-    readVersion === "v2"
-      ? startMs
-      : Math.min(
-        overlapWindow ? overlapWindow.startMs : Number.POSITIVE_INFINITY,
-        retentionWindow ? retentionWindow.startMs : Number.POSITIVE_INFINITY,
-      ),
-    readVersion === "v2"
-      ? effectiveEndMs
-      : Math.max(
-        overlapWindow ? overlapWindow.endMs : Number.NEGATIVE_INFINITY,
-        retentionWindow ? retentionWindow.endMs : Number.NEGATIVE_INFINITY,
-      ),
+    Math.min(
+      overlapWindow ? overlapWindow.startMs : Number.POSITIVE_INFINITY,
+      retentionWindow ? retentionWindow.startMs : Number.POSITIVE_INFINITY,
+    ),
+    Math.max(
+      overlapWindow ? overlapWindow.endMs : Number.NEGATIVE_INFINITY,
+      retentionWindow ? retentionWindow.endMs : Number.NEGATIVE_INFINITY,
+    ),
   );
   const hasHistoryWindow = Boolean(r2Window);
   const hasObsAqiDbWindow = Boolean(obsAqiDbWindow);
@@ -2329,7 +2266,7 @@ async function handleRequest(request, env, ctx) {
     }
     windowContextLookupAttempted = true;
 
-    if (targetConnectorId && (isHistoricalOnlyWindow || readVersion === "v2")) {
+    if (targetConnectorId && isHistoricalOnlyWindow) {
       windowContextLookupSource = "request";
       return {
         connector_id: targetConnectorId,
@@ -2357,7 +2294,7 @@ async function handleRequest(request, env, ctx) {
             && metadataLookup.timeseries_ids.length > 0
             ? metadataLookup.timeseries_ids
             : [timeseriesId];
-          if (isHistoricalOnlyWindow || readVersion === "v2") {
+          if (isHistoricalOnlyWindow) {
             return {
               connector_id: targetConnectorId,
               station_id: targetStationId,
@@ -2465,7 +2402,7 @@ async function handleRequest(request, env, ctx) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       recentFallbackRead = buildEmptyRecentRead("fallback_error", message);
-      if (readVersion !== "v2" && r2Read.points.length === 0) {
+      if (r2Read.points.length === 0) {
         throw new Error(
           `R2 AQI history is unavailable and ObsAQIDB fallback failed (${message}).`,
         );
@@ -2473,20 +2410,6 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  const v2R2FullRangePoints = readVersion === "v2" && r2Window
-    ? filterPointsToWindow(r2Read.points, r2Window.startMs, r2Window.endMs)
-    : [];
-  const v2ObsAqiDbCandidatePoints = readVersion === "v2" && obsAqiDbWindow
-    ? filterPointsToWindow(recentFallbackRead.points, obsAqiDbWindow.startMs, obsAqiDbWindow.endMs)
-    : [];
-  const v2ObsAqiDbFillPoints = readVersion === "v2" && obsAqiDbWindow
-    ? filterPointsToMissingRows(
-      v2ObsAqiDbCandidatePoints,
-      v2R2FullRangePoints,
-      obsAqiDbWindow.startMs,
-      obsAqiDbWindow.endMs,
-    )
-    : [];
   const overlapObsAqiDbCandidatePoints = overlapWindow
     ? filterPointsToWindow(recentFallbackRead.points, overlapWindow.startMs, overlapWindow.endMs)
     : [];
@@ -2517,41 +2440,27 @@ async function handleRequest(request, env, ctx) {
     ...row,
     source_coverage: "retention",
   }));
-  const annotatedV2R2FullRangePoints = v2R2FullRangePoints.map((row) => ({
-    ...row,
-    source_coverage: "r2_first_full_range",
-  }));
-  const annotatedV2ObsAqiDbFillPoints = v2ObsAqiDbFillPoints.map((row) => ({
-    ...row,
-    source_coverage: "obs_aqidb_fill",
-  }));
-  const obsAqiDbMergePoints = readVersion === "v2"
-    ? annotatedV2ObsAqiDbFillPoints
-    : [
-      ...annotatedOverlapObsAqiDbFillPoints,
-      ...annotatedRetentionObsAqiDbPoints,
-    ];
-  const r2MergePoints = readVersion === "v2"
-    ? annotatedV2R2FullRangePoints
-    : [
-      ...annotatedHistoricalR2Points,
-      ...annotatedOverlapR2Points,
-    ];
+  const obsAqiDbMergePoints = [
+    ...annotatedOverlapObsAqiDbFillPoints,
+    ...annotatedRetentionObsAqiDbPoints,
+  ];
+  const r2MergePoints = [
+    ...annotatedHistoricalR2Points,
+    ...annotatedOverlapR2Points,
+  ];
   const points = mergePointsPreferPrimary(
     r2MergePoints,
     obsAqiDbMergePoints,
     limit,
   );
   const rowSummary = summarizeAqiHistoryRows(points);
-  let source = readVersion === "v2" ? "r2_first" : "r2_only";
+  let source = "r2_only";
   if (points.length === 0) {
     source = "no_data_in_window";
   } else if (r2MergePoints.length === 0 && obsAqiDbMergePoints.length > 0) {
-    source = readVersion === "v2" ? "obs_aqidb_fill_only_r2_unavailable" : "obs_aqidb_retention_only";
+    source = "obs_aqidb_retention_only";
   } else if (r2MergePoints.length > 0 && obsAqiDbMergePoints.length > 0) {
-    source = readVersion === "v2"
-      ? "r2_first_with_obs_aqidb_fill"
-      : overlapObsAqiDbFillPoints.length > 0 && retentionObsAqiDbPoints.length > 0
+    source = overlapObsAqiDbFillPoints.length > 0 && retentionObsAqiDbPoints.length > 0
       ? "r2_plus_obs_aqidb_overlap_fill_and_retention"
       : overlapObsAqiDbFillPoints.length > 0
       ? "r2_plus_obs_aqidb_overlap_fill"
@@ -2571,17 +2480,7 @@ async function handleRequest(request, env, ctx) {
   if (hasObsAqiDbWindow && recentFallbackRead.status === "fallback_error") {
     partialReasons.add(`obs_aqidb:${recentFallbackRead.error || "fallback_error"}`);
   }
-  const expectedCoverage = summarizeExpectedAqiHourCoverage(points, {
-    startIso,
-    endIso,
-    sinceIso,
-    timeseriesId,
-    pollutantKey: requestedPollutant,
-  });
-  if (!expectedCoverage.complete) {
-    partialReasons.add("missing_expected_aqi_hours");
-  }
-  const responseComplete = partialReasons.size === 0 && expectedCoverage.complete;
+  const responseComplete = partialReasons.size === 0;
   const hasGap = !responseComplete;
   const coverageState = responseComplete ? "complete" : "partial";
   const partialReasonList = Array.from(partialReasons);
@@ -2598,7 +2497,7 @@ async function handleRequest(request, env, ctx) {
       ? "obs_aqidb_live"
       : recentFallbackRead.status
     : "not_requested";
-  const legacySourceCoverage = [
+  const sourceCoverage = [
     historicalWindow
       ? {
         zone: "historical",
@@ -2636,35 +2535,6 @@ async function handleRequest(request, env, ctx) {
       }
       : null,
   ].filter(Boolean);
-  const sourceCoverage = readVersion === "v2"
-    ? [
-      r2Window
-        ? {
-          zone: "full_range",
-          source: "r2_first",
-          from_utc: r2Window.startIso,
-          to_utc: r2Window.endIso,
-          status: expectedCoverage.complete ? "complete" : "partial",
-          row_count: v2R2FullRangePoints.length,
-          partial_reasons: expectedCoverage.complete ? [] : ["missing_expected_aqi_hours"],
-        }
-        : null,
-      obsAqiDbWindow
-        ? {
-          zone: "fill",
-          source: "obs_aqidb_fill",
-          from_utc: obsAqiDbWindow.startIso,
-          to_utc: obsAqiDbWindow.endIso,
-          status: recentFallbackRead.status === "fallback_error" ? "partial" : "complete",
-          obs_aqidb_candidate_row_count: v2ObsAqiDbCandidatePoints.length,
-          obs_aqidb_fill_row_count: v2ObsAqiDbFillPoints.length,
-          obs_aqidb_status: recentFallbackRead.status === "fallback_live"
-            ? "obs_aqidb_live"
-            : recentFallbackRead.status,
-        }
-        : null,
-    ].filter(Boolean)
-    : legacySourceCoverage;
 
   const responseRows = points.map((row) => projectAqiHistoryResponseRow(row));
   const responseColumns = getAqiHistoryResponseColumns();
@@ -2700,12 +2570,8 @@ async function handleRequest(request, env, ctx) {
     response_complete: responseComplete,
     has_gap: hasGap,
     coverage_state: coverageState,
-      partial_reasons: partialReasonList,
-      expected_hour_count: expectedCoverage.expected_hour_count,
-      present_expected_hour_count: expectedCoverage.present_hour_count,
-      missing_expected_hour_count: expectedCoverage.missing_hour_count,
-      missing_expected_hours: expectedCoverage.missing_hours,
-      wire_format: responseFormat === "tsv" ? "tsv" : "json",
+    partial_reasons: partialReasonList,
+    wire_format: responseFormat === "tsv" ? "tsv" : "json",
     data_format: responseFormat === "objects" ? "objects" : "compact",
     columns: responseColumns,
     points: responseFormat === "objects" ? responseRows : compactPoints,
@@ -2753,7 +2619,6 @@ async function handleRequest(request, env, ctx) {
       has_gap: hasGap,
       coverage_state: coverageState,
       partial_reasons: partialReasonList,
-      expected_hour_coverage: expectedCoverage,
       row_summary: rowSummary,
       scan_metrics: r2Read.scan_metrics,
       coverage: {
@@ -2775,7 +2640,6 @@ async function handleRequest(request, env, ctx) {
         history_scan_stopped_reason: historyScanStoppedReason,
         obs_aqidb_status: recentFallbackRead.status,
         row_summary: rowSummary,
-        expected_hour_coverage: expectedCoverage,
       },
     },
     coverage: {
@@ -2829,7 +2693,6 @@ async function handleRequest(request, env, ctx) {
       has_gap: hasGap,
       coverage_state: coverageState,
       partial_reasons: partialReasonList,
-      expected_hour_coverage: expectedCoverage,
       source_coverage: sourceCoverage,
       history_scan_complete: historyScanComplete,
       history_scan_stopped_reason: historyScanStoppedReason,
@@ -2926,14 +2789,6 @@ async function handleRequest(request, env, ctx) {
 
   return response;
 }
-
-export {
-  buildExpectedAqiHourBuckets,
-  summarizeExpectedAqiHourCoverage,
-  mergePointsPreferPrimary,
-  filterPointsToMissingRows,
-  extractParquetKeysFromTimeseriesIndex,
-};
 
 export default {
   async fetch(request, env, ctx) {
