@@ -30,8 +30,8 @@ Optional:
 
 - `scope` (must be `timeseries`; default `timeseries`)
 - `grain` (must be `hourly`; default `hourly`)
-- `pollutant` (`pm25`, `pm10`, `no2`)
-  - when present, the worker returns only rows for that pollutant_code
+- `pollutant` (`pm25`, `pm10`, `no2`) — required
+  - the worker returns only rows for the requested pollutant_code; omitted or invalid pollutants return HTTP 400 to avoid broad all-pollutant reads
 - `format`
   - default `compact` JSON with `columns` + compact `points` arrays
   - `json` is accepted as an alias for compact JSON
@@ -45,13 +45,14 @@ Optional:
   - alias: `since`
 - `row_limit` (`1..20000`)
   - alias: `limit`
+  - limits only returned `points`; expected-hour completeness is calculated before row limiting and reported with `row_limit_applied`, `row_limit`, `pre_limit_row_count`, and `returned_row_count` metadata
 
 Source strategy:
 
 - `read_version=v2` requests read R2 v2 AQI history first for the full requested range.
 - V2 R2 reads use data files under `history/v2/aqilevels/hourly/data` and manifest-based indexes under `history/_index_v2/aqilevels_hourly_data_timeseries`.
 - V2 timeseries index keys are pollutant partitioned: `day_utc=YYYY-MM-DD/connector_id=N/pollutant_code=P/manifest.json`. The worker reads the manifest and uses `files[].key` to locate the real AQI data parquet files; `_index_v2` itself is not scanned for parquet files.
-- ObsAQIDB remains available for v2, but only as a fill/recent fallback. Its rows fill keys missing from R2; overlapping row keys (`period_start_utc` + `timeseries_id` + `pollutant_code`) are de-duplicated with R2 rows winning.
+- ObsAQIDB remains available for v2, but only as a fill source when R2 expected-hour coverage is incomplete or R2 is unavailable. The worker does not query ObsAQIDB when R2 already covers the expected hours. Fill queries use the smallest contiguous missing-hour window currently implemented, and overlapping row keys (`period_start_utc` + `timeseries_id` + `pollutant_code`) are de-duplicated with R2 rows winning.
 - V2 responses report source metadata such as `r2_first`, `r2_first_with_obs_aqidb_fill`, or `obs_aqidb_fill_only_r2_unavailable`.
 - `read_version=v1` keeps the legacy rolling split with `INGESTDB_RETENTION_DAYS`:
   - retention range (`now - INGESTDB_RETENTION_DAYS` to now): ObsAQIDB only
@@ -147,7 +148,7 @@ Coverage metadata includes fallback status for the recent window:
 - `coverage.source_coverage`: interval-level source diagnostics for historical, overlap, and retention zones
 - `coverage.historical_window_*`, `coverage.overlap_window_*`, `coverage.retention_window_*`: request windows after source splitting
 - `coverage.r2_window_*`: R2 request window; for `read_version=v2` this spans the full requested range, while v1 ends at or before `retention_start_utc`
-- `coverage.obs_aqidb_window_*`: for `read_version=v2`, the fill candidate window; for v1, the live AQI window used for overlap fill plus retention rows
+- `coverage.obs_aqidb_window_*`: for `read_version=v2`, the missing-hour fill window when R2-only coverage is incomplete; it is null/not requested when R2 coverage is complete. For v1, this is the live AQI window used for overlap fill plus retention rows
 - `coverage.overlap_r2_point_count`, `coverage.overlap_obs_aqidb_candidate_row_count`, `coverage.overlap_obs_aqidb_fill_row_count`, `coverage.retention_obs_aqidb_row_count`: source merge counts
 - `coverage.target_connector_id`: resolved connector id for the requested timeseries window context when lookup succeeds
 - `coverage.target_station_id`: resolved station id for the requested timeseries window context (metadata only; parquet filtering is timeseries-based)
@@ -165,7 +166,9 @@ Coverage metadata includes fallback status for the recent window:
 - `coverage.obs_aqidb_fallback_recent_r2_point_count`: R2 hourly point count in the recent fallback window
 - `coverage.obs_aqidb_fallback_error`: fallback error when ObsAQIDB fallback fails but R2 data was still returned
 - top-level `source_of_truth_days` / `source_of_truth_hours`: derived from `INGESTDB_RETENTION_DAYS`
-- top-level `response_complete`: `true` only when required scans/fill sources completed and expected hourly AQI coverage is complete for the requested timeseries/pollutant
+- `coverage.r2_expected_hour_coverage`: R2-only expected-hour coverage for the requested timeseries/pollutant. The v2 `source_coverage` `full_range` entry is based on this R2-only summary.
+- `coverage.merged_expected_hour_coverage` and `meta.expected_hour_coverage`: expected-hour coverage after R2 rows plus ObsAQIDB fill rows have been merged.
+- top-level `response_complete`: `true` only when required scans/fill sources completed and merged expected hourly AQI coverage is complete for the requested timeseries/pollutant
 - `expected_hour_count`, `present_expected_hour_count`, `missing_expected_hour_count`, and `missing_expected_hours`: expected-hour coverage diagnostics from `from_utc/start_utc` inclusive to `to_utc/end_utc` exclusive, respecting `since` as an exclusive incremental lower bound
 - top-level `has_gap`, `coverage_state`, and `partial_reasons`: client-facing gap diagnostics; missing expected rows add `missing_expected_aqi_hours` and make `coverage_state=partial`
 - top-level `cache_scope`: `recent` or `immutable`
@@ -195,7 +198,7 @@ Each row object includes:
 - `source`
 - `source_coverage`
 
-The response returns one row per pollutant per hour. When `pollutant` is omitted, all pollutant rows are returned for the timeseries. When `pollutant` is set, rows are filtered to that pollutant_code.
+The response returns one row per hour for the required `pollutant`. Omitted pollutants are rejected with HTTP 400; the worker does not serve all-pollutant AQI history responses.
 
 `source` is `r2` or `obs_aqidb`. In v2, `source_coverage` is `r2_first_full_range` or `obs_aqidb_fill`; in v1 it remains `historical`, `overlap`, or `retention`.
 

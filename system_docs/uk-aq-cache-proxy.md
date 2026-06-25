@@ -68,8 +68,8 @@ Read endpoints:
     - AQI history route: up to 2 attempts with linear backoff
     - retry statuses: `502`, `503`, `504`
     - AQI history `503` responses with Cloudflare Error 1102 / "Worker exceeded resource limits" HTML are not retried, because retrying repeats the same CPU/R2-heavy upstream work inside the same browser request path
-  - in v2 mode, AQI history requests are handled R2-first by the AQI history worker across the full requested range; ObsAQIDB is only a fill/recent fallback for missing hourly AQI rows
-  - the upstream AQI history worker sets `X-UK-AQ-Response-Complete=false` and `Cache-Control: no-store` when expected-hour coverage is incomplete, so the cache proxy receives a non-cacheable incomplete response
+  - in v2 mode, AQI history requests require `pollutant` and are handled R2-first by the AQI history worker across the full requested range; ObsAQIDB is queried only as fill when R2 expected-hour coverage is incomplete or R2 is unavailable
+  - the upstream AQI history worker reports R2-only and merged expected-hour coverage separately, bases `response_complete` on merged coverage plus scan/fill errors, and sets `X-UK-AQ-Response-Complete=false` and `Cache-Control: no-store` when incomplete so the cache proxy receives a non-cacheable response
 - `/api/aq/postcode_lookup` -> external postcode lookup R2 API URL (`UK_AQ_POSTCODE_LOOKUP_R2_API_URL`)
   - uses the long-lived postcode cache profile (`max-age=86400`)
 - `/api/aq/postcode_suggest` -> external postcode suggest R2 API URL (`UK_AQ_POSTCODE_SUGGEST_R2_API_URL`)
@@ -159,3 +159,8 @@ Worker naming:
 - Same-origin browser requests are accepted even when `Origin` is omitted (fallback uses `Sec-Fetch-Site: same-origin` or same-origin `Referer`).
 - Response diagnostics include `X-UK-AQ-Upstream-Attempts` and (when retries were used) `X-UK-AQ-Upstream-Retry`.
 - For full latest snapshot pipeline details (Cloud Run builder + latest snapshot R2 API worker + cache proxy handoff), see `system_docs/uk-aq-latest-snapshot.md`.
+
+
+### AQI history row limits and cache safety
+
+`row_limit`/`limit` on AQI history limits only the returned `points`. The upstream worker calculates expected-hour coverage before applying the limit, so intentionally truncated payloads do not create false data-gap diagnostics. Incomplete upstream AQI history responses remain non-cacheable and must not be stored by the proxy.

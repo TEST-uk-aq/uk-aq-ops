@@ -359,7 +359,7 @@ test("worker returns normalized compact AQI rows with row-summary metadata", asy
 
   try {
     const response = await aqiHistoryWorker.fetch(
-      new Request("https://example.test/v1/aqi-history?timeseries_id=101&pollutant=pm25&days=1", {
+      new Request("https://example.test/v1/aqi-history?timeseries_id=101&days=1", {
         headers: {
           "x-uk-aq-upstream-auth": "test-upstream-secret",
         },
@@ -383,7 +383,7 @@ test("worker returns normalized compact AQI rows with row-summary metadata", asy
     assert.equal(payload.data_format, "compact");
     assert.equal(payload.source, "obs_aqidb_retention_only");
     assert.equal(payload.coverage.obs_aqidb_status, "fallback_live");
-    assert.equal(payload.row_count, 1);
+    assert.equal(payload.row_count, 3);
     assert.deepEqual(payload.columns.slice(0, 7), [
       "period_start_utc",
       "connector_id",
@@ -404,16 +404,16 @@ test("worker returns normalized compact AQI rows with row-summary metadata", asy
     assert.equal(payload.points[0][13], "obs_aqidb");
     assert.equal(payload.points[0][14], "retention");
 
-    assert.equal(payload.coverage.row_summary.parsed_point_count, 1);
-    assert.equal(payload.coverage.row_summary.null_daqi_count, 0);
-    assert.equal(payload.coverage.row_summary.null_eaqi_count, 0);
-    assert.equal(payload.coverage.row_summary.source_counts.obs_aqidb, 1);
-    assert.equal(payload.coverage.row_summary.source_coverage_counts.retention, 1);
+    assert.equal(payload.coverage.row_summary.parsed_point_count, 3);
+    assert.equal(payload.coverage.row_summary.null_daqi_count, 1);
+    assert.equal(payload.coverage.row_summary.null_eaqi_count, 1);
+    assert.equal(payload.coverage.row_summary.source_counts.obs_aqidb, 3);
+    assert.equal(payload.coverage.row_summary.source_coverage_counts.retention, 3);
     assert.equal(payload.coverage.row_summary.pollutant_counts.pm25, 1);
-    assert.equal(payload.coverage.row_summary.pollutant_counts.no2 || 0, 0);
-    assert.equal(payload.coverage.row_summary.pollutant_counts.pm10 || 0, 0);
-    assert.equal(payload.meta.row_summary.null_daqi_count, 0);
-    assert.equal(payload.meta.row_summary.source_counts.obs_aqidb, 1);
+    assert.equal(payload.coverage.row_summary.pollutant_counts.no2, 1);
+    assert.equal(payload.coverage.row_summary.pollutant_counts.pm10, 1);
+    assert.equal(payload.meta.row_summary.null_daqi_count, 1);
+    assert.equal(payload.meta.row_summary.source_counts.obs_aqidb, 3);
   } finally {
     await harness.restore();
   }
@@ -426,7 +426,7 @@ test("worker returns row objects without legacy timestamp fields when format=obj
 
   try {
     const response = await aqiHistoryWorker.fetch(
-      new Request("https://example.test/v1/aqi-history?timeseries_id=101&pollutant=pm25&days=1&format=objects", {
+      new Request("https://example.test/v1/aqi-history?timeseries_id=101&days=1&format=objects", {
         headers: {
           "x-uk-aq-upstream-auth": "test-upstream-secret",
         },
@@ -451,48 +451,8 @@ test("worker returns row objects without legacy timestamp fields when format=obj
     assert.equal(payload.points[0].source, "obs_aqidb");
     assert.equal(payload.points[0].source_coverage, "retention");
     assert.equal("timestamp_hour_utc" in payload.points[0], false);
-    assert.equal(payload.points[0].daqi_calculation_status, "ok");
-    assert.equal(payload.points[0].eaqi_calculation_status, "ok");
-  } finally {
-    await harness.restore();
-  }
-});
-
-test("worker rejects missing pollutant without broad all-pollutant read", async () => {
-  const harness = installAqiHistoryMocks([]);
-  try {
-    const response = await aqiHistoryWorker.fetch(
-      new Request("https://example.test/v1/aqi-history?timeseries_id=101&days=1", {
-        headers: { "x-uk-aq-upstream-auth": "test-upstream-secret" },
-      }),
-      { UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret", UK_AQ_R2_HISTORY_VERSION: "v2" },
-      harness.ctx,
-    );
-    assert.equal(response.status, 400);
-    assert.equal(harness.calls.length, 0);
-    const payload = await response.json();
-    assert.equal(payload.ok, false);
-    assert.equal(payload.error, "pollutant is required and must be one of pm25, pm10, or no2.");
-  } finally {
-    await harness.restore();
-  }
-});
-
-test("worker rejects invalid pollutant", async () => {
-  const harness = installAqiHistoryMocks([]);
-  try {
-    const response = await aqiHistoryWorker.fetch(
-      new Request("https://example.test/v1/aqi-history?timeseries_id=101&pollutant=o3&days=1", {
-        headers: { "x-uk-aq-upstream-auth": "test-upstream-secret" },
-      }),
-      { UK_AQ_EDGE_UPSTREAM_SECRET: "test-upstream-secret", UK_AQ_R2_HISTORY_VERSION: "v2" },
-      harness.ctx,
-    );
-    assert.equal(response.status, 400);
-    assert.equal(harness.calls.length, 0);
-    const payload = await response.json();
-    assert.equal(payload.ok, false);
-    assert.equal(payload.error, "pollutant is required and must be one of pm25, pm10, or no2.");
+    assert.equal(payload.points[2].daqi_calculation_status, "insufficient_samples");
+    assert.equal(payload.points[2].eaqi_calculation_status, "insufficient_samples");
   } finally {
     await harness.restore();
   }
