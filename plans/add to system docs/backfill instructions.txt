@@ -1,0 +1,113 @@
+Yes, `local_to_aqilevels` exists, but it is **not the right mode for “local Dropbox observations → calculate AQI → write AQI history to R2”**.
+
+`local_to_aqilevels` is badly named for what you want. In the active `run_job.ts`, it:
+
+1. Requires **Ingest Supabase** credentials and **ObsAQIDB Supabase** credentials.
+2. Checks connector counts from `ingestdb` and `obs_aqidb`.
+3. Can read R2 observation history as a source if it chooses `sourceKind === "r2"`.
+4. But then it calls `upsertAqilevelsRows(...)`, which writes to **ObsAQIDB**, not R2.
+
+So `local_to_aqilevels` is basically:
+
+```text id="y99ad0"
+source rows / maybe R2 observations → calculate AQI helper rows → write ObsAQIDB hourly/rollups
+```
+
+not:
+
+```text id="4atp3q"
+Dropbox R2 mirror observations → calculate AQI parquet/manifests → upload aqilevels to R2
+```
+
+## The mode that writes AQI history to R2
+
+The R2-writing mode is:
+
+```text id="lvnv58"
+r2_history_obs_to_aqilevels
+```
+
+with:
+
+```text id="9d2veh"
+UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only
+```
+
+The docs say `aqilevels_only` rebuilds AQI history outputs from committed R2 observation history, and is valid only with `r2_history_obs_to_aqilevels`.  The wrapper also says this mode “reads committed R2 observations and rewrites AQI history” for v1 or v2, and for v2 uses the v2 observations and AQI data/debug prefixes.
+
+That is the active supported route for rebuilding 19/06 AQI in R2.
+
+## But your exact “local Dropbox files → write R2” path is different
+
+There is a diagnostic script that reads local Dropbox observations and recalculates AQI:
+
+```text id="hi5kxm"
+scripts/backup_r2/uk_aq_validate_aqi_from_dropbox_observs.mjs
+```
+
+The docs say it recomputes AQI rows from local Dropbox observations and compares them with local Dropbox aqilevels. It supports `--history-version v1|v2`, and `--write-r2` runs supports `--history-version v1|v2`, and `--write-r2` runs targeted AQI rebuild writes via `scripts/uk_aq__obs_to_aqilevels` mode. fileciteturn443file0L119-L128 The script’s own help confirms `--write-r2` runs backfill with `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels`, `UK_AQ_BACKFILL_OUTPUT_SCOPE=KFILL_FORCE_REPLACE=true`. fileciteturn444file0L69-L75
+
+So the best wording is:
+
+```text id="fkgs9d"
+validate script = reads local Dropbox and decides what is missing
+r2_history_obs_to_aqilevels = does the actual AQI R2 rebuild
+```
+
+It is not a pure “write the locally generated parquet directly to R2” flow for v2. The only fully local generator/uploader described in the docs is the older v1 TEST-only rebuild path, and thatilevels/hourly`, not v2. fileciteturn440file0L178-L228
+
+## What I would run for 19/06
+
+Because there was previously a connector-scoped guard problem, I would avoid a connector filter for the actual rebuild unless you are sure that fix has landed. For a single day, rebuilding all observed connectors is probably safest.
+
+Dry run:
+
+```bash id="6x9xem"
+cd "/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops"
+
+export UK_AQ_R2_HISTORY_VERSION=v2
+export UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels
+export UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only
+export UK_AQ_BACKFILL_DRY_RUN=true
+export UK_AQ_BACKFILL_FORCE_REPLACE=true
+export UK_AQ_BACKFILL_FROM_DAY_UTC=2026-06-19
+export UK_AQ_BACKFILL_TO_DAY_UTC=2026-06-19
+unset UK_AQ_BACKFILL_CONNECTOR_IDS
+
+./scripts/uk_aq_backfill_local.sh
+```
+
+Actual run:
+
+```bash id="ihqk48"
+export UK_AQ_BACKFILL_DRY_RUN=false
+
+./scripts/uk_aq_backfill_local.sh
+```
+
+That will rebuild v2 AQI from committed R2 v2 observations and then the wrapper should run the final R2 history index rebuild unless you set `UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX=false`. The wrapper explicitly rebuilds the R2 history index aft` successful non-dry runs. fileciteturn440file0L34-L39
+
+## Using the Dropbox validator first
+
+This is useful before the write:
+
+```bash id="bvfxat"
+node scripts/backup_r2/uk_aq_validate_aqi_from_dropbox_observs.mjs \
+  --history-version v2 \
+  --root "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup" \
+  --from-day 2026-06-19 \
+  --to-day 2026-06-19 \
+  --connector-id 1 \
+  --include-ok \
+  --format csv \
+  --out /tmp/uk-aq-aqi-validate-2026-06-19-connector-1.csv \
+  --print-write-commands
+```
+
+That checks the local Dropbox mirror and should show exactly what is missing/mismatched.
+
+## Bottom line
+
+`local_to_aqilevels` is for writing calculated AQI into **ObsAQIDB**, not R2. For your immediate need, use `r2_history_obs_to_aqilevels` with `aqilevels_only`. For a local Dropbox-based check first, use `uk_aq_validate_aqi_from_dropbox_observs.mjs`.
+
+The system doc should probably be corrected, because it lists `local_to_aqilevels` but does not explain that it upserts to ObsAQIDB, and the `aqilevels_only` section still describes the v1 path even though the wrapper supports v2.

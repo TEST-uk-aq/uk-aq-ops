@@ -2732,7 +2732,7 @@ function summarizeObservationPartRows(
   };
 }
 
-export function summarizeAqilevelsPartRows(
+function summarizeAqilevelsPartRows(
   rows: AqilevelsHistoryParquetRow[],
 ): {
   min_timeseries_id: number | null;
@@ -2740,14 +2740,12 @@ export function summarizeAqilevelsPartRows(
   min_timestamp_hour_utc: string | null;
   max_timestamp_hour_utc: string | null;
   pollutant_codes: string[];
-  timeseries_row_counts: Record<string, number>;
 } {
   let minTimeseriesId: number | null = null;
   let maxTimeseriesId: number | null = null;
   let minTimestampHourUtc: string | null = null;
   let maxTimestampHourUtc: string | null = null;
   const pollutantCodes = new Set<string>();
-  const timeseriesRowCounts: Record<string, number> = {};
 
   for (const row of rows) {
     const timeseriesId = Number(row.timeseries_id);
@@ -2759,8 +2757,6 @@ export function summarizeAqilevelsPartRows(
       if (maxTimeseriesId === null || normalizedTimeseriesId > maxTimeseriesId) {
         maxTimeseriesId = normalizedTimeseriesId;
       }
-      const key = String(normalizedTimeseriesId);
-      timeseriesRowCounts[key] = (timeseriesRowCounts[key] || 0) + 1;
     }
 
     const timestampHourUtc = typeof row.timestamp_hour_utc === "string"
@@ -2787,7 +2783,6 @@ export function summarizeAqilevelsPartRows(
     min_timestamp_hour_utc: minTimestampHourUtc,
     max_timestamp_hour_utc: maxTimestampHourUtc,
     pollutant_codes: Array.from(pollutantCodes).sort((a, b) => a.localeCompare(b)),
-    timeseries_row_counts: timeseriesRowCounts,
   };
 }
 
@@ -3046,7 +3041,7 @@ function createObservationV2ConnectorManifest(args: {
   });
 }
 
-export function createAqiConnectorManifest(args: {
+function createAqiConnectorManifest(args: {
   dayUtc: string;
   connectorId: number;
   runId: string;
@@ -3058,15 +3053,14 @@ export function createAqiConnectorManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }): AqilevelsConnectorManifest & { [key: string]: unknown } {
-  const manifestFileEntries = stripTimeseriesCountsFromFileEntries(args.fileEntries);
-  const parquetObjectKeys = manifestFileEntries.map((entry) => entry.key);
-  const totalBytes = manifestFileEntries.reduce(
+  const parquetObjectKeys = args.fileEntries.map((entry) => entry.key);
+  const totalBytes = args.fileEntries.reduce(
     (sum, entry) => sum + Number(entry.bytes || 0),
     0,
   );
   let minTimeseriesId: number | null = null;
   let maxTimeseriesId: number | null = null;
-  for (const entry of manifestFileEntries) {
+  for (const entry of args.fileEntries) {
     const entryMin = Number(entry.min_timeseries_id);
     const entryMax = Number(entry.max_timeseries_id);
     if (Number.isFinite(entryMin) && entryMin > 0) {
@@ -3082,8 +3076,7 @@ export function createAqiConnectorManifest(args: {
       }
     }
   }
-  const stats = statsFromFileEntries(manifestFileEntries, args.sourceRowCount);
-  const timeseriesRowCounts = aggregateTimeseriesRowCounts(args.fileEntries);
+  const stats = statsFromFileEntries(args.fileEntries, args.sourceRowCount);
 
   return withManifestHash({
     day_utc: args.dayUtc,
@@ -3096,16 +3089,15 @@ export function createAqiConnectorManifest(args: {
     min_timestamp_hour_utc: args.minTimestampHourUtc,
     max_timestamp_hour_utc: args.maxTimestampHourUtc,
     parquet_object_keys: parquetObjectKeys,
-    file_count: manifestFileEntries.length,
+    file_count: args.fileEntries.length,
     total_bytes: totalBytes,
-    files: manifestFileEntries,
+    files: args.fileEntries,
     history_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
     history_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
     columns: HISTORY_AQILEVELS_COLUMNS,
     writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
     writer_git_sha: args.writerGitSha,
     ...stats,
-    timeseries_row_counts: timeseriesRowCounts,
     backed_up_at_utc: args.backedUpAtUtc,
   });
 }
@@ -3290,7 +3282,7 @@ function historyV2AqiColumns(profile: "data" | "debug"): readonly string[] {
     : HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2;
 }
 
-export function createAqiV2PollutantManifest(args: {
+function createAqiV2PollutantManifest(args: {
   profile: "data" | "debug";
   dayUtc: string;
   connectorId: number;
@@ -3302,13 +3294,11 @@ export function createAqiV2PollutantManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }) {
-  const filesWithCounts = args.fileEntries.map((entry) => ({
+  const files = args.fileEntries.map((entry) => ({
     ...entry,
     pollutant_code: args.pollutantCode,
   }));
-  const files = stripTimeseriesCountsFromFileEntries(filesWithCounts);
   const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const timeseriesRowCounts = aggregateTimeseriesRowCounts(filesWithCounts);
   return withManifestHash({
     manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
     history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
@@ -3338,12 +3328,11 @@ export function createAqiV2PollutantManifest(args: {
     writer_version: HISTORY_R2_V2_WRITER_VERSION,
     writer_git_sha: args.writerGitSha,
     ...statsFromFileEntries(files, args.sourceRowCount),
-    timeseries_row_counts: timeseriesRowCounts,
     backed_up_at_utc: args.backedUpAtUtc,
   });
 }
 
-export function createAqiV2ConnectorManifest(args: {
+function createAqiV2ConnectorManifest(args: {
   profile: "data" | "debug";
   dayUtc: string;
   connectorId: number;
@@ -3364,9 +3353,6 @@ export function createAqiV2ConnectorManifest(args: {
     0,
   );
   const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const timeseriesRowCounts = aggregateTimeseriesRowCounts(
-    args.pollutantManifests as Array<{ timeseries_row_counts?: Record<string, number> | null | undefined }>,
-  );
   const childManifests = args.pollutantManifests.map((manifest) => ({
     pollutant_code: manifest.pollutant_code,
     manifest_key: manifest.manifest_key,
@@ -3410,7 +3396,6 @@ export function createAqiV2ConnectorManifest(args: {
     writer_version: HISTORY_R2_V2_WRITER_VERSION,
     writer_git_sha: args.writerGitSha,
     ...statsFromFileEntries(files, totalRows),
-    timeseries_row_counts: timeseriesRowCounts,
     backed_up_at_utc: args.backedUpAtUtc,
   });
 }
@@ -4229,7 +4214,6 @@ async function exportAqiConnectorDayToR2(args: {
       pollutant_codes: partSummary.pollutant_codes,
       min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
       max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
-      timeseries_row_counts: partSummary.timeseries_row_counts,
     });
     partIndex += 1;
   };
@@ -4858,7 +4842,6 @@ async function exportAqiConnectorRowsToR2V2(args: {
           pollutant_codes: [pollutantCode],
           min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
           max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
-          timeseries_row_counts: partSummary.timeseries_row_counts,
         });
         objectsWritten += 1;
         parquetFilesWritten += 1;
@@ -5064,7 +5047,6 @@ async function exportAqiConnectorRowsToR2(args: {
       pollutant_codes: partSummary.pollutant_codes,
       min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
       max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
-      timeseries_row_counts: partSummary.timeseries_row_counts,
     });
   }
 

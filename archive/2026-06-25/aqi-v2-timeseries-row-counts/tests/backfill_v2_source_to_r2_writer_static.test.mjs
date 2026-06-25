@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const source = readFileSync("workers/uk_aq_backfill_local/run_job.ts", "utf8");
-const wrapperSource = readFileSync("scripts/uk_aq_backfill_local.sh", "utf8");
 
 function bodyOf(functionName) {
   const start = source.indexOf(`function ${functionName}`) >= 0
@@ -59,36 +58,4 @@ test("OpenAQ mapping keeps pollutant_code from source parameter if binding code 
     /pollutant_code: parseSourcePollutantCode\(String\(binding\.pollutant_code \|\| ""\)\) \|\| pollutantCode/,
   );
   assert.match(body, /source_parameter: parameterRaw/);
-});
-
-test("AQI writer carries part timeseries counts into v1 and v2 manifest builders", () => {
-  const summaryBody = bodyOf("summarizeAqilevelsPartRows");
-  assert.match(summaryBody, /timeseries_row_counts: Record<string, number>/);
-  assert.match(summaryBody, /timeseriesRowCounts\[key\] = \(timeseriesRowCounts\[key\] \|\| 0\) \+ 1/);
-
-  const v2PollutantBody = bodyOf("createAqiV2PollutantManifest");
-  assert.match(v2PollutantBody, /timeseriesRowCounts = aggregateTimeseriesRowCounts\(filesWithCounts\)/);
-  assert.match(v2PollutantBody, /timeseries_row_counts: timeseriesRowCounts/);
-  assert.match(v2PollutantBody, /stripTimeseriesCountsFromFileEntries\(filesWithCounts\)/);
-
-  const v2ConnectorBody = bodyOf("createAqiV2ConnectorManifest");
-  assert.match(v2ConnectorBody, /timeseriesRowCounts = aggregateTimeseriesRowCounts/);
-  assert.match(v2ConnectorBody, /timeseries_row_counts: timeseriesRowCounts/);
-
-  const v1ConnectorBody = bodyOf("createAqiConnectorManifest");
-  assert.match(v1ConnectorBody, /stripTimeseriesCountsFromFileEntries\(args\.fileEntries\)/);
-  assert.match(v1ConnectorBody, /timeseries_row_counts: timeseriesRowCounts/);
-});
-
-test("local backfill wrapper adds targeted v2 AQI timeseries-count repair flags only when requested", () => {
-  assert.match(wrapperSource, /UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS:-false/);
-  assert.match(wrapperSource, /UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS:-false/);
-  assert.match(wrapperSource, /--history-version v2/);
-  assert.match(wrapperSource, /--targeted/);
-  assert.match(wrapperSource, /--domain aqilevels/);
-  assert.match(wrapperSource, /--from-day "\$\{REQUESTED_FROM_DAY_UTC\}"/);
-  assert.match(wrapperSource, /--to-day "\$\{REQUESTED_TO_DAY_UTC\}"/);
-  assert.match(wrapperSource, /--compute-missing-timeseries-counts/);
-  assert.match(wrapperSource, /--strict-missing-timeseries-counts/);
-  assert.match(wrapperSource, /--connector-id "\$\{index_connector_id\}"/);
 });
