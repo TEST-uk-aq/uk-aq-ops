@@ -416,6 +416,79 @@ test("targeted v2 AQI index warns when non-empty pollutant manifest lacks usable
     assert.match(warnings, /pollutant_code=no2/);
     assert.match(warnings, /source_row_count=24/);
     assert.match(warnings, /--compute-missing-timeseries-counts/);
+    assert.equal(summary.history_version, "v2");
+    assert.equal(summary.index_prefix, "history/_index_v2");
+    assert.equal(summary.timeseries_metadata.index_kind, "timeseries_metadata");
+  } finally {
+    fake.restore();
+  }
+});
+
+test("targeted v2 AQI index update refreshes timeseries metadata from rewritten indexes", async () => {
+  const objects = {
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/manifest.json": {
+      connector_manifests: [
+        {
+          connector_id: 6,
+          manifest_key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/manifest.json",
+        },
+      ],
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/manifest.json": {
+      connector_id: 6,
+      pollutant_manifests: [
+        {
+          pollutant_code: "no2",
+          manifest_key:
+            "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json",
+        },
+      ],
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json": {
+      manifest_hash: "hash-aqi-no2",
+      source_row_count: 24,
+      row_count: 24,
+      timeseries_row_counts: { "1001": 24 },
+      backed_up_at_utc: "2026-06-02T00:00:00.000Z",
+      files: [
+        {
+          key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/part-00000.parquet",
+          row_count: 24,
+          bytes: 2222,
+          min_timeseries_id: 1001,
+          max_timeseries_id: 1001,
+          min_timestamp_hour_utc: "2026-06-01T00:00:00.000Z",
+          max_timestamp_hour_utc: "2026-06-01T23:00:00.000Z",
+        },
+      ],
+    },
+  };
+  const fake = installFakeR2Fetch(objects);
+  try {
+    const summary = await updateR2HistoryIndexesTargeted({
+      env: {
+        CFLARE_R2_ENDPOINT: "https://r2.example.invalid",
+        CFLARE_R2_BUCKET: "test-bucket",
+        CFLARE_R2_ACCESS_KEY_ID: "key",
+        CFLARE_R2_SECRET_ACCESS_KEY: "secret",
+      },
+      historyVersion: "v2",
+      domains: ["aqilevels"],
+      fromDayUtc: "2026-06-01",
+      toDayUtc: "2026-06-01",
+      connectorId: 6,
+      generatedAt: "2026-06-03T00:00:00.000Z",
+    });
+
+    assert.equal(summary.timeseries_metadata.timeseries_count, 1);
+    assert.equal(summary.timeseries_metadata.metadata_object_count, 1);
+    assert.equal(summary.timeseries_metadata.aqilevels.actual_index_manifest_count, 1);
+    const metadataRaw = fake.puts.get("history/_index_v2/timeseries/timeseries_id=1001.json");
+    assert.ok(metadataRaw, "targeted v2 update writes the timeseries metadata object");
+    const metadata = JSON.parse(metadataRaw);
+    assert.equal(metadata.aqi_coverage.row_count, 24);
+    assert.equal(metadata.aqi_coverage.first_timestamp_hour_utc, "2026-06-01T00:00:00.000Z");
+    assert.equal(metadata.aqi_coverage.last_timestamp_hour_utc, "2026-06-01T23:00:00.000Z");
   } finally {
     fake.restore();
   }
@@ -704,6 +777,12 @@ function installFakeR2Fetch(objectsByKey) {
     const method = String(init.method || "GET").toUpperCase();
     const key = keyFromUrl(String(url));
     if (method === "GET") {
+      if (puts.has(key)) {
+        return new Response(puts.get(key), {
+          status: 200,
+          headers: { etag: `"put-${key.length.toString(16)}"` },
+        });
+      }
       if (!Object.prototype.hasOwnProperty.call(objectsByKey, key)) {
         return new Response("not found", { status: 404 });
       }

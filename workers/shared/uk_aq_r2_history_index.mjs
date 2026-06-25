@@ -3952,11 +3952,13 @@ export async function updateR2HistoryIndexesTargeted({
     throw new Error("No supported domains requested for targeted R2 history index update");
   }
 
+  const normalizedHistoryVersion = String(historyVersion || "v1").trim().toLowerCase();
   const results = [];
   let observationsTimeseries = null;
   let aqilevelsTimeseries = null;
+  let timeseriesMetadata = null;
   for (const domain of normalizedDomains) {
-    if (historyVersion === "v2") {
+    if (normalizedHistoryVersion === "v2") {
       const dataPrefix = domain === "observations"
         ? config.observations_prefix_v2
         : config.aqilevels_hourly_data_prefix_v2;
@@ -4032,21 +4034,55 @@ export async function updateR2HistoryIndexesTargeted({
     }
   }
 
+  if (normalizedHistoryVersion === "v2") {
+    timeseriesMetadata = await rebuildR2HistoryV2TimeseriesMetadataIndexes({
+      r2: config.r2,
+      bucketName: config.r2.bucket,
+      indexPrefix: config.index_prefix_v2,
+      observationsDataPrefix: config.observations_prefix_v2,
+      aqilevelsHourlyDataPrefix: config.aqilevels_hourly_data_prefix_v2,
+      observationsTimeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
+      aqilevelsHourlyDataTimeseriesIndexPrefix:
+        config.aqilevels_hourly_data_timeseries_index_prefix_v2,
+      timeseriesMetadataIndexPrefix: config.timeseries_metadata_index_prefix_v2,
+      generatedAt,
+      fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
+    });
+  }
+
+  const responseIndexPrefix = normalizedHistoryVersion === "v2"
+    ? config.index_prefix_v2
+    : config.index_prefix;
+  const responseObservationsTimeseriesIndexPrefix = normalizedHistoryVersion === "v2"
+    ? config.observations_timeseries_index_prefix_v2
+    : config.observations_timeseries_index_prefix;
+  const responseAqilevelsTimeseriesIndexPrefix = normalizedHistoryVersion === "v2"
+    ? config.aqilevels_hourly_data_timeseries_index_prefix_v2
+    : config.aqilevels_timeseries_index_prefix;
+  const responseObservationsPrefix = normalizedHistoryVersion === "v2"
+    ? config.observations_prefix_v2
+    : config.observations_prefix;
+  const responseAqilevelsPrefix = normalizedHistoryVersion === "v2"
+    ? config.aqilevels_hourly_data_prefix_v2
+    : config.aqilevels_prefix;
+
   return {
     mode: "targeted",
+    history_version: normalizedHistoryVersion,
     generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
     bucket: config.r2.bucket,
-    index_prefix: config.index_prefix,
-    observations_timeseries_index_prefix: config.observations_timeseries_index_prefix,
-    aqilevels_timeseries_index_prefix: config.aqilevels_timeseries_index_prefix,
-    observations_prefix: config.observations_prefix,
-    aqilevels_prefix: config.aqilevels_prefix,
+    index_prefix: responseIndexPrefix,
+    observations_timeseries_index_prefix: responseObservationsTimeseriesIndexPrefix,
+    aqilevels_timeseries_index_prefix: responseAqilevelsTimeseriesIndexPrefix,
+    observations_prefix: responseObservationsPrefix,
+    aqilevels_prefix: responseAqilevelsPrefix,
     from_day_utc: parseIsoDay(fromDayUtc),
     to_day_utc: parseIsoDay(toDayUtc),
     connector_id: connectorId == null ? null : parsePositiveId(connectorId),
     results,
     observations_timeseries: observationsTimeseries,
     aqilevels_timeseries: aqilevelsTimeseries,
+    timeseries_metadata: timeseriesMetadata,
   };
 }
 

@@ -27,7 +27,7 @@ Optional env vars:
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
   UK_AQ_BACKFILL_OUTPUT_SCOPE               default|observations_only|aqilevels_only (default: default)
   UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX   default: true (set false to skip the final full R2 history index rebuild)
-  UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS default: false (targeted v2 AQI index repair with --compute-missing-timeseries-counts)
+  UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS default: false (targeted v2 AQI index repair with --compute-missing-timeseries-counts; refreshes v2 timeseries metadata)
   UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS default: false (fail index rebuild if non-empty v2 AQI manifests lack usable counts)
   UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_ENV_NAME/uk-aq-backfill-local-logs
   UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true
@@ -385,6 +385,7 @@ OUTPUT_SCOPE_RAW="$(trim "${UK_AQ_BACKFILL_OUTPUT_SCOPE:-default}")"
 REBUILD_R2_HISTORY_INDEX_RAW="$(trim "${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX:-true}")"
 REPAIR_MISSING_TIMESERIES_COUNTS_RAW="$(trim "${UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS:-false}")"
 INDEX_STRICT_MISSING_TIMESERIES_COUNTS_RAW="$(trim "${UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS:-false}")"
+INDEX_HISTORY_VERSION_RAW="$(trim "${UK_AQ_R2_HISTORY_VERSION:-}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
@@ -450,6 +451,18 @@ fi
 if ! INDEX_STRICT_MISSING_TIMESERIES_COUNTS="$(parse_bool "${INDEX_STRICT_MISSING_TIMESERIES_COUNTS_RAW}")"; then
   echo "Invalid UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS: ${INDEX_STRICT_MISSING_TIMESERIES_COUNTS_RAW}" >&2
   exit 2
+fi
+
+INDEX_HISTORY_VERSION=""
+if [[ -n "${INDEX_HISTORY_VERSION_RAW}" ]]; then
+  INDEX_HISTORY_VERSION="$(printf '%s' "${INDEX_HISTORY_VERSION_RAW}" | tr '[:upper:]' '[:lower:]')"
+  case "${INDEX_HISTORY_VERSION}" in
+    v1|v2) ;;
+    *)
+      echo "Invalid UK_AQ_R2_HISTORY_VERSION for final index rebuild: ${INDEX_HISTORY_VERSION_RAW}" >&2
+      exit 2
+      ;;
+  esac
 fi
 
 if ! validate_day_utc "${FROM_DAY_UTC}"; then
@@ -600,6 +613,8 @@ if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MOD
     elif [[ -n "$(trim "${UK_AQ_BACKFILL_CONNECTOR_IDS:-}")" ]]; then
       index_connector_scope_note="Info: multiple or non-integer connector ids supplied; final repair rebuild will use the requested date window without --connector-id."
     fi
+  elif [[ -n "${INDEX_HISTORY_VERSION}" ]]; then
+    index_cmd+=(--history-version "${INDEX_HISTORY_VERSION}")
   fi
   if [[ "${INDEX_STRICT_MISSING_TIMESERIES_COUNTS}" == "true" ]]; then
     index_cmd+=(--strict-missing-timeseries-counts)

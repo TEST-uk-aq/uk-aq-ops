@@ -83,6 +83,7 @@ test("AQI writer carries part timeseries counts into v1 and v2 manifest builders
 test("local backfill wrapper adds targeted v2 AQI timeseries-count repair flags only when requested", () => {
   assert.match(wrapperSource, /UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS:-false/);
   assert.match(wrapperSource, /UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS:-false/);
+  assert.match(wrapperSource, /refreshes v2 timeseries metadata/);
   assert.match(wrapperSource, /--history-version v2/);
   assert.match(wrapperSource, /--targeted/);
   assert.match(wrapperSource, /--domain aqilevels/);
@@ -91,4 +92,10 @@ test("local backfill wrapper adds targeted v2 AQI timeseries-count repair flags 
   assert.match(wrapperSource, /--compute-missing-timeseries-counts/);
   assert.match(wrapperSource, /--strict-missing-timeseries-counts/);
   assert.match(wrapperSource, /--connector-id "\$\{index_connector_id\}"/);
+});
+
+test("local backfill wrapper passes active history version to normal final index rebuild when set", () => {
+  assert.match(wrapperSource, /INDEX_HISTORY_VERSION_RAW="\$\(trim "\$\{UK_AQ_R2_HISTORY_VERSION:-\}"\)"/);
+  assert.match(wrapperSource, /Invalid UK_AQ_R2_HISTORY_VERSION for final index rebuild/);
+  assert.match(wrapperSource, /index_cmd\+=\(--history-version "\$\{INDEX_HISTORY_VERSION\}"\)/);
 });
