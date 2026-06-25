@@ -59,12 +59,6 @@
   - Existing spacing control still applies via `UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS`.
   - `UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX` defaults to `true`; set it to `false`
     to skip the final full R2 history index rebuild after a successful run.
-  - `UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS` defaults to `false`; set
-    it to `true` to make the final index step run a targeted v2 AQI repair with
-    `--compute-missing-timeseries-counts` for the requested day window.
-  - `UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS` defaults to
-    `false`; set it to `true` to fail the final index step when non-empty v2
-    AQI manifests still lack usable `timeseries_row_counts`.
   - Full behavior and merge-mode details are documented in:
     - [`uk-aq-backfill-local.md`](uk-aq-backfill-local.md)
 
@@ -112,14 +106,8 @@ system doc.
   - Supports targeted observations rebuilds via:
     - `--target YYYY-MM-DD:connector_id` (repeatable)
     - `--targets-csv <path>` where CSV includes `day_utc,connector_id`.
-  - `--compute-missing-timeseries-counts` can patch missing source-manifest
-    `timeseries_row_counts` from parquet before writing index manifests. For
-    v2 AQI hourly data this repairs non-empty pollutant manifests where the map
-    is missing.
-  - `--strict-missing-timeseries-counts` fails v2 AQI index builds if a
-    non-empty pollutant manifest lacks usable `timeseries_row_counts`; without
-    strict mode the condition is reported in warnings instead of silently
-    indexing `null`.
+  - `--compute-missing-timeseries-counts` can patch missing connector-manifest
+    `timeseries_row_counts` from parquet before writing index manifests.
 - `scripts/backup_r2/uk_aq_report_missing_timeseries_counts_local.mjs`
   - Scans local Dropbox R2 mirror files for observation `(day_utc, connector_id)`
     units where `timeseries_row_counts` are missing/invalid in connector or

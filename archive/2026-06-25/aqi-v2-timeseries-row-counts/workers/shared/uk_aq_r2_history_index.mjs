@@ -145,8 +145,6 @@ const AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
 const HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION = 3;
 const HISTORY_V2_TIMESERIES_METADATA_SCHEMA_VERSION = 1;
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
-const MISSING_TIMESERIES_COUNTS_PREFIX =
-  "Missing usable timeseries_row_counts in v2 AQI pollutant manifest";
 
 function defaultEnv() {
   if (typeof process !== "undefined" && process && process.env) {
@@ -176,16 +174,6 @@ function parseNonNegativeInt(raw) {
     return null;
   }
   return Math.trunc(value);
-}
-
-function parseBoolean(raw, fallback = false) {
-  if (raw === undefined || raw === null || String(raw).trim() === "") {
-    return fallback;
-  }
-  const value = String(raw).trim().toLowerCase();
-  if (["1", "true", "yes", "y", "on"].includes(value)) return true;
-  if (["0", "false", "no", "n", "off"].includes(value)) return false;
-  return fallback;
 }
 
 function parsePositiveId(raw) {
@@ -365,10 +353,6 @@ export function resolveR2HistoryIndexConfig(env = defaultEnv()) {
       DEFAULT_MAX_KEYS,
       100,
       1000,
-    ),
-    strict_missing_timeseries_counts: parseBoolean(
-      env.UK_AQ_R2_HISTORY_INDEX_STRICT_MISSING_TIMESERIES_COUNTS,
-      false,
     ),
   };
 }
@@ -821,54 +805,6 @@ function aggregateTimeseriesRowCountsFromFiles(files) {
     }
   }
   return sawAny ? sortTimeseriesRowCounts(out) : null;
-}
-
-function missingTimeseriesCountsMessage({
-  domain,
-  manifestKey,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-  sourceRowCount,
-}) {
-  const normalizedDomain = String(domain || "").trim().toLowerCase();
-  const rows = parseNonNegativeInt(sourceRowCount) ?? 0;
-  if (normalizedDomain !== "aqilevels" || rows <= 0) return null;
-  return [
-    MISSING_TIMESERIES_COUNTS_PREFIX,
-    `manifest_key=${String(manifestKey || "").trim() || "unknown"}`,
-    `day_utc=${String(dayUtc || "").trim() || "unknown"}`,
-    `connector_id=${String(connectorId ?? "unknown")}`,
-    `pollutant_code=${String(pollutantCode || "").trim() || "unknown"}`,
-    `source_row_count=${rows}`,
-    "rerun with --compute-missing-timeseries-counts to repair the source manifest before indexing",
-  ].join("; ");
-}
-
-function handleMissingTimeseriesCounts({
-  payload,
-  domain,
-  manifestKey,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-  warnings,
-  strictMissingTimeseriesCounts,
-}) {
-  if (payload?.timeseries_row_counts) return;
-  const message = missingTimeseriesCountsMessage({
-    domain,
-    manifestKey,
-    dayUtc,
-    connectorId,
-    pollutantCode,
-    sourceRowCount: payload?.source_row_count,
-  });
-  if (!message) return;
-  if (strictMissingTimeseriesCounts) {
-    throw new Error(message);
-  }
-  warnings.push(message);
 }
 
 
@@ -2955,7 +2891,6 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   maxKeys = DEFAULT_MAX_KEYS,
   computeMissingTimeseriesCounts = false,
-  strictMissingTimeseriesCounts = false,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
   if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
@@ -3060,16 +2995,6 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
                   pollutantManifestKey: pollutantTarget.manifest_key,
                   pollutantManifest: pollutantManifestObject,
                 });
-                handleMissingTimeseriesCounts({
-                  payload,
-                  domain: normalizedDomain,
-                  manifestKey: pollutantTarget.manifest_key,
-                  dayUtc,
-                  connectorId: connectorTarget.connector_id,
-                  pollutantCode: pollutantTarget.pollutant_code,
-                  warnings,
-                  strictMissingTimeseriesCounts,
-                });
                 const pollutantIndexKey = normalizedDomain === "observations"
                   ? buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
                     normalizedTimeseriesPrefix,
@@ -3102,9 +3027,6 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
                 };
               } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
-                if (strictMissingTimeseriesCounts && message.includes(MISSING_TIMESERIES_COUNTS_PREFIX)) {
-                  throw error;
-                }
                 warnings.push(
                   `Skipped ${normalizedDomain} v2 pollutant timeseries index day=${dayUtc} connector=${connectorTarget.connector_id} pollutant=${pollutantTarget.pollutant_code}: ${message}`,
                 );
@@ -3213,7 +3135,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   generatedAt = new Date().toISOString(),
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   computeMissingTimeseriesCounts = false,
-  strictMissingTimeseriesCounts = false,
   fromDayUtc,
   toDayUtc,
   connectorId = null,
@@ -3313,8 +3234,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                 r2,
                 pollutantTarget.manifest_key,
               );
-              const shouldWrite = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
-              if (computeMissingTimeseriesCounts && shouldWrite) {
+              if (computeMissingTimeseriesCounts) {
                 pollutantManifestObject = await maybePatchHistoryV2PollutantManifestWithCounts({
                   r2,
                   manifestKey: pollutantTarget.manifest_key,
@@ -3338,18 +3258,8 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                 pollutantManifestKey: pollutantTarget.manifest_key,
                 pollutantManifest: pollutantManifestObject,
               });
-              if (shouldWrite) {
-                handleMissingTimeseriesCounts({
-                  payload,
-                  domain: normalizedDomain,
-                  manifestKey: pollutantTarget.manifest_key,
-                  dayUtc,
-                  connectorId: connectorTarget.connector_id,
-                  pollutantCode: pollutantTarget.pollutant_code,
-                  warnings,
-                  strictMissingTimeseriesCounts,
-                });
-              }
+
+              const shouldWrite = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
               let putSkipped = null;
 
               if (shouldWrite) {
@@ -3388,9 +3298,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
               };
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
-              if (strictMissingTimeseriesCounts && message.includes(MISSING_TIMESERIES_COUNTS_PREFIX)) {
-                throw error;
-              }
               warnings.push(
                 `Skipped ${normalizedDomain} v2 pollutant timeseries index day=${dayUtc} connector=${connectorTarget.connector_id} pollutant=${pollutantTarget.pollutant_code}: ${message}`,
               );
@@ -3936,7 +3843,6 @@ export async function updateR2HistoryIndexesTargeted({
   generatedAt = new Date().toISOString(),
   fetchConcurrency,
   computeMissingTimeseriesCounts = false,
-  strictMissingTimeseriesCounts,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
@@ -3974,7 +3880,6 @@ export async function updateR2HistoryIndexesTargeted({
         generatedAt,
         fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
         computeMissingTimeseriesCounts,
-        strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
         fromDayUtc,
         toDayUtc,
         connectorId,
@@ -4058,7 +3963,6 @@ export async function rebuildR2HistoryIndexes({
   fetchConcurrency,
   maxKeys,
   computeMissingTimeseriesCounts = false,
-  strictMissingTimeseriesCounts,
   observationsTargets = null,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
@@ -4098,7 +4002,6 @@ export async function rebuildR2HistoryIndexes({
           fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
           maxKeys: maxKeys || config.max_keys,
           computeMissingTimeseriesCounts,
-          strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
         });
         results.push(observationsTimeseries);
       }
@@ -4114,7 +4017,6 @@ export async function rebuildR2HistoryIndexes({
           fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
           maxKeys: maxKeys || config.max_keys,
           computeMissingTimeseriesCounts,
-          strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
         });
         results.push(aqilevelsTimeseries);
       }

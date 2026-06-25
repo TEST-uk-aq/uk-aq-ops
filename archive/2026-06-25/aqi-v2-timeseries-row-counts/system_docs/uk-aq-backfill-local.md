@@ -46,8 +46,6 @@ Primary (preferred) env vars:
 - `UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR` (default `0`, disabled)
 - `UK_AQ_BACKFILL_PAUSE_SECONDS` (legacy alias for run interval)
 - `UK_AQ_BACKFILL_OUTPUT_SCOPE` (default `default`)
-- `UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS` (default `false`)
-- `UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS` (default `false`)
 
 ## Metadata source rules
 
@@ -233,35 +231,14 @@ Reports are written under:
 ~/uk-aq-work/aqilevels-rebuild/reports/local_aqilevels_rebuild_TEST_<timestamp>.json
 ```
 
-## Manual index-count repair flags
+## Manual index-count repair flag
 
-`timeseries_row_counts` is the per-timeseries row-count map for a manifest
-partition. For v2 AQI hourly pollutant manifests it counts AQI hourly rows by
-`timeseries_id`, for example `{ "123": 24, "124": 18 }`.
+The R2 history index rebuilder keeps an explicit manual recovery switch for
+legacy manifests missing `timeseries_row_counts`:
 
-Missing `timeseries_row_counts` on a non-empty v2 AQI source manifest is a
-manifest integrity problem, not evidence that AQI data is absent. The R2 history
-index rebuilder warns by default and includes the affected manifest key, day,
-connector, pollutant, and row count in its JSON summary. Strict mode turns the
-same condition into a failed index build:
+- `node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --compute-missing-timeseries-counts`
 
-- `node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --history-version v2 --targeted --domain aqilevels --from-day <day> --to-day <day> --connector-id <id> --strict-missing-timeseries-counts`
-
-The explicit repair switch reads the referenced parquet files, computes the
-missing map, patches the source manifest with a new `manifest_hash`, and builds
-the index from the patched manifest:
-
-- `node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --history-version v2 --targeted --domain aqilevels --from-day <day> --to-day <day> --connector-id <id> --compute-missing-timeseries-counts`
-
-For local backfill runs, set
-`UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS=true` to have the final index
-step run the targeted v2 AQI repair over the requested date window. If
-`UK_AQ_BACKFILL_CONNECTOR_IDS` contains exactly one integer, the wrapper also
-passes `--connector-id`; otherwise it stays date-targeted. Set
-`UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS=true` to pass the strict
-guard through the wrapper.
-
-These switches are optional and not enabled by default.
+This is optional and not enabled by default.
 
 ## Key env vars for integrity-triggered runs
 

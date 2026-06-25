@@ -783,19 +783,6 @@ The index is built from v2 data manifests only:
 
 No debug AQI v2 indexes are built under `_index_v2`.
 
-For v2 AQI hourly data, source pollutant manifests must include top-level
-`timeseries_row_counts`: a JSON object mapping each valid positive
-`timeseries_id` to the number of AQI hourly rows in that
-day/connector/pollutant partition. New AQI v2 writer paths emit this map on the
-pollutant and connector manifests while keeping duplicate per-file maps out of
-final `files[]` entries.
-
-If a non-empty v2 AQI pollutant manifest is missing usable
-`timeseries_row_counts`, treat it as a manifest integrity issue. The index
-builder warns by default, can fail with `--strict-missing-timeseries-counts`,
-and can repair older affected manifests with
-`--compute-missing-timeseries-counts`.
-
 The observations history API Worker reads this v2 layout only when
 `UK_AQ_R2_HISTORY_READ_VERSION=v2`. In that mode, requests must include a
 `pollutant` query parameter (`pm25`, `pm10`, or `no2`) so the Worker can read

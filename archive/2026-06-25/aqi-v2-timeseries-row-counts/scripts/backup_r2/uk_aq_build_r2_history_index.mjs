@@ -21,9 +21,6 @@ function usage() {
     "                                          compute per-timeseries counts, patch the",
     "                                          source manifest (new manifest_hash), and",
     "                                          build indexes from the patched manifest.",
-    "  --strict-missing-timeseries-counts      Fail v2 AQI index builds when a non-empty",
-    "                                          source pollutant manifest has no usable",
-    "                                          timeseries_row_counts.",
     "  --targeted                              Run a narrow latest-index update for a known",
     "                                          day range instead of a full history rebuild.",
     "  --from-day YYYY-MM-DD                   Required with --targeted.",
@@ -64,8 +61,6 @@ function usage() {
     "                                         default: history/_index_v2/timeseries",
     "  UK_AQ_R2_HISTORY_INDEX_FETCH_CONCURRENCY",
     "  UK_AQ_R2_HISTORY_INDEX_MAX_KEYS",
-    "  UK_AQ_R2_HISTORY_INDEX_STRICT_MISSING_TIMESERIES_COUNTS",
-    "                                         default: false",
   ].join("\n"));
 }
 
@@ -87,10 +82,6 @@ function parseArgs(argv) {
     fetchConcurrency: undefined,
     maxKeys: undefined,
     computeMissingTimeseriesCounts: false,
-    strictMissingTimeseriesCounts: parseBoolEnv(
-      process.env.UK_AQ_R2_HISTORY_INDEX_STRICT_MISSING_TIMESERIES_COUNTS,
-      false,
-    ),
     targeted: false,
     fromDayUtc: undefined,
     toDayUtc: undefined,
@@ -158,10 +149,6 @@ function parseArgs(argv) {
     }
     if (arg === "--compute-missing-timeseries-counts") {
       args.computeMissingTimeseriesCounts = true;
-      continue;
-    }
-    if (arg === "--strict-missing-timeseries-counts") {
-      args.strictMissingTimeseriesCounts = true;
       continue;
     }
     if (arg.startsWith("--kind=")) {
@@ -247,16 +234,6 @@ function parseArgs(argv) {
   args.historyVersion = parseHistoryVersion(args.historyVersion);
 
   return args;
-}
-
-function parseBoolEnv(raw, fallback = false) {
-  if (raw === undefined || raw === null || String(raw).trim() === "") {
-    return fallback;
-  }
-  const value = String(raw).trim().toLowerCase();
-  if (["1", "true", "yes", "y", "on"].includes(value)) return true;
-  if (["0", "false", "no", "n", "off"].includes(value)) return false;
-  return fallback;
 }
 
 function parseHistoryVersion(raw) {
@@ -377,7 +354,6 @@ async function main() {
         connectorId: args.connectorId,
         fetchConcurrency: args.fetchConcurrency,
         computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
-        strictMissingTimeseriesCounts: args.strictMissingTimeseriesCounts,
       })
     : await rebuildR2HistoryIndexes({
         env: process.env,
@@ -386,7 +362,6 @@ async function main() {
         fetchConcurrency: args.fetchConcurrency,
         maxKeys: args.maxKeys,
         computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
-        strictMissingTimeseriesCounts: args.strictMissingTimeseriesCounts,
         observationsTargets: args.observationsTargets.length ? args.observationsTargets : null,
       });
   process.stdout.write(`${JSON.stringify({ ok: true, ...summary }, null, 2)}\n`);

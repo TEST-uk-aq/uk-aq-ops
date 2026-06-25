@@ -27,8 +27,6 @@ Optional env vars:
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
   UK_AQ_BACKFILL_OUTPUT_SCOPE               default|observations_only|aqilevels_only (default: default)
   UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX   default: true (set false to skip the final full R2 history index rebuild)
-  UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS default: false (targeted v2 AQI index repair with --compute-missing-timeseries-counts)
-  UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS default: false (fail index rebuild if non-empty v2 AQI manifests lack usable counts)
   UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_ENV_NAME/uk-aq-backfill-local-logs
   UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true
   UK_AQ_BACKFILL_RUN_INTERVAL_SECONDS       default: 0
@@ -272,17 +270,6 @@ resolve_node_bin() {
   return 1
 }
 
-single_connector_id_filter() {
-  local raw
-  raw="$(trim "${1:-}")"
-  raw="${raw//[[:space:]]/}"
-  if [[ "${raw}" =~ ^[0-9]+$ ]]; then
-    printf '%s' "${raw}"
-    return 0
-  fi
-  printf ''
-}
-
 prune_recent_run_starts() {
   local now_epoch="${1}"
   local cutoff=$((now_epoch - 3599))
@@ -383,8 +370,6 @@ MAX_RUNS_PER_MINUTE_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_MINUTE:-0}")"
 MAX_RUNS_PER_HOUR_RAW="$(trim "${UK_AQ_BACKFILL_MAX_RUNS_PER_HOUR:-0}")"
 OUTPUT_SCOPE_RAW="$(trim "${UK_AQ_BACKFILL_OUTPUT_SCOPE:-default}")"
 REBUILD_R2_HISTORY_INDEX_RAW="$(trim "${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX:-true}")"
-REPAIR_MISSING_TIMESERIES_COUNTS_RAW="$(trim "${UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS:-false}")"
-INDEX_STRICT_MISSING_TIMESERIES_COUNTS_RAW="$(trim "${UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS:-false}")"
 
 case "${RUN_MODE}" in
   local_to_aqilevels|obs_aqi_to_r2|source_to_r2|r2_history_obs_to_aqilevels) ;;
@@ -439,16 +424,6 @@ fi
 
 if ! REBUILD_R2_HISTORY_INDEX="$(parse_bool "${REBUILD_R2_HISTORY_INDEX_RAW}")"; then
   echo "Invalid UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX: ${REBUILD_R2_HISTORY_INDEX_RAW}" >&2
-  exit 2
-fi
-
-if ! REPAIR_MISSING_TIMESERIES_COUNTS="$(parse_bool "${REPAIR_MISSING_TIMESERIES_COUNTS_RAW}")"; then
-  echo "Invalid UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS: ${REPAIR_MISSING_TIMESERIES_COUNTS_RAW}" >&2
-  exit 2
-fi
-
-if ! INDEX_STRICT_MISSING_TIMESERIES_COUNTS="$(parse_bool "${INDEX_STRICT_MISSING_TIMESERIES_COUNTS_RAW}")"; then
-  echo "Invalid UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS: ${INDEX_STRICT_MISSING_TIMESERIES_COUNTS_RAW}" >&2
   exit 2
 fi
 
@@ -530,8 +505,6 @@ while IFS=' ' read -r month_from month_to; do
   echo "Force replace: ${FORCE_REPLACE}"
   echo "Output scope: ${OUTPUT_SCOPE}"
   echo "Full R2 history index rebuild after success: ${REBUILD_R2_HISTORY_INDEX}"
-  echo "Repair missing timeseries counts in final index rebuild: ${REPAIR_MISSING_TIMESERIES_COUNTS}"
-  echo "Strict missing timeseries counts in final index rebuild: ${INDEX_STRICT_MISSING_TIMESERIES_COUNTS}"
   echo "Runner: ${RUN_JOB_PATH}"
   echo "Deno bin: ${DENO_BIN}"
   echo "Node bin: ${NODE_BIN}"
@@ -583,41 +556,14 @@ if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MOD
   index_log_file="${LOG_DIR}/r2_history_index_${RUN_STARTED_AT_UTC}_${LOG_CONNECTOR_SEGMENT}_${REQUESTED_FROM_DAY_UTC}_to_${REQUESTED_TO_DAY_UTC}.log"
   index_rebuild_max_attempts=3
   index_rebuild_retry_sleep_seconds=5
-  index_connector_id="$(single_connector_id_filter "${UK_AQ_BACKFILL_CONNECTOR_IDS:-}")"
-  index_connector_scope_note=""
-  index_cmd=("${NODE_BIN}" scripts/backup_r2/uk_aq_build_r2_history_index.mjs)
-  if [[ "${REPAIR_MISSING_TIMESERIES_COUNTS}" == "true" ]]; then
-    index_cmd+=(
-      --history-version v2
-      --targeted
-      --domain aqilevels
-      --from-day "${REQUESTED_FROM_DAY_UTC}"
-      --to-day "${REQUESTED_TO_DAY_UTC}"
-      --compute-missing-timeseries-counts
-    )
-    if [[ -n "${index_connector_id}" ]]; then
-      index_cmd+=(--connector-id "${index_connector_id}")
-    elif [[ -n "$(trim "${UK_AQ_BACKFILL_CONNECTOR_IDS:-}")" ]]; then
-      index_connector_scope_note="Info: multiple or non-integer connector ids supplied; final repair rebuild will use the requested date window without --connector-id."
-    fi
-  fi
-  if [[ "${INDEX_STRICT_MISSING_TIMESERIES_COUNTS}" == "true" ]]; then
-    index_cmd+=(--strict-missing-timeseries-counts)
-  fi
   echo ""
   echo "=== Rebuild R2 History Index ==="
   echo "Log: ${index_log_file}"
   : > "${index_log_file}"
-  if [[ -n "${index_connector_scope_note}" ]]; then
-    echo "${index_connector_scope_note}" | tee -a "${index_log_file}"
-  fi
-  printf 'Command:' | tee -a "${index_log_file}"
-  printf ' %q' "${index_cmd[@]}" | tee -a "${index_log_file}"
-  printf '\n' | tee -a "${index_log_file}"
   index_rebuild_ok="false"
   for ((index_rebuild_attempt=1; index_rebuild_attempt<=index_rebuild_max_attempts; index_rebuild_attempt++)); do
     echo "R2 history index rebuild attempt ${index_rebuild_attempt}/${index_rebuild_max_attempts}" | tee -a "${index_log_file}"
-    if "${index_cmd[@]}" 2>&1 | tee -a "${index_log_file}"; then
+    if "${NODE_BIN}" scripts/backup_r2/uk_aq_build_r2_history_index.mjs 2>&1 | tee -a "${index_log_file}"; then
       index_rebuild_ok="true"
       break
     fi
