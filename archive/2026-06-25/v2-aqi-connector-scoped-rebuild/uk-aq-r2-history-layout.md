@@ -301,11 +301,6 @@ history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant
 history/v2/aqilevels/hourly/debug/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/part-00000.parquet
 ```
 
-Because `connector_id` and `pollutant_code` are part of the v2 AQI path and
-timeseries-index path, connector-filtered `r2_history_obs_to_aqilevels` repairs
-may rebuild only the requested connector/day partitions. The v1 AQI writer keeps
-the older full-day manifest guard.
-
 R2 history v2 AQI hourly `data` columns:
 
 ```text

@@ -99,21 +99,3 @@ test("local backfill wrapper passes active history version to normal final index
   assert.match(wrapperSource, /Invalid UK_AQ_R2_HISTORY_VERSION for final index rebuild/);
   assert.match(wrapperSource, /index_cmd\+=\(--history-version "\$\{INDEX_HISTORY_VERSION\}"\)/);
 });
-
-test("v2 AQI rebuild allows connector-scoped refresh without full-day non-target guard", () => {
-  const body = bodyOf("runR2HistoryObsToAqilevels");
-  assert.match(
-    body,
-    /const allowConnectorScopedV2AqiRefresh = HISTORY_R2_WRITE_VERSION === "v2" &&\s+hasConnectorFilter/,
-  );
-  assert.match(
-    body,
-    /if \(hasConnectorFilter && !allowConnectorScopedV2AqiRefresh\) \{[\s\S]*loadExistingAqiConnectorManifest/,
-  );
-  assert.match(
-    body,
-    /const unresolvedNonTargetAfterRefresh =\s+hasConnectorFilter && !allowConnectorScopedV2AqiRefresh\s+\? nonTargetConnectors\.filter/,
-  );
-  assert.match(body, /r2_history_obs_to_aqilevels_day_skipped_connector_filter_incomplete/);
-  assert.match(body, /connector_scoped_v2_aqi_refresh: allowConnectorScopedV2AqiRefresh/);
-});

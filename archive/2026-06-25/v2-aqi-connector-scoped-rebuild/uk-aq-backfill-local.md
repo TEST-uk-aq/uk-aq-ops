@@ -166,10 +166,6 @@ skip-on-no-data behaviour; extend per-adapter as needed.
     per-timeseries counts for cross-check parity.
 - `aqilevels_only` (valid only with `r2_history_obs_to_aqilevels`)
   - Rebuilds AQI history outputs only from committed R2 observation history.
-  - For R2 history v2 with `UK_AQ_BACKFILL_CONNECTOR_IDS` set, rebuilds only
-    the requested connector/day AQI partitions and does not require unrelated
-    observation connectors for that day to already have AQI connector manifests.
-    v1 keeps the full-day connector-manifest guard.
   - Writes normalized hourly AQI parquet under `history/v1/aqilevels/hourly/...`
     using `history_schema_name=aqilevels_hourly`,
     `history_schema_version=1`, `grain=hourly`, and
@@ -293,10 +289,6 @@ AQI rebuild pass uses:
 - `UK_AQ_BACKFILL_CONNECTOR_IDS=<connector_id>`
 - `UK_AQ_BACKFILL_FROM_DAY_UTC=<day>`
 - `UK_AQ_BACKFILL_TO_DAY_UTC=<day>`
-
-When the integrity wrapper runs this AQI pass for history v2, the worker allows
-the connector-scoped write and the wrapper follows with a targeted v2 AQI
-timeseries index update plus v2 timeseries metadata refresh.
 
 Recommended supporting vars in the backfill env file:
 

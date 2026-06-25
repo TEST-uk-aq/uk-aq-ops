@@ -283,9 +283,6 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
   - Enforces strict mode/output scope mapping:
     - `observs-only` -> `UK_AQ_BACKFILL_RUN_MODE=source_to_r2` + `UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only`
     - `aqi-only` -> `UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels` + `UK_AQ_BACKFILL_OUTPUT_SCOPE=aqilevels_only`
-  - v2 AQI-only repairs are connector-scoped when `--connector-id` is set; the
-    backfill worker rebuilds the requested connector/day AQI partitions without
-    requiring unrelated connectors on that day to have AQI manifests.
   - Forces `UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX=false` so integrity repairs do
     not trigger a full-history index rebuild.
   - After a successful non-dry-run repair, runs one targeted R2 history index update
