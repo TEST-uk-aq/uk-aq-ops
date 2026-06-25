@@ -2883,8 +2883,6 @@ async function handleRequest(request, env, ctx) {
       obs_aqidb_source_path: recentFallbackRead.source_path,
       obs_aqidb_row_count: obsAqiDbMergePoints.length,
       obs_aqidb_raw_row_count: recentFallbackRead.points.length,
-      r2_expected_hour_coverage: r2ExpectedCoverage,
-      merged_expected_hour_coverage: mergedExpectedCoverage,
       obs_aqidb_status: hasResolvedObsAqiDbWindow ? recentFallbackRead.status : "not_requested",
       obs_aqidb_error: recentFallbackRead.error,
       historical_window_from_utc: windowStartIso(historicalWindow),
