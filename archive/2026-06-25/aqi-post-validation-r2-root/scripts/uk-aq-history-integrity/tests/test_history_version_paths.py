@@ -51,29 +51,6 @@ class HistoryVersionPathTests(unittest.TestCase):
         self.assertEqual(config.aqilevels_timeseries_index_prefix, "history/_index_v2/aqilevels_hourly_data_timeseries")
         self.assertTrue(config.checks_implemented)
 
-    def test_r2_history_root_explicit_absolute_root_wins(self) -> None:
-        env = {
-            "UK_AQ_R2_HISTORY_DROPBOX_ROOT": "/tmp/explicit-r2-root",
-            "UK_AQ_DROPBOX_ROOT": "CIC-Test",
-            "UK_AQ_R2_HISTORY_DROPBOX_DIR": "R2_history_backup",
-        }
-        self.assertEqual(MODULE.resolve_r2_history_root(env), "/tmp/explicit-r2-root")
-
-    def test_r2_history_root_resolves_dropbox_env_and_history_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            env = {
-                "UK_AQ_DROPBOX_ROOT": "CIC-Test",
-                "UK_AQ_R2_HISTORY_DROPBOX_DIR": "R2_history_backup",
-            }
-            self.assertEqual(
-                MODULE.resolve_r2_history_root(env, local_app_root=Path(tmp)),
-                str(Path(tmp) / "CIC-Test" / "R2_history_backup"),
-            )
-
-    def test_r2_history_root_requires_existing_root_config_to_resolve(self) -> None:
-        env = {"UK_AQ_R2_HISTORY_DROPBOX_DIR": "R2_history_backup"}
-        self.assertEqual(MODULE.resolve_r2_history_root(env), "")
-
     def test_executed_script_resolves_v2_core_preflight_path(self) -> None:
         env = {
             "UK_AQ_R2_HISTORY_DROPBOX_ROOT": "/tmp/R2_history_backup",

@@ -1717,51 +1717,6 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(metrics["aqi_post_rebuild_validation_failed"], 0)
         self.assertEqual(metrics["aqi_rebuild_results"][0]["post_rebuild_validation_gaps"], [])
 
-    def test_v2_aqi_post_rebuild_validation_resolves_dropbox_root_and_dir_without_absolute_root(self) -> None:
-        backup_root = self.root / "dropbox-app" / "CIC-Test" / "R2_history_backup"
-        self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"] = str(backup_root)
-        self._insert_aqi_queue_row(run_id=2701, connector_id=6)
-        self._write_v2_observation_partition(
-            day_utc="2026-06-08",
-            connector_id=6,
-            pollutant_code="pm25",
-            timeseries_row_counts={101: 3},
-        )
-        self._write_v2_aqi_partition(
-            day_utc="2026-06-08",
-            connector_id=6,
-            pollutant_code="pm25",
-            timeseries_row_counts={101: 3},
-        )
-        execution_env = dict(self.env)
-        execution_env.pop("UK_AQ_R2_HISTORY_DROPBOX_ROOT", None)
-        execution_env.pop("UK_AQ_DROPBOX_ROOT", None)
-        execution_env.pop("UK_AQ_R2_HISTORY_DROPBOX_DIR", None)
-        with mock.patch.object(MODULE, "DROPBOX_APP_ROOT", self.root / "dropbox-app"), \
-             mock.patch.dict(os.environ, {
-                 "UK_AQ_R2_HISTORY_DROPBOX_ROOT": "",
-                 "UK_AQ_DROPBOX_ROOT": "CIC-Test",
-                 "UK_AQ_R2_HISTORY_DROPBOX_DIR": "R2_history_backup",
-             }, clear=False), \
-             mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")), \
-             mock.patch.object(MODULE, "run_aqi_rebuild_backfill", return_value={"status": "ok", "log_path": None}):
-            metrics = MODULE.run_aqi_rebuild_queue_execution(
-                self.conn,
-                run_id=2701,
-                env_name="CIC-Test",
-                run_compact="run",
-                env=execution_env,
-                dry_run=False,
-                run_backfill=True,
-                limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
-                log=self.log,
-                history_version="v2",
-            )
-
-        self.assertEqual(metrics["aqi_rebuilds_complete"], 1)
-        self.assertEqual(metrics["aqi_post_rebuild_validation_failed"], 0)
-        self.assertEqual(metrics["aqi_rebuild_results"][0]["post_rebuild_validation_gaps"], [])
-
     def test_v2_aqi_integrity_gap_dry_run_plans_aqi_only_rebuild(self) -> None:
         v2_aqi = {
             "gaps": [{

@@ -12,7 +12,6 @@ from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from contextlib import redirect_stderr
-from unittest import mock
 
 
 MODULE_PATH = (
@@ -170,24 +169,7 @@ class PreflightTests(unittest.TestCase):
             args = make_args(skip_cross_check=False)
             with patched_env(os_env):
                 errors, _, _ = MODULE.collect_preflight_errors(args, env)
-            self.assertTrue(any("R2 history Dropbox root could not be resolved" in err for err in errors))
-
-    def test_r2_root_resolves_from_dropbox_root_and_history_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            env, os_env = self._base_env(root)
-            os_env.pop("UK_AQ_R2_HISTORY_DROPBOX_ROOT", None)
-            os_env["UK_AQ_DROPBOX_ROOT"] = "CIC-Test"
-            os_env["UK_AQ_R2_HISTORY_DROPBOX_DIR"] = "R2_history_backup"
-            backup_root = root / "dropbox-app" / "CIC-Test" / "R2_history_backup"
-            (backup_root / "history" / "v1" / "core").mkdir(parents=True, exist_ok=True)
-            (backup_root / "history" / "v1" / "core" / "manifest.json").write_text("{}", encoding="utf-8")
-            os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(backup_root / "history" / "v1" / "core")
-            args = make_args(skip_cross_check=False)
-            with patched_env(os_env), mock.patch.object(MODULE, "DROPBOX_APP_ROOT", root / "dropbox-app"):
-                errors, _, summary = MODULE.collect_preflight_errors(args, env)
-            self.assertEqual(errors, [])
-            self.assertEqual(summary["paths"]["r2_history_root"], str(backup_root))
+            self.assertTrue(any("UK_AQ_R2_HISTORY_DROPBOX_ROOT is required" in err for err in errors))
 
     def test_missing_r2_root_allowed_when_skip_cross_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -64,7 +64,6 @@ PATH_VARS_FOR_GUARDRAILS = (
     "UK_AQ_HISTORY_INTEGRITY_LOCK_DIR",
     "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH",
     "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
-    "UK_AQ_DROPBOX_ROOT",
     "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT",
     "UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER",
     "UK_AQ_INTEGRITY_BACKFILL_WRAPPER",
@@ -80,11 +79,6 @@ PROFILE_START_WINDOWS_DAYS = {
 }
 
 DEFAULT_INGESTDB_RETENTION_DAYS = 5
-
-DROPBOX_APP_ROOT = Path(
-    "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks",
-)
-DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
 
 DAILY_TASK_HEALTH_TASK_KEY = "ops.history_integrity"
 DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
@@ -792,46 +786,6 @@ def resolve_core_snapshot_prefix(history_version: str, env: Mapping[str, str] | 
     raise ValueError(f"unsupported history version: {history_version!r}")
 
 
-def _clean_dropbox_segment(value: str) -> str:
-    return str(value or "").strip().strip("/").strip()
-
-
-def resolve_r2_history_root(
-    env: Mapping[str, str] | None = None,
-    *,
-    local_app_root: Path | str | None = None,
-) -> str:
-    values = os.environ if env is None else env
-    explicit_root = str(values.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "") or "").strip()
-    if explicit_root:
-        return str(Path(explicit_root).expanduser())
-
-    dropbox_root_raw = str(values.get("UK_AQ_DROPBOX_ROOT", "") or "").strip()
-    if not dropbox_root_raw:
-        return ""
-    history_dir_raw = str(
-        values.get("UK_AQ_R2_HISTORY_DROPBOX_DIR", DEFAULT_R2_HISTORY_DROPBOX_DIR)
-        or DEFAULT_R2_HISTORY_DROPBOX_DIR
-    ).strip()
-    if not history_dir_raw:
-        return ""
-
-    history_dir = Path(history_dir_raw).expanduser()
-    if history_dir.is_absolute():
-        return str(history_dir)
-
-    dropbox_root = Path(dropbox_root_raw).expanduser()
-    if dropbox_root.is_absolute():
-        return str(dropbox_root / _clean_dropbox_segment(history_dir_raw))
-
-    base = Path(local_app_root) if local_app_root is not None else DROPBOX_APP_ROOT
-    return str(
-        base.expanduser()
-        / _clean_dropbox_segment(dropbox_root_raw)
-        / _clean_dropbox_segment(history_dir_raw)
-    )
-
-
 def resolve_core_snapshot_root(
     history_version: str,
     env: Mapping[str, str] | None = None,
@@ -839,7 +793,7 @@ def resolve_core_snapshot_root(
     values = os.environ if env is None else env
     version = str(history_version or "v1").strip().lower()
     core_prefix = resolve_core_snapshot_prefix(version, values)
-    backup_root = resolve_r2_history_root(values)
+    backup_root = str(values.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "") or "").strip()
     if backup_root:
         return str(Path(backup_root) / core_prefix)
 
@@ -2942,8 +2896,6 @@ def _summarize_loaded_backfill_env_keys(loaded: dict[str, str]) -> list[str]:
             "UK_AQ_BACKFILL_OUTPUT_SCOPE",
             "UK_AQ_BACKFILL_RUN_JOB_PATH",
             "INGESTDB_RETENTION_DAYS",
-            "UK_AQ_DROPBOX_ROOT",
-            "UK_AQ_R2_HISTORY_DROPBOX_DIR",
             "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
         )
         if key in loaded
@@ -7523,7 +7475,7 @@ def _read_json_manifest_for_guard(
         return payload, "r2", None
 
     merged_env = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
-    root_raw = resolve_r2_history_root(merged_env)
+    root_raw = str(merged_env.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT") or "").strip()
     if root_raw:
         manifest_path = Path(root_raw) / manifest_key
         if manifest_path.is_file():
@@ -9449,7 +9401,7 @@ def run_aqi_rebuild_queue_execution(
                 or AQI_INTEGRITY_OBS_COVERAGE_REASON in merged_reasons
             )
         ):
-            root_raw = resolve_r2_history_root({**os.environ, **env})
+            root_raw = str(env.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT") or "").strip()
             if root_raw:
                 post_validation_gaps = _v2_aqi_observation_coverage_gaps(
                     root=Path(root_raw),
@@ -10249,10 +10201,10 @@ def collect_preflight_errors(
 
     cross_check_enabled = not args.skip_cross_check
     if cross_check_enabled:
-        r2_root_raw = resolve_r2_history_root(os.environ)
+        r2_root_raw = str(os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "")).strip()
         if not r2_root_raw:
             errors.append(
-                "R2 history Dropbox root could not be resolved; set UK_AQ_R2_HISTORY_DROPBOX_ROOT or UK_AQ_DROPBOX_ROOT plus UK_AQ_R2_HISTORY_DROPBOX_DIR.",
+                "UK_AQ_R2_HISTORY_DROPBOX_ROOT is required while cross-check is enabled.",
             )
         else:
             r2_root = Path(r2_root_raw)
@@ -10465,7 +10417,7 @@ def collect_preflight_errors(
             "snapshot_root": resolve_core_snapshot_root(core_history_version, os.environ),
             "core_history_version": core_history_version,
             "core_prefix": resolve_core_snapshot_prefix(core_history_version, os.environ),
-            "r2_history_root": resolve_r2_history_root(os.environ),
+            "r2_history_root": str(os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT", "")),
             "backfill_wrapper": resolve_integrity_backfill_wrapper(),
             "backfill_env_file": str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")),
         },
@@ -11538,9 +11490,8 @@ def main(argv: list[str]) -> int:
             }
             log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
         elif history_version_mode == "v2":
-            r2_history_root = resolve_r2_history_root(os.environ)
             v2_obs = run_v2_observations_integrity_checks(
-                r2_history_root=r2_history_root,
+                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                 config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
@@ -11551,7 +11502,7 @@ def main(argv: list[str]) -> int:
                 log=log,
             )
             v2_aqi = run_v2_aqilevels_integrity_checks(
-                r2_history_root=r2_history_root,
+                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                 config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
@@ -11577,7 +11528,6 @@ def main(argv: list[str]) -> int:
             v1_config = history_path_configs.get("v1")
             if v1_config is None:
                 raise RuntimeError("v1 history path config is required for v1 cross-check mode")
-            r2_history_root = resolve_r2_history_root(os.environ)
             cross_check_metrics = run_r2_cross_checks(
                 conn=conn,
                 run_id=int(run_id),
@@ -11585,7 +11535,7 @@ def main(argv: list[str]) -> int:
                 source_filter=args.source,
                 from_day=from_day,
                 to_day=to_day,
-                r2_history_root=r2_history_root,
+                r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                 r2_manifest_prefix=v1_config.observations_timeseries_index_prefix,
                 checked_at_utc=fmt_iso(utc_now()),
                 log=log,
@@ -11593,7 +11543,7 @@ def main(argv: list[str]) -> int:
             cross_check_metrics["history_version"] = "v1"
             if history_version_mode == "both":
                 v2_obs = run_v2_observations_integrity_checks(
-                    r2_history_root=r2_history_root,
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                     config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
@@ -11604,7 +11554,7 @@ def main(argv: list[str]) -> int:
                     log=log,
                 )
                 v2_aqi = run_v2_aqilevels_integrity_checks(
-                    r2_history_root=r2_history_root,
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                     config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
@@ -11672,7 +11622,7 @@ def main(argv: list[str]) -> int:
                     conn=conn,
                     run_id=int(run_id),
                     env_name=args.env,
-                    r2_history_root=resolve_r2_history_root(os.environ),
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                     r2_aqilevels_prefix=v1_config_for_legacy_aqi.aqilevels_hourly_data_prefix,
                     dry_run=args.dry_run,
                     run_backfill=args.run_backfill,
@@ -11729,7 +11679,7 @@ def main(argv: list[str]) -> int:
                 post_repair = run_v2_post_repair_integrity_rechecks(
                     conn=conn,
                     env_name=args.env,
-                    r2_history_root=resolve_r2_history_root(os.environ),
+                    r2_history_root=os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT"),
                     config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
