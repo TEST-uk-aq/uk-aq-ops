@@ -11243,8 +11243,6 @@ async function runR2HistoryObsToAqilevels(
   );
   const hasConnectorFilter = Array.isArray(effectiveConnectorIds) &&
     effectiveConnectorIds.length > 0;
-  const allowConnectorScopedV2AqiRefresh = HISTORY_R2_WRITE_VERSION === "v2" &&
-    hasConnectorFilter;
   const processedDays = new Set<string>();
 
   const summary: R2HistoryObsToAqilevelsSummary = {
@@ -11318,7 +11316,7 @@ async function runR2HistoryObsToAqilevels(
       !targetConnectorSet.has(connectorId)
     );
     const unresolvedNonTargetConnectors: number[] = [];
-    if (hasConnectorFilter && !allowConnectorScopedV2AqiRefresh) {
+    if (hasConnectorFilter) {
       for (const connectorId of nonTargetConnectors) {
         const existingManifest = await loadExistingAqiConnectorManifest(
           dayUtc,
@@ -11362,7 +11360,6 @@ async function runR2HistoryObsToAqilevels(
       day_utc: dayUtc,
       observed_connector_ids: observedConnectorIds,
       target_connectors: targetConnectors,
-      connector_scoped_v2_aqi_refresh: allowConnectorScopedV2AqiRefresh,
       force_replace: FORCE_REPLACE,
       dry_run: DRY_RUN,
     });
@@ -11766,8 +11763,7 @@ async function runR2HistoryObsToAqilevels(
     const connectorManifestIds = new Set(
       connectorManifests.map((manifest) => Number(manifest.connector_id)),
     );
-    const unresolvedNonTargetAfterRefresh =
-      hasConnectorFilter && !allowConnectorScopedV2AqiRefresh
+    const unresolvedNonTargetAfterRefresh = hasConnectorFilter
       ? nonTargetConnectors.filter((connectorId) =>
         !connectorManifestIds.has(connectorId)
       )
