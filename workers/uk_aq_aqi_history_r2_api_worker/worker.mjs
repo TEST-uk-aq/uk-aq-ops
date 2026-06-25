@@ -2020,6 +2020,20 @@ function summarizeExpectedAqiHourCoverage(points, {
   };
 }
 
+function makeWindowCoveringIsoHours(hourIsoValues) {
+  const hourMsValues = Array.isArray(hourIsoValues)
+    ? hourIsoValues
+      .map((value) => Date.parse(String(value || "")))
+      .filter((value) => Number.isFinite(value))
+    : [];
+  if (hourMsValues.length === 0) {
+    return null;
+  }
+  const startMs = Math.min(...hourMsValues);
+  const endMs = Math.max(...hourMsValues) + HOUR_MS;
+  return makeWindow(startMs, endMs);
+}
+
 function hasMissingKeyInWindow(keys, startMs, endMs) {
   if (!Array.isArray(keys) || keys.length === 0) {
     return false;
@@ -2165,10 +2179,10 @@ async function handleRequest(request, env, ctx) {
   const requestedPollutant = url.searchParams.has("pollutant")
     ? normalizeAqiPollutant(url.searchParams.get("pollutant"))
     : null;
-  if (url.searchParams.has("pollutant") && !requestedPollutant) {
+  if (!requestedPollutant) {
     return jsonResponse({
       ok: false,
-      error: "pollutant must be one of pm25, pm10, or no2 when provided.",
+      error: "pollutant is required and must be one of pm25, pm10, or no2.",
     }, { status: 400, cacheSeconds: 30 });
   }
 
@@ -2288,23 +2302,23 @@ async function handleRequest(request, env, ctx) {
       startMs,
       Math.min(effectiveEndMs, retentionStartMs),
     );
-  const obsAqiDbWindow = makeWindow(
-    readVersion === "v2"
-      ? startMs
-      : Math.min(
+  let obsAqiDbWindow = readVersion === "v2"
+    ? null
+    : makeWindow(
+      Math.min(
         overlapWindow ? overlapWindow.startMs : Number.POSITIVE_INFINITY,
         retentionWindow ? retentionWindow.startMs : Number.POSITIVE_INFINITY,
       ),
-    readVersion === "v2"
-      ? effectiveEndMs
-      : Math.max(
+      Math.max(
         overlapWindow ? overlapWindow.endMs : Number.NEGATIVE_INFINITY,
         retentionWindow ? retentionWindow.endMs : Number.NEGATIVE_INFINITY,
       ),
-  );
+    );
   const hasHistoryWindow = Boolean(r2Window);
   const hasObsAqiDbWindow = Boolean(obsAqiDbWindow);
-  const isHistoricalOnlyWindow = hasHistoryWindow && !hasObsAqiDbWindow;
+  const isHistoricalOnlyWindow = readVersion === "v2"
+    ? false
+    : hasHistoryWindow && !hasObsAqiDbWindow;
   let windowContextSourcePath = null;
   let windowContextLookupError = null;
   let windowContextLookupCacheHit = false;
@@ -2445,7 +2459,23 @@ async function handleRequest(request, env, ctx) {
   const recentR2PointCount = overlapWindow
     ? overlapR2Points.length
     : 0;
-  const shouldFetchRecentFallback = hasObsAqiDbWindow;
+  const v2R2FullRangePoints = readVersion === "v2" && r2Window
+    ? filterPointsToWindow(r2Read.points, r2Window.startMs, r2Window.endMs)
+    : [];
+  const r2ExpectedCoverage = readVersion === "v2"
+    ? summarizeExpectedAqiHourCoverage(v2R2FullRangePoints, {
+      startIso,
+      endIso,
+      sinceIso,
+      timeseriesId,
+      pollutantKey: requestedPollutant,
+    })
+    : null;
+  if (readVersion === "v2" && r2Window && r2ExpectedCoverage && !r2ExpectedCoverage.complete) {
+    obsAqiDbWindow = makeWindowCoveringIsoHours(r2ExpectedCoverage.missing_hours);
+  }
+  const hasResolvedObsAqiDbWindow = Boolean(obsAqiDbWindow);
+  const shouldFetchRecentFallback = hasResolvedObsAqiDbWindow;
 
   if (shouldFetchRecentFallback) {
     try {
@@ -2473,9 +2503,6 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  const v2R2FullRangePoints = readVersion === "v2" && r2Window
-    ? filterPointsToWindow(r2Read.points, r2Window.startMs, r2Window.endMs)
-    : [];
   const v2ObsAqiDbCandidatePoints = readVersion === "v2" && obsAqiDbWindow
     ? filterPointsToWindow(recentFallbackRead.points, obsAqiDbWindow.startMs, obsAqiDbWindow.endMs)
     : [];
@@ -2537,11 +2564,15 @@ async function handleRequest(request, env, ctx) {
       ...annotatedHistoricalR2Points,
       ...annotatedOverlapR2Points,
     ];
-  const points = mergePointsPreferPrimary(
+  const preLimitPoints = mergePointsPreferPrimary(
     r2MergePoints,
     obsAqiDbMergePoints,
-    limit,
+    null,
   );
+  const points = limit !== null && preLimitPoints.length > limit
+    ? preLimitPoints.slice(preLimitPoints.length - limit)
+    : preLimitPoints;
+  const rowLimitApplied = limit !== null && preLimitPoints.length > points.length;
   const rowSummary = summarizeAqiHistoryRows(points);
   let source = readVersion === "v2" ? "r2_first" : "r2_only";
   if (points.length === 0) {
@@ -2568,16 +2599,17 @@ async function handleRequest(request, env, ctx) {
   const partialReasons = new Set([
     ...historicalR2PartialReasons.map((reason) => `historical:${reason}`),
   ]);
-  if (hasObsAqiDbWindow && recentFallbackRead.status === "fallback_error") {
+  if (hasResolvedObsAqiDbWindow && recentFallbackRead.status === "fallback_error") {
     partialReasons.add(`obs_aqidb:${recentFallbackRead.error || "fallback_error"}`);
   }
-  const expectedCoverage = summarizeExpectedAqiHourCoverage(points, {
+  const expectedCoverage = summarizeExpectedAqiHourCoverage(preLimitPoints, {
     startIso,
     endIso,
     sinceIso,
     timeseriesId,
     pollutantKey: requestedPollutant,
   });
+  const mergedExpectedCoverage = expectedCoverage;
   if (!expectedCoverage.complete) {
     partialReasons.add("missing_expected_aqi_hours");
   }
@@ -2644,9 +2676,10 @@ async function handleRequest(request, env, ctx) {
           source: "r2_first",
           from_utc: r2Window.startIso,
           to_utc: r2Window.endIso,
-          status: expectedCoverage.complete ? "complete" : "partial",
+          status: r2ExpectedCoverage?.complete ? "complete" : "partial",
           row_count: v2R2FullRangePoints.length,
-          partial_reasons: expectedCoverage.complete ? [] : ["missing_expected_aqi_hours"],
+          expected_hour_coverage: r2ExpectedCoverage,
+          partial_reasons: r2ExpectedCoverage?.complete ? [] : ["missing_expected_aqi_hours"],
         }
         : null,
       obsAqiDbWindow
@@ -2697,15 +2730,19 @@ async function handleRequest(request, env, ctx) {
     query_to_utc: endIso,
     since_utc: sinceIso,
     row_count: points.length,
+    row_limit_applied: rowLimitApplied,
+    row_limit: limit,
+    pre_limit_row_count: preLimitPoints.length,
+    returned_row_count: points.length,
     response_complete: responseComplete,
     has_gap: hasGap,
     coverage_state: coverageState,
-      partial_reasons: partialReasonList,
-      expected_hour_count: expectedCoverage.expected_hour_count,
-      present_expected_hour_count: expectedCoverage.present_hour_count,
-      missing_expected_hour_count: expectedCoverage.missing_hour_count,
-      missing_expected_hours: expectedCoverage.missing_hours,
-      wire_format: responseFormat === "tsv" ? "tsv" : "json",
+    partial_reasons: partialReasonList,
+    expected_hour_count: expectedCoverage.expected_hour_count,
+    present_expected_hour_count: expectedCoverage.present_hour_count,
+    missing_expected_hour_count: expectedCoverage.missing_hour_count,
+    missing_expected_hours: expectedCoverage.missing_hours,
+    wire_format: responseFormat === "tsv" ? "tsv" : "json",
     data_format: responseFormat === "objects" ? "objects" : "compact",
     columns: responseColumns,
     points: responseFormat === "objects" ? responseRows : compactPoints,
@@ -2713,7 +2750,11 @@ async function handleRequest(request, env, ctx) {
       source,
       response_complete: responseComplete,
       row_count: points.length,
-      raw_row_count: points.length,
+      raw_row_count: preLimitPoints.length,
+      row_limit_applied: rowLimitApplied,
+      row_limit: limit,
+      pre_limit_row_count: preLimitPoints.length,
+      returned_row_count: points.length,
       parsed_point_count: rowSummary.parsed_point_count,
       daqi_count: rowSummary.daqi_count,
       eaqi_count: rowSummary.eaqi_count,
@@ -2753,7 +2794,8 @@ async function handleRequest(request, env, ctx) {
       has_gap: hasGap,
       coverage_state: coverageState,
       partial_reasons: partialReasonList,
-      expected_hour_coverage: expectedCoverage,
+      r2_expected_hour_coverage: r2ExpectedCoverage,
+      expected_hour_coverage: mergedExpectedCoverage,
       row_summary: rowSummary,
       scan_metrics: r2Read.scan_metrics,
       coverage: {
@@ -2773,9 +2815,11 @@ async function handleRequest(request, env, ctx) {
         source_coverage: sourceCoverage,
         history_scan_complete: historyScanComplete,
         history_scan_stopped_reason: historyScanStoppedReason,
-        obs_aqidb_status: recentFallbackRead.status,
+        obs_aqidb_status: hasResolvedObsAqiDbWindow ? recentFallbackRead.status : "not_requested",
         row_summary: rowSummary,
-        expected_hour_coverage: expectedCoverage,
+        r2_expected_hour_coverage: r2ExpectedCoverage,
+        merged_expected_hour_coverage: mergedExpectedCoverage,
+        expected_hour_coverage: mergedExpectedCoverage,
       },
     },
     coverage: {
@@ -2829,7 +2873,9 @@ async function handleRequest(request, env, ctx) {
       has_gap: hasGap,
       coverage_state: coverageState,
       partial_reasons: partialReasonList,
-      expected_hour_coverage: expectedCoverage,
+      r2_expected_hour_coverage: r2ExpectedCoverage,
+      merged_expected_hour_coverage: mergedExpectedCoverage,
+      expected_hour_coverage: mergedExpectedCoverage,
       source_coverage: sourceCoverage,
       history_scan_complete: historyScanComplete,
       history_scan_stopped_reason: historyScanStoppedReason,
@@ -2837,7 +2883,9 @@ async function handleRequest(request, env, ctx) {
       obs_aqidb_source_path: recentFallbackRead.source_path,
       obs_aqidb_row_count: obsAqiDbMergePoints.length,
       obs_aqidb_raw_row_count: recentFallbackRead.points.length,
-      obs_aqidb_status: recentFallbackRead.status,
+      r2_expected_hour_coverage: r2ExpectedCoverage,
+      merged_expected_hour_coverage: mergedExpectedCoverage,
+      obs_aqidb_status: hasResolvedObsAqiDbWindow ? recentFallbackRead.status : "not_requested",
       obs_aqidb_error: recentFallbackRead.error,
       historical_window_from_utc: windowStartIso(historicalWindow),
       historical_window_to_utc: windowEndIso(historicalWindow),
@@ -2849,9 +2897,9 @@ async function handleRequest(request, env, ctx) {
       r2_window_to_utc: windowEndIso(r2Window),
       obs_aqidb_window_from_utc: windowStartIso(obsAqiDbWindow),
       obs_aqidb_window_to_utc: windowEndIso(obsAqiDbWindow),
-      obs_aqidb_fallback_used: recentFallbackRead.status === "fallback_live",
+      obs_aqidb_fallback_used: hasResolvedObsAqiDbWindow && recentFallbackRead.status === "fallback_live",
       obs_aqidb_fallback_reason: shouldFetchRecentFallback
-        ? "overlap_missing_hour_fill_and_retention"
+        ? (readVersion === "v2" ? "r2_missing_expected_hour_fill" : "overlap_missing_hour_fill_and_retention")
         : null,
       obs_aqidb_fallback_recent_r2_point_count: recentR2PointCount,
       historical_r2_point_count: historicalR2PointCount,
