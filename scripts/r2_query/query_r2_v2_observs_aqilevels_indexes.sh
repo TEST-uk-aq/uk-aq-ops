@@ -1,562 +1,416 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONNECTOR_ID=""
-FROM_DAY=""
-TO_DAY=""
-POLLUTANT="pm25"
-TIMESERIES_ID="218"
-OUT_DIR=""
-OBS_TIME_COL=""
-OBS_VALUE_COL=""
-AQI_TIME_COL=""
+python3 - "$@" <<'PY'
+from __future__ import annotations
 
-usage() {
-  cat <<'EOF'
-Usage:
-  scripts/r2_query/query_r2_v2_observs_aqilevels.sh \
-    --connector-id 1 \
-    --from-day 2026-06-18 \
-    --to-day 2026-06-23 \
-    [--pollutant pm25|pm10|no2|o3|all] \
-    [--timeseries-id 218] \
-    [--obs-time-col observed_at_utc] \
-    [--obs-value-col value] \
-    [--aqi-time-col timestamp_hour_utc] \
-    [--out tmp/custom_output_dir]
-
-Required:
-  --connector-id    Connector id, e.g. 1
-  --from-day        Start day, YYYY-MM-DD
-  --to-day          End day, YYYY-MM-DD
-
-Defaults:
-  --pollutant       pm25
-  --timeseries-id   218
-
-Purpose:
-  Copy v2 observations and v2 AQI hourly data from R2, then join them by
-  timeseries_id and hour so the output includes the observation value beside
-  DAQI/EAQI status columns.
-EOF
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --connector-id)
-      CONNECTOR_ID="${2:-}"
-      shift 2
-      ;;
-    --from-day)
-      FROM_DAY="${2:-}"
-      shift 2
-      ;;
-    --to-day)
-      TO_DAY="${2:-}"
-      shift 2
-      ;;
-    --pollutant)
-      POLLUTANT="${2:-}"
-      shift 2
-      ;;
-    --timeseries-id)
-      TIMESERIES_ID="${2:-}"
-      shift 2
-      ;;
-    --obs-time-col)
-      OBS_TIME_COL="${2:-}"
-      shift 2
-      ;;
-    --obs-value-col)
-      OBS_VALUE_COL="${2:-}"
-      shift 2
-      ;;
-    --aqi-time-col)
-      AQI_TIME_COL="${2:-}"
-      shift 2
-      ;;
-    --out)
-      OUT_DIR="${2:-}"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
-done
-
-if [[ -z "$CONNECTOR_ID" || -z "$FROM_DAY" || -z "$TO_DAY" ]]; then
-  echo "Missing required flags." >&2
-  usage >&2
-  exit 2
-fi
-
-if [[ -z "${CFLARE_R2_BUCKET:-}" ]]; then
-  echo "CFLARE_R2_BUCKET is not set." >&2
-  exit 2
-fi
-
-for cmd in rclone jq duckdb python3 perl awk grep sed find sort wc tr; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "Required command not found: $cmd" >&2
-    exit 2
-  fi
-done
-
-duckdb_clean() {
-  TERM=dumb NO_COLOR=1 duckdb "$@" | perl -pe 's/\e\[[0-9;]*[A-Za-z]//g'
-}
-
-duckdb_csv() {
-  TERM=dumb NO_COLOR=1 duckdb -csv "$@"
-}
-
-tsv_box() {
-  local tmp_tsv
-  tmp_tsv="$(mktemp "${TMPDIR:-/tmp}/r2_joined_table.XXXXXX.tsv")"
-
-  cat > "$tmp_tsv"
-
-  python3 - "$tmp_tsv" <<'PY'
+import argparse
+import csv
+import datetime as dt
+import json
+import os
 import sys
 from pathlib import Path
+from typing import Any
 
-path = Path(sys.argv[1])
-raw = [line.rstrip("\n") for line in path.read_text(encoding="utf-8", errors="replace").splitlines()]
-rows = [line.split("\t") for line in raw if line != ""]
+try:
+    import duckdb
+except ModuleNotFoundError:
+    print("DuckDB is required. Install it in the active venv with: python3 -m pip install duckdb", file=sys.stderr)
+    raise SystemExit(2)
 
-if not rows:
-    sys.exit(0)
+POLLUTANTS = ("pm25", "pm10", "no2", "o3")
 
-# DuckDB COPY often writes NULL as an empty field. Make missing values explicit.
-rows = [["NULL" if cell == "" else cell for cell in row] for row in rows]
 
-col_count = max(len(row) for row in rows)
-for row in rows:
-    row.extend(["NULL"] * (col_count - len(row)))
+def parse_day(value: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid day {value!r}; expected YYYY-MM-DD") from exc
 
-widths = [
-    max(len(str(row[i])) for row in rows)
-    for i in range(col_count)
-]
 
-def border(left: str, mid: str, right: str) -> str:
-    return left + mid.join("─" * (width + 2) for width in widths) + right
+def iter_days(from_day: str, to_day: str) -> list[str]:
+    start = parse_day(from_day)
+    end = parse_day(to_day)
+    if end < start:
+        raise SystemExit("--to-day must be on or after --from-day")
+    return [(start + dt.timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
 
-def row_line(row) -> str:
-    return "│ " + " │ ".join(str(row[i]).ljust(widths[i]) for i in range(col_count)) + " │"
 
-print(border("┌", "┬", "┐"))
-print(row_line(rows[0]))
-print(border("├", "┼", "┤"))
-for row in rows[1:]:
-    print(row_line(row))
-print(border("└", "┴", "┘"))
+def existing_root(raw: str | None) -> Path:
+    root = raw or os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT") or os.environ.get("R2_HISTORY_DROPBOX_ROOT")
+    if not root:
+        raise SystemExit(
+            "Missing local R2 backup root. Pass --r2-history-root or set "
+            "UK_AQ_R2_HISTORY_DROPBOX_ROOT/R2_HISTORY_DROPBOX_ROOT."
+        )
+    path = Path(root).expanduser().resolve()
+    if not path.exists():
+        raise SystemExit(f"Local R2 backup root does not exist: {path}")
+    return path
+
+
+def parquet_files(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return sorted(str(p) for p in path.glob("*.parquet") if p.is_file())
+
+
+def parse_manifest(manifest_path: Path, timeseries_id: str, day: str, root: Path) -> dict[str, Any]:
+    empty = {
+        "manifest": "no",
+        "coverage": "",
+        "indexed_file_count": "",
+        "source_row_count": "",
+        "ts_in_range": "no",
+        "time_covers_day": "no",
+        "referenced_files_exist": "no",
+        "has_missing_files": False,
+        "is_complete": False,
+        "ts_out_of_range": False,
+    }
+    if not manifest_path.is_file():
+        return empty
+    
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return empty | {"manifest": "error"}
+
+    result = empty.copy()
+    result["manifest"] = "yes"
+    result["coverage"] = str(data.get("index_coverage", ""))
+    result["indexed_file_count"] = str(data.get("indexed_file_count", ""))
+    result["source_row_count"] = str(data.get("source_row_count", ""))
+    
+    result["is_complete"] = result["coverage"] == "complete"
+    
+    ts_id = int(timeseries_id) if timeseries_id.isdigit() else -1
+    
+    # ts_in_range
+    ts_in_range = False
+    if "min_timeseries_id" in data and "max_timeseries_id" in data:
+        if data["min_timeseries_id"] is not None and data["max_timeseries_id"] is not None:
+            if data["min_timeseries_id"] <= ts_id <= data["max_timeseries_id"]:
+                ts_in_range = True
+    
+    if not ts_in_range:
+        for f in data.get("files", []):
+            if "min_timeseries_id" in f and "max_timeseries_id" in f:
+                if f["min_timeseries_id"] is not None and f["max_timeseries_id"] is not None:
+                    if f["min_timeseries_id"] <= ts_id <= f["max_timeseries_id"]:
+                        ts_in_range = True
+                        break
+    result["ts_in_range"] = "yes" if ts_in_range else "no"
+    result["ts_out_of_range"] = not ts_in_range
+
+    # time_covers_day
+    day_start = f"{day}T00"
+    day_end = f"{day}T23"
+    
+    time_covers_day = False
+    min_ts = data.get("min_timestamp_hour_utc") or data.get("min_observed_at_utc") or ""
+    max_ts = data.get("max_timestamp_hour_utc") or data.get("max_observed_at_utc") or ""
+    if min_ts and max_ts and str(min_ts)[:13] <= day_start and str(max_ts)[:13] >= day_end:
+        time_covers_day = True
+        
+    if not time_covers_day:
+        for f in data.get("files", []):
+            min_ts = f.get("min_timestamp_hour_utc") or f.get("min_observed_at_utc") or ""
+            max_ts = f.get("max_timestamp_hour_utc") or f.get("max_observed_at_utc") or ""
+            if min_ts and max_ts and str(min_ts)[:13] <= day_start and str(max_ts)[:13] >= day_end:
+                time_covers_day = True
+                break
+    result["time_covers_day"] = "yes" if time_covers_day else "no"
+    
+    # referenced_files_exist
+    files_exist = True
+    files_list = data.get("files", [])
+    for f in files_list:
+        key = f.get("key")
+        if key:
+            if not (root / key).is_file():
+                files_exist = False
+                break
+    
+    indexed_file_count_str = str(data.get("indexed_file_count", ""))
+    indexed_file_count = int(indexed_file_count_str) if indexed_file_count_str.isdigit() else 0
+    
+    if not files_list:
+        if indexed_file_count > 0:
+            result["referenced_files_exist"] = "no"
+            result["has_missing_files"] = True
+        else:
+            result["referenced_files_exist"] = "yes"
+            result["has_missing_files"] = False
+    else:
+        result["referenced_files_exist"] = "yes" if files_exist else "no"
+        result["has_missing_files"] = not files_exist
+    
+    return result
+
+
+def read_count(con: duckdb.DuckDBPyConnection, files: list[str], where_sql: str, params: list[Any]) -> int | None:
+    if not files:
+        return 0
+    try:
+        row = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet(?) WHERE {where_sql}",
+            [files, *params],
+        ).fetchone()
+        return int(row[0] or 0)
+    except Exception as exc:
+        return None
+
+
+def read_aqi_counts(con: duckdb.DuckDBPyConnection, files: list[str], timeseries_id: str) -> dict[str, Any]:
+    empty = {
+        "aqi_rows": 0,
+        "daqi_level_rows": 0,
+        "eaqi_level_rows": 0,
+        "daqi_null_rows": 0,
+        "eaqi_null_rows": 0,
+        "daqi_statuses": "",
+        "eaqi_statuses": "",
+        "daqi_missing_reasons": "",
+        "eaqi_missing_reasons": "",
+        "read_error": "",
+    }
+    if not files:
+        return empty
+    try:
+        row = con.execute(
+            """
+            WITH rows AS (
+              SELECT *
+              FROM read_parquet(?)
+              WHERE CAST(timeseries_id AS VARCHAR) = ?
+            )
+            SELECT
+              COUNT(*) AS aqi_rows,
+              COUNT(daqi_index_level) AS daqi_level_rows,
+              COUNT(eaqi_index_level) AS eaqi_level_rows,
+              SUM(CASE WHEN daqi_index_level IS NULL THEN 1 ELSE 0 END) AS daqi_null_rows,
+              SUM(CASE WHEN eaqi_index_level IS NULL THEN 1 ELSE 0 END) AS eaqi_null_rows,
+              COALESCE(string_agg(DISTINCT COALESCE(daqi_calculation_status, '<null>'), ', ' ORDER BY COALESCE(daqi_calculation_status, '<null>')), '') AS daqi_statuses,
+              COALESCE(string_agg(DISTINCT COALESCE(eaqi_calculation_status, '<null>'), ', ' ORDER BY COALESCE(eaqi_calculation_status, '<null>')), '') AS eaqi_statuses,
+              COALESCE(string_agg(DISTINCT COALESCE(daqi_missing_reason, '<null>'), ', ' ORDER BY COALESCE(daqi_missing_reason, '<null>')), '') AS daqi_missing_reasons,
+              COALESCE(string_agg(DISTINCT COALESCE(eaqi_missing_reason, '<null>'), ', ' ORDER BY COALESCE(eaqi_missing_reason, '<null>')), '') AS eaqi_missing_reasons
+            FROM rows
+            """,
+            [files, timeseries_id],
+        ).fetchone()
+        return dict(zip(list(empty)[:-1], row)) | {"read_error": ""}
+    except Exception as exc:
+        result = empty.copy()
+        result["read_error"] = str(exc).splitlines()[0]
+        return result
+
+
+def local_paths(root: Path, day: str, connector_id: str, pollutant: str) -> dict[str, Path]:
+    return {
+        "obs": root / "history/v2/observations" / f"day_utc={day}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant}",
+        "aqi": root / "history/v2/aqilevels/hourly/data" / f"day_utc={day}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant}",
+        "obs_idx": root / "history/_index_v2/observations_timeseries" / f"day_utc={day}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant}",
+        "aqi_idx": root / "history/_index_v2/aqilevels_hourly_data_timeseries" / f"day_utc={day}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant}",
+    }
+
+
+def discover_pollutants(root: Path, days: list[str], connector_id: str) -> list[str]:
+    found: set[str] = set()
+    family_roots = [
+        root / "history/v2/observations",
+        root / "history/v2/aqilevels/hourly/data",
+        root / "history/_index_v2/observations_timeseries",
+        root / "history/_index_v2/aqilevels_hourly_data_timeseries",
+    ]
+    for day in days:
+        for family in family_roots:
+            base = family / f"day_utc={day}" / f"connector_id={connector_id}"
+            if not base.exists():
+                continue
+            for child in base.glob("pollutant_code=*"):
+                if child.is_dir():
+                    found.add(child.name.split("=", 1)[1])
+    return sorted(found, key=lambda p: POLLUTANTS.index(p) if p in POLLUTANTS else 999)
+
+
+def tsv_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\t", " ").replace("\n", " ")
+
+
+def print_table(rows: list[dict[str, Any]], columns: list[str]) -> None:
+    print("\t".join(columns))
+    for row in rows:
+        print("\t".join(tsv_value(row.get(col, "")) for col in columns))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Local Dropbox/R2-backup v2 observation, AQI, and API-facing index check. Does not contact live R2.",
+    )
+    parser.add_argument("--connector-id", required=True)
+    parser.add_argument("--from-day", required=True)
+    parser.add_argument("--to-day", required=True)
+    parser.add_argument("--pollutant", default="pm25", choices=(*POLLUTANTS, "all"))
+    parser.add_argument("--timeseries-id", default="218")
+    parser.add_argument("--r2-history-root")
+    parser.add_argument("--out", help="Optional local output directory for CSV reports. No source data is copied here.")
+    args = parser.parse_args()
+
+    root = existing_root(args.r2_history_root)
+    days = iter_days(args.from_day, args.to_day)
+    pollutants = discover_pollutants(root, days, args.connector_id) if args.pollutant == "all" else [args.pollutant]
+
+    print("WARNING: local Dropbox/R2 backup mode only. This script does not contact live R2 and downloads nothing.", file=sys.stderr)
+    print(f"WARNING: results are only valid if this local backup is fully up to date: {root}", file=sys.stderr)
+
+    if not pollutants:
+        print("No pollutant partitions discovered for the selected connector/date range.", file=sys.stderr)
+        return 1
+
+    con = duckdb.connect()
+    rows: list[dict[str, Any]] = []
+
+    for day in days:
+        for pol in pollutants:
+            paths = local_paths(root, day, args.connector_id, pol)
+            obs_files = parquet_files(paths["obs"])
+            aqi_files = parquet_files(paths["aqi"])
+
+            obs_rows = read_count(con, obs_files, "CAST(timeseries_id AS VARCHAR) = ?", [args.timeseries_id])
+            aqi_counts = read_aqi_counts(con, aqi_files, args.timeseries_id)
+            aqi_rows = int(aqi_counts["aqi_rows"] or 0)
+
+            obs_man = parse_manifest(paths["obs_idx"] / "manifest.json", args.timeseries_id, day, root)
+            aqi_man = parse_manifest(paths["aqi_idx"] / "manifest.json", args.timeseries_id, day, root)
+
+            statuses: list[str] = []
+            if obs_rows is None:
+                statuses.append("obs_read_error")
+            if aqi_counts.get("read_error"):
+                statuses.append("aqi_read_error")
+            if (obs_rows or 0) > 0 and aqi_rows == 0:
+                statuses.append("missing_aqi_data")
+            if (obs_rows or 0) > aqi_rows and aqi_rows > 0:
+                statuses.append("stale_or_partial_aqi_data")
+
+            # Obs Index Status
+            if (obs_rows or 0) > 0:
+                if obs_man["manifest"] == "error":
+                    statuses.append("obs_index_manifest_parse_error")
+                elif obs_man["manifest"] != "yes":
+                    statuses.append("missing_obs_index_manifest")
+                else:
+                    if not obs_man["is_complete"]:
+                        statuses.append("incomplete_obs_index_coverage")
+                    if obs_man["ts_out_of_range"]:
+                        statuses.append("obs_index_timeseries_not_in_range")
+                    if obs_man["time_covers_day"] == "no":
+                        statuses.append("obs_index_time_not_covering_day")
+                    if obs_man["has_missing_files"]:
+                        statuses.append("obs_index_referenced_file_missing")
+
+            # AQI Index Status
+            if aqi_rows > 0:
+                if aqi_man["manifest"] == "error":
+                    statuses.append("aqi_index_manifest_parse_error")
+                elif aqi_man["manifest"] != "yes":
+                    statuses.append("missing_aqi_index_manifest")
+                else:
+                    if not aqi_man["is_complete"]:
+                        statuses.append("incomplete_aqi_index_coverage")
+                    if aqi_man["ts_out_of_range"]:
+                        statuses.append("aqi_index_timeseries_not_in_range")
+                    if aqi_man["time_covers_day"] == "no":
+                        statuses.append("aqi_index_time_not_covering_day")
+                    if aqi_man["has_missing_files"]:
+                        statuses.append("aqi_index_referenced_file_missing")
+
+            if aqi_rows > 0 and int(aqi_counts["daqi_level_rows"] or 0) < aqi_rows:
+                statuses.append("partial_daqi_levels")
+            if aqi_rows > 0 and int(aqi_counts["eaqi_level_rows"] or 0) < aqi_rows:
+                statuses.append("partial_eaqi_levels")
+
+            if not statuses:
+                statuses.append("ok")
+
+            rows.append({
+                "day_utc": day,
+                "pol": pol,
+                "timeseries_id": args.timeseries_id,
+                "obs_files": len(obs_files),
+                "aqi_files": len(aqi_files),
+                "obs_rows": "read_error" if obs_rows is None else obs_rows,
+                "aqi_rows": aqi_rows,
+                "daqi_level_rows": aqi_counts["daqi_level_rows"],
+                "eaqi_level_rows": aqi_counts["eaqi_level_rows"],
+                "daqi_null_rows": aqi_counts["daqi_null_rows"],
+                "eaqi_null_rows": aqi_counts["eaqi_null_rows"],
+                "obs_idx_manifest": obs_man["manifest"],
+                "aqi_idx_manifest": aqi_man["manifest"],
+                "obs_idx_coverage": obs_man["coverage"],
+                "aqi_idx_coverage": aqi_man["coverage"],
+                "obs_idx_indexed_file_count": obs_man["indexed_file_count"],
+                "aqi_idx_indexed_file_count": aqi_man["indexed_file_count"],
+                "obs_idx_source_row_count": obs_man["source_row_count"],
+                "aqi_idx_source_row_count": aqi_man["source_row_count"],
+                "obs_idx_ts_in_range": obs_man["ts_in_range"],
+                "aqi_idx_ts_in_range": aqi_man["ts_in_range"],
+                "obs_idx_time_covers_day": obs_man["time_covers_day"],
+                "aqi_idx_time_covers_day": aqi_man["time_covers_day"],
+                "obs_idx_referenced_files_exist": obs_man["referenced_files_exist"],
+                "aqi_idx_referenced_files_exist": aqi_man["referenced_files_exist"],
+                "daqi_statuses": aqi_counts["daqi_statuses"],
+                "eaqi_statuses": aqi_counts["eaqi_statuses"],
+                "daqi_missing_reasons": aqi_counts["daqi_missing_reasons"],
+                "eaqi_missing_reasons": aqi_counts["eaqi_missing_reasons"],
+                "status": ";".join(statuses),
+            })
+
+    columns = [
+        "day_utc", "pol", "timeseries_id",
+        "obs_files", "aqi_files", "obs_rows", "aqi_rows",
+        "daqi_level_rows", "eaqi_level_rows", "daqi_null_rows", "eaqi_null_rows",
+        "obs_idx_manifest", "aqi_idx_manifest",
+        "obs_idx_coverage", "aqi_idx_coverage",
+        "obs_idx_indexed_file_count", "aqi_idx_indexed_file_count",
+        "obs_idx_source_row_count", "aqi_idx_source_row_count",
+        "obs_idx_ts_in_range", "aqi_idx_ts_in_range",
+        "obs_idx_time_covers_day", "aqi_idx_time_covers_day",
+        "obs_idx_referenced_files_exist", "aqi_idx_referenced_files_exist",
+        "daqi_statuses", "eaqi_statuses", "daqi_missing_reasons", "eaqi_missing_reasons", "status",
+    ]
+
+    print()
+    print(f"=== Local Dropbox v2 data and API-facing index check for timeseries_id={args.timeseries_id} ===")
+    print_table(rows, columns)
+
+    summary_path_str = "None (no --out provided)"
+    if args.out:
+        out = Path(args.out).expanduser().resolve()
+        out.mkdir(parents=True, exist_ok=True)
+        summary_path = out / "local_v2_observs_aqilevels_indexes.csv"
+        with summary_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({col: "" if row.get(col) is None else row.get(col, "") for col in columns})
+        summary_path_str = str(summary_path)
+
+    non_ok_rows = sum(1 for r in rows if r["status"] != "ok")
+    
+    print()
+    print("=== Summary ===")
+    print(f"Output CSV: {summary_path_str}")
+    print(f"Total rows: {len(rows)}")
+    print(f"Non-OK rows: {non_ok_rows}")
+
+    return 0
+
+
+raise SystemExit(main())
 PY
-
-  local status=$?
-  rm -f "$tmp_tsv"
-  return "$status"
-}
-
-
-case "$POLLUTANT" in
-  pm25|pm10|no2|o3|all) ;;
-  *)
-    echo "Unsupported pollutant: $POLLUTANT" >&2
-    echo "Use pm25, pm10, no2, o3, or all." >&2
-    exit 2
-    ;;
-esac
-
-if [[ -z "$OUT_DIR" ]]; then
-  OUT_DIR="tmp/r2_v2_observs_aqilevels_${FROM_DAY}_to_${TO_DAY}_connector_${CONNECTOR_ID}_${POLLUTANT}_ts_${TIMESERIES_ID}"
-fi
-
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR"
-
-echo "Output directory: $OUT_DIR"
-echo "Connector:        $CONNECTOR_ID"
-echo "Days:             $FROM_DAY to $TO_DAY"
-echo "Pollutant:        $POLLUTANT"
-echo "Timeseries ID:    $TIMESERIES_ID"
-echo
-
-DAYS=()
-while IFS= read -r DAY; do
-  DAYS+=("$DAY")
-done < <(
-  python3 - "$FROM_DAY" "$TO_DAY" <<'PY'
-import datetime as dt
-import sys
-
-start = dt.date.fromisoformat(sys.argv[1])
-end = dt.date.fromisoformat(sys.argv[2])
-
-if end < start:
-    raise SystemExit("to-day is before from-day")
-
-day = start
-while day <= end:
-    print(day.isoformat())
-    day += dt.timedelta(days=1)
-PY
-)
-
-for DAY in "${DAYS[@]}"; do
-  OBS_DAY_OUT="$OUT_DIR/observations/day_utc=$DAY"
-  AQI_DAY_OUT="$OUT_DIR/aqilevels/day_utc=$DAY"
-  mkdir -p "$OBS_DAY_OUT" "$AQI_DAY_OUT"
-
-  OBS_BASE_REMOTE="uk_aq_r2:${CFLARE_R2_BUCKET}/history/v2/observations/day_utc=${DAY}/connector_id=${CONNECTOR_ID}"
-  AQI_BASE_REMOTE="uk_aq_r2:${CFLARE_R2_BUCKET}/history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=${CONNECTOR_ID}"
-
-  echo "Copying connector manifests for $DAY"
-  rclone cat "${OBS_BASE_REMOTE}/manifest.json" > "$OBS_DAY_OUT/connector_manifest.json" 2>/dev/null || true
-  rclone cat "${AQI_BASE_REMOTE}/manifest.json" > "$AQI_DAY_OUT/connector_manifest.json" 2>/dev/null || true
-
-  if [[ "$POLLUTANT" == "all" ]]; then
-    echo "Copying v2 observations: $DAY connector_id=$CONNECTOR_ID all pollutants"
-    rclone copy -P "${OBS_BASE_REMOTE}/" "$OBS_DAY_OUT/" || true
-
-    echo "Copying v2 AQI hourly:   $DAY connector_id=$CONNECTOR_ID all pollutants"
-    rclone copy -P "${AQI_BASE_REMOTE}/" "$AQI_DAY_OUT/" || true
-  else
-    echo "Copying v2 observations: $DAY connector_id=$CONNECTOR_ID pollutant=$POLLUTANT"
-    mkdir -p "$OBS_DAY_OUT/pollutant_code=$POLLUTANT"
-    rclone copy -P "${OBS_BASE_REMOTE}/pollutant_code=${POLLUTANT}/" "$OBS_DAY_OUT/pollutant_code=$POLLUTANT/" || true
-
-    echo "Copying v2 AQI hourly:   $DAY connector_id=$CONNECTOR_ID pollutant=$POLLUTANT"
-    mkdir -p "$AQI_DAY_OUT/pollutant_code=$POLLUTANT"
-    rclone copy -P "${AQI_BASE_REMOTE}/pollutant_code=${POLLUTANT}/" "$AQI_DAY_OUT/pollutant_code=$POLLUTANT/" || true
-  fi
-done
-
-print_manifest_counts() {
-  local label="$1"
-  local root="$2"
-
-  echo
-  echo "=== $label manifest counts, including timeseries_id=$TIMESERIES_ID ==="
-
-  {
-    printf "day_utc\tpollutant\trow_count\tsource_row_count\tfile_count\tts_%s_rows\n" "$TIMESERIES_ID"
-
-    while IFS= read -r MANIFEST; do
-      DAY="$(echo "$MANIFEST" | sed -n 's#.*day_utc=\([0-9-]*\).*#\1#p')"
-      POL="$(echo "$MANIFEST" | sed -n 's#.*pollutant_code=\([^/]*\).*#\1#p')"
-
-      jq -r --arg day "$DAY" --arg pol "$POL" --arg ts "$TIMESERIES_ID" '
-        def ts_count($ts):
-          if (.timeseries_row_counts? and .timeseries_row_counts[$ts] != null) then
-            .timeseries_row_counts[$ts]
-          else
-            ([.files[]? | .timeseries_row_counts?[$ts] // empty] | add)
-          end;
-
-        [
-          $day,
-          $pol,
-          (.row_count // ""),
-          (.source_row_count // ""),
-          (.file_count // ""),
-          (ts_count($ts) // "")
-        ] | @tsv
-      ' "$MANIFEST"
-    done < <(find "$root" -path '*/pollutant_code=*/manifest.json' -type f | sort)
-  } | column -t
-}
-
-print_manifest_counts "Observations" "$OUT_DIR/observations"
-print_manifest_counts "AQI hourly" "$OUT_DIR/aqilevels"
-
-OBS_PARQUET_COUNT="$(find "$OUT_DIR/observations" -name '*.parquet' -type f | wc -l | tr -d ' ')"
-AQI_PARQUET_COUNT="$(find "$OUT_DIR/aqilevels" -name '*.parquet' -type f | wc -l | tr -d ' ')"
-
-echo
-echo "Observation parquet files copied: $OBS_PARQUET_COUNT"
-echo "AQI parquet files copied:         $AQI_PARQUET_COUNT"
-
-if [[ "$OBS_PARQUET_COUNT" == "0" && "$AQI_PARQUET_COUNT" == "0" ]]; then
-  echo "No observation or AQI parquet files found under $OUT_DIR"
-  exit 0
-fi
-
-if [[ "$POLLUTANT" == "all" ]]; then
-  OBS_PARQUET_GLOB="$OUT_DIR/observations/day_utc=*/pollutant_code=*/*.parquet"
-  AQI_PARQUET_GLOB="$OUT_DIR/aqilevels/day_utc=*/pollutant_code=*/*.parquet"
-else
-  OBS_PARQUET_GLOB="$OUT_DIR/observations/day_utc=*/pollutant_code=$POLLUTANT/*.parquet"
-  AQI_PARQUET_GLOB="$OUT_DIR/aqilevels/day_utc=*/pollutant_code=$POLLUTANT/*.parquet"
-fi
-
-column_exists() {
-  local glob="$1"
-  local col="$2"
-  duckdb_csv -c "DESCRIBE SELECT * FROM read_parquet('$glob', union_by_name=true, filename=true);" \
-    | awk -F, 'NR > 1 {gsub(/"/, "", $1); print $1}' \
-    | grep -qx "$col"
-}
-
-detect_column() {
-  local glob="$1"
-  shift
-  local candidate
-  for candidate in "$@"; do
-    if column_exists "$glob" "$candidate"; then
-      echo "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-if [[ "$OBS_PARQUET_COUNT" != "0" ]]; then
-  echo
-  echo "=== Observation parquet schema ==="
-  duckdb_clean -c "
-DESCRIBE SELECT * FROM read_parquet('$OBS_PARQUET_GLOB', union_by_name=true, filename=true);
-"
-
-  if [[ -z "$OBS_TIME_COL" ]]; then
-    OBS_TIME_COL="$(detect_column "$OBS_PARQUET_GLOB" \
-      observed_at_utc timestamp_hour_utc timestamp_utc period_start_utc period_start start_utc hour_start_utc datetime_utc || true)"
-  fi
-
-  if [[ -z "$OBS_VALUE_COL" ]]; then
-    OBS_VALUE_COL="$(detect_column "$OBS_PARQUET_GLOB" \
-      value observed_value measurement_value measured_value value_ugm3 value_ug_m3 value_ugm_3 concentration concentration_ugm3 observation_value pollutant_value || true)"
-  fi
-
-  if [[ -z "$OBS_TIME_COL" ]]; then
-    echo "Could not detect observation timestamp column. Re-run with --obs-time-col <column>." >&2
-    exit 3
-  fi
-
-  if [[ -z "$OBS_VALUE_COL" ]]; then
-    echo "Could not detect observation value column. Re-run with --obs-value-col <column>." >&2
-    exit 3
-  fi
-
-  echo "Detected observation timestamp column: $OBS_TIME_COL"
-  echo "Detected observation value column:     $OBS_VALUE_COL"
-fi
-
-if [[ "$AQI_PARQUET_COUNT" != "0" ]]; then
-  echo
-  echo "=== AQI parquet schema ==="
-  duckdb_clean -c "
-DESCRIBE SELECT * FROM read_parquet('$AQI_PARQUET_GLOB', union_by_name=true, filename=true);
-"
-
-  if [[ -z "$AQI_TIME_COL" ]]; then
-    AQI_TIME_COL="$(detect_column "$AQI_PARQUET_GLOB" \
-      timestamp_hour_utc observed_at_utc period_start_utc period_start start_utc hour_start_utc datetime_utc timestamp_utc || true)"
-  fi
-
-  if [[ -z "$AQI_TIME_COL" ]]; then
-    echo "Could not detect AQI timestamp column. Re-run with --aqi-time-col <column>." >&2
-    exit 3
-  fi
-
-  echo "Detected AQI timestamp column:         $AQI_TIME_COL"
-fi
-
-echo
-echo "=== Summary for timeseries_id=$TIMESERIES_ID ==="
-
-if [[ "$OBS_PARQUET_COUNT" != "0" && "$AQI_PARQUET_COUNT" != "0" ]]; then
-  TERM=dumb NO_COLOR=1 duckdb -c "
-COPY (
-  WITH obs AS (
-    SELECT
-      regexp_extract(filename, 'day_utc=([^/]+)', 1) AS file_day_utc,
-      regexp_extract(filename, 'pollutant_code=([^/]+)', 1) AS file_pollutant_code,
-      timeseries_id,
-      CAST(\"$OBS_TIME_COL\" AS TIMESTAMP) AS hour_utc
-    FROM read_parquet('$OBS_PARQUET_GLOB', union_by_name=true, filename=true)
-    WHERE timeseries_id = $TIMESERIES_ID
-  ),
-  aqi AS (
-    SELECT
-      regexp_extract(filename, 'day_utc=([^/]+)', 1) AS file_day_utc,
-      regexp_extract(filename, 'pollutant_code=([^/]+)', 1) AS file_pollutant_code,
-      timeseries_id,
-      CAST(\"$AQI_TIME_COL\" AS TIMESTAMP) AS hour_utc
-    FROM read_parquet('$AQI_PARQUET_GLOB', union_by_name=true, filename=true)
-    WHERE timeseries_id = $TIMESERIES_ID
-  ),
-  obs_summary AS (
-    SELECT
-      file_day_utc,
-      file_pollutant_code,
-      timeseries_id,
-      count(*) AS observation_rows,
-      min(hour_utc) AS first_observation_utc,
-      max(hour_utc) AS last_observation_utc
-    FROM obs
-    GROUP BY 1, 2, 3
-  ),
-  aqi_summary AS (
-    SELECT
-      file_day_utc,
-      file_pollutant_code,
-      timeseries_id,
-      count(*) AS aqi_rows,
-      min(hour_utc) AS first_aqi_utc,
-      max(hour_utc) AS last_aqi_utc
-    FROM aqi
-    GROUP BY 1, 2, 3
-  )
-  SELECT
-    COALESCE(obs_summary.file_day_utc, aqi_summary.file_day_utc) AS file_day_utc,
-    COALESCE(obs_summary.file_pollutant_code, aqi_summary.file_pollutant_code) AS file_pollutant_code,
-    COALESCE(obs_summary.timeseries_id, aqi_summary.timeseries_id) AS timeseries_id,
-    obs_summary.observation_rows,
-    aqi_summary.aqi_rows,
-    obs_summary.first_observation_utc,
-    obs_summary.last_observation_utc,
-    aqi_summary.first_aqi_utc,
-    aqi_summary.last_aqi_utc
-  FROM obs_summary
-  FULL OUTER JOIN aqi_summary
-    ON obs_summary.file_day_utc = aqi_summary.file_day_utc
-   AND obs_summary.file_pollutant_code = aqi_summary.file_pollutant_code
-   AND obs_summary.timeseries_id = aqi_summary.timeseries_id
-  ORDER BY file_day_utc, file_pollutant_code, timeseries_id
-) TO STDOUT (HEADER, DELIMITER '\t');
-" | tsv_box
-
-elif [[ "$OBS_PARQUET_COUNT" != "0" ]]; then
-  TERM=dumb NO_COLOR=1 duckdb -c "
-COPY (
-  SELECT
-    regexp_extract(filename, 'day_utc=([^/]+)', 1) AS file_day_utc,
-    regexp_extract(filename, 'pollutant_code=([^/]+)', 1) AS file_pollutant_code,
-    timeseries_id,
-    count(*) AS observation_rows,
-    NULL::INTEGER AS aqi_rows,
-    min(CAST(\"$OBS_TIME_COL\" AS TIMESTAMP)) AS first_observation_utc,
-    max(CAST(\"$OBS_TIME_COL\" AS TIMESTAMP)) AS last_observation_utc,
-    NULL::TIMESTAMP AS first_aqi_utc,
-    NULL::TIMESTAMP AS last_aqi_utc
-  FROM read_parquet('$OBS_PARQUET_GLOB', union_by_name=true, filename=true)
-  WHERE timeseries_id = $TIMESERIES_ID
-  GROUP BY 1, 2, 3
-  ORDER BY 1, 2, 3
-) TO STDOUT (HEADER, DELIMITER '\t');
-" | tsv_box
-
-else
-  TERM=dumb NO_COLOR=1 duckdb -c "
-COPY (
-  SELECT
-    regexp_extract(filename, 'day_utc=([^/]+)', 1) AS file_day_utc,
-    regexp_extract(filename, 'pollutant_code=([^/]+)', 1) AS file_pollutant_code,
-    timeseries_id,
-    NULL::INTEGER AS observation_rows,
-    count(*) AS aqi_rows,
-    NULL::TIMESTAMP AS first_observation_utc,
-    NULL::TIMESTAMP AS last_observation_utc,
-    min(CAST(\"$AQI_TIME_COL\" AS TIMESTAMP)) AS first_aqi_utc,
-    max(CAST(\"$AQI_TIME_COL\" AS TIMESTAMP)) AS last_aqi_utc
-  FROM read_parquet('$AQI_PARQUET_GLOB', union_by_name=true, filename=true)
-  WHERE timeseries_id = $TIMESERIES_ID
-  GROUP BY 1, 2, 3
-  ORDER BY 1, 2, 3
-) TO STDOUT (HEADER, DELIMITER '\t');
-" | tsv_box
-fi
-
-echo
-echo "=== Joined observations and AQI rows for timeseries_id=$TIMESERIES_ID ==="
-
-if [[ "$OBS_PARQUET_COUNT" != "0" && "$AQI_PARQUET_COUNT" != "0" ]]; then
-  TERM=dumb NO_COLOR=1 duckdb -c "
-COPY (
-  WITH obs AS (
-    SELECT
-      regexp_extract(filename, 'day_utc=([^/]+)', 1) AS obs_day_utc,
-      timeseries_id,
-      CAST(\"$OBS_TIME_COL\" AS TIMESTAMP) AS hour_utc,
-      TRY_CAST(\"$OBS_VALUE_COL\" AS DOUBLE) AS observed_value
-    FROM read_parquet('$OBS_PARQUET_GLOB', union_by_name=true, filename=true)
-    WHERE timeseries_id = $TIMESERIES_ID
-  ),
-  aqi AS (
-    SELECT
-      regexp_extract(filename, 'day_utc=([^/]+)', 1) AS aqi_day_utc,
-      timeseries_id,
-      CAST(\"$AQI_TIME_COL\" AS TIMESTAMP) AS hour_utc,
-      daqi_index_level,
-      daqi_calculation_status,
-      daqi_missing_reason,
-      eaqi_index_level,
-      eaqi_calculation_status,
-      eaqi_missing_reason
-    FROM read_parquet('$AQI_PARQUET_GLOB', union_by_name=true, filename=true)
-    WHERE timeseries_id = $TIMESERIES_ID
-  )
-  SELECT
-    COALESCE(aqi.aqi_day_utc, obs.obs_day_utc) AS file_day_utc,
-    COALESCE(aqi.hour_utc, obs.hour_utc) AS timestamp_hour_utc,
-    obs.observed_value,
-    aqi.daqi_index_level,
-    aqi.daqi_calculation_status,
-    aqi.daqi_missing_reason,
-    aqi.eaqi_index_level,
-    aqi.eaqi_calculation_status,
-    aqi.eaqi_missing_reason
-  FROM obs
-  FULL OUTER JOIN aqi
-    ON obs.timeseries_id = aqi.timeseries_id
-   AND obs.hour_utc = aqi.hour_utc
-  ORDER BY file_day_utc, timestamp_hour_utc
-) TO STDOUT (HEADER, DELIMITER '\t');
-" | tsv_box
-
-elif [[ "$OBS_PARQUET_COUNT" != "0" ]]; then
-  TERM=dumb NO_COLOR=1 duckdb -c "
-COPY (
-  SELECT
-    regexp_extract(filename, 'day_utc=([^/]+)', 1) AS file_day_utc,
-    CAST(\"$OBS_TIME_COL\" AS TIMESTAMP) AS timestamp_hour_utc,
-    TRY_CAST(\"$OBS_VALUE_COL\" AS DOUBLE) AS observed_value,
-    NULL::INTEGER AS daqi_index_level,
-    NULL::VARCHAR AS daqi_calculation_status,
-    NULL::VARCHAR AS daqi_missing_reason,
-    NULL::INTEGER AS eaqi_index_level,
-    NULL::VARCHAR AS eaqi_calculation_status,
-    NULL::VARCHAR AS eaqi_missing_reason
-  FROM read_parquet('$OBS_PARQUET_GLOB', union_by_name=true, filename=true)
-  WHERE timeseries_id = $TIMESERIES_ID
-  ORDER BY file_day_utc, timestamp_hour_utc
-) TO STDOUT (HEADER, DELIMITER '\t');
-" | tsv_box
-
-else
-  TERM=dumb NO_COLOR=1 duckdb -c "
-COPY (
-  SELECT
-    regexp_extract(filename, 'day_utc=([^/]+)', 1) AS file_day_utc,
-    CAST(\"$AQI_TIME_COL\" AS TIMESTAMP) AS timestamp_hour_utc,
-    NULL::DOUBLE AS observed_value,
-    daqi_index_level,
-    daqi_calculation_status,
-    daqi_missing_reason,
-    eaqi_index_level,
-    eaqi_calculation_status,
-    eaqi_missing_reason
-  FROM read_parquet('$AQI_PARQUET_GLOB', union_by_name=true, filename=true)
-  WHERE timeseries_id = $TIMESERIES_ID
-  ORDER BY file_day_utc, timestamp_hour_utc
-) TO STDOUT (HEADER, DELIMITER '\t');
-" | tsv_box
-fi
