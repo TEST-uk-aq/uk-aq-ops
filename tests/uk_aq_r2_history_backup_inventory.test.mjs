@@ -671,7 +671,7 @@ test("sync dry-run reports stale Parquet but does not delete or checkpoint", () 
   assert.equal(report.prune.prune_dry_run_delete_count, 1);
 });
 
-test("sync default does not prune unchanged inventory-listed units", () => {
+test("sync default prunes unchanged inventory-listed units", () => {
   const tempDir = makeTempDir();
   const sourceRoot = path.join(tempDir, "source");
   const destRoot = path.join(tempDir, "dest");
@@ -690,13 +690,14 @@ test("sync default does not prune unchanged inventory-listed units", () => {
   const result = runSyncCli({ sourceRoot, destRoot, fakeRcloneBin, reportOut });
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), true);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), false);
   const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
   assert.equal(report.domains.observations.candidate_days, 0);
-  assert.equal(report.prune.attempted_units, 0);
+  assert.equal(report.prune.scope, "all");
+  assert.equal(report.prune.prune_deleted_count, 1);
 });
 
-test("sync --prune-scope all prunes unchanged inventory-listed units", () => {
+test("sync --prune-scope changed leaves unchanged inventory-listed units alone", () => {
   const tempDir = makeTempDir();
   const sourceRoot = path.join(tempDir, "source");
   const destRoot = path.join(tempDir, "dest");
@@ -717,17 +718,18 @@ test("sync --prune-scope all prunes unchanged inventory-listed units", () => {
     destRoot,
     fakeRcloneBin,
     reportOut,
-    extraArgs: ["--prune-scope", "all"],
+    extraArgs: ["--prune-scope", "changed"],
   });
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), false);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), true);
   const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
   assert.equal(report.domains.observations.candidate_days, 0);
-  assert.equal(report.prune.prune_deleted_count, 1);
+  assert.equal(report.prune.scope, "changed");
+  assert.equal(report.prune.attempted_units, 0);
 });
 
-test("sync --prune-scope all is not limited by max-days-per-run and ignores non-inventory units", () => {
+test("sync default inventory-wide pruning is not limited by max-days-per-run and ignores non-inventory units", () => {
   const tempDir = makeTempDir();
   const sourceRoot = path.join(tempDir, "source");
   const destRoot = path.join(tempDir, "dest");
@@ -745,7 +747,7 @@ test("sync --prune-scope all is not limited by max-days-per-run and ignores non-
     destRoot,
     fakeRcloneBin,
     reportOut,
-    extraArgs: ["--max-days-per-run", "1", "--prune-scope", "all"],
+    extraArgs: ["--max-days-per-run", "1"],
   });
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -755,6 +757,7 @@ test("sync --prune-scope all is not limited by max-days-per-run and ignores non-
   const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
   assert.equal(report.domains.observations.candidate_days, 1);
   assert.equal(report.domains.observations.skipped_by_limit, 1);
+  assert.equal(report.prune.scope, "all");
   assert.equal(report.prune.prune_deleted_count, 2);
 });
 
