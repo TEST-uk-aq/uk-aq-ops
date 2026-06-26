@@ -9,11 +9,9 @@ CIC-test-uk-aq-ingest,Cloudflare Worker,uk_aq_dispatcher,wrangler.toml,disabled 
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 3 * * *,Daily @ 03:00 UTC,Trigger uk_aq_stations_daily,yes,03:00 UTC
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,15 4 * * *,Daily @ 04:15 UTC,Trigger uk_aq_r2_core_snapshot,yes,04:15 UTC
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,35 4 * * *,Daily @ 04:35 UTC,Trigger uk_aq_r2_history_dropbox_backup,yes,04:35 UTC
-CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 22 * * 0,Weekly Sun @ 22:00 UTC,Trigger uk_aq_r2_history_dropbox_backup force_prune_recheck,yes,22:00 UTC
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,49 5 * * *,Daily @ 05:49 UTC,Trigger uk_aq_dropbox_prune_raw,yes,05:49 UTC
 CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_core_snapshot.yml,CF workflow-scheduler,15 4 * * *,Daily @ 04:15 UTC,Core snapshot to R2,yes,04:15 UTC
 CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_history_dropbox_backup.yml,CF workflow-scheduler,35 4 * * *,Daily @ 04:35 UTC,Backup R2 history to Dropbox,yes,04:35 UTC
-CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_history_dropbox_backup.yml,CF workflow-scheduler,0 22 * * 0,Weekly Sun @ 22:00 UTC,Backup R2 history to Dropbox with force prune recheck,yes,22:00 UTC
 CIC-test-uk-aq-ops,GitHub Actions,uk_aq_dropbox_prune_raw.yml,CF workflow-scheduler,49 5 * * *,Daily @ 05:49 UTC,Prune raw data in Dropbox,yes,05:49 UTC
 CIC-test-uk-aq-ops,GitHub Actions,codeql-noarchive.yml,workflow schedule,17 3 * * 1,Weekly Mon @ 03:17 UTC,CodeQL analysis,yes,03:17 UTC
 CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-prune-daily,deploy workflow default,0 2 * * *,Daily @ 02:00 UTC,Prune old observations,yes,02:00 UTC
@@ -38,11 +36,9 @@ CIC-test-uk-aq-ingest,Cloudflare Worker,uk_aq_dispatcher,wrangler.toml,disabled 
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 3 * * *,Daily @ 03:00 UTC,Trigger uk_aq_stations_daily,yes
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,15 4 * * *,Daily @ 04:15 UTC,Trigger uk_aq_r2_core_snapshot,yes
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,35 4 * * *,Daily @ 04:35 UTC,Trigger uk_aq_r2_history_dropbox_backup,yes
-CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 22 * * 0,Weekly Sun @ 22:00 UTC,Trigger uk_aq_r2_history_dropbox_backup force_prune_recheck,yes
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,49 5 * * *,Daily @ 05:49 UTC,Trigger uk_aq_dropbox_prune_raw,yes
 CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_core_snapshot.yml,CF workflow-scheduler,15 4 * * *,Daily @ 04:15 UTC,Core snapshot to R2,yes
 CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_history_dropbox_backup.yml,CF workflow-scheduler,35 4 * * *,Daily @ 04:35 UTC,Backup R2 history to Dropbox,yes
-CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_history_dropbox_backup.yml,CF workflow-scheduler,0 22 * * 0,Weekly Sun @ 22:00 UTC,Backup R2 history to Dropbox with force prune recheck,yes
 CIC-test-uk-aq-ops,GitHub Actions,uk_aq_dropbox_prune_raw.yml,CF workflow-scheduler,49 5 * * *,Daily @ 05:49 UTC,Prune raw data in Dropbox,yes
 CIC-test-uk-aq-ops,GitHub Actions,codeql-noarchive.yml,workflow schedule,17 3 * * 1,Weekly Mon @ 03:17 UTC,CodeQL analysis,yes
 CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-prune-daily,deploy workflow default,0 2 * * *,Daily @ 02:00 UTC,Prune old observations,yes

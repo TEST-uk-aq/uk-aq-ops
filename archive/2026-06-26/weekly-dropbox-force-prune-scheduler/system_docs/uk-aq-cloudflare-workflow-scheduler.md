@@ -24,18 +24,12 @@ Scheduler implementation location in the ops repo:
 | ingest | `uk_aq_stations_daily.yml` | 03:00 daily | `0 3 * * *` |
 | ops | `uk_aq_r2_core_snapshot.yml` | 04:15 daily | `15 4 * * *` |
 | ops | `uk_aq_r2_history_dropbox_backup.yml` | 04:35 daily | `35 4 * * *` |
-| ops | `uk_aq_r2_history_dropbox_backup.yml` | 22:00 Sunday, force v2 prune recheck | `0 22 * * 0` |
 | ops | `uk_aq_dropbox_prune_raw.yml` | 09:22 daily | `22 9 * * *` |
 
 Cron edit rule:
 1. Change only `cloudflare/workflow-scheduler/wrangler.toml`.
-2. Keep `# job_keys: ...` comments on each cron line.
+2. Keep `# job_key: ...` comments on each cron line.
 3. Worker routing uses `job_key` mapping, not list position.
-
-Dropbox history backup scheduling:
-- The daily `35 4 * * *` dispatch runs the normal v2 Dropbox backup. It passes the active Worker `UK_AQ_R2_HISTORY_VERSION` as `history_version` and uses the v2 prune checkpoint for speed.
-- The Sunday `0 22 * * 0` dispatch runs the same workflow with `force_prune_recheck=true`. It is v2-only, forces a full v2 prune recheck, refreshes the v2 prune checkpoint, and catches unexpected Dropbox-only stale Parquet files.
-- If this Worker is deployed with `UK_AQ_R2_HISTORY_VERSION=v1`, the Sunday force-prune job logs a skip and does not fail the cron event.
 
 ## Workflows Intentionally Kept On GitHub Cron
 

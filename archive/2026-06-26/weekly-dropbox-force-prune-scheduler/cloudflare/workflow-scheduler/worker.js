@@ -53,17 +53,6 @@ export const JOBS = [
     ref: "main",
     history_version_input: true,
   },
-  // job_key: uk_aq_r2_history_dropbox_backup_force_prune_recheck
-  {
-    job_key: "uk_aq_r2_history_dropbox_backup_force_prune_recheck",
-    owner: "YOUR_GITHUB_OWNER",
-    repo: "uk-aq-ops",
-    workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
-    ref: "main",
-    history_version_input: true,
-    required_history_version: "v2",
-    inputs: { force_prune_recheck: "true" },
-  },
   // job_key: uk_aq_dropbox_prune_raw
   {
     job_key: "uk_aq_dropbox_prune_raw",
@@ -92,24 +81,10 @@ export function jobsForCron(cronExpression) {
 }
 
 export function inputsForJob(job, env = {}) {
-  const inputs = { ...(job.inputs || {}) };
   if (job.history_version_input) {
-    inputs.history_version = resolveHistoryVersion(env);
+    return { history_version: resolveHistoryVersion(env) };
   }
-  return Object.keys(inputs).length > 0 ? inputs : null;
-}
-
-function skipReasonForJob(job, env = {}) {
-  if (!job.required_history_version) {
-    return null;
-  }
-
-  const activeHistoryVersion = resolveHistoryVersion(env);
-  if (activeHistoryVersion === job.required_history_version) {
-    return null;
-  }
-
-  return `requires history_version=${job.required_history_version}; active history_version=${activeHistoryVersion}`;
+  return job.inputs || null;
 }
 
 export async function dispatchWorkflow(job, token, env = {}) {
@@ -152,39 +127,28 @@ export async function dispatchWorkflow(job, token, env = {}) {
   }
 }
 
-export async function dispatchCronJobs(cronExpression, jobs, token, env = {}) {
+export async function runCron(cronExpression, env) {
+  console.log(`[workflow-scheduler] received cron=${cronExpression}`);
+
+  const token = env.GITHUB_WORKFLOW_DISPATCH_TOKEN;
+  if (!token) {
+    throw new Error("Missing required Worker secret: GITHUB_WORKFLOW_DISPATCH_TOKEN");
+  }
+
+  const jobs = jobsForCron(cronExpression);
+  if (jobs.length === 0) {
+    console.log(
+      `[workflow-scheduler] no configured jobs matched cron=${cronExpression}; configured crons=${Object.keys(CRON_JOB_MAP).join(",")}`,
+    );
+    return;
+  }
+
+  console.log(
+    `[workflow-scheduler] cron=${cronExpression} dispatching ${jobs.length} logical job(s): ${jobs.map((job) => job.job_key).join(",")}`,
+  );
+
   const results = [];
   for (const job of jobs) {
-    let skipReason = null;
-    try {
-      skipReason = skipReasonForJob(job, env);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      results.push({
-        job_key: job.job_key,
-        workflow_file: job.workflow_file,
-        status: "failed",
-        error: message,
-      });
-      console.log(
-        `[workflow-scheduler] dispatch failed cron=${cronExpression} job_key=${job.job_key} workflow=${job.workflow_file} error=${message}`,
-      );
-      continue;
-    }
-
-    if (skipReason) {
-      results.push({
-        job_key: job.job_key,
-        workflow_file: job.workflow_file,
-        status: "skipped",
-        reason: skipReason,
-      });
-      console.log(
-        `[workflow-scheduler] skipping cron=${cronExpression} job_key=${job.job_key} workflow=${job.workflow_file} reason=${skipReason}`,
-      );
-      continue;
-    }
-
     try {
       await dispatchWorkflow(job, token, env);
       results.push({ job_key: job.job_key, workflow_file: job.workflow_file, status: "ok" });
@@ -212,31 +176,6 @@ export async function dispatchCronJobs(cronExpression, jobs, token, env = {}) {
       `Workflow scheduler partially failed for cron=${cronExpression}: ${failed.map((result) => `${result.job_key}: ${result.error}`).join("; ")}`,
     );
   }
-
-  return results;
-}
-
-export async function runCron(cronExpression, env) {
-  console.log(`[workflow-scheduler] received cron=${cronExpression}`);
-
-  const token = env.GITHUB_WORKFLOW_DISPATCH_TOKEN;
-  if (!token) {
-    throw new Error("Missing required Worker secret: GITHUB_WORKFLOW_DISPATCH_TOKEN");
-  }
-
-  const jobs = jobsForCron(cronExpression);
-  if (jobs.length === 0) {
-    console.log(
-      `[workflow-scheduler] no configured jobs matched cron=${cronExpression}; configured crons=${Object.keys(CRON_JOB_MAP).join(",")}`,
-    );
-    return;
-  }
-
-  console.log(
-    `[workflow-scheduler] cron=${cronExpression} dispatching ${jobs.length} logical job(s): ${jobs.map((job) => job.job_key).join(",")}`,
-  );
-
-  return dispatchCronJobs(cronExpression, jobs, token, env);
 }
 
 export default {
