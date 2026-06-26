@@ -23,11 +23,6 @@ on:
         required: false
         default: ""
         type: string
-      force_prune_recheck:
-        description: "Ignore the v2 Dropbox prune checkpoint and recheck selected prune units"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -69,7 +64,6 @@ jobs:
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
-      INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
 
     steps:
       - name: Checkout
@@ -242,9 +236,6 @@ jobs:
 
           if [ "${INPUT_DRY_RUN}" = "true" ]; then
             cmd+=(--dry-run)
-          fi
-          if [ "${INPUT_FORCE_PRUNE_RECHECK}" = "true" ]; then
-            cmd+=(--force-prune-recheck)
           fi
 
           echo "Running: ${cmd[*]}"

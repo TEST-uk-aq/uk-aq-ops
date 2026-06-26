@@ -136,6 +136,16 @@ function makeFakeRcloneBin(tempDir) {
 import fs from "node:fs";
 import path from "node:path";
 
+const rawArgs = process.argv.slice(2);
+const [command, target, dest] = rawArgs;
+if (process.env.FAKE_RCLONE_LOG) {
+  fs.appendFileSync(
+    process.env.FAKE_RCLONE_LOG,
+    JSON.stringify({ command, target, dest, args: rawArgs }) + "\\n",
+    "utf8",
+  );
+}
+
 function fail(message) {
   console.error(message);
   process.exit(1);
@@ -155,7 +165,6 @@ function walkFiles(root, current = "", out = []) {
   return out;
 }
 
-const [command, target, dest] = process.argv.slice(2);
 if (command === "cat") {
   if (!fs.existsSync(target)) fail("object not found");
   process.stdout.write(fs.readFileSync(target, "utf8"));
@@ -207,12 +216,14 @@ function runSyncCli({
   fakeRcloneBin,
   reportOut,
   extraArgs = [],
+  backupVersion = "v1",
+  fakeRcloneLog = "",
 }) {
   return spawnSync(
     process.execPath,
     [
       "scripts/backup_r2/sync_history_to_dropbox.mjs",
-      "--backup-version", "v1",
+      "--backup-version", backupVersion,
       "--source-root", sourceRoot,
       "--dest-root", destRoot,
       "--rclone-bin", fakeRcloneBin,
@@ -223,19 +234,39 @@ function runSyncCli({
     {
       cwd: process.cwd(),
       encoding: "utf8",
-      env: { ...process.env, UK_AQ_R2_HISTORY_VERSION: "v1" },
+      env: {
+        ...process.env,
+        UK_AQ_R2_HISTORY_VERSION: backupVersion,
+        ...(fakeRcloneLog ? { FAKE_RCLONE_LOG: fakeRcloneLog } : {}),
+      },
     },
   );
 }
 
-function seedInventory(sourceRoot, { hash = "hash-new", days = ["2026-06-18"] } = {}) {
+function obsDayInventoryEntryForVersion(dayUtc, hash, backupVersion = "v1") {
+  const prefix = backupVersion === "v2"
+    ? "history/v2/observations"
+    : "history/v1/observations";
+  return {
+    unit_type: "day_folder",
+    relative_path: `${prefix}/day_utc=${dayUtc}`,
+    manifest_relative_path: `${prefix}/day_utc=${dayUtc}/manifest.json`,
+    manifest_hash: hash,
+    manifest_size: 1234,
+  };
+}
+
+function seedInventory(sourceRoot, { hash = "hash-new", days = ["2026-06-18"], backupVersion = "v1" } = {}) {
   const dayEntries = {};
   for (const dayUtc of days) {
-    dayEntries[dayUtc] = obsDayInventoryEntry(dayUtc, hash);
+    dayEntries[dayUtc] = obsDayInventoryEntryForVersion(dayUtc, hash, backupVersion);
   }
+  const inventoryPath = backupVersion === "v2"
+    ? "history/_index_v2/backup_inventory_v2.json"
+    : "history/_index/backup_inventory_v1.json";
   writeJson(
-    path.join(sourceRoot, "history/_index/backup_inventory_v1.json"),
-    makeInventory({ days: { observations: dayEntries } }),
+    path.join(sourceRoot, inventoryPath),
+    makeInventory({ backupVersion, days: { observations: dayEntries } }),
   );
 }
 
@@ -243,10 +274,14 @@ function seedObservationDay(root, {
   dayUtc = "2026-06-18",
   manifestText = null,
   expectedPart = null,
+  backupVersion = "v1",
 } = {}) {
-  const dayRoot = path.join(root, `history/v1/observations/day_utc=${dayUtc}`);
+  const prefix = backupVersion === "v2"
+    ? "history/v2/observations"
+    : "history/v1/observations";
+  const dayRoot = path.join(root, `${prefix}/day_utc=${dayUtc}`);
   const manifestPart = expectedPart
-    || `history/v1/observations/day_utc=${dayUtc}/connector_id=1/part-00000.parquet`;
+    || `${prefix}/day_utc=${dayUtc}/connector_id=1/part-00000.parquet`;
   const manifest = {
     day_utc: dayUtc,
     connector_id: null,
@@ -261,12 +296,50 @@ function seedObservationDay(root, {
   return dayRoot;
 }
 
-function seedDestinationWithStaleParquet(destRoot, { dayUtc = "2026-06-18" } = {}) {
-  const dayRoot = path.join(destRoot, `history/v1/observations/day_utc=${dayUtc}`);
-  seedObservationDay(destRoot, { dayUtc });
+function seedDestinationWithStaleParquet(destRoot, { dayUtc = "2026-06-18", backupVersion = "v1" } = {}) {
+  const prefix = backupVersion === "v2"
+    ? "history/v2/observations"
+    : "history/v1/observations";
+  const dayRoot = path.join(destRoot, `${prefix}/day_utc=${dayUtc}`);
+  seedObservationDay(destRoot, { dayUtc, backupVersion });
   writeText(path.join(dayRoot, "connector_id=1/part-00001.parquet"), "stale");
   writeText(path.join(dayRoot, "connector_id=1/notes.txt"), "keep");
   return dayRoot;
+}
+
+function writeCopyCheckpoint(destRoot, { dayUtc = "2026-06-18", hash = "hash-new", backupVersion = "v1" } = {}) {
+  const relPath = backupVersion === "v2"
+    ? "_ops/checkpoints/r2_history_backup_state_v2.json"
+    : "_ops/checkpoints/r2_history_backup_state_v1.json";
+  writeJson(
+    path.join(destRoot, relPath),
+    makeCheckpoint({
+      days: { observations: { [dayUtc]: obsDayCheckpointEntry(dayUtc, hash) } },
+    }),
+  );
+}
+
+function writeV2PruneCheckpoint(destRoot, units) {
+  writeJson(
+    path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"),
+    {
+      version: 1,
+      kind: "uk_aq_r2_history_backup_prune_state",
+      backup_version: "v2",
+      created_at: "2026-06-26T00:00:00.000Z",
+      updated_at: "2026-06-26T00:00:00.000Z",
+      units,
+    },
+  );
+}
+
+function readFakeRcloneLog(logPath) {
+  if (!fs.existsSync(logPath)) return [];
+  return fs.readFileSync(logPath, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 // ----- planDays -----
@@ -804,6 +877,281 @@ test("sync does not write checkpoint when manifest prune fails", () => {
   const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
   assert.equal(report.prune.prune_error_count, 1);
   assert.match(report.prune.units[0].error, /Failed to parse manifest/);
+});
+
+test("sync v2 missing prune checkpoint prunes inventory units and writes ok state", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const unitPath = "history/v2/observations/day_utc=2026-06-18";
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2" });
+  seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-v2" });
+
+  const result = runSyncCli({ sourceRoot, destRoot, fakeRcloneBin, reportOut, backupVersion: "v2" });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const pruneStatePath = path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json");
+  assert.equal(fs.existsSync(pruneStatePath), true);
+  const pruneState = JSON.parse(fs.readFileSync(pruneStatePath, "utf8"));
+  assert.equal(pruneState.backup_version, "v2");
+  assert.equal(pruneState.units[unitPath].manifest_hash, "hash-v2");
+  assert.equal(pruneState.units[unitPath].status, "ok");
+  assert.equal(pruneState.units[unitPath].stale_deleted_count, 1);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune_checkpoint.enabled, true);
+  assert.equal(report.prune_checkpoint.existed, false);
+  assert.equal(report.prune_checkpoint.entries_written, 1);
+  assert.equal(report.prune.pruned_checkpoint_miss_count, 1);
+});
+
+test("sync v2 current prune checkpoint skips expensive prune listing", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const fakeRcloneLog = path.join(tempDir, "rclone.log");
+  const unitPath = "history/v2/observations/day_utc=2026-06-18";
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2" });
+  const destDayRoot = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-v2" });
+  writeV2PruneCheckpoint(destRoot, {
+    [unitPath]: {
+      manifest_hash: "hash-v2",
+      status: "ok",
+      pruned_at: "2026-06-26T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 1,
+      stale_deleted_count: 0,
+    },
+  });
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    fakeRcloneLog,
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), true);
+  const logEntries = readFakeRcloneLog(fakeRcloneLog);
+  assert.equal(
+    logEntries.some((entry) => entry.command === "lsjson" && String(entry.target).endsWith(unitPath)),
+    false,
+  );
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune.skipped_by_checkpoint, 1);
+  assert.equal(report.prune_checkpoint.skipped_by_checkpoint, 1);
+  assert.equal(report.prune_checkpoint.write_skipped_no_changes, true);
+});
+
+test("sync v2 stale prune checkpoint re-prunes and updates hash", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const unitPath = "history/v2/observations/day_utc=2026-06-18";
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-new" });
+  const destDayRoot = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-new" });
+  writeV2PruneCheckpoint(destRoot, {
+    [unitPath]: {
+      manifest_hash: "hash-old",
+      status: "ok",
+      pruned_at: "2026-06-25T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 1,
+      stale_deleted_count: 0,
+    },
+  });
+
+  const result = runSyncCli({ sourceRoot, destRoot, fakeRcloneBin, reportOut, backupVersion: "v2" });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), false);
+  const pruneState = JSON.parse(fs.readFileSync(path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"), "utf8"));
+  assert.equal(pruneState.units[unitPath].manifest_hash, "hash-new");
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune.pruned_checkpoint_miss_count, 1);
+  assert.equal(report.prune_checkpoint.entries_written, 1);
+});
+
+test("sync copied v2 unit prunes after copy even when prune checkpoint is current", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const unitPath = "history/v2/observations/day_utc=2026-06-18";
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-new" });
+  seedObservationDay(sourceRoot, { backupVersion: "v2" });
+  const destDayRoot = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-old" });
+  writeV2PruneCheckpoint(destRoot, {
+    [unitPath]: {
+      manifest_hash: "hash-new",
+      status: "ok",
+      pruned_at: "2026-06-26T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 1,
+      stale_deleted_count: 0,
+    },
+  });
+
+  const result = runSyncCli({ sourceRoot, destRoot, fakeRcloneBin, reportOut, backupVersion: "v2" });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.domains.observations.copied_days, 1);
+  assert.equal(report.prune.pruned_after_copy_count, 1);
+  assert.equal(report.prune_checkpoint.entries_written, 1);
+});
+
+test("sync v2 --force-prune-recheck ignores current prune checkpoint", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const unitPath = "history/v2/observations/day_utc=2026-06-18";
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2" });
+  const destDayRoot = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-v2" });
+  writeV2PruneCheckpoint(destRoot, {
+    [unitPath]: {
+      manifest_hash: "hash-v2",
+      status: "ok",
+      pruned_at: "2026-06-26T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 1,
+      stale_deleted_count: 0,
+    },
+  });
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    extraArgs: ["--force-prune-recheck"],
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune_checkpoint.force_recheck, true);
+  assert.equal(report.prune_checkpoint.used_for_skip, false);
+  assert.equal(report.prune.pruned_force_recheck_count, 1);
+});
+
+test("sync v2 dry-run does not delete or write prune checkpoint but reports planned update", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const destDayRoot = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-v2" });
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    extraArgs: ["--dry-run"],
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), true);
+  assert.equal(fs.existsSync(path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune.prune_dry_run_delete_count, 1);
+  assert.equal(report.prune_checkpoint.write_skipped_dry_run, true);
+  assert.equal(report.prune_checkpoint.planned_entries_written, 1);
+});
+
+test("sync v2 --prune-scope changed ignores unchanged units even with missing prune checkpoint", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const destDayRoot = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-v2" });
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    extraArgs: ["--prune-scope", "changed"],
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), true);
+  assert.equal(fs.existsSync(path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune.scope, "changed");
+  assert.equal(report.prune.attempted_units, 0);
+  assert.equal(report.prune_checkpoint.write_skipped_no_changes, true);
+});
+
+test("sync v1 does not create or require prune checkpoint", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  seedInventory(sourceRoot, { hash: "hash-v1" });
+  seedDestinationWithStaleParquet(destRoot);
+  writeCopyCheckpoint(destRoot, { hash: "hash-v1" });
+
+  const result = runSyncCli({ sourceRoot, destRoot, fakeRcloneBin, reportOut });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json")), false);
+  assert.equal(fs.existsSync(path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v1.json")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune_checkpoint.enabled, false);
+});
+
+test("sync v2 invalid prune checkpoint warns and does not skip pruning", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2" });
+  const destDayRoot = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-v2" });
+  writeText(path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"), "{bad json\n");
+
+  const result = runSyncCli({ sourceRoot, destRoot, fakeRcloneBin, reportOut, backupVersion: "v2" });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(path.join(destDayRoot, "connector_id=1/part-00001.parquet")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune_checkpoint.existed, true);
+  assert.equal(report.prune_checkpoint.loaded, false);
+  assert.equal(report.prune_checkpoint.used_for_skip, false);
+  assert.match(report.prune_checkpoint.warnings[0], /Ignoring invalid v2 prune checkpoint/);
 });
 
 // ----- backup version selection -----

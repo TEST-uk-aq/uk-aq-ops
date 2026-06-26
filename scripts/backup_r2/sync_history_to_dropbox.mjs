@@ -75,6 +75,9 @@ const DROPBOX_WRITE_RETRY_INITIAL_DELAY_MS = 5_000;
 const DROPBOX_WRITE_RETRY_MAX_DELAY_MS = 60_000;
 const DROPBOX_WRITE_RETRY_BACKOFF_MULTIPLIER = 2;
 const PRUNED_RELATIVE_PATH_REPORT_LIMIT = 200;
+const PRUNE_STATE_KIND = "uk_aq_r2_history_backup_prune_state";
+const PRUNE_STATE_VERSION = 1;
+const V2_PRUNE_STATE_REL_PATH = "_ops/checkpoints/r2_history_backup_prune_state_v2.json";
 
 function isDropboxTooManyWriteOperationsError(error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -126,6 +129,7 @@ function usage() {
       "  --domain <name>              observations | aqilevels | aqilevels_debug | core (repeatable)",
       "  --max-days-per-run <N>       Safety throttle on day copies; 0 = unlimited",
       "  --prune-scope <scope>        all | changed. Default: all",
+      "  --force-prune-recheck        Ignore v2 prune checkpoint skip entries",
       "  --no-prune-stale-parquet     Disable manifest-guided stale Parquet pruning",
       `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
       "  --report-out <file>          Write JSON report to file",
@@ -149,6 +153,7 @@ function parseArgs(argv) {
     domains: [],
     max_days_per_run: DEFAULT_MAX_DAYS_PER_RUN,
     prune_scope: "all",
+    force_prune_recheck: false,
     prune_stale_parquet: true,
     rclone_bin: DEFAULT_RCLONE_BIN,
     dry_run: false,
@@ -214,6 +219,10 @@ function parseArgs(argv) {
     }
     if (arg === "--no-prune-stale-parquet") {
       args.prune_stale_parquet = false;
+      continue;
+    }
+    if (arg === "--force-prune-recheck") {
+      args.force_prune_recheck = true;
       continue;
     }
     if (arg === "--rclone-bin") {
@@ -488,6 +497,115 @@ function writeCheckpointState(rcloneBin, checkpointPath, state) {
     checkpointPath,
     `${JSON.stringify(state, null, 2)}\n`,
     "uk_aq_r2_history_backup_state_",
+    dropboxWriteRetryOptions(),
+  );
+}
+
+function emptyPruneCheckpointState(nowIso) {
+  return {
+    version: PRUNE_STATE_VERSION,
+    kind: PRUNE_STATE_KIND,
+    backup_version: "v2",
+    created_at: nowIso,
+    updated_at: nowIso,
+    units: {},
+  };
+}
+
+function sanitizePruneCheckpointState(rawState, nowIso) {
+  if (!rawState || typeof rawState !== "object" || Array.isArray(rawState)) {
+    throw new Error("root is not a JSON object");
+  }
+  if (rawState.kind !== PRUNE_STATE_KIND) {
+    throw new Error(`unexpected kind=${JSON.stringify(rawState.kind)}`);
+  }
+  if (rawState.version !== PRUNE_STATE_VERSION) {
+    throw new Error(`unexpected version=${JSON.stringify(rawState.version)}`);
+  }
+  if (rawState.backup_version !== "v2") {
+    throw new Error(`unexpected backup_version=${JSON.stringify(rawState.backup_version)}`);
+  }
+
+  const units = {};
+  const rawUnits = rawState.units && typeof rawState.units === "object" && !Array.isArray(rawState.units)
+    ? rawState.units
+    : {};
+  for (const [rawUnitPath, rawEntry] of Object.entries(rawUnits)) {
+    const unitPath = normalizePosixRelativePath(rawUnitPath);
+    if (!unitPath || !rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      continue;
+    }
+    const manifestHash = String(rawEntry.manifest_hash || "").trim();
+    const status = String(rawEntry.status || "").trim();
+    if (!manifestHash || status !== "ok") {
+      continue;
+    }
+    units[unitPath] = {
+      manifest_hash: manifestHash,
+      status: "ok",
+      pruned_at: String(rawEntry.pruned_at || "").trim(),
+      manifest_count: Number.isFinite(Number(rawEntry.manifest_count)) ? Math.trunc(Number(rawEntry.manifest_count)) : 0,
+      manifest_referenced_parquet_count: Number.isFinite(Number(rawEntry.manifest_referenced_parquet_count))
+        ? Math.trunc(Number(rawEntry.manifest_referenced_parquet_count))
+        : 0,
+      actual_destination_parquet_count: Number.isFinite(Number(rawEntry.actual_destination_parquet_count))
+        ? Math.trunc(Number(rawEntry.actual_destination_parquet_count))
+        : 0,
+      stale_deleted_count: Number.isFinite(Number(rawEntry.stale_deleted_count))
+        ? Math.trunc(Number(rawEntry.stale_deleted_count))
+        : 0,
+    };
+  }
+
+  return {
+    version: PRUNE_STATE_VERSION,
+    kind: PRUNE_STATE_KIND,
+    backup_version: "v2",
+    created_at: typeof rawState.created_at === "string" && rawState.created_at ? rawState.created_at : nowIso,
+    updated_at: typeof rawState.updated_at === "string" && rawState.updated_at ? rawState.updated_at : nowIso,
+    units,
+  };
+}
+
+function loadPruneCheckpointState(rcloneBin, checkpointPath) {
+  const nowIso = new Date().toISOString();
+  const empty = emptyPruneCheckpointState(nowIso);
+  const result = rcloneCatMaybe(rcloneBin, checkpointPath);
+  if (!result.found) {
+    return {
+      state: empty,
+      existed: false,
+      loaded: false,
+      used_for_skip: true,
+      warnings: [],
+    };
+  }
+  try {
+    return {
+      state: sanitizePruneCheckpointState(JSON.parse(result.text), nowIso),
+      existed: true,
+      loaded: true,
+      used_for_skip: true,
+      warnings: [],
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      state: empty,
+      existed: true,
+      loaded: false,
+      used_for_skip: false,
+      warnings: [`Ignoring invalid v2 prune checkpoint at ${checkpointPath}: ${message}`],
+    };
+  }
+}
+
+function writePruneCheckpointState(rcloneBin, checkpointPath, state) {
+  uploadFromTempFile(
+    rcloneBin,
+    checkpointPath,
+    `${JSON.stringify(state, null, 2)}\n`,
+    "uk_aq_r2_history_backup_prune_state_",
     dropboxWriteRetryOptions(),
   );
 }
@@ -799,11 +917,17 @@ function emptyPruneReport(args) {
   return {
     enabled: Boolean(args.prune_stale_parquet),
     scope: args.prune_scope,
+    force_recheck: Boolean(args.force_prune_recheck),
     prune_attempted: false,
     prune_skipped: !args.prune_stale_parquet,
     skipped_reason: args.prune_stale_parquet ? null : "disabled_by_no_prune_stale_parquet",
     attempted_units: 0,
     skipped_units: 0,
+    pruned_after_copy_count: 0,
+    pruned_checkpoint_miss_count: 0,
+    pruned_force_recheck_count: 0,
+    skipped_by_checkpoint: 0,
+    planned_checkpoint_updates: 0,
     prune_deleted_count: 0,
     prune_dry_run_delete_count: 0,
     prune_error_count: 0,
@@ -812,6 +936,25 @@ function emptyPruneReport(args) {
     manifest_referenced_parquet_count: 0,
     actual_destination_parquet_count: 0,
     units: [],
+  };
+}
+
+function emptyPruneCheckpointReport(args, pruneCheckpointPath = null) {
+  const enabled = args.backup_version === "v2" && Boolean(args.prune_stale_parquet);
+  return {
+    enabled,
+    path: enabled ? V2_PRUNE_STATE_REL_PATH : null,
+    checkpoint_path: enabled ? pruneCheckpointPath : null,
+    loaded: false,
+    existed: false,
+    used_for_skip: false,
+    force_recheck: Boolean(args.force_prune_recheck),
+    skipped_by_checkpoint: 0,
+    entries_written: 0,
+    planned_entries_written: 0,
+    write_skipped_dry_run: false,
+    write_skipped_no_changes: false,
+    warnings: [],
   };
 }
 
@@ -835,6 +978,16 @@ function recordPruneUnitSummary(pruneReport, unitSummary) {
   } else {
     pruneReport.attempted_units += 1;
   }
+  if (unitSummary.prune_reason === "after_copy") {
+    pruneReport.pruned_after_copy_count += 1;
+  } else if (unitSummary.prune_reason === "checkpoint_missing_or_stale") {
+    pruneReport.pruned_checkpoint_miss_count += 1;
+  } else if (unitSummary.prune_reason === "force_recheck") {
+    pruneReport.pruned_force_recheck_count += 1;
+  }
+  if (unitSummary.prune_checkpoint_update_planned) {
+    pruneReport.planned_checkpoint_updates += 1;
+  }
   pruneReport.prune_deleted_count += Number(unitSummary.prune_deleted_count || 0);
   pruneReport.prune_dry_run_delete_count += Number(unitSummary.prune_dry_run_delete_count || 0);
   pruneReport.prune_error_count += Number(unitSummary.prune_error_count || 0);
@@ -857,6 +1010,24 @@ function recordPruneSkipped(pruneReport, unitRelativePath, reason) {
     prune_skipped: true,
     skipped_reason: reason,
     unit_relative_path: unitRelativePath,
+    manifest_referenced_parquet_count: 0,
+    actual_destination_parquet_count: 0,
+    prune_deleted_count: 0,
+    prune_dry_run_delete_count: 0,
+    prune_error_count: 0,
+    pruned_relative_paths: [],
+    pruned_relative_paths_truncated: false,
+  });
+}
+
+function recordPruneCheckpointSkipped(pruneReport, unitRelativePath, manifestHash) {
+  pruneReport.skipped_by_checkpoint += 1;
+  recordPruneUnitSummary(pruneReport, {
+    prune_attempted: false,
+    prune_skipped: true,
+    skipped_reason: "prune_checkpoint_current",
+    unit_relative_path: unitRelativePath,
+    manifest_hash: manifestHash,
     manifest_referenced_parquet_count: 0,
     actual_destination_parquet_count: 0,
     prune_deleted_count: 0,
@@ -895,6 +1066,32 @@ function inventoryDayUnits(inventory, args) {
     }
   }
   return units;
+}
+
+function pruneCheckpointEntryIsCurrent(pruneState, unitRelativePath, manifestHash) {
+  const entry = pruneState?.units?.[unitRelativePath];
+  return Boolean(
+    entry
+    && entry.status === "ok"
+    && String(entry.manifest_hash || "").trim()
+    && String(entry.manifest_hash || "").trim() === String(manifestHash || "").trim(),
+  );
+}
+
+function markPruneCheckpointUnitOk(pruneState, unitRelativePath, manifestHash, summary, prunedAt) {
+  if (!pruneState.units || typeof pruneState.units !== "object" || Array.isArray(pruneState.units)) {
+    pruneState.units = {};
+  }
+  pruneState.units[unitRelativePath] = {
+    manifest_hash: String(manifestHash || "").trim(),
+    status: "ok",
+    pruned_at: prunedAt,
+    manifest_count: Number(summary.manifest_count || 0),
+    manifest_referenced_parquet_count: Number(summary.manifest_referenced_parquet_count || 0),
+    actual_destination_parquet_count: Number(summary.actual_destination_parquet_count || 0),
+    stale_deleted_count: Number(summary.prune_deleted_count || 0),
+  };
+  pruneState.updated_at = prunedAt;
 }
 
 // ---- Planning (inventory-driven) ----
@@ -1051,6 +1248,22 @@ async function main(args) {
     indexTreeKeys,
   });
   const state = checkpointLoaded.state;
+  const pruneCheckpointEnabled = args.backup_version === "v2" && args.prune_stale_parquet;
+  const pruneCheckpointPath = pruneCheckpointEnabled
+    ? joinTargetPath(args.dest_root, V2_PRUNE_STATE_REL_PATH)
+    : null;
+  const pruneCheckpointLoaded = pruneCheckpointEnabled
+    ? loadPruneCheckpointState(args.rclone_bin, pruneCheckpointPath)
+    : {
+      state: null,
+      existed: false,
+      loaded: false,
+      used_for_skip: false,
+      warnings: [],
+    };
+  const pruneCheckpointState = pruneCheckpointLoaded.state;
+  let pruneCheckpointDirty = false;
+  let pruneCheckpointEntriesWritten = 0;
 
   const report = {
     ok: true,
@@ -1076,6 +1289,7 @@ async function main(args) {
     committed_connector_units: {},
     run_manifest_units: {},
     prune: emptyPruneReport(args),
+    prune_checkpoint: emptyPruneCheckpointReport(args, pruneCheckpointPath),
     totals: {
       listed_days: 0,
       candidate_days: 0,
@@ -1095,8 +1309,16 @@ async function main(args) {
       prune_deleted_count: 0,
       prune_dry_run_delete_count: 0,
       prune_error_count: 0,
+      prune_skipped_by_checkpoint: 0,
     },
   };
+  if (pruneCheckpointEnabled) {
+    report.prune_checkpoint.loaded = pruneCheckpointLoaded.loaded;
+    report.prune_checkpoint.existed = pruneCheckpointLoaded.existed;
+    report.prune_checkpoint.used_for_skip =
+      Boolean(pruneCheckpointLoaded.used_for_skip && !args.force_prune_recheck);
+    report.prune_checkpoint.warnings = [...pruneCheckpointLoaded.warnings];
+  }
   const prunedUnitPaths = new Set();
 
   function syncPruneTotals() {
@@ -1105,12 +1327,20 @@ async function main(args) {
     report.totals.prune_deleted_count = report.prune.prune_deleted_count;
     report.totals.prune_dry_run_delete_count = report.prune.prune_dry_run_delete_count;
     report.totals.prune_error_count = report.prune.prune_error_count;
+    report.totals.prune_skipped_by_checkpoint = report.prune.skipped_by_checkpoint;
+    report.prune_checkpoint.skipped_by_checkpoint = report.prune.skipped_by_checkpoint;
+    report.prune_checkpoint.planned_entries_written = report.prune.planned_checkpoint_updates;
+    report.prune_checkpoint.entries_written = pruneCheckpointEntriesWritten;
   }
 
   function reconcileCopiedDayUnit(invEntry, { dryRunManifestRoot = null } = {}) {
     const relativePath = normalizePosixRelativePath(invEntry?.relative_path || "");
+    const manifestHash = String(invEntry?.manifest_hash || "").trim();
     if (!relativePath) {
       throw new Error("Cannot prune copied unit with missing inventory relative_path");
+    }
+    if (!manifestHash) {
+      throw new Error(`Cannot prune copied unit ${relativePath} with missing inventory manifest_hash`);
     }
     if (!args.prune_stale_parquet) {
       recordPruneSkipped(report.prune, relativePath, "disabled_by_no_prune_stale_parquet");
@@ -1127,6 +1357,22 @@ async function main(args) {
         unitRelativePath: relativePath,
         dryRun: args.dry_run,
       });
+      summary.prune_reason = "after_copy";
+      summary.manifest_hash = manifestHash;
+      if (pruneCheckpointEnabled) {
+        summary.prune_checkpoint_update_planned = true;
+        if (!args.dry_run) {
+          markPruneCheckpointUnitOk(
+            pruneCheckpointState,
+            relativePath,
+            manifestHash,
+            summary,
+            new Date().toISOString(),
+          );
+          pruneCheckpointDirty = true;
+          pruneCheckpointEntriesWritten += 1;
+        }
+      }
       recordPruneUnitSummary(report.prune, summary);
       prunedUnitPaths.add(relativePath);
       syncPruneTotals();
@@ -1194,8 +1440,26 @@ async function main(args) {
 
   if (args.prune_stale_parquet && args.prune_scope === "all") {
     for (const unit of inventoryDayUnits(inventory, args)) {
+      const manifestHash = String(unit.inventory_entry?.manifest_hash || "").trim();
       if (prunedUnitPaths.has(unit.relative_path)) {
         recordPruneSkipped(report.prune, unit.relative_path, "already_pruned_after_copy");
+        syncPruneTotals();
+        continue;
+      }
+      if (!manifestHash) {
+        const error = new Error(`Cannot prune unit ${unit.relative_path} with missing inventory manifest_hash`);
+        recordPruneError(report.prune, unit.relative_path, error);
+        syncPruneTotals();
+        writeReport(args.report_out, report);
+        throw error;
+      }
+      if (
+        pruneCheckpointEnabled
+        && !args.force_prune_recheck
+        && pruneCheckpointLoaded.used_for_skip
+        && pruneCheckpointEntryIsCurrent(pruneCheckpointState, unit.relative_path, manifestHash)
+      ) {
+        recordPruneCheckpointSkipped(report.prune, unit.relative_path, manifestHash);
         syncPruneTotals();
         continue;
       }
@@ -1208,6 +1472,24 @@ async function main(args) {
           unitRelativePath: unit.relative_path,
           dryRun: args.dry_run,
         });
+        summary.prune_reason = args.force_prune_recheck
+          ? "force_recheck"
+          : "checkpoint_missing_or_stale";
+        summary.manifest_hash = manifestHash;
+        if (pruneCheckpointEnabled) {
+          summary.prune_checkpoint_update_planned = true;
+          if (!args.dry_run) {
+            markPruneCheckpointUnitOk(
+              pruneCheckpointState,
+              unit.relative_path,
+              manifestHash,
+              summary,
+              new Date().toISOString(),
+            );
+            pruneCheckpointDirty = true;
+            pruneCheckpointEntriesWritten += 1;
+          }
+        }
         recordPruneUnitSummary(report.prune, summary);
         prunedUnitPaths.add(unit.relative_path);
         syncPruneTotals();
@@ -1352,6 +1634,18 @@ async function main(args) {
     report.committed_connector_units[candidate.domain_key].copied_units.push(candidate.unit_key);
   }
 
+  if (pruneCheckpointEnabled) {
+    syncPruneTotals();
+    if (args.dry_run) {
+      report.prune_checkpoint.write_skipped_dry_run = true;
+    } else if (pruneCheckpointDirty) {
+      writePruneCheckpointState(args.rclone_bin, pruneCheckpointPath, pruneCheckpointState);
+      report.prune_checkpoint.entries_written = pruneCheckpointEntriesWritten;
+    } else {
+      report.prune_checkpoint.write_skipped_no_changes = true;
+    }
+  }
+
   report.completed_at = new Date().toISOString();
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
@@ -1378,6 +1672,8 @@ async function runCli() {
         default_domains: domainNamesForBackupVersion(parsedArgs.backup_version),
         index_file_keys: indexFileKeysForBackupVersion(parsedArgs.backup_version),
         index_tree_keys: indexTreeKeysForBackupVersion(parsedArgs.backup_version),
+        default_prune_scope: parsedArgs.prune_scope,
+        prune_checkpoint_rel_path: parsedArgs.backup_version === "v2" ? V2_PRUNE_STATE_REL_PATH : null,
       };
       console.log(JSON.stringify(selected, null, 2));
       return;
