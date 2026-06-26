@@ -11,6 +11,6 @@ crons = [
   "0 3 * * *",   # job_keys: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
   "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
   "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "0 22 * * 0",  # job_keys: uk_aq_r2_history_dropbox_backup_force_prune_recheck | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml force_prune_recheck=true
+  "0 22 * * SUN",  # job_keys: uk_aq_r2_history_dropbox_backup_force_prune_recheck | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml force_prune_recheck=true
   "49 5 * * *",  # job_keys: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]

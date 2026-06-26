@@ -68,7 +68,7 @@ test("Dropbox backup cron slot dispatches one active history-version job", () =>
 
 test("weekly Dropbox force-prune cron slot dispatches one v2-only job with merged inputs", () => {
   const cronJobMap = parseCronJobMap();
-  assert.deepEqual(cronJobMap.get("0 22 * * 0"), ["uk_aq_r2_history_dropbox_backup_force_prune_recheck"]);
+  assert.deepEqual(cronJobMap.get("0 22 * * SUN"), ["uk_aq_r2_history_dropbox_backup_force_prune_recheck"]);
   const job = jobByKey("uk_aq_r2_history_dropbox_backup_force_prune_recheck");
   assert.equal(job.history_version_input, true);
   assert.equal(job.required_history_version, "v2");
@@ -76,6 +76,19 @@ test("weekly Dropbox force-prune cron slot dispatches one v2-only job with merge
     force_prune_recheck: "true",
     history_version: "v2",
   });
+});
+
+test("wrangler cron expressions avoid Cloudflare-invalid Sunday zero", () => {
+  const cronJobMap = parseCronJobMap();
+  for (const cronExpression of cronJobMap.keys()) {
+    const fields = cronExpression.trim().split(/\s+/);
+    assert.equal(fields.length, 5, `cron must have five fields: ${cronExpression}`);
+    assert.notEqual(
+      fields[4],
+      "0",
+      `Cloudflare Workers cron does not accept weekday 0 for Sunday; use SUN or 1: ${cronExpression}`,
+    );
+  }
 });
 
 test("dispatchWorkflow includes active history_version in GitHub API body", async () => {
@@ -163,10 +176,10 @@ test("v2-only force-prune job dispatches on v2 and skips cleanly on v1", async (
 
   try {
     const job = jobByKey("uk_aq_r2_history_dropbox_backup_force_prune_recheck");
-    const v2Results = await dispatchCronJobs("0 22 * * 0", [job], "test-token", {
+    const v2Results = await dispatchCronJobs("0 22 * * SUN", [job], "test-token", {
       UK_AQ_R2_HISTORY_VERSION: "v2",
     });
-    const v1Results = await dispatchCronJobs("0 22 * * 0", [job], "test-token", {
+    const v1Results = await dispatchCronJobs("0 22 * * SUN", [job], "test-token", {
       UK_AQ_R2_HISTORY_VERSION: "v1",
     });
 
