@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { dispatchCronJobs, dispatchWorkflow, inputsForJob, JOBS } from "../cloudflare/workflow-scheduler/worker.js";
+import { dispatchWorkflow, inputsForJob, JOBS } from "../cloudflare/workflow-scheduler/worker.js";
 
 const wranglerText = readFileSync("cloudflare/workflow-scheduler/wrangler.toml", "utf8");
 const schedulerDeployWorkflowText = readFileSync(".github/workflows/uk_aq_workflow_scheduler_deploy.yml", "utf8");
@@ -34,7 +34,7 @@ function jobByKey(jobKey) {
 
 test("wrangler cron count stays within Cloudflare limit and below previous expanded config", () => {
   const cronJobMap = parseCronJobMap();
-  assert.equal(cronJobMap.size, 5);
+  assert.equal(cronJobMap.size, 4);
   assert.ok(cronJobMap.size <= 5, "Cloudflare allows at most five cron triggers");
   assert.ok(cronJobMap.size <= 6, "grouped scheduler must not increase the previous checked-in expanded cron count");
 });
@@ -66,18 +66,6 @@ test("Dropbox backup cron slot dispatches one active history-version job", () =>
   assert.deepEqual(inputsForJob(job, { UK_AQ_R2_HISTORY_VERSION: "v2" }), { history_version: "v2" });
 });
 
-test("weekly Dropbox force-prune cron slot dispatches one v2-only job with merged inputs", () => {
-  const cronJobMap = parseCronJobMap();
-  assert.deepEqual(cronJobMap.get("0 22 * * 0"), ["uk_aq_r2_history_dropbox_backup_force_prune_recheck"]);
-  const job = jobByKey("uk_aq_r2_history_dropbox_backup_force_prune_recheck");
-  assert.equal(job.history_version_input, true);
-  assert.equal(job.required_history_version, "v2");
-  assert.deepEqual(inputsForJob(job, { UK_AQ_R2_HISTORY_VERSION: "v2" }), {
-    force_prune_recheck: "true",
-    history_version: "v2",
-  });
-});
-
 test("dispatchWorkflow includes active history_version in GitHub API body", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -100,31 +88,6 @@ test("dispatchWorkflow includes active history_version in GitHub API body", asyn
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     ref: "main",
     inputs: { history_version: "v2" },
-  });
-});
-
-test("dispatchWorkflow includes weekly force-prune static input plus active history_version", async () => {
-  const originalFetch = globalThis.fetch;
-  const calls = [];
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url, init });
-    return new Response(null, { status: 204 });
-  };
-
-  try {
-    await dispatchWorkflow(
-      jobByKey("uk_aq_r2_history_dropbox_backup_force_prune_recheck"),
-      "test-token",
-      { UK_AQ_R2_HISTORY_VERSION: "v2" },
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-
-  assert.equal(calls.length, 1);
-  assert.deepEqual(JSON.parse(calls[0].init.body), {
-    ref: "main",
-    inputs: { force_prune_recheck: "true", history_version: "v2" },
   });
 });
 
@@ -151,49 +114,6 @@ test("dispatchWorkflow preserves single-job cron behaviour by omitting inputs wh
 
   assert.equal(calls.length, 1);
   assert.deepEqual(JSON.parse(calls[0].init.body), { ref: "main" });
-});
-
-test("v2-only force-prune job dispatches on v2 and skips cleanly on v1", async () => {
-  const originalFetch = globalThis.fetch;
-  const calls = [];
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url, init });
-    return new Response(null, { status: 204 });
-  };
-
-  try {
-    const job = jobByKey("uk_aq_r2_history_dropbox_backup_force_prune_recheck");
-    const v2Results = await dispatchCronJobs("0 22 * * 0", [job], "test-token", {
-      UK_AQ_R2_HISTORY_VERSION: "v2",
-    });
-    const v1Results = await dispatchCronJobs("0 22 * * 0", [job], "test-token", {
-      UK_AQ_R2_HISTORY_VERSION: "v1",
-    });
-
-    assert.deepEqual(v2Results, [
-      {
-        job_key: "uk_aq_r2_history_dropbox_backup_force_prune_recheck",
-        workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
-        status: "ok",
-      },
-    ]);
-    assert.deepEqual(v1Results, [
-      {
-        job_key: "uk_aq_r2_history_dropbox_backup_force_prune_recheck",
-        workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
-        status: "skipped",
-        reason: "requires history_version=v2; active history_version=v1",
-      },
-    ]);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-
-  assert.equal(calls.length, 1);
-  assert.deepEqual(JSON.parse(calls[0].init.body), {
-    ref: "main",
-    inputs: { force_prune_recheck: "true", history_version: "v2" },
-  });
 });
 
 test("worker source uses cron-to-array map for grouped logical jobs", () => {

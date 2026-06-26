@@ -15,7 +15,6 @@ crons = [
   "0 3 * * *",   # job_keys: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
   "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
   "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
-  "0 22 * * 0",  # job_keys: uk_aq_r2_history_dropbox_backup_force_prune_recheck | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml force_prune_recheck=true
   "49 5 * * *",  # job_keys: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
 ]
 ```
@@ -27,8 +26,7 @@ crons = [
 1. Cloudflare fires `scheduled()` and passes only the cron string (no job name).
 2. Deploy workflow builds a `cron -> [job_key, ...]` map from `wrangler.toml` comments.
 3. Worker matches the received cron string to one or more logical job keys, then dispatches matching workflows.
-4. R2 jobs pass one explicit `history_version` input derived from the Worker `UK_AQ_R2_HISTORY_VERSION` config, merged with any static workflow inputs declared for the logical job. The Worker does not dispatch separate v1/v2 job variants.
-5. The weekly Dropbox force-prune recheck job is v2-only. A Worker deployed with `UK_AQ_R2_HISTORY_VERSION=v1` logs a skip for that job and does not fail the cron event.
+4. R2 jobs pass one explicit `history_version` input derived from the Worker `UK_AQ_R2_HISTORY_VERSION` config. The Worker does not dispatch separate v1/v2 job variants.
 
 The tracked `wrangler.toml` must not hard-code `UK_AQ_R2_HISTORY_VERSION`.
 The deploy workflow reads `UK_AQ_R2_HISTORY_VERSION` from the current repo's
@@ -76,13 +74,11 @@ Optional:
 
 Configured R2 history jobs:
 - `15 4 * * *` dispatches `uk_aq_r2_core_snapshot` once to `uk_aq_r2_core_snapshot.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION`.
-- `35 4 * * *` dispatches `uk_aq_r2_history_dropbox_backup` once to `uk_aq_r2_history_dropbox_backup.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION`. This is the normal daily v2 Dropbox backup and uses the v2 prune checkpoint for speed.
-- `0 22 * * 0` dispatches `uk_aq_r2_history_dropbox_backup_force_prune_recheck` once to `uk_aq_r2_history_dropbox_backup.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION` and `force_prune_recheck=true`. This weekly Sunday run forces a full v2 prune recheck, refreshes the v2 prune checkpoint, and catches unexpected Dropbox-only stale Parquet files.
+- `35 4 * * *` dispatches `uk_aq_r2_history_dropbox_backup` once to `uk_aq_r2_history_dropbox_backup.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION`.
 
 Worker logs include:
 - received cron expression
 - cron expression, `job_key`, workflow, and non-secret workflow inputs being dispatched
-- skip reason for jobs gated by active history version
 - GitHub API response status
 - grouped summary for cron events that dispatch multiple logical jobs
 - GitHub error response body (if any)
