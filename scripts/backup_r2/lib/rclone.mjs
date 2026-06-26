@@ -90,6 +90,9 @@ export function runRcloneWithRetry(rcloneBin, rcloneArgs, options = {}) {
   const onRetry = typeof options.on_retry === "function"
     ? options.on_retry
     : null;
+  const onRetryExhausted = typeof options.on_retry_exhausted === "function"
+    ? options.on_retry_exhausted
+    : null;
 
   let attempt = 1;
   let delayMs = initialDelayMs;
@@ -97,8 +100,20 @@ export function runRcloneWithRetry(rcloneBin, rcloneArgs, options = {}) {
     try {
       return runRclone(rcloneBin, rcloneArgs, options);
     } catch (error) {
-      const retryable = attempt < maxAttempts && shouldRetry(error);
-      if (!retryable) {
+      const matchedRetryableError = shouldRetry(error);
+      if (!matchedRetryableError || attempt >= maxAttempts) {
+        if (matchedRetryableError && onRetryExhausted) {
+          try {
+            onRetryExhausted({
+              attempt,
+              max_attempts: maxAttempts,
+              args: [...rcloneArgs],
+              error,
+            });
+          } catch {
+            // Never mask the original rclone error because a callback throws.
+          }
+        }
         throw error;
       }
 
@@ -136,8 +151,25 @@ export function isRcloneNotFoundMessage(text) {
   );
 }
 
-export function rcloneCatMaybe(rcloneBin, targetPath) {
-  const result = runRclone(rcloneBin, ["cat", targetPath], { allow_failure: true });
+export function rcloneCatMaybe(rcloneBin, targetPath, retryOptions = null) {
+  const args = ["cat", targetPath];
+  let result;
+  try {
+    result = retryOptions
+      ? runRcloneWithRetry(rcloneBin, args, retryOptions)
+      : runRclone(rcloneBin, args, { allow_failure: true });
+  } catch (error) {
+    const combined = error instanceof Error ? error.message : String(error);
+    if (isRcloneNotFoundMessage(combined)) {
+      return { found: false, text: "" };
+    }
+    throw new Error(
+      [`Failed to read path with rclone cat: ${targetPath}`, combined.trim()]
+        .filter(Boolean)
+        .join("\n"),
+      { cause: error },
+    );
+  }
   if (result.status === 0) {
     return { found: true, text: result.stdout };
   }
@@ -152,8 +184,8 @@ export function rcloneCatMaybe(rcloneBin, targetPath) {
   );
 }
 
-export function rcloneCat(rcloneBin, targetPath) {
-  const result = rcloneCatMaybe(rcloneBin, targetPath);
+export function rcloneCat(rcloneBin, targetPath, retryOptions = null) {
+  const result = rcloneCatMaybe(rcloneBin, targetPath, retryOptions);
   if (!result.found) {
     throw new Error(`rclone cat: object not found: ${targetPath}`);
   }
@@ -185,13 +217,33 @@ export function rcloneDeleteFile(rcloneBin, targetPath, retryOptions = null) {
 // recursing into `history/v1/observations/` walks every parquet part inside
 // each connector folder — thousands of extra LIST entries that cost minutes
 // of GH-runner time per scan.
-export function rcloneLsjsonRecursive(rcloneBin, targetPath, { hash = true, maxDepth = 0 } = {}) {
+export function rcloneLsjsonRecursive(
+  rcloneBin,
+  targetPath,
+  { hash = true, maxDepth = 0, retryOptions = null } = {},
+) {
   const args = ["lsjson", targetPath, "--recursive", "--files-only"];
   if (hash) args.push("--hash", "--hash-type", "MD5");
   if (Number.isFinite(maxDepth) && maxDepth > 0) {
     args.push("--max-depth", String(Math.trunc(maxDepth)));
   }
-  const result = runRclone(rcloneBin, args, { allow_failure: true });
+  let result;
+  try {
+    result = retryOptions
+      ? runRcloneWithRetry(rcloneBin, args, retryOptions)
+      : runRclone(rcloneBin, args, { allow_failure: true });
+  } catch (error) {
+    const combined = error instanceof Error ? error.message : String(error);
+    if (isRcloneNotFoundMessage(combined)) {
+      return [];
+    }
+    throw new Error(
+      [`rclone lsjson recursive failed: ${targetPath}`, combined.trim()]
+        .filter(Boolean)
+        .join("\n"),
+      { cause: error },
+    );
+  }
   if (result.status !== 0) {
     const combined = `${result.stderr}\n${result.stdout}`;
     if (isRcloneNotFoundMessage(combined)) {
@@ -218,10 +270,31 @@ export function rcloneLsjsonRecursive(rcloneBin, targetPath, { hash = true, maxD
 //
 // `--hash --hash-type MD5` is included by default for the same reason as
 // `rcloneLsjsonRecursive` — see that function's comment.
-export function rcloneLsjsonFile(rcloneBin, parentPath, fileName, { hash = true } = {}) {
+export function rcloneLsjsonFile(
+  rcloneBin,
+  parentPath,
+  fileName,
+  { hash = true, retryOptions = null } = {},
+) {
   const args = ["lsjson", parentPath, "--files-only", "--max-depth", "1"];
   if (hash) args.push("--hash", "--hash-type", "MD5");
-  const result = runRclone(rcloneBin, args, { allow_failure: true });
+  let result;
+  try {
+    result = retryOptions
+      ? runRcloneWithRetry(rcloneBin, args, retryOptions)
+      : runRclone(rcloneBin, args, { allow_failure: true });
+  } catch (error) {
+    const combined = error instanceof Error ? error.message : String(error);
+    if (isRcloneNotFoundMessage(combined)) {
+      return null;
+    }
+    throw new Error(
+      [`rclone lsjson failed: ${parentPath}`, combined.trim()]
+        .filter(Boolean)
+        .join("\n"),
+      { cause: error },
+    );
+  }
   if (result.status !== 0) {
     const combined = `${result.stderr}\n${result.stdout}`;
     if (isRcloneNotFoundMessage(combined)) {

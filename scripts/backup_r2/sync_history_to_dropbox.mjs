@@ -74,6 +74,10 @@ const DROPBOX_WRITE_RETRY_MAX_ATTEMPTS = 7;
 const DROPBOX_WRITE_RETRY_INITIAL_DELAY_MS = 5_000;
 const DROPBOX_WRITE_RETRY_MAX_DELAY_MS = 60_000;
 const DROPBOX_WRITE_RETRY_BACKOFF_MULTIPLIER = 2;
+const DROPBOX_READ_LIST_RETRY_MAX_ATTEMPTS = 5;
+const DROPBOX_READ_LIST_RETRY_INITIAL_DELAY_MS = 10_000;
+const DROPBOX_READ_LIST_RETRY_MAX_DELAY_MS = 60_000;
+const DROPBOX_READ_LIST_RETRY_BACKOFF_MULTIPLIER = 2;
 const PRUNED_RELATIVE_PATH_REPORT_LIMIT = 200;
 const PRUNE_STATE_KIND = "uk_aq_r2_history_backup_prune_state";
 const PRUNE_STATE_VERSION = 1;
@@ -108,6 +112,58 @@ function dropboxWriteRetryOptions() {
 
 function runDropboxWriteAwareRclone(rcloneBin, rcloneArgs) {
   runRcloneWithRetry(rcloneBin, rcloneArgs, dropboxWriteRetryOptions());
+}
+
+export function isDropboxTransientReadListError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:path\/not_folder|too_many_requests|rate(?:[ _-]?limit|_limited)|too many requests|timeout|timed out|connection reset|connection refused|temporary failure|temporarily unavailable|server error|internal_error|\b5\d\d\b|\b429\b)/i.test(
+    message,
+  );
+}
+
+export function dropboxReadListRetryOptions({
+  retryStats = null,
+  initialDelayMs = DROPBOX_READ_LIST_RETRY_INITIAL_DELAY_MS,
+  maxDelayMs = DROPBOX_READ_LIST_RETRY_MAX_DELAY_MS,
+} = {}) {
+  return {
+    max_attempts: DROPBOX_READ_LIST_RETRY_MAX_ATTEMPTS,
+    initial_delay_ms: initialDelayMs,
+    max_delay_ms: maxDelayMs,
+    backoff_multiplier: DROPBOX_READ_LIST_RETRY_BACKOFF_MULTIPLIER,
+    should_retry: isDropboxTransientReadListError,
+    on_retry: (event) => {
+      if (retryStats) {
+        retryStats.retry_count += 1;
+        retryStats.max_attempts_used = Math.max(
+          retryStats.max_attempts_used,
+          Number(event.attempt || 0) + 1,
+        );
+      }
+      console.warn(
+        `[backup-r2] retrying Dropbox read/list after transient rclone error `
+        + `attempt=${event.attempt} max_attempts=${event.max_attempts} `
+        + `delay_ms=${event.delay_ms} args=${event.args.join(" ")}`,
+      );
+    },
+    on_retry_exhausted: (event) => {
+      if (retryStats) {
+        retryStats.exhausted_count += 1;
+        retryStats.max_attempts_used = Math.max(
+          retryStats.max_attempts_used,
+          Number(event.attempt || 0),
+        );
+      }
+    },
+  };
+}
+
+function emptyReadListRetryStats() {
+  return {
+    retry_count: 0,
+    exhausted_count: 0,
+    max_attempts_used: 1,
+  };
 }
 
 function usage() {
@@ -477,7 +533,7 @@ export function sanitizeCheckpointState(rawState, {
 
 function loadCheckpointState(rcloneBin, checkpointPath, options = {}) {
   const nowIso = new Date().toISOString();
-  const result = rcloneCatMaybe(rcloneBin, checkpointPath);
+  const result = rcloneCatMaybe(rcloneBin, checkpointPath, options.retryOptions);
   if (!result.found) {
     return { state: emptyCheckpointState(nowIso, options), existed: false };
   }
@@ -567,10 +623,10 @@ function sanitizePruneCheckpointState(rawState, nowIso) {
   };
 }
 
-function loadPruneCheckpointState(rcloneBin, checkpointPath) {
+function loadPruneCheckpointState(rcloneBin, checkpointPath, retryOptions = null) {
   const nowIso = new Date().toISOString();
   const empty = emptyPruneCheckpointState(nowIso);
-  const result = rcloneCatMaybe(rcloneBin, checkpointPath);
+  const result = rcloneCatMaybe(rcloneBin, checkpointPath, retryOptions);
   if (!result.found) {
     return {
       state: empty,
@@ -852,20 +908,30 @@ export function buildStaleParquetPrunePlan({
   };
 }
 
-function loadManifestEntriesForPrune(rcloneBin, manifestRootPath) {
-  const entries = rcloneLsjsonRecursive(rcloneBin, manifestRootPath, { hash: false });
+function loadManifestEntriesForPrune(rcloneBin, manifestRootPath, retryOptions = null) {
+  const entries = rcloneLsjsonRecursive(rcloneBin, manifestRootPath, {
+    hash: false,
+    retryOptions,
+  });
   return entries
     .map((entry) => pathFromLsjsonEntry(entry))
     .filter((relPath) => relPath.endsWith("manifest.json"))
     .sort()
     .map((relativePath) => ({
       relative_path: relativePath,
-      text: rcloneCat(rcloneBin, joinTargetPath(manifestRootPath, relativePath)),
+      text: rcloneCat(
+        rcloneBin,
+        joinTargetPath(manifestRootPath, relativePath),
+        retryOptions,
+      ),
     }));
 }
 
-function loadActualParquetEntriesForPrune(rcloneBin, destUnitPath) {
-  return rcloneLsjsonRecursive(rcloneBin, destUnitPath, { hash: false })
+function loadActualParquetEntriesForPrune(rcloneBin, destUnitPath, retryOptions = null) {
+  return rcloneLsjsonRecursive(rcloneBin, destUnitPath, {
+    hash: false,
+    retryOptions,
+  })
     .map((entry) => ({ ...entry, Path: pathFromLsjsonEntry(entry) }))
     .filter((entry) => entry.Path.endsWith(".parquet"));
 }
@@ -876,11 +942,22 @@ export function pruneStaleParquetForUnit({
   destUnitPath,
   unitRelativePath,
   dryRun = false,
+  readListRetryOptions = null,
+  manifestReadListRetryOptions = readListRetryOptions,
+  destinationReadListRetryOptions = readListRetryOptions,
 } = {}) {
   const plan = buildStaleParquetPrunePlan({
     unit_relative_path: unitRelativePath,
-    manifest_entries: loadManifestEntriesForPrune(rcloneBin, manifestRootPath),
-    actual_file_entries: loadActualParquetEntriesForPrune(rcloneBin, destUnitPath),
+    manifest_entries: loadManifestEntriesForPrune(
+      rcloneBin,
+      manifestRootPath,
+      manifestReadListRetryOptions,
+    ),
+    actual_file_entries: loadActualParquetEntriesForPrune(
+      rcloneBin,
+      destUnitPath,
+      destinationReadListRetryOptions,
+    ),
   });
 
   const deletedPaths = [];
@@ -931,6 +1008,10 @@ function emptyPruneReport(args) {
     prune_deleted_count: 0,
     prune_dry_run_delete_count: 0,
     prune_error_count: 0,
+    read_list_retry_count: 0,
+    read_list_retry_exhausted_count: 0,
+    failed_units: [],
+    continued_after_unit_failure: false,
     pruned_relative_paths: [],
     pruned_relative_paths_truncated: false,
     manifest_referenced_parquet_count: 0,
@@ -991,8 +1072,19 @@ function recordPruneUnitSummary(pruneReport, unitSummary) {
   pruneReport.prune_deleted_count += Number(unitSummary.prune_deleted_count || 0);
   pruneReport.prune_dry_run_delete_count += Number(unitSummary.prune_dry_run_delete_count || 0);
   pruneReport.prune_error_count += Number(unitSummary.prune_error_count || 0);
+  pruneReport.read_list_retry_count += Number(unitSummary.read_list_retry_count || 0);
+  pruneReport.read_list_retry_exhausted_count += Number(
+    unitSummary.read_list_retry_exhausted_count || 0,
+  );
   pruneReport.manifest_referenced_parquet_count += Number(unitSummary.manifest_referenced_parquet_count || 0);
   pruneReport.actual_destination_parquet_count += Number(unitSummary.actual_destination_parquet_count || 0);
+  if (unitSummary.error) {
+    pruneReport.failed_units.push({
+      unit_relative_path: unitSummary.unit_relative_path,
+      error: unitSummary.error,
+      retry_attempts: Number(unitSummary.retry_attempts || 1),
+    });
+  }
   appendPrunedRelativePaths(pruneReport, unitSummary);
   pruneReport.units.push({
     ...unitSummary,
@@ -1038,7 +1130,14 @@ function recordPruneCheckpointSkipped(pruneReport, unitRelativePath, manifestHas
   });
 }
 
-function recordPruneError(pruneReport, unitRelativePath, error) {
+function attachReadListRetryStats(unitSummary, retryStats) {
+  unitSummary.read_list_retry_count = Number(retryStats?.retry_count || 0);
+  unitSummary.read_list_retry_exhausted_count = Number(retryStats?.exhausted_count || 0);
+  unitSummary.retry_attempts = Number(retryStats?.max_attempts_used || 1);
+  return unitSummary;
+}
+
+function recordPruneError(pruneReport, unitRelativePath, error, retryStats = null) {
   recordPruneUnitSummary(pruneReport, {
     prune_attempted: true,
     prune_skipped: false,
@@ -1048,6 +1147,9 @@ function recordPruneError(pruneReport, unitRelativePath, error) {
     prune_deleted_count: 0,
     prune_dry_run_delete_count: 0,
     prune_error_count: 1,
+    read_list_retry_count: Number(retryStats?.retry_count || 0),
+    read_list_retry_exhausted_count: Number(retryStats?.exhausted_count || 0),
+    retry_attempts: Number(retryStats?.max_attempts_used || 1),
     pruned_relative_paths: [],
     pruned_relative_paths_truncated: false,
     error: error instanceof Error ? error.message : String(error),
@@ -1246,6 +1348,7 @@ async function main(args) {
     domainNames,
     indexFileKeys,
     indexTreeKeys,
+    retryOptions: dropboxReadListRetryOptions(),
   });
   const state = checkpointLoaded.state;
   const pruneCheckpointEnabled = args.backup_version === "v2" && args.prune_stale_parquet;
@@ -1253,7 +1356,11 @@ async function main(args) {
     ? joinTargetPath(args.dest_root, V2_PRUNE_STATE_REL_PATH)
     : null;
   const pruneCheckpointLoaded = pruneCheckpointEnabled
-    ? loadPruneCheckpointState(args.rclone_bin, pruneCheckpointPath)
+    ? loadPruneCheckpointState(
+      args.rclone_bin,
+      pruneCheckpointPath,
+      dropboxReadListRetryOptions(),
+    )
     : {
       state: null,
       existed: false,
@@ -1347,16 +1454,21 @@ async function main(args) {
       syncPruneTotals();
       return;
     }
+    const retryStats = emptyReadListRetryStats();
     try {
       const destDayPath = joinTargetPath(args.dest_root, relativePath);
       const manifestRootPath = dryRunManifestRoot || destDayPath;
+      const readListRetryOptions = dropboxReadListRetryOptions({ retryStats });
       const summary = pruneStaleParquetForUnit({
         rcloneBin: args.rclone_bin,
         manifestRootPath,
         destUnitPath: destDayPath,
         unitRelativePath: relativePath,
         dryRun: args.dry_run,
+        manifestReadListRetryOptions: dryRunManifestRoot ? null : readListRetryOptions,
+        destinationReadListRetryOptions: readListRetryOptions,
       });
+      attachReadListRetryStats(summary, retryStats);
       summary.prune_reason = "after_copy";
       summary.manifest_hash = manifestHash;
       if (pruneCheckpointEnabled) {
@@ -1377,7 +1489,7 @@ async function main(args) {
       prunedUnitPaths.add(relativePath);
       syncPruneTotals();
     } catch (error) {
-      recordPruneError(report.prune, relativePath, error);
+      recordPruneError(report.prune, relativePath, error, retryStats);
       syncPruneTotals();
       writeReport(args.report_out, report);
       throw error;
@@ -1439,7 +1551,11 @@ async function main(args) {
   }
 
   if (args.prune_stale_parquet && args.prune_scope === "all") {
+    const allPruneFailures = [];
     for (const unit of inventoryDayUnits(inventory, args)) {
+      if (allPruneFailures.length > 0) {
+        report.prune.continued_after_unit_failure = true;
+      }
       const manifestHash = String(unit.inventory_entry?.manifest_hash || "").trim();
       if (prunedUnitPaths.has(unit.relative_path)) {
         recordPruneSkipped(report.prune, unit.relative_path, "already_pruned_after_copy");
@@ -1451,7 +1567,8 @@ async function main(args) {
         recordPruneError(report.prune, unit.relative_path, error);
         syncPruneTotals();
         writeReport(args.report_out, report);
-        throw error;
+        allPruneFailures.push(error);
+        continue;
       }
       if (
         pruneCheckpointEnabled
@@ -1463,6 +1580,7 @@ async function main(args) {
         syncPruneTotals();
         continue;
       }
+      const retryStats = emptyReadListRetryStats();
       try {
         const destDayPath = joinTargetPath(args.dest_root, unit.relative_path);
         const summary = pruneStaleParquetForUnit({
@@ -1471,7 +1589,9 @@ async function main(args) {
           destUnitPath: destDayPath,
           unitRelativePath: unit.relative_path,
           dryRun: args.dry_run,
+          readListRetryOptions: dropboxReadListRetryOptions({ retryStats }),
         });
+        attachReadListRetryStats(summary, retryStats);
         summary.prune_reason = args.force_prune_recheck
           ? "force_recheck"
           : "checkpoint_missing_or_stale";
@@ -1494,11 +1614,31 @@ async function main(args) {
         prunedUnitPaths.add(unit.relative_path);
         syncPruneTotals();
       } catch (error) {
-        recordPruneError(report.prune, unit.relative_path, error);
+        recordPruneError(report.prune, unit.relative_path, error, retryStats);
         syncPruneTotals();
         writeReport(args.report_out, report);
-        throw error;
+        allPruneFailures.push(error);
       }
+    }
+    if (allPruneFailures.length > 0) {
+      syncPruneTotals();
+      if (pruneCheckpointEnabled) {
+        if (args.dry_run) {
+          report.prune_checkpoint.write_skipped_dry_run = true;
+        } else if (pruneCheckpointDirty) {
+          writePruneCheckpointState(args.rclone_bin, pruneCheckpointPath, pruneCheckpointState);
+          report.prune_checkpoint.entries_written = pruneCheckpointEntriesWritten;
+        } else {
+          report.prune_checkpoint.write_skipped_no_changes = true;
+        }
+      }
+      report.ok = false;
+      report.completed_at = new Date().toISOString();
+      writeReport(args.report_out, report);
+      throw new Error(
+        `Dropbox prune audit failed for ${allPruneFailures.length} inventory-listed unit(s); `
+        + "see prune.failed_units in the report",
+      );
     }
   }
 

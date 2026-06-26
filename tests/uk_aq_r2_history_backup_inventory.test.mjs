@@ -15,12 +15,15 @@ import { spawnSync } from "node:child_process";
 
 import {
   buildStaleParquetPrunePlan,
+  dropboxReadListRetryOptions,
+  pruneStaleParquetForUnit,
   planDays,
   planIndexFiles,
   planIndexTreeUnits,
   planRunManifestUnits,
   sanitizeCheckpointState,
 } from "../scripts/backup_r2/sync_history_to_dropbox.mjs";
+import { rcloneCatMaybe } from "../scripts/backup_r2/lib/rclone.mjs";
 import { isRunManifestUnitPath } from "../scripts/backup_r2/build_backup_inventory.mjs";
 import {
   defaultInventoryRelPathForBackupVersion,
@@ -130,6 +133,10 @@ function writeText(filePath, content) {
   fs.writeFileSync(filePath, content, "utf8");
 }
 
+function writeFakeRcloneFailurePlan(filePath, rules) {
+  writeJson(filePath, { rules });
+}
+
 function makeFakeRcloneBin(tempDir) {
   const binPath = path.join(tempDir, "fake-rclone.mjs");
   writeText(binPath, `#!/usr/bin/env node
@@ -151,6 +158,22 @@ function fail(message) {
   process.exit(1);
 }
 
+function injectPlannedFailure() {
+  const planPath = process.env.FAKE_RCLONE_FAILURE_PLAN;
+  if (!planPath || !fs.existsSync(planPath)) return;
+  const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
+  const rules = Array.isArray(plan.rules) ? plan.rules : [];
+  const rule = rules.find((candidate) => (
+    Number(candidate.remaining || 0) > 0
+    && (!candidate.command || candidate.command === command)
+    && (!candidate.target_suffix || String(target || "").endsWith(candidate.target_suffix))
+  ));
+  if (!rule) return;
+  rule.remaining = Number(rule.remaining) - 1;
+  fs.writeFileSync(planPath, JSON.stringify(plan, null, 2) + "\\n", "utf8");
+  fail(rule.message || "temporary failure");
+}
+
 function walkFiles(root, current = "", out = []) {
   const base = current ? path.join(root, current) : root;
   if (!fs.existsSync(base)) return out;
@@ -164,6 +187,8 @@ function walkFiles(root, current = "", out = []) {
   }
   return out;
 }
+
+injectPlannedFailure();
 
 if (command === "cat") {
   if (!fs.existsSync(target)) fail("object not found");
@@ -218,6 +243,7 @@ function runSyncCli({
   extraArgs = [],
   backupVersion = "v1",
   fakeRcloneLog = "",
+  fakeRcloneFailurePlan = "",
 }) {
   return spawnSync(
     process.execPath,
@@ -238,6 +264,7 @@ function runSyncCli({
         ...process.env,
         UK_AQ_R2_HISTORY_VERSION: backupVersion,
         ...(fakeRcloneLog ? { FAKE_RCLONE_LOG: fakeRcloneLog } : {}),
+        ...(fakeRcloneFailurePlan ? { FAKE_RCLONE_FAILURE_PLAN: fakeRcloneFailurePlan } : {}),
       },
     },
   );
@@ -340,6 +367,25 @@ function readFakeRcloneLog(logPath) {
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line));
+}
+
+function withFakeRcloneEnvironment(envValues, callback) {
+  const previous = {};
+  for (const [key, value] of Object.entries(envValues)) {
+    previous[key] = process.env[key];
+    process.env[key] = value;
+  }
+  try {
+    return callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
 }
 
 // ----- planDays -----
@@ -695,6 +741,144 @@ test("buildStaleParquetPrunePlan fails closed when manifest JSON is invalid", ()
   );
 });
 
+test("Dropbox rclone cat transient read failure retries and prune succeeds", () => {
+  const tempDir = makeTempDir();
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const failurePlan = path.join(tempDir, "failure-plan.json");
+  const unitRelativePath = "history/v2/observations/day_utc=2026-06-18";
+  const unitPath = seedDestinationWithStaleParquet(tempDir, { backupVersion: "v2" });
+  const retryStats = { retry_count: 0, exhausted_count: 0, max_attempts_used: 1 };
+  writeFakeRcloneFailurePlan(failurePlan, [{
+    command: "cat",
+    target_suffix: "/manifest.json",
+    remaining: 1,
+    message: "path/not_folder",
+  }]);
+
+  const summary = withFakeRcloneEnvironment(
+    { FAKE_RCLONE_FAILURE_PLAN: failurePlan },
+    () => pruneStaleParquetForUnit({
+      rcloneBin: fakeRcloneBin,
+      manifestRootPath: unitPath,
+      destUnitPath: unitPath,
+      unitRelativePath,
+      readListRetryOptions: dropboxReadListRetryOptions({
+        retryStats,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+      }),
+    }),
+  );
+
+  assert.equal(summary.prune_error_count, 0);
+  assert.equal(summary.prune_deleted_count, 1);
+  assert.equal(retryStats.retry_count, 1);
+  assert.equal(retryStats.exhausted_count, 0);
+  assert.equal(retryStats.max_attempts_used, 2);
+});
+
+test("Dropbox rclone lsjson transient list failure retries and prune succeeds", () => {
+  const tempDir = makeTempDir();
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const failurePlan = path.join(tempDir, "failure-plan.json");
+  const unitRelativePath = "history/v2/observations/day_utc=2026-06-18";
+  const unitPath = seedDestinationWithStaleParquet(tempDir, { backupVersion: "v2" });
+  const retryStats = { retry_count: 0, exhausted_count: 0, max_attempts_used: 1 };
+  writeFakeRcloneFailurePlan(failurePlan, [{
+    command: "lsjson",
+    target_suffix: "/day_utc=2026-06-18",
+    remaining: 1,
+    message: "too_many_requests",
+  }]);
+
+  const summary = withFakeRcloneEnvironment(
+    { FAKE_RCLONE_FAILURE_PLAN: failurePlan },
+    () => pruneStaleParquetForUnit({
+      rcloneBin: fakeRcloneBin,
+      manifestRootPath: unitPath,
+      destUnitPath: unitPath,
+      unitRelativePath,
+      readListRetryOptions: dropboxReadListRetryOptions({
+        retryStats,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+      }),
+    }),
+  );
+
+  assert.equal(summary.prune_deleted_count, 1);
+  assert.equal(retryStats.retry_count, 1);
+  assert.equal(retryStats.exhausted_count, 0);
+});
+
+test("Dropbox read retry exhaustion fails closed without deleting", () => {
+  const tempDir = makeTempDir();
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const fakeRcloneLog = path.join(tempDir, "rclone.log");
+  const failurePlan = path.join(tempDir, "failure-plan.json");
+  const unitRelativePath = "history/v2/observations/day_utc=2026-06-18";
+  const unitPath = seedDestinationWithStaleParquet(tempDir, { backupVersion: "v2" });
+  const stalePath = path.join(unitPath, "connector_id=1/part-00001.parquet");
+  const retryStats = { retry_count: 0, exhausted_count: 0, max_attempts_used: 1 };
+  writeFakeRcloneFailurePlan(failurePlan, [{
+    command: "cat",
+    target_suffix: "/manifest.json",
+    remaining: 5,
+    message: "path/not_folder",
+  }]);
+
+  assert.throws(
+    () => withFakeRcloneEnvironment(
+      {
+        FAKE_RCLONE_FAILURE_PLAN: failurePlan,
+        FAKE_RCLONE_LOG: fakeRcloneLog,
+      },
+      () => pruneStaleParquetForUnit({
+        rcloneBin: fakeRcloneBin,
+        manifestRootPath: unitPath,
+        destUnitPath: unitPath,
+        unitRelativePath,
+        readListRetryOptions: dropboxReadListRetryOptions({
+          retryStats,
+          initialDelayMs: 0,
+          maxDelayMs: 0,
+        }),
+      }),
+    ),
+    /path\/not_folder/,
+  );
+
+  assert.equal(fs.existsSync(stalePath), true);
+  assert.equal(retryStats.retry_count, 4);
+  assert.equal(retryStats.exhausted_count, 1);
+  assert.equal(retryStats.max_attempts_used, 5);
+  assert.equal(readFakeRcloneLog(fakeRcloneLog).some((entry) => entry.command === "deletefile"), false);
+});
+
+test("ordinary rclone cat not-found remains missing without retry", () => {
+  const tempDir = makeTempDir();
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const fakeRcloneLog = path.join(tempDir, "rclone.log");
+  const retryStats = { retry_count: 0, exhausted_count: 0, max_attempts_used: 1 };
+
+  const result = withFakeRcloneEnvironment(
+    { FAKE_RCLONE_LOG: fakeRcloneLog },
+    () => rcloneCatMaybe(
+      fakeRcloneBin,
+      path.join(tempDir, "missing.json"),
+      dropboxReadListRetryOptions({
+        retryStats,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+      }),
+    ),
+  );
+
+  assert.deepEqual(result, { found: false, text: "" });
+  assert.equal(retryStats.retry_count, 0);
+  assert.equal(readFakeRcloneLog(fakeRcloneLog).length, 1);
+});
+
 test("sync default prunes stale Parquet after copy and keeps non-Parquet files", () => {
   const tempDir = makeTempDir();
   const sourceRoot = path.join(tempDir, "source");
@@ -907,6 +1091,47 @@ test("sync v2 missing prune checkpoint prunes inventory units and writes ok stat
   assert.equal(report.prune.pruned_checkpoint_miss_count, 1);
 });
 
+test("sync v2 reports a recovered Dropbox manifest read retry and checkpoints the unit", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const failurePlan = path.join(tempDir, "failure-plan.json");
+  const unitPath = "history/v2/observations/day_utc=2026-06-18";
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2" });
+  seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2" });
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", hash: "hash-v2" });
+  writeFakeRcloneFailurePlan(failurePlan, [{
+    command: "cat",
+    target_suffix: `${unitPath}/manifest.json`,
+    remaining: 1,
+    message: "path/not_folder",
+  }]);
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    fakeRcloneFailurePlan: failurePlan,
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune.read_list_retry_count, 1);
+  assert.equal(report.prune.read_list_retry_exhausted_count, 0);
+  assert.equal(report.prune.failed_units.length, 0);
+  const pruneState = JSON.parse(
+    fs.readFileSync(
+      path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(pruneState.units[unitPath].status, "ok");
+});
+
 test("sync v2 current prune checkpoint skips expensive prune listing", () => {
   const tempDir = makeTempDir();
   const sourceRoot = path.join(tempDir, "source");
@@ -1055,6 +1280,72 @@ test("sync v2 --force-prune-recheck ignores current prune checkpoint", () => {
   assert.equal(report.prune_checkpoint.force_recheck, true);
   assert.equal(report.prune_checkpoint.used_for_skip, false);
   assert.equal(report.prune.pruned_force_recheck_count, 1);
+});
+
+test("force/all prune continues after a failed unit and fails after auditing later units", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const firstDay = "2026-06-18";
+  const secondDay = "2026-06-19";
+  const firstUnit = `history/v2/observations/day_utc=${firstDay}`;
+  const secondUnit = `history/v2/observations/day_utc=${secondDay}`;
+  seedInventory(sourceRoot, {
+    backupVersion: "v2",
+    hash: "hash-v2",
+    days: [firstDay, secondDay],
+  });
+  const firstDest = seedDestinationWithStaleParquet(destRoot, {
+    backupVersion: "v2",
+    dayUtc: firstDay,
+  });
+  const secondDest = seedDestinationWithStaleParquet(destRoot, {
+    backupVersion: "v2",
+    dayUtc: secondDay,
+  });
+  writeText(path.join(firstDest, "manifest.json"), "{bad json\n");
+  writeJson(
+    path.join(destRoot, "_ops/checkpoints/r2_history_backup_state_v2.json"),
+    makeCheckpoint({
+      days: {
+        observations: {
+          [firstDay]: obsDayCheckpointEntry(firstDay, "hash-v2"),
+          [secondDay]: obsDayCheckpointEntry(secondDay, "hash-v2"),
+        },
+      },
+    }),
+  );
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    extraArgs: ["--force-prune-recheck"],
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.existsSync(path.join(firstDest, "connector_id=1/part-00001.parquet")), true);
+  assert.equal(fs.existsSync(path.join(secondDest, "connector_id=1/part-00001.parquet")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.ok, false);
+  assert.equal(report.prune.prune_error_count, 1);
+  assert.equal(report.prune.continued_after_unit_failure, true);
+  assert.equal(report.prune.failed_units.length, 1);
+  assert.equal(report.prune.failed_units[0].unit_relative_path, firstUnit);
+  assert.equal(report.prune.failed_units[0].retry_attempts, 1);
+  assert.equal(report.prune.read_list_retry_count, 0);
+  const pruneState = JSON.parse(
+    fs.readFileSync(
+      path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(pruneState.units[firstUnit], undefined);
+  assert.equal(pruneState.units[secondUnit].status, "ok");
 });
 
 test("sync v2 dry-run does not delete or write prune checkpoint but reports planned update", () => {
