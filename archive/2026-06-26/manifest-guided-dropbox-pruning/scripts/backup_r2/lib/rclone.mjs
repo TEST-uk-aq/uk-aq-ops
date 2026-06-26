@@ -160,14 +160,6 @@ export function rcloneCat(rcloneBin, targetPath) {
   return result.text;
 }
 
-export function rcloneDeleteFile(rcloneBin, targetPath, retryOptions = null) {
-  const args = ["deletefile", targetPath];
-  if (retryOptions) {
-    return runRcloneWithRetry(rcloneBin, args, retryOptions);
-  }
-  return runRclone(rcloneBin, args);
-}
-
 // Recursive lsjson for files under a remote path. Returns [] if the path does
 // not exist; throws on any other rclone error.
 //

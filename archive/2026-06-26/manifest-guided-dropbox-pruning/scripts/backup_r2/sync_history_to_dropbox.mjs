@@ -28,10 +28,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   joinTargetPath,
-  rcloneCat,
   rcloneCatMaybe,
-  rcloneDeleteFile,
-  rcloneLsjsonRecursive,
   runRclone,
   runRcloneWithRetry,
   sha256Hex,
@@ -74,7 +71,6 @@ const DROPBOX_WRITE_RETRY_MAX_ATTEMPTS = 7;
 const DROPBOX_WRITE_RETRY_INITIAL_DELAY_MS = 5_000;
 const DROPBOX_WRITE_RETRY_MAX_DELAY_MS = 60_000;
 const DROPBOX_WRITE_RETRY_BACKOFF_MULTIPLIER = 2;
-const PRUNED_RELATIVE_PATH_REPORT_LIMIT = 200;
 
 function isDropboxTooManyWriteOperationsError(error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -125,8 +121,6 @@ function usage() {
       "  --state-rel-path <path>      Default: selected-version checkpoint path",
       "  --domain <name>              observations | aqilevels | aqilevels_debug | core (repeatable)",
       "  --max-days-per-run <N>       Safety throttle on day copies; 0 = unlimited",
-      "  --prune-scope <scope>        changed | all. Default: changed",
-      "  --no-prune-stale-parquet     Disable manifest-guided stale Parquet pruning",
       `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
       "  --report-out <file>          Write JSON report to file",
       "  --dry-run                    Plan only; no copies, no checkpoint writes",
@@ -148,8 +142,6 @@ function parseArgs(argv) {
     state_rel_path: ENV_STATE_REL_PATH,
     domains: [],
     max_days_per_run: DEFAULT_MAX_DAYS_PER_RUN,
-    prune_scope: "changed",
-    prune_stale_parquet: true,
     rclone_bin: DEFAULT_RCLONE_BIN,
     dry_run: false,
     report_out: DEFAULT_REPORT_OUT,
@@ -201,19 +193,6 @@ function parseArgs(argv) {
       }
       args.max_days_per_run = parsed;
       i += 1;
-      continue;
-    }
-    if (arg === "--prune-scope") {
-      const scope = String(argv[i + 1] || "").trim();
-      if (!["changed", "all"].includes(scope)) {
-        throw new Error("--prune-scope must be changed or all");
-      }
-      args.prune_scope = scope;
-      i += 1;
-      continue;
-    }
-    if (arg === "--no-prune-stale-parquet") {
-      args.prune_stale_parquet = false;
       continue;
     }
     if (arg === "--rclone-bin") {
@@ -595,308 +574,6 @@ function copyFilePath(rcloneBin, sourcePath, destPath, dryRun) {
   runDropboxWriteAwareRclone(rcloneBin, args);
 }
 
-// ---- Manifest-guided stale Parquet pruning ----
-
-function normalizePosixRelativePath(rawPath) {
-  const cleaned = String(rawPath || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
-  if (!cleaned || cleaned.includes("\0")) return "";
-  const normalized = path.posix.normalize(cleaned);
-  if (!normalized || normalized === "." || normalized.startsWith("../") || normalized === "..") {
-    return "";
-  }
-  return normalized;
-}
-
-function pathFromLsjsonEntry(entry) {
-  return normalizePosixRelativePath(entry?.Path || entry?.Name || "");
-}
-
-function toUnitRelativeManifestPath(rawPath, unitRelativePath, manifestRelativePath) {
-  const raw = normalizePosixRelativePath(rawPath);
-  if (!raw || !raw.endsWith(".parquet")) return null;
-
-  const unit = normalizePosixRelativePath(unitRelativePath);
-  if (!unit) {
-    throw new Error(`Invalid prune unit path: ${unitRelativePath}`);
-  }
-
-  let relPath = "";
-  if (raw === unit || raw.startsWith(`${unit}/`)) {
-    relPath = raw.slice(unit.length).replace(/^\/+/, "");
-  } else if (raw.startsWith("history/")) {
-    throw new Error(
-      `Manifest parquet path is outside prune unit: unit=${unit} path=${raw}`,
-    );
-  } else if (raw.includes("/")) {
-    relPath = raw;
-  } else {
-    const manifestRel = normalizePosixRelativePath(manifestRelativePath);
-    const manifestDir = manifestRel && manifestRel.includes("/")
-      ? path.posix.dirname(manifestRel)
-      : "";
-    relPath = manifestDir ? path.posix.join(manifestDir, raw) : raw;
-  }
-
-  const normalizedRel = normalizePosixRelativePath(relPath);
-  if (!normalizedRel || normalizedRel.startsWith("history/") || !normalizedRel.endsWith(".parquet")) {
-    throw new Error(
-      `Manifest parquet path cannot be normalized safely: unit=${unit} path=${raw}`,
-    );
-  }
-  return normalizedRel;
-}
-
-function addManifestParquetReference(expectedPaths, rawPath, context) {
-  const relPath = toUnitRelativeManifestPath(
-    rawPath,
-    context.unit_relative_path,
-    context.manifest_relative_path,
-  );
-  if (relPath) expectedPaths.add(relPath);
-}
-
-export function buildStaleParquetPrunePlan({
-  unit_relative_path,
-  manifest_entries,
-  actual_file_entries,
-} = {}) {
-  const unitRelativePath = normalizePosixRelativePath(unit_relative_path);
-  if (!unitRelativePath) {
-    throw new Error(`Invalid prune unit path: ${unit_relative_path}`);
-  }
-  const manifests = Array.isArray(manifest_entries) ? manifest_entries : [];
-  if (manifests.length === 0) {
-    throw new Error(`No manifest.json files found for prune unit: ${unitRelativePath}`);
-  }
-
-  const expectedPaths = new Set();
-  for (const entry of manifests) {
-    const manifestRelativePath = normalizePosixRelativePath(entry?.relative_path || "");
-    if (!manifestRelativePath || !manifestRelativePath.endsWith("manifest.json")) {
-      throw new Error(`Invalid manifest path for prune unit ${unitRelativePath}: ${entry?.relative_path || ""}`);
-    }
-    let manifest;
-    try {
-      manifest = JSON.parse(String(entry?.text || ""));
-    } catch (error) {
-      throw new Error(
-        `Failed to parse manifest for prune unit ${unitRelativePath} at ${manifestRelativePath}: ${error?.message || error}`,
-      );
-    }
-    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
-      throw new Error(`Manifest root is not a JSON object for prune unit ${unitRelativePath} at ${manifestRelativePath}`);
-    }
-
-    const context = {
-      unit_relative_path: unitRelativePath,
-      manifest_relative_path: manifestRelativePath,
-    };
-    if (Array.isArray(manifest.parquet_object_keys)) {
-      for (const rawPath of manifest.parquet_object_keys) {
-        addManifestParquetReference(expectedPaths, rawPath, context);
-      }
-    }
-    if (Array.isArray(manifest.files)) {
-      for (const fileEntry of manifest.files) {
-        addManifestParquetReference(
-          expectedPaths,
-          fileEntry?.key || fileEntry?.relative_path || fileEntry?.path || fileEntry?.name,
-          context,
-        );
-      }
-    }
-  }
-
-  const actualPaths = new Set();
-  for (const entry of Array.isArray(actual_file_entries) ? actual_file_entries : []) {
-    const relPath = pathFromLsjsonEntry(entry);
-    if (relPath && relPath.endsWith(".parquet")) {
-      actualPaths.add(relPath);
-    }
-  }
-
-  if (expectedPaths.size === 0 && actualPaths.size > 0) {
-    throw new Error(
-      `No manifest-referenced Parquet paths found for prune unit ${unitRelativePath}; refusing to delete destination files`,
-    );
-  }
-
-  const stalePaths = Array.from(actualPaths)
-    .filter((relPath) => !expectedPaths.has(relPath))
-    .sort();
-
-  return {
-    unit_relative_path: unitRelativePath,
-    manifest_count: manifests.length,
-    manifest_referenced_parquet_count: expectedPaths.size,
-    actual_destination_parquet_count: actualPaths.size,
-    stale_relative_paths: stalePaths,
-  };
-}
-
-function loadManifestEntriesForPrune(rcloneBin, manifestRootPath) {
-  const entries = rcloneLsjsonRecursive(rcloneBin, manifestRootPath, { hash: false });
-  return entries
-    .map((entry) => pathFromLsjsonEntry(entry))
-    .filter((relPath) => relPath.endsWith("manifest.json"))
-    .sort()
-    .map((relativePath) => ({
-      relative_path: relativePath,
-      text: rcloneCat(rcloneBin, joinTargetPath(manifestRootPath, relativePath)),
-    }));
-}
-
-function loadActualParquetEntriesForPrune(rcloneBin, destUnitPath) {
-  return rcloneLsjsonRecursive(rcloneBin, destUnitPath, { hash: false })
-    .map((entry) => ({ ...entry, Path: pathFromLsjsonEntry(entry) }))
-    .filter((entry) => entry.Path.endsWith(".parquet"));
-}
-
-export function pruneStaleParquetForUnit({
-  rcloneBin,
-  manifestRootPath,
-  destUnitPath,
-  unitRelativePath,
-  dryRun = false,
-} = {}) {
-  const plan = buildStaleParquetPrunePlan({
-    unit_relative_path: unitRelativePath,
-    manifest_entries: loadManifestEntriesForPrune(rcloneBin, manifestRootPath),
-    actual_file_entries: loadActualParquetEntriesForPrune(rcloneBin, destUnitPath),
-  });
-
-  const deletedPaths = [];
-  const dryRunPaths = [];
-  for (const relPath of plan.stale_relative_paths) {
-    if (dryRun) {
-      dryRunPaths.push(relPath);
-      continue;
-    }
-    rcloneDeleteFile(
-      rcloneBin,
-      joinTargetPath(destUnitPath, relPath),
-      dropboxWriteRetryOptions(),
-    );
-    deletedPaths.push(relPath);
-  }
-
-  return {
-    prune_attempted: true,
-    prune_skipped: false,
-    unit_relative_path: plan.unit_relative_path,
-    manifest_count: plan.manifest_count,
-    manifest_referenced_parquet_count: plan.manifest_referenced_parquet_count,
-    actual_destination_parquet_count: plan.actual_destination_parquet_count,
-    prune_deleted_count: deletedPaths.length,
-    prune_dry_run_delete_count: dryRunPaths.length,
-    prune_error_count: 0,
-    pruned_relative_paths: dryRun ? dryRunPaths : deletedPaths,
-    pruned_relative_paths_truncated: false,
-  };
-}
-
-function emptyPruneReport(args) {
-  return {
-    enabled: Boolean(args.prune_stale_parquet),
-    scope: args.prune_scope,
-    prune_attempted: false,
-    prune_skipped: !args.prune_stale_parquet,
-    skipped_reason: args.prune_stale_parquet ? null : "disabled_by_no_prune_stale_parquet",
-    attempted_units: 0,
-    skipped_units: 0,
-    prune_deleted_count: 0,
-    prune_dry_run_delete_count: 0,
-    prune_error_count: 0,
-    pruned_relative_paths: [],
-    pruned_relative_paths_truncated: false,
-    manifest_referenced_parquet_count: 0,
-    actual_destination_parquet_count: 0,
-    units: [],
-  };
-}
-
-function appendPrunedRelativePaths(pruneReport, unitSummary) {
-  const paths = Array.isArray(unitSummary.pruned_relative_paths)
-    ? unitSummary.pruned_relative_paths
-    : [];
-  for (const relPath of paths) {
-    if (pruneReport.pruned_relative_paths.length < PRUNED_RELATIVE_PATH_REPORT_LIMIT) {
-      pruneReport.pruned_relative_paths.push(`${unitSummary.unit_relative_path}/${relPath}`);
-    } else {
-      pruneReport.pruned_relative_paths_truncated = true;
-    }
-  }
-}
-
-function recordPruneUnitSummary(pruneReport, unitSummary) {
-  pruneReport.prune_attempted = pruneReport.prune_attempted || Boolean(unitSummary.prune_attempted);
-  if (unitSummary.prune_skipped) {
-    pruneReport.skipped_units += 1;
-  } else {
-    pruneReport.attempted_units += 1;
-  }
-  pruneReport.prune_deleted_count += Number(unitSummary.prune_deleted_count || 0);
-  pruneReport.prune_dry_run_delete_count += Number(unitSummary.prune_dry_run_delete_count || 0);
-  pruneReport.prune_error_count += Number(unitSummary.prune_error_count || 0);
-  pruneReport.manifest_referenced_parquet_count += Number(unitSummary.manifest_referenced_parquet_count || 0);
-  pruneReport.actual_destination_parquet_count += Number(unitSummary.actual_destination_parquet_count || 0);
-  appendPrunedRelativePaths(pruneReport, unitSummary);
-  pruneReport.units.push({
-    ...unitSummary,
-    pruned_relative_paths: Array.isArray(unitSummary.pruned_relative_paths)
-      ? unitSummary.pruned_relative_paths.slice(0, PRUNED_RELATIVE_PATH_REPORT_LIMIT)
-      : [],
-    pruned_relative_paths_truncated: Array.isArray(unitSummary.pruned_relative_paths)
-      && unitSummary.pruned_relative_paths.length > PRUNED_RELATIVE_PATH_REPORT_LIMIT,
-  });
-}
-
-function recordPruneSkipped(pruneReport, unitRelativePath, reason) {
-  recordPruneUnitSummary(pruneReport, {
-    prune_attempted: false,
-    prune_skipped: true,
-    skipped_reason: reason,
-    unit_relative_path: unitRelativePath,
-    manifest_referenced_parquet_count: 0,
-    actual_destination_parquet_count: 0,
-    prune_deleted_count: 0,
-    prune_dry_run_delete_count: 0,
-    prune_error_count: 0,
-    pruned_relative_paths: [],
-    pruned_relative_paths_truncated: false,
-  });
-}
-
-function recordPruneError(pruneReport, unitRelativePath, error) {
-  recordPruneUnitSummary(pruneReport, {
-    prune_attempted: true,
-    prune_skipped: false,
-    unit_relative_path: unitRelativePath,
-    manifest_referenced_parquet_count: 0,
-    actual_destination_parquet_count: 0,
-    prune_deleted_count: 0,
-    prune_dry_run_delete_count: 0,
-    prune_error_count: 1,
-    pruned_relative_paths: [],
-    pruned_relative_paths_truncated: false,
-    error: error instanceof Error ? error.message : String(error),
-  });
-}
-
-function inventoryDayUnits(inventory, args) {
-  const units = [];
-  for (const domain of args.domains) {
-    const inventoryDays = inventory?.domains?.[domain]?.days || {};
-    for (const dayUtc of Object.keys(inventoryDays).sort()) {
-      const invEntry = inventoryDays[dayUtc];
-      const relativePath = normalizePosixRelativePath(invEntry?.relative_path || "");
-      if (!relativePath) continue;
-      units.push({ domain, day_utc: dayUtc, inventory_entry: invEntry, relative_path: relativePath });
-    }
-  }
-  return units;
-}
-
 // ---- Planning (inventory-driven) ----
 
 function inventoryDayHash(inventory, domain, dayUtc) {
@@ -1068,14 +745,11 @@ async function main(args) {
     state_existed: checkpointLoaded.existed,
     dry_run: args.dry_run,
     max_days_per_run: args.max_days_per_run,
-    prune_scope: args.prune_scope,
-    prune_stale_parquet: args.prune_stale_parquet,
     domains: {},
     index_files: {},
     index_tree_units: {},
     committed_connector_units: {},
     run_manifest_units: {},
-    prune: emptyPruneReport(args),
     totals: {
       listed_days: 0,
       candidate_days: 0,
@@ -1090,53 +764,8 @@ async function main(args) {
       committed_connector_units_copied: 0,
       run_manifest_units_candidates: 0,
       run_manifest_units_copied: 0,
-      prune_attempted_units: 0,
-      prune_skipped_units: 0,
-      prune_deleted_count: 0,
-      prune_dry_run_delete_count: 0,
-      prune_error_count: 0,
     },
   };
-  const prunedUnitPaths = new Set();
-
-  function syncPruneTotals() {
-    report.totals.prune_attempted_units = report.prune.attempted_units;
-    report.totals.prune_skipped_units = report.prune.skipped_units;
-    report.totals.prune_deleted_count = report.prune.prune_deleted_count;
-    report.totals.prune_dry_run_delete_count = report.prune.prune_dry_run_delete_count;
-    report.totals.prune_error_count = report.prune.prune_error_count;
-  }
-
-  function reconcileCopiedDayUnit(invEntry, { dryRunManifestRoot = null } = {}) {
-    const relativePath = normalizePosixRelativePath(invEntry?.relative_path || "");
-    if (!relativePath) {
-      throw new Error("Cannot prune copied unit with missing inventory relative_path");
-    }
-    if (!args.prune_stale_parquet) {
-      recordPruneSkipped(report.prune, relativePath, "disabled_by_no_prune_stale_parquet");
-      syncPruneTotals();
-      return;
-    }
-    try {
-      const destDayPath = joinTargetPath(args.dest_root, relativePath);
-      const manifestRootPath = dryRunManifestRoot || destDayPath;
-      const summary = pruneStaleParquetForUnit({
-        rcloneBin: args.rclone_bin,
-        manifestRootPath,
-        destUnitPath: destDayPath,
-        unitRelativePath: relativePath,
-        dryRun: args.dry_run,
-      });
-      recordPruneUnitSummary(report.prune, summary);
-      prunedUnitPaths.add(relativePath);
-      syncPruneTotals();
-    } catch (error) {
-      recordPruneError(report.prune, relativePath, error);
-      syncPruneTotals();
-      writeReport(args.report_out, report);
-      throw error;
-    }
-  }
 
   // ---- Plan + copy day folders, per domain ----
   const dayPlan = planDays(inventory, state, args);
@@ -1166,9 +795,6 @@ async function main(args) {
       const destDayPath = joinTargetPath(args.dest_root, relativeDayPath);
 
       copyDayFolder(args.rclone_bin, sourceDayPath, destDayPath, args.dry_run);
-      reconcileCopiedDayUnit(invEntry, {
-        dryRunManifestRoot: args.dry_run ? sourceDayPath : null,
-      });
 
       if (!args.dry_run) {
         const copiedAt = new Date().toISOString();
@@ -1190,34 +816,6 @@ async function main(args) {
     report.totals.copied_days += domainSummary.copied_days;
     report.totals.skipped_unchanged += domainSummary.skipped_unchanged;
     report.totals.skipped_by_limit += domainSummary.skipped_by_limit;
-  }
-
-  if (args.prune_stale_parquet && args.prune_scope === "all") {
-    for (const unit of inventoryDayUnits(inventory, args)) {
-      if (prunedUnitPaths.has(unit.relative_path)) {
-        recordPruneSkipped(report.prune, unit.relative_path, "already_pruned_after_copy");
-        syncPruneTotals();
-        continue;
-      }
-      try {
-        const destDayPath = joinTargetPath(args.dest_root, unit.relative_path);
-        const summary = pruneStaleParquetForUnit({
-          rcloneBin: args.rclone_bin,
-          manifestRootPath: destDayPath,
-          destUnitPath: destDayPath,
-          unitRelativePath: unit.relative_path,
-          dryRun: args.dry_run,
-        });
-        recordPruneUnitSummary(report.prune, summary);
-        prunedUnitPaths.add(unit.relative_path);
-        syncPruneTotals();
-      } catch (error) {
-        recordPruneError(report.prune, unit.relative_path, error);
-        syncPruneTotals();
-        writeReport(args.report_out, report);
-        throw error;
-      }
-    }
   }
 
   // ---- Plan + copy latest index files ----
@@ -1385,19 +983,7 @@ async function runCli() {
     await main(parsedArgs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    let payload = { ok: false, error: message };
-    if (reportOutPath) {
-      try {
-        if (fs.existsSync(path.resolve(reportOutPath))) {
-          const partial = JSON.parse(fs.readFileSync(path.resolve(reportOutPath), "utf8"));
-          if (partial && typeof partial === "object" && !Array.isArray(partial)) {
-            payload = { ...partial, ok: false, error: message };
-          }
-        }
-      } catch {
-        payload = { ok: false, error: message };
-      }
-    }
+    const payload = { ok: false, error: message };
     if (reportOutPath) writeReport(reportOutPath, payload);
     console.error(JSON.stringify(payload));
     process.exit(1);
