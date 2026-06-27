@@ -4,6 +4,9 @@
 
 * Add an exact observed-hour comparison for v2 observation integrity, so it can detect cases where R2 and current source have the same row count for a timeseries but the actual `observed_at_utc` hours differ.
 
+## Snapshot health check
+See '/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops/plans/snapshot health check.md'
+
 
 ## R2 History Worker Refactor
 

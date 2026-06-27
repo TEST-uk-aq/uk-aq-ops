@@ -1076,3 +1076,34 @@ The preferred v0.2.0 approach is:
 - grouped stations do not merge timeseries or observations
 - other networks remain hidden from the first public display until data accuracy work is done
 - front end uses selected station ids and explicit public network display names
+
+
+Breathe London Nodes API test
+
+The BL Nodes gateway API has been smoke-tested successfully from terminal using BLONDON_API_KEY in the X-API-KEY header.
+
+Base URL:
+https://breathe-london-7x54d7qf.ew.gateway.dev
+
+Working endpoints:
+- /ListSensors
+- /SensorData
+
+Metadata:
+- /ListSensors returned 304 station rows.
+- Station identity uses SiteCode, e.g. BL0032.
+- InstallationCode appears to link Nodes records back to existing Communities records, e.g. Nodes SiteCode BL0034 has InstallationCode CLDP0001.
+
+Observation data:
+- /SensorData?SiteCode=BL0032&Species=PM25 returned hourly PM2.5 rows.
+- /SensorData?SiteCode=BL0032&Species=NO2 returned hourly NO2 rows.
+- Windowed startTime/endTime queries work.
+- Species values are PM25 and NO2.
+- Observation value field is ScaledValue.
+- Timestamp field is DateTime.
+- Unit field is Units.
+- QA/status field is RatificationStatus.
+- Rows with ScaledValue null can appear for not-yet-populated hours and should not be treated as valid measurements.
+
+
+
