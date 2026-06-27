@@ -1,9 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  fetchWithTimeout,
-  r2PutObject,
-} from "../workers/shared/r2_sigv4.mjs";
+import { r2PutObject } from "../workers/shared/r2_sigv4.mjs";
 
 const TEST_R2_CONFIG = {
   endpoint: "https://example.invalid",
@@ -15,40 +12,14 @@ const TEST_R2_CONFIG = {
 
 function installImmediateSleep() {
   const originalSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = (callback, delay, ...args) => {
-    if (Number(delay) <= 5000) {
-      callback(...args);
-      return 0;
-    }
-    return originalSetTimeout(callback, delay, ...args);
+  globalThis.setTimeout = (callback, _delay, ...args) => {
+    callback(...args);
+    return 0;
   };
   return () => {
     globalThis.setTimeout = originalSetTimeout;
   };
 }
-
-test("fetchWithTimeout aborts a hung request with an actionable error", async () => {
-  let observedAbort = false;
-  const hangingFetch = async (_url, init) => {
-    return await new Promise((_resolve, reject) => {
-      init.signal.addEventListener("abort", () => {
-        observedAbort = true;
-        reject(new DOMException("aborted", "AbortError"));
-      }, { once: true });
-    });
-  };
-
-  await assert.rejects(
-    () => fetchWithTimeout(
-      "https://example.invalid/hung",
-      { method: "POST" },
-      5,
-      hangingFetch,
-    ),
-    /POST request to https:\/\/example\.invalid\/hung timed out after 5ms/,
-  );
-  assert.equal(observedAbort, true);
-});
 
 test("r2PutObject retries a transient connection reset and succeeds", async () => {
   const restoreSleep = installImmediateSleep();

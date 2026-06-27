@@ -31,10 +31,9 @@ jobs:
       SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_TIMEOUT_SECONDS || '300' }}
       SERVICE_CPU: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_CPU || '0.25' }}
       SERVICE_MEMORY: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_MEMORY || '256Mi' }}
-      SERVICE_CONCURRENCY: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY || '2' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY || '1' }}
       SERVICE_MAX_INSTANCES: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_MAX_INSTANCES || '1' }}
       SERVICE_MIN_INSTANCES: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_MIN_INSTANCES || '0' }}
-      UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS: ${{ vars.UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS || '240000' }}
       SCHEDULER_ENABLED: ${{ vars.GCP_LATEST_SNAPSHOT_SCHEDULER_ENABLED || 'true' }}
       SCHEDULER_JOB_NAME: ${{ vars.GCP_LATEST_SNAPSHOT_SCHEDULER_JOB_NAME || 'uk-aq-latest-snapshot-every-minute' }}
       SCHEDULER_CRON: ${{ vars.GCP_LATEST_SNAPSHOT_SCHEDULER_CRON || '* * * * *' }}
@@ -87,24 +86,6 @@ jobs:
           fi
           if [[ "${LATEST_SNAPSHOT_SERVICE_ACCOUNT}" == *"-compute@developer.gserviceaccount.com" ]]; then
             echo "Invalid runtime service account: default compute service account is not allowed."
-            exit 1
-          fi
-          if [ "${SERVICE_MAX_INSTANCES}" != "1" ]; then
-            echo "GCP_LATEST_SNAPSHOT_SERVICE_MAX_INSTANCES must be 1 so the in-memory overlap guard is authoritative."
-            exit 1
-          fi
-          if ! [[ "${SERVICE_CONCURRENCY}" =~ ^[0-9]+$ ]] || [ "${SERVICE_CONCURRENCY}" -lt 2 ]; then
-            echo "GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY must be at least 2 so overlap requests can return a fast skip."
-            exit 1
-          fi
-          if ! [[ "${SERVICE_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] \
-            || ! [[ "${UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS}" =~ ^[0-9]+$ ]] \
-            || [ "${UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS}" -le 0 ]; then
-            echo "Latest snapshot service and child-job timeouts must be positive integers."
-            exit 1
-          fi
-          if [ $((UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS + 30000)) -ge $((SERVICE_TIMEOUT_SECONDS * 1000)) ]; then
-            echo "UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS must leave at least 30 seconds before the Cloud Run request timeout."
             exit 1
           fi
           if [ -z "${CFLARE_R2_ENDPOINT:-}" ]; then
@@ -165,21 +146,6 @@ jobs:
         run: |
           set -euo pipefail
           gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-
-      - name: Setup Deno
-        uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
-        with:
-          deno-version: v2.1.4
-
-      - name: Check and test latest snapshot service
-        run: |
-          set -euo pipefail
-          deno check \
-            workers/uk_aq_latest_snapshot_cloud_run/service_core.ts \
-            workers/uk_aq_latest_snapshot_cloud_run/run_service.ts \
-            workers/uk_aq_latest_snapshot_cloud_run/run_job.ts
-          deno test workers/uk_aq_latest_snapshot_cloud_run/service_core_test.ts
-          node --test tests/r2_sigv4.test.mjs
 
       - name: Build and push latest snapshot image
         id: build
@@ -283,7 +249,6 @@ jobs:
           add_env UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX
           add_env UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS
           add_env UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION
-          add_env UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS
           add_env UK_AQ_SERVICE_EGRESS_METRICS_ENABLED
           add_env UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL
           add_env UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA

@@ -5,7 +5,6 @@ const R2_RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
 const R2_REQUEST_MAX_ATTEMPTS = 4;
 const R2_REQUEST_RETRY_BASE_MS = 500;
 const R2_REQUEST_RETRY_MAX_MS = 5000;
-const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 
 export function encodeRfc3986(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -173,48 +172,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function fetchWithTimeout(
-  url,
-  init = {},
-  timeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
-  fetchImpl = globalThis.fetch,
-) {
-  const boundedTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-    ? Math.trunc(Number(timeoutMs))
-    : DEFAULT_FETCH_TIMEOUT_MS;
-  const controller = new AbortController();
-  const method = String(init.method || "GET").toUpperCase();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, boundedTimeoutMs);
-
-  try {
-    return await fetchImpl(url, {
-      ...init,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (timedOut) {
-      let target = "external service";
-      try {
-        const parsed = new URL(url);
-        target = `${parsed.origin}${parsed.pathname}`;
-      } catch {
-        // Keep the generic target rather than exposing an unparseable URL.
-      }
-      throw new Error(
-        `${method} request to ${target} timed out after ${boundedTimeoutMs}ms`,
-        { cause: error },
-      );
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 function isRetryableR2Status(status) {
   return R2_RETRYABLE_STATUS_CODES.has(status);
 }
@@ -256,7 +213,7 @@ async function fetchR2WithRetry({ method, buildRequest, body = undefined }) {
   for (let attempt = 1; attempt <= R2_REQUEST_MAX_ATTEMPTS; attempt += 1) {
     const request = buildRequest();
     try {
-      const response = await fetchWithTimeout(request.url, {
+      const response = await fetch(request.url, {
         method,
         headers: request.headers,
         body,
