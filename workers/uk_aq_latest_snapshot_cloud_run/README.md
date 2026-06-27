@@ -53,8 +53,9 @@ The run report includes this trigger mode.
 ## Runtime and overlap safety
 
 - Cloud Run must use exactly one maximum instance. The overlap lock is deliberately in memory and is authoritative only with `max-instances=1`.
-- Container concurrency must be at least `2`: one request can own the active child job while later scheduler requests reach the same instance and return a fast skip.
-- The every-minute scheduler remains enabled. A request received during an active build returns HTTP `200` with `skipped: true`, the active trigger mode, start time, and age.
+- Container concurrency defaults to `1` because the service uses `0.25` CPU. Cloud Run requires concurrency `1` when total CPU is below `1`.
+- The every-minute scheduler remains enabled. With concurrency `1`, overlap requests may wait at Cloud Run instead of reaching the application skip response, but the hard child timeout prevents an indefinite block.
+- If CPU is raised to at least `1`, concurrency can be raised to `2`; overlap requests can then return HTTP `200` with `skipped: true`, the active trigger mode, start time, and age.
 - The service terminates a child that exceeds `UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS`: `SIGTERM` first, then `SIGKILL` after a 10-second grace period.
 - Metadata, Pub/Sub, and shared R2 HTTP calls have a 30-second per-attempt timeout.
 - Structured logs identify accepted, skipped, completed, failed, timed-out, and force-killed child runs.

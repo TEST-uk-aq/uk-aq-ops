@@ -31,7 +31,7 @@ jobs:
       SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_TIMEOUT_SECONDS || '300' }}
       SERVICE_CPU: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_CPU || '0.25' }}
       SERVICE_MEMORY: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_MEMORY || '256Mi' }}
-      SERVICE_CONCURRENCY: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY || '2' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY || '1' }}
       SERVICE_MAX_INSTANCES: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_MAX_INSTANCES || '1' }}
       SERVICE_MIN_INSTANCES: ${{ vars.GCP_LATEST_SNAPSHOT_SERVICE_MIN_INSTANCES || '0' }}
       UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS: ${{ vars.UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS || '240000' }}
@@ -93,10 +93,26 @@ jobs:
             echo "GCP_LATEST_SNAPSHOT_SERVICE_MAX_INSTANCES must be 1 so the in-memory overlap guard is authoritative."
             exit 1
           fi
-          if ! [[ "${SERVICE_CONCURRENCY}" =~ ^[0-9]+$ ]] || [ "${SERVICE_CONCURRENCY}" -lt 2 ]; then
-            echo "GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY must be at least 2 so overlap requests can return a fast skip."
+          if ! [[ "${SERVICE_CONCURRENCY}" =~ ^[0-9]+$ ]] || [ "${SERVICE_CONCURRENCY}" -lt 1 ]; then
+            echo "GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY must be at least 1."
             exit 1
           fi
+          python3 - "${SERVICE_CPU}" "${SERVICE_CONCURRENCY}" <<'PY'
+          from decimal import Decimal, InvalidOperation
+          import sys
+
+          raw_cpu, raw_concurrency = sys.argv[1:3]
+          try:
+              cpu = Decimal(raw_cpu[:-1]) / 1000 if raw_cpu.endswith("m") else Decimal(raw_cpu)
+              concurrency = int(raw_concurrency)
+          except (InvalidOperation, ValueError):
+              raise SystemExit("Latest snapshot CPU and concurrency must be numeric Cloud Run values.")
+          if cpu < 1 and concurrency > 1:
+              raise SystemExit(
+                  "Latest snapshot concurrency must be 1 when CPU is below 1. "
+                  f"Received cpu={raw_cpu} concurrency={raw_concurrency}."
+              )
+          PY
           if ! [[ "${SERVICE_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] \
             || ! [[ "${UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS}" =~ ^[0-9]+$ ]] \
             || [ "${UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS}" -le 0 ]; then
