@@ -171,6 +171,9 @@ jobs:
         with:
           deno-version: v2.7.13
 
+      - name: Install Node dependencies for Deno type resolution
+        run: npm ci --ignore-scripts
+
       - name: Check and test latest snapshot service
         run: |
           set -euo pipefail
