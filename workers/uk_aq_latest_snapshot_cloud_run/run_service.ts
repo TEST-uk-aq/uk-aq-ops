@@ -1,37 +1,69 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import {
+  createLatestSnapshotHandler,
+  JobTimeoutError,
+} from "./service_core.ts";
 
 const PORT = Number(Deno.env.get("PORT") || "8000");
 const RUN_JOB_SCRIPT = "/app/workers/uk_aq_latest_snapshot_cloud_run/run_job.ts";
-const ALLOWED_TRIGGER_MODES = new Set(["scheduler", "manual"]);
+const JOB_TIMEOUT_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS"),
+  240_000,
+);
+const JOB_KILL_GRACE_MS = 10_000;
+const JOB_KILL_WAIT_MS = 5_000;
 
-let inFlight = false;
-
-function resolveTriggerMode(req: Request, body: unknown): string {
-  const url = new URL(req.url);
-  const queryMode = (url.searchParams.get("trigger_mode") || "").trim().toLowerCase();
-  if (queryMode && ALLOWED_TRIGGER_MODES.has(queryMode)) {
-    return queryMode;
+function parsePositiveInt(raw: string | undefined | null, fallback: number): number {
+  const value = Number(raw || "");
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
   }
-
-  const headerMode = (req.headers.get("x-uk-aq-latest-snapshot-trigger-mode") || "").trim().toLowerCase();
-  if (headerMode && ALLOWED_TRIGGER_MODES.has(headerMode)) {
-    return headerMode;
-  }
-
-  const root = body && typeof body === "object" && !Array.isArray(body)
-    ? body as Record<string, unknown>
-    : null;
-  const bodyMode = typeof root?.trigger_mode === "string"
-    ? root.trigger_mode.trim().toLowerCase()
-    : "";
-  if (bodyMode && ALLOWED_TRIGGER_MODES.has(bodyMode)) {
-    return bodyMode;
-  }
-
-  return "manual";
+  return Math.trunc(value);
 }
 
-async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
+function logEvent(
+  level: "log" | "error",
+  event: string,
+  fields: Record<string, unknown>,
+): void {
+  console[level](JSON.stringify({
+    event,
+    timestamp: new Date().toISOString(),
+    ...fields,
+  }));
+}
+
+async function waitForStatus(
+  statusPromise: Promise<Deno.CommandStatus>,
+  timeoutMs: number,
+): Promise<{ timed_out: false; status: Deno.CommandStatus } | { timed_out: true }> {
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ timed_out: true });
+    }, timeoutMs);
+
+    statusPromise.then(
+      (status) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ timed_out: false, status });
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+export async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
+  const startedMs = Date.now();
   const child = new Deno.Command("deno", {
     args: [
       "run",
@@ -49,63 +81,89 @@ async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
     stdout: "inherit",
     stderr: "inherit",
   }).spawn();
-  return await child.status;
+  const statusPromise = child.status;
+
+  logEvent("log", "latest_snapshot_child_started", {
+    trigger_mode: triggerMode,
+    pid: child.pid,
+    timeout_ms: JOB_TIMEOUT_MS,
+  });
+
+  const initialResult = await waitForStatus(statusPromise, JOB_TIMEOUT_MS);
+  if (!initialResult.timed_out) {
+    logEvent(
+      initialResult.status.success ? "log" : "error",
+      "latest_snapshot_child_completed",
+      {
+        trigger_mode: triggerMode,
+        pid: child.pid,
+        code: initialResult.status.code,
+        success: initialResult.status.success,
+        duration_ms: Date.now() - startedMs,
+      },
+    );
+    return initialResult.status;
+  }
+
+  logEvent("error", "latest_snapshot_child_timeout", {
+    trigger_mode: triggerMode,
+    pid: child.pid,
+    timeout_ms: JOB_TIMEOUT_MS,
+    duration_ms: Date.now() - startedMs,
+    signal: "SIGTERM",
+  });
+  try {
+    child.kill("SIGTERM");
+  } catch (error) {
+    logEvent("error", "latest_snapshot_child_signal_failed", {
+      trigger_mode: triggerMode,
+      pid: child.pid,
+      signal: "SIGTERM",
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const graceResult = await waitForStatus(statusPromise, JOB_KILL_GRACE_MS);
+  if (graceResult.timed_out) {
+    logEvent("error", "latest_snapshot_child_kill_escalated", {
+      trigger_mode: triggerMode,
+      pid: child.pid,
+      grace_ms: JOB_KILL_GRACE_MS,
+      signal: "SIGKILL",
+    });
+    try {
+      child.kill("SIGKILL");
+    } catch (error) {
+      logEvent("error", "latest_snapshot_child_signal_failed", {
+        trigger_mode: triggerMode,
+        pid: child.pid,
+        signal: "SIGKILL",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    try {
+      const killedResult = await waitForStatus(statusPromise, JOB_KILL_WAIT_MS);
+      if (killedResult.timed_out) {
+        logEvent("error", "latest_snapshot_child_reap_timeout", {
+          trigger_mode: triggerMode,
+          pid: child.pid,
+          wait_ms: JOB_KILL_WAIT_MS,
+        });
+      }
+    } catch (error) {
+      logEvent("error", "latest_snapshot_child_reap_failed", {
+        trigger_mode: triggerMode,
+        pid: child.pid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  throw new JobTimeoutError(JOB_TIMEOUT_MS);
 }
 
-serve(async (req: Request) => {
-  if (req.method === "GET") {
-    return new Response(
-      JSON.stringify({
-        ok: true,
-        service: "uk_aq_latest_snapshot_cloud_run",
-      }),
-      {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      },
-    );
-  }
+export const handler = createLatestSnapshotHandler({ runJob });
 
-  if (req.method !== "POST") {
-    return new Response("Method not allowed", { status: 405 });
-  }
-
-  if (inFlight) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        error: "run_in_flight",
-      }),
-      {
-        status: 409,
-        headers: { "content-type": "application/json" },
-      },
-    );
-  }
-
-  let body: unknown = null;
-  try {
-    body = await req.json();
-  } catch {
-    body = null;
-  }
-  const triggerMode = resolveTriggerMode(req, body);
-
-  inFlight = true;
-  try {
-    const status = await runJob(triggerMode);
-    return new Response(
-      JSON.stringify({
-        ok: status.success,
-        trigger_mode: triggerMode,
-        code: status.code,
-      }),
-      {
-        status: status.success ? 200 : 500,
-        headers: { "content-type": "application/json" },
-      },
-    );
-  } finally {
-    inFlight = false;
-  }
-}, { port: PORT });
+if (import.meta.main) {
+  serve(handler, { port: PORT });
+}

@@ -1,6 +1,5 @@
 import zlib from "node:zlib";
 import {
-  fetchWithTimeout,
   hasRequiredR2Config,
   normalizePrefix,
   r2GetObject,
@@ -619,7 +618,7 @@ function subscriptionPath(): string {
 }
 
 async function fetchGoogleAccessToken(): Promise<string> {
-  const response = await fetchWithTimeout(
+  const response = await fetch(
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
     { headers: { "Metadata-Flavor": "Google" } },
   );
@@ -643,7 +642,7 @@ async function pubsubPost(path: string, body: Record<string, unknown>): Promise<
   for (let attempt = 1; attempt <= PUBSUB_PULL_RETRIES; attempt += 1) {
     try {
       const token = await fetchGoogleAccessToken();
-      const response = await fetchWithTimeout(`https://pubsub.googleapis.com/v1/${path}`, {
+      const response = await fetch(`https://pubsub.googleapis.com/v1/${path}`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -1700,11 +1699,7 @@ async function main(): Promise<void> {
     skipped_unchanged_count: skippedUnchangedCount,
     warnings,
   };
-  console.log(JSON.stringify({
-    event: "latest_snapshot_job_summary",
-    timestamp: new Date().toISOString(),
-    ...report,
-  }));
+  console.log(JSON.stringify(report));
 
   if (failureCount > 0) {
     throw new Error(`Snapshot build completed with ${failureCount} failed matrix item(s).`);

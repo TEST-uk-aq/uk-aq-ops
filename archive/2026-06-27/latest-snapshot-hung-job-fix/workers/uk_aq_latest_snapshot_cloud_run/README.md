@@ -39,7 +39,6 @@ Builds latest map snapshots from a dedicated Pub/Sub observation subscription an
 - `UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX` (default `history/v1/core`)
 - `UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS` (default `86400`)
 - `UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION` (default `uk-aq-latest-snapshot-sub`; must be dedicated and not equal to `OBSERVS_PUBSUB_SUBSCRIPTION`)
-- `UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS` (default `240000`; must leave at least 30 seconds before the Cloud Run request timeout)
 
 ## Trigger mode
 
@@ -49,12 +48,3 @@ The service accepts `POST` and sets:
 - `UK_AQ_LATEST_SNAPSHOT_TRIGGER_MODE=manual` for manual invocations
 
 The run report includes this trigger mode.
-
-## Runtime and overlap safety
-
-- Cloud Run must use exactly one maximum instance. The overlap lock is deliberately in memory and is authoritative only with `max-instances=1`.
-- Container concurrency must be at least `2`: one request can own the active child job while later scheduler requests reach the same instance and return a fast skip.
-- The every-minute scheduler remains enabled. A request received during an active build returns HTTP `200` with `skipped: true`, the active trigger mode, start time, and age.
-- The service terminates a child that exceeds `UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS`: `SIGTERM` first, then `SIGKILL` after a 10-second grace period.
-- Metadata, Pub/Sub, and shared R2 HTTP calls have a 30-second per-attempt timeout.
-- Structured logs identify accepted, skipped, completed, failed, timed-out, and force-killed child runs.

@@ -41,16 +41,15 @@ Build frequency is every minute via Cloud Scheduler.
 ## Request Flow
 
 1. Cloud Scheduler triggers Cloud Run service every minute.
-2. Cloud Run accepts one active child build. Overlapping scheduler requests return HTTP `200` with `skipped: true` and in-flight age details.
-3. Cloud Run service pulls Pub/Sub observations from the latest-snapshot subscription.
-4. Service updates R2 latest-state object.
-5. Service acknowledges pulled Pub/Sub messages in bounded chunks to stay below Pub/Sub request-size limits during burst/backlog drains.
-6. Service loads cached core metadata (refreshes from latest `history/v1/core/day_utc=...` snapshot once stale).
-7. Service builds the matrix payloads and writes changed snapshot objects to R2.
-8. Service writes/updates latest family manifest.
-9. Browser calls cache proxy route: `/api/aq/latest-snapshot?...`.
-10. Cache proxy forwards to latest snapshot R2 API worker URL from `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`.
-11. R2 API Worker validates upstream auth and serves object from R2.
+2. Cloud Run service pulls Pub/Sub observations from the latest-snapshot subscription.
+3. Service updates R2 latest-state object.
+4. Service acknowledges pulled Pub/Sub messages in bounded chunks to stay below Pub/Sub request-size limits during burst/backlog drains.
+5. Service loads cached core metadata (refreshes from latest `history/v1/core/day_utc=...` snapshot once stale).
+6. Service builds the matrix payloads and writes changed snapshot objects to R2.
+7. Service writes/updates latest family manifest.
+8. Browser calls cache proxy route: `/api/aq/latest-snapshot?...`.
+9. Cache proxy forwards to latest snapshot R2 API worker URL from `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`.
+10. R2 API Worker validates upstream auth and serves object from R2.
 
 ## R2 Key Layout
 
@@ -100,10 +99,9 @@ Cloud Run builder controls:
 - `GCP_LATEST_SNAPSHOT_SERVICE_TIMEOUT_SECONDS` (default `300`)
 - `GCP_LATEST_SNAPSHOT_SERVICE_CPU` (default `0.25`)
 - `GCP_LATEST_SNAPSHOT_SERVICE_MEMORY` (default `256Mi`)
-- `GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY` (default `2`; must be at least `2` so overlaps can return a fast skip)
-- `GCP_LATEST_SNAPSHOT_SERVICE_MAX_INSTANCES` (default and required value `1`)
+- `GCP_LATEST_SNAPSHOT_SERVICE_CONCURRENCY` (default `1`)
+- `GCP_LATEST_SNAPSHOT_SERVICE_MAX_INSTANCES` (default `1`)
 - `GCP_LATEST_SNAPSHOT_SERVICE_MIN_INSTANCES` (default `0`)
-- `UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS` (default `240000`; child receives `SIGTERM`, then `SIGKILL` after 10 seconds)
 - `GCP_LATEST_SNAPSHOT_SCHEDULER_ENABLED` (default `true`)
 - `GCP_LATEST_SNAPSHOT_SCHEDULER_JOB_NAME` (default `uk-aq-latest-snapshot-every-minute`)
 - `GCP_LATEST_SNAPSHOT_SCHEDULER_CRON` (default `* * * * *`)
@@ -172,16 +170,6 @@ Cloud Run builder fails with `Request payload size exceeds the limit: 524288 byt
 
 1. Deploy the builder with ack chunking support from `workers/uk_aq_latest_snapshot_cloud_run/run_job.ts`.
 2. Re-check `subscription/num_undelivered_messages` for `uk-aq-latest-snapshot-sub`; it should fall once the next runs acknowledge the backlog in chunks.
-
-Cloud Scheduler repeatedly reports `409` or snapshots stop advancing:
-
-1. This indicates an old revision may have retained `inFlight=true` while its child process remained hung.
-2. Redeploy the current Cloud Run builder. Deployment replaces the stuck instance and enforces `max-instances=1`, concurrency of at least `2`, and the bounded child timeout.
-3. Keep the scheduler at every minute. Normal overlap now returns HTTP `200` with `reason: "run_in_flight"` rather than an error.
-4. Inspect structured events `latest_snapshot_child_timeout`, `latest_snapshot_child_kill_escalated`, and `latest_snapshot_run_failed`.
-5. Metadata, Pub/Sub, and R2 requests have a 30-second per-attempt timeout, so a hung external request cannot retain the child indefinitely.
-
-The child timeout must remain at least 30 seconds below the Cloud Run request timeout. This covers TERM/KILL escalation and response handling. The deploy workflow validates this relationship and rejects configurations with more than one maximum instance.
 
 ## One-Off State Bootstrap
 
