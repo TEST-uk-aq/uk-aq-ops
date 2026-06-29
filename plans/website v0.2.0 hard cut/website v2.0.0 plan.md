@@ -635,19 +635,21 @@ traffic.
 - Added cache-proxy route tests covering the `/api/aq/networks` mapping,
   metadata cache profile, stable latest-snapshot route, absence of routine
   cache-buster parameters, and unchanged legacy route mappings.
-- Manual post-deploy verification should check:
+- Manual post-deploy verification check. Test from the browser console::
 
   ```bash
-  BASE="https://cic-test.chronicillnesschannel.co.uk/api/aq"
-  curl -s "$BASE/networks" | jq .
-  curl -sI "$BASE/networks"
+  fetch("/api/aq/networks", { credentials: "include" })
+    .then(r => r.json())
+    .then(console.log)
   ```
 
-  Expected result: JSON rather than an HTML redirect; `contract_version` is 2;
-  enabled public networks only; rows include `network_id`, `network_code`,
-  `network_label`, `network_type`, and `public_display_enabled`; OpenAQ is
-  absent while disabled; cache headers match the metadata cache profile; no
-  cache-buster parameter is required.
+  Expected result: 
+
+  contract_version: 2
+  count: 2
+  data includes GOV.UK AURN and Breathe London
+  OpenAQ absent while disabled
+  
 - No website code, ingest code, deployments, database drops, station
   matching/merging, immutable R2 object rewrites, or archive files were created
   or changed in this phase.
