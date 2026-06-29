@@ -44,8 +44,7 @@ jobs:
       UK_AQ_LATEST_SNAPSHOT_POLLUTANTS: ${{ vars.UK_AQ_LATEST_SNAPSHOT_POLLUTANTS || 'pm25,pm10,no2' }}
       UK_AQ_LATEST_SNAPSHOT_WINDOWS: ${{ vars.UK_AQ_LATEST_SNAPSHOT_WINDOWS || '' }}
       UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP: ${{ vars.UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP || 'all' }}
-      UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION: ${{ vars.UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION || 'v2' }}
-      UK_AQ_LATEST_SNAPSHOT_R2_PREFIX: ${{ vars.UK_AQ_LATEST_SNAPSHOT_R2_PREFIX || 'latest_snapshots/v2' }}
+      UK_AQ_LATEST_SNAPSHOT_R2_PREFIX: ${{ vars.UK_AQ_LATEST_SNAPSHOT_R2_PREFIX || 'latest_snapshots/v1' }}
       UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY: ${{ vars.UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY || '' }}
       UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX: ${{ vars.UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX || '' }}
       UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED: ${{ vars.UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED || 'true' }}
@@ -288,57 +287,13 @@ jobs:
             fi
           }
 
-          normalize_snapshot_contract_version() {
-            local raw="${1:-}"
-            case "${raw}" in
-              v1|1) echo "v1" ;;
-              v2|2|"") echo "v2" ;;
-              *)
-                echo "Unsupported UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION: ${raw}" >&2
-                exit 1
-                ;;
-            esac
-          }
-
-          is_under_snapshot_version_prefix() {
-            local value="${1#/}"
-            local version="$2"
-            value="${value%/}"
-            [ "${value}" = "latest_snapshots/${version}" ] || [[ "${value}" == latest_snapshots/${version}/* ]]
-          }
-
-          validate_snapshot_contract_path() {
-            local name="$1"
-            local value="${2:-}"
-            local contract_version="$3"
-            local rejected_version="v1"
-            if [ "${contract_version}" = "v1" ]; then
-              rejected_version="v2"
-            fi
-            [ -z "${value}" ] && return 0
-            if is_under_snapshot_version_prefix "${value}" "${rejected_version}"; then
-              echo "${name}=${value} is under latest_snapshots/${rejected_version} but UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION=${contract_version}. Use a matching latest_snapshots/${contract_version} path or a custom non-versioned prefix."
-              exit 1
-            fi
-          }
-
-          validate_snapshot_contract_paths() {
-            local contract_version
-            contract_version="$(normalize_snapshot_contract_version "${UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION:-v2}")"
-            validate_snapshot_contract_path UK_AQ_LATEST_SNAPSHOT_R2_PREFIX "${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX:-}" "${contract_version}"
-            validate_snapshot_contract_path UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY "${UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY:-}" "${contract_version}"
-            validate_snapshot_contract_path UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX "${UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX:-}" "${contract_version}"
-          }
-
           require_env CFLARE_R2_ENDPOINT
           require_env CFLARE_R2_BUCKET
-          validate_snapshot_contract_paths
 
           env_updates=()
           add_env UK_AQ_LATEST_SNAPSHOT_POLLUTANTS
           add_env UK_AQ_LATEST_SNAPSHOT_WINDOWS
           add_env UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP
-          add_env UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION
           add_env UK_AQ_LATEST_SNAPSHOT_R2_PREFIX
           add_env UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY
           add_env UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX

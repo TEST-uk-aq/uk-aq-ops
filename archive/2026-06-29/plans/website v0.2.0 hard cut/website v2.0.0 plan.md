@@ -590,24 +590,6 @@ proxy/frontend can handle, or trigger a controlled fallback to the live
 Supabase endpoint. It must never produce a response assembled from mixed v1
 and v2 contract objects.
 
-#### Phase 5 implementation result — 2026-06-29
-
-- Latest-snapshot builder now supports `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION`.
-- The default builder contract and deploy workflow defaults are v2, writing to
-  `latest_snapshots/v2`; the latest-observation state remains in
-  `latest_snapshots_state/v1`.
-- v2 rows derive network identity from `station.network_id -> networks.id` and
-  emit scalar `network_id`, `network_code`, and `network_label` fields.
-- v2 rows omit `station_network_memberships`, `network_memberships`,
-  `network_name`, and `network_type`; connector provenance fields remain
-  available.
-- v1 compatibility remains available by setting the contract version/prefix to
-  v1, and existing v1 R2 objects are not rewritten or deleted.
-- Missing station/network metadata is counted/reported and skipped; disabled
-  networks are skipped before writing payload rows.
-- No website code, ingest code, database drops, station matching/merging,
-  deployment, or immutable R2 object rewrites were performed in this phase.
-
 ### Phase 6 — Cache proxy
 
 Add:

@@ -9,8 +9,6 @@ import {
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
 
-type LatestSnapshotContractVersion = "v1" | "v2";
-
 type LatestItem = {
   id: number | null;
   last_value: number | null;
@@ -22,10 +20,7 @@ type LatestItem = {
   display_name: string | null;
   pcon_code: string | null;
   la_code: string | null;
-  network_id?: number | null;
-  network_code?: string | null;
-  network_label?: string | null;
-  station_network_memberships?: Array<{
+  station_network_memberships: Array<{
     network_code: string;
     network_label: string | null;
     is_primary: boolean;
@@ -236,7 +231,7 @@ type MetadataObservedProperty = {
 };
 
 type CoreMetadataCacheFile = {
-  schema_version: 2;
+  schema_version: 1;
   generated_at: string;
   source_day_utc: string | null;
   connectors: MetadataConnector[];
@@ -308,11 +303,8 @@ const UK_AQ_LATEST_SNAPSHOT_WINDOWS = parseCsvList(
 
 const UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP =
   (Deno.env.get("UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP") || "all").trim().toLowerCase() || "all";
-const UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION = parseContractVersion(
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION") || "v2",
-);
 const UK_AQ_LATEST_SNAPSHOT_R2_PREFIX = normalizePrefix(
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_R2_PREFIX") || `latest_snapshots/${UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION}`,
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_R2_PREFIX") || "latest_snapshots/v1",
 );
 const UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY = normalizePrefix(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY") || `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/manifest.json`,
@@ -332,7 +324,7 @@ const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX") || "history/v2/core",
 );
 const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY =
-  `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/core_metadata_cache_v2.json`;
+  `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/core_metadata_cache.json`;
 const UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS = parsePositiveInt(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS"),
   86400,
@@ -374,36 +366,6 @@ function parseBoolean(raw: string | undefined | null, fallback: boolean): boolea
   if (["1", "true", "yes", "y", "on"].includes(value)) return true;
   if (["0", "false", "no", "n", "off"].includes(value)) return false;
   return fallback;
-}
-
-function parseContractVersion(raw: string | undefined | null): LatestSnapshotContractVersion {
-  const normalized = String(raw || "").trim().toLowerCase();
-  if (normalized === "v1" || normalized === "1") return "v1";
-  if (normalized === "v2" || normalized === "2") return "v2";
-  throw new Error(`Unsupported UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION: ${raw}`);
-}
-
-function isUnderSnapshotVersionPrefix(path: string, version: LatestSnapshotContractVersion): boolean {
-  const normalized = normalizePrefix(path);
-  const versionPrefix = `latest_snapshots/${version}`;
-  return normalized === versionPrefix || normalized.startsWith(`${versionPrefix}/`);
-}
-
-function validateSnapshotContractPaths(
-  contractVersion: LatestSnapshotContractVersion,
-  paths: Array<{ name: string; value: string | null | undefined }>,
-): void {
-  const rejectedVersion: LatestSnapshotContractVersion = contractVersion === "v2" ? "v1" : "v2";
-  for (const path of paths) {
-    const value = normalizePrefix(path.value || "");
-    if (!value) continue;
-    if (isUnderSnapshotVersionPrefix(value, rejectedVersion)) {
-      throw new Error(
-        `${path.name}=${value} is under latest_snapshots/${rejectedVersion} but ` +
-          `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION=${contractVersion}. Use a matching latest_snapshots/${contractVersion} path or a custom non-versioned prefix.`,
-      );
-    }
-  }
 }
 
 function parseCsvList(raw: string | undefined | null, fallback: string[]): string[] {
@@ -1155,7 +1117,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     bytesRead += cacheObject.body.byteLength;
     const text = new TextDecoder().decode(cacheObject.body);
     const parsed = JSON.parse(text) as CoreMetadataCacheFile;
-    if (parsed && parsed.schema_version === 2 && Array.isArray(parsed.networks) && isMetadataCacheFresh(parsed)) {
+    if (parsed && parsed.schema_version === 1 && Array.isArray(parsed.networks) && isMetadataCacheFresh(parsed)) {
       return {
         metadata: buildMetadataIndex(parsed),
         stats: {
@@ -1206,7 +1168,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
   }
 
   const cachePayload: CoreMetadataCacheFile = {
-    schema_version: 2,
+    schema_version: 1,
     generated_at: utcNowIso(),
     source_day_utc: manifest.day_utc || latestManifestInfo.day_utc,
     connectors: mapConnectorRows(tableRows.get("connectors") || []),
@@ -1293,7 +1255,6 @@ function computeWindowCutoffMs(windowLabel: string, nowMs: number): number | nul
 function buildSourceRows(
   stateMap: Map<string, LatestStateEntry>,
   metadata: MetadataIndex,
-  contractVersion: LatestSnapshotContractVersion = UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION,
 ): { rows: SnapshotSourceRow[]; missingMetadata: number } {
   const rows: SnapshotSourceRow[] = [];
   let missingMetadata = 0;
@@ -1326,26 +1287,17 @@ function buildSourceRows(
     if (!(station?.pcon_code || station?.la_code)) continue;
 
     const network = station?.network_id ? metadata.networksById.get(station.network_id) || null : null;
-    if (!network?.network_code || !network.display_name) {
+    if (!network?.network_code) {
       missingMetadata += 1;
       continue;
     }
-    if (!network.public_display_enabled) continue;
 
     const stationLabel = resolveStationLabel(station?.label, station?.station_ref, series.label ?? null);
-    const stationNetworkFields = contractVersion === "v2"
-      ? {
-        network_id: network.id,
-        network_code: network.network_code,
-        network_label: network.display_name,
-      }
-      : {
-        station_network_memberships: [{
-          network_code: network.network_code,
-          network_label: network.display_name,
-          is_primary: true,
-        }],
-      };
+    const stationMemberships: LatestItem["station_network_memberships"] = [{
+      network_code: network.network_code,
+      network_label: network.display_name,
+      is_primary: true,
+    }];
 
     const phenomenonLabel = resolvePhenomenonLabel(
       observedProperty?.display_name,
@@ -1372,7 +1324,7 @@ function buildSourceRows(
       ),
       pcon_code: station?.pcon_code ?? null,
       la_code: station?.la_code ?? null,
-      ...stationNetworkFields,
+      station_network_memberships: stationMemberships,
       phenomenon_label: phenomenonLabel,
       pollutant_label: phenomenonLabel,
       observed_property_code: pollutantNormalized,
@@ -1476,11 +1428,6 @@ async function main(): Promise<void> {
   if (!UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY) {
     throw new Error("UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY resolved empty.");
   }
-  validateSnapshotContractPaths(UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION, [
-    { name: "UK_AQ_LATEST_SNAPSHOT_R2_PREFIX", value: UK_AQ_LATEST_SNAPSHOT_R2_PREFIX },
-    { name: "UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY", value: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY },
-    { name: "UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX", value: UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX },
-  ]);
   if (!PUBSUB_PROJECT_ID) {
     throw new Error("Missing GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT).");
   }
@@ -1674,7 +1621,7 @@ async function main(): Promise<void> {
   const manifest: SnapshotManifest = {
     schema_version: 1,
     snapshot_family: "latest",
-    version: UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION,
+    version: "v1",
     generated_at: finishedAt,
     trigger_mode: triggerMode,
     source: {
@@ -1754,19 +1701,6 @@ async function main(): Promise<void> {
     throw new Error(`Snapshot build completed with ${failureCount} failed matrix item(s).`);
   }
 }
-
-export {
-  buildMetadataIndex,
-  buildSourceRows,
-  mapConnectorRows,
-  mapNetworkRows,
-  mapObservedPropertyRows,
-  mapPhenomenonRows,
-  mapStationRows,
-  mapTimeseriesRows,
-  parseContractVersion,
-  validateSnapshotContractPaths,
-};
 
 if (import.meta.main) {
   main().catch((error) => {
