@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveCoreSnapshotPrefix } from '../scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs';
+import { DEFAULT_TABLES, resolveCoreSnapshotPrefix } from '../scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs';
 import { resolveDomainPrefixes } from '../scripts/backup_r2/build_backup_inventory.mjs';
 
 test('core snapshot generation chooses v1 prefix for canonical v1 history version', () => {
@@ -34,4 +34,11 @@ test('backup inventory selects v2 core prefix for v2 backup version', () => {
 test('backup inventory preserves v1 core prefix for v1 backup version', () => {
   const prefixes = resolveDomainPrefixes('v1', {});
   assert.equal(prefixes.core, 'history/v1/core');
+});
+
+
+test('core snapshot default table set uses canonical networks table only', () => {
+  assert.ok(DEFAULT_TABLES.includes('networks'));
+  assert.equal(DEFAULT_TABLES.includes('uk_aq_networks'), false);
+  assert.equal(DEFAULT_TABLES.includes('station_network_memberships'), false);
 });

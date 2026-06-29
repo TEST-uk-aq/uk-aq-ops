@@ -190,6 +190,7 @@ type MetadataConnector = {
 type MetadataStation = {
   id: number;
   connector_id: number | null;
+  network_id: number | null;
   station_ref: string | null;
   label: string | null;
   station_name: string | null;
@@ -197,11 +198,12 @@ type MetadataStation = {
   la_code: string | null;
 };
 
-type MetadataMembership = {
-  station_id: number;
-  network_code: string;
-  network_label: string | null;
-  is_primary: boolean;
+type MetadataNetwork = {
+  id: number;
+  network_code: string | null;
+  display_name: string | null;
+  network_type: string | null;
+  public_display_enabled: boolean;
 };
 
 type MetadataTimeseries = {
@@ -234,7 +236,7 @@ type CoreMetadataCacheFile = {
   source_day_utc: string | null;
   connectors: MetadataConnector[];
   stations: MetadataStation[];
-  memberships: MetadataMembership[];
+  networks: MetadataNetwork[];
   timeseries: MetadataTimeseries[];
   phenomena: MetadataPhenomenon[];
   observed_properties: MetadataObservedProperty[];
@@ -244,7 +246,7 @@ type MetadataIndex = {
   source_day_utc: string | null;
   connectorsById: Map<number, MetadataConnector>;
   stationsById: Map<number, MetadataStation>;
-  membershipsByStationId: Map<number, MetadataMembership[]>;
+  networksById: Map<number, MetadataNetwork>;
   timeseriesById: Map<number, MetadataTimeseries>;
   phenomenaById: Map<number, MetadataPhenomenon>;
   observedPropertyById: Map<number, MetadataObservedProperty>;
@@ -953,33 +955,24 @@ function tableKeyFromManifest(manifest: CoreSnapshotManifest, tableName: string)
 function buildMetadataIndex(cache: CoreMetadataCacheFile): MetadataIndex {
   const connectorsById = new Map<number, MetadataConnector>();
   const stationsById = new Map<number, MetadataStation>();
-  const membershipsByStationId = new Map<number, MetadataMembership[]>();
+  const networksById = new Map<number, MetadataNetwork>();
   const timeseriesById = new Map<number, MetadataTimeseries>();
   const phenomenaById = new Map<number, MetadataPhenomenon>();
   const observedPropertyById = new Map<number, MetadataObservedProperty>();
 
   for (const row of cache.connectors) connectorsById.set(row.id, row);
   for (const row of cache.stations) stationsById.set(row.id, row);
+  for (const row of cache.networks || []) networksById.set(row.id, row);
   for (const row of cache.timeseries) timeseriesById.set(row.id, row);
   for (const row of cache.phenomena) phenomenaById.set(row.id, row);
   for (const row of cache.observed_properties) observedPropertyById.set(row.id, row);
-  for (const row of cache.memberships) {
-    const existing = membershipsByStationId.get(row.station_id) || [];
-    existing.push(row);
-    membershipsByStationId.set(row.station_id, existing);
-  }
-  for (const rows of membershipsByStationId.values()) {
-    rows.sort((a, b) => {
-      if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
-      return a.network_code.localeCompare(b.network_code);
-    });
-  }
+
 
   return {
     source_day_utc: cache.source_day_utc,
     connectorsById,
     stationsById,
-    membershipsByStationId,
+    networksById,
     timeseriesById,
     phenomenaById,
     observedPropertyById,
@@ -1029,6 +1022,10 @@ function mapStationRows(rows: Array<Record<string, unknown>>): MetadataStation[]
     output.push({
       id: Math.trunc(id),
       connector_id: Number.isInteger(connectorId) && connectorId > 0 ? Math.trunc(connectorId) : null,
+      network_id: (() => {
+        const networkId = Number(row.network_id);
+        return Number.isInteger(networkId) && networkId > 0 ? Math.trunc(networkId) : null;
+      })(),
       station_ref: normalizeNonEmptyText(String(row.station_ref ?? "")),
       label: normalizeNonEmptyText(String(row.label ?? "")),
       station_name: normalizeNonEmptyText(String(row.station_name ?? "")),
@@ -1039,17 +1036,17 @@ function mapStationRows(rows: Array<Record<string, unknown>>): MetadataStation[]
   return output;
 }
 
-function mapMembershipRows(rows: Array<Record<string, unknown>>): MetadataMembership[] {
-  const output: MetadataMembership[] = [];
+function mapNetworkRows(rows: Array<Record<string, unknown>>): MetadataNetwork[] {
+  const output: MetadataNetwork[] = [];
   for (const row of rows) {
-    const stationId = Number(row.station_id);
-    const networkCode = normalizeNonEmptyText(String(row.network_code ?? ""));
-    if (!Number.isInteger(stationId) || stationId <= 0 || !networkCode) continue;
+    const id = Number(row.id);
+    if (!Number.isInteger(id) || id <= 0) continue;
     output.push({
-      station_id: Math.trunc(stationId),
-      network_code: networkCode,
-      network_label: normalizeNonEmptyText(String(row.network_label ?? "")),
-      is_primary: Boolean(row.is_primary),
+      id: Math.trunc(id),
+      network_code: normalizeNonEmptyText(String(row.network_code ?? row.code ?? "")),
+      display_name: normalizeNonEmptyText(String(row.display_name ?? row.label ?? "")),
+      network_type: normalizeNonEmptyText(String(row.network_type ?? "")),
+      public_display_enabled: Boolean(row.public_display_enabled),
     });
   }
   return output;
@@ -1120,7 +1117,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     bytesRead += cacheObject.body.byteLength;
     const text = new TextDecoder().decode(cacheObject.body);
     const parsed = JSON.parse(text) as CoreMetadataCacheFile;
-    if (parsed && parsed.schema_version === 1 && isMetadataCacheFresh(parsed)) {
+    if (parsed && parsed.schema_version === 1 && Array.isArray(parsed.networks) && isMetadataCacheFresh(parsed)) {
       return {
         metadata: buildMetadataIndex(parsed),
         stats: {
@@ -1150,6 +1147,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
 
   const requiredTables = [
     "connectors",
+    "networks",
     "stations",
     "timeseries",
     "phenomena",
@@ -1169,24 +1167,13 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     tableRows.set(tableName, parseNdjsonRows(ndjsonText));
   }
 
-  const membershipsKey = tableKeyFromManifest(manifest, "station_network_memberships");
-  if (membershipsKey) {
-    const object = await r2GetObject({ r2: R2_CONFIG, key: membershipsKey });
-    objectsRead += 1;
-    bytesRead += object.body.byteLength;
-    const ndjsonText = decodeCoreTableText(object.body, membershipsKey);
-    tableRows.set("station_network_memberships", parseNdjsonRows(ndjsonText));
-  } else {
-    tableRows.set("station_network_memberships", []);
-  }
-
   const cachePayload: CoreMetadataCacheFile = {
     schema_version: 1,
     generated_at: utcNowIso(),
     source_day_utc: manifest.day_utc || latestManifestInfo.day_utc,
     connectors: mapConnectorRows(tableRows.get("connectors") || []),
     stations: mapStationRows(tableRows.get("stations") || []),
-    memberships: mapMembershipRows(tableRows.get("station_network_memberships") || []),
+    networks: mapNetworkRows(tableRows.get("networks") || []),
     timeseries: mapTimeseriesRows(tableRows.get("timeseries") || []),
     phenomena: mapPhenomenonRows(tableRows.get("phenomena") || []),
     observed_properties: mapObservedPropertyRows(tableRows.get("observed_properties") || []),
@@ -1299,14 +1286,18 @@ function buildSourceRows(
     if (!passesOutlierThreshold(pollutantNormalized, state.value)) continue;
     if (!(station?.pcon_code || station?.la_code)) continue;
 
+    const network = station?.network_id ? metadata.networksById.get(station.network_id) || null : null;
+    if (!network?.network_code) {
+      missingMetadata += 1;
+      continue;
+    }
+
     const stationLabel = resolveStationLabel(station?.label, station?.station_ref, series.label ?? null);
-    const stationMemberships = station
-      ? (metadata.membershipsByStationId.get(station.id) || []).map((item) => ({
-        network_code: item.network_code,
-        network_label: item.network_label,
-        is_primary: item.is_primary,
-      }))
-      : [];
+    const stationMemberships: LatestItem["station_network_memberships"] = [{
+      network_code: network.network_code,
+      network_label: network.display_name,
+      is_primary: true,
+    }];
 
     const phenomenonLabel = resolvePhenomenonLabel(
       observedProperty?.display_name,

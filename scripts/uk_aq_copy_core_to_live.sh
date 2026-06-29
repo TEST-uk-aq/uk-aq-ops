@@ -134,13 +134,12 @@ CORE_TABLES=(
   "uk_aq_core.offerings"
   "uk_aq_core.features"
   "uk_aq_core.procedures"
-  "uk_aq_core.uk_aq_networks"
+  "uk_aq_core.networks"
   "uk_aq_core.uk_air_sos_networks"
   "uk_aq_core.uk_air_sos_network_pollutants"
   "uk_aq_core.connectors"
   "uk_aq_core.stations"
   "uk_aq_core.station_metadata"
-  "uk_aq_core.station_network_memberships"
   "uk_aq_core.timeseries"
 )
 
@@ -245,13 +244,12 @@ UNION ALL SELECT 'phenomena',                     count(*) FROM uk_aq_core.pheno
 UNION ALL SELECT 'offerings',                     count(*) FROM uk_aq_core.offerings
 UNION ALL SELECT 'features',                      count(*) FROM uk_aq_core.features
 UNION ALL SELECT 'procedures',                    count(*) FROM uk_aq_core.procedures
-UNION ALL SELECT 'uk_aq_networks',                count(*) FROM uk_aq_core.uk_aq_networks
+UNION ALL SELECT 'networks',                     count(*) FROM uk_aq_core.networks
 UNION ALL SELECT 'uk_air_sos_networks',           count(*) FROM uk_aq_core.uk_air_sos_networks
 UNION ALL SELECT 'uk_air_sos_network_pollutants', count(*) FROM uk_aq_core.uk_air_sos_network_pollutants
 UNION ALL SELECT 'connectors',                    count(*) FROM uk_aq_core.connectors
 UNION ALL SELECT 'stations',                      count(*) FROM uk_aq_core.stations
 UNION ALL SELECT 'station_metadata',              count(*) FROM uk_aq_core.station_metadata
-UNION ALL SELECT 'station_network_memberships',   count(*) FROM uk_aq_core.station_network_memberships
 UNION ALL SELECT 'timeseries',                    count(*) FROM uk_aq_core.timeseries
 ORDER BY 1;
 SQL
