@@ -55,6 +55,12 @@ Read endpoints:
 - `/api/aq/stations` -> `uk_aq_stations`
 - `/api/aq/la-hex` -> `uk_aq_la_hex`
 - `/api/aq/pcon-hex` -> `uk_aq_pcon_hex`
+- `/api/aq/networks` -> `uk_aq_public_networks`
+  - reads the canonical `uk_aq_public.networks` source through the Supabase edge function
+  - uses the metadata cache profile (`max-age=60`)
+  - returns the v2 public catalog contract with `contract_version: 2` and enabled public-network rows containing `network_id`, `network_code`, `network_label`, `network_type`, and `public_display_enabled: true` where supported by the upstream
+  - disabled networks such as OpenAQ remain excluded by the upstream `uk_aq_public_networks` function while `public_display_enabled=false`
+  - network and snapshot URLs remain stable; do not add routine cache-buster parameters for normal website traffic
 - `/api/aq/aqi-history` -> external AQI history R2 API URL (`UK_AQ_AQI_HISTORY_R2_API_URL`)
   - canonicalizes AQI-history requests to `format=compact` unless the client explicitly asks for `format=objects` or `format=tsv`
   - cache policy is dynamic by requested end time:
