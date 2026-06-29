@@ -723,6 +723,60 @@ Rename its internal selected-code fields without adding a legacy migration.
 
 Do not introduce a connector alias for any new network URL state.
 
+#### Phase 7 implementation result — 2026-06-29
+
+- Updated the active website pages `hex_map.html`, `sensors_map.html`, and
+  `sensors_chart.html` to use the v2 public network catalog from
+  `/api/aq/networks` as the public network source of truth.
+- `hex_map.html` now builds network filters from catalog rows and resolves
+  public identity using scalar `network_id`, `network_code`, and
+  `network_label`. It filters by exact database `network_code` values and no
+  longer remaps `gov_uk_aurn` to `aurn` or `breathelondon` to
+  `breathe_london`.
+- Removed connector-derived public network discovery from the website path,
+  including membership-array collection, connector-label fallbacks for public
+  network display, hardcoded base network definitions as the source of
+  available networks, and old connector/string canonicalisation.
+- Both duplicated hex-map controllers were updated. The shared in-memory
+  network selection now uses selected network codes rather than connector or
+  membership-derived identifiers. No legacy URL-state or localStorage migration
+  was added because the map did not persist connector filters.
+- Network panel counts are seeded from the catalog so enabled public networks
+  can appear even when they currently have zero rows in the selected
+  pollutant/window. Counts remain “active sensors in the current window”.
+- The OpenAQ `AGGREGATOR` badge rule is retained, but it is now keyed from the
+  catalog `network_type = 'aggregator'`. Because OpenAQ remains non-public, it
+  does not appear unless the catalog returns it.
+- `sensors_map.html` now obtains public network codes from `/api/aq/networks`
+  and uses `network_code` station-geometry sharding only if the unfiltered
+  response reaches the response limit. Numeric connector-ID sharding and
+  `connector_probe_max` were removed from the public path.
+- `sensors_chart.html` now renders public network names from scalar
+  `network_label`, with exact `network_code` catalog lookup only as a label
+  fallback. Membership arrays, `network_name`, and connector-label fallbacks
+  were removed from public network display.
+- Connector fields remain available only where they are still useful for
+  provenance, debugging, chart/details metadata, and cache uniqueness. They are
+  no longer used to construct public network identity.
+- Added Phase 7 static regression tests covering catalog use, exact
+  `network_code` filtering, absence of connector/membership public fallbacks,
+  catalog-backed labels, aggregator badge behaviour, no routine network
+  catalog cache busters, and user-facing network paths avoiding connector-label
+  fallbacks.
+- PR #15 was merged into the website repo. The change was limited to website
+  source and tests: `hex_map.html`, `sensors_map.html`, `sensors_chart.html`,
+  `tests/test_phase7_network_hard_cut.py`, and a small station-chart test
+  update. No ops, ingest, schema, edge-function, database, archive, station
+  matching/merging, or immutable R2 object changes were made in this phase.
+- Local validation reported `pytest -q` passing, inline script syntax checks
+  passing, and `git diff --check` passing.
+- Post-deploy observation: the website hard cut depends on v2 latest-snapshot
+  rows carrying scalar `network_code` and `network_label`. If a public network
+  flag is changed after snapshot metadata is cached, the R2 core snapshot and
+  latest-snapshot metadata cache must be refreshed before the new network's
+  latest rows appear in `/api/aq/latest-snapshot`. This is a snapshot metadata
+  refresh concern, not a Phase 7 website fallback issue.
+
 ### Phase 8 — Remove legacy tables and active dependencies
 
 After the replacement schema, APIs, workers, and scripts pass their contract
