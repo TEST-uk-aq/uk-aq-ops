@@ -321,7 +321,7 @@ const UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX = normalizePrefix(
 );
 const UK_AQ_LATEST_SNAPSHOT_STATE_KEY = `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/latest_state.json`;
 const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX = normalizePrefix(
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX") || "history/v1/core",
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX") || "history/v2/core",
 );
 const UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY =
   `${UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX}/core_metadata_cache.json`;
