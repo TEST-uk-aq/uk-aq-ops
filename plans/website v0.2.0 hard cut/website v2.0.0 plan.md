@@ -622,6 +622,36 @@ At cutover, purge affected Cloudflare cache entries or rotate the snapshot
 prefix/contract version. Do not add routine cache-buster parameters to website
 traffic.
 
+#### Phase 6 implementation result — 2026-06-29
+
+- Added the cache-proxy route mapping `/api/aq/networks` to the
+  `uk_aq_public_networks` Supabase edge function.
+- The route uses the existing metadata cache profile and leaves normal network
+  and latest-snapshot URLs stable. No routine cache-buster parameters were
+  added to website traffic.
+- Disabled-network exclusion remains enforced by the `uk_aq_public_networks`
+  upstream, which reads the canonical `uk_aq_public.networks` source and returns
+  only `public_display_enabled=true` rows in the v2 public catalog contract.
+- Added cache-proxy route tests covering the `/api/aq/networks` mapping,
+  metadata cache profile, stable latest-snapshot route, absence of routine
+  cache-buster parameters, and unchanged legacy route mappings.
+- Manual post-deploy verification should check:
+
+  ```bash
+  BASE="https://cic-test.chronicillnesschannel.co.uk/api/aq"
+  curl -s "$BASE/networks" | jq .
+  curl -sI "$BASE/networks"
+  ```
+
+  Expected result: JSON rather than an HTML redirect; `contract_version` is 2;
+  enabled public networks only; rows include `network_id`, `network_code`,
+  `network_label`, `network_type`, and `public_display_enabled`; OpenAQ is
+  absent while disabled; cache headers match the metadata cache profile; no
+  cache-buster parameter is required.
+- No website code, ingest code, deployments, database drops, station
+  matching/merging, immutable R2 object rewrites, or archive files were created
+  or changed in this phase.
+
 ### Phase 7 — Website hard cut
 
 #### Update `hex_map.html`
