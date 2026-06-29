@@ -551,12 +551,13 @@ new snapshots. Existing immutable R2/archive objects are not rewritten.
   and to stop copying `station_network_memberships`.
 - Updated the latest-snapshot Cloud Run metadata refresh to require/read the
   `networks` core snapshot table into its metadata cache and to stop reading
-  `station_network_memberships` from active core snapshots. The emitted latest
-  snapshot row contract is otherwise unchanged in this phase.
+  `station_network_memberships` from active core snapshots. For Phase 4
+  compatibility, the existing latest row `station_network_memberships` array is
+  still emitted, but it is derived from `stations.network_id -> networks.id`
+  rather than the retired membership table.
 - Updated R2 core snapshot and history-integrity docs/tests to reflect the
   canonical `networks` table set.
-- No deployment was performed. Existing immutable R2/archive objects were not
-  rewritten.
+- No deployment was performed. Existing immutable R2 objects were not rewritten.
 
 ### Phase 5 — Latest-snapshot v2
 

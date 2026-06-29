@@ -190,6 +190,7 @@ type MetadataConnector = {
 type MetadataStation = {
   id: number;
   connector_id: number | null;
+  network_id: number | null;
   station_ref: string | null;
   label: string | null;
   station_name: string | null;
@@ -1021,6 +1022,10 @@ function mapStationRows(rows: Array<Record<string, unknown>>): MetadataStation[]
     output.push({
       id: Math.trunc(id),
       connector_id: Number.isInteger(connectorId) && connectorId > 0 ? Math.trunc(connectorId) : null,
+      network_id: (() => {
+        const networkId = Number(row.network_id);
+        return Number.isInteger(networkId) && networkId > 0 ? Math.trunc(networkId) : null;
+      })(),
       station_ref: normalizeNonEmptyText(String(row.station_ref ?? "")),
       label: normalizeNonEmptyText(String(row.label ?? "")),
       station_name: normalizeNonEmptyText(String(row.station_name ?? "")),
@@ -1281,8 +1286,18 @@ function buildSourceRows(
     if (!passesOutlierThreshold(pollutantNormalized, state.value)) continue;
     if (!(station?.pcon_code || station?.la_code)) continue;
 
+    const network = station?.network_id ? metadata.networksById.get(station.network_id) || null : null;
+    if (!network?.network_code) {
+      missingMetadata += 1;
+      continue;
+    }
+
     const stationLabel = resolveStationLabel(station?.label, station?.station_ref, series.label ?? null);
-    const stationMemberships: LatestItem["station_network_memberships"] = [];
+    const stationMemberships: LatestItem["station_network_memberships"] = [{
+      network_code: network.network_code,
+      network_label: network.display_name,
+      is_primary: true,
+    }];
 
     const phenomenonLabel = resolvePhenomenonLabel(
       observedProperty?.display_name,
