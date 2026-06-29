@@ -9,7 +9,7 @@
 </head>
 <body><main>
 <div class="card"><h1>station_snapshot_v2</h1><div class="muted">Lightweight diagnostic for ingestdb, ObsAQIDB, R2 history, and AQI/hourly rows. v1 remains available separately.</div></div>
-<div id="snapshotCard" class="card loading-scope"><div id="loadingOverlay" class="loading-overlay" hidden aria-live="polite" aria-label="Loading"><img class="uk-aq-loader" src="/images/UKAQ-Loading.svg" alt="UK AQ loading"></div><div class="controls"><div><label for="q">Station search</label><input id="q" placeholder="Marylebone, station_id, station_ref, connector"></div><div><label>Pollutant</label><button data-pollutant="pm25" class="active">PM2.5</button> <button data-pollutant="pm10">PM10</button> <button data-pollutant="no2">NO2</button></div><div><label>Range</label><button data-range="24h" class="active">24hrs</button> <button data-range="7d">7 days</button> <button data-range="31d">31 days</button> <button data-range="90d">90 days</button></div><div id="tsBox" hidden><label for="ts">Timeseries</label><select id="ts"></select></div></div><div id="results" class="results"></div></div>
+<div id="snapshotCard" class="card loading-scope"><div id="loadingOverlay" class="loading-overlay" hidden aria-live="polite" aria-label="Loading"><img class="uk-aq-loader" src="/images/UKAQ-Loading.svg" alt="UK AQ loading"></div><div class="controls"><div><label for="q">Station search</label><input id="q" placeholder="Marylebone, station_id, station_ref, network"></div><div><label>Pollutant</label><button data-pollutant="pm25" class="active">PM2.5</button> <button data-pollutant="pm10">PM10</button> <button data-pollutant="no2">NO2</button></div><div><label>Range</label><button data-range="24h" class="active">24hrs</button> <button data-range="7d">7 days</button> <button data-range="31d">31 days</button> <button data-range="90d">90 days</button></div><div id="tsBox" hidden><label for="ts">Timeseries</label><select id="ts"></select></div></div><div id="results" class="results"></div></div>
 <div id="warning" class="status warn" hidden></div><div id="status" class="status">Search for a station to begin.</div><details id="debugPanel" class="card debug-panel" hidden><summary>Rows debug</summary><pre id="debugPre"></pre></details>
 <div class="card table-wrap"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 </main><script>
@@ -94,7 +94,12 @@ function colourCell(row,k){
   return `<span class="swatch" style="background:${fmt(colour)}"></span>`;
 }
 function pollutantLabel(code){if(code==='pm25')return 'PM2.5';if(code==='pm10')return 'PM10';if(code==='no2')return 'NO2';return code;}
-function stationLabel(s){return `${s.station_name || s.label || '(unnamed station)'} · station_id ${s.station_id} · connector ${s.connector_id ?? ''} · ref ${s.station_ref ?? ''}`;}
+function stationLabel(s){
+  const network = s.network_label || s.network_code || 'unknown network';
+  const connector = s.connector_label || s.connector_code || s.connector_id || '';
+  const connectorText = connector ? ` · connector ${connector}` : '';
+  return `${s.station_name || s.label || '(unnamed station)'} · ${network} · station_id ${s.station_id}${connectorText} · ref ${s.station_ref ?? ''}`;
+}
 function stationLastValueLabel(s){
   const time=isNullish(s.last_value_at)?'NULL':fmtDate(s.last_value_at);
   const ts=s.selected_timeseries_id||s.last_value_timeseries_id;

@@ -2,6 +2,10 @@
 
 Serves latest snapshot JSON objects from R2 using stable URL/query keys for cache-proxy upstream use.
 
+The public worker is hard-cut to the `latest_snapshots/v2` object contract. It
+does not read or fall back to v1 objects. Responses identify the contract with
+`X-UK-AQ-Snapshot-Contract: v2`.
+
 ## Endpoints
 
 - `GET /v1/latest-snapshot?pollutant=pm25&window=6h&network_group=all`
@@ -29,6 +33,9 @@ This is intended to be called by `uk_aq_cache_proxy` (not directly by browsers).
 
 ## Optional vars
 
-- `UK_AQ_LATEST_SNAPSHOT_R2_PREFIX` (default `latest_snapshots/v1`)
+- `UK_AQ_LATEST_SNAPSHOT_R2_PREFIX` (required value/default `latest_snapshots/v2`)
 - `UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY` (default `${prefix}/manifest.json`)
 - `UK_AQ_LATEST_SNAPSHOT_R2_CACHE_MAX_AGE_SECONDS` (default `60`)
+
+The worker fails closed with `invalid_v2_snapshot_config` if either path is
+configured outside the canonical v2 prefix/manifest.

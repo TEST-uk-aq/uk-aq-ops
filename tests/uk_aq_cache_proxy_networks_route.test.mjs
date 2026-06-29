@@ -20,6 +20,13 @@ test("cache proxy keeps snapshot URLs stable and does not add routine cache bust
   const source = await cacheProxySource();
 
   assert.match(source, /"latest-snapshot":\s*EXTERNAL_LATEST_SNAPSHOT_UPSTREAM/);
+  assert.match(source, /LATEST_SNAPSHOT_CONTRACT_VERSION = "v2"/);
+  assert.match(source, /LATEST_SNAPSHOT_CACHE_KEY_PARAM = "__uk_aq_snapshot_contract"/);
+  assert.match(source, /latest_snapshot_contract_mismatch/);
+  assert.match(
+    source,
+    /normalizedUpstreamRequestUrl\.searchParams\.delete\(LATEST_SNAPSHOT_CACHE_KEY_PARAM\)/,
+  );
   assert.match(source, /const CACHE_BYPASS_QUERY = "cache"/);
   assert.doesNotMatch(source, /networks.*(?:cache_bust|cache-bust|cachebuster|timestamp|_t)/i);
 });

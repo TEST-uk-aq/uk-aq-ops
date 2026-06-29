@@ -1,4 +1,5 @@
-const DEFAULT_LATEST_SNAPSHOT_PREFIX = "latest_snapshots/v1";
+const LATEST_SNAPSHOT_CONTRACT_VERSION = "v2";
+const DEFAULT_LATEST_SNAPSHOT_PREFIX = `latest_snapshots/${LATEST_SNAPSHOT_CONTRACT_VERSION}`;
 const DEFAULT_LATEST_SNAPSHOT_MANIFEST_KEY = `${DEFAULT_LATEST_SNAPSHOT_PREFIX}/manifest.json`;
 const DEFAULT_CACHE_SECONDS = 60;
 const MAX_CACHE_SECONDS = 604800;
@@ -132,6 +133,27 @@ function buildSnapshotKey(prefix, networkGroup, pollutant, windowLabel) {
   return `${prefix}/network_group=${networkGroup}/pollutant=${pollutant}/window=${windowLabel}.json`;
 }
 
+function resolveSnapshotConfig(env) {
+  const prefix = normalizePrefix(
+    env.UK_AQ_LATEST_SNAPSHOT_R2_PREFIX || DEFAULT_LATEST_SNAPSHOT_PREFIX,
+  ) || DEFAULT_LATEST_SNAPSHOT_PREFIX;
+  const manifestKey = normalizePrefix(
+    env.UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY || `${prefix}/manifest.json`,
+  ) || DEFAULT_LATEST_SNAPSHOT_MANIFEST_KEY;
+  if (
+    prefix !== DEFAULT_LATEST_SNAPSHOT_PREFIX ||
+    manifestKey !== DEFAULT_LATEST_SNAPSHOT_MANIFEST_KEY
+  ) {
+    return {
+      ok: false,
+      error: "invalid_v2_snapshot_config",
+      prefix,
+      manifestKey,
+    };
+  }
+  return { ok: true, prefix, manifestKey };
+}
+
 async function getObjectResponse(env, key, method, cacheSeconds, ifNoneMatchHeader) {
   const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
   if (!object) {
@@ -144,11 +166,13 @@ async function getObjectResponse(env, key, method, cacheSeconds, ifNoneMatchHead
     const headers = new Headers(corsHeaders());
     headers.set("Cache-Control", cacheControlHeader(cacheSeconds));
     headers.set("ETag", etag);
+    headers.set("X-UK-AQ-Snapshot-Contract", LATEST_SNAPSHOT_CONTRACT_VERSION);
     return new Response(null, { status: 304, headers });
   }
 
   const headers = new Headers(corsHeaders());
   setObjectHeaders(headers, object, cacheSeconds);
+  headers.set("X-UK-AQ-Snapshot-Contract", LATEST_SNAPSHOT_CONTRACT_VERSION);
 
   if (method === "HEAD") {
     return new Response(null, { status: 200, headers });
@@ -187,11 +211,11 @@ export default {
       30,
       MAX_CACHE_SECONDS,
     );
-    const prefix = normalizePrefix(env.UK_AQ_LATEST_SNAPSHOT_R2_PREFIX || DEFAULT_LATEST_SNAPSHOT_PREFIX)
-      || DEFAULT_LATEST_SNAPSHOT_PREFIX;
-    const manifestKey = normalizePrefix(
-      env.UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY || `${prefix}/manifest.json`,
-    ) || DEFAULT_LATEST_SNAPSHOT_MANIFEST_KEY;
+    const snapshotConfig = resolveSnapshotConfig(env);
+    if (!snapshotConfig.ok) {
+      return withError(500, snapshotConfig.error);
+    }
+    const { prefix, manifestKey } = snapshotConfig;
 
     const requestIfNoneMatch = request.headers.get("If-None-Match") || "";
 
@@ -224,6 +248,7 @@ export default {
       return jsonResponse({
         ok: true,
         generated_at: new Date().toISOString(),
+        contract_version: LATEST_SNAPSHOT_CONTRACT_VERSION,
         prefix,
         manifest_key: manifestKey,
       }, { cacheSeconds: 30 });

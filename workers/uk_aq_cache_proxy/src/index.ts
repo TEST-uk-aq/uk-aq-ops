@@ -171,6 +171,8 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
 
 const EXTERNAL_AQI_HISTORY_UPSTREAM = "__uk_aq_aqi_history_r2_api__";
 const EXTERNAL_LATEST_SNAPSHOT_UPSTREAM = "__uk_aq_latest_snapshot_r2_api__";
+const LATEST_SNAPSHOT_CONTRACT_VERSION = "v2";
+const LATEST_SNAPSHOT_CACHE_KEY_PARAM = "__uk_aq_snapshot_contract";
 const EXTERNAL_POSTCODE_LOOKUP_UPSTREAM = "__uk_aq_postcode_lookup_r2_api__";
 const EXTERNAL_POSTCODE_SUGGEST_UPSTREAM = "__uk_aq_postcode_suggest_r2_api__";
 const EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM = "__uk_aq_postcode_prefix_hints_r2_api__";
@@ -2247,6 +2249,17 @@ function canonicalizeAqiHistoryRequestUrl(url: URL, upstreamFunction: string): U
   return normalized;
 }
 
+function canonicalizeLatestSnapshotRequestUrl(url: URL, upstreamFunction: string): URL {
+  const normalized = new URL(url.toString());
+  if (upstreamFunction === EXTERNAL_LATEST_SNAPSHOT_UPSTREAM) {
+    normalized.searchParams.set(
+      LATEST_SNAPSHOT_CACHE_KEY_PARAM,
+      LATEST_SNAPSHOT_CONTRACT_VERSION,
+    );
+  }
+  return normalized;
+}
+
 function isImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
   const explicitEndMs = parseIsoMsOrNull(
     url.searchParams.get("to_utc")
@@ -2880,7 +2893,10 @@ export default {
       : null;
     const normalizedRequestUrl = useTimeseriesV2Skeleton
       ? timeseriesV2Canonicalized!.url
-      : canonicalizeAqiHistoryRequestUrl(url, upstreamFunction);
+      : canonicalizeLatestSnapshotRequestUrl(
+        canonicalizeAqiHistoryRequestUrl(url, upstreamFunction),
+        upstreamFunction,
+      );
     const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
@@ -3099,6 +3115,7 @@ export default {
       );
     }
     const normalizedUpstreamRequestUrl = new URL(normalizedRequestUrl.toString());
+    normalizedUpstreamRequestUrl.searchParams.delete(LATEST_SNAPSHOT_CACHE_KEY_PARAM);
     if (
       useTimeseriesV2Skeleton &&
       normalizedUpstreamRequestUrl.searchParams.get("format") === "json"
@@ -3159,6 +3176,20 @@ export default {
       }
     } catch (_err) {
       return makeErrorResponse(502, "upstream_fetch_failed", requestOrigin, allowedOrigins);
+    }
+
+    if (
+      usingExternalLatestSnapshotUpstream &&
+      upstreamResponse.status === 200 &&
+      upstreamResponse.headers.get("X-UK-AQ-Snapshot-Contract") !==
+        LATEST_SNAPSHOT_CONTRACT_VERSION
+    ) {
+      return makeErrorResponse(
+        502,
+        "latest_snapshot_contract_mismatch",
+        requestOrigin,
+        allowedOrigins,
+      );
     }
 
     const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
