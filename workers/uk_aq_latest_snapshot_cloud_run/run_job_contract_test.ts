@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   buildMetadataIndex,
   buildSourceRows,
+  validateSnapshotContractPaths,
 } from "./run_job.ts";
 
 function fixtureMetadata() {
@@ -109,4 +110,39 @@ Deno.test("missing station network metadata is counted and skipped", () => {
   const result = buildSourceRows(fixtureState(), metadata, "v2");
   assert.equal(result.missingMetadata, 1);
   assert.equal(result.rows.length, 0);
+});
+
+
+Deno.test("contract path validation rejects obvious v2/v1 cross-version paths", () => {
+  assert.throws(() => validateSnapshotContractPaths("v2", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_R2_PREFIX", value: "latest_snapshots/v1" },
+  ]), /UK_AQ_LATEST_SNAPSHOT_R2_PREFIX=latest_snapshots\/v1/);
+  assert.throws(() => validateSnapshotContractPaths("v2", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY", value: "latest_snapshots/v1/manifest.json" },
+  ]), /UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY=latest_snapshots\/v1\/manifest.json/);
+  assert.throws(() => validateSnapshotContractPaths("v2", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX", value: "latest_snapshots/v1/_runs" },
+  ]), /UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX=latest_snapshots\/v1\/_runs/);
+  assert.throws(() => validateSnapshotContractPaths("v1", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_R2_PREFIX", value: "latest_snapshots/v2" },
+  ]), /UK_AQ_LATEST_SNAPSHOT_R2_PREFIX=latest_snapshots\/v2/);
+  assert.throws(() => validateSnapshotContractPaths("v1", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY", value: "latest_snapshots/v2/manifest.json" },
+  ]), /UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY=latest_snapshots\/v2\/manifest.json/);
+  assert.throws(() => validateSnapshotContractPaths("v1", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX", value: "latest_snapshots/v2/_runs" },
+  ]), /UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX=latest_snapshots\/v2\/_runs/);
+});
+
+Deno.test("contract path validation allows matching version and custom paths", () => {
+  validateSnapshotContractPaths("v2", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_R2_PREFIX", value: "latest_snapshots/v2" },
+    { name: "UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY", value: "latest_snapshots/v2/manifest.json" },
+    { name: "UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX", value: "latest_snapshots/v2/_runs" },
+    { name: "UK_AQ_LATEST_SNAPSHOT_R2_PREFIX", value: "custom/latest" },
+  ]);
+  validateSnapshotContractPaths("v1", [
+    { name: "UK_AQ_LATEST_SNAPSHOT_R2_PREFIX", value: "latest_snapshots/v1" },
+    { name: "UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY", value: "legacy/latest/manifest.json" },
+  ]);
 });

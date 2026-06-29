@@ -67,3 +67,5 @@ The run report includes this trigger mode.
 - v2 rows intentionally omit `station_network_memberships`, `network_memberships`, `network_name`, and `network_type`. Connector provenance fields such as `connector_code` and `connector_label` remain present.
 - v1 compatibility remains available by setting `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION=v1` and an explicit v1 prefix; v1 rows continue to emit `station_network_memberships`.
 - Missing station/network metadata is counted as `missing_metadata_rows` and skipped instead of falling back to connector-derived network fields. Networks with `public_display_enabled=false` are skipped.
+
+- Runtime and deploy workflow validation reject obvious cross-version standard paths: v2 cannot use `latest_snapshots/v1` for the snapshot prefix, manifest key, or runs prefix, and v1 cannot use `latest_snapshots/v2`. Custom non-versioned prefixes are still allowed.

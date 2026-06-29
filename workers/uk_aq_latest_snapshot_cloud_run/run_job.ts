@@ -383,6 +383,29 @@ function parseContractVersion(raw: string | undefined | null): LatestSnapshotCon
   throw new Error(`Unsupported UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION: ${raw}`);
 }
 
+function isUnderSnapshotVersionPrefix(path: string, version: LatestSnapshotContractVersion): boolean {
+  const normalized = normalizePrefix(path);
+  const versionPrefix = `latest_snapshots/${version}`;
+  return normalized === versionPrefix || normalized.startsWith(`${versionPrefix}/`);
+}
+
+function validateSnapshotContractPaths(
+  contractVersion: LatestSnapshotContractVersion,
+  paths: Array<{ name: string; value: string | null | undefined }>,
+): void {
+  const rejectedVersion: LatestSnapshotContractVersion = contractVersion === "v2" ? "v1" : "v2";
+  for (const path of paths) {
+    const value = normalizePrefix(path.value || "");
+    if (!value) continue;
+    if (isUnderSnapshotVersionPrefix(value, rejectedVersion)) {
+      throw new Error(
+        `${path.name}=${value} is under latest_snapshots/${rejectedVersion} but ` +
+          `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION=${contractVersion}. Use a matching latest_snapshots/${contractVersion} path or a custom non-versioned prefix.`,
+      );
+    }
+  }
+}
+
 function parseCsvList(raw: string | undefined | null, fallback: string[]): string[] {
   const source = String(raw || "").trim();
   if (!source) return [...fallback];
@@ -1453,6 +1476,11 @@ async function main(): Promise<void> {
   if (!UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY) {
     throw new Error("UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY resolved empty.");
   }
+  validateSnapshotContractPaths(UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION, [
+    { name: "UK_AQ_LATEST_SNAPSHOT_R2_PREFIX", value: UK_AQ_LATEST_SNAPSHOT_R2_PREFIX },
+    { name: "UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY", value: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY },
+    { name: "UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX", value: UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX },
+  ]);
   if (!PUBSUB_PROJECT_ID) {
     throw new Error("Missing GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT).");
   }
@@ -1737,6 +1765,7 @@ export {
   mapStationRows,
   mapTimeseriesRows,
   parseContractVersion,
+  validateSnapshotContractPaths,
 };
 
 if (import.meta.main) {
