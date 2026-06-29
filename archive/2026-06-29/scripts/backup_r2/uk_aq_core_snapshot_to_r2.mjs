@@ -61,15 +61,16 @@ const TABLE_EXPORT_CONFIG = Object.freeze({
   offerings: Object.freeze({ order_by: "id" }),
   features: Object.freeze({ order_by: "id" }),
   procedures: Object.freeze({ order_by: "id" }),
-  networks: Object.freeze({ order_by: "id" }),
+  uk_aq_networks: Object.freeze({ order_by: "id" }),
   uk_air_sos_networks: Object.freeze({ order_by: "network_ref" }),
   uk_air_sos_network_pollutants: Object.freeze({ order_by: "network_ref, match_type, match_value" }),
   stations: Object.freeze({ order_by: "id" }),
   station_metadata: Object.freeze({ order_by: "station_id" }),
+  station_network_memberships: Object.freeze({ order_by: "station_id, network_code" }),
   timeseries: Object.freeze({ order_by: "id" }),
 });
 
-export const DEFAULT_TABLES = Object.freeze([
+const DEFAULT_TABLES = Object.freeze([
   "connectors",
   "categories",
   "observed_properties",
@@ -77,11 +78,12 @@ export const DEFAULT_TABLES = Object.freeze([
   "offerings",
   "features",
   "procedures",
-  "networks",
+  "uk_aq_networks",
   "uk_air_sos_networks",
   "uk_air_sos_network_pollutants",
   "stations",
   "station_metadata",
+  "station_network_memberships",
   "timeseries",
 ]);
 

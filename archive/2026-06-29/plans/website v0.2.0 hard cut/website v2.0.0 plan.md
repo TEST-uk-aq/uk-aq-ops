@@ -541,23 +541,6 @@ This does not alter the mandatory Phase B observations backup. The canonical
 `networks` and `stations.network_id` fields replace the legacy core metadata in
 new snapshots. Existing immutable R2/archive objects are not rewritten.
 
-#### Phase 4 result (2026-06-29)
-
-- Updated the R2 core snapshot exporter default table set to export
-  `uk_aq_core.networks` and to omit the legacy `uk_aq_networks` and
-  `station_network_memberships` tables from new manifests.
-- Updated TEST-to-LIVE core copy tooling table order and identity sequence
-  handling to copy `uk_aq_core.networks` instead of `uk_aq_core.uk_aq_networks`
-  and to stop copying `station_network_memberships`.
-- Updated the latest-snapshot Cloud Run metadata refresh to require/read the
-  `networks` core snapshot table into its metadata cache and to stop reading
-  `station_network_memberships` from active core snapshots. The emitted latest
-  snapshot row contract is otherwise unchanged in this phase.
-- Updated R2 core snapshot and history-integrity docs/tests to reflect the
-  canonical `networks` table set.
-- No deployment was performed. Existing immutable R2/archive objects were not
-  rewritten.
-
 ### Phase 5 — Latest-snapshot v2
 
 Update the metadata cache to index:

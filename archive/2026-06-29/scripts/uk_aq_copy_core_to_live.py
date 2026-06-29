@@ -40,18 +40,19 @@ PAGE_SIZE = 1000
 # (postgrest_table, schema, on_conflict_cols, order_col)
 # Order matters: FK dependencies must be satisfied before dependent tables.
 CORE_TABLES: list[tuple[str, str, str, str]] = [
+    ("connectors",                   "uk_aq_core", "id",                              "id"),
     ("observed_properties",          "uk_aq_core", "id",                              "id"),
     ("categories",                   "uk_aq_core", "id",                              "id"),
     ("phenomena",                    "uk_aq_core", "id",                              "id"),
     ("offerings",                    "uk_aq_core", "id",                              "id"),
     ("features",                     "uk_aq_core", "id",                              "id"),
     ("procedures",                   "uk_aq_core", "id",                              "id"),
-    ("networks",                     "uk_aq_core", "id",                              "id"),
-    ("connectors",                   "uk_aq_core", "id",                              "id"),
+    ("uk_aq_networks",               "uk_aq_core", "id",                              "id"),
     ("uk_air_sos_networks",          "uk_aq_core", "network_ref",                     "network_ref"),
     ("uk_air_sos_network_pollutants","uk_aq_core", "network_ref,match_type,match_value","network_ref"),
     ("stations",                     "uk_aq_core", "id",                              "id"),
     ("station_metadata",             "uk_aq_core", "station_id",                      "station_id"),
+    ("station_network_memberships",  "uk_aq_core", "station_id,network_code",         "station_id"),
     ("timeseries",                   "uk_aq_core", "id",                              "id"),
 ]
 
@@ -66,7 +67,7 @@ IDENTITY_TABLES = [
     "uk_aq_core.connectors",
     "uk_aq_core.stations",
     "uk_aq_core.timeseries",
-    "uk_aq_core.networks",
+    "uk_aq_core.uk_aq_networks",
 ]
 
 

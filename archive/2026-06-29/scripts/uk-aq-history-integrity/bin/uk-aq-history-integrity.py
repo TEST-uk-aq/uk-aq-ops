@@ -133,7 +133,7 @@ CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
 
 # Subset of core tables that the integrity DB needs. Other tables in the
 # manifest (categories, observed_properties, offerings, features, procedures,
-# networks, uk_air_sos_*, station_metadata)
+# uk_aq_networks, uk_air_sos_*, station_metadata, station_network_memberships)
 # are accepted in the manifest but not imported in this phase.
 CORE_TABLES_TO_IMPORT = ("connectors", "stations", "timeseries", "phenomena")
 
