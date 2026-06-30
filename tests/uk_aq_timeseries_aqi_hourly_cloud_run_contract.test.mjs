@@ -76,3 +76,20 @@ test("deep reconciliation refresh is chunked before helper paging", () => {
   assert.match(readmeSrc, /canceling statement due to statement timeout/);
   assert.match(systemDocSrc, /start_exclusive, end_inclusive/);
 });
+
+test("station FK preflight uses the Obs AQI public ID-only view", () => {
+  assert.match(runJobSrc, /STATION_FK_CHECK_SCHEMA/);
+  assert.match(runJobSrc, /"uk_aq_public"/);
+  assert.match(runJobSrc, /STATION_FK_CHECK_VIEW/);
+  assert.match(runJobSrc, /"stations_fk_check"/);
+  assert.match(
+    runJobSrc,
+    /normalizeUrl\(OBS_AQIDB_SUPABASE_URL\).*STATION_FK_CHECK_VIEW/s,
+  );
+  const preflightSource = runJobSrc.slice(
+    runJobSrc.indexOf("async function fetchExistingStationIds"),
+    runJobSrc.indexOf("function isStationForeignKeyError"),
+  );
+  assert.doesNotMatch(preflightSource, /"Accept-Profile": "uk_aq_core"/);
+  assert.match(preflightSource, /"Accept-Profile": STATION_FK_CHECK_SCHEMA/);
+});

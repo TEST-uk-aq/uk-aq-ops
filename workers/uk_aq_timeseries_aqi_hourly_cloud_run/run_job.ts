@@ -142,6 +142,10 @@ const TIMESERIES_IDS = parseTimeseriesIdsCsv(optionalEnv("UK_AQ_AQI_TIMESERIES_I
 const SERVICE_NAME = "uk-aq-timeseries-aqi-hourly";
 const STATION_ID_QUERY_CHUNK_SIZE = 500;
 const SKIPPED_ROW_SAMPLE_LIMIT = 20;
+const STATION_FK_CHECK_SCHEMA =
+  (Deno.env.get("UK_AQ_AQI_STATION_FK_CHECK_SCHEMA") || "uk_aq_public").trim();
+const STATION_FK_CHECK_VIEW =
+  (Deno.env.get("UK_AQ_AQI_STATION_FK_CHECK_VIEW") || "stations_fk_check").trim();
 const DROPBOX_APP_KEY = optionalEnv("DROPBOX_APP_KEY") || "";
 const DROPBOX_APP_SECRET = optionalEnv("DROPBOX_APP_SECRET") || "";
 const DROPBOX_REFRESH_TOKEN = optionalEnv("DROPBOX_REFRESH_TOKEN") || "";
@@ -299,7 +303,8 @@ async function fetchExistingStationIds(stationIds: number[]): Promise<Set<number
       select: "id",
       id: `in.(${ids.join(",")})`,
     });
-    const url = `${normalizeUrl(OBS_AQIDB_SUPABASE_URL)}/stations?${query.toString()}`;
+    const url =
+      `${normalizeUrl(OBS_AQIDB_SUPABASE_URL)}/${STATION_FK_CHECK_VIEW}?${query.toString()}`;
     let completed = false;
     let finalError = "unknown_station_preflight_error";
     for (let attempt = 1; attempt <= RPC_RETRIES; attempt += 1) {
@@ -309,7 +314,7 @@ async function fetchExistingStationIds(stationIds: number[]): Promise<Set<number
             apikey: OBS_AQI_PRIVILEGED_KEY,
             Authorization: `Bearer ${OBS_AQI_PRIVILEGED_KEY}`,
             Accept: "application/json",
-            "Accept-Profile": "uk_aq_core",
+            "Accept-Profile": STATION_FK_CHECK_SCHEMA,
             "x-ukaq-egress-caller": "uk_aq_timeseries_aqi_hourly_cloud_run",
           },
         });

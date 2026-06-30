@@ -47,6 +47,8 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 - `UK_AQ_AQI_RECONCILE_SHORT_HOURS` (default `8`)
 - `UK_AQ_AQI_RECONCILE_DEEP_HOURS` (default `36`)
 - `UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS` (default `6`, capped at the deep window)
+- `UK_AQ_AQI_STATION_FK_CHECK_SCHEMA` (default `uk_aq_public`)
+- `UK_AQ_AQI_STATION_FK_CHECK_VIEW` (default `stations_fk_check`)
 - `UK_AQ_AQI_FROM_HOUR_UTC` (backfill)
 - `UK_AQ_AQI_TO_HOUR_UTC` (backfill)
 - `UK_AQ_AQI_TIMESERIES_IDS_CSV` (optional timeseries filter; applies to manual targeted runs, including backfill/reconciliation)
@@ -90,6 +92,12 @@ Do not increase the Postgres statement timeout as the first fix.
 the worker checks all non-null candidate station IDs against that parent table.
 Rows whose parent station is missing are skipped; valid rows continue through
 the hourly upsert and daily/monthly rollups.
+
+The REST preflight queries Obs AQI DB—not ingest DB—through the ID-only
+`uk_aq_public.stations_fk_check` view. The underlying `uk_aq_core` schema is
+intentionally not exposed through Obs AQI DB PostgREST. If the view has not
+been applied, the worker fails with a station-FK preflight error before hourly
+upsert work begins.
 
 The worker emits a structured `missing_station_fk` error entry to stderr/Cloud
 Logging and uploads the same structured record to
