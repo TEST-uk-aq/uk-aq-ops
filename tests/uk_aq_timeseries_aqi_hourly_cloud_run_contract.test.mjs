@@ -47,7 +47,20 @@ test("hourly worker preflights missing station FKs and reports controlled contin
   assert.match(runJobSrc, /continued_after_missing_station_fk/);
   assert.match(runJobSrc, /uploadDropboxErrorLog/);
   assert.match(runJobSrc, /timeseries_aqi_hourly/);
+  assert.match(
+    runJobSrc,
+    /station_id: missingStationIds\.length === 1 \? missingStationIds\[0\] : null/,
+  );
   assert.match(readmeSrc, /sample capped at 20 rows/);
   assert.match(readmeSrc, /\/CIC-Test\/error_log\/YYYY-MM-DD/);
+  for (const requiredDropboxSetting of [
+    "DROPBOX_APP_KEY",
+    "DROPBOX_APP_SECRET",
+    "DROPBOX_REFRESH_TOKEN",
+    "UK_AQ_DROPBOX_ROOT",
+  ]) {
+    assert.match(readmeSrc, new RegExp(requiredDropboxSetting));
+    assert.match(systemDocSrc, new RegExp(requiredDropboxSetting));
+  }
   assert.match(systemDocSrc, /refresh the mirrored stations table/);
 });

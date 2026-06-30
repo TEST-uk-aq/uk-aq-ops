@@ -358,6 +358,11 @@ async function logMissingStationFk(
   details: Record<string, unknown>,
 ): Promise<void> {
   const createdAt = new Date().toISOString();
+  const missingStationIds = Array.isArray(details.missing_station_ids)
+    ? details.missing_station_ids.filter(
+      (value): value is number => Number.isInteger(value) && Number(value) > 0,
+    )
+    : [];
   const payload = {
     id: crypto.randomUUID(),
     created_at: createdAt,
@@ -375,7 +380,7 @@ async function logMissingStationFk(
       ...details,
     },
     connector_id: null,
-    station_id: null,
+    station_id: missingStationIds.length === 1 ? missingStationIds[0] : null,
     timeseries_id: null,
     connector_code: null,
     dropbox_path: null,

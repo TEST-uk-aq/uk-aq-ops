@@ -34,6 +34,10 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 - `SB_SECRET_KEY` (ingest service key)
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
+- `DROPBOX_REFRESH_TOKEN`
+- `UK_AQ_DROPBOX_ROOT` (workflow default `/CIC-Test`)
 
 ## AQI Settings
 
