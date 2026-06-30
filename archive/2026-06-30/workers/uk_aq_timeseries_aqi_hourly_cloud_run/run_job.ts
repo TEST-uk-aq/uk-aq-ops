@@ -2,8 +2,6 @@ import {
   normalizeAqiAveragingCode,
   normalizeAqiCalculationStatus,
 } from "../../lib/aqi/aqi_levels.mjs";
-import { partitionRowsByExistingStations } from "./station_fk_guard.ts";
-import { uploadDropboxErrorLog } from "../shared/dropbox_error_log.ts";
 
 type RpcError = { message: string };
 
@@ -130,13 +128,6 @@ const RUN_LOG_RETENTION_DAYS = parsePositiveInt(
 const FROM_HOUR_UTC = optionalEnv("UK_AQ_AQI_FROM_HOUR_UTC");
 const TO_HOUR_UTC = optionalEnv("UK_AQ_AQI_TO_HOUR_UTC");
 const TIMESERIES_IDS = parseTimeseriesIdsCsv(optionalEnv("UK_AQ_AQI_TIMESERIES_IDS_CSV"));
-const SERVICE_NAME = "uk-aq-timeseries-aqi-hourly";
-const STATION_ID_QUERY_CHUNK_SIZE = 500;
-const SKIPPED_ROW_SAMPLE_LIMIT = 20;
-const DROPBOX_APP_KEY = optionalEnv("DROPBOX_APP_KEY") || "";
-const DROPBOX_APP_SECRET = optionalEnv("DROPBOX_APP_SECRET") || "";
-const DROPBOX_REFRESH_TOKEN = optionalEnv("DROPBOX_REFRESH_TOKEN") || "";
-const UK_AQ_DROPBOX_ROOT = optionalEnv("UK_AQ_DROPBOX_ROOT") || "";
 
 function requiredEnv(name: string): string {
   const value = (Deno.env.get(name) || "").trim();
@@ -280,136 +271,6 @@ async function postgrestRpc<T>(
   }
 
   return { data: null, error: { message: "unknown_rpc_error" } };
-}
-
-async function fetchExistingStationIds(stationIds: number[]): Promise<Set<number>> {
-  const existing = new Set<number>();
-  const distinctIds = Array.from(new Set(stationIds)).sort((a, b) => a - b);
-  for (const ids of chunkRows(distinctIds, STATION_ID_QUERY_CHUNK_SIZE)) {
-    const query = new URLSearchParams({
-      select: "id",
-      id: `in.(${ids.join(",")})`,
-    });
-    const url = `${normalizeUrl(OBS_AQIDB_SUPABASE_URL)}/stations?${query.toString()}`;
-    let completed = false;
-    let finalError = "unknown_station_preflight_error";
-    for (let attempt = 1; attempt <= RPC_RETRIES; attempt += 1) {
-      try {
-        const response = await fetch(url, {
-          headers: {
-            apikey: OBS_AQI_PRIVILEGED_KEY,
-            Authorization: `Bearer ${OBS_AQI_PRIVILEGED_KEY}`,
-            Accept: "application/json",
-            "Accept-Profile": "uk_aq_core",
-            "x-ukaq-egress-caller": "uk_aq_timeseries_aqi_hourly_cloud_run",
-          },
-        });
-        const payload = await response.json().catch(() => null);
-        if (response.ok && Array.isArray(payload)) {
-          for (const row of payload) {
-            const id = Number((row as Record<string, unknown>).id);
-            if (Number.isInteger(id) && id > 0) existing.add(Math.trunc(id));
-          }
-          completed = true;
-          break;
-        }
-        finalError = asErrorMessage(payload, response.status);
-        if (attempt < RPC_RETRIES && isRetryableStatus(response.status)) {
-          await sleep(Math.min(5000, 1000 * attempt));
-          continue;
-        }
-        break;
-      } catch (error) {
-        finalError = error instanceof Error ? error.message : String(error);
-        if (attempt < RPC_RETRIES) {
-          await sleep(Math.min(5000, 1000 * attempt));
-          continue;
-        }
-      }
-    }
-    if (!completed) {
-      throw new Error(`station FK preflight failed: ${finalError}`);
-    }
-  }
-  return existing;
-}
-
-function isStationForeignKeyError(message: string): boolean {
-  return message.includes("timeseries_aqi_hourly_station_id_fkey") ||
-    (
-      message.includes('table "timeseries_aqi_hourly"') &&
-      message.toLowerCase().includes("foreign key")
-    );
-}
-
-function skippedRowSample(rows: HelperRow[]): Array<Record<string, unknown>> {
-  return rows.slice(0, SKIPPED_ROW_SAMPLE_LIMIT).map((row) => ({
-    station_id: row.station_id,
-    timeseries_id: row.timeseries_id,
-    connector_id: row.connector_id,
-    pollutant_code: row.pollutant_code,
-    timestamp_hour_utc: row.timestamp_hour_utc,
-  }));
-}
-
-async function logMissingStationFk(
-  event: "missing_station_fk" | "missing_station_fk_unhandled_by_preflight",
-  window: SyncWindow,
-  details: Record<string, unknown>,
-): Promise<void> {
-  const createdAt = new Date().toISOString();
-  const payload = {
-    id: crypto.randomUUID(),
-    created_at: createdAt,
-    source: "cloud_run",
-    severity: "error",
-    message: String(details.message || event),
-    service: SERVICE_NAME,
-    context: {
-      error_type: event,
-      run_mode: RUN_MODE,
-      trigger_mode: TRIGGER_MODE,
-      window_start_utc: hourIso(window.hourEndStartExclusive),
-      window_end_utc: hourIso(window.hourEndEndInclusive),
-      source_file: "workers/uk_aq_timeseries_aqi_hourly_cloud_run/run_job.ts",
-      ...details,
-    },
-    connector_id: null,
-    station_id: null,
-    timeseries_id: null,
-    connector_code: null,
-    dropbox_path: null,
-  };
-  console.error(JSON.stringify({
-    timestamp_utc: createdAt,
-    level: "error",
-    event,
-    ...payload,
-  }));
-  try {
-    const dropboxPath = await uploadDropboxErrorLog({
-      appKey: DROPBOX_APP_KEY,
-      appSecret: DROPBOX_APP_SECRET,
-      refreshToken: DROPBOX_REFRESH_TOKEN,
-      dropboxRoot: UK_AQ_DROPBOX_ROOT,
-      serviceCode: "timeseries_aqi_hourly",
-      payload,
-    });
-    if (!dropboxPath) {
-      console.error(JSON.stringify({
-        level: "warning",
-        event: "missing_station_fk_dropbox_not_configured",
-        error_id: payload.id,
-      }));
-    }
-  } catch (error) {
-    console.error(JSON.stringify({
-      level: "warning",
-      event: "missing_station_fk_dropbox_upload_failed",
-      error_id: payload.id,
-      message: error instanceof Error ? error.message : String(error),
-    }));
-  }
 }
 
 function floorUtcHour(date: Date): Date {
@@ -733,8 +594,6 @@ async function main(): Promise<void> {
   let stationLinkHealth: StationLinkHealthMetrics | null = null;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
-  const missingStationFkIds = new Set<number>();
-  let skippedMissingStationFkRows = 0;
 
   try {
     if (shouldRefreshHelperWindow()) {
@@ -754,29 +613,7 @@ async function main(): Promise<void> {
         break;
       }
 
-      const candidateStationIds = helperRows
-        .map((row) => row.station_id)
-        .filter((stationId): stationId is number => stationId !== null);
-      const existingStationIds = await fetchExistingStationIds(candidateStationIds);
-      const stationPartition = partitionRowsByExistingStations(helperRows, existingStationIds);
-      for (const stationId of stationPartition.missingStationIds) {
-        missingStationFkIds.add(stationId);
-      }
-      skippedMissingStationFkRows += stationPartition.skippedRows.length;
-      if (stationPartition.skippedRows.length > 0) {
-        await logMissingStationFk("missing_station_fk", window, {
-          missing_station_ids: stationPartition.missingStationIds,
-          missing_station_fk_count: stationPartition.missingStationIds.length,
-          skipped_row_count: stationPartition.skippedRows.length,
-          sample_skipped_rows: skippedRowSample(stationPartition.skippedRows),
-          message: "Rows with missing parent stations were skipped; valid rows continued.",
-        });
-      }
-
-      const chunks = chunkRows(
-        stationPartition.validRows,
-        Math.max(100, HOURLY_UPSERT_CHUNK_SIZE),
-      );
+      const chunks = chunkRows(helperRows, Math.max(100, HOURLY_UPSERT_CHUNK_SIZE));
       for (const chunk of chunks) {
         const upsertResult = await postgrestRpc<unknown>(
           OBS_AQIDB_SUPABASE_URL,
@@ -789,15 +626,6 @@ async function main(): Promise<void> {
           },
         );
         if (upsertResult.error) {
-          if (isStationForeignKeyError(upsertResult.error.message)) {
-            await logMissingStationFk("missing_station_fk_unhandled_by_preflight", window, {
-              rpc_name: HOURLY_UPSERT_RPC,
-              error_text: upsertResult.error.message,
-              attempted_row_count: chunk.length,
-              message:
-                "Station FK failure remained after preflight; the run is failing because the offending row could not be identified safely.",
-            });
-          }
           throw new Error(`hourly upsert RPC failed: ${upsertResult.error.message}`);
         }
         const metrics = parseHourlyUpsertMetrics(upsertResult.data);
@@ -812,7 +640,7 @@ async function main(): Promise<void> {
         }
       }
 
-      for (const row of stationPartition.validRows) {
+      for (const row of helperRows) {
         timeseriesIds.add(row.timeseries_id);
       }
 
@@ -962,10 +790,6 @@ async function main(): Promise<void> {
     station_link_sample_null_timeseries_ids: stationLinkHealth?.sample_null_timeseries_ids ?? null,
     station_link_sample_mismatched_timeseries_ids:
       stationLinkHealth?.sample_mismatched_timeseries_ids ?? null,
-    missing_station_fk_count: missingStationFkIds.size,
-    missing_station_fk_ids: Array.from(missingStationFkIds).sort((a, b) => a - b),
-    skipped_missing_station_fk_rows: skippedMissingStationFkRows,
-    continued_after_missing_station_fk: missingStationFkIds.size > 0,
     duration_ms: durationMs,
     error: errorMessage,
   };

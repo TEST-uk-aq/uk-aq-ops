@@ -36,18 +36,3 @@ test("hourly Cloud Run worker still scopes targeted rebuilds with timeseries ids
   assert.match(readmeSrc, /UK_AQ_AQI_TIMESERIES_IDS_CSV/);
   assert.match(systemDocSrc, /UK_AQ_AQI_TIMESERIES_IDS_CSV/);
 });
-
-test("hourly worker preflights missing station FKs and reports controlled continuation", () => {
-  assert.match(runJobSrc, /fetchExistingStationIds/);
-  assert.match(runJobSrc, /partitionRowsByExistingStations/);
-  assert.match(runJobSrc, /missing_station_fk_unhandled_by_preflight/);
-  assert.match(runJobSrc, /missing_station_fk_count/);
-  assert.match(runJobSrc, /missing_station_fk_ids/);
-  assert.match(runJobSrc, /skipped_missing_station_fk_rows/);
-  assert.match(runJobSrc, /continued_after_missing_station_fk/);
-  assert.match(runJobSrc, /uploadDropboxErrorLog/);
-  assert.match(runJobSrc, /timeseries_aqi_hourly/);
-  assert.match(readmeSrc, /sample capped at 20 rows/);
-  assert.match(readmeSrc, /\/CIC-Test\/error_log\/YYYY-MM-DD/);
-  assert.match(systemDocSrc, /refresh the mirrored stations table/);
-});
