@@ -46,6 +46,7 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 - `UK_AQ_AQI_RUN_MODE` (default `sync_hourly`)
 - `UK_AQ_AQI_RECONCILE_SHORT_HOURS` (default `8`)
 - `UK_AQ_AQI_RECONCILE_DEEP_HOURS` (default `36`)
+- `UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS` (default `6`, capped at the deep window)
 - `UK_AQ_AQI_FROM_HOUR_UTC` (backfill)
 - `UK_AQ_AQI_TO_HOUR_UTC` (backfill)
 - `UK_AQ_AQI_TIMESERIES_IDS_CSV` (optional timeseries filter; applies to manual targeted runs, including backfill/reconciliation)
@@ -69,6 +70,18 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 - `sync_hourly` keeps the existing read-only helper-window flow
 - `reconcile_short` and `reconcile_deep` first run ingest RPC `uk_aq_rpc_timeseries_aqi_hourly_helper_upsert` for the computed mature window
 - after helper refresh, the worker fetches the refreshed helper rows page-by-page and upserts AQI levels in Obs AQI DB
+
+Deep reconciliation refreshes the helper window sequentially in bounded
+exclusive-start/inclusive-end chunks. This avoids the observed
+`canceling statement due to statement timeout` failure from one large helper
+upsert while leaving hourly sync and short reconciliation unchanged. Chunk
+metrics are summed, with maximum changed lag retained, before normal helper
+paging, station-FK validation, AQI upsert, and rollups continue.
+
+If deep reconcile still times out, lower
+`UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS`. If it is stable but too slow,
+increase the value cautiously; it cannot exceed the configured deep window.
+Do not increase the Postgres statement timeout as the first fix.
 
 ## Missing station FK handling
 

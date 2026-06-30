@@ -64,3 +64,15 @@ test("hourly worker preflights missing station FKs and reports controlled contin
   }
   assert.match(systemDocSrc, /refresh the mirrored stations table/);
 });
+
+test("deep reconciliation refresh is chunked before helper paging", () => {
+  assert.match(runJobSrc, /refreshDeepHelperWindow/);
+  assert.match(runJobSrc, /UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS/);
+  assert.match(runJobSrc, /aqi_reconcile_deep_helper_refresh_chunk/);
+  assert.match(runJobSrc, /aqi_reconcile_deep_helper_refresh_chunk_failed/);
+  assert.match(runJobSrc, /helper_refresh_chunk_count/);
+  assert.match(runJobSrc, /helper_refresh_failed_chunk_start_utc/);
+  assert.match(runJobSrc, /helper_refresh_failed_chunk_end_utc/);
+  assert.match(readmeSrc, /canceling statement due to statement timeout/);
+  assert.match(systemDocSrc, /start_exclusive, end_inclusive/);
+});

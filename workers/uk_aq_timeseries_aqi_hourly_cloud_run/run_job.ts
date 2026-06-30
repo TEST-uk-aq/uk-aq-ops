@@ -4,6 +4,11 @@ import {
 } from "../../lib/aqi/aqi_levels.mjs";
 import { partitionRowsByExistingStations } from "./station_fk_guard.ts";
 import { uploadDropboxErrorLog } from "../shared/dropbox_error_log.ts";
+import {
+  aggregateRefreshMetrics,
+  buildDeepRefreshChunks,
+  DeepRefreshChunkError,
+} from "./reconcile_deep_refresh.ts";
 
 type RpcError = { message: string };
 
@@ -107,6 +112,10 @@ const RECONCILE_SHORT_HOURS = parsePositiveInt(
 const RECONCILE_DEEP_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_HOURS"),
   36,
+);
+const RECONCILE_DEEP_REFRESH_CHUNK_HOURS = Math.min(
+  parsePositiveInt(Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS"), 6),
+  RECONCILE_DEEP_HOURS,
 );
 const TRIGGER_MODE = (Deno.env.get("UK_AQ_AQI_TRIGGER_MODE") || "manual").trim() || "manual";
 const MATURITY_DELAY_HOURS = parsePositiveInt(
@@ -716,6 +725,60 @@ async function refreshHelperWindow(window: SyncWindow): Promise<HelperRefreshMet
   return parseHelperRefreshMetrics(result.data);
 }
 
+async function refreshDeepHelperWindow(
+  window: SyncWindow,
+): Promise<{ metrics: HelperRefreshMetrics; chunkCount: number }> {
+  const chunks = buildDeepRefreshChunks(window, RECONCILE_DEEP_REFRESH_CHUNK_HOURS);
+  const metrics: HelperRefreshMetrics[] = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const startedAt = Date.now();
+    try {
+      const chunkMetrics = await refreshHelperWindow({
+        ...chunk,
+        referenceHourEnd: window.referenceHourEnd,
+      });
+      metrics.push(chunkMetrics);
+      console.log(JSON.stringify({
+        level: "info",
+        event: "aqi_reconcile_deep_helper_refresh_chunk",
+        run_mode: RUN_MODE,
+        trigger_mode: TRIGGER_MODE,
+        chunk_index: index + 1,
+        chunk_count: chunks.length,
+        chunk_start_utc: hourIso(chunk.hourEndStartExclusive),
+        chunk_end_utc: hourIso(chunk.hourEndEndInclusive),
+        ...chunkMetrics,
+        duration_ms: Date.now() - startedAt,
+      }));
+    } catch (error) {
+      const rpcError = error instanceof Error ? error.message : String(error);
+      console.error(JSON.stringify({
+        level: "error",
+        event: "aqi_reconcile_deep_helper_refresh_chunk_failed",
+        run_mode: RUN_MODE,
+        trigger_mode: TRIGGER_MODE,
+        full_window_start_utc: hourIso(window.hourEndStartExclusive),
+        full_window_end_utc: hourIso(window.hourEndEndInclusive),
+        chunk_index: index + 1,
+        chunk_count: chunks.length,
+        chunk_start_utc: hourIso(chunk.hourEndStartExclusive),
+        chunk_end_utc: hourIso(chunk.hourEndEndInclusive),
+        rpc_error: rpcError,
+        duration_ms: Date.now() - startedAt,
+      }));
+      throw new DeepRefreshChunkError(
+        window,
+        chunk,
+        index + 1,
+        chunks.length,
+        rpcError,
+      );
+    }
+  }
+  return { metrics: aggregateRefreshMetrics(metrics), chunkCount: chunks.length };
+}
+
 async function main(): Promise<void> {
   const startedAt = Date.now();
   const nowUtc = new Date();
@@ -735,6 +798,9 @@ async function main(): Promise<void> {
   let monthlyRowsUpserted = 0;
   let helperPagesFetched = 0;
   let helperRefreshMetrics: HelperRefreshMetrics | null = null;
+  let helperRefreshChunkCount = 0;
+  let helperRefreshFailedChunkStartUtc: string | null = null;
+  let helperRefreshFailedChunkEndUtc: string | null = null;
   let stationLinkHealth: StationLinkHealthMetrics | null = null;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
@@ -743,7 +809,14 @@ async function main(): Promise<void> {
 
   try {
     if (shouldRefreshHelperWindow()) {
-      helperRefreshMetrics = await refreshHelperWindow(window);
+      if (RUN_MODE === "reconcile_deep") {
+        const deepRefresh = await refreshDeepHelperWindow(window);
+        helperRefreshMetrics = deepRefresh.metrics;
+        helperRefreshChunkCount = deepRefresh.chunkCount;
+      } else {
+        helperRefreshMetrics = await refreshHelperWindow(window);
+        helperRefreshChunkCount = 1;
+      }
     }
 
     const timeseriesIds = new Set<number>();
@@ -885,6 +958,11 @@ async function main(): Promise<void> {
       }
     }
   } catch (error) {
+    if (error instanceof DeepRefreshChunkError) {
+      helperRefreshChunkCount = error.chunkCount;
+      helperRefreshFailedChunkStartUtc = error.chunkStartUtc;
+      helperRefreshFailedChunkEndUtc = error.chunkEndUtc;
+    }
     runStatus = "error";
     errorMessage = error instanceof Error ? error.message : String(error);
   }
@@ -960,6 +1038,13 @@ async function main(): Promise<void> {
     helper_refresh_rows_upserted: helperRefreshMetrics?.rows_upserted ?? null,
     helper_refresh_timeseries_hours_changed: helperRefreshMetrics?.timeseries_hours_changed ?? null,
     helper_refresh_max_changed_lag_hours: helperRefreshMetrics?.max_changed_lag_hours ?? null,
+    helper_refresh_chunk_count: helperRefreshChunkCount,
+    helper_refresh_chunk_hours: RUN_MODE === "reconcile_deep"
+      ? RECONCILE_DEEP_REFRESH_CHUNK_HOURS
+      : null,
+    helper_refresh_chunked: RUN_MODE === "reconcile_deep" && helperRefreshChunkCount > 1,
+    helper_refresh_failed_chunk_start_utc: helperRefreshFailedChunkStartUtc,
+    helper_refresh_failed_chunk_end_utc: helperRefreshFailedChunkEndUtc,
     station_link_null_rows: stationLinkHealth?.null_station_rows ?? null,
     station_link_mismatched_rows: stationLinkHealth?.mismatched_station_rows ?? null,
     station_link_null_timeseries: stationLinkHealth?.null_station_timeseries ?? null,
