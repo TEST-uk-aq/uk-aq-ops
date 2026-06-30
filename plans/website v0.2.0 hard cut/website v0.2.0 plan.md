@@ -779,6 +779,40 @@ Do not introduce a connector alias for any new network URL state.
 
 ### Phase 8 — Remove legacy tables and active dependencies
 
+**Implementation status: source implementation complete (30 June 2026).**
+
+Phase 8 was implemented across the schema, ingest, ops, and webpage
+repositories:
+
+- Canonical schema DDL, public views, security allowlists, DBML models, seeds,
+  and current table documentation no longer define or expose the two retired
+  relations.
+- The focused ordered migration
+  `schemas/migrations/v0.2.0/ingestdb/011_remove_legacy_network_relations.sql`
+  removes the public dependent view and relation privileges/policies, drops
+  `station_network_memberships` before `uk_aq_networks`, and validates both
+  results with `to_regclass(...)`.
+- UK-AIR SOS station listing no longer writes membership rows. The obsolete
+  membership backfill and report scripts were removed and replaced with
+  `scripts/uk_air_sos/uk_air_sos_network_assignment_report.py`, which validates
+  `stations.network_id -> networks.id`.
+- The Dropbox station export and network summary use the canonical relationship.
+  Each exported station now carries scalar `network_id`, `network_code`, and
+  `network_label` alongside unchanged connector provenance.
+- Ops core snapshot, latest-snapshot, cache-proxy, and contract tests use the
+  canonical `networks` metadata. The latest-snapshot builder emits only the v2
+  scalar network contract and has no membership compatibility branch.
+- The active webpage paths remained on the Phase 7 scalar network contract; no
+  connector or membership fallback was reintroduced.
+- Python compilation, targeted Pytest checks, Node tests, Deno tests, and
+  `git diff --check` passed during implementation. The final active-reference
+  scan found only the destructive migration, migration/removal documentation,
+  implementation plans, immutable archives, and negative absence assertions.
+
+The source implementation is complete, but the destructive migration has not
+been applied to a database and no deployment was performed as part of Phase 8.
+Database application and TEST cutover remain Phase 10 activities.
+
 After the replacement schema, APIs, workers, and scripts pass their contract
 tests:
 
@@ -812,6 +846,43 @@ No active SQL, API, worker, script, configuration, test fixture, or system
 documentation may depend on them after cutover.
 
 ### Phase 9 — Documentation and automated tests
+
+**Implementation status: complete (30 June 2026).**
+
+Phase 9 made documentation and test-only changes:
+
+- Schema documentation now defines the v2 public network catalogue, allowed
+  `network_type` values, enabled-network filtering, scalar station identity,
+  OpenAQ visibility, and the shared `breathelondon` network.
+- Ingest API/edge-function and UK-AIR SOS documentation now describes
+  `/api/aq/networks`, `contract_version: 2`, connector-filter `400` responses,
+  and canonical SOS assignment validation using the assignment report.
+- Ops documentation now records `latest_snapshots/v2`, the retained
+  latest-observation state prefix, deterministic core metadata containing
+  `networks`, metadata-cache resolution through
+  `stations.network_id -> networks.id`, stable cache URLs, and fail-closed v1
+  handling.
+- Website data-format documentation now records exact `network_code` filtering,
+  `network_label` display, catalogue-only aggregator badges, hidden OpenAQ
+  behaviour, no connector-label fallback or code remapping, and fixed
+  one-minute polling.
+- Static and contract tests were added or updated across all four repositories,
+  including a cross-repository active-reference regression test.
+
+Validation results:
+
+- schema Pytest: 3 passed;
+- ingest Pytest: 5 passed;
+- ingest Deno public-filter tests: 5 passed;
+- ops Node contract tests: 14 passed;
+- ops Deno latest-snapshot tests: 4 passed;
+- webpage Pytest: 15 passed;
+- `git diff --check`: passed in every changed repository.
+
+No runtime behaviour, database schema, deployment, or database contents were
+changed in Phase 9. Remaining retired-name references are limited to the
+reviewed destructive migration, current migration/removal and explicit
+contract documentation, plans/archives, and negative test assertions.
 
 Update the API, snapshot, cache, core snapshot, SOS membership, and website data
 format documentation listed below.

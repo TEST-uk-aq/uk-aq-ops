@@ -29,7 +29,7 @@ function fixtureMetadata() {
     }],
     networks: [{
       id: 30,
-      network_code: "breathe_london",
+      network_code: "breathelondon",
       display_name: "Breathe London Nodes",
       network_type: "community",
       public_display_enabled: true,
@@ -77,7 +77,7 @@ Deno.test("v2 latest rows expose scalar public network fields and no membership 
   const item = result.rows[0].item as Record<string, unknown>;
 
   assert.equal(item.network_id, 30);
-  assert.equal(item.network_code, "breathe_london");
+  assert.equal(item.network_code, "breathelondon");
   assert.equal(item.network_label, "Breathe London Nodes");
   assert.equal(item.connector_code, "bl");
   assert.equal(item.connector_label, "Breathe London");
