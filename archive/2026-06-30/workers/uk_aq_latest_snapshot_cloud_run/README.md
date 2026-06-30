@@ -31,7 +31,7 @@ Builds latest map snapshots from a dedicated Pub/Sub observation subscription an
 - `UK_AQ_LATEST_SNAPSHOT_POLLUTANTS` (default `pm25,pm10,no2`)
 - `UK_AQ_LATEST_SNAPSHOT_WINDOWS` (default `3h,6h,1d,7d,all`)
 - `UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP` (default `all`)
-- `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION` (must be `v2`)
+- `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION` (default `v2`; set `v1` only for compatibility rebuilds)
 - `UK_AQ_LATEST_SNAPSHOT_R2_PREFIX` (default `latest_snapshots/${UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION}`; currently `latest_snapshots/v2`)
 - `UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY` (default `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/manifest.json`)
 - `UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX` (default `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/_runs`)
@@ -65,7 +65,7 @@ The run report includes this trigger mode.
 
 - v2 rows derive network identity from `station.network_id -> networks.id` and emit scalar `network_id`, `network_code`, and `network_label` fields. `network_label` uses the canonical network display name from the core metadata snapshot.
 - v2 rows intentionally omit `station_network_memberships`, `network_memberships`, `network_name`, and `network_type`. Connector provenance fields such as `connector_code` and `connector_label` remain present.
-- The worker emits only the v2 scalar network contract.
+- v1 compatibility remains available by setting `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION=v1` and an explicit v1 prefix; v1 rows continue to emit `station_network_memberships`.
 - Missing station/network metadata is counted as `missing_metadata_rows` and skipped instead of falling back to connector-derived network fields. Networks with `public_display_enabled=false` are skipped.
 
 - Runtime and deploy workflow validation reject obvious cross-version standard paths: v2 cannot use `latest_snapshots/v1` for the snapshot prefix, manifest key, or runs prefix, and v1 cannot use `latest_snapshots/v2`. Custom non-versioned prefixes are still allowed.
