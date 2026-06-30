@@ -9,7 +9,7 @@ import {
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
 
-type LatestSnapshotContractVersion = "v2";
+type LatestSnapshotContractVersion = "v1" | "v2";
 
 type LatestItem = {
   id: number | null;
@@ -25,6 +25,11 @@ type LatestItem = {
   network_id?: number | null;
   network_code?: string | null;
   network_label?: string | null;
+  station_network_memberships?: Array<{
+    network_code: string;
+    network_label: string | null;
+    is_primary: boolean;
+  }>;
   phenomenon_label: string | null;
   pollutant_label: string | null;
   observed_property_code: string | null;
@@ -373,11 +378,12 @@ function parseBoolean(raw: string | undefined | null, fallback: boolean): boolea
 
 function parseContractVersion(raw: string | undefined | null): LatestSnapshotContractVersion {
   const normalized = String(raw || "").trim().toLowerCase();
+  if (normalized === "v1" || normalized === "1") return "v1";
   if (normalized === "v2" || normalized === "2") return "v2";
   throw new Error(`Unsupported UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION: ${raw}`);
 }
 
-function isUnderSnapshotVersionPrefix(path: string, version: string): boolean {
+function isUnderSnapshotVersionPrefix(path: string, version: LatestSnapshotContractVersion): boolean {
   const normalized = normalizePrefix(path);
   const versionPrefix = `latest_snapshots/${version}`;
   return normalized === versionPrefix || normalized.startsWith(`${versionPrefix}/`);
@@ -387,7 +393,7 @@ function validateSnapshotContractPaths(
   contractVersion: LatestSnapshotContractVersion,
   paths: Array<{ name: string; value: string | null | undefined }>,
 ): void {
-  const rejectedVersion = "v1";
+  const rejectedVersion: LatestSnapshotContractVersion = contractVersion === "v2" ? "v1" : "v2";
   for (const path of paths) {
     const value = normalizePrefix(path.value || "");
     if (!value) continue;
@@ -1327,11 +1333,19 @@ function buildSourceRows(
     if (!network.public_display_enabled) continue;
 
     const stationLabel = resolveStationLabel(station?.label, station?.station_ref, series.label ?? null);
-    const stationNetworkFields = {
-      network_id: network.id,
-      network_code: network.network_code,
-      network_label: network.display_name,
-    };
+    const stationNetworkFields = contractVersion === "v2"
+      ? {
+        network_id: network.id,
+        network_code: network.network_code,
+        network_label: network.display_name,
+      }
+      : {
+        station_network_memberships: [{
+          network_code: network.network_code,
+          network_label: network.display_name,
+          is_primary: true,
+        }],
+      };
 
     const phenomenonLabel = resolvePhenomenonLabel(
       observedProperty?.display_name,

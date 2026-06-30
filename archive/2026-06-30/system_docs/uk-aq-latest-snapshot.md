@@ -86,12 +86,15 @@ The Phase 5 builder writes v2 snapshot objects under `latest_snapshots/v2` by de
 
 v2 rows do not include `station_network_memberships`, `network_memberships`, `network_name`, or `network_type`. `network_type` is reserved for the public network catalog/API phase rather than being repeated on every latest row. Existing connector provenance fields (`connector_code`, `connector_label`) remain in the row contract.
 
-The builder and public worker accept only the canonical v2 contract and never
-fall back to v1. Existing immutable v1 objects are not rewritten or deleted. Missing station/network
+For internal compatibility rebuilds, the builder can still be set to
+`UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION=v1` with an explicit v1 prefix. Those
+objects are not eligible for the public R2 API worker. The public worker accepts
+only the canonical v2 prefix and manifest and never falls back to v1. Existing
+immutable v1 objects are not rewritten or deleted. Missing station/network
 metadata is reported through `missing_metadata_rows` and skipped instead of
 using connector fallbacks. Disabled networks are skipped before payload writes.
 
-- Runtime and deploy workflow validation reject v1 standard paths. Custom non-versioned prefixes are still allowed.
+- Runtime and deploy workflow validation reject obvious cross-version standard paths: v2 cannot use `latest_snapshots/v1` for the snapshot prefix, manifest key, or runs prefix, and v1 cannot use `latest_snapshots/v2`. Custom non-versioned prefixes are still allowed.
 
 ## Query Contract
 
