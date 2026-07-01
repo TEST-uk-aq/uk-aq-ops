@@ -11,6 +11,40 @@
 - Do not inspect or modify any `LIVE` repo unless the user explicitly asks.
 - Live propagation to the sibling live ops copy is handled by the sync script/workflow process outside this repo. Do not manually update the live ops copy unless the user explicitly asks for that repo to be changed.
 
+## Codex operating mode
+Default mode is code-only implementation.
+Codex should:
+- make focused code, schema, documentation, and test edits requested by the task;
+- run only fast, local, non-destructive checks needed to verify the edit;
+- provide a clear manual validation and deployment plan;
+- include exact SQL, gcloud, wrangler, GitHub Actions, and Supabase commands for the user to run manually.
+Codex must not, unless explicitly asked:
+- run SQL against live/test Supabase databases;
+- apply migration files;
+- deploy Cloud Run services, Workers, or GitHub Actions workflows;
+- run backfills, reconciliations, bulk jobs, or long-running data jobs;
+- run broad external API fetches;
+- repeatedly inspect cloud logs;
+- make operational changes in GCP, Supabase, Cloudflare, R2, Dropbox, or GitHub settings.
+When database or deployment work is needed, Codex should stop after producing:
+1. files changed,
+2. tests run,
+3. exact manual commands,
+4. expected outputs,
+5. rollback notes,
+6. post-deploy validation checklist.
+
+## Permission levels
+Unless the prompt says otherwise, use Level 1.
+### Level 1 — Code only
+Edit files and run small local/static tests. Do not touch external services or databases.
+### Level 2 — Local validation
+Level 1 plus local-only scripts/tests that do not call Supabase, GCP, Cloudflare, R2, Dropbox, or external APIs.
+### Level 3 — Assisted operations
+Prepare SQL, deploy commands, and validation commands, but do not run them.
+### Level 4 — Execute operations
+Only when explicitly requested in the prompt. May run database, deployment, or cloud commands.
+
 ## Backup Policy
 
 - The Phase B observations backup is mandatory in this project.
