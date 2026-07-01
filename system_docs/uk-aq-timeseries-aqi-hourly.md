@@ -132,9 +132,14 @@ sequential UTC hour-end chunks to avoid `canceling statement due to statement
 timeout` on a single large database statement or full-window upsert stage. Both
 stages use `UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS` and preserve
 `(start_exclusive, end_inclusive]` semantics. Hourly upsert retains its existing
-configured row-size batching inside each time chunk, capped at 250 rows per RPC
-in deep mode to bound each database statement. Per-chunk structured logs include
-the chunk start/end, source rows, rows upserted, and duration; failures also expose
+configured row-size batching inside each time chunk, capped at 50 rows per RPC
+in deep mode to bound each database statement. The smaller cap is required
+because the hourly upsert RPC can still hit its statement timeout on larger
+batches, even inside a six-hour window. Per-RPC-batch logs include the helper
+page offset, batch index/count, row count, change counts, and duration. Failed
+batch logs also include the first/last hour, sample timeseries IDs, and RPC
+error. Per-chunk structured logs include the chunk start/end, source rows, rows
+upserted, and duration; failures also expose
 `hourly_upsert_failed_chunk_start_utc` and
 `hourly_upsert_failed_chunk_end_utc` in the final run summary. Rollups still run
 once across the complete deep window after every hourly chunk succeeds.
