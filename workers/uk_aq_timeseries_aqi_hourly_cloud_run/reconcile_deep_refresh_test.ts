@@ -1,9 +1,12 @@
 import {
   aggregateRefreshMetrics,
   buildDeepRefreshChunks,
+  buildDeepRollingWindow,
+  buildRecentWindow,
   deepHourlyUpsertBatchSize,
   DeepHourlyUpsertChunkError,
   DeepRefreshChunkError,
+  deepRollingHourlyUpsertBatchSize,
 } from "./reconcile_deep_refresh.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -126,4 +129,73 @@ Deno.test("deep hourly upsert caps each RPC batch at 50 rows", () => {
   assertEquals(deepHourlyUpsertBatchSize(2000), 50);
   assertEquals(deepHourlyUpsertBatchSize(100), 50);
   assertEquals(deepHourlyUpsertBatchSize(25), 25);
+});
+
+Deno.test("rolling deep window covers 24 hours ago through 18 hours ago", () => {
+  const window = buildDeepRollingWindow(
+    new Date("2026-07-01T12:00:00Z"),
+    24,
+    6,
+  );
+  assertEquals(
+    window.hourEndStartExclusive.toISOString(),
+    "2026-06-30T12:00:00.000Z",
+  );
+  assertEquals(
+    window.hourEndEndInclusive.toISOString(),
+    "2026-06-30T18:00:00.000Z",
+  );
+  assertEquals(
+    window.hourEndEndInclusive.getTime() -
+      window.hourEndStartExclusive.getTime(),
+    6 * 60 * 60 * 1000,
+  );
+});
+
+Deno.test("rolling deep hourly upsert caps each RPC batch at 100 rows", () => {
+  assertEquals(deepRollingHourlyUpsertBatchSize(2000), 100);
+  assertEquals(deepRollingHourlyUpsertBatchSize(100), 100);
+  assertEquals(deepRollingHourlyUpsertBatchSize(40), 40);
+});
+
+Deno.test("rolling deep chunk errors identify the rolling run mode", () => {
+  const full = buildDeepRollingWindow(
+    new Date("2026-07-01T12:00:00Z"),
+    24,
+    6,
+  );
+  const error = new DeepHourlyUpsertChunkError(
+    full,
+    full,
+    1,
+    1,
+    "statement timeout",
+    "reconcile_deep_rolling",
+  );
+  if (
+    !error.message.includes(
+      "hourly upsert RPC failed for reconcile_deep_rolling chunk 1/1",
+    )
+  ) {
+    throw new Error(`Unexpected error message: ${error.message}`);
+  }
+});
+
+Deno.test("existing recent-window modes retain their window behavior", () => {
+  const reference = new Date("2026-07-01T12:00:00Z");
+  assertEquals(
+    [
+      buildRecentWindow(reference, 1).hourEndStartExclusive.toISOString(),
+      buildRecentWindow(reference, 1).hourEndEndInclusive.toISOString(),
+    ],
+    ["2026-07-01T11:00:00.000Z", "2026-07-01T12:00:00.000Z"],
+  );
+  assertEquals(
+    buildRecentWindow(reference, 8).hourEndStartExclusive.toISOString(),
+    "2026-07-01T04:00:00.000Z",
+  );
+  assertEquals(
+    buildRecentWindow(reference, 24).hourEndStartExclusive.toISOString(),
+    "2026-06-30T12:00:00.000Z",
+  );
 });

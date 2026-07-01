@@ -1,9 +1,16 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
 const PORT = Number(Deno.env.get("PORT") || "8000");
-const RUN_JOB_SCRIPT = "/app/workers/uk_aq_timeseries_aqi_hourly_cloud_run/run_job.ts";
+const RUN_JOB_SCRIPT =
+  "/app/workers/uk_aq_timeseries_aqi_hourly_cloud_run/run_job.ts";
 const ALLOWED_TRIGGER_MODES = new Set(["scheduler", "manual"]);
-const ALLOWED_RUN_MODES = new Set(["sync_hourly", "backfill", "reconcile_short", "reconcile_deep"]);
+const ALLOWED_RUN_MODES = new Set([
+  "sync_hourly",
+  "backfill",
+  "reconcile_short",
+  "reconcile_deep",
+  "reconcile_deep_rolling",
+]);
 
 let inFlight = false;
 
@@ -17,12 +24,14 @@ type RequestBody = {
 
 function parseTriggerMode(req: Request, body: RequestBody | null): string {
   const url = new URL(req.url);
-  const queryMode = (url.searchParams.get("trigger_mode") || "").trim().toLowerCase();
+  const queryMode = (url.searchParams.get("trigger_mode") || "").trim()
+    .toLowerCase();
   if (queryMode && ALLOWED_TRIGGER_MODES.has(queryMode)) {
     return queryMode;
   }
 
-  const headerMode = (req.headers.get("x-uk-aq-aqi-trigger-mode") || "").trim().toLowerCase();
+  const headerMode = (req.headers.get("x-uk-aq-aqi-trigger-mode") || "").trim()
+    .toLowerCase();
   if (headerMode && ALLOWED_TRIGGER_MODES.has(headerMode)) {
     return headerMode;
   }
@@ -39,12 +48,14 @@ function parseTriggerMode(req: Request, body: RequestBody | null): string {
 
 function parseRunMode(req: Request, body: RequestBody | null): string {
   const url = new URL(req.url);
-  const queryMode = (url.searchParams.get("run_mode") || "").trim().toLowerCase();
+  const queryMode = (url.searchParams.get("run_mode") || "").trim()
+    .toLowerCase();
   if (queryMode && ALLOWED_RUN_MODES.has(queryMode)) {
     return queryMode;
   }
 
-  const headerMode = (req.headers.get("x-uk-aq-aqi-run-mode") || "").trim().toLowerCase();
+  const headerMode = (req.headers.get("x-uk-aq-aqi-run-mode") || "").trim()
+    .toLowerCase();
   if (headerMode && ALLOWED_RUN_MODES.has(headerMode)) {
     return headerMode;
   }

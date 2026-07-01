@@ -98,10 +98,15 @@ When `GCP_TIMESERIES_AQI_HOURLY_SCHEDULER_ENABLED=true`, the deploy workflow kee
   - default job: `uk-aq-timeseries-aqi-reconcile-short-trigger`
   - default schedule: `35 * * * *`
   - payload: `{"trigger_mode":"scheduler","run_mode":"reconcile_short"}`
-- optional deep reconcile job, enabled by `GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_SCHEDULER_ENABLED=true`:
+- legacy deep reconcile job, retained but explicitly kept paused by the deploy workflow:
   - default job: `uk-aq-timeseries-aqi-reconcile-deep-trigger`
   - default schedule: `50 */6 * * *`
   - payload: `{"trigger_mode":"scheduler","run_mode":"reconcile_deep"}`
+- rolling deep reconcile job, enabled by default with
+  `GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ROLLING_SCHEDULER_ENABLED=true`:
+  - default job: `uk-aq-timeseries-aqi-reconcile-deep-rolling-trigger`
+  - default schedule: `50 * * * *`
+  - payload: `{"trigger_mode":"scheduler","run_mode":"reconcile_deep_rolling"}`
 
 If you do not want the workflow to manage the optional jobs, call the Cloud Run service manually with the same JSON payloads shown above.
 
@@ -117,13 +122,20 @@ Mode windows:
 - `sync_hourly`: `(target_hour_end_utc - 1h, target_hour_end_utc]`
 - `reconcile_short`: `(target_hour_end_utc - UK_AQ_AQI_RECONCILE_SHORT_HOURS, target_hour_end_utc]`
 - `reconcile_deep`: `(target_hour_end_utc - UK_AQ_AQI_RECONCILE_DEEP_HOURS, target_hour_end_utc]`
+- `reconcile_deep_rolling`: from
+  `target_hour_end_utc - UK_AQ_AQI_RECONCILE_DEEP_ROLLING_LAG_HOURS` for
+  `UK_AQ_AQI_RECONCILE_DEEP_ROLLING_WINDOW_HOURS`; by default this is the
+  six-hour window from 24 hours ago through 18 hours ago
 - `backfill`: explicit window from manual `from_hour_utc`/`to_hour_utc`, preserving existing behavior
 
 Defaults:
 
 - `UK_AQ_AQI_RECONCILE_SHORT_HOURS=8`
-- `UK_AQ_AQI_RECONCILE_DEEP_HOURS=36`
+- `UK_AQ_AQI_RECONCILE_DEEP_HOURS=24` in the deployment workflow
 - `UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS=6`
+- `UK_AQ_AQI_RECONCILE_DEEP_ROLLING_LAG_HOURS=24`
+- `UK_AQ_AQI_RECONCILE_DEEP_ROLLING_WINDOW_HOURS=6`
+- `UK_AQ_AQI_RECONCILE_DEEP_ROLLING_UPSERT_BATCH_SIZE=100`
 - `UK_AQ_AQI_STATION_FK_CHECK_SCHEMA=uk_aq_public`
 - `UK_AQ_AQI_STATION_FK_CHECK_VIEW=stations_fk_check`
 
@@ -144,6 +156,14 @@ upserted, and duration; failures also expose
 `hourly_upsert_failed_chunk_end_utc` in the final run summary. Rollups still run
 once across the complete deep window after every hourly chunk succeeds.
 
+The legacy `reconcile_deep` mode remains available for manual or emergency
+24-hour repair runs, but its scheduler stays paused. The hourly
+`reconcile_deep_rolling` mode uses the same helper-refresh and detailed
+per-batch diagnostics over a bounded six-hour historical window, with hourly
+upsert RPC batches capped at 100 rows. Running it hourly at `*:50` avoids the
+900-second request-timeout risk of the old full-window schedule and reduces the
+chance of blocking the `*:20` sync or `*:35` short reconcile.
+
 If deep reconciliation still times out, lower the chunk-hours setting. If it is
 stable but too slow, increase it cautiously up to the deep-window size. Do not
 increase the Postgres statement timeout as the first response.
@@ -154,7 +174,7 @@ Behavior by mode:
   - read the existing ingest helper window via `uk_aq_rpc_timeseries_aqi_hourly_helper_window`
   - the helper window returns the normalized DAQI/EAQI fields only
   - reuse `uk_aq_rpc_timeseries_aqi_hourly_upsert` with the existing chunking and retry behavior
-- `reconcile_short` and `reconcile_deep`:
+- `reconcile_short`, `reconcile_deep`, and `reconcile_deep_rolling`:
   - first rebuild the ingest helper window from raw observations via `uk_aq_rpc_timeseries_aqi_hourly_helper_upsert`
   - then fetch the refreshed helper rows from `uk_aq_rpc_timeseries_aqi_hourly_helper_window`
   - page helper-window reads to avoid the PostgREST 1000-row response cap
@@ -188,6 +208,12 @@ Deep reconcile example:
 
 ```json
 {"trigger_mode":"manual","run_mode":"reconcile_deep"}
+```
+
+Rolling deep reconcile example:
+
+```json
+{"trigger_mode":"manual","run_mode":"reconcile_deep_rolling"}
 ```
 
 Backfill example:

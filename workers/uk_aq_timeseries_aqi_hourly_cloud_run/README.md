@@ -25,7 +25,8 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 
 - `sync_hourly`: latest mature hour-end window only
 - `reconcile_short`: recent rolling window ending at the same mature hour-end, default `8` hours
-- `reconcile_deep`: recent rolling window ending at the same mature hour-end, default `36` hours
+- `reconcile_deep`: recent rolling window ending at the same mature hour-end, default `24` hours
+- `reconcile_deep_rolling`: six-hour historical window from 24 hours ago through 18 hours ago
 - `backfill`: explicit hour-end range using `from_hour_utc` + `to_hour_utc`
 
 ## Required Environment
@@ -45,8 +46,11 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 - `UK_AQ_AQI_MATURITY_DELAY_BUFFER_MINUTES` (default `10`)
 - `UK_AQ_AQI_RUN_MODE` (default `sync_hourly`)
 - `UK_AQ_AQI_RECONCILE_SHORT_HOURS` (default `8`)
-- `UK_AQ_AQI_RECONCILE_DEEP_HOURS` (default `36`)
+- `UK_AQ_AQI_RECONCILE_DEEP_HOURS` (default `24`)
 - `UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS` (default `6`, capped at the deep window)
+- `UK_AQ_AQI_RECONCILE_DEEP_ROLLING_LAG_HOURS` (default `24`)
+- `UK_AQ_AQI_RECONCILE_DEEP_ROLLING_WINDOW_HOURS` (default `6`)
+- `UK_AQ_AQI_RECONCILE_DEEP_ROLLING_UPSERT_BATCH_SIZE` (default and maximum `100`)
 - `UK_AQ_AQI_STATION_FK_CHECK_SCHEMA` (default `uk_aq_public`)
 - `UK_AQ_AQI_STATION_FK_CHECK_VIEW` (default `stations_fk_check`)
 - `UK_AQ_AQI_FROM_HOUR_UTC` (backfill)
@@ -70,7 +74,7 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 ## Reconciliation Behavior
 
 - `sync_hourly` keeps the existing read-only helper-window flow
-- `reconcile_short` and `reconcile_deep` first run ingest RPC `uk_aq_rpc_timeseries_aqi_hourly_helper_upsert` for the computed mature window
+- `reconcile_short`, `reconcile_deep`, and `reconcile_deep_rolling` first run ingest RPC `uk_aq_rpc_timeseries_aqi_hourly_helper_upsert` for the computed mature window
 - after helper refresh, the worker fetches the refreshed helper rows page-by-page and upserts AQI levels in Obs AQI DB
 
 Deep reconciliation refreshes the helper window sequentially in bounded

@@ -1,5 +1,6 @@
 const HOUR_MS = 60 * 60 * 1000;
 const DEEP_HOURLY_UPSERT_MAX_BATCH_SIZE = 50;
+const DEEP_ROLLING_HOURLY_UPSERT_MAX_BATCH_SIZE = 100;
 
 export type RefreshWindow = {
   hourEndStartExclusive: Date;
@@ -25,13 +26,14 @@ export class DeepRefreshChunkError extends Error {
     chunkIndex: number,
     chunkCount: number,
     rpcError: string,
+    runMode = "reconcile_deep",
   ) {
     const fullStart = fullWindow.hourEndStartExclusive.toISOString();
     const fullEnd = fullWindow.hourEndEndInclusive.toISOString();
     const chunkStart = chunk.hourEndStartExclusive.toISOString();
     const chunkEnd = chunk.hourEndEndInclusive.toISOString();
     super(
-      `helper upsert RPC failed for reconcile_deep chunk ${chunkIndex}/${chunkCount}: ` +
+      `helper upsert RPC failed for ${runMode} chunk ${chunkIndex}/${chunkCount}: ` +
         `full_window=(${fullStart}, ${fullEnd}] failed_chunk=(${chunkStart}, ${chunkEnd}] ` +
         `error=${rpcError}`,
     );
@@ -55,13 +57,14 @@ export class DeepHourlyUpsertChunkError extends Error {
     chunkIndex: number,
     chunkCount: number,
     rpcError: string,
+    runMode = "reconcile_deep",
   ) {
     const fullStart = fullWindow.hourEndStartExclusive.toISOString();
     const fullEnd = fullWindow.hourEndEndInclusive.toISOString();
     const chunkStart = chunk.hourEndStartExclusive.toISOString();
     const chunkEnd = chunk.hourEndEndInclusive.toISOString();
     super(
-      `hourly upsert RPC failed for reconcile_deep chunk ${chunkIndex}/${chunkCount}: ` +
+      `hourly upsert RPC failed for ${runMode} chunk ${chunkIndex}/${chunkCount}: ` +
         `full_window=(${fullStart}, ${fullEnd}] failed_chunk=(${chunkStart}, ${chunkEnd}] ` +
         `error=${rpcError}`,
     );
@@ -130,4 +133,58 @@ export function deepHourlyUpsertBatchSize(configuredBatchSize: number): number {
     Math.max(1, Math.trunc(configuredBatchSize)),
     DEEP_HOURLY_UPSERT_MAX_BATCH_SIZE,
   );
+}
+
+export function deepRollingHourlyUpsertBatchSize(
+  configuredBatchSize: number,
+): number {
+  return Math.min(
+    Math.max(1, Math.trunc(configuredBatchSize)),
+    DEEP_ROLLING_HOURLY_UPSERT_MAX_BATCH_SIZE,
+  );
+}
+
+export function buildDeepRollingWindow(
+  referenceHourEnd: Date,
+  lagHours: number,
+  windowHours: number,
+): RefreshWindow {
+  if (!Number.isInteger(lagHours) || lagHours <= 0) {
+    throw new Error("lagHours must be a positive integer");
+  }
+  if (
+    !Number.isInteger(windowHours) ||
+    windowHours <= 0 ||
+    windowHours > lagHours
+  ) {
+    throw new Error(
+      "windowHours must be a positive integer no greater than lagHours",
+    );
+  }
+  const referenceMs = referenceHourEnd.getTime();
+  if (!Number.isFinite(referenceMs)) {
+    throw new Error("referenceHourEnd must be a valid date");
+  }
+  const startMs = referenceMs - lagHours * HOUR_MS;
+  return {
+    hourEndStartExclusive: new Date(startMs),
+    hourEndEndInclusive: new Date(startMs + windowHours * HOUR_MS),
+  };
+}
+
+export function buildRecentWindow(
+  referenceHourEnd: Date,
+  windowHours: number,
+): RefreshWindow {
+  if (!Number.isInteger(windowHours) || windowHours <= 0) {
+    throw new Error("windowHours must be a positive integer");
+  }
+  const referenceMs = referenceHourEnd.getTime();
+  if (!Number.isFinite(referenceMs)) {
+    throw new Error("referenceHourEnd must be a valid date");
+  }
+  return {
+    hourEndStartExclusive: new Date(referenceMs - windowHours * HOUR_MS),
+    hourEndEndInclusive: new Date(referenceMs),
+  };
 }
