@@ -7,6 +7,8 @@ import { uploadDropboxErrorLog } from "../shared/dropbox_error_log.ts";
 import {
   aggregateRefreshMetrics,
   buildDeepRefreshChunks,
+  deepHourlyUpsertBatchSize,
+  DeepHourlyUpsertChunkError,
   DeepRefreshChunkError,
 } from "./reconcile_deep_refresh.ts";
 
@@ -17,7 +19,11 @@ type RpcResult<T> = {
   error: RpcError | null;
 };
 
-type RunMode = "sync_hourly" | "backfill" | "reconcile_short" | "reconcile_deep";
+type RunMode =
+  | "sync_hourly"
+  | "backfill"
+  | "reconcile_short"
+  | "reconcile_deep";
 
 type HelperRow = {
   timeseries_id: number;
@@ -90,7 +96,8 @@ const INGEST_PRIVILEGED_KEY = requiredEnvAny(["SB_SECRET_KEY"]);
 const OBS_AQIDB_SUPABASE_URL = requiredEnv("OBS_AQIDB_SUPABASE_URL");
 const OBS_AQI_PRIVILEGED_KEY = requiredEnv("OBS_AQIDB_SECRET_KEY");
 
-const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public").trim();
+const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public")
+  .trim();
 const HELPER_UPSERT_RPC = "uk_aq_rpc_timeseries_aqi_hourly_helper_upsert";
 const HELPER_WINDOW_RPC = (Deno.env.get("UK_AQ_AQI_HELPER_WINDOW_RPC") ||
   "uk_aq_rpc_timeseries_aqi_hourly_helper_window").trim();
@@ -104,7 +111,10 @@ const RUN_LOG_RPC = (Deno.env.get("UK_AQ_AQI_RUN_LOG_RPC") ||
 const RUN_CLEANUP_RPC = (Deno.env.get("UK_AQ_AQI_RUN_CLEANUP_RPC") ||
   "uk_aq_rpc_aqi_compute_runs_cleanup").trim();
 
-const RUN_MODE = parseRunMode(Deno.env.get("UK_AQ_AQI_RUN_MODE"), "sync_hourly");
+const RUN_MODE = parseRunMode(
+  Deno.env.get("UK_AQ_AQI_RUN_MODE"),
+  "sync_hourly",
+);
 const RECONCILE_SHORT_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_RECONCILE_SHORT_HOURS"),
   8,
@@ -114,10 +124,14 @@ const RECONCILE_DEEP_HOURS = parsePositiveInt(
   36,
 );
 const RECONCILE_DEEP_REFRESH_CHUNK_HOURS = Math.min(
-  parsePositiveInt(Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS"), 6),
+  parsePositiveInt(
+    Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS"),
+    6,
+  ),
   RECONCILE_DEEP_HOURS,
 );
-const TRIGGER_MODE = (Deno.env.get("UK_AQ_AQI_TRIGGER_MODE") || "manual").trim() || "manual";
+const TRIGGER_MODE =
+  (Deno.env.get("UK_AQ_AQI_TRIGGER_MODE") || "manual").trim() || "manual";
 const MATURITY_DELAY_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_MATURITY_DELAY_HOURS"),
   3,
@@ -138,14 +152,17 @@ const RUN_LOG_RETENTION_DAYS = parsePositiveInt(
 );
 const FROM_HOUR_UTC = optionalEnv("UK_AQ_AQI_FROM_HOUR_UTC");
 const TO_HOUR_UTC = optionalEnv("UK_AQ_AQI_TO_HOUR_UTC");
-const TIMESERIES_IDS = parseTimeseriesIdsCsv(optionalEnv("UK_AQ_AQI_TIMESERIES_IDS_CSV"));
+const TIMESERIES_IDS = parseTimeseriesIdsCsv(
+  optionalEnv("UK_AQ_AQI_TIMESERIES_IDS_CSV"),
+);
 const SERVICE_NAME = "uk-aq-timeseries-aqi-hourly";
 const STATION_ID_QUERY_CHUNK_SIZE = 500;
 const SKIPPED_ROW_SAMPLE_LIMIT = 20;
 const STATION_FK_CHECK_SCHEMA =
   (Deno.env.get("UK_AQ_AQI_STATION_FK_CHECK_SCHEMA") || "uk_aq_public").trim();
 const STATION_FK_CHECK_VIEW =
-  (Deno.env.get("UK_AQ_AQI_STATION_FK_CHECK_VIEW") || "stations_fk_check").trim();
+  (Deno.env.get("UK_AQ_AQI_STATION_FK_CHECK_VIEW") || "stations_fk_check")
+    .trim();
 const DROPBOX_APP_KEY = optionalEnv("DROPBOX_APP_KEY") || "";
 const DROPBOX_APP_SECRET = optionalEnv("DROPBOX_APP_SECRET") || "";
 const DROPBOX_REFRESH_TOKEN = optionalEnv("DROPBOX_REFRESH_TOKEN") || "";
@@ -166,7 +183,9 @@ function requiredEnvAny(names: string[]): string {
       return value;
     }
   }
-  throw new Error(`Missing required environment variable: one of ${names.join(", ")}`);
+  throw new Error(
+    `Missing required environment variable: one of ${names.join(", ")}`,
+  );
 }
 
 function optionalEnv(name: string): string | null {
@@ -231,7 +250,8 @@ function asErrorMessage(payload: unknown, status: number): string {
 }
 
 function isRetryableStatus(status: number): boolean {
-  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+  return status === 429 || status === 500 || status === 502 || status === 503 ||
+    status === 504;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -264,7 +284,8 @@ async function postgrestRpc<T>(
         headers,
         body: JSON.stringify(args),
       });
-      const contentType = (response.headers.get("content-type") || "").toLowerCase();
+      const contentType = (response.headers.get("content-type") || "")
+        .toLowerCase();
       const payload = contentType.includes("application/json")
         ? await response.json().catch(() => null)
         : await response.text().catch(() => null);
@@ -295,7 +316,9 @@ async function postgrestRpc<T>(
   return { data: null, error: { message: "unknown_rpc_error" } };
 }
 
-async function fetchExistingStationIds(stationIds: number[]): Promise<Set<number>> {
+async function fetchExistingStationIds(
+  stationIds: number[],
+): Promise<Set<number>> {
   const existing = new Set<number>();
   const distinctIds = Array.from(new Set(stationIds)).sort((a, b) => a - b);
   for (const ids of chunkRows(distinctIds, STATION_ID_QUERY_CHUNK_SIZE)) {
@@ -303,8 +326,9 @@ async function fetchExistingStationIds(stationIds: number[]): Promise<Set<number
       select: "id",
       id: `in.(${ids.join(",")})`,
     });
-    const url =
-      `${normalizeUrl(OBS_AQIDB_SUPABASE_URL)}/${STATION_FK_CHECK_VIEW}?${query.toString()}`;
+    const url = `${
+      normalizeUrl(OBS_AQIDB_SUPABASE_URL)
+    }/${STATION_FK_CHECK_VIEW}?${query.toString()}`;
     let completed = false;
     let finalError = "unknown_station_preflight_error";
     for (let attempt = 1; attempt <= RPC_RETRIES; attempt += 1) {
@@ -468,18 +492,22 @@ function buildRollingWindow(referenceHourEnd: Date, hours: number): SyncWindow {
 }
 
 function runWindow(nowUtc: Date): SyncWindow {
-  const totalDelayMs =
-    MATURITY_DELAY_HOURS * ONE_HOUR_MS + MATURITY_DELAY_BUFFER_MINUTES * ONE_MINUTE_MS;
+  const totalDelayMs = MATURITY_DELAY_HOURS * ONE_HOUR_MS +
+    MATURITY_DELAY_BUFFER_MINUTES * ONE_MINUTE_MS;
   const targetHourEnd = floorUtcHour(new Date(nowUtc.getTime() - totalDelayMs));
 
   if (RUN_MODE === "backfill") {
     if (!FROM_HOUR_UTC || !TO_HOUR_UTC) {
-      throw new Error("Backfill mode requires UK_AQ_AQI_FROM_HOUR_UTC and UK_AQ_AQI_TO_HOUR_UTC");
+      throw new Error(
+        "Backfill mode requires UK_AQ_AQI_FROM_HOUR_UTC and UK_AQ_AQI_TO_HOUR_UTC",
+      );
     }
     const fromHourEnd = parseIsoHour(FROM_HOUR_UTC);
     const toHourEnd = parseIsoHour(TO_HOUR_UTC);
     if (toHourEnd.getTime() < fromHourEnd.getTime()) {
-      throw new Error("UK_AQ_AQI_TO_HOUR_UTC must be >= UK_AQ_AQI_FROM_HOUR_UTC");
+      throw new Error(
+        "UK_AQ_AQI_TO_HOUR_UTC must be >= UK_AQ_AQI_FROM_HOUR_UTC",
+      );
     }
     return {
       hourEndStartExclusive: addHours(fromHourEnd, -1),
@@ -539,7 +567,8 @@ function parseHelperRows(payload: unknown): HelperRow[] {
     if (
       !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
       !Number.isInteger(connectorId) || connectorId <= 0 ||
-      (pollutantCode !== "no2" && pollutantCode !== "pm25" && pollutantCode !== "pm10") ||
+      (pollutantCode !== "no2" && pollutantCode !== "pm25" &&
+        pollutantCode !== "pm10") ||
       Number.isNaN(Date.parse(timestampRaw))
     ) {
       continue;
@@ -547,27 +576,44 @@ function parseHelperRows(payload: unknown): HelperRow[] {
 
     rows.push({
       timeseries_id: Math.trunc(timeseriesId),
-      station_id: Number.isInteger(stationId) && stationId !== null && stationId > 0
-        ? Math.trunc(stationId)
-        : null,
+      station_id:
+        Number.isInteger(stationId) && stationId !== null && stationId > 0
+          ? Math.trunc(stationId)
+          : null,
       connector_id: Math.trunc(connectorId),
       pollutant_code: pollutantCode as "no2" | "pm25" | "pm10",
       timestamp_hour_utc: hourIso(new Date(Date.parse(timestampRaw))),
       daqi_input_value_ugm3: toNullableNumber(row.daqi_input_value_ugm3),
-      daqi_input_averaging_code: normalizeAqiAveragingCode(row.daqi_input_averaging_code),
+      daqi_input_averaging_code: normalizeAqiAveragingCode(
+        row.daqi_input_averaging_code,
+      ),
       daqi_index_level: toNullableInt(row.daqi_index_level),
-      daqi_source_observation_count: toNullableInt(row.daqi_source_observation_count),
-      daqi_required_observation_count: toNullableInt(row.daqi_required_observation_count),
-      daqi_calculation_status: normalizeAqiCalculationStatus(row.daqi_calculation_status),
+      daqi_source_observation_count: toNullableInt(
+        row.daqi_source_observation_count,
+      ),
+      daqi_required_observation_count: toNullableInt(
+        row.daqi_required_observation_count,
+      ),
+      daqi_calculation_status: normalizeAqiCalculationStatus(
+        row.daqi_calculation_status,
+      ),
       daqi_missing_reason: typeof row.daqi_missing_reason === "string"
         ? row.daqi_missing_reason
         : null,
       eaqi_input_value_ugm3: toNullableNumber(row.eaqi_input_value_ugm3),
-      eaqi_input_averaging_code: normalizeAqiAveragingCode(row.eaqi_input_averaging_code),
+      eaqi_input_averaging_code: normalizeAqiAveragingCode(
+        row.eaqi_input_averaging_code,
+      ),
       eaqi_index_level: toNullableInt(row.eaqi_index_level),
-      eaqi_source_observation_count: toNullableInt(row.eaqi_source_observation_count),
-      eaqi_required_observation_count: toNullableInt(row.eaqi_required_observation_count),
-      eaqi_calculation_status: normalizeAqiCalculationStatus(row.eaqi_calculation_status),
+      eaqi_source_observation_count: toNullableInt(
+        row.eaqi_source_observation_count,
+      ),
+      eaqi_required_observation_count: toNullableInt(
+        row.eaqi_required_observation_count,
+      ),
+      eaqi_calculation_status: normalizeAqiCalculationStatus(
+        row.eaqi_calculation_status,
+      ),
       eaqi_missing_reason: typeof row.eaqi_missing_reason === "string"
         ? row.eaqi_missing_reason
         : null,
@@ -606,7 +652,8 @@ function parseHourlyUpsertMetrics(payload: unknown): HourlyUpsertMetrics {
       row.timeseries_hours_changed ?? row.station_hours_changed,
     ),
     timeseries_hours_changed_gt_cutoff: toSafeInt(
-      row.timeseries_hours_changed_gt_cutoff ?? row.station_hours_changed_gt_cutoff,
+      row.timeseries_hours_changed_gt_cutoff ??
+        row.station_hours_changed_gt_cutoff,
     ),
     max_changed_lag_hours: toNullableNumber(row.max_changed_lag_hours),
   };
@@ -652,7 +699,9 @@ function parseIntArray(value: unknown): number[] {
   return out;
 }
 
-function parseStationLinkHealthMetrics(payload: unknown): StationLinkHealthMetrics {
+function parseStationLinkHealthMetrics(
+  payload: unknown,
+): StationLinkHealthMetrics {
   if (!Array.isArray(payload) || payload.length === 0) {
     throw new Error("station link health RPC returned no rows");
   }
@@ -663,7 +712,9 @@ function parseStationLinkHealthMetrics(payload: unknown): StationLinkHealthMetri
     null_station_timeseries: toSafeInt(row.null_station_timeseries),
     mismatched_station_timeseries: toSafeInt(row.mismatched_station_timeseries),
     sample_null_timeseries_ids: parseIntArray(row.sample_null_timeseries_ids),
-    sample_mismatched_timeseries_ids: parseIntArray(row.sample_mismatched_timeseries_ids),
+    sample_mismatched_timeseries_ids: parseIntArray(
+      row.sample_mismatched_timeseries_ids,
+    ),
   };
 }
 
@@ -678,7 +729,10 @@ function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
-async function fetchHelperRowsPage(window: SyncWindow, offset: number): Promise<HelperRow[]> {
+async function fetchHelperRowsPage(
+  window: SyncWindow,
+  offset: number,
+): Promise<HelperRow[]> {
   const args: Record<string, unknown> = {
     p_hour_end_start_exclusive: hourIso(window.hourEndStartExclusive),
     p_hour_end_end_inclusive: hourIso(window.hourEndEndInclusive),
@@ -708,7 +762,9 @@ function shouldRefreshHelperWindow(): boolean {
   return RUN_MODE === "reconcile_short" || RUN_MODE === "reconcile_deep";
 }
 
-async function refreshHelperWindow(window: SyncWindow): Promise<HelperRefreshMetrics> {
+async function refreshHelperWindow(
+  window: SyncWindow,
+): Promise<HelperRefreshMetrics> {
   const args: Record<string, unknown> = {
     p_hour_end_start_exclusive: hourIso(window.hourEndStartExclusive),
     p_hour_end_end_inclusive: hourIso(window.hourEndEndInclusive),
@@ -733,7 +789,10 @@ async function refreshHelperWindow(window: SyncWindow): Promise<HelperRefreshMet
 async function refreshDeepHelperWindow(
   window: SyncWindow,
 ): Promise<{ metrics: HelperRefreshMetrics; chunkCount: number }> {
-  const chunks = buildDeepRefreshChunks(window, RECONCILE_DEEP_REFRESH_CHUNK_HOURS);
+  const chunks = buildDeepRefreshChunks(
+    window,
+    RECONCILE_DEEP_REFRESH_CHUNK_HOURS,
+  );
   const metrics: HelperRefreshMetrics[] = [];
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
@@ -781,7 +840,10 @@ async function refreshDeepHelperWindow(
       );
     }
   }
-  return { metrics: aggregateRefreshMetrics(metrics), chunkCount: chunks.length };
+  return {
+    metrics: aggregateRefreshMetrics(metrics),
+    chunkCount: chunks.length,
+  };
 }
 
 async function main(): Promise<void> {
@@ -790,7 +852,10 @@ async function main(): Promise<void> {
   const window = runWindow(nowUtc);
 
   const referenceHourStart = addHours(window.referenceHourEnd, -1);
-  const lateCutoffHour = addHours(referenceHourStart, -LATE_CHANGE_CUTOFF_HOURS);
+  const lateCutoffHour = addHours(
+    referenceHourStart,
+    -LATE_CHANGE_CUTOFF_HOURS,
+  );
 
   let sourceRowsCount = 0;
   let candidateTimeseriesHours = 0;
@@ -806,6 +871,9 @@ async function main(): Promise<void> {
   let helperRefreshChunkCount = 0;
   let helperRefreshFailedChunkStartUtc: string | null = null;
   let helperRefreshFailedChunkEndUtc: string | null = null;
+  let hourlyUpsertChunkCount = 0;
+  let hourlyUpsertFailedChunkStartUtc: string | null = null;
+  let hourlyUpsertFailedChunkEndUtc: string | null = null;
   let stationLinkHealth: StationLinkHealthMetrics | null = null;
   let runStatus: "ok" | "error" = "ok";
   let errorMessage: string | null = null;
@@ -825,84 +893,174 @@ async function main(): Promise<void> {
     }
 
     const timeseriesIds = new Set<number>();
-    let helperOffset = 0;
+    const hourlyUpsertWindows = RUN_MODE === "reconcile_deep"
+      ? buildDeepRefreshChunks(window, RECONCILE_DEEP_REFRESH_CHUNK_HOURS)
+      : [window];
+    hourlyUpsertChunkCount = hourlyUpsertWindows.length;
 
-    while (true) {
-      const helperRows = await fetchHelperRowsPage(window, helperOffset);
-      helperPagesFetched += 1;
-      sourceRowsCount += helperRows.length;
-      candidateTimeseriesHours += helperRows.length;
+    for (
+      let windowIndex = 0;
+      windowIndex < hourlyUpsertWindows.length;
+      windowIndex += 1
+    ) {
+      const hourlyUpsertWindow = hourlyUpsertWindows[windowIndex];
+      const hourlyUpsertSyncWindow: SyncWindow = {
+        ...hourlyUpsertWindow,
+        referenceHourEnd: window.referenceHourEnd,
+      };
+      const chunkStartedAt = Date.now();
+      const chunkSourceRowsBefore = sourceRowsCount;
+      const chunkRowsUpsertedBefore = rowsUpserted;
+      let helperOffset = 0;
 
-      if (helperRows.length === 0) {
-        break;
-      }
+      try {
+        while (true) {
+          const helperRows = await fetchHelperRowsPage(
+            hourlyUpsertSyncWindow,
+            helperOffset,
+          );
+          helperPagesFetched += 1;
+          sourceRowsCount += helperRows.length;
+          candidateTimeseriesHours += helperRows.length;
 
-      const candidateStationIds = helperRows
-        .map((row) => row.station_id)
-        .filter((stationId): stationId is number => stationId !== null);
-      const existingStationIds = await fetchExistingStationIds(candidateStationIds);
-      const stationPartition = partitionRowsByExistingStations(helperRows, existingStationIds);
-      for (const stationId of stationPartition.missingStationIds) {
-        missingStationFkIds.add(stationId);
-      }
-      skippedMissingStationFkRows += stationPartition.skippedRows.length;
-      if (stationPartition.skippedRows.length > 0) {
-        await logMissingStationFk("missing_station_fk", window, {
-          missing_station_ids: stationPartition.missingStationIds,
-          missing_station_fk_count: stationPartition.missingStationIds.length,
-          skipped_row_count: stationPartition.skippedRows.length,
-          sample_skipped_rows: skippedRowSample(stationPartition.skippedRows),
-          message: "Rows with missing parent stations were skipped; valid rows continued.",
-        });
-      }
-
-      const chunks = chunkRows(
-        stationPartition.validRows,
-        Math.max(100, HOURLY_UPSERT_CHUNK_SIZE),
-      );
-      for (const chunk of chunks) {
-        const upsertResult = await postgrestRpc<unknown>(
-          OBS_AQIDB_SUPABASE_URL,
-          OBS_AQI_PRIVILEGED_KEY,
-          HOURLY_UPSERT_RPC,
-          {
-            p_rows: chunk,
-            p_late_cutoff_hour: hourIso(lateCutoffHour),
-            p_reference_hour: hourIso(referenceHourStart),
-          },
-        );
-        if (upsertResult.error) {
-          if (isStationForeignKeyError(upsertResult.error.message)) {
-            await logMissingStationFk("missing_station_fk_unhandled_by_preflight", window, {
-              rpc_name: HOURLY_UPSERT_RPC,
-              error_text: upsertResult.error.message,
-              attempted_row_count: chunk.length,
-              message:
-                "Station FK failure remained after preflight; the run is failing because the offending row could not be identified safely.",
-            });
+          if (helperRows.length === 0) {
+            break;
           }
-          throw new Error(`hourly upsert RPC failed: ${upsertResult.error.message}`);
+
+          const candidateStationIds = helperRows
+            .map((row) => row.station_id)
+            .filter((stationId): stationId is number => stationId !== null);
+          const existingStationIds = await fetchExistingStationIds(
+            candidateStationIds,
+          );
+          const stationPartition = partitionRowsByExistingStations(
+            helperRows,
+            existingStationIds,
+          );
+          for (const stationId of stationPartition.missingStationIds) {
+            missingStationFkIds.add(stationId);
+          }
+          skippedMissingStationFkRows += stationPartition.skippedRows.length;
+          if (stationPartition.skippedRows.length > 0) {
+            await logMissingStationFk(
+              "missing_station_fk",
+              hourlyUpsertSyncWindow,
+              {
+                missing_station_ids: stationPartition.missingStationIds,
+                missing_station_fk_count:
+                  stationPartition.missingStationIds.length,
+                skipped_row_count: stationPartition.skippedRows.length,
+                sample_skipped_rows: skippedRowSample(
+                  stationPartition.skippedRows,
+                ),
+                message:
+                  "Rows with missing parent stations were skipped; valid rows continued.",
+              },
+            );
+          }
+
+          const chunks = chunkRows(
+            stationPartition.validRows,
+            RUN_MODE === "reconcile_deep"
+              ? deepHourlyUpsertBatchSize(HOURLY_UPSERT_CHUNK_SIZE)
+              : Math.max(100, HOURLY_UPSERT_CHUNK_SIZE),
+          );
+          for (const chunk of chunks) {
+            const upsertResult = await postgrestRpc<unknown>(
+              OBS_AQIDB_SUPABASE_URL,
+              OBS_AQI_PRIVILEGED_KEY,
+              HOURLY_UPSERT_RPC,
+              {
+                p_rows: chunk,
+                p_late_cutoff_hour: hourIso(lateCutoffHour),
+                p_reference_hour: hourIso(referenceHourStart),
+              },
+            );
+            if (upsertResult.error) {
+              if (isStationForeignKeyError(upsertResult.error.message)) {
+                await logMissingStationFk(
+                  "missing_station_fk_unhandled_by_preflight",
+                  hourlyUpsertSyncWindow,
+                  {
+                    rpc_name: HOURLY_UPSERT_RPC,
+                    error_text: upsertResult.error.message,
+                    attempted_row_count: chunk.length,
+                    message:
+                      "Station FK failure remained after preflight; the run is failing because the offending row could not be identified safely.",
+                  },
+                );
+              }
+              throw new Error(
+                `hourly upsert RPC failed: ${upsertResult.error.message}`,
+              );
+            }
+            const metrics = parseHourlyUpsertMetrics(upsertResult.data);
+            rowsUpserted += metrics.rows_changed;
+            rowsChanged += metrics.rows_changed;
+            timeseriesHoursChanged += metrics.timeseries_hours_changed;
+            timeseriesHoursChangedGt36h +=
+              metrics.timeseries_hours_changed_gt_cutoff;
+            if (metrics.max_changed_lag_hours !== null) {
+              maxChangedLagHours = maxChangedLagHours === null
+                ? metrics.max_changed_lag_hours
+                : Math.max(maxChangedLagHours, metrics.max_changed_lag_hours);
+            }
+          }
+
+          for (const row of stationPartition.validRows) {
+            timeseriesIds.add(row.timeseries_id);
+          }
+
+          if (helperRows.length < HELPER_WINDOW_RPC_PAGE_SIZE) {
+            break;
+          }
+          helperOffset += HELPER_WINDOW_RPC_PAGE_SIZE;
         }
-        const metrics = parseHourlyUpsertMetrics(upsertResult.data);
-        rowsUpserted += metrics.rows_changed;
-        rowsChanged += metrics.rows_changed;
-        timeseriesHoursChanged += metrics.timeseries_hours_changed;
-        timeseriesHoursChangedGt36h += metrics.timeseries_hours_changed_gt_cutoff;
-        if (metrics.max_changed_lag_hours !== null) {
-          maxChangedLagHours = maxChangedLagHours === null
-            ? metrics.max_changed_lag_hours
-            : Math.max(maxChangedLagHours, metrics.max_changed_lag_hours);
+      } catch (error) {
+        if (RUN_MODE !== "reconcile_deep") {
+          throw error;
         }
+        const rpcError = error instanceof Error ? error.message : String(error);
+        console.error(JSON.stringify({
+          level: "error",
+          event: "aqi_reconcile_deep_hourly_upsert_chunk_failed",
+          run_mode: RUN_MODE,
+          trigger_mode: TRIGGER_MODE,
+          full_window_start_utc: hourIso(window.hourEndStartExclusive),
+          full_window_end_utc: hourIso(window.hourEndEndInclusive),
+          chunk_index: windowIndex + 1,
+          chunk_count: hourlyUpsertWindows.length,
+          chunk_start_utc: hourIso(hourlyUpsertWindow.hourEndStartExclusive),
+          chunk_end_utc: hourIso(hourlyUpsertWindow.hourEndEndInclusive),
+          source_rows: sourceRowsCount - chunkSourceRowsBefore,
+          rows_upserted: rowsUpserted - chunkRowsUpsertedBefore,
+          rpc_error: rpcError,
+          duration_ms: Date.now() - chunkStartedAt,
+        }));
+        throw new DeepHourlyUpsertChunkError(
+          window,
+          hourlyUpsertWindow,
+          windowIndex + 1,
+          hourlyUpsertWindows.length,
+          rpcError,
+        );
       }
 
-      for (const row of stationPartition.validRows) {
-        timeseriesIds.add(row.timeseries_id);
+      if (RUN_MODE === "reconcile_deep") {
+        console.log(JSON.stringify({
+          level: "info",
+          event: "aqi_reconcile_deep_hourly_upsert_chunk",
+          run_mode: RUN_MODE,
+          trigger_mode: TRIGGER_MODE,
+          chunk_index: windowIndex + 1,
+          chunk_count: hourlyUpsertWindows.length,
+          chunk_start_utc: hourIso(hourlyUpsertWindow.hourEndStartExclusive),
+          chunk_end_utc: hourIso(hourlyUpsertWindow.hourEndEndInclusive),
+          source_rows: sourceRowsCount - chunkSourceRowsBefore,
+          rows_upserted: rowsUpserted - chunkRowsUpsertedBefore,
+          duration_ms: Date.now() - chunkStartedAt,
+        }));
       }
-
-      if (helperRows.length < HELPER_WINDOW_RPC_PAGE_SIZE) {
-        break;
-      }
-      helperOffset += HELPER_WINDOW_RPC_PAGE_SIZE;
     }
 
     if (timeseriesIds.size > 0) {
@@ -917,7 +1075,9 @@ async function main(): Promise<void> {
         },
       );
       if (rollupResult.error) {
-        throw new Error(`rollup refresh RPC failed: ${rollupResult.error.message}`);
+        throw new Error(
+          `rollup refresh RPC failed: ${rollupResult.error.message}`,
+        );
       }
       const rollupMetrics = parseRollupMetrics(rollupResult.data);
       dailyRowsUpserted = rollupMetrics.daily_rows_upserted;
@@ -955,9 +1115,12 @@ async function main(): Promise<void> {
             null_station_rows: stationLinkHealth.null_station_rows,
             mismatched_station_rows: stationLinkHealth.mismatched_station_rows,
             null_station_timeseries: stationLinkHealth.null_station_timeseries,
-            mismatched_station_timeseries: stationLinkHealth.mismatched_station_timeseries,
-            sample_null_timeseries_ids: stationLinkHealth.sample_null_timeseries_ids,
-            sample_mismatched_timeseries_ids: stationLinkHealth.sample_mismatched_timeseries_ids,
+            mismatched_station_timeseries:
+              stationLinkHealth.mismatched_station_timeseries,
+            sample_null_timeseries_ids:
+              stationLinkHealth.sample_null_timeseries_ids,
+            sample_mismatched_timeseries_ids:
+              stationLinkHealth.sample_mismatched_timeseries_ids,
           }));
         }
       }
@@ -967,6 +1130,11 @@ async function main(): Promise<void> {
       helperRefreshChunkCount = error.chunkCount;
       helperRefreshFailedChunkStartUtc = error.chunkStartUtc;
       helperRefreshFailedChunkEndUtc = error.chunkEndUtc;
+    }
+    if (error instanceof DeepHourlyUpsertChunkError) {
+      hourlyUpsertChunkCount = error.chunkCount;
+      hourlyUpsertFailedChunkStartUtc = error.chunkStartUtc;
+      hourlyUpsertFailedChunkEndUtc = error.chunkEndUtc;
     }
     runStatus = "error";
     errorMessage = error instanceof Error ? error.message : String(error);
@@ -1041,24 +1209,41 @@ async function main(): Promise<void> {
     helper_pages_fetched: helperPagesFetched,
     helper_refresh_source_rows: helperRefreshMetrics?.source_rows ?? null,
     helper_refresh_rows_upserted: helperRefreshMetrics?.rows_upserted ?? null,
-    helper_refresh_timeseries_hours_changed: helperRefreshMetrics?.timeseries_hours_changed ?? null,
-    helper_refresh_max_changed_lag_hours: helperRefreshMetrics?.max_changed_lag_hours ?? null,
+    helper_refresh_timeseries_hours_changed:
+      helperRefreshMetrics?.timeseries_hours_changed ?? null,
+    helper_refresh_max_changed_lag_hours:
+      helperRefreshMetrics?.max_changed_lag_hours ?? null,
     helper_refresh_chunk_count: helperRefreshChunkCount,
     helper_refresh_chunk_hours: RUN_MODE === "reconcile_deep"
       ? RECONCILE_DEEP_REFRESH_CHUNK_HOURS
       : null,
-    helper_refresh_chunked: RUN_MODE === "reconcile_deep" && helperRefreshChunkCount > 1,
+    helper_refresh_chunked: RUN_MODE === "reconcile_deep" &&
+      helperRefreshChunkCount > 1,
     helper_refresh_failed_chunk_start_utc: helperRefreshFailedChunkStartUtc,
     helper_refresh_failed_chunk_end_utc: helperRefreshFailedChunkEndUtc,
+    hourly_upsert_chunk_count: hourlyUpsertChunkCount,
+    hourly_upsert_chunk_hours: RUN_MODE === "reconcile_deep"
+      ? RECONCILE_DEEP_REFRESH_CHUNK_HOURS
+      : null,
+    hourly_upsert_chunked: RUN_MODE === "reconcile_deep" &&
+      hourlyUpsertChunkCount > 1,
+    hourly_upsert_failed_chunk_start_utc: hourlyUpsertFailedChunkStartUtc,
+    hourly_upsert_failed_chunk_end_utc: hourlyUpsertFailedChunkEndUtc,
     station_link_null_rows: stationLinkHealth?.null_station_rows ?? null,
-    station_link_mismatched_rows: stationLinkHealth?.mismatched_station_rows ?? null,
-    station_link_null_timeseries: stationLinkHealth?.null_station_timeseries ?? null,
-    station_link_mismatched_timeseries: stationLinkHealth?.mismatched_station_timeseries ?? null,
-    station_link_sample_null_timeseries_ids: stationLinkHealth?.sample_null_timeseries_ids ?? null,
+    station_link_mismatched_rows: stationLinkHealth?.mismatched_station_rows ??
+      null,
+    station_link_null_timeseries: stationLinkHealth?.null_station_timeseries ??
+      null,
+    station_link_mismatched_timeseries:
+      stationLinkHealth?.mismatched_station_timeseries ?? null,
+    station_link_sample_null_timeseries_ids:
+      stationLinkHealth?.sample_null_timeseries_ids ?? null,
     station_link_sample_mismatched_timeseries_ids:
       stationLinkHealth?.sample_mismatched_timeseries_ids ?? null,
     missing_station_fk_count: missingStationFkIds.size,
-    missing_station_fk_ids: Array.from(missingStationFkIds).sort((a, b) => a - b),
+    missing_station_fk_ids: Array.from(missingStationFkIds).sort((a, b) =>
+      a - b
+    ),
     skipped_missing_station_fk_rows: skippedMissingStationFkRows,
     continued_after_missing_station_fk: missingStationFkIds.size > 0,
     duration_ms: durationMs,

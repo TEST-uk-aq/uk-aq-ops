@@ -127,13 +127,17 @@ Defaults:
 - `UK_AQ_AQI_STATION_FK_CHECK_SCHEMA=uk_aq_public`
 - `UK_AQ_AQI_STATION_FK_CHECK_VIEW=stations_fk_check`
 
-Deep helper refresh is split into sequential UTC hour-end chunks to avoid
-`canceling statement due to statement timeout` on a single large database
-statement. Each chunk preserves `(start_exclusive, end_inclusive]` semantics.
-After every chunk succeeds, the existing helper-window paging, station FK
-guard, AQI upsert, and rollup flow runs unchanged. Chunk metrics are aggregated
-into the existing helper-refresh summary fields, with additional chunk count,
-size, and failed-chunk fields.
+Deep helper refresh and the final hourly AQI upsert are both split into
+sequential UTC hour-end chunks to avoid `canceling statement due to statement
+timeout` on a single large database statement or full-window upsert stage. Both
+stages use `UK_AQ_AQI_RECONCILE_DEEP_REFRESH_CHUNK_HOURS` and preserve
+`(start_exclusive, end_inclusive]` semantics. Hourly upsert retains its existing
+configured row-size batching inside each time chunk, capped at 250 rows per RPC
+in deep mode to bound each database statement. Per-chunk structured logs include
+the chunk start/end, source rows, rows upserted, and duration; failures also expose
+`hourly_upsert_failed_chunk_start_utc` and
+`hourly_upsert_failed_chunk_end_utc` in the final run summary. Rollups still run
+once across the complete deep window after every hourly chunk succeeds.
 
 If deep reconciliation still times out, lower the chunk-hours setting. If it is
 stable but too slow, increase it cautiously up to the deep-window size. Do not
