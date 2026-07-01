@@ -7,9 +7,12 @@ import { uploadDropboxErrorLog } from "../shared/dropbox_error_log.ts";
 import {
   aggregateRefreshMetrics,
   buildDeepRefreshChunks,
+  buildDeepRollingWindow,
+  buildRecentWindow,
   deepHourlyUpsertBatchSize,
   DeepHourlyUpsertChunkError,
   DeepRefreshChunkError,
+  deepRollingHourlyUpsertBatchSize,
 } from "./reconcile_deep_refresh.ts";
 
 type RpcError = { message: string };
@@ -23,7 +26,8 @@ type RunMode =
   | "sync_hourly"
   | "backfill"
   | "reconcile_short"
-  | "reconcile_deep";
+  | "reconcile_deep"
+  | "reconcile_deep_rolling";
 
 type HelperRow = {
   timeseries_id: number;
@@ -121,7 +125,7 @@ const RECONCILE_SHORT_HOURS = parsePositiveInt(
 );
 const RECONCILE_DEEP_HOURS = parsePositiveInt(
   Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_HOURS"),
-  36,
+  24,
 );
 const RECONCILE_DEEP_REFRESH_CHUNK_HOURS = Math.min(
   parsePositiveInt(
@@ -129,6 +133,21 @@ const RECONCILE_DEEP_REFRESH_CHUNK_HOURS = Math.min(
     6,
   ),
   RECONCILE_DEEP_HOURS,
+);
+const RECONCILE_DEEP_ROLLING_LAG_HOURS = parsePositiveInt(
+  Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_ROLLING_LAG_HOURS"),
+  24,
+);
+const RECONCILE_DEEP_ROLLING_WINDOW_HOURS = Math.min(
+  parsePositiveInt(
+    Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_ROLLING_WINDOW_HOURS"),
+    6,
+  ),
+  RECONCILE_DEEP_ROLLING_LAG_HOURS,
+);
+const RECONCILE_DEEP_ROLLING_UPSERT_BATCH_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_AQI_RECONCILE_DEEP_ROLLING_UPSERT_BATCH_SIZE"),
+  100,
 );
 const TRIGGER_MODE =
   (Deno.env.get("UK_AQ_AQI_TRIGGER_MODE") || "manual").trim() || "manual";
@@ -207,7 +226,8 @@ function parseRunMode(raw: string | undefined, fallback: RunMode): RunMode {
     value === "sync_hourly" ||
     value === "backfill" ||
     value === "reconcile_short" ||
-    value === "reconcile_deep"
+    value === "reconcile_deep" ||
+    value === "reconcile_deep_rolling"
   ) {
     return value;
   }
@@ -484,9 +504,9 @@ function hourIso(date: Date): string {
 }
 
 function buildRollingWindow(referenceHourEnd: Date, hours: number): SyncWindow {
+  const recentWindow = buildRecentWindow(referenceHourEnd, hours);
   return {
-    hourEndStartExclusive: addHours(referenceHourEnd, -hours),
-    hourEndEndInclusive: referenceHourEnd,
+    ...recentWindow,
     referenceHourEnd,
   };
 }
@@ -522,6 +542,18 @@ function runWindow(nowUtc: Date): SyncWindow {
 
   if (RUN_MODE === "reconcile_deep") {
     return buildRollingWindow(targetHourEnd, RECONCILE_DEEP_HOURS);
+  }
+
+  if (RUN_MODE === "reconcile_deep_rolling") {
+    const rollingWindow = buildDeepRollingWindow(
+      targetHourEnd,
+      RECONCILE_DEEP_ROLLING_LAG_HOURS,
+      RECONCILE_DEEP_ROLLING_WINDOW_HOURS,
+    );
+    return {
+      ...rollingWindow,
+      referenceHourEnd: targetHourEnd,
+    };
   }
 
   return buildRollingWindow(targetHourEnd, 1);
@@ -759,7 +791,13 @@ async function fetchHelperRowsPage(
 }
 
 function shouldRefreshHelperWindow(): boolean {
-  return RUN_MODE === "reconcile_short" || RUN_MODE === "reconcile_deep";
+  return RUN_MODE === "reconcile_short" ||
+    RUN_MODE === "reconcile_deep" ||
+    RUN_MODE === "reconcile_deep_rolling";
+}
+
+function isDeepRunMode(): boolean {
+  return RUN_MODE === "reconcile_deep" || RUN_MODE === "reconcile_deep_rolling";
 }
 
 async function refreshHelperWindow(
@@ -837,6 +875,7 @@ async function refreshDeepHelperWindow(
         index + 1,
         chunks.length,
         rpcError,
+        RUN_MODE,
       );
     }
   }
@@ -872,6 +911,7 @@ async function main(): Promise<void> {
   let helperRefreshFailedChunkStartUtc: string | null = null;
   let helperRefreshFailedChunkEndUtc: string | null = null;
   let hourlyUpsertChunkCount = 0;
+  let hourlyUpsertRpcBatchCount = 0;
   let hourlyUpsertFailedChunkStartUtc: string | null = null;
   let hourlyUpsertFailedChunkEndUtc: string | null = null;
   let stationLinkHealth: StationLinkHealthMetrics | null = null;
@@ -882,7 +922,7 @@ async function main(): Promise<void> {
 
   try {
     if (shouldRefreshHelperWindow()) {
-      if (RUN_MODE === "reconcile_deep") {
+      if (isDeepRunMode()) {
         const deepRefresh = await refreshDeepHelperWindow(window);
         helperRefreshMetrics = deepRefresh.metrics;
         helperRefreshChunkCount = deepRefresh.chunkCount;
@@ -893,7 +933,7 @@ async function main(): Promise<void> {
     }
 
     const timeseriesIds = new Set<number>();
-    const hourlyUpsertWindows = RUN_MODE === "reconcile_deep"
+    const hourlyUpsertWindows = isDeepRunMode()
       ? buildDeepRefreshChunks(window, RECONCILE_DEEP_REFRESH_CHUNK_HOURS)
       : [window];
     hourlyUpsertChunkCount = hourlyUpsertWindows.length;
@@ -961,7 +1001,11 @@ async function main(): Promise<void> {
 
           const chunks = chunkRows(
             stationPartition.validRows,
-            RUN_MODE === "reconcile_deep"
+            RUN_MODE === "reconcile_deep_rolling"
+              ? deepRollingHourlyUpsertBatchSize(
+                RECONCILE_DEEP_ROLLING_UPSERT_BATCH_SIZE,
+              )
+              : RUN_MODE === "reconcile_deep"
               ? deepHourlyUpsertBatchSize(HOURLY_UPSERT_CHUNK_SIZE)
               : Math.max(100, HOURLY_UPSERT_CHUNK_SIZE),
           );
@@ -972,6 +1016,7 @@ async function main(): Promise<void> {
           ) {
             const chunk = chunks[batchIndex];
             const batchStartedAt = Date.now();
+            hourlyUpsertRpcBatchCount += 1;
             const upsertResult = await postgrestRpc<unknown>(
               OBS_AQIDB_SUPABASE_URL,
               OBS_AQI_PRIVILEGED_KEY,
@@ -983,7 +1028,7 @@ async function main(): Promise<void> {
               },
             );
             if (upsertResult.error) {
-              if (RUN_MODE === "reconcile_deep") {
+              if (isDeepRunMode()) {
                 const batchTimestamps = chunk.map((row) =>
                   row.timestamp_hour_utc
                 );
@@ -1039,7 +1084,7 @@ async function main(): Promise<void> {
               );
             }
             const metrics = parseHourlyUpsertMetrics(upsertResult.data);
-            if (RUN_MODE === "reconcile_deep") {
+            if (isDeepRunMode()) {
               console.log(JSON.stringify({
                 level: "info",
                 event: "aqi_reconcile_deep_hourly_upsert_rpc_batch",
@@ -1082,7 +1127,7 @@ async function main(): Promise<void> {
           helperOffset += HELPER_WINDOW_RPC_PAGE_SIZE;
         }
       } catch (error) {
-        if (RUN_MODE !== "reconcile_deep") {
+        if (!isDeepRunMode()) {
           throw error;
         }
         const rpcError = error instanceof Error ? error.message : String(error);
@@ -1108,10 +1153,11 @@ async function main(): Promise<void> {
           windowIndex + 1,
           hourlyUpsertWindows.length,
           rpcError,
+          RUN_MODE,
         );
       }
 
-      if (RUN_MODE === "reconcile_deep") {
+      if (isDeepRunMode()) {
         console.log(JSON.stringify({
           level: "info",
           event: "aqi_reconcile_deep_hourly_upsert_chunk",
@@ -1206,7 +1252,7 @@ async function main(): Promise<void> {
   }
 
   const durationMs = Date.now() - startedAt;
-  const deepReconcileEffective = RUN_MODE === "reconcile_deep";
+  const deepReconcileEffective = isDeepRunMode();
 
   const runLogResult = await postgrestRpc<unknown>(
     OBS_AQIDB_SUPABASE_URL,
@@ -1262,6 +1308,19 @@ async function main(): Promise<void> {
     trigger_mode: TRIGGER_MODE,
     window_start_utc: hourIso(window.hourEndStartExclusive),
     window_end_utc: hourIso(window.hourEndEndInclusive),
+    rolling_lag_hours: RUN_MODE === "reconcile_deep_rolling"
+      ? RECONCILE_DEEP_ROLLING_LAG_HOURS
+      : null,
+    rolling_window_hours: RUN_MODE === "reconcile_deep_rolling"
+      ? RECONCILE_DEEP_ROLLING_WINDOW_HOURS
+      : null,
+    hourly_upsert_batch_size: RUN_MODE === "reconcile_deep_rolling"
+      ? deepRollingHourlyUpsertBatchSize(
+        RECONCILE_DEEP_ROLLING_UPSERT_BATCH_SIZE,
+      )
+      : RUN_MODE === "reconcile_deep"
+      ? deepHourlyUpsertBatchSize(HOURLY_UPSERT_CHUNK_SIZE)
+      : Math.max(100, HOURLY_UPSERT_CHUNK_SIZE),
     source_rows: sourceRowsCount,
     candidate_timeseries_hours: candidateTimeseriesHours,
     rows_upserted: rowsUpserted,
@@ -1279,19 +1338,20 @@ async function main(): Promise<void> {
     helper_refresh_max_changed_lag_hours:
       helperRefreshMetrics?.max_changed_lag_hours ?? null,
     helper_refresh_chunk_count: helperRefreshChunkCount,
-    helper_refresh_chunk_hours: RUN_MODE === "reconcile_deep"
+    helper_refresh_chunk_hours: isDeepRunMode()
       ? RECONCILE_DEEP_REFRESH_CHUNK_HOURS
       : null,
-    helper_refresh_chunked: RUN_MODE === "reconcile_deep" &&
+    helper_refresh_chunked: isDeepRunMode() &&
       helperRefreshChunkCount > 1,
     helper_refresh_failed_chunk_start_utc: helperRefreshFailedChunkStartUtc,
     helper_refresh_failed_chunk_end_utc: helperRefreshFailedChunkEndUtc,
     hourly_upsert_chunk_count: hourlyUpsertChunkCount,
-    hourly_upsert_chunk_hours: RUN_MODE === "reconcile_deep"
+    hourly_upsert_rpc_batch_count: hourlyUpsertRpcBatchCount,
+    hourly_upsert_chunk_hours: isDeepRunMode()
       ? RECONCILE_DEEP_REFRESH_CHUNK_HOURS
       : null,
-    hourly_upsert_chunked: RUN_MODE === "reconcile_deep" &&
-      hourlyUpsertChunkCount > 1,
+    hourly_upsert_chunked: isDeepRunMode() &&
+      (hourlyUpsertChunkCount > 1 || hourlyUpsertRpcBatchCount > 1),
     hourly_upsert_failed_chunk_start_utc: hourlyUpsertFailedChunkStartUtc,
     hourly_upsert_failed_chunk_end_utc: hourlyUpsertFailedChunkEndUtc,
     station_link_null_rows: stationLinkHealth?.null_station_rows ?? null,
