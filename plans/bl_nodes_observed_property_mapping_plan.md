@@ -27,7 +27,7 @@ Last updated: 2026-07-01.
 | Phase 2 — Harden central phenomena RPC | Complete | Mapping-authoritative RPC, explicit administrative mapping mode, strict guards, diagnostics, docs, and transactional validation completed and applied to CIC-Test on 2026-07-01. |
 | Phase 3 — Migrate BL Nodes ingest and reconcile metadata | Complete; deploy pending | Ingest migration, tests, documentation, central set-based reconciliation, and BL0052 CIC-Test validation completed on 2026-07-01. Cloud Run image deployment remains an operational step. |
 | Phase 4 — Rebuild helper/AQI rows | Validation complete; deploy pending | Targeted helper rebuild, Cloud Run AQI backfill, ObsAQIDB/rollup checks, index exclusion, and local station snapshot v2 validation completed on 2026-07-01. Dashboard and BL Nodes ingest code deployments remain pending. |
-| Phase 5 — Migrate other ingests | Not started | Renumbered from the former Phase 6. |
+| Phase 5 — Migrate other ingests | Complete; deploy pending | Communities, OpenAQ, Sensor.Community, ERG/LAQN, and both UK-AIR SOS writers migrated; 57 existing mappings seeded and populated CIC-Test connectors smoke-tested on 2026-07-01. Service deployments remain pending. |
 | Phase 6 — Enforce and monitor | Not started | Renumbered from the former Phase 7. |
 
 The former standalone Phase 4 metadata-backfill migration has been removed. A
@@ -914,6 +914,9 @@ Required deployment steps:
 
 Goal: remove the same structural weakness from the rest of the system.
 
+Status: **Implementation and CIC-Test metadata reconciliation complete
+(2026-07-01); connector service deployments pending.**
+
 ### Priority order
 
 1. Breathe London Communities.
@@ -940,6 +943,66 @@ For each connector:
 - No active ingest directly upserts `uk_aq_core.phenomena` without going through the central RPC or a clearly documented equivalent.
 - All raw AQ pollutant series have canonical observed-property mapping.
 - Derived/index/pseudo-series are explicitly classified and excluded.
+
+### Completed implementation
+
+- Added shared fail-closed client helper
+  `scripts/uk_aq_phenomena_rpc.py`.
+- Migrated these active writers away from direct phenomena writes:
+  - Breathe London Communities shared station/ingest writer;
+  - OpenAQ psycopg metadata writer;
+  - Sensor.Community ingest writer;
+  - ERG/LAQN ingest writer;
+  - UK-AIR SOS observation/discovery writer;
+  - UK-AIR SOS station-list discovery writer.
+- Confirmed no active ingest contains a direct phenomena table upsert or direct
+  `insert into uk_aq_core.phenomena`.
+- Added a schema-repo Phase 5 policy seed that preserves verified current
+  canonical mappings and excludes legacy null-source-label rows.
+- Seeded 57 authoritative mappings:
+  - Breathe London Communities: 2;
+  - OpenAQ: 13;
+  - Sensor.Community: 5;
+  - UK-AIR SOS: 37.
+- Preserved AQ/met domain classification and limited AQI eligibility to PM2.5,
+  PM10, and NO2.
+- Reapplying the seed produced `INSERT 0 0`.
+- Ran the central RPC across all 57 stable source labels:
+  - every row returned `mapping_status = existing`;
+  - zero mapping warnings;
+  - zero unmapped phenomena or timeseries for populated non-BL-Nodes
+    connectors.
+- Ran real writer-level CIC-Test smoke calls:
+  - Communities: 2 mappings;
+  - Sensor.Community: 5 mappings;
+  - OpenAQ: 13 mappings;
+  - UK-AIR SOS ingest writer: 37 mappings;
+  - UK-AIR SOS station-list writer: 37 mappings.
+- ERG/LAQN compilation and contract validation passed. It could not receive a
+  database smoke call because no `erg_laqn` connector currently exists in
+  CIC-Test; its fixed species path uses explicit administrative registration.
+- Added shared-helper and unsafe-direct-write contract tests, connector
+  documentation, mapping-table documentation, and the required script note.
+
+Phase 5 egress impact: normal metadata runs replace separate phenomena writes
+and follow-up ID reads with one small RPC diagnostic response where possible.
+The one-time policy/reconciliation validation returned 57 rows. Observation
+endpoint response egress and the fixed one-minute website polling requirement
+are unchanged.
+
+Phase 5 database-size impact: 57 small mapping-policy rows plus indexes already
+created in Phase 1. Existing foreign-key values were reconciled in place; no
+observation, helper, AQI, or history fact rows were added.
+
+Required deployment steps after committing/pushing:
+
+- `.github/workflows/uk_aq_blondon_communities_cloud_run_deploy.yml`;
+- `.github/workflows/uk_aq_openaq_cloud_run_deploy.yml`;
+- `.github/workflows/uk_aq_uk_air_sos_cloud_run_deploy.yml`.
+
+No dedicated Sensor.Community or ERG/LAQN deploy workflow currently exists in
+the ingest repo, so their active deployment path must be identified before
+those runtime migrations can be considered deployed.
 
 ---
 
