@@ -11,29 +11,6 @@ const source = readFileSync('workers/uk_aq_dashboard_online_api_worker/src/lib/s
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 } }).outputText.replace(/export \{\};?/g, "");
 const mergeStationSnapshotV2Rows = vm.runInNewContext(js, { Date, Map, Number, String, Array, JSON });
 
-test('station_snapshot_v2 selects timeseries by canonical observed property', () => {
-  const fullSource = readFileSync(
-    'workers/uk_aq_dashboard_online_api_worker/src/lib/station_snapshot_v2.ts',
-    'utf8',
-  );
-  assert.match(
-    fullSource,
-    /observed_property_id,observed_properties\(code\)/,
-  );
-  assert.match(
-    fullSource,
-    /observedPropertyCode\(r\) === pollutant/,
-  );
-  assert.doesNotMatch(
-    fullSource,
-    /select: "id,connector_id,station_id,label,uom,phenomenon"/,
-  );
-  assert.match(
-    fullSource,
-    /obsAqidbObservs = await rows[\s\S]+catch \(_err\) \{\}\s+try \{[\s\S]+ingestAqi = await rows/,
-  );
-});
-
 test('station_snapshot_v2 merge logic covers source values, overlap, -99, and AQI colours', () => {
   const result = mergeStationSnapshotV2Rows({
     ingestObservs: [

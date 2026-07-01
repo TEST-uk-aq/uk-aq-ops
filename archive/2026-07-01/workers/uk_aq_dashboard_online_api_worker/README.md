@@ -47,15 +47,6 @@ Structured routes (JSON envelope):
 - `GET /api/status/history`
 - `GET /api/history/manifests`
 - `GET /api/history/runs`
-- `GET /api/station-snapshot-v2/search-stations`
-- `GET /api/station-snapshot-v2/rows`
-
-Station snapshot v2 selects timeseries through the canonical
-`timeseries.observed_property_id -> observed_properties.code` relationship.
-Derived/index series without a canonical observed property are excluded from
-raw pollutant selection. ObsAQIDB observation-history and AQI reads are
-independent, so an unavailable observation view does not suppress valid AQI
-rows.
 
 Envelope response shape:
 
