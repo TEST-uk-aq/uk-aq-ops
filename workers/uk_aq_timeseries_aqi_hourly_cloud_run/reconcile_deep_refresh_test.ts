@@ -122,7 +122,8 @@ Deno.test("failed hourly upsert chunk error exposes chunk metadata", () => {
   }
 });
 
-Deno.test("deep hourly upsert caps each RPC batch at 250 rows", () => {
-  assertEquals(deepHourlyUpsertBatchSize(2000), 250);
-  assertEquals(deepHourlyUpsertBatchSize(100), 100);
+Deno.test("deep hourly upsert caps each RPC batch at 50 rows", () => {
+  assertEquals(deepHourlyUpsertBatchSize(2000), 50);
+  assertEquals(deepHourlyUpsertBatchSize(100), 50);
+  assertEquals(deepHourlyUpsertBatchSize(25), 25);
 });

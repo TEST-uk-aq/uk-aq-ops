@@ -1,5 +1,5 @@
 const HOUR_MS = 60 * 60 * 1000;
-const DEEP_HOURLY_UPSERT_MAX_BATCH_SIZE = 250;
+const DEEP_HOURLY_UPSERT_MAX_BATCH_SIZE = 50;
 
 export type RefreshWindow = {
   hourEndStartExclusive: Date;

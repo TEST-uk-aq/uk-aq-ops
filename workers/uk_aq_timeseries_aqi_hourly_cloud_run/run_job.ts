@@ -965,7 +965,13 @@ async function main(): Promise<void> {
               ? deepHourlyUpsertBatchSize(HOURLY_UPSERT_CHUNK_SIZE)
               : Math.max(100, HOURLY_UPSERT_CHUNK_SIZE),
           );
-          for (const chunk of chunks) {
+          for (
+            let batchIndex = 0;
+            batchIndex < chunks.length;
+            batchIndex += 1
+          ) {
+            const chunk = chunks[batchIndex];
+            const batchStartedAt = Date.now();
             const upsertResult = await postgrestRpc<unknown>(
               OBS_AQIDB_SUPABASE_URL,
               OBS_AQI_PRIVILEGED_KEY,
@@ -977,6 +983,44 @@ async function main(): Promise<void> {
               },
             );
             if (upsertResult.error) {
+              if (RUN_MODE === "reconcile_deep") {
+                const batchTimestamps = chunk.map((row) =>
+                  row.timestamp_hour_utc
+                );
+                console.error(JSON.stringify({
+                  level: "error",
+                  event: "aqi_reconcile_deep_hourly_upsert_rpc_batch_failed",
+                  run_mode: RUN_MODE,
+                  trigger_mode: TRIGGER_MODE,
+                  chunk_index: windowIndex + 1,
+                  chunk_count: hourlyUpsertWindows.length,
+                  chunk_start_utc: hourIso(
+                    hourlyUpsertWindow.hourEndStartExclusive,
+                  ),
+                  chunk_end_utc: hourIso(
+                    hourlyUpsertWindow.hourEndEndInclusive,
+                  ),
+                  helper_page_offset: helperOffset,
+                  batch_index: batchIndex + 1,
+                  batch_count: chunks.length,
+                  batch_row_count: chunk.length,
+                  first_timestamp_hour_utc: batchTimestamps.length > 0
+                    ? batchTimestamps.reduce((first, value) =>
+                      value < first ? value : first
+                    )
+                    : null,
+                  last_timestamp_hour_utc: batchTimestamps.length > 0
+                    ? batchTimestamps.reduce((last, value) =>
+                      value > last ? value : last
+                    )
+                    : null,
+                  sample_timeseries_ids: Array.from(
+                    new Set(chunk.slice(0, 5).map((row) => row.timeseries_id)),
+                  ),
+                  rpc_error: upsertResult.error.message,
+                  duration_ms: Date.now() - batchStartedAt,
+                }));
+              }
               if (isStationForeignKeyError(upsertResult.error.message)) {
                 await logMissingStationFk(
                   "missing_station_fk_unhandled_by_preflight",
@@ -995,6 +1039,27 @@ async function main(): Promise<void> {
               );
             }
             const metrics = parseHourlyUpsertMetrics(upsertResult.data);
+            if (RUN_MODE === "reconcile_deep") {
+              console.log(JSON.stringify({
+                level: "info",
+                event: "aqi_reconcile_deep_hourly_upsert_rpc_batch",
+                run_mode: RUN_MODE,
+                trigger_mode: TRIGGER_MODE,
+                chunk_index: windowIndex + 1,
+                chunk_count: hourlyUpsertWindows.length,
+                chunk_start_utc: hourIso(
+                  hourlyUpsertWindow.hourEndStartExclusive,
+                ),
+                chunk_end_utc: hourIso(hourlyUpsertWindow.hourEndEndInclusive),
+                helper_page_offset: helperOffset,
+                batch_index: batchIndex + 1,
+                batch_count: chunks.length,
+                batch_row_count: chunk.length,
+                rows_changed: metrics.rows_changed,
+                timeseries_hours_changed: metrics.timeseries_hours_changed,
+                duration_ms: Date.now() - batchStartedAt,
+              }));
+            }
             rowsUpserted += metrics.rows_changed;
             rowsChanged += metrics.rows_changed;
             timeseriesHoursChanged += metrics.timeseries_hours_changed;
