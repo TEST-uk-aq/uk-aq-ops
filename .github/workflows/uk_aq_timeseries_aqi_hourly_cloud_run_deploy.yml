@@ -41,15 +41,19 @@ jobs:
       SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
       SCHEDULER_JOB_NAME: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_JOB_NAME || 'uk-aq-timeseries-aqi-hourly-trigger' }}
       SCHEDULER_CRON: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_CRON || '20 * * * *' }}
+      SYNC_HOURLY_SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_ATTEMPT_DEADLINE || '' }}
       RECONCILE_SHORT_SCHEDULER_ENABLED: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_SHORT_SCHEDULER_ENABLED || 'false' }}
       RECONCILE_SHORT_SCHEDULER_JOB_NAME: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_SHORT_JOB_NAME || 'uk-aq-timeseries-aqi-reconcile-short-trigger' }}
       RECONCILE_SHORT_SCHEDULER_CRON: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_SHORT_CRON || '35 * * * *' }}
+      RECONCILE_SHORT_SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_SHORT_ATTEMPT_DEADLINE || '' }}
       RECONCILE_DEEP_SCHEDULER_ENABLED: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_SCHEDULER_ENABLED || 'false' }}
       RECONCILE_DEEP_SCHEDULER_JOB_NAME: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_JOB_NAME || 'uk-aq-timeseries-aqi-reconcile-deep-trigger' }}
       RECONCILE_DEEP_SCHEDULER_CRON: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_CRON || '50 */6 * * *' }}
+      RECONCILE_DEEP_SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ATTEMPT_DEADLINE || '' }}
       RECONCILE_DEEP_ROLLING_SCHEDULER_ENABLED: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ROLLING_SCHEDULER_ENABLED || 'true' }}
       RECONCILE_DEEP_ROLLING_SCHEDULER_JOB_NAME: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ROLLING_JOB_NAME || 'uk-aq-timeseries-aqi-reconcile-deep-rolling-trigger' }}
       RECONCILE_DEEP_ROLLING_SCHEDULER_CRON: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ROLLING_CRON || '50 * * * *' }}
+      RECONCILE_DEEP_ROLLING_SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ROLLING_ATTEMPT_DEADLINE || '600s' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
@@ -378,6 +382,11 @@ jobs:
             local job_name="$1"
             local cron="$2"
             local body="$3"
+            local attempt_deadline="${4:-}"
+            local deadline_args=()
+            if [ -n "${attempt_deadline}" ]; then
+              deadline_args=(--attempt-deadline "${attempt_deadline}")
+            fi
 
             if gcloud scheduler jobs describe "${job_name}" --location "${REGION}" >/dev/null 2>&1; then
               gcloud scheduler jobs update http "${job_name}" \
@@ -390,6 +399,7 @@ jobs:
                 --message-body "${body}" \
                 --oidc-service-account-email "${scheduler_sa}" \
                 --oidc-token-audience "${service_uri}" \
+                "${deadline_args[@]}" \
                 --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
               echo "Updated Cloud Scheduler job: ${job_name}"
             else
@@ -403,6 +413,7 @@ jobs:
                 --message-body "${body}" \
                 --oidc-service-account-email "${scheduler_sa}" \
                 --oidc-token-audience "${service_uri}" \
+                "${deadline_args[@]}" \
                 --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
               echo "Created Cloud Scheduler job: ${job_name}"
             fi
@@ -413,18 +424,19 @@ jobs:
             local job_name="$2"
             local cron="$3"
             local body="$4"
+            local attempt_deadline="${5:-}"
 
             if is_truthy "${enabled_flag}"; then
-              ensure_job "${job_name}" "${cron}" "${body}"
+              ensure_job "${job_name}" "${cron}" "${body}" "${attempt_deadline}"
             else
               maybe_pause "${job_name}"
             fi
           }
 
-          ensure_job "${SCHEDULER_JOB_NAME}" "${SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"sync_hourly"}'
-          ensure_or_pause_job "${RECONCILE_SHORT_SCHEDULER_ENABLED}" "${RECONCILE_SHORT_SCHEDULER_JOB_NAME}" "${RECONCILE_SHORT_SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_short"}'
+          ensure_job "${SCHEDULER_JOB_NAME}" "${SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"sync_hourly"}' "${SYNC_HOURLY_SCHEDULER_ATTEMPT_DEADLINE}"
+          ensure_or_pause_job "${RECONCILE_SHORT_SCHEDULER_ENABLED}" "${RECONCILE_SHORT_SCHEDULER_JOB_NAME}" "${RECONCILE_SHORT_SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_short"}' "${RECONCILE_SHORT_SCHEDULER_ATTEMPT_DEADLINE}"
           maybe_pause "${RECONCILE_DEEP_SCHEDULER_JOB_NAME}"
-          ensure_or_pause_job "${RECONCILE_DEEP_ROLLING_SCHEDULER_ENABLED}" "${RECONCILE_DEEP_ROLLING_SCHEDULER_JOB_NAME}" "${RECONCILE_DEEP_ROLLING_SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_deep_rolling"}'
+          ensure_or_pause_job "${RECONCILE_DEEP_ROLLING_SCHEDULER_ENABLED}" "${RECONCILE_DEEP_ROLLING_SCHEDULER_JOB_NAME}" "${RECONCILE_DEEP_ROLLING_SCHEDULER_CRON}" '{"trigger_mode":"scheduler","run_mode":"reconcile_deep_rolling"}' "${RECONCILE_DEEP_ROLLING_SCHEDULER_ATTEMPT_DEADLINE}"
 
       - name: Show deployed service
         run: |

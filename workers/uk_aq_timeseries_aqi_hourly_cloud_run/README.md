@@ -71,6 +71,25 @@ Helper rows carry the normalized DAQI/EAQI inputs, counts, statuses, and index l
 - `UK_AQ_AQI_RPC_RETRIES` (default `3`)
 - `UK_AQ_AQI_HOURLY_UPSERT_CHUNK_SIZE` (default `2000`)
 
+## Scheduler Attempt Deadlines
+
+The deploy workflow manages attempt deadlines independently for each Scheduler
+trigger. A blank or omitted GitHub variable means the workflow omits
+`--attempt-deadline`, leaving GCP's default behavior unchanged.
+
+- `GCP_TIMESERIES_AQI_HOURLY_ATTEMPT_DEADLINE`: blank by default; leave blank
+  or use `180s` if hourly sync needs an explicit deadline.
+- `GCP_TIMESERIES_AQI_HOURLY_RECONCILE_SHORT_ATTEMPT_DEADLINE`: blank by
+  default; leave blank or use `300s` if needed.
+- `GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ROLLING_ATTEMPT_DEADLINE`:
+  defaults to `600s`.
+- `GCP_TIMESERIES_AQI_HOURLY_RECONCILE_DEEP_ATTEMPT_DEADLINE`: blank by
+  default. Keep the legacy deep trigger paused; if it is managed manually,
+  use caution and consider `900s`.
+
+These Scheduler settings do not change the Cloud Run service timeout, retry
+settings, trigger schedules, payloads, or OIDC authentication.
+
 ## Reconciliation Behavior
 
 - `sync_hourly` keeps the existing read-only helper-window flow
