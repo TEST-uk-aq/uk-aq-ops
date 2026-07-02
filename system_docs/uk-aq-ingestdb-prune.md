@@ -114,7 +114,9 @@ When `INGESTDB_PRUNE_DRY_RUN=false`, the flow is:
 - flush outbox in-process (same RPC chain as dry-run pilot)
 
 3. Recheck phase:
-- re-run compare for the original mismatch buckets
+- group the original mismatch buckets by UTC hour
+- re-run the fingerprint compare sequentially for each distinct repaired hour, rather than
+  re-hashing the full 24-hour batch window
 - delete buckets that are now verified
 - log buckets that still mismatch after repair
 

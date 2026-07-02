@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "workers/uk_aq_prune_daily/server.mjs"
+      - "workers/uk_aq_prune_daily/fingerprint_recheck.mjs"
       - "workers/uk_aq_prune_daily/phase_b_history_r2.mjs"
       - "workers/shared/r2_sigv4.mjs"
       - "workers/shared/uk_aq_r2_history_index.mjs"

@@ -6,6 +6,7 @@ import {
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
 } from "./phase_b_history_r2.mjs";
+import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
 import { rebuildR2HistoryIndexes } from "../shared/uk_aq_r2_history_index.mjs";
 
@@ -1109,49 +1110,89 @@ async function recheckSingleBucket(ingestClient, observsClient, mismatch) {
 async function recheckMismatchBuckets(
   ingestClient,
   observsClient,
-  windowStart,
-  windowEnd,
   initialMismatches,
 ) {
-  const [ingestRows, observsRows] = await Promise.all([
-    fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest_recheck"),
-    fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs_recheck"),
-  ]);
-
-  const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
-  const observsMap = new Map(observsRows.map((row) => [row.key, row]));
   const nowDeletableBuckets = [];
   const stillMismatched = [];
+  const recheckGroups = groupFingerprintRechecksByHour(initialMismatches);
 
-  for (const mismatch of initialMismatches) {
-    const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
-    const ingestBucket = ingestMap.get(key);
-    const observsBucket = observsMap.get(key);
-    const nextMismatch = determineBucketMismatch(ingestBucket, observsBucket);
+  logStructured("INFO", "fingerprint_recheck_plan", {
+    mismatch_bucket_count: initialMismatches.length,
+    hour_window_count: recheckGroups.length,
+    windows_preview: sampleRows(recheckGroups.map((group) => ({
+      window_start: group.window_start,
+      window_end: group.window_end,
+      mismatch_bucket_count: group.mismatches.length,
+    }))),
+  });
 
-    if (nextMismatch) {
-      stillMismatched.push(nextMismatch);
-      continue;
+  for (const group of recheckGroups) {
+    const startedAt = Date.now();
+    let ingestRows;
+    let observsRows;
+    try {
+      [ingestRows, observsRows] = await Promise.all([
+        fetchHourlyFingerprints(
+          ingestClient,
+          group.window_start,
+          group.window_end,
+          "ingest_recheck",
+        ),
+        fetchHourlyFingerprints(
+          observsClient,
+          group.window_start,
+          group.window_end,
+          "observs_recheck",
+        ),
+      ]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Fingerprint recheck failed for ${group.window_start} to ${group.window_end}: ${message}`,
+        { cause: error },
+      );
     }
-
-    if (!ingestBucket || !observsBucket) {
-      stillMismatched.push({
-        connector_id: mismatch.connector_id,
-        hour_start: mismatch.hour_start,
-        reason: "missing_in_both_or_unknown_after_repair",
-        ingest_count: ingestBucket ? ingestBucket.observation_count.toString() : null,
-        observs_count: observsBucket ? observsBucket.observation_count.toString() : null,
-      });
-      continue;
-    }
-
-    nowDeletableBuckets.push({
-      connector_id: ingestBucket.connector_id,
-      hour_start: ingestBucket.hour_start,
-      observation_count: ingestBucket.observation_count,
-      min_observed_at: ingestBucket.min_observed_at,
-      max_observed_at: ingestBucket.max_observed_at,
+    logStructured("INFO", "fingerprint_recheck_hour_complete", {
+      window_start: group.window_start,
+      window_end: group.window_end,
+      mismatch_bucket_count: group.mismatches.length,
+      ingest_bucket_count: ingestRows.length,
+      observs_bucket_count: observsRows.length,
+      duration_ms: Date.now() - startedAt,
     });
+    const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
+    const observsMap = new Map(observsRows.map((row) => [row.key, row]));
+
+    for (const mismatch of group.mismatches) {
+      const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
+      const ingestBucket = ingestMap.get(key);
+      const observsBucket = observsMap.get(key);
+      const nextMismatch = determineBucketMismatch(ingestBucket, observsBucket);
+
+      if (nextMismatch) {
+        stillMismatched.push(nextMismatch);
+        continue;
+      }
+
+      if (!ingestBucket || !observsBucket) {
+        stillMismatched.push({
+          connector_id: mismatch.connector_id,
+          hour_start: mismatch.hour_start,
+          reason: "missing_in_both_or_unknown_after_repair",
+          ingest_count: ingestBucket ? ingestBucket.observation_count.toString() : null,
+          observs_count: observsBucket ? observsBucket.observation_count.toString() : null,
+        });
+        continue;
+      }
+
+      nowDeletableBuckets.push({
+        connector_id: ingestBucket.connector_id,
+        hour_start: ingestBucket.hour_start,
+        observation_count: ingestBucket.observation_count,
+        min_observed_at: ingestBucket.min_observed_at,
+        max_observed_at: ingestBucket.max_observed_at,
+      });
+    }
   }
 
   return {
@@ -1673,8 +1714,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     const recheckResult = await recheckMismatchBuckets(
       ingestClient,
       observsClient,
-      windowStart,
-      windowEnd,
       mismatches,
     );
     repairedNowDeletableBuckets = recheckResult.nowDeletableBuckets;
