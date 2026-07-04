@@ -1,4 +1,4 @@
-name: Deploy Supabase DB Dump Backup Cloud Run Service and Job
+name: Deploy Supabase DB Dump Backup Cloud Run Service
 
 on:
   push:
@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: uk-aq-supabase-db-dump-backup-deploy
+  group: uk-aq-supabase-db-dump-backup-service-deploy
   cancel-in-progress: false
 
 jobs:
-  deploy-supabase-db-dump-backup:
+  deploy-supabase-db-dump-backup-service:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,9 +26,7 @@ jobs:
       REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
       REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
       SERVICE_NAME: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_NAME || 'uk-aq-supabase-db-dump-backup-service' }}
-      JOB_NAME: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_NAME || 'uk-aq-supabase-db-dump-backup-job' }}
-      SERVICE_RESOURCE_LABEL: uk-aq-supabase-db-dump-backup-service
-      JOB_RESOURCE_LABEL: uk-aq-supabase-db-dump-backup-job
+      RESOURCE_LABEL: uk-aq-supabase-db-dump-backup-service
       DB_DUMP_BACKUP_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_ACCOUNT || '' }}
       SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_TIMEOUT_SECONDS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_TIMEOUT_SECONDS || '1800' }}
       SERVICE_CPU: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_CPU || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_CPU || '1' }}
@@ -37,16 +35,13 @@ jobs:
       SERVICE_MAX_INSTANCES: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MAX_INSTANCES || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MAX_INSTANCES || '1' }}
       SERVICE_MIN_INSTANCES: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MIN_INSTANCES || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_MIN_INSTANCES || '0' }}
       SERVICE_INGRESS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_INGRESS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SERVICE_INGRESS || 'internal' }}
-      JOB_TASK_TIMEOUT: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_TASK_TIMEOUT || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_TASK_TIMEOUT || '1800s' }}
-      JOB_MAX_RETRIES: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_MAX_RETRIES || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_MAX_RETRIES || '0' }}
-      JOB_SCHEDULER_ENABLED: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_ENABLED || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_ENABLED || 'true' }}
-      JOB_SCHEDULER_NAME_OVERRIDE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_NAME || '' }}
-      JOB_SCHEDULER_CRON: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_CRON || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_CRON || '55 0 * * *' }}
-      JOB_SCHEDULER_TIMEZONE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_TIMEZONE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_TIMEZONE || 'UTC' }}
-      JOB_SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_ATTEMPT_DEADLINE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_ATTEMPT_DEADLINE || '60s' }}
-      JOB_SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_JOB_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ENABLED || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ENABLED || 'true' }}
+      SCHEDULER_JOB_NAME_OVERRIDE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_JOB_NAME || '' }}
+      SCHEDULER_CRON: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_CRON || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_CRON || '55 0 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_TIMEZONE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_TIMEZONE || 'UTC' }}
+      SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ATTEMPT_DEADLINE || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_ATTEMPT_DEADLINE || '1800s' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_MAX_RETRY_ATTEMPTS || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
       SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_SERVICE_ACCOUNT || vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_SCHEDULER_SERVICE_ACCOUNT || '' }}
-      OLD_SERVICE_SCHEDULER_JOB_NAME: uk-aq-supabase-db-dump-backup-trigger
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
       UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR: ${{ vars.UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR || 'Supabase_Backup_db_dump' }}
       UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS: ${{ vars.UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS || '7' }}
@@ -122,13 +117,14 @@ jobs:
             exit 1
           fi
 
-          scheduler_job_name="${JOB_SCHEDULER_NAME_OVERRIDE:-}"
+          scheduler_job_name="${SCHEDULER_JOB_NAME_OVERRIDE:-}"
           if [ -z "${scheduler_job_name}" ]; then
-            scheduler_job_name="${JOB_NAME}-trigger"
-          fi
-          if [ "${scheduler_job_name}" = "${OLD_SERVICE_SCHEDULER_JOB_NAME}" ]; then
-            echo "Refusing to reuse the paused service Scheduler trigger: ${scheduler_job_name}"
-            exit 1
+            scheduler_job_name="${SERVICE_NAME}"
+            if [[ "${scheduler_job_name}" == *-service ]]; then
+              scheduler_job_name="${scheduler_job_name%-service}-trigger"
+            else
+              scheduler_job_name="${scheduler_job_name}-trigger"
+            fi
           fi
 
           printf 'runtime_sa=%s\n' "${runtime_sa}" >> "${GITHUB_OUTPUT}"
@@ -185,7 +181,7 @@ jobs:
           set -euo pipefail
           gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
-      - name: Build and push backup image
+      - name: Build and push backup service image
         id: build
         run: |
           set -euo pipefail
@@ -347,7 +343,7 @@ jobs:
             --min-instances "${SERVICE_MIN_INSTANCES}"
             --no-cpu-boost
             --cpu-throttling
-            --labels "job_name=${SERVICE_RESOURCE_LABEL}"
+            --labels "job_name=${RESOURCE_LABEL}"
             --no-allow-unauthenticated
           )
           if [ -n "${ENV_FILE}" ]; then
@@ -365,111 +361,36 @@ jobs:
           job_name_label="$(
             python3 -c 'import json,sys; print(((json.loads(sys.stdin.read()) or {}).get("metadata", {}) or {}).get("labels", {}).get("job_name", ""))' <<<"${labels_json}"
           )"
-          if [ "${job_name_label}" != "${SERVICE_RESOURCE_LABEL}" ]; then
-            echo "job_name label mismatch: expected ${SERVICE_RESOURCE_LABEL}, got ${job_name_label:-<missing>}"
+          if [ "${job_name_label}" != "${RESOURCE_LABEL}" ]; then
+            echo "job_name label mismatch: expected ${RESOURCE_LABEL}, got ${job_name_label:-<missing>}"
             exit 1
           fi
           echo "Verified label job_name=${job_name_label}"
 
-      - name: Deploy Cloud Run Job
-        run: |
-          set -euo pipefail
-          ENV_FILE='${{ steps.cloudrun_args.outputs.env_file }}'
-          SECRET_CSV='${{ steps.cloudrun_args.outputs.secret_csv }}'
-
-          CMD=(
-            gcloud run jobs deploy "${JOB_NAME}"
-            --region "${REGION}"
-            --image "${{ steps.build.outputs.image }}"
-            --service-account "${{ steps.service_accounts.outputs.runtime_sa }}"
-            --command "node"
-            --args "workers/uk_aq_supabase_db_dump_backup_service/job.mjs"
-            --tasks "1"
-            --parallelism "1"
-            --task-timeout "${JOB_TASK_TIMEOUT}"
-            --max-retries "${JOB_MAX_RETRIES}"
-            --cpu "${SERVICE_CPU}"
-            --memory "${SERVICE_MEMORY}"
-            --labels "job_name=${JOB_RESOURCE_LABEL}"
-          )
-          if [ -n "${ENV_FILE}" ]; then
-            CMD+=(--env-vars-file "${ENV_FILE}")
-          fi
-          if [ -n "${SECRET_CSV}" ]; then
-            CMD+=(--set-secrets "${SECRET_CSV}")
-          fi
-          "${CMD[@]}"
-
-      - name: Verify Cloud Run Job configuration
-        run: |
-          set -euo pipefail
-          job_json="$(
-            gcloud run jobs describe "${JOB_NAME}" \
-              --region "${REGION}" \
-              --format=json
-          )"
-          JOB_JSON="${job_json}" python3 - <<'PY'
-          import json
-          import os
-
-          job = json.loads(os.environ["JOB_JSON"])
-          labels = (job.get("metadata") or {}).get("labels") or {}
-          template = ((job.get("spec") or {}).get("template") or {}).get("spec") or {}
-          task = (template.get("template") or {}).get("spec") or {}
-          expected_label = os.environ["JOB_RESOURCE_LABEL"]
-          expected_retries = int(os.environ["JOB_MAX_RETRIES"])
-
-          assert labels.get("job_name") == expected_label, labels
-          assert template.get("taskCount") == 1, template
-          assert template.get("parallelism") == 1, template
-          assert task.get("maxRetries") == expected_retries, task
-          print("Verified one-task Cloud Run Job with explicit retry policy.")
-          PY
-
-      - name: Verify old service Scheduler trigger remains paused
-        run: |
-          set -euo pipefail
-          if ! gcloud scheduler jobs describe "${OLD_SERVICE_SCHEDULER_JOB_NAME}" \
-            --location "${REGION}" >/dev/null 2>&1; then
-            echo "Old service Scheduler trigger is absent; nothing to protect."
-            exit 0
-          fi
-
-          old_state="$(
-            gcloud scheduler jobs describe "${OLD_SERVICE_SCHEDULER_JOB_NAME}" \
-              --location "${REGION}" \
-              --format='value(state)'
-          )"
-          if [ "${old_state}" != "PAUSED" ]; then
-            echo "Old service Scheduler trigger must remain PAUSED, got ${old_state:-<missing>}."
-            echo "Refusing to create a second active DB backup schedule."
-            exit 1
-          fi
-          echo "Verified old service Scheduler trigger remains paused."
-
-      - name: Ensure Cloud Run Job Scheduler trigger exists
+      - name: Ensure Cloud Scheduler trigger exists
         run: |
           set -euo pipefail
 
-          enabled="$(printf '%s' "${JOB_SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          enabled="$(printf '%s' "${SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           scheduler_sa='${{ steps.service_accounts.outputs.scheduler_sa }}'
           scheduler_job_name='${{ steps.service_accounts.outputs.scheduler_job_name }}'
 
           if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
             if gcloud scheduler jobs describe "${scheduler_job_name}" --location "${REGION}" >/dev/null 2>&1; then
               gcloud scheduler jobs pause "${scheduler_job_name}" --location "${REGION}" || true
-              echo "Paused existing Job scheduler ${scheduler_job_name} (JOB_SCHEDULER_ENABLED=${JOB_SCHEDULER_ENABLED})."
+              echo "Paused existing scheduler job ${scheduler_job_name} (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
             else
-              echo "Job scheduler ${scheduler_job_name} not found; nothing to pause."
+              echo "Scheduler job ${scheduler_job_name} not found; nothing to pause."
             fi
             exit 0
           fi
 
-          run_uri="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/jobs/${JOB_NAME}:run"
+          service_uri="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+          scheduler_body='{"trigger_mode":"scheduler"}'
           project_number="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
           scheduler_agent="service-${project_number}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
 
-          gcloud run jobs add-iam-policy-binding "${JOB_NAME}" \
+          gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
             --region "${REGION}" \
             --member "serviceAccount:${scheduler_sa}" \
             --role "roles/run.invoker" >/dev/null
@@ -482,42 +403,35 @@ jobs:
           if gcloud scheduler jobs describe "${scheduler_job_name}" --location "${REGION}" >/dev/null 2>&1; then
             gcloud scheduler jobs update http "${scheduler_job_name}" \
               --location "${REGION}" \
-              --schedule "${JOB_SCHEDULER_CRON}" \
-              --time-zone "${JOB_SCHEDULER_TIMEZONE}" \
-              --uri "${run_uri}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${service_uri}/run-backup" \
               --http-method POST \
               --update-headers "Content-Type=application/json" \
-              --message-body "{}" \
-              --oauth-service-account-email "${scheduler_sa}" \
-              --oauth-token-scope "https://www.googleapis.com/auth/cloud-platform" \
-              --attempt-deadline "${JOB_SCHEDULER_ATTEMPT_DEADLINE}" \
-              --max-retry-attempts "${JOB_SCHEDULER_MAX_RETRY_ATTEMPTS}"
-            gcloud scheduler jobs resume "${scheduler_job_name}" --location "${REGION}" >/dev/null
-            echo "Updated and resumed Cloud Run Job scheduler: ${scheduler_job_name}"
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+            echo "Updated Cloud Scheduler job: ${scheduler_job_name}"
           else
             gcloud scheduler jobs create http "${scheduler_job_name}" \
               --location "${REGION}" \
-              --schedule "${JOB_SCHEDULER_CRON}" \
-              --time-zone "${JOB_SCHEDULER_TIMEZONE}" \
-              --uri "${run_uri}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${service_uri}/run-backup" \
               --http-method POST \
               --headers "Content-Type=application/json" \
-              --message-body "{}" \
-              --oauth-service-account-email "${scheduler_sa}" \
-              --oauth-token-scope "https://www.googleapis.com/auth/cloud-platform" \
-              --attempt-deadline "${JOB_SCHEDULER_ATTEMPT_DEADLINE}" \
-              --max-retry-attempts "${JOB_SCHEDULER_MAX_RETRY_ATTEMPTS}"
-            echo "Created Cloud Run Job scheduler: ${scheduler_job_name}"
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
+            echo "Created Cloud Scheduler job: ${scheduler_job_name}"
           fi
 
-      - name: Show deployed service, Job, and Scheduler
+      - name: Show deployed service
         run: |
           gcloud run services describe "${SERVICE_NAME}" \
             --region "${REGION}" \
             --format="yaml(metadata.name,metadata.labels,spec.template.spec.serviceAccountName,spec.template.spec.containerConcurrency,spec.template.spec.containers[0].image,spec.template.spec.containers[0].resources,status.url)"
-          gcloud run jobs describe "${JOB_NAME}" \
-            --region "${REGION}" \
-            --format="yaml(metadata.name,metadata.labels,spec.template.spec.taskCount,spec.template.spec.parallelism,spec.template.spec.template.spec.serviceAccountName,spec.template.spec.template.spec.timeoutSeconds,spec.template.spec.template.spec.maxRetries,spec.template.spec.template.spec.containers[0].image,spec.template.spec.template.spec.containers[0].resources)"
-          gcloud scheduler jobs describe '${{ steps.service_accounts.outputs.scheduler_job_name }}' \
-            --location "${REGION}" \
-            --format="yaml(name,state,schedule,timeZone,httpTarget.uri,httpTarget.oauthToken)"
