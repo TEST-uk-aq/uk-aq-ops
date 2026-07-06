@@ -10,6 +10,7 @@ import {
   buildHistoryV2PollutantManifestKey,
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
+  shouldResetManifestlessV2ResumeForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 const DAY = "2026-06-14";
@@ -26,6 +27,22 @@ test("Phase B observations include source-provided DAQI index properties by defa
     resolved.observations_pollutant_codes,
     ["pm25", "pm10", "no2", "pm25index", "pm10index", "no2index"],
   );
+});
+
+test("Phase B resets a stale v2 checkpoint when cleanup already removed all partial objects", () => {
+  assert.equal(shouldResetManifestlessV2ResumeForTest({
+    connectorManifestExists: false,
+    existingEntryCount: 0,
+    resumePartIndex: 2,
+    resumeParts: [{ key: "missing-part.parquet" }],
+  }), true);
+
+  assert.equal(shouldResetManifestlessV2ResumeForTest({
+    connectorManifestExists: false,
+    existingEntryCount: 0,
+    resumePartIndex: 0,
+    resumeParts: [],
+  }), false);
 });
 
 test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () => {

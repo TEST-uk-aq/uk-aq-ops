@@ -2560,6 +2560,19 @@ async function cleanupCandidatePartialOutput({ runtime, dayUtc, connectorId }) {
   return { scanned_count: entries.length, deleted_count: deletedCount, error_count: errorCount };
 }
 
+export function shouldResetManifestlessV2ResumeForTest({
+  connectorManifestExists,
+  existingEntryCount,
+  resumePartIndex,
+  resumeParts,
+}) {
+  return !connectorManifestExists && (
+    Number(existingEntryCount || 0) > 0 ||
+    Number(resumePartIndex || 0) > 0 ||
+    (Array.isArray(resumeParts) && resumeParts.length > 0)
+  );
+}
+
 async function exportCandidateToR2({ candidate, runtime }) {
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
@@ -2616,14 +2629,21 @@ async function exportCandidateToR2({ candidate, runtime }) {
         prefix: `${connectorPrefix(runtime.committed_prefix, dayUtc, connectorId)}/`,
         max_keys: 1000,
       });
-      if (existingEntries.length > 0) {
+      if (shouldResetManifestlessV2ResumeForTest({
+        connectorManifestExists: connectorManifestHead.exists,
+        existingEntryCount: existingEntries.length,
+        resumePartIndex: partIndex,
+        resumeParts: committedParts,
+      })) {
         logPhaseB(runtime, "WARNING", "phase_b_history_candidate_skipped", {
           day_utc: dayUtc,
           connector_id: connectorId,
           prefix: connectorPrefix(runtime.committed_prefix, dayUtc, connectorId),
           reason: "manifestless_partial_final_prefix_cleanup_before_retry",
         });
-        await cleanupCandidatePartialOutput({ runtime, dayUtc, connectorId });
+        if (existingEntries.length > 0) {
+          await cleanupCandidatePartialOutput({ runtime, dayUtc, connectorId });
+        }
         committedParts = [];
         observedRows = 0n;
         totalBytes = 0n;
