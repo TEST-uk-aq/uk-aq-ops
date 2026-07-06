@@ -8,6 +8,7 @@ import {
   buildHistoryV2PartKey,
   buildHistoryV2PollutantManifestForTest,
   buildHistoryV2PollutantManifestKey,
+  resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
@@ -17,6 +18,15 @@ const RUN_ID = "test-run";
 function runManifestKey(prefix, runId = RUN_ID) {
   return `${prefix}/run_id=${runId}/run_manifest.json`;
 }
+
+test("Phase B observations include source-provided DAQI index properties by default", () => {
+  const resolved = resolvePhaseBRuntimeConfig({});
+
+  assert.deepEqual(
+    resolved.observations_pollutant_codes,
+    ["pm25", "pm10", "no2", "pm25index", "pm10index", "no2index"],
+  );
+});
 
 test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () => {
   const resolved = resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v2" });
