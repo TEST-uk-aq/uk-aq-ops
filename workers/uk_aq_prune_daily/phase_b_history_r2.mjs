@@ -4260,7 +4260,10 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     2_000_000,
   );
 
-  const rawPollutantCodes = String(env.UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES || "pm25,pm10,no2").trim();
+  const rawPollutantCodes = String(
+    env.UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES ||
+      "pm25,pm10,no2,pm25index,pm10index,no2index",
+  ).trim();
   const allowedPollutantCodes = rawPollutantCodes.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
 
   return {
