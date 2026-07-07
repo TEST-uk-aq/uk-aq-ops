@@ -3277,27 +3277,37 @@ function buildPruneComparisonBasePath({ runtime, dayUtc, connectorId }) {
   return joinDropboxPath(runtime.dropbox?.root || "", suffix);
 }
 
-async function exportPruneComparisonToDropbox({
-  candidate,
-  runtime,
-  adoptedManifestKey,
-  adoptedManifest,
-  logStructured,
-}) {
-  const dayUtc = candidate.day_utc;
-  const connectorId = candidate.connector_id;
-  const dayStart = `${dayUtc}T00:00:00.000Z`;
-  const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
-  const comparisonRoot = buildPruneComparisonBasePath({ runtime, dayUtc, connectorId });
+function buildPruneComparisonRowsQuery({ runtime, connectorId, dayStart, dayEnd }) {
+  if (runtime.history_write_version === "v2") {
+    const pollutantCodes = observationPollutantCodesForSql(runtime);
+    if (pollutantCodes.length === 0) {
+      throw new Error("Phase B v2 prune Dropbox comparison requires at least one eligible pollutant code.");
+    }
+    return {
+      sql: `
+select
+  connector_id,
+  timeseries_id,
+  observed_at_utc as observed_at,
+  value
+from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
+  $1::integer,
+  $2::timestamptz,
+  $3::timestamptz,
+  $4::integer,
+  $5::timestamptz
+)
+where lower(pollutant_code) = any($6::text[])
+`,
+      params: [connectorId, dayStart, dayEnd, null, null, pollutantCodes],
+      comparison_filter_mode: "v2_observations_pollutant_allow_list",
+      comparison_pollutant_codes: pollutantCodes,
+      comparison_scope: "history_eligible_observations",
+    };
+  }
 
-  const accessToken = await dropboxRefreshAccessToken(runtime.dropbox);
-  const committedParts = [];
-  let observedRows = 0n;
-  let totalBytes = 0n;
-  let partIndex = 0;
-
-  await withPgClient(runtime.supabase_db_url, async (streamClient) => {
-    const sql = `
+  return {
+    sql: `
 select
   connector_id,
   timeseries_id,
@@ -3310,10 +3320,50 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
   $4::integer,
   $5::timestamptz
 )
-`;
+`,
+    params: [connectorId, dayStart, dayEnd, null, null],
+    comparison_filter_mode: "v1_all_observations",
+    comparison_pollutant_codes: [],
+    comparison_scope: "all_observations",
+  };
+}
 
+export function buildPruneComparisonRowsQueryForTest(args) {
+  return buildPruneComparisonRowsQuery(args);
+}
+
+async function exportPruneComparisonToDropbox({
+  candidate,
+  runtime,
+  adoptedManifestKey,
+  adoptedManifest,
+  logStructured,
+}) {
+  const dayUtc = candidate.day_utc;
+  const connectorId = candidate.connector_id;
+  const dayStart = `${dayUtc}T00:00:00.000Z`;
+  const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
+  const comparisonRoot = buildPruneComparisonBasePath({ runtime, dayUtc, connectorId });
+  const comparisonQuery = buildPruneComparisonRowsQuery({ runtime, connectorId, dayStart, dayEnd });
+
+  logStructured("INFO", "phase_b_history_prune_check_dropbox_filter", {
+    run_id: runtime.run_id,
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    comparison_filter_mode: comparisonQuery.comparison_filter_mode,
+    comparison_scope: comparisonQuery.comparison_scope,
+    comparison_pollutant_codes: comparisonQuery.comparison_pollutant_codes,
+  });
+
+  const accessToken = await dropboxRefreshAccessToken(runtime.dropbox);
+  const committedParts = [];
+  let observedRows = 0n;
+  let totalBytes = 0n;
+  let partIndex = 0;
+
+  await withPgClient(runtime.supabase_db_url, async (streamClient) => {
     const cursor = streamClient.query(
-      new Cursor(sql, [connectorId, dayStart, dayEnd, null, null]),
+      new Cursor(comparisonQuery.sql, comparisonQuery.params),
     );
     let pendingRows = [];
 
@@ -3414,6 +3464,9 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
     adopted_r2_total_bytes: adoptedBytes.toString(),
     prune_total_bytes: totalBytes.toString(),
     comparison_output_root: comparisonRoot,
+    comparison_filter_mode: comparisonQuery.comparison_filter_mode,
+    comparison_scope: comparisonQuery.comparison_scope,
+    comparison_pollutant_codes: comparisonQuery.comparison_pollutant_codes,
     notes: "comparison only; committed R2 was not overwritten",
   };
 
@@ -3444,6 +3497,9 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
     prune_source_row_count: observedRows.toString(),
     adopted_source_row_count: adoptedRows.toString(),
     row_count_delta: rowCountDelta.toString(),
+    comparison_filter_mode: comparisonQuery.comparison_filter_mode,
+    comparison_scope: comparisonQuery.comparison_scope,
+    comparison_pollutant_codes: comparisonQuery.comparison_pollutant_codes,
   });
 
   return {

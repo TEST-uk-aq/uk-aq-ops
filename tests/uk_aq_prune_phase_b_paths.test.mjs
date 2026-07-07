@@ -8,6 +8,7 @@ import {
   buildHistoryV2PartKey,
   buildHistoryV2PollutantManifestForTest,
   buildHistoryV2PollutantManifestKey,
+  buildPruneComparisonRowsQueryForTest,
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
   shouldResetManifestlessV2ResumeForTest,
@@ -60,6 +61,32 @@ test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () =
     buildConnectorManifestKey(resolved.aqilevels_prefix, DAY, 7),
     "history/v2/aqilevels/hourly/data/day_utc=2026-06-14/connector_id=7/manifest.json",
   );
+});
+
+test("Phase B v2 Dropbox prune comparison uses the same observations pollutant allow-list", () => {
+  const query = buildPruneComparisonRowsQueryForTest({
+    runtime: {
+      history_write_version: "v2",
+      observations_pollutant_codes: ["PM10", "pm25", "NO2", "pm25index", "pm10index", "no2index", "pm10", ""],
+    },
+    connectorId: 2,
+    dayStart: "2026-07-02T00:00:00.000Z",
+    dayEnd: "2026-07-03T00:00:00.000Z",
+  });
+
+  assert.match(query.sql, /uk_aq_phase_b_history_rows_v2/);
+  assert.doesNotMatch(query.sql, /uk_aq_phase_b_history_rows\(/);
+  assert.match(query.sql, /lower\(pollutant_code\) = any\(\$6::text\[\]\)/);
+  assert.deepEqual(query.params, [
+    2,
+    "2026-07-02T00:00:00.000Z",
+    "2026-07-03T00:00:00.000Z",
+    null,
+    null,
+    ["pm10", "pm25", "no2", "pm25index", "pm10index", "no2index"],
+  ]);
+  assert.equal(query.comparison_filter_mode, "v2_observations_pollutant_allow_list");
+  assert.equal(query.comparison_scope, "history_eligible_observations");
 });
 
 test("Phase B v2 observation checkpoints count only rows eligible for history", async () => {
