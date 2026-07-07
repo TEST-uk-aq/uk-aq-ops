@@ -4,6 +4,8 @@ This Worker replaces selected GitHub cron schedules by calling GitHub `workflow_
 
 ## One-Place Schedule Edits
 
+TIMES ARE IN UTC
+
 Change schedule times only in:
 - `cloudflare/workflow-scheduler/wrangler.toml`
 
