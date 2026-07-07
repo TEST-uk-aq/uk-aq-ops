@@ -72,7 +72,6 @@ Last updated: 2026-04-23
 
 - `workers/uk_aq_timeseries_aqi_hourly_cloud_run/run_service.ts`
 - `workers/uk_aq_db_size_logger_cloud_run/run_service.ts`
-- `workers/uk_aq_who_2021_daily_cloud_run/run_service.ts`
 
 ### Cloudflare Workers (`workers/*/worker.mjs`)
 
@@ -87,7 +86,6 @@ Last updated: 2026-04-23
 - `uk_aq_aqilevels_retention_cloud_run_deploy.yml`
 - `uk_aq_timeseries_aqi_hourly_cloud_run_deploy.yml`
 - `uk_aq_db_size_logger_cloud_run_deploy.yml`
-- `uk_aq_who_2021_daily_cloud_run_deploy.yml`
 - `uk_aq_observs_history_r2_api_worker_deploy.yml`
 - `uk_aq_aqi_history_r2_api_worker_deploy.yml`
 - `uk_aq_db_r2_metrics_api_worker_deploy.yml`

@@ -1,0 +1,254 @@
+name: Deploy WHO 2021 Daily Cloud Run Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_who_2021_daily_cloud_run/**"
+      - "scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+      - ".github/workflows/uk_aq_who_2021_daily_cloud_run_deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: uk-aq-who-2021-daily-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-who-2021-daily-service:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
+      REPO: ${{ vars.GCP_ARTIFACT_REPO || 'uk-aq' }}
+      SERVICE_NAME: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_NAME || 'uk-aq-who-2021-daily' }}
+      WHO_2021_DAILY_SERVICE_ACCOUNT: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || '' }}
+      RESOURCE_LABEL: uk-aq-who-2021-daily-service
+      SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_TIMEOUT_SECONDS || '900' }}
+      SERVICE_CPU: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_CPU || '1' }}
+      SERVICE_MEMORY: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_MEMORY || '512Mi' }}
+      SERVICE_CONCURRENCY: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_CONCURRENCY || '1' }}
+      SERVICE_MAX_INSTANCES: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_MAX_INSTANCES || '1' }}
+      SERVICE_MIN_INSTANCES: ${{ vars.GCP_WHO_2021_DAILY_SERVICE_MIN_INSTANCES || '0' }}
+      SCHEDULER_ENABLED: ${{ vars.GCP_WHO_2021_DAILY_SCHEDULER_ENABLED || 'false' }}
+      SCHEDULER_JOB_NAME: ${{ vars.GCP_WHO_2021_DAILY_JOB_NAME || 'uk-aq-who-2021-daily-trigger' }}
+      SCHEDULER_CRON: ${{ vars.GCP_WHO_2021_DAILY_CRON || '20 4 * * *' }}
+      SCHEDULER_TIMEZONE: ${{ vars.GCP_WHO_2021_DAILY_SCHEDULER_TIMEZONE || 'Etc/UTC' }}
+      SCHEDULER_MAX_RETRY_ATTEMPTS: ${{ vars.GCP_WHO_2021_DAILY_SCHEDULER_MAX_RETRY_ATTEMPTS || '0' }}
+      SCHEDULER_ATTEMPT_DEADLINE: ${{ vars.GCP_WHO_2021_DAILY_ATTEMPT_DEADLINE || '900s' }}
+      SCHEDULER_SERVICE_ACCOUNT: ${{ vars.GCP_WHO_2021_DAILY_SCHEDULER_SERVICE_ACCOUNT || '' }}
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
+      UK_AQ_WHO_2021_DAILY_REFRESH_RPC: ${{ vars.UK_AQ_WHO_2021_DAILY_REFRESH_RPC || 'uk_aq_rpc_who_2021_daily_status_refresh' }}
+      UK_AQ_WHO_2021_RUN_LOG_RPC: ${{ vars.UK_AQ_WHO_2021_RUN_LOG_RPC || 'uk_aq_rpc_who_2021_processing_run_log' }}
+      UK_AQ_WHO_2021_SOURCE_NETWORK_CODE: ${{ vars.UK_AQ_WHO_2021_SOURCE_NETWORK_CODE || 'gov_uk_aurn' }}
+      UK_AQ_WHO_2021_CONNECTOR_ID: ${{ vars.UK_AQ_WHO_2021_CONNECTOR_ID || '1' }}
+      UK_AQ_WHO_2021_POLLUTANT_CODES: ${{ vars.UK_AQ_WHO_2021_POLLUTANT_CODES || 'pm25,pm10,no2' }}
+      UK_AQ_WHO_2021_MIN_VALID_HOURS_PER_DAY: ${{ vars.UK_AQ_WHO_2021_MIN_VALID_HOURS_PER_DAY || '18' }}
+      UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS: ${{ vars.UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS || '2' }}
+      UK_AQ_WHO_2021_MATURITY_DELAY_HOURS: ${{ vars.UK_AQ_WHO_2021_MATURITY_DELAY_HOURS || '3' }}
+      UK_AQ_WHO_2021_CHUNK_DAYS: ${{ vars.UK_AQ_WHO_2021_CHUNK_DAYS || '31' }}
+      UK_AQ_WHO_2021_RPC_RETRIES: ${{ vars.UK_AQ_WHO_2021_RPC_RETRIES || '3' }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required project config
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT_ID:-}" ]; then
+            echo "Missing required variable: GCP_PROJECT_ID"
+            exit 1
+          fi
+          if [ -z "${WHO_2021_DAILY_SERVICE_ACCOUNT:-}" ]; then
+            echo "Missing required service account setting: GCP_WHO_2021_DAILY_SERVICE_ACCOUNT (or GCP_OPS_JOB_SERVICE_ACCOUNT)"
+            exit 1
+          fi
+          if [[ "${WHO_2021_DAILY_SERVICE_ACCOUNT}" == *"-compute@developer.gserviceaccount.com" ]]; then
+            echo "Invalid runtime service account: default compute service account is not allowed."
+            exit 1
+          fi
+          if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ]; then
+            echo "Missing required variable: OBS_AQIDB_SUPABASE_URL"
+            exit 1
+          fi
+
+      - name: Validate Google auth config
+        run: |
+          set -euo pipefail
+          if [ -n "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" ] && [ -n "${GCP_SERVICE_ACCOUNT:-}" ]; then
+            echo "Using Workload Identity Federation auth."
+          elif [ -n "${GCP_SA_KEY:-}" ]; then
+            echo "Using Service Account key auth."
+          else
+            echo "Missing Google auth config."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud (WIF)
+        if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to Google Cloud (Service Account Key fallback)
+        if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || env.GCP_SERVICE_ACCOUNT == '' }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+
+      - name: Configure gcloud project
+        run: |
+          set -euo pipefail
+          gcloud config set project "${PROJECT_ID}"
+          gcloud config set run/region "${REGION}"
+
+      - name: Verify Artifact Registry repository exists
+        run: |
+          set -euo pipefail
+          gcloud artifacts repositories describe "${REPO}" \
+            --location "${REGION}" \
+            --project "${PROJECT_ID}" >/dev/null
+
+      - name: Configure Docker auth for Artifact Registry
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push WHO 2021 daily image
+        id: build
+        run: |
+          set -euo pipefail
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/uk-aq-who-2021-daily:${GITHUB_SHA::12}"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          docker build -f workers/uk_aq_who_2021_daily_cloud_run/Dockerfile -t "${IMAGE}" .
+          docker push "${IMAGE}"
+
+      - name: Sync GitHub secrets to GCP Secret Manager
+        run: |
+          set -euo pipefail
+          UPSERT_SCRIPT="scripts/gcp/uk_aq_secret_upsert_if_changed.sh"
+          printf '%s' "${OBS_AQIDB_SECRET_KEY}" | "${UPSERT_SCRIPT}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" \
+            --required 1 \
+            --apply
+
+      - name: Build Cloud Run env and secret args
+        id: cloudrun_args
+        run: |
+          set -euo pipefail
+          env_file="${RUNNER_TEMP}/uk-aq-who-2021-daily-env.yaml"
+          : > "${env_file}"
+          add_env() {
+            local key="$1"
+            local value="${!key:-}"
+            if [ -n "${value}" ]; then
+              python3 -c 'import json,sys; f=open(sys.argv[1], "a", encoding="utf-8"); print(f"{sys.argv[2]}: {json.dumps(sys.argv[3])}", file=f); f.close()' \
+                "${env_file}" "${key}" "${value}"
+            fi
+          }
+          add_env OBS_AQIDB_SUPABASE_URL
+          add_env UK_AQ_PUBLIC_SCHEMA
+          add_env UK_AQ_WHO_2021_DAILY_REFRESH_RPC
+          add_env UK_AQ_WHO_2021_RUN_LOG_RPC
+          add_env UK_AQ_WHO_2021_SOURCE_NETWORK_CODE
+          add_env UK_AQ_WHO_2021_CONNECTOR_ID
+          add_env UK_AQ_WHO_2021_POLLUTANT_CODES
+          add_env UK_AQ_WHO_2021_MIN_VALID_HOURS_PER_DAY
+          add_env UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS
+          add_env UK_AQ_WHO_2021_MATURITY_DELAY_HOURS
+          add_env UK_AQ_WHO_2021_CHUNK_DAYS
+          add_env UK_AQ_WHO_2021_RPC_RETRIES
+          echo "env_file=${env_file}" >> "${GITHUB_OUTPUT}"
+          echo "secret_csv=OBS_AQIDB_SECRET_KEY=${OBS_AQIDB_SECRET_KEY_SECRET_NAME}:latest" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy Cloud Run service
+        run: |
+          set -euo pipefail
+          gcloud run deploy "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --image "${{ steps.build.outputs.image }}" \
+            --service-account "${WHO_2021_DAILY_SERVICE_ACCOUNT}" \
+            --timeout "${SERVICE_TIMEOUT_SECONDS}" \
+            --cpu "${SERVICE_CPU}" \
+            --memory "${SERVICE_MEMORY}" \
+            --concurrency "${SERVICE_CONCURRENCY}" \
+            --max-instances "${SERVICE_MAX_INSTANCES}" \
+            --min-instances "${SERVICE_MIN_INSTANCES}" \
+            --no-cpu-boost \
+            --cpu-throttling \
+            --labels "job_name=${RESOURCE_LABEL}" \
+            --no-allow-unauthenticated \
+            --env-vars-file "${{ steps.cloudrun_args.outputs.env_file }}" \
+            --set-secrets "${{ steps.cloudrun_args.outputs.secret_csv }}"
+
+      - name: Ensure Cloud Scheduler trigger exists
+        run: |
+          set -euo pipefail
+          enabled="$(printf '%s' "${SCHEDULER_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+          if [ "${enabled}" != "true" ] && [ "${enabled}" != "1" ] && [ "${enabled}" != "yes" ]; then
+            if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
+              gcloud scheduler jobs pause "${SCHEDULER_JOB_NAME}" --location "${REGION}" || true
+              echo "Paused existing scheduler job ${SCHEDULER_JOB_NAME} (SCHEDULER_ENABLED=${SCHEDULER_ENABLED})."
+            else
+              echo "Scheduler job ${SCHEDULER_JOB_NAME} not found; nothing to pause."
+            fi
+            exit 0
+          fi
+
+          scheduler_sa="${SCHEDULER_SERVICE_ACCOUNT:-${WHO_2021_DAILY_SERVICE_ACCOUNT}}"
+          service_uri="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+          scheduler_uri="${service_uri}/run"
+          scheduler_body='{"trigger_mode":"scheduler","run_mode":"daily"}'
+
+          gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+            --region "${REGION}" \
+            --member "serviceAccount:${scheduler_sa}" \
+            --role roles/run.invoker >/dev/null
+
+          deadline_args=()
+          if [ -n "${SCHEDULER_ATTEMPT_DEADLINE:-}" ]; then
+            deadline_args+=(--attempt-deadline "${SCHEDULER_ATTEMPT_DEADLINE}")
+          fi
+
+          if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location "${REGION}" >/dev/null 2>&1; then
+            gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
+              --location "${REGION}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${scheduler_uri}" \
+              --http-method POST \
+              --headers "Content-Type=application/json" \
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}" \
+              "${deadline_args[@]}"
+          else
+            gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
+              --location "${REGION}" \
+              --schedule "${SCHEDULER_CRON}" \
+              --time-zone "${SCHEDULER_TIMEZONE}" \
+              --uri "${scheduler_uri}" \
+              --http-method POST \
+              --headers "Content-Type=application/json" \
+              --message-body "${scheduler_body}" \
+              --oidc-service-account-email "${scheduler_sa}" \
+              --oidc-token-audience "${service_uri}" \
+              --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}" \
+              "${deadline_args[@]}"
+          fi

@@ -90,6 +90,21 @@
   - Supports `--dry-run`, `--local-only`, and `--upload`; upload mode targets
     `uk_aq_r2_test:uk-aq-history-cic-test`.
 
+## Cloud Run workers
+
+- `workers/uk_aq_who_2021_daily_cloud_run/run_service.ts`
+  - Scheduled Cloud Run service for WHO 2021 daily derived status rows.
+  - `GET /` and `GET /health` return a lightweight health response.
+  - `POST /` and `POST /run` run one bounded daily/backfill/dry-run calculation.
+  - Uses service-role RPCs in Obs AQI DB:
+    - `uk_aq_public.uk_aq_rpc_who_2021_daily_status_refresh`
+    - `uk_aq_public.uk_aq_rpc_who_2021_processing_run_log`
+  - Phase 2 scope is `uk_aq_ops.who_2021_daily_status` only. Rolling-year,
+    calendar-year and R2 JSON/parquet outputs are later phases.
+  - Daily windows use hour-ending source semantics: `(day 00:00, next day
+    00:00]`, equivalent to `01:00` through next-day `00:00` UTC/GMT for GOV.UK
+    AURN.
+
 ## History integrity scripts
 
 See [`uk-aq-r2-history-integrity.md`](uk-aq-r2-history-integrity.md) for the full
