@@ -731,25 +731,10 @@ function normalizeFingerprintRows(rows, sourceName) {
   return normalized;
 }
 
-function observationPollutantCodesForPrune(config, repairOnlyMode) {
-  if (repairOnlyMode || config.phaseB?.history_write_version !== "v2") {
-    return null;
-  }
-  const codes = Array.from(new Set(
-    (Array.isArray(config.phaseB?.observations_pollutant_codes)
-      ? config.phaseB.observations_pollutant_codes
-      : [])
-      .map((code) => String(code || "").trim().toLowerCase())
-      .filter(Boolean),
-  ));
-  return codes.length > 0 ? codes : null;
-}
-
-async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceName, pollutantCodes = null) {
+async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceName) {
   const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_HOURLY_FINGERPRINT, {
     window_start: windowStart,
     window_end: windowEnd,
-    p_pollutant_codes: pollutantCodes,
   });
 
   if (error) {
@@ -1100,11 +1085,11 @@ async function replayObservationsForRepairBucket(mainClient, observsClient, mism
   };
 }
 
-async function recheckSingleBucket(ingestClient, observsClient, mismatch, pollutantCodes = null) {
+async function recheckSingleBucket(ingestClient, observsClient, mismatch) {
   const bucketWindow = buildBucketWindow(mismatch.hour_start);
   const [ingestRows, observsRows] = await Promise.all([
-    fetchHourlyFingerprints(ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck", pollutantCodes),
-    fetchHourlyFingerprints(observsClient, bucketWindow.window_start, bucketWindow.window_end, "observs_recheck", pollutantCodes),
+    fetchHourlyFingerprints(ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck"),
+    fetchHourlyFingerprints(observsClient, bucketWindow.window_start, bucketWindow.window_end, "observs_recheck"),
   ]);
 
   const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
@@ -1126,7 +1111,6 @@ async function recheckMismatchBuckets(
   ingestClient,
   observsClient,
   initialMismatches,
-  pollutantCodes = null,
 ) {
   const nowDeletableBuckets = [];
   const stillMismatched = [];
@@ -1153,14 +1137,12 @@ async function recheckMismatchBuckets(
           group.window_start,
           group.window_end,
           "ingest_recheck",
-          pollutantCodes,
         ),
         fetchHourlyFingerprints(
           observsClient,
           group.window_start,
           group.window_end,
           "observs_recheck",
-          pollutantCodes,
         ),
       ]);
     } catch (error) {
@@ -1219,7 +1201,7 @@ async function recheckMismatchBuckets(
   };
 }
 
-async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatchesPerHour, pollutantCodes = null) {
+async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatchesPerHour) {
   const connectorId = toIntField(bucket.connector_id, "bucket.connector_id");
   let totalDeleted = 0n;
   let batchesRun = 0;
@@ -1232,7 +1214,6 @@ async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatche
       p_connector_id: connectorId,
       p_hour_start: bucket.hour_start,
       p_delete_limit: deleteBatchSize,
-      p_pollutant_codes: pollutantCodes,
     });
 
     if (error) {
@@ -1471,7 +1452,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   const dryRunMode = config.dryRun && !repairOnlyMode;
   const modeLabel = repairOnlyMode ? "phase-a-repair-only" : (dryRunMode ? "dry-run" : "delete");
   const historyGateEnabled = Boolean(config.phaseB?.enabled) && !repairOnlyMode;
-  const deleteEligiblePollutantCodes = observationPollutantCodesForPrune(config, repairOnlyMode);
   logStructured("INFO", "ingestdb_prune_run_start", {
     run_id: runId,
     parent_run_id: runContext.parent_run_id ?? null,
@@ -1487,14 +1467,12 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
     repair_one_mismatch_bucket: config.repairOneMismatchBucket,
     history_gate_enabled: historyGateEnabled,
-    delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
-    delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   });
 
   const [ingestBuckets, observsBuckets] = await Promise.all([
-    fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest", deleteEligiblePollutantCodes),
-    fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs", deleteEligiblePollutantCodes),
+    fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest"),
+    fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs"),
   ]);
 
   const { deletableBuckets, mismatches, observsExtraBuckets } = compareBuckets(ingestBuckets, observsBuckets);
@@ -1562,8 +1540,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     observs_count_exceeds_ingest_count: observsCountGreaterThanIngest.length,
     observs_extra_bucket_count: observsExtraBuckets.length,
     history_gate_enabled: historyGateEnabled,
-    delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
-    delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
     history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
@@ -1588,12 +1564,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
             observsClient,
             repairCandidate,
           );
-          const recheck = await recheckSingleBucket(
-            ingestClient,
-            observsClient,
-            repairCandidate,
-            deleteEligiblePollutantCodes,
-          );
+          const recheck = await recheckSingleBucket(ingestClient, observsClient, repairCandidate);
           repairPilot = {
             attempted: true,
             connector_id: repairCandidate.connector_id,
@@ -1660,7 +1631,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
           bucket,
           config.deleteBatchSize,
           config.maxDeleteBatchesPerHour,
-          deleteEligiblePollutantCodes,
         );
         totalDeletedRows += result.deleted_rows;
 
@@ -1745,7 +1715,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       ingestClient,
       observsClient,
       mismatches,
-      deleteEligiblePollutantCodes,
     );
     repairedNowDeletableBuckets = recheckResult.nowDeletableBuckets;
     mismatchesAfterRepair = recheckResult.stillMismatched;
@@ -1794,7 +1763,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
           bucket,
           config.deleteBatchSize,
           config.maxDeleteBatchesPerHour,
-          deleteEligiblePollutantCodes,
         );
         totalDeletedAfterRepairRows += result.deleted_rows;
 
@@ -2073,14 +2041,7 @@ async function discoverLateArrivalDays(ingestClient, overallWindow) {
 }
 
 async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, runId, batchIndex, batchCount) {
-  const deleteEligiblePollutantCodes = observationPollutantCodesForPrune(config, false);
-  const ingestBuckets = await fetchHourlyFingerprints(
-    ingestClient,
-    dayWindow.window_start,
-    dayWindow.window_end,
-    "ingest",
-    deleteEligiblePollutantCodes,
-  );
+  const ingestBuckets = await fetchHourlyFingerprints(ingestClient, dayWindow.window_start, dayWindow.window_end, "ingest");
   const batchSummaryMeta = batchCount > 1
     ? {
       parent_run_id: runId,
@@ -2100,8 +2061,6 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
       window_start: dayWindow.window_start,
       window_end: dayWindow.window_end,
       ingest_bucket_count: 0,
-      delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
-      delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
       deleted_bucket_count: 0,
       total_deleted_rows: "0",
       delete_error_count: 0,
@@ -2120,8 +2079,6 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     day_utc: dayWindow.day_utc,
     mode: config.dryRun ? "dry-run" : "delete",
     ingest_bucket_count: ingestBuckets.length,
-    delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
-    delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     window_start: dayWindow.window_start,
     window_end: dayWindow.window_end,
     ingest_bucket_preview: sampleRows(ingestBuckets.map(toBucketOutput)),
@@ -2139,7 +2096,6 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
           bucket,
           config.deleteBatchSize,
           config.maxDeleteBatchesPerHour,
-          deleteEligiblePollutantCodes,
         );
         totalDeletedRows += result.deleted_rows;
 
@@ -2183,8 +2139,6 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     window_start: dayWindow.window_start,
     window_end: dayWindow.window_end,
     ingest_bucket_count: ingestBuckets.length,
-    delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
-    delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     deleted_bucket_count: deletedBucketResults.length,
     total_deleted_rows: totalDeletedRows.toString(),
     delete_error_count: deleteErrors.length,

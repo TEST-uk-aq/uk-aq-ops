@@ -15,7 +15,7 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 
 ## How this repo connects to the others
 - **Ingest repo**: `CIC-test-uk-aq-ingest` provides ingest/edge pipelines that feed and consume the same databases.
-- **Schema source**: `CIC-test-uk-aq-schema` defines SQL schemas/RPCs used by these workers.
+- **Schema source**: `TEST-uk-aq-schema` defines SQL schemas/RPCs used by these workers.
 - **Change flow**: schema changes may require worker query/RPC updates here and ingest updates there.
 
 ## Setup & run (lightweight)
@@ -42,7 +42,7 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 ## Links
 - Existing README: `README.md`
 - Ingest repo (sibling): `../CIC-test-uk-aq-ingest`
-- Schema repo (sibling): `../CIC-Test-UK-AQ-Schema/CIC-test-uk-aq-schema`
+- Schema repo (sibling): `../TEST-uk-aq-schema`
 - Naming conventions (ingest repo): `../CIC-test-uk-aq-ingest/AGENTS.md`
 
 ## WORKING STYLE (IMPORTANT)
