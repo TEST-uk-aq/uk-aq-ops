@@ -1,14 +1,18 @@
 # UK AQ WHO 2021 Daily Cloud Run
 
-Calculates private WHO 2021 daily guideline status rows in Obs AQI DB.
+Calculates private WHO 2021 derived status rows in Obs AQI DB.
 
-Phase 2 scope is daily status only:
+Current scope is daily plus Phase 3 summaries:
 
 - reads Obs AQI DB observations through service-role RPCs;
 - calculates/upserts `uk_aq_ops.who_2021_daily_status`;
+- checks final-hour source readiness before scheduled publication runs;
+- calculates/upserts `uk_aq_ops.who_2021_rolling_year_status`;
+- calculates/upserts last complete-year rows in
+  `uk_aq_ops.who_2021_calendar_year_status`;
+- builds the 9-row homepage summary JSON in the run ledger;
 - records `uk_aq_ops.who_2021_processing_runs`;
-- does not publish R2 parquet/JSON;
-- does not update rolling-year or calendar-year summary tables.
+- does not publish R2 parquet/JSON.
 
 ## Endpoints
 
@@ -33,9 +37,17 @@ Phase 2 scope is daily status only:
 
 - `daily`: calculates the latest complete day plus configurable lookback.
 - `backfill`: requires `start_day_utc` and `end_day_utc`.
-- `dry_run`: calculates counts without upserting daily status rows.
+- `dry_run`: calculates counts without upserting daily or summary status rows.
 
-The daily window is hour-ending: each `day_utc` covers `(day 00:00, next day 00:00]`, so a GOV.UK AURN daily mean uses `01:00` through next-day `00:00` UTC/GMT.
+The daily window is hour-ending: each `day_utc` covers
+`(day 00:00, next day 00:00]`, so a GOV.UK AURN daily mean uses `01:00` through
+next-day `00:00` UTC/GMT.
+
+Scheduled `daily` runs use a readiness gate before writing latest summaries. If
+the expected final hour-ending timestamp is not present for enough eligible
+timeseries per pollutant, the service logs a deferred no-op and exits
+successfully. The intended scheduler pattern is hourly calls during a bounded
+morning window, for example `0 4-9 * * *` UTC.
 
 ## Required Environment
 
@@ -45,12 +57,20 @@ The daily window is hour-ending: each `day_utc` covers `(day 00:00, next day 00:
 ## Settings
 
 - `UK_AQ_PUBLIC_SCHEMA` default `uk_aq_public`
-- `UK_AQ_WHO_2021_DAILY_REFRESH_RPC` default `uk_aq_rpc_who_2021_daily_status_refresh`
+- `UK_AQ_WHO_2021_DAILY_REFRESH_RPC` default
+  `uk_aq_rpc_who_2021_daily_status_refresh`
+- `UK_AQ_WHO_2021_READINESS_RPC` default `uk_aq_rpc_who_2021_readiness_check`
+- `UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC` default
+  `uk_aq_rpc_who_2021_summary_refresh`
 - `UK_AQ_WHO_2021_RUN_LOG_RPC` default `uk_aq_rpc_who_2021_processing_run_log`
 - `UK_AQ_WHO_2021_SOURCE_NETWORK_CODE` default `gov_uk_aurn`
 - `UK_AQ_WHO_2021_CONNECTOR_ID` default `1`
 - `UK_AQ_WHO_2021_POLLUTANT_CODES` default `pm25,pm10,no2`
 - `UK_AQ_WHO_2021_MIN_VALID_HOURS_PER_DAY` default `18`
+- `UK_AQ_WHO_2021_MIN_VALID_DAYS` default `274`
+- `UK_AQ_WHO_2021_MIN_FINAL_HOUR_COVERAGE_RATIO` default `0.9`
+- `UK_AQ_WHO_2021_READINESS_GATE_ENABLED` default `true`
+- `UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED` default `true`
 - `UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS` default `2`
 - `UK_AQ_WHO_2021_MATURITY_DELAY_HOURS` default `3`
 - `UK_AQ_WHO_2021_CHUNK_DAYS` default `31`

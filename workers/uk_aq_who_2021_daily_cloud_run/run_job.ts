@@ -1,13 +1,19 @@
 import {
   buildDailyRefreshPayload,
   buildDayChunks,
+  buildReadinessPayload,
   buildRunConfig,
+  buildSummaryRefreshPayload,
   DailyRefreshRpcRow,
   mergeDailyRefreshRows,
   parsePollutantCodes,
   parsePositiveInt,
   parseRunMode,
   parseTriggerMode,
+  ReadinessRpcRow,
+  shouldRunReadinessGate,
+  summarizeReadinessRows,
+  SummaryRefreshRpcRow,
 } from "./who_2021_daily_core.ts";
 
 type RpcError = { message: string };
@@ -23,6 +29,11 @@ const RPC_SCHEMA = (Deno.env.get("UK_AQ_PUBLIC_SCHEMA") || "uk_aq_public")
   .trim();
 const DAILY_REFRESH_RPC = (Deno.env.get("UK_AQ_WHO_2021_DAILY_REFRESH_RPC") ||
   "uk_aq_rpc_who_2021_daily_status_refresh").trim();
+const READINESS_RPC = (Deno.env.get("UK_AQ_WHO_2021_READINESS_RPC") ||
+  "uk_aq_rpc_who_2021_readiness_check").trim();
+const SUMMARY_REFRESH_RPC =
+  (Deno.env.get("UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC") ||
+    "uk_aq_rpc_who_2021_summary_refresh").trim();
 const RUN_LOG_RPC = (Deno.env.get("UK_AQ_WHO_2021_RUN_LOG_RPC") ||
   "uk_aq_rpc_who_2021_processing_run_log").trim();
 const RPC_RETRIES = parsePositiveInt(
@@ -47,6 +58,22 @@ const POLLUTANT_CODES = parsePollutantCodes(
 const MIN_VALID_HOURS_PER_DAY = parsePositiveInt(
   Deno.env.get("UK_AQ_WHO_2021_MIN_VALID_HOURS_PER_DAY"),
   18,
+);
+const MIN_VALID_DAYS = parsePositiveInt(
+  Deno.env.get("UK_AQ_WHO_2021_MIN_VALID_DAYS"),
+  274,
+);
+const MIN_FINAL_HOUR_COVERAGE_RATIO = parseRatio(
+  Deno.env.get("UK_AQ_WHO_2021_MIN_FINAL_HOUR_COVERAGE_RATIO"),
+  0.9,
+);
+const READINESS_GATE_ENABLED = parseBoolean(
+  Deno.env.get("UK_AQ_WHO_2021_READINESS_GATE_ENABLED"),
+  true,
+);
+const SUMMARY_REFRESH_ENABLED = parseBoolean(
+  Deno.env.get("UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED"),
+  true,
 );
 const DAILY_LOOKBACK_DAYS = parsePositiveInt(
   Deno.env.get("UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS"),
@@ -74,6 +101,22 @@ function requiredEnv(name: string): string {
 function optionalEnv(name: string): string | null {
   const value = (Deno.env.get(name) || "").trim();
   return value || null;
+}
+
+function parseBoolean(
+  raw: string | null | undefined,
+  fallback: boolean,
+): boolean {
+  const value = String(raw || "").trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(value)) return true;
+  if (["0", "false", "no", "n", "off"].includes(value)) return false;
+  return fallback;
+}
+
+function parseRatio(raw: string | null | undefined, fallback: number): number {
+  const value = Number(raw || "");
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(1, value));
 }
 
 function normalizeUrl(baseUrl: string): string {
@@ -156,6 +199,16 @@ function parseDailyRefreshRows(data: unknown): DailyRefreshRpcRow[] {
   return data.map((item) => item as DailyRefreshRpcRow);
 }
 
+function parseReadinessRows(data: unknown): ReadinessRpcRow[] {
+  if (!Array.isArray(data)) return [];
+  return data.map((item) => item as ReadinessRpcRow);
+}
+
+function parseSummaryRefreshRows(data: unknown): SummaryRefreshRpcRow[] {
+  if (!Array.isArray(data)) return [];
+  return data.map((item) => item as SummaryRefreshRpcRow);
+}
+
 function errorJson(error: unknown): Record<string, unknown> {
   return {
     message: error instanceof Error ? error.message : String(error),
@@ -173,6 +226,8 @@ async function logRun(args: {
   latestCompleteDayUtc: string;
   runStatus: "ok" | "error" | "dry_run";
   dailyRowsUpserted: number;
+  rollingRowsUpserted: number;
+  calendarRowsUpserted: number;
   summaryJson: Record<string, unknown> | null;
   errorJson: Record<string, unknown> | null;
   startedAt: string;
@@ -188,6 +243,8 @@ async function logRun(args: {
     p_latest_complete_day_utc: args.latestCompleteDayUtc,
     p_run_status: args.runStatus,
     p_daily_rows_upserted: args.dailyRowsUpserted,
+    p_rolling_rows_upserted: args.rollingRowsUpserted,
+    p_calendar_rows_upserted: args.calendarRowsUpserted,
     p_summary_json: args.summaryJson,
     p_error_json: args.errorJson,
     p_started_at: args.startedAt,
@@ -220,6 +277,10 @@ async function main(): Promise<void> {
     sourceNetworkCode: SOURCE_NETWORK_CODE,
     pollutantCodes: POLLUTANT_CODES,
     minValidHoursPerDay: MIN_VALID_HOURS_PER_DAY,
+    minValidDays: MIN_VALID_DAYS,
+    minFinalHourCoverageRatio: MIN_FINAL_HOUR_COVERAGE_RATIO,
+    readinessGateEnabled: READINESS_GATE_ENABLED,
+    summaryRefreshEnabled: SUMMARY_REFRESH_ENABLED,
     chunkDays: CHUNK_DAYS,
   });
   const chunks = buildDayChunks(
@@ -228,24 +289,81 @@ async function main(): Promise<void> {
     config.chunkDays,
   );
   const rows: DailyRefreshRpcRow[] = [];
+  const summaryRefreshRows: SummaryRefreshRpcRow[] = [];
+  let readinessSummary: Record<string, unknown> | null = null;
+  let deferred = false;
+  let alreadyCompleted = false;
   let runStatus: "ok" | "error" | "dry_run" = config.dryRun ? "dry_run" : "ok";
   let capturedError: unknown = null;
 
   try {
-    for (const chunk of chunks) {
-      const payload = buildDailyRefreshPayload(config, chunk);
+    if (shouldRunReadinessGate(config)) {
+      const payload = buildReadinessPayload(config);
       console.log(JSON.stringify({
         level: "info",
-        event: "who_2021_daily_refresh_chunk_start",
+        event: "who_2021_readiness_check_start",
         run_mode: config.runMode,
         trigger_mode: config.triggerMode,
         ...payload,
       }));
-      const result = await postgrestRpc<unknown>(DAILY_REFRESH_RPC, payload);
+      const result = await postgrestRpc<unknown>(READINESS_RPC, payload);
       if (result.error) {
-        throw new Error(`daily refresh RPC failed: ${result.error.message}`);
+        throw new Error(`readiness RPC failed: ${result.error.message}`);
       }
-      rows.push(...parseDailyRefreshRows(result.data));
+      const readiness = summarizeReadinessRows(
+        parseReadinessRows(result.data),
+        config.endDayUtc,
+      );
+      readinessSummary = readiness as unknown as Record<string, unknown>;
+      alreadyCompleted = readiness.already_completed;
+      deferred = !readiness.ready && !readiness.already_completed;
+
+      console.log(JSON.stringify({
+        level: deferred ? "warning" : "info",
+        event: deferred
+          ? "who_2021_readiness_deferred"
+          : "who_2021_readiness_ready",
+        readiness,
+      }));
+    }
+
+    if (!deferred && !alreadyCompleted) {
+      for (const chunk of chunks) {
+        const payload = buildDailyRefreshPayload(config, chunk);
+        console.log(JSON.stringify({
+          level: "info",
+          event: "who_2021_daily_refresh_chunk_start",
+          run_mode: config.runMode,
+          trigger_mode: config.triggerMode,
+          ...payload,
+        }));
+        const result = await postgrestRpc<unknown>(DAILY_REFRESH_RPC, payload);
+        if (result.error) {
+          throw new Error(`daily refresh RPC failed: ${result.error.message}`);
+        }
+        rows.push(...parseDailyRefreshRows(result.data));
+      }
+
+      if (config.summaryRefreshEnabled) {
+        const payload = buildSummaryRefreshPayload(config);
+        console.log(JSON.stringify({
+          level: "info",
+          event: "who_2021_summary_refresh_start",
+          run_mode: config.runMode,
+          trigger_mode: config.triggerMode,
+          ...payload,
+        }));
+        const result = await postgrestRpc<unknown>(
+          SUMMARY_REFRESH_RPC,
+          payload,
+        );
+        if (result.error) {
+          throw new Error(
+            `summary refresh RPC failed: ${result.error.message}`,
+          );
+        }
+        summaryRefreshRows.push(...parseSummaryRefreshRows(result.data));
+      }
     }
   } catch (error) {
     runStatus = "error";
@@ -253,8 +371,12 @@ async function main(): Promise<void> {
   }
 
   const summary = mergeDailyRefreshRows(rows);
+  const summaryRefresh = summaryRefreshRows[0] || null;
   const finishedAt = new Date().toISOString();
   const summaryJson = {
+    phase_3_completed: Boolean(summaryRefresh),
+    deferred,
+    already_completed: alreadyCompleted,
     run_mode: config.runMode,
     trigger_mode: config.triggerMode,
     source_network_code: config.sourceNetworkCode,
@@ -264,7 +386,21 @@ async function main(): Promise<void> {
     end_day_utc: config.endDayUtc,
     latest_complete_day_utc: config.latestCompleteDayUtc,
     min_valid_hours_per_day: config.minValidHoursPerDay,
+    min_valid_days: config.minValidDays,
+    min_final_hour_coverage_ratio: config.minFinalHourCoverageRatio,
+    readiness_gate_enabled: config.readinessGateEnabled,
+    summary_refresh_enabled: config.summaryRefreshEnabled,
     dry_run: config.dryRun,
+    readiness: readinessSummary,
+    rolling_rows_upserted: Number(summaryRefresh?.rolling_rows_upserted) || 0,
+    calendar_rows_upserted: Number(summaryRefresh?.calendar_rows_upserted) ||
+      0,
+    calendar_year: summaryRefresh?.calendar_year || null,
+    rolling_window_start_day_utc:
+      summaryRefresh?.rolling_window_start_day_utc || null,
+    rolling_window_end_day_utc: summaryRefresh?.rolling_window_end_day_utc ||
+      null,
+    homepage_summary: summaryRefresh?.homepage_summary || null,
     ...summary,
   };
   const loggedRunId = await logRun({
@@ -277,6 +413,8 @@ async function main(): Promise<void> {
     latestCompleteDayUtc: config.latestCompleteDayUtc,
     runStatus,
     dailyRowsUpserted: summary.rows_upserted,
+    rollingRowsUpserted: Number(summaryRefresh?.rolling_rows_upserted) || 0,
+    calendarRowsUpserted: Number(summaryRefresh?.calendar_rows_upserted) || 0,
     summaryJson,
     errorJson: capturedError ? errorJson(capturedError) : null,
     startedAt,
