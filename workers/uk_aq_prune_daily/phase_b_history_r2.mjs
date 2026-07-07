@@ -38,6 +38,7 @@ const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
+const DEFAULT_OBSERVATIONS_POLLUTANT_CODES = "pm25,pm10,no2,pm25index,pm10index,no2index";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
@@ -4569,9 +4570,11 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
 
   const rawPollutantCodes = String(
     env.UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES ||
-      "pm25,pm10,no2,pm25index,pm10index,no2index",
+      DEFAULT_OBSERVATIONS_POLLUTANT_CODES,
   ).trim();
-  const allowedPollutantCodes = rawPollutantCodes.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
+  const allowedPollutantCodes = Array.from(new Set(
+    rawPollutantCodes.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean),
+  ));
 
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",

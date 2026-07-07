@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   buildConnectorManifestKey,
@@ -29,6 +30,39 @@ test("Phase B observations include source-provided DAQI index properties by defa
     resolved.observations_pollutant_codes,
     ["pm25", "pm10", "no2", "pm25index", "pm10index", "no2index"],
   );
+  assert.equal(resolved.observations_pollutant_codes.includes("humidity"), false);
+  assert.equal(resolved.observations_pollutant_codes.includes("pressure"), false);
+  assert.equal(resolved.observations_pollutant_codes.includes("temperature"), false);
+});
+
+test("Phase B v2 observations allow-list override is normalized and keeps DAQI index rows", () => {
+  const resolved = resolvePhaseBRuntimeConfig({
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+    UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES: "PM10,pm25,NO2,PM25Index,pm10index,NO2Index,pm10,,",
+  });
+
+  assert.deepEqual(
+    resolved.observations_pollutant_codes,
+    ["pm10", "pm25", "no2", "pm25index", "pm10index", "no2index"],
+  );
+});
+
+test("Phase B deploy workflow and env catalogs expose the observations history allow-list", () => {
+  const workflow = readFileSync(".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml", "utf8");
+  const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
+  const master = readFileSync("env-vars-master.csv", "utf8");
+  const expectedDefault = "pm25,pm10,no2,pm25index,pm10index,no2index";
+
+  assert.match(
+    workflow,
+    /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES: \$\{\{ vars\.UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES \|\| 'pm25,pm10,no2,pm25index,pm10index,no2index' \}\}/,
+  );
+  assert.match(
+    workflow,
+    /env_updates\+=\("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES=\$\{UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES\}"\)/,
+  );
+  assert.match(targets, /^UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES,variable$/m);
+  assert.equal(master.includes(`UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES,,,"${expectedDefault}"`), true);
 });
 
 test("Phase B resets a stale v2 checkpoint when cleanup already removed all partial objects", () => {

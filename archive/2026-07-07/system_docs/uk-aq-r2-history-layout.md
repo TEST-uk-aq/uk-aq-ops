@@ -130,17 +130,6 @@ history/v2/observations/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pol
 history/v2/observations/day_utc=YYYY-MM-DD/connector_id=<id>/pollutant_code=<pollutant>/part-00000.parquet
 ```
 
-The default v2 observations eligibility list is
-`pm25,pm10,no2,pm25index,pm10index,no2index`. The `pm25index`,
-`pm10index`, and `no2index` partitions contain source-provided DAQI/index
-observation values, not UK AQ calculated AQI/DAQI output. Do not treat
-source-provided DAQI/index observation rows as disposable derived noise. They
-are retained source observations and are used for later comparison against UK AQ
-calculated DAQI/AQI outputs. Weather/metadata-style rows such as humidity,
-pressure, and temperature are not automatically equivalent to DAQI/index rows
-and may be excluded from public/history observations unless explicitly
-required.
-
 Dropbox R2 history backups are inventory-led. The inventory identifies changed
 day/domain units, sync copies those units with `rclone copy`, and then performs
 manifest-guided pruning inside inventory-listed Dropbox units. The current
@@ -816,10 +805,6 @@ The index is built from v2 data manifests only:
 
 - observations data: `history/v2/observations`
 - AQI hourly compact data: `history/v2/aqilevels/hourly/data`
-
-Source-provided DAQI/index observations under `history/v2/observations` are
-kept separate from UK AQ calculated AQI/DAQI rows under
-`history/v2/aqilevels/hourly/data`.
 
 No debug AQI v2 indexes are built under `_index_v2`.
 
