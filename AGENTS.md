@@ -70,7 +70,7 @@ Only when explicitly requested in the prompt. May run database, deployment, or c
 
 ## Schema Placement Policy
 
-- Canonical SQL DDL belongs in the schema repo (`.../CIC-test-uk-aq-schema/schemas/...`), not only in ops worker directories.
+- Canonical SQL DDL belongs in the schema repo (`/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-schema/schemas/...`), not only in ops worker directories.
 - If ops introduces or changes Obs AQI tables, the change must also be reflected in:
   - `schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql` (main Obs AQI schema), and
   - a schema-repo SQL file under `schemas/obs_aqi_db/` when a targeted apply file is needed.

@@ -859,15 +859,6 @@ function toConnectorDayRow(row) {
     day_utc: normalizeDayUtc(row.day_utc),
     connector_id: Number(row.connector_id),
     expected_row_count: parseBigInt(row.expected_row_count, "expected_row_count"),
-    source_row_count: row.source_row_count === null || row.source_row_count === undefined
-      ? parseBigInt(row.expected_row_count, "expected_row_count")
-      : parseBigInt(row.source_row_count, "source_row_count"),
-    excluded_row_count: row.excluded_row_count === null || row.excluded_row_count === undefined
-      ? 0n
-      : parseBigInt(row.excluded_row_count, "excluded_row_count"),
-    excluded_pollutant_counts: row.excluded_pollutant_counts && typeof row.excluded_pollutant_counts === "object"
-      ? row.excluded_pollutant_counts
-      : {},
     min_observed_at: row.min_observed_at ? new Date(row.min_observed_at).toISOString() : null,
     max_observed_at: row.max_observed_at ? new Date(row.max_observed_at).toISOString() : null,
     status: String(row.status || "pending"),
@@ -898,208 +889,7 @@ function toConnectorDayRow(row) {
   };
 }
 
-function observationPollutantCodesForSql(runtime) {
-  return Array.from(new Set(
-    (Array.isArray(runtime?.observations_pollutant_codes) ? runtime.observations_pollutant_codes : [])
-      .map((code) => String(code || "").trim().toLowerCase())
-      .filter(Boolean),
-  ));
-}
-
-async function populateBackupCandidates(client, latestEligibleWindowEndIso, runtime = {}) {
-  const pollutantCodes = observationPollutantCodesForSql(runtime);
-  if (runtime.history_write_version === "v2") {
-    if (pollutantCodes.length === 0) {
-      throw new Error("Phase B v2 observations require at least one eligible pollutant code.");
-    }
-    const sql = `
-with source_rows as (
-  select
-    (o.observed_at at time zone 'UTC')::date as day_utc,
-    o.connector_id::integer as connector_id,
-    o.observed_at,
-    lower(op.code) as pollutant_code
-  from uk_aq_core.observations o
-  join uk_aq_core.timeseries ts
-    on ts.id = o.timeseries_id
-   and ts.connector_id = o.connector_id
-  join uk_aq_core.phenomena p
-    on p.id = ts.phenomenon_id
-  join uk_aq_core.observed_properties op
-    on op.id = p.observed_property_id
-  left join uk_aq_ops.history_candidates existing_complete
-    on existing_complete.day_utc = (o.observed_at at time zone 'UTC')::date
-   and existing_complete.connector_id = o.connector_id
-   and existing_complete.status = 'complete'
-  where o.observed_at < $1::timestamptz
-    and op.code is not null
-    and existing_complete.day_utc is null
-),
-source_counts as (
-  select
-    day_utc,
-    connector_id,
-    count(*)::bigint as source_row_count
-  from source_rows
-  group by 1, 2
-),
-eligible as (
-  select
-    day_utc,
-    connector_id,
-    count(*)::bigint as expected_row_count,
-    min(observed_at) as min_observed_at,
-    max(observed_at) as max_observed_at
-  from source_rows
-  where pollutant_code = any($2::text[])
-  group by 1, 2
-),
-excluded as (
-  select
-    day_utc,
-    connector_id,
-    coalesce(sum(row_count), 0)::bigint as excluded_row_count,
-    coalesce(jsonb_object_agg(pollutant_code, row_count order by pollutant_code), '{}'::jsonb) as excluded_pollutant_counts
-  from (
-    select
-      day_utc,
-      connector_id,
-      pollutant_code,
-      count(*)::bigint as row_count
-    from source_rows
-    where pollutant_code <> all($2::text[])
-    group by 1, 2, 3
-  ) grouped
-  group by 1, 2
-),
-upserted as (
-  insert into uk_aq_ops.history_candidates (
-    day_utc,
-    connector_id,
-    expected_row_count,
-    min_observed_at,
-    max_observed_at,
-    status,
-    run_id,
-    last_error,
-    manifest_key,
-    history_row_count,
-    history_file_count,
-    history_total_bytes,
-    history_completed_at,
-    resume_last_timeseries_id,
-    resume_last_observed_at,
-    resume_part_index,
-    resume_exported_row_count,
-    resume_parts_json
-  )
-  select
-    e.day_utc,
-    e.connector_id,
-    e.expected_row_count,
-    e.min_observed_at,
-    e.max_observed_at,
-    'pending'::text,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    0,
-    0,
-    '[]'::jsonb
-  from eligible e
-  on conflict (day_utc, connector_id)
-  do update set
-    expected_row_count = excluded.expected_row_count,
-    min_observed_at = excluded.min_observed_at,
-    max_observed_at = excluded.max_observed_at,
-    status = 'pending',
-    run_id = null,
-    last_error = null,
-    manifest_key = null,
-    history_row_count = null,
-    history_file_count = null,
-    history_total_bytes = null,
-    history_completed_at = null,
-    resume_last_timeseries_id = case
-      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then uk_aq_ops.history_candidates.resume_last_timeseries_id
-      else null
-    end,
-    resume_last_observed_at = case
-      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then uk_aq_ops.history_candidates.resume_last_observed_at
-      else null
-    end,
-    resume_part_index = case
-      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then coalesce(uk_aq_ops.history_candidates.resume_part_index, 0)
-      else 0
-    end,
-    resume_exported_row_count = case
-      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then coalesce(uk_aq_ops.history_candidates.resume_exported_row_count, 0)
-      else 0
-    end,
-    resume_parts_json = case
-      when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
-       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
-       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
-      then coalesce(uk_aq_ops.history_candidates.resume_parts_json, '[]'::jsonb)
-      else '[]'::jsonb
-    end,
-    updated_at = now()
-  where uk_aq_ops.history_candidates.status <> 'complete'
-  returning
-    day_utc,
-    connector_id,
-    expected_row_count,
-    min_observed_at,
-    max_observed_at,
-    status,
-    run_id,
-    manifest_key,
-    history_row_count,
-    history_file_count,
-    history_total_bytes,
-    resume_last_timeseries_id,
-    resume_last_observed_at,
-    resume_part_index,
-    resume_exported_row_count,
-    resume_parts_json
-)
-select
-  u.*,
-  coalesce(sc.source_row_count, u.expected_row_count)::bigint as source_row_count,
-  coalesce(x.excluded_row_count, 0)::bigint as excluded_row_count,
-  coalesce(x.excluded_pollutant_counts, '{}'::jsonb) as excluded_pollutant_counts
-from upserted u
-left join source_counts sc
-  on sc.day_utc = u.day_utc
- and sc.connector_id = u.connector_id
-left join excluded x
-  on x.day_utc = u.day_utc
- and x.connector_id = u.connector_id
-order by u.day_utc, u.connector_id
-`;
-
-    const result = await client.query(sql, [latestEligibleWindowEndIso, pollutantCodes]);
-    return result.rows.map(toConnectorDayRow);
-  }
-
+async function populateBackupCandidates(client, latestEligibleWindowEndIso) {
   const sql = `
 with eligible as (
   select
@@ -2432,10 +2222,6 @@ async function writeCommittedV2PartAndCheckpoint({
   const writeGroups = groupedRows.filter(([pollutantCode]) => runtime.observations_pollutant_codes.includes(pollutantCode));
   const writePollutantCodes = writeGroups.map(([pollutantCode]) => pollutantCode);
   const excludedPollutantCodes = sourcePollutantCodes.filter((c) => !writePollutantCodes.includes(c));
-  const excludedRowCount = groupedRows
-    .filter(([pollutantCode]) => !writePollutantCodes.includes(pollutantCode))
-    .reduce((sum, [, pollutantRows]) => sum + pollutantRows.length, 0);
-  const writtenRowCount = writeGroups.reduce((sum, [, pollutantRows]) => sum + pollutantRows.length, 0);
 
   logPhaseB(runtime, "INFO", "phase_b_history_connector_pollutant_plan", {
     day_utc: dayUtc,
@@ -2447,8 +2233,6 @@ async function writeCommittedV2PartAndCheckpoint({
     pollutant_count: sourcePollutantCodes.length,
     write_pollutant_count: writePollutantCodes.length,
     row_count: rows.length,
-    eligible_for_history_count: writtenRowCount,
-    excluded_row_count: excludedRowCount,
   });
   const nextParts = [...committedParts];
   let bytesAdded = 0n;
@@ -2560,7 +2344,7 @@ async function writeCommittedV2PartAndCheckpoint({
     }, 15_000);
   }
 
-  const nextObservedRows = observedRows + BigInt(writtenRowCount);
+  const nextObservedRows = observedRows + BigInt(rows.length);
   const nextTotalBytes = totalBytes + bytesAdded;
   const nextPartIndex = partIndex + 1;
   const lastRow = rows[rows.length - 1];
@@ -2582,9 +2366,6 @@ async function writeCommittedV2PartAndCheckpoint({
     connector_id: connectorId,
     part_index: nextPartIndex,
     rows_written: nextObservedRows.toString(),
-    source_row_count: rows.length,
-    eligible_for_history_count: writtenRowCount,
-    excluded_row_count: excludedRowCount,
     part_count: nextParts.length,
   });
   const checkpointStartedAtMs = Date.now();
@@ -2604,9 +2385,6 @@ async function writeCommittedV2PartAndCheckpoint({
       connector_id: connectorId,
       part_index: nextPartIndex,
       rows_written: nextObservedRows.toString(),
-      source_row_count: rows.length,
-      eligible_for_history_count: writtenRowCount,
-      excluded_row_count: excludedRowCount,
       part_count: nextParts.length,
       duration_ms: Math.max(0, Date.now() - checkpointStartedAtMs),
       ...errorLogFields(error),
@@ -2618,9 +2396,6 @@ async function writeCommittedV2PartAndCheckpoint({
     connector_id: connectorId,
     part_index: nextPartIndex,
     rows_written: nextObservedRows.toString(),
-    source_row_count: rows.length,
-    eligible_for_history_count: writtenRowCount,
-    excluded_row_count: excludedRowCount,
     part_count: nextParts.length,
     duration_ms: Math.max(0, Date.now() - checkpointStartedAtMs),
   });
@@ -2907,7 +2682,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $4::integer,
   $5::timestamptz
 )
-where lower(pollutant_code) = any($6::text[])
 ` : `
 select
   connector_id,
@@ -2924,12 +2698,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
 `;
 
     const cursor = streamClient.query(
-      new Cursor(
-        sql,
-        runtime.history_write_version === "v2"
-          ? [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt, observationPollutantCodesForSql(runtime)]
-          : [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt],
-      ),
+      new Cursor(sql, [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt]),
     );
     let pendingRows = [];
 
@@ -4716,7 +4485,6 @@ export async function runPhaseBBackup({
     cursor_fetch_rows: runtime.cursor_fetch_rows,
     row_group_size: runtime.row_group_size,
     observations_row_group_size: runtime.observations_row_group_size,
-    observations_pollutant_codes: runtime.observations_pollutant_codes,
     aqilevels_row_group_size: runtime.aqilevels_row_group_size,
     r2_bucket: runtime.r2.bucket,
     observations_prefix: runtime.committed_prefix,
@@ -4734,37 +4502,8 @@ export async function runPhaseBBackup({
   let totalWrittenBytes = 0n;
 
   await withPgClient(runtime.supabase_db_url, async (controlClient) => {
-    const upsertedCandidates = await populateBackupCandidates(
-      controlClient,
-      window.latest_eligible_window_end_utc,
-      runtime,
-    );
+    const upsertedCandidates = await populateBackupCandidates(controlClient, window.latest_eligible_window_end_utc);
     summary.populated_candidates = upsertedCandidates.length;
-    if (runtime.history_write_version === "v2" && upsertedCandidates.length > 0) {
-      logStructured("INFO", "phase_b_history_candidate_eligibility_summary", {
-        run_id: runId,
-        history_write_version: runtime.history_write_version,
-        eligible_pollutant_codes: runtime.observations_pollutant_codes,
-        candidate_count: upsertedCandidates.length,
-        source_row_count: upsertedCandidates
-          .reduce((sum, row) => sum + row.source_row_count, 0n)
-          .toString(),
-        eligible_for_history_count: upsertedCandidates
-          .reduce((sum, row) => sum + row.expected_row_count, 0n)
-          .toString(),
-        excluded_row_count: upsertedCandidates
-          .reduce((sum, row) => sum + row.excluded_row_count, 0n)
-          .toString(),
-        candidates_preview: upsertedCandidates.slice(0, 25).map((row) => ({
-          day_utc: row.day_utc,
-          connector_id: row.connector_id,
-          source_row_count: row.source_row_count.toString(),
-          eligible_for_history_count: row.expected_row_count.toString(),
-          excluded_row_count: row.excluded_row_count.toString(),
-          excluded_pollutant_counts: row.excluded_pollutant_counts,
-        })),
-      });
-    }
 
     await markIncompleteDaysAsBackupBlocked(controlClient);
 

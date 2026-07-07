@@ -11,7 +11,6 @@ import {
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
   shouldResetManifestlessV2ResumeForTest,
-  writeCommittedV2PartAndCheckpointForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 const DAY = "2026-06-14";
@@ -22,7 +21,7 @@ function runManifestKey(prefix, runId = RUN_ID) {
 }
 
 test("Phase B observations include source-provided DAQI index properties by default", () => {
-  const resolved = resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" });
+  const resolved = resolvePhaseBRuntimeConfig({});
 
   assert.deepEqual(
     resolved.observations_pollutant_codes,
@@ -60,88 +59,6 @@ test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () =
     buildConnectorManifestKey(resolved.aqilevels_prefix, DAY, 7),
     "history/v2/aqilevels/hourly/data/day_utc=2026-06-14/connector_id=7/manifest.json",
   );
-});
-
-test("Phase B v2 observation checkpoints count only rows eligible for history", async () => {
-  const committedPrefix = "history/v2/observations";
-  const written = new Map();
-  const checkpointCalls = [];
-  const logEvents = [];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => {
-    const key = decodeURIComponent(new URL(url).pathname.replace(/^\/bucket\//, ""));
-    if (init.method === "PUT") {
-      written.set(key, Buffer.from(await new Response(init.body).arrayBuffer()));
-      return new Response(null, { status: 200, headers: { etag: `etag-${written.size}` } });
-    }
-    if (init.method === "HEAD") {
-      return written.has(key)
-        ? new Response(null, {
-          status: 200,
-          headers: { etag: "etag-head", "content-length": String(written.get(key).byteLength) },
-        })
-        : new Response(null, { status: 404 });
-    }
-    throw new Error(`Unexpected fetch ${init.method} ${url}`);
-  };
-
-  try {
-    const result = await writeCommittedV2PartAndCheckpointForTest({
-      streamClient: {},
-      runtime: {
-        run_id: RUN_ID,
-        history_write_version: "v2",
-        committed_prefix: committedPrefix,
-        observations_pollutant_codes: ["pm10", "pm25"],
-        observations_row_group_size: 1000,
-        checkpoint_client_for_test: {
-          async query(_sql, params) {
-            checkpointCalls.push(params);
-            return { rows: [], rowCount: 1 };
-          },
-        },
-        logStructured(severity, event, fields) {
-          logEvents.push({ severity, event, fields });
-        },
-        r2: {
-          endpoint: "https://r2.example.test",
-          bucket: "bucket",
-          region: "auto",
-          access_key_id: "key",
-          secret_access_key: "secret",
-        },
-      },
-      dayUtc: DAY,
-      connectorId: 7,
-      partIndex: 0,
-      rows: [
-        { connector_id: 7, station_id: 1, timeseries_id: 101, pollutant_code: "pm10", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 10 },
-        { connector_id: 7, station_id: 1, timeseries_id: 102, pollutant_code: "temperature", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 18 },
-        { connector_id: 7, station_id: 1, timeseries_id: 103, pollutant_code: "pm25", observed_at_utc: `${DAY}T00:00:00.000Z`, value: 8 },
-      ],
-      committedParts: [],
-      observedRows: 0n,
-      totalBytes: 0n,
-    });
-
-    assert.equal(result.observedRows, 2n);
-    assert.equal(result.committedParts.length, 2);
-    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "pm10", 0)), true);
-    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "pm25", 0)), true);
-    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "temperature", 0)), false);
-    assert.equal(checkpointCalls.length, 1);
-    assert.equal(checkpointCalls[0][6], "2");
-
-    const plan = logEvents.find((entry) => entry.event === "phase_b_history_connector_pollutant_plan");
-    assert.deepEqual(plan.fields.source_pollutant_codes, ["pm10", "pm25", "temperature"]);
-    assert.deepEqual(plan.fields.write_pollutant_codes, ["pm10", "pm25"]);
-    assert.deepEqual(plan.fields.excluded_pollutant_codes, ["temperature"]);
-    assert.equal(plan.fields.row_count, 3);
-    assert.equal(plan.fields.eligible_for_history_count, 2);
-    assert.equal(plan.fields.excluded_row_count, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
 });
 
 test("Phase B rejects deprecated split write version", () => {
