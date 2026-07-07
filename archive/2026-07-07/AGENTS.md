@@ -75,13 +75,6 @@ Only when explicitly requested in the prompt. May run database, deployment, or c
   - `schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql` (main Obs AQI schema), and
   - a schema-repo SQL file under `schemas/obs_aqi_db/` when a targeted apply file is needed.
 
-## Source DAQI/index observations
-
-- Do not treat source-provided DAQI/index observation rows as disposable derived noise. They are retained source observations and are used for later comparison against UK AQ calculated DAQI/AQI outputs.
-- Breathe London source-provided index observation codes currently use `pm25index`, `pm10index`, and `no2index`. These rows belong in Supabase observations and R2 `history/v2/observations` when included by the v2 observations allow-list.
-- Keep these source observations distinct from UK AQ calculated AQI/DAQI hourly output, which belongs under the separate aqilevels history paths.
-- Weather/metadata-style observations such as humidity, pressure, and temperature are not automatically equivalent to source DAQI/index observations and may be excluded from public/history observations unless explicitly required.
-
 ## Environment Sync
 
 - This repo has an env sync script: `scripts/uk_aq_sync_github_secrets.sh`.
