@@ -17,6 +17,10 @@ type RequestBody = {
   connector_id?: unknown;
   source_network_code?: unknown;
   pollutant_codes?: unknown;
+  min_valid_days?: unknown;
+  min_final_hour_coverage_ratio?: unknown;
+  readiness_gate_enabled?: unknown;
+  summary_refresh_enabled?: unknown;
 };
 
 function bodyRecord(body: unknown): Record<string, unknown> | null {
@@ -33,6 +37,23 @@ function positiveIntegerValue(value: unknown): string | null {
   const numberValue = typeof value === "number" ? value : Number(value);
   if (!Number.isInteger(numberValue) || numberValue <= 0) return null;
   return String(Math.trunc(numberValue));
+}
+
+function ratioValue(value: unknown): string | null {
+  const numberValue = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numberValue) || numberValue < 0 || numberValue > 1) {
+    return null;
+  }
+  return String(numberValue);
+}
+
+function booleanValue(value: unknown): string | null {
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return "true";
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return "false";
+  return null;
 }
 
 function pollutantCodesValue(value: unknown): string | null {
@@ -104,6 +125,26 @@ async function runJob(
       req.headers.get("x-uk-aq-who-2021-pollutant-codes") ||
       body?.pollutant_codes,
   );
+  const minValidDays = positiveIntegerValue(
+    new URL(req.url).searchParams.get("min_valid_days") ||
+      req.headers.get("x-uk-aq-who-2021-min-valid-days") ||
+      body?.min_valid_days,
+  );
+  const minFinalHourCoverageRatio = ratioValue(
+    new URL(req.url).searchParams.get("min_final_hour_coverage_ratio") ||
+      req.headers.get("x-uk-aq-who-2021-min-final-hour-coverage-ratio") ||
+      body?.min_final_hour_coverage_ratio,
+  );
+  const readinessGateEnabled = booleanValue(
+    new URL(req.url).searchParams.get("readiness_gate_enabled") ||
+      req.headers.get("x-uk-aq-who-2021-readiness-gate-enabled") ||
+      body?.readiness_gate_enabled,
+  );
+  const summaryRefreshEnabled = booleanValue(
+    new URL(req.url).searchParams.get("summary_refresh_enabled") ||
+      req.headers.get("x-uk-aq-who-2021-summary-refresh-enabled") ||
+      body?.summary_refresh_enabled,
+  );
 
   const env: Record<string, string> = {
     ...Deno.env.toObject(),
@@ -117,6 +158,17 @@ async function runJob(
   }
   if (connectorId) env.UK_AQ_WHO_2021_CONNECTOR_ID = connectorId;
   if (pollutantCodes) env.UK_AQ_WHO_2021_POLLUTANT_CODES = pollutantCodes;
+  if (minValidDays) env.UK_AQ_WHO_2021_MIN_VALID_DAYS = minValidDays;
+  if (minFinalHourCoverageRatio) {
+    env.UK_AQ_WHO_2021_MIN_FINAL_HOUR_COVERAGE_RATIO =
+      minFinalHourCoverageRatio;
+  }
+  if (readinessGateEnabled) {
+    env.UK_AQ_WHO_2021_READINESS_GATE_ENABLED = readinessGateEnabled;
+  }
+  if (summaryRefreshEnabled) {
+    env.UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED = summaryRefreshEnabled;
+  }
 
   const child = new Deno.Command("deno", {
     args: [

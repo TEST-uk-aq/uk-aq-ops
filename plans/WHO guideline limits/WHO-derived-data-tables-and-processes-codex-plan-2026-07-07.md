@@ -11,7 +11,7 @@ Create a derived WHO guideline data layer for UK AQ that calculates and stores:
 
 1. Daily mean status for each AURN pollutant timeseries.
 2. Rolling 365-day WHO summary status for each AURN pollutant timeseries.
-3. Calendar-year and year-to-date WHO summary status for each AURN pollutant timeseries.
+3. Complete calendar-year WHO summary status for each AURN pollutant timeseries, with optional later year-to-date period summaries.
 4. Small public R2 JSON outputs that the website can read cheaply.
 5. R2 v2 parquet archives of the same derived outputs for rebuild/debug/history use.
 
@@ -95,13 +95,15 @@ Use these production defaults:
 - Valid daily mean: at least 18 valid distinct hourly readings assigned to that UTC/GMT sample day.
 - Valid rolling 365-day period: at least 274 valid daily means.
 - Valid complete calendar year: at least 274 valid daily means.
-- Valid year-to-date period: use a proportional 75% threshold based on elapsed days, with a minimum of 1 valid day.
+- Valid year-to-date period summary: optional/deferred. Do not use the fixed 274-day threshold and do not use a minimum of 1 valid day for public above/within classification.
 
-Suggested year-to-date threshold:
+If a year-to-date period summary is implemented later, always store `valid_day_count` and `period_day_count`, but only set `has_enough_data = true` when the period has enough valid daily means. Use a proportional threshold with a sensible minimum, for example:
 
 ```sql
-GREATEST(1, CEIL(period_day_count * 0.75))
+LEAST(period_day_count, GREATEST(14, CEIL(period_day_count * 0.75)))
 ```
+
+If this adds complexity, defer year-to-date period summaries to the later WHO page/league-table phase. Year-to-date daily square calendars do not use this period threshold because they are day-by-day displays, not period-level classifications.
 
 Store the thresholds used on each derived row so future changes are auditable.
 
@@ -271,7 +273,7 @@ Rules:
 
 ### 6.4 `uk_aq_ops.who_2021_calendar_year_status`
 
-Purpose: complete calendar years and current year-to-date summaries.
+Purpose: complete calendar years, plus optional current year-to-date summaries when enabled.
 
 Suggested columns:
 
@@ -459,6 +461,28 @@ For later site/timeseries daily calendars:
 history/v2/who_2021/site_daily_calendar/connector_id=N/pollutant_code=<pollutant>/timeseries_id=<id>.json
 ```
 
+### 7.4 Year-to-date daily square calendar
+
+The later WHO page may show a year-to-date daily square calendar for each timeseries/pollutant. This is not the same as a year-to-date mean classification. It should be driven directly from `uk_aq_ops.who_2021_daily_status`, one square per day.
+
+Each day should expose one of these public statuses:
+
+- `above_guideline`
+- `within_guideline`
+- `not_enough_data`
+- `no_data`
+
+Rules:
+
+- `above_guideline`: daily row exists, `valid_hour_count >= min_valid_hours_per_day`, and `above_who_daily_guideline = true`
+- `within_guideline`: daily row exists, `valid_hour_count >= min_valid_hours_per_day`, and `above_who_daily_guideline = false`
+- `not_enough_data`: hourly data existed for that day/timeseries, but fewer than the required valid hourly readings were available
+- `no_data`: no source data exists for that day/timeseries
+
+Do not apply the rolling/calendar 274-day minimum to the daily square calendar. The square calendar is a day-by-day display, not a period-level classification.
+
+The Phase 2 daily table already stores invalid daily rows with `has_enough_data = false`, nullable `daily_mean_ugm3`, nullable `above_who_daily_guideline`, and a `valid_hour_count`. That supports the basic square-calendar output. If later public UI needs to distinguish "no source rows" from "source rows existed but were filtered/invalid", add an explicit source-row count to the daily calculation or a separate availability output before publishing that distinction.
+
 Daily calendar JSON should contain compact per-day status rows for one timeseries or station/pollutant combination, for example:
 
 ```json
@@ -497,27 +521,57 @@ This should be a Cloud Run service, not a Cloud Run Job, so it can use:
 
 The service should still behave like a batch worker internally: one request performs one bounded calculation/publish run, records a `who_2021_processing_runs` row, and exits cleanly.
 
+### 8.1 Readiness gate and scheduler retry window
+
+Do not rely on the clock alone to decide that yesterday's source data is complete enough for WHO summary publication.
+
+Recommended scheduler pattern:
+
+- Cloud Scheduler calls `/run` hourly during a bounded morning window, for example 04:00-09:00 UTC.
+- Each call calculates `latest_complete_day_utc = yesterday`.
+- Before calculating or publishing summaries, the service checks whether the expected final hour-ending observations have arrived.
+- If the day is not ready, the service logs a clean deferred/no-op run and exits successfully.
+- If the day is ready, the service runs the daily/rolling/calendar calculations and publishes JSON.
+- If the day has already completed successfully, later scheduler calls for the same `latest_complete_day_utc` no-op.
+
+For `as_of_day_utc = 2026-07-02`, the final required hour-ending timestamp is:
+
+```text
+2026-07-03T00:00:00Z
+```
+
+Readiness checks should include:
+
+1. Final hour presence: rows exist for eligible GOV.UK AURN pollutant timeseries at `observed_at = next_day_utc 00:00:00Z`.
+2. Final hour coverage: per pollutant, enough active eligible timeseries have that final-hour row. Use a configurable threshold such as 90-95% rather than requiring 100%.
+3. Daily validity coverage: optionally dry-run or preview the daily calculation and require enough valid daily rows per pollutant before publishing public summary JSON.
+4. Idempotency: check `who_2021_processing_runs` and/or summary rows so a day is not recalculated and republished after a successful run unless explicitly requested.
+
+Prefer the hourly scheduler-window approach over dynamically moving Cloud Scheduler jobs. It is simpler, observable, and avoids marking a day complete while source ingest is still lagging.
+
 Pseudo workflow:
 
 1. Determine latest complete UTC/GMT day.
-2. Determine missing days in `who_2021_daily_status` for `source_network_code = 'gov_uk_aurn'` and pollutants `pm25`, `pm10`, and `no2`.
-3. For each missing day from the first missing day to latest complete day:
+2. Run the readiness gate for `latest_complete_day_utc` unless the request is an explicit backfill or dry-run that bypasses publication readiness.
+3. If the readiness gate is not met, log a deferred/no-op run and stop.
+4. Determine missing days in `who_2021_daily_status` for `source_network_code = 'gov_uk_aurn'` and pollutants `pm25`, `pm10`, and `no2`.
+5. For each missing day from the first missing day to latest complete day:
    - read observations for that derived sample day and network/pollutant set using the hour-ending window `(day_utc 00:00, next_day_utc 00:00]`
    - aggregate to distinct UTC/GMT hourly means first
    - assign each hourly row to `sample_day_utc = (observed_at - interval '1 hour')::date`
    - calculate daily means from valid hourly means for that `sample_day_utc`
    - require at least 18 valid distinct hours
    - upsert into `who_2021_daily_status`
-4. Recalculate rolling 365-day status for affected timeseries as of latest complete day.
-5. Upsert `who_2021_rolling_year_status`.
-6. Recalculate current year-to-date rows.
-7. If a previous calendar year is not final, calculate/finalise complete-year rows.
-8. Export newly created/updated derived rows to R2 v2 parquet.
-9. Write dated public summary JSON to R2.
-10. Replace `history/v2/who_2021/latest_who_2021.json` only after parquet/archive outputs and dated JSON complete.
-11. Log run status, counts, date range, warnings and failures.
+6. Recalculate rolling 365-day status for affected timeseries as of latest complete day.
+7. Upsert `who_2021_rolling_year_status`.
+8. Optionally recalculate current year-to-date rows when that later product is enabled.
+9. If a previous calendar year is not final, calculate/finalise complete-year rows.
+10. Export newly created/updated derived rows to R2 v2 parquet.
+11. Write dated public summary JSON to R2.
+12. Replace `history/v2/who_2021/latest_who_2021.json` only after parquet/archive outputs and dated JSON complete.
+13. Log run status, counts, date range, warnings and failures.
 
-Phase 2 implements the daily-status part of this workflow only: steps 1, 3 and 11. Steps 4 through 10 remain Phase 3/4 work.
+Phase 2 implements the daily-status part of this workflow only. Steps for readiness gating, rolling/calendar summaries, R2 publication and website data wiring remain Phase 3/4/5 work.
 
 The process should be idempotent. Re-running the same date should update the same primary keys, not create duplicates.
 
@@ -543,7 +597,7 @@ Backfill should:
 
 1. Calculate daily rows for the requested range.
 2. Recalculate rolling rows for every as-of day in the range, or at least for requested checkpoint days depending on performance.
-3. Recalculate complete calendar years and year-to-date rows.
+3. Recalculate complete calendar years, and optionally year-to-date rows when that later product is enabled.
 4. Export derived parquet outputs to R2 v2.
 5. Publish dated/latest JSON outputs when `--publish-json` is provided.
 
@@ -574,8 +628,10 @@ history/v2/who_2021/rolling_year_status/as_of_day_utc=YYYY-MM-DD/connector_id=N/
 ```
 
 ```text
-history/v2/who_2021/calendar_year_status/calendar_year=YYYY/period_type=<complete_year|year_to_date>/connector_id=N/pollutant_code=<pollutant>/part-xxxxx.parquet
+history/v2/who_2021/calendar_year_status/calendar_year=YYYY/period_type=complete_year/connector_id=N/pollutant_code=<pollutant>/part-xxxxx.parquet
 ```
+
+If optional year-to-date period summaries are enabled later, use the same `calendar_year_status` prefix with `period_type=year_to_date`.
 
 Recommended parquet columns should match the private Obs AQI DB tables closely. Keep column names stable so DuckDB can query the R2 archive later.
 
@@ -650,6 +706,8 @@ Processing, backfills, R2 parquet/JSON publication and website data wiring are i
 
 ### Phase 2: Daily daily-status calculation
 
+Status: implemented in code and schema. The Phase 2 RPCs have been applied and verified in TEST Obs AQI DB.
+
 Deliver:
 
 - A scheduled ops Cloud Run service that calculates `who_2021_daily_status` for GOV.UK AURN PM2.5, PM10 and NO2.
@@ -676,17 +734,52 @@ Implemented in this phase:
 - Implemented `daily`, `backfill`, and `dry_run` modes.
 - Implemented the hour-ending day rule inside the database RPC: daily rows use `observed_at > day_utc 00:00` and `observed_at <= next_day_utc 00:00`, and assign observations by `(observed_at - interval '1 hour')::date`.
 - Implemented 18 valid distinct hour-ending values per day as the default validity rule.
+- Verified in TEST Obs AQI DB that these service-role RPCs exist:
+  - `uk_aq_rpc_who_2021_daily_status_refresh`
+  - `uk_aq_rpc_who_2021_processing_run_log`
 - Left rolling-year, calendar-year, R2 parquet/JSON publication, and website data wiring for later phases.
 
 ### Phase 3: Rolling and calendar summary calculation
 
+Status: implemented in code and schema. Apply/deploy/operational validation are manual steps.
+
+Phase 3 does not replace the Phase 2 service. It extends the same WHO derived-data pipeline after daily rows exist.
+
+Phase 2 produces one per-timeseries/per-day fact table:
+
+- `uk_aq_ops.who_2021_daily_status`
+
+Phase 3 consumes those daily rows and produces the summary tables needed for homepage percentages, year cards and later league tables:
+
+- `uk_aq_ops.who_2021_rolling_year_status`
+- `uk_aq_ops.who_2021_calendar_year_status`
+
 Deliver:
 
 - Rolling 365-day summary calculation.
-- Calendar-year and year-to-date summary calculation.
+- Last complete calendar-year summary calculation.
 - 274 valid-day threshold for full-year/rolling periods.
-- Proportional 75% threshold for year-to-date rows.
+- Readiness gate before calculating/publishing the latest `as_of_day_utc`, including final-hour coverage checks and deferred no-op logging when source ingest is not ready.
 - In-memory/public-output builder that can create the 9 homepage card rows.
+- Year-to-date period summaries are optional/deferred. If included, use proportional completeness with a sensible minimum such as `LEAST(period_day_count, GREATEST(14, CEIL(period_day_count * 0.75)))`; do not use 274 days or a minimum of 1 valid day for YTD public classification.
+
+Implemented in this phase:
+
+- Added service-role readiness RPC:
+  - `uk_aq_public.uk_aq_rpc_who_2021_readiness_check`
+- Added service-role summary refresh RPC:
+  - `uk_aq_public.uk_aq_rpc_who_2021_summary_refresh`
+- Extended run logging so `who_2021_processing_runs` records daily, rolling and calendar upsert counts.
+- Extended the existing WHO Cloud Run service to:
+  - run the readiness gate for scheduled `daily` mode;
+  - log a deferred no-op if final-hour coverage is not ready;
+  - no-op if the latest `as_of_day_utc` has already completed successfully;
+  - refresh `who_2021_daily_status`;
+  - refresh rolling 365-day rows for `as_of_day_utc`;
+  - refresh last complete calendar-year rows;
+  - include the 9-row homepage summary JSON in `summary_json`.
+- Updated the deploy workflow default scheduler cron to `0 4-9 * * *` so Cloud Scheduler can call hourly during the UTC morning readiness window.
+- Left R2 parquet/JSON publication for Phase 4. The homepage summary is built but not yet written to R2.
 
 ### Phase 4: R2 v2 export/archive
 
@@ -715,8 +808,9 @@ Deliver later:
 
 - WHO guideline page at `/who-guidelines/`.
 - Rolling-year league tables from generated R2 JSON.
-- Calendar-year and year-to-date selectors from generated R2 JSON.
-- Later daily site/timeseries calendar JSON for month/year square views.
+- Calendar-year selectors from generated R2 JSON.
+- Optional year-to-date period selectors from generated R2 JSON if the page needs a YTD mean/status later.
+- Daily site/timeseries calendar JSON for month/year or year-to-date square views.
 - Show `sensors_not_enough_data` on the main WHO page, not on the homepage card.
 - Station detail links.
 - Clear explanation of WHO guidelines vs UK legal limits.
@@ -768,7 +862,7 @@ The implementation is done when:
 2. WHO guideline values are seeded.
 3. Daily status rows can be generated and upserted for `source_network_code = 'gov_uk_aurn'` and pollutants `pm25`, `pm10`, and `no2`.
 4. Rolling-year rows can be generated and upserted.
-5. Calendar-year and year-to-date rows can be generated and upserted.
+5. Last complete calendar-year rows can be generated and upserted.
 6. R2 v2 parquet archives are written to the agreed paths.
 7. Dated summary JSON is written for the latest processed day.
 8. `history/v2/who_2021/latest_who_2021.json` returns 9 homepage card rows for the latest processed day.

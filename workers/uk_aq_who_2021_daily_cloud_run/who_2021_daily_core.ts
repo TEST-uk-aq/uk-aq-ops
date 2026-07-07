@@ -11,6 +11,10 @@ export type RunConfig = {
   sourceNetworkCode: string;
   pollutantCodes: string[];
   minValidHoursPerDay: number;
+  minValidDays: number;
+  minFinalHourCoverageRatio: number;
+  readinessGateEnabled: boolean;
+  summaryRefreshEnabled: boolean;
   chunkDays: number;
   dryRun: boolean;
 };
@@ -37,6 +41,61 @@ export type DailyRefreshRpcRow = {
   valid_timeseries_days: number;
   not_enough_data_timeseries_days: number;
   rows_upserted: number;
+  dry_run: boolean;
+};
+
+export type ReadinessRpcPayload = {
+  p_as_of_day_utc: string;
+  p_connector_id: number;
+  p_source_network_code: string;
+  p_pollutant_codes: string[];
+  p_min_final_hour_coverage_ratio: number;
+};
+
+export type ReadinessRpcRow = {
+  as_of_day_utc: string;
+  connector_id: number;
+  source_network_code: string;
+  pollutant_code: string;
+  eligible_timeseries_count: number;
+  final_hour_timeseries_count: number;
+  final_hour_coverage_ratio: number;
+  final_hour_observed_at: string;
+  pollutant_ready: boolean;
+  all_pollutants_ready: boolean;
+  already_completed: boolean;
+};
+
+export type ReadinessSummary = {
+  checked: boolean;
+  ready: boolean;
+  already_completed: boolean;
+  as_of_day_utc: string;
+  final_hour_observed_at: string | null;
+  pollutant_rows: ReadinessRpcRow[];
+};
+
+export type SummaryRefreshRpcPayload = {
+  p_as_of_day_utc: string;
+  p_connector_id: number;
+  p_source_network_code: string;
+  p_pollutant_codes: string[];
+  p_min_valid_days: number;
+  p_min_valid_hours_per_day: number;
+  p_dry_run: boolean;
+};
+
+export type SummaryRefreshRpcRow = {
+  as_of_day_utc: string;
+  connector_id: number;
+  source_network_code: string;
+  pollutant_codes: string[];
+  rolling_window_start_day_utc: string;
+  rolling_window_end_day_utc: string;
+  calendar_year: number;
+  rolling_rows_upserted: number;
+  calendar_rows_upserted: number;
+  homepage_summary: Record<string, unknown> | null;
   dry_run: boolean;
 };
 
@@ -139,6 +198,10 @@ export function buildRunConfig(params: {
   sourceNetworkCode: string;
   pollutantCodes: string[];
   minValidHoursPerDay: number;
+  minValidDays: number;
+  minFinalHourCoverageRatio: number;
+  readinessGateEnabled: boolean;
+  summaryRefreshEnabled: boolean;
   chunkDays: number;
 }): RunConfig {
   const latestComplete = latestCompleteDayUtc(
@@ -173,6 +236,9 @@ export function buildRunConfig(params: {
   if (params.minValidHoursPerDay < 1 || params.minValidHoursPerDay > 24) {
     throw new Error("min_valid_hours_per_day must be between 1 and 24");
   }
+  if (!Number.isFinite(params.minFinalHourCoverageRatio)) {
+    throw new Error("min_final_hour_coverage_ratio must be finite");
+  }
 
   return {
     runMode: params.runMode,
@@ -185,6 +251,10 @@ export function buildRunConfig(params: {
       "gov_uk_aurn",
     pollutantCodes: params.pollutantCodes,
     minValidHoursPerDay: Math.trunc(params.minValidHoursPerDay),
+    minValidDays: Math.max(1, Math.trunc(params.minValidDays)),
+    minFinalHourCoverageRatio: clampRatio(params.minFinalHourCoverageRatio),
+    readinessGateEnabled: params.readinessGateEnabled,
+    summaryRefreshEnabled: params.summaryRefreshEnabled,
     chunkDays: Math.max(1, Math.trunc(params.chunkDays)),
     dryRun,
   };
@@ -208,6 +278,18 @@ export function buildDayChunks(
   return chunks;
 }
 
+export function buildReadinessPayload(
+  config: RunConfig,
+): ReadinessRpcPayload {
+  return {
+    p_as_of_day_utc: config.endDayUtc,
+    p_connector_id: config.connectorId,
+    p_source_network_code: config.sourceNetworkCode,
+    p_pollutant_codes: config.pollutantCodes,
+    p_min_final_hour_coverage_ratio: config.minFinalHourCoverageRatio,
+  };
+}
+
 export function buildDailyRefreshPayload(
   config: RunConfig,
   chunk: { startDayUtc: string; endDayUtc: string },
@@ -218,6 +300,20 @@ export function buildDailyRefreshPayload(
     p_connector_id: config.connectorId,
     p_source_network_code: config.sourceNetworkCode,
     p_pollutant_codes: config.pollutantCodes,
+    p_min_valid_hours_per_day: config.minValidHoursPerDay,
+    p_dry_run: config.dryRun,
+  };
+}
+
+export function buildSummaryRefreshPayload(
+  config: RunConfig,
+): SummaryRefreshRpcPayload {
+  return {
+    p_as_of_day_utc: config.endDayUtc,
+    p_connector_id: config.connectorId,
+    p_source_network_code: config.sourceNetworkCode,
+    p_pollutant_codes: config.pollutantCodes,
+    p_min_valid_days: config.minValidDays,
     p_min_valid_hours_per_day: config.minValidHoursPerDay,
     p_dry_run: config.dryRun,
   };
@@ -245,8 +341,33 @@ export function mergeDailyRefreshRows(
   };
 }
 
+export function summarizeReadinessRows(
+  rows: ReadinessRpcRow[],
+  asOfDayUtc: string,
+): ReadinessSummary {
+  return {
+    checked: true,
+    ready: rows.length > 0 && rows.every((row) => row.pollutant_ready),
+    already_completed: rows.some((row) => row.already_completed),
+    as_of_day_utc: asOfDayUtc,
+    final_hour_observed_at: rows[0]?.final_hour_observed_at || null,
+    pollutant_rows: rows,
+  };
+}
+
+export function shouldRunReadinessGate(config: RunConfig): boolean {
+  return config.readinessGateEnabled &&
+    config.runMode === "daily" &&
+    !config.dryRun;
+}
+
 function minIsoDay(a: string, b: string): string {
   return compareIsoDay(a, b) <= 0 ? a : b;
+}
+
+function clampRatio(value: number): number {
+  if (!Number.isFinite(value)) return 0.9;
+  return Math.min(1, Math.max(0, value));
 }
 
 function sumRows(

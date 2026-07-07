@@ -3,11 +3,15 @@ import {
   addDays,
   buildDailyRefreshPayload,
   buildDayChunks,
+  buildReadinessPayload,
   buildRunConfig,
+  buildSummaryRefreshPayload,
   daysBetweenInclusive,
   latestCompleteDayUtc,
   mergeDailyRefreshRows,
   parsePollutantCodes,
+  shouldRunReadinessGate,
+  summarizeReadinessRows,
 } from "./who_2021_daily_core.ts";
 
 Deno.test("latest complete day waits for maturity delay after UTC midnight", () => {
@@ -36,6 +40,10 @@ Deno.test("daily mode builds a latest-complete lookback window", () => {
     sourceNetworkCode: "GOV_UK_AURN",
     pollutantCodes: ["pm25", "pm10", "no2"],
     minValidHoursPerDay: 18,
+    minValidDays: 274,
+    minFinalHourCoverageRatio: 0.9,
+    readinessGateEnabled: true,
+    summaryRefreshEnabled: true,
     chunkDays: 31,
   });
 
@@ -44,6 +52,9 @@ Deno.test("daily mode builds a latest-complete lookback window", () => {
   assert.equal(config.latestCompleteDayUtc, "2026-07-06");
   assert.equal(config.sourceNetworkCode, "gov_uk_aurn");
   assert.equal(config.dryRun, false);
+  assert.equal(config.minValidDays, 274);
+  assert.equal(config.minFinalHourCoverageRatio, 0.9);
+  assert.equal(shouldRunReadinessGate(config), true);
 });
 
 Deno.test("backfill requires explicit range and chunks inclusively", () => {
@@ -59,6 +70,10 @@ Deno.test("backfill requires explicit range and chunks inclusively", () => {
     sourceNetworkCode: "gov_uk_aurn",
     pollutantCodes: ["pm25"],
     minValidHoursPerDay: 18,
+    minValidDays: 274,
+    minFinalHourCoverageRatio: 0.9,
+    readinessGateEnabled: true,
+    summaryRefreshEnabled: true,
     chunkDays: 2,
   });
   const chunks = buildDayChunks(
@@ -89,6 +104,10 @@ Deno.test("refresh payload preserves hour-ending daily RPC inputs", () => {
     sourceNetworkCode: "gov_uk_aurn",
     pollutantCodes: parsePollutantCodes("PM25, pm10, no2, pm25"),
     minValidHoursPerDay: 18,
+    minValidDays: 274,
+    minFinalHourCoverageRatio: 0.95,
+    readinessGateEnabled: true,
+    summaryRefreshEnabled: true,
     chunkDays: 31,
   });
   const payload = buildDailyRefreshPayload(config, {
@@ -104,6 +123,85 @@ Deno.test("refresh payload preserves hour-ending daily RPC inputs", () => {
     p_pollutant_codes: ["pm25", "pm10", "no2"],
     p_min_valid_hours_per_day: 18,
     p_dry_run: true,
+  });
+  assert.equal(shouldRunReadinessGate(config), false);
+});
+
+Deno.test("readiness and summary payloads use phase 3 settings", () => {
+  const config = buildRunConfig({
+    runMode: "daily",
+    triggerMode: "scheduler",
+    now: new Date("2026-07-07T14:00:00.000Z"),
+    explicitStartDayUtc: "2026-07-02",
+    explicitEndDayUtc: "2026-07-02",
+    lookbackDays: 1,
+    maturityDelayHours: 3,
+    connectorId: 1,
+    sourceNetworkCode: "gov_uk_aurn",
+    pollutantCodes: ["pm25", "pm10", "no2"],
+    minValidHoursPerDay: 18,
+    minValidDays: 274,
+    minFinalHourCoverageRatio: 0.95,
+    readinessGateEnabled: true,
+    summaryRefreshEnabled: true,
+    chunkDays: 31,
+  });
+
+  assert.deepEqual(buildReadinessPayload(config), {
+    p_as_of_day_utc: "2026-07-02",
+    p_connector_id: 1,
+    p_source_network_code: "gov_uk_aurn",
+    p_pollutant_codes: ["pm25", "pm10", "no2"],
+    p_min_final_hour_coverage_ratio: 0.95,
+  });
+  assert.deepEqual(buildSummaryRefreshPayload(config), {
+    p_as_of_day_utc: "2026-07-02",
+    p_connector_id: 1,
+    p_source_network_code: "gov_uk_aurn",
+    p_pollutant_codes: ["pm25", "pm10", "no2"],
+    p_min_valid_days: 274,
+    p_min_valid_hours_per_day: 18,
+    p_dry_run: false,
+  });
+});
+
+Deno.test("readiness summary defers until every pollutant is ready", () => {
+  const rows = [
+    {
+      as_of_day_utc: "2026-07-02",
+      connector_id: 1,
+      source_network_code: "gov_uk_aurn",
+      pollutant_code: "pm25",
+      eligible_timeseries_count: 145,
+      final_hour_timeseries_count: 145,
+      final_hour_coverage_ratio: 1,
+      final_hour_observed_at: "2026-07-03T00:00:00Z",
+      pollutant_ready: true,
+      all_pollutants_ready: false,
+      already_completed: false,
+    },
+    {
+      as_of_day_utc: "2026-07-02",
+      connector_id: 1,
+      source_network_code: "gov_uk_aurn",
+      pollutant_code: "pm10",
+      eligible_timeseries_count: 135,
+      final_hour_timeseries_count: 100,
+      final_hour_coverage_ratio: 0.7407,
+      final_hour_observed_at: "2026-07-03T00:00:00Z",
+      pollutant_ready: false,
+      all_pollutants_ready: false,
+      already_completed: false,
+    },
+  ];
+
+  assert.deepEqual(summarizeReadinessRows(rows, "2026-07-02"), {
+    checked: true,
+    ready: false,
+    already_completed: false,
+    as_of_day_utc: "2026-07-02",
+    final_hour_observed_at: "2026-07-03T00:00:00Z",
+    pollutant_rows: rows,
   });
 });
 

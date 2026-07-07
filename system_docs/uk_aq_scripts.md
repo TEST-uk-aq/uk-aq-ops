@@ -93,14 +93,21 @@
 ## Cloud Run workers
 
 - `workers/uk_aq_who_2021_daily_cloud_run/run_service.ts`
-  - Scheduled Cloud Run service for WHO 2021 daily derived status rows.
+  - Scheduled Cloud Run service for WHO 2021 derived status rows.
   - `GET /` and `GET /health` return a lightweight health response.
   - `POST /` and `POST /run` run one bounded daily/backfill/dry-run calculation.
   - Uses service-role RPCs in Obs AQI DB:
     - `uk_aq_public.uk_aq_rpc_who_2021_daily_status_refresh`
+    - `uk_aq_public.uk_aq_rpc_who_2021_readiness_check`
+    - `uk_aq_public.uk_aq_rpc_who_2021_summary_refresh`
     - `uk_aq_public.uk_aq_rpc_who_2021_processing_run_log`
-  - Phase 2 scope is `uk_aq_ops.who_2021_daily_status` only. Rolling-year,
-    calendar-year and R2 JSON/parquet outputs are later phases.
+  - Current scope writes `uk_aq_ops.who_2021_daily_status`,
+    `uk_aq_ops.who_2021_rolling_year_status`, and last-complete-year rows in
+    `uk_aq_ops.who_2021_calendar_year_status`. R2 JSON/parquet publication is
+    a later phase.
+  - Scheduled daily runs use a readiness gate before latest-summary refresh:
+    the final hour-ending source timestamp must have enough per-pollutant
+    eligible-timeseries coverage, otherwise the run logs a deferred no-op.
   - Daily windows use hour-ending source semantics: `(day 00:00, next day
     00:00]`, equivalent to `01:00` through next-day `00:00` UTC/GMT for GOV.UK
     AURN.
