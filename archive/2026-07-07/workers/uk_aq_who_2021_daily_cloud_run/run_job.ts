@@ -1,13 +1,9 @@
-declare const Deno: any;
-declare global { interface ImportMeta { main?: boolean; } }
 import {
   buildDailyRefreshPayload,
   buildDayChunks,
   buildReadinessPayload,
   buildRunConfig,
   buildSummaryRefreshPayload,
-  buildR2PublishPlan,
-  stableJson,
   DailyRefreshRpcRow,
   mergeDailyRefreshRows,
   parsePollutantCodes,
@@ -38,22 +34,6 @@ const READINESS_RPC = (Deno.env.get("UK_AQ_WHO_2021_READINESS_RPC") ||
 const SUMMARY_REFRESH_RPC =
   (Deno.env.get("UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC") ||
     "uk_aq_rpc_who_2021_summary_refresh").trim();
-const PARQUET_EXPORT_RPC = (Deno.env.get("UK_AQ_WHO_2021_PARQUET_EXPORT_RPC") ||
-  "uk_aq_rpc_who_2021_r2_parquet_export").trim();
-const R2_PUBLISH_ENABLED = parseBoolean(
-  Deno.env.get("UK_AQ_WHO_2021_R2_PUBLISH_ENABLED"),
-  false,
-);
-const PARQUET_EXPORT_ENABLED = parseBoolean(
-  Deno.env.get("UK_AQ_WHO_2021_PARQUET_EXPORT_ENABLED"),
-  R2_PUBLISH_ENABLED,
-);
-const R2_ENDPOINT = optionalEnv("R2_ENDPOINT") || optionalEnv("CLOUDFLARE_R2_ENDPOINT");
-const R2_BUCKET = optionalEnv("R2_BUCKET") || optionalEnv("CLOUDFLARE_R2_BUCKET");
-const R2_REGION = optionalEnv("R2_REGION") || "auto";
-const R2_ACCESS_KEY_ID = optionalEnv("R2_ACCESS_KEY_ID") || optionalEnv("CLOUDFLARE_R2_ACCESS_KEY_ID");
-const R2_SECRET_ACCESS_KEY = optionalEnv("R2_SECRET_ACCESS_KEY") || optionalEnv("CLOUDFLARE_R2_SECRET_ACCESS_KEY");
-
 const RUN_LOG_RPC = (Deno.env.get("UK_AQ_WHO_2021_RUN_LOG_RPC") ||
   "uk_aq_rpc_who_2021_processing_run_log").trim();
 const RPC_RETRIES = parsePositiveInt(
@@ -236,110 +216,6 @@ function errorJson(error: unknown): Record<string, unknown> {
   };
 }
 
-
-async function sha256Hex(data: Uint8Array | string): Promise<string> {
-  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
-  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function hmacSha256(key: Uint8Array | string, data: string): Promise<Uint8Array> {
-  const rawKey = typeof key === "string" ? new TextEncoder().encode(key) : key;
-  const cryptoKey = await crypto.subtle.importKey("raw", rawKey as BufferSource, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  return new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data)));
-}
-
-function hex(bytes: Uint8Array): string {
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function amzDate(date: Date): string {
-  return date.toISOString().replace(/[:-]|\.\d{3}/g, "");
-}
-
-function encodePathPart(value: string): string {
-  return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
-}
-
-async function signedR2Put(objectKey: string, body: Uint8Array | string, contentType: string): Promise<void> {
-  if (!R2_ENDPOINT || !R2_BUCKET || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
-    throw new Error("R2 publication is enabled but R2 endpoint/bucket/access key/secret key env vars are incomplete");
-  }
-  const payload = typeof body === "string" ? new TextEncoder().encode(body) : body;
-  const payloadHash = await sha256Hex(payload);
-  const endpoint = new URL(R2_ENDPOINT.replace(/\/$/, ""));
-  const canonicalUri = `/${R2_BUCKET}/${objectKey.split("/").filter(Boolean).map(encodePathPart).join("/")}`;
-  const now = new Date();
-  const stamp = amzDate(now);
-  const dateStamp = stamp.slice(0, 8);
-  const headers = {
-    "content-type": contentType,
-    host: endpoint.host,
-    "x-amz-content-sha256": payloadHash,
-    "x-amz-date": stamp,
-  };
-  const canonicalHeaders = Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}:${v}`).join("\n");
-  const signedHeaders = Object.keys(headers).sort().join(";");
-  const canonicalRequest = ["PUT", canonicalUri, "", `${canonicalHeaders}\n`, signedHeaders, payloadHash].join("\n");
-  const scope = `${dateStamp}/${R2_REGION}/s3/aws4_request`;
-  const kDate = await hmacSha256(`AWS4${R2_SECRET_ACCESS_KEY}`, dateStamp);
-  const kRegion = await hmacSha256(kDate, R2_REGION);
-  const kService = await hmacSha256(kRegion, "s3");
-  const kSigning = await hmacSha256(kService, "aws4_request");
-  const stringToSign = ["AWS4-HMAC-SHA256", stamp, scope, await sha256Hex(canonicalRequest)].join("\n");
-  const signature = hex(await hmacSha256(kSigning, stringToSign));
-  const url = new URL(R2_ENDPOINT.replace(/\/$/, ""));
-  url.pathname = canonicalUri;
-  const response = await fetch(url, {
-    method: "PUT",
-    headers: {
-      ...headers,
-      authorization: `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-    },
-    body: payload as BodyInit,
-  });
-  if (!response.ok) {
-    throw new Error(`R2 PUT failed for ${objectKey}: HTTP ${response.status} ${await response.text().catch(() => "")}`);
-  }
-}
-
-type ParquetExportPart = { object_key: string; content_base64: string; content_type?: string };
-
-async function publishPhase4(args: { config: ReturnType<typeof buildRunConfig>; summaryRefresh: SummaryRefreshRpcRow | null; homepageSummary: Record<string, unknown> | null; }): Promise<Record<string, unknown>> {
-  if (!args.config.r2PublishEnabled || args.config.dryRun || !args.summaryRefresh || !args.homepageSummary) {
-    return { enabled: args.config.r2PublishEnabled, skipped: true };
-  }
-  const plan = buildR2PublishPlan({
-    asOfDayUtc: args.config.endDayUtc,
-    connectorId: args.config.connectorId,
-    pollutantCodes: args.config.pollutantCodes,
-    calendarYear: args.summaryRefresh.calendar_year,
-  });
-  const parquetObjects: string[] = [];
-  if (args.config.parquetExportEnabled) {
-    const result = await postgrestRpc<unknown>(PARQUET_EXPORT_RPC, {
-      p_as_of_day_utc: args.config.endDayUtc,
-      p_start_day_utc: args.config.startDayUtc,
-      p_end_day_utc: args.config.endDayUtc,
-      p_connector_id: args.config.connectorId,
-      p_source_network_code: args.config.sourceNetworkCode,
-      p_pollutant_codes: args.config.pollutantCodes,
-    });
-    if (result.error) throw new Error(`parquet export RPC failed: ${result.error.message}`);
-    const parts = (Array.isArray(result.data) ? result.data : []) as ParquetExportPart[];
-    for (const part of parts) {
-      if (!part.object_key || !part.content_base64) continue;
-      const bytes = Uint8Array.from(atob(part.content_base64), (c) => c.charCodeAt(0));
-      await signedR2Put(part.object_key, bytes, part.content_type || "application/vnd.apache.parquet");
-      parquetObjects.push(part.object_key);
-    }
-  }
-  const body = stableJson(args.homepageSummary);
-  await signedR2Put(plan.datedSummaryKey, body, "application/json; charset=utf-8");
-  await signedR2Put(plan.latestSummaryKey, body, "application/json; charset=utf-8");
-  return { enabled: true, skipped: false, plan, parquet_objects_written: parquetObjects.length, parquet_object_keys: parquetObjects, summary_object_keys: [plan.datedSummaryKey, plan.latestSummaryKey] };
-}
-
 async function logRun(args: {
   runMode: string;
   triggerMode: string;
@@ -405,8 +281,6 @@ async function main(): Promise<void> {
     minFinalHourCoverageRatio: MIN_FINAL_HOUR_COVERAGE_RATIO,
     readinessGateEnabled: READINESS_GATE_ENABLED,
     summaryRefreshEnabled: SUMMARY_REFRESH_ENABLED,
-    r2PublishEnabled: R2_PUBLISH_ENABLED,
-    parquetExportEnabled: PARQUET_EXPORT_ENABLED,
     chunkDays: CHUNK_DAYS,
   });
   const chunks = buildDayChunks(
@@ -421,7 +295,6 @@ async function main(): Promise<void> {
   let alreadyCompleted = false;
   let runStatus: "ok" | "error" | "dry_run" = config.dryRun ? "dry_run" : "ok";
   let capturedError: unknown = null;
-  let r2PublishSummary: Record<string, unknown> | null = null;
 
   try {
     if (shouldRunReadinessGate(config)) {
@@ -491,9 +364,6 @@ async function main(): Promise<void> {
         }
         summaryRefreshRows.push(...parseSummaryRefreshRows(result.data));
       }
-
-      const homepageSummary = summaryRefreshRows[0]?.homepage_summary as Record<string, unknown> | null || null;
-      r2PublishSummary = await publishPhase4({ config, summaryRefresh: summaryRefreshRows[0] || null, homepageSummary });
     }
   } catch (error) {
     runStatus = "error";
@@ -520,9 +390,6 @@ async function main(): Promise<void> {
     min_final_hour_coverage_ratio: config.minFinalHourCoverageRatio,
     readiness_gate_enabled: config.readinessGateEnabled,
     summary_refresh_enabled: config.summaryRefreshEnabled,
-    r2_publish_enabled: config.r2PublishEnabled,
-    parquet_export_enabled: config.parquetExportEnabled,
-    r2_publish: r2PublishSummary,
     dry_run: config.dryRun,
     readiness: readinessSummary,
     rolling_rows_upserted: Number(summaryRefresh?.rolling_rows_upserted) || 0,

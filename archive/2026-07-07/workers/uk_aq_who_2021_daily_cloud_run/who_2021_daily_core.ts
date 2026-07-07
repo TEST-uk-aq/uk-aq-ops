@@ -15,8 +15,6 @@ export type RunConfig = {
   minFinalHourCoverageRatio: number;
   readinessGateEnabled: boolean;
   summaryRefreshEnabled: boolean;
-  r2PublishEnabled?: boolean;
-  parquetExportEnabled?: boolean;
   chunkDays: number;
   dryRun: boolean;
 };
@@ -99,17 +97,6 @@ export type SummaryRefreshRpcRow = {
   calendar_rows_upserted: number;
   homepage_summary: Record<string, unknown> | null;
   dry_run: boolean;
-};
-
-export type R2PublishPlan = {
-  datedSummaryKey: string;
-  latestSummaryKey: string;
-  dailyCacheQuery: string;
-  parquetPrefixes: {
-    dailyStatus: string;
-    rollingYearStatus: string;
-    calendarYearStatus: string;
-  };
 };
 
 export type DailyRefreshSummary = {
@@ -215,8 +202,6 @@ export function buildRunConfig(params: {
   minFinalHourCoverageRatio: number;
   readinessGateEnabled: boolean;
   summaryRefreshEnabled: boolean;
-  r2PublishEnabled?: boolean;
-  parquetExportEnabled?: boolean;
   chunkDays: number;
 }): RunConfig {
   const latestComplete = latestCompleteDayUtc(
@@ -270,8 +255,6 @@ export function buildRunConfig(params: {
     minFinalHourCoverageRatio: clampRatio(params.minFinalHourCoverageRatio),
     readinessGateEnabled: params.readinessGateEnabled,
     summaryRefreshEnabled: params.summaryRefreshEnabled,
-    r2PublishEnabled: Boolean(params.r2PublishEnabled),
-    parquetExportEnabled: Boolean(params.parquetExportEnabled),
     chunkDays: Math.max(1, Math.trunc(params.chunkDays)),
     dryRun,
   };
@@ -395,42 +378,4 @@ function sumRows(
     const value = Number(row[key]);
     return total + (Number.isFinite(value) ? value : 0);
   }, 0);
-}
-
-
-export function stableJson(value: unknown): string {
-  return `${JSON.stringify(sortJsonValue(value), null, 2)}\n`;
-}
-
-export function buildR2PublishPlan(args: {
-  asOfDayUtc: string;
-  connectorId: number;
-  pollutantCodes: string[];
-  calendarYear: number | null | undefined;
-}): R2PublishPlan {
-  assertIsoDay(args.asOfDayUtc, "asOfDayUtc");
-  const connector = `connector_id=${args.connectorId}`;
-  const pollutant = "pollutant_code=<pollutant>";
-  const calendarYear = Number(args.calendarYear) || Number(args.asOfDayUtc.slice(0, 4)) - 1;
-  return {
-    datedSummaryKey: `history/v2/who_2021/summaries/as_of_day_utc=${args.asOfDayUtc}/who_2021_summary.json`,
-    latestSummaryKey: "history/v2/who_2021/latest_who_2021.json",
-    dailyCacheQuery: `?as_of=${args.asOfDayUtc}`,
-    parquetPrefixes: {
-      dailyStatus: `history/v2/who_2021/daily_status/day_utc=<YYYY-MM-DD>/${connector}/${pollutant}/`,
-      rollingYearStatus: `history/v2/who_2021/rolling_year_status/as_of_day_utc=${args.asOfDayUtc}/${connector}/${pollutant}/`,
-      calendarYearStatus: `history/v2/who_2021/calendar_year_status/calendar_year=${calendarYear}/period_type=complete_year/${connector}/${pollutant}/`,
-    },
-  };
-}
-
-function sortJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortJsonValue);
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(record).sort()) out[key] = sortJsonValue(record[key]);
-    return out;
-  }
-  return value;
 }
