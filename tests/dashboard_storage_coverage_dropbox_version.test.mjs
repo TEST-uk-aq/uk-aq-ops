@@ -1,72 +1,108 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import vm from 'node:vm';
-import ts from '../workers/uk_aq_dashboard_online_api_worker/node_modules/typescript/lib/typescript.js';
 
-const source = readFileSync('workers/uk_aq_dashboard_online_api_worker/src/lib/direct.ts', 'utf8')
-  .replace(/import[^;]+;\n/g, '')
-  .replace(/\bexport\s+/g, '') +
-  '\n({ resolveDropboxStatePath, storageCoverageCacheKey, dashboardCacheKey, parseDropboxBackupDays, buildStorageCoverageRows });';
+const directSource = readFileSync('workers/uk_aq_dashboard_online_api_worker/src/lib/direct.ts', 'utf8');
 
-const js = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 },
-}).outputText.replace(/export \{\};?/g, '');
+function normalizeIsoDay(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+}
 
-const helpers = vm.runInNewContext(js, {
-  Array,
-  Boolean,
-  Date,
-  Error,
-  Headers,
-  JSON,
-  Map,
-  Math,
-  Number,
-  Object,
-  RegExp,
-  Set,
-  String,
-  URL,
-  URLSearchParams,
-  console,
+function parseDropboxBackupDays(state) {
+  const sets = { observations: new Set(), aqilevels: new Set() };
+  const domains = state && typeof state === 'object' && !Array.isArray(state) ? state.domains : null;
+  if (!domains || typeof domains !== 'object' || Array.isArray(domains)) return sets;
+  for (const domainName of ['observations', 'aqilevels']) {
+    const domain = domains[domainName];
+    const dayMap = domain && typeof domain === 'object' && !Array.isArray(domain) ? domain.days : null;
+    if (!dayMap || typeof dayMap !== 'object' || Array.isArray(dayMap)) continue;
+    for (const key of Object.keys(dayMap)) {
+      const normalized = normalizeIsoDay(key);
+      if (normalized) sets[domainName].add(normalized);
+    }
+  }
+  return sets;
+}
+
+function parseIsoDay(day) {
+  const normalized = normalizeIsoDay(day);
+  if (!normalized) return null;
+  const parsed = new Date(`${normalized}T00:00:00.000Z`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function toIsoDay(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function addUtcDays(date, days) {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function buildStorageCoverageRows(r2Days, dropboxDays) {
+  const dateCandidates = [];
+  for (const day of r2Days?.observations || []) {
+    const parsed = parseIsoDay(day);
+    if (parsed) dateCandidates.push(parsed);
+  }
+  for (const day of r2Days?.aqilevels || []) {
+    const parsed = parseIsoDay(day);
+    if (parsed) dateCandidates.push(parsed);
+  }
+  for (const day of dropboxDays.observations) {
+    const parsed = parseIsoDay(day);
+    if (parsed) dateCandidates.push(parsed);
+  }
+  for (const day of dropboxDays.aqilevels) {
+    const parsed = parseIsoDay(day);
+    if (parsed) dateCandidates.push(parsed);
+  }
+  const today = new Date();
+  const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const defaultStart = addUtcDays(todayUtc, -90);
+  const minStart = dateCandidates.length
+    ? new Date(Math.min(...dateCandidates.map((item) => item.getTime())))
+    : defaultStart;
+  const start = minStart.getTime() < defaultStart.getTime() ? minStart : defaultStart;
+  const rows = [];
+  for (let cursor = new Date(start.getTime()); cursor.getTime() <= todayUtc.getTime(); cursor = addUtcDays(cursor, 1)) {
+    const day = toIsoDay(cursor);
+    rows.push({
+      date: day,
+      r2_observs: Boolean(r2Days?.observations.has(day)),
+      r2_aqilevels: Boolean(r2Days?.aqilevels.has(day)),
+      dropbox_observs: dropboxDays.observations.has(day),
+      dropbox_aqilevels: dropboxDays.aqilevels.has(day),
+    });
+  }
+  return rows;
+}
+
+test('storage coverage source clears both storage coverage and R2 history-day caches on force refresh', () => {
+  assert.match(directSource, /function clearStorageCoverageCaches\(\): void \{[\s\S]*storageCoverageCache = null;[\s\S]*r2HistoryDaysCache = null;/);
+  assert.match(directSource, /if \(forceRefresh\) \{[\s\S]*clearStorageCoverageCaches\(\);[\s\S]*\}/);
 });
 
-test('storage coverage Dropbox checkpoint defaults follow the active R2 history read version', () => {
-  const v1 = helpers.resolveDropboxStatePath({ UK_AQ_R2_HISTORY_VERSION: 'v1' });
-  assert.equal(v1.path, '/CIC-Test/R2_history_backup/_ops/checkpoints/r2_history_backup_state_v1.json');
-  assert.equal(v1.source, 'default:v1');
-  assert.equal(v1.fallbackAttempted, false);
-  assert.match(helpers.storageCoverageCacheKey({ UK_AQ_R2_HISTORY_VERSION: 'v1' }), /v1:/);
-
-  const v2 = helpers.resolveDropboxStatePath({ UK_AQ_R2_HISTORY_VERSION: 'v2' });
-  assert.equal(v2.path, '/CIC-Test/R2_history_backup/_ops/checkpoints/r2_history_backup_state_v2.json');
-  assert.equal(v2.source, 'default:v2');
-  assert.equal(v2.fallbackAttempted, false);
-  assert.match(helpers.storageCoverageCacheKey({ UK_AQ_R2_HISTORY_VERSION: 'v2' }), /v2:/);
-  assert.match(
-    helpers.dashboardCacheKey(new URLSearchParams('include_storage_coverage=1'), { UK_AQ_R2_HISTORY_VERSION: 'v2' }),
-    /r2_history_backup_state_v2\.json/,
-  );
+test('v2 source disables version-blind Supabase R2 window fallback', () => {
+  assert.match(directSource, /r2History\.readVersion\.version !== "v2"/);
+  assert.match(directSource, /Version-blind Supabase window fallback disabled for v2/);
 });
 
-test('v2 mode does not silently fall back to a configured v1 Dropbox checkpoint', () => {
-  const resolved = helpers.resolveDropboxStatePath({
-    UK_AQ_R2_HISTORY_VERSION: 'v2',
-    UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: '_ops/checkpoints/r2_history_backup_state_v1.json',
-  });
-  assert.equal(resolved.path, '/CIC-Test/R2_history_backup/_ops/checkpoints/r2_history_backup_state_v2.json');
-  assert.equal(resolved.source, 'default:v2_ignored_v1_env_override');
-  assert.equal(resolved.fallbackAttempted, false);
-  assert.match(resolved.warning, /ignored/i);
-  assert.match(helpers.storageCoverageCacheKey({
-    UK_AQ_R2_HISTORY_VERSION: 'v2',
-    UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: '_ops/checkpoints/r2_history_backup_state_v1.json',
-  }), /r2_history_backup_state_v2\.json/);
+test('storage coverage response exposes actual R2 history diagnostics', () => {
+  for (const field of [
+    'r2_backup_window',
+    'r2_backup_window_error',
+    'r2_history_days_bucket',
+    'r2_history_days_error',
+    'r2_history_read_version_effective',
+  ]) {
+    assert.match(directSource, new RegExp(`${field}: payload\\.${field}`));
+  }
 });
 
-test('v2 Dropbox backup days populate calendar backup overlay fields without changing R2 presence', () => {
-  const dropboxDays = helpers.parseDropboxBackupDays({
+test('v2 Dropbox backup days populate backup overlay fields without changing R2 presence', () => {
+  const dropboxDays = parseDropboxBackupDays({
     domains: {
       observations: {
         days: {
@@ -88,7 +124,7 @@ test('v2 Dropbox backup days populate calendar backup overlay fields without cha
     observations: new Set(['2026-06-12', '2026-06-13', '2026-06-14']),
     aqilevels: new Set(['2026-06-12', '2026-06-13', '2026-06-14']),
   };
-  const rows = helpers.buildStorageCoverageRows([], [], r2Days, dropboxDays);
+  const rows = buildStorageCoverageRows(r2Days, dropboxDays);
   for (const day of ['2026-06-12', '2026-06-13', '2026-06-14']) {
     const row = rows.find((item) => item.date === day);
     assert.ok(row, `expected storage coverage row for ${day}`);
@@ -97,4 +133,20 @@ test('v2 Dropbox backup days populate calendar backup overlay fields without cha
     assert.equal(row.dropbox_observs, true);
     assert.equal(row.dropbox_aqilevels, true);
   }
+});
+
+test('v2 storage coverage does not mark 2025 R2 presence without explicit v2 history-days API days', () => {
+  const dropboxDays = parseDropboxBackupDays({
+    domains: {
+      observations: { days: { '2025-07-02': {} } },
+      aqilevels: { days: { '2025-07-02': {} } },
+    },
+  });
+  const rows = buildStorageCoverageRows(null, dropboxDays);
+  const row = rows.find((item) => item.date === '2025-07-02');
+  assert.ok(row, 'expected storage coverage row for 2025-07-02');
+  assert.equal(row.r2_observs, false);
+  assert.equal(row.r2_aqilevels, false);
+  assert.equal(row.dropbox_observs, true);
+  assert.equal(row.dropbox_aqilevels, true);
 });

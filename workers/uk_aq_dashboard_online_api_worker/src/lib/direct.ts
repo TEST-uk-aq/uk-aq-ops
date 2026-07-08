@@ -24,6 +24,7 @@ type DashboardPayload = {
   r2_history_days_bucket: string | null;
   r2_history_days_error: string | null;
   r2_history_read_version: R2HistoryReadVersionResolution;
+  r2_history_read_version_effective: R2HistoryReadVersionResolution;
   dropbox_backup_state_path: string | null;
   dropbox_backup_state_error: string | null;
   dropbox_backup_state_source: string | null;
@@ -163,7 +164,12 @@ let storageCoverageCache: CacheEntry<{
   generated_at: string;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
+  r2_backup_window: JsonObject | null;
+  r2_backup_window_error: string | null;
+  r2_history_days_bucket: string | null;
+  r2_history_days_error: string | null;
   r2_history_read_version: R2HistoryReadVersionResolution;
+  r2_history_read_version_effective: R2HistoryReadVersionResolution;
   dropbox_backup_state_path: string | null;
   dropbox_backup_state_error: string | null;
   dropbox_backup_state_source: string | null;
@@ -177,6 +183,13 @@ let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObje
 let r2HistoryDaysCacheVersionKey: string | null = null;
 let storageCoverageCacheVersionKey: string | null = null;
 let dropboxMtimeCache: CacheEntry<{ payload: JsonObject; error: string | null }> | null = null;
+
+function clearStorageCoverageCaches(): void {
+  storageCoverageCache = null;
+  storageCoverageCacheVersionKey = null;
+  r2HistoryDaysCache = null;
+  r2HistoryDaysCacheVersionKey = null;
+}
 
 function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolution {
   const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) =>
@@ -1885,7 +1898,7 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_cache_key = dropboxState.cacheKey;
     dropbox_backup_state_warning = dropboxState.warning;
     dropbox_backup_state_fallback_attempted = dropboxState.fallbackAttempted;
-    if (!r2_backup_window) {
+    if (!r2_backup_window && r2History.readVersion.version !== "v2") {
       const fallbackWindow = await fetchR2BackupWindowFromSupabase(env);
       r2_backup_window = fallbackWindow.window;
       r2_backup_window_error = fallbackWindow.error;
@@ -1894,6 +1907,9 @@ async function fetchDashboardBaseData(
           ? `${r2_history_days_error}; ${r2_backup_window_error}`
           : r2_history_days_error;
       }
+    } else if (!r2_backup_window && r2History.readVersion.version === "v2") {
+      r2_backup_window_error = r2_history_days_error ||
+        "R2 history-days API did not return a v2 window; version-blind Supabase window fallback disabled for v2.";
     }
     if (options.includeStorageCoverage) {
       const dropboxDays = parseDropboxBackupDays(dropboxState.state);
@@ -1950,7 +1966,8 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_fallback_attempted,
     storage_coverage_source: "live_per_day_presence",
     storage_coverage_days,
-    r2_history_read_version: resolveR2HistoryReadVersion(env),
+    r2_history_read_version: r2History.readVersion,
+    r2_history_read_version_effective: r2History.readVersion,
     pollutants: pollutantsPayload,
     dispatch_runs: dispatchRuns,
     dispatcher_settings: dispatcherSettings,
@@ -1997,7 +2014,12 @@ export async function getDirectStorageCoveragePayload(
   generated_at: string;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
+  r2_backup_window: JsonObject | null;
+  r2_backup_window_error: string | null;
+  r2_history_days_bucket: string | null;
+  r2_history_days_error: string | null;
   r2_history_read_version: R2HistoryReadVersionResolution;
+  r2_history_read_version_effective: R2HistoryReadVersionResolution;
   dropbox_backup_state_path: string | null;
   dropbox_backup_state_error: string | null;
   dropbox_backup_state_source: string | null;
@@ -2007,6 +2029,9 @@ export async function getDirectStorageCoveragePayload(
   dropbox_backup_state_fallback_attempted: boolean;
 }> {
   const forceRefresh = asTruthy(search.get("force"));
+  if (forceRefresh) {
+    clearStorageCoverageCaches();
+  }
   const cacheKey = storageCoverageCacheKey(env);
   if (!forceRefresh && storageCoverageCacheVersionKey === cacheKey) {
     const cached = cacheGet(storageCoverageCache);
@@ -2025,7 +2050,12 @@ export async function getDirectStorageCoveragePayload(
     generated_at: nowIso(),
     storage_coverage_source: payload.storage_coverage_source,
     storage_coverage_days: Array.isArray(payload.storage_coverage_days) ? payload.storage_coverage_days : [],
+    r2_backup_window: payload.r2_backup_window || null,
+    r2_backup_window_error: payload.r2_backup_window_error || null,
+    r2_history_days_bucket: payload.r2_history_days_bucket || null,
+    r2_history_days_error: payload.r2_history_days_error || null,
     r2_history_read_version: payload.r2_history_read_version || resolveR2HistoryReadVersion(env),
+    r2_history_read_version_effective: payload.r2_history_read_version_effective || payload.r2_history_read_version || resolveR2HistoryReadVersion(env),
     dropbox_backup_state_path: payload.dropbox_backup_state_path || null,
     dropbox_backup_state_error: payload.dropbox_backup_state_error || null,
     dropbox_backup_state_source: payload.dropbox_backup_state_source || null,
@@ -2044,11 +2074,16 @@ export async function getDirectR2MetricsPayload(
   search: URLSearchParams,
 ): Promise<JsonObject> {
   const forceRefresh = asTruthy(search.get("force"));
-  const [r2Usage, r2History, fallbackWindow] = await Promise.all([
+  const [r2Usage, r2History] = await Promise.all([
     fetchR2Usage(env, forceRefresh),
     fetchR2HistoryDays(env, forceRefresh),
-    fetchR2BackupWindowFromSupabase(env),
   ]);
+  const fallbackWindow = r2History.readVersion.version === "v2"
+    ? {
+      window: null,
+      error: "Version-blind Supabase window fallback disabled for v2.",
+    }
+    : await fetchR2BackupWindowFromSupabase(env);
   const window = r2History.window || fallbackWindow.window;
   let windowError: string | null = null;
   if (r2History.error && fallbackWindow.error) {

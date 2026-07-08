@@ -109,7 +109,16 @@ R2 history API fallback behavior:
 - If `UK_AQ_R2_HISTORY_COUNTS_API_URL` is unset, the worker derives it from `UK_AQ_R2_HISTORY_DAYS_API_URL` (or `UK_AQ_DB_SIZE_API_URL`) origin as `/v1/r2-history-counts`.
 - `UK_AQ_R2_HISTORY_DAYS_API_TOKEN` falls back to `UK_AQ_DB_SIZE_API_TOKEN`.
 - `UK_AQ_R2_HISTORY_COUNTS_API_TOKEN` falls back to `UK_AQ_R2_HISTORY_DAYS_API_TOKEN`, then `UK_AQ_DB_SIZE_API_TOKEN`.
-- `/api/storage_coverage` includes `r2_history_read_version`, `dropbox_backup_state_path`, `dropbox_backup_state_source`, `dropbox_backup_state_cache_key`, and related warning fields so the hosted dashboard can show `R2_v1` or `R2_v2`.
+- `/api/storage_coverage` includes `r2_history_read_version`,
+  `r2_history_read_version_effective`, `r2_history_days_bucket`,
+  `r2_history_days_error`, `r2_backup_window`, `r2_backup_window_error`,
+  `dropbox_backup_state_path`, `dropbox_backup_state_source`,
+  `dropbox_backup_state_cache_key`, and related warning fields so the hosted
+  dashboard can show `R2_v1` or `R2_v2` with the actual history-days source.
+- In `UK_AQ_R2_HISTORY_VERSION=v2`, the storage coverage calendar does not use
+  version-blind Supabase R2 day/window fallbacks. If the v2 history-days API is
+  unavailable, R2 presence remains false/unknown instead of being filled from
+  v1-derived RPC data.
 - `/api/r2_connector_counts` forwards the active read version to the R2 metrics API as `read_version`.
 
 Optional upstream proxy mode:
