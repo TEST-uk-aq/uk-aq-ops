@@ -1529,6 +1529,8 @@ async function fetchDashboardBaseData(
     max_runs_per_dispatch_call: 1,
     updated_at: null,
   };
+  let r2_history_read_version = resolveR2HistoryReadVersion(env);
+  let r2_history_read_version_effective = resolveR2HistoryReadVersion(env);
 
   if (options.includeIngestContext) {
     const connectors = await fetchAllRows(
@@ -1891,6 +1893,10 @@ async function fetchDashboardBaseData(
     r2_history_days_bucket = r2History.bucket;
     r2_history_days_error = r2History.error;
     r2_backup_window = r2History.window;
+    // Update read version from fetched r2History
+    const readVersion = r2History.readVersion;
+    r2_history_read_version = readVersion;
+    r2_history_read_version_effective = readVersion;
     dropbox_backup_state_path = dropboxState.path;
     dropbox_backup_state_error = dropboxState.error;
     dropbox_backup_state_source = dropboxState.source;
@@ -1898,7 +1904,7 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_cache_key = dropboxState.cacheKey;
     dropbox_backup_state_warning = dropboxState.warning;
     dropbox_backup_state_fallback_attempted = dropboxState.fallbackAttempted;
-    if (!r2_backup_window && r2History.readVersion.version !== "v2") {
+    if (!r2_backup_window && r2_history_read_version.version !== "v2") {
       const fallbackWindow = await fetchR2BackupWindowFromSupabase(env);
       r2_backup_window = fallbackWindow.window;
       r2_backup_window_error = fallbackWindow.error;
@@ -1907,7 +1913,7 @@ async function fetchDashboardBaseData(
           ? `${r2_history_days_error}; ${r2_backup_window_error}`
           : r2_history_days_error;
       }
-    } else if (!r2_backup_window && r2History.readVersion.version === "v2") {
+    } else if (!r2_backup_window && r2_history_read_version.version === "v2") {
       r2_backup_window_error = r2_history_days_error ||
         "R2 history-days API did not return a v2 window; version-blind Supabase window fallback disabled for v2.";
     }
@@ -1966,8 +1972,8 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_fallback_attempted,
     storage_coverage_source: "live_per_day_presence",
     storage_coverage_days,
-    r2_history_read_version: r2History.readVersion,
-    r2_history_read_version_effective: r2History.readVersion,
+    r2_history_read_version,
+    r2_history_read_version_effective,
     pollutants: pollutantsPayload,
     dispatch_runs: dispatchRuns,
     dispatcher_settings: dispatcherSettings,
