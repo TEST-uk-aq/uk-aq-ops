@@ -11,7 +11,8 @@ Current scope is daily plus Phase 3 summaries and opt-in Phase 4 R2 publication:
 - calculates/upserts last complete-year rows in
   `uk_aq_ops.who_2021_calendar_year_status`;
 - builds the 9-row homepage summary JSON in the run ledger;
-- can publish WHO summary JSON when Phase 4 publication is explicitly enabled;
+- can publish WHO summary JSON and derived parquet parts to R2 when Phase 4
+  publication is explicitly enabled;
 - records `uk_aq_ops.who_2021_processing_runs`;
 
 ## Endpoints
@@ -102,10 +103,9 @@ until the R2 settings are applied.
 
 Set `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` to publish the dated summary JSON
 and `history/v2/who_2021/latest_who_2021.json` after daily, rolling and calendar
-refreshes complete. Leave `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=false` until
-the Phase 4b parquet writer exists. If that flag is set to `true` in this
-service, the run fails before JSON publication because this Deno publisher does
-not generate parquet bytes.
+refreshes complete. Set `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` to write
+daily, rolling-year and calendar-year parquet parts before the dated summary
+JSON and latest JSON pointer are written.
 
 Required R2 environment variables are `R2_ENDPOINT`, `R2_BUCKET`,
 `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` (`CFLARE_R2_*` aliases are
@@ -121,12 +121,11 @@ Published JSON paths:
 - `history/v2/who_2021/summaries/as_of_day_utc=YYYY-MM-DD/who_2021_summary.json`
 - `history/v2/who_2021/latest_who_2021.json`
 
-Parquet R2 writes are a Phase 4b follow-up. The database-side support for that
-writer is `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`, which returns
-`dataset`, `object_key`, `row_count`, and `rows_json`. Postgres does not
-generate parquet bytes in this repo; the Phase 4b worker must convert
-`rows_json` to parquet using the existing worker-side parquet tooling and PUT
-the result to the returned `object_key`.
+Parquet R2 writes call `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`, which
+returns `dataset`, `object_key`, `row_count`, and `rows_json`. Postgres does not
+generate parquet bytes in this repo; this Deno service converts `rows_json` to
+ZSTD-compressed parquet with Arrow and `parquet-wasm`, then PUTs the result to
+the returned `object_key`.
 
 Static schema check:
 
@@ -153,6 +152,12 @@ limit 20;
 
 Expected shape: `object_key` values start with `history/v2/who_2021/`, and
 `rows_json` is non-empty when the matching WHO derived rows exist.
+
+Parquet writer test:
+
+```bash
+deno test --allow-read workers/uk_aq_who_2021_daily_cloud_run/who_2021_parquet_test.ts
+```
 
 The website should use the stable daily cache key
 `history/v2/who_2021/latest_who_2021.json?as_of=YYYY-MM-DD`, where the `as_of`

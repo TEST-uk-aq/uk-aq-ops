@@ -781,7 +781,7 @@ Implemented in this phase:
 - Updated the deploy workflow default scheduler cron to `0 4-9 * * *` so Cloud Scheduler can call hourly during the UTC morning readiness window.
 - Left R2 parquet/JSON publication for Phase 4. The homepage summary is built but not yet written to R2.
 
-### Phase 4: R2 v2 JSON publication and parquet write preparation
+### Phase 4: R2 v2 JSON publication and parquet writes
 
 Deliver:
 
@@ -792,13 +792,13 @@ Deliver:
 - Dated summary JSON and `latest_who_2021.json` publication.
 - Daily cache/version key documented as `?as_of=YYYY-MM-DD`.
 
-Implemented in Phase 4a:
+Implemented in this phase:
 
 - Added opt-in R2 publication controls to the existing WHO Cloud Run service:
   - `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED` publishes summary JSON after successful daily/rolling/calendar refreshes;
-  - `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED` is reserved for the Phase 4b parquet writer and currently fails fast if enabled in this JSON publisher.
+  - `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED` writes daily, rolling-year and calendar-year parquet parts before JSON publication.
 - Added SigV4 R2 PUT support in the Deno worker, accepting `R2_*` variables and `CFLARE_R2_*` aliases.
-- Added publication ordering so the dated summary JSON is written before `history/v2/who_2021/latest_who_2021.json`.
+- Added publication ordering so parquet parts are written first, then the dated summary JSON, then `history/v2/who_2021/latest_who_2021.json`.
 - Added stable JSON serialization for the public summary payload to reduce unnecessary byte churn on reruns. Object-level skip-if-unchanged writes are not implemented yet, so publication still PUTs the dated and latest JSON objects on each publish attempt.
 - Added explicit failure handling when R2 publication is enabled but the summary refresh returns no row or no `homepage_summary`.
 - Kept R2 publication retryable when the database calculation has already completed: if readiness reports `already_completed` and R2 publication is enabled, the service refreshes the summary payload and attempts publication.
@@ -809,21 +809,17 @@ Implemented in Phase 4a:
   - `history/v2/who_2021/summaries/as_of_day_utc=YYYY-MM-DD/who_2021_summary.json`;
   - `history/v2/who_2021/latest_who_2021.json`.
 - Added database-side row-batch RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`, which returns `dataset`, `object_key`, `row_count`, and `rows_json` for the Phase 4b writer. The RPC owns the exact parquet object keys and enforces the agreed `history/v2/who_2021/...` partition paths.
-- Confirmed existing repo parquet patterns generate parquet bytes in worker-side Node/Deno code using Arrow/parquet tooling, not inside Postgres. Do not fake parquet bytes in SQL.
+- Added worker-side parquet generation with Arrow and `parquet-wasm`, matching the repo pattern that parquet bytes are generated outside Postgres. Do not fake parquet bytes in SQL.
+- Added validation that parquet object keys match their dataset and row counts match `rows_json` before upload.
 - Documented the daily cache/version key as `latest_who_2021.json?as_of=YYYY-MM-DD` in the service README.
 
 Manual follow-up before enabling publication:
 
-- Apply the Phase 4a database row-batch RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows` in TEST Obs AQI DB.
+- Apply the Phase 4 database row-batch RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows` in TEST Obs AQI DB.
 - Set the R2 environment variables/secrets for the Cloud Run service.
 - Enable `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` only after R2 credentials are present.
-- Keep `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=false` until Phase 4b exists.
-- Run one manual dry-run/TEST invocation, inspect dated JSON and latest JSON, then allow the scheduler window to publish normally.
-
-Phase 4b still required:
-
-- Add a worker-side parquet writer that calls `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`, converts each `rows_json` batch to parquet bytes using the existing worker-side parquet tooling, and PUTs each object to the returned `object_key`.
-- Enable `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` only after that writer exists and has a local/static test for the generated object-key paths.
+- Enable `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` only after the row-batch RPC has been applied and one manual TEST run confirms parquet object paths and JSON publication.
+- Run one manual dry-run/TEST invocation, inspect parquet object paths, dated JSON and latest JSON, then allow the scheduler window to publish normally.
 
 ### Phase 5: Website data wiring
 
