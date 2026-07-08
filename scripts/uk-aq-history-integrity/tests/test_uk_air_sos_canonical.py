@@ -371,6 +371,47 @@ class UkAirSosCanonicalTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(int(row[0]), 0)
 
+    def test_no_data_snapshot_is_not_cached_even_when_keep_policy_all(self) -> None:
+        conn = self._new_conn()
+        original = MODULE.build_uk_air_sos_canonical_snapshot
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_root = Path(tmp)
+            try:
+                MODULE.build_uk_air_sos_canonical_snapshot = lambda **kwargs: {
+                    "status": MODULE.UK_AIR_SOS_STATUS_NO_DATA,
+                    "row_count": 0,
+                    "rows": [],
+                    "ndjson_bytes": b"",
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                }
+                result = MODULE._check_one_uk_air_sos_station_day(
+                    conn=conn,
+                    env_name="CIC-Test",
+                    base_url="https://example.test",
+                    station_ref="station-1",
+                    bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],
+                    day=MODULE.dt.date(2026, 5, 11),
+                    cache_root=cache_root,
+                    keep_policy="all",
+                    not_found_cooldown_seconds=0,
+                    log=logging.getLogger("test-no-data-no-cache"),
+                )
+            finally:
+                MODULE.build_uk_air_sos_canonical_snapshot = original
+
+            cache_path = MODULE._uk_air_sos_cache_path(
+                cache_root,
+                "station-1",
+                MODULE.dt.date(2026, 5, 11),
+            )
+            self.assertEqual(result["snapshot_status"], MODULE.UK_AIR_SOS_STATUS_NO_DATA)
+            self.assertFalse(cache_path.exists())
+            state = conn.execute(
+                "SELECT exists_remote, content_length, local_cached_path, last_status FROM source_file_state WHERE source_file_key = ?",
+                ("uk_air_sos:station_ref=station-1:day_utc=2026-05-11",),
+            ).fetchone()
+            self.assertEqual(state, (1, 0, None, "first_seen"))
+
     def test_temporary_error_does_not_overwrite_previous_baseline(self) -> None:
         conn = self._new_conn()
         original = MODULE.build_uk_air_sos_canonical_snapshot

@@ -7294,6 +7294,8 @@ function readUkAirSosIntegritySnapshotTimeseriesPayload(args: {
   if (!ukAirSosIntegritySnapshotCache.has(snapshotPath)) {
     if (!fs.existsSync(snapshotPath)) {
       ukAirSosIntegritySnapshotCache.set(snapshotPath, null);
+    } else if (fs.statSync(snapshotPath).size <= 0) {
+      ukAirSosIntegritySnapshotCache.set(snapshotPath, null);
     } else {
       const byTimeseriesRef = new Map<string, Array<Record<string, unknown>>>();
       const text = fs.readFileSync(snapshotPath, "utf8");
