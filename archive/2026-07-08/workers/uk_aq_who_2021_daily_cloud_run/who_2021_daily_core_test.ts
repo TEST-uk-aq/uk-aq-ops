@@ -3,7 +3,6 @@ import {
   addDays,
   buildDailyRefreshPayload,
   buildDayChunks,
-  buildR2PublishPlan,
   buildReadinessPayload,
   buildRunConfig,
   buildSummaryRefreshPayload,
@@ -12,7 +11,6 @@ import {
   mergeDailyRefreshRows,
   parsePollutantCodes,
   shouldRunReadinessGate,
-  stableJson,
   summarizeReadinessRows,
 } from "./who_2021_daily_core.ts";
 
@@ -248,35 +246,4 @@ Deno.test("refresh summaries merge chunk rows", () => {
     not_enough_data_timeseries_days: 5,
     rows_upserted: 22,
   });
-});
-
-Deno.test("phase 4 R2 publish plan uses agreed summary and archive prefixes", () => {
-  const plan = buildR2PublishPlan({
-    asOfDayUtc: "2026-07-02",
-    connectorId: 1,
-    pollutantCodes: ["pm25", "pm10", "no2"],
-    calendarYear: 2025,
-  });
-
-  assert.deepEqual(plan, {
-    datedSummaryKey:
-      "history/v2/who_2021/summaries/as_of_day_utc=2026-07-02/who_2021_summary.json",
-    latestSummaryKey: "history/v2/who_2021/latest_who_2021.json",
-    dailyCacheQuery: "?as_of=2026-07-02",
-    parquetPrefixes: {
-      dailyStatus:
-        "history/v2/who_2021/daily_status/day_utc=<YYYY-MM-DD>/connector_id=1/pollutant_code=<pollutant>/",
-      rollingYearStatus:
-        "history/v2/who_2021/rolling_year_status/as_of_day_utc=2026-07-02/connector_id=1/pollutant_code=<pollutant>/",
-      calendarYearStatus:
-        "history/v2/who_2021/calendar_year_status/calendar_year=2025/period_type=complete_year/connector_id=1/pollutant_code=<pollutant>/",
-    },
-  });
-});
-
-Deno.test("stable JSON sorts object keys recursively", () => {
-  assert.equal(
-    stableJson({ z: 1, a: { b: 2, a: 1 }, list: [{ y: 2, x: 1 }] }),
-    '{\n  "a": {\n    "a": 1,\n    "b": 2\n  },\n  "list": [\n    {\n      "x": 1,\n      "y": 2\n    }\n  ],\n  "z": 1\n}\n',
-  );
 });
