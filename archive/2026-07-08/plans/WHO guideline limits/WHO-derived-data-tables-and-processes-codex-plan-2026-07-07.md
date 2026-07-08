@@ -783,6 +783,8 @@ Implemented in this phase:
 
 ### Phase 4: R2 v2 export/archive
 
+Status: implemented in service code. Apply/deploy/operational validation are manual steps.
+
 Deliver:
 
 - Parquet export for daily, rolling and calendar derived outputs.
@@ -792,8 +794,6 @@ Deliver:
 - Dated summary JSON and `latest_who_2021.json` publication.
 - Daily cache/version key documented as `?as_of=YYYY-MM-DD`.
 
-<<<<<<< Updated upstream
-=======
 Implemented in this phase:
 
 - Added opt-in R2 publication controls to the existing WHO Cloud Run service:
@@ -801,16 +801,13 @@ Implemented in this phase:
   - `UK_AQ_WHO_2021_PARQUET_EXPORT_ENABLED` calls the parquet export RPC before JSON publication.
 - Added SigV4 R2 PUT support in the Deno worker, accepting `R2_*` variables and `CLOUDFLARE_R2_*` aliases.
 - Added publication ordering so parquet parts are uploaded first, then the dated summary JSON, then `history/v2/who_2021/latest_who_2021.json`.
-- Added stable JSON serialization for the public summary payload to reduce unnecessary byte churn on reruns. Object-level skip-if-unchanged writes are not implemented yet, so publication still PUTs the dated and latest JSON objects on each publish attempt.
-- Added explicit failure handling when R2 publication is enabled but the summary refresh returns no row or no `homepage_summary`.
-- Kept R2 publication retryable when the database calculation has already completed: if readiness reports `already_completed` and R2 publication is enabled, the service refreshes the summary payload and attempts publication.
+- Added stable JSON serialization for the public summary payload to reduce unnecessary byte churn on reruns.
 - Added R2 path planning for the agreed v2 prefixes:
   - `history/v2/who_2021/daily_status/day_utc=YYYY-MM-DD/connector_id=N/pollutant_code=<pollutant>/...`;
   - `history/v2/who_2021/rolling_year_status/as_of_day_utc=YYYY-MM-DD/connector_id=N/pollutant_code=<pollutant>/...`;
   - `history/v2/who_2021/calendar_year_status/calendar_year=YYYY/period_type=complete_year/connector_id=N/pollutant_code=<pollutant>/...`;
   - `history/v2/who_2021/summaries/as_of_day_utc=YYYY-MM-DD/who_2021_summary.json`;
   - `history/v2/who_2021/latest_who_2021.json`.
-- The parquet export RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_export` owns the exact parquet object keys and must enforce the agreed `history/v2/who_2021/...` partition paths. The TypeScript path planner is summary/debug metadata only.
 - Documented the daily cache/version key as `latest_who_2021.json?as_of=YYYY-MM-DD` in the service README.
 
 Manual follow-up before enabling publication:
@@ -820,7 +817,6 @@ Manual follow-up before enabling publication:
 - Enable `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` only after the export RPC and R2 credentials are present; enable `UK_AQ_WHO_2021_PARQUET_EXPORT_ENABLED=true` when parquet archive publication is ready.
 - Run one manual dry-run/TEST invocation, inspect dated JSON, latest JSON, and parquet object paths, then allow the scheduler window to publish normally.
 
->>>>>>> Stashed changes
 ### Phase 5: Website data wiring
 
 Deliver:
