@@ -23,7 +23,9 @@ let writerProperties: unknown | null = null;
 
 function ensureParquetWasmInitialized(): void {
   if (parquetWasmInitialized) return;
-  const wasmUrl = import.meta.resolve("npm:parquet-wasm/esm/parquet_wasm_bg.wasm");
+  const wasmUrl = import.meta.resolve(
+    "npm:parquet-wasm/esm/parquet_wasm_bg.wasm",
+  );
   const wasmBytes = Deno.readFileSync(new URL(wasmUrl));
   parquetWasm.initSync({ module: wasmBytes });
   parquetWasmInitialized = true;
@@ -60,15 +62,24 @@ function textVector(values: unknown[]) {
 }
 
 function int32Vector(values: unknown[]) {
-  return arrow.vectorFromArray(values.map(toNullableInteger), new arrow.Int32());
+  return arrow.vectorFromArray(
+    values.map(toNullableInteger),
+    new arrow.Int32(),
+  );
 }
 
 function float64Vector(values: unknown[]) {
-  return arrow.vectorFromArray(values.map(toNullableNumber), new arrow.Float64());
+  return arrow.vectorFromArray(
+    values.map(toNullableNumber),
+    new arrow.Float64(),
+  );
 }
 
 function boolVector(values: unknown[]) {
-  return arrow.vectorFromArray(values.map(toNullableBoolean), new arrow.Bool());
+  // parquet-wasm currently rejects explicit nullable Arrow Bool vectors with a
+  // zero-length validity bitmap. Let Arrow infer the boolean column from the
+  // nullable JS array so it builds the validity/data buffers correctly.
+  return values.map(toNullableBoolean);
 }
 
 function dateVector(values: unknown[]) {
@@ -277,7 +288,9 @@ export function validateWho2021ParquetObjectKey(
   }
 }
 
-export function rowsToWho2021ParquetBytes(batch: Who2021ParquetBatch): Uint8Array {
+export function rowsToWho2021ParquetBytes(
+  batch: Who2021ParquetBatch,
+): Uint8Array {
   validateWho2021ParquetObjectKey(batch.dataset, batch.object_key);
   const rows = asRows(batch.rows_json);
   if (rows.length !== Number(batch.row_count)) {
