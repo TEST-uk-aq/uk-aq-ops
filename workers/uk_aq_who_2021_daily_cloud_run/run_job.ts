@@ -36,29 +36,27 @@ const READINESS_RPC = (Deno.env.get("UK_AQ_WHO_2021_READINESS_RPC") ||
 const SUMMARY_REFRESH_RPC =
   (Deno.env.get("UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC") ||
     "uk_aq_rpc_who_2021_summary_refresh").trim();
-<<<<<<< Updated upstream
-=======
-const PARQUET_EXPORT_RPC = (Deno.env.get("UK_AQ_WHO_2021_PARQUET_EXPORT_RPC") ||
-  "uk_aq_rpc_who_2021_r2_parquet_export").trim();
+const PARQUET_R2_WRITE_RPC =
+  (Deno.env.get("UK_AQ_WHO_2021_PARQUET_R2_WRITE_RPC") ||
+    "uk_aq_rpc_who_2021_r2_parquet_export").trim();
 const R2_PUBLISH_ENABLED = parseBoolean(
   Deno.env.get("UK_AQ_WHO_2021_R2_PUBLISH_ENABLED"),
   false,
 );
-const PARQUET_EXPORT_ENABLED = parseBoolean(
-  Deno.env.get("UK_AQ_WHO_2021_PARQUET_EXPORT_ENABLED"),
+const PARQUET_R2_WRITE_ENABLED = parseBoolean(
+  Deno.env.get("UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED"),
   R2_PUBLISH_ENABLED,
 );
 const R2_ENDPOINT = optionalEnv("R2_ENDPOINT") ||
-  optionalEnv("CLOUDFLARE_R2_ENDPOINT");
+  optionalEnv("CFLARE_R2_ENDPOINT");
 const R2_BUCKET = optionalEnv("R2_BUCKET") ||
-  optionalEnv("CLOUDFLARE_R2_BUCKET");
+  optionalEnv("CFLARE_R2_BUCKET");
 const R2_REGION = optionalEnv("R2_REGION") || "auto";
 const R2_ACCESS_KEY_ID = optionalEnv("R2_ACCESS_KEY_ID") ||
-  optionalEnv("CLOUDFLARE_R2_ACCESS_KEY_ID");
+  optionalEnv("CFLARE_R2_ACCESS_KEY_ID");
 const R2_SECRET_ACCESS_KEY = optionalEnv("R2_SECRET_ACCESS_KEY") ||
-  optionalEnv("CLOUDFLARE_R2_SECRET_ACCESS_KEY");
+  optionalEnv("CFLARE_R2_SECRET_ACCESS_KEY");
 
->>>>>>> Stashed changes
 const RUN_LOG_RPC = (Deno.env.get("UK_AQ_WHO_2021_RUN_LOG_RPC") ||
   "uk_aq_rpc_who_2021_processing_run_log").trim();
 const RPC_RETRIES = parsePositiveInt(
@@ -241,8 +239,6 @@ function errorJson(error: unknown): Record<string, unknown> {
   };
 }
 
-<<<<<<< Updated upstream
-=======
 async function sha256Hex(data: Uint8Array | string): Promise<string> {
   const bytes = typeof data === "string"
     ? new TextEncoder().encode(data)
@@ -357,7 +353,7 @@ async function signedR2Put(
   }
 }
 
-type ParquetExportPart = {
+type ParquetR2WritePart = {
   object_key: string;
   content_base64: string;
   content_type?: string;
@@ -390,8 +386,8 @@ async function publishPhase4(
     calendarYear: args.summaryRefresh.calendar_year,
   });
   const parquetObjects: string[] = [];
-  if (args.config.parquetExportEnabled) {
-    const result = await postgrestRpc<unknown>(PARQUET_EXPORT_RPC, {
+  if (args.config.parquetR2WriteEnabled) {
+    const result = await postgrestRpc<unknown>(PARQUET_R2_WRITE_RPC, {
       p_as_of_day_utc: args.config.endDayUtc,
       p_start_day_utc: args.config.startDayUtc,
       p_end_day_utc: args.config.endDayUtc,
@@ -400,10 +396,10 @@ async function publishPhase4(
       p_pollutant_codes: args.config.pollutantCodes,
     });
     if (result.error) {
-      throw new Error(`parquet export RPC failed: ${result.error.message}`);
+      throw new Error(`parquet R2 write RPC failed: ${result.error.message}`);
     }
     const parts =
-      (Array.isArray(result.data) ? result.data : []) as ParquetExportPart[];
+      (Array.isArray(result.data) ? result.data : []) as ParquetR2WritePart[];
     for (const part of parts) {
       if (!part.object_key || !part.content_base64) continue;
       const bytes = Uint8Array.from(
@@ -439,7 +435,6 @@ async function publishPhase4(
   };
 }
 
->>>>>>> Stashed changes
 async function logRun(args: {
   runMode: string;
   triggerMode: string;
@@ -505,6 +500,8 @@ async function main(): Promise<void> {
     minFinalHourCoverageRatio: MIN_FINAL_HOUR_COVERAGE_RATIO,
     readinessGateEnabled: READINESS_GATE_ENABLED,
     summaryRefreshEnabled: SUMMARY_REFRESH_ENABLED,
+    r2PublishEnabled: R2_PUBLISH_ENABLED,
+    parquetR2WriteEnabled: PARQUET_R2_WRITE_ENABLED,
     chunkDays: CHUNK_DAYS,
   });
   const chunks = buildDayChunks(
@@ -519,6 +516,7 @@ async function main(): Promise<void> {
   let alreadyCompleted = false;
   let runStatus: "ok" | "error" | "dry_run" = config.dryRun ? "dry_run" : "ok";
   let capturedError: unknown = null;
+  let r2PublishSummary: Record<string, unknown> | null = null;
 
   try {
     if (shouldRunReadinessGate(config)) {
@@ -591,8 +589,6 @@ async function main(): Promise<void> {
           `summary refresh RPC failed: ${result.error.message}`,
         );
       }
-<<<<<<< Updated upstream
-=======
       summaryRefreshRows.push(...parseSummaryRefreshRows(result.data));
     }
 
@@ -605,7 +601,6 @@ async function main(): Promise<void> {
         summaryRefresh: summaryRefreshRows[0] || null,
         homepageSummary,
       });
->>>>>>> Stashed changes
     }
   } catch (error) {
     runStatus = "error";
@@ -632,6 +627,9 @@ async function main(): Promise<void> {
     min_final_hour_coverage_ratio: config.minFinalHourCoverageRatio,
     readiness_gate_enabled: config.readinessGateEnabled,
     summary_refresh_enabled: config.summaryRefreshEnabled,
+    r2_publish_enabled: config.r2PublishEnabled,
+    parquet_r2_write_enabled: config.parquetR2WriteEnabled,
+    r2_publish: r2PublishSummary,
     dry_run: config.dryRun,
     readiness: readinessSummary,
     rolling_rows_upserted: Number(summaryRefresh?.rolling_rows_upserted) || 0,

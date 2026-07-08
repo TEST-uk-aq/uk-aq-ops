@@ -15,6 +15,8 @@ export type RunConfig = {
   minFinalHourCoverageRatio: number;
   readinessGateEnabled: boolean;
   summaryRefreshEnabled: boolean;
+  r2PublishEnabled?: boolean;
+  parquetR2WriteEnabled?: boolean;
   chunkDays: number;
   dryRun: boolean;
 };
@@ -97,6 +99,17 @@ export type SummaryRefreshRpcRow = {
   calendar_rows_upserted: number;
   homepage_summary: Record<string, unknown> | null;
   dry_run: boolean;
+};
+
+export type R2PublishPlan = {
+  datedSummaryKey: string;
+  latestSummaryKey: string;
+  dailyCacheQuery: string;
+  parquetPrefixes: {
+    dailyStatus: string;
+    rollingYearStatus: string;
+    calendarYearStatus: string;
+  };
 };
 
 export type DailyRefreshSummary = {
@@ -202,6 +215,8 @@ export function buildRunConfig(params: {
   minFinalHourCoverageRatio: number;
   readinessGateEnabled: boolean;
   summaryRefreshEnabled: boolean;
+  r2PublishEnabled?: boolean;
+  parquetR2WriteEnabled?: boolean;
   chunkDays: number;
 }): RunConfig {
   const latestComplete = latestCompleteDayUtc(
@@ -255,6 +270,8 @@ export function buildRunConfig(params: {
     minFinalHourCoverageRatio: clampRatio(params.minFinalHourCoverageRatio),
     readinessGateEnabled: params.readinessGateEnabled,
     summaryRefreshEnabled: params.summaryRefreshEnabled,
+    r2PublishEnabled: Boolean(params.r2PublishEnabled),
+    parquetR2WriteEnabled: Boolean(params.parquetR2WriteEnabled),
     chunkDays: Math.max(1, Math.trunc(params.chunkDays)),
     dryRun,
   };
@@ -379,8 +396,6 @@ function sumRows(
     return total + (Number.isFinite(value) ? value : 0);
   }, 0);
 }
-<<<<<<< Updated upstream
-=======
 
 export function stableJson(value: unknown): string {
   return `${JSON.stringify(sortJsonValue(value), null, 2)}\n`;
@@ -425,4 +440,3 @@ function sortJsonValue(value: unknown): unknown {
   }
   return value;
 }
->>>>>>> Stashed changes

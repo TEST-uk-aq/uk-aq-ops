@@ -11,7 +11,7 @@ Current scope is daily plus Phase 3 summaries and opt-in Phase 4 R2 publication:
 - calculates/upserts last complete-year rows in
   `uk_aq_ops.who_2021_calendar_year_status`;
 - builds the 9-row homepage summary JSON in the run ledger;
-- can publish WHO summary JSON and parquet export RPC output to R2 when Phase 4
+- can publish WHO summary JSON and parquet R2 write RPC output when Phase 4
   publication is explicitly enabled;
 - records `uk_aq_ops.who_2021_processing_runs`;
 
@@ -95,22 +95,20 @@ UK_AQ_WHO_2021_START_DAY_UTC=2026-07-02 \
 UK_AQ_WHO_2021_END_DAY_UTC=2026-07-02 \
 deno run --allow-env --allow-net workers/uk_aq_who_2021_daily_cloud_run/run_job.ts
 ```
-<<<<<<< Updated upstream
-=======
 
 ## Phase 4 R2 publication
 
 Phase 4 publication is opt-in so existing daily/summary runs remain unchanged
-until the R2 settings and export RPC are applied.
+until the R2 settings and parquet R2 write RPC are applied.
 
 Set `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` to publish the dated summary JSON
 and `history/v2/who_2021/latest_who_2021.json` after daily, rolling and calendar
-refreshes complete. Set `UK_AQ_WHO_2021_PARQUET_EXPORT_ENABLED=true` to call
+refreshes complete. Set `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` to call
 `uk_aq_rpc_who_2021_r2_parquet_export` and upload the returned parquet parts
 before the JSON latest pointer is replaced.
 
 Required R2 environment variables are `R2_ENDPOINT`, `R2_BUCKET`,
-`R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` (`CLOUDFLARE_R2_*` aliases are
+`R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` (`CFLARE_R2_*` aliases are
 also accepted). `R2_REGION` defaults to `auto`.
 
 If R2 publication is enabled and the readiness gate reports the day is already
@@ -123,7 +121,7 @@ Published JSON paths:
 - `history/v2/who_2021/summaries/as_of_day_utc=YYYY-MM-DD/who_2021_summary.json`
 - `history/v2/who_2021/latest_who_2021.json`
 
-Parquet archive object keys are produced by
+Parquet archive object keys are produced by the parquet R2 write RPC
 `uk_aq_rpc_who_2021_r2_parquet_export`; that RPC is responsible for enforcing
 the agreed `history/v2/who_2021/...` parquet partition paths. The TypeScript
 path planner records expected prefixes for summary/debug metadata.
@@ -135,4 +133,3 @@ value is the expected latest complete UTC/GMT day.
 Public summary JSON is serialized with stable key ordering. The current
 publisher still writes the dated and latest JSON objects on each publication
 attempt; object-level skip-if-unchanged is not implemented yet.
->>>>>>> Stashed changes
