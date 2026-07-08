@@ -566,7 +566,7 @@ Pseudo workflow:
 7. Upsert `who_2021_rolling_year_status`.
 8. Optionally recalculate current year-to-date rows when that later product is enabled.
 9. If a previous calendar year is not final, calculate/finalise complete-year rows.
-10. Export newly created/updated derived rows to R2 v2 parquet.
+10. Write newly created/updated derived rows to R2 v2 parquet.
 11. Write dated public summary JSON to R2.
 12. Replace `history/v2/who_2021/latest_who_2021.json` only after parquet/archive outputs and dated JSON complete.
 13. Log run status, counts, date range, warnings and failures.
@@ -598,7 +598,7 @@ Backfill should:
 1. Calculate daily rows for the requested range.
 2. Recalculate rolling rows for every as-of day in the range, or at least for requested checkpoint days depending on performance.
 3. Recalculate complete calendar years, and optionally year-to-date rows when that later product is enabled.
-4. Export derived parquet outputs to R2 v2.
+4. Write derived parquet outputs to R2 v2.
 5. Publish dated/latest JSON outputs when `--publish-json` is provided.
 
 For the initial deployment, it is acceptable to backfill:
@@ -781,25 +781,23 @@ Implemented in this phase:
 - Updated the deploy workflow default scheduler cron to `0 4-9 * * *` so Cloud Scheduler can call hourly during the UTC morning readiness window.
 - Left R2 parquet/JSON publication for Phase 4. The homepage summary is built but not yet written to R2.
 
-### Phase 4: R2 v2 export/archive
+### Phase 4: R2 v2 parquet writes/archive
 
 Deliver:
 
-- Parquet export for daily, rolling and calendar derived outputs.
+- Parquet R2 writes for daily, rolling and calendar derived outputs.
 - R2 v2 paths with connector and pollutant partitions.
 - Manifest/update logic if the repo already uses manifests for R2 v2.
 - Re-run-safe overwrite or replace behaviour for each partition.
 - Dated summary JSON and `latest_who_2021.json` publication.
 - Daily cache/version key documented as `?as_of=YYYY-MM-DD`.
 
-<<<<<<< Updated upstream
-=======
 Implemented in this phase:
 
 - Added opt-in R2 publication controls to the existing WHO Cloud Run service:
   - `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED` publishes summary JSON after successful daily/rolling/calendar refreshes;
-  - `UK_AQ_WHO_2021_PARQUET_EXPORT_ENABLED` calls the parquet export RPC before JSON publication.
-- Added SigV4 R2 PUT support in the Deno worker, accepting `R2_*` variables and `CLOUDFLARE_R2_*` aliases.
+  - `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED` calls the parquet R2 write RPC before JSON publication.
+- Added SigV4 R2 PUT support in the Deno worker, accepting `R2_*` variables and `CFLARE_R2_*` aliases.
 - Added publication ordering so parquet parts are uploaded first, then the dated summary JSON, then `history/v2/who_2021/latest_who_2021.json`.
 - Added stable JSON serialization for the public summary payload to reduce unnecessary byte churn on reruns. Object-level skip-if-unchanged writes are not implemented yet, so publication still PUTs the dated and latest JSON objects on each publish attempt.
 - Added explicit failure handling when R2 publication is enabled but the summary refresh returns no row or no `homepage_summary`.
@@ -810,17 +808,16 @@ Implemented in this phase:
   - `history/v2/who_2021/calendar_year_status/calendar_year=YYYY/period_type=complete_year/connector_id=N/pollutant_code=<pollutant>/...`;
   - `history/v2/who_2021/summaries/as_of_day_utc=YYYY-MM-DD/who_2021_summary.json`;
   - `history/v2/who_2021/latest_who_2021.json`.
-- The parquet export RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_export` owns the exact parquet object keys and must enforce the agreed `history/v2/who_2021/...` partition paths. The TypeScript path planner is summary/debug metadata only.
+- The parquet R2 write RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_export` owns the exact parquet object keys and must enforce the agreed `history/v2/who_2021/...` partition paths. The TypeScript path planner is summary/debug metadata only.
 - Documented the daily cache/version key as `latest_who_2021.json?as_of=YYYY-MM-DD` in the service README.
 
 Manual follow-up before enabling publication:
 
-- Apply the Phase 4 database export RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_export` in TEST Obs AQI DB. The service expects rows shaped as `object_key`, `content_base64`, and optional `content_type`.
+- Apply the Phase 4 database parquet R2 write RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_export` in TEST Obs AQI DB. The service expects rows shaped as `object_key`, `content_base64`, and optional `content_type`.
 - Set the R2 environment variables/secrets for the Cloud Run service.
-- Enable `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` only after the export RPC and R2 credentials are present; enable `UK_AQ_WHO_2021_PARQUET_EXPORT_ENABLED=true` when parquet archive publication is ready.
+- Enable `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` only after the parquet R2 write RPC and R2 credentials are present; enable `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` when parquet archive publication is ready.
 - Run one manual dry-run/TEST invocation, inspect dated JSON, latest JSON, and parquet object paths, then allow the scheduler window to publish normally.
 
->>>>>>> Stashed changes
 ### Phase 5: Website data wiring
 
 Deliver:
