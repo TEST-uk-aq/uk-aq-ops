@@ -11,8 +11,7 @@ Current scope is daily plus Phase 3 summaries and opt-in Phase 4 R2 publication:
 - calculates/upserts last complete-year rows in
   `uk_aq_ops.who_2021_calendar_year_status`;
 - builds the 9-row homepage summary JSON in the run ledger;
-- can publish WHO summary JSON and parquet R2 write RPC output when Phase 4
-  publication is explicitly enabled;
+- can publish WHO summary JSON when Phase 4 publication is explicitly enabled;
 - records `uk_aq_ops.who_2021_processing_runs`;
 
 ## Endpoints
@@ -99,13 +98,14 @@ deno run --allow-env --allow-net workers/uk_aq_who_2021_daily_cloud_run/run_job.
 ## Phase 4 R2 publication
 
 Phase 4 publication is opt-in so existing daily/summary runs remain unchanged
-until the R2 settings and parquet R2 write RPC are applied.
+until the R2 settings are applied.
 
 Set `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` to publish the dated summary JSON
 and `history/v2/who_2021/latest_who_2021.json` after daily, rolling and calendar
-refreshes complete. Set `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` to call
-`uk_aq_rpc_who_2021_r2_parquet_write` and upload the returned parquet parts
-before the JSON latest pointer is replaced.
+refreshes complete. Leave `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=false` until
+the Phase 4b parquet writer exists. If that flag is set to `true` in this
+service, the run fails before JSON publication because this Deno publisher does
+not generate parquet bytes.
 
 Required R2 environment variables are `R2_ENDPOINT`, `R2_BUCKET`,
 `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` (`CFLARE_R2_*` aliases are
@@ -121,10 +121,38 @@ Published JSON paths:
 - `history/v2/who_2021/summaries/as_of_day_utc=YYYY-MM-DD/who_2021_summary.json`
 - `history/v2/who_2021/latest_who_2021.json`
 
-Parquet archive object keys are produced by the parquet R2 write RPC
-`uk_aq_rpc_who_2021_r2_parquet_write`; that RPC is responsible for enforcing
-the agreed `history/v2/who_2021/...` parquet partition paths. The TypeScript
-path planner records expected prefixes for summary/debug metadata.
+Parquet R2 writes are a Phase 4b follow-up. The database-side support for that
+writer is `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`, which returns
+`dataset`, `object_key`, `row_count`, and `rows_json`. Postgres does not
+generate parquet bytes in this repo; the Phase 4b worker must convert
+`rows_json` to parquet using the existing worker-side parquet tooling and PUT
+the result to the returned `object_key`.
+
+Static schema check:
+
+```bash
+grep -RIn "create or replace function uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows" \
+  ../TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_who_2021_ops_schema.sql \
+  ../TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql
+```
+
+SQL smoke test after applying the focused schema file in TEST Obs AQI DB:
+
+```sql
+select *
+from uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows(
+  p_as_of_day_utc := date '2026-07-02',
+  p_start_day_utc := date '2026-07-02',
+  p_end_day_utc := date '2026-07-02',
+  p_connector_id := 1,
+  p_source_network_code := 'gov_uk_aurn',
+  p_pollutant_codes := array['pm25', 'pm10', 'no2']
+)
+limit 20;
+```
+
+Expected shape: `object_key` values start with `history/v2/who_2021/`, and
+`rows_json` is non-empty when the matching WHO derived rows exist.
 
 The website should use the stable daily cache key
 `history/v2/who_2021/latest_who_2021.json?as_of=YYYY-MM-DD`, where the `as_of`

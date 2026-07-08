@@ -103,8 +103,8 @@
     - `uk_aq_public.uk_aq_rpc_who_2021_processing_run_log`
   - Current scope writes `uk_aq_ops.who_2021_daily_status`,
     `uk_aq_ops.who_2021_rolling_year_status`, and last-complete-year rows in
-    `uk_aq_ops.who_2021_calendar_year_status`. R2 JSON/parquet publication is
-    a later phase.
+    `uk_aq_ops.who_2021_calendar_year_status`. R2 summary JSON publication is
+    opt-in; parquet R2 writes remain a later Phase 4b worker task.
   - Scheduled daily runs use a readiness gate before latest-summary refresh:
     the final hour-ending source timestamp must have enough per-pollutant
     eligible-timeseries coverage, otherwise the run logs a deferred no-op.
