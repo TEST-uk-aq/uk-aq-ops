@@ -38,7 +38,7 @@ const SUMMARY_REFRESH_RPC =
     "uk_aq_rpc_who_2021_summary_refresh").trim();
 const PARQUET_R2_WRITE_RPC =
   (Deno.env.get("UK_AQ_WHO_2021_PARQUET_R2_WRITE_RPC") ||
-    "uk_aq_rpc_who_2021_r2_parquet_export").trim();
+    "uk_aq_rpc_who_2021_r2_parquet_write").trim();
 const R2_PUBLISH_ENABLED = parseBoolean(
   Deno.env.get("UK_AQ_WHO_2021_R2_PUBLISH_ENABLED"),
   false,
