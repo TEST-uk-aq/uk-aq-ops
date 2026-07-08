@@ -100,16 +100,22 @@ For each `(day_utc, connector_id)`:
    source fetches to only locations mapped to those requested timeseries IDs.
    For `uk_air_sos`, pre-filter candidate timeseries bindings to only those
    requested IDs before per-timeseries fetch.
-3. Read existing local Dropbox observations + AQI connector manifests/parquet.
-4. Split data by target timeseries IDs:
+3. For `uk_air_sos`, require a valid AURN flat-file mapping in
+   `uk_aq_raw.uk_air_sos_site_timeseries_refs` before source fetch. Each
+   candidate timeseries must have exactly one valid row for the requested
+   `day_utc`, and each `site_ref + pollutant_code + day_utc` must map to only
+   one timeseries. Missing or ambiguous mappings fail loudly and no R2 objects
+   are written.
+4. Read existing local Dropbox observations + AQI connector manifests/parquet.
+5. Split data by target timeseries IDs:
    - preserve non-target rows from local history
    - replace target rows with newly-built source rows
-5. Optional chunk-safe staging (when enabled): write merged rows to local stage
+6. Optional chunk-safe staging (when enabled): write merged rows to local stage
    files and defer R2 commit until finalize chunk.
-6. Rebuild merged observations parquet + manifest.
-7. Rebuild merged AQI parquet + manifest.
-8. Upload merged connector outputs to live R2 (replace connector/day objects).
-9. Rebuild day-level manifests from connector manifests.
+7. Rebuild merged observations parquet + manifest.
+8. Rebuild merged AQI parquet + manifest.
+9. Upload merged connector outputs to live R2 (replace connector/day objects).
+10. Rebuild day-level manifests from connector manifests.
 
 ### Chunk-safe targeted staging
 
@@ -146,9 +152,25 @@ Metadata-mismatch skips remain skips (no manifest written) — these are configu
 
 - `no_matching_requested_timeseries_ids` — requested IDs don't exist in the connector lookup
 - `no_matching_location_ids_after_timeseries_filter` — requested IDs map to no OpenAQ locations
+- `uk_air_sos_flat_file_mapping_guard_failed` — UK-AIR source-to-R2 has
+  missing or ambiguous `site_ref + pollutant_code + day_utc` mappings in
+  `uk_aq_raw.uk_air_sos_site_timeseries_refs`
 
 Adapters other than OpenAQ and Sensor.Community keep the original
 skip-on-no-data behaviour; extend per-adapter as needed.
+
+### UK-AIR observation status
+
+For `uk_air_sos`, source observations preserve the source status when present
+and write it to observation history parquet as nullable `status`. This is where
+UK-AIR values such as `Ratified` and `Provisional` are carried through to R2.
+Older parquet objects may not have this column; readers treat missing status as
+`null`.
+
+The UK-AIR flat-file mapping guard needs ingest DB access because it reads
+`uk_aq_raw.uk_air_sos_site_timeseries_refs` through PostgREST. Local/manual
+backfill environments therefore need the existing `SUPABASE_URL` and
+`SB_SECRET_KEY` values available before running UK-AIR historical source-to-R2.
 
 ## AQI handling / output scope
 

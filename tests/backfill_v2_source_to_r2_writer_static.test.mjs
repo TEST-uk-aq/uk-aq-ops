@@ -61,6 +61,30 @@ test("OpenAQ mapping keeps pollutant_code from source parameter if binding code 
   assert.match(body, /source_parameter: parameterRaw/);
 });
 
+test("UK-AIR source-to-R2 requires valid flat-file mappings before fetching observations", () => {
+  const guardBody = bodyOf("assertUkAirSosFlatFileMappingsForBackfill");
+  assert.match(source, /uk_air_sos_site_timeseries_refs/);
+  assert.match(guardBody, /missing_timeseries_ids/);
+  assert.match(guardBody, /ambiguous_site_pollutant_sample/);
+  assert.match(guardBody, /UK-AIR flat-file mapping guard failed/);
+
+  assert.match(source, /assertUkAirSosFlatFileMappingsForBackfill/);
+  assert.ok(
+    source.indexOf("assertUkAirSosFlatFileMappingsForBackfill") <
+      source.indexOf("processUkAirSosTimeseriesBatch"),
+    "mapping guard runs before UK-AIR source fetches",
+  );
+});
+
+test("UK-AIR observation status is preserved through source rows and R2 schemas", () => {
+  assert.match(source, /status\?: string \| null/);
+  assert.match(source, /status: datapoint\.status/);
+  assert.match(source, /status_values/);
+  assert.match(source, /HISTORY_OBSERVATIONS_COLUMNS[\s\S]*"status"/);
+  assert.match(source, /HISTORY_OBSERVATIONS_COLUMNS_R2_V2[\s\S]*"status"/);
+  assert.match(source, /status: textVector\(rows\.map\(\(row\) => row\.status \?\? null\)\)/);
+});
+
 test("AQI writer carries part timeseries counts into v1 and v2 manifest builders", () => {
   const summaryBody = bodyOf("summarizeAqilevelsPartRows");
   assert.match(summaryBody, /timeseries_row_counts: Record<string, number>/);

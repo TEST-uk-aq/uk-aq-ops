@@ -388,6 +388,15 @@ async function fetchFilteredParquetRowsFromR2(
         chunkStart,
         chunkEnd,
       );
+      const statusValues = schemaColumns.includes("status")
+        ? await readParquetColumnValues(
+          arrayBuffer,
+          metadata,
+          "status",
+          chunkStart,
+          chunkEnd,
+        )
+        : [];
       for (const idx of matchedIndexes) {
         if (idx >= observedAtValues.length || idx >= valueValues.length) {
           continue;
@@ -395,6 +404,9 @@ async function fetchFilteredParquetRowsFromR2(
         outRows.push({
           observed_at: observedAtValues[idx],
           value: valueValues[idx],
+          status: idx < statusValues.length && statusValues[idx] != null
+            ? String(statusValues[idx])
+            : null,
         });
       }
       if (metrics) {
