@@ -345,6 +345,19 @@ function emptyDomainState() {
   };
 }
 
+function expectedManifestPrefixForCheckpointDomain(backupVersion, domain) {
+  if (backupVersion === "v2") {
+    if (domain === "observations") return "history/v2/observations/day_utc=";
+    if (domain === "aqilevels") return "history/v2/aqilevels/hourly/data/day_utc=";
+    if (domain === "aqilevels_debug") return "history/v2/aqilevels/hourly/debug/day_utc=";
+    if (domain === "core") return "history/v2/core/day_utc=";
+  }
+  if (domain === "observations") return "history/v1/observations/day_utc=";
+  if (domain === "aqilevels") return "history/v1/aqilevels/hourly/day_utc=";
+  if (domain === "core") return "history/v1/core/day_utc=";
+  return "";
+}
+
 function emptyIndexTreeUnitsState(indexTreeKeys = []) {
   const out = {};
   for (const treeKey of indexTreeKeys) {
@@ -401,6 +414,12 @@ export function sanitizeCheckpointState(rawState, {
   const state = rawState && typeof rawState === "object" && !Array.isArray(rawState)
     ? rawState
     : {};
+  const rawBackupVersion = String(state.backup_version || "").trim().toLowerCase();
+  if (rawBackupVersion && rawBackupVersion !== backupVersion) {
+    throw new Error(
+      `Checkpoint backup_version=${rawBackupVersion} does not match selected backup version ${backupVersion}`,
+    );
+  }
 
   const domains = {};
   for (const domain of domainNames) {
@@ -415,8 +434,15 @@ export function sanitizeCheckpointState(rawState, {
     for (const [dayUtc, entry] of Object.entries(dayMap)) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dayUtc)) continue;
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const manifestKey = String(entry.manifest_key || "").trim();
+      const expectedPrefix = expectedManifestPrefixForCheckpointDomain(backupVersion, domain);
+      if (expectedPrefix && manifestKey && !manifestKey.startsWith(expectedPrefix)) {
+        throw new Error(
+          `Checkpoint ${backupVersion} ${domain}/${dayUtc} manifest_key=${manifestKey} does not start with ${expectedPrefix}`,
+        );
+      }
       cleanedDayMap[dayUtc] = {
-        manifest_key: String(entry.manifest_key || "").trim(),
+        manifest_key: manifestKey,
         copied_at: String(entry.copied_at || "").trim(),
         manifest_hash: String(entry.manifest_hash || "").trim(),
       };
@@ -537,13 +563,16 @@ function loadCheckpointState(rcloneBin, checkpointPath, options = {}) {
   if (!result.found) {
     return { state: emptyCheckpointState(nowIso, options), existed: false };
   }
+  if (!String(result.text || "").trim()) {
+    return { state: emptyCheckpointState(nowIso, options), existed: false };
+  }
   try {
     return {
       state: sanitizeCheckpointState(JSON.parse(result.text), options),
       existed: true,
     };
-  } catch {
-    throw new Error(`Checkpoint state is not valid JSON: ${checkpointPath}`);
+  } catch (error) {
+    throw new Error(`Checkpoint state is not valid JSON: ${checkpointPath}: ${error?.message || error}`);
   }
 }
 

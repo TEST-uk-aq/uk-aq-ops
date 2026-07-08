@@ -32,6 +32,10 @@ type DashboardPayload = {
   dropbox_backup_state_cache_key: string | null;
   dropbox_backup_state_warning: string | null;
   dropbox_backup_state_fallback_attempted: boolean;
+  dropbox_backup_observations_earliest_day: string | null;
+  dropbox_backup_observations_latest_day: string | null;
+  dropbox_backup_aqilevels_earliest_day: string | null;
+  dropbox_backup_aqilevels_latest_day: string | null;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
   pollutants: unknown[];
@@ -177,6 +181,10 @@ let storageCoverageCache: CacheEntry<{
   dropbox_backup_state_cache_key: string | null;
   dropbox_backup_state_warning: string | null;
   dropbox_backup_state_fallback_attempted: boolean;
+  dropbox_backup_observations_earliest_day: string | null;
+  dropbox_backup_observations_latest_day: string | null;
+  dropbox_backup_aqilevels_earliest_day: string | null;
+  dropbox_backup_aqilevels_latest_day: string | null;
 }> | null = null;
 let r2UsageCache: CacheEntry<{ usage: JsonObject | null; error: string | null }> | null = null;
 let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> | null = null;
@@ -1404,6 +1412,65 @@ function parseDropboxBackupDays(state: JsonObject | null): R2DaySets {
   return sets;
 }
 
+function daySetBounds(days: Set<string>): { earliest: string | null; latest: string | null } {
+  const sorted = Array.from(days).filter((day) => normalizeIsoDay(day) === day).sort();
+  return {
+    earliest: sorted.length ? sorted[0] : null,
+    latest: sorted.length ? sorted[sorted.length - 1] : null,
+  };
+}
+
+function dropboxBackupDaysDiagnostics(days: R2DaySets): JsonObject {
+  const observations = daySetBounds(days.observations);
+  const aqilevels = daySetBounds(days.aqilevels);
+  return {
+    dropbox_backup_observations_earliest_day: observations.earliest,
+    dropbox_backup_observations_latest_day: observations.latest,
+    dropbox_backup_aqilevels_earliest_day: aqilevels.earliest,
+    dropbox_backup_aqilevels_latest_day: aqilevels.latest,
+  };
+}
+
+function filterDropboxBackupDaysForReadVersion(
+  dropboxDays: R2DaySets,
+  r2Days: R2DaySets | null,
+  readVersion: R2HistoryReadVersionResolution,
+): { days: R2DaySets; warning: string | null } {
+  if (readVersion.version !== "v2") {
+    return { days: dropboxDays, warning: null };
+  }
+  if (!r2Days) {
+    return {
+      days: { observations: new Set<string>(), aqilevels: new Set<string>() },
+      warning: "Active R2 history version is v2 but explicit v2 history-days data is unavailable; ignoring Dropbox checkpoint day coverage because it is not verified.",
+    };
+  }
+
+  const filtered: R2DaySets = { observations: new Set<string>(), aqilevels: new Set<string>() };
+  const warnings: string[] = [];
+  for (const domainName of ["observations", "aqilevels"] as const) {
+    const r2Set = r2Days[domainName];
+    const dropboxSet = dropboxDays[domainName];
+    const r2Bounds = daySetBounds(r2Set);
+    const dropboxBounds = daySetBounds(dropboxSet);
+    for (const day of dropboxSet) {
+      if (r2Set.has(day)) {
+        filtered[domainName].add(day);
+      }
+    }
+    if (r2Bounds.earliest && dropboxBounds.earliest && dropboxBounds.earliest < r2Bounds.earliest) {
+      warnings.push(
+        `Dropbox v2 ${domainName} checkpoint claims ${dropboxBounds.earliest} before explicit v2 R2 history starts at ${r2Bounds.earliest}; earlier Dropbox days ignored.`,
+      );
+    }
+    const ignoredCount = dropboxSet.size - filtered[domainName].size;
+    if (ignoredCount > 0) {
+      warnings.push(`Ignored ${ignoredCount} unverified Dropbox v2 ${domainName} day(s).`);
+    }
+  }
+  return { days: filtered, warning: warnings.length ? warnings.join(" ") : null };
+}
+
 function buildStorageCoverageRows(
   dbRows: unknown[],
   schemaRows: unknown[],
@@ -1870,6 +1937,10 @@ async function fetchDashboardBaseData(
   let dropbox_backup_state_cache_key: string | null = null;
   let dropbox_backup_state_warning: string | null = null;
   let dropbox_backup_state_fallback_attempted = false;
+  let dropbox_backup_observations_earliest_day: string | null = null;
+  let dropbox_backup_observations_latest_day: string | null = null;
+  let dropbox_backup_aqilevels_earliest_day: string | null = null;
+  let dropbox_backup_aqilevels_latest_day: string | null = null;
   let storage_coverage_days: unknown[] = [];
 
   if (options.includeMetricContext || options.includeStorageCoverage) {
@@ -1904,6 +1975,27 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_cache_key = dropboxState.cacheKey;
     dropbox_backup_state_warning = dropboxState.warning;
     dropbox_backup_state_fallback_attempted = dropboxState.fallbackAttempted;
+    const rawDropboxDays = parseDropboxBackupDays(dropboxState.state);
+    const filteredDropbox = filterDropboxBackupDaysForReadVersion(
+      rawDropboxDays,
+      r2History.daySets,
+      r2_history_read_version,
+    );
+    const dropboxDays = filteredDropbox.days;
+    const dropboxDiagnostics = dropboxBackupDaysDiagnostics(dropboxDays);
+    dropbox_backup_observations_earliest_day =
+      dropboxDiagnostics.dropbox_backup_observations_earliest_day as string | null;
+    dropbox_backup_observations_latest_day =
+      dropboxDiagnostics.dropbox_backup_observations_latest_day as string | null;
+    dropbox_backup_aqilevels_earliest_day =
+      dropboxDiagnostics.dropbox_backup_aqilevels_earliest_day as string | null;
+    dropbox_backup_aqilevels_latest_day =
+      dropboxDiagnostics.dropbox_backup_aqilevels_latest_day as string | null;
+    if (filteredDropbox.warning) {
+      dropbox_backup_state_warning = dropbox_backup_state_warning
+        ? `${dropbox_backup_state_warning} ${filteredDropbox.warning}`
+        : filteredDropbox.warning;
+    }
     if (!r2_backup_window && r2_history_read_version.version !== "v2") {
       const fallbackWindow = await fetchR2BackupWindowFromSupabase(env);
       r2_backup_window = fallbackWindow.window;
@@ -1918,7 +2010,6 @@ async function fetchDashboardBaseData(
         "R2 history-days API did not return a v2 window; version-blind Supabase window fallback disabled for v2.";
     }
     if (options.includeStorageCoverage) {
-      const dropboxDays = parseDropboxBackupDays(dropboxState.state);
       storage_coverage_days = buildStorageCoverageRows(
         dbMetrics.dbRows,
         dbMetrics.schemaRows,
@@ -1970,6 +2061,10 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_cache_key,
     dropbox_backup_state_warning,
     dropbox_backup_state_fallback_attempted,
+    dropbox_backup_observations_earliest_day,
+    dropbox_backup_observations_latest_day,
+    dropbox_backup_aqilevels_earliest_day,
+    dropbox_backup_aqilevels_latest_day,
     storage_coverage_source: "live_per_day_presence",
     storage_coverage_days,
     r2_history_read_version,
@@ -2033,6 +2128,10 @@ export async function getDirectStorageCoveragePayload(
   dropbox_backup_state_cache_key: string | null;
   dropbox_backup_state_warning: string | null;
   dropbox_backup_state_fallback_attempted: boolean;
+  dropbox_backup_observations_earliest_day: string | null;
+  dropbox_backup_observations_latest_day: string | null;
+  dropbox_backup_aqilevels_earliest_day: string | null;
+  dropbox_backup_aqilevels_latest_day: string | null;
 }> {
   const forceRefresh = asTruthy(search.get("force"));
   if (forceRefresh) {
@@ -2069,6 +2168,10 @@ export async function getDirectStorageCoveragePayload(
     dropbox_backup_state_cache_key: payload.dropbox_backup_state_cache_key || null,
     dropbox_backup_state_warning: payload.dropbox_backup_state_warning || null,
     dropbox_backup_state_fallback_attempted: payload.dropbox_backup_state_fallback_attempted || false,
+    dropbox_backup_observations_earliest_day: payload.dropbox_backup_observations_earliest_day || null,
+    dropbox_backup_observations_latest_day: payload.dropbox_backup_observations_latest_day || null,
+    dropbox_backup_aqilevels_earliest_day: payload.dropbox_backup_aqilevels_earliest_day || null,
+    dropbox_backup_aqilevels_latest_day: payload.dropbox_backup_aqilevels_latest_day || null,
   };
   storageCoverageCacheVersionKey = cacheKey;
   storageCoverageCache = { value: response, expiresAt: Date.now() + STORAGE_COVERAGE_TTL_MS };

@@ -79,13 +79,24 @@ function buildStorageCoverageRows(r2Days, dropboxDays) {
   return rows;
 }
 
+function filterDropboxBackupDaysForReadVersion(dropboxDays, r2Days, readVersion) {
+  if (readVersion !== 'v2') return dropboxDays;
+  if (!r2Days) {
+    return { observations: new Set(), aqilevels: new Set() };
+  }
+  return {
+    observations: new Set([...dropboxDays.observations].filter((day) => r2Days.observations.has(day))),
+    aqilevels: new Set([...dropboxDays.aqilevels].filter((day) => r2Days.aqilevels.has(day))),
+  };
+}
+
 test('storage coverage source clears both storage coverage and R2 history-day caches on force refresh', () => {
   assert.match(directSource, /function clearStorageCoverageCaches\(\): void \{[\s\S]*storageCoverageCache = null;[\s\S]*r2HistoryDaysCache = null;/);
   assert.match(directSource, /if \(forceRefresh\) \{[\s\S]*clearStorageCoverageCaches\(\);[\s\S]*\}/);
 });
 
 test('v2 source disables version-blind Supabase R2 window fallback', () => {
-  assert.match(directSource, /r2History\.readVersion\.version !== "v2"/);
+  assert.match(directSource, /r2_history_read_version\.version !== "v2"/);
   assert.match(directSource, /Version-blind Supabase window fallback disabled for v2/);
 });
 
@@ -96,9 +107,19 @@ test('storage coverage response exposes actual R2 history diagnostics', () => {
     'r2_history_days_bucket',
     'r2_history_days_error',
     'r2_history_read_version_effective',
+    'dropbox_backup_observations_earliest_day',
+    'dropbox_backup_observations_latest_day',
+    'dropbox_backup_aqilevels_earliest_day',
+    'dropbox_backup_aqilevels_latest_day',
   ]) {
     assert.match(directSource, new RegExp(`${field}: payload\\.${field}`));
   }
+});
+
+test('v2 source filters Dropbox checkpoint days to explicit v2 R2 history days', () => {
+  assert.match(directSource, /function filterDropboxBackupDaysForReadVersion/);
+  assert.match(directSource, /Active R2 history version is v2 but explicit v2 history-days data is unavailable/);
+  assert.match(directSource, /before explicit v2 R2 history starts/);
 });
 
 test('v2 Dropbox backup days populate backup overlay fields without changing R2 presence', () => {
@@ -142,11 +163,38 @@ test('v2 storage coverage does not mark 2025 R2 presence without explicit v2 his
       aqilevels: { days: { '2025-07-02': {} } },
     },
   });
-  const rows = buildStorageCoverageRows(null, dropboxDays);
+  const filteredDropboxDays = filterDropboxBackupDaysForReadVersion(dropboxDays, null, 'v2');
+  const rows = buildStorageCoverageRows(null, filteredDropboxDays);
   const row = rows.find((item) => item.date === '2025-07-02');
-  assert.ok(row, 'expected storage coverage row for 2025-07-02');
-  assert.equal(row.r2_observs, false);
-  assert.equal(row.r2_aqilevels, false);
-  assert.equal(row.dropbox_observs, true);
-  assert.equal(row.dropbox_aqilevels, true);
+  assert.equal(row, undefined);
+});
+
+test('v2 Dropbox state does not include 2025 when explicit v2 R2 starts at 2026-03-18', () => {
+  const rawDropboxDays = parseDropboxBackupDays({
+    domains: {
+      observations: {
+        days: {
+          '2025-07-02': {},
+          '2026-03-18': {},
+        },
+      },
+      aqilevels: {
+        days: {
+          '2025-07-02': {},
+          '2026-03-18': {},
+        },
+      },
+    },
+  });
+  const r2Days = {
+    observations: new Set(['2026-03-18']),
+    aqilevels: new Set(['2026-03-18']),
+  };
+  const dropboxDays = filterDropboxBackupDaysForReadVersion(rawDropboxDays, r2Days, 'v2');
+  const rows = buildStorageCoverageRows(r2Days, dropboxDays);
+  const badRow = rows.find((item) => item.date === '2025-07-02');
+  assert.equal(badRow, undefined);
+  const firstV2Row = rows.find((item) => item.date === '2026-03-18');
+  assert.equal(firstV2Row.dropbox_observs, true);
+  assert.equal(firstV2Row.dropbox_aqilevels, true);
 });

@@ -406,7 +406,7 @@ CLI:
 Behaviour:
 
 1. Loads the inventory via strict reader. Missing / empty / invalid JSON / wrong kind / wrong version → exit non-zero with an actionable error ending in "re-run scripts/backup_r2/build_backup_inventory.mjs --source-root <root> to regenerate it."
-2. Loads the Dropbox checkpoint (creates an empty one if absent; accepts old shapes without the new index sections).
+2. Loads the Dropbox checkpoint (creates an empty one if absent; accepts old shapes without the new index sections). The checkpoint `backup_version` must match the selected version, and day manifest keys must live under the selected version's expected domain prefix. A copied v1 checkpoint or a v1/v2 path rewrite is rejected rather than reused.
 3. In v2 mode with pruning enabled, loads the Dropbox prune checkpoint. Missing means empty; invalid state is ignored with a warning and is not used for skipping.
 4. **Plan days** per domain: for each day in inventory, compare `manifest_hash` against checkpoint's stored hash. Mismatch → queue. Apply `--max-days-per-run` per domain.
 5. **Plan index files**: same hash compare for the selected version's index latest files.
@@ -533,7 +533,7 @@ node scripts/backup_r2/sync_history_to_dropbox.mjs --show-version
 Build the CIC-Test v2 inventory:
 
 ```bash
-UK_AQ_R2_HISTORY_BACKUP_VERSION=v2 \
+UK_AQ_R2_HISTORY_VERSION=v2 \
 node scripts/backup_r2/build_backup_inventory.mjs \
   --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
   --report-out ./tmp/r2_backup_inventory_v2_report.json
@@ -542,12 +542,44 @@ node scripts/backup_r2/build_backup_inventory.mjs \
 Sync CIC-Test v2 to Dropbox:
 
 ```bash
-UK_AQ_R2_HISTORY_BACKUP_VERSION=v2 \
+UK_AQ_R2_HISTORY_VERSION=v2 \
 node scripts/backup_r2/sync_history_to_dropbox.mjs \
   --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
   --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup" \
   --report-out ./tmp/r2_history_dropbox_backup_v2_report.json
 ```
+
+Safely rebuild the CIC-Test v2 checkpoint after quarantining a bad
+`r2_history_backup_state_v2.json`:
+
+```bash
+mkdir -p ./tmp
+
+UK_AQ_R2_HISTORY_VERSION=v2 \
+node scripts/backup_r2/build_backup_inventory.mjs \
+  --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
+  --full-rebuild \
+  --report-out ./tmp/r2_backup_inventory_v2_rebuild_report.json
+
+UK_AQ_R2_HISTORY_VERSION=v2 \
+node scripts/backup_r2/sync_history_to_dropbox.mjs \
+  --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
+  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup" \
+  --state-rel-path "_ops/checkpoints/r2_history_backup_state_v2.json" \
+  --report-out ./tmp/r2_history_dropbox_backup_state_v2_rebuild_dry_run.json \
+  --dry-run
+
+UK_AQ_R2_HISTORY_VERSION=v2 \
+node scripts/backup_r2/sync_history_to_dropbox.mjs \
+  --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
+  --dest-root "uk_aq_dropbox:CIC-Test/R2_history_backup" \
+  --state-rel-path "_ops/checkpoints/r2_history_backup_state_v2.json" \
+  --report-out ./tmp/r2_history_dropbox_backup_state_v2_rebuild_report.json
+```
+
+Expected after rebuild: `domains.observations.days` and
+`domains.aqilevels.days` in `_ops/checkpoints/r2_history_backup_state_v2.json`
+start at the first explicit v2 R2 day, not at copied v1-era 2025 days.
 
 Verify the v2 active backup inventory exists:
 
