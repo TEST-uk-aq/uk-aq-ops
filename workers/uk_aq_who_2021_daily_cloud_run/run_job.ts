@@ -36,16 +36,13 @@ const READINESS_RPC = (Deno.env.get("UK_AQ_WHO_2021_READINESS_RPC") ||
 const SUMMARY_REFRESH_RPC =
   (Deno.env.get("UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC") ||
     "uk_aq_rpc_who_2021_summary_refresh").trim();
-const PARQUET_R2_WRITE_RPC =
-  (Deno.env.get("UK_AQ_WHO_2021_PARQUET_R2_WRITE_RPC") ||
-    "uk_aq_rpc_who_2021_r2_parquet_write").trim();
 const R2_PUBLISH_ENABLED = parseBoolean(
   Deno.env.get("UK_AQ_WHO_2021_R2_PUBLISH_ENABLED"),
   false,
 );
 const PARQUET_R2_WRITE_ENABLED = parseBoolean(
   Deno.env.get("UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED"),
-  R2_PUBLISH_ENABLED,
+  false,
 );
 const R2_ENDPOINT = optionalEnv("R2_ENDPOINT") ||
   optionalEnv("CFLARE_R2_ENDPOINT");
@@ -353,12 +350,6 @@ async function signedR2Put(
   }
 }
 
-type ParquetR2WritePart = {
-  object_key: string;
-  content_base64: string;
-  content_type?: string;
-};
-
 async function publishPhase4(
   args: {
     config: ReturnType<typeof buildRunConfig>;
@@ -387,32 +378,9 @@ async function publishPhase4(
   });
   const parquetObjects: string[] = [];
   if (args.config.parquetR2WriteEnabled) {
-    const result = await postgrestRpc<unknown>(PARQUET_R2_WRITE_RPC, {
-      p_as_of_day_utc: args.config.endDayUtc,
-      p_start_day_utc: args.config.startDayUtc,
-      p_end_day_utc: args.config.endDayUtc,
-      p_connector_id: args.config.connectorId,
-      p_source_network_code: args.config.sourceNetworkCode,
-      p_pollutant_codes: args.config.pollutantCodes,
-    });
-    if (result.error) {
-      throw new Error(`parquet R2 write RPC failed: ${result.error.message}`);
-    }
-    const parts =
-      (Array.isArray(result.data) ? result.data : []) as ParquetR2WritePart[];
-    for (const part of parts) {
-      if (!part.object_key || !part.content_base64) continue;
-      const bytes = Uint8Array.from(
-        atob(part.content_base64),
-        (c) => c.charCodeAt(0),
-      );
-      await signedR2Put(
-        part.object_key,
-        bytes,
-        part.content_type || "application/vnd.apache.parquet",
-      );
-      parquetObjects.push(part.object_key);
-    }
+    throw new Error(
+      "UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true is reserved for the Phase 4b parquet writer. The database provides uk_aq_rpc_who_2021_r2_parquet_rows row batches; this JSON publisher does not generate parquet bytes.",
+    );
   }
   const body = stableJson(args.homepageSummary);
   await signedR2Put(
