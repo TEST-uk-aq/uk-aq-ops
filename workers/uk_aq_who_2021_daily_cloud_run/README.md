@@ -104,7 +104,7 @@ until the R2 settings and parquet R2 write RPC are applied.
 Set `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` to publish the dated summary JSON
 and `history/v2/who_2021/latest_who_2021.json` after daily, rolling and calendar
 refreshes complete. Set `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` to call
-`uk_aq_rpc_who_2021_r2_parquet_export` and upload the returned parquet parts
+`uk_aq_rpc_who_2021_r2_parquet_write` and upload the returned parquet parts
 before the JSON latest pointer is replaced.
 
 Required R2 environment variables are `R2_ENDPOINT`, `R2_BUCKET`,
@@ -122,7 +122,7 @@ Published JSON paths:
 - `history/v2/who_2021/latest_who_2021.json`
 
 Parquet archive object keys are produced by the parquet R2 write RPC
-`uk_aq_rpc_who_2021_r2_parquet_export`; that RPC is responsible for enforcing
+`uk_aq_rpc_who_2021_r2_parquet_write`; that RPC is responsible for enforcing
 the agreed `history/v2/who_2021/...` parquet partition paths. The TypeScript
 path planner records expected prefixes for summary/debug metadata.
 

@@ -808,12 +808,12 @@ Implemented in this phase:
   - `history/v2/who_2021/calendar_year_status/calendar_year=YYYY/period_type=complete_year/connector_id=N/pollutant_code=<pollutant>/...`;
   - `history/v2/who_2021/summaries/as_of_day_utc=YYYY-MM-DD/who_2021_summary.json`;
   - `history/v2/who_2021/latest_who_2021.json`.
-- The parquet R2 write RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_export` owns the exact parquet object keys and must enforce the agreed `history/v2/who_2021/...` partition paths. The TypeScript path planner is summary/debug metadata only.
+- The parquet R2 write RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_write` owns the exact parquet object keys and must enforce the agreed `history/v2/who_2021/...` partition paths. The TypeScript path planner is summary/debug metadata only.
 - Documented the daily cache/version key as `latest_who_2021.json?as_of=YYYY-MM-DD` in the service README.
 
 Manual follow-up before enabling publication:
 
-- Apply the Phase 4 database parquet R2 write RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_export` in TEST Obs AQI DB. The service expects rows shaped as `object_key`, `content_base64`, and optional `content_type`.
+- Apply the Phase 4 database parquet R2 write RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_write` in TEST Obs AQI DB. The service expects rows shaped as `object_key`, `content_base64`, and optional `content_type`.
 - Set the R2 environment variables/secrets for the Cloud Run service.
 - Enable `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=true` only after the parquet R2 write RPC and R2 credentials are present; enable `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true` when parquet archive publication is ready.
 - Run one manual dry-run/TEST invocation, inspect dated JSON, latest JSON, and parquet object paths, then allow the scheduler window to publish normally.

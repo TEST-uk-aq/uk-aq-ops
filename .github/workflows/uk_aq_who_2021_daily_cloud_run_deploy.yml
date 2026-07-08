@@ -60,7 +60,7 @@ jobs:
       UK_AQ_WHO_2021_RPC_RETRIES: ${{ vars.UK_AQ_WHO_2021_RPC_RETRIES || '3' }}
       UK_AQ_WHO_2021_R2_PUBLISH_ENABLED: ${{ vars.UK_AQ_WHO_2021_R2_PUBLISH_ENABLED || 'false' }}
       UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED: ${{ vars.UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED || vars.UK_AQ_WHO_2021_R2_PUBLISH_ENABLED || 'false' }}
-      UK_AQ_WHO_2021_PARQUET_R2_WRITE_RPC: ${{ vars.UK_AQ_WHO_2021_PARQUET_R2_WRITE_RPC || 'uk_aq_rpc_who_2021_r2_parquet_export' }}
+      UK_AQ_WHO_2021_PARQUET_R2_WRITE_RPC: ${{ vars.UK_AQ_WHO_2021_PARQUET_R2_WRITE_RPC || 'uk_aq_rpc_who_2021_r2_parquet_write' }}
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || vars.R2_ENDPOINT || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || vars.R2_BUCKET || '' }}
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || vars.R2_REGION || 'auto' }}
