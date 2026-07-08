@@ -832,6 +832,13 @@ Deliver:
 - Add small loading/error behaviour that does not block the rest of the homepage dashboard.
 - Keep current public wording and layout.
 
+Implemented in this phase:
+
+- Wired the homepage WHO summary card to fetch `history/v2/who_2021/latest_who_2021.json?as_of=YYYY-MM-DD`.
+- Kept the existing static card values as the no-network fallback and added localStorage reuse of the last valid WHO summary payload.
+- Added a small non-blocking status message for loading, cached, and static-fallback states.
+- Preserved the current public wording, layout, and agreed R2 paths.
+
 ### Phase 6: WHO guideline page and league tables
 
 Deliver later:
