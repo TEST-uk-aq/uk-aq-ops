@@ -4832,8 +4832,11 @@ def _check_one_uk_air_sos_station_day(
         last_changed_at = now_iso
 
     keep_snapshot = (
-        keep_policy == "all"
-        or (keep_policy == "changed" and outcome in {"changed", "reappeared"})
+        row_count > 0
+        and (
+            keep_policy == "all"
+            or (keep_policy == "changed" and outcome in {"changed", "reappeared"})
+        )
     )
     cache_path = _uk_air_sos_cache_path(cache_root, station_ref, day)
     local_cached_path: str | None = None
@@ -4844,6 +4847,11 @@ def _check_one_uk_air_sos_station_day(
     else:
         if cache_path.exists():
             cache_path.unlink(missing_ok=True)
+        try:
+            cache_path.parent.rmdir()
+            cache_path.parent.parent.rmdir()
+        except OSError:
+            pass
 
     _upsert_source_state(
         conn=conn,
