@@ -811,6 +811,7 @@ Implemented in this phase:
 - Added database-side row-batch RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`, which returns `dataset`, `object_key`, `row_count`, and `rows_json` for the Phase 4b writer. The RPC owns the exact parquet object keys and enforces the agreed `history/v2/who_2021/...` partition paths.
 - Added worker-side parquet generation with Arrow and `parquet-wasm`, matching the repo pattern that parquet bytes are generated outside Postgres. Do not fake parquet bytes in SQL.
 - Added validation that parquet object keys match their dataset and row counts match `rows_json` before upload.
+- Fixed worker-side nullable boolean handling so mixed true/false/null values and all-null nullable guideline-flag columns encode safely in parquet.
 - Documented the daily cache/version key as `latest_who_2021.json?as_of=YYYY-MM-DD` in the service README.
 
 Manual follow-up before enabling publication:

@@ -159,6 +159,16 @@ Parquet writer test:
 deno test --allow-read workers/uk_aq_who_2021_daily_cloud_run/who_2021_parquet_test.ts
 ```
 
+DuckDB smoke test for a downloaded rolling-year parquet part:
+
+```sql
+select
+  count(*) as rows,
+  count(*) filter (where has_enough_data is false) as not_enough_data_rows,
+  count(*) filter (where above_who_yearly_guideline is null) as null_yearly_flags
+from read_parquet('part-00000.parquet');
+```
+
 The website should use the stable daily cache key
 `history/v2/who_2021/latest_who_2021.json?as_of=YYYY-MM-DD`, where the `as_of`
 value is the expected latest complete UTC/GMT day.
