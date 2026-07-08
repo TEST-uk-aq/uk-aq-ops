@@ -114,6 +114,17 @@ function obsDayCheckpointEntry(dayUtc, hash) {
   };
 }
 
+function obsDayCheckpointEntryForVersion(dayUtc, hash, backupVersion = "v1") {
+  const prefix = backupVersion === "v2"
+    ? "history/v2/observations"
+    : "history/v1/observations";
+  return {
+    manifest_key: `${prefix}/day_utc=${dayUtc}/manifest.json`,
+    copied_at: "2026-05-14T00:00:00.000Z",
+    manifest_hash: hash,
+  };
+}
+
 const SYNC_ARGS = {
   domains: ["observations", "aqilevels", "core"],
   max_days_per_run: 0,
@@ -192,6 +203,7 @@ injectPlannedFailure();
 
 if (command === "cat") {
   if (!fs.existsSync(target)) fail("object not found");
+  if (fs.statSync(target).isDirectory()) fail("object not found");
   process.stdout.write(fs.readFileSync(target, "utf8"));
   process.exit(0);
 }
@@ -341,7 +353,7 @@ function writeCopyCheckpoint(destRoot, { dayUtc = "2026-06-18", hash = "hash-new
   writeJson(
     path.join(destRoot, relPath),
     makeCheckpoint({
-      days: { observations: { [dayUtc]: obsDayCheckpointEntry(dayUtc, hash) } },
+      days: { observations: { [dayUtc]: obsDayCheckpointEntryForVersion(dayUtc, hash, backupVersion) } },
     }),
   );
 }
@@ -1311,8 +1323,8 @@ test("force/all prune continues after a failed unit and fails after auditing lat
     makeCheckpoint({
       days: {
         observations: {
-          [firstDay]: obsDayCheckpointEntry(firstDay, "hash-v2"),
-          [secondDay]: obsDayCheckpointEntry(secondDay, "hash-v2"),
+          [firstDay]: obsDayCheckpointEntryForVersion(firstDay, "hash-v2", "v2"),
+          [secondDay]: obsDayCheckpointEntryForVersion(secondDay, "hash-v2", "v2"),
         },
       },
     }),
@@ -1505,6 +1517,54 @@ test("v1 and v2 backup checkpoint paths are separate", () => {
   assert.notEqual(
     defaultStateRelPathForBackupVersion("v1"),
     defaultStateRelPathForBackupVersion("v2"),
+  );
+});
+
+test("v2 checkpoint sanitizer rejects copied v1 checkpoint state", () => {
+  assert.throws(
+    () =>
+      sanitizeCheckpointState(
+        {
+          backup_version: "v1",
+          domains: {
+            observations: {
+              days: {
+                "2025-01-01": {
+                  manifest_key: "history/v1/observations/day_utc=2025-01-01/manifest.json",
+                  copied_at: "2026-07-08T00:00:00.000Z",
+                  manifest_hash: "hash",
+                },
+              },
+            },
+          },
+        },
+        { backupVersion: "v2" },
+      ),
+    /backup_version=v1 does not match selected backup version v2/,
+  );
+});
+
+test("v2 checkpoint sanitizer rejects v1 manifest keys rewritten into the wrong domain", () => {
+  assert.throws(
+    () =>
+      sanitizeCheckpointState(
+        {
+          backup_version: "v2",
+          domains: {
+            aqilevels: {
+              days: {
+                "2025-01-01": {
+                  manifest_key: "history/v2/aqilevels/day_utc=2025-01-01/manifest.json",
+                  copied_at: "2026-07-08T00:00:00.000Z",
+                  manifest_hash: "hash",
+                },
+              },
+            },
+          },
+        },
+        { backupVersion: "v2" },
+      ),
+    /does not start with history\/v2\/aqilevels\/hourly\/data\/day_utc=/,
   );
 });
 

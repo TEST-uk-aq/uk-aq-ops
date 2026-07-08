@@ -147,6 +147,10 @@ STORAGE_COVERAGE_CACHE_STATE: Dict[str, Any] = {
     "dropbox_state_path": None,
     "dropbox_state_error": None,
     "dropbox_state_info": None,
+    "dropbox_backup_observations_earliest_day": None,
+    "dropbox_backup_observations_latest_day": None,
+    "dropbox_backup_aqilevels_earliest_day": None,
+    "dropbox_backup_aqilevels_latest_day": None,
 }
 DROPBOX_HISTORY_MTIME_CACHE_STATE: Dict[str, Any] = {
     "payload": None,
@@ -290,6 +294,19 @@ def _invalidate_dashboard_cache(clear_storage_coverage: bool = False) -> None:
         if clear_storage_coverage:
             STORAGE_COVERAGE_CACHE_STATE["rows"] = None
             STORAGE_COVERAGE_CACHE_STATE["next_refresh_at"] = None
+            STORAGE_COVERAGE_CACHE_STATE["cache_key"] = None
+            STORAGE_COVERAGE_CACHE_STATE["dropbox_state_path"] = None
+            STORAGE_COVERAGE_CACHE_STATE["dropbox_state_error"] = None
+            STORAGE_COVERAGE_CACHE_STATE["dropbox_state_info"] = None
+            STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_observations_earliest_day"] = None
+            STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_observations_latest_day"] = None
+            STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_aqilevels_earliest_day"] = None
+            STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_aqilevels_latest_day"] = None
+            R2_HISTORY_DAYS_CACHE_STATE["day_sets"] = None
+            R2_HISTORY_DAYS_CACHE_STATE["window"] = None
+            R2_HISTORY_DAYS_CACHE_STATE["bucket"] = None
+            R2_HISTORY_DAYS_CACHE_STATE["error"] = None
+            R2_HISTORY_DAYS_CACHE_STATE["generated_at"] = None
 
 
 def _normalize_token(value: str) -> str:
@@ -1853,6 +1870,53 @@ def _extract_dropbox_backup_days(
     return domain_days, None
 
 
+def _dropbox_day_bounds(days: Set[date]) -> Tuple[Optional[str], Optional[str]]:
+    if not days:
+        return None, None
+    return min(days).isoformat(), max(days).isoformat()
+
+
+def _dropbox_backup_days_diagnostics(days: Dict[str, Set[date]]) -> Dict[str, Optional[str]]:
+    obs_earliest, obs_latest = _dropbox_day_bounds(set(days.get("observations") or set()))
+    aqi_earliest, aqi_latest = _dropbox_day_bounds(set(days.get("aqilevels") or set()))
+    return {
+        "dropbox_backup_observations_earliest_day": obs_earliest,
+        "dropbox_backup_observations_latest_day": obs_latest,
+        "dropbox_backup_aqilevels_earliest_day": aqi_earliest,
+        "dropbox_backup_aqilevels_latest_day": aqi_latest,
+    }
+
+
+def _filter_dropbox_backup_days_for_read_version(
+    dropbox_days: Dict[str, Set[date]],
+    r2_history_days: Optional[Dict[str, Set[date]]],
+    read_version_info: Dict[str, Any],
+) -> Tuple[Dict[str, Set[date]], Optional[str]]:
+    if read_version_info.get("version") != "v2":
+        return dropbox_days, None
+    if not isinstance(r2_history_days, dict):
+        return _empty_dropbox_backup_days(), (
+            "Active R2 history version is v2 but explicit v2 history-days data is unavailable; "
+            "ignoring Dropbox checkpoint day coverage because it is not verified."
+        )
+
+    filtered = _empty_dropbox_backup_days()
+    warnings: List[str] = []
+    for domain_name in ("observations", "aqilevels"):
+        r2_days = set(r2_history_days.get(domain_name) or set())
+        raw_days = set(dropbox_days.get(domain_name) or set())
+        filtered[domain_name] = raw_days & r2_days
+        if r2_days and raw_days and min(raw_days) < min(r2_days):
+            warnings.append(
+                f"Dropbox v2 {domain_name} checkpoint claims {min(raw_days).isoformat()} "
+                f"before explicit v2 R2 history starts at {min(r2_days).isoformat()}; earlier Dropbox days ignored."
+            )
+        ignored_count = len(raw_days) - len(filtered[domain_name])
+        if ignored_count > 0:
+            warnings.append(f"Ignored {ignored_count} unverified Dropbox v2 {domain_name} day(s).")
+    return filtered, " ".join(warnings) if warnings else None
+
+
 def _fetch_dropbox_access_token() -> Tuple[Optional[str], Optional[str]]:
     creds_present = [bool(DROPBOX_APP_KEY), bool(DROPBOX_APP_SECRET), bool(DROPBOX_REFRESH_TOKEN)]
     if not any(creds_present):
@@ -2468,6 +2532,7 @@ def _get_storage_coverage_days_cached(
     )
     next_refresh_at = _next_storage_coverage_refresh(now_utc)
     resolved_info = dropbox_state_info or _resolve_dropbox_state_path_info()
+    dropbox_days_diagnostics = _dropbox_backup_days_diagnostics(dropbox_backup_days or _empty_dropbox_backup_days())
     with CACHE_LOCK:
         STORAGE_COVERAGE_CACHE_STATE["rows"] = rows
         STORAGE_COVERAGE_CACHE_STATE["next_refresh_at"] = next_refresh_at
@@ -2475,6 +2540,7 @@ def _get_storage_coverage_days_cached(
         STORAGE_COVERAGE_CACHE_STATE["dropbox_state_path"] = dropbox_state_path
         STORAGE_COVERAGE_CACHE_STATE["dropbox_state_error"] = dropbox_state_error
         STORAGE_COVERAGE_CACHE_STATE["dropbox_state_info"] = resolved_info
+        STORAGE_COVERAGE_CACHE_STATE.update(dropbox_days_diagnostics)
     return rows
 
 
@@ -3004,7 +3070,8 @@ def _get_r2_history_days_cached(
             )
 
     day_sets, r2_window, bucket_value, error = _fetch_r2_history_days_from_external_api()
-    if error is not None and base_url and service_role_key:
+    read_version = _resolve_r2_history_read_version()
+    if error is not None and base_url and service_role_key and read_version.get("version") != "v2":
         sb_day_sets, sb_window, sb_bucket, sb_error = _fetch_r2_history_days_from_supabase(
             base_url, service_role_key
         )
@@ -3918,6 +3985,7 @@ def _fetch_storage_coverage_context(
     base_url: str,
     headers: Dict[str, str],
     now: datetime,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     (
         db_size_metrics,
@@ -3937,14 +4005,23 @@ def _fetch_storage_coverage_context(
         r2_history_days_bucket,
         r2_history_days_error,
     ) = _get_r2_history_days_cached(
-        force_refresh=False,
+        force_refresh=force_refresh,
         base_url=base_url,
         service_role_key=str(headers.get("apikey") or ""),
     )
-    r2_backup_window_rpc, r2_backup_window_rpc_error = _fetch_r2_backup_window(
-        base_url,
-        headers,
-    )
+    read_version_info = _resolve_r2_history_read_version()
+    if read_version_info.get("version") == "v2":
+        r2_backup_window_rpc = None
+        r2_backup_window_rpc_error = (
+            "Version-blind Supabase window fallback disabled for v2."
+            if r2_backup_window_from_history_days is None
+            else None
+        )
+    else:
+        r2_backup_window_rpc, r2_backup_window_rpc_error = _fetch_r2_backup_window(
+            base_url,
+            headers,
+        )
     r2_backup_window = (
         r2_backup_window_from_history_days
         if r2_backup_window_from_history_days is not None
@@ -3967,6 +4044,18 @@ def _fetch_storage_coverage_context(
             r2_domain_filter_error,
         )
     dropbox_backup_days, dropbox_state_path, dropbox_state_error, dropbox_state_info = _load_dropbox_backup_days()
+    dropbox_backup_days, dropbox_filter_warning = _filter_dropbox_backup_days_for_read_version(
+        dropbox_backup_days,
+        r2_history_days,
+        read_version_info,
+    )
+    if dropbox_filter_warning:
+        current_warning = dropbox_state_info.get("warning")
+        dropbox_state_info = dict(dropbox_state_info)
+        dropbox_state_info["warning"] = (
+            f"{current_warning} {dropbox_filter_warning}" if current_warning else dropbox_filter_warning
+        )
+    dropbox_days_diagnostics = _dropbox_backup_days_diagnostics(dropbox_backup_days)
     return {
         "db_size_metrics": db_size_metrics,
         "schema_size_metrics": schema_size_metrics,
@@ -3983,6 +4072,7 @@ def _fetch_storage_coverage_context(
         "dropbox_state_path": dropbox_state_path,
         "dropbox_state_error": dropbox_state_error,
         "dropbox_state_info": dropbox_state_info,
+        **dropbox_days_diagnostics,
     }
 
 
@@ -4003,6 +4093,10 @@ def _empty_storage_coverage_context() -> Dict[str, Any]:
         "dropbox_state_path": None,
         "dropbox_state_error": None,
         "dropbox_state_info": _resolve_dropbox_state_path_info(),
+        "dropbox_backup_observations_earliest_day": None,
+        "dropbox_backup_observations_latest_day": None,
+        "dropbox_backup_aqilevels_earliest_day": None,
+        "dropbox_backup_aqilevels_latest_day": None,
     }
 
 
@@ -4365,6 +4459,10 @@ def _build_dashboard(
         "dropbox_backup_state_cache_key": dropbox_state_info.get("cache_key"),
         "dropbox_backup_state_warning": dropbox_state_info.get("warning"),
         "dropbox_backup_state_fallback_attempted": dropbox_state_info.get("fallback_attempted", False),
+        "dropbox_backup_observations_earliest_day": coverage_context.get("dropbox_backup_observations_earliest_day"),
+        "dropbox_backup_observations_latest_day": coverage_context.get("dropbox_backup_observations_latest_day"),
+        "dropbox_backup_aqilevels_earliest_day": coverage_context.get("dropbox_backup_aqilevels_earliest_day"),
+        "dropbox_backup_aqilevels_latest_day": coverage_context.get("dropbox_backup_aqilevels_latest_day"),
         "storage_coverage_source": "live_per_day_presence",
         "storage_coverage_days": storage_coverage_days,
         "r2_history_read_version": dropbox_state_info.get("read_version"),
@@ -4429,15 +4527,17 @@ def _get_dashboard(
 def _build_storage_coverage_payload(
     base_url: str,
     service_role_key: str,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
-    storage_coverage_days = _get_cached_storage_coverage_days(now)
+    storage_coverage_days = None if force_refresh else _get_cached_storage_coverage_days(now)
     if storage_coverage_days is None:
         headers = _postgrest_headers(service_role_key)
         coverage_context = _fetch_storage_coverage_context(
             base_url,
             headers,
             now,
+            force_refresh=force_refresh,
         )
         storage_coverage_days = _get_storage_coverage_days_cached(
             now=now,
@@ -4458,6 +4558,10 @@ def _build_storage_coverage_payload(
         dropbox_state_path = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_state_path")
         dropbox_state_error = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_state_error")
         dropbox_state_info = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_state_info") or _resolve_dropbox_state_path_info()
+        dropbox_backup_observations_earliest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_observations_earliest_day")
+        dropbox_backup_observations_latest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_observations_latest_day")
+        dropbox_backup_aqilevels_earliest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_aqilevels_earliest_day")
+        dropbox_backup_aqilevels_latest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_aqilevels_latest_day")
 
     return {
         "generated_at": now.isoformat().replace("+00:00", "Z"),
@@ -4471,6 +4575,10 @@ def _build_storage_coverage_payload(
         "dropbox_backup_state_cache_key": dropbox_state_info.get("cache_key"),
         "dropbox_backup_state_warning": dropbox_state_info.get("warning"),
         "dropbox_backup_state_fallback_attempted": dropbox_state_info.get("fallback_attempted", False),
+        "dropbox_backup_observations_earliest_day": dropbox_backup_observations_earliest_day,
+        "dropbox_backup_observations_latest_day": dropbox_backup_observations_latest_day,
+        "dropbox_backup_aqilevels_earliest_day": dropbox_backup_aqilevels_earliest_day,
+        "dropbox_backup_aqilevels_latest_day": dropbox_backup_aqilevels_latest_day,
     }
 
 
@@ -4766,13 +4874,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         force_refresh_raw = ((query.get("force") or [""])[0] or "").strip().lower()
         force_refresh = force_refresh_raw in {"1", "true", "yes", "y", "on"}
         if force_refresh:
-            with CACHE_LOCK:
-                STORAGE_COVERAGE_CACHE_STATE["rows"] = None
-                STORAGE_COVERAGE_CACHE_STATE["next_refresh_at"] = None
+            _invalidate_dashboard_cache(clear_storage_coverage=True)
         try:
             data = _build_storage_coverage_payload(
                 self.server.base_url,
                 self.server.service_role_key,
+                force_refresh=force_refresh,
             )
         except Exception as exc:
             payload = json.dumps({"error": str(exc)}, indent=2)

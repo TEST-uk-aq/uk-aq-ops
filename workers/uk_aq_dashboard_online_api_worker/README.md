@@ -113,12 +113,21 @@ R2 history API fallback behavior:
   `r2_history_read_version_effective`, `r2_history_days_bucket`,
   `r2_history_days_error`, `r2_backup_window`, `r2_backup_window_error`,
   `dropbox_backup_state_path`, `dropbox_backup_state_source`,
-  `dropbox_backup_state_cache_key`, and related warning fields so the hosted
-  dashboard can show `R2_v1` or `R2_v2` with the actual history-days source.
+  `dropbox_backup_state_cache_key`,
+  `dropbox_backup_observations_earliest_day`,
+  `dropbox_backup_observations_latest_day`,
+  `dropbox_backup_aqilevels_earliest_day`,
+  `dropbox_backup_aqilevels_latest_day`, and related warning fields so the
+  hosted dashboard can show `R2_v1` or `R2_v2` with the actual history-days
+  and Dropbox checkpoint source.
 - In `UK_AQ_R2_HISTORY_VERSION=v2`, the storage coverage calendar does not use
   version-blind Supabase R2 day/window fallbacks. If the v2 history-days API is
   unavailable, R2 presence remains false/unknown instead of being filled from
   v1-derived RPC data.
+- In `UK_AQ_R2_HISTORY_VERSION=v2`, Dropbox checkpoint day coverage is only
+  counted for days also returned by the explicit v2 R2 history-days API. A
+  stale checkpoint that claims 2025 v2 days is warned about and ignored for the
+  coverage calendar.
 - `/api/r2_connector_counts` forwards the active read version to the R2 metrics API as `read_version`.
 
 Optional upstream proxy mode:
