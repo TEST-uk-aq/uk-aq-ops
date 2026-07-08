@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import observsHistoryWorker from "../workers/uk_aq_observs_history_r2_api_worker/worker.mjs";
+
+const workerSource = readFileSync(
+  "workers/uk_aq_observs_history_r2_api_worker/worker.mjs",
+  "utf8",
+);
 
 function makeJsonR2Object(payload) {
   const text = `${JSON.stringify(payload)}\n`;
@@ -87,6 +93,11 @@ function metadataRequest(timeseriesId = 3742) {
     },
   );
 }
+
+test("observations Worker preserves optional parquet observation status", () => {
+  assert.match(workerSource, /schemaColumns\.includes\("status"\)/);
+  assert.match(workerSource, /status: idx < statusValues\.length/);
+});
 
 test("observations Worker v1 default uses configured v1 prefix and v1 index", async () => {
   const harness = installHarness({});

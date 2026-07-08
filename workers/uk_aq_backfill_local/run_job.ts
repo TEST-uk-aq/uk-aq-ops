@@ -124,6 +124,18 @@ type SourceTimeseriesBinding = {
   pollutant_code: SourcePollutantCode;
 };
 
+type UkAirSosSiteTimeseriesRef = {
+  site_ref: string;
+  uk_air_ref: string | null;
+  pollutant_code: SourcePollutantCode;
+  station_id: number;
+  timeseries_id: number;
+  station_ref: string | null;
+  timeseries_ref: string | null;
+  valid_from_day_utc: string | null;
+  valid_to_day_utc: string | null;
+};
+
 type SourceConnectorLookup = {
   connector_id: number;
   station_refs: Set<string>;
@@ -150,6 +162,7 @@ type SourceObservationRow = {
   pollutant_code: SourcePollutantCode;
   observed_at: string;
   value: number;
+  status?: string | null;
   source_parameter?: string | null;
 };
 
@@ -231,6 +244,7 @@ type ObsHistoryRow = {
   pollutant_code?: SourcePollutantCode | null;
   observed_at: string;
   value: number | null;
+  status?: string | null;
 };
 
 type ObsHistoryParquetRow = {
@@ -238,6 +252,12 @@ type ObsHistoryParquetRow = {
   timeseries_id: number;
   observed_at: string;
   value: number | null;
+  status: string | null;
+};
+
+type ObsHistoryV2ParquetRow = ObsHistoryParquetRow & {
+  station_id: number | null;
+  pollutant_code: string;
 };
 
 type AqilevelsHistoryRow = {
@@ -501,8 +521,9 @@ function buildAqiGenerationDiagnostics(
   const narrowRows = sourceObservationsToNarrowRowsCore(validValueRows);
   const helperRows = sourceObservationRowsToHelperRowsForDayCore(validValueRows, dayUtc);
   const thresholdMatchedRows = helperRowsToAqilevelHistoryRowsCore(helperRows)
-    .filter((row: Record<string, unknown>) =>
-      row.daqi_index_level !== null || row.eaqi_index_level !== null
+    .filter((row) =>
+      row !== null &&
+      (row.daqi_index_level !== null || row.eaqi_index_level !== null)
     );
   const counters = {
     rows_read: rows.length,
@@ -621,6 +642,7 @@ const HISTORY_OBSERVATIONS_COLUMNS = Object.freeze([
   "timeseries_id",
   "observed_at",
   "value",
+  "status",
 ]);
 const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
   "connector_id",
@@ -629,6 +651,7 @@ const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
   "pollutant_code",
   "observed_at_utc",
   "value",
+  "status",
 ]);
 const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
 const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
@@ -2190,6 +2213,7 @@ function normalizeObsHistoryRows(payload: unknown): ObsHistoryRow[] {
       timeseries_id: Math.trunc(timeseriesId),
       observed_at: new Date(observedAtMs).toISOString(),
       value: toSafeNumber(record.value),
+      status: record.status == null ? null : String(record.status),
     });
   }
 
@@ -2262,7 +2286,7 @@ async function fetchObsHistoryRowsPageViaTable(
 ): Promise<ObsHistoryRow[]> {
   const bounds = dayBoundsFromIsoDay(args.day_utc);
   const query = new URLSearchParams();
-  query.set("select", "timeseries_id,observed_at,value");
+  query.set("select", "timeseries_id,observed_at,value,status");
   query.set("connector_id", `eq.${args.connector_id}`);
   query.append("observed_at", `gte.${bounds.start_iso}`);
   query.append("observed_at", `lt.${bounds.end_iso}`);
@@ -3543,6 +3567,7 @@ function rowsToParquetBuffer(rows: ObsHistoryParquetRow[]): Uint8Array {
       ? null
       : Number(row.value))
     ),
+    status: rows.map((row) => row.status ?? null),
   });
   const wasmTable = (parquetWasm as unknown as {
     Table: { fromIPCStream: (bytes: Uint8Array) => unknown };
@@ -3656,11 +3681,7 @@ function writeArrowTableToParquet(table: unknown, writerProperties: unknown): Ui
   }).writeParquet(wasmTable, writerProperties);
 }
 
-function rowsToObservationV2ParquetBuffer(rows: Array<ObsHistoryRow & {
-  connector_id: number;
-  station_id: number | null;
-  pollutant_code: string;
-}>): Uint8Array {
+function rowsToObservationV2ParquetBuffer(rows: ObsHistoryV2ParquetRow[]): Uint8Array {
   ensureParquetWasmInitialized();
   const int32Vector = (values: Array<number | null>) =>
     arrow.vectorFromArray(values, new arrow.Int32());
@@ -3677,6 +3698,7 @@ function rowsToObservationV2ParquetBuffer(rows: Array<ObsHistoryRow & {
     pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
     observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at))),
     value: rows.map((row) => row.value === null || row.value === undefined ? null : Number(row.value)),
+    status: textVector(rows.map((row) => row.status ?? null)),
   });
   return writeArrowTableToParquet(
     table,
@@ -4016,6 +4038,9 @@ async function exportObsConnectorDayToR2(args: {
         timeseries_id: row.timeseries_id,
         observed_at: row.observed_at,
         value: row.value,
+        status: (row as Record<string, unknown>).status == null
+          ? null
+          : String((row as Record<string, unknown>).status),
       });
       if (parquetRowsBuffer.length >= OBS_R2_PART_MAX_ROWS) {
         await flushPart();
@@ -4422,6 +4447,7 @@ async function exportObsConnectorRowsToR2(args: {
       timeseries_id: row.timeseries_id,
       observed_at: row.observed_at,
       value: row.value,
+      status: row.status ?? null,
     }));
     const partSummary = summarizeObservationPartRows(parquetRows);
     const partKey = buildObsPartKey(args.day_utc, args.connector_id, partIndex);
@@ -4610,13 +4636,14 @@ async function exportObsConnectorRowsToR2V2(args: {
     for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
       const chunk = rowChunks[partIndex];
       if (!chunk.length) continue;
-      const parquetRows = chunk.map((row) => ({
+      const parquetRows: ObsHistoryV2ParquetRow[] = chunk.map((row) => ({
         connector_id: args.connector_id,
         station_id: row.station_id ?? null,
         timeseries_id: row.timeseries_id,
         pollutant_code: pollutantCode,
         observed_at: row.observed_at,
         value: row.value,
+        status: row.status ?? null,
       }));
       const partSummary = summarizeObservationPartRows(parquetRows);
       const partKey = buildHistoryV2PartKey(
@@ -4693,7 +4720,7 @@ async function exportObsConnectorRowsToR2V2(args: {
     pollutantManifests,
     writerGitSha: OBS_R2_WRITER_GIT_SHA,
     backedUpAtUtc: nowIso(),
-  }) as ObsConnectorManifest & Record<string, unknown>;
+  }) as unknown as ObsConnectorManifest & Record<string, unknown>;
   connectorManifest.rows_with_missing_pollutant_code = classification.rows_with_missing_pollutant_code;
   connectorManifest.rows_skipped_missing_pollutant_code = classification.rows_skipped_missing_pollutant_code;
   connectorManifest.example_missing_pollutant_rows = classification.example_missing_pollutant_rows;
@@ -6661,6 +6688,180 @@ async function fetchUkAirSosSourceLookupForConnector(
   );
 }
 
+function isUkAirSosMappingValidForDay(
+  mapping: UkAirSosSiteTimeseriesRef,
+  dayUtc: string,
+): boolean {
+  if (mapping.valid_from_day_utc && mapping.valid_from_day_utc > dayUtc) {
+    return false;
+  }
+  if (mapping.valid_to_day_utc && mapping.valid_to_day_utc < dayUtc) {
+    return false;
+  }
+  return true;
+}
+
+async function fetchUkAirSosSiteTimeseriesRefsForConnector(
+  connectorId: number,
+  candidateTimeseriesIds: number[],
+): Promise<UkAirSosSiteTimeseriesRef[]> {
+  if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
+    throw new Error(
+      "UK-AIR flat-file mapping guard requires SUPABASE_URL and SB_SECRET_KEY",
+    );
+  }
+  if (connectorId !== UK_AIR_SOS_CONNECTOR_ID_FALLBACK) {
+    logStructured("warning", "uk_air_sos_mapping_guard_connector_id_assumption", {
+      connector_id: connectorId,
+      fallback_connector_id: UK_AIR_SOS_CONNECTOR_ID_FALLBACK,
+    });
+  }
+  if (!candidateTimeseriesIds.length) {
+    return [];
+  }
+
+  const rows: UkAirSosSiteTimeseriesRef[] = [];
+  for (const idChunk of chunkRows(candidateTimeseriesIds, STATION_ID_PAGE_SIZE)) {
+    const query = new URLSearchParams();
+    query.set(
+      "select",
+      "site_ref,uk_air_ref,pollutant_code,station_id,timeseries_id,station_ref,timeseries_ref,valid_from_day_utc,valid_to_day_utc",
+    );
+    query.set("timeseries_id", `in.(${idChunk.join(",")})`);
+    query.set("order", "site_ref.asc,pollutant_code.asc,timeseries_id.asc");
+
+    const result = await postgrestTable<Array<Record<string, unknown>>>(
+      INGEST_SUPABASE_URL,
+      INGEST_PRIVILEGED_KEY,
+      {
+        method: "GET",
+        schema: "uk_aq_raw",
+        table: "uk_air_sos_site_timeseries_refs",
+        query,
+      },
+    );
+    if (result.error) {
+      throw new Error(
+        `UK-AIR flat-file mapping query failed for connector_id=${connectorId}: ${result.error}`,
+      );
+    }
+
+    for (const raw of result.data || []) {
+      const siteRef = String(raw.site_ref || "").trim();
+      const pollutantCode = parseSourcePollutantCode(String(raw.pollutant_code || ""));
+      const stationId = Number(raw.station_id);
+      const timeseriesId = Number(raw.timeseries_id);
+      if (
+        !siteRef || !pollutantCode ||
+        !Number.isInteger(stationId) || stationId <= 0 ||
+        !Number.isInteger(timeseriesId) || timeseriesId <= 0
+      ) {
+        continue;
+      }
+      rows.push({
+        site_ref: siteRef,
+        uk_air_ref: raw.uk_air_ref == null ? null : String(raw.uk_air_ref),
+        pollutant_code: pollutantCode,
+        station_id: Math.trunc(stationId),
+        timeseries_id: Math.trunc(timeseriesId),
+        station_ref: raw.station_ref == null ? null : String(raw.station_ref),
+        timeseries_ref: raw.timeseries_ref == null ? null : String(raw.timeseries_ref),
+        valid_from_day_utc: parseOptionalDay(raw.valid_from_day_utc),
+        valid_to_day_utc: parseOptionalDay(raw.valid_to_day_utc),
+      });
+    }
+  }
+  return rows;
+}
+
+async function assertUkAirSosFlatFileMappingsForBackfill(args: {
+  connector_id: number;
+  day_utc: string;
+  bindings: SourceTimeseriesBinding[];
+}): Promise<UkAirSosSiteTimeseriesRef[]> {
+  const candidateIds = sortedUniquePositiveInts(
+    args.bindings.map((binding) => binding.timeseries_id),
+  );
+  const mappingRows = await fetchUkAirSosSiteTimeseriesRefsForConnector(
+    args.connector_id,
+    candidateIds,
+  );
+  const validRows = mappingRows.filter((row) =>
+    isUkAirSosMappingValidForDay(row, args.day_utc)
+  );
+  const validByTimeseriesId = new Map<number, UkAirSosSiteTimeseriesRef[]>();
+  const validBySitePollutant = new Map<string, UkAirSosSiteTimeseriesRef[]>();
+
+  for (const row of validRows) {
+    const byId = validByTimeseriesId.get(row.timeseries_id) || [];
+    byId.push(row);
+    validByTimeseriesId.set(row.timeseries_id, byId);
+
+    const sitePollutant = stationPollutantKey(row.site_ref, row.pollutant_code);
+    const bySitePollutant = validBySitePollutant.get(sitePollutant) || [];
+    bySitePollutant.push(row);
+    validBySitePollutant.set(sitePollutant, bySitePollutant);
+  }
+
+  const missing = candidateIds.filter((timeseriesId) =>
+    !(validByTimeseriesId.get(timeseriesId) || []).length
+  );
+  const ambiguousByTimeseries = Array.from(validByTimeseriesId.entries())
+    .filter(([, rows]) => rows.length > 1)
+    .map(([timeseriesId, rows]) => ({
+      timeseries_id: timeseriesId,
+      mappings: rows.map((row) => ({
+        site_ref: row.site_ref,
+        pollutant_code: row.pollutant_code,
+        station_id: row.station_id,
+        timeseries_id: row.timeseries_id,
+      })),
+    }));
+  const ambiguousBySitePollutant = Array.from(validBySitePollutant.entries())
+    .filter(([, rows]) => new Set(rows.map((row) => row.timeseries_id)).size > 1)
+    .map(([key, rows]) => ({
+      site_pollutant_key: key,
+      mappings: rows.map((row) => ({
+        site_ref: row.site_ref,
+        pollutant_code: row.pollutant_code,
+        station_id: row.station_id,
+        timeseries_id: row.timeseries_id,
+      })),
+    }));
+
+  if (
+    missing.length ||
+    ambiguousByTimeseries.length ||
+    ambiguousBySitePollutant.length
+  ) {
+    const details = {
+      day_utc: args.day_utc,
+      connector_id: args.connector_id,
+      candidate_timeseries_count: candidateIds.length,
+      mapping_rows: mappingRows.length,
+      valid_mapping_rows: validRows.length,
+      missing_timeseries_ids: missing.slice(0, 50),
+      ambiguous_timeseries_sample: ambiguousByTimeseries.slice(0, 10),
+      ambiguous_site_pollutant_sample: ambiguousBySitePollutant.slice(0, 10),
+    };
+    logStructured("error", "uk_air_sos_flat_file_mapping_guard_failed", details);
+    throw new Error(
+      `UK-AIR flat-file mapping guard failed for day_utc=${args.day_utc} connector_id=${args.connector_id}: ` +
+        `missing_timeseries=${missing.length} ambiguous_timeseries=${ambiguousByTimeseries.length} ` +
+        `ambiguous_site_ref_pollutant=${ambiguousBySitePollutant.length}`,
+    );
+  }
+
+  logStructured("info", "uk_air_sos_flat_file_mapping_guard_ok", {
+    day_utc: args.day_utc,
+    connector_id: args.connector_id,
+    candidate_timeseries_count: candidateIds.length,
+    valid_mapping_rows: validRows.length,
+    site_ref_count: new Set(validRows.map((row) => row.site_ref)).size,
+  });
+  return validRows;
+}
+
 async function fetchMetadataSourceLookupForConnector(
   connectorId: number,
   candidateStationRefs: Set<string>,
@@ -7321,11 +7522,12 @@ function readUkAirSosIntegritySnapshotTimeseriesPayload(args: {
         const timeseriesRef = String(row.timeseries_ref || "").trim();
         const observedAt = String(row.observed_at_utc || "").trim();
         const value = toFiniteNumber(row.value);
+        const status = row.status == null ? null : String(row.status);
         if (!timeseriesRef || !observedAt || value === null) {
           continue;
         }
         const values = byTimeseriesRef.get(timeseriesRef) || [];
-        values.push({ time: observedAt, value });
+        values.push({ time: observedAt, value, status });
         byTimeseriesRef.set(timeseriesRef, values);
       }
       ukAirSosIntegritySnapshotCache.set(snapshotPath, byTimeseriesRef);
@@ -7650,6 +7852,7 @@ async function processUkAirSosTimeseriesBatch(args: {
             pollutant_code: binding.pollutant_code,
             observed_at: datapoint.observed_at,
             value: datapoint.value,
+            status: datapoint.status,
           });
         }
 
@@ -7668,6 +7871,9 @@ async function processUkAirSosTimeseriesBatch(args: {
             pollutant_code: binding.pollutant_code,
             raw_point_count: datapoints.length,
             mapped_point_count: rows.length,
+            status_values: Array.from(
+              new Set(rows.map((row) => row.status).filter((value) => value)),
+            ).sort(),
             mirror_reused: payload.mirror_reused,
             mirror_written: payload.mirror_written,
             integrity_snapshot_reused: payload.integrity_snapshot_reused,
@@ -8582,6 +8788,7 @@ function sourceObservationsToObsHistoryRows(
     pollutant_code: row.pollutant_code,
     observed_at: row.observed_at,
     value: row.value,
+    status: row.status ?? null,
   }));
 }
 
@@ -12915,6 +13122,13 @@ async function runSourceToAll(
             continue;
           }
 
+          const validFlatFileMappings =
+            await assertUkAirSosFlatFileMappingsForBackfill({
+              connector_id: connectorId,
+              day_utc: dayUtc,
+              bindings: candidateBindings,
+            });
+
           const resolvedServiceUrl = await resolveConnectorServiceUrl(
             connectorId,
           );
@@ -13086,6 +13300,12 @@ async function runSourceToAll(
           candidateSourceUnits = candidateBindings.length;
           sourceCheckpointJson.source_base_url = sourceBaseUrl;
           sourceCheckpointJson.timespan = timespan;
+          sourceCheckpointJson.flat_file_mapping_required = true;
+          sourceCheckpointJson.flat_file_mapping_valid_rows =
+            validFlatFileMappings.length;
+          sourceCheckpointJson.flat_file_mapping_site_refs = Array.from(
+            new Set(validFlatFileMappings.map((row) => row.site_ref)),
+          ).sort();
           sourceCheckpointJson.candidate_station_ref_count =
             candidateStationRefs.size;
           sourceCheckpointJson.candidate_timeseries_count =
