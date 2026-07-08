@@ -17,6 +17,8 @@ import {
   summarizeReadinessRows,
   SummaryRefreshRpcRow,
 } from "./who_2021_daily_core.ts";
+import { rowsToWho2021ParquetBytes } from "./who_2021_parquet.ts";
+import type { Who2021ParquetBatch } from "./who_2021_parquet.ts";
 
 type RpcError = { message: string };
 
@@ -36,6 +38,7 @@ const READINESS_RPC = (Deno.env.get("UK_AQ_WHO_2021_READINESS_RPC") ||
 const SUMMARY_REFRESH_RPC =
   (Deno.env.get("UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC") ||
     "uk_aq_rpc_who_2021_summary_refresh").trim();
+const PARQUET_R2_ROWS_RPC = "uk_aq_rpc_who_2021_r2_parquet_rows";
 const R2_PUBLISH_ENABLED = parseBoolean(
   Deno.env.get("UK_AQ_WHO_2021_R2_PUBLISH_ENABLED"),
   false,
@@ -377,10 +380,32 @@ async function publishPhase4(
     calendarYear: args.summaryRefresh.calendar_year,
   });
   const parquetObjects: string[] = [];
+  let parquetBytesWritten = 0;
   if (args.config.parquetR2WriteEnabled) {
-    throw new Error(
-      "UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=true is reserved for the Phase 4b parquet writer. The database provides uk_aq_rpc_who_2021_r2_parquet_rows row batches; this JSON publisher does not generate parquet bytes.",
-    );
+    const result = await postgrestRpc<unknown>(PARQUET_R2_ROWS_RPC, {
+      p_as_of_day_utc: args.config.endDayUtc,
+      p_start_day_utc: args.config.startDayUtc,
+      p_end_day_utc: args.config.endDayUtc,
+      p_connector_id: args.config.connectorId,
+      p_source_network_code: args.config.sourceNetworkCode,
+      p_pollutant_codes: args.config.pollutantCodes,
+    });
+    if (result.error) {
+      throw new Error(`parquet R2 row RPC failed: ${result.error.message}`);
+    }
+    const batches = Array.isArray(result.data)
+      ? result.data as Who2021ParquetBatch[]
+      : [];
+    for (const batch of batches) {
+      const bytes = rowsToWho2021ParquetBytes(batch);
+      await signedR2Put(
+        batch.object_key,
+        bytes,
+        "application/vnd.apache.parquet",
+      );
+      parquetObjects.push(batch.object_key);
+      parquetBytesWritten += bytes.byteLength;
+    }
   }
   const body = stableJson(args.homepageSummary);
   await signedR2Put(
@@ -398,6 +423,7 @@ async function publishPhase4(
     skipped: false,
     plan,
     parquet_objects_written: parquetObjects.length,
+    parquet_bytes_written: parquetBytesWritten,
     parquet_object_keys: parquetObjects,
     summary_object_keys: [plan.datedSummaryKey, plan.latestSummaryKey],
   };
