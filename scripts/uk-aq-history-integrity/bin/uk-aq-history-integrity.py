@@ -113,27 +113,27 @@ def resolve_integrity_backfill_wrapper() -> str:
 SOURCE_KEY_BY_CONNECTOR_CODE = {
     "openaq": "openaq",
     "sensorcommunity": "sensorcommunity",
-    "uk_air_sos": "uk_air_sos",
+    "sos": "sos",
 }
 
 # `--source all` includes all currently implemented source adapters.
 CROSS_CHECK_SOURCE_KEYS_BY_FILTER: dict[str, tuple[str, ...]] = {
     "openaq": ("openaq",),
     "sensorcommunity": ("sensorcommunity",),
-    "uk_air_sos": ("uk_air_sos",),
-    "all": ("openaq", "sensorcommunity", "uk_air_sos"),
+    "sos": ("sos",),
+    "all": ("openaq", "sensorcommunity", "sos"),
 }
 CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
     "openaq": ("openaq",),
     "sensorcommunity": ("sensorcommunity",),
-    # Phase 7.4: include uk_air_sos in observation-repair candidates.
-    "uk_air_sos": ("uk_air_sos",),
-    "all": ("openaq", "sensorcommunity", "uk_air_sos"),
+    # Phase 7.4: include sos in observation-repair candidates.
+    "sos": ("sos",),
+    "all": ("openaq", "sensorcommunity", "sos"),
 }
 
 # Subset of core tables that the integrity DB needs. Other tables in the
 # manifest (categories, observed_properties, offerings, features, procedures,
-# networks, uk_air_sos_*, station_metadata)
+# networks, sos_*, station_metadata)
 # are accepted in the manifest but not imported in this phase.
 CORE_TABLES_TO_IMPORT = ("connectors", "stations", "timeseries", "phenomena")
 
@@ -879,7 +879,7 @@ def classify_core_snapshot_status(
 
 def collect_lookup_active_counts_by_source(
     conn: sqlite3.Connection,
-    source_keys: Iterable[str] = ("openaq", "sensorcommunity", "uk_air_sos"),
+    source_keys: Iterable[str] = ("openaq", "sensorcommunity", "sos"),
 ) -> dict[str, dict[str, int]]:
     keys = tuple(dict.fromkeys(str(k) for k in source_keys if str(k)))
     if not keys:
@@ -1388,24 +1388,24 @@ SC_COLUMN_TO_REF_SUFFIX = {
     "pressure": ":pressure",
 }
 
-UK_AIR_SOS_SOURCE_KEY = "uk_air_sos"
-UK_AIR_SOS_DEFAULT_BASE_URL = "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
-UK_AIR_SOS_DEFAULT_TIMEOUT_SECONDS = 30
+SOS_SOURCE_KEY = "sos"
+SOS_DEFAULT_BASE_URL = "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
+SOS_DEFAULT_TIMEOUT_SECONDS = 30
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ENV = "UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS"
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ALLOWED = {"none", "changed", "all"}
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_DEFAULT = "changed"
-UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_ENV = (
-    "UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES"
+UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES_ENV = (
+    "UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES"
 )
-UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT = 0
+UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT = 0
 
-UK_AIR_SOS_STATUS_OK = "ok"
-UK_AIR_SOS_STATUS_NO_DATA = "no_data"
-UK_AIR_SOS_STATUS_NOT_FOUND = "not_found"
-UK_AIR_SOS_STATUS_TEMP_ERROR = "temporary_error"
-UK_AIR_SOS_STATUS_PERM_ERROR = "permanent_error"
+SOS_STATUS_OK = "ok"
+SOS_STATUS_NO_DATA = "no_data"
+SOS_STATUS_NOT_FOUND = "not_found"
+SOS_STATUS_TEMP_ERROR = "temporary_error"
+SOS_STATUS_PERM_ERROR = "permanent_error"
 
-UkAirSosFetcher = Callable[
+SosFetcher = Callable[
     [str, str, str, str, int],
     dict[str, Any],
 ]
@@ -1417,14 +1417,14 @@ def _iso_utc_seconds(value: dt.datetime) -> str:
     )
 
 
-def _uk_air_sos_day_bounds(day_utc: str) -> tuple[str, str]:
+def _sos_day_bounds(day_utc: str) -> tuple[str, str]:
     day = dt.date.fromisoformat(day_utc)
     start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
     end = start + dt.timedelta(days=1)
     return _iso_utc_seconds(start), _iso_utc_seconds(end)
 
 
-def _uk_air_sos_parse_timestamp(value: Any) -> str | None:
+def _sos_parse_timestamp(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
@@ -1455,7 +1455,7 @@ def _uk_air_sos_parse_timestamp(value: Any) -> str | None:
     return None
 
 
-def _uk_air_sos_to_finite_number(value: Any) -> int | float | None:
+def _sos_to_finite_number(value: Any) -> int | float | None:
     if value is None:
         return None
     try:
@@ -1470,7 +1470,7 @@ def _uk_air_sos_to_finite_number(value: Any) -> int | float | None:
     return int(normalized) if normalized.is_integer() else normalized
 
 
-def _uk_air_sos_extract_datapoints(payload: Any) -> list[dict[str, Any]]:
+def _sos_extract_datapoints(payload: Any) -> list[dict[str, Any]]:
     values = payload
     if not isinstance(values, list) and isinstance(values, dict):
         nested = values.get("values") or values.get("data")
@@ -1486,10 +1486,10 @@ def _uk_air_sos_extract_datapoints(payload: Any) -> list[dict[str, Any]]:
         if isinstance(row, list):
             if len(row) < 2:
                 continue
-            observed_at = _uk_air_sos_parse_timestamp(row[0])
-            number_value = _uk_air_sos_to_finite_number(row[1])
+            observed_at = _sos_parse_timestamp(row[0])
+            number_value = _sos_to_finite_number(row[1])
         elif isinstance(row, dict):
-            observed_at = _uk_air_sos_parse_timestamp(
+            observed_at = _sos_parse_timestamp(
                 row.get("time")
                 or row.get("timestamp")
                 or row.get("t")
@@ -1497,7 +1497,7 @@ def _uk_air_sos_extract_datapoints(payload: Any) -> list[dict[str, Any]]:
                 or row.get("phenomenonTime")
                 or row.get("observed_at"),
             )
-            number_value = _uk_air_sos_to_finite_number(
+            number_value = _sos_to_finite_number(
                 row.get("value")
                 or row.get("v")
                 or row.get("result"),
@@ -1511,7 +1511,7 @@ def _uk_air_sos_extract_datapoints(payload: Any) -> list[dict[str, Any]]:
     return datapoints
 
 
-def _uk_air_sos_fetch_timeseries_payload(
+def _sos_fetch_timeseries_payload(
     base_url: str,
     day_utc: str,
     timeseries_ref: str,
@@ -1531,7 +1531,7 @@ def _uk_air_sos_fetch_timeseries_payload(
                 body = resp.read()
                 payload = json.loads(body.decode("utf-8"))
                 return {
-                    "status": UK_AIR_SOS_STATUS_OK,
+                    "status": SOS_STATUS_OK,
                     "payload": payload,
                     "error": None,
                     "http_status": int(resp.status),
@@ -1539,7 +1539,7 @@ def _uk_air_sos_fetch_timeseries_payload(
         except urllib.error.HTTPError as exc:
             if int(exc.code) == 404:
                 return {
-                    "status": UK_AIR_SOS_STATUS_NOT_FOUND,
+                    "status": SOS_STATUS_NOT_FOUND,
                     "payload": None,
                     "error": f"HTTP 404 for timeseries_ref={timeseries_ref}",
                     "http_status": int(exc.code),
@@ -1549,20 +1549,20 @@ def _uk_air_sos_fetch_timeseries_payload(
                     _sleep_http_retry("GET", url, attempt, exc)
                     continue
                 return {
-                    "status": UK_AIR_SOS_STATUS_TEMP_ERROR,
+                    "status": SOS_STATUS_TEMP_ERROR,
                     "payload": None,
                     "error": f"HTTP {exc.code} for timeseries_ref={timeseries_ref}",
                     "http_status": int(exc.code),
                 }
             return {
-                "status": UK_AIR_SOS_STATUS_PERM_ERROR,
+                "status": SOS_STATUS_PERM_ERROR,
                 "payload": None,
                 "error": f"HTTP {exc.code} for timeseries_ref={timeseries_ref}",
                 "http_status": int(exc.code),
             }
         except json.JSONDecodeError as exc:
             return {
-                "status": UK_AIR_SOS_STATUS_PERM_ERROR,
+                "status": SOS_STATUS_PERM_ERROR,
                 "payload": None,
                 "error": f"invalid JSON for timeseries_ref={timeseries_ref}: {exc}",
                 "http_status": None,
@@ -1573,34 +1573,34 @@ def _uk_air_sos_fetch_timeseries_payload(
                     _sleep_http_retry("GET", url, attempt, exc)
                     continue
                 return {
-                    "status": UK_AIR_SOS_STATUS_TEMP_ERROR,
+                    "status": SOS_STATUS_TEMP_ERROR,
                     "payload": None,
                     "error": f"temporary fetch failure for timeseries_ref={timeseries_ref}: {exc}",
                     "http_status": None,
                 }
             return {
-                "status": UK_AIR_SOS_STATUS_PERM_ERROR,
+                "status": SOS_STATUS_PERM_ERROR,
                 "payload": None,
                 "error": f"non-retryable fetch failure for timeseries_ref={timeseries_ref}: {exc}",
                 "http_status": None,
             }
 
     return {
-        "status": UK_AIR_SOS_STATUS_TEMP_ERROR,
+        "status": SOS_STATUS_TEMP_ERROR,
         "payload": None,
         "error": f"timeseries_ref={timeseries_ref}: exhausted retries",
         "http_status": None,
     }
 
 
-def build_uk_air_sos_canonical_snapshot(
+def build_sos_canonical_snapshot(
     *,
     station_ref: str,
     day_utc: str,
     timeseries_bindings: Iterable[dict[str, Any]],
     base_url: str | None = None,
-    timeout_seconds: int = UK_AIR_SOS_DEFAULT_TIMEOUT_SECONDS,
-    fetcher: UkAirSosFetcher | None = None,
+    timeout_seconds: int = SOS_DEFAULT_TIMEOUT_SECONDS,
+    fetcher: SosFetcher | None = None,
 ) -> dict[str, Any]:
     """Build canonical SOS snapshot rows for one station/day.
 
@@ -1608,12 +1608,12 @@ def build_uk_air_sos_canonical_snapshot(
     stable NDJSON bytes with the minimal canonical row shape.
     """
     source_base_url = (
-        (base_url or os.environ.get("UK_AQ_BACKFILL_UK_AIR_SOS_BASE_URL") or "")
+        (base_url or os.environ.get("UK_AQ_BACKFILL_SOS_BASE_URL") or "")
         .strip()
-        or UK_AIR_SOS_DEFAULT_BASE_URL
+        or SOS_DEFAULT_BASE_URL
     )
-    fetch_fn = fetcher or _uk_air_sos_fetch_timeseries_payload
-    day_start_iso, day_end_iso = _uk_air_sos_day_bounds(day_utc)
+    fetch_fn = fetcher or _sos_fetch_timeseries_payload
+    day_start_iso, day_end_iso = _sos_day_bounds(day_utc)
     timespan = f"{day_start_iso}/{day_end_iso}"
 
     binding_rows = []
@@ -1637,7 +1637,7 @@ def build_uk_air_sos_canonical_snapshot(
             timespan,
             int(timeout_seconds),
         )
-        status = str(fetched.get("status") or UK_AIR_SOS_STATUS_PERM_ERROR)
+        status = str(fetched.get("status") or SOS_STATUS_PERM_ERROR)
         result_row: dict[str, Any] = {
             "timeseries_id": ts_id,
             "timeseries_ref": ts_ref,
@@ -1645,11 +1645,11 @@ def build_uk_air_sos_canonical_snapshot(
             "row_count": 0,
             "error": fetched.get("error"),
         }
-        if status != UK_AIR_SOS_STATUS_OK:
+        if status != SOS_STATUS_OK:
             timeseries_results.append(result_row)
             continue
 
-        datapoints = _uk_air_sos_extract_datapoints(fetched.get("payload"))
+        datapoints = _sos_extract_datapoints(fetched.get("payload"))
         for point in datapoints:
             observed_at = str(point.get("observed_at_utc") or "")
             value = point.get("value")
@@ -1668,22 +1668,22 @@ def build_uk_air_sos_canonical_snapshot(
             })
             result_row["row_count"] = int(result_row["row_count"]) + 1
         if int(result_row["row_count"]) == 0:
-            result_row["status"] = UK_AIR_SOS_STATUS_NO_DATA
+            result_row["status"] = SOS_STATUS_NO_DATA
         timeseries_results.append(result_row)
 
     status_list = [str(item.get("status") or "") for item in timeseries_results]
-    if any(status == UK_AIR_SOS_STATUS_TEMP_ERROR for status in status_list):
-        final_status = UK_AIR_SOS_STATUS_TEMP_ERROR
-    elif any(status == UK_AIR_SOS_STATUS_PERM_ERROR for status in status_list):
-        final_status = UK_AIR_SOS_STATUS_PERM_ERROR
-    elif status_list and all(status == UK_AIR_SOS_STATUS_NOT_FOUND for status in status_list):
-        final_status = UK_AIR_SOS_STATUS_NOT_FOUND
+    if any(status == SOS_STATUS_TEMP_ERROR for status in status_list):
+        final_status = SOS_STATUS_TEMP_ERROR
+    elif any(status == SOS_STATUS_PERM_ERROR for status in status_list):
+        final_status = SOS_STATUS_PERM_ERROR
+    elif status_list and all(status == SOS_STATUS_NOT_FOUND for status in status_list):
+        final_status = SOS_STATUS_NOT_FOUND
     elif rows:
-        final_status = UK_AIR_SOS_STATUS_OK
+        final_status = SOS_STATUS_OK
     else:
-        final_status = UK_AIR_SOS_STATUS_NO_DATA
+        final_status = SOS_STATUS_NO_DATA
 
-    if final_status in (UK_AIR_SOS_STATUS_TEMP_ERROR, UK_AIR_SOS_STATUS_PERM_ERROR):
+    if final_status in (SOS_STATUS_TEMP_ERROR, SOS_STATUS_PERM_ERROR):
         return {
             "status": final_status,
             "station_ref": station_ref,
@@ -1735,17 +1735,17 @@ def _resolve_keep_api_snapshots_policy() -> str:
     return UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_DEFAULT
 
 
-def _resolve_uk_air_sos_not_found_cooldown_seconds() -> int:
+def _resolve_sos_not_found_cooldown_seconds() -> int:
     raw = str(
         os.environ.get(
-            UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_ENV,
-            UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT,
+            UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES_ENV,
+            UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT,
         ),
     ).strip()
     try:
         minutes = int(raw)
     except (TypeError, ValueError):
-        minutes = UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT
+        minutes = UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES_DEFAULT
     if minutes <= 0:
         return 0
     return minutes * 60
@@ -1765,11 +1765,11 @@ def _parse_iso_utc(value: str | None) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def _uk_air_sos_source_file_key(station_ref: str, day: dt.date) -> str:
-    return f"uk_air_sos:station_ref={station_ref}:day_utc={day.isoformat()}"
+def _sos_source_file_key(station_ref: str, day: dt.date) -> str:
+    return f"sos:station_ref={station_ref}:day_utc={day.isoformat()}"
 
 
-def _uk_air_sos_cache_path(cache_root: Path, station_ref: str, day: dt.date) -> Path:
+def _sos_cache_path(cache_root: Path, station_ref: str, day: dt.date) -> Path:
     station_token = urllib.parse.quote(station_ref, safe="._-")
     return (
         cache_root
@@ -1779,14 +1779,14 @@ def _uk_air_sos_cache_path(cache_root: Path, station_ref: str, day: dt.date) -> 
     )
 
 
-def _uk_air_sos_remote_key(base_url: str, station_ref: str, day: dt.date) -> str:
+def _sos_remote_key(base_url: str, station_ref: str, day: dt.date) -> str:
     station_token = urllib.parse.quote(station_ref, safe="")
     return (
         f"{base_url.rstrip('/')}/station_ref={station_token}/day_utc={day.isoformat()}"
     )
 
 
-def _uk_air_sos_station_bindings(
+def _sos_station_bindings(
     conn: sqlite3.Connection,
 ) -> dict[str, list[dict[str, Any]]]:
     rows = conn.execute(
@@ -1808,7 +1808,7 @@ def _uk_air_sos_station_bindings(
           AND t.timeseries_ref != ''
         ORDER BY l.station_ref, l.timeseries_id
         """,
-        (UK_AIR_SOS_SOURCE_KEY,),
+        (SOS_SOURCE_KEY,),
     ).fetchall()
     out: dict[str, list[dict[str, Any]]] = {}
     for source_location_id, station_ref, station_id, connector_id, timeseries_id, timeseries_ref in rows:
@@ -3169,13 +3169,13 @@ def run_narrow_backfill(
             sub_env["UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT"] = str(
                 Path(integrity_cache_root) / "openaq"
             )
-        # Option 1 (same-run handoff): let source_to_r2(uk_air_sos) reuse
+        # Option 1 (same-run handoff): let source_to_r2(sos) reuse
         # canonical station/day snapshots that integrity just fetched in this run.
         if not (
             sub_env.get("UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT") or ""
         ).strip():
             sub_env["UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT"] = str(
-                Path(integrity_cache_root) / "uk_air_sos"
+                Path(integrity_cache_root) / "sos"
             )
 
     started = time.monotonic()
@@ -4472,10 +4472,10 @@ def check_sensor_community(
     return metrics
 
 
-UK_AIR_SOS_REMOTE_SCHEME = "api"
+SOS_REMOTE_SCHEME = "api"
 
 
-def _should_suppress_uk_air_sos_not_found_retry(
+def _should_suppress_sos_not_found_retry(
     prior: dict[str, Any] | None,
     *,
     now_iso: str,
@@ -4495,7 +4495,7 @@ def _should_suppress_uk_air_sos_not_found_retry(
     return elapsed < float(cooldown_seconds)
 
 
-def _check_one_uk_air_sos_station_day_threadsafe(
+def _check_one_sos_station_day_threadsafe(
     db_path: str,
     env_name: str,
     base_url: str,
@@ -4521,7 +4521,7 @@ def _check_one_uk_air_sos_station_day_threadsafe(
         }
     conn = _worker_db_conn(db_path)
     try:
-        result = _check_one_uk_air_sos_station_day(
+        result = _check_one_sos_station_day(
             conn=conn,
             env_name=env_name,
             base_url=base_url,
@@ -4543,7 +4543,7 @@ def _check_one_uk_air_sos_station_day_threadsafe(
     return result
 
 
-def _check_one_uk_air_sos_station_day(
+def _check_one_sos_station_day(
     conn: sqlite3.Connection,
     env_name: str,
     base_url: str,
@@ -4555,7 +4555,7 @@ def _check_one_uk_air_sos_station_day(
     not_found_cooldown_seconds: int,
     log: logging.Logger,
 ) -> dict[str, Any]:
-    sfk = _uk_air_sos_source_file_key(station_ref, day)
+    sfk = _sos_source_file_key(station_ref, day)
     now_iso = fmt_iso(utc_now())
     prior = _fetch_prior_state(conn, sfk)
     source_location_id = station_ref
@@ -4564,17 +4564,17 @@ def _check_one_uk_air_sos_station_day(
         for binding in bindings
         if int(binding["timeseries_id"]) > 0
     })
-    remote_key = _uk_air_sos_remote_key(base_url, station_ref, day)
+    remote_key = _sos_remote_key(base_url, station_ref, day)
 
-    if _should_suppress_uk_air_sos_not_found_retry(
+    if _should_suppress_sos_not_found_retry(
         prior,
         now_iso=now_iso,
         cooldown_seconds=not_found_cooldown_seconds,
     ):
         _upsert_source_state(
             conn=conn,
-            source_key=UK_AIR_SOS_SOURCE_KEY,
-            remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+            source_key=SOS_SOURCE_KEY,
+            remote_scheme=SOS_REMOTE_SCHEME,
             source_file_key=sfk,
             env_name=env_name,
             remote_url_or_key=remote_key,
@@ -4592,13 +4592,13 @@ def _check_one_uk_air_sos_station_day(
             last_changed_at=None,
             last_status="not_found_suppressed",
             notes=(
-                "uk_air_sos not_found suppressed by cooldown "
+                "sos not_found suppressed by cooldown "
                 f"({not_found_cooldown_seconds}s)"
             ),
         )
         return {
             "outcome": "not_found_suppressed",
-            "snapshot_status": UK_AIR_SOS_STATUS_NOT_FOUND,
+            "snapshot_status": SOS_STATUS_NOT_FOUND,
             "downloaded_bytes": 0,
             "row_count": 0,
             "event_id": None,
@@ -4606,7 +4606,7 @@ def _check_one_uk_air_sos_station_day(
             "timeseries_ids": timeseries_ids,
         }
 
-    snapshot = build_uk_air_sos_canonical_snapshot(
+    snapshot = build_sos_canonical_snapshot(
         station_ref=station_ref,
         day_utc=day.isoformat(),
         timeseries_bindings=bindings,
@@ -4618,7 +4618,7 @@ def _check_one_uk_air_sos_station_day(
     sha = snapshot.get("sha256")
 
     # Temporary/permanent fetch errors: do not overwrite baseline hashes/counts.
-    if snapshot_status in {UK_AIR_SOS_STATUS_TEMP_ERROR, UK_AIR_SOS_STATUS_PERM_ERROR}:
+    if snapshot_status in {SOS_STATUS_TEMP_ERROR, SOS_STATUS_PERM_ERROR}:
         if prior is not None:
             _mark_source_state_fetch_error(
                 conn,
@@ -4626,10 +4626,10 @@ def _check_one_uk_air_sos_station_day(
                 status=snapshot_status,
                 now_iso=now_iso,
             )
-        event_type = "temporary_error" if snapshot_status == UK_AIR_SOS_STATUS_TEMP_ERROR else "permanent_error"
+        event_type = "temporary_error" if snapshot_status == SOS_STATUS_TEMP_ERROR else "permanent_error"
         event_id = _insert_source_event(
             conn=conn,
-            source_key=UK_AIR_SOS_SOURCE_KEY,
+            source_key=SOS_SOURCE_KEY,
             event_type=event_type,
             env_name=env_name,
             source_file_key=sfk,
@@ -4659,12 +4659,12 @@ def _check_one_uk_air_sos_station_day(
         }
 
     # not_found from SOS is a missing source unit (station/day).
-    if snapshot_status == UK_AIR_SOS_STATUS_NOT_FOUND:
+    if snapshot_status == SOS_STATUS_NOT_FOUND:
         if prior is None:
             _upsert_source_state(
                 conn=conn,
-                source_key=UK_AIR_SOS_SOURCE_KEY,
-                remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+                source_key=SOS_SOURCE_KEY,
+                remote_scheme=SOS_REMOTE_SCHEME,
                 source_file_key=sfk,
                 env_name=env_name,
                 remote_url_or_key=remote_key,
@@ -4681,11 +4681,11 @@ def _check_one_uk_air_sos_station_day(
                 now_iso=now_iso,
                 last_changed_at=None,
                 last_status="missing",
-                notes="uk_air_sos snapshot not_found",
+                notes="sos snapshot not_found",
             )
             event_id = _insert_source_event(
                 conn=conn,
-                source_key=UK_AIR_SOS_SOURCE_KEY,
+                source_key=SOS_SOURCE_KEY,
                 event_type="missing_first_seen",
                 env_name=env_name,
                 source_file_key=sfk,
@@ -4702,7 +4702,7 @@ def _check_one_uk_air_sos_station_day(
                 downloaded_bytes=0,
                 hash_runtime_ms=0,
                 now_iso=now_iso,
-                notes="uk_air_sos snapshot not_found",
+                notes="sos snapshot not_found",
             )
             return {
                 "outcome": "not_found_first_seen",
@@ -4717,8 +4717,8 @@ def _check_one_uk_air_sos_station_day(
         if int(prior.get("exists_remote") or 0) == 1:
             _upsert_source_state(
                 conn=conn,
-                source_key=UK_AIR_SOS_SOURCE_KEY,
-                remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+                source_key=SOS_SOURCE_KEY,
+                remote_scheme=SOS_REMOTE_SCHEME,
                 source_file_key=sfk,
                 env_name=env_name,
                 remote_url_or_key=remote_key,
@@ -4735,11 +4735,11 @@ def _check_one_uk_air_sos_station_day(
                 now_iso=now_iso,
                 last_changed_at=now_iso,
                 last_status="missing",
-                notes="uk_air_sos snapshot not_found",
+                notes="sos snapshot not_found",
             )
             event_id = _insert_source_event(
                 conn=conn,
-                source_key=UK_AIR_SOS_SOURCE_KEY,
+                source_key=SOS_SOURCE_KEY,
                 event_type="missing_after_seen",
                 env_name=env_name,
                 source_file_key=sfk,
@@ -4756,7 +4756,7 @@ def _check_one_uk_air_sos_station_day(
                 downloaded_bytes=0,
                 hash_runtime_ms=0,
                 now_iso=now_iso,
-                notes="uk_air_sos snapshot not_found after prior success",
+                notes="sos snapshot not_found after prior success",
             )
             return {
                 "outcome": "not_found_after_seen",
@@ -4770,8 +4770,8 @@ def _check_one_uk_air_sos_station_day(
 
         _upsert_source_state(
             conn=conn,
-            source_key=UK_AIR_SOS_SOURCE_KEY,
-            remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+            source_key=SOS_SOURCE_KEY,
+            remote_scheme=SOS_REMOTE_SCHEME,
             source_file_key=sfk,
             env_name=env_name,
             remote_url_or_key=remote_key,
@@ -4788,7 +4788,7 @@ def _check_one_uk_air_sos_station_day(
             now_iso=now_iso,
             last_changed_at=None,
             last_status="missing",
-            notes="uk_air_sos snapshot still missing",
+            notes="sos snapshot still missing",
         )
         return {
             "outcome": "not_found_still",
@@ -4838,7 +4838,7 @@ def _check_one_uk_air_sos_station_day(
             or (keep_policy == "changed" and outcome in {"changed", "reappeared"})
         )
     )
-    cache_path = _uk_air_sos_cache_path(cache_root, station_ref, day)
+    cache_path = _sos_cache_path(cache_root, station_ref, day)
     local_cached_path: str | None = None
     if keep_snapshot:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4855,8 +4855,8 @@ def _check_one_uk_air_sos_station_day(
 
     _upsert_source_state(
         conn=conn,
-        source_key=UK_AIR_SOS_SOURCE_KEY,
-        remote_scheme=UK_AIR_SOS_REMOTE_SCHEME,
+        source_key=SOS_SOURCE_KEY,
+        remote_scheme=SOS_REMOTE_SCHEME,
         source_file_key=sfk,
         env_name=env_name,
         remote_url_or_key=remote_key,
@@ -4874,7 +4874,7 @@ def _check_one_uk_air_sos_station_day(
         last_changed_at=last_changed_at,
         last_status=outcome,
         notes=(
-            f"uk_air_sos snapshot_status={snapshot_status} row_count={row_count} "
+            f"sos snapshot_status={snapshot_status} row_count={row_count} "
             f"keep_policy={keep_policy}"
         ),
     )
@@ -4883,7 +4883,7 @@ def _check_one_uk_air_sos_station_day(
     if event_type:
         event_id = _insert_source_event(
             conn=conn,
-            source_key=UK_AIR_SOS_SOURCE_KEY,
+            source_key=SOS_SOURCE_KEY,
             event_type=event_type,
             env_name=env_name,
             source_file_key=sfk,
@@ -4901,7 +4901,7 @@ def _check_one_uk_air_sos_station_day(
             hash_runtime_ms=0,
             now_iso=now_iso,
             notes=(
-                f"uk_air_sos snapshot_status={snapshot_status} row_count={row_count} "
+                f"sos snapshot_status={snapshot_status} row_count={row_count} "
                 f"keep_policy={keep_policy}"
             ),
         )
@@ -4917,7 +4917,7 @@ def _check_one_uk_air_sos_station_day(
     }
 
 
-def check_uk_air_sos(
+def check_sos(
     conn: sqlite3.Connection,
     env_name: str,
     env: dict[str, str],
@@ -4961,30 +4961,30 @@ def check_uk_air_sos(
         "backfills_ok": 0,
         "backfills_failed": 0,
         "keep_api_snapshots_policy": _resolve_keep_api_snapshots_policy(),
-        "not_found_cooldown_seconds": _resolve_uk_air_sos_not_found_cooldown_seconds(),
+        "not_found_cooldown_seconds": _resolve_sos_not_found_cooldown_seconds(),
         "skipped_reason": None,
     }
     base_url = os.environ.get(
-        "UK_AQ_BACKFILL_UK_AIR_SOS_BASE_URL",
-        UK_AIR_SOS_DEFAULT_BASE_URL,
+        "UK_AQ_BACKFILL_SOS_BASE_URL",
+        SOS_DEFAULT_BASE_URL,
     )
 
     if not from_day or not to_day:
         metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
-        log.warning("uk_air_sos: skipped — %s", metrics["skipped_reason"])
+        log.warning("sos: skipped — %s", metrics["skipped_reason"])
         return metrics
 
-    station_bindings = _uk_air_sos_station_bindings(conn)
+    station_bindings = _sos_station_bindings(conn)
     stations = sorted(station_bindings.keys())
     if not stations:
-        metrics["skipped_reason"] = "no uk_air_sos active station/timeseries bindings in source_station_timeseries_lookup"
-        log.warning("uk_air_sos: skipped — %s", metrics["skipped_reason"])
+        metrics["skipped_reason"] = "no sos active station/timeseries bindings in source_station_timeseries_lookup"
+        log.warning("sos: skipped — %s", metrics["skipped_reason"])
         return metrics
 
     days = _date_range_inclusive(from_day, to_day)
     if not days:
         metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
-        log.warning("uk_air_sos: skipped — %s", metrics["skipped_reason"])
+        log.warning("sos: skipped — %s", metrics["skipped_reason"])
         return metrics
 
     metrics["stations"] = len(stations)
@@ -4993,7 +4993,7 @@ def check_uk_air_sos(
     metrics["ran"] = True
 
     log.info(
-        "uk_air_sos: starting stations=%s days=%s base_url=%s keep_api_snapshots=%s not_found_cooldown_seconds=%s%s",
+        "sos: starting stations=%s days=%s base_url=%s keep_api_snapshots=%s not_found_cooldown_seconds=%s%s",
         len(stations),
         len(days),
         base_url,
@@ -5002,22 +5002,22 @@ def check_uk_air_sos(
         " (dry-run)" if dry_run else "",
     )
     if run_backfill:
-        log.info("uk_air_sos: direct backfill is disabled in Phase 7.3 (cross-check-driven repair only)")
+        log.info("sos: direct backfill is disabled in Phase 7.3 (cross-check-driven repair only)")
 
     if dry_run:
         sample = []
         for station in stations[:3]:
             for day in days[:2]:
-                sample.append(_uk_air_sos_remote_key(base_url, station, day))
+                sample.append(_sos_remote_key(base_url, station, day))
         metrics["sample_urls"] = sample
         log.info(
-            "uk_air_sos dry-run: would check %s station/day units; sample=%s",
+            "sos dry-run: would check %s station/day units; sample=%s",
             len(stations) * len(days),
             sample[:6],
         )
         return metrics
 
-    cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / UK_AIR_SOS_SOURCE_KEY
+    cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY
     cache_root.mkdir(parents=True, exist_ok=True)
     db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
 
@@ -5033,7 +5033,7 @@ def check_uk_air_sos(
                 if limits.should_stop():
                     break
                 futures.append(ex.submit(
-                    _check_one_uk_air_sos_station_day_threadsafe,
+                    _check_one_sos_station_day_threadsafe,
                     db_path,
                     env_name,
                     base_url,
@@ -5048,7 +5048,7 @@ def check_uk_air_sos(
                 ))
         total_tasks = len(futures)
         completed_tasks = 0
-        progress = SingleLineProgress("uk_air_sos progress")
+        progress = SingleLineProgress("sos progress")
         progress.update(
             (
                 f"0/{total_tasks} checked=0 changed=0 downloaded=0 "
@@ -5063,7 +5063,7 @@ def check_uk_air_sos(
                 result = fut.result()
             except Exception as exc:
                 metrics["errors"] += 1
-                log.warning("uk_air_sos worker raised: %s", exc)
+                log.warning("sos worker raised: %s", exc)
                 progress.update(
                     (
                         f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
@@ -5091,11 +5091,11 @@ def check_uk_air_sos(
             metrics["rows_counted"] += int(result.get("row_count") or 0)
             metrics["downloaded_bytes"] += int(result.get("downloaded_bytes") or 0)
             snapshot_status = str(result.get("snapshot_status") or "")
-            if snapshot_status in {UK_AIR_SOS_STATUS_OK, UK_AIR_SOS_STATUS_NO_DATA}:
+            if snapshot_status in {SOS_STATUS_OK, SOS_STATUS_NO_DATA}:
                 metrics["snapshots_successful"] += 1
-                if snapshot_status == UK_AIR_SOS_STATUS_NO_DATA:
+                if snapshot_status == SOS_STATUS_NO_DATA:
                     metrics["snapshots_no_data"] += 1
-            elif snapshot_status == UK_AIR_SOS_STATUS_NOT_FOUND:
+            elif snapshot_status == SOS_STATUS_NOT_FOUND:
                 metrics["not_found"] += 1
 
             if outcome == "first_seen":
@@ -5170,10 +5170,10 @@ def check_uk_air_sos(
 
     if limits.should_stop():
         metrics["stopped_for"] = limits.stopped_for
-        log.warning("uk_air_sos: stopped early due to limit=%s", limits.stopped_for)
+        log.warning("sos: stopped early due to limit=%s", limits.stopped_for)
 
     log.info(
-        "uk_air_sos: done %s",
+        "sos: done %s",
         {
             k: v
             for k, v in metrics.items()
@@ -6905,11 +6905,11 @@ def _collect_cross_check_backfill_targets(
     }
 
 
-def _collect_uk_air_sos_source_change_targets(
+def _collect_sos_source_change_targets(
     conn: sqlite3.Connection,
     *,
     source_filter: str,
-    uk_air_sos_metrics: Mapping[str, Any] | None,
+    sos_metrics: Mapping[str, Any] | None,
 ) -> dict[tuple[str, int], list[int]]:
     """Build connector/day -> timeseries IDs from SOS changed/reappeared rows.
 
@@ -6917,9 +6917,9 @@ def _collect_uk_air_sos_source_change_targets(
     source content changes can be repaired even when row-count parity happens
     to match R2.
     """
-    if source_filter not in {"uk_air_sos", "all"}:
+    if source_filter not in {"sos", "all"}:
         return {}
-    changed_files = (uk_air_sos_metrics or {}).get("changed_files") or []
+    changed_files = (sos_metrics or {}).get("changed_files") or []
     if not isinstance(changed_files, list) or not changed_files:
         return {}
 
@@ -6960,7 +6960,7 @@ def _collect_uk_air_sos_source_change_targets(
         WHERE t.id IN ({placeholders})
           AND c.connector_code = ?
         """,
-        (*sorted(timeseries_ids_set), UK_AIR_SOS_SOURCE_KEY),
+        (*sorted(timeseries_ids_set), SOS_SOURCE_KEY),
     ).fetchall()
     ts_to_connector: dict[int, int] = {}
     for ts_id, connector_id in rows:
@@ -7898,7 +7898,7 @@ def run_cross_check_backfills(
     run_compact: str,
     env: dict[str, str],
     source_filter: str,
-    uk_air_sos_metrics: Mapping[str, Any] | None,
+    sos_metrics: Mapping[str, Any] | None,
     dry_run: bool,
     run_backfill: bool,
     limits: LimitTracker,
@@ -7932,10 +7932,10 @@ def run_cross_check_backfills(
         run_id=run_id,
         source_filter=source_filter,
     )
-    source_change_targets = _collect_uk_air_sos_source_change_targets(
+    source_change_targets = _collect_sos_source_change_targets(
         conn,
         source_filter=source_filter,
-        uk_air_sos_metrics=uk_air_sos_metrics,
+        sos_metrics=sos_metrics,
     )
     metrics["source_change_candidate_days"] = len(
         {day_iso for day_iso, _ in source_change_targets.keys()}
@@ -8677,8 +8677,8 @@ def _source_file_key_for_lookup_row(source_key: str, source_location_id: str, da
         return _openaq_source_file_key(source_location_id, day)
     if source_key == SC_SOURCE_KEY:
         return _sc_source_file_key(source_location_id, day)
-    if source_key == UK_AIR_SOS_SOURCE_KEY:
-        return _uk_air_sos_source_file_key(source_location_id, day)
+    if source_key == SOS_SOURCE_KEY:
+        return _sos_source_file_key(source_location_id, day)
     return None
 
 
@@ -9564,7 +9564,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--source",
         default="all",
-        choices=["openaq", "sensorcommunity", "uk_air_sos", "all"],
+        choices=["openaq", "sensorcommunity", "sos", "all"],
         help="Source adapter filter (also scopes cross-check source rows).",
     )
     p.add_argument("--from-day", dest="from_day", default=None,
@@ -10283,7 +10283,7 @@ def collect_preflight_errors(
                 )
 
     # Source adapter dependency checks (local import only; no network in preflight).
-    if args.source in {"openaq", "all", "sensorcommunity", "uk_air_sos"}:
+    if args.source in {"openaq", "all", "sensorcommunity", "sos"}:
         for module_name in ("gzip", "hashlib", "urllib.request", "sqlite3"):
             try:
                 __import__(module_name)
@@ -10836,7 +10836,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             "## Active lookup counts",
             "",
         ])
-        for source_key in ("openaq", "sensorcommunity", "uk_air_sos"):
+        for source_key in ("openaq", "sensorcommunity", "sos"):
             entry = lookup_counts.get(source_key) or {}
             lines.append(
                 f"- {source_key}: stations={int(entry.get('active_stations', 0))} "
@@ -10893,7 +10893,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
         lines.append("")
 
     cc_for_sos = s.get("cross_check") or {}
-    sos = s.get("uk_air_sos") or {}
+    sos = s.get("sos") or {}
     if sos.get("ran") or sos.get("skipped_reason"):
         lines.extend([
             "## UK-AIR SOS",
@@ -10927,7 +10927,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             lines.append(f"- Skipped reason: {sos['skipped_reason']}")
         sos_first_seen = sos.get("first_seen_files") or []
         if sos_first_seen:
-            lines.extend(["", "### First-seen station/day snapshots (uk_air_sos, baselined — not backfilled)", ""])
+            lines.extend(["", "### First-seen station/day snapshots (sos, baselined — not backfilled)", ""])
             for entry in sos_first_seen[:50]:
                 lines.append(
                     f"- {entry['station_ref']} / {entry['day']} "
@@ -10939,7 +10939,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 lines.append(f"- ... {len(sos_first_seen) - 50} more")
         sos_changed = sos.get("changed_files") or []
         if sos_changed:
-            lines.extend(["", "### Changed station/day snapshots (uk_air_sos)", ""])
+            lines.extend(["", "### Changed station/day snapshots (sos)", ""])
             for entry in sos_changed[:50]:
                 lines.append(
                     f"- {entry['station_ref']} / {entry['day']} "
@@ -11276,10 +11276,10 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "aqi_rebuilds_complete",
         "aqi_rebuilds_failed",
         "aqi_rebuilds_skipped",
-        "uk_air_sos_snapshots_successful",
-        "uk_air_sos_snapshots_no_data",
-        "uk_air_sos_not_found",
-        "uk_air_sos_not_found_suppressed",
+        "sos_snapshots_successful",
+        "sos_snapshots_no_data",
+        "sos_not_found",
+        "sos_not_found_suppressed",
         "warnings_count",
         "errors_count",
     ):
@@ -11470,10 +11470,10 @@ def main(argv: list[str]) -> int:
         if "v2" in checked_history_versions and snapshot_ok:
             v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
             log.info("v2 source scope: %s", v2_source_scope)
-        sos_counts = lookup_source_counts.get("uk_air_sos", {})
+        sos_counts = lookup_source_counts.get("sos", {})
         source_adapter_history_version = adapter_backfill_history_version(history_version_mode)
         log.info(
-            "lookup active counts: openaq stations=%s timeseries=%s; sensorcommunity stations=%s timeseries=%s; uk_air_sos stations=%s timeseries=%s",
+            "lookup active counts: openaq stations=%s timeseries=%s; sensorcommunity stations=%s timeseries=%s; sos stations=%s timeseries=%s",
             (lookup_source_counts.get("openaq") or {}).get("active_stations", 0),
             (lookup_source_counts.get("openaq") or {}).get("active_timeseries", 0),
             (lookup_source_counts.get("sensorcommunity") or {}).get("active_stations", 0),
@@ -11514,14 +11514,14 @@ def main(argv: list[str]) -> int:
                 history_version=source_adapter_history_version,
             )
 
-        run_sos = args.source in {"uk_air_sos", "all"} and snapshot_ok
-        if args.source in {"uk_air_sos", "all"} and not run_sos:
+        run_sos = args.source in {"sos", "all"} and snapshot_ok
+        if args.source in {"sos", "all"} and not run_sos:
             log.warning(
-                "uk_air_sos: skipped because core snapshot status=%s (need imported/reused)",
+                "sos: skipped because core snapshot status=%s (need imported/reused)",
                 snapshot_result["status"],
             )
         if run_sos:
-            sos_metrics = check_uk_air_sos(
+            sos_metrics = check_sos(
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
                 dry_run=args.dry_run, run_backfill=args.run_backfill,
@@ -11640,7 +11640,7 @@ def main(argv: list[str]) -> int:
                 run_compact=run_compact,
                 env=env,
                 source_filter=args.source,
-                uk_air_sos_metrics=sos_metrics,
+                sos_metrics=sos_metrics,
                 dry_run=args.dry_run,
                 run_backfill=args.run_backfill,
                 limits=limits,
@@ -11830,7 +11830,7 @@ def main(argv: list[str]) -> int:
         for adapter_name, adapter_metrics in (
             ("openaq", openaq_metrics),
             ("sensorcommunity", sc_metrics),
-            ("uk_air_sos", sos_metrics),
+            ("sos", sos_metrics),
         ):
             if adapter_metrics.get("ran"):
                 notes_parts.append(
@@ -12052,19 +12052,19 @@ def main(argv: list[str]) -> int:
             "sensor_community_sensors": sc_metrics.get("sensors", 0),
             "sensor_community_days": sc_metrics.get("days", 0),
             "sensor_community_index_fetched": sc_metrics.get("index_fetched", 0),
-            "uk_air_sos_stopped_for": sos_metrics.get("stopped_for"),
-            "uk_air_sos_stations": sos_metrics.get("stations", 0),
-            "uk_air_sos_days": sos_metrics.get("days", 0),
-            "uk_air_sos_station_days_checked": sos_metrics.get("station_days_checked", 0),
-            "uk_air_sos_rows_counted": sos_metrics.get("rows_counted", 0),
-            "uk_air_sos_snapshots_successful": sos_metrics.get("snapshots_successful", 0),
-            "uk_air_sos_snapshots_no_data": sos_metrics.get("snapshots_no_data", 0),
-            "uk_air_sos_not_found": sos_metrics.get("not_found", 0),
-            "uk_air_sos_not_found_suppressed": sos_metrics.get("not_found_suppressed", 0),
-            "uk_air_sos_temporary_errors": sos_metrics.get("temporary_errors", 0),
-            "uk_air_sos_permanent_errors": sos_metrics.get("permanent_errors", 0),
-            "uk_air_sos_lookup_active_stations": int(sos_counts.get("active_stations", 0)),
-            "uk_air_sos_lookup_active_timeseries": int(sos_counts.get("active_timeseries", 0)),
+            "sos_stopped_for": sos_metrics.get("stopped_for"),
+            "sos_stations": sos_metrics.get("stations", 0),
+            "sos_days": sos_metrics.get("days", 0),
+            "sos_station_days_checked": sos_metrics.get("station_days_checked", 0),
+            "sos_rows_counted": sos_metrics.get("rows_counted", 0),
+            "sos_snapshots_successful": sos_metrics.get("snapshots_successful", 0),
+            "sos_snapshots_no_data": sos_metrics.get("snapshots_no_data", 0),
+            "sos_not_found": sos_metrics.get("not_found", 0),
+            "sos_not_found_suppressed": sos_metrics.get("not_found_suppressed", 0),
+            "sos_temporary_errors": sos_metrics.get("temporary_errors", 0),
+            "sos_permanent_errors": sos_metrics.get("permanent_errors", 0),
+            "sos_lookup_active_stations": int(sos_counts.get("active_stations", 0)),
+            "sos_lookup_active_timeseries": int(sos_counts.get("active_timeseries", 0)),
         }
 
         finished_at = utc_now()
@@ -12217,7 +12217,7 @@ def main(argv: list[str]) -> int:
             "lookup_source_counts": lookup_source_counts,
             "openaq": openaq_metrics,
             "sensor_community": sc_metrics,
-            "uk_air_sos": sos_metrics,
+            "sos": sos_metrics,
             "cross_check": cross_check_metrics,
             "metrics": metrics,
             "notes": notes,

@@ -2,7 +2,7 @@
 """
 uk_aq_copy_core_to_live.py
 
-Copies uk_aq_core tables (and optionally uk_aq_raw.uk_air_sos_station_refs)
+Copies uk_aq_core tables (and optionally uk_aq_raw.sos_station_uk_air_refs)
 from test ingestdb to live ingestdb using the Supabase PostgREST REST API
 over HTTPS. No direct Postgres connection required.
 
@@ -19,7 +19,7 @@ Optional env vars (for automatic sequence reset via Management API):
     (derived from LIVE_INGESTDB_SUPABASE_URL if not set)
 
 Flags:
-  --include-station-refs   also copy uk_aq_raw.uk_air_sos_station_refs
+  --include-station-refs   also copy uk_aq_raw.sos_station_uk_air_refs
   --dry-run                export from test only, do not write to live
   --skip-sequences         skip sequence reset step
   --batch-size N           rows per upsert batch (default 500)
@@ -48,14 +48,14 @@ CORE_TABLES: list[tuple[str, str, str, str]] = [
     ("procedures",                   "uk_aq_core", "id",                              "id"),
     ("networks",                     "uk_aq_core", "id",                              "id"),
     ("connectors",                   "uk_aq_core", "id",                              "id"),
-    ("uk_air_sos_networks",          "uk_aq_core", "network_ref",                     "network_ref"),
-    ("uk_air_sos_network_pollutants","uk_aq_core", "network_ref,match_type,match_value","network_ref"),
+    ("sos_networks",          "uk_aq_core", "network_ref",                     "network_ref"),
+    ("sos_network_pollutants","uk_aq_core", "network_ref,match_type,match_value","network_ref"),
     ("stations",                     "uk_aq_core", "id",                              "id"),
     ("station_metadata",             "uk_aq_core", "station_id",                      "station_id"),
     ("timeseries",                   "uk_aq_core", "id",                              "id"),
 ]
 
-STATION_REFS_TABLE = ("uk_air_sos_station_refs", "uk_aq_raw", "station_id", "station_id")
+STATION_REFS_TABLE = ("sos_station_uk_air_refs", "uk_aq_raw", "station_id", "station_id")
 
 IDENTITY_TABLES = [
     "uk_aq_core.categories",

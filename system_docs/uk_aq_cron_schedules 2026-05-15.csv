@@ -6,7 +6,7 @@ FixedTimeUTC,Frequency,Repo,Platform,Service/Workflow,ScheduleSource,CronUTC,Pur
 03:00,Daily @ 03:00 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-observs-partition-maintenance-daily,deploy workflow default,0 3 * * *,Partition maintenance on obs_aqidb,yes
 03:15,Daily @ 03:15 UTC,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-aqilevels-retention-daily,deploy workflow default,15 3 * * *,AQI levels retention cleanup,yes
 03:17,Weekly Mon @ 03:17 UTC,CIC-test-uk-aq-ops,GitHub Actions,codeql-noarchive.yml,workflow schedule,17 3 * * 1,CodeQL analysis,yes
-04:15,Monthly 1st @ 04:15 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_air_sos_site_register_monthly.yml,workflow schedule,15 4 1 * *,SOS site register download,yes
+04:15,Monthly 1st @ 04:15 UTC,CIC-test-uk-aq-ingest,GitHub Actions,sos_site_register_monthly.yml,workflow schedule,15 4 1 * *,SOS site register download,yes
 04:15,Daily @ 04:15 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,15 4 * * *,Trigger uk_aq_r2_core_snapshot,yes
 04:15,Daily @ 04:15 UTC,CIC-test-uk-aq-ops,GitHub Actions,uk_aq_r2_core_snapshot.yml,CF workflow-scheduler,15 4 * * *,Core snapshot to R2,yes
 04:35,Daily @ 04:35 UTC,CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,35 4 * * *,Trigger uk_aq_r2_history_dropbox_backup,yes
@@ -29,7 +29,7 @@ N/A (hourly),Hourly,CIC-test-uk-aq-ops,GCP Cloud Scheduler,uk-aq-db-size-logger-
 ,Every 5 minutes,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_egress_monitor.yml,workflow schedule,*/5 * * * *,Egress monitor for core DB,yes
 ,Every 5 minutes,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_observs_egress_monitor.yml,workflow schedule,*/5 * * * *,Egress monitor for obs_aqidb,yes
 ,Daily @ 06:00 UTC,CIC-test-uk-aq-ingest,GitHub Actions,supabase-keepalive.yml,workflow schedule,0 6 * * *,Supabase keepalive ping,yes
-,Monthly 1st @ 04:15 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_air_sos_site_register_monthly.yml,workflow schedule,15 4 1 * *,SOS site register download,yes
+,Monthly 1st @ 04:15 UTC,CIC-test-uk-aq-ingest,GitHub Actions,sos_site_register_monthly.yml,workflow schedule,15 4 1 * *,SOS site register download,yes
 ,Monthly 1st @ 05:35 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_monthly_index_maintenance.yml,workflow schedule,35 5 1 * *,Index maintenance,yes
 ,Daily @ 03:00 UTC,CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_stations_daily.yml,CF workflow-scheduler (ops),0 3 * * *,Stations daily sync,yes
 ,N/A,CIC-test-uk-aq-ingest,Cloudflare Worker,uk_aq_dispatcher,wrangler.toml,disabled (crons=[]),Poll dispatcher (currently disabled),no

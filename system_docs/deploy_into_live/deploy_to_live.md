@@ -407,7 +407,7 @@ Uses `psql \copy` (CSV) — works through the Supabase session pooler without re
 # From ops repo root:
 scripts/uk_aq_copy_core_to_live.sh
 
-# To also copy uk_aq_raw.uk_air_sos_station_refs (station→UK Air ID mapping):
+# To also copy uk_aq_raw.sos_station_uk_air_refs (station→UK Air ID mapping):
 scripts/uk_aq_copy_core_to_live.sh --include-station-refs
 
 # Dry-run (export only, no writes to live):
@@ -415,9 +415,9 @@ scripts/uk_aq_copy_core_to_live.sh --dry-run
 ```
 
 **uk_aq_raw tables — what to copy and what to skip:**
-- `uk_air_sos_station_refs`: copy with `--include-station-refs` (preserves station→UK Air ID mapping; avoids re-running station matching on first ingest)
+- `sos_station_uk_air_refs`: copy with `--include-station-refs` (preserves station→UK Air ID mapping; avoids re-running station matching on first ingest)
 - All `*_checkpoints` tables: skip — start empty, ingest rebuilds them
-- `uk_air_sos_site_register`, `laqn_site_register`: skip — repopulated from source on first ingest run
+- `sos_site_register`, `laqn_site_register`: skip — repopulated from source on first ingest run
 - `observation_rpc_metrics_minute`, `error_logs`: skip — operational/logs, start fresh
 
 **obs_aqidb tables — no direct copy needed:**
@@ -566,7 +566,7 @@ Also set `UK_AQ_APP_VERSION=$(cat VERSION)`.
 Trigger the `supabase_edge_deploy.yml` workflow manually on the live ingest repo, or run locally:
 
 ```bash
-supabase functions deploy --no-verify-jwt ingest_uk_air_sos
+supabase functions deploy --no-verify-jwt ingest_sos
 supabase functions deploy --no-verify-jwt ingest_breathelondon
 supabase functions deploy --no-verify-jwt ingest_sensorcommunity
 supabase functions deploy --no-verify-jwt ingest_openaq
@@ -630,7 +630,7 @@ Complete Phase 0.4 before this step. Then add the following to the **LIVE-uk-aq-
 | `GCP_OPENAQ_JOB_SERVICE_ACCOUNT` | `uk-aq-openaq-job@project-44502c75-19dc-456a-800.iam.gserviceaccount.com` |
 | `GCP_SCOMM_JOB_SERVICE_ACCOUNT` | `uk-aq-scomm-job@project-44502c75-19dc-456a-800.iam.gserviceaccount.com` |
 | `GCP_BLONDON_COMMUNITIES_JOB_SERVICE_ACCOUNT` | existing `uk-aq-breathelondon-job@project-44502c75-19dc-456a-800.iam.gserviceaccount.com` identity |
-| `GCP_UK_AIR_SOS_JOB_SERVICE_ACCOUNT` | `uk-aq-sos-job@project-44502c75-19dc-456a-800.iam.gserviceaccount.com` |
+| `GCP_SOS_JOB_SERVICE_ACCOUNT` | `uk-aq-sos-job@project-44502c75-19dc-456a-800.iam.gserviceaccount.com` |
 | `GCP_OBSERVS_PUBSUB_SERVICE_ACCOUNT` | `uk-aq-observs-pubsub-job@project-44502c75-19dc-456a-800.iam.gserviceaccount.com` |
 | `GCP_OPS_JOB_SERVICE_ACCOUNT` | `uk-aq-ops-job@project-44502c75-19dc-456a-800.iam.gserviceaccount.com` |
 | `GCP_OBSERVS_PUBSUB_TOPIC` | `uk-aq-observs-observations` |
@@ -639,7 +639,7 @@ Complete Phase 0.4 before this step. Then add the following to the **LIVE-uk-aq-
 - `uk_aq_openaq_cloud_run_deploy.yml`
 - `uk_aq_scomm_cloud_run_deploy.yml`
 - `uk_aq_blondon_communities_cloud_run_deploy.yml`
-- `uk_aq_uk_air_sos_cloud_run_deploy.yml`
+- `uk_aq_sos_cloud_run_deploy.yml`
 - `uk_aq_observs_pubsub_cloud_run_deploy.yml`
 - `uk_aq_dispatcher_deploy.yml`
 - `supabase_edge_deploy.yml`
@@ -660,7 +660,7 @@ Trigger each workflow via GitHub Actions → Run workflow, in this order:
 ### 6.3 Deploy ingest Cloud Run services (from LIVE-uk-aq-ingest)
 
 1. `uk_aq_blondon_communities_cloud_run_deploy.yml`
-2. `uk_aq_uk_air_sos_cloud_run_deploy.yml`
+2. `uk_aq_sos_cloud_run_deploy.yml`
 3. `uk_aq_openaq_cloud_run_deploy.yml`
 4. `uk_aq_scomm_cloud_run_deploy.yml`
 

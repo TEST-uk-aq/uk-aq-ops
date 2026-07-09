@@ -1,4 +1,4 @@
-# UK-AQ History Integrity — `uk_air_sos` Implementation Plan
+# UK-AQ History Integrity — `sos` Implementation Plan
 
 ## Naming rules for this phase
 
@@ -6,17 +6,17 @@ Use these source keys exactly:
 
 ```text
 sensorcommunity
-uk_air_sos
+sos
 ```
 
 Do **not** add or reintroduce:
 
 ```text
 sensor-community
-uk-air-sos
+sos
 ```
 
-The `uk_air_sos` implementation should follow the same integrity model as the other sources, but it is an API snapshot source rather than an archive-file source.
+The `sos` implementation should follow the same integrity model as the other sources, but it is an API snapshot source rather than an archive-file source.
 
 ---
 
@@ -24,7 +24,7 @@ The `uk_air_sos` implementation should follow the same integrity model as the ot
 
 ### Decision 1 — Canonical snapshot format
 
-Recommendation: use canonical **NDJSON** for `uk_air_sos` station/day snapshots.
+Recommendation: use canonical **NDJSON** for `sos` station/day snapshots.
 
 Reason:
 
@@ -50,7 +50,7 @@ timeseries_id, observed_at_utc
 Recommendation for first implementation:
 
 ```text
-CIC-Test/dev: keep all uk_air_sos canonical snapshots
+CIC-Test/dev: keep all sos canonical snapshots
 LIVE routine: keep changed/reappeared snapshots only
 ```
 
@@ -101,34 +101,34 @@ Do not treat failed API calls as changed source data.
 
 ---
 
-# Phase 7.1 — `uk_air_sos` source key, CLI, and lookup plumbing
+# Phase 7.1 — `sos` source key, CLI, and lookup plumbing
 
 ## Goal
 
-Add `uk_air_sos` as a supported history-integrity source without doing API fetching yet.
+Add `sos` as a supported history-integrity source without doing API fetching yet.
 
 The implementation should keep the codebase consistent with the current source-key naming:
 
 ```text
 openaq
 sensorcommunity
-uk_air_sos
+sos
 ```
 
 No hyphenated source keys should be introduced.
 
 ## Requirements
 
-- Add `uk_air_sos` to allowed `--source` choices.
-- Ensure `--source all` includes `uk_air_sos` only when explicitly intended.
-- Do not accept or emit `uk-air-sos`.
+- Add `sos` to allowed `--source` choices.
+- Ensure `--source all` includes `sos` only when explicitly intended.
+- Do not accept or emit `sos`.
 - Do not reintroduce `sensor-community`; use `sensorcommunity` only.
-- Update any source-key mapping so connector code `uk_air_sos` maps to source key `uk_air_sos`.
-- Rebuild/import core lookup so active `uk_air_sos` station/timeseries mappings are available in `source_station_timeseries_lookup`.
+- Update any source-key mapping so connector code `sos` maps to source key `sos`.
+- Rebuild/import core lookup so active `sos` station/timeseries mappings are available in `source_station_timeseries_lookup`.
 - Validate that `source_station_timeseries_lookup` can provide:
 
 ```text
-source_key = uk_air_sos
+source_key = sos
 station_ref
 source_location_id or equivalent station ref
 connector_id
@@ -137,7 +137,7 @@ timeseries_id
 is_active
 ```
 
-- Add report/log output showing how many active `uk_air_sos` stations and timeseries are available.
+- Add report/log output showing how many active `sos` stations and timeseries are available.
 - No source API fetching in this phase.
 - No backfills in this phase.
 
@@ -146,42 +146,42 @@ is_active
 ```text
 Repo: /workspaces/uk-aq-ops
 
-Please implement Phase 7.1 of the UK-AQ History Integrity `uk_air_sos` source support.
+Please implement Phase 7.1 of the UK-AQ History Integrity `sos` source support.
 
 Important naming requirements:
-- Use `uk_air_sos` exactly.
-- Do not use or introduce `uk-air-sos` anywhere.
+- Use `sos` exactly.
+- Do not use or introduce `sos` anywhere.
 - Use `sensorcommunity` exactly.
 - Do not reintroduce `sensor-community` anywhere.
 
 Context:
-The history-integrity system currently supports source adapters such as `openaq` and `sensorcommunity`. We now need to add `uk_air_sos` as an API-based source, but this first phase is only CLI/source-key/lookup plumbing. No API fetching yet.
+The history-integrity system currently supports source adapters such as `openaq` and `sensorcommunity`. We now need to add `sos` as an API-based source, but this first phase is only CLI/source-key/lookup plumbing. No API fetching yet.
 
 Tasks:
 1. Locate the active history-integrity implementation under scripts/uk-aq-history-integrity/.
-2. Add `uk_air_sos` to the allowed `--source` choices.
-3. Ensure `--source all` includes `uk_air_sos` only if the current code structure expects all active sources to run.
-4. Update source-key mapping so connector code `uk_air_sos` maps to source key `uk_air_sos`.
-5. Ensure no hyphenated `uk-air-sos` references are added.
+2. Add `sos` to the allowed `--source` choices.
+3. Ensure `--source all` includes `sos` only if the current code structure expects all active sources to run.
+4. Update source-key mapping so connector code `sos` maps to source key `sos`.
+5. Ensure no hyphenated `sos` references are added.
 6. Ensure no hyphenated `sensor-community` references are added or reintroduced.
-7. Update core lookup import/rebuild logic so active `uk_air_sos` stations/timeseries are represented in `source_station_timeseries_lookup`.
-8. The lookup should support source_key=`uk_air_sos`, station_ref/source_location_id, connector_id, station_id, timeseries_id, and is_active where available.
-9. Add a check-only or dry-run report/log line showing the count of active `uk_air_sos` stations and active `uk_air_sos` timeseries found in the lookup.
+7. Update core lookup import/rebuild logic so active `sos` stations/timeseries are represented in `source_station_timeseries_lookup`.
+8. The lookup should support source_key=`sos`, station_ref/source_location_id, connector_id, station_id, timeseries_id, and is_active where available.
+9. Add a check-only or dry-run report/log line showing the count of active `sos` stations and active `sos` timeseries found in the lookup.
 10. Do not add SOS API fetching in this phase.
 11. Do not trigger backfills in this phase.
 12. Add/update tests if available for source argument validation and lookup mapping.
 
 Acceptance criteria:
-- `--source uk_air_sos --check-only` is accepted.
-- `--source uk-air-sos` is not accepted unless existing CLI parsing already aliases unsupported values; prefer rejecting it.
+- `--source sos --check-only` is accepted.
+- `--source sos` is not accepted unless existing CLI parsing already aliases unsupported values; prefer rejecting it.
 - No `sensor-community` string exists in active integrity code.
-- No `uk-air-sos` string exists in active integrity code.
+- No `sos` string exists in active integrity code.
 - A dry/check-only run can show active SOS lookup counts without fetching source data.
 ```
 
 ---
 
-# Phase 7.2 — `uk_air_sos` canonical snapshot command/function
+# Phase 7.2 — `sos` canonical snapshot command/function
 
 ## Goal
 
@@ -244,16 +244,16 @@ permanent_error
 ```text
 Repo: /workspaces/uk-aq-ops
 
-Please implement Phase 7.2 of the UK-AQ History Integrity `uk_air_sos` support: canonical SOS source snapshots.
+Please implement Phase 7.2 of the UK-AQ History Integrity `sos` support: canonical SOS source snapshots.
 
 Important naming requirements:
-- Use `uk_air_sos` exactly.
-- Do not use or introduce `uk-air-sos` anywhere.
+- Use `sos` exactly.
+- Do not use or introduce `sos` anywhere.
 - Use `sensorcommunity` exactly.
 - Do not reintroduce `sensor-community` anywhere.
 
 Goal:
-Create a stable source snapshot mechanism for `uk_air_sos` so history-integrity can hash and count SOS API data. This phase should not write R2, should not write Supabase, and should not run backfills.
+Create a stable source snapshot mechanism for `sos` so history-integrity can hash and count SOS API data. This phase should not write R2, should not write Supabase, and should not run backfills.
 
 First inspect existing SOS source/backfill/ingest code in the repo, especially workers/uk_aq_backfill_local/run_job.ts and any SOS helper functions. Reuse existing SOS fetch/parsing logic where practical so integrity matches production/backfill behaviour.
 
@@ -303,7 +303,7 @@ Acceptance criteria:
 
 ---
 
-# Phase 7.3 — `uk_air_sos` adapter state, cache, and counts
+# Phase 7.3 — `sos` adapter state, cache, and counts
 
 ## Goal
 
@@ -314,7 +314,7 @@ Add the actual history-integrity adapter that checks SOS station/day source unit
 Use:
 
 ```text
-source_file_key = uk_air_sos:station_ref=<station_ref>:day_utc=<YYYY-MM-DD>
+source_file_key = sos:station_ref=<station_ref>:day_utc=<YYYY-MM-DD>
 ```
 
 Although this table is named `source_file_state`, for SOS it represents an API source history unit.
@@ -324,7 +324,7 @@ Although this table is named `source_file_state`, for SOS it represents an API s
 Recommended path:
 
 ```text
-<source-cache>/uk_air_sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
+<source-cache>/sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
 ```
 
 ## Cache retention
@@ -353,7 +353,7 @@ all      — keep every successful SOS snapshot, useful for CIC-Test debugging
 
 ## Requirements
 
-For each active `uk_air_sos` station/day in the selected window:
+For each active `sos` station/day in the selected window:
 
 1. Fetch canonical snapshot.
 2. Hash canonical bytes.
@@ -382,11 +382,11 @@ temporary_error
 ```text
 Repo: /workspaces/uk-aq-ops
 
-Please implement Phase 7.3 of the UK-AQ History Integrity `uk_air_sos` adapter: source state, source-cache snapshots, and per-timeseries counts.
+Please implement Phase 7.3 of the UK-AQ History Integrity `sos` adapter: source state, source-cache snapshots, and per-timeseries counts.
 
 Important naming requirements:
-- Use `uk_air_sos` exactly.
-- Do not use or introduce `uk-air-sos` anywhere.
+- Use `sos` exactly.
+- Do not use or introduce `sos` anywhere.
 - Use `sensorcommunity` exactly.
 - Do not reintroduce `sensor-community` anywhere.
 
@@ -395,11 +395,11 @@ Build on Phase 7.1 and 7.2.
 Source model:
 For SOS, use station/day as the source history unit:
 
-source_file_key = uk_air_sos:station_ref=<station_ref>:day_utc=<YYYY-MM-DD>
+source_file_key = sos:station_ref=<station_ref>:day_utc=<YYYY-MM-DD>
 
 Even though the table is named source_file_state, treat this as an API source history unit, not a real upstream file.
 
-For each active uk_air_sos station/day in the selected date window:
+For each active sos station/day in the selected date window:
 1. Fetch or build the canonical SOS NDJSON snapshot.
 2. Hash the exact canonical NDJSON bytes.
 3. Compute per-timeseries row counts.
@@ -408,7 +408,7 @@ For each active uk_air_sos station/day in the selected date window:
 6. Delete + reinsert source_file_timeseries_counts in one transaction for successful source checks.
 
 Canonical source-cache path:
-<source-cache>/uk_air_sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
+<source-cache>/sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
 
 Add config:
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=changed
@@ -443,14 +443,14 @@ Important:
 
 Metrics/reporting:
 Add/report separate counts for:
-- uk_air_sos stations checked
-- uk_air_sos snapshots first_seen
-- uk_air_sos snapshots unchanged
-- uk_air_sos snapshots changed
-- uk_air_sos snapshots reappeared
-- uk_air_sos snapshots missing
-- uk_air_sos temporary errors
-- uk_air_sos rows counted
+- sos stations checked
+- sos snapshots first_seen
+- sos snapshots unchanged
+- sos snapshots changed
+- sos snapshots reappeared
+- sos snapshots missing
+- sos temporary errors
+- sos rows counted
 
 Tests:
 Add/update tests for:
@@ -461,7 +461,7 @@ Add/update tests for:
 - deterministic source_file_key and source-cache path
 
 Acceptance criteria:
-- `--source uk_air_sos --check-only` can baseline station/day snapshots.
+- `--source sos --check-only` can baseline station/day snapshots.
 - source_file_timeseries_counts is populated for successful snapshots.
 - first_seen snapshots do not directly trigger backfill.
 - reports distinguish first_seen from changed.
@@ -473,9 +473,9 @@ Acceptance criteria:
 
 ## Goal
 
-Plug `uk_air_sos` into the existing Phase 6.5/6.6/6.8 flow.
+Plug `sos` into the existing Phase 6.5/6.6/6.8 flow.
 
-`uk_air_sos` should use the same repair model:
+`sos` should use the same repair model:
 
 ```text
 source counts vs R2 observation counts
@@ -486,7 +486,7 @@ source counts vs R2 observation counts
 
 ## Requirements
 
-- Include `uk_air_sos` counts in the cross-check pass.
+- Include `sos` counts in the cross-check pass.
 - Compare `source_file_timeseries_counts` against R2 observation manifest `timeseries_row_counts` from local Dropbox R2 history backup.
 - For statuses:
 
@@ -542,21 +542,21 @@ UK_AQ_BACKFILL_TO_DAY_UTC=<day>
 ```text
 Repo: /workspaces/uk-aq-ops
 
-Please implement Phase 7.4 of the UK-AQ History Integrity `uk_air_sos` support: cross-check, observation repair, and AQI rebuild queue integration.
+Please implement Phase 7.4 of the UK-AQ History Integrity `sos` support: cross-check, observation repair, and AQI rebuild queue integration.
 
 Important naming requirements:
-- Use `uk_air_sos` exactly.
-- Do not use or introduce `uk-air-sos` anywhere.
+- Use `sos` exactly.
+- Do not use or introduce `sos` anywhere.
 - Use `sensorcommunity` exactly.
 - Do not reintroduce `sensor-community` anywhere.
 
-Build on the existing Phase 6.5/6.6/6.8 model and the new `uk_air_sos` source_file_timeseries_counts from Phase 7.3.
+Build on the existing Phase 6.5/6.6/6.8 model and the new `sos` source_file_timeseries_counts from Phase 7.3.
 
 Requirements:
-1. Include `uk_air_sos` successful source counts in the R2 observation cross-check pass.
+1. Include `sos` successful source counts in the R2 observation cross-check pass.
 2. Compare source_file_timeseries_counts to local Dropbox R2 observation manifest timeseries_row_counts.
 3. For cross-check statuses mismatch, source_only, and r2_manifest_missing, create observation repair candidates.
-4. Do not create repair candidates just because a `uk_air_sos` snapshot is first_seen.
+4. Do not create repair candidates just because a `sos` snapshot is first_seen.
 5. Real source changed/reappeared outcomes may still create source-change repair candidates according to existing design.
 6. Deduplicate final observation repair candidates by connector_id + day_utc + timeseries_id.
 7. Batch observation repairs by connector/day where practical, passing affected timeseries IDs.
@@ -580,19 +580,19 @@ Requirements:
 12. A failed AQI rebuild must not hide a successful observation repair.
 
 SOS-specific note:
-Codex review has confirmed source_to_r2 supports uk_air_sos historical day windows. However, empty-day manifest behaviour may not have parity with OpenAQ/sensorcommunity. Do not try to solve that here unless required for the tests; log/report no-row SOS cases clearly.
+Codex review has confirmed source_to_r2 supports sos historical day windows. However, empty-day manifest behaviour may not have parity with OpenAQ/sensorcommunity. Do not try to solve that here unless required for the tests; log/report no-row SOS cases clearly.
 
 Tests:
 Add/update tests for:
-- uk_air_sos first_seen + R2 ok => no backfill
-- uk_air_sos first_seen + R2 mismatch => repair candidate from cross-check
-- uk_air_sos changed => repair candidate
+- sos first_seen + R2 ok => no backfill
+- sos first_seen + R2 mismatch => repair candidate from cross-check
+- sos changed => repair candidate
 - duplicate candidates from source-change and cross-check dedupe to one connector/day/timeseries repair
 - successful obs repair queues exactly one AQI rebuild per connector/day
 
 Acceptance criteria:
-- uk_air_sos integrates with existing cross_checks table/reporting.
-- uk_air_sos repair uses observations_only.
+- sos integrates with existing cross_checks table/reporting.
+- sos repair uses observations_only.
 - AQI rebuild queue dedupes connector/day.
 - No first_seen-only backfills are triggered.
 ```
@@ -623,15 +623,15 @@ malformed response
 - Reports should show:
 
 ```text
-uk_air_sos checked station-days
-uk_air_sos successful snapshots
-uk_air_sos no-data snapshots
-uk_air_sos not_found count
-uk_air_sos temporary_error count
-uk_air_sos source changes
-uk_air_sos cross-check discrepancies
-uk_air_sos observation repairs
-uk_air_sos AQI rebuilds queued/completed/failed
+sos checked station-days
+sos successful snapshots
+sos no-data snapshots
+sos not_found count
+sos temporary_error count
+sos source changes
+sos cross-check discrepancies
+sos observation repairs
+sos AQI rebuilds queued/completed/failed
 ```
 
 ## Codex prompt
@@ -639,11 +639,11 @@ uk_air_sos AQI rebuilds queued/completed/failed
 ```text
 Repo: /workspaces/uk-aq-ops
 
-Please implement Phase 7.5 of the UK-AQ History Integrity `uk_air_sos` support: SOS error handling, optional 404 cooldowns, and reporting polish.
+Please implement Phase 7.5 of the UK-AQ History Integrity `sos` support: SOS error handling, optional 404 cooldowns, and reporting polish.
 
 Important naming requirements:
-- Use `uk_air_sos` exactly.
-- Do not use or introduce `uk-air-sos` anywhere.
+- Use `sos` exactly.
+- Do not use or introduce `sos` anywhere.
 - Use `sensorcommunity` exactly.
 - Do not reintroduce `sensor-community` anywhere.
 
@@ -672,16 +672,16 @@ If a suitable existing error_logs/checkpoint pattern exists in the SOS ingest/ba
 
 Reporting:
 Add/source-specific report counters:
-- uk_air_sos station-days checked
-- uk_air_sos successful snapshots
-- uk_air_sos no_data snapshots
-- uk_air_sos not_found count
-- uk_air_sos temporary_error count
-- uk_air_sos permanent_error count
-- uk_air_sos source changes
-- uk_air_sos cross-check discrepancies
-- uk_air_sos observation repairs
-- uk_air_sos AQI rebuilds queued/completed/failed
+- sos station-days checked
+- sos successful snapshots
+- sos no_data snapshots
+- sos not_found count
+- sos temporary_error count
+- sos permanent_error count
+- sos source changes
+- sos cross-check discrepancies
+- sos observation repairs
+- sos AQI rebuilds queued/completed/failed
 
 Tests:
 Add/update tests for:
@@ -703,7 +703,7 @@ Acceptance criteria:
 
 ## Goal
 
-Update the history-integrity system documentation so `uk_air_sos` behaviour is clear.
+Update the history-integrity system documentation so `sos` behaviour is clear.
 
 ## Requirements
 
@@ -713,7 +713,7 @@ Document:
 
 ```text
 sensorcommunity
-uk_air_sos
+sos
 ```
 
 - SOS source unit:
@@ -735,9 +735,9 @@ timeseries_id + day_utc
 - Example commands:
 
 ```bash
-/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh --env CIC-Test --profile manual --source uk_air_sos --from-day 2026-05-01 --to-day 2026-05-03 --check-only
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh --env CIC-Test --profile manual --source sos --from-day 2026-05-01 --to-day 2026-05-03 --check-only
 
-/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh --env CIC-Test --profile manual --source uk_air_sos --from-day 2026-05-01 --to-day 2026-05-03 --dry-run --run-backfill
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh --env CIC-Test --profile manual --source sos --from-day 2026-05-01 --to-day 2026-05-03 --dry-run --run-backfill
 ```
 
 ## Codex prompt
@@ -745,27 +745,27 @@ timeseries_id + day_utc
 ```text
 Repo: /workspaces/uk-aq-ops
 
-Please implement Phase 7.6 of the UK-AQ History Integrity `uk_air_sos` support: documentation and operational examples.
+Please implement Phase 7.6 of the UK-AQ History Integrity `sos` support: documentation and operational examples.
 
 Important naming requirements:
-- Use `uk_air_sos` exactly.
-- Do not use or introduce `uk-air-sos` anywhere.
+- Use `sos` exactly.
+- Do not use or introduce `sos` anywhere.
 - Use `sensorcommunity` exactly.
 - Do not reintroduce `sensor-community` anywhere.
 
-Update the history-integrity plan/docs to describe the implemented `uk_air_sos` behaviour.
+Update the history-integrity plan/docs to describe the implemented `sos` behaviour.
 
 Document:
 1. Source key naming rules:
    - sensorcommunity
-   - uk_air_sos
+   - sos
 2. SOS source model:
    - source check unit is station_ref + day_utc
    - evidence/count unit is timeseries_id + day_utc
    - observation repair unit is affected timeseries IDs for a day
    - AQI rebuild unit is connector_id + day_utc
 3. Canonical SOS snapshot cache:
-   <source-cache>/uk_air_sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
+   <source-cache>/sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
 4. KEEP_API_SNAPSHOTS setting:
    UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all
 5. first_seen behaviour:
@@ -783,12 +783,12 @@ Document:
    - r2_history_obs_to_aqilevels aqilevels_only
 8. Example commands for check-only, dry-run, and narrow manual runs.
 
-Also update any implementation status section to show which uk_air_sos phases are done.
+Also update any implementation status section to show which sos phases are done.
 
 Acceptance criteria:
-- Docs contain no `uk-air-sos` string.
+- Docs contain no `sos` string.
 - Docs contain no `sensor-community` string.
-- Example commands use `--source uk_air_sos`.
+- Example commands use `--source sos`.
 ```
 
 ---
@@ -814,7 +814,7 @@ After implementation, test in CIC-Test only.
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
-  --source uk_air_sos \
+  --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-01 \
   --check-only
@@ -826,7 +826,7 @@ After implementation, test in CIC-Test only.
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
-  --source uk_air_sos \
+  --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-01 \
   --dry-run \
@@ -841,7 +841,7 @@ Pick one known station/day first.
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
-  --source uk_air_sos \
+  --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-01 \
   --run-backfill \
@@ -858,5 +858,5 @@ Pick one known station/day first.
 - `source_to_r2` repairs observations only.
 - `r2_history_obs_to_aqilevels` owns AQI rebuild.
 - AQI rebuilds are deduped by `connector_id + day_utc`.
-- Use `uk_air_sos` only.
+- Use `sos` only.
 - Use `sensorcommunity` only.

@@ -54,7 +54,7 @@ Use this when deciding **what to touch, in which repo, and in what order**.
    - ingest `supabase_edge_deploy.yml`
    - ops `uk_aq_cache_proxy_deploy.yml` (if cache proxy changed)
 
-### C) If you change ingest connectors (`ingest_uk_air_sos`, `ingest_openaq`, `ingest_breathelondon`, `ingest_erg_laqn`, `ingest_sensorcommunity`)
+### C) If you change ingest connectors (`ingest_sos`, `ingest_openaq`, `ingest_breathelondon`, `ingest_erg_laqn`, `ingest_sensorcommunity`)
 
 1. **Ingest repo**:
    - edge function: `supabase/functions/ingest_<source>/index.ts`

@@ -236,7 +236,7 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     `core_stations_snapshot`, `core_timeseries_snapshot`,
     `core_phenomena_snapshot`, and rebuilds
     `source_station_timeseries_lookup` for `openaq`,
-    `sensorcommunity`, and `uk_air_sos`. Reuses on unchanged manifest hash;
+    `sensorcommunity`, and `sos`. Reuses on unchanged manifest hash;
     `--force-snapshot-import` overrides; `--skip-snapshot-import` for
     debug; `--dry-run` reports without writing.
   - Phase 3: OpenAQ adapter — HEADs `https://openaq-data-archive.s3.amazonaws.com`
@@ -258,24 +258,24 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     `state/<ENV>/logs/backfill/<run_compact>/day_<YYYY-MM-DD>.log`,
     and `backfills_triggered / backfills_ok / backfills_failed` on
     the run row. Failed backfills bump `errors_count`.
-  - Phase 7.2 helper: `build_uk_air_sos_canonical_snapshot(...)` builds
-    deterministic station/day canonical NDJSON snapshots for `uk_air_sos`
+  - Phase 7.2 helper: `build_sos_canonical_snapshot(...)` builds
+    deterministic station/day canonical NDJSON snapshots for `sos`
     (`station_ref`, `timeseries_id`, `timeseries_ref`, `observed_at_utc`,
     `value`), returning explicit statuses:
     `ok`, `no_data`, `not_found`, `temporary_error`, `permanent_error`.
     It does not write R2/Supabase and does not trigger backfill.
-  - Phase 7.3: `check_uk_air_sos(...)` now runs station/day SOS source checks
-    (via source key `uk_air_sos`) and writes:
+  - Phase 7.3: `check_sos(...)` now runs station/day SOS source checks
+    (via source key `sos`) and writes:
     `source_file_state`, `source_file_events`, and
     `source_file_timeseries_counts` for successful checks. Source unit is
-    `uk_air_sos:station_ref=<station_ref>:day_utc=<YYYY-MM-DD>`. Snapshot
+    `sos:station_ref=<station_ref>:day_utc=<YYYY-MM-DD>`. Snapshot
     cache retention is controlled by
     `UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all` (default
     `changed`). First-seen entries are baseline-only (no direct backfill);
     temporary/permanent source errors do not replace prior good baseline
     hashes/counts.
   - Phase 7.4: observation-repair candidate selection now includes
-    `uk_air_sos` in cross-check connector filters, and merges cross-check
+    `sos` in cross-check connector filters, and merges cross-check
     discrepancies with SOS source-change candidates (`changed`/`reappeared`)
     before deduping by `(connector_id, day_utc, timeseries_id)`. Observation
     repair continues to run with `observations_only`, and successful observation
@@ -284,11 +284,11 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     `ok`/`no_data`/`not_found`/`temporary_error`/`permanent_error`.
     Temporary/permanent failures do not overwrite prior good baselines and do
     not create repair candidates. Optional 404 suppression can be enabled with
-    `UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES` to avoid
+    `UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES` to avoid
     repeated station/day not-found re-fetches during the cooldown window.
   - Phase 7.6 docs completion: SOS model and operations are now documented in
     `system_docs/uk-aq-r2-history-integrity.md`, including naming rules
-    (`sensorcommunity`, `uk_air_sos`), source/evidence/repair/AQI unit
+    (`sensorcommunity`, `sos`), source/evidence/repair/AQI unit
     boundaries, snapshot-cache path contract, `KEEP_API_SNAPSHOTS` controls,
     and SOS-specific check-only/dry-run/manual run command examples.
   - Phase 5: Sensor.Community adapter — fetches the daily archive

@@ -62,16 +62,16 @@ test("OpenAQ mapping keeps pollutant_code from source parameter if binding code 
 });
 
 test("UK-AIR source-to-R2 requires valid flat-file mappings before fetching observations", () => {
-  const guardBody = bodyOf("assertUkAirSosFlatFileMappingsForBackfill");
-  assert.match(source, /uk_air_sos_site_timeseries_refs/);
+  const guardBody = bodyOf("assertSosFlatFileMappingsForBackfill");
+  assert.match(source, /sos_station_timeseries_site_refs/);
   assert.match(guardBody, /missing_timeseries_ids/);
   assert.match(guardBody, /ambiguous_site_pollutant_sample/);
   assert.match(guardBody, /UK-AIR flat-file mapping guard failed/);
 
-  assert.match(source, /assertUkAirSosFlatFileMappingsForBackfill/);
+  assert.match(source, /assertSosFlatFileMappingsForBackfill/);
   assert.ok(
-    source.indexOf("assertUkAirSosFlatFileMappingsForBackfill") <
-      source.indexOf("processUkAirSosTimeseriesBatch"),
+    source.indexOf("assertSosFlatFileMappingsForBackfill") <
+      source.indexOf("processSosTimeseriesBatch"),
     "mapping guard runs before UK-AIR source fetches",
   );
 });

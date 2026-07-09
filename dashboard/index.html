@@ -1824,7 +1824,7 @@
       const bucketOrder = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"];
       const DISPATCH_CONNECTOR_OPTIONS = [
         { value: "all", label: "All" },
-        { value: "uk_air_sos", label: "UK-AIR SOS" },
+        { value: "sos", label: "UK-AIR SOS" },
         { value: "sensorcommunity", label: "Sensor.Community" },
         { value: "breathelondon", label: "Breathe London" },
         { value: "openaq", label: "OpenAQ" },
@@ -1891,7 +1891,7 @@
       const R2_CONNECTOR_CHARTS = [
         {
           connectorId: 1,
-          title: "UK-AIR-SOS",
+          title: "SOS",
           observsColor: "#013566",
           aqiColor: "#015FA4",
         },
@@ -5097,7 +5097,7 @@
       }
 
       function renderConnectorSettingsPanel(connectors) {
-        const schedulerBackendAllowlist = new Set(["uk_air_sos", "sensorcommunity", "breathelondon", "openaq"]);
+        const schedulerBackendAllowlist = new Set(["sos", "sensorcommunity", "breathelondon", "openaq"]);
         const panel = document.createElement("section");
         panel.className = "panel";
         panel.innerHTML = `

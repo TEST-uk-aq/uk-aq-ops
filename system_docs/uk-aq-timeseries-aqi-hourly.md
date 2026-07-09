@@ -26,7 +26,7 @@ Late observations frequently land after the worker's original single-hour sync w
 
 - Station `7483`: p50 `00:58:13`, p90 `02:34:36`, p99 `05:24:24`, max `05:50:12`
 - Connector lag examples:
-  - `uk_air_sos` p99 `06:50:12`
+  - `sos` p99 `06:50:12`
   - `breathelondon` p99 `03:55:30`
   - `openaq` max `20:33:30`
   - `sensorcommunity` is comparatively low-lag and not the main driver

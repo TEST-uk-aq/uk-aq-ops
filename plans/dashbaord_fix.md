@@ -27,10 +27,10 @@ Problem observed:
 The local dashboard correctly shows recent Dispatcher Feed rows. Example from the local dashboard:
 
 - Sensor.Community updated around 03/06/2026 18:18:09
-- UK-AIR-SOS updated around 03/06/2026 18:15:19
+- SOS updated around 03/06/2026 18:15:19
 - Sensor.Community previous run around 03/06/2026 18:12:11
 
-The hosted online dashboard does not show the same rows consistently. It sometimes shows only UK-AIR-SOS, and sometimes only Sensor.Community, even when the lookback should include both. This suggests the online dashboard API is either using the wrong Supabase project, returning stale cached data, or not applying the Dispatcher Feed lookback/filter logic the same way as local.
+The hosted online dashboard does not show the same rows consistently. It sometimes shows only SOS, and sometimes only Sensor.Community, even when the lookback should include both. This suggests the online dashboard API is either using the wrong Supabase project, returning stale cached data, or not applying the Dispatcher Feed lookback/filter logic the same way as local.
 
 Key things already seen in the code:
 

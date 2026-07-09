@@ -14,7 +14,7 @@ First source adapters:
 
 Planned later source adapters:
 
-- UK-AIR-SOS API/history checks
+- SOS API/history checks
 - Breathe London API/history checks
 
 The system supports both UK-AQ environments:
@@ -382,7 +382,7 @@ Python interpreter defaults to `python3`; override with
 ```text
 --env CIC-Test|LIVE                     (required)
 --profile daily|weekly|monthly|manual   (default: manual)
---source openaq|sensorcommunity|uk_air_sos|all  (default: all)
+--source openaq|sensorcommunity|sos|all  (default: all)
 --from-day YYYY-MM-DD                   (manual profile or override)
 --to-day YYYY-MM-DD                     (manual profile or override)
 --dry-run                               No DB writes / no remote calls; logs the snapshot and OpenAQ plan.
@@ -429,7 +429,7 @@ Naming rules used by the active runtime:
 
 ```text
 sensorcommunity
-uk_air_sos
+sos
 ```
 
 SOS integrity model units:
@@ -444,14 +444,14 @@ AQI rebuild unit: connector_id + day_utc
 SOS canonical snapshot cache path:
 
 ```text
-<source-cache>/uk_air_sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
+<source-cache>/sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
 ```
 
 Relevant SOS snapshot retention and 404 suppression settings:
 
 ```text
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all
-UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES=<int, 0 disables>
+UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES=<int, 0 disables>
 ```
 
 First-seen and error handling rules:
@@ -477,7 +477,7 @@ SOS-focused operational examples:
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
-  --source uk_air_sos \
+  --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-03 \
   --check-only
@@ -486,7 +486,7 @@ SOS-focused operational examples:
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
-  --source uk_air_sos \
+  --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-03 \
   --dry-run \
@@ -496,7 +496,7 @@ SOS-focused operational examples:
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
-  --source uk_air_sos \
+  --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-01 \
   --run-backfill \
@@ -602,7 +602,7 @@ source_station_timeseries_lookup
 Only the columns the integrity tooling needs are imported (PK + the fields
 used for lookup, filtering, or reporting). Other manifest tables
 (`categories`, `observed_properties`, `offerings`, `features`, `procedures`,
-`networks`, `uk_air_sos_*`, and `station_metadata`) are accepted in the manifest but not loaded.
+`networks`, `sos_*`, and `station_metadata`) are accepted in the manifest but not loaded.
 
 The lookup table allows:
 
@@ -954,7 +954,7 @@ adapter only sets `day_utc`.
 
 ## API-based future adapters
 
-UK-AIR-SOS and Breathe London may require API snapshot checking rather than
+SOS and Breathe London may require API snapshot checking rather than
 archive-file checking. Same SQLite DB per environment; source-specific
 adapters.
 
@@ -1330,21 +1330,21 @@ Delivered:
 - Streaming gzipped-NDJSON import for `connectors`, `stations`,
   `timeseries`, `phenomena` into `core_*_snapshot` tables.
 - Derived `source_station_timeseries_lookup` for `openaq`,
-  `sensorcommunity`, and `uk_air_sos`, filtered to non-removed stations.
-- Phase 7.1 adds `--source uk_air_sos` for lookup/cross-check plumbing only
+  `sensorcommunity`, and `sos`, filtered to non-removed stations.
+- Phase 7.1 adds `--source sos` for lookup/cross-check plumbing only
   (no SOS API fetch adapter yet).
 - Phase 7.2 adds a canonical SOS station/day snapshot helper in the integrity
   runtime: deterministic NDJSON rows sorted by `(timeseries_id, observed_at_utc)`
   with status outcomes `ok|no_data|not_found|temporary_error|permanent_error`.
   This phase does not write R2, does not write Supabase, and does not trigger
   backfills.
-- Phase 7.3 adds the `uk_air_sos` station/day source adapter flow:
+- Phase 7.3 adds the `sos` station/day source adapter flow:
   source state/events, per-timeseries source counts, and source-cache retention
   policy via `UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all`
   (default `changed`). First-seen snapshots are baselined only (no direct
   backfill trigger); temporary/permanent fetch errors do not overwrite the prior
   baseline hashes/counts.
-- Phase 7.4 plugs `uk_air_sos` into the observation-repair path:
+- Phase 7.4 plugs `sos` into the observation-repair path:
   cross-check discrepancies plus SOS `changed`/`reappeared` source-change
   targets are merged and deduped at `(connector_id, day_utc, timeseries_id)`.
   Observation repair runs with `source_to_r2 + observations_only`, and successful
@@ -1385,7 +1385,7 @@ Delivered:
 - Phase 7.5 adds SOS error-handling/reporting polish:
   explicit `no_data` vs `not_found` vs `temporary_error` vs `permanent_error`
   counters, optional not-found retry suppression via
-  `UK_AQ_HISTORY_INTEGRITY_UK_AIR_SOS_NOT_FOUND_COOLDOWN_MINUTES`,
+  `UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES`,
   and report visibility for SOS cross-check/repair/AQI outcomes.
 - Phase 7.6 documentation pass is complete in this document and in
   `system_docs/uk_aq_scripts.md`, including SOS model units, cache-path
@@ -1449,7 +1449,7 @@ Pass 1 (subprocess invocation + per-event recording):
   - if `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT` is unset, integrity auto-sets
     it to `<UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR>/openaq` for that call
   - if `UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT` is unset, integrity
-    auto-sets it to `<UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR>/uk_air_sos`
+    auto-sets it to `<UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR>/sos`
     so `source_to_r2` can reuse same-run SOS snapshot files before calling
     the SOS API
 - Per-backfill result recorded on the `source_file_events` row:
@@ -1783,7 +1783,7 @@ reports.
 
 ### Phase 8 — API-based source adapters (PLANNED)
 
-Goal: UK-AIR-SOS and Breathe London canonicalisation and hashing.
+Goal: SOS and Breathe London canonicalisation and hashing.
 
 ---
 

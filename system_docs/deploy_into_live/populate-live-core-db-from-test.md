@@ -68,8 +68,8 @@ The import should cover the same core snapshot table set used by the R2 core sna
 - `features`
 - `procedures`
 - `networks`
-- `uk_air_sos_networks`
-- `uk_air_sos_network_pollutants`
+- `sos_networks`
+- `sos_network_pollutants`
 - `stations`
 - `station_metadata`
 - `timeseries`

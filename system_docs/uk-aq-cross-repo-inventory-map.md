@@ -14,7 +14,7 @@ Last updated: 2026-04-23
 
 ### Edge Functions (`supabase/functions/*/index.ts`)
 
-- `ingest_uk_air_sos`
+- `ingest_sos`
 - `ingest_openaq`
 - `ingest_breathelondon`
 - `ingest_erg_laqn`
@@ -31,7 +31,7 @@ Last updated: 2026-04-23
 
 ### Ingest Script Entrypoints (`scripts/*/*ingest*.py`)
 
-- `scripts/uk_air_sos/uk_air_sos_ingest.py`
+- `scripts/sos/sos_ingest.py`
 - `scripts/breathelondon/breathelondon_ingest.py`
 - `scripts/erg_laqn/erg_laqn_ingest.py`
 - `scripts/sensorcommunity/sensorcommunity_ingest.py`
@@ -39,7 +39,7 @@ Last updated: 2026-04-23
 
 ### Cloud Run Worker Dirs (ingest side)
 
-- `workers/uk_aq_uk_air_sos_cloud_run/`
+- `workers/uk_aq_sos_cloud_run/`
 - `workers/uk_aq_openaq_cloud_run/`
 - `workers/uk_aq_blondon_communities_cloud_run/`
 - `workers/uk_aq_sensorcommunity_cloud_run/`
@@ -50,7 +50,7 @@ Last updated: 2026-04-23
 - `supabase_edge_deploy.yml`
 - `uk_aq_observs_edge_deploy.yml`
 - `uk_aq_dispatcher_deploy.yml`
-- `uk_aq_uk_air_sos_cloud_run_deploy.yml`
+- `uk_aq_sos_cloud_run_deploy.yml`
 - `uk_aq_openaq_cloud_run_deploy.yml`
 - `uk_aq_blondon_communities_cloud_run_deploy.yml`
 - `uk_aq_scomm_cloud_run_deploy.yml`

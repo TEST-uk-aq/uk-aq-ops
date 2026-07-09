@@ -208,7 +208,7 @@ Avoid older or internal labels such as:
 
 - UK-AIR AURN
 - UK AIR SOS
-- UK-AIR-SOS
+- SOS
 
 The new schema and snapshot format should make the display name explicit so the front end does not need label correction logic.
 

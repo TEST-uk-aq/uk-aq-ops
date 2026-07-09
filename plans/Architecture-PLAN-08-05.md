@@ -29,7 +29,7 @@ R2-only sounds attractive because egress is low, but it makes these harder:
 ## Current Architecture Map
 
 ```text
-Cloud Run ingest workers (uk_air_sos, sensorcommunity, breathelondon, openaq worker path)
+Cloud Run ingest workers (sos, sensorcommunity, breathelondon, openaq worker path)
   -> commit latest state + observations in ingestdb (uk_aq_core)
   -> publish history rows to Pub/Sub (pubsub_only mode)
 
@@ -82,7 +82,7 @@ Website
 
 ### Current Runtime Facts (read-only checks, May 8, 2026 UTC)
 
-- Connectors in `ingestdb`: `uk_air_sos`, `breathelondon`, `openaq`, `sensorcommunity`.
+- Connectors in `ingestdb`: `sos`, `breathelondon`, `openaq`, `sensorcommunity`.
 - `OBSERVS_WRITE_MODE` and connector modes in `.env`: `pubsub_only`.
 - `openaq` connector currently `poll_enabled=false` in `ingestdb` at review time.
 - Row estimates:

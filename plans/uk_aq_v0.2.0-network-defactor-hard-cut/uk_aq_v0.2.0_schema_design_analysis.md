@@ -50,8 +50,8 @@ Current core metadata tables:
 - `uk_aq_core.station_metadata`
 - `uk_aq_core.station_network_memberships`
 - `uk_aq_core.uk_aq_networks`
-- `uk_aq_core.uk_air_sos_networks`
-- `uk_aq_core.uk_air_sos_network_pollutants`
+- `uk_aq_core.sos_networks`
+- `uk_aq_core.sos_network_pollutants`
 - `uk_aq_core.timeseries`
 - `uk_aq_core.reference_values`
 - `uk_aq_core.observations` in ingest DB
@@ -60,13 +60,13 @@ Current core metadata tables:
 
 Current raw/checkpoint tables include:
 
-- `uk_aq_raw.uk_air_sos_site_register`
+- `uk_aq_raw.sos_site_register`
 - `uk_aq_raw.laqn_site_register`
-- `uk_aq_raw.uk_air_sos_station_refs`
+- `uk_aq_raw.sos_station_uk_air_refs`
 - `uk_aq_raw.breathelondon_station_checkpoints`
 - `uk_aq_raw.erg_laqn_station_checkpoints`
-- `uk_aq_raw.uk_air_sos_timeseries_checkpoints`
-- `uk_aq_raw.uk_air_sos_station_checkpoints`
+- `uk_aq_raw.sos_timeseries_checkpoints`
+- `uk_aq_raw.sos_station_checkpoints`
 - `uk_aq_raw.openaq_station_checkpoints`
 - `uk_aq_raw.openaq_timeseries_checkpoints`
 - `uk_aq_raw.error_logs`
@@ -109,7 +109,7 @@ Connectors are currently data-source objects, not networks. That is correct.
 
 Important existing distinctions:
 
-- UK-AIR SOS is one connector, with networks in `uk_air_sos_networks` and `station_network_memberships`
+- UK-AIR SOS is one connector, with networks in `sos_networks` and `station_network_memberships`
 - LAQN uses connector code `erg_laqn`
 - Sensor.Community uses connector code `sensorcommunity`
 - Breathe London currently has a connector and station/timeseries upsert scripts
@@ -1066,7 +1066,7 @@ DB-size impact:
 
 Update ingest code paths:
 
-- `scripts/uk_air_sos/*`
+- `scripts/sos/*`
 - `scripts/breathelondon/*`
 - Breathe London Nodes ingest
 - `scripts/erg_laqn/*`

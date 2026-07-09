@@ -64,8 +64,8 @@ R2 reads and writes already use the shared `workers/shared/r2_sigv4.mjs` retry l
 - `features`
 - `procedures`
 - `networks`
-- `uk_air_sos_networks`
-- `uk_air_sos_network_pollutants`
+- `sos_networks`
+- `sos_network_pollutants`
 - `stations`
 - `station_metadata`
 - `timeseries`

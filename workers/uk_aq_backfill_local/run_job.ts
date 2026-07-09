@@ -124,7 +124,7 @@ type SourceTimeseriesBinding = {
   pollutant_code: SourcePollutantCode;
 };
 
-type UkAirSosSiteTimeseriesRef = {
+type SosSiteTimeseriesRef = {
   site_ref: string;
   uk_air_ref: string | null;
   pollutant_code: SourcePollutantCode;
@@ -149,7 +149,7 @@ type SourceAdapterKind =
   | "breathelondon"
   | "sensorcommunity"
   | "openaq"
-  | "uk_air_sos";
+  | "sos";
 
 type StationRefsLookup = {
   station_refs: Set<string>;
@@ -166,13 +166,13 @@ type SourceObservationRow = {
   source_parameter?: string | null;
 };
 
-type UkAirSosDatapoint = {
+type SosDatapoint = {
   observed_at: string;
   value: number | null;
   status: string | null;
 };
 
-type UkAirSosTimeseriesProcessResult = {
+type SosTimeseriesProcessResult = {
   binding: SourceTimeseriesBinding;
   station_ref: string;
   timeseries_ref: string;
@@ -189,13 +189,13 @@ type UkAirSosTimeseriesProcessResult = {
   error_message: string | null;
 };
 
-type UkAirSosNoDataManifestEntry = {
+type SosNoDataManifestEntry = {
   timeseries_ref: string;
   station_ref: string | null;
   recorded_at_utc: string;
 };
 
-type UkAirSosTimeseriesFetchResult = {
+type SosTimeseriesFetchResult = {
   payload: unknown;
   mirror_reused: boolean;
   mirror_written: boolean;
@@ -1082,72 +1082,72 @@ const BREATHELONDON_SOURCE_SPECIES = Object.freeze([
     pollutant_code: "no2" as SourcePollutantCode,
   },
 ]);
-const UK_AIR_SOS_SOURCE_ENABLED = parseBooleanish(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_SOURCE_ENABLED"),
+const SOS_SOURCE_ENABLED = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_SOURCE_ENABLED"),
   true,
 );
-const UK_AIR_SOS_CONNECTOR_CODE = (
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_CONNECTOR_CODE") || "uk_air_sos"
+const SOS_CONNECTOR_CODE = (
+  Deno.env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_CODE") || "sos"
 ).trim().toLowerCase();
-const UK_AIR_SOS_CONNECTOR_ID_FALLBACK = Number.parseInt(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_CONNECTOR_ID_FALLBACK") || "1",
+const SOS_CONNECTOR_ID_FALLBACK = Number.parseInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") || "1",
   10,
 );
-const UK_AIR_SOS_BASE_URL = (
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_BASE_URL") ||
+const SOS_BASE_URL = (
+  Deno.env.get("UK_AQ_BACKFILL_SOS_BASE_URL") ||
   "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
 ).trim().replace(/\/$/, "");
-const UK_AIR_SOS_INCLUDE_MET_FIELDS = parseBooleanish(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_INCLUDE_MET_FIELDS"),
+const SOS_INCLUDE_MET_FIELDS = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_INCLUDE_MET_FIELDS"),
   true,
 );
-const UK_AIR_SOS_TIMEOUT_MS = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_TIMEOUT_MS"),
+const SOS_TIMEOUT_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_TIMEOUT_MS"),
   60000,
   5000,
   600000,
 );
-const UK_AIR_SOS_FETCH_RETRIES = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_RETRIES"),
+const SOS_FETCH_RETRIES = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_FETCH_RETRIES"),
   3,
   1,
   10,
 );
-const UK_AIR_SOS_RETRY_BASE_MS = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_RETRY_BASE_MS"),
+const SOS_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_RETRY_BASE_MS"),
   1500,
   100,
   30000,
 );
-const UK_AIR_SOS_FETCH_CONCURRENCY = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_FETCH_CONCURRENCY"),
+const SOS_FETCH_CONCURRENCY = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_FETCH_CONCURRENCY"),
   5,
   1,
   20,
 );
-const UK_AIR_SOS_TIMESERIES_RETRY_ROUNDS = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_TIMESERIES_RETRY_ROUNDS"),
+const SOS_TIMESERIES_RETRY_ROUNDS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_TIMESERIES_RETRY_ROUNDS"),
   2,
   0,
   10,
 );
-const UK_AIR_SOS_TIMESERIES_RETRY_BASE_MS = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_UK_AIR_SOS_TIMESERIES_RETRY_BASE_MS"),
+const SOS_TIMESERIES_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_TIMESERIES_RETRY_BASE_MS"),
   5000,
   100,
   60000,
 );
-const UK_AIR_SOS_TIMESERIES_RETRY_CONCURRENCY = Math.max(
+const SOS_TIMESERIES_RETRY_CONCURRENCY = Math.max(
   1,
   Math.min(
-    UK_AIR_SOS_FETCH_CONCURRENCY,
-    Math.floor(UK_AIR_SOS_FETCH_CONCURRENCY / 2) || 1,
+    SOS_FETCH_CONCURRENCY,
+    Math.floor(SOS_FETCH_CONCURRENCY / 2) || 1,
   ),
 );
-const UK_AIR_SOS_RAW_MIRROR_ROOT = optionalEnv(
+const SOS_RAW_MIRROR_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT",
 );
-const UK_AIR_SOS_INTEGRITY_SNAPSHOT_ROOT = optionalEnv(
+const SOS_INTEGRITY_SNAPSHOT_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT",
 );
 const OPENAQ_SOURCE_ENABLED = parseBooleanish(
@@ -6677,19 +6677,19 @@ async function fetchOpenaqSourceLookupForConnector(
   );
 }
 
-async function fetchUkAirSosSourceLookupForConnector(
+async function fetchSosSourceLookupForConnector(
   connectorId: number,
   candidateStationRefs: Set<string>,
 ): Promise<SourceConnectorLookup> {
   return await fetchMetadataSourceLookupForConnector(
     connectorId,
     candidateStationRefs,
-    "uk_air_sos",
+    "sos",
   );
 }
 
-function isUkAirSosMappingValidForDay(
-  mapping: UkAirSosSiteTimeseriesRef,
+function isSosMappingValidForDay(
+  mapping: SosSiteTimeseriesRef,
   dayUtc: string,
 ): boolean {
   if (mapping.valid_from_day_utc && mapping.valid_from_day_utc > dayUtc) {
@@ -6701,26 +6701,26 @@ function isUkAirSosMappingValidForDay(
   return true;
 }
 
-async function fetchUkAirSosSiteTimeseriesRefsForConnector(
+async function fetchSosSiteTimeseriesRefsForConnector(
   connectorId: number,
   candidateTimeseriesIds: number[],
-): Promise<UkAirSosSiteTimeseriesRef[]> {
+): Promise<SosSiteTimeseriesRef[]> {
   if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
     throw new Error(
       "UK-AIR flat-file mapping guard requires SUPABASE_URL and SB_SECRET_KEY",
     );
   }
-  if (connectorId !== UK_AIR_SOS_CONNECTOR_ID_FALLBACK) {
-    logStructured("warning", "uk_air_sos_mapping_guard_connector_id_assumption", {
+  if (connectorId !== SOS_CONNECTOR_ID_FALLBACK) {
+    logStructured("warning", "sos_mapping_guard_connector_id_assumption", {
       connector_id: connectorId,
-      fallback_connector_id: UK_AIR_SOS_CONNECTOR_ID_FALLBACK,
+      fallback_connector_id: SOS_CONNECTOR_ID_FALLBACK,
     });
   }
   if (!candidateTimeseriesIds.length) {
     return [];
   }
 
-  const rows: UkAirSosSiteTimeseriesRef[] = [];
+  const rows: SosSiteTimeseriesRef[] = [];
   for (const idChunk of chunkRows(candidateTimeseriesIds, STATION_ID_PAGE_SIZE)) {
     const query = new URLSearchParams();
     query.set(
@@ -6736,7 +6736,7 @@ async function fetchUkAirSosSiteTimeseriesRefsForConnector(
       {
         method: "GET",
         schema: "uk_aq_raw",
-        table: "uk_air_sos_site_timeseries_refs",
+        table: "sos_station_timeseries_site_refs",
         query,
       },
     );
@@ -6774,23 +6774,23 @@ async function fetchUkAirSosSiteTimeseriesRefsForConnector(
   return rows;
 }
 
-async function assertUkAirSosFlatFileMappingsForBackfill(args: {
+async function assertSosFlatFileMappingsForBackfill(args: {
   connector_id: number;
   day_utc: string;
   bindings: SourceTimeseriesBinding[];
-}): Promise<UkAirSosSiteTimeseriesRef[]> {
+}): Promise<SosSiteTimeseriesRef[]> {
   const candidateIds = sortedUniquePositiveInts(
     args.bindings.map((binding) => binding.timeseries_id),
   );
-  const mappingRows = await fetchUkAirSosSiteTimeseriesRefsForConnector(
+  const mappingRows = await fetchSosSiteTimeseriesRefsForConnector(
     args.connector_id,
     candidateIds,
   );
   const validRows = mappingRows.filter((row) =>
-    isUkAirSosMappingValidForDay(row, args.day_utc)
+    isSosMappingValidForDay(row, args.day_utc)
   );
-  const validByTimeseriesId = new Map<number, UkAirSosSiteTimeseriesRef[]>();
-  const validBySitePollutant = new Map<string, UkAirSosSiteTimeseriesRef[]>();
+  const validByTimeseriesId = new Map<number, SosSiteTimeseriesRef[]>();
+  const validBySitePollutant = new Map<string, SosSiteTimeseriesRef[]>();
 
   for (const row of validRows) {
     const byId = validByTimeseriesId.get(row.timeseries_id) || [];
@@ -6844,7 +6844,7 @@ async function assertUkAirSosFlatFileMappingsForBackfill(args: {
       ambiguous_timeseries_sample: ambiguousByTimeseries.slice(0, 10),
       ambiguous_site_pollutant_sample: ambiguousBySitePollutant.slice(0, 10),
     };
-    logStructured("error", "uk_air_sos_flat_file_mapping_guard_failed", details);
+    logStructured("error", "sos_flat_file_mapping_guard_failed", details);
     throw new Error(
       `UK-AIR flat-file mapping guard failed for day_utc=${args.day_utc} connector_id=${args.connector_id}: ` +
         `missing_timeseries=${missing.length} ambiguous_timeseries=${ambiguousByTimeseries.length} ` +
@@ -6852,7 +6852,7 @@ async function assertUkAirSosFlatFileMappingsForBackfill(args: {
     );
   }
 
-  logStructured("info", "uk_air_sos_flat_file_mapping_guard_ok", {
+  logStructured("info", "sos_flat_file_mapping_guard_ok", {
     day_utc: args.day_utc,
     connector_id: args.connector_id,
     candidate_timeseries_count: candidateIds.length,
@@ -7429,18 +7429,18 @@ async function fetchBytesWithTimeout(args: {
   throw new Error(lastErrorMessage);
 }
 
-function ukAirSosMirrorFilePath(
+function sosMirrorFilePath(
   dayUtc: string,
   timeseriesRef: string,
 ): string | null {
-  if (!IS_LOCAL_RUN || !UK_AIR_SOS_RAW_MIRROR_ROOT) {
+  if (!IS_LOCAL_RUN || !SOS_RAW_MIRROR_ROOT) {
     return null;
   }
   const normalizedDay = parseIsoDayUtc(dayUtc);
   if (!normalizedDay) {
     return null;
   }
-  const root = UK_AIR_SOS_RAW_MIRROR_ROOT.trim();
+  const root = SOS_RAW_MIRROR_ROOT.trim();
   if (!root) {
     return null;
   }
@@ -7451,12 +7451,12 @@ function ukAirSosMirrorFilePath(
   );
 }
 
-const ukAirSosIntegritySnapshotCache = new Map<
+const sosIntegritySnapshotCache = new Map<
   string,
   Map<string, Array<Record<string, unknown>>> | null
 >();
 
-function ukAirSosIntegritySnapshotFilePath(
+function sosIntegritySnapshotFilePath(
   dayUtc: string,
   stationRef: string,
 ): string | null {
@@ -7467,7 +7467,7 @@ function ukAirSosIntegritySnapshotFilePath(
   if (!normalizedDay) {
     return null;
   }
-  const root = (UK_AIR_SOS_INTEGRITY_SNAPSHOT_ROOT || "").trim();
+  const root = (SOS_INTEGRITY_SNAPSHOT_ROOT || "").trim();
   if (!root) {
     return null;
   }
@@ -7480,23 +7480,23 @@ function ukAirSosIntegritySnapshotFilePath(
   );
 }
 
-function readUkAirSosIntegritySnapshotTimeseriesPayload(args: {
+function readSosIntegritySnapshotTimeseriesPayload(args: {
   day_utc: string;
   station_ref: string;
   timeseries_ref: string;
 }): unknown | null {
-  const snapshotPath = ukAirSosIntegritySnapshotFilePath(
+  const snapshotPath = sosIntegritySnapshotFilePath(
     args.day_utc,
     args.station_ref,
   );
   if (!snapshotPath) {
     return null;
   }
-  if (!ukAirSosIntegritySnapshotCache.has(snapshotPath)) {
+  if (!sosIntegritySnapshotCache.has(snapshotPath)) {
     if (!fs.existsSync(snapshotPath)) {
-      ukAirSosIntegritySnapshotCache.set(snapshotPath, null);
+      sosIntegritySnapshotCache.set(snapshotPath, null);
     } else if (fs.statSync(snapshotPath).size <= 0) {
-      ukAirSosIntegritySnapshotCache.set(snapshotPath, null);
+      sosIntegritySnapshotCache.set(snapshotPath, null);
     } else {
       const byTimeseriesRef = new Map<string, Array<Record<string, unknown>>>();
       const text = fs.readFileSync(snapshotPath, "utf8");
@@ -7530,11 +7530,11 @@ function readUkAirSosIntegritySnapshotTimeseriesPayload(args: {
         values.push({ time: observedAt, value, status });
         byTimeseriesRef.set(timeseriesRef, values);
       }
-      ukAirSosIntegritySnapshotCache.set(snapshotPath, byTimeseriesRef);
+      sosIntegritySnapshotCache.set(snapshotPath, byTimeseriesRef);
     }
   }
 
-  const byTimeseriesRef = ukAirSosIntegritySnapshotCache.get(snapshotPath) || null;
+  const byTimeseriesRef = sosIntegritySnapshotCache.get(snapshotPath) || null;
   if (!byTimeseriesRef) {
     return null;
   }
@@ -7542,22 +7542,22 @@ function readUkAirSosIntegritySnapshotTimeseriesPayload(args: {
   return { values };
 }
 
-function ukAirSosNoDataManifestFilePath(dayUtc: string): string | null {
-  if (!IS_LOCAL_RUN || !UK_AIR_SOS_RAW_MIRROR_ROOT) {
+function sosNoDataManifestFilePath(dayUtc: string): string | null {
+  if (!IS_LOCAL_RUN || !SOS_RAW_MIRROR_ROOT) {
     return null;
   }
   const normalizedDay = parseIsoDayUtc(dayUtc);
   if (!normalizedDay) {
     return null;
   }
-  const root = UK_AIR_SOS_RAW_MIRROR_ROOT.trim();
+  const root = SOS_RAW_MIRROR_ROOT.trim();
   if (!root) {
     return null;
   }
   return path.join(root, `day_utc=${normalizedDay}`, "_no_data_timeseries.json");
 }
 
-function isUkAirSosEmptyPayload(payload: unknown): boolean {
+function isSosEmptyPayload(payload: unknown): boolean {
   if (Array.isArray(payload)) {
     return payload.length === 0;
   }
@@ -7574,10 +7574,10 @@ function isUkAirSosEmptyPayload(payload: unknown): boolean {
   return false;
 }
 
-function readUkAirSosNoDataManifest(
+function readSosNoDataManifest(
   dayUtc: string,
-): Map<string, UkAirSosNoDataManifestEntry> {
-  const manifestPath = ukAirSosNoDataManifestFilePath(dayUtc);
+): Map<string, SosNoDataManifestEntry> {
+  const manifestPath = sosNoDataManifestFilePath(dayUtc);
   if (!manifestPath || !fs.existsSync(manifestPath)) {
     return new Map();
   }
@@ -7590,7 +7590,7 @@ function readUkAirSosNoDataManifest(
   const timeseriesEntries = Array.isArray(manifest.timeseries)
     ? manifest.timeseries
     : [];
-  const entries = new Map<string, UkAirSosNoDataManifestEntry>();
+  const entries = new Map<string, SosNoDataManifestEntry>();
   for (const rawEntry of timeseriesEntries) {
     if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
       continue;
@@ -7614,11 +7614,11 @@ function readUkAirSosNoDataManifest(
   return entries;
 }
 
-function writeUkAirSosNoDataManifest(args: {
+function writeSosNoDataManifest(args: {
   day_utc: string;
-  entries: Map<string, UkAirSosNoDataManifestEntry>;
+  entries: Map<string, SosNoDataManifestEntry>;
 }): void {
-  const manifestPath = ukAirSosNoDataManifestFilePath(args.day_utc);
+  const manifestPath = sosNoDataManifestFilePath(args.day_utc);
   if (!manifestPath) {
     return;
   }
@@ -7637,15 +7637,15 @@ function writeUkAirSosNoDataManifest(args: {
   );
 }
 
-async function fetchUkAirSosTimeseriesData(args: {
+async function fetchSosTimeseriesData(args: {
   base_url: string;
   day_utc: string;
   station_ref: string;
   timeseries_ref: string;
   timespan: string;
   known_empty_timeseries_refs?: ReadonlySet<string>;
-}): Promise<UkAirSosTimeseriesFetchResult> {
-  const mirrorPath = ukAirSosMirrorFilePath(
+}): Promise<SosTimeseriesFetchResult> {
+  const mirrorPath = sosMirrorFilePath(
     args.day_utc,
     args.timeseries_ref,
   );
@@ -7666,7 +7666,7 @@ async function fetchUkAirSosTimeseriesData(args: {
     }
   }
 
-  const integritySnapshotPayload = readUkAirSosIntegritySnapshotTimeseriesPayload({
+  const integritySnapshotPayload = readSosIntegritySnapshotTimeseriesPayload({
     day_utc: args.day_utc,
     station_ref: args.station_ref,
     timeseries_ref: args.timeseries_ref,
@@ -7700,11 +7700,11 @@ async function fetchUkAirSosTimeseriesData(args: {
   url.searchParams.set("format", "tvp");
   const payload = await fetchJsonWithTimeout(
     url.toString(),
-    UK_AIR_SOS_TIMEOUT_MS,
-    UK_AIR_SOS_FETCH_RETRIES,
-    UK_AIR_SOS_RETRY_BASE_MS,
+    SOS_TIMEOUT_MS,
+    SOS_FETCH_RETRIES,
+    SOS_RETRY_BASE_MS,
   );
-  const shouldWriteMirror = mirrorPath && shouldWriteUkAirSosMirrorPayload(payload);
+  const shouldWriteMirror = mirrorPath && shouldWriteSosMirrorPayload(payload);
   if (shouldWriteMirror) {
     fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
     fs.writeFileSync(mirrorPath, JSON.stringify(payload), "utf8");
@@ -7718,11 +7718,11 @@ async function fetchUkAirSosTimeseriesData(args: {
   };
 }
 
-function shouldWriteUkAirSosMirrorPayload(payload: unknown): boolean {
-  return !isUkAirSosEmptyPayload(payload);
+function shouldWriteSosMirrorPayload(payload: unknown): boolean {
+  return !isSosEmptyPayload(payload);
 }
 
-function parseUkAirSosTimestamp(value: unknown): string | null {
+function parseSosTimestamp(value: unknown): string | null {
   if (value === null || value === undefined) {
     return null;
   }
@@ -7748,7 +7748,7 @@ function parseUkAirSosTimestamp(value: unknown): string | null {
   return null;
 }
 
-function parseUkAirSosDatapoints(values: unknown): UkAirSosDatapoint[] {
+function parseSosDatapoints(values: unknown): SosDatapoint[] {
   let rows = values;
   if (!Array.isArray(rows) && rows && typeof rows === "object") {
     const nested = (rows as Record<string, unknown>).values ||
@@ -7761,7 +7761,7 @@ function parseUkAirSosDatapoints(values: unknown): UkAirSosDatapoint[] {
     return [];
   }
 
-  const datapoints: UkAirSosDatapoint[] = [];
+  const datapoints: SosDatapoint[] = [];
   for (const row of rows) {
     let observedAtIso: string | null = null;
     let value: number | null = null;
@@ -7771,12 +7771,12 @@ function parseUkAirSosDatapoints(values: unknown): UkAirSosDatapoint[] {
       if (row.length < 2) {
         continue;
       }
-      observedAtIso = parseUkAirSosTimestamp(row[0]);
+      observedAtIso = parseSosTimestamp(row[0]);
       value = toFiniteNumber(row[1]);
       status = row.length > 2 && row[2] != null ? String(row[2]) : null;
     } else if (row && typeof row === "object") {
       const record = row as Record<string, unknown>;
-      observedAtIso = parseUkAirSosTimestamp(
+      observedAtIso = parseSosTimestamp(
         record.time ?? record.timestamp ?? record.t ?? record.dateTime ??
           record.phenomenonTime ?? record.observed_at,
       );
@@ -7803,7 +7803,7 @@ function parseUkAirSosDatapoints(values: unknown): UkAirSosDatapoint[] {
   return datapoints;
 }
 
-async function processUkAirSosTimeseriesBatch(args: {
+async function processSosTimeseriesBatch(args: {
   run_id: string;
   day_utc: string;
   connector_id: number;
@@ -7815,13 +7815,13 @@ async function processUkAirSosTimeseriesBatch(args: {
   day_start_iso: string;
   day_end_iso: string;
   retry_round?: number;
-}): Promise<UkAirSosTimeseriesProcessResult[]> {
+}): Promise<SosTimeseriesProcessResult[]> {
   return await mapConcurrent(
     args.bindings,
     args.concurrency,
-    async (binding): Promise<UkAirSosTimeseriesProcessResult> => {
+    async (binding): Promise<SosTimeseriesProcessResult> => {
       try {
-        const payload = await fetchUkAirSosTimeseriesData({
+        const payload = await fetchSosTimeseriesData({
           base_url: args.base_url,
           day_utc: args.day_utc,
           station_ref: binding.station_ref,
@@ -7829,7 +7829,7 @@ async function processUkAirSosTimeseriesBatch(args: {
           timespan: args.timespan,
           known_empty_timeseries_refs: args.known_empty_timeseries_refs,
         });
-        const datapoints = parseUkAirSosDatapoints(payload.payload);
+        const datapoints = parseSosDatapoints(payload.payload);
         const rows: SourceObservationRow[] = [];
         let skippedOutsideDay = 0;
         let skippedNullValue = 0;
@@ -7856,15 +7856,15 @@ async function processUkAirSosTimeseriesBatch(args: {
           });
         }
 
-        const emptyPayloadConfirmed = isUkAirSosEmptyPayload(payload.payload);
+        const emptyPayloadConfirmed = isSosEmptyPayload(payload.payload);
         logStructured(
           "info",
-          "source_to_r2_uk_air_sos_timeseries_processed",
+          "source_to_r2_sos_timeseries_processed",
           {
             run_id: args.run_id,
             day_utc: args.day_utc,
             connector_id: args.connector_id,
-            source_adapter: "uk_air_sos",
+            source_adapter: "sos",
             station_ref: binding.station_ref,
             timeseries_ref: binding.timeseries_ref,
             timeseries_id: binding.timeseries_id,
@@ -7905,12 +7905,12 @@ async function processUkAirSosTimeseriesBatch(args: {
         const message = error instanceof Error ? error.message : String(error);
         logStructured(
           "warning",
-          "source_to_r2_uk_air_sos_timeseries_failed",
+          "source_to_r2_sos_timeseries_failed",
           {
             run_id: args.run_id,
             day_utc: args.day_utc,
             connector_id: args.connector_id,
-            source_adapter: "uk_air_sos",
+            source_adapter: "sos",
             station_ref: binding.station_ref,
             timeseries_ref: binding.timeseries_ref,
             timeseries_id: binding.timeseries_id,
@@ -12185,32 +12185,32 @@ async function runSourceToAll(
     );
   }
 
-  if (UK_AIR_SOS_SOURCE_ENABLED) {
-    const resolvedUkAirSosConnectorId = await resolveConnectorIdByCode(
-      UK_AIR_SOS_CONNECTOR_CODE,
+  if (SOS_SOURCE_ENABLED) {
+    const resolvedSosConnectorId = await resolveConnectorIdByCode(
+      SOS_CONNECTOR_CODE,
     );
-    let ukAirSosConnectorId: number | null = null;
-    if (resolvedUkAirSosConnectorId) {
-      ukAirSosConnectorId = resolvedUkAirSosConnectorId;
+    let sosConnectorId: number | null = null;
+    if (resolvedSosConnectorId) {
+      sosConnectorId = resolvedSosConnectorId;
     } else if (
-      Number.isInteger(UK_AIR_SOS_CONNECTOR_ID_FALLBACK) &&
-      UK_AIR_SOS_CONNECTOR_ID_FALLBACK > 0
+      Number.isInteger(SOS_CONNECTOR_ID_FALLBACK) &&
+      SOS_CONNECTOR_ID_FALLBACK > 0
     ) {
-      ukAirSosConnectorId = UK_AIR_SOS_CONNECTOR_ID_FALLBACK;
+      sosConnectorId = SOS_CONNECTOR_ID_FALLBACK;
       warnings.push(
-        `Could not resolve connector_code=${UK_AIR_SOS_CONNECTOR_CODE}; using fallback connector_id=${UK_AIR_SOS_CONNECTOR_ID_FALLBACK}.`,
+        `Could not resolve connector_code=${SOS_CONNECTOR_CODE}; using fallback connector_id=${SOS_CONNECTOR_ID_FALLBACK}.`,
       );
     } else {
       warnings.push(
-        `UK-AIR SOS source adapter enabled, but connector_id could not be resolved from connector_code=${UK_AIR_SOS_CONNECTOR_CODE}; skipping UK-AIR SOS source adapter.`,
+        `UK-AIR SOS source adapter enabled, but connector_id could not be resolved from connector_code=${SOS_CONNECTOR_CODE}; skipping UK-AIR SOS source adapter.`,
       );
     }
-    if (ukAirSosConnectorId) {
-      sourceAdapterByConnectorId.set(ukAirSosConnectorId, "uk_air_sos");
+    if (sosConnectorId) {
+      sourceAdapterByConnectorId.set(sosConnectorId, "sos");
     }
   } else {
     warnings.push(
-      "UK-AIR SOS source adapter is disabled by UK_AQ_BACKFILL_UK_AIR_SOS_SOURCE_ENABLED=false.",
+      "UK-AIR SOS source adapter is disabled by UK_AQ_BACKFILL_SOS_SOURCE_ENABLED=false.",
     );
   }
 
@@ -12965,7 +12965,7 @@ async function runSourceToAll(
           sourceCheckpointJson.total_skipped_invalid_value_or_timestamp =
             totalSkippedInvalidValueOrTimestamp;
           openaqFetchErrorCount = locationFetchErrorCount;
-        } else if (sourceAdapter === "uk_air_sos") {
+        } else if (sourceAdapter === "sos") {
           const stationRefsLookup = await fetchStationRefsForConnector(
             connectorId,
           );
@@ -13004,7 +13004,7 @@ async function runSourceToAll(
             continue;
           }
 
-          const lookup = await fetchUkAirSosSourceLookupForConnector(
+          const lookup = await fetchSosSourceLookupForConnector(
             connectorId,
             candidateStationRefs,
           );
@@ -13013,7 +13013,7 @@ async function runSourceToAll(
           )
             .filter((binding) => candidateStationRefs.has(binding.station_ref))
             .filter((binding) =>
-              UK_AIR_SOS_INCLUDE_MET_FIELDS ||
+              SOS_INCLUDE_MET_FIELDS ||
               binding.pollutant_code === "no2" ||
               binding.pollutant_code === "pm25" ||
               binding.pollutant_code === "pm10"
@@ -13123,7 +13123,7 @@ async function runSourceToAll(
           }
 
           const validFlatFileMappings =
-            await assertUkAirSosFlatFileMappingsForBackfill({
+            await assertSosFlatFileMappingsForBackfill({
               connector_id: connectorId,
               day_utc: dayUtc,
               bindings: candidateBindings,
@@ -13132,25 +13132,25 @@ async function runSourceToAll(
           const resolvedServiceUrl = await resolveConnectorServiceUrl(
             connectorId,
           );
-          const sourceBaseUrl = (resolvedServiceUrl || UK_AIR_SOS_BASE_URL)
+          const sourceBaseUrl = (resolvedServiceUrl || SOS_BASE_URL)
             .replace(/\/$/, "");
           const dayStartIso = utcDayStartIso(dayUtc);
           const dayEndIso = utcDayEndIso(dayUtc);
           const timespan = `${dayStartIso}/${dayEndIso}`;
           let knownNoDataTimeseriesEntries =
-            new Map<string, UkAirSosNoDataManifestEntry>();
+            new Map<string, SosNoDataManifestEntry>();
           try {
-            knownNoDataTimeseriesEntries = readUkAirSosNoDataManifest(dayUtc);
+            knownNoDataTimeseriesEntries = readSosNoDataManifest(dayUtc);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             logStructured(
               "warning",
-              "source_to_r2_uk_air_sos_no_data_manifest_read_failed",
+              "source_to_r2_sos_no_data_manifest_read_failed",
               {
                 run_id: runId,
                 day_utc: dayUtc,
                 connector_id: connectorId,
-                source_adapter: "uk_air_sos",
+                source_adapter: "sos",
                 error: message,
               },
             );
@@ -13159,12 +13159,12 @@ async function runSourceToAll(
             knownNoDataTimeseriesEntries.keys(),
           );
 
-          let timeseriesResults = await processUkAirSosTimeseriesBatch({
+          let timeseriesResults = await processSosTimeseriesBatch({
             run_id: runId,
             day_utc: dayUtc,
             connector_id: connectorId,
             bindings: candidateBindings,
-            concurrency: UK_AIR_SOS_FETCH_CONCURRENCY,
+            concurrency: SOS_FETCH_CONCURRENCY,
             base_url: sourceBaseUrl,
             timespan,
             known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
@@ -13174,36 +13174,36 @@ async function runSourceToAll(
           let retryableFailedBindings = timeseriesResults
             .filter((result) =>
               result.error_message &&
-              isRetryableSourceFetchError("uk_air_sos", result.error_message)
+              isRetryableSourceFetchError("sos", result.error_message)
             )
             .map((result) => result.binding);
           for (
             let retryRound = 1;
             retryableFailedBindings.length > 0 &&
-              retryRound <= UK_AIR_SOS_TIMESERIES_RETRY_ROUNDS;
+              retryRound <= SOS_TIMESERIES_RETRY_ROUNDS;
             retryRound += 1
           ) {
-            logStructured("info", "source_to_r2_uk_air_sos_retry_round", {
+            logStructured("info", "source_to_r2_sos_retry_round", {
               run_id: runId,
               day_utc: dayUtc,
               connector_id: connectorId,
-              source_adapter: "uk_air_sos",
+              source_adapter: "sos",
               retry_round: retryRound,
               retry_candidate_count: retryableFailedBindings.length,
-              retry_concurrency: UK_AIR_SOS_TIMESERIES_RETRY_CONCURRENCY,
+              retry_concurrency: SOS_TIMESERIES_RETRY_CONCURRENCY,
             });
             await sleep(
               Math.min(
                 60000,
-                UK_AIR_SOS_TIMESERIES_RETRY_BASE_MS * retryRound,
+                SOS_TIMESERIES_RETRY_BASE_MS * retryRound,
               ),
             );
-            const retriedResults = await processUkAirSosTimeseriesBatch({
+            const retriedResults = await processSosTimeseriesBatch({
               run_id: runId,
               day_utc: dayUtc,
               connector_id: connectorId,
               bindings: retryableFailedBindings,
-              concurrency: UK_AIR_SOS_TIMESERIES_RETRY_CONCURRENCY,
+              concurrency: SOS_TIMESERIES_RETRY_CONCURRENCY,
               base_url: sourceBaseUrl,
               timespan,
               known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
@@ -13223,7 +13223,7 @@ async function runSourceToAll(
             retryableFailedBindings = timeseriesResults
               .filter((result) =>
                 result.error_message &&
-                isRetryableSourceFetchError("uk_air_sos", result.error_message)
+                isRetryableSourceFetchError("sos", result.error_message)
               )
               .map((result) => result.binding);
           }
@@ -13269,7 +13269,7 @@ async function runSourceToAll(
             knownNoDataTimeseriesEntries.size - knownNoDataTimeseriesRefs.size;
           if (noDataManifestWrittenCount > 0) {
             try {
-              writeUkAirSosNoDataManifest({
+              writeSosNoDataManifest({
                 day_utc: dayUtc,
                 entries: knownNoDataTimeseriesEntries,
               });
@@ -13277,12 +13277,12 @@ async function runSourceToAll(
               const message = error instanceof Error ? error.message : String(error);
               logStructured(
                 "warning",
-                "source_to_r2_uk_air_sos_no_data_manifest_write_failed",
+                "source_to_r2_sos_no_data_manifest_write_failed",
                 {
                   run_id: runId,
                   day_utc: dayUtc,
                   connector_id: connectorId,
-                  source_adapter: "uk_air_sos",
+                  source_adapter: "sos",
                   error: message,
                 },
               );
@@ -13291,7 +13291,7 @@ async function runSourceToAll(
 
           if (failedTimeseries.length > 0) {
             throw new Error(
-              `uk_air_sos_timeseries_fetch_failed: ${failedTimeseries.length} timeseries failed: ${
+              `sos_timeseries_fetch_failed: ${failedTimeseries.length} timeseries failed: ${
                 failedTimeseries.slice(0, 5).join(" | ")
               }`,
             );

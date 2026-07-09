@@ -98,10 +98,10 @@ For each `(day_utc, connector_id)`:
 1. Fetch source rows for the requested day.
 2. If `UK_AQ_BACKFILL_TIMESERIES_IDS` is set, pre-filter OpenAQ location/day
    source fetches to only locations mapped to those requested timeseries IDs.
-   For `uk_air_sos`, pre-filter candidate timeseries bindings to only those
+   For `sos`, pre-filter candidate timeseries bindings to only those
    requested IDs before per-timeseries fetch.
-3. For `uk_air_sos`, require a valid AURN flat-file mapping in
-   `uk_aq_raw.uk_air_sos_site_timeseries_refs` before source fetch. Each
+3. For `sos`, require a valid AURN flat-file mapping in
+   `uk_aq_raw.sos_station_timeseries_site_refs` before source fetch. Each
    candidate timeseries must have exactly one valid row for the requested
    `day_utc`, and each `site_ref + pollutant_code + day_utc` must map to only
    one timeseries. Missing or ambiguous mappings fail loudly and no R2 objects
@@ -152,23 +152,23 @@ Metadata-mismatch skips remain skips (no manifest written) — these are configu
 
 - `no_matching_requested_timeseries_ids` — requested IDs don't exist in the connector lookup
 - `no_matching_location_ids_after_timeseries_filter` — requested IDs map to no OpenAQ locations
-- `uk_air_sos_flat_file_mapping_guard_failed` — UK-AIR source-to-R2 has
+- `sos_flat_file_mapping_guard_failed` — UK-AIR source-to-R2 has
   missing or ambiguous `site_ref + pollutant_code + day_utc` mappings in
-  `uk_aq_raw.uk_air_sos_site_timeseries_refs`
+  `uk_aq_raw.sos_station_timeseries_site_refs`
 
 Adapters other than OpenAQ and Sensor.Community keep the original
 skip-on-no-data behaviour; extend per-adapter as needed.
 
 ### UK-AIR observation status
 
-For `uk_air_sos`, source observations preserve the source status when present
+For `sos`, source observations preserve the source status when present
 and write it to observation history parquet as nullable `status`. This is where
 UK-AIR values such as `Ratified` and `Provisional` are carried through to R2.
 Older parquet objects may not have this column; readers treat missing status as
 `null`.
 
 The UK-AIR flat-file mapping guard needs ingest DB access because it reads
-`uk_aq_raw.uk_air_sos_site_timeseries_refs` through PostgREST. Local/manual
+`uk_aq_raw.sos_station_timeseries_site_refs` through PostgREST. Local/manual
 backfill environments therefore need the existing `SUPABASE_URL` and
 `SB_SECRET_KEY` values available before running UK-AIR historical source-to-R2.
 
@@ -328,7 +328,7 @@ Recommended supporting vars in the backfill env file:
   explicit `UK_AQ_R2_HISTORY_DROPBOX_ROOT=<absolute local Dropbox backup root>`
   is still supported.
 - `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT=<absolute local OpenAQ cache root>`
-- `UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT=<absolute local integrity source-cache root>/uk_air_sos`
+- `UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT=<absolute local integrity source-cache root>/sos`
 - `CFLARE_R2_*` / `R2_*` credentials for live write
 
 For `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT`, backfill can reuse either local

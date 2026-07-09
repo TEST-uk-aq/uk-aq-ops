@@ -121,7 +121,7 @@ SCHEDULER_BACKEND_ALLOWED = {
     SCHEDULER_BACKEND_GOOGLE_CLOUD_RUN,
 }
 SCHEDULER_BACKEND_CONNECTOR_ALLOWLIST = {
-    "uk_air_sos",
+    "sos",
     "sensorcommunity",
     "breathelondon",
     "openaq"
