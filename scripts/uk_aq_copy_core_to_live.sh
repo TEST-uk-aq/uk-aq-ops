@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uk_aq_copy_core_to_live.sh
 #
-# Copies uk_aq_core tables (and optionally uk_aq_raw.uk_air_sos_station_refs)
+# Copies uk_aq_core tables (and optionally uk_aq_raw.sos_station_uk_air_refs)
 # from test ingestdb to live ingestdb using psql \copy (CSV).
 #
 # Parses Postgres URLs with Python and passes credentials via PGPASSWORD +
@@ -13,7 +13,7 @@
 #     or LIVE_SUPABASE_DB_URL                (fallback name)
 #
 # Optional flags:
-#   --include-station-refs   also copy uk_aq_raw.uk_air_sos_station_refs
+#   --include-station-refs   also copy uk_aq_raw.sos_station_uk_air_refs
 #   --dry-run                export only, do not import
 #   --skip-sequences         skip identity sequence reset step
 #   -h, --help
@@ -25,7 +25,7 @@ usage() {
 Usage: scripts/uk_aq_copy_core_to_live.sh [options]
 
 Options:
-  --include-station-refs   Also copy uk_aq_raw.uk_air_sos_station_refs
+  --include-station-refs   Also copy uk_aq_raw.sos_station_uk_air_refs
   --dry-run                Export from test only; do not write to live
   --skip-sequences         Skip identity sequence reset after import
   -h, --help               Show this help
@@ -135,8 +135,8 @@ CORE_TABLES=(
   "uk_aq_core.features"
   "uk_aq_core.procedures"
   "uk_aq_core.networks"
-  "uk_aq_core.uk_air_sos_networks"
-  "uk_aq_core.uk_air_sos_network_pollutants"
+  "uk_aq_core.sos_networks"
+  "uk_aq_core.sos_network_pollutants"
   "uk_aq_core.connectors"
   "uk_aq_core.stations"
   "uk_aq_core.station_metadata"
@@ -169,9 +169,9 @@ for table in "${CORE_TABLES[@]}"; do
 done
 
 if [[ "${INCLUDE_STATION_REFS}" -eq 1 ]]; then
-  file="$(csv_path "uk_aq_raw.uk_air_sos_station_refs")"
-  printf "  Exporting %-55s" "uk_aq_raw.uk_air_sos_station_refs..."
-  psql_src -c "\copy (SELECT * FROM uk_aq_raw.uk_air_sos_station_refs) TO STDOUT (FORMAT CSV, HEADER)" \
+  file="$(csv_path "uk_aq_raw.sos_station_uk_air_refs")"
+  printf "  Exporting %-55s" "uk_aq_raw.sos_station_uk_air_refs..."
+  psql_src -c "\copy (SELECT * FROM uk_aq_raw.sos_station_uk_air_refs) TO STDOUT (FORMAT CSV, HEADER)" \
     > "${file}"
   printf " %d rows\n" "$(row_count "${file}")"
 fi
@@ -200,9 +200,9 @@ for table in "${CORE_TABLES[@]}"; do
 done
 
 if [[ "${INCLUDE_STATION_REFS}" -eq 1 ]]; then
-  file="$(csv_path "uk_aq_raw.uk_air_sos_station_refs")"
-  printf "  Importing %-55s" "uk_aq_raw.uk_air_sos_station_refs..."
-  psql_dst -c "\copy uk_aq_raw.uk_air_sos_station_refs FROM STDIN (FORMAT CSV, HEADER)" < "${file}"
+  file="$(csv_path "uk_aq_raw.sos_station_uk_air_refs")"
+  printf "  Importing %-55s" "uk_aq_raw.sos_station_uk_air_refs..."
+  psql_dst -c "\copy uk_aq_raw.sos_station_uk_air_refs FROM STDIN (FORMAT CSV, HEADER)" < "${file}"
   printf " done\n"
 fi
 
@@ -245,8 +245,8 @@ UNION ALL SELECT 'offerings',                     count(*) FROM uk_aq_core.offer
 UNION ALL SELECT 'features',                      count(*) FROM uk_aq_core.features
 UNION ALL SELECT 'procedures',                    count(*) FROM uk_aq_core.procedures
 UNION ALL SELECT 'networks',                     count(*) FROM uk_aq_core.networks
-UNION ALL SELECT 'uk_air_sos_networks',           count(*) FROM uk_aq_core.uk_air_sos_networks
-UNION ALL SELECT 'uk_air_sos_network_pollutants', count(*) FROM uk_aq_core.uk_air_sos_network_pollutants
+UNION ALL SELECT 'sos_networks',           count(*) FROM uk_aq_core.sos_networks
+UNION ALL SELECT 'sos_network_pollutants', count(*) FROM uk_aq_core.sos_network_pollutants
 UNION ALL SELECT 'connectors',                    count(*) FROM uk_aq_core.connectors
 UNION ALL SELECT 'stations',                      count(*) FROM uk_aq_core.stations
 UNION ALL SELECT 'station_metadata',              count(*) FROM uk_aq_core.station_metadata

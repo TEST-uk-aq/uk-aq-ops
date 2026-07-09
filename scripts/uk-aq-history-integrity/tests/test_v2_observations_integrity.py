@@ -180,7 +180,7 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertFalse(any(g.get("connector_id") == 1 for g in result["gaps"]))
         self.assertEqual(result["source_scope"]["connector_ids"], [6])
 
-    def test_source_scoped_uk_air_sos_reports_connector_1_missing_index(self) -> None:
+    def test_source_scoped_sos_reports_connector_1_missing_index(self) -> None:
         day = "2026-06-07"
         self._write_healthy(day=day)
         part1 = self._partition(day=day, connector=1, pollutant="o3")

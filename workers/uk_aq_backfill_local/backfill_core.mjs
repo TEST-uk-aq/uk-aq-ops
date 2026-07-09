@@ -50,7 +50,7 @@ const SOURCE_FETCH_ADAPTERS = new Set([
   "breathelondon",
   "sensorcommunity",
   "openaq",
-  "uk_air_sos",
+  "sos",
 ]);
 const RETRYABLE_SOURCE_FETCH_STATUS_CODES = [
   "http 408",

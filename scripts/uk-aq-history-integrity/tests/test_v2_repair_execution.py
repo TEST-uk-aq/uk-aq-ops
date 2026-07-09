@@ -318,7 +318,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         *,
         day_utc: str = "2026-06-18",
         connector_id: int = 1,
-        source_key: str = MODULE.UK_AIR_SOS_SOURCE_KEY,
+        source_key: str = MODULE.SOS_SOURCE_KEY,
         source_location_id: str = "station-1",
         timeseries_pollutants: dict[int, str] | None = None,
         source_counts: dict[int, int] | None = None,
@@ -397,7 +397,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         conn: sqlite3.Connection,
         *,
         day_utc: str = "2026-06-18",
-        source: str = "uk_air_sos",
+        source: str = "sos",
         connector_ids: list[int] | None = None,
     ) -> dict[str, object]:
         return MODULE.run_v2_observations_integrity_checks(
@@ -518,7 +518,7 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertNotIn("reason=obs_repaired", metrics["planned_aqi_rebuilds"][0])
         self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
 
-    def test_source_uk_air_sos_resolves_to_connector_id_1_from_current_metadata(self) -> None:
+    def test_source_sos_resolves_to_connector_id_1_from_current_metadata(self) -> None:
         conn = MODULE.open_db(str(self.root / "sos-source-scope.sqlite"))
         try:
             conn.execute(
@@ -528,14 +528,14 @@ class V2RepairExecutionTests(unittest.TestCase):
                   connector_id, timeseries_id, is_active
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (MODULE.UK_AIR_SOS_SOURCE_KEY, "station-1", "station-1", 1, 1, 1001, 1),
+                (MODULE.SOS_SOURCE_KEY, "station-1", "station-1", 1, 1, 1001, 1),
             )
             conn.commit()
 
-            allowed, scope = MODULE.resolve_v2_source_scope(conn, "uk_air_sos")
+            allowed, scope = MODULE.resolve_v2_source_scope(conn, "sos")
 
             self.assertEqual(allowed, {1})
-            self.assertEqual(scope, {"source": "uk_air_sos", "connector_ids": [1], "scope": "source"})
+            self.assertEqual(scope, {"source": "sos", "connector_ids": [1], "scope": "source"})
         finally:
             conn.close()
 

@@ -794,7 +794,7 @@ repositories:
   results with `to_regclass(...)`.
 - UK-AIR SOS station listing no longer writes membership rows. The obsolete
   membership backfill and report scripts were removed and replaced with
-  `scripts/uk_air_sos/uk_air_sos_network_assignment_report.py`, which validates
+  `scripts/sos/sos_network_assignment_report.py`, which validates
   `stations.network_id -> networks.id`.
 - The Dropbox station export and network summary use the canonical relationship.
   Each exported station now carries scalar `network_id`, `network_code`, and
@@ -938,12 +938,12 @@ merely to serve the website.
 - `supabase/functions/uk_aq_pcon_hex/index.ts`
 - new `supabase/functions/uk_aq_public_networks/index.ts`
 - `.github/workflows/supabase_edge_deploy.yml`
-- `scripts/uk_air_sos/uk_air_sos_list_stations.py`
-- remove or replace `scripts/uk_air_sos/uk_air_sos_membership_report.py`
+- `scripts/sos/sos_list_stations.py`
+- remove or replace `scripts/sos/sos_membership_report.py`
 - remove `scripts/uk_aq_backfill_station_memberships.py`
 - `scripts/uk_aq_export_stations_dropbox.py`
 - `system_docs/uk_aq_edge_functions.md`
-- `system_docs/uk_air_sos_network_memberships.md`
+- `system_docs/sos_network_memberships.md`
 - other current system docs that describe either legacy table
 
 The Breathe London Nodes and UK-AIR SOS Cloud Run deployment workflows do not

@@ -61,16 +61,16 @@ def patched_env(values: dict[str, str]):
 
 
 class PreflightTests(unittest.TestCase):
-    def test_parse_args_accepts_uk_air_sos_source(self) -> None:
+    def test_parse_args_accepts_sos_source(self) -> None:
         parsed = MODULE.parse_args(
-            ["--env", "CIC-Test", "--source", "uk_air_sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
+            ["--env", "CIC-Test", "--source", "sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
         )
-        self.assertEqual(parsed.source, "uk_air_sos")
+        self.assertEqual(parsed.source, "sos")
 
-    def test_parse_args_rejects_hyphenated_uk_air_sos_source(self) -> None:
+    def test_parse_args_rejects_hyphenated_sos_source(self) -> None:
         with self.assertRaises(SystemExit):
             MODULE.parse_args(
-                ["--env", "CIC-Test", "--source", "uk-air-sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
+                ["--env", "CIC-Test", "--source", "sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
             )
 
     def _base_env(self, root: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -255,13 +255,13 @@ class PreflightTests(unittest.TestCase):
             env, os_env = self._base_env(root)
             os_env["UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_ENABLED"] = "true"
             os_env["UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_STRICT"] = "true"
-            args = make_args(source="uk_air_sos", profile="manual", from_day="2026-05-01", to_day="2026-05-01")
+            args = make_args(source="sos", profile="manual", from_day="2026-05-01", to_day="2026-05-01")
             with patched_env(os_env):
                 errors, _, summary = MODULE.collect_preflight_errors(args, env)
             self.assertEqual(errors, [])
             self.assertEqual(summary["env"], "CIC-Test")
             self.assertEqual(summary["profile"], "manual")
-            self.assertEqual(summary["source"], "uk_air_sos")
+            self.assertEqual(summary["source"], "sos")
             self.assertTrue(summary["daily_task_health_enabled"])
             self.assertTrue(summary["daily_task_health_strict"])
 

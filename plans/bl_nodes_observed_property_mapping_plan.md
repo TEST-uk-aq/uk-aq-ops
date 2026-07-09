@@ -420,7 +420,7 @@ was rolled back after the queries.
 | `blondon_communities` | 408 | 0 | 0 |
 | `openaq` | 2,833 | 0 | 0 |
 | `sensorcommunity` | 1,119 | 0 | 0 |
-| `uk_air_sos` | 1,132 | 0 | 0 |
+| `sos` | 1,132 | 0 | 0 |
 
 BL Nodes detail:
 
@@ -998,7 +998,7 @@ Required deployment steps after committing/pushing:
 
 - `.github/workflows/uk_aq_blondon_communities_cloud_run_deploy.yml`;
 - `.github/workflows/uk_aq_openaq_cloud_run_deploy.yml`;
-- `.github/workflows/uk_aq_uk_air_sos_cloud_run_deploy.yml`.
+- `.github/workflows/uk_aq_sos_cloud_run_deploy.yml`.
 
 No dedicated Sensor.Community or ERG/LAQN deploy workflow currently exists in
 the ingest repo, so their active deployment path must be identified before

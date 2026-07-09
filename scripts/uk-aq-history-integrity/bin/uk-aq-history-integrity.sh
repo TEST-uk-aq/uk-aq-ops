@@ -32,8 +32,8 @@ Required:
 
 Forwarded options:
   --profile daily|weekly|monthly|manual   Run profile (default: manual).
-  --source openaq|sensorcommunity|uk_air_sos|all
-                                           Source filter (includes uk_air_sos station/day source checks).
+  --source openaq|sensorcommunity|sos|all
+                                           Source filter (includes sos station/day source checks).
   --from-day YYYY-MM-DD                   Manual lower bound.
   --to-day YYYY-MM-DD                     Manual upper bound.
   --history-version v1|v2|both            R2 history layout version to check.

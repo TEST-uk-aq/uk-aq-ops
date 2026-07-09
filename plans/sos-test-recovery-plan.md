@@ -2,9 +2,9 @@
 
 ## 1. Summary
 
-The **LIVE** UK-AIR-SOS system recovered quickly after the SOS gateway outage, but the **TEST** system has not recovered headline freshness for PM2.5, PM10, and NO2.
+The **LIVE** SOS system recovered quickly after the SOS gateway outage, but the **TEST** system has not recovered headline freshness for PM2.5, PM10, and NO2.
 
-The confusing part is that TEST Cloud Run / dispatcher logs show successful SOS runs and recent `last observed` timestamps, but the dashboard freshness SQL still shows UK-AIR-SOS PM2.5 as stale.
+The confusing part is that TEST Cloud Run / dispatcher logs show successful SOS runs and recent `last observed` timestamps, but the dashboard freshness SQL still shows SOS PM2.5 as stale.
 
 The current evidence points to a **mixed-pollutant station-level scheduling issue**:
 
@@ -22,11 +22,11 @@ In short:
 
 ### 2.1 Freshness SQL result for TEST
 
-For UK-AIR-SOS PM2.5:
+For SOS PM2.5:
 
 ```json
 {
-  "connector_code": "uk_air_sos",
+  "connector_code": "sos",
   "source": "last_value_at",
   "stations_with_pm25": 148,
   "stations_0_3_hours": 0,
@@ -41,7 +41,7 @@ But the same SQL using real observations showed:
 
 ```json
 {
-  "connector_code": "uk_air_sos",
+  "connector_code": "sos",
   "source": "observed_at",
   "stations_with_pm25": 148,
   "stations_0_3_hours": 0,
@@ -115,7 +115,7 @@ This is another sign that summary fields and station-level freshness are not saf
 
 ## 3. Likely Root Cause
 
-The likely root cause is that UK-AIR-SOS scheduling/checkpointing is **station-level**, while SOS data freshness is effectively **timeseries/pollutant-level**.
+The likely root cause is that SOS scheduling/checkpointing is **station-level**, while SOS data freshness is effectively **timeseries/pollutant-level**.
 
 A station can provide many pollutants. If one pollutant updates, the station checkpoint may be advanced. That can incorrectly make the scheduler believe the station has recovered, even if PM2.5, PM10, or NO2 remain stale.
 
@@ -207,7 +207,7 @@ Example SQL:
 with connector as (
   select id as connector_id
   from uk_aq_core.connectors
-  where connector_code = 'uk_air_sos'
+  where connector_code = 'sos'
   limit 1
 ),
 target_station_freshness as (
@@ -258,11 +258,11 @@ numbered as (
   select
     sc.station_id,
     row_number() over (order by sc.station_id) as rn
-  from uk_aq_raw.uk_air_sos_station_checkpoints sc
+  from uk_aq_raw.sos_station_checkpoints sc
   join target_stations t
     on t.station_id = sc.station_id
 )
-update uk_aq_raw.uk_air_sos_station_checkpoints sc
+update uk_aq_raw.sos_station_checkpoints sc
 set
   next_due_at = now() + ((numbered.rn - 1) / 25) * interval '5 minutes',
   last_polled_at = null,
@@ -307,7 +307,7 @@ set
   poll_enabled = true,
   poll_timeseries_batch_size = 25,
   updated_at = now()
-where connector_code = 'uk_air_sos';
+where connector_code = 'sos';
 ```
 
 ---
@@ -345,7 +345,7 @@ with latest as (
     on ts.id = o.timeseries_id
   join uk_aq_core.connectors c
     on c.id = ts.connector_id
-  where c.connector_code = 'uk_air_sos'
+  where c.connector_code = 'sos'
     and o.value is not null
   order by o.timeseries_id, o.observed_at desc
 )
@@ -357,7 +357,7 @@ set
 from latest
 where latest.timeseries_id = ts.id
   and ts.connector_id = (
-    select id from uk_aq_core.connectors where connector_code = 'uk_air_sos' limit 1
+    select id from uk_aq_core.connectors where connector_code = 'sos' limit 1
   );
 ```
 
@@ -559,7 +559,7 @@ with sos as (
     on c.id = ts.connector_id
   left join uk_aq_core.phenomena p
     on p.id = ts.phenomenon_id
-  where c.connector_code = 'uk_air_sos'
+  where c.connector_code = 'sos'
     and ts.station_id is not null
 ),
 latest_obs as (
@@ -605,7 +605,7 @@ with sos as (
     on c.id = ts.connector_id
   left join uk_aq_core.phenomena p
     on p.id = ts.phenomenon_id
-  where c.connector_code = 'uk_air_sos'
+  where c.connector_code = 'sos'
     and ts.station_id is not null
 ),
 latest_obs as (
@@ -651,16 +651,16 @@ You are working in the UK-AQ ingest repo at:
 
 Context:
 
-We have a UK-AIR-SOS connector that runs in Google Cloud Run and uses station-level checkpoints, likely in a table named something like:
+We have a SOS connector that runs in Google Cloud Run and uses station-level checkpoints, likely in a table named something like:
 
-uk_aq_raw.uk_air_sos_station_checkpoints
+uk_aq_raw.sos_station_checkpoints
 
 A recent SOS gateway outage happened. LIVE recovered quickly, but TEST did not recover PM2.5 / PM10 / NO2 freshness.
 
 Important observed behaviour from TEST:
 
 1. Dispatcher/Cloud Run logs show successful SOS runs and recent `last observed` timestamps.
-2. But dashboard freshness for UK-AIR-SOS PM2.5 remains stale.
+2. But dashboard freshness for SOS PM2.5 remains stale.
 3. SQL using real observations shows:
    - PM2.5 observed_24h = 0
    - PM10 observed_24h = 0
@@ -737,4 +737,4 @@ The most likely durable fix is either:
 - **station + pollutant-group checkpoints**, if you want a pragmatic solution, or
 - **timeseries-level checkpoints**, if you want the most correct model.
 
-The current station-level checkpoint model is too blunt for UK-AIR-SOS because one fresh pollutant can hide other stale pollutants at the same station.
+The current station-level checkpoint model is too blunt for SOS because one fresh pollutant can hide other stale pollutants at the same station.

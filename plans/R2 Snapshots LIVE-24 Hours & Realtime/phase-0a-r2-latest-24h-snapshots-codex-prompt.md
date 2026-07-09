@@ -31,7 +31,7 @@ Important current facts:
 - All 4 active network ingest workers are in `pubsub_only` mode.
 - Do not include `erg_laqn` as an active/current ingest network.
 - Active network paths are expected to be:
-  - `uk_air_sos`
+  - `sos`
   - `breathelondon`
   - `openaq`
   - `sensorcommunity`

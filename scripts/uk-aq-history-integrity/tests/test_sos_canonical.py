@@ -23,12 +23,12 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-class UkAirSosCanonicalTests(unittest.TestCase):
+class SosCanonicalTests(unittest.TestCase):
     def test_source_file_key_and_cache_path_are_deterministic(self) -> None:
-        key = MODULE._uk_air_sos_source_file_key("AB/123", MODULE.dt.date(2026, 5, 11))
-        self.assertEqual(key, "uk_air_sos:station_ref=AB/123:day_utc=2026-05-11")
+        key = MODULE._sos_source_file_key("AB/123", MODULE.dt.date(2026, 5, 11))
+        self.assertEqual(key, "sos:station_ref=AB/123:day_utc=2026-05-11")
 
-        cache_path = MODULE._uk_air_sos_cache_path(
+        cache_path = MODULE._sos_cache_path(
             Path("/tmp/cache"),
             "AB/123",
             MODULE.dt.date(2026, 5, 11),
@@ -67,13 +67,13 @@ class UkAirSosCanonicalTests(unittest.TestCase):
             {"timeseries_id": 9, "timeseries_ref": "ts-b"},
             {"timeseries_id": 4, "timeseries_ref": "ts-a"},
         ]
-        first = MODULE.build_uk_air_sos_canonical_snapshot(
+        first = MODULE.build_sos_canonical_snapshot(
             station_ref="station-1",
             day_utc="2026-05-11",
             timeseries_bindings=bindings,
             fetcher=fake_fetcher,
         )
-        second = MODULE.build_uk_air_sos_canonical_snapshot(
+        second = MODULE.build_sos_canonical_snapshot(
             station_ref="station-1",
             day_utc="2026-05-11",
             timeseries_bindings=list(reversed(bindings)),
@@ -109,7 +109,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 "error": None,
             }
 
-        result = MODULE.build_uk_air_sos_canonical_snapshot(
+        result = MODULE.build_sos_canonical_snapshot(
             station_ref="station-1",
             day_utc="2026-05-11",
             timeseries_bindings=[{"timeseries_id": 101, "timeseries_ref": "ts-101"}],
@@ -126,7 +126,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
         def fake_fetcher(base_url: str, day_utc: str, timeseries_ref: str, timespan: str, timeout_seconds: int):
             return {"status": "ok", "payload": {"values": []}, "error": None}
 
-        result = MODULE.build_uk_air_sos_canonical_snapshot(
+        result = MODULE.build_sos_canonical_snapshot(
             station_ref="station-1",
             day_utc="2026-05-11",
             timeseries_bindings=[{"timeseries_id": 1, "timeseries_ref": "ts-1"}],
@@ -148,7 +148,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 "error": "timeout",
             }
 
-        result = MODULE.build_uk_air_sos_canonical_snapshot(
+        result = MODULE.build_sos_canonical_snapshot(
             station_ref="station-1",
             day_utc="2026-05-11",
             timeseries_bindings=[{"timeseries_id": 1, "timeseries_ref": "ts-1"}],
@@ -168,7 +168,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
         conn = self._new_conn()
         conn.execute(
             "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
-            (6, "uk_air_sos", "UK-AIR SOS", "UK-AIR SOS", None),
+            (6, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
         )
         conn.execute(
             "INSERT INTO core_timeseries_snapshot (id, station_id, connector_id, timeseries_ref, label, phenomenon_id, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -184,10 +184,10 @@ class UkAirSosCanonicalTests(unittest.TestCase):
             "first_seen_files": [{"day": "2026-05-11", "timeseries_ids": [101]}],
             "changed_files": [{"day": "2026-05-11", "timeseries_ids": [101, 102]}],
         }
-        targets = MODULE._collect_uk_air_sos_source_change_targets(
+        targets = MODULE._collect_sos_source_change_targets(
             conn,
-            source_filter="uk_air_sos",
-            uk_air_sos_metrics=metrics,
+            source_filter="sos",
+            sos_metrics=metrics,
         )
         self.assertEqual(targets, {("2026-05-11", 6): [101, 102]})
 
@@ -209,7 +209,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
         conn = self._new_conn()
         conn.execute(
             "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
-            (6, "uk_air_sos", "UK-AIR SOS", "UK-AIR SOS", None),
+            (6, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
         )
         conn.commit()
 
@@ -220,8 +220,8 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 env_name="CIC-Test",
                 run_compact="20260518T000000Z",
                 env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
-                source_filter="uk_air_sos",
-                uk_air_sos_metrics={
+                source_filter="sos",
+                sos_metrics={
                     "first_seen_files": [{"day": "2026-05-11", "timeseries_ids": [101]}],
                     "changed_files": [],
                 },
@@ -241,7 +241,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
         conn = self._new_conn()
         conn.execute(
             "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
-            (6, "uk_air_sos", "UK-AIR SOS", "UK-AIR SOS", None),
+            (6, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
         )
         conn.commit()
 
@@ -252,8 +252,8 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 env_name="CIC-Test",
                 run_compact="20260518T000000Z",
                 env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
-                source_filter="uk_air_sos",
-                uk_air_sos_metrics={
+                source_filter="sos",
+                sos_metrics={
                     "not_found": 1,
                     "changed_files": [],
                 },
@@ -273,7 +273,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
         conn = self._new_conn()
         conn.execute(
             "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
-            (6, "uk_air_sos", "UK-AIR SOS", "UK-AIR SOS", None),
+            (6, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
         )
         conn.execute(
             "INSERT INTO core_timeseries_snapshot (id, station_id, connector_id, timeseries_ref, label, phenomenon_id, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -308,8 +308,8 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 env_name="CIC-Test",
                 run_compact="20260518T000000Z",
                 env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
-                source_filter="uk_air_sos",
-                uk_air_sos_metrics={
+                source_filter="sos",
+                sos_metrics={
                     "changed_files": [{"day": "2026-05-11", "timeseries_ids": [102, 103]}],
                 },
                 dry_run=True,
@@ -334,16 +334,16 @@ class UkAirSosCanonicalTests(unittest.TestCase):
 
     def test_no_data_baselines_zero_counts(self) -> None:
         conn = self._new_conn()
-        original = MODULE.build_uk_air_sos_canonical_snapshot
+        original = MODULE.build_sos_canonical_snapshot
         try:
-            MODULE.build_uk_air_sos_canonical_snapshot = lambda **kwargs: {
-                "status": MODULE.UK_AIR_SOS_STATUS_NO_DATA,
+            MODULE.build_sos_canonical_snapshot = lambda **kwargs: {
+                "status": MODULE.SOS_STATUS_NO_DATA,
                 "row_count": 0,
                 "rows": [],
                 "ndjson_bytes": b"",
                 "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             }
-            result = MODULE._check_one_uk_air_sos_station_day(
+            result = MODULE._check_one_sos_station_day(
                 conn=conn,
                 env_name="CIC-Test",
                 base_url="https://example.test",
@@ -356,35 +356,35 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 log=logging.getLogger("test-no-data"),
             )
         finally:
-            MODULE.build_uk_air_sos_canonical_snapshot = original
+            MODULE.build_sos_canonical_snapshot = original
 
-        self.assertEqual(result["snapshot_status"], MODULE.UK_AIR_SOS_STATUS_NO_DATA)
+        self.assertEqual(result["snapshot_status"], MODULE.SOS_STATUS_NO_DATA)
         self.assertEqual(result["outcome"], "first_seen")
         state = conn.execute(
             "SELECT exists_remote, last_status FROM source_file_state WHERE source_file_key = ?",
-            ("uk_air_sos:station_ref=station-1:day_utc=2026-05-11",),
+            ("sos:station_ref=station-1:day_utc=2026-05-11",),
         ).fetchone()
         self.assertEqual(state, (1, "first_seen"))
         row = conn.execute(
             "SELECT COUNT(*) FROM source_file_timeseries_counts WHERE source_file_key = ?",
-            ("uk_air_sos:station_ref=station-1:day_utc=2026-05-11",),
+            ("sos:station_ref=station-1:day_utc=2026-05-11",),
         ).fetchone()
         self.assertEqual(int(row[0]), 0)
 
     def test_no_data_snapshot_is_not_cached_even_when_keep_policy_all(self) -> None:
         conn = self._new_conn()
-        original = MODULE.build_uk_air_sos_canonical_snapshot
+        original = MODULE.build_sos_canonical_snapshot
         with tempfile.TemporaryDirectory() as tmp:
             cache_root = Path(tmp)
             try:
-                MODULE.build_uk_air_sos_canonical_snapshot = lambda **kwargs: {
-                    "status": MODULE.UK_AIR_SOS_STATUS_NO_DATA,
+                MODULE.build_sos_canonical_snapshot = lambda **kwargs: {
+                    "status": MODULE.SOS_STATUS_NO_DATA,
                     "row_count": 0,
                     "rows": [],
                     "ndjson_bytes": b"",
                     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 }
-                result = MODULE._check_one_uk_air_sos_station_day(
+                result = MODULE._check_one_sos_station_day(
                     conn=conn,
                     env_name="CIC-Test",
                     base_url="https://example.test",
@@ -397,27 +397,27 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                     log=logging.getLogger("test-no-data-no-cache"),
                 )
             finally:
-                MODULE.build_uk_air_sos_canonical_snapshot = original
+                MODULE.build_sos_canonical_snapshot = original
 
-            cache_path = MODULE._uk_air_sos_cache_path(
+            cache_path = MODULE._sos_cache_path(
                 cache_root,
                 "station-1",
                 MODULE.dt.date(2026, 5, 11),
             )
-            self.assertEqual(result["snapshot_status"], MODULE.UK_AIR_SOS_STATUS_NO_DATA)
+            self.assertEqual(result["snapshot_status"], MODULE.SOS_STATUS_NO_DATA)
             self.assertFalse(cache_path.exists())
             state = conn.execute(
                 "SELECT exists_remote, content_length, local_cached_path, last_status FROM source_file_state WHERE source_file_key = ?",
-                ("uk_air_sos:station_ref=station-1:day_utc=2026-05-11",),
+                ("sos:station_ref=station-1:day_utc=2026-05-11",),
             ).fetchone()
             self.assertEqual(state, (1, 0, None, "first_seen"))
 
     def test_temporary_error_does_not_overwrite_previous_baseline(self) -> None:
         conn = self._new_conn()
-        original = MODULE.build_uk_air_sos_canonical_snapshot
+        original = MODULE.build_sos_canonical_snapshot
         try:
-            MODULE.build_uk_air_sos_canonical_snapshot = lambda **kwargs: {
-                "status": MODULE.UK_AIR_SOS_STATUS_OK,
+            MODULE.build_sos_canonical_snapshot = lambda **kwargs: {
+                "status": MODULE.SOS_STATUS_OK,
                 "row_count": 1,
                 "rows": [{
                     "timeseries_id": 101,
@@ -427,7 +427,7 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 "ndjson_bytes": b'{"timeseries_id":101}\n',
                 "sha256": "sha-ok",
             }
-            MODULE._check_one_uk_air_sos_station_day(
+            MODULE._check_one_sos_station_day(
                 conn=conn,
                 env_name="CIC-Test",
                 base_url="https://example.test",
@@ -439,15 +439,15 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 not_found_cooldown_seconds=0,
                 log=logging.getLogger("test-temp-error-initial"),
             )
-            MODULE.build_uk_air_sos_canonical_snapshot = lambda **kwargs: {
-                "status": MODULE.UK_AIR_SOS_STATUS_TEMP_ERROR,
+            MODULE.build_sos_canonical_snapshot = lambda **kwargs: {
+                "status": MODULE.SOS_STATUS_TEMP_ERROR,
                 "row_count": 0,
                 "rows": [],
                 "ndjson_bytes": b"",
                 "sha256": None,
                 "error": "timeout",
             }
-            result = MODULE._check_one_uk_air_sos_station_day(
+            result = MODULE._check_one_sos_station_day(
                 conn=conn,
                 env_name="CIC-Test",
                 base_url="https://example.test",
@@ -460,28 +460,28 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 log=logging.getLogger("test-temp-error-second"),
             )
         finally:
-            MODULE.build_uk_air_sos_canonical_snapshot = original
+            MODULE.build_sos_canonical_snapshot = original
 
         self.assertEqual(result["outcome"], "temporary_error")
         state = conn.execute(
             "SELECT sha256_uncompressed, last_status FROM source_file_state WHERE source_file_key = ?",
-            ("uk_air_sos:station_ref=station-1:day_utc=2026-05-11",),
+            ("sos:station_ref=station-1:day_utc=2026-05-11",),
         ).fetchone()
         self.assertEqual(state, ("sha-ok", "temporary_error"))
 
     def test_not_found_suppression_skips_refetch_with_cooldown(self) -> None:
         conn = self._new_conn()
-        original = MODULE.build_uk_air_sos_canonical_snapshot
+        original = MODULE.build_sos_canonical_snapshot
         try:
-            MODULE.build_uk_air_sos_canonical_snapshot = lambda **kwargs: {
-                "status": MODULE.UK_AIR_SOS_STATUS_NOT_FOUND,
+            MODULE.build_sos_canonical_snapshot = lambda **kwargs: {
+                "status": MODULE.SOS_STATUS_NOT_FOUND,
                 "row_count": 0,
                 "rows": [],
                 "ndjson_bytes": b"",
                 "sha256": None,
                 "error": "HTTP 404",
             }
-            first = MODULE._check_one_uk_air_sos_station_day(
+            first = MODULE._check_one_sos_station_day(
                 conn=conn,
                 env_name="CIC-Test",
                 base_url="https://example.test",
@@ -498,8 +498,8 @@ class UkAirSosCanonicalTests(unittest.TestCase):
             def _should_not_fetch_again(**kwargs):
                 raise AssertionError("cooldown suppression should skip second fetch")
 
-            MODULE.build_uk_air_sos_canonical_snapshot = _should_not_fetch_again
-            second = MODULE._check_one_uk_air_sos_station_day(
+            MODULE.build_sos_canonical_snapshot = _should_not_fetch_again
+            second = MODULE._check_one_sos_station_day(
                 conn=conn,
                 env_name="CIC-Test",
                 base_url="https://example.test",
@@ -512,10 +512,10 @@ class UkAirSosCanonicalTests(unittest.TestCase):
                 log=logging.getLogger("test-not-found-second"),
             )
         finally:
-            MODULE.build_uk_air_sos_canonical_snapshot = original
+            MODULE.build_sos_canonical_snapshot = original
 
         self.assertEqual(second["outcome"], "not_found_suppressed")
-        self.assertEqual(second["snapshot_status"], MODULE.UK_AIR_SOS_STATUS_NOT_FOUND)
+        self.assertEqual(second["snapshot_status"], MODULE.SOS_STATUS_NOT_FOUND)
 
 
 if __name__ == "__main__":
