@@ -1,0 +1,47 @@
+# Canonical job configuration for the ops Cloudflare cron scheduler.
+
+config_version = 1
+scheduler_name = "uk-aq-cron-scheduler-ops"
+
+[jobs.uk_aq_r2_core_snapshot]
+enabled = true
+cron_expr = "15 4 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_r2_core_snapshot.yml"
+github_ref = "main"
+dry_run = true
+notes = "R2 core snapshot"
+
+[jobs.uk_aq_r2_history_dropbox_backup]
+enabled = true
+cron_expr = "35 4 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
+github_ref = "main"
+dry_run = true
+notes = "R2 history Dropbox backup"
+
+[jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck]
+enabled = true
+cron_expr = "0 22 * * SUN"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
+github_ref = "main"
+dry_run = true
+notes = "Weekly forced prune recheck"
+
+[jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck.github_inputs]
+force_prune_recheck = "true"
+
+[jobs.uk_aq_dropbox_prune_raw]
+enabled = true
+cron_expr = "49 5 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_dropbox_prune_raw.yml"
+github_ref = "main"
+dry_run = true
+notes = "Dropbox raw-data pruning"
