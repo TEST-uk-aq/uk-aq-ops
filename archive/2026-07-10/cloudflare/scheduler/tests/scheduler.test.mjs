@@ -214,8 +214,8 @@ test("first claim succeeds and an identical due slot is not dispatched twice", a
   };
 
   try {
-    const windowStart = Date.parse("2026-07-10T04:13:30Z");
-    const windowEnd = Date.parse("2026-07-10T04:14:30Z");
+    const windowStart = Date.parse("2026-07-10T04:14:30Z");
+    const windowEnd = Date.parse("2026-07-10T04:15:30Z");
 
     const first = await dispatchDueJobsForWindow(
       store,

@@ -2,7 +2,6 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { createClient } from "@supabase/supabase-js";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
-import { validateRunAuth } from "./run_auth.mjs";
 
 const RPC_SCHEMA = "uk_aq_public";
 const RPC_ENSURE_PARTITIONS = "uk_aq_rpc_observs_ensure_daily_partitions";
@@ -13,6 +12,8 @@ const RPC_DROP_PARTITION = "uk_aq_rpc_observs_drop_partition";
 const RPC_DAY_HAS_ROWS = "uk_aq_rpc_observs_day_has_rows";
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
 const RPC_DAY_COUNT_DELETE = "uk_aq_rpc_obs_aqidb_day_count_delete";
+const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
+
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
@@ -45,6 +46,20 @@ function logStructured(severity, event, details = {}) {
     return;
   }
   console.log(line);
+}
+
+function validateUpstreamAuth(req) {
+  const expected = String(process.env.UK_AQ_EDGE_UPSTREAM_SECRET || "").trim();
+  if (!expected) {
+    return { ok: false, status: 500, error: "Missing UK_AQ_EDGE_UPSTREAM_SECRET." };
+  }
+
+  const supplied = String(req.headers[UPSTREAM_AUTH_HEADER] || "").trim();
+  if (supplied !== expected) {
+    return { ok: false, status: 403, error: "Forbidden." };
+  }
+
+  return { ok: true };
 }
 
 function parseBoolean(raw, fallback) {
@@ -1189,9 +1204,9 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const runAuth = validateRunAuth(req);
-    if (!runAuth.ok) {
-      jsonResponse(res, runAuth.status, { error: runAuth.error });
+    const upstreamAuth = validateUpstreamAuth(req);
+    if (!upstreamAuth.ok) {
+      jsonResponse(res, upstreamAuth.status, { error: upstreamAuth.error });
       return;
     }
 

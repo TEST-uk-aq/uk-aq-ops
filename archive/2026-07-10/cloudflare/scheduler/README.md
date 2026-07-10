@@ -27,21 +27,11 @@ This Worker runs once per minute and reads its schedule entirely from D1.
 
 - `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
 
-## Cloud Run dispatch secret
+## Optional future secret
 
 - `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`
 
-The Worker sends this secret as `x-uk-aq-dispatch-secret`. Install the same value
-on each target Cloud Run service; never put it in `jobs.toml`, D1 headers, or D1
-request bodies.
-
-## Deployment-managed Cloud Run URLs
-
-Cloud Run service URLs are normally stable across revision deployments. Jobs that
-set `cloud_run_url_managed_by_deploy = true` allow their service deployment
-workflow to reconcile the current `${status.url}/run` value directly into D1.
-Normal `jobs.toml` syncs preserve that runtime-owned field while continuing to own
-the schedule, method, body, enabled state, and dry-run state.
+The Cloud Run secret is not required for the initial GitHub workflow migration.
 
 ## Local checks
 
@@ -66,15 +56,6 @@ python3 -m unittest discover -s tests -p 'test*.py'
 6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT` on the Worker.
 7. Deploy the Worker.
 8. Verify one-minute `scheduler_runs` rows and dry-run dispatch records.
-
-Install or rotate the Cloud Run dispatch secret on the Worker:
-
-```bash
-cd cloudflare/scheduler
-printf '%s' "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" | \
-  npx --yes wrangler@4 secret put UK_AQ_CLOUD_RUN_DISPATCH_SECRET \
-    --name uk-aq-cron-scheduler-ops
-```
 
 ## Notes
 

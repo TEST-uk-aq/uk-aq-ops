@@ -93,19 +93,6 @@ jobs:
 
           expected_jobs = expected["jobs"]
           actual_jobs = remote[0]["results"]
-          actual_by_key = {job["job_key"]: job for job in actual_jobs}
-          for expected_job in expected_jobs:
-              job_key = expected_job["job_key"]
-              if job_key not in expected.get("deployment_managed_cloud_run_url_job_keys", []):
-                  continue
-              actual_url = str(actual_by_key.get(job_key, {}).get("cloud_run_url") or "")
-              if actual_url != "https://deployment-pending.invalid/run" and not (
-                  actual_url.startswith("https://") and actual_url.endswith("/run")
-              ):
-                  raise SystemExit(
-                      f"Remote D1 job {job_key} has invalid deployment-managed cloud_run_url: {actual_url!r}"
-                  )
-              expected_job["cloud_run_url"] = actual_url
           if actual_jobs != expected_jobs:
               raise SystemExit(
                   "Remote D1 scheduler_jobs rows do not match jobs.toml\n"
