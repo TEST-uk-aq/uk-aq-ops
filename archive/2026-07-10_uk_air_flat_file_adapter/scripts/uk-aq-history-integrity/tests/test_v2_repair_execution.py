@@ -384,10 +384,10 @@ class V2RepairExecutionTests(unittest.TestCase):
             conn.execute(
                 """
                 INSERT INTO source_file_timeseries_counts (
-                  source_file_key, day_utc, timeseries_id, row_count, counted_at_utc
-                ) VALUES (?, ?, ?, ?, ?)
+                  source_file_key, timeseries_id, row_count, counted_at_utc
+                ) VALUES (?, ?, ?, ?)
                 """,
-                (source_file_key, day_utc, ts_id, count, "2026-06-24T00:00:00Z"),
+                (source_file_key, ts_id, count, "2026-06-24T00:00:00Z"),
             )
         conn.commit()
         return conn
