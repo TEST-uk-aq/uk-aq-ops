@@ -9,7 +9,7 @@ This document covers the ops-side scheduler worker that dispatches the R2 core s
 - Worker: `uk-aq-scheduler-ops`
 - Path: `cloudflare/scheduler/ops/`
 - Crons:
-  - `31 13 * * *`
+  - `15 4 * * *`
 - Jobs: `ops.r2_core_snapshot`
 
 GitHub dispatch secret:

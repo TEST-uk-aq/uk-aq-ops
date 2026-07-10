@@ -25,7 +25,7 @@ export const OPS_JOBS = [
     state_source: "daily_task_runs",
     task_key: "ops.r2_core_snapshot",
     cron: "31 13 * * *",
-    scheduled_time_utc: "13:31",
+    scheduled_time_utc: "13:35",
     due_after_minutes: 0,
     min_gap_minutes: 60,
     stale_after_minutes: 180,
