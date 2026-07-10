@@ -36,18 +36,11 @@ The worker reads enabled jobs from D1, claims due slots once, and dispatches eit
 
 - `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
 
-## Cloud Run secret
+## Optional future secret
 
 - `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`
 
-The Worker adds this value as `x-uk-aq-dispatch-secret` for Cloud Run targets. It
-must match the target service's Secret Manager-backed environment value and must
-not be stored in D1 job headers or bodies.
-
-The `uk_aq_observs_partition_maintenance` target uses a deployment-managed URL.
-Its Cloud Run deploy workflow resolves the current service URL and writes the
-`/run` endpoint to D1. Config syncs preserve that URL while syncing all other job
-fields from `jobs.toml`.
+Cloud Run dispatch remains disabled by default until the matching services are ready.
 
 ## Manual setup
 
@@ -96,15 +89,6 @@ cd cloudflare/scheduler && printf '%s' "$UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT" | w
 
 ```bash
 cd cloudflare/scheduler && wrangler deploy
-```
-
-Install the Cloud Run dispatch secret before deploying:
-
-```bash
-cd cloudflare/scheduler
-printf '%s' "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" | \
-  wrangler secret put UK_AQ_CLOUD_RUN_DISPATCH_SECRET \
-    --name uk-aq-cron-scheduler-ops
 ```
 
 ### 8. Verify locally

@@ -17,7 +17,6 @@ DEFAULT_SCHEDULER_NAME = "uk-aq-cron-scheduler-ops"
 DEFAULT_TIMEZONE = "UTC"
 DEFAULT_GITHUB_REF = "main"
 DEFAULT_CLOUD_RUN_METHOD = "POST"
-DEPLOYMENT_PENDING_CLOUD_RUN_URL = "https://deployment-pending.invalid/run"
 
 MONTH_NAME_TO_NUMBER = {
     "JAN": 1,
@@ -227,7 +226,6 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "github_ref",
         "github_inputs",
         "cloud_run_url",
-        "cloud_run_url_managed_by_deploy",
         "cloud_run_method",
         "cloud_run_headers",
         "cloud_run_body",
@@ -265,20 +263,13 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "cloud_run_body_json": None,
         "dry_run": dry_run,
         "notes": notes,
-        "cloud_run_url_managed_by_deploy": False,
     }
 
     if not job["job_key"]:
         raise JobsConfigError("Invalid scheduler job: job_key must not be empty")
 
     if target_type == "github_workflow":
-        forbidden = {
-            "cloud_run_url",
-            "cloud_run_url_managed_by_deploy",
-            "cloud_run_method",
-            "cloud_run_headers",
-            "cloud_run_body",
-        } & set(raw_job)
+        forbidden = {"cloud_run_url", "cloud_run_method", "cloud_run_headers", "cloud_run_body"} & set(raw_job)
         if forbidden:
             joined = ", ".join(sorted(forbidden))
             raise JobsConfigError(f"Invalid scheduler job {job_key}: github_workflow does not use {joined}")
@@ -299,23 +290,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
             joined = ", ".join(sorted(forbidden))
             raise JobsConfigError(f"Invalid scheduler job {job_key}: cloud_run does not use {joined}")
 
-        managed_url = raw_job.get("cloud_run_url_managed_by_deploy", False)
-        if not isinstance(managed_url, bool):
-            raise JobsConfigError(
-                f"Invalid scheduler_jobs.cloud_run_url_managed_by_deploy for {job_key}: expected true or false"
-            )
-        if managed_url and "cloud_run_url" in raw_job:
-            raise JobsConfigError(
-                f"Invalid scheduler job {job_key}: set cloud_run_url or cloud_run_url_managed_by_deploy, not both"
-            )
-        if managed_url:
-            job["cloud_run_url"] = DEPLOYMENT_PENDING_CLOUD_RUN_URL
-            job["cloud_run_url_managed_by_deploy"] = True
-        else:
-            job["cloud_run_url"] = require_string(
-                raw_job.get("cloud_run_url"),
-                f"scheduler_jobs.cloud_run_url for {job_key}",
-            )
+        job["cloud_run_url"] = require_string(raw_job.get("cloud_run_url"), f"scheduler_jobs.cloud_run_url for {job_key}")
         job["cloud_run_method"] = optional_string(raw_job.get("cloud_run_method")) or DEFAULT_CLOUD_RUN_METHOD
         job["cloud_run_headers_json"] = normalize_json_table(
             raw_job.get("cloud_run_headers"),
@@ -377,11 +352,6 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
     values = [job[column] for column in SQL_COLUMNS] + [SqlExpression("current_timestamp")]
     insert_values = ",\n  ".join(sql_literal(value) for value in values)
 
-    cloud_run_url_update = (
-        "  cloud_run_url = scheduler_jobs.cloud_run_url"
-        if job.get("cloud_run_url_managed_by_deploy")
-        else "  cloud_run_url = excluded.cloud_run_url"
-    )
     update_lines = [
         "  enabled = excluded.enabled",
         "  target_type = excluded.target_type",
@@ -391,7 +361,7 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
         "  github_workflow_file = excluded.github_workflow_file",
         "  github_ref = excluded.github_ref",
         "  github_inputs_json = excluded.github_inputs_json",
-        cloud_run_url_update,
+        "  cloud_run_url = excluded.cloud_run_url",
         "  cloud_run_method = excluded.cloud_run_method",
         "  cloud_run_headers_json = excluded.cloud_run_headers_json",
         "  cloud_run_body_json = excluded.cloud_run_body_json",
@@ -431,15 +401,7 @@ def build_expected_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "config_version": manifest["config_version"],
         "scheduler_name": manifest["scheduler_name"],
         "job_count": manifest["job_count"],
-        "jobs": [
-            {column: job[column] for column in SQL_COLUMNS}
-            for job in manifest["jobs"]
-        ],
-        "deployment_managed_cloud_run_url_job_keys": [
-            job["job_key"]
-            for job in manifest["jobs"]
-            if job.get("cloud_run_url_managed_by_deploy")
-        ],
+        "jobs": manifest["jobs"],
     }
 
 

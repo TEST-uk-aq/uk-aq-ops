@@ -6,7 +6,6 @@ on:
       - main
     paths:
       - "workers/uk_aq_observs_partition_maintenance_service/server.mjs"
-      - "workers/uk_aq_observs_partition_maintenance_service/run_auth.mjs"
       - "workers/shared/daily_task_health.mjs"
       - "Dockerfile"
       - "package.json"
@@ -32,15 +31,6 @@ jobs:
       RESOURCE_LABEL: uk-aq-observs-partition-maintenance-service
       OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT || '' }}
       UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
-      UK_AQ_CLOUD_RUN_DISPATCH_SECRET: ${{ secrets.UK_AQ_CLOUD_RUN_DISPATCH_SECRET || '' }}
-      UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME: ${{ vars.UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME || 'UK_AQ_CLOUD_RUN_DISPATCH_SECRET' }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
-      SCHEDULER_D1_DATABASE: uk_aq_cron_scheduler_ops_db
-      SCHEDULER_JOB_KEY: uk_aq_observs_partition_maintenance
-      SCHEDULER_JOBS_FILE: cloudflare/scheduler/jobs.toml
-      SCHEDULER_SYNC_SCRIPT: cloudflare/scheduler/scripts/sync_jobs.py
-      SCHEDULER_WRANGLER_CONFIG: cloudflare/scheduler/wrangler.toml
       SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || '900' }}
       SERVICE_CPU: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_CPU || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_CPU || '1' }}
       SERVICE_MEMORY: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_MEMORY || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_MEMORY || '256Mi' }}
@@ -99,14 +89,6 @@ jobs:
           fi
           if [ -z "${UK_AQ_EDGE_UPSTREAM_SECRET}" ]; then
             echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
-            exit 1
-          fi
-          if [ -z "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" ]; then
-            echo "Missing secret UK_AQ_CLOUD_RUN_DISPATCH_SECRET."
-            exit 1
-          fi
-          if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ] || [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
-            echo "Missing CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN secret."
             exit 1
           fi
 
@@ -229,7 +211,6 @@ jobs:
           }
 
           upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
-          upsert_secret "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}" "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" 1
 
           if [ -n "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
             upsert_secret "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" "${CFLARE_R2_ACCESS_KEY_ID}" 1
@@ -251,7 +232,6 @@ jobs:
         run: |
           set -euo pipefail
           gcloud secrets describe "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
-          gcloud secrets describe "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
           for optional_secret in \
             "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" \
             "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" \
@@ -323,7 +303,6 @@ jobs:
 
           secret_updates=()
           secret_updates+=("OBS_AQIDB_SECRET_KEY=${OBS_AQIDB_SECRET_KEY_SECRET_NAME}:latest")
-          secret_updates+=("UK_AQ_CLOUD_RUN_DISPATCH_SECRET=${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}:latest")
           if [ -n "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
             secret_updates+=("CFLARE_R2_ACCESS_KEY_ID=${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
           fi
@@ -377,18 +356,6 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve deployed service URL
-        id: service_url
-        run: |
-          set -euo pipefail
-          service_uri="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
-          if [[ ! "${service_uri}" =~ ^https://[^/]+$ ]]; then
-            echo "Invalid Cloud Run service URL: ${service_uri:-<missing>}"
-            exit 1
-          fi
-          printf 'service_uri=%s\n' "${service_uri}" >> "${GITHUB_OUTPUT}"
-          printf 'run_url=%s/run\n' "${service_uri}" >> "${GITHUB_OUTPUT}"
-
       - name: Ensure Cloud Scheduler trigger exists
         run: |
           set -euo pipefail
@@ -400,7 +367,7 @@ jobs:
           fi
 
           scheduler_sa="${{ steps.service_accounts.outputs.scheduler_sa }}"
-          service_uri="${{ steps.service_url.outputs.service_uri }}"
+          service_uri="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
           scheduler_uri="${service_uri}/run"
           scheduler_body='{}'
 
@@ -436,81 +403,6 @@ jobs:
               --max-retry-attempts "${SCHEDULER_MAX_RETRY_ATTEMPTS}"
             echo "Created Cloud Scheduler job: ${SCHEDULER_JOB_NAME}"
           fi
-
-      - name: Sync scheduler config and deployed Cloud Run URL to D1
-        env:
-          SERVICE_RUN_URL: ${{ steps.service_url.outputs.run_url }}
-        run: |
-          set -euo pipefail
-
-          python3 "${SCHEDULER_SYNC_SCRIPT}" \
-            --jobs-file "${SCHEDULER_JOBS_FILE}" \
-            --sql-file /tmp/scheduler_jobs_sync.sql \
-            --json-file /tmp/scheduler_jobs_expected.json
-
-          npx --yes wrangler@4 d1 execute "${SCHEDULER_D1_DATABASE}" \
-            --remote \
-            --config "${SCHEDULER_WRANGLER_CONFIG}" \
-            --file /tmp/scheduler_jobs_sync.sql
-
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          def sql_literal(value: str) -> str:
-              return "'" + value.replace("'", "''") + "'"
-
-          job_key = os.environ["SCHEDULER_JOB_KEY"]
-          run_url = os.environ["SERVICE_RUN_URL"]
-          if not (run_url.startswith("https://") and run_url.endswith("/run")):
-              raise SystemExit(f"Invalid SERVICE_RUN_URL: {run_url!r}")
-          Path("/tmp/scheduler_cloud_run_url.sql").write_text(
-              "update scheduler_jobs\n"
-              f"set cloud_run_url = {sql_literal(run_url)}, updated_at = current_timestamp\n"
-              f"where job_key = {sql_literal(job_key)};\n",
-              encoding="utf-8",
-          )
-          PY
-
-          npx --yes wrangler@4 d1 execute "${SCHEDULER_D1_DATABASE}" \
-            --remote \
-            --config "${SCHEDULER_WRANGLER_CONFIG}" \
-            --file /tmp/scheduler_cloud_run_url.sql
-
-      - name: Verify deployed Cloud Run URL in D1
-        env:
-          SERVICE_RUN_URL: ${{ steps.service_url.outputs.run_url }}
-        run: |
-          set -euo pipefail
-          npx --yes wrangler@4 d1 execute "${SCHEDULER_D1_DATABASE}" \
-            --remote \
-            --config "${SCHEDULER_WRANGLER_CONFIG}" \
-            --json \
-            --command "select job_key, target_type, cloud_run_url, cloud_run_method, dry_run from scheduler_jobs where job_key = '${SCHEDULER_JOB_KEY}'" \
-            > /tmp/scheduler_cloud_run_job.json
-
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          payload = json.loads(Path("/tmp/scheduler_cloud_run_job.json").read_text(encoding="utf-8"))
-          rows = payload[0]["results"]
-          manifest = json.loads(Path("/tmp/scheduler_jobs_expected.json").read_text(encoding="utf-8"))
-          configured_job = next(
-              job for job in manifest["jobs"]
-              if job["job_key"] == os.environ["SCHEDULER_JOB_KEY"]
-          )
-          expected = {
-              "job_key": os.environ["SCHEDULER_JOB_KEY"],
-              "target_type": "cloud_run",
-              "cloud_run_url": os.environ["SERVICE_RUN_URL"],
-              "cloud_run_method": "POST",
-              "dry_run": configured_job["dry_run"],
-          }
-          if rows != [expected]:
-              raise SystemExit(f"D1 Cloud Run scheduler row mismatch: expected={expected!r} actual={rows!r}")
-          PY
 
       - name: Show deployed service
         run: |

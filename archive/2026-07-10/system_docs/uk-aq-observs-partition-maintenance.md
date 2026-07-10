@@ -28,22 +28,6 @@ This deploys a dedicated Cloud Run service that maintains `uk_aq_observs.observa
 
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
-- `UK_AQ_EDGE_UPSTREAM_SECRET`
-- `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`
-
-## HTTP authentication
-
-`POST /run` accepts either existing upstream authentication with
-`x-uk-aq-upstream-auth: <UK_AQ_EDGE_UPSTREAM_SECRET>` or Cloudflare scheduler
-authentication with
-`x-uk-aq-dispatch-secret: <UK_AQ_CLOUD_RUN_DISPATCH_SECRET>`. A caller needs one
-valid route, not both. Missing or invalid credentials return HTTP 403.
-
-The service remains deployed with `--allow-unauthenticated` because the
-Cloudflare Worker does not mint a Google OIDC token. This only permits the request
-through Cloud Run IAM; the application authentication above still protects
-maintenance execution. `/healthz` remains unauthenticated and does not run
-maintenance. `GET /run` remains HTTP 405.
 
 ## Optional environment variables
 
@@ -80,17 +64,13 @@ npm run start:observs-partitions
 Run once:
 
 ```bash
-curl -X POST \
-  -H "x-uk-aq-dispatch-secret: ${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" \
-  "http://localhost:8080/run"
+curl -X POST "http://localhost:8080/run"
 ```
 
 Dry-run partition drop gate:
 
 ```bash
-curl -X POST \
-  -H "x-uk-aq-dispatch-secret: ${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" \
-  "http://localhost:8080/run?dropDryRun=true"
+curl -X POST "http://localhost:8080/run?dropDryRun=true"
 ```
 
 ## Scheduler
@@ -99,67 +79,6 @@ Recommended schedule: `0 3 * * *` with timezone `UTC`.
 
 Target service endpoint:
 - `POST /run`
-
-The `uk_aq_observs_partition_maintenance` job is tracked in
-`cloudflare/scheduler/jobs.toml`. Its Cloud Run URL is deployment-managed: the
-service deploy workflow reads `status.url`, appends `/run`, syncs the Git-tracked
-job configuration, updates that URL in D1, and verifies the resulting row. The
-initial scheduler setting is `dry_run = true`, so it records due dispatches but
-does not call the service.
-
-## Secret rotation and deployment
-
-Generate a secret without placing its value directly in shell history:
-
-```bash
-read -r -s UK_AQ_CLOUD_RUN_DISPATCH_SECRET < <(openssl rand -base64 48)
-export UK_AQ_CLOUD_RUN_DISPATCH_SECRET
-```
-
-Update the GitHub Actions secret used by both deploy workflows:
-
-```bash
-printf '%s' "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" | \
-  gh secret set UK_AQ_CLOUD_RUN_DISPATCH_SECRET --repo TEST-uk-aq/uk-aq-ops
-```
-
-The Cloud Run deploy workflow upserts the value into GCP Secret Manager, maps it
-to `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`, deploys the service, and reconciles the D1
-URL. The Cloudflare Worker deploy workflow installs the same GitHub secret on
-`uk-aq-cron-scheduler-ops`.
-
-```bash
-gh workflow run uk_aq_observs_partition_maintenance_cloud_run_deploy.yml \
-  --repo TEST-uk-aq/uk-aq-ops --ref main
-gh workflow run uk_aq_cloudflare_scheduler_ops_deploy.yml \
-  --repo TEST-uk-aq/uk-aq-ops --ref main
-```
-
-Verify health after obtaining the deployed URL from the workflow output or GCP:
-
-```bash
-SERVICE_URL="$(gcloud run services describe uk-aq-observs-partition-maintenance-service \
-  --project "${GCP_PROJECT_ID}" --region "${GCP_REGION:-europe-west2}" \
-  --format='value(status.url)')"
-curl --fail --silent --show-error "${SERVICE_URL}/healthz"
-```
-
-For the first controlled real run, temporarily set `dry_run = false` in the job,
-set its cron a few minutes ahead in UTC, commit to `main`, and let the config sync
-workflow update D1. Do not enable both GCP Cloud Scheduler and Cloudflare for real
-dispatch at the same time. After the test, restore `cron_expr = "0 3 * * *"`; keep
-`dry_run = false` only when Cloudflare is the selected production trigger.
-
-Inspect the dispatch and Cloud Run result:
-
-```bash
-npx --yes wrangler@4 d1 execute uk_aq_cron_scheduler_ops_db --remote \
-  --config cloudflare/scheduler/wrangler.toml --command \
-  "select job_key, due_at, dispatch_status, response_status, response_preview from scheduler_dispatches where job_key = 'uk_aq_observs_partition_maintenance' order by due_at desc limit 10"
-gcloud logging read \
-  'resource.type="cloud_run_revision" AND resource.labels.service_name="uk-aq-observs-partition-maintenance-service"' \
-  --project "${GCP_PROJECT_ID}" --limit 50 --format json
-```
 
 ## SQL prerequisites
 

@@ -26,12 +26,11 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
 
         self.assertEqual(manifest["config_version"], 1)
         self.assertEqual(manifest["scheduler_name"], "uk-aq-cron-scheduler-ops")
-        self.assertEqual(manifest["job_count"], 5)
+        self.assertEqual(manifest["job_count"], 4)
         self.assertEqual(
             [job["job_key"] for job in manifest["jobs"]],
             [
                 "uk_aq_dropbox_prune_raw",
-                "uk_aq_observs_partition_maintenance",
                 "uk_aq_r2_core_snapshot",
                 "uk_aq_r2_history_dropbox_backup",
                 "uk_aq_r2_history_dropbox_backup_force_prune_recheck",
@@ -42,17 +41,7 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_history_dropbox_backup_force_prune_recheck"
         )
         self.assertEqual(force_prune["github_inputs_json"], '{"force_prune_recheck":"true"}')
-        partition_maintenance = next(
-            job for job in manifest["jobs"] if job["job_key"] == "uk_aq_observs_partition_maintenance"
-        )
-        self.assertEqual(partition_maintenance["target_type"], "cloud_run")
-        self.assertEqual(partition_maintenance["cloud_run_method"], "POST")
-        self.assertEqual(partition_maintenance["cloud_run_url"], sync_jobs.DEPLOYMENT_PENDING_CLOUD_RUN_URL)
-        self.assertTrue(partition_maintenance["cloud_run_url_managed_by_deploy"])
-        self.assertEqual(partition_maintenance["cloud_run_body_json"], '{"source":"cloudflare_scheduler"}')
-        self.assertIsNone(partition_maintenance["github_repo"])
-        self.assertNotIn("x-uk-aq-dispatch-secret", partition_maintenance["cloud_run_headers_json"] or "")
-        self.assertEqual(partition_maintenance["dry_run"], 1)
+        self.assertTrue(all(job["dry_run"] == 1 for job in manifest["jobs"]))
         self.assertTrue(all(job["enabled"] == 1 for job in manifest["jobs"]))
 
     def test_github_workflow_jobs_default_cloud_run_method_to_post(self) -> None:
@@ -83,8 +72,7 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         self.assertIn("updated_at = current_timestamp", sql)
         self.assertIn("github_inputs_json = excluded.github_inputs_json", sql)
         self.assertIn("uk_aq_r2_history_dropbox_backup_force_prune_recheck", sql)
-        self.assertIn("cloud_run_url = scheduler_jobs.cloud_run_url", sql)
-        self.assertIn("'https://deployment-pending.invalid/run'", sql)
+        self.assertIn("NULL,\n  'POST',\n  NULL,\n  NULL,\n  1,", sql)
 
     def test_main_writes_sql_and_manifest_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -108,12 +96,8 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             self.assertTrue(json_path.exists())
 
             manifest = json.loads(json_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["job_count"], 5)
-            self.assertEqual(len(manifest["jobs"]), 5)
-            self.assertEqual(
-                manifest["deployment_managed_cloud_run_url_job_keys"],
-                ["uk_aq_observs_partition_maintenance"],
-            )
+            self.assertEqual(manifest["job_count"], 4)
+            self.assertEqual(len(manifest["jobs"]), 4)
             core_snapshot = next(
                 job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_core_snapshot"
             )
@@ -130,22 +114,6 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
 
             with self.assertRaises(sync_jobs.JobsConfigError):
                 sync_jobs.validate_jobs_config(sync_jobs.load_jobs_config(bad_jobs))
-
-    def test_cloud_run_deploy_reconciles_service_url_and_dispatch_secret(self) -> None:
-        workflow = (
-            ROOT / ".github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("--format='value(status.url)'", workflow)
-        self.assertIn("printf 'run_url=%s/run", workflow)
-        self.assertIn("scheduler_cloud_run_url.sql", workflow)
-        self.assertIn("update scheduler_jobs", workflow)
-        self.assertIn("Verify deployed Cloud Run URL in D1", workflow)
-        self.assertIn(
-            "UK_AQ_CLOUD_RUN_DISPATCH_SECRET=${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}:latest",
-            workflow,
-        )
-        self.assertIn("--allow-unauthenticated", workflow)
 
 
 if __name__ == "__main__":
