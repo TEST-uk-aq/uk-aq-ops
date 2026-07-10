@@ -27,13 +27,13 @@ This Worker runs once per minute and reads its schedule entirely from D1.
 
 - `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
 
-## Cloud Run dispatch secret
+## Cloud Run authentication secret
 
-- `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`
+- `UK_AQ_EDGE_UPSTREAM_SECRET`
 
-The Worker sends this secret as `x-uk-aq-dispatch-secret`. Install the same value
-on each target Cloud Run service; never put it in `jobs.toml`, D1 headers, or D1
-request bodies.
+The Worker sends the shared edge secret as `x-uk-aq-dispatch-secret`. Target
+services may also accept the same value through `x-uk-aq-upstream-auth`. Never
+put the value in `jobs.toml`, D1 headers, or D1 request bodies.
 
 ## Deployment-managed Cloud Run URLs
 
@@ -67,14 +67,17 @@ python3 -m unittest discover -s tests -p 'test*.py'
 7. Deploy the Worker.
 8. Verify one-minute `scheduler_runs` rows and dry-run dispatch records.
 
-Install or rotate the Cloud Run dispatch secret on the Worker:
+Install the existing shared edge secret on the Worker:
 
 ```bash
 cd cloudflare/scheduler
-printf '%s' "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" | \
-  npx --yes wrangler@4 secret put UK_AQ_CLOUD_RUN_DISPATCH_SECRET \
+printf '%s' "${UK_AQ_EDGE_UPSTREAM_SECRET}" | \
+  npx --yes wrangler@4 secret put UK_AQ_EDGE_UPSTREAM_SECRET \
     --name uk-aq-cron-scheduler-ops
 ```
+
+Do not rotate this value only for the scheduler; it is shared with existing edge
+and upstream callers and must be rotated across all consumers together.
 
 ## Notes
 

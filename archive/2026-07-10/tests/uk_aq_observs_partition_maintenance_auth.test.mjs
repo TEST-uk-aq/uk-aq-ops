@@ -15,6 +15,7 @@ function request(headers = {}) {
 
 const configuredEnv = {
   UK_AQ_EDGE_UPSTREAM_SECRET: "upstream-secret-value",
+  UK_AQ_CLOUD_RUN_DISPATCH_SECRET: "dispatch-secret-value",
 };
 
 test("existing upstream authentication remains valid", () => {
@@ -29,15 +30,15 @@ test("existing upstream authentication remains valid", () => {
   assert.equal(
     validateRunAuth(
       request({ [UPSTREAM_AUTH_HEADER]: "upstream-secret-value" }),
-      {},
+      { UK_AQ_CLOUD_RUN_DISPATCH_SECRET: "dispatch-secret-value" },
     ).status,
     403,
   );
 });
 
-test("Cloudflare dispatch header uses the shared edge upstream secret", () => {
+test("Cloudflare dispatch authentication is independently valid", () => {
   assert.deepEqual(
-    validateRunAuth(request({ [DISPATCH_AUTH_HEADER]: "upstream-secret-value" }), configuredEnv),
+    validateRunAuth(request({ [DISPATCH_AUTH_HEADER]: "dispatch-secret-value" }), configuredEnv),
     { ok: true },
   );
   assert.equal(
@@ -46,8 +47,8 @@ test("Cloudflare dispatch header uses the shared edge upstream secret", () => {
   );
   assert.equal(
     validateRunAuth(
-      request({ [DISPATCH_AUTH_HEADER]: "upstream-secret-value" }),
-      {},
+      request({ [DISPATCH_AUTH_HEADER]: "dispatch-secret-value" }),
+      { UK_AQ_EDGE_UPSTREAM_SECRET: "upstream-secret-value" },
     ).status,
     403,
   );
@@ -58,7 +59,7 @@ test("either valid route is sufficient even when the other route is invalid", ()
     validateRunAuth(
       request({
         [UPSTREAM_AUTH_HEADER]: "wrong-upstream-value",
-        [DISPATCH_AUTH_HEADER]: "upstream-secret-value",
+        [DISPATCH_AUTH_HEADER]: "dispatch-secret-value",
       }),
       configuredEnv,
     ),
@@ -123,6 +124,7 @@ test("HTTP routing keeps health public and blocks invalid maintenance requests",
         ...process.env,
         PORT: String(port),
         UK_AQ_EDGE_UPSTREAM_SECRET: "integration-upstream-secret",
+        UK_AQ_CLOUD_RUN_DISPATCH_SECRET: "integration-dispatch-secret",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
