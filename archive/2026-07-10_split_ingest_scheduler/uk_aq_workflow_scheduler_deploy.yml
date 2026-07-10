@@ -1,0 +1,265 @@
+name: Deploy uk_aq_workflow_scheduler Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cloudflare/workflow-scheduler/**"
+      - ".github/workflows/uk_aq_workflow_scheduler_deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    env:
+      UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME: ${{ vars.UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME || 'uk-aq-workflow-scheduler' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN: ${{ secrets.UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN || '' }}
+      UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY: ${{ secrets.UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY || '' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Cloudflare credentials and scheduler token
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            echo "Missing secret CLOUDFLARE_API_TOKEN."
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Missing secret CLOUDFLARE_ACCOUNT_ID."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN}" ]; then
+            echo "Missing secret UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN."
+            exit 1
+          fi
+          case "${UK_AQ_R2_HISTORY_VERSION}" in
+            v1|v2) ;;
+            "")
+              echo "Missing GitHub variable UK_AQ_R2_HISTORY_VERSION."
+              exit 1
+              ;;
+            *)
+              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v1 or v2."
+              exit 1
+              ;;
+          esac
+
+      - name: Prepare scheduler config
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_REPOSITORY_OWNER:-}" ]; then
+            echo "Missing GITHUB_REPOSITORY_OWNER from GitHub Actions context."
+            exit 1
+          fi
+
+          if [ ! -f cloudflare/workflow-scheduler/wrangler.toml ]; then
+            echo "Missing cloudflare/workflow-scheduler/wrangler.toml."
+            exit 1
+          fi
+
+          sed -i "s/YOUR_GITHUB_OWNER/${GITHUB_REPOSITORY_OWNER}/g" cloudflare/workflow-scheduler/worker.js
+          sed -i "s/^name = .*/name = \"${UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME}\"/" cloudflare/workflow-scheduler/wrangler.toml
+
+          python3 - <<'PY'
+          import re
+          import os
+          from pathlib import Path
+
+          wrangler_path = Path("cloudflare/workflow-scheduler/wrangler.toml")
+          worker_path = Path("cloudflare/workflow-scheduler/worker.js")
+
+          wrangler_text = wrangler_path.read_text(encoding="utf-8")
+          worker_text = worker_path.read_text(encoding="utf-8")
+          history_version = os.environ.get("UK_AQ_R2_HISTORY_VERSION", "").strip()
+          if history_version not in {"v1", "v2"}:
+              raise SystemExit("UK_AQ_R2_HISTORY_VERSION must be present and v1 or v2 before deploy config generation")
+
+          match = re.search(r'crons\s*=\s*\[(.*?)\]', wrangler_text, re.S)
+          if not match:
+              raise SystemExit("No [triggers].crons array found in wrangler.toml")
+
+          cron_job_map = {}
+          cron_block = match.group(1)
+          for raw_line in cron_block.splitlines():
+              line = raw_line.strip()
+              if not line:
+                  continue
+              cron_match = re.match(
+                  r'"([^"]+)"\s*,?\s*#\s*job_keys?:\s*([^|#]+)',
+                  line,
+              )
+              if not cron_match:
+                  raise SystemExit(
+                      "Each cron line in wrangler.toml must include '# job_keys: <key>[, <key>...]' comment. "
+                      f"Invalid line: {raw_line.strip()}"
+                  )
+              cron_value, raw_job_keys = cron_match.groups()
+              job_keys = [key.strip() for key in raw_job_keys.split(",") if key.strip()]
+              if not job_keys:
+                  raise SystemExit(f"No job keys found in wrangler.toml cron line: {raw_line.strip()}")
+              for job_key in job_keys:
+                  if not re.fullmatch(r'[A-Za-z0-9_-]+', job_key):
+                      raise SystemExit(f"Invalid job_key in wrangler.toml cron comments: {job_key}")
+                  if any(job_key in keys for keys in cron_job_map.values()):
+                      raise SystemExit(f"Duplicate job_key in wrangler.toml cron comments: {job_key}")
+              cron_job_map[cron_value] = job_keys
+
+          worker_job_keys = re.findall(r'job_key:\s*"([A-Za-z0-9_-]+)"', worker_text)
+          if not worker_job_keys:
+              raise SystemExit("No JOBS job_key entries found in worker.js")
+
+          wrangler_keys = {key for keys in cron_job_map.values() for key in keys}
+          worker_keys = set(worker_job_keys)
+          if wrangler_keys != worker_keys:
+              raise SystemExit(
+                  "Job key mismatch between worker.js and wrangler.toml. "
+                  f"worker keys={sorted(worker_keys)} wrangler keys={sorted(wrangler_keys)}"
+              )
+
+          map_lines = [
+              f'  "{cron_value}": [{", ".join(repr(key).replace(chr(39), chr(34)) for key in job_keys)}],'
+              for cron_value, job_keys in cron_job_map.items()
+          ]
+          generated_block = "\n".join([
+              "/* DEPLOY_CRON_MAP_START */",
+              *map_lines,
+              "  /* DEPLOY_CRON_MAP_END */",
+          ])
+
+          updated_worker = re.sub(
+              r'/\* DEPLOY_CRON_MAP_START \*/.*?/\* DEPLOY_CRON_MAP_END \*/',
+              generated_block,
+              worker_text,
+              flags=re.S,
+          )
+
+          if updated_worker == worker_text:
+              raise SystemExit(
+                  "Failed to inject cron map. Missing DEPLOY_CRON_MAP markers in worker.js"
+              )
+
+          worker_path.write_text(updated_worker, encoding="utf-8")
+          vars_match = re.search(r'(?ms)^\[vars\]\n(?P<body>.*?)(?=^\[|\Z)', wrangler_text)
+          history_line = f'UK_AQ_R2_HISTORY_VERSION = "{history_version}"'
+          if vars_match:
+              body = vars_match.group("body")
+              if re.search(r'^UK_AQ_R2_HISTORY_VERSION\s*=', body, re.M):
+                  body = re.sub(
+                      r'^UK_AQ_R2_HISTORY_VERSION\s*=.*$',
+                      history_line,
+                      body,
+                      flags=re.M,
+                  )
+              else:
+                  body = f"{body.rstrip()}\n{history_line}\n"
+              wrangler_text = f"{wrangler_text[:vars_match.start('body')]}{body}{wrangler_text[vars_match.end('body'):]}"
+          else:
+              insert_after = re.search(r'^compatibility_date\s*=\s*"[^"]+"\s*$', wrangler_text, re.M)
+              if not insert_after:
+                  raise SystemExit("Missing compatibility_date in wrangler.toml")
+              insert_at = insert_after.end()
+              vars_block = f'\n\n[vars]\n{history_line}\n'
+              wrangler_text = f"{wrangler_text[:insert_at]}{vars_block}{wrangler_text[insert_at:]}"
+          wrangler_path.write_text(wrangler_text, encoding="utf-8")
+          print(f"Prepared deploy cron map: {cron_job_map}")
+          print(f"Injected UK_AQ_R2_HISTORY_VERSION={history_version} into generated Worker deploy config")
+          PY
+
+      - name: Validate scheduler cron alignment
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          wrangler_text = Path("cloudflare/workflow-scheduler/wrangler.toml").read_text(encoding="utf-8")
+          worker_text = Path("cloudflare/workflow-scheduler/worker.js").read_text(encoding="utf-8")
+
+          wrangler_match = re.search(r'crons\s*=\s*\[(.*?)\]', wrangler_text, re.S)
+          if not wrangler_match:
+              raise SystemExit("No [triggers].crons array found in wrangler.toml")
+
+          wrangler_map = {}
+          for raw_line in wrangler_match.group(1).splitlines():
+              line = raw_line.strip()
+              if not line:
+                  continue
+              m = re.match(r'"([^"]+)"\s*,?\s*#\s*job_keys?:\s*([^|#]+)', line)
+              if not m:
+                  raise SystemExit(f"Invalid wrangler cron line: {line}")
+              cron, raw_keys = m.groups()
+              keys = [key.strip() for key in raw_keys.split(",") if key.strip()]
+              wrangler_map[cron] = keys
+
+          block_match = re.search(
+              r'/\* DEPLOY_CRON_MAP_START \*/(.*?)/\* DEPLOY_CRON_MAP_END \*/',
+              worker_text,
+              re.S,
+          )
+          if not block_match:
+              raise SystemExit("Missing DEPLOY_CRON_MAP marker block in worker.js")
+
+          worker_map = {
+              cron: [key.strip().strip('"') for key in raw_keys.split(",") if key.strip()]
+              for cron, raw_keys in re.findall(r'"([^"]+)"\s*:\s*\[(.*?)\]', block_match.group(1), re.S)
+          }
+
+          if worker_map != wrangler_map:
+              raise SystemExit(
+                  "Scheduler mapping mismatch between worker.js deploy map and wrangler.toml.\n"
+                  f"worker_map={worker_map}\nwrangler_map={wrangler_map}"
+              )
+
+          job_keys = set(re.findall(r'job_key:\s*"([A-Za-z0-9_-]+)"', worker_text))
+          mapped_job_keys = {key for keys in worker_map.values() for key in keys}
+          if job_keys != mapped_job_keys:
+              raise SystemExit(
+                  "worker.js JOBS keys mismatch deploy map keys.\n"
+                  f"jobs={sorted(job_keys)} map={sorted(mapped_job_keys)}"
+              )
+
+          print(f"Cron alignment OK by cron: {worker_map}")
+          PY
+
+      - name: Deploy Worker (base)
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: cloudflare/workflow-scheduler
+          command: deploy --name ${{ env.UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME }}
+
+      - name: Set Worker secrets
+        working-directory: cloudflare/workflow-scheduler
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg GITHUB_WORKFLOW_DISPATCH_TOKEN "${UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN}" \
+            --arg MANUAL_TRIGGER_KEY "${UK_AQ_WORKFLOW_SCHEDULER_MANUAL_TRIGGER_KEY}" \
+            '{GITHUB_WORKFLOW_DISPATCH_TOKEN: $GITHUB_WORKFLOW_DISPATCH_TOKEN, MANUAL_TRIGGER_KEY: $MANUAL_TRIGGER_KEY} | with_entries(select(.value != ""))')"
+          for attempt in 1 2 3; do
+            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to apply Worker secrets after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: cloudflare/workflow-scheduler
+          command: deploy --name ${{ env.UK_AQ_WORKFLOW_SCHEDULER_WORKER_NAME }}

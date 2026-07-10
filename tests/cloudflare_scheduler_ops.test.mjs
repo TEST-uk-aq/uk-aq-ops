@@ -1,49 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { evaluateDailyTaskJob, evaluateIngestJob } from "../cloudflare/scheduler-dispatchers/shared.mjs";
-import { INGEST_JOBS } from "../cloudflare/scheduler-dispatchers/ingest/worker.mjs";
-import { OPS_JOBS } from "../cloudflare/scheduler-dispatchers/ops/worker.mjs";
-
-test("ingest job is due when last success is stale and no run is in progress", () => {
-  const job = INGEST_JOBS.find((item) => item.job_key === "uk_aq_sos");
-  assert.ok(job);
-  const now = Date.parse("2026-07-10T12:15:00Z");
-  const rows = [
-    {
-      connector_code: "sos",
-      run_started_at: "2026-07-10T11:40:00Z",
-      run_ended_at: "2026-07-10T11:41:00Z",
-      run_status: "succeeded",
-      created_at: "2026-07-10T11:41:00Z",
-    },
-  ];
-
-  const decision = evaluateIngestJob(job, rows, now);
-  assert.equal(decision.due, true);
-  assert.equal(decision.reason, "due");
-  assert.equal(decision.wouldTrigger, true);
-});
-
-test("ingest job skips recent run and in-flight run", () => {
-  const job = INGEST_JOBS.find((item) => item.job_key === "uk_aq_blondon_nodes");
-  assert.ok(job);
-  const now = Date.parse("2026-07-10T12:15:00Z");
-  const rows = [
-    {
-      connector_code: "blondon_nodes",
-      run_started_at: "2026-07-10T12:10:00Z",
-      run_ended_at: null,
-      run_status: "running",
-      created_at: "2026-07-10T12:10:00Z",
-    },
-  ];
-
-  const decision = evaluateIngestJob(job, rows, now);
-  assert.equal(decision.due, false);
-  assert.equal(decision.reason, "run_in_progress");
-  assert.equal(decision.wouldTrigger, false);
-});
+import { evaluateDailyTaskJob } from "../cloudflare/scheduler/shared.mjs";
+import { OPS_JOBS } from "../cloudflare/scheduler/ops/worker.mjs";
 
 test("daily job skips until scheduled time and then becomes due", () => {
   const job = OPS_JOBS.find((item) => item.job_key === "ops.prune_daily");
@@ -86,6 +45,6 @@ test("daily job skips if a run already completed today", () => {
 });
 
 test("planned phase-2 jobs exclude deferred ops targets", () => {
-  assert.equal(INGEST_JOBS.some((job) => job.job_key === "uk_aq_db_size_logger"), false);
+  assert.equal(OPS_JOBS.some((job) => job.job_key === "uk_aq_db_size_logger"), false);
   assert.equal(OPS_JOBS.some((job) => job.job_key === "uk_aq_timeseries_aqi_hourly"), false);
 });

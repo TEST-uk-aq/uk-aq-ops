@@ -1885,6 +1885,38 @@ def _http_get_json(
     raise RuntimeError(f"GET {url} failed after retries")
 
 
+def _http_post_json(
+    *,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any] | list[dict[str, Any]],
+    timeout_seconds: int = 30,
+) -> Any:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    for key, value in headers.items():
+        req.add_header(key, value)
+    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                payload = resp.read()
+                if not payload:
+                    return None
+                return json.loads(payload.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if _is_retryable_url_error(exc) and attempt < HTTP_RETRY_ATTEMPTS:
+                _sleep_http_retry("POST", url, attempt, exc)
+                continue
+            raise
+        except Exception as exc:
+            if _is_retryable_url_error(exc) and attempt < HTTP_RETRY_ATTEMPTS:
+                _sleep_http_retry("POST", url, attempt, exc)
+                continue
+            raise
+    raise RuntimeError(f"POST {url} failed after retries")
+
+
 def _uk_air_flat_file_source_file_key(site_ref: str, year: int) -> str:
     return f"sos:site_ref={str(site_ref).strip().upper()}:year={int(year)}"
 
@@ -1943,6 +1975,8 @@ def _uk_air_flat_file_query_sql(value: str) -> str:
 def _fetch_uk_air_flat_file_mapping_rows(
     *,
     env: Mapping[str, str] | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
     target_pollutants: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     config = _resolve_obs_aqidb_supabase_rest_config(env)
@@ -1950,26 +1984,18 @@ def _fetch_uk_air_flat_file_mapping_rows(
         raise RuntimeError("OBS_AQIDB_SUPABASE_URL / OBS_AQIDB_SECRET_KEY are required for UK-AIR flat-file mode")
 
     pollutants = tuple(target_pollutants or _resolve_sos_target_pollutants(env))
-    select_fields = ",".join([
-        "site_ref",
-        "uk_air_ref",
-        "pollutant_code",
-        "station_id",
-        "timeseries_id",
-        "station_ref",
-        "timeseries_ref",
-        "valid_from_day_utc",
-        "valid_to_day_utc",
-    ])
-    query_parts = [
-        ("select", select_fields),
-        ("pollutant_code", f"in.({','.join(pollutants)})"),
-    ]
-    query = urllib.parse.urlencode(query_parts, quote_via=urllib.parse.quote, safe="(),.*")
-    url = f"{config['supabase_url']}/rest/v1/sos_station_timeseries_site_refs?{query}"
-    payload = _http_get_json(
+    if not from_day or not to_day:
+        raise RuntimeError("from_day/to_day are required for UK-AIR flat-file mapping lookup")
+
+    url = f"{config['supabase_url']}/rest/v1/rpc/uk_aq_rpc_sos_uk_air_flat_file_mappings"
+    payload = _http_post_json(
         url=url,
-        headers=_supabase_rest_headers(config["supabase_key"], "uk_aq_raw"),
+        headers=_supabase_rest_headers(config["supabase_key"], "uk_aq_public"),
+        body={
+            "p_from_day": from_day,
+            "p_to_day": to_day,
+            "p_pollutant_codes": list(pollutants),
+        },
     )
     if payload is None:
         return []
@@ -5956,7 +5982,12 @@ def check_sos_flat_files(
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
         return metrics
 
-    mapping_rows = _fetch_uk_air_flat_file_mapping_rows(env=env, target_pollutants=metrics["target_pollutants"])
+    mapping_rows = _fetch_uk_air_flat_file_mapping_rows(
+        env=env,
+        from_day=from_day,
+        to_day=to_day,
+        target_pollutants=metrics["target_pollutants"],
+    )
     grouped_mappings = _group_uk_air_flat_file_mapping_rows(mapping_rows)
     if not grouped_mappings:
         metrics["skipped_reason"] = "no UK-AIR site_ref mappings returned from Supabase"

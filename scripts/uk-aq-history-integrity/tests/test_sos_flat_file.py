@@ -229,6 +229,58 @@ class SosFlatFileTests(unittest.TestCase):
             "https://uk-air.defra.gov.uk/datastore/data_files/site_data/EA8_2026.csv?v=1",
         ])
 
+    def test_mapping_fetch_uses_public_rpc_window_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _ = self._base_env(root)
+            rpc_rows = [
+                {
+                    "site_ref": "EA8",
+                    "uk_air_ref": "UKA001",
+                    "pollutant_code": "pm10",
+                    "station_id": 1,
+                    "timeseries_id": 66,
+                    "station_ref": "EA8",
+                    "timeseries_ref": "pm10_old",
+                    "valid_from_day_utc": "2020-01-01",
+                    "valid_to_day_utc": "2026-05-17",
+                },
+                {
+                    "site_ref": "EA8",
+                    "uk_air_ref": "UKA001",
+                    "pollutant_code": "pm10",
+                    "station_id": 1,
+                    "timeseries_id": 95,
+                    "station_ref": "EA8",
+                    "timeseries_ref": "pm10_new",
+                    "valid_from_day_utc": "2026-05-18",
+                    "valid_to_day_utc": None,
+                },
+            ]
+            with mock.patch.object(MODULE, "_http_post_json", return_value=rpc_rows) as post_json:
+                rows = MODULE._fetch_uk_air_flat_file_mapping_rows(
+                    env=env,
+                    from_day="2026-05-17",
+                    to_day="2026-05-19",
+                    target_pollutants=("pm10", "no2"),
+                )
+
+            self.assertEqual([int(row["timeseries_id"]) for row in rows], [66, 95])
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(post_json.call_count, 1)
+            call = post_json.call_args
+            self.assertIsNotNone(call)
+            kwargs = call.kwargs
+            self.assertEqual(
+                kwargs["url"],
+                "https://example.supabase.co/rest/v1/rpc/uk_aq_rpc_sos_uk_air_flat_file_mappings",
+            )
+            self.assertEqual(kwargs["headers"]["Accept-Profile"], "uk_aq_public")
+            self.assertEqual(kwargs["headers"]["Content-Profile"], "uk_aq_public")
+            self.assertEqual(kwargs["body"]["p_from_day"], "2026-05-17")
+            self.assertEqual(kwargs["body"]["p_to_day"], "2026-05-19")
+            self.assertEqual(kwargs["body"]["p_pollutant_codes"], ["pm10", "no2"])
+
     def test_flat_file_worker_records_day_granular_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
