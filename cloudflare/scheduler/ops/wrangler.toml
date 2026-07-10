@@ -4,13 +4,9 @@ compatibility_date = "2026-07-10"
 
 [triggers]
 crons = [
-  "0 * * * *",   # job_keys: ops.prune_daily | ops.observs_partition_maintenance
-  "55 12 * * *",  # job_keys: ops.r2_core_snapshot
+  "0 13 * * *",  # job_keys: ops.r2_core_snapshot
 ]
 
-[vars]
-UK_AQ_PRUNE_DAILY_SERVICE_URL = "YOUR_PRUNE_DAILY_SERVICE_URL"
-UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL = "YOUR_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL"
 
 [observability]
 enabled = true
