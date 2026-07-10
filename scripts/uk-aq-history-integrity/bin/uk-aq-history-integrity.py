@@ -13192,6 +13192,7 @@ def main(argv: list[str]) -> int:
                 run_backfill=args.run_backfill,
                 limits=limits,
                 log=log,
+                history_version=history_version_mode,
             )
             cross_check_metrics.update(cc_backfill_metrics)
             if history_version_mode == "v2":
