@@ -84,6 +84,8 @@ class PreflightTests(unittest.TestCase):
                 [
                     "SUPABASE_URL=https://example-ingest.supabase.co",
                     "SB_SECRET_KEY=example-ingest-service-role-key",
+                    "INGESTDB_SUPABASE_URL=https://example-ingest-alt.supabase.co",
+                    "INGESTDB_SECRET_KEY=example-ingest-alt-service-role-key",
                     "OBS_AQIDB_SUPABASE_URL=https://example.supabase.co",
                     "OBS_AQIDB_SECRET_KEY=example-service-role-key",
                     "OBS_AQIDB_SUPABASE_DB_URL=postgresql://example",
@@ -265,13 +267,13 @@ class PreflightTests(unittest.TestCase):
                 errors, _, _ = MODULE.collect_preflight_errors(args, env)
             self.assertTrue(
                 any(
-                    "SUPABASE_URL is required for UK-AIR flat-file SOS mode." in err
+                    "SUPABASE_URL (or INGESTDB_SUPABASE_URL) is required for UK-AIR flat-file SOS mode." in err
                     for err in errors
                 ),
             )
             self.assertTrue(
                 any(
-                    "SB_SECRET_KEY is required for UK-AIR flat-file SOS mode." in err
+                    "SB_SECRET_KEY (or INGESTDB_SECRET_KEY) is required for UK-AIR flat-file SOS mode." in err
                     for err in errors
                 ),
             )

@@ -1,0 +1,18 @@
+name = "uk-aq-cron-scheduler-ops"
+main = "worker.mjs"
+compatibility_date = "2026-07-10"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "SCHEDULER_DB"
+database_name = "uk_aq_cron_scheduler_ops_db"
+database_id = "9efc661d-8300-4f97-8b31-5545547a4419"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true

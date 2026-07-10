@@ -219,10 +219,7 @@ class SosCanonicalTests(unittest.TestCase):
                 run_id=1,
                 env_name="CIC-Test",
                 run_compact="20260518T000000Z",
-                env={
-                    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                    MODULE.UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV: "sos_api",
-                },
+                env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
                 source_filter="sos",
                 sos_metrics={
                     "first_seen_files": [{"day": "2026-05-11", "timeseries_ids": [101]}],
@@ -254,10 +251,7 @@ class SosCanonicalTests(unittest.TestCase):
                 run_id=1,
                 env_name="CIC-Test",
                 run_compact="20260518T000000Z",
-                env={
-                    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                    MODULE.UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV: "sos_api",
-                },
+                env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
                 source_filter="sos",
                 sos_metrics={
                     "not_found": 1,
@@ -313,10 +307,7 @@ class SosCanonicalTests(unittest.TestCase):
                 run_id=1,
                 env_name="CIC-Test",
                 run_compact="20260518T000000Z",
-                env={
-                    "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                    MODULE.UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV: "sos_api",
-                },
+                env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
                 source_filter="sos",
                 sos_metrics={
                     "changed_files": [{"day": "2026-05-11", "timeseries_ids": [102, 103]}],
