@@ -275,8 +275,10 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     controlled by
     `UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all` (default
     `changed`). First-seen entries are baseline-only (no direct backfill);
-    temporary/permanent source errors do not replace prior good baseline
-    hashes/counts.
+    mapping rows are fetched via the public RPC
+    `uk_aq_public.uk_aq_rpc_sos_uk_air_flat_file_mappings` with the active
+    day window. Temporary/permanent source errors do not replace prior good
+    baseline hashes/counts.
   - Phase 7.4: observation-repair candidate selection now includes
     `sos` in cross-check connector filters, and merges cross-check
     discrepancies with SOS source-change candidates (`changed`/`reappeared`)

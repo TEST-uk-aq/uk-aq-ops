@@ -97,7 +97,7 @@ Use this when deciding **what to touch, in which repo, and in what order**.
    - `supabase/functions/ingest_*/index.ts` when invocation contract changes
 2. **Schema repo**: update scheduler helper SQL/RPC definitions if applicable.
 3. **Workflow check**:
-   - `CIC-test-uk-aq-ingest/.github/workflows/uk_aq_dispatcher_deploy.yml`
+   - `CIC-test-uk-aq-ingest/.github/workflows/uk_aq_ingest_poller_deploy.yml`
    - any scheduled workflow invoking polling paths
 4. **Policy check**: website polling requirement remains at 1 minute minimum for relevant paths.
 

@@ -232,7 +232,20 @@ class SosFlatFileTests(unittest.TestCase):
     def test_mapping_fetch_uses_public_rpc_window_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            env, _ = self._base_env(root)
+            backfill_env = root / "backfill.env"
+            backfill_env.write_text(
+                "\n".join(
+                    [
+                        "OBS_AQIDB_SUPABASE_URL=https://example.supabase.co",
+                        "OBS_AQIDB_SECRET_KEY=example-service-role-key",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                "UK_AQ_BACKFILL_ENV_FILE": str(backfill_env),
+            }
             rpc_rows = [
                 {
                     "site_ref": "EA8",
@@ -277,9 +290,9 @@ class SosFlatFileTests(unittest.TestCase):
             )
             self.assertEqual(kwargs["headers"]["Accept-Profile"], "uk_aq_public")
             self.assertEqual(kwargs["headers"]["Content-Profile"], "uk_aq_public")
-            self.assertEqual(kwargs["body"]["p_from_day"], "2026-05-17")
-            self.assertEqual(kwargs["body"]["p_to_day"], "2026-05-19")
-            self.assertEqual(kwargs["body"]["p_pollutant_codes"], ["pm10", "no2"])
+            self.assertEqual(kwargs["body"]["p"]["p_from_day"], "2026-05-17")
+            self.assertEqual(kwargs["body"]["p"]["p_to_day"], "2026-05-19")
+            self.assertEqual(kwargs["body"]["p"]["p_pollutant_codes"], ["pm10", "no2"])
 
     def test_flat_file_worker_records_day_granular_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

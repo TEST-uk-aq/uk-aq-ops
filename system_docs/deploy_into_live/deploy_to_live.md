@@ -641,7 +641,7 @@ Complete Phase 0.4 before this step. Then add the following to the **LIVE-uk-aq-
 - `uk_aq_blondon_communities_cloud_run_deploy.yml`
 - `uk_aq_sos_cloud_run_deploy.yml`
 - `uk_aq_observs_pubsub_cloud_run_deploy.yml`
-- `uk_aq_dispatcher_deploy.yml`
+- `uk_aq_ingest_poller_deploy.yml`
 - `supabase_edge_deploy.yml`
 - `uk_aq_observs_edge_deploy.yml`
 

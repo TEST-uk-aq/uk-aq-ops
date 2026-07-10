@@ -459,9 +459,11 @@ Flat-file mapping rules:
 
 - Source rows are counted by day and pollutant from the annual CSVs.
 - Pollutants are limited to `pm25`, `pm10`, and `no2`.
-- Mapping rows are resolved from `uk_aq_raw.sos_station_timeseries_site_refs`
-  via Obs/AQI DB REST using `OBS_AQIDB_SUPABASE_URL` and
-  `OBS_AQIDB_SECRET_KEY`.
+- Mapping rows are resolved from the public RPC
+  `uk_aq_public.uk_aq_rpc_sos_uk_air_flat_file_mappings`, called via Obs/AQI
+  DB REST using `OBS_AQIDB_SUPABASE_URL` and `OBS_AQIDB_SECRET_KEY`.
+- The mapping fetch is window-limited by `from_day`/`to_day` and the target
+  pollutant set before any CSV downloads begin.
 - 0 mapping rows => `unmapped_source`
 - 1 mapping row => use it
 - >1 mapping rows => `ambiguous_mapping`
