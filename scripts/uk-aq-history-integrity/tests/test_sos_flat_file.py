@@ -290,9 +290,9 @@ class SosFlatFileTests(unittest.TestCase):
             )
             self.assertEqual(kwargs["headers"]["Accept-Profile"], "uk_aq_public")
             self.assertEqual(kwargs["headers"]["Content-Profile"], "uk_aq_public")
-            self.assertEqual(kwargs["body"]["p"]["p_from_day"], "2026-05-17")
-            self.assertEqual(kwargs["body"]["p"]["p_to_day"], "2026-05-19")
-            self.assertEqual(kwargs["body"]["p"]["p_pollutant_codes"], ["pm10", "no2"])
+            self.assertEqual(kwargs["body"]["p_from_day"], "2026-05-17")
+            self.assertEqual(kwargs["body"]["p_to_day"], "2026-05-19")
+            self.assertEqual(kwargs["body"]["p_pollutant_codes"], ["pm10", "no2"])
 
     def test_flat_file_worker_records_day_granular_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

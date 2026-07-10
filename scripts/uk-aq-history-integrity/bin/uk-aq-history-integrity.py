@@ -1992,11 +1992,9 @@ def _fetch_uk_air_flat_file_mapping_rows(
         url=url,
         headers=_supabase_rest_headers(config["supabase_key"], "uk_aq_public"),
         body={
-            "p": {
-                "p_from_day": from_day,
-                "p_to_day": to_day,
-                "p_pollutant_codes": list(pollutants),
-            },
+            "p_from_day": from_day,
+            "p_to_day": to_day,
+            "p_pollutant_codes": list(pollutants),
         },
     )
     if payload is None:
