@@ -1,4 +1,4 @@
-# UK AQ Ops Scheduler Dispatcher
+# UK AQ Scheduler Ops
 
 Cloudflare Worker dry-run scheduler for ops jobs.
 

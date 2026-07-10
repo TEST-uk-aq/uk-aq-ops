@@ -1,9 +1,9 @@
-name = "uk-aq-ingest-scheduler-dispatcher"
+name = "uk-aq-scheduler-ops"
 main = "worker.mjs"
 compatibility_date = "2026-07-10"
 
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["0 * * * *"]
 
 [observability]
 enabled = true

@@ -11,7 +11,7 @@ import {
   summarizeDecision,
 } from "../shared.mjs";
 
-const WORKER_NAME = "uk-aq-ops-scheduler-dispatcher";
+const WORKER_NAME = "uk-aq-scheduler-ops";
 const OPS_SCHEMA = "uk_aq_ops";
 const OPS_TABLE = "daily_task_runs_dashboard";
 const OPS_SELECT = "run_id,task_key,task_name,platform,source,scheduled_for_date,scheduled_time_utc,scheduled_at_utc,attempt,raw_status,started_at,finished_at,failed_at,updated_at,duration_seconds,summary,error_message,log_url,effective_status,scheduled_or_started_at,finished_or_failed_at,is_failed,is_overdue,is_not_started,task_day_rank";
