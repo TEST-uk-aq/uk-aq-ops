@@ -133,7 +133,7 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             with self.assertRaises(sync_jobs.JobsConfigError):
                 sync_jobs.validate_jobs_config(sync_jobs.load_jobs_config(bad_jobs))
 
-    def test_cloud_run_deploy_reconciles_service_url_and_dispatch_secret(self) -> None:
+    def test_cloud_run_deploy_reconciles_service_url_and_shared_edge_secret(self) -> None:
         workflow = (
             ROOT / ".github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml"
         ).read_text(encoding="utf-8")
@@ -144,9 +144,11 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         self.assertIn("update scheduler_jobs", workflow)
         self.assertIn("Verify deployed Cloud Run URL in D1", workflow)
         self.assertIn(
-            "UK_AQ_CLOUD_RUN_DISPATCH_SECRET=${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}:latest",
+            'upsert_secret "UK_AQ_EDGE_UPSTREAM_SECRET" "${UK_AQ_EDGE_UPSTREAM_SECRET}" 1',
             workflow,
         )
+        retired_secret_name = "UK_AQ_CLOUD_RUN_" + "DISPATCH_SECRET"
+        self.assertNotIn(retired_secret_name, workflow)
         self.assertIn("--allow-unauthenticated", workflow)
 
     def test_cloud_run_workflows_map_upstream_auth_only_as_secret(self) -> None:
@@ -166,6 +168,17 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
                     'secret_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=UK_AQ_EDGE_UPSTREAM_SECRET:latest")',
                     workflow,
                 )
+                self.assertIn(
+                    'upsert_secret "UK_AQ_EDGE_UPSTREAM_SECRET" "${UK_AQ_EDGE_UPSTREAM_SECRET}" 1',
+                    workflow,
+                )
+                self.assertIn(
+                    'gcloud secrets describe "UK_AQ_EDGE_UPSTREAM_SECRET"',
+                    workflow,
+                )
+                self.assertIn("group: uk-aq-cloud-run-shared-secret-deploy", workflow)
+                retired_secret_name = "UK_AQ_CLOUD_RUN_" + "DISPATCH_SECRET"
+                self.assertNotIn(retired_secret_name, workflow)
 
 
 if __name__ == "__main__":

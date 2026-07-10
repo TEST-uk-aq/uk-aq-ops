@@ -22,7 +22,7 @@ export function validateRunAuth(req, env = process.env) {
   );
   const dispatchValid = securelyMatches(
     req.headers[DISPATCH_AUTH_HEADER],
-    env.UK_AQ_EDGE_UPSTREAM_SECRET,
+    env.UK_AQ_CLOUD_RUN_DISPATCH_SECRET,
   );
 
   if (upstreamValid || dispatchValid) {

@@ -569,9 +569,9 @@ async function dispatchGitHubWorkflow(job, env) {
 }
 
 async function dispatchCloudRun(job, env) {
-  const secret = trimText(await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET));
+  const secret = trimText(await readSecret(env.UK_AQ_CLOUD_RUN_DISPATCH_SECRET));
   if (!secret) {
-    throw new Error("Missing required Worker secret: UK_AQ_EDGE_UPSTREAM_SECRET");
+    throw new Error("Missing required Worker secret: UK_AQ_CLOUD_RUN_DISPATCH_SECRET");
   }
 
   const headers = new Headers();

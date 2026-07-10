@@ -22,7 +22,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: ${{ secrets.UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT || '' }}
-      UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+      UK_AQ_CLOUD_RUN_DISPATCH_SECRET: ${{ secrets.UK_AQ_CLOUD_RUN_DISPATCH_SECRET || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,10 +40,6 @@ jobs:
           fi
           if [ -z "${UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT}" ]; then
             echo "Missing secret UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT."
-            exit 1
-          fi
-          if [ -z "${UK_AQ_EDGE_UPSTREAM_SECRET}" ]; then
-            echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
             exit 1
           fi
 
@@ -101,8 +97,8 @@ jobs:
           set -euo pipefail
           secrets_json="$(jq -n \
             --arg UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT "${UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT}" \
-            --arg UK_AQ_EDGE_UPSTREAM_SECRET "${UK_AQ_EDGE_UPSTREAM_SECRET}" \
-            '{UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: $UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET} | with_entries(select(.value != ""))')"
+            --arg UK_AQ_CLOUD_RUN_DISPATCH_SECRET "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" \
+            '{UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: $UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT, UK_AQ_CLOUD_RUN_DISPATCH_SECRET: $UK_AQ_CLOUD_RUN_DISPATCH_SECRET} | with_entries(select(.value != ""))')"
           printf '%s' "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-cron-scheduler-ops
 
       - name: Redeploy worker

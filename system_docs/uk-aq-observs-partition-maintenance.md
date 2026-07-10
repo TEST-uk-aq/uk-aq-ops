@@ -29,14 +29,13 @@ This deploys a dedicated Cloud Run service that maintains `uk_aq_observs.observa
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
 - `UK_AQ_EDGE_UPSTREAM_SECRET`
-- `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`
 
 ## HTTP authentication
 
 `POST /run` accepts either existing upstream authentication with
 `x-uk-aq-upstream-auth: <UK_AQ_EDGE_UPSTREAM_SECRET>` or Cloudflare scheduler
 authentication with
-`x-uk-aq-dispatch-secret: <UK_AQ_CLOUD_RUN_DISPATCH_SECRET>`. A caller needs one
+`x-uk-aq-dispatch-secret: <UK_AQ_EDGE_UPSTREAM_SECRET>`. A caller needs one
 valid route, not both. Missing or invalid credentials return HTTP 403.
 
 The service remains deployed with `--allow-unauthenticated` because the
@@ -81,7 +80,7 @@ Run once:
 
 ```bash
 curl -X POST \
-  -H "x-uk-aq-dispatch-secret: ${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" \
+  -H "x-uk-aq-dispatch-secret: ${UK_AQ_EDGE_UPSTREAM_SECRET}" \
   "http://localhost:8080/run"
 ```
 
@@ -89,7 +88,7 @@ Dry-run partition drop gate:
 
 ```bash
 curl -X POST \
-  -H "x-uk-aq-dispatch-secret: ${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" \
+  -H "x-uk-aq-dispatch-secret: ${UK_AQ_EDGE_UPSTREAM_SECRET}" \
   "http://localhost:8080/run?dropDryRun=true"
 ```
 
@@ -104,29 +103,23 @@ The `uk_aq_observs_partition_maintenance` job is tracked in
 `cloudflare/scheduler/jobs.toml`. Its Cloud Run URL is deployment-managed: the
 service deploy workflow reads `status.url`, appends `/run`, syncs the Git-tracked
 job configuration, updates that URL in D1, and verifies the resulting row. The
-initial scheduler setting is `dry_run = true`, so it records due dispatches but
-does not call the service.
+current `dry_run` behavior is controlled by `cloudflare/scheduler/jobs.toml`.
 
 ## Secret rotation and deployment
 
-Generate a secret without placing its value directly in shell history:
+Use the existing GitHub Actions edge secret for both deploy workflows. If it
+needs to be restored from the local environment:
 
 ```bash
-read -r -s UK_AQ_CLOUD_RUN_DISPATCH_SECRET < <(openssl rand -base64 48)
-export UK_AQ_CLOUD_RUN_DISPATCH_SECRET
-```
-
-Update the GitHub Actions secret used by both deploy workflows:
-
-```bash
-printf '%s' "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" | \
-  gh secret set UK_AQ_CLOUD_RUN_DISPATCH_SECRET --repo TEST-uk-aq/uk-aq-ops
+printf '%s' "${UK_AQ_EDGE_UPSTREAM_SECRET}" | \
+  gh secret set UK_AQ_EDGE_UPSTREAM_SECRET --repo TEST-uk-aq/uk-aq-ops
 ```
 
 The Cloud Run deploy workflow upserts the value into GCP Secret Manager, maps it
-to `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`, deploys the service, and reconciles the D1
-URL. The Cloudflare Worker deploy workflow installs the same GitHub secret on
-`uk-aq-cron-scheduler-ops`.
+to `UK_AQ_EDGE_UPSTREAM_SECRET`, deploys the service, and reconciles the D1 URL.
+The Cloudflare Worker deploy workflow installs the same GitHub secret on
+`uk-aq-cron-scheduler-ops`. Do not rotate this shared value only for the
+scheduler; all edge and upstream consumers must be updated together.
 
 ```bash
 gh workflow run uk_aq_observs_partition_maintenance_cloud_run_deploy.yml \

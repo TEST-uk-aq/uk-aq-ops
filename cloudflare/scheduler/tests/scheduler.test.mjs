@@ -358,7 +358,7 @@ test("GitHub PAT and Cloud Run secrets do not appear in logs", async () => {
       store,
       {
         UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: "super-secret-pat",
-        UK_AQ_CLOUD_RUN_DISPATCH_SECRET: "super-secret-cloud-run",
+        UK_AQ_EDGE_UPSTREAM_SECRET: "super-secret-cloud-run",
       },
       Date.parse("2026-07-10T04:15:30Z"),
     );
@@ -407,7 +407,7 @@ test("Cloud Run dispatch adds the shared dispatch secret and records success", a
   try {
     const result = await runScheduler(
       store,
-      { UK_AQ_CLOUD_RUN_DISPATCH_SECRET: "cloud-secret" },
+      { UK_AQ_EDGE_UPSTREAM_SECRET: "cloud-secret" },
       Date.parse("2026-07-10T04:15:30Z"),
     );
 
@@ -448,7 +448,7 @@ test("Cloud Run dispatch records failure for non-2xx responses", async () => {
   try {
     const result = await runScheduler(
       store,
-      { UK_AQ_CLOUD_RUN_DISPATCH_SECRET: "cloud-secret" },
+      { UK_AQ_EDGE_UPSTREAM_SECRET: "cloud-secret" },
       Date.parse("2026-07-10T04:15:30Z"),
     );
 

@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: uk-aq-observs-partition-maintenance-service-deploy
+  group: uk-aq-cloud-run-shared-secret-deploy
   cancel-in-progress: false
 
 jobs:
@@ -32,8 +32,6 @@ jobs:
       RESOURCE_LABEL: uk-aq-observs-partition-maintenance-service
       OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT || '' }}
       UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
-      UK_AQ_CLOUD_RUN_DISPATCH_SECRET: ${{ secrets.UK_AQ_CLOUD_RUN_DISPATCH_SECRET || '' }}
-      UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME: ${{ vars.UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME || 'UK_AQ_CLOUD_RUN_DISPATCH_SECRET' }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
       SCHEDULER_D1_DATABASE: uk_aq_cron_scheduler_ops_db
@@ -99,10 +97,6 @@ jobs:
           fi
           if [ -z "${UK_AQ_EDGE_UPSTREAM_SECRET}" ]; then
             echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
-            exit 1
-          fi
-          if [ -z "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" ]; then
-            echo "Missing secret UK_AQ_CLOUD_RUN_DISPATCH_SECRET."
             exit 1
           fi
           if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ] || [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
@@ -229,7 +223,7 @@ jobs:
           }
 
           upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
-          upsert_secret "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}" "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" 1
+          upsert_secret "UK_AQ_EDGE_UPSTREAM_SECRET" "${UK_AQ_EDGE_UPSTREAM_SECRET}" 1
 
           if [ -n "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
             upsert_secret "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}" "${CFLARE_R2_ACCESS_KEY_ID}" 1
@@ -251,7 +245,7 @@ jobs:
         run: |
           set -euo pipefail
           gcloud secrets describe "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
-          gcloud secrets describe "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null
+          gcloud secrets describe "UK_AQ_EDGE_UPSTREAM_SECRET" --project "${PROJECT_ID}" >/dev/null
           for optional_secret in \
             "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" \
             "${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME:-}" \
@@ -321,7 +315,6 @@ jobs:
 
           secret_updates=()
           secret_updates+=("OBS_AQIDB_SECRET_KEY=${OBS_AQIDB_SECRET_KEY_SECRET_NAME}:latest")
-          secret_updates+=("UK_AQ_CLOUD_RUN_DISPATCH_SECRET=${UK_AQ_CLOUD_RUN_DISPATCH_SECRET_NAME}:latest")
           if [ -n "${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME:-}" ]; then
             secret_updates+=("CFLARE_R2_ACCESS_KEY_ID=${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
           fi

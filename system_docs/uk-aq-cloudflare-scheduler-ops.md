@@ -36,13 +36,14 @@ The worker reads enabled jobs from D1, claims due slots once, and dispatches eit
 
 - `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
 
-## Cloud Run secret
+## Cloud Run authentication secret
 
-- `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`
+- `UK_AQ_EDGE_UPSTREAM_SECRET`
 
 The Worker adds this value as `x-uk-aq-dispatch-secret` for Cloud Run targets. It
 must match the target service's Secret Manager-backed environment value and must
-not be stored in D1 job headers or bodies.
+not be stored in D1 job headers or bodies. The value is shared with existing
+edge/upstream callers, so rotation must be coordinated across all consumers.
 
 The `uk_aq_observs_partition_maintenance` target uses a deployment-managed URL.
 Its Cloud Run deploy workflow resolves the current service URL and writes the
@@ -98,12 +99,12 @@ cd cloudflare/scheduler && printf '%s' "$UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT" | w
 cd cloudflare/scheduler && wrangler deploy
 ```
 
-Install the Cloud Run dispatch secret before deploying:
+Install the existing shared edge secret before deploying:
 
 ```bash
 cd cloudflare/scheduler
-printf '%s' "${UK_AQ_CLOUD_RUN_DISPATCH_SECRET}" | \
-  wrangler secret put UK_AQ_CLOUD_RUN_DISPATCH_SECRET \
+printf '%s' "${UK_AQ_EDGE_UPSTREAM_SECRET}" | \
+  wrangler secret put UK_AQ_EDGE_UPSTREAM_SECRET \
     --name uk-aq-cron-scheduler-ops
 ```
 
