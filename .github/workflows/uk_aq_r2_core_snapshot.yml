@@ -2,7 +2,7 @@ name: UK AQ R2 Core Snapshot
 
 on:
   # Intended external schedule:
-  #   12:05 UTC daily via cloudflare/scheduler/ops
+  #   20 12 * * * via cloudflare/scheduler/ops
   # Previous GitHub cron:
   #   schedule:
   #     - cron: "15 4 * * *"

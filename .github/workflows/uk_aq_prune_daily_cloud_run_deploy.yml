@@ -34,6 +34,7 @@ jobs:
       SERVICE_NAME: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_NAME || vars.GCP_INGESTDB_PRUNE_SERVICE_NAME || vars.INGESTDB_PRUNE_SERVICE_NAME || 'uk-aq-prune-daily' }}
       RESOURCE_LABEL: uk-aq-prune-daily
       UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_ACCOUNT || vars.GCP_INGESTDB_PRUNE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.UK_AQ_PRUNE_DAILY_RUNTIME_SERVICE_ACCOUNT || vars.INGESTDB_PRUNE_RUNTIME_SERVICE_ACCOUNT || '' }}
+      UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
       SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_TIMEOUT_SECONDS || vars.GCP_INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || vars.UK_AQ_PRUNE_DAILY_SERVICE_TIMEOUT_SECONDS || vars.INGESTDB_PRUNE_SERVICE_TIMEOUT_SECONDS || '900' }}
       SERVICE_CPU: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_CPU || vars.GCP_INGESTDB_PRUNE_SERVICE_CPU || vars.UK_AQ_PRUNE_DAILY_SERVICE_CPU || vars.INGESTDB_PRUNE_SERVICE_CPU || '1' }}
       SERVICE_MEMORY: ${{ vars.GCP_UK_AQ_PRUNE_DAILY_SERVICE_MEMORY || vars.GCP_INGESTDB_PRUNE_SERVICE_MEMORY || vars.UK_AQ_PRUNE_DAILY_SERVICE_MEMORY || vars.INGESTDB_PRUNE_SERVICE_MEMORY || '256Mi' }}
@@ -118,6 +119,10 @@ jobs:
           set -euo pipefail
           if [ -z "${PROJECT_ID:-}" ]; then
             echo "Missing required repo variable: GCP_PROJECT_ID"
+            exit 1
+          fi
+          if [ -z "${UK_AQ_EDGE_UPSTREAM_SECRET}" ]; then
+            echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
             exit 1
           fi
           if [ -z "${SUPABASE_URL:-}" ]; then
@@ -369,6 +374,7 @@ jobs:
           if [ -n "${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL:-}" ]; then
             env_updates+=("UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL=${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL}")
           fi
+          env_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=${UK_AQ_EDGE_UPSTREAM_SECRET}")
 
           env_file="${RUNNER_TEMP}/uk-aq-prune-daily-env.yaml"
           : > "${env_file}"
@@ -385,6 +391,7 @@ jobs:
           secret_updates+=("SUPABASE_DB_URL=${SUPABASE_DB_URL_SECRET_NAME}:latest")
           secret_updates+=("CFLARE_R2_ACCESS_KEY_ID=${CFLARE_R2_ACCESS_KEY_ID_SECRET_NAME}:latest")
           secret_updates+=("CFLARE_R2_SECRET_ACCESS_KEY=${CFLARE_R2_SECRET_ACCESS_KEY_SECRET_NAME}:latest")
+          secret_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=UK_AQ_EDGE_UPSTREAM_SECRET:latest")
           if [ -n "${DROPBOX_APP_KEY_SECRET_NAME:-}" ]; then
             secret_updates+=("DROPBOX_APP_KEY=${DROPBOX_APP_KEY_SECRET_NAME}:latest")
           fi
@@ -415,7 +422,7 @@ jobs:
             --no-cpu-boost \
             --cpu-throttling \
             --labels "job_name=${RESOURCE_LABEL},service_name=${SERVICE_NAME}" \
-            --no-allow-unauthenticated \
+            --allow-unauthenticated \
             --env-vars-file "${{ steps.cloudrun_args.outputs.env_file }}" \
             --set-secrets "${{ steps.cloudrun_args.outputs.secret_csv }}"
 
@@ -456,7 +463,7 @@ jobs:
               --time-zone "${SCHEDULER_TIMEZONE}" \
               --uri "${scheduler_uri}" \
               --http-method POST \
-              --update-headers "Content-Type=application/json" \
+              --update-headers "Content-Type=application/json,X-UK-AQ-Upstream-Auth=${UK_AQ_EDGE_UPSTREAM_SECRET}" \
               --message-body "${scheduler_body}" \
               --oidc-service-account-email "${scheduler_sa}" \
               --oidc-token-audience "${service_uri}" \
@@ -470,7 +477,7 @@ jobs:
               --time-zone "${SCHEDULER_TIMEZONE}" \
               --uri "${scheduler_uri}" \
               --http-method POST \
-              --headers "Content-Type=application/json" \
+              --headers "Content-Type=application/json,X-UK-AQ-Upstream-Auth=${UK_AQ_EDGE_UPSTREAM_SECRET}" \
               --message-body "${scheduler_body}" \
               --oidc-service-account-email "${scheduler_sa}" \
               --oidc-token-audience "${service_uri}" \

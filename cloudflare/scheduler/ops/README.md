@@ -4,7 +4,7 @@ Cloudflare Worker scheduler for ops jobs.
 
 ## Scope
 
-This worker evaluates and logs Cloud Run decisions for the hourly ops jobs, and it dispatches the R2 core snapshot GitHub workflow at 12:05 UTC.
+This worker dispatches the hourly ops Cloud Run services and the R2 core snapshot GitHub workflow.
 
 Tracked jobs:
 
@@ -20,13 +20,16 @@ Tracked jobs:
 
 ## Logging
 
-The worker logs one JSON decision record per job and a final summary record for each scheduled invocation. GitHub dispatch jobs also log the dispatch attempt and response status.
+The worker logs one JSON decision record per job and a final summary record for each scheduled invocation. Cloud Run and GitHub dispatch jobs also log the dispatch attempt and response status.
 
 ## Cron
 
 - `0 * * * *`
-- `5 12 * * *`
+- `20 12 * * *`
 
-## GitHub dispatch
+## Required config
 
-The core snapshot dispatch reuses the existing `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN` repo secret and writes it to the Worker secret `GITHUB_WORKFLOW_DISPATCH_TOKEN`.
+- `UK_AQ_EDGE_UPSTREAM_SECRET` is written to the Worker secret `UK_AQ_EDGE_UPSTREAM_SECRET`.
+- `UK_AQ_PRUNE_DAILY_SERVICE_URL` points at the prune Cloud Run service URL.
+- `UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL` points at the observs partition maintenance Cloud Run service URL.
+- `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN` is written to the Worker secret `GITHUB_WORKFLOW_DISPATCH_TOKEN`.

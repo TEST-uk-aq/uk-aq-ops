@@ -1,6 +1,6 @@
 # UK AQ Cloudflare Scheduler Ops
 
-This document covers the ops-side scheduler worker that evaluates fixed schedules, logs decisions, and dispatches the R2 core snapshot GitHub workflow.
+This document covers the ops-side scheduler worker that dispatches the hourly Cloud Run jobs and the R2 core snapshot GitHub workflow.
 
 ## Current scope
 
@@ -10,12 +10,18 @@ This document covers the ops-side scheduler worker that evaluates fixed schedule
 - Path: `cloudflare/scheduler/ops/`
 - Crons:
   - `0 * * * *`
-  - `5 12 * * *`
+  - `20 12 * * *`
 - Jobs: `ops.prune_daily`, `ops.observs_partition_maintenance`, `ops.r2_core_snapshot`
 
 GitHub dispatch secret:
 
 - `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN` from the ops repo, written into the Worker secret `GITHUB_WORKFLOW_DISPATCH_TOKEN` during deploy.
+
+Cloud Run trigger secret and URLs:
+
+- `UK_AQ_EDGE_UPSTREAM_SECRET`
+- `UK_AQ_PRUNE_DAILY_SERVICE_URL`
+- `UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL`
 
 ## Explicitly deferred
 
@@ -33,9 +39,9 @@ Keep them out until the state model is ready for a safe trigger path.
 
 ## Behavior
 
-- The hourly jobs only evaluate and log decisions.
-- The `ops.r2_core_snapshot` job dispatches `workflow_dispatch` to GitHub at 12:05 UTC.
-- `would_trigger` is still logged for the hourly jobs, and dispatch errors fail the scheduled run so they can be retried.
+- The hourly jobs evaluate state and then POST `/run` to their Cloud Run services with `X-UK-AQ-Upstream-Auth`.
+- The `ops.r2_core_snapshot` job dispatches `workflow_dispatch` to GitHub.
+- Dispatch errors fail the scheduled run so they can be retried.
 
 ## Auth direction for later phases
 

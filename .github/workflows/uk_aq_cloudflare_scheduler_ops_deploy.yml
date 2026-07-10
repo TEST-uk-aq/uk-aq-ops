@@ -18,7 +18,10 @@ jobs:
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
       UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN: ${{ secrets.UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN || '' }}
+      UK_AQ_PRUNE_DAILY_SERVICE_URL: ${{ vars.UK_AQ_PRUNE_DAILY_SERVICE_URL || '' }}
+      UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL: ${{ vars.UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL || '' }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY || '' }}
     steps:
@@ -36,8 +39,20 @@ jobs:
             echo "Missing secret CLOUDFLARE_API_TOKEN."
             exit 1
           fi
+          if [ -z "${UK_AQ_EDGE_UPSTREAM_SECRET}" ]; then
+            echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
+            exit 1
+          fi
           if [ -z "${UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN}" ]; then
             echo "Missing secret UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_PRUNE_DAILY_SERVICE_URL}" ]; then
+            echo "Missing repo variable UK_AQ_PRUNE_DAILY_SERVICE_URL."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL}" ]; then
+            echo "Missing repo variable UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL."
             exit 1
           fi
           if [ -z "${OBS_AQIDB_SUPABASE_URL}" ]; then
@@ -57,6 +72,22 @@ jobs:
             exit 1
           fi
           sed -i "s/YOUR_GITHUB_OWNER/${GITHUB_REPOSITORY_OWNER}/g" cloudflare/scheduler/ops/worker.mjs
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          path = Path("cloudflare/scheduler/ops/wrangler.toml")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              "YOUR_PRUNE_DAILY_SERVICE_URL": os.environ["UK_AQ_PRUNE_DAILY_SERVICE_URL"],
+              "YOUR_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL": os.environ["UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL"],
+          }
+          for needle, value in replacements.items():
+              if not value:
+                  raise SystemExit(f"Missing value for {needle}")
+              text = text.replace(needle, value)
+          path.write_text(text, encoding="utf-8")
+          PY
 
       - name: Deploy worker
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
@@ -71,10 +102,11 @@ jobs:
         run: |
           set -euo pipefail
           secrets_json="$(jq -n \
+            --arg UK_AQ_EDGE_UPSTREAM_SECRET "${UK_AQ_EDGE_UPSTREAM_SECRET}" \
             --arg OBS_AQIDB_SUPABASE_URL "${OBS_AQIDB_SUPABASE_URL}" \
             --arg OBS_AQIDB_SECRET_KEY "${OBS_AQIDB_SECRET_KEY}" \
             --arg GITHUB_WORKFLOW_DISPATCH_TOKEN "${UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN}" \
-            '{OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, GITHUB_WORKFLOW_DISPATCH_TOKEN: $GITHUB_WORKFLOW_DISPATCH_TOKEN} | with_entries(select(.value != ""))')"
+            '{UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, GITHUB_WORKFLOW_DISPATCH_TOKEN: $GITHUB_WORKFLOW_DISPATCH_TOKEN} | with_entries(select(.value != ""))')"
           printf '%s' "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-scheduler-ops
 
       - name: Redeploy worker
