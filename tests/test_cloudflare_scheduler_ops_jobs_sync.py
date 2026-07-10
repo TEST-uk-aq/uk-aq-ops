@@ -44,6 +44,25 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         self.assertTrue(all(job["dry_run"] == 1 for job in manifest["jobs"]))
         self.assertTrue(all(job["enabled"] == 1 for job in manifest["jobs"]))
 
+    def test_github_workflow_jobs_default_cloud_run_method_to_post(self) -> None:
+        job = sync_jobs.validate_job(
+            "uk_aq_r2_core_snapshot",
+            {
+                "enabled": True,
+                "target_type": "github_workflow",
+                "cron_expr": "15 4 * * *",
+                "github_repo": "TEST-uk-aq/uk-aq-ops",
+                "github_workflow_file": "uk_aq_r2_core_snapshot.yml",
+                "dry_run": True,
+                "notes": "test",
+            },
+        )
+
+        self.assertEqual(job["cloud_run_method"], "POST")
+
+        sql = sync_jobs.render_upsert_statement(job)
+        self.assertIn("NULL,\n  'POST',\n  NULL,\n  NULL,\n  1,\n  'test'", sql)
+
     def test_rendered_sql_uses_upserts_and_current_timestamp(self) -> None:
         manifest = sync_jobs.validate_jobs_config(sync_jobs.load_jobs_config(self.jobs_file))
         sql = sync_jobs.render_sync_sql(manifest)
@@ -53,6 +72,7 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         self.assertIn("updated_at = current_timestamp", sql)
         self.assertIn("github_inputs_json = excluded.github_inputs_json", sql)
         self.assertIn("uk_aq_r2_history_dropbox_backup_force_prune_recheck", sql)
+        self.assertIn("NULL,\n  'POST',\n  NULL,\n  NULL,\n  1,", sql)
 
     def test_main_writes_sql_and_manifest_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -78,6 +98,10 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             manifest = json.loads(json_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["job_count"], 4)
             self.assertEqual(len(manifest["jobs"]), 4)
+            core_snapshot = next(
+                job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_core_snapshot"
+            )
+            self.assertEqual(core_snapshot["cloud_run_method"], "POST")
 
     def test_invalid_cron_expression_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

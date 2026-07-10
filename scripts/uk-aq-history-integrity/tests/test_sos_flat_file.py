@@ -165,6 +165,49 @@ class SosFlatFileTests(unittest.TestCase):
             "/tmp/cache/site_ref=EA8/year=2026/EA8_2026.csv",
         )
 
+    def test_flat_file_remote_metadata_match_requires_reliable_signal(self) -> None:
+        prior = {
+            "etag": 'W/"same"',
+            "last_modified_utc": "Mon, 01 Jan 2024 00:00:00 GMT",
+            "content_length": 123,
+        }
+        self.assertTrue(
+            MODULE._uk_air_flat_file_remote_metadata_matches(
+                prior,
+                {
+                    "etag": 'W/"same"',
+                    "last_modified": "Tue, 02 Jan 2024 00:00:00 GMT",
+                    "content_length": 999,
+                },
+            )
+        )
+        self.assertFalse(
+            MODULE._uk_air_flat_file_remote_metadata_matches(
+                prior,
+                {
+                    "etag": 'W/"changed"',
+                    "last_modified": prior["last_modified_utc"],
+                    "content_length": prior["content_length"],
+                },
+            )
+        )
+        self.assertTrue(
+            MODULE._uk_air_flat_file_remote_metadata_matches(
+                prior,
+                {
+                    "etag": None,
+                    "last_modified": prior["last_modified_utc"],
+                    "content_length": prior["content_length"],
+                },
+            )
+        )
+        self.assertFalse(
+            MODULE._uk_air_flat_file_remote_metadata_matches(
+                prior,
+                {"etag": None, "last_modified": None, "content_length": 123},
+            )
+        )
+
     def test_flat_file_parser_counts_rows_by_day_and_pollutant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "EA8_2026.csv"
