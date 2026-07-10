@@ -1867,8 +1867,8 @@ def _resolve_ingestdb_supabase_rest_config(
 ) -> dict[str, str]:
     return _resolve_supabase_rest_config(
         env,
-        url_env_names=("SUPABASE_URL",),
-        key_env_names=("SB_SECRET_KEY",),
+        url_env_names=("SUPABASE_URL", "INGESTDB_SUPABASE_URL"),
+        key_env_names=("SB_SECRET_KEY", "INGESTDB_SECRET_KEY"),
     )
 
 
@@ -1877,7 +1877,6 @@ def _supabase_rest_headers(service_key: str, schema: str) -> dict[str, str]:
         "apikey": service_key,
         "Authorization": f"Bearer {service_key}",
         "Accept": "application/json",
-        "Content-Type": "application/json",
         "Accept-Profile": schema,
         "Content-Profile": schema,
     }
@@ -2035,7 +2034,7 @@ def _fetch_uk_air_flat_file_mapping_rows(
     config = _resolve_ingestdb_supabase_rest_config(env)
     if not config["supabase_url"] or not config["supabase_key"]:
         raise RuntimeError(
-            "SUPABASE_URL / SB_SECRET_KEY are required for UK-AIR flat-file mode"
+            "SUPABASE_URL / SB_SECRET_KEY (or INGESTDB_SUPABASE_URL / INGESTDB_SECRET_KEY) are required for UK-AIR flat-file mode"
         )
 
     pollutants = tuple(target_pollutants or _resolve_sos_target_pollutants(env))
@@ -2049,8 +2048,8 @@ def _fetch_uk_air_flat_file_mapping_rows(
             headers=_supabase_rest_headers(config["supabase_key"], "uk_aq_public"),
             body={
                 "p_from_day": from_day,
-                "p_to_day": to_day,
                 "p_pollutant_codes": list(pollutants),
+                "p_to_day": to_day,
             },
         )
     except urllib.error.HTTPError as exc:
@@ -5886,12 +5885,15 @@ def _check_one_sos_uk_air_flat_file(
             event_type = "changed"
         last_changed_at = now_iso
 
-    keep_source_file = (
-        keep_policy == "all"
-        or (keep_policy == "changed" and state_changed)
+    keep_snapshot = (
+        metrics["source_rows"] > 0
+        and (
+            keep_policy == "all"
+            or (keep_policy == "changed" and state_changed)
+        )
     )
     local_cached_path: str | None = None
-    if keep_source_file:
+    if keep_snapshot:
         local_cached_path = str(cache_path)
     else:
         try:
@@ -5913,9 +5915,7 @@ def _check_one_sos_uk_air_flat_file(
         f"mapped_days={metrics['mapped_days']}",
         f"mapped_pollutants={metrics['mapped_pollutants']}",
         f"mapping_status={mapping_status}",
-        f"snapshot_status={metrics['snapshot_status']}",
         f"keep_policy={keep_policy}",
-        f"local_cache={'kept' if keep_source_file else 'deleted'}",
     ]
     if issue_notes:
         notes_bits.append("mapping_issues=" + ";".join(issue_notes[:25]))
@@ -11249,6 +11249,24 @@ def _daily_task_health_error_payload(exc: Exception) -> dict[str, Any]:
     }
 
 
+def _http_post_json(
+    *,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any] | list[dict[str, Any]],
+    timeout_seconds: int = 30,
+) -> Any:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    for key, value in headers.items():
+        req.add_header(key, value)
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        payload = resp.read().decode("utf-8", errors="replace")
+        if not payload.strip():
+            return None
+        return json.loads(payload)
+
+
 def _resolve_daily_task_health_config(
     *,
     env_name: str,
@@ -11639,11 +11657,11 @@ def collect_preflight_errors(
         flat_file_supabase = _resolve_ingestdb_supabase_rest_config(os.environ)
         if not flat_file_supabase.get("supabase_url"):
             errors.append(
-                "SUPABASE_URL is required for UK-AIR flat-file SOS mode.",
+                "SUPABASE_URL (or INGESTDB_SUPABASE_URL) is required for UK-AIR flat-file SOS mode.",
             )
         if not flat_file_supabase.get("supabase_key"):
             errors.append(
-                "SB_SECRET_KEY is required for UK-AIR flat-file SOS mode.",
+                "SB_SECRET_KEY (or INGESTDB_SECRET_KEY) is required for UK-AIR flat-file SOS mode.",
             )
 
     daily_task_health_enabled = _daily_task_health_enabled()

@@ -31,7 +31,7 @@ Cron edit rule:
 2. Keep `# job_keys: ...` comments on each cron line.
 3. Worker routing uses `job_key` mapping, not list position.
 
-`uk_aq_r2_core_snapshot.yml` has moved to `cloudflare/scheduler/` and now runs at `15 4 * * *` from that scheduler instead of this one.
+`uk_aq_r2_core_snapshot.yml` has moved to `cloudflare/scheduler/ops` and now runs at `15 4 * * *` from that scheduler instead of this one.
 
 Dropbox history backup scheduling:
 - The daily `35 4 * * *` dispatch runs the normal v2 Dropbox backup. It passes the active Worker `UK_AQ_R2_HISTORY_VERSION` as `history_version` and uses the v2 prune checkpoint for speed.

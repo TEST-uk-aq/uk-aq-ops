@@ -238,8 +238,9 @@ Additional vars are required conditionally by preflight, for example:
 - `UK_AQ_BACKFILL_WRAPPER` + `UK_AQ_BACKFILL_ENV_FILE` when `--run-backfill` is set.
 - `UK_AQ_BACKFILL_ENV_FILE` + `OBS_AQIDB_SUPABASE_URL` + `OBS_AQIDB_SECRET_KEY`
   (loaded from that file) when daily task health reporting is enabled.
-- `UK_AQ_BACKFILL_ENV_FILE` + `SUPABASE_URL` + `SB_SECRET_KEY` (loaded from
-  that file) when `--source sos` uses the UK-AIR flat-file CSV adapter.
+- `UK_AQ_BACKFILL_ENV_FILE` + `SUPABASE_URL` + `SB_SECRET_KEY`
+  (or `INGESTDB_SUPABASE_URL` + `INGESTDB_SECRET_KEY`, loaded from that file)
+  when `--source sos` uses the UK-AIR flat-file CSV adapter.
 - `UK_AQ_OPS_REPO_ROOT` when deployed outside the main ops repo so the script can locate `workers/shared/r2_sigv4.mjs`.
 - `UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_ENABLED` (default `true`) and
   `UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_STRICT` (default `false`) control
@@ -463,7 +464,8 @@ Flat-file mapping rules:
 - Pollutants are limited to `pm25`, `pm10`, and `no2`.
 - Mapping rows are resolved from the public RPC
   `uk_aq_public.uk_aq_rpc_sos_uk_air_flat_file_mappings`, called via ingestdb
-  REST using `SUPABASE_URL` and `SB_SECRET_KEY`.
+  REST using `SUPABASE_URL` and `SB_SECRET_KEY` (or the
+  `INGESTDB_SUPABASE_URL` / `INGESTDB_SECRET_KEY` fallbacks).
 - The mapping fetch is window-limited by `from_day`/`to_day` and the target
   pollutant set before any CSV downloads begin.
 - 0 mapping rows => `unmapped_source`
@@ -486,13 +488,6 @@ Relevant SOS retention and 404 suppression settings:
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all
 UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES=<int, 0 disables>
 ```
-
-For UK-AIR flat files, `all` keeps every successfully downloaded site/year
-CSV, including files with zero parsed target-pollutant rows. `changed` keeps
-first-seen, changed, and reappeared CSVs, including zero-row files. `none`
-deletes each downloaded CSV after parsing. Fetch errors preserve any prior good
-cached file and do not replace its state path. Legacy SOS API snapshot retention
-continues to use its existing row-based behavior.
 
 First-seen and error handling rules:
 

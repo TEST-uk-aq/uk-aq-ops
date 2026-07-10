@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import io
-import json
 import logging
 import sqlite3
 import tempfile
@@ -32,102 +30,6 @@ class SosFlatFileTests(unittest.TestCase):
 
     def _make_conn(self, db_path: Path) -> sqlite3.Connection:
         return MODULE.open_db(str(db_path))
-
-    def _run_flat_file_worker_case(
-        self,
-        root: Path,
-        *,
-        csv_text: str,
-        keep_policy: str,
-    ) -> tuple[dict, Path, tuple, list[tuple]]:
-        db_path = root / "worker.sqlite"
-        conn = MODULE.open_db(str(db_path))
-        cache_root = root / "source-cache" / "sos"
-        cache_path = MODULE._uk_air_flat_file_cache_path(cache_root, "EA8", 2026)
-        csv_source = root / "EA8_2026.csv"
-        csv_source.write_text(csv_text, encoding="utf-8")
-        grouped_mappings = {
-            "EA8": {
-                "pm10": [
-                    {
-                        "site_ref": "EA8",
-                        "pollutant_code": "pm10",
-                        "station_id": 1,
-                        "timeseries_id": 66,
-                        "valid_from_day_utc": "2020-01-01",
-                        "valid_to_day_utc": "2026-05-17",
-                    },
-                    {
-                        "site_ref": "EA8",
-                        "pollutant_code": "pm10",
-                        "station_id": 1,
-                        "timeseries_id": 95,
-                        "valid_from_day_utc": "2026-05-18",
-                        "valid_to_day_utc": None,
-                    },
-                ],
-            },
-        }
-
-        def fake_head(url: str) -> dict[str, object]:
-            return {
-                "status": 200,
-                "etag": '"flat-file-test"',
-                "content_length": csv_source.stat().st_size,
-                "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
-            }
-
-        def fake_get(
-            url: str,
-            dest_path: Path,
-            timeout: int = 120,
-            chunk_size: int = 65536,
-        ) -> int:
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_bytes(csv_source.read_bytes())
-            return dest_path.stat().st_size
-
-        with mock.patch.object(MODULE, "_http_head", side_effect=fake_head), mock.patch.object(
-            MODULE,
-            "_http_get_to_file",
-            side_effect=fake_get,
-        ):
-            result = MODULE._check_one_sos_uk_air_flat_file(
-                conn=conn,
-                env_name="CIC-Test",
-                base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
-                site_ref="EA8",
-                year=2026,
-                grouped_mappings=grouped_mappings,
-                target_pollutants=("pm10",),
-                cache_root=cache_root,
-                keep_policy=keep_policy,
-                log=logging.getLogger("test-sos-flat-file-worker"),
-            )
-
-        counts = conn.execute(
-            """
-            SELECT day_utc, timeseries_id, row_count
-            FROM source_file_timeseries_counts
-            WHERE source_file_key = ?
-            ORDER BY day_utc, timeseries_id
-            """,
-            ("sos:site_ref=EA8:year=2026",),
-        ).fetchall()
-        state = conn.execute(
-            """
-            SELECT exists_remote, last_status, source_location_id,
-                   local_cached_path, notes
-            FROM source_file_state
-            WHERE source_file_key = ?
-            """,
-            ("sos:site_ref=EA8:year=2026",),
-        ).fetchone()
-        conn.commit()
-        conn.close()
-        if state is None:
-            raise AssertionError("flat-file worker did not record source state")
-        return result, cache_path, state, counts
 
     def test_source_mode_defaults_to_flat_files(self) -> None:
         self.assertEqual(MODULE._resolve_sos_source_mode({}), "uk_air_flat_files")
@@ -336,6 +238,8 @@ class SosFlatFileTests(unittest.TestCase):
                     [
                         "SUPABASE_URL=https://example-ingest.supabase.co",
                         "SB_SECRET_KEY=example-ingest-service-role-key",
+                        "INGESTDB_SUPABASE_URL=https://example-ingest-fallback.supabase.co",
+                        "INGESTDB_SECRET_KEY=example-ingest-fallback-service-role-key",
                         "OBS_AQIDB_SUPABASE_URL=https://example-obs.supabase.co",
                         "OBS_AQIDB_SECRET_KEY=example-obs-service-role-key",
                         "",
@@ -352,22 +256,22 @@ class SosFlatFileTests(unittest.TestCase):
                     "uk_air_ref": "UKA001",
                     "pollutant_code": "pm10",
                     "station_id": 1,
-                    "timeseries_id": 95,
+                    "timeseries_id": 66,
                     "station_ref": "EA8",
-                    "timeseries_ref": "pm10_new",
-                    "valid_from_day_utc": "2026-05-18",
-                    "valid_to_day_utc": None,
+                    "timeseries_ref": "pm10_old",
+                    "valid_from_day_utc": "2020-01-01",
+                    "valid_to_day_utc": "2026-05-17",
                 },
                 {
                     "site_ref": "EA8",
                     "uk_air_ref": "UKA001",
                     "pollutant_code": "pm10",
                     "station_id": 1,
-                    "timeseries_id": 66,
+                    "timeseries_id": 95,
                     "station_ref": "EA8",
-                    "timeseries_ref": "pm10_old",
-                    "valid_from_day_utc": "2020-01-01",
-                    "valid_to_day_utc": "2026-05-17",
+                    "timeseries_ref": "pm10_new",
+                    "valid_from_day_utc": "2026-05-18",
+                    "valid_to_day_utc": None,
                 },
             ]
             with mock.patch.object(MODULE, "_http_post_json", return_value=rpc_rows) as post_json:
@@ -395,86 +299,48 @@ class SosFlatFileTests(unittest.TestCase):
             )
             self.assertEqual(kwargs["headers"]["Accept-Profile"], "uk_aq_public")
             self.assertEqual(kwargs["headers"]["Content-Profile"], "uk_aq_public")
-            self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
             self.assertEqual(
                 list(kwargs["body"].keys()),
-                ["p_from_day", "p_to_day", "p_pollutant_codes"],
+                ["p_from_day", "p_pollutant_codes", "p_to_day"],
             )
             self.assertEqual(kwargs["body"]["p_from_day"], "2026-05-17")
             self.assertEqual(kwargs["body"]["p_to_day"], "2026-05-19")
             self.assertEqual(kwargs["body"]["p_pollutant_codes"], ["pm10", "no2"])
 
-    def test_http_post_json_sends_json_content_type(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return b"[]"
-
-        body = {
-            "p_from_day": "2026-05-17",
-            "p_to_day": "2026-05-19",
-            "p_pollutant_codes": ["pm10"],
-        }
-        with mock.patch.object(
-            MODULE.urllib.request,
-            "urlopen",
-            return_value=FakeResponse(),
-        ) as urlopen:
-            result = MODULE._http_post_json(
-                url="https://example-ingest.supabase.co/rest/v1/rpc/example",
-                headers={"Accept-Profile": "uk_aq_public"},
-                body=body,
-            )
-
-        request = urlopen.call_args.args[0]
-        self.assertEqual(request.get_header("Content-type"), "application/json")
-        self.assertEqual(json.loads(request.data.decode("utf-8")), body)
-        self.assertEqual(result, [])
-
-    def test_mapping_fetch_formats_pgrst202_without_exposing_secret(self) -> None:
-        response = {
-            "code": "PGRST202",
-            "message": "Could not find the function in the schema cache",
-        }
-        error = MODULE.urllib.error.HTTPError(
-            "https://example-ingest.supabase.co/rest/v1/rpc/uk_aq_rpc_sos_uk_air_flat_file_mappings",
-            404,
-            "Not Found",
-            None,
-            io.BytesIO(json.dumps(response).encode("utf-8")),
-        )
-        secret = "must-not-appear-in-error"
-        with mock.patch.object(MODULE, "_http_post_json", side_effect=error):
-            with self.assertRaises(RuntimeError) as raised:
-                MODULE._fetch_uk_air_flat_file_mapping_rows(
-                    env={
-                        "SUPABASE_URL": "https://example-ingest.supabase.co",
-                        "SB_SECRET_KEY": secret,
-                    },
-                    from_day="2026-05-17",
-                    to_day="2026-05-19",
-                    target_pollutants=("pm10",),
-                )
-
-        message = str(raised.exception)
-        self.assertIn("database target=ingestdb", message)
-        self.assertIn("rpc=uk_aq_rpc_sos_uk_air_flat_file_mappings", message)
-        self.assertIn("schema/profile=uk_aq_public", message)
-        self.assertIn("http_status=404", message)
-        self.assertIn("PGRST202", message)
-        self.assertNotIn(secret, message)
-
-    def test_flat_file_keep_all_preserves_csv_with_target_rows(self) -> None:
+    def test_ingestdb_resolver_falls_back_to_ingestdb_prefixed_vars(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            result, cache_path, state, _ = self._run_flat_file_worker_case(
-                root,
-                csv_text="\n".join(
+            backfill_env = root / "backfill.env"
+            backfill_env.write_text(
+                "\n".join(
+                    [
+                        "INGESTDB_SUPABASE_URL=https://fallback-ingest.supabase.co",
+                        "INGESTDB_SECRET_KEY=fallback-ingest-service-role-key",
+                        "OBS_AQIDB_SUPABASE_URL=https://example-obs.supabase.co",
+                        "OBS_AQIDB_SECRET_KEY=example-obs-service-role-key",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                "UK_AQ_BACKFILL_ENV_FILE": str(backfill_env),
+            }
+
+            config = MODULE._resolve_ingestdb_supabase_rest_config(env)
+
+        self.assertEqual(config["supabase_url"], "https://fallback-ingest.supabase.co")
+        self.assertEqual(config["supabase_key"], "fallback-ingest-service-role-key")
+
+    def test_flat_file_worker_records_day_granular_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "worker.sqlite"
+            conn = MODULE.open_db(str(db_path))
+            cache_root = root / "source-cache" / "sos"
+            csv_source = root / "EA8_2026.csv"
+            csv_source.write_text(
+                "\n".join(
                     [
                         "preamble",
                         'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
@@ -483,87 +349,48 @@ class SosFlatFileTests(unittest.TestCase):
                         "",
                     ]
                 ),
-                keep_policy="all",
+                encoding="utf-8",
             )
-            cache_was_file = cache_path.is_file()
+            grouped_mappings = {
+                "EA8": {
+                    "pm10": [
+                        {
+                            "site_ref": "EA8",
+                            "pollutant_code": "pm10",
+                            "station_id": 1,
+                            "timeseries_id": 66,
+                            "valid_from_day_utc": "2020-01-01",
+                            "valid_to_day_utc": "2026-05-17",
+                        },
+                        {
+                            "site_ref": "EA8",
+                            "pollutant_code": "pm10",
+                            "station_id": 1,
+                            "timeseries_id": 95,
+                            "valid_from_day_utc": "2026-05-18",
+                            "valid_to_day_utc": None,
+                        },
+                    ],
+                },
+            }
 
-        self.assertEqual(result["mapping_status"], "ok")
-        self.assertEqual(result["source_rows"], 2)
-        self.assertEqual(result["mapped_rows"], 2)
-        self.assertEqual(result["timeseries_ids"], [66, 95])
-        self.assertTrue(cache_was_file)
-        self.assertEqual(state[3], str(cache_path))
-        self.assertIn("local_cache=kept", state[4])
+            def fake_head(url: str) -> dict[str, object]:
+                return {
+                    "status": 200,
+                    "etag": '"flat-file-test"',
+                    "content_length": csv_source.stat().st_size,
+                    "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+                }
 
-    def test_flat_file_keep_all_preserves_no_data_csv(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            result, cache_path, state, counts = self._run_flat_file_worker_case(
-                root,
-                csv_text="Station metadata only\n",
-                keep_policy="all",
-            )
+            def fake_get(url: str, dest_path: Path, timeout: int = 120, chunk_size: int = 65536) -> int:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                dest_path.write_bytes(csv_source.read_bytes())
+                return dest_path.stat().st_size
 
-            self.assertEqual(result["source_rows"], 0)
-            self.assertEqual(result["snapshot_status"], MODULE.SOS_STATUS_NO_DATA)
-            self.assertEqual(counts, [])
-            self.assertTrue(cache_path.is_file())
-            self.assertEqual(state[3], str(cache_path))
-            self.assertIn("snapshot_status=no_data", state[4])
-            self.assertIn("local_cache=kept", state[4])
-
-    def test_flat_file_keep_none_deletes_csv_after_counting(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            result, cache_path, state, counts = self._run_flat_file_worker_case(
-                root,
-                csv_text="\n".join(
-                    [
-                        "preamble",
-                        'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
-                        "17-05-2026,01:00,10,R,ugm-3",
-                        "18-05-2026,01:00,11,R,ugm-3",
-                        "",
-                    ]
-                ),
-                keep_policy="none",
-            )
-
-            self.assertEqual(result["mapped_rows"], 2)
-            self.assertEqual(counts, [("2026-05-17", 66, 1), ("2026-05-18", 95, 1)])
-            self.assertFalse(cache_path.exists())
-            self.assertIsNone(state[3])
-            self.assertIn("local_cache=deleted", state[4])
-
-    def test_flat_file_keep_changed_preserves_first_seen_no_data_csv(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            result, cache_path, state, _ = self._run_flat_file_worker_case(
-                root,
-                csv_text="Station metadata only\n",
-                keep_policy="changed",
-            )
-
-            self.assertEqual(result["outcome"], "first_seen")
-            self.assertEqual(result["snapshot_status"], MODULE.SOS_STATUS_NO_DATA)
-            self.assertTrue(cache_path.is_file())
-            self.assertEqual(state[3], str(cache_path))
-            self.assertIn("keep_policy=changed", state[4])
-            self.assertIn("local_cache=kept", state[4])
-
-    def test_flat_file_fetch_error_preserves_prior_good_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _, cache_path, initial_state, _ = self._run_flat_file_worker_case(
-                root,
-                csv_text="Station metadata only\n",
-                keep_policy="all",
-            )
-            conn = MODULE.open_db(str(root / "worker.sqlite"))
-            with mock.patch.object(
+            with mock.patch.object(MODULE, "_http_head", side_effect=fake_head), mock.patch.object(
                 MODULE,
-                "_http_head",
-                side_effect=MODULE.urllib.error.URLError(TimeoutError("timed out")),
+                "_http_get_to_file",
+                side_effect=fake_get,
             ):
                 result = MODULE._check_one_sos_uk_air_flat_file(
                     conn=conn,
@@ -571,15 +398,25 @@ class SosFlatFileTests(unittest.TestCase):
                     base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
                     site_ref="EA8",
                     year=2026,
-                    grouped_mappings={},
+                    grouped_mappings=grouped_mappings,
                     target_pollutants=("pm10",),
-                    cache_root=root / "source-cache" / "sos",
-                    keep_policy="all",
-                    log=logging.getLogger("test-sos-flat-file-fetch-error"),
+                    cache_root=cache_root,
+                    keep_policy="none",
+                    log=logging.getLogger("test-sos-flat-file-worker"),
                 )
-            error_state = conn.execute(
+
+            counts = conn.execute(
                 """
-                SELECT local_cached_path, last_status
+                SELECT day_utc, timeseries_id, row_count
+                FROM source_file_timeseries_counts
+                WHERE source_file_key = ?
+                ORDER BY day_utc, timeseries_id
+                """,
+                ("sos:site_ref=EA8:year=2026",),
+            ).fetchall()
+            state = conn.execute(
+                """
+                SELECT exists_remote, last_status, source_location_id
                 FROM source_file_state
                 WHERE source_file_key = ?
                 """,
@@ -587,10 +424,12 @@ class SosFlatFileTests(unittest.TestCase):
             ).fetchone()
             conn.close()
 
-            self.assertEqual(result["outcome"], "temporary_error")
-            self.assertTrue(cache_path.is_file())
-            self.assertEqual(initial_state[3], str(cache_path))
-            self.assertEqual(error_state, (str(cache_path), MODULE.SOS_STATUS_TEMP_ERROR))
+        self.assertEqual(result["mapping_status"], "ok")
+        self.assertEqual(result["source_rows"], 2)
+        self.assertEqual(result["mapped_rows"], 2)
+        self.assertEqual(result["timeseries_ids"], [66, 95])
+        self.assertEqual(counts, [("2026-05-17", 66, 1), ("2026-05-18", 95, 1)])
+        self.assertEqual(state, (1, "first_seen", "EA8"))
 
 
 if __name__ == "__main__":

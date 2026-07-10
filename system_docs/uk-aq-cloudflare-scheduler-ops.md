@@ -1,38 +1,80 @@
-# UK AQ Cloudflare Scheduler Ops
+# UK AQ Cloudflare Cron Scheduler Ops
 
-This document covers the ops-side scheduler worker that dispatches the R2 core snapshot GitHub workflow.
+This document covers the new D1-backed ops scheduler worker.
 
-## Current scope
+## Scope
 
-### Ops scheduler
+- Worker: `uk-aq-cron-scheduler-ops`
+- Path: `cloudflare/scheduler/`
+- Cron: `* * * * *`
+- D1 binding: `SCHEDULER_DB`
 
-- Worker: `uk-aq-scheduler-ops`
-- Path: `cloudflare/scheduler/ops/`
-- Crons:
-  - `15 4 * * *`
-- Jobs: `ops.r2_core_snapshot`
+The worker reads enabled jobs from D1, claims due slots once, and dispatches either GitHub `workflow_dispatch` or Cloud Run HTTP requests. It does not read Supabase to decide whether a job is due.
 
-GitHub dispatch secret:
+## Files
 
-- `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN` from the ops repo, written into the Worker secret `GITHUB_WORKFLOW_DISPATCH_TOKEN` during deploy.
+- `cloudflare/scheduler/worker.mjs`
+- `cloudflare/scheduler/wrangler.toml`
+- `cloudflare/scheduler/migrations/0001_scheduler_schema.sql`
+- `cloudflare/scheduler/seeds/0001_github_jobs.sql`
+- `cloudflare/scheduler/tests/scheduler.test.mjs`
+- `.github/workflows/uk_aq_cloudflare_scheduler_ops_deploy.yml`
 
-## Explicitly deferred
+## Required secret
 
-These jobs are intentionally not included yet:
+- `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
 
-- `uk-aq-db-size-logger`
-- `uk-aq-aqilevels-retention-service`
-- `uk-aq-timeseries-aqi-hourly`
+## Optional future secret
 
-Keep them out until the state model is ready for a safe trigger path.
+- `UK_AQ_CLOUD_RUN_DISPATCH_SECRET`
 
-## State source
+Cloud Run dispatch remains disabled by default until the matching services are ready.
 
-- Ops decisions read `uk_aq_ops.daily_task_runs_dashboard` from `OBS_AQIDB_SUPABASE_URL` + `OBS_AQIDB_SECRET_KEY`.
+## Manual setup
 
-## Behavior
+### 1. Create the D1 database
 
-- The scheduler evaluates state and dispatches `workflow_dispatch` to GitHub for `ops.r2_core_snapshot`.
-- Dispatch errors fail the scheduled run so they can be retried.
+```bash
+cd cloudflare/scheduler && wrangler d1 create uk_aq_cron_scheduler_ops_db
+```
 
-The ingest-side phase-2 scheduler now lives in the ingest repo alongside its own deploy workflow and docs.
+### 2. Update `wrangler.toml`
+
+- Replace `__OPS_D1_DATABASE_ID__` in `cloudflare/scheduler/wrangler.toml` with the new D1 database ID.
+
+### 3. Apply the schema migration
+
+```bash
+cd cloudflare/scheduler && wrangler d1 migrations apply uk_aq_cron_scheduler_ops_db --remote
+```
+
+### 4. Seed the initial jobs
+
+```bash
+cd cloudflare/scheduler && wrangler d1 execute uk_aq_cron_scheduler_ops_db --remote --file=seeds/0001_github_jobs.sql
+```
+
+### 5. Install the Worker secret
+
+```bash
+cd cloudflare/scheduler && printf '%s' "$UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT" | wrangler secret put UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT --name uk-aq-cron-scheduler-ops
+```
+
+### 6. Deploy
+
+```bash
+cd cloudflare/scheduler && wrangler deploy
+```
+
+### 7. Verify locally
+
+```bash
+node --check cloudflare/scheduler/worker.mjs
+node --test tests/cloudflare_scheduler_ops.test.mjs
+```
+
+## Migration notes
+
+- The initial seed keeps all jobs in `dry_run = 1`.
+- The existing `uk-aq-workflow-scheduler` remains active until verification is complete.
+- After the dry-run period, flip individual D1 rows to `dry_run = 0` one by one and confirm the expected GitHub workflow starts.

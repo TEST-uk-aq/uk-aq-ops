@@ -1,0 +1,65 @@
+insert or ignore into scheduler_jobs (
+  job_key,
+  enabled,
+  target_type,
+  cron_expr,
+  timezone,
+  github_repo,
+  github_workflow_file,
+  github_ref,
+  github_inputs_json,
+  dry_run,
+  notes
+) values
+(
+  'uk_aq_r2_core_snapshot',
+  1,
+  'github_workflow',
+  '15 4 * * *',
+  'UTC',
+  'TEST-uk-aq/uk-aq-ops',
+  'uk_aq_r2_core_snapshot.yml',
+  'main',
+  '{}',
+  1,
+  'Migrated from uk-aq-workflow-scheduler'
+),
+(
+  'uk_aq_r2_history_dropbox_backup',
+  1,
+  'github_workflow',
+  '35 4 * * *',
+  'UTC',
+  'TEST-uk-aq/uk-aq-ops',
+  'uk_aq_r2_history_dropbox_backup.yml',
+  'main',
+  '{}',
+  1,
+  'Migrated from uk-aq-workflow-scheduler'
+),
+(
+  'uk_aq_r2_history_dropbox_backup_force_prune_recheck',
+  1,
+  'github_workflow',
+  '0 22 * * SUN',
+  'UTC',
+  'TEST-uk-aq/uk-aq-ops',
+  'uk_aq_r2_history_dropbox_backup.yml',
+  'main',
+  '{"force_prune_recheck":"true"}',
+  1,
+  'Migrated from uk-aq-workflow-scheduler'
+),
+(
+  'uk_aq_dropbox_prune_raw',
+  1,
+  'github_workflow',
+  '49 5 * * *',
+  'UTC',
+  'TEST-uk-aq/uk-aq-ops',
+  'uk_aq_dropbox_prune_raw.yml',
+  'main',
+  '{}',
+  1,
+  'Migrated from uk-aq-workflow-scheduler'
+);
