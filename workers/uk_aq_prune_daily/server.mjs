@@ -46,6 +46,7 @@ const RPC_OBSERVS_UPSERT = "uk_aq_rpc_observs_observations_upsert";
 const RPC_OBSERVS_RECEIPTS_UPSERT = "uk_aq_rpc_observs_sync_receipt_daily_upsert";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
+const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 
 function nowIso() {
   return new Date().toISOString();
@@ -68,6 +69,20 @@ function logStructured(severity, event, details = {}) {
     return;
   }
   console.log(line);
+}
+
+function validateUpstreamAuth(req) {
+  const expected = String(process.env.UK_AQ_EDGE_UPSTREAM_SECRET || "").trim();
+  if (!expected) {
+    return { ok: false, status: 500, error: "Missing UK_AQ_EDGE_UPSTREAM_SECRET." };
+  }
+
+  const supplied = String(req.headers[UPSTREAM_AUTH_HEADER] || "").trim();
+  if (supplied !== expected) {
+    return { ok: false, status: 403, error: "Forbidden." };
+  }
+
+  return { ok: true };
 }
 
 function parseBoolean(raw, fallback) {
@@ -2528,6 +2543,12 @@ const server = createServer(async (req, res) => {
     }
     if (req.method !== "POST") {
       jsonResponse(res, 405, { error: "method_not_allowed", message: "Use POST /run" });
+      return;
+    }
+
+    const upstreamAuth = validateUpstreamAuth(req);
+    if (!upstreamAuth.ok) {
+      jsonResponse(res, upstreamAuth.status, { error: upstreamAuth.error });
       return;
     }
 

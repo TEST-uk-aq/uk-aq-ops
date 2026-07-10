@@ -30,6 +30,7 @@ jobs:
       SERVICE_NAME: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_NAME || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_NAME || 'uk-aq-observs-partition-maintenance-service' }}
       RESOURCE_LABEL: uk-aq-observs-partition-maintenance-service
       OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_ACCOUNT || vars.GCP_OPS_JOB_SERVICE_ACCOUNT || vars.OBSERVS_PARTITION_MAINTENANCE_RUNTIME_SERVICE_ACCOUNT || '' }}
+      UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
       SERVICE_TIMEOUT_SECONDS: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_TIMEOUT_SECONDS || '900' }}
       SERVICE_CPU: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_CPU || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_CPU || '1' }}
       SERVICE_MEMORY: ${{ vars.GCP_OBSERVS_PARTITION_MAINTENANCE_SERVICE_MEMORY || vars.OBSERVS_PARTITION_MAINTENANCE_SERVICE_MEMORY || '256Mi' }}
@@ -84,6 +85,10 @@ jobs:
           fi
           if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ]; then
             echo "Missing required repo variable: OBS_AQIDB_SUPABASE_URL"
+            exit 1
+          fi
+          if [ -z "${UK_AQ_EDGE_UPSTREAM_SECRET}" ]; then
+            echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
             exit 1
           fi
 
@@ -285,6 +290,7 @@ jobs:
           if [ -n "${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL:-}" ]; then
             env_updates+=("UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL=${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL}")
           fi
+          env_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=${UK_AQ_EDGE_UPSTREAM_SECRET}")
 
           env_file="${RUNNER_TEMP}/uk-aq-observs-partition-maintenance-env.yaml"
           : > "${env_file}"
@@ -312,6 +318,7 @@ jobs:
           if [ -n "${DROPBOX_REFRESH_TOKEN_SECRET_NAME:-}" ]; then
             secret_updates+=("DROPBOX_REFRESH_TOKEN=${DROPBOX_REFRESH_TOKEN_SECRET_NAME}:latest")
           fi
+          secret_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=UK_AQ_EDGE_UPSTREAM_SECRET:latest")
           secret_csv="$(IFS=,; echo "${secret_updates[*]}")"
 
           echo "env_file=${env_file}" >> "${GITHUB_OUTPUT}"
@@ -335,7 +342,7 @@ jobs:
             --no-cpu-boost \
             --cpu-throttling \
             --labels "job_name=${RESOURCE_LABEL},service_name=${SERVICE_NAME}" \
-            --no-allow-unauthenticated \
+            --allow-unauthenticated \
             --env-vars-file "${{ steps.cloudrun_args.outputs.env_file }}" \
             --set-secrets "${{ steps.cloudrun_args.outputs.secret_csv }}"
 
@@ -376,7 +383,7 @@ jobs:
               --time-zone "${SCHEDULER_TIMEZONE}" \
               --uri "${scheduler_uri}" \
               --http-method POST \
-              --update-headers "Content-Type=application/json" \
+              --update-headers "Content-Type=application/json,X-UK-AQ-Upstream-Auth=${UK_AQ_EDGE_UPSTREAM_SECRET}" \
               --message-body "${scheduler_body}" \
               --oidc-service-account-email "${scheduler_sa}" \
               --oidc-token-audience "${service_uri}" \
@@ -389,7 +396,7 @@ jobs:
               --time-zone "${SCHEDULER_TIMEZONE}" \
               --uri "${scheduler_uri}" \
               --http-method POST \
-              --headers "Content-Type=application/json" \
+              --headers "Content-Type=application/json,X-UK-AQ-Upstream-Auth=${UK_AQ_EDGE_UPSTREAM_SECRET}" \
               --message-body "${scheduler_body}" \
               --oidc-service-account-email "${scheduler_sa}" \
               --oidc-token-audience "${service_uri}" \

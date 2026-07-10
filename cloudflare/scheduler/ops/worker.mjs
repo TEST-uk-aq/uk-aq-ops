@@ -16,6 +16,7 @@ const OPS_SCHEMA = "uk_aq_ops";
 const OPS_TABLE = "daily_task_runs_dashboard";
 const OPS_SELECT = "run_id,task_key,task_name,platform,source,scheduled_for_date,scheduled_time_utc,scheduled_at_utc,attempt,raw_status,started_at,finished_at,failed_at,updated_at,duration_seconds,summary,error_message,log_url,effective_status,scheduled_or_started_at,finished_or_failed_at,is_failed,is_overdue,is_not_started,task_day_rank";
 const DEFAULT_LIMIT = 10;
+const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 
 export const OPS_JOBS = [
   {
@@ -30,6 +31,8 @@ export const OPS_JOBS = [
     min_gap_minutes: 60,
     stale_after_minutes: 180,
     enabled: true,
+    dispatch_kind: "cloud_run",
+    service_url_env: "UK_AQ_PRUNE_DAILY_SERVICE_URL",
   },
   {
     job_key: "ops.observs_partition_maintenance",
@@ -43,6 +46,8 @@ export const OPS_JOBS = [
     min_gap_minutes: 60,
     stale_after_minutes: 180,
     enabled: true,
+    dispatch_kind: "cloud_run",
+    service_url_env: "UK_AQ_OBSERVS_PARTITION_MAINTENANCE_SERVICE_URL",
   },
   {
     job_key: "ops.r2_core_snapshot",
@@ -50,8 +55,8 @@ export const OPS_JOBS = [
     target_label: "uk_aq_r2_core_snapshot.yml",
     state_source: "daily_task_runs",
     task_key: "ops.r2_core_snapshot",
-    cron: "5 12 * * *",
-    scheduled_time_utc: "12:20",
+    cron: "20 12 * * *",
+    scheduled_time_utc: "12:55",
     due_after_minutes: 0,
     min_gap_minutes: 60,
     stale_after_minutes: 180,
@@ -92,6 +97,10 @@ function workflowDispatchUrl(job) {
   const repo = encodeURIComponent(job.repo);
   const workflow = encodeURIComponent(job.workflow_file);
   return `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`;
+}
+
+function cloudRunDispatchUrl(serviceUrl) {
+  return `${normalizeBaseUrl(serviceUrl)}/run`;
 }
 
 async function dispatchWorkflow(job, token) {
@@ -137,6 +146,53 @@ async function dispatchWorkflow(job, token) {
   }
 }
 
+async function dispatchCloudRun(job, env) {
+  const serviceUrl = normalizeBaseUrl(await readSecret(env[job.service_url_env]));
+  if (!serviceUrl) {
+    throw new Error(`Missing required Worker var: ${job.service_url_env}`);
+  }
+
+  const upstreamSecret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
+  if (!upstreamSecret) {
+    throw new Error("Missing required Worker secret: UK_AQ_EDGE_UPSTREAM_SECRET");
+  }
+
+  const url = cloudRunDispatchUrl(serviceUrl);
+  logJson(WORKER_NAME, "cloud_run_dispatch_attempt", {
+    job_key: job.job_key,
+    target_label: job.target_label,
+    url,
+  });
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      [UPSTREAM_AUTH_HEADER]: upstreamSecret,
+      "User-Agent": "uk-aq-scheduler-ops",
+    },
+    body: "{}",
+  });
+
+  logJson(WORKER_NAME, "cloud_run_dispatch_response", {
+    job_key: job.job_key,
+    target_label: job.target_label,
+    status: response.status,
+  });
+
+  if (!response.ok) {
+    const errorBody = (await response.text()).slice(0, 4000);
+    logJson(WORKER_NAME, "cloud_run_dispatch_error", {
+      job_key: job.job_key,
+      target_label: job.target_label,
+      status: response.status,
+      error_body: errorBody,
+    });
+    throw new Error(`Cloud Run dispatch failed for job_key=${job.job_key} target=${job.target_label} (status ${response.status})`);
+  }
+}
+
 async function evaluateJob(job, env, nowMs) {
   let rows;
   try {
@@ -149,8 +205,8 @@ async function evaluateJob(job, env, nowMs) {
       target_label: job.target_label,
       state_source: job.state_source,
       enabled: job.enabled !== false,
-      dry_run: job.dispatch_kind !== "github_workflow",
-      dispatch_kind: job.dispatch_kind || "dry_run",
+      dry_run: false,
+      dispatch_kind: job.dispatch_kind || "unknown",
       cron: job.cron,
       due: false,
       reason: "state_load_failed",
@@ -158,15 +214,15 @@ async function evaluateJob(job, env, nowMs) {
       error: message,
       now_utc: nowIso(nowMs),
     };
-    logJson(WORKER_NAME, job.dispatch_kind === "github_workflow" ? "dispatch_error" : "dry_run_error", failure);
+    logJson(WORKER_NAME, job.dispatch_kind === "github_workflow" ? "dispatch_error" : "run_error", failure);
     return { ok: false, ...failure };
   }
 
   const decision = evaluateDailyTaskJob(job, rows, nowMs);
   const summary = {
     ...summarizeDecision(job, decision, rows, nowMs),
-    dispatch_kind: job.dispatch_kind || "dry_run",
-    dry_run: job.dispatch_kind !== "github_workflow",
+    dispatch_kind: job.dispatch_kind || "unknown",
+    dry_run: false,
   };
 
   if (job.dispatch_kind === "github_workflow" && decision.due && decision.wouldTrigger) {
@@ -196,11 +252,34 @@ async function evaluateJob(job, env, nowMs) {
     }
   }
 
-  logJson(WORKER_NAME, summary.dry_run ? "dry_run_decision" : "dispatch_decision", {
+  if (job.dispatch_kind === "cloud_run" && decision.due && decision.wouldTrigger) {
+    try {
+      await dispatchCloudRun(job, env);
+      logJson(WORKER_NAME, "dispatch_decision", {
+        ...summary,
+        dispatch_status: "dispatched",
+      });
+      return { ok: true, ...summary, dispatch_status: "dispatched" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failure = {
+        ...summary,
+        due: false,
+        reason: "dispatch_failed",
+        would_trigger: false,
+        error: message,
+        now_utc: nowIso(nowMs),
+      };
+      logJson(WORKER_NAME, "dispatch_error", failure);
+      return { ok: false, ...failure };
+    }
+  }
+
+  logJson(WORKER_NAME, "dispatch_decision", {
     ...summary,
-    dispatch_status: "dry_run",
+    dispatch_status: "not_due",
   });
-  return { ok: true, ...summary, dispatch_status: "dry_run" };
+  return { ok: true, ...summary, dispatch_status: "not_due" };
 }
 
 async function runDispatcher(env, cronExpression, nowMs = Date.now()) {
@@ -210,14 +289,14 @@ async function runDispatcher(env, cronExpression, nowMs = Date.now()) {
     results.push(await evaluateJob(job, env, nowMs));
   }
 
-  logJson(WORKER_NAME, jobs.some((job) => job.dispatch_kind === "github_workflow") ? "dispatch_summary" : "dry_run_summary", {
+  logJson(WORKER_NAME, "dispatch_summary", {
     cron: cronExpression,
     job_count: results.length,
     due_count: results.filter((result) => result.due).length,
     would_trigger_count: results.filter((result) => result.would_trigger).length,
     failed_count: results.filter((result) => !result.ok).length,
     skipped_count: results.filter((result) => !result.due && result.ok).length,
-    dry_run: results.every((result) => result.dry_run !== false),
+    real_run: true,
   });
 
   return results;
@@ -232,15 +311,14 @@ export default {
     return jsonResponse({
       ok: true,
       worker: WORKER_NAME,
-      dry_run: false,
-      mode: "mixed",
+      mode: "real",
       scheduled_crons: [...new Set(OPS_JOBS.map((job) => job.cron))],
       jobs: OPS_JOBS.map((job) => ({
         job_key: job.job_key,
         target_label: job.target_label,
         cron: job.cron,
         enabled: job.enabled !== false,
-        dispatch_kind: job.dispatch_kind || "dry_run",
+        dispatch_kind: job.dispatch_kind || "unknown",
       })),
     }, 200);
   },
