@@ -5,6 +5,8 @@ export const WORKER_NAME = "uk-aq-cron-scheduler-ops";
 export const D1_BINDING_NAME = "SCHEDULER_DB";
 export const DEFAULT_LOOKBACK_MINUTES = 2;
 export const MINUTE_MS = 60_000;
+export const DISPATCH_LEAD_MINUTES = 1;
+export const DISPATCH_LEAD_MS = DISPATCH_LEAD_MINUTES * MINUTE_MS;
 export const RESPONSE_PREVIEW_LIMIT = 1_000;
 export const GITHUB_USER_AGENT = "uk-aq-cloudflare-cron-scheduler";
 
@@ -630,7 +632,11 @@ function formatLogJobPayload(job, dueAt) {
 }
 
 export function dueSlotsForJob(job, windowStartMs, windowEndMs) {
-  return cronDueTimes(job.cron_expr, windowStartMs, windowEndMs);
+  return cronDueTimes(
+    job.cron_expr,
+    windowStartMs + DISPATCH_LEAD_MS,
+    windowEndMs + DISPATCH_LEAD_MS,
+  );
 }
 
 export async function dispatchDueJobsForWindow(store, jobs, env, windowStartMs, windowEndMs, context = {}) {
