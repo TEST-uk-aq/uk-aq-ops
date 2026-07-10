@@ -1366,6 +1366,9 @@ class V2RepairExecutionTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "fail")
         self.assertEqual(result["message"], "v2 observations fixed; v2 AQI still failing")
+        self.assertEqual(result["remaining_observation_gap_count"], 0)
+        self.assertEqual(result["remaining_aqi_gap_count"], 1)
+        self.assertEqual(result["remaining_aqi_debug_gap_count"], 0)
         obs_check.assert_called_once()
         aqi_check.assert_called_once()
         self.assertEqual(obs_check.call_args.kwargs["allowed_connector_ids"], {6})
