@@ -503,6 +503,13 @@ metadata, and cache hash mismatches trigger an atomic redownload. Summary
 metrics distinguish `downloaded`, `cache_reused`, `unchanged_cached`, and
 `cache_missing_redownloaded`; reused files contribute zero `downloaded_bytes`.
 
+For repair planning, a UK-AIR source is available for a connector/day when an
+annual `uk_air_flat_file` state row is remotely present and its
+`source_file_timeseries_counts` contain mapped rows for that exact day. The
+annual state row can use `YYYY-01-01`; it does not need to be keyed to the
+requested day. This also means unchanged cached CSV evidence remains eligible
+for an explicit `--run-backfill` repair.
+
 First-seen and error handling rules:
 
 - `first_seen` is baseline-only and does not directly trigger backfill.
@@ -520,6 +527,15 @@ source_to_r2 + observations_only
 -> queue AQI rebuild (connector_id + day_utc)
 -> r2_history_obs_to_aqilevels + aqilevels_only
 ```
+
+In v2-only mode, partition gaps are repaired by `run_v2_gap_backfills`; the
+legacy v1 `cross_checks` observation planner is skipped rather than reporting
+"no candidates". An AQI queue reason of `obs_repaired` is emitted only after
+the v2 observation repair writes rows and passes its process and manifest
+guards. AQI-only coverage gaps use `aqi_integrity_obs_coverage_gap` instead.
+Post-repair verification logs every remaining observation, AQI, and AQI-debug
+gap as structured JSON and includes separate remaining-gap counts in the run
+report.
 
 Operational notes:
 

@@ -57,6 +57,80 @@ class SosFlatFileTests(unittest.TestCase):
             },
         }
 
+    def _insert_flat_file_source_evidence(
+        self,
+        conn: sqlite3.Connection,
+        root: Path,
+        *,
+        day_utc: str = "2026-05-17",
+        timeseries_id: int = 1001,
+        row_count: int = 24,
+    ) -> Path:
+        conn.execute(
+            """
+            INSERT INTO core_connectors_snapshot (
+              id, connector_code, label, display_name, service_url
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (1, "sos", "UK-AIR SOS", "UK-AIR SOS", None),
+        )
+        conn.execute(
+            """
+            INSERT INTO core_timeseries_snapshot (
+              id, station_id, connector_id, timeseries_ref,
+              label, phenomenon_id, ended_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (timeseries_id, 1, 1, "ts-flat-file", None, None, None),
+        )
+        conn.execute(
+            """
+            INSERT INTO source_station_timeseries_lookup (
+              source_key, source_location_id, station_ref, station_id,
+              connector_id, timeseries_id, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (MODULE.SOS_SOURCE_KEY, "EA8", "EA8", 1, 1, timeseries_id, 1),
+        )
+        cache_path = MODULE._uk_air_flat_file_cache_path(
+            root / "source-cache" / "sos",
+            "EA8",
+            2026,
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text("cached source evidence\n", encoding="utf-8")
+        source_file_key = "sos:site_ref=EA8:year=2026"
+        MODULE._upsert_source_state(
+            conn=conn,
+            source_key=MODULE.SOS_SOURCE_KEY,
+            remote_scheme="uk_air_flat_file",
+            source_file_key=source_file_key,
+            env_name="CIC-Test",
+            remote_url_or_key="https://example.test/EA8_2026.csv",
+            station_ref="EA8",
+            source_location_id="EA8",
+            day=MODULE.dt.date(2026, 1, 1),
+            exists_remote=True,
+            content_length=cache_path.stat().st_size,
+            etag='"flat-file-test"',
+            last_modified_utc="Mon, 01 Jan 2024 00:00:00 GMT",
+            sha256_downloaded="source-sha",
+            sha256_uncompressed="source-sha",
+            local_cached_path=str(cache_path),
+            now_iso="2026-05-18T00:00:00Z",
+            last_changed_at=None,
+            last_status="unchanged",
+        )
+        MODULE._record_source_file_timeseries_counts(
+            conn,
+            source_file_key,
+            {timeseries_id: row_count},
+            "2026-05-18T00:00:00Z",
+            default_day_utc=day_utc,
+        )
+        conn.commit()
+        return cache_path
+
     def _run_flat_file_worker_case(
         self,
         root: Path,
@@ -207,6 +281,56 @@ class SosFlatFileTests(unittest.TestCase):
                 {"etag": None, "last_modified": None, "content_length": 123},
             )
         )
+
+    def test_flat_file_year_state_makes_day_source_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = MODULE.open_db(str(root / "availability.sqlite"))
+            cache_path = self._insert_flat_file_source_evidence(conn, root)
+
+            status = MODULE._source_cache_status_for_connector_day(
+                conn,
+                connector_id=1,
+                day=MODULE.dt.date(2026, 5, 17),
+            )
+            conn.close()
+
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["source_mode"], "uk_air_flat_files")
+        self.assertEqual(status["source_file_count"], 1)
+        self.assertEqual(status["timeseries_count"], 1)
+        self.assertEqual(status["source_rows"], 24)
+        self.assertEqual(status["cached"], 1)
+        self.assertTrue(str(cache_path).endswith("EA8_2026.csv"))
+
+    def test_flat_file_unchanged_source_counts_drive_manual_mismatch_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = MODULE.open_db(str(root / "candidates.sqlite"))
+            self._insert_flat_file_source_evidence(conn, root)
+            conn.execute(
+                """
+                INSERT INTO cross_checks (
+                  run_id, env_name, connector_id, day_utc, timeseries_id,
+                  source_row_count, r2_row_count, delta, status,
+                  checked_at_utc, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    98, "CIC-Test", 1, "2026-05-17", 1001,
+                    24, 23, 1, "mismatch", "2026-05-18T00:00:00Z", None,
+                ),
+            )
+            conn.commit()
+
+            targets = MODULE._collect_cross_check_backfill_targets(
+                conn,
+                run_id=98,
+                source_filter="sos",
+            )
+            conn.close()
+
+        self.assertEqual(targets, {("2026-05-17", 1): [1001]})
 
     def test_flat_file_parser_counts_rows_by_day_and_pollutant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

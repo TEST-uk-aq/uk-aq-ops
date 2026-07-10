@@ -518,7 +518,22 @@ async function dispatchGitHubWorkflow(job, env) {
     throw new Error("Missing required Worker secret: UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT");
   }
 
-  const url = `https://api.github.com/repos/${encodeURIComponent(job.github_repo)}/actions/workflows/${encodeURIComponent(job.github_workflow_file)}/dispatches`;
+  const repoParts = job.github_repo.split("/");
+
+  if (repoParts.length !== 2 || !repoParts[0] || !repoParts[1]) {
+    throw new Error(
+      `Invalid github_repo ${JSON.stringify(job.github_repo)}; expected owner/repo`,
+    );
+  }
+
+  const [owner, repo] = repoParts;
+
+  const url =
+    `https://api.github.com/repos/${encodeURIComponent(owner)}` +
+    `/${encodeURIComponent(repo)}` +
+    `/actions/workflows/${encodeURIComponent(job.github_workflow_file)}` +
+    `/dispatches`;
+	
   const response = await fetch(url, {
     method: "POST",
     headers: {

@@ -240,6 +240,37 @@ class SosCanonicalTests(unittest.TestCase):
         self.assertEqual(metrics["observation_backfill_candidate_days"], 0)
         self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 0)
 
+    def test_v2_mode_does_not_claim_obs_repaired_without_v2_repair(self) -> None:
+        conn = self._new_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = MODULE.run_cross_check_backfills(
+                conn=conn,
+                run_id=1,
+                env_name="CIC-Test",
+                run_compact="20260518T000000Z",
+                env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp},
+                source_filter="sos",
+                sos_metrics={"changed_files": []},
+                dry_run=False,
+                run_backfill=True,
+                limits=MODULE.LimitTracker(
+                    max_download_mb=None,
+                    max_runtime_minutes=None,
+                    started_mono=time.monotonic(),
+                ),
+                log=logging.getLogger("test-v2-skips-legacy-cross-check-repair"),
+                history_version="v2",
+            )
+        conn.close()
+
+        self.assertEqual(metrics["observation_backfill_candidate_days"], 0)
+        self.assertEqual(metrics["observation_backfills_ok"], 0)
+        self.assertEqual(metrics["planned_aqi_rebuilds"], [])
+        self.assertIn(
+            "v2 observation gaps are handled by run_v2_gap_backfills",
+            metrics["cross_check_observation_repair_skipped_reason"],
+        )
+
     def test_run_cross_check_backfills_not_found_only_has_no_candidates(self) -> None:
         conn = self._new_conn()
         conn.execute(
@@ -304,6 +335,34 @@ class SosCanonicalTests(unittest.TestCase):
                 (1, "CIC-Test", 6, "2026-05-11", 101, 10, 9, 1, "mismatch", "2026-05-18T00:00:00Z", None),
                 (1, "CIC-Test", 6, "2026-05-11", 102, 3, None, 3, "source_only", "2026-05-18T00:00:00Z", None),
             ],
+        )
+        MODULE._upsert_source_state(
+            conn=conn,
+            source_key=MODULE.SOS_SOURCE_KEY,
+            remote_scheme=MODULE.SOS_REMOTE_SCHEME,
+            source_file_key="sos:test-source-evidence:2026-05-11",
+            env_name="CIC-Test",
+            remote_url_or_key="https://example.test/sos",
+            station_ref="station-1",
+            source_location_id="station-1",
+            day=MODULE.dt.date(2026, 5, 11),
+            exists_remote=True,
+            content_length=100,
+            etag=None,
+            last_modified_utc=None,
+            sha256_downloaded="source-sha",
+            sha256_uncompressed="source-sha",
+            local_cached_path=None,
+            now_iso="2026-05-18T00:00:00Z",
+            last_changed_at=None,
+            last_status="unchanged",
+        )
+        MODULE._record_source_file_timeseries_counts(
+            conn,
+            "sos:test-source-evidence:2026-05-11",
+            {101: 10, 102: 3},
+            "2026-05-18T00:00:00Z",
+            default_day_utc="2026-05-11",
         )
         conn.commit()
 
