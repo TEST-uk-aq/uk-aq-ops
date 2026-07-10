@@ -86,6 +86,8 @@ where date_utc = current_date;
 
 GitHub tasks (`ops.r2_core_snapshot`, `ingest.stations_daily`, `ops.r2_history_dropbox_backup`, and `ops.dropbox_prune_raw`) are still Phase 3 and are externally scheduled via Cloudflare Worker cron calling `workflow_dispatch`.
 
+Phase 3 rollout should start with `ops.r2_core_snapshot`, since that workflow already has the Cloudflare workflow scheduler route in place and is the lowest-risk GitHub-backed daily job.
+
 ## Phase 3 GitHub Reporting
 
 The GitHub daily workflows report lifecycle status: they write `Started` at workflow begin and then `Finished` or `Failed` at workflow end.

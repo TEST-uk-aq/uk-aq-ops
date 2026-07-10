@@ -264,15 +264,12 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     `value`), returning explicit statuses:
     `ok`, `no_data`, `not_found`, `temporary_error`, `permanent_error`.
     It does not write R2/Supabase and does not trigger backfill.
-  - Phase 7.3: `check_sos(...)` now runs SOS source checks
+  - Phase 7.3: `check_sos(...)` now runs station/day SOS source checks
     (via source key `sos`) and writes:
     `source_file_state`, `source_file_events`, and
-    `source_file_timeseries_counts` for successful checks. The default
-    adapter is the UK-AIR flat-file CSV path (`uk_air_flat_files`);
-    set `UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api` to keep the
-    legacy station/day API mode. Flat-file source unit is
-    `sos:site_ref=<SITE_REF>:year=<YYYY>`. Snapshot cache retention is
-    controlled by
+    `source_file_timeseries_counts` for successful checks. Source unit is
+    `sos:station_ref=<station_ref>:day_utc=<YYYY-MM-DD>`. Snapshot
+    cache retention is controlled by
     `UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all` (default
     `changed`). First-seen entries are baseline-only (no direct backfill);
     temporary/permanent source errors do not replace prior good baseline
@@ -291,10 +288,9 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     repeated station/day not-found re-fetches during the cooldown window.
   - Phase 7.6 docs completion: SOS model and operations are now documented in
     `system_docs/uk-aq-r2-history-integrity.md`, including naming rules
-    (`sensorcommunity`, `sos`), flat-file and legacy SOS unit boundaries,
-    snapshot-cache path contracts, `KEEP_API_SNAPSHOTS` controls, flat-file
-    mapping rules, and SOS-specific check-only/dry-run/manual run command
-    examples.
+    (`sensorcommunity`, `sos`), source/evidence/repair/AQI unit
+    boundaries, snapshot-cache path contract, `KEEP_API_SNAPSHOTS` controls,
+    and SOS-specific check-only/dry-run/manual run command examples.
   - Phase 5: Sensor.Community adapter — fetches the daily archive
     index `https://archive.sensor.community/<YYYY-MM-DD>/`
     (overridable via `UK_AQ_HISTORY_INTEGRITY_SENSOR_COMMUNITY_BASE_URL`),

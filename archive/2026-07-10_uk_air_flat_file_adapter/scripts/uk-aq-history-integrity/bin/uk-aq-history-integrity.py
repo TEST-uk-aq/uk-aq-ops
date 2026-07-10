@@ -227,24 +227,20 @@ CREATE INDEX IF NOT EXISTS idx_lookup_station
 CREATE INDEX IF NOT EXISTS idx_lookup_source_loc
   ON source_station_timeseries_lookup(source_key, source_location_id);
 
--- Phase 6.5 Pass A: per-(source_file, day_utc, timeseries) row counts
--- derived from the upstream archive file at ingest time. Recorded only
--- when we download (first_seen / changed / reappeared); unchanged metadata
--- reuses the previously stored values since the source bytes haven't
--- changed.
+-- Phase 6.5 Pass A: per-(source_file, timeseries) row counts derived from
+-- the upstream archive file at ingest time. Recorded only when we download
+-- (first_seen / changed / reappeared); unchanged metadata reuses the
+-- previously stored values since the source bytes haven't changed.
 CREATE TABLE IF NOT EXISTS source_file_timeseries_counts (
   source_file_key TEXT NOT NULL,
-  day_utc         TEXT NOT NULL,
   timeseries_id   INTEGER NOT NULL,
   row_count       INTEGER NOT NULL,
   counted_at_utc  TEXT NOT NULL,
-  PRIMARY KEY (source_file_key, day_utc, timeseries_id)
+  PRIMARY KEY (source_file_key, timeseries_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sftc_timeseries
   ON source_file_timeseries_counts(timeseries_id);
-CREATE INDEX IF NOT EXISTS idx_sftc_day_timeseries
-  ON source_file_timeseries_counts(day_utc, timeseries_id);
 
 -- Phase 6.5 Pass B: per-run source-vs-R2 comparison outcomes at
 -- (connector_id, day_utc, timeseries_id) granularity.
@@ -1395,24 +1391,6 @@ SC_COLUMN_TO_REF_SUFFIX = {
 SOS_SOURCE_KEY = "sos"
 SOS_DEFAULT_BASE_URL = "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
 SOS_DEFAULT_TIMEOUT_SECONDS = 30
-UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV = (
-    "UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE"
-)
-UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ALLOWED = {
-    "uk_air_flat_files",
-    "sos_api",
-}
-UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_DEFAULT = "uk_air_flat_files"
-UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL_ENV = (
-    "UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL"
-)
-UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL_DEFAULT = (
-    "https://uk-air.defra.gov.uk/datastore/data_files/site_data"
-)
-UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_ENV = (
-    "UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS"
-)
-UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_DEFAULT = "pm25,pm10,no2"
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ENV = "UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS"
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_ALLOWED = {"none", "changed", "all"}
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS_DEFAULT = "changed"
@@ -1773,328 +1751,6 @@ def _resolve_sos_not_found_cooldown_seconds() -> int:
     return minutes * 60
 
 
-def _resolve_sos_source_mode(env: Mapping[str, str] | None = None) -> str:
-    values = os.environ if env is None else env
-    raw = str(
-        values.get(UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV, "")
-    ).strip().lower()
-    if raw in UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ALLOWED:
-        return raw
-    return UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_DEFAULT
-
-
-def _resolve_uk_air_flat_file_base_url(env: Mapping[str, str] | None = None) -> str:
-    values = os.environ if env is None else env
-    raw = str(
-        values.get(UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL_ENV, "")
-    ).strip()
-    return raw.rstrip("/") or UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL_DEFAULT
-
-
-def _resolve_sos_target_pollutants(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    values = os.environ if env is None else env
-    raw = str(
-        values.get(UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_ENV, "")
-    ).strip()
-    tokens = raw.split(",") if raw else UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS_DEFAULT.split(",")
-    seen: set[str] = set()
-    out: list[str] = []
-    for token in tokens:
-        cleaned = str(token).strip().lower()
-        if not cleaned:
-            continue
-        if cleaned not in {"pm25", "pm10", "no2"}:
-            continue
-        if cleaned in seen:
-            continue
-        seen.add(cleaned)
-        out.append(cleaned)
-    if not out:
-        return ("pm25", "pm10", "no2")
-    return tuple(out)
-
-
-def _resolve_obs_aqidb_supabase_rest_config(
-    env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    values = os.environ if env is None else env
-    loaded: dict[str, str] = {}
-    env_file = str(values.get("UK_AQ_BACKFILL_ENV_FILE", "")).strip()
-    if env_file:
-        env_path = Path(env_file).expanduser()
-        if env_path.is_file():
-            try:
-                loaded = _load_env_file(env_path)
-            except OSError:
-                loaded = {}
-    supabase_url = str(
-        loaded.get("OBS_AQIDB_SUPABASE_URL")
-        or values.get("OBS_AQIDB_SUPABASE_URL")
-        or os.environ.get("OBS_AQIDB_SUPABASE_URL")
-        or "",
-    ).strip().rstrip("/")
-    supabase_key = str(
-        loaded.get("OBS_AQIDB_SECRET_KEY")
-        or values.get("OBS_AQIDB_SECRET_KEY")
-        or os.environ.get("OBS_AQIDB_SECRET_KEY")
-        or "",
-    ).strip()
-    return {
-        "supabase_url": supabase_url,
-        "supabase_key": supabase_key,
-        "env_file": env_file,
-    }
-
-
-def _supabase_rest_headers(service_key: str, schema: str) -> dict[str, str]:
-    return {
-        "apikey": service_key,
-        "Authorization": f"Bearer {service_key}",
-        "Accept": "application/json",
-        "Accept-Profile": schema,
-        "Content-Profile": schema,
-    }
-
-
-def _http_get_json(
-    *,
-    url: str,
-    headers: dict[str, str],
-    timeout_seconds: int = 30,
-) -> Any:
-    req = urllib.request.Request(url, method="GET")
-    for key, value in headers.items():
-        req.add_header(key, value)
-    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-                body = resp.read()
-                if not body:
-                    return None
-                return json.loads(body.decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if _is_retryable_url_error(exc) and attempt < HTTP_RETRY_ATTEMPTS:
-                _sleep_http_retry("GET", url, attempt, exc)
-                continue
-            raise
-        except Exception as exc:
-            if _is_retryable_url_error(exc) and attempt < HTTP_RETRY_ATTEMPTS:
-                _sleep_http_retry("GET", url, attempt, exc)
-                continue
-            raise
-    raise RuntimeError(f"GET {url} failed after retries")
-
-
-def _uk_air_flat_file_source_file_key(site_ref: str, year: int) -> str:
-    return f"sos:site_ref={str(site_ref).strip().upper()}:year={int(year)}"
-
-
-def _uk_air_flat_file_remote_url(base_url: str, site_ref: str, year: int) -> str:
-    return f"{base_url.rstrip('/')}/{str(site_ref).strip().upper()}_{int(year)}.csv?v=1"
-
-
-def _uk_air_flat_file_cache_path(cache_root: Path, site_ref: str, year: int) -> Path:
-    site_token = str(site_ref).strip().upper()
-    return cache_root / f"site_ref={site_token}" / f"year={int(year)}" / f"{site_token}_{int(year)}.csv"
-
-
-def _uk_air_flat_file_year_day(year: int) -> dt.date:
-    return dt.date(int(year), 1, 1)
-
-
-def _uk_air_parse_day(value: Any) -> str | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y"):
-        try:
-            return dt.datetime.strptime(raw, fmt).date().isoformat()
-        except ValueError:
-            continue
-    return None
-
-
-def _uk_air_normalize_pollutant_code(value: Any) -> str | None:
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    text = (
-        text.replace("µ", "u")
-        .replace("μ", "u")
-        .replace("&nbsp;", " ")
-    )
-    text = re.sub(r"<[^>]+>", "", text)
-    compact = re.sub(r"[^a-z0-9.]+", "", text)
-    if not compact:
-        return None
-    if "pm25" in compact or "pm2.5" in compact or "pm2p5" in compact or "particulatematter25" in compact:
-        return "pm25"
-    if "pm10" in compact or "particulatematter10" in compact:
-        return "pm10"
-    if "no2" in compact or "nitrogendioxide" in compact:
-        return "no2"
-    return None
-
-
-def _uk_air_flat_file_query_sql(value: str) -> str:
-    return urllib.parse.quote(str(value), safe=".-_~")
-
-
-def _fetch_uk_air_flat_file_mapping_rows(
-    *,
-    env: Mapping[str, str] | None = None,
-    target_pollutants: Iterable[str] | None = None,
-) -> list[dict[str, Any]]:
-    config = _resolve_obs_aqidb_supabase_rest_config(env)
-    if not config["supabase_url"] or not config["supabase_key"]:
-        raise RuntimeError("OBS_AQIDB_SUPABASE_URL / OBS_AQIDB_SECRET_KEY are required for UK-AIR flat-file mode")
-
-    pollutants = tuple(target_pollutants or _resolve_sos_target_pollutants(env))
-    select_fields = ",".join([
-        "site_ref",
-        "uk_air_ref",
-        "pollutant_code",
-        "station_id",
-        "timeseries_id",
-        "station_ref",
-        "timeseries_ref",
-        "valid_from_day_utc",
-        "valid_to_day_utc",
-    ])
-    query_parts = [
-        ("select", select_fields),
-        ("pollutant_code", f"in.({','.join(pollutants)})"),
-    ]
-    query = urllib.parse.urlencode(query_parts, quote_via=urllib.parse.quote, safe="(),.*")
-    url = f"{config['supabase_url']}/rest/v1/sos_station_timeseries_site_refs?{query}"
-    payload = _http_get_json(
-        url=url,
-        headers=_supabase_rest_headers(config["supabase_key"], "uk_aq_raw"),
-    )
-    if payload is None:
-        return []
-    if not isinstance(payload, list):
-        raise RuntimeError("UK-AIR flat-file mapping query did not return a JSON array")
-    rows: list[dict[str, Any]] = []
-    for row in payload:
-        if isinstance(row, dict):
-            rows.append(row)
-    rows.sort(key=lambda row: (
-        str(row.get("site_ref") or "").upper(),
-        str(row.get("pollutant_code") or "").lower(),
-        str(row.get("valid_from_day_utc") or ""),
-        str(row.get("valid_to_day_utc") or ""),
-        int(row.get("timeseries_id") or 0),
-    ))
-    return rows
-
-
-def _group_uk_air_flat_file_mapping_rows(
-    rows: Iterable[Mapping[str, Any]],
-) -> dict[str, dict[str, list[dict[str, Any]]]]:
-    grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
-    for row in rows:
-        site_ref = str(row.get("site_ref") or "").strip().upper()
-        pollutant_code = str(row.get("pollutant_code") or "").strip().lower()
-        if not site_ref or pollutant_code not in {"pm25", "pm10", "no2"}:
-            continue
-        grouped.setdefault(site_ref, {}).setdefault(pollutant_code, []).append(dict(row))
-    return grouped
-
-
-def _resolve_uk_air_flat_file_mapping_row(
-    rows: Iterable[Mapping[str, Any]],
-    day_utc: str,
-) -> tuple[dict[str, Any] | None, str | None]:
-    day = dt.date.fromisoformat(day_utc)
-    matched: list[dict[str, Any]] = []
-    for row in rows:
-        raw_from = str(row.get("valid_from_day_utc") or "").strip()
-        raw_to = str(row.get("valid_to_day_utc") or "").strip()
-        if raw_from:
-            try:
-                valid_from = dt.date.fromisoformat(raw_from)
-            except ValueError:
-                continue
-            if day < valid_from:
-                continue
-        if raw_to:
-            try:
-                valid_to = dt.date.fromisoformat(raw_to)
-            except ValueError:
-                continue
-            if day > valid_to:
-                continue
-        matched.append(dict(row))
-    if len(matched) == 1:
-        return matched[0], None
-    if not matched:
-        return None, "unmapped_source"
-    return None, "ambiguous_mapping"
-
-
-def _uk_air_flat_file_years_for_window(from_day: str, to_day: str) -> list[int]:
-    start = dt.date.fromisoformat(from_day)
-    end = dt.date.fromisoformat(to_day)
-    return list(range(start.year, end.year + 1))
-
-
-def _uk_air_flat_file_parse_day_pollutant_counts(
-    csv_path: Path,
-    *,
-    target_pollutants: Iterable[str],
-) -> tuple[dict[tuple[str, str], int], dict[str, Any]]:
-    import csv
-
-    allowed = {str(code).strip().lower() for code in target_pollutants if str(code or "").strip()}
-    counts: dict[tuple[str, str], int] = {}
-    stats: dict[str, Any] = {
-        "sections": 0,
-        "rows": 0,
-        "days": set(),
-        "pollutants": set(),
-        "unsupported_sections": 0,
-    }
-    current_pollutant: str | None = None
-    with csv_path.open("rt", encoding="utf-8", newline="") as fh:
-        reader = csv.reader(fh)
-        for row in reader:
-            if not row:
-                continue
-            cells = [str(cell).strip() for cell in row]
-            if not any(cells):
-                continue
-            first = cells[0].lower() if len(cells) > 0 else ""
-            second = cells[1].lower() if len(cells) > 1 else ""
-            third = cells[2] if len(cells) > 2 else ""
-            if first == "date" and second == "time":
-                current_pollutant = _uk_air_normalize_pollutant_code(third)
-                if current_pollutant in allowed:
-                    stats["sections"] += 1
-                else:
-                    stats["unsupported_sections"] += 1
-                    current_pollutant = None
-                continue
-            if current_pollutant is None or current_pollutant not in allowed:
-                continue
-            day_utc = _uk_air_parse_day(cells[0] if len(cells) > 0 else "")
-            if not day_utc:
-                continue
-            value = None
-            if len(cells) > 2:
-                value = _sos_to_finite_number(cells[2])
-            if value is None:
-                continue
-            key = (day_utc, current_pollutant)
-            counts[key] = counts.get(key, 0) + 1
-            stats["rows"] += 1
-            stats["days"].add(day_utc)
-            stats["pollutants"].add(current_pollutant)
-    stats["days"] = sorted(stats["days"])
-    stats["pollutants"] = sorted(stats["pollutants"])
-    return counts, stats
-
-
 def _parse_iso_utc(value: str | None) -> dt.datetime | None:
     raw = str(value or "").strip()
     if not raw:
@@ -2262,160 +1918,30 @@ def _resolve_ts_refs_to_ids(
     return out
 
 
-def _source_file_day_from_key(source_file_key: str) -> str | None:
-    raw = str(source_file_key or "").strip()
-    if not raw:
-        return None
-    if "day_utc=" in raw:
-        match = re.search(r"day_utc=(\d{4}-\d{2}-\d{2})", raw)
-        if match:
-            return match.group(1)
-    if "year=" in raw:
-        match = re.search(r"year=(\d{4})", raw)
-        if match:
-            return f"{match.group(1)}-01-01"
-    parts = raw.split(":")
-    if len(parts) >= 2:
-        tail = parts[-1].strip()
-        try:
-            dt.date.fromisoformat(tail)
-            return tail
-        except ValueError:
-            pass
-    return None
-
-
 def _record_source_file_timeseries_counts(
     conn: sqlite3.Connection,
     source_file_key: str,
-    counts_by_key: Mapping[Any, int],
+    counts_by_ts_id: dict[int, int],
     now_iso: str,
-    *,
-    default_day_utc: str | None = None,
 ) -> None:
-    """Replace the per-source-file rows in source_file_timeseries_counts.
-
-    `counts_by_key` may use either `timeseries_id` integers (legacy daily
-    source adapters) or `(day_utc, timeseries_id)` tuples (UK-AIR flat-file
-    source adapters). The helper normalizes both shapes into the
-    day-granular table layout.
-    """
+    """Replace the (source_file_key, *) rows in source_file_timeseries_counts."""
     conn.execute(
         "DELETE FROM source_file_timeseries_counts WHERE source_file_key = ?",
         (source_file_key,),
     )
-    if not counts_by_key:
-        return
-
-    inferred_day = default_day_utc or _source_file_day_from_key(source_file_key)
-    rows: list[tuple[str, str, int, int, str]] = []
-    for raw_key, raw_count in sorted(counts_by_key.items(), key=lambda item: str(item[0])):
-        try:
-            count = int(raw_count)
-        except (TypeError, ValueError):
-            continue
-        if count <= 0:
-            continue
-
-        day_utc: str | None = None
-        timeseries_id: int | None = None
-        if isinstance(raw_key, tuple) and len(raw_key) == 2:
-            raw_day, raw_timeseries_id = raw_key
-            day_utc = str(raw_day or "").strip()
-            try:
-                timeseries_id = int(raw_timeseries_id)
-            except (TypeError, ValueError):
-                timeseries_id = None
-        else:
-            try:
-                timeseries_id = int(raw_key)
-            except (TypeError, ValueError):
-                timeseries_id = None
-            day_utc = inferred_day
-
-        if timeseries_id is None or timeseries_id <= 0:
-            continue
-        if not day_utc:
-            continue
-        rows.append((source_file_key, day_utc, timeseries_id, count, now_iso))
-
-    if not rows:
+    if not counts_by_ts_id:
         return
     conn.executemany(
         """
         INSERT INTO source_file_timeseries_counts
-          (source_file_key, day_utc, timeseries_id, row_count, counted_at_utc)
-        VALUES (?, ?, ?, ?, ?)
+          (source_file_key, timeseries_id, row_count, counted_at_utc)
+        VALUES (?, ?, ?, ?)
         """,
-        rows,
+        [
+            (source_file_key, ts_id, count, now_iso)
+            for ts_id, count in sorted(counts_by_ts_id.items())
+        ],
     )
-
-
-def _prepare_source_file_timeseries_counts_migration(
-    conn: sqlite3.Connection,
-) -> list[tuple[str, str, int, int, str]] | None:
-    """Rename legacy counts tables before the schema DDL runs.
-
-    Older SQLite files have `source_file_timeseries_counts` keyed only by
-    `(source_file_key, timeseries_id)`. New runs need the day-granular table
-    shape, so we snapshot the old rows, rename the legacy table out of the
-    way, and drop the conflicting legacy index before the new schema is
-    applied.
-    """
-    if not _table_exists(conn, "source_file_timeseries_counts"):
-        return None
-
-    columns = {
-        str(row[1])
-        for row in conn.execute("PRAGMA table_info(source_file_timeseries_counts)").fetchall()
-    }
-    if "day_utc" in columns:
-        return None
-    if "source_file_key" not in columns or "timeseries_id" not in columns or "row_count" not in columns:
-        return None
-
-    legacy_rows = conn.execute(
-        """
-        SELECT
-          c.source_file_key,
-          c.timeseries_id,
-          c.row_count,
-          c.counted_at_utc,
-          s.day_utc
-        FROM source_file_timeseries_counts c
-        LEFT JOIN source_file_state s
-          ON s.source_file_key = c.source_file_key
-        ORDER BY c.source_file_key, c.timeseries_id
-        """,
-    ).fetchall()
-
-    conn.execute(
-        "ALTER TABLE source_file_timeseries_counts RENAME TO source_file_timeseries_counts_legacy",
-    )
-    conn.execute("DROP INDEX IF EXISTS idx_sftc_timeseries")
-
-    migrated_rows: list[tuple[str, str, int, int, str]] = []
-    for source_file_key, timeseries_id, row_count, counted_at_utc, day_utc in legacy_rows:
-        resolved_day = str(day_utc or _source_file_day_from_key(str(source_file_key)) or "").strip()
-        if not resolved_day:
-            continue
-        try:
-            parsed_ts_id = int(timeseries_id)
-            parsed_count = int(row_count)
-        except (TypeError, ValueError):
-            continue
-        if parsed_ts_id <= 0 or parsed_count <= 0:
-            continue
-        migrated_rows.append(
-            (
-                str(source_file_key),
-                resolved_day,
-                parsed_ts_id,
-                parsed_count,
-                str(counted_at_utc or ""),
-            ),
-        )
-    return migrated_rows
 
 
 def _openaq_object_key(location_id: str, day: dt.date) -> str:
@@ -5391,789 +4917,6 @@ def _check_one_sos_station_day(
     }
 
 
-def _check_one_sos_uk_air_flat_file_threadsafe(
-    db_path: str,
-    env_name: str,
-    base_url: str,
-    site_ref: str,
-    year: int,
-    grouped_mappings: Mapping[str, Mapping[str, list[dict[str, Any]]]],
-    target_pollutants: Iterable[str],
-    cache_root: Path,
-    keep_policy: str,
-    log: logging.Logger,
-    limits: LimitTracker | None = None,
-) -> dict[str, Any]:
-    if limits is not None and limits.should_stop():
-        return {
-            "outcome": "stopped",
-            "site_ref": site_ref,
-            "year": int(year),
-            "downloaded_bytes": 0,
-            "row_count": 0,
-            "source_rows": 0,
-            "event_id": None,
-            "event_type": None,
-            "timeseries_ids": [],
-        }
-    conn = _worker_db_conn(db_path)
-    try:
-        result = _check_one_sos_uk_air_flat_file(
-            conn=conn,
-            env_name=env_name,
-            base_url=base_url,
-            site_ref=site_ref,
-            year=year,
-            grouped_mappings=grouped_mappings,
-            target_pollutants=target_pollutants,
-            cache_root=cache_root,
-            keep_policy=keep_policy,
-            log=log,
-        )
-    finally:
-        try:
-            conn.commit()
-        except sqlite3.Error:
-            pass
-    result["site_ref"] = str(site_ref).strip().upper()
-    result["year"] = int(year)
-    return result
-
-
-def _check_one_sos_uk_air_flat_file(
-    conn: sqlite3.Connection,
-    env_name: str,
-    base_url: str,
-    site_ref: str,
-    year: int,
-    grouped_mappings: Mapping[str, Mapping[str, list[dict[str, Any]]]],
-    target_pollutants: Iterable[str],
-    cache_root: Path,
-    keep_policy: str,
-    log: logging.Logger,
-) -> dict[str, Any]:
-    site_token = str(site_ref).strip().upper()
-    sfk = _uk_air_flat_file_source_file_key(site_token, year)
-    now_iso = fmt_iso(utc_now())
-    prior = _fetch_prior_state(conn, sfk)
-    remote_url = _uk_air_flat_file_remote_url(base_url, site_token, year)
-    source_location_id = site_token
-    year_day = _uk_air_flat_file_year_day(year)
-
-    metrics: dict[str, Any] = {
-        "outcome": None,
-        "snapshot_status": None,
-        "downloaded_bytes": 0,
-        "row_count": 0,
-        "source_rows": 0,
-        "mapped_rows": 0,
-        "mapped_days": 0,
-        "mapped_pollutants": 0,
-        "unmapped_source_groups": 0,
-        "ambiguous_mapping_groups": 0,
-        "unmapped_source_rows": 0,
-        "ambiguous_mapping_rows": 0,
-        "event_id": None,
-        "event_type": None,
-        "timeseries_ids": [],
-    }
-
-    try:
-        head = _http_head(remote_url)
-    except Exception as exc:
-        snapshot_status = SOS_STATUS_TEMP_ERROR if _is_retryable_url_error(exc) else SOS_STATUS_PERM_ERROR
-        if prior is not None:
-            _mark_source_state_fetch_error(
-                conn,
-                source_file_key=sfk,
-                status=snapshot_status,
-                now_iso=now_iso,
-            )
-        event_type = "temporary_error" if snapshot_status == SOS_STATUS_TEMP_ERROR else "permanent_error"
-        event_id = _insert_source_event(
-            conn=conn,
-            source_key=SOS_SOURCE_KEY,
-            event_type=event_type,
-            env_name=env_name,
-            source_file_key=sfk,
-            remote_url_or_key=remote_url,
-            station_ref=site_token,
-            source_location_id=source_location_id,
-            day=year_day,
-            prior=prior,
-            new_content_length=None,
-            new_etag=None,
-            new_last_modified_utc=None,
-            new_sha256_downloaded=None,
-            new_sha256_uncompressed=None,
-            downloaded_bytes=0,
-            hash_runtime_ms=0,
-            now_iso=now_iso,
-            notes=f"uk_air_flat_file head_failed:{exc}",
-        )
-        return {
-            **metrics,
-            "outcome": event_type,
-            "snapshot_status": snapshot_status,
-            "event_id": event_id,
-            "event_type": event_type,
-        }
-
-    status_code = int(head.get("status") or 0)
-    if status_code == 404:
-        if prior is None:
-            _upsert_source_state(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                remote_scheme="uk_air_flat_file",
-                source_file_key=sfk,
-                env_name=env_name,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                exists_remote=False,
-                content_length=None,
-                etag=None,
-                last_modified_utc=None,
-                sha256_downloaded=None,
-                sha256_uncompressed=None,
-                local_cached_path=None,
-                now_iso=now_iso,
-                last_changed_at=None,
-                last_status="missing",
-                notes="uk_air_flat_file not_found",
-            )
-            event_id = _insert_source_event(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                event_type="missing_first_seen",
-                env_name=env_name,
-                source_file_key=sfk,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                prior=None,
-                new_content_length=None,
-                new_etag=None,
-                new_last_modified_utc=None,
-                new_sha256_downloaded=None,
-                new_sha256_uncompressed=None,
-                downloaded_bytes=0,
-                hash_runtime_ms=0,
-                now_iso=now_iso,
-                notes="uk_air_flat_file not_found",
-            )
-            return {
-                **metrics,
-                "outcome": "not_found_first_seen",
-                "snapshot_status": SOS_STATUS_NOT_FOUND,
-                "event_id": event_id,
-                "event_type": "missing_first_seen",
-            }
-
-        if int(prior.get("exists_remote") or 0) == 1:
-            _upsert_source_state(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                remote_scheme="uk_air_flat_file",
-                source_file_key=sfk,
-                env_name=env_name,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                exists_remote=False,
-                content_length=None,
-                etag=None,
-                last_modified_utc=None,
-                sha256_downloaded=None,
-                sha256_uncompressed=None,
-                local_cached_path=None,
-                now_iso=now_iso,
-                last_changed_at=now_iso,
-                last_status="missing",
-                notes="uk_air_flat_file not_found",
-            )
-            event_id = _insert_source_event(
-                conn=conn,
-                source_key=SOS_SOURCE_KEY,
-                event_type="missing_after_seen",
-                env_name=env_name,
-                source_file_key=sfk,
-                remote_url_or_key=remote_url,
-                station_ref=site_token,
-                source_location_id=source_location_id,
-                day=year_day,
-                prior=prior,
-                new_content_length=None,
-                new_etag=None,
-                new_last_modified_utc=None,
-                new_sha256_downloaded=None,
-                new_sha256_uncompressed=None,
-                downloaded_bytes=0,
-                hash_runtime_ms=0,
-                now_iso=now_iso,
-                notes="uk_air_flat_file not_found after prior success",
-            )
-            return {
-                **metrics,
-                "outcome": "not_found_after_seen",
-                "snapshot_status": SOS_STATUS_NOT_FOUND,
-                "event_id": event_id,
-                "event_type": "missing_after_seen",
-            }
-
-        _upsert_source_state(
-            conn=conn,
-            source_key=SOS_SOURCE_KEY,
-            remote_scheme="uk_air_flat_file",
-            source_file_key=sfk,
-            env_name=env_name,
-            remote_url_or_key=remote_url,
-            station_ref=site_token,
-            source_location_id=source_location_id,
-            day=year_day,
-            exists_remote=False,
-            content_length=None,
-            etag=None,
-            last_modified_utc=None,
-            sha256_downloaded=None,
-            sha256_uncompressed=None,
-            local_cached_path=None,
-            now_iso=now_iso,
-            last_changed_at=None,
-            last_status="missing",
-            notes="uk_air_flat_file still missing",
-        )
-        return {
-            **metrics,
-            "outcome": "not_found_still",
-            "snapshot_status": SOS_STATUS_NOT_FOUND,
-        }
-
-    if status_code != 200:
-        snapshot_status = SOS_STATUS_TEMP_ERROR if status_code >= 500 or status_code == 429 else SOS_STATUS_PERM_ERROR
-        if prior is not None:
-            _mark_source_state_fetch_error(
-                conn,
-                source_file_key=sfk,
-                status=snapshot_status,
-                now_iso=now_iso,
-            )
-        event_type = "temporary_error" if snapshot_status == SOS_STATUS_TEMP_ERROR else "permanent_error"
-        event_id = _insert_source_event(
-            conn=conn,
-            source_key=SOS_SOURCE_KEY,
-            event_type=event_type,
-            env_name=env_name,
-            source_file_key=sfk,
-            remote_url_or_key=remote_url,
-            station_ref=site_token,
-            source_location_id=source_location_id,
-            day=year_day,
-            prior=prior,
-            new_content_length=None,
-            new_etag=None,
-            new_last_modified_utc=None,
-            new_sha256_downloaded=None,
-            new_sha256_uncompressed=None,
-            downloaded_bytes=0,
-            hash_runtime_ms=0,
-            now_iso=now_iso,
-            notes=f"uk_air_flat_file head_status={status_code}",
-        )
-        return {
-            **metrics,
-            "outcome": event_type,
-            "snapshot_status": snapshot_status,
-            "event_id": event_id,
-            "event_type": event_type,
-        }
-
-    cache_path = _uk_air_flat_file_cache_path(cache_root, site_token, year)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    downloaded_bytes = _http_get_to_file(remote_url, cache_path)
-    sha_csv = hashlib.sha256(cache_path.read_bytes()).hexdigest()
-
-    parsed_counts, parse_stats = _uk_air_flat_file_parse_day_pollutant_counts(
-        cache_path,
-        target_pollutants=target_pollutants,
-    )
-    grouped = grouped_mappings.get(site_token, {})
-    counts_by_day_ts: dict[tuple[str, int], int] = {}
-    mapped_timeseries_ids: set[int] = set()
-    mapped_days: set[str] = set()
-    mapped_pollutants: set[str] = set()
-    unmapped_groups = 0
-    ambiguous_groups = 0
-    unmapped_rows = 0
-    ambiguous_rows = 0
-    issue_notes: list[str] = []
-    for (day_utc, pollutant_code), source_count in sorted(parsed_counts.items()):
-        mapping_row, mapping_status = _resolve_uk_air_flat_file_mapping_row(
-            grouped.get(pollutant_code, []),
-            day_utc,
-        )
-        if mapping_row is None:
-            if mapping_status == "ambiguous_mapping":
-                ambiguous_groups += 1
-                ambiguous_rows += int(source_count)
-            else:
-                unmapped_groups += 1
-                unmapped_rows += int(source_count)
-            issue_notes.append(f"{day_utc}:{pollutant_code}={mapping_status}")
-            continue
-        try:
-            timeseries_id = int(mapping_row.get("timeseries_id") or 0)
-        except (TypeError, ValueError):
-            unmapped_groups += 1
-            unmapped_rows += int(source_count)
-            issue_notes.append(f"{day_utc}:{pollutant_code}=invalid_timeseries_id")
-            continue
-        if timeseries_id <= 0:
-            unmapped_groups += 1
-            unmapped_rows += int(source_count)
-            issue_notes.append(f"{day_utc}:{pollutant_code}=invalid_timeseries_id")
-            continue
-        counts_by_day_ts[(day_utc, timeseries_id)] = counts_by_day_ts.get((day_utc, timeseries_id), 0) + int(source_count)
-        mapped_timeseries_ids.add(timeseries_id)
-        mapped_days.add(day_utc)
-        mapped_pollutants.add(pollutant_code)
-
-    metrics["source_rows"] = int(parse_stats.get("rows") or 0)
-    metrics["mapped_rows"] = sum(counts_by_day_ts.values())
-    metrics["row_count"] = metrics["mapped_rows"]
-    metrics["mapped_days"] = len(mapped_days)
-    metrics["mapped_pollutants"] = len(mapped_pollutants)
-    metrics["unmapped_source_groups"] = unmapped_groups
-    metrics["ambiguous_mapping_groups"] = ambiguous_groups
-    metrics["unmapped_source_rows"] = unmapped_rows
-    metrics["ambiguous_mapping_rows"] = ambiguous_rows
-    metrics["timeseries_ids"] = sorted(mapped_timeseries_ids)
-    metrics["downloaded_bytes"] = int(downloaded_bytes)
-    metrics["snapshot_status"] = SOS_STATUS_OK if metrics["source_rows"] > 0 else SOS_STATUS_NO_DATA
-
-    _record_source_file_timeseries_counts(
-        conn,
-        sfk,
-        counts_by_day_ts,
-        now_iso,
-        default_day_utc=year_day.isoformat(),
-    )
-
-    is_first_seen = prior is None
-    was_missing = prior is not None and int(prior.get("exists_remote") or 0) == 0
-    prior_sha = str(prior.get("sha256_uncompressed") or "") if prior else ""
-    content_changed = is_first_seen or (not prior_sha) or prior_sha != sha_csv
-    state_changed = is_first_seen or was_missing or content_changed
-    mapping_status = "ok"
-    if unmapped_groups and ambiguous_groups:
-        mapping_status = "mixed_mapping_issues"
-    elif unmapped_groups:
-        mapping_status = "unmapped_source"
-    elif ambiguous_groups:
-        mapping_status = "ambiguous_mapping"
-    if metrics["mapped_rows"] <= 0 and mapping_status == "ok" and metrics["source_rows"] > 0:
-        mapping_status = "unmapped_source"
-    state_status = mapping_status if mapping_status != "ok" else (
-        "first_seen" if is_first_seen else "reappeared" if was_missing else "changed" if content_changed else "unchanged"
-    )
-
-    if not state_changed:
-        outcome = "unchanged"
-        event_type = None
-        last_changed_at = None
-    else:
-        if is_first_seen:
-            outcome = "first_seen"
-            event_type = "first_seen"
-        elif was_missing:
-            outcome = "reappeared"
-            event_type = "reappeared"
-        else:
-            outcome = "changed"
-            event_type = "changed"
-        last_changed_at = now_iso
-
-    keep_snapshot = (
-        metrics["source_rows"] > 0
-        and (
-            keep_policy == "all"
-            or (keep_policy == "changed" and state_changed)
-        )
-    )
-    local_cached_path: str | None = None
-    if keep_snapshot:
-        local_cached_path = str(cache_path)
-    else:
-        try:
-            cache_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            cache_path.parent.rmdir()
-            cache_path.parent.parent.rmdir()
-        except OSError:
-            pass
-
-    notes_bits = [
-        "uk_air_flat_file",
-        f"site_ref={site_token}",
-        f"year={int(year)}",
-        f"source_rows={metrics['source_rows']}",
-        f"mapped_rows={metrics['mapped_rows']}",
-        f"mapped_days={metrics['mapped_days']}",
-        f"mapped_pollutants={metrics['mapped_pollutants']}",
-        f"mapping_status={mapping_status}",
-        f"keep_policy={keep_policy}",
-    ]
-    if issue_notes:
-        notes_bits.append("mapping_issues=" + ";".join(issue_notes[:25]))
-    notes = " ".join(notes_bits)
-
-    _upsert_source_state(
-        conn=conn,
-        source_key=SOS_SOURCE_KEY,
-        remote_scheme="uk_air_flat_file",
-        source_file_key=sfk,
-        env_name=env_name,
-        remote_url_or_key=remote_url,
-        station_ref=site_token,
-        source_location_id=source_location_id,
-        day=year_day,
-        exists_remote=True,
-        content_length=downloaded_bytes,
-        etag=str(head.get("etag") or "") or None,
-        last_modified_utc=str(head.get("last_modified") or "") or None,
-        sha256_downloaded=sha_csv,
-        sha256_uncompressed=sha_csv,
-        local_cached_path=local_cached_path,
-        now_iso=now_iso,
-        last_changed_at=last_changed_at,
-        last_status=state_status,
-        notes=notes,
-    )
-
-    event_id: int | None = None
-    if event_type:
-        event_id = _insert_source_event(
-            conn=conn,
-            source_key=SOS_SOURCE_KEY,
-            event_type=event_type,
-            env_name=env_name,
-            source_file_key=sfk,
-            remote_url_or_key=remote_url,
-            station_ref=site_token,
-            source_location_id=source_location_id,
-            day=year_day,
-            prior=prior,
-            new_content_length=downloaded_bytes,
-            new_etag=str(head.get("etag") or "") or None,
-            new_last_modified_utc=str(head.get("last_modified") or "") or None,
-            new_sha256_downloaded=sha_csv,
-            new_sha256_uncompressed=sha_csv,
-            downloaded_bytes=downloaded_bytes,
-            hash_runtime_ms=0,
-            now_iso=now_iso,
-            notes=notes,
-        )
-
-    return {
-        **metrics,
-        "outcome": outcome,
-        "event_id": event_id,
-        "event_type": event_type,
-        "source_file_key": sfk,
-        "remote_url": remote_url,
-        "mapping_status": mapping_status,
-    }
-
-
-def check_sos_flat_files(
-    conn: sqlite3.Connection,
-    env_name: str,
-    env: dict[str, str],
-    from_day: str | None,
-    to_day: str | None,
-    *,
-    dry_run: bool,
-    run_backfill: bool,
-    limits: LimitTracker,
-    log: logging.Logger,
-    concurrency: int = DEFAULT_CONCURRENCY,
-    history_version: str = "v1",
-) -> dict[str, Any]:
-    metrics: dict[str, Any] = {
-        "ran": False,
-        "stopped_for": None,
-        "source_mode": "uk_air_flat_files",
-        "stations": 0,
-        "stations_checked": 0,
-        "days": 0,
-        "site_years": 0,
-        "station_days_checked": 0,
-        "head_checked": 0,
-        "files_checked": 0,
-        "downloaded": 0,
-        "first_seen": 0,
-        "changed": 0,
-        "reappeared": 0,
-        "unchanged_after_download": 0,
-        "snapshots_successful": 0,
-        "snapshots_no_data": 0,
-        "missing": 0,
-        "not_found": 0,
-        "not_found_suppressed": 0,
-        "temporary_errors": 0,
-        "permanent_errors": 0,
-        "errors": 0,
-        "rows_counted": 0,
-        "source_rows": 0,
-        "downloaded_bytes": 0,
-        "mapped_days": 0,
-        "mapped_pollutants": 0,
-        "unmapped_source_groups": 0,
-        "ambiguous_mapping_groups": 0,
-        "unmapped_source_rows": 0,
-        "ambiguous_mapping_rows": 0,
-        "first_seen_files": [],
-        "changed_files": [],
-        "planned_backfills": [],
-        "backfills_attempted": 0,
-        "backfills_ok": 0,
-        "backfills_failed": 0,
-        "keep_api_snapshots_policy": _resolve_keep_api_snapshots_policy(),
-        "not_found_cooldown_seconds": _resolve_sos_not_found_cooldown_seconds(),
-        "flat_file_base_url": _resolve_uk_air_flat_file_base_url(env),
-        "target_pollutants": list(_resolve_sos_target_pollutants(env)),
-        "sample_urls": [],
-        "skipped_reason": None,
-    }
-    if not from_day or not to_day:
-        metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
-        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
-        return metrics
-
-    mapping_rows = _fetch_uk_air_flat_file_mapping_rows(env=env, target_pollutants=metrics["target_pollutants"])
-    grouped_mappings = _group_uk_air_flat_file_mapping_rows(mapping_rows)
-    if not grouped_mappings:
-        metrics["skipped_reason"] = "no UK-AIR site_ref mappings returned from Supabase"
-        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
-        return metrics
-
-    years = _uk_air_flat_file_years_for_window(from_day, to_day)
-    if not years:
-        metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
-        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
-        return metrics
-
-    tasks: list[dict[str, Any]] = []
-    for site_ref in sorted(grouped_mappings):
-        for year in years:
-            tasks.append({
-                "site_ref": site_ref,
-                "year": year,
-                "source_file_key": _uk_air_flat_file_source_file_key(site_ref, year),
-                "remote_url": _uk_air_flat_file_remote_url(metrics["flat_file_base_url"], site_ref, year),
-            })
-
-    metrics["stations"] = len(grouped_mappings)
-    metrics["stations_checked"] = len(grouped_mappings)
-    metrics["days"] = len(years)
-    metrics["site_years"] = len(tasks)
-    metrics["station_days_checked"] = 0
-    metrics["head_checked"] = 0
-    metrics["files_checked"] = 0
-    metrics["ran"] = True
-
-    log.info(
-        "sos flat-file: starting sites=%s years=%s files=%s base_url=%s target_pollutants=%s%s",
-        metrics["stations"],
-        len(years),
-        len(tasks),
-        metrics["flat_file_base_url"],
-        ",".join(metrics["target_pollutants"]),
-        " (dry-run)" if dry_run else "",
-    )
-
-    if dry_run:
-        metrics["sample_urls"] = [task["remote_url"] for task in tasks[:6]]
-        log.info(
-            "sos flat-file dry-run: would check %s site/year files; sample=%s",
-            len(tasks),
-            metrics["sample_urls"][:6],
-        )
-        return metrics
-
-    cache_root = Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY
-    cache_root.mkdir(parents=True, exist_ok=True)
-    db_path = env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"]
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures: list[concurrent.futures.Future] = []
-        for task in tasks:
-            if limits.should_stop():
-                break
-            futures.append(ex.submit(
-                _check_one_sos_uk_air_flat_file_threadsafe,
-                db_path,
-                env_name,
-                metrics["flat_file_base_url"],
-                task["site_ref"],
-                int(task["year"]),
-                grouped_mappings,
-                metrics["target_pollutants"],
-                cache_root,
-                metrics["keep_api_snapshots_policy"],
-                log,
-                limits,
-            ))
-
-        total_tasks = len(futures)
-        completed_tasks = 0
-        progress = SingleLineProgress("sos flat-file progress")
-        progress.update(
-            (
-                f"0/{total_tasks} checked=0 downloaded=0 mapped_rows=0 "
-                f"missing=0 errors=0 planned_backfills=0"
-            ),
-            force=True,
-        )
-
-        for fut in concurrent.futures.as_completed(futures):
-            completed_tasks += 1
-            try:
-                result = fut.result()
-            except Exception as exc:
-                metrics["errors"] += 1
-                log.warning("sos flat-file worker raised: %s", exc)
-                progress.update(
-                    (
-                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
-                        f"downloaded={metrics['downloaded']} mapped_rows={metrics['rows_counted']} "
-                        f"missing={metrics['missing']} errors={metrics['errors']} "
-                        f"planned_backfills=0"
-                    ),
-                )
-                continue
-
-            outcome = str(result.get("outcome") or "")
-            metrics["head_checked"] += 1
-            metrics["files_checked"] += 1
-            metrics["downloaded_bytes"] += int(result.get("downloaded_bytes") or 0)
-            metrics["source_rows"] += int(result.get("source_rows") or 0)
-            metrics["rows_counted"] += int(result.get("mapped_rows") or result.get("row_count") or 0)
-            metrics["mapped_days"] += int(result.get("mapped_days") or 0)
-            metrics["mapped_pollutants"] += int(result.get("mapped_pollutants") or 0)
-            metrics["unmapped_source_groups"] += int(result.get("unmapped_source_groups") or 0)
-            metrics["ambiguous_mapping_groups"] += int(result.get("ambiguous_mapping_groups") or 0)
-            metrics["unmapped_source_rows"] += int(result.get("unmapped_source_rows") or 0)
-            metrics["ambiguous_mapping_rows"] += int(result.get("ambiguous_mapping_rows") or 0)
-
-            snapshot_status = str(result.get("snapshot_status") or "")
-            if snapshot_status in {SOS_STATUS_OK, SOS_STATUS_NO_DATA}:
-                metrics["snapshots_successful"] += 1
-                if snapshot_status == SOS_STATUS_NO_DATA:
-                    metrics["snapshots_no_data"] += 1
-            elif snapshot_status == SOS_STATUS_NOT_FOUND:
-                metrics["not_found"] += 1
-
-            if outcome == "first_seen":
-                metrics["downloaded"] += 1
-                metrics["first_seen"] += 1
-                metrics["first_seen_files"].append({
-                    "site_ref": result["site_ref"],
-                    "station_ref": result["site_ref"],
-                    "year": result["year"],
-                    "day": f"{int(result['year'])}-01-01",
-                    "source_file_key": result.get("source_file_key"),
-                    "event_id": result.get("event_id"),
-                    "event_type": result.get("event_type"),
-                    "timeseries_ids": result.get("timeseries_ids"),
-                })
-            elif outcome == "reappeared":
-                metrics["downloaded"] += 1
-                metrics["changed"] += 1
-                metrics["reappeared"] += 1
-                metrics["changed_files"].append({
-                    "site_ref": result["site_ref"],
-                    "station_ref": result["site_ref"],
-                    "year": result["year"],
-                    "day": f"{int(result['year'])}-01-01",
-                    "source_file_key": result.get("source_file_key"),
-                    "event_id": result.get("event_id"),
-                    "event_type": result.get("event_type"),
-                    "timeseries_ids": result.get("timeseries_ids"),
-                })
-            elif outcome == "changed":
-                metrics["downloaded"] += 1
-                metrics["changed"] += 1
-                metrics["changed_files"].append({
-                    "site_ref": result["site_ref"],
-                    "station_ref": result["site_ref"],
-                    "year": result["year"],
-                    "day": f"{int(result['year'])}-01-01",
-                    "source_file_key": result.get("source_file_key"),
-                    "event_id": result.get("event_id"),
-                    "event_type": result.get("event_type"),
-                    "timeseries_ids": result.get("timeseries_ids"),
-                })
-            elif outcome == "unchanged":
-                metrics["downloaded"] += 1
-                metrics["unchanged_after_download"] += 1
-            elif outcome in {"not_found_first_seen", "not_found_after_seen", "not_found_still"}:
-                metrics["missing"] += 1
-            elif outcome == "temporary_error":
-                metrics["temporary_errors"] += 1
-                metrics["errors"] += 1
-            elif outcome == "permanent_error":
-                metrics["permanent_errors"] += 1
-                metrics["errors"] += 1
-            else:
-                metrics["errors"] += 1
-
-            metrics["errors"] += int(result.get("unmapped_source_groups") or 0)
-            metrics["errors"] += int(result.get("ambiguous_mapping_groups") or 0)
-
-            progress.update(
-                (
-                    f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
-                    f"downloaded={metrics['downloaded']} mapped_rows={metrics['rows_counted']} "
-                    f"missing={metrics['missing']} errors={metrics['errors']} "
-                    f"planned_backfills=0"
-                ),
-            )
-
-    progress.update(
-        (
-            f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
-            f"downloaded={metrics['downloaded']} mapped_rows={metrics['rows_counted']} "
-            f"missing={metrics['missing']} errors={metrics['errors']} planned_backfills=0"
-        ),
-        force=True,
-    )
-    progress.finish()
-
-    metrics["first_seen_files"].sort(key=lambda e: (e["year"], e["site_ref"]))
-    metrics["changed_files"].sort(key=lambda e: (e["year"], e["site_ref"]))
-
-    if limits.should_stop():
-        metrics["stopped_for"] = limits.stopped_for
-        log.warning("sos flat-file: stopped early due to limit=%s", limits.stopped_for)
-
-    log.info(
-        "sos flat-file: done %s",
-        {
-            k: v
-            for k, v in metrics.items()
-            if k not in ("first_seen_files", "changed_files", "sample_urls")
-        },
-    )
-    return metrics
-
-
 def check_sos(
     conn: sqlite3.Connection,
     env_name: str,
@@ -6188,26 +4931,9 @@ def check_sos(
     concurrency: int = DEFAULT_CONCURRENCY,
     history_version: str = "v1",
 ) -> dict[str, Any]:
-    source_mode = _resolve_sos_source_mode(env)
-    if source_mode == "uk_air_flat_files":
-        return check_sos_flat_files(
-            conn=conn,
-            env_name=env_name,
-            env=env,
-            from_day=from_day,
-            to_day=to_day,
-            dry_run=dry_run,
-            run_backfill=run_backfill,
-            limits=limits,
-            log=log,
-            concurrency=concurrency,
-            history_version=history_version,
-        )
-
     metrics: dict[str, Any] = {
         "ran": False,
         "stopped_for": None,
-        "source_mode": source_mode,
         "stations": 0,
         "stations_checked": 0,
         "station_days_checked": 0,
@@ -6982,9 +5708,9 @@ def _current_source_counts_for_v2_partition(
         return {}, "source_scope_has_no_source_keys"
 
     where = [
-        "c.day_utc = ?",
+        "s.day_utc = ?",
         "c.row_count > 0",
-        "t.connector_id = ?",
+        "l.connector_id = ?",
         f"s.source_key IN ({','.join('?' for _ in source_keys)})",
     ]
     params: list[Any] = [day_utc, connector_id, *source_keys]
@@ -7006,7 +5732,11 @@ def _current_source_counts_for_v2_partition(
         FROM source_file_timeseries_counts c
         JOIN source_file_state s
           ON s.source_file_key = c.source_file_key
-        JOIN core_timeseries_snapshot t
+        JOIN source_station_timeseries_lookup l
+          ON l.source_key = s.source_key
+         AND l.source_location_id = s.source_location_id
+         AND l.timeseries_id = c.timeseries_id
+        LEFT JOIN core_timeseries_snapshot t
           ON t.id = c.timeseries_id
         LEFT JOIN core_phenomena_snapshot p
           ON p.id = t.phenomenon_id
@@ -7903,34 +6633,36 @@ def run_r2_cross_checks(
 
     where = [
         "s.env_name = ?",
-        "c.day_utc IS NOT NULL",
+        "s.day_utc IS NOT NULL",
         "c.row_count > 0",
         f"s.source_key IN ({','.join('?' for _ in source_keys)})",
     ]
     params: list[Any] = [env_name, *source_keys]
     if from_day:
-        where.append("c.day_utc >= ?")
+        where.append("s.day_utc >= ?")
         params.append(from_day)
     if to_day:
-        where.append("c.day_utc <= ?")
+        where.append("s.day_utc <= ?")
         params.append(to_day)
     where_sql = " AND ".join(where)
 
     rows = conn.execute(
         f"""
         SELECT
-          t.connector_id,
-          c.day_utc,
+          l.connector_id,
+          s.day_utc,
           c.timeseries_id,
           SUM(c.row_count) AS source_row_count
         FROM source_file_timeseries_counts c
         JOIN source_file_state s
           ON s.source_file_key = c.source_file_key
-        JOIN core_timeseries_snapshot t
-          ON t.id = c.timeseries_id
+        JOIN source_station_timeseries_lookup l
+          ON l.source_key = s.source_key
+         AND l.source_location_id = s.source_location_id
+         AND l.timeseries_id = c.timeseries_id
         WHERE {where_sql}
-        GROUP BY t.connector_id, c.day_utc, c.timeseries_id
-        ORDER BY c.day_utc, t.connector_id, c.timeseries_id
+        GROUP BY l.connector_id, s.day_utc, c.timeseries_id
+        ORDER BY s.day_utc, l.connector_id, c.timeseries_id
         """,
         tuple(params),
     ).fetchall()
@@ -9200,13 +7932,11 @@ def run_cross_check_backfills(
         run_id=run_id,
         source_filter=source_filter,
     )
-    source_change_targets: dict[tuple[str, int], list[int]] = {}
-    if source_filter in {"sos", "all"} and _resolve_sos_source_mode(env) == "sos_api":
-        source_change_targets = _collect_sos_source_change_targets(
-            conn,
-            source_filter=source_filter,
-            sos_metrics=sos_metrics,
-        )
+    source_change_targets = _collect_sos_source_change_targets(
+        conn,
+        source_filter=source_filter,
+        sos_metrics=sos_metrics,
+    )
     metrics["source_change_candidate_days"] = len(
         {day_iso for day_iso, _ in source_change_targets.keys()}
     )
@@ -11560,17 +10290,6 @@ def collect_preflight_errors(
             except Exception as exc:  # pragma: no cover - defensive
                 errors.append(f"required Python module '{module_name}' failed to import ({exc}).")
 
-    if args.source in {"sos", "all"} and _resolve_sos_source_mode(os.environ) == "uk_air_flat_files":
-        flat_file_supabase = _resolve_obs_aqidb_supabase_rest_config(os.environ)
-        if not flat_file_supabase.get("supabase_url"):
-            errors.append(
-                "OBS_AQIDB_SUPABASE_URL is required for UK-AIR flat-file SOS mode.",
-            )
-        if not flat_file_supabase.get("supabase_key"):
-            errors.append(
-                "OBS_AQIDB_SECRET_KEY is required for UK-AIR flat-file SOS mode.",
-            )
-
     daily_task_health_enabled = _daily_task_health_enabled()
     if daily_task_health_enabled:
         env_file_raw = str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")).strip()
@@ -11899,18 +10618,7 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    legacy_sftc_rows = _prepare_source_file_timeseries_counts_migration(conn)
     conn.executescript(SCHEMA_SQL)
-    if legacy_sftc_rows is not None:
-        conn.executemany(
-            """
-            INSERT INTO source_file_timeseries_counts
-              (source_file_key, day_utc, timeseries_id, row_count, counted_at_utc)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            legacy_sftc_rows,
-        )
-        conn.execute("DROP TABLE IF EXISTS source_file_timeseries_counts_legacy")
     # In-place schema additions for DBs created by earlier phases.
     ensure_columns(conn, "core_snapshot_imports", {
         "snapshot_day_utc": "TEXT",
@@ -12191,7 +10899,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             "## UK-AIR SOS",
             "",
             f"- Ran:            {bool(sos.get('ran'))}",
-            f"- Source mode:    {sos.get('source_mode') or '(default)'}",
             f"- Stations:       {sos.get('stations', 0)}",
             f"- Days:           {sos.get('days', 0)}",
             f"- Station-days checked: {sos.get('station_days_checked', sos.get('head_checked', 0))}",

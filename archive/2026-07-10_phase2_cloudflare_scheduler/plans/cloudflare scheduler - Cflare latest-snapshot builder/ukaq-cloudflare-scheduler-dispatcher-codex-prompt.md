@@ -345,33 +345,22 @@ would_trigger true/false
 
 Do not log secret values.
 
-Completed:
+### Phase 3: Enable triggering for one low-risk job
 
-- Added phase-2 dry-run Cloudflare scheduler workers for ingest and ops
-- Kept `uk-aq-db-size-logger`, `uk-aq-aqilevels-retention-service`, and `uk-aq-timeseries-aqi-hourly` out of the phase-2 job set, as requested
-- Wired the ingest worker to `uk_aq_core.uk_aq_ingest_runs` and the ops worker to `uk_aq_ops.daily_task_runs_dashboard`
-- Logged `due`, `reason`, `last_started_at`, `last_success_at`, and `would_trigger` for each configured job without issuing Cloud Run requests
-- Added deploy workflow and scheduler docs for the new dry-run workers
-- Added local coverage for ingest due/skip paths, daily task due/skip paths, and the phase-2 exclusion list
-- Confirmed the phase-2 dispatcher package passes `node --check` and `node --test`
-
-### Phase 3: Validate the R2 core snapshot trigger
-
-Start with the R2 core snapshot workflow first:
+Start with a low-risk ops job such as:
 
 ```text
-uk_aq_r2_core_snapshot
+uk-aq-db-size-logger
 ```
-
-This job is already routed through the Cloudflare workflow scheduler, so Phase 3 is about validating that path as the first low-risk external schedule.
 
 Confirm:
 
-- Cloudflare cron fires at 04:15 UTC
-- GitHub `workflow_dispatch` runs
-- daily task health writes `Started`, `Finished`, and `Failed` correctly
-- the R2 snapshot output and report artifact look correct
-- no duplicate trigger occurs
+- Cloudflare cron fires
+- Supabase state check works
+- Cloud Run auth works
+- Cloud Run service receives exactly one trigger
+- task health updates normally
+- no duplicate run occurs
 
 ### Phase 4: Migrate remaining fixed schedules
 

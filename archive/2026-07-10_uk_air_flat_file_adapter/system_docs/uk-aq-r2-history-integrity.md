@@ -423,11 +423,7 @@ Example commands:
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh --env LIVE --source openaq --from-day 2026-04-01 --to-day 2026-04-30 --dry-run
 ```
 
-### UK-AIR SOS flat-file model and run examples
-
-`--source sos` now defaults to the UK-AIR flat-file CSV adapter. Set
-`UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api` to keep the legacy
-station/day API path for comparison or debugging.
+### UK-AIR SOS model and run examples
 
 Naming rules used by the active runtime:
 
@@ -436,47 +432,22 @@ sensorcommunity
 sos
 ```
 
-Flat-file SOS integrity model units:
+SOS integrity model units:
 
 ```text
-source check unit: site_ref + year
-evidence/count unit: day_utc + pollutant_code + timeseries_id
+source check unit: station_ref + day_utc
+evidence/count unit: timeseries_id + day_utc
 observation repair unit: affected timeseries_ids + day_utc
 AQI rebuild unit: connector_id + day_utc
 ```
 
-Flat-file CSV source locations:
+SOS canonical snapshot cache path:
 
 ```text
-remote URL:
-https://uk-air.defra.gov.uk/datastore/data_files/site_data/<SITE_REF>_<YEAR>.csv?v=1
-
-cache path:
-<source-cache>/sos/site_ref=<SITE_REF>/year=<YYYY>/<SITE_REF>_<YYYY>.csv
+<source-cache>/sos/station_ref=<station_ref>/day_utc=<YYYY-MM-DD>/snapshot.ndjson
 ```
 
-Flat-file mapping rules:
-
-- Source rows are counted by day and pollutant from the annual CSVs.
-- Pollutants are limited to `pm25`, `pm10`, and `no2`.
-- Mapping rows are resolved from `uk_aq_raw.sos_station_timeseries_site_refs`
-  via Obs/AQI DB REST using `OBS_AQIDB_SUPABASE_URL` and
-  `OBS_AQIDB_SECRET_KEY`.
-- 0 mapping rows => `unmapped_source`
-- 1 mapping row => use it
-- >1 mapping rows => `ambiguous_mapping`
-- EA8 2026 splits `pm10` across timeseries `66` through `2026-05-17` and `95`
-  from `2026-05-18`.
-
-Relevant flat-file settings:
-
-```text
-UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=uk_air_flat_files|sos_api
-UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL=...
-UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS=pm25,pm10,no2
-```
-
-Relevant SOS retention and 404 suppression settings:
+Relevant SOS snapshot retention and 404 suppression settings:
 
 ```text
 UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all
@@ -486,12 +457,10 @@ UK_AQ_HISTORY_INTEGRITY_SOS_NOT_FOUND_COOLDOWN_MINUTES=<int, 0 disables>
 First-seen and error handling rules:
 
 - `first_seen` is baseline-only and does not directly trigger backfill.
-- Cross-check can still trigger repair if R2 is missing or mismatched.
+- Cross-check can still trigger repair if R2 is missing/mismatched.
 - `no_data` is a successful zero-row snapshot and can baseline zero counts.
-- `not_found` is recorded clearly and does not create repair candidates by
-  itself.
-- `temporary_error` and `permanent_error` do not overwrite prior good baseline
-  hashes/counts and do not create repair candidates.
+- `not_found` is recorded clearly and does not create repair candidates by itself.
+- `temporary_error` and `permanent_error` do not overwrite prior good baseline hashes/counts and do not create repair candidates.
 
 Repair flow for eligible SOS discrepancies/changes:
 
@@ -501,30 +470,10 @@ source_to_r2 + observations_only
 -> r2_history_obs_to_aqilevels + aqilevels_only
 ```
 
-Operational notes:
-
-- `--dry-run` reports planned UK-AIR CSV checks and sample URLs before any
-  download.
-- `--check-only` writes source state/count rows but skips backfill unless
-  `--run-backfill` is also passed.
-- When `UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api`, the legacy
-  station/day API cache path remains available for debugging and comparison.
-- In flat-file mode, source-change backfill collection stays disabled; repair
-  planning comes from cross-check-driven discrepancies instead.
-
 SOS-focused operational examples:
 
 ```bash
-# Dry-run planning for the default UK-AIR flat-file adapter
-/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
-  --env CIC-Test \
-  --profile manual \
-  --source sos \
-  --from-day 2026-05-01 \
-  --to-day 2026-05-03 \
-  --dry-run
-
-# Real flat-file check-only run (writes state, no backfill)
+# Check-only SOS run (manual day window)
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
@@ -533,15 +482,25 @@ SOS-focused operational examples:
   --to-day 2026-05-03 \
   --check-only
 
-# Legacy SOS API mode for comparison/debugging
-UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api \
+# Dry-run planning with backfill enabled (no source writes, no wrapper execution)
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-05-01 \
+  --to-day 2026-05-03 \
+  --dry-run \
+  --run-backfill
+
+# Narrow real SOS run with backfill enabled
 /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
   --env CIC-Test \
   --profile manual \
   --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-01 \
-  --check-only
+  --run-backfill \
+  --max-runtime-minutes 30
 ```
 
 ---

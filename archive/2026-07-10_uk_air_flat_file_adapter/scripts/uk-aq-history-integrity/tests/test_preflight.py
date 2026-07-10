@@ -70,7 +70,7 @@ class PreflightTests(unittest.TestCase):
     def test_parse_args_rejects_hyphenated_sos_source(self) -> None:
         with self.assertRaises(SystemExit):
             MODULE.parse_args(
-                ["--env", "CIC-Test", "--source", "sos-api", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
+                ["--env", "CIC-Test", "--source", "sos", "--profile", "manual", "--from-day", "2026-05-11", "--to-day", "2026-05-11"],
             )
 
     def _base_env(self, root: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -248,31 +248,6 @@ class PreflightTests(unittest.TestCase):
                 errors, _, _ = MODULE.collect_preflight_errors(args, env)
             self.assertTrue(any("OBS_AQIDB_SUPABASE_URL is required" in err for err in errors))
             self.assertTrue(any("OBS_AQIDB_SECRET_KEY is required" in err for err in errors))
-
-    def test_flat_file_sos_mode_missing_obs_creds_errors(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            env, os_env = self._base_env(root)
-            bad_env = root / "bad-flat-file.env"
-            bad_env.write_text("UK_AQ_BACKFILL_WRAPPER=/tmp/dummy.sh\n", encoding="utf-8")
-            os_env["UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_ENABLED"] = "false"
-            os_env["UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE"] = "uk_air_flat_files"
-            os_env["UK_AQ_BACKFILL_ENV_FILE"] = str(bad_env)
-            args = make_args(source="sos")
-            with patched_env(os_env):
-                errors, _, _ = MODULE.collect_preflight_errors(args, env)
-            self.assertTrue(
-                any(
-                    "OBS_AQIDB_SUPABASE_URL is required for UK-AIR flat-file SOS mode." in err
-                    for err in errors
-                ),
-            )
-            self.assertTrue(
-                any(
-                    "OBS_AQIDB_SECRET_KEY is required for UK-AIR flat-file SOS mode." in err
-                    for err in errors
-                ),
-            )
 
     def test_preflight_summary_includes_daily_task_health_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
