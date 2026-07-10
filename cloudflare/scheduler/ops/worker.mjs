@@ -16,7 +16,6 @@ const OPS_SCHEMA = "uk_aq_ops";
 const OPS_TABLE = "daily_task_runs_dashboard";
 const OPS_SELECT = "run_id,task_key,task_name,platform,source,scheduled_for_date,scheduled_time_utc,scheduled_at_utc,attempt,raw_status,started_at,finished_at,failed_at,updated_at,duration_seconds,summary,error_message,log_url,effective_status,scheduled_or_started_at,finished_or_failed_at,is_failed,is_overdue,is_not_started,task_day_rank";
 const DEFAULT_LIMIT = 10;
-const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 
 export const OPS_JOBS = [
   {
@@ -25,8 +24,8 @@ export const OPS_JOBS = [
     target_label: "uk_aq_r2_core_snapshot.yml",
     state_source: "daily_task_runs",
     task_key: "ops.r2_core_snapshot",
-    cron: "13 0 * * *",
-    scheduled_time_utc: "13:00",
+    cron: "31 13 * * *",
+    scheduled_time_utc: "13:31",
     due_after_minutes: 0,
     min_gap_minutes: 60,
     stale_after_minutes: 180,
@@ -67,10 +66,6 @@ function workflowDispatchUrl(job) {
   const repo = encodeURIComponent(job.repo);
   const workflow = encodeURIComponent(job.workflow_file);
   return `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`;
-}
-
-function cloudRunDispatchUrl(serviceUrl) {
-  return `${normalizeBaseUrl(serviceUrl)}/run`;
 }
 
 async function dispatchWorkflow(job, token) {
@@ -116,53 +111,6 @@ async function dispatchWorkflow(job, token) {
   }
 }
 
-async function dispatchCloudRun(job, env) {
-  const serviceUrl = normalizeBaseUrl(await readSecret(env[job.service_url_env]));
-  if (!serviceUrl) {
-    throw new Error(`Missing required Worker var: ${job.service_url_env}`);
-  }
-
-  const upstreamSecret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-  if (!upstreamSecret) {
-    throw new Error("Missing required Worker secret: UK_AQ_EDGE_UPSTREAM_SECRET");
-  }
-
-  const url = cloudRunDispatchUrl(serviceUrl);
-  logJson(WORKER_NAME, "cloud_run_dispatch_attempt", {
-    job_key: job.job_key,
-    target_label: job.target_label,
-    url,
-  });
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      [UPSTREAM_AUTH_HEADER]: upstreamSecret,
-      "User-Agent": "uk-aq-scheduler-ops",
-    },
-    body: "{}",
-  });
-
-  logJson(WORKER_NAME, "cloud_run_dispatch_response", {
-    job_key: job.job_key,
-    target_label: job.target_label,
-    status: response.status,
-  });
-
-  if (!response.ok) {
-    const errorBody = (await response.text()).slice(0, 4000);
-    logJson(WORKER_NAME, "cloud_run_dispatch_error", {
-      job_key: job.job_key,
-      target_label: job.target_label,
-      status: response.status,
-      error_body: errorBody,
-    });
-    throw new Error(`Cloud Run dispatch failed for job_key=${job.job_key} target=${job.target_label} (status ${response.status})`);
-  }
-}
-
 async function evaluateJob(job, env, nowMs) {
   let rows;
   try {
@@ -202,29 +150,6 @@ async function evaluateJob(job, env, nowMs) {
         throw new Error("Missing required Worker secret: GITHUB_WORKFLOW_DISPATCH_TOKEN");
       }
       await dispatchWorkflow(job, token);
-      logJson(WORKER_NAME, "dispatch_decision", {
-        ...summary,
-        dispatch_status: "dispatched",
-      });
-      return { ok: true, ...summary, dispatch_status: "dispatched" };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const failure = {
-        ...summary,
-        due: false,
-        reason: "dispatch_failed",
-        would_trigger: false,
-        error: message,
-        now_utc: nowIso(nowMs),
-      };
-      logJson(WORKER_NAME, "dispatch_error", failure);
-      return { ok: false, ...failure };
-    }
-  }
-
-  if (job.dispatch_kind === "cloud_run" && decision.due && decision.wouldTrigger) {
-    try {
-      await dispatchCloudRun(job, env);
       logJson(WORKER_NAME, "dispatch_decision", {
         ...summary,
         dispatch_status: "dispatched",

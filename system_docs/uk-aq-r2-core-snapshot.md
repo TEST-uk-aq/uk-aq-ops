@@ -18,7 +18,7 @@ The workflow reports daily task health under `ops.r2_core_snapshot` with `Starte
 
 Intended schedule:
 
-- `20 12 * * *` via `cloudflare/scheduler/ops` in the ops repo.
+- `31 13 * * *` via `cloudflare/scheduler/ops` in the ops repo.
 - Previous GitHub cron: `15 4 * * *` (UTC).
 
 Dispatch inputs:
