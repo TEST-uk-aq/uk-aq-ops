@@ -5,7 +5,7 @@ scheduler_name = "uk-aq-cron-scheduler-ops"
 
 [jobs.uk_aq_observs_partition_maintenance]
 enabled = true
-cron_expr = "0 3 * * *"
+cron_expr = "40 20 * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
 cloud_run_method = "POST"
