@@ -284,6 +284,12 @@ test("GitHub dispatch records success and sends workflow inputs", async () => {
     const result = await runScheduler(store, { UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: "pat" }, Date.parse("2026-07-10T04:15:30Z"));
     assert.equal(result.jobs_dispatched, 1);
     assert.equal(calls.length, 1);
+
+	assert.equal(
+	  calls[0].url,
+	  "https://api.github.com/repos/TEST-uk-aq/uk-aq-ops/actions/workflows/uk_aq_r2_core_snapshot.yml/dispatches",
+	);
+
     assert.deepEqual(JSON.parse(calls[0].init.body), {
       ref: "main",
       inputs: { force_prune_recheck: "true" },

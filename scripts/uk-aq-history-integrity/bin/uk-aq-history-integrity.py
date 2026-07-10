@@ -8043,12 +8043,29 @@ def run_v2_post_repair_integrity_rechecks(
     else:
         message = "v2 observations and v2 AQI still failing"
     status = "ok" if obs_status == "ok" and aqi_status == "ok" else "fail"
+    remaining_observation_gaps = list(post_obs.get("gaps") or [])
+    remaining_aqi_gaps = list(post_aqi.get("gaps") or [])
+    remaining_aqi_debug_gaps = list((post_aqi.get("debug") or {}).get("gaps") or [])
+    for domain, gaps in (
+        ("observations", remaining_observation_gaps),
+        ("aqilevels", remaining_aqi_gaps),
+        ("aqilevels_debug", remaining_aqi_debug_gaps),
+    ):
+        for gap in gaps:
+            log.warning(
+                "v2 post-repair remaining gap domain=%s details=%s",
+                domain,
+                json.dumps(gap, sort_keys=True, default=str),
+            )
     return {
         "ran": True,
         "status": status,
         "message": message,
         "observations": post_obs,
         "aqilevels": post_aqi,
+        "remaining_observation_gap_count": len(remaining_observation_gaps),
+        "remaining_aqi_gap_count": len(remaining_aqi_gaps),
+        "remaining_aqi_debug_gap_count": len(remaining_aqi_debug_gaps),
     }
 
 
@@ -10239,6 +10256,77 @@ def _source_cache_status_for_connector_day(
         """,
         (int(connector_id),),
     ).fetchall()
+    has_sos_source = any(str(row[0]) == SOS_SOURCE_KEY for row in lookup_rows)
+    if (
+        has_sos_source
+        and _table_exists(conn, "source_file_timeseries_counts")
+        and _table_exists(conn, "core_timeseries_snapshot")
+    ):
+        flat_rows = conn.execute(
+            """
+            SELECT
+              s.source_file_key,
+              s.local_cached_path,
+              c.timeseries_id,
+              c.row_count
+            FROM source_file_timeseries_counts c
+            JOIN source_file_state s
+              ON s.source_file_key = c.source_file_key
+            JOIN core_timeseries_snapshot t
+              ON t.id = c.timeseries_id
+            WHERE t.connector_id = ?
+              AND c.day_utc = ?
+              AND c.row_count > 0
+              AND s.source_key = ?
+              AND s.remote_scheme = 'uk_air_flat_file'
+              AND s.exists_remote = 1
+              AND s.last_status IN (
+                'unchanged', 'changed', 'first_seen', 'reappeared',
+                'unmapped_source', 'mixed_mapping_issues'
+              )
+            ORDER BY s.source_file_key, c.timeseries_id
+            """,
+            (int(connector_id), day.isoformat(), SOS_SOURCE_KEY),
+        ).fetchall()
+        if flat_rows:
+            source_files = {str(row[0]) for row in flat_rows}
+            cached_files = {
+                str(row[0])
+                for row in flat_rows
+                if str(row[1] or "").strip()
+                and Path(str(row[1])).is_file()
+            }
+            return {
+                "status": "ok",
+                "source_mode": "uk_air_flat_files",
+                "source_file_count": len(source_files),
+                "remote_exists": len(source_files),
+                "cached": len(cached_files),
+                "timeseries_count": len({int(row[2]) for row in flat_rows}),
+                "source_rows": sum(int(row[3] or 0) for row in flat_rows),
+                "evidence_day_utc": day.isoformat(),
+            }
+
+        flat_file_count = int(conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM source_file_state
+            WHERE source_key = ?
+              AND remote_scheme = 'uk_air_flat_file'
+              AND exists_remote = 1
+              AND source_file_key LIKE ?
+            """,
+            (SOS_SOURCE_KEY, f"sos:site_ref=%:year={day.year}"),
+        ).fetchone()[0] or 0)
+        if flat_file_count > 0:
+            return {
+                "status": "unavailable",
+                "source_mode": "uk_air_flat_files",
+                "reason": "no mapped UK-AIR flat-file source counts exist for connector/day",
+                "source_file_count": flat_file_count,
+                "evidence_day_utc": day.isoformat(),
+            }
+
     source_keys = [
         _source_file_key_for_lookup_row(str(row[0]), str(row[1]), day)
         for row in lookup_rows
