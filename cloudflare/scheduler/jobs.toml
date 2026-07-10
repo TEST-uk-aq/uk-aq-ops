@@ -10,7 +10,7 @@ target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
 github_workflow_file = "uk_aq_r2_core_snapshot.yml"
 github_ref = "main"
-dry_run = true
+dry_run = false
 notes = "R2 core snapshot"
 
 [jobs.uk_aq_r2_history_dropbox_backup]
