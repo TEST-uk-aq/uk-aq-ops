@@ -23,7 +23,7 @@ crons = [
 
 `worker.js` does not store literal cron values in source. Deploy injects the cron-to-logical-job map from `wrangler.toml` by `job_keys`.
 
-The `uk_aq_r2_core_snapshot` job has moved to `cloudflare/scheduler/` and now runs there at `15 4 * * *`.
+The `uk_aq_r2_core_snapshot` job has moved to `cloudflare/scheduler/jobs.toml` and now runs there at `15 4 * * *`.
 
 ## How Routing Works
 

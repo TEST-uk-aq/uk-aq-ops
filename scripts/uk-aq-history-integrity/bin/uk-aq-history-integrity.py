@@ -1957,6 +1957,31 @@ def _uk_air_flat_file_cache_path(cache_root: Path, site_ref: str, year: int) -> 
     return cache_root / f"site_ref={site_token}" / f"year={int(year)}" / f"{site_token}_{int(year)}.csv"
 
 
+def _uk_air_flat_file_remote_metadata_matches(
+    prior: Mapping[str, Any],
+    head: Mapping[str, Any],
+) -> bool:
+    remote_etag = str(head.get("etag") or "").strip()
+    if remote_etag:
+        return remote_etag == str(prior.get("etag") or "").strip()
+
+    remote_last_modified = str(head.get("last_modified") or "").strip()
+    prior_last_modified = str(prior.get("last_modified_utc") or "").strip()
+    remote_content_length = head.get("content_length")
+    prior_content_length = prior.get("content_length")
+    if (
+        not remote_last_modified
+        or remote_last_modified != prior_last_modified
+        or remote_content_length is None
+        or prior_content_length is None
+    ):
+        return False
+    try:
+        return int(remote_content_length) == int(prior_content_length)
+    except (TypeError, ValueError):
+        return False
+
+
 def _uk_air_flat_file_year_day(year: int) -> dt.date:
     return dt.date(int(year), 1, 1)
 
@@ -5565,6 +5590,10 @@ def _check_one_sos_uk_air_flat_file(
         "event_id": None,
         "event_type": None,
         "timeseries_ids": [],
+        "downloaded": False,
+        "cache_reused": False,
+        "cache_missing_redownloaded": False,
+        "download_reason": None,
     }
 
     try:
@@ -5782,9 +5811,102 @@ def _check_one_sos_uk_air_flat_file(
         }
 
     cache_path = _uk_air_flat_file_cache_path(cache_root, site_token, year)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    downloaded_bytes = _http_get_to_file(remote_url, cache_path)
-    sha_csv = hashlib.sha256(cache_path.read_bytes()).hexdigest()
+    is_first_seen = prior is None
+    was_missing = prior is not None and int(prior.get("exists_remote") or 0) == 0
+    prior_sha = str(prior.get("sha256_uncompressed") or "") if prior else ""
+    prior_cache_existed = cache_path.is_file()
+    prior_status = str((prior or {}).get("last_status") or "")
+    prior_status_is_error = prior_status in {
+        SOS_STATUS_TEMP_ERROR,
+        SOS_STATUS_PERM_ERROR,
+        "download_failed",
+    }
+
+    cache_reused = False
+    download_reason: str | None = None
+    sha_csv = ""
+    if is_first_seen:
+        download_reason = "first_seen"
+    elif was_missing:
+        download_reason = "reappeared"
+    elif prior_status_is_error:
+        download_reason = "prior_error_status"
+    elif not prior_cache_existed:
+        download_reason = "cache_missing"
+    elif not prior_sha:
+        download_reason = "prior_hash_missing"
+    elif not _uk_air_flat_file_remote_metadata_matches(prior, head):
+        download_reason = "remote_metadata_changed_or_unreliable"
+    else:
+        sha_csv = hashlib.sha256(cache_path.read_bytes()).hexdigest()
+        if sha_csv == prior_sha:
+            cache_reused = True
+        else:
+            download_reason = "cache_hash_mismatch"
+
+    downloaded_bytes = 0
+    if not cache_reused:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            downloaded_bytes = _http_get_to_file(remote_url, cache_path)
+        except Exception as exc:
+            snapshot_status = (
+                SOS_STATUS_TEMP_ERROR
+                if _is_retryable_url_error(exc)
+                else SOS_STATUS_PERM_ERROR
+            )
+            if prior is not None:
+                _mark_source_state_fetch_error(
+                    conn,
+                    source_file_key=sfk,
+                    status=snapshot_status,
+                    now_iso=now_iso,
+                )
+            event_type = (
+                "temporary_error"
+                if snapshot_status == SOS_STATUS_TEMP_ERROR
+                else "permanent_error"
+            )
+            event_id = _insert_source_event(
+                conn=conn,
+                source_key=SOS_SOURCE_KEY,
+                event_type=event_type,
+                env_name=env_name,
+                source_file_key=sfk,
+                remote_url_or_key=remote_url,
+                station_ref=site_token,
+                source_location_id=source_location_id,
+                day=year_day,
+                prior=prior,
+                new_content_length=None,
+                new_etag=None,
+                new_last_modified_utc=None,
+                new_sha256_downloaded=None,
+                new_sha256_uncompressed=None,
+                downloaded_bytes=0,
+                hash_runtime_ms=0,
+                now_iso=now_iso,
+                notes=(
+                    "uk_air_flat_file get_failed "
+                    f"download_reason={download_reason} error={exc}"
+                ),
+            )
+            return {
+                **metrics,
+                "outcome": event_type,
+                "snapshot_status": snapshot_status,
+                "event_id": event_id,
+                "event_type": event_type,
+                "download_reason": download_reason,
+            }
+        sha_csv = hashlib.sha256(cache_path.read_bytes()).hexdigest()
+
+    metrics["downloaded"] = not cache_reused
+    metrics["cache_reused"] = cache_reused
+    metrics["cache_missing_redownloaded"] = (
+        not cache_reused and download_reason == "cache_missing"
+    )
+    metrics["download_reason"] = download_reason
 
     parsed_counts, parse_stats = _uk_air_flat_file_parse_day_pollutant_counts(
         cache_path,
@@ -5852,9 +5974,6 @@ def _check_one_sos_uk_air_flat_file(
         default_day_utc=year_day.isoformat(),
     )
 
-    is_first_seen = prior is None
-    was_missing = prior is not None and int(prior.get("exists_remote") or 0) == 0
-    prior_sha = str(prior.get("sha256_uncompressed") or "") if prior else ""
     content_changed = is_first_seen or (not prior_sha) or prior_sha != sha_csv
     state_changed = is_first_seen or was_missing or content_changed
     mapping_status = "ok"
@@ -5888,7 +6007,10 @@ def _check_one_sos_uk_air_flat_file(
 
     keep_source_file = (
         keep_policy == "all"
-        or (keep_policy == "changed" and state_changed)
+        or (
+            keep_policy == "changed"
+            and (state_changed or prior_cache_existed)
+        )
     )
     local_cached_path: str | None = None
     if keep_source_file:
@@ -5916,10 +6038,20 @@ def _check_one_sos_uk_air_flat_file(
         f"snapshot_status={metrics['snapshot_status']}",
         f"keep_policy={keep_policy}",
         f"local_cache={'kept' if keep_source_file else 'deleted'}",
+        f"source_acquisition={'cache_reused' if cache_reused else 'downloaded'}",
     ]
+    if download_reason:
+        notes_bits.append(f"download_reason={download_reason}")
+    if metrics["cache_missing_redownloaded"]:
+        notes_bits.append("cache_missing_redownloaded=true")
     if issue_notes:
         notes_bits.append("mapping_issues=" + ";".join(issue_notes[:25]))
     notes = " ".join(notes_bits)
+
+    try:
+        source_content_length = int(head.get("content_length"))
+    except (TypeError, ValueError):
+        source_content_length = cache_path.stat().st_size
 
     _upsert_source_state(
         conn=conn,
@@ -5932,7 +6064,7 @@ def _check_one_sos_uk_air_flat_file(
         source_location_id=source_location_id,
         day=year_day,
         exists_remote=True,
-        content_length=downloaded_bytes,
+        content_length=source_content_length,
         etag=str(head.get("etag") or "") or None,
         last_modified_utc=str(head.get("last_modified") or "") or None,
         sha256_downloaded=sha_csv,
@@ -5957,7 +6089,7 @@ def _check_one_sos_uk_air_flat_file(
             source_location_id=source_location_id,
             day=year_day,
             prior=prior,
-            new_content_length=downloaded_bytes,
+            new_content_length=source_content_length,
             new_etag=str(head.get("etag") or "") or None,
             new_last_modified_utc=str(head.get("last_modified") or "") or None,
             new_sha256_downloaded=sha_csv,
@@ -6005,6 +6137,10 @@ def check_sos_flat_files(
         "head_checked": 0,
         "files_checked": 0,
         "downloaded": 0,
+        "unchanged": 0,
+        "unchanged_cached": 0,
+        "cache_reused": 0,
+        "cache_missing_redownloaded": 0,
         "first_seen": 0,
         "changed": 0,
         "reappeared": 0,
@@ -6129,7 +6265,7 @@ def check_sos_flat_files(
         progress = SingleLineProgress("sos flat-file progress")
         progress.update(
             (
-                f"0/{total_tasks} checked=0 downloaded=0 mapped_rows=0 "
+                f"0/{total_tasks} checked=0 downloaded=0 cached=0 mapped_rows=0 "
                 f"missing=0 errors=0 planned_backfills=0"
             ),
             force=True,
@@ -6145,7 +6281,8 @@ def check_sos_flat_files(
                 progress.update(
                     (
                         f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
-                        f"downloaded={metrics['downloaded']} mapped_rows={metrics['rows_counted']} "
+                        f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
+                        f"mapped_rows={metrics['rows_counted']} "
                         f"missing={metrics['missing']} errors={metrics['errors']} "
                         f"planned_backfills=0"
                     ),
@@ -6156,6 +6293,12 @@ def check_sos_flat_files(
             metrics["head_checked"] += 1
             metrics["files_checked"] += 1
             metrics["downloaded_bytes"] += int(result.get("downloaded_bytes") or 0)
+            if bool(result.get("downloaded")):
+                metrics["downloaded"] += 1
+            if bool(result.get("cache_reused")):
+                metrics["cache_reused"] += 1
+            if bool(result.get("cache_missing_redownloaded")):
+                metrics["cache_missing_redownloaded"] += 1
             metrics["source_rows"] += int(result.get("source_rows") or 0)
             metrics["rows_counted"] += int(result.get("mapped_rows") or result.get("row_count") or 0)
             metrics["mapped_days"] += int(result.get("mapped_days") or 0)
@@ -6174,7 +6317,6 @@ def check_sos_flat_files(
                 metrics["not_found"] += 1
 
             if outcome == "first_seen":
-                metrics["downloaded"] += 1
                 metrics["first_seen"] += 1
                 metrics["first_seen_files"].append({
                     "site_ref": result["site_ref"],
@@ -6187,7 +6329,6 @@ def check_sos_flat_files(
                     "timeseries_ids": result.get("timeseries_ids"),
                 })
             elif outcome == "reappeared":
-                metrics["downloaded"] += 1
                 metrics["changed"] += 1
                 metrics["reappeared"] += 1
                 metrics["changed_files"].append({
@@ -6201,7 +6342,6 @@ def check_sos_flat_files(
                     "timeseries_ids": result.get("timeseries_ids"),
                 })
             elif outcome == "changed":
-                metrics["downloaded"] += 1
                 metrics["changed"] += 1
                 metrics["changed_files"].append({
                     "site_ref": result["site_ref"],
@@ -6214,8 +6354,11 @@ def check_sos_flat_files(
                     "timeseries_ids": result.get("timeseries_ids"),
                 })
             elif outcome == "unchanged":
-                metrics["downloaded"] += 1
-                metrics["unchanged_after_download"] += 1
+                metrics["unchanged"] += 1
+                if bool(result.get("cache_reused")):
+                    metrics["unchanged_cached"] += 1
+                else:
+                    metrics["unchanged_after_download"] += 1
             elif outcome in {"not_found_first_seen", "not_found_after_seen", "not_found_still"}:
                 metrics["missing"] += 1
             elif outcome == "temporary_error":
@@ -6233,7 +6376,8 @@ def check_sos_flat_files(
             progress.update(
                 (
                     f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
-                    f"downloaded={metrics['downloaded']} mapped_rows={metrics['rows_counted']} "
+                    f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
+                    f"mapped_rows={metrics['rows_counted']} "
                     f"missing={metrics['missing']} errors={metrics['errors']} "
                     f"planned_backfills=0"
                 ),
@@ -6242,7 +6386,8 @@ def check_sos_flat_files(
     progress.update(
         (
             f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
-            f"downloaded={metrics['downloaded']} mapped_rows={metrics['rows_counted']} "
+            f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
+            f"mapped_rows={metrics['rows_counted']} "
             f"missing={metrics['missing']} errors={metrics['errors']} planned_backfills=0"
         ),
         force=True,

@@ -33,20 +33,8 @@ class SosFlatFileTests(unittest.TestCase):
     def _make_conn(self, db_path: Path) -> sqlite3.Connection:
         return MODULE.open_db(str(db_path))
 
-    def _run_flat_file_worker_case(
-        self,
-        root: Path,
-        *,
-        csv_text: str,
-        keep_policy: str,
-    ) -> tuple[dict, Path, tuple, list[tuple]]:
-        db_path = root / "worker.sqlite"
-        conn = MODULE.open_db(str(db_path))
-        cache_root = root / "source-cache" / "sos"
-        cache_path = MODULE._uk_air_flat_file_cache_path(cache_root, "EA8", 2026)
-        csv_source = root / "EA8_2026.csv"
-        csv_source.write_text(csv_text, encoding="utf-8")
-        grouped_mappings = {
+    def _flat_file_grouped_mappings(self) -> dict:
+        return {
             "EA8": {
                 "pm10": [
                     {
@@ -68,6 +56,21 @@ class SosFlatFileTests(unittest.TestCase):
                 ],
             },
         }
+
+    def _run_flat_file_worker_case(
+        self,
+        root: Path,
+        *,
+        csv_text: str,
+        keep_policy: str,
+    ) -> tuple[dict, Path, tuple, list[tuple]]:
+        db_path = root / "worker.sqlite"
+        conn = MODULE.open_db(str(db_path))
+        cache_root = root / "source-cache" / "sos"
+        cache_path = MODULE._uk_air_flat_file_cache_path(cache_root, "EA8", 2026)
+        csv_source = root / "EA8_2026.csv"
+        csv_source.write_text(csv_text, encoding="utf-8")
+        grouped_mappings = self._flat_file_grouped_mappings()
 
         def fake_head(url: str) -> dict[str, object]:
             return {
@@ -491,6 +494,8 @@ class SosFlatFileTests(unittest.TestCase):
         self.assertEqual(result["source_rows"], 2)
         self.assertEqual(result["mapped_rows"], 2)
         self.assertEqual(result["timeseries_ids"], [66, 95])
+        self.assertTrue(result["downloaded"])
+        self.assertFalse(result["cache_reused"])
         self.assertTrue(cache_was_file)
         self.assertEqual(state[3], str(cache_path))
         self.assertIn("local_cache=kept", state[4])
@@ -551,6 +556,220 @@ class SosFlatFileTests(unittest.TestCase):
             self.assertIn("keep_policy=changed", state[4])
             self.assertIn("local_cache=kept", state[4])
 
+    def test_flat_file_second_run_reuses_unchanged_cached_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, cache_path, _, expected_counts = self._run_flat_file_worker_case(
+                root,
+                csv_text="\n".join(
+                    [
+                        "preamble",
+                        'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
+                        "17-05-2026,01:00,10,R,ugm-3",
+                        "18-05-2026,01:00,11,R,ugm-3",
+                        "",
+                    ]
+                ),
+                keep_policy="all",
+            )
+            conn = MODULE.open_db(str(root / "worker.sqlite"))
+            head = {
+                "status": 200,
+                "etag": '"flat-file-test"',
+                "content_length": cache_path.stat().st_size,
+                "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            }
+            with mock.patch.object(MODULE, "_http_head", return_value=head), mock.patch.object(
+                MODULE,
+                "_http_get_to_file",
+            ) as http_get:
+                result = MODULE._check_one_sos_uk_air_flat_file(
+                    conn=conn,
+                    env_name="CIC-Test",
+                    base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
+                    site_ref="EA8",
+                    year=2026,
+                    grouped_mappings=self._flat_file_grouped_mappings(),
+                    target_pollutants=("pm10",),
+                    cache_root=root / "source-cache" / "sos",
+                    keep_policy="all",
+                    log=logging.getLogger("test-sos-flat-file-cache-reuse"),
+                )
+            counts = conn.execute(
+                """
+                SELECT day_utc, timeseries_id, row_count
+                FROM source_file_timeseries_counts
+                WHERE source_file_key = ?
+                ORDER BY day_utc, timeseries_id
+                """,
+                ("sos:site_ref=EA8:year=2026",),
+            ).fetchall()
+            state = conn.execute(
+                """
+                SELECT local_cached_path, last_status, content_length, notes
+                FROM source_file_state
+                WHERE source_file_key = ?
+                """,
+                ("sos:site_ref=EA8:year=2026",),
+            ).fetchone()
+            conn.close()
+
+            http_get.assert_not_called()
+            self.assertEqual(result["outcome"], "unchanged")
+            self.assertTrue(result["cache_reused"])
+            self.assertFalse(result["downloaded"])
+            self.assertEqual(result["downloaded_bytes"], 0)
+            self.assertEqual(counts, expected_counts)
+            self.assertTrue(cache_path.is_file())
+            self.assertEqual(state[0], str(cache_path))
+            self.assertEqual(state[1], "unchanged")
+            self.assertEqual(state[2], cache_path.stat().st_size)
+            self.assertIn("source_acquisition=cache_reused", state[3])
+
+    def test_flat_file_missing_cache_is_redownloaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, cache_path, _, _ = self._run_flat_file_worker_case(
+                root,
+                csv_text="Station metadata only\n",
+                keep_policy="all",
+            )
+            csv_source = root / "EA8_2026.csv"
+            cache_path.unlink()
+            conn = MODULE.open_db(str(root / "worker.sqlite"))
+            head = {
+                "status": 200,
+                "etag": '"flat-file-test"',
+                "content_length": csv_source.stat().st_size,
+                "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            }
+
+            def fake_get(url: str, dest_path: Path, **kwargs: object) -> int:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                dest_path.write_bytes(csv_source.read_bytes())
+                return dest_path.stat().st_size
+
+            with mock.patch.object(MODULE, "_http_head", return_value=head), mock.patch.object(
+                MODULE,
+                "_http_get_to_file",
+                side_effect=fake_get,
+            ) as http_get:
+                result = MODULE._check_one_sos_uk_air_flat_file(
+                    conn=conn,
+                    env_name="CIC-Test",
+                    base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
+                    site_ref="EA8",
+                    year=2026,
+                    grouped_mappings=self._flat_file_grouped_mappings(),
+                    target_pollutants=("pm10",),
+                    cache_root=root / "source-cache" / "sos",
+                    keep_policy="all",
+                    log=logging.getLogger("test-sos-flat-file-cache-missing"),
+                )
+            state = conn.execute(
+                "SELECT local_cached_path, notes FROM source_file_state WHERE source_file_key = ?",
+                ("sos:site_ref=EA8:year=2026",),
+            ).fetchone()
+            conn.close()
+
+            http_get.assert_called_once()
+            self.assertTrue(result["downloaded"])
+            self.assertFalse(result["cache_reused"])
+            self.assertTrue(result["cache_missing_redownloaded"])
+            self.assertGreater(result["downloaded_bytes"], 0)
+            self.assertTrue(cache_path.is_file())
+            self.assertEqual(state[0], str(cache_path))
+            self.assertIn("cache_missing_redownloaded=true", state[1])
+
+    def test_flat_file_changed_etag_downloads_and_updates_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, cache_path, _, _ = self._run_flat_file_worker_case(
+                root,
+                csv_text="\n".join(
+                    [
+                        "preamble",
+                        'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
+                        "17-05-2026,01:00,10,R,ugm-3",
+                        "",
+                    ]
+                ),
+                keep_policy="all",
+            )
+            changed_csv = root / "EA8_changed_2026.csv"
+            changed_csv.write_text(
+                "\n".join(
+                    [
+                        "preamble",
+                        'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
+                        "17-05-2026,01:00,10,R,ugm-3",
+                        "17-05-2026,02:00,11,R,ugm-3",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            conn = MODULE.open_db(str(root / "worker.sqlite"))
+            head = {
+                "status": 200,
+                "etag": '"flat-file-changed"',
+                "content_length": changed_csv.stat().st_size,
+                "last_modified": "Tue, 02 Jan 2024 00:00:00 GMT",
+            }
+
+            def fake_get(url: str, dest_path: Path, **kwargs: object) -> int:
+                dest_path.write_bytes(changed_csv.read_bytes())
+                return dest_path.stat().st_size
+
+            with mock.patch.object(MODULE, "_http_head", return_value=head), mock.patch.object(
+                MODULE,
+                "_http_get_to_file",
+                side_effect=fake_get,
+            ) as http_get:
+                result = MODULE._check_one_sos_uk_air_flat_file(
+                    conn=conn,
+                    env_name="CIC-Test",
+                    base_url="https://uk-air.defra.gov.uk/datastore/data_files/site_data",
+                    site_ref="EA8",
+                    year=2026,
+                    grouped_mappings=self._flat_file_grouped_mappings(),
+                    target_pollutants=("pm10",),
+                    cache_root=root / "source-cache" / "sos",
+                    keep_policy="all",
+                    log=logging.getLogger("test-sos-flat-file-etag-changed"),
+                )
+            counts = conn.execute(
+                """
+                SELECT day_utc, timeseries_id, row_count
+                FROM source_file_timeseries_counts
+                WHERE source_file_key = ?
+                """,
+                ("sos:site_ref=EA8:year=2026",),
+            ).fetchall()
+            state = conn.execute(
+                """
+                SELECT etag, content_length, sha256_uncompressed
+                FROM source_file_state
+                WHERE source_file_key = ?
+                """,
+                ("sos:site_ref=EA8:year=2026",),
+            ).fetchone()
+            conn.close()
+
+            http_get.assert_called_once()
+            self.assertEqual(result["outcome"], "changed")
+            self.assertTrue(result["downloaded"])
+            self.assertFalse(result["cache_reused"])
+            self.assertEqual(result["download_reason"], "remote_metadata_changed_or_unreliable")
+            self.assertEqual(counts, [("2026-05-17", 66, 2)])
+            self.assertEqual(cache_path.read_bytes(), changed_csv.read_bytes())
+            self.assertEqual(state[0], '"flat-file-changed"')
+            self.assertEqual(state[1], changed_csv.stat().st_size)
+            self.assertEqual(
+                state[2],
+                MODULE.hashlib.sha256(changed_csv.read_bytes()).hexdigest(),
+            )
+
     def test_flat_file_fetch_error_preserves_prior_good_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -563,7 +782,7 @@ class SosFlatFileTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "_http_head",
-                side_effect=MODULE.urllib.error.URLError(TimeoutError("timed out")),
+                return_value={"status": 500},
             ):
                 result = MODULE._check_one_sos_uk_air_flat_file(
                     conn=conn,

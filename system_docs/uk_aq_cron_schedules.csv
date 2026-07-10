@@ -6,7 +6,7 @@ CIC-test-uk-aq-ingest,GitHub Actions,sos_site_register_monthly.yml,workflow sche
 CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_monthly_index_maintenance.yml,workflow schedule,35 5 1 * *,Monthly 1st @ 05:35 UTC,Index maintenance,yes,05:35 UTC
 CIC-test-uk-aq-ingest,GitHub Actions,uk_aq_stations_daily.yml,CF workflow-scheduler (ops),0 3 * * *,Daily @ 03:00 UTC,Stations daily sync,yes,03:00 UTC
 CIC-test-uk-aq-ingest,Cloudflare Worker,uk_aq_ingest_poller,wrangler.toml,disabled (crons=[]),N/A,Poll ingest jobs (currently disabled),no,N/A (disabled)
-CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-cron-scheduler-ops,cloudflare/scheduler/wrangler.toml,* * * * *,Every minute,Dry-run ops scheduler dispatch decisions,no,N/A (every min)
+CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-cron-scheduler-ops,cloudflare/scheduler/jobs.toml,* * * * *,Every minute,Dry-run ops scheduler dispatch decisions,no,N/A (every min)
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 3 * * *,Daily @ 03:00 UTC,Trigger uk_aq_stations_daily,yes,03:00 UTC
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,0 12 * * *,Daily @ 12:00 UTC,Trigger uk_aq_r2_core_snapshot,yes,12:00 UTC
 CIC-test-uk-aq-ops,Cloudflare Worker,uk-aq-workflow-scheduler,wrangler.toml,35 4 * * *,Daily @ 04:35 UTC,Trigger uk_aq_r2_history_dropbox_backup,yes,04:35 UTC

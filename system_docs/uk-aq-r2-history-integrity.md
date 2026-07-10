@@ -494,6 +494,15 @@ deletes each downloaded CSV after parsing. Fetch errors preserve any prior good
 cached file and do not replace its state path. Legacy SOS API snapshot retention
 continues to use its existing row-based behavior.
 
+Each UK-AIR site/year check still performs HEAD. A cached CSV is reused without
+GET when the stored source is present and healthy, its stored SHA matches the
+cached bytes, and either ETag matches or Last-Modified plus Content-Length both
+match. The cached CSV is parsed again so current day/timeseries counts are
+recorded. Missing cache files, missing prior hashes, changed or unreliable
+metadata, and cache hash mismatches trigger an atomic redownload. Summary
+metrics distinguish `downloaded`, `cache_reused`, `unchanged_cached`, and
+`cache_missing_redownloaded`; reused files contribute zero `downloaded_bytes`.
+
 First-seen and error handling rules:
 
 - `first_seen` is baseline-only and does not directly trigger backfill.
