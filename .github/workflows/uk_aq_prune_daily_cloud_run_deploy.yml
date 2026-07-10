@@ -374,8 +374,6 @@ jobs:
           if [ -n "${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL:-}" ]; then
             env_updates+=("UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL=${UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL}")
           fi
-          env_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=${UK_AQ_EDGE_UPSTREAM_SECRET}")
-
           env_file="${RUNNER_TEMP}/uk-aq-prune-daily-env.yaml"
           : > "${env_file}"
           for kv in "${env_updates[@]}"; do
