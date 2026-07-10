@@ -257,7 +257,8 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "timezone": timezone,
         "github_repo": None,
         "github_workflow_file": None,
-        "github_ref": None,
+        # The D1 schema keeps github_ref NOT NULL for every target type.
+        "github_ref": DEFAULT_GITHUB_REF,
         "github_inputs_json": None,
         "cloud_run_url": None,
         "cloud_run_method": DEFAULT_CLOUD_RUN_METHOD,

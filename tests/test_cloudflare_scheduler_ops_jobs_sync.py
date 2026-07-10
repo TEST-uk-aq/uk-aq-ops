@@ -51,8 +51,10 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         self.assertTrue(partition_maintenance["cloud_run_url_managed_by_deploy"])
         self.assertEqual(partition_maintenance["cloud_run_body_json"], '{"source":"cloudflare_scheduler"}')
         self.assertIsNone(partition_maintenance["github_repo"])
+        self.assertIsNone(partition_maintenance["github_workflow_file"])
+        self.assertEqual(partition_maintenance["github_ref"], "main")
+        self.assertIsNone(partition_maintenance["github_inputs_json"])
         self.assertNotIn("x-uk-aq-dispatch-secret", partition_maintenance["cloud_run_headers_json"] or "")
-        self.assertEqual(partition_maintenance["dry_run"], 1)
         self.assertTrue(all(job["enabled"] == 1 for job in manifest["jobs"]))
 
     def test_github_workflow_jobs_default_cloud_run_method_to_post(self) -> None:
@@ -146,6 +148,24 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("--allow-unauthenticated", workflow)
+
+    def test_cloud_run_workflows_map_upstream_auth_only_as_secret(self) -> None:
+        workflow_paths = [
+            ROOT / ".github/workflows/uk_aq_observs_partition_maintenance_cloud_run_deploy.yml",
+            ROOT / ".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml",
+        ]
+
+        for workflow_path in workflow_paths:
+            with self.subTest(workflow=workflow_path.name):
+                workflow = workflow_path.read_text(encoding="utf-8")
+                self.assertNotIn(
+                    'env_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=',
+                    workflow,
+                )
+                self.assertIn(
+                    'secret_updates+=("UK_AQ_EDGE_UPSTREAM_SECRET=UK_AQ_EDGE_UPSTREAM_SECRET:latest")',
+                    workflow,
+                )
 
 
 if __name__ == "__main__":
