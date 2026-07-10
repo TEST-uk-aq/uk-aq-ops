@@ -18,7 +18,7 @@ The workflow reports daily task health under `ops.r2_core_snapshot` with `Starte
 
 Intended schedule:
 
-- `04:15 UTC` daily via external Cloudflare Worker scheduler (`workflow_dispatch`).
+- `12:05 UTC` daily via `cloudflare/scheduler/ops` in the ops repo.
 - Previous GitHub cron: `15 4 * * *` (UTC).
 
 Dispatch inputs:

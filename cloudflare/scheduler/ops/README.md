@@ -1,24 +1,16 @@
 # UK AQ Scheduler Ops
 
-Cloudflare Worker dry-run scheduler for ops jobs.
+Cloudflare Worker scheduler for ops jobs.
 
-## Scope in phase 2
+## Scope
 
-This worker only evaluates and logs decisions. It does not trigger Cloud Run yet.
+This worker evaluates and logs Cloud Run decisions for the hourly ops jobs, and it dispatches the R2 core snapshot GitHub workflow at 12:05 UTC.
 
 Tracked jobs:
 
 - `ops.prune_daily`
 - `ops.observs_partition_maintenance`
-
-Excluded for now:
-
-- `uk-aq-db-size-logger`
-- `uk-aq-aqilevels-retention-service`
-- `uk-aq-timeseries-aqi-hourly`
-- `uk-aq-latest-snapshot-builder`
-- `uk-aq-observs-pubsub-writer`
-- `uk-aq-supabase-db-dump-backup-service`
+- `ops.r2_core_snapshot`
 
 ## State source
 
@@ -28,8 +20,13 @@ Excluded for now:
 
 ## Logging
 
-The worker logs one JSON decision record per job and a final summary record for each scheduled invocation.
+The worker logs one JSON decision record per job and a final summary record for each scheduled invocation. GitHub dispatch jobs also log the dispatch attempt and response status.
 
 ## Cron
 
 - `0 * * * *`
+- `5 12 * * *`
+
+## GitHub dispatch
+
+The core snapshot dispatch reuses the existing `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN` repo secret and writes it to the Worker secret `GITHUB_WORKFLOW_DISPATCH_TOKEN`.

@@ -22,7 +22,6 @@ Scheduler implementation location in the ops repo:
 | Repo | Workflow File | Intended UTC Schedule | Cloudflare Cron |
 |---|---|---:|---|
 | ingest | `uk_aq_stations_daily.yml` | 03:00 daily | `0 3 * * *` |
-| ops | `uk_aq_r2_core_snapshot.yml` | 04:15 daily | `15 4 * * *` |
 | ops | `uk_aq_r2_history_dropbox_backup.yml` | 04:35 daily | `35 4 * * *` |
 | ops | `uk_aq_r2_history_dropbox_backup.yml` | 22:00 Sunday, force v2 prune recheck | `0 22 * * SUN` |
 | ops | `uk_aq_dropbox_prune_raw.yml` | 09:22 daily | `22 9 * * *` |
@@ -31,6 +30,8 @@ Cron edit rule:
 1. Change only `cloudflare/workflow-scheduler/wrangler.toml`.
 2. Keep `# job_keys: ...` comments on each cron line.
 3. Worker routing uses `job_key` mapping, not list position.
+
+`uk_aq_r2_core_snapshot.yml` has moved to `cloudflare/scheduler/ops` and now runs at `5 12 * * *` from that scheduler instead of this one.
 
 Dropbox history backup scheduling:
 - The daily `35 4 * * *` dispatch runs the normal v2 Dropbox backup. It passes the active Worker `UK_AQ_R2_HISTORY_VERSION` as `history_version` and uses the v2 prune checkpoint for speed.

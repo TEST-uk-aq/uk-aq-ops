@@ -1,21 +1,25 @@
 # UK AQ Cloudflare Scheduler Ops
 
-This document covers the ops-side phase-2 dry-run scheduler worker that evaluates fixed schedules and logs decisions without triggering Cloud Run yet.
+This document covers the ops-side scheduler worker that evaluates fixed schedules, logs decisions, and dispatches the R2 core snapshot GitHub workflow.
 
-## Current phase-2 scope
+## Current scope
 
 ### Ops scheduler
 
 - Worker: `uk-aq-scheduler-ops`
 - Path: `cloudflare/scheduler/ops/`
-- Cron: `0 * * * *`
-- Jobs:
-  - `ops.prune_daily`
-  - `ops.observs_partition_maintenance`
+- Crons:
+  - `0 * * * *`
+  - `5 12 * * *`
+- Jobs: `ops.prune_daily`, `ops.observs_partition_maintenance`, `ops.r2_core_snapshot`
+
+GitHub dispatch secret:
+
+- `UK_AQ_WORKFLOW_SCHEDULER_GITHUB_DISPATCH_TOKEN` from the ops repo, written into the Worker secret `GITHUB_WORKFLOW_DISPATCH_TOKEN` during deploy.
 
 ## Explicitly deferred
 
-These jobs are intentionally not included in phase 2:
+These jobs are intentionally not included yet:
 
 - `uk-aq-db-size-logger`
 - `uk-aq-aqilevels-retention-service`
@@ -27,11 +31,11 @@ Keep them out until the state model is ready for a safe trigger path.
 
 - Ops decisions read `uk_aq_ops.daily_task_runs_dashboard` from `OBS_AQIDB_SUPABASE_URL` + `OBS_AQIDB_SECRET_KEY`.
 
-## Phase 2 behavior
+## Behavior
 
-- The workers only evaluate and log decisions.
-- They do not send Cloud Run requests yet.
-- `would_trigger` is logged for future use, but no trigger happens in this phase.
+- The hourly jobs only evaluate and log decisions.
+- The `ops.r2_core_snapshot` job dispatches `workflow_dispatch` to GitHub at 12:05 UTC.
+- `would_trigger` is still logged for the hourly jobs, and dispatch errors fail the scheduled run so they can be retried.
 
 ## Auth direction for later phases
 

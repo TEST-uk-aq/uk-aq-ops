@@ -15,7 +15,6 @@ Each cron line must include a `job_keys` comment with one or more comma-separate
 [triggers]
 crons = [
   "0 3 * * *",   # job_keys: uk_aq_stations_daily | uk-aq-ingest/uk_aq_stations_daily.yml
-  "15 4 * * *",  # job_keys: uk_aq_r2_core_snapshot | uk-aq-ops/uk_aq_r2_core_snapshot.yml
   "35 4 * * *",  # job_keys: uk_aq_r2_history_dropbox_backup | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml
   "0 22 * * SUN",  # job_keys: uk_aq_r2_history_dropbox_backup_force_prune_recheck | uk-aq-ops/uk_aq_r2_history_dropbox_backup.yml force_prune_recheck=true
   "49 5 * * *",  # job_keys: uk_aq_dropbox_prune_raw | uk-aq-ops/uk_aq_dropbox_prune_raw.yml
@@ -23,6 +22,8 @@ crons = [
 ```
 
 `worker.js` does not store literal cron values in source. Deploy injects the cron-to-logical-job map from `wrangler.toml` by `job_keys`.
+
+The `uk_aq_r2_core_snapshot` job has moved to `cloudflare/scheduler/ops` and now runs there at `5 12 * * *`.
 
 ## How Routing Works
 
@@ -77,7 +78,6 @@ Optional:
 ## Logging
 
 Configured R2 history jobs:
-- `15 4 * * *` dispatches `uk_aq_r2_core_snapshot` once to `uk_aq_r2_core_snapshot.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION`.
 - `35 4 * * *` dispatches `uk_aq_r2_history_dropbox_backup` once to `uk_aq_r2_history_dropbox_backup.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION`. This is the normal daily v2 Dropbox backup and uses the v2 prune checkpoint for speed.
 - `0 22 * * SUN` dispatches `uk_aq_r2_history_dropbox_backup_force_prune_recheck` once to `uk_aq_r2_history_dropbox_backup.yml` with `history_version` set from `UK_AQ_R2_HISTORY_VERSION` and `force_prune_recheck=true`. This weekly Sunday run forces a full v2 prune recheck, refreshes the v2 prune checkpoint, and catches unexpected Dropbox-only stale Parquet files.
 

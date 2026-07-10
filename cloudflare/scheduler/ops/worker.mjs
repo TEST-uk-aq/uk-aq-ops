@@ -44,6 +44,24 @@ export const OPS_JOBS = [
     stale_after_minutes: 180,
     enabled: true,
   },
+  {
+    job_key: "ops.r2_core_snapshot",
+    label: "R2 core snapshot",
+    target_label: "uk_aq_r2_core_snapshot.yml",
+    state_source: "daily_task_runs",
+    task_key: "ops.r2_core_snapshot",
+    cron: "5 12 * * *",
+    scheduled_time_utc: "12:20",
+    due_after_minutes: 0,
+    min_gap_minutes: 60,
+    stale_after_minutes: 180,
+    enabled: true,
+    owner: "YOUR_GITHUB_OWNER",
+    repo: "uk-aq-ops",
+    workflow_file: "uk_aq_r2_core_snapshot.yml",
+    ref: "main",
+    dispatch_kind: "github_workflow",
+  },
 ];
 
 async function loadRowsForJob(job, env, nowMs) {
@@ -65,13 +83,64 @@ async function loadRowsForJob(job, env, nowMs) {
   });
 }
 
+function jobsForCron(cronExpression) {
+  return OPS_JOBS.filter((job) => job.cron === cronExpression);
+}
+
+function workflowDispatchUrl(job) {
+  const owner = encodeURIComponent(job.owner);
+  const repo = encodeURIComponent(job.repo);
+  const workflow = encodeURIComponent(job.workflow_file);
+  return `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`;
+}
+
+async function dispatchWorkflow(job, token) {
+  const url = workflowDispatchUrl(job);
+  const label = `${job.owner}/${job.repo}:${job.workflow_file}@${job.ref}`;
+  const body = {
+    ref: job.ref,
+  };
+
+  logJson(WORKER_NAME, "github_dispatch_attempt", {
+    job_key: job.job_key,
+    workflow: label,
+    body,
+  });
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+      "User-Agent": "uk-aq-scheduler-ops",
+    },
+    body: JSON.stringify(body),
+  });
+
+  logJson(WORKER_NAME, "github_dispatch_response", {
+    job_key: job.job_key,
+    workflow: label,
+    status: response.status,
+  });
+
+  if (!response.ok) {
+    const errorBody = (await response.text()).slice(0, 4000);
+    logJson(WORKER_NAME, "github_dispatch_error", {
+      job_key: job.job_key,
+      workflow: label,
+      status: response.status,
+      error_body: errorBody,
+    });
+    throw new Error(`GitHub dispatch failed for job_key=${job.job_key} workflow=${label} (status ${response.status})`);
+  }
+}
+
 async function evaluateJob(job, env, nowMs) {
+  let rows;
   try {
-    const rows = await loadRowsForJob(job, env, nowMs);
-    const decision = evaluateDailyTaskJob(job, rows, nowMs);
-    const summary = summarizeDecision(job, decision, rows, nowMs);
-    logJson(WORKER_NAME, "dry_run_decision", summary);
-    return { ok: true, ...summary };
+    rows = await loadRowsForJob(job, env, nowMs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const failure = {
@@ -80,7 +149,8 @@ async function evaluateJob(job, env, nowMs) {
       target_label: job.target_label,
       state_source: job.state_source,
       enabled: job.enabled !== false,
-      dry_run: true,
+      dry_run: job.dispatch_kind !== "github_workflow",
+      dispatch_kind: job.dispatch_kind || "dry_run",
       cron: job.cron,
       due: false,
       reason: "state_load_failed",
@@ -88,45 +158,89 @@ async function evaluateJob(job, env, nowMs) {
       error: message,
       now_utc: nowIso(nowMs),
     };
-    logJson(WORKER_NAME, "dry_run_error", failure);
+    logJson(WORKER_NAME, job.dispatch_kind === "github_workflow" ? "dispatch_error" : "dry_run_error", failure);
     return { ok: false, ...failure };
   }
+
+  const decision = evaluateDailyTaskJob(job, rows, nowMs);
+  const summary = {
+    ...summarizeDecision(job, decision, rows, nowMs),
+    dispatch_kind: job.dispatch_kind || "dry_run",
+    dry_run: job.dispatch_kind !== "github_workflow",
+  };
+
+  if (job.dispatch_kind === "github_workflow" && decision.due && decision.wouldTrigger) {
+    try {
+      const token = await readSecret(env.GITHUB_WORKFLOW_DISPATCH_TOKEN);
+      if (!token) {
+        throw new Error("Missing required Worker secret: GITHUB_WORKFLOW_DISPATCH_TOKEN");
+      }
+      await dispatchWorkflow(job, token);
+      logJson(WORKER_NAME, "dispatch_decision", {
+        ...summary,
+        dispatch_status: "dispatched",
+      });
+      return { ok: true, ...summary, dispatch_status: "dispatched" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failure = {
+        ...summary,
+        due: false,
+        reason: "dispatch_failed",
+        would_trigger: false,
+        error: message,
+        now_utc: nowIso(nowMs),
+      };
+      logJson(WORKER_NAME, "dispatch_error", failure);
+      return { ok: false, ...failure };
+    }
+  }
+
+  logJson(WORKER_NAME, summary.dry_run ? "dry_run_decision" : "dispatch_decision", {
+    ...summary,
+    dispatch_status: "dry_run",
+  });
+  return { ok: true, ...summary, dispatch_status: "dry_run" };
 }
 
-async function runDispatcher(env, nowMs = Date.now()) {
+async function runDispatcher(env, cronExpression, nowMs = Date.now()) {
+  const jobs = jobsForCron(cronExpression);
   const results = [];
-  for (const job of OPS_JOBS) {
+  for (const job of jobs) {
     results.push(await evaluateJob(job, env, nowMs));
   }
 
-  logJson(WORKER_NAME, "dry_run_summary", {
+  logJson(WORKER_NAME, jobs.some((job) => job.dispatch_kind === "github_workflow") ? "dispatch_summary" : "dry_run_summary", {
+    cron: cronExpression,
     job_count: results.length,
     due_count: results.filter((result) => result.due).length,
     would_trigger_count: results.filter((result) => result.would_trigger).length,
     failed_count: results.filter((result) => !result.ok).length,
     skipped_count: results.filter((result) => !result.due && result.ok).length,
-    dry_run: true,
+    dry_run: results.every((result) => result.dry_run !== false),
   });
 
   return results;
 }
 
 export default {
-  async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(runDispatcher(env));
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runDispatcher(env, controller?.cron || ""));
   },
 
   async fetch() {
     return jsonResponse({
       ok: true,
       worker: WORKER_NAME,
-      dry_run: true,
-      scheduled_cron: "0 * * * *",
+      dry_run: false,
+      mode: "mixed",
+      scheduled_crons: [...new Set(OPS_JOBS.map((job) => job.cron))],
       jobs: OPS_JOBS.map((job) => ({
         job_key: job.job_key,
         target_label: job.target_label,
         cron: job.cron,
         enabled: job.enabled !== false,
+        dispatch_kind: job.dispatch_kind || "dry_run",
       })),
     }, 200);
   },
