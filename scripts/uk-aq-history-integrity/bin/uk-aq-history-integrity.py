@@ -8384,6 +8384,23 @@ def _collect_cross_check_backfill_targets(
           AND x.status IN ({placeholders})
           AND x.day_utc IS NOT NULL
           AND c.connector_code IN ({connector_placeholders})
+          AND EXISTS (
+            SELECT 1
+            FROM source_file_timeseries_counts sc
+            JOIN source_file_state s
+              ON s.source_file_key = sc.source_file_key
+            WHERE sc.day_utc = x.day_utc
+              AND sc.timeseries_id = x.timeseries_id
+              AND sc.row_count > 0
+              AND s.exists_remote = 1
+              AND (
+                s.remote_scheme <> 'uk_air_flat_file'
+                OR s.last_status IN (
+                  'unchanged', 'changed', 'first_seen', 'reappeared',
+                  'unmapped_source', 'mixed_mapping_issues'
+                )
+              )
+          )
         ORDER BY x.day_utc, x.connector_id, x.timeseries_id
         """,
         (run_id, *statuses, *connector_codes),
@@ -9409,6 +9426,7 @@ def run_cross_check_backfills(
     run_backfill: bool,
     limits: LimitTracker,
     log: logging.Logger,
+    history_version: str = "v1",
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "observation_backfill_candidate_days": 0,
@@ -9429,8 +9447,19 @@ def run_cross_check_backfills(
         "backfills_ok": 0,
         "backfills_failed": 0,
         "planned_backfills": [],
+        "cross_check_observation_repair_skipped_reason": None,
     }
     if not run_backfill:
+        return metrics
+    if str(history_version).strip().lower() == "v2":
+        metrics["cross_check_observation_repair_skipped_reason"] = (
+            "legacy cross_checks repair is not used in v2-only mode; "
+            "v2 observation gaps are handled by run_v2_gap_backfills"
+        )
+        log.info(
+            "cross-check observation repair: skipped legacy planner in v2-only mode; "
+            "v2 gap repair planner will handle observation gaps"
+        )
         return metrics
 
     cross_check_targets = _collect_cross_check_backfill_targets(
