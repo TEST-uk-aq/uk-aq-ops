@@ -258,7 +258,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "github_ref": None,
         "github_inputs_json": None,
         "cloud_run_url": None,
-        "cloud_run_method": None,
+        "cloud_run_method": DEFAULT_CLOUD_RUN_METHOD,
         "cloud_run_headers_json": None,
         "cloud_run_body_json": None,
         "dry_run": dry_run,
