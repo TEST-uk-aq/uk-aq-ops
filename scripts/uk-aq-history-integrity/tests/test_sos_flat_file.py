@@ -215,6 +215,84 @@ class SosFlatFileTests(unittest.TestCase):
             MODULE._uk_air_flat_file_source_file_key("ea8", 2026),
             "sos:site_ref=EA8:year=2026",
         )
+
+    def test_one_day_check_fetches_complete_year_mapping_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = MODULE.open_db(str(root / "window.sqlite"))
+            env = {
+                "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR": str(root / "cache"),
+                "UK_AQ_HISTORY_INTEGRITY_DB_PATH": str(root / "window.sqlite"),
+            }
+            mappings = self._flat_file_grouped_mappings()["EA8"]["pm10"]
+            with mock.patch.object(MODULE, "_fetch_uk_air_flat_file_mapping_rows", return_value=mappings) as fetch:
+                MODULE.check_sos_flat_files(
+                    conn, "CIC-Test", env, "2026-05-17", "2026-05-17",
+                    dry_run=True, run_backfill=False,
+                    limits=MODULE.LimitTracker(None, None, MODULE.time.monotonic()),
+                    log=logging.getLogger("test-complete-year-window"),
+                )
+            self.assertEqual(fetch.call_args.kwargs["from_day"], "2026-01-01")
+            self.assertEqual(fetch.call_args.kwargs["to_day"], "2026-12-31")
+            conn.close()
+
+    def test_out_of_window_unmapped_rows_are_not_actionable(self) -> None:
+        mappings = self._flat_file_grouped_mappings()
+        mappings["EA8"]["pm10"] = mappings["EA8"]["pm10"][:1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "worker.sqlite"
+            conn = MODULE.open_db(str(db_path))
+            csv_path = root / "EA8_2026.csv"
+            csv_path.write_text(
+                "All Data GMT hour ending\nDate,time,PM10,status,unit\n"
+                "17-05-2026,01:00,10,R,ugm-3\n"
+                "18-05-2026,01:00,11,R,ugm-3\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(MODULE, "_http_head", return_value={
+                "status": 200, "etag": '"x"', "content_length": csv_path.stat().st_size,
+                "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            }), mock.patch.object(MODULE, "_http_get_to_file", side_effect=lambda _url, dest: (dest.parent.mkdir(parents=True, exist_ok=True), dest.write_bytes(csv_path.read_bytes()))[1]):
+                result = MODULE._check_one_sos_uk_air_flat_file(
+                    conn, "CIC-Test", "https://example.test", "EA8", 2026,
+                    mappings, ("pm10",), root / "cache", "all",
+                    requested_from_day="2026-05-17", requested_to_day="2026-05-17",
+                    log=logging.getLogger("test-out-window"),
+                )
+            self.assertEqual(result["unmapped_source_groups"], 0)
+            self.assertEqual(result["out_of_window_unmapped_groups"], 1)
+            counts = conn.execute(
+                "SELECT day_utc, timeseries_id FROM source_file_timeseries_counts ORDER BY day_utc"
+            ).fetchall()
+            self.assertEqual(counts, [("2026-05-17", 66)])
+            conn.close()
+
+    def test_requested_day_unmapped_rows_remain_actionable(self) -> None:
+        mappings = self._flat_file_grouped_mappings()
+        mappings["EA8"]["pm10"] = mappings["EA8"]["pm10"][:1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = MODULE.open_db(str(root / "worker.sqlite"))
+            csv_path = root / "EA8_2026.csv"
+            csv_path.write_text(
+                "All Data GMT hour ending\nDate,time,PM10,status,unit\n"
+                "18-05-2026,01:00,11,R,ugm-3\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(MODULE, "_http_head", return_value={
+                "status": 200, "etag": '"x"', "content_length": csv_path.stat().st_size,
+                "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            }), mock.patch.object(MODULE, "_http_get_to_file", side_effect=lambda _url, dest: (dest.parent.mkdir(parents=True, exist_ok=True), dest.write_bytes(csv_path.read_bytes()))[1]):
+                result = MODULE._check_one_sos_uk_air_flat_file(
+                    conn, "CIC-Test", "https://example.test", "EA8", 2026,
+                    mappings, ("pm10",), root / "cache", "all",
+                    log=logging.getLogger("test-target-window"),
+                    requested_from_day="2026-05-18", requested_to_day="2026-05-18",
+                )
+            self.assertEqual(result["unmapped_source_groups"], 1)
+            self.assertEqual(result["unmapped_source_rows"], 1)
+            conn.close()
         self.assertEqual(
             MODULE._uk_air_flat_file_remote_url(
                 "https://uk-air.defra.gov.uk/datastore/data_files/site_data",

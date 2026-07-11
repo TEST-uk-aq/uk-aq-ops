@@ -471,13 +471,26 @@ Flat-file mapping rules:
 - Mapping rows are resolved from the public RPC
   `uk_aq_public.uk_aq_rpc_sos_uk_air_flat_file_mappings`, called via ingestdb
   REST using `SUPABASE_URL` and `SB_SECRET_KEY`.
-- The mapping fetch is window-limited by `from_day`/`to_day` and the target
-  pollutant set before any CSV downloads begin.
+- The mapping fetch spans every complete calendar year touched by the selected
+  window. Annual CSV counts are therefore replaced only after all date-valid
+  mappings for that annual file are available; one-day runs cannot erase the
+  other days or mis-map validity transitions.
 - 0 mapping rows => `unmapped_source`
 - 1 mapping row => use it
 - >1 mapping rows => `ambiguous_mapping`
 - EA8 2026 splits `pm10` across timeseries `66` through `2026-05-17` and `95`
   from `2026-05-18`.
+- Mapping issues inside the selected window are actionable diagnostics.
+  Out-of-window annual rows are tracked separately and do not inflate HTTP or
+  download error metrics.
+
+AQI observation-coverage validation uses active, connector-scoped
+`core_observed_property_mappings_snapshot.is_aqi_eligible` metadata. A mapped
+non-AQI pollutant such as O3 may have observation history without an AQI
+partition. If eligibility metadata is missing, validation fails closed by
+retaining the previous all-pollutants coverage requirement. Initial v2
+observation and AQI gaps are logged as compact `v2_integrity_gap` JSON events;
+logging is capped while complete findings remain in the JSON report.
 
 Relevant flat-file settings:
 
