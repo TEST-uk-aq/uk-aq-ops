@@ -292,6 +292,13 @@ class SosFlatFileTests(unittest.TestCase):
                 )
             self.assertEqual(result["unmapped_source_groups"], 1)
             self.assertEqual(result["unmapped_source_rows"], 1)
+            self.assertEqual(result["actionable_mapping_issues"], [{
+                "site_ref": "EA8",
+                "day_utc": "2026-05-18",
+                "pollutant_code": "pm10",
+                "source_rows": 1,
+                "mapping_status": "unmapped_source",
+            }])
             conn.close()
         self.assertEqual(
             MODULE._uk_air_flat_file_remote_url(
