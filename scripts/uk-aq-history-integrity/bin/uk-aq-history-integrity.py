@@ -5555,6 +5555,8 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
     target_pollutants: Iterable[str],
     cache_root: Path,
     keep_policy: str,
+    requested_from_day: str,
+    requested_to_day: str,
     log: logging.Logger,
     limits: LimitTracker | None = None,
 ) -> dict[str, Any]:
@@ -5582,6 +5584,8 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
             target_pollutants=target_pollutants,
             cache_root=cache_root,
             keep_policy=keep_policy,
+            requested_from_day=requested_from_day,
+            requested_to_day=requested_to_day,
             log=log,
         )
     finally:
@@ -5605,6 +5609,8 @@ def _check_one_sos_uk_air_flat_file(
     cache_root: Path,
     keep_policy: str,
     log: logging.Logger,
+    requested_from_day: str | None = None,
+    requested_to_day: str | None = None,
 ) -> dict[str, Any]:
     site_token = str(site_ref).strip().upper()
     sfk = _uk_air_flat_file_source_file_key(site_token, year)
@@ -5627,6 +5633,8 @@ def _check_one_sos_uk_air_flat_file(
         "ambiguous_mapping_groups": 0,
         "unmapped_source_rows": 0,
         "ambiguous_mapping_rows": 0,
+        "out_of_window_unmapped_groups": 0,
+        "out_of_window_unmapped_rows": 0,
         "event_id": None,
         "event_type": None,
         "timeseries_ids": [],
@@ -5961,6 +5969,8 @@ def _check_one_sos_uk_air_flat_file(
     ambiguous_groups = 0
     unmapped_rows = 0
     ambiguous_rows = 0
+    out_of_window_unmapped_groups = 0
+    out_of_window_unmapped_rows = 0
     issue_notes: list[str] = []
     for (day_utc, pollutant_code), source_count in sorted(parsed_counts.items()):
         mapping_row, mapping_status = _resolve_uk_air_flat_file_mapping_row(
@@ -5968,13 +5978,23 @@ def _check_one_sos_uk_air_flat_file(
             day_utc,
         )
         if mapping_row is None:
+            in_requested_window = bool(
+                not requested_from_day or not requested_to_day
+                or requested_from_day <= day_utc <= requested_to_day
+            )
             if mapping_status == "ambiguous_mapping":
-                ambiguous_groups += 1
-                ambiguous_rows += int(source_count)
+                if in_requested_window:
+                    ambiguous_groups += 1
+                    ambiguous_rows += int(source_count)
             else:
-                unmapped_groups += 1
-                unmapped_rows += int(source_count)
-            issue_notes.append(f"{day_utc}:{pollutant_code}={mapping_status}")
+                if in_requested_window:
+                    unmapped_groups += 1
+                    unmapped_rows += int(source_count)
+                else:
+                    out_of_window_unmapped_groups += 1
+                    out_of_window_unmapped_rows += int(source_count)
+            if in_requested_window:
+                issue_notes.append(f"{day_utc}:{pollutant_code}={mapping_status}")
             continue
         try:
             timeseries_id = int(mapping_row.get("timeseries_id") or 0)
@@ -6002,6 +6022,8 @@ def _check_one_sos_uk_air_flat_file(
     metrics["ambiguous_mapping_groups"] = ambiguous_groups
     metrics["unmapped_source_rows"] = unmapped_rows
     metrics["ambiguous_mapping_rows"] = ambiguous_rows
+    metrics["out_of_window_unmapped_groups"] = out_of_window_unmapped_groups
+    metrics["out_of_window_unmapped_rows"] = out_of_window_unmapped_rows
     metrics["timeseries_ids"] = sorted(mapped_timeseries_ids)
     metrics["downloaded_bytes"] = int(downloaded_bytes)
     metrics["snapshot_status"] = SOS_STATUS_OK if metrics["source_rows"] > 0 else SOS_STATUS_NO_DATA
@@ -6202,6 +6224,8 @@ def check_sos_flat_files(
         "ambiguous_mapping_groups": 0,
         "unmapped_source_rows": 0,
         "ambiguous_mapping_rows": 0,
+        "out_of_window_unmapped_groups": 0,
+        "out_of_window_unmapped_rows": 0,
         "first_seen_files": [],
         "changed_files": [],
         "planned_backfills": [],
@@ -6220,21 +6244,21 @@ def check_sos_flat_files(
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
         return metrics
 
+    years = _uk_air_flat_file_years_for_window(from_day, to_day)
+    if not years:
+        metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
+        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
     mapping_rows = _fetch_uk_air_flat_file_mapping_rows(
         env=env,
-        from_day=from_day,
-        to_day=to_day,
+        from_day=f"{min(years):04d}-01-01",
+        to_day=f"{max(years):04d}-12-31",
         target_pollutants=metrics["target_pollutants"],
     )
     grouped_mappings = _group_uk_air_flat_file_mapping_rows(mapping_rows)
     if not grouped_mappings:
         metrics["skipped_reason"] = "no UK-AIR site_ref mappings returned from Supabase"
-        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
-        return metrics
-
-    years = _uk_air_flat_file_years_for_window(from_day, to_day)
-    if not years:
-        metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
         return metrics
 
@@ -6296,6 +6320,8 @@ def check_sos_flat_files(
                 metrics["target_pollutants"],
                 cache_root,
                 metrics["keep_api_snapshots_policy"],
+                from_day,
+                to_day,
                 log,
                 limits,
             ))
@@ -6347,6 +6373,8 @@ def check_sos_flat_files(
             metrics["ambiguous_mapping_groups"] += int(result.get("ambiguous_mapping_groups") or 0)
             metrics["unmapped_source_rows"] += int(result.get("unmapped_source_rows") or 0)
             metrics["ambiguous_mapping_rows"] += int(result.get("ambiguous_mapping_rows") or 0)
+            metrics["out_of_window_unmapped_groups"] += int(result.get("out_of_window_unmapped_groups") or 0)
+            metrics["out_of_window_unmapped_rows"] += int(result.get("out_of_window_unmapped_rows") or 0)
 
             snapshot_status = str(result.get("snapshot_status") or "")
             if snapshot_status in {SOS_STATUS_OK, SOS_STATUS_NO_DATA}:
@@ -7351,7 +7379,9 @@ def _build_v2_source_r2_mismatch_gap(
     gap["r2_rows"] = r2_total_for_source
     gap["missing_timeseries_count"] = len(mismatches)
     gap["sample_missing_timeseries_ids"] = [entry["timeseries_id"] for entry in sample]
-    gap["source_r2_mismatches"] = sample
+    # Keep the complete compact mismatch set in JSON so a targeted repair can
+    # be constructed exactly; only human-facing related_paths are truncated.
+    gap["source_r2_mismatches"] = mismatches
     if source_skip_reason:
         gap["source_skip_reason"] = source_skip_reason
     evidence = gap.setdefault("source_evidence", {})
@@ -7569,7 +7599,38 @@ def run_v2_observations_integrity_checks(
         result["source_scope"] = source_scope
     if log:
         log.info("v2 observations integrity done status=%s checked_partitions=%s gaps=%s", status, checked, len(gaps))
+        _log_v2_integrity_gaps(log, "observations", gaps)
     return result
+
+
+def _log_v2_integrity_gaps(
+    log: logging.Logger,
+    domain: str,
+    gaps: Iterable[Mapping[str, Any]],
+    *,
+    limit: int = 100,
+) -> None:
+    gap_list = list(gaps)
+    for gap in gap_list[:limit]:
+        compact = {
+            key: gap.get(key)
+            for key in (
+                "gap_type", "day_utc", "connector_id", "pollutant_code",
+                "expected_path", "source_rows", "r2_rows",
+                "missing_timeseries_count", "sample_missing_timeseries_ids",
+                "source_evidence", "related_paths",
+            )
+            if gap.get(key) not in (None, [], {})
+        }
+        log.warning(
+            "v2 integrity gap %s",
+            json.dumps({"event": "v2_integrity_gap", "domain": domain, **compact}, sort_keys=True, default=str),
+        )
+    if len(gap_list) > limit:
+        log.warning(
+            "v2 integrity gaps truncated %s",
+            json.dumps({"event": "v2_integrity_gaps_truncated", "domain": domain, "logged": limit, "total": len(gap_list)}, sort_keys=True),
+        )
 
 
 
@@ -7778,6 +7839,7 @@ def run_v2_aqilevels_integrity_checks(
     to_day: str | None,
     allowed_connector_ids: set[int] | None = None,
     source_scope: dict[str, Any] | None = None,
+    conn: sqlite3.Connection | None = None,
     check_aqi_debug: bool = False,
     require_aqi_debug: bool = False,
     log: logging.Logger | None = None,
@@ -7967,6 +8029,7 @@ def run_v2_aqilevels_integrity_checks(
                 config=config,
                 day_utc=day_utc,
                 connector_id=connector_id,
+                conn=conn,
             ))
 
     all_gaps = data_gaps + debug_gaps
@@ -7991,6 +8054,8 @@ def run_v2_aqilevels_integrity_checks(
         result["source_scope"] = source_scope
     if log:
         log.info("v2 AQI integrity done status=%s checked_partitions=%s gaps=%s debug_gaps=%s", status, checked, len(data_gaps), len(debug_gaps))
+        _log_v2_integrity_gaps(log, "aqilevels", data_gaps)
+        _log_v2_integrity_gaps(log, "aqilevels_debug", debug_gaps)
     return result
 
 
@@ -8027,6 +8092,7 @@ def run_v2_post_repair_integrity_rechecks(
         to_day=to_day,
         allowed_connector_ids=allowed_connector_ids,
         source_scope=source_scope,
+        conn=conn,
         check_aqi_debug=check_aqi_debug,
         require_aqi_debug=require_aqi_debug,
         log=log,
@@ -9190,12 +9256,43 @@ def _v2_observation_connector_ids_for_aqi_validation(
     return sorted(connector_ids)
 
 
+def _active_aqi_eligible_pollutants_for_connector(
+    conn: sqlite3.Connection | None,
+    *,
+    connector_id: int,
+) -> set[str] | None:
+    """Return authoritative AQI-eligible codes, or None to fail closed."""
+    if conn is None or not _table_exists(conn, "core_observed_property_mappings_snapshot"):
+        return None
+    active_count = conn.execute(
+        "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot "
+        "WHERE connector_id = ? AND is_active = 1",
+        (int(connector_id),),
+    ).fetchone()
+    if not active_count or int(active_count[0] or 0) <= 0:
+        return None
+    rows = conn.execute(
+        """
+        SELECT DISTINCT observed_property_code
+        FROM core_observed_property_mappings_snapshot
+        WHERE connector_id = ?
+          AND is_active = 1
+          AND is_aqi_eligible = 1
+          AND observed_property_code IS NOT NULL
+          AND observed_property_code != ''
+        """,
+        (int(connector_id),),
+    ).fetchall()
+    return {str(row[0]).strip() for row in rows if str(row[0] or "").strip()}
+
+
 def _v2_aqi_observation_coverage_gaps(
     *,
     root: Path,
     config: HistoryPathConfig,
     day_utc: str,
     connector_id: int,
+    conn: sqlite3.Connection | None = None,
     missing_manifest_gap_type: str = "aqi_manifest_missing_after_obs_repair",
     rows_low_gap_type: str = "aqi_rows_below_observation_rows",
     missing_observations_gap_type: str | None = None,
@@ -9222,8 +9319,15 @@ def _v2_aqi_observation_coverage_gaps(
             ))
         return gaps
 
+    eligible_pollutants = _active_aqi_eligible_pollutants_for_connector(
+        conn,
+        connector_id=connector_id,
+    )
+
     for obs_dir in obs_pollutant_dirs:
         pollutant = obs_dir.name.split("=", 1)[1]
+        if eligible_pollutants is not None and pollutant not in eligible_pollutants:
+            continue
         obs_manifest_rel = _v2_partition_manifest_rel(
             prefix=obs_prefix,
             day_utc=day_utc,
@@ -11216,6 +11320,7 @@ def run_aqi_rebuild_queue_execution(
                     config=resolve_history_path_config("v2", env),
                     day_utc=day_iso,
                     connector_id=int(connector_scope),
+                    conn=conn,
                     missing_observations_gap_type="aqi_missing_after_obs_repair",
                 )
             else:
@@ -13327,6 +13432,7 @@ def main(argv: list[str]) -> int:
                 to_day=to_day,
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
+                conn=conn,
                 check_aqi_debug=bool(args.check_aqi_debug),
                 require_aqi_debug=bool(args.require_aqi_debug),
                 log=log,
@@ -13380,6 +13486,7 @@ def main(argv: list[str]) -> int:
                     to_day=to_day,
                     allowed_connector_ids=v2_allowed_connector_ids,
                     source_scope=v2_source_scope,
+                    conn=conn,
                     check_aqi_debug=bool(args.check_aqi_debug),
                     require_aqi_debug=bool(args.require_aqi_debug),
                     log=log,

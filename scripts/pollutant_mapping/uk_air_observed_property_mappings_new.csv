@@ -1,0 +1,26 @@
+connector_id,source_label,notation,pollutant_label,source_uom,observed_property_id,observed_property_code,mapping_kind,is_aqi_eligible,is_active,confidence,notes
+1,"1,2,3-trimethylbenzene",,"1,2,3-trimethylbenzene",ug/m3,52,123c6h3ch33,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 2 site(s); source units: ugm-3 (1380).
+1,"1,2,4-trimethylbenzene",,"1,2,4-trimethylbenzene",ug/m3,42,124c6h3ch33,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 2 site(s); source units: ugm-3 (2928).
+1,"1,3,5-trimethylbenzene",,"1,3,5-trimethylbenzene",ug/m3,51,135c6h3ch33,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 2 site(s); source units: ugm-3 (2825).
+1,"1,3-butadiene",,"1,3-butadiene",ug/m3,28,ch2chchch2,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (9058).
+1,benzene,,benzene,ug/m3,55,c6h6,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (8942).
+1,Carbon monoxide,,Carbon monoxide,mg/m3,13,co,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 7 site(s); source units: mgm-3 (31478).
+1,ethane,,ethane,ug/m3,36,c2h6,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (9385).
+1,ethene,,ethene,ug/m3,45,h2cch2,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (9288).
+1,ethylbenzene,,ethylbenzene,ug/m3,57,c6h5c2h5,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (8572).
+1,ethyne,,ethyne,ug/m3,34,hcch,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (9061).
+1,m+p-xylene,,m+p-xylene,ug/m3,56,mpc6h4ch32,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 3 site(s); source units: ugm-3 (8555).
+1,n-heptane,,n-heptane,ug/m3,50,c7h16,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (8659).
+1,n-hexane,,n-hexane,ug/m3,44,c6h14,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (9150).
+1,n-octane,,n-octane,ug/m3,15,c8h18,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (8469).
+1,Nitric oxide,,Nitric oxide,ug/m3,8,no,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 154 site(s); source units: ugm-3 (676076).
+1,Nitrogen dioxide,,Nitrogen dioxide,ug/m3,12,no2,raw_observed_property,true,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 154 site(s); source units: ugm-3 (676509).
+1,Nitrogen oxides as nitrogen dioxide,,Nitrogen oxides as nitrogen dioxide,ug/m3,19,nox_as_no2,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 154 site(s); source units: ugm-3 (678072).
+1,o-xylene,,o-xylene,ug/m3,17,oc6h4ch32,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (8693).
+1,Ozone,,Ozone,ug/m3,14,o3,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 93 site(s); source units: ugm-3 (415022).
+1,PM<sub>10</sub> particulate matter (Hourly measured),,PM<sub>10</sub> particulate matter (Hourly measured),,3,pm10,raw_observed_property,true,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 138 site(s); source units: ugm-3 (FIDAS) (491904); ugm-3 (Ref.eq) (130603).
+1,PM<sub>2.5</sub> particulate matter (Hourly measured),,PM<sub>2.5</sub> particulate matter (Hourly measured),,9,pm25,raw_observed_property,true,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 149 site(s); source units: ugm-3 (Ref.eq) (542048); ugm-3 (BAM) (129961); ugm-3 (FIDAS) (240).
+1,propane,,propane,ug/m3,37,h3cch2ch3,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (9395).
+1,propene,,propene,ug/m3,25,ch2chch3,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (9263).
+1,Sulphur dioxide,,Sulphur dioxide,ug/m3,11,so2,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 28 site(s); source units: ugm-3 (122048).
+1,toluene,,toluene,ug/m3,43,c6h5ch3,raw_observed_property,false,true,explicit,Explicit UK-AIR annual CSV heading mapping. Detected at 4 site(s); source units: ugm-3 (8985).

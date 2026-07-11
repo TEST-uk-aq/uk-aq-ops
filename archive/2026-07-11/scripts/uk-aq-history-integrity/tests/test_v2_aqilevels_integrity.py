@@ -86,24 +86,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
     def _gap_types(self, result: dict) -> set[str]:
         return {g["gap_type"] for g in result["gaps"]}
 
-    def _eligibility_conn(self, connector: int = 7) -> object:
-        conn = MODULE.open_db(str(self.root / "eligibility.sqlite"))
-        rows = [
-            (connector, "PM2.5", "pm25", 1),
-            (connector, "Ozone", "o3", 0),
-        ]
-        conn.executemany(
-            """
-            INSERT INTO core_observed_property_mappings_snapshot (
-              connector_id, source_label, observed_property_code,
-              mapping_kind, is_aqi_eligible, is_active
-            ) VALUES (?, ?, ?, 'raw_observed_property', ?, 1)
-            """,
-            rows,
-        )
-        conn.commit()
-        return conn
-
     def test_healthy_v2_aqi_data_partition_is_ok(self) -> None:
         self._write_healthy()
         result = self._run()
@@ -172,24 +154,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
         self.assertEqual(result["observation_coverage_checked"], 1)
         self.assertIn("aqi_manifest_missing_after_obs_repair", self._gap_types(result))
 
-    def test_non_aqi_observation_does_not_require_aqi_manifest(self) -> None:
-        self._write_observations(pollutant="o3")
-        conn = self._eligibility_conn()
-        try:
-            result = self._run(conn=conn)
-        finally:
-            conn.close()
-        self.assertNotIn("aqi_manifest_missing_after_obs_repair", self._gap_types(result))
-
-    def test_eligible_observation_still_requires_aqi_manifest(self) -> None:
-        self._write_observations(pollutant="pm25")
-        conn = self._eligibility_conn()
-        try:
-            result = self._run(conn=conn)
-        finally:
-            conn.close()
-        self.assertIn("aqi_manifest_missing_after_obs_repair", self._gap_types(result))
-
     def test_v2_aqi_integrity_reports_aqi_rows_below_observations(self) -> None:
         self._write_observations(timeseries_row_counts={101: 3})
         self._write_healthy()
@@ -201,11 +165,7 @@ class V2AqiIntegrityTests(unittest.TestCase):
         payload["files"][0]["timeseries_row_counts"] = {"101": 2}
         manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
-        conn = self._eligibility_conn()
-        try:
-            result = self._run(conn=conn)
-        finally:
-            conn.close()
+        result = self._run()
 
         self.assertEqual(result["status"], "fail")
         self.assertIn("aqi_rows_below_observation_rows", self._gap_types(result))
