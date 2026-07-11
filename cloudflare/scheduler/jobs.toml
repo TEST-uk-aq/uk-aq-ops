@@ -1,4 +1,5 @@
 # Canonical job configuration for the ops Cloudflare cron scheduler.
+# Times in UTC
 
 config_version = 1
 scheduler_name = "uk-aq-cron-scheduler-ops"
@@ -37,7 +38,7 @@ notes = "R2 history Dropbox backup"
 
 [jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck]
 enabled = true
-cron_expr = "0 22 * * FRI"
+cron_expr = "0 22 * * SUN"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
 github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
