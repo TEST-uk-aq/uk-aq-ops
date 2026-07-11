@@ -108,18 +108,13 @@ type SourceNarrowRow = {
   sample_count: number | null;
 };
 
-type SourcePollutantCode = string;
-
-export type ObservedPropertyMapping = {
-  connector_id: number;
-  source_label: string;
-  source_uom: string | null;
-  observed_property_id: number | null;
-  observed_property_code: string | null;
-  mapping_kind: "raw_observed_property" | "meteorological" | "ignored" | "unknown";
-  is_aqi_eligible: boolean;
-  is_active: boolean;
-};
+type SourcePollutantCode =
+  | "no2"
+  | "pm25"
+  | "pm10"
+  | "temperature"
+  | "humidity"
+  | "pressure";
 
 type SourceTimeseriesBinding = {
   timeseries_id: number;
@@ -1098,19 +1093,63 @@ const SOS_CONNECTOR_ID_FALLBACK = Number.parseInt(
   Deno.env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") || "1",
   10,
 );
-const SOS_BASE_URL = "https://uk-air.defra.gov.uk/sos-ukair/api/v1";
-const SOS_FLAT_FILE_ROOT = optionalEnv(
-  "UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT",
+const SOS_BASE_URL = (
+  Deno.env.get("UK_AQ_BACKFILL_SOS_BASE_URL") ||
+  "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
+).trim().replace(/\/$/, "");
+const SOS_INCLUDE_MET_FIELDS = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_INCLUDE_MET_FIELDS"),
+  true,
 );
-const SOS_TIMEOUT_MS = 60000;
-const SOS_FETCH_RETRIES = 3;
-const SOS_RETRY_BASE_MS = 1500;
-const SOS_FETCH_CONCURRENCY = 5;
-const SOS_TIMESERIES_RETRY_ROUNDS = 2;
-const SOS_TIMESERIES_RETRY_BASE_MS = 5000;
-const SOS_TIMESERIES_RETRY_CONCURRENCY = 2;
-const SOS_RAW_MIRROR_ROOT: string | null = null;
-const SOS_INTEGRITY_SNAPSHOT_ROOT: string | null = null;
+const SOS_TIMEOUT_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_TIMEOUT_MS"),
+  60000,
+  5000,
+  600000,
+);
+const SOS_FETCH_RETRIES = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_FETCH_RETRIES"),
+  3,
+  1,
+  10,
+);
+const SOS_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_RETRY_BASE_MS"),
+  1500,
+  100,
+  30000,
+);
+const SOS_FETCH_CONCURRENCY = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_FETCH_CONCURRENCY"),
+  5,
+  1,
+  20,
+);
+const SOS_TIMESERIES_RETRY_ROUNDS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_TIMESERIES_RETRY_ROUNDS"),
+  2,
+  0,
+  10,
+);
+const SOS_TIMESERIES_RETRY_BASE_MS = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_SOS_TIMESERIES_RETRY_BASE_MS"),
+  5000,
+  100,
+  60000,
+);
+const SOS_TIMESERIES_RETRY_CONCURRENCY = Math.max(
+  1,
+  Math.min(
+    SOS_FETCH_CONCURRENCY,
+    Math.floor(SOS_FETCH_CONCURRENCY / 2) || 1,
+  ),
+);
+const SOS_RAW_MIRROR_ROOT = optionalEnv(
+  "UK_AQ_BACKFILL_SOS_RAW_MIRROR_ROOT",
+);
+const SOS_INTEGRITY_SNAPSHOT_ROOT = optionalEnv(
+  "UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT",
+);
 const OPENAQ_SOURCE_ENABLED = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_OPENAQ_SOURCE_ENABLED"),
   true,
@@ -1361,9 +1400,6 @@ let r2CoreStationRefsByConnectorPromise:
   | Promise<Map<number, Set<string>> | null>
   | null = null;
 let r2CoreStationRefsSourceDayUtc: string | null = null;
-let r2CoreObservedPropertyMappingsPromise:
-  | Promise<ObservedPropertyMapping[]>
-  | null = null;
 const r2ObservationConnectorIdsByDayCache = new Map<string, number[]>();
 const sourceLookupCache = new Map<number, SourceConnectorLookup>();
 const connectorCodeCache = new Map<string, number>();
@@ -1381,7 +1417,6 @@ function resetRunCaches(): void {
   r2CoreStationIdsSourceDayUtc = null;
   r2CoreStationRefsByConnectorPromise = null;
   r2CoreStationRefsSourceDayUtc = null;
-  r2CoreObservedPropertyMappingsPromise = null;
   r2ObservationConnectorIdsByDayCache.clear();
   sourceLookupCache.clear();
   connectorCodeCache.clear();
@@ -5635,42 +5670,6 @@ function parseCoreTableRows(
   return rows;
 }
 
-async function loadR2CoreObservedPropertyMappings(): Promise<ObservedPropertyMapping[]> {
-  if (r2CoreObservedPropertyMappingsPromise) {
-    return await r2CoreObservedPropertyMappingsPromise;
-  }
-  r2CoreObservedPropertyMappingsPromise = (async () => {
-    const snapshotInfo = await findLatestCoreSnapshotManifestInfo();
-    if (!snapshotInfo) throw new Error("core_snapshot_manifest_missing");
-    const manifestObject = await loadHistoryObjectBytesByR2Key(snapshotInfo.manifest_key);
-    const manifest = parseCoreSnapshotManifest(
-      new TextDecoder().decode(manifestObject.body),
-      snapshotInfo.manifest_key,
-    );
-    const tableKey = findCoreTableKey(manifest, "observed_property_mappings");
-    if (!tableKey) throw new Error("core_snapshot_missing_observed_property_mappings");
-    const object = await loadHistoryObjectBytesByR2Key(tableKey);
-    const rows = parseCoreTableRows(decodeCoreTableText(object.body, tableKey));
-    const mappings = rows.map((row): ObservedPropertyMapping => ({
-      connector_id: Number(row.connector_id),
-      source_label: String(row.source_label || ""),
-      source_uom: row.source_uom == null ? null : String(row.source_uom),
-      observed_property_id: row.observed_property_id == null ? null : Number(row.observed_property_id),
-      observed_property_code: row.observed_property_code == null ? null : String(row.observed_property_code),
-      mapping_kind: String(row.mapping_kind || "unknown") as ObservedPropertyMapping["mapping_kind"],
-      is_aqi_eligible: row.is_aqi_eligible === true,
-      is_active: row.is_active === true,
-    })).filter((row) => Number.isInteger(row.connector_id) && row.source_label.trim());
-    if (!mappings.length) throw new Error("core_snapshot_observed_property_mappings_empty");
-    logStructured("info", "backfill_core_observed_property_mappings_loaded", {
-      snapshot_day_utc: manifest.day_utc || snapshotInfo.day_utc,
-      row_count: mappings.length,
-    });
-    return mappings;
-  })();
-  return await r2CoreObservedPropertyMappingsPromise;
-}
-
 function buildStationRefsIndexFromStationsNdjson(
   ndjsonText: string,
 ): Map<number, Set<string>> {
@@ -6292,7 +6291,9 @@ function parseSourcePollutantCode(value: string): SourcePollutantCode | null {
   const compact = normalized.replace(/[^a-z0-9]+/g, "");
   if (compact === "ino2") return "no2";
   if (compact === "ipm25") return "pm25";
-  if (/^[a-z0-9_]+$/.test(normalized)) return normalized;
+  if (compact === "no2") return "no2";
+  if (compact === "pm10") return "pm10";
+  if (compact === "pm25") return "pm25";
   if (compact === "temperature" || compact === "temp") return "temperature";
   if (
     compact === "humidity" || compact === "relativehumidity" || compact === "rh"
@@ -8604,197 +8605,6 @@ function resolveCsvHeaderIndex(
     }
   }
   return null;
-}
-
-function normalizeUkAirSourceLabel(value: string): string {
-  return value.trim().replace(/\s+/g, " ");
-}
-
-function parseUkAirCsvDay(value: string): string | null {
-  const match = value.trim().match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2}|\d{4})$/);
-  if (!match) return null;
-  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
-  const month = Number(match[2]);
-  const day = Number(match[1]);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  if (
-    parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 ||
-    parsed.getUTCDate() !== day
-  ) return null;
-  return parsed.toISOString().slice(0, 10);
-}
-
-function parseUkAirGmtHourEnding(dayUtc: string, value: string): string | null {
-  const match = value.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
-  if (!match) return null;
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  if (hour < 1 || hour > 24 || minute < 0 || minute > 59) return null;
-  const start = Date.parse(`${dayUtc}T00:00:00.000Z`);
-  return new Date(start + ((hour * 60 + minute) - 60) * 60_000).toISOString();
-}
-
-export type UkAirFlatFileParseResult = {
-  rows: SourceObservationRow[];
-  source_records: number;
-  mapped_records: number;
-  skipped_other_days: number;
-  skipped_invalid_rows: number;
-  skipped_ignored_properties: number;
-  units: string[];
-};
-
-export function parseUkAirFlatFileObservations(args: {
-  dayUtc: string;
-  siteRef: string;
-  csvText: string;
-  mappings: SosSiteTimeseriesRef[];
-  propertyMappings: ObservedPropertyMapping[];
-}): UkAirFlatFileParseResult {
-  const lines = args.csvText.split(/\r?\n/);
-  if (!lines.some((line) => line.trim().toLowerCase() === "all data gmt hour ending")) {
-    throw new Error(`UK-AIR CSV ${args.siteRef} does not declare All Data GMT hour ending`);
-  }
-
-  const mappingsByPollutant = new Map<string, SosSiteTimeseriesRef[]>();
-  for (const mapping of args.mappings) {
-    if (mapping.site_ref.toUpperCase() !== args.siteRef.toUpperCase()) continue;
-    if (!isSosMappingValidForDay(mapping, args.dayUtc)) continue;
-    const rows = mappingsByPollutant.get(mapping.pollutant_code) || [];
-    rows.push(mapping);
-    mappingsByPollutant.set(mapping.pollutant_code, rows);
-  }
-
-  const result: UkAirFlatFileParseResult = {
-    rows: [],
-    source_records: 0,
-    mapped_records: 0,
-    skipped_other_days: 0,
-    skipped_invalid_rows: 0,
-    skipped_ignored_properties: 0,
-    units: [],
-  };
-  const units = new Set<string>();
-  const propertyMappingsByLabel = new Map<string, ObservedPropertyMapping[]>();
-  for (const mapping of args.propertyMappings) {
-    if (mapping.connector_id !== 1) continue;
-    const label = normalizeUkAirSourceLabel(mapping.source_label);
-    const rows = propertyMappingsByLabel.get(label) || [];
-    rows.push(mapping);
-    propertyMappingsByLabel.set(label, rows);
-  }
-  type ColumnBinding = {
-    valueIndex: number;
-    statusIndex: number;
-    unitIndex: number;
-    property: ObservedPropertyMapping;
-    timeseries: SosSiteTimeseriesRef;
-  };
-  let columnBindings: ColumnBinding[] = [];
-
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    const cells = parseCsvRow(line, ",").map((cell) => cell.trim());
-    if (
-      String(cells[0] || "").toLowerCase() === "date" &&
-      String(cells[1] || "").toLowerCase() === "time"
-    ) {
-      columnBindings = [];
-      for (let valueIndex = 2; valueIndex < cells.length; valueIndex += 3) {
-        const sourceLabel = normalizeUkAirSourceLabel(cells[valueIndex] || "");
-        if (!sourceLabel) continue;
-        const candidates = propertyMappingsByLabel.get(sourceLabel) || [];
-        if (!candidates.length) {
-          throw new Error(`unmapped_source_label connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        const active = candidates.filter((mapping) => mapping.is_active);
-        if (!active.length) {
-          throw new Error(`source_label_inactive connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        if (active.length !== 1) {
-          throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
-        }
-        const property = active[0];
-        if (property.mapping_kind === "ignored") {
-          result.skipped_ignored_properties += 1;
-          continue;
-        }
-        if (property.mapping_kind === "unknown") {
-          throw new Error(`source_label_unknown connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        if (property.mapping_kind === "meteorological") {
-          throw new Error(`unsupported_meteorological_mapping connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        if (property.mapping_kind !== "raw_observed_property") {
-          throw new Error(`unsupported_mapping_kind connector_id=1 source_label=${JSON.stringify(sourceLabel)} mapping_kind=${property.mapping_kind} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        const pollutantCode = String(property.observed_property_code || "").trim();
-        if (!/^[a-z0-9_]+$/.test(pollutantCode)) {
-          throw new Error(`invalid_observed_property_code source_label=${JSON.stringify(sourceLabel)} observed_property_code=${JSON.stringify(pollutantCode)}`);
-        }
-        const timeseries = mappingsByPollutant.get(pollutantCode) || [];
-        if (!timeseries.length) {
-          throw new Error(`unmapped_timeseries site_ref=${args.siteRef} source_label=${JSON.stringify(sourceLabel)} observed_property_code=${pollutantCode} day_utc=${args.dayUtc}`);
-        }
-        if (timeseries.length !== 1) {
-          throw new Error(`ambiguous_timeseries_mapping site_ref=${args.siteRef} source_label=${JSON.stringify(sourceLabel)} observed_property_code=${pollutantCode} day_utc=${args.dayUtc} matches=${timeseries.length}`);
-        }
-        columnBindings.push({
-          valueIndex,
-          statusIndex: valueIndex + 1,
-          unitIndex: valueIndex + 2,
-          property,
-          timeseries: timeseries[0],
-        });
-      }
-      continue;
-    }
-    if (!columnBindings.length) continue;
-
-    const sourceDay = parseUkAirCsvDay(cells[0] || "");
-    if (!sourceDay) continue;
-    result.source_records += 1;
-    if (sourceDay !== args.dayUtc) {
-      result.skipped_other_days += 1;
-      continue;
-    }
-    const observedAt = parseUkAirGmtHourEnding(sourceDay, cells[1] || "");
-    if (!observedAt) {
-      result.skipped_invalid_rows += 1;
-      continue;
-    }
-    for (const binding of columnBindings) {
-      const value = toFiniteNumber(cells[binding.valueIndex]);
-      if (value === null) continue;
-      const unit = String(cells[binding.unitIndex] || "").trim();
-      const expectedUnit = String(binding.property.source_uom || "").trim();
-      if (unit && expectedUnit && unit !== expectedUnit) {
-        throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.property.source_label)} observed_property_code=${binding.property.observed_property_code} source_uom=${JSON.stringify(expectedUnit)} csv_uom=${JSON.stringify(unit)}`);
-      }
-      if (unit) units.add(unit);
-      result.rows.push({
-        timeseries_id: binding.timeseries.timeseries_id,
-        station_id: binding.timeseries.station_id,
-        pollutant_code: String(binding.property.observed_property_code),
-        observed_at: observedAt,
-        value,
-        status: String(cells[binding.statusIndex] || "").trim() || null,
-        source_parameter: unit ? `uk_air_flat_file:${unit}` : "uk_air_flat_file",
-      });
-      result.mapped_records += 1;
-    }
-  }
-  result.units = Array.from(units).sort();
-  return result;
-}
-
-function ukAirFlatFilePath(root: string, siteRef: string, year: number): string {
-  return path.join(
-    root,
-    `site_ref=${encodeURIComponent(siteRef.toUpperCase())}`,
-    `year=${year}`,
-    `${siteRef.toUpperCase()}_${year}.csv`,
-  );
 }
 
 type OpenaqCsvParseResult = {
@@ -13203,6 +13013,7 @@ async function runSourceToAll(
           )
             .filter((binding) => candidateStationRefs.has(binding.station_ref))
             .filter((binding) =>
+              SOS_INCLUDE_MET_FIELDS ||
               binding.pollutant_code === "no2" ||
               binding.pollutant_code === "pm25" ||
               binding.pollutant_code === "pm10"
@@ -13317,15 +13128,12 @@ async function runSourceToAll(
               day_utc: dayUtc,
               bindings: candidateBindings,
             });
-          const observedPropertyMappings =
-            await loadR2CoreObservedPropertyMappings();
 
-          if (!SOS_FLAT_FILE_ROOT) {
-            throw new Error(
-              "UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT is required for SOS historical repair",
-            );
-          }
-          const sourceBaseUrl = SOS_FLAT_FILE_ROOT;
+          const resolvedServiceUrl = await resolveConnectorServiceUrl(
+            connectorId,
+          );
+          const sourceBaseUrl = (resolvedServiceUrl || SOS_BASE_URL)
+            .replace(/\/$/, "");
           const dayStartIso = utcDayStartIso(dayUtc);
           const dayEndIso = utcDayEndIso(dayUtc);
           const timespan = `${dayStartIso}/${dayEndIso}`;
@@ -13351,76 +13159,75 @@ async function runSourceToAll(
             knownNoDataTimeseriesEntries.keys(),
           );
 
-          const flatFileRows: SourceObservationRow[] = [];
-          const flatFileSiteRefs = Array.from(
-            new Set(validFlatFileMappings.map((row) => row.site_ref.toUpperCase())),
-          ).sort();
-          let flatFileSourceRecords = 0;
-          let flatFileSkippedOtherDays = 0;
-          let flatFileSkippedInvalidRows = 0;
-          const flatFileUnits = new Set<string>();
-          for (const siteRef of flatFileSiteRefs) {
-            const csvPath = ukAirFlatFilePath(
-              SOS_FLAT_FILE_ROOT,
-              siteRef,
-              Number(dayUtc.slice(0, 4)),
-            );
-            if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
-              throw new Error(`UK-AIR annual CSV cache is missing or empty: ${csvPath}`);
-            }
-            const parsed = parseUkAirFlatFileObservations({
-              dayUtc,
-              siteRef,
-              csvText: fs.readFileSync(csvPath, "utf8"),
-              mappings: validFlatFileMappings,
-              propertyMappings: observedPropertyMappings,
-            });
-            appendRowsSafe(flatFileRows, parsed.rows);
-            flatFileSourceRecords += parsed.source_records;
-            flatFileSkippedOtherDays += parsed.skipped_other_days;
-            flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
-            parsed.units.forEach((unit) => flatFileUnits.add(unit));
-          }
-          const flatRowsByTimeseries = new Map<number, SourceObservationRow[]>();
-          for (const row of flatFileRows) {
-            const rows = flatRowsByTimeseries.get(row.timeseries_id) || [];
-            rows.push(row);
-            flatRowsByTimeseries.set(row.timeseries_id, rows);
-          }
-          const timeseriesResults: SosTimeseriesProcessResult[] = candidateBindings.map(
-            (binding) => {
-              const rows = flatRowsByTimeseries.get(binding.timeseries_id) || [];
-              return {
-                binding,
-                station_ref: binding.station_ref,
-                timeseries_ref: binding.timeseries_ref,
-                rows,
-                raw_point_count: rows.length,
-                mapped_point_count: rows.length,
-                mirror_reused: true,
-                mirror_written: false,
-                integrity_snapshot_reused: false,
-                no_data_manifest_reused: false,
-                empty_payload_confirmed: rows.length === 0,
-                skipped_outside_day: 0,
-                skipped_null_value: 0,
-                error_message: null,
-              };
-            },
-          );
-          logStructured("info", "source_to_r2_sos_flat_file_parsed", {
+          let timeseriesResults = await processSosTimeseriesBatch({
             run_id: runId,
             day_utc: dayUtc,
             connector_id: connectorId,
-            source_adapter: "sos",
-            source_kind: "uk_air_flat_file",
-            site_ref_count: flatFileSiteRefs.length,
-            source_records: flatFileSourceRecords,
-            mapped_records: flatFileRows.length,
-            skipped_other_days: flatFileSkippedOtherDays,
-            skipped_invalid_rows: flatFileSkippedInvalidRows,
-            units: Array.from(flatFileUnits).sort(),
+            bindings: candidateBindings,
+            concurrency: SOS_FETCH_CONCURRENCY,
+            base_url: sourceBaseUrl,
+            timespan,
+            known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
+            day_start_iso: dayStartIso,
+            day_end_iso: dayEndIso,
           });
+          let retryableFailedBindings = timeseriesResults
+            .filter((result) =>
+              result.error_message &&
+              isRetryableSourceFetchError("sos", result.error_message)
+            )
+            .map((result) => result.binding);
+          for (
+            let retryRound = 1;
+            retryableFailedBindings.length > 0 &&
+              retryRound <= SOS_TIMESERIES_RETRY_ROUNDS;
+            retryRound += 1
+          ) {
+            logStructured("info", "source_to_r2_sos_retry_round", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: "sos",
+              retry_round: retryRound,
+              retry_candidate_count: retryableFailedBindings.length,
+              retry_concurrency: SOS_TIMESERIES_RETRY_CONCURRENCY,
+            });
+            await sleep(
+              Math.min(
+                60000,
+                SOS_TIMESERIES_RETRY_BASE_MS * retryRound,
+              ),
+            );
+            const retriedResults = await processSosTimeseriesBatch({
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              bindings: retryableFailedBindings,
+              concurrency: SOS_TIMESERIES_RETRY_CONCURRENCY,
+              base_url: sourceBaseUrl,
+              timespan,
+              known_empty_timeseries_refs: knownNoDataTimeseriesRefs,
+              day_start_iso: dayStartIso,
+              day_end_iso: dayEndIso,
+              retry_round: retryRound,
+            });
+            const retriedByTimeseriesRef = new Map(
+              retriedResults.map((result) => [
+                result.binding.timeseries_ref,
+                result,
+              ]),
+            );
+            timeseriesResults = timeseriesResults.map((result) =>
+              retriedByTimeseriesRef.get(result.binding.timeseries_ref) || result
+            );
+            retryableFailedBindings = timeseriesResults
+              .filter((result) =>
+                result.error_message &&
+                isRetryableSourceFetchError("sos", result.error_message)
+              )
+              .map((result) => result.binding);
+          }
+
           let totalRawPoints = 0;
           let totalMappedPoints = 0;
           let totalMirrorReused = 0;
@@ -13492,8 +13299,6 @@ async function runSourceToAll(
 
           candidateSourceUnits = candidateBindings.length;
           sourceCheckpointJson.source_base_url = sourceBaseUrl;
-          sourceCheckpointJson.source_kind = "uk_air_flat_file";
-          sourceCheckpointJson.time_basis = "GMT hour ending";
           sourceCheckpointJson.timespan = timespan;
           sourceCheckpointJson.flat_file_mapping_required = true;
           sourceCheckpointJson.flat_file_mapping_valid_rows =

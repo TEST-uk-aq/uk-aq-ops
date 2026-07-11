@@ -258,7 +258,6 @@ class PreflightTests(unittest.TestCase):
             bad_env = root / "bad-flat-file.env"
             bad_env.write_text("UK_AQ_BACKFILL_WRAPPER=/tmp/dummy.sh\n", encoding="utf-8")
             os_env["UK_AQ_HISTORY_INTEGRITY_DAILY_TASK_HEALTH_ENABLED"] = "false"
-            os_env["UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE"] = "uk_air_flat_files"
             os_env["UK_AQ_BACKFILL_ENV_FILE"] = str(bad_env)
             args = make_args(source="sos")
             with patched_env(os_env):

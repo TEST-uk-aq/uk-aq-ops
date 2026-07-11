@@ -39,6 +39,7 @@ test('backup inventory preserves v1 core prefix for v1 backup version', () => {
 
 test('core snapshot default table set uses canonical networks table only', () => {
   assert.ok(DEFAULT_TABLES.includes('networks'));
+  assert.ok(DEFAULT_TABLES.includes('observed_property_mappings'));
   assert.equal(DEFAULT_TABLES.includes('uk_aq_networks'), false);
   assert.equal(DEFAULT_TABLES.includes('station_network_memberships'), false);
 });

@@ -268,9 +268,8 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     (via source key `sos`) and writes:
     `source_file_state`, `source_file_events`, and
     `source_file_timeseries_counts` for successful checks. The default
-    adapter is the UK-AIR flat-file CSV path (`uk_air_flat_files`);
-    set `UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api` to keep the
-    legacy station/day API mode. Flat-file source unit is
+    adapter is always the UK-AIR flat-file CSV path (`uk_air_flat_files`),
+    with no SOS API source-mode fallback. Flat-file source unit is
     `sos:site_ref=<SITE_REF>:year=<YYYY>`. Snapshot cache retention is
     controlled by
     `UK_AQ_HISTORY_INTEGRITY_KEEP_API_SNAPSHOTS=none|changed|all` (default

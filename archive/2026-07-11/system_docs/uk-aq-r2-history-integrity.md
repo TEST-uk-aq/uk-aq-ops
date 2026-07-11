@@ -427,16 +427,9 @@ Example commands:
 
 ### UK-AIR SOS flat-file model and run examples
 
-The v2 core snapshot must contain `observed_property_mappings`. This table is
-authoritative for every UK-AIR CSV source heading; no source-label inference or
-legacy fallback exists. Any heading not explicitly mapped fails the repair,
-while `mapping_kind=ignored` is the sole non-error skip. All mapped raw observed
-properties can be stored in observation partitions. `is_aqi_eligible` controls
-AQI processing separately and currently limits AQI inputs to PM2.5, PM10, and
-NO2.
-
-`--source sos` always uses the UK-AIR flat-file CSV adapter. There is no source
-mode switch or SOS API fallback for historical repair.
+`--source sos` now defaults to the UK-AIR flat-file CSV adapter. Set
+`UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api` to keep the legacy
+station/day API path for comparison or debugging.
 
 Naming rules used by the active runtime:
 
@@ -482,6 +475,7 @@ Flat-file mapping rules:
 Relevant flat-file settings:
 
 ```text
+UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=uk_air_flat_files|sos_api
 UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL=...
 UK_AQ_HISTORY_INTEGRITY_SOS_TARGET_POLLUTANTS=pm25,pm10,no2
 ```
@@ -549,7 +543,9 @@ Operational notes:
   download.
 - `--check-only` writes source state/count rows but skips backfill unless
   `--run-backfill` is also passed.
-- Source-change backfill collection stays disabled; repair
+- When `UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api`, the legacy
+  station/day API cache path remains available for debugging and comparison.
+- In flat-file mode, source-change backfill collection stays disabled; repair
   planning comes from cross-check-driven discrepancies instead.
 
 SOS-focused operational examples:
@@ -571,6 +567,16 @@ SOS-focused operational examples:
   --source sos \
   --from-day 2026-05-01 \
   --to-day 2026-05-03 \
+  --check-only
+
+# Legacy SOS API mode for comparison/debugging
+UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE=sos_api \
+/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  --env CIC-Test \
+  --profile manual \
+  --source sos \
+  --from-day 2026-05-01 \
+  --to-day 2026-05-01 \
   --check-only
 ```
 
@@ -1423,11 +1429,9 @@ Delivered:
 	  result is treated as successful for AQI queueing only when the structured
 	  wrapper output reports at least one `rows_observations` row and the final
 	  v2 observation manifest covers the rows actually published by that repair.
-	  SOS manifest expectations come from `source_file_timeseries_counts`, scoped
-	  to the repair day, connector, pollutant and requested timeseries IDs.
-	  Whole-annual parser totals and backfill-emitted mapped totals are retained
-	  as diagnostics but do not drive the manifest guard.
-	  A wrapper `source_to_r2_connector_day_skipped` zero-row outcome
+	  Current source-cache counts that exceed the repaired manifest are reported
+	  as `source_counts_exceed_repaired_manifest` diagnostics, not as a blocking
+	  queue guard. A wrapper `source_to_r2_connector_day_skipped` zero-row outcome
 	  is recorded as `no_observations`, while `source_to_r2_connector_day_pending`
 	  or a `stubbed` backfill run is recorded as source acquisition pending;
 	  neither queues AQI. Source-cache availability is retained as report evidence
@@ -1521,10 +1525,10 @@ Pass 1 (subprocess invocation + per-event recording):
   - `UK_AQ_BACKFILL_TRIGGER_MODE=manual`
   - if `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT` is unset, integrity auto-sets
     it to `<UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR>/openaq` for that call
-  - if `UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT` is unset, integrity auto-sets it
-    to `<UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR>/sos`; SOS historical repair
-    reads annual UK-AIR CSV files from that cache and has no SOS API or
-    Dropbox v1 fallback
+  - if `UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT` is unset, integrity
+    auto-sets it to `<UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR>/sos`
+    so `source_to_r2` can reuse same-run SOS snapshot files before calling
+    the SOS API
 - Per-backfill result recorded on the `source_file_events` row:
   `backfill_triggered`, `backfill_timeseries_ids`,
   `backfill_status ∈ {ok, error, timeout, no_wrapper, no_env_file,
@@ -1572,11 +1576,10 @@ Pass 2 (batching, logs, monitoring):
 	  - manifest pollutant coverage includes pollutant codes emitted by the repair
 	  - manifest per-timeseries counts cover explicit repaired/written counts when
 	    the wrapper reports them
-	  Guard failures use precise reasons including
-	  `manifest_total_rows_below_expected`, `manifest_missing_timeseries`,
-	  `manifest_timeseries_rows_below_expected`, `manifest_missing_pollutant`,
-	  and `expected_counts_scope_invalid`. AQI rebuild remains blocked until the
-	  day-scoped source expectation is satisfied.
+	  Current source-cache counts are retained for diagnosis only. When source
+	  counts exceed the final repaired manifest, the result records
+	  `source_counts_exceed_repaired_manifest` with source rows, manifest rows,
+	  repaired rows, source-minus-manifest delta, and sample low-count timeseries.
 	  If final manifest coverage for the actual repair output cannot be verified,
 	  AQI rebuild is not queued.
 - **Adaptive chunking first-pass.** If chunking is configured and a batch

@@ -221,7 +221,6 @@ class SosCanonicalTests(unittest.TestCase):
                 run_compact="20260518T000000Z",
                 env={
                     "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                    MODULE.UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV: "sos_api",
                 },
                 source_filter="sos",
                 sos_metrics={
@@ -287,7 +286,6 @@ class SosCanonicalTests(unittest.TestCase):
                 run_compact="20260518T000000Z",
                 env={
                     "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                    MODULE.UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV: "sos_api",
                 },
                 source_filter="sos",
                 sos_metrics={
@@ -306,7 +304,7 @@ class SosCanonicalTests(unittest.TestCase):
         self.assertEqual(metrics["observation_backfill_candidate_days"], 0)
         self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 0)
 
-    def test_run_cross_check_backfills_merges_cross_check_and_source_change(self) -> None:
+    def test_run_cross_check_backfills_ignores_legacy_source_change_candidates(self) -> None:
         conn = self._new_conn()
         conn.execute(
             "INSERT INTO core_connectors_snapshot (id, connector_code, label, display_name, service_url) VALUES (?, ?, ?, ?, ?)",
@@ -374,7 +372,6 @@ class SosCanonicalTests(unittest.TestCase):
                 run_compact="20260518T000000Z",
                 env={
                     "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": tmp,
-                    MODULE.UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV: "sos_api",
                 },
                 source_filter="sos",
                 sos_metrics={
@@ -390,14 +387,14 @@ class SosCanonicalTests(unittest.TestCase):
                 log=logging.getLogger("test-merge-candidates"),
             )
 
-        self.assertEqual(metrics["source_change_candidate_days"], 1)
-        self.assertEqual(metrics["source_change_candidate_timeseries_ids"], 2)
+        self.assertEqual(metrics["source_change_candidate_days"], 0)
+        self.assertEqual(metrics["source_change_candidate_timeseries_ids"], 0)
         self.assertEqual(metrics["observation_backfill_candidate_days"], 1)
-        self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 3)
+        self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 2)
         self.assertEqual(len(metrics["planned_observation_backfills"]), 1)
         self.assertIn("UK_AQ_BACKFILL_OUTPUT_SCOPE=observations_only", metrics["planned_observation_backfills"][0])
         self.assertIn("UK_AQ_BACKFILL_CONNECTOR_IDS=6", metrics["planned_observation_backfills"][0])
-        self.assertIn("UK_AQ_BACKFILL_TIMESERIES_IDS=101,102,103", metrics["planned_observation_backfills"][0])
+        self.assertIn("UK_AQ_BACKFILL_TIMESERIES_IDS=101,102", metrics["planned_observation_backfills"][0])
         self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
 
     def test_no_data_baselines_zero_counts(self) -> None:

@@ -122,28 +122,23 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertEqual(results["v2"]["status"], "fail")
 
 
-    def test_v2_repair_plan_uses_uk_air_csv_without_v1_fallback(self) -> None:
+    def test_v1_to_v2_repair_command_is_marked_non_executing_write_risk(self) -> None:
         day = "2026-06-11"
         v1_dir = self.root / f"history/v1/observations/day_utc={day}/connector_id=7"
         v1_dir.mkdir(parents=True)
 
-        result = MODULE.run_v2_observations_integrity_checks(
-            r2_history_root=self.root,
-            config=self.config,
-            from_day=day,
-            to_day=day,
-            allowed_connector_ids={7},
-            source_scope={"source": "sos", "connector_ids": [7], "scope": "source"},
-        )
+        result = self._run(day, day)
 
         gap = next(g for g in result["gaps"] if g["gap_type"] == "day_dir_missing")
         repair = gap["suggested_repair"]
-        self.assertEqual(repair["kind"], "uk_air_csv_to_v2_observations_backfill_required")
+        self.assertEqual(repair["kind"], "v1_dropbox_to_v2_observations_backfill_plan")
         self.assertEqual(repair["executes"], False)
-        self.assertEqual(repair["operator_action_required"], False)
-        self.assertEqual(repair["commands"], [])
-        self.assertNotIn("v1", json.dumps(repair).lower())
-        self.assertNotIn("dropbox", json.dumps(repair).lower())
+        self.assertEqual(repair["operator_action_required"], True)
+        self.assertEqual(repair["write_risk"], "writes_to_r2_if_operator_runs_command")
+        command = repair["commands"][0]
+        self.assertIn("--write-r2", command)
+        self.assertIn("--replace", command)
+        self.assertIn("operator review", repair["notes"])
 
     def test_targeted_day_range_does_not_scan_outside_days(self) -> None:
         self._write_healthy(day="2026-06-11")

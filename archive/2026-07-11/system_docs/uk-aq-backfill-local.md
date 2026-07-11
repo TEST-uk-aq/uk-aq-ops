@@ -328,7 +328,7 @@ Recommended supporting vars in the backfill env file:
   explicit `UK_AQ_R2_HISTORY_DROPBOX_ROOT=<absolute local Dropbox backup root>`
   is still supported.
 - `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT=<absolute local OpenAQ cache root>`
-- `UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT=<absolute local integrity source-cache root>/sos`
+- `UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT=<absolute local integrity source-cache root>/sos`
 - `CFLARE_R2_*` / `R2_*` credentials for live write
 
 For `UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT`, backfill can reuse either local
@@ -337,30 +337,18 @@ cache layout:
 - `day_utc=YYYY-MM-DD/location-<location_id>-YYYYMMDD.csv.gz`
 - `locationid=<location_id>/year=YYYY/month=MM/location-<location_id>-YYYYMMDD.csv.gz`
 
-For `UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT`, SOS historical `source_to_r2` reads
-the cached annual UK-AIR CSV at:
+For `UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT`, `source_to_r2` can reuse
+same-run integrity SOS snapshots at:
 
-- `site_ref=<site_ref>/year=YYYY/<site_ref>_YYYY.csv`
-
-The CSV declares `All Data GMT hour ending`. The writer converts hour ending
-`01:00` through `24:00` to UTC hour starts `00:00Z` through `23:00Z` for the
-stated CSV day. Missing files, malformed GMT declarations, or zero/ambiguous
-date-valid mappings fail the repair. There is no SOS API or Dropbox v1 fallback.
+- `station_ref=<urlencoded_station_ref>/day_utc=YYYY-MM-DD/snapshot.ndjson`
 
 ## Outputs
 
-- connector/day/pollutant Parquet and manifests under
-  `history/v2/observations/...`
-- targeted timeseries indexes under
-  `history/_index_v2/observations_timeseries/...`
+- connector/day parquet + connector manifests under:
+  - `history/v1/observations/...`
+  - `history/v1/aqilevels/hourly/...`
+- day manifests:
+  - `history/v1/observations/day_utc=YYYY-MM-DD/manifest.json`
+  - `history/v1/aqilevels/hourly/day_utc=YYYY-MM-DD/manifest.json`
 - local logs under `UK_AQ_BACKFILL_LOCAL_LOG_DIR`
 - optional ledger rows (when enabled)
-UK-AIR annual CSV headings are resolved exclusively through the
-`uk_aq_core.observed_property_mappings` table included in the v2 core snapshot.
-Matching uses the connector ID and exact source label (apart from trimming and
-collapsing whitespace). There is no hard-coded pollutant parser or fallback.
-Missing, inactive, unknown, ambiguous, invalid-code, unit-mismatch, and missing
-timeseries mappings fail the connector-day before any R2 write. Only mappings
-with `mapping_kind=ignored` are intentionally skipped. AQI eligibility is
-independent of observation support, so mapped non-AQI pollutants are retained
-as observations without creating AQI output.
