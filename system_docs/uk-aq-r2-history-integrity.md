@@ -492,6 +492,23 @@ retaining the previous all-pollutants coverage requirement. Initial v2
 observation and AQI gaps are logged as compact `v2_integrity_gap` JSON events;
 logging is capped while complete findings remain in the JSON report.
 
+Source-versus-R2 mismatch findings retain a complete, sorted
+`missing_timeseries_ids` list for repair planning. Human-readable
+`sample_missing_timeseries_ids` and `related_paths` remain bounded and must not
+be used to narrow a repair. Malformed and non-positive IDs are discarded.
+
+An observation `index_manifest_missing` gap is repaired with the existing v2
+targeted observations index builder and does not rewrite observation parquet.
+When the same connector/day also needs observation data repair, the standalone
+index operation is coalesced because the successful repair wrapper already
+rebuilds all observation pollutant indexes for that connector/day. This means a
+PM10 repair can also restore a missing O3 index without creating O3 AQI.
+
+Actionable in-window SOS mapping failures are emitted as bounded
+`sos_flat_file_mapping_issue` JSON events and listed in the Markdown report with
+site, day, pollutant, source-row count, and status. Out-of-window mapping issues
+remain aggregate diagnostics only.
+
 Relevant flat-file settings:
 
 ```text

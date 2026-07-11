@@ -5635,6 +5635,7 @@ def _check_one_sos_uk_air_flat_file(
         "ambiguous_mapping_rows": 0,
         "out_of_window_unmapped_groups": 0,
         "out_of_window_unmapped_rows": 0,
+        "actionable_mapping_issues": [],
         "event_id": None,
         "event_type": None,
         "timeseries_ids": [],
@@ -5995,6 +5996,13 @@ def _check_one_sos_uk_air_flat_file(
                     out_of_window_unmapped_rows += int(source_count)
             if in_requested_window:
                 issue_notes.append(f"{day_utc}:{pollutant_code}={mapping_status}")
+                metrics["actionable_mapping_issues"].append({
+                    "site_ref": site_token,
+                    "day_utc": day_utc,
+                    "pollutant_code": pollutant_code,
+                    "source_rows": int(source_count),
+                    "mapping_status": mapping_status or "unmapped_source",
+                })
             continue
         try:
             timeseries_id = int(mapping_row.get("timeseries_id") or 0)
@@ -6226,6 +6234,7 @@ def check_sos_flat_files(
         "ambiguous_mapping_rows": 0,
         "out_of_window_unmapped_groups": 0,
         "out_of_window_unmapped_rows": 0,
+        "actionable_mapping_issues": [],
         "first_seen_files": [],
         "changed_files": [],
         "planned_backfills": [],
@@ -6375,6 +6384,11 @@ def check_sos_flat_files(
             metrics["ambiguous_mapping_rows"] += int(result.get("ambiguous_mapping_rows") or 0)
             metrics["out_of_window_unmapped_groups"] += int(result.get("out_of_window_unmapped_groups") or 0)
             metrics["out_of_window_unmapped_rows"] += int(result.get("out_of_window_unmapped_rows") or 0)
+            remaining_issue_slots = max(0, 100 - len(metrics["actionable_mapping_issues"]))
+            if remaining_issue_slots:
+                metrics["actionable_mapping_issues"].extend(
+                    list(result.get("actionable_mapping_issues") or [])[:remaining_issue_slots]
+                )
 
             snapshot_status = str(result.get("snapshot_status") or "")
             if snapshot_status in {SOS_STATUS_OK, SOS_STATUS_NO_DATA}:
@@ -6464,6 +6478,18 @@ def check_sos_flat_files(
 
     metrics["first_seen_files"].sort(key=lambda e: (e["year"], e["site_ref"]))
     metrics["changed_files"].sort(key=lambda e: (e["year"], e["site_ref"]))
+    metrics["actionable_mapping_issues"].sort(
+        key=lambda issue: (
+            str(issue.get("day_utc") or ""),
+            str(issue.get("site_ref") or ""),
+            str(issue.get("pollutant_code") or ""),
+        )
+    )
+    for issue in metrics["actionable_mapping_issues"]:
+        log.warning(
+            "sos flat-file mapping issue %s",
+            json.dumps({"event": "sos_flat_file_mapping_issue", **issue}, sort_keys=True),
+        )
 
     if limits.should_stop():
         metrics["stopped_for"] = limits.stopped_for
@@ -7378,6 +7404,7 @@ def _build_v2_source_r2_mismatch_gap(
     gap["source_rows"] = source_total
     gap["r2_rows"] = r2_total_for_source
     gap["missing_timeseries_count"] = len(mismatches)
+    gap["missing_timeseries_ids"] = [entry["timeseries_id"] for entry in mismatches]
     gap["sample_missing_timeseries_ids"] = [entry["timeseries_id"] for entry in sample]
     # Keep the complete compact mismatch set in JSON so a targeted repair can
     # be constructed exactly; only human-facing related_paths are truncated.
@@ -9510,11 +9537,31 @@ def _timeseries_ids_for_v2_observation_gap(
     connector_id: int,
     gap: Mapping[str, Any],
 ) -> list[int]:
-    explicit_ids = {
-        int(row.get("timeseries_id") or 0)
-        for row in list(gap.get("source_r2_mismatches") or [])
-        if isinstance(row, Mapping) and int(row.get("timeseries_id") or 0) > 0
-    }
+    explicit_ids: set[int] = set()
+    for raw_id in list(gap.get("missing_timeseries_ids") or []):
+        try:
+            timeseries_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if timeseries_id > 0:
+            explicit_ids.add(timeseries_id)
+    for row in list(gap.get("source_r2_mismatches") or []):
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            timeseries_id = int(row.get("timeseries_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if timeseries_id > 0:
+            explicit_ids.add(timeseries_id)
+    if not explicit_ids:
+        for raw_id in list(gap.get("sample_missing_timeseries_ids") or []):
+            try:
+                timeseries_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if timeseries_id > 0:
+                explicit_ids.add(timeseries_id)
     if explicit_ids:
         return sorted(explicit_ids)
     pollutant_code = _uk_air_normalize_pollutant_code(gap.get("pollutant_code"))
@@ -10607,6 +10654,22 @@ def _set_v2_source_repair_plan(
         }
 
 
+def _v2_observations_index_rebuild_command(
+    day_utc: str,
+    connector_id: int,
+) -> list[str]:
+    return [
+        "node",
+        "scripts/backup_r2/uk_aq_build_r2_history_index.mjs",
+        "--history-version", "v2",
+        "--targeted",
+        "--kind", "observations",
+        "--from-day", day_utc,
+        "--to-day", day_utc,
+        "--connector-id", str(int(connector_id)),
+    ]
+
+
 def run_v2_gap_backfills(
     *,
     conn: sqlite3.Connection,
@@ -10659,6 +10722,7 @@ def run_v2_gap_backfills(
         return metrics
     by_key_sets: dict[tuple[str, int], set[int]] = {}
     gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    index_only_keys: set[tuple[str, int]] = set()
     for gap in gaps:
         day_iso = str(gap.get("day_utc") or "").strip()
         try:
@@ -10666,6 +10730,13 @@ def run_v2_gap_backfills(
         except (TypeError, ValueError):
             continue
         if not day_iso or connector_id <= 0:
+            continue
+        if (
+            str(gap.get("gap_type") or "").startswith("index_")
+            or str((gap.get("suggested_repair") or {}).get("kind") or "")
+            == "rebuild_v2_observations_index_only"
+        ):
+            index_only_keys.add((day_iso, connector_id))
             continue
         ts_ids = _timeseries_ids_for_v2_observation_gap(
             conn,
@@ -10676,12 +10747,38 @@ def run_v2_gap_backfills(
             by_key_sets.setdefault((day_iso, connector_id), set()).update(ts_ids)
             gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
     by_key = {key: sorted(values) for key, values in by_key_sets.items()}
+    standalone_index_keys = sorted(index_only_keys - set(by_key))
     metrics["observation_backfill_candidate_days"] = len(by_key)
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     backfill_log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     queued: set[tuple[str, int]] = set()
+    for day_iso, connector_id in standalone_index_keys:
+        idx_cmd = _v2_observations_index_rebuild_command(day_iso, connector_id)
+        metrics["planned_v2_observation_index_rebuilds"].append(" ".join(idx_cmd))
+        if dry_run:
+            continue
+        metrics["v2_observation_index_rebuilds_attempted"] += 1
+        result = subprocess.run(
+            idx_cmd,
+            cwd=Path(__file__).resolve().parents[3],
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            metrics["v2_observation_index_rebuilds_ok"] += 1
+        else:
+            metrics["v2_observation_index_rebuilds_failed"] += 1
+            log.warning(
+                "v2 observation index-only rebuild failed day=%s connector_id=%s exit_code=%s stderr=%s",
+                day_iso,
+                connector_id,
+                result.returncode,
+                _truncate_text(result.stderr or result.stdout or "", 2000),
+            )
     for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
         day_obj = dt.date.fromisoformat(day_iso)
         chunks = _chunk_v2_observation_repair_timeseries_ids(ts_ids)
@@ -10690,7 +10787,7 @@ def run_v2_gap_backfills(
             for chunk_ids in chunks
         ]
         first_cmd = planned_cmds[0] if planned_cmds else None
-        idx_cmd = f"node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --history-version v2 --targeted --kind observations --from-day {day_iso} --to-day {day_iso} --connector-id {connector_id}"
+        idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
         if dry_run:
             metrics["planned_v2_observation_repairs"].extend(planned_cmds)
             metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
@@ -12780,6 +12877,10 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Missing:        {sos.get('missing', 0)}",
             f"- Temporary errors:{sos.get('temporary_errors', 0)}",
             f"- Permanent errors:{sos.get('permanent_errors', 0)}",
+            f"- Actionable mapping groups: {sos.get('unmapped_source_groups', 0)}",
+            f"- Actionable mapping rows: {sos.get('unmapped_source_rows', 0)}",
+            f"- Out-of-window mapping groups: {sos.get('out_of_window_unmapped_groups', 0)}",
+            f"- Out-of-window mapping rows: {sos.get('out_of_window_unmapped_rows', 0)}",
             f"- Rows counted:   {sos.get('rows_counted', 0)}",
             f"- Downloaded MB:  {round(sos.get('downloaded_bytes', 0) / (1024 * 1024), 4)}",
             f"- Cache keep policy: {sos.get('keep_api_snapshots_policy') or '(default)'}",
@@ -12792,6 +12893,23 @@ def format_summary_md(s: dict[str, Any]) -> str:
         ])
         if sos.get("skipped_reason"):
             lines.append(f"- Skipped reason: {sos['skipped_reason']}")
+        mapping_issues = list(sos.get("actionable_mapping_issues") or [])
+        if mapping_issues:
+            lines.extend([
+                "",
+                "### Actionable SOS mapping issues",
+                "",
+                "| Site | Day | Pollutant | Source rows | Status |",
+                "| --- | --- | --- | ---: | --- |",
+            ])
+            for issue in mapping_issues[:25]:
+                lines.append(
+                    f"| {issue.get('site_ref', '')} | {issue.get('day_utc', '')} | "
+                    f"{issue.get('pollutant_code', '')} | {issue.get('source_rows', 0)} | "
+                    f"{issue.get('mapping_status', '')} |"
+                )
+            if len(mapping_issues) > 25:
+                lines.append(f"\n- ... {len(mapping_issues) - 25} more mapping issues")
         sos_first_seen = sos.get("first_seen_files") or []
         if sos_first_seen:
             lines.extend(["", "### First-seen station/day snapshots (sos, baselined — not backfilled)", ""])

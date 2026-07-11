@@ -546,6 +546,77 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertNotIn("reason=obs_repaired", metrics["planned_aqi_rebuilds"][0])
         self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
 
+    def test_v2_mismatch_uses_complete_sorted_valid_repair_ids(self) -> None:
+        full_ids = list(range(1, 44))
+        gap = {
+            "missing_timeseries_ids": [43, "2", 1, 2, 0, -1, "bad", None],
+            "source_r2_mismatches": [
+                {"timeseries_id": value} for value in reversed(full_ids)
+            ] + [{"timeseries_id": "bad"}, {"timeseries_id": -9}],
+            "sample_missing_timeseries_ids": full_ids[:25],
+        }
+
+        resolved = MODULE._timeseries_ids_for_v2_observation_gap(
+            self.conn,
+            connector_id=6,
+            gap=gap,
+        )
+
+        self.assertEqual(resolved, full_ids)
+        self.assertEqual(len(resolved), 43)
+
+    def test_v2_index_only_gap_plans_index_without_observation_repair(self) -> None:
+        metrics = MODULE.run_v2_gap_backfills(
+            conn=self.conn,
+            run_id=1,
+            env_name="CIC-Test",
+            run_compact="run",
+            env=self.env,
+            v2_observations={"gaps": [{
+                "day_utc": "2026-06-08",
+                "connector_id": 6,
+                "pollutant_code": "o3",
+                "gap_type": "index_manifest_missing",
+                "suggested_repair": {"kind": "rebuild_v2_observations_index_only"},
+            }]},
+            dry_run=True,
+            run_backfill=True,
+            limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+            log=self.log,
+        )
+
+        self.assertEqual(metrics["planned_v2_observation_repairs"], [])
+        self.assertEqual(len(metrics["planned_v2_observation_index_rebuilds"]), 1)
+        self.assertIn("--kind observations", metrics["planned_v2_observation_index_rebuilds"][0])
+
+    def test_data_repair_coalesces_same_day_index_only_gap(self) -> None:
+        metrics = MODULE.run_v2_gap_backfills(
+            conn=self.conn,
+            run_id=1,
+            env_name="CIC-Test",
+            run_compact="run",
+            env=self.env,
+            v2_observations={"gaps": [
+                {
+                    "day_utc": "2026-06-08", "connector_id": 6,
+                    "gap_type": "source_r2_timeseries_row_mismatch",
+                    "missing_timeseries_ids": [101, 102],
+                },
+                {
+                    "day_utc": "2026-06-08", "connector_id": 6,
+                    "pollutant_code": "o3", "gap_type": "index_manifest_missing",
+                    "suggested_repair": {"kind": "rebuild_v2_observations_index_only"},
+                },
+            ]},
+            dry_run=True,
+            run_backfill=True,
+            limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+            log=self.log,
+        )
+
+        self.assertEqual(len(metrics["planned_v2_observation_repairs"]), 1)
+        self.assertEqual(len(metrics["planned_v2_observation_index_rebuilds"]), 1)
+
     def test_source_sos_resolves_to_connector_id_1_from_current_metadata(self) -> None:
         conn = MODULE.open_db(str(self.root / "sos-source-scope.sqlite"))
         try:
