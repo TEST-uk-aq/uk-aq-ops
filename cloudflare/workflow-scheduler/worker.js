@@ -35,15 +35,6 @@ export const JOBS = [
     workflow_file: "uk_aq_stations_daily.yml",
     ref: "main",
   },
-  // job_key: uk_aq_r2_history_dropbox_backup
-  {
-    job_key: "uk_aq_r2_history_dropbox_backup",
-    owner: "YOUR_GITHUB_OWNER",
-    repo: "uk-aq-ops",
-    workflow_file: "uk_aq_r2_history_dropbox_backup.yml",
-    ref: "main",
-    history_version_input: true,
-  },
 ];
 
 export function workflowDispatchUrl(job) {
