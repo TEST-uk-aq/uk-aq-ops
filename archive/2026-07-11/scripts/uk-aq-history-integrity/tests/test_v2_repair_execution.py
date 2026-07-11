@@ -412,34 +412,6 @@ class V2RepairExecutionTests(unittest.TestCase):
             log=self.log,
         )
 
-    def _mark_source_as_sos_flat_file(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        extra_day_counts: dict[str, dict[int, int]] | None = None,
-    ) -> None:
-        row = conn.execute(
-            "SELECT source_file_key FROM source_file_state WHERE source_key = ? LIMIT 1",
-            (MODULE.SOS_SOURCE_KEY,),
-        ).fetchone()
-        self.assertIsNotNone(row)
-        source_file_key = str(row[0])
-        conn.execute(
-            "UPDATE source_file_state SET remote_scheme = 'uk_air_flat_file' WHERE source_file_key = ?",
-            (source_file_key,),
-        )
-        for day_utc, counts in (extra_day_counts or {}).items():
-            for timeseries_id, row_count in counts.items():
-                conn.execute(
-                    """
-                    INSERT INTO source_file_timeseries_counts (
-                      source_file_key, day_utc, timeseries_id, row_count, counted_at_utc
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (source_file_key, day_utc, timeseries_id, row_count, "2026-07-11T00:00:00Z"),
-                )
-        conn.commit()
-
     def _ok_obs_repair_result(
         self,
         rows: int = 1,
@@ -1138,136 +1110,14 @@ class V2RepairExecutionTests(unittest.TestCase):
             result = metrics["v2_observation_repair_results"][0]
             self.assertEqual(result["status"], "guard_failed")
             self.assertFalse(result["aqi_rebuild_manifest_guard_ok"])
-            self.assertEqual(result["aqi_rebuild_manifest_guard_reason"], "manifest_missing_timeseries")
+            self.assertIn("manifest_missing_timeseries:1", result["aqi_rebuild_manifest_guard_reason"])
             self.assertEqual(result["aqi_rebuild_manifest_guard"]["missing_timeseries_ids"], [102])
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
             self.assertEqual(int(queued), 0)
         finally:
             conn.close()
 
-    def test_sos_one_day_guard_ignores_other_annual_csv_days_and_pollutants(self) -> None:
-        conn = self._new_current_source_db(
-            day_utc="2026-05-17",
-            connector_id=1,
-            source_key=MODULE.SOS_SOURCE_KEY,
-            timeseries_pollutants={101: "pm10", 102: "pm25", 103: "no2"},
-            source_counts={101: 24, 102: 24, 103: 24},
-        )
-        self._mark_source_as_sos_flat_file(
-            conn,
-            extra_day_counts={
-                "2026-05-16": {101: 24, 102: 24, 103: 24},
-                "2026-05-18": {101: 24, 102: 24, 103: 24},
-            },
-        )
-        try:
-            self._write_v2_observation_connector_manifest(
-                day_utc="2026-05-17",
-                connector_id=1,
-                timeseries_row_counts={101: 24, 102: 30, 103: 30},
-                pollutant_codes=["pm10", "pm25", "no2"],
-            )
-            with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "wrapper.sh")), \
-                 mock.patch.object(
-                     MODULE,
-                     "run_narrow_backfill",
-                     return_value=self._ok_obs_repair_result(
-                         rows=24,
-                         source_counts={101: 7200},
-                         repaired_counts={101: 24},
-                         pollutant_codes=["pm10"],
-                     ),
-                 ) as run_bf:
-                metrics = MODULE.run_v2_gap_backfills(
-                    conn=conn,
-                    run_id=201,
-                    env_name="CIC-Test",
-                    run_compact="run",
-                    env=self.env,
-                    v2_observations={
-                        "source_scope": {"source": "sos", "connector_ids": [1], "scope": "source"},
-                        "gaps": [{"day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "pm10"}],
-                    },
-                    dry_run=False,
-                    run_backfill=True,
-                    limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
-                    log=self.log,
-                )
-
-            self.assertEqual(run_bf.call_args.kwargs["timeseries_ids"], [101])
-            self.assertEqual(metrics["v2_observation_repairs_ok"], 1)
-            self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
-            result = metrics["v2_observation_repair_results"][0]
-            self.assertEqual(result["expected_counts_source"], "source_file_timeseries_counts")
-            self.assertEqual(result["expected_source_rows_for_day"], 24)
-            self.assertEqual(result["expected_timeseries_row_counts_for_day"], {"101": 24})
-            self.assertEqual(result["expected_pollutant_codes"], ["pm10"])
-            self.assertEqual(result["source_rows_from_counts"], 7200)
-            self.assertTrue(result["aqi_rebuild_guard_ok"])
-        finally:
-            conn.close()
-
-    def test_sos_chunked_guard_merges_day_counts_once(self) -> None:
-        conn = self._new_current_source_db(
-            day_utc="2026-05-17",
-            connector_id=1,
-            source_key=MODULE.SOS_SOURCE_KEY,
-            timeseries_pollutants={101: "pm10", 102: "pm10"},
-            source_counts={101: 24, 102: 23},
-        )
-        self._mark_source_as_sos_flat_file(
-            conn,
-            extra_day_counts={
-                "2026-05-16": {101: 24, 102: 24},
-                "2026-05-18": {101: 24, 102: 24},
-            },
-        )
-        try:
-            self._write_v2_observation_connector_manifest(
-                day_utc="2026-05-17",
-                connector_id=1,
-                timeseries_row_counts={101: 24, 102: 23},
-                pollutant_codes=["pm10"],
-            )
-            results = [
-                self._staged_obs_repair_result(rows=24, source_counts={101: 7000}, pollutant_codes=["pm10"]),
-                self._ok_obs_repair_result(rows=47, source_counts={102: 6900}, pollutant_codes=["pm10"]),
-            ]
-            with mock.patch.dict(os.environ, {MODULE._V2_OBSERVATION_REPAIR_CHUNK_ENV_VAR: "1"}), \
-                 mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "wrapper.sh")), \
-                 mock.patch.object(MODULE, "run_narrow_backfill", side_effect=results) as run_bf:
-                metrics = MODULE.run_v2_gap_backfills(
-                    conn=conn,
-                    run_id=202,
-                    env_name="CIC-Test",
-                    run_compact="run",
-                    env=self.env,
-                    v2_observations={
-                        "source_scope": {"source": "sos", "connector_ids": [1], "scope": "source"},
-                        "gaps": [{"day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "pm10"}],
-                    },
-                    dry_run=False,
-                    run_backfill=True,
-                    limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
-                    log=self.log,
-                )
-
-            self.assertEqual([call.kwargs["timeseries_ids"] for call in run_bf.call_args_list], [[101], [102]])
-            result = metrics["v2_observation_repair_results"][0]
-            self.assertEqual(result["expected_source_rows_for_day"], 47)
-            self.assertEqual(result["expected_timeseries_row_counts_for_day"], {"101": 24, "102": 23})
-            self.assertEqual(result["chunks"][0]["chunk_timeseries_ids"], [101])
-            self.assertEqual(result["chunks"][0]["chunk_expected_counts"], {"101": 24})
-            self.assertEqual(result["chunks"][0]["chunk_expected_rows"], 24)
-            self.assertEqual(result["chunks"][1]["chunk_timeseries_ids"], [102])
-            self.assertEqual(result["chunks"][1]["chunk_expected_counts"], {"102": 23})
-            self.assertEqual(result["chunks"][1]["chunk_expected_rows"], 23)
-            self.assertEqual(metrics["v2_observation_repairs_ok"], 1)
-            self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
-        finally:
-            conn.close()
-
-    def test_backfill_emitted_source_counts_above_manifest_are_diagnostic_only(self) -> None:
+    def test_v2_observation_repair_source_counts_above_manifest_are_non_blocking(self) -> None:
         conn = self._new_source_db(timeseries_ids=(101, 102))
         cached = self.root / "cached-openaq-source-counts-above-manifest.csv.gz"
         cached.write_bytes(gzip.compress(b"ok\n"))
@@ -1306,10 +1156,12 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
             result = metrics["v2_observation_repair_results"][0]
             self.assertEqual(result["status"], "ok")
-            self.assertTrue(result["aqi_rebuild_guard_ok"])
-            self.assertIsNone(result["aqi_rebuild_guard_reason"])
-            self.assertEqual(result["source_rows_from_counts"], 10313)
-            self.assertEqual(result["expected_counts_source"], "backfill_repaired_rows")
+            self.assertTrue(result["aqi_rebuild_manifest_guard_ok"])
+            self.assertIsNone(result["aqi_rebuild_manifest_guard_reason"])
+            diagnostic = result["source_counts_exceed_repaired_manifest"]
+            self.assertEqual(diagnostic["diagnostic_type"], "source_counts_exceed_repaired_manifest")
+            self.assertEqual(diagnostic["source_rows_from_counts"], 10313)
+            self.assertEqual(diagnostic["manifest_rows"], 10201)
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
             self.assertEqual(int(queued), 1)
         finally:
@@ -1348,59 +1200,9 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(metrics["v2_observation_repairs_guard_failed"], 1)
             result = metrics["v2_observation_repair_results"][0]
             self.assertEqual(result["status"], "guard_failed")
-            self.assertEqual(
-                result["aqi_rebuild_manifest_guard_reason"],
-                "manifest_total_rows_below_expected",
-            )
-            self.assertEqual(result["aqi_rebuild_manifest_guard"]["shortfall_rows"], 201)
+            self.assertIn("manifest_rows_below_expected:10000<10201", result["aqi_rebuild_manifest_guard_reason"])
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
             self.assertEqual(int(queued), 0)
-        finally:
-            conn.close()
-
-    def test_v2_observation_repair_guard_detects_per_timeseries_shortfall(self) -> None:
-        conn = self._new_source_db(timeseries_ids=(101, 102))
-        cached = self.root / "cached-openaq-timeseries-shortfall.csv.gz"
-        cached.write_bytes(gzip.compress(b"ok\n"))
-        try:
-            self._insert_openaq_prior_state(conn, local_cached_path=str(cached))
-            self._write_v2_observation_connector_manifest(
-                timeseries_row_counts={101: 4, 102: 6},
-                pollutant_codes=["pm25"],
-                declared_row_count=10,
-            )
-            with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "wrapper.sh")), \
-                 mock.patch.object(
-                     MODULE,
-                     "run_narrow_backfill",
-                     return_value=self._ok_obs_repair_result(
-                         rows=10,
-                         source_counts={101: 5, 102: 5},
-                         repaired_counts={101: 5, 102: 5},
-                         pollutant_codes=["pm25"],
-                     ),
-                 ):
-                metrics = MODULE.run_v2_gap_backfills(
-                    conn=conn,
-                    run_id=203,
-                    env_name="CIC-Test",
-                    run_compact="run",
-                    env=self.env,
-                    v2_observations={"gaps": [{"day_utc": "2026-06-08", "connector_id": 6}]},
-                    dry_run=False,
-                    run_backfill=True,
-                    limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
-                    log=self.log,
-                )
-
-            result = metrics["v2_observation_repair_results"][0]
-            self.assertEqual(result["status"], "guard_failed")
-            self.assertEqual(
-                result["aqi_rebuild_manifest_guard_reason"],
-                "manifest_timeseries_rows_below_expected",
-            )
-            self.assertEqual(result["aqi_rebuild_manifest_guard"]["shortfall_rows"], 1)
-            self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 0)
         finally:
             conn.close()
 
@@ -1436,7 +1238,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(metrics["v2_observation_repairs_guard_failed"], 1)
             result = metrics["v2_observation_repair_results"][0]
             self.assertEqual(result["status"], "guard_failed")
-            self.assertEqual(result["aqi_rebuild_manifest_guard_reason"], "manifest_missing_pollutant")
+            self.assertIn("manifest_missing_pollutants:no2", result["aqi_rebuild_manifest_guard_reason"])
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
             self.assertEqual(int(queued), 0)
         finally:
@@ -2138,42 +1940,6 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(metrics["v2_aqi_rebuilds_skipped_missing_observation_evidence"], 1)
         self.assertEqual(metrics["skipped_v2_aqi_rebuilds_from_integrity"][0]["reason"], "missing_v2_observation_evidence")
         queued = self.conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue WHERE run_id = 32").fetchone()[0]
-        self.assertEqual(int(queued), 0)
-
-    def test_v2_aqi_integrity_gap_waits_for_observation_repair_verification(self) -> None:
-        v2_aqi = {
-            "gaps": [{
-                "gap_type": "aqi_rows_below_observation_rows",
-                "day_utc": "2026-06-18",
-                "connector_id": 1,
-                "pollutant_code": "pm25",
-                "source_evidence": {"v2_observations_present": True},
-            }]
-        }
-        metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
-            conn=self.conn,
-            run_id=34,
-            env_name="CIC-Test",
-            env=self.env,
-            v2_aqilevels=v2_aqi,
-            dry_run=False,
-            run_backfill=True,
-            log=self.log,
-            blocked_connector_days={("2026-06-18", 1)},
-        )
-
-        self.assertEqual(metrics["v2_aqi_rebuilds_queued_from_integrity"], 0)
-        self.assertEqual(
-            metrics["v2_aqi_rebuilds_skipped_observation_repair_unverified"],
-            1,
-        )
-        self.assertEqual(
-            metrics["skipped_v2_aqi_rebuilds_from_integrity"][0]["reason"],
-            "observation_repair_not_verified",
-        )
-        queued = self.conn.execute(
-            "SELECT COUNT(*) FROM aqi_rebuild_queue WHERE run_id = 34"
-        ).fetchone()[0]
         self.assertEqual(int(queued), 0)
 
     def test_v2_aqi_integrity_source_scope_limits_queued_connectors(self) -> None:

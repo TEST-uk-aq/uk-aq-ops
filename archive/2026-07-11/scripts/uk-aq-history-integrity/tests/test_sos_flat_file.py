@@ -206,9 +206,14 @@ class SosFlatFileTests(unittest.TestCase):
             raise AssertionError("flat-file worker did not record source state")
         return result, cache_path, state, counts
 
-    def test_sos_has_no_source_mode_switch(self) -> None:
-        self.assertFalse(hasattr(MODULE, "_resolve_sos_source_mode"))
-        self.assertFalse(hasattr(MODULE, "UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV"))
+    def test_source_mode_defaults_to_flat_files(self) -> None:
+        self.assertEqual(MODULE._resolve_sos_source_mode({}), "uk_air_flat_files")
+        self.assertEqual(
+            MODULE._resolve_sos_source_mode({
+                MODULE.UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV: "sos_api",
+            }),
+            "sos_api",
+        )
 
     def test_flat_file_source_key_url_and_cache_path_are_deterministic(self) -> None:
         self.assertEqual(
