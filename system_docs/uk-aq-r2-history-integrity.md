@@ -497,6 +497,13 @@ Source-versus-R2 mismatch findings retain a complete, sorted
 `sample_missing_timeseries_ids` and `related_paths` remain bounded and must not
 be used to narrow a repair. Malformed and non-positive IDs are discarded.
 
+V2 observation indexes accept every safe canonical code recorded by valid
+observation manifests; they do not query Supabase or use an AQI pollutant list.
+AQI indexes retain the implemented PM2.5/PM10/NO2 restriction. Existing
+complete Phase B candidates are re-evaluated when their stored expected count
+differs from the current all-canonical source count, allowing bounded
+supplementary export before prune deletion becomes eligible.
+
 An observation `index_manifest_missing` gap is repaired with the existing v2
 targeted observations index builder and does not rewrite observation parquet.
 When the same connector/day also needs observation data repair, the standalone

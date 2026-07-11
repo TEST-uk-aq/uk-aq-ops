@@ -23,19 +23,19 @@ function runManifestKey(prefix, runId = RUN_ID) {
   return `${prefix}/run_id=${runId}/run_manifest.json`;
 }
 
-test("Phase B observations include source-provided DAQI index properties by default", () => {
+test("Phase B v2 observations use canonical all-property scope", () => {
   const resolved = resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" });
 
   assert.deepEqual(
     resolved.observations_pollutant_codes,
-    ["pm25", "pm10", "no2", "pm25index", "pm10index", "no2index"],
+    [],
   );
   assert.equal(resolved.observations_pollutant_codes.includes("humidity"), false);
   assert.equal(resolved.observations_pollutant_codes.includes("pressure"), false);
   assert.equal(resolved.observations_pollutant_codes.includes("temperature"), false);
 });
 
-test("Phase B v2 observations allow-list override is normalized and keeps DAQI index rows", () => {
+test("Phase B v2 ignores the retired observation allow-list", () => {
   const resolved = resolvePhaseBRuntimeConfig({
     UK_AQ_R2_HISTORY_VERSION: "v2",
     UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES: "PM10,pm25,NO2,PM25Index,pm10index,NO2Index,pm10,,",
@@ -43,26 +43,18 @@ test("Phase B v2 observations allow-list override is normalized and keeps DAQI i
 
   assert.deepEqual(
     resolved.observations_pollutant_codes,
-    ["pm10", "pm25", "no2", "pm25index", "pm10index", "no2index"],
+    [],
   );
 });
 
-test("Phase B deploy workflow and env catalogs expose the observations history allow-list", () => {
+test("Phase B deploy workflow and env catalogs retire the observations history allow-list", () => {
   const workflow = readFileSync(".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml", "utf8");
   const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
   const master = readFileSync("env-vars-master.csv", "utf8");
-  const expectedDefault = "pm25,pm10,no2,pm25index,pm10index,no2index";
+  assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
+  assert.doesNotMatch(targets, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
+  assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
 
-  assert.match(
-    workflow,
-    /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES: \$\{\{ vars\.UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES \|\| 'pm25,pm10,no2,pm25index,pm10index,no2index' \}\}/,
-  );
-  assert.match(
-    workflow,
-    /env_updates\+=\("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES=\$\{UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES\}"\)/,
-  );
-  assert.match(targets, /^UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES,variable$/m);
-  assert.equal(master.includes(`UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES,,,"${expectedDefault}"`), true);
 });
 
 test("Phase B resets a stale v2 checkpoint when cleanup already removed all partial objects", () => {
@@ -97,7 +89,7 @@ test("Phase B v2 resolves AQI levels to v2 hourly data and debug prefixes", () =
   );
 });
 
-test("Phase B v2 Dropbox prune comparison uses the same observations pollutant allow-list", () => {
+test("Phase B v2 Dropbox prune comparison covers all canonical observations", () => {
   const query = buildPruneComparisonRowsQueryForTest({
     runtime: {
       history_write_version: "v2",
@@ -110,20 +102,19 @@ test("Phase B v2 Dropbox prune comparison uses the same observations pollutant a
 
   assert.match(query.sql, /uk_aq_phase_b_history_rows_v2/);
   assert.doesNotMatch(query.sql, /uk_aq_phase_b_history_rows\(/);
-  assert.match(query.sql, /lower\(pollutant_code\) = any\(\$6::text\[\]\)/);
+  assert.doesNotMatch(query.sql, /pollutant_code.*any/);
   assert.deepEqual(query.params, [
     2,
     "2026-07-02T00:00:00.000Z",
     "2026-07-03T00:00:00.000Z",
     null,
     null,
-    ["pm10", "pm25", "no2", "pm25index", "pm10index", "no2index"],
   ]);
-  assert.equal(query.comparison_filter_mode, "v2_observations_pollutant_allow_list");
-  assert.equal(query.comparison_scope, "history_eligible_observations");
+  assert.equal(query.comparison_filter_mode, "canonical_observed_properties");
+  assert.equal(query.comparison_scope, "all_canonical_observations");
 });
 
-test("Phase B v2 observation checkpoints count only rows eligible for history", async () => {
+test("Phase B v2 observation checkpoints include every canonical property", async () => {
   const committedPrefix = "history/v2/observations";
   const written = new Map();
   const checkpointCalls = [];
@@ -185,21 +176,21 @@ test("Phase B v2 observation checkpoints count only rows eligible for history", 
       totalBytes: 0n,
     });
 
-    assert.equal(result.observedRows, 2n);
-    assert.equal(result.committedParts.length, 2);
+    assert.equal(result.observedRows, 3n);
+    assert.equal(result.committedParts.length, 3);
     assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "pm10", 0)), true);
     assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "pm25", 0)), true);
-    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "temperature", 0)), false);
+    assert.equal(written.has(buildHistoryV2PartKey(committedPrefix, DAY, 7, "temperature", 0)), true);
     assert.equal(checkpointCalls.length, 1);
-    assert.equal(checkpointCalls[0][6], "2");
+    assert.equal(checkpointCalls[0][6], "3");
 
     const plan = logEvents.find((entry) => entry.event === "phase_b_history_connector_pollutant_plan");
     assert.deepEqual(plan.fields.source_pollutant_codes, ["pm10", "pm25", "temperature"]);
-    assert.deepEqual(plan.fields.write_pollutant_codes, ["pm10", "pm25"]);
-    assert.deepEqual(plan.fields.excluded_pollutant_codes, ["temperature"]);
+    assert.deepEqual(plan.fields.write_pollutant_codes, ["pm10", "pm25", "temperature"]);
+    assert.deepEqual(plan.fields.excluded_pollutant_codes, []);
     assert.equal(plan.fields.row_count, 3);
-    assert.equal(plan.fields.eligible_for_history_count, 2);
-    assert.equal(plan.fields.excluded_row_count, 1);
+    assert.equal(plan.fields.eligible_for_history_count, 3);
+    assert.equal(plan.fields.excluded_row_count, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

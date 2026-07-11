@@ -196,12 +196,20 @@ function parsePositiveId(raw) {
   return Math.trunc(value);
 }
 
-function parsePollutantCode(raw) {
+export function normalizeObservationPropertyCode(raw) {
   const value = String(raw || "").trim().toLowerCase();
-  if (value === "pm25" || value === "pm10" || value === "no2") {
-    return value;
-  }
-  return null;
+  return /^[a-z][a-z0-9_]*$/.test(value) ? value : null;
+}
+
+export function normalizeAqiPollutantCode(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  return value === "pm25" || value === "pm10" || value === "no2" ? value : null;
+}
+
+function parsePollutantCode(raw, domain = "aqilevels") {
+  return String(domain || "").trim().toLowerCase() === "observations"
+    ? normalizeObservationPropertyCode(raw)
+    : normalizeAqiPollutantCode(raw);
 }
 
 function parseIsoDay(value) {
@@ -455,7 +463,7 @@ export function buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
   );
   const normalizedDay = parseIsoDay(dayUtc);
   const normalizedConnectorId = parsePositiveId(connectorId);
-  const normalizedPollutantCode = parsePollutantCode(pollutantCode);
+  const normalizedPollutantCode = parsePollutantCode(pollutantCode, "observations");
   if (!normalizedDay) {
     throw new Error(`Invalid day_utc for observations v2 timeseries index key: ${String(dayUtc || "")}`);
   }
@@ -700,7 +708,7 @@ function resolveHistoryV2ConnectorManifestTargets(dayManifest, dayUtc, dataPrefi
   return Array.from(byConnectorId.values()).sort((a, b) => a.connector_id - b.connector_id);
 }
 
-function resolveHistoryV2PollutantManifestTargets(connectorManifest, dayUtc, connectorId, dataPrefix) {
+function resolveHistoryV2PollutantManifestTargets(connectorManifest, dayUtc, connectorId, dataPrefix, domain) {
   const byPollutant = new Map();
   const pollutantEntries = Array.isArray(connectorManifest?.pollutant_manifests)
     ? connectorManifest.pollutant_manifests
@@ -709,7 +717,7 @@ function resolveHistoryV2PollutantManifestTargets(connectorManifest, dayUtc, con
       : [];
 
   for (const entry of pollutantEntries) {
-    const pollutantCode = parsePollutantCode(entry?.pollutant_code);
+    const pollutantCode = parsePollutantCode(entry?.pollutant_code, domain);
     if (!pollutantCode) {
       continue;
     }
@@ -732,7 +740,7 @@ function resolveHistoryV2PollutantManifestTargets(connectorManifest, dayUtc, con
     ? connectorManifest.pollutant_codes
     : [];
   for (const rawPollutantCode of pollutantCodes) {
-    const pollutantCode = parsePollutantCode(rawPollutantCode);
+    const pollutantCode = parsePollutantCode(rawPollutantCode, domain);
     if (!pollutantCode) {
       continue;
     }
@@ -1242,7 +1250,7 @@ function normalizeHistoryV2TimeseriesIndexFileEntry(entry, pollutantCode, domain
   if (!key) {
     return null;
   }
-  const normalizedPollutantCode = parsePollutantCode(entry.pollutant_code) || pollutantCode;
+  const normalizedPollutantCode = parsePollutantCode(entry.pollutant_code, domain) || pollutantCode;
   if (!normalizedPollutantCode) {
     return null;
   }
@@ -1289,7 +1297,10 @@ export function buildHistoryV2TimeseriesPollutantIndexPayload({
   if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
     throw new Error(`Unsupported R2 history v2 index domain: ${String(domain || "")}`);
   }
-  const normalizedPollutantCode = parsePollutantCode(pollutantCode || pollutantManifest?.pollutant_code);
+  const normalizedPollutantCode = parsePollutantCode(
+    pollutantCode || pollutantManifest?.pollutant_code,
+    normalizedDomain,
+  );
   if (!normalizedPollutantCode) {
     throw new Error(`Invalid pollutant_code for R2 history v2 index: ${String(pollutantCode || "")}`);
   }
@@ -1390,7 +1401,7 @@ function normalizeTimeseriesMetadataEntry(entry) {
   }
   const dayUtc = parseIsoDay(entry.day_utc);
   const connectorId = parsePositiveId(entry.connector_id);
-  const pollutantCode = parsePollutantCode(entry.pollutant_code);
+  const pollutantCode = parsePollutantCode(entry.pollutant_code, domain);
   const rowCount = parseNonNegativeInt(entry.row_count);
   if (!dayUtc || !connectorId || !pollutantCode || rowCount === null || rowCount <= 0) {
     return null;
@@ -1908,7 +1919,7 @@ function buildAqilevelsTimeseriesLatestPayload({
   };
 }
 
-function normalizeHistoryV2TimeseriesLatestDaySummary(entry) {
+function normalizeHistoryV2TimeseriesLatestDaySummary(entry, domain) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     return null;
   }
@@ -1939,7 +1950,7 @@ function normalizeHistoryV2TimeseriesLatestDaySummary(entry) {
     .sort((a, b) => a.connector_id - b.connector_id);
   const pollutantCodes = Array.from(new Set(
     (Array.isArray(entry.pollutant_codes) ? entry.pollutant_codes : [])
-      .map((value) => parsePollutantCode(value))
+      .map((value) => parsePollutantCode(value, domain))
       .filter(Boolean),
   )).sort((a, b) => a.localeCompare(b));
   const connectorCount = parseNonNegativeInt(entry.connector_count);
@@ -1985,7 +1996,7 @@ export function buildHistoryV2TimeseriesLatestPayload({
     ? buildR2HistoryV2ObservationsTimeseriesLatestKey(normalizedIndexPrefix)
     : buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey(normalizedIndexPrefix);
   const sortedSummaries = Array.from(Array.isArray(daySummaries) ? daySummaries : [])
-    .map((entry) => normalizeHistoryV2TimeseriesLatestDaySummary(entry))
+    .map((entry) => normalizeHistoryV2TimeseriesLatestDaySummary(entry, normalizedDomain))
     .filter(Boolean)
     .sort((a, b) => a.day_utc.localeCompare(b.day_utc));
   const days = sortedSummaries.map((entry) => entry.day_utc);
@@ -2065,7 +2076,7 @@ function resolveHistoryV2LatestPollutantIndexTargets({
     )).sort((a, b) => a - b);
     const pollutantCodes = Array.from(new Set(
       (Array.isArray(summary?.pollutant_codes) ? summary.pollutant_codes : [])
-        .map((value) => parsePollutantCode(value))
+        .map((value) => parsePollutantCode(value, normalizedDomain))
         .filter(Boolean),
     )).sort((a, b) => a.localeCompare(b));
     for (const connectorId of connectorIds) {
@@ -2204,6 +2215,7 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
           dayUtc,
           connectorTarget.connector_id,
           dataPrefix,
+          domain,
         );
         await mapWithConcurrency(pollutantTargets, fetchConcurrency, async (pollutantTarget) => {
           const dataPartitionResult = await fetchJsonObjectFromR2IfExists(
@@ -3026,6 +3038,7 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
             dayUtc,
             connectorTarget.connector_id,
             normalizedDataPrefix,
+            normalizedDomain,
           );
           const pollutantResults = (await mapWithConcurrency(
             pollutantTargets,
@@ -3251,7 +3264,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   for (const entry of Array.isArray(existingLatestPayload?.day_summaries)
     ? existingLatestPayload.day_summaries
     : []) {
-    const normalizedEntry = normalizeHistoryV2TimeseriesLatestDaySummary(entry);
+    const normalizedEntry = normalizeHistoryV2TimeseriesLatestDaySummary(entry, normalizedDomain);
     if (normalizedEntry) {
       daySummaryMap.set(normalizedEntry.day_utc, normalizedEntry);
     }
@@ -3303,6 +3316,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
           dayUtc,
           connectorTarget.connector_id,
           normalizedDataPrefix,
+          normalizedDomain,
         );
         const pollutantResults = (await mapWithConcurrency(
           pollutantTargets,
@@ -3448,7 +3462,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
         toIsoOrNull(dayManifestObject?.backed_up_at_utc)
         || pickMaxIsoTimestamp(connectorResults.map((entry) => entry.backed_up_at_utc)),
     };
-    daySummaryMap.set(dayUtc, normalizeHistoryV2TimeseriesLatestDaySummary(daySummary));
+    daySummaryMap.set(dayUtc, normalizeHistoryV2TimeseriesLatestDaySummary(daySummary, normalizedDomain));
   }
 
   const latestPayload = buildHistoryV2TimeseriesLatestPayload({

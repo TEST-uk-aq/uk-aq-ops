@@ -201,6 +201,11 @@ Daily prune v2 source:
   `observations -> timeseries -> phenomena -> observed_properties`.
 - `observed_properties.code` becomes `pollutant_code`; all rows with a known
   code are eligible, including non-AQI pollutants such as `o3`.
+- Codes must match `^[a-z][a-z0-9_]*$`; malformed canonical codes fail export
+  rather than being silently omitted or used in an R2 path.
+- `observed_properties.code` controls raw observation partitions.
+  `observed_property_mappings.is_aqi_eligible` is separate and currently only
+  PM2.5, PM10, and NO2 have implemented AQI processing.
 - The daily prune path remains Supabase/Postgres sourced. It does not read
   Dropbox or R2 core snapshots for pollutant resolution.
 

@@ -14,6 +14,8 @@ import {
   buildDaySummaryFromManifest,
   buildDomainIndexPayload,
   normalizeR2HistoryIndexDomain,
+  normalizeObservationPropertyCode,
+  normalizeAqiPollutantCode,
   rebuildR2HistoryV2TimeseriesMetadataIndexes,
   resolveR2HistoryIndexConfig,
   updateR2HistoryIndexesTargeted,
@@ -257,6 +259,29 @@ test("v2 timeseries index keys include day, connector, and pollutant without alt
     buildR2HistoryV2TimeseriesMetadataIndexKey("history/_index_v2/timeseries", 3742),
     "history/_index_v2/timeseries/timeseries_id=3742.json",
   );
+});
+
+test("v2 observation property codes accept canonical all-pollutant values and reject unsafe paths", () => {
+  for (const code of [
+    "pm25", "pm10", "no2", "o3", "so2", "co", "no", "nox_as_no2",
+    "pm25index", "pm10index", "no2index",
+  ]) {
+    assert.equal(normalizeObservationPropertyCode(code), code);
+  }
+  for (const value of ["", "../o3", "o3/x", "o3\\x", "o 3", ".", "_o3"] ) {
+    assert.equal(normalizeObservationPropertyCode(value), null);
+  }
+  assert.equal(normalizeAqiPollutantCode("o3"), null);
+  assert.equal(normalizeAqiPollutantCode("PM25"), "pm25");
+  assert.equal(
+    buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
+      "history/_index_v2/observations_timeseries", "2026-05-17", 1, "o3",
+    ),
+    "history/_index_v2/observations_timeseries/day_utc=2026-05-17/connector_id=1/pollutant_code=o3/manifest.json",
+  );
+  assert.throws(() => buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
+    "history/_index_v2/aqilevels_hourly_data_timeseries", "2026-05-17", 1, "o3",
+  ));
 });
 
 test("buildHistoryV2TimeseriesPollutantIndexPayload builds observation pollutant index metadata", () => {

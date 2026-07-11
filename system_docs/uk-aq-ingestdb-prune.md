@@ -22,10 +22,14 @@ Bucket key is:
 - Before fingerprint compare/delete work, the service runs Phase B R2 History export for closed UTC days through `utc_today - (INGESTDB_RETENTION_DAYS + 1 days)`.
 - Example: on `2026-03-17`, with `INGESTDB_RETENTION_DAYS=7`, latest eligible day is `2026-03-09`; with `INGESTDB_RETENTION_DAYS=5`, latest eligible day is `2026-03-11`.
 - Observations source rows are streamed through server-side projection function `uk_aq_ops.uk_aq_phase_b_history_rows` by `(day_utc, connector_id)` and written to R2 Parquet with ZSTD compression.
-- The default v2 observations write allow-list is `pm25,pm10,no2,pm25index,pm10index,no2index`, preserving raw PM/NO2 concentration observations and Breathe London source-provided DAQI/index observations. `UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES` may override the list, but narrowing it to `pm10,pm25` excludes source-provided index observations and is not the intended default.
+- V2 observations have no static pollutant allow-list. Every canonical row that
+  joins to a safe `uk_aq_core.observed_properties.code` is exported.
 - Do not treat source-provided DAQI/index observation rows as disposable derived noise. They are retained source observations and are used for later comparison against UK AQ calculated DAQI/AQI outputs.
 - Source-provided DAQI/index observations are different from UK AQ calculated AQI/DAQI history, which belongs under the separate aqilevels history path. Weather/metadata-style rows such as humidity, pressure, and temperature are not automatically equivalent to DAQI/index rows and may be excluded from public/history observations unless explicitly required.
-- With v2 observation history, Phase B candidate `expected_row_count`, streamed rows, checkpoint/adoption row counts, Dropbox prune comparison exports, ingest/observs fingerprint comparison, and prune delete all use the same allow-list. Rows outside that list are reported as excluded and are not allowed to satisfy or block the v2 observations history gate, and are not deleted by the prune delete RPC.
+- With v2 observation history, candidate counts, streamed rows, checkpoints,
+  Dropbox comparison, fingerprints, and deletion all use the same complete
+  canonical-observation scope. Unsafe canonical codes abort Phase B before
+  export or deletion.
 - Observations part rollover defaults to `1,000,000` rows per file.
 - Observations write each part directly to the version-selected committed prefix (`history/v1/observations/...` or, with `UK_AQ_R2_HISTORY_WRITE_VERSION=v2`, `history/v2/observations/...`) and persist resume checkpoint state after each part so retries continue from the last committed tuple instead of re-reading full-day rows.
 - If failure cleanup has already removed a v2 candidate's partial objects and no connector manifest exists, a retry discards the stale saved checkpoint and restarts that connector/day from zero.
@@ -130,8 +134,10 @@ Only one repair/recheck cycle is executed per run.
 Delete RPC:
 
 - `uk_aq_public.uk_aq_rpc_observations_delete_hour_bucket`
-- In v2 history mode the worker passes `p_pollutant_codes`, so the RPC deletes only observations whose timeseries resolves to an allowed observed property code. Without `p_pollutant_codes`, the RPC retains its legacy all-observations behavior.
-- The same `p_pollutant_codes` list is passed to ingest and observs hourly fingerprint RPCs. This keeps delete eligibility aligned with R2 `history/v2/observations` eligibility and prevents humidity/pressure/temperature-style rows from blocking or satisfying the v2 observations gate unless those codes are explicitly allow-listed.
+- In v2 history mode the worker passes no pollutant subset. Fingerprints and
+  delete RPCs therefore cover all canonical observations, matching the
+  committed Phase B manifest scope. Deletion remains gated on successful
+  complete-history parity.
 
 Each bucket is deleted in bounded batches until:
 

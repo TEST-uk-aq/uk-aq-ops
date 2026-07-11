@@ -38,7 +38,6 @@ const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
-const DEFAULT_OBSERVATIONS_POLLUTANT_CODES = "pm25,pm10,no2,pm25index,pm10index,no2index";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 
@@ -900,18 +899,25 @@ function toConnectorDayRow(row) {
 }
 
 function observationPollutantCodesForSql(runtime) {
-  return Array.from(new Set(
-    (Array.isArray(runtime?.observations_pollutant_codes) ? runtime.observations_pollutant_codes : [])
-      .map((code) => String(code || "").trim().toLowerCase())
-      .filter(Boolean),
-  ));
+  return [];
 }
 
 async function populateBackupCandidates(client, latestEligibleWindowEndIso, runtime = {}) {
   const pollutantCodes = observationPollutantCodesForSql(runtime);
   if (runtime.history_write_version === "v2") {
-    if (pollutantCodes.length === 0) {
-      throw new Error("Phase B v2 observations require at least one eligible pollutant code.");
+    const invalidCodes = await client.query(`
+select distinct op.code
+from uk_aq_core.observations o
+join uk_aq_core.timeseries ts on ts.id = o.timeseries_id and ts.connector_id = o.connector_id
+join uk_aq_core.phenomena p on p.id = ts.phenomenon_id
+join uk_aq_core.observed_properties op on op.id = p.observed_property_id
+where o.observed_at < $1::timestamptz
+  and (op.code is null or btrim(op.code) = '' or op.code !~ '^[a-z][a-z0-9_]*$')
+order by op.code nulls first
+limit 25
+`, [latestEligibleWindowEndIso]);
+    if (invalidCodes.rows.length > 0) {
+      throw new Error(`Invalid observed_properties.code values for v2 history: ${invalidCodes.rows.map((row) => String(row.code)).join(", ")}`);
     }
     const sql = `
 with source_rows as (
@@ -919,6 +925,7 @@ with source_rows as (
     (o.observed_at at time zone 'UTC')::date as day_utc,
     o.connector_id::integer as connector_id,
     o.observed_at,
+    op.code as source_code,
     lower(op.code) as pollutant_code
   from uk_aq_core.observations o
   join uk_aq_core.timeseries ts
@@ -932,6 +939,16 @@ with source_rows as (
     on existing_complete.day_utc = (o.observed_at at time zone 'UTC')::date
    and existing_complete.connector_id = o.connector_id
    and existing_complete.status = 'complete'
+   and existing_complete.expected_row_count = (
+     select count(*)::bigint
+     from uk_aq_core.observations o2
+     join uk_aq_core.timeseries ts2 on ts2.id = o2.timeseries_id and ts2.connector_id = o2.connector_id
+     join uk_aq_core.phenomena p2 on p2.id = ts2.phenomenon_id
+     join uk_aq_core.observed_properties op2 on op2.id = p2.observed_property_id
+     where o2.connector_id = o.connector_id
+       and (o2.observed_at at time zone 'UTC')::date = (o.observed_at at time zone 'UTC')::date
+       and op2.code ~ '^[a-z][a-z0-9_]*$'
+   )
   where o.observed_at < $1::timestamptz
     and op.code is not null
     and existing_complete.day_utc is null
@@ -952,7 +969,7 @@ eligible as (
     min(observed_at) as min_observed_at,
     max(observed_at) as max_observed_at
   from source_rows
-  where pollutant_code = any($2::text[])
+  where source_code ~ '^[a-z][a-z0-9_]*$'
   group by 1, 2
 ),
 excluded as (
@@ -968,7 +985,7 @@ excluded as (
       pollutant_code,
       count(*)::bigint as row_count
     from source_rows
-    where pollutant_code <> all($2::text[])
+    where false
     group by 1, 2, 3
   ) grouped
   group by 1, 2
@@ -2430,7 +2447,7 @@ async function writeCommittedV2PartAndCheckpoint({
 }) {
   const groupedRows = groupRowsByPollutant(rows);
   const sourcePollutantCodes = groupedRows.map(([pollutantCode]) => pollutantCode);
-  const writeGroups = groupedRows.filter(([pollutantCode]) => runtime.observations_pollutant_codes.includes(pollutantCode));
+  const writeGroups = groupedRows;
   const writePollutantCodes = writeGroups.map(([pollutantCode]) => pollutantCode);
   const excludedPollutantCodes = sourcePollutantCodes.filter((c) => !writePollutantCodes.includes(c));
   const excludedRowCount = groupedRows
@@ -2444,7 +2461,7 @@ async function writeCommittedV2PartAndCheckpoint({
     source_pollutant_codes: sourcePollutantCodes,
     write_pollutant_codes: writePollutantCodes,
     excluded_pollutant_codes: excludedPollutantCodes,
-    pollutant_filter_mode: "allow_list",
+    pollutant_filter_mode: "canonical_observed_properties",
     pollutant_count: sourcePollutantCodes.length,
     write_pollutant_count: writePollutantCodes.length,
     row_count: rows.length,
@@ -2908,7 +2925,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $4::integer,
   $5::timestamptz
 )
-where lower(pollutant_code) = any($6::text[])
 ` : `
 select
   connector_id,
@@ -2928,7 +2944,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows(
       new Cursor(
         sql,
         runtime.history_write_version === "v2"
-          ? [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt, observationPollutantCodesForSql(runtime)]
+          ? [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt]
           : [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt],
       ),
     );
@@ -3280,10 +3296,6 @@ function buildPruneComparisonBasePath({ runtime, dayUtc, connectorId }) {
 
 function buildPruneComparisonRowsQuery({ runtime, connectorId, dayStart, dayEnd }) {
   if (runtime.history_write_version === "v2") {
-    const pollutantCodes = observationPollutantCodesForSql(runtime);
-    if (pollutantCodes.length === 0) {
-      throw new Error("Phase B v2 prune Dropbox comparison requires at least one eligible pollutant code.");
-    }
     return {
       sql: `
 select
@@ -3298,12 +3310,11 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $4::integer,
   $5::timestamptz
 )
-where lower(pollutant_code) = any($6::text[])
 `,
-      params: [connectorId, dayStart, dayEnd, null, null, pollutantCodes],
-      comparison_filter_mode: "v2_observations_pollutant_allow_list",
-      comparison_pollutant_codes: pollutantCodes,
-      comparison_scope: "history_eligible_observations",
+      params: [connectorId, dayStart, dayEnd, null, null],
+      comparison_filter_mode: "canonical_observed_properties",
+      comparison_pollutant_codes: [],
+      comparison_scope: "all_canonical_observations",
     };
   }
 
@@ -4568,13 +4579,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     2_000_000,
   );
 
-  const rawPollutantCodes = String(
-    env.UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES ||
-      DEFAULT_OBSERVATIONS_POLLUTANT_CODES,
-  ).trim();
-  const allowedPollutantCodes = Array.from(new Set(
-    rawPollutantCodes.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean),
-  ));
+  const allowedPollutantCodes = [];
 
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
