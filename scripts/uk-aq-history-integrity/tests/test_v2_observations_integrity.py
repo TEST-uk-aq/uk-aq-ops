@@ -43,6 +43,20 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
                 "source_row_count": 3, "file_count": 1,
                 "timeseries_row_counts": {"101": 3}, "files": [{"key": key}],
             }), encoding="utf-8")
+            (self.root / f"history/v2/observations/day_utc={day}/connector_id=7/manifest.json").write_text(json.dumps({
+                "history_version": "v2", "domain": "observations", "manifest_kind": "connector",
+                "day_utc": day, "connector_id": 7, "pollutant_codes": ["pm25"], "row_count": 3,
+                "source_row_count": 3, "file_count": 1, "timeseries_row_counts": {"101": 3},
+                "child_manifests": [{"pollutant_code": "pm25", "key": f"history/v2/observations/day_utc={day}/connector_id=7/pollutant_code=pm25/manifest.json"}],
+                "files": [{"key": key, "row_count": 3, "pollutant_codes": ["pm25"], "timeseries_row_counts": {"101": 3}}],
+            }), encoding="utf-8")
+            (self.root / f"history/v2/observations/day_utc={day}/manifest.json").write_text(json.dumps({
+                "history_version": "v2", "domain": "observations", "manifest_kind": "day",
+                "day_utc": day, "connector_ids": [7], "pollutant_codes": ["pm25"], "row_count": 3,
+                "source_row_count": 3, "file_count": 1, "timeseries_row_counts": {"101": 3},
+                "child_manifests": [{"connector_id": 7, "key": f"history/v2/observations/day_utc={day}/connector_id=7/manifest.json"}],
+                "files": [{"key": key, "row_count": 3, "connector_id": 7, "pollutant_codes": ["pm25"], "timeseries_row_counts": {"101": 3}}],
+            }), encoding="utf-8")
         if index:
             idx = self._index(day=day)
             idx.mkdir(parents=True, exist_ok=True)
@@ -160,6 +174,8 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         key6 = f"history/v2/observations/day_utc={day}/connector_id=6/pollutant_code=pm25/part-00000.parquet"
         (self.root / key6).write_bytes(b"PAR1")
         (part6 / "manifest.json").write_text(json.dumps({"files": [{"key": key6}], "row_count": 1, "timeseries_row_counts": {"301": 1}}), encoding="utf-8")
+        (self.root / f"history/v2/observations/day_utc={day}/connector_id=6/manifest.json").write_text(json.dumps({"connector_id": 6, "pollutant_codes": ["pm25"], "row_count": 1, "file_count": 1, "child_manifests": [{"pollutant_code": "pm25"}], "files": [{"key": key6}]}), encoding="utf-8")
+        (self.root / f"history/v2/observations/day_utc={day}/manifest.json").write_text(json.dumps({"day_utc": day, "connector_ids": [6, 7], "row_count": 4, "file_count": 2, "child_manifests": [{"connector_id": 6}, {"connector_id": 7}], "files": [{"key": key6}]}), encoding="utf-8")
         idx6 = self._index(day=day, connector=6, pollutant="pm25")
         idx6.mkdir(parents=True, exist_ok=True)
         (idx6 / "manifest.json").write_text(json.dumps({"timeseries_row_counts": {"301": 1}}), encoding="utf-8")
@@ -253,6 +269,44 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["connector_id"], 6)
         self.assertTrue(gaps[0]["expected_path"].endswith(f"day_utc={day}/connector_id=6"))
+
+    def test_connector_manifest_omits_valid_pollutant_child(self) -> None:
+        day = "2026-05-17"
+        self._write_healthy(day=day)
+        part = self._partition(day=day, connector=7, pollutant="o3")
+        part.mkdir(parents=True, exist_ok=True)
+        key = f"history/v2/observations/day_utc={day}/connector_id=7/pollutant_code=o3/part-00000.parquet"
+        (self.root / key).write_bytes(b"PAR1")
+        (part / "manifest.json").write_text(json.dumps({"history_version":"v2","domain":"observations","day_utc":day,"connector_id":7,"pollutant_code":"o3","row_count":2,"source_row_count":2,"file_count":1,"timeseries_row_counts":{"201":2},"files":[{"key":key}]}), encoding="utf-8")
+        idx = self._index(day=day, connector=7, pollutant="o3")
+        idx.mkdir(parents=True, exist_ok=True)
+        (idx / "manifest.json").write_text(json.dumps({"timeseries_row_counts": {"201": 2}}), encoding="utf-8")
+        result = self._run(from_day=day, to_day=day)
+        self.assertIn("connector_manifest_missing_pollutant_child", self._gap_types(result))
+        self.assertIn("observation_connector_manifest_repair", {a["kind"] for a in result["repair_plan"]})
+
+    def test_connector_manifest_lists_missing_pollutant_child(self) -> None:
+        self._write_healthy()
+        manifest = self.root / "history/v2/observations/day_utc=2026-06-11/connector_id=7/manifest.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["pollutant_codes"] = ["pm25", "o3"]
+        payload["child_manifests"].append({"pollutant_code": "o3"})
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertIn("connector_manifest_stale_pollutant_child", self._gap_types(self._run()))
+
+    def test_pollutant_manifest_unlisted_actual_parquet(self) -> None:
+        self._write_healthy()
+        (self._partition() / "part-00001.parquet").write_bytes(b"PAR1")
+        self.assertIn("data_manifest_unlisted_parquet", self._gap_types(self._run()))
+
+    def test_day_manifest_references_missing_connector(self) -> None:
+        self._write_healthy()
+        manifest = self.root / "history/v2/observations/day_utc=2026-06-11/manifest.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["connector_ids"] = [7, 99]
+        payload["child_manifests"].append({"connector_id": 99})
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertIn("day_manifest_stale_connector_child", self._gap_types(self._run()))
 
 
 class V2ObservationMalformedLayoutTests(unittest.TestCase):

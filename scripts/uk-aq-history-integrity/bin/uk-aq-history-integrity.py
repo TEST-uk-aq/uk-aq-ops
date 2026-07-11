@@ -7202,6 +7202,335 @@ def _enrich_v2_observations_repair_plans(
             }
 
 
+
+
+def _manifest_child_hash(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("manifest_hash") or payload.get("hash") or payload.get("sha256")
+    return str(value) if value not in (None, "") else None
+
+
+def _manifest_row_count(payload: Mapping[str, Any]) -> int:
+    try:
+        return int(payload.get("row_count") or payload.get("source_row_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _manifest_file_count(payload: Mapping[str, Any]) -> int:
+    try:
+        return int(payload.get("file_count") if payload.get("file_count") is not None else len(_manifest_files(payload)))
+    except (TypeError, ValueError):
+        return len(_manifest_files(payload))
+
+
+def _manifest_total_bytes(payload: Mapping[str, Any]) -> int:
+    try:
+        return int(payload.get("total_bytes") or payload.get("bytes") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pollutant_codes_from_manifest(payload: Mapping[str, Any]) -> set[str]:
+    raw = payload.get("pollutant_codes")
+    if isinstance(raw, list):
+        return {str(v).strip().lower() for v in raw if str(v).strip()}
+    one = payload.get("pollutant_code")
+    return {str(one).strip().lower()} if str(one or "").strip() else set()
+
+
+def _child_pollutant_codes_from_connector_manifest(payload: Mapping[str, Any]) -> set[str]:
+    codes = set(_pollutant_codes_from_manifest(payload))
+    for field in ("child_manifests", "pollutant_manifests"):
+        raw = payload.get(field)
+        if isinstance(raw, list):
+            for entry in raw:
+                if isinstance(entry, dict):
+                    code = entry.get("pollutant_code")
+                    if code:
+                        codes.add(str(code).strip().lower())
+                    key = str(entry.get("key") or entry.get("path") or "")
+                    m = re.search(r"pollutant_code=([^/]+)/manifest\.json$", key)
+                    if m:
+                        codes.add(m.group(1).strip().lower())
+    for entry in _manifest_files(payload):
+        if isinstance(entry, dict):
+            for code in _pollutant_codes_from_manifest(entry):
+                codes.add(code)
+            key = str(entry.get("key") or "")
+            m = re.search(r"pollutant_code=([^/]+)/", key)
+            if m:
+                codes.add(m.group(1).strip().lower())
+    return {c for c in codes if c}
+
+
+def _child_connectors_from_day_manifest(payload: Mapping[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    for field in ("connector_ids",):
+        raw = payload.get(field)
+        if isinstance(raw, list):
+            for v in raw:
+                try:
+                    ids.add(int(v))
+                except (TypeError, ValueError):
+                    pass
+    for field in ("child_manifests", "connector_manifests"):
+        raw = payload.get(field)
+        if isinstance(raw, list):
+            for entry in raw:
+                if isinstance(entry, dict):
+                    cid = entry.get("connector_id")
+                    try:
+                        if cid is not None:
+                            ids.add(int(cid))
+                    except (TypeError, ValueError):
+                        pass
+                    key = str(entry.get("key") or entry.get("path") or "")
+                    m = re.search(r"connector_id=(\d+)/manifest\.json$", key)
+                    if m:
+                        ids.add(int(m.group(1)))
+    for entry in _manifest_files(payload):
+        if isinstance(entry, dict):
+            try:
+                if entry.get("connector_id") is not None:
+                    ids.add(int(entry.get("connector_id")))
+            except (TypeError, ValueError):
+                pass
+            m = re.search(r"connector_id=(\d+)/", str(entry.get("key") or ""))
+            if m:
+                ids.add(int(m.group(1)))
+    return ids
+
+
+def _validate_manifest_file_listing(*, root: Path, payload: Mapping[str, Any], partition_dir: Path, gap_factory, day_utc: str, connector_id: int | str, pollutant_code: str, manifest_rel: str) -> list[dict[str, Any]]:
+    gaps: list[dict[str, Any]] = []
+    files = _manifest_files(payload)
+    listed = []
+    for entry in files:
+        if isinstance(entry, dict) and entry.get("key"):
+            listed.append(str(entry.get("key")))
+    if len(listed) != len(set(listed)):
+        gaps.append(gap_factory("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_id, pollutant_code=pollutant_code, expected_path=manifest_rel))
+    actual = sorted(str(p.relative_to(root)) for p in partition_dir.glob("part-*.parquet") if p.is_file())
+    for key in sorted(set(actual) - set(listed)):
+        gaps.append(gap_factory("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_id, pollutant_code=pollutant_code, expected_path=key))
+    for key in sorted(set(listed) - set(actual)):
+        gaps.append(gap_factory("parquet_missing", day_utc=day_utc, connector_id=connector_id, pollutant_code=pollutant_code, expected_path=key))
+    if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(files):
+        gaps.append(gap_factory("row_count_mismatch", day_utc=day_utc, connector_id=connector_id, pollutant_code=pollutant_code, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
+    ts_sum = sum(_normalize_timeseries_row_counts(payload.get("timeseries_row_counts")).values())
+    row_count = _manifest_row_count(payload)
+    if ts_sum and row_count and ts_sum != row_count:
+        gaps.append(gap_factory("row_count_mismatch", day_utc=day_utc, connector_id=connector_id, pollutant_code=pollutant_code, expected_path=manifest_rel, related_paths=[f"sum(timeseries_row_counts)={ts_sum} row_count={row_count}"]))
+    return gaps
+
+
+def _validate_connector_manifest_hierarchy(*, root: Path, connector_dir: Path, data_prefix: str, day_utc: str, connector_raw: str, gap_factory) -> tuple[list[dict[str, Any]], int]:
+    gaps: list[dict[str, Any]] = []
+    checked = 0
+    manifest_rel = f"{data_prefix}/day_utc={day_utc}/connector_id={connector_raw}/manifest.json"
+    manifest_path = root / manifest_rel
+    child_payloads: dict[str, dict[str, Any]] = {}
+    for pdir in sorted(connector_dir.glob("pollutant_code=*")):
+        if not pdir.is_dir():
+            continue
+        code = pdir.name.split("=", 1)[1]
+        child_path = pdir / "manifest.json"
+        if child_path.is_file():
+            payload, err = _load_json_file(child_path)
+            if err is None and isinstance(payload, dict):
+                child_payloads[code] = payload
+    actual_codes = set(child_payloads)
+    if not manifest_path.is_file():
+        if actual_codes:
+            gaps.append(gap_factory("connector_manifest_missing", day_utc=day_utc, connector_id=connector_raw, expected_path=manifest_rel, related_paths=sorted(actual_codes), severity="warning"))
+        return gaps, checked
+    checked = 1
+    payload, err = _load_json_file(manifest_path)
+    if err or not isinstance(payload, dict):
+        gaps.append(gap_factory("connector_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, expected_path=manifest_rel))
+        return gaps, checked
+    listed_codes = _child_pollutant_codes_from_connector_manifest(payload)
+    for code in sorted(actual_codes - listed_codes):
+        gaps.append(gap_factory("connector_manifest_missing_pollutant_child", day_utc=day_utc, connector_id=connector_raw, pollutant_code=code, expected_path=manifest_rel))
+    for code in sorted(listed_codes - actual_codes):
+        gaps.append(gap_factory("connector_manifest_stale_pollutant_child", day_utc=day_utc, connector_id=connector_raw, pollutant_code=code, expected_path=manifest_rel))
+    child_rows = sum(_manifest_row_count(v) for v in child_payloads.values())
+    child_files = sum(_manifest_file_count(v) for v in child_payloads.values())
+    child_bytes = sum(_manifest_total_bytes(v) for v in child_payloads.values())
+    if child_rows and _manifest_row_count(payload) != child_rows:
+        gaps.append(gap_factory("connector_manifest_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, expected_path=manifest_rel, related_paths=[f"connector={_manifest_row_count(payload)} children={child_rows}"]))
+    if child_files and _manifest_file_count(payload) != child_files:
+        gaps.append(gap_factory("connector_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, expected_path=manifest_rel, related_paths=[f"connector={_manifest_file_count(payload)} children={child_files}"]))
+    if child_bytes and _manifest_total_bytes(payload) != child_bytes:
+        gaps.append(gap_factory("connector_manifest_total_bytes_mismatch", day_utc=day_utc, connector_id=connector_raw, expected_path=manifest_rel, related_paths=[f"connector={_manifest_total_bytes(payload)} children={child_bytes}"]))
+    child_hash_by_code = {code: _manifest_child_hash(v) for code, v in child_payloads.items() if _manifest_child_hash(v)}
+    for field in ("child_manifests", "pollutant_manifests"):
+        raw = payload.get(field)
+        if isinstance(raw, list):
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                code = str(entry.get("pollutant_code") or "").strip().lower()
+                if code and code in child_hash_by_code:
+                    got = _manifest_child_hash(entry)
+                    if got and got != child_hash_by_code[code]:
+                        gaps.append(gap_factory("connector_manifest_child_hash_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=code, expected_path=manifest_rel))
+    return gaps, checked
+
+
+def _validate_day_manifest_hierarchy(*, root: Path, day_dir: Path, data_prefix: str, day_utc: str, allowed_connector_ids: set[int] | None, gap_factory) -> tuple[list[dict[str, Any]], int]:
+    gaps: list[dict[str, Any]] = []
+    checked = 0
+    manifest_rel = f"{data_prefix}/day_utc={day_utc}/manifest.json"
+    manifest_path = root / manifest_rel
+    connector_payloads: dict[int, dict[str, Any]] = {}
+    for cdir in sorted(day_dir.glob("connector_id=*")):
+        cid = _connector_id_from_dirname(cdir.name)
+        if cid is None or (allowed_connector_ids is not None and cid not in allowed_connector_ids):
+            continue
+        cpath = cdir / "manifest.json"
+        if cpath.is_file():
+            payload, err = _load_json_file(cpath)
+            if err is None and isinstance(payload, dict):
+                connector_payloads[cid] = payload
+    actual_ids = set(connector_payloads)
+    if not manifest_path.is_file():
+        if actual_ids:
+            gaps.append(gap_factory("day_manifest_missing", day_utc=day_utc, expected_path=manifest_rel, related_paths=[str(v) for v in sorted(actual_ids)], severity="warning"))
+        return gaps, checked
+    checked = 1
+    payload, err = _load_json_file(manifest_path)
+    if err or not isinstance(payload, dict):
+        gaps.append(gap_factory("day_manifest_invalid_json", day_utc=day_utc, expected_path=manifest_rel))
+        return gaps, checked
+    listed_ids = _child_connectors_from_day_manifest(payload)
+    if allowed_connector_ids is not None:
+        listed_ids = {cid for cid in listed_ids if cid in allowed_connector_ids}
+    for cid in sorted(actual_ids - listed_ids):
+        gaps.append(gap_factory("day_manifest_missing_connector_child", day_utc=day_utc, connector_id=cid, expected_path=manifest_rel))
+    for cid in sorted(listed_ids - actual_ids):
+        gaps.append(gap_factory("day_manifest_stale_connector_child", day_utc=day_utc, connector_id=cid, expected_path=manifest_rel))
+    child_rows = sum(_manifest_row_count(v) for v in connector_payloads.values())
+    child_files = sum(_manifest_file_count(v) for v in connector_payloads.values())
+    child_bytes = sum(_manifest_total_bytes(v) for v in connector_payloads.values())
+    if allowed_connector_ids is None:
+        if child_rows and _manifest_row_count(payload) != child_rows:
+            gaps.append(gap_factory("day_manifest_row_count_mismatch", day_utc=day_utc, expected_path=manifest_rel, related_paths=[f"day={_manifest_row_count(payload)} children={child_rows}"]))
+        if child_files and _manifest_file_count(payload) != child_files:
+            gaps.append(gap_factory("day_manifest_file_count_mismatch", day_utc=day_utc, expected_path=manifest_rel, related_paths=[f"day={_manifest_file_count(payload)} children={child_files}"]))
+        if child_bytes and _manifest_total_bytes(payload) != child_bytes:
+            gaps.append(gap_factory("day_manifest_total_bytes_mismatch", day_utc=day_utc, expected_path=manifest_rel, related_paths=[f"day={_manifest_total_bytes(payload)} children={child_bytes}"]))
+    for field in ("child_manifests", "connector_manifests"):
+        raw = payload.get(field)
+        if isinstance(raw, list):
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    cid = int(entry.get("connector_id"))
+                except (TypeError, ValueError):
+                    continue
+                child_hash = _manifest_child_hash(connector_payloads.get(cid, {}))
+                got = _manifest_child_hash(entry)
+                if child_hash and got and child_hash != got:
+                    gaps.append(gap_factory("day_manifest_child_hash_mismatch", day_utc=day_utc, connector_id=cid, expected_path=manifest_rel))
+    return gaps, checked
+
+
+AQI_ENABLED_POLLUTANTS = frozenset({"pm25", "pm10", "no2"})
+
+
+def is_aqi_enabled_pollutant(code: Any) -> bool:
+    return str(code or "").strip().lower() in AQI_ENABLED_POLLUTANTS
+
+
+def build_v2_repair_plan(*, observation_gaps: Iterable[Mapping[str, Any]] = (), aqi_gaps: Iterable[Mapping[str, Any]] = ()) -> list[dict[str, Any]]:
+    actions: dict[tuple[str, str, str, int | None, str | None], dict[str, Any]] = {}
+    def add(kind: str, domain: str, day: str | None, connector: Any = None, pollutant: Any = None, reason: str | None = None) -> None:
+        if not day:
+            return
+        try:
+            cid = int(connector) if connector is not None else None
+        except (TypeError, ValueError):
+            cid = None
+        pol = str(pollutant).strip().lower() if pollutant not in (None, "") else None
+        key = (kind, domain, day, cid, pol)
+        entry = actions.setdefault(key, {"kind": kind, "domain": domain, "day_utc": day, "connector_id": cid, "pollutant_code": pol, "reasons": []})
+        if reason and reason not in entry["reasons"]:
+            entry["reasons"].append(reason)
+    data_types = {"source_r2_timeseries_row_mismatch", "parquet_missing", "data_manifest_unlisted_parquet", "data_manifest_missing", "data_manifest_invalid_json", "data_manifest_schema_mismatch", "data_manifest_empty", "orphan_parquet_without_manifest"}
+    for gap in observation_gaps:
+        gt = str(gap.get("gap_type") or "")
+        day = gap.get("day_utc")
+        cid = gap.get("connector_id")
+        pol = gap.get("pollutant_code")
+        if gt in data_types:
+            add("observation_data_repair", "observations", day, cid, pol, gt)
+            if is_aqi_enabled_pollutant(pol):
+                add("aqi_rebuild", "aqilevels", day, cid, pol, "observation_data_changed")
+        if gt.startswith("connector_manifest_") or gt == "connector_manifest_missing":
+            add("observation_connector_manifest_repair", "observations", day, cid, None, gt)
+        if gt.startswith("day_manifest_") or gt == "day_manifest_missing":
+            add("observation_day_manifest_repair", "observations", day, None, None, gt)
+        if gt.startswith("index_") or gt == "latest_index_missing":
+            add("observation_index_repair", "observations", day, cid, pol, gt)
+    for gap in aqi_gaps:
+        gt = str(gap.get("gap_type") or "")
+        day = gap.get("day_utc")
+        cid = gap.get("connector_id")
+        pol = gap.get("pollutant_code")
+        if gt.startswith("connector_manifest_") or gt == "connector_manifest_missing":
+            add("aqi_connector_manifest_repair", "aqilevels", day, cid, None, gt)
+        if gt.startswith("day_manifest_") or gt == "day_manifest_missing":
+            add("aqi_day_manifest_repair", "aqilevels", day, None, None, gt)
+        if gt.startswith("index_") or gt == "latest_index_missing":
+            add("aqi_index_repair", "aqilevels", day, cid, pol, gt)
+    order = ["observation_data_repair", "observation_pollutant_manifest_repair", "observation_connector_manifest_repair", "observation_day_manifest_repair", "observation_index_repair", "observation_timeseries_metadata_repair", "aqi_rebuild", "aqi_pollutant_manifest_repair", "aqi_connector_manifest_repair", "aqi_day_manifest_repair", "aqi_index_repair", "source_mapping_issue"]
+    pos = {name: i for i, name in enumerate(order)}
+    return sorted(actions.values(), key=lambda e: (pos.get(e["kind"], 999), e.get("day_utc") or "", e.get("connector_id") or -1, e.get("pollutant_code") or ""))
+
+
+def check_dropbox_backup_ready(*, supabase_url: str | None, service_role_key: str | None, task_keys: list[str], scheduled_for_date: str, integrity_started_at_utc: str, allow_stale_dropbox: bool = False, rpc_name: str = "uk_aq_rpc_daily_task_backup_readiness") -> dict[str, Any]:
+    summary = {"backup_gate_checked": True, "backup_ready": False, "backup_task_keys": list(task_keys), "backup_scheduled_for_date": scheduled_for_date, "backup_completed_at": None, "allow_stale_dropbox": bool(allow_stale_dropbox), "blocked_reason": None, "tasks": []}
+    if allow_stale_dropbox:
+        summary["backup_ready"] = True
+        summary["blocked_reason"] = "allow_stale_dropbox_override"
+        return summary
+    if not task_keys:
+        summary["blocked_reason"] = "no_required_backup_task_keys_configured"
+        return summary
+    if not supabase_url or not service_role_key:
+        summary["blocked_reason"] = "supabase_credentials_unavailable"
+        return summary
+    import urllib.request
+    endpoint = supabase_url.rstrip("/") + f"/rest/v1/rpc/{rpc_name}"
+    payload = json.dumps({"p_scheduled_for_date": scheduled_for_date, "p_task_keys": task_keys}).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=payload, method="POST", headers={"apikey": service_role_key, "Authorization": f"Bearer {service_role_key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8")
+            data = json.loads(body) if body else {}
+    except Exception as exc:
+        summary["blocked_reason"] = f"daily_task_health_query_failed:{exc}"
+        return summary
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, dict):
+        tasks = data.get("tasks") if isinstance(data.get("tasks"), list) else []
+        summary["tasks"] = tasks
+        completed = [str(t.get("completed_at") or t.get("finished_at_utc") or t.get("completed_at_utc") or "") for t in tasks if isinstance(t, dict)]
+        summary["backup_completed_at"] = max([c for c in completed if c] or [str(data.get("backup_completed_at") or "")]) or None
+        ready = bool(data.get("backup_ready") or data.get("ready"))
+        if ready and summary["backup_completed_at"] and summary["backup_completed_at"] > integrity_started_at_utc:
+            ready = False
+            summary["blocked_reason"] = "backup_completed_after_integrity_started"
+        summary["backup_ready"] = ready
+        if not ready and not summary["blocked_reason"]:
+            summary["blocked_reason"] = str(data.get("blocked_reason") or "backup_not_ready")
+    else:
+        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
+    return summary
+
 def _manifest_files(payload: Any) -> list[dict[str, Any]]:
     files = payload.get("files") if isinstance(payload, dict) else None
     return files if isinstance(files, list) else []
@@ -7457,6 +7786,8 @@ def run_v2_observations_integrity_checks(
 
     gaps: list[dict[str, Any]] = []
     checked = 0
+    connector_manifests_checked = 0
+    day_manifests_checked = 0
     data_prefix = config.observations_data_prefix.strip("/")
     index_prefix = config.observations_timeseries_index_prefix.strip("/")
     latest_key = config.observations_latest_index_key.strip("/")
@@ -7614,6 +7945,37 @@ def run_v2_observations_integrity_checks(
                         )
                         if stale_gap is not None:
                             gaps.append(stale_gap)
+                if isinstance(payload, dict):
+                    gaps.extend(_validate_manifest_file_listing(
+                        root=root,
+                        payload=payload,
+                        partition_dir=pollutant_dir,
+                        gap_factory=_v2_obs_gap,
+                        day_utc=day_utc,
+                        connector_id=connector_raw,
+                        pollutant_code=pollutant,
+                        manifest_rel=manifest_rel,
+                    ))
+            hierarchy_gaps, hierarchy_checked = _validate_connector_manifest_hierarchy(
+                root=root,
+                connector_dir=connector_dir,
+                data_prefix=data_prefix,
+                day_utc=day_utc,
+                connector_raw=connector_raw,
+                gap_factory=_v2_obs_gap,
+            )
+            gaps.extend(hierarchy_gaps)
+            connector_manifests_checked += hierarchy_checked
+        day_gaps, day_checked = _validate_day_manifest_hierarchy(
+            root=root,
+            day_dir=day_dir,
+            data_prefix=data_prefix,
+            day_utc=day_utc,
+            allowed_connector_ids=allowed_connector_ids,
+            gap_factory=_v2_obs_gap,
+        )
+        gaps.extend(day_gaps)
+        day_manifests_checked += day_checked
 
     _enrich_v2_observations_repair_plans(
         root=root,
@@ -7621,7 +7983,20 @@ def run_v2_observations_integrity_checks(
         source_scope=source_scope,
     )
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
-    result = {"status": status, "checked_partitions": checked, "gap_count": len(gaps), "gaps": gaps}
+    repair_plan = build_v2_repair_plan(observation_gaps=gaps)
+    result = {
+        "status": status,
+        "checked_partitions": checked,
+        "gap_count": len(gaps),
+        "gaps": gaps,
+        "observation_pollutant_manifests_checked": checked,
+        "observation_connector_manifests_checked": connector_manifests_checked,
+        "observation_day_manifests_checked": day_manifests_checked,
+        "manifest_gaps_total": sum(1 for g in gaps if "manifest" in str(g.get("gap_type") or "")),
+        "observation_indexes_checked": checked,
+        "observation_index_gaps": sum(1 for g in gaps if "index" in str(g.get("gap_type") or "")),
+        "repair_plan": repair_plan,
+    }
     if source_scope is not None:
         result["source_scope"] = source_scope
     if log:
@@ -11582,6 +11957,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG"), False),
         help="Treat missing/invalid v2 AQI hourly debug partitions as errors (default false; env UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG).",
     )
+    p.add_argument(
+        "--allow-stale-dropbox",
+        action="store_true",
+        default=_parse_bool(os.environ.get("UK_AQ_HISTORY_INTEGRITY_ALLOW_STALE_DROPBOX"), False),
+        help="Manual override for scheduled runs: proceed even when today's Dropbox backup readiness gate is not ready.",
+    )
     return p.parse_args(argv)
 
 
@@ -12788,6 +13169,21 @@ def format_summary_md(s: dict[str, Any]) -> str:
         if snap.get("error"):
             lines.append(f"- Error:         {snap['error']}")
         lines.append("")
+    backup = s.get("backup_readiness") or {}
+    if backup:
+        lines.extend([
+            "## Dropbox backup readiness",
+            "",
+            f"- Gate checked: {bool(backup.get('backup_gate_checked'))}",
+            f"- Ready: {backup.get('backup_ready')}",
+            f"- Required task keys: {', '.join(backup.get('backup_task_keys') or [])}",
+            f"- Scheduled date: {backup.get('backup_scheduled_for_date') or '(none)'}",
+            f"- Completed at: {backup.get('backup_completed_at') or '(none)'}",
+            f"- Allow stale Dropbox: {bool(backup.get('allow_stale_dropbox'))}",
+            f"- Blocked reason: {backup.get('blocked_reason') or '(none)'}",
+            "",
+        ])
+
     lookup_counts = s.get("lookup_source_counts") or {}
     if lookup_counts:
         lines.extend([
@@ -13030,9 +13426,30 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"- AQI debug checks: {debug_mode}",
                         f"- Checked observation partitions: {obs.get('checked_partitions', 0)}",
                         f"- Observation gaps: {obs.get('gap_count', len(gaps))}",
+                        f"- Observation manifest gaps: {obs.get('manifest_gaps_total', 0)}",
+                        f"- Observation repair plan actions: {len(obs.get('repair_plan') or [])}",
                         f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
                         f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
+                    repair_plan = obs.get("repair_plan") or []
+                    if repair_plan:
+                        lines.extend([
+                            "",
+                            "### V2 planned repair actions",
+                            "",
+                            "| Kind | Domain | Day | Connector | Pollutant | Reasons |",
+                            "| --- | --- | --- | --- | --- | --- |",
+                        ])
+                        for action in repair_plan[:50]:
+                            lines.append(
+                                "| "
+                                f"{action.get('kind') or ''} | "
+                                f"{action.get('domain') or ''} | "
+                                f"{action.get('day_utc') or ''} | "
+                                f"{action.get('connector_id') or ''} | "
+                                f"{action.get('pollutant_code') or ''} | "
+                                f"{', '.join(action.get('reasons') or [])} |"
+                            )
                     if gaps:
                         lines.extend([
                             "",
@@ -13324,6 +13741,48 @@ def main(argv: list[str]) -> int:
     daily_task_health_run_id: str | None = None
     daily_task_scheduled_for_date = started_at.date().isoformat()
     daily_task_platform_run_id = f"{args.env}:{run_compact}"
+    backup_gate_summary: dict[str, Any] = {"backup_gate_checked": False, "backup_ready": None, "allow_stale_dropbox": bool(args.allow_stale_dropbox)}
+    if args.profile != "manual":
+        task_keys = [
+            part.strip()
+            for part in str(os.environ.get("UK_AQ_HISTORY_INTEGRITY_BACKUP_TASK_KEYS", "r2_backup_inventory,r2_history_dropbox_sync")).split(",")
+            if part.strip()
+        ]
+        backup_gate_summary = check_dropbox_backup_ready(
+            supabase_url=os.environ.get("SUPABASE_URL") or os.environ.get("UK_AQ_SUPABASE_URL"),
+            service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("UK_AQ_SUPABASE_SERVICE_ROLE_KEY"),
+            task_keys=task_keys,
+            scheduled_for_date=daily_task_scheduled_for_date,
+            integrity_started_at_utc=started_iso,
+            allow_stale_dropbox=bool(args.allow_stale_dropbox),
+            rpc_name=str(os.environ.get("UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC", "uk_aq_rpc_daily_task_backup_readiness")),
+        )
+        log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
+        if not backup_gate_summary.get("backup_ready"):
+            log.error("backup gate blocked before Dropbox history scan: %s", backup_gate_summary.get("blocked_reason"))
+            summary = {
+                "env": args.env,
+                "profile": args.profile,
+                "source": args.source,
+                "from_day": args.from_day,
+                "to_day": args.to_day,
+                "started_at_utc": started_iso,
+                "finished_at_utc": fmt_iso(utc_now()),
+                "status": "blocked_backup_not_ready",
+                "dry_run": bool(args.dry_run),
+                "check_only": bool(args.check_only),
+                "run_backfill": bool(args.run_backfill),
+                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+                "log_path": str(log_path),
+                "history_version_mode": history_version_mode,
+                "checked_versions": checked_history_versions,
+                "history_path_configs": serialized_history_path_configs,
+                "backup_readiness": backup_gate_summary,
+                "metrics": {},
+            }
+            write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+            return 2
+
     if daily_task_health_enabled:
         start_summary = {
             "env": args.env,
@@ -13337,6 +13796,7 @@ def main(argv: list[str]) -> int:
             "skip_cross_check": bool(args.skip_cross_check),
             "status": "started",
             "log_path": str(log_path),
+            "backup_readiness": backup_gate_summary,
         }
         try:
             daily_task_health_run_id = _daily_task_health_start(
@@ -14204,6 +14664,8 @@ def main(argv: list[str]) -> int:
             "force_snapshot_import": args.force_snapshot_import,
             "skip_snapshot_import": args.skip_snapshot_import,
             "skip_cross_check": args.skip_cross_check,
+            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+            "backup_readiness": backup_gate_summary,
             "max_download_mb": args.max_download_mb,
             "max_runtime_minutes": args.max_runtime_minutes,
             "started_at_utc": started_iso,
@@ -14272,6 +14734,7 @@ def main(argv: list[str]) -> int:
                 "aqi_rebuilds_failed": metrics.get("aqi_rebuilds_failed", 0),
                 "runtime_seconds": runtime_seconds,
                 "report_json_path": str(json_path),
+                "backup_readiness": backup_gate_summary,
                 "report_md_path": str(md_path),
                 "log_path": str(log_path),
             }
