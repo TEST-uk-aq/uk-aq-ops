@@ -64,16 +64,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_output_dir(env: dict[str, str] | os._Environ[str], args: argparse.Namespace) -> Path:
-    raw = (
-        getattr(args, "output_dir", None)
-        or getattr(args, "out", None)
-        or env.get("UK_AQ_AQI_GAP_REPORT_DIR")
-        or "aqi_gap_check/reports"
-    )
-    return Path(str(raw)).expanduser()
-
-
 def resolve_r2_history_root(cli_root: str | None) -> Path:
     root = cli_root or os.environ.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT") or os.environ.get("R2_HISTORY_DROPBOX_ROOT")
     if not root:
@@ -283,21 +273,8 @@ def write_table(path: Path, rows: list[dict[str, Any]], delimiter: str) -> None:
         writer.writerows(rows)
 
 
-def write_reports(out_dir: Path, rows: list[dict[str, Any]] | str, args: argparse.Namespace | dict[str, Any], root: Path | None = None):
+def write_reports(out_dir: Path, rows: list[dict[str, Any]], args: argparse.Namespace, root: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    if isinstance(rows, str) and isinstance(args, dict) and root is None:
-        stem = rows
-        report = args
-        json_path = out_dir / f"{stem}.json"
-        md_path = out_dir / f"{stem}.md"
-        json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        md_path.write_text(
-            f"# {stem}\n\n```json\n{json.dumps(report, indent=2, sort_keys=True)}\n```\n",
-            encoding="utf-8",
-        )
-        return json_path, md_path
-    if root is None or not isinstance(args, argparse.Namespace):
-        raise TypeError("write_reports expected (out_dir, rows, args, root) for summary reports")
     gap_rows = [row for row in rows if row["status"] != "ok"]
     write_table(out_dir / "summary.tsv", rows, "\t")
     write_table(out_dir / "summary.csv", rows, ",")

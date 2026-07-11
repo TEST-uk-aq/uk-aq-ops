@@ -135,10 +135,7 @@ CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
 # manifest (categories, observed_properties, offerings, features, procedures,
 # networks, sos_*, station_metadata)
 # are accepted in the manifest but not imported in this phase.
-CORE_TABLES_TO_IMPORT = (
-    "connectors", "stations", "timeseries", "phenomena",
-    "observed_property_mappings",
-)
+CORE_TABLES_TO_IMPORT = ("connectors", "stations", "timeseries", "phenomena")
 
 DAY_DIR_PATTERN = "day_utc=*"
 
@@ -213,33 +210,6 @@ CREATE TABLE IF NOT EXISTS core_phenomena_snapshot (
   observed_property_id INTEGER,
   connector_id INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS core_observed_property_mappings_snapshot (
-  id INTEGER PRIMARY KEY,
-  connector_id INTEGER NOT NULL,
-  source_label TEXT NOT NULL,
-  notation TEXT,
-  pollutant_label TEXT,
-  source_uom TEXT,
-  observed_property_id INTEGER,
-  observed_property_code TEXT,
-  mapping_kind TEXT NOT NULL,
-  is_aqi_eligible INTEGER NOT NULL,
-  is_active INTEGER NOT NULL,
-  confidence TEXT,
-  notes TEXT,
-  created_at TEXT,
-  updated_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_core_observed_property_mappings_connector_label
-  ON core_observed_property_mappings_snapshot(connector_id, source_label);
-CREATE INDEX IF NOT EXISTS idx_core_observed_property_mappings_connector_active
-  ON core_observed_property_mappings_snapshot(connector_id, is_active);
-CREATE INDEX IF NOT EXISTS idx_core_observed_property_mappings_code
-  ON core_observed_property_mappings_snapshot(observed_property_code);
-CREATE INDEX IF NOT EXISTS idx_core_observed_property_mappings_kind
-  ON core_observed_property_mappings_snapshot(mapping_kind);
 
 CREATE TABLE IF NOT EXISTS source_station_timeseries_lookup (
   source_key TEXT NOT NULL,
@@ -582,11 +552,8 @@ def snapshot_tables_have_rows(conn: sqlite3.Connection) -> bool:
     """True if the per-env snapshot tables look populated.
     Re-import is forced if the previous run claimed success but the rows
     were wiped (e.g. by a manual DB reset)."""
-    stations = conn.execute("SELECT COUNT(*) FROM core_stations_snapshot").fetchone()
-    mappings = conn.execute(
-        "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot"
-    ).fetchone()
-    return bool(stations and stations[0] > 0 and mappings and mappings[0] > 0)
+    row = conn.execute("SELECT COUNT(*) FROM core_stations_snapshot").fetchone()
+    return bool(row and row[0] > 0)
 
 
 def _row_get_int(row: dict[str, Any], key: str) -> int | None:
@@ -695,36 +662,11 @@ def _phenomena_insert_spec() -> tuple[str, Any]:
     return sql, to_tuple
 
 
-def _observed_property_mappings_insert_spec() -> tuple[str, Any]:
-    sql = (
-        "INSERT INTO core_observed_property_mappings_snapshot "
-        "(id, connector_id, source_label, notation, pollutant_label, source_uom, "
-        " observed_property_id, observed_property_code, mapping_kind, "
-        " is_aqi_eligible, is_active, confidence, notes, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    def to_tuple(r: dict[str, Any]) -> tuple:
-        return (
-            _row_get_int(r, "id"), _row_get_int(r, "connector_id"),
-            _row_get_str(r, "source_label"), _row_get_str(r, "notation"),
-            _row_get_str(r, "pollutant_label"), _row_get_str(r, "source_uom"),
-            _row_get_int(r, "observed_property_id"),
-            _row_get_str(r, "observed_property_code"),
-            _row_get_str(r, "mapping_kind"),
-            1 if r.get("is_aqi_eligible") is True else 0,
-            1 if r.get("is_active") is True else 0,
-            _row_get_str(r, "confidence"), _row_get_str(r, "notes"),
-            _row_get_str(r, "created_at"), _row_get_str(r, "updated_at"),
-        )
-    return sql, to_tuple
-
-
 _INSERT_SPECS = {
     "connectors": _connectors_insert_spec,
     "stations":   _stations_insert_spec,
     "timeseries": _timeseries_insert_spec,
     "phenomena":  _phenomena_insert_spec,
-    "observed_property_mappings": _observed_property_mappings_insert_spec,
 }
 
 _TARGET_TABLES = {
@@ -732,7 +674,6 @@ _TARGET_TABLES = {
     "stations":   "core_stations_snapshot",
     "timeseries": "core_timeseries_snapshot",
     "phenomena":  "core_phenomena_snapshot",
-    "observed_property_mappings": "core_observed_property_mappings_snapshot",
 }
 
 
@@ -1454,6 +1395,14 @@ SC_COLUMN_TO_REF_SUFFIX = {
 SOS_SOURCE_KEY = "sos"
 SOS_DEFAULT_BASE_URL = "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
 SOS_DEFAULT_TIMEOUT_SECONDS = 30
+UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV = (
+    "UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE"
+)
+UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ALLOWED = {
+    "uk_air_flat_files",
+    "sos_api",
+}
+UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_DEFAULT = "uk_air_flat_files"
 UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL_ENV = (
     "UK_AQ_HISTORY_INTEGRITY_UK_AIR_FLAT_FILE_BASE_URL"
 )
@@ -1822,6 +1771,16 @@ def _resolve_sos_not_found_cooldown_seconds() -> int:
     if minutes <= 0:
         return 0
     return minutes * 60
+
+
+def _resolve_sos_source_mode(env: Mapping[str, str] | None = None) -> str:
+    values = os.environ if env is None else env
+    raw = str(
+        values.get(UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ENV, "")
+    ).strip().lower()
+    if raw in UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_ALLOWED:
+        return raw
+    return UK_AQ_HISTORY_INTEGRITY_SOS_SOURCE_MODE_DEFAULT
 
 
 def _resolve_uk_air_flat_file_base_url(env: Mapping[str, str] | None = None) -> str:
@@ -3798,11 +3757,12 @@ def run_narrow_backfill(
             sub_env["UK_AQ_BACKFILL_OPENAQ_RAW_MIRROR_ROOT"] = str(
                 Path(integrity_cache_root) / "openaq"
             )
-        # SOS historical repair uses the annual UK-AIR CSV cache exclusively.
+        # Option 1 (same-run handoff): let source_to_r2(sos) reuse
+        # canonical station/day snapshots that integrity just fetched in this run.
         if not (
-            sub_env.get("UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT") or ""
+            sub_env.get("UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT") or ""
         ).strip():
-            sub_env["UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT"] = str(
+            sub_env["UK_AQ_BACKFILL_SOS_INTEGRITY_SNAPSHOT_ROOT"] = str(
                 Path(integrity_cache_root) / "sos"
             )
 
@@ -5555,8 +5515,6 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
     target_pollutants: Iterable[str],
     cache_root: Path,
     keep_policy: str,
-    requested_from_day: str,
-    requested_to_day: str,
     log: logging.Logger,
     limits: LimitTracker | None = None,
 ) -> dict[str, Any]:
@@ -5584,8 +5542,6 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
             target_pollutants=target_pollutants,
             cache_root=cache_root,
             keep_policy=keep_policy,
-            requested_from_day=requested_from_day,
-            requested_to_day=requested_to_day,
             log=log,
         )
     finally:
@@ -5609,8 +5565,6 @@ def _check_one_sos_uk_air_flat_file(
     cache_root: Path,
     keep_policy: str,
     log: logging.Logger,
-    requested_from_day: str | None = None,
-    requested_to_day: str | None = None,
 ) -> dict[str, Any]:
     site_token = str(site_ref).strip().upper()
     sfk = _uk_air_flat_file_source_file_key(site_token, year)
@@ -5633,9 +5587,6 @@ def _check_one_sos_uk_air_flat_file(
         "ambiguous_mapping_groups": 0,
         "unmapped_source_rows": 0,
         "ambiguous_mapping_rows": 0,
-        "out_of_window_unmapped_groups": 0,
-        "out_of_window_unmapped_rows": 0,
-        "actionable_mapping_issues": [],
         "event_id": None,
         "event_type": None,
         "timeseries_ids": [],
@@ -5970,8 +5921,6 @@ def _check_one_sos_uk_air_flat_file(
     ambiguous_groups = 0
     unmapped_rows = 0
     ambiguous_rows = 0
-    out_of_window_unmapped_groups = 0
-    out_of_window_unmapped_rows = 0
     issue_notes: list[str] = []
     for (day_utc, pollutant_code), source_count in sorted(parsed_counts.items()):
         mapping_row, mapping_status = _resolve_uk_air_flat_file_mapping_row(
@@ -5979,30 +5928,13 @@ def _check_one_sos_uk_air_flat_file(
             day_utc,
         )
         if mapping_row is None:
-            in_requested_window = bool(
-                not requested_from_day or not requested_to_day
-                or requested_from_day <= day_utc <= requested_to_day
-            )
             if mapping_status == "ambiguous_mapping":
-                if in_requested_window:
-                    ambiguous_groups += 1
-                    ambiguous_rows += int(source_count)
+                ambiguous_groups += 1
+                ambiguous_rows += int(source_count)
             else:
-                if in_requested_window:
-                    unmapped_groups += 1
-                    unmapped_rows += int(source_count)
-                else:
-                    out_of_window_unmapped_groups += 1
-                    out_of_window_unmapped_rows += int(source_count)
-            if in_requested_window:
-                issue_notes.append(f"{day_utc}:{pollutant_code}={mapping_status}")
-                metrics["actionable_mapping_issues"].append({
-                    "site_ref": site_token,
-                    "day_utc": day_utc,
-                    "pollutant_code": pollutant_code,
-                    "source_rows": int(source_count),
-                    "mapping_status": mapping_status or "unmapped_source",
-                })
+                unmapped_groups += 1
+                unmapped_rows += int(source_count)
+            issue_notes.append(f"{day_utc}:{pollutant_code}={mapping_status}")
             continue
         try:
             timeseries_id = int(mapping_row.get("timeseries_id") or 0)
@@ -6030,8 +5962,6 @@ def _check_one_sos_uk_air_flat_file(
     metrics["ambiguous_mapping_groups"] = ambiguous_groups
     metrics["unmapped_source_rows"] = unmapped_rows
     metrics["ambiguous_mapping_rows"] = ambiguous_rows
-    metrics["out_of_window_unmapped_groups"] = out_of_window_unmapped_groups
-    metrics["out_of_window_unmapped_rows"] = out_of_window_unmapped_rows
     metrics["timeseries_ids"] = sorted(mapped_timeseries_ids)
     metrics["downloaded_bytes"] = int(downloaded_bytes)
     metrics["snapshot_status"] = SOS_STATUS_OK if metrics["source_rows"] > 0 else SOS_STATUS_NO_DATA
@@ -6232,9 +6162,6 @@ def check_sos_flat_files(
         "ambiguous_mapping_groups": 0,
         "unmapped_source_rows": 0,
         "ambiguous_mapping_rows": 0,
-        "out_of_window_unmapped_groups": 0,
-        "out_of_window_unmapped_rows": 0,
-        "actionable_mapping_issues": [],
         "first_seen_files": [],
         "changed_files": [],
         "planned_backfills": [],
@@ -6253,21 +6180,21 @@ def check_sos_flat_files(
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
         return metrics
 
-    years = _uk_air_flat_file_years_for_window(from_day, to_day)
-    if not years:
-        metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
-        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
-        return metrics
-
     mapping_rows = _fetch_uk_air_flat_file_mapping_rows(
         env=env,
-        from_day=f"{min(years):04d}-01-01",
-        to_day=f"{max(years):04d}-12-31",
+        from_day=from_day,
+        to_day=to_day,
         target_pollutants=metrics["target_pollutants"],
     )
     grouped_mappings = _group_uk_air_flat_file_mapping_rows(mapping_rows)
     if not grouped_mappings:
         metrics["skipped_reason"] = "no UK-AIR site_ref mappings returned from Supabase"
+        log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
+        return metrics
+
+    years = _uk_air_flat_file_years_for_window(from_day, to_day)
+    if not years:
+        metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
         return metrics
 
@@ -6329,8 +6256,6 @@ def check_sos_flat_files(
                 metrics["target_pollutants"],
                 cache_root,
                 metrics["keep_api_snapshots_policy"],
-                from_day,
-                to_day,
                 log,
                 limits,
             ))
@@ -6382,13 +6307,6 @@ def check_sos_flat_files(
             metrics["ambiguous_mapping_groups"] += int(result.get("ambiguous_mapping_groups") or 0)
             metrics["unmapped_source_rows"] += int(result.get("unmapped_source_rows") or 0)
             metrics["ambiguous_mapping_rows"] += int(result.get("ambiguous_mapping_rows") or 0)
-            metrics["out_of_window_unmapped_groups"] += int(result.get("out_of_window_unmapped_groups") or 0)
-            metrics["out_of_window_unmapped_rows"] += int(result.get("out_of_window_unmapped_rows") or 0)
-            remaining_issue_slots = max(0, 100 - len(metrics["actionable_mapping_issues"]))
-            if remaining_issue_slots:
-                metrics["actionable_mapping_issues"].extend(
-                    list(result.get("actionable_mapping_issues") or [])[:remaining_issue_slots]
-                )
 
             snapshot_status = str(result.get("snapshot_status") or "")
             if snapshot_status in {SOS_STATUS_OK, SOS_STATUS_NO_DATA}:
@@ -6478,18 +6396,6 @@ def check_sos_flat_files(
 
     metrics["first_seen_files"].sort(key=lambda e: (e["year"], e["site_ref"]))
     metrics["changed_files"].sort(key=lambda e: (e["year"], e["site_ref"]))
-    metrics["actionable_mapping_issues"].sort(
-        key=lambda issue: (
-            str(issue.get("day_utc") or ""),
-            str(issue.get("site_ref") or ""),
-            str(issue.get("pollutant_code") or ""),
-        )
-    )
-    for issue in metrics["actionable_mapping_issues"]:
-        log.warning(
-            "sos flat-file mapping issue %s",
-            json.dumps({"event": "sos_flat_file_mapping_issue", **issue}, sort_keys=True),
-        )
 
     if limits.should_stop():
         metrics["stopped_for"] = limits.stopped_for
@@ -6520,23 +6426,22 @@ def check_sos(
     concurrency: int = DEFAULT_CONCURRENCY,
     history_version: str = "v1",
 ) -> dict[str, Any]:
-    return check_sos_flat_files(
-        conn=conn,
-        env_name=env_name,
-        env=env,
-        from_day=from_day,
-        to_day=to_day,
-        dry_run=dry_run,
-        run_backfill=run_backfill,
-        limits=limits,
-        log=log,
-        concurrency=concurrency,
-        history_version=history_version,
-    )
+    source_mode = _resolve_sos_source_mode(env)
+    if source_mode == "uk_air_flat_files":
+        return check_sos_flat_files(
+            conn=conn,
+            env_name=env_name,
+            env=env,
+            from_day=from_day,
+            to_day=to_day,
+            dry_run=dry_run,
+            run_backfill=run_backfill,
+            limits=limits,
+            log=log,
+            concurrency=concurrency,
+            history_version=history_version,
+        )
 
-    # The former SOS API implementation below is unreachable. It remains only
-    # as dead code pending a separate mechanical deletion from this large file.
-    source_mode = "sos_api"
     metrics: dict[str, Any] = {
         "ran": False,
         "stopped_for": None,
@@ -7098,6 +7003,41 @@ def _repair_day_connector_args(day_utc: str | None, connector_id: int | str | No
     return args
 
 
+def _confirmed_v1_to_v2_observations_command(
+    *,
+    day_utc: str | None,
+    connector_id: int | str | None,
+) -> list[str]:
+    args = _repair_day_connector_args(day_utc, connector_id)
+    return [
+        "node",
+        "scripts/backup_r2/uk_aq_build_v2_observations_from_dropbox_v1.mjs",
+        *args,
+        "--part-max-rows",
+        "5000",
+        "--write-r2",
+        "--replace",
+        "--report-out",
+        f"tmp/v2_observations_{day_utc or 'selected_range'}_from_v1_dropbox.json",
+    ]
+
+
+def _local_v1_observations_evidence(
+    root: Path,
+    *,
+    day_utc: str | None,
+    connector_id: int | str | None,
+) -> tuple[bool | None, list[str]]:
+    if not day_utc:
+        return None, []
+    base = root / "history/v1/observations" / f"day_utc={day_utc}"
+    if connector_id is not None:
+        base = base / f"connector_id={connector_id}"
+    if not base.exists():
+        return False, [str(base.relative_to(root))]
+    return True, [str(base.relative_to(root))]
+
+
 def _local_v2_observations_evidence(
     root: Path,
     config: HistoryPathConfig,
@@ -7122,10 +7062,7 @@ def _enrich_v2_observations_repair_plans(
     *,
     root: Path,
     gaps: list[dict[str, Any]],
-    source_scope: Mapping[str, Any] | None = None,
 ) -> None:
-    source_name = str((source_scope or {}).get("source") or "").strip().lower()
-    sos_scope = source_name == "sos"
     index_gap_types = {
         "index_day_dir_missing",
         "index_connector_dir_missing",
@@ -7158,6 +7095,16 @@ def _enrich_v2_observations_repair_plans(
         gap_type = str(gap.get("gap_type") or "")
         day_utc = gap.get("day_utc")
         connector_id = gap.get("connector_id")
+        v1_present, v1_paths = _local_v1_observations_evidence(
+            root,
+            day_utc=str(day_utc) if day_utc else None,
+            connector_id=connector_id,
+        )
+        evidence = gap.setdefault("source_evidence", {})
+        evidence["v1_local_dropbox_present"] = v1_present
+        if v1_paths:
+            evidence["v1_local_dropbox_paths"] = v1_paths
+
         if gap_type in index_gap_types:
             gap["suggested_repair"] = {
                 "kind": "rebuild_v2_observations_index_only",
@@ -7172,223 +7119,43 @@ def _enrich_v2_observations_repair_plans(
                     "command contract remains unresolved."
                 ),
             }
-        elif gap_type in data_gap_types:
+        elif gap_type in data_gap_types and v1_present is True:
             gap["suggested_repair"] = {
-                "kind": (
-                    "uk_air_csv_to_v2_observations_backfill_required"
-                    if sos_scope
-                    else "source_to_v2_observations_backfill_required"
-                ),
+                "kind": "v1_dropbox_to_v2_observations_backfill_plan",
                 "requires_index_rebuild": True,
-                "commands": [],
+                "commands": [_confirmed_v1_to_v2_observations_command(day_utc=day_utc, connector_id=connector_id)],
                 "executes": False,
-                "operator_action_required": False,
-                "write_risk": "writes_to_r2_when_run_backfill_is_enabled",
+                "operator_action_required": True,
+                "write_risk": "writes_to_r2_if_operator_runs_command",
                 "steps": [
-                    (
-                        "Use the cached annual UK-AIR CSV as the SOS observation source."
-                        if sos_scope
-                        else "Use the current connector source cache as the observation source."
-                    ),
-                    "Write the affected v2 observation partition through the existing source-to-R2 writer.",
-                    "Rebuild the affected v2 observations _index_v2 manifests and verify source parity before AQI rebuild.",
+                    "Use the confirmed local Dropbox v1-to-v2 observations builder for the affected day/connector scope.",
+                    "Review the suggested command before running it manually because it includes --write-r2 and --replace.",
+                    "After v2 observations are written by an operator, rebuild the affected v2 observations _index_v2 manifests.",
                 ],
                 "notes": (
-                    "The executable --run-backfill path reads the cached UK-AIR annual CSV "
-                    "as the sole SOS historical observation source."
-                    if sos_scope
-                    else "The executable --run-backfill path uses the current connector source adapter."
+                    "This is a non-executing plan. The listed builder command is operator guidance only; "
+                    "the checker does not run it. It contains --write-r2 and --replace, so it must only "
+                    "be copied and run manually after operator review. The follow-up _index_v2 rebuild "
+                    "command is not listed because its command contract has not been confirmed."
                 ),
+            }
+        elif gap_type in data_gap_types and v1_present is False:
+            gap["suggested_repair"] = {
+                "kind": "source_or_v1_backup_investigation_required",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "steps": [
+                    "Confirm whether v1 exists in R2 but is missing from the local Dropbox mirror.",
+                    "If v1 exists only in R2, refresh the Dropbox backup for the target scope before planning v1-to-v2 generation.",
+                    "If neither v1 nor v2 exists, investigate source/prune/Supabase availability before selecting a repair command.",
+                ],
+                "notes": "No Supabase/prune/backfill command is emitted because the exact v2 write contract has not been confirmed.",
             }
 
 
 def _manifest_files(payload: Any) -> list[dict[str, Any]]:
     files = payload.get("files") if isinstance(payload, dict) else None
     return files if isinstance(files, list) else []
-
-
-def _manifest_codes_from_child_list(payload: Mapping[str, Any], field: str, id_key: str) -> set[str]:
-    raw_children = payload.get(field)
-    if not isinstance(raw_children, list):
-        return set()
-    out: set[str] = set()
-    for child in raw_children:
-        if not isinstance(child, dict):
-            continue
-        value = str(child.get(id_key) or "").strip()
-        if value:
-            out.add(value)
-    return out
-
-
-def _manifest_codes_from_scalar_list(payload: Mapping[str, Any], field: str) -> set[str]:
-    raw = payload.get(field)
-    if not isinstance(raw, list):
-        return set()
-    return {str(value).strip() for value in raw if str(value or "").strip()}
-
-
-def _manifest_pollutant_codes_from_files(payload: Mapping[str, Any]) -> set[str]:
-    out: set[str] = set()
-    for entry in _manifest_files(payload):
-        if not isinstance(entry, dict):
-            continue
-        code = str(entry.get("pollutant_code") or "").strip()
-        if code:
-            out.add(code)
-        for value in entry.get("pollutant_codes") or []:
-            code = str(value or "").strip()
-            if code:
-                out.add(code)
-        key = str(entry.get("key") or "").strip()
-        match = re.search(r"/pollutant_code=([^/]+)/", key)
-        if match:
-            out.add(match.group(1))
-    return out
-
-
-def _manifest_connector_ids_from_files(payload: Mapping[str, Any]) -> set[str]:
-    out: set[str] = set()
-    for entry in _manifest_files(payload):
-        if not isinstance(entry, dict):
-            continue
-        value = str(entry.get("connector_id") or "").strip()
-        if value:
-            out.add(value)
-        for raw in entry.get("connector_ids") or []:
-            value = str(raw or "").strip()
-            if value:
-                out.add(value)
-        key = str(entry.get("key") or "").strip()
-        match = re.search(r"/connector_id=([^/]+)/", key)
-        if match:
-            out.add(match.group(1))
-    return out
-
-
-def _append_field_set_gaps(
-    gaps: list[dict[str, Any]],
-    *,
-    domain: str,
-    field_label: str,
-    actual: set[str],
-    represented: set[str],
-    day_utc: str,
-    connector_id: int | str | None = None,
-    expected_path: str,
-    child_key: str,
-) -> None:
-    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
-    missing = sorted(actual - represented)
-    stale = sorted(represented - actual)
-    if missing:
-        kwargs: dict[str, Any] = {
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "expected_path": expected_path,
-            "related_paths": [f"{child_key}={value}" for value in missing],
-        }
-        gaps.append(gap_fn(f"{field_label}_missing_child", **kwargs))
-    if stale:
-        kwargs = {
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "expected_path": expected_path,
-            "related_paths": [f"{child_key}={value}" for value in stale],
-        }
-        gaps.append(gap_fn(f"{field_label}_stale_child", **kwargs))
-
-
-def _validate_v2_parent_hierarchy(
-    *,
-    root: Path,
-    data_prefix: str,
-    day_utc: str,
-    connector_dir: Path | None,
-    day_dir: Path,
-    gaps: list[dict[str, Any]],
-    domain: str,
-) -> None:
-    """Validate connector/day parent representations independently.
-
-    Each parent field is compared to actual live child manifest directories on
-    its own.  This intentionally avoids the old union behaviour where a child
-    present in one representation hid its absence from another.
-    """
-    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
-    if connector_dir is not None:
-        connector_raw = connector_dir.name.split("=", 1)[1]
-        connector_rel = f"{data_prefix}/day_utc={day_utc}/{connector_dir.name}/manifest.json"
-        connector_manifest = root / connector_rel
-        actual_pollutants = {
-            p.name.split("=", 1)[1]
-            for p in connector_dir.glob("pollutant_code=*")
-            if p.is_dir() and (p / "manifest.json").is_file()
-        }
-        if connector_manifest.is_file():
-            payload, err = _load_json_file(connector_manifest)
-            if err or not isinstance(payload, dict):
-                gaps.append(gap_fn("connector_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, expected_path=connector_rel))
-            else:
-                representations = {
-                    "connector_manifest_pollutant_codes": _manifest_codes_from_scalar_list(payload, "pollutant_codes"),
-                    "connector_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "pollutant_code"),
-                    "connector_manifest_pollutant_manifests": _manifest_codes_from_child_list(payload, "pollutant_manifests", "pollutant_code"),
-                    "connector_manifest_files": _manifest_pollutant_codes_from_files(payload),
-                }
-                for label, represented in representations.items():
-                    _append_field_set_gaps(
-                        gaps,
-                        domain=domain,
-                        field_label=label,
-                        actual=actual_pollutants,
-                        represented=represented,
-                        day_utc=day_utc,
-                        connector_id=connector_raw,
-                        expected_path=connector_rel,
-                        child_key="pollutant_code",
-                    )
-        elif actual_pollutants:
-            # Existing legacy/unit fixtures can contain leaf-only partitions.
-            # Treat an absent parent as repair-plannable elsewhere; this helper
-            # is specifically for validating incorrect existing parent
-            # representations without masking field-specific omissions.
-            pass
-
-    if connector_dir is not None:
-        return
-
-    day_rel = f"{data_prefix}/day_utc={day_utc}/manifest.json"
-    day_manifest = root / day_rel
-    actual_connectors = {
-        p.name.split("=", 1)[1]
-        for p in day_dir.glob("connector_id=*")
-        if p.is_dir() and (p / "manifest.json").is_file()
-    }
-    if day_manifest.is_file():
-        payload, err = _load_json_file(day_manifest)
-        if err or not isinstance(payload, dict):
-            gaps.append(gap_fn("day_manifest_invalid_json", day_utc=day_utc, expected_path=day_rel))
-        else:
-            representations = {
-                "day_manifest_connector_ids": _manifest_codes_from_scalar_list(payload, "connector_ids"),
-                "day_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "connector_id"),
-                "day_manifest_connector_manifests": _manifest_codes_from_child_list(payload, "connector_manifests", "connector_id"),
-                "day_manifest_files": _manifest_connector_ids_from_files(payload),
-            }
-            for label, represented in representations.items():
-                _append_field_set_gaps(
-                    gaps,
-                    domain=domain,
-                    field_label=label,
-                    actual=actual_connectors,
-                    represented=represented,
-                    day_utc=day_utc,
-                    expected_path=day_rel,
-                    child_key="connector_id",
-                )
-    elif actual_connectors:
-        pass
 
 
 def _rel_key_to_path(root: Path, key: str) -> Path | None:
@@ -7588,11 +7355,8 @@ def _build_v2_source_r2_mismatch_gap(
     gap["source_rows"] = source_total
     gap["r2_rows"] = r2_total_for_source
     gap["missing_timeseries_count"] = len(mismatches)
-    gap["missing_timeseries_ids"] = [entry["timeseries_id"] for entry in mismatches]
     gap["sample_missing_timeseries_ids"] = [entry["timeseries_id"] for entry in sample]
-    # Keep the complete compact mismatch set in JSON so a targeted repair can
-    # be constructed exactly; only human-facing related_paths are truncated.
-    gap["source_r2_mismatches"] = mismatches
+    gap["source_r2_mismatches"] = sample
     if source_skip_reason:
         gap["source_skip_reason"] = source_skip_reason
     evidence = gap.setdefault("source_evidence", {})
@@ -7737,40 +7501,12 @@ def run_v2_observations_integrity_checks(
                         if schema_bad:
                             gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=schema_bad))
                         files = _manifest_files(payload)
-                        local_parquet_keys = {
-                            str(p.relative_to(root))
-                            for p in sorted(local_parquets)
-                        }
-                        listed_keys: list[str] = []
-                        duplicate_keys: set[str] = set()
-                        for entry in files:
-                            if isinstance(entry, dict) and str(entry.get("key") or "").strip():
-                                key_str = str(entry.get("key")).strip().lstrip("/")
-                                if key_str in listed_keys:
-                                    duplicate_keys.add(key_str)
-                                listed_keys.append(key_str)
-                        listed_key_set = set(listed_keys)
-                        if duplicate_keys:
-                            gaps.append(_v2_obs_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
                         if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(files):
-                            gaps.append(_v2_obs_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
-                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(local_parquet_keys):
-                            gaps.append(_v2_obs_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match actual parquet file count"]))
-                        for missing_key in sorted(listed_key_set - local_parquet_keys):
-                            gaps.append(_v2_obs_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
-                        for unlisted_key in sorted(local_parquet_keys - listed_key_set):
-                            gaps.append(_v2_obs_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
-                        if "total_bytes" in payload and isinstance(payload.get("total_bytes"), int):
-                            actual_bytes = sum((root / key).stat().st_size for key in local_parquet_keys if (root / key).is_file())
-                            if int(payload.get("total_bytes") or 0) != actual_bytes:
-                                gaps.append(_v2_obs_gap("data_manifest_total_bytes_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"manifest_total_bytes={payload.get('total_bytes')} actual_total_bytes={actual_bytes}"]))
-                        ts_sum = sum(_normalize_timeseries_row_counts(payload.get("timeseries_row_counts")).values())
-                        if "row_count" in payload and isinstance(payload.get("row_count"), int) and ts_sum != int(payload.get("row_count") or 0):
-                            gaps.append(_v2_obs_gap("data_manifest_timeseries_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"row_count={payload.get('row_count')} timeseries_sum={ts_sum}"]))
-                        if "row_count" in payload and (not isinstance(payload.get("row_count"), int) or int(payload.get("row_count") or 0) < 0):
+                            gaps.append(_v2_obs_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
+                        if "row_count" in payload and (not isinstance(payload.get("row_count"), int) or int(payload.get("row_count") or 0) <= 0):
                             gaps.append(_v2_obs_gap("data_manifest_empty", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
-                        if "source_row_count" in payload and (not isinstance(payload.get("source_row_count"), int) or int(payload.get("source_row_count") or 0) < 0):
-                            gaps.append(_v2_obs_gap("data_manifest_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a non-negative integer"]))
+                        if "source_row_count" in payload and (not isinstance(payload.get("source_row_count"), int) or int(payload.get("source_row_count") or 0) <= 0):
+                            gaps.append(_v2_obs_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
                         if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
                             gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                         for entry in files:
@@ -7826,68 +7562,15 @@ def run_v2_observations_integrity_checks(
                         )
                         if stale_gap is not None:
                             gaps.append(stale_gap)
-            _validate_v2_parent_hierarchy(
-                root=root,
-                data_prefix=data_prefix,
-                day_utc=day_utc,
-                connector_dir=connector_dir,
-                day_dir=day_dir,
-                gaps=gaps,
-                domain="observations",
-            )
-        _validate_v2_parent_hierarchy(
-            root=root,
-            data_prefix=data_prefix,
-            day_utc=day_utc,
-            connector_dir=None,
-            day_dir=day_dir,
-            gaps=gaps,
-            domain="observations",
-        )
 
-    _enrich_v2_observations_repair_plans(
-        root=root,
-        gaps=gaps,
-        source_scope=source_scope,
-    )
+    _enrich_v2_observations_repair_plans(root=root, gaps=gaps)
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
     result = {"status": status, "checked_partitions": checked, "gap_count": len(gaps), "gaps": gaps}
     if source_scope is not None:
         result["source_scope"] = source_scope
     if log:
         log.info("v2 observations integrity done status=%s checked_partitions=%s gaps=%s", status, checked, len(gaps))
-        _log_v2_integrity_gaps(log, "observations", gaps)
     return result
-
-
-def _log_v2_integrity_gaps(
-    log: logging.Logger,
-    domain: str,
-    gaps: Iterable[Mapping[str, Any]],
-    *,
-    limit: int = 100,
-) -> None:
-    gap_list = list(gaps)
-    for gap in gap_list[:limit]:
-        compact = {
-            key: gap.get(key)
-            for key in (
-                "gap_type", "day_utc", "connector_id", "pollutant_code",
-                "expected_path", "source_rows", "r2_rows",
-                "missing_timeseries_count", "sample_missing_timeseries_ids",
-                "source_evidence", "related_paths",
-            )
-            if gap.get(key) not in (None, [], {})
-        }
-        log.warning(
-            "v2 integrity gap %s",
-            json.dumps({"event": "v2_integrity_gap", "domain": domain, **compact}, sort_keys=True, default=str),
-        )
-    if len(gap_list) > limit:
-        log.warning(
-            "v2 integrity gaps truncated %s",
-            json.dumps({"event": "v2_integrity_gaps_truncated", "domain": domain, "logged": limit, "total": len(gap_list)}, sort_keys=True),
-        )
 
 
 
@@ -8096,7 +7779,6 @@ def run_v2_aqilevels_integrity_checks(
     to_day: str | None,
     allowed_connector_ids: set[int] | None = None,
     source_scope: dict[str, Any] | None = None,
-    conn: sqlite3.Connection | None = None,
     check_aqi_debug: bool = False,
     require_aqi_debug: bool = False,
     log: logging.Logger | None = None,
@@ -8237,24 +7919,6 @@ def run_v2_aqilevels_integrity_checks(
                         data_gaps.append(_v2_aqi_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                     elif not idx_payload.get("timeseries_row_counts"):
                         data_gaps.append(_v2_aqi_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-            _validate_v2_parent_hierarchy(
-                root=root,
-                data_prefix=data_prefix,
-                day_utc=day_utc,
-                connector_dir=connector_dir,
-                day_dir=day_dir,
-                gaps=data_gaps,
-                domain="aqilevels",
-            )
-        _validate_v2_parent_hierarchy(
-            root=root,
-            data_prefix=data_prefix,
-            day_utc=day_utc,
-            connector_dir=None,
-            day_dir=day_dir,
-            gaps=data_gaps,
-            domain="aqilevels",
-        )
 
     debug_status = "skipped"
     if check_aqi_debug:
@@ -8304,7 +7968,6 @@ def run_v2_aqilevels_integrity_checks(
                 config=config,
                 day_utc=day_utc,
                 connector_id=connector_id,
-                conn=conn,
             ))
 
     all_gaps = data_gaps + debug_gaps
@@ -8329,8 +7992,6 @@ def run_v2_aqilevels_integrity_checks(
         result["source_scope"] = source_scope
     if log:
         log.info("v2 AQI integrity done status=%s checked_partitions=%s gaps=%s debug_gaps=%s", status, checked, len(data_gaps), len(debug_gaps))
-        _log_v2_integrity_gaps(log, "aqilevels", data_gaps)
-        _log_v2_integrity_gaps(log, "aqilevels_debug", debug_gaps)
     return result
 
 
@@ -8367,7 +8028,6 @@ def run_v2_post_repair_integrity_rechecks(
         to_day=to_day,
         allowed_connector_ids=allowed_connector_ids,
         source_scope=source_scope,
-        conn=conn,
         check_aqi_debug=check_aqi_debug,
         require_aqi_debug=require_aqi_debug,
         log=log,
@@ -9070,14 +8730,12 @@ def queue_v2_aqi_rebuilds_from_integrity_gaps(
     run_backfill: bool,
     log: logging.Logger,
     allowed_connector_ids: set[int] | None = None,
-    blocked_connector_days: set[tuple[str, int]] | None = None,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "v2_aqi_integrity_rebuild_bridge_ran": False,
         "v2_aqi_rebuilds_queued_from_integrity": 0,
         "v2_aqi_rebuilds_skipped_missing_observation_evidence": 0,
         "v2_aqi_rebuilds_skipped_non_executable_gap": 0,
-        "v2_aqi_rebuilds_skipped_observation_repair_unverified": 0,
         "planned_v2_aqi_rebuilds_from_integrity": [],
         "planned_aqi_rebuild_connector_days": [],
         "queued_aqi_only_connector_days": [],
@@ -9108,9 +8766,6 @@ def queue_v2_aqi_rebuilds_from_integrity_gaps(
         elif allowed_connector_ids is not None and connector_id not in allowed_connector_ids:
             skip_reason = "outside_source_scope"
             metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
-        elif (day_utc, connector_id) in (blocked_connector_days or set()):
-            skip_reason = "observation_repair_not_verified"
-            metrics["v2_aqi_rebuilds_skipped_observation_repair_unverified"] += 1
         elif not observations_present:
             skip_reason = "missing_v2_observation_evidence"
             metrics["v2_aqi_rebuilds_skipped_missing_observation_evidence"] += 1
@@ -9531,43 +9186,12 @@ def _v2_observation_connector_ids_for_aqi_validation(
     return sorted(connector_ids)
 
 
-def _active_aqi_eligible_pollutants_for_connector(
-    conn: sqlite3.Connection | None,
-    *,
-    connector_id: int,
-) -> set[str] | None:
-    """Return authoritative AQI-eligible codes, or None to fail closed."""
-    if conn is None or not _table_exists(conn, "core_observed_property_mappings_snapshot"):
-        return None
-    active_count = conn.execute(
-        "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot "
-        "WHERE connector_id = ? AND is_active = 1",
-        (int(connector_id),),
-    ).fetchone()
-    if not active_count or int(active_count[0] or 0) <= 0:
-        return None
-    rows = conn.execute(
-        """
-        SELECT DISTINCT observed_property_code
-        FROM core_observed_property_mappings_snapshot
-        WHERE connector_id = ?
-          AND is_active = 1
-          AND is_aqi_eligible = 1
-          AND observed_property_code IS NOT NULL
-          AND observed_property_code != ''
-        """,
-        (int(connector_id),),
-    ).fetchall()
-    return {str(row[0]).strip() for row in rows if str(row[0] or "").strip()}
-
-
 def _v2_aqi_observation_coverage_gaps(
     *,
     root: Path,
     config: HistoryPathConfig,
     day_utc: str,
     connector_id: int,
-    conn: sqlite3.Connection | None = None,
     missing_manifest_gap_type: str = "aqi_manifest_missing_after_obs_repair",
     rows_low_gap_type: str = "aqi_rows_below_observation_rows",
     missing_observations_gap_type: str | None = None,
@@ -9594,15 +9218,8 @@ def _v2_aqi_observation_coverage_gaps(
             ))
         return gaps
 
-    eligible_pollutants = _active_aqi_eligible_pollutants_for_connector(
-        conn,
-        connector_id=connector_id,
-    )
-
     for obs_dir in obs_pollutant_dirs:
         pollutant = obs_dir.name.split("=", 1)[1]
-        if eligible_pollutants is not None and pollutant not in eligible_pollutants:
-            continue
         obs_manifest_rel = _v2_partition_manifest_rel(
             prefix=obs_prefix,
             day_utc=day_utc,
@@ -9740,8 +9357,7 @@ def _verify_v2_observation_manifest_content_for_aqi(
         "manifest_pollutant_codes": sorted(manifest_pollutants),
     })
     if expected_min_rows > 0 and manifest_rows < expected_min_rows:
-        details["shortfall_rows"] = expected_min_rows - manifest_rows
-        return False, "manifest_total_rows_below_expected", details
+        return False, f"manifest_rows_below_expected:{manifest_rows}<{expected_min_rows}", details
 
     missing_timeseries: list[int] = []
     low_count_timeseries: list[str] = []
@@ -9761,129 +9377,57 @@ def _verify_v2_observation_manifest_content_for_aqi(
     if missing_timeseries:
         details["missing_timeseries_ids"] = missing_timeseries[:25]
         details["missing_timeseries_count"] = len(missing_timeseries)
-        return False, "manifest_missing_timeseries", details
+        return False, f"manifest_missing_timeseries:{len(missing_timeseries)}", details
     if low_count_timeseries:
         details["low_count_timeseries"] = low_count_timeseries[:25]
         details["low_count_timeseries_count"] = len(low_count_timeseries)
-        details["shortfall_rows"] = sum(
-            max(0, int(expected_timeseries_row_counts[timeseries_id]) - int(manifest_counts.get(timeseries_id, 0) or 0))
-            for timeseries_id in expected_timeseries_row_counts
-        )
-        return False, "manifest_timeseries_rows_below_expected", details
+        return False, f"manifest_timeseries_counts_low:{len(low_count_timeseries)}", details
 
     expected_pollutants = set(details["expected_pollutant_codes"])
     missing_pollutants = sorted(expected_pollutants - manifest_pollutants)
     if missing_pollutants:
         details["missing_pollutant_codes"] = missing_pollutants
-        return False, "manifest_missing_pollutant", details
+        return False, f"manifest_missing_pollutants:{','.join(missing_pollutants)}", details
     return True, None, details
 
 
-def _timeseries_ids_for_v2_observation_gap(
-    conn: sqlite3.Connection,
+def _source_counts_exceed_repaired_manifest_diagnostic(
     *,
-    connector_id: int,
-    gap: Mapping[str, Any],
-) -> list[int]:
-    explicit_ids: set[int] = set()
-    for raw_id in list(gap.get("missing_timeseries_ids") or []):
-        try:
-            timeseries_id = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-        if timeseries_id > 0:
-            explicit_ids.add(timeseries_id)
-    for row in list(gap.get("source_r2_mismatches") or []):
-        if not isinstance(row, Mapping):
-            continue
-        try:
-            timeseries_id = int(row.get("timeseries_id") or 0)
-        except (TypeError, ValueError):
-            continue
-        if timeseries_id > 0:
-            explicit_ids.add(timeseries_id)
-    if not explicit_ids:
-        for raw_id in list(gap.get("sample_missing_timeseries_ids") or []):
-            try:
-                timeseries_id = int(raw_id)
-            except (TypeError, ValueError):
-                continue
-            if timeseries_id > 0:
-                explicit_ids.add(timeseries_id)
-    if explicit_ids:
-        return sorted(explicit_ids)
-    pollutant_code = _uk_air_normalize_pollutant_code(gap.get("pollutant_code"))
-    if pollutant_code and _table_exists(conn, "core_phenomena_snapshot"):
-        rows = conn.execute(
-            """
-            SELECT t.id, p.label, p.source_label, p.pollutant_label
-            FROM core_timeseries_snapshot t
-            JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
-            WHERE t.connector_id = ?
-              AND (t.ended_at IS NULL OR trim(t.ended_at) = '')
-            ORDER BY t.id
-            """,
-            (int(connector_id),),
-        ).fetchall()
-        matched = [
-            int(row[0])
-            for row in rows
-            if any(
-                _uk_air_normalize_pollutant_code(value) == pollutant_code
-                for value in row[1:]
-            )
-        ]
-        if matched:
-            return sorted(set(matched))
-    return _timeseries_ids_for_connector(conn, connector_id)
-
-
-def _sos_day_scoped_expected_counts(
-    conn: sqlite3.Connection,
-    *,
-    day_utc: str,
-    connector_id: int,
-    timeseries_ids: Iterable[int],
-) -> tuple[dict[int, int], list[str]]:
-    requested_ids = sorted({int(value) for value in timeseries_ids if int(value) > 0})
-    if not requested_ids:
-        return {}, []
-    placeholders = ",".join("?" for _ in requested_ids)
-    rows = conn.execute(
-        f"""
-        SELECT
-          c.timeseries_id,
-          SUM(c.row_count) AS expected_rows,
-          p.label,
-          p.source_label,
-          p.pollutant_label
-        FROM source_file_timeseries_counts c
-        JOIN source_file_state s ON s.source_file_key = c.source_file_key
-        JOIN core_timeseries_snapshot t ON t.id = c.timeseries_id
-        LEFT JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
-        WHERE c.day_utc = ?
-          AND t.connector_id = ?
-          AND c.timeseries_id IN ({placeholders})
-          AND c.row_count > 0
-          AND s.source_key = ?
-          AND s.remote_scheme = 'uk_air_flat_file'
-          AND s.exists_remote = 1
-        GROUP BY c.timeseries_id, p.label, p.source_label, p.pollutant_label
-        ORDER BY c.timeseries_id
-        """,
-        (day_utc, int(connector_id), *requested_ids, SOS_SOURCE_KEY),
-    ).fetchall()
-    counts: dict[int, int] = {}
-    pollutants: set[str] = set()
-    for row in rows:
-        timeseries_id = int(row[0])
-        counts[timeseries_id] = counts.get(timeseries_id, 0) + int(row[1] or 0)
-        for raw_label in row[2:]:
-            pollutant = _uk_air_normalize_pollutant_code(raw_label)
-            if pollutant:
-                pollutants.add(pollutant)
-                break
-    return counts, sorted(pollutants)
+    source_timeseries_row_counts: Mapping[int, int],
+    manifest_guard_details: Mapping[str, Any],
+    repaired_observation_rows: int,
+) -> dict[str, Any] | None:
+    source_counts = _normalize_timeseries_row_counts(source_timeseries_row_counts)
+    source_rows = sum(source_counts.values())
+    try:
+        manifest_rows = int(manifest_guard_details.get("manifest_rows") or 0)
+    except (TypeError, ValueError):
+        manifest_rows = 0
+    if source_rows <= 0 or source_rows <= manifest_rows:
+        return None
+    manifest_counts = _normalize_timeseries_row_counts(
+        manifest_guard_details.get("manifest_timeseries_row_counts")
+    )
+    low_count_timeseries: list[str] = []
+    for timeseries_id, source_count in sorted(source_counts.items()):
+        observed_count = int(manifest_counts.get(timeseries_id, 0) or 0)
+        if observed_count < source_count:
+            low_count_timeseries.append(f"{timeseries_id}:{observed_count}<{source_count}")
+        if len(low_count_timeseries) >= 25:
+            break
+    return {
+        "diagnostic_type": "source_counts_exceed_repaired_manifest",
+        "source_rows_from_counts": source_rows,
+        "manifest_rows": manifest_rows,
+        "repaired_observation_rows": int(repaired_observation_rows or 0),
+        "source_minus_manifest": source_rows - manifest_rows,
+        "low_count_timeseries": low_count_timeseries,
+        "low_count_timeseries_count": sum(
+            1
+            for timeseries_id, source_count in source_counts.items()
+            if int(manifest_counts.get(timeseries_id, 0) or 0) < source_count
+        ),
+    }
 
 
 def run_cross_check_backfills(
@@ -9941,6 +9485,12 @@ def run_cross_check_backfills(
         source_filter=source_filter,
     )
     source_change_targets: dict[tuple[str, int], list[int]] = {}
+    if source_filter in {"sos", "all"} and _resolve_sos_source_mode(env) == "sos_api":
+        source_change_targets = _collect_sos_source_change_targets(
+            conn,
+            source_filter=source_filter,
+            sos_metrics=sos_metrics,
+        )
     metrics["source_change_candidate_days"] = len(
         {day_iso for day_iso, _ in source_change_targets.keys()}
     )
@@ -10902,22 +10452,6 @@ def _set_v2_source_repair_plan(
         }
 
 
-def _v2_observations_index_rebuild_command(
-    day_utc: str,
-    connector_id: int,
-) -> list[str]:
-    return [
-        "node",
-        "scripts/backup_r2/uk_aq_build_r2_history_index.mjs",
-        "--history-version", "v2",
-        "--targeted",
-        "--kind", "observations",
-        "--from-day", day_utc,
-        "--to-day", day_utc,
-        "--connector-id", str(int(connector_id)),
-    ]
-
-
 def run_v2_gap_backfills(
     *,
     conn: sqlite3.Connection,
@@ -10968,9 +10502,8 @@ def run_v2_gap_backfills(
     gaps = list(v2_observations.get("gaps") or [])
     if not gaps:
         return metrics
-    by_key_sets: dict[tuple[str, int], set[int]] = {}
+    by_key: dict[tuple[str, int], list[int]] = {}
     gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
-    index_only_keys: set[tuple[str, int]] = set()
     for gap in gaps:
         day_iso = str(gap.get("day_utc") or "").strip()
         try:
@@ -10979,54 +10512,16 @@ def run_v2_gap_backfills(
             continue
         if not day_iso or connector_id <= 0:
             continue
-        if (
-            str(gap.get("gap_type") or "").startswith("index_")
-            or str((gap.get("suggested_repair") or {}).get("kind") or "")
-            == "rebuild_v2_observations_index_only"
-        ):
-            index_only_keys.add((day_iso, connector_id))
-            continue
-        ts_ids = _timeseries_ids_for_v2_observation_gap(
-            conn,
-            connector_id=connector_id,
-            gap=gap,
-        )
+        ts_ids = _timeseries_ids_for_connector(conn, connector_id)
         if ts_ids:
-            by_key_sets.setdefault((day_iso, connector_id), set()).update(ts_ids)
+            by_key[(day_iso, connector_id)] = ts_ids
             gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
-    by_key = {key: sorted(values) for key, values in by_key_sets.items()}
-    standalone_index_keys = sorted(index_only_keys - set(by_key))
     metrics["observation_backfill_candidate_days"] = len(by_key)
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     backfill_log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     queued: set[tuple[str, int]] = set()
-    for day_iso, connector_id in standalone_index_keys:
-        idx_cmd = _v2_observations_index_rebuild_command(day_iso, connector_id)
-        metrics["planned_v2_observation_index_rebuilds"].append(" ".join(idx_cmd))
-        if dry_run:
-            continue
-        metrics["v2_observation_index_rebuilds_attempted"] += 1
-        result = subprocess.run(
-            idx_cmd,
-            cwd=Path(__file__).resolve().parents[3],
-            env={**os.environ, **env},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            metrics["v2_observation_index_rebuilds_ok"] += 1
-        else:
-            metrics["v2_observation_index_rebuilds_failed"] += 1
-            log.warning(
-                "v2 observation index-only rebuild failed day=%s connector_id=%s exit_code=%s stderr=%s",
-                day_iso,
-                connector_id,
-                result.returncode,
-                _truncate_text(result.stderr or result.stdout or "", 2000),
-            )
     for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
         day_obj = dt.date.fromisoformat(day_iso)
         chunks = _chunk_v2_observation_repair_timeseries_ids(ts_ids)
@@ -11035,7 +10530,7 @@ def run_v2_gap_backfills(
             for chunk_ids in chunks
         ]
         first_cmd = planned_cmds[0] if planned_cmds else None
-        idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
+        idx_cmd = f"node scripts/backup_r2/uk_aq_build_r2_history_index.mjs --history-version v2 --targeted --kind observations --from-day {day_iso} --to-day {day_iso} --connector-id {connector_id}"
         if dry_run:
             metrics["planned_v2_observation_repairs"].extend(planned_cmds)
             metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
@@ -11141,31 +10636,7 @@ def run_v2_gap_backfills(
         )
         source_pollutant_codes = list(combined.get("source_pollutant_codes") or [])
         source_rows_from_counts = sum(source_timeseries_row_counts.values())
-        source_scope = v2_observations.get("source_scope")
-        sos_scope = isinstance(source_scope, Mapping) and str(source_scope.get("source") or "").strip().lower() == "sos"
-        expected_timeseries_row_counts = repaired_timeseries_row_counts
-        expected_pollutant_codes = source_pollutant_codes
-        expected_counts_source = "backfill_repaired_rows"
-        expected_counts_scope_valid = True
-        if sos_scope:
-            expected_timeseries_row_counts, expected_pollutant_codes = (
-                _sos_day_scoped_expected_counts(
-                    conn,
-                    day_utc=day_iso,
-                    connector_id=connector_id,
-                    timeseries_ids=ts_ids,
-                )
-            )
-            expected_counts_source = "source_file_timeseries_counts"
-            expected_counts_scope_valid = bool(expected_timeseries_row_counts) and bool(
-                expected_pollutant_codes
-            )
-        expected_min_manifest_rows = sum(expected_timeseries_row_counts.values())
-        if not sos_scope:
-            expected_min_manifest_rows = max(
-                expected_min_manifest_rows,
-                repaired_observation_rows,
-            )
+        expected_min_manifest_rows = repaired_observation_rows
         source_pending = wrapper_ok and (
             pending_events > 0
             or str(backfill_run_status or "").strip() == "stubbed"
@@ -11189,49 +10660,25 @@ def run_v2_gap_backfills(
             and process_guard_ok
         )
         if should_verify_manifest:
-            if not expected_counts_scope_valid:
-                manifest_guard_ok = False
-                manifest_guard_reason = "expected_counts_scope_invalid"
-                manifest_guard_details = {
-                    "requested_day": day_iso,
-                    "requested_connector_id": connector_id,
-                    "requested_timeseries_count": len(ts_ids),
-                    "expected_counts_source": expected_counts_source,
-                }
-            else:
-                manifest_guard_ok, manifest_guard_reason, manifest_guard_details = (
-                    _verify_v2_observation_manifest_content_for_aqi(
-                        day_utc=day_iso,
-                        connector_id=connector_id,
-                        env=env,
-                        expected_timeseries_row_counts=expected_timeseries_row_counts,
-                        expected_pollutant_codes=expected_pollutant_codes,
-                        expected_min_rows=expected_min_manifest_rows,
-                    )
+            manifest_guard_ok, manifest_guard_reason, manifest_guard_details = (
+                _verify_v2_observation_manifest_content_for_aqi(
+                    day_utc=day_iso,
+                    connector_id=connector_id,
+                    env=env,
+                    expected_timeseries_row_counts=repaired_timeseries_row_counts,
+                    expected_pollutant_codes=source_pollutant_codes,
+                    expected_min_rows=expected_min_manifest_rows,
                 )
-            manifest_guard_details.update({
-                "requested_day": day_iso,
-                "requested_connector_id": connector_id,
-                "requested_timeseries_count": len(ts_ids),
-                "expected_counts_source": expected_counts_source,
-                "expected_source_rows_for_day": expected_min_manifest_rows,
-                "expected_timeseries_row_counts_for_day": {
-                    str(timeseries_id): count
-                    for timeseries_id, count in sorted(expected_timeseries_row_counts.items())
-                },
-                "repair_output_rows": repaired_observation_rows,
-            })
-            log.info(
-                "v2 observation manifest guard day=%s connector_id=%s requested_timeseries=%s expected_rows=%s repair_output_rows=%s manifest_rows=%s result=%s reason=%s",
-                day_iso,
-                connector_id,
-                len(ts_ids),
-                expected_min_manifest_rows,
-                repaired_observation_rows,
-                manifest_guard_details.get("manifest_rows"),
-                "pass" if manifest_guard_ok else "fail",
-                manifest_guard_reason,
             )
+        source_manifest_diagnostic = (
+            _source_counts_exceed_repaired_manifest_diagnostic(
+                source_timeseries_row_counts=source_timeseries_row_counts,
+                manifest_guard_details=manifest_guard_details,
+                repaired_observation_rows=repaired_observation_rows,
+            )
+            if should_verify_manifest and manifest_guard_details
+            else None
+        )
         repair_ok = (
             wrapper_ok
             and not source_pending
@@ -11246,10 +10693,7 @@ def run_v2_gap_backfills(
             repair_status = "ok"
         elif no_observation_rows:
             repair_status = "no_observations"
-        elif wrapper_ok and repaired_observation_rows > 0 and (
-            not process_guard_ok
-            or not manifest_guard_ok
-        ):
+        elif wrapper_ok and repaired_observation_rows > 0 and (not process_guard_ok or not manifest_guard_ok):
             repair_status = "guard_failed"
         else:
             repair_status = "failed"
@@ -11283,21 +10727,8 @@ def run_v2_gap_backfills(
             "source_pollutant_codes": sorted({str(code) for code in source_pollutant_codes}),
             "source_mapped_rows": int(combined.get("source_mapped_rows") or 0),
             "source_rows_from_counts": source_rows_from_counts,
-            "expected_counts_source": expected_counts_source,
-            "expected_source_rows_for_day": expected_min_manifest_rows,
-            "expected_timeseries_row_counts_for_day": {
-                str(timeseries_id): count
-                for timeseries_id, count in sorted(expected_timeseries_row_counts.items())
-            },
-            "expected_pollutant_codes": sorted({str(code) for code in expected_pollutant_codes}),
-            "aqi_rebuild_guard_ok": (
-                process_guard_ok
-                and manifest_guard_ok
-            ),
-            "aqi_rebuild_guard_reason": (
-                process_guard_reason
-                or manifest_guard_reason
-            ),
+            "aqi_rebuild_guard_ok": process_guard_ok and manifest_guard_ok,
+            "aqi_rebuild_guard_reason": process_guard_reason or manifest_guard_reason,
             "aqi_rebuild_process_guard_ok": process_guard_ok,
             "aqi_rebuild_process_guard_reason": process_guard_reason,
             "aqi_rebuild_manifest_guard_ok": manifest_guard_ok,
@@ -11314,17 +10745,7 @@ def run_v2_gap_backfills(
             "chunks": [
                 {
                     "chunk_index": i,
-                    "chunk_timeseries_ids": list(chunks[i - 1]) if i - 1 < len(chunks) else [],
                     "timeseries_id_count": len(chunks[i - 1]) if i - 1 < len(chunks) else None,
-                    "chunk_expected_counts": {
-                        str(timeseries_id): expected_timeseries_row_counts[timeseries_id]
-                        for timeseries_id in (chunks[i - 1] if i - 1 < len(chunks) else [])
-                        if timeseries_id in expected_timeseries_row_counts
-                    },
-                    "chunk_expected_rows": sum(
-                        expected_timeseries_row_counts.get(timeseries_id, 0)
-                        for timeseries_id in (chunks[i - 1] if i - 1 < len(chunks) else [])
-                    ),
                     "status": result.get("status"),
                     "exit_code": result.get("exit_code"),
                     "error": result.get("error"),
@@ -11353,6 +10774,9 @@ def run_v2_gap_backfills(
                 for i, result in enumerate(chunk_results, start=1)
             ],
         }
+        if source_manifest_diagnostic is not None:
+            repair_entry["source_counts_exceed_repaired_manifest"] = source_manifest_diagnostic
+            repair_entry["non_blocking_diagnostics"] = [source_manifest_diagnostic]
         metrics["v2_observation_repair_results"].append(repair_entry)
         if repair_ok:
             metrics["v2_observation_repairs_ok"] += 1
@@ -11665,7 +11089,6 @@ def run_aqi_rebuild_queue_execution(
                     config=resolve_history_path_config("v2", env),
                     day_utc=day_iso,
                     connector_id=int(connector_scope),
-                    conn=conn,
                     missing_observations_gap_type="aqi_missing_after_obs_repair",
                 )
             else:
@@ -12474,7 +11897,7 @@ def collect_preflight_errors(
             except Exception as exc:  # pragma: no cover - defensive
                 errors.append(f"required Python module '{module_name}' failed to import ({exc}).")
 
-    if args.source in {"sos", "all"}:
+    if args.source in {"sos", "all"} and _resolve_sos_source_mode(os.environ) == "uk_air_flat_files":
         flat_file_supabase = _resolve_ingestdb_supabase_rest_config(os.environ)
         if not flat_file_supabase.get("supabase_url"):
             errors.append(
@@ -13125,10 +12548,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Missing:        {sos.get('missing', 0)}",
             f"- Temporary errors:{sos.get('temporary_errors', 0)}",
             f"- Permanent errors:{sos.get('permanent_errors', 0)}",
-            f"- Actionable mapping groups: {sos.get('unmapped_source_groups', 0)}",
-            f"- Actionable mapping rows: {sos.get('unmapped_source_rows', 0)}",
-            f"- Out-of-window mapping groups: {sos.get('out_of_window_unmapped_groups', 0)}",
-            f"- Out-of-window mapping rows: {sos.get('out_of_window_unmapped_rows', 0)}",
             f"- Rows counted:   {sos.get('rows_counted', 0)}",
             f"- Downloaded MB:  {round(sos.get('downloaded_bytes', 0) / (1024 * 1024), 4)}",
             f"- Cache keep policy: {sos.get('keep_api_snapshots_policy') or '(default)'}",
@@ -13141,23 +12560,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
         ])
         if sos.get("skipped_reason"):
             lines.append(f"- Skipped reason: {sos['skipped_reason']}")
-        mapping_issues = list(sos.get("actionable_mapping_issues") or [])
-        if mapping_issues:
-            lines.extend([
-                "",
-                "### Actionable SOS mapping issues",
-                "",
-                "| Site | Day | Pollutant | Source rows | Status |",
-                "| --- | --- | --- | ---: | --- |",
-            ])
-            for issue in mapping_issues[:25]:
-                lines.append(
-                    f"| {issue.get('site_ref', '')} | {issue.get('day_utc', '')} | "
-                    f"{issue.get('pollutant_code', '')} | {issue.get('source_rows', 0)} | "
-                    f"{issue.get('mapping_status', '')} |"
-                )
-            if len(mapping_issues) > 25:
-                lines.append(f"\n- ... {len(mapping_issues) - 25} more mapping issues")
         sos_first_seen = sos.get("first_seen_files") or []
         if sos_first_seen:
             lines.extend(["", "### First-seen station/day snapshots (sos, baselined — not backfilled)", ""])
@@ -13798,7 +13200,6 @@ def main(argv: list[str]) -> int:
                 to_day=to_day,
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
-                conn=conn,
                 check_aqi_debug=bool(args.check_aqi_debug),
                 require_aqi_debug=bool(args.require_aqi_debug),
                 log=log,
@@ -13852,7 +13253,6 @@ def main(argv: list[str]) -> int:
                     to_day=to_day,
                     allowed_connector_ids=v2_allowed_connector_ids,
                     source_scope=v2_source_scope,
-                    conn=conn,
                     check_aqi_debug=bool(args.check_aqi_debug),
                     require_aqi_debug=bool(args.require_aqi_debug),
                     log=log,
@@ -13926,16 +13326,6 @@ def main(argv: list[str]) -> int:
             if history_version_mode == "v2":
                 existing_planned_aqi_rows = list(cross_check_metrics.get("planned_aqi_rebuild_connector_days") or [])
                 existing_aqi_only_rows = list(cross_check_metrics.get("queued_aqi_only_connector_days") or [])
-                observation_gap_keys = {
-                    (str(gap.get("day_utc") or ""), int(gap.get("connector_id") or 0))
-                    for gap in list((cross_check_metrics.get("v2_observations") or {}).get("gaps") or [])
-                    if str(gap.get("day_utc") or "") and int(gap.get("connector_id") or 0) > 0
-                }
-                verified_repair_keys = {
-                    (str(result.get("day_utc") or ""), int(result.get("connector_id") or 0))
-                    for result in list(cross_check_metrics.get("v2_observation_repair_results") or [])
-                    if result.get("status") == "ok"
-                }
                 v2_aqi_integrity_queue_metrics = queue_v2_aqi_rebuilds_from_integrity_gaps(
                     conn=conn,
                     run_id=int(run_id),
@@ -13946,7 +13336,6 @@ def main(argv: list[str]) -> int:
                     run_backfill=args.run_backfill,
                     log=log,
                     allowed_connector_ids=v2_allowed_connector_ids,
-                    blocked_connector_days=observation_gap_keys - verified_repair_keys,
                 )
                 cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
                 cross_check_metrics["planned_aqi_rebuild_connector_days"] = [

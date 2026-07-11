@@ -43,22 +43,6 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
                 "source_row_count": 3, "file_count": 1,
                 "timeseries_row_counts": {"101": 3}, "files": [{"key": key}],
             }), encoding="utf-8")
-            connector_manifest = part.parent / "manifest.json"
-            connector_manifest.write_text(json.dumps({
-                "history_version": "v2", "domain": "observations", "day_utc": day,
-                "connector_id": 7, "pollutant_codes": ["pm25"],
-                "child_manifests": [{"pollutant_code": "pm25", "key": f"history/v2/observations/day_utc={day}/connector_id=7/pollutant_code=pm25/manifest.json"}],
-                "pollutant_manifests": [{"pollutant_code": "pm25", "key": f"history/v2/observations/day_utc={day}/connector_id=7/pollutant_code=pm25/manifest.json"}],
-                "files": [{"pollutant_code": "pm25", "key": key}],
-            }), encoding="utf-8")
-            day_manifest = part.parent.parent / "manifest.json"
-            day_manifest.write_text(json.dumps({
-                "history_version": "v2", "domain": "observations", "day_utc": day,
-                "connector_ids": [7],
-                "child_manifests": [{"connector_id": 7, "key": f"history/v2/observations/day_utc={day}/connector_id=7/manifest.json"}],
-                "connector_manifests": [{"connector_id": 7, "key": f"history/v2/observations/day_utc={day}/connector_id=7/manifest.json"}],
-                "files": [{"connector_id": 7, "key": key}],
-            }), encoding="utf-8")
         if index:
             idx = self._index(day=day)
             idx.mkdir(parents=True, exist_ok=True)
@@ -137,86 +121,24 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertEqual(results["v1"]["status"], "checked")
         self.assertEqual(results["v2"]["status"], "fail")
 
-    def test_connector_manifest_reports_missing_child_manifest_even_when_pollutant_code_present(self) -> None:
-        self._write_healthy()
-        o3 = self._partition(pollutant="o3")
-        o3.mkdir(parents=True, exist_ok=True)
-        key = "history/v2/observations/day_utc=2026-06-11/connector_id=7/pollutant_code=o3/part-00000.parquet"
-        (self.root / key).write_bytes(b"PAR1")
-        (o3 / "manifest.json").write_text(json.dumps({
-            "history_version": "v2", "domain": "observations", "day_utc": "2026-06-11",
-            "connector_id": 7, "pollutant_code": "o3", "row_count": 1,
-            "source_row_count": 1, "file_count": 1,
-            "timeseries_row_counts": {"102": 1}, "files": [{"key": key}],
-        }), encoding="utf-8")
-        connector_manifest = o3.parent / "manifest.json"
-        payload = json.loads(connector_manifest.read_text(encoding="utf-8"))
-        payload["pollutant_codes"].append("o3")
-        connector_manifest.write_text(json.dumps(payload), encoding="utf-8")
 
-        result = self._run()
-
-        self.assertIn("connector_manifest_child_manifests_missing_child", self._gap_types(result))
-        self.assertIn("connector_manifest_pollutant_manifests_missing_child", self._gap_types(result))
-        self.assertIn("connector_manifest_files_missing_child", self._gap_types(result))
-
-    def test_day_manifest_reports_missing_connector_representation_independently(self) -> None:
-        self._write_healthy()
-        conn8 = self.root / "history/v2/observations/day_utc=2026-06-11/connector_id=8"
-        conn8.mkdir(parents=True, exist_ok=True)
-        (conn8 / "manifest.json").write_text(json.dumps({
-            "history_version": "v2", "domain": "observations", "day_utc": "2026-06-11",
-            "connector_id": 8, "pollutant_codes": [], "child_manifests": [],
-            "pollutant_manifests": [], "files": [],
-        }), encoding="utf-8")
-        day_manifest = conn8.parent / "manifest.json"
-        payload = json.loads(day_manifest.read_text(encoding="utf-8"))
-        payload["connector_ids"].append(8)
-        day_manifest.write_text(json.dumps(payload), encoding="utf-8")
-
-        result = self._run()
-
-        self.assertIn("day_manifest_child_manifests_missing_child", self._gap_types(result))
-        self.assertIn("day_manifest_connector_manifests_missing_child", self._gap_types(result))
-        self.assertIn("day_manifest_files_missing_child", self._gap_types(result))
-
-    def test_pollutant_manifest_distinguishes_file_count_and_unlisted_parquet(self) -> None:
-        self._write_healthy()
-        extra = self._partition() / "part-extra.parquet"
-        extra.write_bytes(b"PAR1")
-        manifest_path = self._partition() / "manifest.json"
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        payload["file_count"] = 99
-        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
-
-        result = self._run()
-
-        self.assertIn("data_manifest_file_count_mismatch", self._gap_types(result))
-        self.assertIn("data_manifest_unlisted_parquet", self._gap_types(result))
-        self.assertNotIn("row_count_mismatch", self._gap_types(result))
-
-    def test_v2_repair_plan_uses_uk_air_csv_without_v1_fallback(self) -> None:
+    def test_v1_to_v2_repair_command_is_marked_non_executing_write_risk(self) -> None:
         day = "2026-06-11"
         v1_dir = self.root / f"history/v1/observations/day_utc={day}/connector_id=7"
         v1_dir.mkdir(parents=True)
 
-        result = MODULE.run_v2_observations_integrity_checks(
-            r2_history_root=self.root,
-            config=self.config,
-            from_day=day,
-            to_day=day,
-            allowed_connector_ids={7},
-            source_scope={"source": "sos", "connector_ids": [7], "scope": "source"},
-        )
+        result = self._run(day, day)
 
         gap = next(g for g in result["gaps"] if g["gap_type"] == "day_dir_missing")
         repair = gap["suggested_repair"]
-        self.assertEqual(repair["kind"], "uk_air_csv_to_v2_observations_backfill_required")
+        self.assertEqual(repair["kind"], "v1_dropbox_to_v2_observations_backfill_plan")
         self.assertEqual(repair["executes"], False)
-        self.assertEqual(repair["operator_action_required"], False)
-        self.assertEqual(repair["commands"], [])
-        self.assertNotIn("v1", json.dumps(repair).lower())
-        self.assertNotIn("dropbox", json.dumps(repair).lower())
+        self.assertEqual(repair["operator_action_required"], True)
+        self.assertEqual(repair["write_risk"], "writes_to_r2_if_operator_runs_command")
+        command = repair["commands"][0]
+        self.assertIn("--write-r2", command)
+        self.assertIn("--replace", command)
+        self.assertIn("operator review", repair["notes"])
 
     def test_targeted_day_range_does_not_scan_outside_days(self) -> None:
         self._write_healthy(day="2026-06-11")
