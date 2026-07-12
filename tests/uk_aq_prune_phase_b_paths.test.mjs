@@ -97,8 +97,8 @@ test("Phase B v2 accepts digit-leading canonical codes in candidate SQL and R2 p
 
   assert.equal(OBSERVATION_PROPERTY_CODE_SQL_PATTERN, "^[a-z0-9_]+$");
   assert.equal(queries[0].includes(`op.code !~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-  assert.equal(queries[1].includes(`op2.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-  assert.equal(queries[1].includes(`source_code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
+  assert.equal(queries[1].includes(`op.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
+  assert.equal(queries[1].includes("source_aggregates"), true);
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].expected_row_count, BigInt(codes.length));
   assert.equal(candidates[0].source_row_count, BigInt(codes.length));
@@ -140,6 +140,67 @@ test("Phase B v2 still rejects blank and unsafe observation property paths", asy
     }),
     /Invalid observed_properties\.code values for v2 history: a\/b/,
   );
+});
+
+test("Phase B v2 SQL uses set-based aggregation and preserves complete candidates", async () => {
+  const queries = [];
+  const client = {
+    async query(sql) {
+      queries.push(sql);
+      if (sql.includes("select distinct op.code")) {
+        return { rows: [] };
+      }
+      // Return a complete candidate that should remain complete
+      return {
+        rows: [{
+          day_utc: DAY,
+          connector_id: 7,
+          expected_row_count: "100",
+          source_row_count: "100",
+          excluded_row_count: "0",
+          excluded_pollutant_counts: {},
+          min_observed_at: `${DAY}T00:00:00.000Z`,
+          max_observed_at: `${DAY}T23:59:59.999Z`,
+          status: "complete",
+          run_id: "previous-run",
+          manifest_key: "history/v2/observations/day_utc=2026-06-14/connector_id=7/manifest.json",
+          history_row_count: 100,
+          history_file_count: 1,
+          history_total_bytes: 12345,
+          history_completed_at: "2026-06-15T01:00:00.000Z",
+        }],
+      };
+    },
+  };
+
+  const candidates = await populateBackupCandidatesForTest({
+    client,
+    latestEligibleWindowEndIso: "2026-06-15T00:00:00.000Z",
+    runtime: { history_write_version: "v2" },
+  });
+
+  // Verify SQL structure
+  assert.equal(queries.length, 2);
+  assert.equal(queries[1].includes("source_aggregates"), true);
+  assert.equal(queries[1].includes("group by 1, 2"), true);
+  assert.equal(queries[1].includes("count(*)::bigint as expected_row_count"), true);
+  assert.equal(queries[1].includes("min(o.observed_at) as min_observed_at"), true);
+  assert.equal(queries[1].includes("max(o.observed_at) as max_observed_at"), true);
+  
+  // Verify no correlated subquery
+  assert.equal(queries[1].includes("select count(*)::bigint"), false);
+  assert.equal(queries[1].includes("where o2.connector_id = o.connector_id"), false);
+
+  // Verify complete candidate preservation logic
+  assert.equal(queries[1].includes("status = case"), true);
+  assert.equal(queries[1].includes("when uk_aq_ops.history_candidates.status = 'complete'"), true);
+  assert.equal(queries[1].includes("is not distinct from"), true);
+
+  // Verify candidate preservation
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].status, "complete");
+  assert.equal(candidates[0].run_id, "previous-run");
+  assert.equal(candidates[0].manifest_key, "history/v2/observations/day_utc=2026-06-14/connector_id=7/manifest.json");
 });
 
 test("Phase B deploy workflow and env catalogs retire the observations history allow-list", () => {
