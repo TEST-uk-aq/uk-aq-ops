@@ -747,6 +747,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertIn(218, gaps[0]["sample_missing_timeseries_ids"])
             self.assertEqual(gaps[0]["source_evidence"]["source_partition_state"], "successful_non_empty")
             self.assertTrue(gaps[0]["source_evidence"]["source_counts_present"])
+            self.assertTrue(gaps[0]["source_evidence"]["source_counts_available"])
 
             repair_metrics = MODULE.run_v2_gap_backfills(
                 conn=conn,
@@ -795,6 +796,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             gap = next(g for g in result["gaps"] if g["gap_type"] == "data_manifest_row_count_mismatch")
             self.assertEqual(gap["source_evidence"]["source_partition_state"], "successful_empty")
             self.assertFalse(gap["source_evidence"]["source_counts_present"])
+            self.assertTrue(gap["source_evidence"]["source_counts_available"])
         finally:
             empty_source_conn.close()
 
@@ -808,6 +810,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             gap = next(g for g in result["gaps"] if g["gap_type"] == "data_manifest_row_count_mismatch")
             self.assertEqual(gap["source_evidence"]["source_partition_state"], "counts_unavailable")
             self.assertFalse(gap["source_evidence"]["source_counts_present"])
+            self.assertFalse(gap["source_evidence"]["source_counts_available"])
         finally:
             unavailable_source_conn.close()
 
@@ -832,6 +835,9 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(source_counts, {218: 24})
             self.assertEqual(evidence["source_partition_state"], "successful_non_empty")
             self.assertTrue(evidence["source_counts_present"])
+            self.assertTrue(evidence["source_counts_available"])
+            self.assertTrue(evidence["partition"]["source_counts_present"])
+            self.assertTrue(evidence["partition"]["source_counts_available"])
         finally:
             non_empty_conn.close()
 
@@ -846,6 +852,29 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(source_counts, {})
         self.assertEqual(evidence["source_partition_state"], "connection_unavailable")
         self.assertEqual(evidence["source_skip_reason"], "source_connection_unavailable")
+        self.assertFalse(evidence["source_counts_present"])
+        self.assertFalse(evidence["source_counts_available"])
+        self.assertFalse(evidence["partition"]["source_counts_present"])
+        self.assertFalse(evidence["partition"]["source_counts_available"])
+
+        counts_unavailable_conn = MODULE.open_db(str(self.root / "counts-unavailable.sqlite"))
+        try:
+            source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
+                counts_unavailable_conn,
+                env_name="CIC-Test",
+                source_scope=base_scope,
+                day_utc="2026-06-23",
+                connector_id=1,
+                pollutant_code="pm25",
+            )
+            self.assertEqual(source_counts, {})
+            self.assertEqual(evidence["source_partition_state"], "counts_unavailable")
+            self.assertFalse(evidence["source_counts_present"])
+            self.assertFalse(evidence["source_counts_available"])
+            self.assertFalse(evidence["partition"]["source_counts_present"])
+            self.assertFalse(evidence["partition"]["source_counts_available"])
+        finally:
+            counts_unavailable_conn.close()
 
         scope_conn = self._new_current_source_db(
             day_utc="2026-06-20",
@@ -862,10 +891,14 @@ class V2RepairExecutionTests(unittest.TestCase):
                     day_utc="2026-06-20",
                     connector_id=1,
                     pollutant_code="pm25",
-                )
+            )
             self.assertEqual(source_counts, {})
             self.assertEqual(evidence["source_partition_state"], "scope_unavailable")
             self.assertEqual(evidence["source_skip_reason"], "source_scope_has_no_source_keys")
+            self.assertFalse(evidence["source_counts_present"])
+            self.assertFalse(evidence["source_counts_available"])
+            self.assertFalse(evidence["partition"]["source_counts_present"])
+            self.assertFalse(evidence["partition"]["source_counts_available"])
         finally:
             scope_conn.close()
 
@@ -890,6 +923,10 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(source_counts, {})
             self.assertEqual(evidence["source_partition_state"], "metadata_unavailable")
             self.assertEqual(evidence["source_skip_reason"], "source_pollutant_metadata_unavailable")
+            self.assertFalse(evidence["source_counts_present"])
+            self.assertFalse(evidence["source_counts_available"])
+            self.assertFalse(evidence["partition"]["source_counts_present"])
+            self.assertFalse(evidence["partition"]["source_counts_available"])
         finally:
             metadata_conn.close()
 
@@ -911,6 +948,10 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(source_counts, {})
             self.assertEqual(evidence["source_partition_state"], "pollutant_absent")
             self.assertEqual(evidence["source_skip_reason"], "source_pollutant_not_present")
+            self.assertFalse(evidence["source_counts_present"])
+            self.assertFalse(evidence["source_counts_available"])
+            self.assertFalse(evidence["partition"]["source_counts_present"])
+            self.assertFalse(evidence["partition"]["source_counts_available"])
         finally:
             pollutant_conn.close()
 
@@ -956,6 +997,10 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertTrue(manifest_gaps)
         self.assertTrue(all(gap["source_evidence"]["source_partition_state"] == "connection_unavailable" for gap in manifest_gaps))
         self.assertTrue(all(gap["source_evidence"]["source_skip_reason"] == "source_connection_unavailable" for gap in manifest_gaps))
+        self.assertTrue(all(gap["source_evidence"]["source_counts_present"] is False for gap in manifest_gaps))
+        self.assertTrue(all(gap["source_evidence"]["source_counts_available"] is False for gap in manifest_gaps))
+        self.assertTrue(all(gap["source_evidence"]["partition"]["source_counts_present"] is False for gap in manifest_gaps))
+        self.assertTrue(all(gap["source_evidence"]["partition"]["source_counts_available"] is False for gap in manifest_gaps))
         self.assertFalse(any(gap["gap_type"] == "source_r2_timeseries_row_mismatch" for gap in result["gaps"]))
 
     def test_v2_source_r2_matching_counts_do_not_create_repair_candidate(self) -> None:
