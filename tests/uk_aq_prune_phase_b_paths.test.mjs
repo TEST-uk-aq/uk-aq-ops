@@ -63,9 +63,11 @@ test("Phase B v2 accepts digit-leading canonical codes in candidate SQL and R2 p
     "135c6h3ch33",
   ];
   const queries = [];
+  const paramsUsed = [];
   const client = {
-    async query(sql) {
+    async query(sql, params) {
       queries.push(sql);
+      paramsUsed.push(params);
       if (sql.includes("select distinct op.code")) {
         return {
           rows: codes
@@ -89,16 +91,26 @@ test("Phase B v2 accepts digit-leading canonical codes in candidate SQL and R2 p
     },
   };
 
+  const testDate = "2026-06-15T00:00:00.000Z";
   const candidates = await populateBackupCandidatesForTest({
     client,
-    latestEligibleWindowEndIso: "2026-06-15T00:00:00.000Z",
+    latestEligibleWindowEndIso: testDate,
     runtime: { history_write_version: "v2" },
   });
 
   assert.equal(OBSERVATION_PROPERTY_CODE_SQL_PATTERN, "^[a-z0-9_]+$");
   assert.equal(queries[0].includes(`op.code !~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-  assert.equal(queries[1].includes(`op2.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-  assert.equal(queries[1].includes(`source_code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
+  assert.equal(queries[1].includes(`op.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
+  
+  // Verify parameter binding
+  assert.deepEqual(paramsUsed[0], [testDate]);
+  assert.deepEqual(paramsUsed[1], [testDate]);
+  assert.equal(queries[1].includes('$1'), true);
+  assert.equal(queries[1].includes('$2'), false);
+  
+  // Verify DO UPDATE WHERE condition
+  assert.equal(queries[1].includes("where uk_aq_ops.history_candidates.status <> 'complete'"), true);
+  assert.equal(queries[1].includes("is distinct from"), true);
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].expected_row_count, BigInt(codes.length));
   assert.equal(candidates[0].source_row_count, BigInt(codes.length));

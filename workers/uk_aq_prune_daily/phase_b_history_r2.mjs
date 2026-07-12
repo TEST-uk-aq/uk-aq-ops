@@ -935,23 +935,8 @@ with source_rows as (
     on p.id = ts.phenomenon_id
   join uk_aq_core.observed_properties op
     on op.id = p.observed_property_id
-  left join uk_aq_ops.history_candidates existing_complete
-    on existing_complete.day_utc = (o.observed_at at time zone 'UTC')::date
-   and existing_complete.connector_id = o.connector_id
-   and existing_complete.status = 'complete'
-   and existing_complete.expected_row_count = (
-     select count(*)::bigint
-     from uk_aq_core.observations o2
-     join uk_aq_core.timeseries ts2 on ts2.id = o2.timeseries_id and ts2.connector_id = o2.connector_id
-     join uk_aq_core.phenomena p2 on p2.id = ts2.phenomenon_id
-     join uk_aq_core.observed_properties op2 on op2.id = p2.observed_property_id
-     where o2.connector_id = o.connector_id
-       and (o2.observed_at at time zone 'UTC')::date = (o.observed_at at time zone 'UTC')::date
-       and op2.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
-   )
   where o.observed_at < $1::timestamptz
-    and op.code is not null
-    and existing_complete.day_utc is null
+    and op.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
 ),
 source_counts as (
   select
@@ -969,7 +954,6 @@ eligible as (
     min(observed_at) as min_observed_at,
     max(observed_at) as max_observed_at
   from source_rows
-  where source_code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
   group by 1, 2
 ),
 excluded as (
@@ -1036,14 +1020,70 @@ upserted as (
     expected_row_count = excluded.expected_row_count,
     min_observed_at = excluded.min_observed_at,
     max_observed_at = excluded.max_observed_at,
-    status = 'pending',
-    run_id = null,
-    last_error = null,
-    manifest_key = null,
-    history_row_count = null,
-    history_file_count = null,
-    history_total_bytes = null,
-    history_completed_at = null,
+    status = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then 'complete'
+      else 'pending'
+    end,
+    run_id = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.run_id
+      else null
+    end,
+    last_error = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.last_error
+      else null
+    end,
+    manifest_key = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.manifest_key
+      else null
+    end,
+    history_row_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_row_count
+      else null
+    end,
+    history_file_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_file_count
+      else null
+    end,
+    history_total_bytes = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_total_bytes
+      else null
+    end,
+    history_completed_at = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_completed_at
+      else null
+    end,
     resume_last_timeseries_id = case
       when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1081,6 +1121,9 @@ upserted as (
     end,
     updated_at = now()
   where uk_aq_ops.history_candidates.status <> 'complete'
+    or uk_aq_ops.history_candidates.expected_row_count is distinct from excluded.expected_row_count
+    or uk_aq_ops.history_candidates.min_observed_at is distinct from excluded.min_observed_at
+    or uk_aq_ops.history_candidates.max_observed_at is distinct from excluded.max_observed_at
   returning
     day_utc,
     connector_id,
@@ -1181,14 +1224,70 @@ upserted as (
     expected_row_count = excluded.expected_row_count,
     min_observed_at = excluded.min_observed_at,
     max_observed_at = excluded.max_observed_at,
-    status = 'pending',
-    run_id = null,
-    last_error = null,
-    manifest_key = null,
-    history_row_count = null,
-    history_file_count = null,
-    history_total_bytes = null,
-    history_completed_at = null,
+    status = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then 'complete'
+      else 'pending'
+    end,
+    run_id = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.run_id
+      else null
+    end,
+    last_error = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.last_error
+      else null
+    end,
+    manifest_key = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.manifest_key
+      else null
+    end,
+    history_row_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_row_count
+      else null
+    end,
+    history_file_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_file_count
+      else null
+    end,
+    history_total_bytes = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_total_bytes
+      else null
+    end,
+    history_completed_at = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_completed_at
+      else null
+    end,
     resume_last_timeseries_id = case
       when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1226,6 +1325,9 @@ upserted as (
     end,
     updated_at = now()
   where uk_aq_ops.history_candidates.status <> 'complete'
+    or uk_aq_ops.history_candidates.expected_row_count is distinct from excluded.expected_row_count
+    or uk_aq_ops.history_candidates.min_observed_at is distinct from excluded.min_observed_at
+    or uk_aq_ops.history_candidates.max_observed_at is distinct from excluded.max_observed_at
   returning
     day_utc,
     connector_id,
