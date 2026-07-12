@@ -2,8 +2,8 @@
 
 ## Main Repo
 
-- `CIC-test-uk-aq-ops` is the main repo for this project and the default starting point for cross-repo work.
-- Filesystem location: `/Users/mikehinford/Dropbox/Projects/CIC Website/CIC Air Quality Networks/CIC-test-uk-aq-Operations/CIC-test-uk-aq-ops`.
+- `TEST-uk-aq-ops` is the main repo for this project and the default starting point for cross-repo work.
+- Filesystem location: `/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops`.
 
 - `codeql-noarchive` in this repo currently scans `actions` and `javascript-typescript` only.
 - If Python source files are added outside `archive/`, update `.github/workflows/codeql-noarchive.yml` to include `python` in the language matrix.

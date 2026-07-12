@@ -264,12 +264,11 @@ test("v2 timeseries index keys include day, connector, and pollutant without alt
 test("v2 observation property codes accept canonical all-pollutant values and reject unsafe paths", () => {
   for (const code of [
     "pm25", "pm10", "no2", "o3", "so2", "co", "no", "nox_as_no2",
-    "pm25index", "pm10index", "no2index", "oc6h4ch32", "_o3",
-    "123c6h3ch33", "124c6h3ch33", "135c6h3ch33",
+    "pm25index", "pm10index", "no2index",
   ]) {
     assert.equal(normalizeObservationPropertyCode(code), code);
   }
-  for (const value of ["", " ", "../a", "a/b", "a\\b", "a=b", "a%2fb", "a.b", "o 3", "."]) {
+  for (const value of ["", "../o3", "o3/x", "o3\\x", "o 3", ".", "_o3"] ) {
     assert.equal(normalizeObservationPropertyCode(value), null);
   }
   assert.equal(normalizeAqiPollutantCode("o3"), null);
@@ -283,55 +282,6 @@ test("v2 observation property codes accept canonical all-pollutant values and re
   assert.throws(() => buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
     "history/_index_v2/aqilevels_hourly_data_timeseries", "2026-05-17", 1, "o3",
   ));
-});
-
-test("digit-leading observation codes remain in v2 index manifest payloads", () => {
-  for (const code of ["123c6h3ch33", "124c6h3ch33", "135c6h3ch33"]) {
-    const manifestKey =
-      `history/v2/observations/day_utc=2026-07-01/connector_id=7/pollutant_code=${code}/manifest.json`;
-    const partKey =
-      `history/v2/observations/day_utc=2026-07-01/connector_id=7/pollutant_code=${code}/part-00000.parquet`;
-    const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
-      domain: "observations",
-      dayUtc: "2026-07-01",
-      connectorId: 7,
-      pollutantCode: code,
-      generatedAt: "2026-07-02T00:00:00.000Z",
-      bucket: "uk-aq-history-dev",
-      dataPrefix: "history/v2/observations",
-      pollutantManifestKey: manifestKey,
-      pollutantManifest: {
-        pollutant_code: code,
-        source_row_count: 1,
-        timeseries_row_counts: { "101": 1 },
-        backed_up_at_utc: "2026-07-02T00:00:00.000Z",
-        files: [{
-          key: partKey,
-          row_count: 1,
-          bytes: 100,
-          pollutant_code: code,
-          min_timeseries_id: 101,
-          max_timeseries_id: 101,
-          min_observed_at_utc: "2026-07-01T00:00:00.000Z",
-          max_observed_at_utc: "2026-07-01T00:00:00.000Z",
-        }],
-      },
-    });
-
-    assert.equal(
-      buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
-        "history/_index_v2/observations_timeseries",
-        "2026-07-01",
-        7,
-        code,
-      ),
-      `history/_index_v2/observations_timeseries/day_utc=2026-07-01/connector_id=7/pollutant_code=${code}/manifest.json`,
-    );
-    assert.equal(payload.pollutant_code, code);
-    assert.equal(payload.files.length, 1);
-    assert.equal(payload.files[0].pollutant_code, code);
-    assert.equal(payload.files[0].key, partKey);
-  }
 });
 
 test("buildHistoryV2TimeseriesPollutantIndexPayload builds observation pollutant index metadata", () => {

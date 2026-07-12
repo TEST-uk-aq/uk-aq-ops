@@ -256,24 +256,9 @@ When enabled, each integrity run reports to Obs AQI DB daily task health:
 
 The current run order also includes:
 
-- a Dropbox backup readiness gate before any Dropbox-inspecting preflight or history scan starts;
+- a Dropbox backup readiness gate before the Dropbox history scan starts;
 - an optional `--allow-stale-dropbox` override for manual recovery runs;
 - v2 connector/day hierarchy validation for both observations and AQI hourly data.
-
-Scheduled profiles require the latest attempt for daily task
-`ops.r2_history_dropbox_backup` to have status `Finished` for the integrity run
-date, with `finished_at` no later than the integrity start time. That workflow
-builds the R2 backup inventory before running the inventory-driven Dropbox sync,
-so its final factual health row covers both ordered backup steps.
-
-The readiness RPC is called through PostgREST schema `uk_aq_public`. Obs AQI DB
-credentials are resolved only after `UK_AQ_BACKFILL_ENV_FILE` is loaded, with
-dedicated daily-task-health variables first, then
-`OBS_AQIDB_SUPABASE_URL`/`OBS_AQIDB_SECRET_KEY`, followed by established generic
-fallbacks. Any missing credentials, invalid gate input, HTTP/RPC failure, or
-unexpected response shape produces `status=blocked_backup_not_ready` before
-Dropbox is inspected. `--allow-stale-dropbox` bypasses the gate explicitly and
-is recorded in JSON and Markdown reports.
 
 Run lifecycle:
 

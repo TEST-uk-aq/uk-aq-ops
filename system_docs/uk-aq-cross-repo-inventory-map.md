@@ -4,13 +4,13 @@ Last updated: 2026-04-23
 
 ## Repository Roles
 
-- Main orchestrator repo: `CIC-test-uk-aq-ops`
-- Canonical schema repo: `CIC-test-uk-aq-schema` (`schemas/` is source of truth)
-- Ops runtime repo: `CIC-test-uk-aq-ops`
-- Web UI repo: `CIC-test-uk-aq`
+- Main repo and cross-repo starting point: `TEST-uk-aq-ops`
+- Canonical schema repo: `TEST-uk-aq-schema` (`schemas/` is source of truth)
+- Ops runtime repo: `TEST-uk-aq-ops`
+- Web UI repo: `TEST-uk-aq-root.github.io`
 - Population ingest repo: `CIC-Test-uk-population-ingest`
 
-## 1) Ingest Repo (`CIC-test-uk-aq-ingest`)
+## 1) Ingest Repo (`TEST-uk-aq-ingest`)
 
 ### Edge Functions (`supabase/functions/*/index.ts`)
 
@@ -58,7 +58,7 @@ Last updated: 2026-04-23
 - `uk_aq_observs_egress_monitor.yml`
 - `supabase-keepalive.yml`
 
-## 2) Ops Repo (`CIC-test-uk-aq-ops`)
+## 2) Ops Repo (`TEST-uk-aq-ops`, main repo)
 
 ### Cloud Run Services (`workers/*/server.mjs`)
 
@@ -96,7 +96,7 @@ Last updated: 2026-04-23
 - `uk_aq_r2_core_snapshot.yml`
 - `uk_aq_r2_history_restore_from_dropbox.yml`
 
-## 3) Schema Repo (`CIC-test-uk-aq-schema`)
+## 3) Schema Repo (`TEST-uk-aq-schema`)
 
 ### Ingest DB Canonical DDL (`schemas/ingest_db/`)
 
@@ -127,7 +127,7 @@ Last updated: 2026-04-23
 
 - `2026-03-13_obs_aqidb_day_counts_current.sql`
 
-## 4) Web Repo (`CIC-test-uk-aq`)
+## 4) Web Repo (`TEST-uk-aq-root.github.io`)
 
 ### Primary UI Pages
 
@@ -176,7 +176,7 @@ Last updated: 2026-04-23
 
 ## Cross-Repo Touchpoints (Most Important)
 
-- Web read path: `CIC-test-uk-aq` -> cache/API routes and edge functions in `CIC-test-uk-aq-ingest`, plus population edge function in `CIC-Test-uk-population-ingest`.
-- Write path: ingest/population repos write to tables, views, and RPCs defined in `CIC-test-uk-aq-schema`.
-- History/retention/backups: runtime ops execute from `CIC-test-uk-aq-ops` against schema-defined objects.
+- Web read path: `TEST-uk-aq-root.github.io` -> cache/API routes and edge functions in `TEST-uk-aq-ingest`, plus population edge function in `CIC-Test-uk-population-ingest`.
+- Write path: ingest/population repos write to tables, views, and RPCs defined in `TEST-uk-aq-schema`.
+- History/retention/backups: runtime ops execute from the main repo, `TEST-uk-aq-ops`, against schema-defined objects.
 - Recommended change sequence: schema changes first, then ingest/ops runtime updates, then web behavior validation.

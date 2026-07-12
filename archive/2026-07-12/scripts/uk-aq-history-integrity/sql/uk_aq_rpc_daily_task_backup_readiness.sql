@@ -17,7 +17,7 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, uk_aq_public
+SET search_path = pg_catalog, public, uk_aq_public, uk_aq_ops
 AS $$
 DECLARE
   v_task_key text;
@@ -47,7 +47,7 @@ BEGIN
       FROM uk_aq_ops.daily_task_runs AS r
      WHERE r.task_key = v_task_key
        AND r.scheduled_for_date = p_scheduled_for_date
-     ORDER BY r.attempt DESC, r.updated_at DESC, r.id DESC
+     ORDER BY r.started_at_utc DESC NULLS LAST, r.created_at_utc DESC NULLS LAST, r.id DESC
      LIMIT 1;
 
     IF NOT FOUND THEN
@@ -58,37 +58,37 @@ BEGIN
         'backup_ready', false,
         'blocked_reason', 'missing_required_task'
       );
-    ELSIF v_latest.status <> 'Finished' THEN
+    ELSIF v_latest.status <> 'succeeded' THEN
       v_ready := false;
-      v_reason := coalesce(v_reason, 'latest_task_not_finished');
+      v_reason := coalesce(v_reason, 'latest_task_not_succeeded');
       v_tasks := v_tasks || jsonb_build_object(
         'task_key', v_task_key,
         'run_id', v_latest.id,
         'status', v_latest.status,
         'backup_ready', false,
-        'blocked_reason', 'latest_task_not_finished',
-        'finished_at', v_latest.finished_at
+        'blocked_reason', 'latest_task_not_succeeded',
+        'completed_at_utc', v_latest.completed_at_utc
       );
-    ELSIF v_latest.finished_at IS NULL OR v_latest.finished_at > p_integrity_started_at_utc THEN
+    ELSIF v_latest.completed_at_utc IS NULL OR v_latest.completed_at_utc > p_integrity_started_at_utc THEN
       v_ready := false;
-      v_reason := coalesce(v_reason, 'task_finished_after_integrity_start');
+      v_reason := coalesce(v_reason, 'task_completed_after_integrity_start');
       v_tasks := v_tasks || jsonb_build_object(
         'task_key', v_task_key,
         'run_id', v_latest.id,
         'status', v_latest.status,
         'backup_ready', false,
-        'blocked_reason', 'task_finished_after_integrity_start',
-        'finished_at', v_latest.finished_at
+        'blocked_reason', 'task_completed_after_integrity_start',
+        'completed_at_utc', v_latest.completed_at_utc
       );
     ELSE
-      v_completed_at := greatest(coalesce(v_completed_at, v_latest.finished_at), v_latest.finished_at);
+      v_completed_at := greatest(coalesce(v_completed_at, v_latest.completed_at_utc), v_latest.completed_at_utc);
       v_tasks := v_tasks || jsonb_build_object(
         'task_key', v_task_key,
         'run_id', v_latest.id,
         'status', v_latest.status,
         'backup_ready', true,
         'blocked_reason', null,
-        'finished_at', v_latest.finished_at
+        'completed_at_utc', v_latest.completed_at_utc
       );
     END IF;
   END LOOP;

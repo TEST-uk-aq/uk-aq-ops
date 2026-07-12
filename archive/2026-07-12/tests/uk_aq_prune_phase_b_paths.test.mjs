@@ -10,16 +10,11 @@ import {
   buildHistoryV2PollutantManifestForTest,
   buildHistoryV2PollutantManifestKey,
   buildPruneComparisonRowsQueryForTest,
-  populateBackupCandidatesForTest,
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
   shouldResetManifestlessV2ResumeForTest,
   writeCommittedV2PartAndCheckpointForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
-import {
-  normalizeObservationPropertyCode,
-  OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
-} from "../workers/shared/uk_aq_observation_property_code.mjs";
 
 const DAY = "2026-06-14";
 const RUN_ID = "test-run";
@@ -52,96 +47,6 @@ test("Phase B v2 ignores the retired observation allow-list", () => {
   );
 });
 
-test("Phase B v2 accepts digit-leading canonical codes in candidate SQL and R2 paths", async () => {
-  const codes = [
-    "pm25",
-    "pm10",
-    "no2",
-    "oc6h4ch32",
-    "123c6h3ch33",
-    "124c6h3ch33",
-    "135c6h3ch33",
-  ];
-  const queries = [];
-  const client = {
-    async query(sql) {
-      queries.push(sql);
-      if (sql.includes("select distinct op.code")) {
-        return {
-          rows: codes
-            .filter((code) => normalizeObservationPropertyCode(code) === null)
-            .map((code) => ({ code })),
-        };
-      }
-      return {
-        rows: [{
-          day_utc: DAY,
-          connector_id: 7,
-          expected_row_count: String(codes.length),
-          source_row_count: String(codes.length),
-          excluded_row_count: "0",
-          excluded_pollutant_counts: {},
-          min_observed_at: `${DAY}T00:00:00.000Z`,
-          max_observed_at: `${DAY}T06:00:00.000Z`,
-          status: "pending",
-        }],
-      };
-    },
-  };
-
-  const candidates = await populateBackupCandidatesForTest({
-    client,
-    latestEligibleWindowEndIso: "2026-06-15T00:00:00.000Z",
-    runtime: { history_write_version: "v2" },
-  });
-
-  assert.equal(OBSERVATION_PROPERTY_CODE_SQL_PATTERN, "^[a-z0-9_]+$");
-  assert.equal(queries[0].includes(`op.code !~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-  assert.equal(queries[1].includes(`op2.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-  assert.equal(queries[1].includes(`source_code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-  assert.equal(candidates.length, 1);
-  assert.equal(candidates[0].expected_row_count, BigInt(codes.length));
-  assert.equal(candidates[0].source_row_count, BigInt(codes.length));
-  assert.equal(candidates[0].excluded_row_count, 0n);
-
-  for (const code of codes.slice(4)) {
-    assert.equal(
-      buildHistoryV2PollutantManifestKey("history/v2/observations", DAY, 7, code),
-      `history/v2/observations/day_utc=${DAY}/connector_id=7/pollutant_code=${code}/manifest.json`,
-    );
-    assert.equal(
-      buildHistoryV2PartKey("history/v2/observations", DAY, 7, code, 0),
-      `history/v2/observations/day_utc=${DAY}/connector_id=7/pollutant_code=${code}/part-00000.parquet`,
-    );
-  }
-});
-
-test("Phase B v2 still rejects blank and unsafe observation property paths", async () => {
-  const unsafeCodes = ["", " ", "a/b", "a\\b", "a=b", "../a", "a.b", "a%2fb"];
-  for (const code of unsafeCodes) {
-    assert.equal(normalizeObservationPropertyCode(code), null);
-    assert.throws(
-      () => buildHistoryV2PartKey("history/v2/observations", DAY, 7, code, 0),
-      /Invalid pollutant_code for R2 path/,
-    );
-  }
-
-  const client = {
-    async query(sql) {
-      assert.equal(sql.includes(`op.code !~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'`), true);
-      return { rows: [{ code: "a/b" }] };
-    },
-  };
-  await assert.rejects(
-    populateBackupCandidatesForTest({
-      client,
-      latestEligibleWindowEndIso: "2026-06-15T00:00:00.000Z",
-      runtime: { history_write_version: "v2" },
-    }),
-    /Invalid observed_properties\.code values for v2 history: a\/b/,
-  );
-});
-
 test("Phase B deploy workflow and env catalogs retire the observations history allow-list", () => {
   const workflow = readFileSync(".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml", "utf8");
   const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
@@ -149,7 +54,6 @@ test("Phase B deploy workflow and env catalogs retire the observations history a
   assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.doesNotMatch(targets, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
-  assert.match(workflow, /workers\/shared\/uk_aq_observation_property_code\.mjs/);
 
 });
 

@@ -26,9 +26,6 @@ import {
   r2PutObject,
   sha256Hex,
 } from "./r2_sigv4.mjs";
-import { normalizeObservationPropertyCode } from "./uk_aq_observation_property_code.mjs";
-
-export { normalizeObservationPropertyCode };
 
 // MD5 hex of the body bytes — matches the etag R2 returns for single-part
 // PUTs (all our manifests are small enough that R2 never splits them).
@@ -197,6 +194,11 @@ function parsePositiveId(raw) {
     return null;
   }
   return Math.trunc(value);
+}
+
+export function normalizeObservationPropertyCode(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  return /^[a-z][a-z0-9_]*$/.test(value) ? value : null;
 }
 
 export function normalizeAqiPollutantCode(raw) {

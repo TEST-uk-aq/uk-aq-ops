@@ -91,20 +91,6 @@ DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
 DAILY_TASK_HEALTH_SOURCE_WORKER = "uk-aq-history-integrity"
 DAILY_TASK_HEALTH_RPC_SCHEMA = "uk_aq_public"
 DAILY_TASK_HEALTH_ERROR_LIMIT = 1200
-DEFAULT_BACKUP_TASK_KEYS = ("ops.r2_history_dropbox_backup",)
-BACKUP_GATE_URL_ENV_NAMES = (
-    "DAILY_TASK_HEALTH_SUPABASE_URL",
-    "OBS_AQIDB_SUPABASE_URL",
-    "SUPABASE_URL",
-    "UK_AQ_SUPABASE_URL",
-)
-BACKUP_GATE_KEY_ENV_NAMES = (
-    "DAILY_TASK_HEALTH_SUPABASE_SERVICE_ROLE_KEY",
-    "OBS_AQIDB_SECRET_KEY",
-    "OBS_AQIDB_SUPABASE_SERVICE_ROLE_KEY",
-    "SUPABASE_SERVICE_ROLE_KEY",
-    "UK_AQ_SUPABASE_SERVICE_ROLE_KEY",
-)
 
 
 def resolve_integrity_backfill_wrapper() -> str:
@@ -12270,11 +12256,10 @@ def check_dropbox_backup_ready(
     allow_stale_dropbox: bool = False,
     rpc_name: str = "uk_aq_rpc_daily_task_backup_readiness",
 ) -> dict[str, Any]:
-    normalized_task_keys = [str(value or "").strip() for value in task_keys]
     summary: dict[str, Any] = {
         "backup_gate_checked": True,
         "backup_ready": False,
-        "backup_task_keys": normalized_task_keys,
+        "backup_task_keys": list(task_keys),
         "backup_scheduled_for_date": scheduled_for_date,
         "backup_completed_at": None,
         "allow_stale_dropbox": bool(allow_stale_dropbox),
@@ -12285,23 +12270,8 @@ def check_dropbox_backup_ready(
         summary["backup_ready"] = True
         summary["blocked_reason"] = "allow_stale_dropbox_override"
         return summary
-    if not normalized_task_keys or any(not value for value in normalized_task_keys):
+    if not task_keys:
         summary["blocked_reason"] = "no_required_backup_task_keys_configured"
-        return summary
-    try:
-        parsed_date = dt.date.fromisoformat(str(scheduled_for_date))
-        if parsed_date.isoformat() != str(scheduled_for_date):
-            raise ValueError("date is not canonical YYYY-MM-DD")
-    except (TypeError, ValueError):
-        summary["blocked_reason"] = "invalid_scheduled_for_date"
-        return summary
-    started_raw = str(integrity_started_at_utc or "").strip()
-    integrity_started_at = _parse_iso_utc(started_raw)
-    if (
-        integrity_started_at is None
-        or not (started_raw.endswith("Z") or started_raw.endswith("+00:00"))
-    ):
-        summary["blocked_reason"] = "invalid_integrity_started_at_utc"
         return summary
     if not supabase_url or not service_role_key:
         summary["blocked_reason"] = "supabase_credentials_unavailable"
@@ -12311,8 +12281,7 @@ def check_dropbox_backup_ready(
     payload = json.dumps(
         {
             "p_scheduled_for_date": scheduled_for_date,
-            "p_integrity_started_at_utc": integrity_started_at_utc,
-            "p_task_keys": normalized_task_keys,
+            "p_task_keys": task_keys,
         }
     ).encode("utf-8")
     req = urllib.request.Request(
@@ -12323,8 +12292,6 @@ def check_dropbox_backup_ready(
             "apikey": service_role_key,
             "Authorization": f"Bearer {service_role_key}",
             "Content-Type": "application/json",
-            "Accept-Profile": DAILY_TASK_HEALTH_RPC_SCHEMA,
-            "Content-Profile": DAILY_TASK_HEALTH_RPC_SCHEMA,
         },
     )
     try:
@@ -12335,109 +12302,32 @@ def check_dropbox_backup_ready(
         summary["blocked_reason"] = f"daily_task_health_query_failed:{exc}"
         return summary
 
-    if isinstance(data, list):
-        if len(data) != 1:
-            summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
-            return summary
+    if isinstance(data, list) and data:
         data = data[0]
-    if not isinstance(data, dict) or not isinstance(data.get("backup_ready"), bool) or not isinstance(data.get("tasks"), list):
-        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
-        return summary
-
-    tasks = data["tasks"]
-    if any(not isinstance(task, dict) for task in tasks):
-        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
-        return summary
-    summary["tasks"] = tasks
-    tasks_by_key = {str(task.get("task_key") or "").strip(): task for task in tasks}
-    if any(task_key not in tasks_by_key for task_key in normalized_task_keys):
-        summary["blocked_reason"] = str(data.get("blocked_reason") or "missing_required_task")
-        return summary
-
-    completed_values: list[tuple[dt.datetime, str]] = []
-    for task_key in normalized_task_keys:
-        task = tasks_by_key[task_key]
-        if task.get("status") != "Finished":
-            summary["blocked_reason"] = str(task.get("blocked_reason") or "latest_task_not_finished")
-            return summary
-        finished_at_raw = str(task.get("finished_at") or "").strip()
-        finished_at = _parse_iso_utc(finished_at_raw)
-        if (
-            finished_at is None
-            or not (finished_at_raw.endswith("Z") or finished_at_raw.endswith("+00:00"))
-        ):
-            summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
-            return summary
-        if finished_at > integrity_started_at:
-            summary["blocked_reason"] = "task_finished_after_integrity_start"
-            return summary
-        completed_values.append((finished_at, finished_at_raw))
-
-    if not data["backup_ready"]:
-        summary["blocked_reason"] = str(data.get("blocked_reason") or "backup_not_ready")
-        return summary
-
-    summary["backup_completed_at"] = max(completed_values, key=lambda item: item[0])[1]
-    summary["backup_ready"] = True
-    return summary
-
-
-def _first_configured_value(values: Mapping[str, Any], names: Iterable[str]) -> str:
-    for name in names:
-        value = str(values.get(name) or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def resolve_backup_gate_credentials(values: Mapping[str, Any] | None = None) -> tuple[str, str]:
-    source = os.environ if values is None else values
-    resolved_values = dict(source)
-    backfill_env_path = str(source.get("UK_AQ_BACKFILL_ENV_FILE") or "").strip()
-    if backfill_env_path:
-        try:
-            resolved_values.update(load_env_file_assignments(backfill_env_path))
-        except OSError:
-            # Preflight reports an unreadable configured file. The gate still
-            # fails closed below if no usable credentials remain.
-            pass
-    return (
-        _first_configured_value(resolved_values, BACKUP_GATE_URL_ENV_NAMES).rstrip("/"),
-        _first_configured_value(resolved_values, BACKUP_GATE_KEY_ENV_NAMES),
-    )
-
-
-def configured_backup_task_keys(values: Mapping[str, Any] | None = None) -> list[str]:
-    source = os.environ if values is None else values
-    if "UK_AQ_HISTORY_INTEGRITY_BACKUP_TASK_KEYS" in source:
-        raw = str(source.get("UK_AQ_HISTORY_INTEGRITY_BACKUP_TASK_KEYS") or "")
-    else:
-        raw = ",".join(DEFAULT_BACKUP_TASK_KEYS)
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
-def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dict[str, Any]:
-    if args.profile == "manual":
-        return {
-            "backup_gate_checked": False,
-            "backup_ready": None,
-            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-        }
-    supabase_url, service_role_key = resolve_backup_gate_credentials()
-    return check_dropbox_backup_ready(
-        supabase_url=supabase_url,
-        service_role_key=service_role_key,
-        task_keys=configured_backup_task_keys(),
-        scheduled_for_date=started_iso[:10],
-        integrity_started_at_utc=started_iso,
-        allow_stale_dropbox=bool(args.allow_stale_dropbox),
-        rpc_name=str(
-            os.environ.get(
-                "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
-                "uk_aq_rpc_daily_task_backup_readiness",
+    if isinstance(data, dict):
+        tasks = data.get("tasks") if isinstance(data.get("tasks"), list) else []
+        summary["tasks"] = tasks
+        completed = [
+            str(
+                task.get("completed_at")
+                or task.get("finished_at_utc")
+                or task.get("completed_at_utc")
+                or ""
             )
-        ),
-    )
+            for task in tasks
+            if isinstance(task, dict)
+        ]
+        summary["backup_completed_at"] = max([value for value in completed if value] or [str(data.get("backup_completed_at") or "")]) or None
+        ready = bool(data.get("backup_ready") or data.get("ready"))
+        if ready and summary["backup_completed_at"] and summary["backup_completed_at"] > integrity_started_at_utc:
+            ready = False
+            summary["blocked_reason"] = "backup_completed_after_integrity_started"
+        summary["backup_ready"] = ready
+        if not ready and not summary["blocked_reason"]:
+            summary["blocked_reason"] = str(data.get("blocked_reason") or "backup_not_ready")
+    else:
+        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
+    return summary
 
 
 def _parse_env_assignment_line(raw_line: str) -> tuple[str, str] | None:
@@ -14166,6 +14056,7 @@ def main(argv: list[str]) -> int:
     history_path_configs = resolve_history_path_configs(history_version_mode)
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
     site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
+    preflight_summary = run_preflight_or_die(args, env)
 
     started_mono = time.monotonic()
     started_at = utc_now()
@@ -14184,14 +14075,44 @@ def main(argv: list[str]) -> int:
     )
     log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
     log.info("log_file=%s", log_path)
+    log.info("preflight summary=%s", preflight_summary)
+
     daily_task_health_config = _resolve_daily_task_health_config(env_name=args.env)
     daily_task_health_enabled = bool(daily_task_health_config.get("enabled"))
     daily_task_health_strict = bool(daily_task_health_config.get("strict"))
     daily_task_health_run_id: str | None = None
     daily_task_scheduled_for_date = started_at.date().isoformat()
     daily_task_platform_run_id = f"{args.env}:{run_compact}"
-    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
+    backup_gate_summary: dict[str, Any] = {
+        "backup_gate_checked": False,
+        "backup_ready": None,
+        "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+    }
     if args.profile != "manual":
+        task_keys = [
+            part.strip()
+            for part in str(
+                os.environ.get(
+                    "UK_AQ_HISTORY_INTEGRITY_BACKUP_TASK_KEYS",
+                    "r2_backup_inventory,r2_history_dropbox_sync",
+                )
+            ).split(",")
+            if part.strip()
+        ]
+        backup_gate_summary = check_dropbox_backup_ready(
+            supabase_url=os.environ.get("SUPABASE_URL") or os.environ.get("UK_AQ_SUPABASE_URL"),
+            service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("UK_AQ_SUPABASE_SERVICE_ROLE_KEY"),
+            task_keys=task_keys,
+            scheduled_for_date=daily_task_scheduled_for_date,
+            integrity_started_at_utc=started_iso,
+            allow_stale_dropbox=bool(args.allow_stale_dropbox),
+            rpc_name=str(
+                os.environ.get(
+                    "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
+                    "uk_aq_rpc_daily_task_backup_readiness",
+                )
+            ),
+        )
         log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
         if not backup_gate_summary.get("backup_ready"):
             log.error("backup gate blocked before Dropbox history scan: %s", backup_gate_summary.get("blocked_reason"))
@@ -14218,11 +14139,6 @@ def main(argv: list[str]) -> int:
             }
             write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
             return 2
-
-    # Preflight inspects the configured Dropbox roots. It must run only after
-    # scheduled backup readiness has been established (or explicitly bypassed).
-    preflight_summary = run_preflight_or_die(args, env)
-    log.info("preflight summary=%s", preflight_summary)
     if daily_task_health_enabled:
         start_summary = {
             "env": args.env,
