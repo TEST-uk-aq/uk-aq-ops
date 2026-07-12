@@ -258,7 +258,7 @@ If it is an accidental copy created to make a schema test pass, make the test lo
 | --- | --- | --- | --- |
 | 2c.2a | Correct source-state comparison and propagation | Local validation complete, uncommitted | Successful-empty and unavailable states |
 | 2c.2b | Enforce repair precedence and AQI metadata | Local validation complete, uncommitted | One unambiguous result per partition |
-| 2c.2c | Non-DuckDB completion checks and SQL-mirror review | Not started | DuckDB deferred to test system |
+| 2c.2c | Non-DuckDB completion checks and SQL-mirror review | Local validation complete, uncommitted | Full suite complete; no untracked SQL mirror present |
 
 Allowed status values:
 
@@ -745,31 +745,44 @@ Do not copy anything.
 Status:
 
 ```text
-Not started
+Local validation complete, uncommitted
 ```
 
 Full suite:
 
 ```text
-To be updated by Codex.
+python3 -m unittest discover -s scripts/uk-aq-history-integrity/tests -p 'test_*.py' -q -> Ran 249 tests in 1.080s, OK; skipped 0.
+```
+
+Syntax checks:
+
+```text
+python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py -> passed
+```
+
+Working tree checks:
+
+```text
+git diff --check -> passed
+git diff --stat, git diff --name-only, git ls-files --others --exclude-standard, git status --short -> captured after validation; no untracked files were present.
 ```
 
 SQL mirror:
 
 ```text
-To be updated by Codex.
+No untracked ops SQL mirror is present in the current working tree. `git ls-files --others --exclude-standard` returned no paths, so there was nothing to classify or remove.
 ```
 
 Runtime handoff:
 
 ```text
-To be updated by Codex.
+No files were copied in this phase. Runtime-side checker artifact: `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py`. Tests and this plan remain development-only.
 ```
 
 Deferred validation:
 
 ```text
-Real DuckDB-backed validation deferred to the test integrity system.
+Real DuckDB-backed validation was not run in the development environment and is deferred to the test integrity system after manual runtime copy.
 ```
 
 ---
