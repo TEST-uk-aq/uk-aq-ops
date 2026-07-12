@@ -902,12 +902,8 @@ function toConnectorDayRow(row) {
   };
 }
 
-function observationPollutantCodesForSql(runtime) {
-  return [];
-}
 
 async function populateBackupCandidates(client, latestEligibleWindowEndIso, runtime = {}) {
-  const pollutantCodes = observationPollutantCodesForSql(runtime);
   if (runtime.history_write_version === "v2") {
     const invalidCodes = await client.query(`
 select distinct op.code
@@ -1118,7 +1114,7 @@ left join excluded x
 order by u.day_utc, u.connector_id
 `;
 
-    const result = await client.query(sql, [latestEligibleWindowEndIso, pollutantCodes]);
+    const result = await client.query(sql, [latestEligibleWindowEndIso]);
     return result.rows.map(toConnectorDayRow);
   }
 
