@@ -7462,6 +7462,11 @@ def _validate_v2_parent_hierarchy(
             )
             if field not in payload or str(payload.get(field)) != str(expected)
         ]
+        connector_files = _manifest_files_list(payload)
+        connector_files_valid = connector_files is not None
+        if not connector_files_valid:
+            schema_mismatches.append("files")
+            connector_files = []
         if schema_mismatches:
             gaps.append(gap_fn(
                 "connector_manifest_schema_mismatch",
@@ -7474,8 +7479,9 @@ def _validate_v2_parent_hierarchy(
             "connector_manifest_pollutant_codes": _manifest_codes_from_scalar_list(payload, "pollutant_codes"),
             "connector_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "pollutant_code"),
             "connector_manifest_pollutant_manifests": _manifest_codes_from_child_list(payload, "pollutant_manifests", "pollutant_code"),
-            "connector_manifest_files": _manifest_pollutant_codes_from_files(payload),
         }
+        if connector_files_valid:
+            representations["connector_manifest_files"] = _manifest_pollutant_codes_from_files(payload)
         for label, represented in representations.items():
             _append_field_set_gaps(
                 gaps,
@@ -7497,6 +7503,8 @@ def _validate_v2_parent_hierarchy(
             day_utc=day_utc,
             connector_id=connector_raw,
             expected_path=connector_rel,
+            manifest_files=connector_files,
+            files_valid=connector_files_valid,
         )
         _append_child_hash_gaps(
             gaps,
@@ -7545,6 +7553,11 @@ def _validate_v2_parent_hierarchy(
         )
         if field not in payload or str(payload.get(field)) != str(expected)
     ]
+    day_files = _manifest_files_list(payload)
+    day_files_valid = day_files is not None
+    if not day_files_valid:
+        schema_mismatches.append("files")
+        day_files = []
     if schema_mismatches:
         gaps.append(gap_fn(
             "day_manifest_schema_mismatch",
@@ -7556,8 +7569,9 @@ def _validate_v2_parent_hierarchy(
         "day_manifest_connector_ids": _manifest_codes_from_scalar_list(payload, "connector_ids"),
         "day_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "connector_id"),
         "day_manifest_connector_manifests": _manifest_codes_from_child_list(payload, "connector_manifests", "connector_id"),
-        "day_manifest_files": _manifest_connector_ids_from_files(payload),
     }
+    if day_files_valid:
+        representations["day_manifest_files"] = _manifest_connector_ids_from_files(payload)
     for label, represented in representations.items():
         _append_field_set_gaps(
             gaps,
@@ -7578,6 +7592,8 @@ def _validate_v2_parent_hierarchy(
         day_utc=day_utc,
         connector_id=None,
         expected_path=day_rel,
+        manifest_files=day_files,
+        files_valid=day_files_valid,
     )
     _append_child_hash_gaps(
         gaps,
@@ -7599,6 +7615,22 @@ def _manifest_files(payload: Any) -> list[dict[str, Any]]:
     return files if isinstance(files, list) else []
 
 
+def _manifest_files_list(payload: Any) -> list[Any] | None:
+    files = payload.get("files") if isinstance(payload, Mapping) else None
+    return files if isinstance(files, list) else None
+
+
+def _parse_required_timestamp_value(value: Any) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        parsed = value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    if isinstance(value, str):
+        return _parse_iso_utc(value)
+    return None
+
+
 def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any] | None, str | None]:
     """Read actual local parquet content without trusting manifest metadata."""
     parquet_files = sorted({str(Path(path)) for path in files if Path(path).is_file()})
@@ -7606,10 +7638,12 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
         return {
             "row_count": 0,
             "timeseries_row_counts": {},
+            "null_timeseries_count": 0,
             "min_timeseries_id": None,
             "max_timeseries_id": None,
             "min_timestamp_utc": None,
             "max_timestamp_utc": None,
+            "parquet_null_timeseries_id_rows": False,
         }, None
     if importlib.util.find_spec("duckdb") is None:
         return None, "duckdb_unavailable"
@@ -7625,18 +7659,30 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
         columns = {str(row[0]) for row in described}
         if "timeseries_id" not in columns:
             return None, "timeseries_id_column_missing"
-        
-        # Get total row count (including null timeseries_id rows)
+
+        def _duckdb_single_int(result: Any) -> int:
+            if isinstance(result, tuple):
+                result = result[0] if result else 0
+            return int(result)
+
+        # Get total row count and the non-null timeseries_id count separately.
         total_row_count_result = connection.execute(
             "SELECT COUNT(*) FROM read_parquet(?, union_by_name=true)",
             [parquet_files],
-        ).fetchone()[0]
-        # Handle both integer and string results from the query
+        ).fetchone()
         try:
-            total_row_count = int(total_row_count_result)
+            total_row_count = _duckdb_single_int(total_row_count_result)
         except (TypeError, ValueError):
-            total_row_count = total_row_count_result
-        
+            total_row_count = 0
+        non_null_timeseries_count_result = connection.execute(
+            "SELECT COUNT(timeseries_id) FROM read_parquet(?, union_by_name=true)",
+            [parquet_files],
+        ).fetchone()
+        try:
+            non_null_timeseries_count = _duckdb_single_int(non_null_timeseries_count_result)
+        except (TypeError, ValueError):
+            non_null_timeseries_count = 0
+
         # Get non-null timeseries_id rows and their counts
         rows = connection.execute(
             "SELECT CAST(timeseries_id AS BIGINT), COUNT(*) "
@@ -7645,27 +7691,15 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
             [parquet_files],
         ).fetchall()
         counts = {int(timeseries_id): int(row_count) for timeseries_id, row_count in rows}
-        
+
         # Calculate null timeseries_id count
         try:
-            null_timeseries_count = int(total_row_count) - sum(counts.values())
+            null_timeseries_count = max(0, total_row_count - non_null_timeseries_count)
         except (TypeError, ValueError):
-            # If we can't convert to int, assume no null timeseries_id rows
+            # If we can't calculate, assume no null timeseries_id rows.
             null_timeseries_count = 0
-        
-        # If there are null timeseries_id rows, this is a data fault
-        if null_timeseries_count > 0:
-            return {
-                "row_count": total_row_count,
-                "timeseries_row_counts": counts,
-                "null_timeseries_count": null_timeseries_count,
-                "min_timeseries_id": min(counts) if counts else None,
-                "max_timeseries_id": max(counts) if counts else None,
-                "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
-                "max_timestamp_utc": str(max_timestamp) if max_timestamp is not None else None,
-                "parquet_null_timeseries_id_rows": True,
-            }, None
-        
+
+        # Get timestamp stats
         timestamp_column = next(
             (name for name in ("observed_at_utc", "observed_at", "timestamp_hour_utc") if name in columns),
             None,
@@ -7679,14 +7713,19 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
                 "FROM read_parquet(?, union_by_name=true)",
                 [parquet_files],
             ).fetchone()
+
+        # Determine if we have null timeseries_id rows
+        has_null_timeseries_id_rows = null_timeseries_count > 0
         return {
             "row_count": total_row_count,
+            "non_null_timeseries_count": non_null_timeseries_count,
             "timeseries_row_counts": counts,
             "null_timeseries_count": null_timeseries_count,
-            "min_timeseries_id": min(counts) if counts else None,
-            "max_timeseries_id": max(counts) if counts else None,
+            "min_timeseries_id": min(counts.keys()) if counts else None,
+            "max_timeseries_id": max(counts.keys()) if counts else None,
             "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
             "max_timestamp_utc": str(max_timestamp) if max_timestamp is not None else None,
+            "parquet_null_timeseries_id_rows": has_null_timeseries_id_rows,
         }, None
     except Exception as exc:
         return None, f"{type(exc).__name__}:{exc}"
@@ -7699,12 +7738,138 @@ def _int_field(payload: Mapping[str, Any], field: str) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _manifest_file_keys(payload: Mapping[str, Any]) -> set[str]:
+_MANIFEST_FIELD_UNSET = object()
+
+
+def _append_required_int_field_gap(
+    gaps: list[dict[str, Any]],
+    *,
+    gap_fn,
+    gap_prefix: str,
+    payload: Mapping[str, Any],
+    field: str,
+    day_utc: str,
+    connector_id: int | str | None,
+    expected_path: str,
+    pollutant_code: str | None = None,
+    expected_value: Any = _MANIFEST_FIELD_UNSET,
+) -> int | None:
+    field_present = field in payload
+    actual_raw = payload.get(field)
+    gap_kwargs: dict[str, Any] = {
+        "day_utc": day_utc,
+        "connector_id": connector_id,
+        "expected_path": expected_path,
+    }
+    if pollutant_code is not None:
+        gap_kwargs["pollutant_code"] = pollutant_code
+    if not field_present:
+        gaps.append(gap_fn(
+            f"{gap_prefix}_{field}_schema_mismatch",
+            **gap_kwargs,
+            related_paths=[f"field={field} missing_or_invalid_type"],
+        ))
+        return None
+    if actual_raw is None:
+        if expected_value is None:
+            return None
+        gaps.append(gap_fn(
+            f"{gap_prefix}_{field}_schema_mismatch",
+            **gap_kwargs,
+            related_paths=[f"field={field} missing_or_invalid_type"],
+        ))
+        return None
+    if not isinstance(actual_raw, int) or isinstance(actual_raw, bool):
+        gaps.append(gap_fn(
+            f"{gap_prefix}_{field}_schema_mismatch",
+            **gap_kwargs,
+            related_paths=[f"field={field} missing_or_invalid_type"],
+        ))
+        return None
+    actual = int(actual_raw)
+    if expected_value is not _MANIFEST_FIELD_UNSET and actual != expected_value:
+        gaps.append(gap_fn(
+            f"{gap_prefix}_{field}_mismatch",
+            **gap_kwargs,
+            related_paths=[f"manifest_{field}={actual} expected_{field}={expected_value}"],
+        ))
+    return actual
+
+
+def _append_required_timestamp_field_gap(
+    gaps: list[dict[str, Any]],
+    *,
+    gap_fn,
+    gap_prefix: str,
+    payload: Mapping[str, Any],
+    field: str,
+    day_utc: str,
+    connector_id: int | str | None,
+    expected_path: str,
+    pollutant_code: str | None = None,
+    expected_value: Any = _MANIFEST_FIELD_UNSET,
+) -> str | None:
+    field_present = field in payload
+    actual_raw = payload.get(field)
+    gap_kwargs: dict[str, Any] = {
+        "day_utc": day_utc,
+        "connector_id": connector_id,
+        "expected_path": expected_path,
+    }
+    if pollutant_code is not None:
+        gap_kwargs["pollutant_code"] = pollutant_code
+    if not field_present:
+        gaps.append(gap_fn(
+            f"{gap_prefix}_{field}_schema_mismatch",
+            **gap_kwargs,
+            related_paths=[f"field={field} missing_or_invalid_type"],
+        ))
+        return None
+    if actual_raw is None:
+        if expected_value is None:
+            return None
+        gaps.append(gap_fn(
+            f"{gap_prefix}_{field}_schema_mismatch",
+            **gap_kwargs,
+            related_paths=[f"field={field} missing_or_invalid_type"],
+        ))
+        return None
+    actual = _parse_required_timestamp_value(actual_raw)
+    if actual is None:
+        gaps.append(gap_fn(
+            f"{gap_prefix}_{field}_schema_mismatch",
+            **gap_kwargs,
+            related_paths=[f"field={field} missing_or_invalid_type"],
+        ))
+        return None
+    if expected_value is not _MANIFEST_FIELD_UNSET:
+        expected = _parse_required_timestamp_value(expected_value)
+        if expected is None and expected_value is not None:
+            gaps.append(gap_fn(
+                f"{gap_prefix}_{field}_schema_mismatch",
+                **gap_kwargs,
+                related_paths=[f"field={field} missing_or_invalid_type"],
+            ))
+            return None
+        if expected != actual:
+            gaps.append(gap_fn(
+                f"{gap_prefix}_{field}_mismatch",
+                **gap_kwargs,
+                related_paths=[f"manifest_{field}={actual_raw} expected_{field}={expected_value}"],
+            ))
+    return actual_raw if isinstance(actual_raw, str) else None
+
+
+def _manifest_file_keys_from_entries(entries: Iterable[Any]) -> set[str]:
     return {
         str(entry.get("key") or "").strip().lstrip("/")
-        for entry in _manifest_files(payload)
+        for entry in entries
         if isinstance(entry, Mapping) and str(entry.get("key") or "").strip()
     }
+
+
+def _manifest_file_keys(payload: Mapping[str, Any]) -> set[str]:
+    return _manifest_file_keys_from_entries(_manifest_files(payload))
 
 
 def _child_manifest_aggregate(payloads: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -7716,21 +7881,19 @@ def _child_manifest_aggregate(payloads: Iterable[Mapping[str, Any]]) -> dict[str
     min_ids = [int(child["min_timeseries_id"]) for child in children if _is_positive_int(child.get("min_timeseries_id"))]
     max_ids = [int(child["max_timeseries_id"]) for child in children if _is_positive_int(child.get("max_timeseries_id"))]
     min_times = [
-        str(child.get("min_observed_at_utc") or child.get("min_timestamp_hour_utc"))
+        _parse_required_timestamp_value(child.get("min_observed_at_utc") or child.get("min_timestamp_hour_utc"))
         for child in children
-        if child.get("min_observed_at_utc") or child.get("min_timestamp_hour_utc")
     ]
     max_times = [
-        str(child.get("max_observed_at_utc") or child.get("max_timestamp_hour_utc"))
+        _parse_required_timestamp_value(child.get("max_observed_at_utc") or child.get("max_timestamp_hour_utc"))
         for child in children
-        if child.get("max_observed_at_utc") or child.get("max_timestamp_hour_utc")
     ]
     return {
         **numeric_sums,
         "min_timeseries_id": min(min_ids) if min_ids else None,
         "max_timeseries_id": max(max_ids) if max_ids else None,
-        "min_timestamp_utc": min(min_times) if min_times else None,
-        "max_timestamp_utc": max(max_times) if max_times else None,
+        "min_timestamp_utc": min((value for value in min_times if value is not None), default=None),
+        "max_timestamp_utc": max((value for value in max_times if value is not None), default=None),
         "file_keys": set().union(*(_manifest_file_keys(child) for child in children)) if children else set(),
     }
 
@@ -7745,54 +7908,34 @@ def _append_parent_aggregate_gaps(
     day_utc: str,
     connector_id: int | str | None,
     expected_path: str,
+    manifest_files: list[Any] | None = None,
+    files_valid: bool = True,
 ) -> None:
     gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
     aggregate = _child_manifest_aggregate(child_payloads)
-    
-    # Validate required fields are present and of correct type
-    required_fields = ("row_count", "source_row_count", "file_count", "total_bytes")
-    for field in required_fields:
-        actual = _int_field(payload, field)
-        if actual is None:
-            # Missing required field - this is a schema mismatch
-            gaps.append(gap_fn(
-                f"{level}_manifest_{field}_schema_mismatch",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                expected_path=expected_path,
-                related_paths=[f"field={field} missing_or_invalid_type"],
-            ))
-        elif actual != aggregate[field]:
-            # Field present but value mismatch
-            gaps.append(gap_fn(
-                f"{level}_manifest_{field}_mismatch",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                expected_path=expected_path,
-                related_paths=[f"manifest_{field}={actual} child_{field}={aggregate[field]}"],
-            ))
-    
-    # Handle zero vs missing row_count properly
-    row_count = _int_field(payload, "row_count")
-    if row_count is not None and row_count == 0:
-        # Genuine zero row count - use data_partition_zero_rows terminology
-        gaps.append(gap_fn(
-            "data_partition_zero_rows",
+
+    gap_prefix = f"{level}_manifest"
+    required_int_fields = (
+        ("row_count", aggregate["row_count"]),
+        ("source_row_count", aggregate["source_row_count"]),
+        ("file_count", aggregate["file_count"]),
+        ("total_bytes", aggregate["total_bytes"]),
+        ("min_timeseries_id", aggregate["min_timeseries_id"]),
+        ("max_timeseries_id", aggregate["max_timeseries_id"]),
+    )
+    for field, expected_value in required_int_fields:
+        _append_required_int_field_gap(
+            gaps,
+            gap_fn=gap_fn,
+            gap_prefix=gap_prefix,
+            payload=payload,
+            field=field,
             day_utc=day_utc,
             connector_id=connector_id,
             expected_path=expected_path,
-            related_paths=[f"row_count={row_count}"],
-        ))
-    for field in ("min_timeseries_id", "max_timeseries_id"):
-        if field in payload and payload.get(field) != aggregate[field]:
-            gaps.append(gap_fn(
-                f"{level}_manifest_{field}_mismatch",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                expected_path=expected_path,
-                related_paths=[f"manifest_{field}={payload.get(field)} child_{field}={aggregate[field]}"],
-            ))
-    # Domain-specific timestamp field validation
+            expected_value=expected_value,
+        )
+
     if domain == "observations":
         timestamp_fields = (
             ("min_observed_at_utc", "min_timestamp_utc"),
@@ -7805,28 +7948,32 @@ def _append_parent_aggregate_gaps(
         )
     else:
         timestamp_fields = ()
-    
+
     for field, aggregate_field in timestamp_fields:
-        if field in payload and payload.get(field) != aggregate[aggregate_field]:
-            gaps.append(gap_fn(
-                f"{level}_manifest_{field}_mismatch",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                expected_path=expected_path,
-                related_paths=[f"manifest_{field}={payload.get(field)} child_{field}={aggregate[aggregate_field]}"],
-            ))
-    parent_file_keys = _manifest_file_keys(payload)
-    if parent_file_keys != aggregate["file_keys"]:
-        gaps.append(gap_fn(
-            f"{level}_manifest_parquet_keys_mismatch",
+        _append_required_timestamp_field_gap(
+            gaps,
+            gap_fn=gap_fn,
+            gap_prefix=gap_prefix,
+            payload=payload,
+            field=field,
             day_utc=day_utc,
             connector_id=connector_id,
             expected_path=expected_path,
-            related_paths=sorted(
-                [f"missing={key}" for key in aggregate["file_keys"] - parent_file_keys]
-                + [f"stale={key}" for key in parent_file_keys - aggregate["file_keys"]]
-            ),
-        ))
+            expected_value=aggregate[aggregate_field],
+        )
+    if files_valid:
+        parent_file_keys = _manifest_file_keys_from_entries(manifest_files or [])
+        if parent_file_keys != aggregate["file_keys"]:
+            gaps.append(gap_fn(
+                f"{level}_manifest_parquet_keys_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=expected_path,
+                related_paths=sorted(
+                    [f"missing={key}" for key in aggregate["file_keys"] - parent_file_keys]
+                    + [f"stale={key}" for key in parent_file_keys - aggregate["file_keys"]]
+                ),
+            ))
 
 
 def _append_child_hash_gaps(
@@ -8084,16 +8231,7 @@ def _build_v2_source_r2_mismatch_gap(
 def _r2_partition_timeseries_counts_from_manifest(payload: Any) -> dict[int, int]:
     if not isinstance(payload, dict):
         return {}
-    counts = _normalize_timeseries_row_counts(payload.get("timeseries_row_counts"))
-    if counts:
-        return counts
-    merged: dict[int, int] = {}
-    for entry in _manifest_files(payload):
-        if not isinstance(entry, dict):
-            continue
-        for ts_id, count in _normalize_timeseries_row_counts(entry.get("timeseries_row_counts")).items():
-            merged[ts_id] = merged.get(ts_id, 0) + count
-    return merged
+    return _normalize_timeseries_row_counts(payload.get("timeseries_row_counts"))
 
 
 def _append_actual_parquet_gaps(
@@ -8122,29 +8260,155 @@ def _append_actual_parquet_gaps(
         return None, error
     if stats is None or payload is None:
         return stats, None
+    local_parquet_files = [Path(path) for path in parquet_files if Path(path).is_file()]
+    actual_bytes = sum(path.stat().st_size for path in local_parquet_files)
+    actual_file_count = len(local_parquet_files)
+    manifest_files = _manifest_files_list(payload)
+    if manifest_files is None:
+        gaps.append(gap_fn(
+            "data_manifest_schema_mismatch",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            related_paths=["field=files missing_or_invalid_type"],
+        ))
+    gap_prefix = "data_manifest"
+
+    row_count = _append_required_int_field_gap(
+        gaps,
+        gap_fn=gap_fn,
+        gap_prefix=gap_prefix,
+        payload=payload,
+        field="row_count",
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=manifest_rel,
+        expected_value=stats["row_count"],
+    )
+    _append_required_int_field_gap(
+        gaps,
+        gap_fn=gap_fn,
+        gap_prefix=gap_prefix,
+        payload=payload,
+        field="source_row_count",
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=manifest_rel,
+        expected_value=stats["row_count"],
+    )
+    _append_required_int_field_gap(
+        gaps,
+        gap_fn=gap_fn,
+        gap_prefix=gap_prefix,
+        payload=payload,
+        field="file_count",
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=manifest_rel,
+        expected_value=actual_file_count,
+    )
+    _append_required_int_field_gap(
+        gaps,
+        gap_fn=gap_fn,
+        gap_prefix=gap_prefix,
+        payload=payload,
+        field="total_bytes",
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=manifest_rel,
+        expected_value=actual_bytes,
+    )
+
+    if row_count == 0 and stats["row_count"] == 0:
+        gaps.append(gap_fn(
+            "data_partition_zero_rows",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            related_paths=[f"row_count={row_count}"],
+        ))
+
+    _append_required_int_field_gap(
+        gaps,
+        gap_fn=gap_fn,
+        gap_prefix=gap_prefix,
+        payload=payload,
+        field="min_timeseries_id",
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=manifest_rel,
+        expected_value=stats["min_timeseries_id"],
+    )
+    _append_required_int_field_gap(
+        gaps,
+        gap_fn=gap_fn,
+        gap_prefix=gap_prefix,
+        payload=payload,
+        field="max_timeseries_id",
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=manifest_rel,
+        expected_value=stats["max_timeseries_id"],
+    )
+
+    if domain == "observations":
+        timestamp_fields = (
+            ("min_observed_at_utc", "min_timestamp_utc"),
+            ("max_observed_at_utc", "max_timestamp_utc"),
+        )
+    elif domain == "aqilevels":
+        timestamp_fields = (
+            ("min_timestamp_hour_utc", "min_timestamp_utc"),
+            ("max_timestamp_hour_utc", "max_timestamp_utc"),
+        )
+    else:
+        timestamp_fields = ()
+
+    for field, actual_field in timestamp_fields:
+        _append_required_timestamp_field_gap(
+            gaps,
+            gap_fn=gap_fn,
+            gap_prefix=gap_prefix,
+            payload=payload,
+            field=field,
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            expected_value=stats[actual_field],
+        )
+
+    raw_timeseries_counts = payload.get("timeseries_row_counts")
+    if not isinstance(raw_timeseries_counts, dict):
+        gaps.append(gap_fn(
+            "data_manifest_schema_mismatch",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            related_paths=["field=timeseries_row_counts missing_or_invalid_type"],
+        ))
+        return stats, None
 
     manifest_counts = _r2_partition_timeseries_counts_from_manifest(payload)
     actual_counts = stats["timeseries_row_counts"]
-    manifest_row_count = _int_field(payload, "row_count")
-    if manifest_row_count is not None and manifest_row_count != stats["row_count"]:
+    if row_count is not None and row_count > 0 and not raw_timeseries_counts:
         gaps.append(gap_fn(
-            "data_manifest_row_count_mismatch",
+            "data_manifest_empty_timeseries_counts",
             day_utc=day_utc,
             connector_id=connector_id,
             pollutant_code=pollutant_code,
             expected_path=manifest_rel,
-            related_paths=[f"manifest_row_count={manifest_row_count} parquet_row_count={stats['row_count']}"],
         ))
-    source_row_count = _int_field(payload, "source_row_count")
-    if source_row_count is not None and source_row_count != stats["row_count"]:
-        gaps.append(gap_fn(
-            "data_manifest_source_row_count_mismatch",
-            day_utc=day_utc,
-            connector_id=connector_id,
-            pollutant_code=pollutant_code,
-            expected_path=manifest_rel,
-            related_paths=[f"manifest_source_row_count={source_row_count} parquet_row_count={stats['row_count']}"],
-        ))
+
     if manifest_counts != actual_counts:
         gaps.append(gap_fn(
             "data_manifest_timeseries_row_count_mismatch",
@@ -8158,39 +8422,6 @@ def _append_actual_parquet_gaps(
                 if manifest_counts.get(timeseries_id, 0) != actual_counts.get(timeseries_id, 0)
             ],
         ))
-    for field, actual_field in (
-        ("min_timeseries_id", "min_timeseries_id"),
-        ("max_timeseries_id", "max_timeseries_id"),
-    ):
-        if field in payload and payload.get(field) != stats[actual_field]:
-            gaps.append(gap_fn(
-                f"data_manifest_{field}_mismatch",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                pollutant_code=pollutant_code,
-                expected_path=manifest_rel,
-                related_paths=[f"manifest_{field}={payload.get(field)} parquet_{field}={stats[actual_field]}"],
-            ))
-    timestamp_fields = (
-        ("min_observed_at_utc", "min_timestamp_utc"),
-        ("max_observed_at_utc", "max_timestamp_utc"),
-        ("min_timestamp_hour_utc", "min_timestamp_utc"),
-        ("max_timestamp_hour_utc", "max_timestamp_utc"),
-    )
-    for field, actual_field in timestamp_fields:
-        if field not in payload or stats.get(actual_field) is None:
-            continue
-        manifest_timestamp = _parse_iso_utc(str(payload.get(field) or ""))
-        parquet_timestamp = _parse_iso_utc(str(stats.get(actual_field) or ""))
-        if manifest_timestamp is not None and parquet_timestamp is not None and manifest_timestamp != parquet_timestamp:
-            gaps.append(gap_fn(
-                f"data_manifest_{field}_mismatch",
-                day_utc=day_utc,
-                connector_id=connector_id,
-                pollutant_code=pollutant_code,
-                expected_path=manifest_rel,
-                related_paths=[f"manifest_{field}={payload.get(field)} parquet_{field}={stats.get(actual_field)}"],
-            ))
     return stats, None
 
 
@@ -8356,59 +8587,42 @@ def run_v2_observations_integrity_checks(
                         ]
                         if path_bad:
                             gaps.append(_v2_obs_gap("data_manifest_path_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=path_bad))
-                        files = _manifest_files(payload)
+                        files = _manifest_files_list(payload)
+                        files_valid = files is not None
+                        if not files_valid:
+                            files = []
                         local_parquet_keys = {
                             str(p.relative_to(root))
                             for p in sorted(local_parquets)
                         }
-                        listed_keys: list[str] = []
-                        duplicate_keys: set[str] = set()
-                        for entry in files:
-                            if isinstance(entry, dict) and str(entry.get("key") or "").strip():
-                                key_str = str(entry.get("key")).strip().lstrip("/")
-                                if key_str in listed_keys:
-                                    duplicate_keys.add(key_str)
-                                listed_keys.append(key_str)
-                        listed_key_set = set(listed_keys)
-                        if duplicate_keys:
-                            gaps.append(_v2_obs_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
-                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(files):
-                            gaps.append(_v2_obs_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
-                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(local_parquet_keys):
-                            gaps.append(_v2_obs_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match actual parquet file count"]))
-                        for missing_key in sorted(listed_key_set - local_parquet_keys):
-                            gaps.append(_v2_obs_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
-                        for unlisted_key in sorted(local_parquet_keys - listed_key_set):
-                            gaps.append(_v2_obs_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
-                        if "total_bytes" in payload and isinstance(payload.get("total_bytes"), int):
-                            actual_bytes = sum((root / key).stat().st_size for key in local_parquet_keys if (root / key).is_file())
-                            if int(payload.get("total_bytes") or 0) != actual_bytes:
-                                gaps.append(_v2_obs_gap("data_manifest_total_bytes_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"manifest_total_bytes={payload.get('total_bytes')} actual_total_bytes={actual_bytes}"]))
-                        ts_sum = sum(_normalize_timeseries_row_counts(payload.get("timeseries_row_counts")).values())
-                        if "row_count" in payload and isinstance(payload.get("row_count"), int) and ts_sum != int(payload.get("row_count") or 0):
-                            gaps.append(_v2_obs_gap("data_manifest_timeseries_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"row_count={payload.get('row_count')} timeseries_sum={ts_sum}"]))
-                        if "row_count" in payload and (not isinstance(payload.get("row_count"), int) or int(payload.get("row_count") or 0) <= 0):
-                            gaps.append(_v2_obs_gap("data_manifest_empty", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
-                        if "source_row_count" in payload and (not isinstance(payload.get("source_row_count"), int) or int(payload.get("source_row_count") or 0) <= 0):
-                            gaps.append(_v2_obs_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
-                        if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
-                            gaps.append(_v2_obs_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
-                        
-                        # Check for empty timeseries_row_counts (different from missing)
-                        if "timeseries_row_counts" in payload and isinstance(payload.get("timeseries_row_counts"), dict) and not payload.get("timeseries_row_counts"):
-                            gaps.append(_v2_obs_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
-                        for entry in files:
-                            key = entry.get("key") if isinstance(entry, dict) else None
-                            if not key:
-                                gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
-                                continue
-                            file_path = _rel_key_to_path(root, str(key))
-                            if file_path is None:
-                                gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
-                            elif not file_path.is_file():
-                                gaps.append(_v2_obs_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
-                            elif file_path.stat().st_size <= 0:
-                                gaps.append(_v2_obs_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                        if files_valid:
+                            listed_keys: list[str] = []
+                            duplicate_keys: set[str] = set()
+                            for entry in files:
+                                if isinstance(entry, dict) and str(entry.get("key") or "").strip():
+                                    key_str = str(entry.get("key")).strip().lstrip("/")
+                                    if key_str in listed_keys:
+                                        duplicate_keys.add(key_str)
+                                    listed_keys.append(key_str)
+                            listed_key_set = set(listed_keys)
+                            if duplicate_keys:
+                                gaps.append(_v2_obs_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
+                            for missing_key in sorted(listed_key_set - local_parquet_keys):
+                                gaps.append(_v2_obs_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
+                            for unlisted_key in sorted(local_parquet_keys - listed_key_set):
+                                gaps.append(_v2_obs_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
+                            for entry in files:
+                                key = entry.get("key") if isinstance(entry, dict) else None
+                                if not key:
+                                    gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
+                                    continue
+                                file_path = _rel_key_to_path(root, str(key))
+                                if file_path is None:
+                                    gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
+                                elif not file_path.is_file():
+                                    gaps.append(_v2_obs_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                                elif file_path.stat().st_size <= 0:
+                                    gaps.append(_v2_obs_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                     elif payload is not None:
                         gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                 parquet_stats, parquet_error = _append_actual_parquet_gaps(
@@ -8422,11 +8636,11 @@ def run_v2_observations_integrity_checks(
                     parquet_files=local_parquets,
                 )
                 parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
-                
+
                 # Check for null timeseries_id rows in observation parquet files
                 if parquet_stats and parquet_stats.get("parquet_null_timeseries_id_rows"):
                     gaps.append(_v2_obs_gap("parquet_null_timeseries_id_rows", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"null_timeseries_count={parquet_stats.get('null_timeseries_count', 0)}"]))
-                
+
                 for partition_gap in gaps[partition_gap_start:]:
                     if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
                         partition_gap["parquet_readable"] = parquet_readable
@@ -8900,6 +9114,7 @@ def build_v2_repair_plan(
             "data_manifest_invalid_json",
             "data_manifest_schema_mismatch",
             "data_manifest_empty",
+            "data_partition_zero_rows",
             "parquet_missing",
             "parquet_empty_or_placeholder",
             "parquet_unreadable",
@@ -8992,6 +9207,7 @@ def build_v2_repair_plan(
             "data_manifest_invalid_json",
             "data_manifest_schema_mismatch",
             "data_manifest_empty",
+            "data_partition_zero_rows",
             "parquet_missing",
             "parquet_empty_or_placeholder",
             "parquet_unreadable",
@@ -9191,59 +9407,42 @@ def run_v2_aqilevels_integrity_checks(
                         ]
                         if path_bad:
                             data_gaps.append(_v2_aqi_gap("data_manifest_path_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=path_bad))
-                        files = _manifest_files(payload)
+                        files = _manifest_files_list(payload)
+                        files_valid = files is not None
+                        if not files_valid:
+                            files = []
                         local_parquet_keys = {
                             str(p.relative_to(root))
                             for p in sorted(local_parquets)
                         }
-                        listed_keys: list[str] = []
-                        duplicate_keys: set[str] = set()
-                        for entry in files:
-                            if isinstance(entry, dict) and str(entry.get("key") or "").strip():
-                                key_str = str(entry.get("key")).strip().lstrip("/")
-                                if key_str in listed_keys:
-                                    duplicate_keys.add(key_str)
-                                listed_keys.append(key_str)
-                        listed_key_set = set(listed_keys)
-                        if duplicate_keys:
-                            data_gaps.append(_v2_aqi_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
-                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and not isinstance(payload.get("file_count"), bool) and payload.get("file_count") != len(files):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
-                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and not isinstance(payload.get("file_count"), bool) and payload.get("file_count") != len(local_parquet_keys):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match actual parquet file count"]))
-                        for missing_key in sorted(listed_key_set - local_parquet_keys):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
-                        for unlisted_key in sorted(local_parquet_keys - listed_key_set):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
-                        if "total_bytes" in payload and isinstance(payload.get("total_bytes"), int):
-                            actual_bytes = sum((root / key).stat().st_size for key in local_parquet_keys if (root / key).is_file())
-                            if int(payload.get("total_bytes") or 0) != actual_bytes:
-                                data_gaps.append(_v2_aqi_gap("data_manifest_total_bytes_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"manifest_total_bytes={payload.get('total_bytes')} actual_total_bytes={actual_bytes}"]))
-                        ts_sum = sum(_normalize_timeseries_row_counts(payload.get("timeseries_row_counts")).values())
-                        if "row_count" in payload and isinstance(payload.get("row_count"), int) and not isinstance(payload.get("row_count"), bool) and ts_sum != int(payload.get("row_count") or 0):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_timeseries_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"row_count={payload.get('row_count')} timeseries_sum={ts_sum}"]))
-                        if "row_count" in payload and not _is_positive_int(payload.get("row_count")):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_empty", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
-                        if "source_row_count" in payload and not _is_positive_int(payload.get("source_row_count")):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
-                        if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
-                        
-                        # Check for empty timeseries_row_counts (different from missing)
-                        if "timeseries_row_counts" in payload and isinstance(payload.get("timeseries_row_counts"), dict) and not payload.get("timeseries_row_counts"):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
-                        for entry in files:
-                            key = entry.get("key") if isinstance(entry, dict) else None
-                            if not key:
-                                data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
-                                continue
-                            file_path = _rel_key_to_path(root, str(key))
-                            if file_path is None:
-                                data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
-                            elif not file_path.is_file():
-                                data_gaps.append(_v2_aqi_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
-                            elif file_path.stat().st_size <= 0:
-                                data_gaps.append(_v2_aqi_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                        if files_valid:
+                            listed_keys: list[str] = []
+                            duplicate_keys: set[str] = set()
+                            for entry in files:
+                                if isinstance(entry, dict) and str(entry.get("key") or "").strip():
+                                    key_str = str(entry.get("key")).strip().lstrip("/")
+                                    if key_str in listed_keys:
+                                        duplicate_keys.add(key_str)
+                                    listed_keys.append(key_str)
+                            listed_key_set = set(listed_keys)
+                            if duplicate_keys:
+                                data_gaps.append(_v2_aqi_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
+                            for missing_key in sorted(listed_key_set - local_parquet_keys):
+                                data_gaps.append(_v2_aqi_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
+                            for unlisted_key in sorted(local_parquet_keys - listed_key_set):
+                                data_gaps.append(_v2_aqi_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
+                            for entry in files:
+                                key = entry.get("key") if isinstance(entry, dict) else None
+                                if not key:
+                                    data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
+                                    continue
+                                file_path = _rel_key_to_path(root, str(key))
+                                if file_path is None:
+                                    data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
+                                elif not file_path.is_file():
+                                    data_gaps.append(_v2_aqi_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                                elif file_path.stat().st_size <= 0:
+                                    data_gaps.append(_v2_aqi_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                     else:
                         data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                 parquet_stats, parquet_error = _append_actual_parquet_gaps(
@@ -9257,7 +9456,7 @@ def run_v2_aqilevels_integrity_checks(
                     parquet_files=local_parquets,
                 )
                 parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
-                
+
                 # Check for null timeseries_id rows in AQI parquet files
                 if parquet_stats and parquet_stats.get("parquet_null_timeseries_id_rows"):
                     data_gaps.append(_v2_aqi_gap("parquet_null_timeseries_id_rows", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"null_timeseries_count={parquet_stats.get('null_timeseries_count', 0)}"]))

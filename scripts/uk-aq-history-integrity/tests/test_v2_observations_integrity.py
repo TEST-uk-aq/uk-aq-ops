@@ -35,6 +35,12 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
     def _mock_parquet_stats(self, files) -> tuple[dict, None]:
         paths = [str(path) for path in files]
         joined = " ".join(paths)
+        day = "2026-06-11"
+        for path in paths:
+            for part in Path(path).parts:
+                if part.startswith("day_utc="):
+                    day = part.split("=", 1)[1]
+                    break
         if "connector_id=6" in joined:
             counts = {301: 1}
         elif "connector_id=1" in joined:
@@ -48,8 +54,8 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
             "timeseries_row_counts": counts,
             "min_timeseries_id": min(counts),
             "max_timeseries_id": max(counts),
-            "min_timestamp_utc": None,
-            "max_timestamp_utc": None,
+            "min_timestamp_utc": f"{day}T00:00:00+00",
+            "max_timestamp_utc": f"{day}T02:00:00+00",
         }, None
 
     def _partition(self, day: str = "2026-06-11", connector: int = 7, pollutant: str = "pm25") -> Path:
@@ -69,8 +75,12 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
                 "manifest_kind": "pollutant", "history_version": "v2", "domain": "observations",
                 "grain": None, "profile": None, "day_utc": day,
                 "connector_id": 7, "pollutant_code": "pm25", "row_count": 3,
-                "source_row_count": 3, "file_count": 1,
-                "timeseries_row_counts": {"101": 3}, "files": [{"key": key}],
+                "source_row_count": 3, "file_count": 1, "total_bytes": 4,
+                "min_timeseries_id": 101, "max_timeseries_id": 101,
+                "min_observed_at_utc": "2026-06-11T00:00:00+00",
+                "max_observed_at_utc": "2026-06-11T02:00:00+00",
+                "timeseries_row_counts": {"101": 3},
+                "files": [{"key": key, "bytes": 4, "timeseries_row_counts": {"101": 3}}],
             }), encoding="utf-8")
         if index:
             idx = self._index(day=day)
@@ -98,13 +108,22 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
                     children.append(payload)
             connector_id = int(connector_dir.name.split("=", 1)[1])
             files = [entry for child in children for entry in child.get("files", [])]
+            min_ids = [int(child["min_timeseries_id"]) for child in children if isinstance(child.get("min_timeseries_id"), int)]
+            max_ids = [int(child["max_timeseries_id"]) for child in children if isinstance(child.get("max_timeseries_id"), int)]
+            min_times = [str(child["min_observed_at_utc"]) for child in children if child.get("min_observed_at_utc")]
+            max_times = [str(child["max_observed_at_utc"]) for child in children if child.get("max_observed_at_utc")]
             connector_payload = {
                 "manifest_kind": "connector", "history_version": "v2", "domain": "observations",
                 "grain": None, "profile": None, "day_utc": day, "connector_id": connector_id,
                 "pollutant_codes": [child["pollutant_code"] for child in children],
                 "row_count": sum(child.get("row_count", 0) for child in children),
                 "source_row_count": sum(child.get("source_row_count", 0) for child in children),
-                "file_count": len(files), "total_bytes": sum(entry.get("bytes", 0) for entry in files),
+                "file_count": sum(child.get("file_count", 0) for child in children),
+                "total_bytes": sum(child.get("total_bytes", 0) for child in children),
+                "min_timeseries_id": min(min_ids) if min_ids else None,
+                "max_timeseries_id": max(max_ids) if max_ids else None,
+                "min_observed_at_utc": min(min_times) if min_times else None,
+                "max_observed_at_utc": max(max_times) if max_times else None,
                 "files": files,
                 "child_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
                 "pollutant_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
@@ -112,13 +131,22 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
             (connector_dir / "manifest.json").write_text(json.dumps(connector_payload), encoding="utf-8")
             connector_payloads.append(connector_payload)
         files = [entry for child in connector_payloads for entry in child.get("files", [])]
+        min_ids = [int(child["min_timeseries_id"]) for child in connector_payloads if isinstance(child.get("min_timeseries_id"), int)]
+        max_ids = [int(child["max_timeseries_id"]) for child in connector_payloads if isinstance(child.get("max_timeseries_id"), int)]
+        min_times = [str(child["min_observed_at_utc"]) for child in connector_payloads if child.get("min_observed_at_utc")]
+        max_times = [str(child["max_observed_at_utc"]) for child in connector_payloads if child.get("max_observed_at_utc")]
         day_payload = {
             "manifest_kind": "day", "history_version": "v2", "domain": "observations",
             "grain": None, "profile": None, "day_utc": day,
             "connector_ids": [child["connector_id"] for child in connector_payloads],
             "row_count": sum(child.get("row_count", 0) for child in connector_payloads),
             "source_row_count": sum(child.get("source_row_count", 0) for child in connector_payloads),
-            "file_count": len(files), "total_bytes": sum(entry.get("bytes", 0) for entry in files),
+            "file_count": sum(child.get("file_count", 0) for child in connector_payloads),
+            "total_bytes": sum(child.get("total_bytes", 0) for child in connector_payloads),
+            "min_timeseries_id": min(min_ids) if min_ids else None,
+            "max_timeseries_id": max(max_ids) if max_ids else None,
+            "min_observed_at_utc": min(min_times) if min_times else None,
+            "max_observed_at_utc": max(max_times) if max_times else None,
             "files": files,
             "child_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
             "connector_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
@@ -241,8 +269,11 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         (part6 / "manifest.json").write_text(json.dumps({
             "manifest_kind": "pollutant", "history_version": "v2", "domain": "observations",
             "grain": None, "profile": None, "day_utc": day, "connector_id": 6,
-            "pollutant_code": "pm25", "files": [{"key": key6}], "file_count": 1,
-            "row_count": 1, "source_row_count": 1, "timeseries_row_counts": {"301": 1},
+            "pollutant_code": "pm25", "files": [{"key": key6, "bytes": 4, "timeseries_row_counts": {"301": 1}}], "file_count": 1,
+            "total_bytes": 4, "row_count": 1, "source_row_count": 1,
+            "min_timeseries_id": 301, "max_timeseries_id": 301,
+            "min_observed_at_utc": "2026-06-07T00:00:00+00", "max_observed_at_utc": "2026-06-07T02:00:00+00",
+            "timeseries_row_counts": {"301": 1},
         }), encoding="utf-8")
         idx6 = self._index(day=day, connector=6, pollutant="pm25")
         idx6.mkdir(parents=True, exist_ok=True)
@@ -255,8 +286,11 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
             "manifest_kind": "pollutant", "history_version": "v2", "domain": "observations",
             "grain": None, "profile": None, "day_utc": day,
             "connector_id": 1, "pollutant_code": "o3", "row_count": 1,
-            "source_row_count": 1, "file_count": 1,
-            "timeseries_row_counts": {"201": 1}, "files": [{"key": key1}],
+            "source_row_count": 1, "file_count": 1, "total_bytes": 4,
+            "min_timeseries_id": 201, "max_timeseries_id": 201,
+            "min_observed_at_utc": "2026-06-07T00:00:00+00", "max_observed_at_utc": "2026-06-07T02:00:00+00",
+            "timeseries_row_counts": {"201": 1},
+            "files": [{"key": key1, "bytes": 4, "timeseries_row_counts": {"201": 1}}],
         }), encoding="utf-8")
         self._write_parent_manifests(day)
 
@@ -279,6 +313,16 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         key1 = f"history/v2/observations/day_utc={day}/connector_id=1/pollutant_code=o3/part-00000.parquet"
         (self.root / key1).write_bytes(b"PAR1")
         (part1 / "manifest.json").write_text(json.dumps({"files": [{"key": key1}], "row_count": 1, "timeseries_row_counts": {"201": 1}}), encoding="utf-8")
+        (part1 / "manifest.json").write_text(json.dumps({
+            "manifest_kind": "pollutant", "history_version": "v2", "domain": "observations",
+            "grain": None, "profile": None, "day_utc": day,
+            "connector_id": 1, "pollutant_code": "o3", "row_count": 1,
+            "source_row_count": 1, "file_count": 1, "total_bytes": 4,
+            "min_timeseries_id": 201, "max_timeseries_id": 201,
+            "min_observed_at_utc": "2026-06-07T00:00:00+00", "max_observed_at_utc": "2026-06-07T02:00:00+00",
+            "timeseries_row_counts": {"201": 1},
+            "files": [{"key": key1, "bytes": 4, "timeseries_row_counts": {"201": 1}}],
+        }), encoding="utf-8")
 
         result = MODULE.run_v2_observations_integrity_checks(
             r2_history_root=self.root, config=self.config, from_day=day, to_day=day,
@@ -296,6 +340,16 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         key1 = f"history/v2/observations/day_utc={day}/connector_id=1/pollutant_code=o3/part-00000.parquet"
         (self.root / key1).write_bytes(b"PAR1")
         (part1 / "manifest.json").write_text(json.dumps({"files": [{"key": key1}], "row_count": 1, "timeseries_row_counts": {"201": 1}}), encoding="utf-8")
+        (part1 / "manifest.json").write_text(json.dumps({
+            "manifest_kind": "pollutant", "history_version": "v2", "domain": "observations",
+            "grain": None, "profile": None, "day_utc": day,
+            "connector_id": 1, "pollutant_code": "o3", "row_count": 1,
+            "source_row_count": 1, "file_count": 1, "total_bytes": 4,
+            "min_timeseries_id": 201, "max_timeseries_id": 201,
+            "min_observed_at_utc": "2026-06-07T00:00:00+00", "max_observed_at_utc": "2026-06-07T02:00:00+00",
+            "timeseries_row_counts": {"201": 1},
+            "files": [{"key": key1, "bytes": 4, "timeseries_row_counts": {"201": 1}}],
+        }), encoding="utf-8")
 
         result = MODULE.run_v2_observations_integrity_checks(
             r2_history_root=self.root, config=self.config, from_day=day, to_day=day,

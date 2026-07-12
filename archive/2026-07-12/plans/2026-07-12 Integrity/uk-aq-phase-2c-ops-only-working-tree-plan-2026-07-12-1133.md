@@ -545,7 +545,7 @@ No file under an ingest repository is writable.
 | Phase | Name | Status | Working-tree result | Repository boundary |
 | --- | --- | --- | --- | --- |
 | 2c.0 | Inspect `main` and closed PRs | Complete | No code changes | Ops only |
-| 2c.1 | Correct manifest schema and parquet statistics | Not started |  | Ops only |
+| 2c.1 | Correct manifest schema and parquet statistics | Local validation complete, uncommitted | All tests pass, no sibling changes | Ops only |
 | 2c.2 | Propagate evidence and correct planning | Not started |  | Ops only |
 | 2c.3 | Complete stored-hash validation | Not started |  | Ops only |
 | 2c.4 | Run full local validation and prepare handoff | Not started |  | Ops only |
@@ -786,31 +786,59 @@ git status --short
 Status:
 
 ```text
-Not started
+Local validation complete, uncommitted
 ```
 
 Changed ops files:
 
 ```text
-To be updated by Vibe Code.
+scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py
 ```
 
 Sibling repository status comparison:
 
 ```text
-To be updated by Vibe Code.
+Pre-phase: all sibling repos clean (no porcelain output)
+Post-phase: TEST-uk-aq-ingest: clean, uk-aq-ingest: clean, TEST-uk-aq-schema: clean
+No sibling repository changed during Phase 2c.1
 ```
 
 Tests:
 
 ```text
-To be updated by Vibe Code.
+Phase 2c.1 tests: 18 tests passed (test_v2_phase2_validation.py)
+Full v2 suite: 120 tests passed (test_v2_*.py)
+python3 -m py_compile: passed for both bin files
+git diff --check: passed (after trailing whitespace fix)
 ```
 
 Runtime handoff:
 
 ```text
-To be updated by Vibe Code.
+Runtime files to copy:
+  scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+
+Development-only files (no copy needed):
+  scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py
+  plans/2026-07-12 Integrity/uk-aq-phase-2c-ops-only-working-tree-plan-2026-07-12-1133.md
+
+Dependency changes: No dependency change
+Runtime configuration impact: No runtime configuration change
+
+Runtime validation commands:
+  cd <INTEGRITY_INSTALL_DIR>
+  source <RUNTIME_VENV>/bin/activate
+  python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+
+Expected result:
+  Exit code: 0
+  All Phase 2c.1 validation logic active
+  No write behaviour added
+  parquet_null_timeseries_id_rows emitted for null ID rows
+  data_manifest_empty_timeseries_counts terminology used
+
+Rollback files: None (first runtime copy; user backs up existing file before replacement)
 ```
 
 ---
