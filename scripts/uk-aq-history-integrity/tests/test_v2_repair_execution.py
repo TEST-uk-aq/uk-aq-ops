@@ -247,6 +247,8 @@ class V2RepairExecutionTests(unittest.TestCase):
         part = root / f"history/v2/observations/day_utc={day_utc}/connector_id={connector_id}/pollutant_code={pollutant_code}"
         part.mkdir(parents=True, exist_ok=True)
         (root / key).write_bytes(b"PAR1")
+        part_bytes = (root / key).stat().st_size
+        manifest_hash = f"obs-{day_utc}-connector-{connector_id}-{pollutant_code}-hash"
         payload = {
             "manifest_kind": "pollutant",
             "history_version": "v2",
@@ -259,9 +261,16 @@ class V2RepairExecutionTests(unittest.TestCase):
             "row_count": row_count,
             "source_row_count": row_count,
             "file_count": 1,
+            "total_bytes": part_bytes,
+            "min_timeseries_id": min(counts) if counts else None,
+            "max_timeseries_id": max(counts) if counts else None,
+            "min_observed_at_utc": None,
+            "max_observed_at_utc": None,
+            "manifest_hash": manifest_hash,
             "timeseries_row_counts": {str(key): value for key, value in counts.items()},
             "files": [{
                 "key": key,
+                "bytes": part_bytes,
                 "row_count": row_count,
                 "pollutant_code": pollutant_code,
                 "timeseries_row_counts": {str(key): value for key, value in counts.items()},
@@ -288,6 +297,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             payload = json.loads((pollutant_dir / "manifest.json").read_text(encoding="utf-8"))
             children.append(payload)
         files = [entry for child in children for entry in child.get("files", [])]
+        manifest_hash = f"obs-{day_utc}-connector-{connector_id}-hash"
         connector = {
             "manifest_kind": "connector", "history_version": "v2", "domain": "observations",
             "grain": None, "profile": None, "day_utc": day_utc, "connector_id": connector_id,
@@ -295,9 +305,14 @@ class V2RepairExecutionTests(unittest.TestCase):
             "row_count": sum(child["row_count"] for child in children),
             "source_row_count": sum(child["source_row_count"] for child in children),
             "file_count": len(files), "total_bytes": sum(entry.get("bytes", 0) for entry in files),
+            "min_timeseries_id": min((int(child["min_timeseries_id"]) for child in children if child.get("min_timeseries_id") is not None), default=None),
+            "max_timeseries_id": max((int(child["max_timeseries_id"]) for child in children if child.get("max_timeseries_id") is not None), default=None),
+            "min_observed_at_utc": None,
+            "max_observed_at_utc": None,
+            "manifest_hash": manifest_hash,
             "files": files,
-            "child_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
-            "pollutant_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
+            "child_manifests": [{"pollutant_code": child["pollutant_code"], "manifest_hash": child["manifest_hash"]} for child in children],
+            "pollutant_manifests": [{"pollutant_code": child["pollutant_code"], "manifest_hash": child["manifest_hash"]} for child in children],
         }
         (connector_dir / "manifest.json").write_text(json.dumps(connector), encoding="utf-8")
         connectors = []
@@ -306,6 +321,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             if manifest_path.is_file():
                 connectors.append(json.loads(manifest_path.read_text(encoding="utf-8")))
         day_files = [entry for child in connectors for entry in child.get("files", [])]
+        day_manifest_hash = f"obs-{day_utc}-day-hash"
         day = {
             "manifest_kind": "day", "history_version": "v2", "domain": "observations",
             "grain": None, "profile": None, "day_utc": day_utc,
@@ -313,9 +329,14 @@ class V2RepairExecutionTests(unittest.TestCase):
             "row_count": sum(child["row_count"] for child in connectors),
             "source_row_count": sum(child["source_row_count"] for child in connectors),
             "file_count": len(day_files), "total_bytes": sum(entry.get("bytes", 0) for entry in day_files),
+            "min_timeseries_id": min((int(child["min_timeseries_id"]) for child in connectors if child.get("min_timeseries_id") is not None), default=None),
+            "max_timeseries_id": max((int(child["max_timeseries_id"]) for child in connectors if child.get("max_timeseries_id") is not None), default=None),
+            "min_observed_at_utc": None,
+            "max_observed_at_utc": None,
+            "manifest_hash": day_manifest_hash,
             "files": day_files,
-            "child_manifests": [{"connector_id": child["connector_id"]} for child in connectors],
-            "connector_manifests": [{"connector_id": child["connector_id"]} for child in connectors],
+            "child_manifests": [{"connector_id": child["connector_id"], "manifest_hash": child["manifest_hash"]} for child in connectors],
+            "connector_manifests": [{"connector_id": child["connector_id"], "manifest_hash": child["manifest_hash"]} for child in connectors],
         }
         (day_dir / "manifest.json").write_text(json.dumps(day), encoding="utf-8")
 
@@ -368,7 +389,8 @@ class V2RepairExecutionTests(unittest.TestCase):
         source_counts: dict[int, int] | None = None,
     ) -> sqlite3.Connection:
         timeseries_pollutants = timeseries_pollutants or {218: "pm25"}
-        source_counts = source_counts or {218: 24}
+        if source_counts is None:
+            source_counts = {218: 24}
         conn = MODULE.open_db(str(self.root / f"current-source-{connector_id}-{day_utc}.sqlite"))
         phenomenon_ids: dict[str, int] = {}
         for pollutant in sorted(set(timeseries_pollutants.values())):
@@ -400,7 +422,8 @@ class V2RepairExecutionTests(unittest.TestCase):
                 """,
                 (source_key, source_location_id, source_location_id, 1, connector_id, ts_id, 1),
             )
-        source_file_key = f"{source_key}:{source_location_id}:{day_utc}"
+        day = MODULE.dt.date.fromisoformat(day_utc)
+        source_file_key = MODULE._source_file_key_for_lookup_row(source_key, source_location_id, day) or f"{source_key}:{source_location_id}:{day_utc}"
         conn.execute(
             """
             INSERT INTO source_file_state (
@@ -722,6 +745,8 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(gaps[0]["r2_rows"], 13)
             self.assertEqual(gaps[0]["missing_timeseries_count"], 1)
             self.assertIn(218, gaps[0]["sample_missing_timeseries_ids"])
+            self.assertEqual(gaps[0]["source_evidence"]["source_partition_state"], "successful_non_empty")
+            self.assertTrue(gaps[0]["source_evidence"]["source_counts_present"])
 
             repair_metrics = MODULE.run_v2_gap_backfills(
                 conn=conn,
@@ -741,6 +766,50 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertIn("--history-version v2 --targeted --kind observations", repair_metrics["planned_v2_observation_index_rebuilds"][0])
         finally:
             conn.close()
+
+    def test_v2_source_partition_evidence_distinguishes_successful_empty_from_unavailable(self) -> None:
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 13},
+        )
+        manifest_path = Path(self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"]) / "history/v2/observations/day_utc=2026-06-18/connector_id=1/pollutant_code=pm25/manifest.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["row_count"] = 999
+        payload["source_row_count"] = 999
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        empty_source_conn = self._new_current_source_db(
+            day_utc="2026-06-18",
+            connector_id=1,
+            timeseries_pollutants={218: "pm25"},
+            source_counts={},
+        )
+        try:
+            result = self._run_v2_observations_integrity_with_source(
+                empty_source_conn,
+                day_utc="2026-06-18",
+                connector_ids=[1],
+            )
+            gap = next(g for g in result["gaps"] if g["gap_type"] == "data_manifest_row_count_mismatch")
+            self.assertEqual(gap["source_evidence"]["source_partition_state"], "successful_empty")
+            self.assertFalse(gap["source_evidence"]["source_counts_present"])
+        finally:
+            empty_source_conn.close()
+
+        unavailable_source_conn = MODULE.open_db(str(self.root / "unavailable-current-source.sqlite"))
+        try:
+            result = self._run_v2_observations_integrity_with_source(
+                unavailable_source_conn,
+                day_utc="2026-06-18",
+                connector_ids=[1],
+            )
+            gap = next(g for g in result["gaps"] if g["gap_type"] == "data_manifest_row_count_mismatch")
+            self.assertEqual(gap["source_evidence"]["source_partition_state"], "counts_unavailable")
+            self.assertFalse(gap["source_evidence"]["source_counts_present"])
+        finally:
+            unavailable_source_conn.close()
 
     def test_v2_source_r2_matching_counts_do_not_create_repair_candidate(self) -> None:
         self._write_v2_observation_partition(
@@ -907,6 +976,9 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(metrics["planned_aqi_rebuilds"], [])
             self.assertEqual(metrics["v2_observation_repair_results"][0]["status"], "source_pending")
             self.assertEqual(gap["suggested_repair"]["kind"], "source_to_v2_observations_backfill")
+            self.assertFalse(gap["suggested_repair"]["executes"])
+            self.assertFalse(gap["suggested_repair"]["operator_action_required"])
+            self.assertEqual(gap["source_evidence"]["source_cache_status"]["status"], "download_failed")
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
             self.assertEqual(int(queued), 0)
         finally:
@@ -943,6 +1015,9 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(metrics["observation_backfill_candidate_timeseries_ids"], 1)
             self.assertEqual(metrics["aqi_rebuilds_queued_from_obs_repair"], 1)
             self.assertEqual(gap["suggested_repair"]["kind"], "source_to_v2_observations_backfill")
+            self.assertFalse(gap["suggested_repair"]["executes"])
+            self.assertFalse(gap["suggested_repair"]["operator_action_required"])
+            self.assertEqual(gap["source_evidence"]["source_cache_status"]["status"], "ok")
             self.assertIn("reason=obs_repaired", metrics["planned_aqi_rebuilds"][0])
             self.assertEqual(run_bf.call_args.kwargs["connector_ids"], [6])
             queued = conn.execute(

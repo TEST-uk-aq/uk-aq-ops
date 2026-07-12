@@ -825,6 +825,297 @@ class V2Phase2ValidationTests(unittest.TestCase):
         )
         self.assertEqual([], gaps)
 
+    def test_child_manifest_hash_missing_is_reported_for_observations_and_aqilevels(self) -> None:
+        """Test that missing child manifest hashes are reported for both domains."""
+        cases = (
+            ("observations", "o3", 101),
+            ("aqilevels", "pm25", 101),
+        )
+        for domain, pollutant, ts_id in cases:
+            with self.subTest(domain=domain, pollutant=pollutant):
+                self._write_pollutant(domain, pollutant, 1, ts_id)
+                part = self._partition(domain, pollutant)
+                child_manifest_path = part / "manifest.json"
+                child_payload = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+                child_payload.pop("manifest_hash", None)
+                child_manifest_path.write_text(json.dumps(child_payload), encoding="utf-8")
+
+                connector_dir = part.parent
+                connector_manifest = {
+                    "manifest_kind": "connector",
+                    "history_version": "v2",
+                    "domain": domain,
+                    "grain": "hourly" if domain == "aqilevels" else None,
+                    "profile": "data" if domain == "aqilevels" else None,
+                    "day_utc": "2026-06-11",
+                    "connector_id": 1,
+                    "pollutant_codes": [pollutant],
+                    "row_count": 1,
+                    "source_row_count": 1,
+                    "file_count": 1,
+                    "total_bytes": 4,
+                    "min_timeseries_id": ts_id,
+                    "max_timeseries_id": ts_id,
+                    "min_observed_at_utc": "2026-06-11T00:00:00Z" if domain == "observations" else None,
+                    "max_observed_at_utc": "2026-06-11T02:00:00Z" if domain == "observations" else None,
+                    "min_timestamp_hour_utc": "2026-06-11T00:00:00Z" if domain == "aqilevels" else None,
+                    "max_timestamp_hour_utc": "2026-06-11T02:00:00Z" if domain == "aqilevels" else None,
+                    "files": [{
+                        "key": str((part / "part-00000.parquet").relative_to(self.root)),
+                        "bytes": 4,
+                        "timeseries_row_counts": {str(ts_id): 1},
+                    }],
+                    "child_manifests": [{"pollutant_code": pollutant, "manifest_hash": f"hash-{pollutant}"}],
+                    "pollutant_manifests": [{"pollutant_code": pollutant, "manifest_hash": f"hash-{pollutant}"}],
+                    "manifest_hash": "connector-hash",
+                }
+                (connector_dir / "manifest.json").write_text(json.dumps(connector_manifest), encoding="utf-8")
+
+                gaps = []
+                MODULE._validate_v2_parent_hierarchy(
+                    root=self.root,
+                    data_prefix=(
+                        self.config.observations_data_prefix
+                        if domain == "observations"
+                        else self.config.aqilevels_hourly_data_prefix
+                    ),
+                    day_utc="2026-06-11",
+                    connector_dir=connector_dir,
+                    day_dir=connector_dir.parent,
+                    gaps=gaps,
+                    domain=domain,
+                )
+                MODULE._classify_v2_gaps(gaps)
+                gap_types = {gap["gap_type"] for gap in gaps}
+                self.assertIn("data_manifest_manifest_hash_schema_mismatch", gap_types)
+                self.assertTrue(
+                    any(gap["fault_class"] == "pollutant manifest-only fault" for gap in gaps if gap["gap_type"] == "data_manifest_manifest_hash_schema_mismatch"),
+                )
+                self.assertNotIn("connector_manifest_child_manifests_child_hash_mismatch", gap_types)
+                self.assertNotIn("connector_manifest_pollutant_manifests_child_hash_mismatch", gap_types)
+
+    def test_parent_entry_manifest_hash_missing_is_reported_for_connector_and_day(self) -> None:
+        """Test that missing parent child-entry hashes are reported for connector and day manifests."""
+        cases = (
+            ("observations", "connector", "child_manifests", "pollutant_manifests", "connector_manifest_child_manifests_manifest_hash_schema_mismatch"),
+            ("observations", "day", "connector_manifests", "child_manifests", "day_manifest_connector_manifests_manifest_hash_schema_mismatch"),
+            ("aqilevels", "connector", "child_manifests", "pollutant_manifests", "connector_manifest_child_manifests_manifest_hash_schema_mismatch"),
+            ("aqilevels", "day", "connector_manifests", "child_manifests", "day_manifest_connector_manifests_manifest_hash_schema_mismatch"),
+        )
+        for domain, parent_level, missing_field, present_field, expected_gap_type in cases:
+            with self.subTest(domain=domain, parent_level=parent_level):
+                self._write_pollutant(domain, "o3" if domain == "observations" else "pm25", 1, 101)
+                part = self._partition(domain, "o3" if domain == "observations" else "pm25")
+                child_manifest = json.loads((part / "manifest.json").read_text(encoding="utf-8"))
+                connector_dir = part.parent
+
+                connector_manifest = {
+                    "manifest_kind": "connector",
+                    "history_version": "v2",
+                    "domain": domain,
+                    "grain": "hourly" if domain == "aqilevels" else None,
+                    "profile": "data" if domain == "aqilevels" else None,
+                    "day_utc": "2026-06-11",
+                    "connector_id": 1,
+                    "pollutant_codes": [child_manifest["pollutant_code"]],
+                    "row_count": 1,
+                    "source_row_count": 1,
+                    "file_count": 1,
+                    "total_bytes": 4,
+                    "min_timeseries_id": 101,
+                    "max_timeseries_id": 101,
+                    "min_observed_at_utc": "2026-06-11T00:00:00Z" if domain == "observations" else None,
+                    "max_observed_at_utc": "2026-06-11T02:00:00Z" if domain == "observations" else None,
+                    "min_timestamp_hour_utc": "2026-06-11T00:00:00Z" if domain == "aqilevels" else None,
+                    "max_timestamp_hour_utc": "2026-06-11T02:00:00Z" if domain == "aqilevels" else None,
+                    "files": [{
+                        "key": str((part / "part-00000.parquet").relative_to(self.root)),
+                        "bytes": 4,
+                        "timeseries_row_counts": {"101": 1},
+                    }],
+                    missing_field: [{"pollutant_code": child_manifest["pollutant_code"]}],
+                    present_field: [{"pollutant_code": child_manifest["pollutant_code"], "manifest_hash": child_manifest["manifest_hash"]}],
+                    "manifest_hash": "connector-hash",
+                }
+                (connector_dir / "manifest.json").write_text(json.dumps(connector_manifest), encoding="utf-8")
+
+                day_dir = connector_dir.parent
+                day_manifest = {
+                    "manifest_kind": "day",
+                    "history_version": "v2",
+                    "domain": domain,
+                    "grain": "hourly" if domain == "aqilevels" else None,
+                    "profile": "data" if domain == "aqilevels" else None,
+                    "day_utc": "2026-06-11",
+                    "connector_ids": [1],
+                    "row_count": 1,
+                    "source_row_count": 1,
+                    "file_count": 1,
+                    "total_bytes": 4,
+                    "min_timeseries_id": 101,
+                    "max_timeseries_id": 101,
+                    "min_observed_at_utc": "2026-06-11T00:00:00Z" if domain == "observations" else None,
+                    "max_observed_at_utc": "2026-06-11T02:00:00Z" if domain == "observations" else None,
+                    "min_timestamp_hour_utc": "2026-06-11T00:00:00Z" if domain == "aqilevels" else None,
+                    "max_timestamp_hour_utc": "2026-06-11T02:00:00Z" if domain == "aqilevels" else None,
+                    "files": [{
+                        "key": str((part / "part-00000.parquet").relative_to(self.root)),
+                        "bytes": 4,
+                        "timeseries_row_counts": {"101": 1},
+                    }],
+                    "child_manifests": [{"connector_id": 1, "manifest_hash": "connector-hash"}],
+                    "connector_manifests": [{"connector_id": 1, "manifest_hash": "connector-hash"}],
+                    "manifest_hash": "day-hash",
+                }
+                if parent_level == "day":
+                    day_manifest[missing_field] = [{"connector_id": 1}]
+                    day_manifest[present_field] = [{"connector_id": 1, "manifest_hash": "connector-hash"}]
+                    (day_dir / "manifest.json").write_text(json.dumps(day_manifest), encoding="utf-8")
+                else:
+                    (day_dir / "manifest.json").write_text(json.dumps(day_manifest), encoding="utf-8")
+
+                gaps = []
+                MODULE._validate_v2_parent_hierarchy(
+                    root=self.root,
+                    data_prefix=(
+                        self.config.observations_data_prefix
+                        if domain == "observations"
+                        else self.config.aqilevels_hourly_data_prefix
+                    ),
+                    day_utc="2026-06-11",
+                    connector_dir=connector_dir,
+                    day_dir=day_dir,
+                    gaps=gaps,
+                    domain=domain,
+                )
+                if parent_level == "day":
+                    MODULE._validate_v2_parent_hierarchy(
+                        root=self.root,
+                        data_prefix=(
+                            self.config.observations_data_prefix
+                            if domain == "observations"
+                            else self.config.aqilevels_hourly_data_prefix
+                        ),
+                        day_utc="2026-06-11",
+                        connector_dir=None,
+                        day_dir=day_dir,
+                        gaps=gaps,
+                        domain=domain,
+                    )
+                gap_types = {gap["gap_type"] for gap in gaps}
+                self.assertIn(expected_gap_type, gap_types)
+                self.assertNotIn(expected_gap_type.replace("manifest_hash_schema_mismatch", "child_hash_mismatch"), gap_types)
+
+    def test_parent_entry_stored_hash_mismatch_is_reported_for_connector_and_day(self) -> None:
+        """Test that stored parent/child hash mismatches are reported for connector and day manifests."""
+        cases = (
+            ("observations", "connector", "child_manifests", "pollutant_manifests", "connector_manifest_child_manifests_child_hash_mismatch"),
+            ("observations", "day", "connector_manifests", "child_manifests", "day_manifest_connector_manifests_child_hash_mismatch"),
+            ("aqilevels", "connector", "child_manifests", "pollutant_manifests", "connector_manifest_child_manifests_child_hash_mismatch"),
+            ("aqilevels", "day", "connector_manifests", "child_manifests", "day_manifest_connector_manifests_child_hash_mismatch"),
+        )
+        for domain, parent_level, mismatched_field, matching_field, expected_gap_type in cases:
+            with self.subTest(domain=domain, parent_level=parent_level):
+                self._write_pollutant(domain, "o3" if domain == "observations" else "pm25", 1, 101)
+                part = self._partition(domain, "o3" if domain == "observations" else "pm25")
+                child_manifest = json.loads((part / "manifest.json").read_text(encoding="utf-8"))
+                connector_dir = part.parent
+
+                connector_manifest = {
+                    "manifest_kind": "connector",
+                    "history_version": "v2",
+                    "domain": domain,
+                    "grain": "hourly" if domain == "aqilevels" else None,
+                    "profile": "data" if domain == "aqilevels" else None,
+                    "day_utc": "2026-06-11",
+                    "connector_id": 1,
+                    "pollutant_codes": [child_manifest["pollutant_code"]],
+                    "row_count": 1,
+                    "source_row_count": 1,
+                    "file_count": 1,
+                    "total_bytes": 4,
+                    "min_timeseries_id": 101,
+                    "max_timeseries_id": 101,
+                    "min_observed_at_utc": "2026-06-11T00:00:00Z" if domain == "observations" else None,
+                    "max_observed_at_utc": "2026-06-11T02:00:00Z" if domain == "observations" else None,
+                    "min_timestamp_hour_utc": "2026-06-11T00:00:00Z" if domain == "aqilevels" else None,
+                    "max_timestamp_hour_utc": "2026-06-11T02:00:00Z" if domain == "aqilevels" else None,
+                    "files": [{
+                        "key": str((part / "part-00000.parquet").relative_to(self.root)),
+                        "bytes": 4,
+                        "timeseries_row_counts": {"101": 1},
+                    }],
+                    mismatched_field: [{"pollutant_code": child_manifest["pollutant_code"], "manifest_hash": "wrong"}],
+                    matching_field: [{"pollutant_code": child_manifest["pollutant_code"], "manifest_hash": child_manifest["manifest_hash"]}],
+                    "manifest_hash": "connector-hash",
+                }
+                (connector_dir / "manifest.json").write_text(json.dumps(connector_manifest), encoding="utf-8")
+
+                day_dir = connector_dir.parent
+                day_manifest = {
+                    "manifest_kind": "day",
+                    "history_version": "v2",
+                    "domain": domain,
+                    "grain": "hourly" if domain == "aqilevels" else None,
+                    "profile": "data" if domain == "aqilevels" else None,
+                    "day_utc": "2026-06-11",
+                    "connector_ids": [1],
+                    "row_count": 1,
+                    "source_row_count": 1,
+                    "file_count": 1,
+                    "total_bytes": 4,
+                    "min_timeseries_id": 101,
+                    "max_timeseries_id": 101,
+                    "min_observed_at_utc": "2026-06-11T00:00:00Z" if domain == "observations" else None,
+                    "max_observed_at_utc": "2026-06-11T02:00:00Z" if domain == "observations" else None,
+                    "min_timestamp_hour_utc": "2026-06-11T00:00:00Z" if domain == "aqilevels" else None,
+                    "max_timestamp_hour_utc": "2026-06-11T02:00:00Z" if domain == "aqilevels" else None,
+                    "files": [{
+                        "key": str((part / "part-00000.parquet").relative_to(self.root)),
+                        "bytes": 4,
+                        "timeseries_row_counts": {"101": 1},
+                    }],
+                    "child_manifests": [{"connector_id": 1, "manifest_hash": "connector-hash"}],
+                    "connector_manifests": [{"connector_id": 1, "manifest_hash": "connector-hash"}],
+                    "manifest_hash": "day-hash",
+                }
+                if parent_level == "day":
+                    day_manifest[mismatched_field] = [{"connector_id": 1, "manifest_hash": "wrong"}]
+                    day_manifest[matching_field] = [{"connector_id": 1, "manifest_hash": "connector-hash"}]
+                (day_dir / "manifest.json").write_text(json.dumps(day_manifest), encoding="utf-8")
+
+                gaps = []
+                MODULE._validate_v2_parent_hierarchy(
+                    root=self.root,
+                    data_prefix=(
+                        self.config.observations_data_prefix
+                        if domain == "observations"
+                        else self.config.aqilevels_hourly_data_prefix
+                    ),
+                    day_utc="2026-06-11",
+                    connector_dir=connector_dir,
+                    day_dir=day_dir,
+                    gaps=gaps,
+                    domain=domain,
+                )
+                if parent_level == "day":
+                    MODULE._validate_v2_parent_hierarchy(
+                        root=self.root,
+                        data_prefix=(
+                            self.config.observations_data_prefix
+                            if domain == "observations"
+                            else self.config.aqilevels_hourly_data_prefix
+                        ),
+                        day_utc="2026-06-11",
+                        connector_dir=None,
+                        day_dir=day_dir,
+                        gaps=gaps,
+                        domain=domain,
+                    )
+                gap_types = {gap["gap_type"] for gap in gaps}
+                self.assertIn(expected_gap_type, gap_types)
+                self.assertNotIn(expected_gap_type.replace("child_hash_mismatch", "manifest_hash_schema_mismatch"), gap_types)
+
     def test_missing_day_file_count(self) -> None:
         """Test that missing file_count in day manifest is detected as schema mismatch."""
         child = self._write_pollutant("observations", "o3", 1, 101)

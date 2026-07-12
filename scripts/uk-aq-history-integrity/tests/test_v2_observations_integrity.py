@@ -81,6 +81,7 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
                 "max_observed_at_utc": "2026-06-11T02:00:00+00",
                 "timeseries_row_counts": {"101": 3},
                 "files": [{"key": key, "bytes": 4, "timeseries_row_counts": {"101": 3}}],
+                "manifest_hash": f"observations-{day}-connector-7-pm25-hash",
             }), encoding="utf-8")
         if index:
             idx = self._index(day=day)
@@ -125,8 +126,9 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
                 "min_observed_at_utc": min(min_times) if min_times else None,
                 "max_observed_at_utc": max(max_times) if max_times else None,
                 "files": files,
-                "child_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
-                "pollutant_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
+                "child_manifests": [{"pollutant_code": child["pollutant_code"], "manifest_hash": child.get("manifest_hash")} for child in children],
+                "pollutant_manifests": [{"pollutant_code": child["pollutant_code"], "manifest_hash": child.get("manifest_hash")} for child in children],
+                "manifest_hash": f"observations-{day}-connector-{connector_id}-hash",
             }
             (connector_dir / "manifest.json").write_text(json.dumps(connector_payload), encoding="utf-8")
             connector_payloads.append(connector_payload)
@@ -148,8 +150,9 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
             "min_observed_at_utc": min(min_times) if min_times else None,
             "max_observed_at_utc": max(max_times) if max_times else None,
             "files": files,
-            "child_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
-            "connector_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
+            "child_manifests": [{"connector_id": child["connector_id"], "manifest_hash": child.get("manifest_hash")} for child in connector_payloads],
+            "connector_manifests": [{"connector_id": child["connector_id"], "manifest_hash": child.get("manifest_hash")} for child in connector_payloads],
+            "manifest_hash": f"observations-{day}-day-hash",
         }
         day_dir.mkdir(parents=True, exist_ok=True)
         (day_dir / "manifest.json").write_text(json.dumps(day_payload), encoding="utf-8")
@@ -274,6 +277,7 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
             "min_timeseries_id": 301, "max_timeseries_id": 301,
             "min_observed_at_utc": "2026-06-07T00:00:00+00", "max_observed_at_utc": "2026-06-07T02:00:00+00",
             "timeseries_row_counts": {"301": 1},
+            "manifest_hash": f"observations-{day}-connector-6-pm25-hash",
         }), encoding="utf-8")
         idx6 = self._index(day=day, connector=6, pollutant="pm25")
         idx6.mkdir(parents=True, exist_ok=True)
@@ -291,6 +295,7 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
             "min_observed_at_utc": "2026-06-07T00:00:00+00", "max_observed_at_utc": "2026-06-07T02:00:00+00",
             "timeseries_row_counts": {"201": 1},
             "files": [{"key": key1, "bytes": 4, "timeseries_row_counts": {"201": 1}}],
+            "manifest_hash": f"observations-{day}-connector-1-o3-hash",
         }), encoding="utf-8")
         self._write_parent_manifests(day)
 
