@@ -110,7 +110,7 @@ Representative current cases to preserve:
 
 | Phase | Name | Status | Notes |
 | --- | --- | --- | --- |
-| 3a | Writer contract and deterministic builders | In progress | Reuse the existing Node exports; no parallel Python builder. |
+| 3a | Writer contract and deterministic builders | Complete | Reuse the existing Node exports; no parallel Python builder. |
 | 3b | Repair planning and dry-run orchestration | Complete | Bottom-up observation repair only; preserve valid siblings. |
 | 3c | Explicitly gated R2 execution and verification | Complete | Writes only behind an explicit gate; verify changed objects directly in R2. |
 
