@@ -9201,6 +9201,12 @@ def build_v2_repair_plan(
 ) -> list[dict[str, Any]]:
     """Summarize v2 repairs in operator order without executing writes."""
     eligible_pollutants_by_connector: dict[int, set[str] | None] = {}
+    observation_partition_priority = {
+        "observation_data_repair": 3,
+        "source_mapping_issue": 2,
+        "observation_pollutant_manifest_repair": 1,
+        "observation_index_repair": 0,
+    }
 
     def eligible_for(connector_id: int | str | None, pollutant_code: str | None) -> bool:
         if not pollutant_code:
@@ -9274,7 +9280,6 @@ def build_v2_repair_plan(
         parquet_readable = gap.get("parquet_readable") is True
         if (
             source_partition_unavailable
-            and not (gap_type == "orphan_parquet_without_manifest" and parquet_readable)
             and gap_type in {
                 "data_manifest_missing",
                 "data_manifest_invalid_json",
@@ -9295,6 +9300,7 @@ def build_v2_repair_plan(
                 "pollutant_missing",
                 "missing_pollutant_partitions",
                 "unexpected_connector_level_part_file",
+                "orphan_parquet_without_manifest",
             }
         ):
             add_action(
@@ -9392,6 +9398,7 @@ def build_v2_repair_plan(
                     "aqi_rebuild",
                     gap=gap,
                     requires_index_rebuild=True,
+                    data_changes_required=True,
                     notes="Queue AQI rebuilding only because the observation data changed for an AQI-enabled pollutant.",
                 )
 
@@ -9465,24 +9472,60 @@ def build_v2_repair_plan(
                 notes="Rebuild AQI data only where the AQI partition itself is stale or incomplete.",
             )
 
+    selected_observation_actions: dict[tuple[str, str, str], str] = {}
+    for entry in actions.values():
+        kind = str(entry.get("kind") or "")
+        if kind not in observation_partition_priority:
+            continue
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if pollutant_code is None or day_utc is None or connector_id is None:
+            continue
+        key = (str(day_utc), str(connector_id), str(pollutant_code))
+        current_kind = selected_observation_actions.get(key)
+        if current_kind is None or observation_partition_priority[kind] > observation_partition_priority[current_kind]:
+            selected_observation_actions[key] = kind
+
+    filtered_actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
+    for action_key, entry in actions.items():
+        kind = str(entry.get("kind") or "")
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if pollutant_code is None or day_utc is None or connector_id is None:
+            filtered_actions[action_key] = entry
+            continue
+        partition_key = (str(day_utc), str(connector_id), str(pollutant_code))
+        selected_kind = selected_observation_actions.get(partition_key)
+        if kind == "aqi_rebuild":
+            if selected_kind != "observation_data_repair":
+                continue
+            entry["data_changes_required"] = True
+            filtered_actions[action_key] = entry
+            continue
+        if kind in observation_partition_priority and selected_kind != kind:
+            continue
+        filtered_actions[action_key] = entry
+
     order = [
         "observation_data_repair",
+        "source_mapping_issue",
         "observation_pollutant_manifest_repair",
+        "observation_index_repair",
         "observation_connector_manifest_repair",
         "observation_day_manifest_repair",
-        "observation_index_repair",
         "aqi_rebuild",
         "aqi_pollutant_manifest_repair",
         "aqi_connector_manifest_repair",
         "aqi_day_manifest_repair",
         "aqi_index_repair",
-        "source_mapping_issue",
     ]
     position = {kind: idx for idx, kind in enumerate(order)}
-    for entry in actions.values():
+    for entry in filtered_actions.values():
         entry["gap_types"] = sorted(set(entry.get("gap_types") or []))
     return sorted(
-        actions.values(),
+        filtered_actions.values(),
         key=lambda entry: (
             position.get(str(entry.get("kind") or ""), 999),
             str(entry.get("day_utc") or ""),

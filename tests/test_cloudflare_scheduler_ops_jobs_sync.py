@@ -144,11 +144,19 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         self.assertIn("update scheduler_jobs", workflow)
         self.assertIn("Verify deployed Cloud Run URL in D1", workflow)
         self.assertIn(
+            "UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}",
+            workflow,
+        )
+        self.assertIn(
             'upsert_secret "UK_AQ_EDGE_UPSTREAM_SECRET" "${UK_AQ_EDGE_UPSTREAM_SECRET}" 1',
             workflow,
         )
         retired_secret_name = "UK_AQ_CLOUD_RUN_" + "DISPATCH_SECRET"
         self.assertNotIn(retired_secret_name, workflow)
+        self.assertNotIn(
+            "UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}",
+            workflow,
+        )
         self.assertIn("--allow-unauthenticated", workflow)
 
     def test_cloud_run_workflows_map_upstream_auth_only_as_secret(self) -> None:
