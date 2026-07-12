@@ -336,6 +336,53 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         ])
         self.assertEqual([a["kind"] for a in plan], ["observation_connector_manifest_repair", "observation_index_repair"])
 
+    def test_source_unavailable_gap_routes_to_operator_review(self) -> None:
+        plan = MODULE.build_v2_repair_plan(observation_gaps=[
+            {
+                "gap_type": "data_manifest_missing",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "o3",
+                "source_evidence": {"source_partition_state": "counts_unavailable"},
+            },
+        ])
+        self.assertEqual([a["kind"] for a in plan], ["source_mapping_issue"])
+        self.assertTrue(all(a["status"] == "planned" for a in plan))
+        self.assertTrue(all(a["executes"] is False for a in plan))
+
+    def test_manifest_only_gap_remains_manifest_only_for_o3(self) -> None:
+        gap = {
+            "gap_type": "orphan_parquet_without_manifest",
+            "day_utc": "2026-05-17",
+            "connector_id": 1,
+            "pollutant_code": "o3",
+            "parquet_readable": True,
+            "source_evidence": {"source_partition_state": "counts_unavailable"},
+        }
+        MODULE._classify_v2_gaps([gap])
+        plan = MODULE.build_v2_repair_plan(observation_gaps=[gap])
+        self.assertTrue(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
+        self.assertFalse(any(a["kind"] == "aqi_rebuild" for a in plan))
+        self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
+        self.assertTrue(all(a["status"] == "planned" for a in plan))
+        self.assertTrue(all(a["executes"] is False for a in plan))
+
+    def test_pm10_data_fault_keeps_aqi_rebuild_planned_non_executing(self) -> None:
+        plan = MODULE.build_v2_repair_plan(observation_gaps=[
+            {
+                "gap_type": "data_manifest_missing",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "pm10",
+                "source_evidence": {"source_partition_state": "successful_non_empty"},
+            },
+        ])
+        self.assertTrue(any(a["kind"] == "observation_data_repair" for a in plan))
+        self.assertTrue(any(a["kind"] == "aqi_rebuild" for a in plan))
+        self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
+        self.assertTrue(all(a["status"] == "planned" for a in plan))
+        self.assertTrue(all(a["executes"] is False for a in plan))
+
 
 if __name__ == "__main__":
     unittest.main()

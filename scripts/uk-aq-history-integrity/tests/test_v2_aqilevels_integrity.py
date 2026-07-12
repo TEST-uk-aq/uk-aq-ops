@@ -78,6 +78,7 @@ class V2AqiIntegrityTests(unittest.TestCase):
                 "max_timestamp_hour_utc": "2026-06-11T02:00:00+00",
                 "timeseries_row_counts": {"101": 3},
                 "files": [{"key": key, "bytes": 4, "timeseries_row_counts": {"101": 3}}],
+                "manifest_hash": f"aqilevels-{day}-connector-7-pm25-hash",
             }), encoding="utf-8")
         if index:
             idx = self._index(day=day)
@@ -122,8 +123,9 @@ class V2AqiIntegrityTests(unittest.TestCase):
                 "min_timestamp_hour_utc": min(min_times) if min_times else None,
                 "max_timestamp_hour_utc": max(max_times) if max_times else None,
                 "files": files,
-                "child_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
-                "pollutant_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
+                "child_manifests": [{"pollutant_code": child["pollutant_code"], "manifest_hash": child.get("manifest_hash")} for child in children],
+                "pollutant_manifests": [{"pollutant_code": child["pollutant_code"], "manifest_hash": child.get("manifest_hash")} for child in children],
+                "manifest_hash": f"aqilevels-{day}-connector-{connector_id}-hash",
             }
             (connector_dir / "manifest.json").write_text(json.dumps(connector_payload), encoding="utf-8")
             connector_payloads.append(connector_payload)
@@ -145,8 +147,9 @@ class V2AqiIntegrityTests(unittest.TestCase):
             "min_timestamp_hour_utc": min(min_times) if min_times else None,
             "max_timestamp_hour_utc": max(max_times) if max_times else None,
             "files": files,
-            "child_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
-            "connector_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
+            "child_manifests": [{"connector_id": child["connector_id"], "manifest_hash": child.get("manifest_hash")} for child in connector_payloads],
+            "connector_manifests": [{"connector_id": child["connector_id"], "manifest_hash": child.get("manifest_hash")} for child in connector_payloads],
+            "manifest_hash": f"aqilevels-{day}-day-hash",
         }
         day_dir.mkdir(parents=True, exist_ok=True)
         (day_dir / "manifest.json").write_text(json.dumps(day_payload), encoding="utf-8")
@@ -382,7 +385,17 @@ class V2AqiIntegrityTests(unittest.TestCase):
         debug6.mkdir(parents=True, exist_ok=True)
         (debug6 / "manifest.json").write_text(json.dumps({
             "manifest_kind": "pollutant", "history_version": "v2", "domain": "aqilevels", "grain": "hourly", "profile": "debug",
-            "day_utc": day, "connector_id": 6, "pollutant_code": "pm25", "files": []
+            "day_utc": day, "connector_id": 6, "pollutant_code": "pm25", "files": [],
+            "manifest_hash": f"aqilevels-{day}-connector-6-pm25-debug-hash",
+        }), encoding="utf-8")
+        (part6 / "manifest.json").write_text(json.dumps({
+            "manifest_kind": "pollutant", "history_version": "v2", "domain": "aqilevels", "grain": "hourly", "profile": "data",
+            "day_utc": day, "connector_id": 6, "pollutant_code": "pm25", "files": [{"key": key6, "bytes": 4, "timeseries_row_counts": {"301": 1}}], "file_count": 1,
+            "row_count": 1, "source_row_count": 1, "total_bytes": 4,
+            "min_timeseries_id": 301, "max_timeseries_id": 301,
+            "min_timestamp_hour_utc": "2026-06-07T00:00:00+00", "max_timestamp_hour_utc": "2026-06-07T02:00:00+00",
+            "timeseries_row_counts": {"301": 1},
+            "manifest_hash": f"aqilevels-{day}-connector-6-pm25-hash",
         }), encoding="utf-8")
         part1 = self._partition(day=day, connector=1, pollutant="o3")
         part1.mkdir(parents=True, exist_ok=True)
@@ -396,6 +409,7 @@ class V2AqiIntegrityTests(unittest.TestCase):
             "min_timeseries_id": 201, "max_timeseries_id": 201,
             "min_timestamp_hour_utc": "2026-06-07T00:00:00+00", "max_timestamp_hour_utc": "2026-06-07T02:00:00+00",
             "timeseries_row_counts": {"201": 1},
+            "manifest_hash": f"aqilevels-{day}-connector-1-o3-hash",
         }), encoding="utf-8")
         self._write_parent_manifests(day)
 

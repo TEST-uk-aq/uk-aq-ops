@@ -616,7 +616,7 @@ Do not delete or restore an archive path merely because it is under `archive/`. 
 | 2c.0 | Inspect `main` and closed PRs | Complete | No code changes | Ops only |
 | 2c.1 | Correct manifest schema and parquet statistics | Local validation complete, uncommitted | Timestamp normalization, null-aggregate handling, and `files` validation corrected; focused and full v2 tests passed | Ops only |
 | 2c.2 | Propagate evidence and correct planning | Not started |  | Ops only |
-| 2c.3 | Complete stored-hash validation | Not started |  | Ops only |
+| 2c.3 | Complete stored-hash validation | Local validation complete, uncommitted | Stored-hash presence and consistency validation added and verified; focused phase tests and `npm run check` passed | Ops only |
 | 2c.4 | Run full local validation and prepare handoff | Not started |  | Ops only |
 
 Allowed status values:
@@ -1261,31 +1261,54 @@ git status --short
 Status:
 
 ```text
-Not started
+Local validation complete, uncommitted
 ```
 
 Changed ops files:
 
 ```text
-To be updated by Codex.
+scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py
+scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py
+scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py
+plans/2026-07-12 Integrity/uk-aq-phase-2c-ops-only-working-tree-plan-2026-07-12-1442.md
 ```
 
 Sibling repository status comparison:
 
 ```text
-To be updated by Codex.
+git -C ../TEST-uk-aq-ingest status --porcelain -> clean
+git -C ../TEST-uk-aq-schema status --porcelain -> clean
+git -C ../TEST-uk-aq status --porcelain -> clean
 ```
 
 Tests:
 
 ```text
-To be updated by Codex.
+python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py -> passed
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py -> 76 tests passed
+npm run check -> passed
 ```
 
 Runtime handoff:
 
 ```text
-To be updated by Codex.
+Runtime file to copy:
+scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+Development-only files:
+scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py
+scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py
+scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py
+plans/2026-07-12 Integrity/uk-aq-phase-2c-ops-only-working-tree-plan-2026-07-12-1442.md
+Dependency impact:
+No dependency change.
+Runtime configuration impact:
+No runtime configuration change.
+Safe read-only validation:
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py
+npm run check
+Rollback file:
+scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
 ```
 
 ---

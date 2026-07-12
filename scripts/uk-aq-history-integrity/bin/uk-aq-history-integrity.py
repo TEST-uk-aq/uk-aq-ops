@@ -7510,11 +7510,13 @@ def _validate_v2_parent_hierarchy(
             gaps,
             domain=domain,
             level="connector",
+            child_manifest_level="data",
+            child_id_key="pollutant_code",
             representations=(
                 ("child_manifests", payload.get("child_manifests"), "pollutant_code"),
                 ("pollutant_manifests", payload.get("pollutant_manifests"), "pollutant_code"),
             ),
-            actual_hashes={key: str(value.get("manifest_hash") or "") for key, value in child_payloads.items()},
+            actual_hashes={key: _manifest_hash_text(value) for key, value in child_payloads.items()},
             day_utc=day_utc,
             connector_id=connector_raw,
             expected_path=connector_rel,
@@ -7599,11 +7601,13 @@ def _validate_v2_parent_hierarchy(
         gaps,
         domain=domain,
         level="day",
+        child_manifest_level="connector",
+        child_id_key="connector_id",
         representations=(
             ("child_manifests", payload.get("child_manifests"), "connector_id"),
             ("connector_manifests", payload.get("connector_manifests"), "connector_id"),
         ),
-        actual_hashes={key: str(value.get("manifest_hash") or "") for key, value in child_payloads.items()},
+        actual_hashes={key: _manifest_hash_text(value) for key, value in child_payloads.items()},
         day_utc=day_utc,
         connector_id=None,
         expected_path=day_rel,
@@ -7618,6 +7622,16 @@ def _manifest_files(payload: Any) -> list[dict[str, Any]]:
 def _manifest_files_list(payload: Any) -> list[Any] | None:
     files = payload.get("files") if isinstance(payload, Mapping) else None
     return files if isinstance(files, list) else None
+
+
+def _manifest_hash_text(payload: Any) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("manifest_hash")
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
 
 
 def _parse_required_timestamp_value(value: Any) -> dt.datetime | None:
@@ -7981,13 +7995,16 @@ def _append_child_hash_gaps(
     *,
     domain: str,
     level: str,
+    child_manifest_level: str,
+    child_id_key: str,
     representations: Iterable[tuple[str, Any, str]],
-    actual_hashes: Mapping[str, str],
+    actual_hashes: Mapping[str, str | None],
     day_utc: str,
     connector_id: int | str | None,
     expected_path: str,
 ) -> None:
     gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
+    child_hash_gap_type = f"{child_manifest_level}_manifest_manifest_hash_schema_mismatch"
     for field, raw_entries, id_key in representations:
         if not isinstance(raw_entries, list):
             continue
@@ -7995,9 +8012,23 @@ def _append_child_hash_gaps(
             if not isinstance(entry, Mapping):
                 continue
             child_id = str(entry.get(id_key) or "").strip()
+            represented_hash = _manifest_hash_text(entry)
+            if represented_hash is None:
+                gap = gap_fn(
+                    f"{level}_manifest_{field}_manifest_hash_schema_mismatch",
+                    day_utc=day_utc,
+                    connector_id=connector_id,
+                    expected_path=expected_path,
+                    related_paths=[f"{id_key}={child_id}", "field=manifest_hash missing_or_invalid_type"],
+                )
+                if child_manifest_level == "data":
+                    gap["parquet_readable"] = True
+                gaps.append(gap)
+                continue
             expected_hash = actual_hashes.get(child_id)
-            represented_hash = str(entry.get("manifest_hash") or "").strip()
-            if expected_hash and represented_hash and expected_hash != represented_hash:
+            if expected_hash is None:
+                continue
+            if expected_hash != represented_hash:
                 gaps.append(gap_fn(
                     f"{level}_manifest_{field}_child_hash_mismatch",
                     day_utc=day_utc,
@@ -8005,6 +8036,19 @@ def _append_child_hash_gaps(
                     expected_path=expected_path,
                     related_paths=[f"{id_key}={child_id}"],
                 ))
+    for child_id, actual_hash in actual_hashes.items():
+        if actual_hash is not None:
+            continue
+        gap = gap_fn(
+            child_hash_gap_type,
+            day_utc=day_utc,
+            connector_id=connector_id,
+            expected_path=expected_path,
+            related_paths=[f"{child_id_key}={child_id}", "field=manifest_hash missing_or_invalid_type"],
+        )
+        if child_manifest_level == "data":
+            gap["parquet_readable"] = True
+        gaps.append(gap)
 
 
 def _rel_key_to_path(root: Path, key: str) -> Path | None:
@@ -8060,26 +8104,90 @@ def _current_source_counts_for_v2_partition(
     day_utc: str,
     connector_id: int,
     pollutant_code: str,
-) -> tuple[dict[int, int], str | None]:
+) -> tuple[dict[int, int], dict[str, Any]]:
+    partition_evidence: dict[str, Any] = {
+        "source_partition_state": "counts_unavailable",
+        "source_counts_present": False,
+        "source_rows": 0,
+        "source_timeseries_row_counts": {},
+        "source_file_count": 0,
+        "source_file_keys": [],
+        "source_skip_reason": "source_counts_unavailable",
+        "partition": {
+            "state": "counts_unavailable",
+            "source_counts_present": False,
+            "source_rows": 0,
+            "source_timeseries_row_counts": {},
+            "source_file_count": 0,
+            "source_file_keys": [],
+            "source_skip_reason": "source_counts_unavailable",
+        },
+    }
     if conn is None:
-        return {}, "source_connection_unavailable"
+        partition_evidence["source_partition_state"] = "connection_unavailable"
+        partition_evidence["source_skip_reason"] = "source_connection_unavailable"
+        partition_evidence["partition"]["state"] = "connection_unavailable"
+        partition_evidence["partition"]["source_skip_reason"] = "source_connection_unavailable"
+        return {}, partition_evidence
 
     source_keys = _source_keys_for_scope(source_scope)
     if not source_keys:
-        return {}, "source_scope_has_no_source_keys"
+        partition_evidence["source_partition_state"] = "scope_unavailable"
+        partition_evidence["source_skip_reason"] = "source_scope_has_no_source_keys"
+        partition_evidence["partition"]["state"] = "scope_unavailable"
+        partition_evidence["partition"]["source_skip_reason"] = "source_scope_has_no_source_keys"
+        return {}, partition_evidence
 
-    where = [
-        "c.day_utc = ?",
-        "c.row_count > 0",
-        "t.connector_id = ?",
-        f"s.source_key IN ({','.join('?' for _ in source_keys)})",
+    day = dt.date.fromisoformat(day_utc)
+    lookup_rows = conn.execute(
+        f"""
+        SELECT DISTINCT source_key, source_location_id
+        FROM source_station_timeseries_lookup
+        WHERE connector_id = ?
+          AND is_active = 1
+          AND source_location_id IS NOT NULL
+          AND source_key IN ({','.join('?' for _ in source_keys)})
+        ORDER BY source_key, source_location_id
+        """,
+        (int(connector_id), *source_keys),
+    ).fetchall()
+    source_file_keys = [
+        key
+        for source_key, source_location_id in lookup_rows
+        if (key := _source_file_key_for_lookup_row(str(source_key), str(source_location_id), day)) is not None
     ]
-    params: list[Any] = [day_utc, connector_id, *source_keys]
-    if env_name:
-        where.append("s.env_name = ?")
-        params.append(env_name)
-    where_sql = " AND ".join(where)
+    if not source_file_keys:
+        return {}, partition_evidence
 
+    state_where = [f"s.source_file_key IN ({','.join('?' for _ in source_file_keys)})"]
+    state_params: list[Any] = [*source_file_keys]
+    if env_name:
+        state_where.insert(0, "s.env_name = ?")
+        state_params.insert(0, env_name)
+    state_rows = conn.execute(
+        f"""
+        SELECT DISTINCT s.source_file_key, s.exists_remote, s.last_status
+        FROM source_file_state s
+        WHERE {' AND '.join(state_where)}
+        ORDER BY s.source_file_key
+        """,
+        tuple(state_params),
+    ).fetchall()
+
+    rows_where = [
+        "c.row_count > 0",
+        "s.day_utc = ?",
+        "t.connector_id = ?",
+        f"s.source_file_key IN ({','.join('?' for _ in source_file_keys)})",
+        "l.connector_id = ?",
+        "l.is_active = 1",
+        "l.source_location_id IS NOT NULL",
+        f"l.source_key IN ({','.join('?' for _ in source_keys)})",
+    ]
+    rows_params: list[Any] = [day_utc, int(connector_id), *source_file_keys, int(connector_id), *source_keys]
+    if env_name:
+        rows_where.insert(0, "s.env_name = ?")
+        rows_params.insert(0, env_name)
     rows = conn.execute(
         f"""
         SELECT
@@ -8093,11 +8201,15 @@ def _current_source_counts_for_v2_partition(
         FROM source_file_timeseries_counts c
         JOIN source_file_state s
           ON s.source_file_key = c.source_file_key
+        JOIN source_station_timeseries_lookup l
+          ON l.source_key = s.source_key
+         AND l.source_location_id = s.source_location_id
+         AND l.timeseries_id = c.timeseries_id
         JOIN core_timeseries_snapshot t
           ON t.id = c.timeseries_id
         LEFT JOIN core_phenomena_snapshot p
           ON p.id = t.phenomenon_id
-        WHERE {where_sql}
+        WHERE {' AND '.join(rows_where)}
         GROUP BY
           c.timeseries_id,
           t.timeseries_ref,
@@ -8107,7 +8219,7 @@ def _current_source_counts_for_v2_partition(
           p.pollutant_label
         ORDER BY c.timeseries_id
         """,
-        tuple(params),
+        tuple(rows_params),
     ).fetchall()
 
     counts: dict[int, int] = {}
@@ -8146,13 +8258,73 @@ def _current_source_counts_for_v2_partition(
         if ts_id > 0 and count > 0:
             counts[ts_id] = counts.get(ts_id, 0) + count
 
+    source_file_keys_evidence = [str(row[0]) for row in state_rows] or [str(key) for key in source_file_keys]
+
     if counts:
-        return counts, None
+        source_rows = sum(counts.values())
+        source_timeseries_row_counts = {str(timeseries_id): count for timeseries_id, count in sorted(counts.items())}
+        partition_evidence.update({
+            "source_partition_state": "successful_non_empty",
+            "source_counts_present": True,
+            "source_rows": source_rows,
+            "source_timeseries_row_counts": source_timeseries_row_counts,
+            "source_file_count": len(state_rows),
+            "source_file_keys": source_file_keys_evidence,
+            "source_skip_reason": None,
+            "partition": {
+                "state": "successful_non_empty",
+                "source_counts_present": True,
+                "source_rows": source_rows,
+                "source_timeseries_row_counts": source_timeseries_row_counts,
+                "source_file_count": len(state_rows),
+                "source_file_keys": source_file_keys_evidence,
+                "source_skip_reason": None,
+            },
+        })
+        return counts, partition_evidence
+
+    successful_state_statuses = {"first_seen", "changed", "reappeared", "unchanged"}
+    if not rows and state_rows and any(
+        int(row[1] or 0) == 1 and str(row[2] or "").strip() in successful_state_statuses
+        for row in state_rows
+    ):
+        partition_evidence.update({
+            "source_partition_state": "successful_empty",
+            "source_counts_present": False,
+            "source_rows": 0,
+            "source_timeseries_row_counts": {},
+            "source_file_count": len(state_rows),
+            "source_file_keys": source_file_keys_evidence,
+            "source_skip_reason": None,
+            "partition": {
+                "state": "successful_empty",
+                "source_counts_present": False,
+                "source_rows": 0,
+                "source_timeseries_row_counts": {},
+                "source_file_count": len(state_rows),
+                "source_file_keys": source_file_keys_evidence,
+                "source_skip_reason": None,
+            },
+        })
+        return {}, partition_evidence
+
     if saw_source_rows and not saw_pollutant_metadata:
-        return {}, "source_pollutant_metadata_unavailable"
+        partition_evidence["source_partition_state"] = "metadata_unavailable"
+        partition_evidence["source_skip_reason"] = "source_pollutant_metadata_unavailable"
+        partition_evidence["partition"]["state"] = "metadata_unavailable"
+        partition_evidence["partition"]["source_skip_reason"] = "source_pollutant_metadata_unavailable"
+        return {}, partition_evidence
     if saw_source_rows:
-        return {}, "source_pollutant_not_present"
-    return {}, "source_counts_unavailable"
+        partition_evidence["source_partition_state"] = "pollutant_absent"
+        partition_evidence["source_skip_reason"] = "source_pollutant_not_present"
+        partition_evidence["partition"]["state"] = "pollutant_absent"
+        partition_evidence["partition"]["source_skip_reason"] = "source_pollutant_not_present"
+        return {}, partition_evidence
+    partition_evidence["source_partition_state"] = "counts_unavailable"
+    partition_evidence["source_skip_reason"] = "source_counts_unavailable"
+    partition_evidence["partition"]["state"] = "counts_unavailable"
+    partition_evidence["partition"]["source_skip_reason"] = "source_counts_unavailable"
+    return {}, partition_evidence
 
 
 def _build_v2_source_r2_mismatch_gap(
@@ -8163,7 +8335,7 @@ def _build_v2_source_r2_mismatch_gap(
     expected_path: str,
     source_counts: Mapping[int, int],
     r2_counts: Mapping[int, int],
-    source_skip_reason: str | None = None,
+    source_partition_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not source_counts:
         return None
@@ -8217,14 +8389,16 @@ def _build_v2_source_r2_mismatch_gap(
     # Keep the complete compact mismatch set in JSON so a targeted repair can
     # be constructed exactly; only human-facing related_paths are truncated.
     gap["source_r2_mismatches"] = mismatches
-    if source_skip_reason:
-        gap["source_skip_reason"] = source_skip_reason
     evidence = gap.setdefault("source_evidence", {})
     evidence["source_counts_present"] = True
     evidence["source_rows"] = source_total
     evidence["r2_rows_for_source_timeseries"] = r2_total_for_source
     evidence["missing_timeseries_count"] = len(mismatches)
     evidence["sample_missing_timeseries_ids"] = [entry["timeseries_id"] for entry in sample]
+    if source_partition_evidence is not None:
+        evidence["source_partition_state"] = source_partition_evidence.get("source_partition_state")
+        evidence["source_skip_reason"] = source_partition_evidence.get("source_skip_reason")
+        evidence["partition"] = dict(source_partition_evidence.get("partition") or {})
     return gap
 
 
@@ -8625,6 +8799,21 @@ def run_v2_observations_integrity_checks(
                                     gaps.append(_v2_obs_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                     elif payload is not None:
                         gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                try:
+                    connector_id_for_source = int(str(connector_raw))
+                except (TypeError, ValueError):
+                    connector_id_for_source = None
+                source_partition_evidence: dict[str, Any] | None = None
+                source_counts: dict[int, int] = {}
+                if conn is not None and connector_id_for_source is not None:
+                    source_counts, source_partition_evidence = _current_source_counts_for_v2_partition(
+                        conn,
+                        env_name=env_name,
+                        source_scope=source_scope,
+                        day_utc=day_utc,
+                        connector_id=connector_id_for_source,
+                        pollutant_code=pollutant,
+                    )
                 parquet_stats, parquet_error = _append_actual_parquet_gaps(
                     gaps,
                     domain="observations",
@@ -8657,32 +8846,22 @@ def run_v2_observations_integrity_checks(
                             gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                     except Exception:
                         gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                if source_partition_evidence is not None:
+                    for partition_gap in gaps[partition_gap_start:]:
+                        partition_gap.setdefault("source_evidence", {}).update(source_partition_evidence)
 
-                if parquet_stats is not None:
-                    try:
-                        connector_id_for_source = int(str(connector_raw))
-                    except (TypeError, ValueError):
-                        connector_id_for_source = None
-                    if connector_id_for_source is not None:
-                        source_counts, source_skip_reason = _current_source_counts_for_v2_partition(
-                            conn,
-                            env_name=env_name,
-                            source_scope=source_scope,
-                            day_utc=day_utc,
-                            connector_id=connector_id_for_source,
-                            pollutant_code=pollutant,
-                        )
-                        stale_gap = _build_v2_source_r2_mismatch_gap(
-                            day_utc=day_utc,
-                            connector_id=connector_raw,
-                            pollutant_code=pollutant,
-                            expected_path=manifest_rel,
-                            source_counts=source_counts,
-                            r2_counts=parquet_stats["timeseries_row_counts"],
-                            source_skip_reason=source_skip_reason,
-                        )
-                        if stale_gap is not None:
-                            gaps.append(stale_gap)
+                if parquet_stats is not None and connector_id_for_source is not None:
+                    stale_gap = _build_v2_source_r2_mismatch_gap(
+                        day_utc=day_utc,
+                        connector_id=connector_raw,
+                        pollutant_code=pollutant,
+                        expected_path=manifest_rel,
+                        source_counts=source_counts,
+                        r2_counts=parquet_stats["timeseries_row_counts"],
+                        source_partition_evidence=source_partition_evidence,
+                    )
+                    if stale_gap is not None:
+                        gaps.append(stale_gap)
             _validate_v2_parent_hierarchy(
                 root=root,
                 data_prefix=data_prefix,
@@ -8987,6 +9166,30 @@ def _enrich_v2_aqi_repair_plans(
             }
 
 
+_SOURCE_PARTITION_UNAVAILABLE_STATES = {
+    "connection_unavailable",
+    "scope_unavailable",
+    "metadata_unavailable",
+    "pollutant_absent",
+    "counts_unavailable",
+}
+
+
+def _source_partition_state_from_gap(gap: Mapping[str, Any]) -> str | None:
+    evidence = gap.get("source_evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    partition = evidence.get("partition")
+    if isinstance(partition, Mapping):
+        state = partition.get("state")
+        if state:
+            return str(state)
+    state = evidence.get("source_partition_state")
+    if state:
+        return str(state)
+    return None
+
+
 def build_v2_repair_plan(
     *,
     observation_gaps: Iterable[Mapping[str, Any]] = (),
@@ -9063,6 +9266,42 @@ def build_v2_repair_plan(
     for gap in observation_gaps:
         gap_type = str(gap.get("gap_type") or "")
         fault_class = str(gap.get("fault_class") or "")
+        source_partition_state = _source_partition_state_from_gap(gap)
+        source_partition_unavailable = source_partition_state in _SOURCE_PARTITION_UNAVAILABLE_STATES
+        parquet_readable = gap.get("parquet_readable") is True
+        if (
+            source_partition_unavailable
+            and not (gap_type == "orphan_parquet_without_manifest" and parquet_readable)
+            and gap_type in {
+                "data_manifest_missing",
+                "data_manifest_invalid_json",
+                "data_manifest_schema_mismatch",
+                "data_manifest_empty",
+                "data_manifest_file_count_mismatch",
+                "data_manifest_listed_parquet_missing",
+                "data_manifest_unlisted_parquet",
+                "data_manifest_duplicate_file_key",
+                "data_manifest_timeseries_row_count_mismatch",
+                "data_manifest_total_bytes_mismatch",
+                "data_manifest_row_count_mismatch",
+                "parquet_missing",
+                "parquet_empty_or_placeholder",
+                "parquet_unreadable",
+                "row_count_mismatch",
+                "source_r2_timeseries_row_mismatch",
+                "pollutant_missing",
+                "missing_pollutant_partitions",
+                "unexpected_connector_level_part_file",
+            }
+        ):
+            add_action(
+                "source_mapping_issue",
+                gap=gap,
+                operator_action_required=True,
+                data_changes_required=False,
+                notes="Source evidence is unavailable for this scope; review the source mapping before choosing a repair.",
+            )
+            continue
         if gap_type.startswith("connector_manifest_"):
             add_action(
                 "observation_connector_manifest_repair",
@@ -12113,7 +12352,7 @@ def _set_v2_source_repair_plan(
             "kind": "source_to_v2_observations_backfill",
             "requires_index_rebuild": True,
             "commands": [command] if command else [],
-            "executes": True,
+            "executes": False,
             "operator_action_required": False,
             "write_risk": "writes_to_r2_when_run_backfill_is_enabled",
             "steps": [
