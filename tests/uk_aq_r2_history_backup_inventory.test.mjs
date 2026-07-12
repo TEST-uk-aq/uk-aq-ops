@@ -1360,6 +1360,95 @@ test("force/all prune continues after a failed unit and fails after auditing lat
   assert.equal(pruneState.units[secondUnit].status, "ok");
 });
 
+test("sync v2 forced recheck removes a stale checkpoint entry for a failed unit", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const failurePlan = path.join(tempDir, "failure-plan.json");
+  const firstDay = "2026-06-18";
+  const secondDay = "2026-06-19";
+  const firstUnit = `history/v2/observations/day_utc=${firstDay}`;
+  const secondUnit = `history/v2/observations/day_utc=${secondDay}`;
+
+  seedInventory(sourceRoot, {
+    backupVersion: "v2",
+    hash: "hash-v2",
+    days: [firstDay, secondDay],
+  });
+  seedDestinationWithStaleParquet(destRoot, {
+    backupVersion: "v2",
+    dayUtc: firstDay,
+  });
+  seedDestinationWithStaleParquet(destRoot, {
+    backupVersion: "v2",
+    dayUtc: secondDay,
+  });
+  writeJson(
+    path.join(destRoot, "_ops/checkpoints/r2_history_backup_state_v2.json"),
+    makeCheckpoint({
+      days: {
+        observations: {
+          [firstDay]: obsDayCheckpointEntryForVersion(firstDay, "hash-v2", "v2"),
+          [secondDay]: obsDayCheckpointEntryForVersion(secondDay, "hash-v2", "v2"),
+        },
+      },
+    }),
+  );
+  writeV2PruneCheckpoint(destRoot, {
+    [firstUnit]: {
+      manifest_hash: "hash-v2",
+      status: "ok",
+      pruned_at: "2026-06-25T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 2,
+      stale_deleted_count: 1,
+    },
+    [secondUnit]: {
+      manifest_hash: "hash-v2",
+      status: "ok",
+      pruned_at: "2026-06-25T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 2,
+      stale_deleted_count: 1,
+    },
+  });
+  writeFakeRcloneFailurePlan(failurePlan, [{
+    command: "lsjson",
+    target_suffix: firstUnit,
+    remaining: 1,
+    message: "temporary prune audit failure",
+  }]);
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    extraArgs: ["--force-prune-recheck"],
+    fakeRcloneFailurePlan: failurePlan,
+  });
+
+  assert.notEqual(result.status, 0);
+  const pruneState = JSON.parse(
+    fs.readFileSync(
+      path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(pruneState.units[firstUnit], undefined);
+  assert.equal(pruneState.units[secondUnit].status, "ok");
+  assert.equal(fs.existsSync(path.join(destRoot, firstUnit, "connector_id=1/part-00001.parquet")), true);
+  assert.equal(fs.existsSync(path.join(destRoot, secondUnit, "connector_id=1/part-00001.parquet")), false);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune.failed_units.length, 1);
+  assert.equal(report.prune.failed_units[0].unit_relative_path, firstUnit);
+});
+
 test("sync v2 dry-run does not delete or write prune checkpoint but reports planned update", () => {
   const tempDir = makeTempDir();
   const sourceRoot = path.join(tempDir, "source");

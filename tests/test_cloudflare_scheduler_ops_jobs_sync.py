@@ -42,6 +42,10 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_history_dropbox_backup_force_prune_recheck"
         )
         self.assertEqual(force_prune["github_inputs_json"], '{"force_prune_recheck":"true"}')
+        daily_backup = next(
+            job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_history_dropbox_backup"
+        )
+        self.assertEqual(daily_backup["github_inputs_json"], "{}")
         partition_maintenance = next(
             job for job in manifest["jobs"] if job["job_key"] == "uk_aq_observs_partition_maintenance"
         )
