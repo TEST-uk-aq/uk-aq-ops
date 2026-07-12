@@ -1,7 +1,7 @@
-# Cross-repo map: CIC-test-uk-aq-ops
+# Cross-repo map: TEST-uk-aq-ops
 
 ## Main repo
-- `CIC-test-uk-aq-ops` is the main repo for this project and the default starting point for cross-repo tasks.
+- `TEST-uk-aq-ops` is the main repo for this project and the default starting point for cross-repo tasks.
 
 ## Purpose
 This repo runs UK AQ operational Cloud Run services (prune, outbox, partition maintenance, DB size logging, and backfill) and related deployment/setup documentation.
@@ -14,7 +14,7 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 - `config/`: Environment target mappings.
 
 ## How this repo connects to the others
-- **Ingest repo**: `CIC-test-uk-aq-ingest` provides ingest/edge pipelines that feed and consume the same databases.
+- **Ingest repo**: `TEST-uk-aq-ingest` provides ingest/edge pipelines that feed and consume the same databases.
 - **Schema source**: `TEST-uk-aq-schema` defines SQL schemas/RPCs used by these workers.
 - **Change flow**: schema changes may require worker query/RPC updates here and ingest updates there.
 
@@ -41,9 +41,9 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 
 ## Links
 - Existing README: `README.md`
-- Ingest repo (sibling): `../CIC-test-uk-aq-ingest`
+- Ingest repo (sibling): `../TEST-uk-aq-ingest`
 - Schema repo (sibling): `../TEST-uk-aq-schema`
-- Naming conventions (ingest repo): `../CIC-test-uk-aq-ingest/AGENTS.md`
+- Naming conventions (ingest repo): `../TEST-uk-aq-ingest/AGENTS.md`
 
 ## WORKING STYLE (IMPORTANT)
 

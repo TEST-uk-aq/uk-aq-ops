@@ -5,8 +5,8 @@ orchestrator for the UK-AQ history integrity run.
 
 ## Current flow
 
-1. Load the integrity environment and then the configured backfill environment.
-2. Check Dropbox backup readiness for scheduled runs before Dropbox-inspecting preflight checks.
+1. Load environment and preflight the selected environment.
+2. Check Dropbox backup readiness for scheduled runs.
 3. Import the current core snapshot.
 4. Run the configured source adapters.
 5. Run R2 history cross-checks.
@@ -28,19 +28,8 @@ before any Dropbox history scan starts.
 The required task keys default to:
 
 ```text
-ops.r2_history_dropbox_backup
+r2_backup_inventory,r2_history_dropbox_sync
 ```
-
-This is the factual daily-task key for the single GitHub workflow that builds
-the R2 backup inventory and then runs the inventory-driven Dropbox sync. The
-workflow reports `Finished` only after both ordered steps complete successfully.
-
-The gate calls the RPC through the exposed `uk_aq_public` PostgREST schema and
-uses the Obs AQI DB credential order: dedicated daily-task-health variables,
-`OBS_AQIDB_SUPABASE_URL`/`OBS_AQIDB_SECRET_KEY`, then established generic
-fallbacks. The request includes the scheduled date, integrity start timestamp,
-and required task keys. Missing credentials, invalid inputs, RPC failures, or
-unexpected response shapes block the run safely.
 
 ## v2 hierarchy validation
 

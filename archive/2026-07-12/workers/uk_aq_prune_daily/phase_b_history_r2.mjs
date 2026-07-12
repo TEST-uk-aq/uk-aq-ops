@@ -17,10 +17,6 @@ import {
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
 import { resolveR2HistoryVersion } from "../shared/uk_aq_r2_history_version.mjs";
-import {
-  normalizeObservationPropertyCode,
-  OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
-} from "../shared/uk_aq_observation_property_code.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PART_MAX_ROWS = 1_000_000;
@@ -695,8 +691,8 @@ function buildPartKey(prefix, dayUtc, connectorId, partIndex) {
 }
 
 function normalizePollutantCodeForPath(pollutantCode) {
-  const value = normalizeObservationPropertyCode(pollutantCode);
-  if (!value) {
+  const value = String(pollutantCode || "").trim().toLowerCase();
+  if (!/^[a-z0-9_]+$/.test(value)) {
     throw new Error(`Invalid pollutant_code for R2 path: ${String(pollutantCode || "")}`);
   }
   return value;
@@ -916,7 +912,7 @@ join uk_aq_core.timeseries ts on ts.id = o.timeseries_id and ts.connector_id = o
 join uk_aq_core.phenomena p on p.id = ts.phenomenon_id
 join uk_aq_core.observed_properties op on op.id = p.observed_property_id
 where o.observed_at < $1::timestamptz
-  and (op.code is null or btrim(op.code) = '' or op.code !~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}')
+  and (op.code is null or btrim(op.code) = '' or op.code !~ '^[a-z][a-z0-9_]*$')
 order by op.code nulls first
 limit 25
 `, [latestEligibleWindowEndIso]);
@@ -951,7 +947,7 @@ with source_rows as (
      join uk_aq_core.observed_properties op2 on op2.id = p2.observed_property_id
      where o2.connector_id = o.connector_id
        and (o2.observed_at at time zone 'UTC')::date = (o.observed_at at time zone 'UTC')::date
-       and op2.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
+       and op2.code ~ '^[a-z][a-z0-9_]*$'
    )
   where o.observed_at < $1::timestamptz
     and op.code is not null
@@ -973,7 +969,7 @@ eligible as (
     min(observed_at) as min_observed_at,
     max(observed_at) as max_observed_at
   from source_rows
-  where source_code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
+  where source_code ~ '^[a-z][a-z0-9_]*$'
   group by 1, 2
 ),
 excluded as (
@@ -1254,14 +1250,6 @@ order by day_utc, connector_id
 
   const result = await client.query(sql, [latestEligibleWindowEndIso]);
   return result.rows.map(toConnectorDayRow);
-}
-
-export async function populateBackupCandidatesForTest({
-  client,
-  latestEligibleWindowEndIso,
-  runtime,
-}) {
-  return populateBackupCandidates(client, latestEligibleWindowEndIso, runtime);
 }
 
 async function markIncompleteDaysAsBackupBlocked(client) {
