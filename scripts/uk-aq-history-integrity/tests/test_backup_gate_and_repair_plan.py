@@ -315,12 +315,16 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
 
     def test_repair_plan_queues_aqi_only_for_aqi_enabled_pollutants(self) -> None:
         plan = MODULE.build_v2_repair_plan(observation_gaps=[
-            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "pm10"},
-            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3"},
+            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "pm10", "source_evidence": {"source_partition_state": "successful_non_empty"}},
+            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "no2", "source_evidence": {"source_partition_state": "successful_non_empty"}},
+            {"gap_type": "source_r2_timeseries_row_mismatch", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3", "source_evidence": {"source_partition_state": "successful_non_empty"}},
         ])
         aqi = [a for a in plan if a["kind"] == "aqi_rebuild"]
-        self.assertEqual(len(aqi), 1)
-        self.assertEqual(aqi[0]["pollutant_code"], "pm10")
+        self.assertEqual({a["pollutant_code"] for a in aqi}, {"pm10", "no2"})
+        self.assertTrue(all(a["status"] == "planned" for a in aqi))
+        self.assertTrue(all(a["executes"] is False for a in aqi))
+        self.assertTrue(all(a["data_changes_required"] is True for a in aqi))
+        self.assertFalse(any(a["pollutant_code"] == "o3" for a in aqi))
 
     def test_manifest_only_repair_does_not_queue_unnecessary_aqi_rebuild(self) -> None:
         plan = MODULE.build_v2_repair_plan(observation_gaps=[
@@ -334,10 +338,10 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
             {"gap_type": "connector_manifest_missing_pollutant_child", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3"},
             {"gap_type": "index_manifest_missing", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3"},
         ])
-        self.assertEqual([a["kind"] for a in plan], ["observation_connector_manifest_repair", "observation_index_repair"])
+        self.assertEqual([a["kind"] for a in plan], ["observation_index_repair", "observation_connector_manifest_repair"])
 
     def test_source_unavailable_gap_routes_to_operator_review(self) -> None:
-        plan = MODULE.build_v2_repair_plan(observation_gaps=[
+        gaps = [
             {
                 "gap_type": "data_manifest_missing",
                 "day_utc": "2026-05-17",
@@ -345,20 +349,33 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
                 "pollutant_code": "o3",
                 "source_evidence": {"source_partition_state": "counts_unavailable"},
             },
-        ])
+            {
+                "gap_type": "data_manifest_file_count_mismatch",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "o3",
+                "parquet_readable": True,
+                "source_evidence": {"source_partition_state": "successful_non_empty"},
+            },
+        ]
+        MODULE._classify_v2_gaps(gaps)
+        plan = MODULE.build_v2_repair_plan(observation_gaps=gaps)
         self.assertEqual([a["kind"] for a in plan], ["source_mapping_issue"])
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
+        self.assertFalse(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
+        self.assertFalse(any(a["kind"] == "aqi_rebuild" for a in plan))
 
     def test_manifest_only_gap_remains_manifest_only_for_o3(self) -> None:
-        gap = {
-            "gap_type": "orphan_parquet_without_manifest",
-            "day_utc": "2026-05-17",
-            "connector_id": 1,
-            "pollutant_code": "o3",
-            "parquet_readable": True,
-            "source_evidence": {"source_partition_state": "counts_unavailable"},
-        }
+        gap = MODULE._v2_obs_gap(
+            "data_manifest_missing",
+            day_utc="2026-05-17",
+            connector_id=1,
+            pollutant_code="o3",
+            expected_path="manifest.json",
+        )
+        gap["parquet_readable"] = True
+        gap["source_evidence"] = {"source_partition_state": "successful_non_empty"}
         MODULE._classify_v2_gaps([gap])
         plan = MODULE.build_v2_repair_plan(observation_gaps=[gap])
         self.assertTrue(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
@@ -367,19 +384,76 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
 
+    def test_manifest_only_repair_precedes_index_only_for_same_partition(self) -> None:
+        gaps = [
+            MODULE._v2_obs_gap(
+                "data_manifest_file_count_mismatch",
+                day_utc="2026-05-17",
+                connector_id=1,
+                pollutant_code="o3",
+                expected_path="manifest.json",
+            ),
+            MODULE._v2_obs_gap(
+                "index_manifest_missing",
+                day_utc="2026-05-17",
+                connector_id=1,
+                pollutant_code="o3",
+                expected_path="index.json",
+            ),
+        ]
+        gaps[0]["parquet_readable"] = True
+        gaps[0]["source_evidence"] = {"source_partition_state": "successful_non_empty"}
+        MODULE._classify_v2_gaps(gaps)
+        plan = MODULE.build_v2_repair_plan(observation_gaps=gaps)
+        self.assertEqual([a["kind"] for a in plan], ["observation_pollutant_manifest_repair"])
+        self.assertTrue(all(a["status"] == "planned" for a in plan))
+        self.assertTrue(all(a["executes"] is False for a in plan))
+        self.assertFalse(any(a["kind"] == "observation_index_repair" for a in plan))
+        self.assertFalse(any(a["kind"] == "aqi_rebuild" for a in plan))
+
     def test_pm10_data_fault_keeps_aqi_rebuild_planned_non_executing(self) -> None:
-        plan = MODULE.build_v2_repair_plan(observation_gaps=[
+        gaps = [
             {
-                "gap_type": "data_manifest_missing",
+                "gap_type": "source_r2_timeseries_row_mismatch",
                 "day_utc": "2026-05-17",
                 "connector_id": 1,
                 "pollutant_code": "pm10",
                 "source_evidence": {"source_partition_state": "successful_non_empty"},
             },
-        ])
+            {
+                "gap_type": "data_manifest_file_count_mismatch",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "pm10",
+                "parquet_readable": True,
+                "source_evidence": {"source_partition_state": "successful_non_empty"},
+            },
+            {
+                "gap_type": "data_manifest_missing",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "pm10",
+                "source_evidence": {"source_partition_state": "counts_unavailable"},
+            },
+        ]
+        MODULE._classify_v2_gaps(gaps)
+        plan = MODULE.build_v2_repair_plan(observation_gaps=gaps)
         self.assertTrue(any(a["kind"] == "observation_data_repair" for a in plan))
         self.assertTrue(any(a["kind"] == "aqi_rebuild" for a in plan))
+        self.assertFalse(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
         self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
+        self.assertTrue(all(a["status"] == "planned" for a in plan))
+        self.assertTrue(all(a["executes"] is False for a in plan))
+        self.assertTrue(all(a.get("data_changes_required") is True for a in plan if a["kind"] == "aqi_rebuild"))
+        self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
+
+    def test_parent_connector_and_day_manifest_scopes_remain_separate(self) -> None:
+        plan = MODULE.build_v2_repair_plan(observation_gaps=[
+            {"gap_type": "connector_manifest_missing", "day_utc": "2026-05-17", "connector_id": 1},
+            {"gap_type": "day_manifest_missing", "day_utc": "2026-05-17", "connector_id": 1},
+        ])
+        self.assertIn("observation_connector_manifest_repair", [a["kind"] for a in plan])
+        self.assertIn("observation_day_manifest_repair", [a["kind"] for a in plan])
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
 

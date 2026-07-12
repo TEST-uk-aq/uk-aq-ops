@@ -12,7 +12,7 @@ This deploys a dedicated Cloud Run service that maintains `uk_aq_observs.observa
 - default partition diagnostics (`count`, min/max observed_at, top offenders)
 - retention drops based on strict UTC-day cutoff (keeps the last `OBS_AQIDB_OBSERVS_RETENTION_DAYS` full UTC days)
 - R2 History manifest gate before each drop:
-  - HEAD `history/v1/observations/day_utc=YYYY-MM-DD/manifest.json` in Cloudflare R2
+  - HEAD `history/v2/observations/day_utc=YYYY-MM-DD/manifest.json` in Cloudflare R2
   - GET the same `manifest.json` and validate:
     - `day_utc` matches the partition day
     - `manifest_hash` matches SHA-256 of manifest content excluding `manifest_hash`
@@ -21,6 +21,7 @@ This deploys a dedicated Cloud Run service that maintains `uk_aq_observs.observa
     - if the day has no rows: drop the empty partition
     - if `uk_aq_rpc_observs_day_has_rows` is missing from PostgREST schema cache, fallback check uses `uk_aq_rpc_observations_hourly_fingerprint` for that UTC day
   - if not confirmed, skip drop and log `SKIP DROP — history manifest not confirmed`
+  - the Cloud Run deploy workflow maps the worker's `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` env to `vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations'` for this service
 - after a successful partition drop, best-effort delete the matching row from `uk_aq_ops.obs_aqidb_day_counts_current` via `uk_aq_rpc_obs_aqidb_day_count_delete('observs', day_utc)`
   - failures are logged as warnings only because hourly/daily day-count refresh jobs will reconcile later
 
@@ -67,7 +68,7 @@ Cloudflare R2 history-check placeholders (S3-compatible API):
 - `CFLARE_R2_ACCESS_KEY_ID` (or `R2_ACCESS_KEY_ID`)
 - `CFLARE_R2_SECRET_ACCESS_KEY` (or `R2_SECRET_ACCESS_KEY`)
 - `CFLARE_R2_REGION` (or `R2_REGION`, default `auto`)
-- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
+- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`; the Cloud Run deploy workflow for this service overrides it from the v2 repo variable so production resolves to `history/v2/observations`)
 
 ## Local run
 

@@ -257,7 +257,7 @@ If it is an accidental copy created to make a schema test pass, make the test lo
 | Phase | Name | Status | Notes |
 | --- | --- | --- | --- |
 | 2c.2a | Correct source-state comparison and propagation | Local validation complete, uncommitted | Successful-empty and unavailable states |
-| 2c.2b | Enforce repair precedence and AQI metadata | Not started | One unambiguous result per partition |
+| 2c.2b | Enforce repair precedence and AQI metadata | Local validation complete, uncommitted | One unambiguous result per partition |
 | 2c.2c | Non-DuckDB completion checks and SQL-mirror review | Not started | DuckDB deferred to test system |
 
 Allowed status values:
@@ -573,25 +573,33 @@ git status --short
 Status:
 
 ```text
-Not started
+Local validation complete, uncommitted
 ```
 
 Analysis confirmation:
 
 ```text
-To be updated by Codex.
+Finding C confirmed. The repair plan now selects one highest-priority observation action per partition and prunes lower-priority contradictory actions.
+Finding D confirmed. Dependent AQI rebuilds are only retained for observation data repairs and now carry data_changes_required=true.
 ```
 
 Files changed:
 
 ```text
-To be updated by Codex.
+scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+scripts/uk-aq-history-integrity/tests/test_backup_gate_and_repair_plan.py
 ```
 
 Tests:
 
 ```text
-To be updated by Codex.
+python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/tests/test_backup_gate_and_repair_plan.py scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_backup_gate_and_repair_plan.py -q
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py -q
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py -q
+python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py -q
+python3 -m unittest discover -s scripts/uk-aq-history-integrity/tests -p 'test_*.py' -q
+git diff --check
 ```
 
 ---
