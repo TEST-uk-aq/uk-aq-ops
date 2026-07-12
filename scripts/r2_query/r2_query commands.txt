@@ -28,3 +28,6 @@ scripts/r2_query/query_r2_v2_observs_aqilevels_indexes.sh --connector-id 1 --fro
 
 
 scripts/r2_query/query_r2_v2_day_counts.sh   --connector-id all   --from-day 2026-05-01   --to-day 2026-07-10   --out "/Users/mikehinford/uk-aq-work/r2_v2_day_counts_$(date +%Y-%m-%d_%H%M%S).csv"
+
+
+scripts/r2_query/query_r2_v2_day_counts.sh   --connector-id all   --from-day 2026-07-01   --to-day 2026-07-10   --out "/Users/mikehinford/uk-aq-work/r2_v2_day_counts_$(date +%Y-%m-%d_%H%M%S).csv"
