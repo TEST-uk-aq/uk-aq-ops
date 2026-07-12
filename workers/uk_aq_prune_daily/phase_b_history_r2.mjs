@@ -744,6 +744,7 @@ async function withPgClient(connectionString, fn) {
   await client.connect();
   try {
     await client.query("set timezone = 'UTC'");
+    await client.query("set statement_timeout = '10min'");
     return await fn(client);
   } finally {
     await client.end();
@@ -920,13 +921,13 @@ limit 25
       throw new Error(`Invalid observed_properties.code values for v2 history: ${invalidCodes.rows.map((row) => String(row.code)).join(", ")}`);
     }
     const sql = `
-with source_rows as (
+with source_aggregates as (
   select
     (o.observed_at at time zone 'UTC')::date as day_utc,
     o.connector_id::integer as connector_id,
-    o.observed_at,
-    op.code as source_code,
-    lower(op.code) as pollutant_code
+    count(*)::bigint as expected_row_count,
+    min(o.observed_at) as min_observed_at,
+    max(o.observed_at) as max_observed_at
   from uk_aq_core.observations o
   join uk_aq_core.timeseries ts
     on ts.id = o.timeseries_id
@@ -935,59 +936,8 @@ with source_rows as (
     on p.id = ts.phenomenon_id
   join uk_aq_core.observed_properties op
     on op.id = p.observed_property_id
-  left join uk_aq_ops.history_candidates existing_complete
-    on existing_complete.day_utc = (o.observed_at at time zone 'UTC')::date
-   and existing_complete.connector_id = o.connector_id
-   and existing_complete.status = 'complete'
-   and existing_complete.expected_row_count = (
-     select count(*)::bigint
-     from uk_aq_core.observations o2
-     join uk_aq_core.timeseries ts2 on ts2.id = o2.timeseries_id and ts2.connector_id = o2.connector_id
-     join uk_aq_core.phenomena p2 on p2.id = ts2.phenomenon_id
-     join uk_aq_core.observed_properties op2 on op2.id = p2.observed_property_id
-     where o2.connector_id = o.connector_id
-       and (o2.observed_at at time zone 'UTC')::date = (o.observed_at at time zone 'UTC')::date
-       and op2.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
-   )
   where o.observed_at < $1::timestamptz
-    and op.code is not null
-    and existing_complete.day_utc is null
-),
-source_counts as (
-  select
-    day_utc,
-    connector_id,
-    count(*)::bigint as source_row_count
-  from source_rows
-  group by 1, 2
-),
-eligible as (
-  select
-    day_utc,
-    connector_id,
-    count(*)::bigint as expected_row_count,
-    min(observed_at) as min_observed_at,
-    max(observed_at) as max_observed_at
-  from source_rows
-  where source_code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
-  group by 1, 2
-),
-excluded as (
-  select
-    day_utc,
-    connector_id,
-    coalesce(sum(row_count), 0)::bigint as excluded_row_count,
-    coalesce(jsonb_object_agg(pollutant_code, row_count order by pollutant_code), '{}'::jsonb) as excluded_pollutant_counts
-  from (
-    select
-      day_utc,
-      connector_id,
-      pollutant_code,
-      count(*)::bigint as row_count
-    from source_rows
-    where false
-    group by 1, 2, 3
-  ) grouped
+    and op.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
   group by 1, 2
 ),
 upserted as (
@@ -1012,11 +962,11 @@ upserted as (
     resume_parts_json
   )
   select
-    e.day_utc,
-    e.connector_id,
-    e.expected_row_count,
-    e.min_observed_at,
-    e.max_observed_at,
+    sa.day_utc,
+    sa.connector_id,
+    sa.expected_row_count,
+    sa.min_observed_at,
+    sa.max_observed_at,
     'pending'::text,
     null,
     null,
@@ -1030,20 +980,76 @@ upserted as (
     0,
     0,
     '[]'::jsonb
-  from eligible e
+  from source_aggregates sa
   on conflict (day_utc, connector_id)
   do update set
     expected_row_count = excluded.expected_row_count,
     min_observed_at = excluded.min_observed_at,
     max_observed_at = excluded.max_observed_at,
-    status = 'pending',
-    run_id = null,
-    last_error = null,
-    manifest_key = null,
-    history_row_count = null,
-    history_file_count = null,
-    history_total_bytes = null,
-    history_completed_at = null,
+    status = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then 'complete'
+      else 'pending'
+    end,
+    run_id = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.run_id
+      else null
+    end,
+    last_error = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.last_error
+      else null
+    end,
+    manifest_key = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.manifest_key
+      else null
+    end,
+    history_row_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_row_count
+      else null
+    end,
+    history_file_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_file_count
+      else null
+    end,
+    history_total_bytes = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_total_bytes
+      else null
+    end,
+    history_completed_at = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.history_completed_at
+      else null
+    end,
     resume_last_timeseries_id = case
       when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1080,7 +1086,6 @@ upserted as (
       else '[]'::jsonb
     end,
     updated_at = now()
-  where uk_aq_ops.history_candidates.status <> 'complete'
   returning
     day_utc,
     connector_id,
@@ -1101,16 +1106,10 @@ upserted as (
 )
 select
   u.*,
-  coalesce(sc.source_row_count, u.expected_row_count)::bigint as source_row_count,
-  coalesce(x.excluded_row_count, 0)::bigint as excluded_row_count,
-  coalesce(x.excluded_pollutant_counts, '{}'::jsonb) as excluded_pollutant_counts
+  u.expected_row_count::bigint as source_row_count,
+  0::bigint as excluded_row_count,
+  '{}'::jsonb as excluded_pollutant_counts
 from upserted u
-left join source_counts sc
-  on sc.day_utc = u.day_utc
- and sc.connector_id = u.connector_id
-left join excluded x
-  on x.day_utc = u.day_utc
- and x.connector_id = u.connector_id
 order by u.day_utc, u.connector_id
 `;
 
