@@ -9239,6 +9239,35 @@ _SOURCE_PARTITION_UNAVAILABLE_STATES = {
     "counts_unavailable",
 }
 
+_AQI_REBUILD_ORIGIN_ORDER = {
+    "aqi_data_fault": 0,
+    "observation_dependency": 1,
+    "unspecified": 2,
+}
+
+
+def _normalize_aqi_rebuild_origins(origins: Iterable[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for origin in origins or ():
+        origin_text = str(origin).strip()
+        if not origin_text or origin_text in normalized:
+            continue
+        normalized.append(origin_text)
+    if not normalized:
+        normalized = ["unspecified"]
+    return sorted(normalized, key=lambda origin: (_AQI_REBUILD_ORIGIN_ORDER.get(origin, 99), origin))
+
+
+def _should_keep_aqi_rebuild(
+    *,
+    selected_observation_kind: str | None,
+    origins: Iterable[str] | None,
+) -> bool:
+    normalized_origins = _normalize_aqi_rebuild_origins(origins)
+    if any(origin != "observation_dependency" for origin in normalized_origins):
+        return True
+    return selected_observation_kind == "observation_data_repair"
+
 
 def _source_partition_state_from_gap(gap: Mapping[str, Any]) -> str | None:
     evidence = gap.get("source_evidence")
@@ -9300,6 +9329,7 @@ def build_v2_repair_plan(
         executes: bool = False,
         operator_action_required: bool = False,
         data_changes_required: bool = False,
+        aqi_rebuild_origin: str | None = None,
         notes: str | None = None,
     ) -> None:
         day_utc = gap.get("day_utc")
@@ -9308,6 +9338,10 @@ def build_v2_repair_plan(
         key = (kind, str(day_utc or ""), connector_id, str(pollutant_code or "") or None)
         entry = actions.get(key)
         gap_type = str(gap.get("gap_type") or "")
+        if kind == "aqi_rebuild":
+            requires_index_rebuild = True
+            executes = False
+            data_changes_required = True
         if entry is None:
             entry = {
                 "kind": kind,
@@ -9323,6 +9357,8 @@ def build_v2_repair_plan(
                 "commands": [],
                 "notes": notes or "",
             }
+            if kind == "aqi_rebuild":
+                entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins([aqi_rebuild_origin or "unspecified"])
             actions[key] = entry
         else:
             if gap_type and gap_type not in entry["gap_types"]:
@@ -9333,6 +9369,10 @@ def build_v2_repair_plan(
             entry["data_changes_required"] = bool(entry["data_changes_required"] or data_changes_required)
             if notes and notes not in str(entry.get("notes") or ""):
                 entry["notes"] = f"{entry['notes']}; {notes}" if entry.get("notes") else notes
+            if kind == "aqi_rebuild":
+                entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins(
+                    [*(entry.get("aqi_rebuild_origins") or []), aqi_rebuild_origin or "unspecified"]
+                )
 
     for gap in observation_gaps:
         gap_type = str(gap.get("gap_type") or "")
@@ -9461,6 +9501,7 @@ def build_v2_repair_plan(
                     gap=gap,
                     requires_index_rebuild=True,
                     data_changes_required=True,
+                    aqi_rebuild_origin="observation_dependency",
                     notes="Queue AQI rebuilding only because the observation data changed for an AQI-enabled pollutant.",
                 )
 
@@ -9531,6 +9572,7 @@ def build_v2_repair_plan(
                 gap=gap,
                 requires_index_rebuild=True,
                 data_changes_required=True,
+                aqi_rebuild_origin="aqi_data_fault",
                 notes="Rebuild AQI data only where the AQI partition itself is stale or incomplete.",
             )
 
@@ -9561,9 +9603,17 @@ def build_v2_repair_plan(
         partition_key = (str(day_utc), str(connector_id), str(pollutant_code))
         selected_kind = selected_observation_actions.get(partition_key)
         if kind == "aqi_rebuild":
-            if selected_kind != "observation_data_repair":
+            if not _should_keep_aqi_rebuild(
+                selected_observation_kind=selected_kind,
+                origins=entry.get("aqi_rebuild_origins"),
+            ):
                 continue
+            entry["aqi_rebuild_origins"] = _normalize_aqi_rebuild_origins(entry.get("aqi_rebuild_origins"))
             entry["data_changes_required"] = True
+            entry["requires_index_rebuild"] = True
+            entry["executes"] = False
+            entry["status"] = "planned"
+            entry["commands"] = []
             filtered_actions[action_key] = entry
             continue
         if kind in observation_partition_priority and selected_kind != kind:

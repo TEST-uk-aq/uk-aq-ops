@@ -350,6 +350,111 @@ class V2Phase2ValidationTests(unittest.TestCase):
         self.assertTrue(all(action["executes"] is False for action in plan))
         self.assertTrue(all("data_changes_required" in action for action in plan))
 
+    def test_aqi_rebuild_origin_policy_keeps_fallback_and_distinguishes_dependency(self) -> None:
+        self.assertTrue(
+            MODULE._should_keep_aqi_rebuild(
+                selected_observation_kind="observation_data_repair",
+                origins=["observation_dependency"],
+            )
+        )
+        self.assertFalse(
+            MODULE._should_keep_aqi_rebuild(
+                selected_observation_kind="source_mapping_issue",
+                origins=["observation_dependency"],
+            )
+        )
+        self.assertTrue(
+            MODULE._should_keep_aqi_rebuild(
+                selected_observation_kind=None,
+                origins=["aqi_data_fault"],
+            )
+        )
+        self.assertTrue(MODULE._should_keep_aqi_rebuild(selected_observation_kind=None, origins=[]))
+        self.assertEqual(MODULE._normalize_aqi_rebuild_origins([]), ["unspecified"])
+        self.assertEqual(
+            MODULE._normalize_aqi_rebuild_origins(["observation_dependency", "aqi_data_fault"]),
+            ["aqi_data_fault", "observation_dependency"],
+        )
+
+    def test_independent_aqi_only_rebuilds_survive_for_parquet_unreadable_and_zero_rows(self) -> None:
+        for gap_type in ("parquet_unreadable", "data_partition_zero_rows"):
+            with self.subTest(gap_type=gap_type):
+                gap = MODULE._v2_aqi_gap(
+                    gap_type,
+                    day_utc="2026-06-11",
+                    connector_id=1,
+                    pollutant_code="pm25",
+                    expected_path="manifest.json",
+                )
+                plan = MODULE.build_v2_repair_plan(aqi_gaps=[gap])
+                aqi_actions = [action for action in plan if action["kind"] == "aqi_rebuild"]
+                self.assertEqual(len(aqi_actions), 1)
+                action = aqi_actions[0]
+                self.assertEqual(action["aqi_rebuild_origins"], ["aqi_data_fault"])
+                self.assertEqual(action["status"], "planned")
+                self.assertFalse(action["executes"])
+                self.assertTrue(action["data_changes_required"])
+                self.assertTrue(action["requires_index_rebuild"])
+                self.assertEqual(action["commands"], [])
+
+    def test_o3_independent_aqi_fault_survives_without_observation_dependency(self) -> None:
+        gap = MODULE._v2_aqi_gap(
+            "parquet_unreadable",
+            day_utc="2026-06-11",
+            connector_id=1,
+            pollutant_code="o3",
+            expected_path="manifest.json",
+        )
+        plan = MODULE.build_v2_repair_plan(aqi_gaps=[gap])
+        aqi_actions = [action for action in plan if action["kind"] == "aqi_rebuild"]
+        self.assertEqual(len(aqi_actions), 1)
+        self.assertEqual(aqi_actions[0]["aqi_rebuild_origins"], ["aqi_data_fault"])
+        self.assertEqual(aqi_actions[0]["pollutant_code"], "o3")
+
+    def test_observation_triggered_aqi_rebuild_uses_observation_dependency_origin(self) -> None:
+        gap = MODULE._v2_obs_gap(
+            "data_manifest_missing",
+            day_utc="2026-06-11",
+            connector_id=1,
+            pollutant_code="pm25",
+            expected_path="manifest.json",
+        )
+        plan = MODULE.build_v2_repair_plan(observation_gaps=[gap])
+        aqi_actions = [action for action in plan if action["kind"] == "aqi_rebuild"]
+        self.assertEqual(len(aqi_actions), 1)
+        self.assertEqual(aqi_actions[0]["aqi_rebuild_origins"], ["observation_dependency"])
+        self.assertEqual(aqi_actions[0]["status"], "planned")
+        self.assertFalse(aqi_actions[0]["executes"])
+        self.assertTrue(aqi_actions[0]["data_changes_required"])
+        self.assertTrue(aqi_actions[0]["requires_index_rebuild"])
+
+    def test_mixed_independent_and_dependent_aqi_rebuilds_merge_for_same_partition(self) -> None:
+        observation_gap = MODULE._v2_obs_gap(
+            "data_manifest_missing",
+            day_utc="2026-06-11",
+            connector_id=1,
+            pollutant_code="pm25",
+            expected_path="manifest.json",
+        )
+        aqi_gap = MODULE._v2_aqi_gap(
+            "parquet_unreadable",
+            day_utc="2026-06-11",
+            connector_id=1,
+            pollutant_code="pm25",
+            expected_path="manifest.json",
+        )
+        plan = MODULE.build_v2_repair_plan(observation_gaps=[observation_gap], aqi_gaps=[aqi_gap])
+        aqi_actions = [action for action in plan if action["kind"] == "aqi_rebuild"]
+        self.assertEqual(len(aqi_actions), 1)
+        action = aqi_actions[0]
+        self.assertEqual(action["aqi_rebuild_origins"], ["aqi_data_fault", "observation_dependency"])
+        self.assertEqual(action["gap_types"], ["data_manifest_missing", "parquet_unreadable"])
+        self.assertEqual(action["status"], "planned")
+        self.assertFalse(action["executes"])
+        self.assertTrue(action["data_changes_required"])
+        self.assertTrue(action["requires_index_rebuild"])
+        self.assertEqual(action["commands"], [])
+
     def test_phase2_validation_does_not_modify_history_files(self) -> None:
         self._write_pollutant("observations", "o3", 1, 101)
         self._write_pollutant("aqilevels", "pm25", 1, 202)
