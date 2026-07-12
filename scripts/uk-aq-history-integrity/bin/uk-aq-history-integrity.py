@@ -7185,6 +7185,9 @@ def _enrich_v2_observations_repair_plans(
         "data_manifest_duplicate_file_key",
         "data_manifest_timeseries_row_count_mismatch",
         "data_manifest_total_bytes_mismatch",
+        "data_manifest_empty_timeseries_counts",
+        "parquet_null_timeseries_id_rows",
+        "data_partition_zero_rows",
         "parquet_missing",
         "parquet_empty_or_placeholder",
         "parquet_unreadable",
@@ -7622,6 +7625,19 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
         columns = {str(row[0]) for row in described}
         if "timeseries_id" not in columns:
             return None, "timeseries_id_column_missing"
+        
+        # Get total row count (including null timeseries_id rows)
+        total_row_count_result = connection.execute(
+            "SELECT COUNT(*) FROM read_parquet(?, union_by_name=true)",
+            [parquet_files],
+        ).fetchone()[0]
+        # Handle both integer and string results from the query
+        try:
+            total_row_count = int(total_row_count_result)
+        except (TypeError, ValueError):
+            total_row_count = total_row_count_result
+        
+        # Get non-null timeseries_id rows and their counts
         rows = connection.execute(
             "SELECT CAST(timeseries_id AS BIGINT), COUNT(*) "
             "FROM read_parquet(?, union_by_name=true) "
@@ -7629,6 +7645,27 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
             [parquet_files],
         ).fetchall()
         counts = {int(timeseries_id): int(row_count) for timeseries_id, row_count in rows}
+        
+        # Calculate null timeseries_id count
+        try:
+            null_timeseries_count = int(total_row_count) - sum(counts.values())
+        except (TypeError, ValueError):
+            # If we can't convert to int, assume no null timeseries_id rows
+            null_timeseries_count = 0
+        
+        # If there are null timeseries_id rows, this is a data fault
+        if null_timeseries_count > 0:
+            return {
+                "row_count": total_row_count,
+                "timeseries_row_counts": counts,
+                "null_timeseries_count": null_timeseries_count,
+                "min_timeseries_id": min(counts) if counts else None,
+                "max_timeseries_id": max(counts) if counts else None,
+                "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
+                "max_timestamp_utc": str(max_timestamp) if max_timestamp is not None else None,
+                "parquet_null_timeseries_id_rows": True,
+            }, None
+        
         timestamp_column = next(
             (name for name in ("observed_at_utc", "observed_at", "timestamp_hour_utc") if name in columns),
             None,
@@ -7643,8 +7680,9 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
                 [parquet_files],
             ).fetchone()
         return {
-            "row_count": sum(counts.values()),
+            "row_count": total_row_count,
             "timeseries_row_counts": counts,
+            "null_timeseries_count": null_timeseries_count,
             "min_timeseries_id": min(counts) if counts else None,
             "max_timeseries_id": max(counts) if counts else None,
             "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
@@ -7710,9 +7748,22 @@ def _append_parent_aggregate_gaps(
 ) -> None:
     gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
     aggregate = _child_manifest_aggregate(child_payloads)
-    for field in ("row_count", "source_row_count", "file_count", "total_bytes"):
+    
+    # Validate required fields are present and of correct type
+    required_fields = ("row_count", "source_row_count", "file_count", "total_bytes")
+    for field in required_fields:
         actual = _int_field(payload, field)
-        if actual is not None and actual != aggregate[field]:
+        if actual is None:
+            # Missing required field - this is a schema mismatch
+            gaps.append(gap_fn(
+                f"{level}_manifest_{field}_schema_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=expected_path,
+                related_paths=[f"field={field} missing_or_invalid_type"],
+            ))
+        elif actual != aggregate[field]:
+            # Field present but value mismatch
             gaps.append(gap_fn(
                 f"{level}_manifest_{field}_mismatch",
                 day_utc=day_utc,
@@ -7720,6 +7771,18 @@ def _append_parent_aggregate_gaps(
                 expected_path=expected_path,
                 related_paths=[f"manifest_{field}={actual} child_{field}={aggregate[field]}"],
             ))
+    
+    # Handle zero vs missing row_count properly
+    row_count = _int_field(payload, "row_count")
+    if row_count is not None and row_count == 0:
+        # Genuine zero row count - use data_partition_zero_rows terminology
+        gaps.append(gap_fn(
+            "data_partition_zero_rows",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            expected_path=expected_path,
+            related_paths=[f"row_count={row_count}"],
+        ))
     for field in ("min_timeseries_id", "max_timeseries_id"):
         if field in payload and payload.get(field) != aggregate[field]:
             gaps.append(gap_fn(
@@ -7729,12 +7792,21 @@ def _append_parent_aggregate_gaps(
                 expected_path=expected_path,
                 related_paths=[f"manifest_{field}={payload.get(field)} child_{field}={aggregate[field]}"],
             ))
-    for field, aggregate_field in (
-        ("min_observed_at_utc", "min_timestamp_utc"),
-        ("max_observed_at_utc", "max_timestamp_utc"),
-        ("min_timestamp_hour_utc", "min_timestamp_utc"),
-        ("max_timestamp_hour_utc", "max_timestamp_utc"),
-    ):
+    # Domain-specific timestamp field validation
+    if domain == "observations":
+        timestamp_fields = (
+            ("min_observed_at_utc", "min_timestamp_utc"),
+            ("max_observed_at_utc", "max_timestamp_utc"),
+        )
+    elif domain == "aqilevels":
+        timestamp_fields = (
+            ("min_timestamp_hour_utc", "min_timestamp_utc"),
+            ("max_timestamp_hour_utc", "max_timestamp_utc"),
+        )
+    else:
+        timestamp_fields = ()
+    
+    for field, aggregate_field in timestamp_fields:
         if field in payload and payload.get(field) != aggregate[aggregate_field]:
             gaps.append(gap_fn(
                 f"{level}_manifest_{field}_mismatch",
@@ -8320,7 +8392,11 @@ def run_v2_observations_integrity_checks(
                         if "source_row_count" in payload and (not isinstance(payload.get("source_row_count"), int) or int(payload.get("source_row_count") or 0) <= 0):
                             gaps.append(_v2_obs_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
                         if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
-                            gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                            gaps.append(_v2_obs_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                        
+                        # Check for empty timeseries_row_counts (different from missing)
+                        if "timeseries_row_counts" in payload and isinstance(payload.get("timeseries_row_counts"), dict) and not payload.get("timeseries_row_counts"):
+                            gaps.append(_v2_obs_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                         for entry in files:
                             key = entry.get("key") if isinstance(entry, dict) else None
                             if not key:
@@ -8346,6 +8422,11 @@ def run_v2_observations_integrity_checks(
                     parquet_files=local_parquets,
                 )
                 parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
+                
+                # Check for null timeseries_id rows in observation parquet files
+                if parquet_stats and parquet_stats.get("parquet_null_timeseries_id_rows"):
+                    gaps.append(_v2_obs_gap("parquet_null_timeseries_id_rows", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"null_timeseries_count={parquet_stats.get('null_timeseries_count', 0)}"]))
+                
                 for partition_gap in gaps[partition_gap_start:]:
                     if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
                         partition_gap["parquet_readable"] = parquet_readable
@@ -9146,7 +9227,11 @@ def run_v2_aqilevels_integrity_checks(
                         if "source_row_count" in payload and not _is_positive_int(payload.get("source_row_count")):
                             data_gaps.append(_v2_aqi_gap("data_manifest_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
                         if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
-                            data_gaps.append(_v2_aqi_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                            data_gaps.append(_v2_aqi_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                        
+                        # Check for empty timeseries_row_counts (different from missing)
+                        if "timeseries_row_counts" in payload and isinstance(payload.get("timeseries_row_counts"), dict) and not payload.get("timeseries_row_counts"):
+                            data_gaps.append(_v2_aqi_gap("data_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                         for entry in files:
                             key = entry.get("key") if isinstance(entry, dict) else None
                             if not key:
@@ -9172,6 +9257,10 @@ def run_v2_aqilevels_integrity_checks(
                     parquet_files=local_parquets,
                 )
                 parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
+                
+                # Check for null timeseries_id rows in AQI parquet files
+                if parquet_stats and parquet_stats.get("parquet_null_timeseries_id_rows"):
+                    data_gaps.append(_v2_aqi_gap("parquet_null_timeseries_id_rows", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"null_timeseries_count={parquet_stats.get('null_timeseries_count', 0)}"]))
                 for partition_gap in data_gaps[partition_gap_start:]:
                     if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
                         partition_gap["parquet_readable"] = parquet_readable
