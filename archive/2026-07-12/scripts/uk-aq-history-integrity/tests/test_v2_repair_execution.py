@@ -248,11 +248,8 @@ class V2RepairExecutionTests(unittest.TestCase):
         part.mkdir(parents=True, exist_ok=True)
         (root / key).write_bytes(b"PAR1")
         payload = {
-            "manifest_kind": "pollutant",
             "history_version": "v2",
             "domain": "observations",
-            "grain": None,
-            "profile": None,
             "day_utc": day_utc,
             "connector_id": connector_id,
             "pollutant_code": pollutant_code,
@@ -277,47 +274,6 @@ class V2RepairExecutionTests(unittest.TestCase):
         latest = root / "history/_index_v2/observations_timeseries_latest.json"
         latest.parent.mkdir(parents=True, exist_ok=True)
         latest.write_text(json.dumps({"latest": day_utc}), encoding="utf-8")
-        self._write_v2_observation_parent_manifests(day_utc, connector_id)
-
-    def _write_v2_observation_parent_manifests(self, day_utc: str, connector_id: int) -> None:
-        root = Path(self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"])
-        day_dir = root / f"history/v2/observations/day_utc={day_utc}"
-        connector_dir = day_dir / f"connector_id={connector_id}"
-        children = []
-        for pollutant_dir in sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir()):
-            payload = json.loads((pollutant_dir / "manifest.json").read_text(encoding="utf-8"))
-            children.append(payload)
-        files = [entry for child in children for entry in child.get("files", [])]
-        connector = {
-            "manifest_kind": "connector", "history_version": "v2", "domain": "observations",
-            "grain": None, "profile": None, "day_utc": day_utc, "connector_id": connector_id,
-            "pollutant_codes": [child["pollutant_code"] for child in children],
-            "row_count": sum(child["row_count"] for child in children),
-            "source_row_count": sum(child["source_row_count"] for child in children),
-            "file_count": len(files), "total_bytes": sum(entry.get("bytes", 0) for entry in files),
-            "files": files,
-            "child_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
-            "pollutant_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
-        }
-        (connector_dir / "manifest.json").write_text(json.dumps(connector), encoding="utf-8")
-        connectors = []
-        for current_connector_dir in sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir()):
-            manifest_path = current_connector_dir / "manifest.json"
-            if manifest_path.is_file():
-                connectors.append(json.loads(manifest_path.read_text(encoding="utf-8")))
-        day_files = [entry for child in connectors for entry in child.get("files", [])]
-        day = {
-            "manifest_kind": "day", "history_version": "v2", "domain": "observations",
-            "grain": None, "profile": None, "day_utc": day_utc,
-            "connector_ids": [child["connector_id"] for child in connectors],
-            "row_count": sum(child["row_count"] for child in connectors),
-            "source_row_count": sum(child["source_row_count"] for child in connectors),
-            "file_count": len(day_files), "total_bytes": sum(entry.get("bytes", 0) for entry in day_files),
-            "files": day_files,
-            "child_manifests": [{"connector_id": child["connector_id"]} for child in connectors],
-            "connector_manifests": [{"connector_id": child["connector_id"]} for child in connectors],
-        }
-        (day_dir / "manifest.json").write_text(json.dumps(day), encoding="utf-8")
 
     def _write_v2_aqi_partition(
         self,
@@ -444,29 +400,17 @@ class V2RepairExecutionTests(unittest.TestCase):
         source: str = "sos",
         connector_ids: list[int] | None = None,
     ) -> dict[str, object]:
-        def parquet_stats(files):
-            paths = list(files)
-            manifest = json.loads((paths[0].parent / "manifest.json").read_text(encoding="utf-8"))
-            counts = {int(key): int(value) for key, value in manifest["timeseries_row_counts"].items()}
-            return ({
-                "row_count": sum(counts.values()), "timeseries_row_counts": counts,
-                "min_timeseries_id": min(counts) if counts else None,
-                "max_timeseries_id": max(counts) if counts else None,
-                "min_timestamp_utc": None, "max_timestamp_utc": None,
-            }, None)
-
-        with mock.patch.object(MODULE, "_read_parquet_partition_stats", side_effect=parquet_stats):
-            return MODULE.run_v2_observations_integrity_checks(
-                r2_history_root=self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"],
-                config=MODULE.resolve_history_path_config("v2", {}),
-                from_day=day_utc,
-                to_day=day_utc,
-                conn=conn,
-                env_name="CIC-Test",
-                allowed_connector_ids=set(connector_ids) if connector_ids else None,
-                source_scope={"source": source, "connector_ids": connector_ids, "scope": "source" if connector_ids else "all"},
-                log=self.log,
-            )
+        return MODULE.run_v2_observations_integrity_checks(
+            r2_history_root=self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"],
+            config=MODULE.resolve_history_path_config("v2", {}),
+            from_day=day_utc,
+            to_day=day_utc,
+            conn=conn,
+            env_name="CIC-Test",
+            allowed_connector_ids=set(connector_ids) if connector_ids else None,
+            source_scope={"source": source, "connector_ids": connector_ids, "scope": "source" if connector_ids else "all"},
+            log=self.log,
+        )
 
     def _mark_source_as_sos_flat_file(
         self,

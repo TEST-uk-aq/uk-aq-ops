@@ -44,8 +44,20 @@ unexpected response shapes block the run safely.
 
 ## v2 hierarchy validation
 
-The v2 integrity checks now validate parent manifest content against the live
-child directories instead of trusting a single manifest representation.
+The v2 integrity checks start from actual day, connector, pollutant, and parquet
+paths in the scoped Dropbox mirror. They validate parent manifest content
+against valid child manifests instead of trusting a single parent
+representation.
+
+DuckDB reads the actual parquet files and calculates whole-partition and
+per-timeseries row counts. The report keeps these comparisons separate:
+
+1. source counts versus actual parquet counts;
+2. actual parquet counts versus pollutant manifest counts;
+3. pollutant manifests versus connector/day hierarchy representations.
+
+`duckdb` is therefore required for a complete v2 check. An unavailable reader
+or unreadable parquet is reported explicitly and fails closed.
 
 This emits dedicated gap types for:
 
@@ -54,10 +66,25 @@ This emits dedicated gap types for:
 - total-byte mismatches;
 - timeseries row-count mismatches.
 
+Missing connector and day manifests are reported directly. Parent validation
+also covers row/source-row/file/byte aggregates, min/max timeseries identifiers,
+supported timestamp ranges, parquet key sets, and child manifest hashes.
+
+Each finding includes `fault_class`, distinguishing data, pollutant-manifest,
+connector-manifest, day-manifest, index, metadata, source-mapping, and
+source-unavailable faults. Both source-only and R2-only per-timeseries count
+differences are retained in the report.
+
 ## Repair planning
 
-Each v2 run now includes a `repair_plan` array in the report summary. The plan
-is non-executing and is ordered so manifest repairs happen before any rebuilds.
+Each v2 run includes a deterministic, deduplicated `repair_plan` array. Phase 2
+plans are non-executing (`executes=false`, `status=planned`) and include
+`data_changes_required`, `requires_index_rebuild`, and all contributing gap
+types.
+
+Readable valid parquet with a missing or invalid pollutant manifest is a
+manifest-only fault. Its plan rebuilds the manifest without rewriting parquet.
+Manifest-only O3 findings do not queue AQI.
 
 Relevant repair kinds include:
 

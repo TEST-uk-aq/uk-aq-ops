@@ -164,8 +164,8 @@ The new integrity flow must detect and repair this hierarchy without:
 
 | Phase | Name | Status | Completion commit | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | Backup gate correctness and safety | In progress | Pending (uncommitted on `main`) | Implementation and local validation complete; commit and manual SQL apply remain pending. |
-| 2 | Complete read-only v2 validation | Not started |  |  |
+| 1 | Backup gate correctness and safety | Complete | `6965763` | Committed on `main`; implementation and local validation complete. |
+| 2 | Complete read-only v2 validation | In progress | Pending (uncommitted on `main`) | Read-only implementation and local validation complete; completion commit remains pending. |
 | 3 | Observation manifest and index repair | Not started |  |  |
 | 4 | Observation data repair and AQI sequencing | Not started |  |  |
 
@@ -426,7 +426,7 @@ Phase 1 is complete only when:
 Status:
 
 ```text
-In progress
+Complete
 ```
 
 Completed work:
@@ -458,10 +458,9 @@ Tests:
 Remaining issues:
 
 ```text
-- No commit was created because the user did not request one; branch is main and starting HEAD was 12191b2.
-- The canonical SQL has not been applied to Supabase, as required by Level 1/code-only mode.
-- Phase 1 must remain In progress until a completion commit is recorded and the user manually applies/validates the RPC.
-- Phases 2-4 are unchanged apart from the plan-wide impact and operational-permission clarifications above.
+- Completion commit: 6965763.
+- No remaining Phase 1 implementation issue is recorded.
+- Phases 3-4 remain separate and are not enabled by Phase 1.
 ```
 
 ---
@@ -695,25 +694,45 @@ Phase 2 is complete only when:
 Status:
 
 ```text
-Not started
+In progress
 ```
 
 Completed work:
 
 ```text
-To be updated after implementation.
+- Changed discovery to validate actual scoped day/connector/pollutant directories and parquet files.
+- Added DuckDB reads of actual parquet per-timeseries counts, totals, ID ranges and supported timestamps.
+- Separated source-vs-parquet, parquet-vs-pollutant-manifest and child-vs-parent comparisons.
+- Added both source-only and R2-only timeseries mismatch reporting.
+- Added strict pollutant manifest kind/version/domain/profile/grain and path validation.
+- Added missing connector/day manifest detection for observations and AQI.
+- Made connector validation execute once per connector-day rather than once per pollutant.
+- Added independent connector/day representation, aggregate, parquet-key, range and child-hash checks.
+- Added fault_class to findings and manifest-only classification for readable parquet.
+- Changed repair plans to deterministic, deduplicated, non-executing status=planned actions with data_changes_required.
+- Confirmed O3 manifest-only work does not queue AQI.
+- Kept AQI debug optional under --check-aqi-debug/--require-aqi-debug.
+- Added a dedicated Phase 2 acceptance test module and updated existing fixtures for actual-parquet semantics.
 ```
 
 Tests:
 
 ```text
-To be updated after implementation.
+- python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py: PASS
+- python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py: PASS (9 tests)
+- python3 -m unittest discover -s scripts/uk-aq-history-integrity/tests -p 'test_*.py': PASS (212 tests)
+- npm run check: PASS
+- git diff --check: PASS in both ops and schema repos
 ```
 
 Remaining issues:
 
 ```text
-To be updated after implementation.
+- No commit was created because the user did not request one.
+- Phase 2 remains In progress until the plan's required completion commit is recorded.
+- DuckDB is listed in requirements-dev.txt but is not installed in the current system Python; parquet-reader behavior is covered with a deterministic local test double.
+- No Dropbox tree, source API, Supabase, or live-R2 validation run was performed.
+- No Phase 3/4 write or verification behavior was added or executed.
 ```
 
 ---
