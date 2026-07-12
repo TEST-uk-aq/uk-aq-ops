@@ -165,7 +165,7 @@ The new integrity flow must detect and repair this hierarchy without:
 | Phase | Name | Status | Completion commit | Notes |
 | --- | --- | --- | --- | --- |
 | 1 | Backup gate correctness and safety | Complete | `6965763` | Committed on `main`; implementation and local validation complete. |
-| 2 | Complete read-only v2 validation | In progress | Pending (uncommitted on `main`) | Read-only implementation and local validation complete; completion commit remains pending. |
+| 2 | Complete read-only v2 validation | Complete | `afab053` | Phase 2b corrections committed; checker remains read-only and Phase 3 is not started. |
 | 3 | Observation manifest and index repair | Not started |  |  |
 | 4 | Observation data repair and AQI sequencing | Not started |  |  |
 
@@ -1102,3 +1102,34 @@ When asked to implement Phase 1, Codex should:
 6. record the exact commit or branch;
 7. report any blockers honestly;
 8. not deploy or push unless explicitly instructed.
+
+
+### Phase 2b completion record (2026-07-12)
+
+Completion commit: `afab053` (`Complete Phase 2 v2 integrity validation`).
+
+Corrections made:
+
+- Source/parquet comparison now distinguishes successful empty source counts from unavailable source evidence; successful empty counts can report R2-only rows, while unavailable source evidence does not become an empty authoritative source.
+- Pollutant data-manifest empty `timeseries_row_counts` findings now use `data_manifest_empty_timeseries_counts`, not index-manifest terminology.
+- Required integer aggregate fields are validated on pollutant, connector, and day manifests for observations and AQI; required min/max fields are checked when child data supplies values, while absent optional min/max fields on empty child sets are accepted.
+- Hash validation is documented and implemented as stored parent/child manifest-hash consistency plus required stored-hash presence; complete canonical recalculation is left out of Phase 2b.
+- DuckDB parquet stats now count total rows, non-null `timeseries_id` rows, null `timeseries_id` rows, and per-timeseries rows separately. Null `timeseries_id` rows are reported as `parquet_null_timeseries_id_rows` data faults.
+- The confirmed writer rule is that v2 pollutant partitions are built from non-empty candidate row sets; zero-row pollutant partitions are reported as `data_partition_zero_rows` instead of malformed integer values.
+- Repair planning now uses evidence: readable parquet with safe evidence can be manifest-only, source/parquet disagreement and structural parquet faults require data repair, and missing listed parquet with unavailable source evidence is blocked for operator review. Manifest-only O3 observation findings do not queue AQI.
+- Duplicate Phase 2 archive test snapshots under `archive/2026-07-12/scripts/uk-aq-history-integrity/tests/` were removed. No replacement archive copies were created.
+
+Validation record:
+
+- `python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py` passed.
+- `python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py` passed with 15 tests and 1 skip; the real DuckDB-generated parquet test skipped because DuckDB could not be installed in this environment (`pip` was blocked by HTTP 403), although `requirements-dev.txt` declares `duckdb`.
+- `python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py` passed with 44 tests.
+- `python3 -m unittest discover -s scripts/uk-aq-history-integrity/tests -p 'test_*.py'` ran 218 tests with 1 skip and 1 environment error because the sibling schema repository file `/workspace/TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_daily_task_backup_readiness.sql` was not present in this container.
+- `npm run check` passed.
+- `git diff --check` passed.
+
+Remaining limitations:
+
+- Phase 2 remains strictly read-only and only emits planned, non-executing actions.
+- Canonical manifest hash recalculation is not claimed; Phase 2b verifies stored parent/child hash consistency and missing required stored hashes only.
+- No R2 writes, manifest repair execution, index repair execution, AQI execution, live-R2 repair verification, deployments, SQL, or cloud operations were performed.

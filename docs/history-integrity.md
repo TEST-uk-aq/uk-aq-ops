@@ -108,3 +108,14 @@ python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_inte
 
 For a full run, use the existing shell wrapper after loading the environment
 for the target environment.
+
+
+### Phase 2b validation clarifications (2026-07-12)
+
+- The v2 checker remains read-only: it inspects the Dropbox/R2 history mirror and produces planned, non-executing repair actions only.
+- Source comparison now distinguishes a successful empty source count map from unavailable source evidence. Successful empty source counts are authoritative and can report R2-only rows; unavailable source evidence does not masquerade as zero source rows.
+- V2 writer manifests require integer `row_count`, `source_row_count`, `file_count`, and `total_bytes` aggregates on pollutant, connector, and day manifests. Min/max id and timestamp aggregates are required when child data supplies those values; absent optional min/max fields on empty child sets are not faults.
+- The authoritative writer only builds v2 pollutant partitions from non-empty candidate row sets; a zero-row pollutant partition is therefore reported as `data_partition_zero_rows`, not as a malformed integer. Parent zero aggregates are valid only when they accurately summarize empty child sets.
+- Phase 2b validates stored parent/child hash consistency and required stored hash presence. It does not claim complete canonical manifest hash verification beyond writer-compatible stored-hash consistency.
+- Parquet statistics count all rows separately from non-null `timeseries_id` rows. Null `timeseries_id` rows are reported as `parquet_null_timeseries_id_rows` data faults.
+- Repair planning uses evidence: readable parquet matching available source evidence can be manifest-only, source/parquet disagreement or structural parquet faults require data repair, and missing parquet with unavailable source evidence is blocked for operator review rather than planned as manifest-only.
