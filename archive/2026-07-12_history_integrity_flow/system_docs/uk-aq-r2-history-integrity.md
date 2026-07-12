@@ -254,12 +254,6 @@ When enabled, each integrity run reports to Obs AQI DB daily task health:
 - `platform`: `MBPro`
 - `source_repo`: `uk-aq-ops`
 
-The current run order also includes:
-
-- a Dropbox backup readiness gate before the Dropbox history scan starts;
-- an optional `--allow-stale-dropbox` override for manual recovery runs;
-- v2 connector/day hierarchy validation for both observations and AQI hourly data.
-
 Run lifecycle:
 
 1. Start: call `uk_aq_rpc_daily_task_started` for seeded task key
