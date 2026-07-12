@@ -231,6 +231,86 @@ class V2Phase2ValidationTests(unittest.TestCase):
         MODULE._classify_v2_gaps([gap])
         self.assertEqual(gap["fault_class"], "data fault")
 
+    def test_successful_empty_source_mismatch_keeps_empty_source_authoritative(self) -> None:
+        successful_empty_evidence = {
+            "source_partition_state": "successful_empty",
+            "source_counts_present": False,
+            "source_rows": 0,
+            "source_timeseries_row_counts": {},
+            "source_file_count": 1,
+            "source_file_keys": ["source-file-key"],
+            "source_skip_reason": None,
+            "partition": {
+                "state": "successful_empty",
+                "source_counts_present": False,
+                "source_rows": 0,
+                "source_timeseries_row_counts": {},
+                "source_file_count": 1,
+                "source_file_keys": ["source-file-key"],
+                "source_skip_reason": None,
+            },
+        }
+        gap = MODULE._build_v2_source_r2_mismatch_gap(
+            day_utc="2026-06-11",
+            connector_id=1,
+            pollutant_code="pm25",
+            expected_path="manifest.json",
+            source_counts={},
+            r2_counts={101: 3},
+            source_partition_evidence=successful_empty_evidence,
+        )
+        self.assertIsNotNone(gap)
+        self.assertEqual(gap["gap_type"], "source_r2_timeseries_row_mismatch")
+        self.assertEqual(gap["source_rows"], 0)
+        self.assertEqual(gap["r2_rows"], 3)
+        self.assertEqual(gap["source_only_timeseries_ids"], [])
+        self.assertEqual(gap["r2_only_timeseries_ids"], [101])
+        self.assertEqual(gap["sample_missing_timeseries_ids"], [101])
+        self.assertEqual(gap["source_evidence"]["source_partition_state"], "successful_empty")
+        self.assertEqual(gap["source_evidence"]["source_rows"], 0)
+        self.assertEqual(gap["source_evidence"]["r2_rows_for_source_timeseries"], 3)
+        MODULE._classify_v2_gaps([gap])
+        self.assertEqual(gap["fault_class"], "data fault")
+
+        empty_gap = MODULE._build_v2_source_r2_mismatch_gap(
+            day_utc="2026-06-11",
+            connector_id=1,
+            pollutant_code="pm25",
+            expected_path="manifest.json",
+            source_counts={},
+            r2_counts={},
+            source_partition_evidence=successful_empty_evidence,
+        )
+        self.assertIsNone(empty_gap)
+
+        unavailable_evidence = {
+            "source_partition_state": "connection_unavailable",
+            "source_counts_present": False,
+            "source_rows": 0,
+            "source_timeseries_row_counts": {},
+            "source_file_count": 0,
+            "source_file_keys": [],
+            "source_skip_reason": "source_connection_unavailable",
+            "partition": {
+                "state": "connection_unavailable",
+                "source_counts_present": False,
+                "source_rows": 0,
+                "source_timeseries_row_counts": {},
+                "source_file_count": 0,
+                "source_file_keys": [],
+                "source_skip_reason": "source_connection_unavailable",
+            },
+        }
+        self.assertIsNone(MODULE._build_v2_source_r2_mismatch_gap(
+            day_utc="2026-06-11",
+            connector_id=1,
+            pollutant_code="pm25",
+            expected_path="manifest.json",
+            source_counts={},
+            r2_counts={101: 3},
+            source_partition_evidence=unavailable_evidence,
+        ))
+
     def test_unreadable_parquet_is_a_data_fault(self) -> None:
         gaps = []
         with mock.patch.object(MODULE, "_read_parquet_partition_stats", return_value=(None, "InvalidInputException:bad parquet")):

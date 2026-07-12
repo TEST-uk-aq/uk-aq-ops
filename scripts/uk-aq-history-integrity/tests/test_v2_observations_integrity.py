@@ -465,7 +465,8 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         self.assertIn("data_manifest_unlisted_parquet", self._gap_types(result))
         self.assertNotIn("row_count_mismatch", self._gap_types(result))
         self.assertIn("repair_plan", result)
-        self.assertTrue(any(step["kind"] == "observation_pollutant_manifest_repair" for step in result["repair_plan"]))
+        self.assertTrue(any(step["kind"] == "source_mapping_issue" for step in result["repair_plan"]))
+        self.assertFalse(any(step["kind"] == "observation_pollutant_manifest_repair" for step in result["repair_plan"]))
 
 
 class V2ObservationMalformedLayoutTests(unittest.TestCase):

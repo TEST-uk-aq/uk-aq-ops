@@ -811,6 +811,153 @@ class V2RepairExecutionTests(unittest.TestCase):
         finally:
             unavailable_source_conn.close()
 
+    def test_v2_current_source_partition_states_remain_distinct(self) -> None:
+        base_scope = {"source": "sos", "connector_ids": [1], "scope": "source"}
+
+        non_empty_conn = self._new_current_source_db(
+            day_utc="2026-06-18",
+            connector_id=1,
+            timeseries_pollutants={218: "pm25"},
+            source_counts={218: 24},
+        )
+        try:
+            source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
+                non_empty_conn,
+                env_name="CIC-Test",
+                source_scope=base_scope,
+                day_utc="2026-06-18",
+                connector_id=1,
+                pollutant_code="pm25",
+            )
+            self.assertEqual(source_counts, {218: 24})
+            self.assertEqual(evidence["source_partition_state"], "successful_non_empty")
+            self.assertTrue(evidence["source_counts_present"])
+        finally:
+            non_empty_conn.close()
+
+        source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
+            None,
+            env_name="CIC-Test",
+            source_scope=base_scope,
+            day_utc="2026-06-19",
+            connector_id=1,
+            pollutant_code="pm25",
+        )
+        self.assertEqual(source_counts, {})
+        self.assertEqual(evidence["source_partition_state"], "connection_unavailable")
+        self.assertEqual(evidence["source_skip_reason"], "source_connection_unavailable")
+
+        scope_conn = self._new_current_source_db(
+            day_utc="2026-06-20",
+            connector_id=1,
+            timeseries_pollutants={218: "pm25"},
+            source_counts={218: 24},
+        )
+        try:
+            with mock.patch.object(MODULE, "_source_keys_for_scope", return_value=()):
+                source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
+                    scope_conn,
+                    env_name="CIC-Test",
+                    source_scope=base_scope,
+                    day_utc="2026-06-20",
+                    connector_id=1,
+                    pollutant_code="pm25",
+                )
+            self.assertEqual(source_counts, {})
+            self.assertEqual(evidence["source_partition_state"], "scope_unavailable")
+            self.assertEqual(evidence["source_skip_reason"], "source_scope_has_no_source_keys")
+        finally:
+            scope_conn.close()
+
+        metadata_conn = self._new_current_source_db(
+            day_utc="2026-06-21",
+            connector_id=1,
+            timeseries_pollutants={218: "pm25"},
+            source_counts={218: 24},
+        )
+        try:
+            metadata_conn.execute("UPDATE core_timeseries_snapshot SET timeseries_ref = '', label = '' WHERE id = ?", (218,))
+            metadata_conn.execute("UPDATE core_phenomena_snapshot SET label = '', source_label = '', pollutant_label = '' WHERE id = 1")
+            metadata_conn.commit()
+            source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
+                metadata_conn,
+                env_name="CIC-Test",
+                source_scope=base_scope,
+                day_utc="2026-06-21",
+                connector_id=1,
+                pollutant_code="pm25",
+            )
+            self.assertEqual(source_counts, {})
+            self.assertEqual(evidence["source_partition_state"], "metadata_unavailable")
+            self.assertEqual(evidence["source_skip_reason"], "source_pollutant_metadata_unavailable")
+        finally:
+            metadata_conn.close()
+
+        pollutant_conn = self._new_current_source_db(
+            day_utc="2026-06-22",
+            connector_id=1,
+            timeseries_pollutants={218: "no2"},
+            source_counts={218: 24},
+        )
+        try:
+            source_counts, evidence = MODULE._current_source_counts_for_v2_partition(
+                pollutant_conn,
+                env_name="CIC-Test",
+                source_scope=base_scope,
+                day_utc="2026-06-22",
+                connector_id=1,
+                pollutant_code="pm25",
+            )
+            self.assertEqual(source_counts, {})
+            self.assertEqual(evidence["source_partition_state"], "pollutant_absent")
+            self.assertEqual(evidence["source_skip_reason"], "source_pollutant_not_present")
+        finally:
+            pollutant_conn.close()
+
+    def test_v2_observations_integrity_propagates_connection_unavailable_evidence_when_conn_is_none(self) -> None:
+        self._write_v2_observation_partition(
+            day_utc="2026-06-18",
+            connector_id=1,
+            pollutant_code="pm25",
+            timeseries_row_counts={218: 13},
+        )
+        manifest_path = Path(
+            self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"]
+        ) / "history/v2/observations/day_utc=2026-06-18/connector_id=1/pollutant_code=pm25/manifest.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["row_count"] = 99
+        payload["source_row_count"] = 99
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        stats = {
+            "row_count": 13,
+            "non_null_timeseries_count": 1,
+            "timeseries_row_counts": {218: 13},
+            "null_timeseries_count": 0,
+            "min_timeseries_id": 218,
+            "max_timeseries_id": 218,
+            "min_timestamp_utc": "2026-06-18T00:00:00+00",
+            "max_timestamp_utc": "2026-06-18T01:00:00+00",
+            "parquet_null_timeseries_id_rows": False,
+        }
+        with mock.patch.object(MODULE, "_read_parquet_partition_stats", return_value=(stats, None)):
+            result = MODULE.run_v2_observations_integrity_checks(
+                r2_history_root=self.env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"],
+                config=MODULE.resolve_history_path_config("v2", {}),
+                from_day="2026-06-18",
+                to_day="2026-06-18",
+                conn=None,
+                env_name="CIC-Test",
+                allowed_connector_ids={1},
+                source_scope={"source": "sos", "connector_ids": [1], "scope": "source"},
+                log=self.log,
+            )
+        manifest_gaps = [gap for gap in result["gaps"] if gap["gap_type"].startswith("data_manifest_")]
+        self.assertTrue(manifest_gaps)
+        self.assertTrue(all(gap["source_evidence"]["source_partition_state"] == "connection_unavailable" for gap in manifest_gaps))
+        self.assertTrue(all(gap["source_evidence"]["source_skip_reason"] == "source_connection_unavailable" for gap in manifest_gaps))
+        self.assertFalse(any(gap["gap_type"] == "source_r2_timeseries_row_mismatch" for gap in result["gaps"]))
+
     def test_v2_source_r2_matching_counts_do_not_create_repair_candidate(self) -> None:
         self._write_v2_observation_partition(
             day_utc="2026-06-18",

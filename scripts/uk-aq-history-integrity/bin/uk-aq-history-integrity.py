@@ -8337,7 +8337,10 @@ def _build_v2_source_r2_mismatch_gap(
     r2_counts: Mapping[int, int],
     source_partition_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if not source_counts:
+    source_partition_state = str((source_partition_evidence or {}).get("source_partition_state") or "")
+    # Only successful_empty may compare against an empty source map; all
+    # unavailable states must stay distinct from an authoritative zero.
+    if not source_counts and source_partition_state != "successful_empty":
         return None
 
     mismatches: list[dict[str, Any]] = []
@@ -8805,7 +8808,7 @@ def run_v2_observations_integrity_checks(
                     connector_id_for_source = None
                 source_partition_evidence: dict[str, Any] | None = None
                 source_counts: dict[int, int] = {}
-                if conn is not None and connector_id_for_source is not None:
+                if connector_id_for_source is not None:
                     source_counts, source_partition_evidence = _current_source_counts_for_v2_partition(
                         conn,
                         env_name=env_name,
