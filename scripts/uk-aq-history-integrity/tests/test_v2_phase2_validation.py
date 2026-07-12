@@ -235,6 +235,7 @@ class V2Phase2ValidationTests(unittest.TestCase):
         successful_empty_evidence = {
             "source_partition_state": "successful_empty",
             "source_counts_present": False,
+            "source_counts_available": True,
             "source_rows": 0,
             "source_timeseries_row_counts": {},
             "source_file_count": 1,
@@ -243,6 +244,7 @@ class V2Phase2ValidationTests(unittest.TestCase):
             "partition": {
                 "state": "successful_empty",
                 "source_counts_present": False,
+                "source_counts_available": True,
                 "source_rows": 0,
                 "source_timeseries_row_counts": {},
                 "source_file_count": 1,
@@ -269,8 +271,15 @@ class V2Phase2ValidationTests(unittest.TestCase):
         self.assertEqual(gap["source_evidence"]["source_partition_state"], "successful_empty")
         self.assertEqual(gap["source_evidence"]["source_rows"], 0)
         self.assertEqual(gap["source_evidence"]["r2_rows_for_source_timeseries"], 3)
+        self.assertFalse(gap["source_evidence"]["source_counts_present"])
+        self.assertTrue(gap["source_evidence"]["source_counts_available"])
+        self.assertFalse(gap["source_evidence"]["partition"]["source_counts_present"])
+        self.assertTrue(gap["source_evidence"]["partition"]["source_counts_available"])
         MODULE._classify_v2_gaps([gap])
         self.assertEqual(gap["fault_class"], "data fault")
+        plan = MODULE.build_v2_repair_plan(observation_gaps=[gap])
+        self.assertTrue(any(action["kind"] == "observation_data_repair" for action in plan))
+        self.assertFalse(any(action["kind"] == "source_mapping_issue" for action in plan))
 
         empty_gap = MODULE._build_v2_source_r2_mismatch_gap(
             day_utc="2026-06-11",
@@ -286,6 +295,7 @@ class V2Phase2ValidationTests(unittest.TestCase):
         unavailable_evidence = {
             "source_partition_state": "connection_unavailable",
             "source_counts_present": False,
+            "source_counts_available": False,
             "source_rows": 0,
             "source_timeseries_row_counts": {},
             "source_file_count": 0,
@@ -294,6 +304,7 @@ class V2Phase2ValidationTests(unittest.TestCase):
             "partition": {
                 "state": "connection_unavailable",
                 "source_counts_present": False,
+                "source_counts_available": False,
                 "source_rows": 0,
                 "source_timeseries_row_counts": {},
                 "source_file_count": 0,

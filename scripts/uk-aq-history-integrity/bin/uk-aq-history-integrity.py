@@ -7093,6 +7093,7 @@ def _v2_obs_gap(
         "source_evidence": {
             "v1_present": None,
             "source_counts_present": None,
+            "source_counts_available": None,
             "db_dump_present": None,
         },
         "suggested_repair": {
@@ -8096,6 +8097,26 @@ def _source_keys_for_scope(source_scope: Mapping[str, Any] | None) -> tuple[str,
     )
 
 
+def _source_counts_presence_and_availability(
+    source_partition_state: str | None,
+    source_counts: Mapping[int, int] | None = None,
+) -> tuple[bool, bool]:
+    if source_partition_state == "successful_non_empty":
+        return True, True
+    if source_partition_state == "successful_empty":
+        return False, True
+    if source_partition_state in {
+        "connection_unavailable",
+        "scope_unavailable",
+        "metadata_unavailable",
+        "pollutant_absent",
+        "counts_unavailable",
+    }:
+        return False, False
+    present = bool(source_counts)
+    return present, present
+
+
 def _current_source_counts_for_v2_partition(
     conn: sqlite3.Connection | None,
     *,
@@ -8108,6 +8129,7 @@ def _current_source_counts_for_v2_partition(
     partition_evidence: dict[str, Any] = {
         "source_partition_state": "counts_unavailable",
         "source_counts_present": False,
+        "source_counts_available": False,
         "source_rows": 0,
         "source_timeseries_row_counts": {},
         "source_file_count": 0,
@@ -8116,6 +8138,7 @@ def _current_source_counts_for_v2_partition(
         "partition": {
             "state": "counts_unavailable",
             "source_counts_present": False,
+            "source_counts_available": False,
             "source_rows": 0,
             "source_timeseries_row_counts": {},
             "source_file_count": 0,
@@ -8266,6 +8289,7 @@ def _current_source_counts_for_v2_partition(
         partition_evidence.update({
             "source_partition_state": "successful_non_empty",
             "source_counts_present": True,
+            "source_counts_available": True,
             "source_rows": source_rows,
             "source_timeseries_row_counts": source_timeseries_row_counts,
             "source_file_count": len(state_rows),
@@ -8274,6 +8298,7 @@ def _current_source_counts_for_v2_partition(
             "partition": {
                 "state": "successful_non_empty",
                 "source_counts_present": True,
+                "source_counts_available": True,
                 "source_rows": source_rows,
                 "source_timeseries_row_counts": source_timeseries_row_counts,
                 "source_file_count": len(state_rows),
@@ -8291,6 +8316,7 @@ def _current_source_counts_for_v2_partition(
         partition_evidence.update({
             "source_partition_state": "successful_empty",
             "source_counts_present": False,
+            "source_counts_available": True,
             "source_rows": 0,
             "source_timeseries_row_counts": {},
             "source_file_count": len(state_rows),
@@ -8299,6 +8325,7 @@ def _current_source_counts_for_v2_partition(
             "partition": {
                 "state": "successful_empty",
                 "source_counts_present": False,
+                "source_counts_available": True,
                 "source_rows": 0,
                 "source_timeseries_row_counts": {},
                 "source_file_count": len(state_rows),
@@ -8393,7 +8420,42 @@ def _build_v2_source_r2_mismatch_gap(
     # be constructed exactly; only human-facing related_paths are truncated.
     gap["source_r2_mismatches"] = mismatches
     evidence = gap.setdefault("source_evidence", {})
-    evidence["source_counts_present"] = True
+    if source_partition_evidence is not None:
+        evidence.update(dict(source_partition_evidence))
+        partition_evidence = evidence.get("partition")
+        if isinstance(partition_evidence, Mapping):
+            partition_copy = dict(partition_evidence)
+            present, available = _source_counts_presence_and_availability(
+                str(partition_copy.get("state") or source_partition_state or ""),
+                source_counts,
+            )
+            partition_present = partition_copy.get("source_counts_present")
+            partition_available = partition_copy.get("source_counts_available")
+            if partition_present is None:
+                partition_present = present
+            if partition_available is None:
+                partition_available = available
+            partition_copy["source_counts_present"] = bool(partition_present)
+            partition_copy["source_counts_available"] = bool(partition_available)
+            evidence["partition"] = partition_copy
+            evidence["source_counts_present"] = partition_copy["source_counts_present"]
+            evidence["source_counts_available"] = partition_copy["source_counts_available"]
+        else:
+            present, available = _source_counts_presence_and_availability(
+                source_partition_state or None,
+                source_counts,
+            )
+            evidence["source_counts_present"] = present
+            evidence["source_counts_available"] = available
+    else:
+        # Fall back to the counts map itself when no partition evidence object
+        # was supplied; this avoids inventing authority for an unavailable source.
+        present, available = _source_counts_presence_and_availability(
+            source_partition_state or None,
+            source_counts,
+        )
+        evidence["source_counts_present"] = present
+        evidence["source_counts_available"] = available
     evidence["source_rows"] = source_total
     evidence["r2_rows_for_source_timeseries"] = r2_total_for_source
     evidence["missing_timeseries_count"] = len(mismatches)
@@ -8401,7 +8463,6 @@ def _build_v2_source_r2_mismatch_gap(
     if source_partition_evidence is not None:
         evidence["source_partition_state"] = source_partition_evidence.get("source_partition_state")
         evidence["source_skip_reason"] = source_partition_evidence.get("source_skip_reason")
-        evidence["partition"] = dict(source_partition_evidence.get("partition") or {})
     return gap
 
 
@@ -8970,6 +9031,7 @@ def _v2_aqi_gap(
             "v2_observations_present": None,
             "v1_aqi_present": None,
             "source_counts_present": None,
+            "source_counts_available": None,
             "db_dump_present": None,
         },
         "suggested_repair": {
