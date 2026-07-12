@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 import {
   rebuildR2HistoryIndexes,
   updateR2HistoryIndexesTargeted,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
+
+const TEST_R2_BUCKET = "uk-aq-history-cic-test";
 
 function usage() {
   console.log([
@@ -24,6 +27,8 @@ function usage() {
     "  --strict-missing-timeseries-counts      Fail v2 AQI index builds when a non-empty",
     "                                          source pollutant manifest has no usable",
     "                                          timeseries_row_counts.",
+    "  --dry-run                               Plan only; no R2 PUTs (default).",
+    "  --write-r2                              Execute R2 PUTs after an explicit gate.",
     "  --targeted                              Run a narrow latest-index update for a known",
     "                                          day range instead of a full history rebuild.",
     "  --from-day YYYY-MM-DD                   Required with --targeted.",
@@ -77,11 +82,83 @@ function parsePositiveInt(raw, flagName) {
   return Math.trunc(value);
 }
 
+function assertTestR2WriteTarget(r2) {
+  const bucket = String(r2?.bucket || "").trim();
+  if (bucket !== TEST_R2_BUCKET) {
+    throw new Error(`Refusing --write-r2 for non-TEST bucket: ${bucket || "(empty)"}`);
+  }
+}
+
+function countBlockedDependencyWarnings(warnings) {
+  return (Array.isArray(warnings) ? warnings : []).filter((warning) => {
+    const text = String(warning || "").toLowerCase();
+    return text.includes("missing") || text.includes("invalid") || text.includes("removed");
+  }).length;
+}
+
+function summarizeWriteOutcome(summary) {
+  const flags = [];
+  if (summary?.latest_index_put_skipped !== undefined) {
+    flags.push(summary.latest_index_put_skipped);
+  }
+  if (summary?.observations_timeseries?.latest_index_put_skipped !== undefined) {
+    flags.push(summary.observations_timeseries.latest_index_put_skipped);
+  }
+  if (summary?.aqilevels_timeseries?.latest_index_put_skipped !== undefined) {
+    flags.push(summary.aqilevels_timeseries.latest_index_put_skipped);
+  }
+  if (summary?.timeseries_metadata?.metadata_put_skipped_count !== undefined) {
+    flags.push(summary.timeseries_metadata.metadata_put_skipped_count > 0);
+  }
+  for (const result of Array.isArray(summary?.results) ? summary.results : []) {
+    if (result?.latest_index_put_skipped !== undefined) {
+      flags.push(result.latest_index_put_skipped);
+    }
+    if (result?.put_skipped !== undefined) {
+      flags.push(result.put_skipped);
+    }
+  }
+  const sawSkipped = flags.some((value) => value === true);
+  const sawWrite = flags.some((value) => value === false);
+  return {
+    sawSignals: flags.length > 0,
+    allSkipped: flags.length > 0 && sawSkipped && !sawWrite,
+  };
+}
+
+function buildRepairSections(summary, { writeR2, mode }) {
+  const blockedDependencyCount = countBlockedDependencyWarnings(summary?.warnings);
+  const outcome = summarizeWriteOutcome(summary);
+  const repairStatus = !writeR2
+    ? "planned"
+    : (outcome.allSkipped ? "skipped_unchanged" : "succeeded");
+  return {
+    repair: {
+      status: repairStatus,
+      planning: {
+        status: "planned",
+        write_r2: writeR2,
+        mode,
+        blocked_dependency_count: blockedDependencyCount,
+      },
+      execution: {
+        status: repairStatus,
+        write_r2: writeR2,
+      },
+      verification: {
+        status: writeR2 ? repairStatus : "not_run",
+        fresh_remote_reads: writeR2,
+      },
+    },
+  };
+}
+
 function parseArgs(argv) {
   const envHistoryVersion = String(process.env.UK_AQ_R2_HISTORY_INDEX_VERSION || "v1")
     .trim()
     .toLowerCase();
   const args = {
+    mode: "dry-run",
     historyVersion: envHistoryVersion || "v1",
     domains: ["observations", "aqilevels"],
     fetchConcurrency: undefined,
@@ -96,6 +173,8 @@ function parseArgs(argv) {
     toDayUtc: undefined,
     connectorId: undefined,
     observationsTargets: [],
+    sawDryRun: false,
+    sawWriteR2: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -164,6 +243,16 @@ function parseArgs(argv) {
       args.strictMissingTimeseriesCounts = true;
       continue;
     }
+    if (arg === "--dry-run") {
+      args.mode = "dry-run";
+      args.sawDryRun = true;
+      continue;
+    }
+    if (arg === "--write-r2") {
+      args.mode = "write-r2";
+      args.sawWriteR2 = true;
+      continue;
+    }
     if (arg.startsWith("--kind=")) {
       applyDomainArg(args, String(arg.slice("--kind=".length) || "").trim().toLowerCase(), "--kind");
       continue;
@@ -209,6 +298,10 @@ function parseArgs(argv) {
       process.exit(0);
     }
     throw new Error(`Unknown arg: ${arg}`);
+  }
+
+  if (args.sawDryRun && args.sawWriteR2) {
+    throw new Error("Use either --dry-run or --write-r2, not both");
   }
 
   if (args.targeted) {
@@ -365,11 +458,16 @@ function loadTargetsFromCsv(csvPath) {
   return out;
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+export async function runHistoryIndexBuild({ argv = process.argv.slice(2), env = process.env } = {}) {
+  const args = parseArgs(argv);
+  const writeR2 = args.mode === "write-r2";
+  const configBucket = String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim();
+  if (writeR2) {
+    assertTestR2WriteTarget({ bucket: configBucket });
+  }
   const summary = args.targeted
     ? await updateR2HistoryIndexesTargeted({
-        env: process.env,
+        env,
         historyVersion: args.historyVersion,
         domains: args.domains,
         fromDayUtc: args.fromDayUtc,
@@ -378,9 +476,10 @@ async function main() {
         fetchConcurrency: args.fetchConcurrency,
         computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
         strictMissingTimeseriesCounts: args.strictMissingTimeseriesCounts,
+        writeR2,
       })
     : await rebuildR2HistoryIndexes({
-        env: process.env,
+        env,
         domains: args.domains,
         historyVersion: args.historyVersion,
         fetchConcurrency: args.fetchConcurrency,
@@ -388,12 +487,34 @@ async function main() {
         computeMissingTimeseriesCounts: args.computeMissingTimeseriesCounts,
         strictMissingTimeseriesCounts: args.strictMissingTimeseriesCounts,
         observationsTargets: args.observationsTargets.length ? args.observationsTargets : null,
+        writeR2,
       });
-  process.stdout.write(`${JSON.stringify({ ok: true, ...summary }, null, 2)}\n`);
+  const repair = buildRepairSections(summary, { writeR2, mode: args.mode });
+  return {
+    ok: true,
+    status: repair.repair.status,
+    mode: args.mode,
+    dry_run: !writeR2,
+    write_r2: writeR2,
+    history_version: args.historyVersion,
+    targeted: args.targeted,
+    ...repair,
+    ...summary,
+  };
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
-  process.exit(1);
-});
+async function main() {
+  const payload = await runHistoryIndexBuild({ argv: process.argv.slice(2), env: process.env });
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+}
+
+const isMain = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
+    process.exit(1);
+  });
+}

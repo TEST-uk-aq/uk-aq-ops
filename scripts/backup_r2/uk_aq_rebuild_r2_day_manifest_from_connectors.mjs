@@ -605,11 +605,24 @@ function summarizeConnectorIds(manifest) {
   return [];
 }
 
-async function run() {
-  const args = parseArgs(process.argv.slice(2));
-  const config = resolveR2HistoryIndexConfig();
+const TEST_R2_BUCKET = "uk-aq-history-cic-test";
+
+function assertTestR2WriteTarget(r2) {
+  const bucket = String(r2?.bucket || "").trim();
+  if (bucket !== TEST_R2_BUCKET) {
+    throw new Error(`Refusing --write-r2 for non-TEST bucket: ${bucket || "(empty)"}`);
+  }
+}
+
+export async function runDayManifestRebuild({ argv = process.argv.slice(2), env = process.env } = {}) {
+  const args = parseArgs(argv);
+  const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
     throw new Error("Missing required R2 configuration");
+  }
+  const writeR2 = args.mode === "write-r2";
+  if (writeR2) {
+    assertTestR2WriteTarget(config.r2);
   }
 
   const domainPrefix = args.domain === "observations"
@@ -659,18 +672,49 @@ async function run() {
     : "";
   const changed = !existingRead.found || body !== existingBody;
   let putResult = null;
-  if (args.mode === "write-r2" && changed) {
+  let verification = {
+    status: writeR2 ? (changed ? "pending" : "skipped_unchanged") : "not_run",
+    fresh_remote_reads: false,
+    verified_bytes: null,
+  };
+  if (writeR2 && changed) {
     putResult = await r2PutObject({
       r2: config.r2,
       key: manifestKey,
       body,
       content_type: "application/json",
     });
+    const liveObject = await r2GetObject({ r2: config.r2, key: manifestKey });
+    const liveBody = liveObject.body.toString("utf8");
+    if (liveBody !== body || liveObject.bytes !== Buffer.byteLength(body, "utf8")) {
+      throw new Error(
+        `R2 verification failed for ${manifestKey}: live bytes=${liveObject.bytes} differ from rebuilt bytes=${Buffer.byteLength(body, "utf8")}`,
+      );
+    }
+    verification = {
+      status: "succeeded",
+      fresh_remote_reads: true,
+      verified_bytes: liveObject.bytes,
+    };
   }
 
   const output = {
     ok: true,
     mode: args.mode,
+    dry_run: !writeR2,
+    write_r2: writeR2,
+    status: writeR2 ? (changed ? "succeeded" : "skipped_unchanged") : "planned",
+    planning: {
+      status: "planned",
+      changed,
+      blocked_dependency_count: missingRequestedConnectorIds.length,
+      connector_manifest_count: connectorManifests.length,
+    },
+    execution: {
+      status: writeR2 ? (changed ? "succeeded" : "skipped_unchanged") : "planned",
+      wrote_r2: Boolean(putResult),
+    },
+    verification,
     wrote_r2: Boolean(putResult),
     domain: args.domain,
     bucket: config.r2.bucket,
@@ -693,6 +737,11 @@ async function run() {
     put_result: putResult,
   };
 
+  return output;
+}
+
+async function run() {
+  const output = await runDayManifestRebuild({ argv: process.argv.slice(2), env: process.env });
   console.log(JSON.stringify(output, null, 2));
 }
 

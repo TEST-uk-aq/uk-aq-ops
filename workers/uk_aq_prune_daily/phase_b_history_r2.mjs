@@ -1912,6 +1912,35 @@ function maxNumericEntryValue(entries, fieldName) {
   }, null);
 }
 
+function sortHistoryV2FileEntries(fileEntries) {
+  return Array.from(Array.isArray(fileEntries) ? fileEntries : [])
+    .sort((left, right) => String(left?.key || "").localeCompare(String(right?.key || "")));
+}
+
+function sortHistoryV2PollutantManifests(pollutantManifests) {
+  return Array.from(Array.isArray(pollutantManifests) ? pollutantManifests : [])
+    .sort((left, right) => {
+      const leftCode = String(left?.pollutant_code || "").trim().toLowerCase();
+      const rightCode = String(right?.pollutant_code || "").trim().toLowerCase();
+      if (leftCode !== rightCode) {
+        return leftCode.localeCompare(rightCode);
+      }
+      return String(left?.manifest_key || "").localeCompare(String(right?.manifest_key || ""));
+    });
+}
+
+function sortHistoryV2ConnectorManifests(connectorManifests) {
+  return Array.from(Array.isArray(connectorManifests) ? connectorManifests : [])
+    .sort((left, right) => {
+      const leftId = Number(left?.connector_id);
+      const rightId = Number(right?.connector_id);
+      if (Number.isFinite(leftId) && Number.isFinite(rightId) && leftId !== rightId) {
+        return leftId - rightId;
+      }
+      return String(left?.manifest_key || "").localeCompare(String(right?.manifest_key || ""));
+    });
+}
+
 function createHistoryV2PollutantManifest({
   domain,
   grain = null,
@@ -1927,7 +1956,7 @@ function createHistoryV2PollutantManifest({
   backedUpAtUtc,
 }) {
   const normalizedPollutantCode = normalizePollutantCodeForPath(pollutantCode);
-  const files = (Array.isArray(fileEntries) ? fileEntries : []).map((entry) => ({
+  const files = sortHistoryV2FileEntries(fileEntries).map((entry) => ({
     ...entry,
     pollutant_code: normalizedPollutantCode,
   }));
@@ -1985,7 +2014,7 @@ function createHistoryV2ConnectorManifest({
   writerGitSha,
   backedUpAtUtc,
 }) {
-  const manifests = Array.isArray(pollutantManifests) ? pollutantManifests : [];
+  const manifests = sortHistoryV2PollutantManifests(pollutantManifests);
   const childManifests = manifests
     .map((manifest) => ({
       pollutant_code: manifest.pollutant_code,
@@ -2049,12 +2078,12 @@ function createHistoryV2DayManifest({
   profile = null,
   dayUtc,
   runId = null,
-  manifestKey,
-  connectorManifests,
-  writerGitSha,
-  backedUpAtUtc,
+    manifestKey,
+    connectorManifests,
+    writerGitSha,
+    backedUpAtUtc,
 }) {
-  const manifests = Array.isArray(connectorManifests) ? connectorManifests : [];
+  const manifests = sortHistoryV2ConnectorManifests(connectorManifests);
   const childManifests = manifests
     .map((manifest) => ({
       connector_id: manifest.connector_id,

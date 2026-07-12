@@ -447,6 +447,40 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         self.assertTrue(all(a.get("data_changes_required") is True for a in plan if a["kind"] == "aqi_rebuild"))
         self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
 
+    def test_data_fault_preempts_operator_review_and_manifest_only_for_partition(self) -> None:
+        gaps = [
+            {
+                "gap_type": "source_r2_timeseries_row_mismatch",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "pm10",
+                "source_evidence": {"source_partition_state": "successful_non_empty"},
+            },
+            {
+                "gap_type": "data_manifest_file_count_mismatch",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "pm10",
+                "parquet_readable": True,
+                "source_evidence": {"source_partition_state": "successful_non_empty"},
+            },
+            {
+                "gap_type": "data_manifest_missing",
+                "day_utc": "2026-05-17",
+                "connector_id": 1,
+                "pollutant_code": "pm10",
+                "source_evidence": {"source_partition_state": "counts_unavailable"},
+            },
+        ]
+        MODULE._classify_v2_gaps(gaps)
+        plan = MODULE.build_v2_repair_plan(observation_gaps=gaps)
+        self.assertEqual([a["kind"] for a in plan], ["observation_data_repair", "aqi_rebuild"])
+        self.assertEqual(plan[1]["aqi_rebuild_origins"], ["observation_dependency"])
+        self.assertTrue(all(a["status"] == "planned" for a in plan))
+        self.assertTrue(all(a["executes"] is False for a in plan))
+        self.assertFalse(any(a["kind"] == "source_mapping_issue" for a in plan))
+        self.assertFalse(any(a["kind"] == "observation_pollutant_manifest_repair" for a in plan))
+
     def test_parent_connector_and_day_manifest_scopes_remain_separate(self) -> None:
         plan = MODULE.build_v2_repair_plan(observation_gaps=[
             {"gap_type": "connector_manifest_missing", "day_utc": "2026-05-17", "connector_id": 1},
