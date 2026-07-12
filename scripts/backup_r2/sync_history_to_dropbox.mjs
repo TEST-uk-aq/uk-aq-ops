@@ -1225,6 +1225,18 @@ function markPruneCheckpointUnitOk(pruneState, unitRelativePath, manifestHash, s
   pruneState.updated_at = prunedAt;
 }
 
+function invalidatePruneCheckpointUnit(pruneState, unitRelativePath, invalidatedAt) {
+  if (!pruneState.units || typeof pruneState.units !== "object" || Array.isArray(pruneState.units)) {
+    pruneState.units = {};
+  }
+  if (!Object.prototype.hasOwnProperty.call(pruneState.units, unitRelativePath)) {
+    return false;
+  }
+  delete pruneState.units[unitRelativePath];
+  pruneState.updated_at = invalidatedAt;
+  return true;
+}
+
 // ---- Planning (inventory-driven) ----
 
 function inventoryDayHash(inventory, domain, dayUtc) {
@@ -1644,6 +1656,11 @@ async function main(args) {
         syncPruneTotals();
       } catch (error) {
         recordPruneError(report.prune, unit.relative_path, error, retryStats);
+        if (pruneCheckpointEnabled && args.force_prune_recheck) {
+          if (invalidatePruneCheckpointUnit(pruneCheckpointState, unit.relative_path, new Date().toISOString())) {
+            pruneCheckpointDirty = true;
+          }
+        }
         syncPruneTotals();
         writeReport(args.report_out, report);
         allPruneFailures.push(error);
