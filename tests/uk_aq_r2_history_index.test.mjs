@@ -20,6 +20,7 @@ import {
   resolveR2HistoryIndexConfig,
   updateR2HistoryIndexesTargeted,
 } from "../workers/shared/uk_aq_r2_history_index.mjs";
+import { runHistoryIndexBuild } from "../scripts/backup_r2/uk_aq_build_r2_history_index.mjs";
 
 test("buildDaySummaryFromManifest keeps connector row counts from observations day manifest", () => {
   const summary = buildDaySummaryFromManifest({
@@ -625,6 +626,97 @@ test("targeted v2 AQI index strict mode fails when non-empty pollutant manifest 
   } finally {
     fake.restore();
   }
+});
+
+test("runHistoryIndexBuild dry-run stays read only and reports planned repair sections", async () => {
+  const objects = {
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/manifest.json": {
+      connector_manifests: [
+        {
+          connector_id: 6,
+          manifest_key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/manifest.json",
+        },
+      ],
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/manifest.json": {
+      connector_id: 6,
+      pollutant_manifests: [
+        {
+          pollutant_code: "no2",
+          manifest_key:
+            "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json",
+        },
+      ],
+    },
+    "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json": {
+      manifest_hash: "hash-aqi-no2",
+      source_row_count: 24,
+      row_count: 24,
+      timeseries_row_counts: { "1001": 24 },
+      backed_up_at_utc: "2026-06-02T00:00:00.000Z",
+      files: [
+        {
+          key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/part-00000.parquet",
+          row_count: 24,
+          bytes: 2222,
+          min_timeseries_id: 1001,
+          max_timeseries_id: 1001,
+          min_timestamp_hour_utc: "2026-06-01T00:00:00.000Z",
+          max_timestamp_hour_utc: "2026-06-01T23:00:00.000Z",
+        },
+      ],
+    },
+  };
+  const fake = installFakeR2Fetch(objects);
+  try {
+    const payload = await runHistoryIndexBuild({
+      argv: [
+        "--history-version",
+        "v2",
+        "--targeted",
+        "--domain",
+        "aqilevels",
+        "--from-day",
+        "2026-06-01",
+        "--to-day",
+        "2026-06-01",
+        "--connector-id",
+        "6",
+        "--dry-run",
+      ],
+      env: {
+        CFLARE_R2_ENDPOINT: "https://r2.example.invalid",
+        CFLARE_R2_BUCKET: "uk-aq-history-cic-test",
+        CFLARE_R2_ACCESS_KEY_ID: "key",
+        CFLARE_R2_SECRET_ACCESS_KEY: "secret",
+      },
+    });
+
+    assert.equal(payload.status, "planned");
+    assert.equal(payload.write_r2, false);
+    assert.equal(payload.dry_run, true);
+    assert.equal(payload.repair.planning.status, "planned");
+    assert.equal(payload.repair.execution.status, "planned");
+    assert.equal(payload.repair.verification.status, "not_run");
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("runHistoryIndexBuild write gate refuses non-test buckets", async () => {
+  await assert.rejects(
+    runHistoryIndexBuild({
+      argv: ["--history-version", "v2", "--write-r2"],
+      env: {
+        CFLARE_R2_ENDPOINT: "https://r2.example.invalid",
+        CFLARE_R2_BUCKET: "uk-aq-history-dev",
+        CFLARE_R2_ACCESS_KEY_ID: "key",
+        CFLARE_R2_SECRET_ACCESS_KEY: "secret",
+      },
+    }),
+    /Refusing --write-r2 for non-TEST bucket: uk-aq-history-dev/,
+  );
 });
 
 test("v2 pollutant index payload is byte-stable when source backed_up_at_utc is unchanged", () => {

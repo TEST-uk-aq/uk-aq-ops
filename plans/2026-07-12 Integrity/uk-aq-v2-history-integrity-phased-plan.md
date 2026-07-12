@@ -165,7 +165,7 @@ The new integrity flow must detect and repair this hierarchy without:
 | Phase | Name | Status | Completion commit | Notes |
 | --- | --- | --- | --- | --- |
 | 1 | Backup gate correctness and safety | Complete | `6965763` | Committed on `main`; implementation and local validation complete. |
-| 2 | Complete read-only v2 validation | In progress | Pending (uncommitted on `main`) | Read-only implementation and local validation complete; completion commit remains pending. |
+| 2 | Complete read-only v2 validation | Complete | `4438499` | Implemented on main across `7e1b352..4438499`; local validation complete; runtime Phase 2 validation remains pending. |
 | 3 | Observation manifest and index repair | Not started |  |  |
 | 4 | Observation data repair and AQI sequencing | Not started |  |  |
 
@@ -694,45 +694,33 @@ Phase 2 is complete only when:
 Status:
 
 ```text
-In progress
+Complete
 ```
 
 Completed work:
 
 ```text
-- Changed discovery to validate actual scoped day/connector/pollutant directories and parquet files.
-- Added DuckDB reads of actual parquet per-timeseries counts, totals, ID ranges and supported timestamps.
-- Separated source-vs-parquet, parquet-vs-pollutant-manifest and child-vs-parent comparisons.
-- Added both source-only and R2-only timeseries mismatch reporting.
-- Added strict pollutant manifest kind/version/domain/profile/grain and path validation.
-- Added missing connector/day manifest detection for observations and AQI.
-- Made connector validation execute once per connector-day rather than once per pollutant.
-- Added independent connector/day representation, aggregate, parquet-key, range and child-hash checks.
-- Added fault_class to findings and manifest-only classification for readable parquet.
-- Changed repair plans to deterministic, deduplicated, non-executing status=planned actions with data_changes_required.
-- Confirmed O3 manifest-only work does not queue AQI.
-- Kept AQI debug optional under --check-aqi-debug/--require-aqi-debug.
-- Added a dedicated Phase 2 acceptance test module and updated existing fixtures for actual-parquet semantics.
+- Phase 2 implementation is committed on main.
+- The code series landed across `7e1b352..4438499`.
+- Local non-DuckDB validation completed with 249 tests passing and zero skips.
+- `py_compile` passed.
+- `git diff --check` passed.
+- The runtime Python DuckDB dependency has now been installed separately on the test integrity machine, but no real integrity run was performed in this planning task.
 ```
 
 Tests:
 
 ```text
 - python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py: PASS
-- python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_phase2_validation.py: PASS (9 tests)
-- python3 -m unittest discover -s scripts/uk-aq-history-integrity/tests -p 'test_*.py': PASS (212 tests)
-- npm run check: PASS
-- git diff --check: PASS in both ops and schema repos
+- python3 -m unittest discover -s scripts/uk-aq-history-integrity/tests -p 'test_*.py' -q: PASS (249 tests, 0 skips)
+- git diff --check: PASS
 ```
 
 Remaining issues:
 
 ```text
-- No commit was created because the user did not request one.
-- Phase 2 remains In progress until the plan's required completion commit is recorded.
-- DuckDB is listed in requirements-dev.txt but is not installed in the current system Python; parquet-reader behavior is covered with a deterministic local test double.
-- No Dropbox tree, source API, Supabase, or live-R2 validation run was performed.
-- No Phase 3/4 write or verification behavior was added or executed.
+- Runtime Phase 2 validation remains pending until the integrity command is run.
+- No Phase 3 write behaviour has been executed.
 ```
 
 ---

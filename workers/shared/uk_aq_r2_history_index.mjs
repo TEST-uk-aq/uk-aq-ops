@@ -49,11 +49,20 @@ function stripEtagQuotes(etag) {
 // once `generated_at` is data-driven). Saves R2 PUT operations *and* keeps
 // downstream consumers — like the Dropbox backup builder — fast by not
 // churning their etag-skip baseline.
-async function r2PutObjectIfChanged({ r2, key, body, content_type }) {
+async function r2PutObjectIfChanged({
+  r2,
+  key,
+  body,
+  content_type,
+  writeR2 = true,
+}) {
   const newMd5 = md5HexOfBody(body);
   const bodyBytes = typeof body === "string"
     ? Buffer.byteLength(body, "utf-8")
     : body.length;
+  const bodyText = typeof body === "string"
+    ? body
+    : Buffer.from(body).toString("utf8");
 
   let existingEtag = null;
   try {
@@ -66,11 +75,48 @@ async function r2PutObjectIfChanged({ r2, key, body, content_type }) {
   }
 
   if (existingEtag && existingEtag === newMd5) {
-    return { key, etag: existingEtag, bytes: bodyBytes, skipped: true };
+    return {
+      key,
+      etag: existingEtag,
+      bytes: bodyBytes,
+      skipped: true,
+      status: "skipped_unchanged",
+      write_r2: false,
+      verified: true,
+      verification_status: "skipped_unchanged",
+    };
+  }
+
+  if (!writeR2) {
+    return {
+      key,
+      etag: existingEtag,
+      bytes: bodyBytes,
+      skipped: false,
+      status: "planned",
+      write_r2: false,
+      verified: false,
+      verification_status: "not_run",
+    };
   }
 
   const result = await r2PutObject({ r2, key, body, content_type });
-  return { ...result, skipped: false };
+  const liveObject = await r2GetObject({ r2, key });
+  const liveBodyText = liveObject.body.toString("utf8");
+  if (liveBodyText !== bodyText || liveObject.bytes !== bodyBytes) {
+    throw new Error(
+      `R2 verification failed for key=${key}: wrote bytes=${bodyBytes} but live read returned bytes=${liveObject.bytes}`,
+    );
+  }
+
+  return {
+    ...result,
+    skipped: false,
+    status: "succeeded",
+    write_r2: true,
+    verified: true,
+    verification_status: "succeeded",
+  };
 }
 
 // Phase 6.5 Pass A backfill (Path 2): parquet-wasm + arrow read paths.
@@ -971,6 +1017,7 @@ async function maybePatchHistoryV2PollutantManifestWithCounts({
   dayUtc,
   connectorId,
   pollutantCode,
+  writeR2 = true,
 }) {
   if (normalizeTimeseriesRowCounts(pollutantManifest?.timeseries_row_counts)) {
     return pollutantManifest;
@@ -1001,6 +1048,7 @@ async function maybePatchHistoryV2PollutantManifestWithCounts({
     key: manifestKey,
     body: `${JSON.stringify(patched, null, 2)}\n`,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
   return patched;
 }
@@ -1016,6 +1064,7 @@ async function maybePatchConnectorManifestWithCounts({
   warningsSink,
   dayUtc,
   connectorId,
+  writeR2 = true,
 }) {
   if (normalizeTimeseriesRowCounts(connectorManifest?.timeseries_row_counts)) {
     return connectorManifest;
@@ -1041,6 +1090,7 @@ async function maybePatchConnectorManifestWithCounts({
     key: manifestKey,
     body: `${JSON.stringify(patched, null, 2)}\n`,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
   return patched;
 }
@@ -2132,6 +2182,7 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
   timeseriesMetadataIndexPrefix = DEFAULT_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX,
   generatedAt = null,
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
+  writeR2 = true,
 } = {}) {
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for R2 history v2 timeseries metadata index rebuild");
@@ -2321,12 +2372,13 @@ export async function rebuildR2HistoryV2TimeseriesMetadataIndexes({
       timeseriesMetadataIndexPrefix: normalizedMetadataPrefix,
     });
     const key = buildR2HistoryV2TimeseriesMetadataIndexKey(normalizedMetadataPrefix, timeseriesId);
-    const putResult = await r2PutObjectIfChanged({
-      r2,
-      key,
-      body: `${JSON.stringify(payload, null, 2)}\n`,
-      content_type: "application/json; charset=utf-8",
-    });
+  const putResult = await r2PutObjectIfChanged({
+    r2,
+    key,
+    body: `${JSON.stringify(payload, null, 2)}\n`,
+    content_type: "application/json; charset=utf-8",
+    writeR2,
+  });
     writtenCount += 1;
     if (putResult.skipped) {
       putSkippedCount += 1;
@@ -2486,6 +2538,7 @@ export async function rebuildR2HistoryIndexForDomain({
   generatedAt = new Date().toISOString(),
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   maxKeys = DEFAULT_MAX_KEYS,
+  writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
   if (!SUPPORTED_DOMAINS.has(normalizedDomain)) {
@@ -2546,6 +2599,7 @@ export async function rebuildR2HistoryIndexForDomain({
     key: indexKey,
     body,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -2572,6 +2626,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
   maxKeys = DEFAULT_MAX_KEYS,
   computeMissingTimeseriesCounts = false,
   observationTargets = null,
+  writeR2 = true,
 }) {
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for R2 observations timeseries index rebuild");
@@ -2643,6 +2698,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
                 warningsSink: warnings,
                 dayUtc,
                 connectorId: target.connector_id,
+                writeR2,
               });
             }
             const payload = buildObservationTimeseriesConnectorIndexPayload({
@@ -2665,6 +2721,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
               key: connectorIndexKey,
               body,
               content_type: "application/json; charset=utf-8",
+              writeR2,
             });
             return {
               connector_id: target.connector_id,
@@ -2757,6 +2814,7 @@ async function rebuildR2HistoryObservationsTimeseriesIndexes({
     key: latestKey,
     body: latestBody,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -2788,6 +2846,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
   generatedAt = new Date().toISOString(),
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   maxKeys = DEFAULT_MAX_KEYS,
+  writeR2 = true,
 }) {
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for R2 aqilevels timeseries index rebuild");
@@ -2855,6 +2914,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
               key: connectorIndexKey,
               body,
               content_type: "application/json; charset=utf-8",
+              writeR2,
             });
             return {
               connector_id: target.connector_id,
@@ -2936,6 +2996,7 @@ async function rebuildR2HistoryAqilevelsTimeseriesIndexes({
     key: latestKey,
     body: latestBody,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -2966,6 +3027,7 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
   maxKeys = DEFAULT_MAX_KEYS,
   computeMissingTimeseriesCounts = false,
   strictMissingTimeseriesCounts = false,
+  writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
   if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
@@ -3056,6 +3118,7 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
                     dayUtc,
                     connectorId: connectorTarget.connector_id,
                     pollutantCode: pollutantTarget.pollutant_code,
+                    writeR2,
                   });
                 }
                 const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
@@ -3100,6 +3163,7 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
                   key: pollutantIndexKey,
                   body,
                   content_type: "application/json; charset=utf-8",
+                  writeR2,
                 });
                 return {
                   connector_id: connectorTarget.connector_id,
@@ -3190,6 +3254,7 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
     key: latestKey,
     body: latestBody,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -3228,6 +3293,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   fromDayUtc,
   toDayUtc,
   connectorId = null,
+  writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
   if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
@@ -3335,6 +3401,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                   dayUtc,
                   connectorId: connectorTarget.connector_id,
                   pollutantCode: pollutantTarget.pollutant_code,
+                  writeR2,
                 });
               }
               const payload = buildHistoryV2TimeseriesPollutantIndexPayload({
@@ -3384,6 +3451,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                   key: pollutantIndexKey,
                   body,
                   content_type: "application/json; charset=utf-8",
+                  writeR2,
                 });
                 putSkipped = Boolean(putResult.skipped);
               }
@@ -3482,6 +3550,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     key: latestKey,
     body: latestBody,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -3522,6 +3591,7 @@ async function updateR2HistoryIndexForDomainTargeted({
   generatedAt = new Date().toISOString(),
   fromDayUtc,
   toDayUtc,
+  writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
   if (!SUPPORTED_DOMAINS.has(normalizedDomain)) {
@@ -3577,6 +3647,7 @@ async function updateR2HistoryIndexForDomainTargeted({
     key: indexKey,
     body,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -3607,6 +3678,7 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
   fromDayUtc,
   toDayUtc,
   connectorId = null,
+  writeR2 = true,
 }) {
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for targeted observations timeseries index update");
@@ -3673,6 +3745,7 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
               warningsSink: warnings,
               dayUtc,
               connectorId: target.connector_id,
+              writeR2,
             });
           }
           const payload = buildObservationTimeseriesConnectorIndexPayload({
@@ -3698,6 +3771,7 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
               key: connectorIndexKey,
               body,
               content_type: "application/json; charset=utf-8",
+              writeR2,
             });
             putSkipped = Boolean(putResult.skipped);
           }
@@ -3747,6 +3821,7 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
     key: latestKey,
     body: latestBody,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -3783,6 +3858,7 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
   fromDayUtc,
   toDayUtc,
   connectorId = null,
+  writeR2 = true,
 }) {
   if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for targeted aqilevels timeseries index update");
@@ -3864,6 +3940,7 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
               key: connectorIndexKey,
               body,
               content_type: "application/json; charset=utf-8",
+              writeR2,
             });
             putSkipped = Boolean(putResult.skipped);
           }
@@ -3913,6 +3990,7 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
     key: latestKey,
     body: latestBody,
     content_type: "application/json; charset=utf-8",
+    writeR2,
   });
 
   return {
@@ -3949,6 +4027,7 @@ export async function updateR2HistoryIndexesTargeted({
   fetchConcurrency,
   computeMissingTimeseriesCounts = false,
   strictMissingTimeseriesCounts,
+  writeR2 = true,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
@@ -3992,6 +4071,7 @@ export async function updateR2HistoryIndexesTargeted({
         fromDayUtc,
         toDayUtc,
         connectorId,
+        writeR2,
       });
       results.push(result);
       if (domain === "observations") {
@@ -4012,6 +4092,7 @@ export async function updateR2HistoryIndexesTargeted({
         generatedAt,
         fromDayUtc,
         toDayUtc,
+        writeR2,
       }));
 
       if (domain === "observations") {
@@ -4027,6 +4108,7 @@ export async function updateR2HistoryIndexesTargeted({
           fromDayUtc,
           toDayUtc,
           connectorId,
+          writeR2,
         });
       }
       if (domain === "aqilevels") {
@@ -4041,6 +4123,7 @@ export async function updateR2HistoryIndexesTargeted({
           fromDayUtc,
           toDayUtc,
           connectorId,
+          writeR2,
         });
       }
     }
@@ -4059,6 +4142,7 @@ export async function updateR2HistoryIndexesTargeted({
       timeseriesMetadataIndexPrefix: config.timeseries_metadata_index_prefix_v2,
       generatedAt,
       fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
+      writeR2,
     });
   }
 
@@ -4108,6 +4192,7 @@ export async function rebuildR2HistoryIndexes({
   computeMissingTimeseriesCounts = false,
   strictMissingTimeseriesCounts,
   observationsTargets = null,
+  writeR2 = true,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
@@ -4147,6 +4232,7 @@ export async function rebuildR2HistoryIndexes({
           maxKeys: maxKeys || config.max_keys,
           computeMissingTimeseriesCounts,
           strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
+          writeR2,
         });
         results.push(observationsTimeseries);
       }
@@ -4163,6 +4249,7 @@ export async function rebuildR2HistoryIndexes({
           maxKeys: maxKeys || config.max_keys,
           computeMissingTimeseriesCounts,
           strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
+          writeR2,
         });
         results.push(aqilevelsTimeseries);
       }
@@ -4179,6 +4266,7 @@ export async function rebuildR2HistoryIndexes({
       timeseriesMetadataIndexPrefix: config.timeseries_metadata_index_prefix_v2,
       generatedAt,
       fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
+      writeR2,
     });
 
     return {
@@ -4214,6 +4302,7 @@ export async function rebuildR2HistoryIndexes({
       generatedAt,
       fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
       maxKeys: maxKeys || config.max_keys,
+      writeR2,
     }));
 
     if (domain === "observations") {
@@ -4228,6 +4317,7 @@ export async function rebuildR2HistoryIndexes({
         maxKeys: maxKeys || config.max_keys,
         computeMissingTimeseriesCounts,
         observationTargets: observationsTargets,
+        writeR2,
       });
     }
     if (domain === "aqilevels") {
@@ -4240,6 +4330,7 @@ export async function rebuildR2HistoryIndexes({
         generatedAt,
         fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
         maxKeys: maxKeys || config.max_keys,
+        writeR2,
       });
     }
   }

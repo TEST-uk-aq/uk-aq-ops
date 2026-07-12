@@ -599,6 +599,7 @@ if [[ "${DRY_RUN}" == "false" && ( "${RUN_MODE}" == "source_to_r2" || "${RUN_MOD
   index_connector_id="$(single_connector_id_filter "${UK_AQ_BACKFILL_CONNECTOR_IDS:-}")"
   index_connector_scope_note=""
   index_cmd=("${NODE_BIN}" scripts/backup_r2/uk_aq_build_r2_history_index.mjs)
+  index_cmd+=(--write-r2)
   if [[ "${REPAIR_MISSING_TIMESERIES_COUNTS}" == "true" ]]; then
     index_cmd+=(
       --history-version v2
