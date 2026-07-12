@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import gzip
 import hashlib
 import http.client
+import importlib.util
 import json
 import logging
 import math
@@ -7199,6 +7200,16 @@ def _enrich_v2_observations_repair_plans(
         gap_type = str(gap.get("gap_type") or "")
         day_utc = gap.get("day_utc")
         connector_id = gap.get("connector_id")
+        if gap.get("fault_class") == "pollutant manifest-only fault":
+            gap["suggested_repair"] = {
+                "kind": "observation_pollutant_manifest_repair",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "executes": False,
+                "steps": ["Rebuild the pollutant manifest from the readable parquet files."],
+                "notes": "The parquet content is readable; do not rewrite observation data.",
+            }
+            continue
         if gap_type.startswith("connector_manifest_"):
             gap["suggested_repair"] = {
                 "kind": "observation_connector_manifest_repair",
@@ -7408,78 +7419,373 @@ def _validate_v2_parent_hierarchy(
         connector_raw = connector_dir.name.split("=", 1)[1]
         connector_rel = f"{data_prefix}/day_utc={day_utc}/{connector_dir.name}/manifest.json"
         connector_manifest = root / connector_rel
-        actual_pollutants = {
-            p.name.split("=", 1)[1]
-            for p in connector_dir.glob("pollutant_code=*")
-            if p.is_dir() and (p / "manifest.json").is_file()
+        child_payloads: dict[str, Mapping[str, Any]] = {}
+        for pollutant_dir in sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir()):
+            child_path = pollutant_dir / "manifest.json"
+            if not child_path.is_file():
+                continue
+            child_payload, child_err = _load_json_file(child_path)
+            if not child_err and isinstance(child_payload, Mapping):
+                child_payloads[pollutant_dir.name.split("=", 1)[1]] = child_payload
+        actual_pollutants = set(child_payloads)
+        if not connector_manifest.is_file():
+            gaps.append(gap_fn(
+                "connector_manifest_missing",
+                day_utc=day_utc,
+                connector_id=connector_raw,
+                expected_path=connector_rel,
+            ))
+            return
+        payload, err = _load_json_file(connector_manifest)
+        if err or not isinstance(payload, dict):
+            gaps.append(gap_fn(
+                "connector_manifest_invalid_json",
+                day_utc=day_utc,
+                connector_id=connector_raw,
+                expected_path=connector_rel,
+            ))
+            return
+        expected_profile = "data" if domain == "aqilevels" else None
+        expected_grain = "hourly" if domain == "aqilevels" else None
+        schema_mismatches = [
+            field for field, expected in (
+                ("manifest_kind", "connector"),
+                ("history_version", "v2"),
+                ("domain", domain),
+                ("grain", expected_grain),
+                ("profile", expected_profile),
+                ("day_utc", day_utc),
+                ("connector_id", str(connector_raw)),
+            )
+            if field not in payload or str(payload.get(field)) != str(expected)
+        ]
+        if schema_mismatches:
+            gaps.append(gap_fn(
+                "connector_manifest_schema_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_raw,
+                expected_path=connector_rel,
+                related_paths=schema_mismatches,
+            ))
+        representations = {
+            "connector_manifest_pollutant_codes": _manifest_codes_from_scalar_list(payload, "pollutant_codes"),
+            "connector_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "pollutant_code"),
+            "connector_manifest_pollutant_manifests": _manifest_codes_from_child_list(payload, "pollutant_manifests", "pollutant_code"),
+            "connector_manifest_files": _manifest_pollutant_codes_from_files(payload),
         }
-        if connector_manifest.is_file():
-            payload, err = _load_json_file(connector_manifest)
-            if err or not isinstance(payload, dict):
-                gaps.append(
-                    gap_fn(
-                        "connector_manifest_invalid_json",
-                        day_utc=day_utc,
-                        connector_id=connector_raw,
-                        expected_path=connector_rel,
-                    )
-                )
-            else:
-                representations = {
-                    "connector_manifest_pollutant_codes": _manifest_codes_from_scalar_list(payload, "pollutant_codes"),
-                    "connector_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "pollutant_code"),
-                    "connector_manifest_pollutant_manifests": _manifest_codes_from_child_list(payload, "pollutant_manifests", "pollutant_code"),
-                    "connector_manifest_files": _manifest_pollutant_codes_from_files(payload),
-                }
-                for label, represented in representations.items():
-                    _append_field_set_gaps(
-                        gaps,
-                        domain=domain,
-                        field_label=label,
-                        actual=actual_pollutants,
-                        represented=represented,
-                        day_utc=day_utc,
-                        connector_id=connector_raw,
-                        expected_path=connector_rel,
-                        child_key="pollutant_code",
-                    )
+        for label, represented in representations.items():
+            _append_field_set_gaps(
+                gaps,
+                domain=domain,
+                field_label=label,
+                actual=actual_pollutants,
+                represented=represented,
+                day_utc=day_utc,
+                connector_id=connector_raw,
+                expected_path=connector_rel,
+                child_key="pollutant_code",
+            )
+        _append_parent_aggregate_gaps(
+            gaps,
+            domain=domain,
+            level="connector",
+            payload=payload,
+            child_payloads=child_payloads.values(),
+            day_utc=day_utc,
+            connector_id=connector_raw,
+            expected_path=connector_rel,
+        )
+        _append_child_hash_gaps(
+            gaps,
+            domain=domain,
+            level="connector",
+            representations=(
+                ("child_manifests", payload.get("child_manifests"), "pollutant_code"),
+                ("pollutant_manifests", payload.get("pollutant_manifests"), "pollutant_code"),
+            ),
+            actual_hashes={key: str(value.get("manifest_hash") or "") for key, value in child_payloads.items()},
+            day_utc=day_utc,
+            connector_id=connector_raw,
+            expected_path=connector_rel,
+        )
     if connector_dir is not None:
         return
 
     day_rel = f"{data_prefix}/day_utc={day_utc}/manifest.json"
     day_manifest = root / day_rel
-    actual_connectors = {
-        p.name.split("=", 1)[1]
-        for p in day_dir.glob("connector_id=*")
-        if p.is_dir() and (p / "manifest.json").is_file()
+    child_payloads: dict[str, Mapping[str, Any]] = {}
+    for connector_child_dir in sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir()):
+        child_path = connector_child_dir / "manifest.json"
+        if not child_path.is_file():
+            continue
+        child_payload, child_err = _load_json_file(child_path)
+        if not child_err and isinstance(child_payload, Mapping):
+            child_payloads[connector_child_dir.name.split("=", 1)[1]] = child_payload
+    actual_connectors = set(child_payloads)
+    if not day_manifest.is_file():
+        gaps.append(gap_fn("day_manifest_missing", day_utc=day_utc, expected_path=day_rel))
+        return
+    payload, err = _load_json_file(day_manifest)
+    if err or not isinstance(payload, dict):
+        gaps.append(gap_fn("day_manifest_invalid_json", day_utc=day_utc, expected_path=day_rel))
+        return
+    expected_profile = "data" if domain == "aqilevels" else None
+    expected_grain = "hourly" if domain == "aqilevels" else None
+    schema_mismatches = [
+        field for field, expected in (
+            ("manifest_kind", "day"),
+            ("history_version", "v2"),
+            ("domain", domain),
+            ("grain", expected_grain),
+            ("profile", expected_profile),
+            ("day_utc", day_utc),
+        )
+        if field not in payload or str(payload.get(field)) != str(expected)
+    ]
+    if schema_mismatches:
+        gaps.append(gap_fn(
+            "day_manifest_schema_mismatch",
+            day_utc=day_utc,
+            expected_path=day_rel,
+            related_paths=schema_mismatches,
+        ))
+    representations = {
+        "day_manifest_connector_ids": _manifest_codes_from_scalar_list(payload, "connector_ids"),
+        "day_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "connector_id"),
+        "day_manifest_connector_manifests": _manifest_codes_from_child_list(payload, "connector_manifests", "connector_id"),
+        "day_manifest_files": _manifest_connector_ids_from_files(payload),
     }
-    if day_manifest.is_file():
-        payload, err = _load_json_file(day_manifest)
-        if err or not isinstance(payload, dict):
-            gaps.append(gap_fn("day_manifest_invalid_json", day_utc=day_utc, expected_path=day_rel))
-        else:
-            representations = {
-                "day_manifest_connector_ids": _manifest_codes_from_scalar_list(payload, "connector_ids"),
-                "day_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "connector_id"),
-                "day_manifest_connector_manifests": _manifest_codes_from_child_list(payload, "connector_manifests", "connector_id"),
-                "day_manifest_files": _manifest_connector_ids_from_files(payload),
-            }
-            for label, represented in representations.items():
-                _append_field_set_gaps(
-                    gaps,
-                    domain=domain,
-                    field_label=label,
-                    actual=actual_connectors,
-                    represented=represented,
-                    day_utc=day_utc,
-                    expected_path=day_rel,
-                    child_key="connector_id",
-                )
+    for label, represented in representations.items():
+        _append_field_set_gaps(
+            gaps,
+            domain=domain,
+            field_label=label,
+            actual=actual_connectors,
+            represented=represented,
+            day_utc=day_utc,
+            expected_path=day_rel,
+            child_key="connector_id",
+        )
+    _append_parent_aggregate_gaps(
+        gaps,
+        domain=domain,
+        level="day",
+        payload=payload,
+        child_payloads=child_payloads.values(),
+        day_utc=day_utc,
+        connector_id=None,
+        expected_path=day_rel,
+    )
+    _append_child_hash_gaps(
+        gaps,
+        domain=domain,
+        level="day",
+        representations=(
+            ("child_manifests", payload.get("child_manifests"), "connector_id"),
+            ("connector_manifests", payload.get("connector_manifests"), "connector_id"),
+        ),
+        actual_hashes={key: str(value.get("manifest_hash") or "") for key, value in child_payloads.items()},
+        day_utc=day_utc,
+        connector_id=None,
+        expected_path=day_rel,
+    )
 
 
 def _manifest_files(payload: Any) -> list[dict[str, Any]]:
     files = payload.get("files") if isinstance(payload, dict) else None
     return files if isinstance(files, list) else []
+
+
+def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any] | None, str | None]:
+    """Read actual local parquet content without trusting manifest metadata."""
+    parquet_files = sorted({str(Path(path)) for path in files if Path(path).is_file()})
+    if not parquet_files:
+        return {
+            "row_count": 0,
+            "timeseries_row_counts": {},
+            "min_timeseries_id": None,
+            "max_timeseries_id": None,
+            "min_timestamp_utc": None,
+            "max_timestamp_utc": None,
+        }, None
+    if importlib.util.find_spec("duckdb") is None:
+        return None, "duckdb_unavailable"
+
+    import duckdb  # type: ignore[import-not-found]
+
+    connection = duckdb.connect(database=":memory:")
+    try:
+        described = connection.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
+            [parquet_files],
+        ).fetchall()
+        columns = {str(row[0]) for row in described}
+        if "timeseries_id" not in columns:
+            return None, "timeseries_id_column_missing"
+        rows = connection.execute(
+            "SELECT CAST(timeseries_id AS BIGINT), COUNT(*) "
+            "FROM read_parquet(?, union_by_name=true) "
+            "WHERE timeseries_id IS NOT NULL GROUP BY 1 ORDER BY 1",
+            [parquet_files],
+        ).fetchall()
+        counts = {int(timeseries_id): int(row_count) for timeseries_id, row_count in rows}
+        timestamp_column = next(
+            (name for name in ("observed_at_utc", "observed_at", "timestamp_hour_utc") if name in columns),
+            None,
+        )
+        min_timestamp = None
+        max_timestamp = None
+        if timestamp_column:
+            min_timestamp, max_timestamp = connection.execute(
+                f"SELECT CAST(MIN({timestamp_column}) AS VARCHAR), "
+                f"CAST(MAX({timestamp_column}) AS VARCHAR) "
+                "FROM read_parquet(?, union_by_name=true)",
+                [parquet_files],
+            ).fetchone()
+        return {
+            "row_count": sum(counts.values()),
+            "timeseries_row_counts": counts,
+            "min_timeseries_id": min(counts) if counts else None,
+            "max_timeseries_id": max(counts) if counts else None,
+            "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
+            "max_timestamp_utc": str(max_timestamp) if max_timestamp is not None else None,
+        }, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}:{exc}"
+    finally:
+        connection.close()
+
+
+def _int_field(payload: Mapping[str, Any], field: str) -> int | None:
+    value = payload.get(field)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _manifest_file_keys(payload: Mapping[str, Any]) -> set[str]:
+    return {
+        str(entry.get("key") or "").strip().lstrip("/")
+        for entry in _manifest_files(payload)
+        if isinstance(entry, Mapping) and str(entry.get("key") or "").strip()
+    }
+
+
+def _child_manifest_aggregate(payloads: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    children = list(payloads)
+    numeric_sums = {
+        field: sum(_int_field(child, field) or 0 for child in children)
+        for field in ("row_count", "source_row_count", "file_count", "total_bytes")
+    }
+    min_ids = [int(child["min_timeseries_id"]) for child in children if _is_positive_int(child.get("min_timeseries_id"))]
+    max_ids = [int(child["max_timeseries_id"]) for child in children if _is_positive_int(child.get("max_timeseries_id"))]
+    min_times = [
+        str(child.get("min_observed_at_utc") or child.get("min_timestamp_hour_utc"))
+        for child in children
+        if child.get("min_observed_at_utc") or child.get("min_timestamp_hour_utc")
+    ]
+    max_times = [
+        str(child.get("max_observed_at_utc") or child.get("max_timestamp_hour_utc"))
+        for child in children
+        if child.get("max_observed_at_utc") or child.get("max_timestamp_hour_utc")
+    ]
+    return {
+        **numeric_sums,
+        "min_timeseries_id": min(min_ids) if min_ids else None,
+        "max_timeseries_id": max(max_ids) if max_ids else None,
+        "min_timestamp_utc": min(min_times) if min_times else None,
+        "max_timestamp_utc": max(max_times) if max_times else None,
+        "file_keys": set().union(*(_manifest_file_keys(child) for child in children)) if children else set(),
+    }
+
+
+def _append_parent_aggregate_gaps(
+    gaps: list[dict[str, Any]],
+    *,
+    domain: str,
+    level: str,
+    payload: Mapping[str, Any],
+    child_payloads: Iterable[Mapping[str, Any]],
+    day_utc: str,
+    connector_id: int | str | None,
+    expected_path: str,
+) -> None:
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
+    aggregate = _child_manifest_aggregate(child_payloads)
+    for field in ("row_count", "source_row_count", "file_count", "total_bytes"):
+        actual = _int_field(payload, field)
+        if actual is not None and actual != aggregate[field]:
+            gaps.append(gap_fn(
+                f"{level}_manifest_{field}_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=expected_path,
+                related_paths=[f"manifest_{field}={actual} child_{field}={aggregate[field]}"],
+            ))
+    for field in ("min_timeseries_id", "max_timeseries_id"):
+        if field in payload and payload.get(field) != aggregate[field]:
+            gaps.append(gap_fn(
+                f"{level}_manifest_{field}_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=expected_path,
+                related_paths=[f"manifest_{field}={payload.get(field)} child_{field}={aggregate[field]}"],
+            ))
+    for field, aggregate_field in (
+        ("min_observed_at_utc", "min_timestamp_utc"),
+        ("max_observed_at_utc", "max_timestamp_utc"),
+        ("min_timestamp_hour_utc", "min_timestamp_utc"),
+        ("max_timestamp_hour_utc", "max_timestamp_utc"),
+    ):
+        if field in payload and payload.get(field) != aggregate[aggregate_field]:
+            gaps.append(gap_fn(
+                f"{level}_manifest_{field}_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=expected_path,
+                related_paths=[f"manifest_{field}={payload.get(field)} child_{field}={aggregate[aggregate_field]}"],
+            ))
+    parent_file_keys = _manifest_file_keys(payload)
+    if parent_file_keys != aggregate["file_keys"]:
+        gaps.append(gap_fn(
+            f"{level}_manifest_parquet_keys_mismatch",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            expected_path=expected_path,
+            related_paths=sorted(
+                [f"missing={key}" for key in aggregate["file_keys"] - parent_file_keys]
+                + [f"stale={key}" for key in parent_file_keys - aggregate["file_keys"]]
+            ),
+        ))
+
+
+def _append_child_hash_gaps(
+    gaps: list[dict[str, Any]],
+    *,
+    domain: str,
+    level: str,
+    representations: Iterable[tuple[str, Any, str]],
+    actual_hashes: Mapping[str, str],
+    day_utc: str,
+    connector_id: int | str | None,
+    expected_path: str,
+) -> None:
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
+    for field, raw_entries, id_key in representations:
+        if not isinstance(raw_entries, list):
+            continue
+        for entry in raw_entries:
+            if not isinstance(entry, Mapping):
+                continue
+            child_id = str(entry.get(id_key) or "").strip()
+            expected_hash = actual_hashes.get(child_id)
+            represented_hash = str(entry.get("manifest_hash") or "").strip()
+            if expected_hash and represented_hash and expected_hash != represented_hash:
+                gaps.append(gap_fn(
+                    f"{level}_manifest_{field}_child_hash_mismatch",
+                    day_utc=day_utc,
+                    connector_id=connector_id,
+                    expected_path=expected_path,
+                    related_paths=[f"{id_key}={child_id}"],
+                ))
 
 
 def _rel_key_to_path(root: Path, key: str) -> Path | None:
@@ -7644,21 +7950,22 @@ def _build_v2_source_r2_mismatch_gap(
         return None
 
     mismatches: list[dict[str, Any]] = []
-    for timeseries_id in sorted(source_counts):
+    for timeseries_id in sorted(set(source_counts) | set(r2_counts)):
         source_rows = int(source_counts.get(timeseries_id) or 0)
         r2_rows = int(r2_counts.get(timeseries_id) or 0)
-        if source_rows > r2_rows:
+        if source_rows != r2_rows:
             mismatches.append({
                 "timeseries_id": int(timeseries_id),
                 "source_rows": source_rows,
                 "r2_rows": r2_rows,
-                "missing_rows": source_rows - r2_rows,
+                "missing_rows": max(0, source_rows - r2_rows),
+                "extra_rows": max(0, r2_rows - source_rows),
             })
     if not mismatches:
         return None
 
     source_total = sum(int(v or 0) for v in source_counts.values())
-    r2_total_for_source = sum(int(r2_counts.get(ts_id, 0) or 0) for ts_id in source_counts)
+    r2_total_for_source = sum(int(value or 0) for value in r2_counts.values())
     sample = mismatches[:25]
     gap = _v2_obs_gap(
         "source_r2_timeseries_row_mismatch",
@@ -7671,7 +7978,8 @@ def _build_v2_source_r2_mismatch_gap(
                 f"timeseries_id={entry['timeseries_id']} "
                 f"source_rows={entry['source_rows']} "
                 f"r2_rows={entry['r2_rows']} "
-                f"missing_rows={entry['missing_rows']}"
+                f"missing_rows={entry['missing_rows']} "
+                f"extra_rows={entry['extra_rows']}"
             )
             for entry in sample
         ],
@@ -7680,6 +7988,12 @@ def _build_v2_source_r2_mismatch_gap(
     gap["r2_rows"] = r2_total_for_source
     gap["missing_timeseries_count"] = len(mismatches)
     gap["missing_timeseries_ids"] = [entry["timeseries_id"] for entry in mismatches]
+    gap["source_only_timeseries_ids"] = [
+        entry["timeseries_id"] for entry in mismatches if entry["source_rows"] > 0 and entry["r2_rows"] == 0
+    ]
+    gap["r2_only_timeseries_ids"] = [
+        entry["timeseries_id"] for entry in mismatches if entry["source_rows"] == 0 and entry["r2_rows"] > 0
+    ]
     gap["sample_missing_timeseries_ids"] = [entry["timeseries_id"] for entry in sample]
     # Keep the complete compact mismatch set in JSON so a targeted repair can
     # be constructed exactly; only human-facing related_paths are truncated.
@@ -7708,6 +8022,132 @@ def _r2_partition_timeseries_counts_from_manifest(payload: Any) -> dict[int, int
         for ts_id, count in _normalize_timeseries_row_counts(entry.get("timeseries_row_counts")).items():
             merged[ts_id] = merged.get(ts_id, 0) + count
     return merged
+
+
+def _append_actual_parquet_gaps(
+    gaps: list[dict[str, Any]],
+    *,
+    domain: str,
+    day_utc: str,
+    connector_id: int | str,
+    pollutant_code: str,
+    manifest_rel: str,
+    payload: Mapping[str, Any] | None,
+    parquet_files: Iterable[Path],
+) -> tuple[dict[str, Any] | None, str | None]:
+    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
+    stats, error = _read_parquet_partition_stats(parquet_files)
+    if error:
+        gap_type = "parquet_reader_unavailable" if error == "duckdb_unavailable" else "parquet_unreadable"
+        gaps.append(gap_fn(
+            gap_type,
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            related_paths=[error],
+        ))
+        return None, error
+    if stats is None or payload is None:
+        return stats, None
+
+    manifest_counts = _r2_partition_timeseries_counts_from_manifest(payload)
+    actual_counts = stats["timeseries_row_counts"]
+    manifest_row_count = _int_field(payload, "row_count")
+    if manifest_row_count is not None and manifest_row_count != stats["row_count"]:
+        gaps.append(gap_fn(
+            "data_manifest_row_count_mismatch",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            related_paths=[f"manifest_row_count={manifest_row_count} parquet_row_count={stats['row_count']}"],
+        ))
+    source_row_count = _int_field(payload, "source_row_count")
+    if source_row_count is not None and source_row_count != stats["row_count"]:
+        gaps.append(gap_fn(
+            "data_manifest_source_row_count_mismatch",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            related_paths=[f"manifest_source_row_count={source_row_count} parquet_row_count={stats['row_count']}"],
+        ))
+    if manifest_counts != actual_counts:
+        gaps.append(gap_fn(
+            "data_manifest_timeseries_row_count_mismatch",
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+            expected_path=manifest_rel,
+            related_paths=[
+                f"timeseries_id={timeseries_id} manifest_rows={manifest_counts.get(timeseries_id, 0)} parquet_rows={actual_counts.get(timeseries_id, 0)}"
+                for timeseries_id in sorted(set(manifest_counts) | set(actual_counts))
+                if manifest_counts.get(timeseries_id, 0) != actual_counts.get(timeseries_id, 0)
+            ],
+        ))
+    for field, actual_field in (
+        ("min_timeseries_id", "min_timeseries_id"),
+        ("max_timeseries_id", "max_timeseries_id"),
+    ):
+        if field in payload and payload.get(field) != stats[actual_field]:
+            gaps.append(gap_fn(
+                f"data_manifest_{field}_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant_code,
+                expected_path=manifest_rel,
+                related_paths=[f"manifest_{field}={payload.get(field)} parquet_{field}={stats[actual_field]}"],
+            ))
+    timestamp_fields = (
+        ("min_observed_at_utc", "min_timestamp_utc"),
+        ("max_observed_at_utc", "max_timestamp_utc"),
+        ("min_timestamp_hour_utc", "min_timestamp_utc"),
+        ("max_timestamp_hour_utc", "max_timestamp_utc"),
+    )
+    for field, actual_field in timestamp_fields:
+        if field not in payload or stats.get(actual_field) is None:
+            continue
+        manifest_timestamp = _parse_iso_utc(str(payload.get(field) or ""))
+        parquet_timestamp = _parse_iso_utc(str(stats.get(actual_field) or ""))
+        if manifest_timestamp is not None and parquet_timestamp is not None and manifest_timestamp != parquet_timestamp:
+            gaps.append(gap_fn(
+                f"data_manifest_{field}_mismatch",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant_code,
+                expected_path=manifest_rel,
+                related_paths=[f"manifest_{field}={payload.get(field)} parquet_{field}={stats.get(actual_field)}"],
+            ))
+    return stats, None
+
+
+def _classify_v2_gaps(gaps: Iterable[dict[str, Any]]) -> None:
+    for gap in gaps:
+        gap_type = str(gap.get("gap_type") or "")
+        if gap_type.startswith("connector_manifest_"):
+            fault_class = "connector manifest-only fault"
+        elif gap_type.startswith("day_manifest_"):
+            fault_class = "day manifest-only fault"
+        elif gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
+            fault_class = "index-only fault"
+        elif gap_type.startswith("data_manifest_") or gap_type == "orphan_parquet_without_manifest":
+            fault_class = (
+                "pollutant manifest-only fault"
+                if gap.get("parquet_readable") is True
+                else "data fault"
+            )
+        elif gap_type in {"parquet_reader_unavailable"}:
+            fault_class = "source unavailable"
+        elif gap_type in {"source_mapping_issue"}:
+            fault_class = "source mapping issue"
+        elif gap_type in {"source_unavailable"}:
+            fault_class = "source unavailable"
+        elif gap_type.startswith("metadata_"):
+            fault_class = "metadata-only fault"
+        else:
+            fault_class = "data fault"
+        gap["fault_class"] = fault_class
 
 
 def run_v2_observations_integrity_checks(
@@ -7804,6 +8244,7 @@ def run_v2_observations_integrity_checks(
             for pollutant_dir in pollutant_dirs:
                 pollutant = pollutant_dir.name.split("=", 1)[1]
                 checked += 1
+                partition_gap_start = len(gaps)
                 part_rel = f"{day_rel}/{connector_dir.name}/{pollutant_dir.name}"
                 manifest_rel = f"{part_rel}/manifest.json"
                 manifest_path = root / manifest_rel
@@ -7819,14 +8260,30 @@ def run_v2_observations_integrity_checks(
                     except Exception:
                         gaps.append(_v2_obs_gap("data_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                     if isinstance(payload, dict):
-                        schema_bad = []
-                        if payload.get("history_version", "v2") != "v2": schema_bad.append("history_version")
-                        if payload.get("domain", "observations") != "observations": schema_bad.append("domain")
-                        if "day_utc" in payload and str(payload.get("day_utc")) != day_utc: schema_bad.append("day_utc")
-                        if "connector_id" in payload and str(payload.get("connector_id")) != str(connector_raw): schema_bad.append("connector_id")
-                        if "pollutant_code" in payload and str(payload.get("pollutant_code")) != pollutant: schema_bad.append("pollutant_code")
+                        expected_manifest_fields = {
+                            "manifest_kind": "pollutant",
+                            "history_version": "v2",
+                            "domain": "observations",
+                            "grain": None,
+                            "profile": None,
+                        }
+                        expected_path_fields = {
+                            "day_utc": day_utc,
+                            "connector_id": str(connector_raw),
+                            "pollutant_code": pollutant,
+                        }
+                        schema_bad = [
+                            field for field, expected in expected_manifest_fields.items()
+                            if field not in payload or str(payload.get(field)) != str(expected)
+                        ]
                         if schema_bad:
                             gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=schema_bad))
+                        path_bad = [
+                            field for field, expected in expected_path_fields.items()
+                            if field not in payload or str(payload.get(field)) != str(expected)
+                        ]
+                        if path_bad:
+                            gaps.append(_v2_obs_gap("data_manifest_path_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=path_bad))
                         files = _manifest_files(payload)
                         local_parquet_keys = {
                             str(p.relative_to(root))
@@ -7878,6 +8335,20 @@ def run_v2_observations_integrity_checks(
                                 gaps.append(_v2_obs_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                     elif payload is not None:
                         gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                parquet_stats, parquet_error = _append_actual_parquet_gaps(
+                    gaps,
+                    domain="observations",
+                    day_utc=day_utc,
+                    connector_id=connector_raw,
+                    pollutant_code=pollutant,
+                    manifest_rel=manifest_rel,
+                    payload=payload if isinstance(payload, Mapping) else None,
+                    parquet_files=local_parquets,
+                )
+                parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
+                for partition_gap in gaps[partition_gap_start:]:
+                    if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
+                        partition_gap["parquet_readable"] = parquet_readable
                 idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
                 idx_path = root / idx_rel
                 if not idx_path.is_file():
@@ -7892,7 +8363,7 @@ def run_v2_observations_integrity_checks(
                     except Exception:
                         gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
 
-                if isinstance(payload, dict):
+                if parquet_stats is not None:
                     try:
                         connector_id_for_source = int(str(connector_raw))
                     except (TypeError, ValueError):
@@ -7912,20 +8383,20 @@ def run_v2_observations_integrity_checks(
                             pollutant_code=pollutant,
                             expected_path=manifest_rel,
                             source_counts=source_counts,
-                            r2_counts=_r2_partition_timeseries_counts_from_manifest(payload),
+                            r2_counts=parquet_stats["timeseries_row_counts"],
                             source_skip_reason=source_skip_reason,
                         )
                         if stale_gap is not None:
                             gaps.append(stale_gap)
-                _validate_v2_parent_hierarchy(
-                    root=root,
-                    data_prefix=data_prefix,
-                    day_utc=day_utc,
-                    connector_dir=connector_dir,
-                    day_dir=day_dir,
-                    gaps=gaps,
-                    domain="observations",
-                )
+            _validate_v2_parent_hierarchy(
+                root=root,
+                data_prefix=data_prefix,
+                day_utc=day_utc,
+                connector_dir=connector_dir,
+                day_dir=day_dir,
+                gaps=gaps,
+                domain="observations",
+            )
         _validate_v2_parent_hierarchy(
             root=root,
             data_prefix=data_prefix,
@@ -7936,6 +8407,7 @@ def run_v2_observations_integrity_checks(
             domain="observations",
         )
 
+    _classify_v2_gaps(gaps)
     _enrich_v2_observations_repair_plans(
         root=root,
         gaps=gaps,
@@ -8080,6 +8552,16 @@ def _enrich_v2_aqi_repair_plans(
         day_utc = gap.get("day_utc")
         connector_id = gap.get("connector_id")
         pollutant_code = gap.get("pollutant_code")
+        if gap.get("fault_class") == "pollutant manifest-only fault":
+            gap["suggested_repair"] = {
+                "kind": "aqi_pollutant_manifest_repair",
+                "requires_index_rebuild": True,
+                "commands": [],
+                "executes": False,
+                "steps": ["Rebuild the AQI pollutant manifest from the readable parquet files."],
+                "notes": "The parquet content is readable; do not rebuild AQI data.",
+            }
+            continue
         v2_obs_present, v2_obs_paths = _local_v2_observations_evidence(
             root,
             config,
@@ -8248,6 +8730,7 @@ def build_v2_repair_plan(
         requires_index_rebuild: bool = False,
         executes: bool = False,
         operator_action_required: bool = False,
+        data_changes_required: bool = False,
         notes: str | None = None,
     ) -> None:
         day_utc = gap.get("day_utc")
@@ -8259,12 +8742,13 @@ def build_v2_repair_plan(
         if entry is None:
             entry = {
                 "kind": kind,
-                "status": "planned_only",
+                "status": "planned",
                 "day_utc": day_utc,
                 "connector_id": connector_id,
                 "pollutant_code": pollutant_code,
                 "requires_index_rebuild": bool(requires_index_rebuild),
-                "executes": bool(executes),
+                "data_changes_required": bool(data_changes_required),
+                "executes": False,
                 "operator_action_required": bool(operator_action_required),
                 "gap_types": [gap_type] if gap_type else [],
                 "commands": [],
@@ -8277,11 +8761,13 @@ def build_v2_repair_plan(
             entry["requires_index_rebuild"] = bool(entry["requires_index_rebuild"] or requires_index_rebuild)
             entry["executes"] = bool(entry["executes"] or executes)
             entry["operator_action_required"] = bool(entry["operator_action_required"] or operator_action_required)
+            entry["data_changes_required"] = bool(entry["data_changes_required"] or data_changes_required)
             if notes and notes not in str(entry.get("notes") or ""):
                 entry["notes"] = f"{entry['notes']}; {notes}" if entry.get("notes") else notes
 
     for gap in observation_gaps:
         gap_type = str(gap.get("gap_type") or "")
+        fault_class = str(gap.get("fault_class") or "")
         if gap_type.startswith("connector_manifest_"):
             add_action(
                 "observation_connector_manifest_repair",
@@ -8318,6 +8804,16 @@ def build_v2_repair_plan(
                 requires_index_rebuild=True,
                 notes="Repair the pollutant manifest so it matches the actual live-R2 parquet set and row counts.",
             )
+        elif fault_class == "pollutant manifest-only fault" and (
+            gap_type.startswith("data_manifest_") or gap_type == "orphan_parquet_without_manifest"
+        ):
+            add_action(
+                "observation_pollutant_manifest_repair",
+                gap=gap,
+                requires_index_rebuild=True,
+                data_changes_required=False,
+                notes="Rebuild the pollutant manifest from readable parquet without rewriting observation data.",
+            )
         elif gap_type in {
             "data_manifest_missing",
             "data_manifest_invalid_json",
@@ -8337,6 +8833,7 @@ def build_v2_repair_plan(
                 "observation_data_repair",
                 gap=gap,
                 requires_index_rebuild=True,
+                data_changes_required=True,
                 notes="Repair the underlying observation data partition before rebuilding manifests and indexes.",
             )
             if eligible_for(gap.get("connector_id"), gap.get("pollutant_code")) and gap_type in {
@@ -8362,6 +8859,7 @@ def build_v2_repair_plan(
 
     for gap in aqi_gaps:
         gap_type = str(gap.get("gap_type") or "")
+        fault_class = str(gap.get("fault_class") or "")
         if gap_type.startswith("connector_manifest_"):
             add_action(
                 "aqi_connector_manifest_repair",
@@ -8398,6 +8896,16 @@ def build_v2_repair_plan(
                 requires_index_rebuild=True,
                 notes="Repair the AQI pollutant manifest so it matches the actual live-R2 parquet set and row counts.",
             )
+        elif fault_class == "pollutant manifest-only fault" and (
+            gap_type.startswith("data_manifest_") or gap_type == "orphan_parquet_without_manifest"
+        ):
+            add_action(
+                "aqi_pollutant_manifest_repair",
+                gap=gap,
+                requires_index_rebuild=True,
+                data_changes_required=False,
+                notes="Rebuild the AQI pollutant manifest from readable parquet without rewriting AQI data.",
+            )
         elif gap_type in {
             "data_manifest_missing",
             "data_manifest_invalid_json",
@@ -8414,6 +8922,7 @@ def build_v2_repair_plan(
                 "aqi_rebuild",
                 gap=gap,
                 requires_index_rebuild=True,
+                data_changes_required=True,
                 notes="Rebuild AQI data only where the AQI partition itself is stale or incomplete.",
             )
 
@@ -8431,6 +8940,8 @@ def build_v2_repair_plan(
         "source_mapping_issue",
     ]
     position = {kind: idx for idx, kind in enumerate(order)}
+    for entry in actions.values():
+        entry["gap_types"] = sorted(set(entry.get("gap_types") or []))
     return sorted(
         actions.values(),
         key=lambda entry: (
@@ -8467,16 +8978,14 @@ def _validate_v2_aqi_manifest(
         return ["manifest_not_object"]
     bad: list[str] = []
     expected = {
+        "manifest_kind": "pollutant",
         "history_version": "v2",
         "domain": "aqilevels",
         "grain": "hourly",
         "profile": profile,
-        "day_utc": day_utc,
-        "connector_id": str(connector_id),
-        "pollutant_code": pollutant_code,
     }
     for key, want in expected.items():
-        if key in payload and str(payload.get(key)) != want:
+        if key not in payload or str(payload.get(key)) != str(want):
             bad.append(key)
     return bad
 
@@ -8573,10 +9082,12 @@ def run_v2_aqilevels_integrity_checks(
                 pollutant = pollutant_dir.name.split("=", 1)[1]
                 expected_parts.append((day_utc, connector_raw, pollutant))
                 checked += 1
+                partition_gap_start = len(data_gaps)
                 part_rel = f"{day_rel}/{connector_dir.name}/{pollutant_dir.name}"
                 manifest_rel = f"{part_rel}/manifest.json"
                 manifest_path = root / manifest_rel
                 local_parquets = list(pollutant_dir.glob("*.parquet"))
+                payload: Any = None
                 if not manifest_path.is_file():
                     data_gaps.append(_v2_aqi_gap("data_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
                     if local_parquets:
@@ -8589,6 +9100,16 @@ def run_v2_aqilevels_integrity_checks(
                         bad = _validate_v2_aqi_manifest(payload=payload, profile="data", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant)
                         if bad:
                             data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
+                        path_bad = [
+                            field for field, expected in {
+                                "day_utc": day_utc,
+                                "connector_id": str(connector_raw),
+                                "pollutant_code": pollutant,
+                            }.items()
+                            if field not in payload or str(payload.get(field)) != str(expected)
+                        ]
+                        if path_bad:
+                            data_gaps.append(_v2_aqi_gap("data_manifest_path_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=path_bad))
                         files = _manifest_files(payload)
                         local_parquet_keys = {
                             str(p.relative_to(root))
@@ -8640,6 +9161,20 @@ def run_v2_aqilevels_integrity_checks(
                                 data_gaps.append(_v2_aqi_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                     else:
                         data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
+                parquet_stats, parquet_error = _append_actual_parquet_gaps(
+                    data_gaps,
+                    domain="aqilevels",
+                    day_utc=day_utc,
+                    connector_id=connector_raw,
+                    pollutant_code=pollutant,
+                    manifest_rel=manifest_rel,
+                    payload=payload if isinstance(payload, Mapping) else None,
+                    parquet_files=local_parquets,
+                )
+                parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
+                for partition_gap in data_gaps[partition_gap_start:]:
+                    if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
+                        partition_gap["parquet_readable"] = parquet_readable
                 idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
                 idx_path = root / idx_rel
                 if not (root / f"{index_prefix}/day_utc={day_utc}").is_dir():
@@ -8693,6 +9228,14 @@ def run_v2_aqilevels_integrity_checks(
                 debug_gaps.append(_v2_aqi_gap("debug_manifest_invalid_json", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                 continue
             bad = _validate_v2_aqi_manifest(payload=payload, profile="debug", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant)
+            bad.extend(
+                field for field, expected in {
+                    "day_utc": day_utc,
+                    "connector_id": str(connector_raw),
+                    "pollutant_code": pollutant,
+                }.items()
+                if field not in payload or str(payload.get(field)) != str(expected)
+            )
             if bad:
                 debug_gaps.append(_v2_aqi_gap("debug_manifest_schema_mismatch", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
             for entry in _manifest_files(payload):
@@ -8729,6 +9272,7 @@ def run_v2_aqilevels_integrity_checks(
             ))
 
     all_gaps = data_gaps + debug_gaps
+    _classify_v2_gaps(all_gaps)
     _enrich_v2_aqi_repair_plans(root=root, config=config, gaps=all_gaps)
     status = "fail" if any(g.get("severity") == "error" for g in all_gaps) else "ok"
     result = {

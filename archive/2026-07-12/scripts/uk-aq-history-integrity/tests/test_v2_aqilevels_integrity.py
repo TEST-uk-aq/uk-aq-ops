@@ -6,7 +6,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "bin" / "uk-aq-history-integrity.py"
 SPEC = importlib.util.spec_from_file_location("uk_aq_history_integrity_aqi", MODULE_PATH)
@@ -21,31 +20,9 @@ class V2AqiIntegrityTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.config = MODULE.resolve_history_path_config("v2", {})
-        self.parquet_reader = mock.patch.object(
-            MODULE,
-            "_read_parquet_partition_stats",
-            side_effect=self._mock_parquet_stats,
-        )
-        self.parquet_reader.start()
 
     def tearDown(self) -> None:
-        self.parquet_reader.stop()
         self.tmp.cleanup()
-
-    def _mock_parquet_stats(self, files) -> tuple[dict, None]:
-        paths = [str(path) for path in files]
-        joined = " ".join(paths)
-        if "connector_id=6" in joined:
-            counts = {301: 1}
-        elif "connector_id=1" in joined:
-            counts = {201: 1}
-        else:
-            counts = {101: 3}
-        return {
-            "row_count": sum(counts.values()), "timeseries_row_counts": counts,
-            "min_timeseries_id": min(counts), "max_timeseries_id": max(counts),
-            "min_timestamp_utc": None, "max_timestamp_utc": None,
-        }, None
 
     def _partition(self, day: str = "2026-06-11", connector: int = 7, pollutant: str = "pm25", profile: str = "data") -> Path:
         return self.root / f"history/v2/aqilevels/hourly/{profile}/day_utc={day}/connector_id={connector}/pollutant_code={pollutant}"
@@ -64,7 +41,7 @@ class V2AqiIntegrityTests(unittest.TestCase):
             (self.root / key).write_bytes(b"PAR1")
         if manifest:
             (part / "manifest.json").write_text(json.dumps({
-                "manifest_kind": "pollutant", "history_version": "v2", "domain": "aqilevels", "grain": "hourly", "profile": "data",
+                "history_version": "v2", "domain": "aqilevels", "grain": "hourly", "profile": "data",
                 "day_utc": day, "connector_id": 7, "pollutant_code": "pm25", "row_count": 3,
                 "source_row_count": 3, "file_count": 1, "timeseries_row_counts": {"101": 3},
                 "files": [{"key": key}],
@@ -77,51 +54,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
             latest_path = self.root / "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"
             latest_path.parent.mkdir(parents=True, exist_ok=True)
             latest_path.write_text(json.dumps({"latest": day}), encoding="utf-8")
-
-    def _write_parent_manifests(self, day: str = "2026-06-11") -> None:
-        day_dir = self.root / f"history/v2/aqilevels/hourly/data/day_utc={day}"
-        connector_payloads = []
-        for connector_dir in sorted(p for p in day_dir.glob("connector_id=*") if p.is_dir()):
-            children = []
-            for pollutant_dir in sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir()):
-                manifest_path = pollutant_dir / "manifest.json"
-                if not manifest_path.is_file():
-                    continue
-                try:
-                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(payload, dict):
-                    children.append(payload)
-            connector_id = int(connector_dir.name.split("=", 1)[1])
-            files = [entry for child in children for entry in child.get("files", [])]
-            connector_payload = {
-                "manifest_kind": "connector", "history_version": "v2", "domain": "aqilevels",
-                "grain": "hourly", "profile": "data", "day_utc": day, "connector_id": connector_id,
-                "pollutant_codes": [child["pollutant_code"] for child in children],
-                "row_count": sum(child.get("row_count", 0) for child in children),
-                "source_row_count": sum(child.get("source_row_count", 0) for child in children),
-                "file_count": len(files), "total_bytes": sum(entry.get("bytes", 0) for entry in files),
-                "files": files,
-                "child_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
-                "pollutant_manifests": [{"pollutant_code": child["pollutant_code"]} for child in children],
-            }
-            (connector_dir / "manifest.json").write_text(json.dumps(connector_payload), encoding="utf-8")
-            connector_payloads.append(connector_payload)
-        files = [entry for child in connector_payloads for entry in child.get("files", [])]
-        day_payload = {
-            "manifest_kind": "day", "history_version": "v2", "domain": "aqilevels",
-            "grain": "hourly", "profile": "data", "day_utc": day,
-            "connector_ids": [child["connector_id"] for child in connector_payloads],
-            "row_count": sum(child.get("row_count", 0) for child in connector_payloads),
-            "source_row_count": sum(child.get("source_row_count", 0) for child in connector_payloads),
-            "file_count": len(files), "total_bytes": sum(entry.get("bytes", 0) for entry in files),
-            "files": files,
-            "child_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
-            "connector_manifests": [{"connector_id": child["connector_id"]} for child in connector_payloads],
-        }
-        day_dir.mkdir(parents=True, exist_ok=True)
-        (day_dir / "manifest.json").write_text(json.dumps(day_payload), encoding="utf-8")
 
     def _write_observations(
         self,
@@ -146,17 +78,9 @@ class V2AqiIntegrityTests(unittest.TestCase):
         }), encoding="utf-8")
 
     def _run(self, **kwargs) -> dict:
-        from_day = kwargs.pop("from_day", "2026-06-11")
-        to_day = kwargs.pop("to_day", "2026-06-11")
-        refresh_parents = kwargs.pop("refresh_parents", True)
-        if refresh_parents:
-            for day in {from_day, to_day}:
-                day_dir = self.root / f"history/v2/aqilevels/hourly/data/day_utc={day}"
-                if day_dir.is_dir():
-                    self._write_parent_manifests(day)
         return MODULE.run_v2_aqilevels_integrity_checks(
-            r2_history_root=self.root, config=self.config, from_day=from_day,
-            to_day=to_day, **kwargs
+            r2_history_root=self.root, config=self.config, from_day=kwargs.pop("from_day", "2026-06-11"),
+            to_day=kwargs.pop("to_day", "2026-06-11"), **kwargs
         )
 
     def _gap_types(self, result: dict) -> set[str]:
@@ -336,32 +260,21 @@ class V2AqiIntegrityTests(unittest.TestCase):
         part6.mkdir(parents=True, exist_ok=True)
         key6 = f"history/v2/aqilevels/hourly/data/day_utc={day}/connector_id=6/pollutant_code=pm25/part-00000.parquet"
         (self.root / key6).write_bytes(b"PAR1")
-        (part6 / "manifest.json").write_text(json.dumps({
-            "manifest_kind": "pollutant", "history_version": "v2", "domain": "aqilevels",
-            "grain": "hourly", "profile": "data", "day_utc": day, "connector_id": 6,
-            "pollutant_code": "pm25", "files": [{"key": key6}], "file_count": 1,
-            "row_count": 1, "source_row_count": 1, "timeseries_row_counts": {"301": 1},
-        }), encoding="utf-8")
+        (part6 / "manifest.json").write_text(json.dumps({"files": [{"key": key6}], "row_count": 1, "timeseries_row_counts": {"301": 1}}), encoding="utf-8")
         idx6 = self._index(day=day, connector=6, pollutant="pm25")
         idx6.mkdir(parents=True, exist_ok=True)
         (idx6 / "manifest.json").write_text(json.dumps({"timeseries_row_counts": {"301": 1}}), encoding="utf-8")
         debug6 = self._partition(day=day, connector=6, pollutant="pm25", profile="debug")
         debug6.mkdir(parents=True, exist_ok=True)
         (debug6 / "manifest.json").write_text(json.dumps({
-            "manifest_kind": "pollutant", "history_version": "v2", "domain": "aqilevels", "grain": "hourly", "profile": "debug",
+            "history_version": "v2", "domain": "aqilevels", "grain": "hourly", "profile": "debug",
             "day_utc": day, "connector_id": 6, "pollutant_code": "pm25", "files": []
         }), encoding="utf-8")
         part1 = self._partition(day=day, connector=1, pollutant="o3")
         part1.mkdir(parents=True, exist_ok=True)
         key1 = f"history/v2/aqilevels/hourly/data/day_utc={day}/connector_id=1/pollutant_code=o3/part-00000.parquet"
         (self.root / key1).write_bytes(b"PAR1")
-        (part1 / "manifest.json").write_text(json.dumps({
-            "manifest_kind": "pollutant", "history_version": "v2", "domain": "aqilevels",
-            "grain": "hourly", "profile": "data", "day_utc": day, "connector_id": 1,
-            "pollutant_code": "o3", "files": [{"key": key1}], "file_count": 1,
-            "row_count": 1, "source_row_count": 1, "timeseries_row_counts": {"201": 1},
-        }), encoding="utf-8")
-        self._write_parent_manifests(day)
+        (part1 / "manifest.json").write_text(json.dumps({"files": [{"key": key1}], "row_count": 1, "timeseries_row_counts": {"201": 1}}), encoding="utf-8")
 
         result = MODULE.run_v2_aqilevels_integrity_checks(
             r2_history_root=self.root, config=self.config, from_day=day, to_day=day,

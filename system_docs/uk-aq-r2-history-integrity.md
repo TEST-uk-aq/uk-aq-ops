@@ -260,6 +260,34 @@ The current run order also includes:
 - an optional `--allow-stale-dropbox` override for manual recovery runs;
 - v2 connector/day hierarchy validation for both observations and AQI hourly data.
 
+### Phase 2 v2 validation contract
+
+The validator discovers actual scoped Dropbox folders and parquet files first.
+It does not use parent manifests as the child-discovery source. DuckDB reads the
+actual parquet content and returns whole-partition and per-timeseries counts;
+missing DuckDB support or unreadable parquet fails closed with an explicit gap.
+
+Comparisons remain separate in reports:
+
+```text
+source counts -> actual parquet
+actual parquet -> pollutant manifest
+pollutant manifests -> connector/day manifests
+```
+
+Source comparison reports source-only, R2-only, and unequal shared
+timeseries. Connector and day manifests are checked once per scoped parent and
+independently validate all supported representations, aggregates, parquet keys,
+timeseries ranges, timestamp ranges, and child hashes. Missing parents are
+reported as `connector_manifest_missing` and `day_manifest_missing`.
+
+Every finding carries a `fault_class`. A readable parquet partition with a
+missing or invalid manifest is classified as a pollutant manifest-only fault.
+The Phase 2 repair plan is ordered, deduplicated, and non-executing; each action
+uses `status=planned`, `executes=false`, `data_changes_required`,
+`requires_index_rebuild`, and sorted `gap_types`. O3 manifest-only findings do
+not queue AQI.
+
 Scheduled profiles require the latest attempt for daily task
 `ops.r2_history_dropbox_backup` to have status `Finished` for the integrity run
 date, with `finished_at` no later than the integrity start time. That workflow
