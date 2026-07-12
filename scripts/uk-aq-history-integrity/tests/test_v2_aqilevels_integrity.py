@@ -323,6 +323,23 @@ class V2AqiIntegrityTests(unittest.TestCase):
         self.assertEqual(gaps[0]["connector_id"], 6)
         self.assertTrue(gaps[0]["expected_path"].endswith(f"day_utc={day}/connector_id=6"))
 
+    def test_aqi_manifest_distinguishes_file_count_and_unlisted_parquet(self) -> None:
+        self._write_healthy()
+        extra = self._partition() / "part-extra.parquet"
+        extra.write_bytes(b"PAR1")
+        manifest_path = self._partition() / "manifest.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["file_count"] = 99
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = self._run()
+
+        self.assertIn("data_manifest_file_count_mismatch", self._gap_types(result))
+        self.assertIn("data_manifest_unlisted_parquet", self._gap_types(result))
+        self.assertNotIn("row_count_mismatch", self._gap_types(result))
+        self.assertIn("repair_plan", result)
+        self.assertTrue(any(step["kind"] == "aqi_pollutant_manifest_repair" for step in result["repair_plan"]))
+
 
 if __name__ == "__main__":
     unittest.main()

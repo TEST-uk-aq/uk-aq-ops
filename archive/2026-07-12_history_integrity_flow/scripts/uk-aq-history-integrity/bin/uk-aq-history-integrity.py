@@ -7127,24 +7127,6 @@ def _enrich_v2_observations_repair_plans(
     source_name = str((source_scope or {}).get("source") or "").strip().lower()
     sos_scope = source_name == "sos"
     index_gap_types = {
-        "connector_manifest_invalid_json",
-        "connector_manifest_pollutant_codes_missing_child",
-        "connector_manifest_pollutant_codes_stale_child",
-        "connector_manifest_child_manifests_missing_child",
-        "connector_manifest_child_manifests_stale_child",
-        "connector_manifest_pollutant_manifests_missing_child",
-        "connector_manifest_pollutant_manifests_stale_child",
-        "connector_manifest_files_missing_child",
-        "connector_manifest_files_stale_child",
-        "day_manifest_invalid_json",
-        "day_manifest_connector_ids_missing_child",
-        "day_manifest_connector_ids_stale_child",
-        "day_manifest_child_manifests_missing_child",
-        "day_manifest_child_manifests_stale_child",
-        "day_manifest_connector_manifests_missing_child",
-        "day_manifest_connector_manifests_stale_child",
-        "day_manifest_files_missing_child",
-        "day_manifest_files_stale_child",
         "index_day_dir_missing",
         "index_connector_dir_missing",
         "index_pollutant_dir_missing",
@@ -7164,51 +7146,18 @@ def _enrich_v2_observations_repair_plans(
         "data_manifest_invalid_json",
         "data_manifest_schema_mismatch",
         "data_manifest_empty",
-        "data_manifest_file_count_mismatch",
-        "data_manifest_listed_parquet_missing",
-        "data_manifest_unlisted_parquet",
-        "data_manifest_duplicate_file_key",
-        "data_manifest_timeseries_row_count_mismatch",
-        "data_manifest_total_bytes_mismatch",
         "parquet_missing",
         "parquet_empty_or_placeholder",
         "parquet_unreadable",
         "row_count_mismatch",
-        "data_manifest_row_count_mismatch",
         "source_r2_timeseries_row_mismatch",
         "pollutant_missing",
         "orphan_parquet_without_manifest",
-        "missing_pollutant_partitions",
-        "unexpected_connector_level_part_file",
     }
     for gap in gaps:
         gap_type = str(gap.get("gap_type") or "")
         day_utc = gap.get("day_utc")
         connector_id = gap.get("connector_id")
-        if gap_type.startswith("connector_manifest_"):
-            gap["suggested_repair"] = {
-                "kind": "observation_connector_manifest_repair",
-                "requires_index_rebuild": True,
-                "commands": [],
-                "steps": [
-                    "Rebuild the connector manifest from the live pollutant child manifests.",
-                    "Keep any sibling pollutant partitions that are already present.",
-                ],
-                "notes": "Connector-level hierarchy gaps are repairable by rebuilding the parent manifest only.",
-            }
-            continue
-        if gap_type.startswith("day_manifest_"):
-            gap["suggested_repair"] = {
-                "kind": "observation_day_manifest_repair",
-                "requires_index_rebuild": True,
-                "commands": [],
-                "steps": [
-                    "Rebuild the day manifest from the live connector child manifests.",
-                    "Keep any sibling connector partitions that are already present.",
-                ],
-                "notes": "Day-level hierarchy gaps are repairable by rebuilding the parent manifest only.",
-            }
-            continue
         if gap_type in index_gap_types:
             gap["suggested_repair"] = {
                 "kind": "rebuild_v2_observations_index_only",
@@ -7226,20 +7175,9 @@ def _enrich_v2_observations_repair_plans(
         elif gap_type in data_gap_types:
             gap["suggested_repair"] = {
                 "kind": (
-                    "observation_pollutant_manifest_repair"
-                    if gap_type in {
-                        "data_manifest_file_count_mismatch",
-                        "data_manifest_listed_parquet_missing",
-                        "data_manifest_unlisted_parquet",
-                        "data_manifest_duplicate_file_key",
-                        "data_manifest_timeseries_row_count_mismatch",
-                        "data_manifest_total_bytes_mismatch",
-                    }
-                    else (
-                        "uk_air_csv_to_v2_observations_backfill_required"
-                        if sos_scope
-                        else "source_to_v2_observations_backfill_required"
-                    )
+                    "uk_air_csv_to_v2_observations_backfill_required"
+                    if sos_scope
+                    else "source_to_v2_observations_backfill_required"
                 ),
                 "requires_index_rebuild": True,
                 "commands": [],
@@ -7250,18 +7188,7 @@ def _enrich_v2_observations_repair_plans(
                     (
                         "Use the cached annual UK-AIR CSV as the SOS observation source."
                         if sos_scope
-                        else (
-                            "Repair the pollutant manifest so it matches the live parquet set and row counts."
-                            if gap_type in {
-                                "data_manifest_file_count_mismatch",
-                                "data_manifest_listed_parquet_missing",
-                                "data_manifest_unlisted_parquet",
-                                "data_manifest_duplicate_file_key",
-                                "data_manifest_timeseries_row_count_mismatch",
-                                "data_manifest_total_bytes_mismatch",
-                            }
-                            else "Use the current connector source cache as the observation source."
-                        )
+                        else "Use the current connector source cache as the observation source."
                     ),
                     "Write the affected v2 observation partition through the existing source-to-R2 writer.",
                     "Rebuild the affected v2 observations _index_v2 manifests and verify source parity before AQI rebuild.",
@@ -7270,197 +7197,9 @@ def _enrich_v2_observations_repair_plans(
                     "The executable --run-backfill path reads the cached UK-AIR annual CSV "
                     "as the sole SOS historical observation source."
                     if sos_scope
-                    else (
-                        "Pollutant manifest gaps are repaired by rebuilding the manifest from live parquet files."
-                        if gap_type in {
-                            "data_manifest_file_count_mismatch",
-                            "data_manifest_listed_parquet_missing",
-                            "data_manifest_unlisted_parquet",
-                            "data_manifest_duplicate_file_key",
-                            "data_manifest_timeseries_row_count_mismatch",
-                            "data_manifest_total_bytes_mismatch",
-                        }
-                        else "The executable --run-backfill path uses the current connector source adapter."
-                    )
+                    else "The executable --run-backfill path uses the current connector source adapter."
                 ),
             }
-
-
-def _manifest_codes_from_child_list(payload: Mapping[str, Any], field: str, id_key: str) -> set[str]:
-    raw_children = payload.get(field)
-    if not isinstance(raw_children, list):
-        return set()
-    out: set[str] = set()
-    for child in raw_children:
-        if not isinstance(child, dict):
-            continue
-        value = str(child.get(id_key) or "").strip()
-        if value:
-            out.add(value)
-    return out
-
-
-def _manifest_codes_from_scalar_list(payload: Mapping[str, Any], field: str) -> set[str]:
-    raw = payload.get(field)
-    if not isinstance(raw, list):
-        return set()
-    return {str(value).strip() for value in raw if str(value or "").strip()}
-
-
-def _manifest_pollutant_codes_from_files(payload: Mapping[str, Any]) -> set[str]:
-    out: set[str] = set()
-    for entry in _manifest_files(payload):
-        if not isinstance(entry, dict):
-            continue
-        code = str(entry.get("pollutant_code") or "").strip()
-        if code:
-            out.add(code)
-        for value in entry.get("pollutant_codes") or []:
-            code = str(value or "").strip()
-            if code:
-                out.add(code)
-        key = str(entry.get("key") or "").strip()
-        match = re.search(r"/pollutant_code=([^/]+)/", key)
-        if match:
-            out.add(match.group(1))
-    return out
-
-
-def _manifest_connector_ids_from_files(payload: Mapping[str, Any]) -> set[str]:
-    out: set[str] = set()
-    for entry in _manifest_files(payload):
-        if not isinstance(entry, dict):
-            continue
-        value = str(entry.get("connector_id") or "").strip()
-        if value:
-            out.add(value)
-        for raw in entry.get("connector_ids") or []:
-            value = str(raw or "").strip()
-            if value:
-                out.add(value)
-        key = str(entry.get("key") or "").strip()
-        match = re.search(r"/connector_id=([^/]+)/", key)
-        if match:
-            out.add(match.group(1))
-    return out
-
-
-def _append_field_set_gaps(
-    gaps: list[dict[str, Any]],
-    *,
-    domain: str,
-    field_label: str,
-    actual: set[str],
-    represented: set[str],
-    day_utc: str,
-    connector_id: int | str | None = None,
-    expected_path: str,
-    child_key: str,
-) -> None:
-    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
-    missing = sorted(actual - represented)
-    stale = sorted(represented - actual)
-    if missing:
-        kwargs: dict[str, Any] = {
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "expected_path": expected_path,
-            "related_paths": [f"{child_key}={value}" for value in missing],
-        }
-        gaps.append(gap_fn(f"{field_label}_missing_child", **kwargs))
-    if stale:
-        kwargs = {
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "expected_path": expected_path,
-            "related_paths": [f"{child_key}={value}" for value in stale],
-        }
-        gaps.append(gap_fn(f"{field_label}_stale_child", **kwargs))
-
-
-def _validate_v2_parent_hierarchy(
-    *,
-    root: Path,
-    data_prefix: str,
-    day_utc: str,
-    connector_dir: Path | None,
-    day_dir: Path,
-    gaps: list[dict[str, Any]],
-    domain: str,
-) -> None:
-    """Validate connector/day parent representations against live child manifests."""
-    gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
-    if connector_dir is not None:
-        connector_raw = connector_dir.name.split("=", 1)[1]
-        connector_rel = f"{data_prefix}/day_utc={day_utc}/{connector_dir.name}/manifest.json"
-        connector_manifest = root / connector_rel
-        actual_pollutants = {
-            p.name.split("=", 1)[1]
-            for p in connector_dir.glob("pollutant_code=*")
-            if p.is_dir() and (p / "manifest.json").is_file()
-        }
-        if connector_manifest.is_file():
-            payload, err = _load_json_file(connector_manifest)
-            if err or not isinstance(payload, dict):
-                gaps.append(
-                    gap_fn(
-                        "connector_manifest_invalid_json",
-                        day_utc=day_utc,
-                        connector_id=connector_raw,
-                        expected_path=connector_rel,
-                    )
-                )
-            else:
-                representations = {
-                    "connector_manifest_pollutant_codes": _manifest_codes_from_scalar_list(payload, "pollutant_codes"),
-                    "connector_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "pollutant_code"),
-                    "connector_manifest_pollutant_manifests": _manifest_codes_from_child_list(payload, "pollutant_manifests", "pollutant_code"),
-                    "connector_manifest_files": _manifest_pollutant_codes_from_files(payload),
-                }
-                for label, represented in representations.items():
-                    _append_field_set_gaps(
-                        gaps,
-                        domain=domain,
-                        field_label=label,
-                        actual=actual_pollutants,
-                        represented=represented,
-                        day_utc=day_utc,
-                        connector_id=connector_raw,
-                        expected_path=connector_rel,
-                        child_key="pollutant_code",
-                    )
-    if connector_dir is not None:
-        return
-
-    day_rel = f"{data_prefix}/day_utc={day_utc}/manifest.json"
-    day_manifest = root / day_rel
-    actual_connectors = {
-        p.name.split("=", 1)[1]
-        for p in day_dir.glob("connector_id=*")
-        if p.is_dir() and (p / "manifest.json").is_file()
-    }
-    if day_manifest.is_file():
-        payload, err = _load_json_file(day_manifest)
-        if err or not isinstance(payload, dict):
-            gaps.append(gap_fn("day_manifest_invalid_json", day_utc=day_utc, expected_path=day_rel))
-        else:
-            representations = {
-                "day_manifest_connector_ids": _manifest_codes_from_scalar_list(payload, "connector_ids"),
-                "day_manifest_child_manifests": _manifest_codes_from_child_list(payload, "child_manifests", "connector_id"),
-                "day_manifest_connector_manifests": _manifest_codes_from_child_list(payload, "connector_manifests", "connector_id"),
-                "day_manifest_files": _manifest_connector_ids_from_files(payload),
-            }
-            for label, represented in representations.items():
-                _append_field_set_gaps(
-                    gaps,
-                    domain=domain,
-                    field_label=label,
-                    actual=actual_connectors,
-                    represented=represented,
-                    day_utc=day_utc,
-                    expected_path=day_rel,
-                    child_key="connector_id",
-                )
 
 
 def _manifest_files(payload: Any) -> list[dict[str, Any]]:
@@ -7814,36 +7553,8 @@ def run_v2_observations_integrity_checks(
                         if schema_bad:
                             gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=schema_bad))
                         files = _manifest_files(payload)
-                        local_parquet_keys = {
-                            str(p.relative_to(root))
-                            for p in sorted(local_parquets)
-                        }
-                        listed_keys: list[str] = []
-                        duplicate_keys: set[str] = set()
-                        for entry in files:
-                            if isinstance(entry, dict) and str(entry.get("key") or "").strip():
-                                key_str = str(entry.get("key")).strip().lstrip("/")
-                                if key_str in listed_keys:
-                                    duplicate_keys.add(key_str)
-                                listed_keys.append(key_str)
-                        listed_key_set = set(listed_keys)
-                        if duplicate_keys:
-                            gaps.append(_v2_obs_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
                         if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(files):
-                            gaps.append(_v2_obs_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
-                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and payload.get("file_count") != len(local_parquet_keys):
-                            gaps.append(_v2_obs_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match actual parquet file count"]))
-                        for missing_key in sorted(listed_key_set - local_parquet_keys):
-                            gaps.append(_v2_obs_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
-                        for unlisted_key in sorted(local_parquet_keys - listed_key_set):
-                            gaps.append(_v2_obs_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
-                        if "total_bytes" in payload and isinstance(payload.get("total_bytes"), int):
-                            actual_bytes = sum((root / key).stat().st_size for key in local_parquet_keys if (root / key).is_file())
-                            if int(payload.get("total_bytes") or 0) != actual_bytes:
-                                gaps.append(_v2_obs_gap("data_manifest_total_bytes_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"manifest_total_bytes={payload.get('total_bytes')} actual_total_bytes={actual_bytes}"]))
-                        ts_sum = sum(_normalize_timeseries_row_counts(payload.get("timeseries_row_counts")).values())
-                        if "row_count" in payload and isinstance(payload.get("row_count"), int) and ts_sum != int(payload.get("row_count") or 0):
-                            gaps.append(_v2_obs_gap("data_manifest_timeseries_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"row_count={payload.get('row_count')} timeseries_sum={ts_sum}"]))
+                            gaps.append(_v2_obs_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
                         if "row_count" in payload and (not isinstance(payload.get("row_count"), int) or int(payload.get("row_count") or 0) <= 0):
                             gaps.append(_v2_obs_gap("data_manifest_empty", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                         if "source_row_count" in payload and (not isinstance(payload.get("source_row_count"), int) or int(payload.get("source_row_count") or 0) <= 0):
@@ -7903,24 +7614,6 @@ def run_v2_observations_integrity_checks(
                         )
                         if stale_gap is not None:
                             gaps.append(stale_gap)
-                _validate_v2_parent_hierarchy(
-                    root=root,
-                    data_prefix=data_prefix,
-                    day_utc=day_utc,
-                    connector_dir=connector_dir,
-                    day_dir=day_dir,
-                    gaps=gaps,
-                    domain="observations",
-                )
-        _validate_v2_parent_hierarchy(
-            root=root,
-            data_prefix=data_prefix,
-            day_utc=day_utc,
-            connector_dir=None,
-            day_dir=day_dir,
-            gaps=gaps,
-            domain="observations",
-        )
 
     _enrich_v2_observations_repair_plans(
         root=root,
@@ -7928,13 +7621,7 @@ def run_v2_observations_integrity_checks(
         source_scope=source_scope,
     )
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
-    result = {
-        "status": status,
-        "checked_partitions": checked,
-        "gap_count": len(gaps),
-        "gaps": gaps,
-        "repair_plan": build_v2_repair_plan(observation_gaps=gaps, conn=conn),
-    }
+    result = {"status": status, "checked_partitions": checked, "gap_count": len(gaps), "gaps": gaps}
     if source_scope is not None:
         result["source_scope"] = source_scope
     if log:
@@ -8044,21 +7731,12 @@ def _enrich_v2_aqi_repair_plans(
         "data_manifest_invalid_json",
         "data_manifest_schema_mismatch",
         "data_manifest_empty",
-        "data_manifest_file_count_mismatch",
-        "data_manifest_listed_parquet_missing",
-        "data_manifest_unlisted_parquet",
-        "data_manifest_duplicate_file_key",
-        "data_manifest_timeseries_row_count_mismatch",
-        "data_manifest_total_bytes_mismatch",
         "parquet_missing",
         "parquet_empty_or_placeholder",
         "parquet_unreadable",
         "row_count_mismatch",
-        "data_manifest_row_count_mismatch",
         "pollutant_missing",
         "orphan_parquet_without_manifest",
-        "missing_pollutant_partitions",
-        "unexpected_connector_level_part_file",
     }
     debug_gap_prefixes = ("debug_",)
     for gap in gaps:
@@ -8088,28 +7766,6 @@ def _enrich_v2_aqi_repair_plans(
                     "Rebuild only the v2 AQI hourly data _index_v2 timeseries manifest for the affected day/connector/pollutant.",
                 ],
                 "notes": "No exact _index_v2 rebuild command is emitted because the command contract remains unresolved.",
-            }
-        elif gap_type.startswith("connector_manifest_"):
-            gap["suggested_repair"] = {
-                "kind": "aqi_connector_manifest_repair",
-                "requires_index_rebuild": True,
-                "commands": [],
-                "steps": [
-                    "Rebuild the AQI connector manifest from the live pollutant child manifests.",
-                    "Keep any sibling pollutant partitions that are already present.",
-                ],
-                "notes": "Connector-level AQI hierarchy gaps are repairable by rebuilding the parent manifest only.",
-            }
-        elif gap_type.startswith("day_manifest_"):
-            gap["suggested_repair"] = {
-                "kind": "aqi_day_manifest_repair",
-                "requires_index_rebuild": True,
-                "commands": [],
-                "steps": [
-                    "Rebuild the AQI day manifest from the live connector child manifests.",
-                    "Keep any sibling connector partitions that are already present.",
-                ],
-                "notes": "Day-level AQI hierarchy gaps are repairable by rebuilding the parent manifest only.",
             }
         elif gap_type.startswith(debug_gap_prefixes):
             gap["suggested_repair"] = {
@@ -8151,281 +7807,16 @@ def _enrich_v2_aqi_repair_plans(
             }
         elif gap_type in data_gap_types:
             gap["suggested_repair"] = {
-                "kind": (
-                    "aqi_pollutant_manifest_repair"
-                    if gap_type in {
-                        "data_manifest_file_count_mismatch",
-                        "data_manifest_listed_parquet_missing",
-                        "data_manifest_unlisted_parquet",
-                        "data_manifest_duplicate_file_key",
-                        "data_manifest_timeseries_row_count_mismatch",
-                        "data_manifest_total_bytes_mismatch",
-                    }
-                    else "repair_v2_observations_before_v2_aqi"
-                ),
+                "kind": "repair_v2_observations_before_v2_aqi",
                 "requires_index_rebuild": True,
                 "commands": [],
                 "steps": [
-                    (
-                        "Repair the AQI pollutant manifest so it matches the live parquet set and row counts."
-                        if gap_type in {
-                            "data_manifest_file_count_mismatch",
-                            "data_manifest_listed_parquet_missing",
-                            "data_manifest_unlisted_parquet",
-                            "data_manifest_duplicate_file_key",
-                            "data_manifest_timeseries_row_count_mismatch",
-                            "data_manifest_total_bytes_mismatch",
-                        }
-                        else "Repair or generate the missing v2 observations partition first."
-                    ),
+                    "Repair or generate the missing v2 observations partition first.",
                     "Then rebuild v2 AQI hourly data from v2 observations.",
                     "Finally rebuild the affected v2 AQI hourly data _index_v2 manifests.",
                 ],
-                "notes": (
-                    "Manifest-only AQI gaps are repairable by rebuilding the pollutant manifest."
-                    if gap_type in {
-                        "data_manifest_file_count_mismatch",
-                        "data_manifest_listed_parquet_missing",
-                        "data_manifest_unlisted_parquet",
-                        "data_manifest_duplicate_file_key",
-                        "data_manifest_timeseries_row_count_mismatch",
-                        "data_manifest_total_bytes_mismatch",
-                    }
-                    else "No Supabase/prune/backfill command is emitted because the exact v2 write contract has not been confirmed."
-                ),
+                "notes": "No Supabase/prune/backfill command is emitted because the exact v2 write contract has not been confirmed.",
             }
-
-
-def build_v2_repair_plan(
-    *,
-    observation_gaps: Iterable[Mapping[str, Any]] = (),
-    aqi_gaps: Iterable[Mapping[str, Any]] = (),
-    conn: sqlite3.Connection | None = None,
-) -> list[dict[str, Any]]:
-    """Summarize v2 repairs in operator order without executing writes."""
-    eligible_pollutants_by_connector: dict[int, set[str] | None] = {}
-
-    def eligible_for(connector_id: int | str | None, pollutant_code: str | None) -> bool:
-        if not pollutant_code:
-            return False
-        code = str(pollutant_code).strip().lower()
-        if code not in {"pm25", "pm10", "no2"}:
-            return False
-        if connector_id is None:
-            return True
-        try:
-            cid = int(str(connector_id))
-        except (TypeError, ValueError):
-            return False
-        if cid not in eligible_pollutants_by_connector:
-            if conn is None:
-                eligible_pollutants_by_connector[cid] = {"pm25", "pm10", "no2"}
-            else:
-                eligible_pollutants_by_connector[cid] = _active_aqi_eligible_pollutants_for_connector(conn, connector_id=cid)
-        eligible = eligible_pollutants_by_connector[cid]
-        return eligible is None or code in eligible
-
-    actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
-
-    def add_action(
-        kind: str,
-        *,
-        gap: Mapping[str, Any],
-        requires_index_rebuild: bool = False,
-        executes: bool = False,
-        operator_action_required: bool = False,
-        notes: str | None = None,
-    ) -> None:
-        day_utc = gap.get("day_utc")
-        connector_id = gap.get("connector_id")
-        pollutant_code = gap.get("pollutant_code")
-        key = (kind, str(day_utc or ""), connector_id, str(pollutant_code or "") or None)
-        entry = actions.get(key)
-        gap_type = str(gap.get("gap_type") or "")
-        if entry is None:
-            entry = {
-                "kind": kind,
-                "status": "planned_only",
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "requires_index_rebuild": bool(requires_index_rebuild),
-                "executes": bool(executes),
-                "operator_action_required": bool(operator_action_required),
-                "gap_types": [gap_type] if gap_type else [],
-                "commands": [],
-                "notes": notes or "",
-            }
-            actions[key] = entry
-        else:
-            if gap_type and gap_type not in entry["gap_types"]:
-                entry["gap_types"].append(gap_type)
-            entry["requires_index_rebuild"] = bool(entry["requires_index_rebuild"] or requires_index_rebuild)
-            entry["executes"] = bool(entry["executes"] or executes)
-            entry["operator_action_required"] = bool(entry["operator_action_required"] or operator_action_required)
-            if notes and notes not in str(entry.get("notes") or ""):
-                entry["notes"] = f"{entry['notes']}; {notes}" if entry.get("notes") else notes
-
-    for gap in observation_gaps:
-        gap_type = str(gap.get("gap_type") or "")
-        if gap_type.startswith("connector_manifest_"):
-            add_action(
-                "observation_connector_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild the connector manifest from all valid live-R2 pollutant children without dropping siblings.",
-            )
-        elif gap_type.startswith("day_manifest_"):
-            add_action(
-                "observation_day_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild the day manifest from all valid live-R2 connector children without dropping siblings.",
-            )
-        elif gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
-            add_action(
-                "observation_index_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild the observation index metadata for the affected day/connector/pollutant.",
-            )
-        elif gap_type in {
-            "data_manifest_file_count_mismatch",
-            "data_manifest_unlisted_parquet",
-            "data_manifest_listed_parquet_missing",
-            "data_manifest_duplicate_file_key",
-            "data_manifest_timeseries_row_count_mismatch",
-            "data_manifest_total_bytes_mismatch",
-            "data_manifest_row_count_mismatch",
-        }:
-            add_action(
-                "observation_pollutant_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Repair the pollutant manifest so it matches the actual live-R2 parquet set and row counts.",
-            )
-        elif gap_type in {
-            "data_manifest_missing",
-            "data_manifest_invalid_json",
-            "data_manifest_schema_mismatch",
-            "data_manifest_empty",
-            "parquet_missing",
-            "parquet_empty_or_placeholder",
-            "parquet_unreadable",
-            "row_count_mismatch",
-            "source_r2_timeseries_row_mismatch",
-            "pollutant_missing",
-            "orphan_parquet_without_manifest",
-            "missing_pollutant_partitions",
-            "unexpected_connector_level_part_file",
-        }:
-            add_action(
-                "observation_data_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Repair the underlying observation data partition before rebuilding manifests and indexes.",
-            )
-            if eligible_for(gap.get("connector_id"), gap.get("pollutant_code")) and gap_type in {
-                "data_manifest_missing",
-                "data_manifest_invalid_json",
-                "data_manifest_schema_mismatch",
-                "data_manifest_empty",
-                "parquet_missing",
-                "parquet_empty_or_placeholder",
-                "parquet_unreadable",
-                "row_count_mismatch",
-                "data_manifest_row_count_mismatch",
-                "source_r2_timeseries_row_mismatch",
-                "pollutant_missing",
-                "orphan_parquet_without_manifest",
-            }:
-                add_action(
-                    "aqi_rebuild",
-                    gap=gap,
-                    requires_index_rebuild=True,
-                    notes="Queue AQI rebuilding only because the observation data changed for an AQI-enabled pollutant.",
-                )
-
-    for gap in aqi_gaps:
-        gap_type = str(gap.get("gap_type") or "")
-        if gap_type.startswith("connector_manifest_"):
-            add_action(
-                "aqi_connector_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild the AQI connector manifest from all valid live-R2 pollutant children without dropping siblings.",
-            )
-        elif gap_type.startswith("day_manifest_"):
-            add_action(
-                "aqi_day_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild the AQI day manifest from all valid live-R2 connector children without dropping siblings.",
-            )
-        elif gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
-            add_action(
-                "aqi_index_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild AQI index metadata for the affected day/connector/pollutant.",
-            )
-        elif gap_type in {
-            "data_manifest_file_count_mismatch",
-            "data_manifest_unlisted_parquet",
-            "data_manifest_listed_parquet_missing",
-            "data_manifest_duplicate_file_key",
-            "data_manifest_timeseries_row_count_mismatch",
-            "data_manifest_total_bytes_mismatch",
-            "data_manifest_row_count_mismatch",
-        }:
-            add_action(
-                "aqi_pollutant_manifest_repair",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Repair the AQI pollutant manifest so it matches the actual live-R2 parquet set and row counts.",
-            )
-        elif gap_type in {
-            "data_manifest_missing",
-            "data_manifest_invalid_json",
-            "data_manifest_schema_mismatch",
-            "data_manifest_empty",
-            "parquet_missing",
-            "parquet_empty_or_placeholder",
-            "parquet_unreadable",
-            "row_count_mismatch",
-            "pollutant_missing",
-            "orphan_parquet_without_manifest",
-        }:
-            add_action(
-                "aqi_rebuild",
-                gap=gap,
-                requires_index_rebuild=True,
-                notes="Rebuild AQI data only where the AQI partition itself is stale or incomplete.",
-            )
-
-    order = [
-        "observation_data_repair",
-        "observation_pollutant_manifest_repair",
-        "observation_connector_manifest_repair",
-        "observation_day_manifest_repair",
-        "observation_index_repair",
-        "aqi_rebuild",
-        "aqi_pollutant_manifest_repair",
-        "aqi_connector_manifest_repair",
-        "aqi_day_manifest_repair",
-        "aqi_index_repair",
-        "source_mapping_issue",
-    ]
-    position = {kind: idx for idx, kind in enumerate(order)}
-    return sorted(
-        actions.values(),
-        key=lambda entry: (
-            position.get(str(entry.get("kind") or ""), 999),
-            str(entry.get("day_utc") or ""),
-            int(entry["connector_id"]) if str(entry.get("connector_id") or "").isdigit() else -1,
-            str(entry.get("pollutant_code") or ""),
-        ),
-    )
 
 
 def _is_positive_int(value: Any) -> bool:
@@ -8576,40 +7967,12 @@ def run_v2_aqilevels_integrity_checks(
                         if bad:
                             data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=bad))
                         files = _manifest_files(payload)
-                        local_parquet_keys = {
-                            str(p.relative_to(root))
-                            for p in sorted(local_parquets)
-                        }
-                        listed_keys: list[str] = []
-                        duplicate_keys: set[str] = set()
-                        for entry in files:
-                            if isinstance(entry, dict) and str(entry.get("key") or "").strip():
-                                key_str = str(entry.get("key")).strip().lstrip("/")
-                                if key_str in listed_keys:
-                                    duplicate_keys.add(key_str)
-                                listed_keys.append(key_str)
-                        listed_key_set = set(listed_keys)
-                        if duplicate_keys:
-                            data_gaps.append(_v2_aqi_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
                         if "file_count" in payload and isinstance(payload.get("file_count"), int) and not isinstance(payload.get("file_count"), bool) and payload.get("file_count") != len(files):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
-                        if "file_count" in payload and isinstance(payload.get("file_count"), int) and not isinstance(payload.get("file_count"), bool) and payload.get("file_count") != len(local_parquet_keys):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_file_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match actual parquet file count"]))
-                        for missing_key in sorted(listed_key_set - local_parquet_keys):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
-                        for unlisted_key in sorted(local_parquet_keys - listed_key_set):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
-                        if "total_bytes" in payload and isinstance(payload.get("total_bytes"), int):
-                            actual_bytes = sum((root / key).stat().st_size for key in local_parquet_keys if (root / key).is_file())
-                            if int(payload.get("total_bytes") or 0) != actual_bytes:
-                                data_gaps.append(_v2_aqi_gap("data_manifest_total_bytes_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"manifest_total_bytes={payload.get('total_bytes')} actual_total_bytes={actual_bytes}"]))
-                        ts_sum = sum(_normalize_timeseries_row_counts(payload.get("timeseries_row_counts")).values())
-                        if "row_count" in payload and isinstance(payload.get("row_count"), int) and not isinstance(payload.get("row_count"), bool) and ts_sum != int(payload.get("row_count") or 0):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_timeseries_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"row_count={payload.get('row_count')} timeseries_sum={ts_sum}"]))
+                            data_gaps.append(_v2_aqi_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["file_count does not match files[] length"]))
                         if "row_count" in payload and not _is_positive_int(payload.get("row_count")):
                             data_gaps.append(_v2_aqi_gap("data_manifest_empty", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                         if "source_row_count" in payload and not _is_positive_int(payload.get("source_row_count")):
-                            data_gaps.append(_v2_aqi_gap("data_manifest_row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
+                            data_gaps.append(_v2_aqi_gap("row_count_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["source_row_count is not a positive integer"]))
                         if "timeseries_row_counts" in payload and not payload.get("timeseries_row_counts"):
                             data_gaps.append(_v2_aqi_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                         for entry in files:
@@ -8644,24 +8007,6 @@ def run_v2_aqilevels_integrity_checks(
                         data_gaps.append(_v2_aqi_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                     elif not idx_payload.get("timeseries_row_counts"):
                         data_gaps.append(_v2_aqi_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-            _validate_v2_parent_hierarchy(
-                root=root,
-                data_prefix=data_prefix,
-                day_utc=day_utc,
-                connector_dir=connector_dir,
-                day_dir=day_dir,
-                gaps=data_gaps,
-                domain="aqilevels",
-            )
-        _validate_v2_parent_hierarchy(
-            root=root,
-            data_prefix=data_prefix,
-            day_utc=day_utc,
-            connector_dir=None,
-            day_dir=day_dir,
-            gaps=data_gaps,
-            domain="aqilevels",
-        )
 
     debug_status = "skipped"
     if check_aqi_debug:
@@ -8723,7 +8068,6 @@ def run_v2_aqilevels_integrity_checks(
         "observation_coverage_checked": observation_coverage_checked,
         "gap_count": len(data_gaps),
         "gaps": data_gaps,
-        "repair_plan": build_v2_repair_plan(aqi_gaps=data_gaps, conn=conn),
         "debug": {
             "checked": bool(check_aqi_debug),
             "required": bool(require_aqi_debug),
@@ -12216,11 +11560,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip Phase 6.5 Pass B source-vs-R2 count cross-check (debug/recovery).",
     )
-    p.add_argument(
-        "--allow-stale-dropbox",
-        action="store_true",
-        help="Allow the daily task backup gate to proceed even when the Dropbox backup is not yet ready.",
-    )
     default_history_version = os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_VERSION", "v1")
     p.add_argument(
         "--history-version",
@@ -12244,90 +11583,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Treat missing/invalid v2 AQI hourly debug partitions as errors (default false; env UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG).",
     )
     return p.parse_args(argv)
-
-
-def check_dropbox_backup_ready(
-    *,
-    supabase_url: str | None,
-    service_role_key: str | None,
-    task_keys: list[str],
-    scheduled_for_date: str,
-    integrity_started_at_utc: str,
-    allow_stale_dropbox: bool = False,
-    rpc_name: str = "uk_aq_rpc_daily_task_backup_readiness",
-) -> dict[str, Any]:
-    summary: dict[str, Any] = {
-        "backup_gate_checked": True,
-        "backup_ready": False,
-        "backup_task_keys": list(task_keys),
-        "backup_scheduled_for_date": scheduled_for_date,
-        "backup_completed_at": None,
-        "allow_stale_dropbox": bool(allow_stale_dropbox),
-        "blocked_reason": None,
-        "tasks": [],
-    }
-    if allow_stale_dropbox:
-        summary["backup_ready"] = True
-        summary["blocked_reason"] = "allow_stale_dropbox_override"
-        return summary
-    if not task_keys:
-        summary["blocked_reason"] = "no_required_backup_task_keys_configured"
-        return summary
-    if not supabase_url or not service_role_key:
-        summary["blocked_reason"] = "supabase_credentials_unavailable"
-        return summary
-
-    endpoint = supabase_url.rstrip("/") + f"/rest/v1/rpc/{rpc_name}"
-    payload = json.dumps(
-        {
-            "p_scheduled_for_date": scheduled_for_date,
-            "p_task_keys": task_keys,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        method="POST",
-        headers={
-            "apikey": service_role_key,
-            "Authorization": f"Bearer {service_role_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8")
-            data = json.loads(body) if body else {}
-    except Exception as exc:
-        summary["blocked_reason"] = f"daily_task_health_query_failed:{exc}"
-        return summary
-
-    if isinstance(data, list) and data:
-        data = data[0]
-    if isinstance(data, dict):
-        tasks = data.get("tasks") if isinstance(data.get("tasks"), list) else []
-        summary["tasks"] = tasks
-        completed = [
-            str(
-                task.get("completed_at")
-                or task.get("finished_at_utc")
-                or task.get("completed_at_utc")
-                or ""
-            )
-            for task in tasks
-            if isinstance(task, dict)
-        ]
-        summary["backup_completed_at"] = max([value for value in completed if value] or [str(data.get("backup_completed_at") or "")]) or None
-        ready = bool(data.get("backup_ready") or data.get("ready"))
-        if ready and summary["backup_completed_at"] and summary["backup_completed_at"] > integrity_started_at_utc:
-            ready = False
-            summary["blocked_reason"] = "backup_completed_after_integrity_started"
-        summary["backup_ready"] = ready
-        if not ready and not summary["blocked_reason"]:
-            summary["blocked_reason"] = str(data.get("blocked_reason") or "backup_not_ready")
-    else:
-        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
-    return summary
 
 
 def _parse_env_assignment_line(raw_line: str) -> tuple[str, str] | None:
@@ -13533,20 +12788,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
         if snap.get("error"):
             lines.append(f"- Error:         {snap['error']}")
         lines.append("")
-    backup = s.get("backup_readiness") or {}
-    if backup:
-        lines.extend([
-            "## Dropbox backup readiness",
-            "",
-            f"- Gate checked: {bool(backup.get('backup_gate_checked'))}",
-            f"- Ready: {backup.get('backup_ready')}",
-            f"- Required task keys: {', '.join(backup.get('backup_task_keys') or [])}",
-            f"- Scheduled date: {backup.get('backup_scheduled_for_date') or '(none)'}",
-            f"- Completed at: {backup.get('backup_completed_at') or '(none)'}",
-            f"- Allow stale Dropbox: {bool(backup.get('allow_stale_dropbox'))}",
-            f"- Blocked reason: {backup.get('blocked_reason') or '(none)'}",
-            "",
-        ])
     lookup_counts = s.get("lookup_source_counts") or {}
     if lookup_counts:
         lines.extend([
@@ -14083,62 +13324,6 @@ def main(argv: list[str]) -> int:
     daily_task_health_run_id: str | None = None
     daily_task_scheduled_for_date = started_at.date().isoformat()
     daily_task_platform_run_id = f"{args.env}:{run_compact}"
-    backup_gate_summary: dict[str, Any] = {
-        "backup_gate_checked": False,
-        "backup_ready": None,
-        "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-    }
-    if args.profile != "manual":
-        task_keys = [
-            part.strip()
-            for part in str(
-                os.environ.get(
-                    "UK_AQ_HISTORY_INTEGRITY_BACKUP_TASK_KEYS",
-                    "r2_backup_inventory,r2_history_dropbox_sync",
-                )
-            ).split(",")
-            if part.strip()
-        ]
-        backup_gate_summary = check_dropbox_backup_ready(
-            supabase_url=os.environ.get("SUPABASE_URL") or os.environ.get("UK_AQ_SUPABASE_URL"),
-            service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("UK_AQ_SUPABASE_SERVICE_ROLE_KEY"),
-            task_keys=task_keys,
-            scheduled_for_date=daily_task_scheduled_for_date,
-            integrity_started_at_utc=started_iso,
-            allow_stale_dropbox=bool(args.allow_stale_dropbox),
-            rpc_name=str(
-                os.environ.get(
-                    "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
-                    "uk_aq_rpc_daily_task_backup_readiness",
-                )
-            ),
-        )
-        log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
-        if not backup_gate_summary.get("backup_ready"):
-            log.error("backup gate blocked before Dropbox history scan: %s", backup_gate_summary.get("blocked_reason"))
-            summary = {
-                "env": args.env,
-                "profile": args.profile,
-                "source": args.source,
-                "from_day": args.from_day,
-                "to_day": args.to_day,
-                "started_at_utc": started_iso,
-                "finished_at_utc": fmt_iso(utc_now()),
-                "status": "blocked_backup_not_ready",
-                "dry_run": bool(args.dry_run),
-                "check_only": bool(args.check_only),
-                "run_backfill": bool(args.run_backfill),
-                "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-                "log_path": str(log_path),
-                "history_version_mode": history_version_mode,
-                "checked_versions": checked_history_versions,
-                "history_path_configs": serialized_history_path_configs,
-                "backup_readiness": backup_gate_summary,
-                "metrics": {},
-            }
-            write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
-            return 2
     if daily_task_health_enabled:
         start_summary = {
             "env": args.env,
@@ -14150,10 +13335,8 @@ def main(argv: list[str]) -> int:
             "dry_run": bool(args.dry_run),
             "run_backfill": bool(args.run_backfill),
             "skip_cross_check": bool(args.skip_cross_check),
-            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
             "status": "started",
             "log_path": str(log_path),
-            "backup_readiness": backup_gate_summary,
         }
         try:
             daily_task_health_run_id = _daily_task_health_start(
@@ -15021,8 +14204,6 @@ def main(argv: list[str]) -> int:
             "force_snapshot_import": args.force_snapshot_import,
             "skip_snapshot_import": args.skip_snapshot_import,
             "skip_cross_check": args.skip_cross_check,
-            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-            "backup_readiness": backup_gate_summary,
             "max_download_mb": args.max_download_mb,
             "max_runtime_minutes": args.max_runtime_minutes,
             "started_at_utc": started_iso,
@@ -15073,7 +14254,6 @@ def main(argv: list[str]) -> int:
                 "skip_cross_check": bool(args.skip_cross_check),
                 "integrity_run_id": run_id,
                 "status": status,
-                "allow_stale_dropbox": bool(args.allow_stale_dropbox),
                 "files_head_checked": metrics.get("files_head_checked", 0),
                 "files_downloaded": metrics.get("files_downloaded", 0),
                 "files_changed": metrics.get("files_changed", 0),
@@ -15092,7 +14272,6 @@ def main(argv: list[str]) -> int:
                 "aqi_rebuilds_failed": metrics.get("aqi_rebuilds_failed", 0),
                 "runtime_seconds": runtime_seconds,
                 "report_json_path": str(json_path),
-                "backup_readiness": backup_gate_summary,
                 "report_md_path": str(md_path),
                 "log_path": str(log_path),
             }
@@ -15143,9 +14322,7 @@ def main(argv: list[str]) -> int:
                 "skip_cross_check": bool(args.skip_cross_check),
                 "integrity_run_id": run_id,
                 "status": "error",
-                "allow_stale_dropbox": bool(args.allow_stale_dropbox),
                 "runtime_seconds": round(time.monotonic() - started_mono, 3),
-                "backup_readiness": backup_gate_summary,
                 "log_path": str(log_path),
             }
             try:
