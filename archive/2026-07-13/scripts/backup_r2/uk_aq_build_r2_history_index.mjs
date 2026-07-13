@@ -6,6 +6,8 @@ import {
   updateR2HistoryIndexesTargeted,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 
+const TEST_R2_BUCKET = "uk-aq-history-cic-test";
+
 function usage() {
   console.log([
     "Usage:",
@@ -80,6 +82,20 @@ function parsePositiveInt(raw, flagName) {
   return Math.trunc(value);
 }
 
+function assertTestR2WriteTarget(r2) {
+  const bucket = String(r2?.bucket || "").trim();
+  if (bucket !== TEST_R2_BUCKET) {
+    throw new Error(`Refusing --write-r2 for non-TEST bucket: ${bucket || "(empty)"}`);
+  }
+}
+
+function countBlockedDependencyWarnings(warnings) {
+  return (Array.isArray(warnings) ? warnings : []).filter((warning) => {
+    const text = String(warning || "").toLowerCase();
+    return text.includes("missing") || text.includes("invalid") || text.includes("removed");
+  }).length;
+}
+
 function summarizeWriteOutcome(summary) {
   const flags = [];
   if (summary?.latest_index_put_skipped !== undefined) {
@@ -111,11 +127,11 @@ function summarizeWriteOutcome(summary) {
 }
 
 function buildRepairSections(summary, { writeR2, mode }) {
-  const blockedDependencyCount = Number(summary?.blocked_dependency_count || 0);
+  const blockedDependencyCount = countBlockedDependencyWarnings(summary?.warnings);
   const outcome = summarizeWriteOutcome(summary);
-  const repairStatus = blockedDependencyCount > 0
-    ? "blocked_dependency"
-    : (!writeR2 ? "planned" : (outcome.allSkipped ? "skipped_unchanged" : "succeeded"));
+  const repairStatus = !writeR2
+    ? "planned"
+    : (outcome.allSkipped ? "skipped_unchanged" : "succeeded");
   return {
     repair: {
       status: repairStatus,
@@ -126,12 +142,12 @@ function buildRepairSections(summary, { writeR2, mode }) {
         blocked_dependency_count: blockedDependencyCount,
       },
       execution: {
-        status: blockedDependencyCount > 0 ? "not_run" : repairStatus,
+        status: repairStatus,
         write_r2: writeR2,
       },
       verification: {
-        status: writeR2 && blockedDependencyCount === 0 ? repairStatus : "not_run",
-        fresh_remote_reads: writeR2 && blockedDependencyCount === 0,
+        status: writeR2 ? repairStatus : "not_run",
+        fresh_remote_reads: writeR2,
       },
     },
   };
@@ -445,6 +461,10 @@ function loadTargetsFromCsv(csvPath) {
 export async function runHistoryIndexBuild({ argv = process.argv.slice(2), env = process.env } = {}) {
   const args = parseArgs(argv);
   const writeR2 = args.mode === "write-r2";
+  const configBucket = String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim();
+  if (writeR2) {
+    assertTestR2WriteTarget({ bucket: configBucket });
+  }
   const summary = args.targeted
     ? await updateR2HistoryIndexesTargeted({
         env,

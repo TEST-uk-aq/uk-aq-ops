@@ -556,7 +556,6 @@ BACKFILL_REPO_ROOT="$(cd "$(dirname "${BACKFILL_WRAPPER_PATH}")/.." && pwd)"
 TARGETED_INDEX_CMD=(
   "${NODE_BIN}"
   "${BACKFILL_REPO_ROOT}/scripts/backup_r2/uk_aq_build_r2_history_index.mjs"
-  --write-r2
   --targeted
   --history-version "${HISTORY_VERSION}"
   --kind "${TARGET_KIND}"

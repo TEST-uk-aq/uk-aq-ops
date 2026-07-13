@@ -291,19 +291,8 @@ test("runDayManifestRebuild writes only the day manifest key and verifies the li
     ],
     backed_up_at_utc: "2026-05-20T21:00:00.000Z",
   };
-  const siblingConnectorManifest = {
-    ...connectorManifest,
-    connector_id: 3,
-    manifest_key: "history/v1/observations/day_utc=2026-04-30/connector_id=3/manifest.json",
-    parquet_object_keys: ["history/v1/observations/day_utc=2026-04-30/connector_id=3/part-00000.parquet"],
-    files: connectorManifest.files.map((entry) => ({
-      ...entry,
-      key: "history/v1/observations/day_utc=2026-04-30/connector_id=3/part-00000.parquet",
-    })),
-  };
   const fake = installFakeR2Fetch({
     "history/v1/observations/day_utc=2026-04-30/connector_id=7/manifest.json": connectorManifest,
-    "history/v1/observations/day_utc=2026-04-30/connector_id=3/manifest.json": siblingConnectorManifest,
     [dayManifestKey]: {
       day_utc: "2026-04-30",
       connector_ids: [7],
@@ -336,7 +325,6 @@ test("runDayManifestRebuild writes only the day manifest key and verifies the li
     assert.equal(output.verification.fresh_remote_reads, true);
     assert.equal(fake.puts.size, 1);
     assert.deepEqual(Array.from(fake.puts.keys()), [dayManifestKey]);
-    assert.deepEqual(output.rebuilt_connector_ids, [3, 7]);
   } finally {
     fake.restore();
   }

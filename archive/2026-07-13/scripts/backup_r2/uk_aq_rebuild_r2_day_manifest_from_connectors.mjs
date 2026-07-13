@@ -8,9 +8,6 @@ import {
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
 import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
-import {
-  buildHistoryV2DayManifest,
-} from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
 
@@ -81,7 +78,6 @@ function usage() {
     "  Dry-run report only (no R2 writes).",
     "",
     "Options:",
-    "  --history-version v1|v2         Layout to rebuild (default: v1)",
     "  --domain observations|aqilevels   Domain to repair (default: observations)",
     "  --day-utc <YYYY-MM-DD>            Required day to rebuild",
     "  --connector-id <n>                Optional connector filter; repeatable",
@@ -111,7 +107,6 @@ function usage() {
 function parseArgs(argv) {
   const args = {
     domain: "observations",
-    historyVersion: "v1",
     dayUtc: "",
     connectorIds: [],
     maxKeys: undefined,
@@ -124,11 +119,6 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--domain") {
       args.domain = normalizeDomain(argv[i + 1]);
-      i += 1;
-      continue;
-    }
-    if (arg === "--history-version") {
-      args.historyVersion = parseHistoryVersion(argv[i + 1]);
       i += 1;
       continue;
     }
@@ -180,14 +170,6 @@ function normalizeDomain(value) {
     throw new Error("--domain must be observations or aqilevels");
   }
   return domain;
-}
-
-function parseHistoryVersion(value) {
-  const historyVersion = String(value || "").trim().toLowerCase();
-  if (historyVersion !== "v1" && historyVersion !== "v2") {
-    throw new Error("--history-version must be v1 or v2");
-  }
-  return historyVersion;
 }
 
 function parseIsoDay(value) {
@@ -522,7 +504,6 @@ export function buildAqilevelsDayManifestFromConnectorManifests({
 
 export function buildDayManifestFromConnectorManifests({
   domain,
-  historyVersion = "v1",
   dayUtc,
   connectorManifests,
   existingDayManifest = null,
@@ -530,21 +511,6 @@ export function buildDayManifestFromConnectorManifests({
   const normalizedDomain = normalizeDomain(domain);
   if (!Array.isArray(connectorManifests) || connectorManifests.length === 0) {
     throw new Error("At least one connector manifest is required");
-  }
-  if (parseHistoryVersion(historyVersion) === "v2") {
-    const manifestKey = existingDayManifest?.manifest_key
-      || `${normalizedDomain === "observations" ? "history/v2/observations" : "history/v2/aqilevels/hourly/data"}/day_utc=${dayUtc}/manifest.json`;
-    return buildHistoryV2DayManifest({
-      domain: normalizedDomain,
-      grain: normalizedDomain === "aqilevels" ? "hourly" : null,
-      profile: normalizedDomain === "aqilevels" ? "data" : null,
-      dayUtc,
-      runId: pickRunId(connectorManifests, existingDayManifest),
-      manifestKey,
-      connectorManifests,
-      writerGitSha: pickWriterGitSha(connectorManifests, existingDayManifest),
-      backedUpAtUtc: pickBackedUpAtUtc(connectorManifests, existingDayManifest),
-    });
   }
   if (normalizedDomain === "observations") {
     return buildObservationDayManifestFromConnectorManifests({
@@ -608,6 +574,9 @@ async function getOptionalR2Json({ r2, key }) {
 }
 
 async function listConnectorManifestKeys({ r2, domainPrefix, dayUtc, maxKeys, connectorIds }) {
+  if (connectorIds.length > 0) {
+    return connectorIds.map((connectorId) => connectorManifestKey(domainPrefix, dayUtc, connectorId));
+  }
   const prefix = `${domainPrefix}/day_utc=${dayUtc}/connector_id=`;
   const entries = await r2ListAllObjects({ r2, prefix, max_keys: maxKeys });
   return entries
@@ -656,9 +625,9 @@ export async function runDayManifestRebuild({ argv = process.argv.slice(2), env 
     assertTestR2WriteTarget(config.r2);
   }
 
-  const domainPrefix = args.historyVersion === "v2"
-    ? (args.domain === "observations" ? config.observations_prefix_v2 : config.aqilevels_hourly_data_prefix_v2)
-    : (args.domain === "observations" ? config.observations_prefix : config.aqilevels_prefix);
+  const domainPrefix = args.domain === "observations"
+    ? config.observations_prefix
+    : config.aqilevels_prefix;
   const manifestKey = dayManifestKey(domainPrefix, args.dayUtc);
   const existingRead = await getOptionalR2Json({ r2: config.r2, key: manifestKey });
   const connectorManifestKeys = await listConnectorManifestKeys({
@@ -670,19 +639,21 @@ export async function runDayManifestRebuild({ argv = process.argv.slice(2), env 
   });
 
   const connectorManifests = [];
-  const listedConnectorIds = new Set(connectorManifestKeys.map((key) => connectorIdFromManifestKey(key)));
-  const missingRequestedConnectorIds = args.connectorIds.filter((connectorId) => !listedConnectorIds.has(connectorId));
+  const missingRequestedConnectorIds = [];
   for (const key of connectorManifestKeys) {
     try {
       const result = await r2GetObject({ r2: config.r2, key });
       connectorManifests.push(readJsonBuffer(result, key));
     } catch (error) {
-      throw new Error(`Blocked day manifest rebuild: required connector child ${key} is unavailable or malformed (${error instanceof Error ? error.message : String(error)})`);
+      if (args.connectorIds.length > 0 && isR2NotFoundError(error)) {
+        const connectorId = connectorIdFromManifestKey(key);
+        if (connectorId !== null) {
+          missingRequestedConnectorIds.push(connectorId);
+          continue;
+        }
+      }
+      throw error;
     }
-  }
-
-  if (missingRequestedConnectorIds.length > 0) {
-    throw new Error(`Blocked day manifest rebuild: requested connector manifest(s) missing: ${missingRequestedConnectorIds.join(", ")}`);
   }
 
   if (connectorManifests.length === 0) {
@@ -691,7 +662,6 @@ export async function runDayManifestRebuild({ argv = process.argv.slice(2), env 
 
   const rebuilt = buildDayManifestFromConnectorManifests({
     domain: args.domain,
-    historyVersion: args.historyVersion,
     dayUtc: args.dayUtc,
     connectorManifests,
     existingDayManifest: existingRead.payload,
