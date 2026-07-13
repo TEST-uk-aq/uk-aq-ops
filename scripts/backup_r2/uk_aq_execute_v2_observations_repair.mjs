@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Narrow Phase 3 executor: it repairs only the v2 observations hierarchy.
-// It never enumerates parquet writes, AQI paths, or backfill commands.
+// Ordered metadata executor for v2 observations and AQI data.
+// It never rewrites parquet data or invokes either data backfill wrapper.
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
@@ -12,6 +12,7 @@ import {
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
+  buildHistoryV2PollutantManifest,
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
 } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
@@ -28,18 +29,25 @@ const SUPPORTED_ACTIONS = new Set([
   "observation_day_manifest_repair",
   "observation_index_repair",
   "rebuild_v2_observations_index_only",
+  "aqi_pollutant_manifest_repair",
+  "aqi_connector_manifest_repair",
+  "aqi_day_manifest_repair",
+  "aqi_index_repair",
+  "rebuild_v2_aqi_index_only",
 ]);
 
 function parseArgs(argv) {
-  const args = { repairPlanJson: null, writeR2: false };
+  const args = { repairPlanJson: null, repairPlanStdin: false, writeR2: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--repair-plan-json") args.repairPlanJson = String(argv[++index] || "");
+    else if (arg === "--repair-plan-stdin") args.repairPlanStdin = true;
     else if (arg === "--write-r2") args.writeR2 = true;
     else if (arg === "--dry-run") args.writeR2 = false;
     else throw new Error(`Unknown arg: ${arg}`);
   }
-  if (!args.repairPlanJson) throw new Error("--repair-plan-json is required");
+  if (!args.repairPlanJson && !args.repairPlanStdin) throw new Error("--repair-plan-json or --repair-plan-stdin is required");
+  if (args.repairPlanJson && args.repairPlanStdin) throw new Error("pass only one repair plan input");
   return args;
 }
 
@@ -51,7 +59,7 @@ function jsonObject(object, key) {
   }
 }
 
-async function readChildren({ r2, prefix, dayUtc, connectorId, kind }) {
+async function readChildren({ r2, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
   const entries = await r2ListAllObjects({ r2, prefix, max_keys: 1000 });
   const keyPattern = kind === "connector"
     ? /\/connector_id=\d+\/manifest\.json$/
@@ -63,7 +71,11 @@ async function readChildren({ r2, prefix, dayUtc, connectorId, kind }) {
   for (const key of keys) {
     const object = await r2GetObject({ r2, key });
     const payload = jsonObject(object, key);
-    assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
+    if (domain === "observations") {
+      assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
+    } else if (payload?.domain !== "aqilevels" || payload?.manifest_kind !== kind) {
+      throw new Error(`Invalid AQI ${kind} manifest: ${key}`);
+    }
     children.push(payload);
     identities.set(key, { sha256: sha256Hex(object.body), etag: object.etag || null });
   }
@@ -101,12 +113,13 @@ function proposalView(proposal) {
   };
 }
 
-function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kind }) {
+function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
   return {
     prefix,
     dayUtc,
     connectorId,
     kind,
+    domain,
     expected_children: child.children.map((payload) => {
       const key = payload.manifest_key;
       const staged = proposals.get(key);
@@ -129,6 +142,7 @@ async function assertCompleteChildrenUnchanged({ r2, guard }) {
     dayUtc: guard.dayUtc,
     connectorId: guard.connectorId,
     kind: guard.kind,
+    domain: guard.domain,
   });
   const expected = new Map(guard.expected_children.map((child) => [child.key, child]));
   const actualKeys = [...current.identities.keys()].sort();
@@ -307,8 +321,8 @@ async function applyStagedProposals({ r2, proposals, writeR2 }) {
 }
 
 function extractRepairPlan(input) {
-  if (input?.history_version === "v2" && input?.domain === "observations" && Array.isArray(input.repair_plan)) {
-    return { inputKind: "observations_repair_plan", actions: input.repair_plan };
+  if (input?.history_version === "v2" && ["observations", "aqilevels"].includes(input?.domain) && Array.isArray(input.repair_plan)) {
+    return { inputKind: `${input.domain}_repair_plan`, domain: input.domain, actions: input.repair_plan };
   }
   const v2 = input?.history_version_results?.v2;
   const observations = v2?.observations;
@@ -321,7 +335,7 @@ function extractRepairPlan(input) {
       && Array.isArray(observations.repair_plan))) {
       throw new Error("Invalid complete integrity report: expected checked v2 observations results");
     }
-    return { inputKind: "integrity_report", actions: observations.repair_plan };
+    return { inputKind: "integrity_report", domain: "observations", actions: observations.repair_plan };
   }
   throw new Error("Repair input must be a complete integrity report with history_version_results.v2.observations.repair_plan, or { history_version: 'v2', domain: 'observations', repair_plan: [...] }");
 }
@@ -337,7 +351,7 @@ function validateAction(action) {
   if (action.history_version !== undefined && action.history_version !== "v2") {
     throw new Error(`Unsupported history version for Phase 4 repair action: ${action.history_version}`);
   }
-  if (action.domain !== undefined && action.domain !== "observations") {
+  if (action.domain !== undefined && !["observations", "aqilevels"].includes(action.domain)) {
     throw new Error(`Unsupported domain for Phase 4 repair action: ${action.domain}`);
   }
   if (typeof action.requires_index_rebuild !== "boolean" || !Array.isArray(action.gap_types)
@@ -347,7 +361,7 @@ function validateAction(action) {
 }
 
 function normalizePlan(input) {
-  const { inputKind, actions } = extractRepairPlan(input);
+  const { inputKind, domain, actions } = extractRepairPlan(input);
   const scopes = new Map();
   for (const action of actions) {
     validateAction(action);
@@ -357,19 +371,27 @@ function normalizePlan(input) {
       throw new Error("Every repair action must have day_utc and positive connector_id");
     }
     const key = `${dayUtc}|${connectorId}`;
-    const scope = scopes.get(key) || { dayUtc, connectorId, needsConnector: false, needsDay: false, needsIndex: false, pollutantRepair: false, gapTypes: new Set() };
-    scope.needsConnector ||= action.kind === "observation_connector_manifest_repair" || action.kind === "observation_pollutant_manifest_repair";
-    scope.needsDay ||= scope.needsConnector || action.kind === "observation_day_manifest_repair";
+    const scope = scopes.get(key) || { dayUtc, connectorId, needsConnector: false, needsDay: false, needsIndex: false, pollutantRepair: false, pollutantCodes: new Set(), gapTypes: new Set() };
+    scope.needsConnector ||= action.kind.endsWith("connector_manifest_repair") || action.kind.endsWith("pollutant_manifest_repair");
+    scope.needsDay ||= scope.needsConnector || action.kind.endsWith("day_manifest_repair");
     scope.needsIndex ||= Boolean(action.requires_index_rebuild) || action.kind.includes("index");
-    scope.pollutantRepair ||= action.kind === "observation_pollutant_manifest_repair";
+    scope.pollutantRepair ||= action.kind.endsWith("pollutant_manifest_repair");
+    if (typeof action.pollutant_code === "string" && action.pollutant_code.trim()) {
+      scope.pollutantCodes.add(action.pollutant_code.trim().toLowerCase());
+    }
     for (const gapType of action.gap_types) scope.gapTypes.add(gapType);
     scopes.set(key, scope);
   }
   return {
     inputKind,
+    domain,
     scopes: [...scopes.values()]
       .sort((left, right) => left.dayUtc.localeCompare(right.dayUtc) || left.connectorId - right.connectorId)
-      .map(({ gapTypes, ...scope }) => ({ ...scope, gap_types: [...gapTypes].sort() })),
+      .map(({ gapTypes, pollutantCodes, ...scope }) => ({
+        ...scope,
+        gap_types: [...gapTypes].sort(),
+        pollutant_codes: [...pollutantCodes].sort(),
+      })),
   };
 }
 
@@ -380,8 +402,12 @@ export async function runV2ObservationsRepair({
   updateIndexes = updateR2HistoryIndexesTargeted,
 } = {}) {
   const args = repairPlan ? { writeR2: argv.includes("--write-r2") } : parseArgs(argv);
-  const input = repairPlan || JSON.parse(fs.readFileSync(args.repairPlanJson, "utf8"));
-  const { inputKind, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
+  const input = repairPlan || JSON.parse(
+    args.repairPlanStdin
+      ? fs.readFileSync(0, "utf8")
+      : fs.readFileSync(args.repairPlanJson, "utf8"),
+  );
+  const { inputKind, domain, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
   const config = resolveR2HistoryIndexConfig(env);
   if (args.writeR2 && env.UK_AQ_ENV_NAME !== "CIC-Test") {
     throw new Error(`Refusing Phase 4 repair write: UK_AQ_ENV_NAME must be CIC-Test (got ${env.UK_AQ_ENV_NAME || "(empty)"})`);
@@ -401,20 +427,59 @@ export async function runV2ObservationsRepair({
   const blockedScopes = [];
 
   for (const [dayUtc, dayScopes] of [...byDay.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-    const base = `${config.observations_prefix_v2}/day_utc=${dayUtc}`;
-    const blockedScope = dayScopes.find((scope) => scope.pollutantRepair);
-    if (blockedScope) {
-      const blocked = { ...blockedScope, status: "blocked_dependency", reason: "Pollutant manifests are not reconstructed without complete parquet-derived metadata." };
-      blockedScopes.push(blocked);
-      dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: [blocked], proposal_keys: [] });
-      continue;
-    }
-
+    const dataPrefix = domain === "observations"
+      ? config.observations_prefix_v2
+      : config.aqilevels_hourly_data_prefix_v2;
+    const base = `${dataPrefix}/day_utc=${dayUtc}`;
     const proposalKeys = [];
+    // Pollutant manifests are the leaf metadata layer.  Rebuild them before
+    // connector/day manifests so a malformed child cannot be preserved by a
+    // newly generated parent.  The writer records complete per-part metadata
+    // in `files`; its parquet objects are the immutable data dependency.
+    for (const scope of dayScopes.filter((value) => value.pollutantRepair).sort((left, right) => left.connectorId - right.connectorId)) {
+      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
+      const wanted = new Set(scope.pollutant_codes || []);
+      const selected = child.children.filter((payload) => !wanted.size || wanted.has(String(payload.pollutant_code || "").trim().toLowerCase()));
+      if (!selected.length) {
+        const blocked = { ...scope, status: "blocked_dependency", reason: "Pollutant manifest repair requires final combined parquet metadata for the requested pollutant." };
+        blockedScopes.push(blocked);
+        continue;
+      }
+      for (const payload of selected) {
+        const manifestKey = String(payload.manifest_key || "").trim();
+        const files = Array.isArray(payload.files) ? payload.files : [];
+        if (!manifestKey || !files.length) {
+          const blocked = { ...scope, pollutant_code: payload.pollutant_code || null, status: "blocked_dependency", reason: "Pollutant manifest repair is blocked because final parquet file metadata is unavailable." };
+          blockedScopes.push(blocked);
+          continue;
+        }
+        const rebuilt = buildHistoryV2PollutantManifest({
+          domain,
+          profile: domain === "aqilevels" ? "data" : null,
+          dayUtc,
+          connectorId: scope.connectorId,
+          pollutantCode: payload.pollutant_code,
+          runId: payload.run_id || null,
+          manifestKey,
+          sourceRowCount: Number(payload.source_row_count || payload.row_count || 0),
+          fileEntries: files,
+          writerGitSha: payload.writer_git_sha || null,
+          backedUpAtUtc: payload.backed_up_at_utc || `${dayUtc}T00:00:00.000Z`,
+        });
+        await staged.stage({
+          key: manifestKey,
+          body: JSON.stringify(rebuilt, null, 2),
+          kind: "pollutant_manifest",
+          dayUtc,
+          dependencies: files.map((entry) => String(entry?.key || "")).filter(Boolean),
+        });
+        proposalKeys.push(manifestKey);
+      }
+    }
     for (const scope of dayScopes.filter((value) => value.needsConnector).sort((left, right) => left.connectorId - right.connectorId)) {
-      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant" });
+      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
       const key = `${base}/connector_id=${scope.connectorId}/manifest.json`;
-      const payload = buildHistoryV2ConnectorManifest({ domain: "observations", dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      const payload = buildHistoryV2ConnectorManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key,
         body: JSON.stringify(payload, null, 2),
@@ -428,6 +493,7 @@ export async function runV2ObservationsRepair({
           dayUtc,
           connectorId: scope.connectorId,
           kind: "pollutant",
+          domain,
         }),
       });
       proposalKeys.push(key);
@@ -437,8 +503,8 @@ export async function runV2ObservationsRepair({
     let dayManifest = null;
     let dayManifestKey = `${base}/manifest.json`;
     if (needsDay) {
-      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=`, dayUtc, kind: "connector" });
-      dayManifest = buildHistoryV2DayManifest({ domain: "observations", dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
+      dayManifest = buildHistoryV2DayManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key: dayManifestKey,
         body: JSON.stringify(dayManifest, null, 2),
@@ -452,6 +518,7 @@ export async function runV2ObservationsRepair({
           dayUtc,
           connectorId: null,
           kind: "connector",
+          domain,
         }),
       });
       proposalKeys.push(dayManifestKey);
@@ -467,7 +534,7 @@ export async function runV2ObservationsRepair({
         env,
         r2: staged.stagedR2,
         historyVersion: "v2",
-        domains: ["observations"],
+        domains: [domain],
         fromDayUtc: dayUtc,
         toDayUtc: dayUtc,
         connectorId: null,
@@ -517,7 +584,7 @@ export async function runV2ObservationsRepair({
     dry_run: !args.writeR2,
     write_r2: args.writeR2,
     bucket: config.r2.bucket,
-    planning: { status: "planned", input_kind: inputKind, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes },
+    planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes },
     execution: { status: executionStatus },
     verification: { status: verificationStatus },
     results,

@@ -29,13 +29,14 @@ logs, and Dropbox copy. The script code is shared.
 
 Current history integrity supports only `--history-version v2` and imports the
 v2 core writer layout from `R2_history_backup/history/v2/core`. The parser and
-launcher reject `v1`, `both`, and `--run-backfill` before scan or repair work.
-The legacy source-to-R2/AQI integrity wrapper is disabled: it does not own the
-required observation verification, Phase 3 manifest/index finalisation, AQI
-eligibility, and mandatory post-repair check as one sequence. Generic backfill
-and index tools remain separate non-integrity utilities. Historical sections
-below describing the old integrity backfill flow are retained as implementation
-history, not an executable current contract.
+launcher reject `v1` and `both`; `--run-backfill` is valid only after the
+read-only scan and is mutually exclusive with `--check-only`. The Integrity
+specialist wrapper is active for its v2 observation/AQI modes but has no final
+index step: the ordered coordinator owns verification, final manifests, and one
+targeted index per affected day. Generic backfill and index tools remain
+separate non-integrity utilities. Historical sections below describing the old
+integrity backfill flow are retained as implementation history, not an
+executable current contract.
 
 ---
 
@@ -53,7 +54,7 @@ Run the launcher from:
 /Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
 ```
 
-Phase 3 is supported only from this complete checkout. Its executor imports
+Phases 3 and 4 are supported only from this complete checkout. Their executor imports
 shared R2/index modules and the Phase B writer from elsewhere in the repository,
 which depends on the checkout's Node package dependencies. Do not copy `bin/`
 or `env/` to a standalone location, and no partial runtime bundle is supported.
@@ -310,6 +311,33 @@ The canonical Integrity readiness-RPC SQL belongs only to
 It is separate from the general date-based backup readiness RPC, so unrelated
 callers keep their existing contract. No ops SQL mirror is maintained.
 
+### Phase 2 v2 repair coordinator
+
+`--run-backfill` is valid for v2 only and is mutually exclusive with
+`--check-only`. It does not allow source adapters to write during their initial
+evidence/cache pass. After detection completes, the coordinator owns this order:
+
+```text
+observs
+→ observs manifests
+→ observs indexes
+→ aqilevels
+→ aqilevels manifests
+→ aqilevels indexes
+→ final verification
+```
+
+Phase 2 creates the sparse local overlay used by Phases 3 and 4 at
+`UK_AQ_HISTORY_INTEGRITY_TMP_DIR/run-<UTC>/overlay` plus `run-state.json`.
+Only changed/generated objects are eligible for the overlay. Combined local
+reads prefer an object marked `r2_verified=true`; otherwise they use the same
+object key in `R2_history_backup`. Phases 3 and 4 reconnect all data/metadata
+stages after read-only detection. AQI reads use the already verified live-R2
+observation scope because the current AQI writer has no local-reader adapter;
+every resulting AQI object is GET-verified into the overlay. The coordinator,
+not either data wrapper, runs each targeted index after final manifests.
+`--run-backfill --dry-run` still makes no writes.
+
 Run lifecycle:
 
 1. Start: call `uk_aq_rpc_daily_task_started` for seeded task key
@@ -446,7 +474,7 @@ Python interpreter defaults to `python3`; override with
 --dry-run                               No DB writes / no remote calls; logs the snapshot and OpenAQ plan.
 --check-only                            (Phase 5 wires Sensor.Community; OpenAQ already check-only by default)
 --history-version v2                    Required v2-only layout selector; v1 and both are rejected.
---run-backfill                          Rejected while the single v2 repair orchestrator is completed.
+--run-backfill                          Enables ordered v2 observation and AQI repair after detection; incompatible with --check-only.
 --max-download-mb N                     Soft cap on per-run downloaded MB (cooperative; checked before each request).
 --max-runtime-minutes N                 Soft cap on per-run runtime minutes (cooperative; checked before each request).
 --concurrency N                         Worker count for the per-file thread pool (default 8; UK_AQ_HISTORY_INTEGRITY_CONCURRENCY overrides). 1 = strict sequential.
@@ -462,9 +490,9 @@ Current runtime behavior for OpenAQ integrity runs:
 | Flags | Remote HEAD/download checks | Change detection + DB writes | Backfill wrapper execution | Planned backfill commands logged |
 |---|---|---|---|---|
 | none | Yes | Yes | No | No |
-| `--run-backfill` | Rejected before scan | Rejected before scan | No | No |
+| `--run-backfill` | Yes | Yes | Ordered v2 observation and AQI stages | Yes |
 | `--dry-run` | No | No | No | No |
-| `--dry-run --run-backfill` | Rejected before scan | Rejected before scan | No | No |
+| `--dry-run --run-backfill` | No writes | No writes | Planning only | Yes |
 | `--check-only` | Same as corresponding row above | Same as corresponding row above | Same as corresponding row above | Same as corresponding row above |
 
 Notes:
@@ -1042,9 +1070,9 @@ UK_AQ_BACKFILL_TIMESERIES_IDS=12345,12346
 
 internally normalising to a list.
 
-After a successful non-dry-run integrity repair, the integrity wrapper runs one
-targeted R2 history index update for the repaired day range instead of calling
-the backfill wrapper's full-history rebuild path. The targeted update:
+After a successful non-dry-run integrity repair, the coordinator, not the
+Integrity wrapper, runs one targeted R2 history index update for the repaired
+day range after all affected manifests are final. The targeted update:
 
 - reads the affected day manifest(s) directly by key
 - rebuilds the affected latest domain index entry/entries
@@ -1653,9 +1681,9 @@ Pass 2 (batching, logs, monitoring):
   - `UK_AQ_BACKFILL_TARGETED_STAGE_ROOT=state/<ENV>/logs/backfill/<run_compact>/_targeted_stage/run_<run_id>|v2_run_<run_id>/day_<YYYY-MM-DD>/connector_<id>`
   - `UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE=false|true` (final chunk only true)
   - `UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP=false|true` (final chunk only true)
-  Non-final staged chunks skip the wrapper's targeted index update; the final
-  chunk is the only staged chunk that publishes R2 data and rebuilds the
-	  affected index. Multi-chunk v2 observation repairs queue AQI only when the
+  Non-final staged chunks do not publish R2 data. The coordinator owns the
+  sole targeted observation index after final manifests. Multi-chunk v2
+  observation repairs queue AQI only when the
 	  runner sees the expected staged deferred commits, exactly one final
 	  connector/day publish, and final row counts that do not shrink below the
 	  staged baseline. Before queueing AQI, direct v2 observation repairs also read

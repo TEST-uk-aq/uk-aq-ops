@@ -13,6 +13,7 @@ in Phases 5/4/7.
 """
 
 import argparse
+import base64
 import concurrent.futures
 import datetime as dt
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -94,6 +96,23 @@ DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
 DAILY_TASK_HEALTH_SOURCE_WORKER = "uk-aq-history-integrity"
 DAILY_TASK_HEALTH_RPC_SCHEMA = "uk_aq_public"
 DAILY_TASK_HEALTH_ERROR_LIMIT = 1200
+V2_REPAIR_STAGE_ORDER = (
+    "observs",
+    "observs_manifests",
+    "observs_indexes",
+    "aqilevels",
+    "aqilevels_manifests",
+    "aqilevels_indexes",
+    "final_verification",
+)
+OVERLAY_CHANGED_SCOPE_SETS = (
+    "OBSERVS_CHANGED",
+    "OBS_MANIFESTS_CHANGED",
+    "OBS_INDEXES_CHANGED",
+    "AQILEVELS_CHANGED",
+    "AQI_MANIFESTS_CHANGED",
+    "AQI_INDEXES_CHANGED",
+)
 BACKUP_GATE_URL_ENV_NAMES = (
     "DAILY_TASK_HEALTH_SUPABASE_URL",
     "OBS_AQIDB_SUPABASE_URL",
@@ -12712,6 +12731,7 @@ def run_v2_gap_backfills(
     run_backfill: bool,
     limits: LimitTracker,
     log: logging.Logger,
+    run_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -12787,28 +12807,6 @@ def run_v2_gap_backfills(
     for day_iso, connector_id in standalone_index_keys:
         idx_cmd = _v2_observations_index_rebuild_command(day_iso, connector_id)
         metrics["planned_v2_observation_index_rebuilds"].append(" ".join(idx_cmd))
-        if dry_run:
-            continue
-        metrics["v2_observation_index_rebuilds_attempted"] += 1
-        result = subprocess.run(
-            idx_cmd,
-            cwd=Path(__file__).resolve().parents[3],
-            env={**os.environ, **env},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            metrics["v2_observation_index_rebuilds_ok"] += 1
-        else:
-            metrics["v2_observation_index_rebuilds_failed"] += 1
-            log.warning(
-                "v2 observation index-only rebuild failed day=%s connector_id=%s exit_code=%s stderr=%s",
-                day_iso,
-                connector_id,
-                result.returncode,
-                _truncate_text(result.stderr or result.stdout or "", 2000),
-            )
     for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
         day_obj = dt.date.fromisoformat(day_iso)
         chunks = _chunk_v2_observation_repair_timeseries_ids(ts_ids)
@@ -12834,46 +12832,54 @@ def run_v2_gap_backfills(
             connector_id=connector_id,
             day=day_obj,
         )
-        if source_cache_status.get("status") not in {"ok", "not_checked"}:
+        if source_cache_status.get("status") != "ok":
+            record = {
+                "day_utc": day_iso,
+                "connector_id": connector_id,
+                "status": "blocked_dependency",
+                "reason": "source_cache_not_ready",
+                "source_cache": source_cache_status,
+                "timeseries_ids": ts_ids,
+            }
+            metrics["skipped_v2_observation_repairs"].append(record)
+            if run_state is not None:
+                record_blocked_scope(run_state, {"stage": "observs", **record})
             log.warning(
-                "v2 observation repair will run despite source cache status day=%s connector_id=%s source_status=%s reason=%s",
+                "v2 observation repair blocked by source cache day=%s connector_id=%s source_status=%s reason=%s",
                 day_iso,
                 connector_id,
                 source_cache_status.get("status"),
                 source_cache_status.get("reason"),
             )
+            continue
         metrics["planned_v2_observation_repairs"].extend(planned_cmds)
         metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
         for gap in gaps_by_key.get((day_iso, connector_id), []):
             _set_v2_source_repair_plan(gap, status="ready", command=first_cmd, source_cache_status=source_cache_status)
         chunk_results: list[dict[str, Any]] = []
         stage_root = (
-            backfill_log_dir
-            / "_targeted_stage"
-            / f"v2_run_{run_id}"
-            / f"day_{day_iso}"
-            / f"connector_{connector_id}"
+            Path(str(run_state["overlay_root"]))
+            if run_state is not None
+            else backfill_log_dir / "_targeted_stage" / f"v2_run_{run_id}"
         )
-        if len(chunks) > 1:
-            shutil.rmtree(stage_root, ignore_errors=True)
+        shutil.rmtree(stage_root / f"day_utc={day_iso}" / f"connector_id={connector_id}", ignore_errors=True)
         for chunk_index, chunk_ids in enumerate(chunks, start=1):
             if limits.should_stop():
                 break
             chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
             if len(chunks) > 1:
                 chunk_label = f"{chunk_label}_chunk_{chunk_index:03d}_of_{len(chunks):03d}"
-            extra_env: dict[str, str] | None = None
-            if len(chunks) > 1:
-                extra_env = {
-                    "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
-                    "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
-                    "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
-                        "true" if chunk_index == len(chunks) else "false"
-                    ),
-                    "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": (
-                        "true" if chunk_index == len(chunks) else "false"
-                    ),
-                }
+            # Always stage the targeted merge beneath this Integrity run's
+            # sparse overlay.  Earlier chunks only update the staged baseline;
+            # the final chunk alone may publish the scoped observation output.
+            extra_env: dict[str, str] = {
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
+                "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
+                    "true" if chunk_index == len(chunks) else "false"
+                ),
+                "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": "false",
+            }
             bf = run_narrow_backfill(
                 wrapper_path=resolve_integrity_backfill_wrapper(),
                 env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
@@ -13035,6 +13041,26 @@ def run_v2_gap_backfills(
             repair_status = "guard_failed"
         else:
             repair_status = "failed"
+        verified_overlay_keys: list[str] = []
+        if repair_ok and run_state is not None:
+            try:
+                verified_overlay_keys = _capture_verified_v2_observation_scope(
+                    run_state=run_state,
+                    day_utc=day_iso,
+                    connector_id=connector_id,
+                    env=env,
+                )
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                repair_ok = False
+                repair_status = "guard_failed"
+                manifest_guard_ok = False
+                manifest_guard_reason = f"overlay_r2_get_verification_failed:{type(exc).__name__}"
+                log.warning(
+                    "v2 observation overlay verification failed day=%s connector_id=%s error=%s",
+                    day_iso,
+                    connector_id,
+                    exc,
+                )
         repair_entry = {
             "day_utc": day_iso,
             "connector_id": connector_id,
@@ -13093,6 +13119,7 @@ def run_v2_gap_backfills(
             "ok_chunks": sum(1 for r in chunk_results if r.get("status") == "ok"),
             "failed_chunks": sum(1 for r in chunk_results if r.get("status") != "ok"),
             "source_cache": source_cache_status,
+            "verified_overlay_object_keys": verified_overlay_keys,
             "chunks": [
                 {
                     "chunk_index": i,
@@ -13144,6 +13171,14 @@ def run_v2_gap_backfills(
                 queued.add((day_iso, connector_id))
             metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
             metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
+            if run_state is not None:
+                record_changed_scope(run_state, "OBSERVS_CHANGED", {
+                    "day_utc": day_iso,
+                    "connector_id": connector_id,
+                    "timeseries_ids": ts_ids,
+                    "pollutant_codes": sorted({str(code) for code in source_pollutant_codes if str(code)}),
+                    "stage": "observs",
+                })
         elif no_observation_rows:
             metrics["v2_observation_repairs_no_rows"] += 1
             log.warning(
@@ -13203,6 +13238,7 @@ def run_aqi_rebuild_queue_execution(
     log: logging.Logger,
     dry_run_planned_rows: list[dict[str, Any]] | None = None,
     history_version: str = "v1",
+    skip_stale_local_post_validation: bool = False,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "aqi_rebuild_ran": False,
@@ -13213,6 +13249,7 @@ def run_aqi_rebuild_queue_execution(
         "aqi_rebuilds_failed": 0,
         "aqi_rebuilds_skipped": 0,
         "aqi_post_rebuild_validation_failed": 0,
+        "aqi_post_rebuild_validation_skipped_reason": None,
         "planned_aqi_rebuild_commands": [],
         "aqi_rebuild_results": [],
     }
@@ -13435,6 +13472,7 @@ def run_aqi_rebuild_queue_execution(
             bf.get("status") == "ok"
             and history_version == "v2"
             and connector_scope is not None
+            and not skip_stale_local_post_validation
             and (
                 "obs_repaired" in merged_reasons
                 or AQI_INTEGRITY_OBS_COVERAGE_REASON in merged_reasons
@@ -13457,6 +13495,15 @@ def run_aqi_rebuild_queue_execution(
                     connector_id=connector_scope,
                     related_paths=["UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set"],
                 )]
+        elif (
+            bf.get("status") == "ok"
+            and history_version == "v2"
+            and connector_scope is not None
+            and skip_stale_local_post_validation
+        ):
+            metrics["aqi_post_rebuild_validation_skipped_reason"] = (
+                "live_r2_scope_verified_before_dropbox_backup"
+            )
 
         if bf.get("status") == "ok" and not post_validation_gaps:
             metrics["aqi_rebuilds_complete"] += 1
@@ -13534,6 +13581,782 @@ def fmt_compact(t: dt.datetime) -> str:
     return t.strftime("%Y-%m-%dT%H%M%SZ")
 
 
+def _normalise_overlay_object_key(object_key: str) -> str:
+    normalized = str(object_key or "").strip().lstrip("/")
+    path = Path(normalized)
+    if not normalized or path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"invalid overlay object key: {object_key!r}")
+    return path.as_posix()
+
+
+def _overlay_object_entry(run_state: Mapping[str, Any], object_key: str) -> dict[str, Any]:
+    normalized_key = _normalise_overlay_object_key(object_key)
+    objects = run_state.get("objects")
+    if not isinstance(objects, dict):
+        raise ValueError("overlay run state has no objects mapping")
+    entry = objects.get(normalized_key)
+    if not isinstance(entry, dict):
+        raise KeyError(f"overlay object has not been staged: {normalized_key}")
+    return entry
+
+
+def write_run_state(run_state: Mapping[str, Any]) -> Path:
+    state_path = Path(str(run_state["run_state_path"]))
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = state_path.with_name(state_path.name + ".tmp")
+    temp_path.write_text(
+        json.dumps(run_state, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(state_path)
+    return state_path
+
+
+def create_run_overlay(
+    *,
+    tmp_dir: str | Path,
+    run_id: str,
+    environment: str,
+    base_dropbox_root: str | Path,
+) -> dict[str, Any]:
+    run_root = Path(tmp_dir) / f"run-{run_id}"
+    if run_root.exists():
+        raise FileExistsError(f"Integrity overlay run directory already exists: {run_root}")
+    overlay_root = run_root / "overlay"
+    overlay_root.mkdir(parents=True, exist_ok=False)
+    run_state: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "environment": environment,
+        "created_at_utc": fmt_iso(utc_now()),
+        "base_dropbox_root": str(Path(base_dropbox_root)),
+        "run_root": str(run_root),
+        "overlay_root": str(overlay_root),
+        "run_state_path": str(run_root / "run-state.json"),
+        "objects": {},
+        "changed_scopes": {scope_set: [] for scope_set in OVERLAY_CHANGED_SCOPE_SETS},
+        "blocked_scopes": [],
+        "coordinator": None,
+    }
+    write_run_state(run_state)
+    return run_state
+
+
+def resolve_combined_local_path(
+    run_state: Mapping[str, Any],
+    object_key: str,
+) -> Path | None:
+    normalized_key = _normalise_overlay_object_key(object_key)
+    objects = run_state.get("objects")
+    entry = objects.get(normalized_key) if isinstance(objects, dict) else None
+    if isinstance(entry, Mapping) and bool(entry.get("r2_verified")):
+        overlay_path = Path(str(entry.get("local_path") or ""))
+        if overlay_path.is_file():
+            return overlay_path
+
+    backup_path = Path(str(run_state["base_dropbox_root"])) / normalized_key
+    return backup_path if backup_path.is_file() else None
+
+
+def stage_overlay_object(
+    run_state: dict[str, Any],
+    *,
+    object_key: str,
+    source_path: str | Path,
+    stage: str,
+    dependencies: Iterable[str] = (),
+) -> Path:
+    normalized_key = _normalise_overlay_object_key(object_key)
+    source = Path(source_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"overlay source object is not a file: {source}")
+    try:
+        source.resolve().relative_to(Path(str(run_state["base_dropbox_root"])).resolve())
+    except ValueError:
+        pass
+    else:
+        raise ValueError("refusing to copy a Dropbox backup object into the overlay")
+
+    target = Path(str(run_state["overlay_root"])) / normalized_key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    payload = target.read_bytes()
+    objects = run_state["objects"]
+    if not isinstance(objects, dict):
+        raise ValueError("overlay run state has no objects mapping")
+    objects[normalized_key] = {
+        "object_key": normalized_key,
+        "local_path": str(target),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "bytes": len(payload),
+        "stage": stage,
+        "dependencies": sorted({_normalise_overlay_object_key(value) for value in dependencies}),
+        "uploaded": False,
+        "uploaded_at_utc": None,
+        "r2_verified": False,
+        "r2_verified_at_utc": None,
+    }
+    write_run_state(run_state)
+    return target
+
+
+def mark_overlay_uploaded(run_state: dict[str, Any], object_key: str) -> None:
+    entry = _overlay_object_entry(run_state, object_key)
+    entry["uploaded"] = True
+    entry["uploaded_at_utc"] = fmt_iso(utc_now())
+    write_run_state(run_state)
+
+
+def mark_overlay_verified(run_state: dict[str, Any], object_key: str) -> None:
+    entry = _overlay_object_entry(run_state, object_key)
+    if not entry.get("uploaded"):
+        raise ValueError("overlay object cannot be verified before upload")
+    entry["r2_verified"] = True
+    entry["r2_verified_at_utc"] = fmt_iso(utc_now())
+    write_run_state(run_state)
+
+
+def record_changed_scope(
+    run_state: dict[str, Any],
+    scope_set: str,
+    scope: Mapping[str, Any],
+) -> None:
+    if scope_set not in OVERLAY_CHANGED_SCOPE_SETS:
+        raise ValueError(f"unknown changed scope set: {scope_set}")
+    changed_scopes = run_state.get("changed_scopes")
+    if not isinstance(changed_scopes, dict):
+        raise ValueError("overlay run state has no changed_scopes mapping")
+    canonical_scope = json.loads(json.dumps(dict(scope), sort_keys=True, default=str))
+    entries = changed_scopes.setdefault(scope_set, [])
+    if canonical_scope not in entries:
+        entries.append(canonical_scope)
+        entries.sort(key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")))
+    write_run_state(run_state)
+
+
+def record_blocked_scope(run_state: dict[str, Any], scope: Mapping[str, Any]) -> None:
+    canonical_scope = json.loads(json.dumps(dict(scope), sort_keys=True, default=str))
+    blocked_scopes = run_state.get("blocked_scopes")
+    if not isinstance(blocked_scopes, list):
+        raise ValueError("overlay run state has no blocked_scopes list")
+    if canonical_scope not in blocked_scopes:
+        blocked_scopes.append(canonical_scope)
+        blocked_scopes.sort(key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")))
+    write_run_state(run_state)
+
+
+def _v2_observation_metadata_actions(v2_observations: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return only metadata/index actions handled after the observations stage."""
+    supported = {
+        "observation_pollutant_manifest_repair",
+        "observation_connector_manifest_repair",
+        "observation_day_manifest_repair",
+        "observation_index_repair",
+        "rebuild_v2_observations_index_only",
+    }
+    actions: list[dict[str, Any]] = []
+    for action in list(v2_observations.get("repair_plan") or []):
+        if not isinstance(action, Mapping) or str(action.get("kind") or "") not in supported:
+            continue
+        actions.append(dict(action))
+    return actions
+
+
+def _v2_aqi_metadata_actions(v2_aqilevels: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return AQI data-manifest/index actions only; debug remains optional."""
+    supported = {
+        "aqi_pollutant_manifest_repair",
+        "aqi_connector_manifest_repair",
+        "aqi_day_manifest_repair",
+        "aqi_index_repair",
+        "rebuild_v2_aqi_index_only",
+    }
+    return [
+        dict(action)
+        for action in list(v2_aqilevels.get("repair_plan") or [])
+        if isinstance(action, Mapping) and str(action.get("kind") or "") in supported
+    ]
+
+
+def _run_v2_observation_metadata_executor(
+    *,
+    env: Mapping[str, str],
+    actions: list[dict[str, Any]],
+    domain: Literal["observations", "aqilevels"] = "observations",
+    dry_run: bool,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Run the metadata/index specialist once, after all observation repairs.
+
+    The specialist receives a narrow v2 observations plan on stdin.  This keeps
+    the runtime checkout self-contained and prevents the old wrapper from
+    rebuilding an index per observation chunk.
+    """
+    if not actions:
+        return {"status": "not_run", "reason": "no_observation_metadata_actions", "results": []}
+    repo_root = _repo_root_for_integrity_script(env)
+    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    command = [
+        node_bin,
+        str(repo_root / "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"),
+        "--repair-plan-stdin",
+    ]
+    if not dry_run:
+        command.append("--write-r2")
+    plan = {"history_version": "v2", "domain": domain, "repair_plan": actions}
+    proc = subprocess.run(
+        command,
+        cwd=repo_root,
+        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
+        input=json.dumps(plan),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        output = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        output = {}
+    if proc.returncode != 0:
+        log.warning(
+            "v2 observation metadata executor failed exit_code=%s stderr=%s",
+            proc.returncode,
+            _truncate_text(proc.stderr or proc.stdout or "", 2000),
+        )
+        return {
+            "status": "failed",
+            "exit_code": proc.returncode,
+            "error": _truncate_text(proc.stderr or proc.stdout or "", 4000),
+            "results": output.get("results") if isinstance(output, Mapping) else [],
+        }
+    return {
+        "status": str(output.get("status") or ("planned" if dry_run else "succeeded")),
+        "exit_code": proc.returncode,
+        "output": output,
+        "results": output.get("results") if isinstance(output, Mapping) else [],
+    }
+
+
+def _record_metadata_executor_overlay(
+    *,
+    run_state: dict[str, Any],
+    executor_result: Mapping[str, Any],
+    dry_run: bool,
+    manifest_scope_set: str = "OBS_MANIFESTS_CHANGED",
+    index_scope_set: str = "OBS_INDEXES_CHANGED",
+    manifest_stage: str = "observs_manifests",
+    index_stage: str = "observs_indexes",
+) -> None:
+    """Persist only changed metadata/index proposals in the sparse overlay."""
+    if dry_run:
+        return
+    output = executor_result.get("output")
+    if not isinstance(output, Mapping):
+        return
+    planning = output.get("planning")
+    if not isinstance(planning, Mapping):
+        return
+    operation_status: dict[str, str] = {}
+    for result in list(output.get("results") or []):
+        if not isinstance(result, Mapping):
+            continue
+        for operation in list(result.get("operations") or []):
+            if isinstance(operation, Mapping):
+                operation_status[str(operation.get("key") or "")] = str(operation.get("status") or "")
+    for proposal in list(planning.get("proposals") or []):
+        if not isinstance(proposal, Mapping) or not proposal.get("changed"):
+            continue
+        object_key = str(proposal.get("key") or "").strip()
+        body = proposal.get("proposed_body")
+        if not object_key or not isinstance(body, str):
+            continue
+        with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-overlay-") as temp_dir:
+            source = Path(temp_dir) / "generated-object"
+            source.write_text(body, encoding="utf-8")
+            stage_overlay_object(
+                run_state,
+                object_key=object_key,
+                source_path=source,
+                stage=manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage,
+                dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
+            )
+        if operation_status.get(object_key) == "succeeded":
+            mark_overlay_uploaded(run_state, object_key)
+            mark_overlay_verified(run_state, object_key)
+            scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
+            record_changed_scope(run_state, scope_set, {
+                "object_key": object_key,
+                "stage": manifest_stage if scope_set == manifest_scope_set else index_stage,
+            })
+
+
+def _get_r2_object_bytes_for_integrity_overlay(
+    *,
+    object_key: str,
+    env: Mapping[str, str],
+) -> bytes:
+    """GET one object through the shared signer without exposing it in logs."""
+    repo_root = _repo_root_for_integrity_script(env)
+    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    code = r"""
+import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
+const env = process.env;
+const r2 = {
+  endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
+  bucket: String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim(),
+  region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
+  access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
+  secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
+};
+const object = await r2GetObject({ r2, key: String(env.UK_AQ_INTEGRITY_OVERLAY_GET_KEY || "") });
+process.stdout.write(object.body.toString("base64"));
+"""
+    proc = subprocess.run(
+        [node_bin, "--input-type=module", "-e", code],
+        cwd=repo_root,
+        env={
+            **os.environ,
+            **{str(key): str(value) for key, value in env.items()},
+            "UK_AQ_INTEGRITY_OVERLAY_GET_KEY": object_key,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"R2 GET failed for {object_key}: exit_code={proc.returncode}")
+    return base64.b64decode(proc.stdout.encode("ascii"), validate=True)
+
+
+def _capture_verified_v2_observation_scope(
+    *,
+    run_state: dict[str, Any],
+    day_utc: str,
+    connector_id: int,
+    env: Mapping[str, str],
+) -> list[str]:
+    """Capture writer PUTs into the sparse overlay after exact GET verification."""
+    connector_key = _v2_observation_connector_manifest_key(
+        day_utc=day_utc, connector_id=connector_id, env=env,
+    )
+    manifest_raw = _get_r2_object_bytes_for_integrity_overlay(
+        object_key=connector_key, env=env,
+    )
+    manifest = json.loads(manifest_raw.decode("utf-8"))
+    if not isinstance(manifest, Mapping):
+        raise ValueError(f"invalid observation connector manifest after GET: {connector_key}")
+    config = resolve_history_path_config("v2", {**os.environ, **dict(env)})
+    day_key = f"{config.observations_data_prefix.strip('/')}/day_utc={day_utc}/manifest.json"
+    object_keys = [
+        *(str(entry.get("key") or "") for entry in list(manifest.get("files") or []) if isinstance(entry, Mapping)),
+        *(str(entry.get("manifest_key") or "") for entry in list(manifest.get("child_manifests") or []) if isinstance(entry, Mapping)),
+        connector_key,
+        day_key,
+    ]
+    captured: list[str] = []
+    for object_key in sorted({_normalise_overlay_object_key(key) for key in object_keys if key}):
+        payload = manifest_raw if object_key == connector_key else _get_r2_object_bytes_for_integrity_overlay(
+            object_key=object_key, env=env,
+        )
+        with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-observs-") as temp_dir:
+            source = Path(temp_dir) / "r2-object"
+            source.write_bytes(payload)
+            stage_overlay_object(
+                run_state,
+                object_key=object_key,
+                source_path=source,
+                stage="observs",
+                dependencies=(),
+            )
+        # The source-to-R2 writer performed the PUT; this GET is the exact
+        # verification before the object becomes an overlay dependency.
+        mark_overlay_uploaded(run_state, object_key)
+        mark_overlay_verified(run_state, object_key)
+        captured.append(object_key)
+    return captured
+
+
+def _capture_verified_v2_aqi_scope(
+    *,
+    run_state: dict[str, Any],
+    day_utc: str,
+    connector_id: int,
+    env: Mapping[str, str],
+) -> list[str]:
+    """Capture the live-R2 AQI writer output after exact GET verification.
+
+    The current AQI writer accepts committed R2 observations, not a local
+    reader.  This is the narrow Phase 4 exception: its input is the already
+    PUT-and-GET-verified observation scope; every AQI output is then copied to
+    the sparse overlay only after an exact R2 GET.
+    """
+    config = resolve_history_path_config("v2", {**os.environ, **dict(env)})
+    prefixes = [config.aqilevels_hourly_data_prefix]
+    if config.aqilevels_hourly_debug_prefix:
+        prefixes.append(config.aqilevels_hourly_debug_prefix)
+    captured: list[str] = []
+    for prefix in prefixes:
+        normalized_prefix = str(prefix).strip("/")
+        connector_key = (
+            f"{normalized_prefix}/day_utc={day_utc}/connector_id={int(connector_id)}/manifest.json"
+        )
+        manifest_raw = _get_r2_object_bytes_for_integrity_overlay(
+            object_key=connector_key, env=env,
+        )
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+        if not isinstance(manifest, Mapping):
+            raise ValueError(f"invalid AQI connector manifest after GET: {connector_key}")
+        day_key = f"{normalized_prefix}/day_utc={day_utc}/manifest.json"
+        object_keys = [
+            *(str(entry.get("key") or "") for entry in list(manifest.get("files") or []) if isinstance(entry, Mapping)),
+            *(str(entry.get("manifest_key") or "") for entry in list(manifest.get("child_manifests") or []) if isinstance(entry, Mapping)),
+            connector_key,
+            day_key,
+        ]
+        for object_key in sorted({_normalise_overlay_object_key(key) for key in object_keys if key}):
+            payload = manifest_raw if object_key == connector_key else _get_r2_object_bytes_for_integrity_overlay(
+                object_key=object_key, env=env,
+            )
+            with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-aqi-") as temp_dir:
+                source = Path(temp_dir) / "r2-object"
+                source.write_bytes(payload)
+                stage_overlay_object(
+                    run_state,
+                    object_key=object_key,
+                    source_path=source,
+                    stage="aqilevels",
+                    dependencies=(),
+                )
+            mark_overlay_uploaded(run_state, object_key)
+            mark_overlay_verified(run_state, object_key)
+            captured.append(object_key)
+    return sorted(set(captured))
+
+
+def _phase4_aqi_work(
+    *,
+    conn: sqlite3.Connection,
+    run_state: Mapping[str, Any],
+    v2_aqilevels: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return one eligible AQI connector/day rebuild work item per final scope."""
+    work: dict[tuple[str, int], dict[str, Any]] = {}
+    blocked: list[dict[str, Any]] = []
+
+    def scope_key(value: Mapping[str, Any]) -> tuple[str, int] | None:
+        day = str(value.get("day_utc") or "").strip()
+        try:
+            connector = int(value.get("connector_id"))
+        except (TypeError, ValueError):
+            return None
+        return (day, connector) if day and connector > 0 else None
+
+    def add(day_utc: Any, connector_id: Any, pollutants: Iterable[Any], reason: str) -> None:
+        day = str(day_utc or "").strip()
+        try:
+            connector = int(connector_id)
+        except (TypeError, ValueError):
+            connector = 0
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or connector <= 0:
+            return
+        requested = {str(value or "").strip().lower() for value in pollutants}
+        requested &= set(V2_AQI_SUPPORTED_POLLUTANTS)
+        eligible = _active_aqi_eligible_pollutants_for_connector(conn, connector_id=connector)
+        if eligible is None:
+            blocked.append({
+                "stage": "aqilevels",
+                "day_utc": day,
+                "connector_id": connector,
+                "reason": "aqi_eligibility_mapping_unavailable",
+            })
+            return
+        eligible_requested = requested & eligible
+        if not eligible_requested:
+            return
+        entry = work.setdefault((day, connector), {
+            "day_utc": day,
+            "connector_id": connector,
+            "pollutant_codes": set(),
+            "reasons": set(),
+        })
+        entry["pollutant_codes"].update(eligible_requested)
+        entry["reasons"].add(reason)
+
+    for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []):
+        if isinstance(scope, Mapping):
+            add(scope.get("day_utc"), scope.get("connector_id"), scope.get("pollutant_codes") or [], "observations_changed")
+
+    changed_keys = {
+        key for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or [])
+        if isinstance(scope, Mapping) for key in [scope_key(scope)] if key is not None
+    }
+    for action in list(v2_aqilevels.get("repair_plan") or []):
+        if not isinstance(action, Mapping) or str(action.get("kind") or "") != "aqi_rebuild":
+            continue
+        key = scope_key(action)
+        add(
+            action.get("day_utc"),
+            action.get("connector_id"),
+            [action.get("pollutant_code")],
+            "observations_changed" if key in changed_keys else "aqi_data_fault",
+        )
+    return (
+        [
+            {**entry, "pollutant_codes": sorted(entry["pollutant_codes"]), "reasons": sorted(entry["reasons"])}
+            for _, entry in sorted(work.items())
+        ],
+        blocked,
+    )
+
+
+def _queue_phase4_aqi_work(
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    work: Iterable[Mapping[str, Any]],
+    log: logging.Logger,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    planned: list[dict[str, Any]] = []
+    for entry in work:
+        day_utc = str(entry["day_utc"])
+        connector_id = int(entry["connector_id"])
+        row = {**dict(entry), "history_version": "v2", "source_mode": "live_r2"}
+        planned.append(row)
+        if dry_run:
+            continue
+        _queue_aqi_rebuild(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            connector_id=connector_id,
+            day_utc=day_utc,
+            reason="phase4_aqi_rebuild",
+            source_mode="live_r2",
+            requested_timeseries_ids=[],
+            queue_note=(
+                "phase4 ordered AQI rebuild "
+                f"pollutants={','.join(str(value) for value in row['pollutant_codes'])} "
+                f"reasons={','.join(str(value) for value in row['reasons'])}"
+            ),
+            log=log,
+            history_version="v2",
+        )
+    return planned
+
+
+def run_v2_integrity_repair_flow(
+    *,
+    run_state: dict[str, Any],
+    conn: sqlite3.Connection,
+    run_id: int,
+    env_name: str,
+    run_compact: str,
+    env: dict[str, str],
+    v2_observations: Mapping[str, Any],
+    v2_aqilevels: Mapping[str, Any],
+    limits: LimitTracker,
+    dry_run: bool,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """Run the six ordered v2 stages, keeping data writers index-free."""
+    observations = run_v2_gap_backfills(
+        conn=conn, run_id=run_id, env_name=env_name, run_compact=run_compact,
+        env=env, v2_observations=v2_observations, dry_run=dry_run,
+        run_backfill=True, limits=limits, log=log, run_state=run_state,
+    )
+    observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
+    metadata_actions = _v2_observation_metadata_actions(v2_observations)
+    # A repaired leaf always makes its pollutant/connector/day metadata and
+    # targeted index eligible.  Keep one action set per day+connector so the
+    # executor writes each parent only after the full child set is final.
+    for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []):
+        if not isinstance(scope, Mapping):
+            continue
+        day_utc = str(scope.get("day_utc") or "").strip()
+        connector_id = scope.get("connector_id")
+        base = {
+            "status": "planned",
+            "executes": False,
+            "data_changes_required": False,
+            "operator_action_required": False,
+            "history_version": "v2",
+            "domain": "observations",
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "requires_index_rebuild": True,
+            "gap_types": ["observation_repaired"],
+        }
+        for pollutant_code in list(scope.get("pollutant_codes") or []):
+            metadata_actions.append({**base, "kind": "observation_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+        metadata_actions.extend([
+            {**base, "kind": "observation_connector_manifest_repair"},
+            {**base, "kind": "observation_day_manifest_repair"},
+            {**base, "kind": "observation_index_repair"},
+        ])
+    deduped_metadata_actions: dict[str, dict[str, Any]] = {}
+    for action in metadata_actions:
+        deduped_metadata_actions[json.dumps(action, sort_keys=True, default=str)] = action
+    metadata_actions = list(deduped_metadata_actions.values())
+    metadata = (
+        {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
+        if observation_failed else
+        _run_v2_observation_metadata_executor(env=env, actions=metadata_actions, dry_run=dry_run, log=log)
+    )
+    if observation_failed:
+        record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
+    _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
+    observation_stages_verified = not observation_failed and metadata.get("status") not in {
+        "failed", "blocked_dependency",
+    }
+    aqi_work, aqi_blocked = _phase4_aqi_work(
+        conn=conn, run_state=run_state, v2_aqilevels=v2_aqilevels,
+    )
+    for blocked in aqi_blocked:
+        record_blocked_scope(run_state, blocked)
+    if not observation_stages_verified:
+        aqi_result: dict[str, Any] = {
+            "status": "blocked_dependency",
+            "reason": "observation_stages_not_verified",
+            "aqi_rebuild_results": [],
+        }
+        if aqi_work:
+            record_blocked_scope(run_state, {
+                "stage": "aqilevels",
+                "reason": "observation_stages_not_verified",
+                "scope_count": len(aqi_work),
+            })
+    else:
+        planned_aqi_work = _queue_phase4_aqi_work(
+            conn=conn, run_id=run_id, env_name=env_name, work=aqi_work,
+            log=log, dry_run=dry_run,
+        )
+        aqi_result = run_aqi_rebuild_queue_execution(
+            conn,
+            run_id=run_id,
+            env_name=env_name,
+            run_compact=run_compact,
+            env=env,
+            dry_run=dry_run,
+            run_backfill=True,
+            limits=limits,
+            log=log,
+            dry_run_planned_rows=planned_aqi_work,
+            history_version="v2",
+            # The writer currently reads committed R2 observations.  They are
+            # the exact observation objects Phase 3 PUT-and-GET verified; the
+            # Dropbox mirror cannot contain this same-run state yet.
+            skip_stale_local_post_validation=True,
+        )
+        aqi_result["planned_phase4_aqi_work"] = planned_aqi_work
+
+    rebuilt_aqi_scopes: set[tuple[str, int]] = set()
+    aqi_capture_failures = 0
+    if not dry_run:
+        for entry in list(aqi_result.get("aqi_rebuild_results") or []):
+            if not isinstance(entry, Mapping) or str(entry.get("status") or "") != "complete":
+                continue
+            day_utc = str(entry.get("day_utc") or "").strip()
+            try:
+                connector_id = int(entry.get("connector_id"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                object_keys = _capture_verified_v2_aqi_scope(
+                    run_state=run_state, day_utc=day_utc,
+                    connector_id=connector_id, env=env,
+                )
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                aqi_capture_failures += 1
+                record_blocked_scope(run_state, {
+                    "stage": "aqilevels",
+                    "day_utc": day_utc,
+                    "connector_id": connector_id,
+                    "reason": f"aqi_overlay_r2_get_verification_failed:{type(exc).__name__}",
+                })
+                continue
+            rebuilt_aqi_scopes.add((day_utc, connector_id))
+            matching_work = next(
+                (item for item in aqi_work if str(item["day_utc"]) == day_utc and int(item["connector_id"]) == connector_id),
+                {},
+            )
+            record_changed_scope(run_state, "AQILEVELS_CHANGED", {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_codes": list(matching_work.get("pollutant_codes") or []),
+                "object_keys": object_keys,
+                "stage": "aqilevels",
+            })
+
+    aqi_metadata_actions = _v2_aqi_metadata_actions(v2_aqilevels)
+    # The AQI writer already emits its changed data, pollutant, connector and
+    # day manifests in one final connector/day write. Do not write those
+    # objects twice; retain only unchanged-scope manifest repairs here.
+    def aqi_action_scope(action: Mapping[str, Any]) -> tuple[str, int] | None:
+        try:
+            connector_id = int(action.get("connector_id"))
+        except (TypeError, ValueError):
+            return None
+        day_utc = str(action.get("day_utc") or "").strip()
+        return (day_utc, connector_id) if day_utc and connector_id > 0 else None
+
+    aqi_metadata_actions = [
+        action for action in aqi_metadata_actions
+        if aqi_action_scope(action) not in rebuilt_aqi_scopes
+    ]
+    for day_utc, connector_id in sorted(rebuilt_aqi_scopes):
+        aqi_metadata_actions.append({
+            "status": "planned", "executes": False,
+            "data_changes_required": False, "operator_action_required": False,
+            "history_version": "v2", "domain": "aqilevels",
+            "kind": "aqi_index_repair", "day_utc": day_utc,
+            "connector_id": connector_id, "requires_index_rebuild": True,
+            "gap_types": ["aqi_data_rebuilt"],
+        })
+    aqi_metadata = (
+        {"status": "blocked_dependency", "reason": "aqi_data_repair_failed", "results": []}
+        if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0 else
+        _run_v2_observation_metadata_executor(
+            env=env, actions=aqi_metadata_actions, domain="aqilevels",
+            dry_run=dry_run, log=log,
+        )
+    )
+    _record_metadata_executor_overlay(
+        run_state=run_state, executor_result=aqi_metadata, dry_run=dry_run,
+        manifest_scope_set="AQI_MANIFESTS_CHANGED", index_scope_set="AQI_INDEXES_CHANGED",
+        manifest_stage="aqilevels_manifests", index_stage="aqilevels_indexes",
+    )
+    stage_results = [
+        {"stage": "observs", "status": "failed" if observation_failed else ("planned" if dry_run else "succeeded"), "result": observations},
+        {"stage": "observs_manifests", "status": metadata.get("status"), "result": metadata},
+        {"stage": "observs_indexes", "status": metadata.get("status"), "reason": "the metadata executor runs indexes once after final manifests per affected day"},
+        {"stage": "aqilevels", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else ("planned" if dry_run else "succeeded"), "result": aqi_result, "live_r2_read_exception": "writer_reads_verified_live_r2_observations"},
+        {"stage": "aqilevels_manifests", "status": aqi_metadata.get("status"), "result": aqi_metadata},
+        {"stage": "aqilevels_indexes", "status": aqi_metadata.get("status"), "reason": "the metadata executor runs AQI indexes once after final manifests per affected day"},
+        {"stage": "final_verification", "status": "not_run", "reason": "owned by a later phase"},
+    ]
+    result = {
+        "status": "failed" if observation_failed or metadata.get("status") in {"failed", "blocked_dependency"} or aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0 or aqi_metadata.get("status") in {"failed", "blocked_dependency"} else ("planned" if dry_run else "succeeded"),
+        "dry_run": bool(dry_run),
+        "write_enabled": not dry_run,
+        "r2_write_attempted": not dry_run,
+        "stage_order": list(V2_REPAIR_STAGE_ORDER),
+        "stage_results": stage_results,
+        "overlay_root": run_state["overlay_root"],
+        "run_state_path": run_state["run_state_path"],
+    }
+    run_state["coordinator"] = result
+    write_run_state(run_state)
+    log.info(
+        "v2 repair coordinator %s: stages=%s r2_write_attempted=%s",
+        result["status"],
+        ",".join(V2_REPAIR_STAGE_ORDER),
+        result["r2_write_attempted"],
+    )
+    return result
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="uk-aq-history-integrity",
@@ -13559,7 +14382,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--check-only", action="store_true",
                    help="Detect changes; do not trigger backfill.")
     p.add_argument("--run-backfill", action="store_true",
-                   help="Trigger narrow backfill on confirmed source change.")
+                   help="Enable the ordered v2 repair flow after read-only detection.")
     p.add_argument("--max-download-mb", type=int, default=None)
     p.add_argument("--max-runtime-minutes", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
@@ -13621,11 +14444,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Treat missing/invalid v2 AQI hourly debug partitions as errors (default false; env UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG).",
     )
     parsed = p.parse_args(argv)
-    if parsed.run_backfill:
+    if parsed.check_only and parsed.run_backfill:
         p.error(
-            "--run-backfill is temporarily disabled for current v2 integrity: "
-            "the Phase 8 orchestrator does not yet own the observation-data, "
-            "Phase 3 manifest/index, AQI, and mandatory post-repair sequence.",
+            "--check-only and --run-backfill cannot be used together.",
         )
     return parsed
 
@@ -15052,6 +15873,25 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     f"running_since={running.get('started_at') or '(none)'}"
                 )
             lines.append("")
+    repair_flow = s.get("repair_flow") or {}
+    if repair_flow:
+        lines.extend([
+            "## V2 repair coordinator",
+            "",
+            f"- Status: {repair_flow.get('status') or '(none)'}",
+            f"- R2 write attempted: {bool(repair_flow.get('r2_write_attempted'))}",
+            f"- Overlay root: {repair_flow.get('overlay_root') or '(none)'}",
+            f"- Run state: {repair_flow.get('run_state_path') or '(none)'}",
+            "- Stage order: " + " → ".join(repair_flow.get("stage_order") or []),
+            "",
+        ])
+        for stage in repair_flow.get("stage_results") or []:
+            lines.append(
+                f"- {stage.get('stage')}: {stage.get('status')}"
+                f" ({stage.get('reason') or '(none)'})"
+            )
+        if repair_flow.get("stage_results"):
+            lines.append("")
     lookup_counts = s.get("lookup_source_counts") or {}
     if lookup_counts:
         lines.extend([
@@ -15610,6 +16450,27 @@ def main(argv: list[str]) -> int:
     # scheduled backup readiness has been established (or explicitly bypassed).
     preflight_summary = run_preflight_or_die(args, env)
     log.info("preflight summary=%s", preflight_summary)
+    repair_overlay: dict[str, Any] | None = None
+    repair_flow: dict[str, Any] = {
+        "status": "not_requested",
+        "r2_write_attempted": False,
+        "stage_order": list(V2_REPAIR_STAGE_ORDER),
+    }
+    if args.run_backfill:
+        dropbox_root = resolve_r2_history_root({**os.environ, **env})
+        if not dropbox_root:
+            raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is required for the v2 repair overlay")
+        repair_overlay = create_run_overlay(
+            tmp_dir=env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"],
+            run_id=run_compact,
+            environment=args.env,
+            base_dropbox_root=dropbox_root,
+        )
+        log.info(
+            "created v2 repair overlay run_state=%s overlay=%s",
+            repair_overlay["run_state_path"],
+            repair_overlay["overlay_root"],
+        )
     if daily_task_health_enabled:
         start_summary = {
             "env": args.env,
@@ -15766,7 +16627,7 @@ def main(argv: list[str]) -> int:
             openaq_metrics = check_openaq(
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
-                dry_run=args.dry_run, run_backfill=args.run_backfill,
+                dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
                 history_version=source_adapter_history_version,
@@ -15782,7 +16643,7 @@ def main(argv: list[str]) -> int:
             sc_metrics = check_sensor_community(
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
-                dry_run=args.dry_run, run_backfill=args.run_backfill,
+                dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
                 history_version=source_adapter_history_version,
@@ -15798,7 +16659,7 @@ def main(argv: list[str]) -> int:
             sos_metrics = check_sos(
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
-                dry_run=args.dry_run, run_backfill=args.run_backfill,
+                dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log,
                 concurrency=max(1, int(args.concurrency)),
                 history_version=source_adapter_history_version,
@@ -15888,6 +16749,21 @@ def main(argv: list[str]) -> int:
                 blocked_connector_days=observation_gap_keys,
             )
             cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
+
+        if repair_overlay is not None:
+            repair_flow = run_v2_integrity_repair_flow(
+                run_state=repair_overlay,
+                conn=conn,
+                run_id=int(run_id),
+                env_name=args.env,
+                run_compact=run_compact,
+                env=env,
+                v2_observations=cross_check_metrics.get("v2_observations") or {},
+                v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
+                limits=limits,
+                dry_run=bool(args.dry_run),
+                log=log,
+            )
 
         any_adapter_ran = (
             openaq_metrics.get("ran")
@@ -16318,6 +17194,7 @@ def main(argv: list[str]) -> int:
             "skip_cross_check": args.skip_cross_check,
             "allow_stale_dropbox": bool(args.allow_stale_dropbox),
             "backup_readiness": backup_gate_summary,
+            "repair_flow": repair_flow,
             "max_download_mb": args.max_download_mb,
             "max_runtime_minutes": args.max_runtime_minutes,
             "started_at_utc": started_iso,

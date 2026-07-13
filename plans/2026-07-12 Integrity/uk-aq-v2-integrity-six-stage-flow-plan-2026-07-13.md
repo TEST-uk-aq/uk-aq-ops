@@ -716,6 +716,30 @@ A single direct CLI parse invocation is allowed to prove that valid v2 repair mo
 
 Do not run the full test suite.
 
+### Phase 2 implementation record (13/07/2026)
+
+Implemented the Phase 2 v2 coordinator in
+`scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py`:
+
+- Added the sparse local run overlay and `run-state.json` primitives. The state
+  records the run/environment/base and overlay roots, object hash/size/stage/
+  dependency/upload/verification fields, changed-scope sets, and blocked scopes.
+- Added overlay-first, Dropbox-second local resolution. Overlay entries are
+  selected only after `r2_verified=true`; staging rejects copying a Dropbox
+  backup object into the overlay.
+- Restored v2 `--run-backfill` in both Python and the shell launcher, made it
+  mutually exclusive with `--check-only`, and retained v2-only validation.
+- Added the exact seven-stage coordinator order. Dry-run marks every stage
+  planned; non-dry-run keeps every Phase 2 specialist stage not run. Neither
+  path calls an R2 writer.
+- Forced source adapters and the legacy v2 repair planners to remain
+  `run_backfill=False` during detection, so all future writes remain owned by
+  the coordinator.
+
+Structural validation completed: `python3 -m py_compile`, `bash -n` for the
+launcher and env templates, and `git diff --check` passed. No Integrity run,
+R2 contact, deployment, commit, staging, or push was performed.
+
 ## Recommended model
 
 ```text
@@ -906,6 +930,47 @@ Do not run the full Python or Node suites.
 
 Do not perform a functional repair yet.
 
+## Phase 3 implementation record — 2026-07-13
+
+Implemented the first three coordinator stages in
+`scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py` and the
+observation specialist path.
+
+- Inspected the `observations_only` contract before editing. The v2 writer
+  emits pollutant-part parquet (`part-*.parquet`), then pollutant, connector,
+  and day manifests; the local wrapper can also perform a full index rebuild.
+  The Integrity wrapper now disables that full rebuild and no longer invokes a
+  targeted index itself, leaving one post-manifest targeted index pass to the
+  coordinator.
+- Restored the v2-only Integrity specialist wrapper, retaining its observation
+  and AQI modes while removing the disabled exit and unreachable v1 path.
+- Reconnected the observation specialist only after read-only detection. It
+  groups work by day/connector and preserves timeseries/pollutant detail,
+  blocks non-ready source-cache scopes, and always enables the run overlay as
+  its targeted local stage. Successful leaf scopes populate `OBSERVS_CHANGED`.
+- The coordinator now invokes the observation metadata specialist after the
+  observations stage. It supports pollutant-manifest actions, then connector
+  and day manifests, and invokes the targeted observation index only after the
+  day’s manifest work. Changed metadata/index proposals are persisted into the
+  sparse overlay and verified execution results populate
+  `OBS_MANIFESTS_CHANGED` / `OBS_INDEXES_CHANGED`.
+- Failed observation repair blocks the metadata/index stages for that scope;
+  AQI stages remain explicitly `not_run` for Phase 4.
+- Updated the current operator docs and env-template comments to describe the
+  active observation stages and the coordinator-owned index.
+
+Structural checks passed:
+
+```text
+python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+bash -n scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh
+node --check scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs
+deno check workers/uk_aq_backfill_local/run_job.ts
+git diff --check
+```
+
+No Integrity run, R2 request, deployment, commit, stage, or push was performed.
+
 ## Recommended model
 
 ```text
@@ -1095,6 +1160,45 @@ git diff --check
 ```
 
 No full test suites.
+
+## Phase 4 implementation record — 2026-07-14
+
+Implemented the ordered AQI stages in
+`scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py` and extended
+`scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs` into the shared
+v2 metadata executor.
+
+- AQI work is now the union of AQI-eligible `OBSERVS_CHANGED` leaves and
+  executable AQI data faults from unchanged observation scopes. Eligibility is
+  read from the v2 core mapping; unsupported or unmapped pollutants are not
+  queued.
+- The existing queue/execution specialist runs one v2 AQI rebuild per final
+  connector/day after observation stages are verified. AQI rebuilds are
+  triggered for eligible observation changes even when their UTC-hour identity
+  is unchanged; unchanged scopes retain the existing UTC-hour validation.
+- Narrow live-R2 exception: the current AQI writer only reads committed R2
+  observations. Phase 4 uses the observation objects already PUT-and-GET
+  verified by Phase 3, then GET-verifies every resulting AQI object into the
+  sparse overlay. This avoids an unsafe local-reader rewrite in this phase.
+- The AQI wrapper remains index-free. The generalized metadata executor repairs
+  AQI pollutant/connector/day manifests for unchanged scopes and runs one
+  targeted AQI index only after final manifests. Changed proposals are recorded
+  in `AQI_MANIFESTS_CHANGED` and `AQI_INDEXES_CHANGED`; captured AQI data
+  scopes populate `AQILEVELS_CHANGED`.
+- Observation-stage, AQI-data, and AQI-metadata dependency failures block their
+  downstream scope while unrelated connector/day scopes continue.
+
+Structural checks passed:
+
+```text
+python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
+bash -n scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh
+node --check scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs
+deno check workers/uk_aq_backfill_local/run_job.ts
+git diff --check
+```
+
+No Integrity run, R2 request, deployment, commit, stage, or push was performed.
 
 ## Recommended model
 

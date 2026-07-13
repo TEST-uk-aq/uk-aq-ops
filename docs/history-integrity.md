@@ -5,14 +5,14 @@ orchestrator for the UK-AQ history integrity run.
 
 ## Supported runtime model
 
-Run history integrity, including the Phase 3 executor, from the complete ops
+Run history integrity, including the Phase 3/4 executors, from the complete ops
 checkout at:
 
 ```text
 /Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops
 ```
 
-This is the only supported runtime model. The Phase 3 executor imports shared
+This is the only supported runtime model. The Phase 3/4 executor imports shared
 R2/index code and the Phase B writer from elsewhere in the repository, whose
 Node dependencies are also required. Do not copy a partial `bin/` or `env/`
 directory and do not rely on an undocumented runtime bundle.
@@ -27,12 +27,24 @@ directory and do not rely on an undocumented runtime bundle.
 6. Validate v2 only:
    - observations partitions and manifests;
    - AQI hourly partitions and manifests.
-7. Build a repair plan and write JSON/Markdown reports.
+7. Build the repair plan. When `--run-backfill` is set, create a sparse local
+   run overlay and run the ordered v2 coordinator after all detection has
+   completed.
+8. Write JSON/Markdown reports.
 
-`--history-version v2` is the only accepted history version. `v1`, `both`,
-and `--run-backfill` are rejected before scanning or repair work. The current
-integrity CLI is read-only while the single v2 repair orchestrator is completed;
-the Phase 3 executor remains the authoritative manifest/index finaliser.
+`--history-version v2` is the only accepted history version. `v1` and `both`
+remain rejected. `--check-only` and `--run-backfill` are mutually exclusive.
+`--run-backfill --dry-run` records the complete stage plan without writes;
+without `--dry-run`, the coordinator runs the ordered observation and AQI
+stages. The AQI writer uses the already verified live-R2 observation scope as
+the narrow same-run exception; generated AQI objects are GET-verified into the
+overlay before metadata/index work proceeds.
+
+The overlay is under `UK_AQ_HISTORY_INTEGRITY_TMP_DIR/run-<UTC>/overlay` and
+contains only changed/generated objects. `run-state.json` records object hashes,
+dependencies, upload/verification state, changed scopes, and blocked scopes.
+Later stages resolve a verified overlay object first, then the matching
+`R2_history_backup` object. The backup is never updated or copied into.
 
 ## Backup gate
 
@@ -105,8 +117,9 @@ differences are retained in the report.
 
 ## Repair planning
 
-Each v2 run includes a deterministic, deduplicated `repair_plan` array. Phase 2
-plans are non-executing (`executes=false`, `status=planned`) and include
+Each v2 run includes a deterministic, deduplicated `repair_plan` array. The
+The coordinator consumes observation and AQI metadata/index actions after data
+repair and includes
 `data_changes_required`, `requires_index_rebuild`, and all contributing gap
 types.
 
