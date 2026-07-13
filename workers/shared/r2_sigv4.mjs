@@ -283,6 +283,9 @@ async function fetchR2WithRetry({ method, buildRequest, body = undefined }) {
 }
 
 export async function r2PutObject({ r2, key, body, content_type = "application/octet-stream" }) {
+  if (r2?.adapter?.putObject) {
+    return r2.adapter.putObject({ key, body, content_type });
+  }
   const bufferBody = body instanceof Uint8Array ? body : Buffer.from(body);
   const payloadHash = createHash("sha256").update(bufferBody).digest("hex");
   const response = await fetchR2WithRetry({
@@ -345,6 +348,9 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
 }
 
 export async function r2HeadObject({ r2, key }) {
+  if (r2?.adapter?.headObject) {
+    return r2.adapter.headObject({ key });
+  }
   const response = await fetchR2WithRetry({
     method: "HEAD",
     buildRequest: () => buildAwsSignedRequest({
@@ -381,6 +387,9 @@ export async function r2HeadObject({ r2, key }) {
 }
 
 export async function r2GetObject({ r2, key }) {
+  if (r2?.adapter?.getObject) {
+    return r2.adapter.getObject({ key });
+  }
   const response = await fetchR2WithRetry({
     method: "GET",
     buildRequest: () => buildAwsSignedRequest({
@@ -499,6 +508,9 @@ export async function r2ListObjectsV2({
 }
 
 export async function r2ListAllObjects({ r2, prefix, max_keys = 1000 }) {
+  if (r2?.adapter?.listAllObjects) {
+    return r2.adapter.listAllObjects({ prefix, max_keys });
+  }
   const entries = [];
   let token = null;
   for (;;) {
@@ -518,6 +530,9 @@ export async function r2ListAllObjects({ r2, prefix, max_keys = 1000 }) {
 }
 
 export async function r2ListAllCommonPrefixes({ r2, prefix, delimiter = "/", max_keys = 1000 }) {
+  if (r2?.adapter?.listAllCommonPrefixes) {
+    return r2.adapter.listAllCommonPrefixes({ prefix, delimiter, max_keys });
+  }
   const prefixes = [];
   let token = null;
   for (;;) {

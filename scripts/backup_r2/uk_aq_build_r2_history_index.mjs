@@ -110,12 +110,36 @@ function summarizeWriteOutcome(summary) {
   };
 }
 
+const UNSUCCESSFUL_REPAIR_STATUSES = new Set(["blocked_dependency", "failed"]);
+
+function findUnsuccessfulStatus(value, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return null;
+  seen.add(value);
+  if (Number(value.blocked_dependency_count || 0) > 0) return "blocked_dependency";
+  if (Number(value.failed_count || value.failure_count || 0) > 0) return "failed";
+  if (UNSUCCESSFUL_REPAIR_STATUSES.has(value.status)) return value.status;
+  if (UNSUCCESSFUL_REPAIR_STATUSES.has(value.verification_status)) return value.verification_status;
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const status = findUnsuccessfulStatus(entry, seen);
+      if (status) return status;
+    }
+    return null;
+  }
+  for (const entry of Object.values(value)) {
+    const status = findUnsuccessfulStatus(entry, seen);
+    if (status) return status;
+  }
+  return null;
+}
+
 function buildRepairSections(summary, { writeR2, mode }) {
   const blockedDependencyCount = Number(summary?.blocked_dependency_count || 0);
   const outcome = summarizeWriteOutcome(summary);
-  const repairStatus = blockedDependencyCount > 0
-    ? "blocked_dependency"
-    : (!writeR2 ? "planned" : (outcome.allSkipped ? "skipped_unchanged" : "succeeded"));
+  const unsuccessfulStatus = findUnsuccessfulStatus(summary);
+  const repairStatus = unsuccessfulStatus
+    || (blockedDependencyCount > 0 ? "blocked_dependency"
+    : (!writeR2 ? "planned" : (outcome.allSkipped ? "skipped_unchanged" : "succeeded")));
   return {
     repair: {
       status: repairStatus,
@@ -126,12 +150,12 @@ function buildRepairSections(summary, { writeR2, mode }) {
         blocked_dependency_count: blockedDependencyCount,
       },
       execution: {
-        status: blockedDependencyCount > 0 ? "not_run" : repairStatus,
+        status: unsuccessfulStatus ? "not_run" : repairStatus,
         write_r2: writeR2,
       },
       verification: {
-        status: writeR2 && blockedDependencyCount === 0 ? repairStatus : "not_run",
-        fresh_remote_reads: writeR2 && blockedDependencyCount === 0,
+        status: writeR2 && !unsuccessfulStatus ? repairStatus : "not_run",
+        fresh_remote_reads: writeR2 && !unsuccessfulStatus,
       },
     },
   };
@@ -442,11 +466,20 @@ function loadTargetsFromCsv(csvPath) {
   return out;
 }
 
-export async function runHistoryIndexBuild({ argv = process.argv.slice(2), env = process.env } = {}) {
+export function exitCodeForHistoryIndexResult(payload) {
+  return payload?.ok === false ? 1 : 0;
+}
+
+export async function runHistoryIndexBuild({
+  argv = process.argv.slice(2),
+  env = process.env,
+  rebuildIndexes = rebuildR2HistoryIndexes,
+  updateIndexesTargeted = updateR2HistoryIndexesTargeted,
+} = {}) {
   const args = parseArgs(argv);
   const writeR2 = args.mode === "write-r2";
   const summary = args.targeted
-    ? await updateR2HistoryIndexesTargeted({
+    ? await updateIndexesTargeted({
         env,
         historyVersion: args.historyVersion,
         domains: args.domains,
@@ -458,7 +491,7 @@ export async function runHistoryIndexBuild({ argv = process.argv.slice(2), env =
         strictMissingTimeseriesCounts: args.strictMissingTimeseriesCounts,
         writeR2,
       })
-    : await rebuildR2HistoryIndexes({
+    : await rebuildIndexes({
         env,
         domains: args.domains,
         historyVersion: args.historyVersion,
@@ -470,29 +503,38 @@ export async function runHistoryIndexBuild({ argv = process.argv.slice(2), env =
         writeR2,
       });
   const repair = buildRepairSections(summary, { writeR2, mode: args.mode });
+  const status = repair.repair.status;
   return {
-    ok: true,
-    status: repair.repair.status,
+    ...summary,
+    ...repair,
+    ok: !UNSUCCESSFUL_REPAIR_STATUSES.has(status),
+    status,
     mode: args.mode,
     dry_run: !writeR2,
     write_r2: writeR2,
     history_version: args.historyVersion,
     targeted: args.targeted,
-    ...repair,
-    ...summary,
   };
 }
 
-async function main() {
-  const payload = await runHistoryIndexBuild({ argv: process.argv.slice(2), env: process.env });
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+export async function main({
+  run = runHistoryIndexBuild,
+  argv = process.argv.slice(2),
+  env = process.env,
+  stdout = process.stdout,
+} = {}) {
+  const payload = await run({ argv, env });
+  stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  return exitCodeForHistoryIndexResult(payload);
 }
 
 const isMain = process.argv[1]
   && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isMain) {
-  main().catch((error) => {
+  main().then((exitCode) => {
+    process.exitCode = exitCode;
+  }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
     process.exit(1);

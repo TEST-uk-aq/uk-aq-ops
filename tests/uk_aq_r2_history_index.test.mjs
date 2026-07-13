@@ -20,7 +20,10 @@ import {
   resolveR2HistoryIndexConfig,
   updateR2HistoryIndexesTargeted,
 } from "../workers/shared/uk_aq_r2_history_index.mjs";
-import { runHistoryIndexBuild } from "../scripts/backup_r2/uk_aq_build_r2_history_index.mjs";
+import {
+  main as runHistoryIndexBuildCommand,
+  runHistoryIndexBuild,
+} from "../scripts/backup_r2/uk_aq_build_r2_history_index.mjs";
 
 test("buildDaySummaryFromManifest keeps connector row counts from observations day manifest", () => {
   const summary = buildDaySummaryFromManifest({
@@ -722,6 +725,23 @@ test("generic index builder permits an explicitly gated configured environment b
   } finally {
     fake.restore();
   }
+});
+
+test("Phase 7 blocked generic index work returns ok=false and its command exits non-zero", async () => {
+  const output = await runHistoryIndexBuild({
+    argv: ["--history-version", "v2"],
+    rebuildIndexes: async () => ({ blocked_dependency_count: 1 }),
+  });
+  assert.equal(output.ok, false);
+  assert.equal(output.status, "blocked_dependency");
+
+  let printed = "";
+  const exitCode = await runHistoryIndexBuildCommand({
+    run: async () => output,
+    stdout: { write: (value) => { printed += value; } },
+  });
+  assert.equal(exitCode, 1);
+  assert.match(printed, /"ok": false/);
 });
 
 test("v2 pollutant index payload is byte-stable when source backed_up_at_utc is unchanged", () => {

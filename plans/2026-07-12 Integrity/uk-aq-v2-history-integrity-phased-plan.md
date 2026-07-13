@@ -162,21 +162,16 @@ The new integrity flow must detect and repair this hierarchy without:
 
 # Phase status
 
+This is the sole authoritative current status table for history-integrity
+remediation. The Phase 2c and Phase 3 implementation plans are historical
+records and must not be used as current-status authority.
+
 | Phase | Name | Status | Completion commit | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | Backup gate correctness and safety | Complete | `6965763` | Committed on `main`; implementation and local validation complete. |
-| 2 | Complete read-only v2 validation | Complete | `4438499` | Implemented on main across `7e1b352..4438499`; local validation complete; runtime Phase 2 validation remains pending. |
-| 3 | Observation manifest and index repair | In progress |  | Implementation corrected and locally mock-validated; CIC-Test runtime dry-run and explicitly approved CIC-Test repair execution remain pending. LIVE repair execution is not enabled. |
-| 4 | Observation data repair and AQI sequencing | Not started |  |  |
-
-Allowed status values:
-
-```text
-Not started
-In progress
-Blocked
-Complete
-```
+| 1 | Backup gate correctness and safety | Implementation complete | `6965763` | Local validation complete. |
+| 2 | Complete read-only v2 validation | Implementation complete; runtime acceptance pending | `4438499` | Local validation is complete; the real CIC-Test DuckDB check-only acceptance remains pending. |
+| 3 | Observation manifest and index repair | In progress; not safe for runtime execution |  | Local mocked implementation exists, but the remaining Phase 3 safety blockers and CIC-Test dry-run acceptance are pending. LIVE repair execution is disabled. |
+| 4 | Observation data repair and AQI sequencing | Existing overlapping implementation requires audit; formal phase not complete |  | Existing `--run-backfill` paths require the Phase 9 inventory before further Phase 4 design or execution. |
 
 After completing a phase, Codex must:
 
@@ -308,12 +303,14 @@ Never log secret values.
 
 ### 5. Correct the SQL
 
-Maintain matching definitions in:
+The canonical readiness-RPC definition is maintained only in:
 
 ```text
 TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_daily_task_backup_readiness.sql
-TEST-uk-aq-ops/scripts/uk-aq-history-integrity/sql/uk_aq_rpc_daily_task_backup_readiness.sql
 ```
+
+The ops backup-gate contract test reads that sibling schema file directly. Do
+not create or retain an ops SQL mirror solely for test comparison.
 
 Requirements:
 

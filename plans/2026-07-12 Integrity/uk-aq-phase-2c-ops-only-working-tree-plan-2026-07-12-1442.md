@@ -14,6 +14,9 @@ Expected location inside the ops repository:
 plans/2026-07-12 Integrity/uk-aq-phase-2c-ops-only-working-tree-plan-2026-07-12-1442.md
 ```
 
+> Historical implementation record. Current history-integrity phase status is
+> authoritative only in `uk-aq-v2-history-integrity-phased-plan.md`.
+
 # Critical repository boundary
 
 ## The only writable repository

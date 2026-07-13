@@ -1,0 +1,71 @@
+{
+  "env": "CIC-Test",
+  "profile": "manual",
+  "source": "all",
+  "history_integrity_schema_version": "1",
+  "history_version_mode": "v2",
+  "checked_versions": ["v2"],
+  "history_path_configs": {
+    "v2": {
+      "history_version": "v2",
+      "observations_data_prefix": "history/v2/observations"
+    }
+  },
+  "history_version_results": {
+    "v2": {
+      "history_version": "v2",
+      "checks_implemented": true,
+      "status": "fail",
+      "observations": {
+        "status": "fail",
+        "checked_partitions": 1,
+        "gap_count": 1,
+        "gaps": [
+          {
+            "history_version": "v2",
+            "domain": "observations",
+            "gap_type": "connector_manifest_missing",
+            "day_utc": "2026-05-17",
+            "connector_id": 1,
+            "pollutant_code": "o3"
+          }
+        ],
+        "repair_plan": [
+          {
+            "kind": "observation_connector_manifest_repair",
+            "status": "planned",
+            "day_utc": "2026-05-17",
+            "connector_id": 1,
+            "pollutant_code": "o3",
+            "requires_index_rebuild": true,
+            "data_changes_required": false,
+            "executes": false,
+            "operator_action_required": false,
+            "gap_types": ["connector_manifest_missing"],
+            "commands": [],
+            "notes": "Rebuild the connector manifest from verified pollutant manifests."
+          }
+        ],
+        "source_scope": { "scope": "all" }
+      },
+      "aqilevels": {
+        "status": "ok",
+        "checked_partitions": 0,
+        "gap_count": 0,
+        "gaps": [],
+        "repair_plan": [],
+        "debug": { "checked": false, "required": false, "status": "skipped", "gap_count": 0, "gaps": [] }
+      }
+    }
+  },
+  "from_day": "2026-05-17",
+  "to_day": "2026-05-17",
+  "dry_run": true,
+  "check_only": true,
+  "run_backfill": false,
+  "status": "fail",
+  "run_id": 1,
+  "cross_check": {},
+  "metrics": {},
+  "notes": []
+}
