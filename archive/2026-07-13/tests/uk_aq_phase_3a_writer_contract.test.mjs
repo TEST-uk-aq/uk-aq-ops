@@ -6,7 +6,6 @@ import {
   buildHistoryV2DayManifestForTest,
   buildHistoryV2PollutantManifestForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
-import { buildDayManifestFromConnectorManifests } from "../scripts/backup_r2/uk_aq_rebuild_r2_day_manifest_from_connectors.mjs";
 
 const DAY = "2026-06-13";
 const BACKED_UP_AT_UTC = "2026-06-15T00:00:00.000Z";
@@ -238,31 +237,4 @@ test("Phase B v2 day manifests sort child connector manifests and remain byte-st
   ]);
   assert.equal(JSON.stringify(first), JSON.stringify(second));
   assert.equal(first.manifest_hash, hashWithoutManifestHash(first));
-});
-
-test("v2 day-manifest repair reuses the authoritative Phase B payload exactly", () => {
-  const connector = buildConnectorManifest({
-    dayUtc: DAY,
-    connectorId: 6,
-    pollutantManifests: [buildPollutantManifest({
-      dayUtc: DAY,
-      connectorId: 6,
-      pollutantCode: "o3",
-      fileEntries: [{
-        key: partKey(DAY, 6, "o3", 0), row_count: 1, bytes: 9, etag_or_hash: "o3",
-        min_timeseries_id: 600, max_timeseries_id: 600,
-        min_observed_at_utc: `${DAY}T00:00:00.000Z`, max_observed_at_utc: `${DAY}T00:00:00.000Z`,
-        timeseries_row_counts: { "600": 1 },
-      }],
-    })],
-  });
-  const authoritative = buildDayManifest({ dayUtc: DAY, connectorManifests: [connector] });
-  const repaired = buildDayManifestFromConnectorManifests({
-    domain: "observations",
-    historyVersion: "v2",
-    dayUtc: DAY,
-    connectorManifests: [connector],
-    existingDayManifest: { manifest_key: authoritative.manifest_key, run_id: "test-run", writer_git_sha: WRITER_GIT_SHA },
-  });
-  assert.equal(JSON.stringify(repaired), JSON.stringify(authoritative));
 });

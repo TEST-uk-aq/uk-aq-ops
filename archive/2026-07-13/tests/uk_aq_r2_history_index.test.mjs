@@ -704,10 +704,9 @@ test("runHistoryIndexBuild dry-run stays read only and reports planned repair se
   }
 });
 
-test("generic index builder permits an explicitly gated configured environment bucket", async () => {
-  const fake = installFakeR2Fetch({});
-  try {
-    const output = await runHistoryIndexBuild({
+test("runHistoryIndexBuild write gate refuses non-test buckets", async () => {
+  await assert.rejects(
+    runHistoryIndexBuild({
       argv: ["--history-version", "v2", "--write-r2"],
       env: {
         CFLARE_R2_ENDPOINT: "https://r2.example.invalid",
@@ -715,13 +714,9 @@ test("generic index builder permits an explicitly gated configured environment b
         CFLARE_R2_ACCESS_KEY_ID: "key",
         CFLARE_R2_SECRET_ACCESS_KEY: "secret",
       },
-    });
-    assert.equal(output.write_r2, true);
-    assert.notEqual(output.status, "planned");
-    assert.ok(fake.puts.size > 0);
-  } finally {
-    fake.restore();
-  }
+    }),
+    /Refusing --write-r2 for non-TEST bucket: uk-aq-history-dev/,
+  );
 });
 
 test("v2 pollutant index payload is byte-stable when source backed_up_at_utc is unchanged", () => {
@@ -947,17 +942,6 @@ function installFakeR2Fetch(objectsByKey) {
   }
   globalThis.fetch = async (url, init = {}) => {
     const method = String(init.method || "GET").toUpperCase();
-    const parsed = new URL(String(url));
-    if (method === "GET" && parsed.searchParams.get("list-type") === "2") {
-      const objectPrefix = parsed.searchParams.get("prefix") || "";
-      const keys = [...new Set([...Object.keys(objectsByKey), ...puts.keys()])]
-        .filter((candidate) => candidate.startsWith(objectPrefix))
-        .sort((left, right) => left.localeCompare(right));
-      return new Response(
-        `<ListBucketResult>${keys.map((candidate) => `<Contents><Key>${candidate}</Key><Size>1</Size></Contents>`).join("")}</ListBucketResult>`,
-        { status: 200 },
-      );
-    }
     const key = keyFromUrl(String(url));
     if (method === "GET") {
       if (puts.has(key)) {

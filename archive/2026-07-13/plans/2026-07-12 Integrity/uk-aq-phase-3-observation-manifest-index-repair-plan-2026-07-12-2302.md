@@ -110,9 +110,9 @@ Representative current cases to preserve:
 
 | Phase | Name | Status | Notes |
 | --- | --- | --- | --- |
-| 3a | Writer contract and deterministic builders | In progress | The Phase B builders are exported for repair reuse; CIC-Test runtime dry-run remains pending. |
-| 3b | Repair planning and dry-run orchestration | In progress | Narrow v2 observations plan input is implemented and mock-validated; runtime acceptance remains pending. |
-| 3c | Explicitly gated R2 execution and verification | In progress | CIC-Test-only repair writes are explicit-gate protected; no real R2 verification has occurred. |
+| 3a | Writer contract and deterministic builders | Complete | Reuse the existing Node exports; no parallel Python builder. |
+| 3b | Repair planning and dry-run orchestration | Complete | Bottom-up observation repair only; preserve valid siblings. |
+| 3c | Explicitly gated R2 execution and verification | Complete | Writes only behind an explicit gate; verify changed objects directly in R2. |
 
 Allowed status values:
 
@@ -120,7 +120,7 @@ Allowed status values:
 Not started
 In progress
 Blocked
-In progress
+Complete
 ```
 
 ## Phase 3a: Writer contract and deterministic builders
@@ -299,17 +299,20 @@ Complete
 Completed work:
 
 ```text
-Corrected the unsafe filtered day-manifest rebuild so a connector filter is only an assertion: all connector siblings are enumerated and retained. Exported the authoritative Phase B v2 manifest builders and added the narrow `uk_aq_execute_v2_observations_repair.mjs` executor, which accepts only v2 observations manifest/index repair actions, rejects AQI/data/operator actions, is dry-run by default, and refuses non-CIC-Test repair writes. The executor does not reconstruct pollutant manifests without complete parquet-derived metadata. The generic index builder remains explicitly gated but is no longer CIC-Test-only, preserving legitimate normal LIVE index rebuilds. The integrity wrapper adds `--write-r2` only after its dry-run exit.
+Added deterministic child-order normalization to the Phase B v2 pollutant, connector and day manifest builders in `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`. Added `tests/uk_aq_phase_3a_writer_contract.test.mjs` to lock manifest hash stability, byte-stable rebuilds and normalized child ordering for the authoritative Node writer contract.
+Added Phase 3b precedence filtering in `build_v2_repair_plan` so `source_mapping_issue` no longer survives alongside higher-priority data repairs for the same pollutant partition. Added a regression test in `scripts/uk-aq-history-integrity/tests/test_backup_gate_and_repair_plan.py` covering data-fault precedence over operator review and manifest-only repair.
+Added explicit `--write-r2` gating and fresh live-read verification to `scripts/backup_r2/uk_aq_build_r2_history_index.mjs` and `scripts/backup_r2/uk_aq_rebuild_r2_day_manifest_from_connectors.mjs`, plus the `scripts/uk_aq_backfill_local.sh` handoff to pass the write gate only when non-dry-run backfill execution is requested. Added focused phase 3c regression tests for dry-run planning, non-test bucket refusal, unchanged-object skips, approved-key writes, and live verification failures.
 ```
 
 Tests:
 
 ```text
-Focused mocked Node validation passes include the authoritative writer contract, full day-manifest sibling repair checks, generic index write-gate checks, and the O3 parent-manifest/idempotence executor fixture. Python coverage verifies the integrity wrapper reaches its targeted index command only after dry-run exits. Full-suite validation remains recorded only after the final commands in this worktree complete.
+Focused Node validation passed: `node --test tests/uk_aq_rebuild_r2_day_manifest_from_connectors.test.mjs tests/uk_aq_r2_history_index.test.mjs` -> 30 tests, 0 failures, 0 skipped. `node --check scripts/backup_r2/uk_aq_build_r2_history_index.mjs`, `node --check scripts/backup_r2/uk_aq_rebuild_r2_day_manifest_from_connectors.mjs`, `node --check tests/uk_aq_rebuild_r2_day_manifest_from_connectors.test.mjs`, `node --check tests/uk_aq_r2_history_index.test.mjs`, and `bash -n scripts/uk_aq_backfill_local.sh` all passed.
+Focused Python validation passed: `python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py` passed. `python3 -m unittest discover -s scripts/uk-aq-history-integrity/tests -p 'test_*.py' -q` -> 250 tests, 0 failures. `npm run check` passed. `git diff --check` passed.
 ```
 
 Remaining issues:
 
 ```text
-CIC-Test runtime dry-run is pending after manual runtime copy. CIC-Test real repair execution remains pending explicit user approval. LIVE repair execution is not enabled. Local mocked verification does not prove real R2 listing, object-identity, or post-write behavior.
+Broader local Node coverage still has pre-existing fixture/dependency failures outside the focused phase 3c validation set; no new phase 3c blockers remain.
 ```

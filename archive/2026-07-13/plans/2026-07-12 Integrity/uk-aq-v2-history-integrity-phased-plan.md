@@ -166,7 +166,7 @@ The new integrity flow must detect and repair this hierarchy without:
 | --- | --- | --- | --- | --- |
 | 1 | Backup gate correctness and safety | Complete | `6965763` | Committed on `main`; implementation and local validation complete. |
 | 2 | Complete read-only v2 validation | Complete | `4438499` | Implemented on main across `7e1b352..4438499`; local validation complete; runtime Phase 2 validation remains pending. |
-| 3 | Observation manifest and index repair | In progress |  | Implementation corrected and locally mock-validated; CIC-Test runtime dry-run and explicitly approved CIC-Test repair execution remain pending. LIVE repair execution is not enabled. |
+| 3 | Observation manifest and index repair | Not started |  |  |
 | 4 | Observation data repair and AQI sequencing | Not started |  |  |
 
 Allowed status values:
@@ -871,19 +871,19 @@ Phase 3 is complete only when:
 Status:
 
 ```text
-In progress
+Not started
 ```
 
 Completed work:
 
 ```text
-The Phase 3 repair path now exports and reuses the authoritative Phase B v2 manifest builders. The generic index builder remains explicit-write only but can operate against its configured environment bucket. A dedicated v2 observations-only executor accepts a validated repair-plan JSON, is dry-run by default, refuses actual writes outside CIC-Test, rebuilds connector and day parents from freshly enumerated complete child sets, verifies changed JSON bodies, and uses the targeted observations index helper. Pollutant-manifest reconstruction remains blocked when parquet-derived metadata is not complete.
+To be updated after implementation.
 ```
 
 Tests:
 
 ```text
-Focused mocked Node and Python checks passed locally. Real R2 access and runtime repair validation have not been performed.
+To be updated after implementation.
 ```
 
 Remaining issues:

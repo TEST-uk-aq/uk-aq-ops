@@ -2145,24 +2145,17 @@ function createHistoryV2DayManifest({
   });
 }
 
-// These pure builders are the single v2 manifest contract for both the
-// writer and metadata-only repair tooling. Keep the test aliases below for
-// existing callers, but do not duplicate this schema in repair scripts.
-export function buildHistoryV2PollutantManifest(args) {
+export function buildHistoryV2PollutantManifestForTest(args) {
   return createHistoryV2PollutantManifest(args);
 }
 
-export function buildHistoryV2ConnectorManifest(args) {
+export function buildHistoryV2ConnectorManifestForTest(args) {
   return createHistoryV2ConnectorManifest(args);
 }
 
-export function buildHistoryV2DayManifest(args) {
+export function buildHistoryV2DayManifestForTest(args) {
   return createHistoryV2DayManifest(args);
 }
-
-export const buildHistoryV2PollutantManifestForTest = buildHistoryV2PollutantManifest;
-export const buildHistoryV2ConnectorManifestForTest = buildHistoryV2ConnectorManifest;
-export const buildHistoryV2DayManifestForTest = buildHistoryV2DayManifest;
 
 const PARQUET_WRITER_PROPERTIES_CACHE = new Map();
 

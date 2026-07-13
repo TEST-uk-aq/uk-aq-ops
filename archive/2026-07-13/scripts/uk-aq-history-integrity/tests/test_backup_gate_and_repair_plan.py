@@ -491,15 +491,6 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
 
-    def test_real_targeted_index_follow_up_passes_explicit_write_gate_after_dry_run_exit(self) -> None:
-        wrapper = Path(__file__).resolve().parents[1] / "bin" / "uk_aq_integrity_backfill.sh"
-        text = wrapper.read_text(encoding="utf-8")
-        dry_run_exit = text.index('if [[ "${DRY_RUN}" == "true" ]]')
-        command_start = text.index("TARGETED_INDEX_CMD=(")
-        self.assertLess(dry_run_exit, command_start)
-        command_block = text[command_start:text.index(")\nif [[ -n \"${CONNECTOR_ID}\"", command_start)]
-        self.assertIn("--write-r2", command_block)
-
 
 if __name__ == "__main__":
     unittest.main()
