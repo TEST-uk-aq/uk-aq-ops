@@ -71,7 +71,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             "UK_AQ_HISTORY_INTEGRITY_TMP_DIR": str(self.root / "tmp"),
             "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR": str(self.root / "source-cache"),
             "UK_AQ_BACKFILL_ENV_FILE": str(self.root / "backfill.env"),
-            "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(self.root / "r2-history"),
+            "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(self.root / "R2_history_backup"),
         }
         self.log = logging.getLogger("v2-repair-test")
 
