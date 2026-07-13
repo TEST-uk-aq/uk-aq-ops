@@ -5,6 +5,10 @@ import {
   buildDayManifestFromConnectorManifests,
   runDayManifestRebuild,
 } from "../scripts/backup_r2/uk_aq_rebuild_r2_day_manifest_from_connectors.mjs";
+import {
+  buildHistoryV2ConnectorManifest,
+  buildHistoryV2PollutantManifest,
+} from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 
 function hashWithoutManifestHash(payload) {
   const { manifest_hash: _ignored, ...withoutHash } = payload;
@@ -473,6 +477,64 @@ test("runDayManifestRebuild fails when live verification does not match the writ
       /R2 verification failed for history\/v1\/observations\/day_utc=2026-04-30\/manifest\.json/,
     );
     assert.equal(fake.puts.size, 1);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("Phase 7 standalone v2 observations utility rejects a structurally invalid connector child", async () => {
+  const dayUtc = "2026-05-17";
+  const prefix = `history/v2/observations/day_utc=${dayUtc}/connector_id=1`;
+  const pollutantManifest = buildHistoryV2PollutantManifest({
+    domain: "observations",
+    dayUtc,
+    connectorId: 1,
+    pollutantCode: "o3",
+    runId: "fixture",
+    manifestKey: `${prefix}/pollutant_code=o3/manifest.json`,
+    sourceRowCount: 1,
+    fileEntries: [{
+      key: `${prefix}/pollutant_code=o3/part-00000.parquet`,
+      bytes: 1,
+      row_count: 1,
+      etag_or_hash: "part",
+      min_timeseries_id: 1,
+      max_timeseries_id: 1,
+      min_observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+      max_observed_at_utc: `${dayUtc}T00:00:00.000Z`,
+      timeseries_row_counts: { 1: 1 },
+    }],
+    writerGitSha: "fixture",
+    backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const connectorKey = `${prefix}/manifest.json`;
+  const malformedConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations",
+    dayUtc,
+    connectorId: 1,
+    runId: "fixture",
+    manifestKey: connectorKey,
+    pollutantManifests: [pollutantManifest],
+    writerGitSha: "fixture",
+    backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  delete malformedConnector.files;
+  malformedConnector.manifest_hash = hashWithoutManifestHash(malformedConnector);
+  const fake = installFakeR2Fetch({ [connectorKey]: malformedConnector });
+  try {
+    await assert.rejects(
+      runDayManifestRebuild({
+        argv: ["--history-version", "v2", "--domain", "observations", "--day-utc", dayUtc],
+        env: {
+          CFLARE_R2_ENDPOINT: "https://r2.example.invalid",
+          CFLARE_R2_BUCKET: "uk-aq-history-cic-test",
+          CFLARE_R2_ACCESS_KEY_ID: "key",
+          CFLARE_R2_SECRET_ACCESS_KEY: "secret",
+        },
+      }),
+      /Blocked day manifest rebuild: required connector child .*invalid connector manifest/,
+    );
+    assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
   }

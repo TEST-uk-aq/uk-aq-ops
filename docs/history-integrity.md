@@ -3,6 +3,20 @@
 `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py` is the
 orchestrator for the UK-AQ history integrity run.
 
+## Supported runtime model
+
+Run history integrity, including the Phase 3 executor, from the complete ops
+checkout at:
+
+```text
+/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops
+```
+
+This is the only supported runtime model. The Phase 3 executor imports shared
+R2/index code and the Phase B writer from elsewhere in the repository, whose
+Node dependencies are also required. Do not copy a partial `bin/` or `env/`
+directory and do not rely on an undocumented runtime bundle.
+
 ## Current flow
 
 1. Load the integrity environment and then the configured backfill environment.
@@ -41,6 +55,11 @@ uses the Obs AQI DB credential order: dedicated daily-task-health variables,
 fallbacks. The request includes the scheduled date, integrity start timestamp,
 and required task keys. Missing credentials, invalid inputs, RPC failures, or
 unexpected response shapes block the run safely.
+
+The RPC's canonical SQL definition is owned by
+`TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_daily_task_backup_readiness.sql`.
+The ops contract test reads that sibling schema source directly; no ops SQL
+mirror is maintained.
 
 ## v2 hierarchy validation
 

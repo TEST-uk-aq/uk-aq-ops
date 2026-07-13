@@ -11,6 +11,7 @@ import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_histo
 import {
   buildHistoryV2DayManifest,
 } from "../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import { assertV2ObservationsChildManifest } from "./lib/uk_aq_v2_observations_manifest_validation.mjs";
 
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
 
@@ -675,7 +676,16 @@ export async function runDayManifestRebuild({ argv = process.argv.slice(2), env 
   for (const key of connectorManifestKeys) {
     try {
       const result = await r2GetObject({ r2: config.r2, key });
-      connectorManifests.push(readJsonBuffer(result, key));
+      const payload = readJsonBuffer(result, key);
+      if (args.historyVersion === "v2" && args.domain === "observations") {
+        assertV2ObservationsChildManifest(payload, {
+          key,
+          kind: "connector",
+          dayUtc: args.dayUtc,
+          connectorId: connectorIdFromManifestKey(key),
+        });
+      }
+      connectorManifests.push(payload);
     } catch (error) {
       throw new Error(`Blocked day manifest rebuild: required connector child ${key} is unavailable or malformed (${error instanceof Error ? error.message : String(error)})`);
     }

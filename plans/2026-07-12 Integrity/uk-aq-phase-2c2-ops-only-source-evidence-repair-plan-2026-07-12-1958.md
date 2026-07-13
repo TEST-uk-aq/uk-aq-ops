@@ -14,6 +14,9 @@ Expected repository location:
 plans/2026-07-12 Integrity/uk-aq-phase-2c2-ops-only-source-evidence-repair-plan-2026-07-12-1958.md
 ```
 
+> Historical implementation record. Current history-integrity phase status is
+> authoritative only in `uk-aq-v2-history-integrity-phased-plan.md`.
+
 ## Purpose
 
 This plan addresses the remaining Phase 2c.2 defects found in the current `uk-aq-ops` integrity checker.

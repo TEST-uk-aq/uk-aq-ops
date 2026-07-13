@@ -14,6 +14,9 @@ Expected repository location:
 plans/2026-07-12 Integrity/uk-aq-phase-3-observation-manifest-index-repair-plan-2026-07-12-2302.md
 ```
 
+> Historical implementation record. Current history-integrity phase status is
+> authoritative only in `uk-aq-v2-history-integrity-phased-plan.md`.
+
 ## Purpose
 
 This plan prepares Phase 3 only: safe repair of observation manifest-only and index-only faults without rewriting valid observation parquet.

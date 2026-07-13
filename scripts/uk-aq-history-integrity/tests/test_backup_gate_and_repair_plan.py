@@ -17,6 +17,18 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def canonical_readiness_sql_path() -> Path:
+    """Locate the canonical SQL in the sibling schema checkout."""
+    ops_repo_root = MODULE_PATH.parents[3]
+    return (
+        ops_repo_root.parent
+        / "TEST-uk-aq-schema"
+        / "schemas"
+        / "obs_aqi_db"
+        / "uk_aq_rpc_daily_task_backup_readiness.sql"
+    )
+
+
 class DummyResponse:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
@@ -225,24 +237,21 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         self.assertEqual(result["blocked_reason"], "task_finished_after_integrity_start")
 
     def test_readiness_sql_matches_real_daily_task_contract_and_canonical_copy(self) -> None:
-        ops_sql_path = MODULE_PATH.parents[1] / "sql" / "uk_aq_rpc_daily_task_backup_readiness.sql"
-        schema_sql_path = (
-            MODULE_PATH.parents[4]
-            / "TEST-uk-aq-schema"
-            / "schemas"
-            / "obs_aqi_db"
-            / "uk_aq_rpc_daily_task_backup_readiness.sql"
+        schema_sql_path = canonical_readiness_sql_path()
+        self.assertTrue(
+            schema_sql_path.is_file(),
+            "Canonical readiness SQL is unavailable at "
+            f"{schema_sql_path}. Expected TEST-uk-aq-schema to be a sibling of "
+            f"{MODULE_PATH.parents[3]}.",
         )
-        ops_sql = ops_sql_path.read_text(encoding="utf-8")
         schema_sql = schema_sql_path.read_text(encoding="utf-8")
-        self.assertEqual(ops_sql, schema_sql)
-        self.assertIn("v_latest.status <> 'Finished'", ops_sql)
-        self.assertIn("v_latest.finished_at", ops_sql)
-        self.assertIn("ORDER BY r.attempt DESC, r.updated_at DESC", ops_sql)
-        self.assertIn("SET search_path = pg_catalog, uk_aq_public", ops_sql)
-        self.assertNotIn("v_latest.started_at_utc", ops_sql)
-        self.assertNotIn("v_latest.completed_at_utc", ops_sql)
-        self.assertNotIn("status <> 'succeeded'", ops_sql)
+        self.assertIn("v_latest.status <> 'Finished'", schema_sql)
+        self.assertIn("v_latest.finished_at", schema_sql)
+        self.assertIn("ORDER BY r.attempt DESC, r.updated_at DESC", schema_sql)
+        self.assertIn("SET search_path = pg_catalog, uk_aq_public", schema_sql)
+        self.assertNotIn("v_latest.started_at_utc", schema_sql)
+        self.assertNotIn("v_latest.completed_at_utc", schema_sql)
+        self.assertNotIn("status <> 'succeeded'", schema_sql)
 
     def test_backup_gate_blocks_before_scan_when_backup_not_ready(self) -> None:
         payload = {"backup_ready": False, "blocked_reason": "task_not_succeeded", "tasks": []}

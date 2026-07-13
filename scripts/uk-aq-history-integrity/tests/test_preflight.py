@@ -67,6 +67,29 @@ class PreflightTests(unittest.TestCase):
         )
         self.assertEqual(parsed.source, "sos")
 
+    def test_parse_args_for_manual_v2_check_only_acceptance_leaves_backfill_disabled(self) -> None:
+        parsed = MODULE.parse_args([
+            "--env", "CIC-Test",
+            "--profile", "manual",
+            "--source", "all",
+            "--from-day", "2026-05-17",
+            "--to-day", "2026-05-17",
+            "--history-version", "v2",
+            "--check-only",
+            "--concurrency", "1",
+            "--verbose",
+        ])
+        self.assertEqual(parsed.env, "CIC-Test")
+        self.assertEqual(parsed.profile, "manual")
+        self.assertEqual(parsed.source, "all")
+        self.assertEqual(parsed.from_day, "2026-05-17")
+        self.assertEqual(parsed.to_day, "2026-05-17")
+        self.assertEqual(parsed.history_version, "v2")
+        self.assertTrue(parsed.check_only)
+        self.assertFalse(parsed.run_backfill)
+        self.assertEqual(parsed.concurrency, 1)
+        self.assertTrue(parsed.verbose)
+
     def test_parse_args_rejects_hyphenated_sos_source(self) -> None:
         with self.assertRaises(SystemExit):
             MODULE.parse_args(

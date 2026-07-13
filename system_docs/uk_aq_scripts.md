@@ -216,8 +216,9 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
   - Required arg `--env CIC-Test|LIVE`; forwards `--profile`, `--source`,
     `--from-day`, `--to-day`, `--dry-run`, `--check-only`, `--run-backfill`,
     `--max-download-mb`, `--max-runtime-minutes`, `--verbose` to python.
-  - Deploys to `/Users/mikehinford/uk-aq-history-integrity/bin/`; in-repo
-    location is the source of truth.
+  - Runs from the complete ops checkout at
+    `/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/`;
+    do not deploy a partial runtime copy.
 
 - `scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py`
   - Local-only AQI gap checker for missing hourly AQI rows.

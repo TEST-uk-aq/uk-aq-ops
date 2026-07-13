@@ -75,6 +75,12 @@ async function r2PutObjectIfChanged({
   }
 
   if (existingEtag && existingEtag === newMd5) {
+    await r2?.proposal_sink?.({
+      key,
+      body: bodyText,
+      content_type,
+      status: "skipped_unchanged",
+    });
     return {
       key,
       etag: existingEtag,
@@ -88,6 +94,12 @@ async function r2PutObjectIfChanged({
   }
 
   if (!writeR2) {
+    await r2?.proposal_sink?.({
+      key,
+      body: bodyText,
+      content_type,
+      status: "planned",
+    });
     return {
       key,
       etag: existingEtag,
@@ -100,6 +112,12 @@ async function r2PutObjectIfChanged({
     };
   }
 
+  await r2?.proposal_sink?.({
+    key,
+    body: bodyText,
+    content_type,
+    status: "planned",
+  });
   const result = await r2PutObject({ r2, key, body, content_type });
   const liveObject = await r2GetObject({ r2, key });
   const liveBodyText = liveObject.body.toString("utf8");
@@ -4028,9 +4046,11 @@ export async function updateR2HistoryIndexesTargeted({
   computeMissingTimeseriesCounts = false,
   strictMissingTimeseriesCounts,
   writeR2 = true,
+  r2: r2Override = null,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
-  if (!hasRequiredR2Config(config.r2)) {
+  const r2 = r2Override || config.r2;
+  if (!hasRequiredR2Config(r2)) {
     throw new Error("Missing R2 config for targeted R2 history index update");
   }
 
@@ -4058,8 +4078,8 @@ export async function updateR2HistoryIndexesTargeted({
         : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
         
       const result = await updateR2HistoryV2TimeseriesIndexesTargeted({
-        r2: config.r2,
-        bucketName: config.r2.bucket,
+        r2,
+        bucketName: r2.bucket,
         domain,
         dataPrefix,
         indexPrefix: config.index_prefix_v2,
@@ -4131,8 +4151,8 @@ export async function updateR2HistoryIndexesTargeted({
 
   if (normalizedHistoryVersion === "v2") {
     timeseriesMetadata = await rebuildR2HistoryV2TimeseriesMetadataIndexes({
-      r2: config.r2,
-      bucketName: config.r2.bucket,
+      r2,
+      bucketName: r2.bucket,
       indexPrefix: config.index_prefix_v2,
       observationsDataPrefix: config.observations_prefix_v2,
       aqilevelsHourlyDataPrefix: config.aqilevels_hourly_data_prefix_v2,
