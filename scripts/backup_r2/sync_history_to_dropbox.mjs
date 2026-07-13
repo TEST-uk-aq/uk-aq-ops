@@ -116,7 +116,7 @@ function runDropboxWriteAwareRclone(rcloneBin, rcloneArgs) {
 
 export function isDropboxTransientReadListError(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return /(?:path\/not_folder|too_many_requests|rate(?:[ _-]?limit|_limited)|too many requests|timeout|timed out|connection reset|connection refused|temporary failure|temporarily unavailable|server error|internal_error|\b5\d\d\b|\b429\b)/i.test(
+  return /(?:path\/not_folder|too_many_requests|rate(?:[ _-]?limit|_limited)|too many requests|timeout|timed out|connection reset|connection refused|temporary failure|temporarily unavailable|server error|internal_error|unexpected error occurred|\b5\d\d\b|\b429\b)/i.test(
     message,
   );
 }
@@ -937,8 +937,13 @@ export function buildStaleParquetPrunePlan({
   };
 }
 
-function loadManifestEntriesForPrune(rcloneBin, manifestRootPath, retryOptions = null) {
-  const entries = rcloneLsjsonRecursive(rcloneBin, manifestRootPath, {
+function loadManifestEntriesForPrune(
+  rcloneBin,
+  manifestRootPath,
+  retryOptions = null,
+  listedEntries = null,
+) {
+  const entries = listedEntries || rcloneLsjsonRecursive(rcloneBin, manifestRootPath, {
     hash: false,
     retryOptions,
   });
@@ -956,11 +961,16 @@ function loadManifestEntriesForPrune(rcloneBin, manifestRootPath, retryOptions =
     }));
 }
 
-function loadActualParquetEntriesForPrune(rcloneBin, destUnitPath, retryOptions = null) {
-  return rcloneLsjsonRecursive(rcloneBin, destUnitPath, {
+function loadActualParquetEntriesForPrune(
+  rcloneBin,
+  destUnitPath,
+  retryOptions = null,
+  listedEntries = null,
+) {
+  return (listedEntries || rcloneLsjsonRecursive(rcloneBin, destUnitPath, {
     hash: false,
     retryOptions,
-  })
+  }))
     .map((entry) => ({ ...entry, Path: pathFromLsjsonEntry(entry) }))
     .filter((entry) => entry.Path.endsWith(".parquet"));
 }
@@ -975,17 +985,31 @@ export function pruneStaleParquetForUnit({
   manifestReadListRetryOptions = readListRetryOptions,
   destinationReadListRetryOptions = readListRetryOptions,
 } = {}) {
+  // Normal audits read manifests and destination files from the same unit.
+  // Reuse one successful recursive listing while preserving separate paths for
+  // post-copy dry runs and callers with distinct retry policies.
+  const canReuseDestinationListing =
+    manifestRootPath === destUnitPath
+    && manifestReadListRetryOptions === destinationReadListRetryOptions;
+  const destinationListing = canReuseDestinationListing
+    ? rcloneLsjsonRecursive(rcloneBin, destUnitPath, {
+      hash: false,
+      retryOptions: destinationReadListRetryOptions,
+    })
+    : null;
   const plan = buildStaleParquetPrunePlan({
     unit_relative_path: unitRelativePath,
     manifest_entries: loadManifestEntriesForPrune(
       rcloneBin,
       manifestRootPath,
       manifestReadListRetryOptions,
+      destinationListing,
     ),
     actual_file_entries: loadActualParquetEntriesForPrune(
       rcloneBin,
       destUnitPath,
       destinationReadListRetryOptions,
+      destinationListing,
     ),
   });
 

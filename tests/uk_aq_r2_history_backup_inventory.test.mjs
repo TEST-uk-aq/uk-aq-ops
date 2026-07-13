@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import {
   buildStaleParquetPrunePlan,
   dropboxReadListRetryOptions,
+  isDropboxTransientReadListError,
   pruneStaleParquetForUnit,
   planDays,
   planIndexFiles,
@@ -753,6 +754,16 @@ test("buildStaleParquetPrunePlan fails closed when manifest JSON is invalid", ()
   );
 });
 
+test("Dropbox read/list retry matcher accepts the production unexpected-error wording", () => {
+  assert.equal(
+    isDropboxTransientReadListError(
+      new Error("2026/07/12 ERROR : error listing: unexpected error occurred"),
+    ),
+    true,
+  );
+  assert.equal(isDropboxTransientReadListError(new Error("invalid manifest JSON")), false);
+});
+
 test("Dropbox rclone cat transient read failure retries and prune succeeds", () => {
   const tempDir = makeTempDir();
   const fakeRcloneBin = makeFakeRcloneBin(tempDir);
@@ -789,7 +800,7 @@ test("Dropbox rclone cat transient read failure retries and prune succeeds", () 
   assert.equal(retryStats.max_attempts_used, 2);
 });
 
-test("Dropbox rclone lsjson transient list failure retries and prune succeeds", () => {
+test("Dropbox rclone lsjson production transient list failure retries and prune succeeds", () => {
   const tempDir = makeTempDir();
   const fakeRcloneBin = makeFakeRcloneBin(tempDir);
   const failurePlan = path.join(tempDir, "failure-plan.json");
@@ -800,7 +811,7 @@ test("Dropbox rclone lsjson transient list failure retries and prune succeeds", 
     command: "lsjson",
     target_suffix: "/day_utc=2026-06-18",
     remaining: 1,
-    message: "too_many_requests",
+    message: "error listing: unexpected error occurred",
   }]);
 
   const summary = withFakeRcloneEnvironment(
@@ -821,9 +832,10 @@ test("Dropbox rclone lsjson transient list failure retries and prune succeeds", 
   assert.equal(summary.prune_deleted_count, 1);
   assert.equal(retryStats.retry_count, 1);
   assert.equal(retryStats.exhausted_count, 0);
+  assert.equal(retryStats.max_attempts_used, 2);
 });
 
-test("Dropbox read retry exhaustion fails closed without deleting", () => {
+test("Dropbox production transient list retry exhaustion fails closed without deleting", () => {
   const tempDir = makeTempDir();
   const fakeRcloneBin = makeFakeRcloneBin(tempDir);
   const fakeRcloneLog = path.join(tempDir, "rclone.log");
@@ -833,10 +845,10 @@ test("Dropbox read retry exhaustion fails closed without deleting", () => {
   const stalePath = path.join(unitPath, "connector_id=1/part-00001.parquet");
   const retryStats = { retry_count: 0, exhausted_count: 0, max_attempts_used: 1 };
   writeFakeRcloneFailurePlan(failurePlan, [{
-    command: "cat",
-    target_suffix: "/manifest.json",
+    command: "lsjson",
+    target_suffix: "/day_utc=2026-06-18",
     remaining: 5,
-    message: "path/not_folder",
+    message: "error listing: unexpected error occurred",
   }]);
 
   assert.throws(
@@ -857,7 +869,7 @@ test("Dropbox read retry exhaustion fails closed without deleting", () => {
         }),
       }),
     ),
-    /path\/not_folder/,
+    /unexpected error occurred/,
   );
 
   assert.equal(fs.existsSync(stalePath), true);
@@ -865,6 +877,30 @@ test("Dropbox read retry exhaustion fails closed without deleting", () => {
   assert.equal(retryStats.exhausted_count, 1);
   assert.equal(retryStats.max_attempts_used, 5);
   assert.equal(readFakeRcloneLog(fakeRcloneLog).some((entry) => entry.command === "deletefile"), false);
+});
+
+test("prune reuses one recursive Dropbox listing when manifests and destination share a unit", () => {
+  const tempDir = makeTempDir();
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const fakeRcloneLog = path.join(tempDir, "rclone.log");
+  const unitRelativePath = "history/v2/observations/day_utc=2026-06-18";
+  const unitPath = seedDestinationWithStaleParquet(tempDir, { backupVersion: "v2" });
+
+  const summary = withFakeRcloneEnvironment(
+    { FAKE_RCLONE_LOG: fakeRcloneLog },
+    () => pruneStaleParquetForUnit({
+      rcloneBin: fakeRcloneBin,
+      manifestRootPath: unitPath,
+      destUnitPath: unitPath,
+      unitRelativePath,
+    }),
+  );
+
+  assert.equal(summary.prune_deleted_count, 1);
+  assert.equal(
+    readFakeRcloneLog(fakeRcloneLog).filter((entry) => entry.command === "lsjson").length,
+    1,
+  );
 });
 
 test("ordinary rclone cat not-found remains missing without retry", () => {
@@ -1447,6 +1483,150 @@ test("sync v2 forced recheck removes a stale checkpoint entry for a failed unit"
   const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
   assert.equal(report.prune.failed_units.length, 1);
   assert.equal(report.prune.failed_units[0].unit_relative_path, firstUnit);
+});
+
+test("sync v2 forced recheck persists a checkpoint invalidation without successful units", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const failedDay = "2026-06-18";
+  const failedUnit = `history/v2/observations/day_utc=${failedDay}`;
+  const unrelatedUnit = "history/v2/observations/day_utc=2026-06-19";
+  const unrelatedEntry = {
+    manifest_hash: "unrelated-hash",
+    status: "ok",
+    pruned_at: "2026-06-25T00:00:00.000Z",
+    manifest_count: 1,
+    manifest_referenced_parquet_count: 1,
+    actual_destination_parquet_count: 1,
+    stale_deleted_count: 0,
+  };
+
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2", days: [failedDay] });
+  const failedDest = seedDestinationWithStaleParquet(destRoot, {
+    backupVersion: "v2",
+    dayUtc: failedDay,
+  });
+  writeText(path.join(failedDest, "manifest.json"), "{bad json\n");
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", dayUtc: failedDay, hash: "hash-v2" });
+  writeV2PruneCheckpoint(destRoot, {
+    [failedUnit]: {
+      manifest_hash: "hash-v2",
+      status: "ok",
+      pruned_at: "2026-06-25T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 2,
+      stale_deleted_count: 1,
+    },
+    [unrelatedUnit]: unrelatedEntry,
+  });
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    extraArgs: ["--force-prune-recheck"],
+  });
+
+  assert.notEqual(result.status, 0);
+  const pruneState = JSON.parse(
+    fs.readFileSync(
+      path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(pruneState.units[failedUnit], undefined);
+  assert.deepEqual(pruneState.units[unrelatedUnit], unrelatedEntry);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.ok, false);
+  assert.equal(report.prune.failed_units[0].unit_relative_path, failedUnit);
+  assert.equal(report.prune_checkpoint.entries_written, 0);
+});
+
+test("sync v2 forced dry-run failure does not modify the prune checkpoint", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const dayUtc = "2026-06-18";
+  const unitPath = `history/v2/observations/day_utc=${dayUtc}`;
+  const checkpoint = {
+    [unitPath]: {
+      manifest_hash: "hash-v2",
+      status: "ok",
+      pruned_at: "2026-06-25T00:00:00.000Z",
+      manifest_count: 1,
+      manifest_referenced_parquet_count: 1,
+      actual_destination_parquet_count: 2,
+      stale_deleted_count: 1,
+    },
+  };
+
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2", days: [dayUtc] });
+  const destDay = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2", dayUtc });
+  writeText(path.join(destDay, "manifest.json"), "{bad json\n");
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", dayUtc, hash: "hash-v2" });
+  writeV2PruneCheckpoint(destRoot, checkpoint);
+  const checkpointPath = path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json");
+  const checkpointBefore = fs.readFileSync(checkpointPath, "utf8");
+
+  const result = runSyncCli({
+    sourceRoot,
+    destRoot,
+    fakeRcloneBin,
+    reportOut,
+    backupVersion: "v2",
+    extraArgs: ["--force-prune-recheck", "--dry-run"],
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.readFileSync(checkpointPath, "utf8"), checkpointBefore);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune_checkpoint.write_skipped_dry_run, true);
+});
+
+test("sync v2 ordinary prune failure preserves its existing checkpoint entry", () => {
+  const tempDir = makeTempDir();
+  const sourceRoot = path.join(tempDir, "source");
+  const destRoot = path.join(tempDir, "dest");
+  const fakeRcloneBin = makeFakeRcloneBin(tempDir);
+  const reportOut = path.join(tempDir, "report.json");
+  const dayUtc = "2026-06-18";
+  const unitPath = `history/v2/observations/day_utc=${dayUtc}`;
+  const checkpointEntry = {
+    manifest_hash: "old-hash",
+    status: "ok",
+    pruned_at: "2026-06-25T00:00:00.000Z",
+    manifest_count: 1,
+    manifest_referenced_parquet_count: 1,
+    actual_destination_parquet_count: 2,
+    stale_deleted_count: 1,
+  };
+
+  seedInventory(sourceRoot, { backupVersion: "v2", hash: "hash-v2", days: [dayUtc] });
+  const destDay = seedDestinationWithStaleParquet(destRoot, { backupVersion: "v2", dayUtc });
+  writeText(path.join(destDay, "manifest.json"), "{bad json\n");
+  writeCopyCheckpoint(destRoot, { backupVersion: "v2", dayUtc, hash: "hash-v2" });
+  writeV2PruneCheckpoint(destRoot, { [unitPath]: checkpointEntry });
+
+  const result = runSyncCli({ sourceRoot, destRoot, fakeRcloneBin, reportOut, backupVersion: "v2" });
+
+  assert.notEqual(result.status, 0);
+  const pruneState = JSON.parse(
+    fs.readFileSync(
+      path.join(destRoot, "_ops/checkpoints/r2_history_backup_prune_state_v2.json"),
+      "utf8",
+    ),
+  );
+  assert.deepEqual(pruneState.units[unitPath], checkpointEntry);
+  const report = JSON.parse(fs.readFileSync(reportOut, "utf8"));
+  assert.equal(report.prune_checkpoint.write_skipped_no_changes, true);
 });
 
 test("sync v2 dry-run does not delete or write prune checkpoint but reports planned update", () => {
