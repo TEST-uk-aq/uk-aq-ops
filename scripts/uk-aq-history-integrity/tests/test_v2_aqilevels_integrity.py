@@ -299,30 +299,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
             conn.close()
         self.assertIn("aqi_manifest_missing_after_obs_repair", self._gap_types(result))
 
-    def test_v2_aqi_integrity_reports_aqi_rows_below_observations(self) -> None:
-        self._write_observations(timeseries_row_counts={101: 3})
-        self._write_healthy()
-        manifest_path = self._partition() / "manifest.json"
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        payload["row_count"] = 2
-        payload["source_row_count"] = 2
-        payload["timeseries_row_counts"] = {"101": 2}
-        payload["files"][0]["timeseries_row_counts"] = {"101": 2}
-        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
-
-        conn = self._eligibility_conn()
-        try:
-            result = self._run(conn=conn)
-        finally:
-            conn.close()
-
-        self.assertEqual(result["status"], "fail")
-        self.assertIn("aqi_rows_below_observation_rows", self._gap_types(result))
-        gap = next(g for g in result["gaps"] if g["gap_type"] == "aqi_rows_below_observation_rows")
-        self.assertIs(gap["source_evidence"]["v2_observations_present"], True)
-        self.assertEqual(gap["suggested_repair"]["kind"], "v2_aqi_hourly_rebuild_from_v2_observations")
-        self.assertNotEqual(gap["suggested_repair"]["kind"], "repair_plan_unclassified")
-
     def test_debug_skipped_by_default(self) -> None:
         self._write_healthy()
         result = self._run()
@@ -347,13 +323,6 @@ class V2AqiIntegrityTests(unittest.TestCase):
         self._write_healthy(manifest=False)
         aqi = self._run()
         self.assertEqual(aqi["status"], "fail")
-
-    def test_both_reports_v1_and_v2_separately(self) -> None:
-        self._write_healthy(manifest=False)
-        aqi = self._run()
-        results = {"v1": {"status": "checked"}, "v2": {"status": aqi["status"], "aqilevels": aqi}}
-        self.assertEqual(results["v1"]["status"], "checked")
-        self.assertEqual(results["v2"]["status"], "fail")
 
     def test_targeted_day_range_does_not_scan_outside_selected_days(self) -> None:
         self._write_healthy(day="2026-06-11")

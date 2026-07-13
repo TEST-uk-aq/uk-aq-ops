@@ -86,6 +86,8 @@ DROPBOX_APP_ROOT = Path(
     "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks",
 )
 DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
+CURRENT_INTEGRITY_HISTORY_VERSION = "v2"
+CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 
 DAILY_TASK_HEALTH_TASK_KEY = "ops.history_integrity"
 DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
@@ -553,16 +555,74 @@ def read_manifest(day_dir: Path) -> dict[str, Any] | None:
     return manifest
 
 
+def validate_v2_core_snapshot_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    day_dir: Path,
+    expected_prefix: str = CURRENT_INTEGRITY_CORE_PREFIX,
+) -> str | None:
+    """Return a clear validation error when a core manifest is not v2-shaped.
+
+    The v2 core writer emits one compressed NDJSON artifact per core table at
+    ``table=<name>/rows.ndjson.gz`` and records both its relative and complete
+    R2 key in the manifest.  Validate that contract before importing data so
+    this v2-only integrity runtime cannot interpret a legacy core layout.
+    """
+    normalized_prefix = _normalize_history_prefix(expected_prefix, CURRENT_INTEGRITY_CORE_PREFIX)
+    if manifest.get("schema_name") != "uk_aq_core_snapshot":
+        return "manifest schema_name must be 'uk_aq_core_snapshot'"
+    if manifest.get("schema_version") != 1:
+        return "manifest schema_version must be 1"
+    if _normalize_history_prefix(str(manifest.get("prefix") or ""), "") != normalized_prefix:
+        return f"manifest prefix must be '{normalized_prefix}'"
+    expected_day = day_dir.name.removeprefix("day_utc=")
+    if manifest.get("day_utc") != expected_day:
+        return f"manifest day_utc must match directory '{expected_day}'"
+    tables = manifest.get("tables")
+    if not isinstance(tables, list):
+        return "manifest tables must be a list"
+    entries = {
+        str(entry.get("table") or ""): entry
+        for entry in tables
+        if isinstance(entry, dict)
+    }
+    for table in CORE_TABLES_TO_IMPORT:
+        entry = entries.get(table)
+        if entry is None:
+            return f"manifest is missing required table '{table}'"
+        relative_path = f"table={table}/rows.ndjson.gz"
+        expected_key = f"{normalized_prefix}/day_utc={expected_day}/{relative_path}"
+        if entry.get("relative_path") != relative_path:
+            return f"manifest table '{table}' has unexpected relative_path"
+        if entry.get("key") != expected_key:
+            return f"manifest table '{table}' has unexpected key"
+        if not isinstance(entry.get("sha256"), str) or not entry["sha256"].strip():
+            return f"manifest table '{table}' is missing sha256"
+        if not isinstance(entry.get("row_count"), int) or entry["row_count"] < 0:
+            return f"manifest table '{table}' has invalid row_count"
+    return None
+
+
 def find_latest_snapshot(
     root: Path,
     log: logging.Logger,
+    *,
+    expected_prefix: str = CURRENT_INTEGRITY_CORE_PREFIX,
 ) -> tuple[Path, dict[str, Any]] | None:
-    """Find the newest day_utc directory whose manifest.json is valid."""
+    """Find the newest v2 core day whose manifest matches the writer layout."""
     candidates = list_snapshot_day_dirs(root)
     for day_dir in candidates:
         manifest = read_manifest(day_dir)
         if manifest is None:
             log.warning("snapshot %s: missing or invalid manifest.json — skipping", day_dir.name)
+            continue
+        validation_error = validate_v2_core_snapshot_manifest(
+            manifest,
+            day_dir=day_dir,
+            expected_prefix=expected_prefix,
+        )
+        if validation_error is not None:
+            log.warning("snapshot %s: invalid v2 core manifest: %s", day_dir.name, validation_error)
             continue
         return day_dir, manifest
     return None
@@ -845,29 +905,23 @@ def _build_lookup(conn: sqlite3.Connection, log: logging.Logger) -> int:
 
 
 def resolve_core_history_version_for_mode(history_version_mode: str) -> str:
-    mode = str(history_version_mode or "v1").strip().lower()
-    if mode in {"v1", "v2"}:
-        return mode
-    # A combined run preserves the existing v1 core snapshot behaviour; v2-only
-    # runs use v2 and never fall back to v1.
-    if mode == "both":
-        return "v1"
-    raise ValueError(f"unsupported history version mode: {history_version_mode!r}")
+    if str(history_version_mode or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
+        raise ValueError("current history integrity supports history version v2 only")
+    return CURRENT_INTEGRITY_HISTORY_VERSION
 
 def resolve_core_snapshot_prefix(history_version: str, env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
-    version = str(history_version or "v1").strip().lower()
-    if version == "v2":
-        return _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX"),
-            "history/v2/core",
+    if str(history_version or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
+        raise ValueError("current history integrity supports history version v2 only")
+    prefix = _normalize_history_prefix(
+        values.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX"),
+        CURRENT_INTEGRITY_CORE_PREFIX,
+    )
+    if prefix != CURRENT_INTEGRITY_CORE_PREFIX:
+        raise ValueError(
+            "UK_AQ_R2_HISTORY_V2_CORE_PREFIX must be history/v2/core for current history integrity",
         )
-    if version == "v1":
-        return _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_CORE_PREFIX"),
-            "history/v1/core",
-        )
-    raise ValueError(f"unsupported history version: {history_version!r}")
+    return prefix
 
 
 def _clean_dropbox_segment(value: str) -> str:
@@ -915,22 +969,23 @@ def resolve_core_snapshot_root(
     env: Mapping[str, str] | None = None,
 ) -> str:
     values = os.environ if env is None else env
-    version = str(history_version or "v1").strip().lower()
+    version = str(history_version or "").strip().lower()
+    if version != CURRENT_INTEGRITY_HISTORY_VERSION:
+        raise ValueError("current history integrity supports history version v2 only")
     core_prefix = resolve_core_snapshot_prefix(version, values)
+    explicit_root = str(values.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT", "") or "").strip()
+    if explicit_root:
+        normalized = explicit_root.replace("\\", "/").rstrip("/")
+        if not normalized.endswith(f"/{core_prefix}") and normalized != core_prefix:
+            raise ValueError(
+                "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT must target history/v2/core; "
+                f"got {explicit_root}",
+            )
+        return explicit_root
     backup_root = resolve_r2_history_root(values)
     if backup_root:
         return str(Path(backup_root) / core_prefix)
-
-    explicit_root = str(values.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT", "") or "").strip()
-    if not explicit_root:
-        return explicit_root
-    # Preserve legacy v1 behaviour, but prevent v2-only runs from reusing a
-    # configured v1 Dropbox core root silently.
-    if version == "v2":
-        normalized = explicit_root.replace("\\", "/")
-        if normalized.endswith("/history/v1/core") or normalized == "history/v1/core":
-            return explicit_root[: -len("history/v1/core")] + core_prefix
-    return explicit_root
+    return ""
 
 
 def classify_core_snapshot_status(
@@ -3333,12 +3388,9 @@ def _planned_backfill_command(
 
 
 def adapter_backfill_history_version(history_version_mode: str) -> str:
-    """History version used by source-adapter triggered backfills.
-
-    `both` mode remains conservative: source-change backfills keep the legacy
-    v1 target while the v2 checker reports v2 gaps separately.
-    """
-    return "v2" if history_version_mode == "v2" else "v1"
+    if history_version_mode != CURRENT_INTEGRITY_HISTORY_VERSION:
+        raise ValueError("current history integrity supports history version v2 only")
+    return CURRENT_INTEGRITY_HISTORY_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -6825,13 +6877,13 @@ AQILEVELS_EXPECTED_WRITER_VERSION = "parquet-wasm-zstd-v2"
 CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
 
 HISTORY_INTEGRITY_SCHEMA_VERSION = 2
-HISTORY_VERSION_CHOICES = ("v1", "v2", "both")
+HISTORY_VERSION_CHOICES = (CURRENT_INTEGRITY_HISTORY_VERSION,)
 LAST_BACKFILL_ENV_LOAD_RESULT: dict[str, Any] = {}
 AQI_INTEGRITY_OBS_COVERAGE_REASON = "aqi_integrity_obs_coverage_gap"
 V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES = {
     "aqi_manifest_missing_after_obs_repair",
     "aqi_manifest_missing_for_observations",
-    "aqi_rows_below_observation_rows",
+    "aqi_expected_hours_missing",
     "data_manifest_missing",
     "data_manifest_empty",
     "parquet_missing",
@@ -6839,6 +6891,7 @@ V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES = {
     "row_count_mismatch",
     "pollutant_dir_missing",
 }
+V2_AQI_SUPPORTED_POLLUTANTS = frozenset({"no2", "pm25", "pm10"})
 
 
 @dataclass(frozen=True)
@@ -6884,23 +6937,26 @@ def resolve_history_version_mode(args: argparse.Namespace | None = None) -> str:
     if args is not None:
         raw = str(getattr(args, "history_version", "") or "").strip().lower()
     if not raw:
-        raw = str(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_VERSION", "v1")).strip().lower()
+        raw = str(
+            os.environ.get(
+                "UK_AQ_R2_HISTORY_INTEGRITY_VERSION",
+                CURRENT_INTEGRITY_HISTORY_VERSION,
+            ),
+        ).strip().lower()
     if raw not in HISTORY_VERSION_CHOICES:
         raise ValueError(
-            "history version must be one of "
-            f"{', '.join(HISTORY_VERSION_CHOICES)} (got {raw!r})"
+            "current history integrity supports --history-version v2 only "
+            f"(got {raw!r})",
         )
-    return raw
+    return CURRENT_INTEGRITY_HISTORY_VERSION
 
 
 def expand_history_versions(history_version_mode: str) -> list[str]:
-    if history_version_mode == "both":
-        return ["v1", "v2"]
-    if history_version_mode in {"v1", "v2"}:
-        return [history_version_mode]
+    if history_version_mode == CURRENT_INTEGRITY_HISTORY_VERSION:
+        return [CURRENT_INTEGRITY_HISTORY_VERSION]
     raise ValueError(
-        "history version must be one of "
-        f"{', '.join(HISTORY_VERSION_CHOICES)} (got {history_version_mode!r})"
+        "current history integrity supports history version v2 only "
+        f"(got {history_version_mode!r})",
     )
 
 
@@ -6909,45 +6965,7 @@ def resolve_history_path_config(
     env: Mapping[str, str] | None = None,
 ) -> HistoryPathConfig:
     values = os.environ if env is None else env
-    if history_version == "v1":
-        index_prefix = _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_INDEX_PREFIX"),
-            R2_HISTORY_INDEX_PREFIX,
-        )
-        observations_index_prefix = _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_OBSERVATIONS_TIMESERIES_INDEX_PREFIX"),
-            f"{index_prefix}/observations_timeseries",
-        )
-        aqilevels_index_prefix = _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_AQILEVELS_TIMESERIES_INDEX_PREFIX"),
-            f"{index_prefix}/aqilevels_timeseries",
-        )
-        return HistoryPathConfig(
-            history_version="v1",
-            observations_data_prefix=_normalize_history_prefix(
-                values.get("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX"),
-                R2_HISTORY_OBSERVATIONS_PREFIX,
-            ),
-            aqilevels_hourly_data_prefix=_normalize_history_prefix(
-                values.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX"),
-                R2_AQILEVELS_PREFIX,
-            ),
-            aqilevels_hourly_debug_prefix=None,
-            observations_timeseries_index_prefix=observations_index_prefix,
-            aqilevels_timeseries_index_prefix=aqilevels_index_prefix,
-            observations_latest_index_key=_append_json_name(
-                index_prefix,
-                "observations_timeseries_latest.json",
-            ),
-            aqilevels_latest_index_key=_append_json_name(
-                index_prefix,
-                "aqilevels_timeseries_latest.json",
-            ),
-            observations_partition_levels=("day_utc", "connector_id"),
-            aqilevels_partition_levels=("day_utc", "connector_id"),
-            checks_implemented=True,
-        )
-    if history_version == "v2":
+    if history_version == CURRENT_INTEGRITY_HISTORY_VERSION:
         index_prefix = _normalize_history_prefix(
             values.get("UK_AQ_R2_HISTORY_INDEX_V2_PREFIX"),
             R2_HISTORY_V2_INDEX_PREFIX,
@@ -6988,7 +7006,10 @@ def resolve_history_path_config(
             aqilevels_partition_levels=("day_utc", "connector_id", "pollutant_code"),
             checks_implemented=True,
         )
-    raise ValueError(f"unsupported history version: {history_version!r}")
+    raise ValueError(
+        "current history integrity supports history version v2 only "
+        f"(got {history_version!r})",
+    )
 
 
 def resolve_history_path_configs(
@@ -7729,6 +7750,36 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
                 [parquet_files],
             ).fetchone()
 
+        # The v2 AQI writer groups valid source observations by UTC hour.  Keep
+        # that identity here so completeness never compares five-minute source
+        # row counts with hourly AQI row counts.
+        timeseries_hour_keys: dict[int, tuple[int, ...]] = {}
+        if timestamp_column:
+            valid_value_filter = ""
+            if "value" in columns:
+                valid_value_filter = (
+                    " AND TRY_CAST(value AS DOUBLE) IS NOT NULL"
+                    " AND isfinite(TRY_CAST(value AS DOUBLE))"
+                    " AND TRY_CAST(value AS DOUBLE) >= 0"
+                )
+            hour_rows = connection.execute(
+                "SELECT CAST(timeseries_id AS BIGINT), "
+                f"CAST(FLOOR(epoch(TRY_CAST({timestamp_column} AS TIMESTAMPTZ)) / 3600) AS BIGINT) "
+                "FROM read_parquet(?, union_by_name=true) "
+                "WHERE timeseries_id IS NOT NULL "
+                f"AND TRY_CAST({timestamp_column} AS TIMESTAMPTZ) IS NOT NULL"
+                f"{valid_value_filter} "
+                "GROUP BY 1, 2 ORDER BY 1, 2",
+                [parquet_files],
+            ).fetchall()
+            grouped_hour_keys: dict[int, list[int]] = {}
+            for timeseries_id, hour_key in hour_rows:
+                grouped_hour_keys.setdefault(int(timeseries_id), []).append(int(hour_key))
+            timeseries_hour_keys = {
+                timeseries_id: tuple(hour_keys)
+                for timeseries_id, hour_keys in grouped_hour_keys.items()
+            }
+
         # Determine if we have null timeseries_id rows
         has_null_timeseries_id_rows = null_timeseries_count > 0
         return {
@@ -7740,6 +7791,7 @@ def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any]
             "max_timeseries_id": max(counts.keys()) if counts else None,
             "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
             "max_timestamp_utc": str(max_timestamp) if max_timestamp is not None else None,
+            "timeseries_hour_keys": timeseries_hour_keys,
             "parquet_null_timeseries_id_rows": has_null_timeseries_id_rows,
         }, None
     except Exception as exc:
@@ -11209,7 +11261,64 @@ def _active_aqi_eligible_pollutants_for_connector(
         """,
         (int(connector_id),),
     ).fetchall()
-    return {str(row[0]).strip() for row in rows if str(row[0] or "").strip()}
+    normalized: set[str] = set()
+    for row in rows:
+        compact = re.sub(r"[^a-z0-9]+", "", str(row[0] or "").strip().lower())
+        if compact in {"ino2", "no2"}:
+            normalized.add("no2")
+        elif compact in {"ipm25", "pm25", "pm2"}:
+            normalized.add("pm25")
+        elif compact in {"ipm10", "pm10"}:
+            normalized.add("pm10")
+    return normalized
+
+
+def _v2_aqi_expected_hour_keys(
+    stats: Mapping[str, Any] | None,
+    *,
+    pollutant_code: str,
+) -> dict[int, set[int]]:
+    """Return the UTC hour identities the v2 AQI writer must emit.
+
+    The writer accepts only NO2, PM2.5 and PM10 source rows with a finite,
+    non-negative value, then emits one record per timeseries/UTC-hour.  PM
+    DAQI may be insufficient before a 24-hour window is available, but the
+    hourly row is still emitted for its EAQI result and diagnostics.
+    """
+    if pollutant_code not in V2_AQI_SUPPORTED_POLLUTANTS or not stats:
+        return {}
+    raw = stats.get("timeseries_hour_keys")
+    if not isinstance(raw, Mapping):
+        return {}
+    output: dict[int, set[int]] = {}
+    for raw_timeseries_id, raw_hour_keys in raw.items():
+        try:
+            timeseries_id = int(raw_timeseries_id)
+        except (TypeError, ValueError):
+            continue
+        if timeseries_id <= 0 or not isinstance(raw_hour_keys, (list, tuple, set)):
+            continue
+        hour_keys: set[int] = set()
+        for raw_hour_key in raw_hour_keys:
+            try:
+                hour_keys.add(int(raw_hour_key))
+            except (TypeError, ValueError):
+                continue
+        if hour_keys:
+            output[timeseries_id] = hour_keys
+    return output
+
+
+def _v2_aqi_missing_hour_keys(
+    expected_hours: Mapping[int, set[int]],
+    actual_hours: Mapping[int, set[int]],
+) -> dict[int, list[int]]:
+    """Return missing v2 AQI UTC-hour identities by timeseries."""
+    return {
+        timeseries_id: sorted(expected_hour_keys - actual_hours.get(timeseries_id, set()))
+        for timeseries_id, expected_hour_keys in expected_hours.items()
+        if expected_hour_keys - actual_hours.get(timeseries_id, set())
+    }
 
 
 def _v2_aqi_observation_coverage_gaps(
@@ -11220,7 +11329,7 @@ def _v2_aqi_observation_coverage_gaps(
     connector_id: int,
     conn: sqlite3.Connection | None = None,
     missing_manifest_gap_type: str = "aqi_manifest_missing_after_obs_repair",
-    rows_low_gap_type: str = "aqi_rows_below_observation_rows",
+    missing_hours_gap_type: str = "aqi_expected_hours_missing",
     missing_observations_gap_type: str | None = None,
     invalid_gap_type: str = "aqi_post_rebuild_validation_failed",
 ) -> list[dict[str, Any]]:
@@ -11252,6 +11361,8 @@ def _v2_aqi_observation_coverage_gaps(
 
     for obs_dir in obs_pollutant_dirs:
         pollutant = obs_dir.name.split("=", 1)[1]
+        if pollutant not in V2_AQI_SUPPORTED_POLLUTANTS:
+            continue
         if eligible_pollutants is not None and pollutant not in eligible_pollutants:
             continue
         obs_manifest_rel = _v2_partition_manifest_rel(
@@ -11271,9 +11382,20 @@ def _v2_aqi_observation_coverage_gaps(
                 related_paths=[f"observation_manifest_{obs_err or 'not_object'}"],
             ))
             continue
-        obs_rows = _manifest_row_count(obs_payload)
-        obs_counts = _manifest_timeseries_row_counts(obs_payload)
-        if obs_rows <= 0 and not obs_counts:
+        obs_files = sorted(p for p in obs_dir.glob("*.parquet") if p.is_file())
+        obs_stats, obs_error = _read_parquet_partition_stats(obs_files)
+        if obs_error:
+            gaps.append(_v2_aqi_gap(
+                invalid_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=obs_manifest_rel,
+                related_paths=[f"observation_hour_read_{obs_error}"],
+            ))
+            continue
+        expected_hours = _v2_aqi_expected_hour_keys(obs_stats, pollutant_code=pollutant)
+        if not expected_hours:
             continue
 
         aqi_manifest_rel = _v2_partition_manifest_rel(
@@ -11290,7 +11412,7 @@ def _v2_aqi_observation_coverage_gaps(
                 connector_id=connector_id,
                 pollutant_code=pollutant,
                 expected_path=aqi_manifest_rel,
-                related_paths=[obs_manifest_rel, f"observation_rows={obs_rows}"],
+                related_paths=[obs_manifest_rel, f"expected_aqi_hours={sum(map(len, expected_hours.values()))}"],
             ))
             continue
         aqi_payload, aqi_err = _load_json_file(aqi_manifest_path)
@@ -11305,27 +11427,37 @@ def _v2_aqi_observation_coverage_gaps(
             ))
             continue
 
-        aqi_rows = _manifest_row_count(aqi_payload)
-        aqi_counts = _manifest_timeseries_row_counts(aqi_payload)
-        low_reasons: list[str] = []
-        if obs_rows > 0 and aqi_rows < obs_rows:
-            low_reasons.append(f"row_count:{aqi_rows}<{obs_rows}")
-        for timeseries_id, obs_count in sorted(obs_counts.items()):
-            if obs_count <= 0:
-                continue
-            aqi_count = int(aqi_counts.get(timeseries_id, 0) or 0)
-            if aqi_count < obs_count:
-                low_reasons.append(f"timeseries_id={timeseries_id}:{aqi_count}<{obs_count}")
-            if len(low_reasons) >= 25:
-                break
-        if low_reasons:
+        aqi_files = sorted(p for p in aqi_manifest_path.parent.glob("*.parquet") if p.is_file())
+        aqi_stats, aqi_error = _read_parquet_partition_stats(aqi_files)
+        if aqi_error:
             gaps.append(_v2_aqi_gap(
-                rows_low_gap_type,
+                invalid_gap_type,
                 day_utc=day_utc,
                 connector_id=connector_id,
                 pollutant_code=pollutant,
                 expected_path=aqi_manifest_rel,
-                related_paths=[obs_manifest_rel, *low_reasons],
+                related_paths=[f"aqi_hour_read_{aqi_error}"],
+            ))
+            continue
+        actual_hours = _v2_aqi_expected_hour_keys(aqi_stats, pollutant_code=pollutant)
+        missing_reasons: list[str] = []
+        for timeseries_id, missing_hour_keys in sorted(
+            _v2_aqi_missing_hour_keys(expected_hours, actual_hours).items()
+        ):
+            missing_reasons.extend(
+                f"timeseries_id={timeseries_id}:utc_hour_epoch={hour_key}"
+                for hour_key in missing_hour_keys[:25 - len(missing_reasons)]
+            )
+            if len(missing_reasons) >= 25:
+                break
+        if missing_reasons:
+            gaps.append(_v2_aqi_gap(
+                missing_hours_gap_type,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant,
+                expected_path=aqi_manifest_rel,
+                related_paths=[obs_manifest_rel, *missing_reasons],
             ))
     return gaps
 
@@ -13464,13 +13596,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Allow the daily task backup gate to proceed even when the Dropbox backup is not yet ready.",
     )
-    default_history_version = os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_VERSION", "v1")
+    default_history_version = os.environ.get(
+        "UK_AQ_R2_HISTORY_INTEGRITY_VERSION",
+        CURRENT_INTEGRITY_HISTORY_VERSION,
+    )
     p.add_argument(
         "--history-version",
         default=default_history_version,
         choices=list(HISTORY_VERSION_CHOICES),
         help=(
-            "R2 history layout version to check "
+            "R2 history layout version to check (v2 only) "
             f"(default {default_history_version!r}; env UK_AQ_R2_HISTORY_INTEGRITY_VERSION)."
         ),
     )
@@ -13486,7 +13621,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG"), False),
         help="Treat missing/invalid v2 AQI hourly debug partitions as errors (default false; env UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG).",
     )
-    return p.parse_args(argv)
+    parsed = p.parse_args(argv)
+    if parsed.run_backfill:
+        p.error(
+            "--run-backfill is temporarily disabled for current v2 integrity: "
+            "the Phase 8 orchestrator does not yet own the observation-data, "
+            "Phase 3 manifest/index, AQI, and mandatory post-repair sequence.",
+        )
+    return parsed
 
 
 def check_dropbox_backup_ready(
@@ -14253,8 +14395,15 @@ def collect_preflight_errors(
     if parsed_from and parsed_to and parsed_from > parsed_to:
         errors.append("--from-day must be less than or equal to --to-day.")
 
-    core_history_version = resolve_core_history_version_for_mode(resolve_history_version_mode(args))
-    resolved_snapshot_root = resolve_core_snapshot_root(core_history_version, os.environ)
+    try:
+        core_history_version = resolve_core_history_version_for_mode(resolve_history_version_mode(args))
+        resolved_snapshot_root = resolve_core_snapshot_root(core_history_version, os.environ)
+    except ValueError as exc:
+        errors.append(str(exc))
+        core_history_version = CURRENT_INTEGRITY_HISTORY_VERSION
+        resolved_snapshot_root = str(
+            os.environ.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT", ""),
+        ).strip()
     snapshot_root = Path(resolved_snapshot_root)
     if not snapshot_root.exists():
         errors.append(
@@ -14501,9 +14650,9 @@ def collect_preflight_errors(
             "root": env["UK_AQ_HISTORY_INTEGRITY_ROOT"],
             "state_dir": env["UK_AQ_HISTORY_INTEGRITY_STATE_DIR"],
             "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-            "snapshot_root": resolve_core_snapshot_root(core_history_version, os.environ),
+            "snapshot_root": resolved_snapshot_root,
             "core_history_version": core_history_version,
-            "core_prefix": resolve_core_snapshot_prefix(core_history_version, os.environ),
+            "core_prefix": CURRENT_INTEGRITY_CORE_PREFIX,
             "r2_history_root": resolve_r2_history_root(os.environ),
             "backfill_wrapper": resolve_integrity_backfill_wrapper(),
             "backfill_env_file": str(os.environ.get("UK_AQ_BACKFILL_ENV_FILE", "")),
@@ -15108,8 +15257,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 ])
                 hvr = (s.get("history_version_results") or {}).get(version) or {}
                 if version == "v2":
-                    obs = hvr.get("observations") or (cc.get("v2_observations") or {}) or ((cc.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {})
-                    aqi = hvr.get("aqilevels") or (cc.get("v2_aqilevels") or {}) or ((cc.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {})
+                    obs = hvr.get("observations") or (cc.get("v2_observations") or {})
+                    aqi = hvr.get("aqilevels") or (cc.get("v2_aqilevels") or {})
                     gaps = list(obs.get("gaps") or [])
                     aqi_gaps = list(aqi.get("gaps") or []) + list((aqi.get("debug") or {}).get("gaps") or [])
                     debug = aqi.get("debug") or {}
@@ -15175,16 +15324,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
                             )
                         if len(aqi_gaps) > 25:
                             lines.append(f"| info |  | truncated |  |  |  | {len(aqi_gaps) - 25} more gaps |")
-                elif version == "v2" and not config.get("checks_implemented", True):
-                    lines.append("- Deep v2 checks: not implemented in Phase 1")
                 lines.append("")
-            if s.get("history_version_mode") == "both":
-                lines.extend([
-                    "## v1/v2 comparison",
-                    "",
-                    "- Full comparison: not implemented until Phase 5",
-                    "",
-                ])
         lines.extend([
             "## R2 Cross-check metrics",
             "",
@@ -15660,7 +15800,7 @@ def main(argv: list[str]) -> int:
                 ),
             }
             log.warning("cross-check: skipped — %s", cross_check_metrics["skipped_reason"])
-        elif history_version_mode == "v2":
+        else:
             r2_history_root = resolve_r2_history_root(os.environ)
             v2_obs = run_v2_observations_integrity_checks(
                 r2_history_root=r2_history_root,
@@ -15697,203 +15837,38 @@ def main(argv: list[str]) -> int:
                 "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
                 "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
             }
-        else:
-            v1_config = history_path_configs.get("v1")
-            if v1_config is None:
-                raise RuntimeError("v1 history path config is required for v1 cross-check mode")
-            r2_history_root = resolve_r2_history_root(os.environ)
-            cross_check_metrics = run_r2_cross_checks(
-                conn=conn,
-                run_id=int(run_id),
-                env_name=args.env,
-                source_filter=args.source,
-                from_day=from_day,
-                to_day=to_day,
-                r2_history_root=r2_history_root,
-                r2_manifest_prefix=v1_config.observations_timeseries_index_prefix,
-                checked_at_utc=fmt_iso(utc_now()),
-                log=log,
-            )
-            cross_check_metrics["history_version"] = "v1"
-            if history_version_mode == "both":
-                v2_obs = run_v2_observations_integrity_checks(
-                    r2_history_root=r2_history_root,
-                    config=history_path_configs["v2"],
-                    from_day=from_day,
-                    to_day=to_day,
-                    conn=conn,
-                    env_name=args.env,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    source_scope=v2_source_scope,
-                    log=log,
-                )
-                v2_aqi = run_v2_aqilevels_integrity_checks(
-                    r2_history_root=r2_history_root,
-                    config=history_path_configs["v2"],
-                    from_day=from_day,
-                    to_day=to_day,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    source_scope=v2_source_scope,
-                    conn=conn,
-                    check_aqi_debug=bool(args.check_aqi_debug),
-                    require_aqi_debug=bool(args.require_aqi_debug),
-                    log=log,
-                )
-                cross_check_metrics["additional_history_versions"] = {
-                    "v2": {
-                        "ran": True,
-                        "checks_implemented": True,
-                        "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
-                        "source_scope": v2_source_scope,
-                        "observations": v2_obs,
-                        "aqilevels": v2_aqi,
-                    }
-                }
         if cross_check_metrics.get("ran"):
-            cc_backfill_metrics = run_cross_check_backfills(
+            v2_backfill_metrics = run_v2_gap_backfills(
                 conn=conn,
                 run_id=int(run_id),
                 env_name=args.env,
                 run_compact=run_compact,
                 env=env,
-                source_filter=args.source,
-                sos_metrics=sos_metrics,
+                v2_observations=cross_check_metrics.get("v2_observations") or {},
                 dry_run=args.dry_run,
-                run_backfill=args.run_backfill,
+                run_backfill=False,
                 limits=limits,
                 log=log,
-                history_version=history_version_mode,
             )
-            cross_check_metrics.update(cc_backfill_metrics)
-            if history_version_mode == "v2":
-                v2_backfill_metrics = run_v2_gap_backfills(
-                    conn=conn,
-                    run_id=int(run_id),
-                    env_name=args.env,
-                    run_compact=run_compact,
-                    env=env,
-                    v2_observations=cross_check_metrics.get("v2_observations") or {},
-                    dry_run=args.dry_run,
-                    run_backfill=args.run_backfill,
-                    limits=limits,
-                    log=log,
-                )
-                cross_check_metrics.update(v2_backfill_metrics)
-            v1_config_for_legacy_aqi = history_path_configs.get("v1")
-            if v1_config_for_legacy_aqi is None:
-                aqi_health_metrics = {
-                    "aqi_health_ran": False,
-                    "aqi_health_skipped_reason": "skipped because v1 was not selected for this run",
-                    "aqi_health_connector_days_checked": 0,
-                    "aqi_health_rebuilds_queued": 0,
-                    "aqi_health_skipped_already_obs_repaired": 0,
-                    "aqi_health_manifest_missing": 0,
-                    "aqi_health_manifest_stale": 0,
-                    "aqi_health_manifest_empty": 0,
-                    "aqi_health_previous_rebuild_failed": 0,
-                    "queued_aqi_only_connector_days": [],
-                }
-            else:
-                aqi_health_metrics = run_aqi_health_checks(
-                    conn=conn,
-                    run_id=int(run_id),
-                    env_name=args.env,
-                    r2_history_root=resolve_r2_history_root(os.environ),
-                    r2_aqilevels_prefix=v1_config_for_legacy_aqi.aqilevels_hourly_data_prefix,
-                    dry_run=args.dry_run,
-                    run_backfill=args.run_backfill,
-                    log=log,
-                )
-            cross_check_metrics.update(aqi_health_metrics)
-            if history_version_mode == "v2":
-                existing_planned_aqi_rows = list(cross_check_metrics.get("planned_aqi_rebuild_connector_days") or [])
-                existing_aqi_only_rows = list(cross_check_metrics.get("queued_aqi_only_connector_days") or [])
-                observation_gap_keys = {
-                    (str(gap.get("day_utc") or ""), int(gap.get("connector_id") or 0))
-                    for gap in list((cross_check_metrics.get("v2_observations") or {}).get("gaps") or [])
-                    if str(gap.get("day_utc") or "") and int(gap.get("connector_id") or 0) > 0
-                }
-                verified_repair_keys = {
-                    (str(result.get("day_utc") or ""), int(result.get("connector_id") or 0))
-                    for result in list(cross_check_metrics.get("v2_observation_repair_results") or [])
-                    if result.get("status") == "ok"
-                }
-                v2_aqi_integrity_queue_metrics = queue_v2_aqi_rebuilds_from_integrity_gaps(
-                    conn=conn,
-                    run_id=int(run_id),
-                    env_name=args.env,
-                    env=env,
-                    v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
-                    dry_run=args.dry_run,
-                    run_backfill=args.run_backfill,
-                    log=log,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    blocked_connector_days=observation_gap_keys - verified_repair_keys,
-                )
-                cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
-                cross_check_metrics["planned_aqi_rebuild_connector_days"] = [
-                    *existing_planned_aqi_rows,
-                    *(v2_aqi_integrity_queue_metrics.get("planned_aqi_rebuild_connector_days") or []),
-                ]
-                cross_check_metrics["queued_aqi_only_connector_days"] = [
-                    *existing_aqi_only_rows,
-                    *(v2_aqi_integrity_queue_metrics.get("queued_aqi_only_connector_days") or []),
-                ]
-            aqi_rebuild_metrics = run_aqi_rebuild_queue_execution(
+            cross_check_metrics.update(v2_backfill_metrics)
+            observation_gap_keys = {
+                (str(gap.get("day_utc") or ""), int(gap.get("connector_id") or 0))
+                for gap in list((cross_check_metrics.get("v2_observations") or {}).get("gaps") or [])
+                if str(gap.get("day_utc") or "") and int(gap.get("connector_id") or 0) > 0
+            }
+            v2_aqi_integrity_queue_metrics = queue_v2_aqi_rebuilds_from_integrity_gaps(
                 conn=conn,
                 run_id=int(run_id),
                 env_name=args.env,
-                run_compact=run_compact,
                 env=env,
+                v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
                 dry_run=args.dry_run,
-                run_backfill=args.run_backfill,
-                limits=limits,
+                run_backfill=False,
                 log=log,
-                dry_run_planned_rows=[
-                    *(cross_check_metrics.get("planned_aqi_rebuild_connector_days") or []),
-                    *(cross_check_metrics.get("queued_aqi_only_connector_days") or []),
-                ],
-                history_version="v2" if history_version_mode == "v2" else "v1",
+                allowed_connector_ids=v2_allowed_connector_ids,
+                blocked_connector_days=observation_gap_keys,
             )
-            cross_check_metrics.update(aqi_rebuild_metrics)
-            if history_version_mode == "v2" and (
-                int(cross_check_metrics.get("v2_observation_repairs_ok", 0) or 0) > 0
-                or int(cross_check_metrics.get("aqi_rebuilds_complete", 0) or 0) > 0
-                or int(cross_check_metrics.get("aqi_rebuilds_failed", 0) or 0) > 0
-            ):
-                pre_obs = cross_check_metrics.get("v2_observations") or {}
-                pre_aqi = cross_check_metrics.get("v2_aqilevels") or {}
-                post_repair = run_v2_post_repair_integrity_rechecks(
-                    conn=conn,
-                    env_name=args.env,
-                    r2_history_root=resolve_r2_history_root(os.environ),
-                    config=history_path_configs["v2"],
-                    from_day=from_day,
-                    to_day=to_day,
-                    allowed_connector_ids=v2_allowed_connector_ids,
-                    source_scope=v2_source_scope,
-                    check_aqi_debug=bool(args.check_aqi_debug),
-                    require_aqi_debug=bool(args.require_aqi_debug),
-                    log=log,
-                )
-                cross_check_metrics["v2_pre_repair_observations"] = pre_obs
-                cross_check_metrics["v2_pre_repair_aqilevels"] = pre_aqi
-                cross_check_metrics["v2_post_repair"] = post_repair
-                cross_check_metrics["v2_observations"] = post_repair["observations"]
-                cross_check_metrics["v2_aqilevels"] = post_repair["aqilevels"]
-                cross_check_metrics["v2_repair_status_message"] = post_repair["message"]
-                post_obs = post_repair["observations"]
-                post_aqi = post_repair["aqilevels"]
-                post_total = int(post_obs.get("checked_partitions", 0) or 0) + int(post_aqi.get("checked_partitions", 0) or 0)
-                post_gaps = (
-                    int(post_obs.get("gap_count", 0) or 0)
-                    + int(post_aqi.get("gap_count", 0) or 0)
-                    + int((post_aqi.get("debug") or {}).get("gap_count", 0) or 0)
-                )
-                cross_check_metrics["cross_checks_total"] = post_total
-                cross_check_metrics["cross_checks_ok"] = post_total if post_repair["status"] == "ok" else 0
-                cross_check_metrics["cross_checks_mismatch"] = post_gaps
-                cross_check_metrics["discrepancy_total"] = post_gaps
+            cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
 
         any_adapter_ran = (
             openaq_metrics.get("ran")
@@ -15925,9 +15900,6 @@ def main(argv: list[str]) -> int:
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
             + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
             + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
-            + int(((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations") or {}).get("gap_count", 0) or 0)
-            + int(((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {}).get("gap_count", 0) or 0)
-            + int(((((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0) if ((((cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels") or {}).get("debug") or {}).get("required")) else 0)
         )
         if v2_gap_count_for_status > 0:
             status = "fail"
@@ -16286,33 +16258,23 @@ def main(argv: list[str]) -> int:
         )
         conn.commit()
 
-        history_version_results: dict[str, Any] = {}
-        for version, config in history_path_configs.items():
-            if version == "v1":
-                history_version_results[version] = {
-                    "history_version": "v1",
-                    "checks_implemented": True,
-                    "status": "checked" if cross_check_metrics.get("ran") else "skipped",
-                    "skipped_reason": None if cross_check_metrics.get("ran") else cross_check_metrics.get("skipped_reason"),
-                }
-            else:
-                v2_obs = (
-                    cross_check_metrics.get("v2_observations")
-                    or (cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("observations")
-                    or {"status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": []}
-                )
-                v2_aqi = (
-                    cross_check_metrics.get("v2_aqilevels")
-                    or (cross_check_metrics.get("additional_history_versions") or {}).get("v2", {}).get("aqilevels")
-                    or {"status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": [], "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []}}
-                )
-                history_version_results[version] = {
-                    "history_version": "v2",
-                    "checks_implemented": True,
-                    "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
-                    "observations": v2_obs,
-                    "aqilevels": v2_aqi,
-                }
+        v2_obs = cross_check_metrics.get("v2_observations") or {
+            "status": "not_implemented", "checked_partitions": 0, "gap_count": 0, "gaps": [],
+        }
+        v2_aqi = cross_check_metrics.get("v2_aqilevels") or {
+            "status": "not_implemented", "checked_partitions": 0, "gap_count": 0,
+            "gaps": [],
+            "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
+        }
+        history_version_results: dict[str, Any] = {
+            CURRENT_INTEGRITY_HISTORY_VERSION: {
+                "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
+                "checks_implemented": True,
+                "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
+                "observations": v2_obs,
+                "aqilevels": v2_aqi,
+            },
+        }
 
         summary: dict[str, Any] = {
             "env": args.env,

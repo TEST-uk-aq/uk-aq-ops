@@ -19,15 +19,20 @@ directory and do not rely on an undocumented runtime bundle.
 
 ## Current flow
 
-1. Load the integrity environment and then the configured backfill environment.
+1. Load the v2-only integrity environment and then the configured backfill environment when daily-task health needs it.
 2. Check Dropbox backup readiness for scheduled runs before Dropbox-inspecting preflight checks.
-3. Import the current core snapshot.
+3. Import the current `R2_history_backup/history/v2/core` snapshot using the v2 core writer manifest/table contract.
 4. Run the configured source adapters.
 5. Run R2 history cross-checks.
-6. For `history_version=v2`, validate both:
+6. Validate v2 only:
    - observations partitions and manifests;
    - AQI hourly partitions and manifests.
 7. Build a repair plan and write JSON/Markdown reports.
+
+`--history-version v2` is the only accepted history version. `v1`, `both`,
+and `--run-backfill` are rejected before scanning or repair work. The current
+integrity CLI is read-only while the single v2 repair orchestrator is completed;
+the Phase 3 executor remains the authoritative manifest/index finaliser.
 
 ## Backup gate
 

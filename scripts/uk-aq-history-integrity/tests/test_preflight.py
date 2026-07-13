@@ -90,6 +90,15 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(parsed.concurrency, 1)
         self.assertTrue(parsed.verbose)
 
+    def test_parse_args_rejects_v1_both_and_run_backfill_before_work(self) -> None:
+        for value in ("v1", "both"):
+            with self.subTest(history_version=value), self.assertRaises(SystemExit) as raised:
+                MODULE.parse_args(["--env", "CIC-Test", "--history-version", value])
+            self.assertEqual(raised.exception.code, 2)
+        with self.assertRaises(SystemExit) as raised:
+            MODULE.parse_args(["--env", "CIC-Test", "--run-backfill"])
+        self.assertEqual(raised.exception.code, 2)
+
     def test_parse_args_rejects_hyphenated_sos_source(self) -> None:
         with self.assertRaises(SystemExit):
             MODULE.parse_args(
@@ -98,7 +107,8 @@ class PreflightTests(unittest.TestCase):
 
     def _base_env(self, root: Path) -> tuple[dict[str, str], dict[str, str]]:
         state = root / "state" / "CIC-Test"
-        snapshot_root = root / "snapshot"
+        r2_root = root / "r2"
+        snapshot_root = r2_root / "history" / "v2" / "core"
         snapshot_root.mkdir(parents=True, exist_ok=True)
         (snapshot_root / "manifest.json").write_text("{}", encoding="utf-8")
         backfill_env = root / "backfill.env"
@@ -115,11 +125,6 @@ class PreflightTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        r2_root = root / "r2"
-        r2_v1_core = r2_root / "history" / "v1" / "core"
-        r2_v1_core.mkdir(parents=True, exist_ok=True)
-        (r2_v1_core / "manifest.json").write_text("{}", encoding="utf-8")
-
         env = {
             "UK_AQ_ENV_NAME": "CIC-Test",
             "UK_AQ_HISTORY_INTEGRITY_ROOT": str(root),
@@ -205,9 +210,9 @@ class PreflightTests(unittest.TestCase):
             os_env["UK_AQ_DROPBOX_ROOT"] = "CIC-Test"
             os_env["UK_AQ_R2_HISTORY_DROPBOX_DIR"] = "R2_history_backup"
             backup_root = root / "dropbox-app" / "CIC-Test" / "R2_history_backup"
-            (backup_root / "history" / "v1" / "core").mkdir(parents=True, exist_ok=True)
-            (backup_root / "history" / "v1" / "core" / "manifest.json").write_text("{}", encoding="utf-8")
-            os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(backup_root / "history" / "v1" / "core")
+            (backup_root / "history" / "v2" / "core").mkdir(parents=True, exist_ok=True)
+            (backup_root / "history" / "v2" / "core" / "manifest.json").write_text("{}", encoding="utf-8")
+            os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(backup_root / "history" / "v2" / "core")
             args = make_args(skip_cross_check=False)
             with patched_env(os_env), mock.patch.object(MODULE, "DROPBOX_APP_ROOT", root / "dropbox-app"):
                 errors, _, summary = MODULE.collect_preflight_errors(args, env)
@@ -323,9 +328,7 @@ class PreflightTests(unittest.TestCase):
             v2_core_root.mkdir(parents=True, exist_ok=True)
             (v2_core_root / "manifest.json").write_text("{}", encoding="utf-8")
             os_env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"] = str(backup_root)
-            os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(
-                backup_root / "history" / "v1" / "core",
-            )
+            os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(v2_core_root)
             args = make_args(history_version="v2", skip_cross_check=True)
             with patched_env(os_env):
                 errors, _, summary = MODULE.collect_preflight_errors(args, env)
@@ -339,11 +342,9 @@ class PreflightTests(unittest.TestCase):
             root = Path(tmp)
             env, os_env = self._base_env(root)
             backup_root = root / "R2_history_backup"
-            (backup_root / "history" / "v1" / "core").mkdir(parents=True, exist_ok=True)
-            (backup_root / "history" / "v1" / "core" / "manifest.json").write_text("{}", encoding="utf-8")
             os_env["UK_AQ_R2_HISTORY_DROPBOX_ROOT"] = str(backup_root)
             os_env["UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT"] = str(
-                backup_root / "history" / "v1" / "core",
+                backup_root / "history" / "v2" / "core",
             )
             args = make_args(history_version="v2", skip_cross_check=True)
             with patched_env(os_env):

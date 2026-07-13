@@ -224,13 +224,6 @@ class V2ObservationsIntegrityTests(unittest.TestCase):
         result = {"v2": {"status": obs["status"], "observations": obs}}
         self.assertEqual(result["v2"]["status"], "fail")
 
-    def test_both_keeps_v2_failure_separate(self) -> None:
-        self._write_healthy(manifest=False)
-        obs = self._run()
-        results = {"v1": {"status": "checked"}, "v2": {"status": obs["status"], "observations": obs}}
-        self.assertEqual(results["v1"]["status"], "checked")
-        self.assertEqual(results["v2"]["status"], "fail")
-
 
     def test_v2_repair_plan_uses_uk_air_csv_without_v1_fallback(self) -> None:
         day = "2026-06-11"
