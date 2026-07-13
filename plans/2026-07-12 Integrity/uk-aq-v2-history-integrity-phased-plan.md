@@ -31,13 +31,8 @@ Canonical database SQL belongs in:
 TEST-uk-aq-schema/schemas/obs_aqi_db
 ```
 
-A matching deployable copy may also exist in:
-
-```text
-TEST-uk-aq-ops/scripts/uk-aq-history-integrity/sql
-```
-
-The two SQL copies must remain semantically identical.
+The ops repository reads the canonical schema source directly in its contract
+test; no ops SQL mirror is maintained.
 
 ---
 
@@ -171,7 +166,10 @@ records and must not be used as current-status authority.
 | 1 | Backup gate correctness and safety | Implementation complete | `6965763` | Local validation complete. |
 | 2 | Complete read-only v2 validation | Implementation complete; runtime acceptance pending | `4438499` | Local validation is complete; the real CIC-Test DuckDB check-only acceptance remains pending. |
 | 3 | Observation manifest and index repair | In progress; not safe for runtime execution |  | Local mocked implementation exists, but the remaining Phase 3 safety blockers and CIC-Test dry-run acceptance are pending. LIVE repair execution is disabled. |
-| 4 | Observation data repair and AQI sequencing | Existing overlapping implementation requires audit; formal phase not complete |  | Existing `--run-backfill` paths require the Phase 9 inventory before further Phase 4 design or execution. |
+| 4 | Observation data repair and AQI sequencing | Superseded for current integrity by v2-only Phase 8 consolidation |  | The old overlapping `--run-backfill` route is disabled. |
+| 8 | V2-only core/import contract and writer ownership | Implementation complete; runtime acceptance pending |  | Core uses `R2_history_backup/history/v2/core`; v1/both and integrity `--run-backfill` are rejected before work. |
+| 9 | AQI hourly-grain completeness | Implementation complete; real v2 AQI acceptance pending Phase 11 |  | Expected output is compared by valid supported-pollutant UTC hour, never raw observation-row parity. |
+| 10 | Proportionate v2-only local validation | Incomplete |  | The full integrity Python suite has 10 stale AQI repair fixture failures; focused Phase 3 Node tests and static checks pass. |
 
 After completing a phase, Codex must:
 
@@ -181,6 +179,25 @@ After completing a phase, Codex must:
 4. record tests and exact outcomes;
 5. record any changes to later phases caused by what was learned;
 6. avoid marking a phase complete if any acceptance criterion remains unmet.
+
+## Phase 8 current v2 writer ownership
+
+This table is the current ownership decision for every v2 writer previously
+reachable from history integrity. It does not change the generic tools' support
+contracts for non-integrity callers.
+
+| Writer / caller | Domain and target | Owner and gate | Verification | Phase 8 decision |
+| --- | --- | --- | --- | --- |
+| `run_v2_gap_backfills` → `uk_aq_integrity_backfill.sh` → `uk_aq_backfill_local.sh` → `workers/uk_aq_backfill_local/run_job.ts` | Observation data; v2 parquet/manifests | Future single v2 orchestrator only; current parser and launcher reject `--run-backfill`, and the integrity wrapper exits 2. | Required future observation-result verification before finalisation. | Temporarily disabled; generic local writer retained for non-integrity callers. |
+| `scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs` | Observation connector/day manifests and targeted v2 index/latest/metadata | Authoritative Phase 3 specialist; accepts only supported v2 report actions, dry-run by default, CIC-Test + bucket gate for writes. | Fresh child guard and exact post-PUT GET/hash verification. | Retained as the sole current manifest/index finaliser; not called by disabled integrity write route. |
+| `queue_v2_aqi_rebuilds_from_integrity_gaps` → `run_aqi_rebuild_queue_execution` → local backfill worker | v2 AQI hourly data/debug and index | Future single v2 orchestrator only, after verified observation repair and Phase 3 finalisation. | Eligibility and post-repair v2 integrity check are mandatory. | Temporarily disabled from current integrity; generic AQI writer retained for non-integrity callers. |
+| `run_v2_post_repair_integrity_rechecks` | Read-only v2 observations/AQI integrity report | Future single v2 orchestrator, after all eligible repair stages. | Its successful v2 report is the mandatory final gate. | Retained as the authoritative verifier, currently unreachable because current integrity has no write route. |
+| Generic `scripts/backup_r2/uk_aq_build_r2_history_index.mjs` and `scripts/uk_aq_backfill_local.sh` direct callers | Generic v1/v2 index and data tooling | Their own non-integrity caller contracts. | Tool-specific checks. | Retained unchanged; not a current history-integrity orchestration route. |
+
+The required future order remains: v2 repair plan → observation data repair
+when required → observation verification → Phase 3 manifest/index finalisation
+→ eligible AQI rebuild → mandatory post-repair v2 integrity check. No current
+integrity command can bypass that sequence.
 
 ---
 # Phase 1: Backup gate correctness and safety

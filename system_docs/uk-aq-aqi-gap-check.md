@@ -125,12 +125,12 @@ The `obs_idx_rows` and `aqi_idx_rows` fields are per-timeseries index manifest c
 
 For each selected day, connector, pollutant, and timeseries:
 
-- `missing_aqi_data`: observation rows exist and AQI rows are missing
+- `missing_aqi_data`: supported-pollutant valid observation UTC hours exist and AQI rows are missing
 - `missing_aqi_index`: AQI rows exist and the AQI timeseries index manifest is missing
 - `missing_obs_index`: observation rows exist and the observation timeseries index manifest is missing
-- `stale_or_partial_aqi_data`: both data families exist but AQI rows are fewer than observation rows
+- `missing_expected_aqi_hours`: one or more supported-pollutant valid observation UTC hours have no AQI row
 - `stale_or_partial_aqi_index`: AQI index manifest row count is available and lower than AQI data rows
-- `ok`: expected v2 data/index artefacts are present and compatible for the structural checks above
+- `ok`: expected v2 data/index artefacts are present and every expected AQI UTC hour is present; raw observation-row parity is not required
 
 Multiple gap statuses can appear on the same row separated by semicolons.
 

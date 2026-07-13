@@ -4,8 +4,12 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  uk_aq_integrity_backfill.sh --env CIC-Test|LIVE --observs-only [options]
-  uk_aq_integrity_backfill.sh --env CIC-Test|LIVE --aqi-only [options]
+  uk_aq_integrity_backfill.sh [options]
+
+Current status:
+  Disabled for current v2 history integrity. The future single v2 orchestrator
+  must own observation repair, verification, Phase 3 finalisation, AQI
+  eligibility, and post-repair integrity checking as one sequence.
 
 Required:
   --env CIC-Test|LIVE
@@ -24,7 +28,7 @@ Mode-specific requirements:
     --connector-id N      Optional connector filter for partial-day scope.
 
 Optional:
-  --history-version v1|v2 Select R2 history write/index target (default v1).
+  --history-version v2    Historical argument; no execution is permitted.
   --dry-run               Set UK_AQ_BACKFILL_DRY_RUN=true (default false).
   -h, --help              Show this help.
 
@@ -337,6 +341,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+echo "ERROR: uk_aq_integrity_backfill.sh is temporarily disabled for current v2 integrity." >&2
+echo "ERROR: Its source-to-R2, targeted-index, AQI, and post-repair steps are not yet owned by one v2 orchestrator." >&2
+exit 2
 
 if [[ -z "${ENV_NAME}" ]]; then
   echo "ERROR: --env is required." >&2

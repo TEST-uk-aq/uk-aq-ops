@@ -25,6 +25,18 @@ The system supports both UK-AQ environments:
 Each environment has its own configuration, state, SQLite DB, source cache,
 logs, and Dropbox copy. The script code is shared.
 
+## Current v2-only runtime contract
+
+Current history integrity supports only `--history-version v2` and imports the
+v2 core writer layout from `R2_history_backup/history/v2/core`. The parser and
+launcher reject `v1`, `both`, and `--run-backfill` before scan or repair work.
+The legacy source-to-R2/AQI integrity wrapper is disabled: it does not own the
+required observation verification, Phase 3 manifest/index finalisation, AQI
+eligibility, and mandatory post-repair check as one sequence. Generic backfill
+and index tools remain separate non-integrity utilities. Historical sections
+below describing the old integrity backfill flow are retained as implementation
+history, not an executable current contract.
+
 ---
 
 ## Supported runtime location
@@ -182,7 +194,8 @@ UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/gi
 
 UK_AQ_DROPBOX_ROOT="CIC-Test"
 UK_AQ_R2_HISTORY_DROPBOX_DIR="R2_history_backup"
-UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup/history/v1/core"
+UK_AQ_R2_HISTORY_INTEGRITY_VERSION="v2"
+UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup/history/v2/core"
 
 UK_AQ_BACKFILL_WRAPPER="${UK_AQ_OPS_REPO_ROOT}/scripts/uk_aq_backfill_local.sh"
 UK_AQ_BACKFILL_ENV_FILE="/PATH/TO/CIC-Test/backfill.env"
@@ -218,7 +231,8 @@ Additional vars are required conditionally by preflight, for example:
   app-folder layout, `UK_AQ_DROPBOX_ROOT=CIC-Test` and
   `UK_AQ_R2_HISTORY_DROPBOX_DIR=R2_history_backup` resolve to
   `/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup`.
-- `UK_AQ_BACKFILL_WRAPPER` + `UK_AQ_BACKFILL_ENV_FILE` when `--run-backfill` is set.
+- `UK_AQ_BACKFILL_ENV_FILE` when daily-task health reporting is enabled. It does
+  not enable writes from current history integrity.
 - `UK_AQ_BACKFILL_ENV_FILE` + `OBS_AQIDB_SUPABASE_URL` + `OBS_AQIDB_SECRET_KEY`
   (loaded from that file) when daily task health reporting is enabled.
 - `UK_AQ_BACKFILL_ENV_FILE` + `SUPABASE_URL` + `SB_SECRET_KEY` (loaded from
@@ -404,8 +418,8 @@ The launcher is a thin shell wrapper that:
 2. Loads `<UK_AQ_HISTORY_INTEGRITY_ROOT>/env/<ENV>.env`. The root defaults to
    the parent of `bin/`; override with `UK_AQ_HISTORY_INTEGRITY_ROOT`.
 3. Validates required env vars and environment/path guardrails.
-4. Runs structural preflight checks (writable paths, DB parent, optional backfill
-   wrapper/env checks when `--run-backfill` is selected).
+4. Runs structural preflight checks (writable paths, DB parent, and the v2 core
+   snapshot root/manifest contract).
 5. Creates required directories.
 6. Acquires a per-environment PID lock.
 7. Invokes the Python entrypoint, then cleans up the lock on EXIT/INT/TERM.
@@ -426,7 +440,8 @@ Python interpreter defaults to `python3`; override with
 --to-day YYYY-MM-DD                     (manual profile or override)
 --dry-run                               No DB writes / no remote calls; logs the snapshot and OpenAQ plan.
 --check-only                            (Phase 5 wires Sensor.Community; OpenAQ already check-only by default)
---run-backfill                          Invoke UK_AQ_BACKFILL_WRAPPER for eligible changed-day and cross-check batches (union timeseries IDs per day); no-op under --dry-run.
+--history-version v2                    Required v2-only layout selector; v1 and both are rejected.
+--run-backfill                          Rejected while the single v2 repair orchestrator is completed.
 --max-download-mb N                     Soft cap on per-run downloaded MB (cooperative; checked before each request).
 --max-runtime-minutes N                 Soft cap on per-run runtime minutes (cooperative; checked before each request).
 --concurrency N                         Worker count for the per-file thread pool (default 8; UK_AQ_HISTORY_INTEGRITY_CONCURRENCY overrides). 1 = strict sequential.
@@ -442,17 +457,17 @@ Current runtime behavior for OpenAQ integrity runs:
 | Flags | Remote HEAD/download checks | Change detection + DB writes | Backfill wrapper execution | Planned backfill commands logged |
 |---|---|---|---|---|
 | none | Yes | Yes | No | No |
-| `--run-backfill` | Yes | Yes | Yes (for changed files and cross-check `mismatch`/`source_only`/`r2_manifest_missing`; excludes `r2_timeseries_counts_missing`) | Yes |
+| `--run-backfill` | Rejected before scan | Rejected before scan | No | No |
 | `--dry-run` | No | No | No | No |
-| `--dry-run --run-backfill` | No | No | No | Yes (cross-check candidates only) |
+| `--dry-run --run-backfill` | Rejected before scan | Rejected before scan | No | No |
 | `--check-only` | Same as corresponding row above | Same as corresponding row above | Same as corresponding row above | Same as corresponding row above |
 
 Notes:
 
 - `--dry-run` exits the OpenAQ adapter before per-file checks, so there is no
   changed-file set to plan/execute backfills from.
-- `--check-only` is currently recorded in run metadata/report output, but it
-  does not change control flow beyond the `--run-backfill` gate.
+- `--check-only` is recorded in run metadata/report output; the current CLI
+  cannot opt into a repair writer.
 
 Example commands:
 
@@ -694,7 +709,7 @@ Stagger CIC-Test and LIVE so they do not overlap.
 
 If you want it to auto-backfill, use:
 
-30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily --run-backfill >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily --history-version v2 >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
 
 # LIVE daily check
 30 5 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile daily >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
@@ -1184,7 +1199,7 @@ empty.
 
 ---
 
-## Backfill workflow
+## Historical pre-Phase-8 backfill workflow (disabled for current integrity)
 
 Changed source files trigger only narrow repairs.
 
@@ -1244,7 +1259,7 @@ Notes:
 - `disappeared`/`still_missing` are recorded for visibility but do not
   trigger backfill because there is no source file to rebuild from.
 
-### Exact `--run-backfill` trigger rule
+### Historical `--run-backfill` trigger rule
 
 Backfill is attempted only when all conditions are true:
 
@@ -1896,15 +1911,15 @@ upstream archive contains.
   - duplicate queue rows for the same connector/day are marked `skipped`.
 - For v2 rebuilds queued from `obs_repaired` or
   `aqi_integrity_obs_coverage_gap`, a successful wrapper exit is followed by a
-  manifest coverage validation. The runner compares v2 AQI hourly data manifests
-  with the existing v2 observation pollutant manifests for the same
+  manifest coverage validation. The runner compares valid v2 observation UTC-hour
+  identities with v2 AQI hourly UTC-hour identities for the same
   `(day_utc, connector_id, pollutant_code)`. Missing AQI manifests produce
-  `aqi_manifest_missing_after_obs_repair`; AQI row/timeseries counts below
-  observation manifest coverage produce `aqi_rows_below_observation_rows`.
-  Validation checks manifest row coverage only and does not require non-null DAQI
-  index values, so PM rows with insufficient samples remain valid when AQI rows
-  exist. Internally consistent AQI manifests are not sufficient if v2 observations
-  were repaired after AQI was generated.
+  `aqi_manifest_missing_after_obs_repair`; missing expected hourly identities
+  produce `aqi_expected_hours_missing`. Five-minute source rows are grouped to
+  one expected AQI hour, and O3 is not AQI-eligible. PM rows with insufficient
+  24-hour DAQI windows remain valid because the writer still emits their hourly
+  EAQI/diagnostic row. Internally consistent AQI manifests are not sufficient if
+  v2 observations were repaired after AQI was generated.
 - V2 AQI integrity bridge reports include
   `v2_aqi_rebuilds_queued_from_integrity`,
   `planned_v2_aqi_rebuilds_from_integrity`, and skipped diagnostics for

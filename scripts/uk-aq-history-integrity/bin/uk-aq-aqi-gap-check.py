@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 POLLUTANTS = ("pm25", "pm10", "no2", "o3")
+AQI_SUPPORTED_POLLUTANTS = frozenset({"pm25", "pm10", "no2"})
 SUMMARY_COLUMNS = (
     "day_utc",
     "connector_id",
@@ -185,6 +186,66 @@ def read_parquet_counts(files: list[Path], timeseries_id: str | None) -> dict[st
         con.close()
 
 
+def read_parquet_hour_keys(
+    files: list[Path],
+    timeseries_id: str | None,
+    *,
+    source_observations: bool,
+) -> dict[str, set[int]]:
+    """Read v2 UTC-hour identities, not raw source-row counts.
+
+    The authoritative v2 writer filters source observations to finite,
+    non-negative values and groups the supported pollutant rows by UTC hour.
+    Its hourly AQI output has one row per resulting timeseries/hour identity.
+    """
+    if not files:
+        return {}
+    if importlib.util.find_spec("duckdb") is None:
+        raise SystemExit("DuckDB is required to read parquet files. Install the duckdb Python package.", 2)
+    import duckdb
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        query_files = [str(path) for path in files]
+        described = con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
+            [query_files],
+        ).fetchall()
+        columns = {str(row[0]) for row in described}
+        timestamp_column = "observed_at_utc" if source_observations else "timestamp_hour_utc"
+        if timestamp_column not in columns or "timeseries_id" not in columns:
+            return {}
+        where = (
+            "timeseries_id IS NOT NULL "
+            f"AND TRY_CAST({timestamp_column} AS TIMESTAMPTZ) IS NOT NULL"
+        )
+        params: list[Any] = [query_files]
+        if source_observations:
+            if "value" not in columns:
+                return {}
+            where += (
+                " AND TRY_CAST(value AS DOUBLE) IS NOT NULL"
+                " AND isfinite(TRY_CAST(value AS DOUBLE))"
+                " AND TRY_CAST(value AS DOUBLE) >= 0"
+            )
+        if timeseries_id is not None:
+            where += " AND CAST(timeseries_id AS VARCHAR) = ?"
+            params.append(str(timeseries_id))
+        rows = con.execute(
+            "SELECT CAST(timeseries_id AS VARCHAR), "
+            f"CAST(FLOOR(epoch(TRY_CAST({timestamp_column} AS TIMESTAMPTZ)) / 3600) AS BIGINT) "
+            "FROM read_parquet(?, union_by_name=true) "
+            f"WHERE {where} GROUP BY 1, 2 ORDER BY 1, 2",
+            params,
+        ).fetchall()
+        result: dict[str, set[int]] = {}
+        for tsid, hour_key in rows:
+            result.setdefault(str(tsid), set()).add(int(hour_key))
+        return result
+    finally:
+        con.close()
+
+
 def read_manifest(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -229,16 +290,26 @@ def manifest_timeseries_row_count(manifest: dict[str, Any] | None, timeseries_id
     return None
 
 
-def status_for(obs_rows: int, aqi_rows: int, obs_idx: bool, aqi_idx: bool, aqi_idx_rows: int | None) -> str:
+def status_for(
+    obs_rows: int,
+    aqi_rows: int,
+    expected_hour_keys: set[int],
+    actual_hour_keys: set[int],
+    pollutant: str,
+    obs_idx: bool,
+    aqi_idx: bool,
+    aqi_idx_rows: int | None,
+) -> str:
     statuses: list[str] = []
-    if obs_rows > 0 and aqi_rows == 0:
+    expected_aqi_hours = expected_hour_keys if pollutant in AQI_SUPPORTED_POLLUTANTS else set()
+    if expected_aqi_hours and not actual_hour_keys:
         statuses.append("missing_aqi_data")
     if aqi_rows > 0 and not aqi_idx:
         statuses.append("missing_aqi_index")
     if obs_rows > 0 and not obs_idx:
         statuses.append("missing_obs_index")
-    if obs_rows > 0 and aqi_rows > 0 and aqi_rows < obs_rows:
-        statuses.append("stale_or_partial_aqi_data")
+    if expected_aqi_hours - actual_hour_keys:
+        statuses.append("missing_expected_aqi_hours")
     if aqi_rows > 0 and aqi_idx_rows is not None and aqi_idx_rows < aqi_rows:
         statuses.append("stale_or_partial_aqi_index")
     return ";".join(statuses) if statuses else "ok"
@@ -250,9 +321,19 @@ def build_summary_rows(root: Path, days: list[str], connector_id: str | None, po
         for cid, pol in sorted(discover_v2_partitions(root, day, connector_id, pollutant)):
             obs_counts = read_parquet_counts(parquet_files(data_partition(root, "observations", day, cid, pol)), timeseries_id)
             aqi_counts = read_parquet_counts(parquet_files(data_partition(root, "aqilevels_hourly_data", day, cid, pol)), timeseries_id)
+            obs_hour_keys = read_parquet_hour_keys(
+                parquet_files(data_partition(root, "observations", day, cid, pol)),
+                timeseries_id,
+                source_observations=True,
+            )
+            aqi_hour_keys = read_parquet_hour_keys(
+                parquet_files(data_partition(root, "aqilevels_hourly_data", day, cid, pol)),
+                timeseries_id,
+                source_observations=False,
+            )
             obs_manifest = read_manifest(index_manifest(root, "observations_timeseries", day, cid, pol))
             aqi_manifest = read_manifest(index_manifest(root, "aqilevels_hourly_data_timeseries", day, cid, pol))
-            tsids = sorted(set(obs_counts) | set(aqi_counts), key=lambda value: (not value.isdigit(), value))
+            tsids = sorted(set(obs_counts) | set(aqi_counts) | set(obs_hour_keys) | set(aqi_hour_keys), key=lambda value: (not value.isdigit(), value))
             if timeseries_id is not None and not tsids:
                 tsids = [str(timeseries_id)]
             for tsid in tsids:
@@ -271,7 +352,16 @@ def build_summary_rows(root: Path, days: list[str], connector_id: str | None, po
                     "aqi_idx": "yes" if aqi_manifest is not None else "no",
                     "obs_idx_rows": "" if obs_idx_rows is None else obs_idx_rows,
                     "aqi_idx_rows": "" if aqi_idx_rows is None else aqi_idx_rows,
-                    "status": status_for(obs_rows, aqi_rows, obs_manifest is not None, aqi_manifest is not None, aqi_idx_rows),
+                    "status": status_for(
+                        obs_rows,
+                        aqi_rows,
+                        obs_hour_keys.get(tsid, set()),
+                        aqi_hour_keys.get(tsid, set()),
+                        pol,
+                        obs_manifest is not None,
+                        aqi_manifest is not None,
+                        aqi_idx_rows,
+                    ),
                 })
     return rows
 

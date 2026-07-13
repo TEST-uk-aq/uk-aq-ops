@@ -214,7 +214,8 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
   - Thin shell launcher; loads `<ENV>.env`, runs guardrails, creates state
     dirs, takes a per-environment PID lock, then calls the python entrypoint.
   - Required arg `--env CIC-Test|LIVE`; forwards `--profile`, `--source`,
-    `--from-day`, `--to-day`, `--dry-run`, `--check-only`, `--run-backfill`,
+    `--from-day`, `--to-day`, `--dry-run`, `--check-only`, and v2-only
+    `--history-version v2`,
     `--max-download-mb`, `--max-runtime-minutes`, `--verbose` to python.
   - Runs from the complete ops checkout at
     `/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/`;
@@ -248,7 +249,10 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
     `first_seen`/`first_seen_missing`/`disappeared`/`reappeared`/`changed`
     events. `--max-download-mb` and `--max-runtime-minutes` enforce
     cooperative limits (run ends with `status=stopped_limit`).
-    `--run-backfill` invokes `UK_AQ_BACKFILL_WRAPPER` (Phase 4):
+    Current integrity rejects `--run-backfill` before any scan or repair. The
+    legacy integrity wrapper is disabled until one v2 orchestrator owns data
+    repair, Phase 3 manifest/index finalisation, AQI eligibility, and mandatory
+    post-repair verification. Historical behaviour was:
     sources `UK_AQ_BACKFILL_ENV_FILE`, sets
     `RUN_MODE=source_to_r2 / DRY_RUN=false / FORCE_REPLACE=true /
     TIMESERIES_IDS=<csv> / FROM=TO=<day>`, runs via `bash` with a

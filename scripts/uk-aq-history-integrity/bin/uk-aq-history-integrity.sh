@@ -36,11 +36,11 @@ Forwarded options:
                                            Source filter (includes sos station/day source checks).
   --from-day YYYY-MM-DD                   Manual lower bound.
   --to-day YYYY-MM-DD                     Manual upper bound.
-  --history-version v1|v2|both            R2 history layout version to check.
-                                           Forwarded to Python; default is v1 unless env override.
+  --history-version v2                    R2 history layout version to check.
+                                           Current integrity is v2 only.
   --dry-run                               Plan only; no remote calls.
   --check-only                            Detect changes; do not backfill.
-  --run-backfill                          Trigger backfill on confirmed changes.
+  --run-backfill                          Rejected: v2 repair orchestration is not enabled here.
   --max-download-mb N                     Soft cap on downloaded MB.
   --max-runtime-minutes N                 Soft cap on runtime minutes.
   --verbose                               More detailed logging.
@@ -55,7 +55,7 @@ Environment:
     Optional python interpreter override (default: python3).
 
   UK_AQ_R2_HISTORY_INTEGRITY_VERSION
-    Optional default for --history-version: v1, v2, or both.
+    Optional default for --history-version; it must be v2.
 
   UK_AQ_BACKFILL_ENV_FILE
     If set in the integrity env, the Python runner loads this .env file and
@@ -117,6 +117,31 @@ case "${ENV_NAME}" in
     exit 2
     ;;
 esac
+
+for ((i = 0; i < ${#REMAINING_ARGS[@]}; i++)); do
+  arg="${REMAINING_ARGS[i]}"
+  case "${arg}" in
+    --run-backfill)
+      preflight_error "--run-backfill is temporarily disabled for current v2 integrity; use the approved v2 orchestrator when it is introduced."
+      exit 2
+      ;;
+    --history-version)
+      version="${REMAINING_ARGS[i + 1]:-}"
+      if [[ "${version}" != "v2" ]]; then
+        preflight_error "--history-version must be v2 for current history integrity (got '${version}')."
+        exit 2
+      fi
+      ((i += 1))
+      ;;
+    --history-version=*)
+      version="${arg#--history-version=}"
+      if [[ "${version}" != "v2" ]]; then
+        preflight_error "--history-version must be v2 for current history integrity (got '${version}')."
+        exit 2
+      fi
+      ;;
+  esac
+done
 
 ROOT="${UK_AQ_HISTORY_INTEGRITY_ROOT:-${DEFAULT_ROOT}}"
 ENV_FILE="${ROOT}/env/${ENV_NAME}.env"
@@ -235,42 +260,6 @@ if [[ -n "${UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH:-}" ]]; then
   if [[ "${UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH}" == "${UK_AQ_HISTORY_INTEGRITY_DB_PATH}" ]]; then
     preflight_error "UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH must differ from UK_AQ_HISTORY_INTEGRITY_DB_PATH"
     exit 4
-  fi
-fi
-
-RUN_BACKFILL=false
-for arg in "${REMAINING_ARGS[@]}"; do
-  if [[ "${arg}" == "--run-backfill" ]]; then
-    RUN_BACKFILL=true
-    break
-  fi
-done
-
-if [[ "${RUN_BACKFILL}" == "true" ]]; then
-  INTEGRITY_BACKFILL_WRAPPER="${UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER:-${UK_AQ_INTEGRITY_BACKFILL_WRAPPER:-}}"
-  if [[ -z "${INTEGRITY_BACKFILL_WRAPPER}" ]]; then
-    preflight_error "Backfill wrapper is required when --run-backfill is used, but neither UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER nor UK_AQ_INTEGRITY_BACKFILL_WRAPPER is set."
-    exit 3
-  fi
-  if [[ ! -f "${INTEGRITY_BACKFILL_WRAPPER}" ]]; then
-    preflight_error "integrity backfill wrapper does not exist: ${INTEGRITY_BACKFILL_WRAPPER}"
-    exit 3
-  fi
-  if [[ ! -x "${INTEGRITY_BACKFILL_WRAPPER}" ]]; then
-    preflight_error "integrity backfill wrapper is not executable: ${INTEGRITY_BACKFILL_WRAPPER}"
-    exit 3
-  fi
-  if [[ -z "${UK_AQ_BACKFILL_ENV_FILE:-}" ]]; then
-    preflight_error "UK_AQ_BACKFILL_ENV_FILE is required when --run-backfill is used, but it is not set."
-    exit 3
-  fi
-  if [[ ! -f "${UK_AQ_BACKFILL_ENV_FILE}" ]]; then
-    preflight_error "UK_AQ_BACKFILL_ENV_FILE does not exist: ${UK_AQ_BACKFILL_ENV_FILE}"
-    exit 3
-  fi
-  if [[ ! -r "${UK_AQ_BACKFILL_ENV_FILE}" ]]; then
-    preflight_error "UK_AQ_BACKFILL_ENV_FILE is not readable: ${UK_AQ_BACKFILL_ENV_FILE}"
-    exit 3
   fi
 fi
 
