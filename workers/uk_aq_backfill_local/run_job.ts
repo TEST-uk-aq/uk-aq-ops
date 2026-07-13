@@ -3763,7 +3763,7 @@ async function deleteR2Prefix(prefix: string): Promise<number> {
     prefix: `${prefix}/`,
     max_keys: 1000,
   });
-  const keys = entries.map((entry) => String(entry.key || "").trim()).filter(
+  const keys = entries.map((entry: { key?: string }) => String(entry.key || "").trim()).filter(
     Boolean,
   );
   try {

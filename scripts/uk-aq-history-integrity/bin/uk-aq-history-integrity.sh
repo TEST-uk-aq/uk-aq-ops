@@ -40,7 +40,8 @@ Forwarded options:
                                            Current integrity is v2 only.
   --dry-run                               Plan only; no remote calls.
   --check-only                            Detect changes; do not backfill.
-  --run-backfill                          Rejected: v2 repair orchestration is not enabled here.
+  --run-backfill                          Enable the ordered v2 repair flow.
+                                           Phase 2 plans/stubs stages only; it makes no R2 writes.
   --max-download-mb N                     Soft cap on downloaded MB.
   --max-runtime-minutes N                 Soft cap on runtime minutes.
   --verbose                               More detailed logging.
@@ -118,12 +119,16 @@ case "${ENV_NAME}" in
     ;;
 esac
 
+HAS_CHECK_ONLY=false
+HAS_RUN_BACKFILL=false
 for ((i = 0; i < ${#REMAINING_ARGS[@]}; i++)); do
   arg="${REMAINING_ARGS[i]}"
   case "${arg}" in
     --run-backfill)
-      preflight_error "--run-backfill is temporarily disabled for current v2 integrity; use the approved v2 orchestrator when it is introduced."
-      exit 2
+      HAS_RUN_BACKFILL=true
+      ;;
+    --check-only)
+      HAS_CHECK_ONLY=true
       ;;
     --history-version)
       version="${REMAINING_ARGS[i + 1]:-}"
@@ -142,6 +147,11 @@ for ((i = 0; i < ${#REMAINING_ARGS[@]}; i++)); do
       ;;
   esac
 done
+
+if [[ "${HAS_CHECK_ONLY}" == true && "${HAS_RUN_BACKFILL}" == true ]]; then
+  preflight_error "--check-only and --run-backfill cannot be used together."
+  exit 2
+fi
 
 ROOT="${UK_AQ_HISTORY_INTEGRITY_ROOT:-${DEFAULT_ROOT}}"
 ENV_FILE="${ROOT}/env/${ENV_NAME}.env"

@@ -6,11 +6,6 @@ usage() {
 Usage:
   uk_aq_integrity_backfill.sh [options]
 
-Current status:
-  Disabled for current v2 history integrity. The future single v2 orchestrator
-  must own observation repair, verification, Phase 3 finalisation, AQI
-  eligibility, and post-repair integrity checking as one sequence.
-
 Required:
   --env CIC-Test|LIVE
   --from-day YYYY-MM-DD
@@ -28,7 +23,7 @@ Mode-specific requirements:
     --connector-id N      Optional connector filter for partial-day scope.
 
 Optional:
-  --history-version v2    Historical argument; no execution is permitted.
+  --history-version v2    Required v2 history layout (the only supported value).
   --dry-run               Set UK_AQ_BACKFILL_DRY_RUN=true (default false).
   -h, --help              Show this help.
 
@@ -36,8 +31,9 @@ Notes:
   - Loads <ROOT>/env/<ENV>.env from UK_AQ_HISTORY_INTEGRITY_ROOT or script parent.
   - Sources UK_AQ_BACKFILL_ENV_FILE from the integrity env file.
   - Calls UK_AQ_BACKFILL_WRAPPER with strict integrity defaults.
-  - Disables the wrapper's final full R2 history index rebuild and then runs one
-    targeted index update for the repaired day range after a successful non-dry-run.
+  - Disables the wrapper's final full R2 history index rebuild.
+  - The Integrity coordinator owns the final targeted observation index after
+    all observation manifests for the affected day are verified.
 USAGE
 }
 
@@ -266,7 +262,7 @@ TIMESERIES_IDS_RAW=""
 FROM_DAY_UTC=""
 TO_DAY_UTC=""
 DRY_RUN=false
-HISTORY_VERSION="v1"
+HISTORY_VERSION="v2"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -342,10 +338,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "ERROR: uk_aq_integrity_backfill.sh is temporarily disabled for current v2 integrity." >&2
-echo "ERROR: Its source-to-R2, targeted-index, AQI, and post-repair steps are not yet owned by one v2 orchestrator." >&2
-exit 2
-
 if [[ -z "${ENV_NAME}" ]]; then
   echo "ERROR: --env is required." >&2
   exit 2
@@ -358,13 +350,10 @@ case "${ENV_NAME}" in
     ;;
 esac
 
-case "${HISTORY_VERSION}" in
-  v1|v2) ;;
-  *)
-    echo "ERROR: --history-version must be v1 or v2 (got '${HISTORY_VERSION}')." >&2
+if [[ "${HISTORY_VERSION}" != "v2" ]]; then
+    echo "ERROR: --history-version must be v2 for the Integrity specialist (got '${HISTORY_VERSION}')." >&2
     exit 2
-    ;;
-esac
+fi
 
 if (( OBSERVS_ONLY + AQI_ONLY != 1 )); then
   echo "ERROR: pass exactly one of --observs-only or --aqi-only." >&2
@@ -493,11 +482,9 @@ export UK_AQ_BACKFILL_NODE_BIN="${NODE_BIN}"
 if (( OBSERVS_ONLY == 1 )); then
   export UK_AQ_BACKFILL_RUN_MODE="source_to_r2"
   export UK_AQ_BACKFILL_OUTPUT_SCOPE="observations_only"
-  TARGET_KIND="observations"
 else
   export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
   export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
-  TARGET_KIND="aqilevels"
 fi
 
 
@@ -546,53 +533,6 @@ status=$?
 set -e
 if [[ "${status}" -ne 0 ]]; then
   exit "${status}"
-fi
-
-if [[ "${DRY_RUN}" == "true" ]]; then
-  echo "Skipping targeted R2 history index update because --dry-run was set."
-  exit 0
-fi
-
-if (( OBSERVS_ONLY == 1 )) \
-  && [[ "${UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED:-}" == "true" ]] \
-  && [[ "${UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE:-}" != "true" ]]; then
-  echo "Skipping targeted R2 history index update because this staged observation chunk did not finalise."
-  exit 0
-fi
-
-BACKFILL_REPO_ROOT="$(cd "$(dirname "${BACKFILL_WRAPPER_PATH}")/.." && pwd)"
-TARGETED_INDEX_CMD=(
-  "${NODE_BIN}"
-  "${BACKFILL_REPO_ROOT}/scripts/backup_r2/uk_aq_build_r2_history_index.mjs"
-  --write-r2
-  --targeted
-  --history-version "${HISTORY_VERSION}"
-  --kind "${TARGET_KIND}"
-  --from-day "${FROM_DAY_UTC}"
-  --to-day "${TO_DAY_UTC}"
-)
-if [[ -n "${CONNECTOR_ID}" ]]; then
-  TARGETED_INDEX_CMD+=(--connector-id "${CONNECTOR_ID}")
-fi
-
-echo ""
-echo "=== Targeted R2 History Index Update ==="
-echo "kind: ${TARGET_KIND}"
-echo "history_version: ${HISTORY_VERSION}"
-echo "from_day_utc: ${FROM_DAY_UTC}"
-echo "to_day_utc: ${TO_DAY_UTC}"
-echo "connector_id: ${CONNECTOR_ID:-all}"
-echo "node_bin: ${NODE_BIN}"
-echo "repo_root: ${BACKFILL_REPO_ROOT}"
-
-set +e
-"${TARGETED_INDEX_CMD[@]}"
-targeted_status=$?
-set -e
-
-if [[ "${targeted_status}" -ne 0 ]]; then
-  echo "ERROR: targeted R2 history index update failed." >&2
-  exit "${targeted_status}"
 fi
 
 exit 0
