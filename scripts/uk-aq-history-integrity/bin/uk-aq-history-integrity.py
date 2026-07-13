@@ -94,7 +94,6 @@ DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
 DAILY_TASK_HEALTH_SOURCE_WORKER = "uk-aq-history-integrity"
 DAILY_TASK_HEALTH_RPC_SCHEMA = "uk_aq_public"
 DAILY_TASK_HEALTH_ERROR_LIMIT = 1200
-DEFAULT_BACKUP_TASK_KEYS = ("ops.r2_history_dropbox_backup",)
 BACKUP_GATE_URL_ENV_NAMES = (
     "DAILY_TASK_HEALTH_SUPABASE_URL",
     "OBS_AQIDB_SUPABASE_URL",
@@ -13635,36 +13634,24 @@ def check_dropbox_backup_ready(
     *,
     supabase_url: str | None,
     service_role_key: str | None,
-    task_keys: list[str],
-    scheduled_for_date: str,
     integrity_started_at_utc: str,
     allow_stale_dropbox: bool = False,
-    rpc_name: str = "uk_aq_rpc_daily_task_backup_readiness",
+    rpc_name: str = "uk_aq_rpc_history_integrity_readiness",
 ) -> dict[str, Any]:
-    normalized_task_keys = [str(value or "").strip() for value in task_keys]
     summary: dict[str, Any] = {
         "backup_gate_checked": True,
         "backup_ready": False,
-        "backup_task_keys": normalized_task_keys,
-        "backup_scheduled_for_date": scheduled_for_date,
-        "backup_completed_at": None,
+        "backup_run_id": None,
+        "backup_started_at": None,
+        "backup_finished_at": None,
+        "latest_writer_finished_at": None,
+        "writer_runs": [],
         "allow_stale_dropbox": bool(allow_stale_dropbox),
         "blocked_reason": None,
-        "tasks": [],
     }
     if allow_stale_dropbox:
         summary["backup_ready"] = True
         summary["blocked_reason"] = "allow_stale_dropbox_override"
-        return summary
-    if not normalized_task_keys or any(not value for value in normalized_task_keys):
-        summary["blocked_reason"] = "no_required_backup_task_keys_configured"
-        return summary
-    try:
-        parsed_date = dt.date.fromisoformat(str(scheduled_for_date))
-        if parsed_date.isoformat() != str(scheduled_for_date):
-            raise ValueError("date is not canonical YYYY-MM-DD")
-    except (TypeError, ValueError):
-        summary["blocked_reason"] = "invalid_scheduled_for_date"
         return summary
     started_raw = str(integrity_started_at_utc or "").strip()
     integrity_started_at = _parse_iso_utc(started_raw)
@@ -13681,9 +13668,7 @@ def check_dropbox_backup_ready(
     endpoint = supabase_url.rstrip("/") + f"/rest/v1/rpc/{rpc_name}"
     payload = json.dumps(
         {
-            "p_scheduled_for_date": scheduled_for_date,
             "p_integrity_started_at_utc": integrity_started_at_utc,
-            "p_task_keys": normalized_task_keys,
         }
     ).encode("utf-8")
     req = urllib.request.Request(
@@ -13711,44 +13696,72 @@ def check_dropbox_backup_ready(
             summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
             return summary
         data = data[0]
-    if not isinstance(data, dict) or not isinstance(data.get("backup_ready"), bool) or not isinstance(data.get("tasks"), list):
+    if not isinstance(data, dict) or not isinstance(data.get("ready"), bool) or not isinstance(data.get("writer_runs"), list):
         summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
         return summary
 
-    tasks = data["tasks"]
-    if any(not isinstance(task, dict) for task in tasks):
+    writer_runs = data["writer_runs"]
+    expected_writer_task_keys = {
+        "ops.prune_daily",
+        "ops.r2_core_snapshot",
+        "ops.history_integrity",
+    }
+    if (
+        any(
+            not isinstance(writer_run, dict)
+            or not isinstance(writer_run.get("task_key"), str)
+            or (
+                writer_run.get("latest_finished_run") is not None
+                and not isinstance(writer_run.get("latest_finished_run"), dict)
+            )
+            or (
+                writer_run.get("running_run") is not None
+                and not isinstance(writer_run.get("running_run"), dict)
+            )
+            for writer_run in writer_runs
+        )
+        or {writer_run["task_key"] for writer_run in writer_runs} != expected_writer_task_keys
+    ):
         summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
         return summary
-    summary["tasks"] = tasks
-    tasks_by_key = {str(task.get("task_key") or "").strip(): task for task in tasks}
-    if any(task_key not in tasks_by_key for task_key in normalized_task_keys):
-        summary["blocked_reason"] = str(data.get("blocked_reason") or "missing_required_task")
-        return summary
+    for key in (
+        "backup_run_id",
+        "backup_started_at",
+        "backup_finished_at",
+        "latest_writer_finished_at",
+    ):
+        summary[key] = data.get(key)
+    summary["writer_runs"] = writer_runs
 
-    completed_values: list[tuple[dt.datetime, str]] = []
-    for task_key in normalized_task_keys:
-        task = tasks_by_key[task_key]
-        if task.get("status") != "Finished":
-            summary["blocked_reason"] = str(task.get("blocked_reason") or "latest_task_not_finished")
-            return summary
-        finished_at_raw = str(task.get("finished_at") or "").strip()
-        finished_at = _parse_iso_utc(finished_at_raw)
-        if (
-            finished_at is None
-            or not (finished_at_raw.endswith("Z") or finished_at_raw.endswith("+00:00"))
-        ):
-            summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
-            return summary
-        if finished_at > integrity_started_at:
-            summary["blocked_reason"] = "task_finished_after_integrity_start"
-            return summary
-        completed_values.append((finished_at, finished_at_raw))
-
-    if not data["backup_ready"]:
+    if not data["ready"]:
         summary["blocked_reason"] = str(data.get("blocked_reason") or "backup_not_ready")
         return summary
 
-    summary["backup_completed_at"] = max(completed_values, key=lambda item: item[0])[1]
+    if not str(data.get("backup_run_id") or "").strip():
+        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
+        return summary
+    backup_started_raw = str(data.get("backup_started_at") or "").strip()
+    backup_finished_raw = str(data.get("backup_finished_at") or "").strip()
+    backup_started_at = _parse_iso_utc(backup_started_raw)
+    backup_finished_at = _parse_iso_utc(backup_finished_raw)
+    if backup_started_at is None or backup_finished_at is None:
+        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
+        return summary
+    if backup_finished_at >= integrity_started_at:
+        summary["blocked_reason"] = "backup_finished_at_or_after_integrity_start"
+        return summary
+    latest_writer_raw = str(data.get("latest_writer_finished_at") or "").strip()
+    if latest_writer_raw:
+        latest_writer_finished_at = _parse_iso_utc(latest_writer_raw)
+        if latest_writer_finished_at is None:
+            summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
+            return summary
+        if backup_started_at <= latest_writer_finished_at:
+            summary["blocked_reason"] = "backup_started_before_latest_writer_finished"
+            return summary
+    if any(bool(writer_run.get("is_running")) for writer_run in writer_runs):
+        summary["blocked_reason"] = "relevant_writer_running"
+        return summary
     summary["backup_ready"] = True
     return summary
 
@@ -13778,15 +13791,6 @@ def resolve_backup_gate_credentials(values: Mapping[str, Any] | None = None) -> 
     )
 
 
-def configured_backup_task_keys(values: Mapping[str, Any] | None = None) -> list[str]:
-    source = os.environ if values is None else values
-    if "UK_AQ_HISTORY_INTEGRITY_BACKUP_TASK_KEYS" in source:
-        raw = str(source.get("UK_AQ_HISTORY_INTEGRITY_BACKUP_TASK_KEYS") or "")
-    else:
-        raw = ",".join(DEFAULT_BACKUP_TASK_KEYS)
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
 def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dict[str, Any]:
     if args.profile == "manual":
         return {
@@ -13798,14 +13802,12 @@ def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dic
     return check_dropbox_backup_ready(
         supabase_url=supabase_url,
         service_role_key=service_role_key,
-        task_keys=configured_backup_task_keys(),
-        scheduled_for_date=started_iso[:10],
         integrity_started_at_utc=started_iso,
         allow_stale_dropbox=bool(args.allow_stale_dropbox),
         rpc_name=str(
             os.environ.get(
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
-                "uk_aq_rpc_daily_task_backup_readiness",
+                "uk_aq_rpc_history_integrity_readiness",
             )
         ),
     )
@@ -15028,13 +15030,28 @@ def format_summary_md(s: dict[str, Any]) -> str:
             "",
             f"- Gate checked: {bool(backup.get('backup_gate_checked'))}",
             f"- Ready: {backup.get('backup_ready')}",
-            f"- Required task keys: {', '.join(backup.get('backup_task_keys') or [])}",
-            f"- Scheduled date: {backup.get('backup_scheduled_for_date') or '(none)'}",
-            f"- Completed at: {backup.get('backup_completed_at') or '(none)'}",
+            f"- Backup run ID: {backup.get('backup_run_id') or '(none)'}",
+            f"- Backup started at: {backup.get('backup_started_at') or '(none)'}",
+            f"- Backup finished at: {backup.get('backup_finished_at') or '(none)'}",
+            f"- Latest relevant writer finished at: {backup.get('latest_writer_finished_at') or '(none)'}",
             f"- Allow stale Dropbox: {bool(backup.get('allow_stale_dropbox'))}",
             f"- Blocked reason: {backup.get('blocked_reason') or '(none)'}",
             "",
         ])
+        writer_runs = backup.get("writer_runs") or []
+        if writer_runs:
+            lines.extend(["### Relevant R2 writers", ""])
+            for writer in writer_runs:
+                latest = writer.get("latest_finished_run") or {}
+                running = writer.get("running_run") or {}
+                lines.append(
+                    f"- {writer.get('task_key')}: "
+                    f"latest_finished={latest.get('completed_at') or '(none)'} "
+                    f"status={latest.get('status') or '(none)'} "
+                    f"running={bool(writer.get('is_running'))} "
+                    f"running_since={running.get('started_at') or '(none)'}"
+                )
+            lines.append("")
     lookup_counts = s.get("lookup_source_counts") or {}
     if lookup_counts:
         lines.extend([
@@ -15576,6 +15593,7 @@ def main(argv: list[str]) -> int:
                 "dry_run": bool(args.dry_run),
                 "check_only": bool(args.check_only),
                 "run_backfill": bool(args.run_backfill),
+                "repair_mode": bool(args.run_backfill),
                 "allow_stale_dropbox": bool(args.allow_stale_dropbox),
                 "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
                 "log_path": str(log_path),
@@ -15602,6 +15620,7 @@ def main(argv: list[str]) -> int:
             "check_only": bool(args.check_only),
             "dry_run": bool(args.dry_run),
             "run_backfill": bool(args.run_backfill),
+            "repair_mode": bool(args.run_backfill),
             "skip_cross_check": bool(args.skip_cross_check),
             "allow_stale_dropbox": bool(args.allow_stale_dropbox),
             "status": "started",
@@ -16293,6 +16312,7 @@ def main(argv: list[str]) -> int:
             "dry_run": args.dry_run,
             "check_only": args.check_only,
             "run_backfill": args.run_backfill,
+            "repair_mode": args.run_backfill,
             "force_snapshot_import": args.force_snapshot_import,
             "skip_snapshot_import": args.skip_snapshot_import,
             "skip_cross_check": args.skip_cross_check,
@@ -16345,6 +16365,7 @@ def main(argv: list[str]) -> int:
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
+                "repair_mode": bool(args.run_backfill),
                 "skip_cross_check": bool(args.skip_cross_check),
                 "integrity_run_id": run_id,
                 "status": status,
@@ -16415,6 +16436,7 @@ def main(argv: list[str]) -> int:
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
+                "repair_mode": bool(args.run_backfill),
                 "skip_cross_check": bool(args.skip_cross_check),
                 "integrity_run_id": run_id,
                 "status": "error",

@@ -285,11 +285,16 @@ uses `status=planned`, `executes=false`, `data_changes_required`,
 `requires_index_rebuild`, and sorted `gap_types`. O3 manifest-only findings do
 not queue AQI.
 
-Scheduled profiles require the latest attempt for daily task
-`ops.r2_history_dropbox_backup` to have status `Finished` for the integrity run
-date, with `finished_at` no later than the integrity start time. That workflow
-builds the R2 backup inventory before running the inventory-driven Dropbox sync,
-so its final factual health row covers both ordered backup steps.
+Scheduled profiles use the Integrity-specific readiness RPC across all task-run
+dates. It requires the latest successful non-dry-run
+`ops.r2_history_dropbox_backup` to have started after the latest finished
+attempts of `ops.prune_daily` and `ops.r2_core_snapshot`. Failed writer
+attempts count because they may have written R2 before failing. A previous
+`ops.history_integrity` attempt is relevant only when its summary records
+non-dry-run repair mode (`repair_mode=true`, with legacy
+`run_backfill=true` supported). A relevant writer still in `Started` blocks
+the run, and the qualifying backup must have finished before Integrity starts.
+The report includes the qualifying backup timestamps and per-writer run details.
 
 The readiness RPC is called through PostgREST schema `uk_aq_public`. Obs AQI DB
 credentials are resolved only after `UK_AQ_BACKFILL_ENV_FILE` is loaded, with
@@ -300,10 +305,10 @@ unexpected response shape produces `status=blocked_backup_not_ready` before
 Dropbox is inspected. `--allow-stale-dropbox` bypasses the gate explicitly and
 is recorded in JSON and Markdown reports.
 
-The canonical readiness-RPC SQL belongs only to
-`TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_daily_task_backup_readiness.sql`.
-The ops backup-gate contract test resolves and reads that sibling schema file
-directly; an ops SQL mirror is not maintained.
+The canonical Integrity readiness-RPC SQL belongs only to
+`TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_history_integrity_readiness.sql`.
+It is separate from the general date-based backup readiness RPC, so unrelated
+callers keep their existing contract. No ops SQL mirror is maintained.
 
 Run lifecycle:
 
