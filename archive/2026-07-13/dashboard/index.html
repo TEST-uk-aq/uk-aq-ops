@@ -1632,79 +1632,6 @@
           grid-template-columns: 1fr;
         }
       }
-      .multi-select {
-        position: relative;
-        display: inline-block;
-        font-family: "Space Grotesk", "Segoe UI", sans-serif;
-      }
-      .multi-select summary {
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        background: #fff;
-        color: var(--ink);
-        padding: 6px 9px;
-        font-size: 13px;
-        cursor: pointer;
-        list-style: none;
-        min-width: 140px;
-      }
-      .multi-select summary::-webkit-details-marker {
-        display: none;
-      }
-      .multi-select-menu {
-        position: absolute;
-        top: 100%;
-        left: 0;
-        margin-top: 4px;
-        background: #fff;
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
-        padding: 8px;
-        z-index: 100;
-        min-width: 180px;
-        max-height: 300px;
-        overflow-y: auto;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-      }
-      .multi-select-item {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 13px;
-        cursor: pointer;
-        padding: 4px 6px;
-        border-radius: 6px;
-        color: var(--ink);
-      }
-      .multi-select-item:hover {
-        background: rgba(31, 122, 122, 0.05);
-      }
-      .multi-select-item input {
-        margin: 0;
-      }
-      .multi-select-actions {
-        margin-top: 6px;
-        padding-top: 6px;
-        border-top: 1px solid var(--border);
-        text-align: right;
-      }
-      .multi-select-actions button {
-        background: #fff;
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        padding: 4px 12px;
-        font-size: 12px;
-        font-weight: 600;
-        color: var(--ink);
-        cursor: pointer;
-        transition: background 0.2s;
-      }
-      .multi-select-actions button:hover {
-        background: rgba(31, 122, 122, 0.05);
-      }
     </style>
   </head>
   <body>
@@ -1895,7 +1822,13 @@
       }
 
       const bucketOrder = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"];
-
+      const DISPATCH_CONNECTOR_OPTIONS = [
+        { value: "all", label: "All" },
+        { value: "sos", label: "UK-AIR SOS" },
+        { value: "sensorcommunity", label: "Sensor.Community" },
+        { value: "breathelondon", label: "Breathe London" },
+        { value: "openaq", label: "OpenAQ" },
+      ];
       const DISPATCH_LOOKBACK_OPTIONS = [
         { value: 10, label: "10mins" },
         { value: 30, label: "30mins" },
@@ -1942,7 +1875,7 @@
       ];
       const COVERAGE_WEEKDAY_ABBREVIATIONS = ["M", "T", "W", "T", "F", "S", "S"];
       const REFRESH_OPTIONS_SECONDS = [60, 300, 600, 1800, 3600];
-      let dispatchConnectorSet = new Set();
+      let dispatchConnectorFilter = "all";
       let dispatchLookbackMinutes = 30;
       let dbSizePeriodHours = 24;
       let storageCoverageMonthCursor = null;
@@ -2007,20 +1940,8 @@
           dailyTaskRunsModeValue = storedDailyTaskRunsMode;
         }
         const storedConnector = localStorage.getItem(DISPATCH_CONNECTOR_STORAGE_KEY);
-        if (storedConnector) {
-          if (storedConnector === "all") {
-            dispatchConnectorSet = new Set();
-          } else if (storedConnector.startsWith("[")) {
-            try {
-              const parsed = JSON.parse(storedConnector);
-              if (Array.isArray(parsed)) {
-                dispatchConnectorSet = new Set(parsed.map(normalizeConnectorCode).filter(Boolean));
-              }
-            } catch (_err) {}
-          } else {
-            const nc = normalizeConnectorCode(storedConnector);
-            if (nc) dispatchConnectorSet = new Set([nc]);
-          }
+        if (storedConnector && DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === storedConnector)) {
+          dispatchConnectorFilter = storedConnector;
         }
         const storedLookback = Number(localStorage.getItem(DISPATCH_LOOKBACK_STORAGE_KEY));
         if (
@@ -2063,10 +1984,6 @@
       }
       if (!storageCoverageMonthCursor) {
         storageCoverageMonthCursor = startOfUtcMonth(new Date());
-      }
-
-      function normalizeConnectorCode(value) {
-        return String(value || "").trim().toLowerCase();
       }
 
       function escapeHtml(value) {
@@ -3030,42 +2947,10 @@
         return panel;
       }
 
-      function renderDispatchPanel(runs, connectorsSettings) {
-        const dynamicOptions = [];
-        (Array.isArray(connectorsSettings) ? connectorsSettings : []).forEach(c => {
-          const codeRaw = c.connector_code;
-          const code = normalizeConnectorCode(codeRaw);
-          if (!code) return;
-          const label = c.display_name || c.label || code;
-          dynamicOptions.push({ value: code, label: label });
-        });
-
-        const uniqueOptions = [];
-        const seenCodes = new Set();
-        dynamicOptions.forEach(opt => {
-          if (!seenCodes.has(opt.value)) {
-            seenCodes.add(opt.value);
-            uniqueOptions.push(opt);
-          }
-        });
-        uniqueOptions.sort((a, b) => a.label.localeCompare(b.label));
-
-        let changed = false;
-        for (const code of dispatchConnectorSet) {
-          if (!seenCodes.has(code)) {
-            dispatchConnectorSet.delete(code);
-            changed = true;
-          }
-        }
-        if (changed) {
-          try {
-            localStorage.setItem(DISPATCH_CONNECTOR_STORAGE_KEY, JSON.stringify(Array.from(dispatchConnectorSet)));
-          } catch (_err) {}
-        }
-
+      function renderDispatchPanel(runs) {
         const filteredRuns = (Array.isArray(runs) ? runs : []).filter((run) => {
-          const connectorCode = normalizeConnectorCode(run && run.connector_code);
-          if (dispatchConnectorSet.size > 0 && !dispatchConnectorSet.has(connectorCode)) {
+          const connectorCode = String((run && run.connector_code) || "").toLowerCase();
+          if (dispatchConnectorFilter !== "all" && connectorCode !== dispatchConnectorFilter) {
             return false;
           }
           if (dispatchLookbackMinutes <= 0) {
@@ -3089,27 +2974,14 @@
           <h2 class="panel-heading">
             <span>Dispatcher Feed</span>
             <div class="dispatch-filters">
-              <div class="dispatch-filter">
+              <label class="dispatch-filter" for="dispatch-connector-filter">
                 Connector
-                <details class="multi-select" id="dispatch-connector-dropdown">
-                  <summary id="dispatch-connector-summary">${dispatchConnectorSet.size === 0 ? "All" : (dispatchConnectorSet.size === 1 ? escapeHtml(uniqueOptions.find(o => o.value === Array.from(dispatchConnectorSet)[0])?.label || "Unknown") : `${dispatchConnectorSet.size} selected`)}</summary>
-                  <div class="multi-select-menu">
-                    <label class="multi-select-item">
-                      <input type="checkbox" value="all" ${dispatchConnectorSet.size === 0 ? "checked" : ""}>
-                      All
-                    </label>
-                    ${uniqueOptions.map((opt) => `
-                      <label class="multi-select-item">
-                        <input type="checkbox" value="${escapeHtml(opt.value)}" ${dispatchConnectorSet.has(opt.value) ? "checked" : ""}>
-                        ${escapeHtml(opt.label)}
-                      </label>
-                    `).join("")}
-                    <div class="multi-select-actions">
-                      <button type="button" id="dispatch-connector-apply">Apply</button>
-                    </div>
-                  </div>
-                </details>
-              </div>
+                <select id="dispatch-connector-filter">
+                  ${DISPATCH_CONNECTOR_OPTIONS
+                    .map((opt) => `<option value="${opt.value}" ${opt.value === dispatchConnectorFilter ? "selected" : ""}>${opt.label}</option>`)
+                    .join("")}
+                </select>
+              </label>
               <label class="dispatch-filter" for="dispatch-lookback-filter">
                 Lookback
                 <select id="dispatch-lookback-filter">
@@ -3172,48 +3044,21 @@
           <div class="footnote">Ordered by most recent run end time. Filters persist across refresh. Times in UTC.</div>
         `;
 
-        const connectorDropdown = panel.querySelector("#dispatch-connector-dropdown");
-        if (connectorDropdown) {
-          const checkboxes = Array.from(connectorDropdown.querySelectorAll('input[type="checkbox"]'));
-          const applyBtn = connectorDropdown.querySelector("#dispatch-connector-apply");
-
-          let draftSet = new Set(dispatchConnectorSet);
-
-          checkboxes.forEach(cb => {
-            cb.addEventListener("change", (e) => {
-              if (e.target.value === "all") {
-                if (e.target.checked) {
-                  draftSet.clear();
-                  checkboxes.forEach(c => { if (c.value !== "all") c.checked = false; });
-                } else {
-                  e.target.checked = true; // Cannot uncheck 'all' directly
-                }
-              } else {
-                const allCb = checkboxes.find(c => c.value === "all");
-                if (e.target.checked) {
-                  draftSet.add(e.target.value);
-                  if (allCb) allCb.checked = false;
-                } else {
-                  draftSet.delete(e.target.value);
-                }
-
-                if (draftSet.size === 0 && allCb) {
-                  allCb.checked = true;
-                }
-              }
-            });
+        const connectorSelect = panel.querySelector("#dispatch-connector-filter");
+        if (connectorSelect) {
+          connectorSelect.addEventListener("change", (event) => {
+            const nextValue = String(event.target.value || "all");
+            if (!DISPATCH_CONNECTOR_OPTIONS.some((opt) => opt.value === nextValue)) {
+              return;
+            }
+            dispatchConnectorFilter = nextValue;
+            try {
+              localStorage.setItem(DISPATCH_CONNECTOR_STORAGE_KEY, dispatchConnectorFilter);
+            } catch (_err) {
+              // Ignore storage write issues.
+            }
+            loadDashboard();
           });
-
-          if (applyBtn) {
-            applyBtn.addEventListener("click", () => {
-              dispatchConnectorSet = new Set(draftSet);
-              try {
-                localStorage.setItem(DISPATCH_CONNECTOR_STORAGE_KEY, JSON.stringify(Array.from(dispatchConnectorSet)));
-              } catch (_err) {}
-              connectorDropdown.removeAttribute("open");
-              loadDashboard();
-            });
-          }
         }
         const lookbackSelect = panel.querySelector("#dispatch-lookback-filter");
         if (lookbackSelect) {
@@ -6400,7 +6245,7 @@
             nextPanels.push(renderDispatcherSettingsPanel(data.dispatcher_settings));
           }
           if (Array.isArray(data.dispatch_runs)) {
-            nextPanels.push(renderDispatchPanel(data.dispatch_runs, data.connectors_settings));
+            nextPanels.push(renderDispatchPanel(data.dispatch_runs));
           }
           (Array.isArray(data.pollutants) ? data.pollutants : []).forEach((pollutant) => {
             nextPanels.push(renderPanel(pollutant));
