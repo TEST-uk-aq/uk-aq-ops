@@ -36,35 +36,39 @@ the Phase 3 executor remains the authoritative manifest/index finaliser.
 
 ## Backup gate
 
-Scheduled runs now call the Obs AQI DB RPC
-`uk_aq_public.uk_aq_rpc_daily_task_backup_readiness(date, timestamptz, text[])`
-before any Dropbox history scan starts.
+Scheduled runs now call the Integrity-specific Obs AQI DB RPC
+`uk_aq_public.uk_aq_rpc_history_integrity_readiness(timestamptz)` before any
+Dropbox history scan starts. This leaves the unrelated date-based backup
+readiness RPC unchanged for its existing callers.
 
-- If the required backup tasks are not ready, the run exits early with
+- The latest successful non-dry-run `ops.r2_history_dropbox_backup` must have
+  started after the latest finished `ops.prune_daily` and
+  `ops.r2_core_snapshot` attempts. Failed writer attempts count because they
+  may have written R2 objects before failing.
+- A previous `ops.history_integrity` attempt is a writer only when its task
+  summary has `repair_mode=true` (or the legacy `run_backfill=true`) and
+  `dry_run=false`.
+- Any relevant writer still in `Started` blocks the run. The qualifying backup
+  must also have finished before the current Integrity run started.
+- If the gate is not ready, the run exits early with
   `status=blocked_backup_not_ready`.
-- `--allow-stale-dropbox` bypasses the gate for manual recovery runs.
+- `--allow-stale-dropbox` remains an explicit recovery override and is
+  recorded in the JSON and Markdown reports.
 
-The required task keys default to:
-
-```text
-ops.r2_history_dropbox_backup
-```
-
-This is the factual daily-task key for the single GitHub workflow that builds
-the R2 backup inventory and then runs the inventory-driven Dropbox sync. The
-workflow reports `Finished` only after both ordered steps complete successfully.
+The RPC returns the qualifying backup run and timestamps plus the latest
+finished/running state for every relevant writer, so the report explains the
+decision without inspecting R2.
 
 The gate calls the RPC through the exposed `uk_aq_public` PostgREST schema and
 uses the Obs AQI DB credential order: dedicated daily-task-health variables,
 `OBS_AQIDB_SUPABASE_URL`/`OBS_AQIDB_SECRET_KEY`, then established generic
-fallbacks. The request includes the scheduled date, integrity start timestamp,
-and required task keys. Missing credentials, invalid inputs, RPC failures, or
-unexpected response shapes block the run safely.
+fallbacks. The request includes only the Integrity start timestamp. Missing
+credentials, invalid inputs, RPC failures, or unexpected response shapes block
+the run safely.
 
 The RPC's canonical SQL definition is owned by
-`TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_daily_task_backup_readiness.sql`.
-The ops contract test reads that sibling schema source directly; no ops SQL
-mirror is maintained.
+`TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_history_integrity_readiness.sql`.
+No ops SQL mirror is maintained.
 
 ## v2 hierarchy validation
 
