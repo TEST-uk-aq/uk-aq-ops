@@ -21,10 +21,6 @@ import {
   normalizeObservationPropertyCode,
   OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
 } from "../shared/uk_aq_observation_property_code.mjs";
-import {
-  AQI_SUPPORTED_POLLUTANTS,
-  buildAqilevelHistoryRowsForDayFromSourceObservations,
-} from "../../lib/aqi/aqi_levels.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PART_MAX_ROWS = 1_000_000;
@@ -45,9 +41,6 @@ const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
 const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
-const DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED = false;
-const DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED = true;
-const DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS = 2_000_000;
 const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -4261,53 +4254,6 @@ async function exportAqilevelDayToR2({ runtime, dayUtc }) {
   };
 }
 
-
-export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxRows = DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS } = {}) {
-  const dayStart = Date.parse(`${dayUtc}T00:00:00.000Z`);
-  const prevStart = dayStart - DAY_MS;
-  const nextStart = dayStart + DAY_MS;
-  const normalized = [];
-  const pollutantCounts = {};
-  for (const row of Array.isArray(rows) ? rows : []) {
-    if (normalized.length >= maxRows) {
-      return {
-        ok: false,
-        status: "snapshot_row_limit_reached",
-        max_rows: maxRows,
-        source_row_count: normalized.length,
-        rows: normalized,
-        pollutant_counts: pollutantCounts,
-      };
-    }
-    const observedAt = observedAtForHistoryRow(row);
-    const observedMs = Date.parse(String(observedAt || ""));
-    if (!Number.isFinite(observedMs) || observedMs < prevStart || observedMs >= nextStart) continue;
-    const pollutantCode = normalizePollutantCodeForPath(row.pollutant_code);
-    pollutantCounts[pollutantCode] = (pollutantCounts[pollutantCode] || 0) + 1;
-    normalized.push({ ...row, pollutant_code: pollutantCode, observed_at_utc: new Date(observedMs).toISOString() });
-  }
-  normalized.sort((left, right) => {
-    const leftKey = `${left.connector_id || 0}|${left.timeseries_id || 0}|${left.pollutant_code || ""}|${left.observed_at_utc || left.observed_at || ""}`;
-    const rightKey = `${right.connector_id || 0}|${right.timeseries_id || 0}|${right.pollutant_code || ""}|${right.observed_at_utc || right.observed_at || ""}`;
-    return leftKey.localeCompare(rightKey);
-  });
-  const supportedRowCount = normalized.filter((row) => AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)).length;
-  const aqiRows = supportedRowCount > 0
-    ? buildAqilevelHistoryRowsForDayFromSourceObservations(normalized, dayUtc)
-    : [];
-  return {
-    ok: true,
-    status: supportedRowCount > 0 ? "supported_aqi_source" : "no_supported_aqi_source",
-    max_rows: maxRows,
-    source_row_count: normalized.length,
-    supported_source_row_count: supportedRowCount,
-    rows: normalized,
-    day_aqi_rows: aqiRows,
-    day_aqi_row_count: aqiRows.length,
-    pollutant_counts: pollutantCounts,
-  };
-}
-
 async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logStructured }) {
   const summary = {
     enabled: true,
@@ -4720,20 +4666,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       DEFAULT_AQILEVELS_ROW_GROUP_SIZE,
       10_000,
       2_000_000,
-    ),
-    phase_b_calculate_aqi_from_observations_enabled: parseBoolean(
-      env.UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-      DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-    ),
-    phase_b_legacy_aqi_rpc_export_enabled: parseBoolean(
-      env.UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-      DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-    ),
-    phase_b_observation_snapshot_max_rows: parsePositiveInt(
-      env.UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
-      DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
-      1,
-      10_000_000,
     ),
     aqilevels_source_max_pages: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_AQILEVELS_SOURCE_MAX_PAGES,
@@ -5152,24 +5084,13 @@ export async function runPhaseBBackup({
     }
   });
 
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    summary.aqilevels = {
-      enabled: true,
-      source_mode: "frozen_observations",
-      status: "configured_for_connector_scoped_snapshot_writer",
-      legacy_aqi_rpc_export_enabled: runtime.phase_b_legacy_aqi_rpc_export_enabled,
-      snapshot_max_rows: runtime.phase_b_observation_snapshot_max_rows,
-      note: "Frozen D-1+D source helper is available; legacy RPC writer is bypassed when UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=false.",
-    };
-  } else if (runtime.phase_b_legacy_aqi_rpc_export_enabled && hasBudgetFor(runtime, 120_000)) {
+  if (hasBudgetFor(runtime, 120_000)) {
     summary.aqilevels = await runAqilevelsBackup({
       runtime,
       latestEligibleDayUtc: window.latest_eligible_day_utc,
       dryRun,
       logStructured,
     });
-  } else if (!runtime.phase_b_legacy_aqi_rpc_export_enabled) {
-    summary.aqilevels = { skipped: true, reason: "legacy_aqi_rpc_export_disabled" };
   } else {
     logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
       operation: "aqilevels_backup_start",

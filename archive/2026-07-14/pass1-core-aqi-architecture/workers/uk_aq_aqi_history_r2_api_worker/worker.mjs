@@ -1,11 +1,6 @@
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
-  coalesceAqiMissingHourWindows,
-  mergeAqiRowsPreferR2,
-  summarizeAqiCalculationStatuses,
-} from "../../lib/aqi/aqi_levels.mjs";
-import {
   parseR2HistoryVersion,
   resolveR2HistoryVersion,
 } from "../shared/uk_aq_r2_history_version.mjs";
@@ -99,7 +94,6 @@ const AQI_RESPONSE_COLUMNS = [
 ];
 const AQI_HISTORY_RESPONSE_CACHE_VERSION = "2";
 const DEFAULT_AQI_INTERNAL_RESPONSE_CACHE_ENABLED = true;
-const DEFAULT_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED = false;
 const AQI_RESPONSE_FORMATS = new Set(["json", "objects", "compact", "tsv"]);
 const timeseriesWindowContextCache = new Map();
 
@@ -2303,10 +2297,6 @@ async function handleRequest(request, env, ctx) {
           || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`,
       ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`
     );
-  const liveObservationFallbackEnabled = parseOptionalBoolean(
-    env.UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED,
-    DEFAULT_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED,
-  );
   const cachePolicy = resolveCachePolicy(env, endIso);
   const { cacheSeconds, cacheScope, mutableHours } = cachePolicy;
   const ingestRetentionDays = parsePositiveInt(
@@ -2517,10 +2507,7 @@ async function handleRequest(request, env, ctx) {
     obsAqiDbWindow = makeWindowCoveringIsoHours(r2ExpectedCoverage.missing_hours);
   }
   const hasResolvedObsAqiDbWindow = Boolean(obsAqiDbWindow);
-  // Temporary legacy rollback path: while UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED is false,
-  // preserve the deployed materialised Supabase AQI fallback. When true, do not read
-  // materialised AQI; the enabled path is R2 AQI > live observation calculation > no row.
-  const shouldFetchRecentFallback = hasResolvedObsAqiDbWindow && !liveObservationFallbackEnabled;
+  const shouldFetchRecentFallback = hasResolvedObsAqiDbWindow;
 
   if (shouldFetchRecentFallback) {
     try {
@@ -2547,30 +2534,6 @@ async function handleRequest(request, env, ctx) {
       }
     }
   }
-
-  const liveFallbackDiagnostics = liveObservationFallbackEnabled && readVersion === "v2" && obsAqiDbWindow
-    ? {
-      requested: true,
-      enabled: true,
-      materialised_aqi_fallback_queried: false,
-      mutable_hours: mutableHours,
-      ingest_retention_boundary_utc: splitBoundaryIso,
-      missing_aqi_hour_count: r2ExpectedCoverage?.missing_hour_count || 0,
-      missing_hour_windows: coalesceAqiMissingHourWindows(r2ExpectedCoverage?.missing_hours || [], {
-        contextHours: requestedPollutant === "pm25" || requestedPollutant === "pm10" ? 23 : 0,
-      }),
-      status: "observation_read_not_yet_configured",
-    }
-    : {
-      requested: Boolean(readVersion === "v2" && obsAqiDbWindow),
-      enabled: liveObservationFallbackEnabled,
-      materialised_aqi_fallback_queried: shouldFetchRecentFallback,
-      mutable_hours: mutableHours,
-      ingest_retention_boundary_utc: splitBoundaryIso,
-      missing_aqi_hour_count: r2ExpectedCoverage?.missing_hour_count || 0,
-      missing_hour_windows: [],
-      status: liveObservationFallbackEnabled ? "not_requested" : "legacy_materialised_fallback",
-    };
 
   const v2ObsAqiDbCandidatePoints = readVersion === "v2" && obsAqiDbWindow
     ? filterPointsToWindow(recentFallbackRead.points, obsAqiDbWindow.startMs, obsAqiDbWindow.endMs)
@@ -2622,7 +2585,7 @@ async function handleRequest(request, env, ctx) {
     source_coverage: "obs_aqidb_fill",
   }));
   const obsAqiDbMergePoints = readVersion === "v2"
-    ? (liveObservationFallbackEnabled ? [] : annotatedV2ObsAqiDbFillPoints)
+    ? annotatedV2ObsAqiDbFillPoints
     : [
       ...annotatedOverlapObsAqiDbFillPoints,
       ...annotatedRetentionObsAqiDbPoints,
@@ -2633,13 +2596,11 @@ async function handleRequest(request, env, ctx) {
       ...annotatedHistoricalR2Points,
       ...annotatedOverlapR2Points,
     ];
-  const preLimitPoints = liveObservationFallbackEnabled && readVersion === "v2"
-    ? mergeAqiRowsPreferR2({ r2Rows: r2MergePoints, liveRows: [] })
-    : mergePointsPreferPrimary(
-      r2MergePoints,
-      obsAqiDbMergePoints,
-      null,
-    );
+  const preLimitPoints = mergePointsPreferPrimary(
+    r2MergePoints,
+    obsAqiDbMergePoints,
+    null,
+  );
   const points = limit !== null && preLimitPoints.length > limit
     ? preLimitPoints.slice(preLimitPoints.length - limit)
     : preLimitPoints;
@@ -2670,9 +2631,6 @@ async function handleRequest(request, env, ctx) {
   const partialReasons = new Set([
     ...historicalR2PartialReasons.map((reason) => `historical:${reason}`),
   ]);
-  if (liveObservationFallbackEnabled && readVersion === "v2" && hasResolvedObsAqiDbWindow && (r2ExpectedCoverage?.missing_hour_count || 0) > 0) {
-    partialReasons.add("live_observation_fallback_unavailable");
-  }
   if (hasResolvedObsAqiDbWindow && recentFallbackRead.status === "fallback_error") {
     partialReasons.add(`obs_aqidb:${recentFallbackRead.error || "fallback_error"}`);
   }
@@ -2704,7 +2662,6 @@ async function handleRequest(request, env, ctx) {
       ? "obs_aqidb_live"
       : recentFallbackRead.status
     : "not_requested";
-  const liveCalculationStatusCounts = summarizeAqiCalculationStatuses([]);
   const legacySourceCoverage = [
     historicalWindow
       ? {
