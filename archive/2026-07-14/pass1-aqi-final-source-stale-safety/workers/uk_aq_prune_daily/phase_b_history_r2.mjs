@@ -30,7 +30,6 @@ import {
 import {
   AQI_SUPPORTED_POLLUTANTS,
   buildAqilevelHistoryRowsForDayFromSourceObservations,
-  dedupeSourceObservationRows,
 } from "../../lib/aqi/aqi_levels.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -2889,14 +2888,12 @@ function cleanupPhaseBFrozenSourceTemp(temp) {
 }
 
 function normalizeFrozenObservationRow(row) {
-  const observedAt = new Date(row.observed_at_utc || row.observed_at).toISOString();
   return {
     connector_id: Number(row.connector_id),
     station_id: row.station_id === null || row.station_id === undefined ? null : Number(row.station_id),
     timeseries_id: Number(row.timeseries_id),
     pollutant_code: normalizePollutantCodeForPath(row.pollutant_code),
-    observed_at: observedAt,
-    observed_at_utc: observedAt,
+    observed_at_utc: new Date(row.observed_at_utc || row.observed_at).toISOString(),
     value: row.value,
   };
 }
@@ -2929,8 +2926,6 @@ async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, 
     frozen_source_bytes: 0,
     day_observation_row_count: 0,
     supported_aqi_source_row_count: 0,
-    target_day_supported_aqi_source_row_count: 0,
-    context_supported_aqi_source_row_count: 0,
     supported_pollutant_counts: {},
   };
   let committedParts = [];
@@ -2996,11 +2991,6 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
         if (AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) {
           counts.supported_aqi_source_row_count += 1;
           counts.supported_pollutant_counts[row.pollutant_code] = (counts.supported_pollutant_counts[row.pollutant_code] || 0) + 1;
-          if (isObservationRowInDay(row, dayUtc)) {
-            counts.target_day_supported_aqi_source_row_count = (counts.target_day_supported_aqi_source_row_count || 0) + 1;
-          } else {
-            counts.context_supported_aqi_source_row_count = (counts.context_supported_aqi_source_row_count || 0) + 1;
-          }
         }
         if (isObservationRowInDay(row, dayUtc)) {
           counts.day_observation_row_count += 1;
@@ -3022,67 +3012,19 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
 
 async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath }) {
   const sourceRows = [];
-  let targetDaySupportedRowCount = 0;
-  let contextSupportedRowCount = 0;
   let invalidRowCount = 0;
   for await (const row of readFrozenSourceRows(frozenSourcePath)) {
     if (!AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) continue;
     sourceRows.push(row);
-    if (isObservationRowInDay(row, dayUtc)) targetDaySupportedRowCount += 1;
-    else contextSupportedRowCount += 1;
     if (sourceRows.length > runtime.phase_b_observation_snapshot_max_rows) {
       throw new Error(`AQI source row cap exceeded while replaying frozen source for day=${dayUtc} connector=${connectorId}`);
     }
   }
-  if (targetDaySupportedRowCount === 0) {
-    return { status: "no_supported_aqi_source", rows: [], invalid_row_count: invalidRowCount, supported_source_row_count: sourceRows.length, target_day_supported_source_row_count: targetDaySupportedRowCount, context_supported_source_row_count: contextSupportedRowCount };
+  if (sourceRows.length === 0) {
+    return { status: "no_supported_aqi_source", rows: [], invalid_row_count: invalidRowCount };
   }
-  const acceptedRows = dedupeSourceObservationRows(sourceRows);
   const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(sourceRows, dayUtc);
-  if (acceptedRows.length === 0 || rows.length === 0) {
-    throw new Error(`Phase B AQI source normalization produced zero output for day=${dayUtc} connector=${connectorId} despite ${targetDaySupportedRowCount} target-day supported source rows`);
-  }
-  return { status: "complete", rows, invalid_row_count: invalidRowCount, accepted_source_row_count: acceptedRows.length, rejected_source_row_count: Math.max(sourceRows.length - acceptedRows.length, 0), supported_source_row_count: sourceRows.length, target_day_supported_source_row_count: targetDaySupportedRowCount, context_supported_source_row_count: contextSupportedRowCount };
-}
-
-async function writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc }) {
-  const writeProfile = async ({ prefix, profile }) => {
-    const manifestKey = buildConnectorManifestKey(prefix, dayUtc, connectorId);
-    const manifest = createHistoryV2ConnectorManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile,
-      dayUtc,
-      connectorId,
-      runId: runtime.run_id,
-      manifestKey,
-      pollutantManifests: [],
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-    await r2PutObject({
-      r2: runtime.r2,
-      key: manifestKey,
-      body: Buffer.from(JSON.stringify(manifest, null, 2), "utf8"),
-      content_type: "application/json",
-    });
-    const head = await r2HeadObject({ r2: runtime.r2, key: manifestKey });
-    if (!head.exists) throw new Error(`AQI v2 ${profile} empty connector manifest missing after upload: ${manifestKey}`);
-    return manifest;
-  };
-  const connectorManifest = await writeProfile({ prefix: runtime.aqilevels_prefix, profile: "data" });
-  const debugConnectorManifest = await writeProfile({ prefix: runtime.aqilevels_hourly_debug_prefix_v2, profile: "debug" });
-  return {
-    status: "no_supported_aqi_source",
-    source_row_count: 0n,
-    file_count: 0,
-    total_bytes: 0n,
-    connector_manifest: connectorManifest,
-    manifest_key: connectorManifest.manifest_key,
-    debug_connector_manifest: debugConnectorManifest,
-    debug_file_count: 0,
-    debug_total_bytes: 0n,
-  };
+  return { status: "complete", rows, invalid_row_count: invalidRowCount };
 }
 
 async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
@@ -3118,8 +3060,6 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
           },
           rows: aqiBuild.rows,
         });
-      } else if (runtime.history_write_version === "v2") {
-        aqiResult = await writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc });
       }
       return {
         day_utc: dayUtc,
@@ -3136,10 +3076,6 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
           frozen_source_row_count: staged.counts.frozen_source_row_count,
           frozen_source_bytes: staged.counts.frozen_source_bytes,
           supported_aqi_source_row_count: staged.counts.supported_aqi_source_row_count,
-          target_day_supported_aqi_source_row_count: aqiBuild.target_day_supported_source_row_count ?? staged.counts.target_day_supported_aqi_source_row_count,
-          context_supported_aqi_source_row_count: aqiBuild.context_supported_source_row_count ?? staged.counts.context_supported_aqi_source_row_count,
-          accepted_aqi_source_row_count: aqiBuild.accepted_source_row_count ?? 0,
-          rejected_aqi_source_row_count: aqiBuild.rejected_source_row_count ?? aqiBuild.invalid_row_count ?? 0,
           supported_pollutant_counts: staged.counts.supported_pollutant_counts,
           output_row_count: aqiBuild.rows.length,
           manifest_key: aqiResult.manifest_key || aqiResult.connector_manifest?.manifest_key || null,
@@ -4610,8 +4546,7 @@ export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxR
     if (!Number.isFinite(observedMs) || observedMs < prevStart || observedMs >= nextStart) continue;
     const pollutantCode = normalizePollutantCodeForPath(row.pollutant_code);
     pollutantCounts[pollutantCode] = (pollutantCounts[pollutantCode] || 0) + 1;
-    const canonicalObservedAt = new Date(observedMs).toISOString();
-    normalized.push({ ...row, pollutant_code: pollutantCode, observed_at: canonicalObservedAt, observed_at_utc: canonicalObservedAt });
+    normalized.push({ ...row, pollutant_code: pollutantCode, observed_at_utc: new Date(observedMs).toISOString() });
   }
   normalized.sort((left, right) => {
     const leftKey = `${left.connector_id || 0}|${left.timeseries_id || 0}|${left.pollutant_code || ""}|${left.observed_at_utc || left.observed_at || ""}`;
@@ -4619,30 +4554,15 @@ export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxR
     return leftKey.localeCompare(rightKey);
   });
   const supportedRowCount = normalized.filter((row) => AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)).length;
-  const targetDaySupportedRowCount = normalized.filter((row) => AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code) && isObservationRowInDay(row, dayUtc)).length;
-  const aqiRows = targetDaySupportedRowCount > 0
+  const aqiRows = supportedRowCount > 0
     ? buildAqilevelHistoryRowsForDayFromSourceObservations(normalized, dayUtc)
     : [];
-  if (targetDaySupportedRowCount > 0 && aqiRows.length === 0) {
-    return {
-      ok: false,
-      status: "supported_target_day_source_zero_aqi_output",
-      max_rows: maxRows,
-      source_row_count: normalized.length,
-      supported_source_row_count: supportedRowCount,
-      target_day_supported_source_row_count: targetDaySupportedRowCount,
-      rows: normalized,
-      pollutant_counts: pollutantCounts,
-    };
-  }
   return {
     ok: true,
-    status: targetDaySupportedRowCount > 0 ? "supported_aqi_source" : "no_supported_aqi_source",
+    status: supportedRowCount > 0 ? "supported_aqi_source" : "no_supported_aqi_source",
     max_rows: maxRows,
     source_row_count: normalized.length,
     supported_source_row_count: supportedRowCount,
-    target_day_supported_source_row_count: targetDaySupportedRowCount,
-    context_supported_source_row_count: Math.max(supportedRowCount - targetDaySupportedRowCount, 0),
     rows: normalized,
     day_aqi_rows: aqiRows,
     day_aqi_row_count: aqiRows.length,
@@ -4802,15 +4722,12 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc })
     }
     return manifests;
   };
+  const backedUpAtUtc = nowIso();
   const dataConnectorManifests = await readConnectorManifests(runtime.aqilevels_prefix);
   const debugConnectorManifests = await readConnectorManifests(runtime.aqilevels_hourly_debug_prefix_v2);
-  validateAqilevelDataDebugConnectorManifests({
-    runtime,
-    dayUtc,
-    dataConnectorManifests,
-    debugConnectorManifests,
-  });
-  const backedUpAtUtc = nowIso();
+  if (dataConnectorManifests.length !== debugConnectorManifests.length) {
+    throw new Error(`AQI data/debug connector manifest count mismatch for day=${dayUtc}: data=${dataConnectorManifests.length} debug=${debugConnectorManifests.length}`);
+  }
   const dataDayManifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
   const debugDayManifestKey = buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc);
   const dataDayManifest = createHistoryV2DayManifest({
@@ -4861,41 +4778,6 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc })
     index_build: indexBuild,
     index_verification: indexVerification,
   };
-}
-
-export function validateAqilevelDataDebugConnectorManifests({ runtime, dayUtc, dataConnectorManifests, debugConnectorManifests }) {
-  const expectedByProfile = {
-    data: runtime.aqilevels_prefix,
-    debug: runtime.aqilevels_hourly_debug_prefix_v2,
-  };
-  const normalizeSet = (manifests, profile) => {
-    const out = new Map();
-    for (const manifest of manifests || []) {
-      const connectorId = parseManifestPositiveInt(manifest?.connector_id, "connector_id", false);
-      const expectedKey = connectorId ? buildConnectorManifestKey(expectedByProfile[profile], dayUtc, connectorId) : null;
-      const failures = [];
-      if (!connectorId) failures.push("connector_id");
-      if (manifest?.day_utc !== dayUtc) failures.push("day_utc");
-      if (manifest?.domain !== "aqilevels") failures.push("domain");
-      if (manifest?.grain !== HISTORY_AQILEVELS_GRAIN) failures.push("grain");
-      if (manifest?.profile !== profile) failures.push("profile");
-      if (manifest?.manifest_key !== expectedKey) failures.push("manifest_key");
-      if (failures.length) {
-        throw new Error(`AQI ${profile} connector manifest identity mismatch for day=${dayUtc} connector=${connectorId || "unknown"} fields=${failures.join(",")}`);
-      }
-      if (out.has(connectorId)) throw new Error(`AQI ${profile} connector manifest duplicate for day=${dayUtc} connector=${connectorId}`);
-      out.set(connectorId, manifest);
-    }
-    return out;
-  };
-  const dataByConnector = normalizeSet(dataConnectorManifests, "data");
-  const debugByConnector = normalizeSet(debugConnectorManifests, "debug");
-  const dataIds = Array.from(dataByConnector.keys()).sort((a, b) => a - b);
-  const debugIds = Array.from(debugByConnector.keys()).sort((a, b) => a - b);
-  if (dataIds.join(",") !== debugIds.join(",")) {
-    throw new Error(`AQI data/debug connector-set mismatch for day=${dayUtc}: data=[${dataIds.join(",")}] debug=[${debugIds.join(",")}]`);
-  }
-  return { connector_ids: dataIds, connector_manifest_count: dataIds.length };
 }
 
 export function extractAqilevelIndexPollutantsFromConnectorManifest(manifest) {
@@ -4972,9 +4854,7 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
     return { required: false, reason: "legacy_aqi_rpc_export" };
   }
   const requiredTargets = requiredAqilevelDayIndexTargets({ runtime, dayUtc, connectorManifests });
-  if (requiredTargets.length === 0 && (!Array.isArray(connectorManifests) || connectorManifests.length === 0 || !hasRequiredR2Config(runtime.r2))) {
-    return { required: false, reason: "no_supported_aqi_source" };
-  }
+  if (requiredTargets.length === 0) return { required: false, reason: "no_supported_aqi_source" };
   const summary = await updateR2HistoryIndexesTargeted({
     env: buildAqilevelIndexEnv(runtime),
     r2: runtime.r2,
@@ -5004,7 +4884,6 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
   if (warnings.length || omitted.length) {
     throw new Error(`AQI targeted index update failed for day=${dayUtc}; warnings=${warnings.length}; omitted_required_indexes=${omitted.map((entry) => entry.index_key).join(", ")}`);
   }
-  if (requiredTargets.length === 0) return { required: false, reason: "no_supported_aqi_source", summary };
   return { required: true, required_index_manifest_count: requiredTargets.length, summary };
 }
 
