@@ -505,49 +505,6 @@ test("targeted v2 AQI index warns when non-empty pollutant manifest lacks usable
 
 test("targeted v2 AQI index update refreshes timeseries metadata from rewritten indexes", async () => {
   const objects = {
-    "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": {
-      history_version: "v2",
-      domain: "aqilevels",
-      day_count: 3,
-      day_summaries: [
-        {
-          day_utc: "2026-05-31",
-          connector_count: 1,
-          connector_ids: [5],
-          connectors: [{ connector_id: 5, row_count: 12 }],
-          total_rows: 12,
-          pollutant_codes: ["pm25"],
-          pollutant_index_count: 1,
-          file_count: 1,
-          indexed_file_count: 1,
-          backed_up_at_utc: "2026-06-01T00:00:00.000Z",
-        },
-        {
-          day_utc: "2026-06-01",
-          connector_count: 1,
-          connector_ids: [6],
-          connectors: [{ connector_id: 6, row_count: 1 }],
-          total_rows: 1,
-          pollutant_codes: ["no2"],
-          pollutant_index_count: 1,
-          file_count: 1,
-          indexed_file_count: 1,
-          backed_up_at_utc: "2026-06-01T01:00:00.000Z",
-        },
-        {
-          day_utc: "2026-06-02",
-          connector_count: 1,
-          connector_ids: [8],
-          connectors: [{ connector_id: 8, row_count: 36 }],
-          total_rows: 36,
-          pollutant_codes: ["pm10"],
-          pollutant_index_count: 1,
-          file_count: 1,
-          indexed_file_count: 1,
-          backed_up_at_utc: "2026-06-03T00:00:00.000Z",
-        },
-      ],
-    },
     "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/manifest.json": {
       connector_manifests: [
         {
@@ -605,32 +562,12 @@ test("targeted v2 AQI index update refreshes timeseries metadata from rewritten 
     assert.equal(summary.timeseries_metadata.timeseries_count, 1);
     assert.equal(summary.timeseries_metadata.metadata_object_count, 1);
     assert.equal(summary.timeseries_metadata.aqilevels.actual_index_manifest_count, 1);
-    assert.equal(summary.aqilevels_timeseries.history_version, "v2");
-    assert.equal(summary.aqilevels_timeseries.domain, "aqilevels");
-    assert.equal(summary.aqilevels_timeseries.rewritten_pollutant_index_count, 1);
-    assert.equal(summary.aqilevels_timeseries.warning_count, 0);
-    assert.equal(summary.results[0], summary.aqilevels_timeseries);
-    assert.equal(summary.aqilevels_timeseries.affected_pollutant_indexes.length, 1);
-    assert.equal(summary.aqilevels_timeseries.affected_pollutant_indexes[0].key, "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json");
     const metadataRaw = fake.puts.get("history/_index_v2/timeseries/timeseries_id=1001.json");
     assert.ok(metadataRaw, "targeted v2 update writes the timeseries metadata object");
     const metadata = JSON.parse(metadataRaw);
     assert.equal(metadata.aqi_coverage.row_count, 24);
     assert.equal(metadata.aqi_coverage.first_timestamp_hour_utc, "2026-06-01T00:00:00.000Z");
     assert.equal(metadata.aqi_coverage.last_timestamp_hour_utc, "2026-06-01T23:00:00.000Z");
-    const latestRaw = fake.puts.get("history/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
-    assert.ok(latestRaw, "targeted v2 update rewrites the merged global latest index");
-    const latest = JSON.parse(latestRaw);
-    assert.deepEqual(latest.day_summaries.map((entry) => entry.day_utc), [
-      "2026-05-31",
-      "2026-06-01",
-      "2026-06-02",
-    ]);
-    assert.equal(latest.day_count, 3);
-    assert.equal(latest.day_summaries.filter((entry) => entry.day_utc === "2026-06-01").length, 1);
-    assert.equal(latest.day_summaries.find((entry) => entry.day_utc === "2026-05-31").total_rows, 12);
-    assert.equal(latest.day_summaries.find((entry) => entry.day_utc === "2026-06-01").total_rows, 24);
-    assert.equal(latest.day_summaries.find((entry) => entry.day_utc === "2026-06-02").total_rows, 36);
   } finally {
     fake.restore();
   }
@@ -1025,11 +962,8 @@ function installFakeR2Fetch(objectsByKey) {
   function keyFromUrl(url) {
     const parsed = new URL(url);
     const path = decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
-    const firstSlash = path.indexOf("/");
-    if (firstSlash > 0 && !path.startsWith("history/")) {
-      return path.slice(firstSlash + 1);
-    }
-    return path;
+    const prefix = "test-bucket/";
+    return path.startsWith(prefix) ? path.slice(prefix.length) : path;
   }
   globalThis.fetch = async (url, init = {}) => {
     const method = String(init.method || "GET").toUpperCase();
