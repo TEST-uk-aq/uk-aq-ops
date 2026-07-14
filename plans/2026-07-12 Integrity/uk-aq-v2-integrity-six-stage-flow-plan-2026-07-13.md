@@ -633,6 +633,27 @@ cross-stage history, authoritative metadata selection, affected-index identity
 rejection and aggregate mismatch rejection. SQL remains compatible and was not
 changed or applied. CIC-Test operational validation remains the next step.
 
+#### Skipped-unchanged metadata final-view correction
+
+- Issue: **confirmed and fixed**. A canonical `skipped_unchanged`
+  timeseries-metadata operation had no run-overlay object, while the disposable
+  final-verification view excluded the global metadata prefix. This could make
+  an unchanged, byte-identical Dropbox object fail as missing.
+- The view now normalises each required exact metadata key, honours verified
+  tombstones first, then links a verified overlay body when available, otherwise
+  links only the matching Dropbox file. It never copies Dropbox content into the
+  sparse overlay or expands the view to the global metadata prefix.
+- A tombstoned required key remains absent and final metadata verification fails
+  closed with `metadata_operation_final_object_missing`. Unchanged objects are
+  neither uploaded nor verified by this run and remain absent from R2-write
+  accounting.
+
+Changed file: `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py`.
+The required temporary-directory check created the exact Dropbox metadata key,
+confirmed the view symlink, successful validation and zero written R2 objects,
+then confirmed tombstone precedence and fail-closed validation. Required
+structural checks passed. SQL remains compatible and was not changed or applied.
+
 - Undefined final metadata-operation lookup: **confirmed**. Final verification
   now deterministically merges operation evidence by metadata key, unions
   replacement, removal and affected-index identities, and fails on conflicts.

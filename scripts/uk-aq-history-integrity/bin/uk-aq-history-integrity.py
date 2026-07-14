@@ -14331,9 +14331,10 @@ def _create_final_verification_view(
     ]
     file_keys = [config.observations_latest_index_key.strip("/"), config.aqilevels_latest_index_key.strip("/")]
     def link_file(source: Path, relative_key: str) -> None:
-        if relative_key in tombstones:
+        normalized_key = _normalise_overlay_object_key(relative_key)
+        if normalized_key in tombstones:
             return
-        target = view_root / relative_key
+        target = view_root / normalized_key
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(source)
     for prefix in prefixes:
@@ -14349,6 +14350,34 @@ def _create_final_verification_view(
         source = base_root / key
         if source.is_file():
             link_file(source, key)
+
+    # Global timeseries metadata is deliberately not part of the day-scoped
+    # tree above. Link only exact unchanged canonical metadata bodies required
+    # by this run, resolving verified tombstones before overlay then Dropbox.
+    for raw_operation in list(run_state.get("timeseries_metadata_operations") or []):
+        if not isinstance(raw_operation, Mapping) or raw_operation.get("outcome") != "skipped_unchanged":
+            continue
+        object_key = _normalise_overlay_object_key(
+            str(raw_operation.get("metadata_object_key") or "")
+        )
+        if object_key in tombstones:
+            continue
+        overlay_entry = dict(run_state.get("objects") or {}).get(object_key)
+        source: Path | None = None
+        if isinstance(overlay_entry, Mapping) and overlay_entry.get("r2_verified"):
+            candidate = Path(str(overlay_entry.get("local_path") or ""))
+            if candidate.is_file():
+                source = candidate
+        if source is None:
+            candidate = base_root / object_key
+            try:
+                candidate.resolve().relative_to(base_root.resolve())
+            except ValueError:
+                raise ValueError(f"metadata verification object escapes Dropbox root: {object_key}")
+            if candidate.is_file():
+                source = candidate
+        if source is not None:
+            link_file(source, object_key)
 
     for object_key, entry in dict(run_state.get("objects") or {}).items():
         if not isinstance(entry, Mapping) or not entry.get("r2_verified"):
