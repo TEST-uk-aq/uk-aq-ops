@@ -584,3 +584,28 @@ test("Phase B v2 AQI export writes data and debug profile objects and manifests"
     assert.equal(JSON.parse(written.get(buildDayManifestKey(debugPrefix, DAY)).toString("utf8")).profile, "debug");
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test("Phase B requires exactly one canonical AQI writer", () => {
+  assert.throws(
+    () => resolvePhaseBRuntimeConfig({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "false",
+      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "false",
+    }),
+    /exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/,
+  );
+  assert.throws(
+    () => resolvePhaseBRuntimeConfig({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "true",
+      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "true",
+    }),
+    /exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/,
+  );
+  assert.equal(resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" }).phase_b_legacy_aqi_rpc_export_enabled, true);
+  assert.equal(resolvePhaseBRuntimeConfig({
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+    UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "true",
+    UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "false",
+  }).phase_b_calculate_aqi_from_observations_enabled, true);
+});
