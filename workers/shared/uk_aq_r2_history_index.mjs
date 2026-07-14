@@ -1643,6 +1643,134 @@ export function buildHistoryV2TimeseriesMetadataIndexPayload({
   };
 }
 
+function timeseriesMetadataEntryIdentity(entry) {
+  const normalized = normalizeTimeseriesMetadataEntry(entry);
+  return normalized
+    ? `${normalized.domain}|${normalized.day_utc}|${normalized.connector_id}|${normalized.pollutant_code}`
+    : null;
+}
+
+function metadataEntriesFromPayload(payload, timeseriesId) {
+  if (!payload || payload.history_version !== "v2" || payload.index_kind !== "timeseries_metadata"
+    || parsePositiveId(payload.timeseries_id) !== parsePositiveId(timeseriesId)) {
+    throw new Error("existing_timeseries_metadata_invalid");
+  }
+  const rawEntries = [
+    ...(Array.isArray(payload?.observations_coverage?.entries) ? payload.observations_coverage.entries : []),
+    ...(Array.isArray(payload?.aqi_coverage?.entries) ? payload.aqi_coverage.entries : []),
+  ];
+  if (!rawEntries.length) throw new Error("existing_timeseries_metadata_entries_missing");
+  const entries = rawEntries.map(normalizeTimeseriesMetadataEntry);
+  if (entries.some((entry) => !entry)) throw new Error("existing_timeseries_metadata_entries_invalid");
+  const identities = new Set();
+  for (const entry of entries) {
+    const identity = timeseriesMetadataEntryIdentity(entry);
+    if (!identity || identities.has(identity)) throw new Error("existing_timeseries_metadata_entries_duplicate");
+    identities.add(identity);
+  }
+  return entries;
+}
+
+// Exported for the Integrity local regression check. Replacements are keyed by
+// domain + day + connector + pollutant, never by day alone.
+export function mergeHistoryV2TimeseriesMetadataEntries({ existingPayload, timeseriesId, replacements } = {}) {
+  const existingEntries = metadataEntriesFromPayload(existingPayload, timeseriesId);
+  const replacementMap = new Map();
+  for (const entry of Array.isArray(replacements) ? replacements : []) {
+    const normalized = normalizeTimeseriesMetadataEntry(entry);
+    const identity = timeseriesMetadataEntryIdentity(normalized);
+    if (!normalized || !identity || replacementMap.has(identity)) {
+      throw new Error("replacement_timeseries_metadata_entries_invalid");
+    }
+    replacementMap.set(identity, normalized);
+  }
+  if (!replacementMap.size) throw new Error("replacement_timeseries_metadata_entries_missing");
+  const preserved = existingEntries.filter((entry) => !replacementMap.has(timeseriesMetadataEntryIdentity(entry)));
+  const entries = [...preserved, ...replacementMap.values()];
+  return {
+    entries,
+    preserved_entry_count: preserved.length,
+    replaced_entry_count: existingEntries.length - preserved.length,
+    replacement_entry_count: replacementMap.size,
+  };
+}
+
+export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
+  r2,
+  bucketName,
+  indexPrefix = DEFAULT_R2_HISTORY_V2_INDEX_PREFIX,
+  timeseriesMetadataIndexPrefix = DEFAULT_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX,
+  affectedPollutantIndexes = [],
+  generatedAt = null,
+  writeR2 = true,
+} = {}) {
+  const normalizedIndexPrefix = normalizePrefix(indexPrefix);
+  const normalizedMetadataPrefix = normalizePrefix(timeseriesMetadataIndexPrefix);
+  const replacementsByTimeseriesId = new Map();
+  const blocked_scopes = [];
+  for (const source of affectedPollutantIndexes) {
+    const payload = source?.payload;
+    const counts = normalizeTimeseriesRowCounts(payload?.timeseries_row_counts);
+    if (!counts) {
+      blocked_scopes.push({ status: "blocked_dependency", reason: "required_pollutant_timeseries_counts_invalid", path: source?.key || null });
+      continue;
+    }
+    for (const timeseriesId of Object.keys(counts)) {
+      const entry = extractHistoryV2TimeseriesMetadataEntry(payload, timeseriesId);
+      if (!entry) {
+        blocked_scopes.push({ status: "blocked_dependency", reason: "required_pollutant_timeseries_entry_invalid", path: source?.key || null, timeseries_id: timeseriesId });
+        continue;
+      }
+      const key = String(parsePositiveId(timeseriesId));
+      const entries = replacementsByTimeseriesId.get(key) || [];
+      entries.push(entry);
+      replacementsByTimeseriesId.set(key, entries);
+    }
+  }
+  const candidates = [];
+  for (const [timeseriesId, replacements] of replacementsByTimeseriesId.entries()) {
+    const key = buildR2HistoryV2TimeseriesMetadataIndexKey(normalizedMetadataPrefix, timeseriesId);
+    const existing = await fetchJsonObjectFromR2IfExists(r2, key);
+    if (!existing.exists) {
+      blocked_scopes.push({ status: "blocked_dependency", reason: "existing_timeseries_metadata_missing", path: key, timeseries_id: Number(timeseriesId) });
+      continue;
+    }
+    try {
+      const merged = mergeHistoryV2TimeseriesMetadataEntries({
+        existingPayload: existing.payload,
+        timeseriesId,
+        replacements,
+      });
+      const payload = buildHistoryV2TimeseriesMetadataIndexPayload({
+        timeseriesId,
+        entries: merged.entries,
+        generatedAt,
+        indexPrefix: normalizedIndexPrefix,
+        timeseriesMetadataIndexPrefix: normalizedMetadataPrefix,
+      });
+      candidates.push({ key, payload, ...merged });
+    } catch (error) {
+      blocked_scopes.push({ status: "blocked_dependency", reason: String(error?.message || error), path: key, timeseries_id: Number(timeseriesId) });
+    }
+  }
+  if (blocked_scopes.length) return { status: "blocked_dependency", blocked_scopes, metadata_object_count: 0, affected_timeseries_ids: [...replacementsByTimeseriesId.keys()].map(Number).sort((a, b) => a - b) };
+  let metadata_put_skipped_count = 0;
+  for (const candidate of candidates) {
+    const put = await r2PutObjectIfChanged({ r2, key: candidate.key, body: `${JSON.stringify(candidate.payload, null, 2)}\n`, content_type: "application/json; charset=utf-8", writeR2 });
+    if (put.skipped) metadata_put_skipped_count += 1;
+  }
+  return {
+    status: "succeeded",
+    metadata_object_count: candidates.length,
+    metadata_put_skipped_count,
+    affected_timeseries_ids: [...replacementsByTimeseriesId.keys()].map(Number).sort((a, b) => a - b),
+    preserved_entry_count: candidates.reduce((sum, candidate) => sum + candidate.preserved_entry_count, 0),
+    replaced_entry_count: candidates.reduce((sum, candidate) => sum + candidate.replaced_entry_count, 0),
+    replacement_entry_count: candidates.reduce((sum, candidate) => sum + candidate.replacement_entry_count, 0),
+    metadata_keys: candidates.map((candidate) => candidate.key).sort(),
+  };
+}
+
 function aggregateConnectorsFromFiles(files) {
   const connectorMap = new Map();
   for (const entry of Array.isArray(files) ? files : []) {
@@ -3335,6 +3463,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
 
   const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
   const warnings = [];
+  const affectedPollutantIndexes = [];
 
   const latestKey = normalizedDomain === "observations"
     ? buildR2HistoryV2ObservationsTimeseriesLatestKey(normalizedIndexPrefix)
@@ -3360,9 +3489,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     const dayManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/manifest.json`;
     const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
     if (!dayManifestResult.exists) {
-      daySummaryMap.delete(dayUtc);
-      warnings.push(`Removed missing ${normalizedDomain} v2 day summary for ${dayUtc}`);
-      continue;
+      throw new Error(`blocked_dependency|required_day_manifest_unreadable|${dayManifestKey}`);
     }
     const dayManifestObject = dayManifestResult.payload;
 
@@ -3387,10 +3514,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
           connectorManifestObject = await fetchJsonObjectFromR2(r2, connectorTarget.manifest_key);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          warnings.push(
-            `Skipped ${normalizedDomain} v2 connector manifest day=${dayUtc} connector=${connectorTarget.connector_id}: ${message}`,
-          );
-          return null;
+          throw new Error(`blocked_dependency|required_connector_manifest_unreadable|${connectorTarget.manifest_key}|${message}`);
         }
 
         const pollutantTargets = resolveHistoryV2PollutantManifestTargets(
@@ -3448,9 +3572,10 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                 });
               }
               let putSkipped = null;
+              let pollutantIndexKey = null;
 
               if (shouldWrite) {
-                const pollutantIndexKey = normalizedDomain === "observations"
+                pollutantIndexKey = normalizedDomain === "observations"
                   ? buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
                     normalizedTimeseriesPrefix,
                     dayUtc,
@@ -3483,16 +3608,12 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                 backed_up_at_utc: payload.backed_up_at_utc,
                 wrote_index: shouldWrite,
                 put_skipped: putSkipped,
+                index_key: pollutantIndexKey,
+                payload,
               };
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
-              if (strictMissingTimeseriesCounts && message.includes(MISSING_TIMESERIES_COUNTS_PREFIX)) {
-                throw error;
-              }
-              warnings.push(
-                `Skipped ${normalizedDomain} v2 pollutant timeseries index day=${dayUtc} connector=${connectorTarget.connector_id} pollutant=${pollutantTarget.pollutant_code}: ${message}`,
-              );
-              return null;
+              throw new Error(`blocked_dependency|required_pollutant_index_unreadable|${pollutantTarget.manifest_key}|${message}`);
             }
           },
         )).filter(Boolean);
@@ -3520,6 +3641,14 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     rewrittenConnectorIndexCount += connectorResults.filter((entry) => entry.wrote_index).length;
     rewrittenPollutantIndexCount += connectorResults.reduce((sum, entry) => sum + entry.pollutant_indexes.filter(p => p.wrote_index).length, 0);
     rewrittenPutSkippedCount += connectorResults.reduce((sum, entry) => sum + entry.put_skipped_count, 0);
+
+    for (const connectorResult of connectorResults) {
+      for (const pollutantIndex of connectorResult.pollutant_indexes) {
+        if (pollutantIndex.wrote_index && pollutantIndex.payload && pollutantIndex.index_key) {
+          affectedPollutantIndexes.push({ key: pollutantIndex.index_key, payload: pollutantIndex.payload });
+        }
+      }
+    }
 
     const pollutantIndexes = connectorResults.flatMap((entry) => entry.pollutant_indexes);
     const pollutantCodes = Array.from(new Set(
@@ -3597,6 +3726,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     indexed_file_count: latestPayload.indexed_file_count,
     warning_count: warnings.length,
     warnings,
+    affected_pollutant_indexes: affectedPollutantIndexes,
   };
 }
 
@@ -4045,6 +4175,7 @@ export async function updateR2HistoryIndexesTargeted({
   fetchConcurrency,
   computeMissingTimeseriesCounts = false,
   strictMissingTimeseriesCounts,
+  timeseriesMetadataMode = "full",
   writeR2 = true,
   r2: r2Override = null,
 } = {}) {
@@ -4150,7 +4281,21 @@ export async function updateR2HistoryIndexesTargeted({
   }
 
   if (normalizedHistoryVersion === "v2") {
-    timeseriesMetadata = await rebuildR2HistoryV2TimeseriesMetadataIndexes({
+    if (timeseriesMetadataMode === "targeted") {
+      const affectedPollutantIndexes = results.flatMap((result) =>
+        Array.isArray(result?.affected_pollutant_indexes) ? result.affected_pollutant_indexes : []
+      );
+      timeseriesMetadata = await updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
+        r2,
+        bucketName: r2.bucket,
+        indexPrefix: config.index_prefix_v2,
+        timeseriesMetadataIndexPrefix: config.timeseries_metadata_index_prefix_v2,
+        affectedPollutantIndexes,
+        generatedAt,
+        writeR2,
+      });
+    } else {
+      timeseriesMetadata = await rebuildR2HistoryV2TimeseriesMetadataIndexes({
       r2,
       bucketName: r2.bucket,
       indexPrefix: config.index_prefix_v2,
@@ -4163,7 +4308,8 @@ export async function updateR2HistoryIndexesTargeted({
       generatedAt,
       fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
       writeR2,
-    });
+      });
+    }
   }
 
   const responseIndexPrefix = normalizedHistoryVersion === "v2"

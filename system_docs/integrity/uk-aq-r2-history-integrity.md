@@ -359,6 +359,12 @@ exact global latest-index object used by the targeted index merge, retaining
 all untouched latest-index day entries without a broad backup scan. Final
 reports and daily-task summaries distinguish verified writes and deletes, with
 `r2_objects_changed` their non-duplicated total.
+Integrity uses a targeted metadata merge, not the full rebuild: it replaces
+only entries identified by `domain`, `day_utc`, `connector_id` and
+`pollutant_code`, preserving unrelated observation and AQI coverage. Missing
+metadata and unreadable required affected-day children block safely, with no
+latest-index proposal. Final verification reads only changed metadata keys and
+checks their aggregate entries against affected pollutant indexes.
 Final reports label original findings as `pre_repair`, while the principal v2
 status reflects the final verification result. `fail` and `stopped_limit` use
 the daily-task failure path.

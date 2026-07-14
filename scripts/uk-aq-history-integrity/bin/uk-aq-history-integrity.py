@@ -14253,6 +14253,49 @@ def _final_verification_stage_for_gap(domain: str, gap: Mapping[str, Any]) -> st
     return "observs" if domain == "observations" else "aqilevels"
 
 
+def _validate_changed_timeseries_metadata(
+    *, run_state: Mapping[str, Any], view_root: Path, config: HistoryPathConfig,
+) -> list[dict[str, Any]]:
+    """Validate only metadata objects changed by this run, never the full prefix."""
+    gaps: list[dict[str, Any]] = []
+    for object_key, entry in dict(run_state.get("objects") or {}).items():
+        key = _normalise_overlay_object_key(str(object_key))
+        match = re.search(r"/timeseries_id=(\d+)\.json$", key)
+        if not match or not isinstance(entry, Mapping) or not entry.get("r2_verified"):
+            continue
+        path = view_root / key
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            timeseries_id = int(match.group(1))
+            if payload.get("history_version") != "v2" or payload.get("index_kind") != "timeseries_metadata" or int(payload.get("timeseries_id")) != timeseries_id:
+                raise ValueError("schema_or_identity_invalid")
+            entries: list[Mapping[str, Any]] = []
+            for domain, coverage_key in (("observations", "observations_coverage"), ("aqilevels", "aqi_coverage")):
+                coverage = payload.get(coverage_key)
+                if not isinstance(coverage, Mapping) or not isinstance(coverage.get("entries"), list):
+                    raise ValueError(f"{coverage_key}_invalid")
+                domain_entries = [item for item in coverage["entries"] if isinstance(item, Mapping)]
+                identities = {(domain, str(item.get("day_utc")), str(item.get("connector_id")), str(item.get("pollutant_code"))) for item in domain_entries}
+                if len(identities) != len(domain_entries) or int(coverage.get("row_count") or -1) != sum(int(item.get("row_count") or 0) for item in domain_entries):
+                    raise ValueError(f"{coverage_key}_aggregate_invalid")
+                entries.extend(domain_entries)
+            for item in entries:
+                domain = str(item.get("domain") or "")
+                day_utc = str(item.get("day_utc") or "")
+                connector_id = item.get("connector_id")
+                pollutant_code = str(item.get("pollutant_code") or "")
+                prefix = config.observations_timeseries_index_prefix if domain == "observations" else config.aqilevels_timeseries_index_prefix
+                index_path = view_root / prefix / f"day_utc={day_utc}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant_code}" / "manifest.json"
+                if index_path.is_file():
+                    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+                    actual = int((index_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0)
+                    if actual != int(item.get("row_count") or 0):
+                        raise ValueError("affected_pollutant_index_entry_mismatch")
+        except Exception as exc:
+            gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": f"timeseries_metadata_invalid:{exc}"})
+    return gaps
+
+
 def run_v2_final_verification(
     *,
     run_state: dict[str, Any],
@@ -14283,6 +14326,9 @@ def run_v2_final_verification(
         log=log,
     )
     remaining_scopes: list[dict[str, Any]] = []
+    remaining_scopes.extend(_validate_changed_timeseries_metadata(
+        run_state=run_state, view_root=view_root, config=config,
+    ))
     for domain, gaps in (
         ("observations", list((recheck.get("observations") or {}).get("gaps") or [])),
         ("aqilevels", list((recheck.get("aqilevels") or {}).get("gaps") or [])),
