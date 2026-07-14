@@ -113,7 +113,7 @@ function walkLocalObjects(root, prefixes = []) {
   return found;
 }
 
-function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [] }) {
+function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [], dynamicExactKeyPrefixes = [] }) {
   const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
   const paths = walkLocalObjects(dropboxRoot, prefixes);
   for (const rawKey of exactKeys) {
@@ -133,7 +133,11 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
     overlayRoot,
     getObject(key) {
       const normalized = safeLocalKey(key);
-      const localPath = paths.get(normalized);
+      let localPath = paths.get(normalized);
+      if (!localPath && dynamicExactKeyPrefixes.some((prefix) => normalized.startsWith(`${safeLocalKey(prefix)}/`))) {
+        const candidate = `${dropboxRoot}/${normalized}`;
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) localPath = candidate;
+      }
       if (!localPath) throw new Error(`Blocked dependency: combined local object is unavailable: ${normalized}`);
       const body = fs.readFileSync(localPath);
       return objectFromBody({ key: normalized, body, etag: sha256Hex(body) });
@@ -607,6 +611,7 @@ export async function runV2ObservationsRepair({
       `${indexPrefix}/day_utc=${scope.dayUtc}`,
     ]))],
     exactKeys: [latestIndexKey],
+    dynamicExactKeyPrefixes: [config.timeseries_metadata_index_prefix_v2],
   });
   const staged = createStagedObjectMap({ r2: config.r2, store: localStore });
   const dayPlans = [];
@@ -735,17 +740,33 @@ export async function runV2ObservationsRepair({
     let index = null;
     if (dayScopes.some((scope) => scope.needsIndex)) {
       const before = new Set(staged.proposals.keys());
-      index = await updateIndexes({
-        env,
-        r2: staged.stagedR2,
-        historyVersion: "v2",
-        domains: [domain],
-        fromDayUtc: dayUtc,
-        toDayUtc: dayUtc,
-        connectorId: null,
-        generatedAt: stableGeneratedAt({ dayUtc, dayManifest }),
-        writeR2: true,
-      });
+      try {
+        index = await updateIndexes({
+          env,
+          r2: staged.stagedR2,
+          historyVersion: "v2",
+          domains: [domain],
+          fromDayUtc: dayUtc,
+          toDayUtc: dayUtc,
+          connectorId: null,
+          generatedAt: stableGeneratedAt({ dayUtc, dayManifest }),
+          strictMissingTimeseriesCounts: true,
+          timeseriesMetadataMode: "targeted",
+          writeR2: true,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const parts = message.split("|");
+        blockedScopes.push({
+          status: "blocked_dependency",
+          day_utc: dayUtc,
+          reason: parts[1] || "required_index_child_unreadable",
+          path: parts[2] || null,
+          detail: message,
+        });
+        dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+        continue;
+      }
       for (const key of staged.proposals.keys()) {
         if (!before.has(key)) proposalKeys.push(key);
       }

@@ -1095,6 +1095,34 @@ existing readiness RPC contract remains compatible. Structural checks passed:
 both required `bash -n` commands, and `git diff --check`. No Integrity run, R2
 request, SQL apply, deployment, commit, stage or push was performed.
 
+### Index safety follow-up record — 2026-07-14
+
+- Issue 1, global metadata rebuild from scoped Integrity input: **confirmed**.
+  The targeted v2 update unconditionally called the full metadata rebuild even
+  though the sparse resolver holds neither all historical days nor the other
+  domain's data. Integrity now selects a targeted merge. Its identity is
+  `domain`, `day_utc`, `connector_id`, `pollutant_code`; exact existing
+  metadata retains untouched observation and AQI entries, then recalculates
+  coverage. Missing or invalid metadata is `blocked_dependency`. The full
+  rebuild remains available for callers with complete live-R2 evidence.
+- Issue 2, required-child warnings: **confirmed**. Required day, connector and
+  pollutant reads could be skipped while a latest summary continued. They now
+  fail closed and become a structured blocked scope, with no latest or metadata
+  proposal for that incomplete day.
+- Issue 3, final metadata validation: **confirmed**. The final view exposed
+  changed overlay bodies but did not validate global metadata. It now validates
+  each changed metadata key exactly, including schema, identity, unique entries,
+  aggregate counts and affected pollutant-index row counts.
+
+Files changed: shared v2 index code, metadata executor, Integrity coordinator,
+current documentation and this plan. Targeted local checks passed: a merge of
+two observation and two AQI days replaced one observation day while retaining
+the other three entries and recalculating aggregates; a missing required
+connector emitted no latest-index proposal. SQL remains compatible and no SQL
+was changed. First CIC-Test checks are a narrow repair dry-run showing affected
+timeseries IDs and preserved/replaced counts, then an approved narrow repair
+confirming GET verification and final metadata checks.
+
 ## Recommended model
 
 ```text

@@ -61,6 +61,13 @@ The resolver scans only affected day prefixes and reads the single exact global
 latest-index key needed to merge those days, so untouched latest-index entries
 are preserved without a broad Dropbox scan.
 
+Integrity does not use the shared full per-timeseries metadata rebuild. It
+merges each affected metadata object by `domain`, `day_utc`, `connector_id` and
+`pollutant_code`, preserving all untouched observation and AQI entries before
+recalculating coverage. Missing metadata blocks safely. Every final affected
+connector and pollutant child is required, so an unreadable child produces no
+latest-index or metadata proposal for that incomplete day.
+
 The final report includes prior R2 GET verification evidence for every changed
 object and delete verification evidence for every replacement deletion. It
 reports `r2_objects_written`, `r2_objects_deleted`, and their verified union as
@@ -74,6 +81,11 @@ Final repair reports keep the original detection as `pre_repair` evidence and
 make the principal v2 status reflect the final verification state. A failed
 final verification or `stopped_limit` is reported to daily task health as a
 failed task, not a finished task.
+
+Final verification includes each changed global metadata object by exact key.
+It validates schema, identity, entry uniqueness and aggregate counts, then
+cross-checks affected pollutant-index row counts without scanning the global
+metadata prefix.
 
 ## Backup gate
 
