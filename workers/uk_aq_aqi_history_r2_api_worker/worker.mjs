@@ -1,6 +1,13 @@
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
+  coalesceAqiMissingHourWindows,
+  mergeAqiRowsPreferR2,
+  mergeObservationRowsPreferR2,
+  buildAqilevelHistoryRowsForDayFromSourceObservations,
+  summarizeAqiCalculationStatuses,
+} from "../../lib/aqi/aqi_levels.mjs";
+import {
   parseR2HistoryVersion,
   resolveR2HistoryVersion,
 } from "../shared/uk_aq_r2_history_version.mjs";
@@ -94,6 +101,7 @@ const AQI_RESPONSE_COLUMNS = [
 ];
 const AQI_HISTORY_RESPONSE_CACHE_VERSION = "2";
 const DEFAULT_AQI_INTERNAL_RESPONSE_CACHE_ENABLED = true;
+const DEFAULT_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED = false;
 const AQI_RESPONSE_FORMATS = new Set(["json", "objects", "compact", "tsv"]);
 const timeseriesWindowContextCache = new Map();
 
@@ -1836,6 +1844,132 @@ async function readHistoryRows({
   };
 }
 
+
+function dayUtcFromIso(iso) {
+  return new Date(Date.parse(iso)).toISOString().slice(0, 10);
+}
+
+function normalizeLiveObservationRow(row, { connectorId = null, stationId = null, pollutantCode = null, timeseriesIdFromRequest = null } = {}) {
+  const timeseriesId = parseRequiredPositiveInt(row?.timeseries_id) || parseRequiredPositiveInt(timeseriesIdFromRequest);
+  const observedAt = toIsoOrNull(row?.observed_at_utc || row?.observed_at || row?.timestamp_utc || row?.time);
+  if (!timeseriesId || !observedAt) return null;
+  const value = row?.value === null || row?.value === undefined ? null : Number(row.value);
+  if (!Number.isFinite(value)) return null;
+  return {
+    connector_id: parseRequiredPositiveInt(row?.connector_id) || connectorId,
+    station_id: parseRequiredPositiveInt(row?.station_id) || stationId,
+    timeseries_id: timeseriesId,
+    pollutant_code: normalizeAqiPollutant(row?.pollutant_code || pollutantCode),
+    observed_at: observedAt,
+    observed_at_utc: observedAt,
+    value,
+  };
+}
+
+function resolveObservationsApiUrl(configuredUrl) {
+  const baseUrl = normalizeBaseUrl(configuredUrl || "");
+  if (!baseUrl) return null;
+  const url = new URL(baseUrl);
+  const normalizedPath = url.pathname.replace(/\/+$/, "");
+  if (normalizedPath === "" || normalizedPath === "/") {
+    url.pathname = "/v1/observations";
+  } else if (normalizedPath.endsWith("/v1/observations")) {
+    url.pathname = normalizedPath;
+  } else {
+    url.pathname = `${normalizedPath}/v1/observations`;
+  }
+  url.search = "";
+  return url;
+}
+
+function summarizeObservationApiCompleteness(payload) {
+  const explicitComplete = payload?.response_complete;
+  const coverageState = String(payload?.coverage_state || payload?.coverage?.coverage_state || "").trim().toLowerCase();
+  const partialReasons = Array.isArray(payload?.partial_reasons) ? payload.partial_reasons.map(String) : [];
+  const hasGap = payload?.has_gap === true || payload?.coverage?.has_gap === true;
+  const responseComplete = explicitComplete === false || hasGap || (coverageState && coverageState !== "complete")
+    ? false
+    : true;
+  return {
+    response_complete: responseComplete,
+    has_gap: !responseComplete || hasGap,
+    coverage_state: coverageState || (responseComplete ? "complete" : "partial"),
+    partial_reasons: partialReasons,
+    coverage: payload?.coverage || null,
+  };
+}
+
+async function readLiveR2ObservationRows({ env, timeseriesId, connectorId, stationId, pollutantKey, startIso, endIso, authHeader }) {
+  const url = resolveObservationsApiUrl(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL || "");
+  if (!url) return { rows: [], source: "not_configured", error: "UK_AQ_OBSERVS_HISTORY_R2_API_URL is required when live observation fallback is enabled", response_complete: false, has_gap: true, coverage_state: "not_configured", partial_reasons: ["observations_api_url_not_configured"], coverage: null, request_url: null };
+  url.searchParams.set("scope", "timeseries");
+  url.searchParams.set("timeseries_id", String(timeseriesId));
+  if (connectorId) url.searchParams.set("connector_id", String(connectorId));
+  if (stationId) url.searchParams.set("station_id", String(stationId));
+  url.searchParams.set("pollutant", pollutantKey);
+  url.searchParams.set("start_utc", startIso);
+  url.searchParams.set("end_utc", endIso);
+  url.searchParams.set("format", "objects");
+  const headers = authHeader ? { [UPSTREAM_AUTH_HEADER]: authHeader } : {};
+  const requestUrl = url.toString();
+  const response = await fetch(requestUrl, { headers });
+  if (!response.ok) throw new Error(`R2 observations API read failed (${response.status})`);
+  const payload = await response.json();
+  const completeness = summarizeObservationApiCompleteness(payload);
+  const rawRows = Array.isArray(payload?.rows) ? payload.rows : Array.isArray(payload?.points) ? payload.points : [];
+  return {
+    rows: rawRows.map((row) => normalizeLiveObservationRow(row, { connectorId, stationId, pollutantCode: pollutantKey, timeseriesIdFromRequest: timeseriesId })).filter(Boolean),
+    source: "r2_observations_api",
+    error: null,
+    ...completeness,
+    request_url: requestUrl,
+  };
+}
+
+async function readRecentIngestObservationRows({ env, timeseriesId, connectorId, stationId, pollutantKey, startIso, endIso }) {
+  const path = String(env.UK_AQ_OBSAQIDB_OBSERVATIONS_PATH || "uk_aq_observations").trim();
+  const schema = String(env.UK_AQ_PUBLIC_SCHEMA || UK_AQ_PUBLIC_SCHEMA_DEFAULT).trim() || UK_AQ_PUBLIC_SCHEMA_DEFAULT;
+  const result = await fetchObsAqiDbArray({
+    env,
+    path,
+    schema,
+    queryParams: [
+      ["select", "connector_id,station_id,timeseries_id,pollutant_code,observed_at_utc,value"],
+      ["timeseries_id", `eq.${timeseriesId}`],
+      ["observed_at_utc", `gte.${startIso}`],
+      ["observed_at_utc", `lt.${endIso}`],
+      ["order", "observed_at_utc.asc"],
+      ["limit", String(MAX_LIMIT)],
+    ],
+  });
+  return {
+    rows: result.rows.map((row) => normalizeLiveObservationRow(row, { connectorId, stationId, pollutantCode: pollutantKey, timeseriesIdFromRequest: timeseriesId })).filter(Boolean),
+    source: result.source_path,
+  };
+}
+
+function projectLiveAqiRowsToResponseRows(rows) {
+  return (Array.isArray(rows) ? rows : []).map((row) => ({
+    period_start_utc: row.timestamp_hour_utc,
+    connector_id: row.connector_id,
+    station_id: row.station_id,
+    timeseries_id: row.timeseries_id,
+    pollutant_code: row.pollutant_code,
+    daqi_index_level: row.daqi_index_level,
+    eaqi_index_level: row.eaqi_index_level,
+    daqi_input_value_ugm3: row.daqi_input_value_ugm3,
+    daqi_input_averaging_code: row.daqi_input_averaging_code,
+    eaqi_input_value_ugm3: row.eaqi_input_value_ugm3,
+    eaqi_input_averaging_code: row.eaqi_input_averaging_code,
+    daqi_calculation_status: row.daqi_calculation_status,
+    eaqi_calculation_status: row.eaqi_calculation_status,
+    daqi_missing_reason: row.daqi_missing_reason,
+    eaqi_missing_reason: row.eaqi_missing_reason,
+    source: "live_calculated",
+    source_coverage: "live_observation_fallback",
+  }));
+}
+
 async function readRecentRowsFromObsAqiDb({
   env,
   timeseriesId,
@@ -2297,6 +2431,10 @@ async function handleRequest(request, env, ctx) {
           || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`,
       ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`
     );
+  const liveObservationFallbackEnabled = parseOptionalBoolean(
+    env.UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED,
+    DEFAULT_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED,
+  );
   const cachePolicy = resolveCachePolicy(env, endIso);
   const { cacheSeconds, cacheScope, mutableHours } = cachePolicy;
   const ingestRetentionDays = parsePositiveInt(
@@ -2416,6 +2554,11 @@ async function handleRequest(request, env, ctx) {
       }
     }
 
+    if (liveObservationFallbackEnabled && readVersion === "v2") {
+      windowContextLookupSource = windowContextLookupSource || "live_observation_no_materialised_context";
+      return { connector_id: targetConnectorId, station_id: targetStationId, timeseries_ids: targetTimeseriesIds };
+    }
+
     try {
       obsAqiDbContextLookupAttempted = true;
       const lookup = await readTimeseriesWindowContextFromObsAqiDb({
@@ -2507,7 +2650,10 @@ async function handleRequest(request, env, ctx) {
     obsAqiDbWindow = makeWindowCoveringIsoHours(r2ExpectedCoverage.missing_hours);
   }
   const hasResolvedObsAqiDbWindow = Boolean(obsAqiDbWindow);
-  const shouldFetchRecentFallback = hasResolvedObsAqiDbWindow;
+  // Temporary legacy rollback path: while UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED is false,
+  // preserve the deployed materialised Supabase AQI fallback. When true, do not read
+  // materialised AQI; the enabled path is R2 AQI > live observation calculation > no row.
+  const shouldFetchRecentFallback = hasResolvedObsAqiDbWindow && !liveObservationFallbackEnabled;
 
   if (shouldFetchRecentFallback) {
     try {
@@ -2532,6 +2678,118 @@ async function handleRequest(request, env, ctx) {
           `R2 AQI history is unavailable and ObsAQIDB fallback failed (${message}).`,
         );
       }
+    }
+  }
+
+  let liveCalculatedPoints = [];
+  let liveFallbackError = null;
+  const rawMissingHours = r2ExpectedCoverage?.missing_hours || [];
+  const mutableBoundaryMs = nowMs - mutableHours * HOUR_MS;
+  const eligibleMissingHoursForLiveFallback = rawMissingHours.filter((hour) => {
+    const hourMs = Date.parse(hour);
+    return Number.isFinite(hourMs) && hourMs >= mutableBoundaryMs;
+  });
+  const missingHourWindows = coalesceAqiMissingHourWindows(eligibleMissingHoursForLiveFallback, { contextHours: 0 });
+  const observationsApiConfigured = Boolean(normalizeBaseUrl(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL || ""));
+  const liveFallbackDiagnostics = {
+    requested: Boolean(readVersion === "v2" && obsAqiDbWindow),
+    enabled: liveObservationFallbackEnabled,
+    observations_api_url_configured: observationsApiConfigured,
+    materialised_aqi_fallback_queried: shouldFetchRecentFallback,
+    mutable_hours: mutableHours,
+    ingest_retention_boundary_utc: splitBoundaryIso,
+    missing_aqi_hour_count: r2ExpectedCoverage?.missing_hour_count || 0,
+    missing_hour_windows: liveObservationFallbackEnabled ? missingHourWindows : [],
+    r2_observation_row_count: 0,
+    ingest_observation_row_count: 0,
+    discarded_ingest_overlap_count: 0,
+    invalid_observation_count: 0,
+    eligible_output_hour_count: 0,
+    skipped_outside_horizon_hour_count: 0,
+    pm_context_start_utc: null,
+    r2_observation_response_complete: null,
+    r2_observation_partial_reasons: [],
+    r2_observation_coverage_state: null,
+    live_calculated_row_count: 0,
+    status: liveObservationFallbackEnabled ? "not_requested" : "legacy_materialised_fallback",
+  };
+  if (liveObservationFallbackEnabled && readVersion === "v2" && !observationsApiConfigured && obsAqiDbWindow) {
+    liveFallbackError = "UK_AQ_OBSERVS_HISTORY_R2_API_URL is required when UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=true";
+    liveFallbackDiagnostics.status = "error";
+    liveFallbackDiagnostics.error = liveFallbackError;
+  } else if (liveObservationFallbackEnabled && readVersion === "v2" && obsAqiDbWindow && missingHourWindows.length > 0) {
+    try {
+      const liveWindowStartIso = missingHourWindows[0].start_utc;
+      const liveWindowEndIso = missingHourWindows[missingHourWindows.length - 1].end_utc;
+      const outputStartMs = Date.parse(liveWindowStartIso);
+      const outputEndMs = Date.parse(liveWindowEndIso);
+      const r2ObservationStartMs = requestedPollutant === "pm25" || requestedPollutant === "pm10"
+        ? outputStartMs - 23 * HOUR_MS
+        : outputStartMs;
+      const ingestObservationStartMs = Math.max(outputStartMs, retentionStartMs);
+      liveFallbackDiagnostics.pm_context_start_utc = new Date(r2ObservationStartMs).toISOString();
+      const eligibleMissingHours = eligibleMissingHoursForLiveFallback.filter((hour) => {
+        const hourMs = Date.parse(hour);
+        return Number.isFinite(hourMs) && hourMs >= outputStartMs && hourMs < outputEndMs;
+      });
+      liveFallbackDiagnostics.eligible_output_hour_count = eligibleMissingHours.length;
+      liveFallbackDiagnostics.skipped_outside_horizon_hour_count = rawMissingHours.length - eligibleMissingHours.length;
+      if (!Number.isFinite(outputStartMs) || outputStartMs >= outputEndMs || eligibleMissingHours.length === 0) {
+        liveFallbackDiagnostics.status = "outside_live_calculation_horizon";
+      } else {
+        const boundedStartIso = new Date(r2ObservationStartMs).toISOString();
+        const authHeader = request.headers.get(UPSTREAM_AUTH_HEADER) || env.UK_AQ_EDGE_UPSTREAM_SECRET || "";
+        const r2ObsRead = await readLiveR2ObservationRows({
+          env,
+          timeseriesId,
+          connectorId: targetConnectorId,
+          stationId: targetStationId,
+          pollutantKey: requestedPollutant,
+          startIso: boundedStartIso,
+          endIso: liveWindowEndIso,
+          authHeader,
+        });
+        liveFallbackDiagnostics.r2_observation_response_complete = r2ObsRead.response_complete;
+        liveFallbackDiagnostics.r2_observation_partial_reasons = r2ObsRead.partial_reasons;
+        liveFallbackDiagnostics.r2_observation_coverage_state = r2ObsRead.coverage_state;
+        if (r2ObsRead.response_complete === false) {
+          liveFallbackDiagnostics.status = "partial_r2_observations";
+        }
+        const ingestRead = ingestObservationStartMs < outputEndMs ? await readRecentIngestObservationRows({
+          env,
+          timeseriesId,
+          connectorId: targetConnectorId,
+          stationId: targetStationId,
+          pollutantKey: requestedPollutant,
+          startIso: new Date(ingestObservationStartMs).toISOString(),
+          endIso: liveWindowEndIso,
+        }) : { rows: [], source: "outside_ingest_retention" };
+        const mergedObservations = mergeObservationRowsPreferR2({ r2Rows: r2ObsRead.rows, ingestRows: ingestRead.rows });
+        liveFallbackDiagnostics.r2_observation_row_count = r2ObsRead.rows.length;
+        liveFallbackDiagnostics.ingest_observation_row_count = ingestRead.rows.length;
+        liveFallbackDiagnostics.discarded_ingest_overlap_count = mergedObservations.discarded_ingest_overlap_count;
+        const dayRowsByKey = new Map();
+        for (const hour of eligibleMissingHours) {
+          const hourMs = Date.parse(hour);
+          if (!Number.isFinite(hourMs) || hourMs < outputStartMs) continue;
+          const dayUtc = dayUtcFromIso(hour);
+          const calculated = buildAqilevelHistoryRowsForDayFromSourceObservations(mergedObservations.rows, dayUtc)
+            .filter((row) => row.timeseries_id === timeseriesId && row.pollutant_code === requestedPollutant);
+          for (const row of calculated) {
+            const key = `${row.timeseries_id}|${row.pollutant_code}|${row.timestamp_hour_utc}`;
+            dayRowsByKey.set(key, row);
+          }
+        }
+        const missingSet = new Set(eligibleMissingHours);
+        const liveRows = Array.from(dayRowsByKey.values()).filter((row) => missingSet.has(row.timestamp_hour_utc));
+        liveCalculatedPoints = projectLiveAqiRowsToResponseRows(liveRows);
+        liveFallbackDiagnostics.live_calculated_row_count = liveCalculatedPoints.length;
+        if (r2ObsRead.response_complete !== false) liveFallbackDiagnostics.status = "calculated";
+      }
+    } catch (error) {
+      liveFallbackError = error instanceof Error ? error.message : String(error);
+      liveFallbackDiagnostics.status = "error";
+      liveFallbackDiagnostics.error = liveFallbackError;
     }
   }
 
@@ -2585,7 +2843,7 @@ async function handleRequest(request, env, ctx) {
     source_coverage: "obs_aqidb_fill",
   }));
   const obsAqiDbMergePoints = readVersion === "v2"
-    ? annotatedV2ObsAqiDbFillPoints
+    ? (liveObservationFallbackEnabled ? liveCalculatedPoints : annotatedV2ObsAqiDbFillPoints)
     : [
       ...annotatedOverlapObsAqiDbFillPoints,
       ...annotatedRetentionObsAqiDbPoints,
@@ -2596,11 +2854,13 @@ async function handleRequest(request, env, ctx) {
       ...annotatedHistoricalR2Points,
       ...annotatedOverlapR2Points,
     ];
-  const preLimitPoints = mergePointsPreferPrimary(
-    r2MergePoints,
-    obsAqiDbMergePoints,
-    null,
-  );
+  const preLimitPoints = liveObservationFallbackEnabled && readVersion === "v2"
+    ? mergeAqiRowsPreferR2({ r2Rows: r2MergePoints, liveRows: liveCalculatedPoints })
+    : mergePointsPreferPrimary(
+      r2MergePoints,
+      obsAqiDbMergePoints,
+      null,
+    );
   const points = limit !== null && preLimitPoints.length > limit
     ? preLimitPoints.slice(preLimitPoints.length - limit)
     : preLimitPoints;
@@ -2631,6 +2891,15 @@ async function handleRequest(request, env, ctx) {
   const partialReasons = new Set([
     ...historicalR2PartialReasons.map((reason) => `historical:${reason}`),
   ]);
+  if (liveFallbackError) {
+    partialReasons.add("live_observation_read_failed");
+  }
+  if (liveFallbackDiagnostics.r2_observation_response_complete === false) {
+    partialReasons.add("r2_observations_api_partial");
+    for (const reason of liveFallbackDiagnostics.r2_observation_partial_reasons || []) {
+      partialReasons.add(`r2_observations_api:${reason}`);
+    }
+  }
   if (hasResolvedObsAqiDbWindow && recentFallbackRead.status === "fallback_error") {
     partialReasons.add(`obs_aqidb:${recentFallbackRead.error || "fallback_error"}`);
   }
@@ -2662,6 +2931,7 @@ async function handleRequest(request, env, ctx) {
       ? "obs_aqidb_live"
       : recentFallbackRead.status
     : "not_requested";
+  const liveCalculationStatusCounts = summarizeAqiCalculationStatuses(liveCalculatedPoints);
   const legacySourceCoverage = [
     historicalWindow
       ? {
@@ -2717,7 +2987,7 @@ async function handleRequest(request, env, ctx) {
       obsAqiDbWindow
         ? {
           zone: "fill",
-          source: "obs_aqidb_fill",
+          source: liveObservationFallbackEnabled ? "live_observation_fallback" : "obs_aqidb_fill",
           from_utc: obsAqiDbWindow.startIso,
           to_utc: obsAqiDbWindow.endIso,
           status: recentFallbackRead.status === "fallback_error" ? "partial" : "complete",
@@ -2794,6 +3064,7 @@ async function handleRequest(request, env, ctx) {
       null_daqi_count: rowSummary.null_daqi_count,
       null_eaqi_count: rowSummary.null_eaqi_count,
       source_counts: rowSummary.source_counts,
+      live_observation_fallback: liveFallbackDiagnostics,
       source_coverage_counts: rowSummary.source_coverage_counts,
       pollutant_counts: rowSummary.pollutant_counts,
       daqi_status_counts: rowSummary.daqi_status_counts,
@@ -3013,6 +3284,8 @@ export {
   mergePointsPreferPrimary,
   filterPointsToMissingRows,
   extractParquetKeysFromTimeseriesIndex,
+  resolveObservationsApiUrl,
+  summarizeObservationApiCompleteness,
 };
 
 export default {

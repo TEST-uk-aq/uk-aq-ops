@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
   buildConnectorManifestKey,
@@ -14,6 +14,8 @@ import {
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
   shouldResetManifestlessV2ResumeForTest,
+  summarizeFrozenObservationSourceForAqi,
+  validateAqilevelDataDebugConnectorManifests,
   writeCommittedV2PartAndCheckpointForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
@@ -50,6 +52,75 @@ test("Phase B v2 ignores the retired observation allow-list", () => {
     resolved.observations_pollutant_codes,
     [],
   );
+});
+
+test("Phase B frozen AQI summary keeps D-1 context distinct from target-day support", () => {
+  const summary = summarizeFrozenObservationSourceForAqi({
+    dayUtc: "2026-06-14",
+    rows: [{
+      connector_id: 6,
+      station_id: 10,
+      timeseries_id: 1001,
+      pollutant_code: "pm25",
+      observed_at_utc: "2026-06-13T12:00:00.000Z",
+      value: 11,
+    }],
+  });
+
+  assert.equal(summary.ok, true);
+  assert.equal(summary.status, "no_supported_aqi_source");
+  assert.equal(summary.supported_source_row_count, 1);
+  assert.equal(summary.target_day_supported_source_row_count, 0);
+  assert.equal(summary.context_supported_source_row_count, 1);
+  assert.deepEqual(summary.day_aqi_rows, []);
+  assert.equal(Object.hasOwn(summary.rows[0], "observed_at"), true);
+  assert.equal(summary.rows[0].observed_at, summary.rows[0].observed_at_utc);
+});
+
+test("Phase B data/debug AQI connector validation compares identity sets and canonical profiles", () => {
+  const runtime = {
+    aqilevels_prefix: "history/v2/aqilevels/hourly/data",
+    aqilevels_hourly_debug_prefix_v2: "history/v2/aqilevels/hourly/debug",
+  };
+  const data = [1, 2].map((connectorId) => buildHistoryV2ConnectorManifestForTest({
+    domain: "aqilevels",
+    grain: "hourly",
+    profile: "data",
+    dayUtc: DAY,
+    connectorId,
+    runId: RUN_ID,
+    manifestKey: buildConnectorManifestKey(runtime.aqilevels_prefix, DAY, connectorId),
+    pollutantManifests: [],
+    writerGitSha: "test",
+    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
+  }));
+  const debug = [1, 3].map((connectorId) => buildHistoryV2ConnectorManifestForTest({
+    domain: "aqilevels",
+    grain: "hourly",
+    profile: "debug",
+    dayUtc: DAY,
+    connectorId,
+    runId: `${RUN_ID}-${connectorId}`,
+    manifestKey: buildConnectorManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, DAY, connectorId),
+    pollutantManifests: [],
+    writerGitSha: "test",
+    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
+  }));
+
+  assert.throws(() => validateAqilevelDataDebugConnectorManifests({ runtime, dayUtc: DAY, dataConnectorManifests: data, debugConnectorManifests: debug }), /connector-set mismatch/);
+  debug[1] = buildHistoryV2ConnectorManifestForTest({
+    domain: "observations",
+    grain: "hourly",
+    profile: "debug",
+    dayUtc: DAY,
+    connectorId: 2,
+    runId: RUN_ID,
+    manifestKey: buildConnectorManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, DAY, 2),
+    pollutantManifests: [],
+    writerGitSha: "test",
+    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
+  });
+  assert.throws(() => validateAqilevelDataDebugConnectorManifests({ runtime, dayUtc: DAY, dataConnectorManifests: data, debugConnectorManifests: debug }), /identity mismatch/);
 });
 
 test("Phase B v2 accepts digit-leading canonical codes in candidate SQL and R2 paths", async () => {
@@ -206,7 +277,9 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
 test("Phase B deploy workflow and env catalogs retire the observations history allow-list", () => {
   const workflow = readFileSync(".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml", "utf8");
   const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
-  const master = readFileSync("env-vars-master.csv", "utf8");
+  const master = existsSync("env-vars-master.csv")
+    ? readFileSync("env-vars-master.csv", "utf8")
+    : targets;
   assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.doesNotMatch(targets, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
@@ -581,4 +654,292 @@ test("Phase B v2 AQI export writes data and debug profile objects and manifests"
     assert.equal(JSON.parse(written.get(buildDayManifestKey(dataPrefix, DAY)).toString("utf8")).profile, "data");
     assert.equal(JSON.parse(written.get(buildDayManifestKey(debugPrefix, DAY)).toString("utf8")).profile, "debug");
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test("Phase B requires exactly one canonical AQI writer", () => {
+  assert.throws(
+    () => resolvePhaseBRuntimeConfig({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "false",
+      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "false",
+    }),
+    /exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/,
+  );
+  assert.throws(
+    () => resolvePhaseBRuntimeConfig({
+      UK_AQ_R2_HISTORY_VERSION: "v2",
+      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "true",
+      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "true",
+    }),
+    /exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/,
+  );
+  assert.equal(resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" }).phase_b_legacy_aqi_rpc_export_enabled, true);
+  assert.equal(resolvePhaseBRuntimeConfig({
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+    UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "true",
+    UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "false",
+  }).phase_b_calculate_aqi_from_observations_enabled, true);
+});
+
+import {
+  buildAqilevelDayIndexesForTest,
+  extractAqilevelIndexPollutantsFromConnectorManifestForTest,
+  requiredAqilevelDayIndexKeysForTest,
+  verifyAqilevelDayIndexesForTest,
+} from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+
+function installPhaseBFakeR2(objectsByKey) {
+  const originalFetch = globalThis.fetch;
+  const puts = new Map();
+  const keyFromUrl = (rawUrl) => {
+    const url = new URL(String(rawUrl));
+    const path = decodeURIComponent(url.pathname).replace(/^\/+/, "");
+    const firstSlash = path.indexOf("/");
+    return firstSlash > 0 && !path.startsWith("history/") ? path.slice(firstSlash + 1) : path;
+  };
+  globalThis.fetch = async (input, init = {}) => {
+    const method = String(init.method || "GET").toUpperCase();
+    const url = new URL(typeof input === "string" ? input : input.url);
+    if (method === "GET" && url.searchParams.get("list-type") === "2") {
+      const prefix = url.searchParams.get("prefix") || "";
+      const keys = [...new Set([...Object.keys(objectsByKey), ...puts.keys()])]
+        .filter((key) => key.startsWith(prefix))
+        .sort((left, right) => left.localeCompare(right));
+      return new Response(`<ListBucketResult>${keys.map((key) => `<Contents><Key>${key}</Key><Size>1</Size></Contents>`).join("")}</ListBucketResult>`, { status: 200 });
+    }
+    const key = keyFromUrl(url);
+    if (method === "GET") {
+      if (puts.has(key)) return new Response(puts.get(key), { status: 200 });
+      if (!Object.prototype.hasOwnProperty.call(objectsByKey, key)) return new Response("not found", { status: 404 });
+      return new Response(`${JSON.stringify(objectsByKey[key])}\n`, { status: 200 });
+    }
+    if (method === "HEAD") {
+      return new Response(null, { status: puts.has(key) || Object.prototype.hasOwnProperty.call(objectsByKey, key) ? 200 : 404 });
+    }
+    if (method === "PUT") {
+      puts.set(key, String(init.body || ""));
+      return new Response("", { status: 200, headers: { etag: `"put-${puts.size}"` } });
+    }
+    return new Response("unsupported", { status: 405 });
+  };
+  return {
+    puts,
+    restore() {
+      globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+test("Phase B AQI index verification derives pollutants from v2 connector manifest contract", () => {
+  const connectorManifest = {
+    connector_id: 7,
+    pollutant_codes: ["pm25", "temperature"],
+    pollutant_manifests: [
+      { pollutant_code: "no2", manifest_key: "data/no2/manifest.json" },
+      { pollutant_code: "pm10", manifest_key: "data/pm10/manifest.json" },
+    ],
+    child_manifests: [
+      { pollutant_code: "pm25", manifest_key: "data/pm25/manifest.json" },
+    ],
+  };
+  assert.deepEqual(
+    extractAqilevelIndexPollutantsFromConnectorManifestForTest(connectorManifest),
+    ["no2", "pm10", "pm25"],
+  );
+  assert.deepEqual(requiredAqilevelDayIndexKeysForTest({
+    runtime: { aqilevels_timeseries_index_prefix: "history/_index/aqilevels_hourly_data_timeseries" },
+    dayUtc: DAY,
+    connectorManifests: [connectorManifest],
+  }), [
+    "history/_index/aqilevels_hourly_data_timeseries/day_utc=2026-06-14/connector_id=7/pollutant_code=no2/manifest.json",
+    "history/_index/aqilevels_hourly_data_timeseries/day_utc=2026-06-14/connector_id=7/pollutant_code=pm10/manifest.json",
+    "history/_index/aqilevels_hourly_data_timeseries/day_utc=2026-06-14/connector_id=7/pollutant_code=pm25/manifest.json",
+  ]);
+});
+
+test("Phase B AQI index wrappers run targeted update, preserve global latest, and verify current source", async () => {
+  const pollutantManifestKey = `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/pollutant_code=pm25/manifest.json`;
+  const connectorManifest = {
+    connector_id: 7,
+    pollutant_manifests: [{ pollutant_code: "pm25", manifest_key: pollutantManifestKey }],
+  };
+  const objects = {
+    "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": {
+      history_version: "v2",
+      domain: "aqilevels",
+      day_summaries: [{
+        day_utc: "2026-06-13",
+        connector_count: 1,
+        connector_ids: [4],
+        connectors: [{ connector_id: 4, row_count: 10 }],
+        total_rows: 10,
+        pollutant_codes: ["no2"],
+        pollutant_index_count: 1,
+        file_count: 1,
+        indexed_file_count: 1,
+        backed_up_at_utc: "2026-06-14T00:00:00.000Z",
+      }],
+    },
+    [`history/v2/aqilevels/hourly/data/day_utc=${DAY}/manifest.json`]: {
+      connector_manifests: [{ connector_id: 7, manifest_key: `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/manifest.json` }],
+    },
+    [`history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/manifest.json`]: connectorManifest,
+    [pollutantManifestKey]: {
+      manifest_hash: "current-pm25-hash",
+      source_row_count: 24,
+      row_count: 24,
+      timeseries_row_counts: { "101": 24 },
+      backed_up_at_utc: "2026-06-15T00:00:00.000Z",
+      files: [{
+        key: `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/pollutant_code=pm25/part-00000.parquet`,
+        row_count: 24,
+        bytes: 1234,
+        min_timeseries_id: 101,
+        max_timeseries_id: 101,
+        min_timestamp_hour_utc: `${DAY}T00:00:00.000Z`,
+        max_timestamp_hour_utc: `${DAY}T23:00:00.000Z`,
+      }],
+    },
+  };
+  const fake = installPhaseBFakeR2(objects);
+  try {
+    const runtime = {
+      phase_b_calculate_aqi_from_observations_enabled: true,
+      r2: {
+        endpoint: "https://r2.example.invalid",
+        bucket: "bucket",
+        access_key_id: "key",
+        secret_access_key: "secret",
+        region: "auto",
+      },
+      aqilevels_prefix: "history/v2/aqilevels/hourly/data",
+      aqilevels_timeseries_index_prefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
+      index_prefix_v2: "history/_index_v2",
+      timeseries_metadata_index_prefix_v2: "history/_index_v2/timeseries",
+    };
+    const indexBuild = await buildAqilevelDayIndexesForTest({ runtime, dayUtc: DAY, connectorManifests: [connectorManifest] });
+    assert.equal(indexBuild.required, true);
+    assert.equal(indexBuild.summary.aqilevels_timeseries.mode, "targeted");
+    assert.equal(indexBuild.summary.aqilevels_timeseries.rewritten_pollutant_index_count, 1);
+    const indexKey = `history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=${DAY}/connector_id=7/pollutant_code=pm25/manifest.json`;
+    const pollutantIndex = JSON.parse(fake.puts.get(indexKey));
+    assert.equal(pollutantIndex.pollutant_manifest_key, pollutantManifestKey);
+    assert.equal(pollutantIndex.pollutant_manifest_hash, "current-pm25-hash");
+    const latest = JSON.parse(fake.puts.get("history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"));
+    assert.deepEqual(latest.day_summaries.map((entry) => entry.day_utc), ["2026-06-13", DAY]);
+    assert.equal(latest.day_summaries.filter((entry) => entry.day_utc === DAY).length, 1);
+    const verification = await verifyAqilevelDayIndexesForTest({ runtime, dayUtc: DAY, connectorManifests: [connectorManifest], indexBuild });
+    assert.equal(verification.required, true);
+    assert.equal(verification.verified_index_manifest_count, 1);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("Phase B AQI index build failure blocks index readiness", async () => {
+  const pollutantManifestKey = `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/pollutant_code=pm25/manifest.json`;
+  const connectorManifest = {
+    connector_id: 7,
+    pollutant_manifests: [{ pollutant_code: "pm25", manifest_key: pollutantManifestKey }],
+  };
+  const fake = installPhaseBFakeR2({
+    [`history/v2/aqilevels/hourly/data/day_utc=${DAY}/manifest.json`]: {
+      connector_manifests: [{ connector_id: 7, manifest_key: `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/manifest.json` }],
+    },
+    [`history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/manifest.json`]: connectorManifest,
+  });
+  try {
+    await assert.rejects(
+      buildAqilevelDayIndexesForTest({
+        runtime: {
+          phase_b_calculate_aqi_from_observations_enabled: true,
+          r2: {
+            endpoint: "https://r2.example.invalid",
+            bucket: "bucket",
+            access_key_id: "key",
+            secret_access_key: "secret",
+            region: "auto",
+          },
+          aqilevels_prefix: "history/v2/aqilevels/hourly/data",
+          aqilevels_timeseries_index_prefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
+          index_prefix_v2: "history/_index_v2",
+        },
+        dayUtc: DAY,
+        connectorManifests: [connectorManifest],
+      }),
+      /required_pollutant_index_unreadable|not found|404/,
+    );
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("Phase B AQI index gate rejects stale source-manifest identity", async () => {
+  const originalFetch = globalThis.fetch;
+  const objects = new Map();
+  const pollutantManifestKey = `history/v2/aqilevels/hourly/data/day_utc=${DAY}/connector_id=7/pollutant_code=pm25/manifest.json`;
+  const indexKey = `history/_index/aqilevels_hourly_data_timeseries/day_utc=${DAY}/connector_id=7/pollutant_code=pm25/manifest.json`;
+  objects.set(pollutantManifestKey, {
+    manifest_hash: "current-hash",
+    source_row_count: 24,
+    timeseries_row_counts: { "1001": 24 },
+    files: [{ key: "part.parquet", row_count: 24, min_timeseries_id: 1001, max_timeseries_id: 1001 }],
+  });
+  objects.set(indexKey, {
+    history_version: "v2",
+    domain: "aqilevels",
+    grain: "hourly",
+    profile: "data",
+    day_utc: DAY,
+    connector_id: 7,
+    pollutant_code: "pm25",
+    pollutant_manifest_key: pollutantManifestKey,
+    pollutant_manifest_hash: "stale-hash",
+    source_row_count: 24,
+    file_count: 1,
+    indexed_file_count: 1,
+    index_coverage: "complete",
+    timeseries_row_counts: { "1001": 24 },
+  });
+  globalThis.fetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const key = decodeURIComponent(url.pathname).replace(/^\/+[^/]+\//, "");
+    if (!objects.has(key)) return new Response("not found", { status: 404 });
+    return new Response(`${JSON.stringify(objects.get(key))}\n`, { status: 200 });
+  };
+  try {
+    await assert.rejects(
+      verifyAqilevelDayIndexesForTest({
+        runtime: {
+          phase_b_calculate_aqi_from_observations_enabled: true,
+          r2: {
+            endpoint: "https://r2.example.invalid",
+            bucket: "bucket",
+            access_key_id: "key",
+            secret_access_key: "secret",
+            region: "auto",
+          },
+          aqilevels_prefix: "history/v2/aqilevels/hourly/data",
+          aqilevels_timeseries_index_prefix: "history/_index/aqilevels_hourly_data_timeseries",
+        },
+        dayUtc: DAY,
+        connectorManifests: [{
+          connector_id: 7,
+          pollutant_manifests: [{ pollutant_code: "pm25", manifest_key: pollutantManifestKey }],
+        }],
+      }),
+      /current-source identity or coverage mismatch/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Phase B AQI no-supported-source gate remains successful without fake indexes", async () => {
+  assert.deepEqual(await buildAqilevelDayIndexesForTest({
+    runtime: { phase_b_calculate_aqi_from_observations_enabled: true },
+    dayUtc: DAY,
+    connectorManifests: [{ connector_id: 7, pollutant_codes: ["temperature"] }],
+  }), { required: false, reason: "no_supported_aqi_source" });
 });

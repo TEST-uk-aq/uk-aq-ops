@@ -6,6 +6,8 @@ import {
   mergePointsPreferPrimary,
   filterPointsToMissingRows,
   extractParquetKeysFromTimeseriesIndex,
+  resolveObservationsApiUrl,
+  summarizeObservationApiCompleteness,
 } from "../workers/uk_aq_aqi_history_r2_api_worker/worker.mjs";
 
 function row(hour, source = "r2", daqi = 2, eaqi = 3) {
@@ -164,4 +166,61 @@ test("row_limit limits returned points without creating expected-hour coverage g
   assert.equal(preLimitCoverage.complete, true);
   assert.equal(preLimitCoverage.missing_hour_count, 0);
   assert.equal(returnedRows.length, 10);
+});
+
+
+test("live fallback merge returns live-calculated rows when R2 is missing", async () => {
+  const { mergeAqiRowsPreferR2 } = await import("../lib/aqi/aqi_levels.mjs");
+  const live = [row(5, "live_calculated", 4, 4)];
+  const merged = mergeAqiRowsPreferR2({ r2Rows: [], liveRows: live });
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].source, "live_calculated");
+});
+
+test("R2 AQI wins over live rows even when R2 status is insufficient/null", async () => {
+  const { mergeAqiRowsPreferR2 } = await import("../lib/aqi/aqi_levels.mjs");
+  const r2 = [{
+    ...row(8, "r2", null, null),
+    daqi_calculation_status: "insufficient_samples",
+    eaqi_calculation_status: "insufficient_samples",
+    daqi_missing_reason: "not_enough_samples",
+    eaqi_missing_reason: "not_enough_samples",
+  }];
+  const live = [row(8, "live_calculated", 2, 2)];
+  const merged = mergeAqiRowsPreferR2({ r2Rows: r2, liveRows: live });
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].source, "r2");
+  assert.equal(merged[0].daqi_index_level, null);
+  assert.equal(merged[0].daqi_calculation_status, "insufficient_samples");
+});
+
+test("observations API URL resolver uses /v1/observations without duplicating endpoint paths", () => {
+  assert.equal(resolveObservationsApiUrl("https://example.workers.dev").toString(), "https://example.workers.dev/v1/observations");
+  assert.equal(resolveObservationsApiUrl("https://example.workers.dev/v1/observations").toString(), "https://example.workers.dev/v1/observations");
+});
+
+test("observation completeness metadata marks HTTP 200 partial scans incomplete", () => {
+  const partial = summarizeObservationApiCompleteness({
+    response_complete: false,
+    has_gap: true,
+    coverage_state: "partial",
+    partial_reasons: ["missing_manifest"],
+  });
+  assert.equal(partial.response_complete, false);
+  assert.deepEqual(partial.partial_reasons, ["missing_manifest"]);
+  const completeInsufficientSamples = summarizeObservationApiCompleteness({
+    response_complete: true,
+    coverage_state: "complete",
+    rows: [],
+  });
+  assert.equal(completeInsufficientSamples.response_complete, true);
+});
+
+test("PM live fallback context can begin before mutable output boundary while ingest remains bounded", () => {
+  const outputStartMs = Date.parse("2026-07-09T01:00:00.000Z");
+  const retentionStartMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const r2ObservationStartMs = outputStartMs - 23 * 60 * 60 * 1000;
+  const ingestObservationStartMs = Math.max(outputStartMs, retentionStartMs);
+  assert.equal(new Date(r2ObservationStartMs).toISOString(), "2026-07-08T02:00:00.000Z");
+  assert.equal(new Date(ingestObservationStartMs).toISOString(), "2026-07-10T00:00:00.000Z");
 });

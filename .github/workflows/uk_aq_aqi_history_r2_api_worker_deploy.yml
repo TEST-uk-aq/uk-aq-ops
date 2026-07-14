@@ -35,6 +35,8 @@ jobs:
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
       UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED: ${{ vars.UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED || 'true' }}
       UK_AQ_AQI_MUTABLE_HOURS: ${{ vars.UK_AQ_AQI_MUTABLE_HOURS || '120' }}
+      UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED: ${{ vars.UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED || 'false' }}
+      UK_AQ_OBSERVS_HISTORY_R2_API_URL: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,6 +79,10 @@ jobs:
               exit 1
               ;;
           esac
+          if [ "${UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED}" = "true" ] && [ -z "${UK_AQ_OBSERVS_HISTORY_R2_API_URL}" ]; then
+            echo "UK_AQ_OBSERVS_HISTORY_R2_API_URL is required when UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=true."
+            exit 1
+          fi
           echo "Deploy target worker: ${UK_AQ_AQI_HISTORY_R2_API_WORKER_NAME}"
           echo "Cloudflare account id: ${UK_AQ_AQI_HISTORY_R2_API_CLOUDFLARE_ACCOUNT_ID}"
 
@@ -107,6 +113,8 @@ jobs:
               "UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS"],
               "UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED": os.environ["UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED"],
               "UK_AQ_AQI_MUTABLE_HOURS": os.environ["UK_AQ_AQI_MUTABLE_HOURS"],
+              "UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED": os.environ["UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED"],
+              "UK_AQ_OBSERVS_HISTORY_R2_API_URL": os.environ["UK_AQ_OBSERVS_HISTORY_R2_API_URL"],
           }
           for key, value in replacements.items():
               escaped = value.replace("\\", "\\\\").replace('"', '\\"')
