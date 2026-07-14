@@ -42,6 +42,43 @@ test("shared AQI logic returns normalized v1 shape", () => {
   assert.equal(rows[0].eaqi_input_averaging_code, "hourly_mean");
 });
 
+test("shared AQI logic accepts exact frozen observed_at_utc source rows", () => {
+  const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(
+    [{
+      connector_id: 7,
+      station_id: 101,
+      timeseries_id: 1001,
+      pollutant_code: "no2",
+      observed_at_utc: "2025-01-02T01:00:00.000Z",
+      value: 40,
+    }],
+    "2025-01-02",
+  );
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].timestamp_hour_utc, "2025-01-02T01:00:00.000Z");
+  assert.equal(rows[0].daqi_calculation_status, "ok");
+  assert.equal(rows[0].eaqi_calculation_status, "ok");
+});
+
+test("shared AQI PM rolling context accepts observed_at_utc and emits only target day", () => {
+  const start = Date.parse("2025-01-01T01:00:00.000Z");
+  const sourceRows = Array.from({ length: 24 }, (_, index) => ({
+    connector_id: 7,
+    station_id: 101,
+    timeseries_id: 1002,
+    pollutant_code: "pm25",
+    observed_at_utc: new Date(start + index * 60 * 60 * 1000).toISOString(),
+    value: 12,
+  }));
+
+  const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(sourceRows, "2025-01-02");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].timestamp_hour_utc, "2025-01-02T00:00:00.000Z");
+  assert.equal(rows[0].daqi_calculation_status, "ok");
+  assert.ok(rows.every((row) => row.timestamp_hour_utc.startsWith("2025-01-02T")));
+});
+
 test("PM2.5 rolling 24h DAQI uses previous-day context", () => {
   const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(
     hourlyRows({
@@ -86,4 +123,46 @@ test("PM10 rolling DAQI reports insufficient samples when previous context is in
   assert.equal(rows[0].daqi_missing_reason, "insufficient_rolling_24h_hours");
   assert.equal(rows[0].daqi_index_level, null);
   assert.equal(rows[0].eaqi_calculation_status, "ok");
+});
+
+test('shared AQI and observation precedence helpers keep R2 authoritative', async () => {
+  const mod = await import('../lib/aqi/aqi_levels.mjs');
+  const r2Aqi = [{ timeseries_id: 1, pollutant_code: 'pm25', timestamp_hour_utc: '2026-07-14T00:00:00Z', daqi_index_level: null, daqi_calculation_status: 'insufficient_samples' }];
+  const liveAqi = [{ timeseries_id: 1, pollutant_code: 'pm25', timestamp_hour_utc: '2026-07-14T00:00:00Z', daqi_index_level: 2 }];
+  const mergedAqi = mod.mergeAqiRowsPreferR2({ r2Rows: r2Aqi, liveRows: liveAqi });
+  assert.equal(mergedAqi.length, 1);
+  assert.equal(mergedAqi[0].source, 'r2');
+  assert.equal(mergedAqi[0].daqi_index_level, null);
+
+  const r2Obs = [{ timeseries_id: 1, pollutant_code: 'no2', observed_at_utc: '2026-07-14T01:00:00Z', value: 10 }];
+  const ingestObs = [
+    { timeseries_id: 1, pollutant_code: 'no2', observed_at_utc: '2026-07-14T01:00:00Z', value: 99 },
+    { timeseries_id: 1, pollutant_code: 'no2', observed_at_utc: '2026-07-14T02:00:00Z', value: 12 },
+  ];
+  const mergedObs = mod.mergeObservationRowsPreferR2({ r2Rows: r2Obs, ingestRows: ingestObs });
+  assert.equal(mergedObs.discarded_ingest_overlap_count, 1);
+  assert.equal(mergedObs.rows.length, 2);
+  assert.equal(mergedObs.rows.find((row) => row.observed_at_utc.startsWith('2026-07-14T01')).value, 10);
+});
+
+test('missing AQI hour windows are coalesced with PM context', async () => {
+  const mod = await import('../lib/aqi/aqi_levels.mjs');
+  const windows = mod.coalesceAqiMissingHourWindows([
+    '2026-07-14T12:00:00Z',
+    '2026-07-14T13:00:00Z',
+    '2026-07-16T00:00:00Z',
+  ], { contextHours: 23 });
+  assert.equal(windows.length, 2);
+  assert.equal(windows[0].start_utc, '2026-07-13T13:00:00.000Z');
+  assert.equal(windows[0].end_utc, '2026-07-14T14:00:00.000Z');
+});
+
+test('canonical observation identity follows timeseries plus observed_at', async () => {
+  const mod = await import('../lib/aqi/aqi_levels.mjs');
+  const r2Obs = [{ timeseries_id: 1, pollutant_code: 'pm25', observed_at_utc: '2026-07-14T01:00:00Z', value: 10 }];
+  const ingestObs = [{ timeseries_id: 1, pollutant_code: 'pm10', observed_at_utc: '2026-07-14T01:00:00Z', value: 99 }];
+  const merged = mod.mergeObservationRowsPreferR2({ r2Rows: r2Obs, ingestRows: ingestObs });
+  assert.equal(merged.discarded_ingest_overlap_count, 1);
+  assert.equal(merged.rows.length, 1);
+  assert.equal(merged.rows[0].value, 10);
 });
