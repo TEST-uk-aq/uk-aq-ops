@@ -75,6 +75,11 @@ However, path selection is still duplicated or bypassed in several places.
 | GitHub variable registry | `config/uk_aq_github_env_targets.csv` contains the canonical version plus many path variables | Retire normal path-variable targets after compatibility phase |
 | Website/cache proxy | Uses the history APIs and does not need to know the R2 path | Smoke-test only; do not expose storage-version paths to website code |
 | Ingest/schema repos | No confirmed active path selection found in this review | Perform a formal audit; only change if an active R2 history consumer is found |
+| DB size logger | `workers/uk_aq_db_size_logger_cloud_run/run_job.ts` reads specific prefixes | Use the shared profile |
+| DB size metrics API | `workers/uk_aq_db_size_metrics_api_worker/worker.mjs` selects versions and has configurable prefix overrides | Use the shared profile |
+| Dashboard API | `workers/uk_aq_dashboard_online_api_worker/src/lib/direct.ts` parses canonical version and tests `v1` path | Use the shared profile |
+| Latest snapshot | `workers/uk_aq_latest_snapshot_cloud_run/run_job.ts` writes to v2 core | Use the shared profile |
+| Workflow scheduler | `cloudflare/workflow-scheduler/worker.js` parses Canonical version | Use the canonical shared version parsing strategy |
 
 ### 3.2 Immediate safety observation
 
@@ -364,6 +369,8 @@ Until the destructive services are profile-aware:
 - Every active R2 history consumer has an owner and migration phase.
 - Every direct `history/v1` or `history/v2` reference is classified.
 - No destructive service is omitted.
+
+**Status**: Phase 0 Audit Completed. Inventory table committed to `UK_AQ_R2_History_Consumer_Inventory_Phase_0.md`.
 
 ---
 
