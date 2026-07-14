@@ -12,14 +12,8 @@ test('PR6 deployment workflows pass AQI cutover flags with rollback-safe default
 
   const worker = readFileSync('.github/workflows/uk_aq_aqi_history_r2_api_worker_deploy.yml', 'utf8');
   assert.match(worker, /UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED: \$\{\{ vars\.UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED \|\| 'false' \}\}/);
-  assert.match(worker, /UK_AQ_OBSERVS_HISTORY_R2_API_URL: \$\{\{ vars\.UK_AQ_OBSERVS_HISTORY_R2_API_URL \|\| '' \}\}/);
-  assert.match(worker, /UK_AQ_OBSERVS_HISTORY_R2_API_URL is required when UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=true/);
   assert.match(worker, /"UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED": os\.environ\["UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED"\]/);
-  assert.match(worker, /"UK_AQ_OBSERVS_HISTORY_R2_API_URL": os\.environ\["UK_AQ_OBSERVS_HISTORY_R2_API_URL"\]/);
 
   const wrangler = readFileSync('workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml', 'utf8');
   assert.match(wrangler, /UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED = "false"/);
-  assert.match(wrangler, /UK_AQ_OBSERVS_HISTORY_R2_API_URL = ""/);
-  const targets = readFileSync('config/uk_aq_github_env_targets.csv', 'utf8');
-  assert.match(targets, /UK_AQ_OBSERVS_HISTORY_R2_API_URL,variable/);
 });

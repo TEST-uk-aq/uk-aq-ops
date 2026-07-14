@@ -1,106 +1,48 @@
-# R2-first AQI migration report (2026-07-14)
+# R2-first AQI Pass 1 migration report (2026-07-14)
 
-## Completed in PR #6
+## Summary
 
-### Bounded frozen Phase B observation source
+PR #6 completes the Pass 1 architecture for R2-first AQI generation while retaining rollback-safe defaults. Phase B can stage a bounded NDJSON frozen observation source, write permanent v2 AQI data and debug outputs, publish connector/day manifests, and require the AQI timeseries indexes before prune readiness. The live AQI Worker can fill missing recent v2 AQI rows from observations without calling the materialised calculated-AQI fallback when `UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=true`.
 
-- Phase B v2 candidate processing can now use a local NDJSON frozen source for `D-1 <= observed_at < D+1` when `UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED=true`.
-- The source is produced by deterministic cursor reads from the existing Phase B history rows RPC, written sequentially to a temporary local file, and cleaned up after the candidate finishes or fails.
-- Bounds are enforced by row count and staged bytes:
-  - `UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS` default `250000`.
-  - `UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES` default `268435456`.
-- Day-D observation output and day-D AQI calculation consume this same frozen file; the AQI path does not write observations and reread them from R2.
+## Source precedence
 
-### Permanent AQI data/debug output
+- AQI response precedence is: R2 AQI > live-calculated AQI > no row.
+- Observation merge precedence for live calculation is: R2 observations > ingest observations.
+- Existing R2 AQI rows remain authoritative even when DAQI/EAQI values are null or calculation status is `insufficient_samples`.
 
-- Observation-derived AQI uses the shared `lib/aqi/aqi_levels.mjs` implementation.
-- PM2.5 and PM10 receive D-1 plus D context; only day-D AQI rows are written.
-- The existing v2 AQI data/debug Parquet writers and v2 manifest contracts are reused.
-- Connector/day AQI data and debug manifests are written for supported AQI source rows.
-- `no_supported_aqi_source` is a successful explicit connector outcome and does not block the day.
+## Phase B source and gates
 
-### AQI manifests, indexes, and prune gate
+- `UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED=false` and `UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=true` are the rollback-safe defaults.
+- Exactly one Phase B AQI writer must be enabled. Both-disabled and both-enabled configurations fail closed during runtime configuration validation.
+- In observation-derived AQI mode, adoption of an existing observations manifest is skipped with an explicit reason so it cannot bypass AQI output, debug output, manifests, and index verification.
+- A connector/day with no supported PM2.5, PM10 or NO2 source remains a successful `no_supported_aqi_source` state and does not require fake empty Parquet files.
+- Before `history_done=true`, Phase B verifies observation manifests, AQI data/debug manifests, and required AQI timeseries index manifests.
 
-- Day-level AQI data/debug manifests are assembled from connector AQI manifests before the Phase B day gate is marked complete.
-- If AQI calculation, AQI write, manifest creation, or verification fails, candidate completion is not recorded and the existing Phase B failure path blocks pruning.
-- R2 history index rebuild remains the existing post-Phase-B operation in the prune service; it now sees the AQI v2 data/debug manifests written by the candidate path.
+## Live fallback contract
 
-### Live observation fallback
+- Configure `UK_AQ_OBSERVS_HISTORY_R2_API_URL` with the active TEST observations R2 API endpoint before Stage 3 validation. This should be supplied from the existing GitHub repository variable of the same name; this PR only wires the variable and does not create or set it.
+- The URL may be a Worker root (`https://example.workers.dev`) or a full endpoint (`https://example.workers.dev/v1/observations`). The AQI Worker normalizes both to `/v1/observations` without duplicating paths.
+- When live fallback is enabled, missing `UK_AQ_OBSERVS_HISTORY_R2_API_URL` fails closed at deploy/runtime.
+- PM2.5 and PM10 R2 observation reads include 23 hours of rolling context before the oldest eligible AQI output hour; ingest observation reads remain bounded by ingest retention. NO2 does not add the PM context.
+- R2 observation API completeness metadata (`response_complete`, `has_gap`, `coverage_state`, `partial_reasons`, `coverage`) is propagated. Partial upstream observation scans make AQI responses incomplete and uncacheable.
 
-- `UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=false` preserves the legacy materialised AQI fallback.
-- When the flag is true, v2 AQI history responses use `R2 AQI > live calculated AQI > no row`; materialised calculated AQI rows are not queried as a fill source.
-- Live calculation reads raw observations from the configured R2 observations history API and recent ingest observations, merges with `R2 observation > ingest observation`, calculates AQI using the shared library, and merges live rows only under absent R2 AQI keys.
-- Missing PM windows are coalesced with 23 hours of context.
-- Observation-read or calculation failure marks the response incomplete so proxy caching remains safe.
+## Rollout defaults
 
-### Deployment-variable wiring
+```text
+UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED=false
+UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=true
+UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=false
+UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS=250000
+UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES=268435456
+```
 
-- Prune daily Cloud Run workflow now passes:
-  - `UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED`
-  - `UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED`
-  - `UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS`
-  - `UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES`
-- AQI Worker workflow and Wrangler config now pass:
-  - `UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED`
-- Defaults are rollback-safe and no repository variable values are changed by this PR.
+## TEST rollout
 
-## Deliberately retained rollback dependencies
-
-- Legacy Phase B AQI RPC export remains behind `UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=true`.
-- Materialised Supabase AQI fallback remains available while `UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=false`.
-- Existing Supabase AQI tables, views, functions, indexes, and RPCs are retained; this PR does not drop or alter them.
-
-## Remaining materialised Supabase AQI dependencies in active repo code
-
-- `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`: legacy rollback AQI export constants and RPC source config for `uk_aq_rpc_aqilevels_history_day_connector_counts` and `uk_aq_rpc_aqilevels_history_day_rows`.
-- `workers/uk_aq_aqi_history_r2_api_worker/worker.mjs`: temporary legacy materialised AQI fallback/context reads from `uk_aq_public.uk_aq_timeseries_aqi_hourly` when `UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=false`.
-- `workers/uk_aq_backfill_local/run_job.ts`: AQI day count/row RPC defaults for materialised AQI rebuild/export compatibility.
-- `workers/uk_aq_dashboard_online_api_worker/src/lib/station_snapshot_v2.ts`: Station Snapshot AQI consumer still reads `uk_aq_timeseries_aqi_hourly`.
-- `local/dashboard/server/uk_aq_dashboard_api.py`, `local/station_snapshot/server/uk_aq_station_snapshot_local.py`, and `station_snapshot/index.html`: local/manual dashboard and station snapshot code still references materialised AQI sources or labels.
+1. Safe default deploy: keep the defaults above and verify legacy behaviour remains unchanged.
+2. Phase B validation: set `UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED=true` and `UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=false`; run one controlled eligible target day and verify frozen source counts, observations, AQI data/debug Parquet, manifests, indexes, PM prior-day context, `no_supported_aqi_source`, prune gate, and idempotent retry.
+3. Live fallback: set `UK_AQ_OBSERVS_HISTORY_R2_API_URL=<active TEST observations endpoint>` and `UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=true`; test PM2.5, PM10, and NO2; verify R2 precedence, live fill, PM context, R2 observation precedence, ingest fill, partial-scan no-store behaviour, and website bands.
+4. Rollback: set Phase B calculation false, legacy RPC true, and live fallback false. No destructive database rollback is expected.
 
 ## Remaining Pass 2 work
 
-- Station Snapshot migration.
-- Remaining website/API consumer migration where still required.
-- Ingest-dashboard coverage migration.
-- Cross-repository dependency inventory.
-- Guarded Supabase AQI retirement preparation after TEST validation.
-
-## Manual TEST rollout plan
-
-### Stage 1: deploy code with safe defaults
-
-```text
-UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED=false
-UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=true
-UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=false
-```
-
-Verify legacy Phase B AQI export and legacy AQI Worker fallback remain unchanged.
-
-### Stage 2: enable new Phase B only
-
-```text
-UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED=true
-UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=false
-```
-
-Run one controlled eligible day and verify the frozen source, observation output, AQI data, AQI debug, manifests, indexes, PM prior-day context, prune gate, and idempotent retry.
-
-### Stage 3: enable live fallback
-
-```text
-UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=true
-```
-
-Test representative PM2.5, PM10, and NO2 series. Verify R2 AQI wins, recent missing AQI is calculated, R2 observations win overlaps, ingest fills distinct gaps, incomplete responses are not cached, and DAQI/EAQI bands still render.
-
-### Stage 4: rollback
-
-```text
-UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED=false
-UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED=true
-UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=false
-```
-
-No destructive database rollback is required.
+Consumer migration remains out of scope for this PR. Do not begin Pass 2 until Pass 1 TEST validation is complete.

@@ -3803,15 +3803,6 @@ async function maybeAdoptExistingConnectorManifest({
   if (!runtime.adopt_existing_manifest_enabled) {
     return { adopted: false, reason: "adoption_guard_disabled" };
   }
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    logStructured("INFO", "phase_b_history_existing_manifest_adoption_skipped", {
-      run_id: runtime.run_id,
-      day_utc: candidate.day_utc,
-      connector_id: candidate.connector_id,
-      reason: "observation_manifest_cannot_satisfy_aqi_gate",
-    });
-    return { adopted: false, reason: "observation_manifest_cannot_satisfy_aqi_gate" };
-  }
 
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
@@ -4755,48 +4746,12 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc })
   if (!dataHead.exists || !debugHead.exists) {
     throw new Error(`AQI day manifest verification failed for day=${dayUtc}`);
   }
-  const indexVerification = await verifyAqilevelDayIndexes({
-    runtime,
-    dayUtc,
-    connectorManifests: dataConnectorManifests,
-  });
   return {
     required: true,
     data_day_manifest_key: dataDayManifestKey,
     debug_day_manifest_key: debugDayManifestKey,
     connector_manifest_count: dataConnectorManifests.length,
-    index_verification: indexVerification,
   };
-}
-
-async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManifests }) {
-  if (!runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    return { required: false, reason: "legacy_aqi_rpc_export" };
-  }
-  const requiredKeys = new Set();
-  for (const manifest of connectorManifests) {
-    const connectorId = parseManifestPositiveInt(manifest?.connector_id, "connector_id", false);
-    const pollutantCounts = manifest?.pollutant_counts && typeof manifest.pollutant_counts === "object"
-      ? manifest.pollutant_counts
-      : {};
-    for (const pollutant of Object.keys(pollutantCounts).sort()) {
-      if (Number(pollutantCounts[pollutant] || 0) > 0) {
-        requiredKeys.add(`${runtime.aqilevels_timeseries_index_prefix || "history/_index_v2/aqilevels_hourly_data_timeseries"}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutant}/manifest.json`);
-      }
-    }
-  }
-  if (requiredKeys.size === 0) {
-    return { required: false, reason: "no_supported_aqi_source" };
-  }
-  const missing = [];
-  for (const key of requiredKeys) {
-    const head = await r2HeadObject({ r2: runtime.r2, key });
-    if (!head.exists) missing.push(key);
-  }
-  if (missing.length > 0) {
-    throw new Error(`AQI index verification failed for day=${dayUtc}; missing ${missing.length} required index manifest(s): ${missing.slice(0, 5).join(", ")}`);
-  }
-  return { required: true, verified_index_manifest_count: requiredKeys.size };
 }
 
 async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
@@ -5041,19 +4996,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   );
 
   const allowedPollutantCodes = [];
-  const phaseBCalculateAqiFromObservationsEnabled = parseBoolean(
-    env.UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-    DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-  );
-  const phaseBLegacyAqiRpcExportEnabled = parseBoolean(
-    env.UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-    DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-  );
-  if (phaseBCalculateAqiFromObservationsEnabled === phaseBLegacyAqiRpcExportEnabled) {
-    throw new Error(
-      `Invalid Phase B AQI writer configuration: exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED must be true (got calculate=${phaseBCalculateAqiFromObservationsEnabled}, legacy=${phaseBLegacyAqiRpcExportEnabled}).`,
-    );
-  }
 
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
@@ -5098,8 +5040,14 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       10_000,
       2_000_000,
     ),
-    phase_b_calculate_aqi_from_observations_enabled: phaseBCalculateAqiFromObservationsEnabled,
-    phase_b_legacy_aqi_rpc_export_enabled: phaseBLegacyAqiRpcExportEnabled,
+    phase_b_calculate_aqi_from_observations_enabled: parseBoolean(
+      env.UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
+      DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
+    ),
+    phase_b_legacy_aqi_rpc_export_enabled: parseBoolean(
+      env.UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
+      DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
+    ),
     phase_b_observation_snapshot_max_rows: parsePositiveInt(
       env.UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
       DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
@@ -5151,7 +5099,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     committed_prefix_v2: committedPrefixV2,
     aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
     aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
-    aqilevels_timeseries_index_prefix: normalizePrefix(env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX || "history/_index_v2/aqilevels_hourly_data_timeseries"),
     runs_prefix: runsPrefix,
     runs_prefix_v1: writePrefixes.runs_prefix_v1,
     runs_prefix_v2: writePrefixes.runs_prefix_v2,
