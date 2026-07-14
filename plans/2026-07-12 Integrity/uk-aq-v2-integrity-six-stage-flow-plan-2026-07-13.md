@@ -891,7 +891,9 @@ Important: the source adapters must remain read-only/cache-only during the initi
 
 Keep the coordinator stage bodies stubbed or not_run where later phases own the specialist integration. Do not re-enable the old unordered execution path.
 
-Prefer keeping overlay/coordinator Python in uk-aq-history-integrity.py because that file is copied to the local runtime machine.
+Prefer keeping overlay/coordinator Python in uk-aq-history-integrity.py because
+it remains in the selected complete repository checkout; only the dispatcher
+is copied to the local runtime machine.
 
 Use only:
 - python3 -m py_compile;
@@ -1791,29 +1793,18 @@ The online repository remains the source of truth.
 
 Use the existing local copy process to update the runtime machine.
 
-At minimum copy/sync:
+Only the dispatcher is copied to the local runtime machine:
 
 ```text
-scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
 scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
-scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh
 ```
 
-Also copy/sync every changed support file reported by Codex, including any changed:
+Keep the runner, specialist wrapper, Python coordinator and all support files
+in the selected complete repository checkout. Do not copy a partial runtime
+bundle or update a standalone Python file.
 
-```text
-scripts/backup_r2/*.mjs
-workers/shared/*.mjs
-workers/uk_aq_backfill_local/*.ts
-workers/uk_aq_prune_daily/*.mjs
-env templates where used
-```
-
-The runtime must remain a complete ops checkout.
-
-Do not copy only the Python file if the implementation imports or invokes changed support files.
-
-Update the ignored local CIC-Test env with new non-secret overlay/readiness variables while preserving secrets.
+Configure the local `CIC-Test.env` and `LIVE.env` files as one-line
+`UK_AQ_OPS_REPO_ROOT` selectors while preserving the existing local state trees.
 
 This is a Mike task and does not need Codex.
 
@@ -2025,9 +2016,10 @@ Record why the targeted check is necessary.
 
 ```text
 [ ] online repository contains final source
-[ ] updated uk-aq-history-integrity.py is copied to the local runtime machine
-[ ] all changed support files are synced to the complete runtime checkout
-[ ] ignored CIC-Test env is updated without replacing secrets
+[ ] dispatcher is deployed to the local runtime machine
+[ ] one-line CIC-Test and LIVE selectors are configured
+[ ] selected complete repository checkout is up to date
+[ ] existing local state trees are preserved
 ```
 
 ## Real acceptance
@@ -2111,3 +2103,29 @@ Structural validation used shell syntax, help output and temporary stub
 fixtures for selector parsing, missing-selector failure, wrong-repository
 failure, argument preservation, repository path derivation and runner-to-Python
 handoff. No operational command or remote request was run.
+
+## Launcher correction implementation record — 2026-07-14
+
+- Selector templates now document the deployed files as one-line
+  `UK_AQ_OPS_REPO_ROOT` selectors. They no longer describe legacy full
+  profiles or editable backfill paths, and the configured LIVE repository path
+  is unchanged.
+- Specialist-wrapper help now documents repository-root `.env` loading,
+  authoritative `--env`, `UKAQ_ENV_NAME` validation, the root
+  `UK_AQ_BACKFILL_WRAPPER`, selector-file isolation, preserved observation/AQI
+  modes and disabled nested full-index rebuilding.
+- Dispatcher, runner and specialist path guards reject archive path segments,
+  exact `/archive` paths and paths that normalise into an archive location.
+  The specialist explicitly applies this guard to the resolved
+  `UK_AQ_BACKFILL_WRAPPER` before invocation.
+- The runner and specialist validate root `.env` `UKAQ_ENV_NAME` against the
+  authoritative `--env` before runtime directories, locks or real backfill
+  invocation. The command-line value remains the exported `UK_AQ_ENV_NAME`.
+- Active documentation now uses the local dispatcher and
+  `/Users/mikehinford/uk-aq-history-integrity/state/<ENV>/`; only the
+  dispatcher is copied to local runtime. The runner, specialist, Python
+  coordinator and support files remain in the selected complete checkout.
+
+Only `bash -n`, help output, `git diff --check` and temporary harmless
+dispatcher/runner rejection stubs were used. No Integrity, backfill, R2,
+Supabase, deployment or archive operation was run.
