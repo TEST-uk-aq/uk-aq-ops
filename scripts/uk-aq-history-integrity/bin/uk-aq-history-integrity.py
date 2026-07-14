@@ -13875,9 +13875,10 @@ def _run_v2_observation_metadata_executor(
             _truncate_text(proc.stderr or proc.stdout or "", 2000),
         )
         return {
-            "status": "failed",
+            "status": str(output.get("status") or "failed") if isinstance(output, Mapping) else "failed",
             "exit_code": proc.returncode,
             "error": _truncate_text(proc.stderr or proc.stdout or "", 4000),
+            "output": output if isinstance(output, Mapping) else {},
             "results": output.get("results") if isinstance(output, Mapping) else [],
         }
     return {
@@ -14276,6 +14277,27 @@ def _validate_changed_timeseries_metadata(
 ) -> list[dict[str, Any]]:
     """Validate only metadata objects changed by this run, never the full prefix."""
     gaps: list[dict[str, Any]] = []
+    operations_by_key: dict[str, dict[str, Any]] = {}
+    for raw in list(run_state.get("timeseries_metadata_operations") or []):
+        if not isinstance(raw, Mapping):
+            continue
+        key = str(raw.get("metadata_object_key") or "").strip()
+        if not key:
+            gaps.append({"stage": "timeseries_metadata", "gap_type": "metadata_operation_key_missing"})
+            continue
+        operation = operations_by_key.setdefault(key, {
+            "metadata_object_key": key,
+            "replacement_identities": [], "removal_identities": [],
+            "affected_pollutant_index_keys": [],
+        })
+        for field in ("replacement_identities", "removal_identities", "affected_pollutant_index_keys"):
+            operation[field] = sorted(set(operation[field]) | {str(value) for value in list(raw.get(field) or [])})
+        for field in ("timeseries_id", "expected_final_sha256", "preserved_entry_count", "replacement_entry_count", "removal_entry_count"):
+            if raw.get(field) is not None:
+                operation[field] = raw[field]
+    for key, operation in operations_by_key.items():
+        if set(operation["replacement_identities"]) & set(operation["removal_identities"]):
+            gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": "metadata_operation_identity_conflict"})
     for object_key, entry in dict(run_state.get("objects") or {}).items():
         key = _normalise_overlay_object_key(str(object_key))
         match = re.search(r"/timeseries_id=(\d+)\.json$", key)
@@ -14309,6 +14331,8 @@ def _validate_changed_timeseries_metadata(
                 pollutant_code = str(item.get("pollutant_code") or "")
                 prefix = config.observations_timeseries_index_prefix if domain == "observations" else config.aqilevels_timeseries_index_prefix
                 index_path = view_root / prefix / f"day_utc={day_utc}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant_code}" / "manifest.json"
+                if operation and str(index_path.relative_to(view_root).as_posix()) not in set(operation.get("affected_pollutant_index_keys") or []):
+                    continue
                 if not index_path.is_file():
                     raise ValueError("affected_pollutant_index_missing")
                 index_payload = json.loads(index_path.read_text(encoding="utf-8"))
@@ -14324,6 +14348,19 @@ def _validate_changed_timeseries_metadata(
                     raise ValueError("requested_metadata_removal_present")
                 if any(identity not in identities for identity in list(operation.get("replacement_identities") or [])):
                     raise ValueError("requested_metadata_replacement_missing")
+                checked_keys = {
+                    str((view_root / (config.observations_timeseries_index_prefix if str(item.get("domain")) == "observations" else config.aqilevels_timeseries_index_prefix) / f"day_utc={item.get('day_utc')}" / f"connector_id={item.get('connector_id')}" / f"pollutant_code={item.get('pollutant_code')}" / "manifest.json").relative_to(view_root).as_posix())
+                    for item in entries
+                }
+                for index_key in set(operation.get("affected_pollutant_index_keys") or []):
+                    if index_key in checked_keys:
+                        continue
+                    removal_path = view_root / str(index_key)
+                    if not removal_path.is_file():
+                        raise ValueError("affected_metadata_operation_index_missing")
+                    removal_payload = json.loads(removal_path.read_text(encoding="utf-8"))
+                    if int((removal_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0) != 0:
+                        raise ValueError("requested_metadata_removal_still_indexed")
         except Exception as exc:
             gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": f"timeseries_metadata_invalid:{exc}"})
     return gaps
