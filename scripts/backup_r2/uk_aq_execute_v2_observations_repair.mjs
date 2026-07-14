@@ -3,8 +3,12 @@
 // It never rewrites parquet data or invokes either data backfill wrapper.
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
-import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
-import { compressors } from "hyparquet-compressors";
+import {
+  parquetMetadataAsync,
+  parquetRead,
+  parquetSchema,
+  compressors,
+} from "./lib/uk_aq_parquet_dependencies.mjs";
 import {
   hasRequiredR2Config,
   r2GetObject,

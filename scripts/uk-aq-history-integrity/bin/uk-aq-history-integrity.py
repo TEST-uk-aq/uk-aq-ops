@@ -12333,6 +12333,7 @@ def _planned_aqi_rebuild_command(
     day: dt.date,
     history_version: str = "v1",
     env_name: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
@@ -12362,6 +12363,11 @@ def _planned_aqi_rebuild_command(
         if connector_id is not None and int(connector_id) > 0:
             cli_parts.extend(["--connector-id", str(int(connector_id))])
         wrapper_command = " ".join(cli_parts)
+    extra_assignments = " ".join(
+        f"{key}={shlex.quote(str(value))}"
+        for key, value in sorted((extra_env or {}).items())
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key))
+    )
     return (
         f"UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels "
         f"UK_AQ_BACKFILL_DRY_RUN=false "
@@ -12373,6 +12379,7 @@ def _planned_aqi_rebuild_command(
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_ENV_FILE={env_file} "
+        f"{extra_assignments} "
         f"{wrapper_command}"
     )
 
@@ -12886,23 +12893,99 @@ def run_v2_gap_backfills(
     gaps = list(v2_observations.get("gaps") or [])
     if not gaps:
         return metrics
-    by_key_sets: dict[tuple[str, int], set[int]] = {}
-    gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
-    index_only_keys: set[tuple[str, int]] = set()
-    for gap in gaps:
+    metadata_gap_kinds = {
+        "observation_pollutant_manifest_repair",
+        "observation_connector_manifest_repair",
+        "observation_day_manifest_repair",
+        "observation_index_repair",
+        "rebuild_v2_observations_index_only",
+    }
+    explicit_data_suggestion_kinds = {
+        "source_to_v2_observations_backfill",
+        "source_to_v2_observations_backfill_required",
+        "uk_air_csv_to_v2_observations_backfill_required",
+        "source_to_v2_observations_backfill_planned",
+    }
+
+    def gap_partition(gap: Mapping[str, Any]) -> tuple[str, int, str | None] | None:
         day_iso = str(gap.get("day_utc") or "").strip()
         try:
             connector_id = int(gap.get("connector_id"))
         except (TypeError, ValueError):
-            continue
+            return None
         if not day_iso or connector_id <= 0:
+            return None
+        pollutant = str(gap.get("pollutant_code") or "").strip().lower() or None
+        return day_iso, connector_id, pollutant
+
+    repair_plan_present = "repair_plan" in v2_observations
+    explicit_data_keys: set[tuple[str, int, str | None]] = set()
+    for action in list(v2_observations.get("repair_plan") or []):
+        if not isinstance(action, Mapping) or str(action.get("kind") or "") != "observation_data_repair":
             continue
+        action_day = str(action.get("day_utc") or "").strip()
+        try:
+            action_connector = int(action.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        if not action_day or action_connector <= 0:
+            continue
+        action_pollutant = str(action.get("pollutant_code") or "").strip().lower() or None
+        explicit_data_keys.add((action_day, action_connector, action_pollutant))
+
+    def is_explicit_data_repair(gap: Mapping[str, Any]) -> bool:
+        gap_key = gap_partition(gap)
+        if gap_key is None:
+            return False
+        if any(
+            key[:2] == gap_key[:2]
+            and (key[2] is None or gap_key[2] is None or key[2] == gap_key[2])
+            for key in explicit_data_keys
+        ):
+            return True
+        suggested = gap.get("suggested_repair")
+        suggested_kind = str(suggested.get("kind") or "") if isinstance(suggested, Mapping) else ""
+        if not repair_plan_present and suggested_kind in explicit_data_suggestion_kinds:
+            return True
+        # Direct low-level callers historically supplied unclassified data
+        # gaps. Keep that compatibility only for gap types that cannot be
+        # metadata/index findings; coordinator output is always typed with a
+        # repair_plan and therefore cannot use this fallback.
+        gap_type = str(gap.get("gap_type") or "").strip()
+        metadata_gap = (
+            gap_type.startswith(("data_manifest_", "connector_manifest_", "day_manifest_", "index_", "latest_index_"))
+            or gap_type in {"orphan_parquet_without_manifest"}
+        )
+        return not repair_plan_present and not metadata_gap
+
+    by_key_sets: dict[tuple[str, int], set[int]] = {}
+    gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    index_only_keys: set[tuple[str, int]] = set()
+    skipped_metadata_gaps: list[dict[str, Any]] = []
+    for gap in gaps:
+        partition = gap_partition(gap)
+        if partition is None:
+            continue
+        day_iso, connector_id, pollutant_code = partition
         if (
             str(gap.get("gap_type") or "").startswith("index_")
             or str((gap.get("suggested_repair") or {}).get("kind") or "")
             == "rebuild_v2_observations_index_only"
         ):
             index_only_keys.add((day_iso, connector_id))
+            continue
+        if not is_explicit_data_repair(gap):
+            suggested = gap.get("suggested_repair")
+            suggested_kind = str(suggested.get("kind") or "") if isinstance(suggested, Mapping) else ""
+            if suggested_kind in metadata_gap_kinds or gap.get("gap_type"):
+                skipped_metadata_gaps.append({
+                    "day_utc": day_iso,
+                    "connector_id": connector_id,
+                    "pollutant_code": pollutant_code,
+                    "gap_type": gap.get("gap_type"),
+                    "suggested_repair_kind": suggested_kind or None,
+                    "reason": "not_explicit_observation_data_repair",
+                })
             continue
         ts_ids = _timeseries_ids_for_v2_observation_gap(
             conn,
@@ -12918,6 +13001,7 @@ def run_v2_gap_backfills(
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
+    metrics["skipped_v2_observation_metadata_gaps"] = skipped_metadata_gaps
     backfill_log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     queued: set[tuple[str, int]] = set()
     for day_iso, connector_id in standalone_index_keys:
@@ -13896,8 +13980,51 @@ def record_blocked_scope(run_state: dict[str, Any], scope: Mapping[str, Any]) ->
     write_run_state(run_state)
 
 
+def _dedupe_v2_repair_actions(actions: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Merge repeated raw-gap actions into one semantic scope attempt."""
+    merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for raw_action in actions:
+        if not isinstance(raw_action, Mapping):
+            continue
+        action = dict(raw_action)
+        key = (
+            str(action.get("kind") or ""),
+            str(action.get("day_utc") or "").strip(),
+            str(action.get("connector_id") or "").strip(),
+            str(action.get("pollutant_code") or "").strip().lower(),
+        )
+        if key not in merged:
+            merged[key] = action
+            continue
+        current = merged[key]
+        current["requires_index_rebuild"] = bool(
+            current.get("requires_index_rebuild") or action.get("requires_index_rebuild")
+        )
+        current["data_changes_required"] = bool(
+            current.get("data_changes_required") or action.get("data_changes_required")
+        )
+        current["operator_action_required"] = bool(
+            current.get("operator_action_required") or action.get("operator_action_required")
+        )
+        gap_types = sorted({
+            str(value)
+            for value in [*(current.get("gap_types") or []), *(action.get("gap_types") or [])]
+            if str(value)
+        })
+        if gap_types:
+            current["gap_types"] = gap_types
+        notes = sorted({
+            str(value)
+            for value in [current.get("notes"), action.get("notes")]
+            if str(value or "")
+        })
+        if notes:
+            current["notes"] = "; ".join(notes)
+    return [merged[key] for key in sorted(merged)]
+
+
 def _v2_observation_metadata_actions(v2_observations: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return only metadata/index actions handled after the observations stage."""
+    """Return one metadata/index action per affected v2 observation scope."""
     supported = {
         "observation_pollutant_manifest_repair",
         "observation_connector_manifest_repair",
@@ -13910,7 +14037,7 @@ def _v2_observation_metadata_actions(v2_observations: Mapping[str, Any]) -> list
         if not isinstance(action, Mapping) or str(action.get("kind") or "") not in supported:
             continue
         actions.append(dict(action))
-    return actions
+    return _dedupe_v2_repair_actions(actions)
 
 
 def _v2_aqi_metadata_actions(v2_aqilevels: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -13922,11 +14049,11 @@ def _v2_aqi_metadata_actions(v2_aqilevels: Mapping[str, Any]) -> list[dict[str, 
         "aqi_index_repair",
         "rebuild_v2_aqi_index_only",
     }
-    return [
+    return _dedupe_v2_repair_actions([
         dict(action)
         for action in list(v2_aqilevels.get("repair_plan") or [])
         if isinstance(action, Mapping) and str(action.get("kind") or "") in supported
-    ]
+    ])
 
 
 def _run_v2_observation_metadata_executor(
@@ -15012,10 +15139,7 @@ def run_v2_integrity_repair_flow(
             {**base, "kind": "observation_day_manifest_repair"},
             {**base, "kind": "observation_index_repair"},
         ])
-    deduped_metadata_actions: dict[str, dict[str, Any]] = {}
-    for action in metadata_actions:
-        deduped_metadata_actions[json.dumps(action, sort_keys=True, default=str)] = action
-    metadata_actions = list(deduped_metadata_actions.values())
+    metadata_actions = _dedupe_v2_repair_actions(metadata_actions)
     metadata = (
         {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
         if observation_failed else

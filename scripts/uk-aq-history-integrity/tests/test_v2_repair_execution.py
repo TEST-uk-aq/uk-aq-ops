@@ -668,6 +668,86 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(len(metrics["planned_v2_observation_index_rebuilds"]), 1)
         self.assertIn("--kind observations", metrics["planned_v2_observation_index_rebuilds"][0])
 
+    def test_manifest_and_parent_repairs_never_plan_source_writer(self) -> None:
+        gaps = [
+            {"day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": code,
+             "gap_type": "data_manifest_schema_mismatch",
+             "suggested_repair": {"kind": "source_to_v2_observations_backfill_planned"}}
+            for code in ("no2", "pm10", "pm25")
+        ]
+        gaps.extend([
+            {"day_utc": "2026-05-17", "connector_id": 1, "gap_type": "connector_manifest_row_count_mismatch"},
+            {"day_utc": "2026-05-17", "gap_type": "day_manifest_invalid_json"},
+            {"day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3", "gap_type": "index_manifest_missing"},
+        ])
+        plan = [
+            {"kind": "observation_pollutant_manifest_repair", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": code}
+            for code in ("no2", "pm10", "pm25")
+        ] + [
+            {"kind": "observation_connector_manifest_repair", "day_utc": "2026-05-17", "connector_id": 1},
+            {"kind": "observation_day_manifest_repair", "day_utc": "2026-05-17"},
+            {"kind": "observation_index_repair", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3"},
+        ]
+        metrics = MODULE.run_v2_gap_backfills(
+            conn=self.conn, run_id=90, env_name="CIC-Test", run_compact="run", env=self.env,
+            v2_observations={"gaps": gaps, "repair_plan": plan}, dry_run=True, run_backfill=True,
+            limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0), log=self.log,
+        )
+        self.assertEqual(metrics["planned_v2_observation_repairs"], [])
+        self.assertEqual(metrics["planned_aqi_rebuilds"], [])
+        self.assertEqual(len(metrics["planned_v2_observation_index_rebuilds"]), 1)
+
+    def test_explicit_observation_data_repair_is_the_only_writer_eligibility(self) -> None:
+        gap = {"day_utc": "2026-06-08", "connector_id": 6, "gap_type": "source_r2_timeseries_row_mismatch", "missing_timeseries_ids": [101]}
+        metrics = MODULE.run_v2_gap_backfills(
+            conn=self.conn, run_id=91, env_name="CIC-Test", run_compact="run", env=self.env,
+            v2_observations={"gaps": [gap], "repair_plan": [{
+                "kind": "observation_data_repair", "day_utc": "2026-06-08", "connector_id": 6,
+                "pollutant_code": "pm25", "data_changes_required": True,
+            }]}, dry_run=True, run_backfill=True,
+            limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0), log=self.log,
+        )
+        self.assertEqual(len(metrics["planned_v2_observation_repairs"]), 1)
+        self.assertIn("UK_AQ_BACKFILL_TIMESERIES_IDS=101", metrics["planned_v2_observation_repairs"][0])
+        self.assertEqual(len(metrics["planned_aqi_rebuilds"]), 1)
+
+    def test_duplicate_raw_data_gaps_produce_one_writer_plan(self) -> None:
+        gap = {"day_utc": "2026-06-08", "connector_id": 6, "gap_type": "source_r2_timeseries_row_mismatch", "missing_timeseries_ids": [101]}
+        metrics = MODULE.run_v2_gap_backfills(
+            conn=self.conn, run_id=92, env_name="CIC-Test", run_compact="run", env=self.env,
+            v2_observations={"gaps": [dict(gap), dict(gap)], "repair_plan": [{
+                "kind": "observation_data_repair", "day_utc": "2026-06-08", "connector_id": 6,
+                "pollutant_code": "pm25",
+            }]}, dry_run=True, run_backfill=True,
+            limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0), log=self.log,
+        )
+        self.assertEqual(len(metrics["planned_v2_observation_repairs"]), 1)
+        self.assertEqual(len(metrics["planned_v2_observation_index_rebuilds"]), 1)
+        self.assertEqual(len(metrics["planned_aqi_rebuilds"]), 1)
+
+    def test_metadata_executor_uses_repository_root_not_current_directory(self) -> None:
+        with mock.patch.object(MODULE.subprocess, "run", return_value=mock.Mock(
+            returncode=0, stdout=json.dumps({"status": "planned", "results": []}), stderr=""
+        )) as run_process:
+            result = MODULE._run_v2_observation_metadata_executor(
+                env={"UK_AQ_OPS_REPO_ROOT": str(MODULE_PATH.parents[3])},
+                actions=[{"kind": "observation_index_repair", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "o3"}],
+                dry_run=True,
+                log=self.log,
+                run_state={"overlay_root": str(self.root / "overlay"), "base_dropbox_root": str(self.root / "r2"), "run_state_path": str(self.root / "run-state.json")},
+            )
+        self.assertEqual(result["status"], "planned")
+        self.assertEqual(run_process.call_args.kwargs["cwd"], MODULE_PATH.parents[3])
+        self.assertIn("uk_aq_execute_v2_observations_repair.mjs", run_process.call_args.args[0][1])
+
+    def test_duplicate_metadata_actions_merge_by_scope(self) -> None:
+        actions = MODULE._v2_observation_metadata_actions({"repair_plan": [
+            {"kind": "observation_pollutant_manifest_repair", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "no2", "gap_types": ["data_manifest_schema_mismatch"]},
+            {"kind": "observation_pollutant_manifest_repair", "day_utc": "2026-05-17", "connector_id": 1, "pollutant_code": "no2", "gap_types": ["data_manifest_total_bytes_mismatch"]},
+        ]})
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["gap_types"], ["data_manifest_schema_mismatch", "data_manifest_total_bytes_mismatch"])
+
     def test_data_repair_coalesces_same_day_index_only_gap(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
