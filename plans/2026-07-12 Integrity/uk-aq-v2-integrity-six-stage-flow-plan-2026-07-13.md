@@ -1023,6 +1023,45 @@ Structural checks passed: `py_compile`, `bash -n`, `node --check`, `deno check`
 and `git diff --check`. No Integrity run, R2 request, deployment, commit, stage
 or push was performed.
 
+### Follow-up correction record — 2026-07-14
+
+Analysis of the remaining six-stage issues:
+
+- Issue 1, tombstones: **confirmed**. Targeted force-replace deletes were not
+  represented in the combined local view. The writer now records successful,
+  HEAD-confirmed deletes in targeted-stage metadata. Integrity imports them as
+  verified tombstones, which hide stale Dropbox keys in Python, Node and final
+  verification views without changing the backup.
+- Issue 2, parquet-derived leaves: **confirmed**. The metadata executor reused
+  manifest metadata. It now reads final local parquet parts with the existing
+  `hyparquet` stack and derives row counts, hashes, bytes, time ranges and
+  timeseries counts before rebuilding observation or AQI pollutant manifests.
+- Issue 3, dependency propagation: **confirmed**. A blocked pollutant could
+  leave parent proposals active. The affected connector, day and day index are
+  now blocked, reported in the executor result and persisted to run state.
+- Issue 4, full backup scans: **confirmed**. Node planning now scans only the
+  requested day and index prefixes. Final verification links only the selected
+  date range, indexes and latest index objects.
+- Issue 5, stopped limits: **confirmed**. `stopped_limit` now survives a
+  successful partial coordinator and returns non-zero.
+- Issue 6, report state: **confirmed**. Completed repair reports retain
+  `pre_repair` evidence but make the principal v2 status and displayed checks
+  reflect final verification. Dry-runs remain explicitly planned only.
+- Issue 7, task health: **confirmed**. `fail` and `stopped_limit` now use the
+  daily-task failure RPC with the complete final summary.
+- Issue 8, final scope: **partially confirmed**. The validators already checked
+  standalone manifests, indexes, source cache and required debug. The scoped
+  view now preserves those checks while adding tombstone exclusion and verified
+  overlay precedence. No second repair loop was introduced.
+- SQL compatibility: **not a confirmed schema issue**. The already-applied
+  readiness RPC `running_backup_run` shape matches Python validation; failed,
+  non-dry-run repair attempts remain freshness writers. No SQL change is needed.
+
+Files changed for this correction are the Integrity Python coordinator, v2
+metadata executor, local writer, current documentation and this plan. Structural
+checks passed: `py_compile`, `bash -n`, `node --check`, `deno check` and
+`git diff --check` in both repositories. No operational command was run.
+
 ## Recommended model
 
 ```text

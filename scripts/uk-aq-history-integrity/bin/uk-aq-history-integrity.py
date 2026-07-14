@@ -13641,6 +13641,7 @@ def create_run_overlay(
         "overlay_root": str(overlay_root),
         "run_state_path": str(run_root / "run-state.json"),
         "objects": {},
+        "tombstones": {},
         "changed_scopes": {scope_set: [] for scope_set in OVERLAY_CHANGED_SCOPE_SETS},
         "blocked_scopes": [],
         "coordinator": None,
@@ -13654,6 +13655,9 @@ def resolve_combined_local_path(
     object_key: str,
 ) -> Path | None:
     normalized_key = _normalise_overlay_object_key(object_key)
+    tombstone = (run_state.get("tombstones") or {}).get(normalized_key)
+    if isinstance(tombstone, Mapping) and tombstone.get("r2_delete_verified"):
+        return None
     objects = run_state.get("objects")
     entry = objects.get(normalized_key) if isinstance(objects, dict) else None
     if isinstance(entry, Mapping) and bool(entry.get("r2_verified")):
@@ -13663,6 +13667,34 @@ def resolve_combined_local_path(
 
     backup_path = Path(str(run_state["base_dropbox_root"])) / normalized_key
     return backup_path if backup_path.is_file() else None
+
+
+def load_verified_writer_tombstones(run_state: dict[str, Any]) -> list[str]:
+    """Import writer-confirmed deletes without touching the Dropbox backup."""
+    path = Path(str(run_state["overlay_root"])) / "deleted-object-keys.json"
+    if not path.is_file():
+        return []
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, list) or any(not isinstance(key, str) for key in parsed):
+        raise ValueError("writer tombstone metadata has unexpected shape")
+    tombstones = run_state.setdefault("tombstones", {})
+    recorded: list[str] = []
+    for raw_key in parsed:
+        key = _normalise_overlay_object_key(raw_key)
+        if (Path(str(run_state["overlay_root"])) / "generated-objects" / key).is_file():
+            # Force-replace deletes old keys before re-uploading replacement
+            # bodies at some of the same keys. Only absent final keys are
+            # tombstones.
+            continue
+        tombstones[key] = {
+            "object_key": key,
+            "deleted": True,
+            "r2_delete_verified": True,
+            "r2_delete_verified_at_utc": fmt_iso(utc_now()),
+        }
+        recorded.append(key)
+    write_run_state(run_state)
+    return sorted(set(recorded))
 
 
 def stage_overlay_object(
@@ -13870,6 +13902,9 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning")
     if not isinstance(planning, Mapping):
         return
+    for blocked in list(planning.get("blocked_scopes") or []):
+        if isinstance(blocked, Mapping):
+            record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
     operation_status: dict[str, str] = {}
     for result in list(output.get("results") or []):
         if not isinstance(result, Mapping):
@@ -14145,7 +14180,9 @@ def _queue_phase4_aqi_work(
     return planned
 
 
-def _create_final_verification_view(run_state: Mapping[str, Any]) -> Path:
+def _create_final_verification_view(
+    run_state: Mapping[str, Any], *, config: HistoryPathConfig, from_day: str, to_day: str,
+) -> Path:
     """Create a disposable overlay-first filesystem view without copying data."""
     run_root = Path(str(run_state["run_root"]))
     base_root = Path(str(run_state["base_dropbox_root"]))
@@ -14153,18 +14190,45 @@ def _create_final_verification_view(run_state: Mapping[str, Any]) -> Path:
     if view_root.exists() or view_root.is_symlink():
         shutil.rmtree(view_root, ignore_errors=True)
     view_root.mkdir(parents=True, exist_ok=False)
+    tombstones = {
+        _normalise_overlay_object_key(str(key))
+        for key, value in dict(run_state.get("tombstones") or {}).items()
+        if isinstance(value, Mapping) and value.get("r2_delete_verified")
+    }
 
     # The verification checks need directory discovery and parquet paths. Use
     # symlinks, never copied Dropbox objects, and avoid retired archive trees.
-    for directory, dirnames, filenames in os.walk(base_root):
-        dirnames[:] = [name for name in dirnames if name != "archive"]
-        relative_dir = Path(directory).relative_to(base_root)
-        target_dir = view_root / relative_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for filename in filenames:
-            source = Path(directory) / filename
-            target = target_dir / filename
-            target.symlink_to(source)
+    days = [day.isoformat() for day in _date_range_inclusive(from_day, to_day)]
+    prefixes = [
+        *(f"{prefix.strip('/')}/day_utc={day}" for day in days for prefix in (
+            config.observations_data_prefix,
+            config.aqilevels_hourly_data_prefix,
+            config.observations_timeseries_index_prefix,
+            config.aqilevels_timeseries_index_prefix,
+        )),
+        *([f"{config.aqilevels_hourly_debug_prefix.strip('/')}/day_utc={day}" for day in days]
+          if config.aqilevels_hourly_debug_prefix else []),
+    ]
+    file_keys = [config.observations_latest_index_key.strip("/"), config.aqilevels_latest_index_key.strip("/")]
+    def link_file(source: Path, relative_key: str) -> None:
+        if relative_key in tombstones:
+            return
+        target = view_root / relative_key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source)
+    for prefix in prefixes:
+        scoped_root = base_root / prefix
+        if not scoped_root.is_dir():
+            continue
+        for directory, dirnames, filenames in os.walk(scoped_root):
+            dirnames[:] = [name for name in dirnames if name != "archive"]
+            relative_dir = Path(directory).relative_to(base_root)
+            for filename in filenames:
+                link_file(Path(directory) / filename, str((relative_dir / filename).as_posix()))
+    for key in file_keys:
+        source = base_root / key
+        if source.is_file():
+            link_file(source, key)
 
     for object_key, entry in dict(run_state.get("objects") or {}).items():
         if not isinstance(entry, Mapping) or not entry.get("r2_verified"):
@@ -14204,7 +14268,7 @@ def run_v2_final_verification(
     log: logging.Logger,
 ) -> dict[str, Any]:
     """One read-only final pass over source cache and final local objects."""
-    view_root = _create_final_verification_view(run_state)
+    view_root = _create_final_verification_view(run_state, config=config, from_day=from_day, to_day=to_day)
     recheck = run_v2_post_repair_integrity_rechecks(
         conn=conn,
         env_name=env_name,
@@ -14257,6 +14321,13 @@ def run_v2_final_verification(
     for blocked in list(run_state.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             remaining_scopes.append({"stage": "blocked_scope", **dict(blocked)})
+    for object_key, tombstone in dict(run_state.get("tombstones") or {}).items():
+        if not isinstance(tombstone, Mapping) or not tombstone.get("r2_delete_verified"):
+            remaining_scopes.append({
+                "stage": "r2_delete_verification",
+                "object_key": object_key,
+                "gap_type": "deleted_object_missing_r2_delete_verification",
+            })
     stage_counts = {
         stage: sum(1 for scope in remaining_scopes if scope.get("stage") == stage)
         for stage in V2_REPAIR_STAGE_ORDER[:-1]
@@ -14322,6 +14393,8 @@ def run_v2_integrity_repair_flow(
         # historical observation specialist must not enqueue a duplicate.
         queue_aqi_from_observation_repairs=False,
     )
+    if not dry_run:
+        load_verified_writer_tombstones(run_state)
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
     # A repaired leaf always makes its pollutant/connector/day metadata and
@@ -14415,6 +14488,9 @@ def run_v2_integrity_repair_flow(
             },
         )
         aqi_result["planned_phase4_aqi_work"] = planned_aqi_work
+
+    if not dry_run:
+        load_verified_writer_tombstones(run_state)
 
     rebuilt_aqi_scopes: set[tuple[str, int]] = set()
     aqi_capture_failures = 0
@@ -17048,6 +17124,8 @@ def main(argv: list[str]) -> int:
         if args.run_backfill:
             if coordinator_failed:
                 status = "fail"
+            elif any_stopped:
+                status = "stopped_limit"
             elif not args.dry_run:
                 status = "ok"
         elif v2_gap_count_for_status > 0:
@@ -17415,13 +17493,30 @@ def main(argv: list[str]) -> int:
             "gaps": [],
             "debug": {"checked": False, "required": False, "status": "skipped", "gap_count": 0, "gaps": []},
         }
+        v2_result: dict[str, Any] = {
+            "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
+            "checks_implemented": True,
+            "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
+            "observations": v2_obs,
+            "aqilevels": v2_aqi,
+        }
+        final_result = repair_flow.get("final_verification") or {}
+        if args.run_backfill and not args.dry_run and final_result.get("ran"):
+            recheck = final_result.get("recheck") or {}
+            v2_result.update({
+                "status": "ok" if final_result.get("status") == "ok" else "fail",
+                "final_verified": final_result.get("status") == "ok",
+                "pre_repair": {"observations": v2_obs, "aqilevels": v2_aqi},
+                "final_verification": final_result,
+                "observations": recheck.get("observations") or v2_obs,
+                "aqilevels": recheck.get("aqilevels") or v2_aqi,
+            })
+        elif args.run_backfill and args.dry_run:
+            v2_result["final_verified"] = False
+            v2_result["final_verification"] = {"status": "planned", "reason": "dry_run"}
         history_version_results: dict[str, Any] = {
             CURRENT_INTEGRITY_HISTORY_VERSION: {
-                "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
-                "checks_implemented": True,
-                "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
-                "observations": v2_obs,
-                "aqilevels": v2_aqi,
+                **v2_result,
             },
         }
 
@@ -17532,20 +17627,36 @@ def main(argv: list[str]) -> int:
                 "log_path": str(log_path),
             }
             try:
-                _daily_task_health_finish(
-                    daily_task_health_config,
-                    run_id=daily_task_health_run_id,
-                    scheduled_for_date=daily_task_scheduled_for_date,
-                    finished_at_utc=finished_iso,
-                    summary=finish_summary,
-                    platform_run_id=daily_task_platform_run_id,
-                    log_url=str(log_path),
-                )
+                if status in {"fail", "stopped_limit"}:
+                    _daily_task_health_fail(
+                        daily_task_health_config,
+                        run_id=daily_task_health_run_id,
+                        scheduled_for_date=daily_task_scheduled_for_date,
+                        failed_at_utc=finished_iso,
+                        summary=finish_summary,
+                        error_message=(
+                            "Integrity final verification failed"
+                            if status == "fail" else f"Integrity stopped: {any_stopped}"
+                        ),
+                        error_payload={"status": status, "repair_flow": repair_flow},
+                        platform_run_id=daily_task_platform_run_id,
+                        log_url=str(log_path),
+                    )
+                else:
+                    _daily_task_health_finish(
+                        daily_task_health_config,
+                        run_id=daily_task_health_run_id,
+                        scheduled_for_date=daily_task_scheduled_for_date,
+                        finished_at_utc=finished_iso,
+                        summary=finish_summary,
+                        platform_run_id=daily_task_platform_run_id,
+                        log_url=str(log_path),
+                    )
             except Exception as exc:
                 log.warning("daily task health finish failed: %s", exc)
                 if daily_task_health_strict:
                     raise
-        return 1 if status == "fail" else 0
+        return 1 if status in {"fail", "stopped_limit"} else 0
     except Exception as exc:
         log.exception("run failed: %s", exc)
         if run_id is not None:
