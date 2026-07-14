@@ -115,15 +115,16 @@ function walkLocalObjects(root, prefixes = []) {
 
 function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [], dynamicExactKeyPrefixes = [] }) {
   const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
+  const verifiedTombstones = new Set(Object.entries(state?.tombstones || {})
+    .filter(([, value]) => value?.r2_delete_verified === true)
+    .map(([key]) => safeLocalKey(key)));
   const paths = walkLocalObjects(dropboxRoot, prefixes);
   for (const rawKey of exactKeys) {
     const key = safeLocalKey(rawKey);
     const candidate = `${dropboxRoot}/${key}`;
     if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) paths.set(key, candidate);
   }
-  for (const [key, tombstone] of Object.entries(state?.tombstones || {})) {
-    if (tombstone?.r2_delete_verified === true) paths.delete(safeLocalKey(key));
-  }
+  for (const key of verifiedTombstones) paths.delete(key);
   for (const [key, entry] of Object.entries(state?.objects || {})) {
     if (entry?.r2_verified === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
       paths.set(safeLocalKey(key), entry.local_path);
@@ -133,18 +134,27 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
     overlayRoot,
     getObject(key) {
       const normalized = safeLocalKey(key);
+      if (verifiedTombstones.has(normalized)) {
+        const error = new Error(`Combined local object unavailable: ${normalized}`);
+        error.code = "OBJECT_NOT_FOUND";
+        throw error;
+      }
       let localPath = paths.get(normalized);
       if (!localPath && dynamicExactKeyPrefixes.some((prefix) => normalized.startsWith(`${safeLocalKey(prefix)}/`))) {
         const candidate = `${dropboxRoot}/${normalized}`;
         if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) localPath = candidate;
       }
-      if (!localPath) throw new Error(`Blocked dependency: combined local object is unavailable: ${normalized}`);
+      if (!localPath) {
+        const error = new Error(`Combined local object unavailable: ${normalized}`);
+        error.code = "OBJECT_NOT_FOUND";
+        throw error;
+      }
       const body = fs.readFileSync(localPath);
       return objectFromBody({ key: normalized, body, etag: sha256Hex(body) });
     },
     getObjectIfExists(key) {
       try { return this.getObject(key); } catch (error) {
-        if (String(error).includes("combined local object is unavailable")) return null;
+        if (error?.code === "OBJECT_NOT_FOUND") return null;
         throw error;
       }
     },
@@ -239,6 +249,11 @@ async function assertCompleteChildrenUnchanged({ r2, guard }) {
 
 function createStagedObjectMap({ r2, store }) {
   const proposals = new Map();
+  const indexProposalKind = (key) => key.includes("/timeseries_id=")
+    ? "timeseries_metadata"
+    : key.endsWith("_latest.json")
+      ? "latest_timeseries_index"
+      : "pollutant_timeseries_index";
 
   async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], preWriteGuard = null }) {
     const bodyText = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
@@ -273,7 +288,7 @@ function createStagedObjectMap({ r2, store }) {
   const stagedR2 = {
     ...r2,
     proposal_sink: async ({ key, body, content_type }) => {
-      await stage({ key, body, contentType: content_type, kind: "observation_index" });
+      await stage({ key, body, contentType: content_type, kind: indexProposalKind(key) });
     },
     adapter: {
       getObject: async ({ key }) => stagedObject(key) || store.getObject(key),
@@ -304,7 +319,7 @@ function createStagedObjectMap({ r2, store }) {
         return [...prefixes].sort();
       },
       putObject: async ({ key, body, content_type }) => {
-        const proposal = await stage({ key, body, contentType: content_type, kind: "observation_index" });
+        const proposal = await stage({ key, body, contentType: content_type, kind: indexProposalKind(key) });
         return { key, bytes: proposal.bytes, etag: proposal.new_sha256 };
       },
     },
@@ -752,6 +767,7 @@ export async function runV2ObservationsRepair({
           generatedAt: stableGeneratedAt({ dayUtc, dayManifest }),
           strictMissingTimeseriesCounts: true,
           timeseriesMetadataMode: "targeted",
+          proposalOnly: !args.writeR2,
           writeR2: true,
         });
       } catch (error) {
@@ -767,6 +783,16 @@ export async function runV2ObservationsRepair({
         dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
         continue;
       }
+      if (index?.timeseries_metadata?.status === "blocked_dependency") {
+        for (const key of [...staged.proposals.keys()]) {
+          if (!before.has(key)) staged.proposals.delete(key);
+        }
+        for (const blocked of index.timeseries_metadata.blocked_scopes || []) {
+          blockedScopes.push({ day_utc: dayUtc, ...blocked });
+        }
+        dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index });
+        continue;
+      }
       for (const key of staged.proposals.keys()) {
         if (!before.has(key)) proposalKeys.push(key);
       }
@@ -774,6 +800,22 @@ export async function runV2ObservationsRepair({
     dayPlans.push({ day_utc: dayUtc, status: "planned", scopes: dayScopes, blocked_scopes: [], proposal_keys: [...new Set(proposalKeys)].sort(), index });
   }
 
+  // The shared builder plans a latest summary while it is constructing the
+  // targeted merge. Apply it last, after all lower-level index and metadata
+  // proposals have completed their PUT-and-GET verification.
+  const latestKeys = new Set(dayPlans.map((plan) => {
+    const domainResult = domain === "observations"
+      ? plan.index?.observations_timeseries
+      : plan.index?.aqilevels_timeseries;
+    return domainResult?.latest_index_key;
+  }).filter(Boolean));
+  for (const key of latestKeys) {
+    const proposal = staged.proposals.get(key);
+    if (proposal) {
+      staged.proposals.delete(key);
+      staged.proposals.set(key, { ...proposal, kind: "latest_timeseries_index" });
+    }
+  }
   const applied = await applyStagedProposals({ r2: config.r2, proposals: staged.proposals, writeR2: args.writeR2 });
   const proposalViews = [...staged.proposals.values()].map(proposalView).sort((left, right) => left.key.localeCompare(right.key));
   const results = dayPlans.map((plan) => {
