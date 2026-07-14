@@ -1145,6 +1145,24 @@ confirming GET verification and final metadata checks.
 Targeted local checks passed for removal-only preservation and final-empty
 planning. No SQL change is required and no operational command was run.
 
+### Final index-safety follow-up record — 2026-07-14
+
+- Previous pollutant-index evidence: **confirmed**. Missing or invalid old
+  timeseries counts now block with a precise reason rather than becoming `{}`.
+- Proposal rollback: **confirmed**. Each day index plan snapshots the complete
+  proposal map and restores it on a thrown planner error or metadata block,
+  including overwritten multi-day latest proposals.
+- Explicit ordering: **confirmed**. Application is deterministic by proposal
+  kind: manifests, pollutant indexes, metadata, then latest summaries. Latest
+  proposals record lower-level index/metadata dependencies.
+- Final verification: **partially confirmed**. Changed metadata operations now
+  persist expected hash plus replacement/removal identities and final checking
+  requires the affected pollutant index. The existing unsupported final-empty
+  deletion remains fail-closed.
+
+Structural checks passed: `py_compile`, both Node checks, both shell checks and
+`git diff --check`. No SQL change or operational command was performed.
+
 ## Recommended model
 
 ```text

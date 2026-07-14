@@ -1721,7 +1721,31 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
   for (const source of affectedPollutantIndexes) {
     const payload = source?.payload;
     const counts = normalizeTimeseriesRowCounts(payload?.timeseries_row_counts);
-    const oldCounts = normalizeTimeseriesRowCounts(source?.old_payload?.timeseries_row_counts) || {};
+    if (!source?.old_payload) {
+      blocked_scopes.push({
+        status: "blocked_dependency",
+        reason: "previous_pollutant_index_missing",
+        path: source?.key || null,
+        domain: payload?.domain || null,
+        day_utc: payload?.day_utc || null,
+        connector_id: payload?.connector_id || null,
+        pollutant_code: payload?.pollutant_code || null,
+      });
+      continue;
+    }
+    const oldCounts = normalizeTimeseriesRowCounts(source.old_payload.timeseries_row_counts);
+    if (!oldCounts) {
+      blocked_scopes.push({
+        status: "blocked_dependency",
+        reason: "previous_pollutant_timeseries_counts_invalid",
+        path: source?.key || null,
+        domain: payload?.domain || null,
+        day_utc: payload?.day_utc || null,
+        connector_id: payload?.connector_id || null,
+        pollutant_code: payload?.pollutant_code || null,
+      });
+      continue;
+    }
     if (!counts) {
       blocked_scopes.push({ status: "blocked_dependency", reason: "required_pollutant_timeseries_counts_invalid", path: source?.key || null });
       continue;
@@ -1729,7 +1753,8 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
     const identity = `${payload.domain}|${payload.day_utc}|${payload.connector_id}|${payload.pollutant_code}`;
     for (const timeseriesId of new Set([...Object.keys(oldCounts), ...Object.keys(counts)])) {
       const key = String(parsePositiveId(timeseriesId));
-      const operation = operationsByTimeseriesId.get(key) || { replacements: [], removalIdentities: [] };
+      const operation = operationsByTimeseriesId.get(key) || { replacements: [], removalIdentities: [], affectedIndexKeys: [] };
+      operation.affectedIndexKeys.push(source?.key || null);
       if (Object.prototype.hasOwnProperty.call(counts, timeseriesId)) {
         const entry = extractHistoryV2TimeseriesMetadataEntry(payload, timeseriesId);
         if (!entry) {
@@ -1769,7 +1794,7 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
         indexPrefix: normalizedIndexPrefix,
         timeseriesMetadataIndexPrefix: normalizedMetadataPrefix,
       });
-      candidates.push({ key, payload, ...merged });
+      candidates.push({ key, payload, operation, ...merged });
     } catch (error) {
       blocked_scopes.push({ status: "blocked_dependency", reason: String(error?.message || error), path: key, timeseries_id: Number(timeseriesId) });
     }
@@ -1790,6 +1815,17 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
     replacement_entry_count: candidates.reduce((sum, candidate) => sum + candidate.replacement_entry_count, 0),
     removal_entry_count: candidates.reduce((sum, candidate) => sum + candidate.removal_entry_count, 0),
     metadata_keys: candidates.map((candidate) => candidate.key).sort(),
+    metadata_operations: candidates.map((candidate) => ({
+      timeseries_id: Number(candidate.payload.timeseries_id),
+      metadata_object_key: candidate.key,
+      replacement_identities: candidate.operation.replacements.map(timeseriesMetadataEntryIdentity),
+      removal_identities: candidate.operation.removalIdentities,
+      affected_pollutant_index_keys: [...new Set(candidate.operation.affectedIndexKeys.filter(Boolean))].sort(),
+      preserved_entry_count: candidate.preserved_entry_count,
+      replacement_entry_count: candidate.replacement_entry_count,
+      removal_entry_count: candidate.removal_entry_count,
+      expected_final_sha256: sha256Hex(`${JSON.stringify(candidate.payload, null, 2)}\n`),
+    })),
   };
 }
 
