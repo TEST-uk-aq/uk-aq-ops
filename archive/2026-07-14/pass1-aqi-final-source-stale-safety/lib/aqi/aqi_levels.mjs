@@ -197,7 +197,9 @@ export function dedupeSourceObservationRows(rows) {
     const timeseriesId = toPositiveIntOrNull(row?.timeseries_id);
     const stationId = toPositiveIntOrNull(row?.station_id);
     const pollutantCode = normalizePollutantCode(row?.pollutant_code);
-    const observedAt = normalizeIsoTimestamp(row?.observed_at);
+    const observedAt =
+      normalizeIsoTimestamp(row?.observed_at)
+      ?? normalizeIsoTimestamp(row?.observed_at_utc);
     const value = toNumberOrNull(row?.value);
     if (!timeseriesId || !stationId || !pollutantCode || !observedAt || value === null || value < 0) {
       continue;
