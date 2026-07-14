@@ -1684,7 +1684,13 @@ function resolveAuthoritativeTimeseriesBinding(bindings, timeseriesId) {
   const pollutantCode = parsePollutantCode(raw.pollutant_code, "observations")
     || parsePollutantCode(raw.pollutant_code, "aqilevels");
   return connectorId && pollutantCode
-    ? { timeseries_id: normalizedTimeseriesId, connector_id: connectorId, pollutant_code: pollutantCode }
+    ? {
+      timeseries_id: normalizedTimeseriesId,
+      connector_id: connectorId,
+      pollutant_code: pollutantCode,
+      phenomenon_id: raw.phenomenon_id ?? null,
+      observed_property_id: raw.observed_property_id ?? null,
+    }
     : null;
 }
 
@@ -1696,6 +1702,24 @@ function authoritativeTimeseriesBindingMatchesEntry(binding, entry) {
     && normalized.connector_id === binding.connector_id
     && normalized.pollutant_code === binding.pollutant_code
   );
+}
+
+function authoritativeScopeMismatch({ binding, entry, path, timeseriesId }) {
+  const expected = normalizeTimeseriesMetadataEntry(entry);
+  return {
+    status: "blocked_dependency",
+    reason: "authoritative_core_timeseries_scope_mismatch",
+    path: path || null,
+    timeseries_id: Number(timeseriesId),
+    domain: expected?.domain ?? null,
+    day_utc: expected?.day_utc ?? null,
+    expected_connector_id: expected?.connector_id ?? null,
+    expected_pollutant_code: expected?.pollutant_code ?? null,
+    core_connector_id: binding?.connector_id ?? null,
+    core_pollutant_code: binding?.pollutant_code ?? null,
+    core_phenomenon_id: binding?.phenomenon_id ?? null,
+    core_observed_property_id: binding?.observed_property_id ?? null,
+  };
 }
 
 // Exported for the Integrity local regression check. Replacements are keyed by
@@ -1800,7 +1824,12 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
         );
         if (coreBinding) {
           if (!authoritativeTimeseriesBindingMatchesEntry(coreBinding, entry)) {
-            blocked_scopes.push({ status: "blocked_dependency", reason: "authoritative_core_timeseries_scope_mismatch", path: source?.key || null, timeseries_id: Number(timeseriesId) });
+            blocked_scopes.push(authoritativeScopeMismatch({
+              binding: coreBinding,
+              entry,
+              path: source?.key || null,
+              timeseriesId,
+            }));
             continue;
           }
           entry = {
@@ -1829,11 +1858,16 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
         blocked_scopes.push({ status: "blocked_dependency", reason: "authoritative_core_timeseries_missing_or_invalid", path: key, timeseries_id: Number(timeseriesId) });
         continue;
       }
-      const invalidReplacement = operation.replacements.some((entry) =>
+      const invalidReplacement = operation.replacements.find((entry) =>
         !authoritativeTimeseriesBindingMatchesEntry(coreBinding, entry)
       );
       if (invalidReplacement || operation.removalIdentities.length || !operation.replacements.length) {
-        blocked_scopes.push({ status: "blocked_dependency", reason: "authoritative_core_timeseries_scope_mismatch", path: key, timeseries_id: Number(timeseriesId) });
+        blocked_scopes.push(authoritativeScopeMismatch({
+          binding: coreBinding,
+          entry: invalidReplacement || null,
+          path: key,
+          timeseriesId,
+        }));
         continue;
       }
       const payload = buildHistoryV2TimeseriesMetadataIndexPayload({

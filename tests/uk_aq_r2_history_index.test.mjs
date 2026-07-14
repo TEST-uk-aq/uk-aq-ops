@@ -1222,6 +1222,55 @@ test("targeted v2 metadata blocks only when both existing and core metadata are 
   }
 });
 
+test("targeted v2 metadata reports both identities for a core scope mismatch", async () => {
+  const fake = installFakeR2Fetch({});
+  try {
+    const output = await updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
+      r2: {
+        endpoint: "https://r2.example.invalid",
+        bucket: "uk-aq-history-cic-test",
+        region: "auto",
+        access_key_id: "key",
+        secret_access_key: "secret",
+      },
+      affectedPollutantIndexes: [{
+        key: "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-05-17/connector_id=6/pollutant_code=no2/manifest.json",
+        old_payload: null,
+        payload: {
+          history_version: "v2", domain: "aqilevels", day_utc: "2026-05-17",
+          connector_id: 6, pollutant_code: "no2", timeseries_row_counts: { 1417: 1 },
+        },
+      }],
+      authoritativeTimeseriesById: new Map([["1417", {
+        timeseries_id: 1417,
+        connector_id: 6,
+        pollutant_code: "o3",
+        phenomenon_id: 12,
+        observed_property_id: 14,
+      }]]),
+      writeR2: false,
+      plannedOnly: true,
+    });
+    assert.equal(output.status, "blocked_dependency");
+    assert.deepEqual(output.blocked_scopes[0], {
+      status: "blocked_dependency",
+      reason: "authoritative_core_timeseries_scope_mismatch",
+      path: "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-05-17/connector_id=6/pollutant_code=no2/manifest.json",
+      timeseries_id: 1417,
+      domain: "aqilevels",
+      day_utc: "2026-05-17",
+      expected_connector_id: 6,
+      expected_pollutant_code: "no2",
+      core_connector_id: 6,
+      core_pollutant_code: "o3",
+      core_phenomenon_id: 12,
+      core_observed_property_id: 14,
+    });
+  } finally {
+    fake.restore();
+  }
+});
+
 function installFakeR2Fetch(objectsByKey) {
   const originalFetch = globalThis.fetch;
   const puts = new Map();

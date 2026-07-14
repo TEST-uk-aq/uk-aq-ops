@@ -758,12 +758,12 @@ class V2RepairExecutionTests(unittest.TestCase):
                 );
                 CREATE TABLE core_phenomena_snapshot (
                   id INTEGER PRIMARY KEY, label TEXT, source_label TEXT,
-                  pollutant_label TEXT
+                  pollutant_label TEXT, observed_property_id INTEGER
                 );
             """)
             conn.execute(
-                "INSERT INTO core_phenomena_snapshot VALUES (?, ?, ?, ?)",
-                (7, "Nitrogen dioxide", "NO2", "NO2"),
+                "INSERT INTO core_phenomena_snapshot VALUES (?, ?, ?, ?, ?)",
+                (7, "Nitrogen dioxide", "NO2", "NO2", 12),
             )
             conn.execute(
                 "INSERT INTO core_timeseries_snapshot VALUES (?, ?, ?, ?, ?)",
@@ -771,7 +771,13 @@ class V2RepairExecutionTests(unittest.TestCase):
             )
             self.assertEqual(
                 MODULE._authoritative_v2_core_timeseries_bindings(conn),
-                [{"timeseries_id": 101, "connector_id": 1, "pollutant_code": "no2"}],
+                [{
+                    "timeseries_id": 101,
+                    "connector_id": 1,
+                    "pollutant_code": "no2",
+                    "phenomenon_id": 7,
+                    "observed_property_id": 12,
+                }],
             )
         finally:
             conn.close()
