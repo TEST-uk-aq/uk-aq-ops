@@ -293,9 +293,10 @@ attempts of `ops.prune_daily` and `ops.r2_core_snapshot`. Failed writer
 attempts count because they may have written R2 before failing. A previous
 `ops.history_integrity` attempt is relevant only when its summary records
 non-dry-run repair mode (`repair_mode=true`, with legacy
-`run_backfill=true` supported). A relevant writer still in `Started` blocks
-the run, and the qualifying backup must have finished before Integrity starts.
-The report includes the qualifying backup timestamps and per-writer run details.
+`run_backfill=true` supported). A relevant writer still in `Started`, including
+a Dropbox backup attempt, blocks the run, and the qualifying backup must have
+finished before Integrity starts. The report includes qualifying and running
+backup details plus per-writer run details.
 
 The readiness RPC is called through PostgREST schema `uk_aq_public`. Obs AQI DB
 credentials are resolved only after `UK_AQ_BACKFILL_ENV_FILE` is loaded, with
@@ -332,11 +333,19 @@ Phase 2 creates the sparse local overlay used by Phases 3 and 4 at
 Only changed/generated objects are eligible for the overlay. Combined local
 reads prefer an object marked `r2_verified=true`; otherwise they use the same
 object key in `R2_history_backup`. Phases 3 and 4 reconnect all data/metadata
-stages after read-only detection. AQI reads use the already verified live-R2
-observation scope because the current AQI writer has no local-reader adapter;
-every resulting AQI object is GET-verified into the overlay. The coordinator,
-not either data wrapper, runs each targeted index after final manifests.
-`--run-backfill --dry-run` still makes no writes.
+stages after read-only detection. Generated writer bytes stay in the sparse
+overlay and are compared with the subsequent R2 GET before verification. The
+metadata executor plans from the verified overlay plus Dropbox view, using R2
+only for writes, GET verification and narrowly scoped parent race guards. AQI
+reads use the already verified live-R2 observation scope because the current
+AQI writer has no local-reader adapter. The coordinator, not either data
+wrapper, runs each targeted index after final manifests. `--run-backfill
+--dry-run` still makes no writes. A non-dry-run repair then runs one final,
+read-only source-cache and overlay-first/Dropbox-second verification pass. Any
+remaining actionable scope, missing GET verification, or blocked scope fails
+the run. Successful repairs remove only duplicate generated-object staging and
+the disposable verification view after reports are written; failed overlays are
+retained.
 
 Run lifecycle:
 

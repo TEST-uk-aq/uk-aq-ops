@@ -37,17 +37,21 @@ const SUPPORTED_ACTIONS = new Set([
 ]);
 
 function parseArgs(argv) {
-  const args = { repairPlanJson: null, repairPlanStdin: false, writeR2: false };
+  const args = { repairPlanJson: null, repairPlanStdin: false, writeR2: false, overlayRoot: null, dropboxRoot: null, runStateJson: null };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--repair-plan-json") args.repairPlanJson = String(argv[++index] || "");
     else if (arg === "--repair-plan-stdin") args.repairPlanStdin = true;
     else if (arg === "--write-r2") args.writeR2 = true;
     else if (arg === "--dry-run") args.writeR2 = false;
+    else if (arg === "--overlay-root") args.overlayRoot = String(argv[++index] || "");
+    else if (arg === "--dropbox-root") args.dropboxRoot = String(argv[++index] || "");
+    else if (arg === "--run-state-json") args.runStateJson = String(argv[++index] || "");
     else throw new Error(`Unknown arg: ${arg}`);
   }
   if (!args.repairPlanJson && !args.repairPlanStdin) throw new Error("--repair-plan-json or --repair-plan-stdin is required");
   if (args.repairPlanJson && args.repairPlanStdin) throw new Error("pass only one repair plan input");
+  if (!args.overlayRoot || !args.dropboxRoot || !args.runStateJson) throw new Error("--overlay-root, --dropbox-root and --run-state-json are required for the combined local resolver");
   return args;
 }
 
@@ -59,8 +63,8 @@ function jsonObject(object, key) {
   }
 }
 
-async function readChildren({ r2, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
-  const entries = await r2ListAllObjects({ r2, prefix, max_keys: 1000 });
+async function readChildren({ store, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
+  const entries = await store.listAllObjects({ prefix });
   const keyPattern = kind === "connector"
     ? /\/connector_id=\d+\/manifest\.json$/
     : /\/pollutant_code=[^/]+\/manifest\.json$/;
@@ -69,7 +73,7 @@ async function readChildren({ r2, prefix, dayUtc, connectorId, kind, domain = "o
   const children = [];
   const identities = new Map();
   for (const key of keys) {
-    const object = await r2GetObject({ r2, key });
+    const object = await store.getObject(key);
     const payload = jsonObject(object, key);
     if (domain === "observations") {
       assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
@@ -82,18 +86,71 @@ async function readChildren({ r2, prefix, dayUtc, connectorId, kind, domain = "o
   return { children, identities };
 }
 
+function safeLocalKey(key) {
+  const normalized = String(key || "").replace(/^\/+/, "");
+  if (!normalized || normalized.split("/").some((part) => part === "..")) throw new Error(`Unsafe local object key: ${key}`);
+  return normalized;
+}
+
+function walkLocalObjects(root, prefix = "") {
+  const found = new Map();
+  if (!root || !fs.existsSync(root)) return found;
+  const visit = (directory, relative = "") => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const nextRelative = relative ? `${relative}/${entry.name}` : entry.name;
+      const fullPath = `${directory}/${entry.name}`;
+      if (entry.isDirectory()) visit(fullPath, nextRelative);
+      else if (entry.isFile()) found.set(`${prefix}${nextRelative}`, fullPath);
+    }
+  };
+  visit(root);
+  return found;
+}
+
+function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson }) {
+  const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
+  const paths = walkLocalObjects(dropboxRoot);
+  for (const [key, entry] of Object.entries(state?.objects || {})) {
+    if (entry?.r2_verified === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
+      paths.set(safeLocalKey(key), entry.local_path);
+    }
+  }
+  return {
+    overlayRoot,
+    getObject(key) {
+      const normalized = safeLocalKey(key);
+      const localPath = paths.get(normalized);
+      if (!localPath) throw new Error(`Blocked dependency: combined local object is unavailable: ${normalized}`);
+      const body = fs.readFileSync(localPath);
+      return objectFromBody({ key: normalized, body, etag: sha256Hex(body) });
+    },
+    getObjectIfExists(key) {
+      try { return this.getObject(key); } catch (error) {
+        if (String(error).includes("combined local object is unavailable")) return null;
+        throw error;
+      }
+    },
+    listAllObjects({ prefix }) {
+      return [...paths.entries()]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, localPath]) => ({ key, size: fs.statSync(localPath).size, etag: null }))
+        .sort((left, right) => left.key.localeCompare(right.key));
+    },
+  };
+}
+
+// This adapter is used only for the parent pre-write race guard.  It is not a
+// planning source: all normal reads use createCombinedLocalStore above.
+function createR2RaceGuardStore(r2) {
+  return {
+    getObject: async (key) => await r2GetObject({ r2, key }),
+    listAllObjects: async ({ prefix, max_keys = 1000 }) => await r2ListAllObjects({ r2, prefix, max_keys }),
+  };
+}
+
 function objectFromBody({ key, body, etag = null }) {
   const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8");
   return { key, body: buffer, bytes: buffer.byteLength, etag };
-}
-
-async function getObjectIfExists({ r2, key }) {
-  try {
-    return await r2GetObject({ r2, key });
-  } catch (error) {
-    if (String(error).includes("(404)")) return null;
-    throw error;
-  }
 }
 
 function proposalView(proposal) {
@@ -137,7 +194,7 @@ function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kin
 
 async function assertCompleteChildrenUnchanged({ r2, guard }) {
   const current = await readChildren({
-    r2,
+    store: createR2RaceGuardStore(r2),
     prefix: guard.prefix,
     dayUtc: guard.dayUtc,
     connectorId: guard.connectorId,
@@ -162,13 +219,13 @@ async function assertCompleteChildrenUnchanged({ r2, guard }) {
   }
 }
 
-function createStagedObjectMap({ r2 }) {
+function createStagedObjectMap({ r2, store }) {
   const proposals = new Map();
 
   async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], preWriteGuard = null }) {
     const bodyText = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
     const previous = proposals.get(key);
-    const existing = previous || await getObjectIfExists({ r2, key });
+    const existing = previous || store.getObjectIfExists(key);
     const oldBody = previous?.old_body ?? existing?.body?.toString("utf8") ?? null;
     const oldEtag = previous?.old_etag ?? existing?.etag ?? null;
     const proposal = {
@@ -201,14 +258,15 @@ function createStagedObjectMap({ r2 }) {
       await stage({ key, body, contentType: content_type, kind: "observation_index" });
     },
     adapter: {
-      getObject: async ({ key }) => stagedObject(key) || r2GetObject({ r2, key }),
+      getObject: async ({ key }) => stagedObject(key) || store.getObject(key),
       headObject: async ({ key }) => {
         const staged = stagedObject(key);
         if (staged) return { exists: true, key, bytes: staged.bytes, etag: staged.etag };
-        return r2HeadObject({ r2, key });
+        const object = store.getObjectIfExists(key);
+        return object ? { exists: true, key, bytes: object.bytes, etag: object.etag } : { exists: false, key };
       },
       listAllObjects: async ({ prefix, max_keys }) => {
-        const entries = await r2ListAllObjects({ r2, prefix, max_keys });
+        const entries = store.listAllObjects({ prefix, max_keys });
         const byKey = new Map(entries.map((entry) => [entry.key, entry]));
         for (const proposal of proposals.values()) {
           if (proposal.key.startsWith(prefix)) {
@@ -240,6 +298,59 @@ function createStagedObjectMap({ r2 }) {
 function stableGeneratedAt({ dayUtc, dayManifest }) {
   const backedUpAt = String(dayManifest?.backed_up_at_utc || "");
   return /^\d{4}-\d{2}-\d{2}T/.test(backedUpAt) ? backedUpAt : `${dayUtc}T00:00:00.000Z`;
+}
+
+function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId, pollutantCode }) {
+  const pollutantPrefix = `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+  const partKeys = store.listAllObjects({ prefix: `${pollutantPrefix}/` })
+    .map((entry) => entry.key)
+    .filter((key) => /\/part-\d+\.parquet$/.test(key))
+    .sort();
+  if (!partKeys.length) return { blocked_reason: "final_parquet_objects_unavailable" };
+  const manifestKey = `${pollutantPrefix}/manifest.json`;
+  const existing = store.getObjectIfExists(manifestKey);
+  let payload;
+  try { payload = existing ? jsonObject(existing, manifestKey) : null; } catch { payload = null; }
+  let files = Array.isArray(payload?.files) ? payload.files : [];
+  // A missing pollutant manifest can still be rebuilt safely when the final
+  // connector or day manifest has complete entries for its actual parquet
+  // files. Do not trust these parents blindly: the physical key and byte
+  // checks below remain mandatory.
+  if (!files.length) {
+    for (const parentKey of [
+      `${base}/connector_id=${connectorId}/manifest.json`,
+      `${base}/manifest.json`,
+    ]) {
+      const parent = store.getObjectIfExists(parentKey);
+      if (!parent) continue;
+      let parentPayload;
+      try { parentPayload = jsonObject(parent, parentKey); } catch { continue; }
+      const candidate = Array.isArray(parentPayload?.files)
+        ? parentPayload.files.filter((entry) => partKeys.includes(String(entry?.key || "")))
+        : [];
+      if (candidate.length === partKeys.length) {
+        files = candidate;
+        payload = parentPayload;
+        break;
+      }
+    }
+  }
+  const fileKeys = files.map((entry) => String(entry?.key || "")).sort();
+  if (!files.length || fileKeys.length !== partKeys.length || fileKeys.some((key, index) => key !== partKeys[index])) {
+    return { blocked_reason: "final_parquet_metadata_incomplete" };
+  }
+  if (files.some((entry) => !Number.isInteger(entry?.row_count) || entry.row_count < 0 || !Number.isInteger(entry?.bytes) || entry.bytes < 0)) {
+    return { blocked_reason: "final_parquet_metadata_incomplete" };
+  }
+  for (const entry of files) {
+    const object = store.getObject(entry.key);
+    if (object.bytes !== entry.bytes) return { blocked_reason: "final_parquet_metadata_does_not_match_object" };
+    const expectedHash = String(entry.etag_or_hash || "").replace(/^"|"$/g, "");
+    if (/^[a-f0-9]{64}$/i.test(expectedHash) && sha256Hex(object.body) !== expectedHash.toLowerCase()) {
+      return { blocked_reason: "final_parquet_metadata_does_not_match_object" };
+    }
+  }
+  return { manifestKey, payload, files };
 }
 
 const REPAIR_STATUSES = new Set([
@@ -401,7 +512,14 @@ export async function runV2ObservationsRepair({
   repairPlan = null,
   updateIndexes = updateR2HistoryIndexesTargeted,
 } = {}) {
-  const args = repairPlan ? { writeR2: argv.includes("--write-r2") } : parseArgs(argv);
+  const args = repairPlan
+    ? {
+      writeR2: argv.includes("--write-r2"),
+      overlayRoot: String(env.UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT || ""),
+      dropboxRoot: String(env.UK_AQ_R2_HISTORY_DROPBOX_ROOT || ""),
+      runStateJson: String(env.UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON || ""),
+    }
+    : parseArgs(argv);
   const input = repairPlan || JSON.parse(
     args.repairPlanStdin
       ? fs.readFileSync(0, "utf8")
@@ -422,7 +540,11 @@ export async function runV2ObservationsRepair({
     dayScopes.push(scope);
     byDay.set(scope.dayUtc, dayScopes);
   }
-  const staged = createStagedObjectMap({ r2: config.r2 });
+  if (!args.overlayRoot || !args.dropboxRoot || !args.runStateJson) {
+    throw new Error("Combined local resolver paths are required for metadata repair");
+  }
+  const localStore = createCombinedLocalStore(args);
+  const staged = createStagedObjectMap({ r2: config.r2, store: localStore });
   const dayPlans = [];
   const blockedScopes = [];
 
@@ -437,31 +559,39 @@ export async function runV2ObservationsRepair({
     // newly generated parent.  The writer records complete per-part metadata
     // in `files`; its parquet objects are the immutable data dependency.
     for (const scope of dayScopes.filter((value) => value.pollutantRepair).sort((left, right) => left.connectorId - right.connectorId)) {
-      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
       const wanted = new Set(scope.pollutant_codes || []);
-      const selected = child.children.filter((payload) => !wanted.size || wanted.has(String(payload.pollutant_code || "").trim().toLowerCase()));
-      if (!selected.length) {
-        const blocked = { ...scope, status: "blocked_dependency", reason: "Pollutant manifest repair requires final combined parquet metadata for the requested pollutant." };
+      const partEntries = localStore.listAllObjects({ prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=` });
+      const availableCodes = [...new Set(partEntries.map((entry) => {
+        const match = entry.key.match(/\/pollutant_code=([^/]+)\/part-\d+\.parquet$/);
+        return match ? decodeURIComponent(match[1]).toLowerCase() : null;
+      }).filter(Boolean))].sort();
+      const selectedCodes = availableCodes.filter((code) => !wanted.size || wanted.has(code));
+      const missingRequested = [...wanted].filter((code) => !availableCodes.includes(code));
+      for (const pollutantCode of missingRequested) {
+        blockedScopes.push({ ...scope, pollutant_code: pollutantCode, status: "blocked_dependency", reason: "final_parquet_objects_unavailable" });
+      }
+      if (!selectedCodes.length) {
+        const blocked = { ...scope, status: "blocked_dependency", reason: "final_parquet_objects_unavailable" };
         blockedScopes.push(blocked);
         continue;
       }
-      for (const payload of selected) {
-        const manifestKey = String(payload.manifest_key || "").trim();
-        const files = Array.isArray(payload.files) ? payload.files : [];
-        if (!manifestKey || !files.length) {
-          const blocked = { ...scope, pollutant_code: payload.pollutant_code || null, status: "blocked_dependency", reason: "Pollutant manifest repair is blocked because final parquet file metadata is unavailable." };
+      for (const pollutantCode of selectedCodes) {
+        const source = leafManifestSourceFromCombined({ store: localStore, base, dayUtc, connectorId: scope.connectorId, pollutantCode });
+        if (source.blocked_reason) {
+          const blocked = { ...scope, pollutant_code: pollutantCode, status: "blocked_dependency", reason: source.blocked_reason };
           blockedScopes.push(blocked);
           continue;
         }
+        const { manifestKey, payload, files } = source;
         const rebuilt = buildHistoryV2PollutantManifest({
           domain,
           profile: domain === "aqilevels" ? "data" : null,
           dayUtc,
           connectorId: scope.connectorId,
-          pollutantCode: payload.pollutant_code,
+          pollutantCode,
           runId: payload.run_id || null,
           manifestKey,
-          sourceRowCount: Number(payload.source_row_count || payload.row_count || 0),
+          sourceRowCount: files.reduce((total, entry) => total + Number(entry.row_count || 0), 0),
           fileEntries: files,
           writerGitSha: payload.writer_git_sha || null,
           backedUpAtUtc: payload.backed_up_at_utc || `${dayUtc}T00:00:00.000Z`,
@@ -477,7 +607,7 @@ export async function runV2ObservationsRepair({
       }
     }
     for (const scope of dayScopes.filter((value) => value.needsConnector).sort((left, right) => left.connectorId - right.connectorId)) {
-      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
+      const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
       const key = `${base}/connector_id=${scope.connectorId}/manifest.json`;
       const payload = buildHistoryV2ConnectorManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
@@ -503,7 +633,7 @@ export async function runV2ObservationsRepair({
     let dayManifest = null;
     let dayManifestKey = `${base}/manifest.json`;
     if (needsDay) {
-      const child = await readChildren({ r2: staged.stagedR2, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
+      const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
       dayManifest = buildHistoryV2DayManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key: dayManifestKey,
@@ -523,7 +653,7 @@ export async function runV2ObservationsRepair({
       });
       proposalKeys.push(dayManifestKey);
     } else {
-      const existingDay = await getObjectIfExists({ r2: staged.stagedR2, key: dayManifestKey });
+      const existingDay = localStore.getObjectIfExists(dayManifestKey);
       dayManifest = existingDay ? jsonObject(existingDay, dayManifestKey) : null;
     }
 

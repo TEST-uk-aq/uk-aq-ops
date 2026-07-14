@@ -12277,6 +12277,7 @@ def run_aqi_rebuild_backfill(
     log_dir: Path | None = None,
     log_label: str | None = None,
     history_version: str = "v1",
+    extra_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": None,
@@ -12327,6 +12328,8 @@ def run_aqi_rebuild_backfill(
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
     })
+    if extra_env:
+        sub_env.update({str(key): str(value) for key, value in extra_env.items()})
     if connector_id is not None and int(connector_id) > 0:
         sub_env["UK_AQ_BACKFILL_CONNECTOR_IDS"] = str(int(connector_id))
     else:
@@ -12732,6 +12735,7 @@ def run_v2_gap_backfills(
     limits: LimitTracker,
     log: logging.Logger,
     run_state: dict[str, Any] | None = None,
+    queue_aqi_from_observation_repairs: bool = True,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -13166,11 +13170,6 @@ def run_v2_gap_backfills(
         if repair_ok:
             metrics["v2_observation_repairs_ok"] += 1
             metrics["observation_backfills_ok"] += 1
-            action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=ts_ids, queue_note="queued_from_v2_observation_repair", log=log, history_version="v2")
-            if action in {"inserted", "merged"}:
-                queued.add((day_iso, connector_id))
-            metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
-            metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
             if run_state is not None:
                 record_changed_scope(run_state, "OBSERVS_CHANGED", {
                     "day_utc": day_iso,
@@ -13179,6 +13178,12 @@ def run_v2_gap_backfills(
                     "pollutant_codes": sorted({str(code) for code in source_pollutant_codes if str(code)}),
                     "stage": "observs",
                 })
+            if queue_aqi_from_observation_repairs:
+                action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=ts_ids, queue_note="queued_from_v2_observation_repair", log=log, history_version="v2")
+                if action in {"inserted", "merged"}:
+                    queued.add((day_iso, connector_id))
+                metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
+                metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["obs_repaired"], "history_version": "v2"})
         elif no_observation_rows:
             metrics["v2_observation_repairs_no_rows"] += 1
             log.warning(
@@ -13238,6 +13243,7 @@ def run_aqi_rebuild_queue_execution(
     log: logging.Logger,
     dry_run_planned_rows: list[dict[str, Any]] | None = None,
     history_version: str = "v1",
+    extra_env: Mapping[str, str] | None = None,
     skip_stale_local_post_validation: bool = False,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
@@ -13376,6 +13382,7 @@ def run_aqi_rebuild_queue_execution(
             connector_scope,
             day_obj,
             history_version=history_version,
+            extra_env=extra_env,
             env_name=env_name,
         )
         metrics["planned_aqi_rebuild_commands"].append(planned_cmd)
@@ -13785,6 +13792,7 @@ def _run_v2_observation_metadata_executor(
     domain: Literal["observations", "aqilevels"] = "observations",
     dry_run: bool,
     log: logging.Logger,
+    run_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the metadata/index specialist once, after all observation repairs.
 
@@ -13801,6 +13809,12 @@ def _run_v2_observation_metadata_executor(
         str(repo_root / "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"),
         "--repair-plan-stdin",
     ]
+    if run_state is not None:
+        command.extend([
+            "--overlay-root", str(run_state["overlay_root"]),
+            "--dropbox-root", str(run_state["base_dropbox_root"]),
+            "--run-state-json", str(run_state["run_state_path"]),
+        ])
     if not dry_run:
         command.append("--write-r2")
     plan = {"history_version": "v2", "domain": domain, "repair_plan": actions}
@@ -13935,41 +13949,37 @@ def _capture_verified_v2_observation_scope(
     connector_id: int,
     env: Mapping[str, str],
 ) -> list[str]:
-    """Capture writer PUTs into the sparse overlay after exact GET verification."""
+    """Verify and retain the writer's generated observation bytes.
+
+    The local generated-object stage is the source of truth for this run.  R2
+    is read only to verify that its GET has exactly the bytes the writer PUT.
+    This avoids replacing the sparse overlay with a later live object.
+    """
     connector_key = _v2_observation_connector_manifest_key(
         day_utc=day_utc, connector_id=connector_id, env=env,
     )
-    manifest_raw = _get_r2_object_bytes_for_integrity_overlay(
-        object_key=connector_key, env=env,
-    )
-    manifest = json.loads(manifest_raw.decode("utf-8"))
+    generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
+    connector_source = generated_root / _normalise_overlay_object_key(connector_key)
+    if not connector_source.is_file():
+        raise FileNotFoundError(f"generated observation connector manifest is unavailable: {connector_key}")
+    manifest = json.loads(connector_source.read_text(encoding="utf-8"))
     if not isinstance(manifest, Mapping):
         raise ValueError(f"invalid observation connector manifest after GET: {connector_key}")
-    config = resolve_history_path_config("v2", {**os.environ, **dict(env)})
-    day_key = f"{config.observations_data_prefix.strip('/')}/day_utc={day_utc}/manifest.json"
     object_keys = [
         *(str(entry.get("key") or "") for entry in list(manifest.get("files") or []) if isinstance(entry, Mapping)),
         *(str(entry.get("manifest_key") or "") for entry in list(manifest.get("child_manifests") or []) if isinstance(entry, Mapping)),
         connector_key,
-        day_key,
     ]
     captured: list[str] = []
     for object_key in sorted({_normalise_overlay_object_key(key) for key in object_keys if key}):
-        payload = manifest_raw if object_key == connector_key else _get_r2_object_bytes_for_integrity_overlay(
-            object_key=object_key, env=env,
-        )
-        with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-observs-") as temp_dir:
-            source = Path(temp_dir) / "r2-object"
-            source.write_bytes(payload)
-            stage_overlay_object(
-                run_state,
-                object_key=object_key,
-                source_path=source,
-                stage="observs",
-                dependencies=(),
-            )
-        # The source-to-R2 writer performed the PUT; this GET is the exact
-        # verification before the object becomes an overlay dependency.
+        source = generated_root / object_key
+        if not source.is_file():
+            raise FileNotFoundError(f"generated observation object is unavailable: {object_key}")
+        expected = source.read_bytes()
+        actual = _get_r2_object_bytes_for_integrity_overlay(object_key=object_key, env=env)
+        if len(actual) != len(expected) or hashlib.sha256(actual).digest() != hashlib.sha256(expected).digest():
+            raise ValueError(f"R2 GET does not match generated observation object: {object_key}")
+        stage_overlay_object(run_state, object_key=object_key, source_path=source, stage="observs", dependencies=())
         mark_overlay_uploaded(run_state, object_key)
         mark_overlay_verified(run_state, object_key)
         captured.append(object_key)
@@ -13982,51 +13992,40 @@ def _capture_verified_v2_aqi_scope(
     day_utc: str,
     connector_id: int,
     env: Mapping[str, str],
+    include_debug: bool = False,
 ) -> list[str]:
-    """Capture the live-R2 AQI writer output after exact GET verification.
-
-    The current AQI writer accepts committed R2 observations, not a local
-    reader.  This is the narrow Phase 4 exception: its input is the already
-    PUT-and-GET-verified observation scope; every AQI output is then copied to
-    the sparse overlay only after an exact R2 GET.
-    """
+    """Verify and retain generated AQI bytes; debug is required only on request."""
     config = resolve_history_path_config("v2", {**os.environ, **dict(env)})
     prefixes = [config.aqilevels_hourly_data_prefix]
-    if config.aqilevels_hourly_debug_prefix:
+    if include_debug and config.aqilevels_hourly_debug_prefix:
         prefixes.append(config.aqilevels_hourly_debug_prefix)
+    generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
     captured: list[str] = []
     for prefix in prefixes:
         normalized_prefix = str(prefix).strip("/")
         connector_key = (
             f"{normalized_prefix}/day_utc={day_utc}/connector_id={int(connector_id)}/manifest.json"
         )
-        manifest_raw = _get_r2_object_bytes_for_integrity_overlay(
-            object_key=connector_key, env=env,
-        )
-        manifest = json.loads(manifest_raw.decode("utf-8"))
+        connector_source = generated_root / _normalise_overlay_object_key(connector_key)
+        if not connector_source.is_file():
+            raise FileNotFoundError(f"generated AQI connector manifest is unavailable: {connector_key}")
+        manifest = json.loads(connector_source.read_text(encoding="utf-8"))
         if not isinstance(manifest, Mapping):
             raise ValueError(f"invalid AQI connector manifest after GET: {connector_key}")
-        day_key = f"{normalized_prefix}/day_utc={day_utc}/manifest.json"
         object_keys = [
             *(str(entry.get("key") or "") for entry in list(manifest.get("files") or []) if isinstance(entry, Mapping)),
             *(str(entry.get("manifest_key") or "") for entry in list(manifest.get("child_manifests") or []) if isinstance(entry, Mapping)),
             connector_key,
-            day_key,
         ]
         for object_key in sorted({_normalise_overlay_object_key(key) for key in object_keys if key}):
-            payload = manifest_raw if object_key == connector_key else _get_r2_object_bytes_for_integrity_overlay(
-                object_key=object_key, env=env,
-            )
-            with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-aqi-") as temp_dir:
-                source = Path(temp_dir) / "r2-object"
-                source.write_bytes(payload)
-                stage_overlay_object(
-                    run_state,
-                    object_key=object_key,
-                    source_path=source,
-                    stage="aqilevels",
-                    dependencies=(),
-                )
+            source = generated_root / object_key
+            if not source.is_file():
+                raise FileNotFoundError(f"generated AQI object is unavailable: {object_key}")
+            expected = source.read_bytes()
+            actual = _get_r2_object_bytes_for_integrity_overlay(object_key=object_key, env=env)
+            if len(actual) != len(expected) or hashlib.sha256(actual).digest() != hashlib.sha256(expected).digest():
+                raise ValueError(f"R2 GET does not match generated AQI object: {object_key}")
+            stage_overlay_object(run_state, object_key=object_key, source_path=source, stage="aqilevels", dependencies=())
             mark_overlay_uploaded(run_state, object_key)
             mark_overlay_verified(run_state, object_key)
             captured.append(object_key)
@@ -14146,6 +14145,153 @@ def _queue_phase4_aqi_work(
     return planned
 
 
+def _create_final_verification_view(run_state: Mapping[str, Any]) -> Path:
+    """Create a disposable overlay-first filesystem view without copying data."""
+    run_root = Path(str(run_state["run_root"]))
+    base_root = Path(str(run_state["base_dropbox_root"]))
+    view_root = run_root / "final-verification-view"
+    if view_root.exists() or view_root.is_symlink():
+        shutil.rmtree(view_root, ignore_errors=True)
+    view_root.mkdir(parents=True, exist_ok=False)
+
+    # The verification checks need directory discovery and parquet paths. Use
+    # symlinks, never copied Dropbox objects, and avoid retired archive trees.
+    for directory, dirnames, filenames in os.walk(base_root):
+        dirnames[:] = [name for name in dirnames if name != "archive"]
+        relative_dir = Path(directory).relative_to(base_root)
+        target_dir = view_root / relative_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for filename in filenames:
+            source = Path(directory) / filename
+            target = target_dir / filename
+            target.symlink_to(source)
+
+    for object_key, entry in dict(run_state.get("objects") or {}).items():
+        if not isinstance(entry, Mapping) or not entry.get("r2_verified"):
+            continue
+        source = Path(str(entry.get("local_path") or ""))
+        if not source.is_file():
+            continue
+        target = view_root / _normalise_overlay_object_key(str(object_key))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(source)
+    return view_root
+
+
+def _final_verification_stage_for_gap(domain: str, gap: Mapping[str, Any]) -> str:
+    gap_type = str(gap.get("gap_type") or "")
+    if gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
+        return "observs_indexes" if domain == "observations" else "aqilevels_indexes"
+    if "manifest" in gap_type or gap_type.startswith("day_") or gap_type.startswith("connector_"):
+        return "observs_manifests" if domain == "observations" else "aqilevels_manifests"
+    return "observs" if domain == "observations" else "aqilevels"
+
+
+def run_v2_final_verification(
+    *,
+    run_state: dict[str, Any],
+    conn: sqlite3.Connection,
+    env_name: str,
+    config: HistoryPathConfig,
+    from_day: str,
+    to_day: str,
+    allowed_connector_ids: set[int] | None,
+    source_scope: dict[str, Any] | None,
+    check_aqi_debug: bool,
+    require_aqi_debug: bool,
+    log: logging.Logger,
+) -> dict[str, Any]:
+    """One read-only final pass over source cache and final local objects."""
+    view_root = _create_final_verification_view(run_state)
+    recheck = run_v2_post_repair_integrity_rechecks(
+        conn=conn,
+        env_name=env_name,
+        r2_history_root=view_root,
+        config=config,
+        from_day=from_day,
+        to_day=to_day,
+        allowed_connector_ids=allowed_connector_ids,
+        source_scope=source_scope,
+        check_aqi_debug=check_aqi_debug,
+        require_aqi_debug=require_aqi_debug,
+        log=log,
+    )
+    remaining_scopes: list[dict[str, Any]] = []
+    for domain, gaps in (
+        ("observations", list((recheck.get("observations") or {}).get("gaps") or [])),
+        ("aqilevels", list((recheck.get("aqilevels") or {}).get("gaps") or [])),
+        ("aqilevels", list(((recheck.get("aqilevels") or {}).get("debug") or {}).get("gaps") or [])),
+    ):
+        for gap in gaps:
+            if isinstance(gap, Mapping) and str(gap.get("severity") or "error") == "error":
+                remaining_scopes.append({
+                    "stage": _final_verification_stage_for_gap(domain, gap),
+                    "domain": domain,
+                    "day_utc": gap.get("day_utc"),
+                    "connector_id": gap.get("connector_id"),
+                    "pollutant_code": gap.get("pollutant_code"),
+                    "gap_type": gap.get("gap_type"),
+                    "expected_path": gap.get("expected_path"),
+                })
+    verification_evidence: list[dict[str, Any]] = []
+    for object_key, entry in sorted(dict(run_state.get("objects") or {}).items()):
+        if not isinstance(entry, Mapping):
+            continue
+        evidence = {
+            "object_key": object_key,
+            "bytes": entry.get("bytes"),
+            "sha256": entry.get("sha256"),
+            "uploaded": bool(entry.get("uploaded")),
+            "r2_verified": bool(entry.get("r2_verified")),
+            "r2_verified_at_utc": entry.get("r2_verified_at_utc"),
+        }
+        verification_evidence.append(evidence)
+        if not evidence["uploaded"] or not evidence["r2_verified"]:
+            remaining_scopes.append({
+                "stage": "r2_get_verification",
+                "object_key": object_key,
+                "gap_type": "uploaded_object_missing_r2_get_verification",
+            })
+    for blocked in list(run_state.get("blocked_scopes") or []):
+        if isinstance(blocked, Mapping):
+            remaining_scopes.append({"stage": "blocked_scope", **dict(blocked)})
+    stage_counts = {
+        stage: sum(1 for scope in remaining_scopes if scope.get("stage") == stage)
+        for stage in V2_REPAIR_STAGE_ORDER[:-1]
+    }
+    return {
+        "ran": True,
+        "status": "ok" if not remaining_scopes else "failed",
+        "verification_view_path": str(view_root),
+        "source_truth": "source_cache",
+        "local_object_resolution": "verified_overlay_first_then_dropbox",
+        "r2_get_verification_evidence": verification_evidence,
+        "r2_objects_changed": sum(1 for evidence in verification_evidence if evidence["uploaded"]),
+        "remaining_gap_count": len(remaining_scopes),
+        "remaining_scopes": remaining_scopes,
+        "six_stage_remaining_counts": stage_counts,
+        "recheck": recheck,
+    }
+
+
+def cleanup_successful_repair_overlay(run_state: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically remove duplicate generated bodies only after reporting."""
+    generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
+    verification_view = Path(str(run_state["run_root"])) / "final-verification-view"
+    shutil.rmtree(generated_root, ignore_errors=True)
+    shutil.rmtree(verification_view, ignore_errors=True)
+    run_state["cleanup"] = {
+        "policy": "successful repair removes generated-object duplicates and the verification view after reports; failed overlays are retained",
+        "completed_at_utc": fmt_iso(utc_now()),
+        "generated_objects_removed": True,
+        "verification_view_removed": True,
+    }
+    write_run_state(run_state)
+    return dict(run_state["cleanup"])
+
+
 def run_v2_integrity_repair_flow(
     *,
     run_state: dict[str, Any],
@@ -14156,6 +14302,13 @@ def run_v2_integrity_repair_flow(
     env: dict[str, str],
     v2_observations: Mapping[str, Any],
     v2_aqilevels: Mapping[str, Any],
+    final_verification_config: HistoryPathConfig,
+    from_day: str,
+    to_day: str,
+    allowed_connector_ids: set[int] | None,
+    source_scope: dict[str, Any] | None,
+    check_aqi_debug: bool,
+    require_aqi_debug: bool,
     limits: LimitTracker,
     dry_run: bool,
     log: logging.Logger,
@@ -14165,6 +14318,9 @@ def run_v2_integrity_repair_flow(
         conn=conn, run_id=run_id, env_name=env_name, run_compact=run_compact,
         env=env, v2_observations=v2_observations, dry_run=dry_run,
         run_backfill=True, limits=limits, log=log, run_state=run_state,
+        # Phase 4 owns the only AQI queue for this coordinator run.  The
+        # historical observation specialist must not enqueue a duplicate.
+        queue_aqi_from_observation_repairs=False,
     )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
@@ -14202,7 +14358,10 @@ def run_v2_integrity_repair_flow(
     metadata = (
         {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
         if observation_failed else
-        _run_v2_observation_metadata_executor(env=env, actions=metadata_actions, dry_run=dry_run, log=log)
+        _run_v2_observation_metadata_executor(
+            env=env, actions=metadata_actions, dry_run=dry_run, log=log,
+            run_state=run_state,
+        )
     )
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
@@ -14248,6 +14407,12 @@ def run_v2_integrity_repair_flow(
             # the exact observation objects Phase 3 PUT-and-GET verified; the
             # Dropbox mirror cannot contain this same-run state yet.
             skip_stale_local_post_validation=True,
+            extra_env={
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(run_state["overlay_root"]),
+                "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": "true",
+                "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": "false",
+            },
         )
         aqi_result["planned_phase4_aqi_work"] = planned_aqi_work
 
@@ -14266,6 +14431,7 @@ def run_v2_integrity_repair_flow(
                 object_keys = _capture_verified_v2_aqi_scope(
                     run_state=run_state, day_utc=day_utc,
                     connector_id=connector_id, env=env,
+                    include_debug=bool((v2_aqilevels.get("debug") or {}).get("required")),
                 )
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 aqi_capture_failures += 1
@@ -14290,9 +14456,9 @@ def run_v2_integrity_repair_flow(
             })
 
     aqi_metadata_actions = _v2_aqi_metadata_actions(v2_aqilevels)
-    # The AQI writer already emits its changed data, pollutant, connector and
-    # day manifests in one final connector/day write. Do not write those
-    # objects twice; retain only unchanged-scope manifest repairs here.
+    # The AQI writer emits manifests, but they are not trusted as the final
+    # metadata layer. Rebuild and verify pollutant, connector and day manifests
+    # from the final combined view before the targeted index is rebuilt.
     def aqi_action_scope(action: Mapping[str, Any]) -> tuple[str, int] | None:
         try:
             connector_id = int(action.get("connector_id"))
@@ -14306,20 +14472,31 @@ def run_v2_integrity_repair_flow(
         if aqi_action_scope(action) not in rebuilt_aqi_scopes
     ]
     for day_utc, connector_id in sorted(rebuilt_aqi_scopes):
-        aqi_metadata_actions.append({
+        matching_work = next(
+            (item for item in aqi_work if str(item["day_utc"]) == day_utc and int(item["connector_id"]) == connector_id),
+            {},
+        )
+        base = {
             "status": "planned", "executes": False,
             "data_changes_required": False, "operator_action_required": False,
             "history_version": "v2", "domain": "aqilevels",
-            "kind": "aqi_index_repair", "day_utc": day_utc,
-            "connector_id": connector_id, "requires_index_rebuild": True,
+            "day_utc": day_utc, "connector_id": connector_id,
+            "requires_index_rebuild": True,
             "gap_types": ["aqi_data_rebuilt"],
-        })
+        }
+        for pollutant_code in list(matching_work.get("pollutant_codes") or []):
+            aqi_metadata_actions.append({**base, "kind": "aqi_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+        aqi_metadata_actions.extend([
+            {**base, "kind": "aqi_connector_manifest_repair"},
+            {**base, "kind": "aqi_day_manifest_repair"},
+            {**base, "kind": "aqi_index_repair"},
+        ])
     aqi_metadata = (
         {"status": "blocked_dependency", "reason": "aqi_data_repair_failed", "results": []}
         if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0 else
         _run_v2_observation_metadata_executor(
             env=env, actions=aqi_metadata_actions, domain="aqilevels",
-            dry_run=dry_run, log=log,
+            dry_run=dry_run, log=log, run_state=run_state,
         )
     )
     _record_metadata_executor_overlay(
@@ -14327,6 +14504,28 @@ def run_v2_integrity_repair_flow(
         manifest_scope_set="AQI_MANIFESTS_CHANGED", index_scope_set="AQI_INDEXES_CHANGED",
         manifest_stage="aqilevels_manifests", index_stage="aqilevels_indexes",
     )
+    if dry_run:
+        final_verification: dict[str, Any] = {
+            "ran": False,
+            "status": "planned",
+            "reason": "dry_run_has_no_final_written_state",
+            "remaining_gap_count": None,
+            "r2_objects_changed": 0,
+        }
+    else:
+        final_verification = run_v2_final_verification(
+            run_state=run_state,
+            conn=conn,
+            env_name=env_name,
+            config=final_verification_config,
+            from_day=from_day,
+            to_day=to_day,
+            allowed_connector_ids=allowed_connector_ids,
+            source_scope=source_scope,
+            check_aqi_debug=check_aqi_debug,
+            require_aqi_debug=require_aqi_debug,
+            log=log,
+        )
     stage_results = [
         {"stage": "observs", "status": "failed" if observation_failed else ("planned" if dry_run else "succeeded"), "result": observations},
         {"stage": "observs_manifests", "status": metadata.get("status"), "result": metadata},
@@ -14334,15 +14533,32 @@ def run_v2_integrity_repair_flow(
         {"stage": "aqilevels", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else ("planned" if dry_run else "succeeded"), "result": aqi_result, "live_r2_read_exception": "writer_reads_verified_live_r2_observations"},
         {"stage": "aqilevels_manifests", "status": aqi_metadata.get("status"), "result": aqi_metadata},
         {"stage": "aqilevels_indexes", "status": aqi_metadata.get("status"), "reason": "the metadata executor runs AQI indexes once after final manifests per affected day"},
-        {"stage": "final_verification", "status": "not_run", "reason": "owned by a later phase"},
+        {"stage": "final_verification", "status": final_verification.get("status"), "result": final_verification},
     ]
+    coordinator_failed = (
+        observation_failed
+        or metadata.get("status") in {"failed", "blocked_dependency"}
+        or aqi_capture_failures
+        or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0
+        or aqi_metadata.get("status") in {"failed", "blocked_dependency"}
+        or final_verification.get("status") == "failed"
+    )
     result = {
-        "status": "failed" if observation_failed or metadata.get("status") in {"failed", "blocked_dependency"} or aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0 or aqi_metadata.get("status") in {"failed", "blocked_dependency"} else ("planned" if dry_run else "succeeded"),
+        "status": "failed" if coordinator_failed else (
+            "planned" if dry_run else "succeeded"
+        ),
         "dry_run": bool(dry_run),
         "write_enabled": not dry_run,
         "r2_write_attempted": not dry_run,
         "stage_order": list(V2_REPAIR_STAGE_ORDER),
         "stage_results": stage_results,
+        "six_stage_result_counts": {
+            status: sum(1 for stage in stage_results[:-1] if stage.get("status") == status)
+            for status in sorted({str(stage.get("status") or "not_run") for stage in stage_results[:-1]})
+        },
+        "final_verification": final_verification,
+        "r2_objects_changed": int(final_verification.get("r2_objects_changed") or 0),
+        "remaining_gap_count": final_verification.get("remaining_gap_count"),
         "overlay_root": run_state["overlay_root"],
         "run_state_path": run_state["run_state_path"],
     }
@@ -14465,6 +14681,7 @@ def check_dropbox_backup_ready(
         "backup_run_id": None,
         "backup_started_at": None,
         "backup_finished_at": None,
+        "running_backup_run": None,
         "latest_writer_finished_at": None,
         "writer_runs": [],
         "allow_stale_dropbox": bool(allow_stale_dropbox),
@@ -14549,10 +14766,15 @@ def check_dropbox_backup_ready(
         "backup_run_id",
         "backup_started_at",
         "backup_finished_at",
+        "running_backup_run",
         "latest_writer_finished_at",
     ):
         summary[key] = data.get(key)
     summary["writer_runs"] = writer_runs
+
+    if summary["running_backup_run"] is not None and not isinstance(summary["running_backup_run"], dict):
+        summary["blocked_reason"] = "daily_task_health_query_returned_unexpected_shape"
+        return summary
 
     if not data["ready"]:
         summary["blocked_reason"] = str(data.get("blocked_reason") or "backup_not_ready")
@@ -15854,6 +16076,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Backup run ID: {backup.get('backup_run_id') or '(none)'}",
             f"- Backup started at: {backup.get('backup_started_at') or '(none)'}",
             f"- Backup finished at: {backup.get('backup_finished_at') or '(none)'}",
+            f"- Running backup: {json.dumps(backup.get('running_backup_run'), sort_keys=True) if backup.get('running_backup_run') else '(none)'}",
             f"- Latest relevant writer finished at: {backup.get('latest_writer_finished_at') or '(none)'}",
             f"- Allow stale Dropbox: {bool(backup.get('allow_stale_dropbox'))}",
             f"- Blocked reason: {backup.get('blocked_reason') or '(none)'}",
@@ -15892,6 +16115,24 @@ def format_summary_md(s: dict[str, Any]) -> str:
             )
         if repair_flow.get("stage_results"):
             lines.append("")
+        final_verification = repair_flow.get("final_verification") or {}
+        if final_verification:
+            lines.extend([
+                "### Final verification",
+                "",
+                f"- Status: {final_verification.get('status') or '(none)'}",
+                f"- Source truth: {final_verification.get('source_truth') or '(none)'}",
+                f"- Local resolution: {final_verification.get('local_object_resolution') or '(none)'}",
+                f"- R2 objects changed: {final_verification.get('r2_objects_changed', 0)}",
+                f"- Remaining gap count: {final_verification.get('remaining_gap_count', '(not run)')}",
+                "",
+            ])
+            for scope in list(final_verification.get("remaining_scopes") or [])[:100]:
+                lines.append(
+                    "- Remaining: " + json.dumps(scope, sort_keys=True, default=str)
+                )
+            if final_verification.get("remaining_scopes"):
+                lines.append("")
     lookup_counts = s.get("lookup_source_counts") or {}
     if lookup_counts:
         lines.extend([
@@ -16760,6 +17001,13 @@ def main(argv: list[str]) -> int:
                 env=env,
                 v2_observations=cross_check_metrics.get("v2_observations") or {},
                 v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
+                final_verification_config=history_path_configs["v2"],
+                from_day=from_day,
+                to_day=to_day,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                source_scope=v2_source_scope,
+                check_aqi_debug=bool(args.check_aqi_debug),
+                require_aqi_debug=bool(args.require_aqi_debug),
                 limits=limits,
                 dry_run=bool(args.dry_run),
                 log=log,
@@ -16796,7 +17044,13 @@ def main(argv: list[str]) -> int:
             + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
             + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
         )
-        if v2_gap_count_for_status > 0:
+        coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
+        if args.run_backfill:
+            if coordinator_failed:
+                status = "fail"
+            elif not args.dry_run:
+                status = "ok"
+        elif v2_gap_count_for_status > 0:
             status = "fail"
 
         # Build the notes from snapshot + openaq outcomes.
@@ -16976,7 +17230,7 @@ def main(argv: list[str]) -> int:
             + _sum("backfills_failed")
             + cross_check_backfills_failed
             + aqi_rebuilds_failed
-            + v2_gap_count_for_status
+            + (v2_gap_count_for_status if not args.run_backfill else 0)
         )
         warnings_count_total = warnings_delta
         if openaq_metrics.get("skipped_reason"):
@@ -17231,6 +17485,9 @@ def main(argv: list[str]) -> int:
         )
         log.info("report_json=%s", json_path)
         log.info("report_md=%s", md_path)
+        if repair_overlay is not None and status == "ok" and not args.dry_run:
+            cleanup = cleanup_successful_repair_overlay(repair_overlay)
+            log.info("successful repair overlay cleanup=%s", json.dumps(cleanup, sort_keys=True))
         log.info("done status=%s runtime_seconds=%s", status, runtime_seconds)
         if daily_task_health_enabled:
             finish_summary = {
@@ -17263,6 +17520,11 @@ def main(argv: list[str]) -> int:
                 "aqi_rebuilds_queued": metrics.get("aqi_rebuilds_queued_total", 0),
                 "aqi_rebuilds_ok": metrics.get("aqi_rebuilds_complete", 0),
                 "aqi_rebuilds_failed": metrics.get("aqi_rebuilds_failed", 0),
+                "r2_write_attempted": bool(repair_flow.get("r2_write_attempted")),
+                "r2_objects_changed": int(repair_flow.get("r2_objects_changed") or 0),
+                "six_stage_result_counts": repair_flow.get("six_stage_result_counts") or {},
+                "overlay_path": repair_flow.get("overlay_root"),
+                "remaining_gap_count": repair_flow.get("remaining_gap_count"),
                 "runtime_seconds": runtime_seconds,
                 "report_json_path": str(json_path),
                 "backup_readiness": backup_gate_summary,
@@ -17283,7 +17545,7 @@ def main(argv: list[str]) -> int:
                 log.warning("daily task health finish failed: %s", exc)
                 if daily_task_health_strict:
                     raise
-        return 0
+        return 1 if status == "fail" else 0
     except Exception as exc:
         log.exception("run failed: %s", exc)
         if run_id is not None:
@@ -17319,6 +17581,11 @@ def main(argv: list[str]) -> int:
                 "status": "error",
                 "allow_stale_dropbox": bool(args.allow_stale_dropbox),
                 "runtime_seconds": round(time.monotonic() - started_mono, 3),
+                "r2_write_attempted": bool((repair_flow if "repair_flow" in locals() else {}).get("r2_write_attempted")),
+                "r2_objects_changed": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_changed") or 0),
+                "six_stage_result_counts": (repair_flow if "repair_flow" in locals() else {}).get("six_stage_result_counts") or {},
+                "overlay_path": (repair_flow if "repair_flow" in locals() else {}).get("overlay_root"),
+                "remaining_gap_count": (repair_flow if "repair_flow" in locals() else {}).get("remaining_gap_count"),
                 "backup_readiness": backup_gate_summary,
                 "log_path": str(log_path),
             }

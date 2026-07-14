@@ -971,6 +971,58 @@ git diff --check
 
 No Integrity run, R2 request, deployment, commit, stage, or push was performed.
 
+### Phase 1 to 4 correction record — 2026-07-14
+
+The Phase 1 to 4 implementation was corrected after a cross-stage review.
+
+- The canonical Integrity readiness RPC now blocks a running Dropbox backup as
+  `dropbox_backup_running` and returns its task details for reports. It remains
+  separate from unrelated backup-readiness callers.
+- Source-to-R2 writers retain their exact generated observation and AQI bytes
+  in the sparse run overlay. Integrity compares each subsequent R2 GET with
+  those bytes before marking the object verified; it no longer populates the
+  overlay by copying a later live object.
+- Metadata repair plans from the verified overlay plus Dropbox combined local
+  view. It can reconstruct a faulty pollutant manifest when final parquet
+  metadata is available and emits an exact blocked dependency reason when it
+  is not. R2 is reserved for writes, GET verification and parent race guards.
+- A successful observation repair no longer uses the legacy AQI queue path.
+  The Phase 4 coordinator is the sole AQI queue owner, one connector/day.
+- AQI writer-generated manifests are rebuilt and verified in pollutant,
+  connector and day order before the targeted AQI index. Optional AQI debug
+  output is captured only when `--require-aqi-debug` made it required.
+- Repair-stage completion is reported as
+  `repair_stages_completed_final_verification_pending`. Pre-repair gaps remain
+  evidence for Phase 5 and do not alone make a completed coordinator run fail.
+
+Structural checks passed: `py_compile`, `bash -n`, `node --check`, `deno check`
+and `git diff --check` (including the schema repository). No Integrity run, R2
+request, SQL apply, deployment, commit, stage or push was performed.
+
+## Phase 5 implementation record — 2026-07-14
+
+Implemented one final, read-only verification pass after the six ordered repair
+stages.
+
+- The final pass reuses the v2 validators against a disposable combined local
+  view. It resolves verified overlay objects before Dropbox objects and uses
+  source-cache for observation truth.
+- It verifies observations, observation manifests and indexes, AQI Levels, AQI
+  manifests and indexes. It records every remaining actionable scope by stage,
+  plus the existing R2 GET verification evidence for each changed object.
+- Remaining actionable gaps, unverified uploaded objects and blocked scopes
+  make the coordinator fail, and the top-level process returns non-zero.
+- Daily task-health summaries now include repair flags at start and R2 write
+  attempt, changed-object count, six-stage counts, overlay path and remaining
+  gap count at finish.
+- Cleanup is deterministic: after reports for a successful non-dry-run repair,
+  remove only `generated-objects` and the disposable verification view. Retain
+  the sparse verified overlay and run state. Failed overlays are retained.
+
+Structural checks passed: `py_compile`, `bash -n`, `node --check`, `deno check`
+and `git diff --check`. No Integrity run, R2 request, deployment, commit, stage
+or push was performed.
+
 ## Recommended model
 
 ```text
