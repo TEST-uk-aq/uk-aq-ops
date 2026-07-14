@@ -211,8 +211,11 @@ system doc.
 See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) for the full system doc.
 
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh`
-  - Thin shell launcher; loads `<ENV>.env`, runs guardrails, creates state
-    dirs, takes a per-environment PID lock, then calls the python entrypoint.
+  - Stable dispatcher source; selects the repository from the local
+    `CIC-Test.env` or `LIVE.env` selector and forwards arguments.
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh`
+  - Repository runner; loads the root `.env`, derives paths, runs guardrails,
+    creates state dirs, takes a per-environment PID lock, then calls Python.
   - Required arg `--env CIC-Test|LIVE`; forwards `--profile`, `--source`,
     `--from-day`, `--to-day`, `--dry-run`, `--check-only`, and v2-only
     `--history-version v2`,

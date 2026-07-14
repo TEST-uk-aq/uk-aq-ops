@@ -2084,3 +2084,30 @@ reviewing dry-run output
 approving the first R2 write
 checking next-day scheduled readiness
 ```
+
+## Two-layer startup implementation record — 2026-07-14
+
+- The repository launcher is now split into a stable dispatcher source at
+  `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh` and the
+  separately named repository runner
+  `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh`.
+- The dispatcher reads only the local `CIC-Test.env` or `LIVE.env` selector,
+  preserves arguments, exports the selected environment and local root, and
+  `exec`s the selected repository runner. The runner loads only the selected
+  repository root `.env`, derives non-Dropbox state, Dropbox output paths, the
+  v2 core snapshot root and specialist wrapper, then retains the existing lock
+  and Python guardrails.
+- The specialist wrapper now derives its repository root and loads that root
+  `.env`; it no longer reads the local profile selector files. It requires the
+  root `.env` `UK_AQ_BACKFILL_WRAPPER` to resolve to the real active backfill
+  wrapper and preserves observation-only/AQI-only, recursion, archive and
+  dynamic strict-value guardrails.
+- The root `.env` gained only missing non-secret Integrity settings and its
+  backfill wrapper path now resolves to this repository. No credential values
+  were changed or exposed. The LIVE repository selector remains an explicit
+  deployment-time value and was not guessed.
+
+Structural validation used shell syntax, help output and temporary stub
+fixtures for selector parsing, missing-selector failure, wrong-repository
+failure, argument preservation, repository path derivation and runner-to-Python
+handoff. No operational command or remote request was run.

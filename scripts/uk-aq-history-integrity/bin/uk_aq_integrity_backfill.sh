@@ -393,22 +393,39 @@ if (( OBSERVS_ONLY == 1 )) && [[ -z "${TIMESERIES_IDS}" ]]; then
   echo "ERROR: --observs-only requires --timeseries-ids." >&2
   exit 2
 fi
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ROOT="${UK_AQ_HISTORY_INTEGRITY_ROOT:-${DEFAULT_ROOT}}"
-ENV_FILE="${ROOT}/env/${ENV_NAME}.env"
-if [[ ! -f "${ENV_FILE}" ]]; then
-  echo "ERROR: env file not found: ${ENV_FILE}" >&2
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -P -- "${SCRIPT_DIR}/../../.." && pwd -P)"
+if [[ "${REPO_ROOT}" == *"/archive/"* ]]; then
+  echo "ERROR: specialist wrapper resolves under an archive path: ${REPO_ROOT}" >&2
+  exit 4
+fi
+if [[ -n "${UK_AQ_OPS_REPO_ROOT:-}" ]]; then
+  EXPORTED_REPO_ROOT="$(resolve_abs_path "${UK_AQ_OPS_REPO_ROOT}")"
+  ACTUAL_REPO_ROOT="$(resolve_abs_path "${REPO_ROOT}")"
+  if [[ "${EXPORTED_REPO_ROOT}" != "${ACTUAL_REPO_ROOT}" ]]; then
+    echo "ERROR: UK_AQ_OPS_REPO_ROOT points to a different repository." >&2
+    exit 4
+  fi
+fi
+
+ENV_FILE="${REPO_ROOT}/.env"
+if [[ ! -f "${ENV_FILE}" || ! -r "${ENV_FILE}" ]]; then
+  echo "ERROR: repository root .env not found or unreadable: ${ENV_FILE}" >&2
   exit 3
 fi
 
 set -a
+# The shared repository .env is the only environment source for this wrapper.
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
 
+export UK_AQ_ENV_NAME="${ENV_NAME}"
+export UK_AQ_OPS_REPO_ROOT="${REPO_ROOT}"
+export UK_AQ_BACKFILL_ENV_FILE="${ENV_FILE}"
+
 if [[ "$(trim "${UK_AQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
-  echo "ERROR: --env=${ENV_NAME} but UK_AQ_ENV_NAME=${UK_AQ_ENV_NAME:-unset} in ${ENV_FILE}." >&2
+  echo "ERROR: failed to set authoritative UK_AQ_ENV_NAME=${ENV_NAME}." >&2
   exit 4
 fi
 
@@ -437,29 +454,18 @@ for var_name in \
   fi
 done
 
-INTEGRITY_WRAPPER="$(resolve_integrity_wrapper_var)"
-if [[ -z "${INTEGRITY_WRAPPER}" ]]; then
-  echo "ERROR: integrity wrapper path is not set; define UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER (preferred) or UK_AQ_INTEGRITY_BACKFILL_WRAPPER in ${ENV_FILE}." >&2
-  exit 4
-fi
-BACKFILL_ENV_FILE="$(require_env UK_AQ_BACKFILL_ENV_FILE)"
+INTEGRITY_WRAPPER="${SCRIPT_DIR}/uk_aq_integrity_backfill.sh"
+BACKFILL_ENV_FILE="${ENV_FILE}"
 SELF_PATH="$(resolve_abs_path "${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")")"
 
 if [[ "${INTEGRITY_WRAPPER}" == *"/archive/"* || "${INTEGRITY_WRAPPER}" == */archive/* ]]; then
   echo "ERROR: integrity wrapper points to archive path (retired): ${INTEGRITY_WRAPPER}" >&2
   exit 4
 fi
-if [[ ! -f "${INTEGRITY_WRAPPER}" ]]; then
+if [[ ! -f "${INTEGRITY_WRAPPER}" || ! -x "${INTEGRITY_WRAPPER}" ]]; then
   echo "ERROR: integrity wrapper not found: ${INTEGRITY_WRAPPER}" >&2
   exit 4
 fi
-if [[ ! -f "${BACKFILL_ENV_FILE}" ]]; then
-  echo "ERROR: UK_AQ_BACKFILL_ENV_FILE not found: ${BACKFILL_ENV_FILE}" >&2
-  exit 4
-fi
-
-unset UK_AQ_BACKFILL_WRAPPER || true
-apply_env_file_safe "${BACKFILL_ENV_FILE}"
 BACKFILL_WRAPPER="$(require_env UK_AQ_BACKFILL_WRAPPER)"
 BACKFILL_WRAPPER_PATH="$(resolve_abs_path "${BACKFILL_WRAPPER}")"
 INTEGRITY_WRAPPER_PATH="$(resolve_abs_path "${INTEGRITY_WRAPPER}")"

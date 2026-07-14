@@ -48,10 +48,10 @@ The complete ops checkout is the supported runtime location:
 /Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops
 ```
 
-Run the launcher from:
+Run the repository runner directly from:
 
 ```text
-/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
+/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh
 ```
 
 Phases 3 and 4 are supported only from this complete checkout. Their executor imports
@@ -72,11 +72,11 @@ The checkout keeps the source and environment templates:
 ```text
 scripts/uk-aq-history-integrity/
   bin/
-    uk-aq-history-integrity.sh
+    uk-aq-history-integrity-runner.sh
     uk-aq-history-integrity.py
   env/
-    CIC-Test.env.example
-    LIVE.env.example
+    CIC-Test.env.example (legacy tooling reference)
+    LIVE.env.example (legacy tooling reference)
 ```
 
 The live SQLite DBs stay outside Dropbox during writes. After a successful run,
@@ -161,55 +161,73 @@ There are **no** separate script forks for `CIC-Test` and `LIVE`. The launcher
 selects the environment at runtime:
 
 ```bash
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile daily
+"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily
+"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile daily
 ```
 
-The Python implementation receives the selected env config via environment
-variables exported by the shell launcher.
+The local deployed dispatcher at
+`/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh`
+selects `CIC-Test` or `LIVE` from its tiny local selector file and forwards
+arguments to the selected repository runner. The runner loads only the
+selected repository root `.env`, derives state under
+`/Users/mikehinford/uk-aq-history-integrity/state/<ENV>/`, derives Dropbox
+logs/reports from `UK_AQ_DROPBOX_ROOT`, and invokes the repository Python
+coordinator. The dispatcher does not load credentials or the repository `.env`.
 
 ---
 
 ## Environment profiles
 
-### CIC-Test env file
+### Repository root `.env`
 
-Source the template from the complete checkout and configure local state paths.
+The selected repository root `.env` is the shared source for credentials, R2,
+backfill and Dropbox settings. The runner reasserts its authoritative
+environment and repository-owned paths after loading it.
 
 Example contents:
 
 ```bash
-UK_AQ_ENV_NAME="CIC-Test"
-
-UK_AQ_OPS_REPO_ROOT="/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops"
-UK_AQ_HISTORY_INTEGRITY_ROOT="${UK_AQ_OPS_REPO_ROOT}/scripts/uk-aq-history-integrity"
-UK_AQ_HISTORY_INTEGRITY_STATE_DIR="/Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test"
-UK_AQ_HISTORY_INTEGRITY_DB_PATH="${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}/uk_aq_history_integrity.sqlite"
-UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR="${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}/source-cache"
-UK_AQ_HISTORY_INTEGRITY_TMP_DIR="${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}/tmp"
-UK_AQ_HISTORY_INTEGRITY_LOG_DIR="${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}/logs"
-UK_AQ_HISTORY_INTEGRITY_REPORT_DIR="${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}/reports"
-UK_AQ_HISTORY_INTEGRITY_LOCK_DIR="${UK_AQ_HISTORY_INTEGRITY_STATE_DIR}/locks"
-
-UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/uk-aq-history-integrity/uk_aq_history_integrity.sqlite"
-
 UK_AQ_DROPBOX_ROOT="CIC-Test"
 UK_AQ_R2_HISTORY_DROPBOX_DIR="R2_history_backup"
-UK_AQ_R2_HISTORY_INTEGRITY_VERSION="v2"
-UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup/history/v2/core"
-
-UK_AQ_BACKFILL_WRAPPER="${UK_AQ_OPS_REPO_ROOT}/scripts/uk_aq_backfill_local.sh"
-UK_AQ_BACKFILL_ENV_FILE="/PATH/TO/CIC-Test/backfill.env"
+UK_AQ_BACKFILL_WRAPPER="<REPO_ROOT>/scripts/uk_aq_backfill_local.sh"
 ```
 
-### LIVE env file
+### Local selector files
 
-Use the same complete checkout and substitute `LIVE` only in the local state
-paths. LIVE execution remains subject to its separate approval gates.
+The deployed dispatcher reads only these two one-line files:
+
+```bash
+# /Users/mikehinford/uk-aq-history-integrity/env/CIC-Test.env
+UK_AQ_OPS_REPO_ROOT="<CIC-Test ops repository>"
+
+# /Users/mikehinford/uk-aq-history-integrity/env/LIVE.env
+UK_AQ_OPS_REPO_ROOT="<configured LIVE ops repository>"
+```
+
+They contain no `UK_AQ_ENV_NAME`, credentials, R2 settings or runtime paths.
+The LIVE repository path must be configured explicitly and must not be guessed.
+
+One-time local installation, performed manually on the runtime machine:
+
+```bash
+cp \
+  scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh \
+  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
+
+chmod +x \
+  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
+```
+
+Back up the existing local dispatcher before copying it. Create or replace
+`CIC-Test.env` with its one-line CIC-Test repository selector, and create or
+update `LIVE.env` only with the configured LIVE repository selector. Do not
+change the existing local `state/CIC-Test` or `state/LIVE` trees. Future
+repository updates do not require recopying the repository runner. Recopy the
+dispatcher only when its selector protocol changes.
 
 ### Required env vars
 
-The shell launcher refuses to start if any of these are unset:
+The repository runner derives and validates these values before starting:
 
 ```text
 UK_AQ_ENV_NAME
@@ -473,10 +491,10 @@ ERROR: --env=LIVE but UK_AQ_HISTORY_INTEGRITY_DB_PATH=/.../state/CIC-Test/... co
 
 ## Script interface
 
-Launcher:
+Repository runner:
 
 ```text
-/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh
+/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh
 ```
 
 Python entrypoint:
@@ -485,17 +503,21 @@ Python entrypoint:
 /Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py
 ```
 
-The launcher is a thin shell wrapper that:
+The repository runner is responsible for:
 
 1. Parses `--env`.
-2. Loads `<UK_AQ_HISTORY_INTEGRITY_ROOT>/env/<ENV>.env`. The root defaults to
-   the parent of `bin/`; override with `UK_AQ_HISTORY_INTEGRITY_ROOT`.
+2. Loads only the selected repository root `.env`.
 3. Validates required env vars and environment/path guardrails.
 4. Runs structural preflight checks (writable paths, DB parent, and the v2 core
    snapshot root/manifest contract).
 5. Creates required directories.
 6. Acquires a per-environment PID lock.
 7. Invokes the Python entrypoint, then cleans up the lock on EXIT/INT/TERM.
+
+The stable local dispatcher source is
+`scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh`. Copy it
+without renaming to `/Users/mikehinford/uk-aq-history-integrity/bin/`.
+It reads only the two local selector files and invokes this runner.
 
 Python then runs a stricter preflight phase (before any SQLite writes, source
 checks/downloads, cross-checks, or backfill calls).
@@ -545,9 +567,9 @@ Notes:
 Example commands:
 
 ```bash
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile weekly
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --source openaq --from-day 2026-04-01 --to-day 2026-04-30 --dry-run
+"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily
+"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile weekly
+"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --source openaq --from-day 2026-04-01 --to-day 2026-04-30 --dry-run
 ```
 
 ### UK-AIR SOS flat-file model and run examples
@@ -718,7 +740,7 @@ SOS-focused operational examples:
 
 ```bash
 # Dry-run planning for the default UK-AIR flat-file adapter
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" \
+"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" \
   --env CIC-Test \
   --profile manual \
   --source sos \
@@ -727,7 +749,7 @@ SOS-focused operational examples:
   --dry-run
 
 # Real flat-file check-only run (writes state, no backfill)
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" \
+"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" \
   --env CIC-Test \
   --profile manual \
   --source sos \
@@ -778,26 +800,26 @@ Stagger CIC-Test and LIVE so they do not overlap.
 
 ```cron
 # CIC-Test daily check
-30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
 
 If you want it to auto-backfill, use:
 
-30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily --history-version v2 >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily --history-version v2 >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
 
 # LIVE daily check
-30 5 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile daily >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
+30 5 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile daily >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
 
 # CIC-Test weekly check
-30 3 * * 0 "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile weekly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 3 * * 0 "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile weekly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
 
 # LIVE weekly check
-30 4 * * 0 "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile weekly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
+30 4 * * 0 "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile weekly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
 
 # CIC-Test monthly check
-30 2 1 * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile monthly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 2 1 * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile monthly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
 
 # LIVE monthly check
-30 3 1 * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile monthly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
+30 3 1 * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile monthly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
 ```
 
 ---
@@ -1540,9 +1562,10 @@ Do not use broad connector/day force-replace unless explicitly configured.
 
 Delivered:
 
-- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh` — thin
-  shell launcher; argument parsing, env loading, guardrails, dir creation,
-  PID locking.
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh` — stable
+  local-dispatcher source; selects the repository from a tiny local selector.
+- `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh` —
+  repository runner; loads the root `.env`, derives paths, guards and locks.
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py` —
   Python entrypoint; defense-in-depth guardrails, SQLite schema creation,
   CLI argument handling, run row, JSON+MD summary report.
