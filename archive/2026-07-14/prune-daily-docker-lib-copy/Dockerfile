@@ -7,7 +7,6 @@ COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 
 COPY workers ./workers
-COPY lib ./lib
 
 EXPOSE 8080
 CMD ["node", "workers/uk_aq_prune_daily/server.mjs"]
