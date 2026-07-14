@@ -1928,6 +1928,38 @@ function writeTargetedStageJson(
   fs.renameSync(tempPath, filePath);
 }
 
+// Integrity repair keeps a sparse, run-owned copy of the exact bytes generated
+// by the writer.  It is deliberately separate from the row merge stage: the
+// coordinator compares this local output with the subsequent R2 GET before it
+// marks an overlay object verified.
+function writeTargetedStageObject(key: string, body: Uint8Array | string): void {
+  if (!SOURCE_TO_R2_TARGETED_STAGE_ENABLED || !SOURCE_TO_R2_TARGETED_STAGE_ROOT) {
+    return;
+  }
+  const normalizedKey = key.replace(/^\/+/, "");
+  if (!normalizedKey || normalizedKey.split("/").some((part) => part === "..")) {
+    throw new Error(`Unsafe targeted-stage object key: ${key}`);
+  }
+  const outputPath = path.join(
+    SOURCE_TO_R2_TARGETED_STAGE_ROOT,
+    "generated-objects",
+    ...normalizedKey.split("/"),
+  );
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  const tempPath = `${outputPath}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  fs.writeFileSync(tempPath, body);
+  fs.renameSync(tempPath, outputPath);
+}
+
+async function putHistoryObjectWithTargetedStage(args: {
+  key: string;
+  body: Uint8Array | string;
+  content_type: string;
+}): Promise<{ bytes: number; etag: string | null }> {
+  writeTargetedStageObject(args.key, args.body);
+  return await r2PutObject({ r2: OBS_R2_CONFIG, ...args });
+}
+
 function readObsRowsForConnectorDayFromTargetedStage(
   dayUtc: string,
   connectorId: number,
@@ -4619,8 +4651,7 @@ async function exportObsConnectorRowsToR2V2(args: {
         partIndex,
       );
       const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
-      const putResult = await r2PutObject({
-        r2: OBS_R2_CONFIG,
+      const putResult = await putHistoryObjectWithTargetedStage({
         key: partKey,
         body: parquetBuffer,
         content_type: "application/octet-stream",
@@ -4662,8 +4693,7 @@ async function exportObsConnectorRowsToR2V2(args: {
       writerGitSha: OBS_R2_WRITER_GIT_SHA,
       backedUpAtUtc: nowIso(),
     });
-    await r2PutObject({
-      r2: OBS_R2_CONFIG,
+    await putHistoryObjectWithTargetedStage({
       key: manifestKey,
       body: encodeJsonBody(pollutantManifest),
       content_type: "application/json",
@@ -4690,8 +4720,7 @@ async function exportObsConnectorRowsToR2V2(args: {
   connectorManifest.rows_skipped_missing_pollutant_code = classification.rows_skipped_missing_pollutant_code;
   connectorManifest.example_missing_pollutant_rows = classification.example_missing_pollutant_rows;
   connectorManifest.pollutant_codes_written = classification.pollutant_codes_written;
-  await r2PutObject({
-    r2: OBS_R2_CONFIG,
+  await putHistoryObjectWithTargetedStage({
     key: manifestKey,
     body: encodeJsonBody(connectorManifest),
     content_type: "application/json",
@@ -4834,8 +4863,7 @@ async function exportAqiConnectorRowsToR2V2(args: {
         const parquetBuffer = profile === "data"
           ? rowsToAqiDataV2ParquetBuffer(parquetRows)
           : rowsToAqiDebugV2ParquetBuffer(parquetRows);
-        const putResult = await r2PutObject({
-          r2: OBS_R2_CONFIG,
+        const putResult = await putHistoryObjectWithTargetedStage({
           key: partKey,
           body: parquetBuffer,
           content_type: "application/vnd.apache.parquet",
@@ -4873,8 +4901,7 @@ async function exportAqiConnectorRowsToR2V2(args: {
         writerGitSha: OBS_R2_WRITER_GIT_SHA,
         backedUpAtUtc: nowIso(),
       });
-      await r2PutObject({
-        r2: OBS_R2_CONFIG,
+      await putHistoryObjectWithTargetedStage({
         key: manifestKey,
         body: encodeJsonBody(pollutantManifest),
         content_type: "application/json",
@@ -4918,14 +4945,12 @@ async function exportAqiConnectorRowsToR2V2(args: {
     writerGitSha: OBS_R2_WRITER_GIT_SHA,
     backedUpAtUtc: nowIso(),
   });
-  await r2PutObject({
-    r2: OBS_R2_CONFIG,
+  await putHistoryObjectWithTargetedStage({
     key: dataConnectorManifestKey,
     body: encodeJsonBody(dataConnectorManifest),
     content_type: "application/json",
   });
-  await r2PutObject({
-    r2: OBS_R2_CONFIG,
+  await putHistoryObjectWithTargetedStage({
     key: debugConnectorManifestKey,
     body: encodeJsonBody(debugConnectorManifest),
     content_type: "application/json",

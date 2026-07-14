@@ -36,15 +36,25 @@ directory and do not rely on an undocumented runtime bundle.
 remain rejected. `--check-only` and `--run-backfill` are mutually exclusive.
 `--run-backfill --dry-run` records the complete stage plan without writes;
 without `--dry-run`, the coordinator runs the ordered observation and AQI
-stages. The AQI writer uses the already verified live-R2 observation scope as
-the narrow same-run exception; generated AQI objects are GET-verified into the
-overlay before metadata/index work proceeds.
+stages through AQI indexes, then performs one read-only final verification. It
+uses source-cache for observation truth and a disposable overlay-first,
+Dropbox-second local view for observations, manifests and indexes. Any
+actionable remaining scope fails the run. The AQI writer uses the already
+verified live-R2 observation scope as the narrow
+same-run exception; generated AQI objects are compared with the subsequent GET
+before they are marked verified in the overlay.
 
 The overlay is under `UK_AQ_HISTORY_INTEGRITY_TMP_DIR/run-<UTC>/overlay` and
 contains only changed/generated objects. `run-state.json` records object hashes,
 dependencies, upload/verification state, changed scopes, and blocked scopes.
 Later stages resolve a verified overlay object first, then the matching
 `R2_history_backup` object. The backup is never updated or copied into.
+
+The final report includes prior R2 GET verification evidence for every changed
+object. On a successful non-dry-run repair, Integrity removes only the
+duplicate `generated-objects` staging directory and the disposable final
+verification view after the reports are written. It retains the sparse verified
+overlay and `run-state.json`; failed overlays are retained unchanged.
 
 ## Backup gate
 
@@ -60,16 +70,17 @@ readiness RPC unchanged for its existing callers.
 - A previous `ops.history_integrity` attempt is a writer only when its task
   summary has `repair_mode=true` (or the legacy `run_backfill=true`) and
   `dry_run=false`.
-- Any relevant writer still in `Started` blocks the run. The qualifying backup
+- Any relevant writer still in `Started`, including a Dropbox backup attempt,
+  blocks the run. The qualifying backup
   must also have finished before the current Integrity run started.
 - If the gate is not ready, the run exits early with
   `status=blocked_backup_not_ready`.
 - `--allow-stale-dropbox` remains an explicit recovery override and is
   recorded in the JSON and Markdown reports.
 
-The RPC returns the qualifying backup run and timestamps plus the latest
-finished/running state for every relevant writer, so the report explains the
-decision without inspecting R2.
+The RPC returns the qualifying backup run and timestamps, any running Dropbox
+backup details, and the latest finished/running state for every relevant writer,
+so the report explains the decision without inspecting R2.
 
 The gate calls the RPC through the exposed `uk_aq_public` PostgREST schema and
 uses the Obs AQI DB credential order: dedicated daily-task-health variables,

@@ -41,7 +41,7 @@ Forwarded options:
   --dry-run                               Plan only; no remote calls.
   --check-only                            Detect changes; do not backfill.
   --run-backfill                          Enable the ordered v2 repair flow.
-                                           Phase 2 plans/stubs stages only; it makes no R2 writes.
+                                           Runs stages 1 to 6 and final read-only verification.
   --max-download-mb N                     Soft cap on downloaded MB.
   --max-runtime-minutes N                 Soft cap on runtime minutes.
   --verbose                               More detailed logging.
