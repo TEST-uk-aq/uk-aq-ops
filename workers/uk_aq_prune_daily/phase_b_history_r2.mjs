@@ -24,6 +24,10 @@ import {
   OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
 } from "../shared/uk_aq_observation_property_code.mjs";
 import {
+  buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
+  rebuildR2HistoryIndexes,
+} from "../shared/uk_aq_r2_history_index.mjs";
+import {
   AQI_SUPPORTED_POLLUTANTS,
   buildAqilevelHistoryRowsForDayFromSourceObservations,
 } from "../../lib/aqi/aqi_levels.mjs";
@@ -4755,7 +4759,12 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc })
   if (!dataHead.exists || !debugHead.exists) {
     throw new Error(`AQI day manifest verification failed for day=${dayUtc}`);
   }
-  const indexVerification = await verifyAqilevelDayIndexes({
+  const indexBuild = await buildAqilevelDayIndexesForTest({
+    runtime,
+    dayUtc,
+    connectorManifests: dataConnectorManifests,
+  });
+  const indexVerification = await verifyAqilevelDayIndexesForTest({
     runtime,
     dayUtc,
     connectorManifests: dataConnectorManifests,
@@ -4765,27 +4774,75 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc })
     data_day_manifest_key: dataDayManifestKey,
     debug_day_manifest_key: debugDayManifestKey,
     connector_manifest_count: dataConnectorManifests.length,
+    index_build: indexBuild,
     index_verification: indexVerification,
   };
 }
 
-async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManifests }) {
+export function extractAqilevelIndexPollutantsFromConnectorManifestForTest(manifest) {
+  const candidates = [];
+  if (Array.isArray(manifest?.pollutant_codes)) candidates.push(...manifest.pollutant_codes);
+  const childLists = [manifest?.pollutant_manifests, manifest?.child_manifests];
+  for (const list of childLists) {
+    if (!Array.isArray(list)) continue;
+    for (const child of list) candidates.push(child?.pollutant_code);
+  }
+  return uniqueSorted(
+    candidates
+      .map((code) => normalizeObservationPropertyCode(code))
+      .filter((code) => AQI_SUPPORTED_POLLUTANTS.includes(code)),
+  );
+}
+
+export function requiredAqilevelDayIndexKeysForTest({ runtime, dayUtc, connectorManifests }) {
+  const requiredKeys = new Set();
+  for (const manifest of connectorManifests || []) {
+    const connectorId = parseManifestPositiveInt(manifest?.connector_id, "connector_id", false);
+    if (!connectorId) continue;
+    for (const pollutant of extractAqilevelIndexPollutantsFromConnectorManifestForTest(manifest)) {
+      requiredKeys.add(buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
+        runtime.aqilevels_timeseries_index_prefix,
+        dayUtc,
+        connectorId,
+        pollutant,
+      ));
+    }
+  }
+  return Array.from(requiredKeys).sort((a, b) => a.localeCompare(b));
+}
+
+export async function buildAqilevelDayIndexesForTest({ runtime, dayUtc, connectorManifests }) {
   if (!runtime.phase_b_calculate_aqi_from_observations_enabled) {
     return { required: false, reason: "legacy_aqi_rpc_export" };
   }
-  const requiredKeys = new Set();
-  for (const manifest of connectorManifests) {
-    const connectorId = parseManifestPositiveInt(manifest?.connector_id, "connector_id", false);
-    const pollutantCounts = manifest?.pollutant_counts && typeof manifest.pollutant_counts === "object"
-      ? manifest.pollutant_counts
-      : {};
-    for (const pollutant of Object.keys(pollutantCounts).sort()) {
-      if (Number(pollutantCounts[pollutant] || 0) > 0) {
-        requiredKeys.add(`${runtime.aqilevels_timeseries_index_prefix || "history/_index_v2/aqilevels_hourly_data_timeseries"}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutant}/manifest.json`);
-      }
-    }
+  const requiredKeys = requiredAqilevelDayIndexKeysForTest({ runtime, dayUtc, connectorManifests });
+  if (requiredKeys.length === 0) return { required: false, reason: "no_supported_aqi_source" };
+  const summary = await rebuildR2HistoryIndexes({
+    env: {
+      R2_ENDPOINT: runtime.r2?.endpoint,
+      R2_BUCKET: runtime.r2?.bucket,
+      R2_ACCESS_KEY_ID: runtime.r2?.access_key_id,
+      R2_SECRET_ACCESS_KEY: runtime.r2?.secret_access_key,
+      R2_REGION: runtime.r2?.region || "auto",
+      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: runtime.aqilevels_prefix,
+      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: runtime.aqilevels_timeseries_index_prefix,
+      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: runtime.index_prefix_v2 || "history/_index_v2",
+    },
+    domains: ["aqilevels"],
+    historyVersion: "v2",
+    targetDays: [dayUtc],
+    fetchConcurrency: 1,
+    writeR2: true,
+  });
+  return { required: true, required_index_manifest_count: requiredKeys.length, summary };
+}
+
+export async function verifyAqilevelDayIndexesForTest({ runtime, dayUtc, connectorManifests }) {
+  if (!runtime.phase_b_calculate_aqi_from_observations_enabled) {
+    return { required: false, reason: "legacy_aqi_rpc_export" };
   }
-  if (requiredKeys.size === 0) {
+  const requiredKeys = requiredAqilevelDayIndexKeysForTest({ runtime, dayUtc, connectorManifests });
+  if (requiredKeys.length === 0) {
     return { required: false, reason: "no_supported_aqi_source" };
   }
   const missing = [];
@@ -4796,7 +4853,7 @@ async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManifests })
   if (missing.length > 0) {
     throw new Error(`AQI index verification failed for day=${dayUtc}; missing ${missing.length} required index manifest(s): ${missing.slice(0, 5).join(", ")}`);
   }
-  return { required: true, verified_index_manifest_count: requiredKeys.size };
+  return { required: true, verified_index_manifest_count: requiredKeys.length, verified_index_manifest_keys: requiredKeys };
 }
 
 async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {

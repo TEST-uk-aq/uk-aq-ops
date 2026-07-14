@@ -609,35 +609,3 @@ test("Phase B requires exactly one canonical AQI writer", () => {
     UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "false",
   }).phase_b_calculate_aqi_from_observations_enabled, true);
 });
-
-import {
-  extractAqilevelIndexPollutantsFromConnectorManifestForTest,
-  requiredAqilevelDayIndexKeysForTest,
-} from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
-
-test("Phase B AQI index verification derives pollutants from v2 connector manifest contract", () => {
-  const connectorManifest = {
-    connector_id: 7,
-    pollutant_codes: ["pm25", "temperature"],
-    pollutant_manifests: [
-      { pollutant_code: "no2", manifest_key: "data/no2/manifest.json" },
-      { pollutant_code: "pm10", manifest_key: "data/pm10/manifest.json" },
-    ],
-    child_manifests: [
-      { pollutant_code: "pm25", manifest_key: "data/pm25/manifest.json" },
-    ],
-  };
-  assert.deepEqual(
-    extractAqilevelIndexPollutantsFromConnectorManifestForTest(connectorManifest),
-    ["no2", "pm10", "pm25"],
-  );
-  assert.deepEqual(requiredAqilevelDayIndexKeysForTest({
-    runtime: { aqilevels_timeseries_index_prefix: "history/_index/aqilevels_hourly_data_timeseries" },
-    dayUtc: DAY,
-    connectorManifests: [connectorManifest],
-  }), [
-    "history/_index/aqilevels_hourly_data_timeseries/day_utc=2026-06-14/connector_id=7/pollutant_code=no2/manifest.json",
-    "history/_index/aqilevels_hourly_data_timeseries/day_utc=2026-06-14/connector_id=7/pollutant_code=pm10/manifest.json",
-    "history/_index/aqilevels_hourly_data_timeseries/day_utc=2026-06-14/connector_id=7/pollutant_code=pm25/manifest.json",
-  ]);
-});
