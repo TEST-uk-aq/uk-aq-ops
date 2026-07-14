@@ -104,11 +104,3 @@ UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=false
 ```
 
 No destructive database rollback is expected, and no Supabase AQI objects should be removed as part of this Pass 1 rollback.
-
-## Behavioural validation added after PR #9 review
-
-- The AQI Worker now has live-enabled end-to-end coverage through its exported `fetch` handler with `UK_AQ_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED=true` and internal response caching disabled. The tests assert that `/v1/observations` is called, R2 observation rows without `timeseries_id` are normalized with the requested series, R2 observations beat overlapping ingest rows, distinct ingest observations fill absent keys, live-calculated AQI appears in the HTTP response, materialised AQI fallback is not queried, and direct responses remain `no-store` with the internal cache disabled.
-- Partial R2 observation API responses are covered as HTTP 200 upstream responses with `response_complete=false`, `coverage_state=partial`, `has_gap=true`, and explicit partial reasons. The AQI response remains incomplete and uncacheable even if usable observations produce calculated rows.
-- PM2.5 mutable-boundary coverage verifies a missing output hour inside the 120-hour live horizon, a single 23-hour R2 observation context extension, no doubled 46-hour context extension, ingest bounded to retention/output time, and no extra AQI output rows from context-only observations.
-- Phase B index-gate coverage now exercises the actual build and verification wrappers against fake R2 state: completed AQI day/connector/pollutant manifests, a pre-existing global latest index, targeted pollutant index writing, retained unrelated latest-index days, source-manifest hash verification, and failure when a required pollutant manifest cannot be read.
-- The shared targeted-updater test explicitly confirms the real `updateR2HistoryIndexesTargeted()` result shape used by Phase B: the v2 AQI result is exposed via `summary.aqilevels_timeseries` and `summary.results[0]`, with `affected_pollutant_indexes`, `warnings`, rewritten pollutant counts, and `timeseries_metadata` in the returned summary.

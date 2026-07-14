@@ -1860,7 +1860,6 @@ function normalizeLiveObservationRow(row, { connectorId = null, stationId = null
     station_id: parseRequiredPositiveInt(row?.station_id) || stationId,
     timeseries_id: timeseriesId,
     pollutant_code: normalizeAqiPollutant(row?.pollutant_code || pollutantCode),
-    observed_at: observedAt,
     observed_at_utc: observedAt,
     value,
   };
