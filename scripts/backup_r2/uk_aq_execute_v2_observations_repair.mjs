@@ -635,13 +635,29 @@ export function normalizePlan(input) {
       throw new Error(`Repair action ${action.kind} must have pollutant_code`);
     }
     const key = rule.connector === "absent" ? `${dayUtc}|day` : `${dayUtc}|${connectorId}`;
-    const scope = scopes.get(key) || { dayUtc, connectorId, needsConnector: false, needsDay: false, needsIndex: false, pollutantRepair: false, pollutantCodes: new Set(), gapTypes: new Set() };
+    const scope = scopes.get(key) || {
+      dayUtc,
+      connectorId,
+      needsConnector: false,
+      needsDay: false,
+      needsIndex: false,
+      pollutantRepair: false,
+      pollutantManifestCodes: new Set(),
+      indexPollutantCodes: new Set(),
+      gapTypes: new Set(),
+    };
     scope.needsConnector ||= Boolean(rule.needsConnector);
     scope.needsDay ||= Boolean(rule.needsDay);
     scope.needsIndex ||= Boolean(action.requires_index_rebuild) || action.kind.includes("index");
     scope.pollutantRepair ||= Boolean(rule.pollutantRepair);
-    if (pollutantCode) {
-      scope.pollutantCodes.add(pollutantCode);
+    // A direct index repair can share a connector/day scope with manifest
+    // repairs, but it must never promote its valid pollutant manifest into a
+    // manifest rewrite.  Track leaf-manifest and index-only codes separately.
+    if (pollutantCode && rule.pollutantRepair) {
+      scope.pollutantManifestCodes.add(pollutantCode);
+    }
+    if (pollutantCode && action.kind.includes("index")) {
+      scope.indexPollutantCodes.add(pollutantCode);
     }
     for (const gapType of action.gap_types) scope.gapTypes.add(gapType);
     scopes.set(key, scope);
@@ -651,12 +667,32 @@ export function normalizePlan(input) {
     domain,
     scopes: [...scopes.values()]
       .sort((left, right) => left.dayUtc.localeCompare(right.dayUtc) || (left.connectorId ?? -1) - (right.connectorId ?? -1))
-      .map(({ gapTypes, pollutantCodes, ...scope }) => ({
+      .map(({ gapTypes, pollutantManifestCodes, indexPollutantCodes, ...scope }) => ({
         ...scope,
         gap_types: [...gapTypes].sort(),
-        pollutant_codes: [...pollutantCodes].sort(),
+        pollutant_codes: [...pollutantManifestCodes].sort(),
+        index_pollutant_codes: [...indexPollutantCodes].sort(),
       })),
   };
+}
+
+function authoritativeTimeseriesById(input) {
+  const bindings = new Map();
+  for (const raw of Array.isArray(input?.authoritative_core_timeseries)
+    ? input.authoritative_core_timeseries
+    : []) {
+    const timeseriesId = Number(raw?.timeseries_id);
+    const connectorId = Number(raw?.connector_id);
+    const pollutantCode = String(raw?.pollutant_code || "").trim().toLowerCase();
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0
+      || !Number.isInteger(connectorId) || connectorId <= 0 || !pollutantCode) continue;
+    bindings.set(String(timeseriesId), {
+      timeseries_id: timeseriesId,
+      connector_id: connectorId,
+      pollutant_code: pollutantCode,
+    });
+  }
+  return bindings;
 }
 
 export async function runV2ObservationsRepair({
@@ -679,6 +715,7 @@ export async function runV2ObservationsRepair({
       : fs.readFileSync(args.repairPlanJson, "utf8"),
   );
   const { inputKind, domain, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
+  const coreTimeseries = authoritativeTimeseriesById(input);
   const config = resolveR2HistoryIndexConfig(env);
   if (args.writeR2 && env.UK_AQ_ENV_NAME !== "CIC-Test") {
     throw new Error(`Refusing Phase 4 repair write: UK_AQ_ENV_NAME must be CIC-Test (got ${env.UK_AQ_ENV_NAME || "(empty)"})`);
@@ -721,6 +758,10 @@ export async function runV2ObservationsRepair({
   const dayPlans = [];
   const blockedScopes = [];
   const blockedConnectorScopes = new Set();
+  const plannedStageStatus = args.writeR2 ? "not_run" : "planned";
+  const manifestStageStatus = (proposalKeys) => proposalKeys.some((key) =>
+    String(staged.proposals.get(key)?.kind || "").endsWith("manifest")
+  ) ? plannedStageStatus : "not_run";
 
   for (const [dayUtc, dayScopes] of [...byDay.entries()].sort(([left], [right]) => left.localeCompare(right))) {
     const base = `${dataPrefix}/day_utc=${dayUtc}`;
@@ -813,7 +854,7 @@ export async function runV2ObservationsRepair({
     const dayBlocked = [...blockedConnectorScopes].some((scopeKey) => scopeKey.startsWith(`${dayUtc}|`));
     if (dayBlocked) {
       blockedScopes.push({ day_utc: dayUtc, status: "blocked_dependency", reason: "connector_manifest_dependency_blocked" });
-      dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+      dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: "blocked_dependency", index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
       continue;
     }
     if (needsDay) {
@@ -858,6 +899,7 @@ export async function runV2ObservationsRepair({
           timeseriesMetadataMode: "targeted",
           proposalOnly: !args.writeR2,
           writeR2: true,
+          authoritativeTimeseriesById: coreTimeseries,
         });
       } catch (error) {
         staged.proposals.clear();
@@ -871,7 +913,7 @@ export async function runV2ObservationsRepair({
           path: parts[2] || null,
           detail: message,
         });
-        dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+        dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: manifestStageStatus(proposalKeys), index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
         continue;
       }
       if (index?.timeseries_metadata?.status === "blocked_dependency") {
@@ -880,14 +922,23 @@ export async function runV2ObservationsRepair({
         for (const blocked of index.timeseries_metadata.blocked_scopes || []) {
           blockedScopes.push({ day_utc: dayUtc, ...blocked });
         }
-        dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index });
+        dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: manifestStageStatus(proposalKeys), index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index });
         continue;
       }
       for (const key of staged.proposals.keys()) {
         if (!proposalSnapshot.has(key)) proposalKeys.push(key);
       }
     }
-    dayPlans.push({ day_utc: dayUtc, status: "planned", scopes: dayScopes, blocked_scopes: [], proposal_keys: [...new Set(proposalKeys)].sort(), index });
+    dayPlans.push({
+      day_utc: dayUtc,
+      status: "planned",
+      manifest_status: manifestStageStatus(proposalKeys),
+      index_status: dayScopes.some((scope) => scope.needsIndex) ? plannedStageStatus : "not_run",
+      scopes: dayScopes,
+      blocked_scopes: [],
+      proposal_keys: [...new Set(proposalKeys)].sort(),
+      index,
+    });
   }
 
   // The shared builder plans a latest summary while it is constructing the
@@ -953,6 +1004,8 @@ export async function runV2ObservationsRepair({
     status,
     dry_run: !args.writeR2,
     write_r2: args.writeR2,
+    manifest_status: reduceRepairStatus(dayPlans.map((plan) => plan.manifest_status || "not_run"), "not_run"),
+    index_status: reduceRepairStatus(dayPlans.map((plan) => plan.index_status || "not_run"), "not_run"),
     bucket: config.r2.bucket,
     planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes },
     execution: { status: executionStatus },

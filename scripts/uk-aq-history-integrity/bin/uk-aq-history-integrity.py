@@ -14062,6 +14062,57 @@ def _v2_aqi_metadata_actions(v2_aqilevels: Mapping[str, Any]) -> list[dict[str, 
     ])
 
 
+def _authoritative_v2_core_timeseries_bindings(
+    conn: sqlite3.Connection | None,
+) -> list[dict[str, Any]]:
+    """Return v2 core-snapshot identities for targeted metadata creation.
+
+    The coverage entries still come from the rebuilt pollutant indexes, but
+    their timeseries/connector/pollutant identity is checked against the
+    imported core snapshot rather than inferred from observation or AQI values.
+    """
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.id, t.connector_id, t.label, t.timeseries_ref,
+                   p.label, p.source_label, p.pollutant_label
+            FROM core_timeseries_snapshot AS t
+            LEFT JOIN core_phenomena_snapshot AS p ON p.id = t.phenomenon_id
+            WHERE t.id IS NOT NULL AND t.connector_id IS NOT NULL
+            ORDER BY t.id
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    bindings: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            timeseries_id = int(row[0])
+            connector_id = int(row[1])
+        except (TypeError, ValueError):
+            continue
+        if timeseries_id <= 0 or connector_id <= 0:
+            continue
+        pollutant_code = next(
+            (
+                normalized
+                for normalized in (_normalize_history_pollutant_code(value) for value in row[2:])
+                if normalized
+            ),
+            None,
+        )
+        if pollutant_code is None:
+            continue
+        bindings.append({
+            "timeseries_id": timeseries_id,
+            "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+        })
+    return bindings
+
+
 def _run_v2_observation_metadata_executor(
     *,
     env: Mapping[str, str],
@@ -14070,6 +14121,7 @@ def _run_v2_observation_metadata_executor(
     dry_run: bool,
     log: logging.Logger,
     run_state: Mapping[str, Any] | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """Run the metadata/index specialist once, after all observation repairs.
 
@@ -14094,7 +14146,12 @@ def _run_v2_observation_metadata_executor(
         ])
     if not dry_run:
         command.append("--write-r2")
-    plan = {"history_version": "v2", "domain": domain, "repair_plan": actions}
+    plan = {
+        "history_version": "v2",
+        "domain": domain,
+        "repair_plan": actions,
+        "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
+    }
     proc = subprocess.run(
         command,
         cwd=repo_root,
@@ -15155,13 +15212,17 @@ def run_v2_integrity_repair_flow(
         if observation_failed else
         _run_v2_observation_metadata_executor(
             env=env, actions=metadata_actions, dry_run=dry_run, log=log,
-            run_state=run_state,
+            run_state=run_state, conn=conn,
         )
     )
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
     _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
-    observation_stages_verified = not observation_failed and metadata.get("status") not in {
+    observation_manifest_status = str(metadata.get("manifest_status") or metadata.get("status") or "not_run")
+    observation_index_status = str(metadata.get("index_status") or metadata.get("status") or "not_run")
+    observation_stages_verified = not observation_failed and observation_manifest_status not in {
+        "failed", "blocked_dependency",
+    } and observation_index_status not in {
         "failed", "blocked_dependency",
     }
     aqi_work, aqi_blocked = _phase4_aqi_work(
@@ -15298,7 +15359,7 @@ def run_v2_integrity_repair_flow(
         if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0 else
         _run_v2_observation_metadata_executor(
             env=env, actions=aqi_metadata_actions, domain="aqilevels",
-            dry_run=dry_run, log=log, run_state=run_state,
+            dry_run=dry_run, log=log, run_state=run_state, conn=conn,
         )
     )
     _record_metadata_executor_overlay(
@@ -15306,6 +15367,8 @@ def run_v2_integrity_repair_flow(
         manifest_scope_set="AQI_MANIFESTS_CHANGED", index_scope_set="AQI_INDEXES_CHANGED",
         manifest_stage="aqilevels_manifests", index_stage="aqilevels_indexes",
     )
+    aqi_manifest_status = str(aqi_metadata.get("manifest_status") or aqi_metadata.get("status") or "not_run")
+    aqi_index_status = str(aqi_metadata.get("index_status") or aqi_metadata.get("status") or "not_run")
     if dry_run:
         final_verification: dict[str, Any] = {
             "ran": False,
@@ -15332,19 +15395,21 @@ def run_v2_integrity_repair_flow(
         )
     stage_results = [
         {"stage": "observs", "status": "failed" if observation_failed else ("planned" if dry_run else "succeeded"), "result": observations},
-        {"stage": "observs_manifests", "status": metadata.get("status"), "result": metadata},
-        {"stage": "observs_indexes", "status": metadata.get("status"), "reason": "the metadata executor runs indexes once after final manifests per affected day"},
+        {"stage": "observs_manifests", "status": observation_manifest_status, "result": metadata},
+        {"stage": "observs_indexes", "status": observation_index_status, "reason": "the metadata executor runs indexes once after final manifests per affected day"},
         {"stage": "aqilevels", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else ("planned" if dry_run else "succeeded"), "result": aqi_result, "live_r2_read_exception": "writer_reads_verified_live_r2_observations"},
-        {"stage": "aqilevels_manifests", "status": aqi_metadata.get("status"), "result": aqi_metadata},
-        {"stage": "aqilevels_indexes", "status": aqi_metadata.get("status"), "reason": "the metadata executor runs AQI indexes once after final manifests per affected day"},
+        {"stage": "aqilevels_manifests", "status": aqi_manifest_status, "result": aqi_metadata},
+        {"stage": "aqilevels_indexes", "status": aqi_index_status, "reason": "the metadata executor runs AQI indexes once after final manifests per affected day"},
         {"stage": "final_verification", "status": final_verification.get("status"), "result": final_verification},
     ]
     coordinator_failed = (
         observation_failed
-        or metadata.get("status") in {"failed", "blocked_dependency"}
+        or observation_manifest_status in {"failed", "blocked_dependency"}
+        or observation_index_status in {"failed", "blocked_dependency"}
         or aqi_capture_failures
         or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0
-        or aqi_metadata.get("status") in {"failed", "blocked_dependency"}
+        or aqi_manifest_status in {"failed", "blocked_dependency"}
+        or aqi_index_status in {"failed", "blocked_dependency"}
         or final_verification.get("status") == "failed"
     )
     result = {

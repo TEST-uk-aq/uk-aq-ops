@@ -54,11 +54,24 @@ test("whole-day manifest actions remain connector-less and reject a connector su
     pollutantRepair: false,
     gap_types: ["connector_manifest_missing"],
     pollutant_codes: [],
+    index_pollutant_codes: [],
   }]);
   assert.throws(
     () => normalizePlan(observationsRepairPlan(repairAction({ kind: "observation_day_manifest_repair" }))),
     /must have day_utc and no connector_id/,
   );
+});
+
+test("an index-only action does not become a pollutant-manifest repair", () => {
+  const plan = normalizePlan(observationsRepairPlan(repairAction({
+    kind: "observation_index_repair",
+    connector_id: 1,
+    pollutant_code: "o3",
+    requires_index_rebuild: true,
+  })));
+  assert.equal(plan.scopes[0].pollutantRepair, false);
+  assert.deepEqual(plan.scopes[0].pollutant_codes, []);
+  assert.deepEqual(plan.scopes[0].index_pollutant_codes, ["o3"]);
 });
 
 async function assertNoR2Access(operation) {

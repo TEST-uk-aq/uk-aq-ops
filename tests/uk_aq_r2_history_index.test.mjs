@@ -18,6 +18,7 @@ import {
   normalizeAqiPollutantCode,
   rebuildR2HistoryV2TimeseriesMetadataIndexes,
   resolveR2HistoryIndexConfig,
+  updateR2HistoryV2TimeseriesMetadataIndexesTargeted,
   updateR2HistoryIndexesTargeted,
 } from "../workers/shared/uk_aq_r2_history_index.mjs";
 import {
@@ -1142,6 +1143,83 @@ test("v2 timeseries metadata payload is byte-stable when source timestamps are u
     generatedAt: "2026-06-18T11:00:00.000Z",
   }));
   assert.equal(first, second);
+});
+
+test("targeted v2 metadata creates a missing object from core identity without a previous pollutant index", async () => {
+  const fake = installFakeR2Fetch({});
+  const indexKey = "history/_index_v2/observations_timeseries/day_utc=2026-05-17/connector_id=1/pollutant_code=o3/manifest.json";
+  try {
+    const output = await updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
+      r2: {
+        endpoint: "https://r2.example.invalid",
+        bucket: "uk-aq-history-cic-test",
+        region: "auto",
+        access_key_id: "key",
+        secret_access_key: "secret",
+      },
+      affectedPollutantIndexes: [{
+        key: indexKey,
+        old_payload: null,
+        payload: {
+          history_version: "v2",
+          domain: "observations",
+          day_utc: "2026-05-17",
+          connector_id: 1,
+          pollutant_code: "o3",
+          timeseries_row_counts: { 101: 4 },
+          min_observed_at_utc: "2026-05-17T00:00:00.000Z",
+          max_observed_at_utc: "2026-05-17T03:00:00.000Z",
+          pollutant_manifest_key: "history/v2/observations/day_utc=2026-05-17/connector_id=1/pollutant_code=o3/manifest.json",
+          pollutant_manifest_hash: "o3-manifest-hash",
+        },
+      }],
+      authoritativeTimeseriesById: new Map([["101", {
+        timeseries_id: 101,
+        connector_id: 1,
+        pollutant_code: "o3",
+      }]]),
+      generatedAt: "2026-05-18T00:00:00.000Z",
+      writeR2: false,
+      plannedOnly: true,
+    });
+    assert.equal(output.status, "planned");
+    assert.equal(output.metadata_object_count, 1);
+    assert.equal(output.metadata_operations[0].metadata_source, "authoritative_core_snapshot");
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("targeted v2 metadata blocks only when both existing and core metadata are unavailable", async () => {
+  const fake = installFakeR2Fetch({});
+  try {
+    const output = await updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
+      r2: {
+        endpoint: "https://r2.example.invalid",
+        bucket: "uk-aq-history-cic-test",
+        region: "auto",
+        access_key_id: "key",
+        secret_access_key: "secret",
+      },
+      affectedPollutantIndexes: [{
+        key: "history/_index_v2/observations_timeseries/day_utc=2026-05-17/connector_id=1/pollutant_code=o3/manifest.json",
+        old_payload: null,
+        payload: {
+          history_version: "v2", domain: "observations", day_utc: "2026-05-17",
+          connector_id: 1, pollutant_code: "o3", timeseries_row_counts: { 101: 4 },
+        },
+      }],
+      authoritativeTimeseriesById: new Map(),
+      writeR2: false,
+      plannedOnly: true,
+    });
+    assert.equal(output.status, "blocked_dependency");
+    assert.equal(output.blocked_scopes[0].reason, "authoritative_core_timeseries_missing_or_invalid");
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+  }
 });
 
 function installFakeR2Fetch(objectsByKey) {
