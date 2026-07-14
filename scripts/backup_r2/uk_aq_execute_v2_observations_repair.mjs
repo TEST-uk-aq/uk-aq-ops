@@ -484,7 +484,8 @@ async function applyStagedProposals({ r2, proposals, writeR2 }) {
   const ordered = [...proposals.values()].sort((left, right) =>
     (rank[left.kind] || 99) - (rank[right.kind] || 99) || left.key.localeCompare(right.key)
   );
-  for (const proposal of ordered) {
+  for (let position = 0; position < ordered.length; position += 1) {
+    const proposal = ordered[position];
     if (!proposal.changed) {
       results.set(proposal.key, { key: proposal.key, status: "skipped_unchanged", verification: "not_run" });
       continue;
@@ -493,17 +494,19 @@ async function applyStagedProposals({ r2, proposals, writeR2 }) {
       results.set(proposal.key, { key: proposal.key, status: "planned", verification: "not_run" });
       continue;
     }
-    if (proposal.pre_write_guard) {
-      await assertCompleteChildrenUnchanged({ r2, guard: proposal.pre_write_guard });
-    }
-    await r2PutObject({ r2, key: proposal.key, body: proposal.body, content_type: proposal.content_type });
-    const fresh = await r2GetObject({ r2, key: proposal.key });
-    if (fresh.bytes !== proposal.bytes || fresh.body.toString("utf8") !== proposal.body) {
-      throw new Error(`Verification failed for ${proposal.key}`);
+    try {
+      if (proposal.pre_write_guard) await assertCompleteChildrenUnchanged({ r2, guard: proposal.pre_write_guard });
+      await r2PutObject({ r2, key: proposal.key, body: proposal.body, content_type: proposal.content_type });
+      const fresh = await r2GetObject({ r2, key: proposal.key });
+      if (fresh.bytes !== proposal.bytes || fresh.body.toString("utf8") !== proposal.body) throw new Error(`Verification failed for ${proposal.key}`);
+    } catch (error) {
+      results.set(proposal.key, { key: proposal.key, status: "failed", verification: "failed", error: error instanceof Error ? error.message : String(error) });
+      for (const remaining of ordered.slice(position + 1)) results.set(remaining.key, { key: remaining.key, status: "not_run_due_to_dependency", verification: "not_run" });
+      return { results, failure: { key: proposal.key, error: error instanceof Error ? error.message : String(error) } };
     }
     results.set(proposal.key, { key: proposal.key, status: "succeeded", verification: "succeeded" });
   }
-  return results;
+  return { results, failure: null };
 }
 
 function extractRepairPlan(input) {
@@ -836,7 +839,8 @@ export async function runV2ObservationsRepair({
       });
     }
   }
-  const applied = await applyStagedProposals({ r2: config.r2, proposals: staged.proposals, writeR2: args.writeR2 });
+  const appliedResult = await applyStagedProposals({ r2: config.r2, proposals: staged.proposals, writeR2: args.writeR2 });
+  const applied = appliedResult.results;
   const proposalViews = [...staged.proposals.values()].map(proposalView).sort((left, right) => left.key.localeCompare(right.key));
   const results = dayPlans.map((plan) => {
     if (plan.status === "blocked_dependency") return plan;
@@ -858,9 +862,9 @@ export async function runV2ObservationsRepair({
     };
   });
   const topLevelStatuses = results.flatMap((result) => collectOutcomeStatuses(result));
-  const status = blockedScopes.length
+  const status = appliedResult.failure ? "failed" : (blockedScopes.length
     ? "blocked_dependency"
-    : reduceRepairStatus(topLevelStatuses, args.writeR2 ? "not_run" : "planned");
+    : reduceRepairStatus(topLevelStatuses, args.writeR2 ? "not_run" : "planned"));
   const ok = status !== "blocked_dependency" && status !== "failed";
   const executionStatus = args.writeR2
     ? reduceRepairStatus(results.map((result) => result.status), "not_run")
@@ -877,6 +881,7 @@ export async function runV2ObservationsRepair({
     planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes },
     execution: { status: executionStatus },
     verification: { status: verificationStatus },
+    application_failure: appliedResult.failure,
     results,
   };
 }

@@ -565,6 +565,25 @@ run, SQL apply, R2 contact, deployment, commit, staging, or push was performed.
 
 ## Recommended model
 
+### Proposal-evidence corrective record — 2026-07-14
+
+- Undefined final metadata-operation lookup: **confirmed**. Final verification
+  now deterministically merges operation evidence by metadata key, unions
+  replacement, removal and affected-index identities, and fails on conflicts.
+- Broad affected-index validation: **confirmed**. Only operation-recorded index
+  keys are required in the scoped final view; preserved historical entries do
+  not require their out-of-window index files.
+- Non-zero executor JSON discard: **confirmed**. Python retains valid JSON
+  output, successful operations and blocked evidence even when the specialist
+  exits non-zero.
+- Partial application evidence: **confirmed**. The executor now returns the
+  failed operation plus all earlier results, marks later proposals not-run due
+  to dependency, and stops before dependent metadata/latest writes.
+
+Structural checks passed: `py_compile`, both Node checks, shell syntax and
+`git diff --check`. Aggregate-field expansion remains for CIC-Test validation;
+no SQL or operational command was run.
+
 ```text
 Codex: GPT-5.6 Terra
 Reasoning: High
