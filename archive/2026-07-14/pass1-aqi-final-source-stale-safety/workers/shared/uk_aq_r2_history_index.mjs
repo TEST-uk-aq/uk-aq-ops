@@ -22,8 +22,6 @@ import {
   normalizePrefix,
   r2GetObject,
   r2HeadObject,
-  r2DeleteObjects,
-  r2ListAllObjects,
   r2ListAllCommonPrefixes,
   r2PutObject,
   sha256Hex,
@@ -1748,17 +1746,6 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
       });
       continue;
     }
-    if (!counts && source?.payload && Object.keys(source.payload.timeseries_row_counts || {}).length === 0) {
-      const identity = `${source.old_payload.domain}|${source.old_payload.day_utc}|${source.old_payload.connector_id}|${source.old_payload.pollutant_code}`;
-      for (const timeseriesId of Object.keys(oldCounts)) {
-        const key = String(parsePositiveId(timeseriesId));
-        const operation = operationsByTimeseriesId.get(key) || { replacements: [], removalIdentities: [], affectedIndexKeys: [] };
-        operation.affectedIndexKeys.push(source?.key || null);
-        operation.removalIdentities.push(identity);
-        operationsByTimeseriesId.set(key, operation);
-      }
-      continue;
-    }
     if (!counts) {
       blocked_scopes.push({ status: "blocked_dependency", reason: "required_pollutant_timeseries_counts_invalid", path: source?.key || null });
       continue;
@@ -1796,6 +1783,10 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
         replacements: operation.replacements,
         removalIdentities: operation.removalIdentities,
       });
+      if (!merged.entries.length) {
+        blocked_scopes.push({ status: "blocked_dependency", reason: "timeseries_metadata_delete_required_not_supported", path: key, timeseries_id: Number(timeseriesId) });
+        continue;
+      }
       const payload = buildHistoryV2TimeseriesMetadataIndexPayload({
         timeseriesId,
         entries: merged.entries,
@@ -3551,7 +3542,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   let rewrittenConnectorIndexCount = 0;
   let rewrittenPollutantIndexCount = 0;
   let rewrittenPutSkippedCount = 0;
-  let stalePollutantIndexCleanupCount = 0;
 
   for (const dayUtc of dayList) {
     const dayManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/manifest.json`;
@@ -3592,49 +3582,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
           normalizedDataPrefix,
           normalizedDomain,
         );
-        const wantedPollutantIndexKeys = new Set(pollutantTargets.map((pollutantTarget) =>
-          normalizedDomain === "observations"
-            ? buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
-              normalizedTimeseriesPrefix,
-              dayUtc,
-              connectorTarget.connector_id,
-              pollutantTarget.pollutant_code,
-            )
-            : buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey(
-              normalizedTimeseriesPrefix,
-              dayUtc,
-              connectorTarget.connector_id,
-              pollutantTarget.pollutant_code,
-            )
-        ));
-        const shouldWriteConnector = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
-        const stalePollutantIndexes = [];
-        if (shouldWriteConnector) {
-          const connectorIndexPrefix = `${normalizedTimeseriesPrefix}/day_utc=${dayUtc}/connector_id=${connectorTarget.connector_id}/`;
-          const existingIndexEntries = await r2ListAllObjects({ r2, prefix: connectorIndexPrefix, max_keys: 10_000 });
-          for (const entry of existingIndexEntries) {
-            const key = String(entry?.key || "");
-            if (!/\/pollutant_code=[^/]+\/manifest\.json$/.test(key) || wantedPollutantIndexKeys.has(key)) continue;
-            const previousIndex = await fetchJsonObjectFromR2IfExists(r2, key);
-            if (previousIndex.exists) {
-              const oldPayload = previousIndex.payload;
-              stalePollutantIndexes.push({
-                key,
-                payload: {
-                  ...oldPayload,
-                  timeseries_row_counts: {},
-                },
-                old_payload: oldPayload,
-              });
-            }
-          }
-          if (stalePollutantIndexes.length && writeR2) {
-            const result = await r2DeleteObjects({ r2, keys: stalePollutantIndexes.map((entry) => entry.key) });
-            if (result.errors?.length) {
-              warnings.push(`Failed to delete ${result.errors.length} stale ${normalizedDomain} v2 pollutant indexes for day=${dayUtc} connector=${connectorTarget.connector_id}`);
-            }
-          }
-        }
         const pollutantResults = (await mapWithConcurrency(
           pollutantTargets,
           fetchConcurrency,
@@ -3737,7 +3684,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
           pollutant_indexes: pollutantResults.sort((a, b) =>
             a.pollutant_code.localeCompare(b.pollutant_code)
           ),
-          stale_pollutant_indexes: stalePollutantIndexes,
           row_count: pollutantResults.reduce(
             (sum, entry) => sum + (parseNonNegativeInt(entry.row_count) || 0),
             0,
@@ -3756,16 +3702,12 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     rewrittenConnectorIndexCount += connectorResults.filter((entry) => entry.wrote_index).length;
     rewrittenPollutantIndexCount += connectorResults.reduce((sum, entry) => sum + entry.pollutant_indexes.filter(p => p.wrote_index).length, 0);
     rewrittenPutSkippedCount += connectorResults.reduce((sum, entry) => sum + entry.put_skipped_count, 0);
-    stalePollutantIndexCleanupCount += connectorResults.reduce((sum, entry) => sum + (entry.stale_pollutant_indexes || []).length, 0);
 
     for (const connectorResult of connectorResults) {
       for (const pollutantIndex of connectorResult.pollutant_indexes) {
         if (pollutantIndex.wrote_index && pollutantIndex.payload && pollutantIndex.index_key) {
           affectedPollutantIndexes.push({ key: pollutantIndex.index_key, payload: pollutantIndex.payload, old_payload: pollutantIndex.old_payload });
         }
-      }
-      for (const stalePollutantIndex of connectorResult.stale_pollutant_indexes || []) {
-        affectedPollutantIndexes.push(stalePollutantIndex);
       }
     }
 
@@ -3845,7 +3787,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     indexed_file_count: latestPayload.indexed_file_count,
     warning_count: warnings.length,
     warnings,
-    stale_pollutant_index_cleanup_count: stalePollutantIndexCleanupCount,
     affected_pollutant_indexes: affectedPollutantIndexes,
   };
 }
