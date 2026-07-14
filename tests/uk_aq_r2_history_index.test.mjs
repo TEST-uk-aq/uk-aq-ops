@@ -638,6 +638,7 @@ test("targeted v2 AQI index update refreshes timeseries metadata from rewritten 
 
 test("targeted v2 AQI empty connector supersedes stale pollutant index and metadata", async () => {
   const staleIndexKey = "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json";
+  const metadataKey = "history/_index_v2/timeseries/timeseries_id=1001.json";
   const objects = {
     "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": {
       history_version: "v2",
@@ -646,7 +647,7 @@ test("targeted v2 AQI empty connector supersedes stale pollutant index and metad
         day_utc: "2026-06-01",
         connector_count: 1,
         connector_ids: [6],
-   §     connectors: [{ connector_id: 6, row_count: 24 }],
+        connectors: [{ connector_id: 6, row_count: 24 }],
         total_rows: 24,
         pollutant_codes: ["no2"],
         pollutant_index_count: 1,
@@ -666,50 +667,33 @@ test("targeted v2 AQI empty connector supersedes stale pollutant index and metad
         backed_up_at_utc: "2026-06-01T00:00:00.000Z",
       }],
     },
-    "history/_index_v2/timeseries/timeseries_id=1001.json": {
-      history_version: "v2",
-      index_kind: "timeseries_metadata",
-      timeseries_id: 1001,
-      entries: [{
-        domain: "aqilevels",
-        grain: "hourly",
-        profile: "data",
-        day_utc: "2026-06-01",
-        connector_id: 6,
-        pollutant_code: "no2",
-        row_count: 24,
-        min_timestamp_hour_utc: "2026-06-01T00:00:00.000Z",
-        max_timestamp_hour_utc: "2026-06-01T23:00:00.000Z",
-        source_index_key: staleIndexKey,
-        source_manifest_hash: "old-hash",
-        backed_up_at_utc: "2026-06-02T00:00:00.000Z",
-      }],
-      aqi_coverage: { row_count: 24 },
-    },
-    "history/_index_v2/timeseries/timeseries_id=1001.json": {
+    [metadataKey]: {
       history_version: "v2",
       index_kind: "timeseries_metadata",
       timeseries_id: 1001,
       aqi_coverage: {
         row_count: 24,
         entries: [{
-        domain: "aqilevels",
-        grain: "hourly",
-        profile: "data",
-        day_utc: "2026-06-01",
-        connector_id: 6,
-        pollutant_code: "no2",
-        row_count: 24,
-        min_timestamp_hour_utc: "2026-06-01T00:00:00.000Z",
-        max_timestamp_hour_utc: "2026-06-01T23:00:00.000Z",
-        source_index_key: staleIndexKey,
-        source_manifest_hash: "old-hash",
-        backed_up_at_utc: "2026-06-02T00:00:00.000Z",
-      }],
+          domain: "aqilevels",
+          grain: "hourly",
+          profile: "data",
+          day_utc: "2026-06-01",
+          connector_id: 6,
+          pollutant_code: "no2",
+          row_count: 24,
+          min_timestamp_hour_utc: "2026-06-01T00:00:00.000Z",
+          max_timestamp_hour_utc: "2026-06-01T23:00:00.000Z",
+          source_index_key: staleIndexKey,
+          source_manifest_hash: "old-hash",
+          backed_up_at_utc: "2026-06-02T00:00:00.000Z",
+        }],
+      },
     },
-  },
     "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/manifest.json": {
-      connector_manifests: [{ connector_id: 6, manifest_key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/manifest.json" }],
+      connector_manifests: [{
+        connector_id: 6,
+        manifest_key: "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/manifest.json",
+      }],
     },
     "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/connector_id=6/manifest.json": {
       connector_id: 6,
@@ -751,12 +735,27 @@ test("targeted v2 AQI empty connector supersedes stale pollutant index and metad
 
     assert.equal(summary.aqilevels_timeseries.stale_pollutant_index_cleanup_count, 1);
     assert.equal(Object.hasOwn(objects, staleIndexKey), false);
-    const latest = JSON.parse(fake.puts.get("history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"));
+
+    const latest = JSON.parse(
+      fake.puts.get("history/_index_v2/aqilevels_hourly_data_timeseries_latest.json"),
+    );
     const current = latest.day_summaries.find((entry) => entry.day_utc === "2026-06-01");
     assert.equal(current.total_rows, 0);
     assert.deepEqual(current.pollutant_codes, []);
-    assert.equal(latest.day_summaries.find((entry) => entry.day_utc === "2026-05-31").total_rows, 12);
-    assert.equal(summary.timeseries_metadata.blocked_scopes?.some((entry) => String(entry.reason || "").includes("aqilevels")), false);
+    assert.equal(
+      latest.day_summaries.find((entry) => entry.day_utc === "2026-05-31").total_rows,
+      12,
+    );
+
+    assert.equal(summary.timeseries_metadata.status, "succeeded");
+    assert.deepEqual(summary.timeseries_metadata.blocked_scopes ?? [], []);
+    assert.equal(fake.puts.has(metadataKey), true);
+
+    const rewrittenMetadata = JSON.parse(fake.puts.get(metadataKey));
+    assert.equal(rewrittenMetadata.aqi_coverage.row_count, 0);
+    assert.deepEqual(rewrittenMetadata.aqi_coverage.entries, []);
+    assert.deepEqual(rewrittenMetadata.aqi_coverage.pollutant_codes, []);
+    assert.equal(JSON.stringify(rewrittenMetadata).includes(staleIndexKey), false);
   } finally {
     fake.restore();
   }
