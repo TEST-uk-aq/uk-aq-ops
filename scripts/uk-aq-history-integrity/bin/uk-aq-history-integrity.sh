@@ -23,8 +23,31 @@ error() {
   exit 2
 }
 
+path_is_archive() {
+  python3 - "${1:-}" <<'PY'
+from pathlib import Path
+import sys
+
+raw = sys.argv[1]
+try:
+    candidates = (Path(raw), Path(raw).resolve(strict=False))
+except (OSError, RuntimeError, ValueError):
+    raise SystemExit(0)
+raise SystemExit(0 if any("archive" in candidate.parts for candidate in candidates) else 1)
+PY
+}
+
+reject_archive_path() {
+  local label="$1"
+  local value="${2:-}"
+  if [[ "${value}" =~ (^|/)archive(/|$) ]] || path_is_archive "${value}"; then
+    error "${label} points to an archive path"
+  fi
+}
+
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 LOCAL_ROOT="$(cd -P -- "${SCRIPT_DIR}/.." && pwd -P)"
+reject_archive_path "local dispatcher root" "${LOCAL_ROOT}"
 ORIGINAL_ARGS=("$@")
 ENV_NAME=""
 
@@ -80,9 +103,10 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
 done < "${SELECTOR_FILE}"
 
 [[ -n "${OPS_REPO_ROOT}" && "${OPS_REPO_ROOT}" = /* ]] || error "UK_AQ_OPS_REPO_ROOT must be a non-empty absolute path"
-[[ "${OPS_REPO_ROOT}" != *"/archive/"* ]] || error "UK_AQ_OPS_REPO_ROOT may not contain /archive/"
+reject_archive_path "UK_AQ_OPS_REPO_ROOT" "${OPS_REPO_ROOT}"
 [[ -d "${OPS_REPO_ROOT}" ]] || error "selected repository does not exist: ${OPS_REPO_ROOT}"
 OPS_REPO_ROOT="$(cd -P -- "${OPS_REPO_ROOT}" && pwd -P)"
+reject_archive_path "resolved UK_AQ_OPS_REPO_ROOT" "${OPS_REPO_ROOT}"
 RUNNER="${OPS_REPO_ROOT}/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh"
 [[ -f "${RUNNER}" && -x "${RUNNER}" ]] || error "selected repository runner is unavailable or not executable: ${RUNNER}"
 

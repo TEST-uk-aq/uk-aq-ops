@@ -59,10 +59,10 @@ shared R2/index modules and the Phase B writer from elsewhere in the repository,
 which depends on the checkout's Node package dependencies. Do not copy `bin/`
 or `env/` to a standalone location, and no partial runtime bundle is supported.
 
-Local state remains outside the checkout, for example:
+Local deployed state remains outside the checkout at:
 
 ```text
-/Users/mikehinford/.local/state/uk-aq-history-integrity/
+/Users/mikehinford/uk-aq-history-integrity/state/
   CIC-Test/
   LIVE/
 ```
@@ -72,11 +72,12 @@ The checkout keeps the source and environment templates:
 ```text
 scripts/uk-aq-history-integrity/
   bin/
+    uk-aq-history-integrity.sh
     uk-aq-history-integrity-runner.sh
     uk-aq-history-integrity.py
   env/
-    CIC-Test.env.example (legacy tooling reference)
-    LIVE.env.example (legacy tooling reference)
+    CIC-Test.env.example (one-line selector template)
+    LIVE.env.example (one-line selector template)
 ```
 
 The live SQLite DBs stay outside Dropbox during writes. After a successful run,
@@ -161,8 +162,8 @@ There are **no** separate script forks for `CIC-Test` and `LIVE`. The launcher
 selects the environment at runtime:
 
 ```bash
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile daily
+"/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily
+"/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile daily
 ```
 
 The local deployed dispatcher at
@@ -561,15 +562,15 @@ Notes:
 
 - `--dry-run` exits the OpenAQ adapter before per-file checks, so there is no
   changed-file set to plan/execute backfills from.
-- `--check-only` is recorded in run metadata/report output; the current CLI
-  cannot opt into a repair writer.
+- `--check-only` is recorded in run metadata/report output and is mutually
+  exclusive with `--run-backfill`.
 
 Example commands:
 
 ```bash
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile weekly
-"/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --source openaq --from-day 2026-04-01 --to-day 2026-04-30 --dry-run
+"/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily
+"/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile weekly
+"/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --source openaq --from-day 2026-04-01 --to-day 2026-04-30 --dry-run
 ```
 
 ### UK-AIR SOS flat-file model and run examples
@@ -800,26 +801,26 @@ Stagger CIC-Test and LIVE so they do not overlap.
 
 ```cron
 # CIC-Test daily check
-30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 4 * * * "/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily >> /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/cron.log 2>&1
 
 If you want it to auto-backfill, use:
 
-30 4 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile daily --history-version v2 >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 4 * * * "/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile daily --history-version v2 --run-backfill >> /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/cron.log 2>&1
 
 # LIVE daily check
-30 5 * * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile daily >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
+30 5 * * * "/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile daily >> /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/cron.log 2>&1
 
 # CIC-Test weekly check
-30 3 * * 0 "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile weekly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 3 * * 0 "/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile weekly >> /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/cron.log 2>&1
 
 # LIVE weekly check
-30 4 * * 0 "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile weekly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
+30 4 * * 0 "/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile weekly >> /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/cron.log 2>&1
 
 # CIC-Test monthly check
-30 2 1 * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env CIC-Test --profile monthly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/CIC-Test/logs/cron.log 2>&1
+30 2 1 * * "/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env CIC-Test --profile monthly >> /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/cron.log 2>&1
 
 # LIVE monthly check
-30 3 1 * * "/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh" --env LIVE --profile monthly >> /Users/mikehinford/.local/state/uk-aq-history-integrity/LIVE/logs/cron.log 2>&1
+30 3 1 * * "/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh" --env LIVE --profile monthly >> /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/cron.log 2>&1
 ```
 
 ---
@@ -1394,7 +1395,7 @@ scanned window (even if `--run-backfill` was set).
 The live DB is written here:
 
 ```text
-/Users/mikehinford/.local/state/uk-aq-history-integrity/<ENV>/uk_aq_history_integrity.sqlite
+/Users/mikehinford/uk-aq-history-integrity/state/<ENV>/uk_aq_history_integrity.sqlite
 ```
 
 After a successful run, copy the closed DB to:

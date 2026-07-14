@@ -28,12 +28,13 @@ Optional:
   -h, --help              Show this help.
 
 Notes:
-  - Loads <ROOT>/env/<ENV>.env from UK_AQ_HISTORY_INTEGRITY_ROOT or script parent.
-  - Sources UK_AQ_BACKFILL_ENV_FILE from the integrity env file.
-  - Calls UK_AQ_BACKFILL_WRAPPER with strict integrity defaults.
-  - Disables the wrapper's final full R2 history index rebuild.
-  - The Integrity coordinator owns the final targeted observation index after
-    all observation manifests for the affected day are verified.
+  - Derives the repository root from this script's own location.
+  - Loads that repository's root .env; --env CIC-Test|LIVE is authoritative.
+  - Reasserts UK_AQ_ENV_NAME and reads UK_AQ_BACKFILL_WRAPPER from the root .env.
+  - Never reads the local CIC-Test.env or LIVE.env selector files.
+  - Preserves observation-only and AQI-only modes.
+  - Disables the nested full R2 history index rebuild; the Integrity coordinator
+    owns targeted indexes after all manifests for the affected day are verified.
 USAGE
 }
 
@@ -42,6 +43,29 @@ trim() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "${value}"
+}
+
+path_is_archive() {
+  python3 - "${1:-}" <<'PY'
+from pathlib import Path
+import sys
+
+raw = sys.argv[1]
+try:
+    candidates = (Path(raw), Path(raw).resolve(strict=False))
+except (OSError, RuntimeError, ValueError):
+    raise SystemExit(0)
+raise SystemExit(0 if any("archive" in candidate.parts for candidate in candidates) else 1)
+PY
+}
+
+reject_archive_path() {
+  local label="$1"
+  local value="${2:-}"
+  if [[ "${value}" =~ (^|/)archive(/|$) ]] || path_is_archive "${value}"; then
+    echo "ERROR: ${label} points to an archive path." >&2
+    exit 4
+  fi
 }
 
 require_env() {
@@ -395,13 +419,12 @@ if (( OBSERVS_ONLY == 1 )) && [[ -z "${TIMESERIES_IDS}" ]]; then
 fi
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P -- "${SCRIPT_DIR}/../../.." && pwd -P)"
-if [[ "${REPO_ROOT}" == *"/archive/"* ]]; then
-  echo "ERROR: specialist wrapper resolves under an archive path: ${REPO_ROOT}" >&2
-  exit 4
-fi
+reject_archive_path "specialist wrapper repository" "${REPO_ROOT}"
 if [[ -n "${UK_AQ_OPS_REPO_ROOT:-}" ]]; then
+  reject_archive_path "UK_AQ_OPS_REPO_ROOT" "${UK_AQ_OPS_REPO_ROOT}"
   EXPORTED_REPO_ROOT="$(resolve_abs_path "${UK_AQ_OPS_REPO_ROOT}")"
   ACTUAL_REPO_ROOT="$(resolve_abs_path "${REPO_ROOT}")"
+  reject_archive_path "resolved UK_AQ_OPS_REPO_ROOT" "${EXPORTED_REPO_ROOT}"
   if [[ "${EXPORTED_REPO_ROOT}" != "${ACTUAL_REPO_ROOT}" ]]; then
     echo "ERROR: UK_AQ_OPS_REPO_ROOT points to a different repository." >&2
     exit 4
@@ -419,6 +442,11 @@ set -a
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
+
+if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
+  echo "ERROR: UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
+  exit 4
+fi
 
 export UK_AQ_ENV_NAME="${ENV_NAME}"
 export UK_AQ_OPS_REPO_ROOT="${REPO_ROOT}"
@@ -452,23 +480,26 @@ for var_name in \
     echo "ERROR: ${var_name} contains /${OTHER_ENV}/ while --env=${ENV_NAME}. Refusing to run." >&2
     exit 4
   fi
+  if [[ -n "${var_value}" ]]; then
+    reject_archive_path "${var_name}" "${var_value}"
+  fi
 done
 
 INTEGRITY_WRAPPER="${SCRIPT_DIR}/uk_aq_integrity_backfill.sh"
 BACKFILL_ENV_FILE="${ENV_FILE}"
 SELF_PATH="$(resolve_abs_path "${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")")"
 
-if [[ "${INTEGRITY_WRAPPER}" == *"/archive/"* || "${INTEGRITY_WRAPPER}" == */archive/* ]]; then
-  echo "ERROR: integrity wrapper points to archive path (retired): ${INTEGRITY_WRAPPER}" >&2
-  exit 4
-fi
+reject_archive_path "integrity wrapper" "${INTEGRITY_WRAPPER}"
 if [[ ! -f "${INTEGRITY_WRAPPER}" || ! -x "${INTEGRITY_WRAPPER}" ]]; then
   echo "ERROR: integrity wrapper not found: ${INTEGRITY_WRAPPER}" >&2
   exit 4
 fi
 BACKFILL_WRAPPER="$(require_env UK_AQ_BACKFILL_WRAPPER)"
+reject_archive_path "UK_AQ_BACKFILL_WRAPPER" "${BACKFILL_WRAPPER}"
 BACKFILL_WRAPPER_PATH="$(resolve_abs_path "${BACKFILL_WRAPPER}")"
+reject_archive_path "resolved UK_AQ_BACKFILL_WRAPPER" "${BACKFILL_WRAPPER_PATH}"
 INTEGRITY_WRAPPER_PATH="$(resolve_abs_path "${INTEGRITY_WRAPPER}")"
+reject_archive_path "resolved integrity wrapper" "${INTEGRITY_WRAPPER_PATH}"
 if [[ "${BACKFILL_WRAPPER_PATH}" == "${SELF_PATH}" || "${BACKFILL_WRAPPER_PATH}" == "${INTEGRITY_WRAPPER_PATH}" ]]; then
   echo "ERROR: nested UK_AQ_BACKFILL_WRAPPER resolves to integrity wrapper (${BACKFILL_WRAPPER_PATH}); this would recurse." >&2
   echo "ERROR: set UK_AQ_BACKFILL_WRAPPER in ${BACKFILL_ENV_FILE} to the real backfill runner (for example scripts/uk_aq_backfill_local.sh)." >&2

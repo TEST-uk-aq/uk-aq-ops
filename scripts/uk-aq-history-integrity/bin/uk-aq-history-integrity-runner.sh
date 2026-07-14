@@ -25,13 +25,32 @@ error() {
   exit 3
 }
 
+path_is_archive() {
+  python3 - "${1:-}" <<'PY'
+from pathlib import Path
+import sys
+
+raw = sys.argv[1]
+try:
+    candidates = (Path(raw), Path(raw).resolve(strict=False))
+except (OSError, RuntimeError, ValueError):
+    raise SystemExit(0)
+raise SystemExit(0 if any("archive" in candidate.parts for candidate in candidates) else 1)
+PY
+}
+
+reject_archive_path() {
+  local label="$1"
+  local value="${2:-}"
+  if [[ "${value}" =~ (^|/)archive(/|$) ]] || path_is_archive "${value}"; then
+    error "${label} points to an archive path"
+  fi
+}
+
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P -- "${SCRIPT_DIR}/../../.." && pwd -P)"
 EXPECTED_REPO_ROOT="${REPO_ROOT}"
-
-if [[ "${REPO_ROOT}" == *"/archive/"* ]]; then
-  error "repository runner resolves under an archive path: ${REPO_ROOT}"
-fi
+reject_archive_path "repository runner" "${REPO_ROOT}"
 
 resolve_existing_dir() {
   local raw="${1:-}"
@@ -42,7 +61,9 @@ resolve_existing_dir() {
 
 EXPORTED_REPO_ROOT="${UK_AQ_OPS_REPO_ROOT:-}"
 if [[ -n "${EXPORTED_REPO_ROOT}" ]]; then
+  reject_archive_path "UK_AQ_OPS_REPO_ROOT" "${EXPORTED_REPO_ROOT}"
   EXPORTED_REPO_ROOT="$(resolve_existing_dir "${EXPORTED_REPO_ROOT}")" || error "UK_AQ_OPS_REPO_ROOT is not an existing absolute directory"
+  reject_archive_path "resolved UK_AQ_OPS_REPO_ROOT" "${EXPORTED_REPO_ROOT}"
   [[ "${EXPORTED_REPO_ROOT}" == "${EXPECTED_REPO_ROOT}" ]] || error "UK_AQ_OPS_REPO_ROOT points to a different repository"
 fi
 
@@ -82,14 +103,16 @@ ROOT_ENV_FILE="${REPO_ROOT}/.env"
 # ownership values below.
 LOCAL_ROOT="${UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT:-/Users/mikehinford/uk-aq-history-integrity}"
 [[ "${LOCAL_ROOT}" = /* ]] || error "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT must be absolute"
-if [[ "${LOCAL_ROOT}" == *"/archive/"* ]]; then
-  error "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT points to an archive path"
-fi
+reject_archive_path "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT" "${LOCAL_ROOT}"
 
 set -a
 # shellcheck disable=SC1090
 source "${ROOT_ENV_FILE}"
 set +a
+
+if [[ "$(printf '%s' "${UKAQ_ENV_NAME:-}" | sed 's/[[:space:]]*$//')" != "${ENV_NAME}" ]]; then
+  error "UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}"
+fi
 
 UK_AQ_ENV_NAME="${ENV_NAME}"
 UK_AQ_OPS_REPO_ROOT="${REPO_ROOT}"
@@ -106,15 +129,17 @@ PY_ENTRY="${UK_AQ_HISTORY_INTEGRITY_ROOT}/bin/uk-aq-history-integrity.py"
 [[ -f "${PY_ENTRY}" && -r "${PY_ENTRY}" ]] || error "Python entrypoint is unavailable: ${PY_ENTRY}"
 
 DROPBOX_APP_ROOT="${UK_AQ_DROPBOX_APP_ROOT:-/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks}"
+reject_archive_path "UK_AQ_DROPBOX_APP_ROOT" "${DROPBOX_APP_ROOT}"
 DROPBOX_ROOT_RAW="${UK_AQ_DROPBOX_ROOT:-}"
 [[ -n "${DROPBOX_ROOT_RAW}" ]] || error "UK_AQ_DROPBOX_ROOT is missing from ${ROOT_ENV_FILE}"
+reject_archive_path "UK_AQ_DROPBOX_ROOT" "${DROPBOX_ROOT_RAW}"
 if [[ "${DROPBOX_ROOT_RAW}" = /* ]]; then
   DROPBOX_ROOT="${DROPBOX_ROOT_RAW}"
 else
   DROPBOX_ROOT="${DROPBOX_APP_ROOT%/}/${DROPBOX_ROOT_RAW#/}"
 fi
 DROPBOX_ROOT="$(cd -P -- "${DROPBOX_ROOT}" 2>/dev/null && pwd -P)" || error "Dropbox environment root is unavailable: ${DROPBOX_ROOT}"
-[[ "${DROPBOX_ROOT}" != *"/archive/"* ]] || error "Dropbox environment root points to an archive path"
+reject_archive_path "Dropbox environment root" "${DROPBOX_ROOT}"
 
 STATE_DIR="${LOCAL_ROOT%/}/state/${ENV_NAME}"
 export UK_AQ_HISTORY_INTEGRITY_STATE_DIR="${STATE_DIR}"
@@ -134,14 +159,16 @@ if [[ -n "${R2_ROOT_RAW}" ]]; then
   R2_ROOT="${R2_ROOT_RAW}"
 else
   R2_DIR="${UK_AQ_R2_HISTORY_DROPBOX_DIR:-R2_history_backup}"
+  reject_archive_path "UK_AQ_R2_HISTORY_DROPBOX_DIR" "${R2_DIR}"
   if [[ "${R2_DIR}" = /* ]]; then
     R2_ROOT="${R2_DIR}"
   else
     R2_ROOT="${DROPBOX_ROOT%/}/${R2_DIR#/}"
   fi
 fi
+reject_archive_path "UK_AQ_R2_HISTORY_DROPBOX_ROOT" "${R2_ROOT}"
 R2_ROOT="$(cd -P -- "${R2_ROOT}" 2>/dev/null && pwd -P)" || error "R2 history Dropbox root is unavailable: ${R2_ROOT}"
-[[ "${R2_ROOT}" != *"/archive/"* ]] || error "R2 history Dropbox root points to an archive path"
+reject_archive_path "R2 history Dropbox root" "${R2_ROOT}"
 export UK_AQ_R2_HISTORY_DROPBOX_ROOT="${R2_ROOT}"
 export UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT="${R2_ROOT}/history/v2/core"
 export UK_AQ_HISTORY_INTEGRITY_BACKFILL_WRAPPER="${REPO_ROOT}/scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh"

@@ -212,17 +212,22 @@ See [`uk-aq-r2-history-dropbox-backup.md`](uk-aq-r2-history-dropbox-backup.md) f
 
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.sh`
   - Stable dispatcher source; selects the repository from the local
-    `CIC-Test.env` or `LIVE.env` selector and forwards arguments.
+    `CIC-Test.env` or `LIVE.env` one-line `UK_AQ_OPS_REPO_ROOT` selector and
+    forwards arguments. It is the only file copied to
+    `/Users/mikehinford/uk-aq-history-integrity/bin/`.
 - `scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-runner.sh`
   - Repository runner; loads the root `.env`, derives paths, runs guardrails,
-    creates state dirs, takes a per-environment PID lock, then calls Python.
+    validates `UKAQ_ENV_NAME` against `--env`, rejects archive paths, creates
+    state dirs under `/Users/mikehinford/uk-aq-history-integrity/state/<ENV>/`,
+    takes a per-environment PID lock, then calls Python.
   - Required arg `--env CIC-Test|LIVE`; forwards `--profile`, `--source`,
     `--from-day`, `--to-day`, `--dry-run`, `--check-only`, and v2-only
     `--history-version v2`,
     `--max-download-mb`, `--max-runtime-minutes`, `--verbose` to python.
   - Runs from the complete ops checkout at
     `/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/TEST UK-AQ GH Repos/TEST-uk-aq-ops/scripts/uk-aq-history-integrity/bin/`;
-    do not deploy a partial runtime copy.
+    the runner and Python coordinator remain in that complete checkout; do not
+    deploy a partial runtime copy.
 
 - `scripts/uk-aq-history-integrity/bin/uk-aq-aqi-gap-check.py`
   - Local-only AQI gap checker for missing hourly AQI rows.
