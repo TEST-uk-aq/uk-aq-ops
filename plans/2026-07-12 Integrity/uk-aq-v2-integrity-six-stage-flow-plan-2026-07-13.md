@@ -587,6 +587,52 @@ Structural checks passed: `py_compile`, both Node checks, both shell checks and
 `git diff --check`. Aggregate expansion and affected-index schema enrichment
 remain CIC-Test follow-up validation items. No SQL or operational command ran.
 
+#### Final bounded correction pass
+
+- Issue 1, failed application evidence: **confirmed and fixed**. A failure
+  before PUT is imported as an `application_failed_before_put` blocked scope;
+  a failure after PUT was attempted is retained as an uncertain R2 object.
+  Final verification audits imported application failures so neither category
+  can disappear from the remaining-gap report.
+- Issue 2, inferred failure phases: **confirmed and fixed**. The metadata
+  executor now records the actual `pre_write_guard`, `put`, `get` or
+  `body_verification` phase with independent PUT and GET completion flags.
+- Issue 3, proposal history: **confirmed and fixed**. `proposal_evidence` now
+  has deterministic per-key attempts, a latest proposal and the application
+  that produced the authoritative verified overlay body. Dependency-skipped
+  proposals cannot replace that authoritative record.
+- Issue 4, metadata-operation authority: **confirmed and fixed**. Final
+  metadata operation evidence is imported only for GET-verified successful or
+  proved-unchanged bodies. Later planned, failed or dependency-skipped bodies
+  remain diagnostic evidence only. Successive authoritative changes update the
+  final hash and preserve only identities still represented by that body.
+- Issue 5, affected-index identity: **confirmed and fixed**. Final verification
+  parses each affected key and checks its v2 payload domain, day, connector,
+  pollutant, grain, profile, data prefix, pollutant manifest key and row-count
+  map before validating replacement or removal rows.
+- Issue 6, metadata aggregates: **confirmed and fixed**. Pure Python checks
+  now validate every entry and independently recalculate both coverage and
+  top-level metadata aggregates, fixed contract fields, timestamps and
+  backed-up values.
+- Issue 7, metadata operation outcome: **confirmed and fixed**. Every
+  canonical metadata operation requires exactly one authoritative outcome,
+  either `succeeded` with verified overlay evidence or `skipped_unchanged`
+  with the final combined object present. Other outcomes fail closed through
+  blocked or uncertain application evidence.
+
+Changed files: `scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs`,
+`scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py`,
+`docs/history-integrity.md` and
+`system_docs/integrity/uk-aq-r2-history-integrity.md`.
+
+Structural checks: `python3 -m py_compile`, both required `node --check`
+commands, both required `bash -n` commands and `git diff --check`. Narrow local
+checks used only injected executor functions, synthetic in-memory proposals and
+temporary files to verify all five application phases, pre-PUT final evidence,
+cross-stage history, authoritative metadata selection, affected-index identity
+rejection and aggregate mismatch rejection. SQL remains compatible and was not
+changed or applied. CIC-Test operational validation remains the next step.
+
 - Undefined final metadata-operation lookup: **confirmed**. Final verification
   now deterministically merges operation evidence by metadata key, unions
   replacement, removal and affected-index identities, and fails on conflicts.

@@ -471,7 +471,14 @@ function reduceRepairStatus(statuses, fallback = "not_run") {
   return fallback;
 }
 
-async function applyStagedProposals({ r2, proposals, writeR2 }) {
+export async function applyStagedProposals({
+  r2,
+  proposals,
+  writeR2,
+  assertChildren = assertCompleteChildrenUnchanged,
+  putObject = r2PutObject,
+  getObject = r2GetObject,
+}) {
   const results = new Map();
   const rank = {
     pollutant_manifest: 1,
@@ -494,15 +501,43 @@ async function applyStagedProposals({ r2, proposals, writeR2 }) {
       results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "planned", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: null, error: null });
       continue;
     }
+    let phase = "initial";
+    let putAttempted = false;
+    let putCompleted = false;
+    let getVerificationAttempted = false;
+    let getVerificationSucceeded = false;
     try {
-      if (proposal.pre_write_guard) await assertCompleteChildrenUnchanged({ r2, guard: proposal.pre_write_guard });
-      await r2PutObject({ r2, key: proposal.key, body: proposal.body, content_type: proposal.content_type });
-      const fresh = await r2GetObject({ r2, key: proposal.key });
-      if (fresh.bytes !== proposal.bytes || fresh.body.toString("utf8") !== proposal.body) throw new Error(`Verification failed for ${proposal.key}`);
+      if (proposal.pre_write_guard) {
+        phase = "pre_write_guard";
+        await assertChildren({ r2, guard: proposal.pre_write_guard });
+      }
+      phase = "put";
+      putAttempted = true;
+      await putObject({ r2, key: proposal.key, body: proposal.body, content_type: proposal.content_type });
+      putCompleted = true;
+      phase = "get";
+      getVerificationAttempted = true;
+      const fresh = await getObject({ r2, key: proposal.key });
+      phase = "body_verification";
+      if (fresh.bytes !== proposal.bytes || fresh.body.toString("utf8") !== proposal.body) {
+        throw new Error(`Verification failed for ${proposal.key}`);
+      }
+      getVerificationSucceeded = true;
+      phase = "complete";
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const putAttempted = !message.includes("Blocked dependency:");
-      results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "failed", put_attempted: putAttempted, put_completed: false, get_verification_attempted: putAttempted, get_verification_succeeded: false, verification: "failed", failure_stage: putAttempted ? "get" : "pre_write_guard", error: message });
+      results.set(proposal.key, {
+        key: proposal.key,
+        kind: proposal.kind,
+        status: "failed",
+        put_attempted: putAttempted,
+        put_completed: putCompleted,
+        get_verification_attempted: getVerificationAttempted,
+        get_verification_succeeded: getVerificationSucceeded,
+        verification: "failed",
+        failure_stage: phase,
+        error: message,
+      });
       for (const remaining of ordered.slice(position + 1)) results.set(remaining.key, { key: remaining.key, kind: remaining.kind, status: "not_run_due_to_dependency", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: "dependency", error: null });
       return { results, failure: { key: proposal.key, error: error instanceof Error ? error.message : String(error) } };
     }

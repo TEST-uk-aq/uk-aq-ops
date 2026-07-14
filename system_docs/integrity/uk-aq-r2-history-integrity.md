@@ -363,8 +363,13 @@ Integrity uses a targeted metadata merge, not the full rebuild: it replaces
 only entries identified by `domain`, `day_utc`, `connector_id` and
 `pollutant_code`, preserving unrelated observation and AQI coverage. Missing
 metadata and unreadable required affected-day children block safely, with no
-latest-index proposal. Final verification reads only changed metadata keys and
-checks their aggregate entries against affected pollutant indexes.
+latest-index proposal. Final verification reads only changed metadata keys,
+independently recalculates their coverage and top-level aggregates, and checks
+affected pollutant-index payload identities and row counts. Proposal evidence
+is retained per key across stages; only a verified successful or proved-
+unchanged body is authoritative. Before-PUT application failures become blocked
+final-verification scopes and attempted writes without exact GET verification
+become uncertain R2 blockers.
 Old and new pollutant timeseries IDs are unioned so removal-only entries do not
 remain stale. A final-empty metadata object is fail-closed pending verified R2
 deletion support. Index proposals apply in pollutant, metadata, latest-summary
