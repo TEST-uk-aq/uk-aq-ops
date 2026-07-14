@@ -3799,7 +3799,20 @@ async function deleteR2Prefix(prefix: string): Promise<number> {
     Boolean,
   );
   try {
-    return await deleteR2Keys(keys);
+    const deleted = await deleteR2Keys(keys);
+    if (SOURCE_TO_R2_TARGETED_STAGE_ENABLED && SOURCE_TO_R2_TARGETED_STAGE_ROOT && keys.length) {
+      for (const key of keys) {
+        const head = await r2HeadObject({ r2: OBS_R2_CONFIG, key });
+        if (head.exists) throw new Error(`R2 delete verification failed: ${key}`);
+      }
+      const tombstonePath = path.join(SOURCE_TO_R2_TARGETED_STAGE_ROOT, "deleted-object-keys.json");
+      const existing = fs.existsSync(tombstonePath)
+        ? JSON.parse(fs.readFileSync(tombstonePath, "utf8"))
+        : [];
+      const merged = Array.from(new Set([...(Array.isArray(existing) ? existing : []), ...keys])).sort();
+      writeTargetedStageJson(tombstonePath, merged);
+    }
+    return deleted;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`R2 delete prefix failed (${prefix}): ${message}`);

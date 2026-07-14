@@ -347,6 +347,14 @@ the run. Successful repairs remove only duplicate generated-object staging and
 the disposable verification view after reports are written; failed overlays are
 retained.
 
+Targeted force-replace deletions are represented by verified tombstones in the
+run state. They hide only the corresponding Dropbox key in the combined view;
+the Dropbox backup itself is never changed. Metadata leaf manifests derive
+their part metadata from final parquet, rather than inherited manifest fields.
+Final reports label original findings as `pre_repair`, while the principal v2
+status reflects the final verification result. `fail` and `stopped_limit` use
+the daily-task failure path.
+
 Run lifecycle:
 
 1. Start: call `uk_aq_rpc_daily_task_started` for seeded task key

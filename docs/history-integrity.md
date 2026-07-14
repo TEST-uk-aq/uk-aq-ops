@@ -49,12 +49,19 @@ contains only changed/generated objects. `run-state.json` records object hashes,
 dependencies, upload/verification state, changed scopes, and blocked scopes.
 Later stages resolve a verified overlay object first, then the matching
 `R2_history_backup` object. The backup is never updated or copied into.
+Verified tombstones hide objects deleted by a targeted replacement, so a stale
+Dropbox part cannot reappear in the current run's combined view.
 
 The final report includes prior R2 GET verification evidence for every changed
 object. On a successful non-dry-run repair, Integrity removes only the
 duplicate `generated-objects` staging directory and the disposable final
 verification view after the reports are written. It retains the sparse verified
 overlay and `run-state.json`; failed overlays are retained unchanged.
+
+Final repair reports keep the original detection as `pre_repair` evidence and
+make the principal v2 status reflect the final verification state. A failed
+final verification or `stopped_limit` is reported to daily task health as a
+failed task, not a finished task.
 
 ## Backup gate
 

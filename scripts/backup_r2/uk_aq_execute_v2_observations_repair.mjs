@@ -3,6 +3,8 @@
 // It never rewrites parquet data or invokes either data backfill wrapper.
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
+import { parquetMetadataAsync, parquetRead } from "hyparquet";
+import { compressors } from "hyparquet-compressors";
 import {
   hasRequiredR2Config,
   r2GetObject,
@@ -92,7 +94,7 @@ function safeLocalKey(key) {
   return normalized;
 }
 
-function walkLocalObjects(root, prefix = "") {
+function walkLocalObjects(root, prefixes = []) {
   const found = new Map();
   if (!root || !fs.existsSync(root)) return found;
   const visit = (directory, relative = "") => {
@@ -103,13 +105,20 @@ function walkLocalObjects(root, prefix = "") {
       else if (entry.isFile()) found.set(`${prefix}${nextRelative}`, fullPath);
     }
   };
-  visit(root);
+  for (const prefix of prefixes) {
+    const normalized = safeLocalKey(prefix).replace(/\/$/, "");
+    const scopedRoot = `${root}/${normalized}`;
+    if (fs.existsSync(scopedRoot)) visit(scopedRoot, normalized);
+  }
   return found;
 }
 
-function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson }) {
+function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes }) {
   const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
-  const paths = walkLocalObjects(dropboxRoot);
+  const paths = walkLocalObjects(dropboxRoot, prefixes);
+  for (const [key, tombstone] of Object.entries(state?.tombstones || {})) {
+    if (tombstone?.r2_delete_verified === true) paths.delete(safeLocalKey(key));
+  }
   for (const [key, entry] of Object.entries(state?.objects || {})) {
     if (entry?.r2_verified === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
       paths.set(safeLocalKey(key), entry.local_path);
@@ -300,7 +309,67 @@ function stableGeneratedAt({ dayUtc, dayManifest }) {
   return /^\d{4}-\d{2}-\d{2}T/.test(backedUpAt) ? backedUpAt : `${dayUtc}T00:00:00.000Z`;
 }
 
-function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId, pollutantCode }) {
+function parquetIso(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+async function parquetFileEntry({ store, key, domain, pollutantCode }) {
+  const object = store.getObject(key);
+  const file = new Uint8Array(object.body).slice().buffer;
+  const metadata = await parquetMetadataAsync(file);
+  const rowCount = Math.max(0, Number(metadata.num_rows || 0));
+  if (!rowCount) throw new Error("parquet_zero_rows");
+  const timestampColumn = domain === "observations" ? "observed_at" : "timestamp_hour_utc";
+  let rows = [];
+  await parquetRead({
+    file,
+    metadata,
+    columns: ["timeseries_id", timestampColumn],
+    rowStart: 0,
+    rowEnd: rowCount,
+    compressors,
+    onComplete: (value) => { rows = Array.isArray(value) ? value : []; },
+  });
+  const counts = {};
+  let minTimeseriesId = null;
+  let maxTimeseriesId = null;
+  let minTimestamp = null;
+  let maxTimestamp = null;
+  for (const row of rows) {
+    const timeseriesId = Number(Array.isArray(row) ? row[0] : null);
+    const timestamp = parquetIso(Array.isArray(row) ? row[1] : null);
+    if (!Number.isInteger(timeseriesId) || timeseriesId <= 0 || !timestamp) {
+      throw new Error("parquet_required_metadata_invalid");
+    }
+    const id = Math.trunc(timeseriesId);
+    counts[String(id)] = (counts[String(id)] || 0) + 1;
+    minTimeseriesId = minTimeseriesId === null ? id : Math.min(minTimeseriesId, id);
+    maxTimeseriesId = maxTimeseriesId === null ? id : Math.max(maxTimeseriesId, id);
+    minTimestamp = minTimestamp === null || timestamp < minTimestamp ? timestamp : minTimestamp;
+    maxTimestamp = maxTimestamp === null || timestamp > maxTimestamp ? timestamp : maxTimestamp;
+  }
+  if (Object.values(counts).reduce((total, count) => total + count, 0) !== rowCount) {
+    throw new Error("parquet_row_count_metadata_mismatch");
+  }
+  return {
+    key,
+    row_count: rowCount,
+    bytes: object.bytes,
+    etag_or_hash: sha256Hex(object.body),
+    pollutant_codes: [pollutantCode],
+    min_timeseries_id: minTimeseriesId,
+    max_timeseries_id: maxTimeseriesId,
+    ...(domain === "observations"
+      ? { min_observed_at: minTimestamp, max_observed_at: maxTimestamp }
+      : { min_timestamp_hour_utc: minTimestamp, max_timestamp_hour_utc: maxTimestamp }),
+    timeseries_row_counts: counts,
+  };
+}
+
+async function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId, pollutantCode, domain }) {
   const pollutantPrefix = `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
   const partKeys = store.listAllObjects({ prefix: `${pollutantPrefix}/` })
     .map((entry) => entry.key)
@@ -308,49 +377,13 @@ function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId, poll
     .sort();
   if (!partKeys.length) return { blocked_reason: "final_parquet_objects_unavailable" };
   const manifestKey = `${pollutantPrefix}/manifest.json`;
-  const existing = store.getObjectIfExists(manifestKey);
-  let payload;
-  try { payload = existing ? jsonObject(existing, manifestKey) : null; } catch { payload = null; }
-  let files = Array.isArray(payload?.files) ? payload.files : [];
-  // A missing pollutant manifest can still be rebuilt safely when the final
-  // connector or day manifest has complete entries for its actual parquet
-  // files. Do not trust these parents blindly: the physical key and byte
-  // checks below remain mandatory.
-  if (!files.length) {
-    for (const parentKey of [
-      `${base}/connector_id=${connectorId}/manifest.json`,
-      `${base}/manifest.json`,
-    ]) {
-      const parent = store.getObjectIfExists(parentKey);
-      if (!parent) continue;
-      let parentPayload;
-      try { parentPayload = jsonObject(parent, parentKey); } catch { continue; }
-      const candidate = Array.isArray(parentPayload?.files)
-        ? parentPayload.files.filter((entry) => partKeys.includes(String(entry?.key || "")))
-        : [];
-      if (candidate.length === partKeys.length) {
-        files = candidate;
-        payload = parentPayload;
-        break;
-      }
-    }
+  try {
+    const files = [];
+    for (const key of partKeys) files.push(await parquetFileEntry({ store, key, domain, pollutantCode }));
+    return { manifestKey, payload: {}, files };
+  } catch (error) {
+    return { blocked_reason: `final_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
   }
-  const fileKeys = files.map((entry) => String(entry?.key || "")).sort();
-  if (!files.length || fileKeys.length !== partKeys.length || fileKeys.some((key, index) => key !== partKeys[index])) {
-    return { blocked_reason: "final_parquet_metadata_incomplete" };
-  }
-  if (files.some((entry) => !Number.isInteger(entry?.row_count) || entry.row_count < 0 || !Number.isInteger(entry?.bytes) || entry.bytes < 0)) {
-    return { blocked_reason: "final_parquet_metadata_incomplete" };
-  }
-  for (const entry of files) {
-    const object = store.getObject(entry.key);
-    if (object.bytes !== entry.bytes) return { blocked_reason: "final_parquet_metadata_does_not_match_object" };
-    const expectedHash = String(entry.etag_or_hash || "").replace(/^"|"$/g, "");
-    if (/^[a-f0-9]{64}$/i.test(expectedHash) && sha256Hex(object.body) !== expectedHash.toLowerCase()) {
-      return { blocked_reason: "final_parquet_metadata_does_not_match_object" };
-    }
-  }
-  return { manifestKey, payload, files };
 }
 
 const REPAIR_STATUSES = new Set([
@@ -543,15 +576,25 @@ export async function runV2ObservationsRepair({
   if (!args.overlayRoot || !args.dropboxRoot || !args.runStateJson) {
     throw new Error("Combined local resolver paths are required for metadata repair");
   }
-  const localStore = createCombinedLocalStore(args);
+  const dataPrefix = domain === "observations"
+    ? config.observations_prefix_v2
+    : config.aqilevels_hourly_data_prefix_v2;
+  const indexPrefix = domain === "observations"
+    ? config.observations_timeseries_index_prefix_v2
+    : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
+  const localStore = createCombinedLocalStore({
+    ...args,
+    prefixes: [...new Set(scopes.flatMap((scope) => [
+      `${dataPrefix}/day_utc=${scope.dayUtc}`,
+      `${indexPrefix}/day_utc=${scope.dayUtc}`,
+    ]))],
+  });
   const staged = createStagedObjectMap({ r2: config.r2, store: localStore });
   const dayPlans = [];
   const blockedScopes = [];
+  const blockedConnectorScopes = new Set();
 
   for (const [dayUtc, dayScopes] of [...byDay.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-    const dataPrefix = domain === "observations"
-      ? config.observations_prefix_v2
-      : config.aqilevels_hourly_data_prefix_v2;
     const base = `${dataPrefix}/day_utc=${dayUtc}`;
     const proposalKeys = [];
     // Pollutant manifests are the leaf metadata layer.  Rebuild them before
@@ -576,10 +619,11 @@ export async function runV2ObservationsRepair({
         continue;
       }
       for (const pollutantCode of selectedCodes) {
-        const source = leafManifestSourceFromCombined({ store: localStore, base, dayUtc, connectorId: scope.connectorId, pollutantCode });
+        const source = await leafManifestSourceFromCombined({ store: localStore, base, dayUtc, connectorId: scope.connectorId, pollutantCode, domain });
         if (source.blocked_reason) {
           const blocked = { ...scope, pollutant_code: pollutantCode, status: "blocked_dependency", reason: source.blocked_reason };
           blockedScopes.push(blocked);
+          blockedConnectorScopes.add(`${dayUtc}|${scope.connectorId}`);
           continue;
         }
         const { manifestKey, payload, files } = source;
@@ -607,6 +651,10 @@ export async function runV2ObservationsRepair({
       }
     }
     for (const scope of dayScopes.filter((value) => value.needsConnector).sort((left, right) => left.connectorId - right.connectorId)) {
+      if (blockedConnectorScopes.has(`${dayUtc}|${scope.connectorId}`)) {
+        blockedScopes.push({ ...scope, status: "blocked_dependency", reason: "pollutant_manifest_dependency_blocked" });
+        continue;
+      }
       const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
       const key = `${base}/connector_id=${scope.connectorId}/manifest.json`;
       const payload = buildHistoryV2ConnectorManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
@@ -632,6 +680,12 @@ export async function runV2ObservationsRepair({
     const needsDay = dayScopes.some((scope) => scope.needsDay);
     let dayManifest = null;
     let dayManifestKey = `${base}/manifest.json`;
+    const dayBlocked = [...blockedConnectorScopes].some((scopeKey) => scopeKey.startsWith(`${dayUtc}|`));
+    if (dayBlocked) {
+      blockedScopes.push({ day_utc: dayUtc, status: "blocked_dependency", reason: "connector_manifest_dependency_blocked" });
+      dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+      continue;
+    }
     if (needsDay) {
       const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
       dayManifest = buildHistoryV2DayManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
@@ -700,7 +754,9 @@ export async function runV2ObservationsRepair({
     };
   });
   const topLevelStatuses = results.flatMap((result) => collectOutcomeStatuses(result));
-  const status = reduceRepairStatus(topLevelStatuses, args.writeR2 ? "not_run" : "planned");
+  const status = blockedScopes.length
+    ? "blocked_dependency"
+    : reduceRepairStatus(topLevelStatuses, args.writeR2 ? "not_run" : "planned");
   const ok = status !== "blocked_dependency" && status !== "failed";
   const executionStatus = args.writeR2
     ? reduceRepairStatus(results.map((result) => result.status), "not_run")
