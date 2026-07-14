@@ -89,9 +89,14 @@ final verification or `stopped_limit` is reported to daily task health as a
 failed task, not a finished task.
 
 Final verification includes each changed global metadata object by exact key.
-It validates schema, identity, entry uniqueness and aggregate counts, then
-cross-checks affected pollutant-index row counts without scanning the global
-metadata prefix.
+It validates schema, identity, entry uniqueness, every coverage and top-level
+aggregate, then cross-checks affected pollutant-index payload identities and
+row counts without scanning the global metadata prefix. Per-key proposal
+evidence retains every stage attempt, while only a GET-verified or unchanged
+metadata body becomes authoritative for this final contract. A failed
+application is recorded as a deterministic blocked scope before PUT, or an
+uncertain R2 object after PUT was attempted, and therefore always fails the
+single final verification.
 
 ## Backup gate
 

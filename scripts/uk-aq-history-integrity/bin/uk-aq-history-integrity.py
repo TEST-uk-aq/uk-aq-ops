@@ -13911,27 +13911,6 @@ def _record_metadata_executor_overlay(
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
-    for day in list(planning.get("days") or []):
-        if not isinstance(day, Mapping):
-            continue
-        index = day.get("index") or {}
-        metadata = index.get("timeseries_metadata") if isinstance(index, Mapping) else None
-        if not isinstance(metadata, Mapping):
-            continue
-        operations = list(metadata.get("metadata_operations") or [])
-        if operations:
-            merged = {str(item.get("metadata_object_key")): dict(item) for item in list(run_state.get("timeseries_metadata_operations") or []) if isinstance(item, Mapping) and item.get("metadata_object_key")}
-            for operation in operations:
-                if not isinstance(operation, Mapping) or not operation.get("metadata_object_key"):
-                    continue
-                key = str(operation["metadata_object_key"])
-                current = merged.get(key, {"metadata_object_key": key})
-                for field in ("replacement_identities", "removal_identities", "affected_pollutant_index_keys"):
-                    current[field] = sorted(set(current.get(field) or []) | {str(value) for value in list(operation.get(field) or [])})
-                current.update({field: operation[field] for field in ("timeseries_id", "expected_final_sha256", "preserved_entry_count", "replacement_entry_count", "removal_entry_count") if operation.get(field) is not None})
-                merged[key] = current
-            run_state["timeseries_metadata_operations"] = [merged[key] for key in sorted(merged)]
-            write_run_state(run_state)
     application = output.get("application")
     application_operations = list(application.get("operations") or []) if isinstance(application, Mapping) else []
     if not application_operations:
@@ -13944,17 +13923,48 @@ def _record_metadata_executor_overlay(
     }
     evidence = run_state.setdefault("proposal_evidence", {})
     uncertain = run_state.setdefault("uncertain_r2_objects", {})
-    for proposal in list(planning.get("proposals") or []):
-        if not isinstance(proposal, Mapping) or not proposal.get("changed"):
-            continue
+    for proposal in sorted(
+        (item for item in list(planning.get("proposals") or []) if isinstance(item, Mapping)),
+        key=lambda item: (
+            str(item.get("key") or ""), str(item.get("kind") or ""),
+            str(item.get("sha256") or item.get("expected_sha256") or ""),
+        ),
+    ):
         object_key = str(proposal.get("key") or "").strip()
-        body = proposal.get("proposed_body")
-        if not object_key or not isinstance(body, str):
+        if not object_key:
             continue
+        body = proposal.get("proposed_body")
         operation = operation_by_key.get(object_key, {})
         status = str(operation.get("status") or "not_run_due_to_dependency")
-        evidence[object_key] = {"proposal": dict(proposal), "application": operation}
+        attempt = {
+            "stage": manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage,
+            "proposal": dict(proposal),
+            "application": dict(operation),
+        }
+        record = evidence.setdefault(object_key, {"attempts": []})
+        if not isinstance(record, dict):
+            record = {"attempts": []}
+            evidence[object_key] = record
+        attempts = record.setdefault("attempts", [])
+        if not isinstance(attempts, list):
+            attempts = []
+            record["attempts"] = attempts
+        if attempt not in attempts:
+            attempts.append(attempt)
+        record["attempts"] = sorted(
+            attempts,
+            key=lambda item: (
+                str(item.get("stage") or ""),
+                str((item.get("proposal") or {}).get("key") or ""),
+                str((item.get("proposal") or {}).get("kind") or ""),
+                str((item.get("proposal") or {}).get("sha256") or ""),
+            ),
+        )
+        record["latest_proposal"] = dict(proposal)
         if status == "succeeded":
+            record["authoritative_application"] = dict(operation)
+            record["authoritative_proposal"] = dict(proposal)
+        if status == "succeeded" and proposal.get("changed") and isinstance(body, str):
             with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-overlay-") as temp_dir:
                 source = Path(temp_dir) / "generated-object"
                 source.write_text(body, encoding="utf-8")
@@ -13972,9 +13982,80 @@ def _record_metadata_executor_overlay(
                 "object_key": object_key,
                 "stage": manifest_stage if scope_set == manifest_scope_set else index_stage,
             })
-        elif status == "failed" and operation.get("put_attempted"):
-            uncertain[object_key] = dict(operation)
-            record_blocked_scope(run_state, {"stage": index_stage, "object_key": object_key, "reason": "r2_object_uncertain_after_failed_application"})
+        elif status == "failed":
+            if operation.get("put_attempted"):
+                uncertain[object_key] = dict(operation)
+                record_blocked_scope(run_state, {
+                    "stage": index_stage,
+                    "object_key": object_key,
+                    "kind": proposal.get("kind"),
+                    "reason": "r2_object_uncertain_after_failed_application",
+                    "failure_stage": operation.get("failure_stage"),
+                    "error": operation.get("error"),
+                })
+            else:
+                record_blocked_scope(run_state, {
+                    "stage": "application_failure",
+                    "object_key": object_key,
+                    "kind": proposal.get("kind"),
+                    "reason": "application_failed_before_put",
+                    "failure_stage": operation.get("failure_stage") or "pre_write_guard",
+                    "error": operation.get("error"),
+                })
+
+    # Metadata-operation evidence is authoritative only when the exact final
+    # metadata body was either GET-verified or proved unchanged.  Planned,
+    # failed and dependency-skipped proposals remain in proposal_evidence but
+    # must never overwrite the final-body contract used below.
+    merged = {
+        str(item.get("metadata_object_key")): dict(item)
+        for item in list(run_state.get("timeseries_metadata_operations") or [])
+        if isinstance(item, Mapping) and item.get("metadata_object_key")
+    }
+    for day in list(planning.get("days") or []):
+        if not isinstance(day, Mapping):
+            continue
+        index = day.get("index") or {}
+        metadata = index.get("timeseries_metadata") if isinstance(index, Mapping) else None
+        if not isinstance(metadata, Mapping):
+            continue
+        for raw_operation in list(metadata.get("metadata_operations") or []):
+            if not isinstance(raw_operation, Mapping) or not raw_operation.get("metadata_object_key"):
+                continue
+            key = str(raw_operation["metadata_object_key"])
+            application_operation = operation_by_key.get(key, {})
+            outcome = str(application_operation.get("status") or "not_run_due_to_dependency")
+            if outcome not in {"succeeded", "skipped_unchanged"}:
+                continue
+            current = merged.get(key, {"metadata_object_key": key})
+            replacements = set(current.get("replacement_identities") or [])
+            removals = set(current.get("removal_identities") or [])
+            new_replacements = {str(value) for value in list(raw_operation.get("replacement_identities") or [])}
+            new_removals = {str(value) for value in list(raw_operation.get("removal_identities") or [])}
+            replacements.update(new_replacements)
+            replacements.difference_update(new_removals)
+            removals.update(new_removals)
+            removals.difference_update(new_replacements)
+            current.update({
+                "replacement_identities": sorted(replacements),
+                "removal_identities": sorted(removals),
+                "affected_pollutant_index_keys": sorted(
+                    set(current.get("affected_pollutant_index_keys") or [])
+                    | {str(value) for value in list(raw_operation.get("affected_pollutant_index_keys") or [])}
+                ),
+                "outcome": outcome,
+                "application": dict(application_operation),
+            })
+            current.update({
+                field: raw_operation[field]
+                for field in (
+                    "timeseries_id", "expected_final_sha256", "preserved_entry_count",
+                    "replacement_entry_count", "removal_entry_count",
+                )
+                if raw_operation.get(field) is not None
+            })
+            merged[key] = current
+    run_state["timeseries_metadata_operations"] = [merged[key] for key in sorted(merged)]
     write_run_state(run_state)
 
 
@@ -14292,95 +14373,268 @@ def _final_verification_stage_for_gap(domain: str, gap: Mapping[str, Any]) -> st
     return "observs" if domain == "observations" else "aqilevels"
 
 
+def _metadata_iso_value(value: Any, *, field: str) -> tuple[dt.datetime | None, str | None]:
+    if value is None:
+        return None, None
+    parsed = _parse_required_timestamp_value(value)
+    if parsed is None:
+        raise ValueError(f"invalid_{field}")
+    return parsed, fmt_iso(parsed)
+
+
+def _metadata_positive_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"invalid_{field}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid_{field}") from exc
+    if parsed <= 0 or str(parsed) != str(value).strip():
+        raise ValueError(f"invalid_{field}")
+    return parsed
+
+
+def _metadata_identity(item: Mapping[str, Any]) -> str:
+    return (
+        f"{item['domain']}|{item['day_utc']}|{item['connector_id']}|"
+        f"{item['pollutant_code']}"
+    )
+
+
+def _metadata_index_identity_from_key(key: str, config: HistoryPathConfig) -> tuple[str, str, int, str]:
+    normalized = _normalise_overlay_object_key(key)
+    for domain, prefix in (
+        ("observations", config.observations_timeseries_index_prefix),
+        ("aqilevels", config.aqilevels_timeseries_index_prefix),
+    ):
+        escaped = re.escape(prefix.strip("/"))
+        match = re.fullmatch(
+            rf"{escaped}/day_utc=(\d{{4}}-\d{{2}}-\d{{2}})/connector_id=(\d+)/"
+            rf"pollutant_code=([^/]+)/manifest\.json",
+            normalized,
+        )
+        if match:
+            day_utc, connector_id, pollutant_code = match.groups()
+            dt.date.fromisoformat(day_utc)
+            connector = _metadata_positive_int(connector_id, field="affected_index_connector_id")
+            if not re.fullmatch(r"[a-z0-9_]+", pollutant_code):
+                raise ValueError("affected_index_pollutant_code_invalid")
+            return domain, day_utc, connector, pollutant_code
+    raise ValueError("affected_pollutant_index_key_invalid")
+
+
+def _validate_timeseries_metadata_coverage(
+    *, payload: Mapping[str, Any], domain: Literal["observations", "aqilevels"],
+) -> list[dict[str, Any]]:
+    coverage_name = "observations_coverage" if domain == "observations" else "aqi_coverage"
+    label = "observations" if domain == "observations" else "aqi"
+    coverage = payload.get(coverage_name)
+    if not isinstance(coverage, Mapping) or not isinstance(coverage.get("entries"), list):
+        raise ValueError(f"{label}_coverage_invalid")
+    entries: list[dict[str, Any]] = []
+    for raw in coverage["entries"]:
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{label}_coverage_entry_invalid")
+        if str(raw.get("domain") or "") != domain:
+            raise ValueError(f"{label}_coverage_entry_domain_mismatch")
+        day_utc = str(raw.get("day_utc") or "")
+        try:
+            dt.date.fromisoformat(day_utc)
+        except ValueError as exc:
+            raise ValueError(f"{label}_coverage_entry_day_utc_invalid") from exc
+        connector_id = _metadata_positive_int(raw.get("connector_id"), field=f"{label}_coverage_entry_connector_id")
+        pollutant_code = str(raw.get("pollutant_code") or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9_]+", pollutant_code):
+            raise ValueError(f"{label}_coverage_entry_pollutant_code_invalid")
+        if domain == "aqilevels" and pollutant_code not in V2_AQI_SUPPORTED_POLLUTANTS:
+            raise ValueError("aqi_coverage_entry_unsupported_pollutant")
+        row_count = _metadata_positive_int(raw.get("row_count"), field=f"{label}_coverage_entry_row_count")
+        min_name = "min_observed_at_utc" if domain == "observations" else "min_timestamp_hour_utc"
+        max_name = "max_observed_at_utc" if domain == "observations" else "max_timestamp_hour_utc"
+        minimum, minimum_text = _metadata_iso_value(raw.get(min_name), field=min_name)
+        maximum, maximum_text = _metadata_iso_value(raw.get(max_name), field=max_name)
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"{label}_coverage_timestamp_range_invalid")
+        backed, backed_text = _metadata_iso_value(raw.get("backed_up_at_utc"), field="backed_up_at_utc")
+        entries.append({
+            "domain": domain, "day_utc": day_utc, "connector_id": connector_id,
+            "pollutant_code": pollutant_code, "row_count": row_count,
+            min_name: minimum_text, max_name: maximum_text, "backed_up_at_utc": backed_text,
+            "_minimum": minimum, "_maximum": maximum, "_backed": backed,
+        })
+    identities = {_metadata_identity(item) for item in entries}
+    if len(identities) != len(entries):
+        raise ValueError(f"{label}_coverage_entry_identity_duplicate")
+    ordered = sorted(entries, key=lambda item: (item["day_utc"], item["connector_id"], item["pollutant_code"]))
+    timestamp_min = min((item["_minimum"] for item in ordered if item["_minimum"] is not None), default=None)
+    timestamp_max = max((item["_maximum"] for item in ordered if item["_maximum"] is not None), default=None)
+    backed_max = max((item["_backed"] for item in ordered if item["_backed"] is not None), default=None)
+    expected = {
+        "row_count": sum(item["row_count"] for item in ordered),
+        "day_count": len({item["day_utc"] for item in ordered}),
+        "first_day_utc": ordered[0]["day_utc"] if ordered else None,
+        "last_day_utc": ordered[-1]["day_utc"] if ordered else None,
+        "connector_ids": sorted({item["connector_id"] for item in ordered}),
+        "pollutant_codes": sorted({item["pollutant_code"] for item in ordered}),
+        "first_observed_at_utc": fmt_iso(timestamp_min) if domain == "observations" and timestamp_min else None,
+        "last_observed_at_utc": fmt_iso(timestamp_max) if domain == "observations" and timestamp_max else None,
+        "first_timestamp_hour_utc": fmt_iso(timestamp_min) if domain == "aqilevels" and timestamp_min else None,
+        "last_timestamp_hour_utc": fmt_iso(timestamp_max) if domain == "aqilevels" and timestamp_max else None,
+        "backed_up_at_utc": fmt_iso(backed_max) if backed_max else None,
+    }
+    for field, expected_value in expected.items():
+        if coverage.get(field) != expected_value:
+            raise ValueError(f"{label}_coverage_{field}_mismatch")
+    return entries
+
+
+def _validate_timeseries_metadata_payload(
+    *, payload: Mapping[str, Any], key: str, config: HistoryPathConfig,
+) -> tuple[int, list[dict[str, Any]]]:
+    match = re.search(r"/timeseries_id=(\d+)\.json$", key)
+    if not match:
+        raise ValueError("metadata_object_key_invalid")
+    timeseries_id = _metadata_positive_int(match.group(1), field="timeseries_id")
+    if payload.get("schema_version") != 1:
+        raise ValueError("schema_version_mismatch")
+    if payload.get("source") != "r2_history_v2_timeseries_indexes":
+        raise ValueError("source_mismatch")
+    if payload.get("history_version") != "v2" or payload.get("index_kind") != "timeseries_metadata":
+        raise ValueError("history_version_or_index_kind_mismatch")
+    if _metadata_positive_int(payload.get("timeseries_id"), field="timeseries_id") != timeseries_id:
+        raise ValueError("timeseries_id_mismatch")
+    index_prefix = config.observations_latest_index_key.rsplit("/", 1)[0]
+    metadata_prefix = key.rsplit("/", 1)[0]
+    if payload.get("index_prefix") != index_prefix:
+        raise ValueError("index_prefix_mismatch")
+    if payload.get("timeseries_metadata_index_prefix") != metadata_prefix:
+        raise ValueError("timeseries_metadata_index_prefix_mismatch")
+    observations = _validate_timeseries_metadata_coverage(payload=payload, domain="observations")
+    aqilevels = _validate_timeseries_metadata_coverage(payload=payload, domain="aqilevels")
+    entries = observations + aqilevels
+    connector_ids = sorted({item["connector_id"] for item in entries})
+    pollutant_codes = sorted({item["pollutant_code"] for item in entries})
+    backed_values = [item["_backed"] for item in entries if item["_backed"] is not None]
+    backed = max(backed_values) if backed_values else None
+    if payload.get("connector_ids") != connector_ids:
+        raise ValueError("top_level_connector_ids_mismatch")
+    if payload.get("connector_id") != (connector_ids[0] if len(connector_ids) == 1 else None):
+        raise ValueError("top_level_connector_id_mismatch")
+    if payload.get("pollutant_codes") != pollutant_codes:
+        raise ValueError("top_level_pollutant_codes_mismatch")
+    expected_backed = fmt_iso(backed) if backed else None
+    if payload.get("backed_up_at_utc") != expected_backed:
+        raise ValueError("top_level_backed_up_at_utc_mismatch")
+    generated, generated_text = _metadata_iso_value(payload.get("generated_at"), field="generated_at")
+    if backed is not None and generated_text != expected_backed:
+        raise ValueError("top_level_generated_at_mismatch")
+    if backed is None and payload.get("generated_at") is not None and generated is None:
+        raise ValueError("top_level_generated_at_invalid")
+    return timeseries_id, entries
+
+
+def _validate_affected_timeseries_index(
+    *, index_payload: Mapping[str, Any], index_key: str, identity: tuple[str, str, int, str],
+    config: HistoryPathConfig,
+) -> None:
+    domain, day_utc, connector_id, pollutant_code = identity
+    if index_payload.get("history_version") != "v2":
+        raise ValueError("affected_pollutant_index_history_version_mismatch")
+    if index_payload.get("index_kind") != "timeseries_file_ranges":
+        raise ValueError("affected_pollutant_index_kind_mismatch")
+    if index_payload.get("domain") != domain:
+        raise ValueError("affected_pollutant_index_domain_mismatch")
+    if index_payload.get("day_utc") != day_utc:
+        raise ValueError("affected_pollutant_index_day_utc_mismatch")
+    if index_payload.get("connector_id") != connector_id:
+        raise ValueError("affected_pollutant_index_connector_id_mismatch")
+    if index_payload.get("pollutant_code") != pollutant_code:
+        raise ValueError("affected_pollutant_index_pollutant_code_mismatch")
+    expected_grain = None if domain == "observations" else "hourly"
+    expected_profile = None if domain == "observations" else "data"
+    if index_payload.get("grain") != expected_grain:
+        raise ValueError("affected_pollutant_index_grain_mismatch")
+    if index_payload.get("profile") != expected_profile:
+        raise ValueError("affected_pollutant_index_profile_mismatch")
+    data_prefix = config.observations_data_prefix if domain == "observations" else config.aqilevels_hourly_data_prefix
+    if index_payload.get("data_prefix") != data_prefix:
+        raise ValueError("affected_pollutant_index_data_prefix_mismatch")
+    expected_manifest_key = (
+        f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+        f"pollutant_code={pollutant_code}/manifest.json"
+    )
+    if index_payload.get("pollutant_manifest_key") != expected_manifest_key:
+        raise ValueError("affected_pollutant_index_manifest_key_mismatch")
+    if not isinstance(index_payload.get("timeseries_row_counts"), Mapping):
+        raise ValueError("affected_pollutant_index_timeseries_row_counts_invalid")
+
+
 def _validate_changed_timeseries_metadata(
     *, run_state: Mapping[str, Any], view_root: Path, config: HistoryPathConfig,
 ) -> list[dict[str, Any]]:
-    """Validate only metadata objects changed by this run, never the full prefix."""
+    """Validate canonical metadata bodies and their exact affected indexes."""
     gaps: list[dict[str, Any]] = []
     operations_by_key: dict[str, dict[str, Any]] = {}
     for raw in list(run_state.get("timeseries_metadata_operations") or []):
         if not isinstance(raw, Mapping):
             continue
-        key = str(raw.get("metadata_object_key") or "").strip()
-        if not key:
-            gaps.append({"stage": "timeseries_metadata", "gap_type": "metadata_operation_key_missing"})
+        key = _normalise_overlay_object_key(str(raw.get("metadata_object_key") or ""))
+        if not key or key in operations_by_key:
+            gaps.append({"stage": "timeseries_metadata", "object_key": key or None, "gap_type": "metadata_operation_key_invalid_or_duplicate"})
             continue
-        operation = operations_by_key.setdefault(key, {
-            "metadata_object_key": key,
-            "replacement_identities": [], "removal_identities": [],
-            "affected_pollutant_index_keys": [],
-        })
-        for field in ("replacement_identities", "removal_identities", "affected_pollutant_index_keys"):
-            operation[field] = sorted(set(operation[field]) | {str(value) for value in list(raw.get(field) or [])})
-        for field in ("timeseries_id", "expected_final_sha256", "preserved_entry_count", "replacement_entry_count", "removal_entry_count"):
-            if raw.get(field) is not None:
-                operation[field] = raw[field]
-    for key, operation in operations_by_key.items():
-        if set(operation["replacement_identities"]) & set(operation["removal_identities"]):
-            gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": "metadata_operation_identity_conflict"})
-    for object_key, entry in dict(run_state.get("objects") or {}).items():
-        key = _normalise_overlay_object_key(str(object_key))
-        match = re.search(r"/timeseries_id=(\d+)\.json$", key)
-        if not match or not isinstance(entry, Mapping) or not entry.get("r2_verified"):
-            continue
-        path = view_root / key
+        operations_by_key[key] = dict(raw)
+    for key, operation in sorted(operations_by_key.items()):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            operation = operations_by_key.get(key)
-            if operation and operation.get("expected_final_sha256"):
-                actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-                if actual_hash != str(operation["expected_final_sha256"]):
-                    raise ValueError("expected_final_metadata_hash_mismatch")
-            timeseries_id = int(match.group(1))
-            if payload.get("history_version") != "v2" or payload.get("index_kind") != "timeseries_metadata" or int(payload.get("timeseries_id")) != timeseries_id:
-                raise ValueError("schema_or_identity_invalid")
-            entries: list[Mapping[str, Any]] = []
-            for domain, coverage_key in (("observations", "observations_coverage"), ("aqilevels", "aqi_coverage")):
-                coverage = payload.get(coverage_key)
-                if not isinstance(coverage, Mapping) or not isinstance(coverage.get("entries"), list):
-                    raise ValueError(f"{coverage_key}_invalid")
-                domain_entries = [item for item in coverage["entries"] if isinstance(item, Mapping)]
-                identities = {(domain, str(item.get("day_utc")), str(item.get("connector_id")), str(item.get("pollutant_code"))) for item in domain_entries}
-                if len(identities) != len(domain_entries) or int(coverage.get("row_count") or -1) != sum(int(item.get("row_count") or 0) for item in domain_entries):
-                    raise ValueError(f"{coverage_key}_aggregate_invalid")
-                entries.extend(domain_entries)
-            for item in entries:
-                domain = str(item.get("domain") or "")
-                day_utc = str(item.get("day_utc") or "")
-                connector_id = item.get("connector_id")
-                pollutant_code = str(item.get("pollutant_code") or "")
-                prefix = config.observations_timeseries_index_prefix if domain == "observations" else config.aqilevels_timeseries_index_prefix
-                index_path = view_root / prefix / f"day_utc={day_utc}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant_code}" / "manifest.json"
-                if operation and str(index_path.relative_to(view_root).as_posix()) not in set(operation.get("affected_pollutant_index_keys") or []):
-                    continue
+            outcome = str(operation.get("outcome") or "")
+            if outcome not in {"succeeded", "skipped_unchanged"}:
+                raise ValueError("metadata_operation_missing_canonical_outcome")
+            overlay_entry = dict(run_state.get("objects") or {}).get(key)
+            if outcome == "succeeded" and (
+                not isinstance(overlay_entry, Mapping)
+                or not overlay_entry.get("uploaded") or not overlay_entry.get("r2_verified")
+            ):
+                raise ValueError("metadata_operation_verified_success_missing_overlay_evidence")
+            path = view_root / key
+            if not path.is_file():
+                raise ValueError("metadata_operation_final_object_missing")
+            raw_bytes = path.read_bytes()
+            if operation.get("expected_final_sha256") and hashlib.sha256(raw_bytes).hexdigest() != str(operation["expected_final_sha256"]):
+                raise ValueError("expected_final_metadata_hash_mismatch")
+            payload = json.loads(raw_bytes.decode("utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("metadata_payload_not_object")
+            timeseries_id, entries = _validate_timeseries_metadata_payload(
+                payload=payload, key=key, config=config,
+            )
+            entries_by_identity = {_metadata_identity(item): item for item in entries}
+            replacements = {str(value) for value in list(operation.get("replacement_identities") or [])}
+            removals = {str(value) for value in list(operation.get("removal_identities") or [])}
+            if replacements & removals:
+                raise ValueError("metadata_operation_identity_conflict")
+            if not replacements.issubset(entries_by_identity):
+                raise ValueError("requested_metadata_replacement_missing")
+            if removals & set(entries_by_identity):
+                raise ValueError("requested_metadata_removal_present")
+            affected_keys = sorted({_normalise_overlay_object_key(str(value)) for value in list(operation.get("affected_pollutant_index_keys") or [])})
+            for index_key in affected_keys:
+                identity = _metadata_index_identity_from_key(index_key, config)
+                identity_key = "|".join((identity[0], identity[1], str(identity[2]), identity[3]))
+                if identity_key not in replacements and identity_key not in removals:
+                    raise ValueError("affected_metadata_index_without_authoritative_identity")
+                index_path = view_root / index_key
                 if not index_path.is_file():
                     raise ValueError("affected_pollutant_index_missing")
                 index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+                if not isinstance(index_payload, Mapping):
+                    raise ValueError("affected_pollutant_index_not_object")
+                _validate_affected_timeseries_index(
+                    index_payload=index_payload, index_key=index_key, identity=identity, config=config,
+                )
                 actual = int((index_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0)
-                if actual != int(item.get("row_count") or 0):
+                if identity_key in replacements and actual != int(entries_by_identity[identity_key]["row_count"]):
                     raise ValueError("affected_pollutant_index_entry_mismatch")
-            if operation:
-                identities = {
-                    f"{item.get('domain')}|{item.get('day_utc')}|{item.get('connector_id')}|{item.get('pollutant_code')}"
-                    for item in entries
-                }
-                if any(identity in identities for identity in list(operation.get("removal_identities") or [])):
-                    raise ValueError("requested_metadata_removal_present")
-                if any(identity not in identities for identity in list(operation.get("replacement_identities") or [])):
-                    raise ValueError("requested_metadata_replacement_missing")
-                checked_keys = {
-                    str((view_root / (config.observations_timeseries_index_prefix if str(item.get("domain")) == "observations" else config.aqilevels_timeseries_index_prefix) / f"day_utc={item.get('day_utc')}" / f"connector_id={item.get('connector_id')}" / f"pollutant_code={item.get('pollutant_code')}" / "manifest.json").relative_to(view_root).as_posix())
-                    for item in entries
-                }
-                for index_key in set(operation.get("affected_pollutant_index_keys") or []):
-                    if index_key in checked_keys:
-                        continue
-                    removal_path = view_root / str(index_key)
-                    if not removal_path.is_file():
-                        raise ValueError("affected_metadata_operation_index_missing")
-                    removal_payload = json.loads(removal_path.read_text(encoding="utf-8"))
-                    if int((removal_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0) != 0:
-                        raise ValueError("requested_metadata_removal_still_indexed")
+                if identity_key in removals and actual != 0:
+                    raise ValueError("requested_metadata_removal_still_indexed")
         except Exception as exc:
             gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": f"timeseries_metadata_invalid:{exc}"})
     return gaps
@@ -14463,6 +14717,42 @@ def run_v2_final_verification(
             remaining_scopes.append({"stage": "blocked_scope", **dict(blocked)})
     for object_key, evidence in dict(run_state.get("uncertain_r2_objects") or {}).items():
         remaining_scopes.append({"stage": "r2_get_verification", "object_key": object_key, "gap_type": "uncertain_r2_object_after_failed_application", "evidence": evidence})
+    blocked_keys = {
+        str(item.get("object_key") or "")
+        for item in list(run_state.get("blocked_scopes") or [])
+        if isinstance(item, Mapping)
+    }
+    application_failures: list[dict[str, Any]] = []
+    for object_key, record in sorted(dict(run_state.get("proposal_evidence") or {}).items()):
+        if not isinstance(record, Mapping):
+            continue
+        for attempt in list(record.get("attempts") or []):
+            if not isinstance(attempt, Mapping):
+                continue
+            application = attempt.get("application")
+            if not isinstance(application, Mapping) or application.get("status") != "failed":
+                continue
+            failure = {
+                "object_key": str(object_key),
+                "stage": attempt.get("stage"),
+                "kind": application.get("kind"),
+                "put_attempted": bool(application.get("put_attempted")),
+                "failure_stage": application.get("failure_stage"),
+                "error": application.get("error"),
+            }
+            application_failures.append(failure)
+            if failure["put_attempted"] and str(object_key) not in dict(run_state.get("uncertain_r2_objects") or {}):
+                remaining_scopes.append({
+                    "stage": "application_failure",
+                    "gap_type": "failed_application_missing_uncertain_r2_evidence",
+                    **failure,
+                })
+            if not failure["put_attempted"] and str(object_key) not in blocked_keys:
+                remaining_scopes.append({
+                    "stage": "application_failure",
+                    "gap_type": "failed_application_missing_blocked_scope_evidence",
+                    **failure,
+                })
     for object_key, tombstone in dict(run_state.get("tombstones") or {}).items():
         delete_evidence = {
             "object_key": object_key,
@@ -14490,6 +14780,7 @@ def run_v2_final_verification(
         "local_object_resolution": "verified_overlay_first_then_dropbox",
         "r2_get_verification_evidence": verification_evidence,
         "r2_delete_verification_evidence": r2_delete_verification_evidence,
+        "application_failures": application_failures,
         "r2_objects_written": len(r2_written_keys),
         "r2_objects_deleted": sum(
             1
