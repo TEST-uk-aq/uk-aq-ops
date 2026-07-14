@@ -365,6 +365,10 @@ only entries identified by `domain`, `day_utc`, `connector_id` and
 metadata and unreadable required affected-day children block safely, with no
 latest-index proposal. Final verification reads only changed metadata keys and
 checks their aggregate entries against affected pollutant indexes.
+Old and new pollutant timeseries IDs are unioned so removal-only entries do not
+remain stale. A final-empty metadata object is fail-closed pending verified R2
+deletion support. Index proposals apply in pollutant, metadata, latest-summary
+order; tombstones hide Dropbox even during dynamic exact-key fallback.
 Final reports label original findings as `pre_repair`, while the principal v2
 status reflects the final verification result. `fail` and `stopped_limit` use
 the daily-task failure path.

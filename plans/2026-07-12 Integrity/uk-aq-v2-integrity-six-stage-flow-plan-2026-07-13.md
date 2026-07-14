@@ -1123,6 +1123,28 @@ was changed. First CIC-Test checks are a narrow repair dry-run showing affected
 timeseries IDs and preserved/replaced counts, then an approved narrow repair
 confirming GET verification and final metadata checks.
 
+### Targeted metadata removal follow-up record — 2026-07-14
+
+- Issue 1, removal-only IDs: **confirmed**. Planning now unions old and final
+  pollutant-index IDs and removes only the matching full metadata identity.
+- Issue 2, blocked metadata with staged indexes: **confirmed**. The executor
+  removes every proposal from a blocked index plan before application.
+- Issue 3, dry-run status: **confirmed**. Local-only metadata proposals report
+  `planned`, never `succeeded`.
+- Issue 4, local not-found handling: **confirmed**. `OBJECT_NOT_FOUND` reaches
+  the shared fetch helper as an absent exact metadata object.
+- Issue 5, removal verification: **partially confirmed**. Removal updates use
+  normal changed-object evidence; final-empty metadata remains fail-closed as
+  `timeseries_metadata_delete_required_not_supported` pending verified delete
+  and tombstone support.
+- Issue 6, tombstone fallback: **confirmed**. Tombstones are checked before
+  dynamic Dropbox exact-key fallback.
+- Issue 7, latest ordering: **confirmed**. Latest summaries apply after
+  pollutant and metadata proposals, and no latest proposal survives a block.
+
+Targeted local checks passed for removal-only preservation and final-empty
+planning. No SQL change is required and no operational command was run.
+
 ## Recommended model
 
 ```text

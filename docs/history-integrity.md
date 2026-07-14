@@ -68,6 +68,12 @@ recalculating coverage. Missing metadata blocks safely. Every final affected
 connector and pollutant child is required, so an unreadable child produces no
 latest-index or metadata proposal for that incomplete day.
 
+Targeted metadata planning unions old and final pollutant-index timeseries IDs,
+so removal-only IDs lose only their exact affected entry. A final-empty metadata
+object blocks until verified deletion support exists. Latest-index proposals are
+applied after pollutant and metadata proposals, and tombstones precede every
+Dropbox fallback, including dynamic exact-key reads.
+
 The final report includes prior R2 GET verification evidence for every changed
 object and delete verification evidence for every replacement deletion. It
 reports `r2_objects_written`, `r2_objects_deleted`, and their verified union as
