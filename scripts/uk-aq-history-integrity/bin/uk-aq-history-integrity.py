@@ -8782,6 +8782,11 @@ def run_v2_observations_integrity_checks(
         raise RuntimeError("v2 observations integrity requires a selected from/to day range")
 
     gaps: list[dict[str, Any]] = []
+    operations_by_key = {
+        str(operation.get("metadata_object_key")): operation
+        for operation in list(run_state.get("timeseries_metadata_operations") or [])
+        if isinstance(operation, Mapping)
+    }
     checked = 0
     data_prefix = config.observations_data_prefix.strip("/")
     index_prefix = config.observations_timeseries_index_prefix.strip("/")
@@ -13905,6 +13910,19 @@ def _record_metadata_executor_overlay(
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
+    for day in list(planning.get("days") or []):
+        if not isinstance(day, Mapping):
+            continue
+        index = day.get("index") or {}
+        metadata = index.get("timeseries_metadata") if isinstance(index, Mapping) else None
+        if not isinstance(metadata, Mapping):
+            continue
+        operations = list(metadata.get("metadata_operations") or [])
+        if operations:
+            run_state.setdefault("timeseries_metadata_operations", []).extend(
+                dict(operation) for operation in operations if isinstance(operation, Mapping)
+            )
+            write_run_state(run_state)
     operation_status: dict[str, str] = {}
     for result in list(output.get("results") or []):
         if not isinstance(result, Mapping):
@@ -14266,6 +14284,11 @@ def _validate_changed_timeseries_metadata(
         path = view_root / key
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            operation = operations_by_key.get(key)
+            if operation and operation.get("expected_final_sha256"):
+                actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                if actual_hash != str(operation["expected_final_sha256"]):
+                    raise ValueError("expected_final_metadata_hash_mismatch")
             timeseries_id = int(match.group(1))
             if payload.get("history_version") != "v2" or payload.get("index_kind") != "timeseries_metadata" or int(payload.get("timeseries_id")) != timeseries_id:
                 raise ValueError("schema_or_identity_invalid")
@@ -14286,11 +14309,21 @@ def _validate_changed_timeseries_metadata(
                 pollutant_code = str(item.get("pollutant_code") or "")
                 prefix = config.observations_timeseries_index_prefix if domain == "observations" else config.aqilevels_timeseries_index_prefix
                 index_path = view_root / prefix / f"day_utc={day_utc}" / f"connector_id={connector_id}" / f"pollutant_code={pollutant_code}" / "manifest.json"
-                if index_path.is_file():
-                    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
-                    actual = int((index_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0)
-                    if actual != int(item.get("row_count") or 0):
-                        raise ValueError("affected_pollutant_index_entry_mismatch")
+                if not index_path.is_file():
+                    raise ValueError("affected_pollutant_index_missing")
+                index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+                actual = int((index_payload.get("timeseries_row_counts") or {}).get(str(timeseries_id)) or 0)
+                if actual != int(item.get("row_count") or 0):
+                    raise ValueError("affected_pollutant_index_entry_mismatch")
+            if operation:
+                identities = {
+                    f"{item.get('domain')}|{item.get('day_utc')}|{item.get('connector_id')}|{item.get('pollutant_code')}"
+                    for item in entries
+                }
+                if any(identity in identities for identity in list(operation.get("removal_identities") or [])):
+                    raise ValueError("requested_metadata_removal_present")
+                if any(identity not in identities for identity in list(operation.get("replacement_identities") or [])):
+                    raise ValueError("requested_metadata_replacement_missing")
         except Exception as exc:
             gaps.append({"stage": "timeseries_metadata", "object_key": key, "gap_type": f"timeseries_metadata_invalid:{exc}"})
     return gaps

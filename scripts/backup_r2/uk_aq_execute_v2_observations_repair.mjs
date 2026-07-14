@@ -473,7 +473,18 @@ function reduceRepairStatus(statuses, fallback = "not_run") {
 
 async function applyStagedProposals({ r2, proposals, writeR2 }) {
   const results = new Map();
-  for (const proposal of proposals.values()) {
+  const rank = {
+    pollutant_manifest: 1,
+    connector_manifest: 2,
+    day_manifest: 3,
+    pollutant_timeseries_index: 4,
+    timeseries_metadata: 5,
+    latest_timeseries_index: 6,
+  };
+  const ordered = [...proposals.values()].sort((left, right) =>
+    (rank[left.kind] || 99) - (rank[right.kind] || 99) || left.key.localeCompare(right.key)
+  );
+  for (const proposal of ordered) {
     if (!proposal.changed) {
       results.set(proposal.key, { key: proposal.key, status: "skipped_unchanged", verification: "not_run" });
       continue;
@@ -754,7 +765,7 @@ export async function runV2ObservationsRepair({
 
     let index = null;
     if (dayScopes.some((scope) => scope.needsIndex)) {
-      const before = new Set(staged.proposals.keys());
+      const proposalSnapshot = new Map(staged.proposals);
       try {
         index = await updateIndexes({
           env,
@@ -771,6 +782,8 @@ export async function runV2ObservationsRepair({
           writeR2: true,
         });
       } catch (error) {
+        staged.proposals.clear();
+        for (const [key, proposal] of proposalSnapshot) staged.proposals.set(key, proposal);
         const message = error instanceof Error ? error.message : String(error);
         const parts = message.split("|");
         blockedScopes.push({
@@ -784,9 +797,8 @@ export async function runV2ObservationsRepair({
         continue;
       }
       if (index?.timeseries_metadata?.status === "blocked_dependency") {
-        for (const key of [...staged.proposals.keys()]) {
-          if (!before.has(key)) staged.proposals.delete(key);
-        }
+        staged.proposals.clear();
+        for (const [key, proposal] of proposalSnapshot) staged.proposals.set(key, proposal);
         for (const blocked of index.timeseries_metadata.blocked_scopes || []) {
           blockedScopes.push({ day_utc: dayUtc, ...blocked });
         }
@@ -794,7 +806,7 @@ export async function runV2ObservationsRepair({
         continue;
       }
       for (const key of staged.proposals.keys()) {
-        if (!before.has(key)) proposalKeys.push(key);
+        if (!proposalSnapshot.has(key)) proposalKeys.push(key);
       }
     }
     dayPlans.push({ day_utc: dayUtc, status: "planned", scopes: dayScopes, blocked_scopes: [], proposal_keys: [...new Set(proposalKeys)].sort(), index });
@@ -813,7 +825,15 @@ export async function runV2ObservationsRepair({
     const proposal = staged.proposals.get(key);
     if (proposal) {
       staged.proposals.delete(key);
-      staged.proposals.set(key, { ...proposal, kind: "latest_timeseries_index" });
+      const dependencies = [...staged.proposals.values()]
+        .filter((candidate) => ["pollutant_timeseries_index", "timeseries_metadata"].includes(candidate.kind))
+        .map((candidate) => candidate.key)
+        .sort();
+      staged.proposals.set(key, {
+        ...proposal,
+        kind: "latest_timeseries_index",
+        dependencies: [...new Set([...(proposal.dependencies || []), ...dependencies])].sort(),
+      });
     }
   }
   const applied = await applyStagedProposals({ r2: config.r2, proposals: staged.proposals, writeR2: args.writeR2 });
