@@ -962,11 +962,8 @@ function installFakeR2Fetch(objectsByKey) {
   function keyFromUrl(url) {
     const parsed = new URL(url);
     const path = decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
-    const firstSlash = path.indexOf("/");
-    if (firstSlash > 0 && !path.startsWith("history/")) {
-      return path.slice(firstSlash + 1);
-    }
-    return path;
+    const prefix = "test-bucket/";
+    return path.startsWith(prefix) ? path.slice(prefix.length) : path;
   }
   globalThis.fetch = async (url, init = {}) => {
     const method = String(init.method || "GET").toUpperCase();
