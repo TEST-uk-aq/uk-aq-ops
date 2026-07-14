@@ -13920,17 +13920,30 @@ def _record_metadata_executor_overlay(
             continue
         operations = list(metadata.get("metadata_operations") or [])
         if operations:
-            run_state.setdefault("timeseries_metadata_operations", []).extend(
-                dict(operation) for operation in operations if isinstance(operation, Mapping)
-            )
+            merged = {str(item.get("metadata_object_key")): dict(item) for item in list(run_state.get("timeseries_metadata_operations") or []) if isinstance(item, Mapping) and item.get("metadata_object_key")}
+            for operation in operations:
+                if not isinstance(operation, Mapping) or not operation.get("metadata_object_key"):
+                    continue
+                key = str(operation["metadata_object_key"])
+                current = merged.get(key, {"metadata_object_key": key})
+                for field in ("replacement_identities", "removal_identities", "affected_pollutant_index_keys"):
+                    current[field] = sorted(set(current.get(field) or []) | {str(value) for value in list(operation.get(field) or [])})
+                current.update({field: operation[field] for field in ("timeseries_id", "expected_final_sha256", "preserved_entry_count", "replacement_entry_count", "removal_entry_count") if operation.get(field) is not None})
+                merged[key] = current
+            run_state["timeseries_metadata_operations"] = [merged[key] for key in sorted(merged)]
             write_run_state(run_state)
-    operation_status: dict[str, str] = {}
-    for result in list(output.get("results") or []):
-        if not isinstance(result, Mapping):
-            continue
-        for operation in list(result.get("operations") or []):
-            if isinstance(operation, Mapping):
-                operation_status[str(operation.get("key") or "")] = str(operation.get("status") or "")
+    application = output.get("application")
+    application_operations = list(application.get("operations") or []) if isinstance(application, Mapping) else []
+    if not application_operations:
+        for result in list(output.get("results") or []):
+            if isinstance(result, Mapping):
+                application_operations.extend(list(result.get("operations") or []))
+    operation_by_key = {
+        str(operation.get("key") or ""): dict(operation)
+        for operation in application_operations if isinstance(operation, Mapping) and operation.get("key")
+    }
+    evidence = run_state.setdefault("proposal_evidence", {})
+    uncertain = run_state.setdefault("uncertain_r2_objects", {})
     for proposal in list(planning.get("proposals") or []):
         if not isinstance(proposal, Mapping) or not proposal.get("changed"):
             continue
@@ -13938,17 +13951,20 @@ def _record_metadata_executor_overlay(
         body = proposal.get("proposed_body")
         if not object_key or not isinstance(body, str):
             continue
-        with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-overlay-") as temp_dir:
-            source = Path(temp_dir) / "generated-object"
-            source.write_text(body, encoding="utf-8")
-            stage_overlay_object(
-                run_state,
-                object_key=object_key,
-                source_path=source,
-                stage=manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage,
-                dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
-            )
-        if operation_status.get(object_key) == "succeeded":
+        operation = operation_by_key.get(object_key, {})
+        status = str(operation.get("status") or "not_run_due_to_dependency")
+        evidence[object_key] = {"proposal": dict(proposal), "application": operation}
+        if status == "succeeded":
+            with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-overlay-") as temp_dir:
+                source = Path(temp_dir) / "generated-object"
+                source.write_text(body, encoding="utf-8")
+                stage_overlay_object(
+                    run_state,
+                    object_key=object_key,
+                    source_path=source,
+                    stage=manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage,
+                    dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
+                )
             mark_overlay_uploaded(run_state, object_key)
             mark_overlay_verified(run_state, object_key)
             scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
@@ -13956,6 +13972,10 @@ def _record_metadata_executor_overlay(
                 "object_key": object_key,
                 "stage": manifest_stage if scope_set == manifest_scope_set else index_stage,
             })
+        elif status == "failed" and operation.get("put_attempted"):
+            uncertain[object_key] = dict(operation)
+            record_blocked_scope(run_state, {"stage": index_stage, "object_key": object_key, "reason": "r2_object_uncertain_after_failed_application"})
+    write_run_state(run_state)
 
 
 def _get_r2_object_bytes_for_integrity_overlay(
@@ -14441,6 +14461,8 @@ def run_v2_final_verification(
     for blocked in list(run_state.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             remaining_scopes.append({"stage": "blocked_scope", **dict(blocked)})
+    for object_key, evidence in dict(run_state.get("uncertain_r2_objects") or {}).items():
+        remaining_scopes.append({"stage": "r2_get_verification", "object_key": object_key, "gap_type": "uncertain_r2_object_after_failed_application", "evidence": evidence})
     for object_key, tombstone in dict(run_state.get("tombstones") or {}).items():
         delete_evidence = {
             "object_key": object_key,

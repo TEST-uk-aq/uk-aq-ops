@@ -567,6 +567,26 @@ run, SQL apply, R2 contact, deployment, commit, staging, or push was performed.
 
 ### Proposal-evidence corrective record — 2026-07-14
 
+#### Application-evidence follow-up
+
+- Blocked-day successful writes: **confirmed**. A top-level deterministic
+  `application.operations` ledger now reports every staged proposal regardless
+  of its day-plan status.
+- Overlay overwrite by unattempted proposals: **confirmed**. Only succeeded
+  PUT-and-GET-verified proposals replace authoritative overlay objects. Other
+  proposals are recorded as non-authoritative evidence; attempted writes that
+  lack exact GET verification are recorded as uncertain blockers.
+- Partial application evidence: **confirmed**. Application stops at the first
+  failure, reports prior successes, marks later proposals not-run due to
+  dependency and retains the overall failure.
+- Metadata operation import: **confirmed**. Python merges operation evidence by
+  metadata key with deterministic identity unions rather than appending
+  duplicates.
+
+Structural checks passed: `py_compile`, both Node checks, both shell checks and
+`git diff --check`. Aggregate expansion and affected-index schema enrichment
+remain CIC-Test follow-up validation items. No SQL or operational command ran.
+
 - Undefined final metadata-operation lookup: **confirmed**. Final verification
   now deterministically merges operation evidence by metadata key, unions
   replacement, removal and affected-index identities, and fails on conflicts.
