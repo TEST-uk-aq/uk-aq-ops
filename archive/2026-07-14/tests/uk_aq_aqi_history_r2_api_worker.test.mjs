@@ -497,19 +497,3 @@ test("worker rejects invalid pollutant", async () => {
     await harness.restore();
   }
 });
-
-test("live observation fallback normalizes R2 observation rows using requested timeseries context", () => {
-  assert.match(workerSource, /timeseriesIdFromRequest = null/);
-  assert.match(workerSource, /parseRequiredPositiveInt\(row\?\.timeseries_id\) \|\| parseRequiredPositiveInt\(timeseriesIdFromRequest\)/);
-  assert.match(workerSource, /normalizeLiveObservationRow\(row, \{ connectorId, stationId, pollutantCode: pollutantKey, timeseriesIdFromRequest: timeseriesId \}\)/);
-  assert.match(workerSource, /url\.pathname = "\/v1\/observations"/);
-  assert.match(workerSource, /url\.pathname = `\$\{normalizedPath\}\/v1\/observations`/);
-});
-
-test("live observation fallback applies PM R2 context exactly once and bounds ingest independently", () => {
-  assert.match(workerSource, /eligibleMissingHoursForLiveFallback = rawMissingHours\.filter/);
-  assert.match(workerSource, /coalesceAqiMissingHourWindows\(eligibleMissingHoursForLiveFallback, \{ contextHours: 0 \}\)/);
-  assert.match(workerSource, /r2ObservationStartMs = requestedPollutant === "pm25" \|\| requestedPollutant === "pm10"\s*\? outputStartMs - 23 \* HOUR_MS\s*: outputStartMs/s);
-  assert.match(workerSource, /ingestObservationStartMs = Math\.max\(outputStartMs, retentionStartMs\)/);
-  assert.match(workerSource, /for \(const hour of eligibleMissingHours\)/);
-});
