@@ -3232,7 +3232,6 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
   computeMissingTimeseriesCounts = false,
   strictMissingTimeseriesCounts = false,
   writeR2 = true,
-  targetDays = null,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
   if (normalizedDomain !== "observations" && normalizedDomain !== "aqilevels") {
@@ -3255,12 +3254,9 @@ async function rebuildR2HistoryV2TimeseriesIndexes({
     delimiter: "/",
     max_keys: maxKeys,
   });
-  const requestedTargetDays = Array.isArray(targetDays)
-    ? new Set(targetDays.map((day) => parseIsoDay(day)).filter(Boolean))
-    : null;
   const dayList = dayPrefixes
     .map((prefix) => parseDayFromPrefix(prefix, normalizedDataPrefix))
-    .filter((day) => day && (!requestedTargetDays || requestedTargetDays.has(day)))
+    .filter(Boolean)
     .sort((a, b) => a.localeCompare(b));
 
   const warnings = [];
@@ -4426,7 +4422,6 @@ export async function rebuildR2HistoryIndexes({
   strictMissingTimeseriesCounts,
   observationsTargets = null,
   writeR2 = true,
-  targetDays = null,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   if (!hasRequiredR2Config(config.r2)) {
@@ -4467,7 +4462,6 @@ export async function rebuildR2HistoryIndexes({
           computeMissingTimeseriesCounts,
           strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
           writeR2,
-          targetDays,
         });
         results.push(observationsTimeseries);
       }
@@ -4485,7 +4479,6 @@ export async function rebuildR2HistoryIndexes({
           computeMissingTimeseriesCounts,
           strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
           writeR2,
-          targetDays,
         });
         results.push(aqilevelsTimeseries);
       }
