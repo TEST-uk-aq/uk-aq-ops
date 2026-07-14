@@ -9517,6 +9517,12 @@ def build_v2_repair_plan(
         day_utc = gap.get("day_utc")
         connector_id = gap.get("connector_id")
         pollutant_code = gap.get("pollutant_code")
+        # Day manifests aggregate every connector beneath the day.  Their
+        # repair action must never inherit an incidental connector/pollutant
+        # from an individual integrity finding.
+        if kind in {"observation_day_manifest_repair", "aqi_day_manifest_repair"}:
+            connector_id = None
+            pollutant_code = None
         key = (kind, str(day_utc or ""), connector_id, str(pollutant_code or "") or None)
         entry = actions.get(key)
         gap_type = str(gap.get("gap_type") or "")
@@ -15134,10 +15140,14 @@ def run_v2_integrity_repair_flow(
         }
         for pollutant_code in list(scope.get("pollutant_codes") or []):
             metadata_actions.append({**base, "kind": "observation_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+            metadata_actions.append({**base, "kind": "observation_index_repair", "pollutant_code": pollutant_code})
+        day_base = {
+            key: value for key, value in base.items()
+            if key not in {"connector_id", "pollutant_code"}
+        }
         metadata_actions.extend([
             {**base, "kind": "observation_connector_manifest_repair"},
-            {**base, "kind": "observation_day_manifest_repair"},
-            {**base, "kind": "observation_index_repair"},
+            {**day_base, "kind": "observation_day_manifest_repair"},
         ])
     metadata_actions = _dedupe_v2_repair_actions(metadata_actions)
     metadata = (
@@ -15274,10 +15284,14 @@ def run_v2_integrity_repair_flow(
         }
         for pollutant_code in list(matching_work.get("pollutant_codes") or []):
             aqi_metadata_actions.append({**base, "kind": "aqi_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+            aqi_metadata_actions.append({**base, "kind": "aqi_index_repair", "pollutant_code": pollutant_code})
+        day_base = {
+            key: value for key, value in base.items()
+            if key not in {"connector_id", "pollutant_code"}
+        }
         aqi_metadata_actions.extend([
             {**base, "kind": "aqi_connector_manifest_repair"},
-            {**base, "kind": "aqi_day_manifest_repair"},
-            {**base, "kind": "aqi_index_repair"},
+            {**day_base, "kind": "aqi_day_manifest_repair"},
         ])
     aqi_metadata = (
         {"status": "blocked_dependency", "reason": "aqi_data_repair_failed", "results": []}

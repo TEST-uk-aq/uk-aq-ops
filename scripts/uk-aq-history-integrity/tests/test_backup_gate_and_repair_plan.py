@@ -497,6 +497,15 @@ class BackupGateAndRepairPlanTests(unittest.TestCase):
         ])
         self.assertIn("observation_connector_manifest_repair", [a["kind"] for a in plan])
         self.assertIn("observation_day_manifest_repair", [a["kind"] for a in plan])
+        day_action = next(a for a in plan if a["kind"] == "observation_day_manifest_repair")
+        self.assertIsNone(day_action["connector_id"])
+        self.assertIsNone(day_action["pollutant_code"])
+        aqi_plan = MODULE.build_v2_repair_plan(aqi_gaps=[
+            {"gap_type": "day_manifest_missing", "day_utc": "2026-05-17", "connector_id": 1},
+        ])
+        aqi_day_action = next(a for a in aqi_plan if a["kind"] == "aqi_day_manifest_repair")
+        self.assertIsNone(aqi_day_action["connector_id"])
+        self.assertIsNone(aqi_day_action["pollutant_code"])
         self.assertTrue(all(a["status"] == "planned" for a in plan))
         self.assertTrue(all(a["executes"] is False for a in plan))
 

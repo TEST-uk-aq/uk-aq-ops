@@ -42,6 +42,24 @@ const SUPPORTED_ACTIONS = new Set([
   "rebuild_v2_aqi_index_only",
 ]);
 
+// Scope is part of the repair-action contract.  In particular, a day
+// manifest is above the connector hierarchy: giving it a connector ID would
+// rebuild a parent from a subset of its children.  Keep those actions as a
+// distinct, connector-less scope so the day builder reads every final child
+// manifest from the combined overlay/Dropbox view.
+const ACTION_SCOPE_RULES = {
+  observation_pollutant_manifest_repair: { connector: "required", pollutant: "required", needsConnector: true, needsDay: true, pollutantRepair: true },
+  observation_connector_manifest_repair: { connector: "required", needsConnector: true, needsDay: true },
+  observation_day_manifest_repair: { connector: "absent", needsDay: true },
+  observation_index_repair: { connector: "required", pollutant: "required" },
+  rebuild_v2_observations_index_only: { connector: "required" },
+  aqi_pollutant_manifest_repair: { connector: "required", pollutant: "required", needsConnector: true, needsDay: true, pollutantRepair: true },
+  aqi_connector_manifest_repair: { connector: "required", needsConnector: true, needsDay: true },
+  aqi_day_manifest_repair: { connector: "absent", needsDay: true },
+  aqi_index_repair: { connector: "required", pollutant: "required" },
+  rebuild_v2_aqi_index_only: { connector: "required" },
+};
+
 function parseArgs(argv) {
   const args = { repairPlanJson: null, repairPlanStdin: false, writeR2: false, overlayRoot: null, dropboxRoot: null, runStateJson: null };
   for (let index = 0; index < argv.length; index += 1) {
@@ -79,7 +97,9 @@ async function readChildren({ store, prefix, dayUtc, connectorId, kind, domain =
   const children = [];
   const identities = new Map();
   for (const key of keys) {
-    const object = await store.getObject(key);
+    // readChildren is used only with R2-compatible adapters (the staged view
+    // during planning and the live race guard during writes).
+    const object = await store.getObject({ key });
     const payload = jsonObject(object, key);
     if (domain === "observations") {
       assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
@@ -590,24 +610,38 @@ function validateAction(action) {
   }
 }
 
-function normalizePlan(input) {
+export function normalizePlan(input) {
   const { inputKind, domain, actions } = extractRepairPlan(input);
   const scopes = new Map();
   for (const action of actions) {
     validateAction(action);
     const dayUtc = String(action.day_utc || "");
-    const connectorId = Number(action.connector_id);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dayUtc) || !Number.isInteger(connectorId) || connectorId <= 0) {
-      throw new Error("Every repair action must have day_utc and positive connector_id");
+    const rule = ACTION_SCOPE_RULES[action.kind];
+    const hasConnector = action.connector_id !== undefined && action.connector_id !== null;
+    const connectorId = hasConnector ? Number(action.connector_id) : null;
+    const pollutantCode = typeof action.pollutant_code === "string"
+      ? action.pollutant_code.trim().toLowerCase()
+      : "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dayUtc)) {
+      throw new Error(`Repair action ${action.kind} must have day_utc`);
     }
-    const key = `${dayUtc}|${connectorId}`;
+    if (rule.connector === "required" && (!Number.isInteger(connectorId) || connectorId <= 0)) {
+      throw new Error(`Repair action ${action.kind} must have day_utc and positive connector_id`);
+    }
+    if (rule.connector === "absent" && hasConnector) {
+      throw new Error(`Repair action ${action.kind} must have day_utc and no connector_id`);
+    }
+    if (rule.pollutant === "required" && !pollutantCode) {
+      throw new Error(`Repair action ${action.kind} must have pollutant_code`);
+    }
+    const key = rule.connector === "absent" ? `${dayUtc}|day` : `${dayUtc}|${connectorId}`;
     const scope = scopes.get(key) || { dayUtc, connectorId, needsConnector: false, needsDay: false, needsIndex: false, pollutantRepair: false, pollutantCodes: new Set(), gapTypes: new Set() };
-    scope.needsConnector ||= action.kind.endsWith("connector_manifest_repair") || action.kind.endsWith("pollutant_manifest_repair");
-    scope.needsDay ||= scope.needsConnector || action.kind.endsWith("day_manifest_repair");
+    scope.needsConnector ||= Boolean(rule.needsConnector);
+    scope.needsDay ||= Boolean(rule.needsDay);
     scope.needsIndex ||= Boolean(action.requires_index_rebuild) || action.kind.includes("index");
-    scope.pollutantRepair ||= action.kind.endsWith("pollutant_manifest_repair");
-    if (typeof action.pollutant_code === "string" && action.pollutant_code.trim()) {
-      scope.pollutantCodes.add(action.pollutant_code.trim().toLowerCase());
+    scope.pollutantRepair ||= Boolean(rule.pollutantRepair);
+    if (pollutantCode) {
+      scope.pollutantCodes.add(pollutantCode);
     }
     for (const gapType of action.gap_types) scope.gapTypes.add(gapType);
     scopes.set(key, scope);
@@ -616,7 +650,7 @@ function normalizePlan(input) {
     inputKind,
     domain,
     scopes: [...scopes.values()]
-      .sort((left, right) => left.dayUtc.localeCompare(right.dayUtc) || left.connectorId - right.connectorId)
+      .sort((left, right) => left.dayUtc.localeCompare(right.dayUtc) || (left.connectorId ?? -1) - (right.connectorId ?? -1))
       .map(({ gapTypes, pollutantCodes, ...scope }) => ({
         ...scope,
         gap_types: [...gapTypes].sort(),

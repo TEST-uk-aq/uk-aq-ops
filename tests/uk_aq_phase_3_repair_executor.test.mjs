@@ -6,7 +6,7 @@ import {
   buildHistoryV2DayManifest,
   buildHistoryV2PollutantManifest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
-import { runV2ObservationsRepair } from "../scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs";
+import { normalizePlan, runV2ObservationsRepair } from "../scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs";
 
 const DAY = "2026-05-17";
 const PREFIX = "history/v2/observations";
@@ -37,6 +37,29 @@ function repairAction(overrides = {}) {
 function observationsRepairPlan(action = repairAction()) {
   return { history_version: "v2", domain: "observations", repair_plan: [action] };
 }
+
+test("whole-day manifest actions remain connector-less and reject a connector subset", () => {
+  const valid = normalizePlan(observationsRepairPlan(repairAction({
+    kind: "observation_day_manifest_repair",
+    connector_id: null,
+    pollutant_code: null,
+    requires_index_rebuild: true,
+  })));
+  assert.deepEqual(valid.scopes, [{
+    dayUtc: DAY,
+    connectorId: null,
+    needsConnector: false,
+    needsDay: true,
+    needsIndex: true,
+    pollutantRepair: false,
+    gap_types: ["connector_manifest_missing"],
+    pollutant_codes: [],
+  }]);
+  assert.throws(
+    () => normalizePlan(observationsRepairPlan(repairAction({ kind: "observation_day_manifest_repair" }))),
+    /must have day_utc and no connector_id/,
+  );
+});
 
 async function assertNoR2Access(operation) {
   const originalFetch = globalThis.fetch;
