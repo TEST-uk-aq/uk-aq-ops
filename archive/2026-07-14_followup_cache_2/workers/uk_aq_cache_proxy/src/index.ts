@@ -2327,48 +2327,26 @@ function stripAqiProxyHourlyGenerationCacheComponent(url: URL): URL {
   return normalized;
 }
 
-function resolveAqiCacheScope(
-  upstreamFunction: string,
-  url: URL,
-  mutableHours = DEFAULT_AQI_MUTABLE_HOURS,
-  hourlyGenerationEnabled = false,
-): "recent_hourly" | "recent_legacy" | "immutable" | null {
+function resolveAqiCacheScope(upstreamFunction: string, url: URL, mutableHours = DEFAULT_AQI_MUTABLE_HOURS): "recent" | "immutable" | null {
   if (upstreamFunction !== EXTERNAL_AQI_HISTORY_UPSTREAM) {
     return null;
   }
-  if (isImmutableAqiHistoryRequest(url, mutableHours)) {
-    return "immutable";
-  }
-  return hourlyGenerationEnabled ? "recent_hourly" : "recent_legacy";
+  return isImmutableAqiHistoryRequest(url, mutableHours) ? "immutable" : "recent";
 }
 
-function resolveCacheProfileName(
-  upstreamFunction: string,
-  url: URL,
-  mutableHours = DEFAULT_AQI_MUTABLE_HOURS,
-  hourlyGenerationEnabled = false,
-): CacheProfileName {
-  const aqiScope = resolveAqiCacheScope(upstreamFunction, url, mutableHours, hourlyGenerationEnabled);
+function resolveCacheProfileName(upstreamFunction: string, url: URL, mutableHours = DEFAULT_AQI_MUTABLE_HOURS): CacheProfileName {
+  const aqiScope = resolveAqiCacheScope(upstreamFunction, url, mutableHours);
   if (aqiScope === "immutable") {
     return "aqi_history_immutable";
   }
-  if (aqiScope === "recent_hourly") {
+  if (aqiScope === "recent") {
     return "aqi_history_recent";
-  }
-  if (aqiScope === "recent_legacy") {
-    return "realtime";
   }
   return FUNCTION_PROFILE_MAP[upstreamFunction];
 }
 
-function addAqiCacheDiagnosticHeaders(
-  headers: Headers,
-  upstreamFunction: string,
-  url: URL,
-  mutableHours: number,
-  hourlyGenerationEnabled: boolean,
-): void {
-  const scope = resolveAqiCacheScope(upstreamFunction, url, mutableHours, hourlyGenerationEnabled);
+function addAqiCacheDiagnosticHeaders(headers: Headers, upstreamFunction: string, url: URL, mutableHours: number): void {
+  const scope = resolveAqiCacheScope(upstreamFunction, url, mutableHours);
   if (!scope) {
     return;
   }
@@ -3012,12 +2990,7 @@ export default {
         aqiProxyHourlyGenerationEnabled,
         aqiMutableHours,
       );
-    const profileName = resolveCacheProfileName(
-      upstreamFunction,
-      normalizedRequestUrl,
-      aqiMutableHours,
-      aqiProxyHourlyGenerationEnabled,
-    );
+    const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl, aqiMutableHours);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
     const usingExternalLatestSnapshotUpstream = upstreamFunction === EXTERNAL_LATEST_SNAPSHOT_UPSTREAM;
@@ -3092,7 +3065,7 @@ export default {
           }
           notModifiedHeaders.set("X-UK-AQ-Cache", "HIT");
           notModifiedHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-          addAqiCacheDiagnosticHeaders(notModifiedHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
+          addAqiCacheDiagnosticHeaders(notModifiedHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours);
           if (useTimeseriesV2Skeleton) {
             notModifiedHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
             const sourceMode = cachedResponse.headers.get("X-UK-AQ-Timeseries-Source-Mode");
@@ -3111,7 +3084,7 @@ export default {
         const hitHeaders = new Headers(cachedResponse.headers);
         hitHeaders.set("X-UK-AQ-Cache", "HIT");
         hitHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-        addAqiCacheDiagnosticHeaders(hitHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
+        addAqiCacheDiagnosticHeaders(hitHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours);
         if (useTimeseriesV2Skeleton) {
           hitHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
         }
@@ -3157,7 +3130,7 @@ export default {
       responseHeaders.set("ETag", etag);
       responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
       responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-      addAqiCacheDiagnosticHeaders(responseHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
+      addAqiCacheDiagnosticHeaders(responseHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours);
       responseHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
       responseHeaders.set("X-UK-AQ-Timeseries-Cacheable", String(timeseriesResponseCacheable));
       responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", stitched.meta.source_mode);
@@ -3315,22 +3288,20 @@ export default {
       );
     }
 
-    const upstreamResponseCacheable = isCacheableUpstreamResponse(upstreamResponse, {
-      allowAqiAuthenticatedNoStore: usingExternalAqiHistoryUpstream,
-    });
     const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.delete("Set-Cookie");
     responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
     responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-    addAqiCacheDiagnosticHeaders(responseHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
+    addAqiCacheDiagnosticHeaders(responseHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours);
     if (upstreamRetried && upstreamRetryReason) {
       responseHeaders.set("X-UK-AQ-Upstream-Retry", upstreamRetryReason);
     }
     responseHeaders.set("X-UK-AQ-Upstream-Attempts", String(upstreamAttemptCount));
-    if (upstreamResponseCacheable) {
+    const upstreamResponseComplete = (upstreamResponse.headers.get("X-UK-AQ-Response-Complete") ?? "").toLowerCase();
+    if (upstreamResponse.status === 200 && upstreamResponseComplete !== "false") {
       responseHeaders.set("Cache-Control", buildCacheControl(profile));
-    } else {
+    } else if (upstreamResponseComplete === "false") {
       responseHeaders.set("Cache-Control", "no-store");
     }
     const responseBody: BodyInit | null = upstreamResponse.body;
@@ -3342,7 +3313,9 @@ export default {
       headers: responseHeaders,
     });
 
-    if (shouldUseCache && request.method === "GET" && upstreamResponseCacheable) {
+    if (shouldUseCache && request.method === "GET" && isCacheableUpstreamResponse(upstreamResponse, {
+      allowAqiAuthenticatedNoStore: usingExternalAqiHistoryUpstream,
+    })) {
       ctx.waitUntil(cache.put(cacheKey, response.clone()));
     }
     return response;
