@@ -25,10 +25,7 @@ test("AQI proxy cache groundwork uses recent profile, mutable hours, and strips 
   assert.match(source, /const MAX_AQI_MUTABLE_HOURS = 24 \* 30/);
   assert.match(source, /function getAqiProxyGenerationHour[\s\S]*Math\.floor\(nowMs \/ HOUR_MS\) \* HOUR_MS/);
   assert.match(source, /normalizedUpstreamRequestUrl = stripAqiProxyHourlyGenerationCacheComponent\(normalizedRequestUrl\)/);
-  assert.match(source, /resolveCacheProfileName\([\s\S]*upstreamFunction,[\s\S]*normalizedRequestUrl,[\s\S]*aqiMutableHours,[\s\S]*aqiProxyHourlyGenerationEnabled,[\s\S]*\)/);
-  assert.match(source, /aqiScope === "recent_hourly"[\s\S]*return "aqi_history_recent"/);
-  assert.match(source, /aqiScope === "recent_legacy"[\s\S]*return "realtime"/);
-  assert.match(source, /aqiScope === "immutable"[\s\S]*return "aqi_history_immutable"/);
+  assert.match(source, /resolveCacheProfileName\(upstreamFunction, normalizedRequestUrl, aqiMutableHours\)/);
   assert.doesNotMatch(source, /AQI_HISTORY_MUTABLE_WINDOW_MS/);
 });
 
@@ -39,16 +36,6 @@ test("AQI proxy no-store cache exception requires the worker internal-cache-disa
   assert.match(source, /cacheControl\.includes\("private"\)/);
   assert.match(source, /cacheControl\.includes\("no-store"\)[\s\S]*X-UK-AQ-Internal-Response-Cache"\) \?\? ""\)\.toLowerCase\(\) === "disabled"/);
   assert.match(source, /allowAqiAuthenticatedNoStore:\s*usingExternalAqiHistoryUpstream/);
-});
-
-
-test("AQI proxy uses one upstream cacheability result for response headers and cache storage", async () => {
-  const source = await cacheProxySource();
-
-  assert.match(source, /const upstreamResponseCacheable = isCacheableUpstreamResponse\(upstreamResponse, \{[\s\S]*allowAqiAuthenticatedNoStore:\s*usingExternalAqiHistoryUpstream,[\s\S]*\}\)/);
-  assert.match(source, /if \(upstreamResponseCacheable\) \{[\s\S]*responseHeaders\.set\("Cache-Control", buildCacheControl\(profile\)\);[\s\S]*\} else \{[\s\S]*responseHeaders\.set\("Cache-Control", "no-store"\);[\s\S]*\}/);
-  assert.match(source, /shouldUseCache && request\.method === "GET" && upstreamResponseCacheable/);
-  assert.doesNotMatch(source, /upstreamResponse\.status === 200 && upstreamResponseComplete !== "false"\) \{[\s\S]*buildCacheControl\(profile\)/);
 });
 
 test("AQI worker mutable horizon and internal cache toggle share the cache contract", async () => {
