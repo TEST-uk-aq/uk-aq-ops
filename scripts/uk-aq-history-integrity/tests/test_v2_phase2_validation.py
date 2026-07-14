@@ -120,6 +120,104 @@ class V2Phase2ValidationTests(unittest.TestCase):
         self.assertTrue(stats["parquet_null_timeseries_id_rows"])
         self.assertTrue(connection.closed)
 
+    def _run_observation_partition(self) -> dict:
+        stats = {
+            "row_count": 1,
+            "timeseries_row_counts": {101: 1},
+            "min_timeseries_id": 101,
+            "max_timeseries_id": 101,
+            "min_timestamp_utc": "2026-06-11T00:00:00+00",
+            "max_timestamp_utc": "2026-06-11T02:00:00+00",
+            "parquet_null_timeseries_id_rows": False,
+        }
+        with mock.patch.object(MODULE, "_read_parquet_partition_stats", return_value=(stats, None)):
+            return MODULE.run_v2_observations_integrity_checks(
+                r2_history_root=self.root,
+                config=self.config,
+                from_day="2026-06-11",
+                to_day="2026-06-11",
+                source_scope={"source": "sos"},
+            )
+
+    def test_current_v2_writer_shape_with_nullable_observation_metadata_is_healthy(self) -> None:
+        payload = self._write_pollutant("observations", "no2", 1, 101)
+        result = self._run_observation_partition()
+        partition_schema_gaps = [
+            gap for gap in result["gaps"]
+            if gap.get("pollutant_code") == "no2"
+            and gap.get("gap_type") == "data_manifest_schema_mismatch"
+        ]
+        self.assertEqual(partition_schema_gaps, [])
+
+    def test_reconstructible_manifest_schema_fault_is_metadata_only_without_source_counts(self) -> None:
+        payload = self._write_pollutant("observations", "no2", 1, 101)
+        payload.pop("grain")
+        payload.pop("profile")
+        payload.pop("timeseries_row_counts")
+        (self._partition("observations", "no2") / "manifest.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+        result = self._run_observation_partition()
+
+        schema_gaps = [
+            gap for gap in result["gaps"]
+            if gap.get("pollutant_code") == "no2"
+            and gap.get("gap_type") == "data_manifest_schema_mismatch"
+        ]
+        self.assertTrue(schema_gaps)
+        action = next(
+            action for action in result["repair_plan"]
+            if action["pollutant_code"] == "no2"
+        )
+        self.assertEqual(action["kind"], "observation_pollutant_manifest_repair")
+        self.assertFalse(action["data_changes_required"])
+        self.assertFalse(action["operator_action_required"])
+        self.assertFalse(action["executes"])
+        self.assertTrue(action["requires_index_rebuild"])
+        self.assertFalse(any(item["kind"] == "source_mapping_issue" for item in result["repair_plan"]))
+        self.assertFalse(any(item["kind"] == "observation_data_repair" for item in result["repair_plan"]))
+
+    def test_required_manifest_field_with_unavailable_source_remains_operator_review(self) -> None:
+        payload = self._write_pollutant("observations", "no2", 1, 101)
+        payload.pop("manifest_kind")
+        (self._partition("observations", "no2") / "manifest.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+        result = self._run_observation_partition()
+
+        action = next(
+            action for action in result["repair_plan"]
+            if action["pollutant_code"] == "no2"
+        )
+        self.assertEqual(action["kind"], "source_mapping_issue")
+        self.assertTrue(action["operator_action_required"])
+        self.assertFalse(any(item["kind"] == "observation_pollutant_manifest_repair" for item in result["repair_plan"]))
+
+    def test_unreadable_parquet_with_unavailable_source_remains_operator_review(self) -> None:
+        payload = self._write_pollutant("observations", "no2", 1, 101)
+        with mock.patch.object(
+            MODULE,
+            "_read_parquet_partition_stats",
+            return_value=(None, "InvalidInputException:bad parquet"),
+        ):
+            result = MODULE.run_v2_observations_integrity_checks(
+                r2_history_root=self.root,
+                config=self.config,
+                from_day="2026-06-11",
+                to_day="2026-06-11",
+                source_scope={"source": "sos"},
+            )
+
+        self.assertIn("parquet_unreadable", {gap["gap_type"] for gap in result["gaps"]})
+        action = next(
+            action for action in result["repair_plan"]
+            if action["pollutant_code"] == "no2"
+        )
+        self.assertEqual(action["kind"], "source_mapping_issue")
+        self.assertTrue(action["operator_action_required"])
+
     def test_missing_connector_and_day_manifests_are_reported_for_both_domains(self) -> None:
         for domain in ("observations", "aqilevels"):
             self._write_pollutant(domain)

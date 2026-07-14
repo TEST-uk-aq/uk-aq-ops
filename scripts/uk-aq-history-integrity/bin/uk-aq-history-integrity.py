@@ -8782,11 +8782,6 @@ def run_v2_observations_integrity_checks(
         raise RuntimeError("v2 observations integrity requires a selected from/to day range")
 
     gaps: list[dict[str, Any]] = []
-    operations_by_key = {
-        str(operation.get("metadata_object_key")): operation
-        for operation in list(run_state.get("timeseries_metadata_operations") or [])
-        if isinstance(operation, Mapping)
-    }
     checked = 0
     data_prefix = config.observations_data_prefix.strip("/")
     index_prefix = config.observations_timeseries_index_prefix.strip("/")
@@ -9314,6 +9309,117 @@ _SOURCE_PARTITION_UNAVAILABLE_STATES = {
     "counts_unavailable",
 }
 
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES = {
+    "data_manifest_empty_timeseries_counts",
+    "data_manifest_file_count_mismatch",
+    "data_manifest_row_count_mismatch",
+    "data_manifest_timeseries_row_count_mismatch",
+    "data_manifest_total_bytes_mismatch",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS = {
+    "grain",
+    "profile",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS = {
+    "file_count",
+    "max_observed_at_utc",
+    "max_timeseries_id",
+    "min_observed_at_utc",
+    "min_timeseries_id",
+    "row_count",
+    "source_row_count",
+    "timeseries_row_counts",
+    "total_bytes",
+}
+
+
+def _observation_partition_key(gap: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(gap.get("day_utc") or ""),
+        str(gap.get("connector_id") or ""),
+        str(gap.get("pollutant_code") or ""),
+    )
+
+
+def _reconstructible_observation_manifest_gap(
+    gap: Mapping[str, Any],
+    all_gaps: Iterable[Mapping[str, Any]],
+) -> bool:
+    """Allow metadata-only planning only when live Parquet proves the data state."""
+    if gap.get("parquet_readable") is not True:
+        return False
+    gap_type = str(gap.get("gap_type") or "")
+    if gap_type == "data_manifest_schema_mismatch":
+        related = gap.get("related_paths")
+        if not isinstance(related, list) or not related:
+            return False
+        normalized_fields = []
+        for field in related:
+            text = str(field)
+            if text.startswith("field="):
+                text = text[6:].split(" ", 1)[0]
+            normalized_fields.append(text)
+        if not all(
+            field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+            or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+            for field in normalized_fields
+        ):
+            return False
+    elif gap_type.startswith("data_manifest_") and gap_type.endswith("_schema_mismatch"):
+        field = gap_type[len("data_manifest_"):-len("_schema_mismatch")]
+        if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+            return False
+    elif gap_type in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+        pass
+    else:
+        return False
+
+    partition_key = _observation_partition_key(gap)
+    uncertain_gap_types = {
+        "data_manifest_duplicate_file_key",
+        "data_manifest_listed_parquet_missing",
+        "data_manifest_unlisted_parquet",
+        "orphan_parquet_without_manifest",
+        "parquet_empty_or_placeholder",
+        "parquet_missing",
+        "parquet_null_timeseries_id_rows",
+        "parquet_reader_unavailable",
+        "parquet_unreadable",
+        "source_r2_timeseries_row_mismatch",
+    }
+    for sibling in all_gaps:
+        if _observation_partition_key(sibling) != partition_key:
+            continue
+        sibling_type = str(sibling.get("gap_type") or "")
+        if sibling_type in uncertain_gap_types:
+            return False
+        if sibling_type == "data_manifest_schema_mismatch":
+            related = sibling.get("related_paths")
+            if not isinstance(related, list) or not related:
+                return False
+            normalized_fields = []
+            for field in related:
+                text = str(field)
+                if text.startswith("field="):
+                    text = text[6:].split(" ", 1)[0]
+                normalized_fields.append(text)
+            if not all(
+                field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+                or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+                for field in normalized_fields
+            ):
+                return False
+        elif sibling_type.startswith("data_manifest_") and sibling_type.endswith("_schema_mismatch"):
+            field = sibling_type[len("data_manifest_"):-len("_schema_mismatch")]
+            if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+                return False
+        elif sibling_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+            if sibling_type.startswith("data_manifest_"):
+                return False
+    return True
+
 _AQI_REBUILD_ORIGIN_ORDER = {
     "aqi_data_fault": 0,
     "observation_dependency": 1,
@@ -9366,6 +9472,7 @@ def build_v2_repair_plan(
     conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
     """Summarize v2 repairs in operator order without executing writes."""
+    observation_gaps = list(observation_gaps)
     eligible_pollutants_by_connector: dict[int, set[str] | None] = {}
     observation_partition_priority = {
         "observation_data_repair": 3,
@@ -9454,7 +9561,6 @@ def build_v2_repair_plan(
         fault_class = str(gap.get("fault_class") or "")
         source_partition_state = _source_partition_state_from_gap(gap)
         source_partition_unavailable = source_partition_state in _SOURCE_PARTITION_UNAVAILABLE_STATES
-        parquet_readable = gap.get("parquet_readable") is True
         if (
             source_partition_unavailable
             and gap_type in {
@@ -9479,6 +9585,7 @@ def build_v2_repair_plan(
                 "unexpected_connector_level_part_file",
                 "orphan_parquet_without_manifest",
             }
+            and not _reconstructible_observation_manifest_gap(gap, observation_gaps)
         ):
             add_action(
                 "source_mapping_issue",
