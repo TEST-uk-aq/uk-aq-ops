@@ -7256,7 +7256,7 @@ def _enrich_v2_observations_repair_plans(
         if gap_type.startswith("connector_manifest_"):
             gap["suggested_repair"] = {
                 "kind": "observation_connector_manifest_repair",
-                "requires_index_rebuild": True,
+                "requires_index_rebuild": False,
                 "commands": [],
                 "steps": [
                     "Rebuild the connector manifest from the live pollutant child manifests.",
@@ -7268,7 +7268,7 @@ def _enrich_v2_observations_repair_plans(
         if gap_type.startswith("day_manifest_"):
             gap["suggested_repair"] = {
                 "kind": "observation_day_manifest_repair",
-                "requires_index_rebuild": True,
+                "requires_index_rebuild": False,
                 "commands": [],
                 "steps": [
                     "Rebuild the day manifest from the live connector child manifests.",
@@ -9197,7 +9197,7 @@ def _enrich_v2_aqi_repair_plans(
         elif gap_type.startswith("connector_manifest_"):
             gap["suggested_repair"] = {
                 "kind": "aqi_connector_manifest_repair",
-                "requires_index_rebuild": True,
+                "requires_index_rebuild": False,
                 "commands": [],
                 "steps": [
                     "Rebuild the AQI connector manifest from the live pollutant child manifests.",
@@ -9208,7 +9208,7 @@ def _enrich_v2_aqi_repair_plans(
         elif gap_type.startswith("day_manifest_"):
             gap["suggested_repair"] = {
                 "kind": "aqi_day_manifest_repair",
-                "requires_index_rebuild": True,
+                "requires_index_rebuild": False,
                 "commands": [],
                 "steps": [
                     "Rebuild the AQI day manifest from the live connector child manifests.",
@@ -9605,14 +9605,14 @@ def build_v2_repair_plan(
             add_action(
                 "observation_connector_manifest_repair",
                 gap=gap,
-                requires_index_rebuild=True,
+                requires_index_rebuild=False,
                 notes="Rebuild the connector manifest from all valid live-R2 pollutant children without dropping siblings.",
             )
         elif gap_type.startswith("day_manifest_"):
             add_action(
                 "observation_day_manifest_repair",
                 gap=gap,
-                requires_index_rebuild=True,
+                requires_index_rebuild=False,
                 notes="Rebuild the day manifest from all valid live-R2 connector children without dropping siblings.",
             )
         elif gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
@@ -9700,14 +9700,14 @@ def build_v2_repair_plan(
             add_action(
                 "aqi_connector_manifest_repair",
                 gap=gap,
-                requires_index_rebuild=True,
+                requires_index_rebuild=False,
                 notes="Rebuild the AQI connector manifest from all valid live-R2 pollutant children without dropping siblings.",
             )
         elif gap_type.startswith("day_manifest_"):
             add_action(
                 "aqi_day_manifest_repair",
                 gap=gap,
-                requires_index_rebuild=True,
+                requires_index_rebuild=False,
                 notes="Rebuild the AQI day manifest from all valid live-R2 connector children without dropping siblings.",
             )
         elif gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
@@ -14077,7 +14077,8 @@ def _authoritative_v2_core_timeseries_bindings(
         rows = conn.execute(
             """
             SELECT t.id, t.connector_id, t.label, t.timeseries_ref,
-                   p.label, p.source_label, p.pollutant_label
+                   t.phenomenon_id, p.label, p.source_label,
+                   p.pollutant_label, p.observed_property_id
             FROM core_timeseries_snapshot AS t
             LEFT JOIN core_phenomena_snapshot AS p ON p.id = t.phenomenon_id
             WHERE t.id IS NOT NULL AND t.connector_id IS NOT NULL
@@ -14098,7 +14099,7 @@ def _authoritative_v2_core_timeseries_bindings(
         pollutant_code = next(
             (
                 normalized
-                for normalized in (_normalize_history_pollutant_code(value) for value in row[2:])
+                for normalized in (_normalize_history_pollutant_code(value) for value in (row[2], row[3], row[5], row[6], row[7]))
                 if normalized
             ),
             None,
@@ -14109,6 +14110,8 @@ def _authoritative_v2_core_timeseries_bindings(
             "timeseries_id": timeseries_id,
             "connector_id": connector_id,
             "pollutant_code": pollutant_code,
+            "phenomenon_id": row[4],
+            "observed_property_id": row[8],
         })
     return bindings
 

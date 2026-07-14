@@ -690,6 +690,8 @@ function authoritativeTimeseriesById(input) {
       timeseries_id: timeseriesId,
       connector_id: connectorId,
       pollutant_code: pollutantCode,
+      phenomenon_id: raw?.phenomenon_id ?? null,
+      observed_property_id: raw?.observed_property_id ?? null,
     });
   }
   return bindings;
@@ -883,24 +885,69 @@ export async function runV2ObservationsRepair({
     }
 
     let index = null;
-    if (dayScopes.some((scope) => scope.needsIndex)) {
+    const indexRequested = dayScopes.some((scope) => scope.needsIndex);
+    // Parent manifests only describe their already-final children.  Their
+    // hash is not a dependency of a pollutant timeseries index, so a
+    // connector-less day-manifest repair must never expand into every
+    // connector/pollutant index for that day.  Every index-producing action
+    // has a connector scope; fail closed if that contract is ever broken.
+    const indexConnectorIds = [...new Set(dayScopes
+      .filter((scope) => scope.needsIndex)
+      .map((scope) => Number(scope.connectorId))
+      .filter((connectorId) => Number.isInteger(connectorId) && connectorId > 0))]
+      .sort((left, right) => left - right);
+    if (indexRequested && !indexConnectorIds.length) {
+      blockedScopes.push({
+        status: "blocked_dependency",
+        day_utc: dayUtc,
+        reason: "targeted_index_scope_missing_connector",
+      });
+      dayPlans.push({
+        day_utc: dayUtc,
+        status: "blocked_dependency",
+        manifest_status: manifestStageStatus(proposalKeys),
+        index_status: "blocked_dependency",
+        scopes: dayScopes,
+        blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc),
+        proposal_keys: [],
+        index: null,
+      });
+      continue;
+    }
+    if (indexRequested) {
       const proposalSnapshot = new Map(staged.proposals);
       try {
-        index = await updateIndexes({
-          env,
-          r2: staged.stagedR2,
-          historyVersion: "v2",
-          domains: [domain],
-          fromDayUtc: dayUtc,
-          toDayUtc: dayUtc,
-          connectorId: null,
-          generatedAt: stableGeneratedAt({ dayUtc, dayManifest }),
-          strictMissingTimeseriesCounts: true,
-          timeseriesMetadataMode: "targeted",
-          proposalOnly: !args.writeR2,
-          writeR2: true,
-          authoritativeTimeseriesById: coreTimeseries,
-        });
+        const results = [];
+        for (const connectorId of indexConnectorIds) {
+          results.push(await updateIndexes({
+            env,
+            r2: staged.stagedR2,
+            historyVersion: "v2",
+            domains: [domain],
+            fromDayUtc: dayUtc,
+            toDayUtc: dayUtc,
+            connectorId,
+            generatedAt: stableGeneratedAt({ dayUtc, dayManifest }),
+            strictMissingTimeseriesCounts: true,
+            timeseriesMetadataMode: "targeted",
+            proposalOnly: !args.writeR2,
+            writeR2: true,
+            authoritativeTimeseriesById: coreTimeseries,
+          }));
+        }
+        const metadataResults = results.map((result) => result?.timeseries_metadata).filter(Boolean);
+        index = {
+          status: "planned",
+          connector_ids: indexConnectorIds,
+          results,
+          timeseries_metadata: {
+            status: metadataResults.some((result) => result.status === "blocked_dependency")
+              ? "blocked_dependency"
+              : "planned",
+            blocked_scopes: metadataResults.flatMap((result) => result.blocked_scopes || []),
+            metadata_object_count: metadataResults.reduce((total, result) => total + Number(result.metadata_object_count || 0), 0),
+          },
+        };
       } catch (error) {
         staged.proposals.clear();
         for (const [key, proposal] of proposalSnapshot) staged.proposals.set(key, proposal);
@@ -933,7 +980,7 @@ export async function runV2ObservationsRepair({
       day_utc: dayUtc,
       status: "planned",
       manifest_status: manifestStageStatus(proposalKeys),
-      index_status: dayScopes.some((scope) => scope.needsIndex) ? plannedStageStatus : "not_run",
+      index_status: indexRequested ? plannedStageStatus : "not_run",
       scopes: dayScopes,
       blocked_scopes: [],
       proposal_keys: [...new Set(proposalKeys)].sort(),

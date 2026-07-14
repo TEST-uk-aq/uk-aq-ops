@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
@@ -38,19 +41,38 @@ function observationsRepairPlan(action = repairAction()) {
   return { history_version: "v2", domain: "observations", repair_plan: [action] };
 }
 
+function combinedResolverEnv() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-integrity-index-test-"));
+  const overlayRoot = path.join(root, "overlay");
+  const dropboxRoot = path.join(root, "dropbox");
+  const runStateJson = path.join(root, "run-state.json");
+  fs.mkdirSync(overlayRoot, { recursive: true });
+  fs.mkdirSync(dropboxRoot, { recursive: true });
+  fs.writeFileSync(runStateJson, JSON.stringify({ objects: {}, tombstones: {} }));
+  return {
+    env: {
+      ...ENV,
+      UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT: overlayRoot,
+      UK_AQ_R2_HISTORY_DROPBOX_ROOT: dropboxRoot,
+      UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON: runStateJson,
+    },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
 test("whole-day manifest actions remain connector-less and reject a connector subset", () => {
   const valid = normalizePlan(observationsRepairPlan(repairAction({
     kind: "observation_day_manifest_repair",
     connector_id: null,
     pollutant_code: null,
-    requires_index_rebuild: true,
+    requires_index_rebuild: false,
   })));
   assert.deepEqual(valid.scopes, [{
     dayUtc: DAY,
     connectorId: null,
     needsConnector: false,
     needsDay: true,
-    needsIndex: true,
+    needsIndex: false,
     pollutantRepair: false,
     gap_types: ["connector_manifest_missing"],
     pollutant_codes: [],
@@ -72,6 +94,22 @@ test("an index-only action does not become a pollutant-manifest repair", () => {
   assert.equal(plan.scopes[0].pollutantRepair, false);
   assert.deepEqual(plan.scopes[0].pollutant_codes, []);
   assert.deepEqual(plan.scopes[0].index_pollutant_codes, ["o3"]);
+});
+
+test("an AQI day-manifest action does not expand into child indexes", () => {
+  const plan = normalizePlan({
+    history_version: "v2",
+    domain: "aqilevels",
+    repair_plan: [repairAction({
+      kind: "aqi_day_manifest_repair",
+      connector_id: null,
+      pollutant_code: null,
+      requires_index_rebuild: false,
+    })],
+  });
+  assert.equal(plan.scopes[0].needsDay, true);
+  assert.equal(plan.scopes[0].needsIndex, false);
+  assert.equal(plan.scopes[0].connectorId, null);
 });
 
 async function assertNoR2Access(operation) {
@@ -215,21 +253,30 @@ test("Phase 7 index-only blocked work controls the scope and top-level repair re
     requires_index_rebuild: true,
   }));
   const fake = installFakeR2({});
+  const connectorIds = [];
+  const resolver = combinedResolverEnv();
   try {
     const output = await runV2ObservationsRepair({
-      env: ENV,
+      env: resolver.env,
       repairPlan: indexOnly,
-      updateIndexes: async () => ({
+      updateIndexes: async ({ connectorId }) => {
+        connectorIds.push(connectorId);
+        return {
         blocked_dependency_count: 1,
         timeseries_metadata: { status: "blocked_dependency" },
-      }),
+        };
+      },
     });
     assert.equal(output.ok, false);
     assert.equal(output.status, "blocked_dependency");
     assert.equal(output.results[0].status, "blocked_dependency");
     assert.equal(output.execution.status, "not_run");
+    assert.deepEqual(connectorIds, [1], "an index-only scope must not rebuild sibling connectors");
     assert.equal(fake.puts.size, 0);
-  } finally { fake.restore(); }
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
 });
 
 test("Phase 5 dry-run proposal bytes are deterministic and unchanged staged objects are skipped", async () => {
