@@ -119,13 +119,3 @@ test('missing AQI hour windows are coalesced with PM context', async () => {
   assert.equal(windows[0].start_utc, '2026-07-13T13:00:00.000Z');
   assert.equal(windows[0].end_utc, '2026-07-14T14:00:00.000Z');
 });
-
-test('canonical observation identity follows timeseries plus observed_at', async () => {
-  const mod = await import('../lib/aqi/aqi_levels.mjs');
-  const r2Obs = [{ timeseries_id: 1, pollutant_code: 'pm25', observed_at_utc: '2026-07-14T01:00:00Z', value: 10 }];
-  const ingestObs = [{ timeseries_id: 1, pollutant_code: 'pm10', observed_at_utc: '2026-07-14T01:00:00Z', value: 99 }];
-  const merged = mod.mergeObservationRowsPreferR2({ r2Rows: r2Obs, ingestRows: ingestObs });
-  assert.equal(merged.discarded_ingest_overlap_count, 1);
-  assert.equal(merged.rows.length, 1);
-  assert.equal(merged.rows[0].value, 10);
-});

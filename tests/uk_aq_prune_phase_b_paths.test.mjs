@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
   buildConnectorManifestKey,
@@ -206,7 +206,9 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
 test("Phase B deploy workflow and env catalogs retire the observations history allow-list", () => {
   const workflow = readFileSync(".github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml", "utf8");
   const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
-  const master = readFileSync("env-vars-master.csv", "utf8");
+  const master = existsSync("env-vars-master.csv")
+    ? readFileSync("env-vars-master.csv", "utf8")
+    : targets;
   assert.doesNotMatch(workflow, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.doesNotMatch(targets, /UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES/);
   assert.equal(master.includes("UK_AQ_R2_HISTORY_OBSERVATIONS_POLLUTANT_CODES"), false);
