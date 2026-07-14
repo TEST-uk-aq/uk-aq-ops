@@ -242,8 +242,6 @@ const AQI_HISTORY_CANONICALIZE_MIN_WINDOW_MS = 3 * 24 * HOUR_MS;
 const AQI_HISTORY_START_KEYS = ["from_utc", "start_utc", "from", "start"] as const;
 const AQI_HISTORY_END_KEYS = ["to_utc", "end_utc", "to", "end"] as const;
 const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
-const AQI_HISTORY_PROXY_GENERATION_PARAM = "__uk_aq_aqi_proxy_generation_hour";
-const AQI_HISTORY_PROXY_GENERATION_VERSION = "1";
 const CHART_METRICS_MIN_BODY_BYTES = 4 * 1024;
 const CHART_METRICS_DEFAULT_MAX_BODY_BYTES = 16 * 1024;
 const CHART_METRICS_MAX_BODY_BYTES = 256 * 1024;
@@ -2262,15 +2260,7 @@ function canonicalizeLatestSnapshotRequestUrl(url: URL, upstreamFunction: string
   return normalized;
 }
 
-function isAqiProxyHourlyGenerationEnabled(raw: string): boolean {
-  return parseBooleanFlag(raw);
-}
-
-function getAqiProxyGenerationHour(nowMs = Date.now()): string {
-  return new Date(Math.floor(nowMs / HOUR_MS) * HOUR_MS).toISOString();
-}
-
-function isExplicitImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
+function isImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
   const explicitEndMs = parseIsoMsOrNull(
     url.searchParams.get("to_utc")
       || url.searchParams.get("end_utc")
@@ -2281,31 +2271,6 @@ function isExplicitImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boo
     return false;
   }
   return explicitEndMs <= (nowMs - AQI_HISTORY_MUTABLE_WINDOW_MS);
-}
-
-function isImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
-  return isExplicitImmutableAqiHistoryRequest(url, nowMs);
-}
-
-function applyAqiProxyHourlyGenerationCacheComponent(url: URL, upstreamFunction: string, enabled: boolean, nowMs = Date.now()): URL {
-  const normalized = new URL(url.toString());
-  if (upstreamFunction !== EXTERNAL_AQI_HISTORY_UPSTREAM) {
-    return normalized;
-  }
-  normalized.searchParams.delete(AQI_HISTORY_PROXY_GENERATION_PARAM);
-  if (enabled && !isExplicitImmutableAqiHistoryRequest(normalized, nowMs)) {
-    normalized.searchParams.set(
-      AQI_HISTORY_PROXY_GENERATION_PARAM,
-      `${AQI_HISTORY_PROXY_GENERATION_VERSION}:${getAqiProxyGenerationHour(nowMs)}`,
-    );
-  }
-  return normalized;
-}
-
-function stripAqiProxyHourlyGenerationCacheComponent(url: URL): URL {
-  const normalized = new URL(url.toString());
-  normalized.searchParams.delete(AQI_HISTORY_PROXY_GENERATION_PARAM);
-  return normalized;
 }
 
 function resolveCacheProfileName(upstreamFunction: string, url: URL): CacheProfileName {
@@ -2357,7 +2322,7 @@ function shouldCacheRequest(request: Request, bypassRequested: boolean): boolean
   return true;
 }
 
-function isCacheableUpstreamResponse(response: Response, options: { allowAqiAuthenticatedNoStore?: boolean } = {}): boolean {
+function isCacheableUpstreamResponse(response: Response): boolean {
   if (response.status !== 200) {
     return false;
   }
@@ -2365,13 +2330,7 @@ function isCacheableUpstreamResponse(response: Response, options: { allowAqiAuth
     return false;
   }
   const cacheControl = (response.headers.get("Cache-Control") ?? "").toLowerCase();
-  if (cacheControl.includes("private")) {
-    return false;
-  }
-  if (cacheControl.includes("no-store")) {
-    return Boolean(options.allowAqiAuthenticatedNoStore);
-  }
-  return true;
+  return !(cacheControl.includes("no-store") || cacheControl.includes("private"));
 }
 
 function isSafeRequestMethod(method: string): boolean {
@@ -2928,22 +2887,15 @@ export default {
       r2FirstRaw: await readSecret(env.UK_AQ_TIMESERIES_R2_FIRST),
       allowIngestOverwriteRaw: await readSecret(env.UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE),
     });
-    const aqiProxyHourlyGenerationEnabled = isAqiProxyHourlyGenerationEnabled(
-      await readSecret(env.UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED),
-    );
     const useTimeseriesV2Skeleton = isTimeseriesV2Request(url, upstreamFunction, timeseriesV2Flags);
     const timeseriesV2Canonicalized = useTimeseriesV2Skeleton
       ? canonicalizeTimeseriesV2RequestUrl(url, bypassRequested)
       : null;
     const normalizedRequestUrl = useTimeseriesV2Skeleton
       ? timeseriesV2Canonicalized!.url
-      : applyAqiProxyHourlyGenerationCacheComponent(
-        canonicalizeLatestSnapshotRequestUrl(
-          canonicalizeAqiHistoryRequestUrl(url, upstreamFunction),
-          upstreamFunction,
-        ),
+      : canonicalizeLatestSnapshotRequestUrl(
+        canonicalizeAqiHistoryRequestUrl(url, upstreamFunction),
         upstreamFunction,
-        aqiProxyHourlyGenerationEnabled,
       );
     const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl);
     const profile = CACHE_PROFILES[profileName];
@@ -3162,7 +3114,7 @@ export default {
         allowedOrigins,
       );
     }
-    const normalizedUpstreamRequestUrl = stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl);
+    const normalizedUpstreamRequestUrl = new URL(normalizedRequestUrl.toString());
     normalizedUpstreamRequestUrl.searchParams.delete(LATEST_SNAPSHOT_CACHE_KEY_PARAM);
     if (
       useTimeseriesV2Skeleton &&
@@ -3264,9 +3216,7 @@ export default {
       headers: responseHeaders,
     });
 
-    if (shouldUseCache && request.method === "GET" && isCacheableUpstreamResponse(upstreamResponse, {
-      allowAqiAuthenticatedNoStore: usingExternalAqiHistoryUpstream,
-    })) {
+    if (shouldUseCache && request.method === "GET" && isCacheableUpstreamResponse(upstreamResponse)) {
       ctx.waitUntil(cache.put(cacheKey, response.clone()));
     }
     return response;
