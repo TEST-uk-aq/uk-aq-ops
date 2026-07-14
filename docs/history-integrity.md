@@ -52,8 +52,20 @@ Later stages resolve a verified overlay object first, then the matching
 Verified tombstones hide objects deleted by a targeted replacement, so a stale
 Dropbox part cannot reappear in the current run's combined view.
 
+The metadata executor reads parquet metadata from the final combined local
+object. Observation parquet uses `observed_at_utc`, with `observed_at` accepted
+only for older compatible files; a file with neither timestamp column blocks
+its exact leaf scope. Missing requested pollutant parquet blocks its connector,
+day manifest and targeted index rather than allowing partial parent metadata.
+The resolver scans only affected day prefixes and reads the single exact global
+latest-index key needed to merge those days, so untouched latest-index entries
+are preserved without a broad Dropbox scan.
+
 The final report includes prior R2 GET verification evidence for every changed
-object. On a successful non-dry-run repair, Integrity removes only the
+object and delete verification evidence for every replacement deletion. It
+reports `r2_objects_written`, `r2_objects_deleted`, and their verified union as
+`r2_objects_changed`; a key deleted and then recreated in the same run counts
+once as a final write. On a successful non-dry-run repair, Integrity removes only the
 duplicate `generated-objects` staging directory and the disposable final
 verification view after the reports are written. It retains the sparse verified
 overlay and `run-state.json`; failed overlays are retained unchanged.

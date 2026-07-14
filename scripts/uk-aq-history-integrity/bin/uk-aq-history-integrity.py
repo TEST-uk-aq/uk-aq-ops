@@ -14300,6 +14300,8 @@ def run_v2_final_verification(
                     "expected_path": gap.get("expected_path"),
                 })
     verification_evidence: list[dict[str, Any]] = []
+    r2_delete_verification_evidence: list[dict[str, Any]] = []
+    r2_written_keys: set[str] = set()
     for object_key, entry in sorted(dict(run_state.get("objects") or {}).items()):
         if not isinstance(entry, Mapping):
             continue
@@ -14312,6 +14314,8 @@ def run_v2_final_verification(
             "r2_verified_at_utc": entry.get("r2_verified_at_utc"),
         }
         verification_evidence.append(evidence)
+        if evidence["uploaded"] and evidence["r2_verified"]:
+            r2_written_keys.add(str(object_key))
         if not evidence["uploaded"] or not evidence["r2_verified"]:
             remaining_scopes.append({
                 "stage": "r2_get_verification",
@@ -14322,7 +14326,15 @@ def run_v2_final_verification(
         if isinstance(blocked, Mapping):
             remaining_scopes.append({"stage": "blocked_scope", **dict(blocked)})
     for object_key, tombstone in dict(run_state.get("tombstones") or {}).items():
-        if not isinstance(tombstone, Mapping) or not tombstone.get("r2_delete_verified"):
+        delete_evidence = {
+            "object_key": object_key,
+            "r2_delete_verified": bool(
+                isinstance(tombstone, Mapping) and tombstone.get("r2_delete_verified")
+            ),
+            "superseded_by_verified_write": str(object_key) in r2_written_keys,
+        }
+        r2_delete_verification_evidence.append(delete_evidence)
+        if not delete_evidence["r2_delete_verified"]:
             remaining_scopes.append({
                 "stage": "r2_delete_verification",
                 "object_key": object_key,
@@ -14339,7 +14351,18 @@ def run_v2_final_verification(
         "source_truth": "source_cache",
         "local_object_resolution": "verified_overlay_first_then_dropbox",
         "r2_get_verification_evidence": verification_evidence,
-        "r2_objects_changed": sum(1 for evidence in verification_evidence if evidence["uploaded"]),
+        "r2_delete_verification_evidence": r2_delete_verification_evidence,
+        "r2_objects_written": len(r2_written_keys),
+        "r2_objects_deleted": sum(
+            1
+            for evidence in r2_delete_verification_evidence
+            if evidence["r2_delete_verified"] and not evidence["superseded_by_verified_write"]
+        ),
+        "r2_objects_changed": len(r2_written_keys) + sum(
+            1
+            for evidence in r2_delete_verification_evidence
+            if evidence["r2_delete_verified"] and not evidence["superseded_by_verified_write"]
+        ),
         "remaining_gap_count": len(remaining_scopes),
         "remaining_scopes": remaining_scopes,
         "six_stage_remaining_counts": stage_counts,
@@ -14586,6 +14609,8 @@ def run_v2_integrity_repair_flow(
             "status": "planned",
             "reason": "dry_run_has_no_final_written_state",
             "remaining_gap_count": None,
+            "r2_objects_written": 0,
+            "r2_objects_deleted": 0,
             "r2_objects_changed": 0,
         }
     else:
@@ -14633,6 +14658,8 @@ def run_v2_integrity_repair_flow(
             for status in sorted({str(stage.get("status") or "not_run") for stage in stage_results[:-1]})
         },
         "final_verification": final_verification,
+        "r2_objects_written": int(final_verification.get("r2_objects_written") or 0),
+        "r2_objects_deleted": int(final_verification.get("r2_objects_deleted") or 0),
         "r2_objects_changed": int(final_verification.get("r2_objects_changed") or 0),
         "remaining_gap_count": final_verification.get("remaining_gap_count"),
         "overlay_root": run_state["overlay_root"],
@@ -16199,6 +16226,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Status: {final_verification.get('status') or '(none)'}",
                 f"- Source truth: {final_verification.get('source_truth') or '(none)'}",
                 f"- Local resolution: {final_verification.get('local_object_resolution') or '(none)'}",
+                f"- R2 objects written: {final_verification.get('r2_objects_written', 0)}",
+                f"- R2 objects deleted: {final_verification.get('r2_objects_deleted', 0)}",
                 f"- R2 objects changed: {final_verification.get('r2_objects_changed', 0)}",
                 f"- Remaining gap count: {final_verification.get('remaining_gap_count', '(not run)')}",
                 "",
@@ -16802,6 +16831,15 @@ def main(argv: list[str]) -> int:
             "skip_cross_check": bool(args.skip_cross_check),
             "allow_stale_dropbox": bool(args.allow_stale_dropbox),
             "status": "started",
+            "r2_write_attempted": False,
+            "r2_objects_written": 0,
+            "r2_objects_deleted": 0,
+            "r2_objects_changed": 0,
+            "six_stage_result_counts": {},
+            "overlay_path": (
+                repair_overlay.get("overlay_root") if repair_overlay is not None else None
+            ),
+            "remaining_gap_count": None,
             "log_path": str(log_path),
             "backup_readiness": backup_gate_summary,
         }
@@ -17616,6 +17654,8 @@ def main(argv: list[str]) -> int:
                 "aqi_rebuilds_ok": metrics.get("aqi_rebuilds_complete", 0),
                 "aqi_rebuilds_failed": metrics.get("aqi_rebuilds_failed", 0),
                 "r2_write_attempted": bool(repair_flow.get("r2_write_attempted")),
+                "r2_objects_written": int(repair_flow.get("r2_objects_written") or 0),
+                "r2_objects_deleted": int(repair_flow.get("r2_objects_deleted") or 0),
                 "r2_objects_changed": int(repair_flow.get("r2_objects_changed") or 0),
                 "six_stage_result_counts": repair_flow.get("six_stage_result_counts") or {},
                 "overlay_path": repair_flow.get("overlay_root"),
@@ -17693,6 +17733,8 @@ def main(argv: list[str]) -> int:
                 "allow_stale_dropbox": bool(args.allow_stale_dropbox),
                 "runtime_seconds": round(time.monotonic() - started_mono, 3),
                 "r2_write_attempted": bool((repair_flow if "repair_flow" in locals() else {}).get("r2_write_attempted")),
+                "r2_objects_written": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_written") or 0),
+                "r2_objects_deleted": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_deleted") or 0),
                 "r2_objects_changed": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_changed") or 0),
                 "six_stage_result_counts": (repair_flow if "repair_flow" in locals() else {}).get("six_stage_result_counts") or {},
                 "overlay_path": (repair_flow if "repair_flow" in locals() else {}).get("overlay_root"),

@@ -351,6 +351,14 @@ Targeted force-replace deletions are represented by verified tombstones in the
 run state. They hide only the corresponding Dropbox key in the combined view;
 the Dropbox backup itself is never changed. Metadata leaf manifests derive
 their part metadata from final parquet, rather than inherited manifest fields.
+Observation parquet selects `observed_at_utc` and falls back only to legacy
+`observed_at`; absence of both is a leaf-scope dependency block. A requested
+pollutant whose parquet is unavailable blocks its connector, day and targeted
+index. The metadata resolver reads scoped affected-day prefixes plus the one
+exact global latest-index object used by the targeted index merge, retaining
+all untouched latest-index day entries without a broad backup scan. Final
+reports and daily-task summaries distinguish verified writes and deletes, with
+`r2_objects_changed` their non-duplicated total.
 Final reports label original findings as `pre_repair`, while the principal v2
 status reflects the final verification result. `fail` and `stopped_limit` use
 the daily-task failure path.

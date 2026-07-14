@@ -1062,6 +1062,39 @@ metadata executor, local writer, current documentation and this plan. Structural
 checks passed: `py_compile`, `bash -n`, `node --check`, `deno check` and
 `git diff --check` in both repositories. No operational command was run.
 
+### Final follow-up correction record — 2026-07-14
+
+Analysis of the final runtime review:
+
+- Issue 1, scoped local-object key construction: **confirmed**. The recursive
+  scanner referenced a loop-local prefix outside its scope and could not return
+  correctly keyed files. It now retains each full root-relative R2 key exactly
+  once.
+- Issue 2, observation parquet timestamp contract: **confirmed**. The v2
+  writer emits `observed_at_utc`, while metadata repair read `observed_at`.
+  Metadata repair now inspects the parquet schema, prefers `observed_at_utc`,
+  accepts only legacy `observed_at`, and blocks the exact leaf with a precise
+  missing-column reason otherwise.
+- Issue 3, missing-pollutant dependency propagation: **confirmed**. A missing
+  requested pollutant recorded a leaf block but did not always block its
+  connector. It now blocks connector, day and targeted index proposals while
+  retaining the leaf reason.
+- Issue 4, exact global index baseline: **partially confirmed**. Day-prefix
+  scans were already scoped, but the targeted index merge lacked the one global
+  latest-index baseline it reads. The resolver now accepts explicit exact keys
+  and loads only that observations or AQI latest-index object; no full index
+  scan was added.
+- Issue 5, changed-object accounting: **confirmed**. Reports counted verified
+  writes but omitted verified deletion work. Final verification, reports and
+  task-health summaries now expose verified writes, deletes and their
+  de-duplicated total; delete-plus-recreate of the same key counts once.
+
+No SQL change is required: this is a v2 runtime-only correction and the
+existing readiness RPC contract remains compatible. Structural checks passed:
+`python3 -m py_compile`, both required `node --check` commands, `deno check`,
+both required `bash -n` commands, and `git diff --check`. No Integrity run, R2
+request, SQL apply, deployment, commit, stage or push was performed.
+
 ## Recommended model
 
 ```text
