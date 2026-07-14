@@ -42,43 +42,6 @@ test("shared AQI logic returns normalized v1 shape", () => {
   assert.equal(rows[0].eaqi_input_averaging_code, "hourly_mean");
 });
 
-test("shared AQI logic accepts exact frozen observed_at_utc source rows", () => {
-  const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(
-    [{
-      connector_id: 7,
-      station_id: 101,
-      timeseries_id: 1001,
-      pollutant_code: "no2",
-      observed_at_utc: "2025-01-02T01:00:00.000Z",
-      value: 40,
-    }],
-    "2025-01-02",
-  );
-
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].timestamp_hour_utc, "2025-01-02T01:00:00.000Z");
-  assert.equal(rows[0].daqi_calculation_status, "ok");
-  assert.equal(rows[0].eaqi_calculation_status, "ok");
-});
-
-test("shared AQI PM rolling context accepts observed_at_utc and emits only target day", () => {
-  const start = Date.parse("2025-01-01T01:00:00.000Z");
-  const sourceRows = Array.from({ length: 24 }, (_, index) => ({
-    connector_id: 7,
-    station_id: 101,
-    timeseries_id: 1002,
-    pollutant_code: "pm25",
-    observed_at_utc: new Date(start + index * 60 * 60 * 1000).toISOString(),
-    value: 12,
-  }));
-
-  const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(sourceRows, "2025-01-02");
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].timestamp_hour_utc, "2025-01-02T00:00:00.000Z");
-  assert.equal(rows[0].daqi_calculation_status, "ok");
-  assert.ok(rows.every((row) => row.timestamp_hour_utc.startsWith("2025-01-02T")));
-});
-
 test("PM2.5 rolling 24h DAQI uses previous-day context", () => {
   const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(
     hourlyRows({

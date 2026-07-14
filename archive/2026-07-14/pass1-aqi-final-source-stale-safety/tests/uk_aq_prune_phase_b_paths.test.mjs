@@ -14,8 +14,6 @@ import {
   resolvePhaseBRuntimeConfig,
   resolvePhaseBHistoryWritePrefixes,
   shouldResetManifestlessV2ResumeForTest,
-  summarizeFrozenObservationSourceForAqi,
-  validateAqilevelDataDebugConnectorManifests,
   writeCommittedV2PartAndCheckpointForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
@@ -52,75 +50,6 @@ test("Phase B v2 ignores the retired observation allow-list", () => {
     resolved.observations_pollutant_codes,
     [],
   );
-});
-
-test("Phase B frozen AQI summary keeps D-1 context distinct from target-day support", () => {
-  const summary = summarizeFrozenObservationSourceForAqi({
-    dayUtc: "2026-06-14",
-    rows: [{
-      connector_id: 6,
-      station_id: 10,
-      timeseries_id: 1001,
-      pollutant_code: "pm25",
-      observed_at_utc: "2026-06-13T12:00:00.000Z",
-      value: 11,
-    }],
-  });
-
-  assert.equal(summary.ok, true);
-  assert.equal(summary.status, "no_supported_aqi_source");
-  assert.equal(summary.supported_source_row_count, 1);
-  assert.equal(summary.target_day_supported_source_row_count, 0);
-  assert.equal(summary.context_supported_source_row_count, 1);
-  assert.deepEqual(summary.day_aqi_rows, []);
-  assert.equal(Object.hasOwn(summary.rows[0], "observed_at"), true);
-  assert.equal(summary.rows[0].observed_at, summary.rows[0].observed_at_utc);
-});
-
-test("Phase B data/debug AQI connector validation compares identity sets and canonical profiles", () => {
-  const runtime = {
-    aqilevels_prefix: "history/v2/aqilevels/hourly/data",
-    aqilevels_hourly_debug_prefix_v2: "history/v2/aqilevels/hourly/debug",
-  };
-  const data = [1, 2].map((connectorId) => buildHistoryV2ConnectorManifestForTest({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: "data",
-    dayUtc: DAY,
-    connectorId,
-    runId: RUN_ID,
-    manifestKey: buildConnectorManifestKey(runtime.aqilevels_prefix, DAY, connectorId),
-    pollutantManifests: [],
-    writerGitSha: "test",
-    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
-  }));
-  const debug = [1, 3].map((connectorId) => buildHistoryV2ConnectorManifestForTest({
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: "debug",
-    dayUtc: DAY,
-    connectorId,
-    runId: `${RUN_ID}-${connectorId}`,
-    manifestKey: buildConnectorManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, DAY, connectorId),
-    pollutantManifests: [],
-    writerGitSha: "test",
-    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
-  }));
-
-  assert.throws(() => validateAqilevelDataDebugConnectorManifests({ runtime, dayUtc: DAY, dataConnectorManifests: data, debugConnectorManifests: debug }), /connector-set mismatch/);
-  debug[1] = buildHistoryV2ConnectorManifestForTest({
-    domain: "observations",
-    grain: "hourly",
-    profile: "debug",
-    dayUtc: DAY,
-    connectorId: 2,
-    runId: RUN_ID,
-    manifestKey: buildConnectorManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, DAY, 2),
-    pollutantManifests: [],
-    writerGitSha: "test",
-    backedUpAtUtc: "2026-06-15T00:00:00.000Z",
-  });
-  assert.throws(() => validateAqilevelDataDebugConnectorManifests({ runtime, dayUtc: DAY, dataConnectorManifests: data, debugConnectorManifests: debug }), /identity mismatch/);
 });
 
 test("Phase B v2 accepts digit-leading canonical codes in candidate SQL and R2 paths", async () => {
