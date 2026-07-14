@@ -1849,8 +1849,8 @@ function dayUtcFromIso(iso) {
   return new Date(Date.parse(iso)).toISOString().slice(0, 10);
 }
 
-function normalizeLiveObservationRow(row, { connectorId = null, stationId = null, pollutantCode = null } = {}) {
-  const timeseriesId = parseRequiredPositiveInt(row?.timeseries_id);
+function normalizeLiveObservationRow(row, { connectorId = null, stationId = null, pollutantCode = null, timeseriesIdFromRequest = null } = {}) {
+  const timeseriesId = parseRequiredPositiveInt(row?.timeseries_id) || parseRequiredPositiveInt(timeseriesIdFromRequest);
   const observedAt = toIsoOrNull(row?.observed_at_utc || row?.observed_at || row?.timestamp_utc || row?.time);
   if (!timeseriesId || !observedAt) return null;
   const value = row?.value === null || row?.value === undefined ? null : Number(row.value);
@@ -1917,7 +1917,7 @@ async function readLiveR2ObservationRows({ env, timeseriesId, connectorId, stati
   const completeness = summarizeObservationApiCompleteness(payload);
   const rawRows = Array.isArray(payload?.rows) ? payload.rows : Array.isArray(payload?.points) ? payload.points : [];
   return {
-    rows: rawRows.map((row) => normalizeLiveObservationRow(row, { connectorId, stationId, pollutantCode: pollutantKey })).filter(Boolean),
+    rows: rawRows.map((row) => normalizeLiveObservationRow(row, { connectorId, stationId, pollutantCode: pollutantKey, timeseriesIdFromRequest: timeseriesId })).filter(Boolean),
     source: "r2_observations_api",
     error: null,
     ...completeness,
@@ -1942,7 +1942,7 @@ async function readRecentIngestObservationRows({ env, timeseriesId, connectorId,
     ],
   });
   return {
-    rows: result.rows.map((row) => normalizeLiveObservationRow(row, { connectorId, stationId, pollutantCode: pollutantKey })).filter(Boolean),
+    rows: result.rows.map((row) => normalizeLiveObservationRow(row, { connectorId, stationId, pollutantCode: pollutantKey, timeseriesIdFromRequest: timeseriesId })).filter(Boolean),
     source: result.source_path,
   };
 }
@@ -2682,9 +2682,13 @@ async function handleRequest(request, env, ctx) {
 
   let liveCalculatedPoints = [];
   let liveFallbackError = null;
-  const missingHourWindows = coalesceAqiMissingHourWindows(r2ExpectedCoverage?.missing_hours || [], {
-    contextHours: requestedPollutant === "pm25" || requestedPollutant === "pm10" ? 23 : 0,
+  const rawMissingHours = r2ExpectedCoverage?.missing_hours || [];
+  const mutableBoundaryMs = nowMs - mutableHours * HOUR_MS;
+  const eligibleMissingHoursForLiveFallback = rawMissingHours.filter((hour) => {
+    const hourMs = Date.parse(hour);
+    return Number.isFinite(hourMs) && hourMs >= mutableBoundaryMs;
   });
+  const missingHourWindows = coalesceAqiMissingHourWindows(eligibleMissingHoursForLiveFallback, { contextHours: 0 });
   const observationsApiConfigured = Boolean(normalizeBaseUrl(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL || ""));
   const liveFallbackDiagnostics = {
     requested: Boolean(readVersion === "v2" && obsAqiDbWindow),
@@ -2716,19 +2720,19 @@ async function handleRequest(request, env, ctx) {
     try {
       const liveWindowStartIso = missingHourWindows[0].start_utc;
       const liveWindowEndIso = missingHourWindows[missingHourWindows.length - 1].end_utc;
-      const outputStartMs = Math.max(Date.parse(liveWindowStartIso), nowMs - mutableHours * HOUR_MS);
+      const outputStartMs = Date.parse(liveWindowStartIso);
       const outputEndMs = Date.parse(liveWindowEndIso);
       const r2ObservationStartMs = requestedPollutant === "pm25" || requestedPollutant === "pm10"
         ? outputStartMs - 23 * HOUR_MS
         : outputStartMs;
       const ingestObservationStartMs = Math.max(outputStartMs, retentionStartMs);
       liveFallbackDiagnostics.pm_context_start_utc = new Date(r2ObservationStartMs).toISOString();
-      const eligibleMissingHours = (r2ExpectedCoverage?.missing_hours || []).filter((hour) => {
+      const eligibleMissingHours = eligibleMissingHoursForLiveFallback.filter((hour) => {
         const hourMs = Date.parse(hour);
         return Number.isFinite(hourMs) && hourMs >= outputStartMs && hourMs < outputEndMs;
       });
       liveFallbackDiagnostics.eligible_output_hour_count = eligibleMissingHours.length;
-      liveFallbackDiagnostics.skipped_outside_horizon_hour_count = (r2ExpectedCoverage?.missing_hours || []).length - eligibleMissingHours.length;
+      liveFallbackDiagnostics.skipped_outside_horizon_hour_count = rawMissingHours.length - eligibleMissingHours.length;
       if (!Number.isFinite(outputStartMs) || outputStartMs >= outputEndMs || eligibleMissingHours.length === 0) {
         liveFallbackDiagnostics.status = "outside_live_calculation_horizon";
       } else {
@@ -2764,7 +2768,7 @@ async function handleRequest(request, env, ctx) {
         liveFallbackDiagnostics.ingest_observation_row_count = ingestRead.rows.length;
         liveFallbackDiagnostics.discarded_ingest_overlap_count = mergedObservations.discarded_ingest_overlap_count;
         const dayRowsByKey = new Map();
-        for (const hour of r2ExpectedCoverage?.missing_hours || []) {
+        for (const hour of eligibleMissingHours) {
           const hourMs = Date.parse(hour);
           if (!Number.isFinite(hourMs) || hourMs < outputStartMs) continue;
           const dayUtc = dayUtcFromIso(hour);
