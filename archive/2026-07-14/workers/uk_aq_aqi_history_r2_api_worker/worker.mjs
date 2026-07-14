@@ -91,7 +91,6 @@ const AQI_RESPONSE_COLUMNS = [
   "source_coverage",
 ];
 const AQI_HISTORY_RESPONSE_CACHE_VERSION = "2";
-const DEFAULT_AQI_INTERNAL_RESPONSE_CACHE_ENABLED = true;
 const AQI_RESPONSE_FORMATS = new Set(["json", "objects", "compact", "tsv"]);
 const timeseriesWindowContextCache = new Map();
 
@@ -365,24 +364,6 @@ function buildTsvResponseBody(columns, rows) {
     }
   }
   return `${lines.join("\n")}\n`;
-}
-
-function isInternalResponseCacheEnabled(env = {}) {
-  return parseOptionalBoolean(
-    env.UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED,
-    DEFAULT_AQI_INTERNAL_RESPONSE_CACHE_ENABLED,
-  );
-}
-
-function forceDirectAuthenticatedNoStore(response) {
-  const headers = new Headers(response.headers);
-  headers.set("Cache-Control", "no-store");
-  headers.set("X-UK-AQ-Internal-Response-Cache", "disabled");
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
 }
 
 function buildAqiHistoryResponseCacheKey(request, env = {}) {
@@ -3024,15 +3005,10 @@ export default {
       });
     }
 
-    const internalResponseCacheEnabled = isInternalResponseCacheEnabled(env);
-    const cacheKey = internalResponseCacheEnabled
-      ? buildAqiHistoryResponseCacheKey(request, env)
-      : null;
-    if (internalResponseCacheEnabled && cacheKey) {
-      const cached = await caches.default.match(cacheKey);
-      if (cached) {
-        return withCacheMarker(cached, "HIT");
-      }
+    const cacheKey = buildAqiHistoryResponseCacheKey(request, env);
+    const cached = await caches.default.match(cacheKey);
+    if (cached) {
+      return withCacheMarker(cached, "HIT");
     }
 
     let response;
@@ -3046,14 +3022,9 @@ export default {
       });
     }
 
-    if (!internalResponseCacheEnabled) {
-      return withCacheMarker(forceDirectAuthenticatedNoStore(response), "BYPASS");
-    }
-
     if (
       response.ok
       && response.headers.get("X-UK-AQ-Response-Complete") !== "false"
-      && cacheKey
       && ctx
       && typeof ctx.waitUntil === "function"
     ) {
