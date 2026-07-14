@@ -45,9 +45,7 @@ const MAX_MAX_SCAN_ELAPSED_MS = 120000;
 const UK_AQ_PUBLIC_SCHEMA_DEFAULT = "uk_aq_public";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_AQI_MUTABLE_HOURS = 120;
-const MIN_AQI_MUTABLE_HOURS = 1;
-const MAX_AQI_MUTABLE_HOURS = 24 * 30;
+const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const VALID_PATHS = new Set(["/", "/v1/aqi-history"]);
 const TIMESERIES_AQI_HOURLY_VIEW = "uk_aq_timeseries_aqi_hourly";
@@ -303,15 +301,6 @@ function cacheControlHeader(cacheSeconds) {
   return `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}, stale-while-revalidate=${cacheSeconds * 2}`;
 }
 
-function resolveAqiMutableHours(env = {}) {
-  return parsePositiveInt(
-    env.UK_AQ_AQI_MUTABLE_HOURS,
-    DEFAULT_AQI_MUTABLE_HOURS,
-    MIN_AQI_MUTABLE_HOURS,
-    MAX_AQI_MUTABLE_HOURS,
-  );
-}
-
 function resolveCachePolicy(env, endIso) {
   const mutableCacheSeconds = parsePositiveInt(
     env.UK_AQ_AQI_HISTORY_R2_CACHE_MAX_AGE_SECONDS,
@@ -328,13 +317,11 @@ function resolveCachePolicy(env, endIso) {
       MAX_CACHE_SECONDS,
     ),
   );
-  const mutableHours = resolveAqiMutableHours(env);
   const endMs = Date.parse(endIso);
-  const immutable = Number.isFinite(endMs) && endMs <= (Date.now() - mutableHours * HOUR_MS);
+  const immutable = Number.isFinite(endMs) && endMs <= (Date.now() - AQI_HISTORY_MUTABLE_WINDOW_MS);
   return {
     cacheSeconds: immutable ? immutableCacheSeconds : mutableCacheSeconds,
     cacheScope: immutable ? "immutable" : "recent",
-    mutableHours,
   };
 }
 
@@ -2298,7 +2285,7 @@ async function handleRequest(request, env, ctx) {
       ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_INDEX_SUBPREFIX}`
     );
   const cachePolicy = resolveCachePolicy(env, endIso);
-  const { cacheSeconds, cacheScope, mutableHours } = cachePolicy;
+  const { cacheSeconds, cacheScope } = cachePolicy;
   const ingestRetentionDays = parsePositiveInt(
     env.INGESTDB_RETENTION_DAYS,
     DEFAULT_INGESTDB_RETENTION_DAYS,
@@ -2751,7 +2738,6 @@ async function handleRequest(request, env, ctx) {
     source_of_truth_days: ingestRetentionDays,
     source_of_truth_hours: ingestRetentionDays * 24,
     cache_scope: cacheScope,
-    aqi_mutable_hours: mutableHours,
     scope,
     grain,
     pollutant: requestedPollutant,
@@ -2824,7 +2810,6 @@ async function handleRequest(request, env, ctx) {
       retention_start_utc: splitBoundaryIso,
       source_of_truth_days: ingestRetentionDays,
       source_of_truth_hours: ingestRetentionDays * 24,
-      aqi_mutable_hours: mutableHours,
       has_gap: hasGap,
       coverage_state: coverageState,
       partial_reasons: partialReasonList,
