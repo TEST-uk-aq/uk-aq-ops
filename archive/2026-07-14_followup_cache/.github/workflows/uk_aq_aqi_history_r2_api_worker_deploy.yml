@@ -33,8 +33,6 @@ jobs:
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX || 'history/_index_v2/aqilevels_hourly_data_timeseries' }}
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
-      UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED: ${{ vars.UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED || 'true' }}
-      UK_AQ_AQI_MUTABLE_HOURS: ${{ vars.UK_AQ_AQI_MUTABLE_HOURS || '120' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -105,8 +103,6 @@ jobs:
               "UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_ROW_GROUPS_PER_REQUEST"],
               "UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_CHUNKS_PER_REQUEST"],
               "UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS": os.environ["UK_AQ_AQI_HISTORY_R2_MAX_SCAN_ELAPSED_MS"],
-              "UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED": os.environ["UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED"],
-              "UK_AQ_AQI_MUTABLE_HOURS": os.environ["UK_AQ_AQI_MUTABLE_HOURS"],
           }
           for key, value in replacements.items():
               escaped = value.replace("\\", "\\\\").replace('"', '\\"')

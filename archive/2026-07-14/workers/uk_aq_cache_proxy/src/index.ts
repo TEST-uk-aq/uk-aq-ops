@@ -15,8 +15,6 @@ export interface Env {
   OBS_AQIDB_SUPABASE_URL: unknown;
   OBS_AQIDB_SECRET_KEY: unknown;
   UK_AQ_AQI_HISTORY_R2_API_URL: unknown;
-  UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED: unknown;
-  UK_AQ_AQI_MUTABLE_HOURS: unknown;
   UK_AQ_LATEST_SNAPSHOT_R2_API_URL: unknown;
   UK_AQ_POSTCODE_LOOKUP_R2_API_URL: unknown;
   UK_AQ_POSTCODE_SUGGEST_R2_API_URL: unknown;
@@ -58,7 +56,7 @@ export interface Env {
 }
 
 
-type CacheProfileName = "realtime" | "metadata" | "stations_metadata" | "aqi_history_recent" | "aqi_history_immutable" | "postcode_lookup";
+type CacheProfileName = "realtime" | "metadata" | "stations_metadata" | "aqi_history_immutable" | "postcode_lookup";
 
 type CacheProfile = {
   edgeTtlSeconds: number;
@@ -157,12 +155,6 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
     staleWhileRevalidateSeconds: 86400,
     staleIfErrorSeconds: 604800,
   },
-  aqi_history_recent: {
-    edgeTtlSeconds: 3900,
-    browserTtlSeconds: 300,
-    staleWhileRevalidateSeconds: 0,
-    staleIfErrorSeconds: 300,
-  },
   aqi_history_immutable: {
     edgeTtlSeconds: 86400,
     browserTtlSeconds: 86400,
@@ -193,7 +185,7 @@ const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_la_hex: "metadata",
   uk_aq_pcon_hex: "metadata",
   uk_aq_public_networks: "metadata",
-  [EXTERNAL_AQI_HISTORY_UPSTREAM]: "aqi_history_recent",
+  [EXTERNAL_AQI_HISTORY_UPSTREAM]: "realtime",
   [EXTERNAL_LATEST_SNAPSHOT_UPSTREAM]: "realtime",
   [EXTERNAL_POSTCODE_LOOKUP_UPSTREAM]: "postcode_lookup",
   [EXTERNAL_POSTCODE_SUGGEST_UPSTREAM]: "postcode_lookup",
@@ -249,11 +241,7 @@ const DAY_MS = 24 * HOUR_MS;
 const AQI_HISTORY_CANONICALIZE_MIN_WINDOW_MS = 3 * 24 * HOUR_MS;
 const AQI_HISTORY_START_KEYS = ["from_utc", "start_utc", "from", "start"] as const;
 const AQI_HISTORY_END_KEYS = ["to_utc", "end_utc", "to", "end"] as const;
-const DEFAULT_AQI_MUTABLE_HOURS = 120;
-const MIN_AQI_MUTABLE_HOURS = 1;
-const MAX_AQI_MUTABLE_HOURS = 24 * 30;
-const AQI_HISTORY_PROXY_GENERATION_PARAM = "__uk_aq_aqi_proxy_generation_hour";
-const AQI_HISTORY_PROXY_GENERATION_VERSION = "1";
+const AQI_HISTORY_MUTABLE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const CHART_METRICS_MIN_BODY_BYTES = 4 * 1024;
 const CHART_METRICS_DEFAULT_MAX_BODY_BYTES = 16 * 1024;
 const CHART_METRICS_MAX_BODY_BYTES = 256 * 1024;
@@ -2272,24 +2260,7 @@ function canonicalizeLatestSnapshotRequestUrl(url: URL, upstreamFunction: string
   return normalized;
 }
 
-function resolveAqiMutableHours(raw: string): number {
-  return parseIntInRange(
-    raw,
-    DEFAULT_AQI_MUTABLE_HOURS,
-    MIN_AQI_MUTABLE_HOURS,
-    MAX_AQI_MUTABLE_HOURS,
-  );
-}
-
-function isAqiProxyHourlyGenerationEnabled(raw: string): boolean {
-  return parseBooleanFlag(raw);
-}
-
-function getAqiProxyGenerationHour(nowMs = Date.now()): string {
-  return new Date(Math.floor(nowMs / HOUR_MS) * HOUR_MS).toISOString();
-}
-
-function isExplicitImmutableAqiHistoryRequest(url: URL, mutableHours = DEFAULT_AQI_MUTABLE_HOURS, nowMs = Date.now()): boolean {
+function isImmutableAqiHistoryRequest(url: URL, nowMs = Date.now()): boolean {
   const explicitEndMs = parseIsoMsOrNull(
     url.searchParams.get("to_utc")
       || url.searchParams.get("end_utc")
@@ -2299,85 +2270,17 @@ function isExplicitImmutableAqiHistoryRequest(url: URL, mutableHours = DEFAULT_A
   if (explicitEndMs === null || !Number.isFinite(explicitEndMs)) {
     return false;
   }
-  return explicitEndMs <= (nowMs - mutableHours * HOUR_MS);
+  return explicitEndMs <= (nowMs - AQI_HISTORY_MUTABLE_WINDOW_MS);
 }
 
-function isImmutableAqiHistoryRequest(url: URL, mutableHours = DEFAULT_AQI_MUTABLE_HOURS, nowMs = Date.now()): boolean {
-  return isExplicitImmutableAqiHistoryRequest(url, mutableHours, nowMs);
-}
-
-function applyAqiProxyHourlyGenerationCacheComponent(url: URL, upstreamFunction: string, enabled: boolean, mutableHours = DEFAULT_AQI_MUTABLE_HOURS, nowMs = Date.now()): URL {
-  const normalized = new URL(url.toString());
-  if (upstreamFunction !== EXTERNAL_AQI_HISTORY_UPSTREAM) {
-    return normalized;
-  }
-  normalized.searchParams.delete(AQI_HISTORY_PROXY_GENERATION_PARAM);
-  if (enabled && !isExplicitImmutableAqiHistoryRequest(normalized, mutableHours, nowMs)) {
-    normalized.searchParams.set(
-      AQI_HISTORY_PROXY_GENERATION_PARAM,
-      `${AQI_HISTORY_PROXY_GENERATION_VERSION}:${getAqiProxyGenerationHour(nowMs)}`,
-    );
-  }
-  return normalized;
-}
-
-function stripAqiProxyHourlyGenerationCacheComponent(url: URL): URL {
-  const normalized = new URL(url.toString());
-  normalized.searchParams.delete(AQI_HISTORY_PROXY_GENERATION_PARAM);
-  return normalized;
-}
-
-function resolveAqiCacheScope(
-  upstreamFunction: string,
-  url: URL,
-  mutableHours = DEFAULT_AQI_MUTABLE_HOURS,
-  hourlyGenerationEnabled = false,
-): "recent_hourly" | "recent_legacy" | "immutable" | null {
-  if (upstreamFunction !== EXTERNAL_AQI_HISTORY_UPSTREAM) {
-    return null;
-  }
-  if (isImmutableAqiHistoryRequest(url, mutableHours)) {
-    return "immutable";
-  }
-  return hourlyGenerationEnabled ? "recent_hourly" : "recent_legacy";
-}
-
-function resolveCacheProfileName(
-  upstreamFunction: string,
-  url: URL,
-  mutableHours = DEFAULT_AQI_MUTABLE_HOURS,
-  hourlyGenerationEnabled = false,
-): CacheProfileName {
-  const aqiScope = resolveAqiCacheScope(upstreamFunction, url, mutableHours, hourlyGenerationEnabled);
-  if (aqiScope === "immutable") {
+function resolveCacheProfileName(upstreamFunction: string, url: URL): CacheProfileName {
+  if (
+    upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM &&
+    isImmutableAqiHistoryRequest(url)
+  ) {
     return "aqi_history_immutable";
   }
-  if (aqiScope === "recent_hourly") {
-    return "aqi_history_recent";
-  }
-  if (aqiScope === "recent_legacy") {
-    return "realtime";
-  }
   return FUNCTION_PROFILE_MAP[upstreamFunction];
-}
-
-function addAqiCacheDiagnosticHeaders(
-  headers: Headers,
-  upstreamFunction: string,
-  url: URL,
-  mutableHours: number,
-  hourlyGenerationEnabled: boolean,
-): void {
-  const scope = resolveAqiCacheScope(upstreamFunction, url, mutableHours, hourlyGenerationEnabled);
-  if (!scope) {
-    return;
-  }
-  headers.set("X-UK-AQ-AQI-Cache-Scope", scope);
-  headers.set("X-UK-AQ-AQI-Mutable-Hours", String(mutableHours));
-  const generation = url.searchParams.get(AQI_HISTORY_PROXY_GENERATION_PARAM);
-  if (generation) {
-    headers.set("X-UK-AQ-AQI-Generation", generation);
-  }
 }
 
 function normalizeEtag(value: string): string {
@@ -2419,7 +2322,7 @@ function shouldCacheRequest(request: Request, bypassRequested: boolean): boolean
   return true;
 }
 
-function isCacheableUpstreamResponse(response: Response, options: { allowAqiAuthenticatedNoStore?: boolean } = {}): boolean {
+function isCacheableUpstreamResponse(response: Response): boolean {
   if (response.status !== 200) {
     return false;
   }
@@ -2427,14 +2330,7 @@ function isCacheableUpstreamResponse(response: Response, options: { allowAqiAuth
     return false;
   }
   const cacheControl = (response.headers.get("Cache-Control") ?? "").toLowerCase();
-  if (cacheControl.includes("private")) {
-    return false;
-  }
-  if (cacheControl.includes("no-store")) {
-    return Boolean(options.allowAqiAuthenticatedNoStore)
-      && (response.headers.get("X-UK-AQ-Internal-Response-Cache") ?? "").toLowerCase() === "disabled";
-  }
-  return true;
+  return !(cacheControl.includes("no-store") || cacheControl.includes("private"));
 }
 
 function isSafeRequestMethod(method: string): boolean {
@@ -2991,33 +2887,17 @@ export default {
       r2FirstRaw: await readSecret(env.UK_AQ_TIMESERIES_R2_FIRST),
       allowIngestOverwriteRaw: await readSecret(env.UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE),
     });
-    const aqiProxyHourlyGenerationEnabled = isAqiProxyHourlyGenerationEnabled(
-      await readSecret(env.UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED),
-    );
-    const aqiMutableHours = resolveAqiMutableHours(
-      await readSecret(env.UK_AQ_AQI_MUTABLE_HOURS),
-    );
     const useTimeseriesV2Skeleton = isTimeseriesV2Request(url, upstreamFunction, timeseriesV2Flags);
     const timeseriesV2Canonicalized = useTimeseriesV2Skeleton
       ? canonicalizeTimeseriesV2RequestUrl(url, bypassRequested)
       : null;
     const normalizedRequestUrl = useTimeseriesV2Skeleton
       ? timeseriesV2Canonicalized!.url
-      : applyAqiProxyHourlyGenerationCacheComponent(
-        canonicalizeLatestSnapshotRequestUrl(
-          canonicalizeAqiHistoryRequestUrl(url, upstreamFunction),
-          upstreamFunction,
-        ),
+      : canonicalizeLatestSnapshotRequestUrl(
+        canonicalizeAqiHistoryRequestUrl(url, upstreamFunction),
         upstreamFunction,
-        aqiProxyHourlyGenerationEnabled,
-        aqiMutableHours,
       );
-    const profileName = resolveCacheProfileName(
-      upstreamFunction,
-      normalizedRequestUrl,
-      aqiMutableHours,
-      aqiProxyHourlyGenerationEnabled,
-    );
+    const profileName = resolveCacheProfileName(upstreamFunction, normalizedRequestUrl);
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
     const usingExternalLatestSnapshotUpstream = upstreamFunction === EXTERNAL_LATEST_SNAPSHOT_UPSTREAM;
@@ -3092,7 +2972,6 @@ export default {
           }
           notModifiedHeaders.set("X-UK-AQ-Cache", "HIT");
           notModifiedHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-          addAqiCacheDiagnosticHeaders(notModifiedHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
           if (useTimeseriesV2Skeleton) {
             notModifiedHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
             const sourceMode = cachedResponse.headers.get("X-UK-AQ-Timeseries-Source-Mode");
@@ -3111,7 +2990,6 @@ export default {
         const hitHeaders = new Headers(cachedResponse.headers);
         hitHeaders.set("X-UK-AQ-Cache", "HIT");
         hitHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-        addAqiCacheDiagnosticHeaders(hitHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
         if (useTimeseriesV2Skeleton) {
           hitHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
         }
@@ -3157,7 +3035,6 @@ export default {
       responseHeaders.set("ETag", etag);
       responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
       responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-      addAqiCacheDiagnosticHeaders(responseHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
       responseHeaders.set("X-UK-AQ-Cache-Key-Version", TIMESERIES_V2_CACHE_KEY_VERSION);
       responseHeaders.set("X-UK-AQ-Timeseries-Cacheable", String(timeseriesResponseCacheable));
       responseHeaders.set("X-UK-AQ-Timeseries-Source-Mode", stitched.meta.source_mode);
@@ -3237,7 +3114,7 @@ export default {
         allowedOrigins,
       );
     }
-    const normalizedUpstreamRequestUrl = stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl);
+    const normalizedUpstreamRequestUrl = new URL(normalizedRequestUrl.toString());
     normalizedUpstreamRequestUrl.searchParams.delete(LATEST_SNAPSHOT_CACHE_KEY_PARAM);
     if (
       useTimeseriesV2Skeleton &&
@@ -3315,22 +3192,19 @@ export default {
       );
     }
 
-    const upstreamResponseCacheable = isCacheableUpstreamResponse(upstreamResponse, {
-      allowAqiAuthenticatedNoStore: usingExternalAqiHistoryUpstream,
-    });
     const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
     const responseHeaders = new Headers(upstreamResponse.headers);
     responseHeaders.delete("Set-Cookie");
     responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
     responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
-    addAqiCacheDiagnosticHeaders(responseHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
     if (upstreamRetried && upstreamRetryReason) {
       responseHeaders.set("X-UK-AQ-Upstream-Retry", upstreamRetryReason);
     }
     responseHeaders.set("X-UK-AQ-Upstream-Attempts", String(upstreamAttemptCount));
-    if (upstreamResponseCacheable) {
+    const upstreamResponseComplete = (upstreamResponse.headers.get("X-UK-AQ-Response-Complete") ?? "").toLowerCase();
+    if (upstreamResponse.status === 200 && upstreamResponseComplete !== "false") {
       responseHeaders.set("Cache-Control", buildCacheControl(profile));
-    } else {
+    } else if (upstreamResponseComplete === "false") {
       responseHeaders.set("Cache-Control", "no-store");
     }
     const responseBody: BodyInit | null = upstreamResponse.body;
@@ -3342,7 +3216,7 @@ export default {
       headers: responseHeaders,
     });
 
-    if (shouldUseCache && request.method === "GET" && upstreamResponseCacheable) {
+    if (shouldUseCache && request.method === "GET" && isCacheableUpstreamResponse(upstreamResponse)) {
       ctx.waitUntil(cache.put(cacheKey, response.clone()));
     }
     return response;

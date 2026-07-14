@@ -20,8 +20,6 @@ enabled = true
 # Runtime variables:
 # - UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS (optional)
 # - UK_AQ_LOCAL_DEV_BYPASS_ENABLED (optional; set true/1 in test only)
-# - UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED (optional; default false)
-# - UK_AQ_AQI_MUTABLE_HOURS (optional; default 120; bounded 1-720)
 # - UK_AQ_POSTCODE_LOOKUP_R2_API_URL (required for /api/aq/postcode_lookup)
 # - UK_AQ_CHART_METRICS_RPC (optional)
 # - UK_AQ_CHART_METRICS_RPC_SCHEMA (optional, default: uk_aq_public)

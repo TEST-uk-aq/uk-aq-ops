@@ -90,12 +90,10 @@ Read endpoints:
 
 ### AQI history cache profiles
 
-- Recent or mixed AQI history requests keep the existing `realtime` cache profile while `UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED=false` (the default).
-- Recent or mixed AQI history requests use `aqi_history_recent` only when `UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED=true`: browser `max-age=300`, edge `s-maxage=3900`, `stale-while-revalidate=0`, and `stale-if-error=300`.
-- Explicit AQI history requests ending older than `UK_AQ_AQI_MUTABLE_HOURS` use `aqi_history_immutable` regardless of the hourly-generation flag: browser `max-age=86400`, edge `s-maxage=86400`, `stale-while-revalidate=86400`, and `stale-if-error=604800`.
+- Recent or mixed AQI history requests use `aqi_history_recent`: browser `max-age=300`, edge `s-maxage=3900`, `stale-while-revalidate=0`, and `stale-if-error=300`.
+- Explicit AQI history requests ending older than `UK_AQ_AQI_MUTABLE_HOURS` use `aqi_history_immutable`: browser `max-age=86400`, edge `s-maxage=86400`, `stale-while-revalidate=86400`, and `stale-if-error=604800`.
 - When `UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED=true`, recent/mixed AQI cache keys receive an internal UTC-hour generation component that is stripped before upstream fetches.
-- AQI proxy responses expose `X-UK-AQ-AQI-Cache-Scope` (`recent_legacy`, `recent_hourly`, or `immutable`), `X-UK-AQ-AQI-Generation` when applicable, and `X-UK-AQ-AQI-Mutable-Hours` for TEST diagnostics.
-- The intended coordinated TEST cutover is `UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED=true`, `UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED=false`, and `UK_AQ_AQI_MUTABLE_HOURS=120`.
+- AQI proxy responses expose `X-UK-AQ-AQI-Cache-Scope`, `X-UK-AQ-AQI-Generation` when applicable, and `X-UK-AQ-AQI-Mutable-Hours` for TEST diagnostics.
 
 ## Required GitHub env/secret targets
 
