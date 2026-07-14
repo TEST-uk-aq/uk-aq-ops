@@ -3,7 +3,7 @@
 // It never rewrites parquet data or invokes either data backfill wrapper.
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
-import { parquetMetadataAsync, parquetRead } from "hyparquet";
+import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
   hasRequiredR2Config,
@@ -102,7 +102,7 @@ function walkLocalObjects(root, prefixes = []) {
       const nextRelative = relative ? `${relative}/${entry.name}` : entry.name;
       const fullPath = `${directory}/${entry.name}`;
       if (entry.isDirectory()) visit(fullPath, nextRelative);
-      else if (entry.isFile()) found.set(`${prefix}${nextRelative}`, fullPath);
+      else if (entry.isFile()) found.set(nextRelative, fullPath);
     }
   };
   for (const prefix of prefixes) {
@@ -113,9 +113,14 @@ function walkLocalObjects(root, prefixes = []) {
   return found;
 }
 
-function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes }) {
+function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [] }) {
   const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
   const paths = walkLocalObjects(dropboxRoot, prefixes);
+  for (const rawKey of exactKeys) {
+    const key = safeLocalKey(rawKey);
+    const candidate = `${dropboxRoot}/${key}`;
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) paths.set(key, candidate);
+  }
   for (const [key, tombstone] of Object.entries(state?.tombstones || {})) {
     if (tombstone?.r2_delete_verified === true) paths.delete(safeLocalKey(key));
   }
@@ -322,7 +327,14 @@ async function parquetFileEntry({ store, key, domain, pollutantCode }) {
   const metadata = await parquetMetadataAsync(file);
   const rowCount = Math.max(0, Number(metadata.num_rows || 0));
   if (!rowCount) throw new Error("parquet_zero_rows");
-  const timestampColumn = domain === "observations" ? "observed_at" : "timestamp_hour_utc";
+  const schemaColumns = new Set(
+    parquetSchema(metadata).children.map((column) => String(column.element.name)),
+  );
+  const timestampCandidates = domain === "observations"
+    ? ["observed_at_utc", "observed_at"]
+    : ["timestamp_hour_utc"];
+  const timestampColumn = timestampCandidates.find((column) => schemaColumns.has(column));
+  if (!timestampColumn) throw new Error(`parquet_timestamp_column_missing:${timestampCandidates.join("|")}`);
   let rows = [];
   await parquetRead({
     file,
@@ -582,12 +594,19 @@ export async function runV2ObservationsRepair({
   const indexPrefix = domain === "observations"
     ? config.observations_timeseries_index_prefix_v2
     : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
+  // Targeted index rebuilds merge the changed days into this global latest
+  // summary.  Read exactly that key from the Dropbox baseline; scanning the
+  // whole index tree would make the sparse overlay resolver non-deterministic.
+  const latestIndexKey = domain === "observations"
+    ? `${config.index_prefix_v2}/observations_timeseries_latest.json`
+    : `${config.index_prefix_v2}/aqilevels_hourly_data_timeseries_latest.json`;
   const localStore = createCombinedLocalStore({
     ...args,
     prefixes: [...new Set(scopes.flatMap((scope) => [
       `${dataPrefix}/day_utc=${scope.dayUtc}`,
       `${indexPrefix}/day_utc=${scope.dayUtc}`,
     ]))],
+    exactKeys: [latestIndexKey],
   });
   const staged = createStagedObjectMap({ r2: config.r2, store: localStore });
   const dayPlans = [];
@@ -612,10 +631,12 @@ export async function runV2ObservationsRepair({
       const missingRequested = [...wanted].filter((code) => !availableCodes.includes(code));
       for (const pollutantCode of missingRequested) {
         blockedScopes.push({ ...scope, pollutant_code: pollutantCode, status: "blocked_dependency", reason: "final_parquet_objects_unavailable" });
+        blockedConnectorScopes.add(`${dayUtc}|${scope.connectorId}`);
       }
       if (!selectedCodes.length) {
         const blocked = { ...scope, status: "blocked_dependency", reason: "final_parquet_objects_unavailable" };
         blockedScopes.push(blocked);
+        blockedConnectorScopes.add(`${dayUtc}|${scope.connectorId}`);
         continue;
       }
       for (const pollutantCode of selectedCodes) {
