@@ -748,6 +748,83 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0]["gap_types"], ["data_manifest_schema_mismatch", "data_manifest_total_bytes_mismatch"])
 
+    def test_authoritative_metadata_bindings_come_from_imported_core_snapshot(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript("""
+                CREATE TABLE core_timeseries_snapshot (
+                  id INTEGER PRIMARY KEY, connector_id INTEGER, label TEXT,
+                  timeseries_ref TEXT, phenomenon_id INTEGER
+                );
+                CREATE TABLE core_phenomena_snapshot (
+                  id INTEGER PRIMARY KEY, label TEXT, source_label TEXT,
+                  pollutant_label TEXT
+                );
+            """)
+            conn.execute(
+                "INSERT INTO core_phenomena_snapshot VALUES (?, ?, ?, ?)",
+                (7, "Nitrogen dioxide", "NO2", "NO2"),
+            )
+            conn.execute(
+                "INSERT INTO core_timeseries_snapshot VALUES (?, ?, ?, ?, ?)",
+                (101, 1, "ignored", "ignored", 7),
+            )
+            self.assertEqual(
+                MODULE._authoritative_v2_core_timeseries_bindings(conn),
+                [{"timeseries_id": 101, "connector_id": 1, "pollutant_code": "no2"}],
+            )
+        finally:
+            conn.close()
+
+    def test_manifest_stage_remains_planned_when_only_index_metadata_is_blocked(self) -> None:
+        run_state = {
+            "changed_scopes": {"OBSERVS_CHANGED": []},
+            "blocked_scopes": [],
+            "overlay_root": str(self.root / "overlay"),
+            "base_dropbox_root": str(self.root / "r2"),
+            "run_state_path": str(self.root / "run-state.json"),
+        }
+        observation_metadata = {
+            "status": "blocked_dependency",
+            "manifest_status": "planned",
+            "index_status": "blocked_dependency",
+            "results": [],
+        }
+        with mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
+            "v2_observation_repairs_failed": 0,
+            "v2_observation_repairs_guard_failed": 0,
+        }), mock.patch.object(MODULE, "_run_v2_observation_metadata_executor", side_effect=[
+            observation_metadata,
+            {"status": "not_run", "results": []},
+        ]), mock.patch.object(MODULE, "_record_metadata_executor_overlay"), mock.patch.object(
+            MODULE, "_phase4_aqi_work", return_value=([], [])
+        ):
+            result = MODULE.run_v2_integrity_repair_flow(
+                run_state=run_state,
+                conn=self.conn,
+                run_id=1,
+                env_name="CIC-Test",
+                run_compact="run",
+                env=self.env,
+                v2_observations={"repair_plan": []},
+                v2_aqilevels={"repair_plan": []},
+                final_verification_config=MODULE.resolve_history_path_config("v2", self.env),
+                from_day="2026-05-17",
+                to_day="2026-05-17",
+                allowed_connector_ids={1},
+                source_scope={"source": "sos", "connector_ids": [1]},
+                check_aqi_debug=False,
+                require_aqi_debug=False,
+                limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+                dry_run=True,
+                log=self.log,
+            )
+        stages = {entry["stage"]: entry["status"] for entry in result["stage_results"]}
+        self.assertEqual(stages["observs_manifests"], "planned")
+        self.assertEqual(stages["observs_indexes"], "blocked_dependency")
+        self.assertEqual(stages["aqilevels"], "planned")
+        self.assertEqual(result["status"], "failed")
+
     def test_data_repair_coalesces_same_day_index_only_gap(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
