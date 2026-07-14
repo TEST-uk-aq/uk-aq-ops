@@ -487,11 +487,11 @@ async function applyStagedProposals({ r2, proposals, writeR2 }) {
   for (let position = 0; position < ordered.length; position += 1) {
     const proposal = ordered[position];
     if (!proposal.changed) {
-      results.set(proposal.key, { key: proposal.key, status: "skipped_unchanged", verification: "not_run" });
+      results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "skipped_unchanged", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: null, error: null });
       continue;
     }
     if (!writeR2) {
-      results.set(proposal.key, { key: proposal.key, status: "planned", verification: "not_run" });
+      results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "planned", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: null, error: null });
       continue;
     }
     try {
@@ -500,11 +500,13 @@ async function applyStagedProposals({ r2, proposals, writeR2 }) {
       const fresh = await r2GetObject({ r2, key: proposal.key });
       if (fresh.bytes !== proposal.bytes || fresh.body.toString("utf8") !== proposal.body) throw new Error(`Verification failed for ${proposal.key}`);
     } catch (error) {
-      results.set(proposal.key, { key: proposal.key, status: "failed", verification: "failed", error: error instanceof Error ? error.message : String(error) });
-      for (const remaining of ordered.slice(position + 1)) results.set(remaining.key, { key: remaining.key, status: "not_run_due_to_dependency", verification: "not_run" });
+      const message = error instanceof Error ? error.message : String(error);
+      const putAttempted = !message.includes("Blocked dependency:");
+      results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "failed", put_attempted: putAttempted, put_completed: false, get_verification_attempted: putAttempted, get_verification_succeeded: false, verification: "failed", failure_stage: putAttempted ? "get" : "pre_write_guard", error: message });
+      for (const remaining of ordered.slice(position + 1)) results.set(remaining.key, { key: remaining.key, kind: remaining.kind, status: "not_run_due_to_dependency", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: "dependency", error: null });
       return { results, failure: { key: proposal.key, error: error instanceof Error ? error.message : String(error) } };
     }
-    results.set(proposal.key, { key: proposal.key, status: "succeeded", verification: "succeeded" });
+    results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "succeeded", put_attempted: true, put_completed: true, get_verification_attempted: true, get_verification_succeeded: true, verification: "succeeded", failure_stage: null, error: null });
   }
   return { results, failure: null };
 }
@@ -842,6 +844,7 @@ export async function runV2ObservationsRepair({
   const appliedResult = await applyStagedProposals({ r2: config.r2, proposals: staged.proposals, writeR2: args.writeR2 });
   const applied = appliedResult.results;
   const proposalViews = [...staged.proposals.values()].map(proposalView).sort((left, right) => left.key.localeCompare(right.key));
+  const applicationOperations = [...applied.values()].sort((left, right) => left.key.localeCompare(right.key));
   const results = dayPlans.map((plan) => {
     if (plan.status === "blocked_dependency") return plan;
     const operations = plan.proposal_keys.map((key) => applied.get(key)).filter(Boolean);
@@ -882,6 +885,11 @@ export async function runV2ObservationsRepair({
     execution: { status: executionStatus },
     verification: { status: verificationStatus },
     application_failure: appliedResult.failure,
+    application: {
+      status: appliedResult.failure ? "partial" : (args.writeR2 ? "succeeded" : "planned"),
+      operations: applicationOperations,
+      failure: appliedResult.failure,
+    },
     results,
   };
 }
