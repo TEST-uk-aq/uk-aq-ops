@@ -4,7 +4,7 @@
 
 ## Station-series source policy
 
-`GET /v1/station-series` resolves the authoritative timeseries identity before reading data. It performs exactly one recent observation read directly from ObsAQIDB (`uk_aq_public.uk_aq_observations` by default). It never calls the stitched public `uk_aq_timeseries` Edge Function.
+`GET /v1/station-series` resolves the authoritative timeseries identity before reading data. It performs exactly one logical recent observation read directly from ObsAQIDB through `uk_aq_public.rpc/uk_aq_timeseries_rpc`, using the smallest supported RPC window that covers the required source interval. A required interval beyond the RPC's 30-day maximum is marked incomplete rather than treated as direct-source coverage. It never calls the stitched public `uk_aq_timeseries` Edge Function.
 
 A request uses ingest-only mode only when the direct response covers the complete requested output, the requested end, and any PM 23-hour AQI context. Otherwise the same direct result is reused with bounded R2 sources:
 
@@ -13,7 +13,7 @@ A request uses ingest-only mode only when the direct response covers the complet
 - Live AQI is calculated only for R2-missing eligible hours, using the shared AQI library.
 - AQI and observation historical boundaries and completeness states remain independent.
 
-Partial or gap-bearing responses use `Cache-Control: no-store`. Diagnostics report counts, boundaries, completeness, and overlap/mismatch totals but never observation values.
+Partial or gap-bearing responses use `Cache-Control: no-store`. Diagnostics report counts, boundaries, RPC window/HTTP attempt metadata, completeness, and overlap/mismatch totals but never observation values.
 
 ## Configuration
 

@@ -45,17 +45,30 @@ function observationRows(startIso, count) {
   return Array.from({ length: count }, (_, index) => ({ timeseries_id: 7, connector_id: 2, station_id: 9, pollutant_code: "pm25", observed_at_utc: new Date(startMs + index * HOUR_MS).toISOString(), value: 20 }));
 }
 
+function rpcPayload(rows) {
+  return [{
+    timeseries_id: 7,
+    window: "7d",
+    start: "2026-06-30T00:00:00.000Z",
+    end: "2026-07-08T00:00:00.000Z",
+    count: rows.length,
+    guideline: { source: "WHO" },
+    data: rows.map((row) => ({ observed_at: row.observed_at_utc, value: row.value })),
+  }];
+}
+
 async function longRequest({ incompleteIngest = false, r2MissingIndex = 167, missingObservationIndex = incompleteIngest ? 190 : -1 } = {}) {
   const originalFetch = globalThis.fetch;
   const targets = [];
   const headStart = "2026-07-01T00:00:00.000Z";
   const end = "2026-07-08T00:00:00.000Z";
-  globalThis.fetch = async (input) => {
+  globalThis.fetch = async (input, init = {}) => {
     const url = String(input); targets.push(url);
-    if (url.includes("uk_aq_observations")) {
+    if (url.includes("uk_aq_timeseries_rpc")) {
       const contextStart = "2026-06-30T01:00:00.000Z";
       const rows = observationRows(contextStart, 191).filter((_row, index) => index !== missingObservationIndex);
-      return new Response(JSON.stringify(rows), { status: 200 });
+      assert.equal(init.method, "POST");
+      return new Response(JSON.stringify(rpcPayload(rows)), { status: 200 });
     }
     if (url.includes("aqi-r2.example")) {
       return new Response(JSON.stringify({ points: r2Rows(headStart, 168, r2MissingIndex), response_complete: true, coverage: { r2_expected_hour_coverage: { complete: r2MissingIndex < 0 } } }), { status: 200 });
@@ -84,10 +97,10 @@ test("stable head has one row per hour and later chunks can only extend backward
 test("one bounded PM ingest bundle supplies the stable head observations and live R2 gap", async () => {
   const result = await longRequest();
   assert.equal(result.targets.length, 3);
-  assert.match(result.targets[0], /uk_aq_observations/);
+  assert.match(result.targets[0], /uk_aq_timeseries_rpc/);
   assert.match(result.targets[1], /aqi-r2\.example/);
   assert.match(result.targets[2], /observs-r2\.example/);
-  assert.match(result.targets[0], /observed_at_utc=gte\.2026-06-30T01%3A00%3A00.000Z/);
+  assert.doesNotMatch(result.targets[0], /uk_aq_observations|observed_at_utc=/);
   assert.equal(result.body.aqi.source_counts.live_calculated, 1);
   assert.equal(result.body.aqi.rows.at(-1).source, "live_calculated");
   assert.equal(result.body.observations.rows.length, 168);
@@ -111,8 +124,8 @@ test("complete R2 AQI remains complete when unrelated recent observations are in
 
 test("R2 claiming complete coverage with an incomplete response fails closed", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input) => String(input).includes("uk_aq_observations")
-    ? new Response(JSON.stringify(observationRows("2026-06-30T01:00:00.000Z", 191)), { status: 200 })
+  globalThis.fetch = async (input) => String(input).includes("uk_aq_timeseries_rpc")
+    ? new Response(JSON.stringify(rpcPayload(observationRows("2026-06-30T01:00:00.000Z", 191))), { status: 200 })
     : new Response(JSON.stringify({ points: [], response_complete: false, coverage: { r2_expected_hour_coverage: { complete: true } } }), { status: 200 });
   try {
     const request = { timeseriesId: 7, connectorId: 2, stationId: 9, pollutant: "pm25", startMs: Date.parse("2026-06-24T00:00:00.000Z"), endMs: Date.parse("2026-07-08T00:00:00.000Z"), contextHours: 23, contextStartMs: Date.parse("2026-06-23T01:00:00.000Z"), includeAqi: true, window: "14d" };

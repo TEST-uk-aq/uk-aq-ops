@@ -184,6 +184,12 @@ function directDiagnostics(direct, outputRows) {
     output_ingest_row_count: outputRows.filter((row) => row.source === "ingest").length,
     ingest_source_path: direct.source_path,
     ingest_fetch_count: direct.fetch_count,
+    logical_ingest_fetch_count: direct.logical_fetch_count,
+    ingest_http_attempt_count: direct.http_attempt_count,
+    ingest_rpc_window_label: direct.rpc_window_label,
+    ingest_rpc_window_start_utc: direct.rpc_window_start_utc,
+    ingest_rpc_window_end_utc: direct.rpc_window_end_utc,
+    ingest_rpc_window_covers_required_start: direct.rpc_window_covers_required_start,
   };
 }
 
@@ -212,7 +218,7 @@ function buildIngestOnlyResponse(request, direct, capability) {
     aqi: request.includeAqi
       ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_aqi_chunk_end_utc: null, stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only", source_counts: { r2: 0, live_calculated: aqiRows.length }, overlap_count: 0, mismatch_count: 0, mismatch_hours: [] }
       : disabledAqiSection(),
-    observations: { rows: observations, guideline: null, response_complete: observationComplete, has_gap: !observationComplete, gap_ranges: capability.observationGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_observation_chunk_end_utc: null, source_counts: { r2: 0, ingest: observations.length }, discarded_ingest_overlap_count: 0 },
+    observations: { rows: observations, guideline: direct.guideline, response_complete: observationComplete, has_gap: !observationComplete, gap_ranges: capability.observationGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_observation_chunk_end_utc: null, source_counts: { r2: 0, ingest: observations.length }, discarded_ingest_overlap_count: 0 },
   };
 }
 
@@ -307,7 +313,7 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
       source_counts: { r2: r2AqiRows.length, live_calculated: liveRows.length }, overlap_count: mergedAqi.overlap_count, mismatch_count: mergedAqi.mismatch_count, mismatch_hours: mergedAqi.mismatch_hours,
     } : disabledAqiSection(),
     observations: {
-      rows: outputObservations, guideline: null, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: observationGaps,
+      rows: outputObservations, guideline: direct.guideline, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: observationGaps,
       stable_head_start_utc: observationHeadStartUtc, stable_head_end_utc: new Date(request.endMs).toISOString(),
       next_chunk_end_utc: observationBounds.headStartMs > request.startMs ? observationHeadStartUtc : null,
       next_older_observation_chunk_end_utc: observationBounds.headStartMs > request.startMs ? observationHeadStartUtc : null,
@@ -325,7 +331,7 @@ export async function buildStationSeries(request, env, nowMs = Date.now()) {
   const retentionStartMs = nowMs - policy.ingestRetentionDays * DAY_MS;
   const latestPossibleStartMs = request.endMs - HOUR_MS;
   const directStartMs = Math.min(Math.max(requiredStartMs, retentionStartMs), latestPossibleStartMs);
-  const direct = await readDirectIngestObservations({ env, identity: request, startMs: directStartMs, endMs: request.endMs, timeoutMs: policy.obsAqiDbTimeoutMs });
+  const direct = await readDirectIngestObservations({ env, identity: request, startMs: directStartMs, endMs: request.endMs, nowMs, timeoutMs: policy.obsAqiDbTimeoutMs });
   const capability = ingestCapability({ request, direct, aqiBounds, observationBounds, retentionStartMs });
   if (capability.qualifies) return buildIngestOnlyResponse(request, direct, capability);
   return buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds);

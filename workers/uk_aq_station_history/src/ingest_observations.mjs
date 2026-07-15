@@ -1,10 +1,10 @@
 import { normalizePollutantCode } from "../../../lib/aqi/aqi_levels.mjs";
 
 const DEFAULT_SCHEMA = "uk_aq_public";
-const DEFAULT_PATH = "uk_aq_observations";
-const MAX_DIRECT_ROWS = 100_000;
+const RPC_PATH = "rpc/uk_aq_timeseries_rpc";
 const MAX_DIAGNOSTIC_TEXT_LENGTH = 512;
 const SERVICE = "obsaqidb_postgrest";
+const MAX_RPC_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 function required(value) { return String(value ?? "").trim(); }
 
@@ -59,6 +59,20 @@ function safePostgrestFields(payload, fallbackMessage) {
   };
 }
 
+function isUnsupportedRpcSignature(fields) {
+  const message = `${fields.safeMessage ?? ""} ${fields.safeDetails ?? ""}`.toLowerCase();
+  return fields.postgrestCode === "PGRST202"
+    || (message.includes("could not find the function") && message.includes("uk_aq_timeseries_rpc"));
+}
+
+export function selectDirectIngestWindowLabel(startMs, nowMs = Date.now()) {
+  const spanHours = (nowMs - startMs) / (60 * 60 * 1000);
+  if (!Number.isFinite(spanHours) || spanHours > 24 * 7) return "30d";
+  if (spanHours <= 12) return "12h";
+  if (spanHours <= 24) return "24h";
+  return "7d";
+}
+
 export class StationHistoryIngestError extends Error {
   constructor({
     code,
@@ -71,6 +85,8 @@ export class StationHistoryIngestError extends Error {
     safeMessage = null,
     safeHint = null,
     safeDetails = null,
+    httpAttemptCount = 0,
+    logicalFetchCount = 1,
   }) {
     super(code);
     this.name = "StationHistoryIngestError";
@@ -79,12 +95,14 @@ export class StationHistoryIngestError extends Error {
     this.failureClass = failureClass;
     this.service = SERVICE;
     this.schema = safeIdentifier(schema, DEFAULT_SCHEMA);
-    this.path = safeIdentifier(path, DEFAULT_PATH);
+    this.path = RPC_PATH;
     this.upstreamStatus = Number.isInteger(upstreamStatus) ? upstreamStatus : null;
     this.postgrestCode = safePostgrestCode(postgrestCode);
     this.safeMessage = sanitizeIngestDiagnosticText(safeMessage);
     this.safeHint = sanitizeIngestDiagnosticText(safeHint);
     this.safeDetails = sanitizeIngestDiagnosticText(safeDetails);
+    this.httpAttemptCount = Number.isInteger(httpAttemptCount) && httpAttemptCount >= 0 ? httpAttemptCount : 0;
+    this.logicalFetchCount = Number.isInteger(logicalFetchCount) && logicalFetchCount >= 0 ? logicalFetchCount : 0;
   }
 
   toSafeDetail() {
@@ -92,6 +110,8 @@ export class StationHistoryIngestError extends Error {
       service: this.service,
       schema: this.schema,
       path: this.path,
+      logical_ingest_fetch_count: this.logicalFetchCount,
+      http_attempt_count: this.httpAttemptCount,
       ...(this.upstreamStatus === null ? {} : { upstream_status: this.upstreamStatus }),
       ...(this.postgrestCode === null ? {} : { postgrest_code: this.postgrestCode }),
       ...(this.safeMessage === null ? {} : { message: this.safeMessage }),
@@ -102,10 +122,7 @@ export class StationHistoryIngestError extends Error {
 }
 
 function sourceContext(env) {
-  return {
-    schema: safeIdentifier(env.UK_AQ_PUBLIC_SCHEMA, DEFAULT_SCHEMA),
-    path: safeIdentifier(env.UK_AQ_OBSAQIDB_OBSERVATIONS_PATH, DEFAULT_PATH),
-  };
+  return { schema: safeIdentifier(env.UK_AQ_PUBLIC_SCHEMA, DEFAULT_SCHEMA), path: RPC_PATH };
 }
 
 function ingestError(input) {
@@ -128,6 +145,8 @@ function logIngestFailure(error, { route, identity, timeoutMs }) {
     safe_hint: error.safeHint,
     failure_class: error.failureClass,
     timeout_ms: timeoutMs,
+    http_attempt_count: error.httpAttemptCount,
+    logical_ingest_fetch_count: error.logicalFetchCount,
   }));
 }
 
@@ -136,22 +155,21 @@ function throwLogged(error, context) {
   throw error;
 }
 
+function optionalIdentityMatches(raw, identity) {
+  const comparisons = [
+    [raw?.timeseries_id, identity.timeseriesId, positiveInt],
+    [raw?.connector_id, identity.connectorId, positiveInt],
+    [raw?.station_id, identity.stationId, positiveInt],
+    [raw?.pollutant_code, identity.pollutant, normalizePollutantCode],
+  ];
+  return comparisons.every(([value, expected, normalizer]) => value === undefined || value === null || normalizer(value) === expected);
+}
+
 export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
   const rows = [];
   let rejected = 0;
   for (const raw of Array.isArray(rawRows) ? rawRows : []) {
-    const rowIdentity = {
-      timeseriesId: positiveInt(raw?.timeseries_id),
-      connectorId: positiveInt(raw?.connector_id),
-      stationId: positiveInt(raw?.station_id),
-      pollutant: normalizePollutantCode(raw?.pollutant_code),
-    };
-    if (
-      rowIdentity.timeseriesId !== identity.timeseriesId
-      || rowIdentity.connectorId !== identity.connectorId
-      || rowIdentity.stationId !== identity.stationId
-      || rowIdentity.pollutant !== identity.pollutant
-    ) {
+    if (!optionalIdentityMatches(raw, identity)) {
       throw ingestError({
         code: "station_series_ingest_identity_mismatch",
         failureClass: "identity_mismatch",
@@ -160,7 +178,7 @@ export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
         safeMessage: "direct observation row identity does not match the authoritative timeseries identity",
       });
     }
-    const observedAt = normalizeTimestamp(raw?.observed_at_utc);
+    const observedAt = normalizeTimestamp(raw?.observed_at ?? raw?.observed_at_utc);
     const value = Number(raw?.value);
     if (!observedAt || !Number.isFinite(value) || value < 0) {
       rejected += 1;
@@ -173,6 +191,7 @@ export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
       pollutant_code: identity.pollutant,
       observed_at: observedAt,
       value,
+      ...(raw?.status === undefined || raw?.status === null ? {} : { status: raw.status }),
       source: "ingest",
     });
   }
@@ -184,14 +203,7 @@ export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
   };
 }
 
-function responseWasTruncated(response, returnedCount) {
-  const contentRange = response.headers.get("Content-Range");
-  const match = /^(\d+)-(\d+)\/(\d+|\*)$/.exec(String(contentRange || "").trim());
-  if (!match || match[3] === "*") return returnedCount >= MAX_DIRECT_ROWS;
-  return Number(match[3]) > returnedCount;
-}
-
-export async function readDirectIngestObservations({ env, identity, startMs, endMs, timeoutMs, route = "/v1/station-series" }) {
+export async function readDirectIngestObservations({ env, identity, startMs, endMs, timeoutMs, nowMs = Date.now(), route = "/v1/station-series" }) {
   const baseUrl = normalizeBaseUrl(env.OBS_AQIDB_SUPABASE_URL);
   const apiKey = required(env.OBS_AQIDB_SECRET_KEY);
   const source = sourceContext(env);
@@ -203,6 +215,7 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
       failureClass: "config",
       ...source,
       safeMessage: "direct observation source configuration is incomplete",
+      logicalFetchCount: 0,
     }), loggingContext);
   }
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
@@ -212,32 +225,39 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
       failureClass: "request_bounds",
       ...source,
       safeMessage: "direct observation request bounds are invalid",
+      logicalFetchCount: 0,
     }), loggingContext);
   }
 
   const startUtc = new Date(startMs).toISOString();
   const endUtc = new Date(endMs).toISOString();
-  const endpoint = new URL(`${baseUrl}/rest/v1/${source.path}`);
-  endpoint.searchParams.set("select", "connector_id,station_id,timeseries_id,pollutant_code,observed_at_utc,value");
-  endpoint.searchParams.set("timeseries_id", `eq.${identity.timeseriesId}`);
-  endpoint.searchParams.set("observed_at_utc", `gte.${startUtc}`);
-  endpoint.searchParams.append("observed_at_utc", `lt.${endUtc}`);
-  endpoint.searchParams.set("order", "observed_at_utc.asc");
-  endpoint.searchParams.set("limit", String(MAX_DIRECT_ROWS));
+  const windowLabel = selectDirectIngestWindowLabel(startMs, nowMs);
+  const rpcWindowCoversRequiredStart = nowMs - startMs <= MAX_RPC_WINDOW_MS;
+  const endpoint = new URL(`${baseUrl}/rest/v1/${RPC_PATH}`);
+  const requestBody = {
+    timeseries_id: identity.timeseriesId,
+    window_label: windowLabel,
+    limit_rows: null,
+    since_ts: null,
+    include_status: false,
+  };
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
     response = await fetch(endpoint.toString(), {
-      method: "GET",
+      method: "POST",
       headers: {
         Accept: "application/json",
+        "Content-Type": "application/json",
         apikey: apiKey,
         Authorization: `Bearer ${apiKey}`,
         "Accept-Profile": source.schema,
+        "Content-Profile": source.schema,
         "x-ukaq-egress-caller": "uk_aq_station_history_worker",
       },
+      body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
   } catch (error) {
@@ -249,6 +269,7 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
       safeMessage: timedOut
         ? "direct observation request timed out"
         : sanitizeIngestDiagnosticText(error?.message, "direct observation network request failed"),
+      httpAttemptCount: 1,
     }), loggingContext);
   } finally {
     clearTimeout(timeout);
@@ -264,6 +285,7 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
       ...source,
       upstreamStatus: response.status,
       safeMessage: sanitizeIngestDiagnosticText(error?.message, "direct observation response body could not be read"),
+      httpAttemptCount: 1,
     }), loggingContext);
   }
   let payload = null;
@@ -272,12 +294,13 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
   if (!response.ok) {
     const fields = safePostgrestFields(payload, `upstream HTTP ${response.status}`);
     throwLogged(ingestError({
-      code: "station_series_ingest_http_failed",
-      failureClass: "http",
+      code: isUnsupportedRpcSignature(fields) ? "station_series_ingest_unsupported_rpc_signature" : "station_series_ingest_http_failed",
+      failureClass: isUnsupportedRpcSignature(fields) ? "unsupported_rpc_signature" : "http",
       ...source,
       upstreamStatus: response.status,
       ...fields,
       safeMessage: fields.safeMessage ?? (jsonValid ? `upstream HTTP ${response.status}` : `upstream HTTP ${response.status}; response was not valid JSON`),
+      httpAttemptCount: 1,
     }), loggingContext);
   }
   if (!jsonValid) {
@@ -286,24 +309,38 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
       failureClass: "invalid_json",
       ...source,
       upstreamStatus: response.status,
-      safeMessage: "direct observation response was not valid JSON",
+      safeMessage: "direct observation RPC response was not valid JSON",
+      httpAttemptCount: 1,
     }), loggingContext);
   }
-  if (!Array.isArray(payload)) {
+  if (!Array.isArray(payload) || payload.length < 1 || !payload[0] || typeof payload[0] !== "object") {
     throwLogged(ingestError({
-      code: "station_series_ingest_invalid_shape",
-      failureClass: "invalid_shape",
+      code: "station_series_ingest_invalid_rpc_result_shape",
+      failureClass: "invalid_rpc_result_shape",
       ...source,
       upstreamStatus: response.status,
-      safeMessage: "direct observation response must be a JSON array",
+      safeMessage: "direct observation RPC response must contain a result object",
+      httpAttemptCount: 1,
+    }), loggingContext);
+  }
+  const rpcResult = payload[0];
+  if (!Array.isArray(rpcResult.data)) {
+    throwLogged(ingestError({
+      code: "station_series_ingest_invalid_data_shape",
+      failureClass: "invalid_data_shape",
+      ...source,
+      upstreamStatus: response.status,
+      safeMessage: "direct observation RPC result data must be a JSON array",
+      httpAttemptCount: 1,
     }), loggingContext);
   }
   let normalized;
   try {
-    normalized = normalizeDirectIngestRows(payload, identity, source);
+    normalized = normalizeDirectIngestRows(rpcResult.data, identity, source);
   } catch (error) {
     if (error instanceof StationHistoryIngestError) {
       error.upstreamStatus = response.status;
+      error.httpAttemptCount = 1;
       throwLogged(error, loggingContext);
     }
     throw error;
@@ -313,18 +350,24 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
     return observedAtMs >= startMs && observedAtMs < endMs;
   });
   const rejectedRowCount = normalized.rejected_row_count + (normalized.rows.length - boundedRows.length);
-  const responseComplete = !responseWasTruncated(response, payload.length);
   return {
     rows: boundedRows,
-    response_complete: responseComplete,
-    source_path: `${source.schema}.${source.path}`,
+    guideline: rpcResult.guideline ?? null,
+    response_complete: rpcWindowCoversRequiredStart,
+    source_path: `${source.schema}.${RPC_PATH}`,
     start_utc: startUtc,
     end_utc: endUtc,
+    rpc_window_label: windowLabel,
+    rpc_window_covers_required_start: rpcWindowCoversRequiredStart,
+    rpc_window_start_utc: normalizeTimestamp(rpcResult.start),
+    rpc_window_end_utc: normalizeTimestamp(rpcResult.end),
     fetch_count: 1,
-    raw_row_count: payload.length,
+    logical_fetch_count: 1,
+    http_attempt_count: 1,
+    raw_row_count: rpcResult.data.length,
     normalized_row_count: boundedRows.length,
     rejected_row_count: rejectedRowCount,
   };
 }
 
-export { DEFAULT_PATH as DEFAULT_INGEST_OBSERVATIONS_PATH, DEFAULT_SCHEMA as DEFAULT_INGEST_SCHEMA };
+export { DEFAULT_SCHEMA as DEFAULT_INGEST_SCHEMA, RPC_PATH as DIRECT_INGEST_RPC_PATH };
