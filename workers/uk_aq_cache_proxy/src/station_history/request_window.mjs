@@ -76,6 +76,18 @@ export function isTimeseriesV2Request(url, upstreamFunction, flags, timeseriesUp
     && String(url.searchParams.get("v") ?? "").trim() === TIMESERIES_V2_VERSION;
 }
 
+export function isProgressiveStationHistoryChunkRequest(url) {
+  const startMs = parseIsoMsOrNull(url.searchParams.get("start_utc") || url.searchParams.get("from_utc"));
+  const endMs = parseIsoMsOrNull(url.searchParams.get("end_utc") || url.searchParams.get("to_utc"));
+  const stableHeadStartMs = parseIsoMsOrNull(url.searchParams.get("stable_head_start_utc"));
+  return startMs !== null
+    && endMs !== null
+    && stableHeadStartMs !== null
+    && endMs > startMs
+    && endMs <= stableHeadStartMs
+    && endMs - startMs <= 31 * 24 * 60 * 60 * 1000;
+}
+
 export function canonicalizeTimeseriesV2RequestUrl(url, allowCacheBypassParams) {
   const original = new URL(url.toString());
   const strippedCacheBusters = [];

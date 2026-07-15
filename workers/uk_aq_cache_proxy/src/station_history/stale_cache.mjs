@@ -107,11 +107,14 @@ export function inspectCompleteGapFreePayload(payload, internalRoute) {
   if (internalRoute === "/v1/station-series") {
     const aqi = payload.aqi;
     const observations = payload.observations;
+    const aqiComplete = isObject(aqi) && (
+      (aqi.enabled === false && aqi.state === "disabled" && !hasKnownGap(aqi))
+      || (aqi.enabled !== false && aqi.response_complete === true && !hasKnownGap(aqi))
+    );
     const cacheable = isObject(aqi)
       && isObject(observations)
-      && aqi.response_complete === true
+      && aqiComplete
       && observations.response_complete === true
-      && !hasKnownGap(aqi)
       && !hasKnownGap(observations);
     return { cacheable, immutable: false, reason: cacheable ? null : "incomplete_or_gap" };
   }
