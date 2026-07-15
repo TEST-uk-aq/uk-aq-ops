@@ -20,12 +20,27 @@ jobs:
       UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Cloudflare credentials
+      - name: Validate station-history deployment configuration
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
+          OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
+          OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY || '' }}
+          UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+          UK_AQ_AQI_HISTORY_R2_API_URL: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_URL || '' }}
+          UK_AQ_OBSERVS_HISTORY_R2_API_URL: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL || '' }}
         run: |
           set -euo pipefail
           test -n "${UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID}" || { echo "Missing Cloudflare account ID."; exit 1; }
           test -n "${UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN}" || { echo "Missing Cloudflare API token."; exit 1; }
           test -n "${UK_AQ_STATION_HISTORY_WORKER_NAME}" || { echo "Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME."; exit 1; }
+          test -n "${SUPABASE_URL}" || { echo "Missing required GitHub repository variable SUPABASE_URL."; exit 1; }
+          test -n "${SB_SECRET_KEY}" || { echo "Missing required GitHub repository secret SB_SECRET_KEY."; exit 1; }
+          test -n "${OBS_AQIDB_SUPABASE_URL}" || { echo "Missing required GitHub repository variable OBS_AQIDB_SUPABASE_URL."; exit 1; }
+          test -n "${OBS_AQIDB_SECRET_KEY}" || { echo "Missing required GitHub repository secret OBS_AQIDB_SECRET_KEY."; exit 1; }
+          test -n "${UK_AQ_EDGE_UPSTREAM_SECRET}" || { echo "Missing required GitHub repository secret UK_AQ_EDGE_UPSTREAM_SECRET."; exit 1; }
+          test -n "${UK_AQ_AQI_HISTORY_R2_API_URL}" || { echo "Missing required GitHub repository variable UK_AQ_AQI_HISTORY_R2_API_URL."; exit 1; }
+          test -n "${UK_AQ_OBSERVS_HISTORY_R2_API_URL}" || { echo "Missing required GitHub repository variable UK_AQ_OBSERVS_HISTORY_R2_API_URL."; exit 1; }
       - name: Set data-path Worker secrets
         working-directory: workers/uk_aq_station_history
         env:

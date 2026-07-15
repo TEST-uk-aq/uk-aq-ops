@@ -33,7 +33,28 @@ test("gateway declares the private STATION_HISTORY Service Binding and disabled 
   assert.match(source, /isProgressiveStationHistoryChunkRequest\(url\)/);
   assert.match(source, /useTimeseriesV2Skeleton && stationHistoryInternalRoute !== "\/v1\/observations-history"/);
   assert.match(source, /X-UK-AQ-Station-History-Identity-Error/);
+  assert.match(source, /const responseHeaders = new Headers\(internalResponse\.headers\);/);
+  assert.match(source, /new Response\(internalResponse\.body, \{\s*status: internalResponse\.status,/);
   assert.equal((source.match(/cachedStationSeriesIdentityMatchesRequest/g) || []).length, 2, "fresh and stale station-series hits validate any supplied connector hint");
+});
+
+test("station-history deployment validates every mandatory private data-path setting before secret bulk", async () => {
+  const workflow = await readFile(".github/workflows/uk_aq_station_history_deploy.yml", "utf8");
+  for (const name of [
+    "SUPABASE_URL",
+    "SB_SECRET_KEY",
+    "OBS_AQIDB_SUPABASE_URL",
+    "OBS_AQIDB_SECRET_KEY",
+    "UK_AQ_EDGE_UPSTREAM_SECRET",
+    "UK_AQ_AQI_HISTORY_R2_API_URL",
+    "UK_AQ_OBSERVS_HISTORY_R2_API_URL",
+    "UK_AQ_STATION_HISTORY_WORKER_NAME",
+    "UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID",
+    "UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN",
+  ]) {
+    assert.match(workflow, new RegExp(`test -n "\\$\\{${name}\\}"`));
+  }
+  assert.ok(workflow.indexOf("Validate station-history deployment configuration") < workflow.indexOf("Set data-path Worker secrets"));
 });
 
 test("station-series cache canonicalisation separates observations-only requests", async () => {
