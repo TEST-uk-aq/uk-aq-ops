@@ -1469,6 +1469,289 @@ Return:
 Do not deploy or merge.
 ```
 
+
+# Phase 6b: Integrate station-history loading into the Hex Map chart
+
+## Objective
+
+Update `hex_map/index.html` to use the new station-history loading path.
+
+The Hex Map supports up to four selected observation series but displays AQI bands from only one selected AQI-source sensor. The implementation must therefore:
+
+* load the stable AQI head for the selected AQI-source series;
+* load recent observations for every selected series;
+* render the current AQI head first;
+* render recent observation lines immediately afterwards;
+* extend AQI and observations backwards independently;
+* preserve the current multi-sensor chart behaviour;
+* retain the existing loader as a TEST rollback path.
+
+The standalone Sensors page implementation should be treated as a reference, not copied blindly, because Hex Map has multi-series selection, separate AQI-source selection and more complex in-memory caching.
+
+## VS Code Codex prompt
+
+```text
+Use GPT-5.6 Terra with High reasoning.
+
+Work across these TEST repositories:
+
+1. TEST-uk-aq/TEST-uk-aq-root.github.io
+2. TEST-uk-aq/uk-aq-ops, only if a small station-series contract extension is genuinely required
+
+Implement Phase 6b of the station-history progressive-loading plan.
+
+Primary website file:
+
+hex_map/index.html
+
+Existing shared helper:
+
+station-history-loader.js
+
+Do not deploy.
+Do not alter Cloudflare variables or repository secrets.
+Do not change production.
+Do not remove the current Hex Map loading path.
+Do not merge.
+
+Background:
+
+The standalone `sensors/index.html` page has already been migrated to the
+station-history progressive loader.
+
+The Hex Map chart has not yet been migrated. It still uses its previous
+independent AQI-history and timeseries loading paths.
+
+The Hex Map supports up to four selected sensor series. Only one selected
+series is the AQI-band source.
+
+Goal:
+
+Implement the station-history loader for Hex Map while preserving all existing
+chart, selection, caching and rendering behaviour.
+
+Required loading sequence:
+
+1. Resolve the full requested chart range and fix the x-axis to it.
+2. Request the current station-series head for the selected AQI-source series.
+3. Render the stable AQI head as the first visual data layer.
+4. Render the recent observations returned for that AQI-source series.
+5. Obtain recent observations for every other selected series.
+6. Start older AQI-history chunks for the AQI-source series, newest first.
+7. Start older observation-history chunks for all selected series, newest first.
+8. Allow older AQI and observation loading to proceed independently.
+9. Extend data backwards only.
+10. Never replace an AQI hour already delivered by the stable head.
+
+Do not wait for every historical AQI chunk to finish before starting or
+rendering historical observations.
+
+Multi-series behaviour:
+
+- AQI is requested and rendered only for the selected AQI-source series.
+- Every selected series must receive a recent observation head.
+- Preserve the existing maximum of four selected sensors.
+- Preserve symbol ordering and selected-sensor ordering.
+- Preserve the ability to change which selected sensor supplies the AQI bands.
+- A change to the AQI-source sensor must not unnecessarily refetch complete
+  observation history for unchanged selected series.
+- Adding or removing a secondary selected sensor must not replace or repaint a
+  complete stable AQI head unnecessarily.
+
+Inspect the current station-series contract before implementation.
+
+Preferred design for secondary selected series:
+
+- support an observations-only station-series request such as
+  `include_aqi=false`;
+- it should fetch ingest observations once and return recent observations
+  without performing recent R2 AQI lookup or live AQI calculation;
+- the normal AQI-source request retains the existing full AQI plus observations
+  contract.
+
+Only add this small backend option if the current contract does not already
+provide an equivalent capability.
+
+If adding `include_aqi=false`:
+
+- modify only the minimum necessary files in `TEST-uk-aq/uk-aq-ops`;
+- preserve the existing default behaviour when the parameter is absent;
+- require the same request identity and coverage validation;
+- retain the 12h/24h ingest-only capability check;
+- do not call the R2 AQI Worker;
+- do not calculate DAQI or EAQI;
+- return an explicit AQI-disabled state rather than pretending AQI is complete;
+- preserve cacheability rules for the observation response;
+- add the parameter to canonical cache-key construction so AQI and
+  observations-only responses cannot collide;
+- retain all existing feature flags and rollback behaviour.
+
+Do not use the full AQI station-series operation for secondary sensors as the
+permanent implementation merely to discard their AQI output. A temporary
+fallback is acceptable only when explicitly documented and protected behind
+the existing legacy rollback path.
+
+Recent-first invariant:
+
+- cached historical points may hydrate memory before the network response;
+- older-only cached data must not render ahead of an available current
+  station-series head;
+- render the current stable AQI head first;
+- render current recent observations immediately afterwards;
+- then extend both datasets backwards;
+- when the current request fails, older cached data may be displayed only with
+  an explicit stale/current-data-unavailable state;
+- cached historical data must never appear to represent the current interval.
+
+AQI no-replacement rule:
+
+Use `station-history-loader.js` or an equivalent shared helper so that:
+
+- existing stable-head AQI rows remain authoritative for the current load;
+- later history chunks cannot replace them;
+- equivalent overlap is deduplicated;
+- conflicting overlap is logged as a contract error;
+- the already rendered colour is retained;
+- no last-write-wins AQI merge is introduced.
+
+Observation merge rules:
+
+- deduplicate observation points by exact timestamp and series identity;
+- stable recent ingest observations remain visible while history loads;
+- R2 historical chunks extend backwards;
+- source overlap must not create duplicate line points;
+- retain successful chunks when another series or chunk fails;
+- retry only failed chunks.
+
+Caching:
+
+- add a versioned Hex Map station-history cache contract;
+- do not mistake the old Hex Map cache schema for a complete station-history
+  response;
+- old cache data may be used only as a stale historical seed;
+- preserve current useful in-memory caching;
+- do not refetch complete chunks when rerendering, expanding or changing only
+  the AQI source;
+- keep AQI and observation completeness independently;
+- key observation state per series;
+- key AQI state per AQI-source series, pollutant and requested range;
+- include any observations-only station-series mode in the cache identity.
+
+12-hour and 24-hour behaviour:
+
+- when recent ingest coverage includes the whole requested output plus required
+  PM context, do not request R2 AQI or R2 observations;
+- the AQI-source station-series response supplies stable AQI and recent
+  observations;
+- secondary observations-only station-series responses supply the other recent
+  lines;
+- when all returned next-chunk boundaries are null, make no history requests.
+
+Longer ranges:
+
+- render the stable AQI head before any observation line;
+- render all available recent observation heads immediately after that first
+  AQI paint;
+- start AQI history before observation history;
+- observation history may continue while AQI history is still in flight;
+- process chunks newest first;
+- preserve the fixed full-range x-axis;
+- avoid broad parallel request floods;
+- retain the current global and per-series concurrency protections where
+  compatible.
+
+Preserve all current Hex Map behaviour, including:
+
+- chart mode and map mode transitions;
+- selected sensor limit;
+- symbol assignment;
+- selected AQI source control;
+- chart range selector;
+- tooltip contents and date formatting;
+- DAQI and EAQI visual appearance;
+- WHO guideline rendering;
+- loading indicator;
+- progress bar;
+- sensor list ordering;
+- area and map context;
+- chart metrics;
+- website debug logging;
+- Turnstile/session handling;
+- current local-development behaviour.
+
+Rollback:
+
+Add a TEST-only loader switch using the repository’s existing configuration or
+query-parameter conventions.
+
+The old Hex Map loader must remain available until real TEST operation has
+validated the new multi-series path.
+
+The new path should be the normal TEST default only when that matches the
+current Phase 6 deployment approach. Otherwise leave it disabled by default
+and clearly report the enabling step.
+
+Repository handling:
+
+- inspect the current archive convention before modifying files;
+- archive only files changed by this task;
+- do not overwrite existing archives;
+- do not modify unrelated website or ops files.
+
+Post-implementation checks:
+
+Use the existing test and validation approaches only. Do not introduce a broad
+new test framework.
+
+Add focused checks for:
+
+1. stable AQI head renders before observation lines;
+2. primary AQI-source station-series request;
+3. recent observations for every selected series;
+4. secondary series do not perform unnecessary AQI work;
+5. changing AQI source preserves complete observation caches;
+6. adding/removing a secondary series preserves the stable AQI head;
+7. no AQI replacement from older chunks;
+8. conflicting overlap retains the displayed stable-head value;
+9. fixed x-axis throughout progressive loading;
+10. 12h and 24h make no R2 requests when ingest coverage is sufficient;
+11. AQI and observation histories proceed independently after first paint;
+12. one failed series or chunk does not remove successful series;
+13. warm historical cache does not render ahead of current recent data;
+14. failed current request visibly marks cached data as stale;
+15. retries do not duplicate AQI or observation points;
+16. legacy Hex Map loader remains functional through the rollback switch.
+
+After implementation, run:
+
+- the existing website checks;
+- the station-history loader tests;
+- any focused Hex Map loader harness already used by the repository;
+- affected ops tests only if `include_aqi=false` or another backend contract
+  extension was added.
+
+Do not claim functional success from static checks alone. Real chart behaviour
+must be validated after deployment through TEST operations.
+
+Return:
+
+1. whether a backend observations-only extension was required;
+2. exact website and ops files changed;
+3. new Hex Map request sequence;
+4. multi-series state and cache model;
+5. AQI no-replacement implementation;
+6. recent-first rendering implementation;
+7. 12h/24h R2 avoidance;
+8. rollback switch and its default;
+9. checks run and results;
+10. TEST variables or flags that must be enabled;
+11. real operational scenarios still requiring validation;
+12. final commit and pull-request details.
+
+Do not deploy or merge.
+```
+
+
 ---
 
 # Phase 7: Implement explicit fresh and stale cache behaviour

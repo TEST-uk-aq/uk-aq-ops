@@ -3020,11 +3020,7 @@ export default {
       ? timeseriesV2Canonicalized!.url
       : stationHistoryCacheKeys.applyAqiProxyHourlyGenerationCacheComponent(
         canonicalizeLatestSnapshotRequestUrl(
-          stationHistoryCacheKeys.canonicalizeStationSeriesRequestUrl(
-            stationHistoryCacheKeys.canonicalizeAqiHistoryRequestUrl(url, upstreamFunction, EXTERNAL_AQI_HISTORY_UPSTREAM),
-            upstreamFunction,
-            EXTERNAL_STATION_SERIES_UPSTREAM,
-          ),
+          stationHistoryCacheKeys.canonicalizeAqiHistoryRequestUrl(url, upstreamFunction, EXTERNAL_AQI_HISTORY_UPSTREAM),
           upstreamFunction,
         ),
         upstreamFunction,

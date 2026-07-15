@@ -11,17 +11,6 @@ function parseBooleanFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
 }
 
-export function canonicalizeStationSeriesRequestUrl(url, upstreamFunction, stationSeriesUpstream) {
-  const normalized = new URL(url.toString());
-  if (upstreamFunction !== stationSeriesUpstream) return normalized;
-  // The response schema and upstream work differ materially when AQI is
-  // disabled.  Always materialise the default so the two variants can never
-  // share a public gateway cache entry.
-  const includeAqi = !["0", "false", "no", "off"].includes(String(normalized.searchParams.get("include_aqi") ?? "").trim().toLowerCase());
-  normalized.searchParams.set("include_aqi", includeAqi ? "true" : "false");
-  return normalized;
-}
-
 function parseIntInRange(value, fallback, min, max) {
   const normalized = String(value ?? "").trim();
   if (!normalized) return fallback;

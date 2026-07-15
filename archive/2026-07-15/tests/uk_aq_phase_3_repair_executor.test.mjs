@@ -4,8 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import * as arrow from "apache-arrow";
-import * as parquetWasm from "parquet-wasm/esm";
 import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
@@ -26,25 +24,6 @@ const ENV = {
   CFLARE_R2_ACCESS_KEY_ID: "key",
   CFLARE_R2_SECRET_ACCESS_KEY: "secret",
 };
-let parquetWasmInitialized = false;
-
-function observationParquet(rows) {
-  if (!parquetWasmInitialized) {
-    const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
-    const wasmPath = path.resolve(moduleDirectory, "../node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm");
-    parquetWasm.initSync({ module: fs.readFileSync(wasmPath) });
-    parquetWasmInitialized = true;
-  }
-  const table = arrow.tableFromArrays({
-    timeseries_id: rows.map((row) => row.timeseries_id),
-    observed_at_utc: rows.map((row) => new Date(row.observed_at_utc)),
-  });
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const properties = new parquetWasm.WriterPropertiesBuilder()
-    .setCompression(parquetWasm.Compression.UNCOMPRESSED)
-    .build();
-  return Buffer.from(parquetWasm.writeParquet(wasmTable, properties));
-}
 
 function repairAction(overrides = {}) {
   return {
@@ -249,64 +228,6 @@ function pollutant(connectorId, code) {
   });
 }
 
-test("missing observation pollutant manifests are rebuilt from canonical readable parquet evidence", async () => {
-  const o3 = pollutant(1, "o3");
-  const pm25Key = `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=pm25/manifest.json`;
-  const pm25PartKey = pm25Key.replace("manifest.json", "part-00000.parquet");
-  const pm25Part = observationParquet([
-    { timeseries_id: 101, observed_at_utc: `${DAY}T00:01:00.000Z` },
-    { timeseries_id: 101, observed_at_utc: `${DAY}T00:02:00.000Z` },
-    { timeseries_id: 102, observed_at_utc: `${DAY}T00:03:00.000Z` },
-  ]);
-  const connectorKey = `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`;
-  const connector = buildHistoryV2ConnectorManifest({
-    domain: "observations", dayUtc: DAY, connectorId: 1, runId: "fixture", manifestKey: connectorKey,
-    pollutantManifests: [o3], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-  });
-  const dayKey = `${PREFIX}/day_utc=${DAY}/manifest.json`;
-  const day = buildHistoryV2DayManifest({
-    domain: "observations", dayUtc: DAY, runId: "fixture", manifestKey: dayKey,
-    connectorManifests: [connector], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-  });
-  const objects = {
-    [o3.manifest_key]: JSON.stringify(o3, null, 2),
-    [pm25PartKey]: pm25Part,
-    [connectorKey]: JSON.stringify(connector, null, 2),
-    [dayKey]: JSON.stringify(day, null, 2),
-  };
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(objects);
-  try {
-    writeCombinedDropboxFixture(resolver, objects);
-    const output = await runV2ObservationsRepair({
-      env: resolver.env,
-      repairPlan: observationsRepairPlan(repairAction({
-        kind: "observation_pollutant_manifest_repair",
-        connector_id: 1,
-        pollutant_code: "pm25",
-        requires_index_rebuild: false,
-      })),
-    });
-    assert.equal(output.status, "planned", JSON.stringify(output.planning.blocked_scopes));
-    const leaf = output.planning.proposals.find((proposal) => proposal.key === pm25Key);
-    assert.ok(leaf, "the missing leaf manifest must be proposed");
-    const payload = JSON.parse(leaf.proposed_body);
-    assert.equal(payload.grain, null);
-    assert.equal(payload.profile, null);
-    assert.equal(payload.source_row_count, 3);
-    assert.deepEqual(payload.parquet_object_keys, [pm25PartKey]);
-    assert.deepEqual(payload.timeseries_row_counts, { 101: 2, 102: 1 });
-    assert.equal(payload.min_observed_at_utc, `${DAY}T00:01:00.000Z`);
-    assert.equal(payload.max_observed_at_utc, `${DAY}T00:03:00.000Z`);
-    assert.equal(leaf.provenance.source, "parent_manifest_metadata");
-    assert.deepEqual(output.planning.days[0].proposal_keys, [connectorKey, dayKey, pm25Key].sort());
-    assert.equal(fake.puts.size, 0, "a dry run never writes parquet or metadata");
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
 test("shared v2 manifest builders retain explicit observation and AQI grain/profile contracts", () => {
   const observationManifest = pollutant(1, "pm25");
   assert.equal(Object.hasOwn(observationManifest, "grain"), true);
@@ -348,72 +269,6 @@ function twoConnectorFixture() {
     keys: { c1: staleC1.manifest_key, c2: staleC2.manifest_key, day: staleDay.manifest_key },
   };
 }
-
-test("a live-missing O3 index is proposed even when Dropbox has an identical stale copy", async () => {
-  const indexKey = `history/_index_v2/observations_timeseries/day_utc=${DAY}/connector_id=1/pollutant_code=o3/manifest.json`;
-  const indexBody = JSON.stringify({ source: "fixture", timeseries_row_counts: { 101: 1 } });
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2({});
-  try {
-    writeCombinedDropboxFixture(resolver, { [indexKey]: indexBody });
-    const output = await runV2ObservationsRepair({
-      env: resolver.env,
-      repairPlan: observationsRepairPlan(repairAction({
-        kind: "observation_index_repair",
-        connector_id: 1,
-        pollutant_code: "o3",
-        requires_index_rebuild: true,
-      })),
-      updateIndexes: async ({ r2 }) => {
-        await r2.proposal_sink({ key: indexKey, body: indexBody, content_type: "application/json" });
-        return { status: "planned" };
-      },
-    });
-    const proposal = output.planning.proposals.find((candidate) => candidate.key === indexKey);
-    assert.ok(proposal);
-    assert.equal(proposal.old_sha256, null, "Dropbox must not provide the live target baseline");
-    assert.equal(proposal.changed, true, "a missing live index cannot be skipped as unchanged");
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
-test("day repairs preserve live connector siblings and expose Dropbox inventory drift", async () => {
-  const fixture = twoConnectorFixture();
-  const c3pm25 = pollutant(3, "pm25");
-  const c3 = buildHistoryV2ConnectorManifest({
-    domain: "observations", dayUtc: DAY, connectorId: 3, runId: "live", manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=3/manifest.json`,
-    pollutantManifests: [c3pm25], writerGitSha: "live", backedUpAtUtc: "2026-05-18T01:00:00.000Z",
-  });
-  const liveObjects = {
-    ...fixture.objects,
-    [c3pm25.manifest_key]: JSON.stringify(c3pm25, null, 2),
-    [c3.manifest_key]: JSON.stringify(c3, null, 2),
-  };
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(liveObjects);
-  try {
-    writeCombinedDropboxFixture(resolver, fixture.objects);
-    const output = await runV2ObservationsRepair({
-      env: resolver.env,
-      repairPlan: observationsRepairPlan(repairAction({
-        kind: "observation_day_manifest_repair",
-        connector_id: null,
-        pollutant_code: null,
-        requires_index_rebuild: false,
-      })),
-    });
-    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
-    const proposal = output.planning.proposals[0];
-    assert.deepEqual(JSON.parse(proposal.proposed_body).connector_ids, [1, 2, 3]);
-    assert.equal(proposal.pre_write_guard.backup_inventory.state, "backup_drift");
-    assert.deepEqual(proposal.pre_write_guard.backup_inventory.unexpected_keys, [c3.manifest_key]);
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
 
 function proposalFromManifest(manifest, kind = "pollutant_manifest") {
   const body = JSON.stringify(manifest);
@@ -699,7 +554,7 @@ test("Phase 6 blocks a connector parent when the fresh child list gains a siblin
     writeCombinedDropboxFixture(resolver, objects);
     const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: observationsRepairPlan() });
     assert.equal(output.status, "failed");
-    assert.match(output.application_failure.error, /concurrent_live_change pollutant child key inventory changed/);
+    assert.match(output.application_failure.error, /child key set changed before parent write/);
     assert.equal(fake.puts.size, 0, "a blocked connector must prevent its own and dependent writes");
   } finally {
     fake.restore();
@@ -729,8 +584,8 @@ test("Phase 6 blocks a day parent when a freshly read child body changes", async
     writeCombinedDropboxFixture(resolver, objects);
     const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: observationsRepairPlan() });
     assert.equal(output.status, "failed");
-    assert.match(output.application_failure.error, /concurrent_live_change connector child content changed/);
-    assert.deepEqual([...fake.puts.keys()], [], "the full-plan preflight blocks every write when a day child changes");
+    assert.match(output.application_failure.error, /child body changed before parent write/);
+    assert.deepEqual([...fake.puts.keys()], [staleConnector.manifest_key], "the changed day child blocks the day parent after the independent connector write");
     assert.equal(fake.puts.has(staleDay.manifest_key), false);
   } finally {
     fake.restore();
@@ -830,16 +685,15 @@ test("Phase 4 write gate requires the CIC-Test environment and bucket before R2 
       await assert.rejects(runV2ObservationsRepair({ argv: ["--write-r2"], env: { ...resolver.env, ...env }, repairPlan: plan }), expected, name);
     });
   }
-  const fake = installFakeR2({});
-  try {
+  await assertNoR2Access(async () => {
     const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: plan });
     assert.equal(output.status, "blocked_dependency");
     assert.equal(output.write_r2, true);
-    const overridden = await runV2ObservationsRepair({ argv: ["--write-r2"], env: { ...resolver.env, CFLARE_R2_BUCKET: "uk-aq-history-live", R2_BUCKET: "uk-aq-history-cic-test" }, repairPlan: plan });
-    assert.equal(overridden.status, "blocked_dependency");
-  } finally {
-    fake.restore();
-  }
+  });
+  await assertNoR2Access(async () => {
+    const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: { ...resolver.env, CFLARE_R2_BUCKET: "uk-aq-history-live", R2_BUCKET: "uk-aq-history-cic-test" }, repairPlan: plan });
+    assert.equal(output.status, "blocked_dependency");
+  });
   } finally {
     resolver.cleanup();
   }

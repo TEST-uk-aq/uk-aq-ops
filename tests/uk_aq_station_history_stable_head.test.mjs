@@ -55,8 +55,8 @@ async function longRequest({ incompleteIngest = false } = {}) {
     if (targets.length === 1) {
       return new Response(JSON.stringify({ points: r2Rows(headStart, 168, 167), response_complete: true, coverage: { r2_expected_hour_coverage: { complete: false } } }), { status: 200 });
     }
-    const contextStart = "2026-07-07T00:00:00.000Z";
-    const rows = observationRows(contextStart, incompleteIngest ? 23 : 24);
+    const contextStart = "2026-06-30T01:00:00.000Z";
+    const rows = observationRows(contextStart, incompleteIngest ? 190 : 191);
     return new Response(JSON.stringify({ data: rows, response_complete: !incompleteIngest }), { status: 200 });
   };
   try {
@@ -74,13 +74,14 @@ test("stable head has one row per hour and later chunks can only extend backward
   assert.equal(result.body.aqi.next_older_aqi_chunk_end_utc, result.body.aqi.stable_head_start_utc);
 });
 
-test("PM context crosses the R2/live boundary and only two source calls occur", async () => {
+test("one bounded PM ingest bundle supplies the stable head observations and live R2 gap", async () => {
   const result = await longRequest();
   assert.equal(result.targets.length, 2);
   assert.match(result.targets[0], /aqi-r2\.example/);
-  assert.match(result.targets[1], /start_utc=2026-07-07T00%3A00%3A00.000Z/);
+  assert.match(result.targets[1], /start_utc=2026-06-30T01%3A00%3A00.000Z/);
   assert.equal(result.body.aqi.source_counts.live_calculated, 1);
   assert.equal(result.body.aqi.rows.at(-1).source, "live_calculated");
+  assert.equal(result.body.observations.rows.length, 168);
 });
 
 test("incomplete live source leaves the stable head unlocked and uncacheable", async () => {
