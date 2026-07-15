@@ -18,6 +18,7 @@ test("gateway declares the private STATION_HISTORY Service Binding and disabled 
   assert.equal((cacheWorkflow.match(/deploy --config wrangler\.deploy\.toml --name/g) || []).length, 2, "base and final cache deployments use the same resolved binding config");
   assert.match(stationWorkflow, /UK_AQ_STATION_HISTORY_WORKER_NAME: \$\{\{ vars\.UK_AQ_STATION_HISTORY_WORKER_NAME \|\| '' \}\}/);
   assert.match(stationWorkflow, /Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME/);
+  assert.match(stationWorkflow, /SB_SECRET_KEY/);
   assert.match(source, /UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED/);
   assert.match(source, /UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED/);
   assert.match(source, /station_history_internal_fetch_failed/);
@@ -25,6 +26,8 @@ test("gateway declares the private STATION_HISTORY Service Binding and disabled 
   assert.match(source, /usingExternalAqiHistoryUpstream[\s\S]*?"\/v1\/aqi-history"/);
   assert.match(source, /TIMESERIES_UPSTREAM_FUNCTION[\s\S]*?"\/v1\/observations-history"/);
   assert.match(source, /useTimeseriesV2Skeleton && !stationHistoryRouting\.timeseries/);
+  assert.match(source, /X-UK-AQ-Station-History-Identity-Error/);
+  assert.equal((source.match(/cachedStationSeriesIdentityMatchesRequest/g) || []).length, 2, "fresh and stale station-series hits validate any supplied connector hint");
 });
 
 test("station-series cache canonicalisation separates observations-only requests", async () => {

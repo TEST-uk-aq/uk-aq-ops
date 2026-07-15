@@ -45,12 +45,17 @@ function observationRows(startIso, count) {
   return Array.from({ length: count }, (_, index) => ({ timeseries_id: 7, connector_id: 2, station_id: 9, pollutant_code: "pm25", observed_at: new Date(startMs + index * HOUR_MS).toISOString(), value: 20 }));
 }
 
+function identityResponse() {
+  return new Response(JSON.stringify([{ id: 7, station_id: 9, connector_id: 2, phenomenon_id: 4, ended_at: null, phenomena: { connector_id: 2, observed_property_id: 5, observed_properties: { code: "pm25" } } }]), { status: 200 });
+}
+
 async function longRequest({ incompleteIngest = false, r2MissingIndex = 167, missingObservationIndex = incompleteIngest ? 190 : -1 } = {}) {
   const originalFetch = globalThis.fetch;
   const targets = [];
   const headStart = "2026-07-01T00:00:00.000Z";
   const end = "2026-07-08T00:00:00.000Z";
   globalThis.fetch = async (input) => {
+    if (String(input).includes("/rest/v1/timeseries")) return identityResponse();
     targets.push(String(input));
     if (targets.length === 1) {
       return new Response(JSON.stringify({ points: r2Rows(headStart, 168, r2MissingIndex), response_complete: true, coverage: { r2_expected_hour_coverage: { complete: r2MissingIndex < 0 } } }), { status: 200 });
@@ -60,7 +65,7 @@ async function longRequest({ incompleteIngest = false, r2MissingIndex = 167, mis
     return new Response(JSON.stringify({ data: rows, response_complete: !incompleteIngest }), { status: 200 });
   };
   try {
-    const response = await worker.fetch(new Request(`https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=${encodeURIComponent(headStart)}&end_utc=${encodeURIComponent(end)}&window=7d&format=objects`), { SUPABASE_URL: "https://ingest.example", SB_PUBLISHABLE_DEFAULT_KEY: "key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history" });
+    const response = await worker.fetch(new Request(`https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=${encodeURIComponent(headStart)}&end_utc=${encodeURIComponent(end)}&window=7d&format=objects`), { SUPABASE_URL: "https://ingest.example", SB_PUBLISHABLE_DEFAULT_KEY: "key", SB_SECRET_KEY: "service-key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history" });
     return { response, body: await response.json(), targets };
   } finally { globalThis.fetch = originalFetch; }
 }
@@ -102,9 +107,11 @@ test("complete R2 AQI remains complete when unrelated recent observations are in
 
 test("R2 claiming complete coverage with an incomplete response fails closed", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ points: [], response_complete: false, coverage: { r2_expected_hour_coverage: { complete: true } } }), { status: 200 });
+  globalThis.fetch = async (input) => String(input).includes("/rest/v1/timeseries")
+    ? identityResponse()
+    : new Response(JSON.stringify({ points: [], response_complete: false, coverage: { r2_expected_hour_coverage: { complete: true } } }), { status: 200 });
   try {
-    const response = await worker.fetch(new Request("https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=2026-07-01T00%3A00%3A00.000Z&end_utc=2026-07-08T00%3A00%3A00.000Z&window=7d&format=objects"), { UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history" });
+    const response = await worker.fetch(new Request("https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=2026-07-01T00%3A00%3A00.000Z&end_utc=2026-07-08T00%3A00%3A00.000Z&window=7d&format=objects"), { SUPABASE_URL: "https://ingest.example", SB_SECRET_KEY: "service-key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history" });
     assert.equal(response.status, 502);
     assert.equal(response.headers.get("Cache-Control"), "no-store");
     assert.equal((await response.json()).error.code, "station_series_r2_claimed_complete_response_incomplete");

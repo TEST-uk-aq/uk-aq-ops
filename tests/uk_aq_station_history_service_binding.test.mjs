@@ -5,6 +5,7 @@ import worker from "../workers/uk_aq_station_history/src/index.mjs";
 const env = {
   SUPABASE_URL: "https://ingest.example",
   SB_PUBLISHABLE_DEFAULT_KEY: "publishable",
+  SB_SECRET_KEY: "service-key",
   UK_AQ_EDGE_UPSTREAM_SECRET: "upstream-secret",
   UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi.example/v1/aqi-history",
 };
@@ -21,6 +22,9 @@ test("private Worker preserves the AQI history query and adds contract diagnosti
   let target;
   let headers;
   globalThis.fetch = async (input, init) => {
+    if (String(input).includes("/rest/v1/timeseries")) {
+      return new Response(JSON.stringify([{ id: 7, station_id: 9, connector_id: 2, phenomenon_id: 4, ended_at: null, phenomena: { connector_id: 2, observed_property_id: 5, observed_properties: { code: "pm25" } } }]), { status: 200 });
+    }
     target = String(input);
     headers = new Headers(init.headers);
     return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });

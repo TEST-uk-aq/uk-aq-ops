@@ -21,6 +21,12 @@ import {
   buildTsv,
   parseHistoryChunkRequest,
 } from "./history_chunks.mjs";
+import {
+  applyAuthoritativeTimeseriesIdentity,
+  publicTimeseriesIdentity,
+  resolveAuthoritativeTimeseriesIdentity,
+  StationHistoryIdentityError,
+} from "./identity.mjs";
 
 const CONTRACT_VERSION = "v1";
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
@@ -96,10 +102,11 @@ function sourceRowsCoverAqiContext(rows, hours, contextHours) {
 
 export function resolveStationSeriesRequest(url) {
   const timeseriesId = parsePositiveInt(url.searchParams.get("timeseries_id"));
-  const connectorId = parsePositiveInt(url.searchParams.get("connector_id"));
+  const connectorIdText = required(url.searchParams.get("connector_id"));
+  const connectorId = connectorIdText ? parsePositiveInt(connectorIdText) : null;
   const pollutant = normalizePollutantCode(url.searchParams.get("pollutant"));
   const bounds = parseBounds(url);
-  if (!timeseriesId || !connectorId || !pollutant || !bounds) return null;
+  if (!timeseriesId || (connectorIdText && !connectorId) || !pollutant || !bounds) return null;
   const includeAqi = parseIncludeAqi(url.searchParams.get("include_aqi"));
   const contextHours = includeAqi && (pollutant === "pm25" || pollutant === "pm10") ? 23 : 0;
   return {
@@ -109,6 +116,29 @@ export function resolveStationSeriesRequest(url) {
     window: String(url.searchParams.get("window") ?? "").trim() || null,
     includeAqi,
   };
+}
+
+function attachAuthoritativeIdentity(body, identity) {
+  const authoritative = publicTimeseriesIdentity(identity);
+  return {
+    ...body,
+    request: {
+      ...body.request,
+      timeseries_id: authoritative.timeseries_id,
+      connector_id: authoritative.connector_id,
+      station_id: authoritative.station_id,
+      pollutant: authoritative.pollutant,
+    },
+    identity: authoritative,
+  };
+}
+
+function identityErrorResponse(error, route) {
+  if (!(error instanceof StationHistoryIdentityError)) return null;
+  const response = errorResponse(error.status, error.code, route, error.detail);
+  const headers = new Headers(response.headers);
+  headers.set("X-UK-AQ-Station-History-Identity-Error", error.code);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 export function buildStationSeriesFromIngest(request, ingestPayload) {
@@ -360,8 +390,15 @@ function chunkHeaders(body) {
 
 async function handleAqiHistoryChunk(request, env) {
   const url = new URL(request.url);
-  const chunk = parseHistoryChunkRequest(url, "aqi");
-  if (!chunk.ok) return errorResponse(chunk.code === "history_chunk_overlaps_stable_head" ? 409 : 400, chunk.code, url.pathname);
+  const parsedChunk = parseHistoryChunkRequest(url, "aqi");
+  if (!parsedChunk.ok) return errorResponse(parsedChunk.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsedChunk.code, url.pathname);
+  let chunk;
+  try {
+    const identity = await resolveAuthoritativeTimeseriesIdentity(parsedChunk, env);
+    chunk = applyAuthoritativeTimeseriesIdentity(parsedChunk, identity);
+  } catch (error) {
+    return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname);
+  }
   const baseUrl = required(env.UK_AQ_AQI_HISTORY_R2_API_URL);
   const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) return errorResponse(500, "internal_aqi_history_config_missing", url.pathname);
@@ -395,8 +432,15 @@ async function handleAqiHistoryChunk(request, env) {
 
 async function handleObservationHistoryChunk(request, env) {
   const url = new URL(request.url);
-  const chunk = parseHistoryChunkRequest(url, "observations");
-  if (!chunk.ok) return errorResponse(chunk.code === "history_chunk_overlaps_stable_head" ? 409 : 400, chunk.code, url.pathname);
+  const parsedChunk = parseHistoryChunkRequest(url, "observations");
+  if (!parsedChunk.ok) return errorResponse(parsedChunk.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsedChunk.code, url.pathname);
+  let chunk;
+  try {
+    const identity = await resolveAuthoritativeTimeseriesIdentity(parsedChunk, env);
+    chunk = applyAuthoritativeTimeseriesIdentity(parsedChunk, identity);
+  } catch (error) {
+    return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname);
+  }
   const baseUrl = required(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL);
   const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) return errorResponse(500, "internal_observation_history_config_missing", url.pathname);
@@ -429,15 +473,20 @@ export default {
     const stationRequest = resolveStationSeriesRequest(url);
     if (!stationRequest) return errorResponse(400, "station_series_request_invalid", url.pathname);
     try {
-      const shortWindow = stationRequest.window === "12h" || stationRequest.window === "24h";
+      const identity = await resolveAuthoritativeTimeseriesIdentity(stationRequest, env);
+      const authoritativeRequest = applyAuthoritativeTimeseriesIdentity(stationRequest, identity);
+      const shortWindow = authoritativeRequest.window === "12h" || authoritativeRequest.window === "24h";
       const body = !stationRequest.includeAqi && !shortWindow
-        ? await buildObservationOnlyStationSeries(stationRequest, env)
+        ? await buildObservationOnlyStationSeries(authoritativeRequest, env)
         : shortWindow
-          ? buildStationSeriesFromIngest(stationRequest, await fetchIngestOnce(stationRequest, env))
-          : await buildLongStationSeries(stationRequest, env);
-      const complete = (!stationRequest.includeAqi || body.aqi.response_complete) && body.observations.response_complete;
-      return new Response(JSON.stringify(body), { status: 200, headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": body.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(body.source.ingest_fetch_count) }) });
+          ? buildStationSeriesFromIngest(authoritativeRequest, await fetchIngestOnce(authoritativeRequest, env))
+          : await buildLongStationSeries(authoritativeRequest, env);
+      const responseBody = attachAuthoritativeIdentity(body, identity);
+      const complete = (!authoritativeRequest.includeAqi || responseBody.aqi.response_complete) && responseBody.observations.response_complete;
+      return new Response(JSON.stringify(responseBody), { status: 200, headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": responseBody.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(responseBody.source.ingest_fetch_count) }) });
     } catch (error) {
+      const identityResponse = identityErrorResponse(error, url.pathname);
+      if (identityResponse) return identityResponse;
       return errorResponse(502, error instanceof Error ? error.message : "station_series_failed", url.pathname);
     }
   },

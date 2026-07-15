@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import worker, { resolveStationSeriesRequest } from "../workers/uk_aq_station_history/src/index.mjs";
 
-const env = { SUPABASE_URL: "https://ingest.example", SB_PUBLISHABLE_DEFAULT_KEY: "key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret" };
+const env = { SUPABASE_URL: "https://ingest.example", SB_PUBLISHABLE_DEFAULT_KEY: "key", SB_SECRET_KEY: "service-key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret" };
 const HOUR_MS = 60 * 60 * 1000;
 
 function observations(startIso, hours, pollutant) {
@@ -10,14 +10,29 @@ function observations(startIso, hours, pollutant) {
   return Array.from({ length: hours }, (_, index) => ({ timeseries_id: 7, connector_id: 2, station_id: 9, pollutant_code: pollutant, observed_at: new Date(startMs + index * HOUR_MS).toISOString(), value: 20 }));
 }
 
-async function stationSeries({ pollutant, startIso, endIso, rows, window = "24h", includeAqi = true, guideline = null }) {
+function authoritativeIdentity(pollutant = "pm25") {
+  return [{ id: 7, station_id: 9, connector_id: 2, phenomenon_id: 4, ended_at: null, phenomena: { connector_id: 2, observed_property_id: 5, observed_properties: { code: pollutant } } }];
+}
+
+async function stationSeries({ pollutant, startIso, endIso, rows, window = "24h", includeAqi = true, guideline = null, connectorId = 2 }) {
   const originalFetch = globalThis.fetch;
   let calls = 0;
+  let identityCalls = 0;
   let target = "";
-  globalThis.fetch = async (input) => { calls += 1; target = String(input); return new Response(JSON.stringify({ data: rows, response_complete: true, guideline }), { status: 200 }); };
+  globalThis.fetch = async (input) => {
+    const inputUrl = String(input);
+    if (inputUrl.includes("/rest/v1/timeseries")) {
+      identityCalls += 1;
+      return new Response(JSON.stringify(authoritativeIdentity(pollutant)), { status: 200 });
+    }
+    calls += 1;
+    target = inputUrl;
+    return new Response(JSON.stringify({ data: rows, response_complete: true, guideline }), { status: 200 });
+  };
   try {
-    const response = await worker.fetch(new Request(`https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=${pollutant}&start_utc=${encodeURIComponent(startIso)}&end_utc=${encodeURIComponent(endIso)}&window=${window}&format=objects&include_aqi=${includeAqi}`), env);
-    return { response, body: await response.json(), calls, target };
+    const connectorQuery = connectorId == null ? "" : `&connector_id=${connectorId}`;
+    const response = await worker.fetch(new Request(`https://internal/v1/station-series?timeseries_id=7${connectorQuery}&pollutant=${pollutant}&start_utc=${encodeURIComponent(startIso)}&end_utc=${encodeURIComponent(endIso)}&window=${window}&format=objects&include_aqi=${includeAqi}`), env);
+    return { response, body: await response.json(), calls, identityCalls, target };
   } finally { globalThis.fetch = originalFetch; }
 }
 
@@ -25,10 +40,27 @@ test("NO2 12h station-series uses one ingest-only fetch", async () => {
   const start = "2026-07-01T00:00:00.000Z";
   const result = await stationSeries({ pollutant: "no2", startIso: start, endIso: "2026-07-01T12:00:00.000Z", rows: observations(start, 12, "no2") });
   assert.equal(result.calls, 1);
+  assert.equal(result.identityCalls, 1);
   assert.match(result.target, /ingest\.example/);
   assert.equal(result.body.source.mode, "ingest_only");
   assert.equal(result.body.aqi.rows.length, 12);
   assert.equal(result.body.observations.rows.length, 12);
+});
+
+test("station-series accepts timeseries identity without a browser connector and returns authoritative identity", async () => {
+  const start = "2026-07-01T00:00:00.000Z";
+  const result = await stationSeries({ pollutant: "no2", startIso: start, endIso: "2026-07-01T12:00:00.000Z", rows: observations(start, 12, "no2"), connectorId: null });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.calls, 1);
+  assert.deepEqual(result.body.identity, {
+    source: "authoritative_timeseries_lookup",
+    timeseries_id: 7,
+    connector_id: 2,
+    station_id: 9,
+    pollutant: "no2",
+  });
+  assert.equal(result.body.request.connector_id, 2);
+  assert.equal(result.body.request.station_id, 9);
 });
 
 test("PM 24h requests include 23 context hours but exclude them from output", async () => {
