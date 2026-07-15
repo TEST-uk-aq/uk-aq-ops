@@ -8,10 +8,13 @@ import {
 } from "../workers/uk_aq_cache_proxy/src/station_history/request_window.mjs";
 import {
   applyAqiProxyHourlyGenerationCacheComponent,
+  cachedStationSeriesIdentityMatchesRequest,
   canonicalizeAqiHistoryRequestUrl,
+  canonicalizeStationSeriesRequestUrl,
 } from "../workers/uk_aq_cache_proxy/src/station_history/cache_keys.mjs";
 
 const AQI_UPSTREAM = "__uk_aq_aqi_history_r2_api__";
+const STATION_SERIES_UPSTREAM = "__uk_aq_station_history_service__";
 
 test("station-history request module preserves v2 cache-key canonicalisation", () => {
   const result = canonicalizeTimeseriesV2RequestUrl(
@@ -42,4 +45,49 @@ test("station-history AQI cache module retains hourly and immutable cache keys",
   const canonical = canonicalizeAqiHistoryRequestUrl(recent, AQI_UPSTREAM, AQI_UPSTREAM);
   assert.equal(canonical.searchParams.get("from_utc"), "2026-01-01T00:00:00.000Z");
   assert.equal(canonical.searchParams.get("to_utc"), "2026-01-05T02:00:00.000Z");
+});
+
+test("station-series cache identity is deterministic without trusting the optional connector hint", () => {
+  const withoutConnector = canonicalizeStationSeriesRequestUrl(
+    new URL("https://cache.test/api/aq/station-series?end_utc=2026-07-15T12:00:00Z&timeseries_id=7&pollutant=PM2.5&start_utc=2026-07-14T12:00:00Z&window=24h&format=objects"),
+    STATION_SERIES_UPSTREAM,
+    STATION_SERIES_UPSTREAM,
+  );
+  const matchingHint = canonicalizeStationSeriesRequestUrl(
+    new URL("https://cache.test/api/aq/station-series?connector_id=2&timeseries_id=07&pollutant=pm25&start_utc=2026-07-14T12:00:00.000Z&end_utc=2026-07-15T12:00:00.000Z&window=24h&include_aqi=true"),
+    STATION_SERIES_UPSTREAM,
+    STATION_SERIES_UPSTREAM,
+  );
+  assert.equal(matchingHint.toString(), withoutConnector.toString());
+  assert.equal(withoutConnector.searchParams.has("connector_id"), false);
+  assert.equal(withoutConnector.searchParams.get("__uk_aq_station_series_contract"), "2");
+
+  const otherSeries = canonicalizeStationSeriesRequestUrl(
+    new URL("https://cache.test/api/aq/station-series?timeseries_id=8&pollutant=pm25&start_utc=2026-07-14T12:00:00Z&end_utc=2026-07-15T12:00:00Z&window=24h"),
+    STATION_SERIES_UPSTREAM,
+    STATION_SERIES_UPSTREAM,
+  );
+  const observationsOnly = canonicalizeStationSeriesRequestUrl(
+    new URL("https://cache.test/api/aq/station-series?timeseries_id=7&pollutant=pm25&start_utc=2026-07-14T12:00:00Z&end_utc=2026-07-15T12:00:00Z&window=24h&include_aqi=false"),
+    STATION_SERIES_UPSTREAM,
+    STATION_SERIES_UPSTREAM,
+  );
+  assert.notEqual(otherSeries.toString(), withoutConnector.toString());
+  assert.notEqual(observationsOnly.toString(), withoutConnector.toString());
+});
+
+test("a cached station-series response accepts only a matching supplied connector hint", async () => {
+  const response = new Response(JSON.stringify({ identity: { connector_id: 2 } }), { status: 200 });
+  assert.equal(await cachedStationSeriesIdentityMatchesRequest(
+    response,
+    new URL("https://cache.test/api/aq/station-series?connector_id=2"),
+    STATION_SERIES_UPSTREAM,
+    STATION_SERIES_UPSTREAM,
+  ), true);
+  assert.equal(await cachedStationSeriesIdentityMatchesRequest(
+    response,
+    new URL("https://cache.test/api/aq/station-series?connector_id=3"),
+    STATION_SERIES_UPSTREAM,
+    STATION_SERIES_UPSTREAM,
+  ), false);
 });

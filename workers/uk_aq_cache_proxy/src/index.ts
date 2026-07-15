@@ -3136,6 +3136,21 @@ export default {
       ) {
         cachedResponse = undefined;
       }
+      if (
+        cachedResponse
+        && usingStationSeriesUpstream
+        && !await stationHistoryCacheKeys.cachedStationSeriesIdentityMatchesRequest(
+          cachedResponse,
+          url,
+          upstreamFunction,
+          EXTERNAL_STATION_SERIES_UPSTREAM,
+        )
+      ) {
+        // A cached authoritative response may be shared by connector-free and
+        // matching-hint requests, but a mismatch must reach the private Worker
+        // and receive the explicit contract error.
+        cachedResponse = undefined;
+      }
       if (cachedResponse) {
         if (stationHistoryStaleRequestSupported) {
           cachedResponse = stationHistoryStaleCache.buildFreshHitResponse(cachedResponse);
@@ -3269,8 +3284,15 @@ export default {
     if (stationHistoryInternalRoute && env.STATION_HISTORY) {
       const internalUrl = new URL(`https://station-history.internal${stationHistoryInternalRoute}`);
       internalUrl.search = stationHistoryCacheKeys
-        .stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl)
+        .stripStationSeriesCacheContractComponent(
+          stationHistoryCacheKeys.stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl),
+        )
         .search;
+      if (usingStationSeriesUpstream && url.searchParams.has("connector_id")) {
+        // Preserve the optional browser hint only for authoritative validation;
+        // canonical public cache identity deliberately omits it.
+        internalUrl.searchParams.set("connector_id", String(url.searchParams.get("connector_id") ?? ""));
+      }
       const internalHeaders = new Headers();
       const forwardedConditionalHeaders = stationHistoryStaleRequestSupported
         ? ["Accept"]
@@ -3291,6 +3313,14 @@ export default {
         }
         const storedStale = await cache.match(stationHistoryVersionedKeys.stale);
         if (!storedStale || !stationHistoryStaleCache.isValidStaleCacheResponse(storedStale)) {
+          return null;
+        }
+        if (!await stationHistoryCacheKeys.cachedStationSeriesIdentityMatchesRequest(
+          storedStale,
+          url,
+          upstreamFunction,
+          EXTERNAL_STATION_SERIES_UPSTREAM,
+        )) {
           return null;
         }
         const staleResponse = await stationHistoryStaleCache.buildStaleFallbackResponse(storedStale, reason);
@@ -3317,7 +3347,10 @@ export default {
         if (staleResponse) return staleResponse;
         return makeErrorResponse(502, "station_history_internal_fetch_failed", requestOrigin, allowedOrigins);
       }
-      if (stationHistoryStaleCache.isUpstreamFailureStatus(internalResponse.status)) {
+      if (
+        stationHistoryStaleCache.isUpstreamFailureStatus(internalResponse.status)
+        && !internalResponse.headers.get("X-UK-AQ-Station-History-Identity-Error")
+      ) {
         const staleResponse = await tryStaleFallback(`upstream_status_${internalResponse.status}`);
         if (staleResponse) return staleResponse;
       }

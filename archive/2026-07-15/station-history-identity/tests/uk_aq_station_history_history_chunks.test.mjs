@@ -63,13 +63,8 @@ test("AQI object and compact formats retain the existing columns", () => {
 
 test("AQI and observation upstream failures use independent error contracts", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input) => {
-    if (String(input).includes("/rest/v1/timeseries")) {
-      return new Response(JSON.stringify([{ id: 7, station_id: 9, connector_id: 2, phenomenon_id: 4, ended_at: null, phenomena: { connector_id: 2, observed_property_id: 5, observed_properties: { code: "pm25" } } }]), { status: 200 });
-    }
-    throw new Error(String(input).includes("aqi") ? "aqi down" : "observations down");
-  };
-  const env = { SUPABASE_URL: "https://ingest.example", SB_SECRET_KEY: "service-key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi.example/v1/aqi-history", UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations" };
+  globalThis.fetch = async (input) => { throw new Error(String(input).includes("aqi") ? "aqi down" : "observations down"); };
+  const env = { UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi.example/v1/aqi-history", UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example/v1/observations" };
   try {
     const aqiResponse = await worker.fetch(new Request(chunkUrl("/v1/aqi-history", "2026-07-07T00:00:00.000Z", "2026-07-08T00:00:00.000Z")), env);
     const obsResponse = await worker.fetch(new Request(chunkUrl("/v1/observations-history", "2026-07-07T00:00:00.000Z", "2026-07-08T00:00:00.000Z")), env);
@@ -78,22 +73,4 @@ test("AQI and observation upstream failures use independent error contracts", as
   } finally { globalThis.fetch = originalFetch; }
 });
 
-test("history chunks reject a connector that differs from authoritative timeseries identity", async () => {
-  const originalFetch = globalThis.fetch;
-  let calls = 0;
-  globalThis.fetch = async () => {
-    calls += 1;
-    return new Response(JSON.stringify([{ id: 7, station_id: 9, connector_id: 2, phenomenon_id: 4, ended_at: null, phenomena: { connector_id: 2, observed_property_id: 5, observed_properties: { code: "pm25" } } }]), { status: 200 });
-  };
-  const env = { SUPABASE_URL: "https://ingest.example", SB_SECRET_KEY: "service-key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi.example/v1/aqi-history" };
-  try {
-    const url = chunkUrl("/v1/aqi-history", "2026-07-07T00:00:00.000Z", "2026-07-08T00:00:00.000Z");
-    url.searchParams.set("connector_id", "3");
-    const response = await worker.fetch(new Request(url), env);
-    assert.equal(response.status, 409);
-    assert.equal((await response.json()).error.code, "station_history_connector_mismatch");
-    assert.equal(calls, 1, "R2 is not read after authoritative chunk identity rejection");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
+

@@ -6,20 +6,60 @@ const AQI_HISTORY_START_KEYS = ["from_utc", "start_utc", "from", "start"];
 const AQI_HISTORY_END_KEYS = ["to_utc", "end_utc", "to", "end"];
 const AQI_HISTORY_PROXY_GENERATION_PARAM = "__uk_aq_aqi_proxy_generation_hour";
 const AQI_HISTORY_PROXY_GENERATION_VERSION = "1";
+const STATION_SERIES_PROXY_CONTRACT_PARAM = "__uk_aq_station_series_contract";
+const STATION_SERIES_PROXY_CONTRACT_VERSION = "2";
 
 function parseBooleanFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
 }
 
 export function canonicalizeStationSeriesRequestUrl(url, upstreamFunction, stationSeriesUpstream) {
-  const normalized = new URL(url.toString());
-  if (upstreamFunction !== stationSeriesUpstream) return normalized;
+  const original = new URL(url.toString());
+  if (upstreamFunction !== stationSeriesUpstream) return original;
   // The response schema and upstream work differ materially when AQI is
   // disabled.  Always materialise the default so the two variants can never
   // share a public gateway cache entry.
-  const includeAqi = !["0", "false", "no", "off"].includes(String(normalized.searchParams.get("include_aqi") ?? "").trim().toLowerCase());
+  const includeAqi = !["0", "false", "no", "off"].includes(String(original.searchParams.get("include_aqi") ?? "").trim().toLowerCase());
+  const normalized = new URL(original.origin + original.pathname);
+  const timeseriesId = String(original.searchParams.get("timeseries_id") ?? "").trim();
+  if (/^\d+$/.test(timeseriesId) && Number(timeseriesId) > 0) normalized.searchParams.set("timeseries_id", String(Number(timeseriesId)));
+  const pollutant = String(original.searchParams.get("pollutant") ?? "").trim().toLowerCase().replace(/[\s._-]+/g, "");
+  if (["pm25", "pm10", "no2"].includes(pollutant)) normalized.searchParams.set("pollutant", pollutant);
+  for (const key of ["start_utc", "end_utc"]) {
+    const parsed = parseIsoMsOrNull(original.searchParams.get(key));
+    if (parsed !== null) normalized.searchParams.set(key, new Date(parsed).toISOString());
+  }
+  const window = String(original.searchParams.get("window") ?? "").trim().toLowerCase();
+  if (window) normalized.searchParams.set("window", window);
+  normalized.searchParams.set("format", "objects");
   normalized.searchParams.set("include_aqi", includeAqi ? "true" : "false");
+  normalized.searchParams.set(STATION_SERIES_PROXY_CONTRACT_PARAM, STATION_SERIES_PROXY_CONTRACT_VERSION);
+  // connector_id is a validation hint supplied by the browser. The private
+  // Worker resolves connector authority from timeseries_id, so this hint must
+  // never partition or define the successful public cache identity.
   return normalized;
+}
+
+export function stripStationSeriesCacheContractComponent(url) {
+  const normalized = new URL(url.toString());
+  normalized.searchParams.delete(STATION_SERIES_PROXY_CONTRACT_PARAM);
+  return normalized;
+}
+
+export async function cachedStationSeriesIdentityMatchesRequest(response, requestUrl, upstreamFunction, stationSeriesUpstream) {
+  if (upstreamFunction !== stationSeriesUpstream) return true;
+  const suppliedText = String(requestUrl.searchParams.get("connector_id") ?? "").trim();
+  if (!suppliedText) return true;
+  if (!/^\d+$/.test(suppliedText) || Number(suppliedText) <= 0) return false;
+  let payload;
+  try {
+    payload = await response.clone().json();
+  } catch {
+    return false;
+  }
+  const authoritativeConnectorId = Number(payload?.identity?.connector_id ?? payload?.request?.connector_id);
+  return Number.isInteger(authoritativeConnectorId) && authoritativeConnectorId > 0
+    && authoritativeConnectorId === Number(suppliedText);
 }
 
 function parseIntInRange(value, fallback, min, max) {
