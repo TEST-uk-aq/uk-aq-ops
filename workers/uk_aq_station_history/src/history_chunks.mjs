@@ -22,21 +22,23 @@ function formatName(value) {
   return ["objects", "compact", "json", "tsv"].includes(normalized) ? normalized : null;
 }
 
-export function parseHistoryChunkRequest(url, kind) {
+export function parseHistoryChunkRequest(url, kind, limits = {}) {
   const timeseriesId = positiveInt(url.searchParams.get("timeseries_id"));
   const connectorId = positiveInt(url.searchParams.get("connector_id"));
   const pollutant = normalizePollutantCode(url.searchParams.get("pollutant"));
   const startMs = isoMs(url.searchParams.get("start_utc") || url.searchParams.get("from_utc"));
   const endMs = isoMs(url.searchParams.get("end_utc") || url.searchParams.get("to_utc"));
   const stableHeadStartMs = isoMs(url.searchParams.get("stable_head_start_utc"));
-  const maxHours = kind === "aqi" ? AQI_CHUNK_MAX_HOURS : OBSERVATION_CHUNK_MAX_HOURS;
+  const maxHours = kind === "aqi"
+    ? (limits.aqiChunkMaxHours || AQI_CHUNK_MAX_HOURS)
+    : (limits.observationChunkMaxHours || OBSERVATION_CHUNK_MAX_HOURS);
   const format = kind === "aqi" ? formatName(url.searchParams.get("format") || "compact") : "objects";
   const requestedLimit = positiveInt(url.searchParams.get("limit") || url.searchParams.get("row_limit"));
   if (!timeseriesId || !connectorId || !pollutant || startMs === null || endMs === null || stableHeadStartMs === null || !format) return { ok: false, code: "history_chunk_request_invalid" };
   if (endMs <= startMs || endMs - startMs > maxHours * HOUR_MS) return { ok: false, code: "history_chunk_bounds_invalid" };
   if (endMs > stableHeadStartMs) return { ok: false, code: "history_chunk_overlaps_stable_head" };
   if (requestedLimit && kind === "observations" && requestedLimit > OBSERVATION_CHUNK_MAX_ROWS) return { ok: false, code: "observation_chunk_row_limit_exceeded" };
-  const limit = kind === "aqi" ? Math.min(requestedLimit || maxHours, AQI_CHUNK_MAX_HOURS) : Math.min(requestedLimit || OBSERVATION_CHUNK_MAX_ROWS, OBSERVATION_CHUNK_MAX_ROWS);
+  const limit = kind === "aqi" ? Math.min(requestedLimit || maxHours, maxHours) : Math.min(requestedLimit || OBSERVATION_CHUNK_MAX_ROWS, OBSERVATION_CHUNK_MAX_ROWS);
   const startUtc = new Date(startMs).toISOString();
   const endUtc = new Date(endMs).toISOString();
   const stableHeadStartUtc = new Date(stableHeadStartMs).toISOString();
@@ -130,7 +132,7 @@ export function buildObservationHistoryChunk(chunk, payload, nowMs = Date.now())
     coverage_state: complete ? "complete" : "partial",
     source: "r2_only",
     chunk: chunkFields(chunk, cacheClass),
-    limits: { max_chunk_hours: OBSERVATION_CHUNK_MAX_HOURS, max_rows: OBSERVATION_CHUNK_MAX_ROWS, max_pages: 1, max_r2_object_reads: OBSERVATION_CHUNK_MAX_R2_OBJECT_READS },
+    limits: { max_chunk_hours: chunk.maxHours, max_rows: OBSERVATION_CHUNK_MAX_ROWS, max_pages: 1, max_r2_object_reads: OBSERVATION_CHUNK_MAX_R2_OBJECT_READS },
     partial_reasons: complete ? (Array.isArray(payload?.partial_reasons) ? payload.partial_reasons : []) : Array.from(new Set([...(Array.isArray(payload?.partial_reasons) ? payload.partial_reasons : []), ...(upstreamComplete ? [] : ["upstream_incomplete"]), ...(withinObjectLimit ? [] : ["r2_object_read_limit_exceeded"]), ...(rows.length <= chunk.limit ? [] : ["row_limit_exceeded"])])),
   };
 }

@@ -27,8 +27,8 @@ function normalizeIdentityRow(row, source) {
   return { ...row, timestamp_hour_utc: timestamp, pollutant_code: pollutant, source };
 }
 
-export function resolveStableHeadBounds(request) {
-  const headStartMs = Math.max(request.startMs, request.endMs - STABLE_HEAD_MAX_HOURS * HOUR_MS);
+export function resolveStableHeadBounds(request, maxHours = STABLE_HEAD_MAX_HOURS) {
+  const headStartMs = Math.max(request.startMs, request.endMs - maxHours * HOUR_MS);
   return { headStartMs, headEndMs: request.endMs };
 }
 
