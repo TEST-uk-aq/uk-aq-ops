@@ -396,6 +396,16 @@ hierarchy. Its target index remains live-target based, so a live-missing index
 is always proposed as changed even if Dropbox has identical bytes. Any attempt
 to construct a parent from a non-live, non-staged child is reported as
 `invalid_planned_inventory`, not `concurrent_live_change`.
+Metadata application uses a two-pass whole-plan preflight. It first validates
+every canonical proposal body and staged-child relationship, then probes all
+live dependency inventories. During only that second initial pass, an exact
+child with a validated staged replacement may be read as raw live identity so
+its malformed or absent old body does not block the repair intended to replace
+it. Unstaged children remain fully schema-, SHA-256-, and real-R2-ETag checked.
+The write path has no such relaxation: it writes and GET-verifies the child,
+then the normal parent guard rereads and fully validates that live child before
+the parent PUT. Any proposal or dependency failure in either preflight pass
+keeps the complete plan at zero PUTs, including in dry-run mode.
 Integrity uses a targeted metadata merge, not the full rebuild: it replaces
 only entries identified by `domain`, `day_utc`, `connector_id` and
 `pollutant_code`, preserving unrelated observation and AQI coverage. Missing

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -215,10 +216,11 @@ async function assertNoR2Access(operation) {
   assert.equal(calls, 0, "the executor must reject the input before any R2 request");
 }
 
-function installFakeR2(objects, { beforeRequest = null } = {}) {
+function installFakeR2(objects, { beforeRequest = null, etags: initialEtags = {} } = {}) {
   const originalFetch = globalThis.fetch;
   const puts = new Map();
   const requests = [];
+  const etags = new Map(Object.entries(initialEtags));
   const bodyFor = (key) => puts.get(key) || objects[key];
   const keyFromUrl = (url) => decodeURIComponent(new URL(url).pathname).replace(/^\/[^/]+\//, "");
   globalThis.fetch = async (url, init = {}) => {
@@ -227,17 +229,17 @@ function installFakeR2(objects, { beforeRequest = null } = {}) {
     const prefix = parsed.searchParams.get("prefix") || "";
     const key = keyFromUrl(url);
     requests.push({ method, key, prefix });
-    await beforeRequest?.({ method, key, prefix, objects, puts, requests });
+    await beforeRequest?.({ method, key, prefix, objects, puts, requests, etags });
     if (method === "GET" && parsed.searchParams.get("list-type") === "2") {
       const keys = [...new Set([...Object.keys(objects), ...puts.keys()])].filter((key) => key.startsWith(prefix)).sort();
       return new Response(`<ListBucketResult>${keys.map((key) => `<Contents><Key>${key}</Key><Size>1</Size></Contents>`).join("")}</ListBucketResult>`, { status: 200 });
     }
-    if (method === "HEAD") return bodyFor(key) ? new Response(null, { status: 200 }) : new Response(null, { status: 404 });
-    if (method === "GET") return bodyFor(key) ? new Response(bodyFor(key), { status: 200 }) : new Response("not found", { status: 404 });
-    if (method === "PUT") { puts.set(key, String(init.body)); return new Response("", { status: 200, headers: { etag: `\"${key}\"` } }); }
+    if (method === "HEAD") return bodyFor(key) ? new Response(null, { status: 200, headers: etags.has(key) ? { etag: etags.get(key) } : {} }) : new Response(null, { status: 404 });
+    if (method === "GET") return bodyFor(key) ? new Response(bodyFor(key), { status: 200, headers: etags.has(key) ? { etag: etags.get(key) } : {} }) : new Response("not found", { status: 404 });
+    if (method === "PUT") { puts.set(key, String(init.body)); etags.set(key, `\"${key}\"`); return new Response("", { status: 200, headers: { etag: `\"${key}\"` } }); }
     return new Response("unsupported", { status: 405 });
   };
-  return { puts, requests, restore: () => { globalThis.fetch = originalFetch; } };
+  return { puts, requests, etags, restore: () => { globalThis.fetch = originalFetch; } };
 }
 
 function pollutant(connectorId, code) {
@@ -533,10 +535,321 @@ function proposalFromManifest(manifest, kind = "pollutant_manifest") {
     body,
     bytes: Buffer.byteLength(body),
     changed: true,
+    new_sha256: createHash("sha256").update(body).digest("hex"),
     dependencies: [],
     pre_write_guard: null,
   };
 }
+
+function fourConnectorRepairFixture({ connectorOne = "malformed" } = {}) {
+  const connectorIds = [1, 3, 6, 7];
+  const entries = connectorIds.map((connectorId) => {
+    const child = pollutantForTimeseries(connectorId, "pm25", connectorId);
+    const manifest = buildHistoryV2ConnectorManifest({
+      domain: "observations", dayUtc: DAY, connectorId, runId: "fixture",
+      manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/manifest.json`,
+      pollutantManifests: [child], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+    });
+    return { child, manifest };
+  });
+  const day = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc: DAY, runId: "fixture",
+    manifestKey: `${PREFIX}/day_utc=${DAY}/manifest.json`,
+    connectorManifests: entries.map((entry) => entry.manifest), writerGitSha: "fixture",
+    backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const staleLiveDay = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc: DAY, runId: "stale-fixture",
+    manifestKey: day.manifest_key,
+    connectorManifests: entries.slice(1).map((entry) => entry.manifest), writerGitSha: "stale-fixture",
+    backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const objects = Object.fromEntries([
+    ...entries.map(({ child }) => [child.manifest_key, JSON.stringify(child, null, 2)]),
+    ...entries.filter(({ manifest }) => manifest.connector_id !== 1 || connectorOne !== "missing")
+      .map(({ manifest }) => [
+        manifest.manifest_key,
+        JSON.stringify(manifest.connector_id === 1 && connectorOne === "malformed"
+          ? { ...manifest, grain: "invalid-old-live-grain" }
+          : manifest, null, 2),
+      ]),
+    [day.manifest_key, JSON.stringify(staleLiveDay, null, 2)],
+  ]);
+  return { objects, entries, day };
+}
+
+function stagedConnectorAndDayProposals({ connector, day, liveSibling = null, siblingBody = null }) {
+  const connectorProposal = proposalFromManifest(connector, "connector_manifest");
+  const dayProposal = proposalFromManifest(day, "day_manifest");
+  const expectedChildren = [{
+    key: connector.manifest_key,
+    content_sha256: connectorProposal.new_sha256,
+    r2_etag: null,
+    source: "planned_overlay",
+    staged: true,
+  }];
+  if (liveSibling) {
+    expectedChildren.push({
+      key: liveSibling.manifest_key,
+      content_sha256: createHash("sha256").update(siblingBody).digest("hex"),
+      r2_etag: null,
+      source: "live_r2",
+      staged: false,
+    });
+  }
+  dayProposal.dependencies = expectedChildren.map((child) => child.key);
+  dayProposal.pre_write_guard = {
+    prefix: `${PREFIX}/day_utc=${DAY}/connector_id=`,
+    dayUtc: DAY,
+    connectorId: null,
+    kind: "connector",
+    domain: "observations",
+    expected_children: expectedChildren,
+    expected_inventory_source: "live_r2_snapshot",
+    backup_inventory: null,
+    last_live_inventory: null,
+  };
+  return new Map([
+    [connectorProposal.key, connectorProposal],
+    [dayProposal.key, dayProposal],
+  ]);
+}
+
+test("whole-plan preflight accepts a malformed live connector with a canonical staged replacement", async () => {
+  const fixture = fourConnectorRepairFixture();
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(fixture.objects);
+  try {
+    writeCombinedDropboxFixture(resolver, fixture.objects);
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: observationsRepairPlan(repairAction({
+        kind: "observation_connector_manifest_repair",
+        connector_id: 1,
+        pollutant_code: null,
+        requires_index_rebuild: false,
+      })),
+    });
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
+    const connectorProposal = output.planning.proposals.find((proposal) => proposal.kind === "connector_manifest");
+    const dayProposal = output.planning.proposals.find((proposal) => proposal.kind === "day_manifest");
+    assert.deepEqual(JSON.parse(connectorProposal.proposed_body).pollutant_codes, ["pm25"]);
+    assert.deepEqual(JSON.parse(dayProposal.proposed_body).connector_ids, [1, 3, 6, 7]);
+    assert.equal(output.planning.proposals.some((proposal) => proposal.key.endsWith(".parquet")), false);
+    assert.equal(fake.puts.size, 0, "dry-run preflight must not PUT metadata or parquet");
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+test("whole-plan preflight accepts a missing live child with a canonical staged replacement", async () => {
+  const fixture = fourConnectorRepairFixture({ connectorOne: "missing" });
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(fixture.objects);
+  try {
+    writeCombinedDropboxFixture(resolver, fixture.objects);
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: observationsRepairPlan(repairAction({
+        kind: "observation_connector_manifest_repair",
+        connector_id: 1,
+        pollutant_code: null,
+        requires_index_rebuild: false,
+      })),
+    });
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
+    const dayProposal = output.planning.proposals.find((proposal) => proposal.kind === "day_manifest");
+    assert.deepEqual(JSON.parse(dayProposal.proposed_body).connector_ids, [1, 3, 6, 7]);
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+test("whole-plan preflight accepts an exact staged replacement when no old live children exist", async () => {
+  const child = pollutantForTimeseries(1, "pm25", 1);
+  const connector = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc: DAY, connectorId: 1, runId: "fixture",
+    manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`, pollutantManifests: [child],
+    writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const day = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc: DAY, runId: "fixture", manifestKey: `${PREFIX}/day_utc=${DAY}/manifest.json`,
+    connectorManifests: [connector], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const fake = installFakeR2({});
+  try {
+    const output = await applyStagedProposals({
+      r2: { endpoint: ENV.CFLARE_R2_ENDPOINT, bucket: ENV.CFLARE_R2_BUCKET, access_key_id: ENV.CFLARE_R2_ACCESS_KEY_ID, secret_access_key: ENV.CFLARE_R2_SECRET_ACCESS_KEY, region: "auto" },
+      proposals: stagedConnectorAndDayProposals({ connector, day }),
+      writeR2: false,
+    });
+    assert.equal(output.failure, null);
+    assert.equal(output.results.get(connector.manifest_key).status, "planned");
+    assert.equal(output.results.get(day.manifest_key).status, "planned");
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("whole-plan preflight still rejects a malformed unstaged live connector", async () => {
+  const connectorOne = pollutantForTimeseries(1, "pm25", 1);
+  const connectorThree = pollutantForTimeseries(3, "pm25", 3);
+  const stagedConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc: DAY, connectorId: 1, runId: "fixture",
+    manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`, pollutantManifests: [connectorOne],
+    writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const validSibling = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc: DAY, connectorId: 3, runId: "fixture",
+    manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=3/manifest.json`, pollutantManifests: [connectorThree],
+    writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const malformedSiblingBody = JSON.stringify({ ...validSibling, profile: "invalid-old-live-profile" });
+  const day = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc: DAY, runId: "fixture", manifestKey: `${PREFIX}/day_utc=${DAY}/manifest.json`,
+    connectorManifests: [stagedConnector, validSibling], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const fake = installFakeR2({
+    [stagedConnector.manifest_key]: JSON.stringify({ ...stagedConnector, grain: "invalid-old-live-grain" }),
+    [validSibling.manifest_key]: malformedSiblingBody,
+  });
+  try {
+    const output = await applyStagedProposals({
+      r2: { endpoint: ENV.CFLARE_R2_ENDPOINT, bucket: ENV.CFLARE_R2_BUCKET, access_key_id: ENV.CFLARE_R2_ACCESS_KEY_ID, secret_access_key: ENV.CFLARE_R2_SECRET_ACCESS_KEY, region: "auto" },
+      proposals: stagedConnectorAndDayProposals({ connector: stagedConnector, day, liveSibling: validSibling, siblingBody: malformedSiblingBody }),
+      writeR2: false,
+    });
+    assert.equal(output.failure.key, day.manifest_key);
+    assert.match(output.failure.error, /invalid connector manifest/i);
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("invalid canonical staged child content blocks before every guard and PUT", async () => {
+  const fixture = fourConnectorRepairFixture();
+  const connector = fixture.entries[0].manifest;
+  const proposals = stagedConnectorAndDayProposals({ connector, day: fixture.day });
+  const invalid = proposals.get(connector.manifest_key);
+  invalid.body = "{}";
+  invalid.bytes = 2;
+  invalid.new_sha256 = createHash("sha256").update(invalid.body).digest("hex");
+  const day = proposals.get(fixture.day.manifest_key);
+  day.pre_write_guard.expected_children[0].content_sha256 = invalid.new_sha256;
+  let guardCalls = 0;
+  let putCalls = 0;
+  const output = await applyStagedProposals({
+    r2: {},
+    proposals,
+    writeR2: true,
+    assertChildren: async () => { guardCalls += 1; },
+    putObject: async () => { putCalls += 1; },
+  });
+  assert.equal(output.failure.key, connector.manifest_key);
+  assert.equal(output.results.get(connector.manifest_key).failure_stage, "proposal_preflight");
+  assert.equal(guardCalls, 0, "Pass 1 must validate every proposal before dependency guards");
+  assert.equal(putCalls, 0);
+});
+
+test("write simulation verifies the staged connector before the strict parent guard and PUT", async () => {
+  const fixture = fourConnectorRepairFixture();
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(fixture.objects);
+  try {
+    writeCombinedDropboxFixture(resolver, fixture.objects);
+    const output = await runV2ObservationsRepair({
+      argv: ["--write-r2"],
+      env: resolver.env,
+      repairPlan: observationsRepairPlan(repairAction({
+        kind: "observation_connector_manifest_repair",
+        connector_id: 1,
+        pollutant_code: null,
+        requires_index_rebuild: false,
+      })),
+    });
+    assert.equal(output.status, "succeeded", JSON.stringify(output.application_failure));
+    const connectorKey = fixture.entries[0].manifest.manifest_key;
+    const dayKey = fixture.day.manifest_key;
+    const connectorPut = fake.requests.findIndex((request) => request.method === "PUT" && request.key === connectorKey);
+    const connectorVerify = fake.requests.findIndex((request, index) => index > connectorPut && request.method === "GET" && request.key === connectorKey);
+    const strictParentRead = fake.requests.findIndex((request, index) => index > connectorVerify && request.method === "GET" && request.key === connectorKey);
+    const dayPut = fake.requests.findIndex((request) => request.method === "PUT" && request.key === dayKey);
+    assert.ok(connectorPut >= 0 && connectorVerify > connectorPut && strictParentRead > connectorVerify && dayPut > strictParentRead);
+    assert.deepEqual([...fake.puts.keys()], [connectorKey, dayKey]);
+    assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet")), false);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+test("strict parent write guard rejects a staged child corrupted after exact GET verification", async () => {
+  const fixture = fourConnectorRepairFixture();
+  const connectorKey = fixture.entries[0].manifest.manifest_key;
+  const childPrefix = `${PREFIX}/day_utc=${DAY}/connector_id=`;
+  let parentListCount = 0;
+  const fake = installFakeR2(fixture.objects, {
+    beforeRequest: ({ method, prefix, puts }) => {
+      if (method === "GET" && prefix === childPrefix && ++parentListCount === 2) {
+        puts.set(connectorKey, "{}");
+      }
+    },
+  });
+  const resolver = combinedResolverEnv();
+  try {
+    writeCombinedDropboxFixture(resolver, fixture.objects);
+    const output = await runV2ObservationsRepair({
+      argv: ["--write-r2"],
+      env: resolver.env,
+      repairPlan: observationsRepairPlan(repairAction({
+        kind: "observation_connector_manifest_repair",
+        connector_id: 1,
+        pollutant_code: null,
+        requires_index_rebuild: false,
+      })),
+    });
+    assert.equal(output.status, "failed");
+    assert.match(output.application_failure.error, /invalid connector manifest/i);
+    assert.equal(fake.puts.has(connectorKey), true);
+    assert.equal(fake.puts.has(fixture.day.manifest_key), false);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+test("whole-plan preflight blocks a genuine live R2 ETag change", async () => {
+  const o3 = pollutant(1, "o3");
+  const pm25 = pollutant(1, "pm25");
+  const connector = buildHistoryV2ConnectorManifest({ domain: "observations", dayUtc: DAY, connectorId: 1, runId: "fixture", manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`, pollutantManifests: [pm25], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z" });
+  const day = buildHistoryV2DayManifest({ domain: "observations", dayUtc: DAY, runId: "fixture", manifestKey: `${PREFIX}/day_utc=${DAY}/manifest.json`, connectorManifests: [connector], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z" });
+  const objects = Object.fromEntries([o3, pm25, connector, day].map((manifest) => [manifest.manifest_key, JSON.stringify(manifest, null, 2)]));
+  let pm25GetCount = 0;
+  const fake = installFakeR2(objects, {
+    etags: { [pm25.manifest_key]: '"live-etag-v1"' },
+    beforeRequest: ({ method, key, etags }) => {
+      if (method === "GET" && key === pm25.manifest_key && ++pm25GetCount === 2) {
+        etags.set(key, '"live-etag-v2"');
+      }
+    },
+  });
+  const resolver = combinedResolverEnv();
+  try {
+    writeCombinedDropboxFixture(resolver, objects);
+    const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: observationsRepairPlan() });
+    assert.equal(output.status, "failed");
+    assert.match(output.application_failure.error, /child R2 ETag changed/);
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
 
 test("metadata proposal preflight rejects a late invalid proposal before any write", async () => {
   const valid = proposalFromManifest(pollutant(1, "pm25"));
