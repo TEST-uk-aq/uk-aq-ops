@@ -7,10 +7,6 @@ import {
   normalizeObservedRow,
   resolveTimeseriesWindowBounds,
 } from "./timeseries_v2_stitch.mjs";
-import { RequestValidationError, R2HistoryFetchError } from "./station_history/contracts.mjs";
-import * as stationHistoryRequestWindow from "./station_history/request_window.mjs";
-import * as stationHistoryCacheKeys from "./station_history/cache_keys.mjs";
-import * as stationHistoryObservations from "./station_history/observations.mjs";
 
 export interface Env {
   SUPABASE_URL: unknown;
@@ -331,6 +327,15 @@ type TimeseriesV2EnvelopeMeta = {
   cache_status: "MISS" | "HIT" | "BYPASS";
 };
 
+export class R2HistoryFetchError extends Error {
+  details: Record<string, unknown>;
+  constructor(message: string, details: Record<string, unknown>) {
+    super(message);
+    this.name = "R2HistoryFetchError";
+    this.details = details;
+  }
+}
+
 type TimeseriesV2RuntimeConfig = {
   maxWindowDays: number;
   maxR2ObjectsPerRequest: number;
@@ -419,6 +424,17 @@ function parseIntInRange(value: string, fallback: number, min: number, max: numb
 function parseBooleanFlag(value: string): boolean {
   const normalized = String(value ?? "").trim().toLowerCase();
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+class RequestValidationError extends Error {
+  status: number;
+  code: string;
+
+  constructor(status: number, code: string) {
+    super(code);
+    this.status = status;
+    this.code = code;
+  }
 }
 
 function normalizeOrigin(value: string | null): string | null {
@@ -1895,8 +1911,8 @@ async function stitchTimeseriesV2FromR2AndIngest(
     sbSecretKey: string;
   },
 ): Promise<TimeseriesV2StitchResult> {
-  const runtime = stationHistoryRequestWindow.buildTimeseriesV2RuntimeConfig(env);
-  const requestWindow = stationHistoryRequestWindow.buildTimeseriesV2RequestWindow(requestUrl, runtime);
+  const runtime = buildTimeseriesV2RuntimeConfig(env);
+  const requestWindow = buildTimeseriesV2RequestWindow(requestUrl, runtime);
   const requestStartUtc = toIsoSafe(requestWindow.requestStartMs);
   const requestEndUtc = toIsoSafe(requestWindow.requestEndMs);
   const windowLabelForGapDetection = requestWindow.normalizedWindowLabel
@@ -1928,7 +1944,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
   };
 
   if (!flags.r2First || !deps.r2HistoryApiUrl) {
-    const originPayload = await stationHistoryObservations.fetchTimeseriesOriginPayload(
+    const originPayload = await fetchTimeseriesOriginPayload(
       deps.supabaseUrl,
       deps.supabasePublishableKey,
       deps.upstreamAuthSecret,
@@ -1958,18 +1974,18 @@ async function stitchTimeseriesV2FromR2AndIngest(
     partialReasons.add("pollutant_required_for_v2_r2");
   } else {
     if (!connectorId) {
-      r2TimeseriesMetadata = await stationHistoryObservations.loadTimeseriesMetadataFromR2(
+      r2TimeseriesMetadata = await loadTimeseriesMetadataFromR2(
         deps.r2HistoryApiUrl,
         deps.upstreamAuthSecret,
         requestWindow.timeseriesId,
       );
-      connectorId = stationHistoryObservations.connectorIdFromTimeseriesMetadata(r2TimeseriesMetadata);
+      connectorId = connectorIdFromTimeseriesMetadata(r2TimeseriesMetadata);
       if (connectorId) {
         connectorIdSource = "r2_metadata";
       }
     }
     if (!connectorId) {
-      connectorId = await stationHistoryObservations.loadTimeseriesConnectorId(
+      connectorId = await loadTimeseriesConnectorId(
         deps.supabaseUrl,
         deps.sbSecretKey,
         requestWindow.timeseriesId,
@@ -1988,7 +2004,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
           runtime.incrementalOverlapMinutes,
           sourceRoute.r2StartMs ?? requestWindow.requestStartMs,
         );
-        const r2Result = await stationHistoryObservations.fetchR2ObservationsPaged(
+        const r2Result = await fetchR2ObservationsPaged(
           deps.r2HistoryApiUrl,
           deps.upstreamAuthSecret,
           {
@@ -2050,7 +2066,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
     const sliceStartUtc = new Date(slice.startMs).toISOString();
     const sliceEndUtc = new Date(slice.endMs).toISOString();
     try {
-      const originPayload = await stationHistoryObservations.fetchTimeseriesOriginPayload(
+      const originPayload = await fetchTimeseriesOriginPayload(
         deps.supabaseUrl,
         deps.supabasePublishableKey,
         deps.upstreamAuthSecret,
@@ -2064,7 +2080,7 @@ async function stitchTimeseriesV2FromR2AndIngest(
       if (guideline === null && Object.prototype.hasOwnProperty.call(originPayload, "guideline")) {
         guideline = originPayload.guideline;
       }
-      for (const row of stationHistoryObservations.parseTimeseriesRowsFromPayload(originPayload, "ingest")) {
+      for (const row of parseTimeseriesRowsFromPayload(originPayload, "ingest")) {
         const observedAt = String(row?.observed_at ?? "").trim();
         if (observedAt) {
           ingestRowsByObservedAt.set(observedAt, row);
@@ -2969,39 +2985,32 @@ export default {
       }
     }
 
-    const timeseriesV2Flags = stationHistoryRequestWindow.resolveTimeseriesV2FlagsFromEnv({
+    const timeseriesV2Flags = resolveTimeseriesV2FlagsFromEnv({
       v2EnabledRaw: await readSecret(env.UK_AQ_TIMESERIES_V2_ENABLED),
       proxyFirstRaw: await readSecret(env.UK_AQ_TIMESERIES_PROXY_FIRST),
       r2FirstRaw: await readSecret(env.UK_AQ_TIMESERIES_R2_FIRST),
       allowIngestOverwriteRaw: await readSecret(env.UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE),
     });
-    const aqiProxyHourlyGenerationEnabled = stationHistoryCacheKeys.isAqiProxyHourlyGenerationEnabled(
+    const aqiProxyHourlyGenerationEnabled = isAqiProxyHourlyGenerationEnabled(
       await readSecret(env.UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED),
     );
-    const aqiMutableHours = stationHistoryCacheKeys.resolveAqiMutableHours(
+    const aqiMutableHours = resolveAqiMutableHours(
       await readSecret(env.UK_AQ_AQI_MUTABLE_HOURS),
-      { defaultHours: DEFAULT_AQI_MUTABLE_HOURS, minHours: MIN_AQI_MUTABLE_HOURS, maxHours: MAX_AQI_MUTABLE_HOURS },
     );
-    const useTimeseriesV2Skeleton = stationHistoryRequestWindow.isTimeseriesV2Request(
-      url,
-      upstreamFunction,
-      timeseriesV2Flags,
-      TIMESERIES_UPSTREAM_FUNCTION,
-    );
+    const useTimeseriesV2Skeleton = isTimeseriesV2Request(url, upstreamFunction, timeseriesV2Flags);
     const timeseriesV2Canonicalized = useTimeseriesV2Skeleton
-      ? stationHistoryRequestWindow.canonicalizeTimeseriesV2RequestUrl(url, bypassRequested)
+      ? canonicalizeTimeseriesV2RequestUrl(url, bypassRequested)
       : null;
     const normalizedRequestUrl = useTimeseriesV2Skeleton
       ? timeseriesV2Canonicalized!.url
-      : stationHistoryCacheKeys.applyAqiProxyHourlyGenerationCacheComponent(
+      : applyAqiProxyHourlyGenerationCacheComponent(
         canonicalizeLatestSnapshotRequestUrl(
-          stationHistoryCacheKeys.canonicalizeAqiHistoryRequestUrl(url, upstreamFunction, EXTERNAL_AQI_HISTORY_UPSTREAM),
+          canonicalizeAqiHistoryRequestUrl(url, upstreamFunction),
           upstreamFunction,
         ),
         upstreamFunction,
         aqiProxyHourlyGenerationEnabled,
         aqiMutableHours,
-        EXTERNAL_AQI_HISTORY_UPSTREAM,
       );
     const profileName = resolveCacheProfileName(
       upstreamFunction,
