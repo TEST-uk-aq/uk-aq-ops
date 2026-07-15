@@ -195,7 +195,11 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
 // planning source: all normal reads use createCombinedLocalStore above.
 function createR2RaceGuardStore(r2) {
   return {
-    getObject: async (key) => await r2GetObject({ r2, key }),
+    // Keep this signature aligned with the shared R2 adapter contract.  The
+    // guard calls readChildren(), which always passes an object containing the
+    // canonical R2 key.  Passing that wrapper through as the key reached AWS
+    // request signing as `objectKey.split is not a function`.
+    getObject: async ({ key }) => await r2GetObject({ r2, key }),
     listAllObjects: async ({ prefix, max_keys = 1000 }) => await r2ListAllObjects({ r2, prefix, max_keys }),
   };
 }
@@ -239,12 +243,13 @@ function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kin
         // A staged child has no stable live ETag until it is written. Its exact
         // proposed body remains the required comparison in that case.
         etag: staged ? null : identity.etag,
+        staged: Boolean(staged),
       };
     }).sort((left, right) => left.key.localeCompare(right.key)),
   };
 }
 
-async function assertCompleteChildrenUnchanged({ r2, guard }) {
+async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren = false }) {
   const current = await readChildren({
     store: createR2RaceGuardStore(r2),
     prefix: guard.prefix,
@@ -262,7 +267,12 @@ async function assertCompleteChildrenUnchanged({ r2, guard }) {
   for (const key of expectedKeys) {
     const currentIdentity = current.identities.get(key);
     const expectedIdentity = expected.get(key);
-    if (currentIdentity.sha256 !== expectedIdentity.sha256) {
+    // During the full-plan preflight a parent may depend on a child proposal
+    // that deliberately has not been PUT yet.  Validate its key set now, then
+    // compare its exact body at the normal per-parent guard after that child
+    // has been verified.  Unstaged children must match in both passes.
+    if ((!allowStagedChildren || !expectedIdentity.staged)
+      && currentIdentity.sha256 !== expectedIdentity.sha256) {
       throw new Error(`Blocked dependency: ${guard.kind} child body changed before parent write: ${key}`);
     }
     if (expectedIdentity.etag && currentIdentity.etag && expectedIdentity.etag !== currentIdentity.etag) {
@@ -418,9 +428,34 @@ async function parquetFileEntry({ store, key, domain, pollutantCode }) {
     min_timeseries_id: minTimeseriesId,
     max_timeseries_id: maxTimeseriesId,
     ...(domain === "observations"
-      ? { min_observed_at: minTimestamp, max_observed_at: maxTimestamp }
+      ? { min_observed_at_utc: minTimestamp, max_observed_at_utc: maxTimestamp }
       : { min_timestamp_hour_utc: minTimestamp, max_timestamp_hour_utc: maxTimestamp }),
     timeseries_row_counts: counts,
+  };
+}
+
+function existingManifestMetadata(store, manifestKey) {
+  const existing = store.getObjectIfExists(manifestKey);
+  if (!existing) return { blocked_reason: "existing_manifest_metadata_unavailable" };
+  let payload;
+  try {
+    payload = jsonObject(existing, manifestKey);
+  } catch {
+    return { blocked_reason: "existing_manifest_metadata_invalid_json" };
+  }
+  const backedUpAtUtc = typeof payload?.backed_up_at_utc === "string"
+    && !Number.isNaN(Date.parse(payload.backed_up_at_utc))
+    ? payload.backed_up_at_utc
+    : null;
+  if (!backedUpAtUtc) return { blocked_reason: "existing_manifest_backed_up_at_utc_invalid" };
+  return {
+    payload: {
+      run_id: typeof payload?.run_id === "string" || payload?.run_id === null ? payload.run_id : null,
+      writer_git_sha: typeof payload?.writer_git_sha === "string" || payload?.writer_git_sha === null
+        ? payload.writer_git_sha
+        : null,
+      backed_up_at_utc: backedUpAtUtc,
+    },
   };
 }
 
@@ -432,10 +467,12 @@ async function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId
     .sort();
   if (!partKeys.length) return { blocked_reason: "final_parquet_objects_unavailable" };
   const manifestKey = `${pollutantPrefix}/manifest.json`;
+  const metadata = existingManifestMetadata(store, manifestKey);
+  if (metadata.blocked_reason) return metadata;
   try {
     const files = [];
     for (const key of partKeys) files.push(await parquetFileEntry({ store, key, domain, pollutantCode }));
-    return { manifestKey, payload: {}, files };
+    return { manifestKey, payload: metadata.payload, files };
   } catch (error) {
     return { blocked_reason: `final_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
   }
@@ -495,6 +532,112 @@ function reduceRepairStatus(statuses, fallback = "not_run") {
   return fallback;
 }
 
+function assertCanonicalObjectKey(value, label) {
+  if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.startsWith("/")) {
+    throw new Error(`Invalid canonical R2 ${label}`);
+  }
+  const parts = value.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error(`Invalid canonical R2 ${label}: ${value}`);
+  }
+  return value;
+}
+
+function assertCanonicalManifestProposal(proposal) {
+  const expectedKind = {
+    pollutant_manifest: "pollutant",
+    connector_manifest: "connector",
+    day_manifest: "day",
+  }[proposal.kind];
+  if (!expectedKind) return;
+  let payload;
+  try {
+    payload = JSON.parse(proposal.body);
+  } catch {
+    throw new Error(`Invalid ${proposal.kind} JSON proposal: ${proposal.key}`);
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error(`Invalid ${proposal.kind} payload: ${proposal.key}`);
+  }
+  const isAqi = payload.domain === "aqilevels";
+  const expectedGrain = isAqi ? "hourly" : null;
+  const expectedProfile = isAqi ? "data" : null;
+  if (!['observations', 'aqilevels'].includes(payload.domain)
+    || payload.history_version !== "v2"
+    || payload.manifest_kind !== expectedKind
+    || payload.manifest_key !== proposal.key
+    || payload.grain !== expectedGrain
+    || payload.profile !== expectedProfile) {
+    throw new Error(`Invalid canonical ${proposal.kind} contract: ${proposal.key}`);
+  }
+  if (typeof payload.backed_up_at_utc !== "string" || Number.isNaN(Date.parse(payload.backed_up_at_utc))) {
+    throw new Error(`Invalid canonical ${proposal.kind} backed_up_at_utc: ${proposal.key}`);
+  }
+  if (!Array.isArray(payload.files) || !Array.isArray(payload.parquet_object_keys)) {
+    throw new Error(`Invalid canonical ${proposal.kind} file collection: ${proposal.key}`);
+  }
+  for (const entry of payload.files) {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`Invalid canonical ${proposal.kind} files entry: ${proposal.key}`);
+    }
+    assertCanonicalObjectKey(entry.key, "files[].key");
+  }
+  for (const key of payload.parquet_object_keys) assertCanonicalObjectKey(key, "parquet_object_keys entry");
+  const { manifest_hash: manifestHash, ...withoutHash } = payload;
+  if (typeof manifestHash !== "string" || manifestHash !== sha256Hex(JSON.stringify(withoutHash))) {
+    throw new Error(`Invalid canonical ${proposal.kind} manifest_hash: ${proposal.key}`);
+  }
+}
+
+function assertCanonicalProposal(proposal) {
+  if (!proposal || typeof proposal !== "object") throw new Error("Invalid metadata proposal");
+  assertCanonicalObjectKey(proposal.key, "proposal key");
+  if (typeof proposal.body !== "string" || Buffer.byteLength(proposal.body, "utf8") !== proposal.bytes) {
+    throw new Error(`Invalid proposal body or bytes: ${proposal.key}`);
+  }
+  for (const dependency of proposal.dependencies || []) assertCanonicalObjectKey(dependency, "proposal dependency");
+  if (proposal.pre_write_guard) {
+    if (typeof proposal.pre_write_guard !== "object" || !Array.isArray(proposal.pre_write_guard.expected_children)) {
+      throw new Error(`Invalid proposal pre-write guard: ${proposal.key}`);
+    }
+    assertCanonicalObjectKey(proposal.pre_write_guard.prefix, "pre-write guard prefix");
+    for (const child of proposal.pre_write_guard.expected_children) {
+      assertCanonicalObjectKey(child?.key, "pre-write guard child key");
+    }
+  }
+  assertCanonicalManifestProposal(proposal);
+  if (!proposal.kind.endsWith("manifest")) {
+    try {
+      const payload = JSON.parse(proposal.body);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("payload is not an object");
+      }
+    } catch (error) {
+      throw new Error(`Invalid canonical ${proposal.kind} proposal: ${proposal.key} (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
+}
+
+function applicationFailureResults(ordered, failedProposal, error, failureStage) {
+  const results = new Map();
+  for (const proposal of ordered) {
+    const failed = proposal === failedProposal;
+    results.set(proposal.key, {
+      key: proposal.key,
+      kind: proposal.kind,
+      status: failed ? "failed" : "not_run_due_to_dependency",
+      put_attempted: false,
+      put_completed: false,
+      get_verification_attempted: false,
+      get_verification_succeeded: false,
+      verification: failed ? "failed" : "not_run",
+      failure_stage: failed ? failureStage : "dependency",
+      error: failed ? error : null,
+    });
+  }
+  return results;
+}
+
 export async function applyStagedProposals({
   r2,
   proposals,
@@ -515,6 +658,23 @@ export async function applyStagedProposals({
   const ordered = [...proposals.values()].sort((left, right) =>
     (rank[left.kind] || 99) - (rank[right.kind] || 99) || left.key.localeCompare(right.key)
   );
+  // A repair plan is atomic with respect to proposal validity: complete every
+  // schema/key check and every possible pre-write dependency probe before the
+  // first PUT.  This is intentionally also run in dry-run mode.
+  for (const proposal of ordered) {
+    try {
+      assertCanonicalProposal(proposal);
+      if (proposal.pre_write_guard) {
+        await assertChildren({ r2, guard: proposal.pre_write_guard, allowStagedChildren: true });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        results: applicationFailureResults(ordered, proposal, message, "proposal_preflight"),
+        failure: { key: proposal.key, error: message },
+      };
+    }
+  }
   for (let position = 0; position < ordered.length; position += 1) {
     const proposal = ordered[position];
     if (!proposal.changed) {
@@ -802,6 +962,7 @@ export async function runV2ObservationsRepair({
         const { manifestKey, payload, files } = source;
         const rebuilt = buildHistoryV2PollutantManifest({
           domain,
+          grain: domain === "aqilevels" ? "hourly" : null,
           profile: domain === "aqilevels" ? "data" : null,
           dayUtc,
           connectorId: scope.connectorId,
@@ -830,7 +991,7 @@ export async function runV2ObservationsRepair({
       }
       const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
       const key = `${base}/connector_id=${scope.connectorId}/manifest.json`;
-      const payload = buildHistoryV2ConnectorManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      const payload = buildHistoryV2ConnectorManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key,
         body: JSON.stringify(payload, null, 2),
@@ -861,7 +1022,7 @@ export async function runV2ObservationsRepair({
     }
     if (needsDay) {
       const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
-      dayManifest = buildHistoryV2DayManifest({ domain, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      dayManifest = buildHistoryV2DayManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key: dayManifestKey,
         body: JSON.stringify(dayManifest, null, 2),
