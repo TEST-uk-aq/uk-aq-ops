@@ -271,10 +271,10 @@ test("missing diagnostic ranges outside the Supabase tail cap are reported as sk
 
 test("cache proxy tries R2 timeseries metadata before Supabase connector lookup", () => {
   const source = fs.readFileSync("workers/uk_aq_cache_proxy/src/index.ts", "utf8");
-  const r2LookupPos = source.indexOf("stationHistoryObservations.loadTimeseriesMetadataFromR2(");
-  const supabaseLookupPos = source.indexOf("stationHistoryObservations.loadTimeseriesConnectorId(");
-  const r2CallPos = source.indexOf("r2TimeseriesMetadata = await stationHistoryObservations.loadTimeseriesMetadataFromR2(");
-  const supabaseCallPos = source.indexOf("connectorId = await stationHistoryObservations.loadTimeseriesConnectorId(");
+  const r2LookupPos = source.indexOf("loadTimeseriesMetadataFromR2(");
+  const supabaseLookupPos = source.indexOf("loadTimeseriesConnectorId(");
+  const r2CallPos = source.indexOf("r2TimeseriesMetadata = await loadTimeseriesMetadataFromR2(");
+  const supabaseCallPos = source.indexOf("connectorId = await loadTimeseriesConnectorId(");
   assert.ok(r2LookupPos > 0);
   assert.ok(supabaseLookupPos > 0);
   assert.ok(r2CallPos > 0);
@@ -286,10 +286,10 @@ test("cache proxy keeps origin-only wrapper before R2 stitch when R2-first is di
   const source = fs.readFileSync("workers/uk_aq_cache_proxy/src/index.ts", "utf8");
   const guardPos = source.indexOf("if (!flags.r2First || !deps.r2HistoryApiUrl)");
   const originFetchPos = source.indexOf(
-    "const originPayload = await stationHistoryObservations.fetchTimeseriesOriginPayload(",
+    "const originPayload = await fetchTimeseriesOriginPayload(",
     guardPos,
   );
-  const r2FetchPos = source.indexOf("const r2Result = await stationHistoryObservations.fetchR2ObservationsPaged(");
+  const r2FetchPos = source.indexOf("const r2Result = await fetchR2ObservationsPaged(");
   assert.ok(guardPos > 0);
   assert.ok(originFetchPos > guardPos);
   assert.ok(r2FetchPos > originFetchPos);
