@@ -9024,6 +9024,9 @@ def run_v2_observations_integrity_checks(
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
     result = {
         "status": status,
+        # Integrity detection scans the Dropbox R2-history mirror. The repair
+        # executor separately hydrates live R2 before deciding target state.
+        "storage_source": "dropbox_r2_history_mirror",
         "checked_partitions": checked,
         "gap_count": len(gaps),
         "gaps": gaps,
@@ -10150,6 +10153,9 @@ def run_v2_aqilevels_integrity_checks(
     status = "fail" if any(g.get("severity") == "error" for g in all_gaps) else "ok"
     result = {
         "status": status,
+        # Integrity detection scans the Dropbox R2-history mirror. The repair
+        # executor separately hydrates live R2 before deciding target state.
+        "storage_source": "dropbox_r2_history_mirror",
         "checked_partitions": checked,
         "observation_coverage_checked": observation_coverage_checked,
         "gap_count": len(data_gaps),
