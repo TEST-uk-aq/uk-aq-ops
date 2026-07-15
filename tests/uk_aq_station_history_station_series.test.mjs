@@ -9,8 +9,6 @@ const identity = { timeseriesId: 7, connectorId: 2, stationId: 9, pollutant: "no
 const env = {
   SUPABASE_URL: "https://identity.example",
   SB_SECRET_KEY: "service-key",
-  OBS_AQIDB_SUPABASE_URL: "https://obsaqi.example",
-  OBS_AQIDB_SECRET_KEY: "obs-key",
   UK_AQ_PUBLIC_SCHEMA: "uk_aq_public",
   INGESTDB_RETENTION_DAYS: "31",
   UK_AQ_EDGE_UPSTREAM_SECRET: "upstream-key",
@@ -51,7 +49,7 @@ function request({ pollutant = "no2", startIso, endIso, includeAqi = true, windo
   return { ...identity, pollutant, startMs: Date.parse(startIso), endMs: Date.parse(endIso), contextHours: includeAqi && pollutant.startsWith("pm") ? 23 : 0, contextStartMs: Date.parse(startIso) - (includeAqi && pollutant.startsWith("pm") ? 23 : 0) * HOUR_MS, includeAqi, window };
 }
 
-test("direct ObsAQIDB rows retain authority and malformed neighbours survive", () => {
+test("direct ingest rows retain authority and malformed neighbours survive", () => {
   const normalized = normalizeDirectIngestRows([
     ...observations("2026-07-14T00:00:00.000Z", 1),
     { ...observations("2026-07-14T01:00:00.000Z", 1)[0], value: "not-finite" },
@@ -89,6 +87,8 @@ test("fully covered NO2 12h uses one direct read and no R2", async () => {
     assert.equal(direct.init.method, "POST");
     assert.equal(direct.init.headers["Accept-Profile"], "uk_aq_public");
     assert.equal(direct.init.headers["Content-Profile"], "uk_aq_public");
+    assert.equal(direct.init.headers.apikey, "service-key");
+    assert.equal(direct.init.headers.Authorization, "Bearer service-key");
     const rpcBody = JSON.parse(direct.init.body);
     assert.match(rpcBody.window_label, /^(12h|24h|7d|30d)$/);
     delete rpcBody.window_label;

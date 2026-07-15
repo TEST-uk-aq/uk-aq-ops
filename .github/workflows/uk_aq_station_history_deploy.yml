@@ -24,8 +24,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
           SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
-          OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
-          OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY || '' }}
           UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
           UK_AQ_AQI_HISTORY_R2_API_URL: ${{ vars.UK_AQ_AQI_HISTORY_R2_API_URL || '' }}
           UK_AQ_OBSERVS_HISTORY_R2_API_URL: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL || '' }}
@@ -36,8 +34,6 @@ jobs:
           test -n "${UK_AQ_STATION_HISTORY_WORKER_NAME}" || { echo "Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME."; exit 1; }
           test -n "${SUPABASE_URL}" || { echo "Missing required GitHub repository variable SUPABASE_URL."; exit 1; }
           test -n "${SB_SECRET_KEY}" || { echo "Missing required GitHub repository secret SB_SECRET_KEY."; exit 1; }
-          test -n "${OBS_AQIDB_SUPABASE_URL}" || { echo "Missing required GitHub repository variable OBS_AQIDB_SUPABASE_URL."; exit 1; }
-          test -n "${OBS_AQIDB_SECRET_KEY}" || { echo "Missing required GitHub repository secret OBS_AQIDB_SECRET_KEY."; exit 1; }
           test -n "${UK_AQ_EDGE_UPSTREAM_SECRET}" || { echo "Missing required GitHub repository secret UK_AQ_EDGE_UPSTREAM_SECRET."; exit 1; }
           test -n "${UK_AQ_AQI_HISTORY_R2_API_URL}" || { echo "Missing required GitHub repository variable UK_AQ_AQI_HISTORY_R2_API_URL."; exit 1; }
           test -n "${UK_AQ_OBSERVS_HISTORY_R2_API_URL}" || { echo "Missing required GitHub repository variable UK_AQ_OBSERVS_HISTORY_R2_API_URL."; exit 1; }
@@ -47,7 +43,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          jq -n --arg SUPABASE_URL "${{ vars.SUPABASE_URL }}" --arg SB_SECRET_KEY "${{ secrets.SB_SECRET_KEY }}" --arg OBS_AQIDB_SUPABASE_URL "${{ vars.OBS_AQIDB_SUPABASE_URL }}" --arg OBS_AQIDB_SECRET_KEY "${{ secrets.OBS_AQIDB_SECRET_KEY }}" --arg UK_AQ_PUBLIC_SCHEMA "${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}" --arg INGESTDB_RETENTION_DAYS "${{ vars.INGESTDB_RETENTION_DAYS || '5' }}" --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" --arg UK_AQ_AQI_HISTORY_R2_API_URL "${{ vars.UK_AQ_AQI_HISTORY_R2_API_URL }}" --arg UK_AQ_OBSERVS_HISTORY_R2_API_URL "${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL }}" '{SUPABASE_URL:$SUPABASE_URL, SB_SECRET_KEY:$SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL:$OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY:$OBS_AQIDB_SECRET_KEY, UK_AQ_PUBLIC_SCHEMA:$UK_AQ_PUBLIC_SCHEMA, INGESTDB_RETENTION_DAYS:$INGESTDB_RETENTION_DAYS, UK_AQ_EDGE_UPSTREAM_SECRET:$UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_AQI_HISTORY_R2_API_URL:$UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_OBSERVS_HISTORY_R2_API_URL:$UK_AQ_OBSERVS_HISTORY_R2_API_URL}' | npx --yes wrangler@4 secret bulk --name "${UK_AQ_STATION_HISTORY_WORKER_NAME}"
+          jq -n --arg SUPABASE_URL "${{ vars.SUPABASE_URL }}" --arg SB_SECRET_KEY "${{ secrets.SB_SECRET_KEY }}" --arg UK_AQ_PUBLIC_SCHEMA "${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}" --arg INGESTDB_RETENTION_DAYS "${{ vars.INGESTDB_RETENTION_DAYS || '5' }}" --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" --arg UK_AQ_AQI_HISTORY_R2_API_URL "${{ vars.UK_AQ_AQI_HISTORY_R2_API_URL }}" --arg UK_AQ_OBSERVS_HISTORY_R2_API_URL "${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL }}" '{SUPABASE_URL:$SUPABASE_URL, SB_SECRET_KEY:$SB_SECRET_KEY, UK_AQ_PUBLIC_SCHEMA:$UK_AQ_PUBLIC_SCHEMA, INGESTDB_RETENTION_DAYS:$INGESTDB_RETENTION_DAYS, UK_AQ_EDGE_UPSTREAM_SECRET:$UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_AQI_HISTORY_R2_API_URL:$UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_OBSERVS_HISTORY_R2_API_URL:$UK_AQ_OBSERVS_HISTORY_R2_API_URL}' | npx --yes wrangler@4 secret bulk --name "${UK_AQ_STATION_HISTORY_WORKER_NAME}"
       - name: Deploy private Worker
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:

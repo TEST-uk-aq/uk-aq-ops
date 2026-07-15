@@ -19,8 +19,7 @@ test("gateway declares the private STATION_HISTORY Service Binding and disabled 
   assert.match(stationWorkflow, /UK_AQ_STATION_HISTORY_WORKER_NAME: \$\{\{ vars\.UK_AQ_STATION_HISTORY_WORKER_NAME \|\| '' \}\}/);
   assert.match(stationWorkflow, /Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME/);
   assert.match(stationWorkflow, /SB_SECRET_KEY/);
-  assert.match(stationWorkflow, /OBS_AQIDB_SUPABASE_URL/);
-  assert.match(stationWorkflow, /OBS_AQIDB_SECRET_KEY/);
+  assert.doesNotMatch(stationWorkflow, /OBS_AQIDB_SUPABASE_URL|OBS_AQIDB_SECRET_KEY/);
   assert.match(stationWorkflow, /UK_AQ_PUBLIC_SCHEMA/);
   assert.match(stationWorkflow, /INGESTDB_RETENTION_DAYS/);
   assert.doesNotMatch(stationWorkflow, /SB_PUBLISHABLE_DEFAULT_KEY/);
@@ -43,8 +42,6 @@ test("station-history deployment validates every mandatory private data-path set
   for (const name of [
     "SUPABASE_URL",
     "SB_SECRET_KEY",
-    "OBS_AQIDB_SUPABASE_URL",
-    "OBS_AQIDB_SECRET_KEY",
     "UK_AQ_EDGE_UPSTREAM_SECRET",
     "UK_AQ_AQI_HISTORY_R2_API_URL",
     "UK_AQ_OBSERVS_HISTORY_R2_API_URL",

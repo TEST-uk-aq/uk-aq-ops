@@ -62,7 +62,7 @@ function ingestErrorResponse(error, route) {
     error.toSafeDetail(),
   );
   const headers = new Headers(response.headers);
-  headers.set("X-UK-AQ-Station-History-Upstream", "obsaqidb");
+  headers.set("X-UK-AQ-Station-History-Upstream", "ingestdb");
   headers.set(
     "X-UK-AQ-Station-History-Error-Class",
     error.failureClass,
