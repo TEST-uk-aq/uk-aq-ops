@@ -10,10 +10,8 @@ import {
 
 const identity = { timeseriesId: 7, connectorId: 2, stationId: 9, pollutant: "no2" };
 const env = {
-  SUPABASE_URL: "https://identity.example",
-  SB_SECRET_KEY: "service-key",
-  OBS_AQIDB_SUPABASE_URL: "https://obsaqi.example",
-  OBS_AQIDB_SECRET_KEY: "obs-key",
+  SUPABASE_URL: "https://ingest.example",
+  SB_SECRET_KEY: "ingest-key",
   UK_AQ_PUBLIC_SCHEMA: "uk_aq_public",
   INGESTDB_RETENTION_DAYS: "31",
 };
@@ -73,7 +71,7 @@ test("direct ingest reports missing source configuration without attempting a fe
     throw new Error("fetch should not run");
   }, async () => {
     await assert.rejects(
-      readDirectIngestObservations({ ...bounds, env: { ...env, OBS_AQIDB_SECRET_KEY: "" } }),
+      readDirectIngestObservations({ ...bounds, env: { ...env, SB_SECRET_KEY: "" } }),
       (error) => error instanceof StationHistoryIngestError
         && error.code === "station_series_ingest_config_missing"
         && error.failureClass === "config"
@@ -163,6 +161,27 @@ test("valid RPC rows preserve guideline, status, and authoritative enrichment", 
   );
 });
 
+test("direct RPC uses ingest Supabase credentials and ignores obsolete ObsAQIDB credentials", async () => {
+  let captured;
+  await withFetch(async (input, init) => {
+    captured = { url: String(input), init };
+    return new Response(JSON.stringify(rpcPayload([])), { status: 200 });
+  }, async () => {
+    await readDirectIngestObservations({
+      ...bounds,
+      env: {
+        ...env,
+        OBS_AQIDB_SUPABASE_URL: "https://obsolete-obsaqidb.example",
+        OBS_AQIDB_SECRET_KEY: "obsolete-key",
+      },
+    });
+  });
+  assert.equal(captured.url, "https://ingest.example/rest/v1/rpc/uk_aq_timeseries_rpc");
+  assert.doesNotMatch(captured.url, /obsolete-obsaqidb/);
+  assert.equal(captured.init.headers.apikey, "ingest-key");
+  assert.equal(captured.init.headers.Authorization, "Bearer ingest-key");
+});
+
 test("direct ingest selects the smallest supported RPC window for its required source interval", () => {
   const end = Date.parse("2026-07-15T12:00:00.000Z");
   assert.equal(selectDirectIngestWindowLabel(end - 12 * 60 * 60 * 1000, end), "12h");
@@ -227,8 +246,8 @@ test("private station-series responses expose only safe RPC diagnostics", async 
     if (url.includes("/rest/v1/rpc/uk_aq_timeseries_rpc")) {
       return new Response(JSON.stringify({
         code: "PGRST202",
-        message: "function missing; apikey=obs-key",
-        details: "https://obsaqi.example/rest/v1/rpc/uk_aq_timeseries_rpc?apikey=obs-key",
+        message: "function missing; apikey=ingest-key",
+        details: "https://ingest.example/rest/v1/rpc/uk_aq_timeseries_rpc?apikey=ingest-key",
         hint: "check function",
       }), { status: 404 });
     }
@@ -238,12 +257,13 @@ test("private station-series responses expose only safe RPC diagnostics", async 
     const body = await response.json();
     assert.equal(response.status, 502);
     assert.equal(response.headers.get("Cache-Control"), "no-store");
-    assert.equal(response.headers.get("X-UK-AQ-Station-History-Upstream"), "obsaqidb");
+    assert.equal(response.headers.get("X-UK-AQ-Station-History-Upstream"), "ingestdb");
     assert.equal(response.headers.get("X-UK-AQ-Station-History-Upstream-Status"), "404");
     assert.equal(response.headers.get("X-UK-AQ-Station-History-Error-Class"), "unsupported_rpc_signature");
     assert.equal(body.error.code, "station_series_ingest_unsupported_rpc_signature");
     assert.equal(body.error.detail.path, "rpc/uk_aq_timeseries_rpc");
+    assert.equal(body.error.detail.service, "ingestdb");
     assert.equal(body.error.detail.http_attempt_count, 1);
-    assert.doesNotMatch(JSON.stringify(body), /obs-key|obsaqi\.example/);
+    assert.doesNotMatch(JSON.stringify(body), /ingest-key|ingest\.example/);
   });
 });

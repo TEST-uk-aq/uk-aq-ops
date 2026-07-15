@@ -3,7 +3,7 @@ import { normalizePollutantCode } from "../../../lib/aqi/aqi_levels.mjs";
 const DEFAULT_SCHEMA = "uk_aq_public";
 const RPC_PATH = "rpc/uk_aq_timeseries_rpc";
 const MAX_DIAGNOSTIC_TEXT_LENGTH = 512;
-const SERVICE = "obsaqidb_postgrest";
+const SERVICE = "ingestdb";
 const MAX_RPC_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 function required(value) { return String(value ?? "").trim(); }
@@ -204,8 +204,8 @@ export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
 }
 
 export async function readDirectIngestObservations({ env, identity, startMs, endMs, timeoutMs, nowMs = Date.now(), route = "/v1/station-series" }) {
-  const baseUrl = normalizeBaseUrl(env.OBS_AQIDB_SUPABASE_URL);
-  const apiKey = required(env.OBS_AQIDB_SECRET_KEY);
+  const baseUrl = normalizeBaseUrl(env.SUPABASE_URL);
+  const apiKey = required(env.SB_SECRET_KEY);
   const source = sourceContext(env);
   const loggingContext = { route, identity, timeoutMs };
   if (!baseUrl || !apiKey) {

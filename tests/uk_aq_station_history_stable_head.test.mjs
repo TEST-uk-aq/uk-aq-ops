@@ -80,7 +80,7 @@ async function longRequest({ incompleteIngest = false, r2MissingIndex = 167, mis
   };
   try {
     const request = { timeseriesId: 7, connectorId: 2, stationId: 9, pollutant: "pm25", startMs: Date.parse("2026-06-24T00:00:00.000Z"), endMs: Date.parse(end), contextHours: 23, contextStartMs: Date.parse("2026-06-23T01:00:00.000Z"), includeAqi: true, window: "14d" };
-    const body = await buildStationSeries(request, { OBS_AQIDB_SUPABASE_URL: "https://obsaqi.example", OBS_AQIDB_SECRET_KEY: "obs-key", INGESTDB_RETENTION_DAYS: "31", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history", UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observs-r2.example/v1/observations" }, Date.parse("2026-07-08T00:30:00.000Z"));
+    const body = await buildStationSeries(request, { SUPABASE_URL: "https://ingest.example", SB_SECRET_KEY: "ingest-key", INGESTDB_RETENTION_DAYS: "31", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history", UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observs-r2.example/v1/observations" }, Date.parse("2026-07-08T00:30:00.000Z"));
     return { body, targets };
   } finally { globalThis.fetch = originalFetch; }
 }
@@ -129,6 +129,6 @@ test("R2 claiming complete coverage with an incomplete response fails closed", a
     : new Response(JSON.stringify({ points: [], response_complete: false, coverage: { r2_expected_hour_coverage: { complete: true } } }), { status: 200 });
   try {
     const request = { timeseriesId: 7, connectorId: 2, stationId: 9, pollutant: "pm25", startMs: Date.parse("2026-06-24T00:00:00.000Z"), endMs: Date.parse("2026-07-08T00:00:00.000Z"), contextHours: 23, contextStartMs: Date.parse("2026-06-23T01:00:00.000Z"), includeAqi: true, window: "14d" };
-    await assert.rejects(buildStationSeries(request, { OBS_AQIDB_SUPABASE_URL: "https://obsaqi.example", OBS_AQIDB_SECRET_KEY: "obs-key", INGESTDB_RETENTION_DAYS: "31", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history", UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observs-r2.example/v1/observations" }, Date.parse("2026-07-08T00:30:00.000Z")), /station_series_r2_claimed_complete_response_incomplete/);
+    await assert.rejects(buildStationSeries(request, { SUPABASE_URL: "https://ingest.example", SB_SECRET_KEY: "ingest-key", INGESTDB_RETENTION_DAYS: "31", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history", UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observs-r2.example/v1/observations" }, Date.parse("2026-07-08T00:30:00.000Z")), /station_series_r2_claimed_complete_response_incomplete/);
   } finally { globalThis.fetch = originalFetch; }
 });
