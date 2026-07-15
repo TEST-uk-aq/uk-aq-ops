@@ -87,19 +87,41 @@ function jsonObject(object, key) {
   }
 }
 
-async function readChildren({ store, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
+async function readChildren({
+  store,
+  prefix,
+  dayUtc,
+  connectorId,
+  kind,
+  domain = "observations",
+  identityOnlyKeys = new Set(),
+}) {
   const entries = await store.listAllObjects({ prefix });
   const keyPattern = kind === "connector"
     ? /\/connector_id=\d+\/manifest\.json$/
     : /\/pollutant_code=[^/]+\/manifest\.json$/;
   const keys = entries.map((entry) => entry.key).filter((key) => keyPattern.test(key)).sort();
-  if (!keys.length) throw new Error(`Blocked dependency: no ${kind} manifests under ${prefix}`);
+  if (!keys.length && identityOnlyKeys.size === 0) {
+    throw new Error(`Blocked dependency: no ${kind} manifests under ${prefix}`);
+  }
   const children = [];
   const identities = new Map();
   for (const key of keys) {
     // readChildren is used only with R2-compatible adapters (the staged view
     // during planning and the live race guard during writes).
     const object = await store.getObject({ key });
+    identities.set(key, {
+      content_sha256: object.content_sha256 || sha256Hex(object.body),
+      r2_etag: object.r2_etag || object.etag || null,
+      source: object.source || "live_r2",
+      last_modified: object.last_modified || null,
+    });
+    // Initial whole-plan preflight may inspect the old live identity of an
+    // exact child that has already passed canonical staged-proposal
+    // validation. Its replacement body, not the malformed/absent old body,
+    // is the schema dependency. Normal planning and per-write guards never
+    // receive this exemption.
+    if (identityOnlyKeys.has(key)) continue;
     const payload = jsonObject(object, key);
     if (domain === "observations") {
       assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
@@ -107,12 +129,6 @@ async function readChildren({ store, prefix, dayUtc, connectorId, kind, domain =
       throw new Error(`Invalid AQI ${kind} manifest: ${key}`);
     }
     children.push(payload);
-    identities.set(key, {
-      content_sha256: object.content_sha256 || sha256Hex(object.body),
-      r2_etag: object.r2_etag || object.etag || null,
-      source: object.source || "live_r2",
-      last_modified: object.last_modified || null,
-    });
   }
   return { children, identities };
 }
@@ -417,7 +433,12 @@ function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kin
   };
 }
 
-async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren = false }) {
+async function assertCompleteChildrenUnchanged({
+  r2,
+  guard,
+  allowStagedChildren = false,
+  validatedStagedProposalKeys = new Set(),
+}) {
   // A parent may only be planned from the live snapshot/current overlay or a
   // child staged in this plan.  Dropbox is diagnostic/reconstruction input,
   // never a valid member of a live parent inventory.  Classify this as a bad
@@ -437,6 +458,11 @@ async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren 
     };
     throw new Error(`Blocked dependency: invalid_planned_inventory ${guard.kind} expected non-live child under ${guard.prefix}; invalid=${invalidKeys.join(",")}`);
   }
+  const identityOnlyKeys = allowStagedChildren
+    ? new Set(guard.expected_children
+      .filter((child) => child.staged && validatedStagedProposalKeys.has(child.key))
+      .map((child) => child.key))
+    : new Set();
   const current = await readChildren({
     store: createR2RaceGuardStore(r2),
     prefix: guard.prefix,
@@ -444,6 +470,7 @@ async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren 
     connectorId: guard.connectorId,
     kind: guard.kind,
     domain: guard.domain,
+    identityOnlyKeys,
   });
   const expected = new Map(guard.expected_children.map((child) => [child.key, child]));
   const actualKeys = [...current.identities.keys()].sort();
@@ -915,6 +942,30 @@ function assertCanonicalProposal(proposal) {
   }
 }
 
+function assertCanonicalProposalRelationships(proposal, proposals) {
+  const guard = proposal.pre_write_guard;
+  if (!guard) return;
+  const stagedKind = {
+    pollutant: "pollutant_manifest",
+    connector: "connector_manifest",
+  }[guard.kind];
+  for (const child of guard.expected_children) {
+    if (!child?.staged) continue;
+    const staged = proposals.get(child.key);
+    if (!stagedKind
+      || !child.key.startsWith(guard.prefix)
+      || child.source !== "planned_overlay"
+      || child.r2_etag !== null
+      || !staged
+      || staged.kind !== stagedKind
+      || !/^[a-f0-9]{64}$/.test(String(child.content_sha256 || ""))
+      || staged.new_sha256 !== child.content_sha256
+      || !(proposal.dependencies || []).includes(child.key)) {
+      throw new Error(`Invalid staged child proposal dependency: ${proposal.key} -> ${child?.key || "(missing)"}`);
+    }
+  }
+}
+
 function applicationFailureResults(ordered, failedProposal, error, failureStage) {
   const results = new Map();
   for (const proposal of ordered) {
@@ -955,15 +1006,45 @@ export async function applyStagedProposals({
   const ordered = [...proposals.values()].sort((left, right) =>
     (rank[left.kind] || 99) - (rank[right.kind] || 99) || left.key.localeCompare(right.key)
   );
-  // A repair plan is atomic with respect to proposal validity: complete every
-  // schema/key check and every possible pre-write dependency probe before the
-  // first PUT.  This is intentionally also run in dry-run mode.
+  // Pass 1: a repair plan is atomic with respect to proposal validity. Check
+  // every proposal body and every staged-child relationship before any live
+  // dependency guard (and therefore before the first possible PUT).
   for (const proposal of ordered) {
     try {
       assertCanonicalProposal(proposal);
-      if (proposal.pre_write_guard) {
-        await assertChildren({ r2, guard: proposal.pre_write_guard, allowStagedChildren: true });
-      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        results: applicationFailureResults(ordered, proposal, message, "proposal_preflight"),
+        failure: { key: proposal.key, error: message },
+      };
+    }
+  }
+  for (const proposal of ordered) {
+    try {
+      assertCanonicalProposalRelationships(proposal, proposals);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        results: applicationFailureResults(ordered, proposal, message, "proposal_preflight"),
+        failure: { key: proposal.key, error: message },
+      };
+    }
+  }
+  // Pass 2: probe every dependency against the current live inventory. Exact
+  // staged children may be read as raw identities here because their canonical
+  // replacement bodies passed Pass 1. The normal per-parent write guard below
+  // receives no relaxation and fully validates the written child.
+  const validatedStagedProposalKeys = new Set(ordered.map((proposal) => proposal.key));
+  for (const proposal of ordered) {
+    if (!proposal.pre_write_guard) continue;
+    try {
+      await assertChildren({
+        r2,
+        guard: proposal.pre_write_guard,
+        allowStagedChildren: true,
+        validatedStagedProposalKeys,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
