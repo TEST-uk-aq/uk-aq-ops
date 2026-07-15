@@ -107,12 +107,7 @@ async function readChildren({ store, prefix, dayUtc, connectorId, kind, domain =
       throw new Error(`Invalid AQI ${kind} manifest: ${key}`);
     }
     children.push(payload);
-    identities.set(key, {
-      content_sha256: object.content_sha256 || sha256Hex(object.body),
-      r2_etag: object.r2_etag || object.etag || null,
-      source: object.source || "live_r2",
-      last_modified: object.last_modified || null,
-    });
+    identities.set(key, { sha256: sha256Hex(object.body), etag: object.etag || null });
   }
   return { children, identities };
 }
@@ -147,127 +142,39 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
   const verifiedTombstones = new Set(Object.entries(state?.tombstones || {})
     .filter(([, value]) => value?.r2_delete_verified === true)
     .map(([key]) => safeLocalKey(key)));
-  const dropboxPaths = walkLocalObjects(dropboxRoot, prefixes);
+  const paths = walkLocalObjects(dropboxRoot, prefixes);
   for (const rawKey of exactKeys) {
     const key = safeLocalKey(rawKey);
     const candidate = `${dropboxRoot}/${key}`;
-    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) dropboxPaths.set(key, candidate);
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) paths.set(key, candidate);
   }
-  for (const key of verifiedTombstones) dropboxPaths.delete(key);
-  const overlayPaths = new Map();
+  for (const key of verifiedTombstones) paths.delete(key);
   for (const [key, entry] of Object.entries(state?.objects || {})) {
     if (entry?.r2_verified === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
-      overlayPaths.set(safeLocalKey(key), entry.local_path);
+      paths.set(safeLocalKey(key), entry.local_path);
     }
   }
-  const liveObjects = new Map();
-  const inventoryDiagnostics = new Map();
-
-  function localObject(key, source) {
-    const localPath = (source === "overlay" ? overlayPaths : dropboxPaths).get(key);
-    if (!localPath) return null;
-    const body = fs.readFileSync(localPath);
-    return objectFromBody({ key, body, source, content_sha256: sha256Hex(body) });
-  }
-
-  function objectFor(key) {
-    if (verifiedTombstones.has(key)) return null;
-    if (overlayPaths.has(key)) return localObject(key, "overlay");
-    const live = liveObjects.get(key);
-    if (live) return objectFromBody({
-      key,
-      body: live.body,
-      source: "live_r2",
-      content_sha256: live.content_sha256,
-      r2_etag: live.r2_etag,
-      last_modified: live.last_modified,
-    });
-    return localObject(key, "dropbox");
-  }
-
   return {
     overlayRoot,
-    setLiveObject({ key, body, r2_etag = null, last_modified = null }) {
-      const normalized = safeLocalKey(key);
-      const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body);
-      liveObjects.set(normalized, {
-        body: buffer,
-        content_sha256: sha256Hex(buffer),
-        r2_etag: r2_etag || null,
-        last_modified: last_modified || null,
-      });
-    },
-    recordLiveInventory({ prefix, live_keys }) {
-      const normalizedPrefix = safeLocalKey(prefix).replace(/\/$/, "");
-      const backupKeys = [...dropboxPaths.keys()].filter((key) => key.startsWith(normalizedPrefix)).sort();
-      const liveKeys = [...new Set(live_keys.map(safeLocalKey))].sort();
-      const backup = new Set(backupKeys);
-      const live = new Set(liveKeys);
-      inventoryDiagnostics.set(normalizedPrefix, {
-        expected_child_keys: backupKeys,
-        actual_live_child_keys: liveKeys,
-        missing_keys: backupKeys.filter((key) => !live.has(key)),
-        unexpected_keys: liveKeys.filter((key) => !backup.has(key)),
-        expected_inventory_source: "dropbox",
-        state: backupKeys.length === liveKeys.length && backupKeys.every((key, index) => key === liveKeys[index])
-          ? "matched"
-          : "backup_drift",
-      });
-    },
-    inventoryDiagnostic(prefix) {
-      const normalized = safeLocalKey(prefix).replace(/\/$/, "");
-      const direct = inventoryDiagnostics.get(normalized);
-      const source = direct || [...inventoryDiagnostics.entries()]
-        .filter(([candidate]) => normalized.startsWith(`${candidate}/`))
-        .sort(([left], [right]) => right.length - left.length)[0]?.[1];
-      if (!source) return null;
-      const expectedChildKeys = source.expected_child_keys.filter((key) => key.startsWith(normalized));
-      const actualLiveChildKeys = source.actual_live_child_keys.filter((key) => key.startsWith(normalized));
-      const expected = new Set(expectedChildKeys);
-      const actual = new Set(actualLiveChildKeys);
-      return {
-        expected_child_keys: expectedChildKeys,
-        actual_live_child_keys: actualLiveChildKeys,
-        missing_keys: expectedChildKeys.filter((key) => !actual.has(key)),
-        unexpected_keys: actualLiveChildKeys.filter((key) => !expected.has(key)),
-        expected_inventory_source: source.expected_inventory_source,
-        state: expectedChildKeys.length === actualLiveChildKeys.length
-          && expectedChildKeys.every((key, index) => key === actualLiveChildKeys[index])
-          ? "matched"
-          : "backup_drift",
-      };
-    },
-    getObjectFromSourceIfExists(key, source) {
-      const normalized = safeLocalKey(key);
-      if (source === "live_r2") {
-        const live = liveObjects.get(normalized);
-        return live ? objectFromBody({ key: normalized, body: live.body, source, content_sha256: live.content_sha256, r2_etag: live.r2_etag, last_modified: live.last_modified }) : null;
-      }
-      return localObject(normalized, source);
-    },
-    getLiveTargetObjectIfExists(key) {
-      const normalized = safeLocalKey(key);
-      if (verifiedTombstones.has(normalized)) return null;
-      if (overlayPaths.has(normalized)) return localObject(normalized, "overlay");
-      const live = liveObjects.get(normalized);
-      return live ? objectFromBody({ key: normalized, body: live.body, source: "live_r2", content_sha256: live.content_sha256, r2_etag: live.r2_etag, last_modified: live.last_modified }) : null;
-    },
     getObject(key) {
       const normalized = safeLocalKey(key);
-      let object = objectFor(normalized);
-      if (!object && dynamicExactKeyPrefixes.some((prefix) => normalized.startsWith(`${safeLocalKey(prefix)}/`))) {
-        const candidate = `${dropboxRoot}/${normalized}`;
-        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-          dropboxPaths.set(normalized, candidate);
-          object = objectFor(normalized);
-        }
-      }
-      if (!object) {
+      if (verifiedTombstones.has(normalized)) {
         const error = new Error(`Combined local object unavailable: ${normalized}`);
         error.code = "OBJECT_NOT_FOUND";
         throw error;
       }
-      return object;
+      let localPath = paths.get(normalized);
+      if (!localPath && dynamicExactKeyPrefixes.some((prefix) => normalized.startsWith(`${safeLocalKey(prefix)}/`))) {
+        const candidate = `${dropboxRoot}/${normalized}`;
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) localPath = candidate;
+      }
+      if (!localPath) {
+        const error = new Error(`Combined local object unavailable: ${normalized}`);
+        error.code = "OBJECT_NOT_FOUND";
+        throw error;
+      }
+      const body = fs.readFileSync(localPath);
+      return objectFromBody({ key: normalized, body, etag: sha256Hex(body) });
     },
     getObjectIfExists(key) {
       try { return this.getObject(key); } catch (error) {
@@ -276,46 +183,12 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
       }
     },
     listAllObjects({ prefix }) {
-      const keys = new Set([...dropboxPaths.keys(), ...overlayPaths.keys(), ...liveObjects.keys()]);
-      return [...keys]
-        .filter((key) => key.startsWith(prefix) && !verifiedTombstones.has(key))
-        .map((key) => {
-          const object = objectFor(key);
-          return { key, size: object?.bytes ?? null, source: object?.source ?? null, content_sha256: object?.content_sha256 ?? null, r2_etag: object?.r2_etag ?? null };
-        })
-        .sort((left, right) => left.key.localeCompare(right.key));
-    },
-    listLiveTargetObjects({ prefix }) {
-      const keys = new Set([...overlayPaths.keys(), ...liveObjects.keys()]);
-      return [...keys]
-        .filter((key) => key.startsWith(prefix) && !verifiedTombstones.has(key))
-        .map((key) => {
-          const object = this.getLiveTargetObjectIfExists(key);
-          return { key, size: object?.bytes ?? null, source: object?.source ?? null, content_sha256: object?.content_sha256 ?? null, r2_etag: object?.r2_etag ?? null };
-        })
+      return [...paths.entries()]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, localPath]) => ({ key, size: fs.statSync(localPath).size, etag: null }))
         .sort((left, right) => left.key.localeCompare(right.key));
     },
   };
-}
-
-async function hydrateLiveR2State({ store, r2, prefixes, exactKeys = [] }) {
-  const liveKeys = new Set(exactKeys.map(safeLocalKey));
-  for (const prefix of prefixes) {
-    const entries = await r2ListAllObjects({ r2, prefix });
-    const keys = entries.map((entry) => safeLocalKey(entry?.key || "")).filter(Boolean);
-    store.recordLiveInventory({ prefix, live_keys: keys });
-    for (const key of keys) liveKeys.add(key);
-  }
-  for (const key of [...liveKeys].sort()) {
-    try {
-      const object = await r2GetObject({ r2, key });
-      store.setLiveObject({ key, body: object.body, r2_etag: object.etag, last_modified: object.last_modified });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (error?.code === "OBJECT_NOT_FOUND" || message.includes("(404)")) continue;
-      throw new Error(`Unable to hydrate live R2 state for ${key}: ${message}`);
-    }
-  }
 }
 
 // This adapter is used only for the parent pre-write race guard.  It is not a
@@ -331,17 +204,9 @@ function createR2RaceGuardStore(r2) {
   };
 }
 
-function objectFromBody({ key, body, source = "unknown", content_sha256 = null, r2_etag = null, last_modified = null }) {
+function objectFromBody({ key, body, etag = null }) {
   const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8");
-  return {
-    key,
-    body: buffer,
-    bytes: buffer.byteLength,
-    source,
-    content_sha256: content_sha256 || sha256Hex(buffer),
-    r2_etag: r2_etag || null,
-    last_modified: last_modified || null,
-  };
+  return { key, body: buffer, bytes: buffer.byteLength, etag };
 }
 
 function proposalView(proposal) {
@@ -351,46 +216,17 @@ function proposalView(proposal) {
     day_utc: proposal.day_utc,
     bytes: proposal.bytes,
     old_sha256: proposal.old_sha256,
-    old_r2_etag: proposal.old_r2_etag,
+    old_etag: proposal.old_etag,
     new_sha256: proposal.new_sha256,
     changed: proposal.changed,
     status: proposal.changed ? "planned" : "skipped_unchanged",
     dependencies: proposal.dependencies,
-    provenance: proposal.provenance || null,
-    pre_write_guard: proposal.pre_write_guard ? {
-      expected_child_keys: proposal.pre_write_guard.expected_children.map((child) => child.key),
-      expected_inventory_source: proposal.pre_write_guard.expected_inventory_source,
-      backup_inventory: proposal.pre_write_guard.backup_inventory,
-      last_live_inventory: proposal.pre_write_guard.last_live_inventory,
-    } : null,
     expected_verification: proposal.changed ? "exact_body_and_bytes" : "not_required",
     proposed_body: proposal.body,
   };
 }
 
-function manifestInventoryForKind(inventory, kind) {
-  if (!inventory) return null;
-  const pattern = kind === "connector"
-    ? /\/connector_id=\d+\/manifest\.json$/
-    : /\/pollutant_code=[^/]+\/manifest\.json$/;
-  const expectedChildKeys = inventory.expected_child_keys.filter((key) => pattern.test(key));
-  const actualLiveChildKeys = inventory.actual_live_child_keys.filter((key) => pattern.test(key));
-  const expected = new Set(expectedChildKeys);
-  const actual = new Set(actualLiveChildKeys);
-  return {
-    ...inventory,
-    expected_child_keys: expectedChildKeys,
-    actual_live_child_keys: actualLiveChildKeys,
-    missing_keys: expectedChildKeys.filter((key) => !actual.has(key)),
-    unexpected_keys: actualLiveChildKeys.filter((key) => !expected.has(key)),
-    state: expectedChildKeys.length === actualLiveChildKeys.length
-      && expectedChildKeys.every((key, index) => key === actualLiveChildKeys[index])
-      ? "matched"
-      : "backup_drift",
-  };
-}
-
-function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kind, domain = "observations", store = null }) {
+function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kind, domain = "observations" }) {
   return {
     prefix,
     dayUtc,
@@ -403,17 +239,13 @@ function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kin
       const identity = child.identities.get(key);
       return {
         key,
-        content_sha256: staged?.new_sha256 || identity.content_sha256,
+        sha256: staged?.new_sha256 || identity.sha256,
         // A staged child has no stable live ETag until it is written. Its exact
         // proposed body remains the required comparison in that case.
-        r2_etag: staged ? null : identity.r2_etag,
-        source: staged ? "planned_overlay" : identity.source,
+        etag: staged ? null : identity.etag,
         staged: Boolean(staged),
       };
     }).sort((left, right) => left.key.localeCompare(right.key)),
-    expected_inventory_source: "live_r2_snapshot",
-    backup_inventory: manifestInventoryForKind(store?.inventoryDiagnostic(prefix), kind),
-    last_live_inventory: null,
   };
 }
 
@@ -429,22 +261,8 @@ async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren 
   const expected = new Map(guard.expected_children.map((child) => [child.key, child]));
   const actualKeys = [...current.identities.keys()].sort();
   const expectedKeys = [...expected.keys()].sort();
-  const actual = new Set(actualKeys);
-  const expectedKeySet = new Set(expectedKeys);
-  const missingKeys = expectedKeys.filter((key) => !actual.has(key) && !(allowStagedChildren && expected.get(key)?.staged));
-  const unexpectedKeys = actualKeys.filter((key) => !expectedKeySet.has(key));
-  guard.last_live_inventory = {
-    expected_child_keys: expectedKeys,
-    actual_live_child_keys: actualKeys,
-    missing_keys: missingKeys,
-    unexpected_keys: unexpectedKeys,
-    expected_inventory_source: guard.expected_inventory_source || "live_r2_snapshot",
-    state: !missingKeys.length && !unexpectedKeys.length
-      ? "matched"
-      : "concurrent_live_change",
-  };
-  if (missingKeys.length || unexpectedKeys.length) {
-    throw new Error(`Blocked dependency: concurrent_live_change ${guard.kind} child key inventory changed before parent write under ${guard.prefix}; missing=${missingKeys.join(",") || "none"}; unexpected=${unexpectedKeys.join(",") || "none"}`);
+  if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error(`Blocked dependency: ${guard.kind} child key set changed before parent write under ${guard.prefix}`);
   }
   for (const key of expectedKeys) {
     const currentIdentity = current.identities.get(key);
@@ -453,17 +271,17 @@ async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren 
     // that deliberately has not been PUT yet.  Validate its key set now, then
     // compare its exact body at the normal per-parent guard after that child
     // has been verified.  Unstaged children must match in both passes.
-    if (currentIdentity && (!allowStagedChildren || !expectedIdentity.staged)
-      && currentIdentity.content_sha256 !== expectedIdentity.content_sha256) {
-      throw new Error(`Blocked dependency: concurrent_live_change ${guard.kind} child content changed before parent write: ${key}`);
+    if ((!allowStagedChildren || !expectedIdentity.staged)
+      && currentIdentity.sha256 !== expectedIdentity.sha256) {
+      throw new Error(`Blocked dependency: ${guard.kind} child body changed before parent write: ${key}`);
     }
-    if (expectedIdentity.r2_etag && currentIdentity.r2_etag && expectedIdentity.r2_etag !== currentIdentity.r2_etag) {
-      throw new Error(`Blocked dependency: concurrent_live_change ${guard.kind} child R2 ETag changed before parent write: ${key}`);
+    if (expectedIdentity.etag && currentIdentity.etag && expectedIdentity.etag !== currentIdentity.etag) {
+      throw new Error(`Blocked dependency: ${guard.kind} child ETag changed before parent write: ${key}`);
     }
   }
 }
 
-function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
+function createStagedObjectMap({ r2, store }) {
   const proposals = new Map();
   const indexProposalKind = (key) => key.includes("/timeseries_id=")
     ? "timeseries_metadata"
@@ -471,14 +289,12 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
       ? "latest_timeseries_index"
       : "pollutant_timeseries_index";
 
-  async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], preWriteGuard = null, provenance = null }) {
+  async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], preWriteGuard = null }) {
     const bodyText = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
     const previous = proposals.get(key);
-    // Proposal changed/unchanged state is always measured against the live
-    // target (or a verified current-run overlay), never against Dropbox.
-    const existing = previous || store.getLiveTargetObjectIfExists(key);
+    const existing = previous || store.getObjectIfExists(key);
     const oldBody = previous?.old_body ?? existing?.body?.toString("utf8") ?? null;
-    const oldEtag = previous?.old_r2_etag ?? existing?.r2_etag ?? null;
+    const oldEtag = previous?.old_etag ?? existing?.etag ?? null;
     const proposal = {
       key,
       kind: previous?.kind || kind,
@@ -488,12 +304,11 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
       bytes: Buffer.byteLength(bodyText, "utf8"),
       old_body: oldBody,
       old_sha256: oldBody === null ? null : sha256Hex(oldBody),
-      old_r2_etag: oldEtag,
+      old_etag: oldEtag,
       new_sha256: sha256Hex(bodyText),
       changed: oldBody !== bodyText,
       dependencies: [...new Set([...(previous?.dependencies || []), ...dependencies])].sort(),
       pre_write_guard: previous?.pre_write_guard || preWriteGuard,
-      provenance: previous?.provenance || provenance,
     };
     proposals.set(key, proposal);
     return proposal;
@@ -501,7 +316,7 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
 
   function stagedObject(key) {
     const proposal = proposals.get(key);
-    return proposal ? objectFromBody({ key, body: proposal.body, source: "planned_overlay", content_sha256: proposal.new_sha256 }) : null;
+    return proposal ? objectFromBody({ key, body: proposal.body, etag: proposal.new_sha256 }) : null;
   }
 
   const stagedR2 = {
@@ -510,30 +325,19 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
       await stage({ key, body, contentType: content_type, kind: indexProposalKind(key) });
     },
     adapter: {
-      getObject: async ({ key }) => {
-        const staged = stagedObject(key);
-        if (staged) return staged;
-        const indexKey = indexPrefixes.some((prefix) => key.startsWith(prefix));
-        const object = indexKey ? store.getLiveTargetObjectIfExists(key) : store.getObjectIfExists(key);
-        if (object) return object;
-        const error = new Error(`Combined ${indexKey ? "live target" : "local"} object unavailable: ${key}`);
-        error.code = "OBJECT_NOT_FOUND";
-        throw error;
-      },
+      getObject: async ({ key }) => stagedObject(key) || store.getObject(key),
       headObject: async ({ key }) => {
         const staged = stagedObject(key);
-        if (staged) return { exists: true, key, bytes: staged.bytes, etag: null, content_sha256: staged.content_sha256 };
-        const object = store.getLiveTargetObjectIfExists(key);
-        return object ? { exists: true, key, bytes: object.bytes, etag: object.r2_etag, content_sha256: object.content_sha256 } : { exists: false, key };
+        if (staged) return { exists: true, key, bytes: staged.bytes, etag: staged.etag };
+        const object = store.getObjectIfExists(key);
+        return object ? { exists: true, key, bytes: object.bytes, etag: object.etag } : { exists: false, key };
       },
       listAllObjects: async ({ prefix, max_keys }) => {
-        const entries = indexPrefixes.some((indexPrefix) => prefix.startsWith(indexPrefix))
-          ? store.listLiveTargetObjects({ prefix, max_keys })
-          : store.listAllObjects({ prefix, max_keys });
+        const entries = store.listAllObjects({ prefix, max_keys });
         const byKey = new Map(entries.map((entry) => [entry.key, entry]));
         for (const proposal of proposals.values()) {
           if (proposal.key.startsWith(prefix)) {
-            byKey.set(proposal.key, { key: proposal.key, size: proposal.bytes, source: "planned_overlay", content_sha256: proposal.new_sha256, r2_etag: null });
+            byKey.set(proposal.key, { key: proposal.key, size: proposal.bytes, etag: proposal.new_sha256 });
           }
         }
         return [...byKey.values()].sort((left, right) => left.key.localeCompare(right.key));
@@ -630,101 +434,27 @@ async function parquetFileEntry({ store, key, domain, pollutantCode }) {
   };
 }
 
-function canonicalManifestMetadata(payload, {
-  manifestKey,
-  domain,
-  grain,
-  profile,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-  manifestKind,
-}) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)
-    || payload.history_version !== "v2"
-    || payload.manifest_kind !== manifestKind
-    || payload.domain !== domain
-    || payload.grain !== grain
-    || payload.profile !== profile
-    || payload.manifest_key !== manifestKey
-    || payload.day_utc !== dayUtc
-    || payload.connector_id !== connectorId
-    || payload.pollutant_code !== pollutantCode
-    || !Array.isArray(payload.files)
-    || !Array.isArray(payload.parquet_object_keys)) return null;
-  const { manifest_hash: manifestHash, ...withoutHash } = payload;
-  if (typeof manifestHash !== "string" || manifestHash !== sha256Hex(JSON.stringify(withoutHash))) return null;
-  const backedUpAtUtc = typeof payload.backed_up_at_utc === "string" && !Number.isNaN(Date.parse(payload.backed_up_at_utc))
+function existingManifestMetadata(store, manifestKey) {
+  const existing = store.getObjectIfExists(manifestKey);
+  if (!existing) return { blocked_reason: "existing_manifest_metadata_unavailable" };
+  let payload;
+  try {
+    payload = jsonObject(existing, manifestKey);
+  } catch {
+    return { blocked_reason: "existing_manifest_metadata_invalid_json" };
+  }
+  const backedUpAtUtc = typeof payload?.backed_up_at_utc === "string"
+    && !Number.isNaN(Date.parse(payload.backed_up_at_utc))
     ? payload.backed_up_at_utc
     : null;
-  if (!backedUpAtUtc) return null;
-  return {
-    run_id: typeof payload.run_id === "string" || payload.run_id === null ? payload.run_id : null,
-    writer_git_sha: typeof payload.writer_git_sha === "string" || payload.writer_git_sha === null ? payload.writer_git_sha : null,
-    backed_up_at_utc: backedUpAtUtc,
-  };
-}
-
-function sourceManifestMetadata(store, source, label, manifestKey, expectation) {
-  const object = store.getObjectFromSourceIfExists(manifestKey, source);
-  if (!object) return null;
-  try {
-    const metadata = canonicalManifestMetadata(jsonObject(object, manifestKey), { manifestKey, ...expectation });
-    if (!metadata) return null;
-    return {
-      payload: metadata,
-      provenance: {
-        run_id: metadata.run_id === null ? "schema_nullable" : label,
-        writer_git_sha: metadata.writer_git_sha === null ? "schema_nullable" : label,
-        backed_up_at_utc: label,
-        source: label,
-      },
-    };
-  } catch {
-    return null;
-  }
-}
-
-function existingManifestMetadata(store, {
-  manifestKey,
-  base,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-  domain,
-}) {
-  const grain = domain === "aqilevels" ? "hourly" : null;
-  const profile = domain === "aqilevels" ? "data" : null;
-  const leafExpectation = { domain, grain, profile, dayUtc, connectorId, pollutantCode, manifestKind: "pollutant" };
-  for (const [source, label] of [["overlay", "existing_overlay_manifest"], ["live_r2", "existing_live_manifest"], ["dropbox", "dropbox_manifest"]]) {
-    const found = sourceManifestMetadata(store, source, label, manifestKey, leafExpectation);
-    if (found) return found;
-  }
-
-  // A canonical parent can supply equivalent writer/run provenance, but it
-  // cannot supply leaf file metadata. Prefer it only after a valid same-leaf
-  // copy was unavailable, and never invent a historical run ID or Git SHA.
-  const parentKey = `${base}/connector_id=${connectorId}/manifest.json`;
-  const parentExpectation = { domain, grain, profile, dayUtc, connectorId, pollutantCode: null, manifestKind: "connector" };
-  for (const [source, label] of [["live_r2", "parent_manifest_metadata"], ["dropbox", "parent_manifest_metadata"]]) {
-    const found = sourceManifestMetadata(store, source, label, parentKey, parentExpectation);
-    if (found) return found;
-  }
-
+  if (!backedUpAtUtc) return { blocked_reason: "existing_manifest_backed_up_at_utc_invalid" };
   return {
     payload: {
-      run_id: null,
-      writer_git_sha: null,
-      // The v2 schema requires a timestamp. This deterministic timestamp is
-      // explicitly repair-generated provenance, never a claim about the
-      // original writer's historical backup time.
-      backed_up_at_utc: `${dayUtc}T00:00:00.000Z`,
-    },
-    provenance: {
-      run_id: "schema_nullable",
-      writer_git_sha: "schema_nullable",
-      backed_up_at_utc: "repair_generated",
-      source: "repair_generated",
+      run_id: typeof payload?.run_id === "string" || payload?.run_id === null ? payload.run_id : null,
+      writer_git_sha: typeof payload?.writer_git_sha === "string" || payload?.writer_git_sha === null
+        ? payload.writer_git_sha
+        : null,
+      backed_up_at_utc: backedUpAtUtc,
     },
   };
 }
@@ -733,15 +463,16 @@ async function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId
   const pollutantPrefix = `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
   const partKeys = store.listAllObjects({ prefix: `${pollutantPrefix}/` })
     .map((entry) => entry.key)
-    .filter((key) => new RegExp(`^${pollutantPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/part-\\d+\\.parquet$`).test(key))
+    .filter((key) => /\/part-\d+\.parquet$/.test(key))
     .sort();
   if (!partKeys.length) return { blocked_reason: "final_parquet_objects_unavailable" };
   const manifestKey = `${pollutantPrefix}/manifest.json`;
-  const metadata = existingManifestMetadata(store, { manifestKey, base, dayUtc, connectorId, pollutantCode, domain });
+  const metadata = existingManifestMetadata(store, manifestKey);
+  if (metadata.blocked_reason) return metadata;
   try {
     const files = [];
     for (const key of partKeys) files.push(await parquetFileEntry({ store, key, domain, pollutantCode }));
-    return { manifestKey, payload: metadata.payload, provenance: metadata.provenance, files };
+    return { manifestKey, payload: metadata.payload, files };
   } catch (error) {
     return { blocked_reason: `final_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
   }
@@ -1185,27 +916,7 @@ export async function runV2ObservationsRepair({
     exactKeys: [latestIndexKey],
     dynamicExactKeyPrefixes: [config.timeseries_metadata_index_prefix_v2],
   });
-  // The Dropbox mirror is a reconstruction/provenance source, never the
-  // authority for whether a target exists or has changed. Hydrate this narrow
-  // day/index view from live R2 before planning so parents retain every live
-  // sibling and a live-missing index cannot be reported unchanged merely
-  // because an older Dropbox copy exists.
-  await hydrateLiveR2State({
-    store: localStore,
-    r2: config.r2,
-    prefixes: [...new Set(scopes.flatMap((scope) => [
-      `${dataPrefix}/day_utc=${scope.dayUtc}`,
-      `${indexPrefix}/day_utc=${scope.dayUtc}`,
-    ]))],
-    exactKeys: [latestIndexKey],
-  });
-  const staged = createStagedObjectMap({
-    r2: config.r2,
-    store: localStore,
-    indexPrefixes: [config.index_prefix_v2, indexPrefix, config.timeseries_metadata_index_prefix_v2]
-      .filter(Boolean)
-      .map((prefix) => `${String(prefix).replace(/\/+$/, "")}/`),
-  });
+  const staged = createStagedObjectMap({ r2: config.r2, store: localStore });
   const dayPlans = [];
   const blockedScopes = [];
   const blockedConnectorScopes = new Set();
@@ -1248,7 +959,7 @@ export async function runV2ObservationsRepair({
           blockedConnectorScopes.add(`${dayUtc}|${scope.connectorId}`);
           continue;
         }
-        const { manifestKey, payload, provenance, files } = source;
+        const { manifestKey, payload, files } = source;
         const rebuilt = buildHistoryV2PollutantManifest({
           domain,
           grain: domain === "aqilevels" ? "hourly" : null,
@@ -1269,7 +980,6 @@ export async function runV2ObservationsRepair({
           kind: "pollutant_manifest",
           dayUtc,
           dependencies: files.map((entry) => String(entry?.key || "")).filter(Boolean),
-          provenance,
         });
         proposalKeys.push(manifestKey);
       }
@@ -1296,7 +1006,6 @@ export async function runV2ObservationsRepair({
           connectorId: scope.connectorId,
           kind: "pollutant",
           domain,
-          store: localStore,
         }),
       });
       proposalKeys.push(key);
@@ -1328,7 +1037,6 @@ export async function runV2ObservationsRepair({
           connectorId: null,
           kind: "connector",
           domain,
-          store: localStore,
         }),
       });
       proposalKeys.push(dayManifestKey);

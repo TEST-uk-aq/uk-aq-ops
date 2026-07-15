@@ -10,13 +10,13 @@ function observations(startIso, hours, pollutant) {
   return Array.from({ length: hours }, (_, index) => ({ timeseries_id: 7, connector_id: 2, station_id: 9, pollutant_code: pollutant, observed_at: new Date(startMs + index * HOUR_MS).toISOString(), value: 20 }));
 }
 
-async function stationSeries({ pollutant, startIso, endIso, rows }) {
+async function stationSeries({ pollutant, startIso, endIso, rows, window = "24h", includeAqi = true }) {
   const originalFetch = globalThis.fetch;
   let calls = 0;
   let target = "";
   globalThis.fetch = async (input) => { calls += 1; target = String(input); return new Response(JSON.stringify({ data: rows, response_complete: true }), { status: 200 }); };
   try {
-    const response = await worker.fetch(new Request(`https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=${pollutant}&start_utc=${encodeURIComponent(startIso)}&end_utc=${encodeURIComponent(endIso)}&window=24h&format=objects`), env);
+    const response = await worker.fetch(new Request(`https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=${pollutant}&start_utc=${encodeURIComponent(startIso)}&end_utc=${encodeURIComponent(endIso)}&window=${window}&format=objects&include_aqi=${includeAqi}`), env);
     return { response, body: await response.json(), calls, target };
   } finally { globalThis.fetch = originalFetch; }
 }
@@ -56,4 +56,28 @@ test("qualified ingest fast path does not call an R2 upstream", async () => {
   const result = await stationSeries({ pollutant: "no2", startIso: start, endIso: "2026-07-05T12:00:00.000Z", rows: observations(start, 12, "no2") });
   assert.equal(result.calls, 1);
   assert.doesNotMatch(result.target, /r2|workers\.dev/i);
+});
+
+test("observations-only station-series skips AQI calculation and has an explicit disabled AQI section", async () => {
+  const start = "2026-07-06T00:00:00.000Z";
+  const result = await stationSeries({ pollutant: "no2", startIso: start, endIso: "2026-07-06T12:00:00.000Z", rows: observations(start, 12, "no2"), window: "12h", includeAqi: false });
+  assert.equal(result.calls, 1);
+  assert.equal(result.body.source.mode, "ingest_observations_only");
+  assert.equal(result.body.aqi.enabled, false);
+  assert.equal(result.body.aqi.state, "disabled");
+  assert.deepEqual(result.body.aqi.rows, []);
+  assert.equal(result.body.aqi.next_chunk_end_utc, null);
+  assert.equal(result.body.observations.next_chunk_end_utc, null);
+  assert.equal(result.response.headers.get("Cache-Control"), "public, max-age=60, s-maxage=60");
+});
+
+test("long observations-only station-series stays bounded and never requests the R2 AQI head", async () => {
+  const end = "2026-07-20T00:00:00.000Z";
+  const headStart = "2026-07-13T00:00:00.000Z";
+  const result = await stationSeries({ pollutant: "pm25", startIso: "2026-07-01T00:00:00.000Z", endIso: end, rows: observations(headStart, 168, "pm25"), window: "31d", includeAqi: false });
+  assert.equal(result.calls, 1);
+  assert.match(result.target, /start_utc=2026-07-13T00%3A00%3A00.000Z/);
+  assert.equal(result.body.aqi.enabled, false);
+  assert.equal(result.body.observations.rows.length, 168);
+  assert.equal(result.body.observations.next_chunk_end_utc, headStart);
 });
