@@ -7,7 +7,7 @@ enabled = true
 
 [[services]]
 binding = "STATION_HISTORY"
-service = "uk-aq-station-history"
+service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
 
 # Runtime secrets expected:
 # - SUPABASE_URL
