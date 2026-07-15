@@ -1,0 +1,14 @@
+name = "uk-aq-station-history"
+main = "src/index.mjs"
+compatibility_date = "2026-07-15"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+
+# No routes or custom domains: this Worker is reachable only through the
+# uk-aq-cache-proxy STATION_HISTORY Service Binding.

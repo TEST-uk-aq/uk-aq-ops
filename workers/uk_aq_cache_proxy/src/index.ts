@@ -11,8 +11,10 @@ import { RequestValidationError, R2HistoryFetchError } from "./station_history/c
 import * as stationHistoryRequestWindow from "./station_history/request_window.mjs";
 import * as stationHistoryCacheKeys from "./station_history/cache_keys.mjs";
 import * as stationHistoryObservations from "./station_history/observations.mjs";
+import * as stationHistoryStaleCache from "./station_history/stale_cache.mjs";
 
 export interface Env {
+  STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
   SB_SECRET_KEY: unknown;
@@ -59,6 +61,15 @@ export interface Env {
   UK_AQ_DROPBOX_ROOT: unknown;
   UK_AIR_ERROR_DROPBOX_FOLDER: unknown;
   UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES: unknown;
+  UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED: unknown;
+  UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED: unknown;
+  UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED: unknown;
+  UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: unknown;
+  UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS: unknown;
+  UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS: unknown;
+  UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS: unknown;
+  UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS: unknown;
+  UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS: unknown;
 }
 
 
@@ -182,6 +193,7 @@ const CACHE_PROFILES: Record<CacheProfileName, CacheProfile> = {
 };
 
 const EXTERNAL_AQI_HISTORY_UPSTREAM = "__uk_aq_aqi_history_r2_api__";
+const EXTERNAL_STATION_SERIES_UPSTREAM = "__uk_aq_station_history_service__";
 const EXTERNAL_LATEST_SNAPSHOT_UPSTREAM = "__uk_aq_latest_snapshot_r2_api__";
 const LATEST_SNAPSHOT_CONTRACT_VERSION = "v2";
 const LATEST_SNAPSHOT_CACHE_KEY_PARAM = "__uk_aq_snapshot_contract";
@@ -198,6 +210,7 @@ const FUNCTION_PROFILE_MAP: Record<string, CacheProfileName> = {
   uk_aq_pcon_hex: "metadata",
   uk_aq_public_networks: "metadata",
   [EXTERNAL_AQI_HISTORY_UPSTREAM]: "aqi_history_recent",
+  [EXTERNAL_STATION_SERIES_UPSTREAM]: "realtime",
   [EXTERNAL_LATEST_SNAPSHOT_UPSTREAM]: "realtime",
   [EXTERNAL_POSTCODE_LOOKUP_UPSTREAM]: "postcode_lookup",
   [EXTERNAL_POSTCODE_SUGGEST_UPSTREAM]: "postcode_lookup",
@@ -213,6 +226,7 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
   "pcon-hex": "uk_aq_pcon_hex",
   networks: "uk_aq_public_networks",
   "aqi-history": EXTERNAL_AQI_HISTORY_UPSTREAM,
+  "station-series": EXTERNAL_STATION_SERIES_UPSTREAM,
   "latest-snapshot": EXTERNAL_LATEST_SNAPSHOT_UPSTREAM,
   postcode_lookup: EXTERNAL_POSTCODE_LOOKUP_UPSTREAM,
   "postcode-lookup": EXTERNAL_POSTCODE_LOOKUP_UPSTREAM,
@@ -521,7 +535,7 @@ function addCorsHeaders(headers: Headers, requestOrigin: string | null, allowedO
   headers.set("Access-Control-Max-Age", "86400");
   headers.set(
     "Access-Control-Expose-Headers",
-    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version",
+    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason",
   );
   appendVary(headers, "Origin");
 }
@@ -2975,6 +2989,17 @@ export default {
       r2FirstRaw: await readSecret(env.UK_AQ_TIMESERIES_R2_FIRST),
       allowIngestOverwriteRaw: await readSecret(env.UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE),
     });
+    const stationHistoryRouting = {
+      stationSeries: parseBooleanFlag(await readSecret(env.UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED)),
+      aqiHistory: parseBooleanFlag(await readSecret(env.UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED)),
+      timeseries: parseBooleanFlag(await readSecret(env.UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED)),
+    };
+    if (upstreamFunction === EXTERNAL_STATION_SERIES_UPSTREAM && !stationHistoryRouting.stationSeries) {
+      return makeErrorResponse(404, "route_not_found", requestOrigin, allowedOrigins);
+    }
+    if (upstreamFunction === EXTERNAL_STATION_SERIES_UPSTREAM && !env.STATION_HISTORY) {
+      return makeErrorResponse(503, "station_history_binding_unavailable", requestOrigin, allowedOrigins);
+    }
     const aqiProxyHourlyGenerationEnabled = stationHistoryCacheKeys.isAqiProxyHourlyGenerationEnabled(
       await readSecret(env.UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED),
     );
@@ -3011,16 +3036,42 @@ export default {
     );
     const profile = CACHE_PROFILES[profileName];
     const usingExternalAqiHistoryUpstream = upstreamFunction === EXTERNAL_AQI_HISTORY_UPSTREAM;
+    const usingStationSeriesUpstream = upstreamFunction === EXTERNAL_STATION_SERIES_UPSTREAM;
     const usingExternalLatestSnapshotUpstream = upstreamFunction === EXTERNAL_LATEST_SNAPSHOT_UPSTREAM;
     const usingExternalPostcodeLookupUpstream = upstreamFunction === EXTERNAL_POSTCODE_LOOKUP_UPSTREAM;
     const usingExternalPostcodeSuggestUpstream = upstreamFunction === EXTERNAL_POSTCODE_SUGGEST_UPSTREAM;
     const usingExternalPostcodePrefixHintsUpstream = upstreamFunction === EXTERNAL_POSTCODE_PREFIX_HINTS_UPSTREAM;
     const usingExternalUpstream =
       usingExternalAqiHistoryUpstream ||
+      usingStationSeriesUpstream ||
       usingExternalLatestSnapshotUpstream ||
       usingExternalPostcodeLookupUpstream ||
       usingExternalPostcodeSuggestUpstream ||
       usingExternalPostcodePrefixHintsUpstream;
+    const stationHistoryInternalRoute = usingStationSeriesUpstream && stationHistoryRouting.stationSeries
+      ? "/v1/station-series"
+      : usingExternalAqiHistoryUpstream && stationHistoryRouting.aqiHistory
+      ? "/v1/aqi-history"
+      : upstreamFunction === TIMESERIES_UPSTREAM_FUNCTION && stationHistoryRouting.timeseries
+      ? "/v1/observations-history"
+      : null;
+    const stationHistoryStaleConfig = stationHistoryStaleCache.resolveStaleCacheConfig({
+      UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: await readSecret(env.UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED),
+      UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS: await readSecret(env.UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS),
+      UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS: await readSecret(env.UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS),
+      UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS: await readSecret(env.UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS),
+      UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS: await readSecret(env.UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS),
+      UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS: await readSecret(env.UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS),
+    });
+    const stationHistoryStaleRequestSupported = Boolean(
+      stationHistoryInternalRoute
+      && stationHistoryStaleConfig.enabled
+      && env.STATION_HISTORY
+      && stationHistoryStaleCache.isSupportedStationHistoryStaleRequest(
+        normalizedRequestUrl,
+        stationHistoryInternalRoute,
+      )
+    );
 
     const supabaseUrl = await readSecret(env.SUPABASE_URL);
     const supabasePublishableKey = await readSecret(env.SB_PUBLISHABLE_DEFAULT_KEY);
@@ -3066,11 +3117,25 @@ export default {
 
     const shouldUseCache = shouldCacheRequest(request, bypassRequested);
     const cache = (caches as unknown as { default: Cache }).default;
-    const cacheKey = new Request(normalizedRequestUrl.toString(), { method: "GET" });
+    const stationHistoryVersionedKeys = stationHistoryStaleRequestSupported
+      ? stationHistoryStaleCache.buildFreshAndStaleCacheKeys(normalizedRequestUrl)
+      : null;
+    const cacheKey = stationHistoryVersionedKeys?.fresh
+      ?? new Request(normalizedRequestUrl.toString(), { method: "GET" });
 
     if (shouldUseCache && request.method === "GET") {
-      const cachedResponse = await cache.match(cacheKey);
+      let cachedResponse = await cache.match(cacheKey);
+      if (
+        cachedResponse
+        && stationHistoryStaleRequestSupported
+        && !stationHistoryStaleCache.isFreshCacheResponse(cachedResponse)
+      ) {
+        cachedResponse = undefined;
+      }
       if (cachedResponse) {
+        if (stationHistoryStaleRequestSupported) {
+          cachedResponse = stationHistoryStaleCache.buildFreshHitResponse(cachedResponse);
+        }
         if (matchesIfNoneMatch(request.headers.get("If-None-Match"), cachedResponse.headers.get("ETag"))) {
           const notModifiedHeaders = new Headers();
           const etag = cachedResponse.headers.get("ETag");
@@ -3115,7 +3180,7 @@ export default {
       }
     }
 
-    if (useTimeseriesV2Skeleton) {
+    if (useTimeseriesV2Skeleton && !stationHistoryRouting.timeseries) {
       const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
       let stitched: TimeseriesV2StitchResult;
       try {
@@ -3195,6 +3260,143 @@ export default {
         ctx.waitUntil(cache.put(cacheKey, stitchedResponse.clone()));
       }
       return stitchedResponse;
+    }
+
+    if (stationHistoryInternalRoute && env.STATION_HISTORY) {
+      const internalUrl = new URL(`https://station-history.internal${stationHistoryInternalRoute}`);
+      internalUrl.search = stationHistoryCacheKeys
+        .stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl)
+        .search;
+      const internalHeaders = new Headers();
+      const forwardedConditionalHeaders = stationHistoryStaleRequestSupported
+        ? ["Accept"]
+        : ["Accept", "If-None-Match", "If-Modified-Since"];
+      for (const name of forwardedConditionalHeaders) {
+        const value = request.headers.get(name);
+        if (value) internalHeaders.set(name, value);
+      }
+      internalHeaders.set("X-UK-AQ-Station-History-Contract", "v1");
+      const tryStaleFallback = async (reason: string): Promise<Response | null> => {
+        if (!stationHistoryStaleCache.shouldAttemptStaleFallback({
+          enabled: stationHistoryStaleConfig.enabled,
+          shouldUseCache,
+          requestSupported: stationHistoryStaleRequestSupported,
+          upstreamFailure: true,
+        }) || !stationHistoryVersionedKeys) {
+          return null;
+        }
+        const storedStale = await cache.match(stationHistoryVersionedKeys.stale);
+        if (!storedStale || !stationHistoryStaleCache.isValidStaleCacheResponse(storedStale)) {
+          return null;
+        }
+        const staleResponse = await stationHistoryStaleCache.buildStaleFallbackResponse(storedStale, reason);
+        if (!staleResponse) return null;
+        const staleHeaders = new Headers(staleResponse.headers);
+        staleHeaders.set("X-UK-AQ-Cache-Profile", profileName);
+        staleHeaders.set("X-UK-AQ-Station-History-Route", stationHistoryInternalRoute);
+        addAqiCacheDiagnosticHeaders(staleHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
+        addCorsHeaders(staleHeaders, requestOrigin, allowedOrigins);
+        return new Response(staleResponse.body, {
+          status: staleResponse.status,
+          statusText: staleResponse.statusText,
+          headers: staleHeaders,
+        });
+      };
+      let internalResponse: Response;
+      try {
+        internalResponse = await env.STATION_HISTORY.fetch(new Request(internalUrl.toString(), {
+          method: request.method,
+          headers: internalHeaders,
+        }));
+      } catch (_err) {
+        const staleResponse = await tryStaleFallback("upstream_fetch_failed");
+        if (staleResponse) return staleResponse;
+        return makeErrorResponse(502, "station_history_internal_fetch_failed", requestOrigin, allowedOrigins);
+      }
+      if (stationHistoryStaleCache.isUpstreamFailureStatus(internalResponse.status)) {
+        const staleResponse = await tryStaleFallback(`upstream_status_${internalResponse.status}`);
+        if (staleResponse) return staleResponse;
+      }
+      const stationHistoryInspection = stationHistoryStaleRequestSupported
+        ? await stationHistoryStaleCache.inspectStationHistoryResponse(
+          internalResponse.clone(),
+          stationHistoryInternalRoute,
+        )
+        : null;
+      const responseHeaders = new Headers(internalResponse.headers);
+      responseHeaders.delete("Set-Cookie");
+      responseHeaders.set("X-UK-AQ-Cache", shouldUseCache ? "MISS" : "BYPASS");
+      responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
+      responseHeaders.set("X-UK-AQ-Station-History-Route", stationHistoryInternalRoute);
+      addAqiCacheDiagnosticHeaders(responseHeaders, upstreamFunction, normalizedRequestUrl, aqiMutableHours, aqiProxyHourlyGenerationEnabled);
+      let stationHistoryCacheMetadata: ReturnType<typeof stationHistoryStaleCache.buildCacheMetadata> | null = null;
+      let stationHistoryCachePolicy: ReturnType<typeof stationHistoryStaleCache.resolveRouteCachePolicy> | null = null;
+      if (
+        stationHistoryInspection?.cacheable
+        && shouldUseCache
+        && request.method === "GET"
+        && stationHistoryVersionedKeys
+      ) {
+        const existingFreshSeconds = stationHistoryStaleCache.resolveFreshSecondsFromCacheControl(
+          responseHeaders.get("Cache-Control"),
+          profile.edgeTtlSeconds,
+        );
+        stationHistoryCachePolicy = stationHistoryStaleCache.resolveRouteCachePolicy(
+          stationHistoryInternalRoute,
+          stationHistoryInspection,
+          stationHistoryStaleConfig,
+          existingFreshSeconds,
+        );
+        stationHistoryCacheMetadata = stationHistoryStaleCache.buildCacheMetadata(
+          Date.now(),
+          stationHistoryCachePolicy,
+        );
+        if (stationHistoryInternalRoute === "/v1/station-series") {
+          responseHeaders.set(
+            "Cache-Control",
+            `public, max-age=${stationHistoryCachePolicy.freshSeconds}, s-maxage=${stationHistoryCachePolicy.freshSeconds}`,
+          );
+        }
+        stationHistoryStaleCache.applyRefreshMetadataHeaders(
+          responseHeaders,
+          stationHistoryCacheMetadata,
+        );
+      }
+      addCorsHeaders(responseHeaders, requestOrigin, allowedOrigins);
+      const response = new Response(internalResponse.body, { status: internalResponse.status, statusText: internalResponse.statusText, headers: responseHeaders });
+      if (stationHistoryCacheMetadata && stationHistoryCachePolicy && stationHistoryVersionedKeys) {
+        const freshStored = stationHistoryStaleCache.buildStoredCacheResponse(
+          response.clone(),
+          stationHistoryCacheMetadata,
+          "fresh",
+          stationHistoryCachePolicy.freshSeconds,
+        );
+        const staleStored = stationHistoryStaleCache.buildStoredCacheResponse(
+          response.clone(),
+          stationHistoryCacheMetadata,
+          "stale",
+          stationHistoryCachePolicy.freshSeconds + stationHistoryCachePolicy.maxStaleSeconds,
+        );
+        ctx.waitUntil(Promise.all([
+          cache.put(stationHistoryVersionedKeys.fresh, freshStored),
+          cache.put(stationHistoryVersionedKeys.stale, staleStored),
+        ]));
+      } else if (
+        !stationHistoryStaleRequestSupported
+        && shouldUseCache
+        && request.method === "GET"
+        && isCacheableUpstreamResponse(internalResponse, { allowAqiAuthenticatedNoStore: usingExternalAqiHistoryUpstream })
+      ) {
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
+      }
+      if (
+        stationHistoryCacheMetadata
+        && matchesIfNoneMatch(request.headers.get("If-None-Match"), response.headers.get("ETag"))
+      ) {
+        const notModifiedHeaders = new Headers(response.headers);
+        return new Response(null, { status: 304, headers: notModifiedHeaders });
+      }
+      return response;
     }
 
     let upstreamUrl: URL;

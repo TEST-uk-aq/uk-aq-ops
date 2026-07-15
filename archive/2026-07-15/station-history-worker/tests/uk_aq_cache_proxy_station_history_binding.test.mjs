@@ -1,0 +1,16 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+test("gateway declares the private STATION_HISTORY Service Binding and disabled route flags", async () => {
+  const [source, wrangler] = await Promise.all([
+    readFile("workers/uk_aq_cache_proxy/src/index.ts", "utf8"),
+    readFile("workers/uk_aq_cache_proxy/wrangler.toml", "utf8"),
+  ]);
+  assert.match(wrangler, /binding = "STATION_HISTORY"/);
+  assert.match(wrangler, /service = "uk-aq-station-history"/);
+  assert.match(source, /UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED/);
+  assert.match(source, /UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED/);
+  assert.match(source, /station_history_internal_fetch_failed/);
+  assert.match(source, /X-UK-AQ-Station-History-Route/);
+});
