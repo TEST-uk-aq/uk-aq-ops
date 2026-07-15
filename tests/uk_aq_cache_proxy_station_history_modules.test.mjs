@@ -5,9 +5,11 @@ import { RequestValidationError } from "../workers/uk_aq_cache_proxy/src/station
 import {
   buildTimeseriesV2RequestWindow,
   canonicalizeTimeseriesV2RequestUrl,
+  isProgressiveStationHistoryChunkRequest,
 } from "../workers/uk_aq_cache_proxy/src/station_history/request_window.mjs";
 import {
   applyAqiProxyHourlyGenerationCacheComponent,
+  applyStationSeriesAqiGenerationCacheComponent,
   cachedStationSeriesIdentityMatchesRequest,
   canonicalizeAqiHistoryRequestUrl,
   canonicalizeStationSeriesRequestUrl,
@@ -23,6 +25,11 @@ test("station-history request module preserves v2 cache-key canonicalisation", (
   );
   assert.equal(result.url.search, "?timeseries_id=7&pollutant=pm25&window=24h&format=json&v=2");
   assert.deepEqual(result.strippedCacheBusters, ["_t"]);
+});
+
+test("only explicit bounded progressive history requests qualify for Service Binding delegation", () => {
+  assert.equal(isProgressiveStationHistoryChunkRequest(new URL("https://cache.test/api/aq/timeseries?timeseries_id=7&window=24h&v=2")), false);
+  assert.equal(isProgressiveStationHistoryChunkRequest(new URL("https://cache.test/api/aq/aqi-history?timeseries_id=7&start_utc=2026-07-01T00:00:00Z&end_utc=2026-07-02T00:00:00Z&stable_head_start_utc=2026-07-02T00:00:00Z")), true);
 });
 
 test("station-history request module retains the v2 validation contract", () => {
@@ -74,6 +81,33 @@ test("station-series cache identity is deterministic without trusting the option
   );
   assert.notEqual(otherSeries.toString(), withoutConnector.toString());
   assert.notEqual(observationsOnly.toString(), withoutConnector.toString());
+});
+
+test("AQI-enabled station-series uses an internal hourly generation while observations-only omits it", () => {
+  const enabled = applyStationSeriesAqiGenerationCacheComponent(
+    new URL("https://cache.test/api/aq/station-series?timeseries_id=7&include_aqi=true"),
+    STATION_SERIES_UPSTREAM,
+    true,
+    STATION_SERIES_UPSTREAM,
+    Date.parse("2026-07-15T10:59:00Z"),
+  );
+  const nextHour = applyStationSeriesAqiGenerationCacheComponent(
+    enabled,
+    STATION_SERIES_UPSTREAM,
+    true,
+    STATION_SERIES_UPSTREAM,
+    Date.parse("2026-07-15T11:00:00Z"),
+  );
+  const observationsOnly = applyStationSeriesAqiGenerationCacheComponent(
+    new URL("https://cache.test/api/aq/station-series?timeseries_id=7&include_aqi=false"),
+    STATION_SERIES_UPSTREAM,
+    true,
+    STATION_SERIES_UPSTREAM,
+    Date.parse("2026-07-15T11:00:00Z"),
+  );
+  assert.equal(enabled.searchParams.get("__uk_aq_aqi_proxy_generation_hour"), "1:2026-07-15T10:00:00.000Z");
+  assert.equal(nextHour.searchParams.get("__uk_aq_aqi_proxy_generation_hour"), "1:2026-07-15T11:00:00.000Z");
+  assert.equal(observationsOnly.searchParams.has("__uk_aq_aqi_proxy_generation_hour"), false);
 });
 
 test("a cached station-series response accepts only a matching supplied connector hint", async () => {

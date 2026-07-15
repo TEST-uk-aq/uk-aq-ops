@@ -8,6 +8,7 @@ import {
   classifyChunk,
   parseHistoryChunkRequest,
 } from "../workers/uk_aq_station_history/src/history_chunks.mjs";
+import { resolveStationHistoryPolicy } from "../workers/uk_aq_station_history/src/policy.mjs";
 
 function chunkUrl(path, start, end, extra = "") {
   return new URL(`https://internal${path}?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=${encodeURIComponent(start)}&end_utc=${encodeURIComponent(end)}&stable_head_start_utc=${encodeURIComponent("2026-07-08T00:00:00.000Z")}&format=objects${extra}`);
@@ -41,6 +42,16 @@ test("chunks overlapping the stable head are rejected", () => {
   const parsed = parseHistoryChunkRequest(chunkUrl("/v1/aqi-history", "2026-07-07T00:00:00.000Z", "2026-07-09T00:00:00.000Z"), "aqi");
   assert.equal(parsed.ok, false);
   assert.equal(parsed.code, "history_chunk_overlaps_stable_head");
+});
+
+test("station-history source and chunk limits are configurable with safe bounded defaults", () => {
+  const defaults = resolveStationHistoryPolicy({});
+  assert.deepEqual(defaults, { stableAqiHeadMaxHours: 168, aqiChunkMaxHours: 744, observationChunkMaxHours: 168, observationOverlapHours: 2, obsAqiDbTimeoutMs: 10000, ingestRetentionDays: 5 });
+  const tuned = resolveStationHistoryPolicy({ UK_AQ_STATION_HISTORY_AQI_CHUNK_MAX_HOURS: "24", UK_AQ_STATION_HISTORY_OBSERVATION_OVERLAP_HOURS: "3", UK_AQ_STATION_HISTORY_OBSAQIDB_TIMEOUT_MS: "5000" });
+  assert.equal(tuned.aqiChunkMaxHours, 24);
+  assert.equal(tuned.observationOverlapHours, 3);
+  assert.equal(tuned.obsAqiDbTimeoutMs, 5000);
+  assert.equal(resolveStationHistoryPolicy({ UK_AQ_STATION_HISTORY_OBSERVATION_OVERLAP_HOURS: "9" }).observationOverlapHours, 2);
 });
 
 test("incomplete AQI and observation R2 responses remain independently incomplete", () => {

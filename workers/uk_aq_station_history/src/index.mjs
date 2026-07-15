@@ -6,7 +6,6 @@ import {
   sourceObservationsToNarrowRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
 import {
-  STABLE_HEAD_MAX_HOURS,
   mergeStableAqiHead,
   missingHeadHours,
   normalizeExactR2AqiRows,
@@ -27,10 +26,14 @@ import {
   resolveAuthoritativeTimeseriesIdentity,
   StationHistoryIdentityError,
 } from "./identity.mjs";
+import { readDirectIngestObservations } from "./ingest_observations.mjs";
+import { mergeObservationRowsPreferR2, readR2Observations } from "./r2_observations.mjs";
+import { resolveStationHistoryPolicy } from "./policy.mjs";
 
 const CONTRACT_VERSION = "v1";
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 function headersFor(responseHeaders = undefined) {
   const headers = new Headers(responseHeaders);
@@ -47,89 +50,24 @@ function errorResponse(status, code, route, detail = undefined) {
 }
 
 function required(value) { return String(value ?? "").trim(); }
-
-function parsePositiveInt(value) {
-  const numeric = Number(String(value ?? "").trim());
-  return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
-}
-
-function parseIncludeAqi(value) {
-  return !["0", "false", "no", "off"].includes(String(value ?? "").trim().toLowerCase());
-}
-
-function parseBounds(url) {
-  const startMs = Date.parse(String(url.searchParams.get("start_utc") ?? ""));
-  const endMs = Date.parse(String(url.searchParams.get("end_utc") ?? ""));
-  return Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs ? { startMs, endMs } : null;
-}
-
-function outputHours(startMs, endMs) {
-  const hours = [];
-  for (let cursor = Math.floor(startMs / HOUR_MS) * HOUR_MS; cursor < endMs; cursor += HOUR_MS) hours.push(cursor);
-  return hours;
-}
-
-function responseRows(payload) {
-  return Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.rows) ? payload.rows : [];
-}
-
-function sourceComplete(payload, rows, contextStartMs, endMs) {
-  if (payload?.response_complete === false || payload?.meta?.response_complete === false) return false;
-  const observedHours = new Set(rows.map((row) => Math.floor(Date.parse(row.observed_at) / HOUR_MS) * HOUR_MS).filter(Number.isFinite));
-  return outputHours(contextStartMs, endMs).every((hour) => observedHours.has(hour));
-}
-
-function gapRanges(rows, startMs, endMs, timestampField) {
-  const present = new Set(rows.map((row) => Math.floor(Date.parse(row[timestampField]) / HOUR_MS) * HOUR_MS).filter(Number.isFinite));
-  return outputHours(startMs, endMs).filter((hour) => !present.has(hour)).map((hour) => ({
-    start_utc: new Date(hour).toISOString(), end_utc: new Date(hour + HOUR_MS).toISOString(),
-  }));
-}
-
-function sourceRowsCoverAqiContext(rows, hours, contextHours) {
-  const observedHours = new Set(rows
-    .map((row) => Math.floor(Date.parse(row.observed_at) / HOUR_MS) * HOUR_MS)
-    .filter(Number.isFinite));
-  return hours.every((hour) => {
-    const hourMs = Date.parse(hour);
-    if (!Number.isFinite(hourMs)) return false;
-    for (let offset = 0; offset <= contextHours; offset += 1) {
-      if (!observedHours.has(hourMs - offset * HOUR_MS)) return false;
-    }
-    return true;
-  });
-}
+function positiveInt(value) { const n = Number(String(value ?? "").trim()); return Number.isInteger(n) && n > 0 ? n : null; }
+function includeAqi(value) { return !["0", "false", "no", "off"].includes(String(value ?? "").trim().toLowerCase()); }
 
 export function resolveStationSeriesRequest(url) {
-  const timeseriesId = parsePositiveInt(url.searchParams.get("timeseries_id"));
-  const connectorIdText = required(url.searchParams.get("connector_id"));
-  const connectorId = connectorIdText ? parsePositiveInt(connectorIdText) : null;
+  const timeseriesId = positiveInt(url.searchParams.get("timeseries_id"));
+  const connectorText = required(url.searchParams.get("connector_id"));
+  const connectorId = connectorText ? positiveInt(connectorText) : null;
   const pollutant = normalizePollutantCode(url.searchParams.get("pollutant"));
-  const bounds = parseBounds(url);
-  if (!timeseriesId || (connectorIdText && !connectorId) || !pollutant || !bounds) return null;
-  const includeAqi = parseIncludeAqi(url.searchParams.get("include_aqi"));
-  const contextHours = includeAqi && (pollutant === "pm25" || pollutant === "pm10") ? 23 : 0;
+  const startMs = Date.parse(String(url.searchParams.get("start_utc") ?? ""));
+  const endMs = Date.parse(String(url.searchParams.get("end_utc") ?? ""));
+  if (!timeseriesId || (connectorText && !connectorId) || !pollutant || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return null;
+  const aqiEnabled = includeAqi(url.searchParams.get("include_aqi"));
+  const contextHours = aqiEnabled && (pollutant === "pm25" || pollutant === "pm10") ? 23 : 0;
   return {
-    timeseriesId, connectorId, pollutant, contextHours,
-    startMs: bounds.startMs, endMs: bounds.endMs,
-    contextStartMs: bounds.startMs - contextHours * HOUR_MS,
-    window: String(url.searchParams.get("window") ?? "").trim() || null,
-    includeAqi,
-  };
-}
-
-function attachAuthoritativeIdentity(body, identity) {
-  const authoritative = publicTimeseriesIdentity(identity);
-  return {
-    ...body,
-    request: {
-      ...body.request,
-      timeseries_id: authoritative.timeseries_id,
-      connector_id: authoritative.connector_id,
-      station_id: authoritative.station_id,
-      pollutant: authoritative.pollutant,
-    },
-    identity: authoritative,
+    timeseriesId, connectorId, pollutant, startMs, endMs, contextHours,
+    contextStartMs: startMs - contextHours * HOUR_MS,
+    includeAqi: aqiEnabled,
+    window: required(url.searchParams.get("window")) || null,
   };
 }
 
@@ -138,227 +76,227 @@ function identityErrorResponse(error, route) {
   const response = errorResponse(error.status, error.code, route, error.detail);
   const headers = new Headers(response.headers);
   headers.set("X-UK-AQ-Station-History-Identity-Error", error.code);
-  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  return new Response(response.body, { status: response.status, headers });
 }
 
-export function buildStationSeriesFromIngest(request, ingestPayload) {
-  const normalised = dedupeSourceObservationRows(responseRows(ingestPayload)).filter((row) =>
-    row.timeseries_id === request.timeseriesId && row.connector_id === request.connectorId && row.pollutant_code === request.pollutant
-  );
-  const ingestComplete = sourceComplete(ingestPayload, normalised, request.contextStartMs, request.endMs);
-  const observationRows = normalised.filter((row) => {
-    const timestamp = Date.parse(row.observed_at);
-    return timestamp >= request.startMs && timestamp < request.endMs;
-  }).map((row) => ({ ...row, source: "ingest" }));
-  const aqiRows = request.includeAqi
-    ? helperRowsToNormalizedAqiV1Rows(
-      pivotNarrowRowsToHelperRows(sourceObservationsToNarrowRows(normalised)),
-      { computedAtUtc: null },
-    ).filter((row) => {
-      const timestamp = Date.parse(row.timestamp_hour_utc);
-      return timestamp >= request.startMs && timestamp < request.endMs && row.timeseries_id === request.timeseriesId && row.pollutant_code === request.pollutant;
-    }).map((row) => ({ ...row, source: "live_calculated" }))
-    : [];
-  const observationGaps = gapRanges(observationRows, request.startMs, request.endMs, "observed_at");
-  const aqiGaps = gapRanges(aqiRows, request.startMs, request.endMs, "timestamp_hour_utc");
-  const contextGaps = request.includeAqi && request.contextStartMs < request.startMs
-    ? gapRanges(normalised, request.contextStartMs, request.startMs, "observed_at")
-    : [];
-  // Observation completeness is scoped to the requested output interval.
-  // PM AQI has an additional rolling-window context requirement which must
-  // make only the AQI section incomplete when that preceding context is absent.
-  const observationOutputComplete = sourceComplete(ingestPayload, normalised, request.startMs, request.endMs)
-    && observationGaps.length === 0;
-  const aqiContextComplete = !request.includeAqi || (
-    sourceComplete(ingestPayload, normalised, request.contextStartMs, request.startMs)
-    && contextGaps.length === 0
-  );
-  const aqiOutputComplete = !request.includeAqi || (
-    sourceComplete(ingestPayload, normalised, request.startMs, request.endMs)
-    && aqiGaps.length === 0
-  );
-  const aqiComplete = request.includeAqi && aqiContextComplete && aqiOutputComplete;
-  const outputComplete = observationOutputComplete && (!request.includeAqi || aqiComplete);
-  const aqiGapRanges = [...contextGaps, ...aqiGaps];
-  const outputStartUtc = new Date(request.startMs).toISOString();
-  const shortWindow = request.window === "12h" || request.window === "24h";
-  const fullyServedShortAqi = aqiComplete && shortWindow;
-  const fullyServedShortObservations = observationOutputComplete && shortWindow;
+function attachAuthoritativeIdentity(body, identity) {
+  const authoritative = publicTimeseriesIdentity(identity);
+  return { ...body, request: { ...body.request, ...authoritative, pollutant: authoritative.pollutant }, identity: authoritative };
+}
+
+function hourStarts(startMs, endMs) {
+  const values = [];
+  for (let cursor = Math.floor(startMs / HOUR_MS) * HOUR_MS; cursor < endMs; cursor += HOUR_MS) values.push(cursor);
+  return values;
+}
+
+function missingHourRanges(rows, startMs, endMs, field) {
+  const present = new Set((Array.isArray(rows) ? rows : []).map((row) => Math.floor(Date.parse(String(row?.[field] ?? "")) / HOUR_MS) * HOUR_MS).filter(Number.isFinite));
+  return hourStarts(startMs, endMs).filter((hour) => !present.has(hour)).map((hour) => ({ start_utc: new Date(hour).toISOString(), end_utc: new Date(hour + HOUR_MS).toISOString() }));
+}
+
+function rowsCoverAqiContext(rows, hours, contextHours) {
+  const present = new Set(rows.map((row) => Math.floor(Date.parse(row.observed_at) / HOUR_MS) * HOUR_MS).filter(Number.isFinite));
+  return hours.every((hour) => {
+    const hourMs = Date.parse(hour);
+    for (let offset = 0; offset <= contextHours; offset += 1) if (!present.has(hourMs - offset * HOUR_MS)) return false;
+    return true;
+  });
+}
+
+function calculateAqiRows(observationRows, request, startMs, endMs) {
+  return helperRowsToNormalizedAqiV1Rows(
+    pivotNarrowRowsToHelperRows(sourceObservationsToNarrowRows(observationRows)),
+    { computedAtUtc: null },
+  ).filter((row) => {
+    const timestamp = Date.parse(row.timestamp_hour_utc);
+    return timestamp >= startMs && timestamp < endMs
+      && row.timeseries_id === request.timeseriesId
+      && row.connector_id === request.connectorId
+      && row.pollutant_code === request.pollutant;
+  }).map((row) => ({ ...row, source: "live_calculated" }));
+}
+
+function ingestCapability({ request, direct, aqiBounds, observationBounds, retentionStartMs }) {
+  const outputStartMs = Math.min(aqiBounds.headStartMs, observationBounds.headStartMs);
+  const outputRows = direct.rows.filter((row) => Date.parse(row.observed_at) >= outputStartMs && Date.parse(row.observed_at) < request.endMs);
+  const observationGaps = missingHourRanges(outputRows, observationBounds.headStartMs, request.endMs, "observed_at");
+  const contextStartMs = request.includeAqi ? aqiBounds.headStartMs - request.contextHours * HOUR_MS : observationBounds.headStartMs;
+  const contextGaps = request.includeAqi ? missingHourRanges(direct.rows, contextStartMs, aqiBounds.headStartMs, "observed_at") : [];
+  const coversWholeRequest = aqiBounds.headStartMs === request.startMs && observationBounds.headStartMs === request.startMs;
+  const withinRetention = contextStartMs >= retentionStartMs;
+  const observationsComplete = direct.response_complete && observationGaps.length === 0;
+  const aqiContextComplete = !request.includeAqi || (direct.response_complete && contextGaps.length === 0);
   return {
-    schema_version: 1,
-    request: { timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, start_utc: outputStartUtc, end_utc: new Date(request.endMs).toISOString(), window: request.window, format: "objects", include_aqi: request.includeAqi },
-    source: {
-      mode: outputComplete ? (request.includeAqi ? "ingest_only" : "ingest_observations_only") : "ingest_incomplete",
-      required_context_start_utc: new Date(request.contextStartMs).toISOString(),
-      output_start_utc: outputStartUtc,
-      output_end_utc: new Date(request.endMs).toISOString(),
-      ingest_response_complete: ingestComplete,
-      observation_output_complete: observationOutputComplete,
-      aqi_context_complete: aqiContextComplete,
-      aqi_output_complete: aqiOutputComplete,
-      used_recent_r2_aqi: false,
-      used_r2_observations: false,
-      ingest_row_count: normalised.length,
-      ingest_fetch_count: 1,
-      r2_aqi_fetch_count: 0,
-    },
-    aqi: request.includeAqi
-      ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGapRanges, next_chunk_end_utc: fullyServedShortAqi ? null : outputStartUtc, source_counts: { r2: 0, live_calculated: aqiRows.length }, mismatch_count: 0 }
-      : { enabled: false, state: "disabled", rows: [], response_complete: false, has_gap: false, gap_ranges: [], next_chunk_end_utc: null, source_counts: { r2: 0, live_calculated: 0 }, mismatch_count: 0 },
-    observations: { rows: observationRows, guideline: ingestPayload?.guideline || null, response_complete: observationOutputComplete, has_gap: !observationOutputComplete, gap_ranges: observationGaps, next_chunk_end_utc: fullyServedShortObservations ? null : outputStartUtc, source_counts: { ingest: observationRows.length } },
+    qualifies: coversWholeRequest && withinRetention && observationsComplete && aqiContextComplete,
+    observationsComplete,
+    aqiContextComplete,
+    observationGaps,
+    contextGaps,
   };
 }
 
-async function fetchIngestOnce(request, env) {
-  const supabaseUrl = required(env.SUPABASE_URL);
-  const publishableKey = required(env.SB_PUBLISHABLE_DEFAULT_KEY);
-  const upstreamSecret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-  if (!supabaseUrl || !publishableKey || !upstreamSecret) throw new Error("station_series_config_missing");
-  const target = new URL(`${supabaseUrl.replace(/\/$/, "")}/functions/v1/uk_aq_timeseries`);
-  target.searchParams.set("timeseries_id", String(request.timeseriesId));
-  target.searchParams.set("connector_id", String(request.connectorId));
-  target.searchParams.set("pollutant", request.pollutant);
-  target.searchParams.set("start_utc", new Date(request.contextStartMs).toISOString());
-  target.searchParams.set("end_utc", new Date(request.endMs).toISOString());
-  target.searchParams.set("format", "objects");
-  const response = await fetch(target.toString(), { headers: { Accept: "application/json", apikey: publishableKey, Authorization: `Bearer ${publishableKey}`, [UPSTREAM_AUTH_HEADER]: upstreamSecret } });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok || !payload || typeof payload !== "object") throw new Error("station_series_ingest_failed");
-  return payload;
+function disabledAqiSection() {
+  return { enabled: false, state: "disabled", rows: [], response_complete: false, has_gap: false, gap_ranges: [], next_chunk_end_utc: null, next_older_aqi_chunk_end_utc: null, source_counts: { r2: 0, live_calculated: 0 }, mismatch_count: 0 };
 }
 
-async function fetchR2AqiHead(request, bounds, env) {
+function requestFields(request) {
+  return { timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, start_utc: new Date(request.startMs).toISOString(), end_utc: new Date(request.endMs).toISOString(), window: request.window, format: "objects", include_aqi: request.includeAqi };
+}
+
+function directDiagnostics(direct, outputRows) {
+  return {
+    raw_ingest_row_count: direct.raw_row_count,
+    normalized_ingest_row_count: direct.normalized_row_count,
+    rejected_ingest_row_count: direct.rejected_row_count,
+    output_ingest_row_count: outputRows.filter((row) => row.source === "ingest").length,
+    ingest_source_path: direct.source_path,
+    ingest_fetch_count: direct.fetch_count,
+  };
+}
+
+function buildIngestOnlyResponse(request, direct, capability) {
+  const observations = direct.rows.filter((row) => {
+    const ms = Date.parse(row.observed_at);
+    return ms >= request.startMs && ms < request.endMs;
+  });
+  const aqiRows = request.includeAqi ? calculateAqiRows(direct.rows, request, request.startMs, request.endMs) : [];
+  const aqiGaps = request.includeAqi ? [...capability.contextGaps, ...missingHourRanges(aqiRows, request.startMs, request.endMs, "timestamp_hour_utc")] : [];
+  const aqiComplete = request.includeAqi && direct.response_complete && capability.aqiContextComplete && aqiGaps.length === 0;
+  const observationComplete = direct.response_complete && capability.observationsComplete;
+  return {
+    schema_version: 1,
+    request: requestFields(request),
+    source: {
+      mode: request.includeAqi ? "ingest_only" : "ingest_observations_only",
+      required_context_start_utc: new Date(request.contextStartMs).toISOString(),
+      output_start_utc: new Date(request.startMs).toISOString(), output_end_utc: new Date(request.endMs).toISOString(),
+      direct_ingest_start_utc: direct.start_utc, direct_ingest_end_utc: direct.end_utc,
+      aqi_r2_coverage_end_utc: null, observations_r2_coverage_end_utc: null, observation_overlap_start_utc: null,
+      ingest_response_complete: direct.response_complete, r2_aqi_response_complete: null, r2_observations_response_complete: null,
+      used_recent_r2_aqi: false, used_r2_observations: false, r2_aqi_fetch_count: 0, r2_observation_fetch_count: 0,
+      ...directDiagnostics(direct, observations),
+    },
+    aqi: request.includeAqi
+      ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_aqi_chunk_end_utc: null, stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only", source_counts: { r2: 0, live_calculated: aqiRows.length }, overlap_count: 0, mismatch_count: 0, mismatch_hours: [] }
+      : disabledAqiSection(),
+    observations: { rows: observations, guideline: null, response_complete: observationComplete, has_gap: !observationComplete, gap_ranges: capability.observationGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_observation_chunk_end_utc: null, source_counts: { r2: 0, ingest: observations.length }, discarded_ingest_overlap_count: 0 },
+  };
+}
+
+async function fetchR2AqiHead(request, bounds, env, rowLimit) {
   const baseUrl = required(env.UK_AQ_AQI_HISTORY_R2_API_URL);
-  const upstreamSecret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-  if (!baseUrl || !upstreamSecret) throw new Error("station_series_r2_config_missing");
+  const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
+  if (!baseUrl || !secret) throw new Error("station_series_r2_config_missing");
   const target = new URL(baseUrl);
-  target.searchParams.set("scope", "timeseries");
-  target.searchParams.set("grain", "hourly");
-  target.searchParams.set("timeseries_id", String(request.timeseriesId));
-  target.searchParams.set("connector_id", String(request.connectorId));
-  target.searchParams.set("pollutant", request.pollutant);
-  target.searchParams.set("start_utc", new Date(bounds.headStartMs).toISOString());
-  target.searchParams.set("end_utc", new Date(bounds.headEndMs).toISOString());
-  target.searchParams.set("row_limit", String(STABLE_HEAD_MAX_HOURS));
-  target.searchParams.set("format", "objects");
-  const response = await fetch(target.toString(), { headers: { Accept: "application/json", [UPSTREAM_AUTH_HEADER]: upstreamSecret } });
+  target.search = "";
+  target.searchParams.set("scope", "timeseries"); target.searchParams.set("grain", "hourly");
+  target.searchParams.set("timeseries_id", String(request.timeseriesId)); target.searchParams.set("connector_id", String(request.connectorId));
+  target.searchParams.set("pollutant", request.pollutant); target.searchParams.set("start_utc", new Date(bounds.headStartMs).toISOString());
+  target.searchParams.set("end_utc", new Date(bounds.headEndMs).toISOString()); target.searchParams.set("row_limit", String(rowLimit)); target.searchParams.set("format", "objects");
+  const response = await fetch(target.toString(), { headers: { Accept: "application/json", [UPSTREAM_AUTH_HEADER]: secret } });
   const payload = await response.json().catch(() => null);
   if (!response.ok || !payload || typeof payload !== "object") throw new Error("station_series_r2_aqi_failed");
   if (r2CoverageClaimsComplete(payload) && !r2ResponseComplete(payload)) throw new Error("station_series_r2_claimed_complete_response_incomplete");
   return payload;
 }
 
-async function buildObservationOnlyStationSeries(request, env) {
-  const bounds = resolveStableHeadBounds(request);
-  // AQI is deliberately disabled for secondary chart lines.  Unlike AQI, raw
-  // observations need no PM rolling-window context, so this is a bounded
-  // recent ingest request with exactly one upstream read and no R2 AQI call.
-  const ingestRequest = {
-    ...request,
-    startMs: bounds.headStartMs,
-    endMs: bounds.headEndMs,
-    contextHours: 0,
-    contextStartMs: bounds.headStartMs,
-    includeAqi: false,
-  };
-  const body = buildStationSeriesFromIngest(ingestRequest, await fetchIngestOnce(ingestRequest, env));
-  const headStartUtc = new Date(bounds.headStartMs).toISOString();
-  const headEndUtc = new Date(bounds.headEndMs).toISOString();
+function latestR2AqiCoverageEnd(rows) {
+  const latest = rows.reduce((value, row) => Math.max(value, Date.parse(row.timestamp_hour_utc)), Number.NEGATIVE_INFINITY);
+  return Number.isFinite(latest) ? new Date(latest + HOUR_MS).toISOString() : null;
+}
+
+async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds) {
+  let r2Payload = null;
+  let r2AqiRows = [];
+  let missing = [];
+  if (request.includeAqi) {
+    r2Payload = await fetchR2AqiHead(request, aqiBounds, env, policy.stableAqiHeadMaxHours);
+    r2AqiRows = normalizeExactR2AqiRows(r2Payload, request, aqiBounds);
+    missing = missingHeadHours(r2AqiRows, aqiBounds);
+  }
+  const observationContextStartMs = Math.min(observationBounds.headStartMs, aqiBounds.headStartMs - request.contextHours * HOUR_MS);
+  const overlapEndMs = Math.min(request.endMs, Math.max(observationContextStartMs + HOUR_MS, Date.parse(direct.start_utc) + policy.observationOverlapHours * HOUR_MS));
+  const r2Observations = await readR2Observations({ env, identity: request, startMs: observationContextStartMs, endMs: overlapEndMs });
+  const mergedObservations = mergeObservationRowsPreferR2({ r2Rows: r2Observations.rows, ingestRows: direct.rows });
+  const calculationRows = dedupeSourceObservationRows(mergedObservations.rows);
+  const outputObservations = mergedObservations.rows.filter((row) => {
+    const ms = Date.parse(row.observed_at);
+    return ms >= observationBounds.headStartMs && ms < request.endMs;
+  });
+  const observationGaps = missingHourRanges(outputObservations, observationBounds.headStartMs, request.endMs, "observed_at");
+  const observationsComplete = direct.response_complete && r2Observations.response_complete && observationGaps.length === 0;
+
+  let mergedAqi = { rows: [], overlap_count: 0, mismatch_count: 0, mismatch_hours: [] };
+  let liveRows = [];
+  let aqiComplete = false;
+  if (request.includeAqi) {
+    const eligible = new Set(missing.filter((hour) => rowsCoverAqiContext(calculationRows, [hour], request.contextHours)));
+    liveRows = calculateAqiRows(calculationRows, request, aqiBounds.headStartMs, aqiBounds.headEndMs).filter((row) => eligible.has(row.timestamp_hour_utc));
+    mergedAqi = mergeStableAqiHead({ r2Rows: r2AqiRows, liveRows, request, bounds: aqiBounds });
+    const remaining = missingHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs, "timestamp_hour_utc");
+    aqiComplete = r2ResponseComplete(r2Payload) && missing.every((hour) => eligible.has(hour)) && remaining.length === 0;
+  }
+
+  const aqiHeadStartUtc = new Date(aqiBounds.headStartMs).toISOString();
+  const observationHeadStartUtc = new Date(observationBounds.headStartMs).toISOString();
+  const aqiGaps = request.includeAqi ? missingHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs, "timestamp_hour_utc") : [];
+  const sourceMode = request.includeAqi ? "stable_r2_live_head" : "r2_ingest_observations_head";
+  console.log(JSON.stringify({ event: "station_series_source_merge", timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, r2_aqi_rows: r2AqiRows.length, live_aqi_rows: liveRows.length, r2_observation_rows: r2Observations.rows.length, ingest_observation_rows: outputObservations.filter((row) => row.source === "ingest").length, discarded_ingest_observation_overlap_count: mergedObservations.discarded_ingest_overlap_count, aqi_overlap_count: mergedAqi.overlap_count, aqi_mismatch_count: mergedAqi.mismatch_count, aqi_mismatch_hours: mergedAqi.mismatch_hours, aqi_complete: aqiComplete, observations_complete: observationsComplete }));
   return {
-    ...body,
-    request: {
-      ...body.request,
-      start_utc: new Date(request.startMs).toISOString(),
-      end_utc: new Date(request.endMs).toISOString(),
-      include_aqi: false,
-    },
+    schema_version: 1,
+    request: requestFields(request),
     source: {
-      ...body.source,
-      mode: body.observations.response_complete ? "ingest_observations_only_head" : "ingest_observations_only_incomplete",
-      output_start_utc: headStartUtc,
-      output_end_utc: headEndUtc,
-      used_recent_r2_aqi: false,
-      used_r2_observations: false,
+      mode: (request.includeAqi ? aqiComplete : true) && observationsComplete ? sourceMode : `${sourceMode}_incomplete`,
+      required_context_start_utc: new Date(aqiBounds.headStartMs - request.contextHours * HOUR_MS).toISOString(),
+      output_start_utc: new Date(Math.min(aqiBounds.headStartMs, observationBounds.headStartMs)).toISOString(), output_end_utc: new Date(request.endMs).toISOString(),
+      direct_ingest_start_utc: direct.start_utc, direct_ingest_end_utc: direct.end_utc,
+      aqi_r2_coverage_end_utc: latestR2AqiCoverageEnd(r2AqiRows),
+      observations_r2_coverage_end_utc: r2Observations.response_complete ? r2Observations.end_utc : null,
+      observation_overlap_start_utc: direct.start_utc,
+      ingest_response_complete: direct.response_complete,
+      r2_aqi_response_complete: r2Payload ? r2ResponseComplete(r2Payload) : null,
+      r2_observations_response_complete: r2Observations.response_complete,
+      used_recent_r2_aqi: Boolean(request.includeAqi), used_r2_observations: true,
+      r2_aqi_fetch_count: request.includeAqi ? 1 : 0, r2_observation_fetch_count: 1,
+      r2_aqi_row_count: r2AqiRows.length, live_calculated_aqi_row_count: liveRows.length,
+      r2_observation_row_count: outputObservations.filter((row) => row.source === "r2").length,
+      ingest_observation_row_count: outputObservations.filter((row) => row.source === "ingest").length,
+      discarded_ingest_observation_overlap_count: mergedObservations.discarded_ingest_overlap_count,
+      live_calculation_observation_sources: { r2: mergedObservations.rows.filter((row) => row.source === "r2").length, ingest: mergedObservations.rows.filter((row) => row.source === "ingest").length },
+      ...directDiagnostics(direct, outputObservations),
     },
+    aqi: request.includeAqi ? {
+      enabled: true, rows: mergedAqi.rows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps,
+      stable_head_start_utc: aqiHeadStartUtc, stable_head_end_utc: new Date(aqiBounds.headEndMs).toISOString(),
+      next_chunk_end_utc: aqiBounds.headStartMs > request.startMs ? aqiHeadStartUtc : null,
+      next_older_aqi_chunk_end_utc: aqiBounds.headStartMs > request.startMs ? aqiHeadStartUtc : null,
+      stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only",
+      source_counts: { r2: r2AqiRows.length, live_calculated: liveRows.length }, overlap_count: mergedAqi.overlap_count, mismatch_count: mergedAqi.mismatch_count, mismatch_hours: mergedAqi.mismatch_hours,
+    } : disabledAqiSection(),
     observations: {
-      ...body.observations,
-      stable_head_start_utc: headStartUtc,
-      stable_head_end_utc: headEndUtc,
-      next_chunk_end_utc: bounds.headStartMs > request.startMs ? headStartUtc : null,
+      rows: outputObservations, guideline: null, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: observationGaps,
+      stable_head_start_utc: observationHeadStartUtc, stable_head_end_utc: new Date(request.endMs).toISOString(),
+      next_chunk_end_utc: observationBounds.headStartMs > request.startMs ? observationHeadStartUtc : null,
+      next_older_observation_chunk_end_utc: observationBounds.headStartMs > request.startMs ? observationHeadStartUtc : null,
+      source_counts: { r2: outputObservations.filter((row) => row.source === "r2").length, ingest: outputObservations.filter((row) => row.source === "ingest").length },
+      discarded_ingest_overlap_count: mergedObservations.discarded_ingest_overlap_count,
     },
   };
 }
 
-async function buildLongStationSeries(request, env) {
-  const bounds = resolveStableHeadBounds(request);
-  const r2Payload = await fetchR2AqiHead(request, bounds, env);
-  const r2Rows = normalizeExactR2AqiRows(r2Payload, request, bounds);
-  const missingHours = missingHeadHours(r2Rows, bounds);
-  // One bounded ingest bundle serves both purposes: it supplies recent
-  // observations to the combined response and supplies live AQI only for R2
-  // gaps. This prevents a second primary ingest read in the browser path.
-  const requiredContextStartMs = bounds.headStartMs - request.contextHours * HOUR_MS;
-  const ingestRequest = { ...request, startMs: bounds.headStartMs, endMs: bounds.headEndMs, contextStartMs: requiredContextStartMs, includeAqi: true };
-  const ingestPayload = await fetchIngestOnce(ingestRequest, env);
-  const liveBundle = buildStationSeriesFromIngest(ingestRequest, ingestPayload);
-  const eligibleMissing = new Set(missingHours);
-  const liveRows = liveBundle.aqi.rows.filter((row) => eligibleMissing.has(row.timestamp_hour_utc));
-  const observationRows = liveBundle.observations.rows;
-  const liveRowsByHour = new Set(liveRows.map((row) => row.timestamp_hour_utc));
-  const liveAqiComplete = missingHours.length === 0 || (
-    sourceRowsCoverAqiContext(
-      dedupeSourceObservationRows(responseRows(ingestPayload)).filter((row) => (
-        row.timeseries_id === request.timeseriesId && row.connector_id === request.connectorId && row.pollutant_code === request.pollutant
-      )),
-      missingHours,
-      request.contextHours,
-    ) && missingHours.every((hour) => liveRowsByHour.has(hour))
-  );
-  const observationsComplete = liveBundle.observations.response_complete;
-  const ingestRowCount = liveBundle.source.ingest_row_count;
-  const merged = mergeStableAqiHead({ r2Rows, liveRows, request, bounds });
-  const headHours = outputHours(bounds.headStartMs, bounds.headEndMs);
-  const mergedHours = new Set(merged.rows.map((row) => row.timestamp_hour_utc));
-  const remainingMissing = headHours.filter((hour) => !mergedHours.has(new Date(hour).toISOString())).map((hour) => new Date(hour).toISOString());
-  const complete = liveAqiComplete && remainingMissing.length === 0;
-  const headStartUtc = new Date(bounds.headStartMs).toISOString();
-  const headEndUtc = new Date(bounds.headEndMs).toISOString();
-  console.log(JSON.stringify({
-    event: "station_series_stable_head_merge",
-    timeseries_id: request.timeseriesId,
-    connector_id: request.connectorId,
-    pollutant: request.pollutant,
-    head_start_utc: headStartUtc,
-    head_end_utc: headEndUtc,
-    r2_row_count: r2Rows.length,
-    live_calculated_row_count: liveRows.length,
-    overlap_count: merged.overlap_count,
-    mismatch_count: merged.mismatch_count,
-    mismatch_hours: merged.mismatch_hours,
-    response_complete: complete,
-  }));
-  return {
-    schema_version: 1,
-    request: { timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, start_utc: new Date(request.startMs).toISOString(), end_utc: new Date(request.endMs).toISOString(), window: request.window, format: "objects", include_aqi: true },
-    source: { mode: complete && observationsComplete ? "stable_r2_live_head" : "stable_head_incomplete", required_context_start_utc: new Date(requiredContextStartMs).toISOString(), output_start_utc: headStartUtc, output_end_utc: headEndUtc, ingest_response_complete: liveBundle.source.ingest_response_complete, r2_response_complete: r2ResponseComplete(r2Payload), used_recent_r2_aqi: true, used_r2_observations: false, ingest_row_count: ingestRowCount, ingest_fetch_count: 1, r2_aqi_fetch_count: 1 },
-    aqi: {
-      rows: merged.rows,
-      response_complete: complete,
-      has_gap: !complete,
-      gap_ranges: remainingMissing.map((hour) => ({ start_utc: hour, end_utc: new Date(Date.parse(hour) + HOUR_MS).toISOString() })),
-      stable_head_start_utc: headStartUtc,
-      stable_head_end_utc: headEndUtc,
-      next_chunk_end_utc: headStartUtc,
-      next_older_aqi_chunk_end_utc: headStartUtc,
-      stable_head_locked: complete,
-      replacement_policy: "extend_backwards_only",
-      source_counts: { r2: r2Rows.length, live_calculated: liveRows.length },
-      overlap_count: merged.overlap_count,
-      mismatch_count: merged.mismatch_count,
-      mismatch_hours: merged.mismatch_hours,
-    },
-    observations: { rows: observationRows, guideline: liveBundle.observations.guideline || null, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: liveBundle.observations.gap_ranges, stable_head_start_utc: headStartUtc, stable_head_end_utc: headEndUtc, next_chunk_end_utc: headStartUtc, source_counts: { ingest: observationRows.length } },
-  };
+export async function buildStationSeries(request, env, nowMs = Date.now()) {
+  const policy = resolveStationHistoryPolicy(env);
+  const aqiBounds = resolveStableHeadBounds(request, policy.stableAqiHeadMaxHours);
+  const observationBounds = resolveStableHeadBounds(request, policy.observationChunkMaxHours);
+  const requiredStartMs = Math.min(observationBounds.headStartMs, aqiBounds.headStartMs - request.contextHours * HOUR_MS);
+  const retentionStartMs = nowMs - policy.ingestRetentionDays * DAY_MS;
+  const latestPossibleStartMs = request.endMs - HOUR_MS;
+  const directStartMs = Math.min(Math.max(requiredStartMs, retentionStartMs), latestPossibleStartMs);
+  const direct = await readDirectIngestObservations({ env, identity: request, startMs: directStartMs, endMs: request.endMs, timeoutMs: policy.obsAqiDbTimeoutMs });
+  const capability = ingestCapability({ request, direct, aqiBounds, observationBounds, retentionStartMs });
+  if (capability.qualifies) return buildIngestOnlyResponse(request, direct, capability);
+  return buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds);
 }
 
 async function fetchJsonUpstream(target, secret, failureCode) {
@@ -367,99 +305,50 @@ async function fetchJsonUpstream(target, secret, failureCode) {
     const payload = await response.json().catch(() => null);
     if (!response.ok || !payload || typeof payload !== "object") throw new Error(failureCode);
     return payload;
-  } catch (error) {
-    throw new Error(error instanceof Error && error.message === failureCode ? failureCode : failureCode);
+  } catch (_error) {
+    throw new Error(failureCode);
   }
 }
 
 function chunkHeaders(body) {
   const complete = body.response_complete === true;
   const immutable = body.chunk.cache_class === "immutable";
-  return headersFor({
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": complete ? (immutable ? "public, max-age=86400, s-maxage=86400" : "public, max-age=300, s-maxage=300") : "no-store",
-    "X-UK-AQ-Chunk-Direction": body.chunk.direction,
-    "X-UK-AQ-Chunk-Start": body.chunk.start_utc,
-    "X-UK-AQ-Chunk-End": body.chunk.end_utc,
-    "X-UK-AQ-Next-Older-Chunk-End": body.chunk.next_older_chunk_end_utc,
-    "X-UK-AQ-Chunk-Cache-Class": body.chunk.cache_class,
-    "X-UK-AQ-Chunk-Retry-Key": body.chunk.retry_key,
-    "X-UK-AQ-Response-Complete": String(complete),
-  });
+  return headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? (immutable ? "public, max-age=86400, s-maxage=86400" : "public, max-age=300, s-maxage=300") : "no-store", "X-UK-AQ-Chunk-Direction": body.chunk.direction, "X-UK-AQ-Chunk-Start": body.chunk.start_utc, "X-UK-AQ-Chunk-End": body.chunk.end_utc, "X-UK-AQ-Next-Older-Chunk-End": body.chunk.next_older_chunk_end_utc, "X-UK-AQ-Chunk-Cache-Class": body.chunk.cache_class, "X-UK-AQ-Chunk-Retry-Key": body.chunk.retry_key, "X-UK-AQ-Response-Complete": String(complete) });
 }
 
 async function handleAqiHistoryChunk(request, env) {
   const url = new URL(request.url);
-  const parsedChunk = parseHistoryChunkRequest(url, "aqi");
-  if (!parsedChunk.ok) return errorResponse(parsedChunk.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsedChunk.code, url.pathname);
+  const parsed = parseHistoryChunkRequest(url, "aqi", resolveStationHistoryPolicy(env));
+  if (!parsed.ok) return errorResponse(parsed.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsed.code, url.pathname);
   let chunk;
-  try {
-    const identity = await resolveAuthoritativeTimeseriesIdentity(parsedChunk, env);
-    chunk = applyAuthoritativeTimeseriesIdentity(parsedChunk, identity);
-  } catch (error) {
-    return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname);
-  }
-  const baseUrl = required(env.UK_AQ_AQI_HISTORY_R2_API_URL);
-  const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
+  try { chunk = applyAuthoritativeTimeseriesIdentity(parsed, await resolveAuthoritativeTimeseriesIdentity(parsed, env)); }
+  catch (error) { return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname); }
+  const baseUrl = required(env.UK_AQ_AQI_HISTORY_R2_API_URL); const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) return errorResponse(500, "internal_aqi_history_config_missing", url.pathname);
-  const target = new URL(baseUrl);
-  target.search = "";
-  target.searchParams.set("scope", "timeseries");
-  target.searchParams.set("grain", "hourly");
-  target.searchParams.set("timeseries_id", String(chunk.timeseriesId));
-  target.searchParams.set("connector_id", String(chunk.connectorId));
-  target.searchParams.set("pollutant", chunk.pollutant);
-  target.searchParams.set("start_utc", chunk.startUtc);
-  target.searchParams.set("end_utc", chunk.endUtc);
-  target.searchParams.set("row_limit", String(chunk.limit));
-  target.searchParams.set("format", "objects");
+  const target = new URL(baseUrl); target.search = "";
+  for (const [key, value] of [["scope", "timeseries"], ["grain", "hourly"], ["timeseries_id", chunk.timeseriesId], ["connector_id", chunk.connectorId], ["pollutant", chunk.pollutant], ["start_utc", chunk.startUtc], ["end_utc", chunk.endUtc], ["row_limit", chunk.limit], ["format", "objects"]]) target.searchParams.set(key, String(value));
   try {
-    const payload = await fetchJsonUpstream(target, secret, "aqi_history_r2_failed");
-    const body = buildAqiHistoryChunk(chunk, payload);
-    const formatted = aqiResponseRows(body, chunk.format);
-    body.columns = formatted.columns;
-    body.points = formatted.points;
+    const body = buildAqiHistoryChunk(chunk, await fetchJsonUpstream(target, secret, "aqi_history_r2_failed"));
+    const formatted = aqiResponseRows(body, chunk.format); body.columns = formatted.columns; body.points = formatted.points;
     const headers = chunkHeaders(body);
-    if (chunk.format === "tsv") {
-      headers.set("Content-Type", "text/tab-separated-values; charset=utf-8");
-      return new Response(buildTsv(formatted.columns, formatted.points), { status: 200, headers });
-    }
+    if (chunk.format === "tsv") { headers.set("Content-Type", "text/tab-separated-values; charset=utf-8"); return new Response(buildTsv(formatted.columns, formatted.points), { status: 200, headers }); }
     return new Response(JSON.stringify(body), { status: 200, headers });
-  } catch (error) {
-    return errorResponse(502, error instanceof Error ? error.message : "aqi_history_r2_failed", url.pathname);
-  }
+  } catch (error) { return errorResponse(502, error instanceof Error ? error.message : "aqi_history_r2_failed", url.pathname); }
 }
 
 async function handleObservationHistoryChunk(request, env) {
   const url = new URL(request.url);
-  const parsedChunk = parseHistoryChunkRequest(url, "observations");
-  if (!parsedChunk.ok) return errorResponse(parsedChunk.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsedChunk.code, url.pathname);
+  const parsed = parseHistoryChunkRequest(url, "observations", resolveStationHistoryPolicy(env));
+  if (!parsed.ok) return errorResponse(parsed.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsed.code, url.pathname);
   let chunk;
-  try {
-    const identity = await resolveAuthoritativeTimeseriesIdentity(parsedChunk, env);
-    chunk = applyAuthoritativeTimeseriesIdentity(parsedChunk, identity);
-  } catch (error) {
-    return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname);
-  }
-  const baseUrl = required(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL);
-  const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
+  try { chunk = applyAuthoritativeTimeseriesIdentity(parsed, await resolveAuthoritativeTimeseriesIdentity(parsed, env)); }
+  catch (error) { return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname); }
+  const baseUrl = required(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL); const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) return errorResponse(500, "internal_observation_history_config_missing", url.pathname);
-  const target = new URL(baseUrl);
-  if (!target.pathname || target.pathname === "/") target.pathname = "/v1/observations";
-  target.search = "";
-  target.searchParams.set("timeseries_id", String(chunk.timeseriesId));
-  target.searchParams.set("connector_id", String(chunk.connectorId));
-  target.searchParams.set("pollutant", chunk.pollutant);
-  target.searchParams.set("start_utc", chunk.startUtc);
-  target.searchParams.set("end_utc", chunk.endUtc);
-  target.searchParams.set("limit", String(chunk.limit));
-  try {
-    const payload = await fetchJsonUpstream(target, secret, "observation_history_r2_failed");
-    const body = buildObservationHistoryChunk(chunk, payload);
-    return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) });
-  } catch (error) {
-    return errorResponse(502, error instanceof Error ? error.message : "observation_history_r2_failed", url.pathname);
-  }
+  const target = new URL(baseUrl); if (!target.pathname || target.pathname === "/") target.pathname = "/v1/observations"; target.search = "";
+  for (const [key, value] of [["timeseries_id", chunk.timeseriesId], ["connector_id", chunk.connectorId], ["pollutant", chunk.pollutant], ["start_utc", chunk.startUtc], ["end_utc", chunk.endUtc], ["limit", chunk.limit]]) target.searchParams.set(key, String(value));
+  try { const body = buildObservationHistoryChunk(chunk, await fetchJsonUpstream(target, secret, "observation_history_r2_failed")); return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) }); }
+  catch (error) { return errorResponse(502, error instanceof Error ? error.message : "observation_history_r2_failed", url.pathname); }
 }
 
 export default {
@@ -470,24 +359,16 @@ export default {
     if (url.pathname === "/v1/observations-history") return handleObservationHistoryChunk(request, env);
     if (url.pathname !== "/v1/station-series") return errorResponse(404, "internal_route_not_found", url.pathname);
     if (String(url.searchParams.get("format") ?? "").toLowerCase() !== "objects") return errorResponse(400, "station_series_format_objects_required", url.pathname);
-    const stationRequest = resolveStationSeriesRequest(url);
-    if (!stationRequest) return errorResponse(400, "station_series_request_invalid", url.pathname);
+    const parsed = resolveStationSeriesRequest(url);
+    if (!parsed) return errorResponse(400, "station_series_request_invalid", url.pathname);
     try {
-      const identity = await resolveAuthoritativeTimeseriesIdentity(stationRequest, env);
-      const authoritativeRequest = applyAuthoritativeTimeseriesIdentity(stationRequest, identity);
-      const shortWindow = authoritativeRequest.window === "12h" || authoritativeRequest.window === "24h";
-      const body = !stationRequest.includeAqi && !shortWindow
-        ? await buildObservationOnlyStationSeries(authoritativeRequest, env)
-        : shortWindow
-          ? buildStationSeriesFromIngest(authoritativeRequest, await fetchIngestOnce(authoritativeRequest, env))
-          : await buildLongStationSeries(authoritativeRequest, env);
-      const responseBody = attachAuthoritativeIdentity(body, identity);
-      const complete = (!authoritativeRequest.includeAqi || responseBody.aqi.response_complete) && responseBody.observations.response_complete;
-      return new Response(JSON.stringify(responseBody), { status: 200, headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": responseBody.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(responseBody.source.ingest_fetch_count) }) });
+      const identity = await resolveAuthoritativeTimeseriesIdentity(parsed, env);
+      const authoritative = applyAuthoritativeTimeseriesIdentity(parsed, identity);
+      const body = attachAuthoritativeIdentity(await buildStationSeries(authoritative, env), identity);
+      const complete = (!authoritative.includeAqi || body.aqi.response_complete === true) && body.observations.response_complete === true;
+      return new Response(JSON.stringify(body), { status: 200, headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": body.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(body.source.ingest_fetch_count) }) });
     } catch (error) {
-      const identityResponse = identityErrorResponse(error, url.pathname);
-      if (identityResponse) return identityResponse;
-      return errorResponse(502, error instanceof Error ? error.message : "station_series_failed", url.pathname);
+      return identityErrorResponse(error, url.pathname) || errorResponse(502, error instanceof Error ? error.message : "station_series_failed", url.pathname);
     }
   },
 };

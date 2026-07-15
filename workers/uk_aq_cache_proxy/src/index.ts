@@ -2367,12 +2367,17 @@ function addAqiCacheDiagnosticHeaders(
   hourlyGenerationEnabled: boolean,
 ): void {
   const scope = resolveAqiCacheScope(upstreamFunction, url, mutableHours, hourlyGenerationEnabled);
+  const generation = url.searchParams.get(AQI_HISTORY_PROXY_GENERATION_PARAM);
+  if (upstreamFunction === EXTERNAL_STATION_SERIES_UPSTREAM && generation) {
+    headers.set("X-UK-AQ-AQI-Cache-Scope", "station_series_stable_head");
+    headers.set("X-UK-AQ-AQI-Generation", generation);
+    return;
+  }
   if (!scope) {
     return;
   }
   headers.set("X-UK-AQ-AQI-Cache-Scope", scope);
   headers.set("X-UK-AQ-AQI-Mutable-Hours", String(mutableHours));
-  const generation = url.searchParams.get(AQI_HISTORY_PROXY_GENERATION_PARAM);
   if (generation) {
     headers.set("X-UK-AQ-AQI-Generation", generation);
   }
@@ -3018,19 +3023,24 @@ export default {
       : null;
     const normalizedRequestUrl = useTimeseriesV2Skeleton
       ? timeseriesV2Canonicalized!.url
-      : stationHistoryCacheKeys.applyAqiProxyHourlyGenerationCacheComponent(
-        canonicalizeLatestSnapshotRequestUrl(
-          stationHistoryCacheKeys.canonicalizeStationSeriesRequestUrl(
-            stationHistoryCacheKeys.canonicalizeAqiHistoryRequestUrl(url, upstreamFunction, EXTERNAL_AQI_HISTORY_UPSTREAM),
+      : stationHistoryCacheKeys.applyStationSeriesAqiGenerationCacheComponent(
+        stationHistoryCacheKeys.applyAqiProxyHourlyGenerationCacheComponent(
+          canonicalizeLatestSnapshotRequestUrl(
+            stationHistoryCacheKeys.canonicalizeStationSeriesRequestUrl(
+              stationHistoryCacheKeys.canonicalizeAqiHistoryRequestUrl(url, upstreamFunction, EXTERNAL_AQI_HISTORY_UPSTREAM),
+              upstreamFunction,
+              EXTERNAL_STATION_SERIES_UPSTREAM,
+            ),
             upstreamFunction,
-            EXTERNAL_STATION_SERIES_UPSTREAM,
           ),
           upstreamFunction,
+          aqiProxyHourlyGenerationEnabled,
+          aqiMutableHours,
+          EXTERNAL_AQI_HISTORY_UPSTREAM,
         ),
         upstreamFunction,
         aqiProxyHourlyGenerationEnabled,
-        aqiMutableHours,
-        EXTERNAL_AQI_HISTORY_UPSTREAM,
+        EXTERNAL_STATION_SERIES_UPSTREAM,
       );
     const profileName = resolveCacheProfileName(
       upstreamFunction,
@@ -3052,11 +3062,12 @@ export default {
       usingExternalPostcodeLookupUpstream ||
       usingExternalPostcodeSuggestUpstream ||
       usingExternalPostcodePrefixHintsUpstream;
+    const progressiveStationHistoryChunk = stationHistoryRequestWindow.isProgressiveStationHistoryChunkRequest(url);
     const stationHistoryInternalRoute = usingStationSeriesUpstream && stationHistoryRouting.stationSeries
       ? "/v1/station-series"
-      : usingExternalAqiHistoryUpstream && stationHistoryRouting.aqiHistory
+      : usingExternalAqiHistoryUpstream && stationHistoryRouting.aqiHistory && progressiveStationHistoryChunk
       ? "/v1/aqi-history"
-      : upstreamFunction === TIMESERIES_UPSTREAM_FUNCTION && stationHistoryRouting.timeseries
+      : upstreamFunction === TIMESERIES_UPSTREAM_FUNCTION && stationHistoryRouting.timeseries && progressiveStationHistoryChunk
       ? "/v1/observations-history"
       : null;
     const stationHistoryStaleConfig = stationHistoryStaleCache.resolveStaleCacheConfig({
@@ -3199,7 +3210,7 @@ export default {
       }
     }
 
-    if (useTimeseriesV2Skeleton && !stationHistoryRouting.timeseries) {
+    if (useTimeseriesV2Skeleton && stationHistoryInternalRoute !== "/v1/observations-history") {
       const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
       let stitched: TimeseriesV2StitchResult;
       try {

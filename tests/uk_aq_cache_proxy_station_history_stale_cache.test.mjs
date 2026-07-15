@@ -109,6 +109,19 @@ test("incomplete and known-gap responses never qualify to seed stale", () => {
   }, "/v1/station-series").cacheable, false);
 });
 
+test("complete observations-only station-series can seed stale without AQI completeness", () => {
+  const complete = inspectCompleteGapFreePayload({
+    aqi: { enabled: false, state: "disabled", response_complete: false, has_gap: false, rows: [] },
+    observations: { response_complete: true, has_gap: false, gap_ranges: [], rows: [{ observed_at: "2026-07-15T10:00:00.000Z", value: 1 }] },
+  }, "/v1/station-series");
+  assert.equal(complete.cacheable, true);
+  const incomplete = inspectCompleteGapFreePayload({
+    aqi: { enabled: false, state: "disabled", response_complete: false, has_gap: false, rows: [] },
+    observations: { response_complete: false, has_gap: true, rows: [] },
+  }, "/v1/station-series");
+  assert.equal(incomplete.cacheable, false);
+});
+
 test("validation errors and unsupported contracts do not qualify for stale", async () => {
   assert.equal(isUpstreamFailureStatus(400), false);
   assert.equal(isUpstreamFailureStatus(401), false);

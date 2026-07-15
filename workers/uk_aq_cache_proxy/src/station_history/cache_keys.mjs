@@ -116,6 +116,17 @@ export function applyAqiProxyHourlyGenerationCacheComponent(url, upstreamFunctio
   return normalized;
 }
 
+export function applyStationSeriesAqiGenerationCacheComponent(url, upstreamFunction, enabled, stationSeriesUpstream, nowMs = Date.now()) {
+  const normalized = new URL(url.toString());
+  if (upstreamFunction !== stationSeriesUpstream) return normalized;
+  normalized.searchParams.delete(AQI_HISTORY_PROXY_GENERATION_PARAM);
+  const aqiEnabled = !["0", "false", "no", "off"].includes(String(normalized.searchParams.get("include_aqi") ?? "").trim().toLowerCase());
+  if (enabled && aqiEnabled) {
+    normalized.searchParams.set(AQI_HISTORY_PROXY_GENERATION_PARAM, `${AQI_HISTORY_PROXY_GENERATION_VERSION}:${getAqiProxyGenerationHour(nowMs)}`);
+  }
+  return normalized;
+}
+
 export function stripAqiProxyHourlyGenerationCacheComponent(url) {
   const normalized = new URL(url.toString());
   normalized.searchParams.delete(AQI_HISTORY_PROXY_GENERATION_PARAM);
