@@ -406,6 +406,23 @@ The write path has no such relaxation: it writes and GET-verifies the child,
 then the normal parent guard rereads and fully validates that live child before
 the parent PUT. Any proposal or dependency failure in either preflight pass
 keeps the complete plan at zero PUTs, including in dry-run mode.
+Before targeted global timeseries metadata is constructed, the index planner
+derives the exact affected timeseries IDs from the old/new pollutant index
+counts and GETs only their corresponding
+`history/_index_v2/timeseries/timeseries_id=<id>.json` keys from live R2. A
+successful GET supplies the exact merge body, SHA-256, and genuine R2 ETag; an
+explicit 404 is recorded separately and permits creation from the authoritative
+core snapshot. Authentication, timeout, malformed-response, and other lookup
+failures block the complete proposal set as
+`live_timeseries_metadata_lookup_failed`. Dropbox is not target-existence
+evidence. Existing live payloads preserve every unaffected domain/day/
+connector/pollutant entry and replace or remove only the affected identities.
+Each changed global metadata proposal has an exact-target guard during
+whole-plan preflight and again immediately before PUT: existing targets must
+retain their live SHA-256 and genuine ETag, while planned creates must remain
+absent. Every successful PUT still receives exact GET verification. Summary
+counts distinguish existing objects merged, confirmed-new objects, and
+unchanged objects skipped.
 Integrity uses a targeted metadata merge, not the full rebuild: it replaces
 only entries identified by `domain`, `day_utc`, `connector_id` and
 `pollutant_code`, preserving unrelated observation and AQI coverage. Missing

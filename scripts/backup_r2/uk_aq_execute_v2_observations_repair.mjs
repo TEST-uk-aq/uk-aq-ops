@@ -177,6 +177,7 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
     }
   }
   const liveObjects = new Map();
+  const confirmedLiveMissing = new Set();
   const inventoryDiagnostics = new Map();
 
   function localObject(key, source) {
@@ -212,6 +213,27 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
         r2_etag: r2_etag || null,
         last_modified: last_modified || null,
       });
+      confirmedLiveMissing.delete(normalized);
+    },
+    setLiveMissing({ key }) {
+      const normalized = safeLocalKey(key);
+      liveObjects.delete(normalized);
+      confirmedLiveMissing.add(normalized);
+    },
+    getLiveLookupState(key) {
+      const normalized = safeLocalKey(key);
+      const live = liveObjects.get(normalized);
+      if (live) {
+        return {
+          status: "existing",
+          key: normalized,
+          content_sha256: live.content_sha256,
+          r2_etag: live.r2_etag,
+          last_modified: live.last_modified,
+        };
+      }
+      if (confirmedLiveMissing.has(normalized)) return { status: "missing", key: normalized };
+      return { status: "unverified", key: normalized };
     },
     recordLiveInventory({ prefix, live_keys }) {
       const normalizedPrefix = safeLocalKey(prefix).replace(/\/$/, "");
@@ -314,7 +336,7 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
   };
 }
 
-async function hydrateLiveR2State({ store, r2, prefixes, exactKeys = [] }) {
+async function hydrateLiveR2State({ store, r2, prefixes, exactKeys = [], lookupFailureReason = null }) {
   const liveKeys = new Set(exactKeys.map(safeLocalKey));
   for (const prefix of prefixes) {
     const entries = await r2ListAllObjects({ r2, prefix });
@@ -328,7 +350,13 @@ async function hydrateLiveR2State({ store, r2, prefixes, exactKeys = [] }) {
       store.setLiveObject({ key, body: object.body, r2_etag: object.etag, last_modified: object.last_modified });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (error?.code === "OBJECT_NOT_FOUND" || message.includes("(404)")) continue;
+      if (error?.code === "OBJECT_NOT_FOUND" || message.includes("(404)")) {
+        store.setLiveMissing({ key });
+        continue;
+      }
+      if (lookupFailureReason) {
+        throw new Error(`blocked_dependency|${lookupFailureReason}|${key}|${message}`);
+      }
       throw new Error(`Unable to hydrate live R2 state for ${key}: ${message}`);
     }
   }
@@ -378,6 +406,13 @@ function proposalView(proposal) {
       expected_inventory_source: proposal.pre_write_guard.expected_inventory_source,
       backup_inventory: proposal.pre_write_guard.backup_inventory,
       last_live_inventory: proposal.pre_write_guard.last_live_inventory,
+    } : null,
+    target_pre_write_guard: proposal.target_pre_write_guard ? {
+      key: proposal.target_pre_write_guard.key,
+      planned_state: proposal.target_pre_write_guard.planned_state,
+      old_sha256: proposal.target_pre_write_guard.old_sha256,
+      old_r2_etag: proposal.target_pre_write_guard.old_r2_etag,
+      last_live_state: proposal.target_pre_write_guard.last_live_state,
     } : null,
     expected_verification: proposal.changed ? "exact_body_and_bytes" : "not_required",
     proposed_body: proposal.body,
@@ -509,6 +544,68 @@ async function assertCompleteChildrenUnchanged({
   }
 }
 
+function exactTargetGuardSnapshot({ store, key }) {
+  const state = store.getLiveLookupState(key);
+  if (state.status === "existing") {
+    return {
+      kind: "exact_target",
+      key,
+      planned_state: "existing",
+      old_sha256: state.content_sha256,
+      old_r2_etag: state.r2_etag || null,
+      lookup_source: "live_r2_exact_get",
+      last_live_state: null,
+    };
+  }
+  if (state.status === "missing") {
+    return {
+      kind: "exact_target",
+      key,
+      planned_state: "missing",
+      old_sha256: null,
+      old_r2_etag: null,
+      lookup_source: "confirmed_live_404",
+      last_live_state: null,
+    };
+  }
+  throw new Error(`blocked_dependency|live_timeseries_metadata_lookup_failed|${key}|exact live target state was not verified`);
+}
+
+async function assertExactTargetUnchanged({ r2, guard }) {
+  let current = null;
+  try {
+    current = await r2GetObject({ r2, key: guard.key });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error?.code === "OBJECT_NOT_FOUND" || message.includes("(404)"))) {
+      throw new Error(`Blocked dependency: live_timeseries_metadata_lookup_failed ${guard.key}: ${message}`);
+    }
+  }
+  guard.last_live_state = current
+    ? {
+      state: "existing",
+      content_sha256: current.content_sha256 || sha256Hex(current.body),
+      r2_etag: current.etag || null,
+    }
+    : { state: "missing", content_sha256: null, r2_etag: null };
+  if (guard.planned_state === "missing") {
+    if (current) {
+      throw new Error(`Blocked dependency: concurrent_live_change target object was created after planning: ${guard.key}`);
+    }
+    return;
+  }
+  if (!current) {
+    throw new Error(`Blocked dependency: concurrent_live_change target object disappeared after planning: ${guard.key}`);
+  }
+  const currentSha256 = current.content_sha256 || sha256Hex(current.body);
+  if (currentSha256 !== guard.old_sha256) {
+    throw new Error(`Blocked dependency: concurrent_live_change target content changed before write: ${guard.key}`);
+  }
+  if (guard.old_r2_etag && current.etag && guard.old_r2_etag !== current.etag) {
+    throw new Error(`Blocked dependency: concurrent_live_change target R2 ETag changed before write: ${guard.key}`);
+  }
+}
+
 function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKeys = [] }) {
   const proposals = new Map();
   const allowedDropboxSourceKeys = new Set(dropboxSourceKeys.map(safeLocalKey));
@@ -518,7 +615,7 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKey
       ? "latest_timeseries_index"
       : "pollutant_timeseries_index";
 
-  async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], preWriteGuard = null, provenance = null }) {
+  async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], preWriteGuard = null, targetPreWriteGuard = null, provenance = null }) {
     const bodyText = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
     const previous = proposals.get(key);
     // Proposal changed/unchanged state is always measured against the live
@@ -531,6 +628,18 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKey
     // own old value.
     const oldBody = previous ? previous.old_body : existing?.body?.toString("utf8") ?? null;
     const oldEtag = previous ? previous.old_r2_etag : existing?.r2_etag ?? null;
+    const changed = oldBody !== bodyText;
+    const metadataTargetGuard = kind === "timeseries_metadata" && changed
+      ? previous?.target_pre_write_guard || targetPreWriteGuard || exactTargetGuardSnapshot({ store, key })
+      : null;
+    const metadataProvenance = kind === "timeseries_metadata"
+      ? {
+        metadata_source: metadataTargetGuard?.planned_state === "existing"
+          ? "existing_live_timeseries_metadata"
+          : "authoritative_core_snapshot",
+        live_lookup_source: metadataTargetGuard?.lookup_source || "verified_unchanged_live_target",
+      }
+      : null;
     const proposal = {
       key,
       kind: previous?.kind || kind,
@@ -542,10 +651,11 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKey
       old_sha256: oldBody === null ? null : sha256Hex(oldBody),
       old_r2_etag: oldEtag,
       new_sha256: sha256Hex(bodyText),
-      changed: oldBody !== bodyText,
+      changed,
       dependencies: [...new Set([...(previous?.dependencies || []), ...dependencies])].sort(),
       pre_write_guard: previous?.pre_write_guard || preWriteGuard,
-      provenance: previous?.provenance || provenance,
+      target_pre_write_guard: metadataTargetGuard,
+      provenance: previous?.provenance || provenance || metadataProvenance,
     };
     proposals.set(key, proposal);
     return proposal;
@@ -929,6 +1039,17 @@ function assertCanonicalProposal(proposal) {
       assertCanonicalObjectKey(child?.key, "pre-write guard child key");
     }
   }
+  if (proposal.target_pre_write_guard) {
+    const guard = proposal.target_pre_write_guard;
+    if (guard.kind !== "exact_target"
+      || guard.key !== proposal.key
+      || !["existing", "missing"].includes(guard.planned_state)
+      || !["live_r2_exact_get", "confirmed_live_404"].includes(guard.lookup_source)
+      || (guard.planned_state === "existing" && !/^[a-f0-9]{64}$/.test(String(guard.old_sha256 || "")))
+      || (guard.planned_state === "missing" && (guard.old_sha256 !== null || guard.old_r2_etag !== null))) {
+      throw new Error(`Invalid proposal target pre-write guard: ${proposal.key}`);
+    }
+  }
   assertCanonicalManifestProposal(proposal);
   if (!proposal.kind.endsWith("manifest")) {
     try {
@@ -991,6 +1112,7 @@ export async function applyStagedProposals({
   proposals,
   writeR2,
   assertChildren = assertCompleteChildrenUnchanged,
+  assertTarget = assertExactTargetUnchanged,
   putObject = r2PutObject,
   getObject = r2GetObject,
 }) {
@@ -1037,14 +1159,19 @@ export async function applyStagedProposals({
   // receives no relaxation and fully validates the written child.
   const validatedStagedProposalKeys = new Set(ordered.map((proposal) => proposal.key));
   for (const proposal of ordered) {
-    if (!proposal.pre_write_guard) continue;
+    if (!proposal.pre_write_guard && !proposal.target_pre_write_guard) continue;
     try {
-      await assertChildren({
-        r2,
-        guard: proposal.pre_write_guard,
-        allowStagedChildren: true,
-        validatedStagedProposalKeys,
-      });
+      if (proposal.pre_write_guard) {
+        await assertChildren({
+          r2,
+          guard: proposal.pre_write_guard,
+          allowStagedChildren: true,
+          validatedStagedProposalKeys,
+        });
+      }
+      if (proposal.target_pre_write_guard) {
+        await assertTarget({ r2, guard: proposal.target_pre_write_guard });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -1072,6 +1199,10 @@ export async function applyStagedProposals({
       if (proposal.pre_write_guard) {
         phase = "pre_write_guard";
         await assertChildren({ r2, guard: proposal.pre_write_guard });
+      }
+      if (proposal.target_pre_write_guard) {
+        phase = "target_pre_write_guard";
+        await assertTarget({ r2, guard: proposal.target_pre_write_guard });
       }
       phase = "put";
       putAttempted = true;
@@ -1510,6 +1641,15 @@ export async function runV2ObservationsRepair({
             proposalOnly: !args.writeR2,
             writeR2: true,
             authoritativeTimeseriesById: coreTimeseries,
+            prepareTimeseriesMetadataTargets: async ({ metadata_keys: metadataKeys }) => {
+              await hydrateLiveR2State({
+                store: localStore,
+                r2: config.r2,
+                prefixes: [],
+                exactKeys: metadataKeys,
+                lookupFailureReason: "live_timeseries_metadata_lookup_failed",
+              });
+            },
             additionalPollutantManifestTargets: additionalIndexPollutantTargets.filter((target) =>
               target.day_utc === dayUtc && target.connector_id === connectorId
             ),
@@ -1526,6 +1666,9 @@ export async function runV2ObservationsRepair({
               : "planned",
             blocked_scopes: metadataResults.flatMap((result) => result.blocked_scopes || []),
             metadata_object_count: metadataResults.reduce((total, result) => total + Number(result.metadata_object_count || 0), 0),
+            existing_object_merged_count: metadataResults.reduce((total, result) => total + Number(result.existing_object_merged_count || 0), 0),
+            new_object_count: metadataResults.reduce((total, result) => total + Number(result.new_object_count || 0), 0),
+            unchanged_object_count: metadataResults.reduce((total, result) => total + Number(result.unchanged_object_count || 0), 0),
           },
         };
       } catch (error) {
