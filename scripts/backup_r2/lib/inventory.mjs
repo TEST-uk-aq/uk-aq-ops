@@ -35,6 +35,7 @@ export const V1_INDEX_TREE_KEYS = Object.freeze([
 export const V2_INDEX_TREE_KEYS = Object.freeze([
   "observations_timeseries_v2",
   "aqilevels_hourly_data_timeseries_v2",
+  "timeseries_metadata_v2",
 ]);
 export const INDEX_TREE_KEYS = Object.freeze([...V1_INDEX_TREE_KEYS, ...V2_INDEX_TREE_KEYS]);
 export const COMMITTED_CONNECTOR_UNIT_KEYS = Object.freeze([
