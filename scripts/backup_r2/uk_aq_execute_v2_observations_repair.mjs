@@ -412,6 +412,7 @@ function proposalView(proposal) {
       planned_state: proposal.target_pre_write_guard.planned_state,
       old_sha256: proposal.target_pre_write_guard.old_sha256,
       old_r2_etag: proposal.target_pre_write_guard.old_r2_etag,
+      lookup_source: proposal.target_pre_write_guard.lookup_source,
       last_live_state: proposal.target_pre_write_guard.last_live_state,
     } : null,
     expected_verification: proposal.changed ? "exact_body_and_bytes" : "not_required",
@@ -544,7 +545,7 @@ async function assertCompleteChildrenUnchanged({
   }
 }
 
-function exactTargetGuardSnapshot({ store, key }) {
+function exactTargetGuardSnapshot({ store, key, lookupFailureReason = "live_repair_target_lookup_failed" }) {
   const state = store.getLiveLookupState(key);
   if (state.status === "existing") {
     return {
@@ -554,6 +555,7 @@ function exactTargetGuardSnapshot({ store, key }) {
       old_sha256: state.content_sha256,
       old_r2_etag: state.r2_etag || null,
       lookup_source: "live_r2_exact_get",
+      lookup_failure_reason: lookupFailureReason,
       last_live_state: null,
     };
   }
@@ -565,10 +567,11 @@ function exactTargetGuardSnapshot({ store, key }) {
       old_sha256: null,
       old_r2_etag: null,
       lookup_source: "confirmed_live_404",
+      lookup_failure_reason: lookupFailureReason,
       last_live_state: null,
     };
   }
-  throw new Error(`blocked_dependency|live_timeseries_metadata_lookup_failed|${key}|exact live target state was not verified`);
+  throw new Error(`blocked_dependency|${lookupFailureReason}|${key}|exact live target state was not verified`);
 }
 
 async function assertExactTargetUnchanged({ r2, guard }) {
@@ -578,7 +581,7 @@ async function assertExactTargetUnchanged({ r2, guard }) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!(error?.code === "OBJECT_NOT_FOUND" || message.includes("(404)"))) {
-      throw new Error(`Blocked dependency: live_timeseries_metadata_lookup_failed ${guard.key}: ${message}`);
+      throw new Error(`Blocked dependency: ${guard.lookup_failure_reason || "live_repair_target_lookup_failed"} ${guard.key}: ${message}`);
     }
   }
   guard.last_live_state = current
@@ -609,6 +612,14 @@ async function assertExactTargetUnchanged({ r2, guard }) {
 function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKeys = [] }) {
   const proposals = new Map();
   const allowedDropboxSourceKeys = new Set(dropboxSourceKeys.map(safeLocalKey));
+  const exactTargetGuardKinds = new Set([
+    "pollutant_manifest",
+    "connector_manifest",
+    "day_manifest",
+    "pollutant_timeseries_index",
+    "timeseries_metadata",
+    "latest_timeseries_index",
+  ]);
   const indexProposalKind = (key) => key.includes("/timeseries_id=")
     ? "timeseries_metadata"
     : key.endsWith("_latest.json")
@@ -618,9 +629,32 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKey
   async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], preWriteGuard = null, targetPreWriteGuard = null, provenance = null }) {
     const bodyText = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
     const previous = proposals.get(key);
-    // Proposal changed/unchanged state is always measured against the live
-    // target (or a verified current-run overlay), never against Dropbox.
-    const existing = previous ? null : store.getLiveTargetObjectIfExists(key);
+    const proposalKind = previous?.kind || kind;
+    const lookupFailureReason = proposalKind === "timeseries_metadata"
+      ? "live_timeseries_metadata_lookup_failed"
+      : "live_repair_target_lookup_failed";
+    // Prefix discovery supplies exact GET bodies for existing objects, but a
+    // target absent from the listing still needs an exact GET/404 before a
+    // planned create can claim that it is live-missing. Do this lazily for
+    // every JSON proposal kind so lookup/auth failures never become absence.
+    if (!previous && exactTargetGuardKinds.has(proposalKind)
+      && store.getLiveLookupState(key).status === "unverified") {
+      await hydrateLiveR2State({
+        store,
+        r2,
+        prefixes: [],
+        exactKeys: [key],
+        lookupFailureReason,
+      });
+    }
+    // Proposal changed/unchanged state and its guard must share the same exact
+    // live baseline. A verified overlay remains a planning/dependency source,
+    // but it cannot replace the target body's current live SHA-256 and ETag.
+    const existing = previous
+      ? null
+      : exactTargetGuardKinds.has(proposalKind)
+        ? store.getObjectFromSourceIfExists(key, "live_r2")
+        : store.getLiveTargetObjectIfExists(key);
     // A proposal sink can receive the same key more than once while the
     // targeted index builder derives related metadata. Preserve the first
     // live-target baseline exactly, including an intentional null for a
@@ -629,20 +663,24 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKey
     const oldBody = previous ? previous.old_body : existing?.body?.toString("utf8") ?? null;
     const oldEtag = previous ? previous.old_r2_etag : existing?.r2_etag ?? null;
     const changed = oldBody !== bodyText;
-    const metadataTargetGuard = kind === "timeseries_metadata" && changed
-      ? previous?.target_pre_write_guard || targetPreWriteGuard || exactTargetGuardSnapshot({ store, key })
+    const exactTargetGuard = exactTargetGuardKinds.has(proposalKind) && changed
+      ? previous?.target_pre_write_guard || targetPreWriteGuard || exactTargetGuardSnapshot({
+        store,
+        key,
+        lookupFailureReason,
+      })
       : null;
-    const metadataProvenance = kind === "timeseries_metadata"
+    const metadataProvenance = proposalKind === "timeseries_metadata"
       ? {
-        metadata_source: metadataTargetGuard?.planned_state === "existing"
+        metadata_source: exactTargetGuard?.planned_state === "existing"
           ? "existing_live_timeseries_metadata"
           : "authoritative_core_snapshot",
-        live_lookup_source: metadataTargetGuard?.lookup_source || "verified_unchanged_live_target",
+        live_lookup_source: exactTargetGuard?.lookup_source || "verified_unchanged_live_target",
       }
       : null;
     const proposal = {
       key,
-      kind: previous?.kind || kind,
+      kind: proposalKind,
       day_utc: previous?.day_utc || dayUtc,
       content_type: contentType,
       body: bodyText,
@@ -654,7 +692,7 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKey
       changed,
       dependencies: [...new Set([...(previous?.dependencies || []), ...dependencies])].sort(),
       pre_write_guard: previous?.pre_write_guard || preWriteGuard,
-      target_pre_write_guard: metadataTargetGuard,
+      target_pre_write_guard: exactTargetGuard,
       provenance: previous?.provenance || provenance || metadataProvenance,
     };
     proposals.set(key, proposal);
@@ -1045,7 +1083,10 @@ function assertCanonicalProposal(proposal) {
       || guard.key !== proposal.key
       || !["existing", "missing"].includes(guard.planned_state)
       || !["live_r2_exact_get", "confirmed_live_404"].includes(guard.lookup_source)
+      || typeof guard.lookup_failure_reason !== "string"
       || (guard.planned_state === "existing" && !/^[a-f0-9]{64}$/.test(String(guard.old_sha256 || "")))
+      || (guard.planned_state === "existing" && guard.old_sha256 !== proposal.old_sha256)
+      || (guard.planned_state === "existing" && guard.old_r2_etag !== proposal.old_r2_etag)
       || (guard.planned_state === "missing" && (guard.old_sha256 !== null || guard.old_r2_etag !== null))) {
       throw new Error(`Invalid proposal target pre-write guard: ${proposal.key}`);
     }

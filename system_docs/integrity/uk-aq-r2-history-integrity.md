@@ -417,12 +417,21 @@ failures block the complete proposal set as
 `live_timeseries_metadata_lookup_failed`. Dropbox is not target-existence
 evidence. Existing live payloads preserve every unaffected domain/day/
 connector/pollutant entry and replace or remove only the affected identities.
-Each changed global metadata proposal has an exact-target guard during
-whole-plan preflight and again immediately before PUT: existing targets must
-retain their live SHA-256 and genuine ETag, while planned creates must remain
-absent. Every successful PUT still receives exact GET verification. Summary
-counts distinguish existing objects merged, confirmed-new objects, and
-unchanged objects skipped.
+Every changed JSON proposal has an exact-target guard during whole-plan
+preflight and again immediately before PUT. This includes pollutant, connector,
+and day manifests; pollutant timeseries indexes; global timeseries metadata;
+and the shared latest index. Existing targets must retain their exact live-body
+SHA-256 and genuine R2 ETag, while planned creates must remain absent after a
+confirmed live 404. Lookup, authentication, and timeout failures never become
+missing-state guards. Connector and day manifests retain their separate strict
+child-inventory/content guards in addition to the target guard. Unchanged
+proposals are not written and receive no target guard; when they are parent
+dependencies, the parent's normal child guard still validates them. Every
+successful PUT still receives exact GET verification. The latest index remains
+last and is checked against its original
+planning baseline immediately before its PUT, so earlier repair writes cannot
+silently refresh that baseline. Summary counts distinguish existing objects
+merged, confirmed-new objects, and unchanged objects skipped.
 Integrity uses a targeted metadata merge, not the full rebuild: it replaces
 only entries identified by `domain`, `day_utc`, `connector_id` and
 `pollutant_code`, preserving unrelated observation and AQI coverage. Missing

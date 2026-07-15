@@ -96,6 +96,38 @@ function writeCombinedDropboxFixture(resolver, objects) {
   }
 }
 
+const OBSERVATIONS_INDEX_PREFIX = "history/_index_v2/observations_timeseries";
+const OBSERVATIONS_LATEST_KEY = "history/_index_v2/observations_timeseries_latest.json";
+
+function observationsIndexKey(pollutantCode = "o3") {
+  return `${OBSERVATIONS_INDEX_PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=${pollutantCode}/manifest.json`;
+}
+
+function indexGuardUpdater(proposals) {
+  return async ({ r2 }) => {
+    for (const proposal of proposals) {
+      await r2.proposal_sink({
+        key: proposal.key,
+        body: proposal.body,
+        content_type: "application/json",
+      });
+    }
+    return {
+      status: "planned",
+      observations_timeseries: { latest_index_key: OBSERVATIONS_LATEST_KEY },
+    };
+  };
+}
+
+function indexOnlyRepairPlan() {
+  return observationsRepairPlan(repairAction({
+    kind: "observation_index_repair",
+    connector_id: 1,
+    pollutant_code: "o3",
+    requires_index_rebuild: true,
+  }));
+}
+
 test("whole-day manifest actions remain connector-less and reject a connector subset", () => {
   const valid = normalizePlan(observationsRepairPlan(repairAction({
     kind: "observation_day_manifest_repair",
@@ -386,6 +418,8 @@ test("a live-missing O3 index is proposed even when Dropbox has an identical sta
     assert.ok(proposal);
     assert.equal(proposal.old_sha256, null, "Dropbox must not provide the live target baseline");
     assert.equal(proposal.changed, true, "a missing live index cannot be skipped as unchanged");
+    assert.equal(proposal.target_pre_write_guard.planned_state, "missing");
+    assert.equal(proposal.target_pre_write_guard.lookup_source, "confirmed_live_404");
   } finally {
     fake.restore();
     resolver.cleanup();
@@ -485,8 +519,195 @@ test("an explicit O3 index repair uses its Dropbox leaf without making it a live
     assert.ok(o3Index, "the explicit index-only O3 leaf must produce an index proposal");
     assert.equal(o3Index.old_sha256, null);
     assert.equal(o3Index.changed, true);
+    assert.equal(o3Index.target_pre_write_guard.planned_state, "missing");
+    assert.equal(o3Index.target_pre_write_guard.lookup_source, "confirmed_live_404");
     assert.equal(output.planning.proposals.some((proposal) => proposal.key === o3.manifest_key), false);
     assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+test("existing pollutant and latest indexes receive exact live target guards", async () => {
+  const indexKey = observationsIndexKey("no2");
+  const oldIndexBody = JSON.stringify({ version: "old-index" });
+  const oldLatestBody = JSON.stringify({ version: "old-latest" });
+  const indexEtag = 'W/"index-v1"';
+  const latestEtag = 'W/"latest-v1"';
+  const objects = {
+    [indexKey]: oldIndexBody,
+    [OBSERVATIONS_LATEST_KEY]: oldLatestBody,
+  };
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(objects, {
+    etags: {
+      [indexKey]: indexEtag,
+      [OBSERVATIONS_LATEST_KEY]: latestEtag,
+    },
+  });
+  try {
+    writeCombinedDropboxFixture(resolver, objects);
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: indexOnlyRepairPlan(),
+      updateIndexes: indexGuardUpdater([
+        { key: indexKey, body: JSON.stringify({ version: "new-index" }) },
+        { key: OBSERVATIONS_LATEST_KEY, body: JSON.stringify({ version: "new-latest" }) },
+      ]),
+    });
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
+    for (const [key, oldBody, oldEtag] of [
+      [indexKey, oldIndexBody, indexEtag],
+      [OBSERVATIONS_LATEST_KEY, oldLatestBody, latestEtag],
+    ]) {
+      const proposal = output.planning.proposals.find((candidate) => candidate.key === key);
+      assert.ok(proposal);
+      assert.equal(proposal.target_pre_write_guard.planned_state, "existing");
+      assert.equal(proposal.target_pre_write_guard.lookup_source, "live_r2_exact_get");
+      assert.equal(proposal.target_pre_write_guard.old_sha256, createHash("sha256").update(oldBody).digest("hex"));
+      assert.equal(proposal.target_pre_write_guard.old_r2_etag, oldEtag);
+    }
+    assert.equal(fake.puts.size, 0, "dry-run exact-target preflight must stay read-only");
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+for (const race of ["index_body", "latest_body", "index_etag", "index_created", "index_disappeared"]) {
+  test(`index target guard blocks a concurrent ${race.replaceAll("_", " ")} before every PUT`, async () => {
+    const indexKey = observationsIndexKey("o3");
+    const indexStartsMissing = race === "index_created";
+    const objects = {
+      ...(indexStartsMissing ? {} : { [indexKey]: JSON.stringify({ version: "old-index" }) }),
+      [OBSERVATIONS_LATEST_KEY]: JSON.stringify({ version: "old-latest" }),
+    };
+    const etags = {
+      ...(race === "index_etag" ? { [indexKey]: '"index-v1"' } : {}),
+      [OBSERVATIONS_LATEST_KEY]: '"latest-v1"',
+    };
+    const getCounts = new Map();
+    const fake = installFakeR2(objects, {
+      etags,
+      beforeRequest: ({ method, key, objects: liveObjects, etags: liveEtags }) => {
+        if (method !== "GET" || ![indexKey, OBSERVATIONS_LATEST_KEY].includes(key)) return null;
+        const count = (getCounts.get(key) || 0) + 1;
+        getCounts.set(key, count);
+        if (count !== 2) return null;
+        if (race === "index_body" && key === indexKey) liveObjects[key] = JSON.stringify({ version: "concurrent-index" });
+        if (race === "latest_body" && key === OBSERVATIONS_LATEST_KEY) liveObjects[key] = JSON.stringify({ version: "concurrent-latest" });
+        if (race === "index_etag" && key === indexKey) liveEtags.set(key, '"index-v2"');
+        if (race === "index_created" && key === indexKey) liveObjects[key] = JSON.stringify({ version: "concurrent-create" });
+        if (race === "index_disappeared" && key === indexKey) delete liveObjects[key];
+        return null;
+      },
+    });
+    const resolver = combinedResolverEnv();
+    try {
+      writeCombinedDropboxFixture(resolver, objects);
+      const output = await runV2ObservationsRepair({
+        argv: ["--write-r2"],
+        env: resolver.env,
+        repairPlan: indexOnlyRepairPlan(),
+        updateIndexes: indexGuardUpdater([
+          { key: indexKey, body: JSON.stringify({ version: "new-index" }) },
+          { key: OBSERVATIONS_LATEST_KEY, body: JSON.stringify({ version: "new-latest" }) },
+        ]),
+      });
+      assert.equal(output.status, "failed");
+      assert.match(output.application_failure.error, /concurrent_live_change target/);
+      assert.equal(fake.puts.size, 0, "Pass 2 must reject the entire plan before its first PUT");
+    } finally {
+      fake.restore();
+      resolver.cleanup();
+    }
+  });
+}
+
+test("index target lookup failure is blocked and is not converted to live-missing", async () => {
+  const indexKey = observationsIndexKey("o3");
+  const objects = { [OBSERVATIONS_LATEST_KEY]: JSON.stringify({ version: "old-latest" }) };
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(objects, {
+    beforeRequest: ({ method, key }) => method === "GET" && key === indexKey
+      ? new Response("forbidden", { status: 403 })
+      : null,
+  });
+  try {
+    writeCombinedDropboxFixture(resolver, {
+      ...objects,
+      [indexKey]: JSON.stringify({ version: "dropbox-only" }),
+    });
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: indexOnlyRepairPlan(),
+      updateIndexes: indexGuardUpdater([
+        { key: indexKey, body: JSON.stringify({ version: "new-index" }) },
+        { key: OBSERVATIONS_LATEST_KEY, body: JSON.stringify({ version: "new-latest" }) },
+      ]),
+    });
+    assert.equal(output.status, "blocked_dependency");
+    assert.equal(output.planning.blocked_scopes.some((scope) => scope.reason === "live_repair_target_lookup_failed"), true);
+    assert.equal(output.planning.proposals.some((proposal) => proposal.key === indexKey), false);
+    assert.equal(fake.puts.size, 0);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+test("index guards rerun before PUT, verify exact GETs, keep latest last, and are idempotent", async () => {
+  const indexKey = observationsIndexKey("no2");
+  const metadataKey = "history/_index_v2/timeseries/timeseries_id=101.json";
+  const objects = {
+    [indexKey]: JSON.stringify({ version: "old-index" }),
+    [metadataKey]: JSON.stringify({ version: "old-metadata" }),
+    [OBSERVATIONS_LATEST_KEY]: JSON.stringify({ version: "old-latest" }),
+  };
+  const proposed = [
+    { key: indexKey, body: JSON.stringify({ version: "new-index" }) },
+    { key: metadataKey, body: JSON.stringify({ version: "new-metadata" }) },
+    { key: OBSERVATIONS_LATEST_KEY, body: JSON.stringify({ version: "new-latest" }) },
+  ];
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(objects, {
+    etags: Object.fromEntries(Object.keys(objects).map((key) => [key, `"old-${key.length}"`])),
+  });
+  try {
+    writeCombinedDropboxFixture(resolver, objects);
+    const first = await runV2ObservationsRepair({
+      argv: ["--write-r2"],
+      env: resolver.env,
+      repairPlan: indexOnlyRepairPlan(),
+      updateIndexes: indexGuardUpdater(proposed),
+    });
+    assert.equal(first.status, "succeeded", JSON.stringify(first.application_failure));
+    assert.deepEqual(
+      fake.requests.filter((request) => request.method === "PUT").map((request) => request.key),
+      [indexKey, metadataKey, OBSERVATIONS_LATEST_KEY],
+      "latest must remain ordered after pollutant indexes and timeseries metadata",
+    );
+    for (const key of [indexKey, metadataKey, OBSERVATIONS_LATEST_KEY]) {
+      const operations = fake.requests.filter((request) => request.key === key).map((request) => request.method);
+      const putPosition = operations.indexOf("PUT");
+      assert.ok(operations.slice(0, putPosition).filter((method) => method === "GET").length >= 3, `${key} must be hydrated, preflighted, and rechecked`);
+      assert.equal(operations[putPosition + 1], "GET", `${key} must receive exact post-PUT GET verification`);
+    }
+    assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet")), false);
+    const firstPutCount = fake.requests.filter((request) => request.method === "PUT").length;
+    const second = await runV2ObservationsRepair({
+      argv: ["--write-r2"],
+      env: resolver.env,
+      repairPlan: indexOnlyRepairPlan(),
+      updateIndexes: indexGuardUpdater(proposed),
+    });
+    assert.equal(second.status, "planned", "the injected index planner still reports planned while every application proposal is unchanged");
+    assert.equal(fake.requests.filter((request) => request.method === "PUT").length, firstPutCount);
+    for (const proposal of second.planning.proposals) {
+      assert.equal(proposal.changed, false);
+      assert.equal(proposal.target_pre_write_guard, null, "unchanged targets need no write race guard");
+    }
   } finally {
     fake.restore();
     resolver.cleanup();
