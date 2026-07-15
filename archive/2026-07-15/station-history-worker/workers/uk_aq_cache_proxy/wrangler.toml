@@ -1,0 +1,55 @@
+name = "uk-aq-cache-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-02-22"
+
+[observability]
+enabled = true
+
+# Runtime secrets expected:
+# - SUPABASE_URL
+# - SB_PUBLISHABLE_DEFAULT_KEY
+# - SB_SECRET_KEY
+# - OBS_AQIDB_SUPABASE_URL
+# - OBS_AQIDB_SECRET_KEY
+# - UK_AQ_CACHE_ALLOWED_ORIGINS
+# - UK_AQ_EDGE_ACCESS_TOKEN_SECRET
+# - UK_AQ_EDGE_UPSTREAM_SECRET
+# - UK_AQ_CACHE_BYPASS_SECRET
+# - UK_AQ_TURNSTILE_SECRET_KEY
+# - UK_AQ_OBSERVS_HISTORY_R2_API_URL
+# Runtime variables:
+# - UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS (optional)
+# - UK_AQ_LOCAL_DEV_BYPASS_ENABLED (optional; set true/1 in test only)
+# - UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED (optional; default false)
+# - UK_AQ_AQI_MUTABLE_HOURS (optional; default 120; bounded 1-720)
+# - UK_AQ_POSTCODE_LOOKUP_R2_API_URL (required for /api/aq/postcode_lookup)
+# - UK_AQ_CHART_METRICS_RPC (optional)
+# - UK_AQ_CHART_METRICS_RPC_SCHEMA (optional, default: uk_aq_public)
+# - UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE (optional)
+# - UK_AQ_CHART_METRICS_MAX_BODY_BYTES (optional)
+# - UK_AQ_TIMESERIES_V2_ENABLED (optional; default false)
+# - UK_AQ_TIMESERIES_PROXY_FIRST (optional; default false)
+# - UK_AQ_TIMESERIES_R2_FIRST (optional; default false)
+# - UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE (optional; default false)
+# - UK_AQ_TIMESERIES_MAX_WINDOW_DAYS (optional; default 90)
+# - UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST (optional; default 120)
+# - UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS (optional; default 168)
+# - UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES (optional; default 180)
+# - UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR (optional; default true)
+# - UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR (optional; default false)
+# - UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS (optional; default 60)
+# - UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS (optional; default 60)
+# - UK_AQ_TIMESERIES_RECENT_SWR_SECONDS (optional; default 60)
+# - UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS (optional; default 86400)
+# - UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS (optional; default 86400)
+# - UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS (optional; default 86400)
+# - UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS (optional; default 300)
+# - DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN (optional; required for /api/aq/debug-log uploads)
+# - UK_AQ_DROPBOX_ROOT (optional; root folder for /api/aq/debug-log Dropbox uploads)
+# - UK_AIR_ERROR_DROPBOX_FOLDER (optional; default /error_log for /api/aq/debug-log)
+# - UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES (optional; default 262144)
+#
+# Route binding is configured in Cloudflare dashboard or via wrangler CLI.
+# Recommended hostnames:
+# - uk-aq-cache-cic-test.chronicillnesschannel.co.uk
+# - uk-aq-cache.chronicillnesschannel.co.uk
