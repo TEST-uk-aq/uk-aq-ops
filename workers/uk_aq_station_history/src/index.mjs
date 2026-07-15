@@ -131,10 +131,29 @@ export function buildStationSeriesFromIngest(request, ingestPayload) {
     : [];
   const observationGaps = gapRanges(observationRows, request.startMs, request.endMs, "observed_at");
   const aqiGaps = gapRanges(aqiRows, request.startMs, request.endMs, "timestamp_hour_utc");
-  const outputComplete = ingestComplete && observationGaps.length === 0;
-  const aqiComplete = request.includeAqi && outputComplete && aqiGaps.length === 0;
+  const contextGaps = request.includeAqi && request.contextStartMs < request.startMs
+    ? gapRanges(normalised, request.contextStartMs, request.startMs, "observed_at")
+    : [];
+  // Observation completeness is scoped to the requested output interval.
+  // PM AQI has an additional rolling-window context requirement which must
+  // make only the AQI section incomplete when that preceding context is absent.
+  const observationOutputComplete = sourceComplete(ingestPayload, normalised, request.startMs, request.endMs)
+    && observationGaps.length === 0;
+  const aqiContextComplete = !request.includeAqi || (
+    sourceComplete(ingestPayload, normalised, request.contextStartMs, request.startMs)
+    && contextGaps.length === 0
+  );
+  const aqiOutputComplete = !request.includeAqi || (
+    sourceComplete(ingestPayload, normalised, request.startMs, request.endMs)
+    && aqiGaps.length === 0
+  );
+  const aqiComplete = request.includeAqi && aqiContextComplete && aqiOutputComplete;
+  const outputComplete = observationOutputComplete && (!request.includeAqi || aqiComplete);
+  const aqiGapRanges = [...contextGaps, ...aqiGaps];
   const outputStartUtc = new Date(request.startMs).toISOString();
-  const fullyServedShortWindow = outputComplete && (request.window === "12h" || request.window === "24h");
+  const shortWindow = request.window === "12h" || request.window === "24h";
+  const fullyServedShortAqi = aqiComplete && shortWindow;
+  const fullyServedShortObservations = observationOutputComplete && shortWindow;
   return {
     schema_version: 1,
     request: { timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, start_utc: outputStartUtc, end_utc: new Date(request.endMs).toISOString(), window: request.window, format: "objects", include_aqi: request.includeAqi },
@@ -144,6 +163,9 @@ export function buildStationSeriesFromIngest(request, ingestPayload) {
       output_start_utc: outputStartUtc,
       output_end_utc: new Date(request.endMs).toISOString(),
       ingest_response_complete: ingestComplete,
+      observation_output_complete: observationOutputComplete,
+      aqi_context_complete: aqiContextComplete,
+      aqi_output_complete: aqiOutputComplete,
       used_recent_r2_aqi: false,
       used_r2_observations: false,
       ingest_row_count: normalised.length,
@@ -151,9 +173,9 @@ export function buildStationSeriesFromIngest(request, ingestPayload) {
       r2_aqi_fetch_count: 0,
     },
     aqi: request.includeAqi
-      ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, next_chunk_end_utc: fullyServedShortWindow ? null : outputStartUtc, source_counts: { r2: 0, live_calculated: aqiRows.length }, mismatch_count: 0 }
+      ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGapRanges, next_chunk_end_utc: fullyServedShortAqi ? null : outputStartUtc, source_counts: { r2: 0, live_calculated: aqiRows.length }, mismatch_count: 0 }
       : { enabled: false, state: "disabled", rows: [], response_complete: false, has_gap: false, gap_ranges: [], next_chunk_end_utc: null, source_counts: { r2: 0, live_calculated: 0 }, mismatch_count: 0 },
-    observations: { rows: observationRows, guideline: ingestPayload?.guideline || null, response_complete: outputComplete, has_gap: !outputComplete, gap_ranges: observationGaps, next_chunk_end_utc: fullyServedShortWindow ? null : outputStartUtc, source_counts: { ingest: observationRows.length } },
+    observations: { rows: observationRows, guideline: ingestPayload?.guideline || null, response_complete: observationOutputComplete, has_gap: !observationOutputComplete, gap_ranges: observationGaps, next_chunk_end_utc: fullyServedShortObservations ? null : outputStartUtc, source_counts: { ingest: observationRows.length } },
   };
 }
 

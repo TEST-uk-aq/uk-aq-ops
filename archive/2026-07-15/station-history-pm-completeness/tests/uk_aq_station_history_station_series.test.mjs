@@ -42,22 +42,6 @@ test("PM 24h requests include 23 context hours but exclude them from output", as
   assert.ok(result.body.observations.rows.every((row) => row.observed_at >= outputStart));
 });
 
-test("PM context gap leaves complete output observations usable while AQI is incomplete", async () => {
-  const outputStart = "2026-07-02T00:00:00.000Z";
-  const contextStart = "2026-07-01T01:00:00.000Z";
-  const rows = observations(contextStart, 47, "pm25").filter((_, index) => index !== 0);
-  const result = await stationSeries({ pollutant: "pm25", startIso: outputStart, endIso: "2026-07-03T00:00:00.000Z", rows });
-  assert.equal(result.body.observations.response_complete, true);
-  assert.equal(result.body.observations.has_gap, false);
-  assert.equal(result.body.observations.next_chunk_end_utc, null);
-  assert.equal(result.body.aqi.response_complete, false);
-  assert.equal(result.body.aqi.has_gap, true);
-  assert.equal(result.body.source.observation_output_complete, true);
-  assert.equal(result.body.source.aqi_context_complete, false);
-  assert.equal(result.body.source.aqi_output_complete, true);
-  assert.equal(result.response.headers.get("Cache-Control"), "no-store");
-});
-
 test("incomplete ingest makes both sections incomplete and uncacheable", async () => {
   const start = "2026-07-04T00:00:00.000Z";
   const rows = observations(start, 12, "no2").filter((_, index) => index !== 5);
