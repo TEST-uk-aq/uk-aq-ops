@@ -31,3 +31,24 @@ scripts/r2_query/query_r2_v2_day_counts.sh   --connector-id all   --from-day 202
 
 
 scripts/r2_query/query_r2_v2_day_counts.sh   --connector-id all   --from-day 2026-07-01   --to-day 2026-07-10   --out "/Users/mikehinford/uk-aq-work/r2_v2_day_counts_$(date +%Y-%m-%d_%H%M%S).csv"
+
+
+
+
+
+scripts/r2_query/query_r2_v2_day_counts.sh   --connector-id 1   --from-day 2026-05-17   --to-day 2026-05-17   --out "/Users/mikehinford/uk-aq-work/r2_v2_day_counts_$(date +%Y-%m-%d_%H%M%S).csv"
+
+
+scripts/r2_query/query_r2_v2_observs_aqilevels_indexes.sh --connector-id 1 --from-day 2026-05-17 --to-day 2026-05-17 --r2-history-root /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/CIC-Test/R2_history_backup   --out /Users/mikehinford/uk-aq-work/uk-aq-local-index-check_$(date +%Y%m%d-%H%M%S)
+
+
+scripts/r2_query/query_r2_v2_observs_aqilevels.sh --connector-id 1 --from-day 2026-05-17 --to-day 2026-05-17 --out /Users/mikehinford/uk-aq-work/r2_observs_aqi_conn1_2026-05-17_to_2026-05-17_$(date +%Y%m%d-%H%M%S)
+
+BEFORE_DIR="/Users/mikehinford/uk-aq-work/r2_conn1_2026-05-17_before_$(date -u +%Y%m%dT%H%M%SZ)"
+
+scripts/r2_query/query_r2_v2_day_snapshot.sh \
+  --day 2026-05-17 \
+  --connector-id 1 \
+  --label before \
+  --out "$BEFORE_DIR"
+

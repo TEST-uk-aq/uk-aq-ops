@@ -9,7 +9,11 @@ import {
   buildHistoryV2DayManifest,
   buildHistoryV2PollutantManifest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
-import { normalizePlan, runV2ObservationsRepair } from "../scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs";
+import {
+  applyStagedProposals,
+  normalizePlan,
+  runV2ObservationsRepair,
+} from "../scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs";
 
 const DAY = "2026-05-17";
 const PREFIX = "history/v2/observations";
@@ -121,6 +125,60 @@ test("an AQI day-manifest action does not expand into child indexes", () => {
   assert.equal(plan.scopes[0].connectorId, null);
 });
 
+test("AQI day-only repair retains all connectors without pollutant proposals", async () => {
+  const aqiPrefix = "history/v2/aqilevels/hourly/data";
+  const connectorIds = [1, 3, 6, 7];
+  const connectors = connectorIds.map((connectorId) => {
+    const pollutantCode = "pm25";
+    const manifestKey = `${aqiPrefix}/day_utc=${DAY}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+    const pollutant = buildHistoryV2PollutantManifest({
+      domain: "aqilevels", grain: "hourly", profile: "data", dayUtc: DAY, connectorId, pollutantCode,
+      runId: "fixture", manifestKey, sourceRowCount: 1, writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+      fileEntries: [{ key: manifestKey.replace("manifest.json", "part-00000.parquet"), bytes: 1, row_count: 1, etag_or_hash: "part", min_timeseries_id: connectorId, max_timeseries_id: connectorId, min_timestamp_hour_utc: `${DAY}T00:00:00.000Z`, max_timestamp_hour_utc: `${DAY}T00:00:00.000Z`, timeseries_row_counts: { [connectorId]: 1 } }],
+    });
+    const connectorKey = `${aqiPrefix}/day_utc=${DAY}/connector_id=${connectorId}/manifest.json`;
+    const manifest = buildHistoryV2ConnectorManifest({
+      domain: "aqilevels", grain: "hourly", profile: "data", dayUtc: DAY, connectorId, runId: "fixture", manifestKey: connectorKey,
+      pollutantManifests: [pollutant], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+    });
+    return { pollutant, manifest };
+  });
+  const dayKey = `${aqiPrefix}/day_utc=${DAY}/manifest.json`;
+  const staleDay = buildHistoryV2DayManifest({
+    domain: "aqilevels", grain: "hourly", profile: "data", dayUtc: DAY, runId: "fixture", manifestKey: dayKey,
+    connectorManifests: [connectors[0].manifest], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const objects = Object.fromEntries([
+    ...connectors.flatMap(({ pollutant, manifest }) => [
+      [pollutant.manifest_key, JSON.stringify(pollutant, null, 2)],
+      [manifest.manifest_key, JSON.stringify(manifest, null, 2)],
+    ]),
+    [dayKey, JSON.stringify(staleDay, null, 2)],
+  ]);
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(objects);
+  try {
+    writeCombinedDropboxFixture(resolver, objects);
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: {
+        history_version: "v2",
+        domain: "aqilevels",
+        repair_plan: [repairAction({
+          kind: "aqi_day_manifest_repair", connector_id: null, pollutant_code: null, requires_index_rebuild: false,
+        })],
+      },
+    });
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
+    assert.deepEqual(output.planning.days[0].proposal_keys, [dayKey]);
+    assert.equal(output.planning.proposals.some((proposal) => proposal.kind === "pollutant_manifest"), false);
+    assert.equal(JSON.parse(output.planning.proposals[0].proposed_body).grain, "hourly");
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
 async function assertNoR2Access(operation) {
   const originalFetch = globalThis.fetch;
   let calls = 0;
@@ -151,10 +209,10 @@ function installFakeR2(objects, { beforeRequest = null } = {}) {
     await beforeRequest?.({ method, key, prefix, objects, puts, requests });
     if (method === "GET" && parsed.searchParams.get("list-type") === "2") {
       const keys = [...new Set([...Object.keys(objects), ...puts.keys()])].filter((key) => key.startsWith(prefix)).sort();
-      return new Response(`<ListBucketResult>${keys.map((key) => `<Contents><Key>${key}</Key><Size>1</Size><ETag>\"${key}\"</ETag></Contents>`).join("")}</ListBucketResult>`, { status: 200 });
+      return new Response(`<ListBucketResult>${keys.map((key) => `<Contents><Key>${key}</Key><Size>1</Size></Contents>`).join("")}</ListBucketResult>`, { status: 200 });
     }
-    if (method === "HEAD") return bodyFor(key) ? new Response(null, { status: 200, headers: { etag: `\"${key}\"` } }) : new Response(null, { status: 404 });
-    if (method === "GET") return bodyFor(key) ? new Response(bodyFor(key), { status: 200, headers: { etag: `\"${key}\"` } }) : new Response("not found", { status: 404 });
+    if (method === "HEAD") return bodyFor(key) ? new Response(null, { status: 200 }) : new Response(null, { status: 404 });
+    if (method === "GET") return bodyFor(key) ? new Response(bodyFor(key), { status: 200 }) : new Response("not found", { status: 404 });
     if (method === "PUT") { puts.set(key, String(init.body)); return new Response("", { status: 200, headers: { etag: `\"${key}\"` } }); }
     return new Response("unsupported", { status: 405 });
   };
@@ -184,6 +242,81 @@ function twoConnectorFixture() {
     keys: { c1: staleC1.manifest_key, c2: staleC2.manifest_key, day: staleDay.manifest_key },
   };
 }
+
+function proposalFromManifest(manifest, kind = "pollutant_manifest") {
+  const body = JSON.stringify(manifest);
+  return {
+    key: manifest.manifest_key,
+    kind,
+    body,
+    bytes: Buffer.byteLength(body),
+    changed: true,
+    dependencies: [],
+    pre_write_guard: null,
+  };
+}
+
+test("metadata proposal preflight rejects a late invalid proposal before any write", async () => {
+  const valid = proposalFromManifest(pollutant(1, "pm25"));
+  const invalid = {
+    ...valid,
+    key: `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`,
+    kind: "connector_manifest",
+    body: "{}",
+    bytes: 2,
+  };
+  const puts = [];
+  const output = await applyStagedProposals({
+    r2: {},
+    proposals: new Map([[valid.key, valid], [invalid.key, invalid]]),
+    writeR2: true,
+    putObject: async ({ key }) => { puts.push(key); },
+  });
+  assert.equal(output.failure.key, invalid.key);
+  assert.equal(output.results.get(invalid.key).failure_stage, "proposal_preflight");
+  assert.deepEqual(puts, [], "no valid earlier proposal may be written before a later proposal fails preflight");
+});
+
+test("dry-run executes proposal preflight guards without writing", async () => {
+  const valid = proposalFromManifest(pollutant(1, "pm25"));
+  valid.pre_write_guard = { prefix: "history/v2/observations", expected_children: [] };
+  let guardCalls = 0;
+  let putCalls = 0;
+  const output = await applyStagedProposals({
+    r2: {},
+    proposals: new Map([[valid.key, valid]]),
+    writeR2: false,
+    assertChildren: async ({ guard, allowStagedChildren }) => {
+      guardCalls += 1;
+      assert.equal(guard.prefix, "history/v2/observations");
+      assert.equal(allowStagedChildren, true);
+    },
+    putObject: async () => { putCalls += 1; },
+  });
+  assert.equal(output.failure, null);
+  assert.equal(guardCalls, 1);
+  assert.equal(putCalls, 0);
+  assert.equal(output.results.get(valid.key).status, "planned");
+});
+
+test("live connector and day guards receive canonical string keys", async () => {
+  const fixture = twoConnectorFixture();
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(fixture.objects);
+  try {
+    writeCombinedDropboxFixture(resolver, fixture.objects);
+    const output = await runV2ObservationsRepair({
+      argv: ["--write-r2"],
+      env: resolver.env,
+      repairPlan: observationsRepairPlan(),
+    });
+    assert.equal(output.status, "succeeded", JSON.stringify(output.application_failure));
+    assert.deepEqual([...fake.puts.keys()].sort(), [fixture.keys.c1, fixture.keys.day].sort());
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
 
 test("Phase 5 one-connector O3 repair stages the complete connector and day hierarchy, then is idempotent", async () => {
   const o3 = pollutant(1, "o3");
@@ -266,14 +399,18 @@ test("Phase 5 day-only action proposes a parent built from every live connector"
     requires_index_rebuild: false,
   }));
   const resolver = combinedResolverEnv();
+  const fake = installFakeR2(objects);
   try {
     writeCombinedDropboxFixture(resolver, objects);
     const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: dayOnly });
-    assert.equal(output.status, "planned");
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
     assert.deepEqual(output.planning.days[0].proposal_keys, [dayKey]);
     const proposedDay = JSON.parse(output.planning.proposals[0].proposed_body);
     assert.deepEqual(proposedDay.connector_ids, connectorIds, "a connector-less day repair must retain every live connector child");
-  } finally { resolver.cleanup(); }
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
 });
 
 test("Phase 7 index-only blocked work controls the scope and top-level repair result", async () => {
