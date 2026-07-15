@@ -5,7 +5,7 @@ const TIMESERIES_V2_VERSION = "2";
 const TIMESERIES_V2_ALLOWED_WINDOWS = new Set(["12h", "24h", "7d", "31d", "90d"]);
 const TIMESERIES_V2_CACHE_BUSTER_KEYS = new Set(["_t", "timestamp", "cache_bust", "random"]);
 const TIMESERIES_V2_PRIMARY_QUERY_KEYS = [
-  "timeseries_id", "connector_id", "pollutant", "window", "since", "start_utc", "end_utc", "stable_head_start_utc", "format", "v",
+  "timeseries_id", "connector_id", "pollutant", "window", "since", "start_utc", "end_utc", "format", "v",
 ];
 const TIMESERIES_V2_DEFAULT_MAX_WINDOW_DAYS = 90;
 const TIMESERIES_V2_MAX_WINDOW_DAYS_LIMIT = 365;
@@ -107,8 +107,6 @@ export function canonicalizeTimeseriesV2RequestUrl(url, allowCacheBypassParams) 
     normalized.searchParams.set("start_utc", normalizedStartUtc);
     normalized.searchParams.set("end_utc", normalizedEndUtc);
   }
-  const stableHeadStartUtc = normalizeIsoOrNull(original.searchParams.get("stable_head_start_utc"));
-  if (stableHeadStartUtc) normalized.searchParams.set("stable_head_start_utc", stableHeadStartUtc);
   normalized.searchParams.set("format", "json");
   normalized.searchParams.set("v", TIMESERIES_V2_VERSION);
   if (allowCacheBypassParams) {

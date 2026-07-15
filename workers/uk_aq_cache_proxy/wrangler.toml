@@ -5,6 +5,10 @@ compatibility_date = "2026-02-22"
 [observability]
 enabled = true
 
+[[services]]
+binding = "STATION_HISTORY"
+service = "uk-aq-station-history"
+
 # Runtime secrets expected:
 # - SUPABASE_URL
 # - SB_PUBLISHABLE_DEFAULT_KEY
@@ -44,6 +48,15 @@ enabled = true
 # - UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS (optional; default 86400)
 # - UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS (optional; default 86400)
 # - UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS (optional; default 300)
+# - UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED (optional; default false)
+# - UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED (optional; default false)
+# - UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED (optional; default false; non-v2 only in phase 2)
+# - UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED (optional; default false)
+# - UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS (optional; default 60)
+# - UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS (optional; default 300)
+# - UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS (optional; default 300)
+# - UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS (optional; default 300)
+# - UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS (optional; default 604800)
 # - DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN (optional; required for /api/aq/debug-log uploads)
 # - UK_AQ_DROPBOX_ROOT (optional; root folder for /api/aq/debug-log Dropbox uploads)
 # - UK_AIR_ERROR_DROPBOX_FOLDER (optional; default /error_log for /api/aq/debug-log)
