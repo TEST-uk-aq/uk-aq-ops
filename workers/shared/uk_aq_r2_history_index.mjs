@@ -1903,7 +1903,7 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
         indexPrefix: normalizedIndexPrefix,
         timeseriesMetadataIndexPrefix: normalizedMetadataPrefix,
       });
-      candidates.push({ key, payload, operation, ...merged, metadata_source: "existing_live_timeseries_metadata" });
+      candidates.push({ key, payload, operation, ...merged, metadata_source: "existing_timeseries_metadata" });
     } catch (error) {
       blocked_scopes.push({ status: "blocked_dependency", reason: String(error?.message || error), path: key, timeseries_id: Number(timeseriesId) });
     }
@@ -1918,7 +1918,7 @@ export async function updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
     status: plannedOnly || !writeR2 ? "planned" : "succeeded",
     metadata_object_count: candidates.length,
     metadata_put_skipped_count,
-    existing_object_merged_count: candidates.filter((candidate) => candidate.metadata_source === "existing_live_timeseries_metadata").length,
+    existing_object_merged_count: candidates.filter((candidate) => candidate.metadata_source === "existing_timeseries_metadata").length,
     new_object_count: candidates.filter((candidate) => candidate.metadata_source === "authoritative_core_snapshot").length,
     unchanged_object_count: metadata_put_skipped_count,
     affected_timeseries_ids: [...operationsByTimeseriesId.keys()].map(Number).sort((a, b) => a - b),

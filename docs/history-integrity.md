@@ -52,6 +52,15 @@ Later stages resolve a verified overlay object first, then the matching
 Verified tombstones hide objects deleted by a targeted replacement, so a stale
 Dropbox part cannot reappear in the current run's combined view.
 
+The metadata executor plans solely from that combined-local view. It does not
+GET, HEAD, or list live R2 before a metadata PUT. For an authorised real apply,
+every changed proposal is PUT and immediately GET-verified for exact bytes and
+canonical structure. The only retained live-read exception is the AQI writer's
+read of observation objects that the same run has already PUT/GET-verified.
+An index-only O3 observation leaf can be read by exact Dropbox key for its
+index, but cannot enter connector/day child discovery unless an explicit O3
+leaf repair has staged a canonical leaf manifest.
+
 The metadata executor reads parquet metadata from the final combined local
 object. Observation parquet uses `observed_at_utc`, with `observed_at` accepted
 only for older compatible files; a file with neither timestamp column blocks
