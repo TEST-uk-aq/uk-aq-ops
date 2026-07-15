@@ -249,6 +249,15 @@ function pollutant(connectorId, code) {
   });
 }
 
+function pollutantForTimeseries(connectorId, code, timeseriesId) {
+  const key = `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/pollutant_code=${code}/manifest.json`;
+  return buildHistoryV2PollutantManifest({
+    domain: "observations", dayUtc: DAY, connectorId, pollutantCode: code, runId: "fixture",
+    manifestKey: key, writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z", sourceRowCount: 1,
+    fileEntries: [{ key: key.replace("manifest.json", "part-00000.parquet"), bytes: 1, row_count: 1, etag_or_hash: "part", min_timeseries_id: timeseriesId, max_timeseries_id: timeseriesId, min_observed_at_utc: `${DAY}T00:00:00.000Z`, max_observed_at_utc: `${DAY}T00:00:00.000Z`, timeseries_row_counts: { [timeseriesId]: 1 } }],
+  });
+}
+
 test("missing observation pollutant manifests are rebuilt from canonical readable parquet evidence", async () => {
   const o3 = pollutant(1, "o3");
   const pm25Key = `${PREFIX}/day_utc=${DAY}/connector_id=1/pollutant_code=pm25/manifest.json`;
@@ -418,6 +427,62 @@ test("a Dropbox-only index source cannot leak O3 into a live connector manifest"
     assert.deepEqual(connector.pollutant_codes, ["no2"]);
     assert.equal(connector.parquet_object_keys.some((key) => key.includes("pollutant_code=o3")), false);
     assert.equal(connector.child_manifests.some((child) => child.pollutant_code === "o3"), false);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
+test("an explicit O3 index repair uses its Dropbox leaf without making it a live hierarchy child", async () => {
+  const no2 = pollutantForTimeseries(1, "no2", 101);
+  const o3 = pollutantForTimeseries(1, "o3", 102);
+  const connectorKey = `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`;
+  const liveConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc: DAY, connectorId: 1, runId: "live", manifestKey: connectorKey,
+    pollutantManifests: [no2], writerGitSha: "live", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const dayKey = `${PREFIX}/day_utc=${DAY}/manifest.json`;
+  const liveDay = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc: DAY, runId: "live", manifestKey: dayKey,
+    connectorManifests: [liveConnector], writerGitSha: "live", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const liveObjects = {
+    [no2.manifest_key]: JSON.stringify(no2, null, 2),
+    [connectorKey]: JSON.stringify(liveConnector, null, 2),
+    [dayKey]: JSON.stringify(liveDay, null, 2),
+  };
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(liveObjects);
+  try {
+    writeCombinedDropboxFixture(resolver, {
+      ...liveObjects,
+      [o3.manifest_key]: JSON.stringify(o3, null, 2),
+    });
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: {
+        ...observationsRepairPlan(repairAction({
+          kind: "observation_index_repair",
+          connector_id: 1,
+          pollutant_code: "o3",
+          requires_index_rebuild: true,
+        })),
+        authoritative_core_timeseries: [
+          { timeseries_id: 101, connector_id: 1, pollutant_code: "no2" },
+          { timeseries_id: 102, connector_id: 1, pollutant_code: "o3" },
+        ],
+      },
+    });
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
+    const o3Index = output.planning.proposals.find((proposal) =>
+      proposal.key.includes(`/day_utc=${DAY}/connector_id=1/pollutant_code=o3/manifest.json`)
+        && proposal.kind === "pollutant_timeseries_index"
+    );
+    assert.ok(o3Index, "the explicit index-only O3 leaf must produce an index proposal");
+    assert.equal(o3Index.old_sha256, null);
+    assert.equal(o3Index.changed, true);
+    assert.equal(output.planning.proposals.some((proposal) => proposal.key === o3.manifest_key), false);
+    assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
     resolver.cleanup();

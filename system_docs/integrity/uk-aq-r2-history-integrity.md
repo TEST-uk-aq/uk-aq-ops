@@ -388,6 +388,14 @@ the one exact global latest-index object used by the targeted index merge, retai
 all untouched latest-index day entries without a broad backup scan. Final
 reports and daily-task summaries distinguish verified writes and deletes, with
 `r2_objects_changed` their non-duplicated total.
+An explicit observation index-only action may read its exact Dropbox leaf
+manifest as historical source evidence when that leaf is absent from live R2.
+That exception never participates in connector/day child discovery or parent
+inventories: a Dropbox-only O3 leaf cannot be added to a live observation
+hierarchy. Its target index remains live-target based, so a live-missing index
+is always proposed as changed even if Dropbox has identical bytes. Any attempt
+to construct a parent from a non-live, non-staged child is reported as
+`invalid_planned_inventory`, not `concurrent_live_change`.
 Integrity uses a targeted metadata merge, not the full rebuild: it replaces
 only entries identified by `domain`, `day_utc`, `connector_id` and
 `pollutant_code`, preserving unrelated observation and AQI coverage. Missing

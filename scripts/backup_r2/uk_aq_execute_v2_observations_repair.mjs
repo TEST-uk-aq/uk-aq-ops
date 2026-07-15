@@ -418,6 +418,25 @@ function childGuardSnapshot({ child, proposals, prefix, dayUtc, connectorId, kin
 }
 
 async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren = false }) {
+  // A parent may only be planned from the live snapshot/current overlay or a
+  // child staged in this plan.  Dropbox is diagnostic/reconstruction input,
+  // never a valid member of a live parent inventory.  Classify this as a bad
+  // plan rather than claiming that live R2 changed concurrently.
+  const invalidPlannedChildren = guard.expected_children.filter((child) =>
+    !child.staged && child.source !== "live_r2" && child.source !== "overlay"
+  );
+  if (invalidPlannedChildren.length) {
+    const invalidKeys = invalidPlannedChildren.map((child) => child.key).sort();
+    guard.last_live_inventory = {
+      expected_child_keys: guard.expected_children.map((child) => child.key).sort(),
+      actual_live_child_keys: null,
+      missing_keys: invalidKeys,
+      unexpected_keys: [],
+      expected_inventory_source: guard.expected_inventory_source || "live_r2_snapshot",
+      state: "invalid_planned_inventory",
+    };
+    throw new Error(`Blocked dependency: invalid_planned_inventory ${guard.kind} expected non-live child under ${guard.prefix}; invalid=${invalidKeys.join(",")}`);
+  }
   const current = await readChildren({
     store: createR2RaceGuardStore(r2),
     prefix: guard.prefix,
@@ -477,9 +496,14 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKey
     const previous = proposals.get(key);
     // Proposal changed/unchanged state is always measured against the live
     // target (or a verified current-run overlay), never against Dropbox.
-    const existing = previous || store.getLiveTargetObjectIfExists(key);
-    const oldBody = previous?.old_body ?? existing?.body?.toString("utf8") ?? null;
-    const oldEtag = previous?.old_r2_etag ?? existing?.r2_etag ?? null;
+    const existing = previous ? null : store.getLiveTargetObjectIfExists(key);
+    // A proposal sink can receive the same key more than once while the
+    // targeted index builder derives related metadata. Preserve the first
+    // live-target baseline exactly, including an intentional null for a
+    // live-missing object; never turn the previously proposed body into its
+    // own old value.
+    const oldBody = previous ? previous.old_body : existing?.body?.toString("utf8") ?? null;
+    const oldEtag = previous ? previous.old_r2_etag : existing?.r2_etag ?? null;
     const proposal = {
       key,
       kind: previous?.kind || kind,
