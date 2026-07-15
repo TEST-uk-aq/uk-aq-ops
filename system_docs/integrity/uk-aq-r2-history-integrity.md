@@ -354,14 +354,11 @@ reads prefer an object marked `r2_verified=true`; otherwise they use the same
 object key in `R2_history_backup`. Phases 3 and 4 reconnect all data/metadata
 stages after read-only detection. Generated writer bytes stay in the sparse
 overlay and are compared with the subsequent R2 GET before verification. The
-metadata executor uses Dropbox as a reconstruction/provenance source, but
-hydrates the affected data and index prefixes from live R2 before planning.
-Live R2 is therefore authoritative for child inventory, target existence and
-changed/unchanged decisions; a Dropbox SHA-256 is never treated as an R2
-ETag. Planning records Dropbox/live inventory drift, preserves valid live
-siblings, and blocks a real post-snapshot change with explicit missing and
-unexpected child keys. AQI reads use the already verified live-R2 observation
-scope because the current AQI writer has no local-reader adapter. The
+metadata executor plans only from the verified-overlay-first, Dropbox-second
+combined-local resolver. It does not GET, HEAD, or list live R2 before a
+metadata PUT; proposal baselines and child inventory are combined-local facts.
+AQI reads use the already verified live-R2 observation scope only after its
+writer has performed the required immediate PUT/GET verification. The
 coordinator, not either data wrapper, runs each targeted index after final
 manifests. `--run-backfill
 --dry-run` still makes no writes. A non-dry-run repair then runs one final,
@@ -389,49 +386,22 @@ all untouched latest-index day entries without a broad backup scan. Final
 reports and daily-task summaries distinguish verified writes and deletes, with
 `r2_objects_changed` their non-duplicated total.
 An explicit observation index-only action may read its exact Dropbox leaf
-manifest as historical source evidence when that leaf is absent from live R2.
-That exception never participates in connector/day child discovery or parent
-inventories: a Dropbox-only O3 leaf cannot be added to a live observation
-hierarchy. Its target index remains live-target based, so a live-missing index
-is always proposed as changed even if Dropbox has identical bytes. Any attempt
-to construct a parent from a non-live, non-staged child is reported as
-`invalid_planned_inventory`, not `concurrent_live_change`.
-Metadata application uses a two-pass whole-plan preflight. It first validates
-every canonical proposal body and staged-child relationship, then probes all
-live dependency inventories. During only that second initial pass, an exact
-child with a validated staged replacement may be read as raw live identity so
-its malformed or absent old body does not block the repair intended to replace
-it. Unstaged children remain fully schema-, SHA-256-, and real-R2-ETag checked.
-The write path has no such relaxation: it writes and GET-verifies the child,
-then the normal parent guard rereads and fully validates that live child before
-the parent PUT. Any proposal or dependency failure in either preflight pass
-keeps the complete plan at zero PUTs, including in dry-run mode.
-Before targeted global timeseries metadata is constructed, the index planner
-derives the exact affected timeseries IDs from the old/new pollutant index
-counts and GETs only their corresponding
-`history/_index_v2/timeseries/timeseries_id=<id>.json` keys from live R2. A
-successful GET supplies the exact merge body, SHA-256, and genuine R2 ETag; an
-explicit 404 is recorded separately and permits creation from the authoritative
-core snapshot. Authentication, timeout, malformed-response, and other lookup
-failures block the complete proposal set as
-`live_timeseries_metadata_lookup_failed`. Dropbox is not target-existence
-evidence. Existing live payloads preserve every unaffected domain/day/
-connector/pollutant entry and replace or remove only the affected identities.
-Every changed JSON proposal has an exact-target guard during whole-plan
-preflight and again immediately before PUT. This includes pollutant, connector,
-and day manifests; pollutant timeseries indexes; global timeseries metadata;
-and the shared latest index. Existing targets must retain their exact live-body
-SHA-256 and genuine R2 ETag, while planned creates must remain absent after a
-confirmed live 404. Lookup, authentication, and timeout failures never become
-missing-state guards. Connector and day manifests retain their separate strict
-child-inventory/content guards in addition to the target guard. Unchanged
-proposals are not written and receive no target guard; when they are parent
-dependencies, the parent's normal child guard still validates them. Every
-successful PUT still receives exact GET verification. The latest index remains
-last and is checked against its original
-planning baseline immediately before its PUT, so earlier repair writes cannot
-silently refresh that baseline. Summary counts distinguish existing objects
-merged, confirmed-new objects, and unchanged objects skipped.
+manifest as historical source evidence. That exception never participates in
+connector/day child discovery: an unplanned O3 observation leaf is index-only
+and cannot enter the data hierarchy. A canonical O3 leaf can enter only when
+an explicit leaf repair stages it. Invalid local inventory is reported as
+`invalid_planned_inventory` or `backup_drift`, never as
+`concurrent_live_change`.
+
+Metadata application validates every canonical proposal body and its
+combined-local staged-child relationship before any write. It makes no live
+dependency, target, or race-guard request. For a real apply, each changed JSON
+proposal is PUT and then immediately GET-verified for exact bytes and
+canonical structure; no other R2 read is permitted before that PUT. The latest
+index remains last. Existing combined-local metadata preserves unaffected
+domain/day/connector/pollutant entries while replacing the affected identities.
+Summary counts distinguish existing local objects merged, new objects, and
+unchanged proposals skipped.
 Integrity uses a targeted metadata merge, not the full rebuild: it replaces
 only entries identified by `domain`, `day_utc`, `connector_id` and
 `pollutant_code`, preserving unrelated observation and AQI coverage. Missing

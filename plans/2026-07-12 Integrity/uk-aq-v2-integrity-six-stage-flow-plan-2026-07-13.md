@@ -336,6 +336,33 @@ AQI Levels indexes:
 Dropbox final AQI manifests versus Dropbox AQI indexes
 ```
 
+### Live R2 exclusion
+
+Live Cloudflare R2 is not part of the normal Integrity verification or repair-planning input.
+
+Integrity must not use live R2 as:
+
+- integrity evidence;
+- reconstruction or merge input;
+- a changed/unchanged baseline;
+- the source of child or sibling inventories;
+- the source of existing manifest, index or timeseries-metadata content;
+- the final verification base.
+
+Integrity comparisons and repair construction must use:
+
+1. source-cache where source evidence is required;
+2. a verified object in the current run overlay;
+3. otherwise the corresponding object in `R2_history_backup`.
+
+Live R2 may be used only to:
+
+1. receive a final object already constructed locally;
+2. GET that object after the PUT;
+3. verify that the uploaded R2 body exactly matches the locally staged bytes.
+
+A live R2 read must never alter the planned body or replace Dropbox or the verified overlay as the repair source of truth.
+
 ## 3.2 Sparse local overlay
 
 Create one run-specific directory:
@@ -1927,6 +1954,41 @@ Do not create a broad pre-implementation or post-failure unit-test programme.
 
 # 12. Minimal validation policy
 
+## Plan-conformance gate
+
+The approved plan is the authoritative implementation contract.
+uk-aq-ops/plans/2026-07-12 Integrity/uk-aq-v2-integrity-six-stage-flow-plan-2026-07-13.md
+
+Before code changes begin, and again before any operational dry-run or real repair is approved, compare the relevant implementation against this plan and explicitly check for architectural drift.
+
+The review must confirm at least:
+
+* verification inputs match the agreed data-source model;
+* combined local reads remain verified-overlay-first and Dropbox-second;
+* live R2 is not used as integrity evidence, reconstruction input, merge input, child-discovery input, or a changed/unchanged baseline;
+* live R2 reads occur only as the immediate GET verification of an object just PUT by the current Integrity run;
+* the six repair stages retain their required order;
+* only locally generated objects are eligible for upload;
+* later stages use only R2-verified overlay objects;
+* the Dropbox backup is not modified by the repair;
+* no automatic second repair loop has been introduced;
+* failure and blocked-scope behaviour remains fail-closed.
+
+Implementation records, system documentation, comments and tests do not override this plan. If current code or documentation conflicts with the plan, report the conflict as plan drift and stop approval of operational writes.
+
+A change to the agreed architecture requires an explicit amendment to this plan before implementation. It must not be introduced indirectly through a bug fix, safety improvement, implementation record, test expectation or documentation update.
+
+Archived code may be used as reference material, but it is not automatically authoritative and must also be checked against the current approved plan.
+
+Every implementation report must include a `Plan conformance` section stating:
+
+* plan sections reviewed;
+* any drift found;
+* how each drift was corrected;
+* any deliberate exception still present;
+* whether the resulting code conforms fully to the approved plan.
+
+
 ## During implementation
 
 Only:
@@ -2025,6 +2087,7 @@ Record why the targeted check is necessary.
 ## Real acceptance
 
 ```text
+[ ] implementation has passed the plan-conformance gate with no unresolved architectural drift
 [ ] scheduled-style check-only run succeeds
 [ ] repair dry-run shows correct six-stage order and zero writes
 [ ] Mike explicitly approves the first repair write
@@ -2129,3 +2192,24 @@ handoff. No operational command or remote request was run.
 Only `bash -n`, help output, `git diff --check` and temporary harmless
 dispatcher/runner rejection stubs were used. No Integrity, backfill, R2,
 Supabase, deployment or archive operation was run.
+
+## Combined-local metadata planner correction — 2026-07-15
+
+- The v2 metadata executor now uses only the verified sparse overlay and
+  Dropbox baseline while planning: it performs no R2 GET, HEAD, or list before
+  a metadata PUT. Proposal baselines and dependency snapshots are explicitly
+  labelled combined-local rather than live-target state.
+- The former live target and race guards were removed. On an authorised real
+  apply, each changed object is PUT and immediately GET-verified for exact
+  bytes and canonical structure; the executor reports separate before-PUT,
+  PUT, and post-PUT R2 operation counters.
+- Observation O3 is index-only unless a canonical O3 leaf repair has been
+  staged. An exact Dropbox O3 leaf remains available to the index planner but
+  is excluded from connector/day child discovery, preventing it from entering
+  parent manifests.
+- The AQI writer's narrow read of already PUT/GET-verified observation objects
+  remains unchanged. The runner lock prevents overlapping Integrity runs; for
+  a real repair, other history writers must be paused for the short apply
+  window because no live planning race guard is used.
+- Archived files were consulted only for the sparse local staging pattern; no
+  archived file was copied wholesale or modified. No real R2 write occurred.

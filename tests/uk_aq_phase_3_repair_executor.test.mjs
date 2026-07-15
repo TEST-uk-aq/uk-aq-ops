@@ -394,7 +394,7 @@ function twoConnectorFixture() {
   };
 }
 
-test("a live-missing O3 index is proposed even when Dropbox has an identical stale copy", async () => {
+test("an O3 index proposal uses its combined-local baseline without reading live R2", async () => {
   const indexKey = `history/_index_v2/observations_timeseries/day_utc=${DAY}/connector_id=1/pollutant_code=o3/manifest.json`;
   const indexBody = JSON.stringify({ source: "fixture", timeseries_row_counts: { 101: 1 } });
   const resolver = combinedResolverEnv();
@@ -416,10 +416,10 @@ test("a live-missing O3 index is proposed even when Dropbox has an identical sta
     });
     const proposal = output.planning.proposals.find((candidate) => candidate.key === indexKey);
     assert.ok(proposal);
-    assert.equal(proposal.old_sha256, null, "Dropbox must not provide the live target baseline");
-    assert.equal(proposal.changed, true, "a missing live index cannot be skipped as unchanged");
-    assert.equal(proposal.target_pre_write_guard.planned_state, "missing");
-    assert.equal(proposal.target_pre_write_guard.lookup_source, "confirmed_live_404");
+    assert.equal(proposal.old_sha256, createHash("sha256").update(indexBody).digest("hex"));
+    assert.equal(proposal.changed, false);
+    assert.equal(proposal.baseline_source, "dropbox");
+    assert.equal(fake.requests.length, 0, "planning must not query live R2");
   } finally {
     fake.restore();
     resolver.cleanup();
@@ -517,10 +517,8 @@ test("an explicit O3 index repair uses its Dropbox leaf without making it a live
         && proposal.kind === "pollutant_timeseries_index"
     );
     assert.ok(o3Index, "the explicit index-only O3 leaf must produce an index proposal");
-    assert.equal(o3Index.old_sha256, null);
-    assert.equal(o3Index.changed, true);
-    assert.equal(o3Index.target_pre_write_guard.planned_state, "missing");
-    assert.equal(o3Index.target_pre_write_guard.lookup_source, "confirmed_live_404");
+    assert.equal(o3Index.baseline_source, null, "the missing index key has no local baseline");
+    assert.equal(fake.requests.length, 0, "index planning must not query live R2");
     assert.equal(output.planning.proposals.some((proposal) => proposal.key === o3.manifest_key), false);
     assert.equal(fake.puts.size, 0);
   } finally {
@@ -529,23 +527,16 @@ test("an explicit O3 index repair uses its Dropbox leaf without making it a live
   }
 });
 
-test("existing pollutant and latest indexes receive exact live target guards", async () => {
+test("existing pollutant and latest indexes use Dropbox baselines without live planning reads", async () => {
   const indexKey = observationsIndexKey("no2");
   const oldIndexBody = JSON.stringify({ version: "old-index" });
   const oldLatestBody = JSON.stringify({ version: "old-latest" });
-  const indexEtag = 'W/"index-v1"';
-  const latestEtag = 'W/"latest-v1"';
   const objects = {
     [indexKey]: oldIndexBody,
     [OBSERVATIONS_LATEST_KEY]: oldLatestBody,
   };
   const resolver = combinedResolverEnv();
-  const fake = installFakeR2(objects, {
-    etags: {
-      [indexKey]: indexEtag,
-      [OBSERVATIONS_LATEST_KEY]: latestEtag,
-    },
-  });
+  const fake = installFakeR2(objects);
   try {
     writeCombinedDropboxFixture(resolver, objects);
     const output = await runV2ObservationsRepair({
@@ -557,18 +548,16 @@ test("existing pollutant and latest indexes receive exact live target guards", a
       ]),
     });
     assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
-    for (const [key, oldBody, oldEtag] of [
-      [indexKey, oldIndexBody, indexEtag],
-      [OBSERVATIONS_LATEST_KEY, oldLatestBody, latestEtag],
+    for (const [key, oldBody] of [
+      [indexKey, oldIndexBody],
+      [OBSERVATIONS_LATEST_KEY, oldLatestBody],
     ]) {
       const proposal = output.planning.proposals.find((candidate) => candidate.key === key);
       assert.ok(proposal);
-      assert.equal(proposal.target_pre_write_guard.planned_state, "existing");
-      assert.equal(proposal.target_pre_write_guard.lookup_source, "live_r2_exact_get");
-      assert.equal(proposal.target_pre_write_guard.old_sha256, createHash("sha256").update(oldBody).digest("hex"));
-      assert.equal(proposal.target_pre_write_guard.old_r2_etag, oldEtag);
+      assert.equal(proposal.old_sha256, createHash("sha256").update(oldBody).digest("hex"));
+      assert.equal(proposal.baseline_source, "dropbox");
     }
-    assert.equal(fake.puts.size, 0, "dry-run exact-target preflight must stay read-only");
+    assert.equal(fake.requests.length, 0, "dry-run planning must stay entirely local");
   } finally {
     fake.restore();
     resolver.cleanup();
@@ -576,7 +565,7 @@ test("existing pollutant and latest indexes receive exact live target guards", a
 });
 
 for (const race of ["index_body", "latest_body", "index_etag", "index_created", "index_disappeared"]) {
-  test(`index target guard blocks a concurrent ${race.replaceAll("_", " ")} before every PUT`, async () => {
+  test(`index planning ignores a concurrent ${race.replaceAll("_", " ")} until its immediate PUT verification`, async () => {
     const indexKey = observationsIndexKey("o3");
     const indexStartsMissing = race === "index_created";
     const objects = {
@@ -594,7 +583,7 @@ for (const race of ["index_body", "latest_body", "index_etag", "index_created", 
         if (method !== "GET" || ![indexKey, OBSERVATIONS_LATEST_KEY].includes(key)) return null;
         const count = (getCounts.get(key) || 0) + 1;
         getCounts.set(key, count);
-        if (count !== 2) return null;
+        if (count !== 1) return null;
         if (race === "index_body" && key === indexKey) liveObjects[key] = JSON.stringify({ version: "concurrent-index" });
         if (race === "latest_body" && key === OBSERVATIONS_LATEST_KEY) liveObjects[key] = JSON.stringify({ version: "concurrent-latest" });
         if (race === "index_etag" && key === indexKey) liveEtags.set(key, '"index-v2"');
@@ -615,9 +604,10 @@ for (const race of ["index_body", "latest_body", "index_etag", "index_created", 
           { key: OBSERVATIONS_LATEST_KEY, body: JSON.stringify({ version: "new-latest" }) },
         ]),
       });
-      assert.equal(output.status, "failed");
-      assert.match(output.application_failure.error, /concurrent_live_change target/);
-      assert.equal(fake.puts.size, 0, "Pass 2 must reject the entire plan before its first PUT");
+      assert.equal(output.status, "succeeded", JSON.stringify(output.application_failure));
+      assert.equal(fake.puts.size, 2, "only the scheduled metadata/index PUTs may occur");
+      assert.equal(output.r2_operation_counts.r2_get_before_put_count, 0);
+      assert.equal(output.r2_operation_counts.r2_list_before_put_count, 0);
     } finally {
       fake.restore();
       resolver.cleanup();
@@ -625,7 +615,7 @@ for (const race of ["index_body", "latest_body", "index_etag", "index_created", 
   });
 }
 
-test("index target lookup failure is blocked and is not converted to live-missing", async () => {
+test("a live index lookup failure cannot affect local-only planning", async () => {
   const indexKey = observationsIndexKey("o3");
   const objects = { [OBSERVATIONS_LATEST_KEY]: JSON.stringify({ version: "old-latest" }) };
   const resolver = combinedResolverEnv();
@@ -647,9 +637,9 @@ test("index target lookup failure is blocked and is not converted to live-missin
         { key: OBSERVATIONS_LATEST_KEY, body: JSON.stringify({ version: "new-latest" }) },
       ]),
     });
-    assert.equal(output.status, "blocked_dependency");
-    assert.equal(output.planning.blocked_scopes.some((scope) => scope.reason === "live_repair_target_lookup_failed"), true);
-    assert.equal(output.planning.proposals.some((proposal) => proposal.key === indexKey), false);
+    assert.equal(output.status, "planned");
+    assert.equal(output.planning.proposals.some((proposal) => proposal.key === indexKey), true);
+    assert.equal(fake.requests.length, 0);
     assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
@@ -657,7 +647,7 @@ test("index target lookup failure is blocked and is not converted to live-missin
   }
 });
 
-test("index guards rerun before PUT, verify exact GETs, keep latest last, and are idempotent", async () => {
+test("index application PUTs then immediately GET-verifies, with latest last", async () => {
   const indexKey = observationsIndexKey("no2");
   const metadataKey = "history/_index_v2/timeseries/timeseries_id=101.json";
   const objects = {
@@ -691,30 +681,22 @@ test("index guards rerun before PUT, verify exact GETs, keep latest last, and ar
     for (const key of [indexKey, metadataKey, OBSERVATIONS_LATEST_KEY]) {
       const operations = fake.requests.filter((request) => request.key === key).map((request) => request.method);
       const putPosition = operations.indexOf("PUT");
-      assert.ok(operations.slice(0, putPosition).filter((method) => method === "GET").length >= 3, `${key} must be hydrated, preflighted, and rechecked`);
+      assert.equal(operations.slice(0, putPosition).filter((method) => method === "GET").length, 0, `${key} must have no pre-PUT R2 read`);
       assert.equal(operations[putPosition + 1], "GET", `${key} must receive exact post-PUT GET verification`);
     }
     assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet")), false);
     const firstPutCount = fake.requests.filter((request) => request.method === "PUT").length;
-    const second = await runV2ObservationsRepair({
-      argv: ["--write-r2"],
-      env: resolver.env,
-      repairPlan: indexOnlyRepairPlan(),
-      updateIndexes: indexGuardUpdater(proposed),
-    });
-    assert.equal(second.status, "planned", "the injected index planner still reports planned while every application proposal is unchanged");
-    assert.equal(fake.requests.filter((request) => request.method === "PUT").length, firstPutCount);
-    for (const proposal of second.planning.proposals) {
-      assert.equal(proposal.changed, false);
-      assert.equal(proposal.target_pre_write_guard, null, "unchanged targets need no write race guard");
-    }
+    assert.equal(first.r2_operation_counts.r2_get_before_put_count, 0);
+    assert.equal(first.r2_operation_counts.r2_list_before_put_count, 0);
+    assert.equal(first.r2_operation_counts.r2_put_count, firstPutCount);
+    assert.equal(first.r2_operation_counts.r2_get_after_put_verification_count, firstPutCount);
   } finally {
     fake.restore();
     resolver.cleanup();
   }
 });
 
-test("targeted metadata repair hydrates and merges the exact live global object", async () => {
+test("targeted metadata repair merges the combined-local global object", async () => {
   const existingEntries = [
     metadataEntry({ dayUtc: "2026-05-16", rowCount: 8 }),
     metadataEntry({ dayUtc: DAY, rowCount: 99 }),
@@ -722,9 +704,8 @@ test("targeted metadata repair hydrates and merges the exact live global object"
   ];
   const fixture = metadataRepairFixture({ existingEntries });
   const liveBody = fixture.objects[fixture.metadataKey];
-  const liveEtag = 'W/"live-metadata-etag"';
   const resolver = combinedResolverEnv();
-  const fake = installFakeR2(fixture.objects, { etags: { [fixture.metadataKey]: liveEtag } });
+  const fake = installFakeR2(fixture.objects);
   try {
     writeCombinedDropboxFixture(resolver, fixture.objects);
     const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: fixture.repairPlan });
@@ -732,9 +713,8 @@ test("targeted metadata repair hydrates and merges the exact live global object"
     const proposal = output.planning.proposals.find((candidate) => candidate.key === fixture.metadataKey);
     assert.ok(proposal);
     assert.equal(proposal.old_sha256, createHash("sha256").update(liveBody).digest("hex"));
-    assert.equal(proposal.old_r2_etag, liveEtag);
-    assert.equal(proposal.provenance.metadata_source, "existing_live_timeseries_metadata");
-    assert.equal(proposal.target_pre_write_guard.planned_state, "existing");
+    assert.equal(proposal.baseline_source, "dropbox");
+    assert.equal(proposal.provenance.metadata_source, "existing_combined_local_timeseries_metadata");
     const payload = JSON.parse(proposal.proposed_body);
     const observationEntries = payload.observations_coverage.entries;
     assert.deepEqual(observationEntries.map((entry) => entry.day_utc), ["2026-05-16", DAY]);
@@ -747,8 +727,8 @@ test("targeted metadata repair hydrates and merges the exact live global object"
     assert.equal(metadata.new_object_count, 0);
     assert.equal(metadata.preserved_entry_count, 2);
     assert.equal(metadata.replaced_entry_count, 1);
-    assert.equal(metadata.metadata_operations[0].metadata_source, "existing_live_timeseries_metadata");
-    assert.equal(fake.requests.some((request) => request.method === "GET" && request.key === fixture.metadataKey), true);
+    assert.equal(metadata.metadata_operations[0].metadata_source, "existing_timeseries_metadata");
+    assert.equal(fake.requests.length, 0);
     assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
@@ -756,7 +736,7 @@ test("targeted metadata repair hydrates and merges the exact live global object"
   }
 });
 
-test("confirmed live 404 creates metadata from core and ignores a Dropbox-only global object", async () => {
+test("a Dropbox metadata object is the local baseline for a targeted metadata repair", async () => {
   const fixture = metadataRepairFixture();
   const dropboxPayload = buildHistoryV2TimeseriesMetadataIndexPayload({
     timeseriesId: 101,
@@ -772,15 +752,13 @@ test("confirmed live 404 creates metadata from core and ignores a Dropbox-only g
     const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: fixture.repairPlan });
     assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
     const proposal = output.planning.proposals.find((candidate) => candidate.key === fixture.metadataKey);
-    assert.equal(proposal.old_sha256, null);
-    assert.equal(proposal.old_r2_etag, null);
-    assert.equal(proposal.provenance.metadata_source, "authoritative_core_snapshot");
-    assert.equal(proposal.target_pre_write_guard.planned_state, "missing");
+    assert.equal(proposal.old_sha256, createHash("sha256").update(`${JSON.stringify(dropboxPayload, null, 2)}\n`).digest("hex"));
+    assert.equal(proposal.provenance.metadata_source, "existing_combined_local_timeseries_metadata");
     const payload = JSON.parse(proposal.proposed_body);
-    assert.deepEqual(payload.observations_coverage.entries.map((entry) => entry.day_utc), [DAY]);
+    assert.deepEqual(payload.observations_coverage.entries.map((entry) => entry.day_utc), ["2026-05-16", DAY]);
     const metadata = output.planning.days[0].index.results[0].timeseries_metadata;
-    assert.equal(metadata.existing_object_merged_count, 0);
-    assert.equal(metadata.new_object_count, 1);
+    assert.equal(metadata.existing_object_merged_count, 1);
+    assert.equal(metadata.new_object_count, 0);
     assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
@@ -788,7 +766,7 @@ test("confirmed live 404 creates metadata from core and ignores a Dropbox-only g
   }
 });
 
-test("live metadata lookup failure blocks the complete plan instead of becoming a 404", async () => {
+test("a live metadata lookup failure cannot affect local-only metadata planning", async () => {
   const fixture = metadataRepairFixture();
   const resolver = combinedResolverEnv();
   const fake = installFakeR2(fixture.objects, {
@@ -799,9 +777,9 @@ test("live metadata lookup failure blocks the complete plan instead of becoming 
   try {
     writeCombinedDropboxFixture(resolver, fixture.objects);
     const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: fixture.repairPlan });
-    assert.equal(output.status, "blocked_dependency");
-    assert.equal(output.planning.blocked_scopes.some((scope) => scope.reason === "live_timeseries_metadata_lookup_failed"), true);
-    assert.equal(output.planning.proposals.some((proposal) => proposal.kind === "timeseries_metadata"), false);
+    assert.equal(output.status, "planned");
+    assert.equal(output.planning.proposals.some((proposal) => proposal.kind === "timeseries_metadata"), true);
+    assert.equal(fake.requests.length, 0);
     assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
@@ -810,14 +788,14 @@ test("live metadata lookup failure blocks the complete plan instead of becoming 
 });
 
 for (const race of ["body", "etag", "created_after_planning"]) {
-  test(`metadata target guard blocks a concurrent ${race.replaceAll("_", " ")}`, async () => {
+  test(`metadata planning ignores a concurrent ${race.replaceAll("_", " ")}`, async () => {
     const existingEntries = [metadataEntry({ dayUtc: "2026-05-16" }), metadataEntry({ dayUtc: DAY, rowCount: 99 })];
     const fixture = metadataRepairFixture({ existingEntries: race === "created_after_planning" ? null : existingEntries });
     let metadataGetCount = 0;
     const fake = installFakeR2(fixture.objects, {
       etags: race === "etag" ? { [fixture.metadataKey]: '"etag-v1"' } : {},
       beforeRequest: ({ method, key, objects, etags }) => {
-        if (method !== "GET" || key !== fixture.metadataKey || ++metadataGetCount !== 2) return null;
+        if (method !== "GET" || key !== fixture.metadataKey || ++metadataGetCount !== 1) return null;
         if (race === "body") objects[key] = `${fixture.objects[key]} `;
         if (race === "etag") etags.set(key, '"etag-v2"');
         if (race === "created_after_planning") {
@@ -831,9 +809,9 @@ for (const race of ["body", "etag", "created_after_planning"]) {
     try {
       writeCombinedDropboxFixture(resolver, fixture.objects);
       const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: fixture.repairPlan });
-      assert.equal(output.status, "failed");
-      assert.match(output.application_failure.error, /concurrent_live_change target/);
-      assert.equal(fake.puts.size, 0, "whole-plan target guard failure must occur before every PUT");
+      assert.equal(output.status, "succeeded", JSON.stringify(output.application_failure));
+      assert.ok(fake.puts.size > 0);
+      assert.equal(output.r2_operation_counts.r2_get_before_put_count, 0);
     } finally {
       fake.restore();
       resolver.cleanup();
@@ -863,9 +841,9 @@ test("unchanged merged metadata is skipped", async () => {
     const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: initial.repairPlan });
     const proposal = output.planning.proposals.find((candidate) => candidate.key === initial.metadataKey);
     assert.equal(proposal.changed, false);
-    assert.equal(proposal.target_pre_write_guard, null);
+    assert.equal(proposal.baseline_source, "dropbox");
     const metadata = output.planning.days[0].index.results[0].timeseries_metadata;
-    assert.equal(metadata.unchanged_object_count, 1);
+    assert.equal(metadata.unchanged_object_count, 0, "the shared planner has no remote ETag in the combined-local adapter");
     assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
@@ -888,8 +866,9 @@ test("metadata write simulation GET-verifies the target and is idempotent", asyn
     assert.ok(metadataPut >= 0 && metadataVerify > metadataPut);
     assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet")), false);
     const putCount = fake.requests.filter((request) => request.method === "PUT").length;
+    writeCombinedDropboxFixture(resolver, Object.fromEntries(fake.puts));
     const second = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: fixture.repairPlan });
-    assert.equal(["skipped_unchanged", "succeeded"].includes(second.status), true);
+    assert.equal(["planned", "skipped_unchanged", "succeeded"].includes(second.status), true);
     assert.equal(fake.requests.filter((request) => request.method === "PUT").length, putCount);
   } finally {
     fake.restore();
@@ -897,7 +876,7 @@ test("metadata write simulation GET-verifies the target and is idempotent", asyn
   }
 });
 
-test("day repairs preserve live connector siblings and expose Dropbox inventory drift", async () => {
+test("day repairs preserve the complete Dropbox connector inventory without live reads", async () => {
   const fixture = twoConnectorFixture();
   const c3pm25 = pollutant(3, "pm25");
   const c3 = buildHistoryV2ConnectorManifest({
@@ -912,7 +891,7 @@ test("day repairs preserve live connector siblings and expose Dropbox inventory 
   const resolver = combinedResolverEnv();
   const fake = installFakeR2(liveObjects);
   try {
-    writeCombinedDropboxFixture(resolver, fixture.objects);
+    writeCombinedDropboxFixture(resolver, liveObjects);
     const output = await runV2ObservationsRepair({
       env: resolver.env,
       repairPlan: observationsRepairPlan(repairAction({
@@ -925,8 +904,8 @@ test("day repairs preserve live connector siblings and expose Dropbox inventory 
     assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
     const proposal = output.planning.proposals[0];
     assert.deepEqual(JSON.parse(proposal.proposed_body).connector_ids, [1, 2, 3]);
-    assert.equal(proposal.pre_write_guard.backup_inventory.state, "backup_drift");
-    assert.deepEqual(proposal.pre_write_guard.backup_inventory.unexpected_keys, [c3.manifest_key]);
+    assert.equal(proposal.local_dependency_snapshot.source, "combined_local_snapshot");
+    assert.equal(fake.requests.length, 0);
   } finally {
     fake.restore();
     resolver.cleanup();
@@ -1163,7 +1142,7 @@ test("whole-plan preflight accepts an exact staged replacement when no old live 
   }
 });
 
-test("whole-plan preflight still rejects a malformed unstaged live connector", async () => {
+test("whole-plan preflight does not inspect an unstaged live connector", async () => {
   const connectorOne = pollutantForTimeseries(1, "pm25", 1);
   const connectorThree = pollutantForTimeseries(3, "pm25", 3);
   const stagedConnector = buildHistoryV2ConnectorManifest({
@@ -1191,8 +1170,7 @@ test("whole-plan preflight still rejects a malformed unstaged live connector", a
       proposals: stagedConnectorAndDayProposals({ connector: stagedConnector, day, liveSibling: validSibling, siblingBody: malformedSiblingBody }),
       writeR2: false,
     });
-    assert.equal(output.failure.key, day.manifest_key);
-    assert.match(output.failure.error, /invalid connector manifest/i);
+    assert.equal(output.failure, null);
     assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
@@ -1224,7 +1202,7 @@ test("invalid canonical staged child content blocks before every guard and PUT",
   assert.equal(putCalls, 0);
 });
 
-test("write simulation verifies the staged connector before the strict parent guard and PUT", async () => {
+test("write simulation PUTs then immediately verifies each staged parent", async () => {
   const fixture = fourConnectorRepairFixture();
   const resolver = combinedResolverEnv();
   const fake = installFakeR2(fixture.objects);
@@ -1245,9 +1223,8 @@ test("write simulation verifies the staged connector before the strict parent gu
     const dayKey = fixture.day.manifest_key;
     const connectorPut = fake.requests.findIndex((request) => request.method === "PUT" && request.key === connectorKey);
     const connectorVerify = fake.requests.findIndex((request, index) => index > connectorPut && request.method === "GET" && request.key === connectorKey);
-    const strictParentRead = fake.requests.findIndex((request, index) => index > connectorVerify && request.method === "GET" && request.key === connectorKey);
     const dayPut = fake.requests.findIndex((request) => request.method === "PUT" && request.key === dayKey);
-    assert.ok(connectorPut >= 0 && connectorVerify > connectorPut && strictParentRead > connectorVerify && dayPut > strictParentRead);
+    assert.ok(connectorPut >= 0 && connectorVerify > connectorPut && dayPut > connectorVerify);
     assert.deepEqual([...fake.puts.keys()], [connectorKey, dayKey]);
     assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet")), false);
   } finally {
@@ -1256,7 +1233,7 @@ test("write simulation verifies the staged connector before the strict parent gu
   }
 });
 
-test("strict parent write guard rejects a staged child corrupted after exact GET verification", async () => {
+test("local planning does not re-read a staged child from live R2 before its parent PUT", async () => {
   const fixture = fourConnectorRepairFixture();
   const connectorKey = fixture.entries[0].manifest.manifest_key;
   const childPrefix = `${PREFIX}/day_utc=${DAY}/connector_id=`;
@@ -1281,17 +1258,16 @@ test("strict parent write guard rejects a staged child corrupted after exact GET
         requires_index_rebuild: false,
       })),
     });
-    assert.equal(output.status, "failed");
-    assert.match(output.application_failure.error, /invalid connector manifest/i);
+    assert.equal(output.status, "succeeded");
     assert.equal(fake.puts.has(connectorKey), true);
-    assert.equal(fake.puts.has(fixture.day.manifest_key), false);
+    assert.equal(fake.puts.has(fixture.day.manifest_key), true);
   } finally {
     fake.restore();
     resolver.cleanup();
   }
 });
 
-test("whole-plan preflight blocks a genuine live R2 ETag change", async () => {
+test("a live R2 ETag change cannot affect a combined-local plan", async () => {
   const o3 = pollutant(1, "o3");
   const pm25 = pollutant(1, "pm25");
   const connector = buildHistoryV2ConnectorManifest({ domain: "observations", dayUtc: DAY, connectorId: 1, runId: "fixture", manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`, pollutantManifests: [pm25], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z" });
@@ -1310,9 +1286,8 @@ test("whole-plan preflight blocks a genuine live R2 ETag change", async () => {
   try {
     writeCombinedDropboxFixture(resolver, objects);
     const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: observationsRepairPlan() });
-    assert.equal(output.status, "failed");
-    assert.match(output.application_failure.error, /child R2 ETag changed/);
-    assert.equal(fake.puts.size, 0);
+    assert.equal(output.status, "skipped_unchanged");
+    assert.equal(fake.requests.length, 0);
   } finally {
     fake.restore();
     resolver.cleanup();
@@ -1340,29 +1315,22 @@ test("metadata proposal preflight rejects a late invalid proposal before any wri
   assert.deepEqual(puts, [], "no valid earlier proposal may be written before a later proposal fails preflight");
 });
 
-test("dry-run executes proposal preflight guards without writing", async () => {
+test("dry-run executes canonical proposal validation without writing", async () => {
   const valid = proposalFromManifest(pollutant(1, "pm25"));
-  valid.pre_write_guard = { prefix: "history/v2/observations", expected_children: [] };
-  let guardCalls = 0;
   let putCalls = 0;
   const output = await applyStagedProposals({
     r2: {},
     proposals: new Map([[valid.key, valid]]),
     writeR2: false,
-    assertChildren: async ({ guard, allowStagedChildren }) => {
-      guardCalls += 1;
-      assert.equal(guard.prefix, "history/v2/observations");
-      assert.equal(allowStagedChildren, true);
-    },
     putObject: async () => { putCalls += 1; },
   });
   assert.equal(output.failure, null);
-  assert.equal(guardCalls, 1);
+  assert.equal(output.operation_counts.r2_get_before_put_count, 0);
   assert.equal(putCalls, 0);
   assert.equal(output.results.get(valid.key).status, "planned");
 });
 
-test("live connector and day guards receive canonical string keys", async () => {
+test("a connector/day repair writes only local-hierarchy changes", async () => {
   const fixture = twoConnectorFixture();
   const resolver = combinedResolverEnv();
   const fake = installFakeR2(fixture.objects);
@@ -1374,14 +1342,14 @@ test("live connector and day guards receive canonical string keys", async () => 
       repairPlan: observationsRepairPlan(),
     });
     assert.equal(output.status, "succeeded", JSON.stringify(output.application_failure));
-    assert.deepEqual([...fake.puts.keys()].sort(), [fixture.keys.c1, fixture.keys.day].sort());
+    assert.deepEqual([...fake.puts.keys()].sort(), [fixture.keys.day]);
   } finally {
     fake.restore();
     resolver.cleanup();
   }
 });
 
-test("Phase 5 one-connector O3 repair stages the complete connector and day hierarchy, then is idempotent", async () => {
+test("an index-only O3 leaf does not rewrite the observation connector/day hierarchy", async () => {
   const o3 = pollutant(1, "o3");
   const pm25 = pollutant(1, "pm25");
   const no2 = pollutant(2, "no2");
@@ -1395,24 +1363,22 @@ test("Phase 5 one-connector O3 repair stages the complete connector and day hier
   try {
     writeCombinedDropboxFixture(resolver, objects);
     const first = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan });
-    assert.equal(first.status, "succeeded");
-    assert.equal(fake.puts.size, 2);
+    assert.equal(first.status, "skipped_unchanged");
+    assert.equal(fake.puts.size, 0);
     assert.deepEqual(first.planning.days[0].proposal_keys, [staleConnector.manifest_key, staleDay.manifest_key]);
     assert.deepEqual(first.planning.proposals.map((proposal) => proposal.kind), ["connector_manifest", "day_manifest"]);
-    assert.deepEqual(JSON.parse(fake.puts.get(staleConnector.manifest_key)).pollutant_codes, ["o3", "pm25"]);
-    assert.deepEqual(JSON.parse(fake.puts.get(staleDay.manifest_key)).connector_ids, [1, 2]);
+    assert.deepEqual(JSON.parse(first.planning.proposals.find((proposal) => proposal.key === staleConnector.manifest_key).proposed_body).pollutant_codes, ["pm25"]);
     assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet") || key.includes("aqilevels")), false);
-    writeCombinedDropboxFixture(resolver, Object.fromEntries(fake.puts));
     const second = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan });
     assert.equal(second.status, "skipped_unchanged");
-    assert.equal(fake.puts.size, 2);
+    assert.equal(fake.puts.size, 0);
   } finally {
     fake.restore();
     resolver.cleanup();
   }
 });
 
-test("Phase 5 stages two connector repairs into one proposed day and writes the three changed manifests only", async () => {
+test("a mixed connector-manifest plan writes its two connectors and one day parent", async () => {
   const fixture = twoConnectorFixture();
   const plan = { history_version: "v2", domain: "observations", repair_plan: [
     repairAction({ connector_id: 1, pollutant_code: "o3" }),
@@ -1439,7 +1405,7 @@ test("Phase 5 stages two connector repairs into one proposed day and writes the 
     writeCombinedDropboxFixture(writeResolver, fixture.objects);
     const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: writeResolver.env, repairPlan: plan });
     assert.equal(output.status, "succeeded");
-    assert.deepEqual([...writeFake.puts.keys()].sort(), [fixture.keys.c1, fixture.keys.c2, fixture.keys.day].sort());
+    assert.deepEqual([...writeFake.puts.keys()].sort(), [fixture.keys.c2, fixture.keys.day].sort());
   } finally {
     writeFake.restore();
     writeResolver.cleanup();
@@ -1569,7 +1535,7 @@ test("Phase 5 dry-run proposal bytes are deterministic and unchanged staged obje
   }
 });
 
-test("Phase 6 blocks a connector parent when the fresh child list gains a sibling", async () => {
+test("live child changes cannot affect a local-only connector plan", async () => {
   const o3 = pollutant(1, "o3");
   const pm25 = pollutant(1, "pm25");
   const added = pollutant(1, "so2");
@@ -1589,16 +1555,16 @@ test("Phase 6 blocks a connector parent when the fresh child list gains a siblin
   try {
     writeCombinedDropboxFixture(resolver, objects);
     const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: observationsRepairPlan() });
-    assert.equal(output.status, "failed");
-    assert.match(output.application_failure.error, /concurrent_live_change pollutant child key inventory changed/);
-    assert.equal(fake.puts.size, 0, "a blocked connector must prevent its own and dependent writes");
+    assert.equal(output.status, "skipped_unchanged");
+    assert.equal(fake.puts.size, 0);
+    assert.equal(fake.requests.length, 0);
   } finally {
     fake.restore();
     resolver.cleanup();
   }
 });
 
-test("Phase 6 blocks a day parent when a freshly read child body changes", async () => {
+test("live child bodies cannot affect a local-only day plan", async () => {
   const o3 = pollutant(1, "o3");
   const pm25 = pollutant(1, "pm25");
   const no2 = pollutant(2, "no2");
@@ -1619,10 +1585,10 @@ test("Phase 6 blocks a day parent when a freshly read child body changes", async
   try {
     writeCombinedDropboxFixture(resolver, objects);
     const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: observationsRepairPlan() });
-    assert.equal(output.status, "failed");
-    assert.match(output.application_failure.error, /concurrent_live_change connector child content changed/);
-    assert.deepEqual([...fake.puts.keys()], [], "the full-plan preflight blocks every write when a day child changes");
+    assert.equal(output.status, "skipped_unchanged");
+    assert.deepEqual([...fake.puts.keys()], []);
     assert.equal(fake.puts.has(staleDay.manifest_key), false);
+    assert.equal(fake.requests.length, 0);
   } finally {
     fake.restore();
     resolver.cleanup();

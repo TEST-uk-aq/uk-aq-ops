@@ -11172,105 +11172,21 @@ def _v2_observation_connector_manifest_key(
     )
 
 
-def _has_direct_r2_read_config(env: Mapping[str, str]) -> bool:
-    return all(
-        str(env.get(key) or "").strip()
-        for key in (
-            "CFLARE_R2_ENDPOINT",
-            "CFLARE_R2_BUCKET",
-            "CFLARE_R2_ACCESS_KEY_ID",
-            "CFLARE_R2_SECRET_ACCESS_KEY",
-        )
-    ) or all(
-        str(env.get(key) or "").strip()
-        for key in (
-            "R2_ENDPOINT",
-            "R2_BUCKET",
-            "R2_ACCESS_KEY_ID",
-            "R2_SECRET_ACCESS_KEY",
-        )
-    )
-
-
-def _read_json_manifest_from_r2(
-    *,
-    manifest_key: str,
-    env: Mapping[str, str],
-    timeout_seconds: int = 30,
-) -> tuple[Any | None, str | None]:
-    merged_env = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
-    if not _has_direct_r2_read_config(merged_env):
-        return None, "r2_config_missing"
-
-    cwd_path, diag_reason = _resolve_repo_root_with_diagnostics(merged_env)
-    if diag_reason == "r2_sigv4_missing":
-        return None, f"r2_read_failed:{diag_reason}"
-
-    node_bin = (
-        merged_env.get("UK_AQ_BACKFILL_NODE_BIN")
-        or merged_env.get("NODE_BIN")
-        or shutil.which("node")
-        or "node"
-    )
-    read_env = {
-        **merged_env,
-        "UK_AQ_MANIFEST_GUARD_KEY": manifest_key,
-    }
-    code = r"""
-import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
-
-const env = process.env;
-const key = String(env.UK_AQ_MANIFEST_GUARD_KEY || "").trim();
-const r2 = {
-  endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
-  bucket: String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim(),
-  region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
-  access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
-  secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
-};
-const object = await r2GetObject({ r2, key });
-process.stdout.write(object.body.toString("utf8"));
-"""
-    try:
-        proc = subprocess.run(
-            [node_bin, "--input-type=module", "-e", code],
-            cwd=cwd_path,
-            env=read_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return None, f"r2_read_failed:{type(exc).__name__}:[diag={diag_reason}]"
-    if proc.returncode != 0:
-        return None, f"r2_read_failed:exit_code={proc.returncode}:[diag={diag_reason}]"
-    try:
-        return json.loads(proc.stdout or ""), None
-    except json.JSONDecodeError:
-        return None, f"r2_manifest_invalid_json:[diag={diag_reason}]"
-
-
 def _read_json_manifest_for_guard(
     *,
     manifest_key: str,
-    env: Mapping[str, str],
+    run_state: Mapping[str, Any] | None,
 ) -> tuple[Any | None, str | None, str | None]:
-    payload, err = _read_json_manifest_from_r2(manifest_key=manifest_key, env=env)
-    if err is None:
-        return payload, "r2", None
-
-    merged_env = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
-    root_raw = resolve_r2_history_root(merged_env)
-    if root_raw:
-        manifest_path = Path(root_raw) / manifest_key
-        if manifest_path.is_file():
-            local_payload, local_err = _load_json_file(manifest_path)
-            if local_err is None:
-                return local_payload, "local_mirror", None
-            return None, "local_mirror", f"local_manifest_{local_err}"
-        return None, "local_mirror", f"local_manifest_missing:{manifest_key}"
-    return None, None, err
+    if run_state is None:
+        return None, None, "combined_local_run_state_missing"
+    manifest_path = resolve_combined_local_path(run_state, manifest_key)
+    if manifest_path is None:
+        return None, "combined_local", f"combined_local_manifest_missing:{manifest_key}"
+    local_payload, local_err = _load_json_file(manifest_path)
+    if local_err is not None:
+        return None, "combined_local", f"combined_local_manifest_{local_err}"
+    source = "verified_overlay" if str(manifest_path).startswith(str(run_state.get("overlay_root") or "")) else "dropbox"
+    return local_payload, source, None
 
 
 def _manifest_row_count(payload: Mapping[str, Any]) -> int:
@@ -11609,6 +11525,7 @@ def _verify_v2_observation_manifest_content_for_aqi(
     day_utc: str,
     connector_id: int,
     env: Mapping[str, str],
+    run_state: Mapping[str, Any] | None,
     expected_timeseries_row_counts: Mapping[int, int],
     expected_pollutant_codes: Iterable[str],
     expected_min_rows: int,
@@ -11620,7 +11537,7 @@ def _verify_v2_observation_manifest_content_for_aqi(
     )
     payload, source, err = _read_json_manifest_for_guard(
         manifest_key=manifest_key,
-        env=env,
+        run_state=run_state,
     )
     details: dict[str, Any] = {
         "manifest_key": manifest_key,
@@ -13204,6 +13121,7 @@ def run_v2_gap_backfills(
                         day_utc=day_iso,
                         connector_id=connector_id,
                         env=env,
+                        run_state=run_state,
                         expected_timeseries_row_counts=expected_timeseries_row_counts,
                         expected_pollutant_codes=expected_pollutant_codes,
                         expected_min_rows=expected_min_manifest_rows,
@@ -15421,6 +15339,19 @@ def run_v2_integrity_repair_flow(
         or aqi_index_status in {"failed", "blocked_dependency"}
         or final_verification.get("status") == "failed"
     )
+    metadata_r2_operation_counts = {
+        name: sum(
+            int(((entry.get("output") or {}).get("r2_operation_counts") or {}).get(name) or 0)
+            for entry in (metadata, aqi_metadata)
+            if isinstance(entry, Mapping)
+        )
+        for name in (
+            "r2_get_before_put_count",
+            "r2_list_before_put_count",
+            "r2_put_count",
+            "r2_get_after_put_verification_count",
+        )
+    }
     result = {
         "status": "failed" if coordinator_failed else (
             "planned" if dry_run else "succeeded"
@@ -15428,6 +15359,7 @@ def run_v2_integrity_repair_flow(
         "dry_run": bool(dry_run),
         "write_enabled": not dry_run,
         "r2_write_attempted": not dry_run,
+        "metadata_executor_r2_operation_counts": metadata_r2_operation_counts,
         "stage_order": list(V2_REPAIR_STAGE_ORDER),
         "stage_results": stage_results,
         "six_stage_result_counts": {
