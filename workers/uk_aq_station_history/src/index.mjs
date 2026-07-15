@@ -26,7 +26,10 @@ import {
   resolveAuthoritativeTimeseriesIdentity,
   StationHistoryIdentityError,
 } from "./identity.mjs";
-import { readDirectIngestObservations } from "./ingest_observations.mjs";
+import {
+  readDirectIngestObservations,
+  StationHistoryIngestError,
+} from "./ingest_observations.mjs";
 import { mergeObservationRowsPreferR2, readR2Observations } from "./r2_observations.mjs";
 import { resolveStationHistoryPolicy } from "./policy.mjs";
 
@@ -46,6 +49,35 @@ function errorResponse(status, code, route, detail = undefined) {
   return new Response(JSON.stringify({ ok: false, error: { code, route, ...(detail ? { detail } : {}) } }), {
     status,
     headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }),
+  });
+}
+
+function ingestErrorResponse(error, route) {
+  if (!(error instanceof StationHistoryIngestError)) return null;
+
+  const response = errorResponse(
+    error.status,
+    error.code,
+    route,
+    error.toSafeDetail(),
+  );
+  const headers = new Headers(response.headers);
+  headers.set("X-UK-AQ-Station-History-Upstream", "obsaqidb");
+  headers.set(
+    "X-UK-AQ-Station-History-Error-Class",
+    error.failureClass,
+  );
+  if (error.upstreamStatus !== null && error.upstreamStatus !== undefined) {
+    headers.set(
+      "X-UK-AQ-Station-History-Upstream-Status",
+      String(error.upstreamStatus),
+    );
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 
@@ -368,7 +400,9 @@ export default {
       const complete = (!authoritative.includeAqi || body.aqi.response_complete === true) && body.observations.response_complete === true;
       return new Response(JSON.stringify(body), { status: 200, headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": body.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(body.source.ingest_fetch_count) }) });
     } catch (error) {
-      return identityErrorResponse(error, url.pathname) || errorResponse(502, error instanceof Error ? error.message : "station_series_failed", url.pathname);
+      return ingestErrorResponse(error, url.pathname)
+        || identityErrorResponse(error, url.pathname)
+        || errorResponse(502, error instanceof Error ? error.message : "station_series_failed", url.pathname);
     }
   },
 };
