@@ -354,16 +354,11 @@ reads prefer an object marked `r2_verified=true`; otherwise they use the same
 object key in `R2_history_backup`. Phases 3 and 4 reconnect all data/metadata
 stages after read-only detection. Generated writer bytes stay in the sparse
 overlay and are compared with the subsequent R2 GET before verification. The
-metadata executor uses Dropbox as a reconstruction/provenance source, but
-hydrates the affected data and index prefixes from live R2 before planning.
-Live R2 is therefore authoritative for child inventory, target existence and
-changed/unchanged decisions; a Dropbox SHA-256 is never treated as an R2
-ETag. Planning records Dropbox/live inventory drift, preserves valid live
-siblings, and blocks a real post-snapshot change with explicit missing and
-unexpected child keys. AQI reads use the already verified live-R2 observation
-scope because the current AQI writer has no local-reader adapter. The
-coordinator, not either data wrapper, runs each targeted index after final
-manifests. `--run-backfill
+metadata executor plans from the verified overlay plus Dropbox view, using R2
+only for writes, GET verification and narrowly scoped parent race guards. AQI
+reads use the already verified live-R2 observation scope because the current
+AQI writer has no local-reader adapter. The coordinator, not either data
+wrapper, runs each targeted index after final manifests. `--run-backfill
 --dry-run` still makes no writes. A non-dry-run repair then runs one final,
 read-only source-cache and overlay-first/Dropbox-second verification pass. Any
 remaining actionable scope, missing GET verification, or blocked scope fails
@@ -376,15 +371,10 @@ run state. They hide only the corresponding Dropbox key in the combined view;
 the Dropbox backup itself is never changed. Metadata leaf manifests derive
 their part metadata from final parquet, rather than inherited manifest fields.
 Observation parquet selects `observed_at_utc` and falls back only to legacy
-`observed_at`; absence of both is a leaf-scope dependency block. A missing
-observation pollutant manifest is reconstructed from its exact readable,
-canonical-partition parquet files. It uses canonical same-leaf live metadata
-first, then a valid Dropbox leaf, then valid parent provenance; otherwise it
-uses `run_id`/`writer_git_sha` nulls permitted by the schema and a deterministic
-repair-generated timestamp. The planning proposal records that provenance. A
-requested pollutant whose parquet is unavailable blocks its connector, day and
-targeted index. The metadata resolver reads scoped affected-day prefixes plus
-the one exact global latest-index object used by the targeted index merge, retaining
+`observed_at`; absence of both is a leaf-scope dependency block. A requested
+pollutant whose parquet is unavailable blocks its connector, day and targeted
+index. The metadata resolver reads scoped affected-day prefixes plus the one
+exact global latest-index object used by the targeted index merge, retaining
 all untouched latest-index day entries without a broad backup scan. Final
 reports and daily-task summaries distinguish verified writes and deletes, with
 `r2_objects_changed` their non-duplicated total.
