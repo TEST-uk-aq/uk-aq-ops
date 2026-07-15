@@ -3,12 +3,21 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("gateway declares the private STATION_HISTORY Service Binding and disabled route flags", async () => {
-  const [source, wrangler] = await Promise.all([
+  const [source, wrangler, cacheWorkflow, stationWorkflow] = await Promise.all([
     readFile("workers/uk_aq_cache_proxy/src/index.ts", "utf8"),
     readFile("workers/uk_aq_cache_proxy/wrangler.toml", "utf8"),
+    readFile(".github/workflows/uk_aq_cache_proxy_deploy.yml", "utf8"),
+    readFile(".github/workflows/uk_aq_station_history_deploy.yml", "utf8"),
   ]);
   assert.match(wrangler, /binding = "STATION_HISTORY"/);
-  assert.match(wrangler, /service = "uk-aq-station-history"/);
+  assert.match(wrangler, /service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"/);
+  assert.doesNotMatch(wrangler, /service = "uk-aq-station-history"/);
+  assert.match(cacheWorkflow, /UK_AQ_STATION_HISTORY_WORKER_NAME: \$\{\{ vars\.UK_AQ_STATION_HISTORY_WORKER_NAME \|\| '' \}\}/);
+  assert.match(cacheWorkflow, /Resolve STATION_HISTORY Service Binding target/);
+  assert.match(cacheWorkflow, /Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME/);
+  assert.equal((cacheWorkflow.match(/deploy --config wrangler\.deploy\.toml --name/g) || []).length, 2, "base and final cache deployments use the same resolved binding config");
+  assert.match(stationWorkflow, /UK_AQ_STATION_HISTORY_WORKER_NAME: \$\{\{ vars\.UK_AQ_STATION_HISTORY_WORKER_NAME \|\| '' \}\}/);
+  assert.match(stationWorkflow, /Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME/);
   assert.match(source, /UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED/);
   assert.match(source, /UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED/);
   assert.match(source, /station_history_internal_fetch_failed/);

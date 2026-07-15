@@ -15,15 +15,17 @@ jobs:
   deploy-worker:
     runs-on: ubuntu-latest
     env:
-      UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || 'uk-aq-station-history' }}
+      UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate Cloudflare credentials
         run: |
+          set -euo pipefail
           test -n "${UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID}" || { echo "Missing Cloudflare account ID."; exit 1; }
           test -n "${UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN}" || { echo "Missing Cloudflare API token."; exit 1; }
+          test -n "${UK_AQ_STATION_HISTORY_WORKER_NAME}" || { echo "Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME."; exit 1; }
       - name: Set data-path Worker secrets
         working-directory: workers/uk_aq_station_history
         env:

@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
+      UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
     steps:
@@ -34,6 +35,27 @@ jobs:
             echo "Missing variable UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID (or legacy UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID)."
             exit 1
           fi
+          if [ -z "${UK_AQ_STATION_HISTORY_WORKER_NAME}" ]; then
+            echo "Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME."
+            exit 1
+          fi
+
+      - name: Resolve STATION_HISTORY Service Binding target
+        working-directory: workers/uk_aq_cache_proxy
+        env:
+          STATION_HISTORY_SERVICE: ${{ env.UK_AQ_STATION_HISTORY_WORKER_NAME }}
+        run: |
+          set -euo pipefail
+          test -n "${STATION_HISTORY_SERVICE}" || { echo "STATION_HISTORY Service Binding target is empty."; exit 1; }
+          sed "s|__UK_AQ_STATION_HISTORY_WORKER_NAME__|${STATION_HISTORY_SERVICE}|g" wrangler.toml > wrangler.deploy.toml
+          grep -F "service = \"${STATION_HISTORY_SERVICE}\"" wrangler.deploy.toml >/dev/null || {
+            echo "Failed to resolve STATION_HISTORY Service Binding target."
+            exit 1
+          }
+          if grep -q '__UK_AQ_STATION_HISTORY_WORKER_NAME__' wrangler.deploy.toml; then
+            echo "Unresolved STATION_HISTORY Service Binding placeholder."
+            exit 1
+          fi
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
@@ -41,7 +63,7 @@ jobs:
           apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
           accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_cache_proxy
-          command: deploy --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
 
       - name: Validate required Worker secrets and vars
         run: |
@@ -149,4 +171,4 @@ jobs:
           apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
           accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_cache_proxy
-          command: deploy --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
