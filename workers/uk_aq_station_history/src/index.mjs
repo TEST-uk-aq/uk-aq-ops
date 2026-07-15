@@ -80,19 +80,34 @@ function gapRanges(rows, startMs, endMs, timestampField) {
   }));
 }
 
+function sourceRowsCoverAqiContext(rows, hours, contextHours) {
+  const observedHours = new Set(rows
+    .map((row) => Math.floor(Date.parse(row.observed_at) / HOUR_MS) * HOUR_MS)
+    .filter(Number.isFinite));
+  return hours.every((hour) => {
+    const hourMs = Date.parse(hour);
+    if (!Number.isFinite(hourMs)) return false;
+    for (let offset = 0; offset <= contextHours; offset += 1) {
+      if (!observedHours.has(hourMs - offset * HOUR_MS)) return false;
+    }
+    return true;
+  });
+}
+
 export function resolveStationSeriesRequest(url) {
   const timeseriesId = parsePositiveInt(url.searchParams.get("timeseries_id"));
   const connectorId = parsePositiveInt(url.searchParams.get("connector_id"));
   const pollutant = normalizePollutantCode(url.searchParams.get("pollutant"));
   const bounds = parseBounds(url);
   if (!timeseriesId || !connectorId || !pollutant || !bounds) return null;
-  const contextHours = pollutant === "pm25" || pollutant === "pm10" ? 23 : 0;
+  const includeAqi = parseIncludeAqi(url.searchParams.get("include_aqi"));
+  const contextHours = includeAqi && (pollutant === "pm25" || pollutant === "pm10") ? 23 : 0;
   return {
     timeseriesId, connectorId, pollutant, contextHours,
     startMs: bounds.startMs, endMs: bounds.endMs,
     contextStartMs: bounds.startMs - contextHours * HOUR_MS,
     window: String(url.searchParams.get("window") ?? "").trim() || null,
-    includeAqi: parseIncludeAqi(url.searchParams.get("include_aqi")),
+    includeAqi,
   };
 }
 
@@ -138,7 +153,7 @@ export function buildStationSeriesFromIngest(request, ingestPayload) {
     aqi: request.includeAqi
       ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, next_chunk_end_utc: fullyServedShortWindow ? null : outputStartUtc, source_counts: { r2: 0, live_calculated: aqiRows.length }, mismatch_count: 0 }
       : { enabled: false, state: "disabled", rows: [], response_complete: false, has_gap: false, gap_ranges: [], next_chunk_end_utc: null, source_counts: { r2: 0, live_calculated: 0 }, mismatch_count: 0 },
-    observations: { rows: observationRows, response_complete: outputComplete, has_gap: !outputComplete, gap_ranges: observationGaps, next_chunk_end_utc: fullyServedShortWindow ? null : outputStartUtc, source_counts: { ingest: observationRows.length } },
+    observations: { rows: observationRows, guideline: ingestPayload?.guideline || null, response_complete: outputComplete, has_gap: !outputComplete, gap_ranges: observationGaps, next_chunk_end_utc: fullyServedShortWindow ? null : outputStartUtc, source_counts: { ingest: observationRows.length } },
   };
 }
 
@@ -232,19 +247,28 @@ async function buildLongStationSeries(request, env) {
   // gaps. This prevents a second primary ingest read in the browser path.
   const requiredContextStartMs = bounds.headStartMs - request.contextHours * HOUR_MS;
   const ingestRequest = { ...request, startMs: bounds.headStartMs, endMs: bounds.headEndMs, contextStartMs: requiredContextStartMs, includeAqi: true };
-  const liveBundle = buildStationSeriesFromIngest(ingestRequest, await fetchIngestOnce(ingestRequest, env));
+  const ingestPayload = await fetchIngestOnce(ingestRequest, env);
+  const liveBundle = buildStationSeriesFromIngest(ingestRequest, ingestPayload);
   const eligibleMissing = new Set(missingHours);
   const liveRows = liveBundle.aqi.rows.filter((row) => eligibleMissing.has(row.timestamp_hour_utc));
   const observationRows = liveBundle.observations.rows;
-  const liveComplete = liveBundle.source.ingest_response_complete
-    && missingHours.every((hour) => liveRows.some((row) => row.timestamp_hour_utc === hour));
+  const liveRowsByHour = new Set(liveRows.map((row) => row.timestamp_hour_utc));
+  const liveAqiComplete = missingHours.length === 0 || (
+    sourceRowsCoverAqiContext(
+      dedupeSourceObservationRows(responseRows(ingestPayload)).filter((row) => (
+        row.timeseries_id === request.timeseriesId && row.connector_id === request.connectorId && row.pollutant_code === request.pollutant
+      )),
+      missingHours,
+      request.contextHours,
+    ) && missingHours.every((hour) => liveRowsByHour.has(hour))
+  );
   const observationsComplete = liveBundle.observations.response_complete;
   const ingestRowCount = liveBundle.source.ingest_row_count;
   const merged = mergeStableAqiHead({ r2Rows, liveRows, request, bounds });
   const headHours = outputHours(bounds.headStartMs, bounds.headEndMs);
   const mergedHours = new Set(merged.rows.map((row) => row.timestamp_hour_utc));
   const remainingMissing = headHours.filter((hour) => !mergedHours.has(new Date(hour).toISOString())).map((hour) => new Date(hour).toISOString());
-  const complete = liveComplete && remainingMissing.length === 0;
+  const complete = liveAqiComplete && remainingMissing.length === 0;
   const headStartUtc = new Date(bounds.headStartMs).toISOString();
   const headEndUtc = new Date(bounds.headEndMs).toISOString();
   console.log(JSON.stringify({
@@ -281,7 +305,7 @@ async function buildLongStationSeries(request, env) {
       mismatch_count: merged.mismatch_count,
       mismatch_hours: merged.mismatch_hours,
     },
-    observations: { rows: observationRows, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: liveBundle.observations.gap_ranges, stable_head_start_utc: headStartUtc, stable_head_end_utc: headEndUtc, next_chunk_end_utc: headStartUtc, source_counts: { ingest: observationRows.length } },
+    observations: { rows: observationRows, guideline: liveBundle.observations.guideline || null, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: liveBundle.observations.gap_ranges, stable_head_start_utc: headStartUtc, stable_head_end_utc: headEndUtc, next_chunk_end_utc: headStartUtc, source_counts: { ingest: observationRows.length } },
   };
 }
 

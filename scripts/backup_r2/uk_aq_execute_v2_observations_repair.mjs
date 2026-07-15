@@ -463,8 +463,9 @@ async function assertCompleteChildrenUnchanged({ r2, guard, allowStagedChildren 
   }
 }
 
-function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
+function createStagedObjectMap({ r2, store, indexPrefixes = [], dropboxSourceKeys = [] }) {
   const proposals = new Map();
+  const allowedDropboxSourceKeys = new Set(dropboxSourceKeys.map(safeLocalKey));
   const indexProposalKind = (key) => key.includes("/timeseries_id=")
     ? "timeseries_metadata"
     : key.endsWith("_latest.json")
@@ -513,10 +514,15 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
       getObject: async ({ key }) => {
         const staged = stagedObject(key);
         if (staged) return staged;
-        const indexKey = indexPrefixes.some((prefix) => key.startsWith(prefix));
-        const object = indexKey ? store.getLiveTargetObjectIfExists(key) : store.getObjectIfExists(key);
+        // Parent hierarchy and index target state both use only the live
+        // snapshot/current verified overlay. Dropbox can be used for an
+        // explicitly requested index-only leaf source, never by discovery.
+        const object = store.getLiveTargetObjectIfExists(key)
+          || (allowedDropboxSourceKeys.has(safeLocalKey(key))
+            ? store.getObjectFromSourceIfExists(key, "dropbox")
+            : null);
         if (object) return object;
-        const error = new Error(`Combined ${indexKey ? "live target" : "local"} object unavailable: ${key}`);
+        const error = new Error(`Combined live target object unavailable: ${key}`);
         error.code = "OBJECT_NOT_FOUND";
         throw error;
       },
@@ -527,9 +533,7 @@ function createStagedObjectMap({ r2, store, indexPrefixes = [] }) {
         return object ? { exists: true, key, bytes: object.bytes, etag: object.r2_etag, content_sha256: object.content_sha256 } : { exists: false, key };
       },
       listAllObjects: async ({ prefix, max_keys }) => {
-        const entries = indexPrefixes.some((indexPrefix) => prefix.startsWith(indexPrefix))
-          ? store.listLiveTargetObjects({ prefix, max_keys })
-          : store.listAllObjects({ prefix, max_keys });
+        const entries = store.listLiveTargetObjects({ prefix, max_keys });
         const byKey = new Map(entries.map((entry) => [entry.key, entry]));
         for (const proposal of proposals.values()) {
           if (proposal.key.startsWith(prefix)) {
@@ -1176,6 +1180,20 @@ export async function runV2ObservationsRepair({
   const latestIndexKey = domain === "observations"
     ? `${config.index_prefix_v2}/observations_timeseries_latest.json`
     : `${config.index_prefix_v2}/aqilevels_hourly_data_timeseries_latest.json`;
+  // An explicit index-only action can legitimately target a historical leaf
+  // which is absent from the live connector/day hierarchy. Keep that leaf
+  // out of parent discovery, but allow its Dropbox manifest as a narrowly
+  // scoped index source. The target index itself is still live-only.
+  const additionalIndexPollutantTargets = domain === "observations"
+    ? scopes.flatMap((scope) => (scope.needsIndex && Number.isInteger(scope.connectorId) && scope.connectorId > 0
+      ? (scope.index_pollutant_codes || []).map((pollutantCode) => ({
+        day_utc: scope.dayUtc,
+        connector_id: scope.connectorId,
+        pollutant_code: pollutantCode,
+        manifest_key: `${dataPrefix}/day_utc=${scope.dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${pollutantCode}/manifest.json`,
+      }))
+      : []))
+    : [];
   const localStore = createCombinedLocalStore({
     ...args,
     prefixes: [...new Set(scopes.flatMap((scope) => [
@@ -1205,6 +1223,7 @@ export async function runV2ObservationsRepair({
     indexPrefixes: [config.index_prefix_v2, indexPrefix, config.timeseries_metadata_index_prefix_v2]
       .filter(Boolean)
       .map((prefix) => `${String(prefix).replace(/\/+$/, "")}/`),
+    dropboxSourceKeys: additionalIndexPollutantTargets.map((target) => target.manifest_key),
   });
   const dayPlans = [];
   const blockedScopes = [];
@@ -1386,6 +1405,9 @@ export async function runV2ObservationsRepair({
             proposalOnly: !args.writeR2,
             writeR2: true,
             authoritativeTimeseriesById: coreTimeseries,
+            additionalPollutantManifestTargets: additionalIndexPollutantTargets.filter((target) =>
+              target.day_utc === dayUtc && target.connector_id === connectorId
+            ),
           }));
         }
         const metadataResults = results.map((result) => result?.timeseries_metadata).filter(Boolean);

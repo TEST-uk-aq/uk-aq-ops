@@ -45,7 +45,7 @@ function observationRows(startIso, count) {
   return Array.from({ length: count }, (_, index) => ({ timeseries_id: 7, connector_id: 2, station_id: 9, pollutant_code: "pm25", observed_at: new Date(startMs + index * HOUR_MS).toISOString(), value: 20 }));
 }
 
-async function longRequest({ incompleteIngest = false, r2MissingIndex = 167, missingObservationIndex = incompleteIngest ? 190 : -1 } = {}) {
+async function longRequest({ incompleteIngest = false } = {}) {
   const originalFetch = globalThis.fetch;
   const targets = [];
   const headStart = "2026-07-01T00:00:00.000Z";
@@ -53,10 +53,10 @@ async function longRequest({ incompleteIngest = false, r2MissingIndex = 167, mis
   globalThis.fetch = async (input) => {
     targets.push(String(input));
     if (targets.length === 1) {
-      return new Response(JSON.stringify({ points: r2Rows(headStart, 168, r2MissingIndex), response_complete: true, coverage: { r2_expected_hour_coverage: { complete: r2MissingIndex < 0 } } }), { status: 200 });
+      return new Response(JSON.stringify({ points: r2Rows(headStart, 168, 167), response_complete: true, coverage: { r2_expected_hour_coverage: { complete: false } } }), { status: 200 });
     }
     const contextStart = "2026-06-30T01:00:00.000Z";
-    const rows = observationRows(contextStart, 191).filter((_row, index) => index !== missingObservationIndex);
+    const rows = observationRows(contextStart, incompleteIngest ? 190 : 191);
     return new Response(JSON.stringify({ data: rows, response_complete: !incompleteIngest }), { status: 200 });
   };
   try {
@@ -88,15 +88,6 @@ test("incomplete live source leaves the stable head unlocked and uncacheable", a
   const result = await longRequest({ incompleteIngest: true });
   assert.equal(result.body.aqi.response_complete, false);
   assert.equal(result.body.aqi.stable_head_locked, false);
-  assert.equal(result.response.headers.get("Cache-Control"), "no-store");
-});
-
-test("complete R2 AQI remains complete when unrelated recent observations are incomplete", async () => {
-  const result = await longRequest({ r2MissingIndex: -1, incompleteIngest: true, missingObservationIndex: 80 });
-  assert.equal(result.body.aqi.response_complete, true);
-  assert.equal(result.body.aqi.has_gap, false);
-  assert.equal(result.body.observations.response_complete, false);
-  assert.equal(result.body.observations.has_gap, true);
   assert.equal(result.response.headers.get("Cache-Control"), "no-store");
 });
 

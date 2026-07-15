@@ -3607,6 +3607,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   fromDayUtc,
   toDayUtc,
   connectorId = null,
+  additionalPollutantManifestTargets = [],
   writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
@@ -3630,6 +3631,20 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   }
 
   const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const additionalTargets = (normalizedDomain === "observations" ? additionalPollutantManifestTargets : [])
+    .map((target) => {
+      const dayUtc = parseIsoDay(target?.day_utc);
+      const targetConnectorId = parsePositiveId(target?.connector_id);
+      const pollutantCode = parsePollutantCode(target?.pollutant_code, normalizedDomain);
+      const manifestKey = String(target?.manifest_key || "").trim();
+      const expectedKey = dayUtc && targetConnectorId && pollutantCode
+        ? `${normalizedDataPrefix}/day_utc=${dayUtc}/connector_id=${targetConnectorId}/pollutant_code=${pollutantCode}/manifest.json`
+        : null;
+      return dayUtc && targetConnectorId && pollutantCode && manifestKey === expectedKey
+        ? { day_utc: dayUtc, connector_id: targetConnectorId, pollutant_code: pollutantCode, manifest_key: manifestKey }
+        : null;
+    })
+    .filter(Boolean);
   const warnings = [];
   const affectedPollutantIndexes = [];
 
@@ -3686,12 +3701,24 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
           throw new Error(`blocked_dependency|required_connector_manifest_unreadable|${connectorTarget.manifest_key}|${message}`);
         }
 
-        const pollutantTargets = resolveHistoryV2PollutantManifestTargets(
+        const hierarchyTargets = resolveHistoryV2PollutantManifestTargets(
           connectorManifestObject,
           dayUtc,
           connectorTarget.connector_id,
           normalizedDataPrefix,
           normalizedDomain,
+        );
+        // Index-only repairs may name a valid historical leaf which is no
+        // longer part of the live parent hierarchy. Add it only because the
+        // action explicitly requested it; never rediscover it from Dropbox.
+        const targetsByKey = new Map(hierarchyTargets.map((target) => [target.manifest_key, target]));
+        for (const target of additionalTargets) {
+          if (target.day_utc === dayUtc && target.connector_id === connectorTarget.connector_id) {
+            targetsByKey.set(target.manifest_key, target);
+          }
+        }
+        const pollutantTargets = [...targetsByKey.values()].sort((left, right) =>
+          left.pollutant_code.localeCompare(right.pollutant_code)
         );
         const wantedPollutantIndexKeys = new Set(pollutantTargets.map((pollutantTarget) =>
           normalizedDomain === "observations"
@@ -4401,6 +4428,7 @@ export async function updateR2HistoryIndexesTargeted({
   writeR2 = true,
   r2: r2Override = null,
   authoritativeTimeseriesById = null,
+  additionalPollutantManifestTargets = [],
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   const r2 = r2Override || config.r2;
@@ -4445,6 +4473,7 @@ export async function updateR2HistoryIndexesTargeted({
         fromDayUtc,
         toDayUtc,
         connectorId,
+        additionalPollutantManifestTargets,
         writeR2,
       });
       results.push(result);

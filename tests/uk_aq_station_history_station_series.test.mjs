@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import worker from "../workers/uk_aq_station_history/src/index.mjs";
+import worker, { resolveStationSeriesRequest } from "../workers/uk_aq_station_history/src/index.mjs";
 
 const env = { SUPABASE_URL: "https://ingest.example", SB_PUBLISHABLE_DEFAULT_KEY: "key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret" };
 const HOUR_MS = 60 * 60 * 1000;
@@ -10,11 +10,11 @@ function observations(startIso, hours, pollutant) {
   return Array.from({ length: hours }, (_, index) => ({ timeseries_id: 7, connector_id: 2, station_id: 9, pollutant_code: pollutant, observed_at: new Date(startMs + index * HOUR_MS).toISOString(), value: 20 }));
 }
 
-async function stationSeries({ pollutant, startIso, endIso, rows, window = "24h", includeAqi = true }) {
+async function stationSeries({ pollutant, startIso, endIso, rows, window = "24h", includeAqi = true, guideline = null }) {
   const originalFetch = globalThis.fetch;
   let calls = 0;
   let target = "";
-  globalThis.fetch = async (input) => { calls += 1; target = String(input); return new Response(JSON.stringify({ data: rows, response_complete: true }), { status: 200 }); };
+  globalThis.fetch = async (input) => { calls += 1; target = String(input); return new Response(JSON.stringify({ data: rows, response_complete: true, guideline }), { status: 200 }); };
   try {
     const response = await worker.fetch(new Request(`https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=${pollutant}&start_utc=${encodeURIComponent(startIso)}&end_utc=${encodeURIComponent(endIso)}&window=${window}&format=objects&include_aqi=${includeAqi}`), env);
     return { response, body: await response.json(), calls, target };
@@ -80,4 +80,17 @@ test("long observations-only station-series stays bounded and never requests the
   assert.equal(result.body.aqi.enabled, false);
   assert.equal(result.body.observations.rows.length, 168);
   assert.equal(result.body.observations.next_chunk_end_utc, headStart);
+});
+
+test("PM observations-only requests do not fetch AQI context", () => {
+  const request = resolveStationSeriesRequest(new URL("https://internal/v1/station-series?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=2026-07-06T00%3A00%3A00.000Z&end_utc=2026-07-07T00%3A00%3A00.000Z&window=24h&format=objects&include_aqi=false"));
+  assert.equal(request?.includeAqi, false);
+  assert.equal(request?.contextHours, 0);
+});
+
+test("station-series retains the observation guideline for the chart renderer", async () => {
+  const start = "2026-07-07T00:00:00.000Z";
+  const guideline = { limit_value: 25, uom: "µg/m³" };
+  const result = await stationSeries({ pollutant: "no2", startIso: start, endIso: "2026-07-07T12:00:00.000Z", rows: observations(start, 12, "no2"), window: "12h", guideline });
+  assert.deepEqual(result.body.observations.guideline, guideline);
 });

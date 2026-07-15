@@ -379,6 +379,51 @@ test("a live-missing O3 index is proposed even when Dropbox has an identical sta
   }
 });
 
+test("a Dropbox-only index source cannot leak O3 into a live connector manifest", async () => {
+  const no2 = pollutant(1, "no2");
+  const o3 = pollutant(1, "o3");
+  const connectorKey = `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`;
+  const liveConnector = buildHistoryV2ConnectorManifest({
+    domain: "observations", dayUtc: DAY, connectorId: 1, runId: "live", manifestKey: connectorKey,
+    pollutantManifests: [no2], writerGitSha: "live", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const dayKey = `${PREFIX}/day_utc=${DAY}/manifest.json`;
+  const liveDay = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc: DAY, runId: "live", manifestKey: dayKey,
+    connectorManifests: [liveConnector], writerGitSha: "live", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const liveObjects = {
+    [no2.manifest_key]: JSON.stringify(no2, null, 2),
+    [connectorKey]: JSON.stringify(liveConnector, null, 2),
+    [dayKey]: JSON.stringify(liveDay, null, 2),
+  };
+  const resolver = combinedResolverEnv();
+  const fake = installFakeR2(liveObjects);
+  try {
+    writeCombinedDropboxFixture(resolver, {
+      ...liveObjects,
+      [o3.manifest_key]: JSON.stringify(o3, null, 2),
+    });
+    const output = await runV2ObservationsRepair({
+      env: resolver.env,
+      repairPlan: observationsRepairPlan(repairAction({
+        kind: "observation_connector_manifest_repair",
+        connector_id: 1,
+        pollutant_code: null,
+        requires_index_rebuild: false,
+      })),
+    });
+    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
+    const connector = JSON.parse(output.planning.proposals.find((proposal) => proposal.key === connectorKey).proposed_body);
+    assert.deepEqual(connector.pollutant_codes, ["no2"]);
+    assert.equal(connector.parquet_object_keys.some((key) => key.includes("pollutant_code=o3")), false);
+    assert.equal(connector.child_manifests.some((child) => child.pollutant_code === "o3"), false);
+  } finally {
+    fake.restore();
+    resolver.cleanup();
+  }
+});
+
 test("day repairs preserve live connector siblings and expose Dropbox inventory drift", async () => {
   const fixture = twoConnectorFixture();
   const c3pm25 = pollutant(3, "pm25");
