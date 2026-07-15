@@ -44,6 +44,73 @@ The new station-history Worker owns the data-specific work needed by station pag
 
 The public website must continue to call the existing public gateway hostname. The new Worker is private and is reached through a Cloudflare Service Binding.
 
+### Non-negotiable Hex Map compatibility requirements
+
+These requirements clarify and override any earlier wording that could be read
+as requiring recent-first or AQI-first loading to blank an already valid chart.
+They preserve the established legacy-loader behaviour while the progressive
+station-history path remains reversible.
+
+#### A. Existing-chart continuity on time-range changes
+
+This behaviour MUST remain equivalent to the existing legacy Hex Map chart.
+
+Changing the chart time range must not clear or temporarily remove observations,
+AQI bands, guideline lines or other already-rendered chart data.
+
+When a valid chart frame already exists:
+
+1. Immediately retain all currently rendered observations, DAQI and EAQI bands,
+   guideline lines and other chart overlays.
+2. Animate the existing x-axis from the old range to the new range.
+3. Stretch or compress the existing line paths and AQI bands during that
+   transition.
+4. Immediately display any cached points that intersect the new range.
+5. Fetch only intervals not already covered by the page-session cache.
+6. Merge and render newly fetched AQI and observation data from newest to
+   oldest.
+7. Keep successful existing and newly loaded intervals visible when another
+   interval fails.
+8. Never blank the chart merely to guarantee that a newly fetched AQI response
+   is the first network-derived layer.
+
+“AQI first” applies to the order in which newly fetched layers are processed
+for an initially empty chart. It must not override existing-chart continuity
+during a window change.
+
+Range contraction retains the complete page-session cache and displays only
+the intersecting points. It must not delete older cached points or refetch a
+shorter range that is already covered. Explicit Refresh may request a fresh
+authoritative head, but visible history remains until that response is ready.
+
+#### B. Independent DAQI and EAQI availability
+
+DAQI and EAQI availability are independent. For PM2.5 and PM10, DAQI requires
+rolling 24-hour context while EAQI uses the individual hourly concentration.
+Incomplete rolling context may leave DAQI null with an
+`insufficient_samples` status and missing reason, but must not suppress a valid
+EAQI value for the same hour. The inverse legitimate state must also be
+preserved. Each index retains its own value, calculation status and missing
+reason, and overall response completeness remains truthful.
+
+#### C. Partial chunk behaviour
+
+A partial authoritative AQI or observation chunk contributes every valid,
+identity-compatible, non-conflicting row. It remains partial and retryable,
+does not seed a normal complete cache entry, leaves genuine missing intervals
+visible, and cannot replace an already rendered stable-head AQI hour. A failure
+in one interval does not remove successful existing or neighbouring intervals.
+
+#### D. Covered-range cache semantics
+
+Page-session coverage is represented as covered time intervals separately for
+AQI and observations, with complete, partial, failed and stale state where
+applicable. Exact chunk keys remain useful for retry identity, diagnostics,
+in-flight deduplication and completed-request bookkeeping, but are not the sole
+coverage representation. Interval subtraction determines missing work, so a
+chunk-boundary change cannot refetch an already covered interval.
+
+
 ## 2. Decisions already made
 
 No further user decision is required before starting this plan.

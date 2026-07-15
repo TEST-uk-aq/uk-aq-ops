@@ -57,9 +57,13 @@ test("station-history source and chunk limits are configurable with safe bounded
 test("incomplete AQI and observation R2 responses remain independently incomplete", () => {
   const aqiChunk = parseHistoryChunkRequest(chunkUrl("/v1/aqi-history", "2026-07-07T00:00:00.000Z", "2026-07-08T00:00:00.000Z"), "aqi");
   const obsChunk = parseHistoryChunkRequest(chunkUrl("/v1/observations-history", "2026-07-07T00:00:00.000Z", "2026-07-08T00:00:00.000Z"), "observations");
-  const aqi = buildAqiHistoryChunk(aqiChunk, { points: [], response_complete: false, partial_reasons: ["missing_manifest"] });
+  const retainedAqiRow = { period_start_utc: "2026-07-07T01:00:00.000Z", timeseries_id: 7, connector_id: 2, pollutant_code: "pm25", daqi_index_level: 3, eaqi_index_level: 2, source: "r2" };
+  const aqi = buildAqiHistoryChunk(aqiChunk, { points: [retainedAqiRow], response_complete: false, partial_reasons: ["missing_manifest"] });
   const observations = buildObservationHistoryChunk(obsChunk, { rows: [{ observed_at: "2026-07-07T01:00:00.000Z", value: 2 }, { observed_at: "2026-07-07T01:00:00Z", value: 2 }], response_complete: false, coverage: { response_complete: false } });
   assert.equal(aqi.response_complete, false);
+  assert.equal(aqi.has_gap, true);
+  assert.equal(aqi.points.length, 1, "valid R2 AQI rows survive a partial historical chunk");
+  assert.equal(aqi.points[0].period_start_utc, retainedAqiRow.period_start_utc);
   assert.equal(observations.response_complete, false);
   assert.equal(observations.rows.length, 1);
   assert.deepEqual(observations.rows.map((row) => row.observed_at), ["2026-07-07T01:00:00.000Z"]);

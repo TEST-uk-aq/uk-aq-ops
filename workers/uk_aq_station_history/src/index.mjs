@@ -127,15 +127,6 @@ function missingHourRanges(rows, startMs, endMs, field) {
   return hourStarts(startMs, endMs).filter((hour) => !present.has(hour)).map((hour) => ({ start_utc: new Date(hour).toISOString(), end_utc: new Date(hour + HOUR_MS).toISOString() }));
 }
 
-function rowsCoverAqiContext(rows, hours, contextHours) {
-  const present = new Set(rows.map((row) => Math.floor(Date.parse(row.observed_at) / HOUR_MS) * HOUR_MS).filter(Number.isFinite));
-  return hours.every((hour) => {
-    const hourMs = Date.parse(hour);
-    for (let offset = 0; offset <= contextHours; offset += 1) if (!present.has(hourMs - offset * HOUR_MS)) return false;
-    return true;
-  });
-}
-
 function calculateAqiRows(observationRows, request, startMs, endMs) {
   return helperRowsToNormalizedAqiV1Rows(
     pivotNarrowRowsToHelperRows(sourceObservationsToNarrowRows(observationRows)),
@@ -147,6 +138,52 @@ function calculateAqiRows(observationRows, request, startMs, endMs) {
       && row.connector_id === request.connectorId
       && row.pollutant_code === request.pollutant;
   }).map((row) => ({ ...row, source: "live_calculated" }));
+}
+
+function aqiAvailabilityDiagnostics(rows) {
+  const diagnostics = {
+    daqi_available_row_count: 0,
+    eaqi_available_row_count: 0,
+    daqi_missing_row_count: 0,
+    eaqi_missing_row_count: 0,
+    daqi_insufficient_context_row_count: 0,
+    live_only_eaqi_row_count: 0,
+    live_only_daqi_row_count: 0,
+    live_neither_index_row_count: 0,
+    daqi_missing_hours: [],
+    eaqi_missing_hours: [],
+  };
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const hasDaqi = row?.daqi_index_level !== null && row?.daqi_index_level !== undefined;
+    const hasEaqi = row?.eaqi_index_level !== null && row?.eaqi_index_level !== undefined;
+    const hour = String(row?.timestamp_hour_utc || "");
+    if (hasDaqi) diagnostics.daqi_available_row_count += 1;
+    else {
+      diagnostics.daqi_missing_row_count += 1;
+      if (hour) diagnostics.daqi_missing_hours.push(hour);
+    }
+    if (hasEaqi) diagnostics.eaqi_available_row_count += 1;
+    else {
+      diagnostics.eaqi_missing_row_count += 1;
+      if (hour) diagnostics.eaqi_missing_hours.push(hour);
+    }
+    if (row?.daqi_calculation_status === "insufficient_samples") {
+      diagnostics.daqi_insufficient_context_row_count += 1;
+    }
+    if (row?.source === "live_calculated") {
+      if (!hasDaqi && hasEaqi) diagnostics.live_only_eaqi_row_count += 1;
+      else if (hasDaqi && !hasEaqi) diagnostics.live_only_daqi_row_count += 1;
+      else if (!hasDaqi && !hasEaqi) diagnostics.live_neither_index_row_count += 1;
+    }
+  }
+  diagnostics.daqi_missing_hours.sort();
+  diagnostics.eaqi_missing_hours.sort();
+  return diagnostics;
+}
+
+function aqiAvailabilityComplete(diagnostics) {
+  return diagnostics.daqi_missing_row_count === 0
+    && diagnostics.eaqi_missing_row_count === 0;
 }
 
 function ingestCapability({ request, direct, aqiBounds, observationBounds, retentionStartMs }) {
@@ -199,8 +236,10 @@ function buildIngestOnlyResponse(request, direct, capability) {
     return ms >= request.startMs && ms < request.endMs;
   });
   const aqiRows = request.includeAqi ? calculateAqiRows(direct.rows, request, request.startMs, request.endMs) : [];
+  const aqiAvailability = aqiAvailabilityDiagnostics(aqiRows);
   const aqiGaps = request.includeAqi ? [...capability.contextGaps, ...missingHourRanges(aqiRows, request.startMs, request.endMs, "timestamp_hour_utc")] : [];
-  const aqiComplete = request.includeAqi && direct.response_complete && capability.aqiContextComplete && aqiGaps.length === 0;
+  const aqiComplete = request.includeAqi && direct.response_complete && capability.aqiContextComplete
+    && aqiGaps.length === 0 && aqiAvailabilityComplete(aqiAvailability);
   const observationComplete = direct.response_complete && capability.observationsComplete;
   return {
     schema_version: 1,
@@ -216,7 +255,7 @@ function buildIngestOnlyResponse(request, direct, capability) {
       ...directDiagnostics(direct, observations),
     },
     aqi: request.includeAqi
-      ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_aqi_chunk_end_utc: null, stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only", source_counts: { r2: 0, live_calculated: aqiRows.length }, overlap_count: 0, mismatch_count: 0, mismatch_hours: [] }
+      ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, availability: aqiAvailability, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_aqi_chunk_end_utc: null, stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only", source_counts: { r2: 0, live_calculated: aqiRows.length }, overlap_count: 0, mismatch_count: 0, mismatch_hours: [] }
       : disabledAqiSection(),
     observations: { rows: observations, guideline: direct.guideline, response_complete: observationComplete, has_gap: !observationComplete, gap_ranges: capability.observationGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_observation_chunk_end_utc: null, source_counts: { r2: 0, ingest: observations.length }, discarded_ingest_overlap_count: 0 },
   };
@@ -268,12 +307,21 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
   let mergedAqi = { rows: [], overlap_count: 0, mismatch_count: 0, mismatch_hours: [] };
   let liveRows = [];
   let aqiComplete = false;
+  let aqiAvailability = aqiAvailabilityDiagnostics([]);
   if (request.includeAqi) {
-    const eligible = new Set(missing.filter((hour) => rowsCoverAqiContext(calculationRows, [hour], request.contextHours)));
-    liveRows = calculateAqiRows(calculationRows, request, aqiBounds.headStartMs, aqiBounds.headEndMs).filter((row) => eligible.has(row.timestamp_hour_utc));
+    const missingSet = new Set(missing);
+    // The shared AQI helper calculates DAQI and EAQI independently. Retain a
+    // candidate for every R2-missing output hour that has source observations;
+    // incomplete PM rolling context may make DAQI null without suppressing a
+    // valid hourly EAQI result.
+    liveRows = calculateAqiRows(calculationRows, request, aqiBounds.headStartMs, aqiBounds.headEndMs)
+      .filter((row) => missingSet.has(row.timestamp_hour_utc));
     mergedAqi = mergeStableAqiHead({ r2Rows: r2AqiRows, liveRows, request, bounds: aqiBounds });
     const remaining = missingHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs, "timestamp_hour_utc");
-    aqiComplete = r2ResponseComplete(r2Payload) && missing.every((hour) => eligible.has(hour)) && remaining.length === 0;
+    aqiAvailability = aqiAvailabilityDiagnostics(mergedAqi.rows);
+    const liveSourceComplete = missing.length === 0 || direct.response_complete;
+    aqiComplete = r2ResponseComplete(r2Payload) && liveSourceComplete
+      && remaining.length === 0 && aqiAvailabilityComplete(aqiAvailability);
   }
 
   const aqiHeadStartUtc = new Date(aqiBounds.headStartMs).toISOString();
@@ -310,7 +358,7 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
       next_chunk_end_utc: aqiBounds.headStartMs > request.startMs ? aqiHeadStartUtc : null,
       next_older_aqi_chunk_end_utc: aqiBounds.headStartMs > request.startMs ? aqiHeadStartUtc : null,
       stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only",
-      source_counts: { r2: r2AqiRows.length, live_calculated: liveRows.length }, overlap_count: mergedAqi.overlap_count, mismatch_count: mergedAqi.mismatch_count, mismatch_hours: mergedAqi.mismatch_hours,
+      source_counts: { r2: r2AqiRows.length, live_calculated: liveRows.length }, availability: aqiAvailability, overlap_count: mergedAqi.overlap_count, mismatch_count: mergedAqi.mismatch_count, mismatch_hours: mergedAqi.mismatch_hours,
     } : disabledAqiSection(),
     observations: {
       rows: outputObservations, guideline: direct.guideline, response_complete: observationsComplete, has_gap: !observationsComplete, gap_ranges: observationGaps,
