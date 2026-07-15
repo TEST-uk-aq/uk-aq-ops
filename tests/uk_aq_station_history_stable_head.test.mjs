@@ -108,6 +108,24 @@ test("one bounded PM ingest bundle supplies the stable head observations and liv
   assert.equal(result.body.source.live_calculation_observation_sources.r2, 2);
 });
 
+test("PM live calculation retains EAQI when DAQI rolling context is incomplete", async () => {
+  const result = await longRequest({ missingObservationIndex: 170 });
+  const live = result.body.aqi.rows.find((row) => row.source === "live_calculated");
+  assert.ok(live, "the R2-missing hour remains in the stable head");
+  assert.equal(live.daqi_index_level, null);
+  assert.equal(live.daqi_calculation_status, "insufficient_samples");
+  assert.equal(live.daqi_missing_reason, "insufficient_rolling_24h_hours");
+  assert.notEqual(live.eaqi_index_level, null);
+  assert.equal(live.eaqi_calculation_status, "ok");
+  assert.equal(live.eaqi_missing_reason, null);
+  assert.equal(result.body.aqi.availability.live_only_eaqi_row_count, 1);
+  assert.equal(result.body.aqi.availability.daqi_insufficient_context_row_count, 1);
+  assert.equal(result.body.aqi.availability.eaqi_missing_row_count, 0);
+  assert.equal(result.body.aqi.response_complete, false, "valid EAQI does not make incomplete DAQI coverage complete");
+  assert.equal(result.body.aqi.stable_head_locked, false);
+  assert.equal(result.body.source.logical_ingest_fetch_count, 1);
+});
+
 test("incomplete live source leaves the stable head unlocked and uncacheable", async () => {
   const result = await longRequest({ incompleteIngest: true });
   assert.equal(result.body.aqi.response_complete, false);
