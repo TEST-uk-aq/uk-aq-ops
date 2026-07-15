@@ -56,8 +56,17 @@ function combinedResolverEnv() {
       UK_AQ_R2_HISTORY_DROPBOX_ROOT: dropboxRoot,
       UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON: runStateJson,
     },
+    dropboxRoot,
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   };
+}
+
+function writeCombinedDropboxFixture(resolver, objects) {
+  for (const [key, body] of Object.entries(objects)) {
+    const target = path.join(resolver.dropboxRoot, key);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, body);
+  }
 }
 
 test("whole-day manifest actions remain connector-less and reject a connector subset", () => {
@@ -225,26 +234,46 @@ test("Phase 5 stages two connector repairs into one proposed day and writes the 
   } finally { writeFake.restore(); }
 });
 
-test("Phase 5 day-only and index-only actions each produce one targeted proposal set", async () => {
-  const fixture = twoConnectorFixture();
-  const dayOnly = observationsRepairPlan(repairAction({ kind: "observation_day_manifest_repair", requires_index_rebuild: false }));
-  const dayFake = installFakeR2(fixture.objects);
+test("Phase 5 day-only action proposes a parent built from every live connector", async () => {
+  const connectorIds = [1, 3, 6, 7];
+  const connectorManifests = connectorIds.map((connectorId) => {
+    const child = pollutant(connectorId, "pm25");
+    const key = `${PREFIX}/day_utc=${DAY}/connector_id=${connectorId}/manifest.json`;
+    return {
+      child,
+      manifest: buildHistoryV2ConnectorManifest({
+        domain: "observations", dayUtc: DAY, connectorId, runId: "fixture", manifestKey: key,
+        pollutantManifests: [child], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+      }),
+    };
+  });
+  const dayKey = `${PREFIX}/day_utc=${DAY}/manifest.json`;
+  const staleDay = buildHistoryV2DayManifest({
+    domain: "observations", dayUtc: DAY, runId: "fixture", manifestKey: dayKey,
+    connectorManifests: [connectorManifests[0].manifest], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
+  });
+  const objects = Object.fromEntries([
+    ...connectorManifests.flatMap(({ child, manifest }) => [
+      [child.manifest_key, JSON.stringify(child, null, 2)],
+      [manifest.manifest_key, JSON.stringify(manifest, null, 2)],
+    ]),
+    [dayKey, JSON.stringify(staleDay, null, 2)],
+  ]);
+  const dayOnly = observationsRepairPlan(repairAction({
+    kind: "observation_day_manifest_repair",
+    connector_id: null,
+    pollutant_code: null,
+    requires_index_rebuild: false,
+  }));
+  const resolver = combinedResolverEnv();
   try {
-    const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: ENV, repairPlan: dayOnly });
-    assert.equal(output.status, "succeeded");
-    assert.deepEqual([...dayFake.puts.keys()], [fixture.keys.day]);
-  } finally { dayFake.restore(); }
-
-  const indexOnly = observationsRepairPlan(repairAction({ kind: "observation_index_repair", requires_index_rebuild: true }));
-  const indexFake = installFakeR2(fixture.objects);
-  try {
-    const output = await runV2ObservationsRepair({ env: ENV, repairPlan: indexOnly });
-    assert.equal(output.planning.days.length, 1);
-    assert.ok(output.planning.days[0].index, "one day has one targeted index/latest/metadata proposal set");
-    assert.equal(output.planning.proposals.some((proposal) => proposal.kind === "day_manifest"), false);
-    assert.ok(output.planning.proposals.some((proposal) => proposal.kind === "observation_index"));
-    assert.equal(indexFake.puts.size, 0);
-  } finally { indexFake.restore(); }
+    writeCombinedDropboxFixture(resolver, objects);
+    const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: dayOnly });
+    assert.equal(output.status, "planned");
+    assert.deepEqual(output.planning.days[0].proposal_keys, [dayKey]);
+    const proposedDay = JSON.parse(output.planning.proposals[0].proposed_body);
+    assert.deepEqual(proposedDay.connector_ids, connectorIds, "a connector-less day repair must retain every live connector child");
+  } finally { resolver.cleanup(); }
 });
 
 test("Phase 7 index-only blocked work controls the scope and top-level repair result", async () => {
