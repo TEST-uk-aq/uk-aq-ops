@@ -52,3 +52,15 @@ scripts/r2_query/query_r2_v2_day_snapshot.sh \
   --label before \
   --out "$BEFORE_DIR"
 
+
+
+
+
+AFTER_DIR="/Users/mikehinford/uk-aq-work/r2_conn1_2026-05-17_after_$(date -u +%Y%m%dT%H%M%SZ)"
+
+scripts/r2_query/query_r2_v2_day_snapshot.sh \
+  --day 2026-05-17 \
+  --connector-id 1 \
+  --label after \
+  --out "$AFTER_DIR"
+
