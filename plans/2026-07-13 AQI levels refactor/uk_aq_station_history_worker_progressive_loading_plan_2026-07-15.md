@@ -364,6 +364,25 @@ Do not assume that a request labelled `24h` is safe if:
 - the connector has delayed or partial data;
 - the PM context start is outside ingest coverage.
 
+### Retention configuration is not a source boundary
+
+`INGESTDB_RETENTION_DAYS` is a storage/runtime capability hint, not an
+authoritative per-timeseries observation timestamp. A valid row returned by
+the authoritative ingest RPC must not be discarded solely because it precedes
+`now - INGESTDB_RETENTION_DAYS`.
+
+The R2/ingest handoff is determined from actual returned source coverage and
+truthful upstream coverage metadata. For a longer stable head, the Worker
+must retain ingest rows needed after the actual recent R2 boundary, retain PM
+rolling context, allow a deliberate verification overlap, and prefer R2 for
+duplicate overlap rows. Output observations and AQI rows remain restricted to
+the requested output interval; context-only rows are calculation-only.
+
+A genuinely uncovered seam remains a truthful retryable gap. Nominal
+retention arithmetic must not create a gap where either upstream returned
+valid coverage. Diagnostics must report actual ingest and R2 coverage
+start/end separately from configured retention and requested bounds.
+
 ### 3.5 Separate AQI and observation completeness
 
 The website must be able to display complete AQI even if an observation-history chunk fails, and vice versa.

@@ -119,7 +119,7 @@ function attachAuthoritativeIdentity(body, identity) {
 
 function hourStarts(startMs, endMs) {
   const values = [];
-  for (let cursor = Math.floor(startMs / HOUR_MS) * HOUR_MS; cursor < endMs; cursor += HOUR_MS) values.push(cursor);
+  for (let cursor = Math.ceil(startMs / HOUR_MS) * HOUR_MS; cursor < endMs; cursor += HOUR_MS) values.push(cursor);
   return values;
 }
 
@@ -200,18 +200,17 @@ function aqiAvailabilityComplete(diagnostics) {
     && diagnostics.eaqi_missing_row_count === 0;
 }
 
-function ingestCapability({ request, direct, aqiBounds, observationBounds, retentionStartMs }) {
+function ingestCapability({ request, direct, aqiBounds, observationBounds }) {
   const outputStartMs = Math.min(aqiBounds.headStartMs, observationBounds.headStartMs);
   const outputRows = direct.rows.filter((row) => Date.parse(row.observed_at) >= outputStartMs && Date.parse(row.observed_at) < request.endMs);
   const observationGaps = missingHourRanges(outputRows, observationBounds.headStartMs, request.endMs, "observed_at");
   const contextStartMs = request.includeAqi ? aqiBounds.headStartMs - request.contextHours * HOUR_MS : observationBounds.headStartMs;
   const contextGaps = request.includeAqi ? missingHourRanges(direct.rows, contextStartMs, aqiBounds.headStartMs, "observed_at") : [];
   const coversWholeRequest = aqiBounds.headStartMs === request.startMs && observationBounds.headStartMs === request.startMs;
-  const withinRetention = contextStartMs >= retentionStartMs;
   const observationsComplete = direct.response_complete && observationGaps.length === 0;
   const aqiContextComplete = !request.includeAqi || (direct.response_complete && contextGaps.length === 0);
   return {
-    qualifies: coversWholeRequest && withinRetention && observationsComplete && aqiContextComplete,
+    qualifies: coversWholeRequest && observationsComplete && aqiContextComplete,
     observationsComplete,
     aqiContextComplete,
     observationGaps,
@@ -230,21 +229,29 @@ function requestFields(request) {
 function directDiagnostics(direct, outputRows) {
   return {
     raw_ingest_row_count: direct.raw_row_count,
-    normalized_ingest_row_count: direct.normalized_row_count,
-    rejected_ingest_row_count: direct.rejected_row_count,
+    valid_normalized_ingest_row_count: direct.valid_normalized_row_count,
+    retained_calculation_ingest_row_count: direct.retained_calculation_row_count,
+    malformed_or_invalid_ingest_row_count: direct.malformed_or_invalid_row_count,
+    identity_conflicting_ingest_row_count: direct.identity_conflicting_row_count,
+    outside_required_ingest_source_interval_row_count: direct.outside_required_source_interval_row_count,
     output_ingest_row_count: outputRows.filter((row) => row.source === "ingest").length,
     ingest_source_path: direct.source_path,
     ingest_fetch_count: direct.fetch_count,
     logical_ingest_fetch_count: direct.logical_fetch_count,
     ingest_http_attempt_count: direct.http_attempt_count,
     ingest_rpc_window_label: direct.rpc_window_label,
+    ingest_rpc_window_requested_start_utc: direct.rpc_window_requested_start_utc,
     ingest_rpc_window_start_utc: direct.rpc_window_start_utc,
     ingest_rpc_window_end_utc: direct.rpc_window_end_utc,
-    ingest_rpc_window_covers_required_start: direct.rpc_window_covers_required_start,
+    ingest_rpc_window_covers_requested_start: direct.rpc_window_covers_requested_start,
+    direct_ingest_requested_start_utc: direct.requested_start_utc,
+    direct_ingest_requested_end_utc: direct.requested_end_utc,
+    direct_ingest_actual_start_utc: direct.actual_start_utc,
+    direct_ingest_actual_end_utc: direct.actual_end_utc,
   };
 }
 
-function buildIngestOnlyResponse(request, direct, capability) {
+function buildIngestOnlyResponse(request, direct, capability, policy, nowMs) {
   const observations = direct.rows.filter((row) => {
     const ms = Date.parse(row.observed_at);
     return ms >= request.startMs && ms < request.endMs;
@@ -262,8 +269,13 @@ function buildIngestOnlyResponse(request, direct, capability) {
       mode: request.includeAqi ? "ingest_only" : "ingest_observations_only",
       required_context_start_utc: new Date(request.contextStartMs).toISOString(),
       output_start_utc: new Date(request.startMs).toISOString(), output_end_utc: new Date(request.endMs).toISOString(),
-      direct_ingest_start_utc: direct.start_utc, direct_ingest_end_utc: direct.end_utc,
       aqi_r2_coverage_end_utc: null, observations_r2_coverage_end_utc: null, observation_overlap_start_utc: null,
+      configured_ingest_retention_days: policy.ingestRetentionDays,
+      configured_ingest_retention_hint_start_utc: new Date(nowMs - policy.ingestRetentionDays * DAY_MS).toISOString(),
+      r2_aqi_actual_start_utc: null, r2_aqi_actual_end_utc: null,
+      r2_observations_actual_start_utc: null, r2_observations_actual_end_utc: null,
+      seam_gap_hour_count: seamGapHourCount({ aqiGaps, observationGaps: capability.observationGaps }),
+      verified_overlap_row_count: 0,
       ingest_response_complete: direct.response_complete, r2_aqi_response_complete: null, r2_observations_response_complete: null,
       used_recent_r2_aqi: false, used_r2_observations: false, r2_aqi_fetch_count: 0, r2_observation_fetch_count: 0,
       ...directDiagnostics(direct, observations),
@@ -297,7 +309,48 @@ function latestR2AqiCoverageEnd(rows) {
   return Number.isFinite(latest) ? new Date(latest + HOUR_MS).toISOString() : null;
 }
 
-async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds) {
+function sourceRowCoverage(rows, field) {
+  const timestamps = (Array.isArray(rows) ? rows : [])
+    .map((row) => Date.parse(String(row?.[field] ?? "")))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  return {
+    actual_start_utc: timestamps.length ? new Date(timestamps[0]).toISOString() : null,
+    actual_end_utc: timestamps.length ? new Date(timestamps.at(-1)).toISOString() : null,
+  };
+}
+
+function latestHourlyCoverageEnd(rows, field) {
+  const latestMs = (Array.isArray(rows) ? rows : []).reduce((latest, row) => {
+    const timestampMs = Date.parse(String(row?.[field] ?? ""));
+    return Number.isFinite(timestampMs) ? Math.max(latest, timestampMs) : latest;
+  }, Number.NEGATIVE_INFINITY);
+  return Number.isFinite(latestMs) ? new Date(latestMs + HOUR_MS).toISOString() : null;
+}
+
+function assignedR2SegmentEndMs(direct, startMs, endMs) {
+  const actualStartMs = Date.parse(String(direct.actual_start_utc ?? ""));
+  if (!Number.isFinite(actualStartMs)) return endMs;
+  return Math.min(endMs, Math.max(startMs, actualStartMs));
+}
+
+function r2SegmentComplete(rows, startMs, endMs, field) {
+  return missingHourRanges(rows, startMs, endMs, field).length === 0;
+}
+
+function r2AqiSegmentComplete(rows, startMs, endMs) {
+  return missingAqiHourRanges(rows, startMs, endMs).length === 0;
+}
+
+function seamGapHourCount({ aqiGaps, observationGaps }) {
+  const hours = new Set([
+    ...(Array.isArray(aqiGaps) ? aqiGaps : []),
+    ...(Array.isArray(observationGaps) ? observationGaps : []),
+  ].map((range) => range?.start_utc).filter(Boolean));
+  return hours.size;
+}
+
+async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds, nowMs) {
   let r2Payload = null;
   let r2AqiRows = [];
   let missing = [];
@@ -307,8 +360,13 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
     missing = missingHeadHours(r2AqiRows, aqiBounds);
   }
   const observationContextStartMs = Math.min(observationBounds.headStartMs, aqiBounds.headStartMs - request.contextHours * HOUR_MS);
-  const overlapEndMs = Math.min(request.endMs, Math.max(observationContextStartMs + HOUR_MS, Date.parse(direct.start_utc) + policy.observationOverlapHours * HOUR_MS));
-  const r2Observations = await readR2Observations({ env, identity: request, startMs: observationContextStartMs, endMs: overlapEndMs });
+  // The bounded overlap is anchored to actual returned ingest coverage. A
+  // retention hint selects the RPC window but never becomes this boundary.
+  const actualDirectStartMs = Date.parse(String(direct.actual_start_utc ?? ""));
+  const r2ObservationEndMs = Number.isFinite(actualDirectStartMs)
+    ? Math.min(request.endMs, Math.max(observationContextStartMs + HOUR_MS, actualDirectStartMs + policy.observationOverlapHours * HOUR_MS))
+    : request.endMs;
+  const r2Observations = await readR2Observations({ env, identity: request, startMs: observationContextStartMs, endMs: r2ObservationEndMs });
   const mergedObservations = mergeObservationRowsPreferR2({ r2Rows: r2Observations.rows, ingestRows: direct.rows });
   const calculationRows = dedupeSourceObservationRows(mergedObservations.rows);
   const outputObservations = mergedObservations.rows.filter((row) => {
@@ -316,7 +374,19 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
     return ms >= observationBounds.headStartMs && ms < request.endMs;
   });
   const observationGaps = missingHourRanges(outputObservations, observationBounds.headStartMs, request.endMs, "observed_at");
-  const observationsComplete = direct.response_complete && r2Observations.response_complete && observationGaps.length === 0;
+  const observationR2AssignedEndMs = assignedR2SegmentEndMs(direct, observationBounds.headStartMs, request.endMs);
+  const observationR2AssignedRowsComplete = r2SegmentComplete(
+    r2Observations.rows,
+    observationBounds.headStartMs,
+    observationR2AssignedEndMs,
+    "observed_at",
+  );
+  const observationR2AssignedComplete = observationR2AssignedRowsComplete
+    && (observationR2AssignedEndMs < request.endMs || r2Observations.response_complete);
+  const directObservationTailRequired = outputObservations.some((row) => row.source === "ingest");
+  const observationsComplete = observationR2AssignedComplete
+    && (!directObservationTailRequired || direct.response_complete)
+    && observationGaps.length === 0;
 
   let mergedAqi = { rows: [], overlap_count: 0, mismatch_count: 0, mismatch_hours: [] };
   let liveRows = [];
@@ -334,15 +404,31 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
     const remaining = missingAqiHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs);
     aqiAvailability = aqiAvailabilityDiagnostics(mergedAqi.rows);
     const liveSourceComplete = missing.length === 0 || direct.response_complete;
-    aqiComplete = r2ResponseComplete(r2Payload) && liveSourceComplete
+    // A partial R2 response is only a fault for the R2 segment assigned to it.
+    // Its deliberately live-calculated tail is evaluated after the merge.
+    const aqiR2AssignedEndMs = assignedR2SegmentEndMs(direct, aqiBounds.headStartMs, aqiBounds.headEndMs);
+    const aqiR2AssignedComplete = r2AqiSegmentComplete(r2AqiRows, aqiBounds.headStartMs, aqiR2AssignedEndMs)
+      && (aqiR2AssignedEndMs < aqiBounds.headEndMs || r2ResponseComplete(r2Payload));
+    aqiComplete = aqiR2AssignedComplete && liveSourceComplete
       && remaining.length === 0 && aqiAvailabilityComplete(aqiAvailability);
   }
 
   const aqiHeadStartUtc = new Date(aqiBounds.headStartMs).toISOString();
   const observationHeadStartUtc = new Date(observationBounds.headStartMs).toISOString();
   const aqiGaps = request.includeAqi ? missingAqiHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs) : [];
+  const r2AqiCoverage = sourceRowCoverage(r2AqiRows, "timestamp_hour_utc");
+  const r2ObservationCoverage = sourceRowCoverage(r2Observations.rows, "observed_at");
+  const aqiR2AssignedEndMs = request.includeAqi
+    ? assignedR2SegmentEndMs(direct, aqiBounds.headStartMs, aqiBounds.headEndMs)
+    : null;
+  const aqiR2AssignedComplete = request.includeAqi
+    ? r2AqiSegmentComplete(r2AqiRows, aqiBounds.headStartMs, aqiR2AssignedEndMs)
+      && (aqiR2AssignedEndMs < aqiBounds.headEndMs || r2ResponseComplete(r2Payload))
+    : null;
+  const verifiedObservationOverlapRowCount = mergedObservations.discarded_ingest_overlap_count;
+  const verifiedAqiOverlapRowCount = mergedAqi.overlap_count;
   const sourceMode = request.includeAqi ? "stable_r2_live_head" : "r2_ingest_observations_head";
-  console.log(JSON.stringify({ event: "station_series_source_merge", timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, r2_aqi_rows: r2AqiRows.length, live_aqi_rows: liveRows.length, r2_observation_rows: r2Observations.rows.length, ingest_observation_rows: outputObservations.filter((row) => row.source === "ingest").length, discarded_ingest_observation_overlap_count: mergedObservations.discarded_ingest_overlap_count, aqi_overlap_count: mergedAqi.overlap_count, aqi_mismatch_count: mergedAqi.mismatch_count, aqi_mismatch_hours: mergedAqi.mismatch_hours, aqi_complete: aqiComplete, observations_complete: observationsComplete }));
+  console.log(JSON.stringify({ event: "station_series_source_merge", timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, r2_aqi_rows: r2AqiRows.length, live_aqi_rows: liveRows.length, r2_observation_rows: r2Observations.rows.length, ingest_observation_rows: outputObservations.filter((row) => row.source === "ingest").length, verified_observation_overlap_row_count: verifiedObservationOverlapRowCount, verified_aqi_overlap_row_count: verifiedAqiOverlapRowCount, aqi_mismatch_count: mergedAqi.mismatch_count, aqi_mismatch_hours: mergedAqi.mismatch_hours, direct_ingest_actual_start_utc: direct.actual_start_utc, direct_ingest_actual_end_utc: direct.actual_end_utc, r2_aqi_actual_end_utc: r2AqiCoverage.actual_end_utc, r2_observations_actual_end_utc: r2ObservationCoverage.actual_end_utc, aqi_complete: aqiComplete, observations_complete: observationsComplete }));
   return {
     schema_version: 1,
     request: requestFields(request),
@@ -350,10 +436,25 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
       mode: (request.includeAqi ? aqiComplete : true) && observationsComplete ? sourceMode : `${sourceMode}_incomplete`,
       required_context_start_utc: new Date(aqiBounds.headStartMs - request.contextHours * HOUR_MS).toISOString(),
       output_start_utc: new Date(Math.min(aqiBounds.headStartMs, observationBounds.headStartMs)).toISOString(), output_end_utc: new Date(request.endMs).toISOString(),
-      direct_ingest_start_utc: direct.start_utc, direct_ingest_end_utc: direct.end_utc,
       aqi_r2_coverage_end_utc: latestR2AqiCoverageEnd(r2AqiRows),
-      observations_r2_coverage_end_utc: r2Observations.response_complete ? r2Observations.end_utc : null,
-      observation_overlap_start_utc: direct.start_utc,
+      observations_r2_coverage_end_utc: latestHourlyCoverageEnd(r2Observations.rows, "observed_at"),
+      observation_overlap_start_utc: direct.actual_start_utc,
+      configured_ingest_retention_days: policy.ingestRetentionDays,
+      configured_ingest_retention_hint_start_utc: new Date(nowMs - policy.ingestRetentionDays * DAY_MS).toISOString(),
+      r2_aqi_actual_start_utc: r2AqiCoverage.actual_start_utc,
+      r2_aqi_actual_end_utc: r2AqiCoverage.actual_end_utc,
+      r2_observations_actual_start_utc: r2ObservationCoverage.actual_start_utc,
+      r2_observations_actual_end_utc: r2ObservationCoverage.actual_end_utc,
+      r2_aqi_assigned_end_utc: request.includeAqi ? new Date(aqiR2AssignedEndMs).toISOString() : null,
+      r2_aqi_assigned_complete: aqiR2AssignedComplete,
+      r2_observations_assigned_end_utc: new Date(observationR2AssignedEndMs).toISOString(),
+      r2_observations_assigned_complete: observationR2AssignedComplete,
+      observation_seam_gap_hour_count: observationGaps.length,
+      aqi_seam_gap_hour_count: aqiGaps.length,
+      seam_gap_hour_count: seamGapHourCount({ aqiGaps, observationGaps }),
+      verified_observation_overlap_row_count: verifiedObservationOverlapRowCount,
+      verified_aqi_overlap_row_count: verifiedAqiOverlapRowCount,
+      verified_overlap_row_count: verifiedObservationOverlapRowCount + verifiedAqiOverlapRowCount,
       ingest_response_complete: direct.response_complete,
       r2_aqi_response_complete: r2Payload ? r2ResponseComplete(r2Payload) : null,
       r2_observations_response_complete: r2Observations.response_complete,
@@ -390,13 +491,16 @@ export async function buildStationSeries(request, env, nowMs = Date.now()) {
   const aqiBounds = resolveStableHeadBounds(request, policy.stableAqiHeadMaxHours);
   const observationBounds = resolveStableHeadBounds(request, policy.observationChunkMaxHours);
   const requiredStartMs = Math.min(observationBounds.headStartMs, aqiBounds.headStartMs - request.contextHours * HOUR_MS);
-  const retentionStartMs = nowMs - policy.ingestRetentionDays * DAY_MS;
+  const retentionHintStartMs = nowMs - policy.ingestRetentionDays * DAY_MS;
   const latestPossibleStartMs = request.endMs - HOUR_MS;
-  const directStartMs = Math.min(Math.max(requiredStartMs, retentionStartMs), latestPossibleStartMs);
-  const direct = await readDirectIngestObservations({ env, identity: request, startMs: directStartMs, endMs: request.endMs, nowMs, timeoutMs: policy.obsAqiDbTimeoutMs });
-  const capability = ingestCapability({ request, direct, aqiBounds, observationBounds, retentionStartMs });
-  if (capability.qualifies) return buildIngestOnlyResponse(request, direct, capability);
-  return buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds);
+  // Retention is a capability hint, not a per-series source boundary. Retain
+  // every usable row the direct RPC returns in the genuinely required interval.
+  const directStartMs = Math.min(requiredStartMs, latestPossibleStartMs);
+  const rpcWindowStartMs = Math.min(Math.max(requiredStartMs, retentionHintStartMs), latestPossibleStartMs);
+  const direct = await readDirectIngestObservations({ env, identity: request, startMs: directStartMs, rpcWindowStartMs, endMs: request.endMs, nowMs, timeoutMs: policy.obsAqiDbTimeoutMs });
+  const capability = ingestCapability({ request, direct, aqiBounds, observationBounds });
+  if (capability.qualifies) return buildIngestOnlyResponse(request, direct, capability, policy, nowMs);
+  return buildR2LiveResponse(request, env, policy, direct, aqiBounds, observationBounds, nowMs);
 }
 
 async function fetchJsonUpstream(target, secret, failureCode) {
