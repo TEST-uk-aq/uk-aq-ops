@@ -1,4 +1,5 @@
 import { normalizePollutantCode } from "../../../lib/aqi/aqi_levels.mjs";
+import { canonicalAqiHourStarts } from "./stable_head.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 export const AQI_CHUNK_MAX_HOURS = 31 * 24;
@@ -83,7 +84,7 @@ export function buildAqiHistoryChunk(chunk, payload, nowMs = Date.now()) {
     if (!previous) rowsByKey.set(key, row);
   }
   const rows = Array.from(rowsByKey.values()).sort((left, right) => left.period_start_utc.localeCompare(right.period_start_utc));
-  const expectedHours = Math.ceil((chunk.endMs - chunk.startMs) / HOUR_MS);
+  const expectedHours = canonicalAqiHourStarts(chunk.startMs, chunk.endMs).length;
   const upstreamComplete = payload?.response_complete !== false && payload?.meta?.response_complete !== false;
   const complete = upstreamComplete && conflictingDuplicateCount === 0 && rows.length === expectedHours;
   const cacheClass = classifyChunk(chunk.endMs, nowMs);

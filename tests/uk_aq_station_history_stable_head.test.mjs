@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildStationSeries } from "../workers/uk_aq_station_history/src/index.mjs";
-import { mergeStableAqiHead, normalizeExactR2AqiRows } from "../workers/uk_aq_station_history/src/stable_head.mjs";
+import { canonicalAqiHourStarts, mergeStableAqiHead, missingHeadHours, normalizeExactR2AqiRows } from "../workers/uk_aq_station_history/src/stable_head.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const requestIdentity = { timeseriesId: 7, connectorId: 2, pollutant: "pm25" };
@@ -10,6 +10,27 @@ const bounds = { headStartMs: Date.parse("2026-07-01T00:00:00.000Z"), headEndMs:
 function aqi(hour, source, daqi = 2, eaqi = 3) {
   return { timeseries_id: 7, connector_id: 2, station_id: 9, pollutant_code: "pm25", timestamp_hour_utc: hour, daqi_index_level: daqi, eaqi_index_level: eaqi, daqi_calculation_status: "ok", eaqi_calculation_status: "ok", source };
 }
+
+test("canonical AQI hours use the first UTC hour start inside exact bounds", () => {
+  assert.deepEqual(
+    canonicalAqiHourStarts(Date.parse("2026-07-16T10:00:00.000Z"), Date.parse("2026-07-16T12:16:34.527Z"))
+      .map((hourMs) => new Date(hourMs).toISOString()),
+    ["2026-07-16T10:00:00.000Z", "2026-07-16T11:00:00.000Z", "2026-07-16T12:00:00.000Z"],
+  );
+  assert.deepEqual(
+    canonicalAqiHourStarts(Date.parse("2026-07-16T10:16:34.527Z"), Date.parse("2026-07-16T12:00:00.000Z"))
+      .map((hourMs) => new Date(hourMs).toISOString()),
+    ["2026-07-16T11:00:00.000Z"],
+    "an exact hour end remains exclusive",
+  );
+  assert.deepEqual(
+    missingHeadHours([], {
+      headStartMs: Date.parse("2026-07-16T10:16:34.527Z"),
+      headEndMs: Date.parse("2026-07-16T12:16:34.527Z"),
+    }),
+    ["2026-07-16T11:00:00.000Z", "2026-07-16T12:00:00.000Z"],
+  );
+});
 
 test("matching R2/live overlap returns one authoritative R2 row", () => {
   const hour = "2026-07-01T00:00:00.000Z";
@@ -106,6 +127,67 @@ test("one bounded PM ingest bundle supplies the stable head observations and liv
   assert.equal(result.body.observations.rows.length, 168);
   assert.equal(result.body.source.discarded_ingest_observation_overlap_count, 2);
   assert.equal(result.body.source.live_calculation_observation_sources.r2, 2);
+  const observationsTarget = new URL(result.targets[2]);
+  assert.equal(observationsTarget.searchParams.get("scope"), "timeseries");
+  assert.equal(observationsTarget.searchParams.get("format"), "objects");
+});
+
+test("non-hour-aligned stable-head bounds retain a canonical live-calculated R2 gap", async () => {
+  const originalFetch = globalThis.fetch;
+  const endIso = "2026-07-08T00:16:34.527Z";
+  const firstExpectedHour = "2026-07-01T01:00:00.000Z";
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("uk_aq_timeseries_rpc")) {
+      return new Response(JSON.stringify(rpcPayload(observationRows("2026-06-30T02:00:00.000Z", 191))), { status: 200 });
+    }
+    if (url.includes("aqi-r2.example")) {
+      return new Response(JSON.stringify({
+        points: r2Rows(firstExpectedHour, 168, 167),
+        response_complete: true,
+        coverage: { r2_expected_hour_coverage: { complete: false } },
+      }), { status: 200 });
+    }
+    if (url.includes("observs-r2.example")) {
+      return new Response(JSON.stringify({
+        timeseries_id: 7,
+        connector_id: 2,
+        pollutant: "pm25",
+        response_complete: true,
+        rows: observationRows("2026-06-30T02:00:00.000Z", 2).map((row) => ({ observed_at: row.observed_at_utc, value: row.value })),
+      }), { status: 200 });
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+  try {
+    const request = {
+      timeseriesId: 7,
+      connectorId: 2,
+      stationId: 9,
+      pollutant: "pm25",
+      startMs: Date.parse("2026-06-24T00:16:34.527Z"),
+      endMs: Date.parse(endIso),
+      contextHours: 23,
+      contextStartMs: Date.parse("2026-06-23T01:16:34.527Z"),
+      includeAqi: true,
+      window: "14d",
+    };
+    const body = await buildStationSeries(request, {
+      SUPABASE_URL: "https://ingest.example",
+      SB_SECRET_KEY: "ingest-key",
+      INGESTDB_RETENTION_DAYS: "31",
+      UK_AQ_EDGE_UPSTREAM_SECRET: "secret",
+      UK_AQ_AQI_HISTORY_R2_API_URL: "https://aqi-r2.example/v1/aqi-history",
+      UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observs-r2.example/v1/observations",
+    }, Date.parse("2026-07-08T00:30:00.000Z"));
+    const live = body.aqi.rows.find((row) => row.source === "live_calculated");
+    assert.ok(live, "the ingest-period row is not rejected by an unaligned expected key");
+    assert.equal(live.timestamp_hour_utc, "2026-07-08T00:00:00.000Z");
+    assert.equal(body.aqi.rows.length, 168);
+    assert.equal(body.aqi.gap_ranges.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("PM live calculation retains EAQI when DAQI rolling context is incomplete", async () => {

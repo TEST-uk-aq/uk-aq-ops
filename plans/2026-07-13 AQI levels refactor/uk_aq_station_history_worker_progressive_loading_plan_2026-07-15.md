@@ -110,6 +110,68 @@ in-flight deduplication and completed-request bookkeeping, but are not the sole
 coverage representation. Interval subtraction determines missing work, so a
 chunk-boundary change cannot refetch an already covered interval.
 
+#### E. Bounded parallel progressive fetching
+
+Historical progressive loading MUST use bounded parallel network fetching. It
+must not issue every AQI or observation history request serially when multiple
+independent chunks are required.
+
+1. Fetch and render the newest missing chunk first.
+2. After the newest missing chunk has settled, allow a small bounded number of
+   older chunks to be fetched concurrently.
+3. Preserve newest-to-oldest visible commit order even when network responses
+   complete out of order.
+4. A failed or partial newer chunk remains a visible, retryable gap but does
+   not permanently prevent successful older chunks from being committed.
+5. AQI and observation history streams remain independent and may fetch in
+   parallel.
+6. Observation history for separate selected sensors may fetch concurrently,
+   subject to an overall bounded request limit.
+7. Reuse the existing legacy queue and concurrency mechanisms where practical.
+8. Do not introduce unbounded `Promise.all()` over every historical chunk.
+9. Do not duplicate requests already covered by the page-session interval
+   cache.
+10. Preserve successful rows and intervals when another request fails.
+11. Coalesce rapid successive chart updates so multiple responses do not cause
+    unnecessary full redraws.
+12. Performance improvements must not weaken stable-head AQI no-replacement,
+    R2 source precedence, partial-chunk retry behaviour, cache completeness or
+    newest-to-oldest visual extension.
+
+#### F. Canonical hourly AQI identity
+
+Every hourly AQI comparison, expected-hour calculation, missing-hour
+calculation, gap calculation and merge key MUST use canonical UTC hour-start
+timestamps.
+
+1. Exact requested chart bounds may retain minutes, seconds and milliseconds.
+2. AQI identities use UTC hour starts such as `2026-07-16T00:00:00.000Z`.
+3. The first expected AQI hour is the first canonical hour start that falls
+   inside the exact requested interval: use the exact start when it is already
+   hour-aligned, otherwise use the next UTC hour start.
+4. The end bound remains exclusive.
+5. Expected-hour generation uses the same canonical grid as R2 AQI
+   normalisation, live AQI calculation, canonical AQI keys and the final merge.
+6. Never compare a whole-hour calculated timestamp with an expected key that
+   retains arbitrary request minutes, seconds or milliseconds.
+7. Observation timestamp precision and observation coverage semantics remain
+   unchanged by this AQI-specific correction.
+
+#### G. Independent AQI and observation head bounds
+
+The browser MUST treat these Worker fields as independent contracts:
+
+- `aqi.stable_head_start_utc`;
+- `aqi.stable_head_end_utc`;
+- `observations.stable_head_start_utc`;
+- `observations.stable_head_end_utc`.
+
+AQI bounds must not be used to replace an observation head, record observation
+coverage, choose the next older observation cursor, or decide whether
+observation history is already covered. Primary and secondary selected series
+use their own explicit observation bounds and next-boundary fields, including
+observations-only station-series responses.
+
 
 ## 2. Decisions already made
 
