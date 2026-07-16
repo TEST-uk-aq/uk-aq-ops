@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import observsHistoryWorker from "../workers/uk_aq_observs_history_r2_api_worker/worker.mjs";
+import observsHistoryWorker, {
+  buildCanonicalCacheKey,
+  isCompleteGapFreeObservationsResponse,
+  resolveCachePolicy,
+} from "../workers/uk_aq_observs_history_r2_api_worker/worker.mjs";
 
 const workerSource = readFileSync(
   "workers/uk_aq_observs_history_r2_api_worker/worker.mjs",
@@ -97,6 +101,96 @@ function metadataRequest(timeseriesId = 3742) {
 test("observations Worker preserves optional parquet observation status", () => {
   assert.match(workerSource, /schemaColumns\.includes\("status"\)/);
   assert.match(workerSource, /status: idx < statusValues\.length/);
+});
+
+test("observations Cache API eligibility requires complete, gap-free coverage", () => {
+  const complete = {
+    response_complete: true,
+    has_gap: false,
+    coverage_state: "complete",
+    partial_reasons: [],
+    coverage: {
+      response_complete: true,
+      has_gap: false,
+      coverage_state: "complete",
+      partial_reasons: [],
+      timeseries_index: {},
+    },
+  };
+  assert.equal(isCompleteGapFreeObservationsResponse(complete), true);
+  assert.match(workerSource, /if \(response\.ok && eligibility\.cache_eligible\)/, "only an eligible complete response reaches Cache API put");
+  assert.equal(isCompleteGapFreeObservationsResponse({ ...complete, response_complete: false }), false);
+  assert.equal(isCompleteGapFreeObservationsResponse({ ...complete, has_gap: true }), false);
+  assert.equal(isCompleteGapFreeObservationsResponse({ ...complete, partial_reasons: ["missing_manifest"] }), false);
+  assert.equal(isCompleteGapFreeObservationsResponse({
+    ...complete,
+    coverage: { ...complete.coverage, response_complete: false },
+  }), false);
+  assert.equal(isCompleteGapFreeObservationsResponse({
+    ...complete,
+    coverage: { ...complete.coverage, partial_reasons: ["missing_connector_manifest"] },
+  }), false);
+  assert.equal(isCompleteGapFreeObservationsResponse({
+    ...complete,
+    coverage: { ...complete.coverage, timeseries_index: { warnings: ["index_warning"] } },
+  }), false);
+  assert.equal(isCompleteGapFreeObservationsResponse(null), false, "malformed payloads are never cache eligible");
+});
+
+test("observations Cache API keys use the corrected cache generation and retain TTL classes", () => {
+  const cacheKey = buildCanonicalCacheKey("https://example.test/?ignored=yes", {
+    timeseriesId: 1001,
+    connectorId: 396,
+    pollutantKey: "pm25",
+    startIso: "2026-04-03T00:00:00.000Z",
+    endIso: "2026-04-04T00:00:00.000Z",
+    sinceIso: null,
+    limit: null,
+  }, "v2");
+  const url = new URL(cacheKey.url);
+  assert.equal(url.searchParams.get("__ukaq_observs_history_cache_gen"), "2");
+  assert.notEqual(url.searchParams.get("__ukaq_observs_history_cache_gen"), "1");
+  assert.doesNotMatch(workerSource, /OBSERVATIONS_CACHE_GENERATION = "1"/, "old-generation Cache API keys are not read by the new code");
+  const env = {
+    UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS: "300",
+    UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS: "86400",
+  };
+  assert.deepEqual(resolveCachePolicy(env, "2020-01-01T00:00:00.000Z"), {
+    cacheSeconds: 86400,
+    cacheScope: "immutable",
+  });
+  assert.deepEqual(resolveCachePolicy(env, new Date(Date.now() + 60 * 60 * 1000).toISOString()), {
+    cacheSeconds: 300,
+    cacheScope: "recent",
+  });
+});
+
+test("partial and invalid observation responses are no-store and never seed Cache API", async () => {
+  const harness = installHarness({});
+  try {
+    const response = await observsHistoryWorker.fetch(observationRequest(), harness.env, harness.ctx);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.equal(response.headers.get("x-ukaq-cache-eligible"), "false");
+    assert.equal(response.headers.get("x-ukaq-cache-generation"), "2");
+    const payload = await response.json();
+    assert.equal(payload.response_complete, false);
+    assert.equal(payload.has_gap, true);
+    assert.ok(Array.isArray(payload.rows), "partial responses retain their valid rows contract");
+
+    const invalid = await observsHistoryWorker.fetch(
+      new Request("https://example.test/v1/observations", {
+        headers: { "x-uk-aq-upstream-auth": "test-upstream-secret" },
+      }),
+      harness.env,
+      harness.ctx,
+    );
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.headers.get("Cache-Control"), "no-store");
+  } finally {
+    await harness.restore();
+  }
+  assert.equal(harness.cachePutCalls.length, 0);
 });
 
 test("observations Worker v1 default uses configured v1 prefix and v1 index", async () => {

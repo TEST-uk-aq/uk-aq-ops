@@ -110,11 +110,11 @@ in-flight deduplication and completed-request bookkeeping, but are not the sole
 coverage representation. Interval subtraction determines missing work, so a
 chunk-boundary change cannot refetch an already covered interval.
 
-#### E. Bounded parallel progressive fetching
+#### E. Bounded parallel fetching within a historical phase
 
-Historical progressive loading MUST use bounded parallel network fetching. It
-must not issue every AQI or observation history request serially when multiple
-independent chunks are required.
+Each historical phase MUST use bounded parallel network fetching. It must not
+issue every chunk in that phase serially when multiple independent chunks are
+required.
 
 1. Fetch and render the newest missing chunk first.
 2. After the newest missing chunk has settled, allow a small bounded number of
@@ -123,9 +123,10 @@ independent chunks are required.
    complete out of order.
 4. A failed or partial newer chunk remains a visible, retryable gap but does
    not permanently prevent successful older chunks from being committed.
-5. AQI and observation history streams remain independent and may fetch in
-   parallel.
-6. Observation history for separate selected sensors may fetch concurrently,
+5. The observation phase begins only after the AQI phase has settled; AQI and
+   observation history must not make new network requests concurrently.
+6. Observation history for separate selected sensors may fetch concurrently
+   within the observation phase,
    subject to an overall bounded request limit.
 7. Reuse the existing legacy queue and concurrency mechanisms where practical.
 8. Do not introduce unbounded `Promise.all()` over every historical chunk.
@@ -137,6 +138,69 @@ independent chunks are required.
 12. Performance improvements must not weaken stable-head AQI no-replacement,
     R2 source precedence, partial-chunk retry behaviour, cache completeness or
     newest-to-oldest visual extension.
+
+### Historical AQI-first staged loading
+
+Historical loading has two strict, sequential network phases after the recent
+station-series head is rendered:
+
+1. **Historical AQI phase.** Fetch missing AQI chunks newest to oldest, with
+   bounded concurrency and newest-to-oldest visible commits. A complete,
+   partial, or failed chunk is settled. Partial rows remain visible and
+   retryable; a failed or partial chunk leaves a visible retryable gap but does
+   not prevent older AQI work from settling.
+2. **Historical observation phase.** Only after the AQI phase settles, fetch
+   missing observation chunks newest to oldest, with bounded concurrency and
+   newest-to-oldest visible commits. Recent observations already rendered from
+   station-series remain visible while AQI extends backwards.
+
+No historical observation network request may start while any historical AQI
+work for the current load token remains unsettled. Cached historical rows may
+hydrate memory immediately, but new observation requests and visible commits
+from newly fetched observation chunks wait for AQI settlement. The secondary
+series observation phase follows the same rule.
+
+| Historical loading order | Requirement |
+|---|---|
+| Recent head | Render the stable AQI head, then recent observations. |
+| Historical AQI | Fetch and commit newest to oldest with bounded concurrency. |
+| Historical observations | Start only after AQI settles; fetch and commit newest to oldest with bounded concurrency. |
+
+### Historical observation loading progress
+
+The Hex Map MUST use the established `ChartCore.renderProgressBar()` beneath
+the AQI bands while historical observation chunks are outstanding. It is not
+shown for the AQI-only phase.
+
+- Create it immediately before the historical observation network phase, only
+  when more than zero observation chunks remain uncovered.
+- Track the total scheduled historical observation chunks across every
+  selected series. Complete, partial, and failed chunks all count as settled
+  network work and advance progress, even when ordered visible commits remain
+  buffered.
+- Remove and clear it when the observation phase settles, the load is aborted,
+  the load token changes, chart mode is left, an error exits the load, or the
+  chart frame is replaced.
+- Do not create it for fully page-session-covered observations or for an
+  AQI-only source change with no observation work. Do not introduce a second
+  progress indicator or obstruct the chart.
+
+### R2 observations Worker Cache API eligibility
+
+The R2 observations Worker may write a Cache API entry only for a complete,
+gap-free response. Eligibility requires an object payload with
+`response_complete === true`, `has_gap !== true`, no false or gap state in its
+coverage-level completeness contract, and no top-level or coverage-level
+partial reasons. Any nested index or manifest partial state that reports a gap
+also makes the response ineligible.
+
+Partial responses remain useful and retryable: retain valid rows, return
+`Cache-Control: no-store`, and do not write them to `caches.default`.
+Non-2xx, malformed, explicit-error, incomplete, gap, and partial-reason
+responses are likewise never cached. Complete mutable and immutable TTL
+policies remain unchanged. Every R2 observations Cache API key includes a
+code-owned cache-generation component so this correction makes prior entries
+unreachable without enumerating or deleting them.
 
 #### F. Canonical hourly AQI identity
 
@@ -193,7 +257,7 @@ No further user decision is required before starting this plan.
 | AQI precedence | R2 AQI wins over live-calculated AQI |
 | Observation precedence | R2 observations win over ingest observations |
 | Mid-load AQI replacement | Forbidden |
-| Historical loading order | AQI gets first visual render and higher priority; both AQI and observation chunks proceed newest first without waiting for all AQI history to finish |
+| Historical loading order | Stable head first; historical AQI settles newest first before historical observations begin newest first |
 | Website x-axis | Fixed to the full requested range before chunks arrive |
 | Cache migration | Keep public-response cache ownership in the gateway initially |
 | Stale behaviour | Implement deliberately, not by relying on unsupported Cache API directives |
@@ -521,9 +585,9 @@ R2 is not touched when ingest fully covers the required context and output inter
 3. Website:
    a. fixes the full requested x-axis;
    b. renders AQI from the stable head;
-   c. starts older R2 AQI chunks, newest first;
-   d. renders recent observations from the same head response;
-   e. starts older R2 observation chunks, newest first.
+   c. renders recent observations from the same head response;
+   d. starts and settles older R2 AQI chunks, newest first;
+   e. only then starts older R2 observation chunks, newest first.
 
 4. Each older chunk extends backwards only.
 ```
@@ -1491,11 +1555,11 @@ station-series response
   -> start older observation chunks, newest first
 ```
 
-The website may render recent observations immediately after starting the first
-AQI chunk request. It must not wait for every older AQI chunk to finish before
-starting older observation chunks. AQI remains the first visual layer and has
-higher loading priority; historical observation loading proceeds independently
-once the recent head has been rendered.
+The website renders recent observations immediately after the stable AQI head.
+It then settles every scheduled historical AQI chunk before starting historical
+observation requests. AQI remains the first visual layer and the full
+historical AQI phase has higher loading priority; partial and failed AQI chunks
+are settled retryable gaps and therefore do not deadlock the observation phase.
 
 ## Website state
 
@@ -1536,7 +1600,8 @@ New load order:
 3. Render the stable AQI head first.
 4. Start older `/api/aq/aqi-history` chunks, newest first.
 5. Render recent observations from the station-series response.
-6. Start older `/api/aq/timeseries` chunks, newest first.
+6. After the older AQI phase settles, start older `/api/aq/timeseries` chunks,
+   newest first.
 7. Merge and render each successful chunk incrementally.
 
 Rules:
@@ -1611,7 +1676,7 @@ The Hex Map supports up to four selected observation series but displays AQI ban
 * load recent observations for every selected series;
 * render the current AQI head first;
 * render recent observation lines immediately afterwards;
-* extend AQI and observations backwards independently;
+* extend AQI backwards first, then extend observations backwards;
 * preserve the current multi-sensor chart behaviour;
 * retain the existing loader as a TEST rollback path.
 
@@ -1668,12 +1733,14 @@ Required loading sequence:
 5. Obtain recent observations for every other selected series.
 6. Start older AQI-history chunks for the AQI-source series, newest first.
 7. Start older observation-history chunks for all selected series, newest first.
-8. Allow older AQI and observation loading to proceed independently.
+8. Settle older AQI-history chunks before starting older observation-history
+   chunks.
 9. Extend data backwards only.
 10. Never replace an AQI hour already delivered by the stable head.
 
-Do not wait for every historical AQI chunk to finish before starting or
-rendering historical observations.
+Do not start a historical observation request until the historical AQI phase
+has settled. Recent observations returned by station-series continue to render
+while AQI history is loading.
 
 Multi-series behaviour:
 
@@ -1782,7 +1849,7 @@ Longer ranges:
 - render all available recent observation heads immediately after that first
   AQI paint;
 - start AQI history before observation history;
-- observation history may continue while AQI history is still in flight;
+- start observation history only after AQI history has settled;
 - process chunks newest first;
 - preserve the fixed full-range x-axis;
 - avoid broad parallel request floods;
@@ -1844,7 +1911,7 @@ Add focused checks for:
 8. conflicting overlap retains the displayed stable-head value;
 9. fixed x-axis throughout progressive loading;
 10. 12h and 24h make no R2 requests when ingest coverage is sufficient;
-11. AQI and observation histories proceed independently after first paint;
+11. AQI history settles before the observation-history phase begins;
 12. one failed series or chunk does not remove successful series;
 13. warm historical cache does not render ahead of current recent data;
 14. failed current request visibly marks cached data as stale;
@@ -2031,7 +2098,7 @@ Confirm:
 - no colour changes during one load;
 - older AQI extends backwards;
 - recent observations render after the initial AQI paint; older observation
-  chunks may proceed while older AQI chunks remain in flight;
+  chunks begin only after older AQI chunks settle;
 - a warm older browser cache does not hide the current recent head;
 - fixed x-axis;
 - chunk retries are bounded;
@@ -2237,7 +2304,7 @@ The plan is complete when TEST operations show all of the following.
 
 - AQI renders before observations;
 - x-axis is stable;
-- AQI chunks load before observation chunks;
+- AQI chunks settle before observation chunks begin;
 - chunks load newest first;
 - failed chunks retry independently;
 - successful chunks are retained;
