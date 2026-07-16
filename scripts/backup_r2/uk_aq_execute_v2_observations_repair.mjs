@@ -85,7 +85,7 @@ function jsonObject(object, key) {
   }
 }
 
-async function readChildren({
+export async function readChildren({
   store,
   prefix,
   dayUtc,
@@ -285,7 +285,11 @@ function localDependencySnapshot({ child, proposals, prefix, dayUtc, connectorId
 
 export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
   const proposals = new Map();
-  const allowedDropboxSourceKeys = new Set(dropboxSourceKeys.map(safeLocalKey));
+  // `dropboxSourceKeys` identifies exact source leaves for targeted index
+  // repairs. It must not make a valid combined-local leaf invisible to
+  // connector/day discovery: a simultaneous parent rebuild needs every valid
+  // sibling. readChildren still validates every manifest before use.
+  void dropboxSourceKeys;
   const indexProposalKind = (key) => key.includes("/timeseries_id=")
     ? "timeseries_metadata"
     : key.endsWith("_latest.json")
@@ -356,12 +360,7 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
         return object ? { exists: true, key, bytes: object.bytes, etag: null, content_sha256: object.content_sha256 } : { exists: false, key };
       },
       listAllObjects: async ({ prefix, max_keys }) => {
-      const entries = store.listAllObjects({ prefix, max_keys })
-        // Exact Dropbox leaves requested solely for a targeted index repair
-        // must not become a parent child. Every ordinary valid sibling
-        // manifest, including O3, remains discoverable for connector/day
-        // rebuilds from the combined overlay/Dropbox view.
-        .filter((entry) => !allowedDropboxSourceKeys.has(entry.key) || proposals.has(entry.key));
+        const entries = store.listAllObjects({ prefix, max_keys });
         const byKey = new Map(entries.map((entry) => [entry.key, entry]));
         for (const proposal of proposals.values()) {
           if (proposal.key.startsWith(prefix)) {
@@ -774,6 +773,7 @@ export async function applyStagedProposals({
   putObject = r2PutObject,
   getObject = r2GetObject,
   onProgress = null,
+  blockedCount = 0,
 }) {
   const operationCounts = {
     r2_get_before_put_count: 0,
@@ -802,7 +802,7 @@ export async function applyStagedProposals({
       successful_put_count: operationCounts.r2_put_count,
       successful_readback_verification_count: operationCounts.r2_get_after_put_verification_count,
       failures,
-      blocked_count: 0,
+      blocked_count: blockedCount,
     });
   };
   reportProgress("metadata_application_start", 0);
@@ -1386,6 +1386,7 @@ export async function runV2ObservationsRepair({
     proposals: staged.proposals,
     writeR2: args.writeR2,
     onProgress: reportProgress,
+    blockedCount: blockedScopes.length,
   });
   const applied = appliedResult.results;
   const proposalViews = [...staged.proposals.values()].map(proposalView).sort((left, right) => left.key.localeCompare(right.key));
