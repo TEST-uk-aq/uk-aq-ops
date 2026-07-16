@@ -8122,15 +8122,49 @@ def _append_child_hash_gaps(
         gaps.append(gap)
 
 
-def _rel_key_to_path(root: Path, key: str) -> Path | None:
-    raw = str(key).strip().lstrip("/")
-    if not raw:
+def _resolve_canonical_history_object_key(
+    root: Path,
+    key: str,
+    *,
+    allowed_real_roots: Iterable[Path] = (),
+) -> Path | None:
+    """Resolve a canonical ``history/...`` object without permitting escapes.
+
+    The final-verification view is intentionally sparse and may contain
+    symlinks into the verified overlay or the Dropbox mirror.  Validate both
+    the logical view path and the resolved target: the former keeps a supplied
+    R2 key below the selected view, while the latter must remain below either
+    that view or one of its explicitly trusted backing roots.
+    """
+    raw = str(key).strip()
+    if (
+        not raw
+        or raw.startswith("/")
+        or not raw.startswith("history/")
+        or any(part in {"", ".", ".."} for part in raw.split("/"))
+    ):
         return None
-    root_resolved = root.resolve()
-    candidate = (root_resolved / raw).resolve()
+    root_path = root.absolute()
+    candidate = root_path / raw
     try:
-        candidate.relative_to(root_resolved)
+        candidate.relative_to(root_path)
     except ValueError:
+        return None
+
+    trusted_roots = [root_path.resolve()]
+    for allowed_root in allowed_real_roots:
+        try:
+            trusted_roots.append(allowed_root.resolve())
+        except OSError:
+            return None
+    try:
+        resolved_candidate = candidate.resolve()
+    except OSError:
+        return None
+    if not any(
+        resolved_candidate.is_relative_to(trusted_root)
+        for trusted_root in trusted_roots
+    ):
         return None
     return candidate
 
@@ -8772,6 +8806,7 @@ def run_v2_observations_integrity_checks(
     allowed_connector_ids: set[int] | None = None,
     source_scope: dict[str, Any] | None = None,
     log: logging.Logger | None = None,
+    allowed_real_roots: Iterable[Path] = (),
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
@@ -8924,7 +8959,9 @@ def run_v2_observations_integrity_checks(
                                 if not key:
                                     gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
                                     continue
-                                file_path = _rel_key_to_path(root, str(key))
+                                file_path = _resolve_canonical_history_object_key(
+                                    root, str(key), allowed_real_roots=allowed_real_roots,
+                                )
                                 if file_path is None:
                                     gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
                                 elif not file_path.is_file():
@@ -9887,6 +9924,7 @@ def run_v2_aqilevels_integrity_checks(
     check_aqi_debug: bool = False,
     require_aqi_debug: bool = False,
     log: logging.Logger | None = None,
+    allowed_real_roots: Iterable[Path] = (),
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
@@ -10024,7 +10062,9 @@ def run_v2_aqilevels_integrity_checks(
                                 if not key:
                                     data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=["files[] entry missing key"]))
                                     continue
-                                file_path = _rel_key_to_path(root, str(key))
+                                file_path = _resolve_canonical_history_object_key(
+                                    root, str(key), allowed_real_roots=allowed_real_roots,
+                                )
                                 if file_path is None:
                                     data_gaps.append(_v2_aqi_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
                                 elif not file_path.is_file():
@@ -10117,7 +10157,9 @@ def run_v2_aqilevels_integrity_checks(
             for entry in _manifest_files(payload):
                 key = entry.get("key") if isinstance(entry, dict) else None
                 if key:
-                    file_path = _rel_key_to_path(root, str(key))
+                    file_path = _resolve_canonical_history_object_key(
+                        root, str(key), allowed_real_roots=allowed_real_roots,
+                    )
                     if file_path is None:
                         debug_gaps.append(_v2_aqi_gap("debug_manifest_schema_mismatch", profile="debug", severity=severity, day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[f"files[] key escapes mirror root: {key}"]))
                     elif not file_path.is_file():
@@ -10192,6 +10234,7 @@ def run_v2_post_repair_integrity_rechecks(
     check_aqi_debug: bool,
     require_aqi_debug: bool,
     log: logging.Logger,
+    allowed_real_roots: Iterable[Path] = (),
 ) -> dict[str, Any]:
     """Re-run v2 integrity checks after repairs so final status reflects reality."""
     post_obs = run_v2_observations_integrity_checks(
@@ -10204,6 +10247,7 @@ def run_v2_post_repair_integrity_rechecks(
         allowed_connector_ids=allowed_connector_ids,
         source_scope=source_scope,
         log=log,
+        allowed_real_roots=allowed_real_roots,
     )
     post_aqi = run_v2_aqilevels_integrity_checks(
         r2_history_root=r2_history_root,
@@ -10216,6 +10260,7 @@ def run_v2_post_repair_integrity_rechecks(
         check_aqi_debug=check_aqi_debug,
         require_aqi_debug=require_aqi_debug,
         log=log,
+        allowed_real_roots=allowed_real_roots,
     )
     obs_status = str(post_obs.get("status") or "fail")
     aqi_status = str(post_aqi.get("status") or "fail")
@@ -14079,29 +14124,55 @@ def _run_v2_observation_metadata_executor(
         "repair_plan": actions,
         "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
     }
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         command,
         cwd=repo_root,
         env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        input=json.dumps(plan),
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
     )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _drain(stream: Any, destination: list[str], *, progress: bool) -> None:
+        for line in iter(stream.readline, ""):
+            destination.append(line)
+            if progress:
+                log.info("v2 metadata executor %s", line.rstrip())
+        stream.close()
+
+    stdout_thread = threading.Thread(
+        target=_drain, args=(proc.stdout, stdout_lines), kwargs={"progress": False}, daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain, args=(proc.stderr, stderr_lines), kwargs={"progress": True}, daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps(plan))
+    proc.stdin.close()
+    proc.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
     try:
-        output = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        output = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
         output = {}
     if proc.returncode != 0:
         log.warning(
             "v2 observation metadata executor failed exit_code=%s stderr=%s",
             proc.returncode,
-            _truncate_text(proc.stderr or proc.stdout or "", 2000),
+            _truncate_text(stderr or stdout or "", 2000),
         )
         return {
             "status": str(output.get("status") or "failed") if isinstance(output, Mapping) else "failed",
             "exit_code": proc.returncode,
-            "error": _truncate_text(proc.stderr or proc.stdout or "", 4000),
+            "error": _truncate_text(stderr or stdout or "", 4000),
             "output": output if isinstance(output, Mapping) else {},
             "results": output.get("results") if isinstance(output, Mapping) else [],
         }
@@ -14921,6 +14992,10 @@ def run_v2_final_verification(
         check_aqi_debug=check_aqi_debug,
         require_aqi_debug=require_aqi_debug,
         log=log,
+        allowed_real_roots=(
+            Path(str(run_state["overlay_root"])),
+            Path(str(run_state["base_dropbox_root"])),
+        ),
     )
     remaining_scopes: list[dict[str, Any]] = []
     remaining_scopes.extend(_validate_changed_timeseries_metadata(
@@ -15647,12 +15722,6 @@ def resolve_backup_gate_credentials(values: Mapping[str, Any] | None = None) -> 
 
 
 def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dict[str, Any]:
-    if args.profile == "manual":
-        return {
-            "backup_gate_checked": False,
-            "backup_ready": None,
-            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-        }
     supabase_url, service_role_key = resolve_backup_gate_credentials()
     return check_dropbox_backup_ready(
         supabase_url=supabase_url,
@@ -17471,8 +17540,18 @@ def main(argv: list[str]) -> int:
     daily_task_health_run_id: str | None = None
     daily_task_scheduled_for_date = started_at.date().isoformat()
     daily_task_platform_run_id = f"{args.env}:{run_compact}"
-    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
-    if args.profile != "manual":
+    backup_gate_required = bool(args.run_backfill)
+    backup_gate_summary = (
+        run_scheduled_backup_gate(args, started_iso)
+        if backup_gate_required
+        else {
+            "backup_gate_checked": False,
+            "backup_ready": None,
+            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+            "blocked_reason": "repair_not_requested",
+        }
+    )
+    if backup_gate_required:
         log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
         if not backup_gate_summary.get("backup_ready"):
             log.error("backup gate blocked before Dropbox history scan: %s", backup_gate_summary.get("blocked_reason"))
