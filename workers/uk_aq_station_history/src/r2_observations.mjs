@@ -15,6 +15,20 @@ function resolveApiUrl(value) {
   return url;
 }
 
+export function buildR2ObservationRequestUrl({ baseUrl, identity, startMs, endMs, limit = 5000 }) {
+  const url = resolveApiUrl(baseUrl);
+  if (!url) return null;
+  url.searchParams.set("scope", "timeseries");
+  url.searchParams.set("format", "objects");
+  url.searchParams.set("timeseries_id", String(identity.timeseriesId));
+  url.searchParams.set("connector_id", String(identity.connectorId));
+  url.searchParams.set("pollutant", identity.pollutant);
+  url.searchParams.set("start_utc", new Date(startMs).toISOString());
+  url.searchParams.set("end_utc", new Date(endMs).toISOString());
+  url.searchParams.set("limit", String(limit));
+  return url;
+}
+
 export function summarizeR2ObservationCompleteness(payload) {
   const coverageState = String(payload?.coverage_state || payload?.coverage?.coverage_state || "").trim().toLowerCase();
   const hasGap = payload?.has_gap === true || payload?.coverage?.has_gap === true;
@@ -58,17 +72,15 @@ export function normalizeR2ObservationRows(payload, identity, startMs, endMs) {
 }
 
 export async function readR2Observations({ env, identity, startMs, endMs, limit = 5000 }) {
-  const url = resolveApiUrl(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL);
+  const url = buildR2ObservationRequestUrl({
+    baseUrl: env.UK_AQ_OBSERVS_HISTORY_R2_API_URL,
+    identity,
+    startMs,
+    endMs,
+    limit,
+  });
   const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!url || !secret) throw new Error("station_series_r2_observations_config_missing");
-  url.searchParams.set("scope", "timeseries");
-  url.searchParams.set("timeseries_id", String(identity.timeseriesId));
-  url.searchParams.set("connector_id", String(identity.connectorId));
-  url.searchParams.set("pollutant", identity.pollutant);
-  url.searchParams.set("start_utc", new Date(startMs).toISOString());
-  url.searchParams.set("end_utc", new Date(endMs).toISOString());
-  url.searchParams.set("format", "objects");
-  url.searchParams.set("limit", String(limit));
   const response = await fetch(url.toString(), { headers: { Accept: "application/json", [UPSTREAM_AUTH_HEADER]: secret } });
   const payload = await response.json().catch(() => null);
   if (!response.ok || !payload || typeof payload !== "object") throw new Error("station_series_r2_observations_failed");

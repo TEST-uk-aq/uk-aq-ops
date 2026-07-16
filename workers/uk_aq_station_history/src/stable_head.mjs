@@ -3,6 +3,14 @@ import { canonicalAqiKey, normalizePollutantCode } from "../../../lib/aqi/aqi_le
 const HOUR_MS = 60 * 60 * 1000;
 export const STABLE_HEAD_MAX_HOURS = 168;
 
+export function canonicalAqiHourStarts(startMs, endMs) {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return [];
+  const firstHourMs = Math.ceil(startMs / HOUR_MS) * HOUR_MS;
+  const hours = [];
+  for (let cursor = firstHourMs; cursor < endMs; cursor += HOUR_MS) hours.push(cursor);
+  return hours;
+}
+
 function hourIso(row) {
   const raw = row?.timestamp_hour_utc || row?.period_start_utc;
   const ms = Date.parse(String(raw ?? ""));
@@ -56,12 +64,9 @@ export function normalizeExactR2AqiRows(payload, request, bounds) {
 
 export function missingHeadHours(r2Rows, bounds) {
   const present = new Set(r2Rows.map((row) => row.timestamp_hour_utc));
-  const missing = [];
-  for (let cursor = bounds.headStartMs; cursor < bounds.headEndMs; cursor += HOUR_MS) {
-    const hour = new Date(cursor).toISOString();
-    if (!present.has(hour)) missing.push(hour);
-  }
-  return missing;
+  return canonicalAqiHourStarts(bounds.headStartMs, bounds.headEndMs)
+    .map((hourMs) => new Date(hourMs).toISOString())
+    .filter((hour) => !present.has(hour));
 }
 
 export function mergeStableAqiHead({ r2Rows, liveRows, request, bounds }) {

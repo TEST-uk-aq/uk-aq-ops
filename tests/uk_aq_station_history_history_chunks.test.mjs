@@ -9,6 +9,7 @@ import {
   parseHistoryChunkRequest,
 } from "../workers/uk_aq_station_history/src/history_chunks.mjs";
 import { resolveStationHistoryPolicy } from "../workers/uk_aq_station_history/src/policy.mjs";
+import { buildR2ObservationRequestUrl } from "../workers/uk_aq_station_history/src/r2_observations.mjs";
 
 function chunkUrl(path, start, end, extra = "") {
   return new URL(`https://internal${path}?timeseries_id=7&connector_id=2&pollutant=pm25&start_utc=${encodeURIComponent(start)}&end_utc=${encodeURIComponent(end)}&stable_head_start_utc=${encodeURIComponent("2026-07-08T00:00:00.000Z")}&format=objects${extra}`);
@@ -30,6 +31,25 @@ test("identical chunk requests produce a deterministic retry key", () => {
   const first = parseHistoryChunkRequest(url, "observations");
   const second = parseHistoryChunkRequest(new URL(url.toString()), "observations");
   assert.equal(first.retryKey, second.retryKey);
+});
+
+test("recent and historical R2 observation reads share the complete timeseries URL contract", () => {
+  const target = buildR2ObservationRequestUrl({
+    baseUrl: "https://observations.example",
+    identity: { timeseriesId: 7, connectorId: 2, pollutant: "pm25" },
+    startMs: Date.parse("2026-07-01T00:16:34.527Z"),
+    endMs: Date.parse("2026-07-02T00:16:34.527Z"),
+    limit: 1000,
+  });
+  assert.equal(target.pathname, "/v1/observations");
+  assert.equal(target.searchParams.get("scope"), "timeseries");
+  assert.equal(target.searchParams.get("format"), "objects");
+  assert.equal(target.searchParams.get("timeseries_id"), "7");
+  assert.equal(target.searchParams.get("connector_id"), "2");
+  assert.equal(target.searchParams.get("pollutant"), "pm25");
+  assert.equal(target.searchParams.get("start_utc"), "2026-07-01T00:16:34.527Z");
+  assert.equal(target.searchParams.get("end_utc"), "2026-07-02T00:16:34.527Z");
+  assert.equal(target.searchParams.get("limit"), "1000");
 });
 
 test("chunk immutable classification uses the existing 120 hour boundary", () => {
@@ -76,6 +96,16 @@ test("AQI object and compact formats retain the existing columns", () => {
   assert.deepEqual(aqiResponseRows(body, "compact").points, [["2026-07-07T00:00:00.000Z", 7, "r2"]]);
 });
 
+test("AQI chunk completeness counts only canonical hour starts inside exact bounds", () => {
+  const chunk = parseHistoryChunkRequest(chunkUrl("/v1/aqi-history", "2026-07-07T10:16:34.527Z", "2026-07-07T12:00:00.000Z"), "aqi");
+  const body = buildAqiHistoryChunk(chunk, {
+    points: [{ period_start_utc: "2026-07-07T11:00:00.000Z", timeseries_id: 7, connector_id: 2, pollutant_code: "pm25", source: "r2" }],
+    response_complete: true,
+  });
+  assert.equal(body.response_complete, true);
+  assert.equal(body.has_gap, false);
+});
+
 test("AQI and observation upstream failures use independent error contracts", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
@@ -91,6 +121,49 @@ test("AQI and observation upstream failures use independent error contracts", as
     assert.equal((await aqiResponse.json()).error.code, "aqi_history_r2_failed");
     assert.equal((await obsResponse.json()).error.code, "observation_history_r2_failed");
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test("historical observation handler uses the shared timeseries objects request contract", async () => {
+  const originalFetch = globalThis.fetch;
+  let observationTarget = null;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.includes("/rest/v1/timeseries")) {
+      return new Response(JSON.stringify([{ id: 7, station_id: 9, connector_id: 2, phenomenon_id: 4, ended_at: null, phenomena: { connector_id: 2, observed_property_id: 5, observed_properties: { code: "pm25" } } }]), { status: 200 });
+    }
+    observationTarget = url;
+    return new Response(JSON.stringify({
+      timeseries_id: 7,
+      connector_id: 2,
+      pollutant: "pm25",
+      response_complete: false,
+      has_gap: true,
+      partial_reasons: ["missing_manifest"],
+      rows: [{ observed_at: "2026-07-07T01:15:00.000Z", value: 2 }],
+    }), { status: 200 });
+  };
+  const env = { SUPABASE_URL: "https://ingest.example", SB_SECRET_KEY: "service-key", UK_AQ_EDGE_UPSTREAM_SECRET: "secret", UK_AQ_OBSERVS_HISTORY_R2_API_URL: "https://observations.example" };
+  try {
+    const response = await worker.fetch(new Request(chunkUrl("/v1/observations-history", "2026-07-07T00:00:00.000Z", "2026-07-08T00:00:00.000Z", "&limit=1000")), env);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    const body = await response.json();
+    assert.equal(body.response_complete, false);
+    assert.equal(body.has_gap, true);
+    assert.equal(body.rows.length, 1, "a partial upstream response retains its valid observation row");
+    assert.ok(observationTarget);
+    assert.equal(observationTarget.pathname, "/v1/observations");
+    assert.equal(observationTarget.searchParams.get("scope"), "timeseries");
+    assert.equal(observationTarget.searchParams.get("format"), "objects");
+    assert.equal(observationTarget.searchParams.get("timeseries_id"), "7");
+    assert.equal(observationTarget.searchParams.get("connector_id"), "2");
+    assert.equal(observationTarget.searchParams.get("pollutant"), "pm25");
+    assert.equal(observationTarget.searchParams.get("start_utc"), "2026-07-07T00:00:00.000Z");
+    assert.equal(observationTarget.searchParams.get("end_utc"), "2026-07-08T00:00:00.000Z");
+    assert.equal(observationTarget.searchParams.get("limit"), "1000");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("history chunks reject a connector that differs from authoritative timeseries identity", async () => {

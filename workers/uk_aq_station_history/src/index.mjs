@@ -6,6 +6,7 @@ import {
   sourceObservationsToNarrowRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
 import {
+  canonicalAqiHourStarts,
   mergeStableAqiHead,
   missingHeadHours,
   normalizeExactR2AqiRows,
@@ -30,7 +31,7 @@ import {
   readDirectIngestObservations,
   StationHistoryIngestError,
 } from "./ingest_observations.mjs";
-import { mergeObservationRowsPreferR2, readR2Observations } from "./r2_observations.mjs";
+import { buildR2ObservationRequestUrl, mergeObservationRowsPreferR2, readR2Observations } from "./r2_observations.mjs";
 import { resolveStationHistoryPolicy } from "./policy.mjs";
 
 const CONTRACT_VERSION = "v1";
@@ -125,6 +126,19 @@ function hourStarts(startMs, endMs) {
 function missingHourRanges(rows, startMs, endMs, field) {
   const present = new Set((Array.isArray(rows) ? rows : []).map((row) => Math.floor(Date.parse(String(row?.[field] ?? "")) / HOUR_MS) * HOUR_MS).filter(Number.isFinite));
   return hourStarts(startMs, endMs).filter((hour) => !present.has(hour)).map((hour) => ({ start_utc: new Date(hour).toISOString(), end_utc: new Date(hour + HOUR_MS).toISOString() }));
+}
+
+function missingAqiHourRanges(rows, startMs, endMs) {
+  const present = new Set((Array.isArray(rows) ? rows : []).map((row) => {
+    const timestamp = Date.parse(String(row?.timestamp_hour_utc ?? row?.period_start_utc ?? ""));
+    return Number.isFinite(timestamp) ? Math.floor(timestamp / HOUR_MS) * HOUR_MS : null;
+  }).filter(Number.isFinite));
+  return canonicalAqiHourStarts(startMs, endMs)
+    .filter((hourMs) => !present.has(hourMs))
+    .map((hourMs) => ({
+      start_utc: new Date(hourMs).toISOString(),
+      end_utc: new Date(hourMs + HOUR_MS).toISOString(),
+    }));
 }
 
 function calculateAqiRows(observationRows, request, startMs, endMs) {
@@ -237,7 +251,7 @@ function buildIngestOnlyResponse(request, direct, capability) {
   });
   const aqiRows = request.includeAqi ? calculateAqiRows(direct.rows, request, request.startMs, request.endMs) : [];
   const aqiAvailability = aqiAvailabilityDiagnostics(aqiRows);
-  const aqiGaps = request.includeAqi ? [...capability.contextGaps, ...missingHourRanges(aqiRows, request.startMs, request.endMs, "timestamp_hour_utc")] : [];
+  const aqiGaps = request.includeAqi ? [...capability.contextGaps, ...missingAqiHourRanges(aqiRows, request.startMs, request.endMs)] : [];
   const aqiComplete = request.includeAqi && direct.response_complete && capability.aqiContextComplete
     && aqiGaps.length === 0 && aqiAvailabilityComplete(aqiAvailability);
   const observationComplete = direct.response_complete && capability.observationsComplete;
@@ -317,7 +331,7 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
     liveRows = calculateAqiRows(calculationRows, request, aqiBounds.headStartMs, aqiBounds.headEndMs)
       .filter((row) => missingSet.has(row.timestamp_hour_utc));
     mergedAqi = mergeStableAqiHead({ r2Rows: r2AqiRows, liveRows, request, bounds: aqiBounds });
-    const remaining = missingHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs, "timestamp_hour_utc");
+    const remaining = missingAqiHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs);
     aqiAvailability = aqiAvailabilityDiagnostics(mergedAqi.rows);
     const liveSourceComplete = missing.length === 0 || direct.response_complete;
     aqiComplete = r2ResponseComplete(r2Payload) && liveSourceComplete
@@ -326,7 +340,7 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
 
   const aqiHeadStartUtc = new Date(aqiBounds.headStartMs).toISOString();
   const observationHeadStartUtc = new Date(observationBounds.headStartMs).toISOString();
-  const aqiGaps = request.includeAqi ? missingHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs, "timestamp_hour_utc") : [];
+  const aqiGaps = request.includeAqi ? missingAqiHourRanges(mergedAqi.rows, aqiBounds.headStartMs, aqiBounds.headEndMs) : [];
   const sourceMode = request.includeAqi ? "stable_r2_live_head" : "r2_ingest_observations_head";
   console.log(JSON.stringify({ event: "station_series_source_merge", timeseries_id: request.timeseriesId, connector_id: request.connectorId, pollutant: request.pollutant, r2_aqi_rows: r2AqiRows.length, live_aqi_rows: liveRows.length, r2_observation_rows: r2Observations.rows.length, ingest_observation_rows: outputObservations.filter((row) => row.source === "ingest").length, discarded_ingest_observation_overlap_count: mergedObservations.discarded_ingest_overlap_count, aqi_overlap_count: mergedAqi.overlap_count, aqi_mismatch_count: mergedAqi.mismatch_count, aqi_mismatch_hours: mergedAqi.mismatch_hours, aqi_complete: aqiComplete, observations_complete: observationsComplete }));
   return {
@@ -431,8 +445,13 @@ async function handleObservationHistoryChunk(request, env) {
   catch (error) { return identityErrorResponse(error, url.pathname) || errorResponse(502, "station_history_identity_lookup_failed", url.pathname); }
   const baseUrl = required(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL); const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) return errorResponse(500, "internal_observation_history_config_missing", url.pathname);
-  const target = new URL(baseUrl); if (!target.pathname || target.pathname === "/") target.pathname = "/v1/observations"; target.search = "";
-  for (const [key, value] of [["timeseries_id", chunk.timeseriesId], ["connector_id", chunk.connectorId], ["pollutant", chunk.pollutant], ["start_utc", chunk.startUtc], ["end_utc", chunk.endUtc], ["limit", chunk.limit]]) target.searchParams.set(key, String(value));
+  const target = buildR2ObservationRequestUrl({
+    baseUrl,
+    identity: chunk,
+    startMs: chunk.startMs,
+    endMs: chunk.endMs,
+    limit: chunk.limit,
+  });
   try { const body = buildObservationHistoryChunk(chunk, await fetchJsonUpstream(target, secret, "observation_history_r2_failed")); return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) }); }
   catch (error) { return errorResponse(502, error instanceof Error ? error.message : "observation_history_r2_failed", url.pathname); }
 }
