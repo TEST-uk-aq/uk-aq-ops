@@ -6,7 +6,13 @@ Recommended model: **GPT-5.6 Codex, High reasoning**
 Implement Phase 1 of:
 plans/2026-07-16 Invalid values refactor/uk_aq_latest_snapshot_invalid_values_refactor_plan.md
 
-Use Level 1 from AGENTS.md. Code and focused local checks only. Do not commit, deploy, call external services, write R2, query Supabase or perform operational repair.
+Use Level 1 from AGENTS.md. Code and minimal focused local checks only. Do not commit, deploy, call external services, write R2, query Supabase or perform operational repair.
+
+This is the TEST system. Do not delay deployment by building or running a broad pre-deployment test suite. Before deployment, use only:
+- basic syntax/type validation for changed files;
+- one compact deterministic state-policy regression test covering the load-bearing cases below.
+
+Functional testing belongs after deployment through normal TEST operation using the real scheduler, Pub/Sub subscription, R2 state, public API and website.
 
 Read before editing:
 - AGENTS.md
@@ -49,22 +55,17 @@ Required implementation:
 
 8. Make buildSourceRows() use the same central policy as defence in depth. Do not remove output filtering.
 
-9. Add only the focused deterministic checks required by system_docs/latest_snapshot/validation.md:
+9. Add one compact table-driven or similarly narrow deterministic regression test. It should cover, without creating a broad suite:
    - valid row creates state;
-   - negative row creates no state;
-   - newer valid replaces older valid;
-   - newer negative does not replace valid;
-   - older valid does not replace newer valid;
-   - zero is valid;
-   - PM2.5 over 500 is rejected;
-   - PM10 over 600 is rejected;
-   - negative NO2 is rejected;
+   - newer -99 does not replace the Manchester-style previous valid row;
    - invalid row between two valid rows does not block the later valid row;
-   - invalid-only batch does not alter state bytes or retained ingested_at;
-   - serialisation order and schema remain unchanged;
+   - zero is valid;
+   - PM2.5 above 500 and PM10 above 600 are rejected;
+   - negative NO2 is rejected;
+   - an invalid-only batch leaves state bytes and retained ingested_at unchanged;
    - invalid decoded rows remain handled for acknowledgement.
 
-10. Update the deployment workflow only if needed to run the focused test. Do not alter resource, scheduler, timeout, retry, Pub/Sub, R2 or environment configuration.
+10. Update the deployment workflow only if needed to run that one focused test. Do not alter resource, scheduler, timeout, retry, Pub/Sub, R2 or environment configuration.
 
 Functionality that must not change is defined in the plan and system_docs/latest_snapshot/contract.md. In particular, do not change:
 - public v2 row or API contract;
@@ -80,13 +81,14 @@ Functionality that must not change is defined in the plan and system_docs/latest
 
 Do not implement recovery tooling in this phase.
 
-Run only relevant focused local checks.
+Run only the minimal checks described above. Do not run unrelated repository test suites.
 
 Report:
 1. files archived;
 2. files changed and why;
-3. checks run and results;
-4. exact deployment workflow to run manually later;
+3. the minimal checks run and results;
+4. exact deployment workflow to run immediately on TEST;
 5. confirmation that protected behaviour remains unchanged;
-6. remaining risks or Phase 2 follow-up.
+6. post-deployment checks to perform through real TEST operation;
+7. remaining Phase 2 follow-up.
 ```
