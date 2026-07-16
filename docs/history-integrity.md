@@ -20,7 +20,7 @@ directory and do not rely on an undocumented runtime bundle.
 ## Current flow
 
 1. Load the v2-only integrity environment and then the configured backfill environment when daily-task health needs it.
-2. Check Dropbox backup readiness for scheduled runs before Dropbox-inspecting preflight checks.
+2. Check Dropbox backup readiness before any repair run inspects its Dropbox base.
 3. Import the current `R2_history_backup/history/v2/core` snapshot using the v2 core writer manifest/table contract.
 4. Run the configured source adapters.
 5. Run R2 history cross-checks.
@@ -57,9 +57,10 @@ GET, HEAD, or list live R2 before a metadata PUT. For an authorised real apply,
 every changed proposal is PUT and immediately GET-verified for exact bytes and
 canonical structure. The only retained live-read exception is the AQI writer's
 read of observation objects that the same run has already PUT/GET-verified.
-An index-only O3 observation leaf can be read by exact Dropbox key for its
-index, but cannot enter connector/day child discovery unless an explicit O3
-leaf repair has staged a canonical leaf manifest.
+An index-only observation leaf can be read by exact Dropbox key for its index,
+but every valid sibling pollutant manifest already visible in the combined
+overlay/Dropbox view, including O3, is retained by connector/day child
+discovery.
 
 The metadata executor reads parquet metadata from the final combined local
 object. Observation parquet uses `observed_at_utc`, with `observed_at` accepted
@@ -109,7 +110,7 @@ single final verification.
 
 ## Backup gate
 
-Scheduled runs now call the Integrity-specific Obs AQI DB RPC
+Repair runs now call the Integrity-specific Obs AQI DB RPC
 `uk_aq_public.uk_aq_rpc_history_integrity_readiness(timestamptz)` before any
 Dropbox history scan starts. This leaves the unrelated date-based backup
 readiness RPC unchanged for its existing callers.
@@ -124,7 +125,7 @@ readiness RPC unchanged for its existing callers.
 - Any relevant writer still in `Started`, including a Dropbox backup attempt,
   blocks the run. The qualifying backup
   must also have finished before the current Integrity run started.
-- If the gate is not ready, the run exits early with
+- If the gate is not ready, a repair run exits early with
   `status=blocked_backup_not_ready`.
 - `--allow-stale-dropbox` remains an explicit recovery override and is
   recorded in the JSON and Markdown reports.

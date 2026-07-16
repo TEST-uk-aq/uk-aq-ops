@@ -283,7 +283,7 @@ function localDependencySnapshot({ child, proposals, prefix, dayUtc, connectorId
   };
 }
 
-function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
+export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
   const proposals = new Map();
   const allowedDropboxSourceKeys = new Set(dropboxSourceKeys.map(safeLocalKey));
   const indexProposalKind = (key) => key.includes("/timeseries_id=")
@@ -356,16 +356,12 @@ function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
         return object ? { exists: true, key, bytes: object.bytes, etag: null, content_sha256: object.content_sha256 } : { exists: false, key };
       },
       listAllObjects: async ({ prefix, max_keys }) => {
-        const entries = store.listAllObjects({ prefix, max_keys })
-          // An explicit index-only Dropbox leaf can be read by its exact key,
-          // but must never be discovered as a connector/day hierarchy child.
-          // O3 is index-only in the observation hierarchy unless a canonical
-          // O3 leaf proposal has explicitly been staged for this repair.
-          .filter((entry) => (
-            (!allowedDropboxSourceKeys.has(entry.key)
-              && !/\/pollutant_code=o3\/manifest\.json$/.test(entry.key))
-            || proposals.has(entry.key)
-          ));
+      const entries = store.listAllObjects({ prefix, max_keys })
+        // Exact Dropbox leaves requested solely for a targeted index repair
+        // must not become a parent child. Every ordinary valid sibling
+        // manifest, including O3, remains discoverable for connector/day
+        // rebuilds from the combined overlay/Dropbox view.
+        .filter((entry) => !allowedDropboxSourceKeys.has(entry.key) || proposals.has(entry.key));
         const byKey = new Map(entries.map((entry) => [entry.key, entry]));
         for (const proposal of proposals.values()) {
           if (proposal.key.startsWith(prefix)) {
@@ -777,6 +773,7 @@ export async function applyStagedProposals({
   writeR2,
   putObject = r2PutObject,
   getObject = r2GetObject,
+  onProgress = null,
 }) {
   const operationCounts = {
     r2_get_before_put_count: 0,
@@ -796,6 +793,19 @@ export async function applyStagedProposals({
   const ordered = [...proposals.values()].sort((left, right) =>
     (rank[left.kind] || 99) - (rank[right.kind] || 99) || left.key.localeCompare(right.key)
   );
+  const reportProgress = (phase, completedObjects, failures = 0) => {
+    if (typeof onProgress !== "function") return;
+    onProgress({
+      phase,
+      completed_objects: completedObjects,
+      total_objects: ordered.length,
+      successful_put_count: operationCounts.r2_put_count,
+      successful_readback_verification_count: operationCounts.r2_get_after_put_verification_count,
+      failures,
+      blocked_count: 0,
+    });
+  };
+  reportProgress("metadata_application_start", 0);
   // Pass 1: a repair plan is atomic with respect to proposal validity. Check
   // every proposal body and every staged-child relationship before any live
   // dependency guard (and therefore before the first possible PUT).
@@ -827,10 +837,12 @@ export async function applyStagedProposals({
     const proposal = ordered[position];
     if (!proposal.changed) {
       results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "skipped_unchanged", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: null, error: null });
+      if ((position + 1) % 25 === 0 || position + 1 === ordered.length) reportProgress("metadata_application", position + 1);
       continue;
     }
     if (!writeR2) {
       results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "planned", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: null, error: null });
+      if ((position + 1) % 25 === 0 || position + 1 === ordered.length) reportProgress("metadata_application", position + 1);
       continue;
     }
     let phase = "initial";
@@ -871,10 +883,13 @@ export async function applyStagedProposals({
         error: message,
       });
       for (const remaining of ordered.slice(position + 1)) results.set(remaining.key, { key: remaining.key, kind: remaining.kind, status: "not_run_due_to_dependency", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: "dependency", error: null });
+      reportProgress("metadata_application_failed", position + 1, 1);
       return { results, failure: { key: proposal.key, error: error instanceof Error ? error.message : String(error) }, operation_counts: operationCounts };
     }
     results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "succeeded", put_attempted: true, put_completed: true, get_verification_attempted: true, get_verification_succeeded: true, verification: "succeeded", failure_stage: null, error: null });
+    if ((position + 1) % 25 === 0 || position + 1 === ordered.length) reportProgress("metadata_application", position + 1);
   }
+  reportProgress("metadata_application_complete", ordered.length);
   return { results, failure: null, operation_counts: operationCounts };
 }
 
@@ -1011,6 +1026,19 @@ export async function runV2ObservationsRepair({
   repairPlan = null,
   updateIndexes = updateR2HistoryIndexesTargeted,
 } = {}) {
+  const startedAtMs = Date.now();
+  const reportProgress = ({ phase, completed_objects = 0, total_objects = 0, successful_put_count = 0, successful_readback_verification_count = 0, failures = 0, blocked_count = 0 }) => {
+    process.stderr.write(`UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify({
+      phase,
+      completed_objects,
+      total_objects,
+      successful_put_count,
+      successful_readback_verification_count,
+      failures,
+      blocked_count,
+      elapsed_seconds: Math.round((Date.now() - startedAtMs) / 1000),
+    })}\n`);
+  };
   const args = repairPlan
     ? {
       writeR2: argv.includes("--write-r2"),
@@ -1025,6 +1053,7 @@ export async function runV2ObservationsRepair({
       : fs.readFileSync(args.repairPlanJson, "utf8"),
   );
   const { inputKind, domain, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
+  reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
   const coreTimeseries = authoritativeTimeseriesById(input);
   const config = resolveR2HistoryIndexConfig(env);
   if (args.writeR2 && env.UK_AQ_ENV_NAME !== "CIC-Test") {
@@ -1346,7 +1375,18 @@ export async function runV2ObservationsRepair({
       });
     }
   }
-  const appliedResult = await applyStagedProposals({ r2: config.r2, proposals: staged.proposals, writeR2: args.writeR2 });
+  reportProgress({
+    phase: "metadata_planning_complete",
+    completed_objects: staged.proposals.size,
+    total_objects: staged.proposals.size,
+    blocked_count: blockedScopes.length,
+  });
+  const appliedResult = await applyStagedProposals({
+    r2: config.r2,
+    proposals: staged.proposals,
+    writeR2: args.writeR2,
+    onProgress: reportProgress,
+  });
   const applied = appliedResult.results;
   const proposalViews = [...staged.proposals.values()].map(proposalView).sort((left, right) => left.key.localeCompare(right.key));
   const applicationOperations = [...applied.values()].sort((left, right) => left.key.localeCompare(right.key));
