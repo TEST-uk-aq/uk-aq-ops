@@ -14,6 +14,7 @@ const DEFAULT_TIMESERIES_METADATA_INDEX_SUBPREFIX = "timeseries";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
+const OBSERVATIONS_CACHE_GENERATION = "2";
 const MAX_LIMIT = 20000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const HOUR_MS = 60 * 60 * 1000;
@@ -132,7 +133,7 @@ function cacheControlHeader(cacheSeconds) {
   }`;
 }
 
-function resolveCachePolicy(env, endIso) {
+export function resolveCachePolicy(env, endIso) {
   const mutableCacheSeconds = parsePositiveInt(
     env.UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS,
     DEFAULT_CACHE_SECONDS,
@@ -160,13 +161,14 @@ function resolveCachePolicy(env, endIso) {
 function jsonResponse(payload, {
   status = 200,
   cacheSeconds = DEFAULT_CACHE_SECONDS,
+  noStore = false,
   extraHeaders = {},
 } = {}) {
   return new Response(JSON.stringify(payload), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": cacheControlHeader(cacheSeconds),
+      "Cache-Control": noStore ? "no-store" : cacheControlHeader(cacheSeconds),
       ...corsHeaders(),
       ...extraHeaders,
     },
@@ -176,6 +178,94 @@ function jsonResponse(payload, {
 function withCacheMarker(response, marker) {
   const headers = new Headers(response.headers);
   headers.set("x-ukaq-cache", marker);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function hasNonEmptyPartialReasons(value) {
+  if (value === undefined || value === null) return false;
+  return !Array.isArray(value) || value.length > 0;
+}
+
+function hasKnownNestedCoverageGap(payload) {
+  const coverage = payload?.coverage;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
+    return false;
+  }
+  if (coverage.response_complete === false || coverage.has_gap === true
+      || coverage.coverage_state === "partial"
+      || hasNonEmptyPartialReasons(coverage.partial_reasons)
+      || coverage.limited_by_limit === true) {
+    return true;
+  }
+  if ([
+    coverage.missing_day_manifest_keys,
+    coverage.missing_connector_manifest_keys,
+    coverage.missing_parquet_keys,
+  ].some((value) => Array.isArray(value) && value.length > 0)) {
+    return true;
+  }
+  const index = coverage.timeseries_index;
+  return Boolean(index && typeof index === "object" && !Array.isArray(index) && (
+    hasNonEmptyPartialReasons(index.partial_reasons)
+    || (Array.isArray(index.warnings) && index.warnings.length > 0)
+    || (Array.isArray(index.missing_connector_index_keys)
+      && index.missing_connector_index_keys.length > 0)
+  ));
+}
+
+export function isCompleteGapFreeObservationsResponse(payload) {
+  return Boolean(payload && typeof payload === "object" && !Array.isArray(payload)
+    && payload.response_complete === true
+    && payload.has_gap !== true
+    && payload.coverage_state !== "partial"
+    && !hasNonEmptyPartialReasons(payload.partial_reasons)
+    && !hasKnownNestedCoverageGap(payload));
+}
+
+async function inspectObservationsCacheEligibility(response) {
+  if (!response?.ok) {
+    return { cache_eligible: false, malformed: false, payload: null };
+  }
+  try {
+    const payload = await response.clone().json();
+    return {
+      cache_eligible: isCompleteGapFreeObservationsResponse(payload),
+      malformed: false,
+      payload,
+    };
+  } catch (_error) {
+    return { cache_eligible: false, malformed: true, payload: null };
+  }
+}
+
+async function isCacheableTimeseriesMetadataResponse(response) {
+  if (!response?.ok) return false;
+  try {
+    const payload = await response.clone().json();
+    return Boolean(payload && typeof payload === "object" && !Array.isArray(payload)
+      && payload.ok === true && Object.hasOwn(payload, "metadata"));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function withObservationsCacheDiagnostics(response, eligibility) {
+  const headers = new Headers(response.headers);
+  const payload = eligibility?.payload;
+  headers.set("x-ukaq-cache-eligible", String(eligibility?.cache_eligible === true));
+  headers.set("x-ukaq-cache-generation", OBSERVATIONS_CACHE_GENERATION);
+  if (payload && typeof payload === "object") {
+    headers.set("x-ukaq-response-complete", String(payload.response_complete === true));
+    headers.set("x-ukaq-has-gap", String(payload.has_gap === true));
+    headers.set(
+      "x-ukaq-partial-reason-count",
+      String(Array.isArray(payload.partial_reasons) ? payload.partial_reasons.length : 0),
+    );
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -612,7 +702,7 @@ function buildTimeseriesMetadataIndexKey(prefix, timeseriesId) {
   return `${normalizePrefix(prefix)}/timeseries_id=${timeseriesId}.json`;
 }
 
-function buildCanonicalCacheKey(requestUrl, {
+export function buildCanonicalCacheKey(requestUrl, {
   timeseriesId,
   connectorId,
   pollutantKey,
@@ -628,6 +718,7 @@ function buildCanonicalCacheKey(requestUrl, {
   cacheUrl.searchParams.set("timeseries_id", String(timeseriesId));
   cacheUrl.searchParams.set("connector_id", String(connectorId));
   cacheUrl.searchParams.set("__ukaq_observs_history_read_v", parseReadVersion(readVersion));
+  cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", OBSERVATIONS_CACHE_GENERATION);
   if (pollutantKey) {
     cacheUrl.searchParams.set("pollutant", pollutantKey);
   }
@@ -649,6 +740,7 @@ function buildTimeseriesMetadataCacheKey(requestUrl, requestParams) {
   cacheUrl.hash = "";
   cacheUrl.searchParams.set("timeseries_id", String(requestParams.timeseriesId));
   cacheUrl.searchParams.set("__ukaq_observs_history_read_v", "v2");
+  cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", OBSERVATIONS_CACHE_GENERATION);
   return new Request(cacheUrl.toString(), { method: "GET" });
 }
 
@@ -1273,6 +1365,7 @@ async function handleRequest(requestParams, env) {
   }, {
     status: 200,
     cacheSeconds,
+    noStore: !completeness.response_complete || completeness.has_gap,
   });
 }
 
@@ -1293,6 +1386,7 @@ async function handleTimeseriesMetadataRequest(requestParams, env) {
     }, {
       status: 404,
       cacheSeconds: 60,
+      noStore: true,
     });
   }
   return jsonResponse({
@@ -1320,6 +1414,7 @@ export default {
       return jsonResponse({ ok: false, error: "Method not allowed." }, {
         status: 405,
         cacheSeconds: 30,
+        noStore: true,
       });
     }
 
@@ -1328,6 +1423,7 @@ export default {
       return jsonResponse({ ok: false, error: authResult.error }, {
         status: authResult.status,
         cacheSeconds: 30,
+        noStore: true,
       });
     }
 
@@ -1338,6 +1434,7 @@ export default {
         return jsonResponse({ ok: false, error: requestParams.error }, {
           status: requestParams.status,
           cacheSeconds: 30,
+          noStore: true,
         });
       }
       const cacheKey = buildTimeseriesMetadataCacheKey(request.url, requestParams);
@@ -1346,7 +1443,7 @@ export default {
         return withCacheMarker(cached, "HIT");
       }
       const response = await handleTimeseriesMetadataRequest(requestParams, env);
-      if (response.ok) {
+      if (await isCacheableTimeseriesMetadataResponse(response)) {
         ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
       }
       return withCacheMarker(response, "MISS");
@@ -1357,6 +1454,7 @@ export default {
       return jsonResponse({ ok: false, error: requestParams.error }, {
         status: requestParams.status,
         cacheSeconds: 30,
+        noStore: true,
       });
     }
 
@@ -1393,10 +1491,13 @@ export default {
       response = jsonResponse({ ok: false, error: message }, {
         status: 500,
         cacheSeconds: 30,
+        noStore: true,
       });
     }
 
-    if (response.ok) {
+    const eligibility = await inspectObservationsCacheEligibility(response);
+    response = withObservationsCacheDiagnostics(response, eligibility);
+    if (response.ok && eligibility.cache_eligible) {
       ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
     }
     return withCacheMarker(response, "MISS");

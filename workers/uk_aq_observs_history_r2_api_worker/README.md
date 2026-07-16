@@ -70,14 +70,19 @@ Response:
   `parquet_bytes_read`, `parquet_row_groups_scanned`,
   `parquet_chunks_scanned`, and `parquet_matched_rows`.
 - marks responses partial when required day manifests, connector manifests, parquet objects, row-limit capacity, or uncertain timeseries-index skips/warnings prevent the worker from proving full coverage.
-- sets `x-ukaq-cache: HIT|MISS`.
+- sets `x-ukaq-cache: HIT|MISS` and safe cache diagnostics including cache
+  eligibility and cache generation.
 
 Cache behavior:
 
 - cache key is canonicalized to `/v1/observations` with normalized query params:
   - `timeseries_id`, `connector_id`, hidden read version, optional `pollutant`,
-    `start_utc`, `end_utc`, optional `since_utc`, optional `limit`
+    `start_utc`, `end_utc`, optional `since_utc`, optional `limit`, and the
+    code-owned cache generation (`2`).
 - equivalent request forms (including `/` alias or non-canonical timestamp text that resolves to the same ISO value) share the same cache entry.
+- only complete, gap-free observation responses with no top-level or coverage
+  partial reasons may enter Cache API. Partial responses retain valid rows but
+  return `Cache-Control: no-store` and remain retryable.
 - recent window cache TTL uses `UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS` (default `300`).
 - immutable window cache TTL uses `UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS` (default `86400`), applied when `end_utc` is older than 24 hours.
 
