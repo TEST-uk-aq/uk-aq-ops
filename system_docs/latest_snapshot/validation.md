@@ -2,9 +2,17 @@
 
 ## Validation principle
 
-The invalid-value defect is a deterministic state-transition error. A small targeted regression check is genuinely required before deployment because the failure can be proved without external services.
+The latest-snapshot service runs on the TEST system. Pre-deployment validation must therefore remain deliberately small and must not delay functional testing through the real deployed pipeline.
 
-Broader functional validation is performed after deployment through real operation on the TEST system.
+Before deployment, perform only:
+
+1. structural confirmation that the proposed code preserves the authoritative contract;
+2. basic syntax/type validation for changed files;
+3. one compact deterministic regression check for the invalid-state transition.
+
+Functional validation happens after deployment through normal TEST operation using the real Cloud Scheduler, Cloud Run service, Pub/Sub subscription, R2 state, public API and website.
+
+Do not create or run a broad speculative pre-deployment test suite.
 
 ## Pre-implementation structural review
 
@@ -12,72 +20,58 @@ Before changing code, confirm that the proposed implementation can:
 
 - resolve the incoming row to its observed property before state replacement;
 - share one value-eligibility rule between state application and source-row defence-in-depth filtering;
-- skip invalid state changes while still retaining the message for acknowledgement;
+- skip invalid state changes while retaining the message for acknowledgement;
 - preserve the existing state schema;
-- preserve the v2 row and HTTP contracts;
+- preserve the public v2 row and HTTP contracts;
 - repair existing poisoned state separately from normal message handling.
 
-If metadata cannot be available before state application without a larger ordering change, the implementation must document the exact alternative and prove that invalid rows cannot replace state.
+If metadata cannot be available before state application without a larger ordering change, document the alternative and prove structurally that an invalid row cannot replace state.
 
-## Required deterministic regression checks
+## Minimal deterministic regression check
 
-The focused checks should cover only the load-bearing transition contract.
+Use one compact table-driven or similarly narrow check covering only the load-bearing defect and boundaries:
 
-### State replacement
+- a valid row creates state;
+- a newer `-99` does not replace an existing valid row;
+- an invalid row between two valid rows does not prevent the later valid row becoming state;
+- zero is valid;
+- PM2.5 above `500` is rejected;
+- PM10 above `600` is rejected;
+- negative NO2 is rejected;
+- an invalid-only batch does not alter state bytes or the retained row's `ingested_at`;
+- an invalid decoded row is still handled for acknowledgement after successful classification.
 
-1. No state plus a valid value creates state.
-2. No state plus a negative value creates no state.
-3. A newer valid value replaces older valid state.
-4. A newer negative value does not replace valid state.
-5. An older valid value does not replace newer valid state.
-6. Zero is accepted as valid.
-7. PM2.5 above the existing maximum is rejected.
-8. PM10 above the existing maximum is rejected.
-9. Negative NO2 is rejected even though NO2 has no configured upper maximum.
-10. An invalid row between two valid rows does not prevent the later valid row becoming state.
+The Manchester-style sequence is the primary regression:
 
-### State persistence
+```text
+08:00  21.793  valid
+09:00  -99     invalid
+```
 
-1. An invalid-only handled batch does not alter state bytes or hash.
-2. Skipping an invalid row does not refresh the retained row's `ingested_at`.
-3. State serialisation order and schema remain unchanged.
+Required result:
 
-### Snapshot behaviour
+```text
+retained observed_at=08:00
+retained value=21.793
+```
 
-1. The retained valid row remains in `window=all` after a newer invalid row.
-2. Finite-window filtering uses the retained valid row's timestamp.
-3. The invalid value is never emitted as `last_value`.
-4. Snapshot row fields and top-level payload fields are unchanged.
-5. Existing sorting and cursor derivation remain unchanged.
+Do not expand this into a broad suite of unrelated latest-snapshot, API, cache, network or deployment tests before deploying to TEST.
 
-### Message handling
+## Minimal local checks
 
-The implementation must make it structurally clear that a decoded invalid value:
+Run only:
 
-- is classified as handled;
-- does not modify state;
-- remains eligible for normal acknowledgement after successful state handling.
+- syntax/type validation for changed latest-snapshot files;
+- the single focused state-policy regression check;
+- an existing fast service-core check only where it is already required by the deployment workflow and runs locally without external calls.
 
-A narrow integration check may be added if this cannot be established through the extracted state-application result and call ordering.
+Do not run broad repository suites, backfills, Pub/Sub calls, R2 writes, Supabase queries or website automation before deployment.
 
-## Local checks after implementation
+## Diff review before deployment
 
-Run only the focused checks and existing fast structural checks relevant to changed files.
+Compare the diff with [`contract.md`](contract.md).
 
-Expected categories:
-
-- TypeScript or JavaScript syntax/type validation for the builder;
-- the targeted latest-state regression check;
-- existing latest-snapshot contract checks, if present;
-- no deployment or external R2, Pub/Sub or Supabase calls.
-
-Do not run broad backfills, cloud operations or unrelated test suites as pre-deployment validation.
-
-## Diff review
-
-Before deployment, review the diff against [`contract.md`](contract.md).
-
-Confirm no unintended changes to:
+Confirm there are no unintended changes to:
 
 - v2 types and field lists;
 - R2 prefixes and keys;
@@ -87,7 +81,10 @@ Confirm no unintended changes to:
 - sort order and cursor logic;
 - Pub/Sub pull and acknowledgement bounds;
 - Cloud Run overlap and timeout logic;
-- API Worker or cache-proxy behaviour.
+- API Worker or cache-proxy behaviour;
+- raw observation publishing or storage.
+
+Once these minimal checks pass, deploy to TEST rather than adding more pre-deployment testing.
 
 ## TEST deployment validation
 
@@ -98,9 +95,11 @@ Functional validation occurs through normal TEST operation.
 After deployment, confirm:
 
 - scheduled runs complete;
+- metadata loads successfully before state application where the new ordering is used;
 - Pub/Sub backlog does not grow because invalid rows are unacknowledged;
 - invalid-value skips are reported;
 - state entry count remains plausible;
+- invalid-only handling does not generate unnecessary state writes;
 - no new metadata or matrix failures appear.
 
 ### Known Manchester Piccadilly case
@@ -108,14 +107,13 @@ After deployment, confirm:
 For connector `1`, timeseries `360`:
 
 - raw history retains the `2026-07-16 09:00:00+00` value `-99`;
-- latest state retains or is repaired to `2026-07-16 08:00:00+00`, value `21.793`, until a newer valid row exists;
+- latest state retains or is repaired to the newest valid observation;
+- if no newer valid row exists, the expected state is `2026-07-16 08:00:00+00`, value `21.793`;
 - `window=all` contains the timeseries;
-- finite windows depend on the retained valid timestamp;
-- the public latest-snapshot response never emits `-99`;
+- finite windows use the retained valid timestamp;
+- the public response never emits `-99` as `last_value`;
 - website search can find the station when otherwise eligible;
 - the hex map can display it when otherwise eligible.
-
-If a newer valid observation has arrived by validation time, use the newest valid observation as the expected state and still confirm the intervening `-99` remained in raw history.
 
 ### Public interface compatibility
 
@@ -125,8 +123,8 @@ Confirm:
 
 - top-level fields are unchanged;
 - latest row field names are unchanged;
-- network scalar fields remain canonical v2 fields;
-- omitted v1/membership fields remain absent;
+- scalar v2 network fields remain unchanged;
+- omitted v1 and membership fields remain absent;
 - `X-UK-AQ-Snapshot-Contract: v2` remains present;
 - cache-proxy route and query parameters remain unchanged.
 
@@ -141,13 +139,14 @@ Confirm:
 
 ## Acceptance criteria
 
-The latest-snapshot issue is fixed only when all of the following are true:
+The latest-snapshot issue is fixed only when:
 
-1. raw invalid observations are still retained by the raw-data path;
+1. raw invalid observations remain retained by the raw-data path;
 2. invalid pollutant values do not create or replace latest state;
-3. previous valid state remains available to `window=all`;
-4. finite windows use the valid observation timestamp;
-5. decoded invalid messages are acknowledged after handling;
-6. existing poisoned state is repaired or demonstrably self-healed for affected identities;
-7. the website search and hex map work again for the affected station;
-8. no unrelated public, metadata, scheduling or cache behaviour changed.
+3. zero remains valid;
+4. previous valid state remains available to `window=all`;
+5. finite windows use the valid observation timestamp;
+6. decoded invalid messages are acknowledged after handling;
+7. existing poisoned state is repaired or replaced by a newer valid row;
+8. the website search and hex map work again for the affected station;
+9. no unrelated public, metadata, scheduling or cache behaviour changed.
