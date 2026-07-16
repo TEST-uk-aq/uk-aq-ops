@@ -167,7 +167,7 @@ function optionalIdentityMatches(raw, identity) {
 
 export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
   const rows = [];
-  let rejected = 0;
+  let malformedOrInvalidRowCount = 0;
   for (const raw of Array.isArray(rawRows) ? rawRows : []) {
     if (!optionalIdentityMatches(raw, identity)) {
       throw ingestError({
@@ -181,7 +181,7 @@ export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
     const observedAt = normalizeTimestamp(raw?.observed_at ?? raw?.observed_at_utc);
     const value = Number(raw?.value);
     if (!observedAt || !Number.isFinite(value) || value < 0) {
-      rejected += 1;
+      malformedOrInvalidRowCount += 1;
       continue;
     }
     rows.push({
@@ -199,11 +199,14 @@ export function normalizeDirectIngestRows(rawRows, identity, source = {}) {
   for (const row of rows) byTimestamp.set(row.observed_at, row);
   return {
     rows: Array.from(byTimestamp.values()).sort((left, right) => left.observed_at.localeCompare(right.observed_at)),
-    rejected_row_count: rejected,
+    malformed_or_invalid_row_count: malformedOrInvalidRowCount,
+    identity_conflicting_row_count: 0,
+    // Retained for callers that consumed the earlier normalisation helper.
+    rejected_row_count: malformedOrInvalidRowCount,
   };
 }
 
-export async function readDirectIngestObservations({ env, identity, startMs, endMs, timeoutMs, nowMs = Date.now(), route = "/v1/station-series" }) {
+export async function readDirectIngestObservations({ env, identity, startMs, endMs, rpcWindowStartMs = startMs, timeoutMs, nowMs = Date.now(), route = "/v1/station-series" }) {
   const baseUrl = normalizeBaseUrl(env.SUPABASE_URL);
   const apiKey = required(env.SB_SECRET_KEY);
   const source = sourceContext(env);
@@ -218,7 +221,7 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
       logicalFetchCount: 0,
     }), loggingContext);
   }
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+  if (!Number.isFinite(startMs) || !Number.isFinite(rpcWindowStartMs) || !Number.isFinite(endMs) || endMs <= startMs) {
     throwLogged(ingestError({
       code: "station_series_ingest_bounds_invalid",
       status: 500,
@@ -231,8 +234,9 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
 
   const startUtc = new Date(startMs).toISOString();
   const endUtc = new Date(endMs).toISOString();
-  const windowLabel = selectDirectIngestWindowLabel(startMs, nowMs);
-  const rpcWindowCoversRequiredStart = nowMs - startMs <= MAX_RPC_WINDOW_MS;
+  const rpcWindowRequestedStartUtc = new Date(rpcWindowStartMs).toISOString();
+  const windowLabel = selectDirectIngestWindowLabel(rpcWindowStartMs, nowMs);
+  const rpcWindowCoversRequestedStart = nowMs - rpcWindowStartMs <= MAX_RPC_WINDOW_MS;
   const endpoint = new URL(`${baseUrl}/rest/v1/${RPC_PATH}`);
   const requestBody = {
     timeseries_id: identity.timeseriesId,
@@ -349,24 +353,35 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
     const observedAtMs = Date.parse(row.observed_at);
     return observedAtMs >= startMs && observedAtMs < endMs;
   });
-  const rejectedRowCount = normalized.rejected_row_count + (normalized.rows.length - boundedRows.length);
+  const actualStartUtc = boundedRows.length ? boundedRows[0].observed_at : null;
+  const actualEndUtc = boundedRows.length ? boundedRows.at(-1).observed_at : null;
+  const outsideRequiredSourceIntervalRowCount = normalized.rows.length - boundedRows.length;
   return {
     rows: boundedRows,
     guideline: rpcResult.guideline ?? null,
-    response_complete: rpcWindowCoversRequiredStart,
+    response_complete: rpcWindowCoversRequestedStart,
     source_path: `${source.schema}.${RPC_PATH}`,
-    start_utc: startUtc,
-    end_utc: endUtc,
+    requested_start_utc: startUtc,
+    requested_end_utc: endUtc,
+    rpc_window_requested_start_utc: rpcWindowRequestedStartUtc,
+    actual_start_utc: actualStartUtc,
+    actual_end_utc: actualEndUtc,
     rpc_window_label: windowLabel,
-    rpc_window_covers_required_start: rpcWindowCoversRequiredStart,
+    rpc_window_covers_requested_start: rpcWindowCoversRequestedStart,
+    rpc_window_covers_required_start: rpcWindowCoversRequestedStart,
     rpc_window_start_utc: normalizeTimestamp(rpcResult.start),
     rpc_window_end_utc: normalizeTimestamp(rpcResult.end),
     fetch_count: 1,
     logical_fetch_count: 1,
     http_attempt_count: 1,
     raw_row_count: rpcResult.data.length,
-    normalized_row_count: boundedRows.length,
-    rejected_row_count: rejectedRowCount,
+    valid_normalized_row_count: normalized.rows.length,
+    normalized_row_count: normalized.rows.length,
+    retained_calculation_row_count: boundedRows.length,
+    malformed_or_invalid_row_count: normalized.malformed_or_invalid_row_count,
+    identity_conflicting_row_count: normalized.identity_conflicting_row_count,
+    outside_required_source_interval_row_count: outsideRequiredSourceIntervalRowCount,
+    rejected_row_count: normalized.malformed_or_invalid_row_count,
   };
 }
 
