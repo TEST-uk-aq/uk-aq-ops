@@ -198,9 +198,7 @@ jobs:
             workers/uk_aq_latest_snapshot_cloud_run/service_core.ts \
             workers/uk_aq_latest_snapshot_cloud_run/run_service.ts \
             workers/uk_aq_latest_snapshot_cloud_run/run_job.ts
-          deno test \
-            workers/uk_aq_latest_snapshot_cloud_run/service_core_test.ts \
-            workers/uk_aq_latest_snapshot_cloud_run/latest_state_core_test.ts
+          deno test workers/uk_aq_latest_snapshot_cloud_run/service_core_test.ts
           node --test tests/r2_sigv4.test.mjs
 
       - name: Build and push latest snapshot image

@@ -8,15 +8,6 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
-import {
-  evaluateLatestCurrentValue,
-  normalizeLatestMatrixPollutant,
-} from "./latest_value_policy.mjs";
-import {
-  applyEligibleRowsToLatestState,
-  latestStateKey,
-  serializeLatestState,
-} from "./latest_state_core.mjs";
 
 type LatestSnapshotContractVersion = "v2";
 
@@ -137,10 +128,6 @@ type ObservationMessageRow = {
   status: string | null;
 };
 
-type EligibleObservationMessageRow = ObservationMessageRow & {
-  value: number;
-};
-
 type DecodedMessage = {
   ackId: string | null;
   row: ObservationMessageRow | null;
@@ -180,11 +167,11 @@ type LoadedState = {
   existingBytes: number;
 };
 
-type StatePolicySummary = {
-  eligible_rows: number;
-  skipped_invalid_current_value: number;
-  skipped_unsupported_pollutant: number;
-  skipped_metadata_unresolved: number;
+type StateApplySummary = {
+  applied_new: number;
+  applied_newer: number;
+  skipped_older: number;
+  skipped_duplicate: number;
 };
 
 type CoreSnapshotManifest = {
@@ -441,7 +428,13 @@ function normalizeNonEmptyText(value: string | null | undefined): string | null 
 }
 
 function normalizeMatrixPollutant(value: string | null): string | null {
-  return normalizeLatestMatrixPollutant(value);
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  const compact = normalized.toLowerCase().replace(/[\s_.-]/g, "");
+  if (compact === "pm25") return "pm25";
+  if (compact === "pm10") return "pm10";
+  if (compact === "no2") return "no2";
+  return null;
 }
 
 function normalizePollutant(value: string | null): string | null {
@@ -617,6 +610,19 @@ function formatUnit(unit: string | null): string | null {
   return trimmed;
 }
 
+function passesOutlierThreshold(pollutant: string | null, value: number | null): boolean {
+  if (value === null || !Number.isFinite(value)) return false;
+  if (!pollutant) return true;
+  const thresholds: Record<string, { min: number; max: number }> = {
+    "pm2.5": { min: 0, max: 500 },
+    "pm25": { min: 0, max: 500 },
+    "pm10": { min: 0, max: 600 },
+  };
+  const bounds = thresholds[pollutant];
+  if (!bounds) return true;
+  return value >= bounds.min && value <= bounds.max;
+}
+
 function matrixId(networkGroup: string, pollutant: string, windowLabel: string): string {
   return `network_group=${networkGroup}|pollutant=${pollutant}|window=${windowLabel}`;
 }
@@ -787,6 +793,78 @@ function decodeMessageRow(message: PubsubPullMessage): DecodedMessage {
   }
 }
 
+function stateKey(connectorId: number, timeseriesId: number): string {
+  return `${connectorId}:${timeseriesId}`;
+}
+
+function compareStateRows(a: LatestStateEntry, b: LatestStateEntry): number {
+  const aMs = Date.parse(a.observed_at);
+  const bMs = Date.parse(b.observed_at);
+  if (aMs !== bMs) return aMs - bMs;
+  const aIngested = a.ingested_at ? Date.parse(a.ingested_at) : 0;
+  const bIngested = b.ingested_at ? Date.parse(b.ingested_at) : 0;
+  if (aIngested !== bIngested) return aIngested - bIngested;
+  return 0;
+}
+
+function applyRowsToState(
+  stateMap: Map<string, LatestStateEntry>,
+  rows: ObservationMessageRow[],
+  ingestedAt: string,
+): StateApplySummary {
+  const summary: StateApplySummary = {
+    applied_new: 0,
+    applied_newer: 0,
+    skipped_older: 0,
+    skipped_duplicate: 0,
+  };
+
+  for (const row of rows) {
+    const key = stateKey(row.connector_id, row.timeseries_id);
+    const next: LatestStateEntry = {
+      connector_id: row.connector_id,
+      timeseries_id: row.timeseries_id,
+      observed_at: row.observed_at,
+      value: row.value,
+      value_float8_hex: row.value_float8_hex,
+      status: row.status,
+      ingested_at: ingestedAt,
+    };
+    const current = stateMap.get(key);
+    if (!current) {
+      stateMap.set(key, next);
+      summary.applied_new += 1;
+      continue;
+    }
+    const cmp = compareStateRows(current, next);
+    if (cmp < 0) {
+      stateMap.set(key, next);
+      summary.applied_newer += 1;
+    } else if (cmp === 0) {
+      summary.skipped_duplicate += 1;
+    } else {
+      summary.skipped_older += 1;
+    }
+  }
+
+  return summary;
+}
+
+function serializeState(stateMap: Map<string, LatestStateEntry>, updatedAt: string): Uint8Array {
+  const entries = [...stateMap.values()]
+    .sort((a, b) => {
+      if (a.connector_id !== b.connector_id) return a.connector_id - b.connector_id;
+      return a.timeseries_id - b.timeseries_id;
+    });
+
+  const payload: LatestStateFile = {
+    schema_version: 1,
+    updated_at: updatedAt,
+    entries,
+  };
+  return TEXT_ENCODER.encode(`${toStableJson(payload)}\n`);
+}
+
 async function loadState(): Promise<LoadedState> {
   try {
     const existing = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY });
@@ -812,7 +890,7 @@ async function loadState(): Promise<LoadedState> {
       if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) continue;
       if (!observedAt) continue;
       stateMap.set(
-        latestStateKey(Math.trunc(connectorId), Math.trunc(timeseriesId)),
+        stateKey(Math.trunc(connectorId), Math.trunc(timeseriesId)),
         {
           connector_id: Math.trunc(connectorId),
           timeseries_id: Math.trunc(timeseriesId),
@@ -1153,59 +1231,6 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
   };
 }
 
-function resolveEligibleStateRows(
-  rows: ObservationMessageRow[],
-  metadata: MetadataIndex,
-): { rows: EligibleObservationMessageRow[]; summary: StatePolicySummary } {
-  const eligibleRows: EligibleObservationMessageRow[] = [];
-  const summary: StatePolicySummary = {
-    eligible_rows: 0,
-    skipped_invalid_current_value: 0,
-    skipped_unsupported_pollutant: 0,
-    skipped_metadata_unresolved: 0,
-  };
-
-  for (const row of rows) {
-    const series = metadata.timeseriesById.get(row.timeseries_id);
-    if (!series) {
-      summary.skipped_metadata_unresolved += 1;
-      continue;
-    }
-    const phenomenon = series.phenomenon_id ? metadata.phenomenaById.get(series.phenomenon_id) || null : null;
-    const observedProperty = phenomenon?.observed_property_id
-      ? metadata.observedPropertyById.get(phenomenon.observed_property_id) || null
-      : null;
-    const pollutantNormalized = normalizePollutant(
-      observedProperty?.code ??
-        phenomenon?.notation ??
-        phenomenon?.pollutant_label ??
-        phenomenon?.label ??
-        null,
-    );
-    const decision = evaluateLatestCurrentValue({
-      matrixPollutant: normalizeMatrixPollutant(pollutantNormalized),
-      value: row.value,
-    });
-    if (!decision.eligible) {
-      if (decision.reason === "unsupported_pollutant") {
-        summary.skipped_unsupported_pollutant += 1;
-      } else {
-        summary.skipped_invalid_current_value += 1;
-      }
-      continue;
-    }
-    if (typeof row.value !== "number") {
-      summary.skipped_invalid_current_value += 1;
-      continue;
-    }
-
-    eligibleRows.push({ ...row, value: row.value });
-    summary.eligible_rows += 1;
-  }
-
-  return { rows: eligibleRows, summary };
-}
-
 function deriveNextCursor(rows: LatestItem[]): { since: string | null; sinceId: number | null } {
   let bestSince: string | null = null;
   let bestId: number | null = null;
@@ -1291,7 +1316,7 @@ function buildSourceRows(
     const matrixPollutant = normalizeMatrixPollutant(pollutantNormalized);
     if (!matrixPollutant) continue;
 
-    if (!evaluateLatestCurrentValue({ matrixPollutant, value: state.value }).eligible) continue;
+    if (!passesOutlierThreshold(pollutantNormalized, state.value)) continue;
     if (!(station?.pcon_code || station?.la_code)) continue;
 
     const network = station?.network_id ? metadata.networksById.get(station.network_id) || null : null;
@@ -1470,33 +1495,29 @@ async function main(): Promise<void> {
   }
 
   const stateLoaded = await loadState();
-  // Resolve metadata before pulling so an unavailable metadata source cannot
-  // consume or acknowledge Pub/Sub messages.
-  const metadataResult = await loadMetadataIndex();
+
 
   const pulled = await flushPubsubRows();
-  const eligible = resolveEligibleStateRows(pulled.rows, metadataResult.metadata);
   const ingestedAt = utcNowIso();
-  const stateApply = applyEligibleRowsToLatestState(stateLoaded.stateMap, eligible.rows, ingestedAt);
+  const stateApply = applyRowsToState(stateLoaded.stateMap, pulled.rows, ingestedAt);
   if (stateLoaded.stateMap.size > UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES) {
     throw new Error(
       `Latest snapshot state exceeded max entries (${stateLoaded.stateMap.size} > ${UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES}).`,
     );
   }
 
-  const stateTransitionCount = stateApply.applied_new + stateApply.applied_newer;
-  if (stateTransitionCount > 0) {
-    const stateBytes = TEXT_ENCODER.encode(serializeLatestState(stateLoaded.stateMap, ingestedAt));
-    const nextStateHash = sha256Hex(stateBytes);
-    if (nextStateHash !== stateLoaded.existingHash) {
-      await r2PutObject({
-        r2: R2_CONFIG,
-        key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
-        body: stateBytes,
-        content_type: "application/json; charset=utf-8",
-      });
-    }
+  const stateBytes = serializeState(stateLoaded.stateMap, ingestedAt);
+  const nextStateHash = sha256Hex(stateBytes);
+  const stateChanged = nextStateHash !== stateLoaded.existingHash;
+  if (stateChanged) {
+    await r2PutObject({
+      r2: R2_CONFIG,
+      key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
+      body: stateBytes,
+      content_type: "application/json; charset=utf-8",
+    });
   }
+
 
   if (pulled.validAckIds.length) {
     pulled.summary.ack_requests += await ackPubsubMessages(pulled.validAckIds);
@@ -1504,14 +1525,7 @@ async function main(): Promise<void> {
   }
 
 
-  console.log(JSON.stringify({
-    event: "latest_snapshot_state_apply",
-    timestamp: utcNowIso(),
-    pull: pulled.summary,
-    state_apply: stateApply,
-    state_policy: eligible.summary,
-    state_transition_count: stateTransitionCount,
-  }));
+  const metadataResult = await loadMetadataIndex();
 
   const sourceRows = buildSourceRows(stateLoaded.stateMap, metadataResult.metadata);
   if (sourceRows.missingMetadata > 0) {
