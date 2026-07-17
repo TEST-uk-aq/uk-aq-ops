@@ -47,7 +47,9 @@ R2 paths expected:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/manifest.json`
 - connector manifest:
   - `${UK_AQ_R2_HISTORY_AQILEVELS_PREFIX}/day_utc=YYYY-MM-DD/connector_id=NN/manifest.json`
-- the worker resolves timeseries window context from `uk_aq_public.uk_aq_timeseries_aqi_hourly` (including `connector_id`, `station_id`, and window `timeseries_ids`) and narrows scans accordingly
+- in v2, the worker resolves timeseries window context from the stable R2
+  binding, then `uk_aq_public.uk_aq_timeseries_aqi_hourly`; this narrows scans
+  without deriving routing from daily coverage
 - the ObsAQIDB fallback query reads the normalized hourly AQI contract directly (`daqi_input_*`, `eaqi_input_*`, `*_calculation_status`, `*_missing_reason`, and source counts) and the worker returns those normalized rows directly
 - if the ObsAQIDB context lookup misses while `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX=true`, the worker returns structured partial JSON instead of scanning every connector manifest for every day
 - optional AQI timeseries index (fast-path):
@@ -85,6 +87,8 @@ Useful runtime vars:
 - `UK_AQ_AQI_HISTORY_OBSAQIDB_TIMEOUT_MS` (default `10000`)
 - `UK_AQ_AQI_HISTORY_R2_PARQUET_ROW_CHUNK_SIZE` (default `5000`)
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
+- `UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX`
+  (default `history/_index_v2/timeseries_binding`)
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX` (default `history/_index/aqilevels_timeseries`)
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED` (default `true`)
 - `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX` (default `true`)

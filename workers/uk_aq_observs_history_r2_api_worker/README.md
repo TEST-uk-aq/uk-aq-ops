@@ -5,6 +5,7 @@ Cloudflare Worker for historical observations reads from R2 History.
 Routes:
 
 - `GET /v1/observations`
+- `GET /v1/timeseries-binding?timeseries_id=<id>` (stable v2 identity/routing)
 - alias: `GET /`
 
 Required query params:
@@ -102,6 +103,8 @@ Optional env:
   (legacy alias fallback for shared index prefix wiring)
 - `UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX`
   (default `${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}/observations_timeseries`)
+- `UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX`
+  (default `${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}/timeseries_binding`)
 
 ## Deploy (manual)
 

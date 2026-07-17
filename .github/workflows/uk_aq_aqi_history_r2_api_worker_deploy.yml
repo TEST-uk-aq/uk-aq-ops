@@ -32,6 +32,7 @@ jobs:
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX || 'history/_index_v2/aqilevels_hourly_data_timeseries' }}
+      UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || 'history/_index_v2/timeseries_binding' }}
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
       UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED: ${{ vars.UK_AQ_AQI_INTERNAL_RESPONSE_CACHE_ENABLED || 'true' }}
       UK_AQ_AQI_MUTABLE_HOURS: ${{ vars.UK_AQ_AQI_MUTABLE_HOURS || '120' }}
@@ -94,6 +95,7 @@ jobs:
           sed -i "s|__UK_AQ_R2_HISTORY_VERSION__|${UK_AQ_R2_HISTORY_VERSION}|g" workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX__|${UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX}|g" workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX__|${UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX}|g" workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml
+          sed -i "s|__UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX__|${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}|g" workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_INDEX_V2_PREFIX__|${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}|g" workers/uk_aq_aqi_history_r2_api_worker/wrangler.toml
           python3 - <<'PY'
           import os

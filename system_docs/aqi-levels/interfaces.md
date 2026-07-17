@@ -164,6 +164,16 @@ Typical metadata key:
 
 ```text
 history/_index_v2/timeseries/timeseries_id=NN.json
+
+Stable timeseries binding prefix (Phase 1 primary routing lookup):
+
+```text
+history/_index_v2/timeseries_binding/timeseries_id=NN.json
+```
+
+Bindings contain only authoritative core identity/routing fields and no daily
+observation or AQI coverage. The retired cumulative metadata tree is not an
+active API fallback.
 ```
 
 Required-index mode must fail boundedly with structured partial diagnostics when index context is absent. It must not fall back to scanning every connector and parquet object.

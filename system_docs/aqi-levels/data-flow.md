@@ -209,7 +209,8 @@ Index generation must:
 - retain deterministic key ordering and values;
 - derive timestamps from source manifests rather than wall-clock run time;
 - skip writes when the byte-identical index already exists;
-- update v2 timeseries metadata where targeted changes affect coverage.
+- publish stable identity/routing bindings separately from the core snapshot;
+  daily observation and AQI coverage remains in its domain indexes.
 
 Missing or invalid required indexes must produce partial read behaviour, not an unbounded fallback scan.
 

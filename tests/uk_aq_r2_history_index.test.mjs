@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildHistoryV2TimeseriesLatestPayload,
+  buildHistoryV2TimeseriesBindingPayload,
   buildHistoryV2TimeseriesMetadataIndexPayload,
   buildHistoryV2TimeseriesPollutantIndexPayload,
   buildR2HistoryObservationsTimeseriesConnectorIndexKey,
   buildR2HistoryObservationsTimeseriesLatestKey,
   buildR2HistoryV2TimeseriesMetadataIndexKey,
+  buildR2HistoryV2TimeseriesBindingKey,
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey,
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
   buildR2HistoryV2ObservationsTimeseriesLatestKey,
@@ -498,13 +500,12 @@ test("targeted v2 AQI index warns when non-empty pollutant manifest lacks usable
     assert.match(warnings, /--compute-missing-timeseries-counts/);
     assert.equal(summary.history_version, "v2");
     assert.equal(summary.index_prefix, "history/_index_v2");
-    assert.equal(summary.timeseries_metadata.index_kind, "timeseries_metadata");
   } finally {
     fake.restore();
   }
 });
 
-test("targeted v2 AQI index update refreshes timeseries metadata from rewritten indexes", async () => {
+test("targeted v2 AQI index update refreshes rewritten pollutant and latest indexes", async () => {
   const objects = {
     "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": {
       history_version: "v2",
@@ -603,9 +604,6 @@ test("targeted v2 AQI index update refreshes timeseries metadata from rewritten 
       generatedAt: "2026-06-03T00:00:00.000Z",
     });
 
-    assert.equal(summary.timeseries_metadata.timeseries_count, 1);
-    assert.equal(summary.timeseries_metadata.metadata_object_count, 1);
-    assert.equal(summary.timeseries_metadata.aqilevels.actual_index_manifest_count, 1);
     assert.equal(summary.aqilevels_timeseries.history_version, "v2");
     assert.equal(summary.aqilevels_timeseries.domain, "aqilevels");
     assert.equal(summary.aqilevels_timeseries.rewritten_pollutant_index_count, 1);
@@ -613,12 +611,6 @@ test("targeted v2 AQI index update refreshes timeseries metadata from rewritten 
     assert.equal(summary.results[0], summary.aqilevels_timeseries);
     assert.equal(summary.aqilevels_timeseries.affected_pollutant_indexes.length, 1);
     assert.equal(summary.aqilevels_timeseries.affected_pollutant_indexes[0].key, "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json");
-    const metadataRaw = fake.puts.get("history/_index_v2/timeseries/timeseries_id=1001.json");
-    assert.ok(metadataRaw, "targeted v2 update writes the timeseries metadata object");
-    const metadata = JSON.parse(metadataRaw);
-    assert.equal(metadata.aqi_coverage.row_count, 24);
-    assert.equal(metadata.aqi_coverage.first_timestamp_hour_utc, "2026-06-01T00:00:00.000Z");
-    assert.equal(metadata.aqi_coverage.last_timestamp_hour_utc, "2026-06-01T23:00:00.000Z");
     const latestRaw = fake.puts.get("history/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
     assert.ok(latestRaw, "targeted v2 update rewrites the merged global latest index");
     const latest = JSON.parse(latestRaw);
@@ -637,9 +629,8 @@ test("targeted v2 AQI index update refreshes timeseries metadata from rewritten 
   }
 });
 
-test("targeted v2 AQI empty connector supersedes stale pollutant index and metadata", async () => {
+test("targeted v2 AQI empty connector supersedes its stale pollutant index", async () => {
   const staleIndexKey = "history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-06-01/connector_id=6/pollutant_code=no2/manifest.json";
-  const metadataKey = "history/_index_v2/timeseries/timeseries_id=1001.json";
   const objects = {
     "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": {
       history_version: "v2",
@@ -667,28 +658,6 @@ test("targeted v2 AQI empty connector supersedes stale pollutant index and metad
         indexed_file_count: 1,
         backed_up_at_utc: "2026-06-01T00:00:00.000Z",
       }],
-    },
-    [metadataKey]: {
-      history_version: "v2",
-      index_kind: "timeseries_metadata",
-      timeseries_id: 1001,
-      aqi_coverage: {
-        row_count: 24,
-        entries: [{
-          domain: "aqilevels",
-          grain: "hourly",
-          profile: "data",
-          day_utc: "2026-06-01",
-          connector_id: 6,
-          pollutant_code: "no2",
-          row_count: 24,
-          min_timestamp_hour_utc: "2026-06-01T00:00:00.000Z",
-          max_timestamp_hour_utc: "2026-06-01T23:00:00.000Z",
-          source_index_key: staleIndexKey,
-          source_manifest_hash: "old-hash",
-          backed_up_at_utc: "2026-06-02T00:00:00.000Z",
-        }],
-      },
     },
     "history/v2/aqilevels/hourly/data/day_utc=2026-06-01/manifest.json": {
       connector_manifests: [{
@@ -731,7 +700,6 @@ test("targeted v2 AQI empty connector supersedes stale pollutant index and metad
       toDayUtc: "2026-06-01",
       connectorId: 6,
       generatedAt: "2026-06-03T00:00:00.000Z",
-      timeseriesMetadataMode: "targeted",
     });
 
     assert.equal(summary.aqilevels_timeseries.stale_pollutant_index_cleanup_count, 1);
@@ -748,15 +716,6 @@ test("targeted v2 AQI empty connector supersedes stale pollutant index and metad
       12,
     );
 
-    assert.equal(summary.timeseries_metadata.status, "succeeded");
-    assert.deepEqual(summary.timeseries_metadata.blocked_scopes ?? [], []);
-    assert.equal(fake.puts.has(metadataKey), true);
-
-    const rewrittenMetadata = JSON.parse(fake.puts.get(metadataKey));
-    assert.equal(rewrittenMetadata.aqi_coverage.row_count, 0);
-    assert.deepEqual(rewrittenMetadata.aqi_coverage.entries, []);
-    assert.deepEqual(rewrittenMetadata.aqi_coverage.pollutant_codes, []);
-    assert.equal(JSON.stringify(rewrittenMetadata).includes(staleIndexKey), false);
   } finally {
     fake.restore();
   }
@@ -1143,6 +1102,35 @@ test("v2 timeseries metadata payload is byte-stable when source timestamps are u
     generatedAt: "2026-06-18T11:00:00.000Z",
   }));
   assert.equal(first, second);
+});
+
+test("v2 stable timeseries binding payload is identity-only and byte-stable", () => {
+  const binding = {
+    timeseries_id: 3742,
+    connector_id: 6,
+    pollutant_code: "PM2.5",
+    station_id: 91,
+    phenomenon_id: 17,
+    observed_property_id: 4,
+  };
+  const first = JSON.stringify(buildHistoryV2TimeseriesBindingPayload(binding));
+  const second = JSON.stringify(buildHistoryV2TimeseriesBindingPayload(binding));
+  assert.equal(first, second);
+  assert.deepEqual(JSON.parse(first), {
+    schema_version: 1,
+    history_version: "v2",
+    index_kind: "timeseries_binding",
+    timeseries_id: 3742,
+    connector_id: 6,
+    pollutant_code: "pm25",
+    station_id: 91,
+    phenomenon_id: 17,
+    observed_property_id: 4,
+  });
+  assert.equal(
+    buildR2HistoryV2TimeseriesBindingKey("history/_index_v2/timeseries_binding", 3742),
+    "history/_index_v2/timeseries_binding/timeseries_id=3742.json",
+  );
 });
 
 test("targeted v2 metadata creates a missing object from core identity without a previous pollutant index", async () => {

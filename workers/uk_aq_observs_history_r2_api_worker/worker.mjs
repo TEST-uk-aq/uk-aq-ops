@@ -10,7 +10,7 @@ const DEFAULT_HISTORY_V2_PREFIX = "history/v2/observations";
 const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
 const DEFAULT_HISTORY_V2_INDEX_PREFIX = "history/_index_v2";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "observations_timeseries";
-const DEFAULT_TIMESERIES_METADATA_INDEX_SUBPREFIX = "timeseries";
+const DEFAULT_TIMESERIES_BINDING_INDEX_SUBPREFIX = "timeseries_binding";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
@@ -20,7 +20,7 @@ const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const OBS_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
-const VALID_PATHS = new Set(["/", "/v1/observations", "/v1/timeseries-metadata"]);
+const VALID_PATHS = new Set(["/", "/v1/observations", "/v1/timeseries-binding"]);
 
 function corsHeaders() {
   return {
@@ -242,12 +242,12 @@ async function inspectObservationsCacheEligibility(response) {
   }
 }
 
-async function isCacheableTimeseriesMetadataResponse(response) {
+async function isCacheableTimeseriesBindingResponse(response) {
   if (!response?.ok) return false;
   try {
     const payload = await response.clone().json();
     return Boolean(payload && typeof payload === "object" && !Array.isArray(payload)
-      && payload.ok === true && Object.hasOwn(payload, "metadata"));
+      && payload.ok === true && Object.hasOwn(payload, "binding"));
   } catch (_error) {
     return false;
   }
@@ -673,8 +673,8 @@ function parseObservationsRequest(url) {
   };
 }
 
-function parseTimeseriesMetadataRequest(url) {
-  if (url.pathname !== "/v1/timeseries-metadata") {
+function parseTimeseriesBindingRequest(url) {
+  if (url.pathname !== "/v1/timeseries-binding") {
     return { ok: false, status: 404, error: "Not found." };
   }
   const timeseriesId = parseRequiredPositiveInt(url.searchParams.get("timeseries_id"));
@@ -688,17 +688,17 @@ function parseTimeseriesMetadataRequest(url) {
   return { ok: true, timeseriesId };
 }
 
-function resolveTimeseriesMetadataIndexPrefix(env) {
+function resolveTimeseriesBindingIndexPrefix(env) {
   const historyIndexPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || DEFAULT_HISTORY_V2_INDEX_PREFIX,
   ) || DEFAULT_HISTORY_V2_INDEX_PREFIX;
   return normalizePrefix(
-    env.UK_AQ_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX
-      || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_METADATA_INDEX_SUBPREFIX}`,
-  ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_METADATA_INDEX_SUBPREFIX}`;
+    env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
+      || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_BINDING_INDEX_SUBPREFIX}`,
+  ) || `${historyIndexPrefix}/${DEFAULT_TIMESERIES_BINDING_INDEX_SUBPREFIX}`;
 }
 
-function buildTimeseriesMetadataIndexKey(prefix, timeseriesId) {
+function buildTimeseriesBindingIndexKey(prefix, timeseriesId) {
   return `${normalizePrefix(prefix)}/timeseries_id=${timeseriesId}.json`;
 }
 
@@ -733,9 +733,9 @@ export function buildCanonicalCacheKey(requestUrl, {
   return new Request(cacheUrl.toString(), { method: "GET" });
 }
 
-function buildTimeseriesMetadataCacheKey(requestUrl, requestParams) {
+function buildTimeseriesBindingCacheKey(requestUrl, requestParams) {
   const cacheUrl = new URL(requestUrl);
-  cacheUrl.pathname = "/v1/timeseries-metadata";
+  cacheUrl.pathname = "/v1/timeseries-binding";
   cacheUrl.search = "";
   cacheUrl.hash = "";
   cacheUrl.searchParams.set("timeseries_id", String(requestParams.timeseriesId));
@@ -1369,20 +1369,17 @@ async function handleRequest(requestParams, env) {
   });
 }
 
-async function handleTimeseriesMetadataRequest(requestParams, env) {
-  const metadataIndexPrefix = resolveTimeseriesMetadataIndexPrefix(env);
-  const metadataKey = buildTimeseriesMetadataIndexKey(
-    metadataIndexPrefix,
-    requestParams.timeseriesId,
-  );
-  const object = await fetchJsonObjectFromR2(env, metadataKey);
+async function handleTimeseriesBindingRequest(requestParams, env) {
+  const bindingIndexPrefix = resolveTimeseriesBindingIndexPrefix(env);
+  const bindingKey = buildTimeseriesBindingIndexKey(bindingIndexPrefix, requestParams.timeseriesId);
+  const object = await fetchJsonObjectFromR2(env, bindingKey);
   if (!object.exists) {
     return jsonResponse({
       ok: false,
-      error: "timeseries_metadata_not_found",
+      error: "timeseries_binding_not_found",
       timeseries_id: requestParams.timeseriesId,
-      metadata_index_prefix: metadataIndexPrefix,
-      metadata_key: metadataKey,
+      binding_index_prefix: bindingIndexPrefix,
+      binding_key: bindingKey,
     }, {
       status: 404,
       cacheSeconds: 60,
@@ -1392,9 +1389,9 @@ async function handleTimeseriesMetadataRequest(requestParams, env) {
   return jsonResponse({
     ok: true,
     timeseries_id: requestParams.timeseriesId,
-    metadata_index_prefix: metadataIndexPrefix,
-    metadata_key: metadataKey,
-    metadata: object.value,
+    binding_index_prefix: bindingIndexPrefix,
+    binding_key: bindingKey,
+    binding: object.value,
   }, {
     status: 200,
     cacheSeconds: DEFAULT_IMMUTABLE_CACHE_SECONDS,
@@ -1428,8 +1425,8 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
-    if (requestUrl.pathname === "/v1/timeseries-metadata") {
-      const requestParams = parseTimeseriesMetadataRequest(requestUrl);
+    if (requestUrl.pathname === "/v1/timeseries-binding") {
+      const requestParams = parseTimeseriesBindingRequest(requestUrl);
       if (!requestParams.ok) {
         return jsonResponse({ ok: false, error: requestParams.error }, {
           status: requestParams.status,
@@ -1437,13 +1434,11 @@ export default {
           noStore: true,
         });
       }
-      const cacheKey = buildTimeseriesMetadataCacheKey(request.url, requestParams);
+      const cacheKey = buildTimeseriesBindingCacheKey(request.url, requestParams);
       const cached = await caches.default.match(cacheKey);
-      if (cached) {
-        return withCacheMarker(cached, "HIT");
-      }
-      const response = await handleTimeseriesMetadataRequest(requestParams, env);
-      if (await isCacheableTimeseriesMetadataResponse(response)) {
+      if (cached) return withCacheMarker(cached, "HIT");
+      const response = await handleTimeseriesBindingRequest(requestParams, env);
+      if (await isCacheableTimeseriesBindingResponse(response)) {
         ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
       }
       return withCacheMarker(response, "MISS");

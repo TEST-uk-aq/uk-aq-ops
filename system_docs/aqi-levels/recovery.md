@@ -120,7 +120,7 @@ Before write mode, the recovery path should report:
 - current and proposed object keys;
 - current and proposed hashes;
 - parent manifests that must change;
-- indexes and timeseries metadata that must change;
+- indexes that must change;
 - unchanged objects that will be skipped;
 - missing dependencies that block the write.
 
@@ -157,7 +157,7 @@ Indexes are rebuilt only after the final manifest hierarchy is verified.
 For v2 AQI data, update:
 
 - the scoped `aqilevels_hourly_data_timeseries` indexes;
-- affected v2 timeseries metadata;
+- stable bindings remain a separate core-snapshot reconciliation concern;
 - any higher-level deterministic index required by the active read path.
 
 Index payloads must remain byte-stable where their source manifests did not change.

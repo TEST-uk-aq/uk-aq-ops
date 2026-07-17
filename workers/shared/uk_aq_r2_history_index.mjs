@@ -205,6 +205,8 @@ export const DEFAULT_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
   "history/_index_v2/aqilevels_hourly_data_timeseries";
 export const DEFAULT_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX =
   "history/_index_v2/timeseries";
+export const DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX =
+  "history/_index_v2/timeseries_binding";
 
 const DEFAULT_FETCH_CONCURRENCY = 16;
 const DEFAULT_MAX_KEYS = 1000;
@@ -213,6 +215,7 @@ const OBSERVATIONS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
 const AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
 const HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION = 3;
 const HISTORY_V2_TIMESERIES_METADATA_SCHEMA_VERSION = 1;
+export const HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION = 1;
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
 const MISSING_TIMESERIES_COUNTS_PREFIX =
   "Missing usable timeseries_row_counts in v2 AQI pollutant manifest";
@@ -422,9 +425,9 @@ export function resolveR2HistoryIndexConfig(env = defaultEnv()) {
       env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
         || `${indexPrefixV2}/${"aqilevels_hourly_data_timeseries"}`,
     ),
-    timeseries_metadata_index_prefix_v2: normalizePrefix(
-      env.UK_AQ_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX
-        || DEFAULT_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX,
+    timeseries_binding_index_prefix_v2: normalizePrefix(
+      env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
+        || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
     ),
     fetch_concurrency: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_INDEX_FETCH_CONCURRENCY,
@@ -582,6 +585,20 @@ export function buildR2HistoryV2TimeseriesMetadataIndexKey(
   const normalizedTimeseriesId = parsePositiveId(timeseriesId);
   if (!normalizedTimeseriesId) {
     throw new Error(`Invalid timeseries_id for v2 timeseries metadata index key: ${String(timeseriesId || "")}`);
+  }
+  return `${normalizedPrefix}/timeseries_id=${normalizedTimeseriesId}.json`;
+}
+
+export function buildR2HistoryV2TimeseriesBindingKey(
+  timeseriesBindingIndexPrefix,
+  timeseriesId,
+) {
+  const normalizedPrefix = normalizePrefix(
+    timeseriesBindingIndexPrefix || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
+  );
+  const normalizedTimeseriesId = parsePositiveId(timeseriesId);
+  if (!normalizedTimeseriesId) {
+    throw new Error(`Invalid timeseries_id for v2 timeseries binding key: ${String(timeseriesId || "")}`);
   }
   return `${normalizedPrefix}/timeseries_id=${normalizedTimeseriesId}.json`;
 }
@@ -1500,6 +1517,146 @@ function normalizeTimeseriesMetadataEntry(entry) {
         ? entry.source_manifest_hash.trim()
         : null,
     backed_up_at_utc: toIsoOrNull(entry.backed_up_at_utc),
+  };
+}
+
+function parseOptionalPositiveId(raw) {
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function normalizeAuthoritativeTimeseriesBinding(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const timeseriesId = parseOptionalPositiveId(raw.timeseries_id ?? raw.id);
+  const connectorId = parseOptionalPositiveId(raw.connector_id);
+  const pollutantCode = parsePollutantCode(raw.pollutant_code, "observations")
+    || (() => {
+      const compact = String(raw.pollutant_code || "").trim().toLowerCase().replace(/[\s._-]+/g, "");
+      return compact === "pm25" || compact === "pm10" || compact === "no2" ? compact : null;
+    })();
+  if (!timeseriesId || !connectorId || !pollutantCode) return null;
+  return {
+    timeseries_id: timeseriesId,
+    connector_id: connectorId,
+    pollutant_code: pollutantCode,
+    station_id: parseOptionalPositiveId(raw.station_id),
+    phenomenon_id: parseOptionalPositiveId(raw.phenomenon_id),
+    observed_property_id: parseOptionalPositiveId(raw.observed_property_id),
+  };
+}
+
+export function buildHistoryV2TimeseriesBindingPayload(binding) {
+  const normalized = normalizeAuthoritativeTimeseriesBinding(binding);
+  if (!normalized) {
+    throw new Error("authoritative_timeseries_binding_invalid");
+  }
+  const payload = {
+    schema_version: HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION,
+    history_version: "v2",
+    index_kind: "timeseries_binding",
+    timeseries_id: normalized.timeseries_id,
+    connector_id: normalized.connector_id,
+    pollutant_code: normalized.pollutant_code,
+  };
+  for (const field of ["station_id", "phenomenon_id", "observed_property_id"]) {
+    if (normalized[field]) payload[field] = normalized[field];
+  }
+  return payload;
+}
+
+export async function reconcileR2HistoryV2TimeseriesBindings({
+  r2,
+  bucketName,
+  timeseriesBindingIndexPrefix = DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
+  authoritativeTimeseries = [],
+  writeR2 = true,
+} = {}) {
+  if (!hasRequiredR2Config(r2)) {
+    throw new Error("Missing R2 config for R2 history v2 timeseries binding reconciliation");
+  }
+  const bindingPrefix = normalizePrefix(
+    timeseriesBindingIndexPrefix || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
+  );
+  const authoritativeByTimeseriesId = new Map();
+  const conflictedTimeseriesIds = new Set();
+  let invalidBindingCount = 0;
+  for (const raw of authoritativeTimeseries instanceof Map
+    ? authoritativeTimeseries.values()
+    : (Array.isArray(authoritativeTimeseries) ? authoritativeTimeseries : [])) {
+    const normalized = normalizeAuthoritativeTimeseriesBinding(raw);
+    if (!normalized) {
+      invalidBindingCount += 1;
+      continue;
+    }
+    const key = String(normalized.timeseries_id);
+    if (conflictedTimeseriesIds.has(key)) {
+      invalidBindingCount += 1;
+      continue;
+    }
+    const existing = authoritativeByTimeseriesId.get(key);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(normalized)) {
+      invalidBindingCount += 1;
+      authoritativeByTimeseriesId.delete(key);
+      conflictedTimeseriesIds.add(key);
+      continue;
+    }
+    if (!existing) authoritativeByTimeseriesId.set(key, normalized);
+  }
+
+  const existingEntries = await r2ListAllObjects({
+    r2,
+    prefix: `${bindingPrefix}/`,
+    max_keys: 1000,
+  });
+  const existingIds = new Set();
+  for (const entry of existingEntries) {
+    const match = String(entry?.key || "").match(new RegExp(`^${bindingPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/timeseries_id=([1-9]\\d*)\\.json$`));
+    if (match) existingIds.add(match[1]);
+  }
+
+  let bindingWrittenCount = 0;
+  let bindingChangedCount = 0;
+  let bindingUnchangedCount = 0;
+  let bindingNewCount = 0;
+  for (const binding of [...authoritativeByTimeseriesId.values()]
+    .sort((left, right) => left.timeseries_id - right.timeseries_id)) {
+    const key = buildR2HistoryV2TimeseriesBindingKey(bindingPrefix, binding.timeseries_id);
+    const body = `${JSON.stringify(buildHistoryV2TimeseriesBindingPayload(binding), null, 2)}\n`;
+    const result = await r2PutObjectIfChanged({
+      r2,
+      key,
+      body,
+      content_type: "application/json; charset=utf-8",
+      writeR2,
+    });
+    if (result.skipped) {
+      bindingUnchangedCount += 1;
+    } else if (writeR2) {
+      bindingWrittenCount += 1;
+      if (existingIds.has(String(binding.timeseries_id))) bindingChangedCount += 1;
+      else bindingNewCount += 1;
+    }
+  }
+
+  const staleBindingIds = [...existingIds]
+    .filter((timeseriesId) => !authoritativeByTimeseriesId.has(timeseriesId))
+    .map(Number)
+    .sort((left, right) => left - right);
+  return {
+    history_version: "v2",
+    index_kind: "timeseries_binding_reconciliation",
+    bucket: bucketName || r2.bucket,
+    timeseries_binding_index_prefix: bindingPrefix,
+    authoritative_timeseries_count: authoritativeByTimeseriesId.size,
+    binding_candidate_count: authoritativeByTimeseriesId.size,
+    binding_written_count: bindingWrittenCount,
+    binding_new_count: bindingNewCount,
+    binding_changed_count: bindingChangedCount,
+    binding_unchanged_count: bindingUnchangedCount,
+    invalid_binding_count: invalidBindingCount,
+    stale_binding_count: staleBindingIds.length,
+    stale_binding_timeseries_ids: staleBindingIds,
+    status: writeR2 ? "succeeded" : "planned",
   };
 }
 
@@ -4426,13 +4583,9 @@ export async function updateR2HistoryIndexesTargeted({
   fetchConcurrency,
   computeMissingTimeseriesCounts = false,
   strictMissingTimeseriesCounts,
-  timeseriesMetadataMode = "full",
-  proposalOnly = false,
   writeR2 = true,
   r2: r2Override = null,
-  authoritativeTimeseriesById = null,
   additionalPollutantManifestTargets = [],
-  prepareTimeseriesMetadataTargets = null,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   const r2 = r2Override || config.r2;
@@ -4453,7 +4606,6 @@ export async function updateR2HistoryIndexesTargeted({
   const results = [];
   let observationsTimeseries = null;
   let aqilevelsTimeseries = null;
-  let timeseriesMetadata = null;
   for (const domain of normalizedDomains) {
     if (normalizedHistoryVersion === "v2") {
       const dataPrefix = domain === "observations"
@@ -4536,55 +4688,6 @@ export async function updateR2HistoryIndexesTargeted({
     }
   }
 
-  if (normalizedHistoryVersion === "v2") {
-    if (timeseriesMetadataMode === "targeted") {
-      const affectedPollutantIndexes = results.flatMap((result) =>
-        Array.isArray(result?.affected_pollutant_indexes) ? result.affected_pollutant_indexes : []
-      );
-      const affectedTimeseriesIds = [...new Set(affectedPollutantIndexes.flatMap((source) => [
-        ...Object.keys(source?.payload?.timeseries_row_counts || {}),
-        ...Object.keys(source?.old_payload?.timeseries_row_counts || {}),
-      ]).map(parsePositiveId).filter(Boolean))].sort((left, right) => left - right);
-      if (typeof prepareTimeseriesMetadataTargets === "function") {
-        await prepareTimeseriesMetadataTargets({
-          timeseries_ids: affectedTimeseriesIds,
-          metadata_keys: affectedTimeseriesIds.map((timeseriesId) =>
-            buildR2HistoryV2TimeseriesMetadataIndexKey(
-              config.timeseries_metadata_index_prefix_v2,
-              timeseriesId,
-            )
-          ),
-        });
-      }
-      timeseriesMetadata = await updateR2HistoryV2TimeseriesMetadataIndexesTargeted({
-        r2,
-        bucketName: r2.bucket,
-        indexPrefix: config.index_prefix_v2,
-        timeseriesMetadataIndexPrefix: config.timeseries_metadata_index_prefix_v2,
-        affectedPollutantIndexes,
-        generatedAt,
-        writeR2,
-        plannedOnly: proposalOnly,
-        authoritativeTimeseriesById,
-      });
-    } else {
-      timeseriesMetadata = await rebuildR2HistoryV2TimeseriesMetadataIndexes({
-      r2,
-      bucketName: r2.bucket,
-      indexPrefix: config.index_prefix_v2,
-      observationsDataPrefix: config.observations_prefix_v2,
-      aqilevelsHourlyDataPrefix: config.aqilevels_hourly_data_prefix_v2,
-      observationsTimeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
-      aqilevelsHourlyDataTimeseriesIndexPrefix:
-        config.aqilevels_hourly_data_timeseries_index_prefix_v2,
-      timeseriesMetadataIndexPrefix: config.timeseries_metadata_index_prefix_v2,
-      generatedAt,
-      fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
-      writeR2,
-      });
-    }
-  }
-
   const responseIndexPrefix = normalizedHistoryVersion === "v2"
     ? config.index_prefix_v2
     : config.index_prefix;
@@ -4617,7 +4720,6 @@ export async function updateR2HistoryIndexesTargeted({
     results,
     observations_timeseries: observationsTimeseries,
     aqilevels_timeseries: aqilevelsTimeseries,
-    timeseries_metadata: timeseriesMetadata,
   };
 }
 
@@ -4693,21 +4795,6 @@ export async function rebuildR2HistoryIndexes({
         results.push(aqilevelsTimeseries);
       }
     }
-    const timeseriesMetadata = await rebuildR2HistoryV2TimeseriesMetadataIndexes({
-      r2: config.r2,
-      bucketName: config.r2.bucket,
-      indexPrefix: config.index_prefix_v2,
-      observationsDataPrefix: config.observations_prefix_v2,
-      aqilevelsHourlyDataPrefix: config.aqilevels_hourly_data_prefix_v2,
-      observationsTimeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
-      aqilevelsHourlyDataTimeseriesIndexPrefix:
-        config.aqilevels_hourly_data_timeseries_index_prefix_v2,
-      timeseriesMetadataIndexPrefix: config.timeseries_metadata_index_prefix_v2,
-      generatedAt,
-      fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
-      writeR2,
-    });
-
     return {
       history_version: "v2",
       generated_at: toIsoOrNull(generatedAt) || new Date().toISOString(),
@@ -4721,7 +4808,6 @@ export async function rebuildR2HistoryIndexes({
       results,
       observations_timeseries: observationsTimeseries,
       aqilevels_timeseries: aqilevelsTimeseries,
-      timeseries_metadata: timeseriesMetadata,
     };
   }
 

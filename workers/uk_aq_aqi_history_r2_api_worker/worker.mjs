@@ -19,7 +19,7 @@ const DEFAULT_HISTORY_INDEX_PREFIX = "history/_index";
 const DEFAULT_HISTORY_V2_INDEX_PREFIX = "history/_index_v2";
 const DEFAULT_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_timeseries";
 const DEFAULT_V2_TIMESERIES_INDEX_SUBPREFIX = "aqilevels_hourly_data_timeseries";
-const DEFAULT_V2_TIMESERIES_METADATA_INDEX_SUBPREFIX = "timeseries";
+const DEFAULT_V2_TIMESERIES_BINDING_INDEX_SUBPREFIX = "timeseries_binding";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
@@ -1132,9 +1132,10 @@ async function readTimeseriesWindowContextFromObsAqiDb({
   };
 }
 
-function buildTimeseriesMetadataIndexKey(historyIndexPrefix, timeseriesId) {
+function buildTimeseriesBindingIndexKey(historyIndexPrefix, timeseriesId, bindingIndexPrefix = null) {
   const normalizedPrefix = normalizePrefix(
-    `${historyIndexPrefix || DEFAULT_HISTORY_V2_INDEX_PREFIX}/${DEFAULT_V2_TIMESERIES_METADATA_INDEX_SUBPREFIX}`,
+    bindingIndexPrefix
+      || `${historyIndexPrefix || DEFAULT_HISTORY_V2_INDEX_PREFIX}/${DEFAULT_V2_TIMESERIES_BINDING_INDEX_SUBPREFIX}`,
   );
   const normalizedTimeseriesId = parseRequiredPositiveInt(timeseriesId);
   if (!normalizedPrefix || !normalizedTimeseriesId) {
@@ -1143,55 +1144,65 @@ function buildTimeseriesMetadataIndexKey(historyIndexPrefix, timeseriesId) {
   return `${normalizedPrefix}/timeseries_id=${normalizedTimeseriesId}.json`;
 }
 
-async function readTimeseriesWindowContextFromR2Metadata({
+async function readTimeseriesWindowContextFromR2Binding({
   env,
   historyIndexPrefix,
   timeseriesId,
 }) {
-  const metadataKey = buildTimeseriesMetadataIndexKey(historyIndexPrefix, timeseriesId);
+  const bindingKey = buildTimeseriesBindingIndexKey(
+    historyIndexPrefix,
+    timeseriesId,
+    env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
+  );
   if (
-    !metadataKey
+    !bindingKey
     || !env.UK_AQ_HISTORY_BUCKET
     || typeof env.UK_AQ_HISTORY_BUCKET.get !== "function"
   ) {
     return {
       found: false,
-      source_path: metadataKey,
+      source_path: bindingKey,
       connector_id: null,
       station_id: null,
       timeseries_ids: [timeseriesId],
-      metadata: null,
+      binding: null,
     };
   }
 
-  const object = await fetchJsonObjectFromR2(env, metadataKey, null, "timeseries_metadata");
+  const object = await fetchJsonObjectFromR2(env, bindingKey, null, "timeseries_binding");
   if (!object.exists) {
     return {
       found: false,
-      source_path: metadataKey,
+      source_path: bindingKey,
       connector_id: null,
       station_id: null,
       timeseries_ids: [timeseriesId],
-      metadata: null,
+      binding: null,
     };
   }
 
-  const metadata = object.value && typeof object.value === "object" && !Array.isArray(object.value)
+  const binding = object.value && typeof object.value === "object" && !Array.isArray(object.value)
     ? object.value
     : {};
-  const connectorIds = Array.isArray(metadata.connector_ids)
-    ? metadata.connector_ids.map((value) => parseRequiredPositiveInt(value)).filter(Boolean)
-    : [];
-  const connectorId =
-    parseRequiredPositiveInt(metadata.connector_id)
-    || (connectorIds.length === 1 ? connectorIds[0] : null);
+  const normalizedTimeseriesId = parseRequiredPositiveInt(binding.timeseries_id);
+  const connectorId = parseRequiredPositiveInt(binding.connector_id);
+  if (normalizedTimeseriesId !== parseRequiredPositiveInt(timeseriesId) || !connectorId) {
+    return {
+      found: false,
+      source_path: bindingKey,
+      connector_id: null,
+      station_id: null,
+      timeseries_ids: [timeseriesId],
+      binding,
+    };
+  }
   return {
-    found: Boolean(connectorId),
-    source_path: metadataKey,
+    found: true,
+    source_path: bindingKey,
     connector_id: connectorId,
-    station_id: null,
-    timeseries_ids: [timeseriesId],
-    metadata,
+    station_id: parseRequiredPositiveInt(binding.station_id) || null,
+    timeseries_ids: [normalizedTimeseriesId],
+    binding,
   };
 }
 
@@ -2494,10 +2505,10 @@ async function handleRequest(request, env, ctx) {
   let windowContextLookupCacheHit = false;
   let windowContextLookupAttempted = false;
   let windowContextLookupSource = null;
-  let r2TimeseriesMetadataLookupAttempted = false;
-  let r2TimeseriesMetadataLookupFound = false;
-  let r2TimeseriesMetadataIndexKey = null;
-  let r2TimeseriesMetadata = null;
+  let r2TimeseriesBindingLookupAttempted = false;
+  let r2TimeseriesBindingLookupFound = false;
+  let r2TimeseriesBindingIndexKey = null;
+  let r2TimeseriesBinding = null;
   let obsAqiDbContextLookupAttempted = false;
   let targetConnectorId = requestedConnectorId || null;
   let targetStationId = requestedStationId || null;
@@ -2523,23 +2534,23 @@ async function handleRequest(request, env, ctx) {
     }
 
     if (!targetConnectorId && readVersion === "v2" && hasHistoryWindow) {
-      r2TimeseriesMetadataLookupAttempted = true;
+      r2TimeseriesBindingLookupAttempted = true;
       try {
-        const metadataLookup = await readTimeseriesWindowContextFromR2Metadata({
+        const bindingLookup = await readTimeseriesWindowContextFromR2Binding({
           env,
           historyIndexPrefix,
           timeseriesId,
         });
-        r2TimeseriesMetadataIndexKey = metadataLookup.source_path;
-        r2TimeseriesMetadataLookupFound = Boolean(metadataLookup.found);
-        r2TimeseriesMetadata = metadataLookup.metadata || null;
-        if (metadataLookup.found) {
-          windowContextLookupSource = "r2_metadata";
-          targetConnectorId = parseRequiredPositiveInt(metadataLookup.connector_id) || targetConnectorId;
-          targetStationId = parseRequiredPositiveInt(metadataLookup.station_id) || targetStationId;
-          targetTimeseriesIds = Array.isArray(metadataLookup.timeseries_ids)
-            && metadataLookup.timeseries_ids.length > 0
-            ? metadataLookup.timeseries_ids
+        r2TimeseriesBindingIndexKey = bindingLookup.source_path;
+        r2TimeseriesBindingLookupFound = Boolean(bindingLookup.found);
+        r2TimeseriesBinding = bindingLookup.binding || null;
+        if (bindingLookup.found) {
+          windowContextLookupSource = "r2_binding";
+          targetConnectorId = parseRequiredPositiveInt(bindingLookup.connector_id) || targetConnectorId;
+          targetStationId = parseRequiredPositiveInt(bindingLookup.station_id) || targetStationId;
+          targetTimeseriesIds = Array.isArray(bindingLookup.timeseries_ids)
+            && bindingLookup.timeseries_ids.length > 0
+            ? bindingLookup.timeseries_ids
             : [timeseriesId];
           if (isHistoricalOnlyWindow || readVersion === "v2") {
             return {
@@ -3082,7 +3093,7 @@ async function handleRequest(request, env, ctx) {
       used_r2: r2MergePoints.length > 0 || hasHistoryWindow,
       used_supabase: obsAqiDbContextLookupAttempted || recentFallbackRead.status === "fallback_live",
       connector_id_source: windowContextLookupSource,
-      used_r2_timeseries_metadata_lookup: r2TimeseriesMetadataLookupFound,
+      used_r2_timeseries_binding_lookup: r2TimeseriesBindingLookupFound,
       used_supabase_connector_lookup: obsAqiDbContextLookupAttempted,
       timeseries_id: timeseriesId,
       station_id: targetStationId,
@@ -3155,12 +3166,12 @@ async function handleRequest(request, env, ctx) {
       target_station_id: targetStationId,
       resolved_connector_id: resolvedR2ConnectorId,
       connector_id_source: windowContextLookupSource,
-      timeseries_metadata_index_key: r2TimeseriesMetadataIndexKey,
-      r2_timeseries_metadata_lookup_attempted: r2TimeseriesMetadataLookupAttempted,
-      r2_timeseries_metadata_lookup_found: r2TimeseriesMetadataLookupFound,
-      used_r2_timeseries_metadata_lookup: r2TimeseriesMetadataLookupFound,
+      timeseries_binding_index_key: r2TimeseriesBindingIndexKey,
+      r2_timeseries_binding_lookup_attempted: r2TimeseriesBindingLookupAttempted,
+      r2_timeseries_binding_lookup_found: r2TimeseriesBindingLookupFound,
+      used_r2_timeseries_binding_lookup: r2TimeseriesBindingLookupFound,
+      r2_timeseries_binding: r2TimeseriesBinding,
       used_supabase_connector_lookup: obsAqiDbContextLookupAttempted,
-      r2_timeseries_metadata: r2TimeseriesMetadata,
       timeseries_window_context_lookup_source_path: windowContextSourcePath,
       timeseries_window_context_lookup_source: windowContextLookupSource,
       timeseries_window_context_lookup_error: windowContextLookupError,
@@ -3226,7 +3237,6 @@ async function handleRequest(request, env, ctx) {
     station_id: targetStationId,
     connector_id: targetConnectorId,
     connector_id_source: windowContextLookupSource,
-    used_r2_timeseries_metadata_lookup: r2TimeseriesMetadataLookupFound,
     used_supabase_connector_lookup: obsAqiDbContextLookupAttempted,
     pollutant: requestedPollutant,
     from_utc: startIso,

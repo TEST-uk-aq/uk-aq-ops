@@ -56,7 +56,7 @@ See [`documentation_contract.md`](documentation_contract.md) for the full mainte
 | Area | Authoritative directory | Current status |
 |---|---|---|
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Initial authoritative contract created |
-| Raw observations R2 history and indexes | `r2_history/` | Migration analysis pending |
+| Raw observations R2 history and indexes | [`r2_history/`](r2_history/) | Binding-index Phase 1 contract created |
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
 | AQI generation, AQI history and WHO summaries | `aqi/` | Migration analysis pending |
@@ -70,7 +70,7 @@ See [`documentation_contract.md`](documentation_contract.md) for the full mainte
 
 Directories marked as pending are proposed area boundaries, not yet authoritative replacements for existing documents. Existing documents remain in force until their migration is explicitly recorded here.
 
-## Current authoritative area
+## Current authoritative areas
 
 The first completed area is [`latest_snapshot/`](latest_snapshot/). It governs:
 
@@ -80,6 +80,12 @@ The first completed area is [`latest_snapshot/`](latest_snapshot/). It governs:
 - latest-snapshot state seed, repair and rebuild tooling;
 - `.github/workflows/uk_aq_latest_snapshot_cloud_run_deploy.yml`;
 - `.github/workflows/uk_aq_latest_snapshot_r2_api_worker_deploy.yml`.
+
+The R2-history binding contract in [`r2_history/`](r2_history/) governs the
+stable v2 timeseries identity/routing objects, their core-snapshot publisher,
+the observations and AQI R2 API readers, cache-proxy routing, backup inventory
+and local integrity validation. It does not replace the remaining R2-history
+area documentation.
 
 ## Repository-wide rules already defined elsewhere
 

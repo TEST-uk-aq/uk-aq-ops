@@ -231,7 +231,8 @@ After the normal TEST Prune Daily run processes a suitable closed day, confirm:
 - data and debug profile row counts and keys agree;
 - calculation statuses and missing reasons are retained;
 - pollutant, connector and day manifests exist and agree with child objects;
-- targeted indexes and timeseries metadata reflect the committed rows;
+- targeted indexes reflect the committed rows; stable bindings are validated
+  independently against the committed core snapshot;
 - no unrelated observation deletion or history gate behaviour changed.
 
 ## 4. Private AQI History R2 API

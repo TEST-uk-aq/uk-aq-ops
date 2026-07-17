@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DEFAULT_TABLES, resolveCoreSnapshotPrefix } from '../scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs';
+import {
+  DEFAULT_TABLES,
+  buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows,
+  resolveCoreSnapshotPrefix,
+} from '../scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs';
 import { resolveDomainPrefixes } from '../scripts/backup_r2/build_backup_inventory.mjs';
 
 test('core snapshot generation chooses v1 prefix for canonical v1 history version', () => {
@@ -42,4 +46,22 @@ test('core snapshot default table set uses canonical networks table only', () =>
   assert.ok(DEFAULT_TABLES.includes('observed_property_mappings'));
   assert.equal(DEFAULT_TABLES.includes('uk_aq_networks'), false);
   assert.equal(DEFAULT_TABLES.includes('station_network_memberships'), false);
+});
+
+test('core snapshot binding resolver uses only stable authoritative identity fields', () => {
+  const bindings = buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
+    timeseriesRows: [{
+      id: 3742, connector_id: 6, station_id: 91, phenomenon_id: 17,
+    }],
+    phenomenaRows: [{ id: 17, observed_property_id: 4 }],
+    observedPropertiesRows: [{ id: 4, label: 'PM2.5' }],
+  });
+  assert.deepEqual(bindings, [{
+    timeseries_id: 3742,
+    connector_id: 6,
+    pollutant_code: 'pm25',
+    station_id: 91,
+    phenomenon_id: 17,
+    observed_property_id: 4,
+  }]);
 });

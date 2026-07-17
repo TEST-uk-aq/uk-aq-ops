@@ -48,7 +48,8 @@ Do not use archived worker instructions as the normal AQI runbook.
 3. It obtains AQI rows through the configured observation-derived or legacy materialised branch.
 4. It writes AQI data and debug parquet parts.
 5. It writes pollutant, connector and day manifests.
-6. It updates targeted AQI indexes and v2 timeseries metadata.
+6. It updates targeted AQI indexes. Stable timeseries bindings are published
+   and reconciled separately from the core snapshot.
 7. The private AQI API serves only committed manifest-backed history.
 
 ## Prune Daily schedule
@@ -84,6 +85,7 @@ UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX
 UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX
 UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
 UK_AQ_R2_HISTORY_INDEX_V2_PREFIX
+UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
 ```
 
 ## Prune Daily writer configuration
@@ -271,7 +273,7 @@ When AQI bands are missing, shifted or stale, check in this order:
 4. shared calculation input and rolling counts;
 5. R2 data/debug row for the endpoint;
 6. pollutant, connector and day manifests;
-7. AQI timeseries index and timeseries metadata;
+7. AQI timeseries index and stable timeseries binding;
 8. AQI History API completeness and scan stop reason;
 9. station-history source mode, overlap and mismatch diagnostics;
 10. cache-proxy response and feature flags;

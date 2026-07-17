@@ -290,9 +290,7 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
   // connector/day discovery: a simultaneous parent rebuild needs every valid
   // sibling. readChildren still validates every manifest before use.
   void dropboxSourceKeys;
-  const indexProposalKind = (key) => key.includes("/timeseries_id=")
-    ? "timeseries_metadata"
-    : key.endsWith("_latest.json")
+  const indexProposalKind = (key) => key.endsWith("_latest.json")
       ? "latest_timeseries_index"
       : "pollutant_timeseries_index";
 
@@ -305,14 +303,6 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
     const existing = previous ? null : store.getObjectIfExists(key);
     const oldBody = previous ? previous.old_body : existing?.body?.toString("utf8") ?? null;
     const changed = oldBody !== bodyText;
-    const metadataProvenance = proposalKind === "timeseries_metadata"
-      ? {
-        metadata_source: existing
-          ? "existing_combined_local_timeseries_metadata"
-          : "authoritative_core_snapshot",
-        baseline_source: existing?.source || "authoritative_core_snapshot",
-      }
-      : null;
     const proposal = {
       key,
       kind: proposalKind,
@@ -327,7 +317,7 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
       dependencies: [...new Set([...(previous?.dependencies || []), ...dependencies])].sort(),
       baseline_source: previous?.baseline_source || existing?.source || null,
       local_dependency_snapshot: previous?.local_dependency_snapshot || localDependencySnapshot,
-      provenance: previous?.provenance || provenance || metadataProvenance,
+      provenance: previous?.provenance || provenance || null,
     };
     proposals.set(key, proposal);
     return proposal;
@@ -787,8 +777,7 @@ export async function applyStagedProposals({
     connector_manifest: 2,
     day_manifest: 3,
     pollutant_timeseries_index: 4,
-    timeseries_metadata: 5,
-    latest_timeseries_index: 6,
+    latest_timeseries_index: 5,
   };
   const ordered = [...proposals.values()].sort((left, right) =>
     (rank[left.kind] || 99) - (rank[right.kind] || 99) || left.key.localeCompare(right.key)
@@ -1054,7 +1043,6 @@ export async function runV2ObservationsRepair({
   );
   const { inputKind, domain, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
   reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
-  const coreTimeseries = authoritativeTimeseriesById(input);
   const config = resolveR2HistoryIndexConfig(env);
   if (args.writeR2 && env.UK_AQ_ENV_NAME !== "CIC-Test") {
     throw new Error(`Refusing Phase 4 repair write: UK_AQ_ENV_NAME must be CIC-Test (got ${env.UK_AQ_ENV_NAME || "(empty)"})`);
@@ -1105,7 +1093,7 @@ export async function runV2ObservationsRepair({
       `${indexPrefix}/day_utc=${scope.dayUtc}`,
     ]))],
     exactKeys: [latestIndexKey],
-    dynamicExactKeyPrefixes: [config.timeseries_metadata_index_prefix_v2],
+    dynamicExactKeyPrefixes: [],
   });
   const staged = createStagedObjectMap({
     r2: config.r2,
@@ -1286,30 +1274,16 @@ export async function runV2ObservationsRepair({
             connectorId,
             generatedAt: stableGeneratedAt({ dayUtc, dayManifest }),
             strictMissingTimeseriesCounts: true,
-            timeseriesMetadataMode: "targeted",
-            proposalOnly: true,
             writeR2: false,
-            authoritativeTimeseriesById: coreTimeseries,
             additionalPollutantManifestTargets: additionalIndexPollutantTargets.filter((target) =>
               target.day_utc === dayUtc && target.connector_id === connectorId
             ),
           }));
         }
-        const metadataResults = results.map((result) => result?.timeseries_metadata).filter(Boolean);
         index = {
           status: "planned",
           connector_ids: indexConnectorIds,
           results,
-          timeseries_metadata: {
-            status: metadataResults.some((result) => result.status === "blocked_dependency")
-              ? "blocked_dependency"
-              : "planned",
-            blocked_scopes: metadataResults.flatMap((result) => result.blocked_scopes || []),
-            metadata_object_count: metadataResults.reduce((total, result) => total + Number(result.metadata_object_count || 0), 0),
-            existing_object_merged_count: metadataResults.reduce((total, result) => total + Number(result.existing_object_merged_count || 0), 0),
-            new_object_count: metadataResults.reduce((total, result) => total + Number(result.new_object_count || 0), 0),
-            unchanged_object_count: metadataResults.reduce((total, result) => total + Number(result.unchanged_object_count || 0), 0),
-          },
         };
       } catch (error) {
         staged.proposals.clear();
@@ -1324,15 +1298,6 @@ export async function runV2ObservationsRepair({
           detail: message,
         });
         dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: manifestStageStatus(proposalKeys), index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
-        continue;
-      }
-      if (index?.timeseries_metadata?.status === "blocked_dependency") {
-        staged.proposals.clear();
-        for (const [key, proposal] of proposalSnapshot) staged.proposals.set(key, proposal);
-        for (const blocked of index.timeseries_metadata.blocked_scopes || []) {
-          blockedScopes.push({ day_utc: dayUtc, ...blocked });
-        }
-        dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: manifestStageStatus(proposalKeys), index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index });
         continue;
       }
       for (const key of staged.proposals.keys()) {
@@ -1352,7 +1317,7 @@ export async function runV2ObservationsRepair({
   }
 
   // The shared builder plans a latest summary while it is constructing the
-  // targeted merge. Apply it last, after all lower-level index and metadata
+  // targeted merge. Apply it last, after all lower-level index
   // proposals have completed their PUT-and-GET verification.
   const latestKeys = new Set(dayPlans.map((plan) => {
     const domainResult = domain === "observations"
@@ -1365,7 +1330,7 @@ export async function runV2ObservationsRepair({
     if (proposal) {
       staged.proposals.delete(key);
       const dependencies = [...staged.proposals.values()]
-        .filter((candidate) => ["pollutant_timeseries_index", "timeseries_metadata"].includes(candidate.kind))
+        .filter((candidate) => candidate.kind === "pollutant_timeseries_index")
         .map((candidate) => candidate.key)
         .sort();
       staged.proposals.set(key, {
