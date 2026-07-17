@@ -4,6 +4,8 @@
 
 This document defines how to recover latest-valid state and regenerate current physical snapshot products without changing raw observation history or the public v2 API contract.
 
+It also defines the limited recovery and rollback actions for the disposable local cache and R2 run-report policy.
+
 ## Recovery source of truth
 
 A state recovery must rebuild the newest eligible valid raw observation for each `(connector_id, timeseries_id)`.
@@ -13,9 +15,12 @@ The recovery source must contain sufficient observation history to find a preced
 Do not use the following as sole authority when state may be poisoned:
 
 - the existing latest-state object;
+- any `/tmp` local-cache file;
 - existing Latest Snapshot objects;
 - `timeseries.last_value` without confirming that it already means latest valid value;
 - a latest-value RPC that removes an invalid newest row without falling back to the preceding valid observation.
+
+The container-local cache is never recovery evidence. R2 remains durable authority during normal operation, and raw history is required when durable latest state itself is being repaired.
 
 ## Existing seed scripts
 
@@ -50,7 +55,8 @@ A repair must not:
 - refresh a retained valid timestamp to the timestamp of an invalid row;
 - change public row fields;
 - change network or metadata eligibility;
-- create finite-window state or snapshot objects.
+- create finite-window state or snapshot objects;
+- use a local `/tmp` copy as the write source.
 
 ## Safe state-recovery sequence
 
@@ -62,6 +68,8 @@ Before write mode, preserve or download:
 - `latest_snapshots/v2/manifest.json`;
 - the three physical `window=all` objects;
 - a bounded report of affected identities.
+
+Do not preserve local cache files as authoritative evidence. Their body and sidecar may be copied only as optional diagnostic material when investigating a cache defect.
 
 ### 2. Produce a dry report
 
@@ -96,6 +104,8 @@ Write the rebuilt state only after the dry report confirms the expected eligibil
 
 Use the existing state key and schema version unless an approved migration says otherwise.
 
+A direct external R2 state repair changes the R2 ETag. On the next builder run, a warm local copy with the old ETag is rejected and refreshed from R2. No manual local-cache invalidation is required.
+
 ### 5. Regenerate physical products
 
 Run the normal builder. It regenerates only:
@@ -125,6 +135,76 @@ The current runtime classifies value eligibility before state application, so ne
 
 A future valid observation can replace an old poisoned entry, but this is not a reliable substitute for explicit recovery when a timeseries remains silent or invalid for a long period.
 
+## Local-cache fault handling
+
+### Expected automatic recovery
+
+The builder automatically abandons a local entry when:
+
+- either local file is missing;
+- the sidecar is malformed or names another key;
+- the local body is invalid JSON;
+- the local SHA-256 does not match;
+- the R2 object does not exist;
+- the R2 ETag is unavailable or differs;
+- R2 validation fails.
+
+The normal R2 GET path is then used. When successful, it may replace the local entry.
+
+### Manual diagnostic reset
+
+The local cache can be reset by either:
+
+- deploying a new Cloud Run revision or allowing the current container to be replaced;
+- deleting the configured cache directory inside a diagnostic environment;
+- setting `UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED=false` and redeploying.
+
+No R2 objects, Pub/Sub messages or public snapshots need to be changed.
+
+### Persistent local-cache warnings
+
+If `corrupt`, `validation_error`, `write_failure` or `skipped_missing_etag` continue increasing:
+
+1. disable the local cache;
+2. confirm direct R2 operation succeeds;
+3. inspect R2 HEAD/GET response ETags and container filesystem permissions;
+4. restore the previous Cloud Run revision if the cache implementation is implicated.
+
+Do not use an unvalidated local body to keep the builder running during an R2 failure.
+
+## Run-report recovery and rollback
+
+Run reports are diagnostic artefacts, not durable system state.
+
+A missing report for a successful scheduled run is normal when mode is `failures`. First inspect the structured `latest_snapshot_job_summary` fields:
+
+```text
+run_reports.mode
+run_reports.source
+run_reports.write
+run_reports.reason
+```
+
+Expected normal decision:
+
+```text
+mode=failures
+write=false
+reason=scheduled_success
+```
+
+To restore the former every-completed-run report frequency, set:
+
+```text
+UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_MODE=all
+```
+
+and redeploy. This does not change state, snapshots or the manifest.
+
+To disable R2 report objects completely, use `off`.
+
+Old `_runs` objects are not deleted or reconstructed by recovery. Early exceptions that occurred before a completed build summary cannot be recreated as run-report objects and remain available through service logging where retained.
+
 ## Snapshot-architecture rollback
 
 The current public API depends on the deriving R2 API Worker and the all-only builder.
@@ -143,12 +223,33 @@ Old finite objects are not used as fallbacks by the current Worker. They may sup
 
 If a repaired state produces unexpected coverage or metadata behaviour:
 
-1. restore the preserved previous state object;
+1. restore the preserved previous R2 state object;
 2. run the normal builder to regenerate the three physical `all` objects and manifest;
-3. restore the previous runtime revision only if the state-transition implementation is implicated;
-4. retain reports and hashes for diagnosis.
+3. allow ETag validation to refresh any stale local state or manifest copy;
+4. restore the previous runtime revision only if the state-transition implementation is implicated;
+5. retain reports and hashes for diagnosis.
 
 Raw history is not modified and is not part of rollback.
+
+## Warm-cache amendment rollback
+
+The cache and report changes are independently reversible:
+
+```text
+UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED=false
+UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_MODE=all
+```
+
+Redeploying these values restores direct R2 body loads and previous report frequency.
+
+The rollback must not:
+
+- restore local files into R2;
+- alter the state schema;
+- replay acknowledged Pub/Sub messages;
+- change the three physical snapshot objects;
+- change the public R2 API Worker;
+- delete old run reports.
 
 ## Recovery-tool contract
 
@@ -161,4 +262,5 @@ A new or amended recovery tool must:
 - avoid archive execution paths;
 - document its exact source semantics;
 - support bounded targeted repair where practical;
-- generate only current physical `all` products through the normal builder.
+- generate only current physical `all` products through the normal builder;
+- ignore local `/tmp` cache files as recovery sources.
