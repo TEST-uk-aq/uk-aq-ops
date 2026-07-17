@@ -1331,6 +1331,7 @@ function buildRunConfig(url) {
   );
 
   const phaseB = resolvePhaseBRuntimeConfig(process.env);
+  phaseB.observs_retention_days = obsAqidbObservsRetentionDays;
   phaseB.enabled = parseBoolean(
     params.get("historyEnabled") ?? process.env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED,
     phaseB.enabled,

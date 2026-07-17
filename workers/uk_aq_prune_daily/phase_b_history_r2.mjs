@@ -29,8 +29,11 @@ import {
 } from "../shared/uk_aq_r2_history_index.mjs";
 import {
   AQI_SUPPORTED_POLLUTANTS,
+  buildAqilevelHistoryRowsForDayFromHourlyRows,
   buildAqilevelHistoryRowsForDayFromSourceObservations,
   dedupeSourceObservationRows,
+  mergeAqiHourlyRowsPreferTargetDay,
+  sourceObservationsToNarrowRows,
 } from "../../lib/aqi/aqi_levels.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -52,10 +55,15 @@ const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
 const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
+const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
 const DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED = false;
 const DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED = true;
 const DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS = 250_000;
 const DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024;
+const DEFAULT_PHASE_B_PM_CONTEXT_RPC = "uk_aq_rpc_observs_aqi_pm_hourly_context";
+const DEFAULT_PHASE_B_PM_CONTEXT_PAGE_SIZE = 1_000;
+const DEFAULT_PHASE_B_PM_CONTEXT_MAX_PAGES = 100;
+const DEFAULT_PHASE_B_PM_CONTEXT_MAX_ROWS = 50_000;
 const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -799,6 +807,221 @@ async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payloa
   }
 
   return parsed;
+}
+
+class PhaseBPmContextError extends Error {
+  constructor(message, diagnostics, code = "PHASE_B_PM_CONTEXT_INCOMPLETE") {
+    super(message);
+    this.name = "PhaseBPmContextError";
+    this.code = code;
+    this.pm_context_diagnostics = diagnostics;
+  }
+}
+
+function pmContextWindowForDay(dayUtc) {
+  return {
+    start_utc: `${shiftIsoDay(dayUtc, -1)}T01:00:00.000Z`,
+    end_utc: `${dayUtc}T00:00:00.000Z`,
+  };
+}
+
+function obsAqidbRetentionBoundaryUtc(nowUtc, retentionDays) {
+  const now = new Date(nowUtc);
+  if (Number.isNaN(now.getTime())) {
+    throw new Error(`Invalid Phase B now_utc for ObsAQIDB retention guard: ${String(nowUtc)}`);
+  }
+  const boundary = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() - retentionDays,
+    0,
+    0,
+    0,
+    0,
+  ));
+  return boundary.toISOString();
+}
+
+function normalizePmContextRow(raw, { connectorId, windowStartUtc, windowEndUtc }) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("PM context RPC returned a non-object row");
+  }
+  const row = raw;
+  const rowConnectorId = toNullablePositiveInteger(row.connector_id);
+  const stationId = toNullablePositiveInteger(row.station_id);
+  const timeseriesId = toNullablePositiveInteger(row.timeseries_id);
+  const pollutantCode = String(row.pollutant_code || "").trim().toLowerCase();
+  const timestampHourUtc = toNullableIsoTimestamp(row.timestamp_hour_utc);
+  const hourlyMean = toNullableNumber(row.hourly_mean_ugm3);
+  const sampleCount = toNullablePositiveInteger(row.sample_count);
+  if (rowConnectorId !== connectorId || !stationId || !timeseriesId) {
+    throw new Error("PM context RPC returned an invalid connector, station or timeseries identifier");
+  }
+  if (pollutantCode !== "pm25" && pollutantCode !== "pm10") {
+    throw new Error("PM context RPC returned a non-PM pollutant");
+  }
+  if (!timestampHourUtc || timestampHourUtc < windowStartUtc || timestampHourUtc >= windowEndUtc) {
+    throw new Error("PM context RPC returned a row outside the requested context window");
+  }
+  const timestampDate = new Date(timestampHourUtc);
+  if (
+    timestampDate.getUTCMinutes() !== 0 || timestampDate.getUTCSeconds() !== 0 ||
+    timestampDate.getUTCMilliseconds() !== 0
+  ) {
+    throw new Error("PM context RPC returned a non-hour-aligned timestamp");
+  }
+  if (hourlyMean === null || hourlyMean < 0 || !sampleCount) {
+    throw new Error("PM context RPC returned an invalid hourly aggregate");
+  }
+  return {
+    connector_id: rowConnectorId,
+    station_id: stationId,
+    timeseries_id: timeseriesId,
+    pollutant_code: pollutantCode,
+    timestamp_hour_utc: timestampHourUtc,
+    hourly_mean_ugm3: hourlyMean,
+    sample_count: sampleCount,
+  };
+}
+
+function comparePmContextCursor(left, right) {
+  if (left.timeseries_id !== right.timeseries_id) {
+    return left.timeseries_id - right.timeseries_id;
+  }
+  return left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc);
+}
+
+async function fetchPmHourlyContext({ runtime, dayUtc, connectorId, targetPmTimeseries }) {
+  const window = pmContextWindowForDay(dayUtc);
+  const diagnostics = {
+    pm_context_source: "obs_aqidb",
+    pm_context_window_start_utc: window.start_utc,
+    pm_context_window_end_utc: window.end_utc,
+    pm_context_requested_connector_id: connectorId,
+    pm_context_target_timeseries_count: targetPmTimeseries.size,
+    pm_context_rows_fetched: 0,
+    pm_context_rows_accepted: 0,
+    pm_context_rows_discarded: 0,
+    pm_context_page_count: 0,
+    pm_context_complete: false,
+  };
+
+  if (targetPmTimeseries.size === 0) {
+    return { rows: [], diagnostics: { ...diagnostics, pm_context_complete: true } };
+  }
+
+  const source = runtime.observs_source || {};
+  if (
+    !String(source.base_url || "").trim() || !String(source.privileged_key || "").trim() ||
+    !String(source.rpc_schema || "").trim() || !String(source.pm_context_rpc || "").trim()
+  ) {
+    throw new PhaseBPmContextError(
+      "Phase B PM context requires ObsAQIDB service-role RPC configuration.",
+      diagnostics,
+      "PHASE_B_PM_CONTEXT_CONFIG_MISSING",
+    );
+  }
+
+  const retentionBoundaryUtc = obsAqidbRetentionBoundaryUtc(
+    runtime.now_utc,
+    runtime.observs_retention_days,
+  );
+  if (window.start_utc < retentionBoundaryUtc) {
+    throw new PhaseBPmContextError(
+      `PM context window starts before ObsAQIDB retention boundary: start=${window.start_utc} boundary=${retentionBoundaryUtc}`,
+      { ...diagnostics, pm_context_retention_boundary_utc: retentionBoundaryUtc },
+      "PHASE_B_PM_CONTEXT_OUTSIDE_RETENTION",
+    );
+  }
+
+  const rows = [];
+  const seenKeys = new Set();
+  let afterTimeseriesId = null;
+  let afterTimestampHourUtc = null;
+  let previousCursor = null;
+  try {
+    for (;;) {
+      assertBudget(runtime, "pm_context_fetch", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        ...diagnostics,
+      }, 30_000);
+      if (diagnostics.pm_context_page_count >= runtime.pm_context_max_pages) {
+        throw new Error(`PM context RPC exceeded max pages (${runtime.pm_context_max_pages}) before completion`);
+      }
+      const payload = await postgrestRpc({
+        baseUrl: source.base_url,
+        privilegedKey: source.privileged_key,
+        rpcSchema: source.rpc_schema,
+        rpcName: source.pm_context_rpc,
+        payload: {
+          p_connector_id: connectorId,
+          p_start_utc: window.start_utc,
+          p_end_utc: window.end_utc,
+          p_after_timeseries_id: afterTimeseriesId,
+          p_after_timestamp_hour_utc: afterTimestampHourUtc,
+          p_limit: runtime.pm_context_page_size,
+        },
+      });
+      if (!Array.isArray(payload)) {
+        throw new Error("PM context RPC returned a non-array response");
+      }
+      diagnostics.pm_context_page_count += 1;
+      diagnostics.pm_context_rows_fetched += payload.length;
+      if (diagnostics.pm_context_rows_fetched > runtime.pm_context_max_rows) {
+        throw new Error(`PM context RPC exceeded max rows (${runtime.pm_context_max_rows})`);
+      }
+
+      let pageCursor = null;
+      for (const raw of payload) {
+        const row = normalizePmContextRow(raw, {
+          connectorId,
+          windowStartUtc: window.start_utc,
+          windowEndUtc: window.end_utc,
+        });
+        if (pageCursor && comparePmContextCursor(pageCursor, row) >= 0) {
+          throw new Error("PM context RPC cursor did not advance within page");
+        }
+        pageCursor = row;
+        if (previousCursor && comparePmContextCursor(previousCursor, row) >= 0) {
+          throw new Error("PM context RPC cursor did not advance across pages");
+        }
+        const key = `${row.timeseries_id}|${row.pollutant_code}|${row.timestamp_hour_utc}`;
+        if (seenKeys.has(key)) {
+          throw new Error("PM context RPC returned a duplicate hourly key");
+        }
+        seenKeys.add(key);
+        if (targetPmTimeseries.get(row.timeseries_id) === row.pollutant_code) {
+          rows.push(row);
+          diagnostics.pm_context_rows_accepted += 1;
+        } else {
+          diagnostics.pm_context_rows_discarded += 1;
+        }
+      }
+
+      if (payload.length < runtime.pm_context_page_size) {
+        diagnostics.pm_context_complete = true;
+        break;
+      }
+      if (!pageCursor) {
+        throw new Error("PM context RPC returned a full page without a cursor row");
+      }
+      previousCursor = pageCursor;
+      afterTimeseriesId = pageCursor.timeseries_id;
+      afterTimestampHourUtc = pageCursor.timestamp_hour_utc;
+      if (diagnostics.pm_context_rows_fetched >= runtime.pm_context_max_rows) {
+        throw new Error(`PM context RPC reached max rows (${runtime.pm_context_max_rows}) before completion`);
+      }
+    }
+  } catch (error) {
+    if (error instanceof PhaseBPmContextError) throw error;
+    throw new PhaseBPmContextError(
+      error instanceof Error ? error.message : String(error),
+      diagnostics,
+    );
+  }
+
+  return { rows, diagnostics };
 }
 
 function toResumePartEntry(value, index) {
@@ -2875,15 +3098,15 @@ export function shouldResetManifestlessV2ResumeForTest({
 }
 
 
-function makePhaseBFrozenSourceTempPath(runtime, dayUtc, connectorId) {
+function makePhaseBTargetDaySourceTempPath(runtime, dayUtc, connectorId) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `uk-aq-phase-b-aqi-${dayUtc}-${connectorId}-`));
   return {
     root,
-    ndjsonPath: path.join(root, "observations_d_minus_1_to_d.ndjson"),
+    ndjsonPath: path.join(root, "target_day_observations.ndjson"),
   };
 }
 
-function cleanupPhaseBFrozenSourceTemp(temp) {
+function cleanupPhaseBTargetDaySourceTemp(temp) {
   if (!temp?.root) return;
   fs.rmSync(temp.root, { recursive: true, force: true });
 }
@@ -2920,9 +3143,9 @@ async function* readFrozenSourceRows(ndjsonPath) {
 async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, runtime }) {
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
-  const prevDayStart = `${shiftIsoDay(dayUtc, -1)}T00:00:00.000Z`;
-  const nextDayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
-  const temp = makePhaseBFrozenSourceTempPath(runtime, dayUtc, connectorId);
+  const dayStart = `${dayUtc}T00:00:00.000Z`;
+  const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
+  const temp = makePhaseBTargetDaySourceTempPath(runtime, dayUtc, connectorId);
   const output = fs.createWriteStream(temp.ndjsonPath, { encoding: "utf8" });
   const counts = {
     frozen_source_row_count: 0,
@@ -2930,7 +3153,6 @@ async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, 
     day_observation_row_count: 0,
     supported_aqi_source_row_count: 0,
     target_day_supported_aqi_source_row_count: 0,
-    context_supported_aqi_source_row_count: 0,
     supported_pollutant_counts: {},
   };
   let committedParts = [];
@@ -2975,7 +3197,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   null::timestamptz
 )
 `;
-  const cursor = streamClient.query(new Cursor(sql, [connectorId, prevDayStart, nextDayEnd]));
+  const cursor = streamClient.query(new Cursor(sql, [connectorId, dayStart, dayEnd]));
   try {
     for (;;) {
       assertBudget(runtime, "frozen_source_fetch", { day_utc: dayUtc, connector_id: connectorId }, 30_000);
@@ -2983,6 +3205,9 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
       if (!rows.length) break;
       for (const raw of rows) {
         const row = normalizeFrozenObservationRow(raw);
+        if (!isObservationRowInDay(row, dayUtc)) {
+          throw new Error(`Phase B target-day source returned an out-of-range row for day=${dayUtc} connector=${connectorId}`);
+        }
         const encoded = `${JSON.stringify(row)}\n`;
         counts.frozen_source_row_count += 1;
         counts.frozen_source_bytes += Buffer.byteLength(encoded);
@@ -2996,17 +3221,11 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
         if (AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) {
           counts.supported_aqi_source_row_count += 1;
           counts.supported_pollutant_counts[row.pollutant_code] = (counts.supported_pollutant_counts[row.pollutant_code] || 0) + 1;
-          if (isObservationRowInDay(row, dayUtc)) {
-            counts.target_day_supported_aqi_source_row_count = (counts.target_day_supported_aqi_source_row_count || 0) + 1;
-          } else {
-            counts.context_supported_aqi_source_row_count = (counts.context_supported_aqi_source_row_count || 0) + 1;
-          }
+          counts.target_day_supported_aqi_source_row_count += 1;
         }
-        if (isObservationRowInDay(row, dayUtc)) {
-          counts.day_observation_row_count += 1;
-          pendingDayRows.push(row);
-          if (pendingDayRows.length >= runtime.observations_part_max_rows) await flushObservationRows();
-        }
+        counts.day_observation_row_count += 1;
+        pendingDayRows.push(row);
+        if (pendingDayRows.length >= runtime.observations_part_max_rows) await flushObservationRows();
       }
     }
     await flushObservationRows();
@@ -3023,26 +3242,81 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
 async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath }) {
   const sourceRows = [];
   let targetDaySupportedRowCount = 0;
-  let contextSupportedRowCount = 0;
-  let invalidRowCount = 0;
   for await (const row of readFrozenSourceRows(frozenSourcePath)) {
     if (!AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) continue;
+    if (!isObservationRowInDay(row, dayUtc)) {
+      throw new Error(`AQI target-day source contained an out-of-range row for day=${dayUtc} connector=${connectorId}`);
+    }
     sourceRows.push(row);
-    if (isObservationRowInDay(row, dayUtc)) targetDaySupportedRowCount += 1;
-    else contextSupportedRowCount += 1;
+    targetDaySupportedRowCount += 1;
     if (sourceRows.length > runtime.phase_b_observation_snapshot_max_rows) {
       throw new Error(`AQI source row cap exceeded while replaying frozen source for day=${dayUtc} connector=${connectorId}`);
     }
   }
   if (targetDaySupportedRowCount === 0) {
-    return { status: "no_supported_aqi_source", rows: [], invalid_row_count: invalidRowCount, supported_source_row_count: sourceRows.length, target_day_supported_source_row_count: targetDaySupportedRowCount, context_supported_source_row_count: contextSupportedRowCount };
+    return {
+      status: "no_supported_aqi_source",
+      rows: [],
+      supported_source_row_count: sourceRows.length,
+      target_day_supported_source_row_count: targetDaySupportedRowCount,
+      pm_context: {
+        pm_context_source: "obs_aqidb",
+        pm_context_window_start_utc: null,
+        pm_context_window_end_utc: null,
+        pm_context_requested_connector_id: connectorId,
+        pm_context_target_timeseries_count: 0,
+        pm_context_rows_fetched: 0,
+        pm_context_rows_accepted: 0,
+        pm_context_rows_discarded: 0,
+        pm_context_page_count: 0,
+        pm_context_complete: true,
+      },
+      context_supported_aqi_hour_count: 0,
+      daqi_status_counts: {},
+      eaqi_status_counts: {},
+    };
   }
   const acceptedRows = dedupeSourceObservationRows(sourceRows);
-  const rows = buildAqilevelHistoryRowsForDayFromSourceObservations(sourceRows, dayUtc);
-  if (acceptedRows.length === 0 || rows.length === 0) {
+  const targetDayHourlyRows = sourceObservationsToNarrowRows(acceptedRows);
+  if (acceptedRows.length === 0 || targetDayHourlyRows.length === 0) {
     throw new Error(`Phase B AQI source normalization produced zero output for day=${dayUtc} connector=${connectorId} despite ${targetDaySupportedRowCount} target-day supported source rows`);
   }
-  return { status: "complete", rows, invalid_row_count: invalidRowCount, accepted_source_row_count: acceptedRows.length, rejected_source_row_count: Math.max(sourceRows.length - acceptedRows.length, 0), supported_source_row_count: sourceRows.length, target_day_supported_source_row_count: targetDaySupportedRowCount, context_supported_source_row_count: contextSupportedRowCount };
+  const targetPmTimeseries = new Map(
+    targetDayHourlyRows
+      .filter((row) => row.pollutant_code === "pm25" || row.pollutant_code === "pm10")
+      .map((row) => [row.timeseries_id, row.pollutant_code]),
+  );
+  const pmContext = await fetchPmHourlyContext({
+    runtime,
+    dayUtc,
+    connectorId,
+    targetPmTimeseries,
+  });
+  const mergedHourlyRows = mergeAqiHourlyRowsPreferTargetDay({
+    contextRows: pmContext.rows,
+    targetDayRows: targetDayHourlyRows,
+  });
+  const rows = buildAqilevelHistoryRowsForDayFromHourlyRows(mergedHourlyRows, dayUtc);
+  if (rows.length === 0) {
+    throw new Error(`Phase B AQI hourly calculation produced zero output for day=${dayUtc} connector=${connectorId} despite ${targetDaySupportedRowCount} target-day supported source rows`);
+  }
+  const countStatuses = (field) => rows.reduce((counts, row) => {
+    const status = String(row[field] || "unknown");
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, {});
+  return {
+    status: "complete",
+    rows,
+    accepted_source_row_count: acceptedRows.length,
+    rejected_source_row_count: Math.max(sourceRows.length - acceptedRows.length, 0),
+    supported_source_row_count: sourceRows.length,
+    target_day_supported_source_row_count: targetDaySupportedRowCount,
+    pm_context: pmContext.diagnostics,
+    context_supported_aqi_hour_count: pmContext.rows.length,
+    daqi_status_counts: countStatuses("daqi_calculation_status"),
+    eaqi_status_counts: countStatuses("eaqi_calculation_status"),
+  };
 }
 
 async function writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc }) {
@@ -3137,10 +3411,13 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
           frozen_source_bytes: staged.counts.frozen_source_bytes,
           supported_aqi_source_row_count: staged.counts.supported_aqi_source_row_count,
           target_day_supported_aqi_source_row_count: aqiBuild.target_day_supported_source_row_count ?? staged.counts.target_day_supported_aqi_source_row_count,
-          context_supported_aqi_source_row_count: aqiBuild.context_supported_source_row_count ?? staged.counts.context_supported_aqi_source_row_count,
           accepted_aqi_source_row_count: aqiBuild.accepted_source_row_count ?? 0,
-          rejected_aqi_source_row_count: aqiBuild.rejected_source_row_count ?? aqiBuild.invalid_row_count ?? 0,
+          rejected_aqi_source_row_count: aqiBuild.rejected_source_row_count ?? 0,
           supported_pollutant_counts: staged.counts.supported_pollutant_counts,
+          ...(aqiBuild.pm_context || {}),
+          context_supported_aqi_hour_count: aqiBuild.context_supported_aqi_hour_count ?? 0,
+          daqi_status_counts: aqiBuild.daqi_status_counts ?? {},
+          eaqi_status_counts: aqiBuild.eaqi_status_counts ?? {},
           output_row_count: aqiBuild.rows.length,
           manifest_key: aqiResult.manifest_key || aqiResult.connector_manifest?.manifest_key || null,
           debug_manifest_key: aqiResult.debug_connector_manifest?.manifest_key || null,
@@ -3149,7 +3426,7 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
         },
       };
     } finally {
-      cleanupPhaseBFrozenSourceTemp(temp);
+      cleanupPhaseBTargetDaySourceTemp(temp);
     }
   });
 }
@@ -5335,6 +5612,15 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       `Invalid Phase B AQI writer configuration: exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED must be true (got calculate=${phaseBCalculateAqiFromObservationsEnabled}, legacy=${phaseBLegacyAqiRpcExportEnabled}).`,
     );
   }
+  const observsSource = {
+    base_url: String(env.OBS_AQIDB_SUPABASE_URL || "").trim(),
+    privileged_key: String(env.OBS_AQIDB_SECRET_KEY || "").trim(),
+    rpc_schema: String(env.UK_AQ_PUBLIC_SCHEMA || DEFAULT_RPC_SCHEMA).trim() || DEFAULT_RPC_SCHEMA,
+    pm_context_rpc: String(env.UK_AQ_PHASE_B_PM_CONTEXT_RPC || DEFAULT_PHASE_B_PM_CONTEXT_RPC).trim(),
+    connector_counts_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC || AQILEVELS_CONNECTOR_COUNTS_RPC)
+      .trim(),
+    rows_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC || AQILEVELS_ROWS_RPC).trim(),
+  };
 
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
@@ -5392,6 +5678,30 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES,
       1024 * 1024,
       2 * 1024 * 1024 * 1024,
+    ),
+    observs_retention_days: parsePositiveInt(
+      env.OBS_AQIDB_OBSERVS_RETENTION_DAYS,
+      DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS,
+      1,
+      3650,
+    ),
+    pm_context_page_size: parsePositiveInt(
+      env.UK_AQ_PHASE_B_PM_CONTEXT_PAGE_SIZE,
+      DEFAULT_PHASE_B_PM_CONTEXT_PAGE_SIZE,
+      1,
+      5_000,
+    ),
+    pm_context_max_pages: parsePositiveInt(
+      env.UK_AQ_PHASE_B_PM_CONTEXT_MAX_PAGES,
+      DEFAULT_PHASE_B_PM_CONTEXT_MAX_PAGES,
+      1,
+      1_000,
+    ),
+    pm_context_max_rows: parsePositiveInt(
+      env.UK_AQ_PHASE_B_PM_CONTEXT_MAX_ROWS,
+      DEFAULT_PHASE_B_PM_CONTEXT_MAX_ROWS,
+      1,
+      250_000,
     ),
     aqilevels_source_max_pages: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_AQILEVELS_SOURCE_MAX_PAGES,
@@ -5451,14 +5761,9 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       app_secret: String(env.DROPBOX_APP_SECRET || "").trim(),
       refresh_token: String(env.DROPBOX_REFRESH_TOKEN || "").trim(),
     },
-    aqilevels_source: {
-      base_url: String(env.OBS_AQIDB_SUPABASE_URL || "").trim(),
-      privileged_key: String(env.OBS_AQIDB_SECRET_KEY || "").trim(),
-      rpc_schema: String(env.UK_AQ_PUBLIC_SCHEMA || DEFAULT_RPC_SCHEMA).trim() || DEFAULT_RPC_SCHEMA,
-      connector_counts_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC || AQILEVELS_CONNECTOR_COUNTS_RPC)
-        .trim(),
-      rows_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC || AQILEVELS_ROWS_RPC).trim(),
-    },
+    observs_source: observsSource,
+    // Legacy materialised-AQI export still reads this alias until its separate retirement.
+    aqilevels_source: observsSource,
     writer_git_sha: String(env.GITHUB_SHA || "").trim() || null,
   };
 }
@@ -5524,6 +5829,15 @@ export async function runPhaseBBackup({
     adoption_failures: [],
     prune_check_dropbox_exports: 0,
     prune_check_dropbox_failures: 0,
+    pm_context: {
+      source: "obs_aqidb",
+      candidates: 0,
+      complete_candidates: 0,
+      rows_fetched: 0,
+      rows_accepted: 0,
+      rows_discarded: 0,
+      page_count: 0,
+    },
     aqilevels: null,
   };
 
@@ -5722,6 +6036,14 @@ export async function runPhaseBBackup({
         } else if (adoptResult.adopted && runtime.prune_check_dropbox?.enabled) {
           summary.prune_check_dropbox_failures += 1;
         }
+        if (exportResult.aqi?.pm_context_source === "obs_aqidb") {
+          summary.pm_context.candidates += 1;
+          summary.pm_context.complete_candidates += exportResult.aqi.pm_context_complete ? 1 : 0;
+          summary.pm_context.rows_fetched += Number(exportResult.aqi.pm_context_rows_fetched || 0);
+          summary.pm_context.rows_accepted += Number(exportResult.aqi.pm_context_rows_accepted || 0);
+          summary.pm_context.rows_discarded += Number(exportResult.aqi.pm_context_rows_discarded || 0);
+          summary.pm_context.page_count += Number(exportResult.aqi.pm_context_page_count || 0);
+        }
 
         const dayState = await finalizeDayGateIfReady({
           client: controlClient,
@@ -5744,6 +6066,22 @@ export async function runPhaseBBackup({
           manifest_key: exportResult.manifest_key,
           source_owner: exportResult.adopted ? "adopted_existing_r2_manifest" : "phase_b_export",
           comparison_output_root: adoptResult.comparison?.comparison_output_root || null,
+          pm_context: exportResult.aqi ? {
+            pm_context_source: exportResult.aqi.pm_context_source || null,
+            pm_context_window_start_utc: exportResult.aqi.pm_context_window_start_utc || null,
+            pm_context_window_end_utc: exportResult.aqi.pm_context_window_end_utc || null,
+            pm_context_requested_connector_id: exportResult.aqi.pm_context_requested_connector_id ?? null,
+            pm_context_target_timeseries_count: exportResult.aqi.pm_context_target_timeseries_count ?? 0,
+            pm_context_rows_fetched: exportResult.aqi.pm_context_rows_fetched ?? 0,
+            pm_context_rows_accepted: exportResult.aqi.pm_context_rows_accepted ?? 0,
+            pm_context_rows_discarded: exportResult.aqi.pm_context_rows_discarded ?? 0,
+            pm_context_page_count: exportResult.aqi.pm_context_page_count ?? 0,
+            pm_context_complete: exportResult.aqi.pm_context_complete === true,
+            target_day_supported_aqi_source_row_count: exportResult.aqi.target_day_supported_aqi_source_row_count ?? 0,
+            context_supported_aqi_hour_count: exportResult.aqi.context_supported_aqi_hour_count ?? 0,
+            daqi_status_counts: exportResult.aqi.daqi_status_counts ?? {},
+            eaqi_status_counts: exportResult.aqi.eaqi_status_counts ?? {},
+          } : null,
           duration_ms: durationMs,
         });
       } catch (error) {
@@ -5799,6 +6137,7 @@ export async function runPhaseBBackup({
           resumed_from_part_index: Number(candidate.resume_part_index || 0),
           resumed_from_row_count: candidate.resume_exported_row_count.toString(),
           error: message,
+          pm_context: error?.pm_context_diagnostics || null,
           ...errorLogFields(error),
           ...budgetSnapshot(runtime),
           next_action: "retry_safe",

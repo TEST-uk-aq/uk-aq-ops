@@ -255,68 +255,6 @@ export function sourceObservationsToNarrowRows(rows) {
   });
 }
 
-export function canonicalAqiHourlyKey(row) {
-  const timeseriesId = toPositiveIntOrNull(row?.timeseries_id);
-  const pollutantCode = normalizePollutantCode(row?.pollutant_code);
-  const timestampHourUtc = parseIsoHour(row?.timestamp_hour_utc);
-  return timeseriesId && pollutantCode && timestampHourUtc
-    ? `${timeseriesId}|${pollutantCode}|${timestampHourUtc}`
-    : null;
-}
-
-export function normalizeAqiHourlyNarrowRows(rows) {
-  const normalized = [];
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const timeseriesId = toPositiveIntOrNull(row?.timeseries_id);
-    const stationId = toPositiveIntOrNull(row?.station_id);
-    const connectorId = toPositiveIntOrNull(row?.connector_id);
-    const pollutantCode = normalizePollutantCode(row?.pollutant_code);
-    const timestampHourUtc = parseIsoHour(row?.timestamp_hour_utc);
-    const hourlyMean = toNumberOrNull(row?.hourly_mean_ugm3);
-    const sampleCount = toPositiveIntOrNull(row?.sample_count);
-    if (
-      !timeseriesId || !stationId || !pollutantCode || !timestampHourUtc ||
-      hourlyMean === null || hourlyMean < 0 || !sampleCount
-    ) {
-      continue;
-    }
-    normalized.push({
-      timeseries_id: timeseriesId,
-      station_id: stationId,
-      connector_id: connectorId,
-      pollutant_code: pollutantCode,
-      timestamp_hour_utc: timestampHourUtc,
-      hourly_mean_ugm3: hourlyMean,
-      sample_count: sampleCount,
-    });
-  }
-  return normalized.sort((left, right) => {
-    const leftKey = canonicalAqiHourlyKey(left) || "";
-    const rightKey = canonicalAqiHourlyKey(right) || "";
-    return leftKey.localeCompare(rightKey);
-  });
-}
-
-export function mergeAqiHourlyRowsPreferTargetDay({
-  contextRows = [],
-  targetDayRows = [],
-} = {}) {
-  const merged = new Map();
-  for (const row of normalizeAqiHourlyNarrowRows(contextRows)) {
-    const key = canonicalAqiHourlyKey(row);
-    if (key) merged.set(key, row);
-  }
-  for (const row of normalizeAqiHourlyNarrowRows(targetDayRows)) {
-    const key = canonicalAqiHourlyKey(row);
-    if (key) merged.set(key, row);
-  }
-  return Array.from(merged.values()).sort((left, right) => {
-    const leftKey = canonicalAqiHourlyKey(left) || "";
-    const rightKey = canonicalAqiHourlyKey(right) || "";
-    return leftKey.localeCompare(rightKey);
-  });
-}
-
 export function pivotNarrowRowsToHelperRows(narrowRows) {
   const byKey = new Map();
   for (const row of Array.isArray(narrowRows) ? narrowRows : []) {
@@ -608,11 +546,6 @@ export function summarizeAqiCalculationStatuses(rows) {
 
 export function buildAqilevelHistoryRowsForDayFromSourceObservations(rows, dayUtc, options = {}) {
   const helperRows = pivotNarrowRowsToHelperRows(sourceObservationsToNarrowRows(rows));
-  return helperRowsToNormalizedAqiV1Rows(narrowRowsToDayRange(helperRows, dayUtc), options);
-}
-
-export function buildAqilevelHistoryRowsForDayFromHourlyRows(rows, dayUtc, options = {}) {
-  const helperRows = pivotNarrowRowsToHelperRows(normalizeAqiHourlyNarrowRows(rows));
   return helperRowsToNormalizedAqiV1Rows(narrowRowsToDayRange(helperRows, dayUtc), options);
 }
 
