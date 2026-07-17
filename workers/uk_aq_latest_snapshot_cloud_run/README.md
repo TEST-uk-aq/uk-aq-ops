@@ -8,10 +8,11 @@ Builds latest map snapshots from a dedicated Pub/Sub observation subscription an
 - Acknowledge pulled Pub/Sub messages in bounded chunks so backlog bursts do not exceed the Pub/Sub acknowledge request size limit.
 - Maintain latest-per-timeseries state in R2.
 - Refresh metadata from daily R2 core snapshot (default once per day).
-- Snapshot matrix (Phase A):
+- Physical snapshot products:
   - `pollutant`: `pm25`, `pm10`, `no2`
-  - `window`: `3h`, `6h`, `1d`, `7d`, `all`
+  - `window`: `all`
   - `network_group`: `all`
+- The R2 API Worker derives public `3h`, `6h`, `1d`, and `7d` responses from those physical `all` objects.
 - Write per-key snapshot JSON objects with stable keys.
 - Write per-family manifest with hashes, row counts, observed-at bounds, and build metadata.
 - Skip snapshot object writes when payload hash is unchanged.
@@ -29,7 +30,6 @@ Builds latest map snapshots from a dedicated Pub/Sub observation subscription an
 ## Optional env vars
 
 - `UK_AQ_LATEST_SNAPSHOT_POLLUTANTS` (default `pm25,pm10,no2`)
-- `UK_AQ_LATEST_SNAPSHOT_WINDOWS` (default `3h,6h,1d,7d,all`)
 - `UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP` (default `all`)
 - `UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION` (must be `v2`)
 - `UK_AQ_LATEST_SNAPSHOT_R2_PREFIX` (default `latest_snapshots/${UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION}`; currently `latest_snapshots/v2`)

@@ -11,7 +11,7 @@ import {
 } from "../../workers/shared/r2_sigv4.mjs";
 
 const DEFAULT_SNAPSHOT_MANIFEST_KEY = normalizePrefix(
-  process.env.UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY || "latest_snapshots/v2/manifest.json",
+  process.env.UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY || "latest_snapshots/v1/manifest.json",
 );
 const DEFAULT_STATE_PREFIX = normalizePrefix(
   process.env.UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX || "latest_snapshots_state/v1",
@@ -20,7 +20,7 @@ const DEFAULT_STATE_KEY = `${DEFAULT_STATE_PREFIX}/latest_state.json`;
 const DEFAULT_CORE_PREFIX = normalizePrefix(
   process.env.UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX ||
     process.env.UK_AQ_R2_HISTORY_CORE_PREFIX ||
-    "history/v2/core",
+    "history/v1/core",
 );
 const DEFAULT_LOOKBACK_DAYS = 14;
 
