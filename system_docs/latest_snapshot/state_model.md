@@ -8,6 +8,8 @@ It is not raw history and MUST NOT preserve every received observation.
 
 It retains at most one current valid observation for each `(connector_id, timeseries_id)` identity. Public finite windows are derived later by the R2 API Worker and do not create separate state.
 
+The authoritative state remains the R2 object. A container-local cached copy is only a validated optimisation and is not a second state store.
+
 ## Persistent object
 
 Default key:
@@ -79,10 +81,14 @@ A state entry must never represent a missing, negative, sentinel or rejected out
 
 The current builder:
 
-1. loads or refreshes metadata before pulling messages;
-2. resolves decoded rows to observed properties and supported matrix pollutants;
-3. applies the latest-current-value eligibility policy;
-4. passes only eligible rows to state application.
+1. loads the previous physical manifest through the durable-object path;
+2. loads existing state through the durable-object path;
+3. loads or refreshes metadata before pulling messages;
+4. resolves decoded rows to observed properties and supported matrix pollutants;
+5. applies the latest-current-value eligibility policy;
+6. passes only eligible rows to state application;
+7. writes changed state to R2 before updating any local cached copy;
+8. acknowledges handled messages only after durable state handling.
 
 Value eligibility therefore runs before timestamp ordering can replace state.
 
@@ -170,9 +176,11 @@ Object keys are stable-sorted before JSON output. State is written only when its
 
 Skipping an invalid row must not alter the retained entry, `ingested_at`, `updated_at` or object hash when no other state transition occurs.
 
+A local cache hit returns the exact durable bytes previously validated against R2. It must therefore produce the same state map and existing-object hash as an R2 GET.
+
 ## Metadata cache state
 
-The core metadata cache is a separate object:
+The core metadata cache is a separate durable R2 object:
 
 ```text
 latest_snapshots_state/v1/core_metadata_cache_v2.json
@@ -180,11 +188,45 @@ latest_snapshots_state/v1/core_metadata_cache_v2.json
 
 It contains current lookup rows for connectors, networks, stations, timeseries, phenomena and observed properties. It is not part of latest observation state identity and must not be merged into `latest_state.json`.
 
+A local cached copy does not change the metadata-cache schema, R2 key or freshness interval. The contained `generated_at` remains authoritative for deciding when the metadata must be refreshed.
+
+## Transient container-local cache
+
+When enabled, the builder may store validated local copies of:
+
+```text
+latest_snapshots_state/v1/latest_state.json
+latest_snapshots_state/v1/core_metadata_cache_v2.json
+latest_snapshots/v2/manifest.json
+```
+
+Default local directory:
+
+```text
+/tmp/uk-aq-latest-snapshot-cache
+```
+
+For each R2 key, the local cache stores:
+
+- a body file whose filename stem is the SHA-256 of the full R2 key;
+- a JSON sidecar with schema version `1`, the full R2 key, R2 ETag and body SHA-256.
+
+This is transient process-adjacent state only:
+
+- it may survive successive child processes in the same warm Cloud Run container;
+- it disappears when the container is replaced;
+- it is not read without local integrity checks and current R2 ETag validation;
+- it is never a repair or bootstrap source;
+- deleting it is always safe;
+- disabling it requires no migration.
+
+A local write failure must not alter durable state, acknowledgement ordering, manifest contents or build success.
+
 ## State-size safety
 
 The hard maximum remains 500,000 entries. Invalid-only identities must not consume state entries.
 
-## State telemetry
+## State and cache telemetry
 
 State reporting distinguishes:
 
@@ -196,4 +238,15 @@ State reporting distinguishes:
 - skipped unsupported pollutant;
 - skipped unresolved metadata.
 
-Additional reason detail may be added without changing the public contract, provided it does not introduce a second eligibility policy.
+The completed job summary also reports local-cache counters for:
+
+- disabled reads;
+- cold misses;
+- warm hits;
+- R2 fingerprint mismatches;
+- corrupt local entries;
+- validation errors;
+- local write failures;
+- entries skipped because no R2 ETag was available.
+
+Additional reason detail may be added without changing the public contract, provided it does not introduce a second eligibility or durability policy.
