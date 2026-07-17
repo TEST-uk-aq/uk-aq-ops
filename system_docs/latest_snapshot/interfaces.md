@@ -2,15 +2,13 @@
 
 ## Purpose
 
-This file protects the message, state, R2 object and HTTP interface shapes used by the latest-snapshot system.
+This file protects the message, state, physical R2 object, manifest and HTTP interface shapes used by the latest-snapshot system.
 
-The invalid-value state fix MUST NOT change these public or persisted shapes unless a separate contract change is approved.
+The public request matrix contains five windows, while the physical R2 matrix contains only `window=all`. That distinction is part of the current interface contract.
 
 ## Pub/Sub observation message
 
-The latest-snapshot builder decodes a Base64 JSON object.
-
-Supported fields:
+The builder decodes a Base64 JSON object.
 
 | Field | Type | Required for decode | Meaning |
 |---|---|---:|---|
@@ -21,20 +19,7 @@ Supported fields:
 | `value_float8_hex` | string or null | No | Optional bit-exact float representation |
 | `status` | string or null | No | Optional source status |
 
-Example:
-
-```json
-{
-  "connector_id": 1,
-  "timeseries_id": 360,
-  "observed_at": "2026-07-16T09:00:00Z",
-  "value": -99,
-  "value_float8_hex": null,
-  "status": null
-}
-```
-
-This example is structurally valid and decodable. It is not eligible for current pollutant state.
+A structurally valid decoded value such as `-99` is handled and acknowledged but is not eligible for latest pollutant state.
 
 ## Persisted latest-state object
 
@@ -64,7 +49,7 @@ Entry contract:
 | `status` | string or null | Preserved source status for retained row |
 | `ingested_at` | timestamp string or null | State-ingest tie-break timestamp |
 
-The shape remains schema version `1` for the invalid-value fix because the required change is eligibility and transition logic, not storage structure.
+The state schema remains version `1`.
 
 ## Core metadata cache
 
@@ -86,55 +71,40 @@ Top-level fields:
 - `phenomena`;
 - `observed_properties`.
 
-The cache must provide the relationships required to resolve:
+## Physical snapshot object keys
+
+Canonical physical pattern:
 
 ```text
-timeseries
-  -> phenomenon
-      -> observed_property
-
-timeseries
-  -> station
-      -> network
-
-timeseries / station
-  -> connector
+latest_snapshots/v2/network_group={network_group}/pollutant={pollutant}/window=all.json
 ```
 
-## Snapshot object key
-
-Canonical pattern:
+Current physical objects:
 
 ```text
-latest_snapshots/v2/network_group={network_group}/pollutant={pollutant}/window={window}.json
-```
-
-Current examples:
-
-```text
-latest_snapshots/v2/network_group=all/pollutant=pm25/window=3h.json
-latest_snapshots/v2/network_group=all/pollutant=pm10/window=6h.json
+latest_snapshots/v2/network_group=all/pollutant=pm25/window=all.json
+latest_snapshots/v2/network_group=all/pollutant=pm10/window=all.json
 latest_snapshots/v2/network_group=all/pollutant=no2/window=all.json
 ```
 
+There are no current physical `3h`, `6h`, `1d` or `7d` products. Old finite objects may remain in R2 but are not current interfaces and are never fallbacks.
+
 ## Snapshot payload
 
-Top-level fields:
+The same v2 top-level shape is used for the stored `all` payload and derived finite responses.
 
-| Field | Current type/value |
-|---|---|
-| `region` | `null` |
-| `pcon_code` | `null` |
-| `pollutant` | matrix pollutant string |
-| `window` | matrix window string |
-| `since` | `null` |
-| `since_id` | `null` |
-| `next_since` | timestamp string or null |
-| `next_since_id` | integer or null |
-| `count` | integer |
-| `data` | array of latest rows |
-
-No field may be removed, renamed or repurposed by the invalid-value fix.
+| Field | Type/value | Finite response behaviour |
+|---|---|---|
+| `region` | `null` | Preserved |
+| `pcon_code` | `null` | Preserved |
+| `pollutant` | pollutant string | Preserved and validated against request |
+| `window` | window string | Replaced with requested finite window |
+| `since` | `null` | Preserved |
+| `since_id` | `null` | Preserved |
+| `next_since` | timestamp string or null | Recalculated from filtered rows |
+| `next_since_id` | integer or null | Recalculated from filtered rows |
+| `count` | integer | Recalculated from filtered rows |
+| `data` | latest-row array | Filtered for finite windows |
 
 ## Latest row v2 contract
 
@@ -160,6 +130,8 @@ Each `data` row contains:
 | `observed_property_code` | string or null |
 | `uom_display` | string or null |
 
+State `observed_at` is exposed as `last_value_at`.
+
 The v2 contract intentionally omits:
 
 - `station_network_memberships`;
@@ -167,7 +139,7 @@ The v2 contract intentionally omits:
 - `network_name`;
 - `network_type`.
 
-The invalid-value fix MUST NOT reintroduce those fields.
+Derived finite responses MUST preserve the row shape exactly and MUST NOT add or remove fields.
 
 ## Manifest
 
@@ -177,7 +149,9 @@ Canonical key:
 latest_snapshots/v2/manifest.json
 ```
 
-Top-level contract includes:
+The manifest describes physical stored products only.
+
+Top-level fields include:
 
 - `schema_version`;
 - `snapshot_family`, currently `latest`;
@@ -189,21 +163,33 @@ Top-level contract includes:
 - `build`;
 - `snapshots`.
 
-Each snapshot manifest entry includes:
+Current matrix contract:
+
+```json
+{
+  "network_group": "all",
+  "pollutants": ["pm25", "pm10", "no2"],
+  "windows": ["all"]
+}
+```
+
+A fully successful manifest contains three snapshot entries. Each entry includes:
 
 - stable matrix `id`;
 - `network_group`;
 - `pollutant`;
-- `window`;
+- `window`, always `all`;
 - `object_key`;
 - content type and encoding;
-- SHA-256 and etag;
-- row count and byte count;
+- SHA-256 and ETag;
+- row and byte counts;
 - minimum and maximum observed timestamps;
 - generation and build timing;
 - previous hash;
 - changed flag;
 - error field.
+
+Finite public responses are not represented as manifest entries.
 
 ## Private R2 API Worker
 
@@ -211,7 +197,9 @@ Endpoints:
 
 ```text
 GET /v1/latest-snapshot
+HEAD /v1/latest-snapshot
 GET /v1/manifest
+HEAD /v1/manifest
 GET /v1/health
 ```
 
@@ -226,11 +214,67 @@ Accepted aliases:
 - `/` behaves as `/v1/latest-snapshot`;
 - `scope=all` aliases `network_group=all`.
 
-Accepted matrix values:
+Accepted values:
 
 - `pollutant`: `pm25`, `pm10`, `no2`;
 - `window`: `3h`, `6h`, `1d`, `7d`, `all`;
 - `network_group`: `all`.
+
+If `window` is omitted, the current default remains `6h`.
+
+## Source selection and finite derivation
+
+Every accepted snapshot request reads:
+
+```text
+latest_snapshots/v2/network_group=all/pollutant={pollutant}/window=all.json
+```
+
+For a finite window:
+
+- effective time is the start of the current UTC minute;
+- the cutoff is effective time minus the requested duration;
+- inclusion is `Date.parse(last_value_at) >= cutoff`;
+- missing or unparseable timestamps are excluded;
+- source row order is preserved;
+- `window`, `count`, `next_since` and `next_since_id` are recalculated.
+
+Cursor meaning remains:
+
+- `next_since` is the greatest valid `last_value_at` in the returned rows;
+- `next_since_id` is the greatest non-negative row `id` among rows sharing that timestamp;
+- both are `null` when no returned row has a valid timestamp.
+
+## ETags and conditional requests
+
+For `window=all`, the response uses the physical object ETag.
+
+For finite responses, the ETag is a SHA-256 identity derived from:
+
+```text
+physical source ETag
+requested window
+effective UTC minute
+```
+
+Matching `If-None-Match` on GET or HEAD returns `304` with the v2 contract marker.
+
+Finite HEAD responses return the same representation headers as GET, including the derived ETag and recalculated content length, but no body.
+
+## Errors
+
+The Worker preserves the existing bounded errors, including:
+
+- `invalid_pollutant`;
+- `invalid_window`;
+- `invalid_network_group`;
+- `snapshot_not_found`;
+- `invalid_snapshot_payload`;
+- `invalid_v2_snapshot_config`;
+- `method_not_allowed`;
+- `not_found`.
+
+A malformed physical payload fails closed. The Worker does not attempt an old finite or v1 fallback.
 
 ## Authentication and contract marker
 
@@ -246,8 +290,6 @@ Successful canonical snapshot responses identify the contract with:
 X-UK-AQ-Snapshot-Contract: v2
 ```
 
-The Worker must fail closed for non-canonical standard v1/v2 path configuration and must not fall back to v1 objects.
-
 ## Cache-proxy route
 
 External route:
@@ -262,8 +304,8 @@ Upstream configuration:
 UK_AQ_LATEST_SNAPSHOT_R2_API_URL
 ```
 
-The cache proxy must continue validating the v2 contract marker and preserving its existing cache-key, cache-control and error behaviour.
+The cache proxy continues forwarding the public query, validating the v2 marker, and preserving its current cache-key and error behaviour.
 
 ## Compatibility rule
 
-A change that modifies any interface in this file is not an implementation-only latest-state fix. It requires an explicit contract and compatibility review.
+A change to physical product ownership, finite-window derivation, ETag inputs, query values, response fields, row fields, manifest meaning or authentication requires an explicit contract and compatibility review.
