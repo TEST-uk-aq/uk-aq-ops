@@ -4,6 +4,8 @@ This directory contains the authoritative behavioural and operational documentat
 
 The documents are written for both people and coding agents. Human-readable Markdown is the source of truth. There is no separate Codex-only behavioural specification.
 
+`system_docs/` is the sole active system-documentation root. Do not create a second top-level `docs/` tree. Historical reports and superseded broad documents belong under `system_docs_legacy/` and are not current operating instructions.
+
 ## Authority and document types
 
 Documents in an area directory have the following roles:
@@ -20,7 +22,7 @@ Documents in an area directory have the following roles:
 
 Worker-local `README.md` files remain useful implementation guides, but they do not override an area `contract.md`.
 
-Plans describe proposed work. Archives describe historical implementations. Neither is authoritative for current runtime behaviour unless an authoritative area document explicitly incorporates the relevant decision.
+Plans describe proposed work. Archives and `system_docs_legacy/` describe historical implementations or superseded broad documents. None is authoritative for current runtime behaviour unless an authoritative area document explicitly incorporates the relevant decision.
 
 ## Required reading order
 
@@ -28,7 +30,7 @@ Before changing an active system area:
 
 1. Read this index.
 2. Read the area's `README.md`.
-3. Read the area's `contract.md`.
+3. Read the area's `contract.md` when present.
 4. Read the files linked under that area's implementation ownership section.
 5. Read any relevant decision records.
 6. Confirm the requested change against the area's explicit non-goals.
@@ -56,19 +58,20 @@ See [`documentation_contract.md`](documentation_contract.md) for the full mainte
 | Area | Authoritative directory | Current status |
 |---|---|---|
 | Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current, including all-only physical snapshots |
-| Raw observations R2 history and indexes | [`r2_history/`](r2_history/) | Binding-index Phase 1 contract created |
+| Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Binding index, integrity and active AQI write-pipeline contracts are current; remaining history migration is pending |
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
-| AQI generation, AQI history and WHO summaries | `aqi/` | Migration analysis pending |
+| AQI generation and WHO summaries outside the R2 write pipeline | `aqi/` | Migration analysis pending |
 | Public and private R2-backed APIs | `api_services/` | Migration analysis pending |
 | Cache proxy and website routing | `cache_proxy/` | Migration analysis pending |
 | R2 and database backups, restore and repair | `backup_and_recovery/` | Migration analysis pending |
 | Cloudflare and GCP scheduling | `scheduling/` | Migration analysis pending |
 | Task health, metrics and operational dashboards | `monitoring/` | Migration analysis pending |
-| Postcode and geography lookup products | `geography/` | Migration analysis pending |
+| Hosted and local administrative dashboards | [`dashboards/`](dashboards/) | Authoritative and current |
+| Postcode and geography lookup products | [`geography/`](geography/) | Authoritative and current |
 | Shared runtime components and cross-area invariants | `shared/` | Migration analysis pending |
 
-Directories marked as pending are proposed area boundaries, not yet authoritative replacements for existing documents. Existing documents remain in force until their migration is explicitly recorded here.
+Directories marked as pending are proposed area boundaries, not yet authoritative replacements for existing documents. Existing legacy documents remain relevant evidence until their migration is explicitly recorded, but they must not override a completed area contract.
 
 ## Current authoritative areas
 
@@ -83,7 +86,18 @@ The completed [`latest_snapshot/`](latest_snapshot/) area governs:
 
 It defines latest-valid state, the three physical pollutant `window=all` objects, request-time finite-window derivation, the physical manifest, public v2 compatibility and TEST validation policy.
 
-The R2-history binding contract in [`r2_history/`](r2_history/) governs the stable v2 timeseries identity/routing objects, their core-snapshot publisher, the observations and AQI R2 API readers, cache-proxy routing, backup inventory and local integrity validation. It does not replace the remaining R2-history area documentation.
+The R2-history documents in [`r2_history/`](r2_history/) currently govern:
+
+- stable v2 timeseries binding identity and routing;
+- binding publication and reconciliation;
+- v2 integrity detection, repair planning and repair execution;
+- the active Prune Daily Phase B AQI history write and targeted-index gates.
+
+They do not yet replace every legacy R2 layout, backup, read-API or general operations document.
+
+The completed [`dashboards/`](dashboards/) area governs the hosted Pages and API Worker architecture, the local Python dashboard, station snapshot behaviour, displayed data-source ownership, deployment and TEST validation.
+
+The completed [`geography/`](geography/) area governs ONSPD postcode builds and lookup routes, PCON and local-authority boundary shards, source-version selection, upload behaviour and TEST validation.
 
 ## Repository-wide rules already defined elsewhere
 
