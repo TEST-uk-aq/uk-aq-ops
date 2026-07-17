@@ -10,6 +10,8 @@ Its purpose is to prevent implementation drift, accidental behaviour changes and
 
 Human-readable Markdown under `system_docs/` is the authoritative prose specification.
 
+`system_docs/` is the sole active system-documentation root. A top-level `docs/` directory MUST NOT be recreated. Historical reports and superseded broad documents may be retained under `system_docs_legacy/`, but they MUST carry clear historical status and MUST NOT override an active area contract.
+
 Coding agents MUST NOT create or rely on a separate hidden, compressed or non-human-readable behavioural specification.
 
 Machine-readable schemas, fixtures and deterministic checks may accompany the prose contract, but they MUST implement the same rules and MUST NOT introduce a second behavioural authority.
@@ -49,9 +51,9 @@ Explains why a load-bearing decision was made, what alternatives were rejected a
 
 The area contract defines what the system does. The decision record explains why.
 
-### Archive
+### Archive or legacy record
 
-Preserves retired files and historical decisions. Archive paths MUST NOT be used as active runtime or authoritative documentation paths.
+Preserves retired files, point-in-time reports and historical decisions. Archive and `system_docs_legacy/` paths MUST NOT be used as active runtime or authoritative documentation paths.
 
 ## Required area structure
 
@@ -79,9 +81,9 @@ Other documents may summarise or link to it, but they MUST identify the authorit
 
 When an existing broad document is replaced:
 
-1. preserve it in the required dated archive when applicable;
+1. preserve it in the required legacy or dated archive location when applicable;
 2. move its still-current content into the appropriate area files;
-3. replace the original active document with a short redirect or remove it if no active references require the path;
+3. remove the original active document, or use a short redirect only where an active external reference genuinely requires it;
 4. record the migration in the area `README.md` or repository documentation index.
 
 ## Coding-agent change protocol
