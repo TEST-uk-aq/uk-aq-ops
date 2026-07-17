@@ -34,6 +34,19 @@ When database or deployment work is needed, Codex should stop after producing:
 5. rollback notes,
 6. post-deploy validation checklist.
 
+## TEST System Validation Policy
+
+- This repository is part of the UK AQ TEST system. It is intended for development and real operational testing before changes are transferred to LIVE.
+- Perform as little pre-deployment testing as reasonably possible.
+- Before deployment, run only the smallest fast local check needed to establish that changed code or configuration is structurally viable, such as syntax, type checking, parsing or one directly relevant existing check.
+- Do not create new automated tests by default.
+- Add a targeted test only when it is genuinely needed to protect against a specific high-risk regression that would be difficult to detect through normal TEST operation.
+- Do not run broad test suites, exhaustive edge-case testing, large fixture programmes, shadow comparisons, soak tests or extended validation unless the user explicitly requests them.
+- Functional testing should normally happen after deployment through real operation on the TEST system.
+- For a reversible change, one successful normal operation and one representative output check are generally sufficient.
+- Data deletion, schema safety, message acknowledgement and irreversible operations may require one narrowly targeted check before execution.
+- Do not expand the task solely to improve test coverage.
+
 ## Permission levels
 Unless the prompt says otherwise, use Level 1.
 ### Level 1 — Code only
