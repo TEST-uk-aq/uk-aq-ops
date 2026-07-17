@@ -337,3 +337,25 @@ test("observations Worker serves protected immutable v2 timeseries binding", asy
     await harness.restore();
   }
 });
+
+test("observations Worker rejects invalid timeseries binding payloads without caching", async () => {
+  const bindingKey = "history/_index_v2/timeseries_binding/timeseries_id=3742.json";
+  const harness = installHarness({
+    [bindingKey]: makeJsonR2Object({
+      schema_version: 1,
+      history_version: "v2",
+      index_kind: "timeseries_binding",
+      timeseries_id: 3742,
+      connector_id: 6,
+      pollutant_code: "PM2.5",
+    }),
+  });
+  try {
+    const response = await observsHistoryWorker.fetch(bindingRequest(), harness.env, harness.ctx);
+    assert.equal(response.status, 422);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.equal((await response.json()).error, "timeseries_binding_invalid");
+  } finally {
+    await harness.restore();
+  }
+});

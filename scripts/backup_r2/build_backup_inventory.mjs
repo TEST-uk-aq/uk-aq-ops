@@ -62,7 +62,9 @@ const DEFAULT_REPORT_OUT =
 const DAY_MANIFEST_PATTERN = /^day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/;
 const INDEX_TREE_UNIT_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
-const INDEX_TREE_UNIT_V2_PATTERN =
+const OBSERVATIONS_INDEX_TREE_UNIT_V2_PATTERN =
+  /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
+const AQILEVELS_INDEX_TREE_UNIT_V2_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/pollutant_code=(pm25|pm10|no2)\/manifest\.json$/;
 const TIMESERIES_BINDING_INDEX_V2_UNIT_PATTERN =
   /^timeseries_id=([1-9]\d*)\.json$/;
@@ -543,12 +545,12 @@ function indexFileScanConfig(indexKey, args) {
   };
 }
 
-function indexTreeScanConfig(treeKey, args) {
+export function indexTreeScanConfig(treeKey, args) {
   if (treeKey === "observations_timeseries_v2") {
     return {
       indexPrefix: args.index_v2_prefix,
       treePath: "observations_timeseries",
-      unitPattern: INDEX_TREE_UNIT_V2_PATTERN,
+      unitPattern: OBSERVATIONS_INDEX_TREE_UNIT_V2_PATTERN,
       maxDepth: 4,
     };
   }
@@ -557,7 +559,7 @@ function indexTreeScanConfig(treeKey, args) {
     return {
       indexPrefix: args.index_v2_prefix,
       treePath: "aqilevels_hourly_data_timeseries",
-      unitPattern: INDEX_TREE_UNIT_V2_PATTERN,
+      unitPattern: AQILEVELS_INDEX_TREE_UNIT_V2_PATTERN,
       maxDepth: 4,
     };
   }

@@ -107,6 +107,18 @@ function normalizePollutant(raw) {
   return null;
 }
 
+function isValidTimeseriesBinding(binding, requestedTimeseriesId) {
+  if (!binding || typeof binding !== "object" || Array.isArray(binding)) return false;
+  const pollutantCode = String(binding.pollutant_code || "").trim();
+  return binding.schema_version === 1
+    && binding.history_version === "v2"
+    && binding.index_kind === "timeseries_binding"
+    && parseRequiredPositiveInt(binding.timeseries_id) === requestedTimeseriesId
+    && parseRequiredPositiveInt(binding.connector_id) !== null
+    && /^[a-z0-9_]+$/.test(pollutantCode)
+    && pollutantCode === binding.pollutant_code;
+}
+
 function toIsoOrNull(raw) {
   const text = String(raw || "").trim();
   if (!text) {
@@ -247,7 +259,8 @@ async function isCacheableTimeseriesBindingResponse(response) {
   try {
     const payload = await response.clone().json();
     return Boolean(payload && typeof payload === "object" && !Array.isArray(payload)
-      && payload.ok === true && Object.hasOwn(payload, "binding"));
+      && payload.ok === true
+      && isValidTimeseriesBinding(payload.binding, parseRequiredPositiveInt(payload.timeseries_id)));
   } catch (_error) {
     return false;
   }
@@ -1383,6 +1396,19 @@ async function handleTimeseriesBindingRequest(requestParams, env) {
     }, {
       status: 404,
       cacheSeconds: 60,
+      noStore: true,
+    });
+  }
+  if (!isValidTimeseriesBinding(object.value, requestParams.timeseriesId)) {
+    return jsonResponse({
+      ok: false,
+      error: "timeseries_binding_invalid",
+      timeseries_id: requestParams.timeseriesId,
+      binding_index_prefix: bindingIndexPrefix,
+      binding_key: bindingKey,
+    }, {
+      status: 422,
+      cacheSeconds: 0,
       noStore: true,
     });
   }

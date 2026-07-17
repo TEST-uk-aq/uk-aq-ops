@@ -485,18 +485,6 @@ function positiveIntegerOrNull(value) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-function normalizeCorePollutant(...values) {
-  for (const value of values) {
-    const normalized = normalizeObservationPropertyCode(value);
-    if (normalized) return normalized;
-    const compact = String(value || "").trim().toLowerCase().replace(/[\s._-]+/g, "");
-    if (compact === "pm25" || compact === "pm10" || compact === "no2") {
-      return compact;
-    }
-  }
-  return null;
-}
-
 export function buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
   timeseriesRows = [],
   phenomenaRows = [],
@@ -527,21 +515,10 @@ export function buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
       station_id: row?.station_id,
       phenomenon_id: phenomenonId,
       observed_property_id: observedPropertyId,
-      pollutant_code: normalizeCorePollutant(
-        row?.pollutant_code,
-        row?.observed_property_code,
-        row?.label,
-        row?.timeseries_ref,
-        phenomenon?.pollutant_code,
-        phenomenon?.observed_property_code,
-        phenomenon?.pollutant_label,
-        phenomenon?.source_label,
-        phenomenon?.label,
-        observedProperty?.pollutant_code,
-        observedProperty?.observed_property_code,
-        observedProperty?.notation,
-        observedProperty?.label,
-      ),
+      // `uk_aq_core.observed_properties.code` is the sole authoritative
+      // pollutant identity. Missing or unsafe values intentionally remain
+      // null so reconciliation reports an invalid binding rather than guessing.
+      pollutant_code: normalizeObservationPropertyCode(observedProperty?.code),
     });
   }
   return bindings;
@@ -808,6 +785,9 @@ try {
   const report = await main(args);
   writeReport(reportOutPath, report);
   console.log(JSON.stringify(report, null, 2));
+  if (report.timeseries_binding_reconciliation?.status === "failed") {
+    process.exitCode = 1;
+  }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   const payload = {

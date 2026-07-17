@@ -263,6 +263,18 @@ function parseRequiredPositiveInt(raw) {
   return value > 0 ? value : null;
 }
 
+function isValidTimeseriesBinding(binding, requestedTimeseriesId) {
+  if (!binding || typeof binding !== "object" || Array.isArray(binding)) return false;
+  const pollutantCode = String(binding.pollutant_code || "").trim();
+  return binding.schema_version === 1
+    && binding.history_version === "v2"
+    && binding.index_kind === "timeseries_binding"
+    && parseRequiredPositiveInt(binding.timeseries_id) === requestedTimeseriesId
+    && parseRequiredPositiveInt(binding.connector_id) !== null
+    && /^[a-z0-9_]+$/.test(pollutantCode)
+    && pollutantCode === binding.pollutant_code;
+}
+
 function toIsoOrNull(raw) {
   const text = String(raw || "").trim();
   if (!text) {
@@ -1181,12 +1193,8 @@ async function readTimeseriesWindowContextFromR2Binding({
     };
   }
 
-  const binding = object.value && typeof object.value === "object" && !Array.isArray(object.value)
-    ? object.value
-    : {};
-  const normalizedTimeseriesId = parseRequiredPositiveInt(binding.timeseries_id);
-  const connectorId = parseRequiredPositiveInt(binding.connector_id);
-  if (normalizedTimeseriesId !== parseRequiredPositiveInt(timeseriesId) || !connectorId) {
+  const binding = object.value;
+  if (!isValidTimeseriesBinding(binding, parseRequiredPositiveInt(timeseriesId))) {
     return {
       found: false,
       source_path: bindingKey,
@@ -1199,9 +1207,9 @@ async function readTimeseriesWindowContextFromR2Binding({
   return {
     found: true,
     source_path: bindingKey,
-    connector_id: connectorId,
+    connector_id: parseRequiredPositiveInt(binding.connector_id),
     station_id: parseRequiredPositiveInt(binding.station_id) || null,
-    timeseries_ids: [normalizedTimeseriesId],
+    timeseries_ids: [parseRequiredPositiveInt(binding.timeseries_id)],
     binding,
   };
 }
