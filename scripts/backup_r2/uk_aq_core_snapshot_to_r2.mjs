@@ -16,6 +16,11 @@ import {
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
 import { resolveR2HistoryVersion } from "../../workers/shared/uk_aq_r2_history_version.mjs";
+import {
+  reconcileR2HistoryV2TimeseriesBindings,
+  DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
+} from "../../workers/shared/uk_aq_r2_history_index.mjs";
+import { normalizeObservationPropertyCode } from "../../workers/shared/uk_aq_observation_property_code.mjs";
 
 export function resolveCoreSnapshotPrefix(env = process.env) {
   const version = resolveR2HistoryVersion(env, { context: "R2 core snapshot" });
@@ -467,6 +472,93 @@ from (
   };
 }
 
+function readNdjsonGz(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return [];
+  return zlib.gunzipSync(fs.readFileSync(filePath)).toString("utf8")
+    .split(/\r?\n/)
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+}
+
+function positiveIntegerOrNull(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeCorePollutant(...values) {
+  for (const value of values) {
+    const normalized = normalizeObservationPropertyCode(value);
+    if (normalized) return normalized;
+    const compact = String(value || "").trim().toLowerCase().replace(/[\s._-]+/g, "");
+    if (compact === "pm25" || compact === "pm10" || compact === "no2") {
+      return compact;
+    }
+  }
+  return null;
+}
+
+export function buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
+  timeseriesRows = [],
+  phenomenaRows = [],
+  observedPropertiesRows = [],
+} = {}) {
+  const phenomenaById = new Map();
+  for (const row of phenomenaRows) {
+    const id = positiveIntegerOrNull(row?.id);
+    if (id) phenomenaById.set(id, row);
+  }
+  const observedPropertiesById = new Map();
+  for (const row of observedPropertiesRows) {
+    const id = positiveIntegerOrNull(row?.id);
+    if (id) observedPropertiesById.set(id, row);
+  }
+  const bindings = [];
+  for (const row of timeseriesRows) {
+    const phenomenonId = positiveIntegerOrNull(row?.phenomenon_id);
+    const observedPropertyId = positiveIntegerOrNull(row?.observed_property_id)
+      || positiveIntegerOrNull(phenomenaById.get(phenomenonId)?.observed_property_id);
+    const phenomenon = phenomenonId ? phenomenaById.get(phenomenonId) : null;
+    const observedProperty = observedPropertyId
+      ? observedPropertiesById.get(observedPropertyId)
+      : null;
+    bindings.push({
+      timeseries_id: row?.id,
+      connector_id: row?.connector_id,
+      station_id: row?.station_id,
+      phenomenon_id: phenomenonId,
+      observed_property_id: observedPropertyId,
+      pollutant_code: normalizeCorePollutant(
+        row?.pollutant_code,
+        row?.observed_property_code,
+        row?.label,
+        row?.timeseries_ref,
+        phenomenon?.pollutant_code,
+        phenomenon?.observed_property_code,
+        phenomenon?.pollutant_label,
+        phenomenon?.source_label,
+        phenomenon?.label,
+        observedProperty?.pollutant_code,
+        observedProperty?.observed_property_code,
+        observedProperty?.notation,
+        observedProperty?.label,
+      ),
+    });
+  }
+  return bindings;
+}
+
+export function buildAuthoritativeTimeseriesBindingsFromCoreSnapshotFiles({
+  timeseriesFile,
+  phenomenaFile,
+  observedPropertiesFile,
+} = {}) {
+  return buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
+    timeseriesRows: readNdjsonGz(timeseriesFile),
+    phenomenaRows: readNdjsonGz(phenomenaFile),
+    observedPropertiesRows: readNdjsonGz(observedPropertiesFile),
+  });
+}
+
 async function fetchExistingManifestHash(r2, manifestKey) {
   const head = await r2HeadObject({ r2, key: manifestKey });
   if (!head.exists) {
@@ -505,6 +597,7 @@ async function main(args) {
     uploaded_objects: 0,
     uploaded_bytes: 0,
     skipped_write_reason: null,
+    timeseries_binding_reconciliation: null,
     manifest_key: `${args.prefix}/day_utc=${args.day_utc}/manifest.json`,
     checksums_key: `${args.prefix}/day_utc=${args.day_utc}/checksums.sha256`,
     table_exports: [],
@@ -657,6 +750,41 @@ async function main(args) {
       report.skipped_write_reason = "manifest_unchanged";
     } else if (args.dry_run) {
       report.skipped_write_reason = "dry_run";
+    }
+
+    try {
+      if (resolveR2HistoryVersion(process.env, { context: "R2 core snapshot" }) === "v2") {
+        const artifactByTable = new Map(tableArtifacts.map((entry) => [entry.table, entry]));
+        const timeseriesFile = artifactByTable.get("timeseries")?.temp_file;
+        const phenomenaFile = artifactByTable.get("phenomena")?.temp_file;
+        const observedPropertiesFile = artifactByTable.get("observed_properties")?.temp_file;
+        if (!timeseriesFile || !phenomenaFile || !observedPropertiesFile) {
+          report.timeseries_binding_reconciliation = {
+            status: "skipped",
+            reason: "required_core_binding_tables_not_exported",
+          };
+        } else {
+          report.timeseries_binding_reconciliation = await reconcileR2HistoryV2TimeseriesBindings({
+            r2,
+            bucketName: r2.bucket,
+            timeseriesBindingIndexPrefix: normalizePrefix(
+              process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
+                || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
+            ),
+            authoritativeTimeseries: buildAuthoritativeTimeseriesBindingsFromCoreSnapshotFiles({
+              timeseriesFile,
+              phenomenaFile,
+              observedPropertiesFile,
+            }),
+            writeR2: !args.dry_run,
+          });
+        }
+      }
+    } catch (error) {
+      report.timeseries_binding_reconciliation = {
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });

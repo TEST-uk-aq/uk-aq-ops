@@ -27,6 +27,7 @@ directory and do not rely on an undocumented runtime bundle.
 6. Validate v2 only:
    - observations partitions and manifests;
    - AQI hourly partitions and manifests.
+   - available stable timeseries bindings against the imported core snapshot.
 7. Build the repair plan. When `--run-backfill` is set, create a sparse local
    run overlay and run the ordered v2 coordinator after all detection has
    completed.
@@ -52,8 +53,8 @@ Later stages resolve a verified overlay object first, then the matching
 Verified tombstones hide objects deleted by a targeted replacement, so a stale
 Dropbox part cannot reappear in the current run's combined view.
 
-The metadata executor plans solely from that combined-local view. It does not
-GET, HEAD, or list live R2 before a metadata PUT. For an authorised real apply,
+The index executor plans solely from that combined-local view. It does not
+GET, HEAD, or list live R2 before an index PUT. For an authorised real apply,
 every changed proposal is PUT and immediately GET-verified for exact bytes and
 canonical structure. The only retained live-read exception is the AQI writer's
 read of observation objects that the same run has already PUT/GET-verified.
@@ -62,7 +63,7 @@ but every valid sibling pollutant manifest already visible in the combined
 overlay/Dropbox view, including O3, is retained by connector/day child
 discovery.
 
-The metadata executor reads parquet metadata from the final combined local
+The index executor reads parquet metadata from the final combined local
 object. Observation parquet uses `observed_at_utc`, with `observed_at` accepted
 only for older compatible files; a file with neither timestamp column blocks
 its exact leaf scope. Missing requested pollutant parquet blocks its connector,
@@ -71,18 +72,16 @@ The resolver scans only affected day prefixes and reads the single exact global
 latest-index key needed to merge those days, so untouched latest-index entries
 are preserved without a broad Dropbox scan.
 
-Integrity does not use the shared full per-timeseries metadata rebuild. It
-merges each affected metadata object by `domain`, `day_utc`, `connector_id` and
-`pollutant_code`, preserving all untouched observation and AQI entries before
-recalculating coverage. Missing metadata blocks safely. Every final affected
-connector and pollutant child is required, so an unreadable child produces no
-latest-index or metadata proposal for that incomplete day.
+Integrity does not use a cumulative per-timeseries metadata rebuild. Stable
+timeseries bindings are validated independently against the committed core
+snapshot. Every final affected connector and pollutant child is required, so an
+unreadable child produces no latest-index proposal for that incomplete day.
 
-Targeted metadata planning unions old and final pollutant-index timeseries IDs,
-so removal-only IDs lose only their exact affected entry. A final-empty metadata
+Targeted index planning unions old and final pollutant-index timeseries IDs,
+so removal-only IDs lose only their exact affected entry. A final-empty index
 object blocks until verified deletion support exists. Latest-index proposals are
-applied after pollutant and metadata proposals, and tombstones precede every
-Dropbox fallback, including dynamic exact-key reads.
+applied after pollutant-index proposals, and tombstones precede every Dropbox
+fallback, including dynamic exact-key reads.
 
 The final report includes prior R2 GET verification evidence for every changed
 object and delete verification evidence for every replacement deletion. It
@@ -98,15 +97,19 @@ make the principal v2 status reflect the final verification state. A failed
 final verification or `stopped_limit` is reported to daily task health as a
 failed task, not a finished task.
 
-Final verification includes each changed global metadata object by exact key.
-It validates schema, identity, entry uniqueness, every coverage and top-level
-aggregate, then cross-checks affected pollutant-index payload identities and
-row counts without scanning the global metadata prefix. Per-key proposal
-evidence retains every stage attempt, while only a GET-verified or unchanged
-metadata body becomes authoritative for this final contract. A failed
-application is recorded as a deterministic blocked scope before PUT, or an
-uncertain R2 object after PUT was attempted, and therefore always fails the
-single final verification.
+Final verification includes each changed index object by exact key. It validates
+schema, identity and applicable aggregate fields, then cross-checks affected
+pollutant-index payload identities and row counts without scanning a global
+per-timeseries cumulative index prefix. Per-key proposal evidence retains every stage
+attempt, while only a GET-verified or unchanged index body becomes authoritative
+for this final contract. A failed application is recorded as a deterministic
+blocked scope before PUT, or an uncertain R2 object after PUT was attempted,
+and therefore always fails the single final verification.
+
+Stable binding validation is independent of cumulative metadata coverage. It
+compares `history/_index_v2/timeseries_binding` objects to imported core
+identities, reports missing, stale or invalid objects, and never deletes them;
+the dedicated core-snapshot binding reconciliation command is the repair path.
 
 ## Backup gate
 
@@ -174,15 +177,15 @@ also covers row/source-row/file/byte aggregates, min/max timeseries identifiers,
 supported timestamp ranges, parquet key sets, and child manifest hashes.
 
 Each finding includes `fault_class`, distinguishing data, pollutant-manifest,
-connector-manifest, day-manifest, index, metadata, source-mapping, and
-source-unavailable faults. Both source-only and R2-only per-timeseries count
-differences are retained in the report.
+connector-manifest, day-manifest, index, source-mapping, and source-unavailable
+faults. Both source-only and R2-only per-timeseries count differences are
+retained in the report.
 
 ## Repair planning
 
 Each v2 run includes a deterministic, deduplicated `repair_plan` array. The
-The coordinator consumes observation and AQI metadata/index actions after data
-repair and includes
+The coordinator consumes observation and AQI index actions after data repair
+and includes
 `data_changes_required`, `requires_index_rebuild`, and all contributing gap
 types.
 

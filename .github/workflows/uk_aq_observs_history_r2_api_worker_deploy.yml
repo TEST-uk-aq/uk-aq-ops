@@ -26,6 +26,7 @@ jobs:
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
       UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
       UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX || 'history/_index_v2/observations_timeseries' }}
+      UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || 'history/_index_v2/timeseries_binding' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,6 +75,7 @@ jobs:
           sed -i "s|__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX__|${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_INDEX_V2_PREFIX__|${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX__|${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
+          sed -i "s|__UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX__|${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
 
       - name: Set Worker secrets
         working-directory: workers/uk_aq_observs_history_r2_api_worker

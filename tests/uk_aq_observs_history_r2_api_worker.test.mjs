@@ -87,9 +87,9 @@ function observationRequest(extraParams = "") {
   );
 }
 
-function metadataRequest(timeseriesId = 3742) {
+function bindingRequest(timeseriesId = 3742) {
   return new Request(
-    `https://example.test/v1/timeseries-metadata?timeseries_id=${timeseriesId}`,
+    `https://example.test/v1/timeseries-binding?timeseries_id=${timeseriesId}`,
     {
       headers: {
         "x-uk-aq-upstream-auth": "test-upstream-secret",
@@ -311,35 +311,28 @@ test("observations Worker v2 reads pollutant index path and reports missing parq
   }
 });
 
-test("observations Worker serves protected v2 timeseries metadata index", async () => {
-  const metadataKey = "history/_index_v2/timeseries/timeseries_id=3742.json";
+test("observations Worker serves protected immutable v2 timeseries binding", async () => {
+  const bindingKey = "history/_index_v2/timeseries_binding/timeseries_id=3742.json";
   const harness = installHarness({
-    [metadataKey]: makeJsonR2Object({
+    [bindingKey]: makeJsonR2Object({
       schema_version: 1,
-      index_kind: "timeseries_metadata",
       history_version: "v2",
+      index_kind: "timeseries_binding",
       timeseries_id: 3742,
       connector_id: 6,
-      connector_ids: [6],
-      pollutant_codes: ["pm25"],
-      observations_coverage: { row_count: 10 },
-      aqi_coverage: { row_count: 8 },
+      pollutant_code: "pm25",
+      station_id: 91,
     }),
   });
 
   try {
-    const response = await observsHistoryWorker.fetch(
-      metadataRequest(),
-      harness.env,
-      harness.ctx,
-    );
-
+    const response = await observsHistoryWorker.fetch(bindingRequest(), harness.env, harness.ctx);
     assert.equal(response.status, 200);
     const payload = await response.json();
-    assert.equal(payload.ok, true);
-    assert.equal(payload.metadata_key, metadataKey);
-    assert.equal(payload.metadata.connector_id, 6);
-    assert.deepEqual(harness.getKeys, [metadataKey]);
+    assert.equal(payload.binding_key, bindingKey);
+    assert.equal(payload.binding.connector_id, 6);
+    assert.match(response.headers.get("Cache-Control") || "", /max-age=86400/);
+    assert.deepEqual(harness.getKeys, [bindingKey]);
   } finally {
     await harness.restore();
   }

@@ -64,7 +64,7 @@ const INDEX_TREE_UNIT_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
 const INDEX_TREE_UNIT_V2_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/pollutant_code=(pm25|pm10|no2)\/manifest\.json$/;
-const TIMESERIES_METADATA_INDEX_V2_UNIT_PATTERN =
+const TIMESERIES_BINDING_INDEX_V2_UNIT_PATTERN =
   /^timeseries_id=([1-9]\d*)\.json$/;
 const COMMITTED_CONNECTOR_MANIFEST_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
@@ -562,11 +562,11 @@ function indexTreeScanConfig(treeKey, args) {
     };
   }
 
-  if (treeKey === "timeseries_metadata_v2") {
+  if (treeKey === "timeseries_binding_v2") {
     return {
       indexPrefix: args.index_v2_prefix,
-      treePath: "timeseries",
-      unitPattern: TIMESERIES_METADATA_INDEX_V2_UNIT_PATTERN,
+      treePath: "timeseries_binding",
+      unitPattern: TIMESERIES_BINDING_INDEX_V2_UNIT_PATTERN,
       maxDepth: 1,
     };
   }

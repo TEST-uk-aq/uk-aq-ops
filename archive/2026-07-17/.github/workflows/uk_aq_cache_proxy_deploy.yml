@@ -1,0 +1,174 @@
+name: Deploy uk_aq_cache_proxy Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "workers/uk_aq_cache_proxy/**"
+      - ".github/workflows/uk_aq_cache_proxy_deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    env:
+      UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
+      UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
+      UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate cache Cloudflare credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN}" ]; then
+            echo "Missing secret UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN (or legacy UK_AQ_CACHE_CLOUDFLARE_API_TOKEN)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Missing variable UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID (or legacy UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID)."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_STATION_HISTORY_WORKER_NAME}" ]; then
+            echo "Missing required GitHub repository variable UK_AQ_STATION_HISTORY_WORKER_NAME."
+            exit 1
+          fi
+
+      - name: Resolve STATION_HISTORY Service Binding target
+        working-directory: workers/uk_aq_cache_proxy
+        env:
+          STATION_HISTORY_SERVICE: ${{ env.UK_AQ_STATION_HISTORY_WORKER_NAME }}
+        run: |
+          set -euo pipefail
+          test -n "${STATION_HISTORY_SERVICE}" || { echo "STATION_HISTORY Service Binding target is empty."; exit 1; }
+          sed "s|__UK_AQ_STATION_HISTORY_WORKER_NAME__|${STATION_HISTORY_SERVICE}|g" wrangler.toml > wrangler.deploy.toml
+          grep -F "service = \"${STATION_HISTORY_SERVICE}\"" wrangler.deploy.toml >/dev/null || {
+            echo "Failed to resolve STATION_HISTORY Service Binding target."
+            exit 1
+          }
+          if grep -q '__UK_AQ_STATION_HISTORY_WORKER_NAME__' wrangler.deploy.toml; then
+            echo "Unresolved STATION_HISTORY Service Binding placeholder."
+            exit 1
+          fi
+
+      - name: Deploy Worker (base)
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/uk_aq_cache_proxy
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
+
+      - name: Validate required Worker secrets and vars
+        run: |
+          set -euo pipefail
+          missing_secrets=()
+          missing_vars=()
+          [ -z "${{ secrets.UK_AQ_EDGE_ACCESS_TOKEN_SECRET }}" ] && missing_secrets+=("UK_AQ_EDGE_ACCESS_TOKEN_SECRET")
+          [ -z "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" ]     && missing_secrets+=("UK_AQ_EDGE_UPSTREAM_SECRET")
+          [ -z "${{ secrets.UK_AQ_CACHE_BYPASS_SECRET }}" ]      && missing_secrets+=("UK_AQ_CACHE_BYPASS_SECRET")
+          [ -z "${{ secrets.UK_AQ_TURNSTILE_SECRET_KEY }}" ]     && missing_secrets+=("UK_AQ_TURNSTILE_SECRET_KEY")
+          [ -z "${{ secrets.OBS_AQIDB_SECRET_KEY }}" ]           && missing_secrets+=("OBS_AQIDB_SECRET_KEY")
+          [ -z "${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}" ]     && missing_secrets+=("SB_PUBLISHABLE_DEFAULT_KEY")
+          [ -z "${{ vars.UK_AQ_POSTCODE_LOOKUP_R2_API_URL }}" ]  && missing_vars+=("UK_AQ_POSTCODE_LOOKUP_R2_API_URL")
+          [ -z "${{ vars.UK_AQ_POSTCODE_SUGGEST_R2_API_URL }}" ] && missing_vars+=("UK_AQ_POSTCODE_SUGGEST_R2_API_URL")
+          [ -z "${{ vars.UK_AQ_LATEST_SNAPSHOT_R2_API_URL }}" ]  && missing_vars+=("UK_AQ_LATEST_SNAPSHOT_R2_API_URL")
+          if [ ${#missing_secrets[@]} -gt 0 ]; then
+            echo "Missing required GitHub secrets:"
+            printf '  - %s\n' "${missing_secrets[@]}"
+            exit 1
+          fi
+          if [ ${#missing_vars[@]} -gt 0 ]; then
+            echo "Missing required GitHub variables:"
+            printf '  - %s\n' "${missing_vars[@]}"
+            exit 1
+          fi
+
+      - name: Set Worker secrets
+        working-directory: workers/uk_aq_cache_proxy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          secrets_json="$(jq -n \
+            --arg SUPABASE_URL "${{ vars.SUPABASE_URL }}" \
+            --arg SB_PUBLISHABLE_DEFAULT_KEY "${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}" \
+            --arg SB_SECRET_KEY "${{ secrets.SB_SECRET_KEY }}" \
+            --arg OBS_AQIDB_SUPABASE_URL "${{ vars.OBS_AQIDB_SUPABASE_URL }}" \
+            --arg OBS_AQIDB_SECRET_KEY "${{ secrets.OBS_AQIDB_SECRET_KEY }}" \
+            --arg UK_AQ_AQI_HISTORY_R2_API_URL "${{ vars.UK_AQ_AQI_HISTORY_R2_API_URL }}" \
+            --arg UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED "${{ vars.UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED || 'false' }}" \
+            --arg UK_AQ_AQI_MUTABLE_HOURS "${{ vars.UK_AQ_AQI_MUTABLE_HOURS || '120' }}" \
+            --arg UK_AQ_OBSERVS_HISTORY_R2_API_URL "${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL }}" \
+            --arg UK_AQ_LATEST_SNAPSHOT_R2_API_URL "${{ vars.UK_AQ_LATEST_SNAPSHOT_R2_API_URL }}" \
+            --arg UK_AQ_POSTCODE_LOOKUP_R2_API_URL "${{ vars.UK_AQ_POSTCODE_LOOKUP_R2_API_URL }}" \
+            --arg UK_AQ_POSTCODE_SUGGEST_R2_API_URL "${{ vars.UK_AQ_POSTCODE_SUGGEST_R2_API_URL }}" \
+            --arg UK_AQ_CACHE_ALLOWED_ORIGINS "${{ vars.UK_AQ_CACHE_ALLOWED_ORIGINS }}" \
+            --arg UK_AQ_EDGE_ACCESS_TOKEN_SECRET "${{ secrets.UK_AQ_EDGE_ACCESS_TOKEN_SECRET }}" \
+            --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" \
+            --arg UK_AQ_CACHE_BYPASS_SECRET "${{ secrets.UK_AQ_CACHE_BYPASS_SECRET }}" \
+            --arg UK_AQ_LOCAL_DEV_BYPASS_ENABLED "${{ vars.UK_AQ_LOCAL_DEV_BYPASS_ENABLED }}" \
+            --arg UK_AQ_TURNSTILE_SECRET_KEY "${{ secrets.UK_AQ_TURNSTILE_SECRET_KEY }}" \
+            --arg UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS "${{ vars.UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS }}" \
+            --arg UK_AQ_CHART_METRICS_RPC "${{ vars.UK_AQ_CHART_METRICS_RPC }}" \
+            --arg UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE "${{ vars.UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE }}" \
+            --arg UK_AQ_CHART_METRICS_MAX_BODY_BYTES "${{ vars.UK_AQ_CHART_METRICS_MAX_BODY_BYTES }}" \
+            --arg UK_AQ_TIMESERIES_V2_ENABLED "${{ vars.UK_AQ_TIMESERIES_V2_ENABLED }}" \
+            --arg UK_AQ_TIMESERIES_PROXY_FIRST "${{ vars.UK_AQ_TIMESERIES_PROXY_FIRST }}" \
+            --arg UK_AQ_TIMESERIES_R2_FIRST "${{ vars.UK_AQ_TIMESERIES_R2_FIRST }}" \
+            --arg UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE "${{ vars.UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE }}" \
+            --arg UK_AQ_TIMESERIES_MAX_WINDOW_DAYS "${{ vars.UK_AQ_TIMESERIES_MAX_WINDOW_DAYS }}" \
+            --arg UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST "${{ vars.UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST }}" \
+            --arg UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS "${{ vars.UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS }}" \
+            --arg UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES "${{ vars.UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES }}" \
+            --arg UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR "${{ vars.UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR }}" \
+            --arg UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR "${{ vars.UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR }}" \
+            --arg UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS "${{ vars.UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS }}" \
+            --arg UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS "${{ vars.UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS }}" \
+            --arg UK_AQ_TIMESERIES_RECENT_SWR_SECONDS "${{ vars.UK_AQ_TIMESERIES_RECENT_SWR_SECONDS }}" \
+            --arg UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS "${{ vars.UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS }}" \
+            --arg UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS "${{ vars.UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS }}" \
+            --arg UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS "${{ vars.UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS }}" \
+            --arg UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS "${{ vars.UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS }}" \
+            --arg UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED "${{ vars.UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED || 'false' }}" \
+            --arg UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED "${{ vars.UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED || 'false' }}" \
+            --arg UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED "${{ vars.UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED || 'false' }}" \
+            --arg UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED "${{ vars.UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED || 'false' }}" \
+            --arg UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS "${{ vars.UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS || '60' }}" \
+            --arg UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS "${{ vars.UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS || '300' }}" \
+            --arg UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS "${{ vars.UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS || '300' }}" \
+            --arg UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS "${{ vars.UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS || '300' }}" \
+            --arg UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS "${{ vars.UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS || '604800' }}" \
+            --arg DROPBOX_APP_KEY "${{ secrets.DROPBOX_APP_KEY }}" \
+            --arg DROPBOX_APP_SECRET "${{ secrets.DROPBOX_APP_SECRET }}" \
+            --arg DROPBOX_REFRESH_TOKEN "${{ secrets.DROPBOX_REFRESH_TOKEN }}" \
+            --arg UK_AQ_DROPBOX_ROOT "${{ vars.UK_AQ_DROPBOX_ROOT }}" \
+            --arg UK_AIR_ERROR_DROPBOX_FOLDER "${{ vars.UK_AIR_ERROR_DROPBOX_FOLDER }}" \
+            --arg UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES "${{ vars.UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES }}" \
+            '{SUPABASE_URL: $SUPABASE_URL, SB_PUBLISHABLE_DEFAULT_KEY: $SB_PUBLISHABLE_DEFAULT_KEY, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, UK_AQ_AQI_HISTORY_R2_API_URL: $UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED: $UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED, UK_AQ_AQI_MUTABLE_HOURS: $UK_AQ_AQI_MUTABLE_HOURS, UK_AQ_OBSERVS_HISTORY_R2_API_URL: $UK_AQ_OBSERVS_HISTORY_R2_API_URL, UK_AQ_LATEST_SNAPSHOT_R2_API_URL: $UK_AQ_LATEST_SNAPSHOT_R2_API_URL, UK_AQ_POSTCODE_LOOKUP_R2_API_URL: $UK_AQ_POSTCODE_LOOKUP_R2_API_URL, UK_AQ_POSTCODE_SUGGEST_R2_API_URL: $UK_AQ_POSTCODE_SUGGEST_R2_API_URL, UK_AQ_CACHE_ALLOWED_ORIGINS: $UK_AQ_CACHE_ALLOWED_ORIGINS, UK_AQ_EDGE_ACCESS_TOKEN_SECRET: $UK_AQ_EDGE_ACCESS_TOKEN_SECRET, UK_AQ_CACHE_BYPASS_SECRET: $UK_AQ_CACHE_BYPASS_SECRET, UK_AQ_LOCAL_DEV_BYPASS_ENABLED: $UK_AQ_LOCAL_DEV_BYPASS_ENABLED, UK_AQ_TURNSTILE_SECRET_KEY: $UK_AQ_TURNSTILE_SECRET_KEY, UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: $UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS, UK_AQ_CHART_METRICS_RPC: $UK_AQ_CHART_METRICS_RPC, UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE: $UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE, UK_AQ_CHART_METRICS_MAX_BODY_BYTES: $UK_AQ_CHART_METRICS_MAX_BODY_BYTES, UK_AQ_TIMESERIES_V2_ENABLED: $UK_AQ_TIMESERIES_V2_ENABLED, UK_AQ_TIMESERIES_PROXY_FIRST: $UK_AQ_TIMESERIES_PROXY_FIRST, UK_AQ_TIMESERIES_R2_FIRST: $UK_AQ_TIMESERIES_R2_FIRST, UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE: $UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE, UK_AQ_TIMESERIES_MAX_WINDOW_DAYS: $UK_AQ_TIMESERIES_MAX_WINDOW_DAYS, UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST: $UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST, UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS: $UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS, UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES: $UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES, UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR: $UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR, UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR: $UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR, UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS: $UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS, UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS: $UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS, UK_AQ_TIMESERIES_RECENT_SWR_SECONDS: $UK_AQ_TIMESERIES_RECENT_SWR_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS, UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS: $UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS, UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED: $UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED, UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED: $UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED, UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED: $UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED, UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: $UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED, UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS: $UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS, UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS, DROPBOX_APP_KEY: $DROPBOX_APP_KEY, DROPBOX_APP_SECRET: $DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN: $DROPBOX_REFRESH_TOKEN, UK_AQ_DROPBOX_ROOT: $UK_AQ_DROPBOX_ROOT, UK_AIR_ERROR_DROPBOX_FOLDER: $UK_AIR_ERROR_DROPBOX_FOLDER, UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES: $UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES} | with_entries(select(.value != ""))')"
+          secrets_json="$(jq --arg value "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" '. + {UK_AQ_EDGE_UPSTREAM_SECRET: $value}' <<<"$secrets_json")"
+          for attempt in 1 2 3; do
+            if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_CACHE_WORKER_NAME}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to apply Worker secrets after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        with:
+          apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/uk_aq_cache_proxy
+          command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}

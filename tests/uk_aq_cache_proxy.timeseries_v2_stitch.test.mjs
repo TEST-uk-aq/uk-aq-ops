@@ -269,17 +269,18 @@ test("missing diagnostic ranges outside the Supabase tail cap are reported as sk
   );
 });
 
-test("cache proxy tries R2 timeseries metadata before Supabase connector lookup", () => {
+test("cache proxy tries stable binding before Supabase connector lookup", () => {
   const source = fs.readFileSync("workers/uk_aq_cache_proxy/src/index.ts", "utf8");
-  const r2LookupPos = source.indexOf("stationHistoryObservations.loadTimeseriesMetadataFromR2(");
+  const bindingLookupPos = source.indexOf("stationHistoryObservations.loadTimeseriesBindingFromR2(");
   const supabaseLookupPos = source.indexOf("stationHistoryObservations.loadTimeseriesConnectorId(");
-  const r2CallPos = source.indexOf("r2TimeseriesMetadata = await stationHistoryObservations.loadTimeseriesMetadataFromR2(");
+  const bindingCallPos = source.indexOf("r2TimeseriesBinding = await stationHistoryObservations.loadTimeseriesBindingFromR2(");
   const supabaseCallPos = source.indexOf("connectorId = await stationHistoryObservations.loadTimeseriesConnectorId(");
-  assert.ok(r2LookupPos > 0);
+  assert.ok(bindingLookupPos > 0);
   assert.ok(supabaseLookupPos > 0);
-  assert.ok(r2CallPos > 0);
+  assert.ok(bindingCallPos > 0);
   assert.ok(supabaseCallPos > 0);
-  assert.ok(r2CallPos < supabaseCallPos);
+  assert.ok(bindingCallPos < supabaseCallPos);
+  assert.equal(source.includes("/v1/timeseries-metadata"), false);
 });
 
 test("cache proxy keeps origin-only wrapper before R2 stitch when R2-first is disabled or unconfigured", () => {

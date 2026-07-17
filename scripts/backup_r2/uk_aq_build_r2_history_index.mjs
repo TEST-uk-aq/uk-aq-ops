@@ -63,8 +63,6 @@ function usage() {
     "                                         default: history/_index_v2/observations_timeseries",
     "  UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX",
     "                                         default: history/_index_v2/aqilevels_hourly_data_timeseries",
-    "  UK_AQ_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX",
-    "                                         default: history/_index_v2/timeseries",
     "  UK_AQ_R2_HISTORY_INDEX_FETCH_CONCURRENCY",
     "  UK_AQ_R2_HISTORY_INDEX_MAX_KEYS",
     "  UK_AQ_R2_HISTORY_INDEX_STRICT_MISSING_TIMESERIES_COUNTS",
@@ -90,9 +88,6 @@ function summarizeWriteOutcome(summary) {
   }
   if (summary?.aqilevels_timeseries?.latest_index_put_skipped !== undefined) {
     flags.push(summary.aqilevels_timeseries.latest_index_put_skipped);
-  }
-  if (summary?.timeseries_metadata?.metadata_put_skipped_count !== undefined) {
-    flags.push(summary.timeseries_metadata.metadata_put_skipped_count > 0);
   }
   for (const result of Array.isArray(summary?.results) ? summary.results : []) {
     if (result?.latest_index_put_skipped !== undefined) {

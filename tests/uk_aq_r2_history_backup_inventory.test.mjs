@@ -576,6 +576,12 @@ test("planIndexFiles and planIndexTreeUnits include v2 pollutant index keys", ()
   );
 });
 
+test("v2 backup inventory includes only stable timeseries bindings", () => {
+  const keys = indexTreeKeysForBackupVersion("v2");
+  assert.ok(keys.includes("timeseries_binding_v2"));
+  assert.equal(keys.includes("timeseries_metadata_v2"), false);
+});
+
 
 // ----- run manifest inventory/sync units -----
 

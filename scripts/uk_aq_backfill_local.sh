@@ -27,7 +27,7 @@ Optional env vars:
   UK_AQ_BACKFILL_TIMESERIES_ID              optional single timeseries filter alias
   UK_AQ_BACKFILL_OUTPUT_SCOPE               default|observations_only|aqilevels_only (default: default)
   UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX   default: true (set false to skip the final full R2 history index rebuild)
-  UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS default: false (targeted v2 AQI index repair with --compute-missing-timeseries-counts; refreshes v2 timeseries metadata)
+  UK_AQ_BACKFILL_REPAIR_MISSING_TIMESERIES_COUNTS default: false (targeted v2 AQI index repair with --compute-missing-timeseries-counts; refreshes v2 daily indexes)
   UK_AQ_BACKFILL_INDEX_STRICT_MISSING_TIMESERIES_COUNTS default: false (fail index rebuild if non-empty v2 AQI manifests lack usable counts)
   UK_AQ_BACKFILL_LOCAL_LOG_DIR              default: /Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks/$UK_AQ_ENV_NAME/uk-aq-backfill-local-logs
   UK_AQ_BACKFILL_LOCAL_STOP_ON_ERROR        default: true

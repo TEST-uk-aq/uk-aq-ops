@@ -418,7 +418,6 @@ test("historical-only v2 AQI with connector_id does not use Supabase context loo
     const payload = await response.json();
     assert.equal(payload.coverage.connector_id_source, "request");
     assert.equal(payload.coverage.used_supabase_connector_lookup, false);
-    assert.equal(payload.coverage.r2_timeseries_metadata_lookup_attempted, false);
     assert.equal(harness.fetchCalls.length, 0);
     assert.ok(harness.r2GetKeys.some((key) =>
       key.includes("history/_index_v2/aqilevels_hourly_data_timeseries/day_utc=2026-03-18/connector_id=6/pollutant_code=pm25/manifest.json")
@@ -428,42 +427,32 @@ test("historical-only v2 AQI with connector_id does not use Supabase context loo
   }
 });
 
-test("historical-only v2 AQI without connector_id resolves connector from R2 metadata before Supabase", async () => {
-  const metadataKey = "history/_index_v2/timeseries/timeseries_id=3742.json";
+test("historical-only v2 AQI resolves connector from stable R2 binding first", async () => {
+  const bindingKey = "history/_index_v2/timeseries_binding/timeseries_id=3742.json";
   const harness = installHistoricalR2Harness({
-    [metadataKey]: makeJsonR2Object({
+    [bindingKey]: makeJsonR2Object({
       schema_version: 1,
       history_version: "v2",
-      index_kind: "timeseries_metadata",
+      index_kind: "timeseries_binding",
       timeseries_id: 3742,
       connector_id: 6,
-      connector_ids: [6],
-      pollutant_codes: ["pm25"],
-      aqi_coverage: {
-        row_count: 24,
-        connector_ids: [6],
-        pollutant_codes: ["pm25"],
-      },
+      pollutant_code: "pm25",
+      station_id: 91,
     }),
   });
   try {
     const response = await aqiHistoryWorker.fetch(
       new Request("https://example.test/v1/aqi-history?timeseries_id=3742&pollutant=pm25&from_utc=2026-03-18T00:00:00.000Z&to_utc=2026-03-19T00:00:00.000Z", {
-        headers: {
-          "x-uk-aq-upstream-auth": "test-upstream-secret",
-        },
+        headers: { "x-uk-aq-upstream-auth": "test-upstream-secret" },
       }),
       harness.env,
       harness.ctx,
     );
-
     assert.equal(response.status, 200);
     const payload = await response.json();
-    assert.equal(payload.coverage.connector_id_source, "r2_metadata");
-    assert.equal(payload.coverage.target_connector_id, 6);
-    assert.equal(payload.coverage.timeseries_metadata_index_key, metadataKey);
-    assert.equal(payload.coverage.r2_timeseries_metadata_lookup_attempted, true);
-    assert.equal(payload.coverage.r2_timeseries_metadata_lookup_found, true);
+    assert.equal(payload.coverage.connector_id_source, "r2_binding");
+    assert.equal(payload.coverage.timeseries_binding_index_key, bindingKey);
+    assert.equal(payload.coverage.used_r2_timeseries_binding_lookup, true);
     assert.equal(payload.coverage.used_supabase_connector_lookup, false);
     assert.equal(harness.fetchCalls.length, 0);
   } finally {

@@ -32,21 +32,18 @@ export async function loadTimeseriesConnectorId(supabaseUrl, sbSecretKey, timese
   return Number.isFinite(connectorId) && connectorId > 0 ? Math.trunc(connectorId) : null;
 }
 
-export async function loadTimeseriesMetadataFromR2(r2ApiUrl, upstreamAuthSecret, timeseriesId) {
+export async function loadTimeseriesBindingFromR2(r2ApiUrl, upstreamAuthSecret, timeseriesId) {
   if (!r2ApiUrl || !upstreamAuthSecret) return null;
-  const endpoint = new URL(r2ApiUrl); endpoint.pathname = "/v1/timeseries-metadata"; endpoint.search = ""; endpoint.searchParams.set("timeseries_id", String(timeseriesId));
+  const endpoint = new URL(r2ApiUrl); endpoint.pathname = "/v1/timeseries-binding"; endpoint.search = ""; endpoint.searchParams.set("timeseries_id", String(timeseriesId));
   let response; try { response = await fetch(endpoint.toString(), { method: "GET", headers: { Accept: "application/json", [UPSTREAM_AUTH_HEADER]: upstreamAuthSecret } }); } catch { return null; }
   if (response.status === 404 || !response.ok) return null;
   let payload; try { payload = await response.json(); } catch { return null; }
-  return payload && typeof payload === "object" && !Array.isArray(payload) && payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata) ? payload.metadata : null;
+  return payload && typeof payload === "object" && !Array.isArray(payload) && payload.binding && typeof payload.binding === "object" && !Array.isArray(payload.binding) ? payload.binding : null;
 }
 
-export function connectorIdFromTimeseriesMetadata(metadata) {
-  const connectorId = Number(metadata?.connector_id);
-  if (Number.isFinite(connectorId) && connectorId > 0) return Math.trunc(connectorId);
-  const connectorIds = Array.isArray(metadata?.connector_ids) ? metadata.connector_ids : [];
-  const onlyConnectorId = connectorIds.length === 1 ? Number(connectorIds[0]) : NaN;
-  return Number.isFinite(onlyConnectorId) && onlyConnectorId > 0 ? Math.trunc(onlyConnectorId) : null;
+export function connectorIdFromTimeseriesBinding(binding) {
+  const connectorId = Number(binding?.connector_id);
+  return Number.isFinite(connectorId) && connectorId > 0 ? Math.trunc(connectorId) : null;
 }
 
 export async function fetchTimeseriesOriginPayload(supabaseUrl, supabasePublishableKey, upstreamAuthSecret, params) {

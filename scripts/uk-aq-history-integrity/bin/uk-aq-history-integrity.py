@@ -6920,6 +6920,7 @@ class HistoryPathConfig:
     aqilevels_hourly_debug_prefix: str | None
     observations_timeseries_index_prefix: str
     aqilevels_timeseries_index_prefix: str
+    timeseries_binding_index_prefix: str
     observations_latest_index_key: str
     aqilevels_latest_index_key: str
     observations_partition_levels: tuple[str, ...]
@@ -6934,6 +6935,7 @@ class HistoryPathConfig:
             "aqilevels_hourly_debug_prefix": self.aqilevels_hourly_debug_prefix,
             "observations_timeseries_index_prefix": self.observations_timeseries_index_prefix,
             "aqilevels_timeseries_index_prefix": self.aqilevels_timeseries_index_prefix,
+            "timeseries_binding_index_prefix": self.timeseries_binding_index_prefix,
             "observations_latest_index_key": self.observations_latest_index_key,
             "aqilevels_latest_index_key": self.aqilevels_latest_index_key,
             "observations_partition_levels": list(self.observations_partition_levels),
@@ -6996,6 +6998,10 @@ def resolve_history_path_config(
             values.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX"),
             f"{index_prefix}/aqilevels_hourly_data_timeseries",
         )
+        timeseries_binding_index_prefix = _normalize_history_prefix(
+            values.get("UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX"),
+            f"{index_prefix}/timeseries_binding",
+        )
         return HistoryPathConfig(
             history_version="v2",
             observations_data_prefix=_normalize_history_prefix(
@@ -7012,6 +7018,7 @@ def resolve_history_path_config(
             ),
             observations_timeseries_index_prefix=observations_index_prefix,
             aqilevels_timeseries_index_prefix=aqilevels_index_prefix,
+            timeseries_binding_index_prefix=timeseries_binding_index_prefix,
             observations_latest_index_key=_append_json_name(
                 index_prefix,
                 "observations_timeseries_latest.json",
@@ -14042,10 +14049,11 @@ def _authoritative_v2_core_timeseries_bindings(
     """
     if conn is None:
         return []
+    has_station_id = True
     try:
         rows = conn.execute(
             """
-            SELECT t.id, t.connector_id, t.label, t.timeseries_ref,
+            SELECT t.id, t.connector_id, t.station_id, t.label, t.timeseries_ref,
                    t.phenomenon_id, p.label, p.source_label,
                    p.pollutant_label, p.observed_property_id
             FROM core_timeseries_snapshot AS t
@@ -14055,7 +14063,21 @@ def _authoritative_v2_core_timeseries_bindings(
             """
         ).fetchall()
     except sqlite3.Error:
-        return []
+        has_station_id = False
+        try:
+            rows = conn.execute(
+                """
+                SELECT t.id, t.connector_id, t.label, t.timeseries_ref,
+                       t.phenomenon_id, p.label, p.source_label,
+                       p.pollutant_label, p.observed_property_id
+                FROM core_timeseries_snapshot AS t
+                LEFT JOIN core_phenomena_snapshot AS p ON p.id = t.phenomenon_id
+                WHERE t.id IS NOT NULL AND t.connector_id IS NOT NULL
+                ORDER BY t.id
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return []
     bindings: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -14065,23 +14087,27 @@ def _authoritative_v2_core_timeseries_bindings(
             continue
         if timeseries_id <= 0 or connector_id <= 0:
             continue
+        offset = 1 if has_station_id else 0
         pollutant_code = next(
             (
                 normalized
-                for normalized in (_normalize_history_pollutant_code(value) for value in (row[2], row[3], row[5], row[6], row[7]))
+                for normalized in (_normalize_history_pollutant_code(value) for value in (row[2 + offset], row[3 + offset], row[5 + offset], row[6 + offset], row[7 + offset]))
                 if normalized
             ),
             None,
         )
         if pollutant_code is None:
             continue
-        bindings.append({
+        binding = {
             "timeseries_id": timeseries_id,
             "connector_id": connector_id,
             "pollutant_code": pollutant_code,
-            "phenomenon_id": row[4],
-            "observed_property_id": row[8],
-        })
+            "phenomenon_id": row[4 + offset],
+            "observed_property_id": row[8 + offset],
+        }
+        if has_station_id:
+            binding["station_id"] = row[2]
+        bindings.append(binding)
     return bindings
 
 
@@ -14298,59 +14324,6 @@ def _record_metadata_executor_overlay(
                     "error": operation.get("error"),
                 })
 
-    # Metadata-operation evidence is authoritative only when the exact final
-    # metadata body was either GET-verified or proved unchanged.  Planned,
-    # failed and dependency-skipped proposals remain in proposal_evidence but
-    # must never overwrite the final-body contract used below.
-    merged = {
-        str(item.get("metadata_object_key")): dict(item)
-        for item in list(run_state.get("timeseries_metadata_operations") or [])
-        if isinstance(item, Mapping) and item.get("metadata_object_key")
-    }
-    for day in list(planning.get("days") or []):
-        if not isinstance(day, Mapping):
-            continue
-        index = day.get("index") or {}
-        metadata = index.get("timeseries_metadata") if isinstance(index, Mapping) else None
-        if not isinstance(metadata, Mapping):
-            continue
-        for raw_operation in list(metadata.get("metadata_operations") or []):
-            if not isinstance(raw_operation, Mapping) or not raw_operation.get("metadata_object_key"):
-                continue
-            key = str(raw_operation["metadata_object_key"])
-            application_operation = operation_by_key.get(key, {})
-            outcome = str(application_operation.get("status") or "not_run_due_to_dependency")
-            if outcome not in {"succeeded", "skipped_unchanged"}:
-                continue
-            current = merged.get(key, {"metadata_object_key": key})
-            replacements = set(current.get("replacement_identities") or [])
-            removals = set(current.get("removal_identities") or [])
-            new_replacements = {str(value) for value in list(raw_operation.get("replacement_identities") or [])}
-            new_removals = {str(value) for value in list(raw_operation.get("removal_identities") or [])}
-            replacements.update(new_replacements)
-            replacements.difference_update(new_removals)
-            removals.update(new_removals)
-            removals.difference_update(new_replacements)
-            current.update({
-                "replacement_identities": sorted(replacements),
-                "removal_identities": sorted(removals),
-                "affected_pollutant_index_keys": sorted(
-                    set(current.get("affected_pollutant_index_keys") or [])
-                    | {str(value) for value in list(raw_operation.get("affected_pollutant_index_keys") or [])}
-                ),
-                "outcome": outcome,
-                "application": dict(application_operation),
-            })
-            current.update({
-                field: raw_operation[field]
-                for field in (
-                    "timeseries_id", "expected_final_sha256", "preserved_entry_count",
-                    "replacement_entry_count", "removal_entry_count",
-                )
-                if raw_operation.get(field) is not None
-            })
-            merged[key] = current
-    run_state["timeseries_metadata_operations"] = [merged[key] for key in sorted(merged)]
     write_run_state(run_state)
 
 
@@ -14646,34 +14619,6 @@ def _create_final_verification_view(
         if source.is_file():
             link_file(source, key)
 
-    # Global timeseries metadata is deliberately not part of the day-scoped
-    # tree above. Link only exact unchanged canonical metadata bodies required
-    # by this run, resolving verified tombstones before overlay then Dropbox.
-    for raw_operation in list(run_state.get("timeseries_metadata_operations") or []):
-        if not isinstance(raw_operation, Mapping) or raw_operation.get("outcome") != "skipped_unchanged":
-            continue
-        object_key = _normalise_overlay_object_key(
-            str(raw_operation.get("metadata_object_key") or "")
-        )
-        if object_key in tombstones:
-            continue
-        overlay_entry = dict(run_state.get("objects") or {}).get(object_key)
-        source: Path | None = None
-        if isinstance(overlay_entry, Mapping) and overlay_entry.get("r2_verified"):
-            candidate = Path(str(overlay_entry.get("local_path") or ""))
-            if candidate.is_file():
-                source = candidate
-        if source is None:
-            candidate = base_root / object_key
-            try:
-                candidate.resolve().relative_to(base_root.resolve())
-            except ValueError:
-                raise ValueError(f"metadata verification object escapes Dropbox root: {object_key}")
-            if candidate.is_file():
-                source = candidate
-        if source is not None:
-            link_file(source, object_key)
-
     for object_key, entry in dict(run_state.get("objects") or {}).items():
         if not isinstance(entry, Mapping) or not entry.get("r2_verified"):
             continue
@@ -14964,6 +14909,94 @@ def _validate_changed_timeseries_metadata(
     return gaps
 
 
+def _validate_v2_timeseries_bindings(
+    *, conn: sqlite3.Connection | None, view_root: Path, config: HistoryPathConfig,
+) -> list[dict[str, Any]]:
+    """Validate stable bindings against the imported v2 core snapshot.
+
+    Bindings are deliberately independent of daily observation/AQI coverage.
+    Missing or stale objects are reported only; this integrity path never
+    deletes R2 objects.  The dedicated core-snapshot reconciliation command
+    is the repair mechanism.
+    """
+    authoritative = _authoritative_v2_core_timeseries_bindings(conn)
+    if not authoritative:
+        return []
+    expected_by_id: dict[int, dict[str, Any]] = {}
+    for raw in authoritative:
+        try:
+            timeseries_id = int(raw["timeseries_id"])
+            connector_id = int(raw["connector_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if timeseries_id <= 0 or connector_id <= 0:
+            continue
+        expected = {
+            "timeseries_id": timeseries_id,
+            "connector_id": connector_id,
+            "pollutant_code": str(raw.get("pollutant_code") or "").strip().lower(),
+        }
+        for field in ("station_id", "phenomenon_id", "observed_property_id"):
+            try:
+                value = int(raw[field]) if raw.get(field) is not None else None
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value > 0:
+                expected[field] = value
+        if expected["pollutant_code"]:
+            expected_by_id[timeseries_id] = expected
+    if not expected_by_id:
+        return []
+
+    prefix = config.timeseries_binding_index_prefix.strip("/")
+    binding_root = view_root / prefix
+    gaps: list[dict[str, Any]] = []
+    actual_ids: set[int] = set()
+    allowed_fields = {
+        "schema_version", "history_version", "index_kind", "timeseries_id",
+        "connector_id", "pollutant_code", "station_id", "phenomenon_id",
+        "observed_property_id",
+    }
+    for path in sorted(binding_root.glob("timeseries_id=*.json")) if binding_root.is_dir() else []:
+        relative_key = path.relative_to(view_root).as_posix()
+        match = re.fullmatch(r"timeseries_id=([1-9]\d*)\.json", path.name)
+        if not match:
+            gaps.append({"stage": "timeseries_binding", "object_key": relative_key, "gap_type": "binding_object_key_invalid"})
+            continue
+        timeseries_id = int(match.group(1))
+        actual_ids.add(timeseries_id)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("binding_payload_not_object")
+            if set(payload) - allowed_fields:
+                raise ValueError("binding_payload_has_non_identity_fields")
+            if payload.get("schema_version") != 1 or payload.get("history_version") != "v2":
+                raise ValueError("binding_schema_or_history_version_mismatch")
+            if payload.get("index_kind") != "timeseries_binding":
+                raise ValueError("binding_index_kind_mismatch")
+            expected = expected_by_id.get(timeseries_id)
+            if expected is None:
+                raise ValueError("binding_stale_timeseries_id")
+            if payload != {
+                "schema_version": 1,
+                "history_version": "v2",
+                "index_kind": "timeseries_binding",
+                **expected,
+            }:
+                raise ValueError("binding_payload_not_authoritative_core_identity")
+        except Exception as exc:
+            gaps.append({"stage": "timeseries_binding", "object_key": relative_key, "gap_type": f"timeseries_binding_invalid:{exc}"})
+    for timeseries_id in sorted(set(expected_by_id) - actual_ids):
+        gaps.append({
+            "stage": "timeseries_binding",
+            "object_key": f"{prefix}/timeseries_id={timeseries_id}.json",
+            "timeseries_id": timeseries_id,
+            "gap_type": "timeseries_binding_missing_reconcile_from_core",
+        })
+    return gaps
+
+
 def run_v2_final_verification(
     *,
     run_state: dict[str, Any],
@@ -14998,8 +15031,8 @@ def run_v2_final_verification(
         ),
     )
     remaining_scopes: list[dict[str, Any]] = []
-    remaining_scopes.extend(_validate_changed_timeseries_metadata(
-        run_state=run_state, view_root=view_root, config=config,
+    remaining_scopes.extend(_validate_v2_timeseries_bindings(
+        conn=conn, view_root=view_root, config=config,
     ))
     for domain, gaps in (
         ("observations", list((recheck.get("observations") or {}).get("gaps") or [])),

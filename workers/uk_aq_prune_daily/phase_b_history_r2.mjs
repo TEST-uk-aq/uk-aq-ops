@@ -4962,7 +4962,6 @@ function buildAqilevelIndexEnv(runtime) {
     UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: runtime.aqilevels_prefix,
     UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: runtime.aqilevels_timeseries_index_prefix,
     UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: runtime.index_prefix_v2 || "history/_index_v2",
-    UK_AQ_R2_HISTORY_V2_TIMESERIES_METADATA_INDEX_PREFIX: runtime.timeseries_metadata_index_prefix_v2 || "history/_index_v2/timeseries",
     UK_AQ_R2_HISTORY_STRICT_MISSING_TIMESERIES_COUNTS: "true",
   };
 }
@@ -4983,7 +4982,6 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
     fromDayUtc: dayUtc,
     toDayUtc: dayUtc,
     connectorId: null,
-    timeseriesMetadataMode: "targeted",
     strictMissingTimeseriesCounts: true,
     fetchConcurrency: 1,
     writeR2: true,
@@ -4999,7 +4997,6 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
   const omitted = requiredTargets.filter((target) => !affectedKeys.has(target.index_key));
   const warnings = [
     ...(Array.isArray(aqilevelsResult?.warnings) ? aqilevelsResult.warnings : []),
-    ...(Array.isArray(summary?.timeseries_metadata?.warnings) ? summary.timeseries_metadata.warnings : []),
   ];
   if (warnings.length || omitted.length) {
     throw new Error(`AQI targeted index update failed for day=${dayUtc}; warnings=${warnings.length}; omitted_required_indexes=${omitted.map((entry) => entry.index_key).join(", ")}`);
@@ -5021,7 +5018,6 @@ export async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManif
     : null;
   const buildWarnings = [
     ...(Array.isArray(buildResult?.warnings) ? buildResult.warnings : []),
-    ...(Array.isArray(indexBuild?.summary?.timeseries_metadata?.warnings) ? indexBuild.summary.timeseries_metadata.warnings : []),
   ];
   if (buildWarnings.length) {
     throw new Error(`AQI index verification failed for day=${dayUtc}; targeted update reported warnings: ${buildWarnings.join("; ")}`);
