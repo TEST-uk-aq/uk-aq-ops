@@ -3234,7 +3234,9 @@ export default {
       const internalUrl = new URL(`https://station-history.internal${stationHistoryInternalRoute}`);
       internalUrl.search = stationHistoryCacheKeys
         .stripStationSeriesCacheContractComponent(
-          stationHistoryCacheKeys.stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl),
+          stationHistoryCacheKeys.stripAqiHistoryCacheContractComponent(
+            stationHistoryCacheKeys.stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl),
+          ),
         )
         .search;
       if (usingStationSeriesUpstream && url.searchParams.has("connector_id")) {
@@ -3416,7 +3418,9 @@ export default {
         allowedOrigins,
       );
     }
-    const normalizedUpstreamRequestUrl = stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl);
+    const normalizedUpstreamRequestUrl = stationHistoryCacheKeys.stripAqiHistoryCacheContractComponent(
+      stripAqiProxyHourlyGenerationCacheComponent(normalizedRequestUrl),
+    );
     normalizedUpstreamRequestUrl.searchParams.delete(LATEST_SNAPSHOT_CACHE_KEY_PARAM);
     if (
       useTimeseriesV2Skeleton &&

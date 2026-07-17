@@ -52,6 +52,7 @@ test("station-history AQI cache module retains hourly and immutable cache keys",
   const canonical = canonicalizeAqiHistoryRequestUrl(recent, AQI_UPSTREAM, AQI_UPSTREAM);
   assert.equal(canonical.searchParams.get("from_utc"), "2026-01-01T00:00:00.000Z");
   assert.equal(canonical.searchParams.get("to_utc"), "2026-01-05T02:00:00.000Z");
+  assert.equal(canonical.searchParams.get("__uk_aq_aqi_history_contract"), "aqi_hour_interval_v2");
 });
 
 test("station-series cache identity is deterministic without trusting the optional connector hint", () => {
@@ -67,7 +68,7 @@ test("station-series cache identity is deterministic without trusting the option
   );
   assert.equal(matchingHint.toString(), withoutConnector.toString());
   assert.equal(withoutConnector.searchParams.has("connector_id"), false);
-  assert.equal(withoutConnector.searchParams.get("__uk_aq_station_series_contract"), "2");
+  assert.equal(withoutConnector.searchParams.get("__uk_aq_station_series_contract"), "3");
 
   const otherSeries = canonicalizeStationSeriesRequestUrl(
     new URL("https://cache.test/api/aq/station-series?timeseries_id=8&pollutant=pm25&start_utc=2026-07-14T12:00:00Z&end_utc=2026-07-15T12:00:00Z&window=24h"),

@@ -15,6 +15,24 @@ A request uses ingest-only mode only when the direct response covers the complet
 
 Partial or gap-bearing responses use `Cache-Control: no-store`. Diagnostics report counts, boundaries, RPC window/HTTP attempt metadata, completeness, and overlap/mismatch totals but never observation values.
 
+## AQI v2 endpoint response contract
+
+The active R2 v2 AQI path uses `timestamp_hour_utc = n` as its canonical
+hour-ending endpoint. Station-series AQI sections and older AQI chunks expose
+`response_contract: "aqi_hour_interval_v2"`; each AQI row carries both
+`timestamp_hour_utc` and `period_end_utc`, each equal to `n`.
+
+During the additive compatibility release, `period_start_utc` remains the
+legacy endpoint alias. It must not be interpreted as a true start by a
+consumer that has not first selected `period_end_utc` or `timestamp_hour_utc`.
+The coordinated final contract will set the true period start to `n - 1 hour`.
+The represented interval is therefore documented as `(n - 1 hour, n]`; this
+Worker does not change stored R2 v2 data, writers, manifests, indexes or
+metadata.
+
+`/v1/aqi-history` is an internal HTTP route version, not R2 history v1. The
+private Service Binding architecture and R2-over-live precedence are unchanged.
+
 ## Configuration
 
 Required data-path values:

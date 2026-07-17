@@ -2,6 +2,7 @@ import { canonicalAqiKey, normalizePollutantCode } from "../../../lib/aqi/aqi_le
 
 const HOUR_MS = 60 * 60 * 1000;
 export const STABLE_HEAD_MAX_HOURS = 168;
+export const AQI_HOUR_INTERVAL_RESPONSE_CONTRACT = "aqi_hour_interval_v2";
 
 export function canonicalAqiHourStarts(startMs, endMs) {
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return [];
@@ -12,7 +13,7 @@ export function canonicalAqiHourStarts(startMs, endMs) {
 }
 
 function hourIso(row) {
-  const raw = row?.timestamp_hour_utc || row?.period_start_utc;
+  const raw = row?.period_end_utc || row?.timestamp_hour_utc || row?.period_start_utc;
   const ms = Date.parse(String(raw ?? ""));
   return Number.isFinite(ms) ? new Date(Math.floor(ms / HOUR_MS) * HOUR_MS).toISOString() : null;
 }
@@ -32,7 +33,16 @@ function normalizeIdentityRow(row, source) {
   const timestamp = hourIso(row);
   const pollutant = normalizePollutantCode(row?.pollutant_code);
   if (!timestamp || !pollutant) return null;
-  return { ...row, timestamp_hour_utc: timestamp, pollutant_code: pollutant, source };
+  // Retain the legacy alias through the compatibility window.  Consumers that
+  // understand the v2 response contract use period_end_utc/timestamp_hour_utc.
+  return {
+    ...row,
+    period_start_utc: row?.period_start_utc || timestamp,
+    timestamp_hour_utc: timestamp,
+    period_end_utc: timestamp,
+    pollutant_code: pollutant,
+    source,
+  };
 }
 
 export function resolveStableHeadBounds(request, maxHours = STABLE_HEAD_MAX_HOURS) {
@@ -74,6 +84,8 @@ export function mergeStableAqiHead({ r2Rows, liveRows, request, bounds }) {
   let overlapCount = 0;
   let mismatchCount = 0;
   const mismatchHours = [];
+  const normalizedR2Rows = r2Rows.map((sourceRow) => normalizeIdentityRow(sourceRow, "r2"));
+  if (normalizedR2Rows.some((row) => !row)) throw new Error("station_series_r2_identity_unresolved");
   for (const sourceRow of liveRows) {
     const row = normalizeIdentityRow(sourceRow, "live_calculated");
     if (!row || Number(row.timeseries_id) !== request.timeseriesId || Number(row.connector_id) !== request.connectorId || row.pollutant_code !== request.pollutant) throw new Error("station_series_live_identity_mismatch");
@@ -83,12 +95,12 @@ export function mergeStableAqiHead({ r2Rows, liveRows, request, bounds }) {
     if (previous && comparable(previous) !== comparable(row)) throw new Error("station_series_live_duplicate_conflict");
     if (!previous) merged.set(key, row);
   }
-  const r2StationIds = new Set(r2Rows.map((row) => Number(row.station_id)).filter((value) => Number.isInteger(value) && value > 0));
+  const r2StationIds = new Set(normalizedR2Rows.map((row) => Number(row.station_id)).filter((value) => Number.isInteger(value) && value > 0));
   const liveStationIds = new Set(liveRows.map((row) => Number(row.station_id)).filter((value) => Number.isInteger(value) && value > 0));
   if (r2StationIds.size > 1 || liveStationIds.size > 1 || (r2StationIds.size && liveStationIds.size && [...r2StationIds][0] !== [...liveStationIds][0])) {
     throw new Error("station_series_source_identity_mismatch");
   }
-  for (const row of r2Rows) {
+  for (const row of normalizedR2Rows) {
     const key = canonicalAqiKey(row);
     if (!key) throw new Error("station_series_r2_identity_unresolved");
     const live = merged.get(key);

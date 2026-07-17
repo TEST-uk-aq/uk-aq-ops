@@ -1,5 +1,5 @@
 import { normalizePollutantCode } from "../../../lib/aqi/aqi_levels.mjs";
-import { canonicalAqiHourStarts } from "./stable_head.mjs";
+import { AQI_HOUR_INTERVAL_RESPONSE_CONTRACT, canonicalAqiHourStarts } from "./stable_head.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 export const AQI_CHUNK_MAX_HOURS = 31 * 24;
@@ -55,7 +55,7 @@ export function classifyChunk(endMs, nowMs = Date.now()) {
 }
 
 function aqiHour(row) {
-  const parsed = isoMs(row?.timestamp_hour_utc || row?.period_start_utc);
+  const parsed = isoMs(row?.period_end_utc || row?.timestamp_hour_utc || row?.period_start_utc);
   return parsed === null ? null : new Date(Math.floor(parsed / HOUR_MS) * HOUR_MS).toISOString();
 }
 
@@ -78,7 +78,14 @@ export function buildAqiHistoryChunk(chunk, payload, nowMs = Date.now()) {
     if (!key || Number(sourceRow.timeseries_id) !== chunk.timeseriesId || Number(sourceRow.connector_id) !== chunk.connectorId || normalizePollutantCode(sourceRow.pollutant_code) !== chunk.pollutant) continue;
     const hourMs = Date.parse(hour);
     if (hourMs < chunk.startMs || hourMs >= chunk.endMs) continue;
-    const row = { ...sourceRow, period_start_utc: hour, source: "r2" };
+    const row = {
+      ...sourceRow,
+      // period_start_utc remains the legacy endpoint alias until Phase 3.
+      timestamp_hour_utc: hour,
+      period_end_utc: hour,
+      period_start_utc: sourceRow?.period_start_utc || hour,
+      source: "r2",
+    };
     const previous = rowsByKey.get(key);
     if (previous && JSON.stringify(previous) !== JSON.stringify(row)) conflictingDuplicateCount += 1;
     if (!previous) rowsByKey.set(key, row);
@@ -90,6 +97,7 @@ export function buildAqiHistoryChunk(chunk, payload, nowMs = Date.now()) {
   const cacheClass = classifyChunk(chunk.endMs, nowMs);
   return {
     ...payload,
+    response_contract: AQI_HOUR_INTERVAL_RESPONSE_CONTRACT,
     points: rows,
     row_count: rows.length,
     response_complete: complete,
@@ -155,7 +163,7 @@ function chunkFields(chunk, cacheClass) {
 export function aqiResponseRows(payload, format) {
   const columns = Array.isArray(payload?.columns) && payload.columns.length
     ? payload.columns
-    : ["period_start_utc", "connector_id", "station_id", "timeseries_id", "pollutant_code", "daqi_index_level", "eaqi_index_level", "daqi_input_value_ugm3", "daqi_input_averaging_code", "eaqi_input_value_ugm3", "eaqi_input_averaging_code", "daqi_calculation_status", "eaqi_calculation_status", "source", "source_coverage"];
+    : ["period_start_utc", "connector_id", "station_id", "timeseries_id", "pollutant_code", "daqi_index_level", "eaqi_index_level", "daqi_input_value_ugm3", "daqi_input_averaging_code", "eaqi_input_value_ugm3", "eaqi_input_averaging_code", "daqi_calculation_status", "eaqi_calculation_status", "source", "source_coverage", "timestamp_hour_utc", "period_end_utc"];
   if (format === "objects") return { columns, points: payload.points };
   return { columns, points: payload.points.map((row) => columns.map((column) => row[column] ?? null)) };
 }

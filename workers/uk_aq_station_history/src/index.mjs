@@ -7,6 +7,7 @@ import {
 } from "../../../lib/aqi/aqi_levels.mjs";
 import {
   canonicalAqiHourStarts,
+  AQI_HOUR_INTERVAL_RESPONSE_CONTRACT,
   mergeStableAqiHead,
   missingHeadHours,
   normalizeExactR2AqiRows,
@@ -151,7 +152,16 @@ function calculateAqiRows(observationRows, request, startMs, endMs) {
       && row.timeseries_id === request.timeseriesId
       && row.connector_id === request.connectorId
       && row.pollutant_code === request.pollutant;
-  }).map((row) => ({ ...row, source: "live_calculated" }));
+  }).map((row) => ({
+    ...row,
+    // Keep the old alias until the Phase 3 semantic correction.  The explicit
+    // endpoint fields make live and committed v2 rows interchangeable for
+    // Phase 2 consumers without changing v1 response handling.
+    period_start_utc: row.timestamp_hour_utc,
+    timestamp_hour_utc: row.timestamp_hour_utc,
+    period_end_utc: row.timestamp_hour_utc,
+    source: "live_calculated",
+  }));
 }
 
 function aqiAvailabilityDiagnostics(rows) {
@@ -281,7 +291,7 @@ function buildIngestOnlyResponse(request, direct, capability, policy, nowMs) {
       ...directDiagnostics(direct, observations),
     },
     aqi: request.includeAqi
-      ? { enabled: true, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, availability: aqiAvailability, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_aqi_chunk_end_utc: null, stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only", source_counts: { r2: 0, live_calculated: aqiRows.length }, overlap_count: 0, mismatch_count: 0, mismatch_hours: [] }
+      ? { enabled: true, response_contract: AQI_HOUR_INTERVAL_RESPONSE_CONTRACT, rows: aqiRows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps, availability: aqiAvailability, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_aqi_chunk_end_utc: null, stable_head_locked: aqiComplete, replacement_policy: "extend_backwards_only", source_counts: { r2: 0, live_calculated: aqiRows.length }, overlap_count: 0, mismatch_count: 0, mismatch_hours: [] }
       : disabledAqiSection(),
     observations: { rows: observations, guideline: direct.guideline, response_complete: observationComplete, has_gap: !observationComplete, gap_ranges: capability.observationGaps, stable_head_start_utc: new Date(request.startMs).toISOString(), stable_head_end_utc: new Date(request.endMs).toISOString(), next_chunk_end_utc: null, next_older_observation_chunk_end_utc: null, source_counts: { r2: 0, ingest: observations.length }, discarded_ingest_overlap_count: 0 },
   };
@@ -468,7 +478,7 @@ async function buildR2LiveResponse(request, env, policy, direct, aqiBounds, obse
       ...directDiagnostics(direct, outputObservations),
     },
     aqi: request.includeAqi ? {
-      enabled: true, rows: mergedAqi.rows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps,
+      enabled: true, response_contract: AQI_HOUR_INTERVAL_RESPONSE_CONTRACT, rows: mergedAqi.rows, response_complete: aqiComplete, has_gap: !aqiComplete, gap_ranges: aqiGaps,
       stable_head_start_utc: aqiHeadStartUtc, stable_head_end_utc: new Date(aqiBounds.headEndMs).toISOString(),
       next_chunk_end_utc: aqiBounds.headStartMs > request.startMs ? aqiHeadStartUtc : null,
       next_older_aqi_chunk_end_utc: aqiBounds.headStartMs > request.startMs ? aqiHeadStartUtc : null,

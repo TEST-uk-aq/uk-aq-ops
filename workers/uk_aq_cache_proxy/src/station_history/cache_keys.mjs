@@ -6,8 +6,10 @@ const AQI_HISTORY_START_KEYS = ["from_utc", "start_utc", "from", "start"];
 const AQI_HISTORY_END_KEYS = ["to_utc", "end_utc", "to", "end"];
 const AQI_HISTORY_PROXY_GENERATION_PARAM = "__uk_aq_aqi_proxy_generation_hour";
 const AQI_HISTORY_PROXY_GENERATION_VERSION = "1";
+const AQI_HISTORY_PROXY_CONTRACT_PARAM = "__uk_aq_aqi_history_contract";
+const AQI_HISTORY_PROXY_CONTRACT_VERSION = "aqi_hour_interval_v2";
 const STATION_SERIES_PROXY_CONTRACT_PARAM = "__uk_aq_station_series_contract";
-const STATION_SERIES_PROXY_CONTRACT_VERSION = "2";
+const STATION_SERIES_PROXY_CONTRACT_VERSION = "3";
 
 function parseBooleanFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
@@ -74,6 +76,9 @@ function parseIntInRange(value, fallback, min, max) {
 export function canonicalizeAqiHistoryRequestUrl(url, upstreamFunction, aqiHistoryUpstream) {
   const normalized = new URL(url.toString());
   if (upstreamFunction !== aqiHistoryUpstream) return normalized;
+  // This is public cache identity only.  It is stripped before the private
+  // upstream request so the API contract marker cannot affect request parsing.
+  normalized.searchParams.set(AQI_HISTORY_PROXY_CONTRACT_PARAM, AQI_HISTORY_PROXY_CONTRACT_VERSION);
   const requestedFormat = String(normalized.searchParams.get("format") || "").trim().toLowerCase();
   normalized.searchParams.set("format", requestedFormat === "tsv" ? "tsv" : requestedFormat === "objects" ? "objects" : "compact");
   const startMs = parseIsoMsOrNull(getFirstSearchParam(normalized, AQI_HISTORY_START_KEYS));
@@ -130,6 +135,12 @@ export function applyStationSeriesAqiGenerationCacheComponent(url, upstreamFunct
 export function stripAqiProxyHourlyGenerationCacheComponent(url) {
   const normalized = new URL(url.toString());
   normalized.searchParams.delete(AQI_HISTORY_PROXY_GENERATION_PARAM);
+  return normalized;
+}
+
+export function stripAqiHistoryCacheContractComponent(url) {
+  const normalized = new URL(url.toString());
+  normalized.searchParams.delete(AQI_HISTORY_PROXY_CONTRACT_PARAM);
   return normalized;
 }
 
