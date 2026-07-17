@@ -12,6 +12,7 @@ A document is not deleted or redirected until its current content has been revie
 - **Pending review**: still active until migrated.
 - **Split planned**: current content belongs in more than one target file.
 - **Redirect planned**: content has been migrated and the old path can become a short pointer.
+- **Migrated/removed**: current content has an authoritative home and the previous active path no longer exists.
 - **Historical**: documents retired behaviour and should move to or remain in `archive/`.
 - **Stale active reference**: current documentation names a runtime path that is no longer active.
 
@@ -37,18 +38,19 @@ A document is not deleted or redirected until its current content has been revie
 
 | Current file | Status | Target action |
 |---|---|---|
-| `system_docs/uk-aq-latest-snapshot.md` | Redirect planned | Its current behaviour, interface, environment, troubleshooting and bootstrap material has been split into `system_docs/latest_snapshot/`. Preserve an archive copy before replacing it with a short redirect. |
-| `workers/uk_aq_latest_snapshot_cloud_run/README.md` | Active implementation guide | Retain locally. Add a link to the authoritative area contract when next edited. Remove any duplicated behavioural rule that later diverges. |
-| `workers/uk_aq_latest_snapshot_r2_api_worker/README.md` | Active implementation guide | Retain locally. Link to `system_docs/latest_snapshot/interfaces.md` and `contract.md`. |
-| `system_docs/latest_snapshot/README.md` | Authoritative | Area ownership, reading order and known defect. |
-| `system_docs/latest_snapshot/contract.md` | Authoritative | Current-state and compatibility rules. |
-| `system_docs/latest_snapshot/data_flow.md` | Authoritative | End-to-end pipeline and consumer boundaries. |
-| `system_docs/latest_snapshot/state_model.md` | Authoritative | State identity and transition rules. |
-| `system_docs/latest_snapshot/interfaces.md` | Authoritative | Pub/Sub, R2 and HTTP interfaces. |
-| `system_docs/latest_snapshot/operations.md` | Authoritative | Runtime, schedule and monitoring. |
-| `system_docs/latest_snapshot/recovery.md` | Authoritative | Poisoned-state repair and rollback. |
-| `system_docs/latest_snapshot/validation.md` | Authoritative | Focused checks and TEST acceptance criteria. |
-| `system_docs/latest_snapshot/decisions/0001-latest-valid-observation-state.md` | Authoritative | Rationale for consumer-side latest-valid state. |
+| `system_docs/uk-aq-latest-snapshot.md` | Migrated/removed | Current behaviour now lives under `system_docs/latest_snapshot/`. Do not recreate a second editable authority at the old path. |
+| `workers/uk_aq_latest_snapshot_cloud_run/README.md` | Active implementation guide | Retain locally. Its all-only physical-product summary is aligned with the authoritative area. |
+| `workers/uk_aq_latest_snapshot_r2_api_worker/README.md` | Active implementation guide | Retain locally. Its finite-window derivation summary is aligned with the authoritative area. |
+| `system_docs/latest_snapshot/README.md` | Authoritative | Area ownership, physical/public matrix distinction, implementation status and reading order. |
+| `system_docs/latest_snapshot/contract.md` | Authoritative | Latest-valid state, all-only physical products, finite derivation, cache identity and compatibility rules. |
+| `system_docs/latest_snapshot/data_flow.md` | Authoritative | End-to-end pipeline from Pub/Sub through physical R2 products to derived public windows. |
+| `system_docs/latest_snapshot/state_model.md` | Authoritative | State identity, eligibility, transitions and timestamp meanings. |
+| `system_docs/latest_snapshot/interfaces.md` | Authoritative | Pub/Sub, state, physical R2 object, manifest and HTTP interfaces. |
+| `system_docs/latest_snapshot/operations.md` | Authoritative | Runtime, configuration, schedule, deployment order, rollback and monitoring. |
+| `system_docs/latest_snapshot/recovery.md` | Authoritative | State repair, physical-product regeneration and rollback. |
+| `system_docs/latest_snapshot/validation.md` | Authoritative | Minimal pre-deployment checks and real TEST operational acceptance. |
+| `system_docs/latest_snapshot/decisions/0001-latest-valid-observation-state.md` | Authoritative | Rationale and implementation status for consumer-side latest-valid state. |
+| `system_docs/latest_snapshot/decisions/0002-finite-windows-from-all-snapshot.md` | Authoritative | Rationale for three physical `all` products and request-time finite responses. |
 
 ## Prune, retention and observs operations
 
@@ -119,7 +121,7 @@ A document is not deleted or redirected until its current content has been revie
 
 ## Recommended migration order
 
-1. Latest snapshot, completed in this branch.
+1. Latest snapshot, completed and current.
 2. Architecture and shared data semantics.
 3. R2 history layout, manifests and indexes.
 4. Prune daily and deletion gates.
@@ -134,7 +136,7 @@ A document is not deleted or redirected until its current content has been revie
 
 ## Safety rule
 
-Do not mass-move or delete flat documentation before the owning area has been analysed.
+Do not mass-move or remove flat documentation before the owning area has been analysed.
 
 For each migration:
 
