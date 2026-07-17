@@ -8,33 +8,24 @@ Connector ingest
       -> raw observation consumer subscription
           -> raw observs/history systems
       -> dedicated latest-snapshot subscription
-          -> latest-snapshot Cloud Run builder
-              -> latest valid state in R2
+          -> Latest Snapshot Cloud Run builder
+              -> latest-valid state in R2
               -> core metadata cache in R2
-              -> snapshot objects in R2
-              -> latest family manifest in R2
-                  -> latest-snapshot R2 API Worker
-                      -> cache proxy /api/aq/latest-snapshot
-                          -> website map and search
+              -> three physical pollutant/all snapshots in R2
+              -> physical family manifest in R2
+                  -> Latest Snapshot R2 API Worker
+                      -> direct all response or derived finite response
+                          -> cache proxy /api/aq/latest-snapshot
+                              -> website map and search
 ```
 
-The topic may be shared by multiple consumers. Subscription state is not shared. The latest-snapshot builder MUST use its dedicated subscription.
+The shared topic may have multiple consumers. Subscription state is not shared. The Latest Snapshot builder MUST use its dedicated subscription.
 
 ## Stage 1: observation publication
 
-### Input
+Connector ingestion publishes source observation rows.
 
-Observation rows emitted by connector ingestion.
-
-### Responsibility
-
-The upstream publisher transports source observations. It does not decide whether a value is eligible to become a latest public value.
-
-### Required boundary
-
-Negative, sentinel and otherwise invalid source values remain publishable because raw observation consumers must preserve what the source supplied.
-
-The latest-snapshot fix MUST NOT filter the shared publication stream.
+The publisher transports source data. It does not decide whether a value is eligible to become latest public state. Negative, sentinel and otherwise invalid source values remain publishable so raw consumers can preserve what the source supplied.
 
 ## Stage 2: dedicated Pub/Sub pull
 
@@ -44,11 +35,11 @@ The latest-snapshot fix MUST NOT filter the shared publication stream.
 
 ### Behaviour
 
-The builder pulls from `UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION`, currently defaulting to `uk-aq-latest-snapshot-sub`.
+The builder pulls from `UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION`, defaulting to `uk-aq-latest-snapshot-sub`.
 
 The configured subscription MUST differ from `OBSERVS_PUBSUB_SUBSCRIPTION` when that variable is present.
 
-The current pull loop:
+The pull loop:
 
 - requests up to 1,000 messages per pull;
 - performs up to 8 pull batches per run;
@@ -59,62 +50,68 @@ The current pull loop:
 - acknowledges malformed messages separately;
 - holds successfully decoded message acknowledgement until state handling succeeds.
 
-Decode validity and current-value eligibility are different checks. A decoded `-99` row is a well-formed message but is not eligible for current pollutant state.
+Decode validity and current-value eligibility are separate. A decoded `-99` row is well formed but is not eligible for latest pollutant state.
 
-## Stage 3: latest valid state application
+## Stage 3: metadata resolution
+
+Before pulling messages, the builder loads or refreshes the core metadata index needed to classify incoming observations.
+
+The index resolves:
+
+```text
+timeseries -> phenomenon -> observed_property
+timeseries -> station -> network
+timeseries / station -> connector
+```
+
+Loading metadata before the pull prevents an unavailable metadata source from consuming or acknowledging messages that cannot be classified safely.
+
+## Stage 4: latest-valid state application
 
 ### Identity
 
 `(connector_id, timeseries_id)`
 
-### Inputs
-
-- existing R2 state;
-- decoded observation rows;
-- current core metadata needed to identify the observed property and pollutant.
-
-### Required processing order
+### Processing order
 
 1. Load existing state.
-2. Load or refresh the core metadata index needed for value classification.
-3. Resolve each decoded row to its timeseries, phenomenon and observed property.
-4. Determine whether it is a supported pollutant current value.
-5. Apply only eligible valid values to state using timestamp ordering.
-6. Persist changed state.
-7. Acknowledge successfully handled decoded messages.
-8. Generate snapshot source rows from the resulting state and metadata.
+2. Load or refresh core metadata.
+3. Pull and decode observation messages.
+4. Resolve each decoded row to its observed property and supported matrix pollutant.
+5. Apply the latest-current-value policy.
+6. Apply only eligible rows to state using timestamp ordering.
+7. Persist changed state.
+8. Acknowledge successfully handled decoded messages.
 
-The implementation MAY load metadata earlier for efficiency, but it MUST classify value eligibility before an invalid row can replace state.
-
-### Invalid row outcome
-
-For a well-formed invalid pollutant row:
+For a well-formed invalid row:
 
 - raw history remains unaffected;
-- no latest state entry is created or replaced;
-- state apply telemetry records the skip;
-- the Pub/Sub message is acknowledged after successful handling;
-- the retained valid state remains available for snapshot generation.
+- no latest-state entry is created or replaced;
+- telemetry records the skip;
+- the message is acknowledged after successful handling;
+- the previous valid state remains available.
 
-## Stage 4: state persistence
+## Stage 5: state persistence
 
 ### Key
 
-`latest_snapshots_state/v1/latest_state.json`
+```text
+latest_snapshots_state/v1/latest_state.json
+```
 
 ### Behaviour
 
-- serialise state deterministically;
-- sort entries by connector and timeseries identity;
-- calculate a SHA-256 hash;
-- write only when the state bytes change;
-- preserve the existing state schema unless a separate migration is approved.
+- state entries are sorted by connector and timeseries identity;
+- serialisation is deterministic;
+- a SHA-256 hash is calculated;
+- the object is written only when state bytes change;
+- the schema remains version `1`.
 
-## Stage 5: core metadata cache
+## Stage 6: core metadata cache
 
 ### Source
 
-Latest available committed core snapshot under `history/v2/core` within the configured lookback.
+The latest committed core snapshot under `history/v2/core` within the configured lookback.
 
 ### Required tables
 
@@ -127,89 +124,98 @@ Latest available committed core snapshot under `history/v2/core` within the conf
 
 ### Cache key
 
-`latest_snapshots_state/v1/core_metadata_cache_v2.json`
-
-### Behaviour
+```text
+latest_snapshots_state/v1/core_metadata_cache_v2.json
+```
 
 The cache is refreshed when missing, invalid or older than the configured refresh interval, currently 86,400 seconds by default.
 
-The invalid-value fix MUST NOT weaken metadata requirements or introduce connector-based network fallbacks.
-
-## Stage 6: source row construction
+## Stage 7: public source-row construction
 
 For each retained valid state entry, the builder:
 
-1. resolves timeseries metadata;
-2. resolves the observed property code and matrix pollutant;
-3. confirms pollutant value eligibility as defence in depth;
-4. resolves station, connector and network metadata;
-5. applies network visibility and existing geography eligibility;
-6. builds the v2 `LatestItem` row.
+1. resolves timeseries and pollutant metadata;
+2. confirms value eligibility as defence in depth;
+3. resolves station, connector and network metadata;
+4. applies network visibility and geography eligibility;
+5. builds the v2 latest row;
+6. exposes state `observed_at` as row `last_value_at`.
 
-State application is the primary protection against invalid latest values. Source-row validation remains as defence in depth and MUST NOT be removed.
+Missing required metadata is counted and skipped. Connector-derived network fallbacks are not used.
 
-## Stage 7: window matrix generation
+## Stage 8: physical snapshot generation
 
-For each configured pollutant and window:
+The builder groups source rows by pollutant once and creates one physical payload for each supported pollutant.
 
-1. select rows for the pollutant;
-2. apply the finite-window cutoff to the retained valid `last_value_at`;
-3. sort rows using the existing pollutant/station ordering;
-4. derive the existing next cursor;
-5. produce the stable payload;
-6. hash the payload;
-7. write only when changed.
+For each of `pm25`, `pm10` and `no2` it:
 
-`window=all` has no time cutoff.
+1. selects that pollutant's rows;
+2. sorts them using the existing ordering;
+3. derives the existing next cursor;
+4. sets `window` to `all`;
+5. stable-JSON serialises and hashes the payload;
+6. writes the object only when its hash changed.
 
-## Stage 8: manifest and run report
+Physical keys are:
 
-The builder writes the family manifest with:
+```text
+latest_snapshots/v2/network_group=all/pollutant={pollutant}/window=all.json
+```
 
-- source and state identity;
-- configured matrix;
-- per-snapshot object metadata;
-- row counts and observed-at bounds;
-- changed/error state;
-- overall success and partial-failure information.
+The builder does not calculate or write finite-window objects.
 
-A failed key retains the previous manifest entry when one exists.
+## Stage 9: physical manifest and run report
 
-Optional run reports are written under the configured runs prefix.
+The manifest describes stored products only.
 
-## Stage 9: private R2 API Worker
+A fully successful manifest contains:
+
+- `matrix.pollutants = [pm25, pm10, no2]`;
+- `matrix.windows = [all]`;
+- three snapshot entries;
+- per-object hashes, row counts, byte counts and observed-at bounds;
+- source, state, timing, changed and error information.
+
+A failed pollutant preserves its previous physical `all` entry when one exists. Optional run reports remain under the configured runs prefix.
+
+## Stage 10: private R2 API Worker
 
 ### Component
 
 `workers/uk_aq_latest_snapshot_r2_api_worker/worker.mjs`
 
-### Behaviour
+### Source selection
 
-- validates upstream authentication;
-- accepts only the canonical v2 standard paths;
-- reads deterministic snapshot objects and manifest from R2;
-- returns the v2 contract marker header;
-- does not fall back to v1.
+Every accepted request reads the requested pollutant's physical `window=all` object.
 
-The API Worker does not reclassify values. It serves the already-built snapshot product.
+### `window=all`
 
-## Stage 10: cache proxy and website
+The Worker returns the stored object directly, including its physical ETag.
 
-### Component boundary
+### Finite windows
 
-`workers/uk_aq_cache_proxy/src/index.ts`
+For `3h`, `6h`, `1d` and `7d`, the Worker:
 
-### External route
+1. calculates the start of the current UTC minute;
+2. subtracts the requested window duration;
+3. filters rows where parseable `last_value_at >= cutoff`;
+4. preserves physical row order;
+5. changes the response `window`;
+6. recalculates `count`, `next_since` and `next_since_id`;
+7. preserves all other v2 fields.
 
-`/api/aq/latest-snapshot`
+The finite response ETag is derived from the physical object ETag, requested window and effective UTC minute. This allows rows to age out without a new physical object write.
 
-### Behaviour
+The Worker validates authentication and v2 paths, returns the v2 contract marker, fails closed on malformed physical payloads, and never falls back to v1 or old finite objects.
 
-The cache proxy:
+## Stage 11: cache proxy and website
 
-- forwards to `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`;
-- uses the existing private v2 cache-key namespace;
-- requires successful upstream responses to declare the v2 snapshot contract;
-- preserves existing cache and error behaviour.
+The cache proxy route is:
 
-The website map and search operate on the same snapshot family. A timeseries absent from `window=all` cannot be found through that source, which is why retaining the last valid state is load-bearing.
+```text
+/api/aq/latest-snapshot
+```
+
+It forwards the unchanged public query to `UK_AQ_LATEST_SNAPSHOT_R2_API_URL`, retains the existing private v2 cache-key namespace, and requires a successful upstream v2 contract marker.
+
+The website continues requesting `3h`, `6h`, `1d`, `7d` or `all` without knowing whether the representation is physically stored or derived.
