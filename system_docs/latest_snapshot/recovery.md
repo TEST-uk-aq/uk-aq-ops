@@ -2,83 +2,84 @@
 
 ## Purpose
 
-This document defines how to recover latest-snapshot state and generated snapshot objects without changing raw observation history or the public v2 contract.
+This document defines how to recover latest-valid state and regenerate current physical snapshot products without changing raw observation history or the public v2 API contract.
 
 ## Recovery source of truth
 
-A recovery must rebuild current state from the newest eligible valid raw observation for each `(connector_id, timeseries_id)`.
+A state recovery must rebuild the newest eligible valid raw observation for each `(connector_id, timeseries_id)`.
 
-The recovery source must contain historical observation rows, not only the already-derived current value.
+The recovery source must contain sufficient observation history to find a preceding valid value when the newest raw row is invalid.
 
 Do not use the following as sole authority when state may be poisoned:
 
 - the existing latest-state object;
-- existing latest snapshot objects;
+- existing Latest Snapshot objects;
 - `timeseries.last_value` without confirming that it already means latest valid value;
-- a latest-value RPC that removes invalid current rows but does not fall back to the preceding valid observation.
+- a latest-value RPC that removes an invalid newest row without falling back to the preceding valid observation.
 
 ## Existing seed scripts
 
-The repository contains scripts that seed latest state from existing R2 snapshots or a Supabase latest RPC.
+The repository contains:
 
-Before using either for this defect, inspect its source semantics:
+- `scripts/backup_r2/uk_aq_seed_latest_snapshot_state_from_existing_r2.mjs`;
+- `scripts/backup_r2/uk_aq_seed_latest_snapshot_state_from_supabase.mjs`.
 
-- seeding from existing snapshot objects can reproduce omissions already present in those objects;
-- seeding from a latest RPC can omit a timeseries whose stored current value is invalid rather than restoring its previous valid observation.
+The R2 script now defaults to the v2 physical manifest and therefore reads the three physical `window=all` objects. It is useful for bootstrap or deterministic reconstruction from an already-correct snapshot family, but it can reproduce omissions already present in that family.
 
-A script is suitable only if it explicitly selects the latest eligible valid historical observation per identity.
+The Supabase script reads the physical `all` request once per pollutant from the configured RPC. It is suitable only when the RPC semantics are confirmed to return the latest eligible valid row rather than merely excluding an invalid newest row.
 
-## Required repair semantics
+Neither script replaces an authoritative raw-history repair unless its source semantics satisfy this document.
+
+## Required state-repair semantics
 
 For each supported pollutant timeseries:
 
-1. identify its connector and timeseries identity;
+1. identify connector and timeseries identity;
 2. read historical observations in descending timestamp order;
-3. choose the newest finite value greater than or equal to zero;
-4. apply any existing pollutant-specific upper bound;
-5. retain the source timestamp, value, float representation and status for that valid row;
+3. choose the newest numeric finite value greater than or equal to zero;
+4. apply the current pollutant-specific maximum;
+5. retain the source timestamp, value, float representation and status;
 6. write at most one state entry for the identity;
 7. omit identities with no valid historical observation;
-8. serialise state deterministically using the normal state model.
+8. serialise state using the normal deterministic state model.
 
-The repair must not:
+A repair must not:
 
 - delete or rewrite raw observations;
 - convert invalid raw values to null in history;
 - refresh a retained valid timestamp to the timestamp of an invalid row;
-- change snapshot object keys or row fields;
-- change network or metadata eligibility.
+- change public row fields;
+- change network or metadata eligibility;
+- create finite-window state or snapshot objects.
 
-## Safe recovery sequence
+## Safe state-recovery sequence
 
-### 1. Preserve current objects
+### 1. Preserve current evidence
 
 Before write mode, preserve or download:
 
 - `latest_snapshots_state/v1/latest_state.json`;
 - `latest_snapshots/v2/manifest.json`;
-- the affected snapshot objects or a complete object inventory.
-
-This provides rollback evidence and a before/after comparison.
+- the three physical `window=all` objects;
+- a bounded report of affected identities.
 
 ### 2. Produce a dry report
 
 The recovery tool should report:
 
-- current state entry count;
-- rebuilt state entry count;
-- entries unchanged;
-- entries replaced with an earlier valid value;
+- current and rebuilt state entry counts;
+- unchanged entries;
+- entries restored to an earlier valid observation;
 - invalid entries removed;
-- missing-history identities;
+- identities with insufficient history;
 - per-pollutant counts;
-- a bounded sample of changed identities.
+- a bounded sample of changes.
 
 The report must not expose credentials or unrelated raw data.
 
 ### 3. Review known affected identities
 
-For the Manchester Piccadilly PM2.5 example, the expected repaired state is:
+For the historical Manchester Piccadilly PM2.5 example, the expected repaired state before any later valid observation was:
 
 ```text
 connector_id=1
@@ -87,59 +88,77 @@ observed_at=2026-07-16T08:00:00Z
 value=21.793
 ```
 
-The later `-99` observation remains in raw history but is not state.
+The later `-99` remains in raw history but is not latest state.
 
 ### 4. Write repaired state
 
 Write the rebuilt state only after the dry report confirms the expected eligibility and counts.
 
-Use the same state key and schema version unless a separately approved migration requires otherwise.
+Use the existing state key and schema version unless an approved migration says otherwise.
 
-### 5. Regenerate the snapshot family
+### 5. Regenerate physical products
 
-Run the normal builder so it regenerates changed matrix objects and the family manifest from repaired state.
+Run the normal builder. It regenerates only:
 
-Do not hand-edit individual snapshot JSON objects.
+```text
+pm25/window=all
+pm10/window=all
+no2/window=all
+```
 
-### 6. Validate through the TEST website path
+and the three-entry physical manifest.
 
-Confirm the repaired identity:
+Do not hand-edit snapshot JSON objects and do not create finite objects.
 
-- appears in `window=all`;
-- appears in finite windows only when the retained valid timestamp is in range;
-- is searchable through the website's snapshot-backed search;
-- appears on the hex map where otherwise eligible;
-- never displays `-99` as its latest value.
+### 6. Validate through the public TEST path
 
-## Runtime self-healing
+One representative check is normally sufficient:
 
-After the normal state-transition fix is deployed, a future valid observation will replace a poisoned entry. That is useful but is not an adequate immediate recovery plan because:
+- the repaired identity appears in `window=all`;
+- it appears in a finite response only when `last_value_at` is inside the requested cutoff;
+- the public response never emits the invalid value;
+- the website map or search path displays the row when otherwise eligible.
 
-- a sensor may not send another valid row promptly;
-- invalid-only periods could keep the website incomplete;
-- the `all` snapshot remains wrong until recovery or a future valid row.
+## Runtime prevention and self-healing
 
-Existing poisoned state should therefore be repaired explicitly.
+The current runtime classifies value eligibility before state application, so new invalid rows cannot poison state.
 
-## Rollback
+A future valid observation can replace an old poisoned entry, but this is not a reliable substitute for explicit recovery when a timeseries remains silent or invalid for a long period.
 
-If repaired state produces unexpected coverage or metadata behaviour:
+## Snapshot-architecture rollback
+
+The current public API depends on the deriving R2 API Worker and the all-only builder.
+
+If only the deriving Worker has been deployed, roll back that Worker.
+
+If both components must be rolled back:
+
+1. roll back the builder first so the previous finite objects resume being updated;
+2. roll back the R2 API Worker;
+3. confirm the previous public path works.
+
+Old finite objects are not used as fallbacks by the current Worker. They may support a deliberate code rollback only after the previous builder has resumed updating them.
+
+## State-recovery rollback
+
+If a repaired state produces unexpected coverage or metadata behaviour:
 
 1. restore the preserved previous state object;
-2. run the normal builder to regenerate the previous snapshot family;
-3. restore the previous code revision if the runtime transition logic is also implicated;
-4. retain the dry report and object hashes for diagnosis.
+2. run the normal builder to regenerate the three physical `all` objects and manifest;
+3. restore the previous runtime revision only if the state-transition implementation is implicated;
+4. retain reports and hashes for diagnosis.
 
-Rollback must not restore a changed raw observation history because raw history is not modified by this recovery.
+Raw history is not modified and is not part of rollback.
 
 ## Recovery-tool contract
 
-Any new or amended recovery tool must:
+A new or amended recovery tool must:
 
 - default to report-only mode;
 - require an explicit write flag;
-- use the same central value-eligibility rule as the normal builder;
-- produce deterministic output for identical source history;
-- avoid archive code paths;
-- document the exact historical source used;
-- support bounded targeted repair before broad repair where practical.
+- use the same value-eligibility rules as normal runtime;
+- produce deterministic state for identical source history;
+- avoid archive execution paths;
+- document its exact source semantics;
+- support bounded targeted repair where practical;
+- generate only current physical `all` products through the normal builder.
