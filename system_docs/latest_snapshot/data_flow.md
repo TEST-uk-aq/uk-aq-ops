@@ -9,10 +9,12 @@ Connector ingest
           -> raw observs/history systems
       -> dedicated latest-snapshot subscription
           -> Latest Snapshot Cloud Run builder
-              -> latest-valid state in R2
-              -> core metadata cache in R2
+              -> R2 latest-valid state (durable)
+              -> R2 core metadata cache (durable)
+              -> R2 physical family manifest (durable)
+              -> optional validated /tmp copies while container is warm
               -> three physical pollutant/all snapshots in R2
-              -> physical family manifest in R2
+              -> conditional R2 run report
                   -> Latest Snapshot R2 API Worker
                       -> direct all response or derived finite response
                           -> cache proxy /api/aq/latest-snapshot
@@ -20,6 +22,8 @@ Connector ingest
 ```
 
 The shared topic may have multiple consumers. Subscription state is not shared. The Latest Snapshot builder MUST use its dedicated subscription.
+
+R2 remains authoritative for state, metadata and the physical manifest. The local filesystem is an optional read-through and write-through optimisation only.
 
 ## Stage 1: observation publication
 
@@ -52,7 +56,30 @@ The pull loop:
 
 Decode validity and current-value eligibility are separate. A decoded `-99` row is well formed but is not eligible for latest pollutant state.
 
-## Stage 3: metadata resolution
+## Stage 3: durable-object load and local-cache validation
+
+### Components
+
+- `workers/uk_aq_latest_snapshot_cloud_run/run_job.ts`
+- `workers/uk_aq_latest_snapshot_cloud_run/local_r2_cache.ts`
+
+Before using latest state, the core metadata cache or the previous physical manifest, the builder may try a local cached copy.
+
+For each local candidate:
+
+1. derive a deterministic local filename from the SHA-256 of the full R2 key;
+2. read the cached body and sidecar;
+3. validate sidecar schema, object key and local body SHA-256;
+4. confirm the body parses as JSON;
+5. HEAD the R2 object;
+6. require the R2 object to exist and its ETag to match the sidecar ETag;
+7. reuse the local bytes only when every check succeeds.
+
+On a cold start, missing file, corrupt file, validation error, absent ETag or ETag mismatch, the builder uses the normal R2 GET path. A successful R2 GET may then populate the local cache.
+
+The builder does not use an unvalidated stale local copy when R2 validation fails.
+
+## Stage 4: metadata resolution
 
 Before pulling messages, the builder loads or refreshes the core metadata index needed to classify incoming observations.
 
@@ -66,7 +93,9 @@ timeseries / station -> connector
 
 Loading metadata before the pull prevents an unavailable metadata source from consuming or acknowledging messages that cannot be classified safely.
 
-## Stage 4: latest-valid state application
+A local metadata-cache hit does not bypass the existing `generated_at` freshness check. When the configured refresh interval has expired, the normal core-snapshot refresh path still runs.
+
+## Stage 5: latest-valid state application
 
 ### Identity
 
@@ -74,14 +103,15 @@ Loading metadata before the pull prevents an unavailable metadata source from co
 
 ### Processing order
 
-1. Load existing state.
-2. Load or refresh core metadata.
+1. Load existing state through the durable-object path.
+2. Load or refresh core metadata through the durable-object path.
 3. Pull and decode observation messages.
 4. Resolve each decoded row to its observed property and supported matrix pollutant.
 5. Apply the latest-current-value policy.
 6. Apply only eligible rows to state using timestamp ordering.
-7. Persist changed state.
-8. Acknowledge successfully handled decoded messages.
+7. Persist changed state to R2.
+8. After successful R2 persistence, update the local state cache.
+9. Acknowledge successfully handled decoded messages.
 
 For a well-formed invalid row:
 
@@ -91,7 +121,7 @@ For a well-formed invalid row:
 - the message is acknowledged after successful handling;
 - the previous valid state remains available.
 
-## Stage 5: state persistence
+## Stage 6: state persistence
 
 ### Key
 
@@ -104,10 +134,14 @@ latest_snapshots_state/v1/latest_state.json
 - state entries are sorted by connector and timeseries identity;
 - serialisation is deterministic;
 - a SHA-256 hash is calculated;
-- the object is written only when state bytes change;
-- the schema remains version `1`.
+- the R2 object is written only when state bytes change;
+- the schema remains version `1`;
+- local write-through occurs only after the R2 PUT succeeds;
+- a local write failure produces a warning but does not replace R2 durability.
 
-## Stage 6: core metadata cache
+Pub/Sub acknowledgement does not depend on a local cache write.
+
+## Stage 7: core metadata cache
 
 ### Source
 
@@ -122,15 +156,15 @@ The latest committed core snapshot under `history/v2/core` within the configured
 - `phenomena`;
 - `observed_properties`.
 
-### Cache key
+### R2 key
 
 ```text
 latest_snapshots_state/v1/core_metadata_cache_v2.json
 ```
 
-The cache is refreshed when missing, invalid or older than the configured refresh interval, currently 86,400 seconds by default.
+The R2 cache is refreshed when missing, invalid or older than the configured refresh interval, currently 86,400 seconds by default. After the refreshed object is written to R2, the same bytes and returned ETag may be stored locally.
 
-## Stage 7: public source-row construction
+## Stage 8: public source-row construction
 
 For each retained valid state entry, the builder:
 
@@ -143,7 +177,7 @@ For each retained valid state entry, the builder:
 
 Missing required metadata is counted and skipped. Connector-derived network fallbacks are not used.
 
-## Stage 8: physical snapshot generation
+## Stage 9: physical snapshot generation
 
 The builder groups source rows by pollutant once and creates one physical payload for each supported pollutant.
 
@@ -162,9 +196,9 @@ Physical keys are:
 latest_snapshots/v2/network_group=all/pollutant={pollutant}/window=all.json
 ```
 
-The builder does not calculate or write finite-window objects.
+The builder does not calculate or write finite-window objects. The warm local cache does not cache these physical pollutant objects inside the builder.
 
-## Stage 9: physical manifest and run report
+## Stage 10: physical manifest
 
 The manifest describes stored products only.
 
@@ -176,9 +210,32 @@ A fully successful manifest contains:
 - per-object hashes, row counts, byte counts and observed-at bounds;
 - source, state, timing, changed and error information.
 
-A failed pollutant preserves its previous physical `all` entry when one exists. Optional run reports remain under the configured runs prefix.
+A failed pollutant preserves its previous physical `all` entry when one exists.
 
-## Stage 10: private R2 API Worker
+The previous manifest may be read from a validated local copy. The new manifest is always written to R2 before its local copy is replaced.
+
+## Stage 11: run-report decision
+
+After the manifest is written, the builder resolves whether to write a timestamped R2 run report.
+
+The resolved mode is:
+
+- `all`: every completed run;
+- `failures`: every completed manual run and every completed run with one or more failed matrix items;
+- `off`: no run-report object.
+
+The default is `failures`. A successful scheduled run therefore skips the `_runs` write.
+
+Regardless of mode, every completed build emits `latest_snapshot_job_summary` with:
+
+- the normal build report;
+- local cache counters;
+- resolved report mode and configuration source;
+- report write decision and reason.
+
+Run-report creation does not determine manifest success or final build status.
+
+## Stage 12: private R2 API Worker
 
 ### Component
 
@@ -208,7 +265,7 @@ The finite response ETag is derived from the physical object ETag, requested win
 
 The Worker validates authentication and v2 paths, returns the v2 contract marker, fails closed on malformed physical payloads, and never falls back to v1 or old finite objects.
 
-## Stage 11: cache proxy and website
+## Stage 13: cache proxy and website
 
 The cache proxy route is:
 
