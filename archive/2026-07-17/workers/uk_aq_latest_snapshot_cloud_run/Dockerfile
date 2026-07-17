@@ -3,7 +3,6 @@ FROM denoland/deno:2.7.13
 WORKDIR /app
 
 COPY workers/uk_aq_latest_snapshot_cloud_run/run_job.ts /app/workers/uk_aq_latest_snapshot_cloud_run/run_job.ts
-COPY workers/uk_aq_latest_snapshot_cloud_run/local_r2_cache.ts /app/workers/uk_aq_latest_snapshot_cloud_run/local_r2_cache.ts
 COPY workers/uk_aq_latest_snapshot_cloud_run/run_service.ts /app/workers/uk_aq_latest_snapshot_cloud_run/run_service.ts
 COPY workers/uk_aq_latest_snapshot_cloud_run/service_core.ts /app/workers/uk_aq_latest_snapshot_cloud_run/service_core.ts
 COPY workers/uk_aq_latest_snapshot_cloud_run/latest_value_policy.mjs /app/workers/uk_aq_latest_snapshot_cloud_run/latest_value_policy.mjs

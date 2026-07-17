@@ -17,6 +17,7 @@ import {
   latestStateKey,
   serializeLatestState,
 } from "./latest_state_core.mjs";
+import { createLatestSnapshotLocalR2Cache } from "./local_r2_cache.ts";
 
 type LatestSnapshotContractVersion = "v2";
 
@@ -115,6 +116,18 @@ type BuildReport = {
   changed_count: number;
   skipped_unchanged_count: number;
   warnings: string[];
+};
+
+type RunReportsMode = "all" | "failures" | "off";
+
+type RunReportsPolicy = {
+  mode: RunReportsMode;
+  source: "mode" | "legacy_boolean" | "default";
+};
+
+type RunReportDecision = {
+  write: boolean;
+  reason: string;
 };
 
 type PubsubPullMessage = {
@@ -325,10 +338,7 @@ const UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY = normalizePrefix(
 const UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX") || `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/_runs`,
 );
-const UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED = parseBoolean(
-  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED"),
-  true,
-);
+const UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_POLICY = resolveRunReportsPolicy();
 const UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX") || "latest_snapshots_state/v1",
 );
@@ -344,6 +354,14 @@ const UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS = parsePositiveInt(
 );
 const UK_AQ_LATEST_SNAPSHOT_CORE_LOOKBACK_DAYS = 14;
 const UK_AQ_LATEST_SNAPSHOT_MAX_STATE_ENTRIES = 500_000;
+const UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED = parseBoolean(
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED"),
+  true,
+);
+const UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_DIR = (
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_DIR") ||
+  "/tmp/uk-aq-latest-snapshot-cache"
+).trim() || "/tmp/uk-aq-latest-snapshot-cache";
 
 const R2_CONFIG = {
   endpoint: optionalEnvAny(["CFLARE_R2_ENDPOINT", "R2_ENDPOINT"]) || "",
@@ -352,6 +370,11 @@ const R2_CONFIG = {
   access_key_id: optionalEnvAny(["CFLARE_R2_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"]) || "",
   secret_access_key: optionalEnvAny(["CFLARE_R2_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"]) || "",
 };
+
+const LOCAL_R2_CACHE = createLatestSnapshotLocalR2Cache({
+  enabled: UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED,
+  directory: UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_DIR,
+});
 
 const TEXT_ENCODER = new TextEncoder();
 
@@ -363,6 +386,55 @@ function optionalEnvAny(names: string[]): string | null {
     }
   }
   return null;
+}
+
+async function loadDurableR2Object(key: string) {
+  const local = await LOCAL_R2_CACHE.readValidated(key, async () => {
+    const head = await r2HeadObject({ r2: R2_CONFIG, key });
+    return {
+      exists: Boolean(head.exists),
+      etag: "etag" in head && typeof head.etag === "string" ? head.etag : null,
+    };
+  }, (body) => {
+    try {
+      JSON.parse(new TextDecoder().decode(body));
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (local) {
+    return {
+      key,
+      body: local.body,
+      bytes: local.body.byteLength,
+      etag: local.etag,
+    };
+  }
+
+  const object = await r2GetObject({ r2: R2_CONFIG, key });
+  const stored = await LOCAL_R2_CACHE.store(key, object.body, object.etag);
+  if (!stored) {
+    console.warn(JSON.stringify({
+      event: "latest_snapshot_local_cache_write_warning",
+      key,
+    }));
+  }
+  return object;
+}
+
+async function updateLocalR2CacheAfterPut(
+  key: string,
+  body: Uint8Array,
+  etag: string | null,
+): Promise<void> {
+  const stored = await LOCAL_R2_CACHE.store(key, body, etag);
+  if (!stored) {
+    console.warn(JSON.stringify({
+      event: "latest_snapshot_local_cache_write_warning",
+      key,
+    }));
+  }
 }
 
 function parsePositiveInt(raw: string | undefined | null, fallback: number): number {
@@ -379,6 +451,38 @@ function parseBoolean(raw: string | undefined | null, fallback: boolean): boolea
   if (["1", "true", "yes", "y", "on"].includes(value)) return true;
   if (["0", "false", "no", "n", "off"].includes(value)) return false;
   return fallback;
+}
+
+function resolveRunReportsPolicy(): RunReportsPolicy {
+  const modeRaw = Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_MODE");
+  const mode = String(modeRaw || "").trim().toLowerCase();
+  if (mode) {
+    if (mode === "all" || mode === "failures" || mode === "off") {
+      return { mode, source: "mode" };
+    }
+    throw new Error(`Unsupported UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_MODE: ${modeRaw}`);
+  }
+
+  const legacyRaw = Deno.env.get("UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED");
+  if (String(legacyRaw || "").trim()) {
+    return {
+      mode: parseBoolean(legacyRaw, true) ? "all" : "off",
+      source: "legacy_boolean",
+    };
+  }
+  return { mode: "failures", source: "default" };
+}
+
+function resolveRunReportDecision(
+  mode: RunReportsMode,
+  triggerMode: string,
+  failureCount: number,
+): RunReportDecision {
+  if (mode === "off") return { write: false, reason: "mode_off" };
+  if (mode === "all") return { write: true, reason: "mode_all" };
+  if (triggerMode === "manual") return { write: true, reason: "manual_invocation" };
+  if (failureCount > 0) return { write: true, reason: "completed_failure" };
+  return { write: false, reason: "scheduled_success" };
 }
 
 function parseContractVersion(raw: string | undefined | null): LatestSnapshotContractVersion {
@@ -780,7 +884,7 @@ function decodeMessageRow(message: PubsubPullMessage): DecodedMessage {
 
 async function loadState(): Promise<LoadedState> {
   try {
-    const existing = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY });
+    const existing = await loadDurableR2Object(UK_AQ_LATEST_SNAPSHOT_STATE_KEY);
     const text = new TextDecoder().decode(existing.body);
     const bytes = existing.body.byteLength;
     let parsed: unknown = null;
@@ -1057,7 +1161,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
   let bytesRead = 0;
 
   try {
-    const cacheObject = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY });
+    const cacheObject = await loadDurableR2Object(UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY);
     objectsRead += 1;
     bytesRead += cacheObject.body.byteLength;
     const text = new TextDecoder().decode(cacheObject.body);
@@ -1124,12 +1228,17 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     observed_properties: mapObservedPropertyRows(tableRows.get("observed_properties") || []),
   };
   const cacheBytes = TEXT_ENCODER.encode(`${toStableJson(cachePayload)}\n`);
-  await r2PutObject({
+  const metadataCachePut = await r2PutObject({
     r2: R2_CONFIG,
     key: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY,
     body: cacheBytes,
     content_type: "application/json; charset=utf-8",
   });
+  await updateLocalR2CacheAfterPut(
+    UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_CACHE_KEY,
+    cacheBytes,
+    metadataCachePut.etag,
+  );
 
   return {
     metadata: buildMetadataIndex(cachePayload),
@@ -1399,7 +1508,7 @@ async function flushPubsubRows(): Promise<{ rows: ObservationMessageRow[]; valid
 
 async function loadExistingManifest(): Promise<SnapshotManifest | null> {
   try {
-    const existing = await r2GetObject({ r2: R2_CONFIG, key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY });
+    const existing = await loadDurableR2Object(UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY);
     const text = new TextDecoder().decode(existing.body);
     const parsed = JSON.parse(text);
     if (!parsed || typeof parsed !== "object") return null;
@@ -1468,12 +1577,17 @@ async function main(): Promise<void> {
     const stateBytes = TEXT_ENCODER.encode(serializeLatestState(stateLoaded.stateMap, ingestedAt));
     const nextStateHash = sha256Hex(stateBytes);
     if (nextStateHash !== stateLoaded.existingHash) {
-      await r2PutObject({
+      const statePut = await r2PutObject({
         r2: R2_CONFIG,
         key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
         body: stateBytes,
         content_type: "application/json; charset=utf-8",
       });
+      await updateLocalR2CacheAfterPut(
+        UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
+        stateBytes,
+        statePut.etag,
+      );
     }
   }
 
@@ -1658,15 +1772,25 @@ async function main(): Promise<void> {
   };
 
   const manifestBody = TEXT_ENCODER.encode(`${toStableJson(manifest)}\n`);
-  await r2PutObject({
+  const manifestPut = await r2PutObject({
     r2: R2_CONFIG,
     key: UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
     body: manifestBody,
     content_type: "application/json; charset=utf-8",
   });
+  await updateLocalR2CacheAfterPut(
+    UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY,
+    manifestBody,
+    manifestPut.etag,
+  );
 
   let reportKey: string | null = null;
-  if (UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED && UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX) {
+  const runReportDecision = resolveRunReportDecision(
+    UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_POLICY.mode,
+    triggerMode,
+    failureCount,
+  );
+  if (runReportDecision.write && UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX) {
     reportKey = `${UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX}/${compactTimestamp(finishedAt)}.json`;
     const report: BuildReport = {
       ok: failureCount === 0,
@@ -1704,6 +1828,13 @@ async function main(): Promise<void> {
     event: "latest_snapshot_job_summary",
     timestamp: new Date().toISOString(),
     ...report,
+    local_cache: LOCAL_R2_CACHE.summary(),
+    run_reports: {
+      mode: UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_POLICY.mode,
+      source: UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_POLICY.source,
+      write: Boolean(reportKey),
+      reason: runReportDecision.reason,
+    },
   }));
 
   if (failureCount > 0) {
