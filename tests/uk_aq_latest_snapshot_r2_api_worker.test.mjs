@@ -15,8 +15,19 @@ function request(path) {
 
 function snapshotPayload() {
   return {
+    region: null,
+    pcon_code: null,
+    pollutant: "no2",
+    window: "all",
+    since: null,
+    since_id: null,
+    next_since: null,
+    next_since_id: null,
+    count: 1,
     data: [{
       id: 101,
+      last_value: 12,
+      last_value_at: new Date(Date.now()).toISOString(),
       network_id: 2,
       network_code: "breathelondon",
       network_label: "Breathe London",
@@ -27,7 +38,7 @@ function snapshotPayload() {
   };
 }
 
-test("public latest snapshot reads only the canonical v2 object contract", async () => {
+test("public finite latest snapshot derives from the canonical v2 all object", async () => {
   const requestedKeys = [];
   const payload = snapshotPayload();
   const env = {
@@ -37,6 +48,7 @@ test("public latest snapshot reads only the canonical v2 object contract", async
         requestedKeys.push(key);
         return {
           body: JSON.stringify(payload),
+          json: async () => payload,
           etag: "v2-etag",
           httpMetadata: { contentType: "application/json" },
         };
@@ -52,10 +64,15 @@ test("public latest snapshot reads only the canonical v2 object contract", async
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("X-UK-AQ-Snapshot-Contract"), "v2");
   assert.deepEqual(requestedKeys, [
-    "latest_snapshots/v2/network_group=all/pollutant=no2/window=6h.json",
+    "latest_snapshots/v2/network_group=all/pollutant=no2/window=all.json",
   ]);
 
   const body = await response.json();
+  assert.equal(body.window, "6h");
+  assert.equal(body.count, 1);
+  assert.equal(body.next_since, payload.data[0].last_value_at);
+  assert.equal(body.next_since_id, 101);
+  assert.match(response.headers.get("ETag") || "", /^"sha256-[a-f0-9]{64}"$/);
   const row = body.data[0];
   assert.equal(row.network_id, 2);
   assert.equal(row.network_code, "breathelondon");
