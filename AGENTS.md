@@ -13,7 +13,7 @@
 ## Codex operating mode
 Default mode is code-only implementation.
 Codex should:
-- make focused code, schema, documentation, and test edits requested by the task;
+- make focused code, schema, non-system documentation, and test edits requested by the task;
 - run only fast, local, non-destructive checks needed to verify the edit;
 - provide a clear manual validation and deployment plan;
 - include exact SQL, gcloud, wrangler, GitHub Actions, and Supabase commands for the user to run manually.
@@ -44,6 +44,14 @@ Level 1 plus local-only scripts/tests that do not call Supabase, GCP, Cloudflare
 Prepare SQL, deploy commands, and validation commands, but do not run them.
 ### Level 4 — Execute operations
 Only when explicitly requested in the prompt. May run database, deployment, or cloud commands.
+
+## System Documentation Ownership
+
+- Codex and other coding agents must not create, edit, move, rename, or delete files under `system_docs/`.
+- Coding agents may read `system_docs/` for context, but it is read-only to them.
+- When implementation changes require system documentation changes, the coding agent must identify the affected documents and provide a concise handover for ChatGPT in Chat mode.
+- The handover must summarise the implemented behaviour, files changed, schema or configuration changes, deployment implications, and validation results needed to update the documentation accurately.
+- Updating `system_docs/` is reserved for ChatGPT in Chat mode using the coding-agent handover and the implemented repository changes as source material.
 
 ## Backup Policy
 
