@@ -82,8 +82,11 @@ test("incomplete AQI and observation R2 responses remain independently incomplet
   const observations = buildObservationHistoryChunk(obsChunk, { rows: [{ observed_at: "2026-07-07T01:00:00.000Z", value: 2 }, { observed_at: "2026-07-07T01:00:00Z", value: 2 }], response_complete: false, coverage: { response_complete: false } });
   assert.equal(aqi.response_complete, false);
   assert.equal(aqi.has_gap, true);
+  assert.equal(aqi.response_contract, "aqi_hour_interval_v2");
   assert.equal(aqi.points.length, 1, "valid R2 AQI rows survive a partial historical chunk");
   assert.equal(aqi.points[0].period_start_utc, retainedAqiRow.period_start_utc);
+  assert.equal(aqi.points[0].timestamp_hour_utc, retainedAqiRow.period_start_utc);
+  assert.equal(aqi.points[0].period_end_utc, retainedAqiRow.period_start_utc);
   assert.equal(observations.response_complete, false);
   assert.equal(observations.rows.length, 1);
   assert.deepEqual(observations.rows.map((row) => row.observed_at), ["2026-07-07T01:00:00.000Z"]);
@@ -93,6 +96,7 @@ test("AQI object and compact formats retain the existing columns", () => {
   const chunk = parseHistoryChunkRequest(chunkUrl("/v1/aqi-history", "2026-07-07T00:00:00.000Z", "2026-07-07T01:00:00.000Z"), "aqi");
   const body = buildAqiHistoryChunk(chunk, { columns: ["period_start_utc", "timeseries_id", "source"], points: [{ period_start_utc: "2026-07-07T00:00:00.000Z", timeseries_id: 7, connector_id: 2, pollutant_code: "pm25", source: "r2" }], response_complete: true });
   assert.equal(aqiResponseRows(body, "objects").points[0].source, "r2");
+  assert.equal(aqiResponseRows(body, "objects").points[0].period_end_utc, "2026-07-07T00:00:00.000Z");
   assert.deepEqual(aqiResponseRows(body, "compact").points, [["2026-07-07T00:00:00.000Z", 7, "r2"]]);
 });
 

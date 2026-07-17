@@ -99,7 +99,17 @@ const AQI_RESPONSE_COLUMNS = [
   "source",
   "source_coverage",
 ];
+// Keep the v1 wire shape unchanged.  The active v2 read path gains explicit
+// endpoint fields before the legacy period_start_utc alias is corrected in
+// Phase 3 of the AQI display contract rollout.
+const AQI_V2_RESPONSE_COLUMNS = [
+  ...AQI_RESPONSE_COLUMNS,
+  "timestamp_hour_utc",
+  "period_end_utc",
+];
 const AQI_HISTORY_RESPONSE_CACHE_VERSION = "2";
+const AQI_V2_HISTORY_RESPONSE_CACHE_VERSION = "3";
+const AQI_HOUR_INTERVAL_RESPONSE_CONTRACT = "aqi_hour_interval_v2";
 const DEFAULT_AQI_INTERNAL_RESPONSE_CACHE_ENABLED = true;
 const DEFAULT_AQI_LIVE_OBSERVATION_FALLBACK_ENABLED = false;
 const AQI_RESPONSE_FORMATS = new Set(["json", "objects", "compact", "tsv"]);
@@ -420,11 +430,12 @@ function forceDirectAuthenticatedNoStore(response) {
 
 function buildAqiHistoryResponseCacheKey(request, env = {}) {
   const url = new URL(request.url);
-  url.searchParams.set("__ukaq_aqi_history_response_v", AQI_HISTORY_RESPONSE_CACHE_VERSION);
+  const readVersion = resolveR2HistoryVersion(env, { context: "R2 AQI history API reads" });
   url.searchParams.set(
-    "__ukaq_aqi_history_read_v",
-    resolveR2HistoryVersion(env, { context: "R2 AQI history API reads" }),
+    "__ukaq_aqi_history_response_v",
+    readVersion === "v2" ? AQI_V2_HISTORY_RESPONSE_CACHE_VERSION : AQI_HISTORY_RESPONSE_CACHE_VERSION,
   );
+  url.searchParams.set("__ukaq_aqi_history_read_v", readVersion);
   return new Request(url.toString(), { method: "GET" });
 }
 
@@ -624,24 +635,24 @@ function buildAqiBandCacheKey({
   return `${normalizedPrefix}/day_utc=${normalizedDay}/connector_id=${normalizedConnectorId}/timeseries_ids=${normalizedTimeseriesPart}/pollutant=${normalizedPollutant}.json`;
 }
 
-function getAqiHistoryResponseColumns() {
-  return AQI_RESPONSE_COLUMNS.slice();
+function getAqiHistoryResponseColumns(readVersion) {
+  return (readVersion === "v2" ? AQI_V2_RESPONSE_COLUMNS : AQI_RESPONSE_COLUMNS).slice();
 }
 
-function projectAqiHistoryResponseRow(row) {
+function projectAqiHistoryResponseRow(row, responseColumns) {
   const out = {};
-  for (const columnName of AQI_RESPONSE_COLUMNS) {
+  for (const columnName of responseColumns) {
     out[columnName] = row?.[columnName] ?? null;
   }
   return out;
 }
 
-function toAqiHistoryCompactRow(row) {
-  return AQI_RESPONSE_COLUMNS.map((columnName) => row?.[columnName] ?? null);
+function toAqiHistoryCompactRow(row, responseColumns) {
+  return responseColumns.map((columnName) => row?.[columnName] ?? null);
 }
 
-function buildAqiHistoryCompactRows(rows) {
-  return Array.isArray(rows) ? rows.map((row) => toAqiHistoryCompactRow(row)) : [];
+function buildAqiHistoryCompactRows(rows, responseColumns) {
+  return Array.isArray(rows) ? rows.map((row) => toAqiHistoryCompactRow(row, responseColumns)) : [];
 }
 
 function summarizeAqiHistoryRows(rows) {
@@ -1263,8 +1274,8 @@ function normalizeAqiHistoryRow(row, {
   source = null,
   sourceCoverage = null,
 } = {}) {
-  const periodStart = toIsoOrNull(row?.timestamp_hour_utc || row?.period_start_utc);
-  if (!periodStart) {
+  const timestampHour = toIsoOrNull(row?.timestamp_hour_utc || row?.period_end_utc || row?.period_start_utc);
+  if (!timestampHour) {
     return null;
   }
   const timeseriesId = parseRequiredPositiveInt(row?.timeseries_id);
@@ -1274,7 +1285,12 @@ function normalizeAqiHistoryRow(row, {
   }
 
   return {
-    period_start_utc: periodStart,
+    // period_start_utc remains the old endpoint alias until Phase 3.  The
+    // explicit fields below make the v2 endpoint unambiguous for Phase 2
+    // consumers without silently changing that legacy meaning.
+    period_start_utc: timestampHour,
+    timestamp_hour_utc: timestampHour,
+    period_end_utc: timestampHour,
     connector_id: parseRequiredPositiveInt(row?.connector_id) || null,
     station_id: parseRequiredPositiveInt(row?.station_id) || null,
     timeseries_id: timeseriesId,
@@ -1970,6 +1986,8 @@ async function readRecentIngestObservationRows({ env, timeseriesId, connectorId,
 function projectLiveAqiRowsToResponseRows(rows) {
   return (Array.isArray(rows) ? rows : []).map((row) => ({
     period_start_utc: row.timestamp_hour_utc,
+    timestamp_hour_utc: row.timestamp_hour_utc,
+    period_end_utc: row.timestamp_hour_utc,
     connector_id: row.connector_id,
     station_id: row.station_id,
     timeseries_id: row.timeseries_id,
@@ -3020,13 +3038,14 @@ async function handleRequest(request, env, ctx) {
     ].filter(Boolean)
     : legacySourceCoverage;
 
-  const responseRows = points.map((row) => projectAqiHistoryResponseRow(row));
-  const responseColumns = getAqiHistoryResponseColumns();
-  const compactPoints = buildAqiHistoryCompactRows(responseRows);
+  const responseColumns = getAqiHistoryResponseColumns(readVersion);
+  const responseRows = points.map((row) => projectAqiHistoryResponseRow(row, responseColumns));
+  const compactPoints = buildAqiHistoryCompactRows(responseRows, responseColumns);
   const responsePayload = {
     ok: true,
     request_id: requestId,
     generated_at_utc: new Date().toISOString(),
+    ...(readVersion === "v2" ? { response_contract: AQI_HOUR_INTERVAL_RESPONSE_CONTRACT } : {}),
     read_version: readVersion,
     index_version: readVersion,
     data_profile: readVersion === "v2" ? "hourly_data" : "v1",
@@ -3092,6 +3111,7 @@ async function handleRequest(request, env, ctx) {
       eaqi_missing_reason_counts: rowSummary.eaqi_missing_reason_counts,
       data_format: responseFormat === "objects" ? "objects" : "compact",
       wire_format: responseFormat === "tsv" ? "tsv" : "json",
+      ...(readVersion === "v2" ? { response_contract: AQI_HOUR_INTERVAL_RESPONSE_CONTRACT } : {}),
       read_version: readVersion,
       index_version: readVersion,
       data_profile: readVersion === "v2" ? "hourly_data" : "v1",
@@ -3272,6 +3292,7 @@ async function handleRequest(request, env, ctx) {
   const responseExtraHeaders = {
     "X-UK-AQ-Request-ID": requestId,
     "X-UK-AQ-Response-Complete": responseComplete ? "true" : "false",
+    ...(readVersion === "v2" ? { "X-UK-AQ-AQI-Response-Contract": AQI_HOUR_INTERVAL_RESPONSE_CONTRACT } : {}),
     ...(responseComplete ? {} : { "Cache-Control": "no-store" }),
   };
   if (responseFormat === "tsv") {
@@ -3282,6 +3303,7 @@ async function handleRequest(request, env, ctx) {
         "Cache-Control": responseComplete ? cacheControlHeader(cacheSeconds) : "no-store",
         "X-UK-AQ-Request-ID": requestId,
         "X-UK-AQ-Response-Complete": responseComplete ? "true" : "false",
+        ...(readVersion === "v2" ? { "X-UK-AQ-AQI-Response-Contract": AQI_HOUR_INTERVAL_RESPONSE_CONTRACT } : {}),
         ...corsHeaders(),
       },
     });

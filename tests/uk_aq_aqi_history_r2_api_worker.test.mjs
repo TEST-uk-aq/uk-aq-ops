@@ -388,6 +388,8 @@ function installHistoricalR2Harness(objectsByKey = {}) {
 test("worker source uses the normalized hourly AQI response contract", () => {
   assert.match(workerSource, /const AQI_PARQUET_COLUMNS = \[/);
   assert.match(workerSource, /const AQI_RESPONSE_COLUMNS = \[/);
+  assert.match(workerSource, /AQI_V2_RESPONSE_COLUMNS/);
+  assert.match(workerSource, /aqi_hour_interval_v2/);
   assert.match(workerSource, /__ukaq_aqi_history_response_v/);
   assert.match(workerSource, /aqi_band_cache:\s*\{\s*enabled: false/);
   assert.match(workerSource, /UK_AQ_AQI_HISTORY_R2_MAX_R2_OBJECT_READS_PER_REQUEST/);
@@ -415,7 +417,11 @@ test("historical-only v2 AQI with connector_id does not use Supabase context loo
     );
 
     assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-uk-aq-aqi-response-contract"), "aqi_hour_interval_v2");
     const payload = await response.json();
+    assert.equal(payload.response_contract, "aqi_hour_interval_v2");
+    assert.equal(payload.meta.response_contract, "aqi_hour_interval_v2");
+    assert.deepEqual(payload.columns.slice(-2), ["timestamp_hour_utc", "period_end_utc"]);
     assert.equal(payload.coverage.connector_id_source, "request");
     assert.equal(payload.coverage.used_supabase_connector_lookup, false);
     assert.equal(harness.fetchCalls.length, 0);
@@ -606,6 +612,8 @@ test("worker returns row objects without legacy timestamp fields when format=obj
     assert.equal(payload.points[0].source, "obs_aqidb");
     assert.equal(payload.points[0].source_coverage, "retention");
     assert.equal("timestamp_hour_utc" in payload.points[0], false);
+    assert.equal("period_end_utc" in payload.points[0], false);
+    assert.equal("response_contract" in payload, false);
     assert.equal(payload.points[0].daqi_calculation_status, "ok");
     assert.equal(payload.points[0].eaqi_calculation_status, "ok");
   } finally {

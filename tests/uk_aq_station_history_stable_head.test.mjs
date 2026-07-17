@@ -37,6 +37,9 @@ test("matching R2/live overlap returns one authoritative R2 row", () => {
   const result = mergeStableAqiHead({ r2Rows: [aqi(hour, "r2")], liveRows: [aqi(hour, "live_calculated")], request: requestIdentity, bounds });
   assert.equal(result.rows.length, 1);
   assert.equal(result.rows[0].source, "r2");
+  assert.equal(result.rows[0].timestamp_hour_utc, hour);
+  assert.equal(result.rows[0].period_end_utc, hour);
+  assert.equal(result.rows[0].period_start_utc, hour, "Phase 1 retains the legacy endpoint alias");
   assert.equal(result.overlap_count, 1);
   assert.equal(result.mismatch_count, 0);
 });
@@ -109,6 +112,8 @@ async function longRequest({ incompleteIngest = false, r2MissingIndex = 167, mis
 test("stable head has one row per hour and later chunks can only extend backwards", async () => {
   const result = await longRequest();
   assert.equal(result.body.aqi.rows.length, 168);
+  assert.equal(result.body.aqi.response_contract, "aqi_hour_interval_v2");
+  assert.ok(result.body.aqi.rows.every((row) => row.period_end_utc === row.timestamp_hour_utc));
   assert.equal(new Set(result.body.aqi.rows.map((row) => row.timestamp_hour_utc)).size, 168);
   assert.equal(result.body.aqi.stable_head_locked, true);
   assert.equal(result.body.aqi.replacement_policy, "extend_backwards_only");

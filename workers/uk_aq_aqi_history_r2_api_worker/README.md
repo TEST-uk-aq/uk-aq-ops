@@ -60,6 +60,12 @@ R2 paths expected:
 - safety budgets cap R2 object reads, parquet files, row groups, parquet chunks, and elapsed scan time; budget stops return partial JSON with diagnostics instead of running until Cloudflare terminates the Worker
 - legacy hourly band-cache reads/writes are disabled in this worker; normalized responses are served from fresh R2/ObsAQIDB reads plus the HTTP cache layer
 
+For R2 v2, the data profile remains under
+`history/v2/aqilevels/hourly/data` and the required targeted AQI index remains
+under `history/_index_v2/aqilevels_hourly_data_timeseries`. This Worker only
+changes the read response contract; it does not rewrite parquet, manifests,
+indexes or metadata.
+
 Serving rule:
 
 - The request range is split with `INGESTDB_RETENTION_DAYS` into three rolling source zones:
@@ -89,7 +95,7 @@ Useful runtime vars:
 - `UK_AQ_R2_HISTORY_INDEX_PREFIX` (default `history/_index`)
 - `UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX`
   (default `history/_index_v2/timeseries_binding`)
-- `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX` (default `history/_index/aqilevels_timeseries`)
+- `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_PREFIX` (v2 TEST value `history/_index_v2/aqilevels_hourly_data_timeseries`)
 - `UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED` (default `true`)
 - `UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX` (default `true`)
 - `UK_AQ_AQI_HISTORY_R2_MAX_PARQUET_FILES_PER_REQUEST` (default `120`)
@@ -103,12 +109,26 @@ Response:
 
 - default JSON response uses `wire_format=json`, `data_format=compact`, `columns`, and compact `points` arrays.
 - `format=objects` returns row-object JSON; `format=tsv` returns a legacy tab-separated payload.
-- each row is a normalized hourly AQI row with `period_start_utc`, `connector_id`, `station_id`, `timeseries_id`, `pollutant_code`, `daqi_index_level`, `eaqi_index_level`, `daqi_input_value_ugm3`, `daqi_input_averaging_code`, `eaqi_input_value_ugm3`, `eaqi_input_averaging_code`, `daqi_calculation_status`, `eaqi_calculation_status`, `source`, and `source_coverage`
+- R2 v2 responses include `response_contract: "aqi_hour_interval_v2"` at the
+  top level and in `meta`. Object rows and compact `columns` include the
+  canonical endpoint fields `timestamp_hour_utc` and `period_end_utc`.
+- In the additive compatibility release, both endpoint fields equal `n`. The
+  legacy `period_start_utc` field is retained as its existing endpoint alias
+  until all active consumers use the explicit endpoint. It is corrected to
+  `n - 1 hour` only in the later coordinated range-contract release.
+- Compact consumers must decode using `columns`; TSV uses the same selected
+  columns and exposes the marker in `X-UK-AQ-AQI-Response-Contract`; object
+  responses expose the corresponding named fields.
+- each row otherwise retains the normalized AQI identity, levels, statuses,
+  source and coverage fields.
 - includes source and coverage diagnostics (historical/overlap/retention windows, source coverage intervals, history + obs_aqidb counts, `target_connector_id`, `target_station_id`, `timeseries_window_context_lookup_*`, `coverage.timeseries_index`, `coverage.scan_metrics`, `coverage.row_summary`, plus `obs_aqidb_status` and `obs_aqidb_fallback_*` when live fallback is used)
 - `coverage.row_summary` includes returned-row counts plus missing/null diagnostics (`parsed_point_count`, `null_daqi_count`, `null_eaqi_count`, `source_counts`, `source_coverage_counts`, `pollutant_counts`, and calculation-status / missing-reason counts)
 - includes `response_complete`, `has_gap`, `coverage_state`, and `partial_reasons` plus scan-completeness diagnostics (`coverage.history_scan_complete` and `coverage.history_scan_stopped_reason`) so clients can detect partial history scans.
 - includes `cache_scope` of `recent` or `immutable`
 - sets `x-ukaq-cache: HIT|MISS`.
+
+`/v1/aqi-history` is the HTTP API route and is not an R2 history-version
+identifier. R2 v1 remains untouched by the v2 endpoint contract.
 
 ## Deploy (manual)
 
