@@ -59,11 +59,14 @@ Only when explicitly requested in the prompt. May run database, deployment, or c
 
 ### Pre-change Archive Requirement
 
-* Before making a substantial or high-risk code change, archive the current version of every file that is expected to be changed.
+* Archive snapshots are restricted to active, non-test implementation code.
+* Never create archive copies for documentation, including anything under `system_docs/`, tests, test fixtures, snapshots, test data, generated outputs, or other non-code files.
+* Before making a substantial or high-risk change to active non-test code, archive the current version of every in-scope code file that is expected to be changed.
 * Archive copies must be placed under a dated directory inside `archive/`, using today’s date in `YYYY-MM-DD` format.
-* Preserve the original relative path of each archived file inside that dated archive directory where practical, so the archived copy can be traced back to its source location.
-* If additional files are discovered during the work and need to be changed, archive those files before changing them.
-* A file only needs to be archived once per calendar day. If the same file has already been archived in today’s archive directory, do not create another duplicate archive copy for that file.
+* Preserve the original relative path of each archived code file inside that dated archive directory where practical, so the archived copy can be traced back to its source location.
+* If additional active non-test code files are discovered during the work and need to be changed, archive those files before changing them.
+* A code file only needs to be archived once per calendar day. If the same file has already been archived in today’s archive directory, do not create another duplicate archive copy for that file.
+* Files excluded from archive snapshots rely on Git history and the project’s daily backups.
 * Archive copies are for reference and rollback only. Do not wire archive paths into active runtime code, tests, scripts, workers, services, or default runner paths.
 * Do not modify archived copies after they have been created, except to correct an accidental archive-path mistake before the main code change proceeds.
 
