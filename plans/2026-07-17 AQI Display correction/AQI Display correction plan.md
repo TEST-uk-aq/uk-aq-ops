@@ -1,17 +1,18 @@
 # AQI display correction plan
 
 - Date: 17 July 2026
-- Status: Proposed
+- Status: Proposed, with Phase 0 inventory completed
 - Primary repository: `TEST-uk-aq/uk-aq-ops`
 - Website repository: `TEST-uk-aq/TEST-uk-aq-root.github.io`
 - Authoritative system documentation: `system_docs/aqi-levels/`
 - R2 history scope: v2 only
+- Intended TEST station-history routing: enabled for station series, AQI history and observations history
 
 ## Purpose
 
-Correct AQI period handling everywhere it affects the displayed DAQI and European AQI bands in the active v2 path, while preserving the existing calculation formulas, stored R2 v2 timestamps, source precedence, history integrity and unrelated website behaviour.
+Correct AQI period handling everywhere it affects the displayed UK DAQI and European AQI bands in the active R2 v2 path, while preserving calculation formulas, stored R2 v2 timestamps, source precedence, completeness behaviour, history integrity and unrelated website behaviour.
 
-The required time contract is:
+The canonical time contract is:
 
 ```text
 timestamp_hour_utc = n
@@ -28,42 +29,66 @@ S < n <= E
 
 A row ending at `07:00` must colour `06:00` to `07:00`. It must not colour `07:00` to `08:00`.
 
-## v2-only scope
+## Route-name clarification
 
-This correction applies only to the active R2 history v2 path.
+`/v1/aqi-history` is the HTTP API route and contract version. It is not R2 history v1.
+
+Retaining that route does not bring R2 history v1 into scope. The route must not be renamed as part of this work.
+
+## R2 v2-only scope
+
+This correction applies only to the active R2 history v2 read, response, station-history and website consumer paths.
 
 The implementation must:
 
-- inspect and amend only the v2 read and response path where required;
-- leave v1 code, v1 objects, v1 tests and v1 compatibility behaviour unchanged;
-- avoid adding new v1 support or fixing equivalent v1 defects;
-- stop and report a configuration mismatch if the deployed TEST path is not using v2.
+- inspect and amend only the active v2 path where required;
+- leave R2 v1 code, objects, tests and compatibility behaviour unchanged;
+- avoid adding v1 support or repairing equivalent v1 defects;
+- stop and report a configuration mismatch if deployed TEST evidence shows that the exercised path is not using v2.
 
-R2 v1 is being retired and is explicitly out of scope.
+R2 v1 is retiring and is explicitly out of scope.
+
+## Intended TEST routing
+
+The intended TEST repository variables are:
+
+```text
+UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED=true
+UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true
+UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED=true
+UK_AQ_STATION_HISTORY_WORKER_NAME=uk-aq-station-history-test
+```
+
+`UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true` makes progressive older AQI-history chunks pass through the private station-history Worker before that Worker calls the AQI History R2 API.
+
+The station-history AQI route is therefore an intended active TEST path and its corrections are mandatory in this plan. They must not be treated as optional or dormant.
+
+The variable may be enabled before implementation because this is TEST. Functional correctness is established after the implementation is deployed through real TEST requests.
 
 ## R2 v2 data is not expected to change
 
-The stored v2 AQI rows already use `timestamp_hour_utc` as the canonical hour-ending endpoint.
+Stored v2 AQI rows already use `timestamp_hour_utc` as the canonical hour-ending endpoint.
 
-This plan does not expect changes to:
+This plan does not expect or permit changes to:
 
 - v2 AQI parquet rows;
 - `history/v2/aqilevels/hourly/data` objects;
 - `history/v2/aqilevels/hourly/debug` objects;
-- pollutant, connector or day manifests;
+- day, connector or pollutant manifests;
 - v2 timeseries indexes;
 - v2 timeseries metadata;
-- Prune Daily AQI calculation or write behaviour;
 - R2 prefixes;
+- Prune Daily AQI calculation or write behaviour;
 - backfill or history-repair tools;
 - raw observation history;
-- database schema.
+- database schema;
+- inactive daily or monthly AQI roll-ups.
 
-No R2 v2 rebuild, rewrite, migration or reindex is required merely to correct display semantics.
+No R2 v2 rebuild, rewrite, migration or reindex is required.
 
-The v2 R2 API read layer may still need changes because it currently projects and filters stored endpoint timestamps incorrectly. Changing a response projection or a request boundary is not a change to the underlying R2 v2 data.
+The v2 API read layer may change its response projection, filtering and partition selection. Those are read-contract changes, not changes to stored R2 v2 data.
 
-If Phase 0 finds evidence that v2 stored rows themselves are shifted, stop and report the evidence. Do not expand this display-correction plan into a history rewrite.
+If implementation evidence shows that stored v2 rows themselves are shifted, stop and report the evidence. Do not expand this plan into a history rewrite.
 
 ## Authoritative references
 
@@ -82,66 +107,93 @@ Implementation must conform to:
 
 These documents take precedence over older broad AQI, R2, Prune Daily, backfill and archived service documentation.
 
-Every implementation phase must compare its final diff against the mandatory functionality in these documents before deployment.
+Every implementation phase must compare its final diff against the mandatory functionality in these documents and report pass or fail compliance.
 
 ## Confirmed current defects
 
-### Website rendering
+### Website renderers
 
-Both active station-chart renderers currently treat an AQI timestamp `n` as the start of the coloured rectangle and draw to `n + 1 hour`.
+Both active station-chart renderers currently treat endpoint `n` as the start of the coloured rectangle and draw to `n + 1 hour`.
 
-Affected website files include:
+Affected files:
 
 - `hex_map/index.html`;
 - `sensors/index.html`.
 
-This causes the final coloured AQI section to extend beyond the final plotted concentration timestamp.
+This extends the final AQI colour beyond the final plotted concentration timestamp.
 
-### Website loader
+### Website loader and direct parsers
 
 `station-history-loader.js` currently normalises one ambiguous `date` from fields including `period_start_utc` and `timestamp_hour_utc`.
 
-It does not retain explicit period start and end boundaries. This allows a field naming defect upstream to become a rendering defect downstream.
+It does not retain explicit period start and end boundaries.
+
+Both active HTML pages also contain direct AQI payload parsing that must be corrected independently of the shared loader:
+
+- `hex_map/index.html`;
+- `sensors/index.html`.
+
+Every active parser must use this endpoint priority during the compatibility transition:
+
+1. `period_end_utc`;
+2. `timestamp_hour_utc`;
+3. legacy `period_start_utc` only as a temporary fallback for the old ambiguous response.
+
+Compact-array decoding must remain aligned with response `columns` metadata.
+
+### Hex-map AQI carry-forward
+
+The hex-map chart currently carries DAQI or European AQI forward across missing endpoint hours.
+
+This violates the no-fill rule. A missing endpoint must leave the represented hour blank.
+
+The correction must be limited to AQI band handling. Unrelated concentration-series behaviour must remain unchanged.
 
 ### v2 AQI History R2 API
 
-`workers/uk_aq_aqi_history_r2_api_worker/worker.mjs` reads canonical v2 `timestamp_hour_utc` endpoint values but exposes the value as `period_start_utc` without subtracting one hour.
+`workers/uk_aq_aqi_history_r2_api_worker/worker.mjs` reads canonical v2 `timestamp_hour_utc` endpoints but exposes the same value as `period_start_utc`.
 
-The current response therefore gives an endpoint timestamp a start-time field name.
+The worker also uses start-inclusive, end-exclusive assumptions in affected row filtering, expected-hour generation, recent-row handling, gap calculations and day-partition selection.
 
-### Station-history range and completeness logic
+At midnight it can omit the partition containing endpoint `E`.
 
-The station-history path generally generates expected AQI hours and filters rows using start-inclusive, end-exclusive timestamp logic.
+### Station-history stable head and chunks
 
-For hour-ending rows, represented interval `S` to `E` requires endpoint selection:
+The intended active station-history path applies start-labelled semantics in:
+
+- `workers/uk_aq_station_history/src/stable_head.mjs`;
+- `workers/uk_aq_station_history/src/index.mjs`;
+- `workers/uk_aq_station_history/src/history_chunks.mjs`.
+
+Known consequences include:
+
+- first endpoint boundary selected incorrectly;
+- final endpoint omitted;
+- expected endpoint and missing-range logic incorrect;
+- stable-head and older-chunk completeness incorrect;
+- adjacent chunks vulnerable to omission or duplication;
+- endpoint coverage sometimes described as extending to `n + 1 hour`;
+- an already hour-ending R2 endpoint may be advanced by another hour;
+- history chunks relabel endpoint values as `period_start_utc`.
+
+### Cache contract ambiguity
+
+Changing `period_start_utc` from an endpoint alias to a true period start changes the meaning of cached rows.
+
+A corrected response-contract marker and coordinated cache identity are mandatory. Old ambiguous cached responses must not be interpreted under the corrected contract.
+
+The exact cache path includes:
+
+- `workers/uk_aq_cache_proxy/src/station_history/cache_keys.mjs`;
+- `workers/uk_aq_cache_proxy/src/index.ts` where required to apply the marker or key.
+
+Use the explicit marker:
 
 ```text
-S < n <= E
+aqi_hour_interval_v2
 ```
 
-Changing only the website rectangle would leave:
-
-- the first endpoint boundary wrong;
-- the final endpoint omitted in some ranges;
-- gap detection wrong;
-- chunk completeness wrong;
-- midnight endpoint reads vulnerable to omission.
-
-### Midnight v2 partition boundary
-
-R2 v2 AQI `day_utc` follows the endpoint date.
-
-The interval `17 July 23:00` to `18 July 00:00` is represented by endpoint `18 July 00:00` and is stored under:
-
-```text
-day_utc=2026-07-18
-```
-
-The v2 reader must include the endpoint-day partition when the request ends at midnight.
-
-### Inactive roll-ups
-
-Daily and monthly AQI roll-ups are inactive. They are not part of this correction and must not be reactivated, refreshed or amended by this work.
+An equivalent existing repository naming convention may be used only when clearly established and documented.
 
 ## Mandatory retained functionality
 
@@ -152,26 +204,27 @@ The work must retain all of the following:
 - DAQI NO2 remains an hourly mean ending at `n`;
 - European AQI remains an hourly mean ending at `n`;
 - breakpoint values and inclusive upper-bound behaviour remain unchanged;
-- PM DAQI still requires 24 hourly values;
+- PM DAQI still requires 24 endpoint hours: `n-23h` through `n`;
 - European AQI remains independently available when PM DAQI is `insufficient_samples`;
 - negative and non-finite observation values remain excluded from AQI calculation but retained in raw observation history;
 - committed R2 v2 AQI remains authoritative over live calculation for the same endpoint;
-- older history chunks must not replace the stable head;
+- older history chunks extend backwards only and must not replace the stable head;
 - AQI and observation completeness remain independent;
-- incomplete and gap-bearing responses remain explicitly partial and non-cacheable where currently required;
-- v2 data and debug R2 profiles remain aligned and unchanged;
+- missing AQI hours remain blank;
+- incomplete and gap-bearing responses remain explicitly partial and non-cacheable where required;
+- v2 data and debug profiles remain aligned and unchanged;
 - v2 manifest and index hierarchy remains unchanged;
-- stored `timestamp_hour_utc` values and existing parquet row identities remain unchanged;
-- daily and monthly roll-ups remain inactive;
+- stored `timestamp_hour_utc` values and parquet row identities remain unchanged;
 - station-history remains private behind the cache-proxy Service Binding;
-- unrelated map, sensor list, observation chart and cache behaviour remains unchanged;
+- unrelated map, sensor-list, concentration-chart, authentication and cache behaviour remains unchanged;
+- daily and monthly roll-ups remain inactive;
 - v1 remains untouched and out of scope.
 
 ## Explicit non-goals
 
 This plan must not:
 
-- modify any v1 code path, object, test or compatibility contract;
+- modify any R2 v1 code path, object, test or compatibility contract;
 - rewrite or shift historical R2 v2 AQI timestamps;
 - rebuild or reindex R2 v2 history;
 - change R2 v2 parquet, manifests, indexes or metadata;
@@ -181,287 +234,223 @@ This plan must not:
 - modify raw observation history;
 - modify database schema;
 - reactivate daily or monthly roll-ups;
-- introduce interpolation or forward-fill for missing AQI hours;
+- interpolate or forward-fill missing AQI hours;
 - create a second public AQI calculation path;
 - replace R2 precedence with last-write-wins merging;
 - broaden R2 scans when required v2 indexes are missing;
+- rename public routes;
+- change authentication, CORS, Service Binding privacy or unrelated TTLs;
 - refactor unrelated website or Worker code;
 - create a broad speculative pre-deployment test suite.
 
-## Expected change boundary
-
-Expected code changes are limited to:
+## Expected implementation boundary
 
 ### Ops repository
 
-- the v2 response and range branch of `workers/uk_aq_aqi_history_r2_api_worker/`;
-- `workers/uk_aq_station_history/`;
-- narrowly related v2 response tests and Worker documentation;
-- `workers/uk_aq_cache_proxy/src/index.ts` only if a response-contract or cache namespace marker is structurally required.
+Expected implementation targets:
+
+- `workers/uk_aq_aqi_history_r2_api_worker/worker.mjs`;
+- focused existing tests or fixtures for that Worker;
+- `workers/uk_aq_aqi_history_r2_api_worker/README.md`;
+- `workers/uk_aq_station_history/src/stable_head.mjs`;
+- `workers/uk_aq_station_history/src/index.mjs`;
+- `workers/uk_aq_station_history/src/history_chunks.mjs`;
+- narrowly related station-history helpers and existing focused fixtures;
+- `workers/uk_aq_station_history/README.md`;
+- `workers/uk_aq_cache_proxy/src/station_history/cache_keys.mjs`;
+- `workers/uk_aq_cache_proxy/src/index.ts` only where required to apply the response marker or cache identity;
+- `.github/workflows/uk_aq_cache_proxy_deploy.yml` only if structurally required to carry an existing variable or contract marker.
+
+Review-only and expected unchanged:
+
+- `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`;
+- `lib/aqi/aqi_levels.mjs`;
+- `workers/shared/uk_aq_r2_history_index.mjs`;
+- all R2 v2 writer and storage code;
+- schema repository.
 
 ### Website repository
 
-- `station-history-loader.js`;
-- `hex_map/index.html`;
-- `sensors/index.html`;
-- their narrowly related tests or fixtures;
-- directly related local cache-shape versioning only if required.
-
-The shared AQI calculation library should remain unchanged unless endpoint output filtering is implemented there already and cannot be corrected safely in the v2 station-history layer.
-
-Prune Daily, R2 writers, manifests, indexes, history repair tools and schema are review-only for this plan and are expected to remain unchanged.
-
-## Deployment strategy
-
-Use an additive, compatibility-safe transition so an old website and a new website are not forced to interpret the same ambiguous field differently during deployment.
-
-The recommended sequence is:
-
-1. confirm TEST uses R2 v2 and inventory every active v2 consumer;
-2. add an explicit endpoint field through the v2 ops read interfaces while retaining temporary website compatibility;
-3. update both website renderers and the loader to use the explicit endpoint;
-4. correct v2 range, gap, chunk and period-start semantics;
-5. validate through the real TEST pipeline;
-6. remove only temporary compatibility code that is proven unnecessary.
-
-Do not silently change the meaning of `period_start_utc` before every active website consumer can use an explicit endpoint.
-
----
-
-# Phase 0: targeted v2 inventory and deployed configuration confirmation
-
-## Objective
-
-Confirm that TEST is using the R2 v2 AQI history path and identify the exact active v2 producers and consumers before implementation.
-
-This phase is read-only. It must not change code, configuration, R2 objects or deployed services.
-
-## Mandatory targeted check
-
-Confirm the deployed TEST value:
-
-```text
-UK_AQ_R2_HISTORY_VERSION=v2
-```
-
-Also confirm the active v2 read settings and bindings used by:
-
-- the AQI History R2 API Worker;
-- the station-history Worker;
-- the cache proxy;
-- the website station-history route.
-
-Relevant settings may include:
-
-```text
-UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX
-UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX
-UK_AQ_R2_HISTORY_INDEX_V2_PREFIX
-UK_AQ_AQI_HISTORY_R2_TIMESERIES_INDEX_ENABLED
-UK_AQ_AQI_HISTORY_R2_REQUIRE_TIMESERIES_INDEX
-UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED
-UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED
-UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED
-```
-
-If TEST is not using v2, stop. Do not implement a v1 correction.
-
-No Prune Daily branch check is required because this plan does not change the v2 writer.
-
-## Ops repository inventory
-
-Search active, non-archive code for:
-
-- `period_start_utc`;
-- `period_end_utc`;
-- `timestamp_hour_utc`;
-- v2 AQI history prefixes;
-- v2 range and day-partition enumeration;
-- expected AQI endpoint generation;
-- AQI gap detection;
-- stable-head and older-chunk boundaries;
-- compact and object response columns;
-- cache keys or response markers;
-- any shared v1/v2 branch where a v2-only guard is required.
-
-Confirm active ownership across:
-
-- `workers/uk_aq_aqi_history_r2_api_worker/`;
-- `workers/uk_aq_station_history/`;
-- `workers/uk_aq_cache_proxy/src/index.ts`;
-- current deployment workflows;
-- active focused tests.
-
-Review Prune Daily, shared R2 indexes and v2 history layout only to confirm that stored rows are already correct endpoints. They are not implementation targets.
-
-Ignore archived implementations except as historical evidence.
-
-## Website repository inventory
-
-Search for every active AQI consumer and renderer, including:
+Expected implementation targets:
 
 - `station-history-loader.js`;
 - `hex_map/index.html`;
 - `sensors/index.html`;
-- AQI response normalisers;
-- DAQI and European AQI tooltip logic;
-- chart range clipping;
-- local storage or cache state that serialises normalised AQI points;
-- tests and fixtures using `period_start_utc`, `period_end_utc` or `timestamp_hour_utc`.
+- narrowly related existing tests or fixtures;
+- directly related browser or local cache-shape markers only when required.
 
-Confirm there is no third active AQI chart implementation.
+The root `index.html` AQI placeholder is not an active renderer and remains out of scope.
 
-## Phase 0 output
+## Structural validation and functional validation
 
-Produce a concise inventory containing:
+Before implementation, validate only that the proposed response fields, compact columns, cache marker, cache-key transition, Worker bindings and deployment order are structurally viable.
 
-- confirmation that TEST uses v2;
-- exact v2 files that require changes;
-- files reviewed but intentionally unchanged;
-- every active website AQI consumer;
-- proposed additive endpoint fields;
-- whether a response-contract or cache-key version is required;
-- confirmation that no R2 v2 data, writer, manifest, index or schema change is needed;
-- any conflict with this plan or the mandatory system documentation.
+During implementation, syntax and type checks may be used to show that changed files are structurally valid. Do not substitute a speculative or broad pre-deployment functional suite for real TEST operation.
 
-Do not implement in Phase 0.
+Functional testing happens after deployment through real TEST API requests, browser operation and Worker diagnostics.
 
-## Codex prompt for Phase 0
+## Compatibility-safe deployment strategy
 
-**Recommended model: GPT-5.6 Codex, High reasoning.**
+Use this sequence:
 
-```text
-Work in the TEST UK AQ repositories. This is a read-only v2 implementation inventory for the AQI display timestamp correction. Do not edit files, create commits, change configuration, deploy, or write to R2 or Supabase.
+1. confirm repository and workflow inputs structurally select R2 v2;
+2. add `period_end_utc` and retain `timestamp_hour_utc` as the canonical endpoint;
+3. add the `aqi_hour_interval_v2` response marker and versioned affected cache identity;
+4. update `station-history-loader.js` and both direct HTML parsers to prefer the explicit endpoint;
+5. update both renderers to draw `n - 1 hour` to `n`;
+6. remove hex-map AQI carry-forward;
+7. correct true `period_start_utc`, v2 range selection, gaps, stable-head coverage, chunk boundaries and endpoint-day partition selection;
+8. deploy the coordinated changes to TEST in observable stages;
+9. validate through the real enabled station-history AQI route;
+10. remove only temporary legacy fallback proven unnecessary.
 
-Repositories:
-- TEST-uk-aq/uk-aq-ops
-- TEST-uk-aq/TEST-uk-aq-root.github.io
-
-Read first:
-- the complete AQI Display correction plan
-- every file under uk-aq-ops/system_docs/aqi-levels/
-
-Scope:
-- R2 AQI history v2 only
-- v1 is retiring and is out of scope
-- do not propose or implement any v1 changes
-
-Authoritative rule:
-- timestamp_hour_utc=n is the interval endpoint
-- period_start_utc=n-1 hour
-- period_end_utc=n
-- represented interval S..E requires endpoints S < n <= E
-
-First confirm the deployed TEST value UK_AQ_R2_HISTORY_VERSION=v2 and identify the active v2 Worker names, URLs, bindings, prefixes and required-index settings. If TEST is not on v2, stop and report that mismatch.
-
-Audit all active, non-archive v2 producers and consumers. Search for endpoint projection, AQI range filtering, day-partition selection, expected endpoints, gap detection, chunk boundaries, compact/object response columns, cache keys, website normalisation and both renderers.
-
-Review the v2 Prune Daily writer, parquet schema, manifests and indexes only to confirm stored timestamp_hour_utc rows are already hour-ending endpoints. They are expected to remain unchanged.
-
-Return:
-1. confirmation that TEST uses v2;
-2. exact active files that need changes, grouped by repository;
-3. every active website AQI renderer and consumer;
-4. response and cache compatibility risks;
-5. recommended additive endpoint fields and whether a response-contract version is needed;
-6. files reviewed but intentionally unchanged;
-7. explicit confirmation that no R2 v2 data, writer, manifest, index or schema change is required;
-8. any conflict with the plan or system_docs/aqi-levels.
-
-Do not propose broad tests. Do not implement anything.
-```
+Do not silently change the meaning of `period_start_utc` before every active consumer uses the explicit endpoint and affected caches are version-isolated.
 
 ---
 
-# Phase 1: add an explicit endpoint contract to the v2 read path
+# Phase 0: completed inventory and structural configuration evidence
+
+## Status
+
+Completed as a read-only source and workflow inventory.
+
+No code, configuration, R2 object or deployed service was changed by the inventory.
+
+## Structural findings
+
+Repository and workflow inputs select R2 v2 and identify:
+
+- AQI History R2 API Worker: `uk-aq-aqi-history-r2-api`;
+- cache Worker: `uk-aq-cache-test`;
+- station-history Worker: `uk-aq-station-history-test`;
+- public AQI route through the cache proxy;
+- private station-history Service Binding;
+- v2 data, index and binding prefixes;
+- required v2 timeseries index behaviour.
+
+The intended TEST routing variables are all true for station series, AQI history and observations history after the user adds `UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true` and redeploys the cache proxy.
+
+## Limits of Phase 0 evidence
+
+Phase 0 established structural viability from repository and workflow inputs. It did not prove the values present inside the already deployed Cloudflare Workers.
+
+Live runtime confirmation belongs to Phase 4 and must show:
+
+- the AQI-history flag reached the deployed cache Worker;
+- a progressive older AQI request passed through `uk-aq-station-history-test`;
+- that Worker called the AQI History R2 API;
+- the returned response used the R2 v2 path.
+
+## Confirmed change inventory
+
+Ops:
+
+- `workers/uk_aq_aqi_history_r2_api_worker/worker.mjs`;
+- `workers/uk_aq_station_history/src/stable_head.mjs`;
+- `workers/uk_aq_station_history/src/index.mjs`;
+- `workers/uk_aq_station_history/src/history_chunks.mjs`;
+- `workers/uk_aq_cache_proxy/src/station_history/cache_keys.mjs`;
+- `workers/uk_aq_cache_proxy/src/index.ts` where required;
+- relevant Worker READMEs and existing focused fixtures.
+
+Website:
+
+- `station-history-loader.js`;
+- `hex_map/index.html`;
+- `sensors/index.html`;
+- related existing fixtures and cache-shape markers where required.
+
+Review-only:
+
+- Prune Daily;
+- shared AQI calculation;
+- v2 writers, parquet, manifests, indexes and metadata;
+- schema.
+
+Phase 0 must not be repeated unless configuration or topology changes materially before implementation.
+
+---
+
+# Phase 1: add the explicit v2 endpoint and cache contract
 
 ## Objective
 
-Remove timestamp ambiguity from v2 AQI responses without changing R2 v2 stored data and without yet relying on a changed meaning of the existing `period_start_utc` field.
+Remove timestamp ambiguity from v2 AQI responses without changing stored R2 v2 data and without immediately requiring all consumers to reinterpret the old `period_start_utc` field.
 
 ## Required implementation
 
-### v2 AQI History R2 API Worker
+### AQI History R2 API Worker
 
-In the active v2 branch of `workers/uk_aq_aqi_history_r2_api_worker/worker.mjs`:
+In the active v2 path of `workers/uk_aq_aqi_history_r2_api_worker/worker.mjs`:
 
-- retain stored `timestamp_hour_utc` as the canonical endpoint;
-- add an explicit `period_end_utc` response field equal to the canonical endpoint;
-- expose or retain `timestamp_hour_utc` in object responses where compatibility allows;
-- calculate a true `period_start_utc` as endpoint minus one hour only when the compatibility strategy from Phase 0 proves every active consumer can tolerate it;
-- otherwise introduce a clearly versioned additive v2 response contract first;
-- update compact response columns and object response fields consistently;
-- keep retained TSV behaviour consistent where it remains active;
-- preserve source, coverage, partial-response and cache behaviour;
-- preserve required-index and bounded-scan behaviour;
-- do not alter R2 v2 parquet, manifests, indexes or stored timestamps;
-- do not edit the v1 branch.
-
-Where v1 and v2 share response helpers, make the smallest guarded change that affects v2 only.
+- retain `timestamp_hour_utc` as the canonical endpoint;
+- add `period_end_utc = timestamp_hour_utc`;
+- add the response-contract marker `aqi_hour_interval_v2`;
+- keep compact `columns`, compact `points`, object responses and retained TSV output consistent;
+- preserve source diagnostics, coverage, partial responses, ordering, row limits, required-index and bounded-scan behaviour;
+- avoid changing the meaning of the old field until the compatibility sequence makes that safe;
+- guard any shared helper so v1 remains unchanged.
 
 ### Station-history Worker
 
-In `workers/uk_aq_station_history/`:
+In the intended active path:
 
-- normalise incoming v2 R2 rows around an explicit endpoint;
-- make every internal AQI row retain `period_end_utc` or equivalent canonical endpoint information;
-- ensure live-calculated rows and v2 R2 rows expose the same timestamp fields;
-- keep temporary compatibility fields only where required for the deployment sequence;
-- keep stable-head precedence and mismatch logic unchanged;
-- keep AQI and observation sections independent;
-- preserve existing routes and private Service Binding architecture.
+- normalise incoming v2 R2 rows around the explicit endpoint;
+- retain canonical endpoint information on all R2 and live-calculated AQI rows;
+- make the stable-head and history-chunk response shapes carry the same explicit endpoint fields;
+- preserve R2-over-live precedence, mismatch diagnostics and AQI/observation independence;
+- preserve `/v1/station-series`, `/v1/aqi-history` and private Service Binding architecture.
+
+Expected files include:
+
+- `workers/uk_aq_station_history/src/stable_head.mjs`;
+- `workers/uk_aq_station_history/src/index.mjs`;
+- `workers/uk_aq_station_history/src/history_chunks.mjs`.
 
 ### Cache proxy
 
-Review `workers/uk_aq_cache_proxy/src/index.ts` and deployment configuration:
+Make the cache-contract transition mandatory:
 
-- update only if a v2 response-contract marker, cache namespace or feature flag is structurally required;
-- do not change public route names;
-- do not change authentication, CORS, stale fallback or unrelated TTLs;
-- prevent old cached ambiguous rows from being interpreted under a new v2 contract marker.
+- add the corrected AQI interval marker to affected cache identity;
+- ensure old ambiguous responses cannot collide with corrected responses;
+- update `workers/uk_aq_cache_proxy/src/station_history/cache_keys.mjs`;
+- update `workers/uk_aq_cache_proxy/src/index.ts` where needed to apply or expose the marker;
+- preserve public route names, authentication, CORS, stale fallback and unrelated TTLs.
 
-### R2 v2 writer and storage
+Browser cache versioning remains conditional only when the stored browser timestamp is proven to remain an unambiguous canonical endpoint. Document that decision.
 
-No changes are expected.
+### Documentation
 
-Do not edit:
+Update the two Worker READMEs to describe:
 
-- Prune Daily AQI writer logic;
-- v2 data or debug profiles;
-- R2 manifests;
-- v2 indexes;
-- v2 timeseries metadata;
-- R2 prefixes;
-- backfill or repair scripts.
+- endpoint meaning;
+- response marker;
+- compatibility sequence;
+- `/v1/aqi-history` as an HTTP route version rather than R2 v1;
+- unchanged R2 v2 storage.
 
-If implementation cannot proceed without changing these areas, stop and explain why. Do not broaden scope automatically.
+## Pre-deployment structural validation
 
-## Focused checks
+Only verify:
 
-Before deployment, run only:
+- changed JavaScript or TypeScript parses or type-checks;
+- compact `columns` structurally match compact points;
+- object fields and response marker are present in the intended v2 branch;
+- cache keys include the new contract component;
+- shared code changes are guarded away from v1.
 
-- syntax or type checks for changed Worker files;
-- the smallest existing v2 AQI API response test;
-- one compact deterministic check proving endpoint `07:00` yields start `06:00` and end `07:00`;
-- one compact format-consistency check for compact and object v2 responses;
-- one guard check proving the v1 branch or fixture is unchanged where shared code was touched.
-
-Do not run broad repository suites or external service tests before deployment.
-
-## Mandatory system-doc check
-
-Before completing the phase, compare the full diff with all files under `system_docs/aqi-levels/` and report whether every mandatory invariant is retained.
+Do not run broad functional or external-service tests before deployment.
 
 ## Phase 1 acceptance
 
-- all new live and v2 R2 station-history AQI rows have an explicit endpoint;
-- v2 API field meanings are unambiguous in the additive contract;
-- R2 v2 stored timestamps and object content are unchanged;
-- v2 source precedence and completeness are unchanged;
+- v2 responses expose an explicit endpoint;
+- the corrected contract has an explicit marker;
+- affected cache identity is version-isolated;
+- station-history and direct AQI API shapes agree;
+- old website compatibility is retained for the deployment transition;
+- R2 v2 storage, writers, manifests, indexes and metadata are unchanged;
 - v1 is unchanged;
-- the old website deployment remains operational during the transition;
-- no history rebuild or reindex occurs;
-- the diff conforms to all mandatory AQI system documentation.
+- system-document compliance is reported.
 
 ## Codex prompt for Phase 1
 
@@ -470,146 +459,144 @@ Before completing the phase, compare the full diff with all files under `system_
 ```text
 Implement Phase 1 of plans/2026-07-17 AQI Display correction/AQI Display correction plan.md in TEST-uk-aq/uk-aq-ops.
 
-Read the complete plan and every file under system_docs/aqi-levels/ first. Use the completed Phase 0 inventory and confirmed deployed v2 configuration as authoritative evidence.
+Read the complete plan and every file under system_docs/aqi-levels/ first.
 
 Scope:
-- active R2 AQI history v2 read path only
-- v1 is out of scope and must remain unchanged
-- R2 v2 data, writer, parquet, manifests, indexes, metadata and prefixes must remain unchanged
+- active R2 AQI history v2 only
+- the intended TEST station-history AQI route is active and mandatory
+- R2 v1 remains untouched
+- R2 v2 storage, writers, parquet, manifests, indexes, metadata, prefixes and schema remain unchanged
 
-Goal:
-Add an explicit hour-ending AQI endpoint contract through the v2 AQI History R2 API and station-history path without shifting timestamp_hour_utc and without breaking the currently deployed website during the transition.
-
-Required invariant:
-- endpoint n represents (n-1h,n]
+Required contract:
+- timestamp_hour_utc=n is the canonical endpoint
 - period_end_utc=n
-- true period_start_utc=n-1h
+- represented interval is (n-1h,n]
+- add response marker aqi_hour_interval_v2
 
-Update only:
-- the active v2 branch of workers/uk_aq_aqi_history_r2_api_worker/worker.mjs
-- its focused v2 tests and README where needed
-- workers/uk_aq_station_history active source and focused tests
-- cache proxy only if a v2 contract marker or cache namespace change is genuinely required
+Update:
+- workers/uk_aq_aqi_history_r2_api_worker/worker.mjs
+- relevant focused existing fixtures and README
+- workers/uk_aq_station_history/src/stable_head.mjs
+- workers/uk_aq_station_history/src/index.mjs
+- workers/uk_aq_station_history/src/history_chunks.mjs
+- workers/uk_aq_station_history/README.md
+- workers/uk_aq_cache_proxy/src/station_history/cache_keys.mjs
+- workers/uk_aq_cache_proxy/src/index.ts only where needed to apply the marker or key
 
-Do not:
-- edit or fix v1
-- rewrite R2 v2 data
-- change Prune Daily
-- change v2 manifests or indexes
-- rebuild or reindex history
-- alter breakpoints or calculation formulas
-- alter R2-over-live precedence
-- weaken completeness or required-index behaviour
-- change public routes, auth, CORS or unrelated cache settings
-- touch inactive daily or monthly roll-ups
-- refactor unrelated code
+Make compact and object responses consistent. Preserve retained TSV behaviour where active. Version affected cache identity so old ambiguous rows cannot be interpreted under the corrected contract.
 
-Before implementation, validate only that the additive v2 interface is structurally viable for all active consumers.
+Do not change calculations, source precedence, partial-response rules, scan budgets, required-index behaviour, routes, auth, CORS, unrelated TTLs, observations, Prune Daily, R2 data or v1.
 
-Run only narrow checks:
-- syntax/type checks for changed files
-- smallest focused v2 response tests
-- 07:00 -> start 06:00, end 07:00
-- compact/object consistency
-- v1 unchanged where shared helpers were touched
+Before implementation, validate structural viability only. After implementation, run only syntax or type checks and inspect the resulting response and cache shapes. Functional testing happens after deployment on TEST.
 
-Do not run broad suites or external functional tests. Functional validation will occur after deployment on TEST.
+Compare the final diff against every mandatory document under system_docs/aqi-levels/ and report pass or fail compliance.
 
-Before finishing, compare the full diff against every mandatory requirement in system_docs/aqi-levels/ and include a pass/fail compliance table.
-
-Return:
-1. changed files;
-2. exact v2 compatibility strategy;
-3. confirmation that R2 v2 data and v1 are unchanged;
-4. focused checks run and results;
-5. system-doc compliance result;
-6. deployment order for Phase 2;
-7. anything blocked or intentionally deferred.
+Return changed files, compatibility strategy, cache marker and key change, structural checks, confirmation that v1 and R2 v2 storage are unchanged, system-doc compliance and deployment notes.
 ```
 
 ---
 
-# Phase 2: correct the website loader and both AQI renderers
+# Phase 2: correct the website loader, direct parsers and both renderers
 
 ## Objective
 
-Make the website use the explicit v2 endpoint and draw each DAQI and European AQI band over the correct represented hour.
+Make every active website AQI consumer use the explicit endpoint and draw DAQI and European AQI over the correct represented hour.
 
 ## Required implementation
 
-### Website loader
+### Shared loader
 
 In `station-history-loader.js`:
 
-- normalise AQI rows into explicit `periodStart` and `periodEnd` values, or equivalent clearly named properties;
-- prefer `period_end_utc` from the new v2 ops contract;
-- accept `timestamp_hour_utc` as the canonical endpoint fallback;
-- during the temporary compatibility window, use the minimum fallback needed for the old deployed response;
-- do not add v1-specific compatibility logic;
-- do not discard one index because the other is null;
-- key AQI merge identity by the canonical endpoint;
-- retain stable-head no-replacement behaviour for older chunks;
-- update authoritative-head replacement boundaries using represented intervals rather than treating endpoint keys as starts;
-- preserve observation merging and coverage state unchanged.
+- normalise every AQI row into explicit period start and period end values;
+- use endpoint priority:
+  1. `period_end_utc`;
+  2. `timestamp_hour_utc`;
+  3. temporary legacy `period_start_utc` fallback;
+- key AQI identity and merges by the canonical endpoint;
+- preserve valid European AQI when DAQI is null;
+- preserve older-chunk no-replacement of the stable head;
+- correct authoritative-head replacement boundaries using represented intervals;
+- preserve observation merging and coverage state;
+- retain the legacy fallback only for the compatibility window.
 
-### Hex map station chart
+### Direct parser in `hex_map/index.html`
+
+Correct the direct AQI payload parser as well as the renderer:
+
+- use the same endpoint priority as the shared loader;
+- decode compact arrays from the supplied `columns` metadata;
+- do not assume a fixed compact-column position after the contract changes;
+- retain explicit start and end values.
+
+### Direct parser in `sensors/index.html`
+
+Apply the same parser rules:
+
+- same endpoint priority;
+- same compact-column handling;
+- same explicit start and end representation.
+
+### Hex-map renderer
 
 In `hex_map/index.html`:
 
-- update `renderAqiBands` or equivalent so each row ending at `n` draws from `n - 1 hour` to `n`;
-- clip rectangles to the chart domain;
-- do not create a rectangle for a missing index value;
+- draw endpoint `n` from `n - 1 hour` to `n`;
+- clip the rectangle to the chart domain;
+- do not draw an index rectangle when that index value is null;
+- preserve DAQI and European AQI independently;
+- remove AQI carry-forward across missing endpoints;
+- leave each missing represented hour blank;
+- ensure the final coloured edge ends at the final endpoint;
+- preserve the intentionally selected DAQI colour ordering;
+- preserve legends, tooltips, range controls and concentration rendering.
+
+The no-fill change applies only to AQI bands. Do not alter unrelated concentration-series behaviour.
+
+### Sensors renderer
+
+In `sensors/index.html`:
+
+- apply the same `n - 1 hour` to `n` geometry;
+- apply the same clipping and missing-hour behaviour;
 - preserve independent DAQI and European AQI rows;
-- leave a missing hour blank;
-- ensure the final colour ends at the final AQI endpoint and does not extend one hour beyond the concentration line;
-- preserve the current DAQI colour ordering intentionally chosen for the website;
-- preserve tooltip, legend, range selector and observation rendering behaviour.
+- correct older/head boundary checks so endpoint ownership follows `S < n <= E`;
+- preserve unrelated chart and page behaviour.
 
-### Sensors station chart
+### Browser and local caches
 
-Apply the same interval correction in `sensors/index.html`.
+Review serialised AQI state:
 
-The two implementations must use the same endpoint semantics and missing-hour behaviour.
+- version or invalidate only affected state that would otherwise reinterpret old ambiguous timestamps;
+- do not clear unrelated state;
+- keep endpoint identity unambiguous;
+- do not introduce permanent dual semantics.
 
-Do not fix only one chart.
+## Pre-deployment structural validation
 
-### Browser or local cache compatibility
+Only verify:
 
-Review any serialised station-history cache or local state:
+- changed JavaScript parses;
+- all three parsers use the documented endpoint priority;
+- compact decoding follows `columns`;
+- both renderers derive start as endpoint minus one hour;
+- no-fill code path does not carry AQI into a missing endpoint;
+- cache shape is structurally isolated where changed.
 
-- version or invalidate only if the normalised AQI point shape changes and stale stored rows would be interpreted incorrectly;
-- do not clear unrelated website state;
-- do not introduce permanent dual timestamp interpretation;
-- do not add v1-specific fallbacks.
-
-## Focused checks
-
-Before deployment, use only:
-
-- syntax checks for changed JavaScript;
-- the existing focused loader test where available;
-- one deterministic loader check for endpoint normalisation;
-- one deterministic renderer-boundary check for each renderer;
-- one missing-hour check;
-- one independent DAQI-null and European-AQI-valid check.
-
-Do not add browser automation or a broad website suite before TEST deployment.
-
-## Mandatory system-doc check
-
-Before completing the phase, compare the website diff with all applicable mandatory behaviour in `system_docs/aqi-levels/`, especially the contract, interfaces, decision 0001 and validation acceptance criteria.
+Functional visual validation occurs after deployment on TEST.
 
 ## Phase 2 acceptance
 
-- both charts draw endpoint `07:00` from `06:00` to `07:00`;
-- neither chart colours `07:00` to `08:00` from that row;
-- the final coloured edge aligns with the final plotted value;
-- a missing endpoint produces a blank hour;
+- both charts derive `06:00` to `07:00` from endpoint `07:00`;
+- neither chart draws `07:00` to `08:00` from that row;
+- the final coloured edge aligns with the final endpoint;
+- a missing endpoint leaves a blank represented hour;
 - valid European AQI remains visible when DAQI is null;
+- both direct parsers and the shared loader agree;
 - older chunks cannot replace the stable head;
-- existing observation chart behaviour is unchanged;
-- no v1-specific behaviour was added;
-- the diff conforms to the mandatory AQI system documentation.
+- observation-chart behaviour is unchanged;
+- no v1-specific behaviour is added;
+- system-document compliance is reported.
 
 ## Codex prompt for Phase 2
 
@@ -619,204 +606,140 @@ Before completing the phase, compare the website diff with all applicable mandat
 Implement Phase 2 of the AQI Display correction plan in TEST-uk-aq/TEST-uk-aq-root.github.io.
 
 Read:
-- the complete plan in the ops repository
-- every file under ops/system_docs/aqi-levels/
-- the completed Phase 1 v2 response contract and deployment notes
+- the complete plan in TEST-uk-aq/uk-aq-ops
+- every file under uk-aq-ops/system_docs/aqi-levels/
+- the deployed Phase 1 response and cache contract
 
 Scope:
-- active v2 station-history response only
+- active R2 v2 station-history website path only
 - v1 is out of scope
 
-Goal:
-Make every active website AQI consumer use the explicit hour-ending endpoint and render each DAQI and European AQI band over (n-1h,n].
-
-Required files include:
+Update:
 - station-history-loader.js
 - hex_map/index.html
 - sensors/index.html
-- only their focused tests or fixtures and directly related cache-shape versioning
+- only narrowly related existing fixtures and affected cache-shape markers
 
-Requirements:
-- prefer period_end_utc
-- use timestamp_hour_utc as canonical endpoint fallback where present
-- keep only the minimum temporary fallback needed for the old deployed v2 response
-- do not add v1 compatibility
-- normalise explicit period start and end values
-- merge AQI identity by endpoint
-- retain stable-head precedence over older chunks
-- draw x1=n-1h and x2=n
-- clip to chart range
-- leave missing hours blank
-- keep DAQI and European AQI independent
-- preserve current website DAQI colours, legends, tooltip behaviour and observation chart behaviour
-- correct both active chart implementations
+Every parser, including the direct parsers in both HTML pages, must use:
+1. period_end_utc
+2. timestamp_hour_utc
+3. temporary legacy period_start_utc fallback
 
-Do not:
-- change AQI calculation or breakpoints
-- forward-fill or interpolate gaps
-- change unrelated layout or map behaviour
-- introduce a new public API route
-- run broad browser automation before deployment
+Decode compact arrays from response columns metadata.
 
-Use only narrow pre-deployment checks:
-- JavaScript syntax
-- focused loader test
-- 07:00 endpoint renders 06:00-07:00 in both charts
-- no colour after final endpoint
-- missing 08:00 remains blank
-- European AQI remains visible when DAQI is null
+Render endpoint n from n-1h to n in both charts. Clip to the chart range. Preserve DAQI and European AQI independently. Remove AQI carry-forward in the hex-map chart so a missing endpoint remains blank. Do not alter unrelated concentration-series behaviour.
 
-Functional testing happens after deployment on TEST through the real website.
+Preserve website colours, legends, tooltips, controls, observation rendering and stable-head precedence.
 
-Before finishing, compare the full diff against the applicable mandatory requirements in ops/system_docs/aqi-levels/ and include a pass/fail compliance table.
+Do not change AQI calculations, APIs, R2 data, v1 or unrelated layout.
 
-Return:
-1. changed files;
-2. old and new timestamp normalisation behaviour;
-3. focused checks run;
-4. system-doc compliance result;
-5. exact TEST visual checks;
-6. any temporary compatibility fallback that remains.
+Before implementation, validate structural viability only. After implementation, run JavaScript syntax checks and inspect parser, renderer and cache shapes. Functional testing happens after deployment through the real TEST website.
+
+Compare the final diff against applicable mandatory requirements in system_docs/aqi-levels/ and report pass or fail compliance.
+
+Return changed files, old and new normalisation, direct-parser changes, no-fill change, cache decision, structural checks, system-doc compliance and TEST deployment notes.
 ```
 
 ---
 
-# Phase 3: correct v2 endpoint selection, gaps and chunk boundaries
+# Phase 3: correct v2 endpoint selection, gaps, coverage and chunks
 
 ## Objective
 
-Correct the underlying active v2 range semantics so the right AQI rows are returned, not merely drawn differently.
+Correct the active v2 range semantics so the right endpoint rows are returned and described, not merely drawn differently.
 
-This phase deploys after the website can consume explicit endpoint fields.
+This phase follows deployment of the explicit endpoint-aware website.
 
 ## Required implementation
 
 ### Narrow endpoint helpers
 
-Create or centralise narrowly scoped helpers in the active v2 ops AQI read path for:
+Create or centralise narrowly scoped v2 helpers for:
 
 - canonical endpoint parsing;
-- true period-start derivation;
-- expected endpoint generation for represented interval `S` to `E`;
-- endpoint-in-range predicate `S < n <= E`;
-- conversion between represented interval boundaries and any start-inclusive or end-exclusive source query required internally.
+- true start derivation;
+- endpoint selection predicate `S < n <= E`;
+- expected endpoint generation;
+- represented missing-interval generation;
+- translation to any source query that internally requires inclusive-start or exclusive-end mechanics.
 
-Avoid multiple slightly different implementations across the v2 API and station-history code.
+Avoid a broad date utility refactor. Do not modify v1 helpers.
 
-Do not create a broad date utility refactor and do not modify v1 helpers.
+### AQI History R2 API
 
-### Station-history on-the-fly filtering
-
-Correct AQI output filtering so represented interval requests select:
-
-```text
-startMs < timestamp_hour_utc <= endMs
-```
-
-Retain the 23 preceding endpoint hours required for PM context.
-
-Do not shift source observations or rolling-window endpoints.
-
-### Expected endpoints and gaps
-
-Replace start-labelled expected-hour logic for AQI with endpoint-aware generation.
-
-Correct:
-
-- expected endpoint lists;
-- `missingAqiHourRanges` or equivalent;
-- stable-head completeness;
-- history-chunk completeness;
-- seam-gap detection;
-- actual start and end diagnostics where they currently imply forward coverage;
-- latest v2 R2 AQI coverage end so an endpoint `n` does not falsely claim coverage through `n + 1 hour`.
-
-Gap ranges returned to consumers should describe represented missing intervals clearly.
-
-### v2 AQI History R2 API range selection
-
-Correct v2 row selection and day-partition enumeration for represented intervals:
+Correct the active v2 path in `worker.mjs`:
 
 - exclude endpoint `S`;
 - include endpoint `E`;
-- include the endpoint-day v2 partition at midnight;
-- keep `since_utc` semantics explicitly documented and consistent;
-- preserve row limits, ordering and source-coverage diagnostics;
-- preserve R2 v2 precedence;
-- preserve required-index and bounded-scan behaviour.
+- include the endpoint-day partition when `E` is midnight;
+- correct recent or live-row filtering to the same endpoint contract;
+- correct expected endpoint and gap calculations;
+- document and retain deliberate `since_utc` semantics;
+- retain ordering, row limits, diagnostics, R2 precedence, scan budgets and required-index behaviour;
+- make `period_start_utc = period_end_utc - 1 hour` in the final corrected contract;
+- retain `period_end_utc` and `timestamp_hour_utc`.
 
-Where an internal parquet filter or recent-source query uses start-inclusive or end-exclusive mechanics, translate the represented interval deliberately rather than changing stored values.
+### Station-history stable head
 
-### History chunks
+Correct:
 
-Correct older AQI chunk boundaries so adjacent chunks:
+- canonical expected endpoints;
+- AQI output filtering;
+- PM context retention of the 23 preceding endpoints plus `n`;
+- stable-head completeness;
+- R2/live merge boundaries;
+- source coverage diagnostics;
+- latest R2 coverage end so endpoint `n` does not claim coverage to `n + 1 hour`.
 
-- have no duplicated represented hour;
-- have no omitted represented hour;
-- remain newest-first by cursor and ascending within each returned chunk;
-- end at or before the stable-head represented boundary;
-- retain immutable or mutable cache classification.
+### Older AQI chunks
 
-Observation chunk semantics must remain unchanged.
+Correct `history_chunks.mjs` so:
 
-### Response contract finalisation
+- requested represented range uses `S < n <= E`;
+- adjacent chunks omit no represented hour;
+- adjacent chunks duplicate no represented hour;
+- rows are ascending within a chunk;
+- cursors extend backwards only;
+- older chunks do not replace stable-head rows;
+- mutable and immutable classifications remain;
+- missing endpoint intervals and partial reasons are accurate;
+- observation chunk semantics remain unchanged.
 
-After the website consumes the explicit endpoint:
+### Cache finalisation
 
-- make `period_start_utc` the true start in the selected v2 response contract;
-- retain `period_end_utc` as the canonical endpoint;
-- keep `timestamp_hour_utc` where useful for internal or debug compatibility;
-- remove or deprecate any temporary ambiguous alias according to the Phase 0 compatibility decision;
-- version cache keys or response markers only where required.
+Keep the mandatory `aqi_hour_interval_v2` contract and cache identity.
 
-### R2 v2 writer and storage
+Remove or deprecate only temporary ambiguous aliases that the Phase 1 and Phase 2 rollout no longer requires.
 
-No changes are expected or permitted under this plan.
+Do not merge corrected responses into old cache identity.
 
-The phase may read v2 partitions differently, but it must not change:
+## Pre-deployment structural validation
 
-- stored endpoint rows;
-- parquet content;
-- partition names;
-- manifests;
-- indexes;
-- metadata;
-- Prune Daily;
-- history repair or backfill tooling.
+Only verify:
 
-Do not edit v1.
+- endpoint helper predicates and loops encode `S < n <= E`;
+- midnight enumeration includes `E`'s endpoint day;
+- PM context count remains structurally 24 endpoints;
+- chunk cursor equations are adjacent without overlap or omission;
+- response fields and compact columns remain aligned;
+- cache identity retains the corrected contract;
+- v1 branches remain untouched.
 
-## Focused checks
-
-Before deployment, run only narrow deterministic checks for:
-
-- `S < n <= E` endpoint selection;
-- 23 preceding PM context hours plus the current endpoint;
-- no duplicate or missing endpoint across adjacent chunks;
-- midnight endpoint included from the v2 endpoint-day partition;
-- one missing-endpoint gap interval;
-- R2 v2 and live overlap still retains R2;
-- v2 compact and object response-field consistency;
-- v1 unchanged where shared helpers were touched.
-
-Do not run broad integration suites before deployment.
-
-## Mandatory system-doc check
-
-Compare the complete Phase 3 diff with every file under `system_docs/aqi-levels/`. Report each mandatory retained function as pass or fail before deployment.
+Functional boundary and continuity testing happens after deployment on TEST.
 
 ## Phase 3 acceptance
 
-- represented range requests return exactly the required v2 endpoint rows;
-- the final endpoint is included;
-- the initial pre-range endpoint is excluded;
-- midnight requests include the proper v2 endpoint-day partition;
-- gap and completeness reporting matches represented intervals;
-- adjacent chunks are continuous without duplication;
-- stored R2 v2 timestamps and objects remain unchanged;
-- R2 v2 and live precedence remains unchanged;
-- v1 remains unchanged;
-- the diff conforms to all mandatory AQI system documentation.
+- represented ranges return the exact required endpoint rows;
+- final endpoint `E` is included;
+- endpoint `S` is excluded;
+- midnight endpoint is read from the endpoint-day partition;
+- gap and completeness output describes represented intervals correctly;
+- adjacent chunks have no omission or duplication;
+- stable-head rows remain authoritative over older chunks;
+- R2 v2 remains authoritative over live rows;
+- stored R2 v2 data is unchanged;
+- v1 is unchanged;
+- system-document compliance is reported.
 
 ## Codex prompt for Phase 3
 
@@ -826,75 +749,44 @@ Compare the complete Phase 3 diff with every file under `system_docs/aqi-levels/
 Implement Phase 3 of plans/2026-07-17 AQI Display correction/AQI Display correction plan.md in TEST-uk-aq/uk-aq-ops.
 
 Prerequisites:
-- Phase 1 explicit v2 endpoint contract is deployed on TEST
-- Phase 2 website supports period_end_utc and renders (n-1h,n]
+- Phase 1 explicit endpoint and aqi_hour_interval_v2 cache contract are deployed
+- Phase 2 website consumes period_end_utc and renders (n-1h,n]
+- UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true is intended for TEST
 
-Read the full plan and every file under system_docs/aqi-levels/ first.
+Read the complete plan and every file under system_docs/aqi-levels/ first.
 
 Scope:
-- active R2 AQI history v2 read and station-history paths only
-- v1 is out of scope and must remain unchanged
-- R2 v2 data, writer, parquet, manifests, indexes and metadata must remain unchanged
+- active R2 AQI history v2 API and station-history paths
+- v1 remains untouched
+- R2 v2 storage, writers, parquet, manifests, indexes, metadata, prefixes and schema remain unchanged
 
-Goal:
-Correct active v2 AQI range selection, expected endpoint, gap, coverage and history-chunk semantics to use represented interval S..E => endpoints S < n <= E.
+Update the affected v2 logic in:
+- workers/uk_aq_aqi_history_r2_api_worker/worker.mjs
+- workers/uk_aq_station_history/src/stable_head.mjs
+- workers/uk_aq_station_history/src/index.mjs
+- workers/uk_aq_station_history/src/history_chunks.mjs
+- narrowly related v2 helpers, existing fixtures and READMEs
+- cache files only where needed to retain the final aqi_hour_interval_v2 identity
 
-Review and update only:
-- workers/uk_aq_station_history/
-- the active v2 branch of workers/uk_aq_aqi_history_r2_api_worker/
-- narrowly scoped shared endpoint helpers where structurally necessary
-- focused tests and Worker READMEs
-- cache proxy only if final v2 response marker or cache versioning requires it
+Required semantics:
+- timestamp_hour_utc=n
+- period_end_utc=n
+- period_start_utc=n-1h
+- represented request S..E selects S < n <= E
+- PM DAQI context uses n-23h through n
+- midnight endpoint E is read from E's endpoint-day partition
+- adjacent older AQI chunks neither omit nor duplicate a represented hour
+- endpoint n never claims coverage after n
 
-Requirements:
-- centralise narrow v2 endpoint helpers rather than duplicate off-by-one logic
-- retain 23 preceding PM endpoint hours for 24-hour DAQI context
-- select output endpoints with start < n <= end
-- fix expected endpoints and missing AQI interval reporting
-- fix stable-head and older-chunk completeness
-- ensure adjacent AQI chunks neither duplicate nor omit a represented hour
-- include midnight endpoint E from E's v2 endpoint-day partition
-- stop claiming coverage to n+1h from a row ending at n
-- make period_start_utc a true start in the final v2 contract
-- retain period_end_utc as endpoint
-- preserve R2-over-live precedence, scan budgets, required-index behaviour, partial responses and observation semantics
+Preserve R2-over-live precedence, partial responses, scan budgets, required indexes, observations, routes, auth, CORS and unrelated TTLs.
 
-Do not:
-- edit or fix v1
-- shift or rewrite stored R2 v2 timestamps
-- change Prune Daily
-- change v2 parquet, manifests, indexes or metadata
-- change breakpoint or calculation formulas
-- change raw observations
-- reactivate daily or monthly roll-ups
-- modify observation range semantics unless required to prevent accidental coupling
-- broaden scans when indexes are missing
-- refactor unrelated time utilities
+Do not change v1, calculations, Prune Daily, R2 objects, manifests, indexes, metadata, schema or inactive roll-ups.
 
-Before implementation, validate structural viability only.
+Before implementation, validate structural viability only. After implementation, run syntax or type checks and inspect boundary, chunk and response shapes. Functional testing happens after deployment on TEST.
 
-Run narrow checks for:
-- endpoint selection boundaries
-- PM context
-- midnight v2 partition
-- one missing-endpoint gap
-- adjacent chunk continuity
-- R2 v2/live precedence
-- compact/object field consistency
-- v1 unchanged where shared code was touched
+Compare the final diff against every mandatory requirement in system_docs/aqi-levels/ and report pass or fail compliance.
 
-Do not run broad suites or external functional tests. Deploy to TEST for functional validation.
-
-Before finishing, compare the full diff against every mandatory requirement in system_docs/aqi-levels/ and include a pass/fail compliance table.
-
-Return:
-1. changed files;
-2. endpoint helper and range translation design;
-3. exact old and new boundary behaviour;
-4. confirmation that v1 and R2 v2 stored data are unchanged;
-5. focused checks run;
-6. system-doc compliance result;
-7. TEST deployment and validation sequence.
+Return changed files, helper and range design, old and new boundaries, cache finalisation, confirmation that v1 and R2 v2 storage are unchanged, structural checks, system-doc compliance and deployment sequence.
 ```
 
 ---
@@ -903,143 +795,164 @@ Return:
 
 ## Objective
 
-Validate the coordinated v2 correction through real TEST operations rather than expanding pre-deployment test coverage.
+Validate the coordinated correction through real TEST operations, including the enabled station-history AQI route.
 
 ## Deployment order
 
-Use the compatibility strategy confirmed in Phase 0:
-
-1. deploy Phase 1 additive v2 endpoint contract;
-2. verify the old website remains functional;
-3. deploy Phase 2 website endpoint-aware loader and renderers;
-4. verify the website works with the additive Phase 1 v2 response;
-5. deploy Phase 3 finalised v2 range and period-start semantics;
-6. allow normal cache expiry or version only affected cache entries;
-7. validate recent and historical v2 chart paths.
+1. ensure `UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true` exists as a repository variable;
+2. deploy the cache proxy so the variable reaches the Worker;
+3. deploy Phase 1 additive endpoint and cache contract;
+4. confirm the old website remains functional;
+5. deploy Phase 2 website parser and renderer changes;
+6. confirm the website uses the explicit endpoint;
+7. deploy Phase 3 final range, start, coverage and chunk semantics;
+8. allow affected old caches to expire or rely on the mandatory version isolation;
+9. exercise recent, stable-head and progressive older-history paths.
 
 No Prune Daily deployment or R2 v2 data operation is required.
 
-Do not combine all repositories into one unobservable deployment unless Phase 0 proves there is an atomic deployment mechanism.
+Keep deployments observable and independently reversible.
 
-## Required real TEST checks
+## Required runtime evidence
 
-### v2 source confirmation
+### Routing and v2 source
 
-For every API and chart check, record evidence that the response uses the active v2 path.
+Record evidence that:
+
+- the deployed cache Worker received `UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true`;
+- a progressive older AQI request routed through `uk-aq-station-history-test`;
+- the private station-history Worker called the AQI History R2 API;
+- the response used R2 history v2;
+- `/v1/aqi-history` remained private behind the Service Binding where intended.
 
 Do not use v1 responses as acceptance evidence.
 
-### Known single-hour display
+### Single endpoint geometry
 
-Use a station with a clear final AQI endpoint `n`.
+In both chart implementations, confirm endpoint `n`:
 
-Confirm in both website chart implementations:
+- is associated with the concentration point at `n`;
+- starts DAQI colour at `n - 1 hour`;
+- ends DAQI colour at `n`;
+- starts European AQI colour at `n - 1 hour`;
+- ends European AQI colour at `n`;
+- produces no colour after `n`.
 
-- the concentration point is at `n`;
-- DAQI colour starts at `n - 1 hour`;
-- DAQI colour ends at `n`;
-- European AQI colour starts at `n - 1 hour`;
-- European AQI colour ends at `n`;
-- no colour appears after `n`.
+### Range boundaries
 
-### Missing-hour display
+For a represented request `S` to `E`, confirm:
 
-Use or identify a range containing a genuinely missing AQI endpoint.
+- endpoint `S` is excluded;
+- the first returned endpoint colours the first represented hour;
+- endpoint `E` is included;
+- no row claims coverage beyond `E`.
+
+### Midnight endpoint
+
+Use a range ending or crossing UTC midnight.
+
+Confirm endpoint `00:00`:
+
+- is returned;
+- comes from the endpoint-day v2 partition where R2 is used;
+- colours `23:00` to `00:00`;
+- does not colour `00:00` to `01:00`.
+
+### Missing endpoint and no-fill
+
+Use a real range with a missing AQI endpoint or a narrowly controlled TEST condition.
 
 Confirm:
 
 - the represented missing hour is blank;
-- the previous colour does not extend forward;
-- the next colour does not extend backwards;
-- the v2 response reports the corresponding gap and is not cached as complete.
+- the preceding AQI is not carried forward;
+- a later AQI is not extended backwards;
+- DAQI and European AQI remain independent;
+- the response is partial and non-cacheable where required.
 
 ### PM incomplete DAQI
 
-Use a recent PM range with fewer than 24 rolling hours where available.
-
-Confirm:
+Confirm a recent PM case where fewer than 24 valid endpoint hours are available:
 
 - DAQI is null with `insufficient_samples`;
 - European AQI remains present when the hourly mean is valid;
-- the European AQI band uses the correct hour-ending interval.
+- the European AQI band uses the correct represented hour.
 
-### R2 v2 and live seam
-
-Use a range spanning committed R2 v2 and recent live-calculated AQI.
+### R2/live seam
 
 Confirm:
 
-- there is no omitted or duplicated hour at the seam;
-- R2 v2 wins in overlap;
-- mismatch diagnostics remain visible if a difference exists;
-- the final endpoint is not extended forward.
+- there is no omitted or duplicated represented hour;
+- R2 v2 wins at overlapping endpoints;
+- mismatch diagnostics remain visible;
+- the seam does not extend the final endpoint forward.
 
-### Older chunk boundary
+### Progressive older chunks
 
-Load enough history to fetch at least two AQI chunks.
+Load at least two older AQI chunks and confirm:
 
-Confirm:
-
+- progressive requests use the station-history AQI route;
 - chunks extend backwards only;
-- the boundary hour appears exactly once;
+- boundary endpoints occur exactly once;
 - stable-head rows are not replaced;
-- visual colours remain continuous only where endpoint rows are continuous.
+- visual continuity appears only where endpoint rows are continuous.
 
-### Midnight boundary
-
-Use a chart range crossing UTC midnight.
-
-Confirm the row ending at `00:00`:
-
-- is returned through the v2 read path;
-- comes from the `00:00` v2 endpoint-day partition where R2 history is used;
-- colours `23:00` to `00:00`;
-- is not assigned to `00:00` to `01:00`;
-- is not omitted from the end of the preceding represented day.
-
-### R2 v2 immutability confirmation
-
-Confirm that the correction caused no changes to:
-
-- v2 parquet object hashes or etags;
-- v2 manifest hashes or etags;
-- v2 index hashes or etags;
-- v2 timeseries metadata;
-- Prune Daily configuration or output behaviour.
-
-A full bucket inventory is not required. Use bounded evidence for the affected days and timeseries.
-
-### Compatibility and unrelated behaviour
+### Cache contract
 
 Confirm:
 
-- observation lines, tooltips and units remain correct;
+- responses expose `aqi_hour_interval_v2`;
+- cache diagnostics or keys show corrected contract isolation;
+- old ambiguous responses are not served under the new interpretation;
+- partial responses are not cached as complete;
+- unrelated cache profiles and TTLs are unchanged.
+
+### R2 v2 immutability
+
+Use bounded evidence for affected dates and timeseries to confirm no rewrite of:
+
+- v2 parquet objects;
+- manifests;
+- indexes;
+- timeseries metadata;
+- stored timestamps.
+
+Also confirm:
+
+- Prune Daily code, configuration and output behaviour are unchanged;
+- shared AQI calculation code is unchanged;
+- v1 code and deployment are unchanged.
+
+A full bucket inventory is not required.
+
+### Unrelated behaviour
+
+Confirm:
+
+- concentration lines, units and tooltips remain correct;
 - DAQI and European AQI colours and legends remain unchanged;
-- station search, chart-range controls and older-history loading still work;
-- partial responses remain non-cacheable;
-- private Worker routes remain private;
-- no new errors appear in Worker, cache-proxy or browser logs;
-- no v1 code or deployment was changed.
+- station search and range controls work;
+- private routes remain private;
+- no new Worker, cache-proxy or browser errors appear.
 
 ## Rollback
 
-If Phase 1 causes compatibility issues, roll back the additive v2 ops deployment only. Stored R2 data is unaffected.
+- Phase 1 issue: roll back the additive API, station-history and cache-contract deployment together.
+- Phase 2 issue: roll back the website while retaining the additive explicit endpoint response.
+- Phase 3 issue: roll back the final range and period-start changes while retaining Phase 1 fields.
+- Routing issue: set `UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=false` and redeploy the cache proxy.
 
-If Phase 2 causes rendering issues, roll back the website while retaining the additive endpoint fields in v2 ops.
-
-If Phase 3 causes range or completeness issues, roll back the final v2 range change while the website continues using the explicit endpoint from Phase 1.
-
-Do not roll back by rewriting R2 timestamps or modifying v1.
-
-Keep each phase deployable and reversible independently.
+Never roll back by rewriting R2 timestamps or modifying v1.
 
 ## Phase 4 acceptance
 
 The correction is complete only when:
 
-- all applicable acceptance criteria in `system_docs/aqi-levels/validation.md` pass through the real TEST v2 path;
-- bounded evidence confirms R2 v2 stored data and metadata are unchanged;
-- v1 is unchanged and was not used as acceptance evidence.
+- all applicable acceptance criteria in `system_docs/aqi-levels/validation.md` pass through real TEST v2 operation;
+- progressive older AQI requests demonstrably use station-history;
+- the corrected cache contract is isolated;
+- bounded evidence confirms R2 v2 data and metadata are unchanged;
+- v1 remains unchanged and is not used as acceptance evidence.
 
 ## Codex prompt for Phase 4 review
 
@@ -1048,90 +961,69 @@ The correction is complete only when:
 ```text
 Perform the Phase 4 post-deployment review for the AQI Display correction on TEST.
 
-Do not make code changes initially. Use the deployed TEST v2 services, real v2 API responses and both website chart implementations.
+Read the complete plan, every file under system_docs/aqi-levels/ and deployment notes from Phases 1 to 3.
 
-Read:
-- the complete plan
-- every file under system_docs/aqi-levels/
-- deployment notes from Phases 1-3
-
-Scope:
-- validate R2 AQI history v2 only
-- v1 is out of scope and must not be used as acceptance evidence
-- no Prune Daily or R2 data change is expected
+Do not change code initially. Use real TEST API requests, the website, Worker diagnostics and bounded R2 metadata evidence.
 
 Validate:
-1. evidence confirms each tested response uses v2;
-2. one endpoint n draws only n-1h to n in both charts;
-3. no colour extends beyond the final concentration endpoint;
-4. a missing endpoint leaves one blank represented hour;
-5. PM DAQI can be insufficient while European AQI remains visible;
-6. the R2 v2/live seam has no omission or duplicate and R2 wins overlap;
-7. older chunks extend backwards without replacing stable head;
-8. midnight endpoint 00:00 is returned from the v2 endpoint-day partition and colours 23:00-00:00;
-9. partial responses remain partial and non-cacheable;
-10. unrelated observations, colours, legends, tooltips, range controls and private routing remain unchanged;
-11. bounded object evidence confirms v2 parquet, manifests, indexes and metadata were not rewritten;
-12. v1 code and deployment remain unchanged;
-13. all applicable mandatory requirements in system_docs/aqi-levels/ pass.
+1. UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true reached the deployed cache Worker.
+2. A progressive older AQI request routes through uk-aq-station-history-test and then the AQI History R2 API.
+3. Responses use R2 history v2 and expose aqi_hour_interval_v2.
+4. Endpoint n renders only n-1h to n in both charts.
+5. S < n <= E holds at first and final range boundaries.
+6. Midnight endpoint 00:00 comes from the endpoint-day v2 partition and colours 23:00-00:00.
+7. A missing endpoint remains blank with no AQI carry-forward.
+8. DAQI and European AQI remain independent.
+9. The R2 v2/live seam has no omission or duplication and R2 wins overlap.
+10. At least two older AQI chunks extend backwards without replacing the stable head.
+11. Partial responses remain partial and non-cacheable.
+12. Old ambiguous cache identity cannot serve under the corrected contract.
+13. Unrelated chart, route, auth, CORS and cache behaviour remains unchanged.
+14. Bounded evidence confirms v2 parquet, manifests, indexes, metadata and stored timestamps were not rewritten.
+15. Prune Daily, shared AQI calculation and v1 remain unchanged.
+16. All mandatory system_docs/aqi-levels/ requirements pass.
 
-Capture exact request ranges, endpoint timestamps, source modes, completeness fields and bounded screenshots or log excerpts needed to support each conclusion. Do not expose secrets.
+Capture exact ranges, endpoints, source modes, headers, completeness fields and bounded screenshots or log excerpts. Do not expose secrets.
 
-If a defect is found, classify it as:
-- v2 API projection
-- v2 endpoint selection
-- gap or completeness
-- chunk boundary
-- v2 R2 partition read
-- live calculation context
-- website normalisation
-- renderer geometry
-- cache compatibility
+If a defect is found, classify it narrowly as API projection, endpoint selection, gap/completeness, stable head, chunk boundary, v2 partition read, live context, website normalisation, renderer geometry, no-fill, routing or cache compatibility.
 
-Recommend the narrowest rollback or correction. Do not rewrite R2 v2 timestamps, edit v1 or broaden the scope without evidence.
-
-Return:
-- a pass/fail table against the documented acceptance criteria;
-- a system-doc compliance table;
-- confirmation that R2 v2 stored data and v1 are unchanged;
-- any precise follow-up changes required.
+Return pass or fail tables for acceptance and system-document compliance, evidence that R2 v2 data and v1 are unchanged, and any narrow follow-up required.
 ```
 
 ---
 
-# Phase 5: optional removal of temporary compatibility code
+# Phase 5: optional compatibility cleanup
 
 ## Objective
 
-Remove only temporary v2 transition code that is no longer needed after the final contract has operated successfully on TEST.
+Remove only temporary v2 transition code after the final contract has operated successfully on TEST.
 
 This phase is optional and must not happen merely for tidiness.
 
 ## Preconditions
 
-- Phase 4 acceptance criteria pass;
-- caches carrying the ambiguous old v2 response have expired or are isolated by contract version;
-- no active website consumer depends on the ambiguous field meaning;
-- logs show no old-contract requests during a reasonable TEST observation period;
+- Phase 4 passes;
+- caches carrying old ambiguous responses have expired or are contract-isolated;
+- no active website consumer relies on `period_start_utc` as an endpoint;
+- relevant TEST logs show no old-contract use during a reasonable observation period;
 - rollback evidence is retained.
 
 ## Allowed cleanup
 
-- remove temporary fallback that treats ambiguous `period_start_utc` as an endpoint;
-- remove a temporary v2 response alias only where the compatibility decision explicitly permits it;
-- simplify focused tests to the final v2 contract;
-- update Worker READMEs and AQI system docs to mark implementation discrepancies resolved;
-- record the deployed v2 response contract and completion date.
+- remove the temporary fallback that interprets legacy `period_start_utc` as an endpoint;
+- remove a temporary response alias only where the compatibility decision permits it;
+- retain `period_end_utc`, `timestamp_hour_utc` and `aqi_hour_interval_v2`;
+- update focused documentation and existing fixtures;
+- record the deployed contract and completion date.
 
 ## Prohibited cleanup
 
-- removing `period_end_utc`;
 - removing canonical endpoint information;
 - editing v1;
 - deleting or rewriting R2 v2 history;
-- changing v2 manifests, indexes or metadata;
-- changing cache, route or authentication behaviour unrelated to the transition;
-- activating daily or monthly roll-ups;
+- changing manifests, indexes or metadata;
+- changing unrelated cache, route or authentication behaviour;
+- activating inactive roll-ups;
 - broad refactoring.
 
 ## Codex prompt for Phase 5
@@ -1141,32 +1033,28 @@ This phase is optional and must not happen merely for tidiness.
 ```text
 Review whether Phase 5 cleanup is justified for the AQI Display correction.
 
-Read the full plan, Phase 4 validation report and every file under system_docs/aqi-levels/.
+Read the full plan, Phase 4 validation evidence and every file under system_docs/aqi-levels/.
 
-Scope:
-- final v2 compatibility cleanup only
-- v1 and R2 v2 stored data remain out of scope
+Do not edit unless all preconditions are proven:
+- the corrected v2 contract passed TEST validation
+- old ambiguous caches are expired or version-isolated
+- no active consumer relies on period_start_utc as an endpoint
+- relevant logs show no old-contract use
 
-First determine whether every precondition is proven:
-- final v2 contract passed TEST validation
-- old ambiguous cached responses are expired or version-isolated
-- no active consumer relies on ambiguous period_start_utc-as-endpoint behaviour
-- no old-contract requests remain in relevant logs
+If evidence is incomplete, report what is missing and make no changes.
 
-If any precondition is not proven, do not edit code. Return what evidence is missing.
+If proven, remove only temporary v2 compatibility code. Retain:
+- timestamp_hour_utc=n
+- period_end_utc=n
+- period_start_utc=n-1h
+- aqi_hour_interval_v2
+- S < n <= E
 
-If all preconditions are proven, remove only temporary v2 compatibility code and update focused documentation or tests to the final contract:
-- period_start_utc is true start
-- period_end_utc is endpoint
-- represented range S..E uses S < n <= E
+Do not edit v1 or touch R2 v2 data, writers, manifests, indexes, metadata, calculations, inactive roll-ups, routes, auth, unrelated cache policy or unrelated website code.
 
-Do not edit v1. Do not touch R2 v2 data, writers, manifests, indexes, metadata, calculations, inactive roll-ups, routes, auth, unrelated cache policy or unrelated website code.
+Use syntax or type checks only before deployment. Functional confirmation remains on TEST.
 
-Use only syntax or type checks and the smallest focused contract tests before deployment. Functional confirmation remains on TEST.
-
-Before finishing, compare the diff with every mandatory requirement in system_docs/aqi-levels/ and include a pass/fail compliance table.
-
-Return changed files, removed temporary behaviour, retained permanent fields, system-doc compliance and final TEST checks.
+Compare the final diff against every mandatory system_docs/aqi-levels/ requirement and report pass or fail compliance.
 ```
 
 ---
@@ -1175,14 +1063,15 @@ Return changed files, removed temporary behaviour, retained permanent fields, sy
 
 | Area | Expected change | Must not change |
 |---|---|---|
-| v2 AQI History R2 API | Explicit start/end fields, v2 endpoint-aware ranges and partition reads | R2 v2 stored rows, v1, precedence, scan budgets |
-| Station-history Worker | Endpoint-aware normalisation, gaps, coverage and chunks | Private routing, observation semantics, source precedence |
-| Cache proxy | v2 contract or cache versioning only if required | Route names, auth, CORS, unrelated TTLs |
-| Website loader | Explicit period start/end, endpoint-keyed merge | Stable-head precedence, observation merge, v1-specific logic |
-| Hex map chart | Draw `[n-1h,n]` | Colours, legend, tooltip, observation line |
-| Sensors chart | Draw `[n-1h,n]` | Colours, legend, tooltip, observation line |
-| Shared AQI calculation | Expected to remain unchanged | Breakpoints, averaging formulas, 24-hour PM rule |
-| Prune Daily | Review only | All code, configuration, schedules and output behaviour |
+| v2 AQI History R2 API | Explicit endpoint fields, true start, response marker, endpoint-aware ranges and partitions | Stored R2 v2 rows, v1, precedence, scan budgets |
+| Station-history Worker | Endpoint-aware normalisation, stable head, gaps, coverage and progressive AQI chunks | Private routing, observation semantics, source precedence |
+| Cache proxy | Mandatory `aqi_hour_interval_v2` cache identity for affected AQI paths | Route names, auth, CORS, unrelated TTLs |
+| Website loader | Explicit start/end and endpoint-keyed merge | Observation merge, stable-head precedence |
+| Direct HTML parsers | Endpoint priority and columns-aware compact decoding | Unrelated page parsing |
+| Hex-map chart | Draw `n-1h` to `n`; no AQI carry-forward | Colours, legend, tooltip, concentration series |
+| Sensors chart | Draw `n-1h` to `n`; endpoint-aware head/chunk boundary | Colours, legend, tooltip, concentration series |
+| Shared AQI calculation | Review only | Breakpoints, averaging formulas, 24-hour PM rule |
+| Prune Daily | Review only | Code, configuration, schedules and output |
 | R2 v2 parquet | No change | Rows, timestamps, hashes and partitions |
 | R2 v2 manifests | No change | Hierarchy, bodies, hashes and etags |
 | R2 v2 indexes and metadata | No change | Prefixes, bodies, hashes and etags |
@@ -1193,22 +1082,27 @@ Return changed files, removed temporary behaviour, retained permanent fields, sy
 
 The plan is complete only when:
 
-1. TEST is confirmed to use the v2 AQI history path;
-2. every active v2 AQI producer and consumer uses an unambiguous hour-ending endpoint;
-3. represented interval requests select `S < n <= E`;
-4. both website chart implementations draw `n - 1 hour` to `n`;
-5. the final coloured edge aligns with the final valid concentration endpoint;
-6. missing hours remain blank;
-7. midnight endpoint rows are included from the correct v2 endpoint-day partition;
-8. PM rolling context remains 24 endpoint hours;
-9. European AQI remains independent of PM DAQI completeness;
-10. R2 v2 remains authoritative over live calculation;
-11. chunks have no omitted or duplicated represented hours;
-12. partial responses remain explicit and appropriately non-cacheable;
-13. R2 v2 parquet, manifests, indexes, metadata and stored timestamps remain unchanged;
-14. Prune Daily remains unchanged;
-15. v1 remains unchanged and out of scope;
-16. daily and monthly roll-ups remain inactive;
-17. unrelated website and API behaviour is retained;
-18. every phase reports compliance with the mandatory AQI system documentation;
-19. all functional acceptance checks pass through the real TEST v2 system.
+1. TEST is confirmed at runtime to use R2 v2;
+2. `UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED=true` is deployed;
+3. progressive older AQI requests use the private station-history Worker;
+4. every active AQI producer, wrapper, parser and renderer uses an unambiguous endpoint;
+5. responses expose `aqi_hour_interval_v2`;
+6. affected caches are isolated from old ambiguous rows;
+7. represented requests select `S < n <= E`;
+8. both charts draw `n - 1 hour` to `n`;
+9. missing endpoint hours remain blank without AQI carry-forward;
+10. the final coloured edge aligns with the final endpoint;
+11. midnight endpoints are included from the endpoint-day partition;
+12. PM rolling context remains 24 endpoint hours;
+13. European AQI remains independent of PM DAQI completeness;
+14. R2 v2 remains authoritative over live calculation;
+15. stable-head rows are not replaced by older chunks;
+16. adjacent chunks have no omitted or duplicated represented hours;
+17. partial responses remain explicit and appropriately non-cacheable;
+18. R2 v2 parquet, manifests, indexes, metadata and stored timestamps remain unchanged;
+19. Prune Daily and the shared AQI calculation remain unchanged;
+20. v1 remains unchanged and out of scope;
+21. daily and monthly roll-ups remain inactive;
+22. unrelated website, API, auth and cache behaviour is retained;
+23. every phase reports pass or fail compliance with mandatory AQI system documentation;
+24. all functional acceptance checks pass through real TEST operation.
