@@ -18,6 +18,16 @@ Accepted route aliases:
 - `/` behaves like `/v1/latest-snapshot`
 - `scope=all` is accepted as alias for `network_group=all`
 
+## Snapshot source
+
+Every accepted latest-snapshot request reads the pollutant's physical
+`window=all.json` object. `window=all` is returned directly. The Worker derives
+public `3h`, `6h`, `1d`, and `7d` responses by filtering `last_value_at` at the
+start of the current UTC minute, preserving row order and recalculating the
+window, count, and cursors. Finite response ETags include the source ETag,
+requested window, and effective UTC minute. Old finite objects and v1 objects
+are never fallbacks.
+
 ## Security
 
 All read endpoints require upstream auth header:

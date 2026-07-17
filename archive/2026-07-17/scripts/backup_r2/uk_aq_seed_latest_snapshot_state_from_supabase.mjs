@@ -16,7 +16,10 @@ const DEFAULT_POLLUTANTS = String(process.env.UK_AQ_LATEST_SNAPSHOT_POLLUTANTS |
   .split(",")
   .map((value) => normalizeMatrixPollutant(value))
   .filter(Boolean);
-const PHYSICAL_WINDOW = "all";
+const DEFAULT_WINDOWS = String(process.env.UK_AQ_LATEST_SNAPSHOT_WINDOWS || "3h,6h,1d,7d,all")
+  .split(",")
+  .map((value) => normalizeWindow(value))
+  .filter(Boolean);
 const DEFAULT_STATE_PREFIX = normalizePrefix(
   process.env.UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX || "latest_snapshots_state/v1",
 );
@@ -43,6 +46,7 @@ function usage() {
       `  --rpc <name>                  Default: ${DEFAULT_RPC}`,
       `  --limit-rows <N>              Default: ${DEFAULT_LIMIT_ROWS}`,
       `  --pollutants <csv>            Default: ${DEFAULT_POLLUTANTS.join(",")}`,
+      `  --windows <csv>               Default: ${DEFAULT_WINDOWS.join(",")}`,
       `  --state-key <key>             Default: ${DEFAULT_STATE_KEY}`,
       "  --write-r2                    Write state object to R2 (default: dry-run)",
       "  --report-out <path>           Write JSON report to file",
@@ -50,7 +54,7 @@ function usage() {
       "",
       "Notes:",
       "  - One-off refresh from Supabase latest RPC to rebuild latest_state.json.",
-      "  - Reads the physical all window once per pollutant.",
+      "  - Uses same pollutant/window matrix as legacy latest snapshot flow.",
     ].join("\n"),
   );
 }
@@ -98,6 +102,12 @@ function normalizePollutant(value) {
   return normalized.toLowerCase();
 }
 
+function normalizeWindow(value) {
+  const normalized = normalizeText(value)?.toLowerCase();
+  if (!normalized) return null;
+  return ["3h", "6h", "1d", "7d", "all"].includes(normalized) ? normalized : null;
+}
+
 function toRpcPollutant(matrixPollutant) {
   const normalized = normalizeMatrixPollutant(matrixPollutant);
   if (normalized === "pm25") return "pm2.5";
@@ -124,6 +134,7 @@ function parseArgs(argv) {
     rpc: DEFAULT_RPC,
     limit_rows: DEFAULT_LIMIT_ROWS,
     pollutants: [...DEFAULT_POLLUTANTS],
+    windows: [...DEFAULT_WINDOWS],
     state_key: DEFAULT_STATE_KEY,
     write_r2: false,
     report_out: "",
@@ -164,6 +175,14 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (arg === "--windows") {
+      args.windows = String(argv[i + 1] || "")
+        .split(",")
+        .map((value) => normalizeWindow(value))
+        .filter(Boolean);
+      i += 1;
+      continue;
+    }
     if (arg === "--state-key") {
       args.state_key = normalizePrefix(argv[i + 1] || "");
       i += 1;
@@ -191,6 +210,7 @@ function parseArgs(argv) {
   if (!args.rpc) throw new Error("RPC name resolved empty");
   if (!args.state_key) throw new Error("State key resolved empty");
   if (!args.pollutants.length) throw new Error("Pollutant list resolved empty");
+  if (!args.windows.length) throw new Error("Window list resolved empty");
   return args;
 }
 
@@ -453,7 +473,7 @@ async function main() {
     schema: args.schema,
     rpc: args.rpc,
     pollutants: args.pollutants,
-    window: PHYSICAL_WINDOW,
+    windows: args.windows,
     limit_rows: args.limit_rows,
     matrix_calls: 0,
     matrix_errors: 0,
@@ -480,73 +500,75 @@ async function main() {
   const stateByKey = new Map();
 
   for (const pollutant of args.pollutants) {
-    report.matrix_calls += 1;
-    const rpcResult = await callLatestRpc({
-      supabase_url: args.supabase_url,
-      sb_secret_key: args.sb_secret_key,
-      schema: args.schema,
-      rpc: args.rpc,
-      pollutant: toRpcPollutant(pollutant),
-      window_label: PHYSICAL_WINDOW,
-      limit_rows: args.limit_rows,
-    });
-    report.rpc_response_bytes_total += rpcResult?.meta?.response_bytes || 0;
-    report.rpc_duration_ms_total += rpcResult?.meta?.duration_ms || 0;
-
-    if (rpcResult.error) {
-      report.matrix_errors += 1;
-      report.warnings.push(
-        `rpc_failed pollutant=${pollutant} window=${PHYSICAL_WINDOW} msg=${rpcResult.error.message}`,
-      );
-      continue;
-    }
-
-    const rows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
-    for (const row of rows) {
-      report.rows_scanned += 1;
-      const timeseriesId = Number(row?.id);
-      const connectorId = Number(row?.connector_id);
-      const observedAt = normalizeTimestamp(row?.last_value_at);
-      if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) {
-        report.rows_missing_timeseries_id += 1;
-        continue;
-      }
-      if (!Number.isInteger(connectorId) || connectorId <= 0) {
-        report.rows_missing_connector_id += 1;
-        continue;
-      }
-      if (!observedAt) {
-        report.rows_missing_timestamp += 1;
-        continue;
-      }
-      if (!hasAssignedGeoCode(row)) {
-        report.rows_filtered_no_geo += 1;
-        continue;
-      }
-      if (!passesOutlierThreshold(row)) {
-        report.rows_filtered_outlier += 1;
-        continue;
-      }
-      const valueRaw = row?.last_value;
-      const value = valueRaw === null || valueRaw === undefined ? null : Number(valueRaw);
-      if (value !== null && !Number.isFinite(value)) {
-        report.rows_invalid_value += 1;
-        continue;
-      }
-
-      const applied = applyCandidate(stateByKey, {
-        connector_id: Math.trunc(connectorId),
-        timeseries_id: Math.trunc(timeseriesId),
-        observed_at: observedAt,
-        value,
-        value_float8_hex: null,
-        status: null,
-        ingested_at: report.generated_at,
+    for (const windowLabel of args.windows) {
+      report.matrix_calls += 1;
+      const rpcResult = await callLatestRpc({
+        supabase_url: args.supabase_url,
+        sb_secret_key: args.sb_secret_key,
+        schema: args.schema,
+        rpc: args.rpc,
+        pollutant: toRpcPollutant(pollutant),
+        window_label: windowLabel,
+        limit_rows: args.limit_rows,
       });
-      if (applied === "new") report.candidates_applied_new += 1;
-      else if (applied === "updated_newer") report.candidates_applied_updated_newer += 1;
-      else if (applied === "duplicate") report.candidates_skipped_duplicate += 1;
-      else report.candidates_skipped_older += 1;
+      report.rpc_response_bytes_total += rpcResult?.meta?.response_bytes || 0;
+      report.rpc_duration_ms_total += rpcResult?.meta?.duration_ms || 0;
+
+      if (rpcResult.error) {
+        report.matrix_errors += 1;
+        report.warnings.push(
+          `rpc_failed pollutant=${pollutant} window=${windowLabel} msg=${rpcResult.error.message}`,
+        );
+        continue;
+      }
+
+      const rows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
+      for (const row of rows) {
+        report.rows_scanned += 1;
+        const timeseriesId = Number(row?.id);
+        const connectorId = Number(row?.connector_id);
+        const observedAt = normalizeTimestamp(row?.last_value_at);
+        if (!Number.isInteger(timeseriesId) || timeseriesId <= 0) {
+          report.rows_missing_timeseries_id += 1;
+          continue;
+        }
+        if (!Number.isInteger(connectorId) || connectorId <= 0) {
+          report.rows_missing_connector_id += 1;
+          continue;
+        }
+        if (!observedAt) {
+          report.rows_missing_timestamp += 1;
+          continue;
+        }
+        if (!hasAssignedGeoCode(row)) {
+          report.rows_filtered_no_geo += 1;
+          continue;
+        }
+        if (!passesOutlierThreshold(row)) {
+          report.rows_filtered_outlier += 1;
+          continue;
+        }
+        const valueRaw = row?.last_value;
+        const value = valueRaw === null || valueRaw === undefined ? null : Number(valueRaw);
+        if (value !== null && !Number.isFinite(value)) {
+          report.rows_invalid_value += 1;
+          continue;
+        }
+
+        const applied = applyCandidate(stateByKey, {
+          connector_id: Math.trunc(connectorId),
+          timeseries_id: Math.trunc(timeseriesId),
+          observed_at: observedAt,
+          value,
+          value_float8_hex: null,
+          status: null,
+          ingested_at: report.generated_at,
+        });
+        if (applied === "new") report.candidates_applied_new += 1;
+        else if (applied === "updated_newer") report.candidates_applied_updated_newer += 1;
+        else if (applied === "duplicate") report.candidates_skipped_duplicate += 1;
+        else report.candidates_skipped_older += 1;
+      }
     }
   }
 
