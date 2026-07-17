@@ -6,14 +6,14 @@ This document defines the current required behaviour of the R2 v2 AQI history wr
 
 It covers:
 
-- the observation sources used for target-day AQI calculation;
+- target-day observation source ownership;
 - the separate ObsAQIDB PM rolling-context read;
-- permanent v2 AQI data and debug objects;
-- connector and day manifests;
-- targeted index gates;
-- failure, retry and completion behaviour.
+- AQI calculation and output boundaries;
+- v2 data and debug objects;
+- manifests, targeted indexes and completion gates;
+- failure, retry and recovery behaviour.
 
-Calculation formulae and public read behaviour remain owned by their respective AQI and API components.
+AQI formulae and public read behaviour remain owned by their respective AQI and API components.
 
 ## Implementation ownership
 
@@ -24,7 +24,11 @@ The main implementation files are:
 - `.github/workflows/uk_aq_prune_daily_cloud_run_deploy.yml`;
 - `config/uk_aq_github_env_targets.csv`.
 
-The ObsAQIDB PM context RPC is an interface owned by the canonical ObsAQIDB schema in `TEST-uk-aq/uk-aq-schema`. Its deployed definition and grants MUST remain version-controlled there.
+The ObsAQIDB PM context RPC is owned by `TEST-uk-aq/uk-aq-schema` and is version-controlled in:
+
+- `schemas/migrations/20260717_001_obs_aqidb_pm_hourly_context_rpc.sql`;
+- `schemas/obs_aqi_db/uk_aq_obs_aqi_db_ops_rpcs.sql`;
+- `schemas/obs_aqi_db/uk_aq_obs_aqi_db_schema.sql`.
 
 ## Source ownership
 
@@ -32,7 +36,7 @@ Phase B deliberately uses two observation sources for different purposes.
 
 ### Target-day source
 
-IngestDB is authoritative for the target connector and UTC day being archived.
+IngestDB is authoritative for the connector and UTC day being archived.
 
 The frozen target-day source covers:
 
@@ -40,7 +44,7 @@ The frozen target-day source covers:
 D 00:00 inclusive to D+1 00:00 exclusive
 ```
 
-The same frozen target-day rows feed:
+The same frozen rows feed:
 
 - the permanent R2 observation write for D;
 - the target-day hourly inputs used by the AQI calculation.
@@ -49,7 +53,7 @@ ObsAQIDB MUST NOT replace this target-day source. This preserves the existing fi
 
 ### PM rolling-context source
 
-ObsAQIDB supplies only the older PM2.5 and PM10 hourly aggregates needed to start the target day with a complete rolling window.
+ObsAQIDB supplies only the older PM2.5 and PM10 hourly aggregates required to start D with a complete rolling window.
 
 For target day D, the context window is:
 
@@ -57,7 +61,7 @@ For target day D, the context window is:
 D-1 01:00 inclusive to D 00:00 exclusive
 ```
 
-This is exactly 23 older UTC hours. Combined with the target hour, it permits the shared AQI library to calculate the rolling 24-hour PM DAQI value for D 00:00.
+This is exactly 23 older UTC hours. Combined with the target hour, it permits the shared AQI library to calculate PM DAQI for D 00:00.
 
 NO2 does not use this context. NO2 DAQI and EAQI continue to use the target hour's hourly mean.
 
@@ -76,11 +80,11 @@ ObsAQIDB context rows MUST NOT:
 Exactly one Phase B AQI writer mode MUST be enabled:
 
 - observation-derived AQI; or
-- the legacy AQI RPC export.
+- the legacy materialised-AQI RPC export.
 
-Both enabled and both disabled are invalid and must fail closed.
+Both enabled and both disabled are invalid and fail closed.
 
-For the current R2-first TEST path, the expected settings are:
+The current R2-first TEST configuration is expected to use:
 
 ```text
 UK_AQ_R2_HISTORY_VERSION=v2
@@ -95,11 +99,11 @@ For each target connector/day, Phase B MUST:
 1. stream and freeze target-day observations from IngestDB;
 2. write only those target-day observations to the canonical v2 observation layout;
 3. select supported target-day PM2.5, PM10 and NO2 rows;
-4. aggregate target-day raw observations to hourly narrow rows through `lib/aqi/aqi_levels.mjs`;
+4. aggregate target-day observations to hourly rows through `lib/aqi/aqi_levels.mjs`;
 5. identify target-day PM timeseries requiring older context;
 6. fetch the preceding 23 hourly PM aggregates from ObsAQIDB;
 7. discard context rows that do not match a target-day PM timeseries and pollutant;
-8. merge context and target-day hourly rows by `timeseries_id + pollutant_code + timestamp_hour_utc`;
+8. merge context and target-day rows by `timeseries_id + pollutant_code + timestamp_hour_utc`;
 9. prefer the target-day IngestDB-derived row if an overlap occurs;
 10. calculate DAQI and EAQI through the shared AQI library;
 11. restrict final AQI output to target day D;
@@ -108,7 +112,7 @@ For each target connector/day, Phase B MUST:
 14. build and verify the required targeted indexes;
 15. set `history_done=true` only after every required gate succeeds.
 
-The Phase B writer MUST compose the shared AQI helpers. It MUST NOT copy breakpoints or implement a second rolling-average algorithm.
+The writer MUST compose the shared AQI helpers. It MUST NOT copy breakpoints or implement a second rolling-average algorithm.
 
 ## Shared AQI behaviour
 
@@ -122,13 +126,13 @@ The shared AQI library remains authoritative for:
 - calculation statuses and missing reasons;
 - algorithm version.
 
-PM DAQI requires 24 available hourly values in the range:
+PM DAQI requires 24 available hourly values in:
 
 ```text
 H-23 hours through H
 ```
 
-A complete source read with genuinely missing hours is not a writer failure. The affected row uses the existing result:
+A complete source read with genuine missing hours is not an infrastructure failure. The affected row uses:
 
 ```text
 daqi_calculation_status=insufficient_samples
@@ -146,7 +150,7 @@ The default RPC is:
 uk_aq_public.uk_aq_rpc_observs_aqi_pm_hourly_context
 ```
 
-The RPC is called through PostgREST with the ObsAQIDB service-role key.
+It is called through PostgREST with the ObsAQIDB service-role key.
 
 ### Inputs
 
@@ -161,7 +165,7 @@ p_limit
 
 ### Output
 
-Rows MUST be ordered by `timeseries_id, timestamp_hour_utc` and contain:
+Rows are ordered by `timeseries_id, timestamp_hour_utc` and contain:
 
 ```text
 connector_id
@@ -179,15 +183,20 @@ The RPC MUST:
 
 - require `service_role`;
 - read ObsAQIDB observations and authoritative timeseries metadata;
+- accept only a positive connector ID;
+- require hour-aligned start and end timestamps;
+- reject an empty, reversed or longer-than-24-hour window;
+- require both cursor fields together or neither;
 - return only `pm25` and `pm10`;
-- use the same UTC hourly bucket boundary as the shared AQI library;
-- return non-negative hourly means and positive sample counts;
-- use stable keyset pagination;
-- return a successful empty array when no qualifying context rows exist;
-- reject invalid connector IDs, invalid windows and unsafe limits;
-- not expose a broad public raw-observation query.
+- ignore null and negative observation values;
+- use UTC hourly buckets matching the JavaScript AQI library;
+- aggregate an hourly mean and sample count;
+- order output for stable keyset pagination;
+- clamp `p_limit` to the range 1 to 5000;
+- return an empty array when no qualifying rows exist;
+- remain unavailable to `public`, `anon` and `authenticated` roles.
 
-The caller validates connector, station and timeseries identifiers, pollutant code, UTC hour alignment, requested window, hourly mean and sample count. Invalid or out-of-order rows fail the candidate.
+The caller validates returned identifiers, pollutant, UTC hour alignment, requested window, hourly mean, sample count, order and uniqueness. Invalid output fails the candidate.
 
 ## Pagination and bounded reads
 
@@ -208,21 +217,29 @@ UK_AQ_PHASE_B_PM_CONTEXT_MAX_ROWS=50000
 
 These limits bound PostgREST calls and memory use. Reaching a page or row cap before a complete response is a failure, not a partial success.
 
-The context RPC currently reads the connector/window scope, after which the service accepts only rows matching target-day PM timeseries. Operators should watch `pm_context_rows_fetched`, `pm_context_rows_accepted` and `pm_context_rows_discarded`, especially for large connectors. A cap failure requires either a safe configuration adjustment or a more selective RPC contract. It MUST NOT be bypassed by accepting a truncated response.
+The current RPC reads the connector/window PM scope. The service then accepts only rows matching target-day PM timeseries. Operators should monitor:
+
+```text
+pm_context_rows_fetched
+pm_context_rows_accepted
+pm_context_rows_discarded
+```
+
+A cap failure requires either a safe configuration adjustment or a more selective RPC contract. It MUST NOT be bypassed by accepting a truncated response.
 
 ## ObsAQIDB retention guard
 
-Before requesting context, Phase B calculates the configured ObsAQIDB retention boundary from:
+Before requesting context, Phase B calculates the ObsAQIDB retention boundary from:
 
 ```text
 OBS_AQIDB_OBSERVS_RETENTION_DAYS
 ```
 
-The current default is 14 days.
+The default is 14 days. The boundary calculation matches the daily partition-maintenance retention semantics.
 
-If the required context start is older than the calculated UTC retention boundary, the candidate fails with a clear PM-context error. Phase B does not attempt an incomplete calculation and the day remains blocked from pruning.
+If the required context start is older than the UTC retention boundary, the candidate fails. Phase B does not attempt an incomplete calculation and the day remains blocked from pruning.
 
-A normal Phase B candidate should be within this boundary because ObsAQIDB retains observations longer than IngestDB. An older pending candidate outside the boundary requires repair or rebuild from an authoritative retained source, normally existing R2 observations or another approved backfill source.
+A normal Phase B candidate should be inside this boundary because ObsAQIDB retains observations longer than IngestDB. An older pending candidate requires rebuild from another authoritative retained source, normally R2 observations or an approved backfill source.
 
 ## Fail-closed context contract
 
@@ -230,16 +247,16 @@ The candidate MUST fail and pruning MUST remain blocked when:
 
 - ObsAQIDB configuration is missing;
 - the context RPC request fails;
-- the RPC response is not an array;
+- the response is not an array;
 - pagination does not advance monotonically;
 - duplicate hourly keys are returned;
 - a page or row cap is reached before completion;
 - a row cannot be normalised safely;
 - a row is outside the requested window;
-- the required context window is outside ObsAQIDB retention;
-- the service cannot distinguish a complete empty result from a partial read.
+- the context start is outside ObsAQIDB retention;
+- a complete empty result cannot be distinguished from an incomplete read.
 
-A context failure uses the normal retry-safe candidate failure path. Partial v2 output for that connector is cleaned up, the candidate is marked failed, the day gate remains incomplete and a later run may retry.
+A context failure follows the normal retry-safe path. The candidate is marked failed, the day gate remains incomplete and partial connector output is cleaned up where the existing v2 cleanup contract requires it.
 
 ## Target-day precedence
 
@@ -249,9 +266,9 @@ Context and target-day hourly values are merged by:
 timeseries_id + pollutant_code + timestamp_hour_utc
 ```
 
-The target-day value derived from the frozen IngestDB source MUST win over an ObsAQIDB context value for the same key.
+The target-day value derived from frozen IngestDB observations MUST win over an ObsAQIDB context value for the same key.
 
-The intended windows do not overlap, but this rule protects the source-of-truth boundary if an upstream query changes or returns an unexpected boundary row.
+The intended windows do not overlap, but this rule protects the source boundary if an upstream query returns an unexpected edge row.
 
 ## No-supported-source state
 
@@ -259,30 +276,30 @@ A target connector/day with no supported PM2.5, PM10 or NO2 target-day rows is a
 
 In this state:
 
-- the PM context RPC is not required;
-- context from the previous day cannot create target-day AQI output;
+- the PM context RPC is not called;
+- previous-day context cannot create target-day AQI output;
 - canonical empty connector manifests are written;
 - fake Parquet files are not created;
-- stale pollutant indexes or metadata must not remain authoritative.
+- stale pollutant indexes or metadata do not remain authoritative.
 
 ## R2 outputs
 
-Observation-derived AQI writes the current v2 object families:
+Observation-derived AQI writes:
 
 ```text
 history/v2/aqilevels/hourly/data
 history/v2/aqilevels/hourly/debug
 ```
 
-The data profile contains compact values required by the public history path, including DAQI and EAQI levels, statuses and missing reasons.
+The data profile contains DAQI and EAQI levels, statuses and missing reasons required by the public history path.
 
 The debug profile contains calculation inputs, source counts, required counts, algorithm version and computation timestamp.
 
-Context rows themselves are never published as a separate R2 product.
+Context rows are never published as a separate R2 product.
 
 ## Structured diagnostics
 
-Successful candidate logs and run summaries expose the following PM context fields:
+Successful candidate logs and run summaries expose:
 
 ```text
 pm_context_source
@@ -300,14 +317,14 @@ daqi_status_counts
 eaqi_status_counts
 ```
 
-Candidate failures attach available PM-context diagnostics to `phase_b_history_candidate_failed`.
+Candidate failures attach available diagnostics to `phase_b_history_candidate_failed`.
 
 These fields distinguish:
 
 - a complete context read with genuine missing source hours;
 - a complete read with full rolling context;
 - irrelevant connector/window rows discarded by the target-timeseries filter;
-- an incomplete or invalid context read that failed closed.
+- an incomplete or invalid read that failed closed.
 
 ## Index and manifest safety
 
@@ -322,15 +339,15 @@ The targeted update must:
 - use byte-stable put-if-changed behaviour;
 - verify that every required index refers to the current pollutant manifest and hash.
 
-Object existence alone is not sufficient evidence. Warnings, missing generated indexes, unreadable payloads or source-manifest mismatches block completion.
+Object existence alone is insufficient. Warnings, missing generated indexes, unreadable payloads or source-manifest mismatches block completion.
 
-Adopting an existing observation manifest MUST NOT bypass AQI output, debug output, manifest or index verification.
+Observation-manifest adoption is disabled for the observation-derived AQI path because an observation manifest alone cannot satisfy the AQI gate.
 
 ## Idempotency and retries
 
-Valid objects may remain after a later gate fails so a retry can complete without duplicating data. Rewriting the same canonical state must be idempotent.
+Rewriting the same canonical state must be idempotent.
 
-If supported target-day rows exist but normalisation or hourly calculation unexpectedly produces no AQI rows, the writer fails closed rather than publishing a successful empty result.
+If supported target-day rows exist but normalisation or hourly calculation produces no AQI rows, the writer fails closed rather than publishing a successful empty result.
 
 A PM context failure is retry-safe while the required context remains inside ObsAQIDB retention.
 
@@ -338,23 +355,25 @@ A PM context failure is retry-safe while the required context remains inside Obs
 
 Deploying this fix does not automatically replace AQI objects already committed with insufficient prior-day context.
 
-A previously affected day, including 12 July 2026 on TEST, requires an explicit targeted AQI repair or rebuild from authoritative observation history. The repair must replace the affected data and debug manifests and update the targeted indexes without changing unrelated days.
+A previously affected day, including 12 July 2026 on TEST, requires an explicit targeted AQI rebuild from authoritative observation history. The repair must replace affected data and debug manifests and update targeted indexes without changing unrelated days.
+
+For an old day no longer available in IngestDB or ObsAQIDB, use the existing R2-observation-to-AQI integrity/backfill route after confirming it supplies the same preceding 23-hour PM context.
 
 ## Validation policy
 
 Pre-deployment validation is limited to structural viability and small deterministic checks needed for the known boundary defect.
 
-After deployment, functional acceptance is through a real TEST Phase B operation. Confirm:
+Functional acceptance is through a real TEST Phase B operation. Confirm:
 
 1. `pm_context_source=obs_aqidb` is reported for PM-capable candidates.
 2. The context window is D-1 01:00 through D 00:00.
 3. `pm_context_complete=true` and pagination remains within configured caps.
 4. PM DAQI is available at D 00:00 when 23 valid older hours plus the target hour exist.
-5. Genuine missing source hours still produce `insufficient_samples` rather than invented values.
+5. Genuine missing hours still produce `insufficient_samples` rather than invented values.
 6. EAQI and NO2 behaviour remain unchanged.
 7. The R2 observation partition contains only D observations.
-8. AQI data and debug manifests cover only D output rows.
-9. Targeted indexes point to the new current manifests and unrelated days remain unchanged.
+8. AQI data and debug manifests contain only D output rows.
+9. Targeted indexes point to the current manifests and unrelated days remain unchanged.
 10. `history_done` is set only after all observation, AQI, manifest and index gates succeed.
 
-The dated rollout material remains under `system_docs_legacy/reports/` as historical evidence and does not override this current contract.
+The dated rollout material under `system_docs_legacy/` is historical evidence and does not override this contract.
