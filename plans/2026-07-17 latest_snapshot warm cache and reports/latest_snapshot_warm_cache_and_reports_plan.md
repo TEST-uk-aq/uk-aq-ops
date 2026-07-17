@@ -358,7 +358,7 @@ Work in TEST-uk-aq/uk-aq-ops only. Do not inspect or modify LIVE.
 
 Read AGENTS.md and the complete authoritative Latest Snapshot area under system_docs/latest_snapshot/. Then read:
 
-plans/2026-07-17 latest_snapshot warm cache and reports/plan.md
+plans/2026-07-17 latest_snapshot warm cache and reports/latest_snapshot_warm_cache_and_reports_plan.md
 
 Perform Phase 0 only. Confirm the structural viability of a container-local /tmp cache shared by run_service.ts and each run_job.ts child process, while keeping R2 as durable authority. Identify the exact state, metadata-cache and manifest load/write functions, the strongest existing R2 fingerprint available for validation, the current successful run-report writer, and whether any active consumer depends on every successful scheduled _runs object.
 
@@ -479,7 +479,7 @@ Work in TEST-uk-aq/uk-aq-ops only. Do not inspect or modify LIVE.
 
 Read AGENTS.md, the complete authoritative system_docs/latest_snapshot/ area, and:
 
-plans/2026-07-17 latest_snapshot warm cache and reports/plan.md
+plans/2026-07-17 latest_snapshot warm cache and reports/latest_snapshot_warm_cache_and_reports_plan.md
 
 Use the accepted Phase 0 findings and implement Phases 1 and 2 in one focused branch/change set.
 
@@ -594,7 +594,7 @@ Use GPT-5.6 Codex with High reasoning.
 
 Perform Phase 3 of:
 
-plans/2026-07-17 latest_snapshot warm cache and reports/plan.md
+plans/2026-07-17 latest_snapshot warm cache and reports/latest_snapshot_warm_cache_and_reports_plan.md
 
 This explicitly authorises the required TEST Cloud Run deployment. Do not touch LIVE. Do not edit system_docs.
 

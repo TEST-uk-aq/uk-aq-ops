@@ -35,12 +35,28 @@ Builds latest map snapshots from a dedicated Pub/Sub observation subscription an
 - `UK_AQ_LATEST_SNAPSHOT_R2_PREFIX` (default `latest_snapshots/${UK_AQ_LATEST_SNAPSHOT_CONTRACT_VERSION}`; currently `latest_snapshots/v2`)
 - `UK_AQ_LATEST_SNAPSHOT_MANIFEST_KEY` (default `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/manifest.json`)
 - `UK_AQ_LATEST_SNAPSHOT_RUNS_PREFIX` (default `${UK_AQ_LATEST_SNAPSHOT_R2_PREFIX}/_runs`)
-- `UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED` (default `true`)
+- `UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_MODE` (default `failures`; accepted values: `all`, `failures`, `off`)
+- `UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED` (legacy fallback only when the mode is absent: `true` maps to `all`, `false` maps to `off`)
 - `UK_AQ_LATEST_SNAPSHOT_STATE_PREFIX` (default `latest_snapshots_state/v1`)
 - `UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX` (default `history/v2/core`)
 - `UK_AQ_LATEST_SNAPSHOT_METADATA_REFRESH_SECONDS` (default `86400`)
 - `UK_AQ_LATEST_SNAPSHOT_PUBSUB_SUBSCRIPTION` (default `uk-aq-latest-snapshot-sub`; must be dedicated and not equal to `OBSERVS_PUBSUB_SUBSCRIPTION`)
 - `UK_AQ_LATEST_SNAPSHOT_JOB_TIMEOUT_MS` (default `240000`; must leave at least 30 seconds before the Cloud Run request timeout)
+- `UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED` (default `true`)
+- `UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_DIR` (default `/tmp/uk-aq-latest-snapshot-cache`)
+
+## Warm local cache and run reports
+
+The builder may retain local copies of latest state, the metadata cache and the
+physical manifest in `/tmp` while a Cloud Run container remains warm. Each reuse
+is validated with an R2 ETag; R2 remains the durable authority. Local writes
+occur only after the corresponding R2 read or write succeeds, and a missing or
+corrupt local entry falls back to normal R2 handling.
+
+In the default `failures` report mode, successful scheduler runs retain the
+structured job summary but do not create an R2 `_runs` object. Completed manual
+runs and completed builds with failed matrix items remain reportable. `all`
+retains the prior every-completed-run behaviour and `off` disables R2 reports.
 
 ## Trigger mode
 
