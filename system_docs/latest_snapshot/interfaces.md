@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This file protects the message, state, physical R2 object, manifest and HTTP interface shapes used by the latest-snapshot system.
+This file protects the message, durable-state, transient-cache, physical R2 object, manifest, run-report and HTTP interface shapes used by the latest-snapshot system.
 
 The public request matrix contains five windows, while the physical R2 matrix contains only `window=all`. That distinction is part of the current interface contract.
 
@@ -71,6 +71,89 @@ Top-level fields:
 - `phenomena`;
 - `observed_properties`.
 
+## Container-local R2 cache interface
+
+### Runtime settings
+
+```text
+UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED
+UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_DIR
+```
+
+Defaults:
+
+```text
+UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED=true
+UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_DIR=/tmp/uk-aq-latest-snapshot-cache
+```
+
+The enabled setting uses the repository's standard boolean forms. Disabling it returns all durable-object loads to the direct R2 path.
+
+### Cached R2 keys
+
+Only these durable objects use the local cache:
+
+```text
+latest_snapshots_state/v1/latest_state.json
+latest_snapshots_state/v1/core_metadata_cache_v2.json
+latest_snapshots/v2/manifest.json
+```
+
+### Local filename interface
+
+The body and sidecar filenames use the lowercase hexadecimal SHA-256 of the complete R2 key as the filename stem:
+
+```text
+{cache_dir}/{sha256-of-r2-key}.bin
+{cache_dir}/{sha256-of-r2-key}.json
+```
+
+R2 keys are not interpolated directly as local paths.
+
+### Sidecar schema
+
+```json
+{
+  "schema_version": 1,
+  "key": "latest_snapshots_state/v1/latest_state.json",
+  "etag": "<R2 ETag>",
+  "sha256": "<64-character lowercase SHA-256 of body>"
+}
+```
+
+A local entry is usable only when:
+
+- the body and sidecar both exist;
+- sidecar schema and field types are valid;
+- `key` equals the requested full R2 key;
+- the body parses as JSON;
+- the body SHA-256 matches the sidecar;
+- a current R2 HEAD says the object exists;
+- the current R2 ETag is present and equals the sidecar ETag.
+
+If any condition fails, the caller uses the normal R2 GET path.
+
+Local body and sidecar files are written through temporary files and rename. Because the two files are separate, an interrupted pair update may leave a mismatched entry, which the validation rules treat as corrupt or stale and replace from R2.
+
+### Cache statistics
+
+The `local_cache` object in `latest_snapshot_job_summary` contains:
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Resolved cache switch |
+| `cache_dir` | Resolved local directory |
+| `disabled` | Read attempts bypassed because cache is disabled |
+| `cold_miss` | Missing body or sidecar |
+| `warm_hit` | Locally valid body whose R2 ETag still matches |
+| `fingerprint_mismatch` | Missing R2 object/ETag or ETag mismatch |
+| `corrupt` | Invalid sidecar, JSON body or local SHA-256 |
+| `validation_error` | R2 fingerprint lookup failed |
+| `write_failure` | Local body or sidecar write failed |
+| `skipped_missing_etag` | Local store skipped because R2 returned no usable ETag |
+
+These are operational counters. They are not public API fields.
+
 ## Physical snapshot object keys
 
 Canonical physical pattern:
@@ -88,6 +171,8 @@ latest_snapshots/v2/network_group=all/pollutant=no2/window=all.json
 ```
 
 There are no current physical `3h`, `6h`, `1d` or `7d` products. Old finite objects may remain in R2 but are not current interfaces and are never fallbacks.
+
+The builder's local cache does not contain these pollutant snapshot objects.
 
 ## Snapshot payload
 
@@ -191,6 +276,85 @@ A fully successful manifest contains three snapshot entries. Each entry includes
 
 Finite public responses are not represented as manifest entries.
 
+## R2 run reports
+
+Default prefix:
+
+```text
+latest_snapshots/v2/_runs
+```
+
+Timestamped key form remains:
+
+```text
+{runs_prefix}/{compact-finished-at}.json
+```
+
+A report that is written retains the existing fields:
+
+| Field | Meaning |
+|---|---|
+| `ok` | Whether all physical matrix items succeeded |
+| `trigger_mode` | Scheduler or manual mode resolved by the service |
+| `manifest_key` | Physical manifest key |
+| `reports_key` | This report's key |
+| `duration_ms` | Build duration |
+| `success_count` | Successful physical matrix item count |
+| `failure_count` | Failed physical matrix item count |
+| `changed_count` | Changed physical snapshots written |
+| `skipped_unchanged_count` | Unchanged physical snapshot writes skipped |
+| `warnings` | Bounded build warning strings |
+
+### Report-mode settings
+
+```text
+UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_MODE
+UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_ENABLED
+```
+
+Accepted new modes:
+
+```text
+all
+failures
+off
+```
+
+Resolution:
+
+1. an explicit valid mode wins;
+2. otherwise an explicit legacy boolean maps `true` to `all` and `false` to `off`;
+3. otherwise the default is `failures`.
+
+An explicit invalid mode is a configuration error.
+
+### Report decision reasons
+
+The structured job summary exposes:
+
+```json
+{
+  "run_reports": {
+    "mode": "failures",
+    "source": "mode",
+    "write": false,
+    "reason": "scheduled_success"
+  }
+}
+```
+
+Current reason values are:
+
+- `mode_off`;
+- `mode_all`;
+- `manual_invocation`;
+- `completed_failure`;
+- `scheduled_success`.
+
+The `write` field indicates whether an R2 report key was actually produced. If the configured runs prefix is empty, a decision to write cannot create an object and `write` remains false.
+
+Run reports are not manifest entries and are not required by the public API.
+
 ## Private R2 API Worker
 
 Endpoints:
@@ -261,6 +425,8 @@ Matching `If-None-Match` on GET or HEAD returns `304` with the v2 contract marke
 
 Finite HEAD responses return the same representation headers as GET, including the derived ETag and recalculated content length, but no body.
 
+The ETags used by the Cloud Run local cache belong to state, metadata-cache and manifest R2 objects. They are independent of public finite-response ETag derivation.
+
 ## Errors
 
 The Worker preserves the existing bounded errors, including:
@@ -308,4 +474,4 @@ The cache proxy continues forwarding the public query, validating the v2 marker,
 
 ## Compatibility rule
 
-A change to physical product ownership, finite-window derivation, ETag inputs, query values, response fields, row fields, manifest meaning or authentication requires an explicit contract and compatibility review.
+A change to durable-object authority, local sidecar schema or validation, run-report modes, physical product ownership, finite-window derivation, public ETag inputs, query values, response fields, row fields, manifest meaning or authentication requires an explicit contract and compatibility review.
