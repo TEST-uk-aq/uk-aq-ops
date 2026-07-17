@@ -43,7 +43,7 @@ If code and the documented contract disagree, do not silently choose one. Record
 
 ## Change rule
 
-An intentional behavioural change must update the authoritative documents in the same branch or pull request.
+An intentional behavioural change must update the authoritative documents in the same branch or pull request, or through the explicitly assigned post-implementation ChatGPT documentation phase.
 
 An implementation-only change that preserves behaviour does not require artificial wording changes, but its change report must state:
 
@@ -57,7 +57,7 @@ See [`documentation_contract.md`](documentation_contract.md) for the full mainte
 
 | Area | Authoritative directory | Current status |
 |---|---|---|
-| Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current, including all-only physical snapshots |
+| Latest snapshot builder, R2 API and cache-proxy boundary | [`latest_snapshot/`](latest_snapshot/) | Authoritative and current, including all-only physical snapshots, validated warm local cache and failures-by-default run reports |
 | Raw observations and AQI R2 history | [`r2_history/`](r2_history/) | Binding index, integrity and active AQI write-pipeline contracts are current; remaining history migration is pending |
 | Prune daily and backup gating | `prune_and_retention/` | Migration analysis pending |
 | Observs outbox and partition maintenance | `observs_operations/` | Migration analysis pending |
@@ -84,7 +84,17 @@ The completed [`latest_snapshot/`](latest_snapshot/) area governs:
 - `.github/workflows/uk_aq_latest_snapshot_cloud_run_deploy.yml`;
 - `.github/workflows/uk_aq_latest_snapshot_r2_api_worker_deploy.yml`.
 
-It defines latest-valid state, the three physical pollutant `window=all` objects, request-time finite-window derivation, the physical manifest, public v2 compatibility and TEST validation policy.
+It defines:
+
+- latest-valid state;
+- R2 as durable authority;
+- the disposable ETag-validated local cache for state, metadata cache and manifest;
+- the three physical pollutant `window=all` objects;
+- request-time finite-window derivation;
+- the physical manifest;
+- failures-by-default R2 run-report policy;
+- public v2 compatibility;
+- minimal TEST validation and rollback policy.
 
 The R2-history documents in [`r2_history/`](r2_history/) currently govern:
 
