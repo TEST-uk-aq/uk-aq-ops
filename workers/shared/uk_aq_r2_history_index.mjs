@@ -1542,9 +1542,14 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     max_keys: 1000,
   });
   const existingIds = new Set();
+  const existingEtags = new Map();
   for (const entry of existingEntries) {
     const match = String(entry?.key || "").match(new RegExp(`^${bindingPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/timeseries_id=([1-9]\\d*)\\.json$`));
-    if (match) existingIds.add(match[1]);
+    if (match) {
+      existingIds.add(match[1]);
+      const etag = stripEtagQuotes(entry?.etag || entry?.e_tag || entry?.ETag);
+      if (etag) existingEtags.set(match[1], etag);
+    }
   }
 
   let bindingWrittenCount = 0;
@@ -1553,22 +1558,29 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
   let bindingNewCount = 0;
   let plannedChangedCount = 0;
   let plannedNewCount = 0;
+  let headFallbackCount = 0;
+  let bindingVerificationGetCount = 0;
   for (const binding of [...authoritativeByTimeseriesId.values()]
     .sort((left, right) => left.timeseries_id - right.timeseries_id)) {
     const key = buildR2HistoryV2TimeseriesBindingKey(bindingPrefix, binding.timeseries_id);
     const body = `${JSON.stringify(buildHistoryV2TimeseriesBindingPayload(binding), null, 2)}\n`;
-    const result = await r2PutObjectIfChanged({
-      r2,
-      key,
-      body,
-      content_type: "application/json; charset=utf-8",
-      writeR2,
-    });
-    if (result.skipped) {
+    const id = String(binding.timeseries_id);
+    const listedEtag = existingEtags.get(id);
+    if (listedEtag && listedEtag === md5HexOfBody(body)) {
       bindingUnchangedCount += 1;
       continue;
     }
-    if (existingIds.has(String(binding.timeseries_id))) {
+    let exists = existingIds.has(id);
+    if (exists && !listedEtag) {
+      headFallbackCount += 1;
+      const head = await r2HeadObject({ r2, key });
+      if (head.exists && stripEtagQuotes(head.etag) === md5HexOfBody(body)) {
+        bindingUnchangedCount += 1;
+        continue;
+      }
+      exists = Boolean(head.exists);
+    }
+    if (exists) {
       if (writeR2) bindingChangedCount += 1;
       else plannedChangedCount += 1;
     } else if (writeR2) {
@@ -1576,7 +1588,13 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     } else {
       plannedNewCount += 1;
     }
-    if (writeR2) bindingWrittenCount += 1;
+    if (writeR2) {
+      await r2PutObject({ r2, key, body, content_type: "application/json; charset=utf-8" });
+      const verified = await r2GetObject({ r2, key });
+      bindingVerificationGetCount += 1;
+      if (verified.body.toString("utf8") !== body) throw new Error(`R2 binding verification failed for ${key}`);
+      bindingWrittenCount += 1;
+    }
   }
 
   const staleBindingIds = [...existingIds]
@@ -1597,6 +1615,11 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     planned_new_count: plannedNewCount,
     planned_changed_count: plannedChangedCount,
     unchanged_count: bindingUnchangedCount,
+    etag_listing_optimization_used: true,
+    listed_binding_count: existingIds.size,
+    head_fallback_count: headFallbackCount,
+    binding_put_count: bindingWrittenCount,
+    binding_verification_get_count: bindingVerificationGetCount,
     invalid_binding_count: invalidBindingCount,
     stale_binding_count: staleBindingIds.length,
     stale_binding_timeseries_ids: staleBindingIds,

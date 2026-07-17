@@ -91,6 +91,53 @@ export const DEFAULT_TABLES = Object.freeze([
   "station_metadata",
   "timeseries",
 ]);
+export const TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION = 1;
+const TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION = 1;
+const TIMESERIES_BINDING_SOURCE_TABLES = Object.freeze(["timeseries", "phenomena", "observed_properties"]);
+
+export function buildTimeseriesBindingSourceFingerprint(tableArtifacts) {
+  const artifacts = tableArtifacts instanceof Map
+    ? tableArtifacts
+    : new Map((Array.isArray(tableArtifacts) ? tableArtifacts : []).map((entry) => [entry.table, entry]));
+  const tables = TIMESERIES_BINDING_SOURCE_TABLES.map((table) => {
+    const artifact = artifacts.get(table);
+    const rowCount = Number(artifact?.row_count);
+    const sha256 = String(artifact?.sha256_uncompressed || "").trim().toLowerCase();
+    if (!Number.isInteger(rowCount) || rowCount < 0 || !/^[a-f0-9]{64}$/.test(sha256)) return null;
+    return { table, row_count: rowCount, sha256_uncompressed: sha256 };
+  });
+  if (tables.some((entry) => !entry)) return null;
+  const canonical = JSON.stringify({ version: TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, tables });
+  return { fingerprint: createHash("sha256").update(canonical).digest("hex"), tables };
+}
+
+export function buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint, sourceTables, authoritativeTimeseriesCount }) {
+  return {
+    schema_version: TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION,
+    history_version: "v2",
+    state_kind: "timeseries_binding_source_state",
+    timeseries_binding_index_prefix: normalizePrefix(bindingPrefix),
+    fingerprint_algorithm: "sha256",
+    fingerprint_version: TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION,
+    source_schema: String(sourceSchema || "").trim(),
+    source_fingerprint: sourceFingerprint,
+    source_tables: sourceTables,
+    authoritative_timeseries_count: authoritativeTimeseriesCount,
+  };
+}
+
+function validTimeseriesBindingSourceState(state, { bindingPrefix, sourceSchema }) {
+  return Boolean(state && typeof state === "object" && !Array.isArray(state)
+    && state.schema_version === TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION
+    && state.history_version === "v2"
+    && state.state_kind === "timeseries_binding_source_state"
+    && state.fingerprint_algorithm === "sha256"
+    && state.fingerprint_version === TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION
+    && state.timeseries_binding_index_prefix === normalizePrefix(bindingPrefix)
+    && state.source_schema === String(sourceSchema || "").trim()
+    && /^[a-f0-9]{64}$/.test(String(state.source_fingerprint || ""))
+    && Array.isArray(state.source_tables));
+}
 
 function usage() {
   console.log(
@@ -741,13 +788,33 @@ async function main(args) {
             reason: "required_core_binding_tables_not_exported",
           };
         } else {
-          report.timeseries_binding_reconciliation = await reconcileR2HistoryV2TimeseriesBindings({
+          const bindingPrefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
+            || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX);
+          const sourceStateKey = `${bindingPrefix}/_source_state.json`;
+          const source = buildTimeseriesBindingSourceFingerprint(tableArtifacts);
+          if (!source) throw new Error("timeseries_binding_source_fingerprint_invalid");
+          let storedState = null;
+          let sourceStateStatus = "missing";
+          try {
+            const object = await r2GetObject({ r2, key: sourceStateKey });
+            storedState = JSON.parse(object.body.toString("utf8"));
+            sourceStateStatus = validTimeseriesBindingSourceState(storedState, { bindingPrefix, sourceSchema }) ? "valid" : "invalid";
+          } catch (error) {
+            if (!String(error instanceof Error ? error.message : error).includes("(404)")) sourceStateStatus = "invalid";
+          }
+          const fingerprintMatch = sourceStateStatus === "valid" && storedState.source_fingerprint === source.fingerprint;
+          if (fingerprintMatch) {
+            report.timeseries_binding_reconciliation = {
+              status: "skipped", reason: "source_fingerprint_unchanged", source_state_key: sourceStateKey,
+              current_source_fingerprint: source.fingerprint, stored_source_fingerprint: storedState.source_fingerprint,
+              source_fingerprint_match: true, source_state_status: "valid",
+              authoritative_timeseries_count: storedState.authoritative_timeseries_count,
+            };
+          } else {
+          const reconciliation = await reconcileR2HistoryV2TimeseriesBindings({
             r2,
             bucketName: r2.bucket,
-            timeseriesBindingIndexPrefix: normalizePrefix(
-              process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
-                || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
-            ),
+            timeseriesBindingIndexPrefix: bindingPrefix,
             authoritativeTimeseries: buildAuthoritativeTimeseriesBindingsFromCoreSnapshotFiles({
               timeseriesFile,
               phenomenaFile,
@@ -755,6 +822,20 @@ async function main(args) {
             }),
             writeR2: !args.dry_run,
           });
+          report.timeseries_binding_reconciliation = {
+            ...reconciliation, source_state_key: sourceStateKey, current_source_fingerprint: source.fingerprint,
+            stored_source_fingerprint: sourceStateStatus === "valid" ? storedState.source_fingerprint : null,
+            source_fingerprint_match: false, source_state_status: sourceStateStatus,
+          };
+          if (!args.dry_run && reconciliation.status === "succeeded" && reconciliation.invalid_binding_count === 0) {
+            const state = buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint: source.fingerprint, sourceTables: source.tables, authoritativeTimeseriesCount: reconciliation.authoritative_timeseries_count });
+            const body = `${JSON.stringify(state, null, 2)}\n`;
+            await r2PutObject({ r2, key: sourceStateKey, body, content_type: "application/json; charset=utf-8" });
+            const verified = await r2GetObject({ r2, key: sourceStateKey });
+            if (verified.body.toString("utf8") !== body) throw new Error("timeseries_binding_source_state_verification_failed");
+            report.timeseries_binding_reconciliation.source_state_status = "written";
+          }
+          }
         }
       }
     } catch (error) {
