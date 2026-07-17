@@ -25,7 +25,7 @@ import {
   sanitizeCheckpointState,
 } from "../scripts/backup_r2/sync_history_to_dropbox.mjs";
 import { rcloneCatMaybe } from "../scripts/backup_r2/lib/rclone.mjs";
-import { isRunManifestUnitPath } from "../scripts/backup_r2/build_backup_inventory.mjs";
+import { indexTreeScanConfig, isRunManifestUnitPath } from "../scripts/backup_r2/build_backup_inventory.mjs";
 import {
   defaultInventoryRelPathForBackupVersion,
   defaultStateRelPathForBackupVersion,
@@ -580,6 +580,16 @@ test("v2 backup inventory includes only stable timeseries bindings", () => {
   const keys = indexTreeKeysForBackupVersion("v2");
   assert.ok(keys.includes("timeseries_binding_v2"));
   assert.equal(keys.includes("timeseries_metadata_v2"), false);
+});
+
+test("v2 observation index inventory accepts canonical non-AQI property codes", () => {
+  const args = { index_v2_prefix: "history/_index_v2" };
+  const observations = indexTreeScanConfig("observations_timeseries_v2", args);
+  const aqilevels = indexTreeScanConfig("aqilevels_hourly_data_timeseries_v2", args);
+  for (const code of ["o3", "pm25index"]) {
+    assert.equal(observations.unitPattern.test(`day_utc=2026-05-10/connector_id=6/pollutant_code=${code}/manifest.json`), true);
+    assert.equal(aqilevels.unitPattern.test(`day_utc=2026-05-10/connector_id=6/pollutant_code=${code}/manifest.json`), false);
+  }
 });
 
 

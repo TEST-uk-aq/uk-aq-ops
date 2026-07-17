@@ -17,7 +17,6 @@ import {
   normalizePlan,
   runV2ObservationsRepair,
 } from "../scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs";
-import { buildHistoryV2TimeseriesMetadataIndexPayload } from "../workers/shared/uk_aq_r2_history_index.mjs";
 
 const DAY = "2026-05-17";
 const PREFIX = "history/v2/observations";
@@ -649,15 +648,12 @@ test("a live index lookup failure cannot affect local-only planning", async () =
 
 test("index application PUTs then immediately GET-verifies, with latest last", async () => {
   const indexKey = observationsIndexKey("no2");
-  const metadataKey = "history/_index_v2/timeseries/timeseries_id=101.json";
   const objects = {
     [indexKey]: JSON.stringify({ version: "old-index" }),
-    [metadataKey]: JSON.stringify({ version: "old-metadata" }),
     [OBSERVATIONS_LATEST_KEY]: JSON.stringify({ version: "old-latest" }),
   };
   const proposed = [
     { key: indexKey, body: JSON.stringify({ version: "new-index" }) },
-    { key: metadataKey, body: JSON.stringify({ version: "new-metadata" }) },
     { key: OBSERVATIONS_LATEST_KEY, body: JSON.stringify({ version: "new-latest" }) },
   ];
   const resolver = combinedResolverEnv();
@@ -675,10 +671,10 @@ test("index application PUTs then immediately GET-verifies, with latest last", a
     assert.equal(first.status, "succeeded", JSON.stringify(first.application_failure));
     assert.deepEqual(
       fake.requests.filter((request) => request.method === "PUT").map((request) => request.key),
-      [indexKey, metadataKey, OBSERVATIONS_LATEST_KEY],
-      "latest must remain ordered after pollutant indexes and timeseries metadata",
+      [indexKey, OBSERVATIONS_LATEST_KEY],
+      "latest must remain ordered after pollutant indexes",
     );
-    for (const key of [indexKey, metadataKey, OBSERVATIONS_LATEST_KEY]) {
+    for (const key of [indexKey, OBSERVATIONS_LATEST_KEY]) {
       const operations = fake.requests.filter((request) => request.key === key).map((request) => request.method);
       const putPosition = operations.indexOf("PUT");
       assert.equal(operations.slice(0, putPosition).filter((method) => method === "GET").length, 0, `${key} must have no pre-PUT R2 read`);
@@ -690,186 +686,6 @@ test("index application PUTs then immediately GET-verifies, with latest last", a
     assert.equal(first.r2_operation_counts.r2_list_before_put_count, 0);
     assert.equal(first.r2_operation_counts.r2_put_count, firstPutCount);
     assert.equal(first.r2_operation_counts.r2_get_after_put_verification_count, firstPutCount);
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
-test("targeted metadata repair merges the combined-local global object", async () => {
-  const existingEntries = [
-    metadataEntry({ dayUtc: "2026-05-16", rowCount: 8 }),
-    metadataEntry({ dayUtc: DAY, rowCount: 99 }),
-    metadataEntry({ dayUtc: DAY, domain: "aqilevels", rowCount: 7 }),
-  ];
-  const fixture = metadataRepairFixture({ existingEntries });
-  const liveBody = fixture.objects[fixture.metadataKey];
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(fixture.objects);
-  try {
-    writeCombinedDropboxFixture(resolver, fixture.objects);
-    const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: fixture.repairPlan });
-    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
-    const proposal = output.planning.proposals.find((candidate) => candidate.key === fixture.metadataKey);
-    assert.ok(proposal);
-    assert.equal(proposal.old_sha256, createHash("sha256").update(liveBody).digest("hex"));
-    assert.equal(proposal.baseline_source, "dropbox");
-    assert.equal(proposal.provenance.metadata_source, "existing_combined_local_timeseries_metadata");
-    const payload = JSON.parse(proposal.proposed_body);
-    const observationEntries = payload.observations_coverage.entries;
-    assert.deepEqual(observationEntries.map((entry) => entry.day_utc), ["2026-05-16", DAY]);
-    assert.equal(observationEntries.find((entry) => entry.day_utc === "2026-05-16").row_count, 8);
-    assert.equal(observationEntries.find((entry) => entry.day_utc === DAY).row_count, 1);
-    assert.equal(payload.aqi_coverage.entries.length, 1);
-    assert.equal(payload.aqi_coverage.entries[0].row_count, 7);
-    const metadata = output.planning.days[0].index.results[0].timeseries_metadata;
-    assert.equal(metadata.existing_object_merged_count, 1);
-    assert.equal(metadata.new_object_count, 0);
-    assert.equal(metadata.preserved_entry_count, 2);
-    assert.equal(metadata.replaced_entry_count, 1);
-    assert.equal(metadata.metadata_operations[0].metadata_source, "existing_timeseries_metadata");
-    assert.equal(fake.requests.length, 0);
-    assert.equal(fake.puts.size, 0);
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
-test("a Dropbox metadata object is the local baseline for a targeted metadata repair", async () => {
-  const fixture = metadataRepairFixture();
-  const dropboxPayload = buildHistoryV2TimeseriesMetadataIndexPayload({
-    timeseriesId: 101,
-    entries: [metadataEntry({ dayUtc: "2026-05-16" })],
-  });
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(fixture.objects);
-  try {
-    writeCombinedDropboxFixture(resolver, {
-      ...fixture.objects,
-      [fixture.metadataKey]: `${JSON.stringify(dropboxPayload, null, 2)}\n`,
-    });
-    const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: fixture.repairPlan });
-    assert.equal(output.status, "planned", JSON.stringify(output.application_failure));
-    const proposal = output.planning.proposals.find((candidate) => candidate.key === fixture.metadataKey);
-    assert.equal(proposal.old_sha256, createHash("sha256").update(`${JSON.stringify(dropboxPayload, null, 2)}\n`).digest("hex"));
-    assert.equal(proposal.provenance.metadata_source, "existing_combined_local_timeseries_metadata");
-    const payload = JSON.parse(proposal.proposed_body);
-    assert.deepEqual(payload.observations_coverage.entries.map((entry) => entry.day_utc), ["2026-05-16", DAY]);
-    const metadata = output.planning.days[0].index.results[0].timeseries_metadata;
-    assert.equal(metadata.existing_object_merged_count, 1);
-    assert.equal(metadata.new_object_count, 0);
-    assert.equal(fake.puts.size, 0);
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
-test("a live metadata lookup failure cannot affect local-only metadata planning", async () => {
-  const fixture = metadataRepairFixture();
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(fixture.objects, {
-    beforeRequest: ({ method, key }) => method === "GET" && key === fixture.metadataKey
-      ? new Response("forbidden", { status: 403 })
-      : null,
-  });
-  try {
-    writeCombinedDropboxFixture(resolver, fixture.objects);
-    const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: fixture.repairPlan });
-    assert.equal(output.status, "planned");
-    assert.equal(output.planning.proposals.some((proposal) => proposal.kind === "timeseries_metadata"), true);
-    assert.equal(fake.requests.length, 0);
-    assert.equal(fake.puts.size, 0);
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
-for (const race of ["body", "etag", "created_after_planning"]) {
-  test(`metadata planning ignores a concurrent ${race.replaceAll("_", " ")}`, async () => {
-    const existingEntries = [metadataEntry({ dayUtc: "2026-05-16" }), metadataEntry({ dayUtc: DAY, rowCount: 99 })];
-    const fixture = metadataRepairFixture({ existingEntries: race === "created_after_planning" ? null : existingEntries });
-    let metadataGetCount = 0;
-    const fake = installFakeR2(fixture.objects, {
-      etags: race === "etag" ? { [fixture.metadataKey]: '"etag-v1"' } : {},
-      beforeRequest: ({ method, key, objects, etags }) => {
-        if (method !== "GET" || key !== fixture.metadataKey || ++metadataGetCount !== 1) return null;
-        if (race === "body") objects[key] = `${fixture.objects[key]} `;
-        if (race === "etag") etags.set(key, '"etag-v2"');
-        if (race === "created_after_planning") {
-          const payload = buildHistoryV2TimeseriesMetadataIndexPayload({ timeseriesId: 101, entries: existingEntries });
-          objects[key] = `${JSON.stringify(payload, null, 2)}\n`;
-        }
-        return null;
-      },
-    });
-    const resolver = combinedResolverEnv();
-    try {
-      writeCombinedDropboxFixture(resolver, fixture.objects);
-      const output = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: fixture.repairPlan });
-      assert.equal(output.status, "succeeded", JSON.stringify(output.application_failure));
-      assert.ok(fake.puts.size > 0);
-      assert.equal(output.r2_operation_counts.r2_get_before_put_count, 0);
-    } finally {
-      fake.restore();
-      resolver.cleanup();
-    }
-  });
-}
-
-test("unchanged merged metadata is skipped", async () => {
-  const initial = metadataRepairFixture();
-  const firstResolver = combinedResolverEnv();
-  const firstFake = installFakeR2(initial.objects);
-  let proposedBody;
-  try {
-    writeCombinedDropboxFixture(firstResolver, initial.objects);
-    const first = await runV2ObservationsRepair({ env: firstResolver.env, repairPlan: initial.repairPlan });
-    proposedBody = first.planning.proposals.find((proposal) => proposal.key === initial.metadataKey).proposed_body;
-  } finally {
-    firstFake.restore();
-    firstResolver.cleanup();
-  }
-  const objects = { ...initial.objects, [initial.metadataKey]: proposedBody };
-  const md5 = createHash("md5").update(proposedBody).digest("hex");
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(objects, { etags: { [initial.metadataKey]: `"${md5}"` } });
-  try {
-    writeCombinedDropboxFixture(resolver, objects);
-    const output = await runV2ObservationsRepair({ env: resolver.env, repairPlan: initial.repairPlan });
-    const proposal = output.planning.proposals.find((candidate) => candidate.key === initial.metadataKey);
-    assert.equal(proposal.changed, false);
-    assert.equal(proposal.baseline_source, "dropbox");
-    const metadata = output.planning.days[0].index.results[0].timeseries_metadata;
-    assert.equal(metadata.unchanged_object_count, 0, "the shared planner has no remote ETag in the combined-local adapter");
-    assert.equal(fake.puts.size, 0);
-  } finally {
-    fake.restore();
-    resolver.cleanup();
-  }
-});
-
-test("metadata write simulation GET-verifies the target and is idempotent", async () => {
-  const fixture = metadataRepairFixture({
-    existingEntries: [metadataEntry({ dayUtc: "2026-05-16" }), metadataEntry({ dayUtc: DAY, rowCount: 99 })],
-  });
-  const resolver = combinedResolverEnv();
-  const fake = installFakeR2(fixture.objects, { etags: { [fixture.metadataKey]: '"metadata-live-v1"' } });
-  try {
-    writeCombinedDropboxFixture(resolver, fixture.objects);
-    const first = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: fixture.repairPlan });
-    assert.equal(first.status, "succeeded", JSON.stringify(first.application_failure));
-    const metadataPut = fake.requests.findIndex((request) => request.method === "PUT" && request.key === fixture.metadataKey);
-    const metadataVerify = fake.requests.findIndex((request, index) => index > metadataPut && request.method === "GET" && request.key === fixture.metadataKey);
-    assert.ok(metadataPut >= 0 && metadataVerify > metadataPut);
-    assert.equal([...fake.puts.keys()].some((key) => key.endsWith(".parquet")), false);
-    const putCount = fake.requests.filter((request) => request.method === "PUT").length;
-    writeCombinedDropboxFixture(resolver, Object.fromEntries(fake.puts));
-    const second = await runV2ObservationsRepair({ argv: ["--write-r2"], env: resolver.env, repairPlan: fixture.repairPlan });
-    assert.equal(["planned", "skipped_unchanged", "succeeded"].includes(second.status), true);
-    assert.equal(fake.requests.filter((request) => request.method === "PUT").length, putCount);
   } finally {
     fake.restore();
     resolver.cleanup();
@@ -923,68 +739,6 @@ function proposalFromManifest(manifest, kind = "pollutant_manifest") {
     new_sha256: createHash("sha256").update(body).digest("hex"),
     dependencies: [],
     pre_write_guard: null,
-  };
-}
-
-function metadataEntry({ dayUtc, timeseriesId = 101, pollutantCode = "pm10", domain = "observations", rowCount = 12 }) {
-  return {
-    domain,
-    day_utc: dayUtc,
-    connector_id: 1,
-    pollutant_code: pollutantCode,
-    row_count: rowCount,
-    min_observed_at_utc: domain === "observations" ? `${dayUtc}T00:00:00.000Z` : null,
-    max_observed_at_utc: domain === "observations" ? `${dayUtc}T23:00:00.000Z` : null,
-    min_timestamp_hour_utc: domain === "aqilevels" ? `${dayUtc}T00:00:00.000Z` : null,
-    max_timestamp_hour_utc: domain === "aqilevels" ? `${dayUtc}T23:00:00.000Z` : null,
-    source_index_key: domain === "observations"
-      ? `${PREFIX}/day_utc=${dayUtc}/connector_id=1/pollutant_code=${pollutantCode}/manifest.json`
-      : `history/v2/aqilevels/hourly/data/day_utc=${dayUtc}/connector_id=1/pollutant_code=${pollutantCode}/manifest.json`,
-    source_manifest_hash: `fixture-${timeseriesId}-${domain}-${dayUtc}`,
-    backed_up_at_utc: `${dayUtc}T23:00:00.000Z`,
-  };
-}
-
-function metadataRepairFixture({ timeseriesId = 101, pollutantCode = "pm10", existingEntries = null } = {}) {
-  const pollutantManifest = pollutantForTimeseries(1, pollutantCode, timeseriesId);
-  const connector = buildHistoryV2ConnectorManifest({
-    domain: "observations", dayUtc: DAY, connectorId: 1, runId: "fixture",
-    manifestKey: `${PREFIX}/day_utc=${DAY}/connector_id=1/manifest.json`, pollutantManifests: [pollutantManifest],
-    writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-  });
-  const day = buildHistoryV2DayManifest({
-    domain: "observations", dayUtc: DAY, runId: "fixture", manifestKey: `${PREFIX}/day_utc=${DAY}/manifest.json`,
-    connectorManifests: [connector], writerGitSha: "fixture", backedUpAtUtc: "2026-05-18T00:00:00.000Z",
-  });
-  const metadataKey = `history/_index_v2/timeseries/timeseries_id=${timeseriesId}.json`;
-  const objects = {
-    [pollutantManifest.manifest_key]: JSON.stringify(pollutantManifest, null, 2),
-    [connector.manifest_key]: JSON.stringify(connector, null, 2),
-    [day.manifest_key]: JSON.stringify(day, null, 2),
-  };
-  if (existingEntries) {
-    const payload = buildHistoryV2TimeseriesMetadataIndexPayload({
-      timeseriesId,
-      entries: existingEntries,
-      generatedAt: `${DAY}T00:00:00.000Z`,
-    });
-    objects[metadataKey] = `${JSON.stringify(payload, null, 2)}\n`;
-  }
-  return {
-    objects,
-    pollutantManifest,
-    connector,
-    day,
-    metadataKey,
-    repairPlan: {
-      ...observationsRepairPlan(repairAction({
-        kind: "observation_index_repair",
-        connector_id: 1,
-        pollutant_code: pollutantCode,
-        requires_index_rebuild: true,
-      })),
-      authoritative_core_timeseries: [{ timeseries_id: timeseriesId, connector_id: 1, pollutant_code: pollutantCode }],
-    },
   };
 }
 
@@ -1474,7 +1228,6 @@ test("Phase 7 index-only blocked work controls the scope and top-level repair re
         connectorIds.push(connectorId);
         return {
         blocked_dependency_count: 1,
-        timeseries_metadata: { status: "blocked_dependency" },
         };
       },
     });

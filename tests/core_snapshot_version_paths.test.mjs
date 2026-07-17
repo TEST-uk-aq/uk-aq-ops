@@ -54,7 +54,7 @@ test('core snapshot binding resolver uses only stable authoritative identity fie
       id: 3742, connector_id: 6, station_id: 91, phenomenon_id: 17,
     }],
     phenomenaRows: [{ id: 17, observed_property_id: 4 }],
-    observedPropertiesRows: [{ id: 4, label: 'PM2.5' }],
+    observedPropertiesRows: [{ id: 4, code: 'pm25', label: 'PM2.5' }],
   });
   assert.deepEqual(bindings, [{
     timeseries_id: 3742,
@@ -64,4 +64,13 @@ test('core snapshot binding resolver uses only stable authoritative identity fie
     phenomenon_id: 17,
     observed_property_id: 4,
   }]);
+});
+
+test('core snapshot binding resolver rejects guessed pollutant identity', () => {
+  const bindings = buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows({
+    timeseriesRows: [{ id: 3742, connector_id: 6, phenomenon_id: 17, label: 'PM2.5' }],
+    phenomenaRows: [{ id: 17, observed_property_id: 4, label: 'PM2.5' }],
+    observedPropertiesRows: [{ id: 4, notation: 'PM2.5', label: 'PM2.5' }],
+  });
+  assert.equal(bindings[0].pollutant_code, null);
 });
