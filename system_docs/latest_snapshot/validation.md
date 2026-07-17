@@ -2,151 +2,147 @@
 
 ## Validation principle
 
-The latest-snapshot service runs on the TEST system. Pre-deployment validation must therefore remain deliberately small and must not delay functional testing through the real deployed pipeline.
+Latest Snapshot runs on the UK AQ TEST system. Pre-deployment validation must remain deliberately small so functional validation happens through the real deployed pipeline.
 
-Before deployment, perform only:
+Follow `AGENTS.md`:
 
-1. structural confirmation that the proposed code preserves the authoritative contract;
-2. basic syntax/type validation for changed files;
-3. one compact deterministic regression check for the invalid-state transition.
+- perform as little pre-deployment testing as reasonably possible;
+- run only the smallest structural or syntax/type check needed;
+- do not create new automated tests by default;
+- add a targeted deterministic check only for a specific high-risk regression that is difficult to detect through normal TEST operation;
+- do not run broad suites, exhaustive edge cases, shadow comparisons or soak tests unless explicitly requested.
 
-Functional validation happens after deployment through normal TEST operation using the real Cloud Scheduler, Cloud Run service, Pub/Sub subscription, R2 state, public API and website.
+For a reversible Latest Snapshot change, one successful normal operation and one representative output check are generally sufficient.
 
-Do not create or run a broad speculative pre-deployment test suite.
+## Structural review before implementation
 
-## Pre-implementation structural review
+Confirm only the dependencies that could make the proposed structure invalid.
 
-Before changing code, confirm that the proposed implementation can:
+For the current all-only architecture, the load-bearing structural checks are:
 
-- resolve the incoming row to its observed property before state replacement;
-- share one value-eligibility rule between state application and source-row defence-in-depth filtering;
-- skip invalid state changes while retaining the message for acknowledgement;
-- preserve the existing state schema;
-- preserve the public v2 row and HTTP contracts;
-- repair existing poisoned state separately from normal message handling.
+- no active consumer requires finite physical objects;
+- the physical manifest is treated as a stored-product manifest rather than a public request catalogue;
+- the cache proxy and website continue forwarding the same public window parameter;
+- the Worker can read and parse the pollutant's physical `all` payload within its runtime limits;
+- state, Pub/Sub acknowledgement and metadata ordering are not accidentally changed.
 
-If metadata cannot be available before state application without a larger ordering change, document the alternative and prove structurally that an invalid row cannot replace state.
+Do not inspect archive code as an active dependency.
 
-## Minimal deterministic regression check
+## Minimal pre-deployment checks
 
-Use one compact table-driven or similarly narrow check covering only the load-bearing defect and boundaries:
+Use only:
 
-- a valid row creates state;
-- a newer `-99` does not replace an existing valid row;
-- an invalid row between two valid rows does not prevent the later valid row becoming state;
-- zero is valid;
-- PM2.5 above `500` is rejected;
-- PM10 above `600` is rejected;
-- negative NO2 is rejected;
-- an invalid-only batch does not alter state bytes or the retained row's `ingested_at`;
-- an invalid decoded row is still handled for acknowledgement after successful classification.
+- syntax or type validation for changed files;
+- workflow parsing where deployment configuration changed;
+- at most one directly relevant existing fast check when genuinely useful.
 
-The Manchester-style sequence is the primary regression:
+A targeted state-transition check is justified only when the latest-current-value policy or state application ordering changes. The compact regression is:
 
 ```text
 08:00  21.793  valid
 09:00  -99     invalid
 ```
 
-Required result:
+Required state:
 
 ```text
-retained observed_at=08:00
-retained value=21.793
+observed_at=08:00
+value=21.793
 ```
 
-Do not expand this into a broad suite of unrelated latest-snapshot, API, cache, network or deployment tests before deploying to TEST.
+Do not expand this into a broad API, cache, network or website test suite before deploying to TEST.
 
-## Minimal local checks
+## Current architecture acceptance
 
-Run only:
+### Physical builder product
 
-- syntax/type validation for changed latest-snapshot files;
-- the single focused state-policy regression check;
-- an existing fast service-core check only where it is already required by the deployment workflow and runs locally without external calls.
+A successful normal run must show:
 
-Do not run broad repository suites, backfills, Pub/Sub calls, R2 writes, Supabase queries or website automation before deployment.
+- `success_count=3`;
+- `failure_count=0`;
+- `matrix.windows=["all"]`;
+- three manifest entries;
+- each object key ends with `window=all.json`;
+- unchanged physical payloads continue skipping writes;
+- no new metadata, timeout, overlap or R2 errors;
+- dedicated Pub/Sub acknowledgement remains healthy.
 
-## Diff review before deployment
+### Representative finite response
 
-Compare the diff with [`contract.md`](contract.md).
-
-Confirm there are no unintended changes to:
-
-- v2 types and field lists;
-- R2 prefixes and keys;
-- matrix pollutants or windows;
-- metadata and network rules;
-- display-name formatting;
-- sort order and cursor logic;
-- Pub/Sub pull and acknowledgement bounds;
-- Cloud Run overlap and timeout logic;
-- API Worker or cache-proxy behaviour;
-- raw observation publishing or storage.
-
-Once these minimal checks pass, deploy to TEST rather than adding more pre-deployment testing.
-
-## TEST deployment validation
-
-Functional validation occurs through normal TEST operation.
-
-### Builder health
-
-After deployment, confirm:
-
-- scheduled runs complete;
-- metadata loads successfully before state application where the new ordering is used;
-- Pub/Sub backlog does not grow because invalid rows are unacknowledged;
-- invalid-value skips are reported;
-- state entry count remains plausible;
-- invalid-only handling does not generate unnecessary state writes;
-- no new metadata or matrix failures appear.
-
-### Known Manchester Piccadilly case
-
-For connector `1`, timeseries `360`:
-
-- raw history retains the `2026-07-16 09:00:00+00` value `-99`;
-- latest state retains or is repaired to the newest valid observation;
-- if no newer valid row exists, the expected state is `2026-07-16 08:00:00+00`, value `21.793`;
-- `window=all` contains the timeseries;
-- finite windows use the retained valid timestamp;
-- the public response never emits `-99` as `last_value`;
-- website search can find the station when otherwise eligible;
-- the hex map can display it when otherwise eligible.
-
-### Public interface compatibility
-
-Compare a representative response before and after deployment.
+One representative finite request, normally PM2.5 `3h`, is sufficient unless it exposes a problem.
 
 Confirm:
 
-- top-level fields are unchanged;
-- latest row field names are unchanged;
-- scalar v2 network fields remain unchanged;
-- omitted v1 and membership fields remain absent;
-- `X-UK-AQ-Snapshot-Contract: v2` remains present;
-- cache-proxy route and query parameters remain unchanged.
+- HTTP `200`;
+- `X-UK-AQ-Snapshot-Contract: v2` is accepted through the normal path;
+- top-level and row field names remain unchanged;
+- every returned row has a parseable `last_value_at` within the inclusive cutoff from the start of the current UTC minute;
+- `count` matches returned data;
+- `next_since` and `next_since_id` match the newest returned timestamp and tie-break ID;
+- the response uses a derived finite ETag.
 
-### Matrix and manifest
+Do not compare every pollutant and every public window unless the representative check identifies a defect.
 
-Confirm:
+### `window=all`
 
-- all 15 configured pollutant/window combinations remain represented;
-- unchanged objects still skip writes;
-- changed objects have matching manifest hashes and row counts;
-- no matrix entry fails solely because an invalid observation was skipped.
+When specifically relevant, confirm that `window=all` is served from the physical object and retains its physical ETag. A separate all-response check is not required for every reversible change.
+
+### Website output
+
+Load the normal TEST map or station search once and confirm Latest Snapshot data displays. Do not run broad browser automation or a manual regression programme by default.
+
+## Latest-valid state acceptance
+
+When state policy or recovery is in scope, confirm only the affected behaviour:
+
+- raw invalid observations remain retained by the raw-data path;
+- invalid pollutant values do not create or replace latest state;
+- zero remains valid;
+- the previous valid row remains in the physical `all` object;
+- finite public windows use that valid row's timestamp;
+- decoded invalid messages are acknowledged after handling;
+- the public response does not emit an invalid current value.
+
+The historical Manchester Piccadilly identity may be used as a concrete diagnostic example, but it is not a mandatory repeated test for unrelated changes.
+
+## Cache validation
+
+Finite response identity changes with:
+
+- source physical ETag;
+- requested window;
+- effective UTC minute.
+
+A matching `If-None-Match` may return `304`. Test this only when ETag or conditional-request code changes.
+
+## Failure and rollback validation
+
+When both components change, deploy the Worker first and the builder second.
+
+If rollback is required after both are deployed:
+
+1. roll back the builder so finite objects resume updating;
+2. roll back the Worker;
+3. make one representative public request.
+
+Do not modify latest state or raw observations for an architecture rollback.
+
+## Current TEST status
+
+The all-only builder and deriving R2 API Worker were deployed and confirmed running successfully on TEST on 17 July 2026.
 
 ## Acceptance criteria
 
-The latest-snapshot issue is fixed only when:
+The system conforms to this documentation when:
 
-1. raw invalid observations remain retained by the raw-data path;
-2. invalid pollutant values do not create or replace latest state;
-3. zero remains valid;
-4. previous valid state remains available to `window=all`;
-5. finite windows use the valid observation timestamp;
-6. decoded invalid messages are acknowledged after handling;
-7. existing poisoned state is repaired or replaced by a newer valid row;
-8. the website search and hex map work again for the affected station;
-9. no unrelated public, metadata, scheduling or cache behaviour changed.
+1. latest-valid state rules remain intact;
+2. the builder stores only three physical `window=all` objects;
+3. the physical manifest contains only those three entries;
+4. the API continues accepting `3h`, `6h`, `1d`, `7d` and `all`;
+5. finite responses derive from `last_value_at` at the UTC-minute cutoff;
+6. finite order, counts and cursors are correct;
+7. finite ETags are time-aware;
+8. public v2 fields, route and query parameters remain unchanged;
+9. Pub/Sub acknowledgement and normal scheduled operation remain healthy;
+10. one representative website output works;
+11. no broad or speculative testing is required unless a real problem is found.
