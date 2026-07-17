@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_TABLES,
   buildAuthoritativeTimeseriesBindingsFromCoreSnapshotRows,
+  buildTimeseriesBindingSourceFingerprint,
   resolveCoreSnapshotPrefix,
 } from '../scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs';
 import { resolveDomainPrefixes } from '../scripts/backup_r2/build_backup_inventory.mjs';
@@ -73,4 +74,15 @@ test('core snapshot binding resolver rejects guessed pollutant identity', () => 
     observedPropertiesRows: [{ id: 4, notation: 'PM2.5', label: 'PM2.5' }],
   });
   assert.equal(bindings[0].pollutant_code, null);
+});
+
+test('binding source fingerprint is deterministic and changes with source or algorithm metadata', () => {
+  const artifacts = [
+    { table: 'timeseries', row_count: 3, sha256_uncompressed: 'a'.repeat(64) },
+    { table: 'phenomena', row_count: 2, sha256_uncompressed: 'b'.repeat(64) },
+    { table: 'observed_properties', row_count: 4, sha256_uncompressed: 'c'.repeat(64) },
+  ];
+  const first = buildTimeseriesBindingSourceFingerprint(artifacts);
+  assert.equal(first.fingerprint, buildTimeseriesBindingSourceFingerprint([...artifacts].reverse()).fingerprint);
+  assert.notEqual(first.fingerprint, buildTimeseriesBindingSourceFingerprint([{ ...artifacts[0], sha256_uncompressed: 'd'.repeat(64) }, ...artifacts.slice(1)]).fingerprint);
 });
