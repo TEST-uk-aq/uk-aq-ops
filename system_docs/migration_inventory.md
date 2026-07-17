@@ -60,18 +60,20 @@ A document is not deleted or redirected until its current content has been revie
 | Current file | Status | Target action |
 |---|---|---|
 | `system_docs_legacy/uk-aq-latest-snapshot.md` | Historical | Current behaviour lives under `system_docs/latest_snapshot/`. Do not recreate a second editable authority. |
-| `workers/uk_aq_latest_snapshot_cloud_run/README.md` | Active implementation guide | Retain locally. Its all-only physical-product summary is aligned with the authoritative area. |
+| `workers/uk_aq_latest_snapshot_cloud_run/README.md` | Active implementation guide | Retain locally. Its all-only products, warm-cache variables and run-report modes are aligned with the authoritative area. |
+| `workers/uk_aq_latest_snapshot_cloud_run/local_r2_cache.ts` | Active implementation | Current focused helper for disposable ETag-validated local copies. Behaviour is governed by `system_docs/latest_snapshot/`. |
 | `workers/uk_aq_latest_snapshot_r2_api_worker/README.md` | Active implementation guide | Retain locally. Its finite-window derivation summary is aligned with the authoritative area. |
-| `system_docs/latest_snapshot/README.md` | Authoritative | Area ownership, physical/public matrix distinction, implementation status and reading order. |
-| `system_docs/latest_snapshot/contract.md` | Authoritative | Latest-valid state, all-only physical products, finite derivation, cache identity and compatibility rules. |
-| `system_docs/latest_snapshot/data_flow.md` | Authoritative | End-to-end pipeline from Pub/Sub through physical R2 products to derived public windows. |
-| `system_docs/latest_snapshot/state_model.md` | Authoritative | State identity, eligibility, transitions and timestamp meanings. |
-| `system_docs/latest_snapshot/interfaces.md` | Authoritative | Pub/Sub, state, physical R2 object, manifest and HTTP interfaces. |
-| `system_docs/latest_snapshot/operations.md` | Authoritative | Runtime, configuration, schedule, deployment order, rollback and monitoring. |
-| `system_docs/latest_snapshot/recovery.md` | Authoritative | State repair, physical-product regeneration and rollback. |
-| `system_docs/latest_snapshot/validation.md` | Authoritative | Minimal pre-deployment checks and real TEST operational acceptance. |
+| `system_docs/latest_snapshot/README.md` | Authoritative | Area ownership, physical/public matrix distinction, durable authority, warm cache, report policy, implementation status and reading order. |
+| `system_docs/latest_snapshot/contract.md` | Authoritative | Latest-valid state, durable authority, local-cache validation, run-report modes, all-only products, finite derivation and compatibility rules. |
+| `system_docs/latest_snapshot/data_flow.md` | Authoritative | End-to-end pipeline from Pub/Sub through durable R2/local-cache handling and physical products to derived public windows. |
+| `system_docs/latest_snapshot/state_model.md` | Authoritative | State identity, eligibility, transitions, timestamp meanings and separation from transient local cache files. |
+| `system_docs/latest_snapshot/interfaces.md` | Authoritative | Pub/Sub, state, local sidecar, physical R2 object, manifest, run-report and HTTP interfaces. |
+| `system_docs/latest_snapshot/operations.md` | Authoritative | Runtime, configuration, warm-cache handling, report modes, schedule, deployment, rollback and monitoring. |
+| `system_docs/latest_snapshot/recovery.md` | Authoritative | State repair, local-cache fault handling, report-policy rollback, physical-product regeneration and architecture rollback. |
+| `system_docs/latest_snapshot/validation.md` | Authoritative | Minimal pre-deployment checks and real TEST acceptance for state, cache, reports and public output. |
 | `system_docs/latest_snapshot/decisions/0001-latest-valid-observation-state.md` | Authoritative | Rationale and implementation status for consumer-side latest-valid state. |
 | `system_docs/latest_snapshot/decisions/0002-finite-windows-from-all-snapshot.md` | Authoritative | Rationale for three physical `all` products and request-time finite responses. |
+| `system_docs/latest_snapshot/decisions/0003-warm-local-cache-and-run-report-policy.md` | Authoritative | Rationale for ETag-validated `/tmp` copies and failures-by-default run reports. |
 
 ## Dashboards
 
