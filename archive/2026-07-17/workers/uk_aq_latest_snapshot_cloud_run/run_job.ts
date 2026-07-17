@@ -309,7 +309,10 @@ const UK_AQ_LATEST_SNAPSHOT_POLLUTANTS = parseCsvList(
   ["pm25", "pm10", "no2"],
 ).map((value) => normalizeMatrixPollutant(value)).filter((value): value is string => Boolean(value));
 
-const UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW = "all";
+const UK_AQ_LATEST_SNAPSHOT_WINDOWS = parseCsvList(
+  Deno.env.get("UK_AQ_LATEST_SNAPSHOT_WINDOWS"),
+  ["3h", "6h", "1d", "7d", "all"],
+).map((value) => normalizeWindow(value)).filter((value): value is string => Boolean(value));
 
 const UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP =
   (Deno.env.get("UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP") || "all").trim().toLowerCase() || "all";
@@ -449,6 +452,12 @@ function normalizePollutant(value: string | null): string | null {
   if (compact === "pm10") return "pm10";
   if (compact === "no2") return "no2";
   return normalized.toLowerCase();
+}
+
+function normalizeWindow(value: string | null): string | null {
+  const normalized = normalizeText(value)?.toLowerCase();
+  if (!normalized) return null;
+  return ["3h", "6h", "1d", "7d", "all"].includes(normalized) ? normalized : null;
 }
 
 function measureUtf8Bytes(value: string): number {
@@ -1241,6 +1250,15 @@ function minMaxObservedAt(rows: LatestItem[]): { min: string | null; max: string
   return { min, max };
 }
 
+function computeWindowCutoffMs(windowLabel: string, nowMs: number): number | null {
+  if (windowLabel === "all") return null;
+  if (windowLabel === "3h") return nowMs - 3 * 60 * 60 * 1000;
+  if (windowLabel === "6h") return nowMs - 6 * 60 * 60 * 1000;
+  if (windowLabel === "1d") return nowMs - 24 * 60 * 60 * 1000;
+  if (windowLabel === "7d") return nowMs - 7 * 24 * 60 * 60 * 1000;
+  return null;
+}
+
 function buildSourceRows(
   stateMap: Map<string, LatestStateEntry>,
   metadata: MetadataIndex,
@@ -1436,6 +1454,9 @@ async function main(): Promise<void> {
   if (UK_AQ_LATEST_SNAPSHOT_POLLUTANTS.length === 0) {
     throw new Error("UK_AQ_LATEST_SNAPSHOT_POLLUTANTS resolved empty.");
   }
+  if (UK_AQ_LATEST_SNAPSHOT_WINDOWS.length === 0) {
+    throw new Error("UK_AQ_LATEST_SNAPSHOT_WINDOWS resolved empty.");
+  }
 
   const triggerMode = (Deno.env.get("UK_AQ_LATEST_SNAPSHOT_TRIGGER_MODE") || "manual").trim().toLowerCase() || "manual";
   const startedAt = utcNowIso();
@@ -1497,16 +1518,7 @@ async function main(): Promise<void> {
     warnings.push(`missing_metadata_rows=${sourceRows.missingMetadata}`);
   }
 
-  const sourceRowsByPollutant = new Map<string, LatestItem[]>();
-  for (const sourceRow of sourceRows.rows) {
-    const rows = sourceRowsByPollutant.get(sourceRow.pollutant);
-    if (rows) {
-      rows.push(sourceRow.item);
-    } else {
-      sourceRowsByPollutant.set(sourceRow.pollutant, [sourceRow.item]);
-    }
-  }
-
+  const nowMs = Date.now();
   const entries: SnapshotManifestEntry[] = [];
   let successCount = 0;
   let failureCount = 0;
@@ -1514,110 +1526,114 @@ async function main(): Promise<void> {
   let skippedUnchangedCount = 0;
 
   for (const pollutant of UK_AQ_LATEST_SNAPSHOT_POLLUTANTS) {
-    const itemStarted = Date.now();
-    const id = matrixId(
-      UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
-      pollutant,
-      UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-    );
-    const key = snapshotKey(
-      UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
-      pollutant,
-      UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-    );
-    const previous = previousById.get(id) || null;
-    try {
-      const rows = [...(sourceRowsByPollutant.get(pollutant) || [])];
+    for (const windowLabel of UK_AQ_LATEST_SNAPSHOT_WINDOWS) {
+      const itemStarted = Date.now();
+      const id = matrixId(UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP, pollutant, windowLabel);
+      const key = snapshotKey(UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP, pollutant, windowLabel);
+      const previous = previousById.get(id) || null;
+      try {
+        const cutoffMs = computeWindowCutoffMs(windowLabel, nowMs);
+        const rows = sourceRows.rows
+          .filter((row) => row.pollutant === pollutant)
+          .map((row) => row.item)
+          .filter((item) => {
+            if (cutoffMs === null) return true;
+            const observedAt = normalizeTimestamp(item.last_value_at);
+            if (!observedAt) return false;
+            return Date.parse(observedAt) >= cutoffMs;
+          });
 
-      sortSnapshotRows(rows);
-      const nextCursor = deriveNextCursor(rows);
-      const payload: SnapshotPayload = {
-        region: null,
-        pcon_code: null,
-        pollutant,
-        window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-        since: null,
-        since_id: null,
-        next_since: nextCursor.since,
-        next_since_id: nextCursor.sinceId,
-        count: rows.length,
-        data: rows,
-      };
+        sortSnapshotRows(rows);
+        const nextCursor = deriveNextCursor(rows);
+        const payload: SnapshotPayload = {
+          region: null,
+          pcon_code: null,
+          pollutant,
+          window: windowLabel,
+          since: null,
+          since_id: null,
+          next_since: nextCursor.since,
+          next_since_id: nextCursor.sinceId,
+          count: rows.length,
+          data: rows,
+        };
 
-      const body = `${toStableJson(payload)}\n`;
-      const bodyBytes = TEXT_ENCODER.encode(body);
-      const hash = sha256Hex(bodyBytes);
-      const etag = `"sha256-${hash}"`;
-      const changed = previous?.sha256 !== hash || previous?.object_key !== key;
-      const itemDurationMs = Date.now() - itemStarted;
+        const body = `${toStableJson(payload)}\n`;
+        const bodyBytes = TEXT_ENCODER.encode(body);
+        const hash = sha256Hex(bodyBytes);
+        const etag = `"sha256-${hash}"`;
+        const changed = previous?.sha256 !== hash || previous?.object_key !== key;
+        const itemDurationMs = Date.now() - itemStarted;
 
-      if (changed) {
-        await r2PutObject({
-          r2: R2_CONFIG,
-          key,
-          body: bodyBytes,
-          content_type: "application/json; charset=utf-8",
-        });
-        changedCount += 1;
-      } else {
-        skippedUnchangedCount += 1;
-      }
+        if (changed) {
+          await r2PutObject({
+            r2: R2_CONFIG,
+            key,
+            body: bodyBytes,
+            content_type: "application/json; charset=utf-8",
+          });
+          changedCount += 1;
+        } else {
+          skippedUnchangedCount += 1;
+        }
 
-      const observed = minMaxObservedAt(rows);
-      entries.push({
-        id,
-        network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
-        pollutant,
-        window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-        object_key: key,
-        content_type: "application/json; charset=utf-8",
-        content_encoding: null,
-        sha256: hash,
-        etag,
-        row_count: rows.length,
-        bytes: bodyBytes.byteLength,
-        min_observed_at: observed.min,
-        max_observed_at: observed.max,
-        generated_at: utcNowIso(),
-        build_duration_ms: itemDurationMs,
-        previous_sha256: previous?.sha256 ?? null,
-        changed,
-        error: null,
-      });
-      successCount += 1;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      failureCount += 1;
-      warnings.push(`${id}: ${message}`);
-      if (previous) {
-        entries.push({
-          ...previous,
-          build_duration_ms: Date.now() - itemStarted,
-          generated_at: utcNowIso(),
-          changed: false,
-          error: message,
-        });
-      } else {
+
+        const observed = minMaxObservedAt(rows);
         entries.push({
           id,
           network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
           pollutant,
-          window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-          object_key: null,
+          window: windowLabel,
+          object_key: key,
           content_type: "application/json; charset=utf-8",
           content_encoding: null,
-          sha256: null,
-          etag: null,
-          row_count: null,
-          bytes: null,
-          min_observed_at: null,
-          max_observed_at: null,
+          sha256: hash,
+          etag,
+          row_count: rows.length,
+          bytes: bodyBytes.byteLength,
+          min_observed_at: observed.min,
+          max_observed_at: observed.max,
           generated_at: utcNowIso(),
-          build_duration_ms: Date.now() - itemStarted,
-          previous_sha256: null,
-          changed: false,
-          error: message,
+          build_duration_ms: itemDurationMs,
+          previous_sha256: previous?.sha256 ?? null,
+          changed,
+          error: null,
         });
+        successCount += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failureCount += 1;
+        warnings.push(`${id}: ${message}`);
+        if (previous) {
+          entries.push({
+            ...previous,
+            build_duration_ms: Date.now() - itemStarted,
+            generated_at: utcNowIso(),
+            changed: false,
+            error: message,
+          });
+        } else {
+          entries.push({
+            id,
+            network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
+            pollutant,
+            window: windowLabel,
+            object_key: null,
+            content_type: "application/json; charset=utf-8",
+            content_encoding: null,
+            sha256: null,
+            etag: null,
+            row_count: null,
+            bytes: null,
+            min_observed_at: null,
+            max_observed_at: null,
+            generated_at: utcNowIso(),
+            build_duration_ms: Date.now() - itemStarted,
+            previous_sha256: null,
+            changed: false,
+            error: message,
+          });
+        }
       }
     }
   }
@@ -1643,7 +1659,7 @@ async function main(): Promise<void> {
     matrix: {
       network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
       pollutants: [...UK_AQ_LATEST_SNAPSHOT_POLLUTANTS],
-      windows: [UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW],
+      windows: [...UK_AQ_LATEST_SNAPSHOT_WINDOWS],
     },
     build: {
       started_at: startedAt,

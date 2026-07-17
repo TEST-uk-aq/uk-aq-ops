@@ -7,12 +7,6 @@ const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 
 const VALID_WINDOWS = new Set(["3h", "6h", "1d", "7d", "all"]);
 const VALID_NETWORK_GROUPS = new Set(["all"]);
-const FINITE_WINDOW_DURATIONS_MS = Object.freeze({
-  "3h": 3 * 60 * 60 * 1000,
-  "6h": 6 * 60 * 60 * 1000,
-  "1d": 24 * 60 * 60 * 1000,
-  "7d": 7 * 24 * 60 * 60 * 1000,
-});
 
 function corsHeaders() {
   return {
@@ -135,52 +129,6 @@ function setObjectHeaders(headers, object, cacheSeconds) {
   }
 }
 
-function objectEtag(object) {
-  return object.httpEtag || (object.etag ? `"${object.etag}"` : null);
-}
-
-function effectiveUtcMinuteMs(nowMs = Date.now()) {
-  return Math.floor(nowMs / 60_000) * 60_000;
-}
-
-function parseLastValueAtMs(row) {
-  const value = typeof row?.last_value_at === "string" ? row.last_value_at.trim() : "";
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function deriveNextCursor(rows) {
-  let bestSince = null;
-  let bestId = null;
-  let bestMs = Number.NEGATIVE_INFINITY;
-  for (const row of rows) {
-    const rowMs = parseLastValueAtMs(row);
-    if (rowMs === null) continue;
-    const rowId = Number.isInteger(row?.id) && row.id >= 0 ? row.id : 0;
-    if (rowMs > bestMs) {
-      bestMs = rowMs;
-      bestSince = new Date(rowMs).toISOString();
-      bestId = rowId;
-      continue;
-    }
-    if (rowMs === bestMs && rowId > (bestId ?? 0)) {
-      bestId = rowId;
-    }
-  }
-  return {
-    since: bestSince,
-    sinceId: bestSince ? (bestId ?? 0) : null,
-  };
-}
-
-async function finiteResponseEtag(sourceEtag, windowLabel, effectiveMinuteMs) {
-  const source = `${sourceEtag || ""}\n${windowLabel}\n${effectiveMinuteMs}`;
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source));
-  const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `"sha256-${hash}"`;
-}
-
 function buildSnapshotKey(prefix, networkGroup, pollutant, windowLabel) {
   return `${prefix}/network_group=${networkGroup}/pollutant=${pollutant}/window=${windowLabel}.json`;
 }
@@ -212,7 +160,7 @@ async function getObjectResponse(env, key, method, cacheSeconds, ifNoneMatchHead
     return withError(404, "snapshot_not_found");
   }
 
-  const etag = objectEtag(object);
+  const etag = object.httpEtag || (object.etag ? `"${object.etag}"` : null);
   const ifNoneMatch = String(method === "GET" || method === "HEAD" ? (ifNoneMatchHeader || "") : "").trim();
   if (ifNoneMatch && etag && ifNoneMatch === etag) {
     const headers = new Headers(corsHeaders());
@@ -231,79 +179,6 @@ async function getObjectResponse(env, key, method, cacheSeconds, ifNoneMatchHead
   }
 
   return new Response(object.body, { status: 200, headers });
-}
-
-async function getFiniteWindowResponse(
-  env,
-  key,
-  pollutant,
-  windowLabel,
-  method,
-  cacheSeconds,
-  ifNoneMatchHeader,
-) {
-  const object = await env.UK_AQ_HISTORY_BUCKET.get(key);
-  if (!object) {
-    return withError(404, "snapshot_not_found");
-  }
-
-  const effectiveMinuteMs = effectiveUtcMinuteMs();
-  const etag = await finiteResponseEtag(objectEtag(object), windowLabel, effectiveMinuteMs);
-  const ifNoneMatch = String(method === "GET" || method === "HEAD" ? (ifNoneMatchHeader || "") : "").trim();
-  if (ifNoneMatch && ifNoneMatch === etag) {
-    const headers = new Headers(corsHeaders());
-    headers.set("Cache-Control", cacheControlHeader(cacheSeconds));
-    headers.set("ETag", etag);
-    headers.set("X-UK-AQ-Snapshot-Contract", LATEST_SNAPSHOT_CONTRACT_VERSION);
-    return new Response(null, { status: 304, headers });
-  }
-
-  let sourcePayload;
-  try {
-    sourcePayload = await object.json();
-  } catch {
-    return withError(500, "invalid_snapshot_payload");
-  }
-  if (
-    !sourcePayload ||
-    typeof sourcePayload !== "object" ||
-    Array.isArray(sourcePayload) ||
-    sourcePayload.pollutant !== pollutant ||
-    sourcePayload.window !== "all" ||
-    !Array.isArray(sourcePayload.data)
-  ) {
-    return withError(500, "invalid_snapshot_payload");
-  }
-
-  const durationMs = FINITE_WINDOW_DURATIONS_MS[windowLabel];
-  if (!durationMs) {
-    return withError(500, "invalid_window");
-  }
-  const cutoffMs = effectiveMinuteMs - durationMs;
-  const rows = sourcePayload.data.filter((row) => {
-    const rowMs = parseLastValueAtMs(row);
-    return rowMs !== null && rowMs >= cutoffMs;
-  });
-  const nextCursor = deriveNextCursor(rows);
-  const payload = {
-    ...sourcePayload,
-    window: windowLabel,
-    next_since: nextCursor.since,
-    next_since_id: nextCursor.sinceId,
-    count: rows.length,
-    data: rows,
-  };
-  const body = JSON.stringify(payload);
-  const headers = new Headers(corsHeaders());
-  setObjectHeaders(headers, object, cacheSeconds);
-  headers.set("ETag", etag);
-  headers.set("Content-Length", String(new TextEncoder().encode(body).byteLength));
-  headers.set("X-UK-AQ-Snapshot-Contract", LATEST_SNAPSHOT_CONTRACT_VERSION);
-
-  if (method === "HEAD") {
-    return new Response(null, { status: 200, headers });
-  }
-  return new Response(body, { status: 200, headers });
 }
 
 export default {
@@ -361,19 +236,8 @@ export default {
         return withError(400, "invalid_network_group");
       }
 
-      const key = buildSnapshotKey(prefix, networkGroup, pollutant, "all");
-      if (windowLabel === "all") {
-        return await getObjectResponse(env, key, request.method, cacheSeconds, requestIfNoneMatch);
-      }
-      return await getFiniteWindowResponse(
-        env,
-        key,
-        pollutant,
-        windowLabel,
-        request.method,
-        cacheSeconds,
-        requestIfNoneMatch,
-      );
+      const key = buildSnapshotKey(prefix, networkGroup, pollutant, windowLabel);
+      return await getObjectResponse(env, key, request.method, cacheSeconds, requestIfNoneMatch);
     }
 
     if (pathname === "/v1/manifest") {
