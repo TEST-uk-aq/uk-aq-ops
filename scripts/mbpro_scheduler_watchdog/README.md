@@ -11,6 +11,10 @@ per Worker, with a 900-second request timeout. A capped local attempt is logged
 and skipped; the next successfully claimed Worker run recovers from its last
 finished scheduler evaluation window.
 
+Each request explicitly sends `Accept: application/json` and the documented
+UK AQ Scheduler Watchdog browser-style user-agent so Cloudflare Browser
+Integrity Check does not reject Python urllib with error 1010.
+
 ## Local configuration
 
 Create a file outside the repository, for example:
