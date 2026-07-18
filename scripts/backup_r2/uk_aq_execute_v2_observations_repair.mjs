@@ -13,6 +13,7 @@ import {
   hasRequiredR2Config,
   r2GetObject,
   r2HeadObject,
+  r2ListAllObjects,
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
@@ -397,7 +398,7 @@ function parquetIso(value) {
 }
 
 async function parquetFileEntry({ store, key, domain, pollutantCode }) {
-  const object = store.getObject(key);
+  const object = await store.getObject(key);
   const file = new Uint8Array(object.body).slice().buffer;
   const metadata = await parquetMetadataAsync(file);
   const rowCount = Math.max(0, Number(metadata.num_rows || 0));
@@ -555,26 +556,159 @@ function existingManifestMetadata(store, {
   };
 }
 
-async function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId, pollutantCode, domain, dataReceipt = null }) {
+export function validateObservationDataReceipt(receipt, { dataPrefix, dayUtc, connectorId }) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+    || Number(receipt.receipt_schema_version) !== 2
+    || receipt.history_version !== "v2" || receipt.domain !== "observations"
+    || receipt.day_utc !== dayUtc || Number(receipt.connector_id) !== connectorId
+    || receipt.finalisation_status !== "complete_generations_get_verified"
+    || !Array.isArray(receipt.complete_requested_timeseries_ids)
+    || !Array.isArray(receipt.chunks) || !Array.isArray(receipt.completed_chunks)
+    || receipt.chunks.length !== Number(receipt.expected_chunk_count)
+    || receipt.completed_chunks.length !== Number(receipt.expected_chunk_count)
+    || (receipt.incomplete_chunk_identities || []).length
+    || (receipt.failed_chunks || []).length
+    || !Array.isArray(receipt.affected_pollutant_codes)
+    || !Array.isArray(receipt.files) || !receipt.files.length) {
+    throw new Error("targeted_data_receipt_contract_invalid");
+  }
+  const transactionId = String(receipt.transaction_id || "");
+  const expectedKey = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/transactions/transaction_id=${transactionId}/data-receipt.json`;
+  if (!transactionId || receipt.permanent_receipt_key !== expectedKey) {
+    throw new Error("targeted_data_receipt_key_invalid");
+  }
+  const declaredPollutants = new Set(receipt.affected_pollutant_codes.map((value) => String(value).toLowerCase()));
+  const partitions = receipt.complete_pollutant_partitions;
+  if (!partitions || typeof partitions !== "object" || Array.isArray(partitions)
+    || [...declaredPollutants].some((code) => !partitions[code])
+    || Object.keys(partitions).some((code) => !declaredPollutants.has(code))) {
+    throw new Error("targeted_data_receipt_partition_contract_invalid");
+  }
+  for (const file of receipt.files) {
+    const pollutantCode = String(file?.pollutant_code || "").toLowerCase();
+    const expectedPrefix = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/generation=${transactionId}/part-`;
+    if (!declaredPollutants.has(pollutantCode)
+      || typeof file?.key !== "string" || !file.key.startsWith(expectedPrefix) || !file.key.endsWith(".parquet")
+      || !/^[a-f0-9]{64}$/.test(String(file.content_sha256 || ""))
+      || !Number.isInteger(Number(file.bytes)) || Number(file.bytes) <= 0
+      || !Number.isInteger(Number(file.row_count)) || Number(file.row_count) <= 0
+      || !file.timeseries_row_counts || typeof file.timeseries_row_counts !== "object") {
+      throw new Error("targeted_data_receipt_file_contract_invalid");
+    }
+  }
+  for (const pollutantCode of declaredPollutants) {
+    const partition = partitions[pollutantCode];
+    const files = receipt.files.filter((entry) => String(entry.pollutant_code).toLowerCase() === pollutantCode);
+    const rowCount = files.reduce((total, entry) => total + Number(entry.row_count || 0), 0);
+    const counts = {};
+    for (const file of files) {
+      for (const [timeseriesId, count] of Object.entries(file.timeseries_row_counts || {})) {
+        counts[timeseriesId] = Number(counts[timeseriesId] || 0) + Number(count || 0);
+      }
+    }
+    if (!files.length || rowCount !== Number(partition.row_count)
+      || JSON.stringify(counts) !== JSON.stringify(partition.timeseries_row_counts || {})
+      || Number(partition.replaced_row_count || 0) + Number(partition.preserved_unaffected_row_count || 0) !== rowCount) {
+      throw new Error("targeted_data_receipt_partition_counts_invalid");
+    }
+  }
+  return receipt;
+}
+
+async function validLivePollutantManifestEvidence({ r2, dataPrefix, dayUtc, connectorId, pollutantCode }) {
+  const key = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+  try {
+    const object = await r2GetObject({ r2, key });
+    const payload = jsonObject(object, key);
+    assertV2ObservationsChildManifest(payload, { key, kind: "pollutant", dayUtc, connectorId });
+    if (payload.pollutant_code !== pollutantCode || !Array.isArray(payload.files) || !payload.files.length) return null;
+    return {
+      files: payload.files.map((entry) => ({
+        key: String(entry.key),
+        pollutant_code: pollutantCode,
+        bytes: Number(entry.bytes),
+        content_sha256: String(entry.etag_or_hash || ""),
+        row_count: Number(entry.row_count),
+      })),
+      payload,
+      provenance: {
+        run_id: "existing_live_manifest",
+        writer_git_sha: "existing_live_manifest",
+        backed_up_at_utc: "existing_live_manifest",
+        source: "existing_live_manifest",
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function permanentReceiptEvidence({ store, r2, dataPrefix, dayUtc, connectorId, pollutantCode }) {
+  const prefix = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/transactions/`;
+  const keyPattern = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}transaction_id=[^/]+/data-receipt\\.json$`);
+  const candidates = new Map();
+  const localEntries = store.listAllObjects({ prefix }).filter((entry) => keyPattern.test(entry.key));
+  const liveEntries = (await r2ListAllObjects({ r2, prefix })).filter((entry) => keyPattern.test(entry.key));
+  for (const entry of localEntries) {
+    const key = entry.key;
+    const object = store.getObjectIfExists(key);
+    if (!object) continue;
+    const receipt = validateObservationDataReceipt(jsonObject(object, key), { dataPrefix, dayUtc, connectorId });
+    if (!receipt.affected_pollutant_codes.includes(pollutantCode)) continue;
+    const identity = sha256Hex(object.body);
+    const existing = candidates.get(receipt.transaction_id);
+    if (existing && existing.identity !== identity) throw new Error("conflicting_permanent_transaction_receipt");
+    candidates.set(receipt.transaction_id, { receipt, identity });
+  }
+  for (const entry of liveEntries) {
+    const key = entry.key;
+    const object = await r2GetObject({ r2, key });
+    const receipt = validateObservationDataReceipt(jsonObject(object, key), { dataPrefix, dayUtc, connectorId });
+    if (!receipt.affected_pollutant_codes.includes(pollutantCode)) continue;
+    const identity = sha256Hex(object.body);
+    const existing = candidates.get(receipt.transaction_id);
+    if (existing && existing.identity !== identity) throw new Error("conflicting_permanent_transaction_receipt");
+    candidates.set(receipt.transaction_id, { receipt, identity });
+  }
+  const matches = [...candidates.values()];
+  if (matches.length > 1) throw new Error("ambiguous_permanent_transaction_receipt");
+  return matches[0]?.receipt || null;
+}
+
+export async function leafManifestSourceFromCombined({ store, r2, dataPrefix, base, dayUtc, connectorId, pollutantCode, domain, dataReceipt = null }) {
   const pollutantPrefix = `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
-  const receiptFiles = domain === "observations" && dataReceipt
-    ? (Array.isArray(dataReceipt.files) ? dataReceipt.files : []).filter((entry) =>
-      entry?.pollutant_code === pollutantCode && typeof entry?.key === "string"
-    ).sort((left, right) => String(left.key).localeCompare(String(right.key)))
+  let receipt = dataReceipt;
+  let manifestEvidence = null;
+  if (domain === "observations" && receipt) {
+    receipt = validateObservationDataReceipt(receipt, { dataPrefix, dayUtc, connectorId });
+  } else if (domain === "observations") {
+    manifestEvidence = await validLivePollutantManifestEvidence({ r2, dataPrefix, dayUtc, connectorId, pollutantCode });
+    if (!manifestEvidence) {
+      receipt = await permanentReceiptEvidence({ store, r2, dataPrefix, dayUtc, connectorId, pollutantCode });
+    }
+  }
+  const receiptFiles = receipt
+    ? receipt.files.filter((entry) => entry?.pollutant_code === pollutantCode && typeof entry?.key === "string")
+      .sort((left, right) => String(left.key).localeCompare(String(right.key)))
     : null;
   const partKeys = receiptFiles
     ? receiptFiles.map((entry) => String(entry.key))
-    : store.listAllObjects({ prefix: `${pollutantPrefix}/` })
-    .map((entry) => entry.key)
-    .filter((key) => new RegExp(`^${pollutantPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/part-\\d+\\.parquet$`).test(key))
-    .sort();
+    : manifestEvidence?.files.map((entry) => String(entry.key)) || (domain === "aqilevels"
+      ? store.listAllObjects({ prefix: `${pollutantPrefix}/` })
+        .map((entry) => entry.key)
+        .filter((key) => new RegExp(`^${pollutantPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/part-\\d+\\.parquet$`).test(key))
+        .sort()
+      : []);
   if (!partKeys.length) return { blocked_reason: "final_parquet_objects_unavailable" };
   const manifestKey = `${pollutantPrefix}/manifest.json`;
-  const metadata = existingManifestMetadata(store, { manifestKey, base, dayUtc, connectorId, pollutantCode, domain });
+  const metadata = manifestEvidence || existingManifestMetadata(store, { manifestKey, base, dayUtc, connectorId, pollutantCode, domain });
+  const exactStore = {
+    getObject: async (key) => store.getObjectIfExists(key) || await r2GetObject({ r2, key }),
+  };
   try {
     const files = [];
     for (const key of partKeys) {
-      const file = await parquetFileEntry({ store, key, domain, pollutantCode });
+      const file = await parquetFileEntry({ store: exactStore, key, domain, pollutantCode });
       const receiptFile = receiptFiles?.find((entry) => String(entry.key) === key);
       if (receiptFile && (
         file.bytes !== Number(receiptFile.bytes)
@@ -1373,15 +1507,11 @@ export async function runV2ObservationsRepair({
       const dataReceipt = domain === "observations"
         ? localStore.getObservationDataReceipt(dayUtc, scope.connectorId)
         : null;
-      const partEntries = localStore.listAllObjects({ prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=` });
       const availableCodes = dataReceipt
-        ? [...new Set((Array.isArray(dataReceipt.files) ? dataReceipt.files : []).map((entry) =>
-          typeof entry?.pollutant_code === "string" ? entry.pollutant_code.toLowerCase() : null
+        ? [...new Set((Array.isArray(dataReceipt.affected_pollutant_codes) ? dataReceipt.affected_pollutant_codes : []).map((entry) =>
+          typeof entry === "string" ? entry.toLowerCase() : null
         ).filter(Boolean))].sort()
-        : [...new Set(partEntries.map((entry) => {
-          const match = entry.key.match(/\/pollutant_code=([^/]+)\/(?:generation=[^/]+\/)?part-\d+\.parquet$/);
-          return match ? decodeURIComponent(match[1]).toLowerCase() : null;
-        }).filter(Boolean))].sort();
+        : [...wanted].sort();
       const selectedCodes = availableCodes.filter((code) => !wanted.size || wanted.has(code));
       const missingRequested = [...wanted].filter((code) => !availableCodes.includes(code));
       for (const pollutantCode of missingRequested) {
@@ -1395,7 +1525,17 @@ export async function runV2ObservationsRepair({
         continue;
       }
       for (const pollutantCode of selectedCodes) {
-        const source = await leafManifestSourceFromCombined({ store: localStore, base, dayUtc, connectorId: scope.connectorId, pollutantCode, domain, dataReceipt });
+        const source = await leafManifestSourceFromCombined({
+          store: localStore,
+          r2: config.r2,
+          dataPrefix,
+          base,
+          dayUtc,
+          connectorId: scope.connectorId,
+          pollutantCode,
+          domain,
+          dataReceipt,
+        });
         if (source.blocked_reason) {
           const blocked = { ...scope, pollutant_code: pollutantCode, status: "blocked_dependency", reason: source.blocked_reason };
           blockedScopes.push(blocked);

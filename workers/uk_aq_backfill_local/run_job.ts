@@ -63,6 +63,17 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
+import {
+  buildTargetedObservationPermanentReceiptKey,
+  inspectImmutableObject,
+  markTargetedObservationTransactionFinalised,
+  publishImmutableObject,
+  recordTargetedObservationChunkCompletion,
+  selectCompleteAffectedPollutantRows,
+  targetedObservationWriterEvidence,
+  validateTargetedObservationFinalisation,
+  writeJsonFileIdempotent,
+} from "./targeted_observation_transaction.mjs";
 
 type RunMode =
   | "local_to_aqilevels"
@@ -1158,6 +1169,9 @@ const SOURCE_TO_R2_TARGETED_STAGE_ENABLED = parseBooleanish(
 const SOURCE_TO_R2_TARGETED_STAGE_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT",
 );
+const SOURCE_TO_R2_TARGETED_TRANSACTION_STATE_PATH = optionalEnv(
+  "UK_AQ_BACKFILL_TARGETED_TRANSACTION_STATE_PATH",
+);
 const SOURCE_TO_R2_TARGETED_STAGE_FINALIZE = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE"),
   false,
@@ -1984,13 +1998,15 @@ function targetedObservationDataReceiptPath(dayUtc: string, connectorId: number)
 
 function writeTargetedObservationDataReceipt(dayUtc: string, connectorId: number, receipt: Record<string, unknown>): void {
   const receiptPath = targetedObservationDataReceiptPath(dayUtc, connectorId);
-  fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
-  const encoded = `${JSON.stringify(receipt, null, 2)}\n`;
-  const previous = fs.existsSync(receiptPath) ? fs.readFileSync(receiptPath, "utf8") : null;
-  if (previous !== null && previous !== encoded) {
-    throw new Error(`Conflicting targeted observation data receipt: ${receiptPath}`);
+  writeJsonFileIdempotent(receiptPath, receipt);
+}
+
+function targetedObservationTransactionStatePath(): string {
+  const statePath = String(SOURCE_TO_R2_TARGETED_TRANSACTION_STATE_PATH || "").trim();
+  if (!statePath) {
+    throw new Error("UK_AQ_BACKFILL_TARGETED_TRANSACTION_STATE_PATH is required for targeted observation staging");
   }
-  if (previous === null) fs.writeFileSync(receiptPath, encoded, "utf8");
+  return statePath;
 }
 
 async function putHistoryObjectWithTargetedStage(args: {
@@ -2037,6 +2053,7 @@ function readObsRowsForConnectorDayFromTargetedStage(
       pollutant_code: parsePollutantCode(row.pollutant_code),
       observed_at: observedAt,
       value,
+      status: optionalText(row.status),
     });
   }
   return rows;
@@ -4458,6 +4475,8 @@ async function exportObsConnectorRowsToR2(args: {
   rows_skipped_missing_pollutant_code?: number;
   example_missing_pollutant_rows?: MissingPollutantExampleRow[];
   pollutant_codes_written?: string[];
+  permanent_data_receipt_key?: string;
+  permanent_data_receipt_sha256?: string;
 }> {
   if (HISTORY_R2_WRITE_VERSION === "v2") {
     return await exportObsConnectorRowsToR2V2(args);
@@ -4627,6 +4646,304 @@ function groupObservationRowsByPollutant(
   return grouped;
 }
 
+type ObsV2ExportResult = {
+  rows_read: number;
+  objects_written_r2: number;
+  manifest_key: string;
+  connector_manifest: ObsConnectorManifest & Record<string, unknown>;
+  rows_with_missing_pollutant_code: number;
+  rows_skipped_missing_pollutant_code: number;
+  example_missing_pollutant_rows: MissingPollutantExampleRow[];
+  pollutant_codes_written: string[];
+  permanent_data_receipt_key?: string;
+  permanent_data_receipt_sha256?: string;
+};
+
+async function exportTargetedObsConnectorRowsToR2V2(args: {
+  run_id: string;
+  day_utc: string;
+  connector_id: number;
+  rows: ObsHistoryRow[];
+}): Promise<ObsV2ExportResult> {
+  const transactionId = targetedObservationTransactionId();
+  const statePath = targetedObservationTransactionStatePath();
+  const stagedRowsSha256 = sha256Hex(JSON.stringify(args.rows));
+  const transactionState = validateTargetedObservationFinalisation({
+    filePath: statePath,
+    transactionId,
+    dayUtc: args.day_utc,
+    connectorId: args.connector_id,
+    stagedMergedRowCount: args.rows.length,
+    stagedMergedRowsSha256: stagedRowsSha256,
+  });
+  const completeTargetIds = new Set<number>(transactionState.complete_requested_timeseries_ids);
+  const affectedPollutants = new Set<string>(transactionState.affected_pollutant_codes);
+  const rowsForWrite = selectCompleteAffectedPollutantRows(
+    args.rows,
+    transactionState.affected_pollutant_codes,
+  ) as ObsHistoryRow[];
+  const classification = classifyObservationRowsForV2PollutantPartitions(rowsForWrite);
+  if (classification.rows_skipped_missing_pollutant_code > 0) {
+    throw new Error("targeted observation finalisation contains rows without a valid pollutant_code");
+  }
+  const sortedRows = [...classification.valid_rows].sort((left, right) => {
+    const pollutantOrder = String(left.pollutant_code).localeCompare(String(right.pollutant_code));
+    if (pollutantOrder) return pollutantOrder;
+    if (left.timeseries_id !== right.timeseries_id) return left.timeseries_id - right.timeseries_id;
+    return left.observed_at.localeCompare(right.observed_at);
+  });
+  const pollutantGroups = groupObservationRowsByPollutant(sortedRows);
+  for (const pollutantCode of affectedPollutants) {
+    if (!pollutantGroups.get(pollutantCode)?.length) {
+      throw new Error(`targeted observation complete pollutant partition is empty: ${pollutantCode}`);
+    }
+  }
+
+  const preparedObjects: Array<{
+    key: string;
+    body: Uint8Array;
+    pollutant_code: string;
+    file_entry: ObsHistoryFileEntry;
+    receipt_entry: Record<string, unknown>;
+  }> = [];
+  const pollutantManifests: Array<Record<string, unknown>> = [];
+  const pollutantPartitionCounts: Record<string, unknown> = {};
+  for (const [pollutantCode, pollutantRows] of Array.from(pollutantGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+    const fileEntries: ObsHistoryFileEntry[] = [];
+    const partitionTimeseriesCounts: Record<string, number> = {};
+    let replacedRows = 0;
+    let preservedRows = 0;
+    for (const row of pollutantRows) {
+      const key = String(row.timeseries_id);
+      partitionTimeseriesCounts[key] = (partitionTimeseriesCounts[key] || 0) + 1;
+      if (completeTargetIds.has(row.timeseries_id)) replacedRows += 1;
+      else preservedRows += 1;
+    }
+    const rowChunks = chunkRows(pollutantRows, OBS_R2_PART_MAX_ROWS);
+    for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
+      const chunk = rowChunks[partIndex];
+      if (!chunk.length) continue;
+      const parquetRows: ObsHistoryV2ParquetRow[] = chunk.map((row) => ({
+        connector_id: args.connector_id,
+        station_id: row.station_id ?? null,
+        timeseries_id: row.timeseries_id,
+        pollutant_code: pollutantCode,
+        observed_at: row.observed_at,
+        value: row.value,
+        status: row.status ?? null,
+      }));
+      const summary = summarizeObservationPartRows(parquetRows);
+      const key = buildTargetedHistoryV2PartKey(
+        OBS_R2_HISTORY_PREFIX_V2,
+        args.day_utc,
+        args.connector_id,
+        pollutantCode,
+        transactionId,
+        partIndex,
+      );
+      const body = rowsToObservationV2ParquetBuffer(parquetRows);
+      const contentSha256 = sha256Hex(body);
+      const fileEntry: ObsHistoryFileEntry = {
+        key,
+        row_count: chunk.length,
+        bytes: body.byteLength,
+        etag_or_hash: contentSha256,
+        pollutant_codes: [pollutantCode],
+        min_timeseries_id: summary.min_timeseries_id,
+        max_timeseries_id: summary.max_timeseries_id,
+        min_observed_at: summary.min_observed_at,
+        max_observed_at: summary.max_observed_at,
+        timeseries_row_counts: summary.timeseries_row_counts,
+      };
+      fileEntries.push(fileEntry);
+      preparedObjects.push({
+        key,
+        body,
+        pollutant_code: pollutantCode,
+        file_entry: fileEntry,
+        receipt_entry: {
+          key,
+          pollutant_code: pollutantCode,
+          bytes: body.byteLength,
+          content_sha256: contentSha256,
+          row_count: chunk.length,
+          min_timeseries_id: summary.min_timeseries_id,
+          max_timeseries_id: summary.max_timeseries_id,
+          min_observed_at: summary.min_observed_at,
+          max_observed_at: summary.max_observed_at,
+          timeseries_row_counts: summary.timeseries_row_counts,
+          immutable_live_object_result: "content_identity_get_verified",
+        },
+      });
+    }
+    const manifestKey = buildHistoryV2PollutantManifestKey(
+      OBS_R2_HISTORY_PREFIX_V2,
+      args.day_utc,
+      args.connector_id,
+      pollutantCode,
+    );
+    pollutantManifests.push(createObservationV2PollutantManifest({
+      dayUtc: args.day_utc,
+      connectorId: args.connector_id,
+      pollutantCode,
+      runId: args.run_id,
+      manifestKey,
+      sourceRowCount: pollutantRows.length,
+      fileEntries,
+      writerGitSha: OBS_R2_WRITER_GIT_SHA,
+      backedUpAtUtc: nowIso(),
+    }));
+    pollutantPartitionCounts[pollutantCode] = {
+      row_count: pollutantRows.length,
+      replaced_row_count: replacedRows,
+      preserved_unaffected_row_count: preservedRows,
+      timeseries_row_counts: Object.fromEntries(Object.entries(partitionTimeseriesCounts)
+        .sort(([left], [right]) => Number(left) - Number(right))),
+    };
+  }
+
+  const manifestKey = buildHistoryV2ConnectorManifestKey(
+    OBS_R2_HISTORY_PREFIX_V2,
+    args.day_utc,
+    args.connector_id,
+  );
+  const connectorManifest = createObservationV2ConnectorManifest({
+    dayUtc: args.day_utc,
+    connectorId: args.connector_id,
+    runId: args.run_id,
+    manifestKey,
+    pollutantManifests,
+    writerGitSha: OBS_R2_WRITER_GIT_SHA,
+    backedUpAtUtc: nowIso(),
+  }) as unknown as ObsConnectorManifest & Record<string, unknown>;
+  const timeseriesRowCounts = Object.fromEntries(
+    transactionState.complete_requested_timeseries_ids.map((id: number) => [String(id), 0]),
+  ) as Record<string, number>;
+  for (const prepared of preparedObjects) {
+    for (const [timeseriesId, count] of Object.entries(prepared.file_entry.timeseries_row_counts || {})) {
+      timeseriesRowCounts[timeseriesId] = (timeseriesRowCounts[timeseriesId] || 0) + Number(count || 0);
+    }
+  }
+  const permanentReceiptKey = buildTargetedObservationPermanentReceiptKey(
+    OBS_R2_HISTORY_PREFIX_V2,
+    args.day_utc,
+    args.connector_id,
+    transactionId,
+  );
+  const receipt: Record<string, unknown> = {
+    receipt_schema_version: 2,
+    transaction_id: transactionId,
+    history_version: "v2",
+    domain: "observations",
+    day_utc: args.day_utc,
+    connector_id: args.connector_id,
+    complete_requested_timeseries_ids: transactionState.complete_requested_timeseries_ids,
+    expected_chunk_count: transactionState.expected_chunk_count,
+    chunks: transactionState.chunks,
+    completed_chunks: transactionState.completed_chunks,
+    completed_chunk_identities: transactionState.completed_chunk_identities,
+    incomplete_chunk_identities: [],
+    failed_chunks: [],
+    affected_pollutant_codes: [...affectedPollutants].sort(),
+    pollutant_codes: [...affectedPollutants].sort(),
+    source_row_count: transactionState.source_row_count,
+    source_timeseries_row_counts: transactionState.source_timeseries_row_counts,
+    staged_merged_row_identity: transactionState.staged_merged_row_identity,
+    complete_pollutant_partitions: pollutantPartitionCounts,
+    files: preparedObjects.map((entry) => entry.receipt_entry)
+      .sort((left, right) => String(left.key).localeCompare(String(right.key))),
+    timeseries_row_counts: Object.fromEntries(Object.entries(timeseriesRowCounts)
+      .sort(([left], [right]) => Number(left) - Number(right))),
+    preserved_unaffected_timeseries_ids: [...new Set(sortedRows
+      .map((row) => row.timeseries_id)
+      .filter((timeseriesId) => !completeTargetIds.has(timeseriesId)))].sort((a, b) => a - b),
+    permanent_receipt_key: permanentReceiptKey,
+    finalisation_status: "complete_generations_get_verified",
+  };
+  const receiptBody = TEXT_ENCODER.encode(`${JSON.stringify(receipt, null, 2)}\n`);
+  const localReceiptPath = targetedObservationDataReceiptPath(args.day_utc, args.connector_id);
+  if (fs.existsSync(localReceiptPath) && fs.readFileSync(localReceiptPath, "utf8") !== new TextDecoder().decode(receiptBody)) {
+    throw new Error(`Conflicting targeted observation data receipt: ${localReceiptPath}`);
+  }
+
+  // Complete all transaction checks and inspect every immutable live key,
+  // including the permanent receipt, before the first possible PUT.
+  const inspections = new Map<string, Record<string, unknown>>();
+  for (const prepared of preparedObjects) {
+    inspections.set(prepared.key, await inspectImmutableObject({
+      key: prepared.key,
+      body: prepared.body,
+      r2: OBS_R2_CONFIG,
+      headObject: r2HeadObject,
+      getObject: r2GetObject,
+    }));
+  }
+  const receiptInspection = await inspectImmutableObject({
+    key: permanentReceiptKey,
+    body: receiptBody,
+    r2: OBS_R2_CONFIG,
+    headObject: r2HeadObject,
+    getObject: r2GetObject,
+  });
+  if (receiptInspection.exists && [...inspections.values()].some((inspection) => !inspection.exists)) {
+    throw new Error("permanent_targeted_observation_receipt_exists_with_missing_generation_object");
+  }
+
+  let objectsWritten = 0;
+  for (const prepared of preparedObjects) {
+    writeTargetedStageObject(prepared.key, prepared.body);
+    const published = await publishImmutableObject({
+      key: prepared.key,
+      body: prepared.body,
+      contentType: "application/octet-stream",
+      r2: OBS_R2_CONFIG,
+      inspection: inspections.get(prepared.key),
+      putObject: r2PutObject,
+      getObject: r2GetObject,
+    });
+    if (published.put_performed) objectsWritten += 1;
+  }
+  writeTargetedStageObject(permanentReceiptKey, receiptBody);
+  const publishedReceipt = await publishImmutableObject({
+    key: permanentReceiptKey,
+    body: receiptBody,
+    contentType: "application/json",
+    r2: OBS_R2_CONFIG,
+    inspection: receiptInspection,
+    putObject: r2PutObject,
+    getObject: r2GetObject,
+  });
+  if (publishedReceipt.put_performed) objectsWritten += 1;
+  writeTargetedObservationDataReceipt(args.day_utc, args.connector_id, receipt);
+  markTargetedObservationTransactionFinalised(
+    statePath,
+    permanentReceiptKey,
+    publishedReceipt.content_sha256,
+  );
+  logStructured("info", "source_to_r2_targeted_permanent_data_receipt_verified", {
+    run_id: args.run_id,
+    day_utc: args.day_utc,
+    connector_id: args.connector_id,
+    transaction_id: transactionId,
+    permanent_data_receipt_key: permanentReceiptKey,
+    generation_object_count: preparedObjects.length,
+    affected_pollutant_codes: [...affectedPollutants].sort(),
+    objects_put: objectsWritten,
+  });
+  return {
+    rows_read: rowsForWrite.length,
+    objects_written_r2: objectsWritten,
+    manifest_key: manifestKey,
+    connector_manifest: connectorManifest,
+    rows_with_missing_pollutant_code: 0,
+    rows_skipped_missing_pollutant_code: 0,
+    example_missing_pollutant_rows: [],
+    pollutant_codes_written: [...affectedPollutants].sort(),
+    permanent_data_receipt_key: permanentReceiptKey,
+    permanent_data_receipt_sha256: publishedReceipt.content_sha256,
+  };
+}
+
 async function exportObsConnectorRowsToR2V2(args: {
   run_id: string;
   day_utc: string;
@@ -4643,7 +4960,8 @@ async function exportObsConnectorRowsToR2V2(args: {
   example_missing_pollutant_rows: MissingPollutantExampleRow[];
   pollutant_codes_written: string[];
 }> {
-  // Integrity targeted finalisation owns only the replacement Parquet objects.
+  // Integrity targeted finalisation owns only the complete affected-pollutant
+  // generation objects and their permanent transaction receipt.
   // Its canonical metadata executor publishes the complete pollutant,
   // connector and day hierarchy after it has checked preserved live children.
   // In particular, do not delete the connector prefix here: old unreferenced
@@ -4651,15 +4969,10 @@ async function exportObsConnectorRowsToR2V2(args: {
   const targetedDataOnlyFinalisation = SOURCE_TO_R2_TARGETED_STAGE_ENABLED &&
     SOURCE_TO_R2_TARGETED_STAGE_FINALIZE &&
     BACKFILL_OUTPUT_SCOPE === "observations_only";
-  const targetedTransactionId = targetedDataOnlyFinalisation
-    ? targetedObservationTransactionId()
-    : null;
-  const targetedDataFiles: Array<Record<string, unknown>> = [];
-  const targetedTimeseries = new Set((args.targeted_timeseries_ids || []).filter((value) => Number.isInteger(value) && value > 0));
-  if (targetedDataOnlyFinalisation && !targetedTimeseries.size) {
-    throw new Error("targeted observation finalisation has no targeted timeseries IDs");
+  if (targetedDataOnlyFinalisation) {
+    return await exportTargetedObsConnectorRowsToR2V2(args);
   }
-  if (FORCE_REPLACE && !targetedDataOnlyFinalisation) {
+  if (FORCE_REPLACE) {
     await deleteR2Prefix(
       buildHistoryV2ConnectorPrefix(
         OBS_R2_HISTORY_PREFIX_V2,
@@ -4669,9 +4982,7 @@ async function exportObsConnectorRowsToR2V2(args: {
     );
   }
 
-  const rowsForWrite = targetedDataOnlyFinalisation
-    ? args.rows.filter((row) => targetedTimeseries.has(row.timeseries_id))
-    : args.rows;
+  const rowsForWrite = args.rows;
   const classification = classifyObservationRowsForV2PollutantPartitions(rowsForWrite);
   if (classification.rows_skipped_missing_pollutant_code > 0) {
     logStructured("warning", "source_to_r2_v2_observations_missing_pollutant_code_rows_skipped", {
@@ -4719,22 +5030,13 @@ async function exportObsConnectorRowsToR2V2(args: {
         status: row.status ?? null,
       }));
       const partSummary = summarizeObservationPartRows(parquetRows);
-      const partKey = targetedTransactionId
-        ? buildTargetedHistoryV2PartKey(
-          OBS_R2_HISTORY_PREFIX_V2,
-          args.day_utc,
-          args.connector_id,
-          pollutantCode,
-          targetedTransactionId,
-          partIndex,
-        )
-        : buildHistoryV2PartKey(
-          OBS_R2_HISTORY_PREFIX_V2,
-          args.day_utc,
-          args.connector_id,
-          pollutantCode,
-          partIndex,
-        );
+      const partKey = buildHistoryV2PartKey(
+        OBS_R2_HISTORY_PREFIX_V2,
+        args.day_utc,
+        args.connector_id,
+        pollutantCode,
+        partIndex,
+      );
       const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
       const putResult = await putHistoryObjectWithTargetedStage({
         key: partKey,
@@ -4758,21 +5060,6 @@ async function exportObsConnectorRowsToR2V2(args: {
         max_observed_at: partSummary.max_observed_at,
         timeseries_row_counts: partSummary.timeseries_row_counts,
       });
-      if (targetedTransactionId) {
-        targetedDataFiles.push({
-          key: partKey,
-          pollutant_code: pollutantCode,
-          bytes: Math.trunc(actual.bytes),
-          content_sha256: contentSha256,
-          row_count: chunk.length,
-          min_timeseries_id: partSummary.min_timeseries_id,
-          max_timeseries_id: partSummary.max_timeseries_id,
-          min_observed_at: partSummary.min_observed_at,
-          max_observed_at: partSummary.max_observed_at,
-          timeseries_row_counts: partSummary.timeseries_row_counts,
-          r2_put_and_get_verified: true,
-        });
-      }
       objectsWritten += 1;
     }
     const manifestKey = buildHistoryV2PollutantManifestKey(
@@ -4792,14 +5079,12 @@ async function exportObsConnectorRowsToR2V2(args: {
       writerGitSha: OBS_R2_WRITER_GIT_SHA,
       backedUpAtUtc: nowIso(),
     });
-    if (!targetedDataOnlyFinalisation) {
-      await putHistoryObjectWithTargetedStage({
-        key: manifestKey,
-        body: encodeJsonBody(pollutantManifest),
-        content_type: "application/json",
-      });
-      objectsWritten += 1;
-    }
+    await putHistoryObjectWithTargetedStage({
+      key: manifestKey,
+      body: encodeJsonBody(pollutantManifest),
+      content_type: "application/json",
+    });
+    objectsWritten += 1;
     pollutantManifests.push(pollutantManifest);
   }
 
@@ -4821,39 +5106,12 @@ async function exportObsConnectorRowsToR2V2(args: {
   connectorManifest.rows_skipped_missing_pollutant_code = classification.rows_skipped_missing_pollutant_code;
   connectorManifest.example_missing_pollutant_rows = classification.example_missing_pollutant_rows;
   connectorManifest.pollutant_codes_written = classification.pollutant_codes_written;
-  if (!targetedDataOnlyFinalisation) {
-    await putHistoryObjectWithTargetedStage({
-      key: manifestKey,
-      body: encodeJsonBody(connectorManifest),
-      content_type: "application/json",
-    });
-    objectsWritten += 1;
-  }
-
-  if (targetedTransactionId) {
-    const timeseriesRowCounts: Record<string, number> = {};
-    for (const file of targetedDataFiles) {
-      for (const [timeseriesId, count] of Object.entries(file.timeseries_row_counts as Record<string, number>)) {
-        timeseriesRowCounts[timeseriesId] = (timeseriesRowCounts[timeseriesId] || 0) + Number(count || 0);
-      }
-    }
-    writeTargetedObservationDataReceipt(args.day_utc, args.connector_id, {
-      receipt_schema_version: 1,
-      transaction_id: targetedTransactionId,
-      history_version: "v2",
-      domain: "observations",
-      day_utc: args.day_utc,
-      connector_id: args.connector_id,
-      pollutant_codes: [...new Set(targetedDataFiles.map((file) => String(file.pollutant_code)))].sort(),
-      files: targetedDataFiles.sort((left, right) => String(left.key).localeCompare(String(right.key))),
-      timeseries_row_counts: Object.fromEntries(Object.entries(timeseriesRowCounts).sort(([left], [right]) => Number(left) - Number(right))),
-      preserved_unaffected_timeseries_ids: [...new Set(args.rows
-        .map((row) => row.timeseries_id)
-        .filter((timeseriesId) => !targetedTimeseries.has(timeseriesId)))]
-        .sort((left, right) => left - right),
-      finalisation_status: "data_put_and_get_verified",
-    });
-  }
+  await putHistoryObjectWithTargetedStage({
+    key: manifestKey,
+    body: encodeJsonBody(connectorManifest),
+    content_type: "application/json",
+  });
+  objectsWritten += 1;
 
   return {
     rows_read: rowsForWrite.length,
@@ -9803,12 +10061,9 @@ async function loadObsRowsForConnectorDayFromLocalHistory(
   for (const parquetKey of parquetKeys) {
     const parquetBytes = loadLocalHistoryObjectBytesByR2Key(parquetKey);
     if (!parquetBytes) {
-      logStructured("warning", "source_to_r2_merge_local_parquet_missing", {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        parquet_key: parquetKey,
-      });
-      continue;
+      throw new Error(
+        `source_to_r2_merge_authoritative_local_parquet_missing: day_utc=${dayUtc} connector_id=${connectorId} key=${parquetKey}`,
+      );
     }
     const parsedRows = await readObsHistoryRowsFromParquetBytes(parquetBytes);
     appendRowsSafe(rows, parsedRows);
@@ -13831,6 +14086,44 @@ async function runSourceToAll(
                   writeTargetedStageJson(aqiStagePath, aqilevelRows);
                 }
               }
+              if (sourceObservationsOnly) {
+                const sourceTimeseriesRowCounts: Record<string, number> = {};
+                for (const row of replacementObsRows) {
+                  const key = String(row.timeseries_id);
+                  sourceTimeseriesRowCounts[key] = (sourceTimeseriesRowCounts[key] || 0) + 1;
+                }
+                const affectedPollutantCodes = targetedTimeseriesIds.map((timeseriesId) =>
+                  connectorLookup.binding_by_timeseries_id.get(timeseriesId)?.pollutant_code || ""
+                ).filter(Boolean);
+                const transactionId = targetedObservationTransactionId();
+                const transactionState = recordTargetedObservationChunkCompletion({
+                  filePath: targetedObservationTransactionStatePath(),
+                  transactionId,
+                  dayUtc,
+                  connectorId,
+                  chunkTimeseriesIds: targetedTimeseriesIds,
+                  affectedPollutantCodes,
+                  sourceTimeseriesRowCounts,
+                  sourceRowCount: replacementObsRows.length,
+                  stagedMergedRowCount: obsHistoryRows.length,
+                  stagedMergedRowsSha256: sha256Hex(JSON.stringify(obsHistoryRows)),
+                });
+                sourceCheckpointJson.targeted_transaction_id = transactionId;
+                sourceCheckpointJson.targeted_transaction_state_path =
+                  targetedObservationTransactionStatePath();
+                sourceCheckpointJson.targeted_timeseries_ids =
+                  transactionState.complete_requested_timeseries_ids;
+                sourceCheckpointJson.targeted_expected_chunk_count =
+                  transactionState.expected_chunk_count;
+                sourceCheckpointJson.targeted_completed_chunk_count =
+                  transactionState.completed_chunks.length;
+                sourceCheckpointJson.targeted_incomplete_chunk_count =
+                  transactionState.incomplete_chunk_identities.length;
+                sourceCheckpointJson.targeted_affected_pollutant_codes =
+                  transactionState.affected_pollutant_codes;
+                sourceCheckpointJson.targeted_staged_merged_row_identity =
+                  transactionState.staged_merged_row_identity;
+              }
             }
           } else {
             if (!sourceObservationsOnly) {
@@ -14059,6 +14352,15 @@ async function runSourceToAll(
           targetedStageActiveForConnectorDay &&
           SOURCE_TO_R2_TARGETED_STAGE_FINALIZE &&
           sourceObservationsOnly;
+        const targetedWriterCheckpointEvidence = targetedObservationDataOnlyFinalisation
+          ? targetedObservationWriterEvidence({
+            objectsWritten: obsExport.objects_written_r2,
+            plannedManifestKey: obsExport.manifest_key,
+            plannedDayManifestKey: buildObsDayManifestKey(dayUtc),
+            receiptKey: obsExport.permanent_data_receipt_key,
+            receiptSha256: obsExport.permanent_data_receipt_sha256,
+          })
+          : null;
         let aqiExport:
           | { objects_written_r2: number; manifest_key: string }
           | null = null;
@@ -14145,6 +14447,9 @@ async function runSourceToAll(
           rows_skipped_missing_pollutant_code: obsExport.rows_skipped_missing_pollutant_code ?? 0,
           example_missing_pollutant_rows: obsExport.example_missing_pollutant_rows ?? [],
           pollutant_codes_written: obsExport.pollutant_codes_written ?? [],
+          publication_state: targetedObservationDataOnlyFinalisation
+            ? "immutable_data_and_permanent_receipt_finalised"
+            : "canonical_metadata_published",
           rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
           objects_written_r2: sourceObservationsOnly
             ? obsExport.objects_written_r2 + (targetedObservationDataOnlyFinalisation ? 0 : 1)
@@ -14167,13 +14472,28 @@ async function runSourceToAll(
               (aqiExport?.objects_written_r2 || 0) + 2,
           checkpoint_json: {
             source_adapter: sourceAdapter,
-            observation_manifest_key: obsExport.manifest_key,
+            observation_manifest_key: targetedWriterCheckpointEvidence
+              ? targetedWriterCheckpointEvidence.observation_manifest_key
+              : obsExport.manifest_key,
+            planned_observation_manifest_key: targetedObservationDataOnlyFinalisation
+              ? targetedWriterCheckpointEvidence?.planned_observation_manifest_key
+              : null,
+            observation_manifest_owner: targetedObservationDataOnlyFinalisation
+              ? "integrity_metadata_executor"
+              : "writer",
+            permanent_data_receipt_key: targetedWriterCheckpointEvidence?.permanent_data_receipt_key || null,
+            permanent_data_receipt_sha256: targetedWriterCheckpointEvidence?.permanent_data_receipt_sha256 || null,
             rows_with_missing_pollutant_code: obsExport.rows_with_missing_pollutant_code ?? 0,
             rows_skipped_missing_pollutant_code: obsExport.rows_skipped_missing_pollutant_code ?? 0,
             example_missing_pollutant_rows: obsExport.example_missing_pollutant_rows ?? [],
             pollutant_codes_written: obsExport.pollutant_codes_written ?? [],
             aqilevels_manifest_key: aqiExport?.manifest_key || null,
-            day_observation_manifest_key: buildObsDayManifestKey(dayUtc),
+            day_observation_manifest_key: targetedObservationDataOnlyFinalisation
+              ? targetedWriterCheckpointEvidence?.day_observation_manifest_key
+              : buildObsDayManifestKey(dayUtc),
+            planned_day_observation_manifest_key: targetedObservationDataOnlyFinalisation
+              ? targetedWriterCheckpointEvidence?.planned_day_observation_manifest_key
+              : null,
             day_aqilevels_manifest_key: sourceObservationsOnly
               ? null
               : buildAqiDayManifestKey(dayUtc),
@@ -14192,12 +14512,22 @@ async function runSourceToAll(
           rows_read: obsHistoryRows.length,
           rows_written_aqilevels: sourceObservationsOnly ? 0 : aqilevelRows.length,
           objects_written_r2: sourceObservationsOnly
-            ? obsExport.objects_written_r2 + 1
+            ? obsExport.objects_written_r2 + (targetedObservationDataOnlyFinalisation ? 0 : 1)
             : obsExport.objects_written_r2 +
               (aqiExport?.objects_written_r2 || 0) + 2,
           checkpoint_json: {
             source_adapter: sourceAdapter,
-            observation_manifest_key: obsExport.manifest_key,
+            observation_manifest_key: targetedWriterCheckpointEvidence
+              ? targetedWriterCheckpointEvidence.observation_manifest_key
+              : obsExport.manifest_key,
+            planned_observation_manifest_key: targetedObservationDataOnlyFinalisation
+              ? targetedWriterCheckpointEvidence?.planned_observation_manifest_key
+              : null,
+            observation_manifest_owner: targetedObservationDataOnlyFinalisation
+              ? "integrity_metadata_executor"
+              : "writer",
+            permanent_data_receipt_key: targetedWriterCheckpointEvidence?.permanent_data_receipt_key || null,
+            permanent_data_receipt_sha256: targetedWriterCheckpointEvidence?.permanent_data_receipt_sha256 || null,
             rows_with_missing_pollutant_code: obsExport.rows_with_missing_pollutant_code ?? 0,
             rows_skipped_missing_pollutant_code: obsExport.rows_skipped_missing_pollutant_code ?? 0,
             example_missing_pollutant_rows: obsExport.example_missing_pollutant_rows ?? [],

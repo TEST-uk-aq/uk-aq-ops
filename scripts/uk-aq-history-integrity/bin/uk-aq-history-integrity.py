@@ -3543,6 +3543,115 @@ def _chunk_v2_observation_repair_timeseries_ids(ids: list[int]) -> list[list[int
     return [list(ids[i:i + max_per]) for i in range(0, len(ids), max_per)]
 
 
+def _v2_observation_chunk_identity(timeseries_ids: Iterable[int]) -> str:
+    normalized = sorted({int(value) for value in timeseries_ids if int(value) > 0})
+    encoded = json.dumps(normalized, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _v2_observation_transaction_state_path(
+    stage_root: Path,
+    *,
+    day_utc: str,
+    connector_id: int,
+) -> Path:
+    return (
+        stage_root / "transaction-state" / f"day_utc={day_utc}"
+        / f"connector_id={int(connector_id)}.json"
+    )
+
+
+def _initialise_v2_observation_transaction_state(
+    stage_root: Path,
+    *,
+    transaction_id: str,
+    day_utc: str,
+    connector_id: int,
+    complete_timeseries_ids: list[int],
+    chunks: list[list[int]],
+) -> Path:
+    requested = sorted({int(value) for value in complete_timeseries_ids if int(value) > 0})
+    definitions = [
+        {
+            "chunk_index": index,
+            "chunk_identity": _v2_observation_chunk_identity(chunk),
+            "timeseries_ids": sorted({int(value) for value in chunk if int(value) > 0}),
+        }
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    state = {
+        "transaction_state_schema_version": 1,
+        "transaction_id": transaction_id,
+        "history_version": "v2",
+        "domain": "observations",
+        "day_utc": day_utc,
+        "connector_id": int(connector_id),
+        "complete_requested_timeseries_ids": requested,
+        "expected_chunk_count": len(definitions),
+        "chunks": definitions,
+        "completed_chunks": [],
+        "completed_chunk_identities": [],
+        "incomplete_chunk_identities": sorted(
+            definition["chunk_identity"] for definition in definitions
+        ),
+        "failed_chunks": [],
+        "affected_pollutant_codes": [],
+        "source_row_count": 0,
+        "source_timeseries_row_counts": {},
+        "staged_merged_row_identity": None,
+        "finalisation_status": "initialised",
+    }
+    state_path = _v2_observation_transaction_state_path(
+        stage_root, day_utc=day_utc, connector_id=connector_id
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(state, indent=2, sort_keys=False) + "\n"
+    if state_path.exists():
+        existing = json.loads(state_path.read_text(encoding="utf-8"))
+        identity_fields = (
+            "transaction_state_schema_version", "transaction_id", "history_version",
+            "domain", "day_utc", "connector_id", "complete_requested_timeseries_ids",
+            "expected_chunk_count", "chunks",
+        )
+        if any(existing.get(field) != state.get(field) for field in identity_fields):
+            raise ValueError(
+                f"conflicting v2 observation transaction state: {state_path}"
+            )
+        return state_path
+    temporary = state_path.with_name(f"{state_path.name}.tmp-{os.getpid()}")
+    temporary.write_text(encoded, encoding="utf-8")
+    temporary.replace(state_path)
+    return state_path
+
+
+def _record_v2_observation_chunk_failure(
+    state_path: Path,
+    *,
+    chunk_timeseries_ids: list[int],
+    status: str,
+    error: Any,
+) -> None:
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    identity = _v2_observation_chunk_identity(chunk_timeseries_ids)
+    failure = {
+        "chunk_identity": identity,
+        "status": str(status or "failed"),
+        "error": str(error or "")[:1000] or None,
+    }
+    failures = [
+        entry for entry in list(state.get("failed_chunks") or [])
+        if isinstance(entry, Mapping) and entry.get("chunk_identity") != identity
+    ]
+    failures.append(failure)
+    state["failed_chunks"] = sorted(
+        failures, key=lambda entry: str(entry.get("chunk_identity") or "")
+    )
+    state["finalisation_status"] = "chunk_failed"
+    temporary = state_path.with_name(f"{state_path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(state_path)
+
+
 def _tail_lines(text: str, limit: int = 80) -> str:
     if not text:
         return ""
@@ -8973,6 +9082,92 @@ def _classify_v2_gaps(gaps: Iterable[dict[str, Any]]) -> None:
         gap["fault_class"] = fault_class
 
 
+def _validate_v2_observation_transaction_receipts(
+    *,
+    root: Path,
+    data_prefix: str,
+    day_utc: str,
+    connector_id: str,
+    connector_dir: Path,
+    gaps: list[dict[str, Any]],
+) -> int:
+    transactions_dir = connector_dir / "transactions"
+    if not transactions_dir.is_dir():
+        return 0
+    checked = 0
+    for receipt_path in sorted(
+        transactions_dir.glob("transaction_id=*/data-receipt.json")
+    ):
+        checked += 1
+        receipt_rel = str(receipt_path.relative_to(root))
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            transaction_id = receipt_path.parent.name.split("=", 1)[1]
+            expected_key = (
+                f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+                f"transactions/transaction_id={transaction_id}/data-receipt.json"
+            )
+            if (
+                not isinstance(receipt, Mapping)
+                or int(receipt.get("receipt_schema_version") or 0) != 2
+                or receipt.get("transaction_id") != transaction_id
+                or receipt.get("history_version") != "v2"
+                or receipt.get("domain") != "observations"
+                or receipt.get("day_utc") != day_utc
+                or str(receipt.get("connector_id")) != str(connector_id)
+                or receipt.get("permanent_receipt_key") != expected_key
+                or receipt.get("finalisation_status")
+                != "complete_generations_get_verified"
+                or not isinstance(receipt.get("affected_pollutant_codes"), list)
+                or not isinstance(receipt.get("files"), list)
+                or not receipt.get("files")
+                or len(receipt.get("chunks") or [])
+                != int(receipt.get("expected_chunk_count") or 0)
+                or len(receipt.get("completed_chunks") or [])
+                != int(receipt.get("expected_chunk_count") or 0)
+                or receipt.get("incomplete_chunk_identities")
+                or receipt.get("failed_chunks")
+            ):
+                raise ValueError("receipt contract mismatch")
+            declared = {
+                str(value).strip().lower()
+                for value in receipt.get("affected_pollutant_codes") or []
+                if str(value).strip()
+            }
+            for entry in receipt.get("files") or []:
+                pollutant_code = str(entry.get("pollutant_code") or "").lower()
+                key = str(entry.get("key") or "").lstrip("/")
+                expected_prefix = (
+                    f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+                    f"pollutant_code={pollutant_code}/generation={transaction_id}/part-"
+                )
+                object_path = _resolve_canonical_history_object_key(root, key)
+                if (
+                    pollutant_code not in declared
+                    or not key.startswith(expected_prefix)
+                    or not key.endswith(".parquet")
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(entry.get("content_sha256") or ""))
+                    or int(entry.get("bytes") or 0) <= 0
+                    or int(entry.get("row_count") or 0) <= 0
+                    or not isinstance(entry.get("timeseries_row_counts"), Mapping)
+                    or object_path is None
+                    or not object_path.is_file()
+                    or object_path.stat().st_size != int(entry.get("bytes") or -1)
+                    or hashlib.sha256(object_path.read_bytes()).hexdigest()
+                    != str(entry.get("content_sha256") or "")
+                ):
+                    raise ValueError(f"receipt file mismatch: {key}")
+        except Exception as exc:
+            gaps.append(_v2_obs_gap(
+                "transaction_receipt_invalid",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=receipt_rel,
+                related_paths=[str(exc)],
+            ))
+    return checked
+
+
 def run_v2_observations_integrity_checks(
     *,
     r2_history_root: str | Path | None,
@@ -8997,6 +9192,7 @@ def run_v2_observations_integrity_checks(
 
     gaps: list[dict[str, Any]] = []
     checked = 0
+    checked_transaction_receipts = 0
     data_prefix = config.observations_data_prefix.strip("/")
     index_prefix = config.observations_timeseries_index_prefix.strip("/")
     latest_key = config.observations_latest_index_key.strip("/")
@@ -9053,6 +9249,14 @@ def run_v2_observations_integrity_checks(
             continue
         for connector_dir in connector_dirs:
             connector_raw = connector_dir.name.split("=", 1)[1]
+            checked_transaction_receipts += _validate_v2_observation_transaction_receipts(
+                root=root,
+                data_prefix=data_prefix,
+                day_utc=day_utc,
+                connector_id=connector_raw,
+                connector_dir=connector_dir,
+                gaps=gaps,
+            )
             pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
             connector_level_parts = sorted(p for p in connector_dir.glob("part-*.parquet") if p.is_file())
             if connector_level_parts:
@@ -9073,7 +9277,10 @@ def run_v2_observations_integrity_checks(
                 part_rel = f"{day_rel}/{connector_dir.name}/{pollutant_dir.name}"
                 manifest_rel = f"{part_rel}/manifest.json"
                 manifest_path = root / manifest_rel
-                local_parquets = list(pollutant_dir.glob("*.parquet"))
+                discovered_parquets = list(pollutant_dir.glob("part-*.parquet")) + list(
+                    pollutant_dir.glob("generation=*/part-*.parquet")
+                )
+                local_parquets = list(discovered_parquets)
                 payload: Any = None
                 if not manifest_path.is_file():
                     gaps.append(_v2_obs_gap("data_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=[str(p.relative_to(root)) for p in local_parquets]))
@@ -9113,10 +9320,6 @@ def run_v2_observations_integrity_checks(
                         files_valid = files is not None
                         if not files_valid:
                             files = []
-                        local_parquet_keys = {
-                            str(p.relative_to(root))
-                            for p in sorted(local_parquets)
-                        }
                         if files_valid:
                             listed_keys: list[str] = []
                             duplicate_keys: set[str] = set()
@@ -9126,13 +9329,9 @@ def run_v2_observations_integrity_checks(
                                     if key_str in listed_keys:
                                         duplicate_keys.add(key_str)
                                     listed_keys.append(key_str)
-                            listed_key_set = set(listed_keys)
                             if duplicate_keys:
                                 gaps.append(_v2_obs_gap("data_manifest_duplicate_file_key", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel, related_paths=sorted(duplicate_keys)))
-                            for missing_key in sorted(listed_key_set - local_parquet_keys):
-                                gaps.append(_v2_obs_gap("data_manifest_listed_parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=missing_key))
-                            for unlisted_key in sorted(local_parquet_keys - listed_key_set):
-                                gaps.append(_v2_obs_gap("data_manifest_unlisted_parquet", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=unlisted_key))
+                            authoritative_parquets: list[Path] = []
                             for entry in files:
                                 key = entry.get("key") if isinstance(entry, dict) else None
                                 if not key:
@@ -9147,6 +9346,9 @@ def run_v2_observations_integrity_checks(
                                     gaps.append(_v2_obs_gap("parquet_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
                                 elif file_path.stat().st_size <= 0:
                                     gaps.append(_v2_obs_gap("parquet_empty_or_placeholder", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=str(key)))
+                                else:
+                                    authoritative_parquets.append(file_path)
+                            local_parquets = authoritative_parquets
                     elif payload is not None:
                         gaps.append(_v2_obs_gap("data_manifest_schema_mismatch", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=manifest_rel))
                 try:
@@ -9244,6 +9446,7 @@ def run_v2_observations_integrity_checks(
         # executor separately hydrates live R2 before deciding target state.
         "storage_source": "dropbox_r2_history_mirror",
         "checked_partitions": checked,
+        "checked_transaction_receipts": checked_transaction_receipts,
         "gap_count": len(gaps),
         "gaps": gaps,
         "repair_plan": build_v2_repair_plan(observation_gaps=gaps, conn=conn),
@@ -13227,6 +13430,18 @@ def run_v2_gap_backfills(
             if run_state is not None
             else backfill_log_dir / "_targeted_stage" / f"v2_run_{run_id}"
         )
+        transaction_id = (
+            f"integrity-{str(run_state.get('run_id') if run_state is not None else run_id)}-"
+            f"observations-{day_iso}-connector-{connector_id}"
+        )
+        transaction_state_path = _initialise_v2_observation_transaction_state(
+            stage_root,
+            transaction_id=transaction_id,
+            day_utc=day_iso,
+            connector_id=connector_id,
+            complete_timeseries_ids=ts_ids,
+            chunks=chunks,
+        )
         shutil.rmtree(stage_root / f"day_utc={day_iso}" / f"connector_id={connector_id}", ignore_errors=True)
         for chunk_index, chunk_ids in enumerate(chunks, start=1):
             if limits.should_stop():
@@ -13240,8 +13455,9 @@ def run_v2_gap_backfills(
             extra_env: dict[str, str] = {
                 "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
                 "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
-                "UK_AQ_BACKFILL_TARGETED_TRANSACTION_ID": (
-                    f"integrity-{str(run_state.get('run_id') if run_state is not None else run_id)}-observations-{day_iso}-connector-{connector_id}"
+                "UK_AQ_BACKFILL_TARGETED_TRANSACTION_ID": transaction_id,
+                "UK_AQ_BACKFILL_TARGETED_TRANSACTION_STATE_PATH": str(
+                    transaction_state_path
                 ),
                 "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
                     "true" if chunk_index == len(chunks) else "false"
@@ -13269,6 +13485,12 @@ def run_v2_gap_backfills(
             if bf.get("status") == "ok":
                 metrics["v2_observation_index_rebuilds_ok"] += 1
             else:
+                _record_v2_observation_chunk_failure(
+                    transaction_state_path,
+                    chunk_timeseries_ids=chunk_ids,
+                    status=str(bf.get("status") or "failed"),
+                    error=bf.get("error") or bf.get("stderr_tail"),
+                )
                 metrics["v2_observation_repairs_failed"] += 1
                 metrics["observation_backfills_failed"] += 1
                 metrics["v2_observation_index_rebuilds_failed"] += 1
@@ -14811,12 +15033,12 @@ def _capture_verified_v2_observation_scope(
     if not isinstance(receipt, Mapping):
         raise ValueError("targeted observation data receipt is not an object")
     if (
-        int(receipt.get("receipt_schema_version") or 0) != 1
+        int(receipt.get("receipt_schema_version") or 0) != 2
         or receipt.get("history_version") != "v2"
         or receipt.get("domain") != "observations"
         or str(receipt.get("day_utc") or "") != day_utc
         or int(receipt.get("connector_id") or 0) != connector_id
-        or receipt.get("finalisation_status") != "data_put_and_get_verified"
+        or receipt.get("finalisation_status") != "complete_generations_get_verified"
     ):
         raise ValueError("targeted observation data receipt identity is invalid")
     file_entries = list(receipt.get("files") or [])
@@ -14856,7 +15078,8 @@ def _capture_verified_v2_observation_scope(
             or len(expected_sha) != 64 or expected_bytes < 0
             or int(entry.get("row_count") or 0) <= 0
             or not isinstance(entry.get("timeseries_row_counts"), Mapping)
-            or entry.get("r2_put_and_get_verified") is not True
+            or entry.get("immutable_live_object_result")
+            != "content_identity_get_verified"
         ):
             raise ValueError("targeted observation data receipt file identity is invalid")
         source = generated_root / object_key
@@ -14873,6 +15096,40 @@ def _capture_verified_v2_observation_scope(
         mark_overlay_verified(run_state, object_key)
         captured.append(object_key)
         normalized_files.append(dict(entry, key=object_key))
+    permanent_receipt_key = _normalise_overlay_object_key(
+        str(receipt.get("permanent_receipt_key") or "")
+    )
+    expected_receipt_key = (
+        f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/connector_id={connector_id}/"
+        f"transactions/transaction_id={transaction_id}/data-receipt.json"
+    )
+    if permanent_receipt_key != expected_receipt_key:
+        raise ValueError("targeted observation permanent receipt key is invalid")
+    receipt_source = generated_root / permanent_receipt_key
+    if not receipt_source.is_file():
+        raise FileNotFoundError(
+            f"generated permanent observation receipt is unavailable: {permanent_receipt_key}"
+        )
+    receipt_expected = receipt_source.read_bytes()
+    receipt_actual = _get_r2_object_bytes_for_integrity_overlay(
+        object_key=permanent_receipt_key, env=env
+    )
+    if (
+        len(receipt_actual) != len(receipt_expected)
+        or hashlib.sha256(receipt_actual).digest()
+        != hashlib.sha256(receipt_expected).digest()
+    ):
+        raise ValueError("R2 GET does not match permanent observation receipt")
+    stage_overlay_object(
+        run_state,
+        object_key=permanent_receipt_key,
+        source_path=receipt_source,
+        stage="observs",
+        dependencies=tuple(captured),
+    )
+    mark_overlay_uploaded(run_state, permanent_receipt_key)
+    mark_overlay_verified(run_state, permanent_receipt_key)
+    captured.append(permanent_receipt_key)
     receipt_key = f"{day_utc}|{connector_id}"
     run_state.setdefault("observation_data_receipts", {})[receipt_key] = {
         **dict(receipt),
