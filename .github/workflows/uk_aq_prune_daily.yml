@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Run the existing Prune Daily dry-run path"
+        description: "Force dry-run mode. When unchecked, use the repository-configured default."
         required: false
         default: false
         type: boolean
@@ -122,7 +122,7 @@ jobs:
           exit "${missing}"
 
       - name: Run Prune Daily
-        run: timeout 15m node workers/uk_aq_prune_daily/job.mjs
+        run: timeout --kill-after=30s 15m node workers/uk_aq_prune_daily/job.mjs
 
       - name: Upload Prune Daily report
         if: always()

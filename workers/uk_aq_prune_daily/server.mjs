@@ -2554,7 +2554,9 @@ export async function reportPruneDailyError(error, context = {}) {
   const errorPayload = {
     id: errorId,
     created_at: createdAt,
-    source: "cloud_run_ingestdb_prune",
+    source: context.execution_mode === "github_actions"
+      ? "github_actions_ingestdb_prune"
+      : "cloud_run_ingestdb_prune",
     severity: "error",
     message,
     stack,

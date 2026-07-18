@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       drop_dry_run:
-        description: "Do not drop eligible partitions during this run"
+        description: "Force dry-run mode. When unchecked, use the repository-configured default."
         required: false
         default: false
         type: boolean
@@ -57,7 +57,14 @@ jobs:
       - name: Validate required configuration
         run: |
           set -euo pipefail
-          required_values=(OBS_AQIDB_SUPABASE_URL OBS_AQIDB_SECRET_KEY)
+          required_values=(
+            OBS_AQIDB_SUPABASE_URL
+            OBS_AQIDB_SECRET_KEY
+            CFLARE_R2_ENDPOINT
+            CFLARE_R2_BUCKET
+            CFLARE_R2_ACCESS_KEY_ID
+            CFLARE_R2_SECRET_ACCESS_KEY
+          )
           missing=0
           for key in "${required_values[@]}"; do
             if [ -z "${!key:-}" ]; then
@@ -68,7 +75,7 @@ jobs:
           exit "${missing}"
 
       - name: Run Observs partition maintenance
-        run: timeout 15m node workers/uk_aq_observs_partition_maintenance_service/job.mjs
+        run: timeout --kill-after=30s 15m node workers/uk_aq_observs_partition_maintenance_service/job.mjs
 
       - name: Upload Observs partition-maintenance report
         if: always()
