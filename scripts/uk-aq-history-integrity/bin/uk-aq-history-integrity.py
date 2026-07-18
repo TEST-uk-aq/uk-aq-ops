@@ -8428,7 +8428,7 @@ def _current_source_counts_for_v2_partition(
 
     rows_where = [
         "c.row_count > 0",
-        "s.day_utc = ?",
+        "c.day_utc = ?",
         "t.connector_id = ?",
         f"s.source_file_key IN ({','.join('?' for _ in source_file_keys)})",
         "l.connector_id = ?",
@@ -12715,7 +12715,9 @@ def _source_file_key_for_lookup_row(source_key: str, source_location_id: str, da
     if source_key == SC_SOURCE_KEY:
         return _sc_source_file_key(source_location_id, day)
     if source_key == SOS_SOURCE_KEY:
-        return _sos_source_file_key(source_location_id, day)
+        # UK-AIR flat files are one source file per site/year.  Their state
+        # row is anchored at 1 January, while their count rows are day-granular.
+        return _uk_air_flat_file_source_file_key(source_location_id, day.year)
     return None
 
 
@@ -17094,6 +17096,95 @@ def _upsert_daily_profile_state(
     conn.commit()
 
 
+def _upsert_failed_daily_profile_state(
+    conn: sqlite3.Connection,
+    *,
+    env_name: str,
+    logical_run_date: dt.date,
+    started_at_utc: str,
+    error_message: str,
+) -> str:
+    """Record a daily selection failure without requiring a full selection.
+
+    A first post-deployment failure must seed the local state table so its
+    historical allocation remains eligible for the next logical-date catch-up.
+    Existing successful terminal rows are deliberately left unchanged.
+    """
+    now_iso = fmt_iso(utc_now())
+    conn.execute(
+        """
+        INSERT INTO daily_profile_state (
+          env_name, logical_run_date, integrity_run_id,
+          latest_r2_observations_day, recent_start_day, recent_end_day,
+          historical_target_days_json, selected_days_json,
+          represented_month_count, status, started_at_utc, completed_at_utc,
+          completed_by_run_id, caught_up_at_utc, caught_up_by_logical_run_date,
+          error_message, updated_at_utc
+        ) VALUES (?, ?, NULL, NULL, NULL, NULL, ?, '[]', 0, 'failed', ?, NULL,
+                  NULL, NULL, NULL, ?, ?)
+        ON CONFLICT(env_name, logical_run_date) DO UPDATE SET
+          status = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.status
+            ELSE 'failed'
+          END,
+          started_at_utc = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.started_at_utc
+            ELSE COALESCE(daily_profile_state.started_at_utc, excluded.started_at_utc)
+          END,
+          completed_at_utc = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.completed_at_utc
+            ELSE NULL
+          END,
+          completed_by_run_id = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.completed_by_run_id
+            ELSE NULL
+          END,
+          caught_up_at_utc = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.caught_up_at_utc
+            ELSE NULL
+          END,
+          caught_up_by_logical_run_date = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.caught_up_by_logical_run_date
+            ELSE NULL
+          END,
+          error_message = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.error_message
+            ELSE excluded.error_message
+          END,
+          updated_at_utc = CASE
+            WHEN daily_profile_state.status IN ('complete', 'caught_up')
+              THEN daily_profile_state.updated_at_utc
+            ELSE excluded.updated_at_utc
+          END
+        """,
+        (
+            env_name,
+            logical_run_date.isoformat(),
+            historical_target_days_json(historical_target_day_numbers(logical_run_date)),
+            started_at_utc,
+            error_message,
+            now_iso,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT status
+        FROM daily_profile_state
+        WHERE env_name = ? AND logical_run_date = ?
+        """,
+        (env_name, logical_run_date.isoformat()),
+    ).fetchone()
+    return str(row[0]) if row else "failed"
+
+
 def _mark_caught_up_logical_dates(
     conn: sqlite3.Connection,
     *,
@@ -18026,12 +18117,23 @@ def main(argv: list[str]) -> int:
 
     def fail_daily_selection(selection_error: str) -> int:
         """Write a terminal report before daily task-health has started."""
+        try:
+            state_row_status = _upsert_failed_daily_profile_state(
+                conn,
+                env_name=args.env,
+                logical_run_date=logical_run_date,
+                started_at_utc=started_iso,
+                error_message=selection_error,
+            )
+        except Exception as state_exc:
+            state_row_status = "failed_state_record_error"
+            log.exception("daily selection failure state record failed: %s", state_exc)
         failed_selection = {
             "selection_mode": "daily_explicit",
             "logical_run_date": logical_run_date.isoformat(),
             "logical_run_date_source": logical_run_date_source,
             "logical_run_timezone": "UTC",
-            "state_row_status": "failed",
+            "state_row_status": state_row_status,
             "error": selection_error,
         }
         summary = {
