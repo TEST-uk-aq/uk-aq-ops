@@ -1,0 +1,79 @@
+name: UK AQ Observs Partition Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      drop_dry_run:
+        description: "Do not drop eligible partitions during this run"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-observs-partition-maintenance
+  cancel-in-progress: false
+
+jobs:
+  observs-partition-maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      OBSERVS_PARTITIONS_FUTURE_DAYS: ${{ vars.OBSERVS_PARTITIONS_FUTURE_DAYS || '3' }}
+      OBSERVS_PARTITIONS_HOT_DAYS: ${{ vars.OBSERVS_PARTITIONS_HOT_DAYS || '3' }}
+      OBS_AQIDB_OBSERVS_RETENTION_DAYS: ${{ vars.OBS_AQIDB_OBSERVS_RETENTION_DAYS || '14' }}
+      OBSERVS_DEFAULT_TOP_N: ${{ vars.OBSERVS_DEFAULT_TOP_N || '20' }}
+      OBSERVS_PARTITION_DROP_DRY_RUN: ${{ vars.OBSERVS_PARTITION_DROP_DRY_RUN || 'false' }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER: ${{ vars.UK_AQ_OBSERVS_PARTITION_DROPBOX_FOLDER || '/observs_partition_maintenance' }}
+      UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      INPUT_DROP_DRY_RUN: ${{ github.event.inputs.drop_dry_run == 'true' && 'true' || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          required_values=(OBS_AQIDB_SUPABASE_URL OBS_AQIDB_SECRET_KEY)
+          missing=0
+          for key in "${required_values[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required value: ${key}" >&2
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Run Observs partition maintenance
+        run: timeout 15m node workers/uk_aq_observs_partition_maintenance_service/job.mjs
+
+      - name: Upload Observs partition-maintenance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-observs-partition-maintenance-report
+          path: tmp/uk_aq_observs_partition_maintenance_report.json
+          if-no-files-found: warn

@@ -1,0 +1,133 @@
+name: UK AQ Prune Daily
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the existing Prune Daily dry-run path"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-prune-daily
+  cancel-in-progress: false
+
+jobs:
+  prune-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      OBS_AQIDB_OBSERVS_RETENTION_DAYS: ${{ vars.OBS_AQIDB_OBSERVS_RETENTION_DAYS || '14' }}
+      INGESTDB_PRUNE_DRY_RUN: ${{ vars.INGESTDB_PRUNE_DRY_RUN || 'true' }}
+      INGESTDB_RETENTION_DAYS: ${{ vars.INGESTDB_RETENTION_DAYS || '5' }}
+      MAX_HOURS_PER_RUN: ${{ vars.INGESTDB_PRUNE_MAX_HOURS_PER_RUN || '48' }}
+      DELETE_BATCH_SIZE: ${{ vars.INGESTDB_PRUNE_DELETE_BATCH_SIZE || '50000' }}
+      MAX_DELETE_BATCHES_PER_HOUR: ${{ vars.INGESTDB_PRUNE_MAX_DELETE_BATCHES_PER_HOUR || '10' }}
+      REPAIR_ONE_MISMATCH_BUCKET: ${{ vars.INGESTDB_PRUNE_REPAIR_ONE_MISMATCH_BUCKET || 'true' }}
+      REPAIR_BUCKET_OUTBOX_CHUNK_SIZE: ${{ vars.INGESTDB_PRUNE_REPAIR_BUCKET_OUTBOX_CHUNK_SIZE || '1000' }}
+      FLUSH_CLAIM_BATCH_LIMIT: ${{ vars.INGESTDB_PRUNE_FLUSH_CLAIM_BATCH_LIMIT || '20' }}
+      MAX_FLUSH_BATCHES: ${{ vars.INGESTDB_PRUNE_MAX_FLUSH_BATCHES || '30' }}
+      UK_AQ_R2_HISTORY_PHASE_B_ENABLED: ${{ vars.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || 'true' }}
+      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: ${{ vars.UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED || 'false' }}
+      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: ${{ vars.UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED || 'true' }}
+      UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS: ${{ vars.UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS || '250000' }}
+      UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES: ${{ vars.UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES || '268435456' }}
+      UK_AQ_PHASE_B_PM_CONTEXT_RPC: ${{ vars.UK_AQ_PHASE_B_PM_CONTEXT_RPC || 'uk_aq_rpc_observs_aqi_pm_hourly_context' }}
+      UK_AQ_PHASE_B_PM_CONTEXT_PAGE_SIZE: ${{ vars.UK_AQ_PHASE_B_PM_CONTEXT_PAGE_SIZE || '1000' }}
+      UK_AQ_PHASE_B_PM_CONTEXT_MAX_PAGES: ${{ vars.UK_AQ_PHASE_B_PM_CONTEXT_MAX_PAGES || '100' }}
+      UK_AQ_PHASE_B_PM_CONTEXT_MAX_ROWS: ${{ vars.UK_AQ_PHASE_B_PM_CONTEXT_MAX_ROWS || '50000' }}
+      UK_AQ_R2_HISTORY_PART_MAX_ROWS: ${{ vars.UK_AQ_R2_HISTORY_PART_MAX_ROWS || '1000000' }}
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PART_MAX_ROWS: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PART_MAX_ROWS || '5000' }}
+      UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS: ${{ vars.UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS || '20000' }}
+      UK_AQ_R2_HISTORY_ROW_GROUP_SIZE: ${{ vars.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE || '100000' }}
+      UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500' }}
+      UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS: ${{ vars.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS || '7' }}
+      UK_AQ_R2_HISTORY_STAGING_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_STAGING_PREFIX || 'history/v1/_ops/observations/staging' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
+      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
+      UK_AQ_R2_HISTORY_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_RUNS_PREFIX || 'history/v1/_ops/observations/runs' }}
+      UK_AQ_R2_HISTORY_AQILEVELS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || 'history/v1/aqilevels/hourly' }}
+      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
+      UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || 'history/v2/aqilevels/hourly/debug' }}
+      UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || 'history/v2/_ops/observations/runs' }}
+      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
+      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX || 'history/_index_v2/observations_timeseries' }}
+      UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED: ${{ vars.UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED || 'true' }}
+      UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED: ${{ vars.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED || 'false' }}
+      UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED: ${{ vars.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED || 'false' }}
+      UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR || 'prune_r2_check' }}
+      UK_AQ_CHART_METRICS_RETENTION_DAYS: ${{ vars.UK_AQ_CHART_METRICS_RETENTION_DAYS || '90' }}
+      UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS: ${{ vars.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS || '7' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AIR_ERROR_DROPBOX_FOLDER: ${{ vars.UK_AIR_ERROR_DROPBOX_FOLDER || '/error_log' }}
+      UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.UK_AIR_ERROR_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
+      INPUT_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'true' || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          required_values=(
+            SUPABASE_URL
+            OBS_AQIDB_SUPABASE_URL
+            SB_SECRET_KEY
+            OBS_AQIDB_SECRET_KEY
+            UK_AQ_R2_HISTORY_VERSION
+          )
+          if [ "${UK_AQ_R2_HISTORY_PHASE_B_ENABLED}" = "true" ]; then
+            required_values+=(
+              SUPABASE_DB_URL
+              CFLARE_R2_ENDPOINT
+              CFLARE_R2_BUCKET
+              CFLARE_R2_ACCESS_KEY_ID
+              CFLARE_R2_SECRET_ACCESS_KEY
+            )
+          fi
+          missing=0
+          for key in "${required_values[@]}"; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required value: ${key}" >&2
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Run Prune Daily
+        run: timeout 15m node workers/uk_aq_prune_daily/job.mjs
+
+      - name: Upload Prune Daily report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-prune-daily-report
+          path: tmp/uk_aq_prune_daily_report.json
+          if-no-files-found: warn
