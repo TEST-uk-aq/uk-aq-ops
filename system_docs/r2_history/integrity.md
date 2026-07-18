@@ -102,6 +102,48 @@ A real `--run-backfill` performs the same acquisition, comparison and repair pla
 
 It must not mutate R2 until all local replacement objects required for the first affected mutation scope have been built and structurally validated. It must record actual deletions, writes, post-write verification and final verification separately from the original findings and plan.
 
+## Temporary repair overlay
+
+The repair overlay is a run-specific local working directory. It exists only to combine objects created or changed by the current run with unchanged objects from the chosen Dropbox baseline while later repair stages are planned and built.
+
+`--check-only` must not create a repair overlay. `--run-backfill --dry-run` and real `--run-backfill` may create one only after detection and repair planning have completed.
+
+The overlay must:
+
+- be sparse, containing only objects created, changed or marked for deletion by the current run;
+- use the same relative object keys as the canonical R2 v2 paths;
+- contain only local working files and local run-state evidence;
+- never contain `generation=<transaction>` paths or permanent transaction receipts;
+- never be copied into Dropbox or treated as an authoritative backup.
+
+Later local stages resolve an object in this order:
+
+1. a structurally validated replacement object in the current run overlay;
+2. a current-run tombstone, which means the canonical object is absent from the proposed final state;
+3. otherwise the matching object from the chosen Dropbox baseline.
+
+A tombstone is only a local marker during planning and building. It prevents an old Dropbox object that is scheduled for deletion from reappearing in the combined local view. It does not prove that the corresponding live R2 object has been deleted.
+
+Only structurally validated overlay objects may be used as input to later manifest, parent-manifest, AQI or index stages. A merely proposed, partially built or failed object must not become authoritative within the current run.
+
+Local run state must keep these states distinct where applicable:
+
+- proposed write or deletion;
+- locally built;
+- structurally validated;
+- uploaded;
+- GET-verified;
+- deleted and deletion-verified;
+- failed or blocked.
+
+An uploaded object is not treated as successfully repaired until its post-write GET verification has succeeded. A planned deletion is not treated as complete until absence has been verified during the real apply.
+
+Dry-run may record proposed, locally built and structurally validated objects and tombstones. It must never mark anything as uploaded, deleted, GET-verified or deletion-verified.
+
+The overlay is not a resume mechanism. An interrupted or failed repair is rerun from the beginning with a new overlay. A retained failed-run overlay may be inspected for diagnosis, but must not be used as input to a later repair.
+
+After a successful repair, completed final verification and completed reports, the overlay may be deleted. Durable audit evidence remains in Integrity SQLite, task logs and JSON/Markdown reports.
+
 ## Seven logical v2 areas
 
 Integrity checks seven logical areas. These are not necessarily seven broad scans:
