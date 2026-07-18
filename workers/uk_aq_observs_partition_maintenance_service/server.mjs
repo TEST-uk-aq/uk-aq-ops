@@ -95,17 +95,50 @@ function compactObservsPartitionHealthSummary(summary = {}) {
     ensure_start_day_utc: summary.ensure_start_day_utc,
     ensure_end_day_utc: summary.ensure_end_day_utc,
     retention_cutoff_utc: summary.retention_cutoff_utc,
-    partitions_checked: summary.drop_candidate_count,
-    partitions_created: summary.ensured_partition_count,
+    partitions_checked: summary.partitions_ensured_count,
+    partitions_created: summary.partitions_created_count,
     partitions_already_existing: undefined,
     partitions_missing: undefined,
-    partitions_repaired: summary.index_enforcement_count,
+    partitions_repaired: summary.partitions_index_changed_count,
+    drop_candidates_checked: summary.drop_candidates_checked_count,
     rows_affected: undefined,
     dropped_count: summary.dropped_count,
     skipped_count: summary.skipped_count,
     default_row_count: summary.default_partition_diagnostics?.default_row_count,
     warnings,
   };
+}
+
+function githubActionsTaskRunMetadata() {
+  if (process.env.GITHUB_ACTIONS !== "true") {
+    return {};
+  }
+
+  const repository = String(process.env.GITHUB_REPOSITORY || "").trim();
+  const workflow = String(process.env.GITHUB_WORKFLOW || "").trim();
+  const runId = String(process.env.GITHUB_RUN_ID || "").trim();
+  if (!(repository && workflow && runId)) {
+    return {};
+  }
+
+  return {
+    source_repo: repository,
+    source_worker: workflow,
+    platform_run_id: runId,
+    log_url: `https://github.com/${repository}/actions/runs/${runId}`,
+  };
+}
+
+function countCreatedPartitions(results) {
+  return results.filter((result) => result?.partition_created === true).length;
+}
+
+function countPartitionsWithIndexChanges(results) {
+  return results.filter((result) => (
+    result?.brin_created === true
+    || result?.hot_key_created === true
+    || Number(result?.btree_indexes_dropped ?? 0) > 0
+  )).length;
 }
 
 function requiredEnvAny(names) {
@@ -1150,12 +1183,16 @@ async function runObservsPartitionMaintenance(config) {
     observs_retention_days: config.observsRetentionDays,
     drop_dry_run: config.dropDryRun,
     ensured_partition_count: ensured.length,
+    partitions_ensured_count: ensured.length,
+    partitions_created_count: countCreatedPartitions(ensured),
     ensured_partitions_preview: ensured.slice(0, 25),
     index_enforcement_count: enforceResults.length,
+    partitions_index_changed_count: countPartitionsWithIndexChanges(enforceResults),
     index_enforcement_preview: enforceResults.slice(0, 25),
     default_partition_diagnostics: defaultDiagnostics,
     default_partition_dropbox_upload: defaultDropboxUpload,
     drop_candidate_count: dropCandidates.length,
+    drop_candidates_checked_count: dropCandidates.length,
     dropped_count: dropped.length,
     skipped_count: skipped.length,
     dropped_preview: dropped.slice(0, 50),
@@ -1172,6 +1209,7 @@ export async function executeObservsPartitionMaintenance(config) {
       task_key: "ops.observs_partition_maintenance",
       source_repo: "uk-aq-ops",
       source_worker: "uk_aq_observs_partition_maintenance_service",
+      ...githubActionsTaskRunMetadata(),
       startSummary: {
         drop_dry_run: config.dropDryRun,
         future_partition_days: config.futurePartitionDays,

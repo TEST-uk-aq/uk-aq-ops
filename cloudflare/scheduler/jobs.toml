@@ -7,14 +7,22 @@ scheduler_name = "uk-aq-cron-scheduler-ops"
 [jobs.uk_aq_observs_partition_maintenance]
 enabled = true
 cron_expr = "0 3 * * *"
-target_type = "cloud_run"
-cloud_run_url_managed_by_deploy = true
-cloud_run_method = "POST"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_observs_partition_maintenance.yml"
+github_ref = "main"
 dry_run = false
-notes = "Observations partition maintenance; endpoint URL is reconciled by the Cloud Run deploy workflow"
+notes = "Observations partition maintenance via GitHub Actions"
 
-[jobs.uk_aq_observs_partition_maintenance.cloud_run_body]
-source = "cloudflare_scheduler"
+[jobs.uk_aq_prune_daily]
+enabled = true
+cron_expr = "0 2 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_prune_daily.yml"
+github_ref = "main"
+dry_run = false
+notes = "Prune Daily via GitHub Actions"
 
 [jobs.uk_aq_r2_core_snapshot]
 enabled = true
