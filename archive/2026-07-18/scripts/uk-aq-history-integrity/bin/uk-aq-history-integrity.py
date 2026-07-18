@@ -42,20 +42,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
 
-# The entrypoint is also loaded directly by focused tests, where Python does
-# not automatically place this script directory on sys.path.
-_INTEGRITY_BIN_DIR = Path(__file__).resolve().parent
-if str(_INTEGRITY_BIN_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRITY_BIN_DIR))
-
-from daily_profile import (
-    DailyProfileSelection,
-    build_daily_selection,
-    discover_observations_days,
-    historical_target_days_json,
-    selected_days_json,
-)
-
 
 REQUIRED_ENV_VARS = (
     "UK_AQ_ENV_NAME",
@@ -507,27 +493,6 @@ CREATE TABLE IF NOT EXISTS integrity_runs (
 
   notes TEXT
 );
-
-CREATE TABLE IF NOT EXISTS daily_profile_state (
-  env_name TEXT NOT NULL,
-  logical_run_date TEXT NOT NULL,
-  integrity_run_id INTEGER,
-  latest_r2_observations_day TEXT,
-  recent_start_day TEXT,
-  recent_end_day TEXT,
-  historical_target_days_json TEXT NOT NULL,
-  selected_days_json TEXT NOT NULL,
-  represented_month_count INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL,
-  started_at_utc TEXT,
-  completed_at_utc TEXT,
-  error_message TEXT,
-  updated_at_utc TEXT NOT NULL,
-  PRIMARY KEY (env_name, logical_run_date)
-);
-
-CREATE INDEX IF NOT EXISTS idx_daily_profile_state_env_status_date
-  ON daily_profile_state(env_name, status, logical_run_date);
 """
 
 
@@ -2762,19 +2727,6 @@ def _date_range_inclusive(from_day: str, to_day: str) -> list[dt.date]:
     return out
 
 
-def _selected_dates_or_range(
-    from_day: str | None,
-    to_day: str | None,
-    selected_days: Iterable[str] | None = None,
-) -> list[dt.date]:
-    """Use the daily profile's explicit dates without changing legacy ranges."""
-    if selected_days is not None:
-        return sorted({dt.date.fromisoformat(str(day)) for day in selected_days})
-    if not from_day or not to_day:
-        return []
-    return _date_range_inclusive(from_day, to_day)
-
-
 def _upsert_state(
     conn: sqlite3.Connection,
     *,
@@ -4106,7 +4058,6 @@ def check_openaq(
     from_day: str | None,
     to_day: str | None,
     *,
-    selected_days: Iterable[str] | None = None,
     dry_run: bool,
     run_backfill: bool,
     limits: LimitTracker,
@@ -4150,7 +4101,7 @@ def check_openaq(
         "UK_AQ_HISTORY_INTEGRITY_OPENAQ_BASE_URL", OPENAQ_DEFAULT_BASE_URL
     )
 
-    if selected_days is None and (not from_day or not to_day):
+    if not from_day or not to_day:
         metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
         log.warning("openaq: skipped — %s", metrics["skipped_reason"])
         return metrics
@@ -4161,7 +4112,7 @@ def check_openaq(
         log.warning("openaq: skipped — %s", metrics["skipped_reason"])
         return metrics
 
-    days = _selected_dates_or_range(from_day, to_day, selected_days)
+    days = _date_range_inclusive(from_day, to_day)
     if not days:
         metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
         log.warning("openaq: skipped — %s", metrics["skipped_reason"])
@@ -4894,7 +4845,6 @@ def check_sensor_community(
     from_day: str | None,
     to_day: str | None,
     *,
-    selected_days: Iterable[str] | None = None,
     dry_run: bool,
     run_backfill: bool,
     limits: LimitTracker,
@@ -4934,7 +4884,7 @@ def check_sensor_community(
         "UK_AQ_HISTORY_INTEGRITY_SENSOR_COMMUNITY_BASE_URL", SC_DEFAULT_BASE_URL
     )
 
-    if selected_days is None and (not from_day or not to_day):
+    if not from_day or not to_day:
         metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
         log.warning("sensorcommunity: skipped — %s", metrics["skipped_reason"])
         return metrics
@@ -4945,7 +4895,7 @@ def check_sensor_community(
         log.warning("sensorcommunity: skipped — %s", metrics["skipped_reason"])
         return metrics
 
-    days = _selected_dates_or_range(from_day, to_day, selected_days)
+    days = _date_range_inclusive(from_day, to_day)
     if not days:
         metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
         log.warning("sensorcommunity: skipped — %s", metrics["skipped_reason"])
@@ -5692,7 +5642,6 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
     keep_policy: str,
     requested_from_day: str,
     requested_to_day: str,
-    requested_days: Iterable[str] | None,
     log: logging.Logger,
     limits: LimitTracker | None = None,
 ) -> dict[str, Any]:
@@ -5722,7 +5671,6 @@ def _check_one_sos_uk_air_flat_file_threadsafe(
             keep_policy=keep_policy,
             requested_from_day=requested_from_day,
             requested_to_day=requested_to_day,
-            requested_days=requested_days,
             log=log,
         )
     finally:
@@ -5748,7 +5696,6 @@ def _check_one_sos_uk_air_flat_file(
     log: logging.Logger,
     requested_from_day: str | None = None,
     requested_to_day: str | None = None,
-    requested_days: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     site_token = str(site_ref).strip().upper()
     sfk = _uk_air_flat_file_source_file_key(site_token, year)
@@ -6111,20 +6058,15 @@ def _check_one_sos_uk_air_flat_file(
     out_of_window_unmapped_groups = 0
     out_of_window_unmapped_rows = 0
     issue_notes: list[str] = []
-    requested_day_set = {str(day) for day in requested_days} if requested_days is not None else None
     for (day_utc, pollutant_code), source_count in sorted(parsed_counts.items()):
         mapping_row, mapping_status = _resolve_uk_air_flat_file_mapping_row(
             grouped.get(pollutant_code, []),
             day_utc,
         )
         if mapping_row is None:
-            in_requested_window = (
-                day_utc in requested_day_set
-                if requested_day_set is not None
-                else bool(
-                    not requested_from_day or not requested_to_day
-                    or requested_from_day <= day_utc <= requested_to_day
-                )
+            in_requested_window = bool(
+                not requested_from_day or not requested_to_day
+                or requested_from_day <= day_utc <= requested_to_day
             )
             if mapping_status == "ambiguous_mapping":
                 if in_requested_window:
@@ -6158,8 +6100,6 @@ def _check_one_sos_uk_air_flat_file(
             unmapped_groups += 1
             unmapped_rows += int(source_count)
             issue_notes.append(f"{day_utc}:{pollutant_code}=invalid_timeseries_id")
-            continue
-        if requested_day_set is not None and day_utc not in requested_day_set:
             continue
         counts_by_day_ts[(day_utc, timeseries_id)] = counts_by_day_ts.get((day_utc, timeseries_id), 0) + int(source_count)
         mapped_timeseries_ids.add(timeseries_id)
@@ -6333,7 +6273,6 @@ def check_sos_flat_files(
     from_day: str | None,
     to_day: str | None,
     *,
-    selected_days: Iterable[str] | None = None,
     dry_run: bool,
     run_backfill: bool,
     limits: LimitTracker,
@@ -6394,13 +6333,12 @@ def check_sos_flat_files(
         "sample_urls": [],
         "skipped_reason": None,
     }
-    if selected_days is None and (not from_day or not to_day):
+    if not from_day or not to_day:
         metrics["skipped_reason"] = "from_day/to_day not set; manual profile requires both"
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
         return metrics
 
-    requested_dates = _selected_dates_or_range(from_day, to_day, selected_days)
-    years = sorted({day.year for day in requested_dates})
+    years = _uk_air_flat_file_years_for_window(from_day, to_day)
     if not years:
         metrics["skipped_reason"] = f"empty date range {from_day}..{to_day}"
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
@@ -6430,7 +6368,7 @@ def check_sos_flat_files(
 
     metrics["stations"] = len(grouped_mappings)
     metrics["stations_checked"] = len(grouped_mappings)
-    metrics["days"] = len(requested_dates)
+    metrics["days"] = len(years)
     metrics["site_years"] = len(tasks)
     metrics["station_days_checked"] = 0
     metrics["head_checked"] = 0
@@ -6478,7 +6416,6 @@ def check_sos_flat_files(
                 metrics["keep_api_snapshots_policy"],
                 from_day,
                 to_day,
-                tuple(day.isoformat() for day in requested_dates),
                 log,
                 limits,
             ))
@@ -6661,7 +6598,6 @@ def check_sos(
     from_day: str | None,
     to_day: str | None,
     *,
-    selected_days: Iterable[str] | None = None,
     dry_run: bool,
     run_backfill: bool,
     limits: LimitTracker,
@@ -6675,7 +6611,6 @@ def check_sos(
         env=env,
         from_day=from_day,
         to_day=to_day,
-        selected_days=selected_days,
         dry_run=dry_run,
         run_backfill=run_backfill,
         limits=limits,
@@ -6959,7 +6894,7 @@ AQILEVELS_EXPECTED_HISTORY_SCHEMA_VERSION = 2
 AQILEVELS_EXPECTED_WRITER_VERSION = "parquet-wasm-zstd-v2"
 CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
 
-HISTORY_INTEGRITY_SCHEMA_VERSION = 3
+HISTORY_INTEGRITY_SCHEMA_VERSION = 2
 HISTORY_VERSION_CHOICES = (CURRENT_INTEGRITY_HISTORY_VERSION,)
 LAST_BACKFILL_ENV_LOAD_RESULT: dict[str, Any] = {}
 AQI_INTEGRITY_OBS_COVERAGE_REASON = "aqi_integrity_obs_coverage_gap"
@@ -8873,7 +8808,6 @@ def run_v2_observations_integrity_checks(
     config: HistoryPathConfig,
     from_day: str | None,
     to_day: str | None,
-    selected_days: Iterable[str] | None = None,
     conn: sqlite3.Connection | None = None,
     env_name: str | None = None,
     allowed_connector_ids: set[int] | None = None,
@@ -8886,7 +8820,7 @@ def run_v2_observations_integrity_checks(
     root = Path(r2_history_root)
     if not root.is_dir():
         raise RuntimeError(f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {root}")
-    if selected_days is None and (not from_day or not to_day):
+    if not from_day or not to_day:
         raise RuntimeError("v2 observations integrity requires a selected from/to day range")
 
     gaps: list[dict[str, Any]] = []
@@ -8904,7 +8838,7 @@ def run_v2_observations_integrity_checks(
         except Exception:
             gaps.append(_v2_obs_gap("latest_index_invalid_json", expected_path=latest_key))
 
-    for day in _selected_dates_or_range(from_day, to_day, selected_days):
+    for day in _date_range_inclusive(from_day, to_day):
         day_utc = day.isoformat()
         day_rel = f"{data_prefix}/day_utc={day_utc}"
         day_dir = root / day_rel
@@ -9991,7 +9925,6 @@ def run_v2_aqilevels_integrity_checks(
     config: HistoryPathConfig,
     from_day: str | None,
     to_day: str | None,
-    selected_days: Iterable[str] | None = None,
     allowed_connector_ids: set[int] | None = None,
     source_scope: dict[str, Any] | None = None,
     conn: sqlite3.Connection | None = None,
@@ -10005,7 +9938,7 @@ def run_v2_aqilevels_integrity_checks(
     root = Path(r2_history_root)
     if not root.is_dir():
         raise RuntimeError(f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {root}")
-    if selected_days is None and (not from_day or not to_day):
+    if not from_day or not to_day:
         raise RuntimeError("v2 AQI integrity requires a selected from/to day range")
 
     data_gaps: list[dict[str, Any]] = []
@@ -10028,7 +9961,7 @@ def run_v2_aqilevels_integrity_checks(
             data_gaps.append(_v2_aqi_gap("latest_index_stale_or_incomplete", expected_path=latest_key, related_paths=["latest index is not an object"]))
 
     expected_parts: list[tuple[str, str, str]] = []
-    for day in _selected_dates_or_range(from_day, to_day, selected_days):
+    for day in _date_range_inclusive(from_day, to_day):
         day_utc = day.isoformat()
         day_rel = f"{data_prefix}/day_utc={day_utc}"
         day_dir = root / day_rel
@@ -10246,7 +10179,7 @@ def run_v2_aqilevels_integrity_checks(
             debug_status = "ok"
 
     observation_coverage_checked = 0
-    for day in _selected_dates_or_range(from_day, to_day, selected_days):
+    for day in _date_range_inclusive(from_day, to_day):
         day_utc = day.isoformat()
         for connector_id in _v2_observation_connector_ids_for_aqi_validation(
             root=root,
@@ -10308,7 +10241,6 @@ def run_v2_post_repair_integrity_rechecks(
     check_aqi_debug: bool,
     require_aqi_debug: bool,
     log: logging.Logger,
-    selected_days: Iterable[str] | None = None,
     allowed_real_roots: Iterable[Path] = (),
 ) -> dict[str, Any]:
     """Re-run v2 integrity checks after repairs so final status reflects reality."""
@@ -10317,7 +10249,6 @@ def run_v2_post_repair_integrity_rechecks(
         config=config,
         from_day=from_day,
         to_day=to_day,
-        selected_days=selected_days,
         conn=conn,
         env_name=env_name,
         allowed_connector_ids=allowed_connector_ids,
@@ -10330,7 +10261,6 @@ def run_v2_post_repair_integrity_rechecks(
         config=config,
         from_day=from_day,
         to_day=to_day,
-        selected_days=selected_days,
         allowed_connector_ids=allowed_connector_ids,
         source_scope=source_scope,
         conn=conn,
@@ -14640,7 +14570,6 @@ def _queue_phase4_aqi_work(
 
 def _create_final_verification_view(
     run_state: Mapping[str, Any], *, config: HistoryPathConfig, from_day: str, to_day: str,
-    selected_days: Iterable[str] | None = None,
 ) -> Path:
     """Create a disposable overlay-first filesystem view without copying data."""
     run_root = Path(str(run_state["run_root"]))
@@ -14657,10 +14586,7 @@ def _create_final_verification_view(
 
     # The verification checks need directory discovery and parquet paths. Use
     # symlinks, never copied Dropbox objects, and avoid retired archive trees.
-    days = [
-        day.isoformat()
-        for day in _selected_dates_or_range(from_day, to_day, selected_days)
-    ]
+    days = [day.isoformat() for day in _date_range_inclusive(from_day, to_day)]
     prefixes = [
         *(f"{prefix.strip('/')}/day_utc={day}" for day in days for prefix in (
             config.observations_data_prefix,
@@ -15084,13 +15010,9 @@ def run_v2_final_verification(
     check_aqi_debug: bool,
     require_aqi_debug: bool,
     log: logging.Logger,
-    selected_days: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """One read-only final pass over source cache and final local objects."""
-    view_root = _create_final_verification_view(
-        run_state, config=config, from_day=from_day, to_day=to_day,
-        selected_days=selected_days,
-    )
+    view_root = _create_final_verification_view(run_state, config=config, from_day=from_day, to_day=to_day)
     recheck = run_v2_post_repair_integrity_rechecks(
         conn=conn,
         env_name=env_name,
@@ -15098,7 +15020,6 @@ def run_v2_final_verification(
         config=config,
         from_day=from_day,
         to_day=to_day,
-        selected_days=selected_days,
         allowed_connector_ids=allowed_connector_ids,
         source_scope=source_scope,
         check_aqi_debug=check_aqi_debug,
@@ -15275,7 +15196,6 @@ def run_v2_integrity_repair_flow(
     limits: LimitTracker,
     dry_run: bool,
     log: logging.Logger,
-    selected_days: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Run the six ordered v2 stages, keeping data writers index-free."""
     observations = run_v2_gap_backfills(
@@ -15502,7 +15422,6 @@ def run_v2_integrity_repair_flow(
             config=final_verification_config,
             from_day=from_day,
             to_day=to_day,
-            selected_days=selected_days,
             allowed_connector_ids=allowed_connector_ids,
             source_scope=source_scope,
             check_aqi_debug=check_aqi_debug,
@@ -16764,10 +16683,6 @@ def compute_window(
 ) -> tuple[str | None, str | None]:
     if profile == "manual":
         return (from_day, to_day)
-    if profile == "daily" and not from_day and not to_day:
-        # Scheduled daily selection is resolved from the committed local v2
-        # observations tree after preflight; it must not use retention.
-        return (None, None)
     today = utc_now().date()
     start_back = PROFILE_START_WINDOWS_DAYS[profile]
     end_back = resolve_integrity_end_back_days(env)
@@ -16899,118 +16814,6 @@ def open_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def _daily_profile_missed_logical_dates(
-    conn: sqlite3.Connection,
-    *,
-    env_name: str,
-    logical_run_date: dt.date,
-) -> list[dt.date]:
-    """Return incomplete UTC logical dates after the last completed daily run.
-
-    An empty state table seeds this feature at the current logical date and
-    deliberately does not invent pre-deployment catch-up work.
-    """
-    row_count = int(conn.execute(
-        "SELECT COUNT(*) FROM daily_profile_state WHERE env_name = ?",
-        (env_name,),
-    ).fetchone()[0])
-    if row_count == 0:
-        return []
-    last_complete_raw = conn.execute(
-        """
-        SELECT MAX(logical_run_date)
-        FROM daily_profile_state
-        WHERE env_name = ? AND status = 'complete'
-        """,
-        (env_name,),
-    ).fetchone()[0]
-    if last_complete_raw:
-        start = dt.date.fromisoformat(str(last_complete_raw)) + dt.timedelta(days=1)
-    else:
-        first_raw = conn.execute(
-            "SELECT MIN(logical_run_date) FROM daily_profile_state WHERE env_name = ?",
-            (env_name,),
-        ).fetchone()[0]
-        start = dt.date.fromisoformat(str(first_raw)) if first_raw else logical_run_date
-    if start >= logical_run_date:
-        return []
-    status_by_day = {
-        dt.date.fromisoformat(str(day)): str(status)
-        for day, status in conn.execute(
-            """
-            SELECT logical_run_date, status
-            FROM daily_profile_state
-            WHERE env_name = ? AND logical_run_date >= ? AND logical_run_date < ?
-            """,
-            (env_name, start.isoformat(), logical_run_date.isoformat()),
-        )
-    }
-    missed: list[dt.date] = []
-    day = start
-    while day < logical_run_date:
-        if status_by_day.get(day) != "complete":
-            missed.append(day)
-        day += dt.timedelta(days=1)
-    return missed
-
-
-def _upsert_daily_profile_state(
-    conn: sqlite3.Connection,
-    *,
-    env_name: str,
-    selection: DailyProfileSelection,
-    integrity_run_id: int | None,
-    status: str,
-    started_at_utc: str | None = None,
-    completed_at_utc: str | None = None,
-    error_message: str | None = None,
-) -> None:
-    if status not in {"planned", "running", "complete", "failed", "stopped_limit"}:
-        raise ValueError(f"unsupported daily profile state status: {status}")
-    now_iso = fmt_iso(utc_now())
-    conn.execute(
-        """
-        INSERT INTO daily_profile_state (
-          env_name, logical_run_date, integrity_run_id,
-          latest_r2_observations_day, recent_start_day, recent_end_day,
-          historical_target_days_json, selected_days_json,
-          represented_month_count, status, started_at_utc, completed_at_utc,
-          error_message, updated_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(env_name, logical_run_date) DO UPDATE SET
-          integrity_run_id = excluded.integrity_run_id,
-          latest_r2_observations_day = excluded.latest_r2_observations_day,
-          recent_start_day = excluded.recent_start_day,
-          recent_end_day = excluded.recent_end_day,
-          historical_target_days_json = excluded.historical_target_days_json,
-          selected_days_json = excluded.selected_days_json,
-          represented_month_count = excluded.represented_month_count,
-          status = excluded.status,
-          started_at_utc = COALESCE(excluded.started_at_utc, daily_profile_state.started_at_utc),
-          completed_at_utc = excluded.completed_at_utc,
-          error_message = excluded.error_message,
-          updated_at_utc = excluded.updated_at_utc
-        """,
-        (
-            env_name,
-            selection.logical_run_date.isoformat(),
-            integrity_run_id,
-            selection.latest_r2_observations_day.isoformat(),
-            selection.recent_start_day.isoformat(),
-            selection.recent_end_day.isoformat(),
-            historical_target_days_json(selection.historical_target_day_numbers),
-            selected_days_json(selection.selected_days),
-            selection.represented_historical_month_count,
-            status,
-            started_at_utc,
-            completed_at_utc,
-            error_message,
-            now_iso,
-        ),
-    )
-    conn.commit()
-
-
 def normalize_source_key_sensorcommunity(
     conn: sqlite3.Connection,
     log: logging.Logger,
@@ -17113,35 +16916,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
         f"- Log:       {s['log_path']}",
         "",
     ]
-
-    selection = s.get("date_selection") or {}
-    if selection:
-        lines.extend([
-            "## Date selection",
-            "",
-            f"- Mode: {selection.get('selection_mode')}",
-            f"- Logical run date: {selection.get('logical_run_date') or '(manual override)'}",
-            f"- Logical run timezone: {selection.get('logical_run_timezone') or '(n/a)'}",
-            f"- Latest R2 observations day: {selection.get('latest_r2_observations_day') or '(n/a)'}",
-            f"- Discovery source: {selection.get('discovery_source') or '(n/a)'}",
-            f"- Observations prefix: {selection.get('active_observations_prefix') or '(n/a)'}",
-            f"- Recent scope: {selection.get('recent_start_day') or '(n/a)'} -> {selection.get('recent_end_day') or '(n/a)'}",
-            f"- Historical target day numbers: {', '.join(str(day) for day in selection.get('historical_target_day_numbers') or []) or '(n/a)'}",
-            f"- Represented historical months: {selection.get('represented_historical_month_count') or 0}",
-            f"- Selected date count: {selection.get('selected_date_count') or 0}",
-            f"- State row status: {selection.get('state_row_status') or '(not persisted)'}",
-        ])
-        caught_up = selection.get("caught_up_logical_dates") or []
-        if caught_up:
-            lines.append(f"- Caught-up logical dates: {', '.join(str(day) for day in caught_up)}")
-        selected = selection.get("selected_days") or []
-        if selected:
-            lines.extend(["", "### Explicit selected dates", ""])
-            for entry in selected:
-                lines.append(
-                    f"- {entry.get('day_utc')}: {', '.join(entry.get('reasons') or [])}"
-                )
-        lines.append("")
 
     history_configs = s.get("history_path_configs") or {}
     if history_configs:
@@ -17905,14 +17679,16 @@ def main(argv: list[str]) -> int:
                 log.error("daily task health strict mode enabled; aborting run")
                 return 1
 
+    end_back_days = resolve_integrity_end_back_days(os.environ)
     from_day, to_day = compute_window(
         args.profile, args.from_day, args.to_day, os.environ
     )
-    if args.profile != "manual" and args.profile != "daily":
+    log.info("window from=%s to=%s", from_day, to_day)
+    if args.profile != "manual":
         log.info(
             "window defaults: profile_start_days=%s r2_end_days=%s (INGESTDB_RETENTION_DAYS+1)",
             PROFILE_START_WINDOWS_DAYS[args.profile],
-            resolve_integrity_end_back_days(os.environ),
+            end_back_days,
         )
     if args.profile == "manual" and (not from_day or not to_day):
         log.warning(
@@ -17921,102 +17697,6 @@ def main(argv: list[str]) -> int:
 
     conn = open_db(env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
     normalize_source_key_sensorcommunity(conn, log)
-    daily_selection: DailyProfileSelection | None = None
-    selected_day_values: tuple[str, ...] | None = None
-    selection_summary: dict[str, Any] | None = None
-    if args.profile == "daily" and not args.from_day and not args.to_day:
-        r2_history_root = resolve_r2_history_root(os.environ)
-        if not r2_history_root:
-            raise RuntimeError(
-                "daily profile cannot discover the latest R2 observations day: "
-                "UK_AQ_R2_HISTORY_DROPBOX_ROOT is unavailable"
-            )
-        observations_prefix = history_path_configs["v2"].observations_data_prefix
-        observations_days = discover_observations_days(r2_history_root, observations_prefix)
-        if not observations_days:
-            selection_error = (
-                "daily profile cannot discover a strictly parsed committed v2 "
-                f"observations day under {observations_prefix!r} in {r2_history_root}"
-            )
-            selection_summary = {
-                "selection_mode": "daily_explicit",
-                "logical_run_date": started_at.date().isoformat(),
-                "logical_run_timezone": "UTC",
-                "discovery_source": "local_dropbox_committed_v2_observations_tree",
-                "active_observations_prefix": observations_prefix,
-                "state_row_status": "failed",
-                "error": selection_error,
-            }
-            summary = {
-                "env": args.env,
-                "profile": args.profile,
-                "source": args.source,
-                "from_day": None,
-                "to_day": None,
-                "date_selection": selection_summary,
-                "started_at_utc": started_iso,
-                "finished_at_utc": fmt_iso(utc_now()),
-                "status": "failed",
-                "dry_run": bool(args.dry_run),
-                "check_only": bool(args.check_only),
-                "run_backfill": bool(args.run_backfill),
-                "repair_mode": bool(args.run_backfill),
-                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-                "log_path": str(log_path),
-                "history_version_mode": history_version_mode,
-                "checked_versions": checked_history_versions,
-                "history_path_configs": serialized_history_path_configs,
-                "backup_readiness": backup_gate_summary,
-                "metrics": {},
-                "notes": selection_error,
-            }
-            write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
-            conn.close()
-            return 1
-        logical_run_date = started_at.date()
-        catch_up_logical_dates = _daily_profile_missed_logical_dates(
-            conn, env_name=args.env, logical_run_date=logical_run_date,
-        )
-        daily_selection = build_daily_selection(
-            logical_run_date=logical_run_date,
-            observations_days=observations_days,
-            observations_prefix=observations_prefix,
-            catch_up_logical_dates=catch_up_logical_dates,
-        )
-        selected_day_values = tuple(
-            entry.day.isoformat() for entry in daily_selection.selected_days
-        )
-        from_day, to_day = daily_selection.from_day, daily_selection.to_day
-        selection_summary = daily_selection.to_dict()
-        _upsert_daily_profile_state(
-            conn,
-            env_name=args.env,
-            selection=daily_selection,
-            integrity_run_id=None,
-            status="planned",
-        )
-        selection_summary = {
-            **selection_summary,
-            "state_row_status": "planned",
-        }
-        log.info(
-            "daily explicit selection logical_run_date=%s latest_r2_observations_day=%s "
-            "selected_dates=%s represented_historical_months=%s caught_up_dates=%s",
-            logical_run_date.isoformat(),
-            daily_selection.latest_r2_observations_day.isoformat(),
-            len(selected_day_values),
-            daily_selection.represented_historical_month_count,
-            ",".join(day.isoformat() for day in catch_up_logical_dates) or "(none)",
-        )
-        log.info("daily date selection=%s", json.dumps(selection_summary, sort_keys=True))
-    elif args.profile == "daily":
-        selection_summary = {
-            "selection_mode": "manual_override_contiguous_window",
-            "logical_run_timezone": "UTC",
-            "from_day": from_day,
-            "to_day": to_day,
-        }
-    log.info("window compatibility bounds from=%s to=%s", from_day, to_day)
     run_id: int | None = None
     try:
         cur = conn.execute(
@@ -18035,15 +17715,6 @@ def main(argv: list[str]) -> int:
         run_id = cur.lastrowid
         conn.commit()
         log.info("integrity_runs.id=%s", run_id)
-        if daily_selection is not None:
-            _upsert_daily_profile_state(
-                conn,
-                env_name=args.env,
-                selection=daily_selection,
-                integrity_run_id=int(run_id),
-                status="running",
-                started_at_utc=started_iso,
-            )
 
         # Phase 2: import the core snapshot from Dropbox R2 backup.
         snapshot_result: dict[str, Any]
@@ -18132,7 +17803,6 @@ def main(argv: list[str]) -> int:
             openaq_metrics = check_openaq(
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
-                selected_days=selected_day_values,
                 dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
@@ -18149,7 +17819,6 @@ def main(argv: list[str]) -> int:
             sc_metrics = check_sensor_community(
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
-                selected_days=selected_day_values,
                 dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
@@ -18166,7 +17835,6 @@ def main(argv: list[str]) -> int:
             sos_metrics = check_sos(
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
-                selected_days=selected_day_values,
                 dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log,
                 concurrency=max(1, int(args.concurrency)),
@@ -18195,7 +17863,6 @@ def main(argv: list[str]) -> int:
                 config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
-                selected_days=selected_day_values,
                 conn=conn,
                 env_name=args.env,
                 allowed_connector_ids=v2_allowed_connector_ids,
@@ -18207,7 +17874,6 @@ def main(argv: list[str]) -> int:
                 config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
-                selected_days=selected_day_values,
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
                 conn=conn,
@@ -18273,7 +17939,6 @@ def main(argv: list[str]) -> int:
                 final_verification_config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
-                selected_days=selected_day_values,
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
                 check_aqi_debug=bool(args.check_aqi_debug),
@@ -18324,27 +17989,6 @@ def main(argv: list[str]) -> int:
                 status = "ok"
         elif v2_gap_count_for_status > 0:
             status = "fail"
-
-        if daily_selection is not None:
-            daily_state_status = "stopped_limit" if status == "stopped_limit" else (
-                "complete" if status in {"ok", "noop"} else "failed"
-            )
-            _upsert_daily_profile_state(
-                conn,
-                env_name=args.env,
-                selection=daily_selection,
-                integrity_run_id=int(run_id),
-                status=daily_state_status,
-                completed_at_utc=fmt_iso(utc_now()),
-                error_message=(
-                    None if daily_state_status == "complete"
-                    else f"integrity run status={status}"
-                ),
-            )
-            selection_summary = {
-                **daily_selection.to_dict(),
-                "state_row_status": daily_state_status,
-            }
 
         # Build the notes from snapshot + openaq outcomes.
         notes_parts: list[str] = []
@@ -18749,7 +18393,6 @@ def main(argv: list[str]) -> int:
             "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,
             "from_day": from_day,
             "to_day": to_day,
-            "date_selection": selection_summary,
             "dry_run": args.dry_run,
             "check_only": args.check_only,
             "run_backfill": args.run_backfill,
@@ -18807,7 +18450,6 @@ def main(argv: list[str]) -> int:
                 "source": args.source,
                 "from_day": from_day,
                 "to_day": to_day,
-                "date_selection": selection_summary,
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
@@ -18894,19 +18536,6 @@ def main(argv: list[str]) -> int:
                 conn.commit()
             except Exception:
                 pass
-        if "daily_selection" in locals() and daily_selection is not None:
-            try:
-                _upsert_daily_profile_state(
-                    conn,
-                    env_name=args.env,
-                    selection=daily_selection,
-                    integrity_run_id=run_id,
-                    status="failed",
-                    completed_at_utc=fmt_iso(utc_now()),
-                    error_message=str(exc),
-                )
-            except Exception:
-                pass
         if daily_task_health_enabled:
             failed_iso = fmt_iso(utc_now())
             fail_summary = {
@@ -18915,7 +18544,6 @@ def main(argv: list[str]) -> int:
                 "source": args.source,
                 "from_day": from_day if "from_day" in locals() else args.from_day,
                 "to_day": to_day if "to_day" in locals() else args.to_day,
-                "date_selection": selection_summary if "selection_summary" in locals() else None,
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
