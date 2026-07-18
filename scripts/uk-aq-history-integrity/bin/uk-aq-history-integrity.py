@@ -52,6 +52,7 @@ from daily_profile import (
     DailyProfileSelection,
     build_daily_selection,
     discover_observations_days,
+    historical_target_day_numbers,
     historical_target_days_json,
     selected_days_json,
 )
@@ -521,6 +522,9 @@ CREATE TABLE IF NOT EXISTS daily_profile_state (
   status TEXT NOT NULL,
   started_at_utc TEXT,
   completed_at_utc TEXT,
+  completed_by_run_id INTEGER,
+  caught_up_at_utc TEXT,
+  caught_up_by_logical_run_date TEXT,
   error_message TEXT,
   updated_at_utc TEXT NOT NULL,
   PRIMARY KEY (env_name, logical_run_date)
@@ -5764,8 +5768,14 @@ def _check_one_sos_uk_air_flat_file(
         "downloaded_bytes": 0,
         "row_count": 0,
         "source_rows": 0,
+        "source_rows_total": 0,
+        "selected_source_rows": 0,
         "mapped_rows": 0,
+        "mapped_rows_total": 0,
+        "selected_mapped_rows": 0,
         "mapped_days": 0,
+        "mapped_days_total": 0,
+        "selected_mapped_days": 0,
         "mapped_pollutants": 0,
         "unmapped_source_groups": 0,
         "ambiguous_mapping_groups": 0,
@@ -5779,6 +5789,7 @@ def _check_one_sos_uk_air_flat_file(
         "timeseries_ids": [],
         "downloaded": False,
         "cache_reused": False,
+        "counts_rebuilt_from_cache": False,
         "cache_missing_redownloaded": False,
         "download_reason": None,
     }
@@ -6101,13 +6112,13 @@ def _check_one_sos_uk_air_flat_file(
     )
     grouped = grouped_mappings.get(site_token, {})
     counts_by_day_ts: dict[tuple[str, int], int] = {}
+    selected_counts_by_day_ts: dict[tuple[str, int], int] = {}
     mapped_timeseries_ids: set[int] = set()
     mapped_days: set[str] = set()
+    selected_mapped_days: set[str] = set()
     mapped_pollutants: set[str] = set()
-    unmapped_groups = 0
-    ambiguous_groups = 0
-    unmapped_rows = 0
-    ambiguous_rows = 0
+    unmapped_groups = ambiguous_groups = unmapped_rows = ambiguous_rows = 0
+    unmapped_groups_total = ambiguous_groups_total = unmapped_rows_total = ambiguous_rows_total = 0
     out_of_window_unmapped_groups = 0
     out_of_window_unmapped_rows = 0
     issue_notes: list[str] = []
@@ -6127,10 +6138,14 @@ def _check_one_sos_uk_air_flat_file(
                 )
             )
             if mapping_status == "ambiguous_mapping":
+                ambiguous_groups_total += 1
+                ambiguous_rows_total += int(source_count)
                 if in_requested_window:
                     ambiguous_groups += 1
                     ambiguous_rows += int(source_count)
             else:
+                unmapped_groups_total += 1
+                unmapped_rows_total += int(source_count)
                 if in_requested_window:
                     unmapped_groups += 1
                     unmapped_rows += int(source_count)
@@ -6150,26 +6165,45 @@ def _check_one_sos_uk_air_flat_file(
         try:
             timeseries_id = int(mapping_row.get("timeseries_id") or 0)
         except (TypeError, ValueError):
-            unmapped_groups += 1
-            unmapped_rows += int(source_count)
-            issue_notes.append(f"{day_utc}:{pollutant_code}=invalid_timeseries_id")
+            unmapped_groups_total += 1
+            unmapped_rows_total += int(source_count)
+            if requested_day_set is None or day_utc in requested_day_set:
+                unmapped_groups += 1
+                unmapped_rows += int(source_count)
+                issue_notes.append(f"{day_utc}:{pollutant_code}=invalid_timeseries_id")
             continue
         if timeseries_id <= 0:
-            unmapped_groups += 1
-            unmapped_rows += int(source_count)
-            issue_notes.append(f"{day_utc}:{pollutant_code}=invalid_timeseries_id")
-            continue
-        if requested_day_set is not None and day_utc not in requested_day_set:
+            unmapped_groups_total += 1
+            unmapped_rows_total += int(source_count)
+            if requested_day_set is None or day_utc in requested_day_set:
+                unmapped_groups += 1
+                unmapped_rows += int(source_count)
+                issue_notes.append(f"{day_utc}:{pollutant_code}=invalid_timeseries_id")
             continue
         counts_by_day_ts[(day_utc, timeseries_id)] = counts_by_day_ts.get((day_utc, timeseries_id), 0) + int(source_count)
         mapped_timeseries_ids.add(timeseries_id)
         mapped_days.add(day_utc)
         mapped_pollutants.add(pollutant_code)
+        if requested_day_set is None or day_utc in requested_day_set:
+            selected_counts_by_day_ts[(day_utc, timeseries_id)] = selected_counts_by_day_ts.get((day_utc, timeseries_id), 0) + int(source_count)
+            selected_mapped_days.add(day_utc)
 
     metrics["source_rows"] = int(parse_stats.get("rows") or 0)
-    metrics["mapped_rows"] = sum(counts_by_day_ts.values())
-    metrics["row_count"] = metrics["mapped_rows"]
-    metrics["mapped_days"] = len(mapped_days)
+    metrics["source_rows_total"] = metrics["source_rows"]
+    metrics["selected_source_rows"] = sum(
+        int(count) for (day, _), count in parsed_counts.items()
+        if requested_day_set is None or day in requested_day_set
+    )
+    metrics["mapped_rows_total"] = sum(counts_by_day_ts.values())
+    metrics["selected_mapped_rows"] = sum(selected_counts_by_day_ts.values())
+    # Retain the original metric names for callers.  They now describe the
+    # selected daily scope, while the explicit *_total fields describe the
+    # complete annual source file persisted in SQLite.
+    metrics["mapped_rows"] = metrics["selected_mapped_rows"]
+    metrics["row_count"] = metrics["selected_mapped_rows"]
+    metrics["mapped_days_total"] = len(mapped_days)
+    metrics["selected_mapped_days"] = len(selected_mapped_days)
+    metrics["mapped_days"] = metrics["selected_mapped_days"]
     metrics["mapped_pollutants"] = len(mapped_pollutants)
     metrics["unmapped_source_groups"] = unmapped_groups
     metrics["ambiguous_mapping_groups"] = ambiguous_groups
@@ -6188,17 +6222,18 @@ def _check_one_sos_uk_air_flat_file(
         now_iso,
         default_day_utc=year_day.isoformat(),
     )
+    metrics["counts_rebuilt_from_cache"] = cache_reused
 
     content_changed = is_first_seen or (not prior_sha) or prior_sha != sha_csv
     state_changed = is_first_seen or was_missing or content_changed
     mapping_status = "ok"
-    if unmapped_groups and ambiguous_groups:
+    if unmapped_groups_total and ambiguous_groups_total:
         mapping_status = "mixed_mapping_issues"
-    elif unmapped_groups:
+    elif unmapped_groups_total:
         mapping_status = "unmapped_source"
-    elif ambiguous_groups:
+    elif ambiguous_groups_total:
         mapping_status = "ambiguous_mapping"
-    if metrics["mapped_rows"] <= 0 and mapping_status == "ok" and metrics["source_rows"] > 0:
+    if metrics["mapped_rows_total"] <= 0 and mapping_status == "ok" and metrics["source_rows_total"] > 0:
         mapping_status = "unmapped_source"
     state_status = mapping_status if mapping_status != "ok" else (
         "first_seen" if is_first_seen else "reappeared" if was_missing else "changed" if content_changed else "unchanged"
@@ -6245,9 +6280,12 @@ def _check_one_sos_uk_air_flat_file(
         "uk_air_flat_file",
         f"site_ref={site_token}",
         f"year={int(year)}",
-        f"source_rows={metrics['source_rows']}",
-        f"mapped_rows={metrics['mapped_rows']}",
-        f"mapped_days={metrics['mapped_days']}",
+        f"source_rows_total={metrics['source_rows_total']}",
+        f"selected_source_rows={metrics['selected_source_rows']}",
+        f"mapped_rows_total={metrics['mapped_rows_total']}",
+        f"selected_mapped_rows={metrics['selected_mapped_rows']}",
+        f"mapped_days_total={metrics['mapped_days_total']}",
+        f"selected_mapped_days={metrics['selected_mapped_days']}",
         f"mapped_pollutants={metrics['mapped_pollutants']}",
         f"mapping_status={mapping_status}",
         f"snapshot_status={metrics['snapshot_status']}",
@@ -6356,6 +6394,7 @@ def check_sos_flat_files(
         "unchanged": 0,
         "unchanged_cached": 0,
         "cache_reused": 0,
+        "counts_rebuilt_from_cache": 0,
         "cache_missing_redownloaded": 0,
         "first_seen": 0,
         "changed": 0,
@@ -6371,8 +6410,14 @@ def check_sos_flat_files(
         "errors": 0,
         "rows_counted": 0,
         "source_rows": 0,
+        "source_rows_total": 0,
+        "selected_source_rows": 0,
+        "mapped_rows_total": 0,
+        "selected_mapped_rows": 0,
         "downloaded_bytes": 0,
         "mapped_days": 0,
+        "mapped_days_total": 0,
+        "selected_mapped_days": 0,
         "mapped_pollutants": 0,
         "unmapped_source_groups": 0,
         "ambiguous_mapping_groups": 0,
@@ -6520,9 +6565,17 @@ def check_sos_flat_files(
                 metrics["downloaded"] += 1
             if bool(result.get("cache_reused")):
                 metrics["cache_reused"] += 1
+            if bool(result.get("counts_rebuilt_from_cache")):
+                metrics["counts_rebuilt_from_cache"] += 1
             if bool(result.get("cache_missing_redownloaded")):
                 metrics["cache_missing_redownloaded"] += 1
             metrics["source_rows"] += int(result.get("source_rows") or 0)
+            metrics["source_rows_total"] += int(result.get("source_rows_total") or 0)
+            metrics["selected_source_rows"] += int(result.get("selected_source_rows") or 0)
+            metrics["mapped_rows_total"] += int(result.get("mapped_rows_total") or 0)
+            metrics["selected_mapped_rows"] += int(result.get("selected_mapped_rows") or 0)
+            metrics["mapped_days_total"] += int(result.get("mapped_days_total") or 0)
+            metrics["selected_mapped_days"] += int(result.get("selected_mapped_days") or 0)
             metrics["rows_counted"] += int(result.get("mapped_rows") or result.get("row_count") or 0)
             metrics["mapped_days"] += int(result.get("mapped_days") or 0)
             metrics["mapped_pollutants"] += int(result.get("mapped_pollutants") or 0)
@@ -10441,6 +10494,7 @@ def run_r2_cross_checks(
     r2_manifest_prefix: str | None,
     checked_at_utc: str,
     log: logging.Logger,
+    selected_days: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Phase 6.5 Pass B: compare source_file_timeseries_counts against local
     R2 observations_timeseries index manifests.
@@ -10470,12 +10524,17 @@ def run_r2_cross_checks(
         f"s.source_key IN ({','.join('?' for _ in source_keys)})",
     ]
     params: list[Any] = [env_name, *source_keys]
-    if from_day:
-        where.append("c.day_utc >= ?")
-        params.append(from_day)
-    if to_day:
-        where.append("c.day_utc <= ?")
-        params.append(to_day)
+    explicit_selected_days = sorted({str(day) for day in selected_days or ()})
+    if explicit_selected_days:
+        where.append(f"c.day_utc IN ({','.join('?' for _ in explicit_selected_days)})")
+        params.extend(explicit_selected_days)
+    else:
+        if from_day:
+            where.append("c.day_utc >= ?")
+            params.append(from_day)
+        if to_day:
+            where.append("c.day_utc <= ?")
+            params.append(to_day)
     where_sql = " AND ".join(where)
 
     rows = conn.execute(
@@ -15595,6 +15654,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="YYYY-MM-DD lower bound (manual profile or override).")
     p.add_argument("--to-day", dest="to_day", default=None,
                    help="YYYY-MM-DD upper bound (manual profile or override).")
+    p.add_argument(
+        "--logical-run-date",
+        default=None,
+        help="UTC scheduled logical date (YYYY-MM-DD); daily profile retries reuse this identity.",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--check-only", action="store_true",
                    help="Detect changes; do not trigger backfill.")
@@ -15661,6 +15725,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Treat missing/invalid v2 AQI hourly debug partitions as errors (default false; env UK_AQ_R2_HISTORY_INTEGRITY_REQUIRE_AQI_DEBUG).",
     )
     parsed = p.parse_args(argv)
+    if parsed.logical_run_date:
+        try:
+            dt.date.fromisoformat(parsed.logical_run_date)
+        except ValueError:
+            p.error("--logical-run-date must be YYYY-MM-DD")
+        if parsed.profile != "daily":
+            p.error("--logical-run-date is supported only with --profile daily")
     if parsed.check_only and parsed.run_backfill:
         p.error(
             "--check-only and --run-backfill cannot be used together.",
@@ -16895,6 +16966,11 @@ def open_db(db_path: str) -> sqlite3.Connection:
         "aqi_rebuilds_failed": "INTEGER DEFAULT 0",
         "aqi_rebuilds_skipped": "INTEGER DEFAULT 0",
     })
+    ensure_columns(conn, "daily_profile_state", {
+        "completed_by_run_id": "INTEGER",
+        "caught_up_at_utc": "TEXT",
+        "caught_up_by_logical_run_date": "TEXT",
+    })
     conn.commit()
     return conn
 
@@ -16920,7 +16996,7 @@ def _daily_profile_missed_logical_dates(
         """
         SELECT MAX(logical_run_date)
         FROM daily_profile_state
-        WHERE env_name = ? AND status = 'complete'
+        WHERE env_name = ? AND status IN ('complete', 'caught_up')
         """,
         (env_name,),
     ).fetchone()[0]
@@ -16948,7 +17024,7 @@ def _daily_profile_missed_logical_dates(
     missed: list[dt.date] = []
     day = start
     while day < logical_run_date:
-        if status_by_day.get(day) != "complete":
+        if status_by_day.get(day) not in {"complete", "caught_up"}:
             missed.append(day)
         day += dt.timedelta(days=1)
     return missed
@@ -16965,7 +17041,7 @@ def _upsert_daily_profile_state(
     completed_at_utc: str | None = None,
     error_message: str | None = None,
 ) -> None:
-    if status not in {"planned", "running", "complete", "failed", "stopped_limit"}:
+    if status not in {"planned", "running", "complete", "caught_up", "failed", "stopped_limit", "dry_run", "skipped"}:
         raise ValueError(f"unsupported daily profile state status: {status}")
     now_iso = fmt_iso(utc_now())
     conn.execute(
@@ -16975,8 +17051,9 @@ def _upsert_daily_profile_state(
           latest_r2_observations_day, recent_start_day, recent_end_day,
           historical_target_days_json, selected_days_json,
           represented_month_count, status, started_at_utc, completed_at_utc,
+          completed_by_run_id, caught_up_at_utc, caught_up_by_logical_run_date,
           error_message, updated_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(env_name, logical_run_date) DO UPDATE SET
           integrity_run_id = excluded.integrity_run_id,
           latest_r2_observations_day = excluded.latest_r2_observations_day,
@@ -16988,6 +17065,9 @@ def _upsert_daily_profile_state(
           status = excluded.status,
           started_at_utc = COALESCE(excluded.started_at_utc, daily_profile_state.started_at_utc),
           completed_at_utc = excluded.completed_at_utc,
+          completed_by_run_id = CASE WHEN excluded.status = 'caught_up' THEN excluded.completed_by_run_id ELSE NULL END,
+          caught_up_at_utc = CASE WHEN excluded.status = 'caught_up' THEN excluded.caught_up_at_utc ELSE NULL END,
+          caught_up_by_logical_run_date = CASE WHEN excluded.status = 'caught_up' THEN excluded.caught_up_by_logical_run_date ELSE NULL END,
           error_message = excluded.error_message,
           updated_at_utc = excluded.updated_at_utc
         """,
@@ -17004,11 +17084,61 @@ def _upsert_daily_profile_state(
             status,
             started_at_utc,
             completed_at_utc,
+            None,
+            None,
+            None,
             error_message,
             now_iso,
         ),
     )
     conn.commit()
+
+
+def _mark_caught_up_logical_dates(
+    conn: sqlite3.Connection,
+    *,
+    env_name: str,
+    caught_up_dates: Iterable[dt.date],
+    integrity_run_id: int,
+    current_logical_run_date: dt.date,
+    completed_at_utc: str,
+) -> list[str]:
+    completed: list[str] = []
+    for logical_date in sorted(set(caught_up_dates)):
+        target_days = historical_target_day_numbers(logical_date)
+        conn.execute(
+            """
+            INSERT INTO daily_profile_state (
+              env_name, logical_run_date, integrity_run_id,
+              historical_target_days_json, selected_days_json,
+              represented_month_count, status, completed_at_utc,
+              completed_by_run_id, caught_up_at_utc, caught_up_by_logical_run_date,
+              updated_at_utc
+            ) VALUES (?, ?, ?, ?, '[]', 0, 'caught_up', ?, ?, ?, ?, ?)
+            ON CONFLICT(env_name, logical_run_date) DO UPDATE SET
+              status = 'caught_up',
+              completed_at_utc = excluded.completed_at_utc,
+              completed_by_run_id = excluded.completed_by_run_id,
+              caught_up_at_utc = excluded.caught_up_at_utc,
+              caught_up_by_logical_run_date = excluded.caught_up_by_logical_run_date,
+              error_message = NULL,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            (
+                env_name,
+                logical_date.isoformat(),
+                integrity_run_id,
+                historical_target_days_json(target_days),
+                completed_at_utc,
+                integrity_run_id,
+                completed_at_utc,
+                current_logical_run_date.isoformat(),
+                completed_at_utc,
+            ),
+        )
+        completed.append(logical_date.isoformat())
+    conn.commit()
+    return completed
 
 
 def normalize_source_key_sensorcommunity(
@@ -17121,6 +17251,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             "",
             f"- Mode: {selection.get('selection_mode')}",
             f"- Logical run date: {selection.get('logical_run_date') or '(manual override)'}",
+            f"- Logical run date source: {selection.get('logical_run_date_source') or '(n/a)'}",
             f"- Logical run timezone: {selection.get('logical_run_timezone') or '(n/a)'}",
             f"- Latest R2 observations day: {selection.get('latest_r2_observations_day') or '(n/a)'}",
             f"- Discovery source: {selection.get('discovery_source') or '(n/a)'}",
@@ -17369,6 +17500,10 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Out-of-window mapping groups: {sos.get('out_of_window_unmapped_groups', 0)}",
             f"- Out-of-window mapping rows: {sos.get('out_of_window_unmapped_rows', 0)}",
             f"- Rows counted:   {sos.get('rows_counted', 0)}",
+            f"- Annual source rows / selected scope: {sos.get('source_rows_total', 0)} / {sos.get('selected_source_rows', 0)}",
+            f"- Annual mapped rows / selected scope: {sos.get('mapped_rows_total', 0)} / {sos.get('selected_mapped_rows', 0)}",
+            f"- Annual mapped days / selected scope: {sos.get('mapped_days_total', 0)} / {sos.get('selected_mapped_days', 0)}",
+            f"- Annual count sets rebuilt from cache: {sos.get('counts_rebuilt_from_cache', 0)}",
             f"- Downloaded MB:  {round(sos.get('downloaded_bytes', 0) / (1024 * 1024), 4)}",
             f"- Cache keep policy: {sos.get('keep_api_snapshots_policy') or '(default)'}",
             f"- Not-found cooldown secs: {sos.get('not_found_cooldown_seconds', 0)}",
@@ -17797,7 +17932,12 @@ def main(argv: list[str]) -> int:
     daily_task_health_enabled = bool(daily_task_health_config.get("enabled"))
     daily_task_health_strict = bool(daily_task_health_config.get("strict"))
     daily_task_health_run_id: str | None = None
-    daily_task_scheduled_for_date = started_at.date().isoformat()
+    logical_run_date = (
+        dt.date.fromisoformat(args.logical_run_date)
+        if args.logical_run_date else started_at.date()
+    )
+    logical_run_date_source = "cli_logical_run_date" if args.logical_run_date else "current_utc_date"
+    daily_task_scheduled_for_date = logical_run_date.isoformat()
     daily_task_platform_run_id = f"{args.env}:{run_compact}"
     backup_gate_required = bool(args.run_backfill)
     backup_gate_summary = (
@@ -17864,47 +18004,6 @@ def main(argv: list[str]) -> int:
             repair_overlay["run_state_path"],
             repair_overlay["overlay_root"],
         )
-    if daily_task_health_enabled:
-        start_summary = {
-            "env": args.env,
-            "profile": args.profile,
-            "source": args.source,
-            "from_day": args.from_day,
-            "to_day": args.to_day,
-            "check_only": bool(args.check_only),
-            "dry_run": bool(args.dry_run),
-            "run_backfill": bool(args.run_backfill),
-            "repair_mode": bool(args.run_backfill),
-            "skip_cross_check": bool(args.skip_cross_check),
-            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
-            "status": "started",
-            "r2_write_attempted": False,
-            "r2_objects_written": 0,
-            "r2_objects_deleted": 0,
-            "r2_objects_changed": 0,
-            "six_stage_result_counts": {},
-            "overlay_path": (
-                repair_overlay.get("overlay_root") if repair_overlay is not None else None
-            ),
-            "remaining_gap_count": None,
-            "log_path": str(log_path),
-            "backup_readiness": backup_gate_summary,
-        }
-        try:
-            daily_task_health_run_id = _daily_task_health_start(
-                daily_task_health_config,
-                scheduled_for_date=daily_task_scheduled_for_date,
-                started_at_utc=started_iso,
-                summary=start_summary,
-                platform_run_id=daily_task_platform_run_id,
-                log_url=str(log_path),
-            )
-        except Exception as exc:
-            log.warning("daily task health start failed: %s", exc)
-            if daily_task_health_strict:
-                log.error("daily task health strict mode enabled; aborting run")
-                return 1
-
     from_day, to_day = compute_window(
         args.profile, args.from_day, args.to_day, os.environ
     )
@@ -17924,77 +18023,87 @@ def main(argv: list[str]) -> int:
     daily_selection: DailyProfileSelection | None = None
     selected_day_values: tuple[str, ...] | None = None
     selection_summary: dict[str, Any] | None = None
+
+    def fail_daily_selection(selection_error: str) -> int:
+        """Write a terminal report before daily task-health has started."""
+        failed_selection = {
+            "selection_mode": "daily_explicit",
+            "logical_run_date": logical_run_date.isoformat(),
+            "logical_run_date_source": logical_run_date_source,
+            "logical_run_timezone": "UTC",
+            "state_row_status": "failed",
+            "error": selection_error,
+        }
+        summary = {
+            "env": args.env,
+            "profile": args.profile,
+            "source": args.source,
+            "from_day": None,
+            "to_day": None,
+            "date_selection": failed_selection,
+            "started_at_utc": started_iso,
+            "finished_at_utc": fmt_iso(utc_now()),
+            "status": "failed",
+            "dry_run": bool(args.dry_run),
+            "check_only": bool(args.check_only),
+            "run_backfill": bool(args.run_backfill),
+            "repair_mode": bool(args.run_backfill),
+            "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+            "log_path": str(log_path),
+            "history_version_mode": history_version_mode,
+            "checked_versions": checked_history_versions,
+            "history_path_configs": serialized_history_path_configs,
+            "backup_readiness": backup_gate_summary,
+            "metrics": {},
+            "notes": selection_error,
+        }
+        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+        conn.close()
+        return 1
+
     if args.profile == "daily" and not args.from_day and not args.to_day:
         r2_history_root = resolve_r2_history_root(os.environ)
         if not r2_history_root:
-            raise RuntimeError(
+            return fail_daily_selection(
                 "daily profile cannot discover the latest R2 observations day: "
                 "UK_AQ_R2_HISTORY_DROPBOX_ROOT is unavailable"
             )
         observations_prefix = history_path_configs["v2"].observations_data_prefix
-        observations_days = discover_observations_days(r2_history_root, observations_prefix)
+        try:
+            observations_days = discover_observations_days(r2_history_root, observations_prefix)
+        except Exception as exc:
+            return fail_daily_selection(f"daily observations discovery failed: {exc}")
         if not observations_days:
             selection_error = (
                 "daily profile cannot discover a strictly parsed committed v2 "
                 f"observations day under {observations_prefix!r} in {r2_history_root}"
             )
-            selection_summary = {
-                "selection_mode": "daily_explicit",
-                "logical_run_date": started_at.date().isoformat(),
-                "logical_run_timezone": "UTC",
-                "discovery_source": "local_dropbox_committed_v2_observations_tree",
-                "active_observations_prefix": observations_prefix,
-                "state_row_status": "failed",
-                "error": selection_error,
-            }
-            summary = {
-                "env": args.env,
-                "profile": args.profile,
-                "source": args.source,
-                "from_day": None,
-                "to_day": None,
-                "date_selection": selection_summary,
-                "started_at_utc": started_iso,
-                "finished_at_utc": fmt_iso(utc_now()),
-                "status": "failed",
-                "dry_run": bool(args.dry_run),
-                "check_only": bool(args.check_only),
-                "run_backfill": bool(args.run_backfill),
-                "repair_mode": bool(args.run_backfill),
-                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
-                "log_path": str(log_path),
-                "history_version_mode": history_version_mode,
-                "checked_versions": checked_history_versions,
-                "history_path_configs": serialized_history_path_configs,
-                "backup_readiness": backup_gate_summary,
-                "metrics": {},
-                "notes": selection_error,
-            }
-            write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
-            conn.close()
-            return 1
-        logical_run_date = started_at.date()
-        catch_up_logical_dates = _daily_profile_missed_logical_dates(
-            conn, env_name=args.env, logical_run_date=logical_run_date,
-        )
-        daily_selection = build_daily_selection(
-            logical_run_date=logical_run_date,
-            observations_days=observations_days,
-            observations_prefix=observations_prefix,
-            catch_up_logical_dates=catch_up_logical_dates,
-        )
-        selected_day_values = tuple(
-            entry.day.isoformat() for entry in daily_selection.selected_days
-        )
-        from_day, to_day = daily_selection.from_day, daily_selection.to_day
-        selection_summary = daily_selection.to_dict()
-        _upsert_daily_profile_state(
-            conn,
-            env_name=args.env,
-            selection=daily_selection,
-            integrity_run_id=None,
-            status="planned",
-        )
+            return fail_daily_selection(selection_error)
+        try:
+            catch_up_logical_dates = _daily_profile_missed_logical_dates(
+                conn, env_name=args.env, logical_run_date=logical_run_date,
+            )
+            daily_selection = build_daily_selection(
+                logical_run_date=logical_run_date,
+                logical_run_date_source=logical_run_date_source,
+                observations_days=observations_days,
+                observations_prefix=observations_prefix,
+                catch_up_logical_dates=catch_up_logical_dates,
+            )
+            selected_day_values = tuple(
+                entry.day.isoformat() for entry in daily_selection.selected_days
+            )
+            from_day, to_day = daily_selection.from_day, daily_selection.to_day
+            selection_summary = daily_selection.to_dict()
+            _upsert_daily_profile_state(
+                conn,
+                env_name=args.env,
+                selection=daily_selection,
+                integrity_run_id=None,
+                status="planned",
+            )
+        except Exception as exc:
+            return fail_daily_selection(f"daily date selection failed: {exc}")
         selection_summary = {
             **selection_summary,
             "state_row_status": "planned",
@@ -18012,6 +18121,8 @@ def main(argv: list[str]) -> int:
     elif args.profile == "daily":
         selection_summary = {
             "selection_mode": "manual_override_contiguous_window",
+            "logical_run_date": logical_run_date.isoformat(),
+            "logical_run_date_source": logical_run_date_source,
             "logical_run_timezone": "UTC",
             "from_day": from_day,
             "to_day": to_day,
@@ -18044,6 +18155,35 @@ def main(argv: list[str]) -> int:
                 status="running",
                 started_at_utc=started_iso,
             )
+        if daily_task_health_enabled:
+            start_summary = {
+                "env": args.env, "profile": args.profile, "source": args.source,
+                "from_day": from_day, "to_day": to_day,
+                "date_selection": selection_summary,
+                "logical_run_date": logical_run_date.isoformat(),
+                "logical_run_date_source": logical_run_date_source,
+                "check_only": bool(args.check_only), "dry_run": bool(args.dry_run),
+                "run_backfill": bool(args.run_backfill), "repair_mode": bool(args.run_backfill),
+                "skip_cross_check": bool(args.skip_cross_check),
+                "allow_stale_dropbox": bool(args.allow_stale_dropbox), "status": "started",
+                "integrity_run_id": run_id, "r2_write_attempted": False,
+                "r2_objects_written": 0, "r2_objects_deleted": 0,
+                "r2_objects_changed": 0, "six_stage_result_counts": {},
+                "overlay_path": repair_overlay.get("overlay_root") if repair_overlay else None,
+                "remaining_gap_count": None, "log_path": str(log_path),
+                "backup_readiness": backup_gate_summary,
+            }
+            try:
+                daily_task_health_run_id = _daily_task_health_start(
+                    daily_task_health_config,
+                    scheduled_for_date=daily_task_scheduled_for_date,
+                    started_at_utc=started_iso, summary=start_summary,
+                    platform_run_id=daily_task_platform_run_id, log_url=str(log_path),
+                )
+            except Exception as exc:
+                log.warning("daily task health start failed: %s", exc)
+                if daily_task_health_strict:
+                    raise RuntimeError("daily task health strict mode start failure") from exc
 
         # Phase 2: import the core snapshot from Dropbox R2 backup.
         snapshot_result: dict[str, Any]
@@ -18326,16 +18466,20 @@ def main(argv: list[str]) -> int:
             status = "fail"
 
         if daily_selection is not None:
-            daily_state_status = "stopped_limit" if status == "stopped_limit" else (
-                "complete" if status in {"ok", "noop"} else "failed"
+            daily_state_status = (
+                "dry_run" if args.dry_run else
+                "complete" if status == "ok" and args.run_backfill else
+                "stopped_limit" if status == "stopped_limit" else
+                "skipped" if status in {"noop", "ok"} else "failed"
             )
+            completed_at = fmt_iso(utc_now())
             _upsert_daily_profile_state(
                 conn,
                 env_name=args.env,
                 selection=daily_selection,
                 integrity_run_id=int(run_id),
                 status=daily_state_status,
-                completed_at_utc=fmt_iso(utc_now()),
+                completed_at_utc=completed_at,
                 error_message=(
                     None if daily_state_status == "complete"
                     else f"integrity run status={status}"
@@ -18344,7 +18488,18 @@ def main(argv: list[str]) -> int:
             selection_summary = {
                 **daily_selection.to_dict(),
                 "state_row_status": daily_state_status,
+                "catch_up_completion_status": "not_completed",
             }
+            if daily_state_status == "complete" and daily_selection.caught_up_logical_dates:
+                completed_catchups = _mark_caught_up_logical_dates(
+                    conn, env_name=args.env,
+                    caught_up_dates=daily_selection.caught_up_logical_dates,
+                    integrity_run_id=int(run_id),
+                    current_logical_run_date=daily_selection.logical_run_date,
+                    completed_at_utc=completed_at,
+                )
+                selection_summary["catch_up_completion_status"] = "completed"
+                selection_summary["caught_up_completed_logical_dates"] = completed_catchups
 
         # Build the notes from snapshot + openaq outcomes.
         notes_parts: list[str] = []
@@ -18808,6 +18963,8 @@ def main(argv: list[str]) -> int:
                 "from_day": from_day,
                 "to_day": to_day,
                 "date_selection": selection_summary,
+                "logical_run_date": logical_run_date.isoformat(),
+                "logical_run_date_source": logical_run_date_source,
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
@@ -18820,6 +18977,11 @@ def main(argv: list[str]) -> int:
                 "files_downloaded": metrics.get("files_downloaded", 0),
                 "files_changed": metrics.get("files_changed", 0),
                 "files_first_seen": int(openaq_metrics.get("first_seen", 0)) + int(sc_metrics.get("first_seen", 0)) + int(sos_metrics.get("first_seen", 0)),
+                "sos_source_rows_total": int(sos_metrics.get("source_rows_total", 0) or 0),
+                "sos_selected_source_rows": int(sos_metrics.get("selected_source_rows", 0) or 0),
+                "sos_mapped_rows_total": int(sos_metrics.get("mapped_rows_total", 0) or 0),
+                "sos_selected_mapped_rows": int(sos_metrics.get("selected_mapped_rows", 0) or 0),
+                "sos_counts_rebuilt_from_cache": int(sos_metrics.get("counts_rebuilt_from_cache", 0) or 0),
                 "cross_checks_total": metrics.get("cross_checks_total", 0),
                 "cross_checks_ok": metrics.get("cross_checks_ok", 0),
                 "cross_checks_mismatch": metrics.get("cross_checks_mismatch", 0),
@@ -18916,6 +19078,8 @@ def main(argv: list[str]) -> int:
                 "from_day": from_day if "from_day" in locals() else args.from_day,
                 "to_day": to_day if "to_day" in locals() else args.to_day,
                 "date_selection": selection_summary if "selection_summary" in locals() else None,
+                "logical_run_date": logical_run_date.isoformat(),
+                "logical_run_date_source": logical_run_date_source,
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
