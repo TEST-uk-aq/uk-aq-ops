@@ -8355,6 +8355,11 @@ def _current_source_counts_for_v2_partition(
     connector_id: int,
     pollutant_code: str,
 ) -> tuple[dict[int, int], dict[str, Any]]:
+    property_identity_evidence: dict[str, int] = {
+        "authoritative_observed_property_code_timeseries_count": 0,
+        "text_fallback_missing_mapping_timeseries_count": 0,
+        "text_fallback_ambiguous_mapping_timeseries_count": 0,
+    }
     partition_evidence: dict[str, Any] = {
         "source_partition_state": "counts_unavailable",
         "source_counts_present": False,
@@ -8364,6 +8369,7 @@ def _current_source_counts_for_v2_partition(
         "source_file_count": 0,
         "source_file_keys": [],
         "source_skip_reason": "source_counts_unavailable",
+        "property_identity": property_identity_evidence,
         "partition": {
             "state": "counts_unavailable",
             "source_counts_present": False,
@@ -8373,6 +8379,7 @@ def _current_source_counts_for_v2_partition(
             "source_file_count": 0,
             "source_file_keys": [],
             "source_skip_reason": "source_counts_unavailable",
+            "property_identity": property_identity_evidence,
         },
     }
     if conn is None:
@@ -8449,7 +8456,9 @@ def _current_source_counts_for_v2_partition(
           t.label AS timeseries_label,
           p.label AS phenomenon_label,
           p.source_label AS phenomenon_source_label,
-          p.pollutant_label AS phenomenon_pollutant_label
+          p.pollutant_label AS phenomenon_pollutant_label,
+          m.observed_property_code,
+          m.observed_property_code_count
         FROM source_file_timeseries_counts c
         JOIN source_file_state s
           ON s.source_file_key = c.source_file_key
@@ -8461,6 +8470,20 @@ def _current_source_counts_for_v2_partition(
           ON t.id = c.timeseries_id
         LEFT JOIN core_phenomena_snapshot p
           ON p.id = t.phenomenon_id
+        LEFT JOIN (
+          SELECT
+            connector_id,
+            observed_property_id,
+            MIN(LOWER(TRIM(observed_property_code))) AS observed_property_code,
+            COUNT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_code_count
+          FROM core_observed_property_mappings_snapshot
+          WHERE is_active = 1
+            AND observed_property_id IS NOT NULL
+            AND TRIM(observed_property_code) != ''
+          GROUP BY connector_id, observed_property_id
+        ) m
+          ON m.connector_id = t.connector_id
+         AND m.observed_property_id = p.observed_property_id
         WHERE {' AND '.join(rows_where)}
         GROUP BY
           c.timeseries_id,
@@ -8468,7 +8491,9 @@ def _current_source_counts_for_v2_partition(
           t.label,
           p.label,
           p.source_label,
-          p.pollutant_label
+          p.pollutant_label,
+          m.observed_property_code,
+          m.observed_property_code_count
         ORDER BY c.timeseries_id
         """,
         tuple(rows_params),
@@ -8477,7 +8502,7 @@ def _current_source_counts_for_v2_partition(
     counts: dict[int, int] = {}
     saw_source_rows = False
     saw_pollutant_metadata = False
-    wanted_pollutant = _normalize_history_pollutant_code(pollutant_code)
+    wanted_pollutant = str(pollutant_code or "").strip().lower()
     for (
         timeseries_id,
         source_row_count,
@@ -8486,22 +8511,46 @@ def _current_source_counts_for_v2_partition(
         phenomenon_label,
         phenomenon_source_label,
         phenomenon_pollutant_label,
+        observed_property_code,
+        observed_property_code_count,
     ) in rows:
         saw_source_rows = True
-        candidates = [
-            phenomenon_pollutant_label,
-            phenomenon_source_label,
-            phenomenon_label,
-            timeseries_label,
-            timeseries_ref,
-        ]
-        normalized_candidates = {
-            code for code in (_normalize_history_pollutant_code(value) for value in candidates) if code
-        }
-        if normalized_candidates:
+        try:
+            observed_property_code_count_int = int(observed_property_code_count or 0)
+        except (TypeError, ValueError):
+            observed_property_code_count_int = 0
+        authoritative_code = str(observed_property_code or "").strip().lower()
+        if observed_property_code_count_int == 1 and authoritative_code:
+            property_identity_evidence[
+                "authoritative_observed_property_code_timeseries_count"
+            ] += 1
             saw_pollutant_metadata = True
-        if wanted_pollutant and wanted_pollutant not in normalized_candidates:
-            continue
+            if authoritative_code != wanted_pollutant:
+                continue
+        else:
+            fallback_key = (
+                "text_fallback_ambiguous_mapping_timeseries_count"
+                if observed_property_code_count_int > 1
+                else "text_fallback_missing_mapping_timeseries_count"
+            )
+            property_identity_evidence[fallback_key] += 1
+            # This is a diagnostic fallback for incomplete core metadata only.
+            # It never treats the whole connector total as an individual
+            # pollutant partition.
+            candidates = [
+                phenomenon_pollutant_label,
+                phenomenon_source_label,
+                phenomenon_label,
+                timeseries_label,
+                timeseries_ref,
+            ]
+            normalized_candidates = {
+                code for code in (_normalize_history_pollutant_code(value) for value in candidates) if code
+            }
+            if normalized_candidates:
+                saw_pollutant_metadata = True
+            if wanted_pollutant not in normalized_candidates:
+                continue
         try:
             ts_id = int(timeseries_id)
             count = int(source_row_count or 0)
@@ -8524,6 +8573,7 @@ def _current_source_counts_for_v2_partition(
             "source_file_count": len(state_rows),
             "source_file_keys": source_file_keys_evidence,
             "source_skip_reason": None,
+            "property_identity": property_identity_evidence,
             "partition": {
                 "state": "successful_non_empty",
                 "source_counts_present": True,
@@ -8533,6 +8583,7 @@ def _current_source_counts_for_v2_partition(
                 "source_file_count": len(state_rows),
                 "source_file_keys": source_file_keys_evidence,
                 "source_skip_reason": None,
+                "property_identity": property_identity_evidence,
             },
         })
         return counts, partition_evidence
@@ -8551,6 +8602,7 @@ def _current_source_counts_for_v2_partition(
             "source_file_count": len(state_rows),
             "source_file_keys": source_file_keys_evidence,
             "source_skip_reason": None,
+            "property_identity": property_identity_evidence,
             "partition": {
                 "state": "successful_empty",
                 "source_counts_present": False,
@@ -8560,6 +8612,7 @@ def _current_source_counts_for_v2_partition(
                 "source_file_count": len(state_rows),
                 "source_file_keys": source_file_keys_evidence,
                 "source_skip_reason": None,
+                "property_identity": property_identity_evidence,
             },
         })
         return {}, partition_evidence
@@ -13289,27 +13342,6 @@ def run_v2_gap_backfills(
             and process_guard_ok
         )
         if should_verify_manifest:
-            if not expected_counts_scope_valid:
-                manifest_guard_ok = False
-                manifest_guard_reason = "expected_counts_scope_invalid"
-                manifest_guard_details = {
-                    "requested_day": day_iso,
-                    "requested_connector_id": connector_id,
-                    "requested_timeseries_count": len(ts_ids),
-                    "expected_counts_source": expected_counts_source,
-                }
-            else:
-                manifest_guard_ok, manifest_guard_reason, manifest_guard_details = (
-                    _verify_v2_observation_manifest_content_for_aqi(
-                        day_utc=day_iso,
-                        connector_id=connector_id,
-                        env=env,
-                        run_state=run_state,
-                        expected_timeseries_row_counts=expected_timeseries_row_counts,
-                        expected_pollutant_codes=expected_pollutant_codes,
-                        expected_min_rows=expected_min_manifest_rows,
-                    )
-                )
             manifest_guard_details.update({
                 "requested_day": day_iso,
                 "requested_connector_id": connector_id,
@@ -13321,17 +13353,15 @@ def run_v2_gap_backfills(
                     for timeseries_id, count in sorted(expected_timeseries_row_counts.items())
                 },
                 "repair_output_rows": repaired_observation_rows,
+                "verification": "deferred_to_metadata_commit_receipt",
             })
             log.info(
-                "v2 observation manifest guard day=%s connector_id=%s requested_timeseries=%s expected_rows=%s repair_output_rows=%s manifest_rows=%s result=%s reason=%s",
+                "v2 observation transaction precheck day=%s connector_id=%s requested_timeseries=%s expected_rows=%s repair_output_rows=%s result=pass verification=deferred_to_metadata_commit_receipt",
                 day_iso,
                 connector_id,
                 len(ts_ids),
                 expected_min_manifest_rows,
                 repaired_observation_rows,
-                manifest_guard_details.get("manifest_rows"),
-                "pass" if manifest_guard_ok else "fail",
-                manifest_guard_reason,
             )
         repair_ok = (
             wrapper_ok
@@ -13426,6 +13456,7 @@ def run_v2_gap_backfills(
             "aqi_rebuild_manifest_guard": manifest_guard_details,
             "backfill_run_status": backfill_run_status,
             "source_acquisition_pending_days": pending_days,
+            "timeseries_ids": ts_ids,
             "timeseries_id_count": len(ts_ids),
             "chunk_count": len(chunks),
             "attempted_chunks": len(chunk_results),
@@ -13953,6 +13984,7 @@ def create_run_overlay(
         "tombstones": {},
         "changed_scopes": {scope_set: [] for scope_set in OVERLAY_CHANGED_SCOPE_SETS},
         "blocked_scopes": [],
+        "commit_receipts": [],
         "coordinator": None,
     }
     write_run_state(run_state)
@@ -14126,6 +14158,16 @@ def _dedupe_v2_repair_actions(actions: Iterable[Mapping[str, Any]]) -> list[dict
         })
         if gap_types:
             current["gap_types"] = gap_types
+        targeted_ids = sorted({
+            int(value)
+            for value in [
+                *(current.get("targeted_replacement_timeseries_ids") or []),
+                *(action.get("targeted_replacement_timeseries_ids") or []),
+            ]
+            if str(value).strip().isdigit() and int(value) > 0
+        })
+        if targeted_ids:
+            current["targeted_replacement_timeseries_ids"] = targeted_ids
         notes = sorted({
             str(value)
             for value in [current.get("notes"), action.get("notes")]
@@ -14186,9 +14228,24 @@ def _authoritative_v2_core_timeseries_bindings(
             """
             SELECT t.id, t.connector_id, t.station_id, t.label, t.timeseries_ref,
                    t.phenomenon_id, p.label, p.source_label,
-                   p.pollutant_label, p.observed_property_id
+                   p.pollutant_label, p.observed_property_id,
+                   m.observed_property_code, m.observed_property_code_count
             FROM core_timeseries_snapshot AS t
             LEFT JOIN core_phenomena_snapshot AS p ON p.id = t.phenomenon_id
+            LEFT JOIN (
+                SELECT
+                    connector_id,
+                    observed_property_id,
+                    MIN(LOWER(TRIM(observed_property_code))) AS observed_property_code,
+                    COUNT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_code_count
+                FROM core_observed_property_mappings_snapshot
+                WHERE is_active = 1
+                  AND observed_property_id IS NOT NULL
+                  AND TRIM(observed_property_code) != ''
+                GROUP BY connector_id, observed_property_id
+            ) AS m
+              ON m.connector_id = t.connector_id
+             AND m.observed_property_id = p.observed_property_id
             WHERE t.id IS NOT NULL AND t.connector_id IS NOT NULL
             ORDER BY t.id
             """
@@ -14200,9 +14257,24 @@ def _authoritative_v2_core_timeseries_bindings(
                 """
                 SELECT t.id, t.connector_id, t.label, t.timeseries_ref,
                        t.phenomenon_id, p.label, p.source_label,
-                       p.pollutant_label, p.observed_property_id
+                       p.pollutant_label, p.observed_property_id,
+                       m.observed_property_code, m.observed_property_code_count
                 FROM core_timeseries_snapshot AS t
                 LEFT JOIN core_phenomena_snapshot AS p ON p.id = t.phenomenon_id
+                LEFT JOIN (
+                    SELECT
+                        connector_id,
+                        observed_property_id,
+                        MIN(LOWER(TRIM(observed_property_code))) AS observed_property_code,
+                        COUNT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_code_count
+                    FROM core_observed_property_mappings_snapshot
+                    WHERE is_active = 1
+                      AND observed_property_id IS NOT NULL
+                      AND TRIM(observed_property_code) != ''
+                    GROUP BY connector_id, observed_property_id
+                ) AS m
+                  ON m.connector_id = t.connector_id
+                 AND m.observed_property_id = p.observed_property_id
                 WHERE t.id IS NOT NULL AND t.connector_id IS NOT NULL
                 ORDER BY t.id
                 """
@@ -14219,20 +14291,17 @@ def _authoritative_v2_core_timeseries_bindings(
         if timeseries_id <= 0 or connector_id <= 0:
             continue
         offset = 1 if has_station_id else 0
-        pollutant_code = next(
-            (
-                normalized
-                for normalized in (_normalize_history_pollutant_code(value) for value in (row[2 + offset], row[3 + offset], row[5 + offset], row[6 + offset], row[7 + offset]))
-                if normalized
-            ),
-            None,
-        )
-        if pollutant_code is None:
+        observed_property_code = str(row[9 + offset] or "").strip().lower()
+        try:
+            observed_property_code_count = int(row[10 + offset] or 0)
+        except (TypeError, ValueError):
+            observed_property_code_count = 0
+        if observed_property_code_count != 1 or not observed_property_code:
             continue
         binding = {
             "timeseries_id": timeseries_id,
             "connector_id": connector_id,
-            "pollutant_code": pollutant_code,
+            "pollutant_code": observed_property_code,
             "phenomenon_id": row[4 + offset],
             "observed_property_id": row[8 + offset],
         }
@@ -14333,12 +14402,210 @@ def _run_v2_observation_metadata_executor(
             "output": output if isinstance(output, Mapping) else {},
             "results": output.get("results") if isinstance(output, Mapping) else [],
         }
+    receipt_status = _metadata_commit_receipt_status(
+        output if isinstance(output, Mapping) else {},
+        actions=actions,
+        dry_run=dry_run,
+    )
     return {
         "status": str(output.get("status") or ("planned" if dry_run else "succeeded")),
         "exit_code": proc.returncode,
         "output": output,
         "results": output.get("results") if isinstance(output, Mapping) else [],
+        "commit_receipts": output.get("commit_receipts") if isinstance(output, Mapping) else [],
+        **receipt_status,
     }
+
+
+def _metadata_commit_receipt_status(
+    output: Mapping[str, Any],
+    *,
+    actions: Iterable[Mapping[str, Any]],
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Require a fresh verified receipt for every connector metadata commit."""
+    receipts = [
+        dict(receipt) for receipt in list(output.get("commit_receipts") or [])
+        if isinstance(receipt, Mapping)
+    ]
+    if dry_run:
+        return {
+            "commit_receipt_status": "not_required_dry_run",
+            "commit_receipt_reason": None,
+            "commit_receipts": receipts,
+        }
+    receipt_by_scope: dict[tuple[str, int], dict[str, Any]] = {}
+    for receipt in receipts:
+        try:
+            scope = (str(receipt.get("day_utc") or ""), int(receipt.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        if scope[0] and scope[1] > 0:
+            receipt_by_scope[scope] = receipt
+    connector_commit_kinds = {
+        "observation_pollutant_manifest_repair",
+        "observation_connector_manifest_repair",
+        "aqi_pollutant_manifest_repair",
+        "aqi_connector_manifest_repair",
+    }
+    required_scopes: set[tuple[str, int]] = set()
+    for action in actions:
+        if str(action.get("kind") or "") not in connector_commit_kinds:
+            continue
+        try:
+            connector_id = int(action.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        day_utc = str(action.get("day_utc") or "").strip()
+        if day_utc and connector_id > 0:
+            required_scopes.add((day_utc, connector_id))
+    missing_or_unverified: list[str] = []
+    required_fields = {
+        "transaction_id",
+        "history_version",
+        "domain",
+        "day_utc",
+        "connector_id",
+        "targeted_replacement_timeseries_ids",
+        "complete_committed_pollutant_set",
+        "connector_manifest_key",
+        "connector_manifest_hash",
+        "committed_connector_row_count",
+        "committed_timeseries_row_counts",
+        "written_object_keys",
+        "preserved_child_count",
+        "replaced_child_count",
+        "replaced_timeseries_count",
+        "finalisation_status",
+        "fresh_live_r2_verification",
+    }
+    for scope in sorted(required_scopes):
+        receipt = receipt_by_scope.get(scope)
+        if receipt is None:
+            missing_or_unverified.append(f"missing_receipt:{scope[0]}:connector_id={scope[1]}")
+            continue
+        missing_fields = sorted(field for field in required_fields if field not in receipt)
+        if missing_fields:
+            missing_or_unverified.append(
+                f"invalid_receipt:{scope[0]}:connector_id={scope[1]}:missing={','.join(missing_fields)}"
+            )
+            continue
+        if (
+            receipt.get("history_version") != "v2"
+            or receipt.get("finalisation_status") != "committed"
+            or receipt.get("fresh_live_r2_verification") is not True
+        ):
+            missing_or_unverified.append(
+                f"unverified_receipt:{scope[0]}:connector_id={scope[1]}"
+            )
+    return {
+        "commit_receipt_status": "succeeded" if not missing_or_unverified else "failed",
+        "commit_receipt_reason": "; ".join(missing_or_unverified) or None,
+        "commit_receipts": receipts,
+    }
+
+
+def _attach_observation_data_receipt_evidence(
+    metadata: dict[str, Any],
+    observations: Mapping[str, Any],
+) -> None:
+    """Merge the verified data-object evidence into the final metadata receipt."""
+    receipts = metadata.get("commit_receipts")
+    if not isinstance(receipts, list):
+        return
+    data_by_scope: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for result in list(observations.get("v2_observation_repair_results") or []):
+        if not isinstance(result, Mapping) or str(result.get("status") or "") != "ok":
+            continue
+        try:
+            scope = (str(result.get("day_utc") or ""), int(result.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        if scope[0] and scope[1] > 0:
+            data_by_scope[scope] = result
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            continue
+        try:
+            scope = (str(receipt.get("day_utc") or ""), int(receipt.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        data_result = data_by_scope.get(scope)
+        if data_result is None:
+            continue
+        data_keys = [
+            str(key) for key in list(data_result.get("verified_overlay_object_keys") or [])
+            if str(key).strip()
+        ]
+        receipt["written_object_keys"] = sorted({
+            *(str(key) for key in list(receipt.get("written_object_keys") or [])),
+            *data_keys,
+        })
+        timeseries_ids = sorted({
+            int(value) for value in list(data_result.get("timeseries_ids") or [])
+            if str(value).strip().isdigit() and int(value) > 0
+        })
+        if timeseries_ids:
+            receipt["targeted_replacement_timeseries_ids"] = timeseries_ids
+            receipt["replaced_timeseries_count"] = len(timeseries_ids)
+    output = metadata.get("output")
+    if isinstance(output, dict):
+        output["commit_receipts"] = receipts
+
+
+def _validate_observation_receipts_against_data(
+    metadata: dict[str, Any],
+    observations: Mapping[str, Any],
+) -> None:
+    """Use the committed connector receipt, not wrapper row totals, as the data gate."""
+    receipts = metadata.get("commit_receipts")
+    if not isinstance(receipts, list):
+        return
+    receipt_by_scope: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            continue
+        try:
+            scope = (str(receipt.get("day_utc") or ""), int(receipt.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        if scope[0] and scope[1] > 0:
+            receipt_by_scope[scope] = receipt
+    failures: list[str] = []
+    for result in list(observations.get("v2_observation_repair_results") or []):
+        if not isinstance(result, Mapping) or str(result.get("status") or "") != "ok":
+            continue
+        try:
+            scope = (str(result.get("day_utc") or ""), int(result.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        receipt = receipt_by_scope.get(scope)
+        if receipt is None:
+            failures.append(f"missing_receipt:{scope[0]}:connector_id={scope[1]}")
+            continue
+        expected_rows = int(result.get("expected_source_rows_for_day") or 0)
+        committed_rows = int(receipt.get("committed_connector_row_count") or 0)
+        if expected_rows > 0 and committed_rows < expected_rows:
+            failures.append(
+                f"receipt_row_count_below_expected:{scope[0]}:connector_id={scope[1]}"
+            )
+        expected_counts = _normalize_timeseries_row_counts(
+            result.get("expected_timeseries_row_counts_for_day")
+        )
+        committed_counts = _normalize_timeseries_row_counts(
+            receipt.get("committed_timeseries_row_counts")
+        )
+        for timeseries_id, expected_count in expected_counts.items():
+            if committed_counts.get(timeseries_id) != expected_count:
+                failures.append(
+                    f"receipt_timeseries_count_mismatch:{scope[0]}:connector_id={scope[1]}:timeseries_id={timeseries_id}"
+                )
+    if failures:
+        metadata["commit_receipt_status"] = "failed"
+        existing_reason = str(metadata.get("commit_receipt_reason") or "").strip()
+        metadata["commit_receipt_reason"] = "; ".join(
+            value for value in [existing_reason, *failures] if value
+        )
 
 
 def _record_metadata_executor_overlay(
@@ -14360,6 +14627,11 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning")
     if not isinstance(planning, Mapping):
         return
+    receipts = executor_result.get("commit_receipts")
+    if isinstance(receipts, list):
+        run_state["commit_receipts"] = [
+            dict(receipt) for receipt in receipts if isinstance(receipt, Mapping)
+        ]
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
@@ -15368,6 +15640,11 @@ def run_v2_integrity_repair_flow(
             "domain": "observations",
             "day_utc": day_utc,
             "connector_id": connector_id,
+            "targeted_replacement_timeseries_ids": sorted({
+                int(timeseries_id)
+                for timeseries_id in list(scope.get("timeseries_ids") or [])
+                if str(timeseries_id).strip().isdigit() and int(timeseries_id) > 0
+            }),
             "requires_index_rebuild": True,
             "gap_types": ["observation_repaired"],
         }
@@ -15391,6 +15668,8 @@ def run_v2_integrity_repair_flow(
             run_state=run_state, conn=conn,
         )
     )
+    _attach_observation_data_receipt_evidence(metadata, observations)
+    _validate_observation_receipts_against_data(metadata, observations)
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
     _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
@@ -15400,7 +15679,7 @@ def run_v2_integrity_repair_flow(
         "failed", "blocked_dependency",
     } and observation_index_status not in {
         "failed", "blocked_dependency",
-    }
+    } and str(metadata.get("commit_receipt_status") or "succeeded") not in {"failed"}
     aqi_work, aqi_blocked = _phase4_aqi_work(
         conn=conn, run_state=run_state, v2_aqilevels=v2_aqilevels,
     )

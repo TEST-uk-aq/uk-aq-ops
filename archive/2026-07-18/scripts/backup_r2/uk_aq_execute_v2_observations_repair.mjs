@@ -920,12 +920,6 @@ function validateAction(action) {
     || action.gap_types.some((gapType) => typeof gapType !== "string" || !gapType.trim())) {
     throw new Error(`Invalid Phase 4 repair action contract: ${action.kind}`);
   }
-  if (action.targeted_replacement_timeseries_ids !== undefined
-    && (!Array.isArray(action.targeted_replacement_timeseries_ids)
-      || action.targeted_replacement_timeseries_ids.some((value) =>
-        !Number.isInteger(Number(value)) || Number(value) <= 0))) {
-    throw new Error(`Invalid targeted replacement timeseries IDs: ${action.kind}`);
-  }
 }
 
 export function normalizePlan(input) {
@@ -962,7 +956,6 @@ export function normalizePlan(input) {
       pollutantRepair: false,
       pollutantManifestCodes: new Set(),
       indexPollutantCodes: new Set(),
-      targetedReplacementTimeseriesIds: new Set(),
       gapTypes: new Set(),
     };
     scope.needsConnector ||= Boolean(rule.needsConnector);
@@ -978,9 +971,6 @@ export function normalizePlan(input) {
     if (pollutantCode && action.kind.includes("index")) {
       scope.indexPollutantCodes.add(pollutantCode);
     }
-    for (const value of action.targeted_replacement_timeseries_ids || []) {
-      scope.targetedReplacementTimeseriesIds.add(Number(value));
-    }
     for (const gapType of action.gap_types) scope.gapTypes.add(gapType);
     scopes.set(key, scope);
   }
@@ -989,19 +979,11 @@ export function normalizePlan(input) {
     domain,
     scopes: [...scopes.values()]
       .sort((left, right) => left.dayUtc.localeCompare(right.dayUtc) || (left.connectorId ?? -1) - (right.connectorId ?? -1))
-      .map(({
-        gapTypes,
-        pollutantManifestCodes,
-        indexPollutantCodes,
-        targetedReplacementTimeseriesIds,
-        ...scope
-      }) => ({
+      .map(({ gapTypes, pollutantManifestCodes, indexPollutantCodes, ...scope }) => ({
         ...scope,
         gap_types: [...gapTypes].sort(),
         pollutant_codes: [...pollutantManifestCodes].sort(),
         index_pollutant_codes: [...indexPollutantCodes].sort(),
-        targeted_replacement_timeseries_ids: [...targetedReplacementTimeseriesIds]
-          .sort((left, right) => left - right),
       })),
   };
 }
@@ -1025,62 +1007,6 @@ function authoritativeTimeseriesById(input) {
     });
   }
   return bindings;
-}
-
-export function buildCommitReceipts({ runStateJson, domain, dayPlans, proposals, applied, writeR2 }) {
-  const runState = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
-  const runId = String(runState?.run_id || "unknown");
-  const receipts = [];
-  for (const plan of dayPlans) {
-    if (plan.status === "blocked_dependency") continue;
-    for (const scope of plan.scopes || []) {
-      const connectorId = Number(scope?.connectorId);
-      if (!scope?.needsConnector || !Number.isInteger(connectorId) || connectorId <= 0) continue;
-      const connectorKey = [...(plan.proposal_keys || [])].find((key) => {
-        const proposal = proposals.get(key);
-        return proposal?.kind === "connector_manifest"
-          && proposal.day_utc === plan.day_utc
-          && key.includes(`/connector_id=${connectorId}/manifest.json`);
-      });
-      if (!connectorKey) continue;
-      const proposal = proposals.get(connectorKey);
-      const operation = applied.get(connectorKey) || {};
-      const manifest = jsonObject({ body: Buffer.from(proposal.body, "utf8") }, connectorKey);
-      const targetedPollutants = [...new Set(scope.pollutant_codes || [])].sort();
-      const targetedTimeseries = [...new Set(scope.targeted_replacement_timeseries_ids || [])]
-        .map(Number)
-        .filter((value) => Number.isInteger(value) && value > 0)
-        .sort((left, right) => left - right);
-      const writtenObjectKeys = [...new Set((plan.proposal_keys || []).filter((key) => {
-        const candidate = applied.get(key);
-        return candidate?.status === "succeeded" && candidate.put_completed === true;
-      }))].sort();
-      const finalisationStatus = operation.status === "succeeded"
-        ? "committed"
-        : (operation.status === "skipped_unchanged" ? "unchanged" : "not_committed");
-      receipts.push({
-        receipt_schema_version: 1,
-        transaction_id: `integrity:${runId}:${domain}:${plan.day_utc}:connector_id=${connectorId}`,
-        history_version: "v2",
-        domain,
-        day_utc: plan.day_utc,
-        connector_id: connectorId,
-        targeted_replacement_timeseries_ids: targetedTimeseries,
-        complete_committed_pollutant_set: [...(manifest.pollutant_codes || [])].sort(),
-        connector_manifest_key: connectorKey,
-        connector_manifest_hash: manifest.manifest_hash,
-        committed_connector_row_count: Number(manifest.row_count || 0),
-        committed_timeseries_row_counts: manifest.timeseries_row_counts || {},
-        written_object_keys: writtenObjectKeys,
-        preserved_child_count: Math.max(0, (manifest.child_manifests || []).length - targetedPollutants.length),
-        replaced_child_count: targetedPollutants.length,
-        replaced_timeseries_count: targetedTimeseries.length,
-        finalisation_status: finalisationStatus,
-        fresh_live_r2_verification: Boolean(writeR2 && operation.get_verification_succeeded === true),
-      });
-    }
-  }
-  return receipts.sort((left, right) => left.transaction_id.localeCompare(right.transaction_id));
 }
 
 export async function runV2ObservationsRepair({
@@ -1460,14 +1386,6 @@ export async function runV2ObservationsRepair({
   const verificationStatus = args.writeR2
     ? reduceRepairStatus(results.flatMap((result) => collectOutcomeStatuses(result.verification)), "not_run")
     : "not_run";
-  const receipts = buildCommitReceipts({
-    runStateJson: args.runStateJson,
-    domain,
-    dayPlans,
-    proposals: staged.proposals,
-    applied,
-    writeR2: args.writeR2,
-  });
   return {
     ok,
     status,
@@ -1486,7 +1404,6 @@ export async function runV2ObservationsRepair({
       operations: applicationOperations,
       failure: appliedResult.failure,
     },
-    commit_receipts: receipts,
     results,
   };
 }
