@@ -12,6 +12,7 @@ import {
 import {
   hasRequiredR2Config,
   r2GetObject,
+  r2HeadObject,
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
@@ -736,6 +737,72 @@ function assertCanonicalProposalRelationships(proposal, proposals) {
   }
 }
 
+function manifestDependencyKeys(payload) {
+  const keys = new Set();
+  for (const entry of Array.isArray(payload?.files) ? payload.files : []) {
+    if (typeof entry?.key === "string") keys.add(entry.key);
+  }
+  for (const key of Array.isArray(payload?.parquet_object_keys) ? payload.parquet_object_keys : []) {
+    if (typeof key === "string") keys.add(key);
+  }
+  for (const entry of Array.isArray(payload?.child_manifests) ? payload.child_manifests : []) {
+    if (typeof entry?.manifest_key === "string") keys.add(entry.manifest_key);
+  }
+  for (const entry of Array.isArray(payload?.connector_manifests) ? payload.connector_manifests : []) {
+    if (typeof entry?.manifest_key === "string") keys.add(entry.manifest_key);
+  }
+  return [...keys].sort();
+}
+
+// Planning deliberately reads the verified overlay before the audited Dropbox
+// baseline. This records every non-staged object identity used by a proposed
+// parent, recursively including Parquet named by preserved manifests. The
+// apply step must freshly compare these identities with live R2 before PUT.
+export function collectPreservedLiveDependencies({ store, proposals }) {
+  const dependencies = new Map();
+  const add = (key, object, role) => {
+    const normalized = assertCanonicalObjectKey(key, "live dependency key");
+    const identity = sha256Hex(object.body);
+    const existing = dependencies.get(normalized);
+    if (existing && existing.content_sha256 !== identity) {
+      throw new Error(`Conflicting local dependency identity: ${normalized}`);
+    }
+    dependencies.set(normalized, {
+      key: normalized,
+      content_sha256: identity,
+      bytes: object.bytes,
+      roles: [...new Set([...(existing?.roles || []), role])].sort(),
+    });
+  };
+  const visit = (key, role, seen = new Set()) => {
+    const normalized = assertCanonicalObjectKey(key, "live dependency key");
+    if (proposals.has(normalized)) return;
+    const object = store.getObjectIfExists(normalized);
+    if (!object) throw new Error(`Blocked live dependency has no local identity: ${normalized}`);
+    add(normalized, object, role);
+    if (!normalized.endsWith("/manifest.json") || seen.has(normalized)) return;
+    const nextSeen = new Set(seen);
+    nextSeen.add(normalized);
+    for (const childKey of manifestDependencyKeys(jsonObject(object, normalized))) {
+      visit(childKey, `preserved_child_of:${normalized}`, nextSeen);
+    }
+  };
+  const baselineAbsences = [];
+  for (const proposal of [...proposals.values()].filter((item) => item.changed).sort((a, b) => a.key.localeCompare(b.key))) {
+    if (proposal.old_sha256) {
+      const object = store.getObjectIfExists(proposal.key);
+      if (!object || sha256Hex(object.body) !== proposal.old_sha256) {
+        throw new Error(`Blocked proposal baseline has no matching local identity: ${proposal.key}`);
+      }
+      add(proposal.key, object, "proposal_baseline");
+    } else {
+      baselineAbsences.push({ key: proposal.key, expected_absent: true, roles: ["new_proposal_baseline"] });
+    }
+    for (const dependency of proposal.dependencies || []) visit(dependency, `dependency_of:${proposal.key}`);
+  }
+  return [...dependencies.values(), ...baselineAbsences].sort((a, b) => a.key.localeCompare(b.key));
+}
+
 function applicationFailureResults(ordered, failedProposal, error, failureStage) {
   const results = new Map();
   for (const proposal of ordered) {
@@ -762,11 +829,14 @@ export async function applyStagedProposals({
   writeR2,
   putObject = r2PutObject,
   getObject = r2GetObject,
+  headObject = r2HeadObject,
+  liveDependencies = [],
   onProgress = null,
   blockedCount = 0,
 }) {
   const operationCounts = {
     r2_get_before_put_count: 0,
+    r2_head_before_put_count: 0,
     r2_list_before_put_count: 0,
     r2_put_count: 0,
     r2_get_after_put_verification_count: 0,
@@ -820,6 +890,34 @@ export async function applyStagedProposals({
         failure: { key: proposal.key, error: message },
         operation_counts: operationCounts,
       };
+    }
+  }
+  // The Dropbox/overlay view is an audited planning baseline, not proof of
+  // the current committed hierarchy. Check every preserved dependency and
+  // every existing/new proposal baseline before the first metadata PUT.
+  if (writeR2) {
+    for (const dependency of [...liveDependencies].sort((left, right) => left.key.localeCompare(right.key))) {
+      try {
+        if (dependency.expected_absent) {
+          operationCounts.r2_head_before_put_count += 1;
+          const head = await headObject({ r2, key: dependency.key });
+          if (head?.exists) throw new Error(`Live new-object baseline already exists: ${dependency.key}`);
+        } else {
+          operationCounts.r2_get_before_put_count += 1;
+          const fresh = await getObject({ r2, key: dependency.key });
+          if (fresh.bytes !== dependency.bytes || sha256Hex(fresh.body) !== dependency.content_sha256) {
+            throw new Error(`Live dependency identity mismatch: ${dependency.key}`);
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const failedProposal = ordered[0] || { key: dependency.key, kind: "live_dependency" };
+        return {
+          results: applicationFailureResults(ordered, failedProposal, message, "live_dependency_guard"),
+          failure: { key: dependency.key, error: message },
+          operation_counts: operationCounts,
+        };
+      }
     }
   }
   for (let position = 0; position < ordered.length; position += 1) {
@@ -1027,7 +1125,42 @@ function authoritativeTimeseriesById(input) {
   return bindings;
 }
 
-export function buildCommitReceipts({ runStateJson, domain, dayPlans, proposals, applied, writeR2 }) {
+export async function verifyCommittedConnectorHierarchies({ r2, receipts, proposals, getObject = r2GetObject, headObject = r2HeadObject }) {
+  const evidence = new Map();
+  for (const receipt of receipts) {
+    try {
+      const proposal = proposals.get(receipt.connector_manifest_key);
+      const connector = await getObject({ r2, key: receipt.connector_manifest_key });
+      if (!proposal || sha256Hex(connector.body) !== proposal.new_sha256) throw new Error("connector_manifest_identity_mismatch");
+      const manifest = jsonObject(connector, receipt.connector_manifest_key);
+      if (manifest.manifest_hash !== receipt.connector_manifest_hash) throw new Error("connector_manifest_hash_mismatch");
+      for (const child of manifest.child_manifests || []) {
+        const childKey = assertCanonicalObjectKey(child?.manifest_key, "committed child manifest key");
+        const childObject = await getObject({ r2, key: childKey });
+        const childManifest = jsonObject(childObject, childKey);
+        if (childManifest.manifest_hash !== child?.manifest_hash) throw new Error(`child_manifest_identity_mismatch:${childKey}`);
+        for (const file of childManifest.files || []) {
+          const fileKey = assertCanonicalObjectKey(file?.key, "committed parquet key");
+          const head = await headObject({ r2, key: fileKey });
+          if (!head?.exists) throw new Error(`committed_parquet_missing:${fileKey}`);
+        }
+      }
+      const dayKey = receipt.connector_manifest_key.replace(/\/connector_id=\d+\/manifest\.json$/, "/manifest.json");
+      if (dayKey === receipt.connector_manifest_key) throw new Error("connector_manifest_key_not_in_day_hierarchy");
+      const day = jsonObject(await getObject({ r2, key: dayKey }), dayKey);
+      const dayChild = (day.child_manifests || []).find((entry) => entry?.manifest_key === receipt.connector_manifest_key);
+      if (!dayChild || dayChild.manifest_hash !== manifest.manifest_hash) {
+        throw new Error(`day_manifest_child_identity_mismatch:${dayKey}`);
+      }
+      evidence.set(receipt.transaction_id, { verified: true, connector_manifest: manifest });
+    } catch (error) {
+      evidence.set(receipt.transaction_id, { verified: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return evidence;
+}
+
+export function buildCommitReceipts({ runStateJson, domain, dayPlans, proposals, applied, writeR2, liveEvidence = new Map() }) {
   const runState = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
   const runId = String(runState?.run_id || "unknown");
   const receipts = [];
@@ -1045,22 +1178,27 @@ export function buildCommitReceipts({ runStateJson, domain, dayPlans, proposals,
       if (!connectorKey) continue;
       const proposal = proposals.get(connectorKey);
       const operation = applied.get(connectorKey) || {};
-      const manifest = jsonObject({ body: Buffer.from(proposal.body, "utf8") }, connectorKey);
+      const receiptId = `integrity:${runId}:${domain}:${plan.day_utc}:connector_id=${connectorId}`;
+      const live = liveEvidence.get(receiptId);
+      const manifest = live?.connector_manifest || jsonObject({ body: Buffer.from(proposal.body, "utf8") }, connectorKey);
       const targetedPollutants = [...new Set(scope.pollutant_codes || [])].sort();
       const targetedTimeseries = [...new Set(scope.targeted_replacement_timeseries_ids || [])]
         .map(Number)
         .filter((value) => Number.isInteger(value) && value > 0)
         .sort((left, right) => left - right);
+      const connectorPrefix = `/connector_id=${connectorId}/`;
       const writtenObjectKeys = [...new Set((plan.proposal_keys || []).filter((key) => {
         const candidate = applied.get(key);
-        return candidate?.status === "succeeded" && candidate.put_completed === true;
+        return key.includes(connectorPrefix)
+          && candidate?.status === "succeeded" && candidate.put_completed === true;
       }))].sort();
+      const sharedScopeId = `integrity:${runId}:${domain}:${plan.day_utc}:shared`;
       const finalisationStatus = operation.status === "succeeded"
         ? "committed"
         : (operation.status === "skipped_unchanged" ? "unchanged" : "not_committed");
       receipts.push({
         receipt_schema_version: 1,
-        transaction_id: `integrity:${runId}:${domain}:${plan.day_utc}:connector_id=${connectorId}`,
+        transaction_id: receiptId,
         history_version: "v2",
         domain,
         day_utc: plan.day_utc,
@@ -1072,15 +1210,31 @@ export function buildCommitReceipts({ runStateJson, domain, dayPlans, proposals,
         committed_connector_row_count: Number(manifest.row_count || 0),
         committed_timeseries_row_counts: manifest.timeseries_row_counts || {},
         written_object_keys: writtenObjectKeys,
+        shared_commit_scope_ids: [sharedScopeId],
         preserved_child_count: Math.max(0, (manifest.child_manifests || []).length - targetedPollutants.length),
         replaced_child_count: targetedPollutants.length,
         replaced_timeseries_count: targetedTimeseries.length,
         finalisation_status: finalisationStatus,
-        fresh_live_r2_verification: Boolean(writeR2 && operation.get_verification_succeeded === true),
+        fresh_live_r2_verification: Boolean(writeR2 && live?.verified === true),
+        fresh_live_r2_verification_error: live?.verified === false ? live.error : null,
       });
     }
   }
   return receipts.sort((left, right) => left.transaction_id.localeCompare(right.transaction_id));
+}
+
+export function buildSharedCommitObjects({ runStateJson, domain, dayPlans, applied }) {
+  const runState = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
+  const runId = String(runState?.run_id || "unknown");
+  return dayPlans.map((plan) => ({
+    scope_id: `integrity:${runId}:${domain}:${plan.day_utc}:shared`,
+    domain,
+    day_utc: plan.day_utc,
+    written_object_keys: [...new Set((plan.proposal_keys || []).filter((key) => {
+      const operation = applied.get(key);
+      return !/\/connector_id=\d+\//.test(key) && operation?.status === "succeeded" && operation.put_completed === true;
+    }))].sort(),
+  })).sort((left, right) => left.scope_id.localeCompare(right.scope_id));
 }
 
 export async function runV2ObservationsRepair({
@@ -1420,14 +1574,58 @@ export async function runV2ObservationsRepair({
     total_objects: staged.proposals.size,
     blocked_count: blockedScopes.length,
   });
-  const appliedResult = await applyStagedProposals({
+  const hierarchyProposals = new Map([...staged.proposals.entries()].filter(([, proposal]) =>
+    ["pollutant_manifest", "connector_manifest", "day_manifest"].includes(proposal.kind)
+  ));
+  const indexProposals = new Map([...staged.proposals.entries()].filter(([, proposal]) =>
+    !hierarchyProposals.has(proposal.key)
+  ));
+  const hierarchyDependencies = collectPreservedLiveDependencies({
+    store: localStore,
+    proposals: hierarchyProposals,
+  });
+  const hierarchyAppliedResult = await applyStagedProposals({
     r2: config.r2,
-    proposals: staged.proposals,
+    proposals: hierarchyProposals,
     writeR2: args.writeR2,
+    liveDependencies: hierarchyDependencies,
     onProgress: reportProgress,
     blockedCount: blockedScopes.length,
   });
-  const applied = appliedResult.results;
+  const provisionalReceipts = buildCommitReceipts({
+    runStateJson: args.runStateJson,
+    domain,
+    dayPlans,
+    proposals: staged.proposals,
+    applied: hierarchyAppliedResult.results,
+    writeR2: args.writeR2,
+  });
+  const liveEvidence = args.writeR2 && !hierarchyAppliedResult.failure
+    ? await verifyCommittedConnectorHierarchies({ r2: config.r2, receipts: provisionalReceipts, proposals: staged.proposals })
+    : new Map();
+  const hierarchyVerificationFailure = [...liveEvidence.values()].find((entry) => entry?.verified === false) || null;
+  const indexAppliedResult = hierarchyAppliedResult.failure || hierarchyVerificationFailure
+    ? {
+      results: applicationFailureResults([...indexProposals.values()], null,
+        hierarchyVerificationFailure?.error || "hierarchy_metadata_application_failed", "committed_hierarchy_verification"),
+      failure: hierarchyVerificationFailure ? { key: "committed_hierarchy", error: hierarchyVerificationFailure.error } : hierarchyAppliedResult.failure,
+      operation_counts: { r2_get_before_put_count: 0, r2_head_before_put_count: 0, r2_list_before_put_count: 0, r2_put_count: 0, r2_get_after_put_verification_count: 0 },
+    }
+    : await applyStagedProposals({
+      r2: config.r2,
+      proposals: indexProposals,
+      writeR2: args.writeR2,
+      onProgress: reportProgress,
+      blockedCount: blockedScopes.length,
+    });
+  const applied = new Map([...hierarchyAppliedResult.results, ...indexAppliedResult.results]);
+  const appliedResult = {
+    failure: hierarchyAppliedResult.failure || indexAppliedResult.failure,
+    operation_counts: Object.fromEntries(Object.keys(hierarchyAppliedResult.operation_counts).map((key) => [
+      key,
+      Number(hierarchyAppliedResult.operation_counts[key] || 0) + Number(indexAppliedResult.operation_counts[key] || 0),
+    ])),
+  };
   const proposalViews = [...staged.proposals.values()].map(proposalView).sort((left, right) => left.key.localeCompare(right.key));
   const applicationOperations = [...applied.values()].sort((left, right) => left.key.localeCompare(right.key));
   const results = dayPlans.map((plan) => {
@@ -1467,6 +1665,10 @@ export async function runV2ObservationsRepair({
     proposals: staged.proposals,
     applied,
     writeR2: args.writeR2,
+    liveEvidence,
+  });
+  const sharedCommitObjects = buildSharedCommitObjects({
+    runStateJson: args.runStateJson, domain, dayPlans, applied,
   });
   return {
     ok,
@@ -1487,6 +1689,7 @@ export async function runV2ObservationsRepair({
       failure: appliedResult.failure,
     },
     commit_receipts: receipts,
+    shared_commit_objects: sharedCommitObjects,
     results,
   };
 }

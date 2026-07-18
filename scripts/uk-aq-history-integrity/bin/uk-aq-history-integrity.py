@@ -14629,8 +14629,29 @@ def _record_metadata_executor_overlay(
         return
     receipts = executor_result.get("commit_receipts")
     if isinstance(receipts, list):
+        merged_receipts: dict[str, dict[str, Any]] = {}
+        for existing in list(run_state.get("commit_receipts") or []):
+            if not isinstance(existing, Mapping):
+                continue
+            transaction_id = str(existing.get("transaction_id") or "").strip()
+            if transaction_id:
+                merged_receipts[transaction_id] = dict(existing)
+        for receipt in receipts:
+            if not isinstance(receipt, Mapping):
+                continue
+            candidate = dict(receipt)
+            transaction_id = str(candidate.get("transaction_id") or "").strip()
+            if not transaction_id:
+                raise ValueError("metadata commit receipt missing transaction_id")
+            existing = merged_receipts.get(transaction_id)
+            if existing is not None and existing != candidate:
+                raise ValueError(
+                    f"conflicting metadata commit receipt transaction_id={transaction_id}"
+                )
+            merged_receipts[transaction_id] = candidate
         run_state["commit_receipts"] = [
-            dict(receipt) for receipt in receipts if isinstance(receipt, Mapping)
+            merged_receipts[transaction_id]
+            for transaction_id in sorted(merged_receipts)
         ]
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
