@@ -1192,7 +1192,9 @@ export async function reportObservsPartitionMaintenanceError(error, context = {}
   const payload = {
     id: errorId,
     created_at: createdAt,
-    source: "cloud_run_observs_partition_maintenance",
+    source: context.execution_mode === "github_actions"
+      ? "github_actions_observs_partition_maintenance"
+      : "cloud_run_observs_partition_maintenance",
     severity: "error",
     message,
     stack,
