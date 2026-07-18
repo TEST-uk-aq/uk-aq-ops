@@ -1,6 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
 import { validateRunAuth } from "./run_auth.mjs";
@@ -273,7 +272,7 @@ function computeRetentionCutoffUtc(now, retentionDays) {
   return utcMidnightFromIsoDate(earliestKeptUtcDay);
 }
 
-export function buildObservsConfig(url) {
+function buildObservsConfig(url) {
   const params = url.searchParams;
 
   const futurePartitionDays = parsePositiveInt(
@@ -1166,77 +1165,6 @@ async function runObservsPartitionMaintenance(config) {
   return summary;
 }
 
-export async function executeObservsPartitionMaintenance(config) {
-  return withDailyTaskRun(
-    {
-      task_key: "ops.observs_partition_maintenance",
-      source_repo: "uk-aq-ops",
-      source_worker: "uk_aq_observs_partition_maintenance_service",
-      startSummary: {
-        drop_dry_run: config.dropDryRun,
-        future_partition_days: config.futurePartitionDays,
-        hot_partition_days: config.hotPartitionDays,
-        observs_retention_days: config.observsRetentionDays,
-      },
-      buildFinishedSummary: compactObservsPartitionHealthSummary,
-    },
-    () => runObservsPartitionMaintenance(config),
-  );
-}
-
-export async function reportObservsPartitionMaintenanceError(error, context = {}) {
-  const message = error instanceof Error ? error.message : String(error);
-  const stack = error instanceof Error ? error.stack || null : null;
-  const errorId = randomUUID();
-  const createdAt = nowIso();
-  const payload = {
-    id: errorId,
-    created_at: createdAt,
-    source: "cloud_run_observs_partition_maintenance",
-    severity: "error",
-    message,
-    stack,
-    context,
-  };
-
-  const dropboxResult = await (async () => {
-    try {
-      return await uploadMaintenanceLogToDropbox(
-        "observs_partition_service_error",
-        payload,
-        createdAt,
-        errorId,
-      );
-    } catch (uploadError) {
-      const uploadMessage = uploadError instanceof Error
-        ? uploadError.message
-        : String(uploadError);
-      return {
-        uploaded: false,
-        reason: "upload_failed",
-        upload_error: uploadMessage,
-      };
-    }
-  })();
-
-  logStructured("ERROR", "observs_partition_maintenance_run_error", {
-    error_id: errorId,
-    message,
-    request_method: context.request_method || "",
-    request_path: context.request_path || "",
-    dropbox_uploaded: Boolean(dropboxResult.uploaded),
-    dropbox_path: dropboxResult.dropbox_path || null,
-    dropbox_reason: dropboxResult.reason || null,
-  });
-
-  return {
-    error_id: errorId,
-    dropbox_uploaded: Boolean(dropboxResult.uploaded),
-    dropbox_path: dropboxResult.dropbox_path || null,
-    dropbox_reason: dropboxResult.reason || null,
-  };
-}
-
 const server = createServer(async (req, res) => {
   let requestPath = "/";
   let requestQuery = "";
@@ -1268,39 +1196,94 @@ const server = createServer(async (req, res) => {
     }
 
     const config = buildObservsConfig(url);
-    const summary = await executeObservsPartitionMaintenance(config);
+    const summary = await withDailyTaskRun(
+      {
+        task_key: "ops.observs_partition_maintenance",
+        source_repo: "uk-aq-ops",
+        source_worker: "uk_aq_observs_partition_maintenance_service",
+        startSummary: {
+          drop_dry_run: config.dropDryRun,
+          future_partition_days: config.futurePartitionDays,
+          hot_partition_days: config.hotPartitionDays,
+          observs_retention_days: config.observsRetentionDays,
+        },
+        buildFinishedSummary: compactObservsPartitionHealthSummary,
+      },
+      () => runObservsPartitionMaintenance(config),
+    );
     jsonResponse(res, 200, summary);
   } catch (error) {
-    const errorReport = await reportObservsPartitionMaintenanceError(error, {
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack || null : null;
+    const errorId = randomUUID();
+    const createdAt = nowIso();
+
+    const payload = {
+      id: errorId,
+      created_at: createdAt,
+      source: "cloud_run_observs_partition_maintenance",
+      severity: "error",
+      message,
+      stack,
+      context: {
+        request_method: req.method || "",
+        request_path: requestPath,
+        request_query: requestQuery,
+        host: req.headers.host || "",
+        user_agent: req.headers["user-agent"] || "",
+      },
+    };
+
+    const dropboxResult = await (async () => {
+      try {
+        return await uploadMaintenanceLogToDropbox(
+          "observs_partition_service_error",
+          payload,
+          createdAt,
+          errorId,
+        );
+      } catch (uploadError) {
+        const uploadMessage = uploadError instanceof Error
+          ? uploadError.message
+          : String(uploadError);
+        return {
+          uploaded: false,
+          reason: "upload_failed",
+          upload_error: uploadMessage,
+        };
+      }
+    })();
+
+    logStructured("ERROR", "observs_partition_maintenance_run_error", {
+      error_id: errorId,
+      message,
       request_method: req.method || "",
       request_path: requestPath,
-      request_query: requestQuery,
-      host: req.headers.host || "",
-      user_agent: req.headers["user-agent"] || "",
+      dropbox_uploaded: Boolean(dropboxResult.uploaded),
+      dropbox_path: dropboxResult.dropbox_path || null,
+      dropbox_reason: dropboxResult.reason || null,
     });
 
     jsonResponse(res, 500, {
       error: "observs_partition_maintenance_run_error",
       message: "Internal error. See logs with error_id.",
-      error_id: errorReport.error_id,
-      dropbox_uploaded: errorReport.dropbox_uploaded,
-      dropbox_path: errorReport.dropbox_path,
+      error_id: errorId,
+      dropbox_uploaded: Boolean(dropboxResult.uploaded),
+      dropbox_path: dropboxResult.dropbox_path || null,
     });
   }
 });
 
 const port = parsePositiveInt(process.env.PORT, 8080, 1, 65535);
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  server.listen(port, () => {
-    logStructured("INFO", "observs_partition_maintenance_service_started", {
-      port,
-      defaults: {
-        future_partition_days: DEFAULT_FUTURE_PARTITION_DAYS,
-        hot_partition_days: DEFAULT_HOT_PARTITION_DAYS,
-        observs_retention_days: DEFAULT_OBSERVS_RETENTION_DAYS,
-        default_top_n: DEFAULT_DEFAULT_TOP_N,
-        drop_dry_run: DEFAULT_DROP_DRY_RUN,
-      },
-    });
+server.listen(port, () => {
+  logStructured("INFO", "observs_partition_maintenance_service_started", {
+    port,
+    defaults: {
+      future_partition_days: DEFAULT_FUTURE_PARTITION_DAYS,
+      hot_partition_days: DEFAULT_HOT_PARTITION_DAYS,
+      observs_retention_days: DEFAULT_OBSERVS_RETENTION_DAYS,
+      default_top_n: DEFAULT_DEFAULT_TOP_N,
+      drop_dry_run: DEFAULT_DROP_DRY_RUN,
+    },
   });
-}
+});

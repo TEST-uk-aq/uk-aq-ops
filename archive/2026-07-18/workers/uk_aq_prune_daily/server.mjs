@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import {
   fetchBackupDoneDays,
@@ -1279,7 +1278,7 @@ async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatche
   };
 }
 
-export function buildRunConfig(url) {
+function buildRunConfig(url) {
   const params = url.searchParams;
 
   const dryRun = parseBoolean(
@@ -2527,73 +2526,6 @@ async function runPrune(config) {
   return combinedSummary;
 }
 
-export async function executePruneDaily(config) {
-  return withDailyTaskRun(
-    {
-      task_key: "ops.prune_daily",
-      source_repo: "uk-aq-ops",
-      source_worker: "uk_aq_prune_daily",
-      startSummary: {
-        dry_run: config.dryRun,
-        max_hours_per_run: config.maxHoursPerRun,
-        ingestdb_retention_days: config.ingestDbRetentionDays,
-        phase_a_enabled: config.phaseAEnabled,
-        phase_b_enabled: Boolean(config.phaseB?.enabled),
-      },
-      buildFinishedSummary: compactPruneHealthSummary,
-    },
-    () => runPrune(config),
-  );
-}
-
-export async function reportPruneDailyError(error, context = {}) {
-  const message = error instanceof Error ? error.message : String(error);
-  const stack = error instanceof Error ? error.stack || null : null;
-  const errorId = randomUUID();
-  const createdAt = nowIso();
-  const errorPayload = {
-    id: errorId,
-    created_at: createdAt,
-    source: "cloud_run_ingestdb_prune",
-    severity: "error",
-    message,
-    stack,
-    context,
-  };
-
-  const dropboxResult = await (async () => {
-    try {
-      return await uploadErrorPayloadToDropbox(errorPayload, createdAt, errorId);
-    } catch (uploadError) {
-      const uploadMessage = uploadError instanceof Error
-        ? uploadError.message
-        : String(uploadError);
-      logStructured("ERROR", "ingestdb_prune_error_dropbox_upload_failed", {
-        error_id: errorId,
-        message: uploadMessage,
-      });
-      return { uploaded: false, reason: "upload_failed", upload_error: uploadMessage };
-    }
-  })();
-
-  logStructured("ERROR", "ingestdb_prune_run_error", {
-    error_id: errorId,
-    message,
-    request_method: context.request_method || "",
-    request_path: context.request_path || "",
-    dropbox_uploaded: Boolean(dropboxResult.uploaded),
-    dropbox_path: dropboxResult.dropbox_path || null,
-    dropbox_reason: dropboxResult.reason || null,
-  });
-
-  return {
-    error_id: errorId,
-    dropbox_uploaded: Boolean(dropboxResult.uploaded),
-    dropbox_path: dropboxResult.dropbox_path || null,
-    dropbox_reason: dropboxResult.reason || null,
-  };
-}
-
 const server = createServer(async (req, res) => {
   let requestPath = "/";
   let requestQuery = "";
@@ -2622,35 +2554,85 @@ const server = createServer(async (req, res) => {
     }
 
     const config = buildRunConfig(url);
-    const summary = await executePruneDaily(config);
+    const summary = await withDailyTaskRun(
+      {
+        task_key: "ops.prune_daily",
+        source_repo: "uk-aq-ops",
+        source_worker: "uk_aq_prune_daily",
+        startSummary: {
+          dry_run: config.dryRun,
+          max_hours_per_run: config.maxHoursPerRun,
+          ingestdb_retention_days: config.ingestDbRetentionDays,
+          phase_a_enabled: config.phaseAEnabled,
+          phase_b_enabled: Boolean(config.phaseB?.enabled),
+        },
+        buildFinishedSummary: compactPruneHealthSummary,
+      },
+      () => runPrune(config),
+    );
     jsonResponse(res, 200, summary);
   } catch (error) {
-    const errorReport = await reportPruneDailyError(error, {
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack || null : null;
+    const errorId = randomUUID();
+    const createdAt = nowIso();
+    const errorPayload = {
+      id: errorId,
+      created_at: createdAt,
+      source: "cloud_run_ingestdb_prune",
+      severity: "error",
+      message,
+      stack,
+      context: {
+        request_method: req.method || "",
+        request_path: requestPath,
+        request_query: requestQuery,
+        host: req.headers.host || "",
+        user_agent: req.headers["user-agent"] || "",
+      },
+    };
+
+    const dropboxResult = await (async () => {
+      try {
+        return await uploadErrorPayloadToDropbox(errorPayload, createdAt, errorId);
+      } catch (uploadError) {
+        const uploadMessage = uploadError instanceof Error
+          ? uploadError.message
+          : String(uploadError);
+        logStructured("ERROR", "ingestdb_prune_error_dropbox_upload_failed", {
+          error_id: errorId,
+          message: uploadMessage,
+        });
+        return { uploaded: false, reason: "upload_failed", upload_error: uploadMessage };
+      }
+    })();
+
+    logStructured("ERROR", "ingestdb_prune_run_error", {
+      error_id: errorId,
+      message,
       request_method: req.method || "",
       request_path: requestPath,
-      request_query: requestQuery,
-      host: req.headers.host || "",
-      user_agent: req.headers["user-agent"] || "",
+      dropbox_uploaded: Boolean(dropboxResult.uploaded),
+      dropbox_path: dropboxResult.dropbox_path || null,
+      dropbox_reason: dropboxResult.reason || null,
     });
     jsonResponse(res, 500, {
       error: "ingestdb_prune_run_error",
       message: "Internal error. See logs with error_id.",
-      error_id: errorReport.error_id,
-      dropbox_uploaded: errorReport.dropbox_uploaded,
-      dropbox_path: errorReport.dropbox_path,
+      error_id: errorId,
+      dropbox_uploaded: Boolean(dropboxResult.uploaded),
+      dropbox_path: dropboxResult.dropbox_path || null,
     });
   }
 });
 
 const port = parsePositiveInt(process.env.PORT, 8080, 1, 65535);
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  server.listen(port, () => {
-    logStructured("INFO", "ingestdb_prune_service_started", {
-      port,
-      default_dry_run: DEFAULT_DRY_RUN,
-      default_ingestdb_retention_days: DEFAULT_INGESTDB_RETENTION_DAYS,
-      default_max_hours_per_run: DEFAULT_MAX_HOURS_PER_RUN,
-      default_obs_aqidb_observs_retention_days: DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS,
-    });
+server.listen(port, () => {
+  logStructured("INFO", "ingestdb_prune_service_started", {
+    port,
+    default_dry_run: DEFAULT_DRY_RUN,
+    default_ingestdb_retention_days: DEFAULT_INGESTDB_RETENTION_DAYS,
+    default_max_hours_per_run: DEFAULT_MAX_HOURS_PER_RUN,
+    default_obs_aqidb_observs_retention_days: DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS,
   });
-}
+});
