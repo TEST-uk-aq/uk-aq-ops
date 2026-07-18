@@ -90,3 +90,6 @@ and upstream callers and must be rotated across all consumers together.
 - Cloudflare cron and authenticated `POST /run-if-due` calls share an atomic D1
   UTC-minute claim. The first source records and runs the minute; later calls
   receive a bounded `already_claimed` result without evaluating jobs.
+- Each claimed ops minute evaluates only its preceding one-minute window. Ops
+  does not replay missed maintenance, snapshot, or backup jobs after an outage;
+  operators review and run missed work manually.
