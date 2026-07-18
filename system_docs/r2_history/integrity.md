@@ -16,6 +16,8 @@ A complete checkout is the only supported runtime model because the orchestrator
 
 `--history-version v2` is the only accepted history version. `v1` and `both` remain rejected. `--check-only` and `--run-backfill` are mutually exclusive.
 
+Source, connector, day-range and other scope filters must have the same meaning in every mode. Changing mode must not silently broaden the requested scope.
+
 ## Authoritative inputs
 
 Integrity uses these inputs:
@@ -38,9 +40,67 @@ Integrity detection and repair planning do not use live R2 as a comparison sourc
 5. Read the scoped R2 v2 mirror from Dropbox.
 6. Compare source/cache truth with the Dropbox Parquet, manifests, indexes and stable bindings.
 7. Build a deterministic repair plan after all detection has completed.
-8. With `--run-backfill --dry-run`, report the plan without writing R2.
-9. With a real `--run-backfill`, build and validate corrected objects locally, apply the repair to R2 in the required order, and GET-verify every written object.
-10. Run one final read-only verification and write the SQLite, JSON, Markdown and task-health evidence.
+8. Stop after reporting when running `--check-only`.
+9. With `--run-backfill --dry-run`, calculate the exact local repair proposals without writing R2.
+10. With a real `--run-backfill`, build and validate corrected objects locally, apply the repair to R2 in the required order, and GET-verify every written object.
+11. For a real repair, run one final read-only verification and write the SQLite, JSON, Markdown and task-health evidence.
+
+Equivalent source/cache input and the same chosen Dropbox baseline must produce the same findings, repair plan and canonical replacement content.
+
+## Run mode contracts
+
+### `--check-only`
+
+`--check-only` is the normal scheduled detection mode. It answers: **what is wrong, and what repair would be required?**
+
+It must:
+
+1. Apply the backup readiness gate unless `--allow-stale-dropbox` is supplied.
+2. Import the Dropbox core snapshot and scoped R2 v2 mirror.
+3. Read or fetch the relevant authoritative connector source/cache before comparison.
+4. Check all relevant parts of the seven logical v2 areas within the requested scope.
+5. Record source snapshots, findings and audit evidence in the local Integrity SQLite database.
+6. Build the deterministic, deduplicated repair plan.
+7. Write JSON, Markdown and task-health reports.
+
+It must not:
+
+- invoke an R2 repair writer, deletion path or metadata executor;
+- build replacement Parquet or other local repair output merely for later upload;
+- create a repair overlay that represents uploaded or verified objects;
+- HEAD, GET, list, PUT or DELETE anything in live R2;
+- change the Dropbox backup;
+- perform post-write verification, because nothing was written.
+
+A completed check-only run must distinguish at least:
+
+- no actionable integrity fault found;
+- actionable integrity fault found and represented in the repair plan;
+- blocked because the Dropbox readiness gate failed;
+- incomplete or unreliable checking because a source, cache, reader or mapping was unavailable.
+
+An actionable finding is a failed Integrity result even though detection itself completed successfully.
+
+### `--run-backfill --dry-run`
+
+`--run-backfill --dry-run` answers: **given the detected faults, what exact repair actions and object changes would be attempted?**
+
+It performs the same acquisition, Dropbox comparison, findings and repair planning as check-only. It may additionally run local-only builders and proposal logic needed to calculate exact canonical replacement files, manifests, deletions, indexes and dependencies.
+
+It may write only disposable local files, Integrity SQLite evidence and run reports. It must not:
+
+- read live R2;
+- write or delete live R2;
+- change Dropbox;
+- claim that any proposed object was uploaded or GET-verified.
+
+Its report must keep planned deletions, writes and verifications separate from completed operations.
+
+### Real `--run-backfill`
+
+A real `--run-backfill` performs the same acquisition, comparison and repair planning, then applies the simplified repair execution contract in this document.
+
+It must not mutate R2 until all local replacement objects required for the first affected mutation scope have been built and structurally validated. It must record actual deletions, writes, post-write verification and final verification separately from the original findings and plan.
 
 ## Seven logical v2 areas
 
@@ -58,18 +118,18 @@ Stable bindings live under `history/_index_v2/timeseries_binding`. They are chec
 
 ## Backup gate and stale-backup override
 
-Repair runs call the Integrity-specific Obs AQI DB RPC `uk_aq_public.uk_aq_rpc_history_integrity_readiness(timestamptz)` before scanning the Dropbox history base.
+Every normal Integrity mode that inspects the Dropbox history base, including check-only, dry-run and real repair, calls the Integrity-specific Obs AQI DB RPC `uk_aq_public.uk_aq_rpc_history_integrity_readiness(timestamptz)` first.
 
-For a normal repair run:
+For a normal run:
 
 - the latest successful non-dry-run `ops.r2_history_dropbox_backup` must have started after the latest finished relevant R2 writer attempts;
 - unfinished relevant writers or an unfinished Dropbox backup block the run;
 - the qualifying backup must have finished before the current Integrity run started;
 - a failed readiness check exits with `status=blocked_backup_not_ready`.
 
-`--allow-stale-dropbox` has one meaning only: it bypasses the Dropbox readiness gate and uses the available Dropbox mirror as the chosen repair baseline.
+`--allow-stale-dropbox` has one meaning only: it bypasses the Dropbox readiness gate and uses the available Dropbox mirror as the chosen comparison and repair baseline.
 
-The override does not change fault classification, does not force a data rebuild, and does not disable metadata-only repair. It must be recorded clearly in SQLite, JSON and Markdown reports.
+The override does not change fault classification, does not force a data rebuild, does not disable metadata-only repair and does not permit live R2 to become an alternative comparison baseline. It must be recorded clearly in SQLite, JSON and Markdown reports.
 
 The operator is responsible for using the override only when the selected Dropbox state is appropriate. A common supported use is rerunning an interrupted Integrity repair from the same Dropbox baseline without waiting for another backup.
 
@@ -139,9 +199,11 @@ The apply order is always child data first, then child manifests, parent manifes
 
 Integrity detection and repair planning must not HEAD, GET or list live R2.
 
+Check-only and dry-run must not access live R2 at all.
+
 A data repair does not read the existing live R2 connector-day before writing because the authoritative replacement is built from source/cache and the chosen Dropbox baseline.
 
-Live R2 reads during apply are limited to post-mutation verification:
+Live R2 reads during real apply are limited to post-mutation verification:
 
 - confirm required deletions;
 - GET every written Parquet, manifest and index object;
@@ -180,11 +242,11 @@ Integrity may replace a connector-day with no observation rows only when the rel
 
 ## Audit evidence
 
-SQLite, task logs and JSON/Markdown reports must record at least:
+Every mode records its mode, requested scope, chosen Dropbox baseline, whether `--allow-stale-dropbox` was used, source acquisition result, findings, repair plan and final mode result.
+
+For a real repair, SQLite, task logs and JSON/Markdown reports must additionally record at least:
 
 - environment, source, day and connector;
-- whether `--allow-stale-dropbox` was used;
-- pre-repair findings and repair-plan actions;
 - local source and replacement row counts;
 - object keys deleted and written;
 - post-write GET verification results;
@@ -192,6 +254,8 @@ SQLite, task logs and JSON/Markdown reports must record at least:
 - AQI work queued or completed;
 - final verification status;
 - stopped, failed and blocked scopes.
+
+Check-only and dry-run reports must not populate actual-write or actual-delete fields with planned operations. Planned and completed evidence must remain distinct.
 
 The main reported v2 status after a real repair reflects the final verification result. A failed final verification or stopped run is a failed task, not a completed task.
 
