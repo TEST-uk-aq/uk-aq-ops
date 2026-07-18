@@ -1880,6 +1880,27 @@ function buildHistoryV2PartKey(
   }.parquet`;
 }
 
+function targetedObservationTransactionId(): string {
+  const raw = String(Deno.env.get("UK_AQ_BACKFILL_TARGETED_TRANSACTION_ID") || "").trim();
+  if (!raw || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(raw)) {
+    throw new Error("UK_AQ_BACKFILL_TARGETED_TRANSACTION_ID is required and must be a safe stable identifier for targeted finalisation");
+  }
+  return raw;
+}
+
+function buildTargetedHistoryV2PartKey(
+  basePrefix: string,
+  dayUtc: string,
+  connectorId: number,
+  pollutantCode: string,
+  transactionId: string,
+  partIndex: number,
+): string {
+  return `${buildHistoryV2PollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/generation=${transactionId}/part-${
+    String(partIndex).padStart(5, "0")
+  }.parquet`;
+}
+
 function resolveTargetedStageDir(
   dayUtc: string,
   connectorId: number,
@@ -1949,6 +1970,27 @@ function writeTargetedStageObject(key: string, body: Uint8Array | string): void 
   const tempPath = `${outputPath}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   fs.writeFileSync(tempPath, body);
   fs.renameSync(tempPath, outputPath);
+}
+
+function targetedObservationDataReceiptPath(dayUtc: string, connectorId: number): string {
+  if (!SOURCE_TO_R2_TARGETED_STAGE_ROOT) throw new Error("targeted observation receipt requires a stage root");
+  return path.join(
+    SOURCE_TO_R2_TARGETED_STAGE_ROOT,
+    "data-receipts",
+    `day_utc=${dayUtc}`,
+    `connector_id=${connectorId}.json`,
+  );
+}
+
+function writeTargetedObservationDataReceipt(dayUtc: string, connectorId: number, receipt: Record<string, unknown>): void {
+  const receiptPath = targetedObservationDataReceiptPath(dayUtc, connectorId);
+  fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
+  const encoded = `${JSON.stringify(receipt, null, 2)}\n`;
+  const previous = fs.existsSync(receiptPath) ? fs.readFileSync(receiptPath, "utf8") : null;
+  if (previous !== null && previous !== encoded) {
+    throw new Error(`Conflicting targeted observation data receipt: ${receiptPath}`);
+  }
+  if (previous === null) fs.writeFileSync(receiptPath, encoded, "utf8");
 }
 
 async function putHistoryObjectWithTargetedStage(args: {
@@ -4406,6 +4448,7 @@ async function exportObsConnectorRowsToR2(args: {
   day_utc: string;
   connector_id: number;
   rows: ObsHistoryRow[];
+  targeted_timeseries_ids?: number[];
 }): Promise<{
   rows_read: number;
   objects_written_r2: number;
@@ -4589,6 +4632,7 @@ async function exportObsConnectorRowsToR2V2(args: {
   day_utc: string;
   connector_id: number;
   rows: ObsHistoryRow[];
+  targeted_timeseries_ids?: number[];
 }): Promise<{
   rows_read: number;
   objects_written_r2: number;
@@ -4605,7 +4649,16 @@ async function exportObsConnectorRowsToR2V2(args: {
   // In particular, do not delete the connector prefix here: old unreferenced
   // parts are intentionally retained until separately collected.
   const targetedDataOnlyFinalisation = SOURCE_TO_R2_TARGETED_STAGE_ENABLED &&
-    SOURCE_TO_R2_TARGETED_STAGE_FINALIZE;
+    SOURCE_TO_R2_TARGETED_STAGE_FINALIZE &&
+    BACKFILL_OUTPUT_SCOPE === "observations_only";
+  const targetedTransactionId = targetedDataOnlyFinalisation
+    ? targetedObservationTransactionId()
+    : null;
+  const targetedDataFiles: Array<Record<string, unknown>> = [];
+  const targetedTimeseries = new Set((args.targeted_timeseries_ids || []).filter((value) => Number.isInteger(value) && value > 0));
+  if (targetedDataOnlyFinalisation && !targetedTimeseries.size) {
+    throw new Error("targeted observation finalisation has no targeted timeseries IDs");
+  }
   if (FORCE_REPLACE && !targetedDataOnlyFinalisation) {
     await deleteR2Prefix(
       buildHistoryV2ConnectorPrefix(
@@ -4616,21 +4669,24 @@ async function exportObsConnectorRowsToR2V2(args: {
     );
   }
 
-  const classification = classifyObservationRowsForV2PollutantPartitions(args.rows);
+  const rowsForWrite = targetedDataOnlyFinalisation
+    ? args.rows.filter((row) => targetedTimeseries.has(row.timeseries_id))
+    : args.rows;
+  const classification = classifyObservationRowsForV2PollutantPartitions(rowsForWrite);
   if (classification.rows_skipped_missing_pollutant_code > 0) {
     logStructured("warning", "source_to_r2_v2_observations_missing_pollutant_code_rows_skipped", {
       run_id: args.run_id,
       day_utc: args.day_utc,
       connector_id: args.connector_id,
-      rows_read: args.rows.length,
+      rows_read: rowsForWrite.length,
       rows_with_missing_pollutant_code: classification.rows_with_missing_pollutant_code,
       rows_skipped_missing_pollutant_code: classification.rows_skipped_missing_pollutant_code,
       example_missing_pollutant_rows: classification.example_missing_pollutant_rows,
     });
   }
-  if (args.rows.length > 0 && classification.valid_rows.length === 0) {
+  if (rowsForWrite.length > 0 && classification.valid_rows.length === 0) {
     throw new Error(
-      `No valid pollutant_code rows for v2 observation R2 write: day_utc=${args.day_utc} connector_id=${args.connector_id} rows_read=${args.rows.length} rows_skipped_missing_pollutant_code=${classification.rows_skipped_missing_pollutant_code}`,
+      `No valid pollutant_code rows for v2 observation R2 write: day_utc=${args.day_utc} connector_id=${args.connector_id} rows_read=${rowsForWrite.length} rows_skipped_missing_pollutant_code=${classification.rows_skipped_missing_pollutant_code}`,
     );
   }
 
@@ -4663,30 +4719,38 @@ async function exportObsConnectorRowsToR2V2(args: {
         status: row.status ?? null,
       }));
       const partSummary = summarizeObservationPartRows(parquetRows);
-      const partKey = buildHistoryV2PartKey(
-        OBS_R2_HISTORY_PREFIX_V2,
-        args.day_utc,
-        args.connector_id,
-        pollutantCode,
-        partIndex,
-      );
+      const partKey = targetedTransactionId
+        ? buildTargetedHistoryV2PartKey(
+          OBS_R2_HISTORY_PREFIX_V2,
+          args.day_utc,
+          args.connector_id,
+          pollutantCode,
+          targetedTransactionId,
+          partIndex,
+        )
+        : buildHistoryV2PartKey(
+          OBS_R2_HISTORY_PREFIX_V2,
+          args.day_utc,
+          args.connector_id,
+          pollutantCode,
+          partIndex,
+        );
       const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
       const putResult = await putHistoryObjectWithTargetedStage({
         key: partKey,
         body: parquetBuffer,
         content_type: "application/octet-stream",
       });
-      const head = await r2HeadObject({ r2: OBS_R2_CONFIG, key: partKey });
-      if (!head.exists) {
-        throw new Error(`Missing v2 observation parquet part after upload: ${partKey}`);
+      const actual = await r2GetObject({ r2: OBS_R2_CONFIG, key: partKey });
+      const contentSha256 = sha256Hex(parquetBuffer);
+      if (actual.bytes !== parquetBuffer.byteLength || sha256Hex(actual.body) !== contentSha256) {
+        throw new Error(`v2 observation parquet GET verification failed: ${partKey}`);
       }
       fileEntries.push({
         key: partKey,
         row_count: chunk.length,
-        bytes: typeof head.bytes === "number" && Number.isFinite(head.bytes)
-          ? Math.trunc(head.bytes)
-          : Math.trunc(putResult.bytes),
-        etag_or_hash: head.etag || putResult.etag || null,
+        bytes: Math.trunc(actual.bytes),
+        etag_or_hash: actual.etag || putResult.etag || contentSha256,
         pollutant_codes: [pollutantCode],
         min_timeseries_id: partSummary.min_timeseries_id,
         max_timeseries_id: partSummary.max_timeseries_id,
@@ -4694,6 +4758,21 @@ async function exportObsConnectorRowsToR2V2(args: {
         max_observed_at: partSummary.max_observed_at,
         timeseries_row_counts: partSummary.timeseries_row_counts,
       });
+      if (targetedTransactionId) {
+        targetedDataFiles.push({
+          key: partKey,
+          pollutant_code: pollutantCode,
+          bytes: Math.trunc(actual.bytes),
+          content_sha256: contentSha256,
+          row_count: chunk.length,
+          min_timeseries_id: partSummary.min_timeseries_id,
+          max_timeseries_id: partSummary.max_timeseries_id,
+          min_observed_at: partSummary.min_observed_at,
+          max_observed_at: partSummary.max_observed_at,
+          timeseries_row_counts: partSummary.timeseries_row_counts,
+          r2_put_and_get_verified: true,
+        });
+      }
       objectsWritten += 1;
     }
     const manifestKey = buildHistoryV2PollutantManifestKey(
@@ -4751,8 +4830,33 @@ async function exportObsConnectorRowsToR2V2(args: {
     objectsWritten += 1;
   }
 
+  if (targetedTransactionId) {
+    const timeseriesRowCounts: Record<string, number> = {};
+    for (const file of targetedDataFiles) {
+      for (const [timeseriesId, count] of Object.entries(file.timeseries_row_counts as Record<string, number>)) {
+        timeseriesRowCounts[timeseriesId] = (timeseriesRowCounts[timeseriesId] || 0) + Number(count || 0);
+      }
+    }
+    writeTargetedObservationDataReceipt(args.day_utc, args.connector_id, {
+      receipt_schema_version: 1,
+      transaction_id: targetedTransactionId,
+      history_version: "v2",
+      domain: "observations",
+      day_utc: args.day_utc,
+      connector_id: args.connector_id,
+      pollutant_codes: [...new Set(targetedDataFiles.map((file) => String(file.pollutant_code)))].sort(),
+      files: targetedDataFiles.sort((left, right) => String(left.key).localeCompare(String(right.key))),
+      timeseries_row_counts: Object.fromEntries(Object.entries(timeseriesRowCounts).sort(([left], [right]) => Number(left) - Number(right))),
+      preserved_unaffected_timeseries_ids: [...new Set(args.rows
+        .map((row) => row.timeseries_id)
+        .filter((timeseriesId) => !targetedTimeseries.has(timeseriesId)))]
+        .sort((left, right) => left - right),
+      finalisation_status: "data_put_and_get_verified",
+    });
+  }
+
   return {
-    rows_read: args.rows.length,
+    rows_read: rowsForWrite.length,
     objects_written_r2: objectsWritten,
     manifest_key: manifestKey,
     connector_manifest: connectorManifest as ObsConnectorManifest & Record<string, unknown>,
@@ -13946,6 +14050,9 @@ async function runSourceToAll(
           day_utc: dayUtc,
           connector_id: connectorId,
           rows: obsHistoryRows,
+          targeted_timeseries_ids: sourceCheckpointJson.targeted_merge
+            ? (sourceCheckpointJson.targeted_timeseries_ids as number[])
+            : undefined,
         });
         objectsWrittenR2 += obsExport.objects_written_r2;
         const targetedObservationDataOnlyFinalisation =

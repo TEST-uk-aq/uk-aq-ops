@@ -13240,6 +13240,9 @@ def run_v2_gap_backfills(
             extra_env: dict[str, str] = {
                 "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
                 "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
+                "UK_AQ_BACKFILL_TARGETED_TRANSACTION_ID": (
+                    f"integrity-{str(run_state.get('run_id') if run_state is not None else run_id)}-observations-{day_iso}-connector-{connector_id}"
+                ),
                 "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
                     "true" if chunk_index == len(chunks) else "false"
                 ),
@@ -14796,40 +14799,86 @@ def _capture_verified_v2_observation_scope(
     connector_id: int,
     env: Mapping[str, str],
 ) -> list[str]:
-    """Verify and retain the writer's generated observation bytes.
-
-    The local generated-object stage is the source of truth for this run.  R2
-    is read only to verify that its GET has exactly the bytes the writer PUT.
-    This avoids replacing the sparse overlay with a later live object.
-    """
-    connector_key = _v2_observation_connector_manifest_key(
-        day_utc=day_utc, connector_id=connector_id, env=env,
-    )
+    """Verify and retain exactly the final writer receipt's Parquet objects."""
     generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
-    connector_source = generated_root / _normalise_overlay_object_key(connector_key)
-    if not connector_source.is_file():
-        raise FileNotFoundError(f"generated observation connector manifest is unavailable: {connector_key}")
-    manifest = json.loads(connector_source.read_text(encoding="utf-8"))
-    if not isinstance(manifest, Mapping):
-        raise ValueError(f"invalid observation connector manifest after GET: {connector_key}")
-    object_keys = [
-        *(str(entry.get("key") or "") for entry in list(manifest.get("files") or []) if isinstance(entry, Mapping)),
-        *(str(entry.get("manifest_key") or "") for entry in list(manifest.get("child_manifests") or []) if isinstance(entry, Mapping)),
-        connector_key,
-    ]
+    receipt_path = (
+        Path(str(run_state["overlay_root"])) / "data-receipts" /
+        f"day_utc={day_utc}" / f"connector_id={connector_id}.json"
+    )
+    if not receipt_path.is_file():
+        raise FileNotFoundError(f"targeted observation data receipt is unavailable: {receipt_path}")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, Mapping):
+        raise ValueError("targeted observation data receipt is not an object")
+    if (
+        int(receipt.get("receipt_schema_version") or 0) != 1
+        or receipt.get("history_version") != "v2"
+        or receipt.get("domain") != "observations"
+        or str(receipt.get("day_utc") or "") != day_utc
+        or int(receipt.get("connector_id") or 0) != connector_id
+        or receipt.get("finalisation_status") != "data_put_and_get_verified"
+    ):
+        raise ValueError("targeted observation data receipt identity is invalid")
+    file_entries = list(receipt.get("files") or [])
+    if not file_entries:
+        raise ValueError("targeted observation data receipt has no files")
+    transaction_id = str(receipt.get("transaction_id") or "").strip()
+    declared_pollutants = {
+        str(value).strip().lower()
+        for value in list(receipt.get("pollutant_codes") or [])
+        if str(value).strip()
+    }
+    if not transaction_id or not declared_pollutants:
+        raise ValueError("targeted observation data receipt scope is invalid")
+    expected_transaction_id = (
+        f"integrity-{str(run_state.get('run_id') or '')}-observations-"
+        f"{day_utc}-connector-{connector_id}"
+    )
+    if transaction_id != expected_transaction_id:
+        raise ValueError("targeted observation data receipt transaction_id is invalid")
     captured: list[str] = []
-    for object_key in sorted({_normalise_overlay_object_key(key) for key in object_keys if key}):
+    normalized_files: list[dict[str, Any]] = []
+    for entry in file_entries:
+        if not isinstance(entry, Mapping):
+            raise ValueError("targeted observation data receipt file is invalid")
+        object_key = _normalise_overlay_object_key(str(entry.get("key") or ""))
+        pollutant_code = str(entry.get("pollutant_code") or "").strip().lower()
+        expected_sha = str(entry.get("content_sha256") or "")
+        expected_bytes = int(entry.get("bytes") or -1)
+        expected_key_fragment = (
+            f"/day_utc={day_utc}/connector_id={connector_id}/"
+            f"pollutant_code={pollutant_code}/generation={transaction_id}/part-"
+        )
+        if (
+            not object_key or pollutant_code not in declared_pollutants
+            or expected_key_fragment not in f"/{object_key}"
+            or not object_key.endswith(".parquet")
+            or len(expected_sha) != 64 or expected_bytes < 0
+            or int(entry.get("row_count") or 0) <= 0
+            or not isinstance(entry.get("timeseries_row_counts"), Mapping)
+            or entry.get("r2_put_and_get_verified") is not True
+        ):
+            raise ValueError("targeted observation data receipt file identity is invalid")
         source = generated_root / object_key
         if not source.is_file():
             raise FileNotFoundError(f"generated observation object is unavailable: {object_key}")
         expected = source.read_bytes()
+        if len(expected) != expected_bytes or hashlib.sha256(expected).hexdigest() != expected_sha:
+            raise ValueError(f"generated observation object does not match receipt: {object_key}")
         actual = _get_r2_object_bytes_for_integrity_overlay(object_key=object_key, env=env)
-        if len(actual) != len(expected) or hashlib.sha256(actual).digest() != hashlib.sha256(expected).digest():
+        if len(actual) != expected_bytes or hashlib.sha256(actual).hexdigest() != expected_sha:
             raise ValueError(f"R2 GET does not match generated observation object: {object_key}")
         stage_overlay_object(run_state, object_key=object_key, source_path=source, stage="observs", dependencies=())
         mark_overlay_uploaded(run_state, object_key)
         mark_overlay_verified(run_state, object_key)
         captured.append(object_key)
+        normalized_files.append(dict(entry, key=object_key))
+    receipt_key = f"{day_utc}|{connector_id}"
+    run_state.setdefault("observation_data_receipts", {})[receipt_key] = {
+        **dict(receipt),
+        "files": sorted(normalized_files, key=lambda entry: str(entry["key"])),
+    }
+    write_run_state(run_state)
     return captured
 
 
