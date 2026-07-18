@@ -117,7 +117,13 @@ def invoke_worker(
         http_request = request.Request(
             url,
             method="POST",
-            headers={"X-UK-AQ-Scheduler-Trigger": trigger_secret},
+            headers={
+                "X-UK-AQ-Scheduler-Trigger": trigger_secret,
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 Chrome/150 Safari/537.36 "
+                "UK-AQ-Scheduler-Watchdog/1.0",
+            },
         )
         with request.urlopen(http_request, timeout=timeout_seconds) as response:
             http_status = response.status
