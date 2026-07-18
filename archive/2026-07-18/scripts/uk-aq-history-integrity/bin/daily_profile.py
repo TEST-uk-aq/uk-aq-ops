@@ -25,7 +25,6 @@ class SelectedDay:
 @dataclass(frozen=True)
 class DailyProfileSelection:
     logical_run_date: dt.date
-    logical_run_date_source: str
     latest_r2_observations_day: dt.date
     recent_start_day: dt.date
     recent_end_day: dt.date
@@ -47,7 +46,6 @@ class DailyProfileSelection:
         return {
             "selection_mode": "daily_explicit",
             "logical_run_date": self.logical_run_date.isoformat(),
-            "logical_run_date_source": self.logical_run_date_source,
             "logical_run_timezone": "UTC",
             "latest_r2_observations_day": self.latest_r2_observations_day.isoformat(),
             "discovery_source": "local_dropbox_committed_v2_observations_tree",
@@ -115,7 +113,6 @@ def _valid_month_day(year: int, month: int, day: int) -> dt.date | None:
 def build_daily_selection(
     *,
     logical_run_date: dt.date,
-    logical_run_date_source: str,
     observations_days: Iterable[dt.date],
     observations_prefix: str,
     catch_up_logical_dates: Iterable[dt.date] = (),
@@ -161,7 +158,6 @@ def build_daily_selection(
     )
     return DailyProfileSelection(
         logical_run_date=logical_run_date,
-        logical_run_date_source=logical_run_date_source,
         latest_r2_observations_day=latest_day,
         recent_start_day=recent_start,
         recent_end_day=latest_day,
