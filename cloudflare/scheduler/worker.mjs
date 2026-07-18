@@ -3,7 +3,6 @@ import { jsonResponse, logJson, nowIso, readSecret } from "./shared.mjs";
 export const SCHEDULER_NAME = "uk-aq-cron-scheduler-ops";
 export const WORKER_NAME = "uk-aq-cron-scheduler-ops";
 export const D1_BINDING_NAME = "SCHEDULER_DB";
-export const DEFAULT_LOOKBACK_MINUTES = 2;
 export const MINUTE_MS = 60_000;
 export const DISPATCH_LEAD_MINUTES = 0.5;
 export const DISPATCH_LEAD_MS = DISPATCH_LEAD_MINUTES * MINUTE_MS;
@@ -59,6 +58,19 @@ export function canonicalMinuteSlot(nowMs) {
     throw new Error("Invalid scheduler invocation time");
   }
   return nowIso(Math.floor(timestamp / MINUTE_MS) * MINUTE_MS);
+}
+
+export function currentMinuteEvaluationWindow(minuteSlot) {
+  const endMs = Date.parse(minuteSlot);
+  if (!Number.isFinite(endMs)) {
+    throw new Error("Invalid scheduler minute slot");
+  }
+  return {
+    startMs: endMs - MINUTE_MS,
+    endMs,
+    start: nowIso(endMs - MINUTE_MS),
+    end: nowIso(endMs),
+  };
 }
 
 function normalizeTriggerSource(value) {
@@ -387,23 +399,6 @@ export function createSchedulerStore(db) {
   const schedulerDb = requireD1Db(db);
 
   return {
-    async getLatestFinishedRun(schedulerName, minuteSlot) {
-      return dbFirst(
-        schedulerDb,
-        `
-          select id, scheduler_name, started_at, evaluation_window_end
-          from scheduler_runs
-          where scheduler_name = ?
-            and status = 'finished'
-            and evaluation_window_end is not null
-            and evaluation_window_end < ?
-          order by evaluation_window_end desc, id desc
-          limit 1
-        `,
-        [schedulerName, minuteSlot],
-      );
-    },
-
     async claimMinute(run) {
       const result = await dbRun(
         schedulerDb,
@@ -878,23 +873,12 @@ export async function runScheduler(
 
   const startedAt = nowIso(startedAtMs);
   const minuteSlot = canonicalMinuteSlot(startedAtMs);
-  const minuteSlotMs = Date.parse(minuteSlot);
+  const evaluationWindow = currentMinuteEvaluationWindow(minuteSlot);
+  const minuteSlotMs = evaluationWindow.endMs;
   const normalizedTriggerSource = normalizeTriggerSource(triggerSource);
-  const previousRun = await store.getLatestFinishedRun(schedulerName, minuteSlot);
-  const previousRunStartedAt = previousRun?.started_at ? trimText(previousRun.started_at) : null;
-  const previousEvaluationWindowEnd = previousRun?.evaluation_window_end
-    ? trimText(previousRun.evaluation_window_end)
-    : null;
-  const previousEvaluationWindowEndMs = previousEvaluationWindowEnd
-    ? Date.parse(previousEvaluationWindowEnd)
-    : null;
-  if (previousEvaluationWindowEnd && !Number.isFinite(previousEvaluationWindowEndMs)) {
-    throw new Error(`Invalid previous scheduler evaluation window: ${previousEvaluationWindowEnd}`);
-  }
-  const evaluationWindowStartMs = Number.isFinite(previousEvaluationWindowEndMs)
-    ? previousEvaluationWindowEndMs
-    : minuteSlotMs - DEFAULT_LOOKBACK_MINUTES * MINUTE_MS;
-  const evaluationWindowStart = nowIso(evaluationWindowStartMs);
+  const previousRunStartedAt = null;
+  const evaluationWindowStartMs = evaluationWindow.startMs;
+  const evaluationWindowStart = evaluationWindow.start;
 
   const minuteClaim = await store.claimMinute({
     scheduler_name: schedulerName,
