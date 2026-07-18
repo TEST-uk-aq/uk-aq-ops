@@ -573,7 +573,7 @@ In both Workers:
 
 ### Phase 4: disable SOS in the canonical TEST scheduler manifest
 
-1. Set the ingest SOS job to `enabled = false`.
+1. ingest SOS job has already been set to dry_run being 'true', so no changes needed. 
 2. Preserve its cron, URL ownership and notes.
 3. Prepare the exact remote D1 sync command for the operator.
 4. Do not call or test SOS.

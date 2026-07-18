@@ -26,6 +26,7 @@ This Worker runs once per minute and reads its schedule entirely from D1.
 ## Required secret
 
 - `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
+- `UK_AQ_SCHEDULER_TRIGGER_SECRET` for authenticated `POST /run-if-due`
 
 ## Cloud Run authentication secret
 
@@ -60,10 +61,11 @@ python3 -m unittest discover -s tests -p 'test*.py'
 
 1. Create the D1 database for the ops scheduler.
 2. Update `cloudflare/scheduler/wrangler.toml` with the new D1 database ID.
-3. Apply `cloudflare/scheduler/migrations/0001_scheduler_schema.sql`.
+3. Apply the scheduler migrations, including `0002_scheduler_minute_slot_claim.sql`.
 4. Sync `cloudflare/scheduler/jobs.toml` into D1 with the config sync workflow or the local sync script.
 5. Seed `cloudflare/scheduler/seeds/0001_github_jobs.sql` only if you need a bootstrap snapshot for a brand-new D1 database.
-6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT` on the Worker.
+6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT` and
+   `UK_AQ_SCHEDULER_TRIGGER_SECRET` on the Worker.
 7. Deploy the Worker.
 8. Verify one-minute `scheduler_runs` rows and dry-run dispatch records.
 
@@ -85,3 +87,6 @@ and upstream callers and must be rotated across all consumers together.
 - Individual schedules live in `jobs.toml`, not `wrangler.toml`.
 - `jobs.toml` changes sync to D1 through `.github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml`.
 - Dry-run is per job and defaults to enabled in `jobs.toml` and the seed snapshot.
+- Cloudflare cron and authenticated `POST /run-if-due` calls share an atomic D1
+  UTC-minute claim. The first source records and runs the minute; later calls
+  receive a bounded `already_claimed` result without evaluating jobs.
