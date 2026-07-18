@@ -4599,14 +4599,7 @@ async function exportObsConnectorRowsToR2V2(args: {
   example_missing_pollutant_rows: MissingPollutantExampleRow[];
   pollutant_codes_written: string[];
 }> {
-  // Integrity targeted finalisation owns only the replacement Parquet objects.
-  // Its canonical metadata executor publishes the complete pollutant,
-  // connector and day hierarchy after it has checked preserved live children.
-  // In particular, do not delete the connector prefix here: old unreferenced
-  // parts are intentionally retained until separately collected.
-  const targetedDataOnlyFinalisation = SOURCE_TO_R2_TARGETED_STAGE_ENABLED &&
-    SOURCE_TO_R2_TARGETED_STAGE_FINALIZE;
-  if (FORCE_REPLACE && !targetedDataOnlyFinalisation) {
+  if (FORCE_REPLACE) {
     await deleteR2Prefix(
       buildHistoryV2ConnectorPrefix(
         OBS_R2_HISTORY_PREFIX_V2,
@@ -4713,14 +4706,12 @@ async function exportObsConnectorRowsToR2V2(args: {
       writerGitSha: OBS_R2_WRITER_GIT_SHA,
       backedUpAtUtc: nowIso(),
     });
-    if (!targetedDataOnlyFinalisation) {
-      await putHistoryObjectWithTargetedStage({
-        key: manifestKey,
-        body: encodeJsonBody(pollutantManifest),
-        content_type: "application/json",
-      });
-      objectsWritten += 1;
-    }
+    await putHistoryObjectWithTargetedStage({
+      key: manifestKey,
+      body: encodeJsonBody(pollutantManifest),
+      content_type: "application/json",
+    });
+    objectsWritten += 1;
     pollutantManifests.push(pollutantManifest);
   }
 
@@ -4742,14 +4733,12 @@ async function exportObsConnectorRowsToR2V2(args: {
   connectorManifest.rows_skipped_missing_pollutant_code = classification.rows_skipped_missing_pollutant_code;
   connectorManifest.example_missing_pollutant_rows = classification.example_missing_pollutant_rows;
   connectorManifest.pollutant_codes_written = classification.pollutant_codes_written;
-  if (!targetedDataOnlyFinalisation) {
-    await putHistoryObjectWithTargetedStage({
-      key: manifestKey,
-      body: encodeJsonBody(connectorManifest),
-      content_type: "application/json",
-    });
-    objectsWritten += 1;
-  }
+  await putHistoryObjectWithTargetedStage({
+    key: manifestKey,
+    body: encodeJsonBody(connectorManifest),
+    content_type: "application/json",
+  });
+  objectsWritten += 1;
 
   return {
     rows_read: args.rows.length,
@@ -13948,30 +13937,25 @@ async function runSourceToAll(
           rows: obsHistoryRows,
         });
         objectsWrittenR2 += obsExport.objects_written_r2;
-        const targetedObservationDataOnlyFinalisation =
-          targetedStageActiveForConnectorDay &&
-          SOURCE_TO_R2_TARGETED_STAGE_FINALIZE &&
-          sourceObservationsOnly;
+
+        const obsConnectorManifests = await loadAllObsConnectorManifestsForDay(
+          dayUtc,
+        );
+        if (!obsConnectorManifests.length) {
+          throw new Error(
+            `missing observation connector manifests for day=${dayUtc} after source_to_r2 export`,
+          );
+        }
+        const obsDayManifest = createObsDayManifest({
+          dayUtc,
+          runId,
+          connectorManifests: obsConnectorManifests,
+          writerGitSha: OBS_R2_WRITER_GIT_SHA,
+          backedUpAtUtc: nowIso(),
+        });
         let aqiExport:
           | { objects_written_r2: number; manifest_key: string }
           | null = null;
-
-        if (!targetedObservationDataOnlyFinalisation) {
-          const obsConnectorManifests = await loadAllObsConnectorManifestsForDay(
-            dayUtc,
-          );
-          if (!obsConnectorManifests.length) {
-            throw new Error(
-              `missing observation connector manifests for day=${dayUtc} after source_to_r2 export`,
-            );
-          }
-          const obsDayManifest = createObsDayManifest({
-            dayUtc,
-            runId,
-            connectorManifests: obsConnectorManifests,
-            writerGitSha: OBS_R2_WRITER_GIT_SHA,
-            backedUpAtUtc: nowIso(),
-          });
         if (!sourceObservationsOnly) {
           aqiExport = await exportAqiConnectorRowsToR2({
             run_id: runId,
@@ -14010,14 +13994,6 @@ async function runSourceToAll(
           content_type: "application/json",
         });
         objectsWrittenR2 += 1;
-        } else {
-          logStructured("info", "source_to_r2_targeted_data_only_finalised", {
-            run_id: runId,
-            day_utc: dayUtc,
-            connector_id: connectorId,
-            objects_written_r2: obsExport.objects_written_r2,
-          });
-        }
         if (
           targetedStageActiveForConnectorDay &&
           SOURCE_TO_R2_TARGETED_STAGE_FINALIZE &&
@@ -14040,7 +14016,7 @@ async function runSourceToAll(
           pollutant_codes_written: obsExport.pollutant_codes_written ?? [],
           rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
           objects_written_r2: sourceObservationsOnly
-            ? obsExport.objects_written_r2 + (targetedObservationDataOnlyFinalisation ? 0 : 1)
+            ? obsExport.objects_written_r2 + 1
             : obsExport.objects_written_r2 +
               (aqiExport?.objects_written_r2 || 0) + 2,
         });
@@ -14055,7 +14031,7 @@ async function runSourceToAll(
           rows_read: obsHistoryRows.length,
           rows_written_aqilevels: sourceObservationsOnly ? 0 : aqilevelRows.length,
           objects_written_r2: sourceObservationsOnly
-            ? obsExport.objects_written_r2 + (targetedObservationDataOnlyFinalisation ? 0 : 1)
+            ? obsExport.objects_written_r2 + 1
             : obsExport.objects_written_r2 +
               (aqiExport?.objects_written_r2 || 0) + 2,
           checkpoint_json: {
