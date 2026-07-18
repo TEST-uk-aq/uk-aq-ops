@@ -2,106 +2,204 @@
 
 ## Authority and scope
 
-This document defines the current v2 integrity detection, repair-planning and repair-execution contract. It supplements the stable binding-index contract in this area and does not reintroduce retired cumulative timeseries metadata.
+This document defines the required v2 Integrity detection, repair-planning and repair-execution contract. It supplements the stable binding-index contract and does not reintroduce retired cumulative timeseries metadata.
 
-`scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py` is the orchestrator for the UK-AQ history integrity run.
+`scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py` is the orchestrator for the UK-AQ history Integrity run.
+
+Where active code differs from this document, this document is authoritative and the code must be brought into line before a real repair run.
 
 ## Supported runtime model
 
-Run history integrity, including the Phase 3/4 executors, from a complete `uk-aq-ops` repository checkout. The checkout location is operator-specific and is not part of the system contract.
+Run history Integrity from a complete `uk-aq-ops` repository checkout. The checkout location is operator-specific and is not part of the system contract.
 
-A complete checkout is the only supported runtime model. The Phase 3/4 executor imports shared R2/index code and the Phase B writer from elsewhere in the repository, whose Node dependencies are also required. Do not copy a partial `bin/` or `env/` directory and do not rely on an undocumented runtime bundle.
-
-## Current flow
-
-1. Load the v2-only integrity environment and then the configured backfill environment when daily-task health needs it.
-2. Check Dropbox backup readiness before any repair run inspects its Dropbox base.
-3. Import the current `R2_history_backup/history/v2/core` snapshot using the v2 core writer manifest/table contract.
-4. Run the configured source adapters.
-5. Run R2 history cross-checks.
-6. Validate v2 only:
-   - observations partitions and manifests;
-   - AQI hourly partitions and manifests;
-   - available stable timeseries bindings against the imported core snapshot.
-7. Build the repair plan. When `--run-backfill` is set, create a sparse local run overlay and run the ordered v2 coordinator after all detection has completed.
-8. Write JSON/Markdown reports.
+A complete checkout is the only supported runtime model because the orchestrator uses shared source-adapter, R2 writer, manifest and index code from elsewhere in the repository. Do not copy a partial `bin/` or `env/` directory and do not rely on an undocumented runtime bundle.
 
 `--history-version v2` is the only accepted history version. `v1` and `both` remain rejected. `--check-only` and `--run-backfill` are mutually exclusive.
 
-`--run-backfill --dry-run` records the complete stage plan without writes; without `--dry-run`, the coordinator runs the ordered observation and AQI stages through AQI indexes, then performs one read-only final verification. It uses source-cache for observation truth and a disposable overlay-first, Dropbox-second local view for observations, manifests and indexes. Any actionable remaining scope fails the run. The AQI writer uses the already verified live-R2 observation scope as the narrow same-run exception; generated AQI objects are compared with the subsequent GET before they are marked verified in the overlay.
+## Authoritative inputs
 
-The overlay is under `UK_AQ_HISTORY_INTEGRITY_TMP_DIR/run-<UTC>/overlay` and contains only changed/generated objects. `run-state.json` records object hashes, dependencies, upload/verification state, changed scopes, and blocked scopes. Later stages resolve a verified overlay object first, then the matching `R2_history_backup` object. The backup is never updated or copied into. Verified tombstones hide objects deleted by a targeted replacement, so a stale Dropbox part cannot reappear in the current run's combined view.
+Integrity uses these inputs:
 
-The index executor plans solely from that combined-local view. It does not GET, HEAD, or list live R2 before an index PUT. For an authorised real apply, every changed proposal is PUT and immediately GET-verified for exact bytes and canonical structure. The only retained live-read exception is the AQI writer's read of observation objects that the same run has already PUT/GET-verified. An index-only observation leaf can be read by exact Dropbox key for its index, but every valid sibling pollutant manifest already visible in the combined overlay/Dropbox view, including O3, is retained by connector/day child discovery.
+1. The relevant historical connector gateway or its existing local source cache for authoritative historical observations.
+2. The Dropbox `R2_history_backup` mirror for the R2 v2 data, manifests and indexes being checked.
+3. The committed v2 core snapshot in Dropbox for connector, station, timeseries and observed-property identity.
+4. The local Integrity SQLite database for source snapshots, findings, repair planning and audit evidence.
 
-The index executor reads parquet metadata from the final combined local object. Observation parquet uses `observed_at_utc`, with `observed_at` accepted only for older compatible files; a file with neither timestamp column blocks its exact leaf scope. Missing requested pollutant parquet blocks its connector, day manifest and targeted index rather than allowing partial parent metadata. The resolver scans only affected day prefixes and reads the single exact global latest-index key needed to merge those days, so untouched latest-index entries are preserved without a broad Dropbox scan.
+Source acquisition must happen before comparison. When the required historical source file is already cached locally, Integrity reuses it. Otherwise the relevant source adapter fetches it. Source unavailability or an uncertain empty result must block the affected repair scope.
 
-Integrity does not use a cumulative per-timeseries metadata rebuild. Stable timeseries bindings are validated independently against the committed core snapshot. Every final affected connector and pollutant child is required, so an unreadable child produces no latest-index proposal for that incomplete day.
+Integrity detection and repair planning do not use live R2 as a comparison source.
 
-Targeted index planning unions old and final pollutant-index timeseries IDs, so removal-only IDs lose only their exact affected entry. A final-empty index object blocks until verified deletion support exists. Latest-index proposals are applied after pollutant-index proposals, and tombstones precede every Dropbox fallback, including dynamic exact-key reads.
+## Current flow
 
-The final report includes prior R2 GET verification evidence for every changed object and delete verification evidence for every replacement deletion. It reports `r2_objects_written`, `r2_objects_deleted`, and their verified union as `r2_objects_changed`; a key deleted and then recreated in the same run counts once as a final write. On a successful non-dry-run repair, Integrity removes only the duplicate `generated-objects` staging directory and the disposable final verification view after the reports are written. It retains the sparse verified overlay and `run-state.json`; failed overlays are retained unchanged.
+1. Load the v2-only Integrity environment and the configured source/backfill environment.
+2. Check Dropbox backup readiness unless `--allow-stale-dropbox` is supplied.
+3. Import the current `R2_history_backup/history/v2/core` snapshot.
+4. Read or fetch the relevant historical connector data through the configured source adapters and caches.
+5. Read the scoped R2 v2 mirror from Dropbox.
+6. Compare source/cache truth with the Dropbox Parquet, manifests, indexes and stable bindings.
+7. Build a deterministic repair plan after all detection has completed.
+8. With `--run-backfill --dry-run`, report the plan without writing R2.
+9. With a real `--run-backfill`, build and validate corrected objects locally, apply the repair to R2 in the required order, and GET-verify every written object.
+10. Run one final read-only verification and write the SQLite, JSON, Markdown and task-health evidence.
 
-Final repair reports keep the original detection as `pre_repair` evidence and make the principal v2 status reflect the final verification state. A failed final verification or `stopped_limit` is reported to daily task health as a failed task, not a finished task.
+## Seven logical v2 areas
 
-Final verification includes each changed index object by exact key. It validates schema, identity and applicable aggregate fields, then cross-checks affected pollutant-index payload identities and row counts without scanning a global per-timeseries cumulative index prefix. Per-key proposal evidence retains every stage attempt, while only a GET-verified or unchanged index body becomes authoritative for this final contract. A failed application is recorded as a deterministic blocked scope before PUT, or an uncertain R2 object after PUT was attempted, and therefore always fails the single final verification.
+Integrity checks seven logical areas. These are not necessarily seven broad scans:
 
-Stable binding validation is independent of cumulative metadata coverage. It compares `history/_index_v2/timeseries_binding` objects to imported core identities, reports missing, stale or invalid objects, and never deletes them; the dedicated core-snapshot binding reconciliation command is the repair path.
+1. Core snapshot.
+2. Observation data and manifests.
+3. Observation timeseries indexes, including the latest index.
+4. AQI hourly data and manifests.
+5. AQI debug data and manifests.
+6. AQI timeseries indexes, including the latest index.
+7. Stable timeseries bindings.
 
-## Backup gate
+Stable bindings live under `history/_index_v2/timeseries_binding`. They are checked independently against the imported core snapshot and are not rewritten by an observation data repair. The dedicated core-snapshot binding reconciliation path owns binding repair.
 
-Repair runs now call the Integrity-specific Obs AQI DB RPC `uk_aq_public.uk_aq_rpc_history_integrity_readiness(timestamptz)` before any Dropbox history scan starts. This leaves the unrelated date-based backup readiness RPC unchanged for its existing callers.
+## Backup gate and stale-backup override
 
-- The latest successful non-dry-run `ops.r2_history_dropbox_backup` must have started after the latest finished `ops.prune_daily` and `ops.r2_core_snapshot` attempts. Failed writer attempts count because they may have written R2 objects before failing.
-- A previous `ops.history_integrity` attempt is a writer only when its task summary has `repair_mode=true` (or the legacy `run_backfill=true`) and `dry_run=false`.
-- Any relevant writer still in `Started`, including a Dropbox backup attempt, blocks the run. The qualifying backup must also have finished before the current Integrity run started.
-- If the gate is not ready, a repair run exits early with `status=blocked_backup_not_ready`.
-- `--allow-stale-dropbox` remains an explicit recovery override and is recorded in the JSON and Markdown reports.
+Repair runs call the Integrity-specific Obs AQI DB RPC `uk_aq_public.uk_aq_rpc_history_integrity_readiness(timestamptz)` before scanning the Dropbox history base.
 
-The RPC returns the qualifying backup run and timestamps, any running Dropbox backup details, and the latest finished/running state for every relevant writer, so the report explains the decision without inspecting R2.
+For a normal repair run:
 
-The gate calls the RPC through the exposed `uk_aq_public` PostgREST schema and uses the Obs AQI DB credential order: dedicated daily-task-health variables, `OBS_AQIDB_SUPABASE_URL`/`OBS_AQIDB_SECRET_KEY`, then established generic fallbacks. The request includes only the Integrity start timestamp. Missing credentials, invalid inputs, RPC failures, or unexpected response shapes block the run safely.
+- the latest successful non-dry-run `ops.r2_history_dropbox_backup` must have started after the latest finished relevant R2 writer attempts;
+- unfinished relevant writers or an unfinished Dropbox backup block the run;
+- the qualifying backup must have finished before the current Integrity run started;
+- a failed readiness check exits with `status=blocked_backup_not_ready`.
+
+`--allow-stale-dropbox` has one meaning only: it bypasses the Dropbox readiness gate and uses the available Dropbox mirror as the chosen repair baseline.
+
+The override does not change fault classification, does not force a data rebuild, and does not disable metadata-only repair. It must be recorded clearly in SQLite, JSON and Markdown reports.
+
+The operator is responsible for using the override only when the selected Dropbox state is appropriate. A common supported use is rerunning an interrupted Integrity repair from the same Dropbox baseline without waiting for another backup.
 
 The RPC's canonical SQL definition is owned by `TEST-uk-aq-schema/schemas/obs_aqi_db/uk_aq_rpc_history_integrity_readiness.sql`. No ops SQL mirror is maintained.
 
-## v2 hierarchy validation
+## Detection and hierarchy validation
 
-The v2 integrity checks start from actual day, connector, pollutant, and parquet paths in the scoped Dropbox mirror. They validate parent manifest content against valid child manifests instead of trusting a single parent representation.
+The v2 checks start from actual day, connector, pollutant and Parquet paths in the scoped Dropbox mirror. They validate parent manifest content against valid child manifests instead of trusting a single parent representation.
 
-DuckDB reads the actual parquet files and calculates whole-partition and per-timeseries row counts. The report keeps these comparisons separate:
+DuckDB reads the actual Dropbox Parquet and calculates whole-partition and per-timeseries row counts. The report keeps these comparisons separate:
 
-1. source counts versus actual parquet counts;
-2. actual parquet counts versus pollutant manifest counts;
-3. pollutant manifests versus connector/day hierarchy representations.
+1. source/cache counts versus actual Dropbox Parquet counts;
+2. actual Parquet counts versus pollutant manifest counts;
+3. pollutant manifests versus connector and day hierarchy representations;
+4. committed manifests versus pollutant and latest indexes;
+5. stable binding objects versus imported core identities.
 
-`duckdb` is therefore required for a complete v2 check. An unavailable reader or unreadable parquet is reported explicitly and fails closed.
+An unavailable reader, unreadable Parquet, unavailable source/cache or ambiguous source mapping is reported explicitly and fails closed for the affected scope.
 
-This emits dedicated gap types for:
-
-- missing child representations in connector/day manifests;
-- file-count, unlisted-parquet, and listed-parquet mismatches;
-- total-byte mismatches;
-- timeseries row-count mismatches.
-
-Missing connector and day manifests are reported directly. Parent validation also covers row/source-row/file/byte aggregates, min/max timeseries identifiers, supported timestamp ranges, parquet key sets, and child manifest hashes.
-
-Each finding includes `fault_class`, distinguishing data, pollutant-manifest, connector-manifest, day-manifest, index, source-mapping, and source-unavailable faults. Both source-only and R2-only per-timeseries count differences are retained in the report.
+Findings distinguish data, pollutant-manifest, connector-manifest, day-manifest, index, source-mapping and source-unavailable faults. Both source-only and Dropbox-only per-timeseries differences remain visible in the report.
 
 ## Repair planning
 
-Each v2 run includes a deterministic, deduplicated `repair_plan` array. The coordinator consumes observation and AQI index actions after data repair and includes `data_changes_required`, `requires_index_rebuild`, and all contributing gap types.
+Each v2 run includes a deterministic, deduplicated `repair_plan` array. The plan records whether each scope needs data replacement, metadata repair, index repair, AQI rebuild or operator action.
 
-Readable valid parquet with a missing or invalid pollutant manifest is a manifest-only fault. Its plan rebuilds the manifest without rewriting parquet. Manifest-only O3 findings do not queue AQI.
+A readable valid Parquet partition with a missing or invalid manifest is a metadata-only fault. Metadata-only repair must not rewrite valid Parquet. Manifest-only O3 findings do not queue AQI.
+
+An observation data fault is repaired from the authoritative connector source/cache. The repair scope is the complete observation connector-day, not a selected fragment of one Parquet file. This keeps replacement and interruption recovery deterministic.
 
 Relevant repair kinds include:
 
+- `observation_data_repair`
 - `observation_pollutant_manifest_repair`
 - `observation_connector_manifest_repair`
 - `observation_day_manifest_repair`
+- `observation_index_repair`
+- `aqi_rebuild`
 - `aqi_pollutant_manifest_repair`
 - `aqi_connector_manifest_repair`
 - `aqi_day_manifest_repair`
-- `aqi_rebuild`
+- `aqi_index_repair`
+
+## Simplified repair execution contract
+
+Before any R2 mutation, Integrity must build all corrected files for the affected repair scope locally and validate that they are structurally complete.
+
+For an observation data repair:
+
+1. Read or fetch the complete authoritative connector-day from the relevant source/cache.
+2. Build the complete corrected connector-day observation Parquet locally.
+3. Build all required pollutant and connector manifests locally.
+4. Validate local row counts, pollutant partitions, object keys, manifest aggregates and hashes.
+5. Delete the existing canonical observation connector-day prefix only after the local replacement has passed validation.
+6. Verify that stale surplus canonical files under that connector-day prefix have been removed.
+7. Upload the canonical pollutant Parquet files.
+8. GET each uploaded Parquet object and confirm exact bytes or SHA-256 against the local file.
+9. Upload and GET-verify pollutant manifests, then the connector manifest.
+10. Rebuild and GET-verify the day manifest using the corrected connector and the unaffected connector children from the chosen Dropbox baseline.
+11. Rebuild and GET-verify the affected pollutant indexes, then the global latest index.
+12. Run the required AQI repair stages for AQI-eligible changed observation data.
+
+For a metadata-only repair, preserve the Dropbox Parquet and rebuild only the required manifests or indexes from the chosen Dropbox baseline and any corrected local overlay objects.
+
+The apply order is always child data first, then child manifests, parent manifests, scoped indexes, and global latest indexes last.
+
+## R2 access rules
+
+Integrity detection and repair planning must not HEAD, GET or list live R2.
+
+A data repair does not read the existing live R2 connector-day before writing because the authoritative replacement is built from source/cache and the chosen Dropbox baseline.
+
+Live R2 reads during apply are limited to post-mutation verification:
+
+- confirm required deletions;
+- GET every written Parquet, manifest and index object;
+- verify exact bytes or SHA-256 and canonical structure.
+
+The final read-only verification may read the exact affected live R2 keys needed to prove the completed repair. It must not use broad live R2 discovery as an alternative repair baseline.
+
+## No generation or receipt contract
+
+Active Integrity repair must use the canonical R2 v2 paths directly.
+
+It must not:
+
+- create `generation=<transaction>` Parquet directories;
+- create permanent R2 transaction receipts under `transactions/`;
+- preserve old canonical Parquet on R2 for rollback;
+- inventory special transaction receipts for Dropbox backup;
+- attempt to resume an interrupted internal transaction from a receipt;
+- select between multiple historical repair generations.
+
+Repair audit information belongs in Integrity SQLite, task logs and JSON/Markdown run reports.
+
+## Interrupted repair recovery
+
+An interrupted repair is rerun from the beginning. Integrity does not resume individual internal write stages.
+
+A manual rerun may use `--allow-stale-dropbox` to reuse the same chosen Dropbox baseline without waiting for another Dropbox backup. The rerun may overwrite canonical files that were already written correctly by the interrupted attempt. That is expected and safe because the complete corrected scope is rebuilt deterministically from the same authoritative source/cache.
+
+The successful rerun must complete all writes, post-write GET verification, parent metadata, indexes and final verification. A failed or interrupted run remains failed in the audit trail.
+
+## Empty and unavailable source results
+
+A gateway failure, missing cache file, parse failure or uncertain empty response must never be interpreted as authoritative no-data.
+
+Integrity may replace a connector-day with no observation rows only when the relevant source adapter explicitly classifies the result as authoritative no-data under its documented source contract. Otherwise it must make no R2 changes for that scope.
+
+## Audit evidence
+
+SQLite, task logs and JSON/Markdown reports must record at least:
+
+- environment, source, day and connector;
+- whether `--allow-stale-dropbox` was used;
+- pre-repair findings and repair-plan actions;
+- local source and replacement row counts;
+- object keys deleted and written;
+- post-write GET verification results;
+- manifests and indexes rebuilt;
+- AQI work queued or completed;
+- final verification status;
+- stopped, failed and blocked scopes.
+
+The main reported v2 status after a real repair reflects the final verification result. A failed final verification or stopped run is a failed task, not a completed task.
+
+## Validation model
+
+Before implementation, only confirm that the proposed code paths, configuration and data contracts are structurally viable.
+
+After deployment to CIC-Test, functional validation is performed through one real scoped Integrity operation, followed by its post-write verification and a later normal check against the next successful Dropbox backup. Do not add broad speculative pre-implementation test suites.
 
 ## Related authoritative documents
 
@@ -109,15 +207,4 @@ Relevant repair kinds include:
 - [`contract.md`](contract.md)
 - [`operations.md`](operations.md)
 - [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md)
-
-## Manual validation
-
-Typical local checks:
-
-```bash
-python3 -m unittest scripts/uk-aq-history-integrity/tests/test_backup_gate_and_repair_plan.py
-python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_observations_integrity.py
-python3 -m unittest scripts/uk-aq-history-integrity/tests/test_v2_aqilevels_integrity.py
-```
-
-For a full run, use the existing shell wrapper after loading the environment for the target environment.
+- [`timeseries_binding_contract.md`](timeseries_binding_contract.md)
