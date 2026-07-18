@@ -187,6 +187,10 @@ function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, pref
 
   return {
     overlayRoot,
+    getObservationDataReceipt(dayUtc, connectorId) {
+      const receipt = state?.observation_data_receipts?.[`${dayUtc}|${connectorId}`];
+      return receipt && typeof receipt === "object" && !Array.isArray(receipt) ? receipt : null;
+    },
     getObjectFromSourceIfExists(key, source) {
       const normalized = safeLocalKey(key);
       return ["overlay", "dropbox"].includes(source) ? localObject(normalized, source) : null;
@@ -551,9 +555,16 @@ function existingManifestMetadata(store, {
   };
 }
 
-async function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId, pollutantCode, domain }) {
+async function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId, pollutantCode, domain, dataReceipt = null }) {
   const pollutantPrefix = `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
-  const partKeys = store.listAllObjects({ prefix: `${pollutantPrefix}/` })
+  const receiptFiles = domain === "observations" && dataReceipt
+    ? (Array.isArray(dataReceipt.files) ? dataReceipt.files : []).filter((entry) =>
+      entry?.pollutant_code === pollutantCode && typeof entry?.key === "string"
+    ).sort((left, right) => String(left.key).localeCompare(String(right.key)))
+    : null;
+  const partKeys = receiptFiles
+    ? receiptFiles.map((entry) => String(entry.key))
+    : store.listAllObjects({ prefix: `${pollutantPrefix}/` })
     .map((entry) => entry.key)
     .filter((key) => new RegExp(`^${pollutantPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/part-\\d+\\.parquet$`).test(key))
     .sort();
@@ -562,7 +573,16 @@ async function leafManifestSourceFromCombined({ store, base, dayUtc, connectorId
   const metadata = existingManifestMetadata(store, { manifestKey, base, dayUtc, connectorId, pollutantCode, domain });
   try {
     const files = [];
-    for (const key of partKeys) files.push(await parquetFileEntry({ store, key, domain, pollutantCode }));
+    for (const key of partKeys) {
+      const file = await parquetFileEntry({ store, key, domain, pollutantCode });
+      const receiptFile = receiptFiles?.find((entry) => String(entry.key) === key);
+      if (receiptFile && (
+        file.bytes !== Number(receiptFile.bytes)
+        || file.etag_or_hash !== String(receiptFile.content_sha256)
+        || file.row_count !== Number(receiptFile.row_count)
+      )) throw new Error(`targeted_data_receipt_file_mismatch:${key}`);
+      files.push(file);
+    }
     return { manifestKey, payload: metadata.payload, provenance: metadata.provenance, files };
   } catch (error) {
     return { blocked_reason: `final_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
@@ -758,7 +778,7 @@ function manifestDependencyKeys(payload) {
 // baseline. This records every non-staged object identity used by a proposed
 // parent, recursively including Parquet named by preserved manifests. The
 // apply step must freshly compare these identities with live R2 before PUT.
-export function collectPreservedLiveDependencies({ store, proposals }) {
+export function collectPreservedLiveDependencies({ store, proposals, includeDependencies = true }) {
   const dependencies = new Map();
   const add = (key, object, role) => {
     const normalized = assertCanonicalObjectKey(key, "live dependency key");
@@ -788,17 +808,22 @@ export function collectPreservedLiveDependencies({ store, proposals }) {
     }
   };
   const baselineAbsences = [];
-  for (const proposal of [...proposals.values()].filter((item) => item.changed).sort((a, b) => a.key.localeCompare(b.key))) {
+  // Unchanged staged children are still a live dependency of a changed
+  // parent. Guard their planning baseline too; otherwise a concurrent child
+  // update would be noticed only after its parent had been published.
+  for (const proposal of [...proposals.values()].sort((a, b) => a.key.localeCompare(b.key))) {
     if (proposal.old_sha256) {
       const object = store.getObjectIfExists(proposal.key);
       if (!object || sha256Hex(object.body) !== proposal.old_sha256) {
         throw new Error(`Blocked proposal baseline has no matching local identity: ${proposal.key}`);
       }
       add(proposal.key, object, "proposal_baseline");
-    } else {
+    } else if (proposal.changed) {
       baselineAbsences.push({ key: proposal.key, expected_absent: true, roles: ["new_proposal_baseline"] });
     }
-    for (const dependency of proposal.dependencies || []) visit(dependency, `dependency_of:${proposal.key}`);
+    if (includeDependencies) {
+      for (const dependency of proposal.dependencies || []) visit(dependency, `dependency_of:${proposal.key}`);
+    }
   }
   return [...dependencies.values(), ...baselineAbsences].sort((a, b) => a.key.localeCompare(b.key));
 }
@@ -1345,11 +1370,18 @@ export async function runV2ObservationsRepair({
     // in `files`; its parquet objects are the immutable data dependency.
     for (const scope of dayScopes.filter((value) => value.pollutantRepair).sort((left, right) => left.connectorId - right.connectorId)) {
       const wanted = new Set(scope.pollutant_codes || []);
+      const dataReceipt = domain === "observations"
+        ? localStore.getObservationDataReceipt(dayUtc, scope.connectorId)
+        : null;
       const partEntries = localStore.listAllObjects({ prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=` });
-      const availableCodes = [...new Set(partEntries.map((entry) => {
-        const match = entry.key.match(/\/pollutant_code=([^/]+)\/part-\d+\.parquet$/);
-        return match ? decodeURIComponent(match[1]).toLowerCase() : null;
-      }).filter(Boolean))].sort();
+      const availableCodes = dataReceipt
+        ? [...new Set((Array.isArray(dataReceipt.files) ? dataReceipt.files : []).map((entry) =>
+          typeof entry?.pollutant_code === "string" ? entry.pollutant_code.toLowerCase() : null
+        ).filter(Boolean))].sort()
+        : [...new Set(partEntries.map((entry) => {
+          const match = entry.key.match(/\/pollutant_code=([^/]+)\/(?:generation=[^/]+\/)?part-\d+\.parquet$/);
+          return match ? decodeURIComponent(match[1]).toLowerCase() : null;
+        }).filter(Boolean))].sort();
       const selectedCodes = availableCodes.filter((code) => !wanted.size || wanted.has(code));
       const missingRequested = [...wanted].filter((code) => !availableCodes.includes(code));
       for (const pollutantCode of missingRequested) {
@@ -1363,7 +1395,7 @@ export async function runV2ObservationsRepair({
         continue;
       }
       for (const pollutantCode of selectedCodes) {
-        const source = await leafManifestSourceFromCombined({ store: localStore, base, dayUtc, connectorId: scope.connectorId, pollutantCode, domain });
+        const source = await leafManifestSourceFromCombined({ store: localStore, base, dayUtc, connectorId: scope.connectorId, pollutantCode, domain, dataReceipt });
         if (source.blocked_reason) {
           const blocked = { ...scope, pollutant_code: pollutantCode, status: "blocked_dependency", reason: source.blocked_reason };
           blockedScopes.push(blocked);
@@ -1615,6 +1647,11 @@ export async function runV2ObservationsRepair({
       r2: config.r2,
       proposals: indexProposals,
       writeR2: args.writeR2,
+      liveDependencies: collectPreservedLiveDependencies({
+        store: localStore,
+        proposals: indexProposals,
+        includeDependencies: false,
+      }),
       onProgress: reportProgress,
       blockedCount: blockedScopes.length,
     });
