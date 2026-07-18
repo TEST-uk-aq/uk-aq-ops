@@ -203,6 +203,26 @@ function compactPruneHealthSummary(summary = {}) {
   };
 }
 
+function githubActionsTaskRunMetadata() {
+  if (process.env.GITHUB_ACTIONS !== "true") {
+    return {};
+  }
+
+  const repository = String(process.env.GITHUB_REPOSITORY || "").trim();
+  const workflow = String(process.env.GITHUB_WORKFLOW || "").trim();
+  const runId = String(process.env.GITHUB_RUN_ID || "").trim();
+  if (!(repository && workflow && runId)) {
+    return {};
+  }
+
+  return {
+    source_repo: repository,
+    source_worker: workflow,
+    platform_run_id: runId,
+    log_url: `https://github.com/${repository}/actions/runs/${runId}`,
+  };
+}
+
 function isObservsStatementTimeoutError(message) {
   return /statement timeout|canceling statement due to statement timeout/i.test(message);
 }
@@ -2533,6 +2553,7 @@ export async function executePruneDaily(config) {
       task_key: "ops.prune_daily",
       source_repo: "uk-aq-ops",
       source_worker: "uk_aq_prune_daily",
+      ...githubActionsTaskRunMetadata(),
       startSummary: {
         dry_run: config.dryRun,
         max_hours_per_run: config.maxHoursPerRun,
