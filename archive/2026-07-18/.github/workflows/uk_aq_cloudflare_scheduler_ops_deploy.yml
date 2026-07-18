@@ -9,8 +9,6 @@ on:
       - "cloudflare/scheduler/*.js"
       - "cloudflare/scheduler/*.cjs"
       - "cloudflare/scheduler/wrangler.toml"
-      - "cloudflare/scheduler/migrations/**"
-      - "cloudflare/scheduler/seeds/**"
       - ".github/workflows/uk_aq_cloudflare_scheduler_ops_deploy.yml"
   workflow_dispatch:
 
@@ -25,7 +23,6 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: ${{ secrets.UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT || '' }}
       UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
-      UK_AQ_SCHEDULER_TRIGGER_SECRET: ${{ secrets.UK_AQ_SCHEDULER_TRIGGER_SECRET || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,10 +46,6 @@ jobs:
             echo "Missing secret UK_AQ_EDGE_UPSTREAM_SECRET."
             exit 1
           fi
-          if [ -z "${UK_AQ_SCHEDULER_TRIGGER_SECRET}" ]; then
-            echo "Missing secret UK_AQ_SCHEDULER_TRIGGER_SECRET."
-            exit 1
-          fi
 
       - name: Validate scheduler files
         run: |
@@ -63,7 +56,6 @@ jobs:
             cloudflare/scheduler/wrangler.toml \
             cloudflare/scheduler/README.md \
             cloudflare/scheduler/migrations/0001_scheduler_schema.sql \
-            cloudflare/scheduler/migrations/0002_scheduler_minute_slot_claim.sql \
             cloudflare/scheduler/seeds/0001_github_jobs.sql
           do
             if [ ! -f "${path}" ]; then
@@ -95,12 +87,6 @@ jobs:
               raise SystemExit("Missing D1 database name uk_aq_cron_scheduler_ops_db")
           PY
 
-      - name: Apply scheduler D1 migrations
-        working-directory: cloudflare/scheduler
-        run: |
-          set -euo pipefail
-          npx --yes wrangler@4 d1 migrations apply uk_aq_cron_scheduler_ops_db --remote
-
       - name: Deploy worker
         uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
         with:
@@ -116,8 +102,7 @@ jobs:
           secrets_json="$(jq -n \
             --arg UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT "${UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT}" \
             --arg UK_AQ_EDGE_UPSTREAM_SECRET "${UK_AQ_EDGE_UPSTREAM_SECRET}" \
-            --arg UK_AQ_SCHEDULER_TRIGGER_SECRET "${UK_AQ_SCHEDULER_TRIGGER_SECRET}" \
-            '{UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: $UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET, UK_AQ_SCHEDULER_TRIGGER_SECRET: $UK_AQ_SCHEDULER_TRIGGER_SECRET} | with_entries(select(.value != ""))')"
+            '{UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT: $UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT, UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET} | with_entries(select(.value != ""))')"
           printf '%s' "$secrets_json" | npx --yes wrangler@4 secret bulk --name uk-aq-cron-scheduler-ops
 
       - name: Redeploy worker
