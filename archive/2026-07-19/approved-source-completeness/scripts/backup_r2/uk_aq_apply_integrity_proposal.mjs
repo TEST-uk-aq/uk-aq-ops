@@ -63,41 +63,6 @@ function objectRank(key) {
   return domainOffset + 55;
 }
 
-const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
-  /^history\/v2\/aqilevels\/hourly\/data\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
-  /^history\/v2\/aqilevels\/hourly\/debug\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
-]);
-
-function assertCanonicalConnectorDayPrefix(prefix) {
-  const match = CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS
-    .map((pattern) => prefix.match(pattern))
-    .find(Boolean);
-  if (!match) {
-    throw new Error(`Deletion prefix is outside the canonical connector-day allowlist: ${prefix}`);
-  }
-  const [, dayUtc, connectorIdRaw] = match;
-  const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
-  if (Number.isNaN(parsedDay.getTime()) || parsedDay.toISOString().slice(0, 10) !== dayUtc) {
-    throw new Error(`Deletion prefix has an invalid UTC day: ${prefix}`);
-  }
-  const connectorId = Number(connectorIdRaw);
-  if (!Number.isSafeInteger(connectorId) || connectorId <= 0 || String(connectorId) !== connectorIdRaw) {
-    throw new Error(`Deletion prefix has an invalid connector ID: ${prefix}`);
-  }
-}
-
-function dependencyIdentity(entry, dependencyKey) {
-  const identities = entry?.dependency_identities;
-  if (!identities || typeof identities !== "object" || Array.isArray(identities)) return null;
-  const identity = identities[dependencyKey];
-  if (!identity || typeof identity !== "object") return null;
-  const sha256 = String(identity.sha256 || "").trim().toLowerCase();
-  const bytes = Number(identity.bytes);
-  if (!/^[a-f0-9]{64}$/.test(sha256) || !Number.isSafeInteger(bytes) || bytes < 0) return null;
-  return { sha256, bytes };
-}
-
 export function validateLocalProposal(runState) {
   if (!runState || typeof runState !== "object") throw new Error("run state must be an object");
   if (runState.environment !== "CIC-Test") {
@@ -136,20 +101,12 @@ export function validateLocalProposal(runState) {
           throw new Error(`Local proposal dependency is not structurally validated: ${key} -> ${dependencyKey}`);
         }
       } else {
-        const expectedIdentity = dependencyIdentity(entry, dependencyKey);
-        if (!expectedIdentity) {
-          throw new Error(`Dropbox baseline dependency identity is not pinned: ${key} -> ${dependencyKey}`);
-        }
         if (proposedPrefixes.some((prefix) => dependencyKey.startsWith(prefix))) {
           throw new Error(`Proposed deletion would remove an unstaged dependency: ${key} -> ${dependencyKey}`);
         }
         const baselinePath = path.join(String(runState.base_dropbox_root || ""), dependencyKey);
         if (!fs.statSync(baselinePath, { throwIfNoEntry: false })?.isFile()) {
           throw new Error(`Dropbox baseline dependency is unavailable: ${key} -> ${dependencyKey}`);
-        }
-        const baselineBody = fs.readFileSync(baselinePath);
-        if (baselineBody.byteLength !== expectedIdentity.bytes || sha256Hex(baselineBody) !== expectedIdentity.sha256) {
-          throw new Error(`Dropbox baseline dependency identity changed after planning: ${key} -> ${dependencyKey}`);
         }
       }
     }
@@ -158,7 +115,9 @@ export function validateLocalProposal(runState) {
   const normalizedPrefixes = prefixes.map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
     if (!entry?.proposed) throw new Error(`Deletion prefix is not proposed: ${prefix}`);
-    assertCanonicalConnectorDayPrefix(prefix);
+    if (!/^history\/v2\/(observations|aqilevels_[^/]+)\/day_utc=\d{4}-\d{2}-\d{2}\/connector_id=\d+$/.test(prefix)) {
+      throw new Error(`Deletion prefix is outside a canonical connector-day: ${prefix}`);
+    }
     return { entry, prefix, domain: objectDomain(prefix) };
   });
   return {

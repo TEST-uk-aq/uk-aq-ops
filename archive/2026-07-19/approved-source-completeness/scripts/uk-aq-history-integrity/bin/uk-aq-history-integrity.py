@@ -35,11 +35,9 @@ import tempfile
 import threading
 import time
 import traceback
-import struct
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
@@ -3437,7 +3435,6 @@ def _planned_backfill_command(
     output_scope: str | None = None,
     history_version: str = "v1",
     env_name: str | None = None,
-    complete_connector_day: bool = False,
 ) -> str:
     wrapper_raw = resolve_integrity_backfill_wrapper()
     env_file = str(
@@ -3463,11 +3460,9 @@ def _planned_backfill_command(
             iso,
             "--to-day",
             iso,
+            "--timeseries-ids",
+            shlex.quote(ids_csv),
         ]
-        if complete_connector_day:
-            cli_parts.append("--complete-connector-day")
-        else:
-            cli_parts.extend(["--timeseries-ids", shlex.quote(ids_csv)])
         if connector_csv:
             cli_parts.extend(["--connector-id", shlex.quote(connector_csv.split(",", 1)[0])])
         wrapper_command = " ".join(cli_parts)
@@ -3479,7 +3474,7 @@ def _planned_backfill_command(
         f"UK_AQ_R2_HISTORY_INDEX_VERSION={history_version} "
         f"{f'UK_AQ_BACKFILL_OUTPUT_SCOPE={output_scope} ' if output_scope else ''}"
         f"{f'UK_AQ_BACKFILL_CONNECTOR_IDS={connector_csv} ' if connector_csv else ''}"
-        f"{'UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY=true ' if complete_connector_day else f'UK_AQ_BACKFILL_TIMESERIES_IDS={ids_csv} '}"
+        f"UK_AQ_BACKFILL_TIMESERIES_IDS={ids_csv} "
         f"UK_AQ_BACKFILL_FROM_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_TO_DAY_UTC={iso} "
         f"UK_AQ_BACKFILL_ENV_FILE={env_file} "
@@ -3883,7 +3878,6 @@ def run_narrow_backfill(
     output_scope: str | None = None,
     extra_env: dict[str, str] | None = None,
     history_version: str = "v1",
-    complete_connector_day: bool = False,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one (timeseries-ids, day).
 
@@ -3905,7 +3899,7 @@ def run_narrow_backfill(
         "log_path": None,
         "error": None,
     }
-    if not timeseries_ids and not complete_connector_day:
+    if not timeseries_ids:
         result["status"] = "no_timeseries_ids"
         result["error"] = "no timeseries_ids to backfill"
         return result
@@ -3945,17 +3939,10 @@ def run_narrow_backfill(
         "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
         "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
+        "UK_AQ_BACKFILL_TIMESERIES_IDS": ",".join(str(t) for t in timeseries_ids),
         # Always force trigger_mode=manual (wrapper enforces this anyway).
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
     })
-    if complete_connector_day:
-        sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
-        sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_ID", None)
-        sub_env["UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY"] = "true"
-    else:
-        sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"] = ",".join(
-            str(t) for t in timeseries_ids
-        )
     connector_csv = ",".join(str(c) for c in (connector_ids or []) if int(c) > 0)
     if connector_csv:
         sub_env["UK_AQ_BACKFILL_CONNECTOR_IDS"] = connector_csv
@@ -3987,7 +3974,7 @@ def run_narrow_backfill(
         wrapper_path,
         iso,
         sub_env.get("UK_AQ_BACKFILL_CONNECTOR_IDS", "all"),
-        sub_env.get("UK_AQ_BACKFILL_TIMESERIES_IDS", "complete_connector_day"),
+        sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
     )
 
     wrapper_name = Path(wrapper_path).name
@@ -4005,14 +3992,9 @@ def run_narrow_backfill(
             iso,
             "--to-day",
             iso,
+            "--timeseries-ids",
+            sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
         ]
-        if complete_connector_day:
-            cmd.append("--complete-connector-day")
-        else:
-            cmd.extend([
-                "--timeseries-ids",
-                sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"],
-            ])
         if connector_csv:
             first_connector = connector_csv.split(",", 1)[0]
             cmd.extend(["--connector-id", first_connector])
@@ -4063,9 +4045,7 @@ def run_narrow_backfill(
                 fh.write(f"# env_file: {env_file_path}\n")
                 fh.write(f"# day: {iso}\n")
                 fh.write(f"# connector_ids: {sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n")
-                fh.write(
-                    f"# timeseries_ids: {sub_env.get('UK_AQ_BACKFILL_TIMESERIES_IDS', 'complete_connector_day')}\n"
-                )
+                fh.write(f"# timeseries_ids: {sub_env['UK_AQ_BACKFILL_TIMESERIES_IDS']}\n")
                 fh.write(f"# output_scope: {sub_env.get('UK_AQ_BACKFILL_OUTPUT_SCOPE', 'default')}\n")
                 if extra_env:
                     fh.write(f"# extra_env: {json.dumps(extra_env, sort_keys=True)}\n")
@@ -13198,16 +13178,27 @@ def run_v2_gap_backfills(
             connector_id=connector_id,
             gap=gap,
         )
-        by_key_sets.setdefault((day_iso, connector_id), set()).update(ts_ids)
-        gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
+        if ts_ids:
+            by_key_sets.setdefault((day_iso, connector_id), set()).update(ts_ids)
+            gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
     targeted_mismatch_ids = {key: sorted(values) for key, values in by_key_sets.items()}
-    by_key: dict[tuple[str, int], list[int]] = {
-        key: targeted_mismatch_ids[key] for key in sorted(by_key_sets)
-    }
+    by_key: dict[tuple[str, int], list[int]] = {}
+    for key in sorted(by_key_sets):
+        complete_connector_ids = _timeseries_ids_for_connector(conn, key[1])
+        if complete_connector_ids:
+            by_key[key] = complete_connector_ids
+        else:
+            metrics["skipped_v2_observation_repairs"].append({
+                "day_utc": key[0],
+                "connector_id": key[1],
+                "status": "blocked_dependency",
+                "reason": "authoritative_complete_connector_scope_empty",
+                "mismatch_timeseries_ids": targeted_mismatch_ids[key],
+            })
     standalone_index_keys = sorted(index_only_keys - set(by_key))
     metrics["observation_backfill_candidate_days"] = len(by_key)
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
-    metrics["observation_backfill_scope"] = "complete_source_derived_connector_day"
+    metrics["observation_backfill_scope"] = "complete_active_connector_day"
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     metrics["skipped_v2_observation_metadata_gaps"] = skipped_metadata_gaps
@@ -13218,20 +13209,40 @@ def run_v2_gap_backfills(
         metrics["planned_v2_observation_index_rebuilds"].append(" ".join(idx_cmd))
     for (day_iso, connector_id), ts_ids in sorted(by_key.items()):
         day_obj = dt.date.fromisoformat(day_iso)
-        chunks = [[]]
-        planned_cmds = [_planned_backfill_command(
-            env, [], day_obj, connector_ids=[connector_id],
-            output_scope="observations_only", history_version="v2",
-            env_name=env_name, complete_connector_day=True,
-        )]
+        chunks = _chunk_v2_observation_repair_timeseries_ids(ts_ids)
+        planned_cmds = [
+            _planned_backfill_command(env, chunk_ids, day_obj, connector_ids=[connector_id], output_scope="observations_only", history_version="v2", env_name=env_name)
+            for chunk_ids in chunks
+        ]
         first_cmd = planned_cmds[0] if planned_cmds else None
         idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
         if limits.should_stop():
             break
-        source_cache_status = {
-            "status": "validated_by_connector_adapter",
-            "reason": "complete enumeration and required-file reads are validated from source evidence",
-        }
+        source_cache_status = _source_cache_status_for_connector_day(
+            conn,
+            connector_id=connector_id,
+            day=day_obj,
+        )
+        if source_cache_status.get("status") != "ok":
+            record = {
+                "day_utc": day_iso,
+                "connector_id": connector_id,
+                "status": "blocked_dependency",
+                "reason": "source_cache_not_ready",
+                "source_cache": source_cache_status,
+                "timeseries_ids": ts_ids,
+            }
+            metrics["skipped_v2_observation_repairs"].append(record)
+            if run_state is not None:
+                record_blocked_scope(run_state, {"stage": "observs", **record})
+            log.warning(
+                "v2 observation repair blocked by source cache day=%s connector_id=%s source_status=%s reason=%s",
+                day_iso,
+                connector_id,
+                source_cache_status.get("status"),
+                source_cache_status.get("reason"),
+            )
+            continue
         metrics["planned_v2_observation_repairs"].extend(planned_cmds)
         metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
         for gap in gaps_by_key.get((day_iso, connector_id), []):
@@ -13255,9 +13266,10 @@ def run_v2_gap_backfills(
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
                 "UK_AQ_BACKFILL_INTEGRITY_CHUNK_MERGE": "true",
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": (
+                    "true" if chunk_index == len(chunks) else "false"
+                ),
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
-                "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
             }
             bf = run_narrow_backfill(
                 wrapper_path=resolve_integrity_backfill_wrapper(),
@@ -13272,7 +13284,6 @@ def run_v2_gap_backfills(
                 output_scope="observations_only",
                 history_version="v2",
                 extra_env=extra_env,
-                complete_connector_day=True,
             )
             chunk_results.append(bf)
             metrics["v2_observation_repairs_attempted"] += 1
@@ -13309,14 +13320,33 @@ def run_v2_gap_backfills(
         )
         source_pollutant_codes = list(combined.get("source_pollutant_codes") or [])
         source_rows_from_counts = sum(source_timeseries_row_counts.values())
+        source_scope = v2_observations.get("source_scope")
+        sos_scope = isinstance(source_scope, Mapping) and str(source_scope.get("source") or "").strip().lower() == "sos"
         expected_timeseries_row_counts = source_timeseries_row_counts
         expected_pollutant_codes = source_pollutant_codes
         expected_counts_source = "authoritative_source_rows"
-        expected_min_manifest_rows = sum(expected_timeseries_row_counts.values())
-        expected_min_manifest_rows = max(
-            expected_min_manifest_rows,
-            repaired_observation_rows,
+        expected_counts_scope_valid = bool(expected_timeseries_row_counts) and bool(
+            expected_pollutant_codes
         )
+        if sos_scope:
+            expected_timeseries_row_counts, expected_pollutant_codes = (
+                _sos_day_scoped_expected_counts(
+                    conn,
+                    day_utc=day_iso,
+                    connector_id=connector_id,
+                    timeseries_ids=ts_ids,
+                )
+            )
+            expected_counts_source = "source_file_timeseries_counts"
+            expected_counts_scope_valid = bool(expected_timeseries_row_counts) and bool(
+                expected_pollutant_codes
+            )
+        expected_min_manifest_rows = sum(expected_timeseries_row_counts.values())
+        if not sos_scope:
+            expected_min_manifest_rows = max(
+                expected_min_manifest_rows,
+                repaired_observation_rows,
+            )
         source_pending = wrapper_ok and (
             pending_events > 0
             or str(backfill_run_status or "").strip() == "stubbed"
@@ -13332,10 +13362,19 @@ def run_v2_gap_backfills(
         manifest_guard_ok = True
         manifest_guard_reason: str | None = None
         manifest_guard_details: dict[str, Any] = {}
+        if repaired_observation_rows > 0 and not expected_counts_scope_valid:
+            manifest_guard_ok = False
+            manifest_guard_reason = "authoritative_source_counts_unavailable"
+            manifest_guard_details = {
+                "expected_counts_source": expected_counts_source,
+                "source_rows_from_counts": source_rows_from_counts,
+                "source_pollutant_codes": source_pollutant_codes,
+            }
         should_verify_manifest = (
             wrapper_ok
             and not source_pending
             and failed_events <= 0
+            and repaired_observation_rows > 0
             and manifest_guard_ok
             and process_guard_ok
         )
@@ -13361,11 +13400,12 @@ def run_v2_gap_backfills(
                 expected_min_manifest_rows,
                 repaired_observation_rows,
             )
-        repair_ok = (
+        repair_ok = no_observation_rows or (
             wrapper_ok
             and not source_pending
             and failed_events <= 0
-            and complete_events == 1
+            and repaired_observation_rows > 0
+            and expected_counts_scope_valid
             and process_guard_ok
             and manifest_guard_ok
         )
@@ -13373,7 +13413,9 @@ def run_v2_gap_backfills(
             repair_status = "source_pending"
         elif repair_ok:
             repair_status = "ok"
-        elif wrapper_ok and (
+        elif no_observation_rows:
+            repair_status = "ok"
+        elif wrapper_ok and repaired_observation_rows > 0 and (
             not process_guard_ok
             or not manifest_guard_ok
         ):
@@ -13381,31 +13423,14 @@ def run_v2_gap_backfills(
         else:
             repair_status = "failed"
         validated_overlay_keys: list[str] = []
-        source_evidence: dict[str, Any] = {}
         if repair_ok and run_state is not None:
             try:
                 validated_overlay_keys = _capture_local_v2_observation_scope(
                     run_state=run_state,
                     day_utc=day_iso,
                     connector_id=connector_id,
+                    expected_timeseries_row_counts=expected_timeseries_row_counts,
                 )
-                evidence_path = (
-                    Path(str(run_state["overlay_root"])) /
-                    f"day_utc={day_iso}" / f"connector_id={connector_id}" /
-                    "source-evidence.json"
-                )
-                source_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-                expected_timeseries_row_counts = _normalize_timeseries_row_counts(
-                    source_evidence.get("per_timeseries_counts")
-                )
-                expected_pollutant_codes = [
-                    str(value) for value in list(source_evidence.get("pollutant_set") or [])
-                ]
-                expected_min_manifest_rows = int(source_evidence.get("total_rows") or 0)
-                manifest_guard_details["source_evidence_path"] = str(evidence_path)
-                manifest_guard_details["source_evidence_sha256"] = hashlib.sha256(
-                    evidence_path.read_bytes()
-                ).hexdigest()
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 repair_ok = False
                 repair_status = "guard_failed"
@@ -13471,13 +13496,11 @@ def run_v2_gap_backfills(
             "source_acquisition_pending_days": pending_days,
             "timeseries_ids": ts_ids,
             "timeseries_id_count": len(ts_ids),
-            "complete_source_timeseries_ids": sorted(expected_timeseries_row_counts),
             "chunk_count": len(chunks),
             "attempted_chunks": len(chunk_results),
             "ok_chunks": sum(1 for r in chunk_results if r.get("status") == "ok"),
             "failed_chunks": sum(1 for r in chunk_results if r.get("status") != "ok"),
             "source_cache": source_cache_status,
-            "complete_source_evidence": source_evidence,
             "validated_overlay_object_keys": validated_overlay_keys,
             "chunks": [
                 {
@@ -13539,15 +13562,14 @@ def run_v2_gap_backfills(
                 record_changed_scope(run_state, "OBSERVS_CHANGED", {
                     "day_utc": day_iso,
                     "connector_id": connector_id,
-                    "timeseries_ids": sorted(expected_timeseries_row_counts),
-                    "targeted_mismatch_timeseries_ids": ts_ids,
+                    "timeseries_ids": ts_ids,
                     "pollutant_codes": proposal_pollutants,
                     "affected_pollutant_codes": affected_pollutants,
                     "object_keys": validated_overlay_keys,
                     "stage": "observs",
                 })
             if queue_aqi_from_observation_repairs:
-                action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=sorted(expected_timeseries_row_counts), queue_note="queued_from_complete_source_connector_day_repair", log=log, history_version="v2")
+                action = _queue_aqi_rebuild_from_obs_repair(conn=conn, run_id=run_id, env_name=env_name, connector_id=connector_id, day_utc=day_iso, requested_timeseries_ids=ts_ids, queue_note="queued_from_v2_observation_repair", log=log, history_version="v2")
                 if action in {"inserted", "merged"}:
                     queued.add((day_iso, connector_id))
                 metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=obs_repaired history_version=v2")
@@ -13621,7 +13643,6 @@ def run_aqi_rebuild_queue_execution(
         "aqi_rebuilds_queued_total": 0,
         "aqi_rebuilds_attempted": 0,
         "aqi_rebuilds_complete": 0,
-        "aqi_rebuilds_proposal_validated": 0,
         "aqi_rebuilds_failed": 0,
         "aqi_rebuilds_skipped": 0,
         "aqi_post_rebuild_validation_failed": 0,
@@ -13886,31 +13907,22 @@ def run_aqi_rebuild_queue_execution(
             )
 
         if bf.get("status") == "ok" and not post_validation_gaps:
-            success_status = "proposal_validated" if execute_local_proposal else "complete"
-            if execute_local_proposal:
-                metrics["aqi_rebuilds_proposal_validated"] += 1
-            else:
-                metrics["aqi_rebuilds_complete"] += 1
+            metrics["aqi_rebuilds_complete"] += 1
             conn.execute(
                 """
                 UPDATE aqi_rebuild_queue
-                SET status = ?,
+                SET status = 'complete',
                     finished_at_utc = ?,
                     notes = ?
                 WHERE id = ?
                 """,
                 (
-                    success_status,
                     finished_iso,
-                    _merge_notes(
-                        primary_row[6],
-                        "aqi_proposal_validated_locally" if execute_local_proposal
-                        else "aqi_rebuild_complete",
-                    ),
+                    _merge_notes(primary_row[6], "aqi_rebuild_complete"),
                     primary_row_id,
                 ),
             )
-            final_status = success_status
+            final_status = "complete"
             error_text = None
         else:
             metrics["aqi_rebuilds_failed"] += 1
@@ -14065,7 +14077,6 @@ def stage_overlay_object(
     source_path: str | Path,
     stage: str,
     dependencies: Iterable[str] = (),
-    dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Path:
     normalized_key = _normalise_overlay_object_key(object_key)
     source = Path(source_path)
@@ -14085,44 +14096,13 @@ def stage_overlay_object(
     objects = run_state["objects"]
     if not isinstance(objects, dict):
         raise ValueError("overlay run state has no objects mapping")
-    normalized_dependencies = sorted({
-        _normalise_overlay_object_key(value) for value in dependencies
-    })
-    supplied_identities = dependency_identities or {}
-    normalized_identities: dict[str, dict[str, Any]] = {}
-    for dependency in normalized_dependencies:
-        identity = supplied_identities.get(dependency)
-        if not isinstance(identity, Mapping):
-            raise ValueError(
-                f"overlay dependency identity is unavailable: {normalized_key} -> {dependency}"
-            )
-        sha256 = str(identity.get("sha256") or "").strip().lower()
-        try:
-            byte_count = int(identity.get("bytes"))
-        except (TypeError, ValueError):
-            byte_count = -1
-        source_kind = str(identity.get("source") or "").strip()
-        if (
-            not re.fullmatch(r"[a-f0-9]{64}", sha256)
-            or byte_count < 0
-            or source_kind not in {"planned_overlay", "overlay", "dropbox"}
-        ):
-            raise ValueError(
-                f"overlay dependency identity is invalid: {normalized_key} -> {dependency}"
-            )
-        normalized_identities[dependency] = {
-            "sha256": sha256,
-            "bytes": byte_count,
-            "source": source_kind,
-        }
     objects[normalized_key] = {
         "object_key": normalized_key,
         "local_path": str(target),
         "sha256": hashlib.sha256(payload).hexdigest(),
         "bytes": len(payload),
         "stage": stage,
-        "dependencies": normalized_dependencies,
-        "dependency_identities": normalized_identities,
+        "dependencies": sorted({_normalise_overlay_object_key(value) for value in dependencies}),
         "proposed": True,
         "built": True,
         "structurally_validated": False,
@@ -14507,11 +14487,6 @@ def _record_metadata_executor_overlay(
             stage_overlay_object(
                 run_state, object_key=object_key, source_path=source, stage=stage,
                 dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
-                dependency_identities=(
-                    proposal.get("dependency_identities")
-                    if isinstance(proposal.get("dependency_identities"), Mapping)
-                    else None
-                ),
             )
         mark_overlay_structurally_validated(run_state, object_key)
         scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
@@ -14527,9 +14502,9 @@ def _capture_local_v2_observation_scope(
     run_state: dict[str, Any],
     day_utc: str,
     connector_id: int,
+    expected_timeseries_row_counts: Mapping[int, int],
 ) -> list[str]:
-    """Prove source/Parquet equality, then stage one connector-day proposal."""
-    stage_root = Path(str(run_state["overlay_root"]))
+    """Validate and stage one complete canonical connector-day proposal."""
     generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
     connector_prefix = (
         f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
@@ -14548,157 +14523,26 @@ def _capture_local_v2_observation_scope(
         or int(manifest.get("connector_id") or 0) != int(connector_id)
     ):
         raise ValueError("canonical connector manifest identity is invalid")
-    evidence_path = (
-        stage_root / f"day_utc={day_utc}" /
-        f"connector_id={int(connector_id)}" / "source-evidence.json"
-    )
-    source_rows_path = evidence_path.with_name("obs_history_rows.json")
-    if not evidence_path.is_file() or not source_rows_path.is_file():
-        raise FileNotFoundError("complete connector-day source evidence is unavailable")
-    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    source_rows_body = source_rows_path.read_bytes()
-    source_rows = json.loads(source_rows_body)
-    if (
-        not isinstance(evidence, Mapping)
-        or evidence.get("schema_version") != 1
-        or evidence.get("contract") != "complete_authoritative_connector_day_source_rows"
-        or evidence.get("enumeration_complete") is not True
-        or str(evidence.get("day_utc") or "") != day_utc
-        or int(evidence.get("connector_id") or 0) != int(connector_id)
-        or not isinstance(source_rows, list)
-    ):
-        raise ValueError("complete connector-day source evidence identity is invalid")
-    if (
-        hashlib.sha256(source_rows_body).hexdigest()
-        != str(evidence.get("canonical_rows_sha256") or "")
-        or len(source_rows_body) != int(evidence.get("canonical_rows_bytes") or -1)
-        or len(source_rows) != int(evidence.get("total_rows") or 0)
-    ):
-        raise ValueError("complete connector-day source row evidence identity changed")
-    files_required = {str(value) for value in list(evidence.get("files_required") or [])}
-    files_read = {str(value) for value in list(evidence.get("files_read") or [])}
-    files_absent = {
-        str(value) for value in list(evidence.get("files_authoritatively_absent") or [])
+    expected_counts = {
+        int(timeseries_id): int(row_count)
+        for timeseries_id, row_count in expected_timeseries_row_counts.items()
+        if int(timeseries_id) > 0 and int(row_count) > 0
     }
-    if files_required != files_read | files_absent or files_read & files_absent:
-        raise ValueError("complete connector-day required source files were not all read or authoritatively absent")
-    if (
-        int(evidence.get("blocked_row_count") or 0) != 0
-        or int(evidence.get("inactive_identity_rows_skipped") or 0) != 0
-    ):
-        raise ValueError("complete connector-day source evidence contains blocked or inactive-skipped rows")
-
-    def canonical_row_identity(row: Mapping[str, Any], *, source: str) -> tuple[Any, ...]:
-        try:
-            row_connector_id = int(row.get("connector_id", connector_id))
-            station_id = int(row.get("station_id"))
-            timeseries_id = int(row.get("timeseries_id"))
-            pollutant_code = str(row.get("pollutant_code") or "").strip().lower()
-            timestamp = row.get("observed_at")
-            parsed_timestamp = _parse_required_timestamp_value(timestamp)
-            value = float(row.get("value"))
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"invalid {source} observation identity: {row!r}") from exc
-        if (
-            row_connector_id != int(connector_id)
-            or station_id <= 0
-            or timeseries_id <= 0
-            or not re.fullmatch(r"[a-z0-9_]+", pollutant_code)
-            or parsed_timestamp is None
-            or parsed_timestamp.date().isoformat() != day_utc
-            or not math.isfinite(value)
-        ):
-            raise ValueError(f"invalid {source} observation identity: {row!r}")
-        timestamp_micros = int(parsed_timestamp.timestamp() * 1_000_000)
-        value_identity = struct.pack(">d", value).hex()
-        status_value = row.get("status")
-        status = None if status_value is None else str(status_value)
-        return (
-            row_connector_id,
-            station_id,
-            timeseries_id,
-            pollutant_code,
-            timestamp_micros,
-            value_identity,
-            status,
-        )
-
-    source_identities = Counter(
-        canonical_row_identity(row, source="source")
-        for row in source_rows
-        if isinstance(row, Mapping)
-    )
-    if sum(source_identities.values()) != len(source_rows):
-        raise ValueError("source evidence contains a non-object observation row")
-
-    parquet_paths = sorted(source_root.glob("pollutant_code=*/part-*.parquet"))
-    if importlib.util.find_spec("duckdb") is None:
-        raise RuntimeError("duckdb is required for exact connector-day Parquet read-back")
-    import duckdb  # type: ignore[import-not-found]
-
-    parquet_rows: list[tuple[Any, ...]] = []
-    if parquet_paths:
-        connection = duckdb.connect(database=":memory:")
-        try:
-            result_rows = connection.execute(
-                """
-                SELECT connector_id, station_id, timeseries_id, pollutant_code,
-                       observed_at_utc AS observed_at, "value", status
-                FROM read_parquet(?, union_by_name=true)
-                """,
-                [[str(path) for path in parquet_paths]],
-            ).fetchall()
-        finally:
-            connection.close()
-        parquet_rows = [
-            (
-                row[0], row[1], row[2], row[3], row[4], row[5], row[6],
-            )
-            for row in result_rows
-        ]
-    parquet_identities = Counter(
-        canonical_row_identity({
-            "connector_id": row[0],
-            "station_id": row[1],
-            "timeseries_id": row[2],
-            "pollutant_code": row[3],
-            "observed_at": row[4],
-            "value": row[5],
-            "status": row[6],
-        }, source="Parquet")
-        for row in parquet_rows
-    )
-    if source_identities != parquet_identities:
-        missing = list((source_identities - parquet_identities).items())[:10]
-        surplus = list((parquet_identities - source_identities).items())[:10]
+    actual_counts = _normalize_timeseries_row_counts(manifest.get("timeseries_row_counts"))
+    all_count_ids = sorted(set(expected_counts) | set(actual_counts))
+    count_mismatches = {
+        timeseries_id: {
+            "expected": int(expected_counts.get(timeseries_id, 0)),
+            "actual": int(actual_counts.get(timeseries_id, 0)),
+        }
+        for timeseries_id in all_count_ids
+        if int(actual_counts.get(timeseries_id, 0)) != int(expected_counts.get(timeseries_id, 0))
+    }
+    if count_mismatches:
         raise ValueError(
-            "canonical connector Parquet rows do not exactly match authoritative source rows: "
-            f"missing={missing!r} surplus={surplus!r}"
+            "canonical connector proposal row counts do not match authoritative source: "
+            f"{dict(list(count_mismatches.items())[:25])}"
         )
-
-    expected_counts = _normalize_timeseries_row_counts(
-        evidence.get("per_timeseries_counts")
-    )
-    expected_pollutant_counts = {
-        str(code): int(count)
-        for code, count in dict(evidence.get("per_pollutant_counts") or {}).items()
-    }
-    manifest_pollutant_counts = {
-        str(child.get("pollutant_code") or ""): int(child.get("source_row_count") or 0)
-        for child in list(manifest.get("child_manifests") or [])
-        if isinstance(child, Mapping)
-    }
-    if (
-        _normalize_timeseries_row_counts(manifest.get("timeseries_row_counts"))
-        != expected_counts
-        or int(manifest.get("source_row_count") or 0) != len(source_rows)
-        or manifest_pollutant_counts != expected_pollutant_counts
-        or sorted(str(value) for value in list(manifest.get("pollutant_codes") or []))
-        != sorted(expected_pollutant_counts)
-        or sorted(str(value) for value in list(evidence.get("pollutant_set") or []))
-        != sorted(expected_pollutant_counts)
-    ):
-        raise ValueError("canonical connector manifest does not match source-derived evidence")
     object_paths = sorted(path for path in source_root.rglob("*") if path.is_file())
     if not object_paths:
         raise ValueError("canonical connector proposal has no objects")
@@ -15849,7 +15693,7 @@ def run_v2_integrity_repair_flow(
     rebuilt_aqi_scopes: set[tuple[str, int]] = set()
     aqi_capture_failures = 0
     for entry in list(aqi_result.get("aqi_rebuild_results") or []):
-            if not isinstance(entry, Mapping) or str(entry.get("status") or "") != "proposal_validated":
+            if not isinstance(entry, Mapping) or str(entry.get("status") or "") != "complete":
                 continue
             day_utc = str(entry.get("day_utc") or "").strip()
             try:
@@ -15978,35 +15822,6 @@ def run_v2_integrity_repair_flow(
     else:
         apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
         record_integrity_object_operations(conn, run_id=run_id, run_state=run_state)
-        if apply_result.get("status") == "succeeded":
-            completed_at = fmt_iso(utc_now())
-            validated_count = 0
-            for entry in list(aqi_result.get("aqi_rebuild_results") or []):
-                if not isinstance(entry, dict) or entry.get("status") != "proposal_validated":
-                    continue
-                entry["status"] = "complete"
-                entry["remote_get_verified"] = True
-                for queue_row_id in list(entry.get("queue_row_ids") or []):
-                    conn.execute(
-                        """
-                        UPDATE aqi_rebuild_queue
-                        SET status = 'complete', finished_at_utc = ?,
-                            notes = COALESCE(notes, '') || ?
-                        WHERE id = ? AND status = 'proposal_validated'
-                        """,
-                        (completed_at, "; canonical_apply_get_verified", int(queue_row_id)),
-                    )
-                validated_count += 1
-            if validated_count:
-                aqi_result["aqi_rebuilds_complete"] = (
-                    int(aqi_result.get("aqi_rebuilds_complete") or 0) + validated_count
-                )
-                aqi_result["aqi_rebuilds_proposal_validated"] = max(
-                    0,
-                    int(aqi_result.get("aqi_rebuilds_proposal_validated") or 0)
-                    - validated_count,
-                )
-                conn.commit()
 
     if proposal_failed or apply_result.get("status") == "failed":
         final_verification: dict[str, Any] = {
@@ -18086,7 +17901,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Not-found cooldown secs: {sos.get('not_found_cooldown_seconds', 0)}",
             f"- Cross-check discrepancies: {cc_for_sos.get('discrepancy_total', 0)}",
             f"- Observation repairs: attempted={cc_for_sos.get('observation_backfills_attempted', cc_for_sos.get('backfills_attempted', 0))} ok={cc_for_sos.get('observation_backfills_ok', cc_for_sos.get('backfills_ok', 0))} failed={cc_for_sos.get('observation_backfills_failed', cc_for_sos.get('backfills_failed', 0))}",
-            f"- AQI rebuilds: queued={cc_for_sos.get('aqi_rebuilds_queued_total', 0)} proposal_validated={cc_for_sos.get('aqi_rebuilds_proposal_validated', 0)} complete={cc_for_sos.get('aqi_rebuilds_complete', 0)} failed={cc_for_sos.get('aqi_rebuilds_failed', 0)}",
+            f"- AQI rebuilds: queued={cc_for_sos.get('aqi_rebuilds_queued_total', 0)} complete={cc_for_sos.get('aqi_rebuilds_complete', 0)} failed={cc_for_sos.get('aqi_rebuilds_failed', 0)}",
             f"- Stopped for:    {sos.get('stopped_for') or '(none)'}",
             f"- Backfills:      attempted={sos.get('backfills_attempted', 0)} ok={sos.get('backfills_ok', 0)} failed={sos.get('backfills_failed', 0)}",
         ])
@@ -18309,7 +18124,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- AQI rebuild queued total:          {cc.get('aqi_rebuilds_queued_total', 0)}",
             f"- AQI rebuild attempted:             {cc.get('aqi_rebuilds_attempted', 0)}",
             f"- AQI rebuild complete:              {cc.get('aqi_rebuilds_complete', 0)}",
-            f"- AQI proposals validated locally:  {cc.get('aqi_rebuilds_proposal_validated', 0)}",
             f"- AQI rebuild failed:                {cc.get('aqi_rebuilds_failed', 0)}",
             f"- AQI rebuild skipped:               {cc.get('aqi_rebuilds_skipped', 0)}",
             f"- AQI rebuild ran:                   {bool(cc.get('aqi_rebuild_ran'))}",
