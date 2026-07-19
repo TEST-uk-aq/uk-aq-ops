@@ -173,6 +173,8 @@ type SourceObservationRow = {
   source_parameter?: string | null;
 };
 
+const INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT = 10;
+
 type SosDatapoint = {
   observed_at: string;
   value: number | null;
@@ -8411,6 +8413,12 @@ async function fetchSensorcommunityArchiveFileNames(
     }
     files.add(fileName);
   }
+  if (files.size === 0) {
+    throw new Error(
+      "sensorcommunity_archive_index_fetch_failed: " +
+        `unrecognised_http_200_index_response day_utc=${dayUtc} index_url=${indexUrl}`,
+    );
+  }
   return {
     file_names: Array.from(files).sort((left, right) =>
       left.localeCompare(right)
@@ -8817,6 +8825,8 @@ export type UkAirFlatFileParseResult = {
   mapped_records: number;
   skipped_other_days: number;
   skipped_invalid_rows: number;
+  blocked_target_day_rows: number;
+  blocked_target_day_row_samples: Record<string, unknown>[];
   skipped_ignored_properties: number;
   units: string[];
 };
@@ -8848,6 +8858,8 @@ export function parseUkAirFlatFileObservations(args: {
     mapped_records: 0,
     skipped_other_days: 0,
     skipped_invalid_rows: 0,
+    blocked_target_day_rows: 0,
+    blocked_target_day_row_samples: [],
     skipped_ignored_properties: 0,
     units: [],
   };
@@ -8869,7 +8881,7 @@ export function parseUkAirFlatFileObservations(args: {
   };
   let columnBindings: ColumnBinding[] = [];
 
-  for (const line of lines) {
+  for (const [lineIndex, line] of lines.entries()) {
     if (!line.trim()) continue;
     const cells = parseCsvRow(line, ",").map((cell) => cell.trim());
     if (
@@ -8929,7 +8941,23 @@ export function parseUkAirFlatFileObservations(args: {
     if (!columnBindings.length) continue;
 
     const sourceDay = parseUkAirCsvDay(cells[0] || "");
-    if (!sourceDay) continue;
+    if (!sourceDay) {
+      result.skipped_invalid_rows += 1;
+      result.blocked_target_day_rows += 1;
+      if (
+        result.blocked_target_day_row_samples.length <
+          INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
+      ) {
+        result.blocked_target_day_row_samples.push({
+          reason: "unparseable_observation_date",
+          site_ref: args.siteRef,
+          line_number: lineIndex + 1,
+          date: String(cells[0] || "").trim(),
+          time: String(cells[1] || "").trim(),
+        });
+      }
+      continue;
+    }
     result.source_records += 1;
     if (sourceDay !== args.dayUtc) {
       result.skipped_other_days += 1;
@@ -8938,6 +8966,19 @@ export function parseUkAirFlatFileObservations(args: {
     const observedAt = parseUkAirGmtHourEnding(sourceDay, cells[1] || "");
     if (!observedAt) {
       result.skipped_invalid_rows += 1;
+      result.blocked_target_day_rows += 1;
+      if (
+        result.blocked_target_day_row_samples.length <
+          INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
+      ) {
+        result.blocked_target_day_row_samples.push({
+          reason: "invalid_gmt_hour_ending",
+          site_ref: args.siteRef,
+          line_number: lineIndex + 1,
+          date: String(cells[0] || "").trim(),
+          time: String(cells[1] || "").trim(),
+        });
+      }
       continue;
     }
     for (const binding of columnBindings) {
@@ -9182,6 +9223,98 @@ function dedupeSourceObservationRows(
   rows: SourceObservationRow[],
 ): SourceObservationRow[] {
   return dedupeSourceObservationRowsCore(rows) as SourceObservationRow[];
+}
+
+type IntegrityDuplicateSourceEvidence = {
+  duplicate_canonical_row_count: number;
+  duplicate_canonical_row_identity_samples: Record<string, unknown>[];
+  uncanonicalisable_source_row_count: number;
+  blocked_row_samples: Record<string, unknown>[];
+};
+
+function inspectIntegritySourceRowsForBlockingEvidence(
+  rows: SourceObservationRow[],
+  connectorId: number,
+): IntegrityDuplicateSourceEvidence {
+  const occurrencesByCanonicalKey = new Map<
+    string,
+    { count: number; identities: Record<string, unknown>[] }
+  >();
+  const blockedRowSamples: Record<string, unknown>[] = [];
+  const duplicateCanonicalRowIdentitySamples: Record<string, unknown>[] = [];
+  let uncanonicalisableSourceRowCount = 0;
+
+  for (const row of rows) {
+    const canonicalRows = dedupeSourceObservationRows([row]);
+    if (canonicalRows.length !== 1) {
+      uncanonicalisableSourceRowCount += 1;
+      if (blockedRowSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) {
+        blockedRowSamples.push({
+          reason: "source_row_failed_existing_canonical_normalisation",
+          row: {
+            connector_id: connectorId,
+            timeseries_id: row.timeseries_id,
+            station_id: row.station_id,
+            pollutant_code: row.pollutant_code,
+            observed_at: row.observed_at,
+            value: row.value,
+            status: row.status ?? null,
+          },
+        });
+      }
+      continue;
+    }
+    const canonical = canonicalRows[0];
+    const canonicalKey = `${canonical.timeseries_id}|${canonical.observed_at}`;
+    const occurrence = occurrencesByCanonicalKey.get(canonicalKey) || {
+      count: 0,
+      identities: [],
+    };
+    occurrence.count += 1;
+    if (occurrence.identities.length < 2) {
+      occurrence.identities.push({
+        connector_id: connectorId,
+        station_id: canonical.station_id,
+        timeseries_id: canonical.timeseries_id,
+        pollutant_code: canonical.pollutant_code,
+        observed_at: canonical.observed_at,
+        value: canonical.value,
+        status: canonical.status ?? null,
+      });
+    }
+    occurrencesByCanonicalKey.set(canonicalKey, occurrence);
+  }
+
+  let duplicateCanonicalRowCount = 0;
+  for (const [canonicalKey, occurrence] of Array.from(
+    occurrencesByCanonicalKey.entries(),
+  ).sort(([left], [right]) => left.localeCompare(right))) {
+    if (occurrence.count <= 1) continue;
+    duplicateCanonicalRowCount += occurrence.count - 1;
+    const duplicateSample = {
+      reason: "duplicate_canonical_source_row",
+      canonical_key: canonicalKey,
+      duplicate_row_count: occurrence.count - 1,
+      identities: occurrence.identities,
+    };
+    if (
+      duplicateCanonicalRowIdentitySamples.length <
+        INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
+    ) {
+      duplicateCanonicalRowIdentitySamples.push(duplicateSample);
+    }
+    if (blockedRowSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) {
+      blockedRowSamples.push(duplicateSample);
+    }
+  }
+
+  return {
+    duplicate_canonical_row_count: duplicateCanonicalRowCount,
+    duplicate_canonical_row_identity_samples:
+      duplicateCanonicalRowIdentitySamples,
+    uncanonicalisable_source_row_count: uncanonicalisableSourceRowCount,
+    blocked_row_samples: blockedRowSamples,
+  };
 }
 
 function sourceObservationsToObsHistoryRows(
@@ -13636,6 +13769,8 @@ async function runSourceToAll(
           let flatFileSourceRecords = 0;
           let flatFileSkippedOtherDays = 0;
           let flatFileSkippedInvalidRows = 0;
+          let flatFileBlockedTargetDayRows = 0;
+          const flatFileBlockedTargetDayRowSamples: Record<string, unknown>[] = [];
           const flatFileUnits = new Set<string>();
           for (const siteRef of flatFileSiteRefs) {
             const csvPath = ukAirFlatFilePath(
@@ -13660,6 +13795,16 @@ async function runSourceToAll(
             flatFileSourceRecords += parsed.source_records;
             flatFileSkippedOtherDays += parsed.skipped_other_days;
             flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
+            flatFileBlockedTargetDayRows += parsed.blocked_target_day_rows;
+            for (const sample of parsed.blocked_target_day_row_samples) {
+              if (
+                flatFileBlockedTargetDayRowSamples.length >=
+                  INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
+              ) {
+                break;
+              }
+              flatFileBlockedTargetDayRowSamples.push(sample);
+            }
             parsed.units.forEach((unit) => flatFileUnits.add(unit));
           }
           const flatRowsByTimeseries = new Map<number, SourceObservationRow[]>();
@@ -13799,6 +13944,12 @@ async function runSourceToAll(
           sourceCheckpointJson.total_skipped_outside_day =
             totalSkippedOutsideDay;
           sourceCheckpointJson.total_skipped_null_value = totalSkippedNullValue;
+          sourceCheckpointJson.total_skipped_invalid_rows =
+            flatFileSkippedInvalidRows;
+          sourceCheckpointJson.source_adapter_blocked_row_count =
+            flatFileBlockedTargetDayRows;
+          sourceCheckpointJson.source_adapter_blocked_row_samples =
+            flatFileBlockedTargetDayRowSamples;
           sourceEnumerationComplete = true;
         } else {
           throw new Error(
@@ -13809,6 +13960,17 @@ async function runSourceToAll(
         const dedupedObservationRows = dedupeSourceObservationRows(
           observationRowsRaw,
         );
+        const duplicateSourceEvidence = INTEGRITY_COMPLETE_CONNECTOR_DAY
+          ? inspectIntegritySourceRowsForBlockingEvidence(
+            observationRowsRaw,
+            connectorId,
+          )
+          : {
+            duplicate_canonical_row_count: 0,
+            duplicate_canonical_row_identity_samples: [],
+            uncanonicalisable_source_row_count: 0,
+            blocked_row_samples: [],
+          };
         rowsRead += dedupedObservationRows.length;
 
         let obsHistoryRows = sourceObservationsToObsHistoryRows(
@@ -13853,6 +14015,26 @@ async function runSourceToAll(
           const skippedRowCount = Object.entries(sourceCheckpointJson)
             .filter(([key, value]) => key.startsWith("total_skipped_") && Number.isFinite(Number(value)))
             .reduce((total, [, value]) => total + Number(value), 0);
+          const sourceAdapterBlockedRowCount = Number(
+            sourceCheckpointJson.source_adapter_blocked_row_count || 0,
+          );
+          const sourceAdapterBlockedRowSamples = Array.isArray(
+            sourceCheckpointJson.source_adapter_blocked_row_samples,
+          )
+            ? sourceCheckpointJson.source_adapter_blocked_row_samples.filter(
+              (sample): sample is Record<string, unknown> =>
+                Boolean(sample) && typeof sample === "object" && !Array.isArray(sample),
+            )
+            : [];
+          const blockedRowCount =
+            duplicateSourceEvidence.duplicate_canonical_row_count +
+            duplicateSourceEvidence.uncanonicalisable_source_row_count +
+            sourceAdapterBlockedRowCount;
+          const blockedRowSamples = [
+            ...duplicateSourceEvidence.duplicate_canonical_row_identity_samples,
+            ...duplicateSourceEvidence.blocked_row_samples,
+            ...sourceAdapterBlockedRowSamples,
+          ].slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT);
           writeIntegrityProposalStageJson(evidencePath, {
             schema_version: 1,
             contract: "complete_authoritative_connector_day_source_rows",
@@ -13880,13 +14062,29 @@ async function runSourceToAll(
             source_rows_before_canonical_dedupe: observationRowsRaw.length,
             duplicate_rows_removed_by_canonical_normalisation:
               observationRowsRaw.length - dedupedObservationRows.length,
-            blocked_row_count: 0,
+            duplicate_canonical_row_count:
+              duplicateSourceEvidence.duplicate_canonical_row_count,
+            duplicate_canonical_row_identity_samples:
+              duplicateSourceEvidence.duplicate_canonical_row_identity_samples,
+            uncanonicalisable_source_row_count:
+              duplicateSourceEvidence.uncanonicalisable_source_row_count,
+            source_adapter_blocked_row_count: sourceAdapterBlockedRowCount,
+            source_adapter_blocked_row_samples: sourceAdapterBlockedRowSamples,
+            blocked_row_count: blockedRowCount,
+            blocked_row_samples: blockedRowSamples,
             skipped_row_count: skippedRowCount,
             inactive_identity_rows_skipped: 0,
           });
           sourceCheckpointJson.complete_connector_day = true;
           sourceCheckpointJson.source_evidence_path = evidencePath;
           sourceCheckpointJson.source_evidence_rows_sha256 = sha256Hex(rowsJson);
+          if (blockedRowCount > 0) {
+            throw new Error(
+              "complete_connector_day_source_evidence_blocked " +
+                `connector_id=${connectorId} day_utc=${dayUtc} ` +
+                `blocked_row_count=${blockedRowCount}`,
+            );
+          }
         }
 
         if (
