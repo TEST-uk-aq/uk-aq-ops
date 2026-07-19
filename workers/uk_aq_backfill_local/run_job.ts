@@ -1173,6 +1173,10 @@ const INTEGRITY_COMPLETE_CONNECTOR_DAY = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY"),
   false,
 );
+const INTEGRITY_SOURCE_EVIDENCE_ONLY = parseBooleanish(
+  Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
+  false,
+);
 const IS_LOCAL_RUN = !optionalEnv("K_SERVICE") && !optionalEnv("K_REVISION");
 
 function nowIso(): string {
@@ -8436,7 +8440,15 @@ function sourceMirrorFilePath(dayUtc: string, fileName: string): string | null {
   if (!root) {
     return null;
   }
-  return path.join(root, `day_utc=${dayUtc}`, fileName);
+  const candidates = [
+    path.join(root, `day_utc=${dayUtc}`, fileName),
+    // Integrity acquisition stores Sensor.Community files under the plain
+    // UTC day directory. Keep the v2-shaped path first for established
+    // backfill mirrors, but never require an archive fetch when this cache
+    // already contains the authoritative file.
+    path.join(root, dayUtc, fileName),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
 }
 
 async function fetchSensorcommunityArchiveCsv(
@@ -8446,6 +8458,11 @@ async function fetchSensorcommunityArchiveCsv(
   const mirrorPath = sourceMirrorFilePath(dayUtc, fileName);
   if (mirrorPath && fs.existsSync(mirrorPath)) {
     return fs.readFileSync(mirrorPath, "utf8");
+  }
+  if (INTEGRITY_COMPLETE_CONNECTOR_DAY) {
+    throw new Error(
+      `sensorcommunity_complete_connector_day_cache_missing: ${fileName}`,
+    );
   }
 
   const fileUrl = `${SCOMM_ARCHIVE_BASE_URL}/${dayUtc}/${fileName}`;
@@ -12950,6 +12967,32 @@ async function runSourceToAll(
         const sourceFilesRequired: string[] = [];
         const sourceFilesRead: string[] = [];
         const sourceFilesAuthoritativelyAbsent: string[] = [];
+        const sourceFileIdentities = new Map<string, {
+          source_file: string;
+          sha256: string;
+          bytes: number;
+        }>();
+        const recordSourceFileRead = (sourceFile: string, content: string) => {
+          const sourceFileKey = String(sourceFile || "").trim();
+          if (!sourceFileKey) {
+            throw new Error("complete_connector_day_source_file_identity_missing");
+          }
+          const identity = {
+            source_file: sourceFileKey,
+            sha256: sha256Hex(content),
+            bytes: Buffer.byteLength(content, "utf8"),
+          };
+          const prior = sourceFileIdentities.get(sourceFileKey);
+          if (
+            prior &&
+            (prior.sha256 !== identity.sha256 || prior.bytes !== identity.bytes)
+          ) {
+            throw new Error(
+              `complete_connector_day_source_file_content_changed file=${sourceFileKey}`,
+            );
+          }
+          sourceFileIdentities.set(sourceFileKey, identity);
+        };
         let sourceEnumerationComplete = false;
         let openaqFetchErrorCount = 0;
         let candidateSourceUnits = 0;
@@ -13279,7 +13322,9 @@ async function runSourceToAll(
               dayUtc,
               fileName,
             );
-            sourceFilesRead.push(`${archiveIndexResult.index_url}#${fileName}`);
+            const sourceFileIdentity = `${archiveIndexResult.index_url}#${fileName}`;
+            sourceFilesRead.push(sourceFileIdentity);
+            recordSourceFileRead(sourceFileIdentity, csvText);
             const parsed = parseSensorcommunityCsvObservations({
               dayUtc,
               csvText,
@@ -13499,6 +13544,7 @@ async function runSourceToAll(
 
             locationFilesFound += 1;
             sourceFilesRead.push(sourceFile.archive_key);
+            recordSourceFileRead(sourceFile.archive_key, sourceFile.csv_text);
             if (sourceFile.mirror_reused) {
               locationFilesMirrorReused += 1;
             }
@@ -13824,11 +13870,13 @@ async function runSourceToAll(
             if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
               throw new Error(`UK-AIR annual CSV cache is missing or empty: ${csvPath}`);
             }
+            const csvText = fs.readFileSync(csvPath, "utf8");
             sourceFilesRead.push(csvPath);
+            recordSourceFileRead(csvPath, csvText);
             const parsed = parseUkAirFlatFileObservations({
               dayUtc,
               siteRef,
-              csvText: fs.readFileSync(csvPath, "utf8"),
+              csvText,
               mappings: validFlatFileMappings,
               propertyMappings: observedPropertyMappings,
             });
@@ -14076,6 +14124,14 @@ async function runSourceToAll(
             ...duplicateSourceEvidence.blocked_row_samples,
             ...sourceAdapterBlockedRowSamples,
           ].slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT);
+          const sourceFileIdentityList = Array.from(sourceFileIdentities.values())
+            .sort((left, right) => left.source_file.localeCompare(right.source_file));
+          if (sourceFileIdentityList.length !== new Set(sourceFilesRead).size) {
+            throw new Error(
+              "complete_connector_day_source_file_identity_count_mismatch",
+            );
+          }
+          const sourceFileIdentitiesJson = JSON.stringify(sourceFileIdentityList);
           writeIntegrityProposalStageJson(evidencePath, {
             schema_version: 1,
             contract: "complete_authoritative_connector_day_source_rows",
@@ -14089,6 +14145,8 @@ async function runSourceToAll(
             files_authoritatively_absent: Array.from(
               new Set(sourceFilesAuthoritativelyAbsent),
             ).sort(),
+            source_file_identities: sourceFileIdentityList,
+            source_file_identities_sha256: sha256Hex(sourceFileIdentitiesJson),
             canonical_rows_file: "obs_history_rows.json",
             canonical_rows_sha256: sha256Hex(rowsJson),
             canonical_rows_bytes: Buffer.byteLength(rowsJson, "utf8"),
@@ -14125,6 +14183,21 @@ async function runSourceToAll(
                 `connector_id=${connectorId} day_utc=${dayUtc} ` +
                 `blocked_row_count=${blockedRowCount}`,
             );
+          }
+          if (INTEGRITY_SOURCE_EVIDENCE_ONLY) {
+            connectorDayComplete += 1;
+            sourceProcessedDaySet.add(dayUtc);
+            logStructured("info", "source_to_r2_connector_day_complete", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: sourceAdapter,
+              source_evidence_only: true,
+              rows_observations: obsHistoryRows.length,
+              pollutant_codes_written: Object.keys(perPollutant).sort(),
+              objects_written_r2: 0,
+            });
+            continue;
           }
         }
 

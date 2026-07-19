@@ -326,6 +326,27 @@ CREATE INDEX IF NOT EXISTS idx_sftc_timeseries
 CREATE INDEX IF NOT EXISTS idx_sftc_day_timeseries
   ON source_file_timeseries_counts(day_utc, timeseries_id);
 
+-- Immutable canonical source evidence captured from the connector adapter
+-- after cache acquisition and before a destructive connector-day repair.
+CREATE TABLE IF NOT EXISTS source_connector_day_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  env_name TEXT NOT NULL,
+  day_utc TEXT NOT NULL,
+  connector_id INTEGER NOT NULL,
+  source_adapter TEXT NOT NULL,
+  source_file_identities_sha256 TEXT NOT NULL,
+  canonical_rows_sha256 TEXT NOT NULL,
+  canonical_rows_bytes INTEGER NOT NULL,
+  evidence_sha256 TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  canonical_rows_json TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  UNIQUE (env_name, day_utc, connector_id, source_file_identities_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_connector_day_evidence_lookup
+  ON source_connector_day_evidence(env_name, day_utc, connector_id, id DESC);
+
 -- Phase 6.5 Pass B: per-run source-vs-R2 comparison outcomes at
 -- (connector_id, day_utc, timeseries_id) granularity.
 CREATE TABLE IF NOT EXISTS cross_checks (
@@ -3979,6 +4000,12 @@ def run_narrow_backfill(
         ).strip():
             sub_env["UK_AQ_BACKFILL_SOS_FLAT_FILE_ROOT"] = str(
                 Path(integrity_cache_root) / "sos"
+            )
+        if not (
+            sub_env.get("UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT") or ""
+        ).strip():
+            sub_env["UK_AQ_BACKFILL_SCOMM_RAW_MIRROR_ROOT"] = str(
+                Path(integrity_cache_root) / "sensorcommunity"
             )
 
     started = time.monotonic()
@@ -13047,6 +13074,198 @@ def _v2_observations_index_rebuild_command(
     ]
 
 
+def _load_complete_connector_day_source_evidence(
+    *,
+    stage_root: Path,
+    day_utc: str,
+    connector_id: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read and independently validate a worker-produced canonical source set."""
+    source_dir = stage_root / f"day_utc={day_utc}" / f"connector_id={int(connector_id)}"
+    evidence_path = source_dir / "source-evidence.json"
+    rows_path = source_dir / "obs_history_rows.json"
+    if not evidence_path.is_file() or not rows_path.is_file():
+        raise FileNotFoundError("complete connector-day detector source evidence is unavailable")
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    rows_bytes = rows_path.read_bytes()
+    rows = json.loads(rows_bytes)
+    if not isinstance(evidence, dict) or not isinstance(rows, list):
+        raise ValueError("complete connector-day detector source evidence is invalid")
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("contract") != "complete_authoritative_connector_day_source_rows"
+        or evidence.get("enumeration_complete") is not True
+        or str(evidence.get("day_utc") or "") != day_utc
+        or int(evidence.get("connector_id") or 0) != int(connector_id)
+        or hashlib.sha256(rows_bytes).hexdigest() != str(evidence.get("canonical_rows_sha256") or "")
+        or len(rows_bytes) != int(evidence.get("canonical_rows_bytes") or -1)
+        or len(rows) != int(evidence.get("total_rows") or -1)
+        or int(evidence.get("blocked_row_count") or 0) != 0
+        or int(evidence.get("inactive_identity_rows_skipped") or 0) != 0
+    ):
+        raise ValueError("complete connector-day detector source evidence identity is invalid")
+    files_required = {str(value) for value in list(evidence.get("files_required") or [])}
+    files_read = {str(value) for value in list(evidence.get("files_read") or [])}
+    files_absent = {
+        str(value) for value in list(evidence.get("files_authoritatively_absent") or [])
+    }
+    if files_required != files_read | files_absent or files_read & files_absent:
+        raise ValueError("complete connector-day detector source files are incomplete")
+    identities = list(evidence.get("source_file_identities") or [])
+    if not all(isinstance(value, Mapping) for value in identities):
+        raise ValueError("complete connector-day detector source file identities are invalid")
+    normalized_identities: list[dict[str, Any]] = []
+    for value in identities:
+        source_file = str(value.get("source_file") or "").strip()
+        sha256 = str(value.get("sha256") or "").strip().lower()
+        try:
+            byte_count = int(value.get("bytes"))
+        except (TypeError, ValueError):
+            byte_count = -1
+        if not source_file or not re.fullmatch(r"[0-9a-f]{64}", sha256) or byte_count < 0:
+            raise ValueError("complete connector-day detector source file identity is invalid")
+        normalized_identities.append({
+            "source_file": source_file,
+            "sha256": sha256,
+            "bytes": byte_count,
+        })
+    normalized_identities.sort(key=lambda value: str(value["source_file"]))
+    if len({str(value["source_file"]) for value in normalized_identities}) != len(normalized_identities):
+        raise ValueError("complete connector-day detector source file identity is duplicated")
+    if {str(value["source_file"]) for value in normalized_identities} != files_read:
+        raise ValueError("complete connector-day detector source file identities do not match reads")
+    identity_bytes = json.dumps(
+        normalized_identities, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    if hashlib.sha256(identity_bytes).hexdigest() != str(
+        evidence.get("source_file_identities_sha256") or ""
+    ):
+        raise ValueError("complete connector-day detector source file identities changed")
+
+    per_timeseries: dict[str, int] = {}
+    per_pollutant: dict[str, int] = {}
+    canonical_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("complete connector-day detector source row is not an object")
+        try:
+            row_connector_id = int(row.get("connector_id", connector_id))
+            station_id = int(row.get("station_id"))
+            timeseries_id = int(row.get("timeseries_id"))
+            pollutant_code = str(row.get("pollutant_code") or "").strip().lower()
+            observed_at = _parse_required_timestamp_value(row.get("observed_at"))
+            value = float(row.get("value"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("complete connector-day detector source row is invalid") from exc
+        if (
+            row_connector_id != int(connector_id)
+            or station_id <= 0
+            or timeseries_id <= 0
+            or not re.fullmatch(r"[a-z0-9_]+", pollutant_code)
+            or observed_at is None
+            or observed_at.date().isoformat() != day_utc
+            or not math.isfinite(value)
+        ):
+            raise ValueError("complete connector-day detector source row identity is invalid")
+        per_timeseries[str(timeseries_id)] = per_timeseries.get(str(timeseries_id), 0) + 1
+        per_pollutant[pollutant_code] = per_pollutant.get(pollutant_code, 0) + 1
+        canonical_rows.append(row)
+    expected_timeseries = {
+        str(key): int(value)
+        for key, value in dict(evidence.get("per_timeseries_counts") or {}).items()
+    }
+    expected_pollutants = {
+        str(key): int(value)
+        for key, value in dict(evidence.get("per_pollutant_counts") or {}).items()
+    }
+    if (
+        per_timeseries != expected_timeseries
+        or per_pollutant != expected_pollutants
+        or sorted(per_pollutant) != sorted(str(value) for value in list(evidence.get("pollutant_set") or []))
+    ):
+        raise ValueError("complete connector-day detector source evidence counts are invalid")
+    evidence["source_file_identities"] = normalized_identities
+    return evidence, canonical_rows
+
+
+def _persist_complete_connector_day_source_evidence(
+    *,
+    conn: sqlite3.Connection,
+    env_name: str,
+    evidence: Mapping[str, Any],
+    canonical_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Persist evidence immutably; a source-file identity may never change meaning."""
+    day_utc = str(evidence.get("day_utc") or "")
+    connector_id = int(evidence.get("connector_id") or 0)
+    source_adapter = str(evidence.get("source_adapter") or "").strip()
+    source_identity_hash = str(evidence.get("source_file_identities_sha256") or "").strip()
+    canonical_rows_sha256 = str(evidence.get("canonical_rows_sha256") or "").strip()
+    canonical_rows_bytes = int(evidence.get("canonical_rows_bytes") or -1)
+    if not day_utc or connector_id <= 0 or not source_adapter or not source_identity_hash:
+        raise ValueError("complete connector-day detector source evidence persistence identity is invalid")
+    evidence_json = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    canonical_rows_json = json.dumps(canonical_rows, separators=(",", ":"), ensure_ascii=False)
+    evidence_sha256 = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+    existing = conn.execute(
+        """
+        SELECT id, evidence_sha256, canonical_rows_sha256, canonical_rows_bytes
+        FROM source_connector_day_evidence
+        WHERE env_name = ? AND day_utc = ? AND connector_id = ?
+          AND source_file_identities_sha256 = ?
+        """,
+        (env_name, day_utc, connector_id, source_identity_hash),
+    ).fetchone()
+    if existing is not None:
+        if (
+            str(existing[1]) != evidence_sha256
+            or str(existing[2]) != canonical_rows_sha256
+            or int(existing[3]) != canonical_rows_bytes
+        ):
+            raise RuntimeError(
+                "immutable complete connector-day source evidence conflicts for identical source files"
+            )
+        return {"evidence_id": int(existing[0]), "evidence_sha256": evidence_sha256}
+    cursor = conn.execute(
+        """
+        INSERT INTO source_connector_day_evidence (
+          env_name, day_utc, connector_id, source_adapter,
+          source_file_identities_sha256, canonical_rows_sha256,
+          canonical_rows_bytes, evidence_sha256, evidence_json,
+          canonical_rows_json, created_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            env_name, day_utc, connector_id, source_adapter,
+            source_identity_hash, canonical_rows_sha256, canonical_rows_bytes,
+            evidence_sha256, evidence_json, canonical_rows_json, utc_now().isoformat(),
+        ),
+    )
+    return {"evidence_id": int(cursor.lastrowid), "evidence_sha256": evidence_sha256}
+
+
+def _assert_detector_and_proposal_source_evidence_agree(
+    *,
+    detector: Mapping[str, Any],
+    proposal: Mapping[str, Any],
+) -> None:
+    fields = (
+        "canonical_rows_sha256",
+        "canonical_rows_bytes",
+        "total_rows",
+        "per_timeseries_counts",
+        "per_pollutant_counts",
+        "pollutant_set",
+        "source_file_identities_sha256",
+    )
+    mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
+    if mismatched:
+        raise ValueError(
+            "detector and proposal complete connector-day source evidence disagree: "
+            + ",".join(mismatched)
+        )
+
+
 def run_v2_gap_backfills(
     *,
     conn: sqlite3.Connection,
@@ -13229,21 +13448,95 @@ def run_v2_gap_backfills(
         if limits.should_stop():
             break
         source_cache_status = {
-            "status": "validated_by_connector_adapter",
-            "reason": "complete enumeration and required-file reads are validated from source evidence",
+            "status": "pending_immutable_detector_source_evidence",
+            "reason": "complete canonical source evidence must be captured before proposal",
         }
         metrics["planned_v2_observation_repairs"].extend(planned_cmds)
         metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
         for gap in gaps_by_key.get((day_iso, connector_id), []):
             _set_v2_source_repair_plan(gap, status="ready", command=first_cmd, source_cache_status=source_cache_status)
-        chunk_results: list[dict[str, Any]] = []
         stage_root = (
             Path(str(run_state["overlay_root"]))
             if run_state is not None
             else backfill_log_dir / "_integrity_proposal" / f"v2_run_{run_id}"
         )
+        detector_stage_root = stage_root / "detector-source-evidence"
+        detector_evidence: dict[str, Any] = {}
+        detector_evidence_persistence: dict[str, Any] = {}
+        detector_evidence_error: str | None = None
+        detector_result: dict[str, Any] | None = None
+        shutil.rmtree(
+            detector_stage_root / f"day_utc={day_iso}" / f"connector_id={connector_id}",
+            ignore_errors=True,
+        )
+        try:
+            detector_result = run_narrow_backfill(
+                wrapper_path=resolve_integrity_backfill_wrapper(),
+                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                env_name=env_name,
+                timeseries_ids=[],
+                connector_ids=[connector_id],
+                day=day_obj,
+                log=log,
+                log_dir=backfill_log_dir,
+                log_label=f"v2_obs_detector_day_{day_iso}_connector_{connector_id}",
+                output_scope="observations_only",
+                history_version="v2",
+                extra_env={
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(detector_stage_root),
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                    "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
+                    "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                },
+                complete_connector_day=True,
+            )
+            if detector_result.get("status") != "ok":
+                raise RuntimeError(
+                    "detector_source_evidence_worker_failed:"
+                    f"{detector_result.get('error') or detector_result.get('exit_code')}"
+                )
+            detector_evidence, detector_rows = _load_complete_connector_day_source_evidence(
+                stage_root=detector_stage_root,
+                day_utc=day_iso,
+                connector_id=connector_id,
+            )
+            detector_evidence_persistence = _persist_complete_connector_day_source_evidence(
+                conn=conn,
+                env_name=env_name,
+                evidence=detector_evidence,
+                canonical_rows=detector_rows,
+            )
+            # The proposal must never be able to outlive the independent
+            # evidence on which its destructive scope depends.
+            conn.commit()
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            detector_evidence_error = f"immutable_detector_source_evidence_failed:{type(exc).__name__}"
+            log.warning(
+                "v2 observation detector source evidence failed day=%s connector_id=%s error=%s",
+                day_iso,
+                connector_id,
+                exc,
+            )
+        source_cache_status = {
+            "status": "validated_by_immutable_detector_source_evidence"
+            if detector_evidence_error is None else "immutable_detector_source_evidence_failed",
+            "reason": "complete canonical source rows and source-file hashes were persisted before proposal"
+            if detector_evidence_error is None else detector_evidence_error,
+        }
+        for gap in gaps_by_key.get((day_iso, connector_id), []):
+            _set_v2_source_repair_plan(
+                gap,
+                status="ready" if detector_evidence_error is None else "blocked",
+                command=first_cmd,
+                source_cache_status=source_cache_status,
+            )
+        chunk_results: list[dict[str, Any]] = []
         shutil.rmtree(stage_root / f"day_utc={day_iso}" / f"connector_id={connector_id}", ignore_errors=True)
         for chunk_index, chunk_ids in enumerate(chunks, start=1):
+            if detector_evidence_error is not None:
+                break
             if limits.should_stop():
                 break
             chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
@@ -13300,23 +13593,19 @@ def run_v2_gap_backfills(
             repaired_observation_rows=repaired_observation_rows,
         )
         source_timeseries_row_counts = _normalize_timeseries_row_counts(
-            combined.get("source_timeseries_row_counts")
+            detector_evidence.get("per_timeseries_counts")
         )
         repaired_timeseries_row_counts = _normalize_timeseries_row_counts(
             combined.get("repaired_timeseries_row_counts")
             or combined.get("written_timeseries_row_counts")
             or combined.get("observation_timeseries_row_counts")
         )
-        source_pollutant_codes = list(combined.get("source_pollutant_codes") or [])
+        source_pollutant_codes = list(detector_evidence.get("pollutant_set") or [])
         source_rows_from_counts = sum(source_timeseries_row_counts.values())
         expected_timeseries_row_counts = source_timeseries_row_counts
         expected_pollutant_codes = source_pollutant_codes
-        expected_counts_source = "authoritative_source_rows"
-        expected_min_manifest_rows = sum(expected_timeseries_row_counts.values())
-        expected_min_manifest_rows = max(
-            expected_min_manifest_rows,
-            repaired_observation_rows,
-        )
+        expected_counts_source = "immutable_detector_source_evidence"
+        expected_min_manifest_rows = int(detector_evidence.get("total_rows") or 0)
         source_pending = wrapper_ok and (
             pending_events > 0
             or str(backfill_run_status or "").strip() == "stubbed"
@@ -13329,8 +13618,8 @@ def run_v2_gap_backfills(
             and repaired_observation_rows <= 0
             and complete_events > 0
         )
-        manifest_guard_ok = True
-        manifest_guard_reason: str | None = None
+        manifest_guard_ok = detector_evidence_error is None
+        manifest_guard_reason: str | None = detector_evidence_error
         manifest_guard_details: dict[str, Any] = {}
         should_verify_manifest = (
             wrapper_ok
@@ -13351,7 +13640,9 @@ def run_v2_gap_backfills(
                     for timeseries_id, count in sorted(expected_timeseries_row_counts.items())
                 },
                 "repair_output_rows": repaired_observation_rows,
-                "verification": "canonical_local_proposal_validation",
+                "verification": "immutable_detector_evidence_then_canonical_local_proposal_validation",
+                "detector_evidence_id": detector_evidence_persistence.get("evidence_id"),
+                "detector_evidence_sha256": detector_evidence_persistence.get("evidence_sha256"),
             })
             log.info(
                 "v2 observation local proposal precheck day=%s connector_id=%s requested_timeseries=%s expected_rows=%s repair_output_rows=%s result=pass",
@@ -13384,17 +13675,20 @@ def run_v2_gap_backfills(
         source_evidence: dict[str, Any] = {}
         if repair_ok and run_state is not None:
             try:
+                source_evidence, _ = _load_complete_connector_day_source_evidence(
+                    stage_root=stage_root,
+                    day_utc=day_iso,
+                    connector_id=connector_id,
+                )
+                _assert_detector_and_proposal_source_evidence_agree(
+                    detector=detector_evidence,
+                    proposal=source_evidence,
+                )
                 validated_overlay_keys = _capture_local_v2_observation_scope(
                     run_state=run_state,
                     day_utc=day_iso,
                     connector_id=connector_id,
                 )
-                evidence_path = (
-                    Path(str(run_state["overlay_root"])) /
-                    f"day_utc={day_iso}" / f"connector_id={connector_id}" /
-                    "source-evidence.json"
-                )
-                source_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
                 expected_timeseries_row_counts = _normalize_timeseries_row_counts(
                     source_evidence.get("per_timeseries_counts")
                 )
@@ -13402,10 +13696,15 @@ def run_v2_gap_backfills(
                     str(value) for value in list(source_evidence.get("pollutant_set") or [])
                 ]
                 expected_min_manifest_rows = int(source_evidence.get("total_rows") or 0)
+                evidence_path = (
+                    stage_root / f"day_utc={day_iso}" /
+                    f"connector_id={connector_id}" / "source-evidence.json"
+                )
                 manifest_guard_details["source_evidence_path"] = str(evidence_path)
                 manifest_guard_details["source_evidence_sha256"] = hashlib.sha256(
                     evidence_path.read_bytes()
                 ).hexdigest()
+                manifest_guard_details["detector_proposal_evidence_agreement"] = "exact"
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 repair_ok = False
                 repair_status = "guard_failed"
@@ -13477,6 +13776,9 @@ def run_v2_gap_backfills(
             "ok_chunks": sum(1 for r in chunk_results if r.get("status") == "ok"),
             "failed_chunks": sum(1 for r in chunk_results if r.get("status") != "ok"),
             "source_cache": source_cache_status,
+            "immutable_detector_source_evidence": detector_evidence,
+            "immutable_detector_source_evidence_persistence": detector_evidence_persistence,
+            "immutable_detector_source_evidence_error": detector_evidence_error,
             "complete_source_evidence": source_evidence,
             "validated_overlay_object_keys": validated_overlay_keys,
             "chunks": [
