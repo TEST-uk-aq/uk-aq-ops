@@ -9226,11 +9226,48 @@ function dedupeSourceObservationRows(
 }
 
 type IntegrityDuplicateSourceEvidence = {
+  canonical_observation_rows: SourceObservationRow[];
   duplicate_canonical_row_count: number;
   duplicate_canonical_row_identity_samples: Record<string, unknown>[];
   uncanonicalisable_source_row_count: number;
   blocked_row_samples: Record<string, unknown>[];
 };
+
+function normalizeObservationValueIdentity(value: number): string {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setFloat64(0, value, false);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizeSourceObservationForV2(
+  row: SourceObservationRow,
+): SourceObservationRow | null {
+  const timeseriesId = Number(row.timeseries_id);
+  const stationId = Number(row.station_id);
+  const parsedTimestamp = Date.parse(String(row.observed_at || "").trim());
+  const value = Number(row.value);
+  let pollutantCode: string;
+  try {
+    pollutantCode = normalizePollutantCodeForR2Path(row.pollutant_code);
+  } catch {
+    return null;
+  }
+  if (
+    !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
+    !Number.isInteger(stationId) || stationId <= 0 ||
+    !Number.isFinite(parsedTimestamp) || !Number.isFinite(value)
+  ) {
+    return null;
+  }
+  return {
+    timeseries_id: Math.trunc(timeseriesId),
+    station_id: Math.trunc(stationId),
+    pollutant_code: pollutantCode,
+    observed_at: new Date(parsedTimestamp).toISOString(),
+    value: Object.is(value, -0) ? 0 : value,
+    status: row.status == null ? null : String(row.status),
+  };
+}
 
 function inspectIntegritySourceRowsForBlockingEvidence(
   rows: SourceObservationRow[],
@@ -9242,11 +9279,12 @@ function inspectIntegritySourceRowsForBlockingEvidence(
   >();
   const blockedRowSamples: Record<string, unknown>[] = [];
   const duplicateCanonicalRowIdentitySamples: Record<string, unknown>[] = [];
+  const canonicalObservationRows: SourceObservationRow[] = [];
   let uncanonicalisableSourceRowCount = 0;
 
   for (const row of rows) {
-    const canonicalRows = dedupeSourceObservationRows([row]);
-    if (canonicalRows.length !== 1) {
+    const canonical = normalizeSourceObservationForV2(row);
+    if (!canonical) {
       uncanonicalisableSourceRowCount += 1;
       if (blockedRowSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) {
         blockedRowSamples.push({
@@ -9264,23 +9302,25 @@ function inspectIntegritySourceRowsForBlockingEvidence(
       }
       continue;
     }
-    const canonical = canonicalRows[0];
-    const canonicalKey = `${canonical.timeseries_id}|${canonical.observed_at}`;
+    canonicalObservationRows.push(canonical);
+    const canonicalIdentity = {
+      connector_id: connectorId,
+      station_id: canonical.station_id,
+      timeseries_id: canonical.timeseries_id,
+      pollutant_code: canonical.pollutant_code,
+      observed_at: canonical.observed_at,
+      value: canonical.value,
+      value_identity: normalizeObservationValueIdentity(canonical.value),
+      status: canonical.status ?? null,
+    };
+    const canonicalKey = JSON.stringify(canonicalIdentity);
     const occurrence = occurrencesByCanonicalKey.get(canonicalKey) || {
       count: 0,
       identities: [],
     };
     occurrence.count += 1;
     if (occurrence.identities.length < 2) {
-      occurrence.identities.push({
-        connector_id: connectorId,
-        station_id: canonical.station_id,
-        timeseries_id: canonical.timeseries_id,
-        pollutant_code: canonical.pollutant_code,
-        observed_at: canonical.observed_at,
-        value: canonical.value,
-        status: canonical.status ?? null,
-      });
+      occurrence.identities.push(canonicalIdentity);
     }
     occurrencesByCanonicalKey.set(canonicalKey, occurrence);
   }
@@ -9293,7 +9333,7 @@ function inspectIntegritySourceRowsForBlockingEvidence(
     duplicateCanonicalRowCount += occurrence.count - 1;
     const duplicateSample = {
       reason: "duplicate_canonical_source_row",
-      canonical_key: canonicalKey,
+      canonical_identity: occurrence.identities[0],
       duplicate_row_count: occurrence.count - 1,
       identities: occurrence.identities,
     };
@@ -9309,6 +9349,7 @@ function inspectIntegritySourceRowsForBlockingEvidence(
   }
 
   return {
+    canonical_observation_rows: canonicalObservationRows,
     duplicate_canonical_row_count: duplicateCanonicalRowCount,
     duplicate_canonical_row_identity_samples:
       duplicateCanonicalRowIdentitySamples,
@@ -13957,24 +13998,25 @@ async function runSourceToAll(
           );
         }
 
-        const dedupedObservationRows = dedupeSourceObservationRows(
-          observationRowsRaw,
-        );
         const duplicateSourceEvidence = INTEGRITY_COMPLETE_CONNECTOR_DAY
           ? inspectIntegritySourceRowsForBlockingEvidence(
             observationRowsRaw,
             connectorId,
           )
           : {
+            canonical_observation_rows: [],
             duplicate_canonical_row_count: 0,
             duplicate_canonical_row_identity_samples: [],
             uncanonicalisable_source_row_count: 0,
             blocked_row_samples: [],
           };
-        rowsRead += dedupedObservationRows.length;
+        const canonicalObservationRows = INTEGRITY_COMPLETE_CONNECTOR_DAY
+          ? duplicateSourceEvidence.canonical_observation_rows
+          : dedupeSourceObservationRows(observationRowsRaw);
+        rowsRead += canonicalObservationRows.length;
 
         let obsHistoryRows = sourceObservationsToObsHistoryRows(
-          dedupedObservationRows,
+          canonicalObservationRows,
         );
         let aqilevelRows: AqilevelsHistoryRow[] = [];
         let integrityProposalActiveForConnectorDay =
@@ -14031,7 +14073,6 @@ async function runSourceToAll(
             duplicateSourceEvidence.uncanonicalisable_source_row_count +
             sourceAdapterBlockedRowCount;
           const blockedRowSamples = [
-            ...duplicateSourceEvidence.duplicate_canonical_row_identity_samples,
             ...duplicateSourceEvidence.blocked_row_samples,
             ...sourceAdapterBlockedRowSamples,
           ].slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT);
@@ -14061,7 +14102,7 @@ async function runSourceToAll(
             pollutant_set: Object.keys(perPollutant).sort(),
             source_rows_before_canonical_dedupe: observationRowsRaw.length,
             duplicate_rows_removed_by_canonical_normalisation:
-              observationRowsRaw.length - dedupedObservationRows.length,
+              0,
             duplicate_canonical_row_count:
               duplicateSourceEvidence.duplicate_canonical_row_count,
             duplicate_canonical_row_identity_samples:
@@ -14235,7 +14276,7 @@ async function runSourceToAll(
           } else {
             if (!sourceObservationsOnly) {
               const helperRows = sourceObservationRowsToHelperRowsForDay(
-                dedupedObservationRows,
+                canonicalObservationRows,
                 dayUtc,
               );
               aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
@@ -14244,7 +14285,7 @@ async function runSourceToAll(
         } else {
           if (!sourceObservationsOnly) {
             const helperRows = sourceObservationRowsToHelperRowsForDay(
-              dedupedObservationRows,
+              canonicalObservationRows,
               dayUtc,
             );
             aqilevelRows = helperRowsToAqilevelHistoryRows(helperRows);
