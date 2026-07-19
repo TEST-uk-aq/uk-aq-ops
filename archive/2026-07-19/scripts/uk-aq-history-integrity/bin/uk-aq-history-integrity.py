@@ -111,11 +111,13 @@ DAILY_TASK_HEALTH_SOURCE_REPO = "uk-aq-ops"
 DAILY_TASK_HEALTH_SOURCE_WORKER = "uk-aq-history-integrity"
 DAILY_TASK_HEALTH_RPC_SCHEMA = "uk_aq_public"
 DAILY_TASK_HEALTH_ERROR_LIMIT = 1200
-CANONICAL_REPAIR_STAGE_ORDER = (
-    "observations_proposal",
-    "observations_metadata_proposal",
-    "aqi_proposal",
-    "canonical_apply",
+V2_REPAIR_STAGE_ORDER = (
+    "observs",
+    "observs_manifests",
+    "observs_indexes",
+    "aqilevels",
+    "aqilevels_manifests",
+    "aqilevels_indexes",
     "final_verification",
 )
 OVERLAY_CHANGED_SCOPE_SETS = (
@@ -464,9 +466,6 @@ CREATE TABLE IF NOT EXISTS integrity_runs (
   source_filter TEXT,
   from_day TEXT,
   to_day TEXT,
-  effective_mode TEXT,
-  dropbox_baseline TEXT,
-  allow_stale_dropbox INTEGER NOT NULL DEFAULT 0,
 
   status TEXT NOT NULL,
 
@@ -509,30 +508,6 @@ CREATE TABLE IF NOT EXISTS integrity_runs (
 
   notes TEXT
 );
-
-CREATE TABLE IF NOT EXISTS integrity_object_operations (
-  run_id INTEGER NOT NULL,
-  object_key TEXT NOT NULL,
-  domain TEXT NOT NULL,
-  operation_kind TEXT NOT NULL,
-  planned INTEGER NOT NULL DEFAULT 0,
-  local_path TEXT,
-  local_sha256 TEXT,
-  local_bytes INTEGER,
-  structurally_validated INTEGER NOT NULL DEFAULT 0,
-  remote_attempted INTEGER NOT NULL DEFAULT 0,
-  remote_completed INTEGER NOT NULL DEFAULT 0,
-  get_verified INTEGER NOT NULL DEFAULT 0,
-  delete_verified INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL,
-  error TEXT,
-  updated_at_utc TEXT NOT NULL,
-  PRIMARY KEY (run_id, object_key, operation_kind),
-  FOREIGN KEY (run_id) REFERENCES integrity_runs(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_integrity_object_operations_run_status
-  ON integrity_object_operations(run_id, status, operation_kind);
 
 CREATE TABLE IF NOT EXISTS daily_profile_state (
   env_name TEXT NOT NULL,
@@ -3568,6 +3543,115 @@ def _chunk_v2_observation_repair_timeseries_ids(ids: list[int]) -> list[list[int
     return [list(ids[i:i + max_per]) for i in range(0, len(ids), max_per)]
 
 
+def _v2_observation_chunk_identity(timeseries_ids: Iterable[int]) -> str:
+    normalized = sorted({int(value) for value in timeseries_ids if int(value) > 0})
+    encoded = json.dumps(normalized, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _v2_observation_transaction_state_path(
+    stage_root: Path,
+    *,
+    day_utc: str,
+    connector_id: int,
+) -> Path:
+    return (
+        stage_root / "transaction-state" / f"day_utc={day_utc}"
+        / f"connector_id={int(connector_id)}.json"
+    )
+
+
+def _initialise_v2_observation_transaction_state(
+    stage_root: Path,
+    *,
+    transaction_id: str,
+    day_utc: str,
+    connector_id: int,
+    complete_timeseries_ids: list[int],
+    chunks: list[list[int]],
+) -> Path:
+    requested = sorted({int(value) for value in complete_timeseries_ids if int(value) > 0})
+    definitions = [
+        {
+            "chunk_index": index,
+            "chunk_identity": _v2_observation_chunk_identity(chunk),
+            "timeseries_ids": sorted({int(value) for value in chunk if int(value) > 0}),
+        }
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    state = {
+        "transaction_state_schema_version": 1,
+        "transaction_id": transaction_id,
+        "history_version": "v2",
+        "domain": "observations",
+        "day_utc": day_utc,
+        "connector_id": int(connector_id),
+        "complete_requested_timeseries_ids": requested,
+        "expected_chunk_count": len(definitions),
+        "chunks": definitions,
+        "completed_chunks": [],
+        "completed_chunk_identities": [],
+        "incomplete_chunk_identities": sorted(
+            definition["chunk_identity"] for definition in definitions
+        ),
+        "failed_chunks": [],
+        "affected_pollutant_codes": [],
+        "source_row_count": 0,
+        "source_timeseries_row_counts": {},
+        "staged_merged_row_identity": None,
+        "finalisation_status": "initialised",
+    }
+    state_path = _v2_observation_transaction_state_path(
+        stage_root, day_utc=day_utc, connector_id=connector_id
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(state, indent=2, sort_keys=False) + "\n"
+    if state_path.exists():
+        existing = json.loads(state_path.read_text(encoding="utf-8"))
+        identity_fields = (
+            "transaction_state_schema_version", "transaction_id", "history_version",
+            "domain", "day_utc", "connector_id", "complete_requested_timeseries_ids",
+            "expected_chunk_count", "chunks",
+        )
+        if any(existing.get(field) != state.get(field) for field in identity_fields):
+            raise ValueError(
+                f"conflicting v2 observation transaction state: {state_path}"
+            )
+        return state_path
+    temporary = state_path.with_name(f"{state_path.name}.tmp-{os.getpid()}")
+    temporary.write_text(encoded, encoding="utf-8")
+    temporary.replace(state_path)
+    return state_path
+
+
+def _record_v2_observation_chunk_failure(
+    state_path: Path,
+    *,
+    chunk_timeseries_ids: list[int],
+    status: str,
+    error: Any,
+) -> None:
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    identity = _v2_observation_chunk_identity(chunk_timeseries_ids)
+    failure = {
+        "chunk_identity": identity,
+        "status": str(status or "failed"),
+        "error": str(error or "")[:1000] or None,
+    }
+    failures = [
+        entry for entry in list(state.get("failed_chunks") or [])
+        if isinstance(entry, Mapping) and entry.get("chunk_identity") != identity
+    ]
+    failures.append(failure)
+    state["failed_chunks"] = sorted(
+        failures, key=lambda entry: str(entry.get("chunk_identity") or "")
+    )
+    state["finalisation_status"] = "chunk_failed"
+    temporary = state_path.with_name(f"{state_path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(state_path)
+
+
 def _tail_lines(text: str, limit: int = 80) -> str:
     if not text:
         return ""
@@ -3595,9 +3679,9 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "source_connector_day_skipped_events": 0,
                 "source_connector_day_pending_events": 0,
                 "source_connector_day_failed_events": 0,
-                "integrity_proposal_chunk_staged_events": 0,
-                "integrity_proposal_staged_rows": 0,
-                "max_integrity_proposal_staged_rows": 0,
+                "source_to_r2_targeted_stage_deferred_commit_events": 0,
+                "targeted_stage_deferred_rows_observations": 0,
+                "max_targeted_stage_deferred_rows_observations": 0,
                 "source_timeseries_row_counts": {},
                 "repaired_timeseries_row_counts": {},
                 "source_pollutant_codes": [],
@@ -3630,10 +3714,10 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "source_connector_day_skipped_events": sum(int(r.get("source_connector_day_skipped_events") or 0) for r in results),
         "source_connector_day_pending_events": sum(int(r.get("source_connector_day_pending_events") or 0) for r in results),
         "source_connector_day_failed_events": sum(int(r.get("source_connector_day_failed_events") or 0) for r in results),
-        "integrity_proposal_chunk_staged_events": sum(int(r.get("integrity_proposal_chunk_staged_events") or 0) for r in results),
-        "integrity_proposal_staged_rows": sum(int(r.get("integrity_proposal_staged_rows") or 0) for r in results),
-        "max_integrity_proposal_staged_rows": max(
-            [int(r.get("max_integrity_proposal_staged_rows") or 0) for r in results] or [0]
+        "source_to_r2_targeted_stage_deferred_commit_events": sum(int(r.get("source_to_r2_targeted_stage_deferred_commit_events") or 0) for r in results),
+        "targeted_stage_deferred_rows_observations": sum(int(r.get("targeted_stage_deferred_rows_observations") or 0) for r in results),
+        "max_targeted_stage_deferred_rows_observations": max(
+            [int(r.get("max_targeted_stage_deferred_rows_observations") or 0) for r in results] or [0]
         ),
         "source_timeseries_row_counts": _merge_timeseries_row_counts([
             r.get("source_timeseries_row_counts") for r in results
@@ -3768,9 +3852,9 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         "source_connector_day_skipped_events": 0,
         "source_connector_day_pending_events": 0,
         "source_connector_day_failed_events": 0,
-        "integrity_proposal_chunk_staged_events": 0,
-        "integrity_proposal_staged_rows": 0,
-        "max_integrity_proposal_staged_rows": 0,
+        "source_to_r2_targeted_stage_deferred_commit_events": 0,
+        "targeted_stage_deferred_rows_observations": 0,
+        "max_targeted_stage_deferred_rows_observations": 0,
         "source_timeseries_row_counts": {},
         "repaired_timeseries_row_counts": {},
         "source_pollutant_codes": [],
@@ -3835,15 +3919,15 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         if event_name == "source_to_r2_connector_day_failed":
             status["source_connector_day_failed_events"] += 1
             continue
-        if event_name == "source_to_r2_integrity_proposal_chunk_staged":
-            status["integrity_proposal_chunk_staged_events"] += 1
+        if event_name == "source_to_r2_targeted_stage_deferred_commit":
+            status["source_to_r2_targeted_stage_deferred_commit_events"] += 1
             try:
                 rows_observations = int(event.get("rows_observations") or 0)
             except (TypeError, ValueError):
                 rows_observations = 0
-            status["integrity_proposal_staged_rows"] += rows_observations
-            status["max_integrity_proposal_staged_rows"] = max(
-                int(status["max_integrity_proposal_staged_rows"] or 0),
+            status["targeted_stage_deferred_rows_observations"] += rows_observations
+            status["max_targeted_stage_deferred_rows_observations"] = max(
+                int(status["max_targeted_stage_deferred_rows_observations"] or 0),
                 rows_observations,
             )
             continue
@@ -8998,6 +9082,92 @@ def _classify_v2_gaps(gaps: Iterable[dict[str, Any]]) -> None:
         gap["fault_class"] = fault_class
 
 
+def _validate_v2_observation_transaction_receipts(
+    *,
+    root: Path,
+    data_prefix: str,
+    day_utc: str,
+    connector_id: str,
+    connector_dir: Path,
+    gaps: list[dict[str, Any]],
+) -> int:
+    transactions_dir = connector_dir / "transactions"
+    if not transactions_dir.is_dir():
+        return 0
+    checked = 0
+    for receipt_path in sorted(
+        transactions_dir.glob("transaction_id=*/data-receipt.json")
+    ):
+        checked += 1
+        receipt_rel = str(receipt_path.relative_to(root))
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            transaction_id = receipt_path.parent.name.split("=", 1)[1]
+            expected_key = (
+                f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+                f"transactions/transaction_id={transaction_id}/data-receipt.json"
+            )
+            if (
+                not isinstance(receipt, Mapping)
+                or int(receipt.get("receipt_schema_version") or 0) != 2
+                or receipt.get("transaction_id") != transaction_id
+                or receipt.get("history_version") != "v2"
+                or receipt.get("domain") != "observations"
+                or receipt.get("day_utc") != day_utc
+                or str(receipt.get("connector_id")) != str(connector_id)
+                or receipt.get("permanent_receipt_key") != expected_key
+                or receipt.get("finalisation_status")
+                != "complete_generations_get_verified"
+                or not isinstance(receipt.get("affected_pollutant_codes"), list)
+                or not isinstance(receipt.get("files"), list)
+                or not receipt.get("files")
+                or len(receipt.get("chunks") or [])
+                != int(receipt.get("expected_chunk_count") or 0)
+                or len(receipt.get("completed_chunks") or [])
+                != int(receipt.get("expected_chunk_count") or 0)
+                or receipt.get("incomplete_chunk_identities")
+                or receipt.get("failed_chunks")
+            ):
+                raise ValueError("receipt contract mismatch")
+            declared = {
+                str(value).strip().lower()
+                for value in receipt.get("affected_pollutant_codes") or []
+                if str(value).strip()
+            }
+            for entry in receipt.get("files") or []:
+                pollutant_code = str(entry.get("pollutant_code") or "").lower()
+                key = str(entry.get("key") or "").lstrip("/")
+                expected_prefix = (
+                    f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+                    f"pollutant_code={pollutant_code}/generation={transaction_id}/part-"
+                )
+                object_path = _resolve_canonical_history_object_key(root, key)
+                if (
+                    pollutant_code not in declared
+                    or not key.startswith(expected_prefix)
+                    or not key.endswith(".parquet")
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(entry.get("content_sha256") or ""))
+                    or int(entry.get("bytes") or 0) <= 0
+                    or int(entry.get("row_count") or 0) <= 0
+                    or not isinstance(entry.get("timeseries_row_counts"), Mapping)
+                    or object_path is None
+                    or not object_path.is_file()
+                    or object_path.stat().st_size != int(entry.get("bytes") or -1)
+                    or hashlib.sha256(object_path.read_bytes()).hexdigest()
+                    != str(entry.get("content_sha256") or "")
+                ):
+                    raise ValueError(f"receipt file mismatch: {key}")
+        except Exception as exc:
+            gaps.append(_v2_obs_gap(
+                "transaction_receipt_invalid",
+                day_utc=day_utc,
+                connector_id=connector_id,
+                expected_path=receipt_rel,
+                related_paths=[str(exc)],
+            ))
+    return checked
+
+
 def run_v2_observations_integrity_checks(
     *,
     r2_history_root: str | Path | None,
@@ -9022,6 +9192,7 @@ def run_v2_observations_integrity_checks(
 
     gaps: list[dict[str, Any]] = []
     checked = 0
+    checked_transaction_receipts = 0
     data_prefix = config.observations_data_prefix.strip("/")
     index_prefix = config.observations_timeseries_index_prefix.strip("/")
     latest_key = config.observations_latest_index_key.strip("/")
@@ -9078,6 +9249,14 @@ def run_v2_observations_integrity_checks(
             continue
         for connector_dir in connector_dirs:
             connector_raw = connector_dir.name.split("=", 1)[1]
+            checked_transaction_receipts += _validate_v2_observation_transaction_receipts(
+                root=root,
+                data_prefix=data_prefix,
+                day_utc=day_utc,
+                connector_id=connector_raw,
+                connector_dir=connector_dir,
+                gaps=gaps,
+            )
             pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
             connector_level_parts = sorted(p for p in connector_dir.glob("part-*.parquet") if p.is_file())
             if connector_level_parts:
@@ -9098,7 +9277,9 @@ def run_v2_observations_integrity_checks(
                 part_rel = f"{day_rel}/{connector_dir.name}/{pollutant_dir.name}"
                 manifest_rel = f"{part_rel}/manifest.json"
                 manifest_path = root / manifest_rel
-                discovered_parquets = list(pollutant_dir.glob("part-*.parquet"))
+                discovered_parquets = list(pollutant_dir.glob("part-*.parquet")) + list(
+                    pollutant_dir.glob("generation=*/part-*.parquet")
+                )
                 local_parquets = list(discovered_parquets)
                 payload: Any = None
                 if not manifest_path.is_file():
@@ -9265,6 +9446,7 @@ def run_v2_observations_integrity_checks(
         # executor separately hydrates live R2 before deciding target state.
         "storage_source": "dropbox_r2_history_mirror",
         "checked_partitions": checked,
+        "checked_transaction_receipts": checked_transaction_receipts,
         "gap_count": len(gaps),
         "gaps": gaps,
         "repair_plan": build_v2_repair_plan(observation_gaps=gaps, conn=conn),
@@ -11330,7 +11512,7 @@ def _queue_aqi_rebuild_from_obs_repair(
         connector_id=connector_id,
         day_utc=day_utc,
         reason="obs_repaired",
-        source_mode="combined_local",
+        source_mode="live_r2",
         requested_timeseries_ids=requested_timeseries_ids,
         queue_note=queue_note,
         log=log,
@@ -11350,7 +11532,7 @@ def _validate_chunked_v2_observation_repair_for_aqi(
         return False, f"attempted_chunks={len(chunk_results)} expected_chunks={chunk_count}"
 
     deferred_events = sum(
-        int(result.get("integrity_proposal_chunk_staged_events") or 0)
+        int(result.get("source_to_r2_targeted_stage_deferred_commit_events") or 0)
         for result in chunk_results
     )
     complete_events = sum(
@@ -11360,7 +11542,7 @@ def _validate_chunked_v2_observation_repair_for_aqi(
     expected_deferred_events = chunk_count - 1
     if deferred_events != expected_deferred_events:
         return False, (
-            f"integrity_proposal_chunk_staged_events={deferred_events} "
+            f"targeted_stage_deferred_events={deferred_events} "
             f"expected={expected_deferred_events}"
         )
     if complete_events != 1:
@@ -11375,7 +11557,7 @@ def _validate_chunked_v2_observation_repair_for_aqi(
 
     max_deferred_rows = max(
         [
-            int(result.get("max_integrity_proposal_staged_rows") or 0)
+            int(result.get("max_targeted_stage_deferred_rows_observations") or 0)
             for result in chunk_results[:-1]
         ] or [0]
     )
@@ -11440,7 +11622,7 @@ def _read_json_manifest_for_guard(
     local_payload, local_err = _load_json_file(manifest_path)
     if local_err is not None:
         return None, "combined_local", f"combined_local_manifest_{local_err}"
-    source = "structurally_validated_overlay" if str(manifest_path).startswith(str(run_state.get("overlay_root") or "")) else "dropbox"
+    source = "verified_overlay" if str(manifest_path).startswith(str(run_state.get("overlay_root") or "")) else "dropbox"
     return local_payload, source, None
 
 
@@ -12164,7 +12346,7 @@ def run_cross_check_backfills(
             )
         stage_root = (
             backfill_log_dir
-            / "_integrity_proposal"
+            / "_targeted_stage"
             / f"run_{run_id}"
             / f"day_{day_iso}"
             / f"connector_{connector_id}"
@@ -12180,12 +12362,12 @@ def run_cross_check_backfills(
             extra_env: dict[str, str] | None = None
             if len(chunks) > 1:
                 extra_env = {
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": (
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
                         "true" if chunk_index == len(chunks) else "false"
                     ),
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": (
+                    "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": (
                         "true" if chunk_index == len(chunks) else "false"
                     ),
                 }
@@ -13181,24 +13363,10 @@ def run_v2_gap_backfills(
         if ts_ids:
             by_key_sets.setdefault((day_iso, connector_id), set()).update(ts_ids)
             gaps_by_key.setdefault((day_iso, connector_id), []).append(gap)
-    targeted_mismatch_ids = {key: sorted(values) for key, values in by_key_sets.items()}
-    by_key: dict[tuple[str, int], list[int]] = {}
-    for key in sorted(by_key_sets):
-        complete_connector_ids = _timeseries_ids_for_connector(conn, key[1])
-        if complete_connector_ids:
-            by_key[key] = complete_connector_ids
-        else:
-            metrics["skipped_v2_observation_repairs"].append({
-                "day_utc": key[0],
-                "connector_id": key[1],
-                "status": "blocked_dependency",
-                "reason": "authoritative_complete_connector_scope_empty",
-                "mismatch_timeseries_ids": targeted_mismatch_ids[key],
-            })
+    by_key = {key: sorted(values) for key, values in by_key_sets.items()}
     standalone_index_keys = sorted(index_only_keys - set(by_key))
     metrics["observation_backfill_candidate_days"] = len(by_key)
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
-    metrics["observation_backfill_scope"] = "complete_active_connector_day"
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     metrics["skipped_v2_observation_metadata_gaps"] = skipped_metadata_gaps
@@ -13216,6 +13384,15 @@ def run_v2_gap_backfills(
         ]
         first_cmd = planned_cmds[0] if planned_cmds else None
         idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
+        if dry_run:
+            metrics["planned_v2_observation_repairs"].extend(planned_cmds)
+            metrics["planned_v2_observation_index_rebuilds"].append(idx_cmd)
+            metrics["planned_aqi_rebuilds"].append(f"connector_id={connector_id} day_utc={day_iso} reason=planned_after_obs_repair history_version=v2")
+            metrics["planned_aqi_rebuild_connector_days"].append({"day_utc": day_iso, "connector_id": connector_id, "reasons": ["planned_after_obs_repair"], "history_version": "v2"})
+            for gap in gaps_by_key.get((day_iso, connector_id), []):
+                _set_v2_source_repair_plan(gap, status="planned_after_obs_repair", command=first_cmd, source_cache_status=None)
+            queued.add((day_iso, connector_id))
+            continue
         if limits.should_stop():
             break
         source_cache_status = _source_cache_status_for_connector_day(
@@ -13251,7 +13428,19 @@ def run_v2_gap_backfills(
         stage_root = (
             Path(str(run_state["overlay_root"]))
             if run_state is not None
-            else backfill_log_dir / "_integrity_proposal" / f"v2_run_{run_id}"
+            else backfill_log_dir / "_targeted_stage" / f"v2_run_{run_id}"
+        )
+        transaction_id = (
+            f"integrity-{str(run_state.get('run_id') if run_state is not None else run_id)}-"
+            f"observations-{day_iso}-connector-{connector_id}"
+        )
+        transaction_state_path = _initialise_v2_observation_transaction_state(
+            stage_root,
+            transaction_id=transaction_id,
+            day_utc=day_iso,
+            connector_id=connector_id,
+            complete_timeseries_ids=ts_ids,
+            chunks=chunks,
         )
         shutil.rmtree(stage_root / f"day_utc={day_iso}" / f"connector_id={connector_id}", ignore_errors=True)
         for chunk_index, chunk_ids in enumerate(chunks, start=1):
@@ -13260,16 +13449,20 @@ def run_v2_gap_backfills(
             chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
             if len(chunks) > 1:
                 chunk_label = f"{chunk_label}_chunk_{chunk_index:03d}_of_{len(chunks):03d}"
-            # Chunking is local acquisition only. The final chunk builds one
-            # complete canonical connector-day proposal without remote writes.
+            # Always stage the targeted merge beneath this Integrity run's
+            # sparse overlay.  Earlier chunks only update the staged baseline;
+            # the final chunk alone may publish the scoped observation output.
             extra_env: dict[str, str] = {
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
-                "UK_AQ_BACKFILL_INTEGRITY_CHUNK_MERGE": "true",
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": (
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(stage_root),
+                "UK_AQ_BACKFILL_TARGETED_TRANSACTION_ID": transaction_id,
+                "UK_AQ_BACKFILL_TARGETED_TRANSACTION_STATE_PATH": str(
+                    transaction_state_path
+                ),
+                "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": (
                     "true" if chunk_index == len(chunks) else "false"
                 ),
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": "false",
             }
             bf = run_narrow_backfill(
                 wrapper_path=resolve_integrity_backfill_wrapper(),
@@ -13292,6 +13485,12 @@ def run_v2_gap_backfills(
             if bf.get("status") == "ok":
                 metrics["v2_observation_index_rebuilds_ok"] += 1
             else:
+                _record_v2_observation_chunk_failure(
+                    transaction_state_path,
+                    chunk_timeseries_ids=chunk_ids,
+                    status=str(bf.get("status") or "failed"),
+                    error=bf.get("error") or bf.get("stderr_tail"),
+                )
                 metrics["v2_observation_repairs_failed"] += 1
                 metrics["observation_backfills_failed"] += 1
                 metrics["v2_observation_index_rebuilds_failed"] += 1
@@ -13322,12 +13521,10 @@ def run_v2_gap_backfills(
         source_rows_from_counts = sum(source_timeseries_row_counts.values())
         source_scope = v2_observations.get("source_scope")
         sos_scope = isinstance(source_scope, Mapping) and str(source_scope.get("source") or "").strip().lower() == "sos"
-        expected_timeseries_row_counts = source_timeseries_row_counts
+        expected_timeseries_row_counts = repaired_timeseries_row_counts
         expected_pollutant_codes = source_pollutant_codes
-        expected_counts_source = "authoritative_source_rows"
-        expected_counts_scope_valid = bool(expected_timeseries_row_counts) and bool(
-            expected_pollutant_codes
-        )
+        expected_counts_source = "backfill_repaired_rows"
+        expected_counts_scope_valid = True
         if sos_scope:
             expected_timeseries_row_counts, expected_pollutant_codes = (
                 _sos_day_scoped_expected_counts(
@@ -13357,25 +13554,16 @@ def run_v2_gap_backfills(
             and not source_pending
             and failed_events <= 0
             and repaired_observation_rows <= 0
-            and complete_events > 0
+            and (complete_events > 0 or skipped_events > 0)
         )
         manifest_guard_ok = True
         manifest_guard_reason: str | None = None
         manifest_guard_details: dict[str, Any] = {}
-        if repaired_observation_rows > 0 and not expected_counts_scope_valid:
-            manifest_guard_ok = False
-            manifest_guard_reason = "authoritative_source_counts_unavailable"
-            manifest_guard_details = {
-                "expected_counts_source": expected_counts_source,
-                "source_rows_from_counts": source_rows_from_counts,
-                "source_pollutant_codes": source_pollutant_codes,
-            }
         should_verify_manifest = (
             wrapper_ok
             and not source_pending
             and failed_events <= 0
             and repaired_observation_rows > 0
-            and manifest_guard_ok
             and process_guard_ok
         )
         if should_verify_manifest:
@@ -13390,22 +13578,21 @@ def run_v2_gap_backfills(
                     for timeseries_id, count in sorted(expected_timeseries_row_counts.items())
                 },
                 "repair_output_rows": repaired_observation_rows,
-                "verification": "canonical_local_proposal_validation",
+                "verification": "deferred_to_metadata_commit_receipt",
             })
             log.info(
-                "v2 observation local proposal precheck day=%s connector_id=%s requested_timeseries=%s expected_rows=%s repair_output_rows=%s result=pass",
+                "v2 observation transaction precheck day=%s connector_id=%s requested_timeseries=%s expected_rows=%s repair_output_rows=%s result=pass verification=deferred_to_metadata_commit_receipt",
                 day_iso,
                 connector_id,
                 len(ts_ids),
                 expected_min_manifest_rows,
                 repaired_observation_rows,
             )
-        repair_ok = no_observation_rows or (
+        repair_ok = (
             wrapper_ok
             and not source_pending
             and failed_events <= 0
             and repaired_observation_rows > 0
-            and expected_counts_scope_valid
             and process_guard_ok
             and manifest_guard_ok
         )
@@ -13414,7 +13601,7 @@ def run_v2_gap_backfills(
         elif repair_ok:
             repair_status = "ok"
         elif no_observation_rows:
-            repair_status = "ok"
+            repair_status = "no_observations"
         elif wrapper_ok and repaired_observation_rows > 0 and (
             not process_guard_ok
             or not manifest_guard_ok
@@ -13422,22 +13609,22 @@ def run_v2_gap_backfills(
             repair_status = "guard_failed"
         else:
             repair_status = "failed"
-        validated_overlay_keys: list[str] = []
+        verified_overlay_keys: list[str] = []
         if repair_ok and run_state is not None:
             try:
-                validated_overlay_keys = _capture_local_v2_observation_scope(
+                verified_overlay_keys = _capture_verified_v2_observation_scope(
                     run_state=run_state,
                     day_utc=day_iso,
                     connector_id=connector_id,
-                    expected_timeseries_row_counts=expected_timeseries_row_counts,
+                    env=env,
                 )
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 repair_ok = False
                 repair_status = "guard_failed"
                 manifest_guard_ok = False
-                manifest_guard_reason = f"local_proposal_validation_failed:{type(exc).__name__}"
+                manifest_guard_reason = f"overlay_r2_get_verification_failed:{type(exc).__name__}"
                 log.warning(
-                    "v2 observation local proposal validation failed day=%s connector_id=%s error=%s",
+                    "v2 observation overlay verification failed day=%s connector_id=%s error=%s",
                     day_iso,
                     connector_id,
                     exc,
@@ -13458,9 +13645,9 @@ def run_v2_gap_backfills(
             "source_connector_day_skipped_events": skipped_events,
             "source_connector_day_pending_events": pending_events,
             "source_connector_day_failed_events": failed_events,
-            "integrity_proposal_chunk_staged_events": int(combined.get("integrity_proposal_chunk_staged_events") or 0),
-            "integrity_proposal_staged_rows": int(combined.get("integrity_proposal_staged_rows") or 0),
-            "max_integrity_proposal_staged_rows": int(combined.get("max_integrity_proposal_staged_rows") or 0),
+            "source_to_r2_targeted_stage_deferred_commit_events": int(combined.get("source_to_r2_targeted_stage_deferred_commit_events") or 0),
+            "targeted_stage_deferred_rows_observations": int(combined.get("targeted_stage_deferred_rows_observations") or 0),
+            "max_targeted_stage_deferred_rows_observations": int(combined.get("max_targeted_stage_deferred_rows_observations") or 0),
             "source_timeseries_row_counts": {
                 str(timeseries_id): count
                 for timeseries_id, count in sorted(source_timeseries_row_counts.items())
@@ -13501,7 +13688,7 @@ def run_v2_gap_backfills(
             "ok_chunks": sum(1 for r in chunk_results if r.get("status") == "ok"),
             "failed_chunks": sum(1 for r in chunk_results if r.get("status") != "ok"),
             "source_cache": source_cache_status,
-            "validated_overlay_object_keys": validated_overlay_keys,
+            "verified_overlay_object_keys": verified_overlay_keys,
             "chunks": [
                 {
                     "chunk_index": i,
@@ -13527,9 +13714,9 @@ def run_v2_gap_backfills(
                     "source_connector_day_skipped_events": int(result.get("source_connector_day_skipped_events") or 0),
                     "source_connector_day_pending_events": int(result.get("source_connector_day_pending_events") or 0),
                     "source_connector_day_failed_events": int(result.get("source_connector_day_failed_events") or 0),
-                    "integrity_proposal_chunk_staged_events": int(result.get("integrity_proposal_chunk_staged_events") or 0),
-                    "integrity_proposal_staged_rows": int(result.get("integrity_proposal_staged_rows") or 0),
-                    "max_integrity_proposal_staged_rows": int(result.get("max_integrity_proposal_staged_rows") or 0),
+                    "source_to_r2_targeted_stage_deferred_commit_events": int(result.get("source_to_r2_targeted_stage_deferred_commit_events") or 0),
+                    "targeted_stage_deferred_rows_observations": int(result.get("targeted_stage_deferred_rows_observations") or 0),
+                    "max_targeted_stage_deferred_rows_observations": int(result.get("max_targeted_stage_deferred_rows_observations") or 0),
                     "source_timeseries_row_counts": {
                         str(timeseries_id): count
                         for timeseries_id, count in sorted(
@@ -13549,23 +13736,11 @@ def run_v2_gap_backfills(
             metrics["v2_observation_repairs_ok"] += 1
             metrics["observation_backfills_ok"] += 1
             if run_state is not None:
-                proposal_pollutants = sorted({
-                    match.group(1)
-                    for key in validated_overlay_keys
-                    if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", key))
-                })
-                affected_pollutants = sorted({
-                    str(gap.get("pollutant_code") or "").strip().lower()
-                    for gap in gaps_by_key.get((day_iso, connector_id), [])
-                    if str(gap.get("pollutant_code") or "").strip()
-                } | set(proposal_pollutants))
                 record_changed_scope(run_state, "OBSERVS_CHANGED", {
                     "day_utc": day_iso,
                     "connector_id": connector_id,
                     "timeseries_ids": ts_ids,
-                    "pollutant_codes": proposal_pollutants,
-                    "affected_pollutant_codes": affected_pollutants,
-                    "object_keys": validated_overlay_keys,
+                    "pollutant_codes": sorted({str(code) for code in source_pollutant_codes if str(code)}),
                     "stage": "observs",
                 })
             if queue_aqi_from_observation_repairs:
@@ -13635,7 +13810,6 @@ def run_aqi_rebuild_queue_execution(
     history_version: str = "v1",
     extra_env: Mapping[str, str] | None = None,
     skip_stale_local_post_validation: bool = False,
-    execute_local_proposal: bool = False,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "aqi_rebuild_ran": False,
@@ -13686,7 +13860,7 @@ def run_aqi_rebuild_queue_execution(
         by_key.setdefault((day_iso, connector_scope), []).append(row)
 
     metrics["aqi_rebuilds_queued_total"] = len(by_key)
-    if dry_run and not execute_local_proposal and metrics["aqi_rebuilds_queued_total"] == 0 and dry_run_planned_rows:
+    if dry_run and metrics["aqi_rebuilds_queued_total"] == 0 and dry_run_planned_rows:
         seed_by_key: dict[tuple[str, int | None], dict[str, Any]] = {}
         for row in dry_run_planned_rows:
             day_iso = str(row.get("day_utc") or "").strip()
@@ -13735,7 +13909,7 @@ def run_aqi_rebuild_queue_execution(
                 "day_utc": day_iso,
                 "reasons": seed.get("reasons") or [],
                 "status": "planned",
-                "source_mode": "combined_local",
+                "source_mode": "live_r2",
                 "error": None,
                 "log_path": None,
             })
@@ -13800,7 +13974,7 @@ def run_aqi_rebuild_queue_execution(
                     )
                 conn.commit()
 
-        if dry_run and not execute_local_proposal:
+        if dry_run:
             metrics["aqi_rebuild_results"].append({
                 "queue_row_ids": row_ids,
                 "connector_id": connector_scope,
@@ -13808,7 +13982,7 @@ def run_aqi_rebuild_queue_execution(
                 "day_utc": day_iso,
                 "reasons": reasons_sorted,
                 "status": "planned",
-                "source_mode": "combined_local",
+                "source_mode": "live_r2",
                 "error": None,
                 "log_path": None,
             })
@@ -13823,7 +13997,7 @@ def run_aqi_rebuild_queue_execution(
                 "day_utc": day_iso,
                 "reasons": reasons_sorted,
                 "status": "skipped_limit",
-                "source_mode": "combined_local" if execute_local_proposal else "live_r2",
+                "source_mode": "live_r2",
                 "error": f"stopped_for={limits.stopped_for}",
                 "log_path": None,
             })
@@ -13861,7 +14035,6 @@ def run_aqi_rebuild_queue_execution(
                 else f"aqi_day_{day_iso}_all_connectors"
             ),
             history_version=history_version,
-            extra_env=extra_env,
         )
         metrics["aqi_rebuilds_attempted"] += 1
 
@@ -13901,9 +14074,7 @@ def run_aqi_rebuild_queue_execution(
             and skip_stale_local_post_validation
         ):
             metrics["aqi_post_rebuild_validation_skipped_reason"] = (
-                "combined_local_proposal_validated_before_apply"
-                if execute_local_proposal else
-                "post_rebuild_validation_explicitly_skipped"
+                "live_r2_scope_verified_before_dropbox_backup"
             )
 
         if bf.get("status") == "ok" and not post_validation_gaps:
@@ -13957,7 +14128,7 @@ def run_aqi_rebuild_queue_execution(
             "day_utc": day_iso,
             "reasons": reasons_sorted,
             "status": final_status,
-            "source_mode": "combined_local" if execute_local_proposal else "live_r2",
+            "source_mode": "live_r2",
             "error": error_text,
             "log_path": bf.get("log_path"),
             "post_rebuild_validation_gaps": post_validation_gaps,
@@ -14036,9 +14207,9 @@ def create_run_overlay(
         "run_state_path": str(run_root / "run-state.json"),
         "objects": {},
         "tombstones": {},
-        "tombstone_prefixes": [],
         "changed_scopes": {scope_set: [] for scope_set in OVERLAY_CHANGED_SCOPE_SETS},
         "blocked_scopes": [],
+        "commit_receipts": [],
         "coordinator": None,
     }
     write_run_state(run_state)
@@ -14051,23 +14222,45 @@ def resolve_combined_local_path(
 ) -> Path | None:
     normalized_key = _normalise_overlay_object_key(object_key)
     tombstone = (run_state.get("tombstones") or {}).get(normalized_key)
-    if isinstance(tombstone, Mapping) and (tombstone.get("proposed") or tombstone.get("deleted")):
+    if isinstance(tombstone, Mapping) and tombstone.get("r2_delete_verified"):
         return None
     objects = run_state.get("objects")
     entry = objects.get(normalized_key) if isinstance(objects, dict) else None
-    if isinstance(entry, Mapping) and bool(entry.get("structurally_validated")):
+    if isinstance(entry, Mapping) and bool(entry.get("r2_verified")):
         overlay_path = Path(str(entry.get("local_path") or ""))
         if overlay_path.is_file():
             return overlay_path
-    for prefix_entry in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(prefix_entry, Mapping) or not prefix_entry.get("proposed"):
-            continue
-        prefix = _normalise_overlay_object_key(str(prefix_entry.get("prefix") or "")).rstrip("/")
-        if normalized_key.startswith(f"{prefix}/"):
-            return None
 
     backup_path = Path(str(run_state["base_dropbox_root"])) / normalized_key
     return backup_path if backup_path.is_file() else None
+
+
+def load_verified_writer_tombstones(run_state: dict[str, Any]) -> list[str]:
+    """Import writer-confirmed deletes without touching the Dropbox backup."""
+    path = Path(str(run_state["overlay_root"])) / "deleted-object-keys.json"
+    if not path.is_file():
+        return []
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, list) or any(not isinstance(key, str) for key in parsed):
+        raise ValueError("writer tombstone metadata has unexpected shape")
+    tombstones = run_state.setdefault("tombstones", {})
+    recorded: list[str] = []
+    for raw_key in parsed:
+        key = _normalise_overlay_object_key(raw_key)
+        if (Path(str(run_state["overlay_root"])) / "generated-objects" / key).is_file():
+            # Force-replace deletes old keys before re-uploading replacement
+            # bodies at some of the same keys. Only absent final keys are
+            # tombstones.
+            continue
+        tombstones[key] = {
+            "object_key": key,
+            "deleted": True,
+            "r2_delete_verified": True,
+            "r2_delete_verified_at_utc": fmt_iso(utc_now()),
+        }
+        recorded.append(key)
+    write_run_state(run_state)
+    return sorted(set(recorded))
 
 
 def stage_overlay_object(
@@ -14103,10 +14296,6 @@ def stage_overlay_object(
         "bytes": len(payload),
         "stage": stage,
         "dependencies": sorted({_normalise_overlay_object_key(value) for value in dependencies}),
-        "proposed": True,
-        "built": True,
-        "structurally_validated": False,
-        "structurally_validated_at_utc": None,
         "uploaded": False,
         "uploaded_at_utc": None,
         "r2_verified": False,
@@ -14114,15 +14303,6 @@ def stage_overlay_object(
     }
     write_run_state(run_state)
     return target
-
-
-def mark_overlay_structurally_validated(
-    run_state: dict[str, Any], object_key: str
-) -> None:
-    entry = _overlay_object_entry(run_state, object_key)
-    entry["structurally_validated"] = True
-    entry["structurally_validated_at_utc"] = fmt_iso(utc_now())
-    write_run_state(run_state)
 
 
 def mark_overlay_uploaded(run_state: dict[str, Any], object_key: str) -> None:
@@ -14387,6 +14567,8 @@ def _run_v2_observation_metadata_executor(
             "--dropbox-root", str(run_state["base_dropbox_root"]),
             "--run-state-json", str(run_state["run_state_path"]),
         ])
+    if not dry_run:
+        command.append("--write-r2")
     plan = {
         "history_version": "v2",
         "domain": domain,
@@ -14445,12 +14627,210 @@ def _run_v2_observation_metadata_executor(
             "output": output if isinstance(output, Mapping) else {},
             "results": output.get("results") if isinstance(output, Mapping) else [],
         }
+    receipt_status = _metadata_commit_receipt_status(
+        output if isinstance(output, Mapping) else {},
+        actions=actions,
+        dry_run=dry_run,
+    )
     return {
-        "status": str(output.get("status") or "planned"),
+        "status": str(output.get("status") or ("planned" if dry_run else "succeeded")),
         "exit_code": proc.returncode,
         "output": output,
         "results": output.get("results") if isinstance(output, Mapping) else [],
+        "commit_receipts": output.get("commit_receipts") if isinstance(output, Mapping) else [],
+        **receipt_status,
     }
+
+
+def _metadata_commit_receipt_status(
+    output: Mapping[str, Any],
+    *,
+    actions: Iterable[Mapping[str, Any]],
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Require a fresh verified receipt for every connector metadata commit."""
+    receipts = [
+        dict(receipt) for receipt in list(output.get("commit_receipts") or [])
+        if isinstance(receipt, Mapping)
+    ]
+    if dry_run:
+        return {
+            "commit_receipt_status": "not_required_dry_run",
+            "commit_receipt_reason": None,
+            "commit_receipts": receipts,
+        }
+    receipt_by_scope: dict[tuple[str, int], dict[str, Any]] = {}
+    for receipt in receipts:
+        try:
+            scope = (str(receipt.get("day_utc") or ""), int(receipt.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        if scope[0] and scope[1] > 0:
+            receipt_by_scope[scope] = receipt
+    connector_commit_kinds = {
+        "observation_pollutant_manifest_repair",
+        "observation_connector_manifest_repair",
+        "aqi_pollutant_manifest_repair",
+        "aqi_connector_manifest_repair",
+    }
+    required_scopes: set[tuple[str, int]] = set()
+    for action in actions:
+        if str(action.get("kind") or "") not in connector_commit_kinds:
+            continue
+        try:
+            connector_id = int(action.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        day_utc = str(action.get("day_utc") or "").strip()
+        if day_utc and connector_id > 0:
+            required_scopes.add((day_utc, connector_id))
+    missing_or_unverified: list[str] = []
+    required_fields = {
+        "transaction_id",
+        "history_version",
+        "domain",
+        "day_utc",
+        "connector_id",
+        "targeted_replacement_timeseries_ids",
+        "complete_committed_pollutant_set",
+        "connector_manifest_key",
+        "connector_manifest_hash",
+        "committed_connector_row_count",
+        "committed_timeseries_row_counts",
+        "written_object_keys",
+        "preserved_child_count",
+        "replaced_child_count",
+        "replaced_timeseries_count",
+        "finalisation_status",
+        "fresh_live_r2_verification",
+    }
+    for scope in sorted(required_scopes):
+        receipt = receipt_by_scope.get(scope)
+        if receipt is None:
+            missing_or_unverified.append(f"missing_receipt:{scope[0]}:connector_id={scope[1]}")
+            continue
+        missing_fields = sorted(field for field in required_fields if field not in receipt)
+        if missing_fields:
+            missing_or_unverified.append(
+                f"invalid_receipt:{scope[0]}:connector_id={scope[1]}:missing={','.join(missing_fields)}"
+            )
+            continue
+        if (
+            receipt.get("history_version") != "v2"
+            or receipt.get("finalisation_status") != "committed"
+            or receipt.get("fresh_live_r2_verification") is not True
+        ):
+            missing_or_unverified.append(
+                f"unverified_receipt:{scope[0]}:connector_id={scope[1]}"
+            )
+    return {
+        "commit_receipt_status": "succeeded" if not missing_or_unverified else "failed",
+        "commit_receipt_reason": "; ".join(missing_or_unverified) or None,
+        "commit_receipts": receipts,
+    }
+
+
+def _attach_observation_data_receipt_evidence(
+    metadata: dict[str, Any],
+    observations: Mapping[str, Any],
+) -> None:
+    """Merge the verified data-object evidence into the final metadata receipt."""
+    receipts = metadata.get("commit_receipts")
+    if not isinstance(receipts, list):
+        return
+    data_by_scope: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for result in list(observations.get("v2_observation_repair_results") or []):
+        if not isinstance(result, Mapping) or str(result.get("status") or "") != "ok":
+            continue
+        try:
+            scope = (str(result.get("day_utc") or ""), int(result.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        if scope[0] and scope[1] > 0:
+            data_by_scope[scope] = result
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            continue
+        try:
+            scope = (str(receipt.get("day_utc") or ""), int(receipt.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        data_result = data_by_scope.get(scope)
+        if data_result is None:
+            continue
+        data_keys = [
+            str(key) for key in list(data_result.get("verified_overlay_object_keys") or [])
+            if str(key).strip()
+        ]
+        receipt["written_object_keys"] = sorted({
+            *(str(key) for key in list(receipt.get("written_object_keys") or [])),
+            *data_keys,
+        })
+        timeseries_ids = sorted({
+            int(value) for value in list(data_result.get("timeseries_ids") or [])
+            if str(value).strip().isdigit() and int(value) > 0
+        })
+        if timeseries_ids:
+            receipt["targeted_replacement_timeseries_ids"] = timeseries_ids
+            receipt["replaced_timeseries_count"] = len(timeseries_ids)
+    output = metadata.get("output")
+    if isinstance(output, dict):
+        output["commit_receipts"] = receipts
+
+
+def _validate_observation_receipts_against_data(
+    metadata: dict[str, Any],
+    observations: Mapping[str, Any],
+) -> None:
+    """Use the committed connector receipt, not wrapper row totals, as the data gate."""
+    receipts = metadata.get("commit_receipts")
+    if not isinstance(receipts, list):
+        return
+    receipt_by_scope: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            continue
+        try:
+            scope = (str(receipt.get("day_utc") or ""), int(receipt.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        if scope[0] and scope[1] > 0:
+            receipt_by_scope[scope] = receipt
+    failures: list[str] = []
+    for result in list(observations.get("v2_observation_repair_results") or []):
+        if not isinstance(result, Mapping) or str(result.get("status") or "") != "ok":
+            continue
+        try:
+            scope = (str(result.get("day_utc") or ""), int(result.get("connector_id")))
+        except (TypeError, ValueError):
+            continue
+        receipt = receipt_by_scope.get(scope)
+        if receipt is None:
+            failures.append(f"missing_receipt:{scope[0]}:connector_id={scope[1]}")
+            continue
+        expected_rows = int(result.get("expected_source_rows_for_day") or 0)
+        committed_rows = int(receipt.get("committed_connector_row_count") or 0)
+        if expected_rows > 0 and committed_rows < expected_rows:
+            failures.append(
+                f"receipt_row_count_below_expected:{scope[0]}:connector_id={scope[1]}"
+            )
+        expected_counts = _normalize_timeseries_row_counts(
+            result.get("expected_timeseries_row_counts_for_day")
+        )
+        committed_counts = _normalize_timeseries_row_counts(
+            receipt.get("committed_timeseries_row_counts")
+        )
+        for timeseries_id, expected_count in expected_counts.items():
+            if committed_counts.get(timeseries_id) != expected_count:
+                failures.append(
+                    f"receipt_timeseries_count_mismatch:{scope[0]}:connector_id={scope[1]}:timeseries_id={timeseries_id}"
+                )
+    if failures:
+        metadata["commit_receipt_status"] = "failed"
+        existing_reason = str(metadata.get("commit_receipt_reason") or "").strip()
+        metadata["commit_receipt_reason"] = "; ".join(
+            value for value in [existing_reason, *failures] if value
+        )
 
 
 def _record_metadata_executor_overlay(
@@ -14463,118 +14843,303 @@ def _record_metadata_executor_overlay(
     manifest_stage: str = "observs_manifests",
     index_stage: str = "observs_indexes",
 ) -> None:
-    """Stage structurally validated metadata/index proposals locally."""
-    del dry_run
+    """Persist only changed metadata/index proposals in the sparse overlay."""
+    if dry_run:
+        return
     output = executor_result.get("output")
-    planning = output.get("planning") if isinstance(output, Mapping) else None
+    if not isinstance(output, Mapping):
+        return
+    planning = output.get("planning")
     if not isinstance(planning, Mapping):
         return
+    receipts = executor_result.get("commit_receipts")
+    if isinstance(receipts, list):
+        merged_receipts: dict[str, dict[str, Any]] = {}
+        for existing in list(run_state.get("commit_receipts") or []):
+            if not isinstance(existing, Mapping):
+                continue
+            transaction_id = str(existing.get("transaction_id") or "").strip()
+            if transaction_id:
+                merged_receipts[transaction_id] = dict(existing)
+        for receipt in receipts:
+            if not isinstance(receipt, Mapping):
+                continue
+            candidate = dict(receipt)
+            transaction_id = str(candidate.get("transaction_id") or "").strip()
+            if not transaction_id:
+                raise ValueError("metadata commit receipt missing transaction_id")
+            existing = merged_receipts.get(transaction_id)
+            if existing is not None and existing != candidate:
+                raise ValueError(
+                    f"conflicting metadata commit receipt transaction_id={transaction_id}"
+                )
+            merged_receipts[transaction_id] = candidate
+        run_state["commit_receipts"] = [
+            merged_receipts[transaction_id]
+            for transaction_id in sorted(merged_receipts)
+        ]
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
+    application = output.get("application")
+    application_operations = list(application.get("operations") or []) if isinstance(application, Mapping) else []
+    if not application_operations:
+        for result in list(output.get("results") or []):
+            if isinstance(result, Mapping):
+                application_operations.extend(list(result.get("operations") or []))
+    operation_by_key = {
+        str(operation.get("key") or ""): dict(operation)
+        for operation in application_operations if isinstance(operation, Mapping) and operation.get("key")
+    }
+    evidence = run_state.setdefault("proposal_evidence", {})
+    uncertain = run_state.setdefault("uncertain_r2_objects", {})
     for proposal in sorted(
         (item for item in list(planning.get("proposals") or []) if isinstance(item, Mapping)),
-        key=lambda item: str(item.get("key") or ""),
+        key=lambda item: (
+            str(item.get("key") or ""), str(item.get("kind") or ""),
+            str(item.get("sha256") or item.get("expected_sha256") or ""),
+        ),
     ):
         object_key = str(proposal.get("key") or "").strip()
-        body = proposal.get("proposed_body")
-        if not object_key or not proposal.get("changed") or not isinstance(body, str):
+        if not object_key:
             continue
-        with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
-            source = Path(temp_dir) / "generated-object"
-            source.write_text(body, encoding="utf-8")
-            stage = manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage
-            stage_overlay_object(
-                run_state, object_key=object_key, source_path=source, stage=stage,
-                dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
-            )
-        mark_overlay_structurally_validated(run_state, object_key)
-        scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
-        record_changed_scope(run_state, scope_set, {
-            "object_key": object_key,
-            "stage": manifest_stage if scope_set == manifest_scope_set else index_stage,
-            "provenance": proposal.get("provenance") or "repair_generated",
-        })
+        body = proposal.get("proposed_body")
+        operation = operation_by_key.get(object_key, {})
+        status = str(operation.get("status") or "not_run_due_to_dependency")
+        attempt = {
+            "stage": manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage,
+            "proposal": dict(proposal),
+            "application": dict(operation),
+        }
+        record = evidence.setdefault(object_key, {"attempts": []})
+        if not isinstance(record, dict):
+            record = {"attempts": []}
+            evidence[object_key] = record
+        attempts = record.setdefault("attempts", [])
+        if not isinstance(attempts, list):
+            attempts = []
+            record["attempts"] = attempts
+        if attempt not in attempts:
+            attempts.append(attempt)
+        record["attempts"] = sorted(
+            attempts,
+            key=lambda item: (
+                str(item.get("stage") or ""),
+                str((item.get("proposal") or {}).get("key") or ""),
+                str((item.get("proposal") or {}).get("kind") or ""),
+                str((item.get("proposal") or {}).get("sha256") or ""),
+            ),
+        )
+        record["latest_proposal"] = dict(proposal)
+        if status == "succeeded":
+            record["authoritative_application"] = dict(operation)
+            record["authoritative_proposal"] = dict(proposal)
+        if status == "succeeded" and proposal.get("changed") and isinstance(body, str):
+            with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-overlay-") as temp_dir:
+                source = Path(temp_dir) / "generated-object"
+                source.write_text(body, encoding="utf-8")
+                stage_overlay_object(
+                    run_state,
+                    object_key=object_key,
+                    source_path=source,
+                    stage=manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage,
+                    dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
+                )
+            mark_overlay_uploaded(run_state, object_key)
+            mark_overlay_verified(run_state, object_key)
+            scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
+            record_changed_scope(run_state, scope_set, {
+                "object_key": object_key,
+                "stage": manifest_stage if scope_set == manifest_scope_set else index_stage,
+            })
+        elif status == "failed":
+            if operation.get("put_attempted"):
+                uncertain[object_key] = dict(operation)
+                record_blocked_scope(run_state, {
+                    "stage": index_stage,
+                    "object_key": object_key,
+                    "kind": proposal.get("kind"),
+                    "reason": "r2_object_uncertain_after_failed_application",
+                    "failure_stage": operation.get("failure_stage"),
+                    "error": operation.get("error"),
+                })
+            else:
+                record_blocked_scope(run_state, {
+                    "stage": "application_failure",
+                    "object_key": object_key,
+                    "kind": proposal.get("kind"),
+                    "reason": "application_failed_before_put",
+                    "failure_stage": operation.get("failure_stage") or "pre_write_guard",
+                    "error": operation.get("error"),
+                })
+
     write_run_state(run_state)
 
-def _capture_local_v2_observation_scope(
+
+def _get_r2_object_bytes_for_integrity_overlay(
+    *,
+    object_key: str,
+    env: Mapping[str, str],
+) -> bytes:
+    """GET one object through the shared signer without exposing it in logs."""
+    repo_root = _repo_root_for_integrity_script(env)
+    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    code = r"""
+import { r2GetObject } from "./workers/shared/r2_sigv4.mjs";
+const env = process.env;
+const r2 = {
+  endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
+  bucket: String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim(),
+  region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
+  access_key_id: String(env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim(),
+  secret_access_key: String(env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim(),
+};
+const object = await r2GetObject({ r2, key: String(env.UK_AQ_INTEGRITY_OVERLAY_GET_KEY || "") });
+process.stdout.write(object.body.toString("base64"));
+"""
+    proc = subprocess.run(
+        [node_bin, "--input-type=module", "-e", code],
+        cwd=repo_root,
+        env={
+            **os.environ,
+            **{str(key): str(value) for key, value in env.items()},
+            "UK_AQ_INTEGRITY_OVERLAY_GET_KEY": object_key,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"R2 GET failed for {object_key}: exit_code={proc.returncode}")
+    return base64.b64decode(proc.stdout.encode("ascii"), validate=True)
+
+
+def _capture_verified_v2_observation_scope(
     *,
     run_state: dict[str, Any],
     day_utc: str,
     connector_id: int,
-    expected_timeseries_row_counts: Mapping[int, int],
+    env: Mapping[str, str],
 ) -> list[str]:
-    """Validate and stage one complete canonical connector-day proposal."""
+    """Verify and retain exactly the final writer receipt's Parquet objects."""
     generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
-    connector_prefix = (
-        f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-        f"connector_id={int(connector_id)}"
+    receipt_path = (
+        Path(str(run_state["overlay_root"])) / "data-receipts" /
+        f"day_utc={day_utc}" / f"connector_id={connector_id}.json"
     )
-    source_root = generated_root / connector_prefix
-    manifest_source = source_root / "manifest.json"
-    if not manifest_source.is_file():
-        raise FileNotFoundError(f"canonical connector manifest is unavailable: {connector_prefix}")
-    manifest = json.loads(manifest_source.read_text(encoding="utf-8"))
+    if not receipt_path.is_file():
+        raise FileNotFoundError(f"targeted observation data receipt is unavailable: {receipt_path}")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, Mapping):
+        raise ValueError("targeted observation data receipt is not an object")
     if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("history_version") != "v2"
-        or manifest.get("domain") != "observations"
-        or str(manifest.get("day_utc") or "") != day_utc
-        or int(manifest.get("connector_id") or 0) != int(connector_id)
+        int(receipt.get("receipt_schema_version") or 0) != 2
+        or receipt.get("history_version") != "v2"
+        or receipt.get("domain") != "observations"
+        or str(receipt.get("day_utc") or "") != day_utc
+        or int(receipt.get("connector_id") or 0) != connector_id
+        or receipt.get("finalisation_status") != "complete_generations_get_verified"
     ):
-        raise ValueError("canonical connector manifest identity is invalid")
-    expected_counts = {
-        int(timeseries_id): int(row_count)
-        for timeseries_id, row_count in expected_timeseries_row_counts.items()
-        if int(timeseries_id) > 0 and int(row_count) > 0
+        raise ValueError("targeted observation data receipt identity is invalid")
+    file_entries = list(receipt.get("files") or [])
+    if not file_entries:
+        raise ValueError("targeted observation data receipt has no files")
+    transaction_id = str(receipt.get("transaction_id") or "").strip()
+    declared_pollutants = {
+        str(value).strip().lower()
+        for value in list(receipt.get("pollutant_codes") or [])
+        if str(value).strip()
     }
-    actual_counts = _normalize_timeseries_row_counts(manifest.get("timeseries_row_counts"))
-    all_count_ids = sorted(set(expected_counts) | set(actual_counts))
-    count_mismatches = {
-        timeseries_id: {
-            "expected": int(expected_counts.get(timeseries_id, 0)),
-            "actual": int(actual_counts.get(timeseries_id, 0)),
-        }
-        for timeseries_id in all_count_ids
-        if int(actual_counts.get(timeseries_id, 0)) != int(expected_counts.get(timeseries_id, 0))
-    }
-    if count_mismatches:
-        raise ValueError(
-            "canonical connector proposal row counts do not match authoritative source: "
-            f"{dict(list(count_mismatches.items())[:25])}"
-        )
-    object_paths = sorted(path for path in source_root.rglob("*") if path.is_file())
-    if not object_paths:
-        raise ValueError("canonical connector proposal has no objects")
+    if not transaction_id or not declared_pollutants:
+        raise ValueError("targeted observation data receipt scope is invalid")
+    expected_transaction_id = (
+        f"integrity-{str(run_state.get('run_id') or '')}-observations-"
+        f"{day_utc}-connector-{connector_id}"
+    )
+    if transaction_id != expected_transaction_id:
+        raise ValueError("targeted observation data receipt transaction_id is invalid")
     captured: list[str] = []
-    parquet_pattern = re.compile(
-        rf"^{re.escape(connector_prefix)}/pollutant_code=[a-z0-9_]+/part-\d+\.parquet$"
-    )
-    for source in object_paths:
-        object_key = source.relative_to(generated_root).as_posix()
-        if re.search(r"/(?:generation|transactions)(?:=|/)", f"/{object_key}"):
-            raise ValueError(f"non-canonical proposal key: {object_key}")
-        if object_key.endswith(".parquet") and not parquet_pattern.fullmatch(object_key):
-            raise ValueError(f"non-canonical parquet proposal key: {object_key}")
-        stage_overlay_object(
-            run_state, object_key=object_key, source_path=source,
-            stage="observations_data", dependencies=(),
+    normalized_files: list[dict[str, Any]] = []
+    for entry in file_entries:
+        if not isinstance(entry, Mapping):
+            raise ValueError("targeted observation data receipt file is invalid")
+        object_key = _normalise_overlay_object_key(str(entry.get("key") or ""))
+        pollutant_code = str(entry.get("pollutant_code") or "").strip().lower()
+        expected_sha = str(entry.get("content_sha256") or "")
+        expected_bytes = int(entry.get("bytes") or -1)
+        expected_key_fragment = (
+            f"/day_utc={day_utc}/connector_id={connector_id}/"
+            f"pollutant_code={pollutant_code}/generation={transaction_id}/part-"
         )
-        mark_overlay_structurally_validated(run_state, object_key)
+        if (
+            not object_key or pollutant_code not in declared_pollutants
+            or expected_key_fragment not in f"/{object_key}"
+            or not object_key.endswith(".parquet")
+            or len(expected_sha) != 64 or expected_bytes < 0
+            or int(entry.get("row_count") or 0) <= 0
+            or not isinstance(entry.get("timeseries_row_counts"), Mapping)
+            or entry.get("immutable_live_object_result")
+            != "content_identity_get_verified"
+        ):
+            raise ValueError("targeted observation data receipt file identity is invalid")
+        source = generated_root / object_key
+        if not source.is_file():
+            raise FileNotFoundError(f"generated observation object is unavailable: {object_key}")
+        expected = source.read_bytes()
+        if len(expected) != expected_bytes or hashlib.sha256(expected).hexdigest() != expected_sha:
+            raise ValueError(f"generated observation object does not match receipt: {object_key}")
+        actual = _get_r2_object_bytes_for_integrity_overlay(object_key=object_key, env=env)
+        if len(actual) != expected_bytes or hashlib.sha256(actual).hexdigest() != expected_sha:
+            raise ValueError(f"R2 GET does not match generated observation object: {object_key}")
+        stage_overlay_object(run_state, object_key=object_key, source_path=source, stage="observs", dependencies=())
+        mark_overlay_uploaded(run_state, object_key)
+        mark_overlay_verified(run_state, object_key)
         captured.append(object_key)
-    prefix_tombstones = run_state.setdefault("tombstone_prefixes", [])
-    prefix_tombstones.append({
-        "prefix": connector_prefix, "proposed": True, "deleted": False,
-        "deletion_verified": False, "stage": "observations_data",
-    })
-    run_state["tombstone_prefixes"] = sorted(
-        {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
-        key=lambda entry: str(entry["prefix"]),
+        normalized_files.append(dict(entry, key=object_key))
+    permanent_receipt_key = _normalise_overlay_object_key(
+        str(receipt.get("permanent_receipt_key") or "")
     )
+    expected_receipt_key = (
+        f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/connector_id={connector_id}/"
+        f"transactions/transaction_id={transaction_id}/data-receipt.json"
+    )
+    if permanent_receipt_key != expected_receipt_key:
+        raise ValueError("targeted observation permanent receipt key is invalid")
+    receipt_source = generated_root / permanent_receipt_key
+    if not receipt_source.is_file():
+        raise FileNotFoundError(
+            f"generated permanent observation receipt is unavailable: {permanent_receipt_key}"
+        )
+    receipt_expected = receipt_source.read_bytes()
+    receipt_actual = _get_r2_object_bytes_for_integrity_overlay(
+        object_key=permanent_receipt_key, env=env
+    )
+    if (
+        len(receipt_actual) != len(receipt_expected)
+        or hashlib.sha256(receipt_actual).digest()
+        != hashlib.sha256(receipt_expected).digest()
+    ):
+        raise ValueError("R2 GET does not match permanent observation receipt")
+    stage_overlay_object(
+        run_state,
+        object_key=permanent_receipt_key,
+        source_path=receipt_source,
+        stage="observs",
+        dependencies=tuple(captured),
+    )
+    mark_overlay_uploaded(run_state, permanent_receipt_key)
+    mark_overlay_verified(run_state, permanent_receipt_key)
+    captured.append(permanent_receipt_key)
+    receipt_key = f"{day_utc}|{connector_id}"
+    run_state.setdefault("observation_data_receipts", {})[receipt_key] = {
+        **dict(receipt),
+        "files": sorted(normalized_files, key=lambda entry: str(entry["key"])),
+    }
     write_run_state(run_state)
     return captured
 
-def _capture_local_v2_aqi_scope(
+
+def _capture_verified_v2_aqi_scope(
     *,
     run_state: dict[str, Any],
     day_utc: str,
@@ -14582,7 +15147,7 @@ def _capture_local_v2_aqi_scope(
     env: Mapping[str, str],
     include_debug: bool = False,
 ) -> list[str]:
-    """Validate and stage generated AQI bytes without remote access."""
+    """Verify and retain generated AQI bytes; debug is required only on request."""
     config = resolve_history_path_config("v2", {**os.environ, **dict(env)})
     prefixes = [config.aqilevels_hourly_data_prefix]
     if include_debug and config.aqilevels_hourly_debug_prefix:
@@ -14599,35 +15164,24 @@ def _capture_local_v2_aqi_scope(
             raise FileNotFoundError(f"generated AQI connector manifest is unavailable: {connector_key}")
         manifest = json.loads(connector_source.read_text(encoding="utf-8"))
         if not isinstance(manifest, Mapping):
-            raise ValueError(f"invalid local AQI connector manifest: {connector_key}")
-        if (
-            manifest.get("history_version") != "v2"
-            or manifest.get("domain") != "aqilevels"
-            or str(manifest.get("day_utc") or "") != day_utc
-            or int(manifest.get("connector_id") or 0) != int(connector_id)
-        ):
-            raise ValueError(f"invalid local AQI connector identity: {connector_key}")
-        connector_prefix = connector_key.removesuffix("/manifest.json")
-        source_root = generated_root / connector_prefix
-        object_paths = sorted(path for path in source_root.rglob("*") if path.is_file())
-        parquet_pattern = re.compile(
-            rf"^{re.escape(connector_prefix)}/pollutant_code=[a-z0-9_]+/part-\d+\.parquet$"
-        )
-        for source in object_paths:
-            object_key = source.relative_to(generated_root).as_posix()
-            if object_key.endswith(".parquet") and not parquet_pattern.fullmatch(object_key):
-                raise ValueError(f"non-canonical AQI parquet proposal key: {object_key}")
+            raise ValueError(f"invalid AQI connector manifest after GET: {connector_key}")
+        object_keys = [
+            *(str(entry.get("key") or "") for entry in list(manifest.get("files") or []) if isinstance(entry, Mapping)),
+            *(str(entry.get("manifest_key") or "") for entry in list(manifest.get("child_manifests") or []) if isinstance(entry, Mapping)),
+            connector_key,
+        ]
+        for object_key in sorted({_normalise_overlay_object_key(key) for key in object_keys if key}):
+            source = generated_root / object_key
+            if not source.is_file():
+                raise FileNotFoundError(f"generated AQI object is unavailable: {object_key}")
+            expected = source.read_bytes()
+            actual = _get_r2_object_bytes_for_integrity_overlay(object_key=object_key, env=env)
+            if len(actual) != len(expected) or hashlib.sha256(actual).digest() != hashlib.sha256(expected).digest():
+                raise ValueError(f"R2 GET does not match generated AQI object: {object_key}")
             stage_overlay_object(run_state, object_key=object_key, source_path=source, stage="aqilevels", dependencies=())
-            mark_overlay_structurally_validated(run_state, object_key)
+            mark_overlay_uploaded(run_state, object_key)
+            mark_overlay_verified(run_state, object_key)
             captured.append(object_key)
-        run_state.setdefault("tombstone_prefixes", []).append({
-            "prefix": connector_prefix,
-            "proposed": True,
-            "deleted": False,
-            "deletion_verified": False,
-            "stage": "aqilevels",
-        })
-    write_run_state(run_state)
     return sorted(set(captured))
 
 
@@ -14682,12 +15236,7 @@ def _phase4_aqi_work(
 
     for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []):
         if isinstance(scope, Mapping):
-            add(
-                scope.get("day_utc"),
-                scope.get("connector_id"),
-                scope.get("affected_pollutant_codes") or scope.get("pollutant_codes") or [],
-                "observations_changed",
-            )
+            add(scope.get("day_utc"), scope.get("connector_id"), scope.get("pollutant_codes") or [], "observations_changed")
 
     changed_keys = {
         key for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or [])
@@ -14725,7 +15274,7 @@ def _queue_phase4_aqi_work(
     for entry in work:
         day_utc = str(entry["day_utc"])
         connector_id = int(entry["connector_id"])
-        row = {**dict(entry), "history_version": "v2", "source_mode": "combined_local"}
+        row = {**dict(entry), "history_version": "v2", "source_mode": "live_r2"}
         planned.append(row)
         if dry_run:
             continue
@@ -14736,7 +15285,7 @@ def _queue_phase4_aqi_work(
             connector_id=connector_id,
             day_utc=day_utc,
             reason="phase4_aqi_rebuild",
-            source_mode="combined_local",
+            source_mode="live_r2",
             requested_timeseries_ids=[],
             queue_note=(
                 "phase4 ordered AQI rebuild "
@@ -14763,13 +15312,8 @@ def _create_final_verification_view(
     tombstones = {
         _normalise_overlay_object_key(str(key))
         for key, value in dict(run_state.get("tombstones") or {}).items()
-        if isinstance(value, Mapping) and (value.get("proposed") or value.get("deleted"))
+        if isinstance(value, Mapping) and value.get("r2_delete_verified")
     }
-    tombstone_prefixes = tuple(
-        f"{_normalise_overlay_object_key(str(entry.get('prefix') or '')).rstrip('/')}/"
-        for entry in list(run_state.get("tombstone_prefixes") or [])
-        if isinstance(entry, Mapping) and entry.get("proposed") and entry.get("prefix")
-    )
 
     # The verification checks need directory discovery and parquet paths. Use
     # symlinks, never copied Dropbox objects, and avoid retired archive trees.
@@ -14786,14 +15330,11 @@ def _create_final_verification_view(
         )),
         *([f"{config.aqilevels_hourly_debug_prefix.strip('/')}/day_utc={day}" for day in days]
           if config.aqilevels_hourly_debug_prefix else []),
-        config.timeseries_binding_index_prefix.strip("/"),
     ]
     file_keys = [config.observations_latest_index_key.strip("/"), config.aqilevels_latest_index_key.strip("/")]
     def link_file(source: Path, relative_key: str) -> None:
         normalized_key = _normalise_overlay_object_key(relative_key)
-        if normalized_key in tombstones or any(
-            normalized_key.startswith(prefix) for prefix in tombstone_prefixes
-        ):
+        if normalized_key in tombstones:
             return
         target = view_root / normalized_key
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -14813,7 +15354,7 @@ def _create_final_verification_view(
             link_file(source, key)
 
     for object_key, entry in dict(run_state.get("objects") or {}).items():
-        if not isinstance(entry, Mapping) or not entry.get("structurally_validated"):
+        if not isinstance(entry, Mapping) or not entry.get("r2_verified"):
             continue
         source = Path(str(entry.get("local_path") or ""))
         if not source.is_file():
@@ -14829,10 +15370,10 @@ def _create_final_verification_view(
 def _final_verification_stage_for_gap(domain: str, gap: Mapping[str, Any]) -> str:
     gap_type = str(gap.get("gap_type") or "")
     if gap_type.startswith("index_") or gap_type.startswith("latest_index_"):
-        return "observations_metadata_proposal" if domain == "observations" else "aqi_proposal"
+        return "observs_indexes" if domain == "observations" else "aqilevels_indexes"
     if "manifest" in gap_type or gap_type.startswith("day_") or gap_type.startswith("connector_"):
-        return "observations_metadata_proposal" if domain == "observations" else "aqi_proposal"
-    return "observations_proposal" if domain == "observations" else "aqi_proposal"
+        return "observs_manifests" if domain == "observations" else "aqilevels_manifests"
+    return "observs" if domain == "observations" else "aqilevels"
 
 
 def _metadata_iso_value(value: Any, *, field: str) -> tuple[dt.datetime | None, str | None]:
@@ -15204,7 +15745,6 @@ def run_v2_final_verification(
     require_aqi_debug: bool,
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
-    require_remote_state: bool = True,
 ) -> dict[str, Any]:
     """One read-only final pass over source cache and final local objects."""
     view_root = _create_final_verification_view(
@@ -15266,7 +15806,7 @@ def run_v2_final_verification(
         verification_evidence.append(evidence)
         if evidence["uploaded"] and evidence["r2_verified"]:
             r2_written_keys.add(str(object_key))
-        if require_remote_state and (not evidence["uploaded"] or not evidence["r2_verified"]):
+        if not evidence["uploaded"] or not evidence["r2_verified"]:
             remaining_scopes.append({
                 "stage": "r2_get_verification",
                 "object_key": object_key,
@@ -15322,60 +15862,39 @@ def run_v2_final_verification(
             "superseded_by_verified_write": str(object_key) in r2_written_keys,
         }
         r2_delete_verification_evidence.append(delete_evidence)
-        if require_remote_state and not delete_evidence["r2_delete_verified"]:
+        if not delete_evidence["r2_delete_verified"]:
             remaining_scopes.append({
                 "stage": "r2_delete_verification",
                 "object_key": object_key,
                 "gap_type": "deleted_object_missing_r2_delete_verification",
             })
-    for prefix_entry in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(prefix_entry, Mapping):
-            continue
-        prefix = str(prefix_entry.get("prefix") or "").rstrip("/")
-        delete_evidence = {
-            "object_key": f"{prefix}/",
-            "r2_delete_verified": bool(prefix_entry.get("deletion_verified")),
-            "deleted_object_count": int(prefix_entry.get("deleted_object_count") or 0),
-            "deleted_object_keys": sorted({
-                str(value) for value in list(prefix_entry.get("deleted_object_keys") or [])
-                if str(value)
-            }),
-            "superseded_by_verified_write": False,
-        }
-        r2_delete_verification_evidence.append(delete_evidence)
-        if require_remote_state and not delete_evidence["r2_delete_verified"]:
-            remaining_scopes.append({
-                "stage": "canonical_apply",
-                "object_key": f"{prefix}/",
-                "gap_type": "connector_prefix_missing_delete_verification",
-            })
     stage_counts = {
         stage: sum(1 for scope in remaining_scopes if scope.get("stage") == stage)
-        for stage in CANONICAL_REPAIR_STAGE_ORDER[:-1]
+        for stage in V2_REPAIR_STAGE_ORDER[:-1]
     }
     return {
         "ran": True,
-        "status": ("ok" if require_remote_state else "planned") if not remaining_scopes else "failed",
+        "status": "ok" if not remaining_scopes else "failed",
         "verification_view_path": str(view_root),
         "source_truth": "source_cache",
-        "local_object_resolution": "structurally_validated_overlay_then_proposed_tombstone_then_dropbox",
+        "local_object_resolution": "verified_overlay_first_then_dropbox",
         "r2_get_verification_evidence": verification_evidence,
         "r2_delete_verification_evidence": r2_delete_verification_evidence,
         "application_failures": application_failures,
         "r2_objects_written": len(r2_written_keys),
         "r2_objects_deleted": sum(
-            int(evidence.get("deleted_object_count") or 1)
+            1
             for evidence in r2_delete_verification_evidence
             if evidence["r2_delete_verified"] and not evidence["superseded_by_verified_write"]
         ),
         "r2_objects_changed": len(r2_written_keys) + sum(
-            int(evidence.get("deleted_object_count") or 1)
+            1
             for evidence in r2_delete_verification_evidence
             if evidence["r2_delete_verified"] and not evidence["superseded_by_verified_write"]
         ),
         "remaining_gap_count": len(remaining_scopes),
         "remaining_scopes": remaining_scopes,
-        "stage_remaining_counts": stage_counts,
+        "six_stage_remaining_counts": stage_counts,
         "recheck": recheck,
     }
 
@@ -15394,146 +15913,6 @@ def cleanup_successful_repair_overlay(run_state: dict[str, Any]) -> dict[str, An
     }
     write_run_state(run_state)
     return dict(run_state["cleanup"])
-
-
-def _object_operation_domain(object_key: str) -> str:
-    return "aqilevels" if "/aqilevels_" in object_key or "/aqilevels/" in object_key else "observations"
-
-
-def record_integrity_object_operations(
-    conn: sqlite3.Connection,
-    *,
-    run_id: int,
-    run_state: Mapping[str, Any],
-) -> dict[str, int]:
-    """Persist planned and completed object states without conflating them."""
-    now_iso = fmt_iso(utc_now())
-    counts = {"planned_writes": 0, "planned_deletions": 0, "completed_writes": 0, "completed_deletions": 0}
-    for object_key, entry in sorted(dict(run_state.get("objects") or {}).items()):
-        if not isinstance(entry, Mapping):
-            continue
-        remote_completed = bool(entry.get("remote_completed") or entry.get("r2_verified"))
-        counts["planned_writes"] += 1
-        counts["completed_writes"] += int(remote_completed)
-        conn.execute(
-            """
-            INSERT INTO integrity_object_operations (
-              run_id, object_key, domain, operation_kind, planned,
-              local_path, local_sha256, local_bytes, structurally_validated,
-              remote_attempted, remote_completed, get_verified, delete_verified,
-              status, error, updated_at_utc
-            ) VALUES (?, ?, ?, 'put', 1, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-            ON CONFLICT(run_id, object_key, operation_kind) DO UPDATE SET
-              local_path=excluded.local_path,
-              local_sha256=excluded.local_sha256,
-              local_bytes=excluded.local_bytes,
-              structurally_validated=excluded.structurally_validated,
-              remote_attempted=excluded.remote_attempted,
-              remote_completed=excluded.remote_completed,
-              get_verified=excluded.get_verified,
-              status=excluded.status,
-              error=excluded.error,
-              updated_at_utc=excluded.updated_at_utc
-            """,
-            (
-                int(run_id), str(object_key), _object_operation_domain(str(object_key)),
-                entry.get("local_path"), entry.get("sha256"), entry.get("bytes"),
-                int(bool(entry.get("structurally_validated"))),
-                int(bool(entry.get("remote_attempted") or entry.get("uploaded"))),
-                int(remote_completed), int(bool(entry.get("r2_verified"))),
-                str(entry.get("status") or ("planned" if entry.get("proposed") else "blocked")),
-                entry.get("error"), now_iso,
-            ),
-        )
-    for prefix_entry in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(prefix_entry, Mapping) or not prefix_entry.get("prefix"):
-            continue
-        prefix = str(prefix_entry["prefix"]).rstrip("/")
-        remote_completed = bool(prefix_entry.get("remote_completed") or prefix_entry.get("deletion_verified"))
-        counts["planned_deletions"] += 1
-        counts["completed_deletions"] += int(remote_completed)
-        conn.execute(
-            """
-            INSERT INTO integrity_object_operations (
-              run_id, object_key, domain, operation_kind, planned,
-              structurally_validated, remote_attempted, remote_completed,
-              get_verified, delete_verified, status, error, updated_at_utc
-            ) VALUES (?, ?, ?, 'delete_prefix', 1, 1, ?, ?, 0, ?, ?, ?, ?)
-            ON CONFLICT(run_id, object_key, operation_kind) DO UPDATE SET
-              remote_attempted=excluded.remote_attempted,
-              remote_completed=excluded.remote_completed,
-              delete_verified=excluded.delete_verified,
-              status=excluded.status,
-              error=excluded.error,
-              updated_at_utc=excluded.updated_at_utc
-            """,
-            (
-                int(run_id), f"{prefix}/", _object_operation_domain(prefix),
-                int(bool(prefix_entry.get("remote_attempted"))), int(remote_completed),
-                int(bool(prefix_entry.get("deletion_verified"))),
-                str(prefix_entry.get("status") or "planned"), prefix_entry.get("error"), now_iso,
-            ),
-        )
-        for deleted_key in sorted({
-            str(value)
-            for value in list(prefix_entry.get("deleted_object_keys") or [])
-            if str(value)
-        }):
-            conn.execute(
-                """
-                INSERT INTO integrity_object_operations (
-                  run_id, object_key, domain, operation_kind, planned,
-                  structurally_validated, remote_attempted, remote_completed,
-                  get_verified, delete_verified, status, error, updated_at_utc
-                ) VALUES (?, ?, ?, 'delete', 0, 0, 1, 1, 0, 1, 'deletion_verified', NULL, ?)
-                ON CONFLICT(run_id, object_key, operation_kind) DO UPDATE SET
-                  remote_attempted=1,
-                  remote_completed=1,
-                  delete_verified=1,
-                  status='deletion_verified',
-                  error=NULL,
-                  updated_at_utc=excluded.updated_at_utc
-                """,
-                (int(run_id), deleted_key, _object_operation_domain(deleted_key), now_iso),
-            )
-    conn.commit()
-    return counts
-
-
-def run_canonical_apply_executor(
-    *,
-    run_state: dict[str, Any],
-    env: Mapping[str, str],
-    log: logging.Logger,
-) -> dict[str, Any]:
-    repo_root = _repo_root_for_integrity_script(env)
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    command = [
-        node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"),
-        "--run-state-json", str(run_state["run_state_path"]),
-        "--write-r2",
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    try:
-        output = json.loads(completed.stdout) if completed.stdout.strip() else {}
-    except json.JSONDecodeError:
-        output = {}
-    refreshed = json.loads(Path(str(run_state["run_state_path"])).read_text(encoding="utf-8"))
-    run_state.clear()
-    run_state.update(refreshed)
-    if completed.returncode != 0:
-        error = _truncate_text(completed.stderr or completed.stdout or "canonical apply failed", 4000)
-        log.error("canonical apply executor failed exit_code=%s error=%s", completed.returncode, error)
-        return {"status": "failed", "exit_code": completed.returncode, "error": error, "output": output}
-    return {"status": "succeeded", "exit_code": 0, "output": output}
 
 
 def run_v2_integrity_repair_flow(
@@ -15558,7 +15937,7 @@ def run_v2_integrity_repair_flow(
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Build one canonical local proposal, then optionally apply and verify it."""
+    """Run the six ordered v2 stages, keeping data writers index-free."""
     observations = run_v2_gap_backfills(
         conn=conn, run_id=run_id, env_name=env_name, run_compact=run_compact,
         env=env, v2_observations=v2_observations, dry_run=dry_run,
@@ -15567,21 +15946,10 @@ def run_v2_integrity_repair_flow(
         # historical observation specialist must not enqueue a duplicate.
         queue_aqi_from_observation_repairs=False,
     )
+    if not dry_run:
+        load_verified_writer_tombstones(run_state)
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
-    empty_replacement_scopes = {
-        (str(scope.get("day_utc") or ""), int(scope.get("connector_id") or 0))
-        for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or [])
-        if isinstance(scope, Mapping) and not list(scope.get("pollutant_codes") or [])
-    }
-    metadata_actions = [
-        action for action in metadata_actions
-        if not (
-            str(action.get("kind") or "") == "observation_pollutant_manifest_repair"
-            and (str(action.get("day_utc") or ""), int(action.get("connector_id") or 0))
-            in empty_replacement_scopes
-        )
-    ]
     # A repaired leaf always makes its pollutant/connector/day metadata and
     # targeted index eligible.  Keep one action set per day+connector so the
     # executor writes each parent only after the full child set is final.
@@ -15627,6 +15995,8 @@ def run_v2_integrity_repair_flow(
             run_state=run_state, conn=conn,
         )
     )
+    _attach_observation_data_receipt_evidence(metadata, observations)
+    _validate_observation_receipts_against_data(metadata, observations)
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
     _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
@@ -15636,7 +16006,7 @@ def run_v2_integrity_repair_flow(
         "failed", "blocked_dependency",
     } and observation_index_status not in {
         "failed", "blocked_dependency",
-    }
+    } and str(metadata.get("commit_receipt_status") or "succeeded") not in {"failed"}
     aqi_work, aqi_blocked = _phase4_aqi_work(
         conn=conn, run_state=run_state, v2_aqilevels=v2_aqilevels,
     )
@@ -15655,16 +16025,9 @@ def run_v2_integrity_repair_flow(
                 "scope_count": len(aqi_work),
             })
     else:
-        combined_observations_root = _create_final_verification_view(
-            run_state,
-            config=final_verification_config,
-            from_day=from_day,
-            to_day=to_day,
-            selected_days=selected_days,
-        )
         planned_aqi_work = _queue_phase4_aqi_work(
             conn=conn, run_id=run_id, env_name=env_name, work=aqi_work,
-            log=log, dry_run=False,
+            log=log, dry_run=dry_run,
         )
         aqi_result = run_aqi_rebuild_queue_execution(
             conn,
@@ -15672,27 +16035,32 @@ def run_v2_integrity_repair_flow(
             env_name=env_name,
             run_compact=run_compact,
             env=env,
-            dry_run=False,
+            dry_run=dry_run,
             run_backfill=True,
             limits=limits,
             log=log,
             dry_run_planned_rows=planned_aqi_work,
             history_version="v2",
+            # The writer currently reads committed R2 observations.  They are
+            # the exact observation objects Phase 3 PUT-and-GET verified; the
+            # Dropbox mirror cannot contain this same-run state yet.
             skip_stale_local_post_validation=True,
-            execute_local_proposal=True,
             extra_env={
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(run_state["overlay_root"]),
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
-                "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(combined_observations_root),
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ENABLED": "true",
+                "UK_AQ_BACKFILL_TARGETED_STAGE_ROOT": str(run_state["overlay_root"]),
+                "UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE": "true",
+                "UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP": "false",
             },
         )
         aqi_result["planned_phase4_aqi_work"] = planned_aqi_work
 
+    if not dry_run:
+        load_verified_writer_tombstones(run_state)
+
     rebuilt_aqi_scopes: set[tuple[str, int]] = set()
     aqi_capture_failures = 0
-    for entry in list(aqi_result.get("aqi_rebuild_results") or []):
+    if not dry_run:
+        for entry in list(aqi_result.get("aqi_rebuild_results") or []):
             if not isinstance(entry, Mapping) or str(entry.get("status") or "") != "complete":
                 continue
             day_utc = str(entry.get("day_utc") or "").strip()
@@ -15701,13 +16069,10 @@ def run_v2_integrity_repair_flow(
             except (TypeError, ValueError):
                 continue
             try:
-                object_keys = _capture_local_v2_aqi_scope(
+                object_keys = _capture_verified_v2_aqi_scope(
                     run_state=run_state, day_utc=day_utc,
                     connector_id=connector_id, env=env,
-                    include_debug=bool(
-                        check_aqi_debug
-                        or (v2_aqilevels.get("debug") or {}).get("required")
-                    ),
+                    include_debug=bool((v2_aqilevels.get("debug") or {}).get("required")),
                 )
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 aqi_capture_failures += 1
@@ -15715,7 +16080,7 @@ def run_v2_integrity_repair_flow(
                     "stage": "aqilevels",
                     "day_utc": day_utc,
                     "connector_id": connector_id,
-                    "reason": f"aqi_local_proposal_validation_failed:{type(exc).__name__}",
+                    "reason": f"aqi_overlay_r2_get_verification_failed:{type(exc).__name__}",
                 })
                 continue
             rebuilt_aqi_scopes.add((day_utc, connector_id))
@@ -15760,23 +16125,8 @@ def run_v2_integrity_repair_flow(
             "requires_index_rebuild": True,
             "gap_types": ["aqi_data_rebuilt"],
         }
-        rebuilt_scope = next(
-            (
-                scope for scope in list((run_state.get("changed_scopes") or {}).get("AQILEVELS_CHANGED") or [])
-                if isinstance(scope, Mapping)
-                and str(scope.get("day_utc") or "") == day_utc
-                and int(scope.get("connector_id") or 0) == connector_id
-            ),
-            {},
-        )
-        proposal_aqi_pollutants = {
-            match.group(1)
-            for key in list(rebuilt_scope.get("object_keys") or [])
-            if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", str(key)))
-        }
         for pollutant_code in list(matching_work.get("pollutant_codes") or []):
-            if pollutant_code in proposal_aqi_pollutants:
-                aqi_metadata_actions.append({**base, "kind": "aqi_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+            aqi_metadata_actions.append({**base, "kind": "aqi_pollutant_manifest_repair", "pollutant_code": pollutant_code})
             aqi_metadata_actions.append({**base, "kind": "aqi_index_repair", "pollutant_code": pollutant_code})
         day_base = {
             key: value for key, value in base.items()
@@ -15801,33 +16151,11 @@ def run_v2_integrity_repair_flow(
     )
     aqi_manifest_status = str(aqi_metadata.get("manifest_status") or aqi_metadata.get("status") or "not_run")
     aqi_index_status = str(aqi_metadata.get("index_status") or aqi_metadata.get("status") or "not_run")
-    proposal_failed = (
-        observation_failed
-        or observation_manifest_status in {"failed", "blocked_dependency"}
-        or observation_index_status in {"failed", "blocked_dependency"}
-        or aqi_capture_failures > 0
-        or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0
-        or aqi_manifest_status in {"failed", "blocked_dependency"}
-        or aqi_index_status in {"failed", "blocked_dependency"}
-        or bool(run_state.get("blocked_scopes"))
-    )
-    planned_operation_counts = record_integrity_object_operations(
-        conn, run_id=run_id, run_state=run_state,
-    )
-    if dry_run or proposal_failed:
-        apply_result: dict[str, Any] = {
-            "status": "blocked_dependency" if proposal_failed else "planned",
-            "reason": "local_proposal_validation_failed" if proposal_failed else "repair_dry_run",
-        }
-    else:
-        apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
-        record_integrity_object_operations(conn, run_id=run_id, run_state=run_state)
-
-    if proposal_failed or apply_result.get("status") == "failed":
+    if dry_run:
         final_verification: dict[str, Any] = {
             "ran": False,
-            "status": "blocked_dependency",
-            "reason": "proposal_or_apply_failed",
+            "status": "planned",
+            "reason": "dry_run_has_no_final_written_state",
             "remaining_gap_count": None,
             "r2_objects_written": 0,
             "r2_objects_deleted": 0,
@@ -15847,18 +16175,24 @@ def run_v2_integrity_repair_flow(
             check_aqi_debug=check_aqi_debug,
             require_aqi_debug=require_aqi_debug,
             log=log,
-            require_remote_state=not dry_run,
         )
     stage_results = [
-        {"stage": "observations_proposal", "status": "failed" if observation_failed else "validated", "result": observations},
-        {"stage": "observations_metadata_proposal", "status": "failed" if observation_manifest_status in {"failed", "blocked_dependency"} or observation_index_status in {"failed", "blocked_dependency"} else "validated", "result": metadata},
-        {"stage": "aqi_proposal", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else "validated", "result": aqi_result, "source_mode": "combined_local"},
-        {"stage": "canonical_apply", "status": apply_result.get("status"), "result": apply_result},
+        {"stage": "observs", "status": "failed" if observation_failed else ("planned" if dry_run else "succeeded"), "result": observations},
+        {"stage": "observs_manifests", "status": observation_manifest_status, "result": metadata},
+        {"stage": "observs_indexes", "status": observation_index_status, "reason": "the metadata executor runs indexes once after final manifests per affected day"},
+        {"stage": "aqilevels", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else ("planned" if dry_run else "succeeded"), "result": aqi_result, "live_r2_read_exception": "writer_reads_verified_live_r2_observations"},
+        {"stage": "aqilevels_manifests", "status": aqi_manifest_status, "result": aqi_metadata},
+        {"stage": "aqilevels_indexes", "status": aqi_index_status, "reason": "the metadata executor runs AQI indexes once after final manifests per affected day"},
         {"stage": "final_verification", "status": final_verification.get("status"), "result": final_verification},
     ]
     coordinator_failed = (
-        proposal_failed
-        or apply_result.get("status") == "failed"
+        observation_failed
+        or observation_manifest_status in {"failed", "blocked_dependency"}
+        or observation_index_status in {"failed", "blocked_dependency"}
+        or aqi_capture_failures
+        or int(aqi_result.get("aqi_rebuilds_failed") or 0) > 0
+        or aqi_manifest_status in {"failed", "blocked_dependency"}
+        or aqi_index_status in {"failed", "blocked_dependency"}
         or final_verification.get("status") == "failed"
     )
     metadata_r2_operation_counts = {
@@ -15880,15 +16214,13 @@ def run_v2_integrity_repair_flow(
         ),
         "dry_run": bool(dry_run),
         "write_enabled": not dry_run,
-        "r2_write_attempted": bool(not dry_run and apply_result.get("status") in {"succeeded", "failed"}),
-        "planned_object_operation_counts": planned_operation_counts,
-        "canonical_apply": apply_result,
+        "r2_write_attempted": not dry_run,
         "metadata_executor_r2_operation_counts": metadata_r2_operation_counts,
-        "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
+        "stage_order": list(V2_REPAIR_STAGE_ORDER),
         "stage_results": stage_results,
-        "stage_result_counts": {
-            status: sum(1 for stage in stage_results if stage.get("status") == status)
-            for status in sorted({str(stage.get("status") or "not_run") for stage in stage_results})
+        "six_stage_result_counts": {
+            status: sum(1 for stage in stage_results[:-1] if stage.get("status") == status)
+            for status in sorted({str(stage.get("status") or "not_run") for stage in stage_results[:-1]})
         },
         "final_verification": final_verification,
         "r2_objects_written": int(final_verification.get("r2_objects_written") or 0),
@@ -15903,7 +16235,7 @@ def run_v2_integrity_repair_flow(
     log.info(
         "v2 repair coordinator %s: stages=%s r2_write_attempted=%s",
         result["status"],
-        ",".join(CANONICAL_REPAIR_STAGE_ORDER),
+        ",".join(V2_REPAIR_STAGE_ORDER),
         result["r2_write_attempted"],
     )
     return result
@@ -16013,30 +16345,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "--check-only and --run-backfill cannot be used together.",
         )
     return parsed
-
-
-def resolve_effective_mode(args: argparse.Namespace) -> Literal[
-    "check_only", "repair_dry_run", "repair_apply"
-]:
-    """Map the compatible CLI flags onto the three Integrity modes."""
-    if args.run_backfill:
-        return "repair_dry_run" if args.dry_run else "repair_apply"
-    return "check_only"
-
-
-def mode_creates_repair_overlay(effective_mode: str) -> bool:
-    return effective_mode in {"repair_dry_run", "repair_apply"}
-
-
-def mode_allows_remote_apply(effective_mode: str) -> bool:
-    return effective_mode == "repair_apply"
-
-
-def source_acquisition_dry_run(effective_mode: str) -> bool:
-    """Source acquisition is real/reused in every mode; dry-run applies to mutation only."""
-    if effective_mode not in {"check_only", "repair_dry_run", "repair_apply"}:
-        raise ValueError(f"unknown Integrity mode: {effective_mode}")
-    return False
 
 
 def check_dropbox_backup_ready(
@@ -17241,9 +17549,6 @@ def open_db(db_path: str) -> sqlite3.Connection:
         "source_observations_version": "TEXT",
     })
     ensure_columns(conn, "integrity_runs", {
-        "effective_mode": "TEXT",
-        "dropbox_baseline": "TEXT",
-        "allow_stale_dropbox": "INTEGER NOT NULL DEFAULT 0",
         "backfills_ok": "INTEGER DEFAULT 0",
         "backfills_failed": "INTEGER DEFAULT 0",
         "cross_checks_total": "INTEGER DEFAULT 0",
@@ -18296,7 +18601,6 @@ def write_reports(
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    effective_mode = resolve_effective_mode(args)
     env = load_env_or_die()
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
@@ -18332,8 +18636,17 @@ def main(argv: list[str]) -> int:
     logical_run_date_source = "cli_logical_run_date" if args.logical_run_date else "current_utc_date"
     daily_task_scheduled_for_date = logical_run_date.isoformat()
     daily_task_platform_run_id = f"{args.env}:{run_compact}"
-    backup_gate_required = True
-    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
+    backup_gate_required = bool(args.run_backfill)
+    backup_gate_summary = (
+        run_scheduled_backup_gate(args, started_iso)
+        if backup_gate_required
+        else {
+            "backup_gate_checked": False,
+            "backup_ready": None,
+            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+            "blocked_reason": "repair_not_requested",
+        }
+    )
     if backup_gate_required:
         log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
         if not backup_gate_summary.get("backup_ready"):
@@ -18350,8 +18663,6 @@ def main(argv: list[str]) -> int:
                 "dry_run": bool(args.dry_run),
                 "check_only": bool(args.check_only),
                 "run_backfill": bool(args.run_backfill),
-                "effective_mode": effective_mode,
-                "dropbox_baseline": resolve_r2_history_root(os.environ),
                 "repair_mode": bool(args.run_backfill),
                 "allow_stale_dropbox": bool(args.allow_stale_dropbox),
                 "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
@@ -18373,8 +18684,23 @@ def main(argv: list[str]) -> int:
     repair_flow: dict[str, Any] = {
         "status": "not_requested",
         "r2_write_attempted": False,
-        "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
+        "stage_order": list(V2_REPAIR_STAGE_ORDER),
     }
+    if args.run_backfill:
+        dropbox_root = resolve_r2_history_root({**os.environ, **env})
+        if not dropbox_root:
+            raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is required for the v2 repair overlay")
+        repair_overlay = create_run_overlay(
+            tmp_dir=env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"],
+            run_id=run_compact,
+            environment=args.env,
+            base_dropbox_root=dropbox_root,
+        )
+        log.info(
+            "created v2 repair overlay run_state=%s overlay=%s",
+            repair_overlay["run_state_path"],
+            repair_overlay["overlay_root"],
+        )
     from_day, to_day = compute_window(
         args.profile, args.from_day, args.to_day, os.environ
     )
@@ -18429,8 +18755,6 @@ def main(argv: list[str]) -> int:
             "dry_run": bool(args.dry_run),
             "check_only": bool(args.check_only),
             "run_backfill": bool(args.run_backfill),
-            "effective_mode": effective_mode,
-            "dropbox_baseline": resolve_r2_history_root(os.environ),
             "repair_mode": bool(args.run_backfill),
             "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
             "log_path": str(log_path),
@@ -18518,15 +18842,12 @@ def main(argv: list[str]) -> int:
             """
             INSERT INTO integrity_runs (
               started_at_utc, env_name, profile, source_filter,
-              from_day, to_day, effective_mode, dropbox_baseline,
-              allow_stale_dropbox, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              from_day, to_day, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 started_iso, args.env, args.profile, args.source,
-                from_day, to_day, effective_mode,
-                resolve_r2_history_root(os.environ),
-                1 if args.allow_stale_dropbox else 0, "running",
+                from_day, to_day, "running",
                 "history integrity run in progress.",
             ),
         )
@@ -18551,13 +18872,11 @@ def main(argv: list[str]) -> int:
                 "logical_run_date_source": logical_run_date_source,
                 "check_only": bool(args.check_only), "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill), "repair_mode": bool(args.run_backfill),
-                "effective_mode": effective_mode,
-                "dropbox_baseline": resolve_r2_history_root(os.environ),
                 "skip_cross_check": bool(args.skip_cross_check),
                 "allow_stale_dropbox": bool(args.allow_stale_dropbox), "status": "started",
                 "integrity_run_id": run_id, "r2_write_attempted": False,
                 "r2_objects_written": 0, "r2_objects_deleted": 0,
-                "r2_objects_changed": 0, "stage_result_counts": {},
+                "r2_objects_changed": 0, "six_stage_result_counts": {},
                 "overlay_path": repair_overlay.get("overlay_root") if repair_overlay else None,
                 "remaining_gap_count": None, "log_path": str(log_path),
                 "backup_readiness": backup_gate_summary,
@@ -18600,7 +18919,7 @@ def main(argv: list[str]) -> int:
                 env_name=args.env,
                 snapshot_root_str=resolve_core_snapshot_root(resolve_core_history_version_for_mode(history_version_mode), os.environ),
                 force=args.force_snapshot_import,
-                dry_run=False,
+                dry_run=args.dry_run,
                 log=log,
             )
             snapshot_result["core_history_version"] = resolve_core_history_version_for_mode(history_version_mode)
@@ -18662,7 +18981,7 @@ def main(argv: list[str]) -> int:
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
                 selected_days=selected_day_values,
-                dry_run=source_acquisition_dry_run(effective_mode), run_backfill=False,
+                dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
                 history_version=source_adapter_history_version,
@@ -18679,7 +18998,7 @@ def main(argv: list[str]) -> int:
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
                 selected_days=selected_day_values,
-                dry_run=source_acquisition_dry_run(effective_mode), run_backfill=False,
+                dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log, run_compact=run_compact,
                 concurrency=max(1, int(args.concurrency)),
                 history_version=source_adapter_history_version,
@@ -18696,7 +19015,7 @@ def main(argv: list[str]) -> int:
                 conn=conn, env_name=args.env, env=env,
                 from_day=from_day, to_day=to_day,
                 selected_days=selected_day_values,
-                dry_run=source_acquisition_dry_run(effective_mode), run_backfill=False,
+                dry_run=args.dry_run, run_backfill=False,
                 limits=limits, log=log,
                 concurrency=max(1, int(args.concurrency)),
                 history_version=source_adapter_history_version,
@@ -18789,24 +19108,7 @@ def main(argv: list[str]) -> int:
             )
             cross_check_metrics.update(v2_aqi_integrity_queue_metrics)
 
-        if mode_creates_repair_overlay(effective_mode):
-            dropbox_root = resolve_r2_history_root({**os.environ, **env})
-            if not dropbox_root:
-                raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is required for the v2 repair overlay")
-            repair_overlay = create_run_overlay(
-                tmp_dir=env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"],
-                run_id=run_compact,
-                environment=args.env,
-                base_dropbox_root=dropbox_root,
-            )
-            repair_overlay["effective_mode"] = effective_mode
-            repair_overlay["dropbox_baseline"] = str(dropbox_root)
-            repair_overlay["allow_stale_dropbox"] = bool(args.allow_stale_dropbox)
-            write_run_state(repair_overlay)
-            log.info(
-                "created v2 repair overlay after detection and planning run_state=%s overlay=%s",
-                repair_overlay["run_state_path"], repair_overlay["overlay_root"],
-            )
+        if repair_overlay is not None:
             repair_flow = run_v2_integrity_repair_flow(
                 run_state=repair_overlay,
                 conn=conn,
@@ -18825,7 +19127,7 @@ def main(argv: list[str]) -> int:
                 check_aqi_debug=bool(args.check_aqi_debug),
                 require_aqi_debug=bool(args.require_aqi_debug),
                 limits=limits,
-                dry_run=not mode_allows_remote_apply(effective_mode),
+                dry_run=bool(args.dry_run),
                 log=log,
             )
 
@@ -19314,8 +19616,6 @@ def main(argv: list[str]) -> int:
             "dry_run": args.dry_run,
             "check_only": args.check_only,
             "run_backfill": args.run_backfill,
-            "effective_mode": effective_mode,
-            "dropbox_baseline": resolve_r2_history_root(os.environ),
             "repair_mode": args.run_backfill,
             "force_snapshot_import": args.force_snapshot_import,
             "skip_snapshot_import": args.skip_snapshot_import,
@@ -19376,8 +19676,6 @@ def main(argv: list[str]) -> int:
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
-                "effective_mode": effective_mode,
-                "dropbox_baseline": resolve_r2_history_root(os.environ),
                 "repair_mode": bool(args.run_backfill),
                 "skip_cross_check": bool(args.skip_cross_check),
                 "integrity_run_id": run_id,
@@ -19408,7 +19706,7 @@ def main(argv: list[str]) -> int:
                 "r2_objects_written": int(repair_flow.get("r2_objects_written") or 0),
                 "r2_objects_deleted": int(repair_flow.get("r2_objects_deleted") or 0),
                 "r2_objects_changed": int(repair_flow.get("r2_objects_changed") or 0),
-                "stage_result_counts": repair_flow.get("stage_result_counts") or {},
+                "six_stage_result_counts": repair_flow.get("six_stage_result_counts") or {},
                 "overlay_path": repair_flow.get("overlay_root"),
                 "remaining_gap_count": repair_flow.get("remaining_gap_count"),
                 "runtime_seconds": runtime_seconds,
@@ -19493,8 +19791,6 @@ def main(argv: list[str]) -> int:
                 "check_only": bool(args.check_only),
                 "dry_run": bool(args.dry_run),
                 "run_backfill": bool(args.run_backfill),
-                "effective_mode": effective_mode,
-                "dropbox_baseline": resolve_r2_history_root(os.environ),
                 "repair_mode": bool(args.run_backfill),
                 "skip_cross_check": bool(args.skip_cross_check),
                 "integrity_run_id": run_id,
@@ -19505,7 +19801,7 @@ def main(argv: list[str]) -> int:
                 "r2_objects_written": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_written") or 0),
                 "r2_objects_deleted": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_deleted") or 0),
                 "r2_objects_changed": int((repair_flow if "repair_flow" in locals() else {}).get("r2_objects_changed") or 0),
-                "stage_result_counts": (repair_flow if "repair_flow" in locals() else {}).get("stage_result_counts") or {},
+                "six_stage_result_counts": (repair_flow if "repair_flow" in locals() else {}).get("six_stage_result_counts") or {},
                 "overlay_path": (repair_flow if "repair_flow" in locals() else {}).get("overlay_root"),
                 "remaining_gap_count": (repair_flow if "repair_flow" in locals() else {}).get("remaining_gap_count"),
                 "backup_readiness": backup_gate_summary,

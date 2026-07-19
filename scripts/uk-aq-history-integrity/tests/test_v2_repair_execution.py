@@ -538,9 +538,9 @@ class V2RepairExecutionTests(unittest.TestCase):
             "source_connector_day_skipped_events": 0,
             "source_connector_day_pending_events": 0,
             "source_connector_day_failed_events": 0,
-            "source_to_r2_targeted_stage_deferred_commit_events": 0,
-            "targeted_stage_deferred_rows_observations": 0,
-            "max_targeted_stage_deferred_rows_observations": 0,
+            "integrity_proposal_chunk_staged_events": 0,
+            "integrity_proposal_staged_rows": 0,
+            "max_integrity_proposal_staged_rows": 0,
             "source_timeseries_row_counts": {str(key): value for key, value in source_counts.items()},
             "repaired_timeseries_row_counts": {str(key): value for key, value in repaired_counts.items()},
             "source_pollutant_codes": pollutant_codes,
@@ -569,9 +569,9 @@ class V2RepairExecutionTests(unittest.TestCase):
             "source_connector_day_skipped_events": 0,
             "source_connector_day_pending_events": 0,
             "source_connector_day_failed_events": 0,
-            "source_to_r2_targeted_stage_deferred_commit_events": 1,
-            "targeted_stage_deferred_rows_observations": rows,
-            "max_targeted_stage_deferred_rows_observations": rows,
+            "integrity_proposal_chunk_staged_events": 1,
+            "integrity_proposal_staged_rows": rows,
+            "max_integrity_proposal_staged_rows": rows,
             "source_timeseries_row_counts": {str(key): value for key, value in source_counts.items()},
             "repaired_timeseries_row_counts": {str(key): value for key, value in repaired_counts.items()},
             "source_pollutant_codes": pollutant_codes,
@@ -1597,10 +1597,10 @@ class V2RepairExecutionTests(unittest.TestCase):
 
             self.assertEqual(run_bf.call_count, 3)
             self.assertEqual([call.kwargs["timeseries_ids"] for call in run_bf.call_args_list], [[101, 102], [103, 104], [105]])
-            self.assertEqual(run_bf.call_args_list[0].kwargs["extra_env"]["UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE"], "false")
-            self.assertEqual(run_bf.call_args_list[1].kwargs["extra_env"]["UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE"], "false")
-            self.assertEqual(run_bf.call_args_list[2].kwargs["extra_env"]["UK_AQ_BACKFILL_TARGETED_STAGE_FINALIZE"], "true")
-            self.assertEqual(run_bf.call_args_list[2].kwargs["extra_env"]["UK_AQ_BACKFILL_TARGETED_STAGE_CLEANUP"], "true")
+            self.assertEqual(run_bf.call_args_list[0].kwargs["extra_env"]["UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE"], "false")
+            self.assertEqual(run_bf.call_args_list[1].kwargs["extra_env"]["UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE"], "false")
+            self.assertEqual(run_bf.call_args_list[2].kwargs["extra_env"]["UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE"], "true")
+            self.assertEqual(run_bf.call_args_list[2].kwargs["extra_env"]["UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP"], "false")
             self.assertEqual(metrics["v2_observation_repairs_attempted"], 3)
             self.assertEqual(metrics["observation_backfills_attempted"], 3)
             self.assertEqual(metrics["v2_observation_repairs_ok"], 1)
@@ -1610,7 +1610,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             self.assertEqual(metrics["v2_observation_repair_results"][0]["chunk_count"], 3)
             self.assertEqual(metrics["v2_observation_repair_results"][0]["ok_chunks"], 3)
             self.assertTrue(metrics["v2_observation_repair_results"][0]["aqi_rebuild_guard_ok"])
-            self.assertEqual(metrics["v2_observation_repair_results"][0]["source_to_r2_targeted_stage_deferred_commit_events"], 2)
+            self.assertEqual(metrics["v2_observation_repair_results"][0]["integrity_proposal_chunk_staged_events"], 2)
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue WHERE connector_id = 6 AND history_version = 'v2'").fetchone()[0]
             self.assertEqual(int(queued), 1)
         finally:
@@ -1648,7 +1648,7 @@ class V2RepairExecutionTests(unittest.TestCase):
             result = metrics["v2_observation_repair_results"][0]
             self.assertEqual(result["status"], "guard_failed")
             self.assertFalse(result["aqi_rebuild_guard_ok"])
-            self.assertIn("targeted_stage_deferred_events=0", result["aqi_rebuild_guard_reason"])
+            self.assertIn("integrity_proposal_chunk_staged_events=0", result["aqi_rebuild_guard_reason"])
             queued = conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
             self.assertEqual(int(queued), 0)
         finally:
