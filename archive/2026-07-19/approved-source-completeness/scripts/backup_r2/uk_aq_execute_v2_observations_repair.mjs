@@ -252,7 +252,6 @@ function proposalView(proposal) {
     changed: proposal.changed,
     status: proposal.changed ? "planned" : "skipped_unchanged",
     dependencies: proposal.dependencies,
-    dependency_identities: proposal.dependency_identities,
     provenance: proposal.provenance || null,
     baseline_source: proposal.baseline_source || null,
     local_dependency_snapshot: proposal.local_dependency_snapshot ? {
@@ -297,28 +296,6 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
       ? "latest_timeseries_index"
       : "pollutant_timeseries_index";
 
-  function resolveDependencyIdentities(dependencies) {
-    return Object.fromEntries(dependencies.map((dependencyKey) => {
-      const staged = proposals.get(dependencyKey);
-      if (staged) {
-        return [dependencyKey, {
-          sha256: staged.new_sha256,
-          bytes: staged.bytes,
-          source: "planned_overlay",
-        }];
-      }
-      const existing = store.getObjectIfExists(dependencyKey);
-      if (!existing) {
-        throw new Error(`Combined local dependency unavailable: ${dependencyKey}`);
-      }
-      return [dependencyKey, {
-        sha256: existing.content_sha256 || sha256Hex(existing.body),
-        bytes: existing.bytes,
-        source: existing.source,
-      }];
-    }));
-  }
-
   async function stage({ key, body, contentType = "application/json", kind, dayUtc = null, dependencies = [], localDependencySnapshot = null, provenance = null }) {
     const bodyText = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
     const previous = proposals.get(key);
@@ -328,7 +305,6 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
     const existing = previous ? null : store.getObjectIfExists(key);
     const oldBody = previous ? previous.old_body : existing?.body?.toString("utf8") ?? null;
     const changed = oldBody !== bodyText;
-    const allDependencies = [...new Set([...(previous?.dependencies || []), ...dependencies])].sort();
     const proposal = {
       key,
       kind: proposalKind,
@@ -340,8 +316,7 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
       old_sha256: oldBody === null ? null : sha256Hex(oldBody),
       new_sha256: sha256Hex(bodyText),
       changed,
-      dependencies: allDependencies,
-      dependency_identities: resolveDependencyIdentities(allDependencies),
+      dependencies: [...new Set([...(previous?.dependencies || []), ...dependencies])].sort(),
       baseline_source: previous?.baseline_source || existing?.source || null,
       local_dependency_snapshot: previous?.local_dependency_snapshot || localDependencySnapshot,
       provenance: previous?.provenance || provenance || null,
@@ -721,18 +696,6 @@ function assertCanonicalProposal(proposal) {
     throw new Error(`Invalid proposal body or bytes: ${proposal.key}`);
   }
   for (const dependency of proposal.dependencies || []) assertCanonicalObjectKey(dependency, "proposal dependency");
-  if (!proposal.dependency_identities || typeof proposal.dependency_identities !== "object"
-    || Array.isArray(proposal.dependency_identities)) {
-    throw new Error(`Invalid proposal dependency identities: ${proposal.key}`);
-  }
-  for (const dependency of proposal.dependencies || []) {
-    const identity = proposal.dependency_identities[dependency];
-    if (!identity || !/^[a-f0-9]{64}$/.test(String(identity.sha256 || ""))
-      || !Number.isSafeInteger(identity.bytes) || identity.bytes < 0
-      || !["planned_overlay", "overlay", "dropbox"].includes(identity.source)) {
-      throw new Error(`Invalid proposal dependency identity: ${proposal.key} -> ${dependency}`);
-    }
-  }
   if (proposal.local_dependency_snapshot) {
     if (typeof proposal.local_dependency_snapshot !== "object"
       || proposal.local_dependency_snapshot.source !== "combined_local_snapshot"
@@ -1284,9 +1247,6 @@ export async function runV2ObservationsRepair({
     total_objects: staged.proposals.size,
     blocked_count: blockedScopes.length,
   });
-  for (const proposal of staged.proposals.values()) {
-    proposal.dependency_identities = resolveDependencyIdentities(proposal.dependencies || []);
-  }
   for (const proposal of staged.proposals.values()) assertCanonicalProposal(proposal);
   for (const proposal of staged.proposals.values()) {
     assertCanonicalProposalRelationships(proposal, staged.proposals);

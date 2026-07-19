@@ -17,9 +17,7 @@ Mode flags (exactly one required):
 
 Mode-specific requirements:
   --observs-only:
-    --timeseries-ids CSV  Comma-separated positive integer timeseries IDs, or:
-    --complete-connector-day
-                          Enumerate the adapter's complete source day.
+    --timeseries-ids CSV  Comma-separated positive integer timeseries IDs.
     --connector-id N      Optional connector filter for tighter scope.
   --aqi-only:
     --connector-id N      Optional connector filter for partial-day scope.
@@ -285,7 +283,6 @@ OBSERVS_ONLY=0
 AQI_ONLY=0
 CONNECTOR_ID_RAW=""
 TIMESERIES_IDS_RAW=""
-COMPLETE_CONNECTOR_DAY=0
 FROM_DAY_UTC=""
 TO_DAY_UTC=""
 DRY_RUN=false
@@ -323,10 +320,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --timeseries-ids=*)
       TIMESERIES_IDS_RAW="${1#--timeseries-ids=}"
-      shift
-      ;;
-    --complete-connector-day)
-      COMPLETE_CONNECTOR_DAY=1
       shift
       ;;
     --from-day)
@@ -420,12 +413,8 @@ if [[ -n "${TIMESERIES_IDS_RAW}" ]]; then
   fi
 fi
 
-if (( OBSERVS_ONLY == 1 )) && [[ -z "${TIMESERIES_IDS}" ]] && (( COMPLETE_CONNECTOR_DAY == 0 )); then
-  echo "ERROR: --observs-only requires --timeseries-ids or --complete-connector-day." >&2
-  exit 2
-fi
-if (( COMPLETE_CONNECTOR_DAY == 1 )) && { (( OBSERVS_ONLY == 0 )) || [[ -n "${TIMESERIES_IDS}" ]] || [[ -z "${CONNECTOR_ID}" ]]; }; then
-  echo "ERROR: --complete-connector-day requires --observs-only and one --connector-id, and cannot be combined with --timeseries-ids." >&2
+if (( OBSERVS_ONLY == 1 )) && [[ -z "${TIMESERIES_IDS}" ]]; then
+  echo "ERROR: --observs-only requires --timeseries-ids." >&2
   exit 2
 fi
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -552,14 +541,7 @@ else
 fi
 
 if (( OBSERVS_ONLY == 1 )); then
-  if (( COMPLETE_CONNECTOR_DAY == 1 )); then
-    unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
-    unset UK_AQ_BACKFILL_TIMESERIES_ID || true
-    export UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY="true"
-  else
-    export UK_AQ_BACKFILL_TIMESERIES_IDS="${TIMESERIES_IDS}"
-    unset UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY || true
-  fi
+  export UK_AQ_BACKFILL_TIMESERIES_IDS="${TIMESERIES_IDS}"
 else
   unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
   unset UK_AQ_BACKFILL_TIMESERIES_ID || true
@@ -578,7 +560,6 @@ echo "from_day_utc: ${UK_AQ_BACKFILL_FROM_DAY_UTC}"
 echo "to_day_utc: ${UK_AQ_BACKFILL_TO_DAY_UTC}"
 echo "connector_ids: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
 echo "timeseries_ids: ${UK_AQ_BACKFILL_TIMESERIES_IDS:-n/a}"
-echo "complete_connector_day: ${UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY:-false}"
 echo "integrity_wrapper: ${INTEGRITY_WRAPPER}"
 echo "backfill_wrapper: ${BACKFILL_WRAPPER}"
 echo "backfill_env_file: ${BACKFILL_ENV_FILE}"
