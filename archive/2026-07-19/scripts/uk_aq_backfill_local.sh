@@ -174,11 +174,6 @@ PY
 
 resolve_run_job_path() {
   local repo_root="${1}"
-  local active_runner="${repo_root}/workers/uk_aq_backfill_local/run_job.ts"
-  if [[ ! -f "${active_runner}" ]]; then
-    echo "Active backfill runner not found: ${active_runner}" >&2
-    return 1
-  fi
   local override_raw
   override_raw="$(strip_wrapping_quotes "${UK_AQ_BACKFILL_RUN_JOB_PATH:-}")"
   if [[ -n "${override_raw}" ]]; then
@@ -194,11 +189,15 @@ resolve_run_job_path() {
       echo "Invalid UK_AQ_BACKFILL_RUN_JOB_PATH (file not found): ${override_raw}" >&2
       return 1
     fi
-    if [[ "$(cd -P -- "$(dirname -- "${override_path}")" && pwd -P)/$(basename -- "${override_path}")" != "${active_runner}" ]]; then
-      echo "Ignoring UK_AQ_BACKFILL_RUN_JOB_PATH outside this repository: ${override_raw}" >&2
-    fi
+    printf '%s' "${override_path}"
+    return 0
   fi
 
+  local active_runner="${repo_root}/workers/uk_aq_backfill_local/run_job.ts"
+  if [[ ! -f "${active_runner}" ]]; then
+    echo "Active backfill runner not found: ${active_runner}" >&2
+    return 1
+  fi
   printf '%s' "${active_runner}"
   return 0
 }
