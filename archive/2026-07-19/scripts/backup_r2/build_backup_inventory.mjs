@@ -71,6 +71,8 @@ const TIMESERIES_BINDING_INDEX_V2_UNIT_PATTERN =
 const COMMITTED_CONNECTOR_MANIFEST_PATTERN =
   /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/manifest\.json$/;
 const RUN_MANIFEST_UNIT_PATTERN = /^run_id=[^/]+\/run_manifest\.json$/;
+const OBSERVATION_TRANSACTION_RECEIPT_PATTERN =
+  /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=(\d+)\/transactions\/transaction_id=([^/]+)\/data-receipt\.json$/;
 
 export function isRunManifestUnitPath(relativePath) {
   return RUN_MANIFEST_UNIT_PATTERN.test(String(relativePath || ""));
@@ -628,6 +630,48 @@ function scanRunManifests({
   return units;
 }
 
+function scanObservationTransactionReceipts({
+  rcloneBin,
+  sourceRoot,
+  domainPrefix,
+  previousUnits,
+  excludeRelativePaths,
+  stats,
+}) {
+  const sourcePath = joinTargetPath(sourceRoot, domainPrefix);
+  const lsjsonEntries = rcloneLsjsonRecursive(rcloneBin, sourcePath, { maxDepth: 5 });
+  const units = {};
+  for (const entry of lsjsonEntries) {
+    const relPath = String(entry?.Path || "");
+    if (!OBSERVATION_TRANSACTION_RECEIPT_PATTERN.test(relPath)) continue;
+    const unitKey = `transaction-receipt/${relPath}`;
+    const unitRelativePath = `${domainPrefix}/${relPath}`;
+    if (excludeRelativePaths.has(unitRelativePath)) continue;
+    stats.run_manifest_units_listed += 1;
+    const currentMeta = extractLsjsonMetadata(entry);
+    recordMd5Availability(stats, currentMeta.has_md5);
+    const previousEntry = previousUnits?.[unitKey] || null;
+    const prevMeta = previousMetadata(previousEntry, "size");
+    const reuseClass = previousEntry && previousEntry.hash
+      ? classifyReuse(currentMeta, prevMeta)
+      : null;
+    if (reuseClass) {
+      units[unitKey] = { ...previousEntry };
+      stats.run_manifest_units_skipped += 1;
+      recordReuseOutcome(stats, reuseClass);
+      continue;
+    }
+    const fileText = rcloneCat(rcloneBin, joinTargetPath(sourceRoot, unitRelativePath));
+    stats.run_manifest_units_reread += 1;
+    units[unitKey] = buildFileInventoryEntry({
+      relativePath: unitRelativePath,
+      fileText,
+      lsjsonEntry: entry,
+    });
+  }
+  return units;
+}
+
 function scanCommittedConnectorManifests({
   rcloneBin,
   sourceRoot,
@@ -953,8 +997,18 @@ async function main() {
       excludeRelativePaths,
       stats,
     });
+    const transactionReceiptUnits = args.backup_version === "v2"
+      ? scanObservationTransactionReceipts({
+        rcloneBin: args.rclone_bin,
+        sourceRoot: args.source_root,
+        domainPrefix: domainPrefixes.observations,
+        previousUnits,
+        excludeRelativePaths,
+        stats,
+      })
+      : {};
     inventory.run_manifest_units.observations = {
-      units: runUnits,
+      units: { ...runUnits, ...transactionReceiptUnits },
     };
   }
   stats.elapsed_ms.run_manifest_units = Date.now() - tRunManifests;

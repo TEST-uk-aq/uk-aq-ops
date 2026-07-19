@@ -9,7 +9,14 @@ import {
   parquetSchema,
   compressors,
 } from "./lib/uk_aq_parquet_dependencies.mjs";
-import { sha256Hex } from "../../workers/shared/r2_sigv4.mjs";
+import {
+  hasRequiredR2Config,
+  r2GetObject,
+  r2HeadObject,
+  r2ListAllObjects,
+  r2PutObject,
+  sha256Hex,
+} from "../../workers/shared/r2_sigv4.mjs";
 import {
   buildHistoryV2PollutantManifest,
   buildHistoryV2ConnectorManifest,
@@ -21,6 +28,7 @@ import {
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import { assertV2ObservationsChildManifest } from "./lib/uk_aq_v2_observations_manifest_validation.mjs";
 
+const TEST_R2_BUCKET = "uk-aq-history-cic-test";
 const SUPPORTED_ACTIONS = new Set([
   "observation_pollutant_manifest_repair",
   "observation_connector_manifest_repair",
@@ -87,14 +95,13 @@ export async function readChildren({
   kind,
   domain = "observations",
   identityOnlyKeys = new Set(),
-  allowEmpty = false,
 }) {
   const entries = await store.listAllObjects({ prefix });
   const keyPattern = kind === "connector"
     ? /\/connector_id=\d+\/manifest\.json$/
     : /\/pollutant_code=[^/]+\/manifest\.json$/;
   const keys = entries.map((entry) => entry.key).filter((key) => keyPattern.test(key)).sort();
-  if (!keys.length && identityOnlyKeys.size === 0 && !allowEmpty) {
+  if (!keys.length && identityOnlyKeys.size === 0) {
     throw new Error(`Blocked dependency: no ${kind} manifests under ${prefix}`);
   }
   const children = [];
@@ -148,28 +155,21 @@ function walkLocalObjects(root, prefixes = []) {
   return found;
 }
 
-export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [], dynamicExactKeyPrefixes = [] }) {
+function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [], dynamicExactKeyPrefixes = [] }) {
   const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
-  const proposedTombstones = new Set(Object.entries(state?.tombstones || {})
-    .filter(([, value]) => value?.proposed === true || value?.deleted === true)
+  const verifiedTombstones = new Set(Object.entries(state?.tombstones || {})
+    .filter(([, value]) => value?.r2_delete_verified === true)
     .map(([key]) => safeLocalKey(key)));
-  const proposedTombstonePrefixes = (state?.tombstone_prefixes || [])
-    .filter((entry) => entry?.proposed === true && typeof entry?.prefix === "string")
-    .map((entry) => `${safeLocalKey(entry.prefix).replace(/\/+$/, "")}/`);
-  const isProposedAbsent = (key) => proposedTombstones.has(key)
-    || proposedTombstonePrefixes.some((prefix) => key.startsWith(prefix));
   const dropboxPaths = walkLocalObjects(dropboxRoot, prefixes);
   for (const rawKey of exactKeys) {
     const key = safeLocalKey(rawKey);
     const candidate = `${dropboxRoot}/${key}`;
     if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) dropboxPaths.set(key, candidate);
   }
-  for (const key of [...dropboxPaths.keys()]) {
-    if (isProposedAbsent(key)) dropboxPaths.delete(key);
-  }
+  for (const key of verifiedTombstones) dropboxPaths.delete(key);
   const overlayPaths = new Map();
   for (const [key, entry] of Object.entries(state?.objects || {})) {
-    if (entry?.structurally_validated === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
+    if (entry?.r2_verified === true && typeof entry.local_path === "string" && fs.existsSync(entry.local_path)) {
       overlayPaths.set(safeLocalKey(key), entry.local_path);
     }
   }
@@ -181,13 +181,17 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
   }
 
   function objectFor(key) {
-    if (isProposedAbsent(key) && !overlayPaths.has(key)) return null;
+    if (verifiedTombstones.has(key)) return null;
     if (overlayPaths.has(key)) return localObject(key, "overlay");
     return localObject(key, "dropbox");
   }
 
   return {
     overlayRoot,
+    getObservationDataReceipt(dayUtc, connectorId) {
+      const receipt = state?.observation_data_receipts?.[`${dayUtc}|${connectorId}`];
+      return receipt && typeof receipt === "object" && !Array.isArray(receipt) ? receipt : null;
+    },
     getObjectFromSourceIfExists(key, source) {
       const normalized = safeLocalKey(key);
       return ["overlay", "dropbox"].includes(source) ? localObject(normalized, source) : null;
@@ -218,7 +222,7 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
     listAllObjects({ prefix }) {
       const keys = new Set([...dropboxPaths.keys(), ...overlayPaths.keys()]);
       return [...keys]
-        .filter((key) => key.startsWith(prefix) && (!isProposedAbsent(key) || overlayPaths.has(key)))
+        .filter((key) => key.startsWith(prefix) && !verifiedTombstones.has(key))
         .map((key) => {
           const object = objectFor(key);
           return { key, size: object?.bytes ?? null, source: object?.source ?? null, content_sha256: object?.content_sha256 ?? null, r2_etag: object?.r2_etag ?? null };
@@ -519,7 +523,7 @@ function existingManifestMetadata(store, {
   const grain = domain === "aqilevels" ? "hourly" : null;
   const profile = domain === "aqilevels" ? "data" : null;
   const leafExpectation = { domain, grain, profile, dayUtc, connectorId, pollutantCode, manifestKind: "pollutant" };
-  for (const [source, label] of [["overlay", "overlay_manifest"], ["dropbox", "dropbox_manifest"]]) {
+  for (const [source, label] of [["overlay", "existing_overlay_manifest"], ["live_r2", "existing_live_manifest"], ["dropbox", "dropbox_manifest"]]) {
     const found = sourceManifestMetadata(store, source, label, manifestKey, leafExpectation);
     if (found) return found;
   }
@@ -529,7 +533,7 @@ function existingManifestMetadata(store, {
   // copy was unavailable, and never invent a historical run ID or Git SHA.
   const parentKey = `${base}/connector_id=${connectorId}/manifest.json`;
   const parentExpectation = { domain, grain, profile, dayUtc, connectorId, pollutantCode: null, manifestKind: "connector" };
-  for (const [source, label] of [["overlay", "overlay_parent_manifest_metadata"], ["dropbox", "dropbox_parent_manifest_metadata"]]) {
+  for (const [source, label] of [["live_r2", "parent_manifest_metadata"], ["dropbox", "parent_manifest_metadata"]]) {
     const found = sourceManifestMetadata(store, source, label, parentKey, parentExpectation);
     if (found) return found;
   }
@@ -552,29 +556,170 @@ function existingManifestMetadata(store, {
   };
 }
 
-export async function leafManifestSourceFromCombined({ store, dataPrefix, base, dayUtc, connectorId, pollutantCode, domain }) {
-  void dataPrefix;
+export function validateObservationDataReceipt(receipt, { dataPrefix, dayUtc, connectorId }) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+    || Number(receipt.receipt_schema_version) !== 2
+    || receipt.history_version !== "v2" || receipt.domain !== "observations"
+    || receipt.day_utc !== dayUtc || Number(receipt.connector_id) !== connectorId
+    || receipt.finalisation_status !== "complete_generations_get_verified"
+    || !Array.isArray(receipt.complete_requested_timeseries_ids)
+    || !Array.isArray(receipt.chunks) || !Array.isArray(receipt.completed_chunks)
+    || receipt.chunks.length !== Number(receipt.expected_chunk_count)
+    || receipt.completed_chunks.length !== Number(receipt.expected_chunk_count)
+    || (receipt.incomplete_chunk_identities || []).length
+    || (receipt.failed_chunks || []).length
+    || !Array.isArray(receipt.affected_pollutant_codes)
+    || !Array.isArray(receipt.files) || !receipt.files.length) {
+    throw new Error("targeted_data_receipt_contract_invalid");
+  }
+  const transactionId = String(receipt.transaction_id || "");
+  const expectedKey = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/transactions/transaction_id=${transactionId}/data-receipt.json`;
+  if (!transactionId || receipt.permanent_receipt_key !== expectedKey) {
+    throw new Error("targeted_data_receipt_key_invalid");
+  }
+  const declaredPollutants = new Set(receipt.affected_pollutant_codes.map((value) => String(value).toLowerCase()));
+  const partitions = receipt.complete_pollutant_partitions;
+  if (!partitions || typeof partitions !== "object" || Array.isArray(partitions)
+    || [...declaredPollutants].some((code) => !partitions[code])
+    || Object.keys(partitions).some((code) => !declaredPollutants.has(code))) {
+    throw new Error("targeted_data_receipt_partition_contract_invalid");
+  }
+  for (const file of receipt.files) {
+    const pollutantCode = String(file?.pollutant_code || "").toLowerCase();
+    const expectedPrefix = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/generation=${transactionId}/part-`;
+    if (!declaredPollutants.has(pollutantCode)
+      || typeof file?.key !== "string" || !file.key.startsWith(expectedPrefix) || !file.key.endsWith(".parquet")
+      || !/^[a-f0-9]{64}$/.test(String(file.content_sha256 || ""))
+      || !Number.isInteger(Number(file.bytes)) || Number(file.bytes) <= 0
+      || !Number.isInteger(Number(file.row_count)) || Number(file.row_count) <= 0
+      || !file.timeseries_row_counts || typeof file.timeseries_row_counts !== "object") {
+      throw new Error("targeted_data_receipt_file_contract_invalid");
+    }
+  }
+  for (const pollutantCode of declaredPollutants) {
+    const partition = partitions[pollutantCode];
+    const files = receipt.files.filter((entry) => String(entry.pollutant_code).toLowerCase() === pollutantCode);
+    const rowCount = files.reduce((total, entry) => total + Number(entry.row_count || 0), 0);
+    const counts = {};
+    for (const file of files) {
+      for (const [timeseriesId, count] of Object.entries(file.timeseries_row_counts || {})) {
+        counts[timeseriesId] = Number(counts[timeseriesId] || 0) + Number(count || 0);
+      }
+    }
+    if (!files.length || rowCount !== Number(partition.row_count)
+      || JSON.stringify(counts) !== JSON.stringify(partition.timeseries_row_counts || {})
+      || Number(partition.replaced_row_count || 0) + Number(partition.preserved_unaffected_row_count || 0) !== rowCount) {
+      throw new Error("targeted_data_receipt_partition_counts_invalid");
+    }
+  }
+  return receipt;
+}
+
+async function validLivePollutantManifestEvidence({ r2, dataPrefix, dayUtc, connectorId, pollutantCode }) {
+  const key = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+  try {
+    const object = await r2GetObject({ r2, key });
+    const payload = jsonObject(object, key);
+    assertV2ObservationsChildManifest(payload, { key, kind: "pollutant", dayUtc, connectorId });
+    if (payload.pollutant_code !== pollutantCode || !Array.isArray(payload.files) || !payload.files.length) return null;
+    return {
+      files: payload.files.map((entry) => ({
+        key: String(entry.key),
+        pollutant_code: pollutantCode,
+        bytes: Number(entry.bytes),
+        content_sha256: String(entry.etag_or_hash || ""),
+        row_count: Number(entry.row_count),
+      })),
+      payload,
+      provenance: {
+        run_id: "existing_live_manifest",
+        writer_git_sha: "existing_live_manifest",
+        backed_up_at_utc: "existing_live_manifest",
+        source: "existing_live_manifest",
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function permanentReceiptEvidence({ store, r2, dataPrefix, dayUtc, connectorId, pollutantCode }) {
+  const prefix = `${dataPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/transactions/`;
+  const keyPattern = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}transaction_id=[^/]+/data-receipt\\.json$`);
+  const candidates = new Map();
+  const localEntries = store.listAllObjects({ prefix }).filter((entry) => keyPattern.test(entry.key));
+  const liveEntries = (await r2ListAllObjects({ r2, prefix })).filter((entry) => keyPattern.test(entry.key));
+  for (const entry of localEntries) {
+    const key = entry.key;
+    const object = store.getObjectIfExists(key);
+    if (!object) continue;
+    const receipt = validateObservationDataReceipt(jsonObject(object, key), { dataPrefix, dayUtc, connectorId });
+    if (!receipt.affected_pollutant_codes.includes(pollutantCode)) continue;
+    const identity = sha256Hex(object.body);
+    const existing = candidates.get(receipt.transaction_id);
+    if (existing && existing.identity !== identity) throw new Error("conflicting_permanent_transaction_receipt");
+    candidates.set(receipt.transaction_id, { receipt, identity });
+  }
+  for (const entry of liveEntries) {
+    const key = entry.key;
+    const object = await r2GetObject({ r2, key });
+    const receipt = validateObservationDataReceipt(jsonObject(object, key), { dataPrefix, dayUtc, connectorId });
+    if (!receipt.affected_pollutant_codes.includes(pollutantCode)) continue;
+    const identity = sha256Hex(object.body);
+    const existing = candidates.get(receipt.transaction_id);
+    if (existing && existing.identity !== identity) throw new Error("conflicting_permanent_transaction_receipt");
+    candidates.set(receipt.transaction_id, { receipt, identity });
+  }
+  const matches = [...candidates.values()];
+  if (matches.length > 1) throw new Error("ambiguous_permanent_transaction_receipt");
+  return matches[0]?.receipt || null;
+}
+
+export async function leafManifestSourceFromCombined({ store, r2, dataPrefix, base, dayUtc, connectorId, pollutantCode, domain, dataReceipt = null }) {
   const pollutantPrefix = `${base}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
-  const keyPattern = new RegExp(
-    `^${pollutantPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/part-\\d+\\.parquet$`,
-  );
-  const partKeys = store.listAllObjects({ prefix: `${pollutantPrefix}/` })
-    .map((entry) => entry.key)
-    .filter((key) => keyPattern.test(key))
-    .sort();
-  if (!partKeys.length) return { blocked_reason: "canonical_parquet_objects_unavailable" };
+  let receipt = dataReceipt;
+  let manifestEvidence = null;
+  if (domain === "observations" && receipt) {
+    receipt = validateObservationDataReceipt(receipt, { dataPrefix, dayUtc, connectorId });
+  } else if (domain === "observations") {
+    manifestEvidence = await validLivePollutantManifestEvidence({ r2, dataPrefix, dayUtc, connectorId, pollutantCode });
+    if (!manifestEvidence) {
+      receipt = await permanentReceiptEvidence({ store, r2, dataPrefix, dayUtc, connectorId, pollutantCode });
+    }
+  }
+  const receiptFiles = receipt
+    ? receipt.files.filter((entry) => entry?.pollutant_code === pollutantCode && typeof entry?.key === "string")
+      .sort((left, right) => String(left.key).localeCompare(String(right.key)))
+    : null;
+  const partKeys = receiptFiles
+    ? receiptFiles.map((entry) => String(entry.key))
+    : manifestEvidence?.files.map((entry) => String(entry.key)) || (domain === "aqilevels"
+      ? store.listAllObjects({ prefix: `${pollutantPrefix}/` })
+        .map((entry) => entry.key)
+        .filter((key) => new RegExp(`^${pollutantPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/part-\\d+\\.parquet$`).test(key))
+        .sort()
+      : []);
+  if (!partKeys.length) return { blocked_reason: "final_parquet_objects_unavailable" };
   const manifestKey = `${pollutantPrefix}/manifest.json`;
-  const metadata = existingManifestMetadata(store, {
-    manifestKey, base, dayUtc, connectorId, pollutantCode, domain,
-  });
+  const metadata = manifestEvidence || existingManifestMetadata(store, { manifestKey, base, dayUtc, connectorId, pollutantCode, domain });
+  const exactStore = {
+    getObject: async (key) => store.getObjectIfExists(key) || await r2GetObject({ r2, key }),
+  };
   try {
     const files = [];
     for (const key of partKeys) {
-      files.push(await parquetFileEntry({ store, key, domain, pollutantCode }));
+      const file = await parquetFileEntry({ store: exactStore, key, domain, pollutantCode });
+      const receiptFile = receiptFiles?.find((entry) => String(entry.key) === key);
+      if (receiptFile && (
+        file.bytes !== Number(receiptFile.bytes)
+        || file.etag_or_hash !== String(receiptFile.content_sha256)
+        || file.row_count !== Number(receiptFile.row_count)
+      )) throw new Error(`targeted_data_receipt_file_mismatch:${key}`);
+      files.push(file);
     }
     return { manifestKey, payload: metadata.payload, provenance: metadata.provenance, files };
   } catch (error) {
-    return { blocked_reason: `canonical_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
+    return { blocked_reason: `final_parquet_metadata_unreadable:${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -746,6 +891,254 @@ function assertCanonicalProposalRelationships(proposal, proposals) {
   }
 }
 
+function manifestDependencyKeys(payload) {
+  const keys = new Set();
+  for (const entry of Array.isArray(payload?.files) ? payload.files : []) {
+    if (typeof entry?.key === "string") keys.add(entry.key);
+  }
+  for (const key of Array.isArray(payload?.parquet_object_keys) ? payload.parquet_object_keys : []) {
+    if (typeof key === "string") keys.add(key);
+  }
+  for (const entry of Array.isArray(payload?.child_manifests) ? payload.child_manifests : []) {
+    if (typeof entry?.manifest_key === "string") keys.add(entry.manifest_key);
+  }
+  for (const entry of Array.isArray(payload?.connector_manifests) ? payload.connector_manifests : []) {
+    if (typeof entry?.manifest_key === "string") keys.add(entry.manifest_key);
+  }
+  return [...keys].sort();
+}
+
+// Planning deliberately reads the verified overlay before the audited Dropbox
+// baseline. This records every non-staged object identity used by a proposed
+// parent, recursively including Parquet named by preserved manifests. The
+// apply step must freshly compare these identities with live R2 before PUT.
+export function collectPreservedLiveDependencies({ store, proposals, includeDependencies = true }) {
+  const dependencies = new Map();
+  const add = (key, object, role) => {
+    const normalized = assertCanonicalObjectKey(key, "live dependency key");
+    const identity = sha256Hex(object.body);
+    const existing = dependencies.get(normalized);
+    if (existing && existing.content_sha256 !== identity) {
+      throw new Error(`Conflicting local dependency identity: ${normalized}`);
+    }
+    dependencies.set(normalized, {
+      key: normalized,
+      content_sha256: identity,
+      bytes: object.bytes,
+      roles: [...new Set([...(existing?.roles || []), role])].sort(),
+    });
+  };
+  const visit = (key, role, seen = new Set()) => {
+    const normalized = assertCanonicalObjectKey(key, "live dependency key");
+    if (proposals.has(normalized)) return;
+    const object = store.getObjectIfExists(normalized);
+    if (!object) throw new Error(`Blocked live dependency has no local identity: ${normalized}`);
+    add(normalized, object, role);
+    if (!normalized.endsWith("/manifest.json") || seen.has(normalized)) return;
+    const nextSeen = new Set(seen);
+    nextSeen.add(normalized);
+    for (const childKey of manifestDependencyKeys(jsonObject(object, normalized))) {
+      visit(childKey, `preserved_child_of:${normalized}`, nextSeen);
+    }
+  };
+  const baselineAbsences = [];
+  // Unchanged staged children are still a live dependency of a changed
+  // parent. Guard their planning baseline too; otherwise a concurrent child
+  // update would be noticed only after its parent had been published.
+  for (const proposal of [...proposals.values()].sort((a, b) => a.key.localeCompare(b.key))) {
+    if (proposal.old_sha256) {
+      const object = store.getObjectIfExists(proposal.key);
+      if (!object || sha256Hex(object.body) !== proposal.old_sha256) {
+        throw new Error(`Blocked proposal baseline has no matching local identity: ${proposal.key}`);
+      }
+      add(proposal.key, object, "proposal_baseline");
+    } else if (proposal.changed) {
+      baselineAbsences.push({ key: proposal.key, expected_absent: true, roles: ["new_proposal_baseline"] });
+    }
+    if (includeDependencies) {
+      for (const dependency of proposal.dependencies || []) visit(dependency, `dependency_of:${proposal.key}`);
+    }
+  }
+  return [...dependencies.values(), ...baselineAbsences].sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function applicationFailureResults(ordered, failedProposal, error, failureStage) {
+  const results = new Map();
+  for (const proposal of ordered) {
+    const failed = proposal === failedProposal;
+    results.set(proposal.key, {
+      key: proposal.key,
+      kind: proposal.kind,
+      status: failed ? "failed" : "not_run_due_to_dependency",
+      put_attempted: false,
+      put_completed: false,
+      get_verification_attempted: false,
+      get_verification_succeeded: false,
+      verification: failed ? "failed" : "not_run",
+      failure_stage: failed ? failureStage : "dependency",
+      error: failed ? error : null,
+    });
+  }
+  return results;
+}
+
+export async function applyStagedProposals({
+  r2,
+  proposals,
+  writeR2,
+  putObject = r2PutObject,
+  getObject = r2GetObject,
+  headObject = r2HeadObject,
+  liveDependencies = [],
+  onProgress = null,
+  blockedCount = 0,
+}) {
+  const operationCounts = {
+    r2_get_before_put_count: 0,
+    r2_head_before_put_count: 0,
+    r2_list_before_put_count: 0,
+    r2_put_count: 0,
+    r2_get_after_put_verification_count: 0,
+  };
+  const results = new Map();
+  const rank = {
+    pollutant_manifest: 1,
+    connector_manifest: 2,
+    day_manifest: 3,
+    pollutant_timeseries_index: 4,
+    latest_timeseries_index: 5,
+  };
+  const ordered = [...proposals.values()].sort((left, right) =>
+    (rank[left.kind] || 99) - (rank[right.kind] || 99) || left.key.localeCompare(right.key)
+  );
+  const reportProgress = (phase, completedObjects, failures = 0) => {
+    if (typeof onProgress !== "function") return;
+    onProgress({
+      phase,
+      completed_objects: completedObjects,
+      total_objects: ordered.length,
+      successful_put_count: operationCounts.r2_put_count,
+      successful_readback_verification_count: operationCounts.r2_get_after_put_verification_count,
+      failures,
+      blocked_count: blockedCount,
+    });
+  };
+  reportProgress("metadata_application_start", 0);
+  // Pass 1: a repair plan is atomic with respect to proposal validity. Check
+  // every proposal body and every staged-child relationship before any live
+  // dependency guard (and therefore before the first possible PUT).
+  for (const proposal of ordered) {
+    try {
+      assertCanonicalProposal(proposal);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        results: applicationFailureResults(ordered, proposal, message, "proposal_preflight"),
+        failure: { key: proposal.key, error: message },
+        operation_counts: operationCounts,
+      };
+    }
+  }
+  for (const proposal of ordered) {
+    try {
+      assertCanonicalProposalRelationships(proposal, proposals);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        results: applicationFailureResults(ordered, proposal, message, "proposal_preflight"),
+        failure: { key: proposal.key, error: message },
+        operation_counts: operationCounts,
+      };
+    }
+  }
+  // The Dropbox/overlay view is an audited planning baseline, not proof of
+  // the current committed hierarchy. Check every preserved dependency and
+  // every existing/new proposal baseline before the first metadata PUT.
+  if (writeR2) {
+    for (const dependency of [...liveDependencies].sort((left, right) => left.key.localeCompare(right.key))) {
+      try {
+        if (dependency.expected_absent) {
+          operationCounts.r2_head_before_put_count += 1;
+          const head = await headObject({ r2, key: dependency.key });
+          if (head?.exists) throw new Error(`Live new-object baseline already exists: ${dependency.key}`);
+        } else {
+          operationCounts.r2_get_before_put_count += 1;
+          const fresh = await getObject({ r2, key: dependency.key });
+          if (fresh.bytes !== dependency.bytes || sha256Hex(fresh.body) !== dependency.content_sha256) {
+            throw new Error(`Live dependency identity mismatch: ${dependency.key}`);
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const failedProposal = ordered[0] || { key: dependency.key, kind: "live_dependency" };
+        return {
+          results: applicationFailureResults(ordered, failedProposal, message, "live_dependency_guard"),
+          failure: { key: dependency.key, error: message },
+          operation_counts: operationCounts,
+        };
+      }
+    }
+  }
+  for (let position = 0; position < ordered.length; position += 1) {
+    const proposal = ordered[position];
+    if (!proposal.changed) {
+      results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "skipped_unchanged", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: null, error: null });
+      if ((position + 1) % 25 === 0 || position + 1 === ordered.length) reportProgress("metadata_application", position + 1);
+      continue;
+    }
+    if (!writeR2) {
+      results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "planned", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: null, error: null });
+      if ((position + 1) % 25 === 0 || position + 1 === ordered.length) reportProgress("metadata_application", position + 1);
+      continue;
+    }
+    let phase = "initial";
+    let putAttempted = false;
+    let putCompleted = false;
+    let getVerificationAttempted = false;
+    let getVerificationSucceeded = false;
+    try {
+      phase = "put";
+      putAttempted = true;
+      operationCounts.r2_put_count += 1;
+      await putObject({ r2, key: proposal.key, body: proposal.body, content_type: proposal.content_type });
+      putCompleted = true;
+      phase = "get";
+      getVerificationAttempted = true;
+      operationCounts.r2_get_after_put_verification_count += 1;
+      const fresh = await getObject({ r2, key: proposal.key });
+      phase = "body_verification";
+      if (fresh.bytes !== proposal.bytes || fresh.body.toString("utf8") !== proposal.body) {
+        throw new Error(`Verification failed for ${proposal.key}`);
+      }
+      phase = "structure_verification";
+      assertCanonicalProposal({ ...proposal, body: fresh.body.toString("utf8"), bytes: fresh.bytes });
+      getVerificationSucceeded = true;
+      phase = "complete";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      results.set(proposal.key, {
+        key: proposal.key,
+        kind: proposal.kind,
+        status: "failed",
+        put_attempted: putAttempted,
+        put_completed: putCompleted,
+        get_verification_attempted: getVerificationAttempted,
+        get_verification_succeeded: getVerificationSucceeded,
+        verification: "failed",
+        failure_stage: phase,
+        error: message,
+      });
+      for (const remaining of ordered.slice(position + 1)) results.set(remaining.key, { key: remaining.key, kind: remaining.kind, status: "not_run_due_to_dependency", put_attempted: false, put_completed: false, get_verification_attempted: false, get_verification_succeeded: false, verification: "not_run", failure_stage: "dependency", error: null });
+      reportProgress("metadata_application_failed", position + 1, 1);
+      return { results, failure: { key: proposal.key, error: error instanceof Error ? error.message : String(error) }, operation_counts: operationCounts };
+    }
+    results.set(proposal.key, { key: proposal.key, kind: proposal.kind, status: "succeeded", put_attempted: true, put_completed: true, get_verification_attempted: true, get_verification_succeeded: true, verification: "succeeded", failure_stage: null, error: null });
+    if ((position + 1) % 25 === 0 || position + 1 === ordered.length) reportProgress("metadata_application", position + 1);
+  }
+  reportProgress("metadata_application_complete", ordered.length);
+  return { results, failure: null, operation_counts: operationCounts };
+}
+
 function extractRepairPlan(input) {
   if (input?.history_version === "v2" && ["observations", "aqilevels"].includes(input?.domain) && Array.isArray(input.repair_plan)) {
     return { inputKind: `${input.domain}_repair_plan`, domain: input.domain, actions: input.repair_plan };
@@ -891,6 +1284,118 @@ function authoritativeTimeseriesById(input) {
   return bindings;
 }
 
+export async function verifyCommittedConnectorHierarchies({ r2, receipts, proposals, getObject = r2GetObject, headObject = r2HeadObject }) {
+  const evidence = new Map();
+  for (const receipt of receipts) {
+    try {
+      const proposal = proposals.get(receipt.connector_manifest_key);
+      const connector = await getObject({ r2, key: receipt.connector_manifest_key });
+      if (!proposal || sha256Hex(connector.body) !== proposal.new_sha256) throw new Error("connector_manifest_identity_mismatch");
+      const manifest = jsonObject(connector, receipt.connector_manifest_key);
+      if (manifest.manifest_hash !== receipt.connector_manifest_hash) throw new Error("connector_manifest_hash_mismatch");
+      for (const child of manifest.child_manifests || []) {
+        const childKey = assertCanonicalObjectKey(child?.manifest_key, "committed child manifest key");
+        const childObject = await getObject({ r2, key: childKey });
+        const childManifest = jsonObject(childObject, childKey);
+        if (childManifest.manifest_hash !== child?.manifest_hash) throw new Error(`child_manifest_identity_mismatch:${childKey}`);
+        for (const file of childManifest.files || []) {
+          const fileKey = assertCanonicalObjectKey(file?.key, "committed parquet key");
+          const head = await headObject({ r2, key: fileKey });
+          if (!head?.exists) throw new Error(`committed_parquet_missing:${fileKey}`);
+        }
+      }
+      const dayKey = receipt.connector_manifest_key.replace(/\/connector_id=\d+\/manifest\.json$/, "/manifest.json");
+      if (dayKey === receipt.connector_manifest_key) throw new Error("connector_manifest_key_not_in_day_hierarchy");
+      const day = jsonObject(await getObject({ r2, key: dayKey }), dayKey);
+      const dayChild = (day.child_manifests || []).find((entry) => entry?.manifest_key === receipt.connector_manifest_key);
+      if (!dayChild || dayChild.manifest_hash !== manifest.manifest_hash) {
+        throw new Error(`day_manifest_child_identity_mismatch:${dayKey}`);
+      }
+      evidence.set(receipt.transaction_id, { verified: true, connector_manifest: manifest });
+    } catch (error) {
+      evidence.set(receipt.transaction_id, { verified: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return evidence;
+}
+
+export function buildCommitReceipts({ runStateJson, domain, dayPlans, proposals, applied, writeR2, liveEvidence = new Map() }) {
+  const runState = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
+  const runId = String(runState?.run_id || "unknown");
+  const receipts = [];
+  for (const plan of dayPlans) {
+    if (plan.status === "blocked_dependency") continue;
+    for (const scope of plan.scopes || []) {
+      const connectorId = Number(scope?.connectorId);
+      if (!scope?.needsConnector || !Number.isInteger(connectorId) || connectorId <= 0) continue;
+      const connectorKey = [...(plan.proposal_keys || [])].find((key) => {
+        const proposal = proposals.get(key);
+        return proposal?.kind === "connector_manifest"
+          && proposal.day_utc === plan.day_utc
+          && key.includes(`/connector_id=${connectorId}/manifest.json`);
+      });
+      if (!connectorKey) continue;
+      const proposal = proposals.get(connectorKey);
+      const operation = applied.get(connectorKey) || {};
+      const receiptId = `integrity:${runId}:${domain}:${plan.day_utc}:connector_id=${connectorId}`;
+      const live = liveEvidence.get(receiptId);
+      const manifest = live?.connector_manifest || jsonObject({ body: Buffer.from(proposal.body, "utf8") }, connectorKey);
+      const targetedPollutants = [...new Set(scope.pollutant_codes || [])].sort();
+      const targetedTimeseries = [...new Set(scope.targeted_replacement_timeseries_ids || [])]
+        .map(Number)
+        .filter((value) => Number.isInteger(value) && value > 0)
+        .sort((left, right) => left - right);
+      const connectorPrefix = `/connector_id=${connectorId}/`;
+      const writtenObjectKeys = [...new Set((plan.proposal_keys || []).filter((key) => {
+        const candidate = applied.get(key);
+        return key.includes(connectorPrefix)
+          && candidate?.status === "succeeded" && candidate.put_completed === true;
+      }))].sort();
+      const sharedScopeId = `integrity:${runId}:${domain}:${plan.day_utc}:shared`;
+      const finalisationStatus = operation.status === "succeeded"
+        ? "committed"
+        : (operation.status === "skipped_unchanged" ? "unchanged" : "not_committed");
+      receipts.push({
+        receipt_schema_version: 1,
+        transaction_id: receiptId,
+        history_version: "v2",
+        domain,
+        day_utc: plan.day_utc,
+        connector_id: connectorId,
+        targeted_replacement_timeseries_ids: targetedTimeseries,
+        complete_committed_pollutant_set: [...(manifest.pollutant_codes || [])].sort(),
+        connector_manifest_key: connectorKey,
+        connector_manifest_hash: manifest.manifest_hash,
+        committed_connector_row_count: Number(manifest.row_count || 0),
+        committed_timeseries_row_counts: manifest.timeseries_row_counts || {},
+        written_object_keys: writtenObjectKeys,
+        shared_commit_scope_ids: [sharedScopeId],
+        preserved_child_count: Math.max(0, (manifest.child_manifests || []).length - targetedPollutants.length),
+        replaced_child_count: targetedPollutants.length,
+        replaced_timeseries_count: targetedTimeseries.length,
+        finalisation_status: finalisationStatus,
+        fresh_live_r2_verification: Boolean(writeR2 && live?.verified === true),
+        fresh_live_r2_verification_error: live?.verified === false ? live.error : null,
+      });
+    }
+  }
+  return receipts.sort((left, right) => left.transaction_id.localeCompare(right.transaction_id));
+}
+
+export function buildSharedCommitObjects({ runStateJson, domain, dayPlans, applied }) {
+  const runState = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
+  const runId = String(runState?.run_id || "unknown");
+  return dayPlans.map((plan) => ({
+    scope_id: `integrity:${runId}:${domain}:${plan.day_utc}:shared`,
+    domain,
+    day_utc: plan.day_utc,
+    written_object_keys: [...new Set((plan.proposal_keys || []).filter((key) => {
+      const operation = applied.get(key);
+      return !/\/connector_id=\d+\//.test(key) && operation?.status === "succeeded" && operation.put_completed === true;
+    }))].sort(),
+  })).sort((left, right) => left.scope_id.localeCompare(right.scope_id));
+}
+
 export async function runV2ObservationsRepair({
   argv = process.argv.slice(2),
   env = process.env,
@@ -926,9 +1431,13 @@ export async function runV2ObservationsRepair({
   const { inputKind, domain, scopes } = normalizePlan(input); // Validate all actions before the first R2 request.
   reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
   const config = resolveR2HistoryIndexConfig(env);
-  if (args.writeR2) {
-    throw new Error("metadata executor is proposal-only; use the validated canonical apply executor");
+  if (args.writeR2 && env.UK_AQ_ENV_NAME !== "CIC-Test") {
+    throw new Error(`Refusing Phase 4 repair write: UK_AQ_ENV_NAME must be CIC-Test (got ${env.UK_AQ_ENV_NAME || "(empty)"})`);
   }
+  if (args.writeR2 && config.r2.bucket !== TEST_R2_BUCKET) {
+    throw new Error(`Refusing Phase 4 repair write: configured R2 bucket must be ${TEST_R2_BUCKET} (got ${config.r2.bucket || "(empty)"})`);
+  }
+  if (!hasRequiredR2Config(config.r2)) throw new Error("Missing R2 configuration");
   const byDay = new Map();
   for (const scope of scopes) {
     const dayScopes = byDay.get(scope.dayUtc) || [];
@@ -995,7 +1504,14 @@ export async function runV2ObservationsRepair({
     // in `files`; its parquet objects are the immutable data dependency.
     for (const scope of dayScopes.filter((value) => value.pollutantRepair).sort((left, right) => left.connectorId - right.connectorId)) {
       const wanted = new Set(scope.pollutant_codes || []);
-      const availableCodes = [...wanted].sort();
+      const dataReceipt = domain === "observations"
+        ? localStore.getObservationDataReceipt(dayUtc, scope.connectorId)
+        : null;
+      const availableCodes = dataReceipt
+        ? [...new Set((Array.isArray(dataReceipt.affected_pollutant_codes) ? dataReceipt.affected_pollutant_codes : []).map((entry) =>
+          typeof entry === "string" ? entry.toLowerCase() : null
+        ).filter(Boolean))].sort()
+        : [...wanted].sort();
       const selectedCodes = availableCodes.filter((code) => !wanted.size || wanted.has(code));
       const missingRequested = [...wanted].filter((code) => !availableCodes.includes(code));
       for (const pollutantCode of missingRequested) {
@@ -1011,12 +1527,14 @@ export async function runV2ObservationsRepair({
       for (const pollutantCode of selectedCodes) {
         const source = await leafManifestSourceFromCombined({
           store: localStore,
+          r2: config.r2,
           dataPrefix,
           base,
           dayUtc,
           connectorId: scope.connectorId,
           pollutantCode,
           domain,
+          dataReceipt,
         });
         if (source.blocked_reason) {
           const blocked = { ...scope, pollutant_code: pollutantCode, status: "blocked_dependency", reason: source.blocked_reason };
@@ -1055,27 +1573,8 @@ export async function runV2ObservationsRepair({
         blockedScopes.push({ ...scope, status: "blocked_dependency", reason: "pollutant_manifest_dependency_blocked" });
         continue;
       }
-      const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain, allowEmpty: true });
+      const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain });
       const key = `${base}/connector_id=${scope.connectorId}/manifest.json`;
-      if (!child.children.length) {
-        const existing = staged.stagedR2.adapter.getObjectIfExists(key);
-        if (!existing) {
-          blockedScopes.push({ ...scope, status: "blocked_dependency", reason: "empty_connector_manifest_unavailable" });
-          blockedConnectorScopes.add(`${dayUtc}|${scope.connectorId}`);
-          continue;
-        }
-        const existingPayload = jsonObject(existing, key);
-        if (domain === "observations") {
-          assertV2ObservationsChildManifest(existingPayload, { key, kind: "connector", dayUtc, connectorId: scope.connectorId });
-        } else if (existingPayload?.domain !== "aqilevels" || existingPayload?.manifest_kind !== "connector") {
-          throw new Error(`Invalid empty AQI connector manifest: ${key}`);
-        }
-        if ((existingPayload.child_manifests || []).length || (existingPayload.files || []).length) {
-          throw new Error(`Connector manifest has children hidden by the proposed final state: ${key}`);
-        }
-        proposalKeys.push(key);
-        continue;
-      }
       const payload = buildHistoryV2ConnectorManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key,
@@ -1247,42 +1746,127 @@ export async function runV2ObservationsRepair({
     total_objects: staged.proposals.size,
     blocked_count: blockedScopes.length,
   });
-  for (const proposal of staged.proposals.values()) assertCanonicalProposal(proposal);
-  for (const proposal of staged.proposals.values()) {
-    assertCanonicalProposalRelationships(proposal, staged.proposals);
-  }
-  const proposalViews = [...staged.proposals.values()]
-    .map(proposalView)
-    .sort((left, right) => left.key.localeCompare(right.key));
-  const results = dayPlans.map((plan) => plan.status === "blocked_dependency"
-    ? plan
-    : { ...plan, status: "planned", verification: { status: "not_run" }, operations: [] });
-  const status = blockedScopes.length ? "blocked_dependency" : "planned";
-  const ok = status !== "blocked_dependency";
+  const hierarchyProposals = new Map([...staged.proposals.entries()].filter(([, proposal]) =>
+    ["pollutant_manifest", "connector_manifest", "day_manifest"].includes(proposal.kind)
+  ));
+  const indexProposals = new Map([...staged.proposals.entries()].filter(([, proposal]) =>
+    !hierarchyProposals.has(proposal.key)
+  ));
+  const hierarchyDependencies = collectPreservedLiveDependencies({
+    store: localStore,
+    proposals: hierarchyProposals,
+  });
+  const hierarchyAppliedResult = await applyStagedProposals({
+    r2: config.r2,
+    proposals: hierarchyProposals,
+    writeR2: args.writeR2,
+    liveDependencies: hierarchyDependencies,
+    onProgress: reportProgress,
+    blockedCount: blockedScopes.length,
+  });
+  const provisionalReceipts = buildCommitReceipts({
+    runStateJson: args.runStateJson,
+    domain,
+    dayPlans,
+    proposals: staged.proposals,
+    applied: hierarchyAppliedResult.results,
+    writeR2: args.writeR2,
+  });
+  const liveEvidence = args.writeR2 && !hierarchyAppliedResult.failure
+    ? await verifyCommittedConnectorHierarchies({ r2: config.r2, receipts: provisionalReceipts, proposals: staged.proposals })
+    : new Map();
+  const hierarchyVerificationFailure = [...liveEvidence.values()].find((entry) => entry?.verified === false) || null;
+  const indexAppliedResult = hierarchyAppliedResult.failure || hierarchyVerificationFailure
+    ? {
+      results: applicationFailureResults([...indexProposals.values()], null,
+        hierarchyVerificationFailure?.error || "hierarchy_metadata_application_failed", "committed_hierarchy_verification"),
+      failure: hierarchyVerificationFailure ? { key: "committed_hierarchy", error: hierarchyVerificationFailure.error } : hierarchyAppliedResult.failure,
+      operation_counts: { r2_get_before_put_count: 0, r2_head_before_put_count: 0, r2_list_before_put_count: 0, r2_put_count: 0, r2_get_after_put_verification_count: 0 },
+    }
+    : await applyStagedProposals({
+      r2: config.r2,
+      proposals: indexProposals,
+      writeR2: args.writeR2,
+      liveDependencies: collectPreservedLiveDependencies({
+        store: localStore,
+        proposals: indexProposals,
+        includeDependencies: false,
+      }),
+      onProgress: reportProgress,
+      blockedCount: blockedScopes.length,
+    });
+  const applied = new Map([...hierarchyAppliedResult.results, ...indexAppliedResult.results]);
+  const appliedResult = {
+    failure: hierarchyAppliedResult.failure || indexAppliedResult.failure,
+    operation_counts: Object.fromEntries(Object.keys(hierarchyAppliedResult.operation_counts).map((key) => [
+      key,
+      Number(hierarchyAppliedResult.operation_counts[key] || 0) + Number(indexAppliedResult.operation_counts[key] || 0),
+    ])),
+  };
+  const proposalViews = [...staged.proposals.values()].map(proposalView).sort((left, right) => left.key.localeCompare(right.key));
+  const applicationOperations = [...applied.values()].sort((left, right) => left.key.localeCompare(right.key));
+  const results = dayPlans.map((plan) => {
+    if (plan.status === "blocked_dependency") return plan;
+    const operations = plan.proposal_keys.map((key) => applied.get(key)).filter(Boolean);
+    const statuses = [
+      ...operations.flatMap((operation) => collectOutcomeStatuses(operation)),
+      ...collectOutcomeStatuses(plan.index),
+    ];
+    const verificationStatuses = operations.flatMap((operation) => {
+      const status = operation.verification;
+      return REPAIR_STATUSES.has(status) ? [status] : [];
+    });
+    collectVerificationStatuses(plan.index, verificationStatuses);
+    return {
+      ...plan,
+      status: reduceRepairStatus(statuses, args.writeR2 ? "not_run" : "planned"),
+      verification: { status: reduceRepairStatus(verificationStatuses, "not_run") },
+      operations,
+    };
+  });
+  const topLevelStatuses = results.flatMap((result) => collectOutcomeStatuses(result));
+  const status = appliedResult.failure ? "failed" : (blockedScopes.length
+    ? "blocked_dependency"
+    : reduceRepairStatus(topLevelStatuses, args.writeR2 ? "not_run" : "planned"));
+  const ok = status !== "blocked_dependency" && status !== "failed";
+  const executionStatus = args.writeR2
+    ? reduceRepairStatus(results.map((result) => result.status), "not_run")
+    : "not_run";
+  const verificationStatus = args.writeR2
+    ? reduceRepairStatus(results.flatMap((result) => collectOutcomeStatuses(result.verification)), "not_run")
+    : "not_run";
+  const receipts = buildCommitReceipts({
+    runStateJson: args.runStateJson,
+    domain,
+    dayPlans,
+    proposals: staged.proposals,
+    applied,
+    writeR2: args.writeR2,
+    liveEvidence,
+  });
+  const sharedCommitObjects = buildSharedCommitObjects({
+    runStateJson: args.runStateJson, domain, dayPlans, applied,
+  });
   return {
     ok,
     status,
-    dry_run: true,
-    write_r2: false,
+    dry_run: !args.writeR2,
+    write_r2: args.writeR2,
     manifest_status: reduceRepairStatus(dayPlans.map((plan) => plan.manifest_status || "not_run"), "not_run"),
     index_status: reduceRepairStatus(dayPlans.map((plan) => plan.index_status || "not_run"), "not_run"),
     bucket: config.r2.bucket,
     planning: { status: "planned", input_kind: inputKind, domain, scopes, days: dayPlans, proposals: proposalViews, blocked_scopes: blockedScopes },
-    execution: { status: "not_run" },
-    verification: { status: "not_run" },
-    application_failure: null,
-    r2_operation_counts: {
-      r2_get_before_put_count: 0,
-      r2_head_before_put_count: 0,
-      r2_list_before_put_count: 0,
-      r2_put_count: 0,
-      r2_get_after_put_verification_count: 0,
-    },
+    execution: { status: executionStatus },
+    verification: { status: verificationStatus },
+    application_failure: appliedResult.failure,
+    r2_operation_counts: appliedResult.operation_counts,
     application: {
-      status: "planned",
-      operations: [],
-      failure: null,
+      status: appliedResult.failure ? "partial" : (args.writeR2 ? "succeeded" : "planned"),
+      operations: applicationOperations,
+      failure: appliedResult.failure,
     },
+    commit_receipts: receipts,
+    shared_commit_objects: sharedCommitObjects,
     results,
   };
 }
