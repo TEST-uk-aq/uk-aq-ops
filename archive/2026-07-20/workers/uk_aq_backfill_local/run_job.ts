@@ -1177,14 +1177,6 @@ const INTEGRITY_SOURCE_EVIDENCE_ONLY = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
   false,
 );
-const INTEGRITY_REPAIR_POLLUTANTS = new Set(
-  (Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS") || "")
-    .split(",")
-    .map((value) => value.trim().toLowerCase())
-    .filter((value) => value.length > 0),
-);
-const INTEGRITY_POLLUTANT_SCOPED_REPAIR =
-  INTEGRITY_COMPLETE_CONNECTOR_DAY && INTEGRITY_REPAIR_POLLUTANTS.size > 0;
 const IS_LOCAL_RUN = !optionalEnv("K_SERVICE") && !optionalEnv("K_REVISION");
 
 function nowIso(): string {
@@ -14066,14 +14058,9 @@ async function runSourceToAll(
             uncanonicalisable_source_row_count: 0,
             blocked_row_samples: [],
           };
-        const completeCanonicalObservationRows = INTEGRITY_COMPLETE_CONNECTOR_DAY
+        const canonicalObservationRows = INTEGRITY_COMPLETE_CONNECTOR_DAY
           ? duplicateSourceEvidence.canonical_observation_rows
           : dedupeSourceObservationRows(observationRowsRaw);
-        const canonicalObservationRows = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-          ? completeCanonicalObservationRows.filter((row) =>
-            INTEGRITY_REPAIR_POLLUTANTS.has(String(row.pollutant_code || "").toLowerCase())
-          )
-          : completeCanonicalObservationRows;
         rowsRead += canonicalObservationRows.length;
 
         let obsHistoryRows = sourceObservationsToObsHistoryRows(
@@ -14147,12 +14134,7 @@ async function runSourceToAll(
           const sourceFileIdentitiesJson = JSON.stringify(sourceFileIdentityList);
           writeIntegrityProposalStageJson(evidencePath, {
             schema_version: 1,
-            contract: INTEGRITY_POLLUTANT_SCOPED_REPAIR
-              ? "pollutant_scoped_authoritative_connector_day_source_rows"
-              : "complete_authoritative_connector_day_source_rows",
-            requested_pollutant_set: INTEGRITY_POLLUTANT_SCOPED_REPAIR
-              ? Array.from(INTEGRITY_REPAIR_POLLUTANTS).sort()
-              : [],
+            contract: "complete_authoritative_connector_day_source_rows",
             connector_id: connectorId,
             day_utc: dayUtc,
             source_adapter: sourceAdapter,
@@ -14193,7 +14175,6 @@ async function runSourceToAll(
             inactive_identity_rows_skipped: 0,
           });
           sourceCheckpointJson.complete_connector_day = true;
-          sourceCheckpointJson.integrity_repair_pollutants = Array.from(INTEGRITY_REPAIR_POLLUTANTS).sort();
           sourceCheckpointJson.source_evidence_path = evidencePath;
           sourceCheckpointJson.source_evidence_rows_sha256 = sha256Hex(rowsJson);
           if (blockedRowCount > 0) {

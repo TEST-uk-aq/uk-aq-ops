@@ -3905,7 +3905,6 @@ def run_narrow_backfill(
     extra_env: dict[str, str] | None = None,
     history_version: str = "v1",
     complete_connector_day: bool = False,
-    repair_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one (timeseries-ids, day).
 
@@ -3974,9 +3973,6 @@ def run_narrow_backfill(
         sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
         sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_ID", None)
         sub_env["UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY"] = "true"
-        selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
-        if selected_pollutants:
-            sub_env["UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS"] = ",".join(selected_pollutants)
     else:
         sub_env["UK_AQ_BACKFILL_TIMESERIES_IDS"] = ",".join(
             str(t) for t in timeseries_ids
@@ -13097,7 +13093,7 @@ def _load_complete_connector_day_source_evidence(
         raise ValueError("complete connector-day detector source evidence is invalid")
     if (
         evidence.get("schema_version") != 1
-        or evidence.get("contract") not in {"complete_authoritative_connector_day_source_rows", "pollutant_scoped_authoritative_connector_day_source_rows"}
+        or evidence.get("contract") != "complete_authoritative_connector_day_source_rows"
         or evidence.get("enumeration_complete") is not True
         or str(evidence.get("day_utc") or "") != day_utc
         or int(evidence.get("connector_id") or 0) != int(connector_id)
@@ -13248,19 +13244,6 @@ def _persist_complete_connector_day_source_evidence(
     return {"evidence_id": int(cursor.lastrowid), "evidence_sha256": evidence_sha256}
 
 
-def _normalise_repair_pollutants(values: Iterable[Any] | None) -> list[str]:
-    allowed = {"pm25", "pm10", "no2"}
-    normalized = sorted({str(value or "").strip().lower() for value in (values or []) if str(value or "").strip()})
-    invalid = [value for value in normalized if value not in allowed]
-    if invalid:
-        raise ValueError(f"unsupported repair pollutant(s): {','.join(invalid)}")
-    return normalized
-
-
-def _parse_repair_pollutants_arg(raw: str | None) -> list[str]:
-    return _normalise_repair_pollutants((raw or "").split(","))
-
-
 def _assert_detector_and_proposal_source_evidence_agree(
     *,
     detector: Mapping[str, Any],
@@ -13274,7 +13257,6 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "per_pollutant_counts",
         "pollutant_set",
         "source_file_identities_sha256",
-        "requested_pollutant_set",
     )
     mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
     if mismatched:
@@ -13298,7 +13280,6 @@ def run_v2_gap_backfills(
     log: logging.Logger,
     run_state: dict[str, Any] | None = None,
     queue_aqi_from_observation_repairs: bool = True,
-    repair_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -13510,7 +13491,6 @@ def run_v2_gap_backfills(
                     "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
                 },
                 complete_connector_day=True,
-                repair_pollutants=repair_pollutants,
             )
             if detector_result.get("status") != "ok":
                 raise RuntimeError(
@@ -13586,7 +13566,6 @@ def run_v2_gap_backfills(
                 history_version="v2",
                 extra_env=extra_env,
                 complete_connector_day=True,
-                repair_pollutants=repair_pollutants,
             )
             chunk_results.append(bf)
             metrics["v2_observation_repairs_attempted"] += 1
@@ -13709,7 +13688,6 @@ def run_v2_gap_backfills(
                     run_state=run_state,
                     day_utc=day_iso,
                     connector_id=connector_id,
-                    repair_pollutants=repair_pollutants,
                 )
                 expected_timeseries_row_counts = _normalize_timeseries_row_counts(
                     source_evidence.get("per_timeseries_counts")
@@ -14851,7 +14829,6 @@ def _capture_local_v2_observation_scope(
     run_state: dict[str, Any],
     day_utc: str,
     connector_id: int,
-    repair_pollutants: Iterable[str] | None = None,
 ) -> list[str]:
     """Prove source/Parquet equality, then stage one connector-day proposal."""
     stage_root = Path(str(run_state["overlay_root"]))
@@ -14860,7 +14837,6 @@ def _capture_local_v2_observation_scope(
         f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
         f"connector_id={int(connector_id)}"
     )
-    selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
     source_root = generated_root / connector_prefix
     manifest_source = source_root / "manifest.json"
     if not manifest_source.is_file():
@@ -14887,7 +14863,7 @@ def _capture_local_v2_observation_scope(
     if (
         not isinstance(evidence, Mapping)
         or evidence.get("schema_version") != 1
-        or evidence.get("contract") not in {"complete_authoritative_connector_day_source_rows", "pollutant_scoped_authoritative_connector_day_source_rows"}
+        or evidence.get("contract") != "complete_authoritative_connector_day_source_rows"
         or evidence.get("enumeration_complete") is not True
         or str(evidence.get("day_utc") or "") != day_utc
         or int(evidence.get("connector_id") or 0) != int(connector_id)
@@ -14957,10 +14933,7 @@ def _capture_local_v2_observation_scope(
     if sum(source_identities.values()) != len(source_rows):
         raise ValueError("source evidence contains a non-object observation row")
 
-    parquet_paths = sorted(
-        path for path in source_root.glob("pollutant_code=*/part-*.parquet")
-        if not selected_pollutants or path.parent.name.removeprefix("pollutant_code=") in selected_pollutants
-    )
+    parquet_paths = sorted(source_root.glob("pollutant_code=*/part-*.parquet"))
     if importlib.util.find_spec("duckdb") is None:
         raise RuntimeError("duckdb is required for exact connector-day Parquet read-back")
     import duckdb  # type: ignore[import-not-found]
@@ -15028,15 +15001,7 @@ def _capture_local_v2_observation_scope(
         != sorted(expected_pollutant_counts)
     ):
         raise ValueError("canonical connector manifest does not match source-derived evidence")
-    object_paths = sorted(
-        path for path in source_root.rglob("*") if path.is_file() and (
-            not selected_pollutants
-            or (
-                path.relative_to(source_root).as_posix().startswith("pollutant_code=")
-                and path.relative_to(source_root).as_posix().split("pollutant_code=", 1)[1].split("/", 1)[0] in selected_pollutants
-            )
-        )
-    )
+    object_paths = sorted(path for path in source_root.rglob("*") if path.is_file())
     if not object_paths:
         raise ValueError("canonical connector proposal has no objects")
     captured: list[str] = []
@@ -15056,16 +15021,10 @@ def _capture_local_v2_observation_scope(
         mark_overlay_structurally_validated(run_state, object_key)
         captured.append(object_key)
     prefix_tombstones = run_state.setdefault("tombstone_prefixes", [])
-    tombstone_prefixes = (
-        [f"{connector_prefix}/pollutant_code={pollutant}" for pollutant in selected_pollutants]
-        if selected_pollutants else [connector_prefix]
-    )
-    for tombstone_prefix in tombstone_prefixes:
-        prefix_tombstones.append({
-            "prefix": tombstone_prefix, "proposed": True, "deleted": False,
-            "deletion_verified": False, "stage": "observations_data",
-            "repair_pollutants": selected_pollutants,
-        })
+    prefix_tombstones.append({
+        "prefix": connector_prefix, "proposed": True, "deleted": False,
+        "deletion_verified": False, "stage": "observations_data",
+    })
     run_state["tombstone_prefixes"] = sorted(
         {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
         key=lambda entry: str(entry["prefix"]),
@@ -16056,7 +16015,6 @@ def run_v2_integrity_repair_flow(
     dry_run: bool,
     log: logging.Logger,
     selected_days: Iterable[str] | None = None,
-    repair_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
     observations = run_v2_gap_backfills(
@@ -16066,7 +16024,6 @@ def run_v2_integrity_repair_flow(
         # Phase 4 owns the only AQI queue for this coordinator run.  The
         # historical observation specialist must not enqueue a duplicate.
         queue_aqi_from_observation_repairs=False,
-        repair_pollutants=repair_pollutants,
     )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
@@ -16470,11 +16427,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Detect changes; do not trigger backfill.")
     p.add_argument("--run-backfill", action="store_true",
                    help="Enable the ordered v2 repair flow after read-only detection.")
-    p.add_argument(
-        "--repair-pollutants",
-        default=os.environ.get("UK_AQ_HISTORY_INTEGRITY_REPAIR_POLLUTANTS", ""),
-        help="Explicit AQI pollutant-scoped observation repair list: pm25,pm10,no2.",
-    )
     p.add_argument("--max-download-mb", type=int, default=None)
     p.add_argument("--max-runtime-minutes", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
@@ -16543,9 +16495,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             p.error("--logical-run-date must be YYYY-MM-DD")
         if parsed.profile != "daily":
             p.error("--logical-run-date is supported only with --profile daily")
-    parsed.repair_pollutants = _parse_repair_pollutants_arg(parsed.repair_pollutants)
-    if parsed.repair_pollutants and not parsed.run_backfill:
-        p.error("--repair-pollutants requires --run-backfill")
     if parsed.check_only and parsed.run_backfill:
         p.error(
             "--check-only and --run-backfill cannot be used together.",
@@ -19366,7 +19315,6 @@ def main(argv: list[str]) -> int:
                 limits=limits,
                 dry_run=not mode_allows_remote_apply(effective_mode),
                 log=log,
-                repair_pollutants=args.repair_pollutants,
             )
 
         any_adapter_ran = (
