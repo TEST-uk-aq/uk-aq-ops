@@ -63,16 +63,20 @@ function objectRank(key) {
   return domainOffset + 55;
 }
 
-const OBSERVATION_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
 const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
   /^history\/v2\/aqilevels\/hourly\/data\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
   /^history\/v2\/aqilevels\/hourly\/debug\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
 ]);
-const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 
-function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
+function assertCanonicalConnectorDayPrefix(prefix) {
+  const match = CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS
+    .map((pattern) => prefix.match(pattern))
+    .find(Boolean);
+  if (!match) {
+    throw new Error(`Deletion prefix is outside the canonical connector-day allowlist: ${prefix}`);
+  }
+  const [, dayUtc, connectorIdRaw] = match;
   const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
   if (Number.isNaN(parsedDay.getTime()) || parsedDay.toISOString().slice(0, 10) !== dayUtc) {
     throw new Error(`Deletion prefix has an invalid UTC day: ${prefix}`);
@@ -80,35 +84,6 @@ function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
   const connectorId = Number(connectorIdRaw);
   if (!Number.isSafeInteger(connectorId) || connectorId <= 0 || String(connectorId) !== connectorIdRaw) {
     throw new Error(`Deletion prefix has an invalid connector ID: ${prefix}`);
-  }
-}
-
-function assertCanonicalDeletionPrefix(prefix, entry) {
-  const pollutantMatch = prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
-  if (pollutantMatch) {
-    const [, dayUtc, connectorIdRaw, pollutant] = pollutantMatch;
-    validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw });
-    if (!OBSERVATION_INTEGRITY_POLLUTANTS.has(pollutant)) {
-      throw new Error(`Observation deletion prefix has an unsupported pollutant: ${prefix}`);
-    }
-    const repairPollutants = Array.isArray(entry?.repair_pollutants)
-      ? entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
-      : [];
-    if (!repairPollutants.includes(pollutant) || repairPollutants.some((value) => !OBSERVATION_INTEGRITY_POLLUTANTS.has(value))) {
-      throw new Error(`Observation pollutant deletion prefix is not backed by matching repair_pollutants evidence: ${prefix}`);
-    }
-    return;
-  }
-  const match = CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS
-    .map((pattern) => prefix.match(pattern))
-    .find(Boolean);
-  if (!match) {
-    throw new Error(`Deletion prefix is outside the canonical allowlist: ${prefix}`);
-  }
-  const [, dayUtc, connectorIdRaw] = match;
-  validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw });
-  if (prefix.startsWith("history/v2/observations/") && Array.isArray(entry?.repair_pollutants) && entry.repair_pollutants.length > 0) {
-    throw new Error(`Pollutant-scoped observation repair cannot delete a connector-day prefix: ${prefix}`);
   }
 }
 
@@ -183,29 +158,9 @@ export function validateLocalProposal(runState) {
   const normalizedPrefixes = prefixes.map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
     if (!entry?.proposed) throw new Error(`Deletion prefix is not proposed: ${prefix}`);
-    assertCanonicalDeletionPrefix(prefix, entry);
+    assertCanonicalConnectorDayPrefix(prefix);
     return { entry, prefix, domain: objectDomain(prefix) };
   });
-  const scopedObservationGroups = new Map();
-  for (const item of normalizedPrefixes) {
-    const match = item.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
-    if (!match) continue;
-    const [, dayUtc, connectorIdRaw, pollutant] = match;
-    const repairPollutants = Array.isArray(item.entry?.repair_pollutants)
-      ? item.entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
-      : [];
-    const groupKey = `${dayUtc}|${connectorIdRaw}|${repairPollutants.join(",")}`;
-    const group = scopedObservationGroups.get(groupKey) || { repairPollutants, prefixes: new Map() };
-    group.prefixes.set(pollutant, (group.prefixes.get(pollutant) || 0) + 1);
-    scopedObservationGroups.set(groupKey, group);
-  }
-  for (const [groupKey, group] of scopedObservationGroups.entries()) {
-    for (const pollutant of group.repairPollutants) {
-      if (group.prefixes.get(pollutant) !== 1) {
-        throw new Error(`Pollutant-scoped observation repair requires exactly one deletion prefix for ${pollutant}: ${groupKey}`);
-      }
-    }
-  }
   return {
     objects: normalizedObjects.sort((left, right) => objectRank(left.key) - objectRank(right.key) || left.key.localeCompare(right.key)),
     prefixes: normalizedPrefixes.sort((left, right) => left.domain.localeCompare(right.domain) || left.prefix.localeCompare(right.prefix)),
