@@ -3,7 +3,9 @@ import {
   createAqiV2ConnectorManifest,
   createAqiV2PollutantManifest,
   parseOpenaqCsvObservations,
+  parseSensorcommunityCsvObservations,
   parseUkAirFlatFileObservations,
+  reconcileIntegritySourceAdapterBlockedRows,
   summarizeAqilevelsPartRows,
 } from "./run_job.ts";
 
@@ -238,6 +240,61 @@ Deno.test("UK-AIR CSV ignores only explicitly ignored source labels", () => {
   });
   assertEquals(parsed.rows, []);
   assertEquals(parsed.skipped_ignored_properties, 1);
+});
+
+Deno.test("Integrity source-adapter blocked-row reconciliation preserves exact counts and fails closed", () => {
+  assertEquals(reconcileIntegritySourceAdapterBlockedRows({ raw: 10, selected: 2, outOfScope: 3, ambiguous: 1, scoped: true }), {
+    selected: 2,
+    outOfScope: 3,
+    ambiguous: 5,
+    blocking: 7,
+  });
+  assertEquals(reconcileIntegritySourceAdapterBlockedRows({ raw: 3, selected: 0, outOfScope: 3, ambiguous: 0, scoped: true }).blocking, 0);
+  assertEquals(reconcileIntegritySourceAdapterBlockedRows({ raw: 4, selected: 0, outOfScope: 0, ambiguous: 0, scoped: false }).blocking, 4);
+});
+
+Deno.test("Sensor.Community parser records selected invalid timestamp blocker", () => {
+  const lookup = {
+    connector_id: 7,
+    station_refs: new Set<string>(["123"]),
+    binding_by_station_pollutant: new Map([["123|pm25", { timeseries_id: 1, station_id: 2, station_ref: "123", timeseries_ref: "123-pm25", pollutant_code: "pm25" }]]),
+    binding_by_timeseries_id: new Map(),
+    binding_by_timeseries_ref: new Map(),
+    binding_by_timeseries_ref_pollutant: new Map(),
+    ambiguous_station_pollutant_keys: new Set<string>(),
+    ambiguous_timeseries_ref_pollutant_keys: new Set<string>(),
+    ambiguous_timeseries_ref_keys: new Set<string>(),
+  };
+  const parsed = parseSensorcommunityCsvObservations({
+    dayUtc: "2026-07-12",
+    lookup,
+    csvText: ["sensor_id;timestamp;P1;P2", "123;not-a-date;;12.5"].join("\n"),
+  });
+  assertEquals(parsed.selected_source_adapter_blocked_row_count, 1);
+});
+
+Deno.test("OpenAQ parser classifies scoped invalid selected and out-of-scope rows", () => {
+  const lookup = {
+    connector_id: 6,
+    station_refs: new Set<string>(["42"]),
+    binding_by_station_pollutant: new Map(),
+    binding_by_timeseries_id: new Map(),
+    binding_by_timeseries_ref: new Map(),
+    binding_by_timeseries_ref_pollutant: new Map(),
+    ambiguous_station_pollutant_keys: new Set<string>(),
+    ambiguous_timeseries_ref_pollutant_keys: new Set<string>(),
+    ambiguous_timeseries_ref_keys: new Set<string>(),
+  };
+  const parsed = parseOpenaqCsvObservations({
+    dayUtc: "2026-07-12",
+    csvText: ["location_id,sensors_id,datetime,parameter,value", "42,s1,bad,pm25,12", "42,s2,2026-07-12T00:00:00Z,so2,nan"].join("\n"),
+    lookup,
+    locationId: 42,
+    includeMetFields: true,
+    repairPollutants: new Set(["pm25", "no2", "o3"]),
+  });
+  assertEquals(parsed.selected_source_adapter_blocked_row_count, 1);
+  assertEquals(parsed.out_of_scope_source_adapter_blocked_row_count, 1);
 });
 
 Deno.test("AQI part summary counts valid timeseries ids only", () => {

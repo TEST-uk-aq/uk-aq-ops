@@ -8536,7 +8536,7 @@ function parseArchiveTimestampToIso(raw: string): string | null {
   return new Date(parsedMs).toISOString();
 }
 
-function parseSensorcommunityCsvObservations(args: {
+export function parseSensorcommunityCsvObservations(args: {
   dayUtc: string;
   csvText: string;
   lookup: SourceConnectorLookup;
@@ -8545,11 +8545,17 @@ function parseSensorcommunityCsvObservations(args: {
   source_records: number;
   skipped_outside_day: number;
   skipped_null_value: number;
+  selected_source_adapter_blocked_row_count: number;
+  selected_source_adapter_blocked_row_samples: Record<string, unknown>[];
+  out_of_scope_source_adapter_blocked_row_count: number;
+  out_of_scope_source_adapter_blocked_row_samples: Record<string, unknown>[];
+  ambiguous_source_adapter_blocked_row_count: number;
+  ambiguous_source_adapter_blocked_row_samples: Record<string, unknown>[];
 } {
   const { dayUtc, csvText, lookup } = args;
   const lines = csvText.split(/\r?\n/).filter((line) => line.trim().length > 0);
   if (lines.length <= 1) {
-    return { rows: [], source_records: 0, skipped_outside_day: 0, skipped_null_value: 0 };
+    return { rows: [], source_records: 0, skipped_outside_day: 0, skipped_null_value: 0, selected_source_adapter_blocked_row_count: 0, selected_source_adapter_blocked_row_samples: [], out_of_scope_source_adapter_blocked_row_count: 0, out_of_scope_source_adapter_blocked_row_samples: [], ambiguous_source_adapter_blocked_row_count: 0, ambiguous_source_adapter_blocked_row_samples: [] };
   }
 
   const headers = lines[0].split(";").map((header) => header.trim());
@@ -8564,7 +8570,7 @@ function parseSensorcommunityCsvObservations(args: {
     if (INTEGRITY_COMPLETE_CONNECTOR_DAY) {
       throw new Error("sensorcommunity_required_headers_missing");
     }
-    return { rows: [], source_records: 0, skipped_outside_day: 0, skipped_null_value: 0 };
+    return { rows: [], source_records: 0, skipped_outside_day: 0, skipped_null_value: 0, selected_source_adapter_blocked_row_count: 0, selected_source_adapter_blocked_row_samples: [], out_of_scope_source_adapter_blocked_row_count: 0, out_of_scope_source_adapter_blocked_row_samples: [], ambiguous_source_adapter_blocked_row_count: 0, ambiguous_source_adapter_blocked_row_samples: [] };
   }
 
   const mappings: Array<
@@ -8590,6 +8596,12 @@ function parseSensorcommunityCsvObservations(args: {
   let sourceRecords = 0;
   let skippedOutsideDay = 0;
   let skippedNullValue = 0;
+  let selectedBlocked = 0;
+  const selectedSamples: Record<string, unknown>[] = [];
+  let outOfScopeBlocked = 0;
+  const outOfScopeSamples: Record<string, unknown>[] = [];
+  const ambiguousBlocked = 0;
+  const ambiguousSamples: Record<string, unknown>[] = [];
 
   for (let lineIndex = 1; lineIndex < lines.length; lineIndex += 1) {
     const columns = lines[lineIndex].split(";");
@@ -8600,11 +8612,22 @@ function parseSensorcommunityCsvObservations(args: {
       columns[timestampIndex] || "",
     );
     if (!observedAtIso) {
-      if (INTEGRITY_COMPLETE_CONNECTOR_DAY && activeMappings.some((mapping) => {
-        const index = headerIndex.get(mapping.header);
-        return index !== undefined && parseCsvNumber(columns[index] || "") !== null;
-      })) {
-        throw new Error(`sensorcommunity_invalid_timestamp line=${lineIndex + 1}`);
+      if (INTEGRITY_COMPLETE_CONNECTOR_DAY) {
+        const selected = activeMappings.some((mapping) => {
+          const index = headerIndex.get(mapping.header);
+          return index !== undefined && parseCsvNumber(columns[index] || "") !== null;
+        });
+        const any = mappings.some((mapping) => {
+          const index = headerIndex.get(mapping.header);
+          return index !== undefined && parseCsvNumber(columns[index] || "") !== null;
+        });
+        if (selected) {
+          selectedBlocked += 1;
+          if (selectedSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) selectedSamples.push({ source_adapter: "sensorcommunity", line_number: lineIndex + 1, station_ref: stationRefRaw || null, scope_classification: "selected", reason: "invalid_timestamp" });
+        } else if (any) {
+          outOfScopeBlocked += 1;
+          if (outOfScopeSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) outOfScopeSamples.push({ source_adapter: "sensorcommunity", line_number: lineIndex + 1, station_ref: stationRefRaw || null, scope_classification: "out_of_scope", reason: "invalid_timestamp" });
+        }
       }
       continue;
     }
@@ -8651,7 +8674,7 @@ function parseSensorcommunityCsvObservations(args: {
     }
   }
 
-  return { rows, source_records: sourceRecords, skipped_outside_day: skippedOutsideDay, skipped_null_value: skippedNullValue };
+  return { rows, source_records: sourceRecords, skipped_outside_day: skippedOutsideDay, skipped_null_value: skippedNullValue, selected_source_adapter_blocked_row_count: selectedBlocked, selected_source_adapter_blocked_row_samples: selectedSamples, out_of_scope_source_adapter_blocked_row_count: outOfScopeBlocked, out_of_scope_source_adapter_blocked_row_samples: outOfScopeSamples, ambiguous_source_adapter_blocked_row_count: ambiguousBlocked, ambiguous_source_adapter_blocked_row_samples: ambiguousSamples };
 }
 
 function buildOpenaqArchiveObjectKey(
@@ -9057,6 +9080,12 @@ type OpenaqCsvParseResult = {
   skipped_unknown_parameter: number;
   skipped_outside_day: number;
   skipped_invalid_value_or_timestamp: number;
+  selected_source_adapter_blocked_row_count: number;
+  selected_source_adapter_blocked_row_samples: Record<string, unknown>[];
+  out_of_scope_source_adapter_blocked_row_count: number;
+  out_of_scope_source_adapter_blocked_row_samples: Record<string, unknown>[];
+  ambiguous_source_adapter_blocked_row_count: number;
+  ambiguous_source_adapter_blocked_row_samples: Record<string, unknown>[];
 };
 
 export function parseOpenaqCsvObservations(args: {
@@ -9065,8 +9094,10 @@ export function parseOpenaqCsvObservations(args: {
   lookup: SourceConnectorLookup;
   locationId: number;
   includeMetFields: boolean;
+  repairPollutants?: Set<string> | null;
 }): OpenaqCsvParseResult {
   const { dayUtc, csvText, lookup, locationId, includeMetFields } = args;
+  const repairPollutants = args.repairPollutants || null;
   const lines = csvText.split(/\r?\n/).filter((line) => line.trim().length > 0);
   if (lines.length <= 1) {
     return {
@@ -9077,6 +9108,12 @@ export function parseOpenaqCsvObservations(args: {
       skipped_unknown_parameter: 0,
       skipped_outside_day: 0,
       skipped_invalid_value_or_timestamp: 0,
+      selected_source_adapter_blocked_row_count: 0,
+      selected_source_adapter_blocked_row_samples: [],
+      out_of_scope_source_adapter_blocked_row_count: 0,
+      out_of_scope_source_adapter_blocked_row_samples: [],
+      ambiguous_source_adapter_blocked_row_count: 0,
+      ambiguous_source_adapter_blocked_row_samples: [],
     };
   }
 
@@ -9127,6 +9164,12 @@ export function parseOpenaqCsvObservations(args: {
       skipped_unknown_parameter: 0,
       skipped_outside_day: 0,
       skipped_invalid_value_or_timestamp: 0,
+      selected_source_adapter_blocked_row_count: 0,
+      selected_source_adapter_blocked_row_samples: [],
+      out_of_scope_source_adapter_blocked_row_count: 0,
+      out_of_scope_source_adapter_blocked_row_samples: [],
+      ambiguous_source_adapter_blocked_row_count: 0,
+      ambiguous_source_adapter_blocked_row_samples: [],
     };
   }
 
@@ -9138,6 +9181,12 @@ export function parseOpenaqCsvObservations(args: {
   let skippedUnknownParameter = 0;
   let skippedOutsideDay = 0;
   let skippedInvalidValueOrTimestamp = 0;
+  let selectedBlocked = 0;
+  const selectedSamples: Record<string, unknown>[] = [];
+  let outOfScopeBlocked = 0;
+  const outOfScopeSamples: Record<string, unknown>[] = [];
+  let ambiguousBlocked = 0;
+  const ambiguousSamples: Record<string, unknown>[] = [];
 
   for (let lineIndex = 1; lineIndex < lines.length; lineIndex += 1) {
     totalRecords += 1;
@@ -9178,7 +9227,16 @@ export function parseOpenaqCsvObservations(args: {
     const value = parseCsvNumber(columns[valueIndex] || "");
     if (!observedAtIso || value === null) {
       skippedInvalidValueOrTimestamp += 1;
-      if (INTEGRITY_COMPLETE_CONNECTOR_DAY && !observedAtIso && value !== null) {
+      if (repairPollutants) {
+        const sample = { source_adapter: "openaq", location_id: locationId, line_number: lineIndex + 1, pollutant_code: pollutantCode, parameter: parameterRaw, reason: !observedAtIso ? "invalid_timestamp" : "invalid_value" };
+        if (repairPollutants.has(pollutantCode)) {
+          selectedBlocked += 1;
+          if (selectedSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) selectedSamples.push({ ...sample, scope_classification: "selected" });
+        } else {
+          outOfScopeBlocked += 1;
+          if (outOfScopeSamples.length < INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT) outOfScopeSamples.push({ ...sample, scope_classification: "out_of_scope" });
+        }
+      } else if (INTEGRITY_COMPLETE_CONNECTOR_DAY && !observedAtIso && value !== null) {
         throw new Error(`openaq_observation_invalid_timestamp location_id=${locationId} line=${lineIndex + 1}`);
       }
       continue;
@@ -9250,6 +9308,12 @@ export function parseOpenaqCsvObservations(args: {
     skipped_unknown_parameter: skippedUnknownParameter,
     skipped_outside_day: skippedOutsideDay,
     skipped_invalid_value_or_timestamp: skippedInvalidValueOrTimestamp,
+    selected_source_adapter_blocked_row_count: selectedBlocked,
+    selected_source_adapter_blocked_row_samples: selectedSamples,
+    out_of_scope_source_adapter_blocked_row_count: outOfScopeBlocked,
+    out_of_scope_source_adapter_blocked_row_samples: outOfScopeSamples,
+    ambiguous_source_adapter_blocked_row_count: ambiguousBlocked,
+    ambiguous_source_adapter_blocked_row_samples: ambiguousSamples,
   };
 }
 
@@ -9257,6 +9321,19 @@ function dedupeSourceObservationRows(
   rows: SourceObservationRow[],
 ): SourceObservationRow[] {
   return dedupeSourceObservationRowsCore(rows) as SourceObservationRow[];
+}
+
+export function reconcileIntegritySourceAdapterBlockedRows(args: { raw: number; selected: number; outOfScope: number; ambiguous: number; scoped: boolean }): { selected: number; outOfScope: number; ambiguous: number; blocking: number } {
+  const raw = Math.max(0, Math.trunc(Number(args.raw) || 0));
+  const selected = Math.max(0, Math.trunc(Number(args.selected) || 0));
+  const outOfScope = Math.max(0, Math.trunc(Number(args.outOfScope) || 0));
+  let ambiguous = Math.max(0, Math.trunc(Number(args.ambiguous) || 0));
+  if (args.scoped) {
+    const classified = selected + outOfScope + ambiguous;
+    if (raw > classified) ambiguous += raw - classified;
+    return { selected, outOfScope, ambiguous, blocking: selected + ambiguous };
+  }
+  return { selected: raw, outOfScope: 0, ambiguous: 0, blocking: raw };
 }
 
 type IntegrityDuplicateSourceEvidence = {
@@ -13334,6 +13411,12 @@ async function runSourceToAll(
           let totalSourceRecords = 0;
           let totalSkippedOutsideDay = 0;
           let totalSkippedNullValue = 0;
+          let selectedAdapterBlocked = 0;
+          let outOfScopeAdapterBlocked = 0;
+          let ambiguousAdapterBlocked = 0;
+          const selectedAdapterSamples: Record<string, unknown>[] = [];
+          const outOfScopeAdapterSamples: Record<string, unknown>[] = [];
+          const ambiguousAdapterSamples: Record<string, unknown>[] = [];
           for (const fileName of candidateFiles) {
             const csvText = await fetchSensorcommunityArchiveCsv(
               dayUtc,
@@ -13351,6 +13434,12 @@ async function runSourceToAll(
             totalSourceRecords += parsed.source_records;
             totalSkippedOutsideDay += parsed.skipped_outside_day;
             totalSkippedNullValue += parsed.skipped_null_value;
+            selectedAdapterBlocked += parsed.selected_source_adapter_blocked_row_count;
+            outOfScopeAdapterBlocked += parsed.out_of_scope_source_adapter_blocked_row_count;
+            ambiguousAdapterBlocked += parsed.ambiguous_source_adapter_blocked_row_count;
+            selectedAdapterSamples.push(...parsed.selected_source_adapter_blocked_row_samples.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT - selectedAdapterSamples.length));
+            outOfScopeAdapterSamples.push(...parsed.out_of_scope_source_adapter_blocked_row_samples.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT - outOfScopeAdapterSamples.length));
+            ambiguousAdapterSamples.push(...parsed.ambiguous_source_adapter_blocked_row_samples.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT - ambiguousAdapterSamples.length));
           }
           sourceEnumerationComplete = true;
           candidateSourceUnits = candidateFiles.length;
@@ -13359,6 +13448,13 @@ async function runSourceToAll(
           sourceCheckpointJson.total_source_records = totalSourceRecords;
           sourceCheckpointJson.total_skipped_outside_day = totalSkippedOutsideDay;
           sourceCheckpointJson.total_skipped_null_value = totalSkippedNullValue;
+          sourceCheckpointJson.selected_source_adapter_blocked_row_count = selectedAdapterBlocked;
+          sourceCheckpointJson.selected_source_adapter_blocked_row_samples = selectedAdapterSamples;
+          sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_count = outOfScopeAdapterBlocked;
+          sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_samples = outOfScopeAdapterSamples;
+          sourceCheckpointJson.ambiguous_source_adapter_blocked_row_count = ambiguousAdapterBlocked;
+          sourceCheckpointJson.ambiguous_source_adapter_blocked_row_samples = ambiguousAdapterSamples;
+          sourceCheckpointJson.source_adapter_blocked_row_count = selectedAdapterBlocked + outOfScopeAdapterBlocked + ambiguousAdapterBlocked;
         } else if (sourceAdapter === "openaq") {
           const stationRefsLookup = await fetchStationRefsForConnector(
             connectorId,
@@ -13528,6 +13624,12 @@ async function runSourceToAll(
           let totalSkippedUnknownParameter = 0;
           let totalSkippedOutsideDay = 0;
           let totalSkippedInvalidValueOrTimestamp = 0;
+          let selectedAdapterBlocked = 0;
+          let outOfScopeAdapterBlocked = 0;
+          let ambiguousAdapterBlocked = 0;
+          const selectedAdapterSamples: Record<string, unknown>[] = [];
+          const outOfScopeAdapterSamples: Record<string, unknown>[] = [];
+          const ambiguousAdapterSamples: Record<string, unknown>[] = [];
           // fetchOpenaqArchiveCsvGz currently returns found:true/false or throws.
           // It does not currently return structured non-throwing error results.
           let locationFetchErrorCount = 0;
@@ -13575,6 +13677,7 @@ async function runSourceToAll(
               lookup,
               locationId,
               includeMetFields: OPENAQ_INCLUDE_MET_FIELDS,
+              repairPollutants: INTEGRITY_POLLUTANT_SCOPED_REPAIR ? new Set<string>(Array.from(INTEGRITY_REPAIR_POLLUTANTS).map(String)) : null,
             });
             appendRowsSafe(observationRowsRaw, parsed.rows);
             totalCsvRecords += parsed.total_records;
@@ -13584,6 +13687,12 @@ async function runSourceToAll(
             totalSkippedOutsideDay += parsed.skipped_outside_day;
             totalSkippedInvalidValueOrTimestamp +=
               parsed.skipped_invalid_value_or_timestamp;
+            selectedAdapterBlocked += parsed.selected_source_adapter_blocked_row_count;
+            outOfScopeAdapterBlocked += parsed.out_of_scope_source_adapter_blocked_row_count;
+            ambiguousAdapterBlocked += parsed.ambiguous_source_adapter_blocked_row_count;
+            selectedAdapterSamples.push(...parsed.selected_source_adapter_blocked_row_samples.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT - selectedAdapterSamples.length));
+            outOfScopeAdapterSamples.push(...parsed.out_of_scope_source_adapter_blocked_row_samples.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT - outOfScopeAdapterSamples.length));
+            ambiguousAdapterSamples.push(...parsed.ambiguous_source_adapter_blocked_row_samples.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT - ambiguousAdapterSamples.length));
 
             logStructured("info", "source_to_r2_openaq_location_processed", {
               run_id: runId,
@@ -13655,6 +13764,13 @@ async function runSourceToAll(
             totalSkippedOutsideDay;
           sourceCheckpointJson.total_skipped_invalid_value_or_timestamp =
             totalSkippedInvalidValueOrTimestamp;
+          sourceCheckpointJson.selected_source_adapter_blocked_row_count = selectedAdapterBlocked;
+          sourceCheckpointJson.selected_source_adapter_blocked_row_samples = selectedAdapterSamples;
+          sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_count = outOfScopeAdapterBlocked;
+          sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_samples = outOfScopeAdapterSamples;
+          sourceCheckpointJson.ambiguous_source_adapter_blocked_row_count = ambiguousAdapterBlocked;
+          sourceCheckpointJson.ambiguous_source_adapter_blocked_row_samples = ambiguousAdapterSamples;
+          sourceCheckpointJson.source_adapter_blocked_row_count = selectedAdapterBlocked + outOfScopeAdapterBlocked + ambiguousAdapterBlocked;
           openaqFetchErrorCount = locationFetchErrorCount;
           sourceEnumerationComplete = true;
         } else if (sourceAdapter === "sos") {
@@ -13728,7 +13844,11 @@ async function runSourceToAll(
               }
               return left.timeseries_id - right.timeseries_id;
             });
-          let candidateBindings = candidateBindingsUnfiltered;
+          let candidateBindings = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? candidateBindingsUnfiltered.filter((binding) =>
+              INTEGRITY_REPAIR_POLLUTANTS.has(String(binding.pollutant_code || "").toLowerCase())
+            )
+            : candidateBindingsUnfiltered;
           if (REQUESTED_TIMESERIES_IDS && REQUESTED_TIMESERIES_IDS.length > 0) {
             const requestedSet = new Set(REQUESTED_TIMESERIES_IDS);
             const targetedTimeseriesIds = sortedUniquePositiveInts(
@@ -14132,20 +14252,37 @@ async function runSourceToAll(
           const skippedRowCount = Object.entries(sourceCheckpointJson)
             .filter(([key, value]) => key.startsWith("total_skipped_") && Number.isFinite(Number(value)))
             .reduce((total, [, value]) => total + Number(value), 0);
-          const sourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? 0
-            : Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0);
+          const rawSourceAdapterBlockedRowCount = Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0);
+          const selectedSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? Number(sourceCheckpointJson.selected_source_adapter_blocked_row_count || 0)
+            : rawSourceAdapterBlockedRowCount;
           const outOfScopeSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0)
+            ? Number(sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_count || 0)
             : 0;
-          const sourceAdapterBlockedRowSamples = Array.isArray(
-            sourceCheckpointJson.source_adapter_blocked_row_samples,
-          )
-            ? sourceCheckpointJson.source_adapter_blocked_row_samples.filter(
-              (sample): sample is Record<string, unknown> =>
-                Boolean(sample) && typeof sample === "object" && !Array.isArray(sample),
-            )
+          const explicitAmbiguousSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? Number(sourceCheckpointJson.ambiguous_source_adapter_blocked_row_count || 0)
+            : 0;
+          const classifiedSourceAdapterBlockedRowCount = selectedSourceAdapterBlockedRowCount + outOfScopeSourceAdapterBlockedRowCount + explicitAmbiguousSourceAdapterBlockedRowCount;
+          const ambiguousSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR && rawSourceAdapterBlockedRowCount > classifiedSourceAdapterBlockedRowCount
+            ? explicitAmbiguousSourceAdapterBlockedRowCount + (rawSourceAdapterBlockedRowCount - classifiedSourceAdapterBlockedRowCount)
+            : explicitAmbiguousSourceAdapterBlockedRowCount;
+          const sourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? selectedSourceAdapterBlockedRowCount + ambiguousSourceAdapterBlockedRowCount
+            : rawSourceAdapterBlockedRowCount;
+          const selectedSourceAdapterBlockedRowSamples = Array.isArray(sourceCheckpointJson.selected_source_adapter_blocked_row_samples)
+            ? sourceCheckpointJson.selected_source_adapter_blocked_row_samples.filter((sample): sample is Record<string, unknown> => Boolean(sample) && typeof sample === "object" && !Array.isArray(sample))
             : [];
+          const outOfScopeSourceAdapterBlockedRowSamples = Array.isArray(sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_samples)
+            ? sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_samples.filter((sample): sample is Record<string, unknown> => Boolean(sample) && typeof sample === "object" && !Array.isArray(sample))
+            : [];
+          const ambiguousSourceAdapterBlockedRowSamples = Array.isArray(sourceCheckpointJson.ambiguous_source_adapter_blocked_row_samples)
+            ? sourceCheckpointJson.ambiguous_source_adapter_blocked_row_samples.filter((sample): sample is Record<string, unknown> => Boolean(sample) && typeof sample === "object" && !Array.isArray(sample))
+            : [];
+          const sourceAdapterBlockedRowSamples = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? [...selectedSourceAdapterBlockedRowSamples, ...ambiguousSourceAdapterBlockedRowSamples].slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT)
+            : (Array.isArray(sourceCheckpointJson.source_adapter_blocked_row_samples)
+              ? sourceCheckpointJson.source_adapter_blocked_row_samples.filter((sample): sample is Record<string, unknown> => Boolean(sample) && typeof sample === "object" && !Array.isArray(sample))
+              : []);
           const blockedRowCount =
             duplicateSourceEvidence.duplicate_canonical_row_count +
             duplicateSourceEvidence.uncanonicalisable_source_row_count +
@@ -14202,9 +14339,15 @@ async function runSourceToAll(
               duplicateSourceEvidence.duplicate_canonical_row_identity_samples,
             uncanonicalisable_source_row_count:
               duplicateSourceEvidence.uncanonicalisable_source_row_count,
+            raw_source_adapter_blocked_row_count: rawSourceAdapterBlockedRowCount,
             source_adapter_blocked_row_count: sourceAdapterBlockedRowCount,
             source_adapter_blocked_row_samples: sourceAdapterBlockedRowSamples,
+            selected_source_adapter_blocked_row_count: selectedSourceAdapterBlockedRowCount,
+            selected_source_adapter_blocked_row_samples: selectedSourceAdapterBlockedRowSamples,
             out_of_scope_source_adapter_blocked_row_count: outOfScopeSourceAdapterBlockedRowCount,
+            out_of_scope_source_adapter_blocked_row_samples: outOfScopeSourceAdapterBlockedRowSamples,
+            ambiguous_source_adapter_blocked_row_count: ambiguousSourceAdapterBlockedRowCount,
+            ambiguous_source_adapter_blocked_row_samples: ambiguousSourceAdapterBlockedRowSamples,
             blocked_row_count: blockedRowCount,
             blocked_row_samples: blockedRowSamples,
             skipped_row_count: skippedRowCount,
