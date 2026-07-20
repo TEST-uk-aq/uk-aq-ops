@@ -8,6 +8,34 @@ This document defines the required v2 Integrity detection, repair-planning and r
 
 Where active code differs from this document, this document is authoritative and the code must be brought into line before a real repair run.
 
+## Supported pollutant scope
+
+Active observation Integrity is limited to these four canonical pollutant codes:
+
+- `pm25`
+- `pm10`
+- `no2`
+- `o3`
+
+This four-pollutant scope applies to observation detection, source comparison, repair planning, observation data repair, observation manifests and indexes, and final verification.
+
+A connector is checked and repaired only for the pollutants in this list that it actually provides. A connector not providing one of the four pollutants is not itself an Integrity fault. For example, Sensor.Community may be repaired for `pm25,pm10` without being required to provide `no2` or `o3`.
+
+Observation data for any other observed property that already exists in the Dropbox R2 mirror or live R2 is outside the active Integrity scope. Integrity must:
+
+- ignore it during detection and source comparison;
+- not create findings or repair actions for it;
+- not require source completeness, mapping or canonical-row evidence for it;
+- not allow it to block a repair of one or more of the four supported pollutants;
+- not delete, rewrite or relocate it;
+- preserve its existing canonical objects and existing parent-manifest child entries when rebuilding metadata for an affected connector-day.
+
+Existing out-of-scope pollutant objects are treated as opaque preserved baseline content. Integrity does not validate their Parquet bodies, counts or indexes. When parent metadata must be rebuilt, existing out-of-scope child entries and their recorded aggregate values are carried forward from the chosen Dropbox baseline. If that preservation cannot be proven structurally, the repair must block rather than broaden its deletion scope.
+
+Integrity must not create new out-of-scope pollutant data.
+
+AQI eligibility remains separate from observation Integrity scope. AQI rebuilds remain limited to `pm25`, `pm10` and `no2`. An `o3` observation repair or metadata-only finding does not queue AQI work.
+
 ## Supported runtime model
 
 Run history Integrity from a complete `uk-aq-ops` repository checkout. The checkout location is operator-specific and is not part of the system contract.
@@ -16,18 +44,22 @@ A complete checkout is the only supported runtime model because the orchestrator
 
 `--history-version v2` is the only accepted history version. `v1` and `both` remain rejected. `--check-only` and `--run-backfill` are mutually exclusive.
 
-Source, connector, day-range and other scope filters must have the same meaning in every mode. Changing mode must not silently broaden the requested scope.
+Source, connector, day-range, pollutant and other scope filters must have the same meaning in every mode. Changing mode must not silently broaden the requested scope.
+
+A destructive observation repair must use an explicit pollutant subset through `--repair-pollutants`. Accepted values are limited to `pm25`, `pm10`, `no2` and `o3`. The selected set must pass unchanged through detection evidence, proposal generation, validation, tombstone planning, apply and final verification.
 
 ## Authoritative inputs
 
 Integrity uses these inputs:
 
-1. The relevant historical connector gateway or its existing local source cache for authoritative historical observations.
+1. The relevant historical connector gateway or its existing local source cache for authoritative historical observations within the selected four-pollutant scope.
 2. The Dropbox `R2_history_backup` mirror for the R2 v2 data, manifests and indexes being checked.
 3. The committed v2 core snapshot in Dropbox for connector, station, timeseries and observed-property identity.
 4. The local Integrity SQLite database for source snapshots, findings, repair planning and audit evidence.
 
-Source acquisition must happen before comparison. When the required historical source file is already cached locally, Integrity reuses it. Otherwise the relevant source adapter fetches it. Source unavailability or an uncertain empty result must block the affected repair scope.
+Source acquisition must happen before comparison. When the required historical source file is already cached locally, Integrity reuses it. Otherwise the relevant source adapter fetches it. Source unavailability or an uncertain empty result must block the affected selected-pollutant repair scope.
+
+Source files must still be enumerated and identity-pinned sufficiently to prove that all rows for the selected pollutants have been considered. Rows for other observed properties may be ignored after parsing and must not become selected-row blocking evidence.
 
 Integrity detection and repair planning do not use live R2 as a comparison source.
 
@@ -38,27 +70,27 @@ Integrity detection and repair planning do not use live R2 as a comparison sourc
 3. Import the current `R2_history_backup/history/v2/core` snapshot.
 4. Read or fetch the relevant historical connector data through the configured source adapters and caches.
 5. Read the scoped R2 v2 mirror from Dropbox.
-6. Compare source/cache truth with the Dropbox Parquet, manifests, indexes and stable bindings.
+6. Compare source/cache truth with the Dropbox Parquet, manifests, indexes and stable bindings for the four supported pollutants.
 7. Build a deterministic repair plan after all detection has completed.
 8. Stop after reporting when running `--check-only`.
 9. With `--run-backfill --dry-run`, calculate the exact local repair proposals without writing R2.
 10. With a real `--run-backfill`, build and validate corrected objects locally, apply the repair to R2 in the required order, and GET-verify every written object.
 11. For a real repair, run one final read-only verification and write the SQLite, JSON, Markdown and task-health evidence.
 
-Equivalent source/cache input and the same chosen Dropbox baseline must produce the same findings, repair plan and canonical replacement content.
+Equivalent source/cache input, selected pollutant scope and chosen Dropbox baseline must produce the same findings, repair plan and canonical replacement content.
 
 ## Run mode contracts
 
 ### `--check-only`
 
-`--check-only` is the normal scheduled detection mode. It answers: **what is wrong, and what repair would be required?**
+`--check-only` is the normal scheduled detection mode. It answers: **what is wrong within the four-pollutant scope, and what repair would be required?**
 
 It must:
 
 1. Apply the backup readiness gate unless `--allow-stale-dropbox` is supplied.
 2. Import the Dropbox core snapshot and scoped R2 v2 mirror.
 3. Read or fetch the relevant authoritative connector source/cache before comparison.
-4. Check all relevant parts of the seven logical v2 areas within the requested scope.
+4. Check all relevant parts of the seven logical v2 areas for `pm25`, `pm10`, `no2` and `o3` within the requested source, connector and day scope.
 5. Record source snapshots, findings and audit evidence in the local Integrity SQLite database.
 6. Build the deterministic, deduplicated repair plan.
 7. Write JSON, Markdown and task-health reports.
@@ -70,20 +102,21 @@ It must not:
 - create a repair overlay that represents uploaded or verified objects;
 - HEAD, GET, list, PUT or DELETE anything in live R2;
 - change the Dropbox backup;
+- report out-of-scope observed properties as Integrity faults;
 - perform post-write verification, because nothing was written.
 
 A completed check-only run must distinguish at least:
 
-- no actionable integrity fault found;
-- actionable integrity fault found and represented in the repair plan;
+- no actionable four-pollutant Integrity fault found;
+- actionable Integrity fault found and represented in the repair plan;
 - blocked because the Dropbox readiness gate failed;
-- incomplete or unreliable checking because a source, cache, reader or mapping was unavailable.
+- incomplete or unreliable checking because a selected-pollutant source, cache, reader or mapping was unavailable.
 
 An actionable finding is a failed Integrity result even though detection itself completed successfully.
 
 ### `--run-backfill --dry-run`
 
-`--run-backfill --dry-run` answers: **given the detected faults, what exact repair actions and object changes would be attempted?**
+`--run-backfill --dry-run` answers: **given the detected faults and explicit repair pollutant set, what exact repair actions and object changes would be attempted?**
 
 It performs the same acquisition, Dropbox comparison, findings and repair planning as check-only. It may additionally run local-only builders and proposal logic needed to calculate exact canonical replacement files, manifests, deletions, indexes and dependencies.
 
@@ -98,13 +131,13 @@ Its report must keep planned deletions, writes and verifications separate from c
 
 ### Real `--run-backfill`
 
-A real `--run-backfill` performs the same acquisition, comparison and repair planning, then applies the simplified repair execution contract in this document.
+A real `--run-backfill` performs the same acquisition, comparison and repair planning, then applies the repair execution contract in this document.
 
-It must not mutate R2 until all local replacement objects required for the first affected mutation scope have been built and structurally validated. It must record actual deletions, writes, post-write verification and final verification separately from the original findings and plan.
+It must not mutate R2 until every local replacement object and preserved-baseline dependency required for the first affected selected-pollutant mutation scope has been structurally validated. It must record actual deletions, writes, post-write verification and final verification separately from the original findings and plan.
 
 ## Temporary repair overlay
 
-The repair overlay is a run-specific local working directory. It exists only to combine objects created or changed by the current run with unchanged objects from the chosen Dropbox baseline while later repair stages are planned and built.
+The repair overlay is a run-specific local working directory. It combines objects created or changed by the current run with unchanged objects from the chosen Dropbox baseline while later repair stages are planned and built.
 
 `--check-only` must not create a repair overlay. `--run-backfill --dry-run` and real `--run-backfill` may create one only after detection and repair planning have completed.
 
@@ -119,10 +152,10 @@ The overlay must:
 Later local stages resolve an object in this order:
 
 1. a structurally validated replacement object in the current run overlay;
-2. a current-run tombstone, which means the canonical object is absent from the proposed final state;
+2. a current-run exact pollutant-prefix tombstone, which means the canonical object is absent from the proposed final state;
 3. otherwise the matching object from the chosen Dropbox baseline.
 
-A tombstone is only a local marker during planning and building. It prevents an old Dropbox object that is scheduled for deletion from reappearing in the combined local view. It does not prove that the corresponding live R2 object has been deleted.
+A tombstone is only a local marker during planning and building. It prevents an old Dropbox object scheduled for deletion from reappearing in the combined local view. It does not prove that the corresponding live R2 object has been deleted.
 
 Only structurally validated overlay objects may be used as input to later manifest, parent-manifest, AQI or index stages. A merely proposed, partially built or failed object must not become authoritative within the current run.
 
@@ -146,13 +179,13 @@ After a successful repair, completed final verification and completed reports, t
 
 ## Seven logical v2 areas
 
-Integrity checks seven logical areas. These are not necessarily seven broad scans:
+Integrity checks seven logical areas within the four-pollutant scope. These are not necessarily seven broad scans:
 
 1. Core snapshot.
 2. Observation data and manifests.
 3. Observation timeseries indexes, including the latest index.
-4. AQI hourly data and manifests.
-5. AQI debug data and manifests.
+4. AQI hourly data and manifests for AQI-eligible pollutants.
+5. AQI debug data and manifests for AQI-eligible pollutants.
 6. AQI timeseries indexes, including the latest index.
 7. Stable timeseries bindings.
 
@@ -179,27 +212,40 @@ The RPC's canonical SQL definition is owned by `TEST-uk-aq-schema/schemas/obs_aq
 
 ## Detection and hierarchy validation
 
-The v2 checks start from actual day, connector, pollutant and Parquet paths in the scoped Dropbox mirror. They validate parent manifest content against valid child manifests instead of trusting a single parent representation.
+The v2 checks start from actual day, connector, supported-pollutant and Parquet paths in the scoped Dropbox mirror. They validate target parent-manifest content against valid target child manifests instead of trusting a single parent representation.
 
-DuckDB reads the actual Dropbox Parquet and calculates whole-partition and per-timeseries row counts. The report keeps these comparisons separate:
+DuckDB reads the actual Dropbox Parquet for the supported pollutants and calculates whole-partition and per-timeseries row counts. The report keeps these comparisons separate:
 
 1. source/cache counts versus actual Dropbox Parquet counts;
 2. actual Parquet counts versus pollutant manifest counts;
-3. pollutant manifests versus connector and day hierarchy representations;
-4. committed manifests versus pollutant and latest indexes;
+3. supported-pollutant manifests versus connector and day hierarchy representations;
+4. committed supported-pollutant entries versus pollutant and latest indexes;
 5. stable binding objects versus imported core identities.
 
-An unavailable reader, unreadable Parquet, unavailable source/cache or ambiguous source mapping is reported explicitly and fails closed for the affected scope.
+Existing out-of-scope pollutant partitions, manifest entries and indexes are ignored as findings. Extra out-of-scope children in a connector or day manifest are permitted and must be carried through unchanged when that parent is rebuilt. Their presence must not alter the target-pollutant counts used for comparison.
 
-Findings distinguish data, pollutant-manifest, connector-manifest, day-manifest, index, source-mapping and source-unavailable faults. Both source-only and Dropbox-only per-timeseries differences remain visible in the report.
+An unavailable reader, unreadable selected-pollutant Parquet, unavailable selected-pollutant source/cache or ambiguous selected-pollutant source mapping is reported explicitly and fails closed for the affected scope.
+
+Findings distinguish data, pollutant-manifest, connector-manifest, day-manifest, index, source-mapping and source-unavailable faults. Both source-only and Dropbox-only per-timeseries differences remain visible for the supported pollutants.
 
 ## Repair planning
 
-Each v2 run includes a deterministic, deduplicated `repair_plan` array. The plan records whether each scope needs data replacement, metadata repair, index repair, AQI rebuild or operator action.
+Each v2 run includes a deterministic, deduplicated `repair_plan` array. The plan records whether each supported-pollutant scope needs data replacement, metadata repair, index repair, AQI rebuild or operator action.
 
-A readable valid Parquet partition with a missing or invalid manifest is a metadata-only fault. Metadata-only repair must not rewrite valid Parquet. Manifest-only O3 findings do not queue AQI.
+A readable valid selected-pollutant Parquet partition with a missing or invalid manifest is a metadata-only fault. Metadata-only repair must not rewrite valid Parquet. O3 findings do not queue AQI.
 
-An observation data fault is repaired from the authoritative connector source/cache. The repair scope is the complete observation connector-day, not a selected fragment of one Parquet file. This keeps replacement and interruption recovery deterministic.
+An observation data fault is repaired from the authoritative connector source/cache. The destructive repair unit is one connector-day plus an explicit subset of `pm25`, `pm10`, `no2` and `o3`.
+
+A pollutant-scoped repair must:
+
+- enumerate and identity-pin the source files required to prove every selected-pollutant row;
+- compare detector and proposal evidence exactly for the selected pollutant set;
+- build and validate complete replacement content for each selected pollutant partition;
+- delete only the exact selected pollutant prefixes;
+- preserve every unselected supported pollutant and every existing out-of-scope pollutant object;
+- rebuild parent metadata and indexes from selected replacements plus preserved baseline children.
+
+It must never tombstone or delete the complete observation connector-day prefix.
 
 Relevant repair kinds include:
 
@@ -214,28 +260,30 @@ Relevant repair kinds include:
 - `aqi_day_manifest_repair`
 - `aqi_index_repair`
 
-## Simplified repair execution contract
+## Repair execution contract
 
-Before any R2 mutation, Integrity must build all corrected files for the affected repair scope locally and validate that they are structurally complete.
+Before any R2 mutation, Integrity must build all corrected files for the selected repair scope locally and validate that they are structurally complete.
 
 For an observation data repair:
 
-1. Read or fetch the complete authoritative connector-day from the relevant source/cache.
-2. Build the complete corrected connector-day observation Parquet locally.
-3. Build all required pollutant and connector manifests locally.
-4. Validate local row counts, pollutant partitions, object keys, manifest aggregates and hashes.
-5. Delete the existing canonical observation connector-day prefix only after the local replacement has passed validation.
-6. Verify that stale surplus canonical files under that connector-day prefix have been removed.
-7. Upload the canonical pollutant Parquet files.
-8. GET each uploaded Parquet object and confirm exact bytes or SHA-256 against the local file.
-9. Upload and GET-verify pollutant manifests, then the connector manifest.
-10. Rebuild and GET-verify the day manifest using the corrected connector and the unaffected connector children from the chosen Dropbox baseline.
-11. Rebuild and GET-verify the affected pollutant indexes, then the global latest index.
-12. Run the required AQI repair stages for AQI-eligible changed observation data.
+1. Read or fetch and identity-pin all source files required for the selected connector-day pollutants.
+2. Build canonical source evidence containing only the selected pollutants.
+3. Fail on any missing, malformed, unmapped, ambiguous, duplicate or otherwise blocked selected-pollutant row.
+4. Ignore non-selected source rows for repair blocking, while retaining enough file identity evidence to prove the selected rows came from the expected source files.
+5. Build the complete corrected Parquet and pollutant manifests for every selected pollutant locally.
+6. Validate selected source-to-Parquet row identity, counts, pollutant set, object keys, hashes and detector/proposal equality.
+7. Resolve preserved unselected children from the chosen Dropbox baseline and prove that reconstructed connector and day metadata retain them.
+8. Create tombstones only for exact selected prefixes of the form `history/v2/observations/day_utc=<day>/connector_id=<connector>/pollutant_code=<pollutant>`.
+9. During real apply, delete and verify absence of only those exact selected prefixes.
+10. Upload and GET-verify the selected canonical pollutant Parquet files.
+11. Upload and GET-verify the selected pollutant manifests.
+12. Rebuild and GET-verify the connector and day manifests from selected replacements plus preserved baseline children.
+13. Rebuild and GET-verify the affected supported-pollutant indexes, then the global latest index without dropping preserved out-of-scope entries.
+14. Run the required AQI repair stages only for changed `pm25`, `pm10` or `no2` observations.
 
-For a metadata-only repair, preserve the Dropbox Parquet and rebuild only the required manifests or indexes from the chosen Dropbox baseline and any corrected local overlay objects.
+For a metadata-only repair, preserve the Dropbox Parquet and rebuild only the required supported-pollutant manifests or indexes from the chosen Dropbox baseline and any corrected local overlay objects.
 
-The apply order is always child data first, then child manifests, parent manifests, scoped indexes, and global latest indexes last.
+The apply order is always selected child data first, then selected child manifests, parent manifests, scoped indexes and global latest indexes last.
 
 ## R2 access rules
 
@@ -243,11 +291,11 @@ Integrity detection and repair planning must not HEAD, GET or list live R2.
 
 Check-only and dry-run must not access live R2 at all.
 
-A data repair does not read the existing live R2 connector-day before writing because the authoritative replacement is built from source/cache and the chosen Dropbox baseline.
+A data repair does not read existing live R2 before writing because the authoritative replacement and preserved-child plan are built from source/cache and the chosen Dropbox baseline.
 
 Live R2 reads during real apply are limited to post-mutation verification:
 
-- confirm required deletions;
+- confirm required selected-prefix deletions;
 - GET every written Parquet, manifest and index object;
 - verify exact bytes or SHA-256 and canonical structure.
 
@@ -272,24 +320,25 @@ Repair audit information belongs in Integrity SQLite, task logs and JSON/Markdow
 
 An interrupted repair is rerun from the beginning. Integrity does not resume individual internal write stages.
 
-A manual rerun may use `--allow-stale-dropbox` to reuse the same chosen Dropbox baseline without waiting for another Dropbox backup. The rerun may overwrite canonical files that were already written correctly by the interrupted attempt. That is expected and safe because the complete corrected scope is rebuilt deterministically from the same authoritative source/cache.
+A manual rerun may use `--allow-stale-dropbox` to reuse the same chosen Dropbox baseline without waiting for another Dropbox backup. The rerun may overwrite selected canonical files already written correctly by the interrupted attempt. That is expected and safe because the selected corrected scope is rebuilt deterministically from the same authoritative source/cache.
 
 The successful rerun must complete all writes, post-write GET verification, parent metadata, indexes and final verification. A failed or interrupted run remains failed in the audit trail.
 
 ## Empty and unavailable source results
 
-A gateway failure, missing cache file, parse failure or uncertain empty response must never be interpreted as authoritative no-data.
+A gateway failure, missing cache file, parse failure or uncertain empty response must never be interpreted as authoritative no-data for a selected pollutant.
 
-Integrity may replace a connector-day with no observation rows only when the relevant source adapter explicitly classifies the result as authoritative no-data under its documented source contract. Otherwise it must make no R2 changes for that scope.
+Integrity may replace a selected connector-day pollutant partition with no observation rows only when the relevant source adapter explicitly classifies that selected-pollutant result as authoritative no-data under its documented source contract. Otherwise it must make no R2 changes for that selected scope.
 
 ## Audit evidence
 
-Every mode records its mode, requested scope, chosen Dropbox baseline, whether `--allow-stale-dropbox` was used, source acquisition result, findings, repair plan and final mode result.
+Every mode records its mode, requested source, connector, day and pollutant scope, chosen Dropbox baseline, whether `--allow-stale-dropbox` was used, source acquisition result, findings, repair plan and final mode result.
 
 For a real repair, SQLite, task logs and JSON/Markdown reports must additionally record at least:
 
-- environment, source, day and connector;
-- local source and replacement row counts;
+- environment, source, day, connector and selected pollutant set;
+- selected-pollutant source and replacement row counts;
+- preserved baseline pollutant children;
 - object keys deleted and written;
 - post-write GET verification results;
 - manifests and indexes rebuilt;
