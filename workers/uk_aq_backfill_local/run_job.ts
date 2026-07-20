@@ -63,6 +63,9 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
+import {
+  reconcileIntegritySourceAdapterBlockedRows,
+} from "./source_integrity/blocked_rows.ts";
 type RunMode =
   | "local_to_aqilevels"
   | "obs_aqi_to_r2"
@@ -14132,12 +14135,15 @@ async function runSourceToAll(
           const skippedRowCount = Object.entries(sourceCheckpointJson)
             .filter(([key, value]) => key.startsWith("total_skipped_") && Number.isFinite(Number(value)))
             .reduce((total, [, value]) => total + Number(value), 0);
-          const sourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? 0
-            : Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0);
-          const outOfScopeSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0)
-            : 0;
+          const reconciledSourceAdapterBlockedRows =
+            reconcileIntegritySourceAdapterBlockedRows({
+              raw: sourceCheckpointJson.source_adapter_blocked_row_count,
+              scoped: INTEGRITY_POLLUTANT_SCOPED_REPAIR,
+            });
+          const sourceAdapterBlockedRowCount =
+            reconciledSourceAdapterBlockedRows.selected;
+          const outOfScopeSourceAdapterBlockedRowCount =
+            reconciledSourceAdapterBlockedRows.outOfScope;
           const sourceAdapterBlockedRowSamples = Array.isArray(
             sourceCheckpointJson.source_adapter_blocked_row_samples,
           )
@@ -14149,7 +14155,7 @@ async function runSourceToAll(
           const blockedRowCount =
             duplicateSourceEvidence.duplicate_canonical_row_count +
             duplicateSourceEvidence.uncanonicalisable_source_row_count +
-            sourceAdapterBlockedRowCount;
+            reconciledSourceAdapterBlockedRows.blocking;
           const blockedRowSamples = [
             ...duplicateSourceEvidence.blocked_row_samples,
             ...sourceAdapterBlockedRowSamples,
