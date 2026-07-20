@@ -5,8 +5,6 @@ logs/
 .env
 .env.test
 .env.live
-workers/GCP-vars/astute-lyceum-484111-k5-7c737a34a644.json
-workers/GCP-vars/astute-lyceum-484111-k5-245477747bc3.json
 *.numbers
 env-vars-master.csv
 /tmp
@@ -14,9 +12,10 @@ env-vars-master.csv
 nohup.out
 nohup_MBAir.out
 .dashboards.pids
-/logs2
 .vscode/settings.json
 system_docs_ops.zip
 *.pyc
 *.env
 /scripts/aqi_gaps/r2_aqi_gap_check*
+/workers/GCP-vars
+sync_to_live.sh
