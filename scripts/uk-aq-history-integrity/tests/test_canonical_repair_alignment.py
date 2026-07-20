@@ -192,6 +192,102 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
                 )
             self.assertEqual(bad_state["tombstone_prefixes"], [])
 
+
+    def test_repair_pollutants_accept_o3_and_reject_unsupported(self) -> None:
+        integrity = load_integrity_module()
+        args = integrity.parse_args([
+            "--env", "CIC-Test", "--run-backfill", "--dry-run",
+            "--repair-pollutants", "pm25,pm10,no2,o3",
+        ])
+        self.assertEqual(args.repair_pollutants, ["no2", "o3", "pm10", "pm25"])
+        with self.assertRaises(SystemExit):
+            integrity.parse_args([
+                "--env", "CIC-Test", "--run-backfill",
+                "--repair-pollutants", "pm25,benzene",
+            ])
+
+
+    def test_run_narrow_backfill_does_not_leak_stale_repair_pollutants(self) -> None:
+        import logging
+        import os
+
+        integrity = load_integrity_module()
+        with tempfile.TemporaryDirectory(prefix="uk-aq-env-leak-test-") as temp_raw:
+            temp = Path(temp_raw)
+            wrapper = temp / "uk_aq_integrity_backfill.sh"
+            wrapper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            env_file = temp / "backfill.env"
+            env_file.write_text(
+                "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS=pm25\n",
+                encoding="utf-8",
+            )
+            captured = {}
+            original_run = integrity.subprocess.run
+            old_env = os.environ.get("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS")
+            os.environ["UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS"] = "no2"
+            def fake_run(*_args, **kwargs):
+                captured.update(kwargs.get("env") or {})
+                class Proc:
+                    returncode = 0
+                    stdout = ""
+                    stderr = ""
+                return Proc()
+            integrity.subprocess.run = fake_run
+            try:
+                result = integrity.run_narrow_backfill(
+                    wrapper_path=str(wrapper),
+                    env_file_path=str(env_file),
+                    env_name="CIC-Test",
+                    timeseries_ids=[],
+                    connector_ids=[7],
+                    day=__import__("datetime").date(2026, 7, 12),
+                    log=logging.getLogger("env-leak-test"),
+                    complete_connector_day=True,
+                    history_version="v2",
+                )
+            finally:
+                integrity.subprocess.run = original_run
+                if old_env is None:
+                    os.environ.pop("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", None)
+                else:
+                    os.environ["UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS"] = old_env
+            self.assertEqual(result["status"], "ok")
+            self.assertNotIn("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", captured)
+
+    def test_o3_observation_change_is_excluded_from_aqi_work(self) -> None:
+        integrity = load_integrity_module()
+        with tempfile.TemporaryDirectory(prefix="uk-aq-o3-aqi-test-") as temp_raw:
+            conn = integrity.open_db(str(Path(temp_raw) / "integrity.sqlite"))
+            try:
+                work, blocked = integrity._phase4_aqi_work(
+                    conn=conn,
+                    run_state={
+                        "changed_scopes": {
+                            "OBSERVS_CHANGED": [{
+                                "day_utc": "2026-07-12",
+                                "connector_id": 7,
+                                "affected_pollutant_codes": ["o3"],
+                            }]
+                        }
+                    },
+                    v2_aqilevels={},
+                )
+                self.assertEqual(work, [])
+                self.assertEqual(blocked, [])
+            finally:
+                conn.close()
+
+    def test_sos_missing_day_suggested_repair_enters_plan(self) -> None:
+        integrity = load_integrity_module()
+        plan = integrity.build_v2_repair_plan(observation_gaps=[{
+            "gap_type": "day_dir_missing",
+            "day_utc": "2026-07-12",
+            "connector_id": 2,
+            "suggested_repair": {"kind": "uk_air_csv_to_v2_observations_backfill_required"},
+        }])
+        self.assertTrue(any(action.get("kind") == "observation_data_repair" for action in plan))
+
     def test_modes_and_local_proposal_safety(self) -> None:
         integrity = load_integrity_module()
         check_args = argparse.Namespace(run_backfill=False, dry_run=False)
@@ -350,6 +446,7 @@ for (const prefix of [
   "history/v2/observations/day_utc=2026-02-30/connector_id=7",
   "history/v2/observations/day_utc=2026-07-12/connector_id=0",
   "history/v2/observations/day_utc=2026-07-12/connector_id=07",
+  "history/v2/observations/day_utc=2026-07-12/connector_id=7/pollutant_code=benzene",
   "history/v2/observations/day_utc=2026-07-12/connector_id=7/pollutant_code=pm25",
   "history/v2/observations/day_utc=2026-07-12/connector_id=7/generation=x",
   "history/v2/observations/day_utc=2026-07-12/connector_id=7/transactions",
@@ -363,6 +460,22 @@ for (const prefix of [
   try { validateLocalProposal(rejected); } catch { didReject = true; }
   if (!didReject) throw new Error(`apply preflight accepted forbidden deletion prefix: ${prefix}`);
 }
+const scopedPrefixAllowed = structuredClone(state);
+scopedPrefixAllowed.tombstone_prefixes = [{
+  prefix: "history/v2/observations/day_utc=2026-07-12/connector_id=7/pollutant_code=pm25",
+  proposed: true,
+  repair_pollutants: ["pm25"],
+}];
+validateLocalProposal(scopedPrefixAllowed);
+const scopedConnectorRejected = structuredClone(state);
+scopedConnectorRejected.tombstone_prefixes = [{
+  prefix: "history/v2/observations/day_utc=2026-07-12/connector_id=7",
+  proposed: true,
+  repair_pollutants: ["pm25"],
+}];
+let scopedConnectorDidReject = false;
+try { validateLocalProposal(scopedConnectorRejected); } catch { scopedConnectorDidReject = true; }
+if (!scopedConnectorDidReject) throw new Error("apply preflight accepted scoped connector deletion");
 """
             subprocess.run(
                 [

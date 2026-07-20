@@ -1177,12 +1177,18 @@ const INTEGRITY_SOURCE_EVIDENCE_ONLY = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
   false,
 );
+const INTEGRITY_OBSERVATION_REPAIR_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
 const INTEGRITY_REPAIR_POLLUTANTS = new Set(
   (Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS") || "")
     .split(",")
     .map((value) => value.trim().toLowerCase())
     .filter((value) => value.length > 0),
 );
+for (const pollutant of INTEGRITY_REPAIR_POLLUTANTS) {
+  if (!INTEGRITY_OBSERVATION_REPAIR_POLLUTANTS.has(pollutant)) {
+    throw new Error(`unsupported_integrity_repair_pollutant pollutant_code=${pollutant}`);
+  }
+}
 const INTEGRITY_POLLUTANT_SCOPED_REPAIR =
   INTEGRITY_COMPLETE_CONNECTOR_DAY && INTEGRITY_REPAIR_POLLUTANTS.size > 0;
 const IS_LOCAL_RUN = !optionalEnv("K_SERVICE") && !optionalEnv("K_REVISION");
@@ -8574,6 +8580,9 @@ function parseSensorcommunityCsvObservations(args: {
       { header: "pressure", pollutant_code: "pressure" },
     );
   }
+  const activeMappings = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+    ? mappings.filter((mapping) => INTEGRITY_REPAIR_POLLUTANTS.has(mapping.pollutant_code))
+    : mappings;
 
   const dayStartIso = utcDayStartIso(dayUtc);
   const dayEndIso = utcDayEndIso(dayUtc);
@@ -8591,7 +8600,7 @@ function parseSensorcommunityCsvObservations(args: {
       columns[timestampIndex] || "",
     );
     if (!observedAtIso) {
-      if (INTEGRITY_COMPLETE_CONNECTOR_DAY && mappings.some((mapping) => {
+      if (INTEGRITY_COMPLETE_CONNECTOR_DAY && activeMappings.some((mapping) => {
         const index = headerIndex.get(mapping.header);
         return index !== undefined && parseCsvNumber(columns[index] || "") !== null;
       })) {
@@ -8605,7 +8614,7 @@ function parseSensorcommunityCsvObservations(args: {
     }
     const stationKnown = Boolean(stationRefRaw) && lookup.station_refs.has(stationRefRaw);
 
-    for (const mapping of mappings) {
+    for (const mapping of activeMappings) {
       const valueIndex = headerIndex.get(mapping.header);
       if (valueIndex === undefined) {
         continue;
@@ -14054,9 +14063,14 @@ async function runSourceToAll(
           );
         }
 
+        const rowsForIntegrityBlockingEvidence = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+          ? observationRowsRaw.filter((row) =>
+            INTEGRITY_REPAIR_POLLUTANTS.has(String(row.pollutant_code || "").toLowerCase())
+          )
+          : observationRowsRaw;
         const duplicateSourceEvidence = INTEGRITY_COMPLETE_CONNECTOR_DAY
           ? inspectIntegritySourceRowsForBlockingEvidence(
-            observationRowsRaw,
+            rowsForIntegrityBlockingEvidence,
             connectorId,
           )
           : {
@@ -14118,9 +14132,12 @@ async function runSourceToAll(
           const skippedRowCount = Object.entries(sourceCheckpointJson)
             .filter(([key, value]) => key.startsWith("total_skipped_") && Number.isFinite(Number(value)))
             .reduce((total, [, value]) => total + Number(value), 0);
-          const sourceAdapterBlockedRowCount = Number(
-            sourceCheckpointJson.source_adapter_blocked_row_count || 0,
-          );
+          const sourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? 0
+            : Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0);
+          const outOfScopeSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0)
+            : 0;
           const sourceAdapterBlockedRowSamples = Array.isArray(
             sourceCheckpointJson.source_adapter_blocked_row_samples,
           )
@@ -14187,6 +14204,7 @@ async function runSourceToAll(
               duplicateSourceEvidence.uncanonicalisable_source_row_count,
             source_adapter_blocked_row_count: sourceAdapterBlockedRowCount,
             source_adapter_blocked_row_samples: sourceAdapterBlockedRowSamples,
+            out_of_scope_source_adapter_blocked_row_count: outOfScopeSourceAdapterBlockedRowCount,
             blocked_row_count: blockedRowCount,
             blocked_row_samples: blockedRowSamples,
             skipped_row_count: skippedRowCount,
