@@ -3038,7 +3038,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   toDayUtc,
   connectorId = null,
   additionalPollutantManifestTargets = [],
-  pollutantScope = null,
   writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
@@ -3076,9 +3075,6 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
         : null;
     })
     .filter(Boolean);
-  const scopedPollutants = Array.isArray(pollutantScope) || pollutantScope instanceof Set
-    ? new Set([...pollutantScope].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))
-    : null;
   const warnings = [];
   const affectedPollutantIndexes = [];
 
@@ -3151,12 +3147,9 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
             targetsByKey.set(target.manifest_key, target);
           }
         }
-        const allPollutantTargets = [...targetsByKey.values()].sort((left, right) =>
+        const pollutantTargets = [...targetsByKey.values()].sort((left, right) =>
           left.pollutant_code.localeCompare(right.pollutant_code)
         );
-        const pollutantTargets = scopedPollutants && normalizedDomain === "observations" && normalizedConnectorId
-          ? allPollutantTargets.filter((target) => scopedPollutants.has(target.pollutant_code))
-          : allPollutantTargets;
         const wantedPollutantIndexKeys = new Set(pollutantTargets.map((pollutantTarget) =>
           normalizedDomain === "observations"
             ? buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
@@ -3179,9 +3172,7 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
           const existingIndexEntries = await r2ListAllObjects({ r2, prefix: connectorIndexPrefix, max_keys: 10_000 });
           for (const entry of existingIndexEntries) {
             const key = String(entry?.key || "");
-            const match = key.match(/\/pollutant_code=([^/]+)\/manifest\.json$/);
-            if (!match || wantedPollutantIndexKeys.has(key)) continue;
-            if (scopedPollutants && normalizedDomain === "observations" && !scopedPollutants.has(String(match[1] || "").toLowerCase())) continue;
+            if (!/\/pollutant_code=[^/]+\/manifest\.json$/.test(key) || wantedPollutantIndexKeys.has(key)) continue;
             const previousIndex = await fetchJsonObjectFromR2IfExists(r2, key);
             if (previousIndex.exists) {
               const oldPayload = previousIndex.payload;
@@ -3865,7 +3856,6 @@ export async function updateR2HistoryIndexesTargeted({
   writeR2 = true,
   r2: r2Override = null,
   additionalPollutantManifestTargets = [],
-  pollutantScope = null,
 } = {}) {
   const config = resolveR2HistoryIndexConfig(env);
   const r2 = r2Override || config.r2;
@@ -3910,7 +3900,6 @@ export async function updateR2HistoryIndexesTargeted({
         toDayUtc,
         connectorId,
         additionalPollutantManifestTargets,
-        pollutantScope,
         writeR2,
       });
       results.push(result);

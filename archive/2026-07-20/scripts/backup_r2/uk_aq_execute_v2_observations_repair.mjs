@@ -1216,9 +1216,6 @@ export async function runV2ObservationsRepair({
             additionalPollutantManifestTargets: additionalIndexPollutantTargets.filter((target) =>
               target.day_utc === dayUtc && target.connector_id === connectorId
             ),
-            pollutantScope: domain === "observations"
-              ? Array.from(new Set(dayScopes.map((scope) => String(scope.pollutantCode || "").trim().toLowerCase()).filter(Boolean)))
-              : null,
           }));
         }
         index = {

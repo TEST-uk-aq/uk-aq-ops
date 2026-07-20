@@ -7659,6 +7659,7 @@ def _validate_v2_parent_hierarchy(
     day_dir: Path,
     gaps: list[dict[str, Any]],
     domain: str,
+    active_pollutant_scope: set[str] | frozenset[str] | None = None,
 ) -> None:
     """Validate connector/day parent representations against live child manifests."""
     gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
@@ -7668,12 +7669,15 @@ def _validate_v2_parent_hierarchy(
         connector_manifest = root / connector_rel
         child_payloads: dict[str, Mapping[str, Any]] = {}
         for pollutant_dir in sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir()):
+            pollutant_code = pollutant_dir.name.split("=", 1)[1].strip().lower()
+            if active_pollutant_scope is not None and pollutant_code not in active_pollutant_scope:
+                continue
             child_path = pollutant_dir / "manifest.json"
             if not child_path.is_file():
                 continue
             child_payload, child_err = _load_json_file(child_path)
             if not child_err and isinstance(child_payload, Mapping):
-                child_payloads[pollutant_dir.name.split("=", 1)[1]] = child_payload
+                child_payloads[pollutant_code] = child_payload
         actual_pollutants = set(child_payloads)
         if not connector_manifest.is_file():
             gaps.append(gap_fn(
@@ -9297,6 +9301,7 @@ def run_v2_observations_integrity_checks(
                 day_dir=day_dir,
                 gaps=gaps,
                 domain="observations",
+                active_pollutant_scope=V2_OBSERVATION_INTEGRITY_POLLUTANTS,
             )
         _validate_v2_parent_hierarchy(
             root=root,
@@ -9306,6 +9311,7 @@ def run_v2_observations_integrity_checks(
             day_dir=day_dir,
             gaps=gaps,
             domain="observations",
+            active_pollutant_scope=V2_OBSERVATION_INTEGRITY_POLLUTANTS,
         )
 
     _classify_v2_gaps(gaps)

@@ -8871,6 +8871,7 @@ export function parseUkAirFlatFileObservations(args: {
   csvText: string;
   mappings: SosSiteTimeseriesRef[];
   propertyMappings: ObservedPropertyMapping[];
+  repairPollutants?: Set<string>;
 }): UkAirFlatFileParseResult {
   const lines = args.csvText.split(/\r?\n/);
   if (!lines.some((line) => line.trim().toLowerCase() === "all data gmt hour ending")) {
@@ -8938,6 +8939,11 @@ export function parseUkAirFlatFileObservations(args: {
           throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
         }
         const property = active[0];
+        const pollutantCode = String(property.observed_property_code || "").trim().toLowerCase();
+        if (args.repairPollutants && pollutantCode && !args.repairPollutants.has(pollutantCode)) {
+          result.skipped_ignored_properties += 1;
+          continue;
+        }
         if (property.mapping_kind === "ignored") {
           result.skipped_ignored_properties += 1;
           continue;
@@ -8951,7 +8957,6 @@ export function parseUkAirFlatFileObservations(args: {
         if (property.mapping_kind !== "raw_observed_property") {
           throw new Error(`unsupported_mapping_kind connector_id=1 source_label=${JSON.stringify(sourceLabel)} mapping_kind=${property.mapping_kind} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
         }
-        const pollutantCode = String(property.observed_property_code || "").trim();
         if (!/^[a-z0-9_]+$/.test(pollutantCode)) {
           throw new Error(`invalid_observed_property_code source_label=${JSON.stringify(sourceLabel)} observed_property_code=${JSON.stringify(pollutantCode)}`);
         }
@@ -8986,6 +8991,8 @@ export function parseUkAirFlatFileObservations(args: {
           reason: "unparseable_observation_date",
           site_ref: args.siteRef,
           line_number: lineIndex + 1,
+          pollutant_code: columnBindings.length === 1 ? String(columnBindings[0].property.observed_property_code) : null,
+          pollutant_codes: Array.from(new Set(columnBindings.map((binding) => String(binding.property.observed_property_code)))).sort(),
           date: String(cells[0] || "").trim(),
           time: String(cells[1] || "").trim(),
         });
@@ -9009,6 +9016,8 @@ export function parseUkAirFlatFileObservations(args: {
           reason: "invalid_gmt_hour_ending",
           site_ref: args.siteRef,
           line_number: lineIndex + 1,
+          pollutant_code: columnBindings.length === 1 ? String(columnBindings[0].property.observed_property_code) : null,
+          pollutant_codes: Array.from(new Set(columnBindings.map((binding) => String(binding.property.observed_property_code)))).sort(),
           date: String(cells[0] || "").trim(),
           time: String(cells[1] || "").trim(),
         });
@@ -13896,6 +13905,7 @@ async function runSourceToAll(
               csvText,
               mappings: validFlatFileMappings,
               propertyMappings: observedPropertyMappings,
+              repairPollutants: INTEGRITY_POLLUTANT_SCOPED_REPAIR ? INTEGRITY_REPAIR_POLLUTANTS : undefined,
             });
             appendRowsSafe(flatFileRows, parsed.rows);
             flatFileSourceRecords += parsed.source_records;
@@ -14132,13 +14142,7 @@ async function runSourceToAll(
           const skippedRowCount = Object.entries(sourceCheckpointJson)
             .filter(([key, value]) => key.startsWith("total_skipped_") && Number.isFinite(Number(value)))
             .reduce((total, [, value]) => total + Number(value), 0);
-          const sourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? 0
-            : Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0);
-          const outOfScopeSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0)
-            : 0;
-          const sourceAdapterBlockedRowSamples = Array.isArray(
+          const rawSourceAdapterBlockedRowSamples = Array.isArray(
             sourceCheckpointJson.source_adapter_blocked_row_samples,
           )
             ? sourceCheckpointJson.source_adapter_blocked_row_samples.filter(
@@ -14146,6 +14150,71 @@ async function runSourceToAll(
                 Boolean(sample) && typeof sample === "object" && !Array.isArray(sample),
             )
             : [];
+          const selectedSourceAdapterBlockedRowSamples: Record<string, unknown>[] = [];
+          const outOfScopeSourceAdapterBlockedRowSamples: Record<string, unknown>[] = [];
+          const ambiguousSourceAdapterBlockedRowSamples: Record<string, unknown>[] = [];
+          if (INTEGRITY_POLLUTANT_SCOPED_REPAIR) {
+            for (const sample of rawSourceAdapterBlockedRowSamples) {
+              const pollutantCode = String(sample.pollutant_code || sample.observed_property_code || "").trim().toLowerCase();
+              const scopedSample = {
+                source_adapter: sourceAdapter,
+                source_file: String(sample.source_file || sample.csv_path || ""),
+                source_row: sample.line_number ?? sample.row_number ?? sample.record_ref ?? null,
+                pollutant_code: pollutantCode || null,
+                scope_classification: pollutantCode
+                  ? (INTEGRITY_REPAIR_POLLUTANTS.has(pollutantCode) ? "selected" : "out_of_scope")
+                  : "ambiguous",
+                blocking_reason: String(sample.reason || sample.error || "source_adapter_blocked_row"),
+                ...sample,
+              };
+              if (!pollutantCode) {
+                ambiguousSourceAdapterBlockedRowSamples.push(scopedSample);
+              } else if (INTEGRITY_REPAIR_POLLUTANTS.has(pollutantCode)) {
+                selectedSourceAdapterBlockedRowSamples.push(scopedSample);
+              } else {
+                outOfScopeSourceAdapterBlockedRowSamples.push(scopedSample);
+              }
+            }
+          }
+          const explicitSelectedSourceAdapterBlockedRowCount = Number(
+            sourceCheckpointJson.selected_source_adapter_blocked_row_count || 0,
+          );
+          const explicitOutOfScopeSourceAdapterBlockedRowCount = Number(
+            sourceCheckpointJson.out_of_scope_source_adapter_blocked_row_count || 0,
+          );
+          const explicitAmbiguousSourceAdapterBlockedRowCount = Number(
+            sourceCheckpointJson.ambiguous_source_adapter_blocked_row_count || 0,
+          );
+          const rawSourceAdapterBlockedRowCount = Number(
+            sourceCheckpointJson.source_adapter_blocked_row_count || 0,
+          );
+          const classifiedBlockedRowCount = selectedSourceAdapterBlockedRowSamples.length +
+            outOfScopeSourceAdapterBlockedRowSamples.length + ambiguousSourceAdapterBlockedRowSamples.length;
+          const unclassifiedBlockedRemainder = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? Math.max(0, rawSourceAdapterBlockedRowCount - classifiedBlockedRowCount)
+            : 0;
+          const sourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? explicitSelectedSourceAdapterBlockedRowCount + selectedSourceAdapterBlockedRowSamples.length +
+              explicitAmbiguousSourceAdapterBlockedRowCount + ambiguousSourceAdapterBlockedRowSamples.length +
+              unclassifiedBlockedRemainder
+            : rawSourceAdapterBlockedRowCount;
+          const outOfScopeSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? explicitOutOfScopeSourceAdapterBlockedRowCount + outOfScopeSourceAdapterBlockedRowSamples.length
+            : 0;
+          const sourceAdapterBlockedRowSamples = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? [
+              ...selectedSourceAdapterBlockedRowSamples,
+              ...ambiguousSourceAdapterBlockedRowSamples,
+              ...(unclassifiedBlockedRemainder > 0
+                ? [{
+                  source_adapter: sourceAdapter,
+                  scope_classification: "ambiguous",
+                  blocking_reason: "unclassified_source_adapter_blocked_rows_fail_closed",
+                  unclassified_blocked_row_count: unclassifiedBlockedRemainder,
+                }]
+                : []),
+            ].slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT)
+            : rawSourceAdapterBlockedRowSamples;
           const blockedRowCount =
             duplicateSourceEvidence.duplicate_canonical_row_count +
             duplicateSourceEvidence.uncanonicalisable_source_row_count +
@@ -14204,7 +14273,14 @@ async function runSourceToAll(
               duplicateSourceEvidence.uncanonicalisable_source_row_count,
             source_adapter_blocked_row_count: sourceAdapterBlockedRowCount,
             source_adapter_blocked_row_samples: sourceAdapterBlockedRowSamples,
+            selected_source_adapter_blocked_row_count: sourceAdapterBlockedRowCount,
+            selected_source_adapter_blocked_row_samples: sourceAdapterBlockedRowSamples,
             out_of_scope_source_adapter_blocked_row_count: outOfScopeSourceAdapterBlockedRowCount,
+            out_of_scope_source_adapter_blocked_row_samples: outOfScopeSourceAdapterBlockedRowSamples,
+            ambiguous_source_adapter_blocked_row_count: INTEGRITY_POLLUTANT_SCOPED_REPAIR
+              ? ambiguousSourceAdapterBlockedRowSamples.length + unclassifiedBlockedRemainder
+              : 0,
+            ambiguous_source_adapter_blocked_row_samples: ambiguousSourceAdapterBlockedRowSamples,
             blocked_row_count: blockedRowCount,
             blocked_row_samples: blockedRowSamples,
             skipped_row_count: skippedRowCount,
