@@ -8,8 +8,8 @@ import {
   runV2ObservationsRepair as runV2ObservationsRepairImpl,
 } from "./uk_aq_execute_v2_observations_repair_impl.mjs";
 import {
-  prepareCanonicalObservationManifestCompatibility,
-} from "../../workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs";
+  prepareCanonicalObservationManifestCompatibilityFromNormalisedView,
+} from "../../workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility_view.mjs";
 import {
   finaliseLegacyObservationManifestCompatibility,
   prepareLegacyObservationManifestCompatibility,
@@ -85,7 +85,7 @@ export async function runV2ObservationsRepair(options = {}) {
     env,
     repairPlan,
   });
-  const canonicalPreparation = await prepareCanonicalObservationManifestCompatibility({
+  const canonicalPreparation = await prepareCanonicalObservationManifestCompatibilityFromNormalisedView({
     env,
     repairPlan,
   });

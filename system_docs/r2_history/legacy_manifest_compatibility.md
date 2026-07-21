@@ -28,6 +28,8 @@ The connector identity must be proven before any compatibility object is staged:
 - the child path code and declared pollutant code agree;
 - canonical child manifests have the exact expected `manifest_key`, day, connector and pollutant identity.
 
+Early connector manifests may record the same child in both `pollutant_manifests` and `child_manifests`. Compatibility treats those entries as one child only when their exact `manifest_key` and normalised `pollutant_code` agree. The same key with different pollutant identities blocks immediately. The same pollutant identity on different keys is not deduplicated and remains subject to downstream conflict detection.
+
 A mismatch blocks the metadata proposal.
 
 ## Pollutant aliases
