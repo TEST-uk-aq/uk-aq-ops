@@ -33,9 +33,23 @@ finally:
 
 
 _ORIGINAL_SINGLE_LINE_PROGRESS = SingleLineProgress
+_ORIGINAL_CONSOLE_NOISE_FILTER = ConsoleNoiseFilter
+_PROGRESS_LOGGER_NAME = "uk_aq_history_integrity.progress"
 _PROGRESS_COUNTS_RE = re.compile(r"(?:files=)?(?P<completed>\d+)/(?P<total>\d+)")
 _PROGRESS_LOG_INTERVAL_SECONDS = 30.0
 _PROGRESS_LOG_CHECKPOINTS = 20
+
+
+class ProgressAwareConsoleNoiseFilter(_ORIGINAL_CONSOLE_NOISE_FILTER):
+    """Keep durable progress checkpoints out of the live console only."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.WARNING:
+            if record.name == _PROGRESS_LOGGER_NAME:
+                return False
+            if record.getMessage().startswith("sos flat-file progress "):
+                return False
+        return super().filter(record)
 
 
 class DurableSingleLineProgress:
@@ -75,7 +89,7 @@ class DurableSingleLineProgress:
         force = bool(kwargs.get("force", False))
         now = time.monotonic()
         if text and text != self._last_logged_message and self._should_log(text, force=force, now=now):
-            logging.getLogger("uk_aq_history_integrity.progress").info(
+            logging.getLogger(_PROGRESS_LOGGER_NAME).info(
                 "%s: %s",
                 self._label,
                 text,
@@ -88,6 +102,7 @@ class DurableSingleLineProgress:
         return self._delegate.finish(*args, **kwargs)
 
 
+ConsoleNoiseFilter = ProgressAwareConsoleNoiseFilter
 SingleLineProgress = DurableSingleLineProgress
 
 
