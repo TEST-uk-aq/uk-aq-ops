@@ -32,7 +32,6 @@ finally:
     globals()["__name__"] = _PUBLIC_MODULE_NAME
 
 
-_ORIGINAL_SINGLE_LINE_PROGRESS = SingleLineProgress
 _ORIGINAL_CONSOLE_NOISE_FILTER = ConsoleNoiseFilter
 _PROGRESS_LOGGER_NAME = "uk_aq_history_integrity.progress"
 _PROGRESS_COUNTS_RE = re.compile(r"(?:files=)?(?P<completed>\d+)/(?P<total>\d+)")
@@ -41,7 +40,7 @@ _PROGRESS_LOG_CHECKPOINTS = 20
 
 
 class ProgressAwareConsoleNoiseFilter(_ORIGINAL_CONSOLE_NOISE_FILTER):
-    """Keep durable progress checkpoints out of the live console only."""
+    """Keep durable progress checkpoints out of the logging console handler."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno < logging.WARNING:
@@ -53,18 +52,27 @@ class ProgressAwareConsoleNoiseFilter(_ORIGINAL_CONSOLE_NOISE_FILTER):
 
 
 class DurableSingleLineProgress:
-    """Preserve terminal progress and add durable INFO log checkpoints."""
+    """Write live progress directly to stderr and durable INFO checkpoints."""
 
     def __init__(self, label: str, *args: Any, **kwargs: Any) -> None:
         self._label = str(label)
-        self._delegate = _ORIGINAL_SINGLE_LINE_PROGRESS(label, *args, **kwargs)
+        self._stream = kwargs.pop("stream", None) or _wrapper_sys.stderr
         self._last_logged_at = 0.0
         self._last_logged_message: str | None = None
+        self._last_live_message: str | None = None
         self._next_completed_checkpoint = 0
+        self._last_rendered_width = 0
+        self._live_line_active = False
 
     @staticmethod
     def _clean_message(message: Any) -> str:
         return " ".join(str(message).replace("\r", " ").replace("\n", " ").split())
+
+    def _stream_is_tty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except (AttributeError, OSError, ValueError):
+            return False
 
     def _should_log(self, text: str, *, force: bool, now: float) -> bool:
         if force or self._last_logged_message is None:
@@ -83,12 +91,37 @@ class DurableSingleLineProgress:
             return True
         return False
 
-    def update(self, message: Any, *args: Any, **kwargs: Any) -> Any:
-        result = self._delegate.update(message, *args, **kwargs)
+    def _write_live(self, text: str, *, checkpoint: bool) -> None:
+        line = f"{self._label}: {text}"
+        try:
+            if self._stream_is_tty():
+                padded = line.ljust(max(self._last_rendered_width, len(line)))
+                self._stream.write(f"\r{padded}")
+                self._last_rendered_width = len(line)
+                self._live_line_active = True
+            elif checkpoint:
+                self._stream.write(f"{line}\n")
+            self._stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return
+
+    def update(self, message: Any, *args: Any, **kwargs: Any) -> None:
         text = self._clean_message(message)
+        if not text:
+            return
+
         force = bool(kwargs.get("force", False))
         now = time.monotonic()
-        if text and text != self._last_logged_message and self._should_log(text, force=force, now=now):
+        checkpoint = (
+            text != self._last_logged_message
+            and self._should_log(text, force=force, now=now)
+        )
+
+        if force or text != self._last_live_message:
+            self._write_live(text, checkpoint=checkpoint)
+            self._last_live_message = text
+
+        if checkpoint:
             logging.getLogger(_PROGRESS_LOGGER_NAME).info(
                 "%s: %s",
                 self._label,
@@ -96,10 +129,15 @@ class DurableSingleLineProgress:
             )
             self._last_logged_at = now
             self._last_logged_message = text
-        return result
 
-    def finish(self, *args: Any, **kwargs: Any) -> Any:
-        return self._delegate.finish(*args, **kwargs)
+    def finish(self, *args: Any, **kwargs: Any) -> None:
+        if self._live_line_active:
+            try:
+                self._stream.write("\n")
+                self._stream.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            self._live_line_active = False
 
 
 ConsoleNoiseFilter = ProgressAwareConsoleNoiseFilter
