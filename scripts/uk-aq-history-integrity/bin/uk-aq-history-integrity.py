@@ -74,6 +74,31 @@ class DurableSingleLineProgress:
         except (AttributeError, OSError, ValueError):
             return False
 
+    def _live_text(self, text: str) -> str:
+        """Keep the SOS terminal line compact while preserving full log detail."""
+        if self._label != "sos flat-file progress":
+            return text
+
+        counts_match = _PROGRESS_COUNTS_RE.search(text)
+        if counts_match is None:
+            return text
+
+        parts = [f"{counts_match.group('completed')}/{counts_match.group('total')}"]
+        for source_name, live_name in (
+            ("downloaded", "downloaded"),
+            ("cached", "cached"),
+            ("mapped_rows", "rows"),
+            ("missing", "missing"),
+            ("errors", "errors"),
+        ):
+            value_match = re.search(
+                rf"(?:^|\s){re.escape(source_name)}=([^\s]+)",
+                text,
+            )
+            if value_match is not None:
+                parts.append(f"{live_name}={value_match.group(1)}")
+        return " ".join(parts)
+
     def _should_log(self, text: str, *, force: bool, now: float) -> bool:
         if force or self._last_logged_message is None:
             return True
@@ -116,10 +141,11 @@ class DurableSingleLineProgress:
             text != self._last_logged_message
             and self._should_log(text, force=force, now=now)
         )
+        live_text = self._live_text(text)
 
-        if force or text != self._last_live_message:
-            self._write_live(text, checkpoint=checkpoint)
-            self._last_live_message = text
+        if force or live_text != self._last_live_message:
+            self._write_live(live_text, checkpoint=checkpoint)
+            self._last_live_message = live_text
 
         if checkpoint:
             logging.getLogger(_PROGRESS_LOGGER_NAME).info(
