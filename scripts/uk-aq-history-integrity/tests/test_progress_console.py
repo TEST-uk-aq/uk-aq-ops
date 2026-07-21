@@ -105,6 +105,36 @@ class ProgressConsoleTests(unittest.TestCase):
         self.assertNotIn("sample progress: 2/100 checked=2\n", console_text)
         self.assertIn("sample progress: 100/100 checked=100\n", console_text)
 
+    def test_sos_tty_progress_is_compact_but_log_keeps_full_detail(self) -> None:
+        console_output = TtyBuffer()
+        durable_output = io.StringIO()
+        durable_handler = logging.StreamHandler(durable_output)
+
+        self.root_logger.handlers = [durable_handler]
+        self.root_logger.setLevel(logging.INFO)
+
+        detailed_message = (
+            "connector_ids=1 day=2026-07-12 stations=188 files=86/188 "
+            "current_site=ABCD year=2026 checked=86 downloaded=0 cached=86 "
+            "mapped_rows=1152 missing=0 errors=1 planned_backfills=0"
+        )
+        with contextlib.redirect_stderr(console_output):
+            progress = MODULE.SingleLineProgress("sos flat-file progress")
+            progress.update(detailed_message, force=True)
+            progress.finish()
+
+        console_text = console_output.getvalue()
+        durable_text = durable_output.getvalue()
+        self.assertIn(
+            "\rsos flat-file progress: 86/188 downloaded=0 cached=86 "
+            "rows=1152 missing=0 errors=1",
+            console_text,
+        )
+        self.assertNotIn("stations=188", console_text)
+        self.assertNotIn("current_site=ABCD", console_text)
+        self.assertNotIn("year=2026", console_text)
+        self.assertIn(detailed_message, durable_text)
+
 
 if __name__ == "__main__":
     unittest.main()
