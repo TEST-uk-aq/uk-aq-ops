@@ -1,0 +1,173 @@
+name: Apply SOS Integrity pollutant scope fix on branch
+
+on:
+  push:
+    branches:
+      - agent/fix-sos-integrity-pollutant-scope-v2
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply focused correction
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one exact replacement target, found {count}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          worker = Path("workers/uk_aq_backfill_local/run_job.ts")
+          replace_once(
+              worker,
+              '''          const candidateBindingsUnfiltered = Array.from(
+            lookup.binding_by_timeseries_ref.values(),
+          )
+            .filter((binding) => candidateStationRefs.has(binding.station_ref))
+            .filter((binding) => INTEGRITY_COMPLETE_CONNECTOR_DAY ||
+              binding.pollutant_code === "no2" ||
+              binding.pollutant_code === "pm25" ||
+              binding.pollutant_code === "pm10")
+            .sort((left, right) => {
+''',
+              '''          const candidateBindingsUnfiltered = Array.from(
+            lookup.binding_by_timeseries_ref.values(),
+          )
+            .filter((binding) => candidateStationRefs.has(binding.station_ref))
+            .filter((binding) =>
+              INTEGRITY_POLLUTANT_SCOPED_REPAIR
+                ? INTEGRITY_REPAIR_POLLUTANTS.has(binding.pollutant_code)
+                : INTEGRITY_COMPLETE_CONNECTOR_DAY ||
+                  binding.pollutant_code === "no2" ||
+                  binding.pollutant_code === "pm25" ||
+                  binding.pollutant_code === "pm10"
+            )
+            .sort((left, right) => {
+''',
+          )
+
+          wrapper = Path("scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh")
+          replace_once(
+              wrapper,
+              '''    --complete-connector-day
+                           Enumerate the adapter's complete selected source day.
+''',
+              '''    --complete-connector-day
+                           Enumerate the adapter's complete source day.
+''',
+          )
+          replace_once(
+              wrapper,
+              '''  - Complete connector-day Integrity repairs require an explicit selected
+    pollutant set and resolve its exact active timeseries IDs from Integrity SQLite.
+''',
+              '''  - Complete connector-day Integrity repairs preserve the coordinator's
+    explicit selected pollutant set without adding a timeseries-ID filter.
+''',
+          )
+          wrapper_text = wrapper.read_text(encoding="utf-8")
+          block_pattern = re.compile(
+              r'''RESOLVED_TIMESERIES_COUNT=0\nif \(\( OBSERVS_ONLY == 1 \)\); then\n.*?\nfi\n\necho "=== UK AQ Integrity Backfill ==="''',
+              re.DOTALL,
+          )
+          replacement = '''if (( OBSERVS_ONLY == 1 )); then
+  if (( COMPLETE_CONNECTOR_DAY == 1 )); then
+    unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
+    unset UK_AQ_BACKFILL_TIMESERIES_ID || true
+    export UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY="true"
+  else
+    export UK_AQ_BACKFILL_TIMESERIES_IDS="${TIMESERIES_IDS}"
+    unset UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY || true
+  fi
+else
+  unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
+  unset UK_AQ_BACKFILL_TIMESERIES_ID || true
+fi
+
+echo "=== UK AQ Integrity Backfill ==="'''
+          wrapper_text, count = block_pattern.subn(replacement, wrapper_text, count=1)
+          if count != 1:
+              raise SystemExit(f"{wrapper}: complete-day block replacement count={count}")
+          wrapper.write_text(wrapper_text, encoding="utf-8")
+          replace_once(
+              wrapper,
+              '''if (( COMPLETE_CONNECTOR_DAY == 1 )); then
+  echo "timeseries_scope: selected_pollutants=${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS} count=${RESOLVED_TIMESERIES_COUNT}"
+else
+  echo "timeseries_ids: ${UK_AQ_BACKFILL_TIMESERIES_IDS:-n/a}"
+fi
+''',
+              '''echo "timeseries_ids: ${UK_AQ_BACKFILL_TIMESERIES_IDS:-n/a}"
+''',
+          )
+
+          resolver = Path("scripts/uk-aq-history-integrity/bin/resolve_integrity_timeseries_scope.py")
+          if not resolver.is_file():
+              raise SystemExit(f"expected resolver introduced by PR #24: {resolver}")
+          resolver.unlink()
+
+          impl = Path("scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py")
+          replace_once(
+              impl,
+              '''    if parsed.repair_pollutants and not parsed.run_backfill:
+        p.error("--repair-pollutants requires --run-backfill")
+    if parsed.check_only and parsed.run_backfill:
+''',
+              '''    if parsed.repair_pollutants and not parsed.run_backfill:
+        p.error("--repair-pollutants requires --run-backfill")
+    if parsed.run_backfill and not parsed.repair_pollutants:
+        p.error(
+            "--run-backfill requires an explicit --repair-pollutants subset "
+            "of pm25,pm10,no2,o3"
+        )
+    if parsed.check_only and parsed.run_backfill:
+''',
+          )
+
+          docs = Path("system_docs/r2_history/README.md")
+          replace_once(
+              docs,
+              '''A complete connector-day Integrity repair remains limited to its explicit selected pollutant set. The specialist wrapper resolves the matching active timeseries identities from the imported Integrity core snapshot and passes that exact list to the shared source-to-R2 worker while retaining complete connector-day evidence mode. Unselected, ended or otherwise unrelated connector bindings must not enter source-adapter mapping guards or broaden the repair evidence.
+''',
+              '''A complete connector-day Integrity repair remains limited to its explicit selected pollutant set. The coordinator passes that set unchanged to the shared source-to-R2 worker while retaining complete connector-day evidence mode. The worker filters source-adapter bindings by the selected pollutant set before adapter mapping guards run. Complete connector-day mode must not use a timeseries-ID filter. Unselected bindings must not broaden repair evidence or block the selected repair scope.
+''',
+          )
+
+          for temporary in (
+              Path(".github/workflows/apply_sos_integrity_pollutant_scope_fix.yml"),
+              Path(".github/workflows/apply_sos_integrity_pollutant_scope_fix_push.yml"),
+              Path(".github/apply_sos_integrity_scope_trigger"),
+          ):
+              temporary.unlink(missing_ok=True)
+          PY
+
+      - name: Structural validation
+        shell: bash
+        run: |
+          bash -n scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh
+          python3 -m py_compile scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py
+          git diff --check
+          grep -q 'INTEGRITY_POLLUTANT_SCOPED_REPAIR' workers/uk_aq_backfill_local/run_job.ts
+          test ! -e scripts/uk-aq-history-integrity/bin/resolve_integrity_timeseries_scope.py
+
+      - name: Commit corrected implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Correct SOS Integrity pollutant scope handling"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
