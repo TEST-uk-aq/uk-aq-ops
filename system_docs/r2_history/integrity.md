@@ -283,6 +283,16 @@ For an observation data repair:
 
 For a metadata-only repair, preserve the Dropbox Parquet and rebuild only the required supported-pollutant manifests or indexes from the chosen Dropbox baseline and any corrected local overlay objects.
 
+When a day-manifest repair encounters a non-canonical observation connector manifest, Integrity may include a connector-manifest correction in the same proposal set only when all of the following are true:
+
+- the existing connector manifest has the exact expected v2 observations domain, manifest kind, object key, day and numeric connector identity;
+- every discovered pollutant child manifest is independently valid under the current canonical contract;
+- every declared child manifest and every existing baseline Parquet object under that connector-day is represented by the validated child set;
+- the replacement connector manifest is rebuilt exclusively from those validated child manifests, rather than trusting the legacy connector aggregates, child summaries or stored hash;
+- an apparently empty connector is accepted only when its existing zero-row, zero-file and empty-files evidence is internally explicit.
+
+The connector correction must be reported as its own proposal, including the failed canonical validation rules. A wrong domain, kind, key, day or connector identity, an unavailable child set, or any invalid pollutant child remains a blocked dependency. The canonical connector proposal must be staged before the day manifest is rebuilt from the final child hierarchy.
+
 The apply order is always selected child data first, then selected child manifests, parent manifests, scoped indexes and global latest indexes last.
 
 ## R2 access rules
