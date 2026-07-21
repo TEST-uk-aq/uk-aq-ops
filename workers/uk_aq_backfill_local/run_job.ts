@@ -13712,10 +13712,14 @@ async function runSourceToAll(
             lookup.binding_by_timeseries_ref.values(),
           )
             .filter((binding) => candidateStationRefs.has(binding.station_ref))
-            .filter((binding) => INTEGRITY_COMPLETE_CONNECTOR_DAY ||
-              binding.pollutant_code === "no2" ||
-              binding.pollutant_code === "pm25" ||
-              binding.pollutant_code === "pm10")
+            .filter((binding) =>
+              INTEGRITY_POLLUTANT_SCOPED_REPAIR
+                ? INTEGRITY_REPAIR_POLLUTANTS.has(binding.pollutant_code)
+                : INTEGRITY_COMPLETE_CONNECTOR_DAY ||
+                  binding.pollutant_code === "no2" ||
+                  binding.pollutant_code === "pm25" ||
+                  binding.pollutant_code === "pm10"
+            )
             .sort((left, right) => {
               const stationCompare = left.station_ref.localeCompare(
                 right.station_ref,
