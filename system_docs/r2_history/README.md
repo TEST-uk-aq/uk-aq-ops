@@ -37,6 +37,10 @@ For scheduled Integrity date selection, also read [`daily_profile_selection.md`]
 
 For Phase B AQI writes, also read [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
 
+## Integrity repair execution scope
+
+A complete connector-day Integrity repair remains limited to its explicit selected pollutant set. The specialist wrapper resolves the matching active timeseries identities from the imported Integrity core snapshot and passes that exact list to the shared source-to-R2 worker while retaining complete connector-day evidence mode. Unselected, ended or otherwise unrelated connector bindings must not enter source-adapter mapping guards or broaden the repair evidence.
+
 ## Implementation ownership
 
 - `scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs`
