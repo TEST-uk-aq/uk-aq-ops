@@ -21,17 +21,29 @@ function envBoolean(name: string): boolean {
 }
 
 /**
- * The complete connector-day guard predates the source-evidence-only phase and
- * currently insists on the finalisation marker. Evidence-only exits before any
- * R2 publication, so normalise that one local process phase for compatibility.
+ * The specialist wrapper loads the repository .env after the Integrity
+ * coordinator has supplied its run-specific phase flags. Repository defaults
+ * can therefore replace prepare/finalize before run_job.ts evaluates its
+ * complete connector-day guard.
+ *
+ * Source-evidence-only is an explicit coordinator-owned phase. It exits before
+ * proposal publication or R2 mutation, but it still needs the complete-day
+ * prepare/finalize guard shape so that the worker can enumerate and write its
+ * local immutable detector evidence. Restore that narrow phase here without
+ * weakening normal complete connector-day calls.
  */
 export function normaliseIntegritySourceEvidencePhase(): void {
   if (
-    envValue("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE").toLowerCase() === "prepare" &&
-    envBoolean("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY") &&
-    envBoolean("UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY") &&
-    !envBoolean("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE")
+    !envBoolean("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY") ||
+    !envBoolean("UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY")
   ) {
+    return;
+  }
+
+  if (envValue("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE").toLowerCase() !== "prepare") {
+    Deno.env.set("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE", "prepare");
+  }
+  if (!envBoolean("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE")) {
     Deno.env.set("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE", "true");
   }
 }
