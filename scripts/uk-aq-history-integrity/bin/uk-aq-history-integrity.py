@@ -6560,8 +6560,33 @@ def check_sos_flat_files(
     metrics["files_checked"] = 0
     metrics["ran"] = True
 
+    connector_ids = sorted({
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT connector_id
+            FROM source_station_timeseries_lookup
+            WHERE source_key = ? AND is_active = 1
+            ORDER BY connector_id
+            """,
+            (SOS_SOURCE_KEY,),
+        ).fetchall()
+        if int(row[0] or 0) > 0
+    })
+    connector_scope = ",".join(str(connector_id) for connector_id in connector_ids) or "unknown"
+    day_scope = (
+        requested_dates[0].isoformat()
+        if len(requested_dates) == 1
+        else f"{requested_dates[0].isoformat()}..{requested_dates[-1].isoformat()}"
+    )
+    metrics["connector_ids"] = connector_ids
+    metrics["day_scope"] = day_scope
+
     log.info(
-        "sos flat-file: starting sites=%s years=%s files=%s base_url=%s target_pollutants=%s%s",
+        "sos flat-file: starting connector_ids=%s day=%s stations=%s years=%s files=%s "
+        "base_url=%s target_pollutants=%s%s",
+        connector_scope,
+        day_scope,
         metrics["stations"],
         len(years),
         len(tasks),
@@ -6609,9 +6634,43 @@ def check_sos_flat_files(
         total_tasks = len(futures)
         completed_tasks = 0
         progress = SingleLineProgress("sos flat-file progress")
+        progress_log_interval = max(1, math.ceil(max(total_tasks, 1) / 20))
+
+        def log_flat_file_progress(
+            *,
+            current_site: str = "n/a",
+            current_year: str = "n/a",
+            force: bool = False,
+        ) -> None:
+            if not force and (
+                completed_tasks != 1
+                and completed_tasks != total_tasks
+                and completed_tasks % progress_log_interval != 0
+            ):
+                return
+            log.info(
+                "sos flat-file progress connector_ids=%s day=%s stations=%s "
+                "files=%s/%s current_site=%s year=%s checked=%s downloaded=%s "
+                "cached=%s mapped_rows=%s missing=%s errors=%s",
+                connector_scope,
+                day_scope,
+                metrics["stations"],
+                completed_tasks,
+                total_tasks,
+                current_site,
+                current_year,
+                metrics["head_checked"],
+                metrics["downloaded"],
+                metrics["cache_reused"],
+                metrics["rows_counted"],
+                metrics["missing"],
+                metrics["errors"],
+            )
+
         progress.update(
             (
-                f"0/{total_tasks} checked=0 downloaded=0 cached=0 mapped_rows=0 "
+                f"connector_ids={connector_scope} day={day_scope} stations={metrics['stations']} "
+                f"files=0/{total_tasks} checked=0 downloaded=0 cached=0 mapped_rows=0 "
                 f"missing=0 errors=0 planned_backfills=0"
             ),
             force=True,
@@ -6626,13 +6685,15 @@ def check_sos_flat_files(
                 log.warning("sos flat-file worker raised: %s", exc)
                 progress.update(
                     (
-                        f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                        f"connector_ids={connector_scope} day={day_scope} stations={metrics['stations']} "
+                        f"files={completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
                         f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
                         f"mapped_rows={metrics['rows_counted']} "
                         f"missing={metrics['missing']} errors={metrics['errors']} "
                         f"planned_backfills=0"
                     ),
                 )
+                log_flat_file_progress(current_site="error")
                 continue
 
             outcome = str(result.get("outcome") or "")
@@ -6736,23 +6797,31 @@ def check_sos_flat_files(
 
             progress.update(
                 (
-                    f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+                    f"connector_ids={connector_scope} day={day_scope} stations={metrics['stations']} "
+                    f"files={completed_tasks}/{total_tasks} current_site={result.get('site_ref', 'n/a')} "
+                    f"year={result.get('year', 'n/a')} checked={metrics['head_checked']} "
                     f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
                     f"mapped_rows={metrics['rows_counted']} "
                     f"missing={metrics['missing']} errors={metrics['errors']} "
                     f"planned_backfills=0"
                 ),
             )
+            log_flat_file_progress(
+                current_site=str(result.get("site_ref") or "n/a"),
+                current_year=str(result.get("year") or "n/a"),
+            )
 
     progress.update(
         (
-            f"{completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
+            f"connector_ids={connector_scope} day={day_scope} stations={metrics['stations']} "
+            f"files={completed_tasks}/{total_tasks} checked={metrics['head_checked']} "
             f"downloaded={metrics['downloaded']} cached={metrics['cache_reused']} "
             f"mapped_rows={metrics['rows_counted']} "
             f"missing={metrics['missing']} errors={metrics['errors']} planned_backfills=0"
         ),
         force=True,
     )
+    log_flat_file_progress(force=True)
     progress.finish()
 
     metrics["first_seen_files"].sort(key=lambda e: (e["year"], e["site_ref"]))
