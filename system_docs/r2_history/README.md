@@ -39,7 +39,7 @@ For Phase B AQI writes, also read [`aqi_history_write_pipeline.md`](aqi_history_
 
 ## Integrity repair execution scope
 
-A complete connector-day Integrity repair remains limited to its explicit selected pollutant set. The specialist wrapper resolves the matching active timeseries identities from the imported Integrity core snapshot and passes that exact list to the shared source-to-R2 worker while retaining complete connector-day evidence mode. Unselected, ended or otherwise unrelated connector bindings must not enter source-adapter mapping guards or broaden the repair evidence.
+A complete connector-day Integrity repair remains pollutant-scoped. The selected pollutant set passes unchanged to the shared source-to-R2 worker, which filters adapter bindings before mapping guards while retaining complete connector-day source evidence. Complete connector-day mode must not use a timeseries-ID filter.
 
 ## Implementation ownership
 
