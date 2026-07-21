@@ -19,7 +19,7 @@ Mode-specific requirements:
   --observs-only:
     --timeseries-ids CSV  Comma-separated positive integer timeseries IDs, or:
     --complete-connector-day
-                          Enumerate the adapter's complete source day.
+                           Enumerate the adapter's complete selected source day.
     --connector-id N      Optional connector filter for tighter scope.
   --aqi-only:
     --connector-id N      Optional connector filter for partial-day scope.
@@ -35,6 +35,8 @@ Notes:
   - Reasserts UK_AQ_ENV_NAME and reads UK_AQ_BACKFILL_WRAPPER from the root .env.
   - Never reads the local CIC-Test.env or LIVE.env selector files.
   - Preserves observation-only and AQI-only modes.
+  - Complete connector-day Integrity repairs require an explicit selected
+    pollutant set and resolve its exact active timeseries IDs from Integrity SQLite.
   - Disables the nested full R2 history index rebuild; the Integrity coordinator
     owns targeted indexes after all manifests for the affected day are verified.
 USAGE
@@ -448,11 +450,15 @@ if [[ ! -f "${ENV_FILE}" || ! -r "${ENV_FILE}" ]]; then
   exit 3
 fi
 
+INCOMING_INTEGRITY_REPAIR_POLLUTANTS="$(trim "${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS:-}")"
 set -a
 # The shared repository .env is the only environment source for this wrapper.
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
+if [[ -n "${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}" ]]; then
+  export UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS="${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}"
+fi
 
 if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
   echo "ERROR: UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
@@ -535,7 +541,6 @@ else
   export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
 fi
 
-
 export UK_AQ_R2_HISTORY_VERSION="${HISTORY_VERSION}"
 export UK_AQ_R2_HISTORY_INDEX_VERSION="${HISTORY_VERSION}"
 export UK_AQ_BACKFILL_TRIGGER_MODE="manual"
@@ -551,11 +556,40 @@ else
   unset UK_AQ_BACKFILL_CONNECTOR_IDS || true
 fi
 
+RESOLVED_TIMESERIES_COUNT=0
 if (( OBSERVS_ONLY == 1 )); then
   if (( COMPLETE_CONNECTOR_DAY == 1 )); then
-    unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
+    REPAIR_POLLUTANTS="$(trim "${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS:-}")"
+    if [[ -z "${REPAIR_POLLUTANTS}" ]]; then
+      echo "ERROR: --complete-connector-day requires UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS." >&2
+      exit 3
+    fi
+    INTEGRITY_DB_PATH="$(require_env UK_AQ_HISTORY_INTEGRITY_DB_PATH)"
+    SCOPE_RESOLVER="${SCRIPT_DIR}/resolve_integrity_timeseries_scope.py"
+    reject_archive_path "Integrity timeseries scope resolver" "${SCOPE_RESOLVER}"
+    if [[ ! -f "${SCOPE_RESOLVER}" || ! -r "${SCOPE_RESOLVER}" ]]; then
+      echo "ERROR: Integrity timeseries scope resolver not found or unreadable: ${SCOPE_RESOLVER}" >&2
+      exit 4
+    fi
+    if ! TIMESERIES_IDS="$(python3 "${SCOPE_RESOLVER}" \
+      --db-path "${INTEGRITY_DB_PATH}" \
+      --connector-id "${CONNECTOR_ID}" \
+      --pollutants "${REPAIR_POLLUTANTS}")"; then
+      echo "ERROR: failed to resolve selected Integrity timeseries scope." >&2
+      exit 4
+    fi
+    if ! TIMESERIES_IDS="$(normalize_positive_int_csv "${TIMESERIES_IDS}")"; then
+      echo "ERROR: resolved Integrity timeseries scope was empty or invalid." >&2
+      exit 4
+    fi
+    export UK_AQ_BACKFILL_TIMESERIES_IDS="${TIMESERIES_IDS}"
     unset UK_AQ_BACKFILL_TIMESERIES_ID || true
     export UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY="true"
+    RESOLVED_TIMESERIES_COUNT="$(python3 - "${TIMESERIES_IDS}" <<'PY'
+import sys
+print(len([value for value in sys.argv[1].split(",") if value]))
+PY
+)"
   else
     export UK_AQ_BACKFILL_TIMESERIES_IDS="${TIMESERIES_IDS}"
     unset UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY || true
@@ -577,7 +611,11 @@ echo "full_r2_history_index_rebuild: ${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX}"
 echo "from_day_utc: ${UK_AQ_BACKFILL_FROM_DAY_UTC}"
 echo "to_day_utc: ${UK_AQ_BACKFILL_TO_DAY_UTC}"
 echo "connector_ids: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
-echo "timeseries_ids: ${UK_AQ_BACKFILL_TIMESERIES_IDS:-n/a}"
+if (( COMPLETE_CONNECTOR_DAY == 1 )); then
+  echo "timeseries_scope: selected_pollutants=${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS} count=${RESOLVED_TIMESERIES_COUNT}"
+else
+  echo "timeseries_ids: ${UK_AQ_BACKFILL_TIMESERIES_IDS:-n/a}"
+fi
 echo "complete_connector_day: ${UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY:-false}"
 echo "integrity_wrapper: ${INTEGRITY_WRAPPER}"
 echo "backfill_wrapper: ${BACKFILL_WRAPPER}"
