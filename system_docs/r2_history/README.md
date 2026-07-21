@@ -4,13 +4,14 @@
 
 Read [`contract.md`](contract.md) first for the stable v2 per-timeseries binding contract.
 
-This area currently has three completed authority groups:
+This area currently has four completed authority groups:
 
 - stable timeseries binding identity and routing;
 - v2 history integrity detection and repair in [`integrity.md`](integrity.md);
+- scheduled Integrity daily date selection in [`daily_profile_selection.md`](daily_profile_selection.md);
 - the active Phase B AQI writer, PM rolling-context source split and targeted-index gates in [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
 
-The remaining daily layout, manifest, backup, observations-write and read-API documentation is still being migrated from `system_docs_legacy/`. Do not infer that a legacy broad document overrides the completed files above.
+The remaining broader daily layout, manifest, backup, observations-write and read-API documentation is still being migrated from `system_docs_legacy/`. Do not infer that a legacy broad document overrides the completed files above.
 
 ## AQI writer source boundary
 
@@ -32,6 +33,8 @@ The exact RPC, pagination, retention, diagnostics and recovery contract is defin
 5. [`validation.md`](validation.md)
 6. relevant files under [`decisions/`](decisions/)
 
+For scheduled Integrity date selection, also read [`daily_profile_selection.md`](daily_profile_selection.md).
+
 For Phase B AQI writes, also read [`aqi_history_write_pipeline.md`](aqi_history_write_pipeline.md).
 
 ## Implementation ownership
@@ -46,4 +49,4 @@ For Phase B AQI writes, also read [`aqi_history_write_pipeline.md`](aqi_history_
 - `scripts/backup_r2/`
 - `scripts/uk-aq-history-integrity/`
 
-The binding contract does not own daily observation or AQI coverage. The AQI write-pipeline document owns Phase B source selection, calculation boundaries, write and completion gates, but not public display semantics.
+The binding contract does not own daily observation or AQI coverage. The daily-profile selection contract owns scheduled Integrity date selection. The AQI write-pipeline document owns Phase B source selection, calculation boundaries, write and completion gates, but not public display semantics.
