@@ -3628,6 +3628,7 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "repaired_timeseries_row_counts": {},
                 "source_pollutant_codes": [],
                 "source_mapped_rows": 0,
+                "source_connector_day_first_error": None,
                 "backfill_run_status": None,
                 "source_acquisition_pending_days": []}
     if len(results) == 1:
@@ -3677,6 +3678,11 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             if str(code or "").strip()
         }),
         "source_mapped_rows": sum(int(r.get("source_mapped_rows") or 0) for r in results),
+        "source_connector_day_first_error": next((
+            r.get("source_connector_day_first_error")
+            for r in results
+            if r.get("source_connector_day_first_error")
+        ), None),
         "backfill_run_status": next((str(r.get("backfill_run_status")) for r in results if r.get("backfill_run_status")), None),
         "source_acquisition_pending_days": sorted({
             str(day)
@@ -3801,6 +3807,7 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         "repaired_timeseries_row_counts": {},
         "source_pollutant_codes": [],
         "source_mapped_rows": 0,
+        "source_connector_day_first_error": None,
         "backfill_run_status": None,
         "source_acquisition_pending_days": [],
     }
@@ -3860,6 +3867,10 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
             continue
         if event_name == "source_to_r2_connector_day_failed":
             status["source_connector_day_failed_events"] += 1
+            if status["source_connector_day_first_error"] is None:
+                error = str(event.get("error") or "").strip()
+                if error:
+                    status["source_connector_day_first_error"] = error
             continue
         if event_name == "source_to_r2_integrity_proposal_chunk_staged":
             status["integrity_proposal_chunk_staged_events"] += 1
@@ -13620,9 +13631,14 @@ def run_v2_gap_backfills(
                 repair_pollutants=repair_pollutants,
             )
             if detector_result.get("status") != "ok":
+                worker_error = str(
+                    detector_result.get("source_connector_day_first_error")
+                    or detector_result.get("error")
+                    or detector_result.get("exit_code")
+                )
                 raise RuntimeError(
                     "detector_source_evidence_worker_failed:"
-                    f"{detector_result.get('error') or detector_result.get('exit_code')}"
+                    f"{worker_error}"
                 )
             detector_evidence, detector_rows = _load_complete_connector_day_source_evidence(
                 stage_root=detector_stage_root,
@@ -13640,7 +13656,7 @@ def run_v2_gap_backfills(
             # evidence on which its destructive scope depends.
             conn.commit()
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-            detector_evidence_error = f"immutable_detector_source_evidence_failed:{type(exc).__name__}"
+            detector_evidence_error = f"immutable_detector_source_evidence_failed:{exc}"
             log.warning(
                 "v2 observation detector source evidence failed day=%s connector_id=%s error=%s",
                 day_iso,
