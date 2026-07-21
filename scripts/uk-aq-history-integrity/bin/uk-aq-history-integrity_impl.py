@@ -16598,7 +16598,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Enable the ordered v2 repair flow after read-only detection.")
     p.add_argument(
         "--repair-pollutants",
-        default=os.environ.get("UK_AQ_HISTORY_INTEGRITY_REPAIR_POLLUTANTS", ""),
+        default="",
         help="Explicit pollutant-scoped observation repair list: pm25,pm10,no2,o3.",
     )
     p.add_argument("--max-download-mb", type=int, default=None)
@@ -16673,6 +16673,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parsed.repair_pollutants = _parse_repair_pollutants_arg(parsed.repair_pollutants)
     except ValueError as exc:
         p.error(str(exc))
+    if parsed.run_backfill and not parsed.repair_pollutants:
+        p.error(
+            "--run-backfill requires an explicit --repair-pollutants subset of "
+            "pm25,pm10,no2,o3",
+        )
     if parsed.repair_pollutants and not parsed.run_backfill:
         p.error("--repair-pollutants requires --run-backfill")
     if parsed.check_only and parsed.run_backfill:
