@@ -8,6 +8,9 @@ import {
   runV2ObservationsRepair as runV2ObservationsRepairImpl,
 } from "./uk_aq_execute_v2_observations_repair_impl.mjs";
 import {
+  prepareCanonicalObservationManifestCompatibility,
+} from "../../workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs";
+import {
   finaliseLegacyObservationManifestCompatibility,
   prepareLegacyObservationManifestCompatibility,
 } from "../../workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs";
@@ -44,6 +47,33 @@ function resolveRepairPlan({ argv, repairPlan }) {
   return null;
 }
 
+function mergePreparations(...values) {
+  const preparedByConnector = new Map();
+  let runStatePath = null;
+  for (const value of values) {
+    if (!value) continue;
+    if (value.run_state_path) {
+      if (runStatePath && runStatePath !== value.run_state_path) {
+        throw new Error("Manifest compatibility preparations resolved different run-state files");
+      }
+      runStatePath = value.run_state_path;
+    }
+    for (const item of value.prepared || []) {
+      const key = String(item?.connector_key || "");
+      if (!key) throw new Error("Manifest compatibility preparation has no connector key");
+      if (preparedByConnector.has(key)) {
+        throw new Error(`Blocked dependency: multiple compatibility preparations for ${key}`);
+      }
+      preparedByConnector.set(key, item);
+    }
+  }
+  return {
+    prepared: [...preparedByConnector.values()]
+      .sort((left, right) => left.connector_key.localeCompare(right.connector_key)),
+    run_state_path: runStatePath,
+  };
+}
+
 export async function runV2ObservationsRepair(options = {}) {
   const argv = Array.isArray(options.argv) ? options.argv : process.argv.slice(2);
   const env = resolvedEnvironment(options.env || process.env, argv);
@@ -55,10 +85,15 @@ export async function runV2ObservationsRepair(options = {}) {
     env,
     repairPlan,
   });
-  const preparation = await prepareLegacyObservationManifestCompatibility({
+  const canonicalPreparation = await prepareCanonicalObservationManifestCompatibility({
     env,
     repairPlan,
   });
+  const legacyPreparation = await prepareLegacyObservationManifestCompatibility({
+    env,
+    repairPlan,
+  });
+  const preparation = mergePreparations(canonicalPreparation, legacyPreparation);
   const output = await runV2ObservationsRepairImpl({
     ...options,
     argv,
@@ -69,8 +104,16 @@ export async function runV2ObservationsRepair(options = {}) {
     output,
     preparation,
   });
-  if (finalised?.planning && inputValidation.legacy_connectors > 0) {
-    finalised.planning.compatibility_input_validation = inputValidation;
+  if (finalised?.planning
+    && (inputValidation.legacy_connectors > 0 || preparation.prepared.length > 0)) {
+    finalised.planning.compatibility_input_validation = {
+      ...inputValidation,
+      prepared_connectors: preparation.prepared.length,
+      prepared_pollutant_manifests: preparation.prepared.reduce(
+        (total, item) => total + Number(item?.pollutant_proposals?.length || 0),
+        0,
+      ),
+    };
   }
   return finalised;
 }
