@@ -8854,25 +8854,6 @@ function normalizeUkAirSourceLabel(value: string): string {
   return value.trim().replace(/\s+/g, " ");
 }
 
-export function normaliseConcentrationUnitForComparison(
-  value: string | null | undefined,
-): string {
-  const compact = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[µμ]/g, "u")
-    .replace(/³/g, "3")
-    .replace(/[−–]/g, "-")
-    .replace(/\s+/g, "");
-  const aliases = new Map<string, string>([
-    ["ug/m3", "ug/m3"],
-    ["ugm-3", "ug/m3"],
-    ["mg/m3", "mg/m3"],
-    ["mgm-3", "mg/m3"],
-  ]);
-  return aliases.get(compact) || compact;
-}
-
 function parseUkAirCsvDay(value: string): string | null {
   const match = value.trim().match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2}|\d{4})$/);
   if (!match) return null;
@@ -9080,12 +9061,8 @@ export function parseUkAirFlatFileObservations(args: {
       if (value === null) continue;
       const unit = String(cells[binding.unitIndex] || "").trim();
       const expectedUnit = String(binding.property.source_uom || "").trim();
-      const normalisedUnit = normaliseConcentrationUnitForComparison(unit);
-      const normalisedExpectedUnit = normaliseConcentrationUnitForComparison(
-        expectedUnit,
-      );
-      if (expectedUnit && normalisedUnit !== normalisedExpectedUnit) {
-        throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.property.source_label)} observed_property_code=${binding.property.observed_property_code} source_uom=${JSON.stringify(expectedUnit)} csv_uom=${JSON.stringify(unit)} normalised_source_uom=${JSON.stringify(normalisedExpectedUnit)} normalised_csv_uom=${JSON.stringify(normalisedUnit)}`);
+      if (unit && expectedUnit && unit !== expectedUnit) {
+        throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.property.source_label)} observed_property_code=${binding.property.observed_property_code} source_uom=${JSON.stringify(expectedUnit)} csv_uom=${JSON.stringify(unit)}`);
       }
       if (unit) units.add(unit);
       result.rows.push({

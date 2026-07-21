@@ -2,12 +2,13 @@ import {
   classifyObservationRowsForV2PollutantPartitions,
   createAqiV2ConnectorManifest,
   createAqiV2PollutantManifest,
+  normaliseConcentrationUnitForComparison,
   parseOpenaqCsvObservations,
   parseUkAirFlatFileObservations,
   summarizeAqilevelsPartRows,
 } from "./run_job.ts";
 
-const propertyMapping = (sourceLabel: string, code: string, sourceUom = "ugm-3") => ({
+const propertyMapping = (sourceLabel: string, code: string, sourceUom = "ug/m3") => ({
   connector_id: 1,
   source_label: sourceLabel,
   source_uom: sourceUom,
@@ -24,6 +25,24 @@ function assertEquals(actual: unknown, expected: unknown): void {
     throw new Error(`assertEquals failed: actual=${actualJson} expected=${expectedJson}`);
   }
 }
+
+Deno.test("UK-AIR concentration-unit aliases preserve scale and reject a different scale", () => {
+  assertEquals(
+    ["ug/m3", "ugm-3", "ug m-3", "µg/m3", "μg/m3", "µg/m³", "μg/m³"]
+      .map(normaliseConcentrationUnitForComparison),
+    ["ug/m3", "ug/m3", "ug/m3", "ug/m3", "ug/m3", "ug/m3", "ug/m3"],
+  );
+  assertEquals(
+    ["mg/m3", "mgm-3", "mg m-3", "mg/m³"]
+      .map(normaliseConcentrationUnitForComparison),
+    ["mg/m3", "mg/m3", "mg/m3", "mg/m3"],
+  );
+  assertEquals(
+    normaliseConcentrationUnitForComparison("mg/m3") ===
+      normaliseConcentrationUnitForComparison("ug/m3"),
+    false,
+  );
+});
 
 Deno.test("v2 classifier skips blank, null, and invalid pollutant_code rows", () => {
   const classified = classifyObservationRowsForV2PollutantPartitions([

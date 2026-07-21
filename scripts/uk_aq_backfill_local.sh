@@ -564,7 +564,7 @@ while IFS=' ' read -r month_from month_to; do
   RUN_START_EPOCHS+=("$(date +%s)")
 
   if "${DENO_BIN}" run --allow-env --allow-net --allow-read --allow-write --allow-run \
-    "${RUN_JOB_PATH}" | tee "${log_file}"; then
+    "${RUN_JOB_PATH}" 2>&1 | tee "${log_file}"; then
     echo "Window ${month_from} -> ${month_to}: ok"
   else
     echo "Window ${month_from} -> ${month_to}: failed" >&2
