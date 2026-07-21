@@ -26,6 +26,11 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
+class TtyBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class ProgressConsoleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root_logger = logging.getLogger()
@@ -36,8 +41,8 @@ class ProgressConsoleTests(unittest.TestCase):
         self.root_logger.handlers = self.original_handlers
         self.root_logger.setLevel(self.original_level)
 
-    def test_numbered_progress_stays_live_while_checkpoints_are_logged(self) -> None:
-        console_output = io.StringIO()
+    def test_tty_progress_writes_directly_to_stderr_and_logs_checkpoints(self) -> None:
+        console_output = TtyBuffer()
         durable_output = io.StringIO()
 
         console_handler = logging.StreamHandler(console_output)
@@ -47,7 +52,7 @@ class ProgressConsoleTests(unittest.TestCase):
         self.root_logger.handlers = [console_handler, durable_handler]
         self.root_logger.setLevel(logging.INFO)
 
-        with contextlib.redirect_stdout(console_output):
+        with contextlib.redirect_stderr(console_output):
             progress = MODULE.SingleLineProgress("sample progress")
             progress.update("0/2 checked=0", force=True)
             progress.update("2/2 checked=2", force=True)
@@ -77,6 +82,28 @@ class ProgressConsoleTests(unittest.TestCase):
             "sos flat-file progress connector_ids=1 files=1/2",
             durable_text,
         )
+
+    def test_non_tty_progress_emits_numbered_checkpoint_lines(self) -> None:
+        console_output = io.StringIO()
+        durable_output = io.StringIO()
+        durable_handler = logging.StreamHandler(durable_output)
+
+        self.root_logger.handlers = [durable_handler]
+        self.root_logger.setLevel(logging.INFO)
+
+        with contextlib.redirect_stderr(console_output):
+            progress = MODULE.SingleLineProgress("sample progress")
+            progress.update("0/100 checked=0", force=True)
+            progress.update("1/100 checked=1")
+            progress.update("2/100 checked=2")
+            progress.update("100/100 checked=100", force=True)
+            progress.finish()
+
+        console_text = console_output.getvalue()
+        self.assertIn("sample progress: 0/100 checked=0\n", console_text)
+        self.assertIn("sample progress: 1/100 checked=1\n", console_text)
+        self.assertNotIn("sample progress: 2/100 checked=2\n", console_text)
+        self.assertIn("sample progress: 100/100 checked=100\n", console_text)
 
 
 if __name__ == "__main__":
