@@ -11898,288 +11898,6 @@ def _manifest_pollutant_codes(payload: Mapping[str, Any]) -> set[str]:
     return codes
 
 
-class CanonicalConnectorManifestValidationError(ValueError):
-    """A fail-closed local proposal error with concise persisted diagnostics."""
-
-    def __init__(self, reason: str, details: Mapping[str, Any]) -> None:
-        self.reason = reason
-        self.details = dict(details)
-        super().__init__(
-            "canonical connector manifest validation failed "
-            f"reason={reason} details="
-            f"{json.dumps(self.details, sort_keys=True, separators=(',', ':'))}"
-        )
-
-
-def _manifest_exact_nonnegative_int(value: Any) -> int | None:
-    """Accept JSON integer values (or decimal integer text), but never bool/float."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
-        return int(value.strip())
-    return None
-
-
-def _manifest_declared_row_count(payload: Mapping[str, Any]) -> int | None:
-    declared: list[int] = []
-    for field in ("row_count", "source_row_count"):
-        if field not in payload:
-            continue
-        value = _manifest_exact_nonnegative_int(payload.get(field))
-        if value is None:
-            return None
-        declared.append(value)
-    if not declared or len(set(declared)) != 1:
-        return None
-    return declared[0]
-
-
-def _manifest_count_comparison(
-    expected: Mapping[int, int], actual: Mapping[int, int]
-) -> dict[str, Any]:
-    expected_counts = {int(key): int(value) for key, value in expected.items()}
-    actual_counts = {int(key): int(value) for key, value in actual.items()}
-    expected_ids = set(expected_counts)
-    actual_ids = set(actual_counts)
-    mismatches = [
-        f"{timeseries_id}:{expected_counts[timeseries_id]}!={actual_counts[timeseries_id]}"
-        for timeseries_id in sorted(expected_ids & actual_ids)
-        if expected_counts[timeseries_id] != actual_counts[timeseries_id]
-    ]
-    return {
-        "expected_count": len(expected_counts),
-        "actual_count": len(actual_counts),
-        "missing_timeseries_ids": sorted(expected_ids - actual_ids)[:25],
-        "unexpected_timeseries_ids": sorted(actual_ids - expected_ids)[:25],
-        "count_mismatches": mismatches[:25],
-    }
-
-
-def _v2_observation_connector_manifest_summary(
-    payload: Mapping[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Normalise the writer's connector hierarchy and retain structural failures."""
-    errors: list[dict[str, Any]] = []
-    raw_files = _manifest_files_list(payload)
-    files = raw_files if isinstance(raw_files, list) else []
-    if raw_files is None:
-        errors.append({"field": "manifest_file_entries", "reason": "files_missing_or_not_list"})
-
-    file_rows = 0
-    file_timeseries: dict[int, int] = {}
-    file_pollutant_rows: dict[str, int] = {}
-    for index, raw_entry in enumerate(files):
-        if not isinstance(raw_entry, Mapping):
-            errors.append({"field": "manifest_file_entries", "reason": "file_not_object", "index": index})
-            continue
-        row_count = _manifest_exact_nonnegative_int(raw_entry.get("row_count"))
-        if row_count is None:
-            errors.append({"field": "manifest_file_entries", "reason": "row_count_invalid", "index": index})
-            continue
-        file_rows += row_count
-        raw_counts = raw_entry.get("timeseries_row_counts")
-        if not isinstance(raw_counts, Mapping):
-            errors.append({"field": "manifest_file_entries", "reason": "timeseries_row_counts_invalid", "index": index})
-        else:
-            entry_counts: dict[int, int] = {}
-            entry_counts_valid = True
-            for raw_id, raw_count in raw_counts.items():
-                timeseries_id = _manifest_exact_nonnegative_int(raw_id)
-                count = _manifest_exact_nonnegative_int(raw_count)
-                if timeseries_id is None or timeseries_id <= 0 or count is None:
-                    errors.append({"field": "manifest_file_entries", "reason": "timeseries_row_count_invalid", "index": index})
-                    entry_counts_valid = False
-                    break
-                entry_counts[timeseries_id] = count
-            if entry_counts_valid and sum(entry_counts.values()) != row_count:
-                errors.append({"field": "manifest_file_entries", "reason": "timeseries_row_counts_do_not_sum_to_file_rows", "index": index})
-            if entry_counts_valid:
-                for timeseries_id, count in entry_counts.items():
-                    file_timeseries[timeseries_id] = file_timeseries.get(timeseries_id, 0) + count
-
-        file_codes = _manifest_pollutant_codes({"files": [dict(raw_entry)]})
-        if len(file_codes) != 1:
-            errors.append({"field": "manifest_file_entries", "reason": "pollutant_code_ambiguous_or_missing", "index": index})
-            continue
-        code = next(iter(file_codes))
-        file_pollutant_rows[code] = file_pollutant_rows.get(code, 0) + row_count
-
-    child_representations: dict[str, dict[str, int]] = {}
-    for field in ("child_manifests", "pollutant_manifests"):
-        raw_children = payload.get(field)
-        if raw_children is None:
-            continue
-        if not isinstance(raw_children, list):
-            errors.append({"field": field, "reason": "not_list"})
-            continue
-        counts: dict[str, int] = {}
-        for index, child in enumerate(raw_children):
-            if not isinstance(child, Mapping):
-                errors.append({"field": field, "reason": "child_not_object", "index": index})
-                continue
-            code = str(child.get("pollutant_code") or "").strip()
-            row_count = _manifest_declared_row_count(child)
-            if not code:
-                errors.append({"field": field, "reason": "pollutant_code_missing", "index": index})
-            elif row_count is None:
-                errors.append({"field": field, "reason": "row_count_missing_or_invalid", "index": index})
-            elif code in counts:
-                errors.append({"field": field, "reason": "duplicate_pollutant_code", "pollutant_code": code})
-            else:
-                counts[code] = row_count
-        child_representations[field] = counts
-
-    if not child_representations:
-        errors.append({"field": "pollutant_child_manifest_counts", "reason": "children_missing"})
-    child_counts = child_representations.get(
-        "child_manifests",
-        child_representations.get("pollutant_manifests", {}),
-    )
-    if (
-        "child_manifests" in child_representations
-        and "pollutant_manifests" in child_representations
-        and child_representations["child_manifests"]
-        != child_representations["pollutant_manifests"]
-    ):
-        errors.append({"field": "pollutant_child_manifest_counts", "reason": "child_representations_disagree"})
-
-    declared_manifest_rows = _manifest_declared_row_count(payload)
-    if declared_manifest_rows is None:
-        errors.append({"field": "connector_manifest_row_count", "reason": "row_count_missing_or_invalid"})
-    manifest_rows = _manifest_row_count(payload)
-    manifest_timeseries = _manifest_timeseries_row_counts(payload)
-    manifest_pollutants = _manifest_pollutant_codes(payload)
-    top_level_counts = _normalize_timeseries_row_counts(payload.get("timeseries_row_counts"))
-    if "timeseries_row_counts" in payload:
-        raw_top_level_counts = payload.get("timeseries_row_counts")
-        if not isinstance(raw_top_level_counts, Mapping):
-            errors.append({"field": "timeseries_row_counts", "reason": "top_level_not_object"})
-        else:
-            for raw_id, raw_count in raw_top_level_counts.items():
-                timeseries_id = _manifest_exact_nonnegative_int(raw_id)
-                count = _manifest_exact_nonnegative_int(raw_count)
-                if timeseries_id is None or timeseries_id <= 0 or count is None:
-                    errors.append({"field": "timeseries_row_counts", "reason": "top_level_count_invalid"})
-                    break
-    if top_level_counts and top_level_counts != file_timeseries:
-        errors.append({"field": "timeseries_row_counts", "reason": "top_level_and_file_counts_disagree"})
-    if manifest_rows != file_rows:
-        errors.append({"field": "connector_manifest_row_count", "reason": "manifest_and_file_rows_disagree"})
-    if manifest_timeseries != file_timeseries:
-        errors.append({"field": "timeseries_row_counts", "reason": "normalised_and_file_counts_disagree"})
-    if child_counts != file_pollutant_rows:
-        errors.append({"field": "pollutant_child_manifest_counts", "reason": "child_and_file_counts_disagree"})
-    if manifest_pollutants != set(file_pollutant_rows):
-        errors.append({"field": "pollutant_codes", "reason": "manifest_and_file_codes_disagree"})
-
-    return {
-        "connector_manifest_row_count": {
-            "row_count": payload.get("row_count"),
-            "source_row_count": payload.get("source_row_count"),
-            "derived_file_row_count": file_rows,
-            "actual": manifest_rows,
-        },
-        "timeseries_row_counts": {
-            "top_level_present": "timeseries_row_counts" in payload,
-            "top_level_count": len(top_level_counts),
-            "derived_file_count": len(file_timeseries),
-            "actual_count": len(manifest_timeseries),
-        },
-        "pollutant_codes": {
-            "top_level": sorted({str(code).strip() for code in list(payload.get("pollutant_codes") or []) if str(code or "").strip()}),
-            "derived_file_codes": sorted(file_pollutant_rows),
-            "actual": sorted(manifest_pollutants),
-        },
-        "pollutant_child_manifest_counts": {
-            "actual": dict(sorted(child_counts.items())),
-            "derived_file": dict(sorted(file_pollutant_rows.items())),
-            "representations": {
-                field: dict(sorted(counts.items()))
-                for field, counts in sorted(child_representations.items())
-            },
-        },
-        "manifest_file_entries": {
-            "count": len(files),
-            "row_count": file_rows,
-        },
-    }, errors
-
-
-def _v2_observation_manifest_evidence_mismatches(
-    payload: Mapping[str, Any],
-    *,
-    expected_source_row_count: int,
-    expected_timeseries_row_counts: Mapping[int, int],
-    expected_pollutant_counts: Mapping[str, int] | None = None,
-    expected_pollutant_codes: Iterable[str] | None = None,
-    source_evidence_pollutant_set: Iterable[str] | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Compare one canonical connector manifest with source-derived semantics."""
-    summary, mismatches = _v2_observation_connector_manifest_summary(payload)
-    manifest_rows = _manifest_row_count(payload)
-    manifest_timeseries_counts = _manifest_timeseries_row_counts(payload)
-    manifest_pollutant_codes = _manifest_pollutant_codes(payload)
-    manifest_pollutant_counts = dict(
-        summary["pollutant_child_manifest_counts"]["actual"]
-    )
-    expected_counts = _normalize_timeseries_row_counts(expected_timeseries_row_counts)
-    expected_codes = {
-        str(value).strip()
-        for value in (
-            expected_pollutant_codes
-            if expected_pollutant_codes is not None
-            else (expected_pollutant_counts or {}).keys()
-        )
-        if str(value or "").strip()
-    }
-    if manifest_rows != int(expected_source_row_count):
-        mismatches.append({
-            "field": "connector_manifest_row_count",
-            "expected": int(expected_source_row_count),
-            "actual": manifest_rows,
-        })
-    timeseries_comparison = _manifest_count_comparison(
-        expected_counts, manifest_timeseries_counts
-    )
-    if any(timeseries_comparison[key] for key in (
-        "missing_timeseries_ids", "unexpected_timeseries_ids", "count_mismatches"
-    )):
-        mismatches.append({"field": "timeseries_row_counts", **timeseries_comparison})
-    if expected_pollutant_counts is not None:
-        normalized_expected_pollutant_counts = {
-            str(code): int(count)
-            for code, count in expected_pollutant_counts.items()
-        }
-        if manifest_pollutant_counts != normalized_expected_pollutant_counts:
-            mismatches.append({
-                "field": "pollutant_child_manifest_counts",
-                "expected": dict(sorted(normalized_expected_pollutant_counts.items())),
-                "actual": dict(sorted(manifest_pollutant_counts.items())),
-            })
-    if manifest_pollutant_codes != expected_codes:
-        mismatches.append({
-            "field": "pollutant_codes",
-            "expected": sorted(expected_codes),
-            "actual": sorted(manifest_pollutant_codes),
-            "missing_pollutant_codes": sorted(expected_codes - manifest_pollutant_codes),
-            "unexpected_pollutant_codes": sorted(manifest_pollutant_codes - expected_codes),
-        })
-    if source_evidence_pollutant_set is not None:
-        evidence_codes = {
-            str(value).strip() for value in source_evidence_pollutant_set
-            if str(value or "").strip()
-        }
-        if evidence_codes != expected_codes:
-            mismatches.append({
-                "field": "source_evidence_pollutant_set",
-                "expected": sorted(expected_codes),
-                "actual": sorted(evidence_codes),
-            })
-    return summary, mismatches
-
-
 def _v2_partition_manifest_rel(
     *,
     prefix: str,
@@ -12509,16 +12227,55 @@ def _verify_v2_observation_manifest_content_for_aqi(
         if manifest_connector_id != int(connector_id):
             return False, "manifest_connector_mismatch", details
 
-    manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
-        payload,
-        expected_source_row_count=int(expected_min_rows or 0),
-        expected_timeseries_row_counts=expected_timeseries_row_counts,
-        expected_pollutant_codes=details["expected_pollutant_codes"],
-    )
-    details["manifest"] = manifest_summary
-    if mismatches:
-        details["mismatches"] = mismatches[:25]
-        return False, f"manifest_{mismatches[0]['field']}_mismatch", details
+    manifest_rows = _manifest_row_count(payload)
+    manifest_counts = _manifest_timeseries_row_counts(payload)
+    manifest_pollutants = _manifest_pollutant_codes(payload)
+    details.update({
+        "manifest_rows": manifest_rows,
+        "manifest_timeseries_count": len(manifest_counts),
+        "manifest_timeseries_row_counts": {
+            str(timeseries_id): count
+            for timeseries_id, count in sorted(manifest_counts.items())
+        },
+        "manifest_pollutant_codes": sorted(manifest_pollutants),
+    })
+    if expected_min_rows > 0 and manifest_rows < expected_min_rows:
+        details["shortfall_rows"] = expected_min_rows - manifest_rows
+        return False, "manifest_total_rows_below_expected", details
+
+    missing_timeseries: list[int] = []
+    low_count_timeseries: list[str] = []
+    for raw_timeseries_id, raw_expected_count in expected_timeseries_row_counts.items():
+        try:
+            timeseries_id = int(raw_timeseries_id)
+            expected_count = int(raw_expected_count)
+        except (TypeError, ValueError):
+            continue
+        if expected_count <= 0:
+            continue
+        observed_count = int(manifest_counts.get(timeseries_id, 0) or 0)
+        if observed_count <= 0:
+            missing_timeseries.append(timeseries_id)
+        elif observed_count < expected_count:
+            low_count_timeseries.append(f"{timeseries_id}:{observed_count}<{expected_count}")
+    if missing_timeseries:
+        details["missing_timeseries_ids"] = missing_timeseries[:25]
+        details["missing_timeseries_count"] = len(missing_timeseries)
+        return False, "manifest_missing_timeseries", details
+    if low_count_timeseries:
+        details["low_count_timeseries"] = low_count_timeseries[:25]
+        details["low_count_timeseries_count"] = len(low_count_timeseries)
+        details["shortfall_rows"] = sum(
+            max(0, int(expected_timeseries_row_counts[timeseries_id]) - int(manifest_counts.get(timeseries_id, 0) or 0))
+            for timeseries_id in expected_timeseries_row_counts
+        )
+        return False, "manifest_timeseries_rows_below_expected", details
+
+    expected_pollutants = set(details["expected_pollutant_codes"])
+    missing_pollutants = sorted(expected_pollutants - manifest_pollutants)
+    if missing_pollutants:
+        details["missing_pollutant_codes"] = missing_pollutants
+        return False, "manifest_missing_pollutant", details
     return True, None, details
 
 
@@ -14491,13 +14248,9 @@ def run_v2_gap_backfills(
                 "requested_timeseries_count": len(ts_ids),
                 "expected_counts_source": expected_counts_source,
                 "expected_source_rows_for_day": expected_min_manifest_rows,
-                "expected_timeseries_count": len(expected_timeseries_row_counts),
-                "expected_timeseries_rows": sum(expected_timeseries_row_counts.values()),
-                "expected_timeseries_row_counts_sample": {
+                "expected_timeseries_row_counts_for_day": {
                     str(timeseries_id): count
-                    for timeseries_id, count in list(
-                        sorted(expected_timeseries_row_counts.items())
-                    )[:25]
+                    for timeseries_id, count in sorted(expected_timeseries_row_counts.items())
                 },
                 "repair_output_rows": repaired_observation_rows,
                 "verification": "immutable_detector_evidence_then_canonical_local_proposal_validation",
@@ -14571,16 +14324,7 @@ def run_v2_gap_backfills(
                 repair_ok = False
                 repair_status = "guard_failed"
                 manifest_guard_ok = False
-                if isinstance(exc, CanonicalConnectorManifestValidationError):
-                    manifest_guard_reason = (
-                        "local_proposal_validation_failed:"
-                        f"{exc.reason}"
-                    )
-                    manifest_guard_details["manifest_validation"] = exc.details
-                else:
-                    manifest_guard_reason = (
-                        f"local_proposal_validation_failed:{type(exc).__name__}"
-                    )
+                manifest_guard_reason = f"local_proposal_validation_failed:{type(exc).__name__}"
                 log.warning(
                     "v2 observation local proposal validation failed day=%s connector_id=%s error=%s",
                     day_iso,
@@ -15877,35 +15621,27 @@ def _capture_local_v2_observation_scope(
         str(code): int(count)
         for code, count in dict(evidence.get("per_pollutant_counts") or {}).items()
     }
+    manifest_pollutant_counts = {
+        str(child.get("pollutant_code") or ""): int(child.get("source_row_count") or 0)
+        for child in list(manifest.get("child_manifests") or [])
+        if isinstance(child, Mapping)
+    }
     if selected_pollutants and (
         sorted(expected_pollutant_counts) != sorted(set(expected_pollutant_counts) & set(selected_pollutants))
         or not set(expected_pollutant_counts).issubset(set(selected_pollutants))
     ):
         raise ValueError("canonical proposal pollutant set escaped requested repair scope")
-    evidence_pollutants = list(evidence.get("pollutant_set") or [])
-    manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
-        manifest,
-        expected_source_row_count=len(source_rows),
-        expected_timeseries_row_counts=expected_counts,
-        expected_pollutant_counts=expected_pollutant_counts,
-        source_evidence_pollutant_set=evidence_pollutants,
-    )
-    if mismatches:
-        first_field = str(mismatches[0].get("field") or "manifest")
-        raise CanonicalConnectorManifestValidationError(
-            f"source_evidence_{first_field}_mismatch",
-            {
-                "expected_source_row_count": len(source_rows),
-                "expected_timeseries_count": len(expected_counts),
-                "expected_pollutant_counts": dict(sorted(expected_pollutant_counts.items())),
-                "source_evidence_pollutant_set": sorted(
-                    str(value).strip() for value in evidence_pollutants
-                    if str(value or "").strip()
-                ),
-                "manifest": manifest_summary,
-                "mismatches": mismatches[:25],
-            },
-        )
+    if (
+        _normalize_timeseries_row_counts(manifest.get("timeseries_row_counts"))
+        != expected_counts
+        or int(manifest.get("source_row_count") or 0) != len(source_rows)
+        or manifest_pollutant_counts != expected_pollutant_counts
+        or sorted(str(value) for value in list(manifest.get("pollutant_codes") or []))
+        != sorted(expected_pollutant_counts)
+        or sorted(str(value) for value in list(evidence.get("pollutant_set") or []))
+        != sorted(expected_pollutant_counts)
+    ):
+        raise ValueError("canonical connector manifest does not match source-derived evidence")
     object_paths = sorted(
         path for path in source_root.rglob("*") if path.is_file() and (
             not selected_pollutants

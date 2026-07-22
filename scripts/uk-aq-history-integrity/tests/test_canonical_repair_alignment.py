@@ -118,11 +118,27 @@ class CanonicalRepairAlignmentTest(unittest.TestCase):
             manifest = {
                 "history_version": "v2", "domain": "observations",
                 "day_utc": day, "connector_id": connector_id,
-                "source_row_count": 1, "timeseries_row_counts": {"700": 1},
+                "source_row_count": 1, "row_count": 1,
                 "pollutant_codes": ["pm25"],
+                "files": [{
+                    "key": f"{connector_prefix}/pollutant_code=pm25/part-00000.parquet",
+                    "row_count": 1,
+                    "pollutant_code": "pm25",
+                    "pollutant_codes": ["pm25"],
+                    "timeseries_row_counts": {"700": 1},
+                }],
                 "child_manifests": [
-                    {"pollutant_code": "pm25", "source_row_count": 1}
+                    {
+                        "pollutant_code": "pm25", "source_row_count": 1,
+                        "row_count": 1,
+                        "manifest_key": f"{connector_prefix}/pollutant_code=pm25/manifest.json",
+                    }
                 ],
+                "pollutant_manifests": [{
+                    "pollutant_code": "pm25", "source_row_count": 1,
+                    "row_count": 1,
+                    "manifest_key": f"{connector_prefix}/pollutant_code=pm25/manifest.json",
+                }],
             }
             (source_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             evidence_root = (
