@@ -8851,8 +8851,65 @@ function resolveCsvHeaderIndex(
 }
 
 function normalizeUkAirSourceLabel(value: string): string {
-  return value.trim().replace(/\s+/g, " ");
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
+
+type SosSourceLabelRegistryStatus = "mapped" | "ignore" | "review";
+type SosSourceLabelRegistryEntry = {
+  normalised_source_label: string;
+  status: SosSourceLabelRegistryStatus;
+  pollutant_code: string | null;
+  expected_uom: string | null;
+  raw_label_variants: string[];
+  observed_units: string[];
+  reviewed_at_utc: string | null;
+  review_notes: string | null;
+};
+type SosSourceLabelRegistrySnapshot = {
+  source_file: string;
+  sha256: string;
+  entries: Map<string, SosSourceLabelRegistryEntry>;
+};
+
+function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnapshot | null {
+  const sourceFile = optionalEnv("UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE");
+  if (!sourceFile) return null;
+  if (!fs.existsSync(sourceFile)) {
+    throw new Error(`sos_source_label_registry_file_missing path=${sourceFile}`);
+  }
+  const text = fs.readFileSync(sourceFile, "utf8");
+  const payload = JSON.parse(text) as { connector_id?: unknown; labels?: unknown };
+  if (Number(payload.connector_id) !== 1 || !Array.isArray(payload.labels)) {
+    throw new Error(`sos_source_label_registry_invalid path=${sourceFile}`);
+  }
+  const entries = new Map<string, SosSourceLabelRegistryEntry>();
+  for (const raw of payload.labels) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as SosSourceLabelRegistryEntry;
+    if (
+      !entry.normalised_source_label ||
+      !["mapped", "ignore", "review"].includes(entry.status)
+    ) {
+      throw new Error(`sos_source_label_registry_invalid_entry path=${sourceFile}`);
+    }
+    if (
+      (entry.status === "mapped" &&
+        !["pm25", "pm10", "no2", "o3"].includes(String(entry.pollutant_code || ""))) ||
+      (entry.status !== "mapped" && entry.pollutant_code !== null)
+    ) {
+      throw new Error(`sos_source_label_registry_invalid_decision path=${sourceFile}`);
+    }
+    entries.set(entry.normalised_source_label, entry);
+  }
+  return { source_file: sourceFile, sha256: sha256Hex(text), entries };
+}
+
+function isPossibleSupportedSosSourceLabel(label: string): boolean {
+  const compact = label.replace(/[^a-z0-9.]+/g, "");
+  return /pm2\.5|pm25|pm10|nitrogendioxide|no2|ozone|o3/.test(compact);
+}
+
+const SOS_SOURCE_LABEL_REGISTRY = loadSosSourceLabelRegistrySnapshot();
 
 export function normaliseConcentrationUnitForComparison(
   value: string | null | undefined,
@@ -8904,6 +8961,7 @@ export type UkAirFlatFileParseResult = {
   skipped_other_days: number;
   skipped_invalid_rows: number;
   skipped_unselected_pollutant_rows: number;
+  source_label_classifications: Array<Record<string, unknown>>;
   blocked_target_day_rows: number;
   blocked_target_day_row_samples: Record<string, unknown>[];
   skipped_ignored_properties: number;
@@ -8938,6 +8996,7 @@ export function parseUkAirFlatFileObservations(args: {
     skipped_other_days: 0,
     skipped_invalid_rows: 0,
     skipped_unselected_pollutant_rows: 0,
+    source_label_classifications: [],
     blocked_target_day_rows: 0,
     blocked_target_day_row_samples: [],
     skipped_ignored_properties: 0,
@@ -8956,11 +9015,27 @@ export function parseUkAirFlatFileObservations(args: {
     valueIndex: number;
     statusIndex: number;
     unitIndex: number;
+    sourceLabel: string;
+    normalisedSourceLabel: string;
     property: ObservedPropertyMapping;
     timeseries: SosSiteTimeseriesRef;
+    expectedUom: string;
+    units: Set<string>;
+    targetDayNonNullRowCount: number;
   };
   let columnBindings: ColumnBinding[] = [];
+  const mappedSelectedSourceLabelColumns: ColumnBinding[] = [];
   let unselectedPollutantValueIndexes: number[] = [];
+  type SkippedSourceLabelColumn = {
+    valueIndex: number;
+    sourceLabel: string;
+    normalisedSourceLabel: string;
+    classification: "ignore" | "review" | "unregistered" | "mapped_out_of_scope";
+    units: Set<string>;
+    targetDayNonNullRowCount: number;
+  };
+  let skippedSourceLabelColumns: SkippedSourceLabelColumn[] = [];
+  const allSkippedSourceLabelColumns: SkippedSourceLabelColumn[] = [];
 
   for (const [lineIndex, line] of lines.entries()) {
     if (!line.trim()) continue;
@@ -8971,9 +9046,33 @@ export function parseUkAirFlatFileObservations(args: {
     ) {
       columnBindings = [];
       unselectedPollutantValueIndexes = [];
+      skippedSourceLabelColumns = [];
       for (let valueIndex = 2; valueIndex < cells.length; valueIndex += 3) {
         const sourceLabel = normalizeUkAirSourceLabel(cells[valueIndex] || "");
         if (!sourceLabel) continue;
+        const registryEntry = SOS_SOURCE_LABEL_REGISTRY?.entries.get(sourceLabel);
+        const skipSourceLabel = (
+          classification: SkippedSourceLabelColumn["classification"],
+        ) => {
+          const skipped: SkippedSourceLabelColumn = {
+            valueIndex,
+            sourceLabel: String(cells[valueIndex] || "").trim(),
+            normalisedSourceLabel: sourceLabel,
+            classification,
+            units: new Set<string>(),
+            targetDayNonNullRowCount: 0,
+          };
+          skippedSourceLabelColumns.push(skipped);
+          allSkippedSourceLabelColumns.push(skipped);
+        };
+        if (registryEntry?.status === "ignore" || registryEntry?.status === "review") {
+          skipSourceLabel(registryEntry.status);
+          continue;
+        }
+        if (SOS_SOURCE_LABEL_REGISTRY && !registryEntry) {
+          skipSourceLabel("unregistered");
+          continue;
+        }
         const candidates = propertyMappingsByLabel.get(sourceLabel) || [];
         if (!candidates.length) {
           throw new Error(`unmapped_source_label connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
@@ -8987,6 +9086,9 @@ export function parseUkAirFlatFileObservations(args: {
         }
         const property = active[0];
         if (property.mapping_kind === "ignored") {
+          if (registryEntry?.status === "mapped") {
+            throw new Error(`sos_source_label_registry_mapping_inactive source_label=${JSON.stringify(sourceLabel)} mapping_kind=ignored`);
+          }
           result.skipped_ignored_properties += 1;
           continue;
         }
@@ -8998,10 +9100,17 @@ export function parseUkAirFlatFileObservations(args: {
           throw new Error(`invalid_observed_property_code source_label=${JSON.stringify(sourceLabel)} observed_property_code=${JSON.stringify(pollutantCode)}`);
         }
         if (
+          registryEntry?.status === "mapped" &&
+          registryEntry.pollutant_code !== pollutantCode
+        ) {
+          throw new Error(`sos_source_label_registry_mapping_mismatch source_label=${JSON.stringify(sourceLabel)} registry_pollutant_code=${registryEntry.pollutant_code} observed_property_code=${pollutantCode}`);
+        }
+        if (
           INTEGRITY_POLLUTANT_SCOPED_REPAIR &&
           !INTEGRITY_REPAIR_POLLUTANTS.has(pollutantCode)
         ) {
           unselectedPollutantValueIndexes.push(valueIndex);
+          skipSourceLabel("mapped_out_of_scope");
           continue;
         }
         if (property.mapping_kind === "meteorological") {
@@ -9017,17 +9126,30 @@ export function parseUkAirFlatFileObservations(args: {
         if (timeseries.length !== 1) {
           throw new Error(`ambiguous_timeseries_mapping site_ref=${args.siteRef} source_label=${JSON.stringify(sourceLabel)} observed_property_code=${pollutantCode} day_utc=${args.dayUtc} matches=${timeseries.length}`);
         }
-        columnBindings.push({
+        const binding: ColumnBinding = {
           valueIndex,
           statusIndex: valueIndex + 1,
           unitIndex: valueIndex + 2,
+          sourceLabel: String(cells[valueIndex] || "").trim(),
+          normalisedSourceLabel: sourceLabel,
           property,
           timeseries: timeseries[0],
-        });
+          expectedUom: String(
+            registryEntry?.expected_uom || property.source_uom || "",
+          ).trim(),
+          units: new Set<string>(),
+          targetDayNonNullRowCount: 0,
+        };
+        columnBindings.push(binding);
+        mappedSelectedSourceLabelColumns.push(binding);
       }
       continue;
     }
-    if (!columnBindings.length) continue;
+    if (
+      !columnBindings.length &&
+      !skippedSourceLabelColumns.length &&
+      !unselectedPollutantValueIndexes.length
+    ) continue;
 
     const sourceDay = parseUkAirCsvDay(cells[0] || "");
     if (!sourceDay) {
@@ -9075,11 +9197,20 @@ export function parseUkAirFlatFileObservations(args: {
         result.skipped_unselected_pollutant_rows += 1;
       }
     }
+    for (const skipped of skippedSourceLabelColumns) {
+      if (toFiniteNumber(cells[skipped.valueIndex]) !== null) {
+        skipped.targetDayNonNullRowCount += 1;
+        const unit = String(cells[skipped.valueIndex + 2] || "").trim();
+        if (unit) skipped.units.add(unit);
+      }
+    }
     for (const binding of columnBindings) {
       const value = toFiniteNumber(cells[binding.valueIndex]);
       if (value === null) continue;
       const unit = String(cells[binding.unitIndex] || "").trim();
-      const expectedUnit = String(binding.property.source_uom || "").trim();
+      binding.targetDayNonNullRowCount += 1;
+      if (unit) binding.units.add(unit);
+      const expectedUnit = binding.expectedUom;
       const normalisedUnit = normaliseConcentrationUnitForComparison(unit);
       const normalisedExpectedUnit = normaliseConcentrationUnitForComparison(
         expectedUnit,
@@ -9101,6 +9232,28 @@ export function parseUkAirFlatFileObservations(args: {
     }
   }
   result.units = Array.from(units).sort();
+  result.source_label_classifications = [
+    ...mappedSelectedSourceLabelColumns.map((column) => ({
+      source_label: column.sourceLabel,
+      normalised_source_label: column.normalisedSourceLabel,
+      classification: "mapped_selected",
+      site_ref: args.siteRef,
+      observed_units: Array.from(column.units).sort(),
+      target_day_non_null_row_count: column.targetDayNonNullRowCount,
+      possible_supported_pollutant_label: false,
+    })),
+    ...allSkippedSourceLabelColumns.map((column) => ({
+      source_label: column.sourceLabel,
+      normalised_source_label: column.normalisedSourceLabel,
+      classification: column.classification,
+      site_ref: args.siteRef,
+      observed_units: Array.from(column.units).sort(),
+      target_day_non_null_row_count: column.targetDayNonNullRowCount,
+      possible_supported_pollutant_label:
+        (column.classification === "review" || column.classification === "unregistered") &&
+        isPossibleSupportedSosSourceLabel(column.normalisedSourceLabel),
+    })),
+  ];
   return result;
 }
 
@@ -13943,6 +14096,7 @@ async function runSourceToAll(
           let flatFileSkippedInvalidRows = 0;
           let flatFileSkippedUnselectedPollutantRows = 0;
           let flatFileBlockedTargetDayRows = 0;
+          const flatFileSourceLabelClassifications: Array<Record<string, unknown>> = [];
           const flatFileBlockedTargetDayRowSamples: Record<string, unknown>[] = [];
           const flatFileUnits = new Set<string>();
           for (const siteRef of flatFileSiteRefs) {
@@ -13972,6 +14126,9 @@ async function runSourceToAll(
             flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
             flatFileSkippedUnselectedPollutantRows +=
               parsed.skipped_unselected_pollutant_rows;
+            flatFileSourceLabelClassifications.push(
+              ...parsed.source_label_classifications,
+            );
             flatFileBlockedTargetDayRows += parsed.blocked_target_day_rows;
             for (const sample of parsed.blocked_target_day_row_samples) {
               if (
@@ -13983,6 +14140,92 @@ async function runSourceToAll(
               flatFileBlockedTargetDayRowSamples.push(sample);
             }
             parsed.units.forEach((unit) => flatFileUnits.add(unit));
+          }
+          const sourceLabelClassificationSummary = new Map<string, {
+            classification: string;
+            normalised_source_label: string;
+            raw_label_variants: Set<string>;
+            site_refs: Set<string>;
+            observed_units: Set<string>;
+            target_day_non_null_row_count: number;
+            possible_supported_pollutant_label: boolean;
+          }>();
+          for (const entry of flatFileSourceLabelClassifications) {
+            const classification = String(entry.classification || "");
+            const normalised = String(entry.normalised_source_label || "");
+            const key = `${classification}|${normalised}`;
+            const summary = sourceLabelClassificationSummary.get(key) || {
+              classification,
+              normalised_source_label: normalised,
+              raw_label_variants: new Set<string>(),
+              site_refs: new Set<string>(),
+              observed_units: new Set<string>(),
+              target_day_non_null_row_count: 0,
+              possible_supported_pollutant_label: false,
+            };
+            if (entry.source_label) summary.raw_label_variants.add(String(entry.source_label));
+            if (entry.site_ref) summary.site_refs.add(String(entry.site_ref));
+            for (const unit of Array.isArray(entry.observed_units) ? entry.observed_units : []) {
+              summary.observed_units.add(String(unit));
+            }
+            summary.target_day_non_null_row_count += Number(entry.target_day_non_null_row_count || 0);
+            summary.possible_supported_pollutant_label ||= Boolean(entry.possible_supported_pollutant_label);
+            sourceLabelClassificationSummary.set(key, summary);
+          }
+          const sourceLabelClassifications = Array.from(sourceLabelClassificationSummary.values())
+            .map((entry) => ({
+              classification: entry.classification,
+              normalised_source_label: entry.normalised_source_label,
+              raw_label_variants: Array.from(entry.raw_label_variants).sort(),
+              site_count: entry.site_refs.size,
+              site_refs: Array.from(entry.site_refs).sort().slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT),
+              observed_units: Array.from(entry.observed_units).sort(),
+              target_day_non_null_row_count: entry.target_day_non_null_row_count,
+              possible_supported_pollutant_label: entry.possible_supported_pollutant_label,
+            }))
+            .sort((left, right) => `${left.classification}|${left.normalised_source_label}`.localeCompare(`${right.classification}|${right.normalised_source_label}`));
+          const sourceLabelClassificationCounts = Object.fromEntries(
+            ["mapped_selected", "mapped_out_of_scope", "ignore", "review", "unregistered"].map((classification) => [
+              classification,
+              sourceLabelClassifications.filter((entry) => entry.classification === classification).length,
+            ]),
+          );
+          const sourceLabelTargetDayRowCounts = Object.fromEntries(
+            ["mapped_selected", "mapped_out_of_scope", "ignore", "review", "unregistered"].map((classification) => [
+              classification,
+              sourceLabelClassifications
+                .filter((entry) => entry.classification === classification)
+                .reduce((total, entry) => total + Number(entry.target_day_non_null_row_count || 0), 0),
+            ]),
+          );
+          const sourceLabelSummary = {
+            mapped_selected_label_count: sourceLabelClassificationCounts.mapped_selected,
+            mapped_selected_target_day_row_count: sourceLabelTargetDayRowCounts.mapped_selected,
+            mapped_out_of_scope_label_count: sourceLabelClassificationCounts.mapped_out_of_scope,
+            mapped_out_of_scope_target_day_row_count: sourceLabelTargetDayRowCounts.mapped_out_of_scope,
+            known_ignored_source_label_count: sourceLabelClassificationCounts.ignore,
+            known_ignored_target_day_row_count: sourceLabelTargetDayRowCounts.ignore,
+            review_source_label_count: sourceLabelClassificationCounts.review,
+            review_target_day_row_count: sourceLabelTargetDayRowCounts.review,
+            unregistered_source_label_count: sourceLabelClassificationCounts.unregistered,
+            unregistered_target_day_row_count: sourceLabelTargetDayRowCounts.unregistered,
+          };
+          const reviewSourceLabels = sourceLabelClassifications.filter((entry) =>
+            entry.classification === "review" || entry.classification === "unregistered"
+          );
+          if (reviewSourceLabels.length) {
+            logStructured("warning", "source_to_r2_sos_source_labels_require_review", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: "sos",
+              review_source_label_count: reviewSourceLabels.length,
+              review_target_day_row_count: reviewSourceLabels.reduce(
+                (total, entry) => total + Number(entry.target_day_non_null_row_count || 0),
+                0,
+              ),
+              samples: reviewSourceLabels.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT),
+            });
           }
           const flatRowsByTimeseries = new Map<number, SourceObservationRow[]>();
           for (const row of flatFileRows) {
@@ -14024,6 +14267,8 @@ async function runSourceToAll(
             skipped_invalid_rows: flatFileSkippedInvalidRows,
             skipped_unselected_pollutant_rows:
               flatFileSkippedUnselectedPollutantRows,
+            source_label_classifications: sourceLabelClassifications,
+            source_label_summary: sourceLabelSummary,
             units: Array.from(flatFileUnits).sort(),
           });
           let totalRawPoints = 0;
@@ -14127,6 +14372,17 @@ async function runSourceToAll(
             flatFileSkippedInvalidRows;
           sourceCheckpointJson.total_skipped_unselected_pollutant_rows =
             flatFileSkippedUnselectedPollutantRows;
+          sourceCheckpointJson.sos_source_label_registry_file =
+            SOS_SOURCE_LABEL_REGISTRY?.source_file || null;
+          sourceCheckpointJson.sos_source_label_registry_sha256 =
+            SOS_SOURCE_LABEL_REGISTRY?.sha256 || null;
+          sourceCheckpointJson.sos_source_label_classification_counts =
+            sourceLabelClassificationCounts;
+          sourceCheckpointJson.sos_source_label_target_day_row_counts =
+            sourceLabelTargetDayRowCounts;
+          sourceCheckpointJson.sos_source_label_summary = sourceLabelSummary;
+          sourceCheckpointJson.sos_source_label_classifications =
+            sourceLabelClassifications;
           sourceCheckpointJson.source_adapter_blocked_row_count =
             flatFileBlockedTargetDayRows;
           sourceCheckpointJson.source_adapter_blocked_row_samples =
@@ -14260,6 +14516,18 @@ async function runSourceToAll(
             ).sort(),
             source_file_identities: sourceFileIdentityList,
             source_file_identities_sha256: sha256Hex(sourceFileIdentitiesJson),
+            source_label_registry_snapshot_file:
+              sourceCheckpointJson.sos_source_label_registry_file || null,
+            source_label_registry_snapshot_sha256:
+              sourceCheckpointJson.sos_source_label_registry_sha256 || null,
+            source_label_classification_counts:
+              sourceCheckpointJson.sos_source_label_classification_counts || {},
+            source_label_target_day_row_counts:
+              sourceCheckpointJson.sos_source_label_target_day_row_counts || {},
+            source_label_summary:
+              sourceCheckpointJson.sos_source_label_summary || {},
+            source_label_classifications:
+              sourceCheckpointJson.sos_source_label_classifications || [],
             canonical_rows_file: "obs_history_rows.json",
             canonical_rows_sha256: sha256Hex(rowsJson),
             canonical_rows_bytes: Buffer.byteLength(rowsJson, "utf8"),

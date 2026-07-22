@@ -61,6 +61,12 @@ Source acquisition must happen before comparison. When the required historical s
 
 Source files must still be enumerated and identity-pinned sufficiently to prove that all rows for the selected pollutants have been considered. Rows for other observed properties may be ignored after parsing and must not become selected-row blocking evidence.
 
+### UK-AIR CSV source-label registry
+
+The Integrity SQLite database owns the approval registry for UK-AIR annual CSV headings. A heading is `mapped`, `ignore` or `review`: only explicitly approved `mapped` labels may target `pm25`, `pm10`, `no2` or observation-only `o3`; `ignore` labels are known non-target fields; newly discovered labels are `review` and are skipped with an aggregated warning. Python discovers cached headings, updates the registry and writes an immutable per-run snapshot for the source-to-R2 worker. The worker never opens the Integrity SQLite database.
+
+Review and ignored labels do not block selected-pollutant repair. Approved mapped labels remain fail-closed for inactive or ambiguous mappings, missing timeseries, invalid rows and incompatible units. Operators use `scripts/uk-aq-history-integrity/bin/manage_uk_air_source_labels.py` to list reviews and set an approved `ignore` or `mapped` decision. Ozone registry mapping does not add ozone to AQI rebuilds.
+
 Integrity detection and repair planning do not use live R2 as a comparison source.
 
 ## Current flow
