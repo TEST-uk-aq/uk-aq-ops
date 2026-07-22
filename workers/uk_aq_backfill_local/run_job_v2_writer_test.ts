@@ -138,6 +138,62 @@ Deno.test("UK-AIR CSV parses GMT hour-ending rows into UTC hour starts", () => {
   assertEquals(parsed.units, ["ugm-3"]);
 });
 
+Deno.test("UK-AIR CSV time-basis declaration accepts notes and warns without blocking", () => {
+  const sourceLabel = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const baseArgs = {
+    dayUtc: "2026-05-17",
+    siteRef: "HORS",
+    sourceFile: "HORS_2025.csv",
+    mappings: [{
+      site_ref: "HORS", uk_air_ref: "HORS", pollutant_code: "pm10" as const,
+      station_id: 1, timeseries_id: 66, station_ref: "station-hors",
+      timeseries_ref: "timeseries-hors", valid_from_day_utc: null,
+      valid_to_day_utc: null,
+    }],
+    propertyMappings: [propertyMapping(sourceLabel, "pm10")],
+  };
+  const csv = (declaration: string) => [
+    declaration,
+    `Date,time,"${sourceLabel}",status,unit`,
+    "17-05-2026,01:00,10,R,ugm-3",
+  ].join("\n");
+
+  assertEquals(
+    parseUkAirFlatFileObservations({ ...baseArgs, csvText: csv("All Data GMT hour ending") }).rows.length,
+    1,
+  );
+  assertEquals(
+    parseUkAirFlatFileObservations({
+      ...baseArgs,
+      csvText: csv(
+        "All Data GMT hour ending  NB: Upto 21/07/2025 PM10 were measured with a BAM 1020 heated",
+      ),
+    }).rows.length,
+    1,
+  );
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: unknown[]) => warnings.push(values.map(String).join(" "));
+  try {
+    assertEquals(
+      parseUkAirFlatFileObservations({
+        ...baseArgs,
+        csvText: csv("Station metadata without the time-basis declaration"),
+      }).rows.length,
+      1,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assertEquals(warnings.length, 1);
+  const warning = JSON.parse(warnings[0]);
+  assertEquals(warning.event, "sos_uk_air_csv_time_basis_warning");
+  assertEquals(warning.site_ref, "HORS");
+  assertEquals(warning.source_file, "HORS_2025.csv");
+  assertEquals(warning.expected_phrase, "All Data GMT hour ending");
+});
+
 Deno.test("UK-AIR CSV mapping switches timeseries at the EA8 validity boundary", () => {
   const mappings = [
     {
