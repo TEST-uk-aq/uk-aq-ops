@@ -195,6 +195,90 @@ Deno.test("UK-AIR CSV repair fails closed for ambiguous mappings", () => {
   if (!message.includes("matches=2")) throw new Error(`Expected ambiguous mapping failure, got: ${message}`);
 });
 
+Deno.test("UK-AIR CSV skips selected rows when no authoritative timeseries binding exists", () => {
+  const sourceLabel = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const normalisedSourceLabel = sourceLabel.toLowerCase();
+  const parsed = parseUkAirFlatFileObservations({
+    dayUtc: "2026-07-18",
+    siteRef: "HG4",
+    csvText: [
+      "Station metadata",
+      "All Data GMT hour ending",
+      `Date,time,"${sourceLabel}",status,unit`,
+      "18-07-2026,01:00,10,R,ugm-3",
+      "18-07-2026,02:00,11,R,ugm-3",
+      "19-07-2026,01:00,12,R,ugm-3",
+    ].join("\n"),
+    mappings: [],
+    propertyMappings: [propertyMapping(sourceLabel, "pm10")],
+    registryEntries: new Map([[normalisedSourceLabel, {
+      normalised_source_label: normalisedSourceLabel,
+      status: "mapped",
+      pollutant_code: "pm10",
+      expected_uom: "ug/m3",
+      raw_label_variants: [sourceLabel],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-18T00:00:00Z",
+      review_notes: null,
+    }]]),
+  });
+
+  assertEquals(parsed.rows, []);
+  assertEquals(parsed.mapped_records, 0);
+  assertEquals(parsed.missing_binding_groups, 1);
+  assertEquals(parsed.missing_binding_rows, 2);
+  assertEquals(parsed.source_label_classifications, [{
+    source_label: sourceLabel,
+    normalised_source_label: normalisedSourceLabel,
+    classification: "no_authoritative_timeseries_binding",
+    reason: "no_authoritative_timeseries_binding",
+    site_ref: "HG4",
+    pollutant_code: "pm10",
+    observed_units: ["ugm-3"],
+    target_day_non_null_row_count: 2,
+    target_day_blank_unit_row_count: 0,
+    header_section_index: 1,
+    section_normalised_units: ["ug/m3"],
+    expected_unit: "ug/m3",
+    expected_normalised_unit: "ug/m3",
+    possible_supported_pollutant_label: false,
+  }]);
+});
+
+Deno.test("UK-AIR CSV registry and core mapping contradiction remains fail closed", () => {
+  const sourceLabel = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const normalisedSourceLabel = sourceLabel.toLowerCase();
+  let message = "";
+  try {
+    parseUkAirFlatFileObservations({
+      dayUtc: "2026-07-18",
+      siteRef: "HG4",
+      csvText: [
+        "All Data GMT hour ending",
+        `Date,time,"${sourceLabel}",status,unit`,
+        "18-07-2026,01:00,10,R,ugm-3",
+      ].join("\n"),
+      mappings: [],
+      propertyMappings: [propertyMapping(sourceLabel, "no2")],
+      registryEntries: new Map([[normalisedSourceLabel, {
+        normalised_source_label: normalisedSourceLabel,
+        status: "mapped",
+        pollutant_code: "pm10",
+        expected_uom: "ug/m3",
+        raw_label_variants: [sourceLabel],
+        observed_units: ["ugm-3"],
+        reviewed_at_utc: "2026-07-18T00:00:00Z",
+        review_notes: null,
+      }]]),
+    });
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  if (!message.includes("sos_source_label_registry_mapping_mismatch")) {
+    throw new Error(`Expected registry/core mapping contradiction, got: ${message}`);
+  }
+});
+
 Deno.test("UK-AIR CSV parses every mapped pollutant triplet", () => {
   const labels = [
     ["Ozone", "o3"],

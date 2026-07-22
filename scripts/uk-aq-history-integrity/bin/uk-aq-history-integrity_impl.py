@@ -13461,6 +13461,28 @@ def _load_complete_connector_day_source_evidence(
         or sorted(per_pollutant) != sorted(str(value) for value in list(evidence.get("pollutant_set") or []))
     ):
         raise ValueError("complete connector-day detector source evidence counts are invalid")
+    missing_binding_groups = int(evidence.get("missing_binding_groups") or 0)
+    missing_binding_rows = int(evidence.get("missing_binding_rows") or 0)
+    if missing_binding_groups or missing_binding_rows:
+        classification_counts = dict(
+            evidence.get("source_label_classification_counts") or {}
+        )
+        classification_row_counts = dict(
+            evidence.get("source_label_target_day_row_counts") or {}
+        )
+        if (
+            missing_binding_groups <= 0
+            or missing_binding_rows <= 0
+            or int(evidence.get("source_records_examined") or -1) < 0
+            or int(evidence.get("canonical_rows_mapped") or -1) != len(canonical_rows)
+            or int(classification_counts.get("no_authoritative_timeseries_binding") or 0)
+            != missing_binding_groups
+            or int(classification_row_counts.get("no_authoritative_timeseries_binding") or 0)
+            != missing_binding_rows
+        ):
+            raise ValueError(
+                "complete connector-day missing-binding evidence counts are invalid"
+            )
     evidence["source_file_identities"] = normalized_identities
     return evidence, canonical_rows
 
@@ -13554,6 +13576,14 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "source_adapter",
         "duplicate_canonical_row_count",
         "blocked_row_count",
+        "source_records_examined",
+        "canonical_rows_mapped",
+        "missing_binding_groups",
+        "missing_binding_rows",
+        "source_label_classification_counts",
+        "source_label_target_day_row_counts",
+        "source_label_summary",
+        "source_label_classifications",
     )
     mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
     if mismatched:
@@ -14087,6 +14117,12 @@ def run_v2_gap_backfills(
             },
             "source_pollutant_codes": sorted({str(code) for code in source_pollutant_codes}),
             "source_mapped_rows": int(combined.get("source_mapped_rows") or 0),
+            "source_missing_binding_groups": int(
+                detector_evidence.get("missing_binding_groups") or 0
+            ),
+            "source_missing_binding_rows": int(
+                detector_evidence.get("missing_binding_rows") or 0
+            ),
             "source_rows_from_counts": source_rows_from_counts,
             "expected_counts_source": expected_counts_source,
             "expected_source_rows_for_day": expected_min_manifest_rows,
