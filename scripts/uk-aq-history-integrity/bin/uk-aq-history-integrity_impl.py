@@ -2265,14 +2265,15 @@ def _uk_air_source_label_seed_decisions(conn: sqlite3.Connection) -> dict[str, t
         mapped = [row for row in active if str(row[3] or "") == "raw_observed_property" and str(row[2] or "").lower() in {"pm25", "pm10", "no2", "o3"}]
         if len(mapped) == 1:
             row = mapped[0]
-            decisions[key] = ("mapped", str(row[2]).lower(), str(row[1] or "") or None)
+            decisions[key] = ("mapped", str(row[2]).lower(), str(row[1] or "") or "ug/m3")
             continue
         # Multiple supported mappings are not safe to turn into an automatic
         # ignore decision.  Leave them for explicit operator review instead.
         if mapped:
             continue
-        ignored = [row for row in active if str(row[3] or "") == "ignored" or str(row[2] or "").strip()]
-        if ignored:
+        ignored = [row for row in active if str(row[3] or "") == "ignored"]
+        unsupported = [row for row in active if str(row[3] or "") == "raw_observed_property" and str(row[2] or "").strip()]
+        if len(active) == 1 and (ignored or unsupported):
             decisions[key] = ("ignore", None, None)
     return decisions
 
@@ -2289,6 +2290,7 @@ def refresh_uk_air_source_label_registry(
     now_iso = utc_now_iso()
     seeds = _uk_air_source_label_seed_decisions(conn)
     discovered: dict[str, dict[str, Any]] = {}
+    scan_errors: list[dict[str, str]] = []
     for csv_path in sorted(cache_root.glob("site_ref=*/year=*/*.csv")):
         site_ref = csv_path.stem.rsplit("_", 1)[0].upper()
         try:
@@ -2312,8 +2314,10 @@ def refresh_uk_air_source_label_registry(
                     for index, key, _raw in bindings:
                         if index < len(cells) and _sos_to_finite_number(cells[index]) is not None and index + 2 < len(cells) and cells[index + 2]:
                             discovered[key]["units"].add(cells[index + 2])
-        except OSError:
-            continue
+        except (OSError, UnicodeError, csv.Error) as exc:
+            scan_errors.append({"path": str(csv_path), "exception": type(exc).__name__, "message": str(exc)})
+    if scan_errors:
+        raise RuntimeError(f"UK-AIR registry scan failed for cached source files: {json.dumps(scan_errors, sort_keys=True)}")
     for key, entry in discovered.items():
         existing = conn.execute(
             "SELECT status, pollutant_code, expected_uom, first_seen_at_utc, first_seen_site_ref, reviewed_at_utc, review_notes, raw_label_variants_json, observed_units_json FROM uk_air_csv_source_labels WHERE connector_id=? AND normalised_source_label=?",
@@ -2333,13 +2337,17 @@ def refresh_uk_air_source_label_registry(
             continue
         prior_variants = set(json.loads(existing[7] or "[]"))
         prior_units = set(json.loads(existing[8] or "[]"))
+        seeded = seeds.get(key)
+        expected_uom = existing[2]
+        if existing[0] == "mapped" and not expected_uom and not existing[5] and seeded and seeded[0] == "mapped" and seeded[1] == existing[1]:
+            expected_uom = seeded[2]
         conn.execute(
-            """UPDATE uk_air_csv_source_labels SET last_seen_at_utc=?, last_seen_site_ref=?, raw_label_variants_json=?, observed_units_json=?
+            """UPDATE uk_air_csv_source_labels SET last_seen_at_utc=?, last_seen_site_ref=?, expected_uom=?, raw_label_variants_json=?, observed_units_json=?
                WHERE connector_id=? AND normalised_source_label=?""",
-            (now_iso, last_site, json.dumps(sorted(prior_variants | set(variants))), json.dumps(sorted(prior_units | set(units))), connector_id, key),
+            (now_iso, last_site, expected_uom, json.dumps(sorted(prior_variants | set(variants))), json.dumps(sorted(prior_units | set(units))), connector_id, key),
         )
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM uk_air_csv_source_labels WHERE connector_id=? GROUP BY status", (connector_id,)).fetchall())
-    return {"discovered_labels": len(discovered), "mapped_labels": int(counts.get("mapped", 0)), "ignored_labels": int(counts.get("ignore", 0)), "review_labels": int(counts.get("review", 0))}
+    return {"discovered_labels": len(discovered), "mapped_labels": int(counts.get("mapped", 0)), "ignored_labels": int(counts.get("ignore", 0)), "review_labels": int(counts.get("review", 0)), "scan_errors": scan_errors}
 
 
 def write_uk_air_source_label_registry_snapshot(
@@ -2353,10 +2361,10 @@ def write_uk_air_source_label_registry_snapshot(
     ).fetchall()
     labels = [{"source_label": row[0], "normalised_source_label": row[1], "status": row[2], "pollutant_code": row[3], "expected_uom": row[4], "raw_label_variants": json.loads(row[5] or "[]"), "observed_units": json.loads(row[6] or "[]"), "reviewed_at_utc": row[7], "review_notes": row[8]} for row in rows]
     payload: dict[str, Any] = {"schema_version": 1, "connector_id": connector_id, "generated_at_utc": utc_now_iso(), "inventory": inventory, "labels": labels}
-    payload["registry_sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    payload["registry_content_sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return {"path": str(snapshot_path), "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(), "inventory": inventory, "review_labels": [entry["normalised_source_label"] for entry in labels if entry["status"] == "review"]}
+    return {"path": str(snapshot_path), "registry_file_sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(), "registry_content_sha256": payload["registry_content_sha256"], "inventory": inventory, "review_labels": [entry["normalised_source_label"] for entry in labels if entry["status"] == "review"]}
 
 
 def _uk_air_normalize_pollutant_code(value: Any) -> str | None:
@@ -13742,18 +13750,21 @@ def run_v2_gap_backfills(
             if run_state is not None
             else backfill_log_dir / "_integrity_proposal" / f"v2_run_{run_id}"
         )
-        registry_root = (
-            Path(str(run_state["run_root"])) / "sos-source-label-registry"
-            if run_state is not None
-            else stage_root / "sos-source-label-registry"
-        )
-        registry_snapshot = write_uk_air_source_label_registry_snapshot(
-            conn=conn,
-            connector_id=connector_id,
-            cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
-            snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
-        )
-        if run_state is not None:
+        sos_connector_id = int(str(env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") or "1"))
+        registry_snapshot: dict[str, Any] | None = None
+        if connector_id == sos_connector_id:
+            registry_root = (
+                Path(str(run_state["run_root"])) / "sos-source-label-registry"
+                if run_state is not None
+                else stage_root / "sos-source-label-registry"
+            )
+            registry_snapshot = write_uk_air_source_label_registry_snapshot(
+                conn=conn,
+                connector_id=connector_id,
+                cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
+                snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
+            )
+        if run_state is not None and registry_snapshot is not None:
             run_state.setdefault("sos_source_label_registry_snapshots", {})[
                 f"{day_iso}/connector_id={connector_id}"
             ] = registry_snapshot
@@ -13787,7 +13798,7 @@ def run_v2_gap_backfills(
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                     "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
                     "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
-                    "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"],
+                    **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
                 },
                 complete_connector_day=True,
                 repair_pollutants=repair_pollutants,
@@ -13857,7 +13868,7 @@ def run_v2_gap_backfills(
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                 "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
-                "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"],
+                **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
             }
             bf = run_narrow_backfill(
                 wrapper_path=resolve_integrity_backfill_wrapper(),

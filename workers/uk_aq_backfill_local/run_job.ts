@@ -8867,20 +8867,42 @@ type SosSourceLabelRegistryEntry = {
 };
 type SosSourceLabelRegistrySnapshot = {
   source_file: string;
-  sha256: string;
+  file_sha256: string;
+  content_sha256: string;
   entries: Map<string, SosSourceLabelRegistryEntry>;
 };
 
-function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnapshot | null {
+function canonicalRegistryJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalRegistryJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalRegistryJson(record[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+let sosSourceLabelRegistrySnapshot: SosSourceLabelRegistrySnapshot | null | undefined;
+
+export function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnapshot | null {
+  if (sosSourceLabelRegistrySnapshot !== undefined) return sosSourceLabelRegistrySnapshot;
   const sourceFile = optionalEnv("UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE");
-  if (!sourceFile) return null;
+  if (!sourceFile) return sosSourceLabelRegistrySnapshot = null;
   if (!fs.existsSync(sourceFile)) {
     throw new Error(`sos_source_label_registry_file_missing path=${sourceFile}`);
   }
   const text = fs.readFileSync(sourceFile, "utf8");
-  const payload = JSON.parse(text) as { connector_id?: unknown; labels?: unknown };
-  if (Number(payload.connector_id) !== 1 || !Array.isArray(payload.labels)) {
+  const payload = JSON.parse(text) as Record<string, unknown>;
+  if (Number(payload.schema_version) !== 1 || Number(payload.connector_id) !== 1 || !Array.isArray(payload.labels)) {
     throw new Error(`sos_source_label_registry_invalid path=${sourceFile}`);
+  }
+  const declaredContentHash = String(payload.registry_content_sha256 || "");
+  const contentPayload = { ...payload };
+  delete contentPayload.registry_content_sha256;
+  if (!/^[a-f0-9]{64}$/.test(declaredContentHash) ||
+    sha256Hex(canonicalRegistryJson(contentPayload)) !== declaredContentHash) {
+    throw new Error(`sos_source_label_registry_content_hash_invalid path=${sourceFile}`);
   }
   const entries = new Map<string, SosSourceLabelRegistryEntry>();
   for (const raw of payload.labels) {
@@ -8892,24 +8914,34 @@ function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnapshot | 
     ) {
       throw new Error(`sos_source_label_registry_invalid_entry path=${sourceFile}`);
     }
+    if (!Array.isArray(entry.raw_label_variants) || !Array.isArray(entry.observed_units) ||
+      (entry.reviewed_at_utc !== null && typeof entry.reviewed_at_utc !== "string") ||
+      (entry.review_notes !== null && typeof entry.review_notes !== "string") ||
+      entries.has(entry.normalised_source_label)) {
+      throw new Error(`sos_source_label_registry_invalid_entry path=${sourceFile}`);
+    }
     if (
       (entry.status === "mapped" &&
-        !["pm25", "pm10", "no2", "o3"].includes(String(entry.pollutant_code || ""))) ||
+        (!['pm25', 'pm10', 'no2', 'o3'].includes(String(entry.pollutant_code || "")) ||
+          !String(entry.expected_uom || "").trim())) ||
       (entry.status !== "mapped" && entry.pollutant_code !== null)
     ) {
       throw new Error(`sos_source_label_registry_invalid_decision path=${sourceFile}`);
     }
     entries.set(entry.normalised_source_label, entry);
   }
-  return { source_file: sourceFile, sha256: sha256Hex(text), entries };
+  return sosSourceLabelRegistrySnapshot = {
+    source_file: sourceFile,
+    file_sha256: sha256Hex(text),
+    content_sha256: declaredContentHash,
+    entries,
+  };
 }
 
 function isPossibleSupportedSosSourceLabel(label: string): boolean {
   const compact = label.replace(/[^a-z0-9.]+/g, "");
   return /pm2\.5|pm25|pm10|nitrogendioxide|no2|ozone|o3/.test(compact);
 }
-
-const SOS_SOURCE_LABEL_REGISTRY = loadSosSourceLabelRegistrySnapshot();
 
 export function normaliseConcentrationUnitForComparison(
   value: string | null | undefined,
@@ -8920,6 +8952,7 @@ export function normaliseConcentrationUnitForComparison(
     .replace(/[µμ]/g, "u")
     .replace(/³/g, "3")
     .replace(/[−–]/g, "-")
+    .replace(/\([^)]*\)$/g, "")
     .replace(/\s+/g, "");
   const aliases = new Map<string, string>([
     ["ug/m3", "ug/m3"],
@@ -8975,6 +9008,8 @@ export function parseUkAirFlatFileObservations(args: {
   mappings: SosSiteTimeseriesRef[];
   propertyMappings: ObservedPropertyMapping[];
 }): UkAirFlatFileParseResult {
+  // This is intentionally lazy: non-SOS adapters never read an SOS snapshot.
+  const registry = loadSosSourceLabelRegistrySnapshot();
   const lines = args.csvText.split(/\r?\n/);
   if (!lines.some((line) => line.trim().toLowerCase() === "all data gmt hour ending")) {
     throw new Error(`UK-AIR CSV ${args.siteRef} does not declare All Data GMT hour ending`);
@@ -9020,8 +9055,10 @@ export function parseUkAirFlatFileObservations(args: {
     property: ObservedPropertyMapping;
     timeseries: SosSiteTimeseriesRef;
     expectedUom: string;
+    decisionSource: "integrity_registry" | "integrity_registry_and_core" | "core_mapping";
     units: Set<string>;
     targetDayNonNullRowCount: number;
+    pendingRows: Array<{ observedAt: string; value: number; status: string | null; unit: string }>;
   };
   let columnBindings: ColumnBinding[] = [];
   const mappedSelectedSourceLabelColumns: ColumnBinding[] = [];
@@ -9050,7 +9087,7 @@ export function parseUkAirFlatFileObservations(args: {
       for (let valueIndex = 2; valueIndex < cells.length; valueIndex += 3) {
         const sourceLabel = normalizeUkAirSourceLabel(cells[valueIndex] || "");
         if (!sourceLabel) continue;
-        const registryEntry = SOS_SOURCE_LABEL_REGISTRY?.entries.get(sourceLabel);
+        const registryEntry = registry?.entries.get(sourceLabel);
         const skipSourceLabel = (
           classification: SkippedSourceLabelColumn["classification"],
         ) => {
@@ -9069,41 +9106,59 @@ export function parseUkAirFlatFileObservations(args: {
           skipSourceLabel(registryEntry.status);
           continue;
         }
-        if (SOS_SOURCE_LABEL_REGISTRY && !registryEntry) {
+        if (registry && !registryEntry) {
           skipSourceLabel("unregistered");
           continue;
         }
         const candidates = propertyMappingsByLabel.get(sourceLabel) || [];
-        if (!candidates.length) {
-          throw new Error(`unmapped_source_label connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
         const active = candidates.filter((mapping) => mapping.is_active);
-        if (!active.length) {
-          throw new Error(`source_label_inactive connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        if (active.length !== 1) {
-          throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
-        }
-        const property = active[0];
-        if (property.mapping_kind === "ignored") {
-          if (registryEntry?.status === "mapped") {
-            throw new Error(`sos_source_label_registry_mapping_inactive source_label=${JSON.stringify(sourceLabel)} mapping_kind=ignored`);
+        let property: ObservedPropertyMapping;
+        let pollutantCode: string;
+        let decisionSource: "integrity_registry" | "integrity_registry_and_core" | "core_mapping";
+        if (registryEntry?.status === "mapped") {
+          pollutantCode = String(registryEntry.pollutant_code || "");
+          if (!['pm25', 'pm10', 'no2', 'o3'].includes(pollutantCode) || !registryEntry.expected_uom?.trim()) {
+            throw new Error(`sos_source_label_registry_invalid_mapped_decision source_label=${JSON.stringify(sourceLabel)}`);
           }
-          result.skipped_ignored_properties += 1;
-          continue;
+          if (candidates.length) {
+            if (active.length !== 1) {
+              throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
+            }
+            property = active[0];
+            if (property.mapping_kind !== "raw_observed_property" ||
+              String(property.observed_property_code || "").trim() !== pollutantCode) {
+              throw new Error(`sos_source_label_registry_mapping_mismatch source_label=${JSON.stringify(sourceLabel)} registry_pollutant_code=${pollutantCode} observed_property_code=${property.observed_property_code} mapping_kind=${property.mapping_kind}`);
+            }
+            decisionSource = "integrity_registry_and_core";
+          } else {
+            property = {
+              connector_id: 1, source_label: String(cells[valueIndex] || "").trim(),
+              source_uom: registryEntry.expected_uom, observed_property_id: null,
+              observed_property_code: pollutantCode, mapping_kind: "raw_observed_property",
+              is_aqi_eligible: ['pm25', 'pm10', 'no2'].includes(pollutantCode), is_active: true,
+            };
+            decisionSource = "integrity_registry";
+          }
+        } else {
+          if (!candidates.length) {
+            throw new Error(`unmapped_source_label connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
+          }
+          if (active.length !== 1) {
+            throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
+          }
+          property = active[0];
+          if (property.mapping_kind === "ignored") {
+            result.skipped_ignored_properties += 1;
+            continue;
+          }
+          if (property.mapping_kind !== "raw_observed_property") {
+            throw new Error(`unsupported_mapping_kind connector_id=1 source_label=${JSON.stringify(sourceLabel)} mapping_kind=${property.mapping_kind} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
+          }
+          pollutantCode = String(property.observed_property_code || "").trim();
+          decisionSource = "core_mapping";
         }
-        if (property.mapping_kind === "unknown") {
-          throw new Error(`source_label_unknown connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        const pollutantCode = String(property.observed_property_code || "").trim();
         if (!/^[a-z0-9_]+$/.test(pollutantCode)) {
           throw new Error(`invalid_observed_property_code source_label=${JSON.stringify(sourceLabel)} observed_property_code=${JSON.stringify(pollutantCode)}`);
-        }
-        if (
-          registryEntry?.status === "mapped" &&
-          registryEntry.pollutant_code !== pollutantCode
-        ) {
-          throw new Error(`sos_source_label_registry_mapping_mismatch source_label=${JSON.stringify(sourceLabel)} registry_pollutant_code=${registryEntry.pollutant_code} observed_property_code=${pollutantCode}`);
         }
         if (
           INTEGRITY_POLLUTANT_SCOPED_REPAIR &&
@@ -9112,12 +9167,6 @@ export function parseUkAirFlatFileObservations(args: {
           unselectedPollutantValueIndexes.push(valueIndex);
           skipSourceLabel("mapped_out_of_scope");
           continue;
-        }
-        if (property.mapping_kind === "meteorological") {
-          throw new Error(`unsupported_meteorological_mapping connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        if (property.mapping_kind !== "raw_observed_property") {
-          throw new Error(`unsupported_mapping_kind connector_id=1 source_label=${JSON.stringify(sourceLabel)} mapping_kind=${property.mapping_kind} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
         }
         const timeseries = mappingsByPollutant.get(pollutantCode) || [];
         if (!timeseries.length) {
@@ -9137,8 +9186,10 @@ export function parseUkAirFlatFileObservations(args: {
           expectedUom: String(
             registryEntry?.expected_uom || property.source_uom || "",
           ).trim(),
+          decisionSource,
           units: new Set<string>(),
           targetDayNonNullRowCount: 0,
+          pendingRows: [],
         };
         columnBindings.push(binding);
         mappedSelectedSourceLabelColumns.push(binding);
@@ -9210,23 +9261,28 @@ export function parseUkAirFlatFileObservations(args: {
       const unit = String(cells[binding.unitIndex] || "").trim();
       binding.targetDayNonNullRowCount += 1;
       if (unit) binding.units.add(unit);
-      const expectedUnit = binding.expectedUom;
-      const normalisedUnit = normaliseConcentrationUnitForComparison(unit);
-      const normalisedExpectedUnit = normaliseConcentrationUnitForComparison(
-        expectedUnit,
-      );
-      if (expectedUnit && normalisedUnit !== normalisedExpectedUnit) {
-        throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.property.source_label)} observed_property_code=${binding.property.observed_property_code} source_uom=${JSON.stringify(expectedUnit)} csv_uom=${JSON.stringify(unit)} normalised_source_uom=${JSON.stringify(normalisedExpectedUnit)} normalised_csv_uom=${JSON.stringify(normalisedUnit)}`);
-      }
       if (unit) units.add(unit);
+      binding.pendingRows.push({ observedAt, value, unit, status: String(cells[binding.statusIndex] || "").trim() || null });
+    }
+  }
+  for (const binding of mappedSelectedSourceLabelColumns) {
+    const expectedUnit = binding.expectedUom;
+    const normalisedExpectedUnit = normaliseConcentrationUnitForComparison(expectedUnit);
+    const observedUnits = Array.from(binding.units).sort();
+    const normalisedUnits = observedUnits.map(normaliseConcentrationUnitForComparison);
+    if (!expectedUnit || !normalisedExpectedUnit || !observedUnits.length ||
+      normalisedUnits.some((unit) => unit !== normalisedExpectedUnit)) {
+      throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.sourceLabel)} observed_property_code=${binding.property.observed_property_code} expected_raw_unit=${JSON.stringify(expectedUnit)} expected_normalised_unit=${JSON.stringify(normalisedExpectedUnit)} observed_raw_units=${JSON.stringify(observedUnits)} observed_normalised_units=${JSON.stringify(normalisedUnits)} blank_unit_row_count=${binding.pendingRows.filter((row) => !row.unit).length}`);
+    }
+    for (const row of binding.pendingRows) {
       result.rows.push({
         timeseries_id: binding.timeseries.timeseries_id,
         station_id: binding.timeseries.station_id,
         pollutant_code: String(binding.property.observed_property_code),
-        observed_at: observedAt,
-        value,
-        status: String(cells[binding.statusIndex] || "").trim() || null,
-        source_parameter: unit ? `uk_air_flat_file:${unit}` : "uk_air_flat_file",
+        observed_at: row.observedAt,
+        value: row.value,
+        status: row.status,
+        source_parameter: row.unit ? `uk_air_flat_file:${row.unit}` : `uk_air_flat_file:${expectedUnit}`,
       });
       result.mapped_records += 1;
     }
@@ -9241,6 +9297,7 @@ export function parseUkAirFlatFileObservations(args: {
       observed_units: Array.from(column.units).sort(),
       target_day_non_null_row_count: column.targetDayNonNullRowCount,
       possible_supported_pollutant_label: false,
+      mapping_decision_source: column.decisionSource,
     })),
     ...allSkippedSourceLabelColumns.map((column) => ({
       source_label: column.sourceLabel,
@@ -13154,6 +13211,9 @@ async function runSourceToAll(
       if (!sourceAdapter) {
         continue;
       }
+      const sosRegistry = sourceAdapter === "sos"
+        ? loadSosSourceLabelRegistrySnapshot()
+        : null;
 
       try {
         const existingObsManifest = await loadExistingConnectorManifest(
@@ -14373,9 +14433,11 @@ async function runSourceToAll(
           sourceCheckpointJson.total_skipped_unselected_pollutant_rows =
             flatFileSkippedUnselectedPollutantRows;
           sourceCheckpointJson.sos_source_label_registry_file =
-            SOS_SOURCE_LABEL_REGISTRY?.source_file || null;
-          sourceCheckpointJson.sos_source_label_registry_sha256 =
-            SOS_SOURCE_LABEL_REGISTRY?.sha256 || null;
+            sosRegistry?.source_file || null;
+          sourceCheckpointJson.sos_source_label_registry_file_sha256 =
+            sosRegistry?.file_sha256 || null;
+          sourceCheckpointJson.sos_source_label_registry_content_sha256 =
+            sosRegistry?.content_sha256 || null;
           sourceCheckpointJson.sos_source_label_classification_counts =
             sourceLabelClassificationCounts;
           sourceCheckpointJson.sos_source_label_target_day_row_counts =
@@ -14518,8 +14580,10 @@ async function runSourceToAll(
             source_file_identities_sha256: sha256Hex(sourceFileIdentitiesJson),
             source_label_registry_snapshot_file:
               sourceCheckpointJson.sos_source_label_registry_file || null,
-            source_label_registry_snapshot_sha256:
-              sourceCheckpointJson.sos_source_label_registry_sha256 || null,
+            source_label_registry_snapshot_file_sha256:
+              sourceCheckpointJson.sos_source_label_registry_file_sha256 || null,
+            source_label_registry_snapshot_content_sha256:
+              sourceCheckpointJson.sos_source_label_registry_content_sha256 || null,
             source_label_classification_counts:
               sourceCheckpointJson.sos_source_label_classification_counts || {},
             source_label_target_day_row_counts:

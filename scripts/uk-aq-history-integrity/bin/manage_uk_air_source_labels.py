@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -19,6 +20,10 @@ def normalise_label(value: str) -> str:
 
 
 def default_db_path(env_name: str) -> Path:
+    state_dir = os.environ.get("UK_AQ_HISTORY_INTEGRITY_STATE_DIR", "").strip()
+    if state_dir:
+        root = Path(state_dir)
+        return root / "uk_aq_history_integrity.sqlite" if root.name == env_name else root / env_name / "uk_aq_history_integrity.sqlite"
     return Path("/Users/mikehinford/uk-aq-history-integrity/state") / env_name / "uk_aq_history_integrity.sqlite"
 
 
@@ -50,6 +55,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     db_path = args.db_path or default_db_path(args.env)
+    print(f"Integrity SQLite DB: {db_path}")
     if not db_path.is_file():
         raise SystemExit(f"Integrity SQLite DB not found: {db_path}")
     conn = sqlite3.connect(db_path)
