@@ -65,7 +65,7 @@ Source files must still be enumerated and identity-pinned sufficiently to prove 
 
 The Integrity SQLite database owns the approval registry for UK-AIR annual CSV headings. A heading is `mapped`, `ignore` or `review`: only explicitly approved `mapped` labels with an explicit expected unit may target `pm25`, `pm10`, `no2` or observation-only `o3`; `ignore` labels are known non-target fields; newly discovered labels are `review` and are skipped with an aggregated warning. An automatic `mapped` decision is seeded only when exactly one active core mapping exists, it targets a supported pollutant and it supplies an explicit unit; every multiple-active-mapping case requires review. Previously seeded, unreviewed decisions that no longer meet these rules return to `review`, while operator-reviewed decisions are preserved. A mapped registry decision is authoritative for heading-to-pollutant routing; an active matching core mapping is a consistency check, not a second approval. Python discovers cached headings, updates the registry and writes one immutable per-run snapshot for both detector and proposal stages. The SOS flat-file worker never opens the Integrity SQLite database; non-SOS adapters neither receive nor load this snapshot.
 
-Review and ignored labels do not block selected-pollutant repair. Approved mapped labels remain fail-closed for contradictory or ambiguous core mappings, missing timeseries, invalid rows and incompatible units. Unit evidence is validated per source column/header section, independently of target-day emission: zero target-day values need no target-day unit; blank target-day units are accepted only after compatible non-empty evidence exists in that same section. Python's broad cached-heading inventory is warning-only and does not classify every target-year cache file as required. The worker is the sole authority for required active-operation files: it derives exact paths from validated active connector-day SOS mappings and keeps missing, empty, unreadable and identity-invalid required files fail-closed. Snapshot content hashes use sorted keys, compact UTF-8 JSON with literal Unicode, excluding the hash field; file hashes represent the exact supplied bytes. The manager honours `--db-path`, then `UK_AQ_HISTORY_INTEGRITY_STATE_DIR`, then the Integrity local-root convention. Ozone registry mapping does not add ozone to AQI rebuilds.
+Review and ignored labels do not block selected-pollutant repair. For an approved mapped label, a source site/pollutant group with no authoritative active timeseries binding is warning-only and is skipped with the reason `no_authoritative_timeseries_binding`; Integrity must not invent a station or timeseries identity. Immutable detector evidence, proposal evidence, structured logs and run reports must record the affected site, source label, pollutant and target-day non-null row count. Those skipped rows must be excluded consistently from canonical rows, expected source and pollutant totals, per-timeseries counts, Parquet, manifests and proposal-validation expectations, while other valid groups continue. Contradictory or ambiguous core or timeseries mappings, incompatible units and invalid selected canonical rows remain fail-closed. Unit evidence is validated per source column/header section, independently of target-day emission: zero target-day values need no target-day unit; blank target-day units are accepted only after compatible non-empty evidence exists in that same section. Python's broad cached-heading inventory is warning-only and does not classify every target-year cache file as required. The worker is the sole authority for required active-operation files: it derives exact paths from validated active connector-day SOS mappings and keeps missing, empty, unreadable and identity-invalid required files fail-closed. Snapshot content hashes use sorted keys, compact UTF-8 JSON with literal Unicode, excluding the hash field; file hashes represent the exact supplied bytes. The manager honours `--db-path`, then `UK_AQ_HISTORY_INTEGRITY_STATE_DIR`, then the Integrity local-root convention. Ozone registry mapping does not add ozone to AQI rebuilds.
 
 ## Operational environment
 
@@ -121,6 +121,8 @@ A completed check-only run must distinguish at least:
 - actionable Integrity fault found and represented in the repair plan;
 - blocked because the Dropbox readiness gate failed;
 - incomplete or unreliable checking because a selected-pollutant source, cache, reader or mapping was unavailable.
+
+A recorded `no_authoritative_timeseries_binding` warning does not by itself make checking incomplete. The affected source rows are non-canonicalisable under the imported core identity and must remain visible as skipped evidence rather than being treated as unavailable source data.
 
 An actionable finding is a failed Integrity result even though detection itself completed successfully.
 
@@ -234,7 +236,7 @@ DuckDB reads the actual Dropbox Parquet for the supported pollutants and calcula
 
 Existing out-of-scope pollutant partitions, manifest entries and indexes are ignored as findings. Extra out-of-scope children in a connector or day manifest are permitted and must be carried through unchanged when that parent is rebuilt. Their presence must not alter the target-pollutant counts used for comparison.
 
-An unavailable reader, unreadable selected-pollutant Parquet, unavailable selected-pollutant source/cache or ambiguous selected-pollutant source mapping is reported explicitly and fails closed for the affected scope.
+An unavailable reader, unreadable selected-pollutant Parquet, unavailable selected-pollutant source/cache or ambiguous selected-pollutant source mapping is reported explicitly and fails closed for the affected scope. An entirely absent authoritative active timeseries binding for a source site/pollutant is not an ambiguous mapping: it is warning-only, is recorded as `no_authoritative_timeseries_binding`, and is excluded from canonical source evidence and expected counts.
 
 Findings distinguish data, pollutant-manifest, connector-manifest, day-manifest, index, source-mapping and source-unavailable faults. Both source-only and Dropbox-only per-timeseries differences remain visible for the supported pollutants.
 
@@ -248,9 +250,10 @@ An observation data fault is repaired from the authoritative connector source/ca
 
 A pollutant-scoped repair must:
 
-- enumerate and identity-pin the source files required to prove every selected-pollutant row;
-- compare detector and proposal evidence exactly for the selected pollutant set;
-- build and validate complete replacement content for each selected pollutant partition;
+- enumerate and identity-pin the source files required to prove that every selected-pollutant source row was examined;
+- classify each selected source site/pollutant group as exactly one canonical binding, warning-only `no_authoritative_timeseries_binding`, or fail-closed ambiguous or contradictory mapping;
+- compare detector and proposal evidence exactly for the selected pollutant set, including identical warning-only skipped groups and row counts;
+- build and validate complete replacement content for each selected pollutant partition from canonicalisable rows only;
 - delete only the exact selected pollutant prefixes;
 - preserve every unselected supported pollutant and every existing out-of-scope pollutant object;
 - rebuild parent metadata and indexes from selected replacements plus preserved baseline children.
@@ -278,18 +281,20 @@ For an observation data repair:
 
 1. Read or fetch and identity-pin all source files required for the selected connector-day pollutants.
 2. Build canonical source evidence containing only the selected pollutants.
-3. Fail on any missing, malformed, unmapped, ambiguous, duplicate or otherwise blocked selected-pollutant row.
-4. Ignore non-selected source rows for repair blocking, while retaining enough file identity evidence to prove the selected rows came from the expected source files.
-5. Build the complete corrected Parquet and pollutant manifests for every selected pollutant locally.
-6. Validate selected source-to-Parquet row identity, counts, pollutant set, object keys, hashes and detector/proposal equality.
-7. Resolve preserved unselected children from the chosen Dropbox baseline and prove that reconstructed connector and day metadata retain them.
-8. Create tombstones only for exact selected prefixes of the form `history/v2/observations/day_utc=<day>/connector_id=<connector>/pollutant_code=<pollutant>`.
-9. During real apply, delete and verify absence of only those exact selected prefixes.
-10. Upload and GET-verify the selected canonical pollutant Parquet files.
-11. Upload and GET-verify the selected pollutant manifests.
-12. Rebuild and GET-verify the connector and day manifests from selected replacements plus preserved baseline children.
-13. Rebuild and GET-verify the affected supported-pollutant indexes, then the global latest index without dropping preserved out-of-scope entries.
-14. Run the required AQI repair stages only for changed `pm25`, `pm10` or `no2` observations.
+3. Classify every selected source site/pollutant group against the imported authoritative identity.
+4. When no authoritative active timeseries binding exists, record one aggregated `no_authoritative_timeseries_binding` warning containing the site, source label, pollutant and target-day non-null row count; skip those rows and exclude them from every canonical source, pollutant, per-timeseries, Parquet, manifest and proposal-validation count.
+5. Fail on malformed, ambiguously mapped, contradictorily mapped, duplicate or otherwise blocked selected-pollutant rows. A binding must never be invented or chosen arbitrarily.
+6. Ignore non-selected source rows for repair blocking, while retaining enough file identity evidence to prove the selected rows came from the expected source files.
+7. Build the complete corrected Parquet and pollutant manifests for every selected pollutant locally.
+8. Validate selected source-to-Parquet row identity, counts, pollutant set, object keys, hashes, skipped-binding evidence and detector/proposal equality.
+9. Resolve preserved unselected children from the chosen Dropbox baseline and prove that reconstructed connector and day metadata retain them.
+10. Create tombstones only for exact selected prefixes of the form `history/v2/observations/day_utc=<day>/connector_id=<connector>/pollutant_code=<pollutant>`.
+11. During real apply, delete and verify absence of only those exact selected prefixes.
+12. Upload and GET-verify the selected canonical pollutant Parquet files.
+13. Upload and GET-verify the selected pollutant manifests.
+14. Rebuild and GET-verify the connector and day manifests from selected replacements plus preserved baseline children.
+15. Rebuild and GET-verify the affected supported-pollutant indexes, then the global latest index without dropping preserved out-of-scope entries.
+16. Run the required AQI repair stages only for changed `pm25`, `pm10` or `no2` observations.
 
 For a metadata-only repair, preserve the Dropbox Parquet and rebuild only the required supported-pollutant manifests or indexes from the chosen Dropbox baseline and any corrected local overlay objects.
 
@@ -350,14 +355,25 @@ A gateway failure, missing cache file, parse failure or uncertain empty response
 
 Integrity may replace a selected connector-day pollutant partition with no observation rows only when the relevant source adapter explicitly classifies that selected-pollutant result as authoritative no-data under its documented source contract. Otherwise it must make no R2 changes for that selected scope.
 
+A source site/pollutant group skipped because no authoritative active timeseries binding exists is neither unavailable source nor authoritative no-data. Its source rows were examined, but they cannot enter canonical history until the separate core identity owner provides a valid binding.
+
 ## Audit evidence
 
 Every mode records its mode, requested source, connector, day and pollutant scope, chosen Dropbox baseline, whether `--allow-stale-dropbox` was used, source acquisition result, findings, repair plan and final mode result.
 
+For SOS selected-pollutant processing, immutable detector evidence, proposal evidence, logs and reports must separately record:
+
+- selected source rows examined;
+- canonical rows mapped;
+- `no_authoritative_timeseries_binding` groups;
+- rows skipped for those groups;
+- the affected site reference, source label, pollutant and target-day non-null row count.
+
 For a real repair, SQLite, task logs and JSON/Markdown reports must additionally record at least:
 
 - environment, source, day, connector and selected pollutant set;
-- selected-pollutant source and replacement row counts;
+- selected-pollutant source, canonical and replacement row counts;
+- warning-only missing-binding groups and skipped row counts;
 - preserved baseline pollutant children;
 - object keys deleted and written;
 - post-write GET verification results;
