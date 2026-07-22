@@ -8883,6 +8883,12 @@ function canonicalRegistryJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+const SOURCE_EVIDENCE_CONTRACT_VERSION = 2;
+
+function deterministicSemanticHash(value: unknown): string {
+  return sha256Hex(canonicalRegistryJson(value));
+}
+
 let sosSourceLabelRegistrySnapshot: SosSourceLabelRegistrySnapshot | null | undefined;
 
 export function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnapshot | null {
@@ -8900,8 +8906,15 @@ export function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnap
   const declaredContentHash = String(payload.registry_content_sha256 || "");
   const contentPayload = { ...payload };
   delete contentPayload.registry_content_sha256;
+  const semanticContentHash = sha256Hex(canonicalRegistryJson({
+    schema_version: payload.schema_version,
+    connector_id: payload.connector_id,
+    labels: payload.labels,
+  }));
+  const legacyContentHash = sha256Hex(canonicalRegistryJson(contentPayload));
   if (!/^[a-f0-9]{64}$/.test(declaredContentHash) ||
-    sha256Hex(canonicalRegistryJson(contentPayload)) !== declaredContentHash) {
+    (declaredContentHash !== semanticContentHash &&
+      declaredContentHash !== legacyContentHash)) {
     throw new Error(`sos_source_label_registry_content_hash_invalid path=${sourceFile}`);
   }
   const entries = new Map<string, SosSourceLabelRegistryEntry>();
@@ -8933,7 +8946,7 @@ export function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnap
   return sosSourceLabelRegistrySnapshot = {
     source_file: sourceFile,
     file_sha256: sha256Hex(text),
-    content_sha256: declaredContentHash,
+    content_sha256: semanticContentHash,
     entries,
   };
 }
@@ -8998,6 +9011,7 @@ export type UkAirFlatFileParseResult = {
   blocked_target_day_rows: number;
   blocked_target_day_row_samples: Record<string, unknown>[];
   skipped_ignored_properties: number;
+  selected_source_records_examined: number;
   missing_binding_groups: number;
   missing_binding_rows: number;
   units: string[];
@@ -9040,6 +9054,7 @@ export function parseUkAirFlatFileObservations(args: {
     blocked_target_day_rows: 0,
     blocked_target_day_row_samples: [],
     skipped_ignored_properties: 0,
+    selected_source_records_examined: 0,
     missing_binding_groups: 0,
     missing_binding_rows: 0,
     units: [],
@@ -9428,6 +9443,8 @@ export function parseUkAirFlatFileObservations(args: {
     (total, entry) => total + entry.target_day_non_null_row_count,
     0,
   );
+  result.selected_source_records_examined =
+    result.mapped_records + result.missing_binding_rows;
   return result;
 }
 
@@ -14232,6 +14249,38 @@ async function runSourceToAll(
           }
           const observedPropertyMappings =
             await loadR2CoreObservedPropertyMappings();
+          const authoritativeMappingInput = validFlatFileMappings.map((row) => ({
+            site_ref: row.site_ref,
+            uk_air_ref: row.uk_air_ref,
+            station_id: row.station_id,
+            timeseries_id: row.timeseries_id,
+            station_ref: row.station_ref,
+            timeseries_ref: row.timeseries_ref,
+            pollutant_code: row.pollutant_code,
+            valid_from_day_utc: row.valid_from_day_utc,
+            valid_to_day_utc: row.valid_to_day_utc,
+          })).sort((left, right) =>
+            canonicalRegistryJson(left).localeCompare(canonicalRegistryJson(right))
+          );
+          const observedPropertyMappingInput = observedPropertyMappings
+            .filter((row) => row.connector_id === connectorId)
+            .map((row) => ({
+              connector_id: row.connector_id,
+              source_label: row.source_label,
+              source_uom: row.source_uom,
+              observed_property_id: row.observed_property_id,
+              observed_property_code: row.observed_property_code,
+              mapping_kind: row.mapping_kind,
+              is_aqi_eligible: row.is_aqi_eligible,
+              is_active: row.is_active,
+            }))
+            .sort((left, right) =>
+              canonicalRegistryJson(left).localeCompare(canonicalRegistryJson(right))
+            );
+          sourceCheckpointJson.authoritative_station_timeseries_mapping_sha256 =
+            deterministicSemanticHash(authoritativeMappingInput);
+          sourceCheckpointJson.observed_property_mapping_sha256 =
+            deterministicSemanticHash(observedPropertyMappingInput);
 
           if (!SOS_FLAT_FILE_ROOT) {
             throw new Error(
@@ -14272,6 +14321,7 @@ async function runSourceToAll(
           let flatFileSkippedOtherDays = 0;
           let flatFileSkippedInvalidRows = 0;
           let flatFileSkippedUnselectedPollutantRows = 0;
+          let flatFileSelectedSourceRecordsExamined = 0;
           let flatFileMissingBindingGroups = 0;
           let flatFileMissingBindingRows = 0;
           let flatFileBlockedTargetDayRows = 0;
@@ -14305,6 +14355,8 @@ async function runSourceToAll(
             flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
             flatFileSkippedUnselectedPollutantRows +=
               parsed.skipped_unselected_pollutant_rows;
+            flatFileSelectedSourceRecordsExamined +=
+              parsed.selected_source_records_examined;
             flatFileSourceLabelClassifications.push(
               ...parsed.source_label_classifications,
             );
@@ -14521,6 +14573,8 @@ async function runSourceToAll(
             source_kind: "uk_air_flat_file",
             site_ref_count: flatFileSiteRefs.length,
             source_records: flatFileSourceRecords,
+            source_csv_records_scanned: flatFileSourceRecords,
+            source_records_examined: flatFileSelectedSourceRecordsExamined,
             mapped_records: flatFileRows.length,
             skipped_other_days: flatFileSkippedOtherDays,
             skipped_invalid_rows: flatFileSkippedInvalidRows,
@@ -14633,15 +14687,14 @@ async function runSourceToAll(
             flatFileSkippedInvalidRows;
           sourceCheckpointJson.total_skipped_unselected_pollutant_rows =
             flatFileSkippedUnselectedPollutantRows;
-          if (flatFileMissingBindingGroups > 0) {
-            sourceCheckpointJson.total_source_records_examined =
-              flatFileSourceRecords;
-            sourceCheckpointJson.total_skipped_no_authoritative_timeseries_binding =
-              flatFileMissingBindingRows;
-            sourceCheckpointJson.missing_binding_groups =
-              flatFileMissingBindingGroups;
-            sourceCheckpointJson.missing_binding_rows = flatFileMissingBindingRows;
-          }
+          sourceCheckpointJson.source_csv_records_scanned = flatFileSourceRecords;
+          sourceCheckpointJson.selected_source_records_examined =
+            flatFileSelectedSourceRecordsExamined;
+          sourceCheckpointJson.total_skipped_no_authoritative_timeseries_binding =
+            flatFileMissingBindingRows;
+          sourceCheckpointJson.missing_binding_groups =
+            flatFileMissingBindingGroups;
+          sourceCheckpointJson.missing_binding_rows = flatFileMissingBindingRows;
           sourceCheckpointJson.sos_source_label_registry_file =
             sosRegistry?.source_file || null;
           sourceCheckpointJson.sos_source_label_registry_file_sha256 =
@@ -14768,14 +14821,79 @@ async function runSourceToAll(
             );
           }
           const sourceFileIdentitiesJson = JSON.stringify(sourceFileIdentityList);
+          const sourceFileIdentitiesSha256 = sha256Hex(sourceFileIdentitiesJson);
+          const sourceEvidenceContract = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? "pollutant_scoped_authoritative_connector_day_source_rows"
+            : "complete_authoritative_connector_day_source_rows";
+          const requestedPollutantSet = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? Array.from(INTEGRITY_REPAIR_POLLUTANTS).sort()
+            : [];
+          const registryContentSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.sos_source_label_registry_content_sha256 ||
+                "",
+            )
+            : null;
+          const authoritativeMappingSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.authoritative_station_timeseries_mapping_sha256 ||
+                "",
+            )
+            : null;
+          const observedPropertyMappingSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.observed_property_mapping_sha256 || "",
+            )
+            : null;
+          if (sourceAdapter === "sos" &&
+            ![registryContentSha256, authoritativeMappingSha256, observedPropertyMappingSha256]
+              .every((value) => /^[a-f0-9]{64}$/.test(String(value || "")))) {
+            throw new Error("complete_connector_day_semantic_mapping_identity_missing");
+          }
+          const sourceEvidenceInput = {
+            source_adapter: sourceAdapter,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_file_identities_sha256: sourceFileIdentitiesSha256,
+            requested_pollutant_set: requestedPollutantSet,
+            contract: sourceEvidenceContract,
+            evidence_contract_version: SOURCE_EVIDENCE_CONTRACT_VERSION,
+            source_label_registry_snapshot_content_sha256: registryContentSha256,
+            authoritative_station_timeseries_mapping_sha256:
+              authoritativeMappingSha256,
+            observed_property_mapping_sha256: observedPropertyMappingSha256,
+          };
+          const sourceEvidenceInputSha256 = deterministicSemanticHash(
+            sourceEvidenceInput,
+          );
+          const missingBindingGroups = Number(
+            sourceCheckpointJson.missing_binding_groups || 0,
+          );
+          const missingBindingRows = Number(
+            sourceCheckpointJson.missing_binding_rows || 0,
+          );
+          const sourceRecordsExamined = sourceAdapter === "sos"
+            ? Number(
+              sourceCheckpointJson.selected_source_records_examined || 0,
+            )
+            : obsHistoryRows.length;
+          const sourceCsvRecordsScanned = sourceAdapter === "sos"
+            ? Number(sourceCheckpointJson.source_csv_records_scanned || 0)
+            : Number(sourceCheckpointJson.total_csv_records || obsHistoryRows.length);
+          if (
+            ![missingBindingGroups, missingBindingRows, sourceRecordsExamined,
+              sourceCsvRecordsScanned].every((value) =>
+              Number.isInteger(value) && value >= 0
+            ) || sourceRecordsExamined !== obsHistoryRows.length + missingBindingRows
+          ) {
+            throw new Error("complete_connector_day_selected_source_count_mismatch");
+          }
           writeIntegrityProposalStageJson(evidencePath, {
             schema_version: 1,
-            contract: INTEGRITY_POLLUTANT_SCOPED_REPAIR
-              ? "pollutant_scoped_authoritative_connector_day_source_rows"
-              : "complete_authoritative_connector_day_source_rows",
-            requested_pollutant_set: INTEGRITY_POLLUTANT_SCOPED_REPAIR
-              ? Array.from(INTEGRITY_REPAIR_POLLUTANTS).sort()
-              : [],
+            contract: sourceEvidenceContract,
+            evidence_contract_version: SOURCE_EVIDENCE_CONTRACT_VERSION,
+            source_evidence_input_sha256: sourceEvidenceInputSha256,
+            requested_pollutant_set: requestedPollutantSet,
             connector_id: connectorId,
             day_utc: dayUtc,
             source_adapter: sourceAdapter,
@@ -14787,13 +14905,16 @@ async function runSourceToAll(
               new Set(sourceFilesAuthoritativelyAbsent),
             ).sort(),
             source_file_identities: sourceFileIdentityList,
-            source_file_identities_sha256: sha256Hex(sourceFileIdentitiesJson),
+            source_file_identities_sha256: sourceFileIdentitiesSha256,
             source_label_registry_snapshot_file:
               sourceCheckpointJson.sos_source_label_registry_file || null,
             source_label_registry_snapshot_file_sha256:
               sourceCheckpointJson.sos_source_label_registry_file_sha256 || null,
             source_label_registry_snapshot_content_sha256:
-              sourceCheckpointJson.sos_source_label_registry_content_sha256 || null,
+              registryContentSha256,
+            authoritative_station_timeseries_mapping_sha256:
+              authoritativeMappingSha256,
+            observed_property_mapping_sha256: observedPropertyMappingSha256,
             source_label_classification_counts:
               sourceCheckpointJson.sos_source_label_classification_counts || {},
             source_label_target_day_row_counts:
@@ -14802,20 +14923,11 @@ async function runSourceToAll(
               sourceCheckpointJson.sos_source_label_summary || {},
             source_label_classifications:
               sourceCheckpointJson.sos_source_label_classifications || [],
-            ...(Number(sourceCheckpointJson.missing_binding_groups || 0) > 0
-              ? {
-                source_records_examined: Number(
-                  sourceCheckpointJson.total_source_records_examined || 0,
-                ),
-                canonical_rows_mapped: obsHistoryRows.length,
-                missing_binding_groups: Number(
-                  sourceCheckpointJson.missing_binding_groups || 0,
-                ),
-                missing_binding_rows: Number(
-                  sourceCheckpointJson.missing_binding_rows || 0,
-                ),
-              }
-              : {}),
+            source_records_examined: sourceRecordsExamined,
+            source_csv_records_scanned: sourceCsvRecordsScanned,
+            canonical_rows_mapped: obsHistoryRows.length,
+            missing_binding_groups: missingBindingGroups,
+            missing_binding_rows: missingBindingRows,
             canonical_rows_file: "obs_history_rows.json",
             canonical_rows_sha256: sha256Hex(rowsJson),
             canonical_rows_bytes: Buffer.byteLength(rowsJson, "utf8"),
