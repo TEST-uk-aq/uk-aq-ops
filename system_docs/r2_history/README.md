@@ -41,6 +41,8 @@ For Phase B AQI writes, also read [`aqi_history_write_pipeline.md`](aqi_history_
 
 A complete connector-day Integrity repair remains pollutant-scoped. The selected pollutant set passes unchanged to the shared source-to-R2 worker, which filters adapter bindings before mapping guards while retaining complete connector-day source evidence. Complete connector-day mode must not use a timeseries-ID filter.
 
+UK-AIR CSV heading decisions are maintained in the Integrity SQLite source-label registry. Each repair receives a hashed JSON snapshot of `mapped`, `ignore` and `review` decisions; unknown headings are treated as review, skipped and reported rather than broadening the repair scope. Only approved mappings for `pm25`, `pm10`, `no2` and observation-only `o3` enter canonical processing.
+
 ## Implementation ownership
 
 - `scripts/backup_r2/uk_aq_core_snapshot_to_r2.mjs`

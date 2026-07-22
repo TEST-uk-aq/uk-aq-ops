@@ -326,6 +326,30 @@ CREATE INDEX IF NOT EXISTS idx_sftc_timeseries
 CREATE INDEX IF NOT EXISTS idx_sftc_day_timeseries
   ON source_file_timeseries_counts(day_utc, timeseries_id);
 
+-- Integrity-owned approval registry for UK-AIR annual CSV headings. The
+-- source-to-R2 worker receives only an immutable JSON snapshot of this table.
+CREATE TABLE IF NOT EXISTS uk_air_csv_source_labels (
+  connector_id INTEGER NOT NULL,
+  source_label TEXT NOT NULL,
+  normalised_source_label TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('mapped', 'ignore', 'review')),
+  pollutant_code TEXT CHECK (pollutant_code IS NULL OR pollutant_code IN ('pm25', 'pm10', 'no2', 'o3')),
+  expected_uom TEXT,
+  first_seen_at_utc TEXT NOT NULL,
+  last_seen_at_utc TEXT NOT NULL,
+  first_seen_site_ref TEXT,
+  last_seen_site_ref TEXT,
+  raw_label_variants_json TEXT NOT NULL DEFAULT '[]',
+  observed_units_json TEXT NOT NULL DEFAULT '[]',
+  reviewed_at_utc TEXT,
+  review_notes TEXT,
+  PRIMARY KEY (connector_id, normalised_source_label),
+  CHECK ((status = 'mapped' AND pollutant_code IS NOT NULL) OR (status IN ('ignore', 'review') AND pollutant_code IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_uk_air_csv_source_labels_status
+  ON uk_air_csv_source_labels(connector_id, status, normalised_source_label);
+
 -- Immutable canonical source evidence captured from the connector adapter
 -- after cache acquisition and before a destructive connector-day repair.
 CREATE TABLE IF NOT EXISTS source_connector_day_evidence (
@@ -585,6 +609,10 @@ CREATE INDEX IF NOT EXISTS idx_daily_profile_state_env_status_date
 
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
+
+
+def utc_now_iso() -> str:
+    return utc_now().isoformat().replace("+00:00", "Z")
 
 
 # ---------------------------------------------------------------------------
@@ -2212,6 +2240,123 @@ def _uk_air_parse_day(value: Any) -> str | None:
         except ValueError:
             continue
     return None
+
+
+def _normalise_uk_air_source_label(value: Any) -> str:
+    """Stable registry key; raw spelling is retained separately for review."""
+    text = str(value or "").strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def _uk_air_source_label_seed_decisions(conn: sqlite3.Connection) -> dict[str, tuple[str, str | None, str | None]]:
+    decisions: dict[str, tuple[str, str | None, str | None]] = {}
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    rows = conn.execute(
+        """
+        SELECT source_label, source_uom, observed_property_code, mapping_kind, is_active
+        FROM core_observed_property_mappings_snapshot
+        WHERE connector_id = 1
+        """
+    ).fetchall()
+    for row in rows:
+        grouped.setdefault(_normalise_uk_air_source_label(row[0]), []).append(row)
+    for key, candidates in grouped.items():
+        active = [row for row in candidates if int(row[4] or 0) == 1]
+        mapped = [row for row in active if str(row[3] or "") == "raw_observed_property" and str(row[2] or "").lower() in {"pm25", "pm10", "no2", "o3"}]
+        if len(mapped) == 1:
+            row = mapped[0]
+            decisions[key] = ("mapped", str(row[2]).lower(), str(row[1] or "") or None)
+            continue
+        # Multiple supported mappings are not safe to turn into an automatic
+        # ignore decision.  Leave them for explicit operator review instead.
+        if mapped:
+            continue
+        ignored = [row for row in active if str(row[3] or "") == "ignored" or str(row[2] or "").strip()]
+        if ignored:
+            decisions[key] = ("ignore", None, None)
+    return decisions
+
+
+def refresh_uk_air_source_label_registry(
+    *, conn: sqlite3.Connection, cache_root: Path, connector_id: int = 1,
+) -> dict[str, Any]:
+    """Discover cached UK-AIR headings and idempotently register decisions.
+
+    Existing registry decisions are never replaced by a later source scan.
+    """
+    import csv
+
+    now_iso = utc_now_iso()
+    seeds = _uk_air_source_label_seed_decisions(conn)
+    discovered: dict[str, dict[str, Any]] = {}
+    for csv_path in sorted(cache_root.glob("site_ref=*/year=*/*.csv")):
+        site_ref = csv_path.stem.rsplit("_", 1)[0].upper()
+        try:
+            with csv_path.open("rt", encoding="utf-8", newline="") as fh:
+                reader = csv.reader(fh)
+                bindings: list[tuple[int, str, str]] = []
+                for row in reader:
+                    cells = [str(cell).strip() for cell in row]
+                    if len(cells) >= 2 and cells[0].lower() == "date" and cells[1].lower() == "time":
+                        bindings = []
+                        for index in range(2, len(cells), 3):
+                            raw = cells[index]
+                            key = _normalise_uk_air_source_label(raw)
+                            if not key:
+                                continue
+                            entry = discovered.setdefault(key, {"source_label": raw, "variants": set(), "units": set(), "sites": set()})
+                            entry["variants"].add(raw)
+                            entry["sites"].add(site_ref)
+                            bindings.append((index, key, raw))
+                        continue
+                    for index, key, _raw in bindings:
+                        if index < len(cells) and _sos_to_finite_number(cells[index]) is not None and index + 2 < len(cells) and cells[index + 2]:
+                            discovered[key]["units"].add(cells[index + 2])
+        except OSError:
+            continue
+    for key, entry in discovered.items():
+        existing = conn.execute(
+            "SELECT status, pollutant_code, expected_uom, first_seen_at_utc, first_seen_site_ref, reviewed_at_utc, review_notes, raw_label_variants_json, observed_units_json FROM uk_air_csv_source_labels WHERE connector_id=? AND normalised_source_label=?",
+            (connector_id, key),
+        ).fetchone()
+        variants = sorted(entry["variants"])
+        units = sorted(entry["units"])
+        last_site = sorted(entry["sites"])[-1] if entry["sites"] else None
+        if existing is None:
+            status, code, expected_uom = seeds.get(key, ("review", None, None))
+            conn.execute(
+                """INSERT INTO uk_air_csv_source_labels
+                   (connector_id,source_label,normalised_source_label,status,pollutant_code,expected_uom,first_seen_at_utc,last_seen_at_utc,first_seen_site_ref,last_seen_site_ref,raw_label_variants_json,observed_units_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (connector_id, entry["source_label"], key, status, code, expected_uom, now_iso, now_iso, last_site, last_site, json.dumps(variants), json.dumps(units)),
+            )
+            continue
+        prior_variants = set(json.loads(existing[7] or "[]"))
+        prior_units = set(json.loads(existing[8] or "[]"))
+        conn.execute(
+            """UPDATE uk_air_csv_source_labels SET last_seen_at_utc=?, last_seen_site_ref=?, raw_label_variants_json=?, observed_units_json=?
+               WHERE connector_id=? AND normalised_source_label=?""",
+            (now_iso, last_site, json.dumps(sorted(prior_variants | set(variants))), json.dumps(sorted(prior_units | set(units))), connector_id, key),
+        )
+    counts = dict(conn.execute("SELECT status, COUNT(*) FROM uk_air_csv_source_labels WHERE connector_id=? GROUP BY status", (connector_id,)).fetchall())
+    return {"discovered_labels": len(discovered), "mapped_labels": int(counts.get("mapped", 0)), "ignored_labels": int(counts.get("ignore", 0)), "review_labels": int(counts.get("review", 0))}
+
+
+def write_uk_air_source_label_registry_snapshot(
+    *, conn: sqlite3.Connection, connector_id: int, cache_root: Path, snapshot_path: Path,
+) -> dict[str, Any]:
+    inventory = refresh_uk_air_source_label_registry(conn=conn, cache_root=cache_root, connector_id=connector_id)
+    rows = conn.execute(
+        """SELECT source_label, normalised_source_label, status, pollutant_code, expected_uom, raw_label_variants_json, observed_units_json, reviewed_at_utc, review_notes
+           FROM uk_air_csv_source_labels WHERE connector_id=? ORDER BY normalised_source_label""",
+        (connector_id,),
+    ).fetchall()
+    labels = [{"source_label": row[0], "normalised_source_label": row[1], "status": row[2], "pollutant_code": row[3], "expected_uom": row[4], "raw_label_variants": json.loads(row[5] or "[]"), "observed_units": json.loads(row[6] or "[]"), "reviewed_at_utc": row[7], "review_notes": row[8]} for row in rows]
+    payload: dict[str, Any] = {"schema_version": 1, "connector_id": connector_id, "generated_at_utc": utc_now_iso(), "inventory": inventory, "labels": labels}
+    payload["registry_sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {"path": str(snapshot_path), "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(), "inventory": inventory, "review_labels": [entry["normalised_source_label"] for entry in labels if entry["status"] == "review"]}
 
 
 def _uk_air_normalize_pollutant_code(value: Any) -> str | None:
@@ -13597,6 +13742,22 @@ def run_v2_gap_backfills(
             if run_state is not None
             else backfill_log_dir / "_integrity_proposal" / f"v2_run_{run_id}"
         )
+        registry_root = (
+            Path(str(run_state["run_root"])) / "sos-source-label-registry"
+            if run_state is not None
+            else stage_root / "sos-source-label-registry"
+        )
+        registry_snapshot = write_uk_air_source_label_registry_snapshot(
+            conn=conn,
+            connector_id=connector_id,
+            cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
+            snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
+        )
+        if run_state is not None:
+            run_state.setdefault("sos_source_label_registry_snapshots", {})[
+                f"{day_iso}/connector_id={connector_id}"
+            ] = registry_snapshot
+            write_run_state(run_state)
         detector_stage_root = stage_root / "detector-source-evidence"
         detector_evidence: dict[str, Any] = {}
         detector_evidence_persistence: dict[str, Any] = {}
@@ -13626,6 +13787,7 @@ def run_v2_gap_backfills(
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                     "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
                     "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                    "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"],
                 },
                 complete_connector_day=True,
                 repair_pollutants=repair_pollutants,
@@ -13695,6 +13857,7 @@ def run_v2_gap_backfills(
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                 "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
+                "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"],
             }
             bf = run_narrow_backfill(
                 wrapper_path=resolve_integrity_backfill_wrapper(),

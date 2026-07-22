@@ -451,6 +451,7 @@ if [[ ! -f "${ENV_FILE}" || ! -r "${ENV_FILE}" ]]; then
 fi
 
 INCOMING_INTEGRITY_REPAIR_POLLUTANTS="$(trim "${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS:-}")"
+INCOMING_SOS_SOURCE_LABEL_REGISTRY_FILE="$(trim "${UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE:-}")"
 set -a
 # The shared repository .env is the only environment source for this wrapper.
 # shellcheck disable=SC1090
@@ -458,6 +459,9 @@ source "${ENV_FILE}"
 set +a
 if [[ -n "${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}" ]]; then
   export UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS="${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}"
+fi
+if [[ -n "${INCOMING_SOS_SOURCE_LABEL_REGISTRY_FILE}" ]]; then
+  export UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE="${INCOMING_SOS_SOURCE_LABEL_REGISTRY_FILE}"
 fi
 
 if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
