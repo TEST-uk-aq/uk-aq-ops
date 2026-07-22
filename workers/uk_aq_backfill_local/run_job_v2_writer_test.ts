@@ -80,6 +80,9 @@ Deno.test("OpenAQ CSV mapping populates pollutant_code from source parameter whe
     binding_by_timeseries_id: new Map(),
     binding_by_timeseries_ref: new Map(),
     binding_by_timeseries_ref_pollutant: new Map(),
+    ambiguous_station_pollutant_keys: new Set<string>(),
+    ambiguous_timeseries_ref_keys: new Set<string>(),
+    ambiguous_timeseries_ref_pollutant_keys: new Set<string>(),
   };
   const csvText = [
     "location_id,sensors_id,datetime,parameter,value",
