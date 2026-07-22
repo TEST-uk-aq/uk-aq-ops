@@ -359,13 +359,14 @@ CREATE TABLE IF NOT EXISTS source_connector_day_evidence (
   connector_id INTEGER NOT NULL,
   source_adapter TEXT NOT NULL,
   source_file_identities_sha256 TEXT NOT NULL,
+  source_evidence_input_sha256 TEXT,
   canonical_rows_sha256 TEXT NOT NULL,
   canonical_rows_bytes INTEGER NOT NULL,
   evidence_sha256 TEXT NOT NULL,
   evidence_json TEXT NOT NULL,
   canonical_rows_json TEXT NOT NULL,
   created_at_utc TEXT NOT NULL,
-  UNIQUE (env_name, day_utc, connector_id, source_file_identities_sha256)
+  UNIQUE (env_name, day_utc, connector_id, source_evidence_input_sha256)
 );
 
 CREATE INDEX IF NOT EXISTS idx_source_connector_day_evidence_lookup
@@ -2369,7 +2370,19 @@ def write_uk_air_source_label_registry_snapshot(
     ).fetchall()
     labels = [{"source_label": row[0], "normalised_source_label": row[1], "status": row[2], "pollutant_code": row[3], "expected_uom": row[4], "raw_label_variants": json.loads(row[5] or "[]"), "observed_units": json.loads(row[6] or "[]"), "reviewed_at_utc": row[7], "review_notes": row[8]} for row in rows]
     payload: dict[str, Any] = {"schema_version": 1, "connector_id": connector_id, "generated_at_utc": utc_now_iso(), "inventory": inventory, "labels": labels}
-    payload["registry_content_sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+    semantic_content = {
+        "schema_version": payload["schema_version"],
+        "connector_id": payload["connector_id"],
+        "labels": payload["labels"],
+    }
+    payload["registry_content_sha256"] = hashlib.sha256(
+        json.dumps(
+            semantic_content,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"path": str(snapshot_path), "registry_file_sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(), "registry_content_sha256": payload["registry_content_sha256"], "inventory": inventory, "review_labels": [entry["normalised_source_label"] for entry in labels if entry["status"] == "review"]}
@@ -2907,6 +2920,81 @@ def _prepare_source_file_timeseries_counts_migration(
             ),
         )
     return migrated_rows
+
+
+def _prepare_source_connector_day_evidence_migration(
+    conn: sqlite3.Connection,
+) -> None:
+    """Preserve legacy immutable evidence while replacing its incomplete key."""
+    if not _table_exists(conn, "source_connector_day_evidence"):
+        return
+    columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(source_connector_day_evidence)"
+        ).fetchall()
+    }
+    if "source_evidence_input_sha256" in columns:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "ALTER TABLE source_connector_day_evidence "
+            "RENAME TO source_connector_day_evidence_legacy"
+        )
+        conn.execute("DROP INDEX IF EXISTS idx_source_connector_day_evidence_lookup")
+        conn.execute(
+            """
+            CREATE TABLE source_connector_day_evidence (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              env_name TEXT NOT NULL,
+              day_utc TEXT NOT NULL,
+              connector_id INTEGER NOT NULL,
+              source_adapter TEXT NOT NULL,
+              source_file_identities_sha256 TEXT NOT NULL,
+              source_evidence_input_sha256 TEXT,
+              canonical_rows_sha256 TEXT NOT NULL,
+              canonical_rows_bytes INTEGER NOT NULL,
+              evidence_sha256 TEXT NOT NULL,
+              evidence_json TEXT NOT NULL,
+              canonical_rows_json TEXT NOT NULL,
+              created_at_utc TEXT NOT NULL,
+              UNIQUE (
+                env_name, day_utc, connector_id, source_evidence_input_sha256
+              )
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_source_connector_day_evidence_lookup
+              ON source_connector_day_evidence(
+                env_name, day_utc, connector_id, id DESC
+              )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO source_connector_day_evidence (
+              id, env_name, day_utc, connector_id, source_adapter,
+              source_file_identities_sha256, source_evidence_input_sha256,
+              canonical_rows_sha256, canonical_rows_bytes, evidence_sha256,
+              evidence_json, canonical_rows_json, created_at_utc
+            )
+            SELECT id, env_name, day_utc, connector_id, source_adapter,
+                   source_file_identities_sha256, NULL,
+                   canonical_rows_sha256, canonical_rows_bytes, evidence_sha256,
+                   evidence_json, canonical_rows_json, created_at_utc
+            FROM source_connector_day_evidence_legacy
+            ORDER BY id
+            """
+        )
+        conn.execute("DROP TABLE source_connector_day_evidence_legacy")
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 def _openaq_object_key(location_id: str, day: dt.date) -> str:
@@ -13343,6 +13431,75 @@ def _v2_observations_index_rebuild_command(
     ]
 
 
+SOURCE_EVIDENCE_CONTRACT_VERSION = 2
+
+
+def _require_nonnegative_evidence_int(
+    evidence: Mapping[str, Any], key: str
+) -> int:
+    if key not in evidence:
+        raise ValueError(f"complete connector-day evidence field is missing: {key}")
+    value = evidence[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"complete connector-day evidence field must be a non-negative integer: {key}"
+        )
+    return value
+
+
+def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source_adapter": str(evidence.get("source_adapter") or ""),
+        "day_utc": str(evidence.get("day_utc") or ""),
+        "connector_id": int(evidence.get("connector_id") or 0),
+        "source_file_identities_sha256": str(
+            evidence.get("source_file_identities_sha256") or ""
+        ),
+        "requested_pollutant_set": sorted(
+            str(value)
+            for value in list(evidence.get("requested_pollutant_set") or [])
+        ),
+        "contract": str(evidence.get("contract") or ""),
+        "evidence_contract_version": _require_nonnegative_evidence_int(
+            evidence, "evidence_contract_version"
+        ),
+        "source_label_registry_snapshot_content_sha256": evidence.get(
+            "source_label_registry_snapshot_content_sha256"
+        ),
+        "authoritative_station_timeseries_mapping_sha256": evidence.get(
+            "authoritative_station_timeseries_mapping_sha256"
+        ),
+        "observed_property_mapping_sha256": evidence.get(
+            "observed_property_mapping_sha256"
+        ),
+    }
+
+
+def _source_evidence_input_sha256(evidence: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            _source_evidence_input_payload(evidence),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
+    payload = dict(evidence)
+    payload.pop("source_label_registry_snapshot_file", None)
+    payload.pop("source_label_registry_snapshot_file_sha256", None)
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _load_complete_connector_day_source_evidence(
     *,
     stage_root: Path,
@@ -13367,18 +13524,54 @@ def _load_complete_connector_day_source_evidence(
         if selected_pollutants else "complete_authoritative_connector_day_source_rows"
     )
     requested_pollutant_set = sorted(str(value) for value in list(evidence.get("requested_pollutant_set") or []))
+    source_records_examined = _require_nonnegative_evidence_int(
+        evidence, "source_records_examined"
+    )
+    source_csv_records_scanned = _require_nonnegative_evidence_int(
+        evidence, "source_csv_records_scanned"
+    )
+    canonical_rows_mapped = _require_nonnegative_evidence_int(
+        evidence, "canonical_rows_mapped"
+    )
+    missing_binding_groups = _require_nonnegative_evidence_int(
+        evidence, "missing_binding_groups"
+    )
+    missing_binding_rows = _require_nonnegative_evidence_int(
+        evidence, "missing_binding_rows"
+    )
+    canonical_rows_bytes = _require_nonnegative_evidence_int(
+        evidence, "canonical_rows_bytes"
+    )
+    total_rows = _require_nonnegative_evidence_int(evidence, "total_rows")
+    blocked_row_count = _require_nonnegative_evidence_int(
+        evidence, "blocked_row_count"
+    )
+    inactive_identity_rows_skipped = _require_nonnegative_evidence_int(
+        evidence, "inactive_identity_rows_skipped"
+    )
+    source_evidence_input_sha256 = str(
+        evidence.get("source_evidence_input_sha256") or ""
+    )
     if (
         evidence.get("schema_version") != 1
+        or evidence.get("evidence_contract_version")
+        != SOURCE_EVIDENCE_CONTRACT_VERSION
         or evidence.get("contract") != expected_contract
         or requested_pollutant_set != selected_pollutants
         or evidence.get("enumeration_complete") is not True
         or str(evidence.get("day_utc") or "") != day_utc
         or int(evidence.get("connector_id") or 0) != int(connector_id)
         or hashlib.sha256(rows_bytes).hexdigest() != str(evidence.get("canonical_rows_sha256") or "")
-        or len(rows_bytes) != int(evidence.get("canonical_rows_bytes") or -1)
-        or len(rows) != int(evidence.get("total_rows") or -1)
-        or int(evidence.get("blocked_row_count") or 0) != 0
-        or int(evidence.get("inactive_identity_rows_skipped") or 0) != 0
+        or len(rows_bytes) != canonical_rows_bytes
+        or len(rows) != total_rows
+        or blocked_row_count != 0
+        or inactive_identity_rows_skipped != 0
+        or canonical_rows_mapped != len(rows)
+        or source_records_examined
+        != canonical_rows_mapped + missing_binding_rows
+        or (missing_binding_groups == 0) != (missing_binding_rows == 0)
+        or not re.fullmatch(r"[0-9a-f]{64}", source_evidence_input_sha256)
+        or source_evidence_input_sha256 != _source_evidence_input_sha256(evidence)
     ):
         raise ValueError("complete connector-day detector source evidence identity is invalid")
     files_required = {str(value) for value in list(evidence.get("files_required") or [])}
@@ -13418,6 +13611,19 @@ def _load_complete_connector_day_source_evidence(
         evidence.get("source_file_identities_sha256") or ""
     ):
         raise ValueError("complete connector-day detector source file identities changed")
+    if str(evidence.get("source_adapter") or "") == "sos":
+        semantic_mapping_hashes = (
+            evidence.get("source_label_registry_snapshot_content_sha256"),
+            evidence.get("authoritative_station_timeseries_mapping_sha256"),
+            evidence.get("observed_property_mapping_sha256"),
+        )
+        if not all(
+            re.fullmatch(r"[0-9a-f]{64}", str(value or ""))
+            for value in semantic_mapping_hashes
+        ):
+            raise ValueError(
+                "complete connector-day SOS semantic mapping identity is invalid"
+            )
 
     per_timeseries: dict[str, int] = {}
     per_pollutant: dict[str, int] = {}
@@ -13461,28 +13667,31 @@ def _load_complete_connector_day_source_evidence(
         or sorted(per_pollutant) != sorted(str(value) for value in list(evidence.get("pollutant_set") or []))
     ):
         raise ValueError("complete connector-day detector source evidence counts are invalid")
-    missing_binding_groups = int(evidence.get("missing_binding_groups") or 0)
-    missing_binding_rows = int(evidence.get("missing_binding_rows") or 0)
-    if missing_binding_groups or missing_binding_rows:
-        classification_counts = dict(
-            evidence.get("source_label_classification_counts") or {}
+    classification_counts = dict(
+        evidence.get("source_label_classification_counts") or {}
+    )
+    classification_row_counts = dict(
+        evidence.get("source_label_target_day_row_counts") or {}
+    )
+    missing_binding_classification_groups = classification_counts.get(
+        "no_authoritative_timeseries_binding", 0
+    )
+    missing_binding_classification_rows = classification_row_counts.get(
+        "no_authoritative_timeseries_binding", 0
+    )
+    if (
+        isinstance(missing_binding_classification_groups, bool)
+        or not isinstance(missing_binding_classification_groups, int)
+        or missing_binding_classification_groups < 0
+        or missing_binding_classification_groups != missing_binding_groups
+        or isinstance(missing_binding_classification_rows, bool)
+        or not isinstance(missing_binding_classification_rows, int)
+        or missing_binding_classification_rows < 0
+        or missing_binding_classification_rows != missing_binding_rows
+    ):
+        raise ValueError(
+            "complete connector-day missing-binding evidence counts are invalid"
         )
-        classification_row_counts = dict(
-            evidence.get("source_label_target_day_row_counts") or {}
-        )
-        if (
-            missing_binding_groups <= 0
-            or missing_binding_rows <= 0
-            or int(evidence.get("source_records_examined") or -1) < 0
-            or int(evidence.get("canonical_rows_mapped") or -1) != len(canonical_rows)
-            or int(classification_counts.get("no_authoritative_timeseries_binding") or 0)
-            != missing_binding_groups
-            or int(classification_row_counts.get("no_authoritative_timeseries_binding") or 0)
-            != missing_binding_rows
-        ):
-            raise ValueError(
-                "complete connector-day missing-binding evidence counts are invalid"
-            )
     evidence["source_file_identities"] = normalized_identities
     return evidence, canonical_rows
 
@@ -13494,26 +13703,52 @@ def _persist_complete_connector_day_source_evidence(
     evidence: Mapping[str, Any],
     canonical_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Persist evidence immutably; a source-file identity may never change meaning."""
+    """Persist evidence immutably under its complete semantic input identity."""
     day_utc = str(evidence.get("day_utc") or "")
     connector_id = int(evidence.get("connector_id") or 0)
     source_adapter = str(evidence.get("source_adapter") or "").strip()
     source_identity_hash = str(evidence.get("source_file_identities_sha256") or "").strip()
+    source_evidence_input_hash = str(
+        evidence.get("source_evidence_input_sha256") or ""
+    ).strip()
     canonical_rows_sha256 = str(evidence.get("canonical_rows_sha256") or "").strip()
-    canonical_rows_bytes = int(evidence.get("canonical_rows_bytes") or -1)
-    if not day_utc or connector_id <= 0 or not source_adapter or not source_identity_hash:
+    canonical_rows_bytes = _require_nonnegative_evidence_int(
+        evidence, "canonical_rows_bytes"
+    )
+    semantic_mapping_hashes = (
+        evidence.get("source_label_registry_snapshot_content_sha256"),
+        evidence.get("authoritative_station_timeseries_mapping_sha256"),
+        evidence.get("observed_property_mapping_sha256"),
+    )
+    if (
+        not day_utc
+        or connector_id <= 0
+        or not source_adapter
+        or not re.fullmatch(r"[0-9a-f]{64}", source_identity_hash)
+        or not re.fullmatch(r"[0-9a-f]{64}", source_evidence_input_hash)
+        or source_evidence_input_hash != _source_evidence_input_sha256(evidence)
+        or evidence.get("evidence_contract_version")
+        != SOURCE_EVIDENCE_CONTRACT_VERSION
+        or (
+            source_adapter == "sos"
+            and not all(
+                re.fullmatch(r"[0-9a-f]{64}", str(value or ""))
+                for value in semantic_mapping_hashes
+            )
+        )
+    ):
         raise ValueError("complete connector-day detector source evidence persistence identity is invalid")
     evidence_json = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     canonical_rows_json = json.dumps(canonical_rows, separators=(",", ":"), ensure_ascii=False)
-    evidence_sha256 = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+    evidence_sha256 = _immutable_source_evidence_sha256(evidence)
     existing = conn.execute(
         """
         SELECT id, evidence_sha256, canonical_rows_sha256, canonical_rows_bytes
         FROM source_connector_day_evidence
         WHERE env_name = ? AND day_utc = ? AND connector_id = ?
-          AND source_file_identities_sha256 = ?
+          AND source_evidence_input_sha256 = ?
         """,
-        (env_name, day_utc, connector_id, source_identity_hash),
+        (env_name, day_utc, connector_id, source_evidence_input_hash),
     ).fetchone()
     if existing is not None:
         if (
@@ -13522,21 +13757,23 @@ def _persist_complete_connector_day_source_evidence(
             or int(existing[3]) != canonical_rows_bytes
         ):
             raise RuntimeError(
-                "immutable complete connector-day source evidence conflicts for identical source files"
+                "immutable complete connector-day source evidence conflicts for identical semantic inputs"
             )
         return {"evidence_id": int(existing[0]), "evidence_sha256": evidence_sha256}
     cursor = conn.execute(
         """
         INSERT INTO source_connector_day_evidence (
           env_name, day_utc, connector_id, source_adapter,
-          source_file_identities_sha256, canonical_rows_sha256,
+          source_file_identities_sha256, source_evidence_input_sha256,
+          canonical_rows_sha256,
           canonical_rows_bytes, evidence_sha256, evidence_json,
           canonical_rows_json, created_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             env_name, day_utc, connector_id, source_adapter,
-            source_identity_hash, canonical_rows_sha256, canonical_rows_bytes,
+            source_identity_hash, source_evidence_input_hash,
+            canonical_rows_sha256, canonical_rows_bytes,
             evidence_sha256, evidence_json, canonical_rows_json, utc_now().isoformat(),
         ),
     )
@@ -13565,6 +13802,8 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "canonical_rows_sha256",
         "canonical_rows_bytes",
         "total_rows",
+        "evidence_contract_version",
+        "source_evidence_input_sha256",
         "per_timeseries_counts",
         "per_pollutant_counts",
         "pollutant_set",
@@ -13584,6 +13823,10 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "source_label_target_day_row_counts",
         "source_label_summary",
         "source_label_classifications",
+        "source_label_registry_snapshot_content_sha256",
+        "authoritative_station_timeseries_mapping_sha256",
+        "observed_property_mapping_sha256",
+        "source_csv_records_scanned",
     )
     mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
     if mismatched:
@@ -18133,6 +18376,7 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    _prepare_source_connector_day_evidence_migration(conn)
     legacy_sftc_rows = _prepare_source_file_timeseries_counts_migration(conn)
     conn.executescript(SCHEMA_SQL)
     if legacy_sftc_rows is not None:

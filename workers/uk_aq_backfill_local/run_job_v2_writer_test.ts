@@ -225,6 +225,7 @@ Deno.test("UK-AIR CSV skips selected rows when no authoritative timeseries bindi
 
   assertEquals(parsed.rows, []);
   assertEquals(parsed.mapped_records, 0);
+  assertEquals(parsed.selected_source_records_examined, 2);
   assertEquals(parsed.missing_binding_groups, 1);
   assertEquals(parsed.missing_binding_rows, 2);
   assertEquals(parsed.source_label_classifications, [{
@@ -243,6 +244,64 @@ Deno.test("UK-AIR CSV skips selected rows when no authoritative timeseries bindi
     expected_normalised_unit: "ug/m3",
     possible_supported_pollutant_label: false,
   }]);
+});
+
+Deno.test("UK-AIR selected source count includes mapped and missing-binding rows", () => {
+  const pm10Label = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const no2Label = "Nitrogen dioxide (Hourly measured)";
+  const registryEntries = new Map([
+    [pm10Label.toLowerCase(), {
+      normalised_source_label: pm10Label.toLowerCase(),
+      status: "mapped" as const,
+      pollutant_code: "pm10",
+      expected_uom: "ug/m3",
+      raw_label_variants: [pm10Label],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-18T00:00:00Z",
+      review_notes: null,
+    }],
+    [no2Label.toLowerCase(), {
+      normalised_source_label: no2Label.toLowerCase(),
+      status: "mapped" as const,
+      pollutant_code: "no2",
+      expected_uom: "ug/m3",
+      raw_label_variants: [no2Label],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-18T00:00:00Z",
+      review_notes: null,
+    }],
+  ]);
+  const parsed = parseUkAirFlatFileObservations({
+    dayUtc: "2026-07-18",
+    siteRef: "HG4",
+    csvText: [
+      "All Data GMT hour ending",
+      `Date,time,"${pm10Label}",status,unit,"${no2Label}",status,unit`,
+      "18-07-2026,01:00,10,R,ugm-3,20,R,ugm-3",
+      "18-07-2026,02:00,11,R,ugm-3,21,R,ugm-3",
+    ].join("\n"),
+    mappings: [{
+      site_ref: "HG4",
+      uk_air_ref: "HG4",
+      pollutant_code: "no2",
+      station_id: 10,
+      timeseries_id: 20,
+      station_ref: "station-hg4",
+      timeseries_ref: "timeseries-hg4-no2",
+      valid_from_day_utc: "2020-01-01",
+      valid_to_day_utc: null,
+    }],
+    propertyMappings: [
+      propertyMapping(pm10Label, "pm10"),
+      propertyMapping(no2Label, "no2"),
+    ],
+    registryEntries,
+  });
+
+  assertEquals(parsed.mapped_records, 2);
+  assertEquals(parsed.missing_binding_rows, 2);
+  assertEquals(parsed.selected_source_records_examined, 4);
+  assertEquals(parsed.rows.length, 2);
 });
 
 Deno.test("UK-AIR CSV registry and core mapping contradiction remains fail closed", () => {
