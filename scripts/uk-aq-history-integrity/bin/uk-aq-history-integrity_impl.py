@@ -2263,15 +2263,15 @@ def _uk_air_source_label_seed_decisions(conn: sqlite3.Connection) -> dict[str, t
     for key, candidates in grouped.items():
         active = [row for row in candidates if int(row[4] or 0) == 1]
         mapped = [row for row in active if str(row[3] or "") == "raw_observed_property" and str(row[2] or "").lower() in {"pm25", "pm10", "no2", "o3"}]
-        if len(mapped) == 1:
+        if len(active) == 1 and len(mapped) == 1:
             row = mapped[0]
             expected_uom = str(row[1] or "").strip()
             if expected_uom:
                 decisions[key] = ("mapped", str(row[2]).lower(), expected_uom)
             continue
-        # Multiple supported mappings are not safe to turn into an automatic
-        # ignore decision.  Leave them for explicit operator review instead.
-        if mapped:
+        # More than one active mapping is never safe to seed automatically,
+        # even when only one of those mappings targets a supported pollutant.
+        if len(active) > 1:
             continue
         ignored = [row for row in active if str(row[3] or "") == "ignored"]
         unsupported = [row for row in active if str(row[3] or "") == "raw_observed_property" and str(row[2] or "").strip()]
@@ -2282,11 +2282,11 @@ def _uk_air_source_label_seed_decisions(conn: sqlite3.Connection) -> dict[str, t
 
 def refresh_uk_air_source_label_registry(
     *, conn: sqlite3.Connection, cache_root: Path, connector_id: int = 1,
-    required_paths: Iterable[Path] | None = None,
 ) -> dict[str, Any]:
     """Discover cached UK-AIR headings and idempotently register decisions.
 
-    Existing registry decisions are never replaced by a later source scan.
+    Operator-reviewed registry decisions are never replaced by a later source
+    scan. Stale unreviewed automatic decisions are returned to review.
     """
     import csv
 
@@ -2294,7 +2294,7 @@ def refresh_uk_air_source_label_registry(
     seeds = _uk_air_source_label_seed_decisions(conn)
     discovered: dict[str, dict[str, Any]] = {}
     scan_errors: list[dict[str, str]] = []
-    required = {str(path.resolve(strict=False)) for path in (required_paths or [])}
+    reclassified_unreviewed_labels: list[str] = []
     for csv_path in sorted(cache_root.glob("site_ref=*/year=*/*.csv")):
         site_ref = csv_path.stem.rsplit("_", 1)[0].upper()
         try:
@@ -2319,10 +2319,7 @@ def refresh_uk_air_source_label_registry(
                         if index < len(cells) and _sos_to_finite_number(cells[index]) is not None and index + 2 < len(cells) and cells[index + 2]:
                             discovered[key]["units"].add(cells[index + 2])
         except (OSError, UnicodeError, csv.Error) as exc:
-            scan_errors.append({"path": str(csv_path), "exception": type(exc).__name__, "message": str(exc), "required": str(csv_path.resolve(strict=False)) in required})
-    required_errors = [entry for entry in scan_errors if entry["required"]]
-    if required_errors:
-        raise RuntimeError(f"UK-AIR registry scan failed for required cached source files: {json.dumps(required_errors, sort_keys=True)}")
+            scan_errors.append({"path": str(csv_path), "exception": type(exc).__name__, "message": str(exc)})
     for key, entry in discovered.items():
         existing = conn.execute(
             "SELECT status, pollutant_code, expected_uom, first_seen_at_utc, first_seen_site_ref, reviewed_at_utc, review_notes, raw_label_variants_json, observed_units_json FROM uk_air_csv_source_labels WHERE connector_id=? AND normalised_source_label=?",
@@ -2342,20 +2339,29 @@ def refresh_uk_air_source_label_registry(
             continue
         prior_variants = set(json.loads(existing[7] or "[]"))
         prior_units = set(json.loads(existing[8] or "[]"))
+        status = str(existing[0] or "review")
+        pollutant_code = existing[1]
+        expected_uom = existing[2]
+        if not existing[5] and status in {"mapped", "ignore"}:
+            current_decision = (status, pollutant_code, expected_uom)
+            if seeds.get(key) != current_decision:
+                status = "review"
+                pollutant_code = None
+                expected_uom = None
+                reclassified_unreviewed_labels.append(key)
         conn.execute(
-            """UPDATE uk_air_csv_source_labels SET last_seen_at_utc=?, last_seen_site_ref=?, expected_uom=?, raw_label_variants_json=?, observed_units_json=?
+            """UPDATE uk_air_csv_source_labels SET last_seen_at_utc=?, last_seen_site_ref=?, status=?, pollutant_code=?, expected_uom=?, raw_label_variants_json=?, observed_units_json=?
                WHERE connector_id=? AND normalised_source_label=?""",
-            (now_iso, last_site, existing[2], json.dumps(sorted(prior_variants | set(variants))), json.dumps(sorted(prior_units | set(units))), connector_id, key),
+            (now_iso, last_site, status, pollutant_code, expected_uom, json.dumps(sorted(prior_variants | set(variants))), json.dumps(sorted(prior_units | set(units))), connector_id, key),
         )
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM uk_air_csv_source_labels WHERE connector_id=? GROUP BY status", (connector_id,)).fetchall())
-    return {"discovered_labels": len(discovered), "mapped_labels": int(counts.get("mapped", 0)), "ignored_labels": int(counts.get("ignore", 0)), "review_labels": int(counts.get("review", 0)), "scan_errors": scan_errors}
+    return {"discovered_labels": len(discovered), "mapped_labels": int(counts.get("mapped", 0)), "ignored_labels": int(counts.get("ignore", 0)), "review_labels": int(counts.get("review", 0)), "scan_errors": scan_errors, "reclassified_unreviewed_labels": sorted(reclassified_unreviewed_labels)}
 
 
 def write_uk_air_source_label_registry_snapshot(
     *, conn: sqlite3.Connection, connector_id: int, cache_root: Path, snapshot_path: Path,
-    required_paths: Iterable[Path] | None = None,
 ) -> dict[str, Any]:
-    inventory = refresh_uk_air_source_label_registry(conn=conn, cache_root=cache_root, connector_id=connector_id, required_paths=required_paths)
+    inventory = refresh_uk_air_source_label_registry(conn=conn, cache_root=cache_root, connector_id=connector_id)
     rows = conn.execute(
         """SELECT source_label, normalised_source_label, status, pollutant_code, expected_uom, raw_label_variants_json, observed_units_json, reviewed_at_utc, review_notes
            FROM uk_air_csv_source_labels WHERE connector_id=? ORDER BY normalised_source_label""",
@@ -13766,13 +13772,18 @@ def run_v2_gap_backfills(
                 connector_id=connector_id,
                 cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
                 snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
-                required_paths=(Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY).glob(f"site_ref=*/year={day_obj.year}/*.csv"),
             )
             optional_scan_errors = list((registry_snapshot.get("inventory") or {}).get("scan_errors") or [])
             if optional_scan_errors:
                 log.warning(
                     "UK-AIR registry optional inventory scan errors day=%s connector_id=%s count=%s samples=%s",
                     day_iso, connector_id, len(optional_scan_errors), optional_scan_errors[:5],
+                )
+            reclassified_labels = list((registry_snapshot.get("inventory") or {}).get("reclassified_unreviewed_labels") or [])
+            if reclassified_labels:
+                log.warning(
+                    "UK-AIR registry returned stale unreviewed automatic decisions to review day=%s connector_id=%s count=%s labels=%s",
+                    day_iso, connector_id, len(reclassified_labels), reclassified_labels,
                 )
         if run_state is not None and registry_snapshot is not None:
             run_state.setdefault("sos_source_label_registry_snapshots", {})[
