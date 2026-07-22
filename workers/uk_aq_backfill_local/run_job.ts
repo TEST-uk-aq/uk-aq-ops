@@ -9020,6 +9020,7 @@ export type UkAirFlatFileParseResult = {
 export function parseUkAirFlatFileObservations(args: {
   dayUtc: string;
   siteRef: string;
+  sourceFile?: string;
   csvText: string;
   mappings: SosSiteTimeseriesRef[];
   propertyMappings: ObservedPropertyMapping[];
@@ -9030,8 +9031,17 @@ export function parseUkAirFlatFileObservations(args: {
     ? loadSosSourceLabelRegistrySnapshot()?.entries
     : args.registryEntries;
   const lines = args.csvText.split(/\r?\n/);
-  if (!lines.some((line) => line.trim().toLowerCase() === "all data gmt hour ending")) {
-    throw new Error(`UK-AIR CSV ${args.siteRef} does not declare All Data GMT hour ending`);
+  const expectedTimeBasisDeclaration = "All Data GMT hour ending";
+  if (!lines.some((line) =>
+    line.replace(/^\uFEFF/, "").trim().includes(expectedTimeBasisDeclaration)
+  )) {
+    logStructured("warning", "sos_uk_air_csv_time_basis_warning", {
+      site_ref: args.siteRef,
+      source_file: args.sourceFile || args.siteRef,
+      expected_phrase: expectedTimeBasisDeclaration,
+      message:
+        "Expected GMT hour-ending declaration was not found; continuing with CSV processing.",
+    });
   }
 
   const mappingsByPollutant = new Map<string, SosSiteTimeseriesRef[]>();
@@ -14345,6 +14355,7 @@ async function runSourceToAll(
             const parsed = parseUkAirFlatFileObservations({
               dayUtc,
               siteRef,
+              sourceFile: path.basename(csvPath),
               csvText,
               mappings: validFlatFileMappings,
               propertyMappings: observedPropertyMappings,
