@@ -22,9 +22,9 @@ def normalise_label(value: str) -> str:
 def default_db_path(env_name: str) -> Path:
     state_dir = os.environ.get("UK_AQ_HISTORY_INTEGRITY_STATE_DIR", "").strip()
     if state_dir:
-        root = Path(state_dir)
-        return root / "uk_aq_history_integrity.sqlite" if root.name == env_name else root / env_name / "uk_aq_history_integrity.sqlite"
-    return Path("/Users/mikehinford/uk-aq-history-integrity/state") / env_name / "uk_aq_history_integrity.sqlite"
+        return Path(state_dir) / "uk_aq_history_integrity.sqlite"
+    local_root = Path(os.environ.get("UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT", "").strip() or (Path.home() / "uk-aq-history-integrity"))
+    return local_root / "state" / env_name / "uk_aq_history_integrity.sqlite"
 
 
 def print_row(row: sqlite3.Row | None) -> None:
@@ -79,8 +79,15 @@ def main() -> int:
             return 0 if row is not None else 1
         if row is None:
             raise SystemExit("label has not been discovered by Integrity; run the SOS scan before setting a decision")
-        if args.status == "mapped" and not args.pollutant_code:
+        existing_status = str(row["status"] or "")
+        existing_code = str(row["pollutant_code"] or "").strip() or None
+        existing_uom = str(row["expected_uom"] or "").strip() or None
+        pollutant_code = args.pollutant_code or (existing_code if args.status == "mapped" and existing_status == "mapped" else None)
+        expected_uom = str(args.expected_uom or "").strip() or (existing_uom if args.status == "mapped" and existing_status == "mapped" else None)
+        if args.status == "mapped" and not pollutant_code:
             raise SystemExit("mapped requires --pollutant-code pm25|pm10|no2|o3")
+        if args.status == "mapped" and not expected_uom:
+            raise SystemExit("mapped requires a non-empty --expected-uom")
         if args.status != "mapped" and args.pollutant_code:
             raise SystemExit("ignore and review do not accept --pollutant-code")
         if args.status != "mapped" and args.expected_uom:
@@ -92,8 +99,8 @@ def main() -> int:
             """UPDATE uk_air_csv_source_labels
                SET status=?, pollutant_code=?, expected_uom=?, reviewed_at_utc=?, review_notes=?
                WHERE connector_id=1 AND normalised_source_label=?""",
-            (args.status, args.pollutant_code if args.status == "mapped" else None,
-             args.expected_uom, now, args.notes, key),
+            (args.status, pollutant_code if args.status == "mapped" else None,
+             expected_uom if args.status == "mapped" else None, now, args.notes, key),
         )
         conn.commit()
         print("after:")
