@@ -9058,10 +9058,13 @@ export function parseUkAirFlatFileObservations(args: {
     decisionSource: "integrity_registry" | "integrity_registry_and_core" | "core_mapping";
     units: Set<string>;
     targetDayNonNullRowCount: number;
+    targetDayBlankUnitRowCount: number;
+    headerSectionIndex: number;
     pendingRows: Array<{ observedAt: string; value: number; status: string | null; unit: string }>;
   };
   let columnBindings: ColumnBinding[] = [];
   const mappedSelectedSourceLabelColumns: ColumnBinding[] = [];
+  let headerSectionIndex = 0;
   let unselectedPollutantValueIndexes: number[] = [];
   type SkippedSourceLabelColumn = {
     valueIndex: number;
@@ -9081,6 +9084,7 @@ export function parseUkAirFlatFileObservations(args: {
       String(cells[0] || "").toLowerCase() === "date" &&
       String(cells[1] || "").toLowerCase() === "time"
     ) {
+      headerSectionIndex += 1;
       columnBindings = [];
       unselectedPollutantValueIndexes = [];
       skippedSourceLabelColumns = [];
@@ -9189,6 +9193,8 @@ export function parseUkAirFlatFileObservations(args: {
           decisionSource,
           units: new Set<string>(),
           targetDayNonNullRowCount: 0,
+          targetDayBlankUnitRowCount: 0,
+          headerSectionIndex,
           pendingRows: [],
         };
         columnBindings.push(binding);
@@ -9221,6 +9227,15 @@ export function parseUkAirFlatFileObservations(args: {
       continue;
     }
     result.source_records += 1;
+    // Unit evidence belongs to the header section, not only to the target
+    // day.  A blank target-day unit may inherit only this section's proven
+    // compatible non-empty unit evidence.
+    for (const binding of columnBindings) {
+      const value = toFiniteNumber(cells[binding.valueIndex]);
+      if (value === null) continue;
+      const unit = String(cells[binding.unitIndex] || "").trim();
+      if (unit) binding.units.add(unit);
+    }
     if (sourceDay !== args.dayUtc) {
       result.skipped_other_days += 1;
       continue;
@@ -9260,7 +9275,7 @@ export function parseUkAirFlatFileObservations(args: {
       if (value === null) continue;
       const unit = String(cells[binding.unitIndex] || "").trim();
       binding.targetDayNonNullRowCount += 1;
-      if (unit) binding.units.add(unit);
+      if (!unit) binding.targetDayBlankUnitRowCount += 1;
       if (unit) units.add(unit);
       binding.pendingRows.push({ observedAt, value, unit, status: String(cells[binding.statusIndex] || "").trim() || null });
     }
@@ -9270,9 +9285,11 @@ export function parseUkAirFlatFileObservations(args: {
     const normalisedExpectedUnit = normaliseConcentrationUnitForComparison(expectedUnit);
     const observedUnits = Array.from(binding.units).sort();
     const normalisedUnits = observedUnits.map(normaliseConcentrationUnitForComparison);
-    if (!expectedUnit || !normalisedExpectedUnit || !observedUnits.length ||
+    const hasTargetDayValues = binding.targetDayNonNullRowCount > 0;
+    if (!expectedUnit || !normalisedExpectedUnit ||
+      (hasTargetDayValues && !observedUnits.length) ||
       normalisedUnits.some((unit) => unit !== normalisedExpectedUnit)) {
-      throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.sourceLabel)} observed_property_code=${binding.property.observed_property_code} expected_raw_unit=${JSON.stringify(expectedUnit)} expected_normalised_unit=${JSON.stringify(normalisedExpectedUnit)} observed_raw_units=${JSON.stringify(observedUnits)} observed_normalised_units=${JSON.stringify(normalisedUnits)} blank_unit_row_count=${binding.pendingRows.filter((row) => !row.unit).length}`);
+      throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.sourceLabel)} observed_property_code=${binding.property.observed_property_code} header_section_index=${binding.headerSectionIndex} expected_raw_unit=${JSON.stringify(expectedUnit)} expected_normalised_unit=${JSON.stringify(normalisedExpectedUnit)} observed_raw_units=${JSON.stringify(observedUnits)} observed_normalised_units=${JSON.stringify(normalisedUnits)} target_day_non_null_row_count=${binding.targetDayNonNullRowCount} target_day_blank_unit_row_count=${binding.targetDayBlankUnitRowCount}`);
     }
     for (const row of binding.pendingRows) {
       result.rows.push({
@@ -9296,6 +9313,11 @@ export function parseUkAirFlatFileObservations(args: {
       site_ref: args.siteRef,
       observed_units: Array.from(column.units).sort(),
       target_day_non_null_row_count: column.targetDayNonNullRowCount,
+      target_day_blank_unit_row_count: column.targetDayBlankUnitRowCount,
+      header_section_index: column.headerSectionIndex,
+      section_normalised_units: Array.from(column.units).map(normaliseConcentrationUnitForComparison).sort(),
+      expected_unit: column.expectedUom,
+      expected_normalised_unit: normaliseConcentrationUnitForComparison(column.expectedUom),
       possible_supported_pollutant_label: false,
       mapping_decision_source: column.decisionSource,
     })),
@@ -14208,6 +14230,8 @@ async function runSourceToAll(
             site_refs: Set<string>;
             observed_units: Set<string>;
             target_day_non_null_row_count: number;
+            target_day_blank_unit_row_count: number;
+            section_unit_evidence: Map<string, Record<string, unknown>>;
             possible_supported_pollutant_label: boolean;
           }>();
           for (const entry of flatFileSourceLabelClassifications) {
@@ -14221,6 +14245,8 @@ async function runSourceToAll(
               site_refs: new Set<string>(),
               observed_units: new Set<string>(),
               target_day_non_null_row_count: 0,
+              target_day_blank_unit_row_count: 0,
+              section_unit_evidence: new Map<string, Record<string, unknown>>(),
               possible_supported_pollutant_label: false,
             };
             if (entry.source_label) summary.raw_label_variants.add(String(entry.source_label));
@@ -14229,6 +14255,20 @@ async function runSourceToAll(
               summary.observed_units.add(String(unit));
             }
             summary.target_day_non_null_row_count += Number(entry.target_day_non_null_row_count || 0);
+            summary.target_day_blank_unit_row_count += Number(entry.target_day_blank_unit_row_count || 0);
+            if (entry.header_section_index !== undefined) {
+              const section = {
+                site_ref: String(entry.site_ref || ""),
+                header_section_index: Number(entry.header_section_index),
+                target_day_non_null_row_count: Number(entry.target_day_non_null_row_count || 0),
+                target_day_blank_unit_row_count: Number(entry.target_day_blank_unit_row_count || 0),
+                section_non_empty_units: Array.isArray(entry.observed_units) ? entry.observed_units : [],
+                section_normalised_units: Array.isArray(entry.section_normalised_units) ? entry.section_normalised_units : [],
+                expected_unit: entry.expected_unit || null,
+                expected_normalised_unit: entry.expected_normalised_unit || null,
+              };
+              summary.section_unit_evidence.set(`${section.site_ref}|${section.header_section_index}`, section);
+            }
             summary.possible_supported_pollutant_label ||= Boolean(entry.possible_supported_pollutant_label);
             sourceLabelClassificationSummary.set(key, summary);
           }
@@ -14241,6 +14281,8 @@ async function runSourceToAll(
               site_refs: Array.from(entry.site_refs).sort().slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT),
               observed_units: Array.from(entry.observed_units).sort(),
               target_day_non_null_row_count: entry.target_day_non_null_row_count,
+              target_day_blank_unit_row_count: entry.target_day_blank_unit_row_count,
+              section_unit_evidence: Array.from(entry.section_unit_evidence.values()),
               possible_supported_pollutant_label: entry.possible_supported_pollutant_label,
             }))
             .sort((left, right) => `${left.classification}|${left.normalised_source_label}`.localeCompare(`${right.classification}|${right.normalised_source_label}`));

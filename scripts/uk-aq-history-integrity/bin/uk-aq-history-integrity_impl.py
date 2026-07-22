@@ -2265,7 +2265,9 @@ def _uk_air_source_label_seed_decisions(conn: sqlite3.Connection) -> dict[str, t
         mapped = [row for row in active if str(row[3] or "") == "raw_observed_property" and str(row[2] or "").lower() in {"pm25", "pm10", "no2", "o3"}]
         if len(mapped) == 1:
             row = mapped[0]
-            decisions[key] = ("mapped", str(row[2]).lower(), str(row[1] or "") or "ug/m3")
+            expected_uom = str(row[1] or "").strip()
+            if expected_uom:
+                decisions[key] = ("mapped", str(row[2]).lower(), expected_uom)
             continue
         # Multiple supported mappings are not safe to turn into an automatic
         # ignore decision.  Leave them for explicit operator review instead.
@@ -2280,6 +2282,7 @@ def _uk_air_source_label_seed_decisions(conn: sqlite3.Connection) -> dict[str, t
 
 def refresh_uk_air_source_label_registry(
     *, conn: sqlite3.Connection, cache_root: Path, connector_id: int = 1,
+    required_paths: Iterable[Path] | None = None,
 ) -> dict[str, Any]:
     """Discover cached UK-AIR headings and idempotently register decisions.
 
@@ -2291,6 +2294,7 @@ def refresh_uk_air_source_label_registry(
     seeds = _uk_air_source_label_seed_decisions(conn)
     discovered: dict[str, dict[str, Any]] = {}
     scan_errors: list[dict[str, str]] = []
+    required = {str(path.resolve(strict=False)) for path in (required_paths or [])}
     for csv_path in sorted(cache_root.glob("site_ref=*/year=*/*.csv")):
         site_ref = csv_path.stem.rsplit("_", 1)[0].upper()
         try:
@@ -2315,9 +2319,10 @@ def refresh_uk_air_source_label_registry(
                         if index < len(cells) and _sos_to_finite_number(cells[index]) is not None and index + 2 < len(cells) and cells[index + 2]:
                             discovered[key]["units"].add(cells[index + 2])
         except (OSError, UnicodeError, csv.Error) as exc:
-            scan_errors.append({"path": str(csv_path), "exception": type(exc).__name__, "message": str(exc)})
-    if scan_errors:
-        raise RuntimeError(f"UK-AIR registry scan failed for cached source files: {json.dumps(scan_errors, sort_keys=True)}")
+            scan_errors.append({"path": str(csv_path), "exception": type(exc).__name__, "message": str(exc), "required": str(csv_path.resolve(strict=False)) in required})
+    required_errors = [entry for entry in scan_errors if entry["required"]]
+    if required_errors:
+        raise RuntimeError(f"UK-AIR registry scan failed for required cached source files: {json.dumps(required_errors, sort_keys=True)}")
     for key, entry in discovered.items():
         existing = conn.execute(
             "SELECT status, pollutant_code, expected_uom, first_seen_at_utc, first_seen_site_ref, reviewed_at_utc, review_notes, raw_label_variants_json, observed_units_json FROM uk_air_csv_source_labels WHERE connector_id=? AND normalised_source_label=?",
@@ -2337,14 +2342,10 @@ def refresh_uk_air_source_label_registry(
             continue
         prior_variants = set(json.loads(existing[7] or "[]"))
         prior_units = set(json.loads(existing[8] or "[]"))
-        seeded = seeds.get(key)
-        expected_uom = existing[2]
-        if existing[0] == "mapped" and not expected_uom and not existing[5] and seeded and seeded[0] == "mapped" and seeded[1] == existing[1]:
-            expected_uom = seeded[2]
         conn.execute(
             """UPDATE uk_air_csv_source_labels SET last_seen_at_utc=?, last_seen_site_ref=?, expected_uom=?, raw_label_variants_json=?, observed_units_json=?
                WHERE connector_id=? AND normalised_source_label=?""",
-            (now_iso, last_site, expected_uom, json.dumps(sorted(prior_variants | set(variants))), json.dumps(sorted(prior_units | set(units))), connector_id, key),
+            (now_iso, last_site, existing[2], json.dumps(sorted(prior_variants | set(variants))), json.dumps(sorted(prior_units | set(units))), connector_id, key),
         )
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM uk_air_csv_source_labels WHERE connector_id=? GROUP BY status", (connector_id,)).fetchall())
     return {"discovered_labels": len(discovered), "mapped_labels": int(counts.get("mapped", 0)), "ignored_labels": int(counts.get("ignore", 0)), "review_labels": int(counts.get("review", 0)), "scan_errors": scan_errors}
@@ -2352,8 +2353,9 @@ def refresh_uk_air_source_label_registry(
 
 def write_uk_air_source_label_registry_snapshot(
     *, conn: sqlite3.Connection, connector_id: int, cache_root: Path, snapshot_path: Path,
+    required_paths: Iterable[Path] | None = None,
 ) -> dict[str, Any]:
-    inventory = refresh_uk_air_source_label_registry(conn=conn, cache_root=cache_root, connector_id=connector_id)
+    inventory = refresh_uk_air_source_label_registry(conn=conn, cache_root=cache_root, connector_id=connector_id, required_paths=required_paths)
     rows = conn.execute(
         """SELECT source_label, normalised_source_label, status, pollutant_code, expected_uom, raw_label_variants_json, observed_units_json, reviewed_at_utc, review_notes
            FROM uk_air_csv_source_labels WHERE connector_id=? ORDER BY normalised_source_label""",
@@ -2361,7 +2363,7 @@ def write_uk_air_source_label_registry_snapshot(
     ).fetchall()
     labels = [{"source_label": row[0], "normalised_source_label": row[1], "status": row[2], "pollutant_code": row[3], "expected_uom": row[4], "raw_label_variants": json.loads(row[5] or "[]"), "observed_units": json.loads(row[6] or "[]"), "reviewed_at_utc": row[7], "review_notes": row[8]} for row in rows]
     payload: dict[str, Any] = {"schema_version": 1, "connector_id": connector_id, "generated_at_utc": utc_now_iso(), "inventory": inventory, "labels": labels}
-    payload["registry_content_sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    payload["registry_content_sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"path": str(snapshot_path), "registry_file_sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(), "registry_content_sha256": payload["registry_content_sha256"], "inventory": inventory, "review_labels": [entry["normalised_source_label"] for entry in labels if entry["status"] == "review"]}
@@ -13570,6 +13572,7 @@ def run_v2_gap_backfills(
     run_state: dict[str, Any] | None = None,
     queue_aqi_from_observation_repairs: bool = True,
     repair_pollutants: Iterable[str] | None = None,
+    source_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -13752,7 +13755,7 @@ def run_v2_gap_backfills(
         )
         sos_connector_id = int(str(env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") or "1"))
         registry_snapshot: dict[str, Any] | None = None
-        if connector_id == sos_connector_id:
+        if connector_id == sos_connector_id and str((source_scope or {}).get("source") or "") in {"sos", "all"}:
             registry_root = (
                 Path(str(run_state["run_root"])) / "sos-source-label-registry"
                 if run_state is not None
@@ -13763,7 +13766,14 @@ def run_v2_gap_backfills(
                 connector_id=connector_id,
                 cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
                 snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
+                required_paths=(Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY).glob(f"site_ref=*/year={day_obj.year}/*.csv"),
             )
+            optional_scan_errors = list((registry_snapshot.get("inventory") or {}).get("scan_errors") or [])
+            if optional_scan_errors:
+                log.warning(
+                    "UK-AIR registry optional inventory scan errors day=%s connector_id=%s count=%s samples=%s",
+                    day_iso, connector_id, len(optional_scan_errors), optional_scan_errors[:5],
+                )
         if run_state is not None and registry_snapshot is not None:
             run_state.setdefault("sos_source_label_registry_snapshots", {})[
                 f"{day_iso}/connector_id={connector_id}"
@@ -16383,6 +16393,7 @@ def run_v2_integrity_repair_flow(
         # historical observation specialist must not enqueue a duplicate.
         queue_aqi_from_observation_repairs=False,
         repair_pollutants=repair_pollutants,
+        source_scope=source_scope,
     )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
