@@ -43,6 +43,8 @@ Each date in that seven-day range is selected even when its own top-level R2 day
 
 The daily profile does not infer or select dates after `latest_r2_observations_day`. A manual scoped run or another writer must first establish a later committed observations day before the scheduled profile advances beyond the current latest day.
 
+Because discovery uses the committed local Dropbox mirror rather than live R2, a run using an older mirror, including one allowed through `--allow-stale-dropbox`, remains anchored to the latest day visible in that mirror until a newer successful Dropbox backup is available.
+
 ## Historical month representation
 
 A historical year/month is represented when at least one strictly parsed top-level observations day directory exists in that month and the month is earlier than the month containing `latest_r2_observations_day`.
@@ -83,11 +85,36 @@ The logical run date is UTC. Across each logical calendar month, historical day 
 
 A historical target is skipped only when that constructed calendar date is invalid for the represented historical month. For example, a selected historical day number 31 is skipped for April.
 
+## Missed logical-date catch-up
+
+The daily profile uses the local Integrity SQLite `daily_profile_state` table to recover historical allocations belonging to UTC logical run dates that did not complete successfully.
+
+Catch-up is calculated separately for each Integrity environment:
+
+1. If the environment has no daily-profile state rows, the feature starts from the current logical date. It deliberately does not invent catch-up work for dates before the feature was first used.
+2. Otherwise, Integrity finds the latest logical date whose state is `complete` or `caught_up`.
+3. Starting with the following UTC date and ending on the day before the current logical run date, any date with no state row, or whose state is not `complete` or `caught_up`, is treated as missed.
+4. If state rows exist but none is complete or caught up, the scan starts from the earliest recorded logical date.
+5. For each missed logical date, Integrity calculates that date's historical day-number allocation using the rules above and adds the corresponding dates in every represented historical month to the current selection.
+
+Catch-up recovers the historical day-of-month allocations that a missed daily profile would have contributed. It does **not** replay a separate seven-day recent window for every missed logical date. The current run always contributes one recent seven-day window, recalculated from the latest observations day visible in the chosen Dropbox mirror.
+
+The recent dates, current historical allocations and catch-up historical allocations are combined and de-duplicated. A selected date may retain more than one reason, including `recent`, `historical:<day-number>` and `catch_up:<missed-logical-date>:<day-number>`.
+
+Catch-up state is cleared only by a successful real daily repair run:
+
+- the current logical date is marked `complete` only when a non-dry-run `--run-backfill` daily profile finishes with overall status `ok`;
+- only after that completion are the included missed logical dates marked `caught_up` and linked to the completing Integrity run;
+- a dry run is recorded as `dry_run` and does not clear catch-up work;
+- failed, stopped, skipped or otherwise incomplete daily runs do not clear catch-up work, so those logical dates remain eligible for a later daily profile.
+
 ## Connector and source scope
 
 Daily date selection is global and happens before connector-specific checking.
 
 The selected dates do not imply that every connector is expected to exist on every selected day. After selection, Integrity applies the requested source, connector and pollutant scope and evaluates each relevant connector according to its authoritative source and mapping contract.
+
+For example, running the daily profile with `--source sos` uses the same global recent, historical and catch-up date selection, but only the SOS connector scope is acquired, checked and, when requested, repaired.
 
 The date-selection stage must not become connector-specific unless this system contract is deliberately changed.
 
@@ -103,4 +130,7 @@ The run evidence records at least:
 - the allocated historical day numbers;
 - the number of represented historical months;
 - every selected date and its selection reason;
-- any catch-up logical dates applied by the scheduler state.
+- each catch-up logical date included in the selection;
+- whether catch-up completion occurred;
+- each logical date marked `caught_up` by the completing run;
+- the persisted state-row status for the current logical date.
