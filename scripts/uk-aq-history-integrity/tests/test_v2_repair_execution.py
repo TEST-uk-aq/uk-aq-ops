@@ -831,6 +831,115 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertEqual(stages["aqilevels"], "planned")
         self.assertEqual(result["status"], "failed")
 
+    def test_canonical_coordinator_bridges_28_observation_backed_aqi_days_before_final_verification(self) -> None:
+        self.conn.execute("""
+            CREATE TABLE core_observed_property_mappings_snapshot (
+              id INTEGER PRIMARY KEY, connector_id INTEGER NOT NULL,
+              observed_property_code TEXT, mapping_kind TEXT NOT NULL,
+              is_aqi_eligible INTEGER NOT NULL, is_active INTEGER NOT NULL
+            )
+        """)
+        self.conn.executemany(
+            """
+            INSERT INTO core_observed_property_mappings_snapshot (
+              id, connector_id, observed_property_code, mapping_kind,
+              is_aqi_eligible, is_active
+            ) VALUES (?, 1, ?, 'direct', 1, 1)
+            """,
+            [(1, "no2"), (2, "pm10"), (3, "pm25")],
+        )
+        run_state = MODULE.create_run_overlay(
+            tmp_dir=self.root / "tmp",
+            run_id="canonical-aqi-bridge",
+            environment="CIC-Test",
+            base_dropbox_root=self.root / "R2_history_backup",
+        )
+        gaps = []
+        for day_offset in range(28):
+            day_utc = (MODULE.dt.date(2026, 2, 1) + MODULE.dt.timedelta(days=day_offset)).isoformat()
+            gaps.append({
+                "gap_type": "day_dir_missing",
+                "day_utc": day_utc,
+                "connector_id": 1,
+                "source_evidence": {"v2_observations_present": True},
+                "suggested_repair": {"kind": MODULE.V2_AQI_OBS_REBUILD_KIND},
+            })
+            for pollutant_code in ("no2", "pm10", "pm25"):
+                gaps.append({
+                    "gap_type": "aqi_manifest_missing_after_obs_repair",
+                    "day_utc": day_utc,
+                    "connector_id": 1,
+                    "pollutant_code": pollutant_code,
+                    "source_evidence": {"v2_observations_present": True},
+                    "suggested_repair": {"kind": MODULE.V2_AQI_OBS_REBUILD_KIND},
+                })
+        execution_order: list[str] = []
+
+        def execute_aqi_queue(*_args, **_kwargs):
+            execution_order.append("aqi")
+            queued = self.conn.execute(
+                "SELECT COUNT(*) FROM aqi_rebuild_queue WHERE run_id = 281"
+            ).fetchone()[0]
+            self.assertEqual(queued, 28)
+            return {
+                "aqi_rebuild_ran": True,
+                "aqi_rebuilds_queued": 28,
+                "aqi_rebuilds_queued_total": 28,
+                "aqi_rebuilds_attempted": 28,
+                "aqi_rebuilds_complete": 28,
+                "aqi_rebuilds_failed": 0,
+                "aqi_rebuild_results": [],
+            }
+
+        def final_verification(*_args, **_kwargs):
+            execution_order.append("final_verification")
+            self.assertEqual(execution_order, ["aqi", "final_verification"])
+            return {
+                "status": "ok",
+                "remaining_gap_count": 0,
+                "r2_objects_written": 0,
+                "r2_objects_deleted": 0,
+                "r2_objects_changed": 0,
+            }
+
+        metadata_ok = {"status": "ok", "manifest_status": "ok", "index_status": "ok", "results": []}
+        with mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={
+            "v2_observation_repairs_failed": 0,
+            "v2_observation_repairs_guard_failed": 0,
+        }), mock.patch.object(MODULE, "_run_v2_observation_metadata_executor", side_effect=[metadata_ok, metadata_ok]), \
+             mock.patch.object(MODULE, "_record_metadata_executor_overlay"), \
+             mock.patch.object(MODULE, "record_integrity_object_operations", return_value={}), \
+             mock.patch.object(MODULE, "run_aqi_rebuild_queue_execution", side_effect=execute_aqi_queue), \
+             mock.patch.object(MODULE, "run_canonical_apply_executor", return_value={"status": "succeeded"}), \
+             mock.patch.object(MODULE, "run_v2_final_verification", side_effect=final_verification):
+            result = MODULE.run_v2_integrity_repair_flow(
+                run_state=run_state,
+                conn=self.conn,
+                run_id=281,
+                env_name="CIC-Test",
+                run_compact="run",
+                env=self.env,
+                v2_observations={"repair_plan": []},
+                v2_aqilevels={"gaps": gaps, "repair_plan": []},
+                final_verification_config=MODULE.resolve_history_path_config("v2", self.env),
+                from_day="2026-02-01",
+                to_day="2026-02-28",
+                allowed_connector_ids={1},
+                source_scope={"source": "sos", "connector_ids": [1]},
+                check_aqi_debug=False,
+                require_aqi_debug=False,
+                limits=MODULE.LimitTracker(max_download_mb=0, max_runtime_minutes=0, started_mono=0.0),
+                dry_run=False,
+                log=self.log,
+            )
+
+        aqi_stage = next(stage["result"] for stage in result["stage_results"] if stage["stage"] == "aqi_proposal")
+        self.assertTrue(aqi_stage["v2_aqi_integrity_rebuild_bridge_ran"])
+        self.assertEqual(aqi_stage["v2_aqi_rebuilds_queued_from_integrity"], 28)
+        self.assertEqual(len(aqi_stage["planned_aqi_rebuild_connector_days"]), 28)
+        self.assertEqual(aqi_stage["aqi_rebuilds_attempted"], 28)
+        self.assertEqual(result["status"], "succeeded")
+
     def test_data_repair_coalesces_same_day_index_only_gap(self) -> None:
         metrics = MODULE.run_v2_gap_backfills(
             conn=self.conn,
@@ -2518,6 +2627,44 @@ class V2RepairExecutionTests(unittest.TestCase):
         self.assertIn("--history-version v2", planned)
         self.assertIn("--connector-id 1", planned)
         self.assertIn("UK_AQ_BACKFILL_RUN_MODE=r2_history_obs_to_aqilevels", planned)
+        queued = self.conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
+        self.assertEqual(int(queued), 0)
+
+    def test_v2_aqi_integrity_dry_run_deduplicates_28_connector_days(self) -> None:
+        gaps = []
+        for day_offset in range(28):
+            day_utc = (MODULE.dt.date(2026, 2, 1) + MODULE.dt.timedelta(days=day_offset)).isoformat()
+            gaps.append({
+                "gap_type": "day_dir_missing",
+                "day_utc": day_utc,
+                "connector_id": 1,
+                "source_evidence": {"v2_observations_present": True},
+                "suggested_repair": {"kind": MODULE.V2_AQI_OBS_REBUILD_KIND},
+            })
+            for pollutant_code in ("no2", "pm10", "pm25"):
+                gaps.append({
+                    "gap_type": "aqi_manifest_missing_after_obs_repair",
+                    "day_utc": day_utc,
+                    "connector_id": 1,
+                    "pollutant_code": pollutant_code,
+                    "source_evidence": {"v2_observations_present": True},
+                })
+        with mock.patch.object(MODULE, "resolve_integrity_backfill_wrapper", return_value=str(self.root / "uk_aq_integrity_backfill.sh")):
+            metrics = MODULE.queue_v2_aqi_rebuilds_from_integrity_gaps(
+                conn=self.conn,
+                run_id=280,
+                env_name="CIC-Test",
+                env=self.env,
+                v2_aqilevels={"gaps": gaps},
+                dry_run=True,
+                run_backfill=True,
+                log=self.log,
+                allowed_connector_ids={1},
+            )
+
+        self.assertTrue(metrics["v2_aqi_integrity_rebuild_bridge_ran"])
+        self.assertEqual(metrics["v2_aqi_rebuilds_queued_from_integrity"], 28)
+        self.assertEqual(len(metrics["planned_aqi_rebuild_connector_days"]), 28)
         queued = self.conn.execute("SELECT COUNT(*) FROM aqi_rebuild_queue").fetchone()[0]
         self.assertEqual(int(queued), 0)
 
