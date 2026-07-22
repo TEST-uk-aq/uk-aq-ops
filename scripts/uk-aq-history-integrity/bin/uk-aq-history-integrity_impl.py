@@ -7423,7 +7423,9 @@ HISTORY_INTEGRITY_SCHEMA_VERSION = 3
 HISTORY_VERSION_CHOICES = (CURRENT_INTEGRITY_HISTORY_VERSION,)
 LAST_BACKFILL_ENV_LOAD_RESULT: dict[str, Any] = {}
 AQI_INTEGRITY_OBS_COVERAGE_REASON = "aqi_integrity_obs_coverage_gap"
+V2_AQI_OBS_REBUILD_KIND = "v2_aqi_hourly_rebuild_from_v2_observations"
 V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES = {
+    "day_dir_missing",
     "aqi_manifest_missing_after_obs_repair",
     "aqi_manifest_missing_for_observations",
     "aqi_expected_hours_missing",
@@ -11592,6 +11594,11 @@ def queue_v2_aqi_rebuilds_from_integrity_gaps(
     grouped: dict[tuple[str, int], dict[str, Any]] = {}
     for gap in list(v2_aqilevels.get("gaps") or []):
         gap_type = str(gap.get("gap_type") or "").strip()
+        suggested_repair = gap.get("suggested_repair")
+        suggested_kind = (
+            str(suggested_repair.get("kind") or "").strip()
+            if isinstance(suggested_repair, Mapping) else ""
+        )
         day_utc = str(gap.get("day_utc") or "").strip()
         try:
             connector_id = int(gap.get("connector_id"))
@@ -11602,7 +11609,10 @@ def queue_v2_aqi_rebuilds_from_integrity_gaps(
         observations_present = evidence.get("v2_observations_present") is True
 
         skip_reason: str | None = None
-        if gap_type not in V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES:
+        if (
+            gap_type not in V2_AQI_EXECUTABLE_OBS_COVERAGE_GAP_TYPES
+            and suggested_kind != V2_AQI_OBS_REBUILD_KIND
+        ):
             skip_reason = "non_executable_gap_type"
             metrics["v2_aqi_rebuilds_skipped_non_executable_gap"] += 1
         elif not day_utc or connector_id <= 0:
@@ -14801,6 +14811,7 @@ def run_aqi_rebuild_queue_execution(
     metrics: dict[str, Any] = {
         "aqi_rebuild_ran": False,
         "aqi_rebuild_skipped_reason": None,
+        "aqi_rebuilds_queued": 0,
         "aqi_rebuilds_queued_total": 0,
         "aqi_rebuilds_attempted": 0,
         "aqi_rebuilds_complete": 0,
@@ -14848,6 +14859,7 @@ def run_aqi_rebuild_queue_execution(
         by_key.setdefault((day_iso, connector_scope), []).append(row)
 
     metrics["aqi_rebuilds_queued_total"] = len(by_key)
+    metrics["aqi_rebuilds_queued"] = len(by_key)
     if dry_run and not execute_local_proposal and metrics["aqi_rebuilds_queued_total"] == 0 and dry_run_planned_rows:
         seed_by_key: dict[tuple[str, int | None], dict[str, Any]] = {}
         for row in dry_run_planned_rows:
@@ -14902,6 +14914,7 @@ def run_aqi_rebuild_queue_execution(
                 "log_path": None,
             })
         metrics["aqi_rebuilds_queued_total"] = len(seed_by_key)
+        metrics["aqi_rebuilds_queued"] = len(seed_by_key)
         metrics["aqi_rebuild_ran"] = True
         return metrics
 
@@ -16091,6 +16104,89 @@ def _phase4_aqi_work(
     )
 
 
+def _phase4_aqi_work_from_integrity_bridge(
+    *,
+    conn: sqlite3.Connection,
+    planned_rows: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Translate executable AQI-gap plans into canonical Phase 4 work."""
+    work: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for row in planned_rows:
+        day_utc = str(row.get("day_utc") or "").strip()
+        try:
+            connector_id = int(row.get("connector_id"))
+        except (TypeError, ValueError):
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc) or connector_id <= 0:
+            continue
+        eligible = _active_aqi_eligible_pollutants_for_connector(
+            conn, connector_id=connector_id,
+        )
+        if eligible is None:
+            blocked.append({
+                "stage": "aqilevels",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "reason": "aqi_eligibility_mapping_unavailable",
+            })
+            continue
+        requested = {
+            str(value or "").strip().lower()
+            for value in list(row.get("pollutants") or [])
+        } & set(V2_AQI_SUPPORTED_POLLUTANTS)
+        # A missing AQI day is not pollutant-specific. Preserve the existing
+        # eligibility rule by rebuilding every active eligible pollutant.
+        pollutant_codes = sorted((requested & eligible) if requested else eligible)
+        if not pollutant_codes:
+            continue
+        work.append({
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_codes": pollutant_codes,
+            "reasons": [AQI_INTEGRITY_OBS_COVERAGE_REASON],
+        })
+    return work, blocked
+
+
+def _merge_phase4_aqi_work(*groups: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate canonical AQI work while retaining the full eligible scope."""
+    merged: dict[tuple[str, int], dict[str, Any]] = {}
+    for group in groups:
+        for row in group:
+            day_utc = str(row.get("day_utc") or "").strip()
+            try:
+                connector_id = int(row.get("connector_id"))
+            except (TypeError, ValueError):
+                continue
+            if not day_utc or connector_id <= 0:
+                continue
+            entry = merged.setdefault((day_utc, connector_id), {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_codes": set(),
+                "reasons": set(),
+            })
+            entry["pollutant_codes"].update(
+                str(value).strip().lower()
+                for value in list(row.get("pollutant_codes") or [])
+                if str(value or "").strip()
+            )
+            entry["reasons"].update(
+                str(value).strip()
+                for value in list(row.get("reasons") or [])
+                if str(value or "").strip()
+            )
+    return [
+        {
+            **entry,
+            "pollutant_codes": sorted(entry["pollutant_codes"]),
+            "reasons": sorted(entry["reasons"]),
+        }
+        for _, entry in sorted(merged.items())
+    ]
+
+
 def _queue_phase4_aqi_work(
     *,
     conn: sqlite3.Connection,
@@ -17022,12 +17118,50 @@ def run_v2_integrity_repair_flow(
     aqi_work, aqi_blocked = _phase4_aqi_work(
         conn=conn, run_state=run_state, v2_aqilevels=v2_aqilevels,
     )
+    aqi_bridge_metrics: dict[str, Any] = {
+        "v2_aqi_integrity_rebuild_bridge_ran": False,
+        "v2_aqi_rebuilds_queued_from_integrity": 0,
+        "planned_v2_aqi_rebuilds_from_integrity": [],
+        "planned_aqi_rebuild_connector_days": [],
+        "queued_aqi_only_connector_days": [],
+    }
+    if observation_stages_verified:
+        # The canonical coordinator owns the executable bridge.  The
+        # pre-coordinator check-only path deliberately does not queue work;
+        # doing so here makes observation-backed AQI coverage gaps available
+        # to the combined local proposal before final verification.
+        aqi_bridge_metrics = queue_v2_aqi_rebuilds_from_integrity_gaps(
+            conn=conn,
+            run_id=run_id,
+            env_name=env_name,
+            env=env,
+            v2_aqilevels=v2_aqilevels,
+            # Canonical dry-runs still prepare and validate their disposable
+            # local proposal.  Match the existing Phase 4 queue semantics;
+            # remote application remains disabled by the coordinator.
+            dry_run=False,
+            run_backfill=True,
+            log=log,
+            allowed_connector_ids=allowed_connector_ids,
+        )
+        bridge_work, bridge_blocked = _phase4_aqi_work_from_integrity_bridge(
+            conn=conn,
+            planned_rows=aqi_bridge_metrics["planned_aqi_rebuild_connector_days"],
+        )
+        aqi_work = _merge_phase4_aqi_work(aqi_work, bridge_work)
+        aqi_blocked.extend(bridge_blocked)
     for blocked in aqi_blocked:
         record_blocked_scope(run_state, blocked)
     if not observation_stages_verified:
         aqi_result: dict[str, Any] = {
+            **aqi_bridge_metrics,
             "status": "blocked_dependency",
             "reason": "observation_stages_not_verified",
+            "aqi_rebuilds_queued": 0,
+            "aqi_rebuilds_queued_total": 0,
+            "aqi_rebuilds_attempted": 0,
+            "aqi_rebuilds_complete": 0,
+            "aqi_rebuilds_failed": 0,
             "aqi_rebuild_results": [],
         }
         if aqi_work:
@@ -17048,28 +17182,31 @@ def run_v2_integrity_repair_flow(
             conn=conn, run_id=run_id, env_name=env_name, work=aqi_work,
             log=log, dry_run=False,
         )
-        aqi_result = run_aqi_rebuild_queue_execution(
-            conn,
-            run_id=run_id,
-            env_name=env_name,
-            run_compact=run_compact,
-            env=env,
-            dry_run=False,
-            run_backfill=True,
-            limits=limits,
-            log=log,
-            dry_run_planned_rows=planned_aqi_work,
-            history_version="v2",
-            skip_stale_local_post_validation=True,
-            execute_local_proposal=True,
-            extra_env={
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(run_state["overlay_root"]),
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
-                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
-                "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(combined_observations_root),
-            },
-        )
+        aqi_result = {
+            **aqi_bridge_metrics,
+            **run_aqi_rebuild_queue_execution(
+                conn,
+                run_id=run_id,
+                env_name=env_name,
+                run_compact=run_compact,
+                env=env,
+                dry_run=False,
+                run_backfill=True,
+                limits=limits,
+                log=log,
+                dry_run_planned_rows=planned_aqi_work,
+                history_version="v2",
+                skip_stale_local_post_validation=True,
+                execute_local_proposal=True,
+                extra_env={
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(run_state["overlay_root"]),
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
+                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                    "UK_AQ_R2_HISTORY_DROPBOX_ROOT": str(combined_observations_root),
+                },
+            ),
+        }
         aqi_result["planned_phase4_aqi_work"] = planned_aqi_work
 
     rebuilt_aqi_scopes: set[tuple[str, int]] = set()
@@ -20258,6 +20395,32 @@ def main(argv: list[str]) -> int:
                 log=log,
                 repair_pollutants=args.repair_pollutants,
             )
+            aqi_stage = next(
+                (
+                    stage.get("result")
+                    for stage in list(repair_flow.get("stage_results") or [])
+                    if isinstance(stage, Mapping) and stage.get("stage") == "aqi_proposal"
+                    and isinstance(stage.get("result"), Mapping)
+                ),
+                {},
+            )
+            if isinstance(aqi_stage, Mapping):
+                cross_check_metrics.update({
+                    key: aqi_stage[key]
+                    for key in (
+                        "v2_aqi_integrity_rebuild_bridge_ran",
+                        "v2_aqi_rebuilds_queued_from_integrity",
+                        "planned_v2_aqi_rebuilds_from_integrity",
+                        "planned_aqi_rebuild_connector_days",
+                        "queued_aqi_only_connector_days",
+                        "aqi_rebuilds_queued",
+                        "aqi_rebuilds_queued_total",
+                        "aqi_rebuilds_attempted",
+                        "aqi_rebuilds_complete",
+                        "aqi_rebuilds_failed",
+                    )
+                    if key in aqi_stage
+                })
 
         any_adapter_ran = (
             openaq_metrics.get("ran")
@@ -20566,6 +20729,22 @@ def main(argv: list[str]) -> int:
             "aqi_health_manifest_stale": aqi_health_manifest_stale,
             "aqi_health_manifest_empty": aqi_health_manifest_empty,
             "aqi_health_previous_rebuild_failed": aqi_health_previous_rebuild_failed,
+            "v2_aqi_integrity_rebuild_bridge_ran": bool(
+                cross_check_metrics.get("v2_aqi_integrity_rebuild_bridge_ran")
+            ),
+            "v2_aqi_rebuilds_queued_from_integrity": int(
+                cross_check_metrics.get("v2_aqi_rebuilds_queued_from_integrity", 0) or 0
+            ),
+            "planned_v2_aqi_rebuilds_from_integrity": list(
+                cross_check_metrics.get("planned_v2_aqi_rebuilds_from_integrity") or []
+            ),
+            "planned_aqi_rebuild_connector_days": list(
+                cross_check_metrics.get("planned_aqi_rebuild_connector_days") or []
+            ),
+            "queued_aqi_only_connector_days": list(
+                cross_check_metrics.get("queued_aqi_only_connector_days") or []
+            ),
+            "aqi_rebuilds_queued": aqi_rebuilds_queued_total,
             "aqi_rebuilds_queued_total": aqi_rebuilds_queued_total,
             "aqi_rebuilds_attempted": aqi_rebuilds_attempted,
             "aqi_rebuilds_complete": aqi_rebuilds_complete,
