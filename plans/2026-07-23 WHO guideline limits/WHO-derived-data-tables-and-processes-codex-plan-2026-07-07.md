@@ -554,10 +554,10 @@ Required workflow characteristics:
 - non-zero exit on a genuine calculation/publication failure
 - successful exit for the existing clean deferred/no-op and already-completed outcomes
 
-Suggested report path:
+Suggested Dropbox report path:
 
 ```text
-tmp/uk_aq_who_2021_daily_report.json
+{$UK_AQ_DROPBOX_ROOT}/who_2021/uk_aq_who_2021_daily_report.json
 ```
 
 The normal scheduler-dispatched workflow must use daily mode and production publication settings from repository configuration. Manual `workflow_dispatch` should also support the existing backfill and dry-run modes without changing normal defaults.
