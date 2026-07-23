@@ -1,14 +1,16 @@
 # UK AQ WHO guideline derived data implementation plan
 
 Date: 2026-07-07  
-Amended: 2026-07-23  
-Scope: private Obs AQI DB calculation/state tables, GitHub Actions daily processing, R2 v2 derived parquet archive, R2 public JSON outputs, and later website wiring for WHO guideline information.
+Amended and consolidated: 2026-07-23  
+Scope: private Obs AQI DB calculation/state tables, GitHub Actions processing, Cloudflare Scheduler dispatch, R2 v2 derived parquet archive, R2 public JSON outputs, Dropbox operational reports, and later website wiring for WHO guideline information.
+
+This is the single authoritative implementation plan. It incorporates the previous daily-workflow recalculation and Dropbox-report amendment directly into the main plan. The separate amendment is no longer required for implementation.
 
 This plan is for VS Code Codex. Recommended model: **GPT-5.6 Codex with High reasoning**. It is separate from the static homepage card implementation plan. The homepage card can initially use hard-coded figures. This plan creates the data layer that will later feed that card, the WHO guideline page, league tables and sensor detail pages.
 
-The daily calculation and publication task is a fresh implementation built directly for GitHub Actions and the existing Cloudflare cron scheduler. The active implementation must use this architecture from its first operational run.
+The daily calculation and publication task is built directly for GitHub Actions and the existing Cloudflare Scheduler. Cloudflare Scheduler is the sole schedule authority and dispatches the GitHub workflow through `workflow_dispatch`.
 
-Codex can work directly from the phases in this plan. Separate long-form Codex prompts are not required. Each Codex request only needs to identify the phase or phases to implement, repeat the TEST-only and minimal-validation constraints, and use GPT-5.6 Codex with High reasoning.
+Codex can work directly from the early implementation phases in this plan. The later phases are reserved for the user/operator and ChatGPT after the repository implementation is complete.
 
 ## 1. Goal
 
@@ -19,6 +21,7 @@ Create a derived WHO guideline data layer for UK AQ that calculates and stores:
 3. Complete calendar-year WHO summary status for each AURN pollutant timeseries, with optional later year-to-date period summaries.
 4. Small public R2 JSON outputs that the website can read cheaply.
 5. R2 v2 parquet archives of the same derived outputs for rebuild/debug/history use.
+6. A bounded operational JSON report for every workflow attempt, uploaded to Dropbox and retained as a GitHub Actions artefact.
 
 The first production phase is GOV.UK AURN only, for:
 
@@ -47,6 +50,7 @@ Cloudflare Scheduler
   -> direct WHO Deno batch job
   -> private Obs AQI DB RPCs
   -> R2 v2 parquet and public JSON
+  -> Dropbox operational report upload
 ```
 
 Do not add a GitHub Actions `schedule:` trigger. The workflow must run the batch entry point directly rather than starting or calling an HTTP service.
@@ -538,7 +542,7 @@ workers/uk_aq_who_2021_daily/
 .github/workflows/uk_aq_who_2021_daily.yml
 ```
 
-The worker directory must use neutral task naming. Keep calculation, readiness, summary, parquet and R2 publication modules together under this directory, with a direct batch entry point and no HTTP server.
+The worker directory must use neutral task naming. Keep calculation, readiness, summary, parquet, R2 publication and report modules together under this directory, with a direct batch entry point and no HTTP server.
 
 The workflow must use `workflow_dispatch` only. Cloudflare Scheduler remains the sole schedule authority and dispatches this workflow. Do not add a GitHub `schedule:` block.
 
@@ -548,13 +552,14 @@ Required workflow characteristics:
 - Deno version pinned consistently with the repository
 - stable concurrency group such as `uk-aq-who-2021-daily`
 - `cancel-in-progress: false`
-- a workflow timeout with a small margin above the 15-minute task deadline
+- workflow timeout with a small margin above the 15-minute task deadline
 - direct execution of the WHO batch entry point
 - GitHub repository variables for non-secret configuration
-- GitHub repository secrets for `OBS_AQIDB_SECRET_KEY`, R2 access key and R2 secret access key
-- a bounded JSON run report uploaded as a workflow artefact with `if: always()`
-- non-zero exit on a genuine calculation, database or publication failure
-- successful exit for the existing clean deferred/no-op and already-completed outcomes
+- GitHub repository secrets for `OBS_AQIDB_SECRET_KEY`, R2 credentials and the repository-consistent Dropbox credential
+- `UK_AQ_DROPBOX_ROOT` mapped from non-secret GitHub repository configuration
+- a bounded JSON run report uploaded to Dropbox and retained as a GitHub Actions artefact, both with `if: always()`
+- non-zero exit on a genuine calculation, database, R2 publication or Dropbox report-upload failure
+- successful exit for clean `deferred` and `unchanged` outcomes
 
 Write the runner-local report to:
 
@@ -562,15 +567,37 @@ Write the runner-local report to:
 tmp/uk_aq_who_2021_daily_report.json
 ```
 
+Then upload it to Dropbox through the repository's existing Dropbox helper if one exists. If none exists, add the smallest repository-consistent Dropbox API uploader.
+
+`${UK_AQ_DROPBOX_ROOT}` is the remote Dropbox root path. It is not a local GitHub runner or Mac filesystem path.
+
+Upload reports under:
+
+```text
+${UK_AQ_DROPBOX_ROOT}/who_2021/
+```
+
+Use a unique timestamped filename that includes the GitHub run ID, for example:
+
+```text
+uk_aq_who_2021_daily_report_2026-07-23T090000Z_123456789.json
+```
+
+Keep the GitHub Actions artefact as a secondary copy for workflow inspection.
+
 The normal scheduler-dispatched workflow must use daily mode and publication settings from repository configuration. Manual `workflow_dispatch` must support the existing daily, backfill and dry-run modes without changing normal defaults.
 
 The implementation must preserve:
 
 - `who_2021_processing_runs` logging
-- readiness/deferred semantics
+- the 18-valid-hour individual daily rule
+- readiness/deferred semantics for the latest complete day
+- recalculation of the latest two complete sample days on every scheduled run
 - idempotent daily, rolling and calendar upserts
+- content-aware R2 writes that skip unchanged objects
 - R2 parquet-before-JSON publication ordering
 - dated JSON before `latest_who_2021.json`
+- Dropbox report upload after the local report is written
 - the current retry and warning/failure behaviour
 - the existing source network, connector, pollutant and completeness defaults
 
@@ -582,33 +609,59 @@ uk_aq_who_2021_daily_github_actions
 
 Confirm that the label is accepted by any relevant egress allow-list or monitoring rule.
 
-### 8.1 Readiness gate and scheduler retry window
+### 8.1 Normal scheduled-day selection
 
-Do not rely on the clock alone to decide that yesterday's source data is complete enough for WHO summary publication.
-
-Recommended scheduler pattern:
-
-- Cloudflare Scheduler dispatches the GitHub workflow hourly during a bounded morning window, for example 04:00-09:00 UTC.
-- Each workflow run calculates `latest_complete_day_utc = yesterday`.
-- Before calculating or publishing summaries, the batch job checks whether the expected final hour-ending observations have arrived.
-- If the day is not ready, the job logs a clean deferred/no-op run and exits successfully.
-- If the day is ready, the job runs the daily/rolling/calendar calculations and publishes R2 outputs.
-- If the day has already completed successfully, later workflow runs for the same `latest_complete_day_utc` no-op, except that the existing retryable R2 publication path may run where configured.
-
-For `as_of_day_utc = 2026-07-02`, the final required hour-ending timestamp is:
+Every normal scheduler-dispatched workflow run must calculate:
 
 ```text
-2026-07-03T00:00:00Z
+latest_complete_day_utc = yesterday
+correction_day_utc = latest_complete_day_utc - 1 day
 ```
+
+Every run at 04:00, 05:00, 06:00, 07:00, 08:00 and 09:00 UTC must recalculate both complete sample days.
+
+Do not recalculate a wider normal correction window. Corrections older than the day before yesterday remain a manual backfill concern.
+
+A successful earlier run must not prevent a later hourly run from recalculating the same two days. Idempotency must prevent duplicate logical rows and objects, not prevent recalculation.
+
+### 8.2 Readiness and publication date
+
+The latest-day readiness check is a network-level ingest-readiness signal. It is not a requirement that every individual timeseries contains the final `00:00` hour-ending observation.
+
+An individual timeseries daily mean remains valid when it has at least 18 valid distinct hourly observations in the sample-day window, even when its final midnight observation is absent.
+
+The readiness result controls which day becomes the current published summary date:
+
+```text
+if latest_complete_day_utc is ready:
+    publication_as_of_day_utc = latest_complete_day_utc
+else:
+    publication_as_of_day_utc = correction_day_utc
+```
+
+Both target days must still be recalculated in either case.
+
+When the latest day is deferred:
+
+- record the latest day as deferred;
+- keep the current public summary as of `correction_day_utc`;
+- regenerate the correction-day rolling and current summary outputs;
+- update their R2 objects only if their content changed.
+
+When readiness passes, advance the current rolling and summary outputs to `latest_complete_day_utc`.
 
 Readiness checks should include:
 
-1. Final hour presence: rows exist for eligible GOV.UK AURN pollutant timeseries at `observed_at = next_day_utc 00:00:00Z`.
-2. Final hour coverage: per pollutant, enough active eligible timeseries have that final-hour row. Use a configurable threshold such as 90-95% rather than requiring 100%.
-3. Daily validity coverage: optionally preview the daily calculation and require enough valid daily rows per pollutant before publishing public summary JSON.
-4. Idempotency: check `who_2021_processing_runs` and/or summary rows so a day is not recalculated and republished after a successful run unless explicitly requested.
+1. Final-hour presence for eligible GOV.UK AURN pollutant timeseries at `observed_at = next_day_utc 00:00:00Z`.
+2. Final-hour coverage per pollutant, using a configurable threshold such as 90-95% rather than requiring 100%.
+3. Optional daily-validity preview when needed to prevent publishing clearly incomplete public summaries.
+4. Clear readiness evidence in the bounded report.
 
-The Cloudflare scheduler entry should use the existing GitHub-workflow target pattern:
+The readiness result must not create an `already_completed` skip that suppresses later hourly recalculation.
+
+### 8.3 Hourly recalculation window
+
+The Cloudflare Scheduler entry should use the existing GitHub-workflow target pattern:
 
 ```toml
 [jobs.uk_aq_who_2021_daily]
@@ -622,33 +675,76 @@ dry_run = false
 notes = "WHO 2021 daily derived data via GitHub Actions"
 ```
 
-Confirm the final job key and current authoritative scheduler conventions in the repository before editing `cloudflare/scheduler/jobs.toml`. Cloudflare D1 claim protection remains responsible for preventing duplicate dispatch of the same due slot. GitHub workflow concurrency prevents overlap between separate hourly slots.
+Confirm the final job key and current authoritative scheduler conventions before editing `cloudflare/scheduler/jobs.toml`.
 
-Pseudo workflow:
+Each hourly slot is an intentional recalculation opportunity for late or amended observations. It is not merely a failure retry.
 
-1. Cloudflare Scheduler dispatches the GitHub workflow.
-2. The workflow maps repository variables, secrets and manual inputs into the WHO runtime environment.
-3. Determine latest complete UTC/GMT day.
-4. Run the readiness gate for `latest_complete_day_utc` unless the request is an explicit backfill or dry-run that bypasses publication readiness.
-5. If the readiness gate is not met, log a deferred/no-op run, write the report artefact and stop successfully.
-6. Determine missing days in `who_2021_daily_status` for `source_network_code = 'gov_uk_aurn'` and pollutants `pm25`, `pm10`, and `no2`.
-7. For each missing day from the first missing day to latest complete day:
-   - read observations for that derived sample day and network/pollutant set using the hour-ending window `(day_utc 00:00, next_day_utc 00:00]`
-   - aggregate to distinct UTC/GMT hourly means first
-   - assign each hourly row to `sample_day_utc = (observed_at - interval '1 hour')::date`
-   - calculate daily means from valid hourly means for that `sample_day_utc`
-   - require at least 18 valid distinct hours
-   - upsert into `who_2021_daily_status`
-8. Recalculate rolling 365-day status for affected timeseries as of latest complete day.
-9. Upsert `who_2021_rolling_year_status`.
-10. Optionally recalculate current year-to-date rows when that later product is enabled.
-11. If a previous calendar year is not final, calculate/finalise complete-year rows.
-12. Write newly created/updated derived rows to R2 v2 parquet.
-13. Write dated public summary JSON to R2.
-14. Replace `history/v2/who_2021/latest_who_2021.json` only after parquet/archive outputs and dated JSON complete.
-15. Write the bounded workflow report artefact and log run status, counts, date range, warnings and failures.
+Cloudflare D1 claim protection remains responsible for preventing duplicate dispatch of the same due slot. GitHub workflow concurrency prevents overlap between separate hourly slots.
 
-The process must remain idempotent. Re-running the same date updates the same primary keys and safely replaces the same R2 objects rather than creating duplicate logical data.
+Expected normal outcomes are:
+
+- `deferred`: the latest complete day is not ready, but both daily target days and the correction-day current summary are still recalculated;
+- `updated`: one or more derived rows or published objects changed;
+- `unchanged`: recalculation completed and the logical result matches the existing state;
+- `failed`: calculation, database, R2 publication or Dropbox report upload failed.
+
+The existing processing-run schema may retain its current status vocabulary where required. The bounded report must expose the operational outcome above clearly and consistently.
+
+### 8.4 Daily workflow sequence
+
+The normal daily workflow must:
+
+1. Determine `latest_complete_day_utc` and `correction_day_utc`.
+2. Run the latest-day readiness check.
+3. Recalculate daily status for both target days using the hour-ending window `(day_utc 00:00, next_day_utc 00:00]`.
+4. Apply the existing 18-valid-hour rule independently to each timeseries and day.
+5. Idempotently upsert changed, valid, invalid or newly missing daily states according to the existing RPC contract.
+6. Select `publication_as_of_day_utc` from the readiness result.
+7. Recalculate the current rolling 365-day and other enabled current summaries as of `publication_as_of_day_utc`.
+8. Generate affected R2 parquet and JSON payloads using stable serialisation or a stable logical-content hash.
+9. Compare every generated R2 payload with the existing R2 object.
+10. Upload only changed R2 objects.
+11. Preserve parquet-before-JSON ordering and dated JSON before `latest_who_2021.json`.
+12. Write the bounded JSON run report.
+13. Upload the report to Dropbox and retain the same report as a GitHub Actions artefact.
+
+### 8.5 R2 comparison state
+
+Do not use GitHub workflow artefacts or caches as cross-run application state.
+
+Use:
+
+- Obs AQI DB as the source for derived database state;
+- the existing R2 object as the comparison source for each published object.
+
+Before an R2 write, compare the new canonical payload or stable logical-content hash with the existing object. Skip the write when unchanged. Replace the same stable object key when changed.
+
+The comparison must ignore volatile fields that would make identical logical content appear changed, such as a newly generated timestamp, unless that field is intentionally part of the published product.
+
+The report must list changed and unchanged R2 objects so the hourly behaviour is auditable.
+
+### 8.6 Report contents
+
+Keep the report bounded and free of secrets.
+
+Include at least:
+
+- workflow run ID and attempt;
+- run mode;
+- start and finish timestamps;
+- `latest_complete_day_utc`;
+- `correction_day_utc`;
+- `publication_as_of_day_utc`;
+- readiness result and coverage evidence;
+- daily, rolling and calendar row counts;
+- R2 objects checked;
+- R2 objects updated;
+- R2 objects unchanged;
+- Dropbox destination path and upload result;
+- warnings;
+- final operational outcome.
+
+Write the report on successful, deferred, unchanged and failure paths wherever technically possible.
 
 ## 9. Backfill process
 
@@ -687,7 +783,7 @@ Backfill should:
 3. Recalculate complete calendar years, and optionally year-to-date rows when that later product is enabled.
 4. Write derived parquet outputs to R2 v2.
 5. Publish dated/latest JSON outputs only when publication is explicitly enabled.
-6. Write and upload the same bounded workflow report artefact as the normal daily task.
+6. Write the same bounded report as the normal daily task, upload it to `${UK_AQ_DROPBOX_ROOT}/who_2021/`, and retain it as a GitHub Actions artefact.
 
 For the initial deployment, it is acceptable to backfill:
 
@@ -765,185 +861,138 @@ Expected frontend behaviour:
 <img src="sidebar-images/UK-AQ-WHO-button-medium.svg" alt="WHO" />
 ```
 
-## 12. Phasing recommendation
+## 12. Existing implementation baseline
 
-Yes, this needs phases. Codex can implement directly from these phases without separate detailed prompts.
+The following work already exists and must be reused rather than rewritten without a clear reason.
 
-For a Codex request, use a short instruction such as:
-
-```text
-Use GPT-5.6 Codex with High reasoning.
-
-Implement Phases 7.1 to 7.5 of:
-plans/2026-07-23 WHO guideline limits/WHO-derived-data-tables-and-processes-codex-plan-2026-07-23.md
-
-Work only in TEST-uk-aq/uk-aq-ops. Follow AGENTS.md and the authoritative system_docs. Use minimal structural validation only. Do not deploy, dispatch workflows, sync scheduler configuration or edit system_docs unless the selected phase explicitly requires it.
-```
-
-The plan itself supplies the technical requirements, sequence, constraints and done criteria.
-
-### Phase 1: Schema and reference values
+### 12.1 Schema and reference values
 
 Status: implemented.
 
-Deliver:
+Existing implementation includes:
 
-- SQL migrations for the private Obs AQI DB WHO tables.
-- Seed data for guideline values.
-- RLS/grants consistent with private `uk_aq_ops` service-role patterns.
-- Database comments explaining these are WHO health-based guideline comparisons, not UK legal-limit checks.
+- private Obs AQI DB WHO tables;
+- WHO 2021 PM2.5, PM10 and NO2 guideline values;
+- the 4-day daily allowance;
+- service-role-only RLS policies and grants;
+- database comments and `updated_at` triggers;
+- explicit hour-ending daily-window metadata.
 
-Implemented:
+### 12.2 Daily status calculation
 
-- Added canonical and focused Obs AQI DB schema definitions.
-- Added:
-  - `who_2021_guideline_values`
-  - `who_2021_daily_status`
-  - `who_2021_rolling_year_status`
-  - `who_2021_calendar_year_status`
-  - `who_2021_processing_runs`
-- Seeded WHO 2021 PM2.5, PM10 and NO2 guideline values with the 4-day daily allowance.
-- Added service-role-only RLS policies, grants, comments and `updated_at` triggers.
-- Included explicit hour-ending daily-window metadata.
-
-### Phase 2: Daily status calculation
-
-Status: calculation code and schema implemented. The active worker still needs to be organised under the neutral direct-batch path defined in Phase 7.
-
-Final deliver:
-
-- Direct batch calculation of `who_2021_daily_status` for GOV.UK AURN PM2.5, PM10 and NO2.
-- 18-hour valid-day rule.
-- Idempotent upserts.
-- Daily, backfill and dry-run modes.
-- One bounded run report for GitHub Actions.
+Status: calculation code and schema implemented. The active worker still needs to be organised under the neutral direct-batch path.
 
 Reusable implementation includes:
 
-- `uk_aq_public.uk_aq_rpc_who_2021_daily_status_refresh`
-- `uk_aq_public.uk_aq_rpc_who_2021_processing_run_log`
-- the current WHO daily job, core and parquet modules
-- existing focused tests and README material
+- `uk_aq_public.uk_aq_rpc_who_2021_daily_status_refresh`;
+- `uk_aq_public.uk_aq_rpc_who_2021_processing_run_log`;
+- the current WHO daily job, core and parquet modules;
+- existing focused tests and README material;
+- daily, backfill and dry-run modes.
 
-Phase 7 establishes the final neutral worker layout and GitHub Actions execution path.
-
-### Phase 3: Rolling and calendar summary calculation
+### 12.3 Rolling and calendar summaries
 
 Status: implemented in code and schema.
 
-Deliver:
+Reusable implementation includes:
 
-- Rolling 365-day summary calculation.
-- Last complete calendar-year summary calculation.
-- 274 valid-day threshold for full-year/rolling periods.
-- Readiness gate with final-hour coverage checks and deferred no-op logging.
-- In-memory/public-output builder for the 9 homepage card rows.
-- Optional/deferred proportional year-to-date completeness.
+- `uk_aq_public.uk_aq_rpc_who_2021_readiness_check`;
+- `uk_aq_public.uk_aq_rpc_who_2021_summary_refresh`;
+- daily, rolling and calendar upsert counts in processing-run logging;
+- readiness and deferred behaviour;
+- 9-row homepage summary generation;
+- 274-valid-day threshold for rolling and complete-year periods.
 
-Implemented:
+Any existing successful-run or `already_completed` skip must be amended so it does not suppress the required hourly recalculation.
 
-- `uk_aq_public.uk_aq_rpc_who_2021_readiness_check`
-- `uk_aq_public.uk_aq_rpc_who_2021_summary_refresh`
-- daily, rolling and calendar upsert counts in processing-run logging
-- readiness, already-completed and deferred behaviour in the shared batch implementation
-- 9-row homepage summary generation
-
-Cloudflare Scheduler owns the 04:00-09:00 UTC readiness window.
-
-### Phase 4: R2 v2 JSON publication and parquet writes
+### 12.4 R2 publication
 
 Status: implemented in the shared batch code. Apply and operational validation steps may still be required in TEST.
 
-Deliver:
+Reusable implementation includes:
 
-- Parquet R2 writes for daily, rolling and calendar outputs.
-- R2 v2 partition paths.
-- Re-run-safe replacement behaviour.
-- Dated summary JSON and `latest_who_2021.json`.
-- Daily cache/version key `?as_of=YYYY-MM-DD`.
+- opt-in summary and parquet publication controls;
+- SigV4 R2 PUT support;
+- parquet-before-JSON ordering;
+- stable JSON serialisation;
+- row-batch RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`;
+- Arrow and `parquet-wasm` generation;
+- nullable boolean handling;
+- agreed R2 v2 object paths.
 
-Implemented:
+The implementation must add or confirm R2 read/metadata support for change-aware comparison before writing.
 
-- opt-in summary and parquet publication controls
-- SigV4 R2 PUT support
-- parquet-before-JSON publication ordering
-- stable JSON serialisation
-- retryable publication after an already-completed database calculation
-- row-batch RPC `uk_aq_public.uk_aq_rpc_who_2021_r2_parquet_rows`
-- Arrow and `parquet-wasm` generation
-- nullable boolean handling
-- agreed v2 object paths
-
-Remaining TEST data-layer follow-up:
-
-- apply or confirm the Phase 4 row-batch RPC
-- confirm R2 credentials
-- enable publication flags
-- inspect one real TEST workflow publication
-
-### Phase 5: Website data wiring
+### 12.5 Website wiring
 
 Status: implemented.
 
-Implemented:
+Existing implementation includes:
 
-- homepage fetch of `history/v2/who_2021/latest_who_2021.json?as_of=YYYY-MM-DD`
-- static fallback and localStorage reuse
-- non-blocking status message
-- preserved public wording and layout
+- homepage fetch of `history/v2/who_2021/latest_who_2021.json?as_of=YYYY-MM-DD`;
+- static fallback and localStorage reuse;
+- non-blocking status message;
+- preserved public wording and layout.
 
-### Phase 6: WHO guideline page and league tables
+### 12.6 Later website work
 
-Status: later work.
+Status: not part of the active execution-host implementation.
 
-Deliver later:
+Later work may include:
 
-- WHO guideline page at `/who-guidelines/`
-- rolling-year league tables
-- calendar-year selectors
-- optional year-to-date period selectors
-- daily site/timeseries square-calendar JSON
-- not-enough-data counts
-- station detail links
-- clear WHO guideline versus UK legal-limit explanation
+- `/who-guidelines/`;
+- rolling-year league tables;
+- complete-year selectors;
+- optional year-to-date period selectors;
+- daily square-calendar JSON;
+- station detail links;
+- expanded WHO guideline explanations.
 
-### Phase 7: GitHub Actions and Cloudflare Scheduler implementation
+## 13. Phased implementation and ownership
 
-Status: required by the 2026-07-23 amendment.
+All repository implementation phases come first and are owned by Codex. Real TEST operation follows after the Codex phases are committed. Authoritative documentation is the final ChatGPT phase.
 
-**Owner:** Codex for repository implementation, user/operator for real TEST operation  
-**Recommended model:** GPT-5.6 Codex with High reasoning
+For Codex, use **GPT-5.6 Codex with High reasoning**.
 
-Build the active execution path directly for GitHub Actions and Cloudflare Scheduler. Do not introduce a transitional execution path or duplicate scheduler.
+### Phase 1: Codex focused inspection
 
-#### Phase 7.1 Focused inspection
+**Owner:** Codex  
+**Testing:** structural viability inspection only
 
 Before editing, Codex must read:
 
-- `AGENTS.md`
-- `system_docs/README.md`
-- `system_docs/documentation_contract.md`
-- the authoritative WHO, scheduler, R2 and task-health documents
-- the current WHO calculation, readiness and publication modules
-- existing direct GitHub batch workflow patterns
-- `cloudflare/scheduler/jobs.toml`
-- scheduler config-sync code
-- relevant environment and secret catalogues
+- `AGENTS.md`;
+- `system_docs/README.md`;
+- `system_docs/documentation_contract.md`;
+- authoritative WHO, scheduler, R2, Dropbox and task-health documents;
+- current WHO calculation, readiness and publication modules;
+- existing direct GitHub batch workflow patterns;
+- `cloudflare/scheduler/jobs.toml`;
+- scheduler config-sync code;
+- relevant environment, variable and secret catalogues.
 
 Confirm:
 
-- the direct Deno command for the WHO batch job
-- the repository Deno version and dependency-cache pattern
-- all runtime variables and actual GitHub secrets
-- the active R2 publication settings
-- the current scheduler GitHub-workflow target schema
-- whether the proposed egress caller label is accepted
-- the smallest safe way to write a bounded JSON report
-- whether any targeted check is genuinely required before implementation
+- the direct Deno command for the WHO batch job;
+- repository Deno version and dependency-cache pattern;
+- all runtime variables and actual GitHub secret names;
+- active R2 publication settings;
+- scheduler GitHub-workflow target schema;
+- whether the diagnostic egress caller label is accepted;
+- where a successful-run or `already_completed` skip currently occurs;
+- the smallest focused change that permits later hourly recalculation;
+- the existing R2 read or metadata mechanism suitable for change comparison;
+- any existing Dropbox API/helper pattern;
+- if no Dropbox helper exists, the smallest repository-consistent uploader;
+- the Dropbox secret name and remote-path conventions;
+- how `UK_AQ_DROPBOX_ROOT` is supplied to GitHub Actions;
+- the smallest safe way to write a bounded JSON report;
+- whether any targeted structural check is genuinely required.
 
-Do not call external services during this inspection.
+Do not call external services during inspection.
 
-#### Phase 7.2 Create the neutral direct worker
+### Phase 2: Codex neutral direct worker
+
+**Owner:** Codex
 
 Create or organise the active implementation under:
 
@@ -951,24 +1000,59 @@ Create or organise the active implementation under:
 workers/uk_aq_who_2021_daily/
 ```
 
-The directory should contain the direct batch entry point, calculation/core modules, parquet module, focused tests and README.
-
 Requirements:
 
-- reuse the existing calculation, readiness, RPC and R2 publication logic
-- do not duplicate calculation logic
-- do not start an HTTP server
-- use neutral task names in paths, scripts, log metadata and documentation
-- write `tmp/uk_aq_who_2021_daily_report.json` on success, deferred/no-op, already-completed and failure paths
-- ensure the report is bounded and contains no secrets
-- use `uk_aq_who_2021_daily_github_actions` as the diagnostic egress caller label
-- update relevant package scripts and environment catalogues
-- remove unused active HTTP-service, container and deployment-only files rather than retaining an alternate execution path
-- follow the repository archive policy only for active non-test code that is actually changed
+- reuse the existing calculation, readiness, RPC and R2 publication logic;
+- do not duplicate calculation logic;
+- do not start an HTTP server;
+- use neutral task names in paths, scripts, log metadata and documentation;
+- keep direct entry point, core calculation, readiness, parquet, R2 comparison and report modules together;
+- preserve daily, backfill and dry-run modes;
+- write `tmp/uk_aq_who_2021_daily_report.json` on all normal outcomes and failure paths wherever possible;
+- use `uk_aq_who_2021_daily_github_actions` as the diagnostic egress caller label;
+- update relevant package scripts and environment catalogues;
+- remove unused alternate execution-path files rather than retaining two active implementations;
+- follow the repository archive policy only for active non-test code that is actually changed.
 
-#### Phase 7.3 Add the GitHub Actions workflow
+### Phase 3: Codex hourly recalculation and readiness behaviour
 
-Add:
+**Owner:** Codex
+
+Implement the consolidated behaviour in section 8:
+
+- recalculate yesterday and the day before yesterday on every scheduled run;
+- do not use a prior successful run to suppress later recalculation;
+- apply readiness only to the current publication date;
+- retain the individual 18-valid-hour daily rule;
+- keep the current public summary on the correction day while the latest day is deferred;
+- advance publication to yesterday when readiness passes;
+- preserve idempotent upserts;
+- expose `deferred`, `updated`, `unchanged` and `failed` outcomes clearly in the report.
+
+### Phase 4: Codex R2 comparison and Dropbox reporting
+
+**Owner:** Codex
+
+Implement:
+
+- stable serialisation or stable logical-content hashing;
+- comparison against the existing R2 object;
+- no R2 write when logical content is unchanged;
+- overwrite of the same stable key when content changed;
+- preservation of parquet-before-JSON ordering;
+- preservation of dated JSON before `latest_who_2021.json`;
+- changed and unchanged object lists in the report;
+- remote Dropbox upload to `${UK_AQ_DROPBOX_ROOT}/who_2021/`;
+- timestamped report filenames including the GitHub run ID;
+- GitHub Actions artefact retention as a secondary report copy;
+- visible failure when Dropbox upload fails;
+- no direct filesystem write to `${UK_AQ_DROPBOX_ROOT}`.
+
+### Phase 5: Codex GitHub Actions workflow
+
+**Owner:** Codex
+
+Add or update:
 
 ```text
 .github/workflows/uk_aq_who_2021_daily.yml
@@ -976,23 +1060,26 @@ Add:
 
 Required behaviour:
 
-- `workflow_dispatch` only
-- no GitHub `schedule:`
-- direct Deno batch execution
-- `permissions: contents: read`
-- stable concurrency group with `cancel-in-progress: false`
-- workflow timeout with a small margin over the 15-minute task deadline
-- normal daily defaults for scheduler dispatch
-- manual daily, backfill and dry-run inputs
-- direct mapping of existing non-secret repository variables
-- direct mapping of `OBS_AQIDB_SECRET_KEY` and R2 credentials from GitHub secrets
-- bounded JSON report uploaded with `if: always()`
-- existing deferred/already-completed outcomes remain successful
-- genuine calculation, database or publication failures remain non-zero
+- `workflow_dispatch` only;
+- no GitHub `schedule:`;
+- direct Deno batch execution;
+- `permissions: contents: read`;
+- stable concurrency group with `cancel-in-progress: false`;
+- workflow timeout with a small margin over the 15-minute task deadline;
+- normal daily defaults for scheduler dispatch;
+- manual daily, backfill and dry-run inputs;
+- direct mapping of existing non-secret repository variables;
+- direct mapping of Obs AQI DB, R2 and Dropbox credentials from GitHub secrets;
+- `UK_AQ_DROPBOX_ROOT` mapped from non-secret configuration;
+- Dropbox report upload and GitHub artefact retention with `if: always()` after report creation;
+- clean `deferred` and `unchanged` outcomes remain successful;
+- genuine calculation, database, R2 publication or Dropbox upload failures remain non-zero.
 
 Do not duplicate runtime configuration or calculation logic in workflow YAML. Inputs should translate into the existing environment-variable interface.
 
-#### Phase 7.4 Add the Cloudflare Scheduler job
+### Phase 6: Codex Cloudflare Scheduler configuration
+
+**Owner:** Codex
 
 Add or update the WHO entry in:
 
@@ -1000,98 +1087,138 @@ Add or update the WHO entry in:
 cloudflare/scheduler/jobs.toml
 ```
 
-Use the repository's existing GitHub workflow target conventions and the entry in section 8.1.
-
 Requirements:
 
-- retain the 04:00-09:00 UTC hourly readiness window unless current authoritative configuration differs
-- use `target_type = "github_workflow"`
-- target `TEST-uk-aq/uk-aq-ops`
-- target `uk_aq_who_2021_daily.yml` on `main`
-- use normal daily mode
-- do not add a GitHub cron
-- preserve Cloudflare D1 due-slot and duplicate-claim protection
+- retain `cron_expr = "0 4-9 * * *"` unless authoritative scheduler configuration requires a syntax-only adjustment;
+- document the schedule as an hourly recalculation and readiness window;
+- use `target_type = "github_workflow"`;
+- target `TEST-uk-aq/uk-aq-ops`;
+- target `uk_aq_who_2021_daily.yml` on `main`;
+- use normal daily mode;
+- do not add a GitHub cron;
+- preserve Cloudflare D1 due-slot and duplicate-claim protection.
 
 Codex must not sync D1 or dispatch the workflow during implementation.
 
-#### Phase 7.5 Minimal structural checks
+### Phase 7: Codex minimal structural validation and repository completion
 
-Before the first real TEST run, run only:
+**Owner:** Codex
 
-- `deno check` on changed TypeScript entry points
-- the repository's existing fast YAML/workflow parse check
-- the scheduler TOML parse or payload-generation check
-- one narrow local report-file check only if genuinely needed to prove that all exit paths write valid JSON
+Before handing over to the user, run only:
 
-Do not create a broad new test suite, mock database/R2 system, shadow comparison or soak test. Functional validation happens through real operation on TEST.
+- `deno check` on changed TypeScript entry points;
+- the repository's existing fast YAML/workflow parse check;
+- scheduler TOML parse or payload-generation check;
+- one narrow report JSON check only if genuinely needed;
+- one narrow Dropbox path-construction or uploader invocation check only if existing structural coverage is absent.
 
-#### Phase 7.6 Real TEST validation
+Do not create a broad new test suite, mock Obs AQI DB/R2/Dropbox system, shadow comparison or soak test.
 
-After Phases 7.1 to 7.5 are on `main`:
+Codex must then provide:
 
-1. Manually dispatch one normal daily workflow run.
-2. Run the existing Cloudflare scheduler configuration sync.
-3. Accept one scheduler-dispatched workflow run.
+- files changed;
+- structural checks run and their results;
+- exact GitHub variables and secrets required;
+- any configuration the user must add;
+- exact manual workflow inputs for the first TEST run;
+- any unresolved risk that requires real TEST evidence.
 
-Confirm:
+Codex must not deploy, sync the scheduler, dispatch the workflow, run a large backfill or edit authoritative `system_docs/` during Phases 1-7.
 
-- checkout and Deno setup succeed
-- the direct batch job runs without starting an HTTP server
-- readiness/deferred/already-completed status is credible
-- one processing-run record is written
-- the bounded report artefact is uploaded
-- when ready, daily/rolling/calendar processing completes
-- when publication is enabled, parquet and dated/latest JSON objects are written in the existing order
-- no secrets appear in logs or artefacts
-- the workflow stays within the current operational deadline
-- the scheduler produces one D1 claim and one GitHub workflow dispatch for each due slot
+### Phase 8: User/operator real TEST operation
+
+**Owner:** User/operator
+
+After Codex Phases 1-7 are on `main`:
+
+1. Add or confirm the required GitHub variables and secrets.
+2. Manually dispatch one normal daily workflow run.
+3. Inspect the workflow log, bounded artefact, processing-run row, R2 objects and Dropbox report.
+4. Run the existing Cloudflare Scheduler configuration sync.
+5. Accept one scheduler-dispatched workflow run.
+6. Allow a later hourly slot to run so the recalculation behaviour can be observed after an earlier success.
+
+Confirm through real TEST operation:
+
+- checkout and Deno setup succeed;
+- the direct batch job runs without starting an HTTP server;
+- yesterday and the day before yesterday are recalculated;
+- a prior successful hourly run does not suppress a later run;
+- readiness deferral keeps the public summary on the correction day;
+- correction-day output can still change while the latest day is deferred;
+- the individual 18-valid-hour rule remains correct;
+- changed database rows are idempotently upserted;
+- unchanged R2 objects are not rewritten;
+- changed R2 objects are replaced in the required publication order;
+- dated JSON is written before `latest_who_2021.json`;
+- the Dropbox report appears under `${UK_AQ_DROPBOX_ROOT}/who_2021/`;
+- the same report is retained as a GitHub Actions artefact;
+- no secrets appear in logs, reports or artefacts;
+- the workflow stays within the operational deadline;
+- the scheduler produces one D1 claim and one workflow dispatch for each due slot.
 
 A dry run is optional. Use it only for a specific unresolved configuration risk.
 
-#### Phase 7.7 Update authoritative system documentation
+Do not include a large historical backfill in the first execution-host validation. Run any required backfill separately after the normal workflow is accepted.
+
+### Phase 9: ChatGPT authoritative documentation and close-out
 
 **Owner:** ChatGPT in Chat mode using Thinking
 
-After the implementation and real TEST validation are accepted, update the relevant authoritative `system_docs/` files.
+After the user accepts the real TEST results, update the relevant authoritative `system_docs/` files.
 
 Document:
 
-- Cloudflare Scheduler and D1 as schedule/dispatch authority
-- GitHub Actions as execution host
-- workflow and direct entry-point names
-- 04:00-09:00 UTC readiness window
-- concurrency and timeout behaviour
-- readiness/deferred/already-completed semantics
-- processing-run logging
-- R2 publication order and paths
-- manual backfill operation
-- monitoring and failure handling
+- Cloudflare Scheduler and D1 as schedule and dispatch authority;
+- GitHub Actions as execution host;
+- workflow and direct entry-point names;
+- 04:00-09:00 UTC hourly recalculation and readiness window;
+- recalculation of yesterday and the day before yesterday;
+- readiness and publication-date selection;
+- `deferred`, `updated`, `unchanged` and `failed` operational outcomes;
+- individual 18-valid-hour semantics;
+- processing-run logging;
+- change-aware R2 publication;
+- R2 publication order and paths;
+- Dropbox report upload to `${UK_AQ_DROPBOX_ROOT}/who_2021/`;
+- GitHub Actions artefact retention as a secondary report copy;
+- manual backfill operation;
+- monitoring and failure handling;
+- actual TEST evidence and any accepted limitations.
 
 Do not create duplicate authority across multiple system documents.
 
-## 13. Validation checks
+ChatGPT should also mark this plan with the accepted implementation status and record any deferred later website work.
 
-### 13.1 GitHub Actions and scheduler validation
+## 14. Validation checks
 
-This is the TEST system. Pre-deployment validation must be minimal and structural.
+### 14.1 Pre-operation structural validation
 
-Before deployment, use only:
+This is the TEST system. Before real operation, validation must be minimal and structural.
 
-- `deno check` for changed TypeScript
-- existing fast GitHub workflow YAML validation
-- existing scheduler TOML parsing or payload generation
-- one narrow JSON report-file check only if genuinely needed
+Use only:
 
-Do not build a speculative test suite. Functional validation happens through:
+- `deno check` for changed TypeScript;
+- existing fast GitHub workflow YAML validation;
+- existing scheduler TOML parsing or payload generation;
+- one narrow report JSON check only if genuinely needed;
+- one narrow Dropbox uploader/path check only if genuinely needed.
 
-1. one manually dispatched normal TEST workflow run;
-2. one Cloudflare Scheduler-dispatched TEST workflow run.
+Do not build a speculative test suite. Functional validation happens through real operation on TEST.
 
-Use the workflow artefact, `who_2021_processing_runs`, representative Obs AQI DB counts and R2 objects as the real operational evidence.
+### 14.2 Real TEST evidence
 
-### 13.2 Calculation regression reference
+Use:
 
-Use local DuckDB outputs and private Obs AQI DB query outputs to compare when a calculation-specific change or real TEST discrepancy requires it.
+1. one manually dispatched normal workflow run;
+2. one scheduler-dispatched workflow run;
+3. one later hourly run after an earlier successful run.
+
+Use the workflow logs, bounded report, `who_2021_processing_runs`, representative Obs AQI DB counts, R2 object metadata/content and Dropbox report as the operational evidence.
+
+### 14.3 Calculation regression reference
+
+Use local DuckDB outputs and private Obs AQI DB query outputs only when a calculation-specific change or real TEST discrepancy requires it.
 
 Expected production-style 18-hour sample for latest day 2026-07-02:
 
@@ -1114,9 +1241,9 @@ PM10 32.3%, 40 of 124 sensors
 NO2 79.6%, 121 of 152 sensors
 ```
 
-These are not hard-coded production expectations forever. They are a regression reference against the first implementation using the same backup data. Do not require this broad comparison unless a real TEST result suggests the calculation changed.
+These are not permanent hard-coded expectations. They are a regression reference against the first implementation using the same backup data. Do not require this broad comparison unless a real TEST result suggests the calculation changed.
 
-## 14. Important non-goals
+## 15. Important non-goals
 
 Do not include UK legal-limit calculations in this WHO phase.
 
@@ -1138,7 +1265,16 @@ Do not rewrite the existing WHO calculation, readiness, RPC or R2 publication lo
 
 Do not run a large historical backfill as part of the first GitHub workflow validation.
 
-## 15. Done criteria
+
+Do not use GitHub Actions artefacts or caches as authoritative cross-run application state.
+
+Do not suppress later hourly recalculation merely because an earlier run succeeded.
+
+Do not write directly to `${UK_AQ_DROPBOX_ROOT}` as a local filesystem path.
+
+Do not recalculate more than yesterday and the day before yesterday during normal scheduled operation. Older corrections use manual backfill.
+
+## 16. Done criteria
 
 The implementation is done when:
 
@@ -1147,17 +1283,24 @@ The implementation is done when:
 3. Daily status rows can be generated and upserted for `source_network_code = 'gov_uk_aurn'` and pollutants `pm25`, `pm10`, and `no2`.
 4. Rolling-year rows can be generated and upserted.
 5. Last complete calendar-year rows can be generated and upserted.
-6. R2 v2 parquet archives are written to the agreed paths.
-7. Dated summary JSON is written for the latest processed day.
-8. `history/v2/who_2021/latest_who_2021.json` returns 9 homepage card rows for the latest processed day.
-9. Re-running the job for the same date is idempotent and does not create duplicate logical data.
-10. The active direct worker is under `workers/uk_aq_who_2021_daily/` and does not start an HTTP server.
-11. `.github/workflows/uk_aq_who_2021_daily.yml` runs the WHO batch logic directly through `workflow_dispatch`.
-12. The workflow uses GitHub repository variables and secrets directly.
-13. Cloudflare Scheduler is the sole schedule authority and dispatches the workflow during the agreed readiness window.
-14. The GitHub workflow has stable non-cancelling concurrency and a bounded timeout.
-15. A bounded JSON report is uploaded for every workflow attempt.
-16. One manual normal TEST workflow run and one scheduler-dispatched TEST run have been accepted.
-17. The scheduler entry uses the repository's normal D1 due-slot and duplicate-claim protection.
-18. The website can consume the public R2 JSON without changing the private calculation data model.
-19. Authoritative `system_docs/` describe Cloudflare Scheduler -> GitHub Actions -> Obs AQI DB/R2 as the active WHO daily execution path.
+6. Every normal hourly run recalculates yesterday and the day before yesterday.
+7. A prior successful run does not suppress later recalculation.
+8. Readiness controls the current published `as_of_day_utc`, not whether the two private daily dates can be recalculated.
+9. Individual daily validity remains based on at least 18 valid distinct hours and does not require an individual timeseries to contain the final midnight observation.
+10. R2 v2 parquet archives are written to the agreed paths.
+11. Dated summary JSON is written before `history/v2/who_2021/latest_who_2021.json`.
+12. The latest JSON returns the 9 homepage card rows for the current published day.
+13. Re-running the job is idempotent and does not create duplicate logical data.
+14. Unchanged R2 JSON and parquet objects are not rewritten.
+15. Changed R2 objects replace the same stable keys in the required publication order.
+16. The active direct worker is under `workers/uk_aq_who_2021_daily/` and does not start an HTTP server.
+17. `.github/workflows/uk_aq_who_2021_daily.yml` runs the WHO batch logic directly through `workflow_dispatch`.
+18. Cloudflare Scheduler is the sole schedule authority and dispatches the workflow during the 04:00-09:00 UTC window.
+19. The workflow has stable non-cancelling concurrency and a bounded timeout.
+20. Every workflow attempt writes a bounded report wherever technically possible.
+21. Every report is uploaded through Dropbox to `${UK_AQ_DROPBOX_ROOT}/who_2021/` and retained as a GitHub Actions artefact.
+22. One manual normal TEST run, one scheduler-dispatched TEST run and one later hourly recalculation run have been accepted.
+23. The scheduler uses the repository's normal D1 due-slot and duplicate-claim protection.
+24. No secrets appear in logs, reports or artefacts.
+25. The website can consume the public R2 JSON without changing the private calculation data model.
+26. Authoritative `system_docs/` describe the accepted Cloudflare Scheduler -> GitHub Actions -> Obs AQI DB/R2/Dropbox execution path.
