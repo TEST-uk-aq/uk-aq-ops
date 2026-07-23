@@ -6,7 +6,9 @@ Scope: private Obs AQI DB calculation/state tables, GitHub Actions daily process
 
 This plan is for VS Code Codex. Recommended model: **GPT-5.6 Codex with High reasoning**. It is separate from the static homepage card implementation plan. The homepage card can initially use hard-coded figures. This plan creates the data layer that will later feed that card, the WHO guideline page, league tables and sensor detail pages.
 
-Execution-host amendment: the daily WHO calculation and R2 publication task must run directly in GitHub Actions and be triggered by the existing Cloudflare cron scheduler. GCP Cloud Run and GCP Cloud Scheduler are not part of the final daily-task architecture.
+The daily calculation and publication task is a fresh implementation built directly for GitHub Actions and the existing Cloudflare cron scheduler. The active implementation must use this architecture from its first operational run.
+
+Codex can work directly from the phases in this plan. Separate long-form Codex prompts are not required. Each Codex request only needs to identify the phase or phases to implement, repeat the TEST-only and minimal-validation constraints, and use GPT-5.6 Codex with High reasoning.
 
 ## 1. Goal
 
@@ -36,7 +38,7 @@ Use Option B:
 - GitHub Actions is the execution host for the daily WHO calculation and publication task.
 - Cloudflare Scheduler is the sole schedule authority and dispatches the GitHub workflow through `workflow_dispatch`.
 
-The final daily execution path is:
+The daily execution path is:
 
 ```text
 Cloudflare Scheduler
@@ -47,7 +49,7 @@ Cloudflare Scheduler
   -> R2 v2 parquet and public JSON
 ```
 
-Do not add a GitHub Actions `schedule:` trigger. Do not use GCP Cloud Run, GCP Cloud Scheduler, Artifact Registry or GCP Secret Manager for this daily task after cutover.
+Do not add a GitHub Actions `schedule:` trigger. The workflow must run the batch entry point directly rather than starting or calling an HTTP service.
 
 Do not expose public Supabase WHO views in phase 1. The homepage card should read a small R2 JSON file, not query Supabase.
 
@@ -529,15 +531,16 @@ This supports later calendar-square views by month/year without requiring public
 
 Implement the daily WHO derived-data process in the ops repo as a directly executed GitHub Actions batch workflow.
 
-The workflow should be:
+Use:
 
 ```text
+workers/uk_aq_who_2021_daily/
 .github/workflows/uk_aq_who_2021_daily.yml
 ```
 
-The workflow must use `workflow_dispatch` only. The existing Cloudflare Scheduler remains the sole schedule authority and dispatches this workflow. Do not add a GitHub `schedule:` block.
+The worker directory must use neutral task naming. Keep calculation, readiness, summary, parquet and R2 publication modules together under this directory, with a direct batch entry point and no HTTP server.
 
-Run the existing WHO batch implementation directly. Do not start an HTTP server and do not call an authenticated `/run` endpoint. The current calculation, readiness, summary and R2 publication logic in `run_job.ts` should be reused with the smallest safe refactor.
+The workflow must use `workflow_dispatch` only. Cloudflare Scheduler remains the sole schedule authority and dispatches this workflow. Do not add a GitHub `schedule:` block.
 
 Required workflow characteristics:
 
@@ -545,24 +548,23 @@ Required workflow characteristics:
 - Deno version pinned consistently with the repository
 - stable concurrency group such as `uk-aq-who-2021-daily`
 - `cancel-in-progress: false`
-- a workflow timeout with a small margin above the existing 15-minute task deadline
+- a workflow timeout with a small margin above the 15-minute task deadline
 - direct execution of the WHO batch entry point
-- no Google authentication, `gcloud`, Docker build, Artifact Registry or Secret Manager steps
 - GitHub repository variables for non-secret configuration
 - GitHub repository secrets for `OBS_AQIDB_SECRET_KEY`, R2 access key and R2 secret access key
 - a bounded JSON run report uploaded as a workflow artefact with `if: always()`
-- non-zero exit on a genuine calculation/publication failure
+- non-zero exit on a genuine calculation, database or publication failure
 - successful exit for the existing clean deferred/no-op and already-completed outcomes
 
-Suggested Dropbox report path:
+Write the runner-local report to:
 
 ```text
-{$UK_AQ_DROPBOX_ROOT}/who_2021/uk_aq_who_2021_daily_report.json
+tmp/uk_aq_who_2021_daily_report.json
 ```
 
-The normal scheduler-dispatched workflow must use daily mode and production publication settings from repository configuration. Manual `workflow_dispatch` should also support the existing backfill and dry-run modes without changing normal defaults.
+The normal scheduler-dispatched workflow must use daily mode and publication settings from repository configuration. Manual `workflow_dispatch` must support the existing daily, backfill and dry-run modes without changing normal defaults.
 
-The workflow must preserve:
+The implementation must preserve:
 
 - `who_2021_processing_runs` logging
 - readiness/deferred semantics
@@ -572,7 +574,13 @@ The workflow must preserve:
 - the current retry and warning/failure behaviour
 - the existing source network, connector, pollutant and completeness defaults
 
-Update the diagnostic egress caller label from the Cloud Run-specific value to a GitHub Actions-specific value only after checking whether any allow-list or monitoring rule relies on the old value.
+Use the diagnostic egress caller label:
+
+```text
+uk_aq_who_2021_daily_github_actions
+```
+
+Confirm that the label is accepted by any relevant egress allow-list or monitoring rule.
 
 ### 8.1 Readiness gate and scheduler retry window
 
@@ -619,7 +627,7 @@ Confirm the final job key and current authoritative scheduler conventions in the
 Pseudo workflow:
 
 1. Cloudflare Scheduler dispatches the GitHub workflow.
-2. The workflow maps repository variables, secrets and manual inputs into the existing WHO runtime environment.
+2. The workflow maps repository variables, secrets and manual inputs into the WHO runtime environment.
 3. Determine latest complete UTC/GMT day.
 4. Run the readiness gate for `latest_complete_day_utc` unless the request is an explicit backfill or dry-run that bypasses publication readiness.
 5. If the readiness gate is not met, log a deferred/no-op run, write the report artefact and stop successfully.
@@ -759,7 +767,20 @@ Expected frontend behaviour:
 
 ## 12. Phasing recommendation
 
-Yes, this needs phases. The calculation and publication logic already exists, but the execution host must now be migrated from GCP to GitHub Actions.
+Yes, this needs phases. Codex can implement directly from these phases without separate detailed prompts.
+
+For a Codex request, use a short instruction such as:
+
+```text
+Use GPT-5.6 Codex with High reasoning.
+
+Implement Phases 7.1 to 7.5 of:
+plans/2026-07-23 WHO guideline limits/WHO-derived-data-tables-and-processes-codex-plan-2026-07-23.md
+
+Work only in TEST-uk-aq/uk-aq-ops. Follow AGENTS.md and the authoritative system_docs. Use minimal structural validation only. Do not deploy, dispatch workflows, sync scheduler configuration or edit system_docs unless the selected phase explicitly requires it.
+```
+
+The plan itself supplies the technical requirements, sequence, constraints and done criteria.
 
 ### Phase 1: Schema and reference values
 
@@ -787,7 +808,7 @@ Implemented:
 
 ### Phase 2: Daily status calculation
 
-Status: calculation code and schema implemented. The existing Cloud Run HTTP wrapper is transitional and is not the final execution host.
+Status: calculation code and schema implemented. The active worker still needs to be organised under the neutral direct-batch path defined in Phase 7.
 
 Final deliver:
 
@@ -797,15 +818,14 @@ Final deliver:
 - Daily, backfill and dry-run modes.
 - One bounded run report for GitHub Actions.
 
-Existing reusable implementation:
+Reusable implementation includes:
 
 - `uk_aq_public.uk_aq_rpc_who_2021_daily_status_refresh`
 - `uk_aq_public.uk_aq_rpc_who_2021_processing_run_log`
-- `workers/uk_aq_who_2021_daily_cloud_run/run_job.ts`
-- `workers/uk_aq_who_2021_daily_cloud_run/who_2021_daily_core.ts`
-- existing focused tests and README
+- the current WHO daily job, core and parquet modules
+- existing focused tests and README material
 
-Phase 7 below moves the direct batch implementation into the final GitHub Actions execution path.
+Phase 7 establishes the final neutral worker layout and GitHub Actions execution path.
 
 ### Phase 3: Rolling and calendar summary calculation
 
@@ -828,11 +848,11 @@ Implemented:
 - readiness, already-completed and deferred behaviour in the shared batch implementation
 - 9-row homepage summary generation
 
-The 04:00-09:00 UTC readiness window remains, but Cloudflare Scheduler becomes the schedule authority in Phase 7.
+Cloudflare Scheduler owns the 04:00-09:00 UTC readiness window.
 
 ### Phase 4: R2 v2 JSON publication and parquet writes
 
-Status: implemented in the shared batch code. Apply/deploy/operational validation steps may still be required in TEST.
+Status: implemented in the shared batch code. Apply and operational validation steps may still be required in TEST.
 
 Deliver:
 
@@ -856,7 +876,7 @@ Implemented:
 
 Remaining TEST data-layer follow-up:
 
-- apply/confirm the Phase 4 row-batch RPC
+- apply or confirm the Phase 4 row-batch RPC
 - confirm R2 credentials
 - enable publication flags
 - inspect one real TEST workflow publication
@@ -887,14 +907,14 @@ Deliver later:
 - station detail links
 - clear WHO guideline versus UK legal-limit explanation
 
-### Phase 7: Migrate the daily execution host to GitHub Actions
+### Phase 7: GitHub Actions and Cloudflare Scheduler implementation
 
 Status: required by the 2026-07-23 amendment.
 
-**Owner:** Codex for repository implementation, user/operator for real TEST runs and removal of GCP resources  
+**Owner:** Codex for repository implementation, user/operator for real TEST operation  
 **Recommended model:** GPT-5.6 Codex with High reasoning
 
-This is an execution-host migration. Do not rewrite the WHO calculation, readiness, database RPC or R2 publication rules.
+Build the active execution path directly for GitHub Actions and Cloudflare Scheduler. Do not introduce a transitional execution path or duplicate scheduler.
 
 #### Phase 7.1 Focused inspection
 
@@ -904,26 +924,49 @@ Before editing, Codex must read:
 - `system_docs/README.md`
 - `system_docs/documentation_contract.md`
 - the authoritative WHO, scheduler, R2 and task-health documents
-- the current WHO worker and deploy workflow
+- the current WHO calculation, readiness and publication modules
 - existing direct GitHub batch workflow patterns
 - `cloudflare/scheduler/jobs.toml`
 - scheduler config-sync code
-- relevant environment/secret catalogues
+- relevant environment and secret catalogues
 
 Confirm:
 
-- the direct command required to run `run_job.ts`
-- the existing Deno version and dependency cache pattern
-- the current 15-minute service timeout
-- all runtime variables and actual secrets
+- the direct Deno command for the WHO batch job
+- the repository Deno version and dependency-cache pattern
+- all runtime variables and actual GitHub secrets
 - the active R2 publication settings
 - the current scheduler GitHub-workflow target schema
-- whether the egress caller label is allow-listed
+- whether the proposed egress caller label is accepted
 - the smallest safe way to write a bounded JSON report
+- whether any targeted check is genuinely required before implementation
 
 Do not call external services during this inspection.
 
-#### Phase 7.2 Add the direct GitHub workflow
+#### Phase 7.2 Create the neutral direct worker
+
+Create or organise the active implementation under:
+
+```text
+workers/uk_aq_who_2021_daily/
+```
+
+The directory should contain the direct batch entry point, calculation/core modules, parquet module, focused tests and README.
+
+Requirements:
+
+- reuse the existing calculation, readiness, RPC and R2 publication logic
+- do not duplicate calculation logic
+- do not start an HTTP server
+- use neutral task names in paths, scripts, log metadata and documentation
+- write `tmp/uk_aq_who_2021_daily_report.json` on success, deferred/no-op, already-completed and failure paths
+- ensure the report is bounded and contains no secrets
+- use `uk_aq_who_2021_daily_github_actions` as the diagnostic egress caller label
+- update relevant package scripts and environment catalogues
+- remove unused active HTTP-service, container and deployment-only files rather than retaining an alternate execution path
+- follow the repository archive policy only for active non-test code that is actually changed
+
+#### Phase 7.3 Add the GitHub Actions workflow
 
 Add:
 
@@ -936,37 +979,59 @@ Required behaviour:
 - `workflow_dispatch` only
 - no GitHub `schedule:`
 - direct Deno batch execution
-- no HTTP server
-- no GCP authentication or deployment steps
 - `permissions: contents: read`
 - stable concurrency group with `cancel-in-progress: false`
-- workflow timeout with a small margin over the current 15-minute task limit
+- workflow timeout with a small margin over the 15-minute task deadline
 - normal daily defaults for scheduler dispatch
 - manual daily, backfill and dry-run inputs
-- direct mapping of existing non-secret variables
-- direct GitHub secret mapping for Obs AQI DB and R2 credentials
+- direct mapping of existing non-secret repository variables
+- direct mapping of `OBS_AQIDB_SECRET_KEY` and R2 credentials from GitHub secrets
 - bounded JSON report uploaded with `if: always()`
 - existing deferred/already-completed outcomes remain successful
 - genuine calculation, database or publication failures remain non-zero
 
-Use the current `run_job.ts` and core modules with the smallest safe refactor. Do not duplicate calculation logic in workflow YAML.
+Do not duplicate runtime configuration or calculation logic in workflow YAML. Inputs should translate into the existing environment-variable interface.
 
-During initial implementation, retain the existing Cloud Run service and deploy workflow solely as rollback. Do not deploy or delete GCP resources in this Codex phase.
+#### Phase 7.4 Add the Cloudflare Scheduler job
 
-#### Phase 7.3 Minimal structural checks
+Add or update the WHO entry in:
+
+```text
+cloudflare/scheduler/jobs.toml
+```
+
+Use the repository's existing GitHub workflow target conventions and the entry in section 8.1.
+
+Requirements:
+
+- retain the 04:00-09:00 UTC hourly readiness window unless current authoritative configuration differs
+- use `target_type = "github_workflow"`
+- target `TEST-uk-aq/uk-aq-ops`
+- target `uk_aq_who_2021_daily.yml` on `main`
+- use normal daily mode
+- do not add a GitHub cron
+- preserve Cloudflare D1 due-slot and duplicate-claim protection
+
+Codex must not sync D1 or dispatch the workflow during implementation.
+
+#### Phase 7.5 Minimal structural checks
 
 Before the first real TEST run, run only:
 
 - `deno check` on changed TypeScript entry points
 - the repository's existing fast YAML/workflow parse check
-- the scheduler TOML parse or payload-generation check only if the scheduler entry is edited in the same phase
-- one narrow local report-file check only if needed to prove the direct job writes valid JSON
+- the scheduler TOML parse or payload-generation check
+- one narrow local report-file check only if genuinely needed to prove that all exit paths write valid JSON
 
-Do not create a broad new test suite, mock Supabase/R2 system, shadow comparison or soak test. Functional testing happens through real operation on TEST.
+Do not create a broad new test suite, mock database/R2 system, shadow comparison or soak test. Functional validation happens through real operation on TEST.
 
-#### Phase 7.4 Real TEST workflow validation
+#### Phase 7.6 Real TEST validation
 
-After the workflow is on `main`, manually dispatch one normal daily run.
+After Phases 7.1 to 7.5 are on `main`:
+
+1. Manually dispatch one normal daily workflow run.
+2. Run the existing Cloudflare scheduler configuration sync.
+3. Accept one scheduler-dispatched workflow run.
 
 Confirm:
 
@@ -979,53 +1044,15 @@ Confirm:
 - when publication is enabled, parquet and dated/latest JSON objects are written in the existing order
 - no secrets appear in logs or artefacts
 - the workflow stays within the current operational deadline
+- the scheduler produces one D1 claim and one GitHub workflow dispatch for each due slot
 
 A dry run is optional. Use it only for a specific unresolved configuration risk.
-
-#### Phase 7.5 Cut over Cloudflare Scheduler
-
-After one accepted normal manual workflow run, update `cloudflare/scheduler/jobs.toml` to target the GitHub workflow using the entry in section 8.1.
-
-Codex must:
-
-- retain the 04:00-09:00 UTC hourly readiness window unless current authoritative configuration differs
-- use `target_type = "github_workflow"`
-- target `TEST-uk-aq/uk-aq-ops`
-- target `uk_aq_who_2021_daily.yml` on `main`
-- remove Cloud Run-only target fields
-- not add a GitHub cron
-- run only the existing scheduler config parse/payload check
-- not sync D1 or dispatch the workflow
-
-The user/operator runs the existing scheduler config-sync process and confirms one scheduled D1 claim and GitHub workflow dispatch.
-
-#### Phase 7.6 Remove the old GCP execution path
-
-After one accepted scheduler-dispatched TEST run, the user may remove:
-
-- the GCP Cloud Scheduler trigger for the WHO task
-- the WHO Cloud Run service
-- its Artifact Registry image(s), where no retention reason remains
-
-After the user confirms removal, Codex should make one focused cleanup:
-
-- remove `.github/workflows/uk_aq_who_2021_daily_cloud_run_deploy.yml`
-- remove the obsolete HTTP service wrapper and Dockerfile if no rollback use remains
-- rename the active worker directory from `uk_aq_who_2021_daily_cloud_run` to a neutral name such as `uk_aq_who_2021_daily` if this can be done as a focused change
-- update imports, scripts, READMEs and active runbooks
-- change Cloud Run-specific diagnostic labels to GitHub Actions-specific labels
-- remove only GCP variables and Secret Manager-name settings proven to be exclusive to this retired task
-- retain all direct runtime variables and GitHub secrets
-- retain generic GCP support used by other services
-- do not edit historical plans or archived evidence
-
-Run only directly relevant Deno, YAML and configuration parsing checks.
 
 #### Phase 7.7 Update authoritative system documentation
 
 **Owner:** ChatGPT in Chat mode using Thinking
 
-After the workflow, scheduler cutover and GCP removal are accepted, update the relevant authoritative `system_docs/` files.
+After the implementation and real TEST validation are accepted, update the relevant authoritative `system_docs/` files.
 
 Document:
 
@@ -1038,26 +1065,27 @@ Document:
 - processing-run logging
 - R2 publication order and paths
 - manual backfill operation
-- rollback and monitoring
-- removal of the WHO Cloud Run service and deploy workflow
+- monitoring and failure handling
+
+Do not create duplicate authority across multiple system documents.
 
 ## 13. Validation checks
 
-### 13.1 Execution-host migration validation
+### 13.1 GitHub Actions and scheduler validation
 
-This is the TEST system. Pre-deployment validation for the GitHub Actions migration must be minimal and structural.
+This is the TEST system. Pre-deployment validation must be minimal and structural.
 
 Before deployment, use only:
 
 - `deno check` for changed TypeScript
 - existing fast GitHub workflow YAML validation
-- existing scheduler TOML parsing or payload generation where applicable
+- existing scheduler TOML parsing or payload generation
 - one narrow JSON report-file check only if genuinely needed
 
 Do not build a speculative test suite. Functional validation happens through:
 
 1. one manually dispatched normal TEST workflow run;
-2. one Cloudflare Scheduler-dispatched TEST workflow run after cutover.
+2. one Cloudflare Scheduler-dispatched TEST workflow run.
 
 Use the workflow artefact, `who_2021_processing_runs`, representative Obs AQI DB counts and R2 objects as the real operational evidence.
 
@@ -1086,7 +1114,7 @@ PM10 32.3%, 40 of 124 sensors
 NO2 79.6%, 121 of 152 sensors
 ```
 
-These are not hard-coded production expectations forever. They are a regression reference against the first implementation using the same backup data. Do not require this broad comparison solely for the execution-host migration unless the real TEST result suggests the calculation changed.
+These are not hard-coded production expectations forever. They are a regression reference against the first implementation using the same backup data. Do not require this broad comparison unless a real TEST result suggests the calculation changed.
 
 ## 14. Important non-goals
 
@@ -1102,9 +1130,11 @@ Do not use “safe limits” wording.
 
 Do not add a GitHub Actions `schedule:` trigger.
 
-Do not keep GCP Cloud Run or GCP Cloud Scheduler as part of the final daily WHO execution path.
+Do not create an HTTP service or alternate execution host for the daily WHO task.
 
-Do not rewrite the existing WHO calculation, readiness, RPC or R2 publication logic merely to change execution host.
+Do not duplicate the Cloudflare schedule in GitHub.
+
+Do not rewrite the existing WHO calculation, readiness, RPC or R2 publication logic merely to package the direct worker.
 
 Do not run a large historical backfill as part of the first GitHub workflow validation.
 
@@ -1121,13 +1151,13 @@ The implementation is done when:
 7. Dated summary JSON is written for the latest processed day.
 8. `history/v2/who_2021/latest_who_2021.json` returns 9 homepage card rows for the latest processed day.
 9. Re-running the job for the same date is idempotent and does not create duplicate logical data.
-10. `.github/workflows/uk_aq_who_2021_daily.yml` runs the WHO batch logic directly through `workflow_dispatch`.
-11. The workflow uses GitHub repository variables and secrets directly and has no GCP authentication, deployment or Secret Manager dependency.
-12. Cloudflare Scheduler is the sole schedule authority and dispatches the workflow during the agreed readiness window.
-13. The GitHub workflow has stable non-cancelling concurrency and a bounded timeout.
-14. A bounded JSON report is uploaded for every workflow attempt.
-15. One manual normal TEST workflow run and one scheduler-dispatched TEST run have been accepted.
-16. The old WHO GCP Cloud Scheduler trigger and Cloud Run service have been removed after cutover.
-17. Obsolete Cloud Run deployment files and task-exclusive GCP configuration have been removed, while shared GCP support remains intact.
+10. The active direct worker is under `workers/uk_aq_who_2021_daily/` and does not start an HTTP server.
+11. `.github/workflows/uk_aq_who_2021_daily.yml` runs the WHO batch logic directly through `workflow_dispatch`.
+12. The workflow uses GitHub repository variables and secrets directly.
+13. Cloudflare Scheduler is the sole schedule authority and dispatches the workflow during the agreed readiness window.
+14. The GitHub workflow has stable non-cancelling concurrency and a bounded timeout.
+15. A bounded JSON report is uploaded for every workflow attempt.
+16. One manual normal TEST workflow run and one scheduler-dispatched TEST run have been accepted.
+17. The scheduler entry uses the repository's normal D1 due-slot and duplicate-claim protection.
 18. The website can consume the public R2 JSON without changing the private calculation data model.
 19. Authoritative `system_docs/` describe Cloudflare Scheduler -> GitHub Actions -> Obs AQI DB/R2 as the active WHO daily execution path.
