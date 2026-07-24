@@ -17903,10 +17903,31 @@ def run_v2_integrity_repair_flow(
     planned_operation_counts = record_integrity_object_operations(
         conn, run_id=run_id, run_state=run_state,
     )
-    if dry_run or proposal_failed:
+    has_planned_r2_operations = (
+        int(planned_operation_counts.get("planned_writes") or 0) > 0
+        or int(planned_operation_counts.get("planned_deletions") or 0) > 0
+    )
+    if proposal_failed:
         apply_result: dict[str, Any] = {
-            "status": "blocked_dependency" if proposal_failed else "planned",
-            "reason": "local_proposal_validation_failed" if proposal_failed else "repair_dry_run",
+            "status": "blocked_dependency",
+            "reason": "local_proposal_validation_failed",
+        }
+    elif not has_planned_r2_operations:
+        apply_result = {
+            "status": "skipped_noop",
+            "reason": "no_r2_operations_required",
+            "exit_code": 0,
+            "output": {
+                "planned_writes": 0,
+                "planned_deletions": 0,
+                "completed_writes": 0,
+                "completed_deletions": 0,
+            },
+        }
+    elif dry_run:
+        apply_result = {
+            "status": "planned",
+            "reason": "repair_dry_run",
         }
     else:
         apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
@@ -18019,7 +18040,12 @@ def run_v2_integrity_repair_flow(
         {"stage": "observations_proposal", "status": "failed" if observation_failed else "validated", "result": observations},
         {"stage": "observations_metadata_proposal", "status": "failed" if observation_manifest_status in {"failed", "blocked_dependency"} or observation_index_status in {"failed", "blocked_dependency"} else "validated", "result": metadata},
         {"stage": "aqi_proposal", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else "validated", "result": aqi_result, "source_mode": "combined_local"},
-        {"stage": "canonical_apply", "status": apply_result.get("status"), "result": apply_result},
+        {
+            "stage": "canonical_apply",
+            "status": apply_result.get("status"),
+            "reason": apply_result.get("reason"),
+            "result": apply_result,
+        },
         {
             "stage": "first_value_at_reconciliation",
             "status": first_value_at_reconciliation.get("status"),
