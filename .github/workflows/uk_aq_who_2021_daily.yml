@@ -107,6 +107,9 @@ jobs:
         uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
         with:
           deno-version: v2.7.13
+		  
+      - name: Install Deno dependencies
+        run: deno install --frozen
 
       - name: Cache Deno dependencies
         uses: actions/cache@v4
@@ -143,6 +146,88 @@ jobs:
             deno run --allow-env --allow-net --allow-read --allow-write \
               workers/uk_aq_who_2021_daily/main.ts
 
+      - name: Ensure WHO report exists
+        if: always()
+        env:
+          WHO_JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          report_path="${UK_AQ_WHO_2021_REPORT_PATH}"
+
+          if [ ! -f "${report_path}" ]; then
+            mkdir -p "$(dirname "${report_path}")"
+
+            python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          report_path = Path(
+              os.environ["UK_AQ_WHO_2021_REPORT_PATH"]
+          )
+
+          now = datetime.now(timezone.utc).isoformat().replace(
+              "+00:00", "Z"
+          )
+
+          report = {
+              "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "workflow_run_attempt": os.environ.get(
+                  "GITHUB_RUN_ATTEMPT"
+              ),
+              "run_id": None,
+              "run_mode": os.environ.get(
+                  "UK_AQ_WHO_2021_RUN_MODE", "daily"
+              ),
+              "trigger_mode": os.environ.get(
+                  "UK_AQ_WHO_2021_TRIGGER_MODE", "manual"
+              ),
+              "started_at": None,
+              "finished_at": now,
+              "latest_complete_day_utc": None,
+              "correction_day_utc": None,
+              "publication_as_of_day_utc": None,
+              "readiness": None,
+              "row_counts": {
+                  "daily_rows_upserted": 0,
+                  "rolling_rows_upserted": 0,
+                  "calendar_rows_upserted": 0,
+                  "valid_timeseries_days": 0,
+                  "not_enough_data_timeseries_days": 0,
+              },
+              "r2_objects_checked": [],
+              "r2_objects_updated": [],
+              "r2_objects_unchanged": [],
+              "dropbox": {
+                  "destination_path": None,
+                  "upload_result": "pending",
+              },
+              "warnings": [
+                  "The workflow failed before the WHO worker wrote "
+                  "its normal report."
+              ],
+              "operational_outcome": "failed",
+              "error": {
+                  "message": (
+                      "Workflow setup or dependency installation "
+                      "failed before the WHO batch started."
+                  ),
+                  "source_file": (
+                      ".github/workflows/"
+                      "uk_aq_who_2021_daily.yml"
+                  ),
+              },
+          }
+
+          report_path.write_text(
+              json.dumps(report, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          fi
+
       - name: Upload WHO report to Dropbox
         if: always()
         run: |
@@ -155,5 +240,5 @@ jobs:
         with:
           name: uk-aq-who-2021-daily-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: tmp/uk_aq_who_2021_daily_report.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
