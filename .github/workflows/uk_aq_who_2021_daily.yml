@@ -108,8 +108,14 @@ jobs:
         with:
           deno-version: v2.7.13
 
-      - name: Install Deno dependencies
-        run: deno install --frozen
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
 
       - name: Cache Deno dependencies
         uses: actions/cache@v4
