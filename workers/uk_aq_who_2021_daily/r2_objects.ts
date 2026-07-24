@@ -195,15 +195,30 @@ export async function getR2Object(
     throw new Error(`R2 GET failed for ${objectKey}: HTTP ${response.status}`);
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
-  const declaredLength = Number(response.headers.get("content-length"));
-  if (
-    Number.isFinite(declaredLength) &&
-    declaredLength >= 0 &&
-    declaredLength !== bytes.byteLength
-  ) {
-    throw new Error(
-      `R2 content-length mismatch for ${objectKey}: expected ${declaredLength}, read ${bytes.byteLength}`,
-    );
+  const rawDeclaredLength = response.headers.get("content-length");
+  if (rawDeclaredLength !== null && rawDeclaredLength.trim() !== "") {
+    const normalizedDeclaredLength = rawDeclaredLength.trim();
+    if (!/^\d+$/.test(normalizedDeclaredLength)) {
+      throw new Error(
+        `Invalid R2 content-length for ${objectKey}: ${
+          normalizedDeclaredLength.slice(0, 200)
+        }`.slice(0, 500),
+      );
+    }
+    const declaredLength = Number(normalizedDeclaredLength);
+    if (!Number.isSafeInteger(declaredLength) || declaredLength < 0) {
+      throw new Error(
+        `Invalid R2 content-length for ${objectKey}: ${
+          normalizedDeclaredLength.slice(0, 200)
+        }`.slice(0, 500),
+      );
+    }
+    if (declaredLength !== bytes.byteLength) {
+      throw new Error(
+        `R2 content-length mismatch for ${objectKey}: expected ${declaredLength}, read ${bytes.byteLength}`
+          .slice(0, 500),
+      );
+    }
   }
   return {
     key: objectKey,
