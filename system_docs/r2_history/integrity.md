@@ -92,6 +92,48 @@ For an approved mapped label, a source site/pollutant group with no authoritativ
 
 Contradictory or ambiguous mappings, incompatible units and invalid selected canonical rows remain fail-closed. Unit evidence is validated per source column/header section. Zero target-day values need no target-day unit; blank target-day units are accepted only after compatible non-empty evidence exists in that same section.
 
+## Verification status contract
+
+Canonical R2 v2 observation rows contain a nullable string field named:
+
+```text
+verification_status
+```
+
+For UK-AIR SOS observations, the canonical values are:
+
+```text
+P = provisional
+R = ratified
+null = no source verification status supplied
+```
+
+UK-AIR SOS source values are normalised after trimming and case-insensitive comparison:
+
+```text
+null or blank -> null
+P or Provisional -> P
+R or Ratified -> R
+```
+
+Any other non-empty UK-AIR SOS status MUST fail closed for the affected selected source scope. It MUST NOT be silently mapped to provisional, ratified or null.
+
+For connectors other than UK-AIR SOS, `verification_status` remains null unless that connector has a separately documented source field with equivalent provisional or ratified meaning. Operational sensor state, QA flags with different meanings and ingestion status MUST NOT be placed in this field.
+
+Ratified observations are not immutable. A later change to a ratified concentration or a later change in verification status remains valid source correction evidence. It changes the observation-content hash and can trigger the normal complete pollutant-partition repair.
+
+### Legacy read compatibility
+
+During migration, readers and Integrity canonicalisation MUST resolve the status in this order:
+
+1. canonical `verification_status` when present;
+2. legacy nullable `status` when present;
+3. otherwise null.
+
+Legacy `status` is a read-compatibility alias only. New observation writers MUST emit `verification_status` and MUST NOT emit both fields.
+
+A missing legacy status column and an explicit null status are semantically equivalent. Existing SOS partitions without preserved status may differ from authoritative UK-AIR source content and therefore require complete pollutant-partition repair. A non-SOS partition whose authoritative status is null does not require data replacement merely to add an all-null physical column when its canonical content otherwise agrees; it may use the legacy hashless metadata-adoption path.
+
 ## Operational environment
 
 Integrity operational runs occur on the dedicated Integrity machine through its local `uk-aq-history-integrity.sh` dispatcher. It selects the repository and environment, then invokes the repository runner, which derives state and source-cache paths from the Integrity local root.
@@ -140,12 +182,20 @@ Every non-empty v2 observation pollutant manifest MUST contain:
     "timeseries_id",
     "pollutant_code",
     "observed_at_utc",
-    "value"
-  ]
+    "value",
+    "verification_status"
+  ],
+  "verification_status_counts": {
+    "P": 600,
+    "R": 620,
+    "null": 14
+  }
 }
 ```
 
 `observation_content_hash_row_count` MUST equal the pollutant manifest `row_count` and the number of rows supplied to the hash helper.
+
+`verification_status_counts` is derived from the same canonical row collection. Its `P`, `R` and `null` values MUST be non-negative integers and MUST sum exactly to `observation_content_hash_row_count`. The keys are fixed and always present in the order shown, including when one or more counts are zero.
 
 The pollutant manifest's existing `manifest_hash` includes these fields. Connector and day manifests continue to reference child `manifest_hash` values. No separate R2 hash object or backup path is introduced.
 
@@ -157,7 +207,7 @@ Prune Daily and the Integrity source-to-R2 worker MUST use one shared implementa
 workers/shared/uk_aq_observation_content_hash.mjs
 ```
 
-The shared module owns the hash contract version, row normalisation, canonical encoding, ordering and SHA-256 calculation. Neither writer may copy or independently reimplement the algorithm.
+The shared module owns the hash contract version, row normalisation, verification-status normalisation, canonical encoding, ordering, status counts and SHA-256 calculation. Neither writer may copy or independently reimplement the algorithm.
 
 The shared function should be exported with an explicit name such as:
 
@@ -165,7 +215,7 @@ The shared function should be exported with an explicit name such as:
 computeObservationContentHash(rows)
 ```
 
-It returns the hash, algorithm, contract version, row count and canonical column list required by the manifest builder.
+It returns the hash, algorithm, contract version, row count, canonical column list and `verification_status_counts` required by the manifest builder.
 
 ### Contract version 1 canonical encoding
 
@@ -178,6 +228,7 @@ timeseries_id
 pollutant_code
 observed_at_utc
 value
+verification_status
 ```
 
 Required normalisation:
@@ -190,12 +241,13 @@ Required normalisation:
 - `value` is a finite IEEE-754 binary64 value;
 - finite negative values are preserved;
 - negative zero is normalised to positive zero;
-- null, NaN and infinite values are invalid canonical observation rows.
+- null, NaN and infinite values are invalid canonical observation values;
+- `verification_status` is canonical `P`, canonical `R` or null under the verification-status contract above.
 
 The value is encoded as 16 lower-case hexadecimal characters containing the big-endian IEEE-754 binary64 bytes. Each canonical row is then encoded as compact UTF-8 JSON with this fixed array order:
 
 ```text
-[connector_id, station_id, timeseries_id, pollutant_code, observed_at_utc, value_float64_hex]
+[connector_id, station_id, timeseries_id, pollutant_code, observed_at_utc, value_float64_hex, verification_status]
 ```
 
 Canonical row strings are sorted lexicographically, exact duplicate rows are retained, and the SHA-256 input is:
@@ -209,7 +261,7 @@ uk-aq-observation-content-hash:v1\n
 
 The final row also ends with `\n`. This contract makes the result independent of source order and Parquet physical order while preserving duplicate multiplicity.
 
-The current v1 hash contract does not contain `verification_status_code` because that field is not yet part of the canonical R2 v2 observation schema. Adding that field to canonical R2 observations requires a new observation-content-hash contract version and coordinated writer, reader, manifest and Integrity changes.
+A change to `verification_status`, including `P` to `R`, `R` to `P`, null to a known status or a known status to null, MUST change the content hash when all other row fields remain unchanged.
 
 ### Writer requirements
 
@@ -218,7 +270,9 @@ The Prune Daily writer calculates the hash from the exact canonical pollutant ro
 A writer MUST fail closed rather than publish a manifest when:
 
 - any selected row cannot be canonicalised;
+- any non-empty UK-AIR SOS verification status is not recognised;
 - the hash row count differs from the selected pollutant row count;
+- `verification_status_counts` does not match the canonical rows or sum to the row count;
 - the returned contract metadata is missing or invalid;
 - the manifest fields do not exactly represent the hash result.
 
@@ -229,7 +283,7 @@ For every selected day, connector and pollutant:
 1. Compare source and R2 total and per-timeseries row counts as the fast structural check.
 2. If any count differs, classify an observation data mismatch and rebuild the complete selected pollutant partition. A content-hash comparison is not needed to prove that repair is required.
 3. If counts match, calculate the authoritative source `observation_content_hash` and compare it with the hash in the Dropbox pollutant manifest.
-4. If the hashes match and the manifest contract metadata is valid, the observation content is verified.
+4. If the hashes match and the manifest contract metadata and `verification_status_counts` are valid, the observation content is verified.
 5. If the hashes differ, classify an observation data mismatch and rebuild the complete selected pollutant partition.
 6. A hash mismatch may produce bounded diagnostic samples and difference-category counts. A complete row-by-row pre-repair diff is not required because the repair unit is the complete day/connector/pollutant partition.
 
@@ -239,13 +293,15 @@ The comparison result MUST distinguish at least:
 - `observation_content_hash_mismatch`;
 - `observation_content_hash_missing`;
 - `observation_content_hash_invalid_contract`;
-- verified count and hash agreement.
+- `verification_status_invalid`;
+- `verification_status_counts_mismatch`;
+- verified count, hash and status-count agreement.
 
 ### Existing manifests without the hash
 
 Missing observation-content-hash fields in an otherwise readable historical pollutant manifest are a metadata gap, not automatic proof that the Parquet data is wrong.
 
-For a legacy hashless partition, Integrity MUST read the Dropbox Parquet and calculate its observation-content hash through the shared helper:
+For a legacy hashless partition, Integrity MUST read the Dropbox Parquet and calculate its observation-content hash through the shared helper, applying the legacy status fallback before hashing:
 
 - if the calculated R2 hash matches the source hash, plan a metadata-only pollutant-manifest repair and preserve the Parquet;
 - if it differs, plan a complete selected-pollutant observation data repair;
@@ -258,8 +314,8 @@ Once a valid hash is present, routine source comparison uses the manifest value.
 After a real observation repair, Integrity MUST:
 
 1. GET/read the written pollutant Parquet from live R2;
-2. recalculate its observation-content hash through the shared helper;
-3. require exact equality with the authoritative source hash;
+2. recalculate its observation-content hash and `verification_status_counts` through the shared helper;
+3. require exact equality with the authoritative source hash and source status counts;
 4. require the written pollutant manifest fields to equal that verified result;
 5. only then treat the observation repair as successful and continue to parent manifests, indexes and AQI work.
 
@@ -268,19 +324,19 @@ The audit chain is:
 ```text
 old R2 hash differs from source hash
 complete pollutant partition rebuilt
-new live R2 hash equals source hash
+new live R2 hash and verification-status counts equal source truth
 ```
 
 ### SQLite ownership and optional future source cache
 
-Integrity SQLite stores comparison and audit evidence, including the source hash used, the R2 manifest hash, comparison result, repair run identity and post-repair verification. It does not store a duplicate authoritative R2 observation-content-hash cache.
+Integrity SQLite stores comparison and audit evidence, including the source hash used, source and R2 verification-status counts, the R2 manifest hash, comparison result, repair run identity and post-repair verification. It does not store a duplicate authoritative R2 observation-content-hash cache.
 
 The initial implementation SHOULD calculate source hashes during the existing source parsing and canonical-row pass. If real TEST operations show that source hash creation is materially slow, a later additive SQLite source-hash cache MAY be introduced.
 
 Any future source-hash cache MUST be non-authoritative and MUST be keyed or invalidated by all inputs that can change canonical content, including:
 
 - exact source-file identities and SHA-256 values;
-- source timestamp/parser contract version;
+- source timestamp/parser and verification-status normalisation contract versions;
 - source-label registry snapshot identity;
 - station/timeseries and observed-property mapping identities;
 - day, connector and pollutant scope;
@@ -290,7 +346,7 @@ A cache entry MUST NOT survive a change to any of those identities. Adding such 
 
 ### Dropbox backup
 
-The existing v2 history Dropbox backup copies the observation day folder and its pollutant manifests. Therefore `observation_content_hash` is preserved through the existing manifest/day backup path.
+The existing v2 history Dropbox backup copies the observation day folder and its pollutant manifests. Therefore `observation_content_hash`, `verification_status_counts` and the canonical status column are preserved through the existing manifest/day backup path.
 
 No separate hash object, backup inventory category or Dropbox checkpoint section is added. A changed pollutant manifest changes its own bytes and hash, its parent manifest identities and the existing backup inventory entry, causing the normal changed units to be copied.
 
@@ -300,10 +356,10 @@ No separate hash object, backup inventory category or Dropbox checkpoint section
 2. Check Dropbox backup readiness unless `--allow-stale-dropbox` is supplied.
 3. Import the current `R2_history_backup/history/v2/core` snapshot.
 4. Read or fetch relevant historical connector data through configured source adapters and caches.
-5. Normalise source timestamps, mappings and canonical selected-pollutant rows.
+5. Normalise source timestamps, mappings, verification status and canonical selected-pollutant rows.
 6. Compare source and Dropbox row counts.
 7. For count-matching scopes, compare the source `observation_content_hash` with the Dropbox pollutant-manifest hash.
-8. Validate Parquet, manifests, indexes and stable bindings and classify any remaining metadata faults.
+8. Validate status counts, Parquet, manifests, indexes and stable bindings and classify any remaining metadata faults.
 9. Build a deterministic repair plan after detection completes.
 10. Stop after reporting in `--check-only` mode.
 11. With `--run-backfill --dry-run`, calculate exact local repair proposals without writing R2.
@@ -323,7 +379,7 @@ It MUST:
 1. Apply the backup readiness gate unless `--allow-stale-dropbox` is supplied.
 2. Import the Dropbox core snapshot and scoped R2 v2 mirror.
 3. Read or fetch the authoritative connector source/cache.
-4. Apply count and observation-content-hash comparison.
+4. Apply count, verification-status and observation-content-hash comparison.
 5. Check all relevant parts of the seven logical v2 areas.
 6. Record source state, comparison evidence, findings and the repair plan in SQLite and reports.
 
@@ -385,20 +441,21 @@ The report keeps these comparisons separate:
 
 1. source/cache counts versus R2 recorded and, when needed, Parquet-derived counts;
 2. source observation-content hash versus pollutant-manifest observation-content hash;
-3. actual Parquet evidence versus pollutant manifest counts and file identities where a Parquet read is required;
-4. supported-pollutant manifests versus connector and day hierarchy representations;
-5. committed supported-pollutant entries versus pollutant and latest indexes;
-6. stable binding objects versus imported core identities.
+3. source verification-status counts versus pollutant-manifest status counts;
+4. actual Parquet evidence versus pollutant manifest counts and file identities where a Parquet read is required;
+5. supported-pollutant manifests versus connector and day hierarchy representations;
+6. committed supported-pollutant entries versus pollutant and latest indexes;
+7. stable binding objects versus imported core identities.
 
 Existing out-of-scope pollutant partitions, manifest entries and indexes are ignored as findings and are carried through unchanged when a parent is rebuilt.
 
-An unavailable reader, unreadable selected-pollutant Parquet, unavailable selected-pollutant source/cache or ambiguous selected-pollutant mapping fails closed. An absent authoritative active binding remains warning-only and is excluded from canonical evidence, counts and hashes.
+An unavailable reader, unreadable selected-pollutant Parquet, unavailable selected-pollutant source/cache, unrecognised source verification status or ambiguous selected-pollutant mapping fails closed. An absent authoritative active binding remains warning-only and is excluded from canonical evidence, counts and hashes.
 
 ## Repair planning
 
 Each v2 run includes a deterministic, deduplicated `repair_plan` array. The plan records whether each selected scope needs data replacement, metadata repair, index repair, AQI rebuild or operator action.
 
-A valid readable pollutant Parquet whose calculated R2 content hash matches source truth but whose hash fields are missing or invalid is a metadata-only fault. Metadata-only repair MUST NOT rewrite valid Parquet.
+A valid readable pollutant Parquet whose calculated R2 content hash and status counts match source truth but whose manifest hash fields are missing or invalid is a metadata-only fault. Metadata-only repair MUST NOT rewrite valid Parquet.
 
 A count mismatch or observation-content-hash mismatch is an observation data fault. The destructive repair unit is one connector-day plus an explicit selected pollutant subset. The physical delete/write scope remains the exact selected day/connector/pollutant prefix.
 
@@ -411,19 +468,19 @@ Before any R2 mutation, Integrity builds all corrected files locally and validat
 For an observation data repair:
 
 1. Read or fetch and identity-pin all required source files.
-2. Build canonical selected-pollutant source evidence.
-3. Calculate authoritative source counts and `observation_content_hash` through the shared helper.
+2. Build canonical selected-pollutant source evidence, including canonical `verification_status`.
+3. Calculate authoritative source counts, `verification_status_counts` and `observation_content_hash` through the shared helper.
 4. Exclude and report warning-only `no_authoritative_timeseries_binding` rows consistently.
-5. Fail on malformed, ambiguous, contradictory, duplicate-conflicting or otherwise blocked rows.
+5. Fail on malformed, ambiguous, contradictory, duplicate-conflicting, unrecognised-status or otherwise blocked rows.
 6. Build complete corrected selected-pollutant Parquet and pollutant manifests locally.
-7. Require the replacement manifest hash metadata to match the source hash result.
-8. Validate source-to-Parquet row identity, counts, pollutant set, object keys, hashes and detector/proposal equality.
+7. Require the replacement manifest hash metadata and status counts to match the source result.
+8. Validate source-to-Parquet row identity, counts, pollutant set, object keys, hashes, status counts and detector/proposal equality.
 9. Resolve and preserve unselected children from the Dropbox baseline.
 10. Create tombstones only for exact selected pollutant prefixes.
 11. During real apply, delete and verify absence of those exact prefixes.
 12. Upload selected Parquet and pollutant manifests.
-13. GET/read the written Parquet, recalculate the observation-content hash and require equality with the source hash.
-14. GET-verify the written pollutant manifest and require it to contain the verified hash result.
+13. GET/read the written Parquet, recalculate the observation-content hash and status counts and require equality with source truth.
+14. GET-verify the written pollutant manifest and require it to contain the verified hash result and status counts.
 15. Rebuild and GET-verify connector and day manifests.
 16. Rebuild and GET-verify affected supported-pollutant indexes and the global latest index without dropping preserved entries.
 17. Run AQI repair stages only for changed `pm25`, `pm10` or `no2` observations.
@@ -460,23 +517,35 @@ A source site/pollutant group skipped because no authoritative active timeseries
 
 ## Audit evidence
 
-Every mode records its mode, requested scope, chosen Dropbox baseline, stale-backup override state, source acquisition result, count comparison, source and R2 observation-content hashes, hash contract version, findings, repair plan and final result.
+Every mode records its mode, requested scope, chosen Dropbox baseline, stale-backup override state, source acquisition result, count comparison, source and R2 observation-content hashes, source and R2 `verification_status_counts`, hash contract version, findings, repair plan and final result.
 
-For a real repair, reports additionally record selected source and replacement row counts, hashes before and after repair, preserved children, object keys deleted and written, post-write GET/hash verification, manifests and indexes rebuilt, AQI work and final verification status.
+For a real repair, reports additionally record selected source and replacement row counts, hashes and status counts before and after repair, preserved children, object keys deleted and written, post-write GET/hash verification, manifests and indexes rebuilt, AQI work and final verification status.
 
 Check-only and dry-run reports MUST keep planned and completed operations distinct.
 
 ## Validation model
 
-Before implementation, confirm only that the shared helper, writer integration, manifest schema and Integrity comparison paths are structurally viable. A small deterministic contract fixture is genuinely required because a hash implementation that differs between the two writers would make every comparison unreliable.
+Before implementation, confirm only that the shared helper, writer integration, manifest schema, verification-status source path and Integrity comparison paths are structurally viable. A small deterministic contract fixture is genuinely required because a hash implementation that differs between the two writers would make every comparison unreliable.
 
-The focused structural check should prove identical hashes for identical logical rows despite different input order, changed hashes for value, timestamp and identity changes, duplicate multiplicity, negative-value preservation and deterministic Float64 encoding.
+Before finalising the source normaliser, one narrow source-vocabulary inspection is genuinely required. It must inspect representative distinct UK-AIR annual-file status values and distinct SOS IngestDB status values, without launching a broad data-validation programme. Any additional non-empty source value must be reported before implementation rather than guessed.
+
+The focused structural check should prove:
+
+- identical hashes for identical logical rows despite different input order;
+- changed hashes for value, timestamp, identity and verification-status changes;
+- canonical `P`, `R` and null normalisation;
+- rejection of unknown non-empty UK-AIR SOS status values;
+- `verification_status_counts` agreement and sum-to-row-count behaviour;
+- legacy `verification_status`, `status` and missing-column precedence;
+- duplicate multiplicity;
+- negative-value preservation;
+- deterministic Float64 encoding.
 
 After deployment to CIC-Test, functional validation is performed through:
 
-1. one normal Prune Daily Phase B operation that writes a manifest containing a valid observation-content hash;
+1. one normal Prune Daily Phase B operation that writes a manifest containing a valid observation-content hash and status counts;
 2. one real scoped historical Integrity operation, including a hash-mismatch repair or legacy hashless-manifest path;
-3. post-write live R2 hash equality;
+3. post-write live R2 hash and status-count equality;
 4. a later normal check against the next successful Dropbox backup.
 
 Do not add a broad speculative pre-implementation test suite.
