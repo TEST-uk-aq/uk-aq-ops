@@ -150,14 +150,14 @@ Deno.test("readiness and summary payloads use phase 3 settings", () => {
   });
 
   assert.deepEqual(buildReadinessPayload(config), {
-    p_as_of_day_utc: "2026-07-02",
+    p_as_of_day_utc: "2026-07-06",
     p_connector_id: 1,
     p_source_network_code: "gov_uk_aurn",
     p_pollutant_codes: ["pm25", "pm10", "no2"],
     p_min_final_hour_coverage_ratio: 0.95,
   });
   assert.deepEqual(buildSummaryRefreshPayload(config), {
-    p_as_of_day_utc: "2026-07-02",
+    p_as_of_day_utc: "2026-07-06",
     p_connector_id: 1,
     p_source_network_code: "gov_uk_aurn",
     p_pollutant_codes: ["pm25", "pm10", "no2"],

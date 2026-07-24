@@ -6,7 +6,9 @@ derived status in Obs AQI DB. It does not start an HTTP server.
 The batch:
 
 - recalculates yesterday and the day before yesterday on every normal daily run;
-- uses final-hour network readiness only to choose the current publication day;
+- uses Obs AQI DB first for each daily target and validated R2 v2
+  observations as the exact-day fallback;
+- uses validated R2 v2 observations exclusively for historical backfill;
 - preserves the 18-valid-hour daily rule and 274-valid-day period rule;
 - refreshes rolling-year and last-complete-year status through the existing
   service-role RPCs;
@@ -25,6 +27,8 @@ The batch:
 - `who_2021_daily_core.ts`: date, readiness, RPC payload and stable JSON logic.
 - `who_2021_parquet.ts`: Arrow/parquet conversion.
 - `r2_objects.ts`: signed R2 comparison and conditional PUT.
+- `r2_observations.ts`: signed R2 manifest/parquet validation and hour-ending
+  daily aggregation.
 - `report.ts`: bounded report construction and atomic local write.
 
 The GitHub workflow is `.github/workflows/uk_aq_who_2021_daily.yml`.
@@ -34,11 +38,15 @@ Cloudflare Scheduler is the only schedule authority.
 
 - `daily`: always targets yesterday and the day before yesterday.
 - `backfill`: requires `UK_AQ_WHO_2021_START_DAY_UTC` and
-  `UK_AQ_WHO_2021_END_DAY_UTC`.
+  `UK_AQ_WHO_2021_END_DAY_UTC`, reads R2 v2, commits one day at a time, and
+  rejects ranges longer than 31 inclusive days.
 - `dry_run`: calculates RPC counts without database upserts or R2 writes.
 
 For hour-ending GOV.UK AURN data, a `day_utc` window is
 `(day 00:00, next day 00:00]`.
+The R2 partition for `day` contributes only `01:00` through `23:00`; the
+partition for `day + 1` contributes only its `00:00` boundary. Both partitions
+must pass the v2 day/connector/pollutant manifest and parquet checks.
 
 ## Required runtime configuration
 
@@ -47,7 +55,7 @@ Database:
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
 
-R2 when JSON or parquet publication is enabled:
+R2 for backfill, daily fallback, JSON publication, or parquet publication:
 
 - `CFLARE_R2_ENDPOINT`
 - `CFLARE_R2_BUCKET`
@@ -74,9 +82,14 @@ WHO defaults:
 - `UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED=true`
 - `UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS=2`
 - `UK_AQ_WHO_2021_CHUNK_DAYS=31`
+- `UK_AQ_WHO_2021_R2_BACKFILL_MAX_DAYS=31`
 - `UK_AQ_WHO_2021_RPC_RETRIES=3`
 - `UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=false` (set `true` for publication)
 - `UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=false` (set `true` for archive writes)
+
+`refresh_summaries` uses a mode-aware workflow default: `true` for `daily`,
+`false` for `backfill` and `dry_run`. Backfill JSON and derived parquet
+publication remain off unless explicitly enabled.
 
 The diagnostic Supabase egress caller label is
 `uk_aq_who_2021_daily_github_actions`.

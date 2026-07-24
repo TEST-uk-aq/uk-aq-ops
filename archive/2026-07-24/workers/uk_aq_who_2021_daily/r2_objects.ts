@@ -14,13 +14,6 @@ export type R2ObjectResult = {
   logical_sha256: string;
 };
 
-export type R2ReadResult = {
-  key: string;
-  bytes: Uint8Array;
-  etag: string | null;
-  contentLength: number;
-};
-
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const LOGICAL_HASH_HEADER = "x-amz-meta-uk-aq-logical-sha256";
@@ -181,36 +174,6 @@ async function fetchR2(
     await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
   }
   throw new Error("R2 request retry loop exhausted");
-}
-
-export async function getR2Object(
-  config: R2Config,
-  objectKey: string,
-): Promise<R2ReadResult> {
-  const response = await fetchR2(config, "GET", objectKey);
-  if (response.status === 404) {
-    throw new Error(`R2 object not found: ${objectKey}`);
-  }
-  if (!response.ok) {
-    throw new Error(`R2 GET failed for ${objectKey}: HTTP ${response.status}`);
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  const declaredLength = Number(response.headers.get("content-length"));
-  if (
-    Number.isFinite(declaredLength) &&
-    declaredLength >= 0 &&
-    declaredLength !== bytes.byteLength
-  ) {
-    throw new Error(
-      `R2 content-length mismatch for ${objectKey}: expected ${declaredLength}, read ${bytes.byteLength}`,
-    );
-  }
-  return {
-    key: objectKey,
-    bytes,
-    etag: response.headers.get("etag"),
-    contentLength: bytes.byteLength,
-  };
 }
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {

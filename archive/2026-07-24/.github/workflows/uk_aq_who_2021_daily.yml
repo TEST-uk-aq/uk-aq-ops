@@ -31,16 +31,6 @@ on:
         required: false
         default: ""
         type: string
-      refresh_summaries:
-        description: "Refresh rolling/calendar summaries (mode_default: daily=true, backfill/dry_run=false)"
-        required: true
-        default: mode_default
-        type: choice
-        options:
-          - mode_default
-          - "false"
-          - "true"
-          - configured
       publish_json:
         description: "Publish summary JSON (configured uses repository variable)"
         required: true
@@ -70,13 +60,12 @@ concurrency:
 jobs:
   who-2021-daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
       UK_AQ_WHO_2021_DAILY_REFRESH_RPC: ${{ vars.UK_AQ_WHO_2021_DAILY_REFRESH_RPC || 'uk_aq_rpc_who_2021_daily_status_refresh' }}
-      UK_AQ_WHO_2021_PREPARED_UPSERT_RPC: ${{ vars.UK_AQ_WHO_2021_PREPARED_UPSERT_RPC || 'uk_aq_rpc_who_2021_daily_status_upsert_prepared' }}
       UK_AQ_WHO_2021_READINESS_RPC: ${{ vars.UK_AQ_WHO_2021_READINESS_RPC || 'uk_aq_rpc_who_2021_readiness_check' }}
       UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC: ${{ vars.UK_AQ_WHO_2021_SUMMARY_REFRESH_RPC || 'uk_aq_rpc_who_2021_summary_refresh' }}
       UK_AQ_WHO_2021_RUN_LOG_RPC: ${{ vars.UK_AQ_WHO_2021_RUN_LOG_RPC || 'uk_aq_rpc_who_2021_processing_run_log' }}
@@ -87,9 +76,9 @@ jobs:
       UK_AQ_WHO_2021_MIN_VALID_DAYS: ${{ vars.UK_AQ_WHO_2021_MIN_VALID_DAYS || '274' }}
       UK_AQ_WHO_2021_MIN_FINAL_HOUR_COVERAGE_RATIO: ${{ vars.UK_AQ_WHO_2021_MIN_FINAL_HOUR_COVERAGE_RATIO || '0.9' }}
       UK_AQ_WHO_2021_READINESS_GATE_ENABLED: ${{ vars.UK_AQ_WHO_2021_READINESS_GATE_ENABLED || 'true' }}
+      UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED: ${{ vars.UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED || 'true' }}
       UK_AQ_WHO_2021_DAILY_LOOKBACK_DAYS: "2"
       UK_AQ_WHO_2021_CHUNK_DAYS: ${{ vars.UK_AQ_WHO_2021_CHUNK_DAYS || '31' }}
-      UK_AQ_WHO_2021_R2_BACKFILL_MAX_DAYS: ${{ vars.UK_AQ_WHO_2021_R2_BACKFILL_MAX_DAYS || '31' }}
       UK_AQ_WHO_2021_RPC_RETRIES: ${{ vars.UK_AQ_WHO_2021_RPC_RETRIES || '3' }}
       UK_AQ_WHO_2021_RUN_MODE: ${{ github.event.inputs.run_mode || 'daily' }}
       UK_AQ_WHO_2021_TRIGGER_MODE: ${{ github.event.inputs.trigger_mode || 'manual' }}
@@ -98,10 +87,8 @@ jobs:
       UK_AQ_WHO_2021_REPORT_PATH: tmp/uk_aq_who_2021_daily_report.json
       CONFIGURED_PUBLISH_JSON: ${{ vars.UK_AQ_WHO_2021_R2_PUBLISH_ENABLED || 'false' }}
       CONFIGURED_WRITE_PARQUET: ${{ vars.UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED || 'false' }}
-      CONFIGURED_REFRESH_SUMMARIES: ${{ vars.UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED || 'true' }}
       INPUT_PUBLISH_JSON: ${{ github.event.inputs.publish_json || 'false' }}
       INPUT_WRITE_PARQUET: ${{ github.event.inputs.write_parquet || 'false' }}
-      INPUT_REFRESH_SUMMARIES: ${{ github.event.inputs.refresh_summaries || 'mode_default' }}
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || vars.R2_ENDPOINT || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || vars.R2_BUCKET || '' }}
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || vars.R2_REGION || 'auto' }}
@@ -154,28 +141,14 @@ jobs:
           }
           publish_json="$(resolve_switch "${INPUT_PUBLISH_JSON}" "${CONFIGURED_PUBLISH_JSON}")"
           write_parquet="$(resolve_switch "${INPUT_WRITE_PARQUET}" "${CONFIGURED_WRITE_PARQUET}")"
-          case "${INPUT_REFRESH_SUMMARIES}" in
-            true|false) refresh_summaries="${INPUT_REFRESH_SUMMARIES}" ;;
-            configured) refresh_summaries="${CONFIGURED_REFRESH_SUMMARIES}" ;;
-            mode_default)
-              case "${UK_AQ_WHO_2021_RUN_MODE}" in
-                daily) refresh_summaries=true ;;
-                backfill|dry_run) refresh_summaries=false ;;
-                *) echo "Invalid run mode: ${UK_AQ_WHO_2021_RUN_MODE}" >&2; exit 1 ;;
-              esac
-              ;;
-            *) echo "Invalid summary refresh setting: ${INPUT_REFRESH_SUMMARIES}" >&2; exit 1 ;;
-          esac
           case "${publish_json}" in true|false) ;; *) echo "Configured JSON publication value must be true or false" >&2; exit 1 ;; esac
           case "${write_parquet}" in true|false) ;; *) echo "Configured parquet publication value must be true or false" >&2; exit 1 ;; esac
-          case "${refresh_summaries}" in true|false) ;; *) echo "Configured summary refresh value must be true or false" >&2; exit 1 ;; esac
           echo "UK_AQ_WHO_2021_R2_PUBLISH_ENABLED=${publish_json}" >> "${GITHUB_ENV}"
           echo "UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED=${write_parquet}" >> "${GITHUB_ENV}"
-          echo "UK_AQ_WHO_2021_SUMMARY_REFRESH_ENABLED=${refresh_summaries}" >> "${GITHUB_ENV}"
 
       - name: Run WHO 2021 daily batch
         run: |
-          timeout --kill-after=30s 40m \
+          timeout --kill-after=30s 15m \
             deno run --allow-env --allow-net --allow-read --allow-write \
               workers/uk_aq_who_2021_daily/main.ts
 
@@ -222,30 +195,7 @@ jobs:
               "latest_complete_day_utc": None,
               "correction_day_utc": None,
               "publication_as_of_day_utc": None,
-              "source_mode": None,
-              "requested_start_day_utc": os.environ.get(
-                  "UK_AQ_WHO_2021_START_DAY_UTC"
-              ) or None,
-              "requested_end_day_utc": os.environ.get(
-                  "UK_AQ_WHO_2021_END_DAY_UTC"
-              ) or None,
-              "completed_days": [],
-              "last_completed_day": None,
-              "failed_day": None,
-              "daily_sources": [],
               "readiness": None,
-              "manifest_keys_used": [],
-              "manifest_hash_validation": {
-                  "manifests_validated": 0,
-                  "parquet_objects_validated": 0,
-                  "result": "not_run",
-              },
-              "r2_object_count": 0,
-              "r2_bytes_read": 0,
-              "parquet_row_count": 0,
-              "prepared_daily_row_count": 0,
-              "summary_refresh_requested": False,
-              "summary_refresh_completed": False,
               "row_counts": {
                   "daily_rows_upserted": 0,
                   "rolling_rows_upserted": 0,
