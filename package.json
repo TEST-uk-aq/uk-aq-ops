@@ -14,6 +14,8 @@
     "start:aqilevels-retention": "node workers/uk_aq_aqilevels_retention_service/server.mjs",
     "start:supabase-db-dump-backup": "node workers/uk_aq_supabase_db_dump_backup_service/server.mjs",
     "run:supabase-db-dump-backup-job": "node workers/uk_aq_supabase_db_dump_backup_service/job.mjs",
+    "run:who-2021-daily": "deno run --allow-env --allow-net --allow-read --allow-write workers/uk_aq_who_2021_daily/main.ts",
+    "upload:who-2021-report": "deno run --allow-env --allow-net --allow-read --allow-write workers/uk_aq_who_2021_daily/upload_report.ts",
     "dashboard:config": "node scripts/dashboard/generate_dashboard_config.mjs",
     "dashboard:local": "local/scripts/run_dashboard_local.sh",
     "dashboard:test": "local/scripts/run_dashboard_test.sh",

@@ -16,14 +16,14 @@ import {
   summarizeReadinessRows,
 } from "./who_2021_daily_core.ts";
 
-Deno.test("latest complete day waits for maturity delay after UTC midnight", () => {
+Deno.test("latest complete day is always yesterday in UTC", () => {
   assert.equal(
     latestCompleteDayUtc(new Date("2026-07-07T14:00:00.000Z"), 3),
     "2026-07-06",
   );
   assert.equal(
     latestCompleteDayUtc(new Date("2026-07-07T02:59:00.000Z"), 3),
-    "2026-07-05",
+    "2026-07-06",
   );
   assert.equal(
     latestCompleteDayUtc(new Date("2026-07-07T03:01:00.000Z"), 3),
