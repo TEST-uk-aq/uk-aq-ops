@@ -382,27 +382,6 @@ type ObsConnectorManifest = {
   files: ObsHistoryFileEntry[];
 };
 
-export type FirstValueAtCandidate = {
-  timeseries_id: number;
-  first_observed_at: string;
-};
-
-type FirstValueAtReconciliationSummary = {
-  attempted: boolean;
-  dry_run: boolean;
-  connector_id: number;
-  candidate_timeseries_count: number;
-  rpc_call_count: number;
-  matched_count: number;
-  would_update_count: number;
-  updated_count: number;
-  unchanged_count: number;
-  earliest_supplied_at: string | null;
-  latest_supplied_at: string | null;
-  status: "complete" | "dry_run" | "skipped_empty" | "failed";
-  error: string | null;
-};
-
 type AqilevelsConnectorManifest = {
   day_utc: string;
   connector_id: number;
@@ -604,16 +583,6 @@ type SourceToAllSummary = {
   local_to_aqilevels_days: string[];
   source_acquisition_pending_days: string[];
   local_to_aqilevels_summary: LocalToAqilevelsSummary | null;
-  first_value_at_reconciliation: {
-    connector_day_count: number;
-    failed_connector_day_count: number;
-    candidate_timeseries_count: number;
-    rpc_call_count: number;
-    matched_count: number;
-    would_update_count: number;
-    updated_count: number;
-    unchanged_count: number;
-  };
   warnings: string[];
 };
 
@@ -676,9 +645,6 @@ const AQI_R2_SOURCE_RPC = (Deno.env.get("UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC") ||
 const AQI_R2_CONNECTOR_COUNTS_RPC =
   (Deno.env.get("UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC") ||
     "uk_aq_rpc_aqilevels_history_day_connector_counts").trim();
-const FIRST_VALUE_AT_RECONCILE_RPC =
-  (Deno.env.get("UK_AQ_BACKFILL_FIRST_VALUE_AT_RECONCILE_RPC") ||
-    "uk_aq_rpc_timeseries_first_value_at_reconcile").trim();
 
 const HISTORY_OBSERVATIONS_SCHEMA_NAME = "observations";
 const HISTORY_OBSERVATIONS_SCHEMA_VERSION = 2;
@@ -921,12 +887,6 @@ const SOURCE_RPC_TIMESERIES_FILTER_CHUNK_SIZE = parsePositiveInt(
   500,
   25,
   5000,
-);
-const FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE = parsePositiveInt(
-  Deno.env.get("UK_AQ_BACKFILL_FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE"),
-  1000,
-  1,
-  2000,
 );
 const OBS_R2_SOURCE_PAGE_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE"),
@@ -1521,172 +1481,6 @@ async function postgrestRpc<T>(
   }
 
   return { data: null, error: { message: "unknown_rpc_error" }, status: 0 };
-}
-
-export function deriveFirstValueAtCandidates(
-  rows: Pick<ObsHistoryRow, "timeseries_id" | "observed_at">[],
-): FirstValueAtCandidate[] {
-  const earliestByTimeseries = new Map<number, string>();
-  for (const row of rows) {
-    const timeseriesId = Number(row.timeseries_id);
-    const observedAtMs = Date.parse(String(row.observed_at || ""));
-    if (
-      !Number.isSafeInteger(timeseriesId) ||
-      timeseriesId <= 0 ||
-      !Number.isFinite(observedAtMs)
-    ) {
-      throw new Error(
-        "canonical observation row has invalid first_value_at identity",
-      );
-    }
-    const observedAt = new Date(observedAtMs).toISOString();
-    const current = earliestByTimeseries.get(timeseriesId);
-    if (!current || observedAt < current) {
-      earliestByTimeseries.set(timeseriesId, observedAt);
-    }
-  }
-  return Array.from(
-    earliestByTimeseries,
-    ([timeseries_id, first_observed_at]) => ({
-      timeseries_id,
-      first_observed_at,
-    }),
-  ).sort((left, right) => left.timeseries_id - right.timeseries_id);
-}
-
-export function chunkFirstValueAtCandidates(
-  candidates: FirstValueAtCandidate[],
-  chunkSize = FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE,
-): FirstValueAtCandidate[][] {
-  if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > 2000) {
-    throw new Error(
-      "first_value_at reconciliation chunk size must be between 1 and 2000",
-    );
-  }
-  const sorted = [...candidates].sort((left, right) =>
-    left.timeseries_id - right.timeseries_id
-  );
-  const chunks: FirstValueAtCandidate[][] = [];
-  for (let index = 0; index < sorted.length; index += chunkSize) {
-    chunks.push(sorted.slice(index, index + chunkSize));
-  }
-  return chunks;
-}
-
-async function reconcileTimeseriesFirstValueAt(args: {
-  connector_id: number;
-  rows: Pick<ObsHistoryRow, "timeseries_id" | "observed_at">[];
-  dry_run: boolean;
-  day_utc: string;
-  r2_verification: "newly_written_verified" | "unchanged_verified" | "dry_run";
-}): Promise<FirstValueAtReconciliationSummary> {
-  const candidates = deriveFirstValueAtCandidates(args.rows);
-  const timestamps = candidates.map((row) => row.first_observed_at).sort();
-  const summary: FirstValueAtReconciliationSummary = {
-    attempted: candidates.length > 0,
-    dry_run: args.dry_run,
-    connector_id: args.connector_id,
-    candidate_timeseries_count: candidates.length,
-    rpc_call_count: 0,
-    matched_count: 0,
-    would_update_count: 0,
-    updated_count: 0,
-    unchanged_count: 0,
-    earliest_supplied_at: timestamps[0] ?? null,
-    latest_supplied_at: timestamps[timestamps.length - 1] ?? null,
-    status: candidates.length === 0
-      ? "skipped_empty"
-      : args.dry_run
-      ? "dry_run"
-      : "complete",
-    error: null,
-  };
-  if (!candidates.length) {
-    logStructured("info", "source_to_r2_first_value_at_reconciliation", {
-      day_utc: args.day_utc,
-      r2_verification: args.r2_verification,
-      ...summary,
-    });
-    return summary;
-  }
-
-  try {
-    const source = SOURCE_DB_BY_KIND.obs_aqidb;
-    if (!source) {
-      throw new Error(
-        "first_value_at reconciliation requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY",
-      );
-    }
-    for (
-      const chunk of chunkFirstValueAtCandidates(
-        candidates,
-        FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE,
-      )
-    ) {
-      const response = await postgrestRpc<unknown[]>(
-        source,
-        FIRST_VALUE_AT_RECONCILE_RPC,
-        {
-          p_connector_id: args.connector_id,
-          p_rows: chunk,
-          p_dry_run: args.dry_run,
-        },
-      );
-      if (response.error) {
-        throw new Error(response.error.message);
-      }
-      const result = Array.isArray(response.data) ? response.data[0] : null;
-      if (!result || typeof result !== "object" || Array.isArray(result)) {
-        throw new Error(
-          "first_value_at reconciliation RPC returned no summary row",
-        );
-      }
-      const record = result as Record<string, unknown>;
-      const submitted = Number(record.submitted_count);
-      const matched = Number(record.matched_count);
-      const wouldUpdate = Number(record.would_update_count);
-      const updated = Number(record.updated_count);
-      const unchanged = Number(record.already_equal_or_earlier_count);
-      if (
-        ![submitted, matched, wouldUpdate, updated, unchanged].every((value) =>
-          Number.isSafeInteger(value) && value >= 0
-        ) ||
-        submitted !== chunk.length ||
-        matched !== chunk.length ||
-        unchanged + wouldUpdate !== matched ||
-        (args.dry_run ? updated !== 0 : updated !== wouldUpdate) ||
-        Boolean(record.dry_run) !== args.dry_run
-      ) {
-        throw new Error(
-          "first_value_at reconciliation RPC returned an invalid summary",
-        );
-      }
-      summary.rpc_call_count += 1;
-      summary.matched_count += matched;
-      summary.would_update_count += wouldUpdate;
-      summary.updated_count += updated;
-      summary.unchanged_count += unchanged;
-    }
-  } catch (error) {
-    summary.status = "failed";
-    summary.error = (error instanceof Error ? error.message : String(error))
-      .slice(0, 1200);
-    logStructured("error", "source_to_r2_first_value_at_reconciliation", {
-      day_utc: args.day_utc,
-      r2_verification: args.r2_verification,
-      ...summary,
-    });
-    throw new Error(
-      `R2 observation partition verified but first_value_at reconciliation failed: ${summary.error}`,
-    );
-  }
-
-  logStructured("info", "source_to_r2_first_value_at_reconciliation", {
-    day_utc: args.day_utc,
-    r2_verification: args.r2_verification,
-    ...summary,
-  });
-  return summary;
 }
 
 async function postgrestTable<T>(
@@ -4157,185 +3951,6 @@ async function loadExistingConnectorManifest(
       files.reduce((sum, file) => sum + file.bytes, 0),
     files,
   };
-}
-
-async function loadVerifiedR2ObservationRowsForConnectorDay(
-  dayUtc: string,
-  connectorId: number,
-  requireLocalByteIdentity: boolean,
-): Promise<ObsHistoryRow[]> {
-  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
-    throw new Error(
-      "verified observation history read requires complete R2 configuration",
-    );
-  }
-  const manifestKey = buildObsConnectorManifestKey(dayUtc, connectorId);
-  const liveManifest = await r2GetObject({
-    r2: OBS_R2_CONFIG,
-    key: manifestKey,
-  });
-  const localManifest = loadLocalHistoryObjectBytesByR2Key(manifestKey);
-  if (requireLocalByteIdentity && !localManifest) {
-    throw new Error(
-      `unchanged observation connector manifest is unavailable for byte verification: ${manifestKey}`,
-    );
-  }
-  if (
-    requireLocalByteIdentity &&
-    localManifest &&
-    sha256Hex(localManifest) !== sha256Hex(liveManifest.body)
-  ) {
-    throw new Error(
-      `unchanged observation connector manifest failed byte verification: ${manifestKey}`,
-    );
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder().decode(liveManifest.body));
-  } catch {
-    throw new Error(
-      `verified observation connector manifest is invalid JSON: ${manifestKey}`,
-    );
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(
-      `verified observation connector manifest is not an object: ${manifestKey}`,
-    );
-  }
-  const record = parsed as Record<string, unknown>;
-  if (
-    String(record.history_version || "") !== "v2" ||
-    String(record.domain || "") !== "observations" ||
-    String(record.day_utc || "") !== dayUtc ||
-    Number(record.connector_id) !== connectorId
-  ) {
-    throw new Error(
-      `verified observation connector manifest identity mismatch: ${manifestKey}`,
-    );
-  }
-
-  const childManifestKeys = Array.from(
-    new Set(
-      (Array.isArray(record.child_manifests) ? record.child_manifests : [])
-        .map((entry) =>
-          entry && typeof entry === "object" && !Array.isArray(entry)
-            ? String((entry as Record<string, unknown>).manifest_key || "")
-              .trim()
-            : ""
-        )
-        .filter(Boolean),
-    ),
-  ).sort();
-  for (const childKey of childManifestKeys) {
-    const liveChild = await r2GetObject({ r2: OBS_R2_CONFIG, key: childKey });
-    const localChild = loadLocalHistoryObjectBytesByR2Key(childKey);
-    if (requireLocalByteIdentity && !localChild) {
-      throw new Error(
-        `unchanged observation pollutant manifest is unavailable for byte verification: ${childKey}`,
-      );
-    }
-    if (
-      requireLocalByteIdentity &&
-      localChild &&
-      sha256Hex(localChild) !== sha256Hex(liveChild.body)
-    ) {
-      throw new Error(
-        `unchanged observation pollutant manifest failed byte verification: ${childKey}`,
-      );
-    }
-  }
-
-  const files = Array.isArray(record.files) ? record.files : [];
-  const fileEntries = files.map((entry) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      throw new Error(
-        `verified observation connector manifest has an invalid file entry: ${manifestKey}`,
-      );
-    }
-    const file = entry as Record<string, unknown>;
-    const key = String(file.key || "").trim();
-    const rowCount = Number(file.row_count);
-    const bytes = Number(file.bytes);
-    if (
-      !key ||
-      !Number.isSafeInteger(rowCount) ||
-      rowCount < 0 ||
-      !Number.isSafeInteger(bytes) ||
-      bytes < 0
-    ) {
-      throw new Error(
-        `verified observation connector manifest has an invalid file identity: ${manifestKey}`,
-      );
-    }
-    return { key, row_count: rowCount, bytes };
-  }).sort((left, right) => left.key.localeCompare(right.key));
-  if (
-    Number(record.file_count) !== fileEntries.length ||
-    new Set(fileEntries.map((entry) => entry.key)).size !== fileEntries.length
-  ) {
-    throw new Error(
-      `verified observation connector manifest file count mismatch: ${manifestKey}`,
-    );
-  }
-
-  const rows: ObsHistoryRow[] = [];
-  const dayStart = Date.parse(`${dayUtc}T00:00:00.000Z`);
-  const dayEnd = dayStart + 24 * 60 * 60 * 1000;
-  for (const file of fileEntries) {
-    const livePart = await r2GetObject({ r2: OBS_R2_CONFIG, key: file.key });
-    if (livePart.body.byteLength !== file.bytes) {
-      throw new Error(
-        `verified observation parquet byte count mismatch: ${file.key}`,
-      );
-    }
-    const localPart = loadLocalHistoryObjectBytesByR2Key(file.key);
-    if (requireLocalByteIdentity && !localPart) {
-      throw new Error(
-        `unchanged observation parquet is unavailable for byte verification: ${file.key}`,
-      );
-    }
-    if (
-      requireLocalByteIdentity &&
-      localPart &&
-      sha256Hex(localPart) !== sha256Hex(livePart.body)
-    ) {
-      throw new Error(
-        `unchanged observation parquet failed byte verification: ${file.key}`,
-      );
-    }
-    const partRows = await readObsHistoryRowsFromParquetBytes(livePart.body);
-    if (partRows.length !== file.row_count) {
-      throw new Error(
-        `verified observation parquet row count mismatch: ${file.key}`,
-      );
-    }
-    for (const row of partRows) {
-      const observedAtMs = Date.parse(row.observed_at);
-      if (
-        !Number.isSafeInteger(row.timeseries_id) ||
-        row.timeseries_id <= 0 ||
-        !Number.isFinite(observedAtMs) ||
-        observedAtMs < dayStart ||
-        observedAtMs >= dayEnd
-      ) {
-        throw new Error(
-          `verified observation parquet row identity mismatch: ${file.key}`,
-        );
-      }
-      rows.push(row);
-    }
-  }
-  const declaredRows = Number(record.row_count ?? record.source_row_count);
-  if (
-    !Number.isSafeInteger(declaredRows) || declaredRows < 0 ||
-    rows.length !== declaredRows
-  ) {
-    throw new Error(
-      `verified observation connector row count mismatch: ${manifestKey}`,
-    );
-  }
-  return dedupeObsHistoryRows(rows);
 }
 
 async function loadR2ObservationConnectorIdsForDay(
@@ -13724,31 +13339,6 @@ async function runSourceToAll(
   let connectorDayComplete = 0;
   let connectorDaySkipped = 0;
   let connectorDayError = 0;
-  const firstValueAtReconciliationTotals = {
-    connector_day_count: 0,
-    failed_connector_day_count: 0,
-    candidate_timeseries_count: 0,
-    rpc_call_count: 0,
-    matched_count: 0,
-    would_update_count: 0,
-    updated_count: 0,
-    unchanged_count: 0,
-  };
-  const recordFirstValueAtReconciliation = (
-    result: FirstValueAtReconciliationSummary,
-  ) => {
-    firstValueAtReconciliationTotals.connector_day_count += 1;
-    firstValueAtReconciliationTotals.failed_connector_day_count +=
-      result.status === "failed" ? 1 : 0;
-    firstValueAtReconciliationTotals.candidate_timeseries_count +=
-      result.candidate_timeseries_count;
-    firstValueAtReconciliationTotals.rpc_call_count += result.rpc_call_count;
-    firstValueAtReconciliationTotals.matched_count += result.matched_count;
-    firstValueAtReconciliationTotals.would_update_count +=
-      result.would_update_count;
-    firstValueAtReconciliationTotals.updated_count += result.updated_count;
-    firstValueAtReconciliationTotals.unchanged_count += result.unchanged_count;
-  };
   const sensorcommunityArchiveIndexByDay = new Map<
     string,
     SensorcommunityArchiveIndexResult
@@ -13779,22 +13369,6 @@ async function runSourceToAll(
           connectorId,
         );
         if (!FORCE_REPLACE && existingObsManifest && existingAqiManifest) {
-          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
-            const verifiedRows =
-              await loadVerifiedR2ObservationRowsForConnectorDay(
-                dayUtc,
-                connectorId,
-                true,
-              );
-            const reconciliation = await reconcileTimeseriesFirstValueAt({
-              connector_id: connectorId,
-              rows: verifiedRows,
-              dry_run: DRY_RUN,
-              day_utc: dayUtc,
-              r2_verification: DRY_RUN ? "dry_run" : "unchanged_verified",
-            });
-            recordFirstValueAtReconciliation(reconciliation);
-          }
           connectorDaySkipped += 1;
           logStructured("info", "source_to_r2_connector_day_skipped_existing", {
             run_id: runId,
@@ -15690,16 +15264,6 @@ async function runSourceToAll(
         }
 
         if (DRY_RUN) {
-          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
-            const reconciliation = await reconcileTimeseriesFirstValueAt({
-              connector_id: connectorId,
-              rows: obsHistoryRows,
-              dry_run: true,
-              day_utc: dayUtc,
-              r2_verification: "dry_run",
-            });
-            recordFirstValueAtReconciliation(reconciliation);
-          }
           connectorDaySkipped += 1;
           logStructured("info", "source_to_r2_connector_day_dry_run_plan", {
             run_id: runId,
@@ -15800,29 +15364,6 @@ async function runSourceToAll(
           integrityProposalActiveForConnectorDay &&
           INTEGRITY_PROPOSAL_FINALIZE &&
           sourceObservationsOnly;
-        let firstValueAtReconciliation:
-          | FirstValueAtReconciliationSummary
-          | null = null;
-        if (
-          !integrityObservationProposalFinalisation &&
-          !INTEGRITY_PROPOSAL_MODE &&
-          HISTORY_R2_WRITE_VERSION === "v2"
-        ) {
-          const verifiedRows =
-            await loadVerifiedR2ObservationRowsForConnectorDay(
-              dayUtc,
-              connectorId,
-              false,
-            );
-          firstValueAtReconciliation = await reconcileTimeseriesFirstValueAt({
-            connector_id: connectorId,
-            rows: verifiedRows,
-            dry_run: false,
-            day_utc: dayUtc,
-            r2_verification: "newly_written_verified",
-          });
-          recordFirstValueAtReconciliation(firstValueAtReconciliation);
-        }
         let aqiExport:
           | { objects_written_r2: number; manifest_key: string }
           | null = null;
@@ -15914,7 +15455,6 @@ async function runSourceToAll(
             ? "canonical_local_proposal_built"
             : "canonical_metadata_published",
           rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
-          first_value_at_reconciliation: firstValueAtReconciliation,
           objects_written_r2: sourceObservationsOnly
             ? obsExport.objects_written_r2 + (integrityObservationProposalFinalisation ? 0 : 1)
             : obsExport.objects_written_r2 +
@@ -15951,7 +15491,6 @@ async function runSourceToAll(
               ? null
               : buildAqiDayManifestKey(dayUtc),
             candidate_source_units: candidateSourceUnits,
-            first_value_at_reconciliation: firstValueAtReconciliation,
             ...sourceCheckpointJson,
           },
           started_at: startedAt,
@@ -15983,7 +15522,6 @@ async function runSourceToAll(
             updated_by_run_id: runId,
             completed_at: nowIso(),
             candidate_source_units: candidateSourceUnits,
-            first_value_at_reconciliation: firstValueAtReconciliation,
             ...sourceCheckpointJson,
           },
           updated_at: nowIso(),
@@ -16040,9 +15578,6 @@ async function runSourceToAll(
             error: message,
           });
           continue;
-        }
-        if (message.includes("first_value_at reconciliation failed")) {
-          firstValueAtReconciliationTotals.failed_connector_day_count += 1;
         }
         connectorDayError += 1;
         sourceFailedDaySet.add(dayUtc);
@@ -16126,7 +15661,6 @@ async function runSourceToAll(
     source_acquisition_pending_days: Array.from(sourceAcquisitionPendingDaySet)
       .sort(compareIsoDay),
     local_to_aqilevels_summary: null,
-    first_value_at_reconciliation: firstValueAtReconciliationTotals,
     warnings,
   };
 }

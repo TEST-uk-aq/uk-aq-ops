@@ -118,12 +118,8 @@ CANONICAL_REPAIR_STAGE_ORDER = (
     "observations_metadata_proposal",
     "aqi_proposal",
     "canonical_apply",
-    "first_value_at_reconciliation",
     "final_verification",
 )
-FIRST_VALUE_AT_RECONCILE_RPC = "uk_aq_rpc_timeseries_first_value_at_reconcile"
-FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE = 1000
-FIRST_VALUE_AT_RECONCILE_REPORT_SCOPE_LIMIT = 50
 OVERLAY_CHANGED_SCOPE_SETS = (
     "OBSERVS_CHANGED",
     "OBS_MANIFESTS_CHANGED",
@@ -3883,8 +3879,7 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "source_mapped_rows": 0,
                 "source_connector_day_first_error": None,
                 "backfill_run_status": None,
-                "source_acquisition_pending_days": [],
-                "first_value_at_reconciliation": None}
+                "source_acquisition_pending_days": []}
     if len(results) == 1:
         return results[0]
     ranked = sorted(
@@ -3944,11 +3939,6 @@ def _combine_backfill_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             for day in (r.get("source_acquisition_pending_days") or [])
             if str(day or "").strip()
         }),
-        "first_value_at_reconciliation": next((
-            r.get("first_value_at_reconciliation")
-            for r in results
-            if r.get("first_value_at_reconciliation")
-        ), None),
     }
 
 
@@ -4069,7 +4059,6 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
         "source_connector_day_first_error": None,
         "backfill_run_status": None,
         "source_acquisition_pending_days": [],
-        "first_value_at_reconciliation": None,
     }
     source_timeseries_row_counts: dict[int, int] = {}
     source_pollutant_codes: set[str] = set()
@@ -4143,28 +4132,6 @@ def _extract_source_to_r2_observation_status(stdout_text: str) -> dict[str, Any]
                 int(status["max_integrity_proposal_staged_rows"] or 0),
                 rows_observations,
             )
-            continue
-        if event_name == "source_to_r2_first_value_at_reconciliation":
-            status["first_value_at_reconciliation"] = {
-                key: event.get(key)
-                for key in (
-                    "attempted",
-                    "dry_run",
-                    "connector_id",
-                    "candidate_timeseries_count",
-                    "rpc_call_count",
-                    "matched_count",
-                    "would_update_count",
-                    "updated_count",
-                    "unchanged_count",
-                    "earliest_supplied_at",
-                    "latest_supplied_at",
-                    "status",
-                    "error",
-                    "day_utc",
-                    "r2_verification",
-                )
-            }
             continue
         if event_name == "backfill_run_complete":
             run_status = event.get("status")
@@ -8253,11 +8220,7 @@ def _parse_required_timestamp_value(value: Any) -> dt.datetime | None:
     return None
 
 
-def _read_parquet_partition_stats(
-    files: Iterable[Path],
-    *,
-    include_timeseries_min_timestamps: bool = False,
-) -> tuple[dict[str, Any] | None, str | None]:
+def _read_parquet_partition_stats(files: Iterable[Path]) -> tuple[dict[str, Any] | None, str | None]:
     """Read actual local parquet content without trusting manifest metadata."""
     parquet_files = sorted({str(Path(path)) for path in files if Path(path).is_file()})
     if not parquet_files:
@@ -8269,7 +8232,6 @@ def _read_parquet_partition_stats(
             "max_timeseries_id": None,
             "min_timestamp_utc": None,
             "max_timestamp_utc": None,
-            "timeseries_min_timestamp_utc": {},
             "parquet_null_timeseries_id_rows": False,
         }, None
     if importlib.util.find_spec("duckdb") is None:
@@ -8345,22 +8307,6 @@ def _read_parquet_partition_stats(
         # that identity here so completeness never compares five-minute source
         # row counts with hourly AQI row counts.
         timeseries_hour_keys: dict[int, tuple[int, ...]] = {}
-        timeseries_min_timestamp_utc: dict[int, str] = {}
-        if timestamp_column and include_timeseries_min_timestamps:
-            min_timestamp_rows = connection.execute(
-                "SELECT CAST(timeseries_id AS BIGINT), "
-                f"CAST(MIN(TRY_CAST({timestamp_column} AS TIMESTAMPTZ)) AS VARCHAR) "
-                "FROM read_parquet(?, union_by_name=true) "
-                "WHERE timeseries_id IS NOT NULL "
-                f"AND TRY_CAST({timestamp_column} AS TIMESTAMPTZ) IS NOT NULL "
-                "GROUP BY 1 ORDER BY 1",
-                [parquet_files],
-            ).fetchall()
-            timeseries_min_timestamp_utc = {
-                int(timeseries_id): str(min_timestamp)
-                for timeseries_id, min_timestamp in min_timestamp_rows
-                if min_timestamp is not None
-            }
         if timestamp_column:
             valid_value_filter = ""
             if "value" in columns:
@@ -8398,7 +8344,6 @@ def _read_parquet_partition_stats(
             "max_timeseries_id": max(counts.keys()) if counts else None,
             "min_timestamp_utc": str(min_timestamp) if min_timestamp is not None else None,
             "max_timestamp_utc": str(max_timestamp) if max_timestamp is not None else None,
-            "timeseries_min_timestamp_utc": timeseries_min_timestamp_utc,
             "timeseries_hour_keys": timeseries_hour_keys,
             "parquet_null_timeseries_id_rows": has_null_timeseries_id_rows,
         }, None
@@ -9231,10 +9176,7 @@ def _append_actual_parquet_gaps(
     parquet_files: Iterable[Path],
 ) -> tuple[dict[str, Any] | None, str | None]:
     gap_fn = _v2_aqi_gap if domain == "aqilevels" else _v2_obs_gap
-    stats, error = _read_parquet_partition_stats(
-        parquet_files,
-        include_timeseries_min_timestamps=domain == "observations",
-    )
+    stats, error = _read_parquet_partition_stats(parquet_files)
     if error:
         gap_type = "parquet_reader_unavailable" if error == "duckdb_unavailable" else "parquet_unreadable"
         gaps.append(gap_fn(
@@ -9454,7 +9396,6 @@ def run_v2_observations_integrity_checks(
     source_scope: dict[str, Any] | None = None,
     log: logging.Logger | None = None,
     allowed_real_roots: Iterable[Path] = (),
-    verified_first_value_at_scope_sink: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
@@ -9466,10 +9407,6 @@ def run_v2_observations_integrity_checks(
 
     gaps: list[dict[str, Any]] = []
     checked = 0
-    verified_first_value_at_minima: dict[
-        tuple[str, int],
-        dict[int, dt.datetime],
-    ] = {}
     data_prefix = config.observations_data_prefix.strip("/")
     index_prefix = config.observations_timeseries_index_prefix.strip("/")
     latest_key = config.observations_latest_index_key.strip("/")
@@ -9646,25 +9583,6 @@ def run_v2_observations_integrity_checks(
                     parquet_files=local_parquets,
                 )
                 parquet_readable = parquet_stats is not None and parquet_error is None and bool(local_parquets)
-                if parquet_readable and connector_id_for_source is not None:
-                    scope_minima = verified_first_value_at_minima.setdefault(
-                        (day_utc, connector_id_for_source),
-                        {},
-                    )
-                    for raw_timeseries_id, raw_observed_at in dict(
-                        parquet_stats.get("timeseries_min_timestamp_utc") or {}
-                    ).items():
-                        try:
-                            timeseries_id = int(raw_timeseries_id)
-                            observed_at = _parse_required_timestamp_value(raw_observed_at)
-                        except (TypeError, ValueError):
-                            continue
-                        if timeseries_id <= 0 or observed_at is None:
-                            continue
-                        observed_at = observed_at.astimezone(dt.timezone.utc)
-                        current = scope_minima.get(timeseries_id)
-                        if current is None or observed_at < current:
-                            scope_minima[timeseries_id] = observed_at
 
                 # Check for null timeseries_id rows in observation parquet files
                 if parquet_stats and parquet_stats.get("parquet_null_timeseries_id_rows"):
@@ -9727,46 +9645,6 @@ def run_v2_observations_integrity_checks(
         gaps=gaps,
         source_scope=source_scope,
     )
-    blocked_days: set[str] = set()
-    blocked_connector_days: set[tuple[str, int]] = set()
-    for gap in gaps:
-        gap_day = str(gap.get("day_utc") or "").strip()
-        if not gap_day:
-            continue
-        try:
-            gap_connector_id = int(gap.get("connector_id"))
-        except (TypeError, ValueError):
-            blocked_days.add(gap_day)
-            continue
-        if gap_connector_id > 0:
-            blocked_connector_days.add((gap_day, gap_connector_id))
-        else:
-            blocked_days.add(gap_day)
-    verified_first_value_at_scopes = [
-        {
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "r2_verification": "dropbox_r2_history_mirror_integrity_verified",
-            "candidates": [
-                {
-                    "timeseries_id": timeseries_id,
-                    "first_observed_at": observed_at.isoformat(
-                        timespec="milliseconds"
-                    ).replace("+00:00", "Z"),
-                }
-                for timeseries_id, observed_at in sorted(minima.items())
-            ],
-        }
-        for (day_utc, connector_id), minima in sorted(
-            verified_first_value_at_minima.items()
-        )
-        if day_utc not in blocked_days
-        and (day_utc, connector_id) not in blocked_connector_days
-    ]
-    if verified_first_value_at_scope_sink is not None:
-        verified_first_value_at_scope_sink.extend(
-            verified_first_value_at_scopes
-        )
     status = "fail" if any(g.get("severity") == "error" for g in gaps) else "ok"
     result = {
         "status": status,
@@ -14777,9 +14655,6 @@ def run_v2_gap_backfills(
             "aqi_rebuild_manifest_guard": manifest_guard_details,
             "backfill_run_status": backfill_run_status,
             "source_acquisition_pending_days": pending_days,
-            "worker_first_value_at_reconciliation": combined.get(
-                "first_value_at_reconciliation"
-            ),
             "timeseries_ids": ts_ids,
             "timeseries_id_count": len(ts_ids),
             "complete_source_timeseries_ids": sorted(expected_timeseries_row_counts),
@@ -17136,320 +17011,6 @@ def run_canonical_apply_executor(
     return {"status": "succeeded", "exit_code": 0, "output": output}
 
 
-def _resolve_obs_aqidb_rpc_credentials(
-    env: Mapping[str, str],
-) -> tuple[str, str]:
-    loaded: dict[str, str] = {}
-    env_file = str(env.get("UK_AQ_BACKFILL_ENV_FILE") or os.environ.get("UK_AQ_BACKFILL_ENV_FILE") or "").strip()
-    if env_file:
-        try:
-            loaded = load_env_file_assignments(env_file)
-        except OSError:
-            loaded = {}
-    url = str(
-        env.get("OBS_AQIDB_SUPABASE_URL")
-        or loaded.get("OBS_AQIDB_SUPABASE_URL")
-        or os.environ.get("OBS_AQIDB_SUPABASE_URL")
-        or ""
-    ).strip().rstrip("/")
-    key = str(
-        env.get("OBS_AQIDB_SECRET_KEY")
-        or loaded.get("OBS_AQIDB_SECRET_KEY")
-        or os.environ.get("OBS_AQIDB_SECRET_KEY")
-        or ""
-    ).strip()
-    return url, key
-
-
-def _first_value_at_candidates_from_evidence(
-    conn: sqlite3.Connection,
-    repair_entry: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    persistence = repair_entry.get("immutable_detector_source_evidence_persistence")
-    evidence_id = persistence.get("evidence_id") if isinstance(persistence, Mapping) else None
-    try:
-        parsed_evidence_id = int(evidence_id)
-    except (TypeError, ValueError):
-        raise ValueError("canonical source evidence ID is unavailable")
-    row = conn.execute(
-        "SELECT canonical_rows_json FROM source_connector_day_evidence WHERE id = ?",
-        (parsed_evidence_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError("canonical source evidence row is unavailable")
-    canonical_rows = json.loads(str(row[0] or "[]"))
-    if not isinstance(canonical_rows, list):
-        raise ValueError("canonical source evidence rows are invalid")
-    earliest: dict[int, dt.datetime] = {}
-    for canonical_row in canonical_rows:
-        if not isinstance(canonical_row, Mapping):
-            raise ValueError("canonical source evidence contains a non-object row")
-        try:
-            timeseries_id = int(canonical_row.get("timeseries_id"))
-        except (TypeError, ValueError):
-            raise ValueError("canonical source evidence has an invalid timeseries_id")
-        observed_at = _parse_required_timestamp_value(canonical_row.get("observed_at"))
-        if timeseries_id <= 0 or observed_at is None or observed_at.tzinfo is None:
-            raise ValueError("canonical source evidence has an invalid observation identity")
-        observed_at = observed_at.astimezone(dt.timezone.utc)
-        current = earliest.get(timeseries_id)
-        if current is None or observed_at < current:
-            earliest[timeseries_id] = observed_at
-    return [
-        {
-            "timeseries_id": timeseries_id,
-            "first_observed_at": observed_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        }
-        for timeseries_id, observed_at in sorted(earliest.items())
-    ]
-
-
-def _normalise_first_value_at_candidates(
-    raw_candidates: Any,
-) -> list[dict[str, Any]]:
-    if not isinstance(raw_candidates, list):
-        raise ValueError("verified first_value_at candidates are invalid")
-    earliest: dict[int, dt.datetime] = {}
-    for candidate in raw_candidates:
-        if not isinstance(candidate, Mapping):
-            raise ValueError("verified first_value_at candidate is not an object")
-        try:
-            timeseries_id = int(candidate.get("timeseries_id"))
-        except (TypeError, ValueError):
-            raise ValueError("verified first_value_at candidate has an invalid timeseries_id")
-        observed_at = _parse_required_timestamp_value(
-            candidate.get("first_observed_at")
-        )
-        if timeseries_id <= 0 or observed_at is None or observed_at.tzinfo is None:
-            raise ValueError("verified first_value_at candidate has an invalid identity")
-        observed_at = observed_at.astimezone(dt.timezone.utc)
-        current = earliest.get(timeseries_id)
-        if current is None or observed_at < current:
-            earliest[timeseries_id] = observed_at
-    return [
-        {
-            "timeseries_id": timeseries_id,
-            "first_observed_at": observed_at.isoformat(
-                timespec="milliseconds"
-            ).replace("+00:00", "Z"),
-        }
-        for timeseries_id, observed_at in sorted(earliest.items())
-    ]
-
-
-def run_first_value_at_reconciliation(
-    *,
-    conn: sqlite3.Connection,
-    observations: Mapping[str, Any],
-    env: Mapping[str, str],
-    dry_run: bool,
-    log: logging.Logger,
-    verified_connector_days: Iterable[Mapping[str, Any]] = (),
-) -> dict[str, Any]:
-    aggregate: dict[str, Any] = {
-        "attempted": False,
-        "dry_run": bool(dry_run),
-        "connector_day_count": 0,
-        "failed_connector_day_count": 0,
-        "candidate_timeseries_count": 0,
-        "rpc_call_count": 0,
-        "matched_count": 0,
-        "would_update_count": 0,
-        "updated_count": 0,
-        "unchanged_count": 0,
-        "earliest_supplied_at": None,
-        "latest_supplied_at": None,
-        "status": "skipped_empty",
-        "error": None,
-        "connector_day_results_sample": [],
-        "connector_day_results_truncated": 0,
-    }
-    repair_entries = [
-        entry for entry in list(observations.get("v2_observation_repair_results") or [])
-        if isinstance(entry, Mapping) and str(entry.get("status") or "") == "ok"
-    ]
-    repaired_keys = {
-        (str(entry.get("day_utc") or ""), int(entry.get("connector_id") or 0))
-        for entry in repair_entries
-    }
-    verified_entries = [
-        entry for entry in verified_connector_days
-        if isinstance(entry, Mapping)
-        and (
-            str(entry.get("day_utc") or ""),
-            int(entry.get("connector_id") or 0),
-        ) not in repaired_keys
-    ]
-    scope_inputs = [
-        ("repaired_verified", entry) for entry in repair_entries
-    ] + [
-        ("unchanged_verified", entry) for entry in verified_entries
-    ]
-    if not scope_inputs:
-        return aggregate
-
-    supabase_url, service_role_key = _resolve_obs_aqidb_rpc_credentials(env)
-    if not supabase_url or not service_role_key:
-        aggregate.update({
-            "status": "failed",
-            "error": "OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY are required",
-            "failed_connector_day_count": len(scope_inputs),
-        })
-        log.error(
-            "R2 observation partitions verified but first_value_at reconciliation failed: %s",
-            aggregate["error"],
-        )
-        return aggregate
-
-    endpoint = f"{supabase_url}/rest/v1/rpc/{FIRST_VALUE_AT_RECONCILE_RPC}"
-    headers = {
-        "apikey": service_role_key,
-        "Authorization": f"Bearer {service_role_key}",
-        "Content-Type": "application/json",
-        "Accept-Profile": "uk_aq_public",
-        "Content-Profile": "uk_aq_public",
-    }
-    scope_results: list[dict[str, Any]] = []
-    for input_kind, scope_entry in sorted(
-        scope_inputs,
-        key=lambda item: (
-            str(item[1].get("day_utc") or ""),
-            int(item[1].get("connector_id") or 0),
-            item[0],
-        ),
-    ):
-        day_utc = str(scope_entry.get("day_utc") or "").strip()
-        try:
-            connector_id = int(scope_entry.get("connector_id"))
-        except (TypeError, ValueError):
-            connector_id = 0
-        scope: dict[str, Any] = {
-            "attempted": False,
-            "dry_run": bool(dry_run),
-            "connector_id": connector_id,
-            "day_utc": day_utc,
-            "r2_verification": str(
-                scope_entry.get("r2_verification") or input_kind
-            ),
-            "candidate_timeseries_count": 0,
-            "rpc_call_count": 0,
-            "matched_count": 0,
-            "would_update_count": 0,
-            "updated_count": 0,
-            "unchanged_count": 0,
-            "earliest_supplied_at": None,
-            "latest_supplied_at": None,
-            "status": "skipped_empty",
-            "error": None,
-        }
-        try:
-            if connector_id <= 0 or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc):
-                raise ValueError("invalid connector/day reconciliation scope")
-            candidates = (
-                _first_value_at_candidates_from_evidence(conn, scope_entry)
-                if input_kind == "repaired_verified"
-                else _normalise_first_value_at_candidates(
-                    scope_entry.get("candidates")
-                )
-            )
-            scope["candidate_timeseries_count"] = len(candidates)
-            if candidates:
-                scope["attempted"] = True
-                scope["earliest_supplied_at"] = min(
-                    str(candidate["first_observed_at"]) for candidate in candidates
-                )
-                scope["latest_supplied_at"] = max(
-                    str(candidate["first_observed_at"]) for candidate in candidates
-                )
-                for index in range(0, len(candidates), FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE):
-                    chunk = candidates[index:index + FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE]
-                    response = _http_post_json(
-                        url=endpoint,
-                        headers=headers,
-                        body={
-                            "p_connector_id": connector_id,
-                            "p_rows": chunk,
-                            "p_dry_run": bool(dry_run),
-                        },
-                    )
-                    result = response[0] if isinstance(response, list) and len(response) == 1 else None
-                    if not isinstance(result, Mapping):
-                        raise RuntimeError("reconciliation RPC returned an unexpected response")
-                    submitted = int(result.get("submitted_count"))
-                    matched = int(result.get("matched_count"))
-                    would_update = int(result.get("would_update_count"))
-                    updated = int(result.get("updated_count"))
-                    unchanged = int(result.get("already_equal_or_earlier_count"))
-                    if (
-                        submitted != len(chunk)
-                        or matched != len(chunk)
-                        or min(submitted, matched, would_update, updated, unchanged) < 0
-                        or unchanged + would_update != matched
-                        or (updated != 0 if dry_run else updated != would_update)
-                        or bool(result.get("dry_run")) != bool(dry_run)
-                    ):
-                        raise RuntimeError("reconciliation RPC returned invalid summary counts")
-                    scope["rpc_call_count"] += 1
-                    scope["matched_count"] += matched
-                    scope["would_update_count"] += would_update
-                    scope["updated_count"] += updated
-                    scope["unchanged_count"] += unchanged
-                scope["status"] = "dry_run" if dry_run else "complete"
-        except Exception as exc:
-            scope["status"] = "failed"
-            scope["error"] = _truncate_text(str(exc), 1200)
-            log.error(
-                "R2 observation partition verified but first_value_at reconciliation failed day=%s connector_id=%s error=%s",
-                day_utc, connector_id, scope["error"],
-            )
-        scope_results.append(scope)
-
-    aggregate["connector_day_count"] = len(scope_results)
-    aggregate["failed_connector_day_count"] = sum(
-        1 for scope in scope_results if scope["status"] == "failed"
-    )
-    for field in (
-        "candidate_timeseries_count",
-        "rpc_call_count",
-        "matched_count",
-        "would_update_count",
-        "updated_count",
-        "unchanged_count",
-    ):
-        aggregate[field] = sum(int(scope[field]) for scope in scope_results)
-    supplied = [
-        str(scope[field])
-        for scope in scope_results
-        for field in ("earliest_supplied_at", "latest_supplied_at")
-        if scope.get(field)
-    ]
-    aggregate["earliest_supplied_at"] = min(supplied) if supplied else None
-    aggregate["latest_supplied_at"] = max(supplied) if supplied else None
-    aggregate["attempted"] = any(bool(scope["attempted"]) for scope in scope_results)
-    aggregate["status"] = (
-        "failed" if aggregate["failed_connector_day_count"]
-        else "dry_run" if dry_run and aggregate["attempted"]
-        else "complete" if aggregate["attempted"]
-        else "skipped_empty"
-    )
-    errors = [str(scope["error"]) for scope in scope_results if scope.get("error")]
-    aggregate["error"] = _truncate_text("; ".join(errors), 1200) if errors else None
-    aggregate["connector_day_results_sample"] = scope_results[
-        :FIRST_VALUE_AT_RECONCILE_REPORT_SCOPE_LIMIT
-    ]
-    aggregate["connector_day_results_truncated"] = max(
-        0,
-        len(scope_results) - FIRST_VALUE_AT_RECONCILE_REPORT_SCOPE_LIMIT,
-    )
-    log.info(
-        "first_value_at reconciliation status=%s dry_run=%s connector_days=%s candidates=%s rpc_calls=%s would_update=%s updated=%s",
-        aggregate["status"], aggregate["dry_run"], aggregate["connector_day_count"],
-        aggregate["candidate_timeseries_count"], aggregate["rpc_call_count"],
-        aggregate["would_update_count"], aggregate["updated_count"],
-    )
-    return aggregate
-
-
 def run_v2_integrity_repair_flow(
     *,
     run_state: dict[str, Any],
@@ -17459,7 +17020,6 @@ def run_v2_integrity_repair_flow(
     run_compact: str,
     env: dict[str, str],
     v2_observations: Mapping[str, Any],
-    verified_first_value_at_connector_days: Iterable[Mapping[str, Any]] = (),
     v2_aqilevels: Mapping[str, Any],
     final_verification_config: HistoryPathConfig,
     from_day: str,
@@ -17812,36 +17372,6 @@ def run_v2_integrity_repair_flow(
                 conn.commit()
 
     if proposal_failed or apply_result.get("status") == "failed":
-        first_value_at_reconciliation: dict[str, Any] = {
-            "attempted": False,
-            "dry_run": bool(dry_run),
-            "status": "blocked_dependency",
-            "reason": "R2 observation verification did not complete",
-            "connector_day_count": 0,
-            "failed_connector_day_count": 0,
-            "candidate_timeseries_count": 0,
-            "rpc_call_count": 0,
-            "matched_count": 0,
-            "would_update_count": 0,
-            "updated_count": 0,
-            "unchanged_count": 0,
-            "earliest_supplied_at": None,
-            "latest_supplied_at": None,
-            "error": None,
-            "connector_day_results_sample": [],
-            "connector_day_results_truncated": 0,
-        }
-    else:
-        first_value_at_reconciliation = run_first_value_at_reconciliation(
-            conn=conn,
-            observations=observations,
-            env=env,
-            dry_run=dry_run,
-            log=log,
-            verified_connector_days=verified_first_value_at_connector_days,
-        )
-
-    if proposal_failed or apply_result.get("status") == "failed":
         final_verification: dict[str, Any] = {
             "ran": False,
             "status": "blocked_dependency",
@@ -17872,17 +17402,11 @@ def run_v2_integrity_repair_flow(
         {"stage": "observations_metadata_proposal", "status": "failed" if observation_manifest_status in {"failed", "blocked_dependency"} or observation_index_status in {"failed", "blocked_dependency"} else "validated", "result": metadata},
         {"stage": "aqi_proposal", "status": "failed" if aqi_capture_failures or int(aqi_result.get("aqi_rebuilds_failed") or 0) else "validated", "result": aqi_result, "source_mode": "combined_local"},
         {"stage": "canonical_apply", "status": apply_result.get("status"), "result": apply_result},
-        {
-            "stage": "first_value_at_reconciliation",
-            "status": first_value_at_reconciliation.get("status"),
-            "result": first_value_at_reconciliation,
-        },
         {"stage": "final_verification", "status": final_verification.get("status"), "result": final_verification},
     ]
     coordinator_failed = (
         proposal_failed
         or apply_result.get("status") == "failed"
-        or first_value_at_reconciliation.get("status") == "failed"
         or final_verification.get("status") == "failed"
     )
     metadata_r2_operation_counts = {
@@ -17907,7 +17431,6 @@ def run_v2_integrity_repair_flow(
         "r2_write_attempted": bool(not dry_run and apply_result.get("status") in {"succeeded", "failed"}),
         "planned_object_operation_counts": planned_operation_counts,
         "canonical_apply": apply_result,
-        "first_value_at_reconciliation": first_value_at_reconciliation,
         "metadata_executor_r2_operation_counts": metadata_r2_operation_counts,
         "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
         "stage_results": stage_results,
@@ -19820,26 +19343,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             )
         if repair_flow.get("stage_results"):
             lines.append("")
-        reconciliation = repair_flow.get("first_value_at_reconciliation") or {}
-        if reconciliation:
-            lines.extend([
-                "### Timeseries first_value_at reconciliation",
-                "",
-                f"- Status: {reconciliation.get('status') or '(none)'}",
-                f"- Dry run: {bool(reconciliation.get('dry_run'))}",
-                f"- Connector-days: {int(reconciliation.get('connector_day_count') or 0)}",
-                f"- Failed connector-days: {int(reconciliation.get('failed_connector_day_count') or 0)}",
-                f"- Candidate timeseries: {int(reconciliation.get('candidate_timeseries_count') or 0)}",
-                f"- RPC calls: {int(reconciliation.get('rpc_call_count') or 0)}",
-                f"- Matched: {int(reconciliation.get('matched_count') or 0)}",
-                f"- Would update: {int(reconciliation.get('would_update_count') or 0)}",
-                f"- Updated: {int(reconciliation.get('updated_count') or 0)}",
-                f"- Unchanged: {int(reconciliation.get('unchanged_count') or 0)}",
-                f"- Earliest supplied: {reconciliation.get('earliest_supplied_at') or '(none)'}",
-                f"- Latest supplied: {reconciliation.get('latest_supplied_at') or '(none)'}",
-                f"- Error: {reconciliation.get('error') or '(none)'}",
-                "",
-            ])
         final_verification = repair_flow.get("final_verification") or {}
         if final_verification:
             lines.extend([
@@ -20694,7 +20197,6 @@ def main(argv: list[str]) -> int:
         sc_metrics: dict[str, Any] = dict(empty_metrics)
         sos_metrics: dict[str, Any] = dict(empty_metrics)
         cross_check_metrics: dict[str, Any] = dict(empty_metrics)
-        verified_first_value_at_connector_days: list[dict[str, Any]] = []
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
         )
@@ -20794,9 +20296,6 @@ def main(argv: list[str]) -> int:
                 allowed_connector_ids=v2_allowed_connector_ids,
                 source_scope=v2_source_scope,
                 log=log,
-                verified_first_value_at_scope_sink=(
-                    verified_first_value_at_connector_days
-                ),
             )
             v2_aqi = run_v2_aqilevels_integrity_checks(
                 r2_history_root=r2_history_root,
@@ -20882,9 +20381,6 @@ def main(argv: list[str]) -> int:
                 run_compact=run_compact,
                 env=env,
                 v2_observations=cross_check_metrics.get("v2_observations") or {},
-                verified_first_value_at_connector_days=(
-                    verified_first_value_at_connector_days
-                ),
                 v2_aqilevels=cross_check_metrics.get("v2_aqilevels") or {},
                 final_verification_config=history_path_configs["v2"],
                 from_day=from_day,
