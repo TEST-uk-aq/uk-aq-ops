@@ -519,7 +519,7 @@ function parseManifestFiles(
   return files;
 }
 
-function validateParquetHash(
+export function validateParquetHash(
   object: R2ReadResult,
   file: ManifestFile,
 ): void {
@@ -543,10 +543,6 @@ function validateParquetHash(
     throw new Error(
       `Parquet hash mismatch for ${file.key}: expected ${expected}, got ${actual}`,
     );
-  }
-  const responseEtag = object.etag ? normalizeHash(object.etag) : "";
-  if (responseEtag && MD5_RE.test(responseEtag) && responseEtag !== expected) {
-    throw new Error(`R2 ETag does not match manifest for ${file.key}`);
   }
 }
 
