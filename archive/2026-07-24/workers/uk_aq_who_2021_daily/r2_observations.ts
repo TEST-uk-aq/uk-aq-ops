@@ -145,186 +145,22 @@ function md5Hex(bytes: Uint8Array): string {
   return createHash("md5").update(bytes).digest("hex");
 }
 
-const COVERAGE_STATE_FIELDS = new Set([
-  "coverage",
-  "index_coverage",
-  "manifest_coverage",
-  "coverage_state",
-  "completeness",
-]);
-const COVERAGE_LIST_FIELDS = new Set([
-  "partial_reasons",
-  "missing_day_manifest_keys",
-  "missing_connector_manifest_keys",
-  "missing_parquet_keys",
-  "missing_connector_index_keys",
-]);
-
-function normalizeCoverageName(value: string): string {
-  return value
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .replace(/[^a-z0-9]+/gi, "_")
-    .replace(/^_+|_+$/g, "")
-    .toLowerCase();
-}
-
-function normalizeCoverageValue(value: unknown): string {
-  return String(value ?? "")
-    .trim()
-    .replace(/[^a-z0-9]+/gi, "_")
-    .replace(/^_+|_+$/g, "")
-    .toLowerCase();
-}
-
-function isIncompleteCoverageState(value: unknown): boolean {
-  if (typeof value !== "string") return false;
-  const normalized = normalizeCoverageValue(value);
-  return normalized === "partial" ||
-    normalized === "incomplete" ||
-    normalized === "not_complete" ||
-    normalized.includes("partial") ||
-    normalized.includes("incomplete") ||
-    normalized.includes("with_gap") ||
-    normalized.includes("missing");
-}
-
-function isFalseCoverageValue(value: unknown): boolean {
-  if (value === false || value === 0) return true;
-  if (typeof value !== "string") return false;
-  return ["false", "0", "no", "partial", "incomplete", "not_complete"]
-    .includes(normalizeCoverageValue(value));
-}
-
-function isTrueCoverageValue(value: unknown): boolean {
-  if (value === true || value === 1) return true;
-  if (typeof value !== "string") return false;
-  return ["true", "1", "yes", "gap", "gapped", "partial", "incomplete"]
-    .includes(normalizeCoverageValue(value));
-}
-
-function hasNonEmptyCoverageSignal(value: unknown): boolean {
-  if (value === undefined || value === null) return false;
-  if (typeof value === "string") return value.trim().length > 0;
-  if (Array.isArray(value)) return value.length > 0;
-  if (typeof value === "object") return Object.keys(value).length > 0;
-  return Boolean(value);
-}
-
-function coverageError(label: string, path: string, reason: string): Error {
-  return new Error(
-    `Incomplete R2 coverage in ${label} at ${path}: ${reason}`.slice(0, 500),
-  );
-}
-
-export function assertCompleteManifestCoverage(
-  value: unknown,
-  label = "manifest",
-): void {
-  const visit = (
-    current: unknown,
-    path: string,
-    coverageContext: boolean,
-  ): void => {
-    if (Array.isArray(current)) {
-      current.forEach((entry, index) =>
-        visit(entry, `${path}[${index}]`, coverageContext)
-      );
-      return;
+function checkCoverage(record: JsonRecord, label: string): void {
+  for (
+    const field of [
+      "coverage",
+      "index_coverage",
+      "manifest_coverage",
+      "completeness",
+    ]
+  ) {
+    const raw = record[field];
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const value = raw.trim().toLowerCase();
+    if (value === "partial" || value === "incomplete") {
+      throw new Error(`${label}.${field} is ${value}`);
     }
-    if (!current || typeof current !== "object") return;
-
-    for (const [rawKey, child] of Object.entries(current)) {
-      const key = normalizeCoverageName(rawKey);
-      const childPath = `${path}.${rawKey}`;
-      const childCoverageContext = coverageContext ||
-        key.includes("coverage") ||
-        key.includes("completeness") ||
-        key.includes("gap") ||
-        key === "timeseries_index";
-
-      if (key === "response_complete" && isFalseCoverageValue(child)) {
-        throw coverageError(label, childPath, "response_complete is false");
-      }
-      if (key === "has_gap" && isTrueCoverageValue(child)) {
-        throw coverageError(label, childPath, "has_gap is true");
-      }
-      if (
-        COVERAGE_STATE_FIELDS.has(key) &&
-        (
-          isIncompleteCoverageState(child) ||
-          isFalseCoverageValue(child)
-        )
-      ) {
-        throw coverageError(
-          label,
-          childPath,
-          `state is ${String(child).slice(0, 80)}`,
-        );
-      }
-      if (
-        (
-          COVERAGE_LIST_FIELDS.has(key) ||
-          key === "gap_ranges" ||
-          key === "gaps" ||
-          key === "gap" ||
-          key === "coverage_gaps" ||
-          key === "coverage_gap" ||
-          key === "missing_ranges" ||
-          key.endsWith("_coverage_gaps") ||
-          (key.startsWith("missing_") && key.endsWith("_keys")) ||
-          (
-            childCoverageContext &&
-            (
-              key.startsWith("missing") ||
-              key === "partial" ||
-              key === "incomplete"
-            )
-          )
-        ) &&
-        hasNonEmptyCoverageSignal(child)
-      ) {
-        throw coverageError(label, childPath, "contains coverage gaps");
-      }
-      if (
-        childCoverageContext &&
-        (key === "complete" ||
-          key === "is_complete" ||
-          key === "fully_covered") &&
-        isFalseCoverageValue(child)
-      ) {
-        throw coverageError(label, childPath, "nested completeness is false");
-      }
-      if (
-        childCoverageContext &&
-        (key === "status" || key === "state" || key === "result") &&
-        isIncompleteCoverageState(child)
-      ) {
-        throw coverageError(
-          label,
-          childPath,
-          `nested state is ${String(child).slice(0, 80)}`,
-        );
-      }
-      if (
-        childCoverageContext &&
-        (key === "warnings" || key === "reasons") &&
-        hasNonEmptyCoverageSignal(child)
-      ) {
-        throw coverageError(label, childPath, "contains coverage warnings");
-      }
-      if (
-        childCoverageContext &&
-        key === "limited_by_limit" &&
-        isTrueCoverageValue(child)
-      ) {
-        throw coverageError(label, childPath, "coverage was limit-truncated");
-      }
-
-      visit(child, childPath, childCoverageContext);
-    }
-  };
-
-  visit(value, "$", false);
+  }
 }
 
 async function validateManifestHash(
@@ -367,7 +203,7 @@ async function readJsonManifest(
     throw new Error(`Invalid JSON manifest: ${key}`);
   }
   const manifest = asRecord(value, key);
-  assertCompleteManifestCoverage(manifest, key);
+  checkCoverage(manifest, key);
   await validateManifestHash(manifest, key, metrics);
   cache?.set(key, manifest);
   return manifest;
@@ -852,40 +688,22 @@ export async function prepareWhoDailyRowsFromR2(args: {
 
   try {
     for (const pollutantCode of pollutants) {
-      let dayRows: R2ObservationRow[];
-      try {
-        dayRows = await readValidatedObservationPollutantPartition({
-          readObject: args.readObject,
-          dayUtc: args.dayUtc,
-          connectorId: args.connectorId,
-          pollutantCode,
-          metrics,
-          manifestCache,
-        });
-      } catch (error) {
-        throw new Error(
-          `WHO source partition ${args.dayUtc} missing or incomplete for ${pollutantCode}: ${
-            String(error instanceof Error ? error.message : error).slice(0, 320)
-          }`,
-        );
-      }
-      let boundaryRows: R2ObservationRow[];
-      try {
-        boundaryRows = await readValidatedObservationPollutantPartition({
-          readObject: args.readObject,
-          dayUtc: boundaryDay,
-          connectorId: args.connectorId,
-          pollutantCode,
-          metrics,
-          manifestCache,
-        });
-      } catch (error) {
-        throw new Error(
-          `WHO D+1 boundary partition ${boundaryDay} missing or incomplete for ${pollutantCode}: ${
-            String(error instanceof Error ? error.message : error).slice(0, 320)
-          }`,
-        );
-      }
+      const dayRows = await readValidatedObservationPollutantPartition({
+        readObject: args.readObject,
+        dayUtc: args.dayUtc,
+        connectorId: args.connectorId,
+        pollutantCode,
+        metrics,
+        manifestCache,
+      });
+      const boundaryRows = await readValidatedObservationPollutantPartition({
+        readObject: args.readObject,
+        dayUtc: boundaryDay,
+        connectorId: args.connectorId,
+        pollutantCode,
+        metrics,
+        manifestCache,
+      });
       const pollutantPrepared = aggregatePollutantRows({
         dayUtc: args.dayUtc,
         pollutantCode,

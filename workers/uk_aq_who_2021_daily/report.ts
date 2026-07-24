@@ -41,6 +41,12 @@ export function boundedReport(
     latest_complete_day_utc: value.latest_complete_day_utc || null,
     correction_day_utc: value.correction_day_utc || null,
     publication_as_of_day_utc: value.publication_as_of_day_utc || null,
+    publication_decision_reason:
+      String(value.publication_decision_reason || "").slice(0, 100) || null,
+    publication_eligible_days: boundedStrings(
+      value.publication_eligible_days,
+      31,
+    ),
     source_mode: String(value.source_mode || "").slice(0, 30) || null,
     requested_start_day_utc: value.requested_start_day_utc || null,
     requested_end_day_utc: value.requested_end_day_utc || null,
